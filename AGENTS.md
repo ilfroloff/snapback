@@ -33,9 +33,12 @@ one place.
   panic. On EVERY return from a child, hard-reset the terminal — a deterministic
   full re-init onto a fresh screen — so a dirty hand-back (notably a Ctrl-Z that
   exits `claude` without restoring the terminal) repaints from a known-good state
-  with no stale cells, native scrollback, or leftover escape-parser corruption
-  showing through, and without regressing the idempotent restore.
-  (`src/tui/mod.rs`, `src/resume.rs`)
+  with no stale cells, native scrollback, leaked keyboard/input modes (notably a
+  leftover kitty keyboard-protocol level), or leftover escape-parser corruption
+  showing through, and without regressing the idempotent restore. The reset is
+  ONE complete return-to-known-state, not one mode per bug, and stays WRITE-ONLY:
+  never emit a cursor-position (DSR `CSI 6n`) query on the return path — it
+  deadlocks on a dirty child's stdin. (`src/tui/mod.rs`, `src/resume.rs`)
 - **NUCLEO ISOLATION.** Every `nucleo` call stays in `src/search.rs`. Matching
   is SUBSTRING (`AtomKind::Substring`), not fuzzy; the filter and highlight
   share one `Pattern`. (`src/search.rs`)

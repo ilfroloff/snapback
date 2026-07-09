@@ -16,8 +16,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Result;
+use crossterm::cursor::{SetCursorStyle, Show};
 use crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableMouseCapture,
+    PopKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::style::{Attribute, SetAttribute};
@@ -129,6 +131,90 @@ fn recover_parser_state<W: Write>(w: &mut W) -> io::Result<()> {
     execute!(w, SetAttribute(Attribute::Reset))
 }
 
+/// Kitty keyboard protocol "set enhancement flags ABSOLUTELY to 0" — `CSI = 0 u`
+/// (bytes `1b 5b 3d 30 75`), per the kitty progressive-enhancement spec's
+/// `CSI = flags ; mode u` set form with `flags = 0`. Unlike a POP (which clears
+/// one stack level) this forces the flags at the CURRENT stack level to none, so
+/// pairing it with [`PopKeyboardEnhancementFlags`] disables any residue the pop
+/// left at the base level (see [`reset_terminal_state`] for why both are needed).
+/// crossterm has no typed command for the set form, so it is written as raw
+/// bytes (mirrors [`CAN`] / [`ST`]). WRITE-ONLY and a harmless no-op on terminals
+/// that do not implement the protocol.
+const KITTY_DISABLE_KEYBOARD: [u8; 5] = [0x1b, b'[', b'=', b'0', b'u'];
+
+/// `DECSTR` (Soft Terminal Reset) — `CSI ! p` (bytes `1b 5b 21 70`), DEC STD 070.
+/// Sweeps the remaining minor DEC ANSI modes to their power-on defaults
+/// (DECOM/DECAWM/DECCKM off, DECTCEM cursor shown, IRM replace, SGR normal,
+/// keypad numeric, DECSTBM full-screen margins, saved cursor home) in ONE
+/// escape, so a child's leftover minor-mode state cannot bleed into the board. It
+/// is a soft reset over DEC-defined modes ONLY: it does NOT touch the xterm
+/// PRIVATE modes `?1049` (alt screen) or `?100x` (mouse), which is why
+/// [`reassert_board_screen`] can safely re-assert those AFTER this runs. No
+/// crossterm typed command emits it, so it is written as raw bytes (mirrors
+/// [`CAN`] / [`ST`]). WRITE-ONLY.
+const DECSTR: [u8; 4] = [0x1b, b'[', b'!', b'p'];
+
+/// `DECCKM` off (Normal Cursor Keys mode) — `CSI ? 1 l` (bytes `1b 5b 3f 31 6c`).
+/// Forces the cursor/arrow keys back to the normal `CSI A/B/C/D` encoding rather
+/// than the application `SS3 A/B/…` form a child (e.g. one in an editor mode) may
+/// have set with `CSI ? 1 h`, so the board's arrow-key handling decodes as
+/// expected. [`DECSTR`] already resets DECCKM, but this asserts it explicitly and
+/// independently of soft-reset support. No crossterm typed command emits it, so
+/// it is written as raw bytes (mirrors [`CAN`] / [`ST`]). WRITE-ONLY.
+const DECCKM_OFF: [u8; 5] = [0x1b, b'[', b'?', b'1', b'l'];
+
+/// Return the terminal's KEYBOARD, CURSOR, and minor-MODE state to a known-good
+/// baseline after a spawned `claude` child handed control back — the state
+/// [`hard_reset`]'s other seams do not cover. Every escape here is WRITE-ONLY (no
+/// cursor-position / DSR `CSI 6n` query, so it can never block reading a reply
+/// from a dirty child's stdin) and a harmless no-op on a terminal that lacks the
+/// mode, so [`hard_reset`] runs it UNCONDITIONALLY on every board (re)entry.
+/// Factored out and generic over [`Write`] so the emitted bytes can be asserted
+/// in a unit test without a real TTY (mirrors [`recover_parser_state`] /
+/// [`reset_child_modes`] / [`reassert_board_screen`]).
+///
+/// Emitted, in order:
+/// 1. [`PopKeyboardEnhancementFlags`] — crossterm emits `CSI < 1 u`, popping ONE
+///    level of the kitty keyboard progressive-enhancement stack. This is the
+///    PRIORITY fix: a `claude` child that pushed the protocol (`CSI > … u`) and
+///    exited on `Ctrl-Z` without popping leaves an enhancement level active, and
+///    the leftover level re-encodes ordinary keys (adds release events, alternate
+///    key reports), scrambling the board's input.
+/// 2. [`KITTY_DISABLE_KEYBOARD`] — `CSI = 0 u`, set the flags ABSOLUTELY to 0.
+///    A single pop clears only ONE stack entry, and we CANNOT query the stack
+///    depth to know how many to pop — that needs `CSI ? u`, a DSR-class query
+///    whose reply would block on a dirty child's stdin (forbidden on this path,
+///    the same reason [`hard_reset`] issues no `CSI 6n`). So instead of popping
+///    blindly we PAIR one pop with an absolute-off at the current level, the most
+///    robust write-only way to reach "no enhancement" regardless of residual
+///    depth.
+/// 3. [`SetCursorStyle::DefaultUserShape`] — `CSI 0 SP q` (DECSCUSR default),
+///    normalizing a blinking-bar / custom cursor shape the child set.
+/// 4. [`Show`] — `CSI ?25h` (DECTCEM on), un-hiding a cursor the child hid.
+///    ratatui re-hides/re-positions the cursor per frame anyway; this just avoids
+///    an invisible or wrongly-shaped cursor flashing on return.
+/// 5. [`DECSTR`] — `CSI ! p` soft reset, sweeping the remaining minor DEC modes.
+/// 6. [`DECCKM_OFF`] — `CSI ? 1 l`, explicit normal cursor-keys encoding.
+fn reset_terminal_state<W: Write>(w: &mut W) -> io::Result<()> {
+    // Kitty keyboard protocol: pop one enhancement level, then hard-disable any
+    // residue at the base level with an absolute `CSI = 0 u`. A single pop clears
+    // only ONE stack level and the depth is unknowable without a forbidden query
+    // (see the doc comment), so pop + absolute-off is the robust write-only path.
+    execute!(w, PopKeyboardEnhancementFlags)?;
+    w.write_all(&KITTY_DISABLE_KEYBOARD)?;
+    // Normalize cursor shape + visibility the child may have changed (ratatui
+    // re-hides/re-positions per frame regardless).
+    execute!(w, SetCursorStyle::DefaultUserShape, Show)?;
+    // Soft-reset the remaining minor DEC modes, then force normal cursor-key
+    // encoding explicitly. Neither has a crossterm typed command — raw bytes.
+    // DECSTR does NOT touch the xterm private modes `?1049` (alt screen) / `?100x`
+    // (mouse) that `reassert_board_screen` re-asserts AFTER this, so it is safe
+    // here.
+    w.write_all(&DECSTR)?;
+    w.write_all(&DECCKM_OFF)?;
+    Ok(())
+}
+
 /// Turn OFF the terminal modes a spawned `claude` child may have enabled but
 /// that `snapback` never uses, so a child that exited on `Ctrl-Z` without
 /// restoring, or exited abnormally, cannot leak them into the board.
@@ -184,9 +270,22 @@ fn reassert_board_screen<W: Write>(w: &mut W) -> io::Result<()> {
     )
 }
 
-/// Re-assert a known-good board screen after returning from a spawned `claude`
-/// child, healing a terminal the child left DIRTY. Every escape it emits is
-/// WRITE-ONLY — it NEVER issues a cursor-position (DSR `CSI 6n`) query.
+/// Assert ONE COMPLETE return-to-known-good-state reset after returning from a
+/// spawned `claude` child, healing a terminal the child left DIRTY. Every escape
+/// it emits is WRITE-ONLY — it NEVER issues a cursor-position (DSR `CSI 6n`)
+/// query.
+///
+/// The guiding principle is to re-assert a whole known state, NOT to clear one
+/// mode per reported bug: a child that exits dirty on `Ctrl-Z` can leave ANY of
+/// the modes it touched set, so the seam sweeps the full set the board depends on
+/// — escape parser, kitty keyboard protocol, cursor shape/visibility, minor DEC
+/// modes, input modes, alt screen, mouse — every time. The kitty keyboard
+/// protocol is the load-bearing addition: a `claude` child that pushed
+/// progressive enhancement and exited without popping leaves an enhancement level
+/// active that re-encodes ordinary keys and scrambles the board's input; it is
+/// NOT one of the modes `restore_terminal` / the older seams ever cleared, so it
+/// persisted across the round trip and was the primary cause of the reported
+/// still-unstable `Ctrl-Z`.
 ///
 /// [`init_terminal`] re-runs on every board (re)entry and its
 /// [`ratatui::try_init`] re-enables raw mode — [`restore_terminal`] cleared
@@ -221,12 +320,21 @@ fn reassert_board_screen<W: Write>(w: &mut W) -> io::Result<()> {
 ///    reported leaked `[39m` that cascades over the whole board). The recovery
 ///    bytes are harmless no-ops on a clean terminal, so prepending them on every
 ///    board (re)entry is safe.
-/// 2. [`enable_raw_mode`] — cheap, idempotent confirmation of raw mode (already
+/// 2. [`reset_terminal_state`] — return keyboard/cursor/minor-mode state to a
+///    known-good baseline: pop the kitty keyboard protocol + absolute-off
+///    (`CSI < 1 u` + `CSI = 0 u`) so a child's leftover progressive-enhancement
+///    level cannot scramble the board's key input, reset cursor shape + show it
+///    (`CSI 0 SP q` + `CSI ?25h`), soft-reset the remaining minor DEC modes with
+///    `DECSTR` (`CSI ! p`), and force normal cursor keys with `DECCKM`-off
+///    (`CSI ? 1 l`). Placed BEFORE step 4: `DECSTR` is a soft reset over DEC ANSI
+///    modes only and does NOT touch the xterm private modes `?1049` / `?100x`, so
+///    the alt-screen + mouse re-assert in step 4 still wins.
+/// 3. [`enable_raw_mode`] — cheap, idempotent confirmation of raw mode (already
 ///    re-applied by `try_init`), so this seam's post-condition — alt screen +
 ///    raw mode + mouse capture — is self-contained rather than assumed.
-/// 3. [`reset_child_modes`] — turn off input modes the child may have leaked
+/// 4. [`reset_child_modes`] — turn off input modes the child may have leaked
 ///    (bracketed paste `?2004l`, focus reporting `?1004l`).
-/// 4. [`reassert_board_screen`] — round-trip `Leave`→`EnterAlternateScreen` to
+/// 5. [`reassert_board_screen`] — round-trip `Leave`→`EnterAlternateScreen` to
 ///    force a FRESH alt buffer (defeating the no-op re-enter), re-arm mouse
 ///    capture, clear the visible screen with `Clear(ClearType::All)` (`CSI 2J`),
 ///    and purge the native SCROLLBACK with `Clear(ClearType::Purge)` (`CSI 3J`).
@@ -252,6 +360,11 @@ fn hard_reset() -> Result<()> {
     // child left it mid control-string, so the re-init escapes below are parsed
     // as commands rather than swallowed as string content.
     recover_parser_state(&mut out)?;
+    // Return keyboard/cursor/minor-mode state to a known-good baseline (kitty
+    // keyboard-protocol pop + absolute-off, cursor shape + show, DECSTR soft
+    // reset, DECCKM-off). Runs AFTER parser recovery and BEFORE the alt-screen /
+    // mouse re-assert, so DECSTR's soft reset cannot undo `?1049` / `?100x`.
+    reset_terminal_state(&mut out)?;
     enable_raw_mode()?;
     reset_child_modes(&mut out)?;
     reassert_board_screen(&mut out)?;
@@ -418,6 +531,114 @@ mod tests {
 
         assert!(can < st, "CAN must precede ST, got {seq:?}");
         assert!(st < sgr, "ST must precede the SGR reset, got {seq:?}");
+    }
+
+    /// The hard-reset seam must return keyboard/cursor/minor-mode state to a
+    /// known-good baseline on return from a spawned `claude` child. Asserts
+    /// [`reset_terminal_state`] emits, IN ORDER: the kitty keyboard-protocol POP
+    /// (`CSI < 1 u`) and the absolute-off (`CSI = 0 u`) — the priority fix for a
+    /// leftover progressive-enhancement level scrambling key input — then the
+    /// cursor-style reset (`CSI 0 SP q`), cursor Show (`CSI ?25h`), DECSTR soft
+    /// reset (`CSI ! p`), and DECCKM-off / normal cursor keys (`CSI ? 1 l`). Every
+    /// one is WRITE-ONLY (no DSR `CSI 6n`), keeping the return leg non-blocking on
+    /// a dirty child's stdin. Tests the PURE helper against a `Vec<u8>` (no TTY).
+    ///
+    /// NOTE: crossterm 0.29's `PopKeyboardEnhancementFlags` emits `CSI < 1 u`
+    /// (pop ONE level, with an explicit count), not the bare `CSI < u` — both pop
+    /// a single stack level, so the count is immaterial; the test matches the
+    /// bytes the pinned crossterm actually writes.
+    #[test]
+    fn hard_reset_returns_keyboard_cursor_and_minor_modes_to_baseline() {
+        let mut buf: Vec<u8> = Vec::new();
+        reset_terminal_state(&mut buf).expect("write terminal-state reset sequence");
+        let seq = String::from_utf8_lossy(&buf);
+
+        // Kitty keyboard protocol POP (`CSI < 1 u`).
+        let pop = buf
+            .windows(4)
+            .position(|w| w == b"[<1u")
+            .unwrap_or_else(|| {
+                panic!("reset must pop the kitty keyboard flags (CSI <1u), got {seq:?}")
+            });
+        // Kitty keyboard protocol absolute-off (`CSI = 0 u`).
+        let koff = buf
+            .windows(4)
+            .position(|w| w == b"[=0u")
+            .unwrap_or_else(|| {
+                panic!("reset must absolute-disable the kitty flags (CSI =0u), got {seq:?}")
+            });
+        // Default cursor style (DECSCUSR): `CSI 0 SP q` — the space before `q`
+        // distinguishes it from the SGR reset `[0m` in `recover_parser_state`.
+        let cursor = buf
+            .windows(4)
+            .position(|w| w == b"[0 q")
+            .unwrap_or_else(|| {
+                panic!("reset must set the default cursor style (CSI 0 SP q), got {seq:?}")
+            });
+        // Cursor Show (DECTCEM on): `CSI ?25h`.
+        let show = buf
+            .windows(5)
+            .position(|w| w == b"[?25h")
+            .unwrap_or_else(|| panic!("reset must show the cursor (CSI ?25h), got {seq:?}"));
+        // DECSTR soft reset: `CSI ! p`.
+        let decstr = buf.windows(3).position(|w| w == b"[!p").unwrap_or_else(|| {
+            panic!("reset must soft-reset the terminal (DECSTR, CSI !p), got {seq:?}")
+        });
+        // DECCKM off / normal cursor keys: `CSI ? 1 l`.
+        let ckm = buf
+            .windows(4)
+            .position(|w| w == b"[?1l")
+            .unwrap_or_else(|| {
+                panic!("reset must set normal cursor keys (DECCKM off, CSI ?1l), got {seq:?}")
+            });
+
+        // Order matches the doc contract: pop → absolute-off → cursor style →
+        // show → DECSTR → DECCKM-off.
+        assert!(
+            pop < koff,
+            "kitty pop must precede absolute-off, got {seq:?}"
+        );
+        assert!(
+            koff < cursor,
+            "kitty absolute-off must precede the cursor-style reset, got {seq:?}"
+        );
+        assert!(
+            cursor < show,
+            "cursor-style reset must precede cursor show, got {seq:?}"
+        );
+        assert!(
+            show < decstr,
+            "cursor show must precede DECSTR, got {seq:?}"
+        );
+        assert!(decstr < ckm, "DECSTR must precede DECCKM-off, got {seq:?}");
+    }
+
+    /// Parser recovery must still come FIRST — before the new keyboard/cursor/mode
+    /// resets — on the return path, so a child stuck MID control-string cannot
+    /// swallow the mode-reset escapes as string content. Composes the two PURE
+    /// helpers in the SAME order [`hard_reset`] calls them into one buffer and
+    /// asserts the parser-recovery prefix (`CAN`) lands before the first
+    /// mode-reset escape (the kitty pop `CSI < 1 u`). Tests the pure helpers, not
+    /// the impure `hard_reset` driver.
+    #[test]
+    fn hard_reset_recovers_parser_before_the_mode_resets() {
+        let mut buf: Vec<u8> = Vec::new();
+        recover_parser_state(&mut buf).expect("write parser-recovery sequence");
+        reset_terminal_state(&mut buf).expect("write terminal-state reset sequence");
+        let seq = String::from_utf8_lossy(&buf);
+
+        let can = buf
+            .iter()
+            .position(|&b| b == CAN)
+            .unwrap_or_else(|| panic!("recovery must emit CAN (0x18) first, got {seq:?}"));
+        let pop = buf
+            .windows(4)
+            .position(|w| w == b"[<1u")
+            .unwrap_or_else(|| panic!("reset must emit the kitty pop (CSI <1u), got {seq:?}"));
+        assert!(
+            can < pop,
+            "parser recovery (CAN) must precede the first mode reset (kitty pop), got {seq:?}"
+        );
     }
 
     /// The hard-reset seam must re-enter a FRESH alternate screen (`CSI ?1049h`),
