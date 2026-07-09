@@ -1,0 +1,8 @@
+# Pin the Rust toolchain to an EXACT version so local dev and CI can never drift:
+# rustup reads this file locally and `actions-rust-lang/setup-rust-toolchain` reads
+# it in CI, making it the single source of truth for both. Mirrors the exact-pin
+# philosophy of Cargo.toml (see its dependency comments) — reproducibility over
+# floating "stable", which silently upgrades and can turn CI red on a new lint.
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
