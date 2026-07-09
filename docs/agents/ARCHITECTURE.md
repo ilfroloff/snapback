@@ -117,19 +117,43 @@ every board (re)entry, but cannot recover a terminal a returning `claude` child
 left dirty: its `EnterAlternateScreen` is a no-op when the emulator already
 believes it is on the alt screen, and the diff renderer only repaints cells that
 differ from its freshly-built buffer. `hard_reset` is therefore a deterministic
-full re-init — it (1) recovers the terminal's escape parser FIRST, before any
-other escape, with a write-only `CAN` (`0x18`) + `ST` (`ESC \`) + SGR reset
-(`CSI 0m`): a child that exited MID control-string (a dangling DCS/OSC/CSI with
-no terminator) leaves the parser swallowing input, so were the re-init escapes to
-run ahead of the recovery they would be eaten as string content and every
-downstream SGR code would render as literal text (the reported leaked `[39m`
-cascading over the board); (2) confirms raw mode; (3) disables input modes the
-child may have leaked (bracketed paste, focus reporting); (4) round-trips
+full re-init that asserts ONE complete return-to-known-state rather than clearing
+one mode per reported bug — it (1) recovers the terminal's escape parser FIRST,
+before any other escape, with a write-only `CAN` (`0x18`) + `ST` (`ESC \`) + SGR
+reset (`CSI 0m`): a child that exited MID control-string (a dangling DCS/OSC/CSI
+with no terminator) leaves the parser swallowing input, so were the re-init
+escapes to run ahead of the recovery they would be eaten as string content and
+every downstream SGR code would render as literal text (the reported leaked
+`[39m` cascading over the board); (2) returns keyboard/cursor/minor-mode state to
+a known-good baseline — pops the kitty keyboard progressive-enhancement stack
+(`CSI < 1 u`) AND absolute-disables its flags (`CSI = 0 u`), resets the cursor
+shape (`CSI 0 SP q`) and shows it (`CSI ?25h`), soft-resets remaining minor DEC
+modes (`DECSTR`, `CSI ! p`), and forces normal cursor keys (`DECCKM`-off,
+`CSI ? 1 l`); (3) confirms raw mode; (4) disables input modes the child may have
+leaked (bracketed paste, focus reporting); (5) round-trips
 `LeaveAlternateScreen`→`EnterAlternateScreen` to force a *fresh* alt buffer,
 re-arms mouse capture, clears the visible screen with `Clear(ClearType::All)`
 (`CSI 2J`), and purges the native scrollback with `Clear(ClearType::Purge)`
 (`CSI 3J`). Every escape it emits is **write-only** — the seam issues NO
-cursor-position (DSR `CSI 6n`) query. That is deliberate: in ratatui 0.30
+cursor-position (DSR `CSI 6n`) query.
+
+The kitty keyboard reset in step (2) is the priority fix for the reported
+*still-unstable* `Ctrl-Z`: a `claude` child that pushed progressive enhancement
+and exited without popping leaves an enhancement level active that re-encodes
+ordinary keys (release events, alternate reports) and scrambles the board's
+input — a mode none of the other seams ever cleared, so it persisted across the
+round trip. A single pop clears only ONE stack level and the depth is UNKNOWABLE
+without a `CSI ? u` query (a DSR-class query forbidden on this write-only path),
+so the seam pairs one pop with an absolute `CSI = 0 u` off — the robust
+write-only way to reach "no enhancement" regardless of residual depth; both are
+harmless no-ops on terminals lacking the protocol. Step (2) runs BEFORE step (5)
+deliberately: `DECSTR` is a soft reset over DEC ANSI modes only
+(DECCKM/DECOM/DECAWM/DECTCEM/SGR/…) and does NOT touch the xterm private modes
+`?1049` (alt screen) or `?100x` (mouse), so re-asserting those afterwards still
+wins — verified in a tmux repro where the board renders and mouse scroll still
+work after a dirty `Ctrl-Z` return.
+
+The write-only discipline is deliberate: in ratatui 0.30
 `Terminal::clear()` first calls `get_cursor_position()`, which emits `CSI 6n` and
 blocks reading the reply; on a dirty `Ctrl-Z` hand-back the reply is lost,
 crossterm times out (~2s), and the error crashed snapback with "The cursor
