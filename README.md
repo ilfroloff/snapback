@@ -126,8 +126,12 @@ resolves the click to the link itself and hands the url to the OS opener in the
 background; the board never blocks and the browser opens behind it.
 
 The header line shows the active scope, the active search mode, and a
-`matched / total` session count; the bottom line is a one-row keybinding cheat
-sheet.
+`matched / total` session count, with a version indicator right-aligned on the
+same row: a release build shows `v<crate-version>` (e.g. `v1.0.0`), while a
+local dev build shows `dev+<git-hash>` (with a trailing `-dirty` when the
+working tree has uncommitted changes), so you can tell an installed release from
+a build off your own checkout at a glance. The bottom line is a one-row
+keybinding cheat sheet.
 
 ---
 

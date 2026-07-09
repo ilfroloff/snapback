@@ -55,9 +55,25 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
 }
 
-/// Prefix for the version indicator (`v0.1.0`); the leading `v` is the
-/// conventional marker readers expect before a semver string.
-const VERSION_PREFIX: &str = "v";
+/// Prefix for a release build's version indicator (`v0.1.0`); the leading `v`
+/// is the conventional marker readers expect before a semver string.
+const RELEASE_VERSION_PREFIX: &str = "v";
+/// Prefix for a local debug build's indicator (`dev+a1b2c3d`). The `+` is
+/// semver build-metadata syntax carrying the source commit the binary was built
+/// from, flagging at a glance that this is a hand-built dev binary, not a
+/// shipped release.
+const DEV_VERSION_PREFIX: &str = "dev+";
+/// Suffix appended to a dev indicator when the working tree had uncommitted
+/// changes at build time, so a hacked-on build (`dev+a1b2c3d-dirty`) is never
+/// mistaken for a clean checkout of that commit.
+const DEV_DIRTY_SUFFIX: &str = "-dirty";
+
+/// Source commit short hash captured at build time (see `build.rs`), or
+/// `unknown` when built outside a git repository. Only rendered for dev builds.
+const GIT_HASH: &str = env!("SNAPBACK_GIT_HASH");
+/// `"1"` when the working tree had uncommitted changes at build time, else
+/// `"0"` (see `build.rs`). Only consulted for dev builds.
+const GIT_DIRTY: &str = env!("SNAPBACK_GIT_DIRTY");
 
 /// The preview scrollbar's `begin_symbol`, shown ONLY when the preview is
 /// pinned to the very top (`offset == 0`) — a clear directional glyph for the
@@ -76,10 +92,26 @@ const SCROLLBAR_END_ARROW: &str = "↓";
 /// jittering each time an arrow pops in or out at an edge.
 const SCROLLBAR_ARROW_HIDDEN: &str = " ";
 
-/// Build the header's version label (`v0.1.0`) from the compile-time crate
-/// version so it always tracks `Cargo.toml`.
+/// Build the header's version label from compile-time metadata.
+///
+/// Release builds (`cfg!(debug_assertions)` off — `cargo build --release`,
+/// `cargo install`) show `v<crate-version>`, always tracking `Cargo.toml`.
+/// Local debug builds (`cargo dev`/`run`/`test`) show `dev+<git-short-hash>`
+/// with a trailing `-dirty` when the working tree had uncommitted changes at
+/// build time, so a running TUI states whether it is a shipped release or a
+/// local build and, if local, exactly which commit it came from.
 fn version_label() -> String {
-    format!("{}{}", VERSION_PREFIX, env!("CARGO_PKG_VERSION"))
+    format_version_label(cfg!(debug_assertions), GIT_HASH, GIT_DIRTY == "1")
+}
+
+/// Pure formatter split out of [`version_label`] so the release/dev/dirty
+/// branching is unit-testable without a real build profile or git repository.
+fn format_version_label(debug_build: bool, git_hash: &str, dirty: bool) -> String {
+    if !debug_build {
+        return format!("{}{}", RELEASE_VERSION_PREFIX, env!("CARGO_PKG_VERSION"));
+    }
+    let dirty = if dirty { DEV_DIRTY_SUFFIX } else { "" };
+    format!("{DEV_VERSION_PREFIX}{git_hash}{dirty}")
 }
 
 /// The top status line: title, active scope, search mode, and counts on the
@@ -832,10 +864,32 @@ mod tests {
     use crate::store::Session;
 
     #[test]
-    fn version_label_prefixes_v_and_carries_crate_version() {
-        let label = version_label();
-        assert!(label.starts_with('v'));
-        assert!(label.contains(env!("CARGO_PKG_VERSION")));
+    fn release_label_is_v_prefixed_crate_version() {
+        let label = format_version_label(false, "abc1234", true);
+        assert_eq!(label, format!("v{}", env!("CARGO_PKG_VERSION")));
+        // Release builds ignore git metadata entirely.
+        assert!(!label.contains("abc1234"));
+        assert!(!label.contains("dirty"));
+    }
+
+    #[test]
+    fn dev_label_carries_git_short_hash() {
+        assert_eq!(format_version_label(true, "abc1234", false), "dev+abc1234");
+    }
+
+    #[test]
+    fn dev_label_marks_a_dirty_working_tree() {
+        assert_eq!(
+            format_version_label(true, "abc1234", true),
+            "dev+abc1234-dirty"
+        );
+    }
+
+    #[test]
+    fn version_label_under_cargo_test_is_a_dev_build() {
+        // `cargo test` compiles in debug mode, so the live label takes the dev
+        // branch; asserts the wiring (cfg + env vars), not a specific commit.
+        assert!(version_label().starts_with(DEV_VERSION_PREFIX));
     }
 
     #[test]
