@@ -16,6 +16,12 @@ The JSONL format is external and undocumented, so treat every read as hostile:
   a missing binary, non-zero exit, non-JSON, or a non-array top level all
   collapse to an **empty set**, never a panic. There is exactly one place the
   wire shape is interpreted per source.
+- DEFINED-agent discovery (`defined_agents`) is the same: a missing
+  `.claude/agents` dir, an unreadable file, or malformed YAML frontmatter is
+  skipped (`parse_frontmatter` returns `None`), collapsing to a (possibly empty)
+  list — never a panic. The frontmatter is hand-parsed (no YAML crate) to keep the
+  crate dependency-free, exactly like the hand-rolled markdown pass in
+  `store::preview`.
 
 ## 2. Authoritative-from-file
 
@@ -32,13 +38,17 @@ Decision logic is pure and unit-tested; side effects sit in thin wrappers over
 it. Follow this split when adding behavior:
 
 - Pure, tested: `resume::plan` / `plan_from_parts` / `build_argv` /
-  `status_for_exit`; `update::key_to_action` / `wheel_target`; every `App`
-  state transition; `view`'s `wrapped_rows` / `clamp_preview_offset` /
-  `centered_rect` / `highlight_runs`.
-- Thin, impure: `resume::launch` (chdir + spawn + wait), the `watch` threads,
+  `build_new_argv` / `status_for_exit`; `defined_agents::select_agents` /
+  `parse_frontmatter`; `update::key_to_action` / `wheel_target`; every `App`
+  state transition (incl. `pick_default_index` and the agent-picker cycle);
+  `view`'s `wrapped_rows` / `clamp_preview_offset` / `centered_rect` /
+  `highlight_runs`.
+- Thin, impure: `resume::launch` (chdir + spawn + wait), `defined_agents::discover_agents`
+  (the FS walk over `select_agents` / `parse_frontmatter`), the `watch` threads,
   `tui::run` (draw loop). Keep these small and delegate to tested helpers.
 
-The terminal-up **refusal gate** is an instance of this: `resume::check` runs
+The terminal-up **refusal gate** is an instance of this: `resume::check` (and its
+sibling `resume::check_new` for starting a fresh session in the launch dir) runs
 the pure predicate while the UI is still drawn, so a refusal becomes a board
 status with no teardown flash; only a confirmed `Ready` escalates to
 `Outcome::Resume` and the impure `launch`.
@@ -123,9 +133,12 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    search never blocks navigation).
 2. `apply_action` mutates the `App` and returns an `Outcome`
    (`Continue`/`Quit`/`Resume`).
-3. Modal state (the running-session overlay) owns the keyboard via
-   `pending_live` and its own `live_choice_key` state machine; a mouse wheel is
-   handled **before** and **independent of** that gate.
+3. Modal state owns the keyboard: the running-session overlay via `pending_live`
+   + its `live_choice_key` machine, and the new-session agent picker via
+   `pending_agent` + its `agent_pick_key` machine (`handle_event` checks each in
+   turn before the board). Both are guarded the same way — `App::overlay_active`
+   gates mouse actions (splitter drag / link open) so neither fires while a modal
+   is up. A mouse wheel is handled **before** and **independent of** those gates.
 
 Add a keybinding by extending the `Action` enum + `key_to_action` + `apply_action`
 and covering it with a `key_to_action` unit test. Keep the doc-comment key table

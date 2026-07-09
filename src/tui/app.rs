@@ -19,6 +19,7 @@ use ratatui::text::{Line, Text};
 use time::OffsetDateTime;
 
 use crate::agents::LiveAgent;
+use crate::defined_agents::DefinedAgent;
 use crate::search::{SearchIndex, SearchMode};
 use crate::store::{preview, Session};
 
@@ -131,6 +132,58 @@ pub struct PendingLive {
     pub session_id: String,
     /// The currently highlighted choice.
     pub selected: LiveChoice,
+}
+
+/// The open NEW-SESSION agent picker: the discovered agents plus the highlighted
+/// row.
+///
+/// Row `0` is always a synthetic "default (no agent)" entry, so a valid `selected`
+/// spans `0..=agents.len()`: `0` launches bare `claude` and `i + 1` binds
+/// `agents[i]`. Modeled as explicit state (mirroring [`PendingLive`]) so the
+/// picker is a small, unit-testable state machine that owns the keyboard while open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingAgent {
+    /// Discovered selectable agents in display order (the default entry is NOT in
+    /// here — it is the implicit row `0`).
+    pub agents: Vec<DefinedAgent>,
+    /// The highlighted row in `0..=agents.len()` (`0` = default / no agent).
+    pub selected: usize,
+}
+
+impl PendingAgent {
+    /// Total selectable rows, including the leading default (no-agent) entry.
+    fn len(&self) -> usize {
+        self.agents.len() + 1
+    }
+
+    /// The agent name for the highlighted row, or `None` for the default entry
+    /// (row `0`). Also `None` if `selected` somehow points past the list — the
+    /// safe, launch-bare fallback rather than a panic.
+    #[must_use]
+    pub fn selected_agent(&self) -> Option<&str> {
+        self.selected
+            .checked_sub(1)
+            .and_then(|i| self.agents.get(i))
+            .map(|a| a.name.as_str())
+    }
+}
+
+/// Choose the picker row to pre-highlight when it opens.
+///
+/// Returns the row matching `last` (offset by 1 for the leading default entry),
+/// or `0` (the default "no agent" row) when `last` is `None` or no longer among
+/// `agents` (its defining file was removed since the last pick). Pure so the
+/// "pick default vs. last" decision is unit-tested; keeps `Ctrl-N` then `Enter`
+/// a one-keystroke fast path onto whatever was chosen last.
+#[must_use]
+pub fn pick_default_index(last: Option<&str>, agents: &[DefinedAgent]) -> usize {
+    match last {
+        Some(name) => agents
+            .iter()
+            .position(|a| a.name == name)
+            .map_or(0, |i| i + 1),
+        None => 0,
+    }
 }
 
 /// Canonicalize `p`, falling back to the raw path when it cannot be resolved
@@ -281,6 +334,13 @@ pub struct App {
     /// The open running-session choice overlay, if any. `Some` while the
     /// Attach/Fork/Cancel prompt owns the keyboard.
     pub pending_live: Option<PendingLive>,
+    /// The open new-session agent picker, if any. `Some` while the agent-pick
+    /// overlay owns the keyboard (`Ctrl-N` when defined agents exist).
+    pub pending_agent: Option<PendingAgent>,
+    /// The agent chosen for the most recent new session (`None` = default / no
+    /// agent). In-memory ONLY — never persisted to disk — so the NEXT `Ctrl-N`
+    /// pre-highlights it for a one-keystroke repeat.
+    last_new_agent: Option<String>,
     /// Whether the list/preview splitter is currently being dragged (mouse
     /// button down on the seam). Private: only the drag methods below need
     /// it, mirroring `scoped`/`preview_cache`/`index`.
@@ -334,6 +394,8 @@ impl App {
             status: None,
             live: HashMap::new(),
             pending_live: None,
+            pending_agent: None,
+            last_new_agent: None,
             dragging_split: false,
             scoped: Vec::new(),
             preview_cache: HashMap::new(),
@@ -523,11 +585,12 @@ impl App {
     // --- splitter drag -------------------------------------------------------
 
     /// Begin dragging the list/preview splitter (mouse-down on the seam). A
-    /// no-op while the running-session choice overlay owns input, so a stray
-    /// click during the overlay can never start a drag that a later `Drag`
-    /// event would then apply once the overlay closes.
+    /// no-op while ANY modal overlay owns input (the running-session choice or
+    /// the new-session agent picker), so a stray click during an overlay can
+    /// never start a drag that a later `Drag` event would then apply once the
+    /// overlay closes.
     pub fn begin_split_drag(&mut self) {
-        if self.pending_live.is_none() {
+        if !self.overlay_active() {
             self.dragging_split = true;
         }
     }
@@ -630,6 +693,57 @@ impl App {
     /// Dismiss the overlay, returning to the board.
     pub fn live_choice_cancel(&mut self) {
         self.pending_live = None;
+    }
+
+    // --- new-session agent picker -----------------------------------------
+
+    /// Whether ANY modal overlay currently owns the board (the running-session
+    /// choice or the new-session agent picker). Used to gate mouse actions
+    /// (splitter drag / link open) that must not fire while a modal is up.
+    #[must_use]
+    pub fn overlay_active(&self) -> bool {
+        self.pending_live.is_some() || self.pending_agent.is_some()
+    }
+
+    /// Open the new-session agent picker over `agents`, pre-highlighting the
+    /// last-picked agent (or the default entry when none was picked or it is
+    /// gone) via [`pick_default_index`]. The caller only opens this when
+    /// discovery found at least one agent — an empty launch dir skips straight to
+    /// a bare `claude`, so the common no-agent case keeps its zero-extra-keystroke
+    /// path.
+    pub fn open_agent_picker(&mut self, agents: Vec<DefinedAgent>) {
+        let selected = pick_default_index(self.last_new_agent.as_deref(), &agents);
+        self.pending_agent = Some(PendingAgent { agents, selected });
+    }
+
+    /// Move the picker highlight down one row (wraps). No-op if it is not open.
+    pub fn agent_pick_next(&mut self) {
+        self.cycle_agent_pick(1);
+    }
+
+    /// Move the picker highlight up one row (wraps). No-op if it is not open.
+    pub fn agent_pick_prev(&mut self) {
+        self.cycle_agent_pick(-1);
+    }
+
+    /// Shift the highlighted picker row by `delta`, wrapping across the default
+    /// entry and the discovered agents.
+    fn cycle_agent_pick(&mut self, delta: isize) {
+        if let Some(pending) = self.pending_agent.as_mut() {
+            let n = pending.len() as isize;
+            pending.selected = (pending.selected as isize + delta).rem_euclid(n) as usize;
+        }
+    }
+
+    /// Dismiss the picker without starting a session, returning to the board.
+    pub fn agent_pick_cancel(&mut self) {
+        self.pending_agent = None;
+    }
+
+    /// Remember the agent chosen for the last new session (`None` = default / no
+    /// agent), so the next `Ctrl-N` pre-highlights it. In-memory only.
+    pub fn set_last_new_agent(&mut self, agent: Option<String>) {
+        self.last_new_agent = agent;
     }
 
     // --- autorefresh reload -----------------------------------------------
@@ -1448,5 +1562,90 @@ mod tests {
 
         app.live_choice_cancel();
         assert!(app.pending_live.is_none(), "cancel returns to the board");
+    }
+
+    // --- new-session agent picker -----------------------------------------
+
+    fn def_agent(name: &str) -> DefinedAgent {
+        DefinedAgent {
+            name: name.to_string(),
+            description: None,
+        }
+    }
+
+    #[test]
+    fn pick_default_index_maps_last_agent_to_its_row_or_falls_back_to_default() {
+        let agents = vec![def_agent("alpha"), def_agent("beta")];
+        // No prior pick -> the default (no-agent) row 0.
+        assert_eq!(pick_default_index(None, &agents), 0);
+        // A prior pick maps to its row, offset by 1 for the leading default entry.
+        assert_eq!(pick_default_index(Some("alpha"), &agents), 1);
+        assert_eq!(pick_default_index(Some("beta"), &agents), 2);
+        // A prior pick that no longer exists (its file was removed) -> default.
+        assert_eq!(pick_default_index(Some("gone"), &agents), 0);
+    }
+
+    #[test]
+    fn agent_picker_opens_cycles_and_maps_the_selected_agent() {
+        let mut app = app_all(vec![session("s", "r", Some("main"), "/tmp/s")]);
+        assert!(app.pending_agent.is_none());
+
+        app.open_agent_picker(vec![def_agent("alpha"), def_agent("beta")]);
+        let pending = app.pending_agent.clone().expect("picker open");
+        // No prior pick -> row 0 (default / no agent).
+        assert_eq!(pending.selected, 0);
+        assert_eq!(pending.selected_agent(), None, "row 0 is the default entry");
+
+        // Down cycles default -> alpha -> beta -> (wrap) default.
+        app.agent_pick_next();
+        assert_eq!(
+            app.pending_agent.as_ref().unwrap().selected_agent(),
+            Some("alpha")
+        );
+        app.agent_pick_next();
+        assert_eq!(
+            app.pending_agent.as_ref().unwrap().selected_agent(),
+            Some("beta")
+        );
+        app.agent_pick_next();
+        assert_eq!(
+            app.pending_agent.as_ref().unwrap().selected_agent(),
+            None,
+            "the highlight wraps back to the default entry"
+        );
+        // Up wraps the other way to the last agent.
+        app.agent_pick_prev();
+        assert_eq!(
+            app.pending_agent.as_ref().unwrap().selected_agent(),
+            Some("beta")
+        );
+
+        app.agent_pick_cancel();
+        assert!(app.pending_agent.is_none(), "cancel returns to the board");
+    }
+
+    #[test]
+    fn open_agent_picker_pre_highlights_the_last_picked_agent() {
+        let mut app = app_all(vec![session("s", "r", Some("main"), "/tmp/s")]);
+        app.set_last_new_agent(Some("beta".to_string()));
+        app.open_agent_picker(vec![def_agent("alpha"), def_agent("beta")]);
+        // The last pick pre-highlights its row so Ctrl-N then Enter repeats it.
+        assert_eq!(
+            app.pending_agent.as_ref().unwrap().selected_agent(),
+            Some("beta"),
+            "the picker opens on the last-picked agent"
+        );
+    }
+
+    #[test]
+    fn agent_picker_counts_as_an_active_overlay_and_blocks_split_drag() {
+        let mut app = app_all(vec![session("s", "r", Some("main"), "/tmp/s")]);
+        app.open_agent_picker(vec![def_agent("alpha")]);
+        assert!(app.overlay_active(), "an open picker is an active overlay");
+        app.begin_split_drag();
+        assert!(
+            !app.is_dragging_split(),
+            "a stray click during the picker must not start a splitter drag"
+        );
     }
 }

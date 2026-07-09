@@ -19,7 +19,8 @@ one place.
 
 - **FAIL-SOFT parsing.** Parse JSONL as `serde_json::Value`, NEVER hard-typed
   deserialize structs. Skip bad lines/files; never panic on malformed input.
-  Same for `claude agents --json`. (`src/store/*`, `src/agents.rs`)
+  Same for `claude agents --json` and for DEFINED-agent frontmatter (hand-parsed,
+  no YAML crate). (`src/store/*`, `src/agents.rs`, `src/defined_agents.rs`)
 - **AUTHORITATIVE-FROM-FILE.** Read `cwd`/`sessionId` from INSIDE the file,
   never decode the `<encoded-cwd>` folder name (the `/`→`-` encoding is lossy).
   Re-read them at hand-off time. (`src/store/parse.rs`, `src/resume.rs`)
@@ -121,6 +122,17 @@ Full command reference and the validation checklist:
 
 ## Changelog
 
+- **2026-07-09** — Added DEFINED-agent selection for a new session: `Ctrl-N` opens
+  an agent picker (`claude --agent <name>`) when `~/.claude/agents/*.md` /
+  `<launch_dir>/.claude/agents/*.md` yield any, remembering the last pick
+  in-memory; new module `src/defined_agents.rs` (distinct from the live-agent
+  `src/agents.rs`). Threaded through `resume::build_new_argv`/`check_new` with a
+  new-session-specific non-zero hint, a `pending_agent` overlay in
+  `tui::{app,update,view}`, and key/agent docs refreshed.
+- **2026-07-08** — Documented the `Ctrl-N` new-session hand-off (bare `claude`
+  in the launch dir via `check_new`/`build_new_argv`) across `docs/agents/*`
+  (`DOMAIN.md` hand-off table, `ARCHITECTURE.md` resume row, `PATTERNS.md` pure
+  list + refusal gate).
 - **2026-07-06** — Initial `AGENTS.md` + `docs/agents/*` generated from the
   repository.
 

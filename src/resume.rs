@@ -66,6 +66,14 @@ pub struct Ready {
     pub cwd: PathBuf,
     /// The full argv to spawn; `argv[0]` is the program (always `claude`).
     pub argv: Vec<String>,
+    /// The neutral board hint shown if THIS child exits non-zero. Carried on the
+    /// plan (rather than fixed in [`launch`]) because a resume and a new session
+    /// fail for different reasons: a resume points at Fork/Attach
+    /// ([`RESUME_NONZERO_HINT`]), whereas a new session — which has no live
+    /// session and no fork target — points at the agent name instead
+    /// ([`NEW_SESSION_NONZERO_HINT`]). Reusing the resume wording on a new-session
+    /// failure would be actively misleading.
+    pub nonzero_hint: &'static str,
 }
 
 /// Neutral hint shown on the board when a resumed `claude` exits NON-ZERO.
@@ -75,6 +83,17 @@ pub struct Ready {
 /// message only points at the next moves rather than diagnosing.
 pub const RESUME_NONZERO_HINT: &str =
     "claude exited with an error — if this session is running, use Fork (Ctrl-F) or Attach.";
+
+/// Neutral hint shown when a NEW session's `claude` exits NON-ZERO.
+///
+/// A new session has no live agent to attach to and no session to fork, so the
+/// resume-worded hint would be wrong here. Like [`RESUME_NONZERO_HINT`] it does
+/// not assert a cause (a user Ctrl-C'ing a healthy fresh session also exits
+/// non-zero), but it points at the one new-session-specific failure mode: an
+/// invalid `--agent <name>` (built-in/plugin agents are not on-disk files, so the
+/// discovery list is incomplete and a hand-typed or stale pick can be rejected).
+pub const NEW_SESSION_NONZERO_HINT: &str =
+    "claude exited with an error — if you picked an agent, check that its name is valid.";
 
 /// Refusal shown when Attach is chosen for a session with no attachable agent
 /// job.
@@ -148,6 +167,30 @@ pub fn build_attach_argv(job_id: &str) -> Vec<String> {
     ]
 }
 
+/// Build the `claude` argv for STARTING a brand-new interactive session
+/// (bare `claude`, no `-r`), optionally bound to a selected agent.
+///
+/// Unlike [`build_argv`] (resume/fork) and [`build_attach_argv`] (reattach), a
+/// new session has no source file and no session id to pass — `claude` mints one
+/// itself. When `agent` is `Some(non-empty)`, `--agent <name>` is appended so the
+/// fresh session starts bound to that agent; when it is `None` — or `Some` of an
+/// empty/whitespace string, treated identically so a blank pick can never emit a
+/// bare `--agent` with no value — the invocation is just the program: `claude`.
+/// Pure so the exact invocation is directly assertable, and it funnels through the
+/// SAME [`launch`] round trip as every other hand-off.
+#[must_use]
+pub fn build_new_argv(agent: Option<&str>) -> Vec<String> {
+    let mut argv = vec!["claude".to_string()];
+    if let Some(name) = agent {
+        let name = name.trim();
+        if !name.is_empty() {
+            argv.push("--agent".to_string());
+            argv.push(name.to_string());
+        }
+    }
+    argv
+}
+
 /// Decide the Attach target from the matched live agent's agent-view `id`, or
 /// refuse.
 ///
@@ -165,16 +208,20 @@ fn attach_job_id(agent_id: Option<&str>) -> Result<&str, String> {
     }
 }
 
-/// Map a child's exit code to an optional board status.
+/// Map a child's exit code to an optional board status, using the hand-off's own
+/// neutral `hint` for the non-zero case.
 ///
 /// `Some(0)` (a clean exit) → `None` (no status). Any non-zero code, or `None`
-/// (killed by a signal, so no code) → the neutral [`RESUME_NONZERO_HINT`]. Pure
-/// so the exit-handling is unit-testable without actually spawning `claude`.
+/// (killed by a signal, so no code) → `Some(hint)`. `hint` is the plan's
+/// [`Ready::nonzero_hint`] so a resume points at Fork/Attach
+/// ([`RESUME_NONZERO_HINT`]) while a new session points at the agent name
+/// ([`NEW_SESSION_NONZERO_HINT`]). Pure so the exit-handling is unit-testable
+/// without actually spawning `claude`.
 #[must_use]
-pub fn status_for_exit(code: Option<i32>) -> Option<String> {
+pub fn status_for_exit(code: Option<i32>, hint: &str) -> Option<String> {
     match code {
         Some(0) => None,
-        _ => Some(RESUME_NONZERO_HINT.to_string()),
+        _ => Some(hint.to_string()),
     }
 }
 
@@ -246,6 +293,7 @@ pub fn check(session: &Session, fork: bool) -> Result<Ready, ResumeError> {
         } => Ok(Ready {
             argv: build_argv(&session_id, fork),
             cwd,
+            nonzero_hint: RESUME_NONZERO_HINT,
         }),
         ResumePlan::Refuse { message } => Err(ResumeError::Refused(message)),
     }
@@ -273,8 +321,39 @@ pub fn check_attach(session: &Session, agent_id: Option<&str>) -> Result<Ready, 
         ResumePlan::Ready { cwd, .. } => Ok(Ready {
             argv: build_attach_argv(job_id),
             cwd,
+            nonzero_hint: RESUME_NONZERO_HINT,
         }),
         ResumePlan::Refuse { message } => Err(ResumeError::Refused(message)),
+    }
+}
+
+/// Terminal-up gate for STARTING a brand-new session in the launch directory,
+/// optionally bound to a selected `agent`.
+///
+/// The counterpart of [`check`] for a session that does not exist yet. There is
+/// deliberately NO authoritative re-read here: a new session has no source file
+/// to read a `cwd` from, so the authoritative working directory is the launch dir
+/// itself (already canonicalized once in `App::launch_dir`). It reuses only the
+/// existence gate — the very predicate `plan_from_parts` applies to a resume: if
+/// `launch_dir` is still a directory, produce a [`Ready`] that `chdir`s there and
+/// spawns `claude` (bare, or `claude --agent <name>` when `agent` is
+/// `Some(non-empty)`) via the identical [`launch`] round trip; if it vanished
+/// (deleted out from under the board), refuse with a clear board status rather
+/// than crash. The plan carries [`NEW_SESSION_NONZERO_HINT`] so a non-zero exit
+/// surfaces the new-session hint, not the resume one.
+pub fn check_new(launch_dir: &Path, agent: Option<&str>) -> Result<Ready, ResumeError> {
+    if launch_dir.is_dir() {
+        Ok(Ready {
+            cwd: launch_dir.to_path_buf(),
+            argv: build_new_argv(agent),
+            nonzero_hint: NEW_SESSION_NONZERO_HINT,
+        })
+    } else {
+        Err(ResumeError::Refused(format!(
+            "The launch directory no longer exists:\n    {}\n\
+             Cannot start a new session there.",
+            launch_dir.display()
+        )))
     }
 }
 
@@ -291,8 +370,8 @@ fn command(argv: &[String]) -> Command {
 /// child inherits a clean, non-raw TTY (inherited stdin/stdout/stderr are the
 /// default for [`Command`]). This `chdir`s into the authoritative `cwd` first,
 /// then spawns `ready.argv` (`claude -r <id> [--fork-session]` for a
-/// resume/fork, or `claude attach <id>` for an Attach) and blocks until
-/// it exits.
+/// resume/fork, `claude attach <id>` for an Attach, or `claude [--agent <name>]`
+/// for a new session) and blocks until it exits.
 ///
 /// Returns `Ok(Some(status))` on a NON-ZERO / signalled child exit (a neutral
 /// board hint — see [`status_for_exit`]) and `Ok(None)` on a clean exit;
@@ -312,8 +391,9 @@ pub fn launch(ready: &Ready) -> Result<Option<String>, ResumeError> {
 
     let result = match command(&ready.argv).status() {
         // A clean exit shows nothing; a non-zero / signalled exit surfaces the
-        // neutral hint. Either way we return straight to the board.
-        Ok(status) => Ok(status_for_exit(status.code())),
+        // plan's own neutral hint (resume vs. new-session). Either way we return
+        // straight to the board.
+        Ok(status) => Ok(status_for_exit(status.code(), ready.nonzero_hint)),
         Err(spawn_err) => Err(ResumeError::Launch(format!(
             "failed to launch `{}`: {spawn_err}",
             ready.argv.join(" ")
@@ -507,6 +587,79 @@ mod tests {
     }
 
     #[test]
+    fn new_argv_is_bare_claude_when_no_agent() {
+        // A brand-new session with no agent mints its own id, so the invocation is
+        // just the program — no `-r`, no id, no `--agent`.
+        assert_eq!(build_new_argv(None).join(" "), "claude");
+    }
+
+    #[test]
+    fn new_argv_appends_agent_flag_when_an_agent_is_selected() {
+        // A selected agent binds the fresh session via `--agent <name>`.
+        assert_eq!(
+            build_new_argv(Some("code-reviewer")).join(" "),
+            "claude --agent code-reviewer"
+        );
+    }
+
+    #[test]
+    fn new_argv_treats_empty_or_whitespace_agent_as_none() {
+        // A blank / whitespace pick must never emit a valueless `--agent`; it
+        // collapses to a bare `claude`, identical to the `None` case.
+        assert_eq!(build_new_argv(Some("")).join(" "), "claude");
+        assert_eq!(build_new_argv(Some("   ")).join(" "), "claude");
+    }
+
+    #[test]
+    fn check_new_proceeds_for_an_existing_launch_dir() {
+        // The new-session gate is pure existence: an existing dir yields a Ready
+        // that chdirs there and spawns bare `claude`, with the launch dir itself
+        // as the authoritative cwd (no source file to re-read). It carries the
+        // new-session non-zero hint, NOT the resume-worded one.
+        let existing = std::env::temp_dir();
+        assert!(existing.is_dir(), "temp_dir should exist");
+        match check_new(&existing, None) {
+            Ok(Ready {
+                cwd,
+                argv,
+                nonzero_hint,
+            }) => {
+                assert_eq!(cwd, existing);
+                assert_eq!(argv, vec!["claude".to_string()]);
+                assert_eq!(nonzero_hint, NEW_SESSION_NONZERO_HINT);
+            }
+            Err(e) => panic!("an existing launch dir must proceed: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn check_new_carries_the_selected_agent_into_the_argv() {
+        // A selected agent threads through the gate into `claude --agent <name>`.
+        let existing = std::env::temp_dir();
+        match check_new(&existing, Some("planner")) {
+            Ok(ready) => {
+                assert_eq!(ready.argv.join(" "), "claude --agent planner");
+                assert_eq!(ready.nonzero_hint, NEW_SESSION_NONZERO_HINT);
+            }
+            Err(e) => panic!("an existing launch dir must proceed: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn check_new_refuses_a_missing_launch_dir() {
+        // A launch dir deleted out from under the board becomes a transient board
+        // status, never a crash.
+        let missing = PathBuf::from("/no/such/snapback/launch/dir/anywhere");
+        assert!(!missing.exists(), "test path must not exist");
+        match check_new(&missing, None) {
+            Err(ResumeError::Refused(message)) => {
+                assert!(message.contains("no longer exists"), "{message}");
+            }
+            other => panic!("a missing launch dir must refuse: {other:?}"),
+        }
+    }
+
+    #[test]
     fn attach_argv_reattaches_by_the_short_agent_view_job_id() {
         // Attach uses the one-shot `claude attach <job-id>` command, keyed on the
         // SHORT agent-view id (e.g. `ca56b543`), which is what `claude attach`
@@ -597,25 +750,45 @@ mod tests {
     #[test]
     fn nonzero_exit_yields_a_status_and_clean_exit_does_not() {
         assert_eq!(
-            status_for_exit(Some(0)),
+            status_for_exit(Some(0), RESUME_NONZERO_HINT),
             None,
             "a clean exit shows no status"
         );
         assert!(
-            status_for_exit(Some(1)).is_some(),
+            status_for_exit(Some(1), RESUME_NONZERO_HINT).is_some(),
             "a non-zero exit must surface a status"
         );
-        assert!(status_for_exit(Some(2)).is_some());
+        assert!(status_for_exit(Some(2), RESUME_NONZERO_HINT).is_some());
         assert!(
-            status_for_exit(None).is_some(),
+            status_for_exit(None, RESUME_NONZERO_HINT).is_some(),
             "a signalled exit (no code) must also surface a status"
         );
-        // The hint is NEUTRAL — it points at the next moves, not a specific cause.
-        let msg = status_for_exit(Some(1)).expect("non-zero has a message");
+        // The resume hint is NEUTRAL — it points at the next moves, not a cause.
+        let msg = status_for_exit(Some(1), RESUME_NONZERO_HINT).expect("non-zero has a message");
         let lower = msg.to_lowercase();
         assert!(
             lower.contains("fork") && lower.contains("attach"),
-            "the hint should point at Fork/Attach: {msg}"
+            "the resume hint should point at Fork/Attach: {msg}"
         );
+    }
+
+    #[test]
+    fn new_session_nonzero_exit_uses_the_new_session_hint_not_the_resume_one() {
+        // The new-session hint is routed by the plan (Ready::nonzero_hint), so a
+        // failed new session never surfaces the resume-worded Fork/Attach advice.
+        let msg = status_for_exit(Some(1), NEW_SESSION_NONZERO_HINT)
+            .expect("a non-zero new-session exit surfaces a status");
+        assert_eq!(msg, NEW_SESSION_NONZERO_HINT);
+        let lower = msg.to_lowercase();
+        assert!(
+            lower.contains("agent"),
+            "the new-session hint should mention the agent: {msg}"
+        );
+        assert!(
+            !lower.contains("fork") && !lower.contains("attach"),
+            "the new-session hint must NOT reuse the resume Fork/Attach wording: {msg}"
+        );
+        // A clean exit still shows nothing, whatever the hint.
+        assert_eq!(status_for_exit(Some(0), NEW_SESSION_NONZERO_HINT), None);
     }
 }
