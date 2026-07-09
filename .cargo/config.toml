@@ -1,0 +1,12 @@
+# Project-local cargo command aliases. Invoke as `cargo <alias>`.
+# Aliases only extend cargo (they cannot shadow built-in subcommands) and are
+# scoped to this repo, so they stay out of the global toolchain.
+[alias]
+# Run the TUI from source for local iteration.
+"run:dev" = "run --bin snapback"
+# Install both binaries (snapback + sb) from this checkout onto PATH.
+# Key is quoted because the ':' makes it a non-bare TOML key.
+link = "install --path ."
+"link:dev" = "install --debug --path ."
+# Optimized production build. Extend with more steps here as the pipeline grows.
+release = "build --release"
