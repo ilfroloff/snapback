@@ -122,6 +122,14 @@ Full command reference and the validation checklist:
 
 ## Changelog
 
+- **2026-07-09** — Split the header version indicator by build profile. Release
+  builds still show `v<crate-version>`; local debug builds now show
+  `dev+<git-short-hash>` with a trailing `-dirty` when the working tree had
+  uncommitted changes at build time. New fail-soft `build.rs` captures the hash
+  and dirty flag into `SNAPBACK_GIT_HASH`/`SNAPBACK_GIT_DIRTY` (degrades to
+  `unknown`/`0` outside a repo); `tui::view::version_label` branches on
+  `cfg!(debug_assertions)` via the pure, unit-tested `format_version_label`.
+  Docs refreshed (`ARCHITECTURE.md` module map + view row, `README.md` header).
 - **2026-07-09** — Added DEFINED-agent selection for a new session: `Ctrl-N` opens
   an agent picker (`claude --agent <name>`) when `~/.claude/agents/*.md` /
   `<launch_dir>/.claude/agents/*.md` yield any, remembering the last pick

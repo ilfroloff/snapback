@@ -54,7 +54,8 @@ before any TUI code runs on top of it.
 | `tui` | `src/tui/mod.rs` | Terminal setup/teardown (+ panic hook) and the draw/event `run` loop. |
 | `tui::app` | `src/tui/app.rs` | The `App` model — all TUI state, pure state transitions, no terminal I/O. |
 | `tui::update` | `src/tui/update.rs` | Elm-style event→state dispatch: `key_to_action`, `handle_event`, mouse routing (wheel scroll, splitter drag, preview link click-to-open), and the two overlay state machines (running-session choice + new-session agent picker). |
-| `tui::view` | `src/tui/view.rs` | Rendering: two-pane grouped list + preview, header/search/help lines, running-session overlay + new-session agent picker. Owns the pure wrap-mapping (`wrapped_line_height`/`link_at`) that hit-tests a click to a preview link. |
+| `tui::view` | `src/tui/view.rs` | Rendering: two-pane grouped list + preview, header/search/help lines, running-session overlay + new-session agent picker. The header's right-aligned version indicator branches on `cfg!(debug_assertions)`: release builds show `v<crate-version>`, dev builds `dev+<git-hash>[-dirty]` (pure `format_version_label`). Owns the pure wrap-mapping (`wrapped_line_height`/`link_at`) that hit-tests a click to a preview link. |
+| `build` | `build.rs` | Build script (compile-time, not a runtime module): fail-soft `git rev-parse`/`status` into `SNAPBACK_GIT_HASH`/`SNAPBACK_GIT_DIRTY` env vars for the dev version indicator; degrades to `unknown`/`0` outside a repo. |
 
 ## Runtime architecture
 
