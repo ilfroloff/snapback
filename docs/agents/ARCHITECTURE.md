@@ -47,13 +47,14 @@ before any TUI code runs on top of it.
 | `store::label` | `src/store/label.rs` | Label preference (summary → first real user prompt → session id). |
 | `store::preview` | `src/store/preview.rs` | Transcript → `RenderedPreview` (styled ratatui `Text` + clickable `LinkRegion`s), self-contained markdown pass. |
 | `search` | `src/search.rs` | The **only** place `nucleo` is called: substring index, incremental re-filter, highlight seam. |
-| `agents` | `src/agents.rs` | Live-agent detection via `claude agents --json` (fail-soft parse). |
+| `agents` | `src/agents.rs` | Live/RUNNING-agent detection via `claude agents --json` (fail-soft parse); drives the Attach/Fork overlay. |
+| `defined_agents` | `src/defined_agents.rs` | DEFINED-agent discovery for a new session: fail-soft frontmatter scan of `~/.claude/agents/*.md` + `<launch_dir>/.claude/agents/*.md`, deduped (project over user). Distinct from `agents` (live vs. defined). |
 | `watch` | `src/watch.rs` | Debounced FS watcher + `EventLoop` that merges input/watcher/tick/agents onto one channel. |
-| `resume` | `src/resume.rs` | Resume/fork/attach hand-off: re-read authoritative parts, existence gate, spawn `claude`, return. |
+| `resume` | `src/resume.rs` | Resume/fork/attach/new-session hand-off: re-read authoritative parts (or, for a new session, gate on the launch dir + optional `--agent <name>`), existence gate, spawn `claude`, return. Each `Ready` carries its own neutral non-zero hint (resume vs. new-session). |
 | `tui` | `src/tui/mod.rs` | Terminal setup/teardown (+ panic hook) and the draw/event `run` loop. |
 | `tui::app` | `src/tui/app.rs` | The `App` model — all TUI state, pure state transitions, no terminal I/O. |
-| `tui::update` | `src/tui/update.rs` | Elm-style event→state dispatch: `key_to_action`, `handle_event`, mouse routing (wheel scroll, splitter drag, preview link click-to-open), overlay state machine. |
-| `tui::view` | `src/tui/view.rs` | Rendering: two-pane grouped list + preview, header/search/help lines, running-session overlay. Owns the pure wrap-mapping (`wrapped_line_height`/`link_at`) that hit-tests a click to a preview link. |
+| `tui::update` | `src/tui/update.rs` | Elm-style event→state dispatch: `key_to_action`, `handle_event`, mouse routing (wheel scroll, splitter drag, preview link click-to-open), and the two overlay state machines (running-session choice + new-session agent picker). |
+| `tui::view` | `src/tui/view.rs` | Rendering: two-pane grouped list + preview, header/search/help lines, running-session overlay + new-session agent picker. Owns the pure wrap-mapping (`wrapped_line_height`/`link_at`) that hit-tests a click to a preview link. |
 
 ## Runtime architecture
 

@@ -16,6 +16,7 @@
 
 mod agents;
 mod cli;
+mod defined_agents;
 mod resume;
 mod search;
 mod store;

@@ -48,6 +48,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if app.pending_live.is_some() {
         render_live_choice(frame, app);
     }
+    // The new-session agent picker likewise overlays the board. The two are
+    // mutually exclusive (each owns the keyboard while open), so at most one draws.
+    if app.pending_agent.is_some() {
+        render_agent_pick(frame, app);
+    }
 }
 
 /// Prefix for the version indicator (`v0.1.0`); the leading `v` is the
@@ -589,7 +594,7 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
             )])
         }
         None => Line::from(vec![Span::styled(
-            "↑↓/jk move · Enter resume · ^F fork · type to search · Tab name/content · ^A scope · ^/ preview · PgUp/PgDn·^U/^D·Home/End·wheel scroll · q/Esc quit",
+            "↑↓/jk move · Enter resume · ^F fork · ^N new · type to search · Tab name/content · ^A scope · ^/ preview · PgUp/PgDn·^U/^D·Home/End·wheel scroll · q/Esc quit",
             Style::default().add_modifier(Modifier::DIM),
         )]),
     };
@@ -646,6 +651,100 @@ fn render_live_choice(frame: &mut Frame, app: &App) {
             .alignment(Alignment::Center),
         area,
     );
+}
+
+/// Fixed width (columns) of the new-session agent picker overlay, matching the
+/// running-session choice overlay's footprint so the two modals feel of a piece;
+/// [`centered_rect`] shrinks it to fit on a tiny terminal.
+const AGENT_PICK_WIDTH: u16 = 62;
+
+/// Non-entry rows the agent picker always draws around its selectable list: a
+/// title line, a blank spacer above the list, a blank spacer below it, and a
+/// footer help line. Named so the overlay height (entries + this chrome + the two
+/// border rows) carries no bare magic number.
+const AGENT_PICK_CHROME_ROWS: u16 = 4;
+
+/// The new-session agent picker overlay: a centered vertical list of the
+/// discovered agents, preceded by a "default (no agent)" entry, with the
+/// highlighted row reversed.
+///
+/// Drawn last (on top of the board) with a [`Clear`] so the board shows through
+/// only outside the box. The selectable rows and the highlight live in [`App`], so
+/// this is pure presentation. Row 0 is the synthetic default (no-agent) entry; the
+/// rest map to `pending.agents` in order (mirroring `PendingAgent::selected_agent`).
+fn render_agent_pick(frame: &mut Frame, app: &App) {
+    let Some(pending) = &app.pending_agent else {
+        return;
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "Start a new session — pick an agent:",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+    // Row 0: the default (no-agent) entry; then one row per discovered agent.
+    lines.push(agent_entry_line(
+        "default (no agent)",
+        None,
+        pending.selected == 0,
+    ));
+    for (i, agent) in pending.agents.iter().enumerate() {
+        lines.push(agent_entry_line(
+            &agent.name,
+            agent.description.as_deref(),
+            pending.selected == i + 1,
+        ));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "↑/↓ choose · Enter start · Esc cancel",
+        Style::default().add_modifier(Modifier::DIM),
+    )));
+
+    // Height: entry rows (default + each agent) + the fixed chrome + two borders.
+    let entry_rows = pending.agents.len() as u16 + 1;
+    let height = entry_rows
+        .saturating_add(AGENT_PICK_CHROME_ROWS)
+        .saturating_add(2);
+    let area = centered_rect(frame.area(), AGENT_PICK_WIDTH, height);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" new session ");
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// One row of the agent picker: a `› ` marker + reversed, bold name when
+/// selected (the same highlight glyph the list uses), else a padded name, with an
+/// optional dim description trailing. Owns its text (`'static`) so it composes
+/// into the picker `Paragraph`.
+fn agent_entry_line(name: &str, description: Option<&str>, selected: bool) -> Line<'static> {
+    let (marker, name_style) = if selected {
+        (
+            "› ",
+            Style::default()
+                .add_modifier(Modifier::REVERSED)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        ("  ", Style::default())
+    };
+    let mut spans = vec![
+        Span::raw(marker),
+        Span::styled(name.to_string(), name_style),
+    ];
+    if let Some(desc) = description {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            desc.to_string(),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
+    Line::from(spans)
 }
 
 /// A centered `width`x`height` (cells) rect within `area`, clamped so it never
@@ -1372,5 +1471,77 @@ mod tests {
                 "a genuine partial scroll must detach the thumb from the {label} track row"
             );
         }
+    }
+
+    // --- new-session agent picker overlay ---------------------------------
+
+    use crate::defined_agents::DefinedAgent;
+
+    #[test]
+    fn agent_entry_line_marks_the_selected_row_and_trails_the_description() {
+        // A selected row leads with the highlight marker and reverses the name.
+        let sel = agent_entry_line("planner", Some("plans work"), true);
+        let text: String = sel.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.starts_with("› "),
+            "a selected row leads with the highlight marker: {text:?}"
+        );
+        assert!(text.contains("planner") && text.contains("plans work"));
+        let name = sel
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "planner")
+            .expect("the name span is present");
+        assert!(
+            name.style.add_modifier.contains(Modifier::REVERSED),
+            "the selected name is reversed"
+        );
+
+        // An unselected, description-less row is padded and not reversed.
+        let unsel = agent_entry_line("planner", None, false);
+        let text: String = unsel.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(
+            text, "  planner",
+            "unselected row is padded, no description"
+        );
+        let name = unsel
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "planner")
+            .expect("the name span is present");
+        assert!(
+            !name.style.add_modifier.contains(Modifier::REVERSED),
+            "an unselected name is not reversed"
+        );
+    }
+
+    #[test]
+    fn render_draws_the_agent_picker_overlay_without_panicking() {
+        // Full-frame render with the picker open must lay the overlay out (height
+        // math + centering) and draw over the board without panicking.
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.open_agent_picker(vec![
+            DefinedAgent {
+                name: "planner".to_string(),
+                description: Some("plans work".to_string()),
+            },
+            DefinedAgent {
+                name: "reviewer".to_string(),
+                description: None,
+            },
+        ]);
+        let mut terminal =
+            Terminal::new(TestBackend::new(80, 24)).expect("build an in-memory test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("render must not panic with the agent picker open");
+        assert!(
+            app.pending_agent.is_some(),
+            "rendering must not disturb the open picker"
+        );
     }
 }

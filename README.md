@@ -18,7 +18,9 @@ It exists because the built-in `/resume` picker is **per-project** and offers
    changed, or removed - no restart.
 4. **Folder scoping:** by default only the sessions launched from the current
    directory are shown; one key (or `--all`) widens to every folder.
-5. One keystroke to **resume** (or **fork**) the chosen session via `claude -r`.
+5. One keystroke to **resume** (or **fork**) the chosen session via `claude -r`,
+   or to **start a new session** in the launch directory (`Ctrl-N`) — optionally
+   binding it to one of your Claude Code **agents** via a quick picker.
 
 This is a personal CLI tool, not part of any application. It is a single,
 self-contained crate that depends on nothing outside its own `Cargo.toml` and
@@ -88,6 +90,7 @@ filters live. `Tab` widens the match from name-only to name+content (below).
 | `j` / `k`          | Move selection - **only while the query is empty**; once you are typing, `j`/`k` are ordinary search characters |
 | `Enter`            | **Resume** the selected session (`chdir` to its `cwd`, spawn `claude -r <id>` as a child, then **return to the board** when it exits). If the session is **running** (has a live badge), Enter instead opens an **Attach / Fork / Cancel** choice - see below |
 | `Ctrl-F`           | **Fork** it instead (`claude -r <id> --fork-session`; also returns to the board). Available for **any** session, running or not |
+| `Ctrl-N`           | **Start a new session** in the launch directory (spawns `claude` in the folder `snapback` was launched from, then **returns to the board** when it exits). If you have Claude Code **agents** defined, it first opens an **agent picker** (`↑`/`↓` to choose, `Enter` to start, `Esc` to cancel) with a `default (no agent)` entry first; the last agent you picked is pre-highlighted. With no agents defined it launches a bare `claude` directly - see below |
 | `Tab`              | Toggle search mode: **name-only ↔ name+content**                |
 | `Ctrl-A`           | Toggle scope: **current folder ↔ all folders**                  |
 | `Ctrl-/`           | Toggle the transcript **preview** pane                           |
@@ -194,6 +197,29 @@ without ever blocking the UI. If detection is unavailable it simply degrades to
   - **Cancel** dismisses the overlay and stays on the board.
 - **Enter on a non-running row** is an ordinary resume, and **`Ctrl-F` fork**
   stays available for **any** session, running or not.
+
+### New sessions: start with an agent (`Ctrl-N`)
+
+`Ctrl-N` starts a **fresh** `claude` session in the directory `snapback` was
+launched from, then returns to the board when it exits. If you have **Claude
+Code agents** defined, it first opens a small **agent picker** so the new session
+can start bound to one (`claude --agent <name>`):
+
+- The picker lists a **`default (no agent)`** entry first, then your discovered
+  agents (name plus a dim description). `↑`/`↓` (or `k`/`j`) choose, `Enter`
+  starts, `Esc`/`Ctrl-C` cancel back to the board.
+- The **last agent you picked** is pre-highlighted, so repeating a choice is just
+  `Ctrl-N` then `Enter`. That memory is **in-memory only** - it resets when you
+  quit `snapback`, and nothing is written to disk.
+- Agents are discovered **fail-soft** from Markdown files with YAML frontmatter
+  under `~/.claude/agents/*.md` (user-level) and `<launch-dir>/.claude/agents/*.md`
+  (project-level, which overrides a same-named user agent). Unreadable or
+  malformed files are simply skipped.
+- This list is a **convenience**: built-in and plugin agents are not on-disk
+  files, so the scan cannot see them. Pick `default (no agent)` to launch a bare
+  `claude` (and pass the agent yourself), or type/select from what was found.
+- If **no** agents are discovered, `Ctrl-N` skips the picker entirely and starts
+  a bare `claude` immediately - one keystroke, exactly as before.
 
 ### Readable transcript preview (`Ctrl-/`)
 

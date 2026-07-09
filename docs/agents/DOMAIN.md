@@ -139,6 +139,7 @@ autorefresh reload.
 | Resume | `claude -r <id>` (`<id>` = full `sessionId`) |
 | Fork | `claude -r <id> --fork-session` (`<id>` = full `sessionId`) |
 | Attach | `claude attach <job-id>` (one-shot reattach; `<job-id>` = the **short agent-view id** from `claude agents --json`, **not** the `sessionId`) |
+| New session | `claude [--agent <name>]` (bare interactive launch, no `-r` — mints its own id; started in `App::launch_dir` via `Ctrl-N`, optionally bound to a picked agent) |
 
 `claude attach` matches the agent-view **job id** (the short id), not the full
 `sessionId` — a full UUID exits 1 ("No job matching"). Only **background** agents
@@ -151,4 +152,18 @@ Before any hand-off, `cwd` and `sessionId` are **re-read from inside the file**
 (authoritative at hand-off time) and the `cwd` must still exist on disk;
 otherwise the board surfaces a refusal (deleted worktrees are common) and stays
 up. Attach still `chdir`s into that authoritative `cwd`, but its argv is keyed on
-the agent-view job id rather than the re-read `sessionId`.
+the agent-view job id rather than the re-read `sessionId`. **New session** is the
+exception: it has no source file to re-read, so `resume::check_new` gates on the
+existence of `App::launch_dir` itself and uses that dir as the authoritative
+`cwd`. All four escalate to the same `Outcome::Resume` round trip.
+
+A new session can also be **bound to a DEFINED agent** (`claude --agent <name>`).
+These are DISTINCT from the live/running agents above: they are on-disk
+definitions discovered fail-soft (`src/defined_agents.rs`) from Markdown files
+with YAML frontmatter under `~/.claude/agents/*.md` (user) and
+`<launch_dir>/.claude/agents/*.md` (project overrides user by `name`). The list
+is a convenience — built-in/plugin agents are not files, so it is inherently
+incomplete; the picker always offers a `default (no agent)` bare launch and never
+blocks on it. `Ctrl-N` opens the picker only when at least one agent is
+discovered (otherwise it launches bare `claude` directly), pre-highlighting the
+last-picked agent, which `App` remembers **in-memory only** (never persisted).

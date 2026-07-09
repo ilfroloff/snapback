@@ -19,6 +19,7 @@
 //! | `j` / `k` | move selection (only while the query is empty; otherwise typed) |
 //! | `Enter` | resume the selected session |
 //! | `Ctrl-F` | fork-resume the selected session |
+//! | `Ctrl-N` | start a new session in the launch directory (pick an agent when any are defined) |
 //! | `Tab` | toggle name-only vs. name+content search |
 //! | `Ctrl-A` | toggle scope (current-folder <-> all) |
 //! | `Ctrl-/` | toggle the preview pane |
@@ -42,6 +43,7 @@ use crossterm::event::{
 };
 use ratatui::layout::{Margin, Position, Rect};
 
+use crate::defined_agents;
 use crate::resume::{self, Ready};
 use crate::store::SessionStore;
 use crate::watch::AppEvent;
@@ -65,6 +67,12 @@ pub enum Action {
         /// Whether to fork the session (`Ctrl-F`) rather than plain resume.
         fork: bool,
     },
+    /// Start a brand-new `claude` session in the launch directory (`Ctrl-N`).
+    /// When defined agents exist, [`apply_action`] opens the agent picker first;
+    /// otherwise (or once a pick is confirmed) the launch-dir existence gate and
+    /// the `claude` hand-off are decided there and a confirmed plan surfaces as
+    /// [`Outcome::Resume`].
+    NewSession,
     /// Toggle name-only vs. name+content search.
     ToggleSearchMode,
     /// Toggle current-folder vs. all scope.
@@ -124,6 +132,7 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool) -> Action {
             // control code 0x1f surface it as Char('_'); accept both.
             KeyCode::Char('/') | KeyCode::Char('_') => Action::TogglePreview,
             KeyCode::Char('a') | KeyCode::Char('A') => Action::ToggleScope,
+            KeyCode::Char('n') | KeyCode::Char('N') => Action::NewSession,
             KeyCode::Char('c') | KeyCode::Char('C') => Action::Quit,
             // Quarter-page preview scroll (readline-style). Acts regardless of
             // the query, like the arrows, so search never blocks preview scrolling.
@@ -177,6 +186,10 @@ pub fn handle_event(app: &mut App, event: AppEvent, root: &Path) -> Outcome {
             // keyboard: keys navigate/confirm/cancel the overlay, never the board.
             if app.pending_live.is_some() {
                 return handle_live_choice_key(app, key);
+            }
+            // The new-session agent picker likewise owns the keyboard while open.
+            if app.pending_agent.is_some() {
+                return handle_agent_pick_key(app, key);
             }
             // A transient status (e.g. a resume refusal) lives exactly until the
             // next key; clear it first so this keypress may set a fresh one.
@@ -290,10 +303,11 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
             app.begin_split_drag();
         }
         // A left-click inside the preview pane (the seam-drag arm above already
-        // claimed the border). Gated by the overlay like the drag, so a click
-        // while the running-session choice owns input never opens a link.
+        // claimed the border). Gated by any modal overlay like the drag, so a
+        // click while the running-session choice or the agent picker owns input
+        // never opens a link.
         MouseEventKind::Down(MouseButton::Left)
-            if app.pending_live.is_none()
+            if !app.overlay_active()
                 && app.preview_rect.contains(Position {
                     x: mouse.column,
                     y: mouse.row,
@@ -378,6 +392,7 @@ fn apply_action(app: &mut App, action: Action) -> Outcome {
                 None => Outcome::Continue,
             }
         }
+        Action::NewSession => new_session(app),
         Action::ToggleSearchMode => {
             app.toggle_search_mode();
             Outcome::Continue
@@ -529,6 +544,112 @@ fn route_handoff(app: &mut App, session_id: &str, kind: Handoff) -> Outcome {
         }
         None => Outcome::Continue,
     }
+}
+
+/// Handle `Ctrl-N`. When defined agents exist for the launch dir, OPEN the agent
+/// picker (pre-highlighted on the last pick) and stay on the board; otherwise
+/// launch a bare `claude` immediately, so the common no-agent case keeps its
+/// zero-extra-keystroke path. Discovery is FAIL-SOFT — any error yields an empty
+/// list, which just means the bare-launch branch (see
+/// [`defined_agents::discover_agents`]).
+fn new_session(app: &mut App) -> Outcome {
+    let agents = defined_agents::discover_agents(&app.launch_dir);
+    if agents.is_empty() {
+        // No selectable agents: a one-entry picker would be pure friction —
+        // launch straight into a bare `claude`, exactly as before agents existed.
+        return launch_new_session(app, None);
+    }
+    app.open_agent_picker(agents);
+    Outcome::Continue
+}
+
+/// Run the new-session existence gate for `agent` (`None` = no agent) while the
+/// terminal is still up, and escalate a confirmed plan to [`Outcome::Resume`]; a
+/// refusal (a deleted launch dir) sets a transient board status. Shared by the
+/// no-agent fast path and the picker confirm so the gate + status handling live
+/// in one place. `check_new` returns an owned `Result`, so the `&launch_dir`
+/// borrow is released before we mutably touch `app` for `set_status`.
+fn launch_new_session(app: &mut App, agent: Option<&str>) -> Outcome {
+    match resume::check_new(&app.launch_dir, agent) {
+        Ok(ready) => Outcome::Resume(ready),
+        Err(err) => {
+            app.set_status(err.message().to_string());
+            Outcome::Continue
+        }
+    }
+}
+
+/// A decoded intent while the new-session agent picker owns the keyboard.
+enum AgentNav {
+    /// Move the highlight down one row (`↓`/`Tab`/`j`).
+    Next,
+    /// Move the highlight up one row (`↑`/`k`).
+    Prev,
+    /// Start the session bound to the highlighted agent (`Enter`).
+    Confirm,
+    /// Dismiss the picker without starting a session (`Esc`/`Ctrl-C`).
+    Cancel,
+    /// A key with no binding in the picker.
+    Ignore,
+}
+
+/// Map a keypress to an [`AgentNav`] while the agent picker is open. The picker
+/// is a vertical list, so Up/Down (and `k`/`j`, mirroring the board's nav keys)
+/// move the highlight; `Tab` also steps forward for parity with the running-
+/// session overlay.
+fn agent_pick_key(key: KeyEvent) -> AgentNav {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return match key.code {
+            KeyCode::Char('c') | KeyCode::Char('C') => AgentNav::Cancel,
+            _ => AgentNav::Ignore,
+        };
+    }
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => AgentNav::Prev,
+        KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => AgentNav::Next,
+        KeyCode::Enter => AgentNav::Confirm,
+        KeyCode::Esc => AgentNav::Cancel,
+        _ => AgentNav::Ignore,
+    }
+}
+
+/// Apply a picker keypress: navigation stays on the board; Confirm starts the
+/// chosen agent's session; Esc/Ctrl-C dismiss.
+fn handle_agent_pick_key(app: &mut App, key: KeyEvent) -> Outcome {
+    match agent_pick_key(key) {
+        AgentNav::Next => {
+            app.agent_pick_next();
+            Outcome::Continue
+        }
+        AgentNav::Prev => {
+            app.agent_pick_prev();
+            Outcome::Continue
+        }
+        AgentNav::Cancel => {
+            app.agent_pick_cancel();
+            Outcome::Continue
+        }
+        AgentNav::Confirm => confirm_agent_pick(app),
+        AgentNav::Ignore => Outcome::Continue,
+    }
+}
+
+/// Resolve the highlighted picker row into a driver [`Outcome`].
+///
+/// Records the chosen agent as the last pick (so the next `Ctrl-N` repeats it),
+/// closes the picker, and runs the new-session gate for it — a confirmed plan
+/// escalates to [`Outcome::Resume`] through the IDENTICAL teardown→spawn→wait→
+/// return round trip as a resume; a refusal sets a board status. The clone
+/// releases the `pending_agent` borrow before `set_last_new_agent` / `check_new`
+/// re-borrow `app`.
+fn confirm_agent_pick(app: &mut App) -> Outcome {
+    let Some(pending) = app.pending_agent.clone() else {
+        return Outcome::Continue;
+    };
+    let agent = pending.selected_agent().map(str::to_owned);
+    app.set_last_new_agent(agent.clone());
+    app.agent_pick_cancel();
+    launch_new_session(app, agent.as_deref())
 }
 
 #[cfg(test)]
@@ -1103,6 +1224,23 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_n_starts_a_new_session_regardless_of_query() {
+        // Ctrl-N is an always-available action key (like Ctrl-F / Ctrl-A): it
+        // never becomes query input, so it maps to NewSession whether or not the
+        // user is mid-query. Both `n` and `N` (Shift) decode the same.
+        for empty in [true, false] {
+            assert_eq!(
+                key_to_action(ctrl(KeyCode::Char('n')), empty),
+                Action::NewSession
+            );
+            assert_eq!(
+                key_to_action(ctrl(KeyCode::Char('N')), empty),
+                Action::NewSession
+            );
+        }
+    }
+
+    #[test]
     fn toggles_are_reachable_regardless_of_query() {
         // Tab toggles search mode; Ctrl-A scope; Ctrl-/ preview.
         assert_eq!(
@@ -1179,5 +1317,113 @@ mod tests {
         );
         assert!(!is_actionable(released), "release events must be ignored");
         assert!(is_actionable(key(KeyCode::Char('q'))), "press events act");
+    }
+
+    // --- new-session agent picker -----------------------------------------
+
+    use crate::defined_agents::DefinedAgent;
+
+    fn def_agent(name: &str) -> DefinedAgent {
+        DefinedAgent {
+            name: name.to_string(),
+            description: None,
+        }
+    }
+
+    #[test]
+    fn agent_pick_key_maps_navigation_confirm_and_cancel() {
+        // The picker is a vertical list: Up/Down (and k/j, plus Tab forward)
+        // navigate; Enter confirms; Esc / Ctrl-C cancel.
+        assert!(matches!(agent_pick_key(key(KeyCode::Down)), AgentNav::Next));
+        assert!(matches!(
+            agent_pick_key(key(KeyCode::Char('j'))),
+            AgentNav::Next
+        ));
+        assert!(matches!(agent_pick_key(key(KeyCode::Tab)), AgentNav::Next));
+        assert!(matches!(agent_pick_key(key(KeyCode::Up)), AgentNav::Prev));
+        assert!(matches!(
+            agent_pick_key(key(KeyCode::Char('k'))),
+            AgentNav::Prev
+        ));
+        assert!(matches!(
+            agent_pick_key(key(KeyCode::Enter)),
+            AgentNav::Confirm
+        ));
+        assert!(matches!(
+            agent_pick_key(key(KeyCode::Esc)),
+            AgentNav::Cancel
+        ));
+        assert!(matches!(
+            agent_pick_key(ctrl(KeyCode::Char('c'))),
+            AgentNav::Cancel
+        ));
+    }
+
+    #[test]
+    fn picker_confirm_on_the_default_row_starts_a_bare_claude() {
+        // `app_with` uses `/tmp` as the launch dir (exists), so the new-session
+        // gate proceeds and the default (row 0) confirms to a bare `claude`.
+        let mut app = app_with("s", None);
+        app.open_agent_picker(vec![def_agent("planner"), def_agent("reviewer")]);
+        let out = press(&mut app, KeyCode::Enter);
+        match out {
+            Outcome::Resume(ready) => assert_eq!(ready.argv.join(" "), "claude"),
+            _ => panic!("the default pick must start a bare claude"),
+        }
+        assert!(app.pending_agent.is_none(), "confirm closes the picker");
+    }
+
+    #[test]
+    fn picker_confirm_on_an_agent_row_binds_it_and_remembers_the_pick() {
+        let mut app = app_with("s", None);
+        app.open_agent_picker(vec![def_agent("planner"), def_agent("reviewer")]);
+        // Down once from the default row -> the first agent (planner).
+        press(&mut app, KeyCode::Down);
+        assert_eq!(
+            app.pending_agent.as_ref().unwrap().selected_agent(),
+            Some("planner")
+        );
+        let out = press(&mut app, KeyCode::Enter);
+        match out {
+            Outcome::Resume(ready) => {
+                assert_eq!(ready.argv.join(" "), "claude --agent planner");
+                // The plan carries the new-session hint, not the resume one.
+                assert_eq!(ready.nonzero_hint, resume::NEW_SESSION_NONZERO_HINT);
+            }
+            _ => panic!("an agent pick must start `claude --agent planner`"),
+        }
+        // The pick is remembered in-memory: the NEXT picker pre-highlights it.
+        app.open_agent_picker(vec![def_agent("planner"), def_agent("reviewer")]);
+        assert_eq!(
+            app.pending_agent.as_ref().unwrap().selected_agent(),
+            Some("planner"),
+            "the last pick pre-highlights on the next Ctrl-N"
+        );
+    }
+
+    #[test]
+    fn picker_esc_dismisses_without_starting_a_session() {
+        let mut app = app_with("s", None);
+        app.open_agent_picker(vec![def_agent("planner")]);
+        let out = press(&mut app, KeyCode::Esc);
+        assert!(matches!(out, Outcome::Continue));
+        assert!(app.pending_agent.is_none(), "Esc dismisses the picker");
+    }
+
+    #[test]
+    fn keys_route_to_the_picker_not_the_board_while_it_is_open() {
+        // While the picker owns the keyboard, a printable char is an inert picker
+        // keypress — it must not type into the query or touch the board.
+        let mut app = app_with("s", None);
+        app.open_agent_picker(vec![def_agent("planner")]);
+        press(&mut app, KeyCode::Char('x'));
+        assert!(
+            app.query.is_empty(),
+            "a key during the picker must not type into the query"
+        );
+        assert!(
+            app.pending_agent.is_some(),
+            "an inert key leaves the picker open"
+        );
     }
 }

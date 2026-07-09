@@ -28,8 +28,9 @@ OPTIONS:
 
 KEYS:
     ↑/↓, j/k      move          Enter        resume (returns to the board on exit)
-    Ctrl-F        fork          Tab          toggle name / name+content search
+    Ctrl-F        fork          Ctrl-N       new session in the launch dir (pick an agent)
     Ctrl-A        toggle scope  Ctrl-/       toggle preview
+    Tab           toggle name / name+content search
     PgUp/PgDn     preview page  Ctrl-U/Ctrl-D  preview quarter-page
     Home/End      preview top / bottom
     wheel         scroll preview / list (mouse mode on; hold Shift/Option to select)
