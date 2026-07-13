@@ -78,6 +78,11 @@ one place.
   `GIT_COMMIT_INSTRUCTIONS.md` first.
 - **NEVER** commit gitignored files, and NEVER use `git add -f` or similar force
   commands to bypass `.gitignore` (notably `/target`).
+- **Commit TYPE now drives the released version.** release-plz maps Conventional
+  Commit types to the next `vX.Y.Z` bump on every merge to `main`, so choosing the
+  accurate type per `GIT_COMMIT_INSTRUCTIONS.md` is exactly what the next release
+  is computed from. See the release flow in
+  [docs/agents/OPERATIONS.md](docs/agents/OPERATIONS.md#how-a-release-happens).
 
 ## Self-healing stage (do before finishing)
 
@@ -110,7 +115,7 @@ Full command reference and the validation checklist:
 | Module map, stack, runtime wiring | [docs/agents/ARCHITECTURE.md](docs/agents/ARCHITECTURE.md) |
 | Session format, JSONL fields, domain concepts | [docs/agents/DOMAIN.md](docs/agents/DOMAIN.md) |
 | Implementation + testing conventions | [docs/agents/PATTERNS.md](docs/agents/PATTERNS.md) |
-| Commands, env, `--print-list`, checklist | [docs/agents/OPERATIONS.md](docs/agents/OPERATIONS.md) |
+| Commands, env, `--print-list`, CI + release automation, checklist | [docs/agents/OPERATIONS.md](docs/agents/OPERATIONS.md) |
 | Commit message rules + examples | [GIT_COMMIT_INSTRUCTIONS.md](GIT_COMMIT_INSTRUCTIONS.md) |
 | Reading order / doc ownership | [docs/agents/README.md](docs/agents/README.md) |
 | End-user features + full key map | [README.md](README.md) |
@@ -125,6 +130,15 @@ Full command reference and the validation checklist:
 
 ## Changelog
 
+- **2026-07-10** — Added Conventional-Commits-driven versioning + releases via
+  release-plz. New `.github/workflows/release-plz.yml` (runs `release-pr` +
+  `release` on every push to `main`) and `release-plz.toml` (git-tag-based
+  detection with `git_only`, `publish = false`, `features_always_increment_minor`,
+  and `git_tag_name = "v{{ version }}"`). Baseline `Cargo.toml` version 0.0.0 ->
+  0.1.0 so the first release tags `v0.1.0`. Docs refreshed: `OPERATIONS.md` gains a
+  "Continuous integration & releases" section (and drops the stale "no CI config"
+  claim), `README.md` gains a `cargo install --git ... --tag vX.Y.Z` path, and the
+  Git-commits rule now notes that commit type drives the bump.
 - **2026-07-09** — Split the header version indicator by build profile. Release
   builds still show `v<crate-version>`; local debug builds now show
   `dev+<git-short-hash>` with a trailing `-dirty` when the working tree had

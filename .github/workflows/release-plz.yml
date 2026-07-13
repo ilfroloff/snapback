@@ -1,0 +1,70 @@
+name: "🔖 Release"
+
+# Conventional-Commits-driven versioning + releases via release-plz.
+#
+# On every push to main, release-plz runs BOTH of its commands (an empty
+# `command` input runs `release-pr` then `release`):
+#   1. release-pr: opens/refreshes a single "Release vX.Y.Z" PR that accumulates
+#      the pending version bump + changelog from the Conventional Commits merged
+#      since the last release. Ordinary feature merges just refresh this PR.
+#   2. release: once that release PR is merged (its bump lands in Cargo.toml on
+#      main), cuts the `vX.Y.Z` git tag and a matching GitHub Release.
+#
+# No crates.io publish ever happens - snapback is a non-published binary crate
+# installed from a tagged git ref (see release-plz.toml + README.md).
+#
+# NO CI LOOP: the release PR, commits, and tags are created with the built-in
+# GITHUB_TOKEN, and GitHub deliberately does NOT trigger further workflow runs
+# from GITHUB_TOKEN-authored events. So this workflow never re-triggers ci.yml
+# (or itself). Supplying RELEASE_PLZ_TOKEN below opts INTO running ci.yml on the
+# release PR; without it the PR still opens and tags still cut, just with no CI.
+
+on:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Least privilege: release-plz needs to push tags/commits (contents) and to
+# open/update the release PR (pull-requests). Nothing else.
+permissions:
+  contents: write
+  pull-requests: write
+
+# One release run at a time per branch, and never cancel an in-flight one so a
+# tag/release is never left half-created.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-plz:
+    name: "🔖 Release-plz"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+        with:
+          # release-plz derives versions from git tags (git_only), so it needs
+          # the FULL history + tags, not the default shallow clone.
+          fetch-depth: 0
+          # Don't persist the checkout token in .git/config; release-plz
+          # authenticates through the token passed in env below instead.
+          persist-credentials: false
+
+      - name: "🦀 Set up Rust toolchain (from rust-toolchain.toml)"
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      # Pinned to the v0.5 line: this action is pre-1.0, so v0.5 is its stable
+      # "major" tag and it moves with v0.5.x patches - the same float-within-a-
+      # line policy ci.yml uses with actions/checkout@v4 and
+      # actions-rust-lang/setup-rust-toolchain@v1.
+      - name: "🔖 Run release-plz (release-pr + release)"
+        uses: release-plz/action@v0.5
+        env:
+          # Prefer a user-supplied PAT / GitHub App token (RELEASE_PLZ_TOKEN) so
+          # ci.yml runs on the release PR; fall back to the built-in token, which
+          # still opens the PR and cuts tags but won't trigger ci.yml. The
+          # fallback keeps this workflow functional with zero secrets configured.
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}

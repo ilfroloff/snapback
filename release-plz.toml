@@ -1,0 +1,58 @@
+# release-plz configuration for snapback.
+#
+# snapback is a SINGLE, non-published binary crate (Cargo.toml sets
+# `publish = false`). It is installed from source with
+# `cargo install --git <repo> --tag vX.Y.Z`, so the git TAG - not crates.io - is
+# the only source of truth for "what version is released". This file wires
+# release-plz to that reality: derive versions from git tags, cut a `v{version}`
+# git tag + GitHub Release on each release, and never touch a cargo registry.
+#
+# Per this repo's NO MAGIC VALUES rule (see AGENTS.md / Cargo.toml), every value
+# below is set explicitly and carries the reason it holds that value - including
+# the ones that merely re-assert a release-plz default, because those defaults
+# are load-bearing to this setup.
+#
+# Field reference: https://release-plz.dev/docs/config
+
+[workspace]
+# feat: -> MINOR even while we are on 0.x (0.1.0 -> 0.2.0), and fix:/perf: ->
+# PATCH. Without this, SemVer's 0.x special-case would fold a feat: into a patch
+# bump; this restores the intuitive mapping we want for this tool. Breaking
+# changes still bump only MINOR on 0.x: that is release-plz's (next_version's)
+# default for pre-1.0 versions, NOT a field set in this file - there is no
+# `breaking_always_increment_major` key to add here. Forcing a 1.0.0 major bump
+# would require opting in explicitly through a release-plz-supported mechanism
+# such as `custom_major_increment_regex`, which we have deliberately not done.
+features_always_increment_minor = true
+
+[[package]]
+name = "snapback"
+
+# There is no crates.io entry for this crate, so a registry lookup would never
+# find a "latest release". git-only mode makes release-plz read the existing
+# `v{version}` git tags to determine the current version and the next bump. On
+# the very first run there are no tags yet, so release-plz has no prior release
+# to bump from and takes the Cargo.toml baseline (0.1.0) verbatim - the first
+# release is exactly v0.1.0.
+git_only = true
+
+# Never run `cargo publish`. This mirrors Cargo.toml's own `publish = false` and
+# makes the intent explicit at the release-plz layer. (release-plz forbids
+# `git_only = true` together with `publish = true`, so this must stay false.)
+publish = false
+
+# Cut an annotated git tag for every release. This is the release-plz default
+# (true), pinned here because the tag IS the release for a crate installed
+# straight from a tagged git ref.
+git_tag_enable = true
+
+# Create a GitHub Release off that tag too (default true), so each version has a
+# visible release entry with its accumulated changelog.
+git_release_enable = true
+
+# Tag format MUST be `v{version}` (e.g. v0.1.0). This is load-bearing three ways:
+# the TUI header prints `v<crate-version>` for release builds
+# (src/tui/view.rs), the install docs pin with
+# `cargo install --git ... --tag vX.Y.Z` (README.md), and git-only mode above
+# scans exactly this pattern to find prior releases. Keep it stable.
+git_tag_name = "v{{ version }}"

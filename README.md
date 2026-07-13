@@ -51,10 +51,26 @@ cargo build --release
 ## Install / run
 
 ```sh
-# install both binaries onto your PATH (into ~/.cargo/bin by default):
+# from a local checkout - install both binaries onto your PATH
+# (into ~/.cargo/bin by default):
 cargo install --path .
 snapback   # or: sb
 ```
+
+Or install straight from GitHub without cloning — this compiles from source the
+same way (there is no prebuilt binary), it just fetches the crate for you:
+
+```sh
+# latest main (moves as new commits land):
+cargo install --git https://github.com/ilfroloff/snapback
+
+# a specific pinned release (recommended - reproducible):
+cargo install --git https://github.com/ilfroloff/snapback --tag v0.1.0
+```
+
+Releases are tagged `vX.Y.Z` (see the [`🔖 Release`](.github/workflows/release-plz.yml)
+workflow); pick the tag you want from the repo's Releases page. All three forms
+produce the same two binaries.
 
 `snapback` and `sb` are both produced by the one `cargo install` — the same
 program under two names, so use whichever you prefer.

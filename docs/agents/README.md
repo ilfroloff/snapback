@@ -18,8 +18,8 @@ find the same rule in two places, that is a bug to fix.
 4. [PATTERNS.md](PATTERNS.md) — **how to build new things**: the repeated
    implementation rules and the testing conventions to match.
 5. [OPERATIONS.md](OPERATIONS.md) — build/test/lint/run commands, the
-   `CLAUDE_PROJECTS_DIR` override, the hidden `--print-list` mode, and the
-   pre-finish validation checklist.
+   `CLAUDE_PROJECTS_DIR` override, the hidden `--print-list` mode, the CI +
+   release-plz automation, and the pre-finish validation checklist.
 
 ## Section ownership (avoid duplication)
 
@@ -28,7 +28,7 @@ find the same rule in two places, that is a bug to fix.
 | Module responsibilities, stack, runtime wiring | ARCHITECTURE |
 | Store layout, JSONL fields, label/grouping/live-agent semantics | DOMAIN |
 | Fail-soft / authoritative-from-file / isolation / styling rules, testing conventions | PATTERNS |
-| Commands, env vars, validation checklist | OPERATIONS |
+| Commands, env vars, CI + release automation, validation checklist | OPERATIONS |
 | Critical rules + engineering principles + changelog | AGENTS.md |
 
 ## Maintenance
