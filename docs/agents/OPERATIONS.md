@@ -86,7 +86,7 @@ Versioning is driven by the **Conventional Commit** type of each merged commit
 This crate is **never published to crates.io** (`publish = false`); the git tag
 is the sole source of truth for "what is released" (`git_only = true`), so there
 is no registry step. Users install a tagged version straight from git — see the
-README [Install](../../README.md#install--run) section.
+README [Install](../../README.md#install) section.
 
 The release PR, commits, and tags are created with the built-in `GITHUB_TOKEN`,
 which by design does **not** trigger other workflow runs, so `🚀 CI` is never
