@@ -1,0 +1,9 @@
+# Rust build artifacts for the `snapback` crate.
+# Root .gitignore has no `target` rule; this tool-local ignore is the correct scope.
+/target
+
+# Cargo.lock is intentionally NOT ignored: this is a binary crate, so the lockfile
+# is committed for reproducible builds (reinforces the exact version pins).
+
+# `ai-to-go` artifacts
+/docs/plans

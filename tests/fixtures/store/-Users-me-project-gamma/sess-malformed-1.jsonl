@@ -1,0 +1,4 @@
+{"type":"user","sessionId":"sess-malformed-1","cwd":"/Users/me/project-gamma","gitBranch":"dev","timestamp":"2026-07-03T08:00:00.000Z","message":{"role":"user","content":"<command-name>/init</command-name>"}}
+{"type":"user","sessionId":"sess-malformed-1","cwd": "/Users/me/project-gamma", THIS LINE IS NOT VALID JSON {{{
+{"type":"user","sessionId":"sess-malformed-1","cwd":"/Users/me/project-gamma","gitBranch":"dev","timestamp":"2026-07-03T08:00:05.000Z","message":{"role":"user","content":"Add retry logic to the client"}}
+{"type":"assistant","sessionId":"sess-malformed-1","cwd":"/Users/me/project-gamma","gitBranch":"dev","timestamp":"2026-07-03T08:00:10.000Z","message":{"role":"assistant","content":"Done."}}
