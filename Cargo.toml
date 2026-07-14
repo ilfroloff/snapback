@@ -1,0 +1,40 @@
+[package]
+name = "snapback"
+version = "0.0.0"
+edition = "2021"
+description = "Browse, search, and resume Claude Code sessions from a ratatui TUI."
+publish = false
+
+# Personal, standalone tool. The module tree lives in the library crate
+# (src/lib.rs) so it compiles once, and two thin binary shims (src/main.rs ->
+# snapback, src/bin/sb.rs -> sb) are autodiscovered by Cargo. `cargo install
+# --path .` installs both binaries. See ./README.md.
+
+# Exact version pins for reproducibility. `nucleo` is pinned per the plan's Risks
+# table (evolving API, isolated behind src/search.rs); the rest are pinned exact
+# to keep the toolchain deterministic for this personal binary.
+[dependencies]
+# Terminal rendering. Default features include the crossterm backend.
+ratatui = "=0.30.2"
+# Terminal control + input events (matches the crossterm backend used by ratatui 0.30).
+crossterm = "=0.29.0"
+# fzf-grade fuzzy matcher. Pinned exact; all matcher calls isolated in src/search.rs.
+nucleo = "=0.5.0"
+# Filesystem watcher for autorefresh over ~/.claude/projects.
+notify = "=8.2.0"
+# ~200ms debounce that coalesces notify event storms into one "sessions changed".
+notify-debouncer-mini = "=0.7.0"
+# Fail-soft JSONL parsing as serde_json::Value (never hard-typed structs).
+serde_json = "=1.0.150"
+# RFC 3339 timestamp parsing/formatting for session sort + display.
+time = { version = "=0.3.53", features = ["parsing", "formatting", "macros"] }
+# Resolve the home directory for the default ~/.claude/projects store root.
+dirs = "=6.0.0"
+# Ergonomic error propagation across the data core and TUI.
+anyhow = "=1.0.103"
+# Parallel per-file scan in SessionStore::load (Task 2.7). Already in the tree via nucleo.
+rayon = "=1.12.0"
+# Terminal display-width of stripped table-cell text so inline markers (**x**,
+# [a](b)) and CJK/emoji measure at their rendered column count, keeping table
+# columns aligned. Already in the tree transitively via ratatui; pinned exact.
+unicode-width = "=0.2.2"

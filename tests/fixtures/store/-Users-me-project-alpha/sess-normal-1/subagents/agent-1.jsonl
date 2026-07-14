@@ -1,0 +1,3 @@
+{"type":"summary","summary":"Subagent phantom that must never appear"}
+{"type":"user","sessionId":"sess-normal-1","cwd":"/Users/me/project-alpha","gitBranch":"main","isSidechain":true,"timestamp":"2026-07-01T10:00:03.000Z","message":{"role":"user","content":"subagent internal prompt"}}
+{"type":"assistant","sessionId":"sess-normal-1","cwd":"/Users/me/project-alpha","gitBranch":"main","timestamp":"2026-07-01T10:00:04.000Z","message":{"role":"assistant","content":"subagent internal reply"}}
