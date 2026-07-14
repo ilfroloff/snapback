@@ -130,6 +130,16 @@ Full command reference and the validation checklist:
 
 ## Changelog
 
+- **2026-07-13** — Restructured `README.md` into a pain-first, user-facing doc:
+  expanded the "why" into a concrete cross-folder scenario, tightened the payoff,
+  de-jargoned the (unchanged, still-complete) key map, and reduced the feature
+  sections to benefit blurbs. Implementation detail was removed by DELETION, not
+  moved — it already lives in its owning `docs/agents/*` (crate pins →
+  ARCHITECTURE Stack; build/binary shims → OPERATIONS; canonicalization,
+  substring search, live badges/Attach job-id, defined-agent frontmatter →
+  DOMAIN/PATTERNS; dev-vs-release version label → ARCHITECTURE). Fixed the now
+  stale `OPERATIONS.md` install cross-link anchor (`#install--run` → `#install`).
+  No code/keybinding/flag changes.
 - **2026-07-10** — Added Conventional-Commits-driven versioning + releases via
   release-plz. New `.github/workflows/release-plz.yml` (runs `release-pr` +
   `release` on every push to `main`) and `release-plz.toml` (git-tag-based

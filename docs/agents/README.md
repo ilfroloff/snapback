@@ -35,5 +35,5 @@ find the same rule in two places, that is a bug to fix.
 
 These docs are generated and refreshed by the `project-agent-docs` skill from
 the real repository. When the code structure changes, re-run that skill rather
-than hand-patching, so stale references are removed in the same pass. Record the
-harness + model in the `AGENTS.md` changelog.
+than hand-patching, so stale references are removed in the same pass. Log the
+refresh in the `AGENTS.md` changelog, following the entry conventions there.
