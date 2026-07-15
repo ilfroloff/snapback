@@ -40,6 +40,34 @@ pub struct ParsedFile {
     pub summary: Option<String>,
     /// First "real" user prompt, if any (see [`label::user_prompt_text`]).
     pub first_user: Option<String>,
+    /// `uuid` of the record whose `parentUuid` is JSON `null` — the transcript
+    /// TREE's root, which identifies a fork lineage (a background hand-off copies
+    /// the whole leading prefix, root included, into the new session file).
+    ///
+    /// NOT the first `user`/`assistant` uuid: the root is an `attachment` in the
+    /// large majority of real files (hook-injected context precedes the first
+    /// prompt), and anchoring on the first message misses real forks whose
+    /// leading prompt differs while the conversation is identical. `None` when
+    /// the file has no null-parent record — fail-soft, meaning "no lineage",
+    /// never a dropped session.
+    pub root_uuid: Option<String>,
+    /// How many conversation TURNS the file holds: records typed `user` or
+    /// `assistant`.
+    ///
+    /// Counted in the streaming pass, NEVER derived from [`content_index`]:
+    /// that buffer stops at [`CONTENT_INDEX_CAP`], so a long session's turns
+    /// would silently stop being counted at ~64 KB. This is a real counter over
+    /// every record, so the cap cannot reach it.
+    ///
+    /// Deliberately a NARROWER set than the four tree types [`root_uuid`]
+    /// reasons about — do not unify the two. See the counting site in
+    /// [`parse_file`] for why.
+    ///
+    /// 0 when the file holds no turns — fail-soft, like every field here.
+    ///
+    /// [`content_index`]: ParsedFile::content_index
+    /// [`root_uuid`]: ParsedFile::root_uuid
+    pub msg_count: usize,
     /// Capped, readable transcript text for content search.
     pub content_index: String,
 }
@@ -58,6 +86,8 @@ pub fn parse_file(path: &Path) -> Option<ParsedFile> {
     let mut timestamp_raw: Option<String> = None;
     let mut summary: Option<String> = None;
     let mut first_user: Option<String> = None;
+    let mut root_uuid: Option<String> = None;
+    let mut msg_count: usize = 0;
     let mut content_index = String::new();
 
     for line in reader.lines() {
@@ -89,6 +119,48 @@ pub fn parse_file(path: &Path) -> Option<ParsedFile> {
             if let Some(s) = record.get("sessionId").and_then(Value::as_str) {
                 session_id = Some(s.to_string());
             }
+        }
+        // Lineage root: the FIRST record in file order whose `parentUuid` is JSON
+        // null. The transcript is a TREE and this is its root, so it is copied
+        // verbatim into every fork of the session — which is what makes it a
+        // stable lineage identity. Deliberately NOT filtered by `type`: the root
+        // is usually an `attachment` (hook-injected context), only sometimes a
+        // `user` message.
+        //
+        // `get` distinguishes the two cases this depends on: an ABSENT
+        // `parentUuid` yields `None` (records outside the tree — `last-prompt`,
+        // `mode`, `agent-setting`, `permission-mode`, `file-history-snapshot` —
+        // carry no such key and must never be mistaken for the root), whereas the
+        // root yields `Some(Value::Null)`. A null-parent record with no readable
+        // `uuid` is skipped rather than latching, so a later one can still win
+        // (fail-soft). A file may carry more than one null-parent record (a
+        // forest); the first wins, deterministically.
+        if root_uuid.is_none() && record.get("parentUuid").is_some_and(Value::is_null) {
+            if let Some(u) = record.get("uuid").and_then(Value::as_str) {
+                root_uuid = Some(u.to_string());
+            }
+        }
+        // Conversation TURNS: `user` + `assistant` records, counted here in the
+        // one existing pass — no second read, no allocation, and nothing to
+        // invalidate.
+        //
+        // This is deliberately a DIFFERENT set from the four types the root
+        // logic above reasons about (`user`, `assistant`, `attachment`,
+        // `system`). Those four are what carry `uuid`/`parentUuid` and so form
+        // the TREE; roughly a quarter of it is not conversation at all —
+        // hook-injected `attachment` context and `system` notices, which nobody
+        // typed and claude did not answer. Counting them would inflate a stub
+        // that holds no work into something that looks like it does, which is
+        // the exact question this number exists to answer. The two notions are
+        // separate on purpose: do NOT unify them into one "tree record" test.
+        //
+        // `Value` access throughout, so a missing or non-string `type` simply
+        // does not count rather than panicking (FAIL-SOFT).
+        if matches!(
+            record.get("type").and_then(Value::as_str),
+            Some("user") | Some("assistant")
+        ) {
+            msg_count += 1;
         }
         // gitBranch + timestamp: last non-null (most-recent activity wins).
         if let Some(b) = record.get("gitBranch").and_then(Value::as_str) {
@@ -124,6 +196,8 @@ pub fn parse_file(path: &Path) -> Option<ParsedFile> {
         timestamp_raw,
         summary,
         first_user,
+        root_uuid,
+        msg_count,
         content_index,
     })
 }
@@ -193,6 +267,220 @@ fn truncate_on_char_boundary(s: &mut String, max: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// An isolated temp dir for a hand-written transcript (PATTERNS: never touch
+    /// the real `~/.claude/projects`).
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is after the unix epoch")
+            .as_nanos();
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "snapback-parse-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    /// Write `lines` as a `<id>.jsonl` transcript and run the real streaming
+    /// parse over it, so these tests exercise `parse_file`'s loop (including its
+    /// first-wins ordering) rather than a re-implementation of it.
+    fn parse_lines(tag: &str, lines: &[&str]) -> Option<ParsedFile> {
+        let dir = unique_temp_dir(tag);
+        let file = dir.join(format!("sess-{tag}.jsonl"));
+        std::fs::write(&file, lines.join("\n")).expect("write transcript");
+        let parsed = parse_file(&file);
+        std::fs::remove_dir_all(&dir).ok();
+        parsed
+    }
+
+    /// The real leading shape of a session file: out-of-tree bookkeeping records
+    /// (no `uuid`, no `parentUuid` key at all) ahead of the tree's root.
+    const OUT_OF_TREE_PRELUDE: [&str; 2] = [
+        r#"{"type":"last-prompt","sessionId":"s","leafUuid":"lp-1"}"#,
+        r#"{"type":"mode","sessionId":"s","mode":"default"}"#,
+    ];
+
+    #[test]
+    fn root_uuid_is_the_null_parent_record_even_when_it_is_an_attachment() {
+        // The real shape: hook-injected `attachment` context is the tree root and
+        // PRECEDES the first user message, which is why the root uuid — not the
+        // first message uuid — is the lineage identity. The two uuids differ here
+        // on purpose: a fixture where they agree passes against either key and so
+        // cannot distinguish them.
+        let mut lines = OUT_OF_TREE_PRELUDE.to_vec();
+        lines.extend([
+            r#"{"type":"attachment","sessionId":"s","cwd":"/w","uuid":"root-attachment","parentUuid":null,"attachment":{}}"#,
+            r#"{"type":"attachment","sessionId":"s","cwd":"/w","uuid":"att-2","parentUuid":"root-attachment","attachment":{}}"#,
+            r#"{"type":"user","sessionId":"s","cwd":"/w","uuid":"first-user","parentUuid":"att-2","message":{"role":"user","content":"hi"}}"#,
+        ]);
+        let parsed = parse_lines("attachment-root", &lines).expect("file has a cwd");
+
+        assert_eq!(parsed.root_uuid.as_deref(), Some("root-attachment"));
+        // Pin the correction explicitly: anchoring on the first message is the
+        // key this replaces, and it would answer `first-user` here.
+        assert_ne!(parsed.root_uuid.as_deref(), Some("first-user"));
+    }
+
+    #[test]
+    fn a_record_with_no_parent_uuid_key_is_not_the_root() {
+        // `parentUuid: null` (the root) vs an ABSENT `parentUuid` (a record
+        // outside the tree) are different cases, and `get` is what tells them
+        // apart: absent => `None`, root => `Some(Value::Null)`.
+        //
+        // The two real out-of-tree records below catch an implementation that
+        // LATCHES onto the first absent-parent record (root would degrade to
+        // `None`). They cannot catch one that treats absent as null and CAPTURES,
+        // because no out-of-tree record in the observed store carries a `uuid` to
+        // capture — the bug is real but currently latent behind that. The third
+        // record models exactly that drift, so the distinction is pinned by
+        // behaviour rather than by a record that happens to be unreachable today.
+        let mut lines = OUT_OF_TREE_PRELUDE.to_vec();
+        lines.extend([
+            r#"{"type":"file-history-snapshot","sessionId":"s","uuid":"out-of-tree-uuid"}"#,
+            r#"{"type":"attachment","sessionId":"s","cwd":"/w","uuid":"real-root","parentUuid":null,"attachment":{}}"#,
+            r#"{"type":"user","sessionId":"s","cwd":"/w","uuid":"u-1","parentUuid":"real-root","message":{"role":"user","content":"hi"}}"#,
+        ]);
+        let parsed = parse_lines("absent-vs-null", &lines).expect("file has a cwd");
+
+        assert_eq!(parsed.root_uuid.as_deref(), Some("real-root"));
+        assert_ne!(
+            parsed.root_uuid.as_deref(),
+            Some("out-of-tree-uuid"),
+            "a record with no parentUuid key sits outside the tree and can never be its root"
+        );
+    }
+
+    #[test]
+    fn the_first_null_parent_record_wins_in_a_forest() {
+        // A small minority of real files carry more than one null-parent record.
+        // Ordering by file position keeps the answer deterministic.
+        let lines = [
+            r#"{"type":"attachment","sessionId":"s","cwd":"/w","uuid":"root-first","parentUuid":null,"attachment":{}}"#,
+            r#"{"type":"user","sessionId":"s","cwd":"/w","uuid":"u-1","parentUuid":"root-first","message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"attachment","sessionId":"s","cwd":"/w","uuid":"root-second","parentUuid":null,"attachment":{}}"#,
+        ];
+        let parsed = parse_lines("forest", &lines).expect("file has a cwd");
+
+        assert_eq!(parsed.root_uuid.as_deref(), Some("root-first"));
+    }
+
+    #[test]
+    fn no_null_parent_record_yields_none_not_a_drop() {
+        // FAIL-SOFT: no derivable root means "no lineage" (never folded), NEVER a
+        // dropped session. The file is still a resumable session.
+        let lines = [
+            r#"{"type":"user","sessionId":"sess-rootless","cwd":"/w","uuid":"u-1","parentUuid":"gone","message":{"role":"user","content":"orphaned"}}"#,
+            r#"{"type":"assistant","sessionId":"sess-rootless","cwd":"/w","uuid":"a-1","parentUuid":"u-1","message":{"role":"assistant","content":"ok"}}"#,
+        ];
+        let parsed = parse_lines("rootless", &lines).expect("a rootless file is still a session");
+
+        assert_eq!(parsed.root_uuid, None);
+        assert_eq!(parsed.cwd, "/w", "the session itself must survive");
+        assert_eq!(parsed.session_id, "sess-rootless");
+    }
+
+    #[test]
+    fn msg_count_counts_conversation_turns_not_tree_records() {
+        // The fixture is built so the two candidate rules give VISIBLY different
+        // answers: 6 turns sit inside 15 tree records. Count "every record that
+        // carries uuid + parentUuid" — the set the ROOT logic uses — and this
+        // file reports 15. A pair of near-identical fixtures could not tell the
+        // rules apart at all, which is the point of the 9 non-conversation
+        // records below.
+        let mut lines = OUT_OF_TREE_PRELUDE.to_vec();
+        lines.extend([
+            // Hook-injected context: in the tree, but nobody said it.
+            r#"{"type":"attachment","sessionId":"s","cwd":"/w","uuid":"att-1","parentUuid":null,"attachment":{}}"#,
+            r#"{"type":"attachment","sessionId":"s","cwd":"/w","uuid":"att-2","parentUuid":"att-1","attachment":{}}"#,
+            r#"{"type":"attachment","sessionId":"s","cwd":"/w","uuid":"att-3","parentUuid":"att-2","attachment":{}}"#,
+            r#"{"type":"system","sessionId":"s","cwd":"/w","uuid":"sys-1","parentUuid":"att-3","content":"hook ran"}"#,
+            r#"{"type":"system","sessionId":"s","cwd":"/w","uuid":"sys-2","parentUuid":"sys-1","content":"hook ran"}"#,
+            // The conversation itself: 3 user + 3 assistant = 6 turns.
+            r#"{"type":"user","sessionId":"s","cwd":"/w","uuid":"u-1","parentUuid":"sys-2","message":{"role":"user","content":"one"}}"#,
+            r#"{"type":"assistant","sessionId":"s","cwd":"/w","uuid":"a-1","parentUuid":"u-1","message":{"role":"assistant","content":[{"type":"text","text":"1"}]}}"#,
+            r#"{"type":"attachment","sessionId":"s","cwd":"/w","uuid":"att-4","parentUuid":"a-1","attachment":{}}"#,
+            r#"{"type":"user","sessionId":"s","cwd":"/w","uuid":"u-2","parentUuid":"att-4","message":{"role":"user","content":"two"}}"#,
+            r#"{"type":"assistant","sessionId":"s","cwd":"/w","uuid":"a-2","parentUuid":"u-2","message":{"role":"assistant","content":[{"type":"text","text":"2"}]}}"#,
+            r#"{"type":"system","sessionId":"s","cwd":"/w","uuid":"sys-3","parentUuid":"a-2","content":"hook ran"}"#,
+            r#"{"type":"system","sessionId":"s","cwd":"/w","uuid":"sys-4","parentUuid":"sys-3","content":"hook ran"}"#,
+            r#"{"type":"attachment","sessionId":"s","cwd":"/w","uuid":"att-5","parentUuid":"sys-4","attachment":{}}"#,
+            r#"{"type":"user","sessionId":"s","cwd":"/w","uuid":"u-3","parentUuid":"att-5","message":{"role":"user","content":"three"}}"#,
+            r#"{"type":"assistant","sessionId":"s","cwd":"/w","uuid":"a-3","parentUuid":"u-3","message":{"role":"assistant","content":[{"type":"text","text":"3"}]}}"#,
+        ]);
+        let parsed = parse_lines("turn-count", &lines).expect("file has a cwd");
+
+        assert_eq!(
+            parsed.msg_count, 6,
+            "only `user`/`assistant` records are turns"
+        );
+        assert_ne!(
+            parsed.msg_count, 15,
+            "counting every TREE record (the four types the root logic considers) \
+             inflates this file's 6 turns to 15: `attachment` context is injected \
+             by hooks and `system` records are notices, so neither is a turn"
+        );
+        // And the out-of-tree bookkeeping records are not turns either — a
+        // `last-prompt` is a pointer, not something anybody said.
+        assert_ne!(parsed.msg_count, 6 + OUT_OF_TREE_PRELUDE.len());
+    }
+
+    #[test]
+    fn a_file_with_no_turns_counts_zero_rather_than_failing() {
+        // FAIL-SOFT: a file with nothing said in it counts 0 and stays a
+        // session. The last two records model schema drift — a `type` that is
+        // absent, and one that is not a string — which `Value` access must
+        // shrug off rather than panic on.
+        let lines = [
+            r#"{"type":"attachment","sessionId":"sess-quiet","cwd":"/w","uuid":"att-1","parentUuid":null,"attachment":{}}"#,
+            r#"{"type":"system","sessionId":"sess-quiet","cwd":"/w","uuid":"sys-1","parentUuid":"att-1","content":"hook ran"}"#,
+            r#"{"sessionId":"sess-quiet","cwd":"/w","uuid":"no-type-key"}"#,
+            r#"{"type":42,"sessionId":"sess-quiet","cwd":"/w","uuid":"type-is-a-number"}"#,
+        ];
+        let parsed = parse_lines("no-turns", &lines).expect("a quiet file is still a session");
+
+        assert_eq!(parsed.msg_count, 0);
+        assert_eq!(parsed.session_id, "sess-quiet", "the session must survive");
+    }
+
+    #[test]
+    fn msg_count_keeps_counting_past_the_content_index_cap() {
+        // The counter is its own pass over every record, NOT a read of
+        // `content_index` — which is exactly why the cap objection to the old
+        // `content_index`-as-a-proxy idea does not apply to it. Each turn below
+        // carries ~1 KB of text, so the index fills and stops long before the
+        // records do; the count must not stop with it.
+        let body = "x".repeat(1024);
+        let mut lines: Vec<String> = vec![
+            r#"{"type":"attachment","sessionId":"s","cwd":"/w","uuid":"att-1","parentUuid":null,"attachment":{}}"#
+                .to_string(),
+        ];
+        let turns = 200;
+        for i in 0..turns {
+            lines.push(format!(
+                r#"{{"type":"user","sessionId":"s","cwd":"/w","uuid":"u-{i}","parentUuid":"att-1","message":{{"role":"user","content":"{body}"}}}}"#
+            ));
+        }
+        let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let parsed = parse_lines("past-the-cap", &borrowed).expect("file has a cwd");
+
+        assert_eq!(
+            parsed.content_index.len(),
+            CONTENT_INDEX_CAP,
+            "the fixture must actually reach the cap, or it proves nothing"
+        );
+        assert_eq!(
+            parsed.msg_count, turns,
+            "the cap truncates the searchable text, never the turn count — a \
+             count that stopped at the cap would silently understate exactly the \
+             long sessions worth telling apart"
+        );
+    }
 
     #[test]
     fn readable_text_handles_string_and_blocks() {

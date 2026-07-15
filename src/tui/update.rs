@@ -17,6 +17,7 @@
 //! | --- | ------ |
 //! | `Up` / `Down` | move selection (always) |
 //! | `j` / `k` | move selection (only while the query is empty; otherwise typed) |
+//! | `Left` / `Right` | fold / expand the selected row's fork lineage (always) |
 //! | `Enter` | resume the selected session |
 //! | `Ctrl-F` | fork-resume the selected session |
 //! | `Ctrl-N` | start a new session in the launch directory (pick an agent when any are defined) |
@@ -60,6 +61,11 @@ pub enum Action {
     MoveUp,
     /// Move the selection down one row.
     MoveDown,
+    /// Collapse the selected row's fork lineage back to its single head (`←`).
+    CollapseLineage,
+    /// Expand the selected row's fork lineage, showing the members its head
+    /// stands for (`→`).
+    ExpandLineage,
     /// Resume (or fork-resume) the selected session. The refusal gate and the
     /// `claude` hand-off are decided in [`apply_action`]; a confirmed plan
     /// surfaces as [`Outcome::Resume`].
@@ -145,6 +151,13 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool) -> Action {
     match key.code {
         KeyCode::Up => Action::MoveUp,
         KeyCode::Down => Action::MoveDown,
+        // Fork-lineage fold toggle, on the canonical tree idiom. Bound OUTSIDE
+        // the `ctrl` block above on purpose: that namespace is already crowded,
+        // and these keys are not printable, so — like the arrows and the preview
+        // scroll keys — they act regardless of the query and can never be
+        // swallowed by type-to-search the way a plain letter would.
+        KeyCode::Left => Action::CollapseLineage,
+        KeyCode::Right => Action::ExpandLineage,
         // Preview scroll: page + jump. Bound regardless of query state (they are
         // not printable, so they never collide with type-to-search).
         KeyCode::PageUp => Action::PreviewPageUp,
@@ -390,6 +403,14 @@ fn apply_action(app: &mut App, action: Action) -> Outcome {
         }
         Action::MoveDown => {
             app.move_selection(1);
+            Outcome::Continue
+        }
+        Action::CollapseLineage => {
+            app.collapse_selected();
+            Outcome::Continue
+        }
+        Action::ExpandLineage => {
+            app.expand_selected();
             Outcome::Continue
         }
         Action::Resume { fork } => {
@@ -776,6 +797,8 @@ mod tests {
             timestamp: None,
             repo: "repo".to_string(),
             label: format!("label {id}"),
+            root_uuid: None,
+            msg_count: 0,
             content_index: String::new(),
         }
     }
@@ -1257,6 +1280,8 @@ mod tests {
             timestamp: None,
             repo: "repo".to_string(),
             label: "link session".to_string(),
+            root_uuid: None,
+            msg_count: 0,
             content_index: String::new(),
         }
     }
@@ -1525,6 +1550,8 @@ mod tests {
             timestamp: None,
             repo: "repo".to_string(),
             label: format!("label {id}"),
+            root_uuid: None,
+            msg_count: 0,
             content_index: String::new(),
         }
     }
@@ -2026,6 +2053,26 @@ mod tests {
             key_to_action(key(KeyCode::Char('k')), false),
             Action::Insert('k')
         );
+    }
+
+    #[test]
+    fn left_right_fold_and_expand_regardless_of_query() {
+        // `←` folds a fork lineage back to its head, `→` expands it. Neither key
+        // is printable, so — unlike `j`/`k`/`q` directly above — they must NOT be
+        // gated on the query: a `(+N)` head found BY searching is exactly the row
+        // a user most wants to open, and gating would make it unopenable without
+        // first clearing the query. The `query_empty = false` half is the one with
+        // teeth; it is what fails if these are ever gated like the letter keys.
+        for empty in [true, false] {
+            assert_eq!(
+                key_to_action(key(KeyCode::Left), empty),
+                Action::CollapseLineage
+            );
+            assert_eq!(
+                key_to_action(key(KeyCode::Right), empty),
+                Action::ExpandLineage
+            );
+        }
     }
 
     #[test]

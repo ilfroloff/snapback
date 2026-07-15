@@ -14,7 +14,8 @@ find the same rule in two places, that is a bug to fix.
    load pipeline, terminal-safety seams).
 3. [DOMAIN.md](DOMAIN.md) — **the session format**: store layout, the
    session/subagent/sidecar distinction, the JSONL fields relied on, and the
-   derived concepts (label, grouping, content index, live agents, scopes).
+   derived concepts (label, grouping, content index, fork lineage, turn count,
+   live agents, scopes).
 4. [PATTERNS.md](PATTERNS.md) — **how to build new things**: the repeated
    implementation rules and the testing conventions to match.
 5. [OPERATIONS.md](OPERATIONS.md) — build/test/lint/run commands, the
@@ -26,7 +27,7 @@ find the same rule in two places, that is a bug to fix.
 | Topic | Lives in |
 | --- | --- |
 | Module responsibilities, stack, runtime wiring | ARCHITECTURE |
-| Store layout, JSONL fields, label/grouping/live-agent semantics | DOMAIN |
+| Store layout, JSONL fields, label/grouping/fork-lineage/turn-count/live-agent semantics | DOMAIN |
 | Fail-soft / authoritative-from-file / isolation / styling rules, testing conventions | PATTERNS |
 | Commands, env vars, CI + release automation, validation checklist | OPERATIONS |
 | Critical rules + engineering principles + changelog | AGENTS.md |

@@ -71,6 +71,7 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | --- | ------ |
 | `↑` / `↓` | Move the selection |
 | `j` / `k` | Move the selection — while the query is empty; once you're typing, they're search characters |
+| `←` / `→` | **Fold** / **expand** a stack of look-alike rows that are really one conversation — a row marked `(+N)` stands for `N` more |
 | `Enter` | **Resume** the selected session, returning to the board when it exits. On a **running** session it opens an **Attach / Fork / Cancel** choice instead |
 | `Ctrl-F` | **Fork** the selected session into a copy — available for any session, running or not |
 | `Ctrl-N` | **Start a new session** in the launch directory; if you have Claude Code agents defined, pick one first (or `default (no agent)`) |
@@ -145,6 +146,25 @@ and a session can start or finish in between — so if one is secretly still
 running, you get the Attach/Fork choice rather than an error. And if a resume
 does fail because the session came back to life underneath you, the board says so
 and offers the same choice instead of leaving you to guess.
+
+**No more look-alike duplicates.** Every time you hand a prompt to a background
+agent, Claude Code quietly copies the session into a new file and carries on
+there. Both copies keep the same name, the same folder and the same branch — so
+one conversation shows up as two, three, four rows you can't tell apart, drifting
+further apart in the list as the day goes on.
+
+snapback spots that they're the same conversation (by what's inside the files,
+not by their names) and shows you **one row**, marked `(+N)` for the `N` copies
+behind it. Press `→` and they fan out underneath it, oldest work included, no
+matter how far apart in time they landed; `←` tidies them away again. Each copy
+says how many messages it holds — `6 msgs` next to `171 msgs` — so you can see
+which one is a stub the hand-off left behind and which one holds the real work.
+The names can't tell you that; they're identical.
+
+Nothing is hidden from you and nothing is thrown away — every copy is still a
+real session you can resume, and that matters: a session that's running in the
+background can't be plain-resumed, so the older copy is often the one that
+*will* open. It's one keypress away instead of lost in a row of twins.
 
 **Start a new session, with an agent.** `Ctrl-N` starts a fresh session in the
 folder you launched from. If you keep Claude Code agents defined, it offers a

@@ -28,6 +28,7 @@ OPTIONS:
 
 KEYS:
     ↑/↓, j/k      move          Enter        resume (returns to the board on exit)
+    ←/→           fold / expand a fork lineage (a row marked (+N) stands for more)
     Ctrl-F        fork          Ctrl-N       new session in the launch dir (pick an agent)
     Ctrl-A        toggle scope  Ctrl-/       toggle preview
     Tab           toggle name / name+content search

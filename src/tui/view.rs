@@ -107,6 +107,65 @@ const BADGE_WORKING: Color = Color::Gray;
 /// intensity on any theme (TERMINAL-SAFE STYLING) rather than as a second state.
 const BADGE_WORKING_DIM: Color = Color::DarkGray;
 
+/// The selection marker `List` draws at the left of the highlighted row.
+///
+/// Named because it is also RESERVED width: ratatui pads EVERY row by this
+/// symbol's columns (blanking it on unselected rows) before drawing the item, so
+/// a row's real drawable width is the block's inner width less this. The label
+/// fit ([`fit_label`]) has to subtract it, and reading it off the same const the
+/// `List` is configured with means the two can never drift apart.
+const LIST_HIGHLIGHT_SYMBOL: &str = "› ";
+
+/// A session row's left gutter: two columns of breathing room between the
+/// selection marker and the timestamp.
+const ROW_GUTTER: &str = "  ";
+/// An expanded lineage CHILD's left gutter, replacing [`ROW_GUTTER`].
+///
+/// One more level of indent plus a `↳`, so the row reads as subordinate to the
+/// head above it. Sized against `ROW_GUTTER` rather than in absolute columns:
+/// the extra indent is what makes a child visibly hang off its head, and the
+/// glyph is what says which direction it hangs. Rows with no lineage keep
+/// `ROW_GUTTER` and are therefore untouched by any of this.
+const CHILD_GUTTER: &str = "   ↳ ";
+
+/// The gap between a folded head's label and its `(+N)` marker.
+///
+/// Part of the marker's own reserved width (see [`lineage_marker`]) rather than a
+/// separate span, so the width [`fit_label`] holds back is exactly the width the
+/// marker later draws — there is one number, and it cannot be reserved wrongly.
+const LINEAGE_MARKER_GAP: &str = "  ";
+
+/// What a width-truncated label ends with. One column, so the arithmetic in
+/// [`fit_label`] stays in columns without a width table.
+const LABEL_ELLIPSIS: &str = "…";
+
+/// How many leading chars of a `session_id` a lineage CHILD row shows.
+///
+/// Eight: a session id is a uuid, whose first hyphen-delimited group is 8 hex
+/// chars — the form these sessions are named by everywhere else (`e4a59d02`), and
+/// far more than enough to tell apart the handful of members of ONE lineage,
+/// which is the only comparison this row invites.
+const CHILD_ID_CHARS: usize = 8;
+
+/// The gap between a lineage CHILD row's id and its turn count.
+///
+/// Two columns, matching [`LINEAGE_MARKER_GAP`] and the row's other inter-column
+/// gaps, so a child's fields sit on the same rhythm as every other row's. Folded
+/// into the segment [`child_msgs`] builds, for the same reason the marker folds
+/// its own gap in: the width reserved is then the width drawn.
+const CHILD_MSGS_GAP: &str = "  ";
+
+/// The unit a lineage CHILD row's turn count wears: `6 msgs`.
+///
+/// Spelled out rather than left a bare number, because a bare `6` sitting beside
+/// an 8-char hex id reads as more id. The unit is what makes the number
+/// self-describing at the glance this row is built for. Uniform across every
+/// count (`1 msgs` is not special-cased): the plural rule would buy a
+/// grammatically nicer edge case at the price of a width that depends on the
+/// value, and this segment's width has to be knowable before it is drawn — see
+/// [`fit_child_msgs`].
+const CHILD_MSGS_SUFFIX: &str = " msgs";
+
 /// The glyph of the search line's cursor.
 const SEARCH_CURSOR: &str = "\u{258f}";
 /// What the pulsing search cursor renders in its hidden phase: a SAME-WIDTH
@@ -261,6 +320,13 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
+    // The columns a row can actually draw into: the block's inner width, less the
+    // selection marker ratatui pads EVERY row with. Derived from the block and
+    // the const the `List` below is configured with rather than restated, so a
+    // border or marker change cannot leave this arithmetic behind.
+    let content_width =
+        usize::from(block.inner(area).width).saturating_sub(LIST_HIGHLIGHT_SYMBOL.chars().count());
+
     // Under a NON-EMPTY query, precompute which CHAR positions of each visible
     // session label the query matched, so the row can highlight them. This
     // needs `&mut app` (nucleo's matcher carries scratch state), so it is done
@@ -274,8 +340,14 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
         let labels: Vec<(usize, String)> = rows
             .iter()
             .filter_map(|row| match row {
-                Row::Session(i) => Some((*i, app.sessions[*i].label.clone())),
-                Row::Group { .. } => None,
+                // A child row draws no label (it shows what DIFFERS from its
+                // head instead), so it has nothing to highlight.
+                Row::Session {
+                    index,
+                    child: false,
+                    ..
+                } => Some((*index, app.sessions[*index].label.clone())),
+                Row::Session { child: true, .. } | Row::Group { .. } => None,
             })
             .collect();
         labels
@@ -300,10 +372,16 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             )])),
-            Row::Session(i) => {
+            Row::Session {
+                index: i,
+                hidden,
+                child,
+            } => {
                 let session = &app.sessions[*i];
                 let mut spans = vec![
-                    Span::raw("  "),
+                    // An expanded lineage member hangs off the head above it;
+                    // every other row keeps the gutter it has always had.
+                    Span::raw(if *child { CHILD_GUTTER } else { ROW_GUTTER }),
                     Span::styled(
                         short_time(session.timestamp),
                         Style::default().add_modifier(Modifier::DIM),
@@ -351,20 +429,83 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                     }
                     spans.push(Span::raw("  "));
                 }
+                if *child {
+                    // A child spends its width on what DIFFERS from its head,
+                    // never on the label: every member of a lineage carries the
+                    // SAME label by construction (one conversation, copied), so
+                    // repeating it would spend the row saying nothing. What is
+                    // genuinely its own is the timestamp and badge already drawn
+                    // above, plus the id below — which is also the id `claude -r`
+                    // would resume, i.e. the reason this row is kept reachable.
+                    //
+                    // Note what is NOT claimed here: the sketch's "plain-resumable"
+                    // would be an assertion about claude's gate, and the badge
+                    // beside it comes from the ~1s poll. Liveness is unaskable in
+                    // a render (see `preview_split`) and a polled snapshot is not
+                    // authority for it, so the row REPORTS what claude said and
+                    // leaves the verdict to the hand-off probe.
+                    spans.push(Span::raw(short_id(&session.session_id)));
+
+                    // ...and how much conversation it actually holds, which is
+                    // the only field on this row carrying real information.
+                    // Timestamp and id say WHICH member this is; `6 msgs` beside
+                    // a sibling's `171 msgs` says which one is a stub the fork
+                    // stalled and which one holds the work — the question the
+                    // user is actually asking when they expand a lineage whose
+                    // members are, by construction, label-identical.
+                    //
+                    // DIM, like the timestamp: the id is left the row's one
+                    // undimmed field so the eye can scan children by it, and the
+                    // count reads as an annotation hanging off it. A named
+                    // Modifier, never an embedded escape or an RGB value
+                    // (TERMINAL-SAFE STYLING).
+                    let used: usize = spans.iter().map(Span::width).sum();
+                    if let Some(msgs) = fit_child_msgs(session.msg_count, content_width, used) {
+                        spans.push(Span::styled(
+                            msgs,
+                            Style::default().add_modifier(Modifier::DIM),
+                        ));
+                    }
+                    return ListItem::new(Line::from(spans));
+                }
+
+                // A folded head's `(+N)`, reserved BEFORE the label so a narrow
+                // pane clips the (identical, redundant) label rather than the one
+                // marker saying this row stands for others — see [`fit_label`].
+                // `hidden` is 0 for every row with nothing hidden, and such a row
+                // takes the untouched label it always has.
+                let marker = (*hidden > 0).then(|| lineage_marker(*hidden));
+                let label = match &marker {
+                    Some(marker) => {
+                        let used: usize = spans.iter().map(Span::width).sum();
+                        fit_label(&session.label, content_width, used, marker.chars().count())
+                    }
+                    None => session.label.clone(),
+                };
+
                 // The visible label: under an active query, matched chars are
                 // split out into light-blue spans; otherwise it is one raw span.
                 // The base style is `default()` — the List's `highlight_style`
                 // composes the selection over these spans at render time.
                 match highlights.get(i) {
                     Some(matched) => spans.extend(highlight_label_spans(
-                        &session.label,
+                        &label,
                         matched,
                         Style::default(),
                         Style::default()
                             .fg(Color::LightBlue)
                             .add_modifier(Modifier::BOLD),
                     )),
-                    None => spans.push(Span::raw(session.label.clone())),
+                    None => spans.push(Span::raw(label)),
+                }
+                if let Some(marker) = marker {
+                    // DIM: the marker is a footnote on the row, not a competitor
+                    // to the label. A named-ANSI Modifier, never an embedded
+                    // escape or an RGB value (TERMINAL-SAFE STYLING).
+                    spans.push(Span::styled(
+                        marker,
+                        Style::default().add_modifier(Modifier::DIM),
+                    ));
                 }
                 ListItem::new(Line::from(spans))
             }
@@ -379,7 +520,7 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 .add_modifier(Modifier::REVERSED)
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("› ");
+        .highlight_symbol(LIST_HIGHLIGHT_SYMBOL);
 
     let mut state = ListState::default();
     *state.offset_mut() = app.scroll.min(rows.len().saturating_sub(1));
@@ -939,7 +1080,7 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
             )])
         }
         None => Line::from(vec![Span::styled(
-            "↑↓/jk move · Enter resume · ^F fork · ^N new · type to search · Tab name/content · ^A scope · ^/ preview · PgUp/PgDn·^U/^D·Home/End·wheel scroll · q/Esc quit",
+            "↑↓/jk move · ←/→ fold/expand · Enter resume · ^F fork · ^N new · type to search · Tab name/content · ^A scope · ^/ preview · PgUp/PgDn·^U/^D·Home/End·wheel scroll · q/Esc quit",
             Style::default().add_modifier(Modifier::DIM),
         )]),
     };
@@ -1121,6 +1262,92 @@ fn short_time(ts: Option<OffsetDateTime>) -> String {
         ),
         None => "--".to_string(),
     }
+}
+
+/// The marker a folded lineage head wears: `(+N)`, N being the members it stands
+/// in for.
+///
+/// Only ever built for `hidden > 0` — a row that hides nothing must render
+/// nothing, so a `(+0)` is unrepresentable rather than merely unused.
+fn lineage_marker(hidden: usize) -> String {
+    format!("{LINEAGE_MARKER_GAP}(+{hidden})")
+}
+
+/// The first [`CHILD_ID_CHARS`] chars of `session_id`.
+fn short_id(session_id: &str) -> String {
+    session_id.chars().take(CHILD_ID_CHARS).collect()
+}
+
+/// The turn-count segment a lineage CHILD row wears: `  6 msgs`.
+///
+/// The gap is folded in exactly as [`lineage_marker`] folds [`LINEAGE_MARKER_GAP`]
+/// in, so the columns [`fit_child_msgs`] weighs are the columns this draws —
+/// one number, impossible to reserve wrongly.
+fn child_msgs(msg_count: usize) -> String {
+    format!("{CHILD_MSGS_GAP}{msg_count}{CHILD_MSGS_SUFFIX}")
+}
+
+/// The turn-count segment a child row can afford, or `None` to draw none.
+///
+/// `content_width` is the row's drawable columns and `used` what its fields
+/// (gutter, timestamp, badge, id) already spend.
+///
+/// ALL-OR-NOTHING, and that is the RULE rather than an implementation detail: a
+/// clipped count is not a degraded count, it is a WRONG one. `171 msgs` cut to
+/// fit reads back as `17` — a plausible number, silently off by an order of
+/// magnitude — and this field exists precisely to say which member of a lineage
+/// is a stalled stub and which holds the work. Getting no answer leaves the user
+/// where they were; getting a confidently wrong one sends them to resume the
+/// wrong session. So the segment renders WHOLE or not at all, and it never wears
+/// [`LABEL_ELLIPSIS`].
+///
+/// The id is NOT cut down to make room, and that is the same marker-first
+/// discipline [`fit_label`] applies rather than an exception to it. There the
+/// label gives way because it is redundant — identical across the lineage. Here
+/// the id is ALREADY cut to [`CHILD_ID_CHARS`], the documented minimum that
+/// still tells one member of a lineage from another, so it has nothing left to
+/// give: shortening it further would trade a field that cannot be wrong for one
+/// that can, and could collapse two children onto a shared prefix. The count is
+/// the field that yields last and, when the columns run out, entirely.
+///
+/// Pure, so the drop is tested as arithmetic rather than only through a pane.
+fn fit_child_msgs(msg_count: usize, content_width: usize, used: usize) -> Option<String> {
+    let segment = child_msgs(msg_count);
+    (segment.chars().count() <= content_width.saturating_sub(used)).then_some(segment)
+}
+
+/// The label text for a row that must ALSO fit `marker` columns of `(+N)`.
+///
+/// `content_width` is the row's drawable columns and `used` what its prefix
+/// (gutter, timestamp, badge) already spends; the label takes what is left after
+/// the marker is held back, and is truncated with a [`LABEL_ELLIPSIS`] when it
+/// does not fit.
+///
+/// The marker is reserved FIRST, and that ordering is the whole point: the label
+/// is identical across every member of a lineage — which is exactly why the rows
+/// looked like duplicates — so a few clipped chars off its tail cost nothing,
+/// while the marker is the ONLY thing on the board saying N other sessions are
+/// behind this row. Let the list clip right-to-left as it does by default and the
+/// marker is the first thing gone on a narrow pane, silently turning a fold back
+/// into the vanished-sessions bug it exists to prevent.
+///
+/// Pure so the reservation is tested as arithmetic rather than only through a
+/// rendered pane. Truncation counts CHARS, matching [`highlight_runs`] and
+/// `store::label`'s `LABEL_MAX` — the crate's one convention for label width.
+fn fit_label(label: &str, content_width: usize, used: usize, marker: usize) -> String {
+    let budget = content_width.saturating_sub(used).saturating_sub(marker);
+    if label.chars().count() <= budget {
+        return label.to_string();
+    }
+    // A budget of zero has no room even for the ellipsis; the marker still wins.
+    if budget == 0 {
+        return String::new();
+    }
+    label
+        .chars()
+        .take(budget - LABEL_ELLIPSIS.chars().count())
+        .chain(LABEL_ELLIPSIS.chars())
+        .collect()
 }
 
 /// Break `label` into consecutive `(text, is_match)` runs on CHAR boundaries.
@@ -1631,6 +1858,8 @@ mod tests {
             timestamp: None,
             repo: "project-alpha".to_string(),
             label: "sess-normal-1".to_string(),
+            root_uuid: None,
+            msg_count: 0,
             content_index: String::new(),
         }
     }
@@ -3384,6 +3613,390 @@ mod tests {
              at x={url_x}); changed columns: {:?}; row: {:?}",
             changed.iter().map(|(x, _, _)| *x).collect::<Vec<_>>(),
             row_text(&on, y, width).trim_end()
+        );
+    }
+
+    // --- fork-lineage rows -------------------------------------------------
+
+    /// The label a fork lineage's members SHARE.
+    ///
+    /// Identical across the lineage by construction — a background hand-off
+    /// copies the transcript, so `label::finalize_label` derives the same label
+    /// from both files. That is the whole reported bug, and it is why a child row
+    /// must spend its width on something else. Long enough that the narrow board
+    /// below genuinely cannot fit it beside a marker.
+    const LINEAGE_LABEL: &str = "I see kinda double-sessions in the sessions list";
+    /// The lineage-LESS control row's label, distinct so it is addressable.
+    const LONE_LABEL: &str = "I kinda don't like style of the README";
+
+    /// Session ids of the real shape (uuids), so [`short_id`] has a genuine first
+    /// group to cut at.
+    const BG_ID: &str = "2265afd8-3c03-466b-92fd-977c716018f3";
+    const ANCESTOR_ID: &str = "e4a59d02-1111-2222-3333-444444444444";
+    const LONE_ID: &str = "c6ce9d37-5555-6666-7777-888888888888";
+
+    /// The bg copy kept growing after the fork, so it is the NEWER member and
+    /// therefore the lineage's head (D1).
+    const BG_TS: i64 = 200;
+    /// The stalled foreground ancestor, older and folded away by default.
+    const ANCESTOR_TS: i64 = 100;
+    const LONE_TS: i64 = 50;
+
+    /// Turn counts that make the pair's members tell a STORY, since that is the
+    /// whole reason a child row carries one: the bg copy took the prompt and did
+    /// the work, the foreground ancestor stalled at the fork point holding almost
+    /// nothing. Multi-digit on purpose — a count clipped to fit would read back
+    /// as a smaller, entirely plausible number, which is what
+    /// [`fit_child_msgs`] refuses to let happen.
+    const BG_MSGS: usize = 171;
+    const ANCESTOR_MSGS: usize = 6;
+    const LONE_MSGS: usize = 42;
+
+    fn at(unix_secs: i64) -> Option<OffsetDateTime> {
+        Some(OffsetDateTime::from_unix_timestamp(unix_secs).expect("a valid test timestamp"))
+    }
+
+    fn lineage_session(
+        id: &str,
+        root: &str,
+        label: &str,
+        unix_secs: i64,
+        msg_count: usize,
+    ) -> Session {
+        Session {
+            file: PathBuf::from(format!("/tmp/{id}.jsonl")),
+            session_id: id.to_string(),
+            cwd: PathBuf::from("/Users/me/project-alpha"),
+            git_branch: Some("main".to_string()),
+            timestamp: at(unix_secs),
+            repo: "project-alpha".to_string(),
+            label: label.to_string(),
+            root_uuid: Some(root.to_string()),
+            msg_count,
+            content_index: String::new(),
+        }
+    }
+
+    /// A board holding ONE background-fork lineage — the `bg` copy that kept
+    /// growing plus the stalled `ancestor` it forked from, sharing a root uuid, a
+    /// repo+branch and a label — beside a `lone` session whose lineage is only
+    /// itself.
+    ///
+    /// The lone row is the CONTROL, and it is why all three render in a single
+    /// pass: folding must be invisible to it, which a board of nothing but
+    /// lineage members could never show.
+    fn lineage_board() -> App {
+        let sessions = vec![
+            lineage_session(
+                ANCESTOR_ID,
+                "fork-root",
+                LINEAGE_LABEL,
+                ANCESTOR_TS,
+                ANCESTOR_MSGS,
+            ),
+            lineage_session(BG_ID, "fork-root", LINEAGE_LABEL, BG_TS, BG_MSGS),
+            lineage_session(LONE_ID, "other-root", LONE_LABEL, LONE_TS, LONE_MSGS),
+        ];
+        App::new(sessions, Scope::All, PathBuf::from("/tmp/launch"))
+    }
+
+    /// Wide enough to draw a whole lineage row (gutter + timestamp + label +
+    /// marker) with room to spare, tall enough for the group head plus all three
+    /// session rows EXPANDED and the block's two borders — a row scrolled out of
+    /// view would silently weaken every assertion below.
+    const LINEAGE_BOARD_SIZE: (u16, u16) = (100, 8);
+
+    /// A pane too narrow to fit [`LINEAGE_LABEL`] beside the marker — the only
+    /// width at which the reservation in [`fit_label`] is observable at all.
+    const LINEAGE_NARROW_WIDTH: u16 = 40;
+
+    #[test]
+    fn fit_label_holds_the_marker_back_and_spends_what_is_left_on_the_label() {
+        let marker = lineage_marker(1).chars().count();
+
+        // Room for everything: the label is handed over whole and untouched.
+        assert_eq!(fit_label("short", 40, 0, marker), "short");
+
+        // Exactly the columns left once the marker is reserved: still whole.
+        let budget = 20 - marker;
+        let exact = "x".repeat(budget);
+        assert_eq!(fit_label(&exact, 20, 0, marker), exact);
+
+        // One column too many: the LABEL is what gives, and it gives up one more
+        // column to say so, so the fit never overruns its budget.
+        let fitted = fit_label(&"x".repeat(budget + 1), 20, 0, marker);
+        assert!(fitted.ends_with(LABEL_ELLIPSIS));
+        assert_eq!(
+            fitted.chars().count() + marker,
+            20,
+            "label + marker fill the row exactly, never more: {fitted:?}"
+        );
+    }
+
+    #[test]
+    fn fit_label_gives_the_last_columns_to_the_marker_not_the_label() {
+        let marker = lineage_marker(12).chars().count();
+
+        // A row whose prefix has already eaten everything: the label vanishes
+        // outright rather than shoving the marker off the edge.
+        assert_eq!(fit_label("anything", 10, 10, marker), "");
+        // And a prefix that OVERRUNS the row saturates rather than panicking —
+        // a terminal can always be dragged narrower than the layout wants.
+        assert_eq!(fit_label("anything", 4, 99, marker), "");
+    }
+
+    /// The default: three sessions, two rows, and the surviving head says so.
+    #[test]
+    fn render_list_marks_a_folded_head_with_a_dim_hidden_count() {
+        let mut app = lineage_board();
+        let (width, height) = LINEAGE_BOARD_SIZE;
+        let buffer = drawn_list(&mut app, width, height);
+
+        // Folded is the default, so only the head draws the shared label.
+        let head = row_of(&buffer, width, height, LINEAGE_LABEL);
+        let text = row_text(&buffer, head, width);
+        assert!(
+            text.contains("(+1)"),
+            "the folded head must wear the count of what it stands for, or the \
+             ancestor has silently vanished: {text:?}"
+        );
+
+        // Read the style off the DRAWN cells, not off the span we built: a
+        // marker the List restyles away is a marker the user never sees.
+        // `contains`, because the selected row is patched REVERSED | BOLD.
+        let x = column_of(&buffer, head, width, "(+1)");
+        for (i, ch) in "(+1)".chars().enumerate() {
+            let cell = buffer
+                .cell((
+                    x + u16::try_from(i).expect("a marker shorter than a row"),
+                    head,
+                ))
+                .expect("a drawn marker cell");
+            assert_eq!(cell.symbol(), ch.to_string());
+            assert!(
+                cell.modifier.contains(Modifier::DIM),
+                "the marker is a dim footnote on the row, not a second label"
+            );
+        }
+    }
+
+    /// The narrow pane, which is the whole reason the marker is reserved first.
+    #[test]
+    fn render_list_keeps_the_hidden_count_when_the_pane_is_too_narrow_for_the_label() {
+        let mut app = lineage_board();
+        let (_, height) = LINEAGE_BOARD_SIZE;
+        let width = LINEAGE_NARROW_WIDTH;
+        let buffer = drawn_list(&mut app, width, height);
+
+        // Found by the marker, since the label is necessarily cut at this width.
+        let head = row_of(&buffer, width, height, "(+1)");
+        let text = row_text(&buffer, head, width);
+
+        assert!(
+            !text.contains(LINEAGE_LABEL),
+            "the fixture must be too narrow for the whole label, or it proves \
+             nothing about what gets cut: {text:?}"
+        );
+        assert!(
+            text.contains(LABEL_ELLIPSIS),
+            "the LABEL is what gives way, and says so: {text:?}"
+        );
+        // The marker is the row's LAST drawn thing: nothing was pushed past it
+        // off the right edge, which is how it would silently disappear.
+        assert!(
+            text.trim_end().ends_with("(+1)"),
+            "the marker must survive a narrow pane — it is the only thing saying \
+             this row stands for another session: {text:?}"
+        );
+    }
+
+    /// Expanding: the ancestor comes back, indented, saying what makes it
+    /// different rather than repeating what does not.
+    #[test]
+    fn render_list_indents_an_expanded_child_and_shows_what_differs_from_its_head() {
+        let mut app = lineage_board();
+        app.expand_selected();
+        let (width, height) = LINEAGE_BOARD_SIZE;
+        let buffer = drawn_list(&mut app, width, height);
+
+        // The child is addressable by its ID — which is the point: that is what
+        // it draws INSTEAD of the label it would otherwise duplicate.
+        let child = row_of(&buffer, width, height, &short_id(ANCESTOR_ID));
+        let child_text = row_text(&buffer, child, width);
+        assert!(
+            !child_text.contains(LINEAGE_LABEL),
+            "a child must not repeat the label it shares with its head — the \
+             width is exactly what it has to spend on the difference: {child_text:?}"
+        );
+
+        // An open head stands in for nobody, so its marker is gone: `(+N)` may
+        // only ever count rows that are really hidden.
+        let head = row_of(&buffer, width, height, LINEAGE_LABEL);
+        let head_text = row_text(&buffer, head, width);
+        assert!(
+            !head_text.contains("(+"),
+            "an expanded head hides nothing and must not claim otherwise: {head_text:?}"
+        );
+
+        // The indent is REAL, measured in drawn columns: the child's timestamp
+        // starts right of its head's, which is what the eye reads as hanging off
+        // it. A gutter const that stopped indenting fails here.
+        let head_ts = column_of(&buffer, head, width, &short_time(at(BG_TS)));
+        let child_ts = column_of(&buffer, child, width, &short_time(at(ANCESTOR_TS)));
+        assert!(
+            child_ts > head_ts,
+            "the child must be indented past its head ({child_ts} vs {head_ts})"
+        );
+        assert!(
+            child_text.contains('↳'),
+            "and it must say which way it hangs: {child_text:?}"
+        );
+
+        // What the child spends the reclaimed width ON. The id says WHICH
+        // session; only this says whether it is worth going back to.
+        assert!(
+            child_text.contains(&child_msgs(ANCESTOR_MSGS)),
+            "a child must report how much conversation it holds — the one field \
+             that separates the stub the fork stalled from the member carrying \
+             the work: {child_text:?}"
+        );
+
+        // Read the style off the DRAWN cells: the count is an annotation on the
+        // id, not a second identity, and a count the List restyles away is a
+        // count the user never sees. `contains`, since the selected row is
+        // patched REVERSED | BOLD.
+        let count = format!("{ANCESTOR_MSGS}{CHILD_MSGS_SUFFIX}");
+        let x = column_of(&buffer, child, width, &count);
+        for (i, ch) in count.chars().enumerate() {
+            let cell = buffer
+                .cell((
+                    x + u16::try_from(i).expect("a count shorter than a row"),
+                    child,
+                ))
+                .expect("a drawn count cell");
+            assert_eq!(cell.symbol(), ch.to_string());
+            assert!(
+                cell.modifier.contains(Modifier::DIM),
+                "the count hangs off the id as a dim annotation, leaving the id \
+                 the row's one undimmed field to scan by"
+            );
+        }
+    }
+
+    /// The narrow pane, and the rule that a wrong number beats no number is
+    /// FALSE: the segment goes whole or not at all.
+    #[test]
+    fn render_list_drops_a_childs_turn_count_whole_rather_than_clipping_it() {
+        let mut app = lineage_board();
+        let (_, height) = LINEAGE_BOARD_SIZE;
+        let width = LINEAGE_NARROW_WIDTH;
+        app.expand_selected();
+        let buffer = drawn_list(&mut app, width, height);
+
+        let id = short_id(ANCESTOR_ID);
+        let child = row_of(&buffer, width, height, &id);
+        let text = row_text(&buffer, child, width);
+
+        // The fixture must genuinely be too narrow, or it pins nothing: at a
+        // width that fits the count, dropping and keeping look the same.
+        assert!(
+            !text.contains(CHILD_MSGS_SUFFIX),
+            "this pane cannot afford the count, so none of it may be drawn: {text:?}"
+        );
+
+        // The claim with the teeth. `!contains(" msgs")` alone is satisfied by
+        // the very bug this forbids — appending the segment and letting the List
+        // hard-clip it leaves `…e4a59d02  6 m`, which contains no " msgs" and
+        // would sail through. Only "the id is still the last thing on the row"
+        // can see that a fragment was pushed past it.
+        assert!(
+            text.trim_end().ends_with(&id),
+            "the id must remain the row's last drawn field: anything after it is \
+             a count fragment the List cut mid-number, and a clipped count is not \
+             a smaller count — it is a WRONG one ({ANCESTOR_MSGS} msgs clipped \
+             reads back as a plausible other number): {text:?}"
+        );
+
+        // And the drop costs the row nothing it used to have: a child on a pane
+        // too narrow for the count draws exactly what it drew before there was
+        // one.
+        let unselected = " ".repeat(LIST_HIGHLIGHT_SYMBOL.chars().count());
+        assert_eq!(
+            text.trim_end(),
+            format!(
+                "{unselected}{CHILD_GUTTER}{}  {id}",
+                short_time(at(ANCESTOR_TS))
+            ),
+        );
+    }
+
+    #[test]
+    fn fit_child_msgs_is_all_or_nothing_and_never_ellipsizes() {
+        let segment = child_msgs(BG_MSGS);
+        let width = segment.chars().count();
+
+        // Room to spare, and room for exactly the segment: drawn whole.
+        assert_eq!(
+            fit_child_msgs(BG_MSGS, width + 10, 0).as_deref(),
+            Some(segment.as_str())
+        );
+        assert_eq!(
+            fit_child_msgs(BG_MSGS, width, 0).as_deref(),
+            Some(segment.as_str()),
+            "the exact fit is a fit — the segment reserves what it draws, no more"
+        );
+
+        // One column short: the whole segment goes. Not a shorter one, and above
+        // all not an ellipsized one — `17…` would be read as 17.
+        assert_eq!(
+            fit_child_msgs(BG_MSGS, width - 1, 0),
+            None,
+            "a count that cannot be drawn whole is not drawn at all"
+        );
+
+        // The columns a row's own fields already spent count against it, and a
+        // prefix that OVERRUNS the pane saturates rather than panicking — a
+        // terminal can always be dragged narrower than the layout wants.
+        assert_eq!(fit_child_msgs(BG_MSGS, 100, 100 - width), Some(segment));
+        assert_eq!(fit_child_msgs(BG_MSGS, 4, 99), None);
+    }
+
+    /// The control, and the sharpest claim in this file: folding is INVISIBLE to
+    /// a row with no lineage. Not "close to" what the board always drew — the
+    /// same cells.
+    #[test]
+    fn render_list_leaves_a_row_with_no_hidden_members_exactly_as_it_was() {
+        let mut app = lineage_board();
+        let (width, height) = LINEAGE_BOARD_SIZE;
+        let buffer = drawn_list(&mut app, width, height);
+
+        let lone = row_of(&buffer, width, height, LONE_LABEL);
+        let text = row_text(&buffer, lone, width);
+
+        // Unselected rows are padded by the width of the selection marker.
+        let unselected = " ".repeat(LIST_HIGHLIGHT_SYMBOL.chars().count());
+        assert_eq!(
+            text,
+            format!(
+                "{unselected}{ROW_GUTTER}{}  {LONE_LABEL}",
+                short_time(at(LONE_TS))
+            ),
+            "a session with a lineage of one must draw exactly what it always \
+             has: no marker, no indent, no ellipsis, nothing new to notice"
+        );
+
+        // And at a width where the label cannot fit: still untouched. Nothing
+        // reserves anything on this row, so it is HARD-CLIPPED by the List
+        // exactly as it always was, rather than width-fitted into an ellipsis it
+        // never used to have. The wide board above cannot see this — its label
+        // fits either way — which is precisely why the narrow half is here.
+        let narrow = drawn_list(&mut app, LINEAGE_NARROW_WIDTH, height);
+        let lone = row_of(&narrow, LINEAGE_NARROW_WIDTH, height, "I kinda");
+        let text = row_text(&narrow, lone, LINEAGE_NARROW_WIDTH);
+        assert!(
+            !text.contains(LABEL_ELLIPSIS),
+            "a row with nothing hidden reserves nothing, so its label must be \
+             clipped by the List and never fitted: {text:?}"
         );
     }
 }
