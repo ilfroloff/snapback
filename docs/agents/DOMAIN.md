@@ -56,13 +56,18 @@ never fatal:
 | `sessionId` | first non-null (else file stem) | stable id, resume target, reported-agent join key |
 | `gitBranch` | last non-null (`None` ⇒ `(detached)`) | branch grouping level |
 | `timestamp` | last non-null, RFC 3339 | sort + display (per-message too, in preview) |
-| `type` | `"summary"` / `"user"` / `"assistant"` | label, preview, content index |
+| `type` | `"summary"` / `"user"` / `"assistant"` | label, preview, content index, [turn count](#turn-count-storeparse) |
 | `summary` | on `type:"summary"` | preferred label + searchable text |
 | `message.content` | string **or** typed-block array | user prompt, preview body, content index |
 | `isSidechain` | bool | skip sub-agent turns when picking a label/preview |
+| `uuid` | per record | a record's identity in the transcript **tree** |
+| `parentUuid` | per record; **JSON `null` on the root** | the tree edge; the null-parent record's `uuid` is the fork-lineage identity (see [Fork lineage](#fork-lineage-storelineage)) |
 
 "First non-null" vs "last non-null" is deliberate: identity fields take the
 earliest value, activity fields (branch, timestamp) take the most recent.
+
+`parentUuid` is the one field where **absent and `null` are different answers**,
+and conflating them breaks the lineage — see [Fork lineage](#fork-lineage-storelineage).
 
 ## Derived concepts
 
@@ -98,7 +103,8 @@ text (user/assistant text blocks + summaries; tool params/thinking omitted),
 truncated on a UTF-8 char boundary. Extracted **once at load**; the name+content
 search mode scores against it per keystroke without re-reading disk.
 
-There is deliberately **no on-disk index** (YAGNI at ~170 sessions): the whole
+There is deliberately **no on-disk index** (YAGNI at the observed few-hundred
+sessions — ~270 when last measured, 2026-07-15): the whole
 content corpus is a few single-digit MB held in memory and nucleo matches it per
 keystroke instantly, so a SQLite/FTS index would be pure overhead. If the store
 ever grows into the **thousands** of sessions and the initial load or the
@@ -106,6 +112,200 @@ content haystack starts to feel heavy, the first step is a lazily-populated,
 **mtime-keyed on-disk cache** (e.g. `~/.cache/snapback/`) of each session's
 `content_index`, so only changed sessions are re-extracted; an **FTS5** table
 over transcript text is the step past that. Until then it is not worth it.
+
+### Fork lineage (`store::lineage`)
+
+> **Two different things are called "fork" here.** Keep them apart:
+>
+> | Sense | Who does it | What it is |
+> | --- | --- | --- |
+> | **Fork, the hand-off** | **snapback**, when the user presses `Ctrl-F` | `claude -r <id> --fork-session` — a deliberate, asked-for branch of a session. See [Hand-off invocations](#hand-off-invocations-srcresumers). |
+> | **Fork, the event** | **Claude Code**, unasked | handing a prompt to a **background** job copies the transcript into a new session file. Nobody requested it and nothing on the board announced it. This section is about *this* one. |
+>
+> They are unrelated mechanisms that happen to share a verb. Where it matters,
+> this doc says "the fork **hand-off**" for the first and "a **background
+> fork**" for the second.
+
+#### The mechanism (why identical rows appear)
+
+When a prompt is handed to a **background** job, Claude Code **forks the
+transcript**: it copies the foreground file's records **verbatim — identical
+record `uuid`s** — into a **NEW `sessionId` file**, stamps that file
+`sessionKind: "bg"`, and appends there. The foreground file **stops growing** at
+the fork point.
+
+Both files therefore share `cwd`, `gitBranch`, and the first user prompt — so
+`label::finalize_label` derives the **same label** for both, and the board draws
+two visually identical rows. A lineage grows by one file per background fork, so
+a long-running conversation can occupy several look-alike rows.
+
+**snapback is not mis-parsing this.** Verified against the real store: **zero**
+duplicate `sessionId`s on disk, zero subagent leaks. Every file is a real,
+distinct, **separately resumable** session. This is a presentation problem, not a
+data problem — which is why the fold is presentation-only and drops nothing.
+
+The twins are also **not redundant**, so they must never be hidden outright: the
+bg copy is what makes `claude -r` refuse (the reason `src/agents.rs` exists), so
+the **stalled ancestor is the only plain-resumable copy** of that conversation.
+Hiding it irrecoverably would remove a real capability; hence a reversible fold
+(`←`/`→`) rather than a filter.
+
+#### `sessionKind`
+
+A file-level field marking how the session runs; `"bg"` identifies the background
+copy a fork produced. It is **deliberately not read** by any code path — not for
+folding, not for filtering. The lineage is derived from the transcript **tree**
+instead, because that is what makes two files provably the same conversation;
+`sessionKind` only says what a file *is*, never what it is a copy *of*. Recorded
+here because it is the field that explains the duplicate on disk, and the next
+author will find it while looking.
+
+#### The transcript is a TREE, not a message list
+
+This is the model the lineage rests on, and the one most likely to be
+mis-assumed:
+
+- **Four record types carry `uuid` + `parentUuid`** and form the tree:
+  `assistant`, `user`, `attachment`, `system`. Roughly **27% of the tree is not
+  conversation**.
+- **Types with no `uuid` sit outside the tree entirely** and must be ignored by
+  lineage code: `last-prompt`, `mode`, `agent-setting`, `permission-mode`,
+  `file-history-snapshot`. They carry **no `parentUuid` key at all** — which is
+  why absent must never be read as `null`.
+- **It really branches.** The large majority of files contain a record with more
+  than one child; only a minority are strictly linear. **Never assume a single
+  chain.** (The lineage code only needs the root, so it never walks children —
+  do not add code that assumes linearity.)
+- **A file may be a forest** — more than one `parentUuid: null` record. Rare, but
+  real; the first in file order wins, deterministically.
+
+#### The root uuid is the lineage identity
+
+`root_uuid` is the `uuid` of the record whose **`parentUuid` is JSON `null`** —
+the tree's root — captured in `parse`'s existing streaming pass.
+
+**It is NOT the first `user`/`assistant` uuid**, and that distinction is
+load-bearing rather than pedantic:
+
+- **The root is usually not a message.** The conversation typically starts two
+  records deep, behind hook-injected context, so the null-parent record is an
+  `attachment` in the large majority of files and a `user` in a minority. A tree
+  rooted at an `attachment` looks wrong and is not — **do not "fix" it by
+  filtering on `type`.**
+- **The first-message key is anchored to FILE ORDER**, so it breaks whenever a
+  fork's leading user record differs (an edited-and-resent prompt, a
+  `<command-message>` turn ordered differently) even though the conversation is
+  identical. Measured, it **missed three real forks**, one of which shared 133 of
+  ~136 message uuids with its twin.
+- The null-parent root is a **structural** anchor: it is copied verbatim into
+  every fork, so nothing downstream can move it.
+
+**No false-positive risk**: uuids are minted per record, so two genuinely fresh
+sessions never share a root even when a hook injects byte-identical content. Only
+a **copied prefix** can collide, and a copied prefix *is* a fork.
+
+**FAIL-SOFT**: a file with no null-parent record yields `None`, which means "no
+lineage" — never folded, never dropped. A degraded parse costs a fold, never a
+session.
+
+#### The lineage key is `(repo, branch, root)`
+
+Not the root uuid alone. Some lineages span more than one `gitBranch` (none span
+more than one `cwd`), and folding across branches would gather members across
+branch group heads, breaking `build_rows`' invariant that same-group rows are
+contiguous with exactly one head per group. Branch-scoping is also the right
+semantic: **a fork onto another branch is different work**, and it keeps its own
+row under its own branch's head.
+
+#### What the fold does
+
+Each collapsed lineage shows one **head** — its **newest** member, tie-broken by
+`session_id` — wearing a `(+N)` marker for the members it stands in for. Newest,
+rather than (say) the largest transcript, because the board already sorts
+timestamp-desc and ranks groups by their MAX timestamp: a head chosen any other
+way could carry a timestamp below its own lineage's max, and the folded row would
+sort incoherently against the very rows it represents.
+
+Expanding (`→`) **gathers** the other members immediately beneath their head
+rather than leaving them at their own timestamp slots. That is deliberate, and it
+is not what plain filtering does: time scatters a lineage — the bg head keeps
+working while its stalled ancestor strands hours or days back, with unrelated
+rows between — so an un-gathered member surfaces as an indented, label-less row
+far from the head that explains it, which moves the "I can't tell these apart"
+complaint rather than solving it.
+
+A gathered member draws as an indented **child row** carrying only what actually
+DIFFERS from its head: its own timestamp, its badge, the first 8 chars of its
+`session_id`, and its [turn count](#turn-count-storeparse). The count is the one
+field there carrying real information. A lineage's members share a label BY
+CONSTRUCTION — that identity *is* the reported bug — so `6 msgs` beside
+`171 msgs` is what says which member is a stalled stub and which holds the work;
+a timestamp and an id only ever say WHICH member. The row **reports** and
+predicts nothing about whether a member will plain-resume: that is the hand-off
+probe's question, asked at hand-off (see [Why the gate does not read the `--all`
+map](#why-the-gate-does-not-read-the---all-map)).
+
+Folding is **content-derived and never liveness-gated**. That is deliberate and
+easy to "improve" wrongly: the agents poll fires about once a second, so folding
+on whether a twin is live would restructure the list once per second, with rows
+appearing and vanishing under the cursor.
+
+`--print-list` prints **every** session, unfolded — it is a discovery/parse dump,
+and folding it would hide exactly what it exists to verify.
+
+#### Observed store shape
+
+A **sampled observation dated 2026-07-15 on one machine — NOT a contract**, in the
+same spirit as the agent distribution below. It records *provenance*: what the
+lineage rules were built against.
+
+Across **270** sessions: every file yielded a root uuid (270/270); the null-parent
+record was an `attachment` in **209**, a `user` in **60**, a `system` in **1**;
+**183** files branched (2,042 branch points store-wide), **87** were linear;
+**2** were a forest; **zero** had a dangling `parentUuid` (one pointing outside
+its file). Tree records by type: `assistant` 16,564, `user` 9,609, `attachment`
+3,992, `system` 1,855. **28** lineages had more than one member before
+branch-scoping; **19** survived it, folding **23** rows away by default.
+
+**The store is live and it drifts** — treat every number above as a snapshot and
+re-measure before relying on one. Observed during this work: four sessions
+**vanished from disk mid-implementation** (269 → 265 total), and the cross-branch
+root count moved from 8 to 5, with both of the originally named example roots
+gone entirely. The **relationships** are what the code relies on and they are
+structural: a background fork copies uuids verbatim; a root uuid never spans a
+`cwd`. The counts are not.
+
+That every file yields a root today is likewise a statistic, not a licence: the
+`Option` and its never-folded fallback stay regardless, and are pinned by the
+`sess-rootless-1` fixture rather than by the store.
+
+### Turn count (`store::parse`)
+
+`Session::msg_count` is how many **conversation turns** a transcript holds:
+records typed `user` or `assistant`, counted in `parse`'s existing streaming
+pass. Its consumer is the expanded lineage
+[child row](#fork-lineage-storelineage).
+
+**Turns are a NARROWER set than tree records, and the two are deliberately not
+unified.** Four types carry `uuid` + `parentUuid` and form the tree
+(`assistant`, `user`, `attachment`, `system`, [above](#the-transcript-is-a-tree-not-a-message-list)),
+but roughly a quarter of it is not conversation: `attachment` context is injected
+by hooks and `system` records are notices — nobody typed them and claude did not
+answer them. Counting tree records would inflate a stub that holds no work into
+something that looks like it does, which is the exact question this number exists
+to answer. Do **not** collapse the two tests into one "tree record" predicate;
+they are separate notions that happen to overlap.
+
+**It is a real counter, never read off `content_index`.** That buffer stops at
+`CONTENT_INDEX_CAP` ([above](#content-index-storeparse)), so a count derived from
+it would silently stop at ~64 KB and understate exactly the long sessions most
+worth telling apart — a 200-turn file would report 64. The counter sees every
+record, so the cap cannot reach it (pinned by
+`msg_count_keeps_counting_past_the_content_index_cap`).
+
+**FAIL-SOFT**, like every field here: a file with nothing said in it counts 0 and
+stays a session, and a missing or non-string `type` simply does not count rather
+than panicking.
 
 ### Reported agents (`src/agents.rs`)
 
@@ -262,6 +462,10 @@ repo's *other* worktree folders do not appear until you switch to all-folders or
 autorefresh reload.
 
 ## Hand-off invocations (`src/resume.rs`)
+
+These are the forks **snapback performs**, on request. They are not the
+[background fork](#fork-lineage-storelineage) Claude Code performs on its own —
+different mechanism, same verb.
 
 | Action | argv |
 | --- | --- |

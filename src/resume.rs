@@ -582,6 +582,8 @@ mod tests {
             timestamp: None,
             repo: "repo".into(),
             label: String::new(),
+            root_uuid: None,
+            msg_count: 0,
             content_index: String::new(),
         };
         (session, dir)
@@ -674,6 +676,8 @@ mod tests {
             timestamp: None,
             repo: "project-alpha".into(),
             label: String::new(),
+            root_uuid: None,
+            msg_count: 0,
             content_index: String::new(),
         };
         match plan(&session, false) {
@@ -697,6 +701,8 @@ mod tests {
             timestamp: None,
             repo: "project-alpha".into(),
             label: String::new(),
+            root_uuid: None,
+            msg_count: 0,
             content_index: String::new(),
         };
         match check(&session, false) {
@@ -904,6 +910,8 @@ mod tests {
             timestamp: None,
             repo: "project-alpha".into(),
             label: String::new(),
+            root_uuid: None,
+            msg_count: 0,
             content_index: String::new(),
         };
         match check_attach(&session, None) {

@@ -57,14 +57,25 @@ it. Follow this split when adding behavior:
   (`friendly_status` / `is_active`) plus both argv builders (`agents_argv` /
   `live_agents_argv`) and `agents_from_output` (the shell-out's
   non-zero-exit-means-no-signal decision, split from the spawn so it is testable
-  without one); `update::key_to_action` /
-  `wheel_target`; every `App` state transition (incl. `pick_default_index` and
-  the agent-picker cycle); `view`'s `wrapped_rows` / `clamp_preview_offset` /
-  `preview_split` / `centered_rect` / `highlight_runs` / `blink_visible` (the
-  board's ONE pulse phase, a pure fn of `App::tick`) / `badge_color` and its
-  `pulse_color` partner (also derived from `classify`, but a rendering decision,
-  so the palette sits in the view rather than dragging ratatui into the parser
-  layer).
+  without one); `store::lineage`'s `lineage_key` / `head_of` / `fold` (the whole
+  fold is one pure fn of `(sessions, filtered, expanded)`, so the `(+N)` board can
+  be tested as a list transformation with no terminal and no store);
+  `update::key_to_action` / `wheel_target`; every `App` state transition (incl.
+  `pick_default_index`, the agent-picker cycle, and `child_indices`, which marks
+  the indented rows by reusing `lineage::head_of` rather than re-deriving a head);
+  `view`'s `wrapped_rows` / `clamp_preview_offset` / `preview_split` /
+  `centered_rect` / `highlight_runs` / `fit_label` (the marker-vs-label width
+  reservation, pure so it is tested as arithmetic rather than only through a
+  rendered pane) / `child_msgs` and `fit_child_msgs` (a lineage child's
+  turn-count segment and whether the row can afford it — ALL-OR-NOTHING: the
+  segment is drawn whole or dropped entirely and never ellipsized, because a
+  clipped `171 msgs` reads back as a plausible `17` and a confidently WRONG
+  number is worse than none, where a clipped label merely looks clipped. The
+  segment folds its own leading gap in, exactly as `lineage_marker` does, so the
+  width weighed is the width drawn) / `blink_visible` (the board's ONE pulse phase, a pure fn of
+  `App::tick`) / `badge_color` and its `pulse_color` partner (also derived from
+  `classify`, but a rendering decision, so the palette sits in the view rather
+  than dragging ratatui into the parser layer).
 - Thin, impure: `resume::launch` (chdir + spawn + wait), `defined_agents::discover_agents`
   (the FS walk over `select_agents` / `parse_frontmatter`), the `watch` threads,
   `tui::run` (draw loop). Keep these small and delegate to tested helpers.
@@ -293,8 +304,18 @@ Tests are **inline** `#[cfg(test)] mod tests` at the bottom of each source file
 
 - **Fixture store**: `tests/fixtures/store/` holds representative JSONL — a
   normal session, a no-summary session, a malformed-line session, a worktree
-  cwd, a sidecar (no `cwd`), and a nested subagent. Reach it via
-  `env!("CARGO_MANIFEST_DIR")`. Add a fixture when you add a format edge case.
+  cwd, a sidecar (no `cwd`), a nested subagent, a **background-fork pair**
+  (two files sharing one tree root, `cwd`, branch and label — the duplicate-row
+  shape), and a **root-less** session (no `parentUuid: null` record). Reach it
+  via `env!("CARGO_MANIFEST_DIR")`. Add a fixture when you add a format edge
+  case, and update the counts in `store::mod`'s discovery/session-count tests.
+  A fixture pair must **differ in the field under test**, and the fork pair
+  differs twice on purpose: its leading user records differ (a pair that agrees
+  everywhere passes against the wrong lineage key too and cannot distinguish it),
+  and its members carry different turn counts (2 vs 4, behind three copied
+  `attachment` records each) so the child row's count column has something to
+  tell apart — a pair that agreed there could not test the one field that exists
+  to separate the stub from the member holding the work.
 - **Synthetic models**: build `Session`/`ReportedAgent` values directly in tests
   (see the `session(...)` helpers) rather than round-tripping through disk.
 - **Isolated temp dirs**: watcher/app tests create a unique

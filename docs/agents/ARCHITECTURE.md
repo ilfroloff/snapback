@@ -34,8 +34,8 @@ comments). `Cargo.lock` is committed. Toolchain: stable Rust (developed on
 ## Module map
 
 Data-core-first: the `store` layer's parsing core (`discover` / `parse` /
-`group` / `label`) is framework-independent and fully unit-tested before any TUI
-code runs on top of it. **`store::preview` is a deliberate exception**: it
+`group` / `label` / `lineage`) is framework-independent and fully unit-tested
+before any TUI code runs on top of it. **`store::preview` is a deliberate exception**: it
 returns styled ratatui `Text` because it *is* the rendering step (transcript →
 markdown), colocated with the store since its output is cached per session and
 fitted to the pane width.
@@ -56,6 +56,7 @@ the render framework.** That is why `agents::classify` buckets the undocumented
 | `store::parse` | `src/store/parse.rs` | Fail-soft, streaming per-file JSONL scan → `ParsedFile`. |
 | `store::group` | `src/store/group.rs` | `repo_of(cwd)` repo/branch grouping heuristic (worktree collapse). |
 | `store::label` | `src/store/label.rs` | Label preference (summary → first real user prompt → session id). |
+| `store::lineage` | `src/store/lineage.rs` | Background-fork lineage identity + folding: `lineage_key` (`(repo, branch, root_uuid)`), `head_of` (the newest member), and `fold` — the single entry point, which reduces a display list to the visible indices plus a head→hidden-count map. Presentation-only: it hides indices, it cannot drop a session. Pure and framework-free. See [DOMAIN.md](DOMAIN.md#fork-lineage-storelineage) for the mechanism it models. |
 | `store::preview` | `src/store/preview.rs` | Transcript → `RenderedPreview` (styled ratatui `Text` + clickable `LinkRegion`s), self-contained markdown pass. |
 | `search` | `src/search.rs` | The **only** place `nucleo` is called: substring index, incremental re-filter, highlight seam. |
 | `agents` | `src/agents.rs` | Agent detection via `claude agents --json`, read TWO ways through ONE fail-soft parser. `reported_agents` (`--all`, polled ~1s off-thread) is the DISPLAY signal: `classify` buckets each qualifier into an `AgentActivity` that the preview banner, list-badge color and pulse (which alternates that color, never the glyph) derive from. `live_agents` (bare, NO `--all`, one-shot at EVERY hand-off) is the HAND-OFF signal: the bare command IS claude's active list, so MEMBERSHIP is liveness — no inference — and the same records carry the Attach job `id`, so one authoritative read answers both. The split exists because `--all`'s `done` means "the agent reported completion", not "claude will permit `-r`"; inferring liveness from that polled snapshot was a TOCTOU race, and reading an attach id from it was the same bug one layer down. Framework-free: it interprets the value set, while the color it maps to is the view's call. |
@@ -63,9 +64,9 @@ the render framework.** That is why `agents::classify` buckets the undocumented
 | `watch` | `src/watch.rs` | Debounced FS watcher + `EventLoop` that merges input/watcher/tick/agents onto one channel. |
 | `resume` | `src/resume.rs` | Resume/fork/attach/new-session hand-off: re-read authoritative parts (or, for a new session, gate on the launch dir + optional `--agent <name>`), existence gate, spawn `claude`, return. Each `Ready` carries its own neutral non-zero hint (resume vs. new-session). |
 | `tui` | `src/tui/mod.rs` | Terminal setup/teardown (+ panic hook) and the draw/event `run` loop. |
-| `tui::app` | `src/tui/app.rs` | The `App` model — all TUI state, pure state transitions, no terminal I/O. |
+| `tui::app` | `src/tui/app.rs` | The `App` model — all TUI state, pure state transitions, no terminal I/O. Owns the fold state: `expanded` (a set of `LineageKey`s, EMPTY by default so every lineage starts folded) and the derived `hidden` head→count map, applied by `lineage::fold` as the last step of `recompute_filtered` so `filtered` holds only VISIBLE indices. |
 | `tui::update` | `src/tui/update.rs` | Elm-style event→state dispatch: `key_to_action`, `handle_event`, mouse routing (wheel scroll, splitter drag, preview link click-to-open), and the two overlay state machines (running-session choice + new-session agent picker). |
-| `tui::view` | `src/tui/view.rs` | Rendering: two-pane grouped list + preview, header/search/help lines, running-session overlay + new-session agent picker. The header's right-aligned version indicator branches on `cfg!(debug_assertions)`: release builds show `v<crate-version>`, dev builds `dev+<git-hash>[-dirty]` (pure `format_version_label`). Owns the pure wrap-mapping (`wrapped_line_height`/`link_at`) that hit-tests a click to a preview link, the pure `preview_split` that carves a REPORTED session's pinned status-banner row off the preview pane (the transcript rect `update` must hit-test against — keyed on having a banner, never on liveness, since a `done` agent has one but is not live), and the badge's palette (`badge_color`, mapping an `AgentActivity` to a named ANSI color). |
+| `tui::view` | `src/tui/view.rs` | Rendering: two-pane grouped list + preview, header/search/help lines, running-session overlay + new-session agent picker. The header's right-aligned version indicator branches on `cfg!(debug_assertions)`: release builds show `v<crate-version>`, dev builds `dev+<git-hash>[-dirty]` (pure `format_version_label`). Owns the pure wrap-mapping (`wrapped_line_height`/`link_at`) that hit-tests a click to a preview link, the pure `preview_split` that carves a REPORTED session's pinned status-banner row off the preview pane (the transcript rect `update` must hit-test against — keyed on having a banner, never on liveness, since a `done` agent has one but is not live), and the badge's palette (`badge_color`, mapping an `AgentActivity` to a named ANSI color). Draws a folded head's `(+N)` and indents an expanded lineage's children, with the pure `fit_label` reserving the marker's columns BEFORE the label's so a narrow pane clips the label instead of the marker. A child's turn count (`child_msgs` / `fit_child_msgs`) is the mirror of that rule: it is drawn WHOLE or dropped entirely, never clipped, since a truncated count reads back as a plausible wrong number rather than a short one. |
 | `build` | `build.rs` | Build script (compile-time, not a runtime module): fail-soft `git rev-parse`/`status` into `SNAPBACK_GIT_HASH`/`SNAPBACK_GIT_DIRTY` env vars for the dev version indicator; degrades to `unknown`/`0` outside a repo. |
 
 ## Runtime architecture
@@ -124,9 +125,18 @@ Four producers merged onto one `mpsc` channel of `AppEvent`:
 ### The load pipeline (`store`)
 
 `discover` (depth-pinned, subagent-excluding) → `parse` (fail-soft, per file in
-parallel via rayon) → derive (`label`, `repo`, timestamp, `content_index`) →
-sort repo↑ / branch↑ / timestamp↓. Every correctness constraint lives here and
-is covered by unit tests. See [DOMAIN.md](DOMAIN.md) for the data model.
+parallel via rayon) → derive (`label`, `repo`, timestamp, `root_uuid`,
+`msg_count`, `content_index`) → sort repo↑ / branch↑ / timestamp↓. Every
+correctness constraint lives here and is covered by unit tests. See
+[DOMAIN.md](DOMAIN.md) for the data model.
+
+`root_uuid` and `msg_count` both fall out of the SAME streaming pass — no second
+read, no walk, no index — which is why the lineage needs no cache of its own and
+why the turn count costs nothing to keep. `msg_count` is counted OUTSIDE the
+`CONTENT_INDEX_CAP` guard on purpose: inside it, the count would stop with the
+buffer (see [DOMAIN.md](DOMAIN.md#turn-count-storeparse)). `store::lineage` then
+runs **above** this pipeline, at display time (`App::recompute_filtered`), never
+during the load: folding is a view of the store, not part of it.
 
 ### Terminal safety seams
 

@@ -452,6 +452,8 @@ mod tests {
             timestamp: None,
             repo: "project".to_string(),
             label: label.to_string(),
+            root_uuid: None,
+            msg_count: 0,
             content_index: content.to_string(),
         }
     }

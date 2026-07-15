@@ -11,7 +11,7 @@
 //! [`crate::tui::update`].
 
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use ratatui::layout::Rect;
@@ -21,6 +21,7 @@ use time::OffsetDateTime;
 use crate::agents::ReportedAgent;
 use crate::defined_agents::DefinedAgent;
 use crate::search::{SearchIndex, SearchMode};
+use crate::store::lineage::{self, LineageKey};
 use crate::store::{preview, Session};
 
 /// Lines the preview scrolls per mouse-wheel notch. Small (the terminal reports
@@ -80,8 +81,22 @@ pub enum Row {
         /// The branch label (`(detached)` when absent).
         branch: String,
     },
-    /// A session row; the payload indexes into [`App::sessions`].
-    Session(usize),
+    /// A session row addressing [`App::sessions`].
+    Session {
+        /// Index into [`App::sessions`].
+        index: usize,
+        /// How many fork-lineage members this row is standing in for, driving
+        /// its `(+N)` marker. `0` on a plain row — a lone session, and an
+        /// EXPANDED head (whose members are drawn on their own rows and are
+        /// therefore not hidden by anything). Only a genuinely folded head
+        /// carries a count, so a `(+N)` can never claim a fold that did not
+        /// happen.
+        hidden: usize,
+        /// This row is an expanded lineage member that is NOT its head, so it is
+        /// drawn indented beneath the head it belongs to. Never true for a row
+        /// with no lineage, which must look exactly as it always has.
+        child: bool,
+    },
 }
 
 /// One of the three routes offered when `Enter` lands on a LIVE session — one
@@ -209,6 +224,36 @@ pub fn in_scope(scope: Scope, session: &Session, launch: &Path) -> bool {
     }
 }
 
+/// The session indices in `filtered` that are EXPANDED lineage members standing
+/// beneath a visible head — i.e. every member of a lineage that still shows more
+/// than one row, except that lineage's own head.
+///
+/// Derived from what is VISIBLE rather than from `expanded`, and the two agree by
+/// construction: [`lineage::fold`] leaves a collapsed lineage exactly one visible
+/// member, so a lineage with two or more visible members is an open one. Reading
+/// visibility keeps this honest even if the caller hands over a `filtered` built
+/// some other way — a row is a child iff its head is really on screen with it.
+///
+/// The head is [`lineage::head_of`], never "whichever member came first", so the
+/// D1 rule lives in exactly one place and this cannot drift from the head
+/// [`lineage::fold`] chose. Pure so the child marking is unit-testable on its own.
+fn child_indices(sessions: &[Session], filtered: &[usize]) -> HashSet<usize> {
+    let mut members: HashMap<lineage::LineageKey, Vec<usize>> = HashMap::new();
+    for &i in filtered {
+        if let Some(key) = lineage::lineage_key(&sessions[i]) {
+            members.entry(key).or_default().push(i);
+        }
+    }
+    members
+        .into_values()
+        .filter(|group| group.len() > 1)
+        .flat_map(|group| {
+            let head = lineage::head_of(sessions, &group);
+            group.into_iter().filter(move |&i| i != head)
+        })
+        .collect()
+}
+
 /// Flatten `filtered` (indices into `sessions`, in scope-aware display order)
 /// into rows for the list.
 ///
@@ -218,12 +263,34 @@ pub fn in_scope(scope: Scope, session: &Session, launch: &Path) -> bool {
 /// same-group rows are contiguous, so each group yields exactly ONE head. In
 /// [`Scope::CurrentFolder`] group heads are suppressed entirely and the result
 /// is a flat, timestamp-desc list of session rows.
+///
+/// Folding cannot disturb that one-head-per-group invariant, because a lineage is
+/// keyed by `(repo, branch, root)` (D4): every member of one lineage shares the
+/// group its head sits in, so hiding members or drawing them back can only ever
+/// add or remove rows INSIDE a single group's contiguous run.
+///
+/// `hidden` is [`lineage::fold`]'s head-index -> hidden-count map; an index absent
+/// from it hides nothing and renders as a plain row.
 #[must_use]
-pub fn build_rows(sessions: &[Session], filtered: &[usize], scope: Scope) -> Vec<Row> {
+pub fn build_rows(
+    sessions: &[Session],
+    filtered: &[usize],
+    scope: Scope,
+    hidden: &HashMap<usize, usize>,
+) -> Vec<Row> {
+    let children = child_indices(sessions, filtered);
+    // One place builds a session row, so the flat and grouped lists can never
+    // disagree about a row's marker or indent.
+    let session_row = |i: usize| Row::Session {
+        index: i,
+        hidden: hidden.get(&i).copied().unwrap_or(0),
+        child: children.contains(&i),
+    };
+
     let mut rows = Vec::with_capacity(filtered.len() + 8);
     // Current-folder scope is a flat, head-less list.
     if scope == Scope::CurrentFolder {
-        rows.extend(filtered.iter().map(|&i| Row::Session(i)));
+        rows.extend(filtered.iter().map(|&i| session_row(i)));
         return rows;
     }
     let mut current: Option<(String, String)> = None;
@@ -237,7 +304,7 @@ pub fn build_rows(sessions: &[Session], filtered: &[usize], scope: Scope) -> Vec
             });
             current = Some(key);
         }
-        rows.push(Row::Session(i));
+        rows.push(session_row(i));
     }
     rows
 }
@@ -414,6 +481,28 @@ pub struct App {
     /// Indices (into `sessions`) that pass the scope predicate, cached so a
     /// per-keystroke query re-filter never re-canonicalizes paths.
     scoped: Vec<usize>,
+    /// The fork lineages the user has EXPANDED. EMPTY IS THE DEFAULT, and it
+    /// means every lineage is folded: a background fork shows one row until the
+    /// user opens it.
+    ///
+    /// Keyed by the content-derived [`LineageKey`] and NEVER by a list index —
+    /// the same discipline `selected` follows, and for the same reason. This set
+    /// outlives `apply_sessions`, which replaces `sessions` wholesale and can
+    /// reorder every index in it; an index-keyed set would silently start naming
+    /// a DIFFERENT lineage on the next autorefresh. The key is derived from what
+    /// is inside the files, so it survives any reload that keeps the lineage.
+    expanded: HashSet<LineageKey>,
+    /// Head session index -> how many lineage members that head is currently
+    /// standing in for, rebuilt from scratch by every
+    /// [`recompute_filtered`](Self::recompute_filtered) (see [`lineage::fold`]).
+    /// Feeds the head's `(+N)` marker.
+    ///
+    /// Index-keyed is safe here precisely BECAUSE it is derived rather than
+    /// persisted: it is discarded and rebuilt alongside the `filtered` indices it
+    /// addresses, so no reload can ever leave it pointing at the wrong session.
+    /// Contrast `expanded` above, which must cross reloads and therefore may not
+    /// be.
+    hidden: HashMap<usize, usize>,
     /// Readable, markdown-styled transcript preview, keyed by `session_id`.
     ///
     /// The rendered layout (GFM tables shrink-to-fit) depends on the preview
@@ -466,6 +555,8 @@ impl App {
             last_new_agent: None,
             dragging_split: false,
             scoped: Vec::new(),
+            expanded: HashSet::new(),
+            hidden: HashMap::new(),
             preview_cache: HashMap::new(),
             preview_width: None,
             index,
@@ -492,6 +583,36 @@ impl App {
         self.filtered
             .iter()
             .position(|&i| &self.sessions[i].session_id == id)
+    }
+
+    /// Index into [`sessions`](Self::sessions) of the selected VISIBLE row.
+    ///
+    /// Distinct from [`selected_session`](Self::selected_session), which finds the
+    /// id anywhere in the store: this resolves through `filtered`, so it is the
+    /// index `hidden` and [`lineage::fold`] speak in.
+    fn selected_index(&self) -> Option<usize> {
+        self.filtered.get(self.selected_pos()?).copied()
+    }
+
+    /// The fork lineage of the selected row, or `None` when nothing is selected
+    /// or the selection has no derivable lineage (FAIL-SOFT: a session with no
+    /// root uuid belongs to none and is never folded).
+    fn selected_lineage(&self) -> Option<LineageKey> {
+        lineage::lineage_key(&self.sessions[self.selected_index()?])
+    }
+
+    /// The VISIBLE members of `key`'s lineage, as indices into
+    /// [`sessions`](Self::sessions).
+    ///
+    /// Gathered from `filtered` — the very list [`lineage::fold`] gathers from —
+    /// so a head derived from this can never disagree with the head the fold
+    /// keeps.
+    fn visible_lineage_members(&self, key: &LineageKey) -> Vec<usize> {
+        self.filtered
+            .iter()
+            .copied()
+            .filter(|&i| lineage::lineage_key(&self.sessions[i]).as_ref() == Some(key))
+            .collect()
     }
 
     /// The single selection setter: assign the selected id and, when it actually
@@ -575,6 +696,56 @@ impl App {
     pub fn toggle_scope(&mut self) {
         self.scope = self.scope.toggled();
         self.recompute_scope();
+        self.reapply_preserving_selection();
+    }
+
+    // --- fork-lineage fold toggle -----------------------------------------
+
+    /// Expand the selected row's fork lineage, bringing back the members its head
+    /// stands for.
+    ///
+    /// A no-op unless the selection is a head that is CURRENTLY hiding something.
+    /// `hidden` carries an entry only for such a head (see [`lineage::fold`]), so
+    /// asking it settles every other case at once: a rootless row, a lone
+    /// session, an already-expanded lineage and an empty list all fall through
+    /// without disturbing the list.
+    pub fn expand_selected(&mut self) {
+        let Some(index) = self.selected_index() else {
+            return;
+        };
+        if !self.hidden.contains_key(&index) {
+            return;
+        }
+        let Some(key) = lineage::lineage_key(&self.sessions[index]) else {
+            return;
+        };
+        self.expanded.insert(key);
+        self.reapply_preserving_selection();
+    }
+
+    /// Collapse the selected row's fork lineage back to its single head.
+    ///
+    /// A no-op when the selection has no lineage, or when the lineage has nothing
+    /// to hide — a lone session, or one already folded, since either way only one
+    /// of its members is on screen to begin with.
+    pub fn collapse_selected(&mut self) {
+        let Some(key) = self.selected_lineage() else {
+            return;
+        };
+        let members = self.visible_lineage_members(&key);
+        if members.len() < 2 {
+            return;
+        }
+        let head = lineage::head_of(&self.sessions, &members);
+        // Retarget FIRST — this ordering is the correctness of the whole method.
+        // Collapsing drops every non-head member from `filtered`, so a selection
+        // still pointing at a CHILD would be a selection on a row that no longer
+        // exists, and `restore_selection` would clamp it to whatever unrelated row
+        // inherited that position. Moving to the head while the children are still
+        // visible means the row we are standing on is one the fold is guaranteed
+        // to keep, and the user's place can never be lost as a side effect.
+        self.set_selected(Some(self.sessions[head].session_id.clone()));
+        self.expanded.remove(&key);
         self.reapply_preserving_selection();
     }
 
@@ -907,20 +1078,27 @@ impl App {
             .collect();
     }
 
-    /// Recompute `filtered` from the cached scope set and the active query, then
-    /// sort it into scope-aware display order via
-    /// [`order_filtered`](Self::order_filtered).
+    /// Recompute `filtered` from the cached scope set and the active query, sort
+    /// it into scope-aware display order via
+    /// [`order_filtered`](Self::order_filtered), then FOLD each collapsed fork
+    /// lineage down to its head.
     ///
     /// An empty query takes the whole scope set; a non-empty query keeps only
     /// the scope members that the nucleo index matched. Both paths funnel
     /// through [`order_filtered`](Self::order_filtered), so display ordering is
     /// applied uniformly and the result is never left in raw store order.
+    ///
+    /// The fold is deliberately LAST, AFTER the ordering: it leaves `filtered`
+    /// holding only the indices the user can actually SEE. That single choice is
+    /// what lets `selected_pos`, `move_selection`, `clamp_scroll` and the mouse
+    /// wheel keep working untouched and know nothing about lineages — every one
+    /// of them would otherwise have to skip hidden rows by hand. Folding earlier
+    /// would also hand `order_filtered` a list it no longer decides the shape of.
     fn recompute_filtered(&mut self) {
         if self.query.is_empty() {
             self.filtered = self.scoped.clone();
         } else {
-            let matched: std::collections::HashSet<usize> =
-                self.index.results().into_iter().collect();
+            let matched: HashSet<usize> = self.index.results().into_iter().collect();
             self.filtered = self
                 .scoped
                 .iter()
@@ -929,6 +1107,9 @@ impl App {
                 .collect();
         }
         self.order_filtered();
+        let folded = lineage::fold(&self.sessions, &self.filtered, &self.expanded);
+        self.filtered = folded.visible;
+        self.hidden = folded.hidden;
     }
 
     /// Sort [`filtered`](Self::filtered) into scope-aware DISPLAY order.
@@ -987,22 +1168,62 @@ impl App {
         self.clamp_scroll();
     }
 
-    /// Restore the selection after `filtered` was recomputed: keep the same id
-    /// if it survived, else clamp the previous position into the new list.
+    /// Restore the selection after `filtered` was recomputed: keep the same id if
+    /// it survived; auto-expand its lineage if it was merely FOLDED away; else
+    /// clamp the previous position into the new list.
     fn restore_selection(&mut self, prev_id: Option<String>, prev_pos: Option<usize>) {
-        let survived = prev_id.and_then(|id| {
+        let survived = prev_id.as_ref().and_then(|id| {
             self.filtered
                 .iter()
-                .position(|&i| self.sessions[i].session_id == id)
+                .position(|&i| &self.sessions[i].session_id == id)
         });
-        match survived {
-            Some(pos) => self.select_pos(pos),
-            None if self.filtered.is_empty() => self.set_selected(None),
-            None => {
-                let pos = prev_pos.unwrap_or(0).min(self.filtered.len() - 1);
-                self.select_pos(pos);
-            }
+        if let Some(pos) = survived {
+            self.select_pos(pos);
+            return;
         }
+        // Absent from `filtered` is not the same as GONE. An autorefresh that
+        // introduces a newer fork of the selected session folds the user's row
+        // under a head that did not exist a moment ago — the session is still
+        // right there on disk. Clamping to a neighbour would move the user's place
+        // because a BACKGROUND job wrote a file, which is precisely the surprise
+        // the fold is supposed to prevent. Open the lineage instead.
+        if let Some(pos) = prev_id.as_deref().and_then(|id| self.reveal_hidden(id)) {
+            self.select_pos(pos);
+            return;
+        }
+        if self.filtered.is_empty() {
+            self.set_selected(None);
+            return;
+        }
+        let pos = prev_pos.unwrap_or(0).min(self.filtered.len() - 1);
+        self.select_pos(pos);
+    }
+
+    /// Reveal `id` when it is FOLDED away rather than filtered out, by expanding
+    /// its lineage; reports its position in the recomputed `filtered`.
+    ///
+    /// Returns `None` — leaving `expanded` EXACTLY as it found it — when the id is
+    /// missing for any other reason: deleted on disk, out of scope, or not a query
+    /// match. That rollback is what stops a vanishing row from quietly unfolding a
+    /// lineage the user never opened (a scope toggle would otherwise leave one
+    /// open behind their back); only an expansion that genuinely PUT THE ROW BACK
+    /// is allowed to stick.
+    fn reveal_hidden(&mut self, id: &str) -> Option<usize> {
+        let key = lineage::lineage_key(self.sessions.iter().find(|s| s.session_id == id)?)?;
+        if !self.expanded.insert(key.clone()) {
+            // Already open, so nothing was folding this row away: it is gone.
+            return None;
+        }
+        self.recompute_filtered();
+        let pos = self
+            .filtered
+            .iter()
+            .position(|&i| self.sessions[i].session_id == id);
+        if pos.is_none() {
+            self.expanded.remove(&key);
+            self.recompute_filtered();
+        }
+        pos
     }
 
     /// Clamp the scroll offset into the current row bounds.
@@ -1017,7 +1238,7 @@ impl App {
     /// in the current-folder scope (see [`build_rows`]).
     #[must_use]
     pub fn rows(&self) -> Vec<Row> {
-        build_rows(&self.sessions, &self.filtered, self.scope)
+        build_rows(&self.sessions, &self.filtered, self.scope, &self.hidden)
     }
 
     /// The row index (into [`rows`](Self::rows)) of the selected session, for
@@ -1027,7 +1248,7 @@ impl App {
         let sel = self.selected_pos()?;
         let target = *self.filtered.get(sel)?;
         rows.iter()
-            .position(|r| matches!(r, Row::Session(i) if *i == target))
+            .position(|r| matches!(r, Row::Session { index, .. } if *index == target))
     }
 
     /// The CHAR indices within `display` (a row's visible label) that the
@@ -1112,6 +1333,8 @@ mod tests {
             timestamp: None,
             repo: repo.to_string(),
             label: format!("label for {id}"),
+            root_uuid: None,
+            msg_count: 0,
             content_index: String::new(),
         }
     }
@@ -1134,6 +1357,259 @@ mod tests {
     /// a throwaway launch dir.
     fn app_all(sessions: Vec<Session>) -> App {
         App::new(sessions, Scope::All, PathBuf::from("/tmp/launch"))
+    }
+
+    /// A member of a fork lineage: like [`session_ts`] but carrying the `root`
+    /// uuid every member of a lineage copies verbatim.
+    ///
+    /// Every lineage session is pinned to ONE repo+branch, because the lineage
+    /// key is scoped to them (D4) — a fixture that let the branch vary would be
+    /// testing the scoping rather than the fold.
+    fn session_fork(id: &str, cwd: &str, root: &str, unix_secs: i64) -> Session {
+        let mut s = session_ts(id, "repo", Some("main"), cwd, unix_secs);
+        s.root_uuid = Some(root.to_string());
+        s
+    }
+
+    /// The session ids the board would DRAW, in display order — i.e. `filtered`
+    /// after the fold, which is the whole point of folding there (D6).
+    fn visible_ids(app: &App) -> Vec<&str> {
+        app.filtered
+            .iter()
+            .map(|&i| app.sessions[i].session_id.as_str())
+            .collect()
+    }
+
+    /// How many lineage members the row for `id` hides — `None` when it hides
+    /// nothing and would therefore render no `(+N)` marker.
+    fn hidden_for(app: &App, id: &str) -> Option<usize> {
+        let index = app.sessions.iter().position(|s| s.session_id == id)?;
+        app.hidden.get(&index).copied()
+    }
+
+    // --- fork-lineage folding ---------------------------------------------
+
+    #[test]
+    fn folding_hides_members_and_keeps_the_head() {
+        // The real background-fork shape: ONE conversation in two files sharing a
+        // root uuid under one repo+branch. The bg copy kept growing after the
+        // fork, so it is the newer member and therefore the head (D1).
+        let mut app = app_all(vec![
+            session_fork("ancestor", "/tmp/w", "fork-root", 100),
+            session_fork("bg", "/tmp/w", "fork-root", 200),
+            session_fork("lone", "/tmp/w", "other-root", 50),
+        ]);
+
+        // FOLDED IS THE DEFAULT: `expanded` starts empty, so the duplicate row
+        // the user reported is gone without them doing anything.
+        assert_eq!(
+            visible_ids(&app),
+            vec!["bg", "lone"],
+            "the stalled ancestor folds under its newest fork by default"
+        );
+        assert_eq!(
+            hidden_for(&app, "bg"),
+            Some(1),
+            "the head must report the one member it stands for, so `(+N)` can \
+             say the row is not the whole story"
+        );
+        assert_eq!(
+            hidden_for(&app, "lone"),
+            None,
+            "a session with a lineage of one hides nothing and must never claim \
+             a (+N)"
+        );
+
+        // Expanding brings the ancestor back — nothing was dropped, only hidden.
+        app.expand_selected();
+        assert_eq!(visible_ids(&app), vec!["bg", "ancestor", "lone"]);
+        assert_eq!(
+            hidden_for(&app, "bg"),
+            None,
+            "an open head is standing in for nobody"
+        );
+    }
+
+    #[test]
+    fn j_k_walk_an_expanded_head_into_its_own_children() {
+        // D6: `filtered`'s order IS the navigation order — `selected_pos`,
+        // `move_selection`, `clamp_scroll` and the wheel all read positions in it.
+        // So gathering has to leave `j` walking head -> its children -> next head.
+        // The interloper is what gives this teeth: it is NEWER than the ancestor,
+        // so an ungathered list would read bg -> interloper -> ancestor and `j`
+        // would step off the lineage and back onto it.
+        let mut app = app_all(vec![
+            session_fork("ancestor", "/tmp/w", "fork-root", 100),
+            session_fork("bg", "/tmp/w", "fork-root", 300),
+            session_fork("interloper", "/tmp/w", "other-root", 200),
+        ]);
+        app.select_first();
+        app.expand_selected();
+        assert_eq!(
+            visible_ids(&app),
+            vec!["bg", "ancestor", "interloper"],
+            "the ancestor gathers under its head, ahead of the newer interloper"
+        );
+
+        // Walk down with `j`, then back up with `k`.
+        let mut walk = vec![app.selected.clone().unwrap()];
+        for _ in 0..2 {
+            app.move_selection(1);
+            walk.push(app.selected.clone().unwrap());
+        }
+        assert_eq!(
+            walk,
+            vec!["bg", "ancestor", "interloper"],
+            "`j` must walk the head into its OWN child before the next head"
+        );
+        app.move_selection(-1);
+        assert_eq!(
+            app.selected.as_deref(),
+            Some("ancestor"),
+            "`k` retraces the same order"
+        );
+    }
+
+    #[test]
+    fn collapsing_with_a_child_selected_retargets_to_the_head() {
+        let mut app = app_all(vec![
+            session_fork("ancestor", "/tmp/w", "fork-root", 100),
+            session_fork("bg", "/tmp/w", "fork-root", 200),
+            session_fork("neighbour", "/tmp/w", "other-root", 50),
+        ]);
+        app.expand_selected();
+        // Stand on the CHILD — precisely the row the collapse is about to hide.
+        app.move_selection(1);
+        assert_eq!(app.selected.as_deref(), Some("ancestor"));
+
+        app.collapse_selected();
+
+        assert_eq!(
+            app.selected.as_deref(),
+            Some("bg"),
+            "collapsing must retarget the selection to the lineage head; a \
+             selection left on a row the fold removes cannot survive it"
+        );
+        assert_eq!(
+            app.selected_pos(),
+            Some(0),
+            "the head is a row that is actually on screen"
+        );
+        assert_eq!(visible_ids(&app), vec!["bg", "neighbour"]);
+    }
+
+    #[test]
+    fn expand_state_survives_apply_sessions_reorder() {
+        // STABLE-ID STATE, applied to the fold. Two lineages of two; the user
+        // opens only the FIRST.
+        let a_head = session_fork("a-head", "/tmp/w", "root-a", 400);
+        let a_child = session_fork("a-child", "/tmp/w", "root-a", 300);
+        let b_head = session_fork("b-head", "/tmp/w", "root-b", 200);
+        let b_child = session_fork("b-child", "/tmp/w", "root-b", 100);
+
+        let mut app = app_all(vec![
+            a_head.clone(),
+            a_child.clone(),
+            b_head.clone(),
+            b_child.clone(),
+        ]);
+        app.expand_selected();
+        assert_eq!(visible_ids(&app), vec!["a-head", "a-child", "b-head"]);
+
+        // Reload the SAME four sessions with lineage B first. Every index moves,
+        // and A's head index (0) now addresses B's head — so an `expanded` keyed
+        // by index would open the WRONG lineage and re-fold the user's.
+        app.apply_sessions(vec![b_head, b_child, a_head, a_child]);
+
+        assert_eq!(
+            visible_ids(&app),
+            vec!["a-head", "a-child", "b-head"],
+            "the fold state names a lineage by its CONTENT, so reordering the \
+             sessions vec must not move it onto a different lineage"
+        );
+        assert_eq!(
+            hidden_for(&app, "b-head"),
+            Some(1),
+            "the lineage the user never opened is still folded"
+        );
+        assert_eq!(hidden_for(&app, "a-head"), None, "and theirs is still open");
+    }
+
+    #[test]
+    fn a_reload_that_hides_the_selection_auto_expands_its_lineage() {
+        // Before the hand-off there is no lineage at all: one file, one row.
+        let mut app = app_all(vec![
+            session_fork("mine", "/tmp/w", "fork-root", 100),
+            session_fork("neighbour", "/tmp/w", "other-root", 50),
+        ]);
+        assert_eq!(app.selected.as_deref(), Some("mine"));
+        assert_eq!(visible_ids(&app), vec!["mine", "neighbour"]);
+
+        // Now a background hand-off forks the transcript. The autorefresh brings
+        // in a NEWER copy sharing the root, which takes over as head and would
+        // fold the user's own row away underneath their cursor.
+        app.apply_sessions(vec![
+            session_fork("mine", "/tmp/w", "fork-root", 100),
+            session_fork("neighbour", "/tmp/w", "other-root", 50),
+            session_fork("forked-off", "/tmp/w", "fork-root", 200),
+        ]);
+
+        assert_eq!(
+            app.selected.as_deref(),
+            Some("mine"),
+            "the selected session still exists, so a fork appearing in the \
+             background must never move the user's place"
+        );
+        assert_eq!(
+            visible_ids(&app),
+            vec!["forked-off", "mine", "neighbour"],
+            "its lineage auto-expands, rather than the selection clamping to a \
+             neighbour"
+        );
+    }
+
+    #[test]
+    fn scope_toggle_preserves_expand_state() {
+        let here = unique_temp_dir("fold-scope");
+        let launch = resolve_dir(&here);
+        let cwd = here.to_str().unwrap();
+        let mut app = App::new(
+            vec![
+                session_fork("ancestor", cwd, "fork-root", 100),
+                session_fork("bg", cwd, "fork-root", 200),
+                session_fork("out-head", "/tmp/somewhere-else", "out-root", 60),
+                session_fork("out-child", "/tmp/somewhere-else", "out-root", 50),
+            ],
+            Scope::All,
+            launch,
+        );
+        // Open the in-folder lineage; leave the out-of-folder one alone.
+        app.expand_selected();
+        assert_eq!(visible_ids(&app), vec!["bg", "ancestor", "out-head"]);
+
+        // Stand on a row the scope is about to drop, so the restore path runs
+        // against a selection that is GONE rather than merely folded.
+        app.move_selection(2);
+        assert_eq!(app.selected.as_deref(), Some("out-head"));
+
+        app.toggle_scope();
+        assert_eq!(
+            visible_ids(&app),
+            vec!["bg", "ancestor"],
+            "scoping to the folder drops the outside rows, but says nothing \
+             about lineages and must not re-fold the one the user opened"
+        );
+
+        app.toggle_scope();
+        assert_eq!(
+            visible_ids(&app),
+            vec!["bg", "ancestor", "out-head"],
+            "back in the all scope the open lineage is still open AND the \
+             untouched one is still folded: a row leaving the scope must never \
+             unfold its own lineage behind the user's back"
+        );
+
+        let _ = std::fs::remove_dir_all(&here);
     }
 
     fn unique_temp_dir(tag: &str) -> PathBuf {
@@ -1461,6 +1937,16 @@ mod tests {
 
     // --- grouping for render ----------------------------------------------
 
+    /// A plain session row: no lineage, so nothing hidden and no indent. Rows
+    /// like this must stay exactly what they have always been.
+    fn plain_row(index: usize) -> Row {
+        Row::Session {
+            index,
+            hidden: 0,
+            child: false,
+        }
+    }
+
     #[test]
     fn grouping_emits_one_head_per_repo_branch_group() {
         let sessions = vec![
@@ -1470,7 +1956,7 @@ mod tests {
             session("s3", "repo-b", Some("main"), "/tmp/s3"),
         ];
         let filtered = vec![0usize, 1, 2, 3];
-        let rows = build_rows(&sessions, &filtered, Scope::All);
+        let rows = build_rows(&sessions, &filtered, Scope::All, &HashMap::new());
 
         // Distinct groups: (repo-a,main), (repo-a,dev), (repo-b,main) -> 3 heads.
         let heads: Vec<&Row> = rows
@@ -1488,18 +1974,18 @@ mod tests {
                     repo: "repo-a".into(),
                     branch: "main".into()
                 },
-                Row::Session(0),
-                Row::Session(1),
+                plain_row(0),
+                plain_row(1),
                 Row::Group {
                     repo: "repo-a".into(),
                     branch: "dev".into()
                 },
-                Row::Session(2),
+                plain_row(2),
                 Row::Group {
                     repo: "repo-b".into(),
                     branch: "main".into()
                 },
-                Row::Session(3),
+                plain_row(3),
             ]
         );
     }
@@ -1507,7 +1993,7 @@ mod tests {
     #[test]
     fn detached_branch_groups_under_detached_head() {
         let sessions = vec![session("s0", "repo-a", None, "/tmp/s0")];
-        let rows = build_rows(&sessions, &[0], Scope::All);
+        let rows = build_rows(&sessions, &[0], Scope::All, &HashMap::new());
         assert_eq!(
             rows[0],
             Row::Group {
@@ -1529,7 +2015,7 @@ mod tests {
         let rows = app.rows();
         let row = app.selected_row(&rows).expect("selected row");
         assert!(
-            matches!(rows[row], Row::Session(1)),
+            matches!(rows[row], Row::Session { index: 1, .. }),
             "selected_row must land on the session row, not a group head: {rows:?}"
         );
     }
@@ -1559,19 +2045,19 @@ mod tests {
                     repo: "repo-b".into(),
                     branch: "main".into()
                 },
-                Row::Session(3), // b-new (400)
-                Row::Session(2), // b-old (200)
+                plain_row(3), // b-new (400)
+                plain_row(2), // b-old (200)
                 Row::Group {
                     repo: "repo-a".into(),
                     branch: "main".into()
                 },
-                Row::Session(1), // a-new (300)
-                Row::Session(0), // a-old (100)
+                plain_row(1), // a-new (300)
+                plain_row(0), // a-old (100)
                 Row::Group {
                     repo: "repo-c".into(),
                     branch: "main".into()
                 },
-                Row::Session(4), // c-only (50)
+                plain_row(4), // c-only (50)
             ],
             "groups most-recent-desc, rows ts-desc, one head per group: {rows:?}"
         );
@@ -1593,12 +2079,12 @@ mod tests {
         let rows = app.rows();
 
         assert!(
-            rows.iter().all(|r| matches!(r, Row::Session(_))),
+            rows.iter().all(|r| matches!(r, Row::Session { .. })),
             "current-folder scope must be a flat, head-less list: {rows:?}"
         );
         assert_eq!(
             rows,
-            vec![Row::Session(1), Row::Session(0), Row::Session(2)],
+            vec![plain_row(1), plain_row(0), plain_row(2)],
             "flat list ordered purely by timestamp desc: {rows:?}"
         );
         let _ = std::fs::remove_dir_all(&here);
@@ -1610,10 +2096,10 @@ mod tests {
             session("s0", "repo-a", Some("main"), "/tmp/s0"),
             session("s1", "repo-b", Some("dev"), "/tmp/s1"),
         ];
-        let rows = build_rows(&sessions, &[0, 1], Scope::CurrentFolder);
+        let rows = build_rows(&sessions, &[0, 1], Scope::CurrentFolder, &HashMap::new());
         assert_eq!(
             rows,
-            vec![Row::Session(0), Row::Session(1)],
+            vec![plain_row(0), plain_row(1)],
             "the folder scope emits only session rows, no heads: {rows:?}"
         );
     }

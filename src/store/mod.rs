@@ -9,6 +9,7 @@
 pub mod discover;
 pub mod group;
 pub mod label;
+pub mod lineage;
 pub mod parse;
 pub mod preview;
 
@@ -36,6 +37,21 @@ pub struct Session {
     pub repo: String,
     /// Derived display label (see [`label::finalize_label`]).
     pub label: String,
+    /// `uuid` of the transcript tree's root record (see [`parse::ParsedFile`]).
+    /// Shared verbatim by every member of a background-fork lineage, so it is
+    /// what identifies one (read by [`lineage::lineage_key`]). `None` (no
+    /// derivable root) means "no lineage", and is never folded.
+    pub root_uuid: Option<String>,
+    /// How many conversation turns the transcript holds (see
+    /// [`parse::ParsedFile::msg_count`]).
+    ///
+    /// Drawn on an expanded lineage CHILD row, and it is the one field there
+    /// that carries real information: every member of a lineage shares a label
+    /// BY CONSTRUCTION (a background hand-off copies the conversation), so the
+    /// label cannot tell them apart and neither a timestamp nor an id says
+    /// which member is a stalled stub and which holds the work. `6` beside
+    /// `171` says it at a glance.
+    pub msg_count: usize,
     /// Capped, readable transcript text for content search.
     pub content_index: String,
 }
@@ -73,6 +89,8 @@ impl Session {
             timestamp,
             repo,
             label,
+            root_uuid: parsed.root_uuid,
+            msg_count: parsed.msg_count,
             content_index: parsed.content_index,
         })
     }
@@ -145,8 +163,8 @@ mod tests {
                 .any(|p| p.components().any(|c| c.as_os_str() == "subagents")),
             "discovery must never descend into a subagents/ directory: {files:?}"
         );
-        // The five depth-2 `.jsonl` files, none of the nested subagent file.
-        assert_eq!(files.len(), 5, "unexpected discovered set: {files:?}");
+        // The eight depth-2 `.jsonl` files, none of the nested subagent file.
+        assert_eq!(files.len(), 8, "unexpected discovered set: {files:?}");
     }
 
     #[test]
@@ -168,8 +186,75 @@ mod tests {
             !sessions.iter().any(|s| s.label.contains("Sidecar title")),
             "a sidecar file with no cwd was surfaced as a session"
         );
-        // Exactly four resumable sessions survive (5 discovered - 1 sidecar).
-        assert_eq!(sessions.len(), 4, "unexpected session count");
+        // Exactly seven resumable sessions survive (8 discovered - 1 sidecar).
+        assert_eq!(sessions.len(), 7, "unexpected session count");
+    }
+
+    #[test]
+    fn fork_pair_shares_one_root_uuid_through_the_session_model() {
+        let sessions = load();
+        let fg = find(&sessions, "sess-fork-fg-1");
+        let bg = find(&sessions, "sess-fork-bg-1");
+
+        // The lineage identity survives `Session::from_file`, and it is the
+        // SHARED tree root copied verbatim into the background fork — an
+        // `attachment`, ahead of either file's first user message.
+        assert_eq!(fg.root_uuid.as_deref(), Some("fork-root-att"));
+        assert_eq!(bg.root_uuid.as_deref(), Some("fork-root-att"));
+
+        // Why the pair is indistinguishable on the board today: same repo, same
+        // branch, same label. This is the "double session" the fold addresses.
+        assert_eq!(fg.label, bg.label);
+        assert_eq!(fg.repo, bg.repo);
+        assert_eq!(fg.branch_display(), bg.branch_display());
+        assert_ne!(fg.session_id, bg.session_id, "two distinct session files");
+
+        // The background copy is the newer one (D1's head), and it kept growing
+        // after the fork while the ancestor stalled.
+        assert!(bg.timestamp > fg.timestamp);
+    }
+
+    #[test]
+    fn fork_pair_members_report_different_turn_counts() {
+        let sessions = load();
+        let fg = find(&sessions, "sess-fork-fg-1");
+        let bg = find(&sessions, "sess-fork-bg-1");
+
+        // The exact shape of the reported bug: everything a board row normally
+        // shows is IDENTICAL across the pair (asserted above), so the turn count
+        // is the only field that separates the stalled ancestor from the copy
+        // that kept working. If these two ever agreed, the column would be
+        // decoration — a fixture that cannot distinguish the members cannot
+        // test the thing they are distinguished BY.
+        assert_ne!(
+            fg.msg_count, bg.msg_count,
+            "the fork pair must differ in turns or it pins nothing"
+        );
+        // The ancestor stalled at the fork point with one exchange; the bg copy
+        // carries that same exchange plus the work it did afterwards.
+        assert_eq!(fg.msg_count, 2);
+        assert_eq!(bg.msg_count, 4);
+        assert!(
+            bg.msg_count > fg.msg_count,
+            "the member that kept going is the one holding the work"
+        );
+
+        // Both files carry THREE copied `attachment` records ahead of their
+        // first prompt, so counting tree records instead of turns would report
+        // 5 and 7. The turns are what the count means.
+        assert_ne!(fg.msg_count, 5);
+        assert_ne!(bg.msg_count, 7);
+    }
+
+    #[test]
+    fn a_session_with_no_null_parent_record_survives_with_no_root() {
+        let sessions = load();
+        let s = find(&sessions, "sess-rootless-1");
+        // FAIL-SOFT: no derivable root degrades to "no lineage" (never folded),
+        // never to a dropped session.
+        assert_eq!(s.root_uuid, None);
+        assert_eq!(s.cwd, PathBuf::from("/Users/me/project-delta"));
+        assert_eq!(s.label, "Rewrite the changelog entry");
     }
 
     #[test]

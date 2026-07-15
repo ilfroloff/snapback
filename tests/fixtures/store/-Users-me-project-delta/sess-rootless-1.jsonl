@@ -1,0 +1,4 @@
+{"type":"last-prompt","sessionId":"sess-rootless-1","leafUuid":"rootless-leaf-1"}
+{"type":"file-history-snapshot","sessionId":"sess-rootless-1","messageId":"rootless-1","snapshot":{}}
+{"type":"user","sessionId":"sess-rootless-1","cwd":"/Users/me/project-delta","gitBranch":"feature/fold","timestamp":"2026-07-14T11:00:00.000Z","uuid":"rootless-user-1","parentUuid":"trimmed-away","isSidechain":false,"message":{"role":"user","content":"Rewrite the changelog entry"}}
+{"type":"assistant","sessionId":"sess-rootless-1","cwd":"/Users/me/project-delta","gitBranch":"feature/fold","timestamp":"2026-07-14T11:00:05.000Z","uuid":"rootless-assistant-1","parentUuid":"rootless-user-1","message":{"role":"assistant","content":[{"type":"text","text":"Sure."}]}}

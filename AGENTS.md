@@ -151,6 +151,157 @@ Full command reference and the validation checklist:
   arrangement release-plz's own git-only setup expects. Comments in `Cargo.toml`
   and `release-plz.toml` plus the release section of `OPERATIONS.md` were
   reconciled to that mechanism. No code or config-value changes.
+- **2026-07-15** — Restored the `N msgs` turn count on an expanded fork lineage's
+  CHILD rows, which the fold below shipped without. The drop was the wrong call,
+  and its three arguments are recorded here because each will look reasonable
+  again: (1) *"`Session` carries no message count"* — true, and that is the thing
+  to FIX, not a reason not to do it; a missing field is a task, not a constraint.
+  (2) *"`content_index` is a 64 KB-capped dump that would silently lie at the
+  cap"* — a CORRECT argument, but only against using `content_index` as a PROXY
+  for the count. It says nothing about a real counter and went irrelevant the
+  moment one existed; it is now pinned from the other side by a test that counts
+  200 turns in a file whose index stops dead at the cap. (3) *"widening the model
+  to satisfy a mockup is the speculative abstraction YAGNI forbids"* — a MISREAD.
+  YAGNI forbids fields added because they MIGHT be needed; this one serves a
+  shipped, approved UI requirement, which makes it REQUIRED rather than
+  speculative. "A mockup" is the wrong frame for a ratified spec, and YAGNI never
+  licenses declining to build what was asked for.
+  What all three missed is the point of the row: lineage members are
+  label-identical BY CONSTRUCTION — that identity IS the duplicate-row bug — so
+  `6 msgs` beside `171 msgs` is the single most informative thing a child can
+  carry. It says at a glance which member is a stalled stub and which holds the
+  work. The timestamp and the 8-char id say WHICH member; neither says which one
+  is worth going back to.
+  **A turn is a `user` or `assistant` record — deliberately a NARROWER set than
+  the four types (`user`/`assistant`/`attachment`/`system`) the root-uuid logic
+  calls tree records, and the two are NOT to be unified.** Roughly a quarter of
+  the tree is not conversation: `attachment` context is hook-injected and
+  `system` records are notices — nobody typed them and claude did not answer
+  them. Counting tree records would inflate a stub that holds no work into
+  something that looks like it does, which is precisely the question the number
+  exists to answer. Two overlapping notions, one of them a tree test and the
+  other a conversation test; collapsing them into a single "tree record"
+  predicate would break the count while leaving the lineage correct, which is the
+  kind of bug that reads as a tidy-up. The counter rides the EXISTING streaming
+  pass — no second read, no allocation, nothing to invalidate — and sits OUTSIDE
+  the cap guard, which is the whole of argument (2)'s answer. FAIL-SOFT: no turns
+  counts 0, and a missing or non-string `type` simply does not count.
+  **The ` N msgs` segment is ALL-OR-NOTHING — drawn whole or dropped entirely,
+  never clipped.** A clipped count is not a smaller count, it is a WRONG one:
+  `171` cut to fit reads back as `17`, a plausible number off by an order of
+  magnitude, and it would send the user to resume the wrong member. No answer
+  leaves them where they were; a confident wrong answer does not. The 8-char id
+  is not shortened to make room either — it is already at its documented minimum
+  (`CHILD_ID_CHARS`), so it has nothing left to give, and trimming it would trade
+  a field that cannot be wrong for one that can while risking two children on a
+  shared prefix. The count is the field that yields last and, when the columns run
+  out, entirely. That is the same marker-first discipline `fit_label` already
+  applies, not an exception to it: there the label yields because it is redundant,
+  here the count yields because it is the only thing left that can.
+  Docs refreshed: `DOMAIN.md` gains the turn count as a derived concept (the
+  turns-vs-tree-records split, and why a real counter is untouched by the cap
+  objection that sank the proxy) and records what an expanded child row carries
+  and why the count is the informative field; `ARCHITECTURE.md` notes `msg_count`
+  falling out of the same streaming pass as `root_uuid`, counted outside the cap
+  guard, plus the view's all-or-nothing drop; `PATTERNS.md` §3 registers
+  `child_msgs`/`fit_child_msgs` and its fixture inventory records that the fork
+  pair's members differ in turns on purpose; `README.md` tells the user the
+  fanned-out copies say how much work each one holds.
+- **2026-07-15** — Folded background-fork lineages behind one expandable row,
+  ending the visually identical "double sessions" the board drew during
+  background work. The cause was never a parse bug: handing a prompt to a
+  background job makes claude FORK the transcript — it copies the foreground
+  file's records verbatim (identical record `uuid`s) into a NEW `sessionId` file,
+  stamps it `sessionKind: "bg"`, and appends there while the foreground file
+  stops growing. Both share `cwd` + `gitBranch` + first prompt, so
+  `label::finalize_label` derives the SAME label and the rows are
+  indistinguishable. The store itself is clean — zero duplicate `sessionId`s,
+  every file separately resumable — so this is presentation, and the fold is
+  presentation-ONLY. That is proven rather than asserted: a same-moment A/B of
+  two binaries against ONE store state (265 vs 265, **id sets identical**, and
+  the id-set comparison is what carries it, since two equal counts could hide an
+  offsetting drop+add). The method was forced by the store itself — a count
+  written down earlier is NOT a baseline, because the live store DRIFTS under the
+  measurement: four sessions vanished from disk mid-implementation, so comparing
+  against the recorded 269 would have reported a phantom 4-session regression.
+  A TOGGLE, not a hide, because the twins are not redundant: the bg copy is what
+  makes `claude -r` refuse, so the stalled ancestor is the ONLY plain-resumable
+  copy of that conversation. Hiding it irrecoverably would delete a real
+  capability. `←`/`→` were unbound and are non-printable, so they can never be
+  swallowed by type-to-search the way a plain letter would.
+  **The lineage identity is the `uuid` of the record whose `parentUuid` is JSON
+  `null` — the transcript TREE's root — NOT the first user/assistant uuid.** That
+  correction is the load-bearing one. The first-message key is anchored to FILE
+  ORDER, so it breaks whenever a fork's leading prompt differs (edited-and-resent,
+  or a slash-command turn ordered differently) even though the conversation is
+  identical: measured, it MISSED three real lineages, one of which shares 133 of
+  ~136 message uuids with its twin. The null-parent root is STRUCTURAL — copied
+  verbatim into every fork, so nothing downstream can move it — and it costs one
+  comparison inside the EXISTING streaming pass: no walk, no second read, no
+  index (YAGNI — the field falls out for free). It cannot false-positive either,
+  since uuids are minted per record, so only a COPIED prefix can collide and a
+  copied prefix IS a fork. Two traps are pinned by tests because both look like
+  bugs to a future reader: `type` is deliberately NOT filtered on (the root is an
+  `attachment` far more often than a `user` — the conversation starts two records
+  deep, behind hook-injected context), and `parentUuid: null` (the root) is a
+  different answer from an ABSENT `parentUuid` (a record outside the tree).
+  FAIL-SOFT throughout: `root_uuid: Option<String>`; `None` ⇒ no lineage ⇒ never
+  folded, never dropped.
+  Keyed on `(repo, branch, root)` rather than the root ALONE: some lineages span
+  branches, and folding across them would gather members across branch group
+  heads and break `build_rows`' one-head-per-group invariant. It is also the
+  correct semantic — a fork onto another branch is different work, and keeps its
+  own row under its own branch's head.
+  Folding is **content-derived and never liveness-gated**, which is the quietest
+  decision here and the one most likely to be "improved" later. Gating the fold on
+  having a live twin would let the ~1s agents poll restructure the list once per
+  second, with rows appearing and vanishing under the cursor — precisely what
+  STABLE-ID STATE exists to prevent. `expanded` is likewise keyed by the
+  content-derived `LineageKey` and never by index, so it survives the reload that
+  reorders every index in it.
+  **Gathering an expanded lineage's members under their head is deliberate and
+  implemented, not emergent** — an earlier draft called it "inherent to folding",
+  which was simply wrong. Filtering alone leaves a child at its OWN timestamp
+  slot, and time scatters a lineage: measured, 18 of 27 head→child pairs have
+  unrelated rows between them, so an un-gathered child lands as an indented,
+  label-less row far from the head that explains it — leaving the original
+  complaint ("I can't tell these apart") moved rather than solved. It lives in
+  `fold`, not `build_rows`, which cannot reorder without breaking the rule that
+  `filtered`'s order IS the navigation order.
+  New pure, framework-free `store::lineage` (`lineage_key` / `head_of` / `fold`),
+  with D1's rank written down ONCE as a private `member_rank` that both the head
+  pick and the gather sort read, so the head can never drift from the top of its
+  own run. `(+N)` is `Modifier::DIM` + named ANSI; the pure `fit_label` reserves
+  the marker's columns BEFORE the label's, so a narrow pane clips the (identical,
+  by-construction redundant) label rather than the one mark saying this row stands
+  for others — clip that and the fold silently becomes the vanished-sessions bug
+  it exists to prevent. No `▸`/`▾` chevron: an expanded head hides nothing and so
+  carries no count, making it indistinguishable from a lone row at row level,
+  while its gathered children already say it is open. A child row reports
+  (timestamp, badge, 8-char id) and asserts nothing about resumability — that is
+  the hand-off probe's call, never a render's.
+  (**The field list SUPERSEDED 2026-07-15**: a child row also reports its TURN
+  COUNT. Dropping it here was wrong — the members of a lineage are
+  label-identical by construction, so the count is the ONE field on that row that
+  says which of them is a stalled stub and which holds the work, and the reasons
+  given for dropping it do not survive inspection. The "asserts nothing about
+  resumability" half STANDS exactly as written: a turn count is a REPORT of what
+  the file contains, never a prediction of what claude's gate will permit. See
+  the entry above, which wins wherever the two disagree.)
+  Docs refreshed: `DOMAIN.md` gains the fork-on-background mechanism, the
+  `sessionKind` field (recorded as the thing that explains the duplicate on disk,
+  and deliberately NOT read — the tree is what proves two files are one
+  conversation), and the tree/root-uuid lineage model. All three were
+  undocumented anywhere in the repo, which is exactly why the duplicate rows were
+  surprising. It also now splits the TWO senses of "fork" — the hand-off snapback
+  performs on request (`--fork-session`) versus the copy claude makes unasked —
+  where it previously knew only the former; and it records the store shape as
+  PROVENANCE, not a contract, following the sampled `state`/`status` precedent,
+  with the observed drift written down. `ARCHITECTURE.md` gains the
+  `store::lineage` row, the fold's place above the load pipeline, and the app/view
+  ownership; `PATTERNS.md` §3 registers the new pure fns and its fixture inventory
+  gains the fork pair + root-less session; `README.md` describes the fold for end
+  users.
 - **2026-07-15** — Closed the loose thread the entry below left: the Attach job
   id was still read from `App::reported_agent(...)` — the `--all` polled map that
   the same entry declares too stale to trust for liveness. That is the identical
