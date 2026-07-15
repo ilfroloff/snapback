@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ratatui::layout::{Alignment, Constraint, Layout, Margin, Position, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -20,6 +20,7 @@ use ratatui::widgets::{
 use ratatui::Frame;
 use time::OffsetDateTime;
 
+use crate::agents::{self, AgentActivity, ReportedAgent};
 use crate::search::SearchMode;
 use crate::store::preview::LinkRegion;
 
@@ -75,6 +76,50 @@ const GIT_HASH: &str = env!("SNAPBACK_GIT_HASH");
 /// `"0"` (see `build.rs`). Only consulted for dev builds.
 const GIT_DIRTY: &str = env!("SNAPBACK_GIT_DIRTY");
 
+/// How many `AppEvent::Tick`s each phase of the live-badge pulse lasts.
+///
+/// The pulse is driven by the board's own redraw cadence rather than by the
+/// terminal: 2 x [`crate::watch::TICK`] (250ms) = 500ms shown + 500ms hidden,
+/// so one full cycle is 1000ms (~1Hz) — the classic cursor-blink rate, and the
+/// cadence asked for. The two are MULTIPLIED, so this is only meaningful next to
+/// `watch::TICK`: if that cadence ever changes, retune this to keep ~1Hz.
+const BLINK_TICKS: u64 = 2;
+
+/// The glyph of a live badge's dot.
+///
+/// Drawn for EVERY reported agent in EVERY pulse phase, active or not: the pulse
+/// alternates the dot's COLOR and must never touch its symbol (see
+/// [`pulse_color`] for why).
+const BADGE_DOT: &str = "\u{25cf}";
+
+/// The base badge color of the buckets that PULSE (`Working`, and `Other`
+/// tracking it — see [`crate::agents::is_active`]).
+///
+/// Named rather than spelled inline in [`badge_color`] so [`pulse_color`] can
+/// declare its dim partner against the SAME value the palette hands out: the two
+/// are one pair, and a pulse that dimmed a color `badge_color` no longer emits
+/// would silently stop pulsing.
+const BADGE_WORKING: Color = Color::Gray;
+/// [`BADGE_WORKING`]'s dim partner — the color its dot alternates to on the
+/// pulse's off phase.
+///
+/// `DarkGray` is the NAMED ANSI dim gray, so it reads as the same badge at lower
+/// intensity on any theme (TERMINAL-SAFE STYLING) rather than as a second state.
+const BADGE_WORKING_DIM: Color = Color::DarkGray;
+
+/// The glyph of the search line's cursor.
+const SEARCH_CURSOR: &str = "\u{258f}";
+/// What the pulsing search cursor renders in its hidden phase: a SAME-WIDTH
+/// blank. The cursor is currently the LAST span on its line, so blanking and
+/// dropping it paint identical cells today; the blank is what keeps the column
+/// held if anything is ever appended after it.
+///
+/// Show/hide is right HERE and only here: a cursor's whole job is to appear and
+/// disappear, and nothing on the search line is auto-detected by the terminal, so
+/// mutating this line's text costs nothing. The badge dot deliberately does NOT
+/// work this way — see [`pulse_color`].
+const SEARCH_CURSOR_HIDDEN: &str = " ";
+
 /// The preview scrollbar's `begin_symbol`, shown ONLY when the preview is
 /// pinned to the very top (`offset == 0`) — a clear directional glyph for the
 /// boundary-only arrow, chosen deliberately since we set `begin_symbol`
@@ -91,6 +136,12 @@ const SCROLLBAR_END_ARROW: &str = "↓";
 /// constant across scroll positions, rather than the thumb's geometry
 /// jittering each time an arrow pops in or out at an edge.
 const SCROLLBAR_ARROW_HIDDEN: &str = " ";
+
+/// Rows the PINNED status banner reserves at the top of the preview's
+/// inner area (see [`preview_split`]). Exactly one: [`preview_banner`] is a
+/// single, never-wrapped line, so a taller reservation would only add dead
+/// space above the transcript and a shorter one would hide the banner outright.
+const PREVIEW_BANNER_ROWS: u16 = 1;
 
 /// Build the header's version label from compile-time metadata.
 ///
@@ -259,16 +310,38 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                     ),
                     Span::raw("  "),
                 ];
-                // Compact live badge in its own column: `● bg` / `● live` (+ a dim
-                // state/status qualifier). Non-live rows show nothing here. Joined
-                // strictly by full session_id.
-                if let Some(agent) = app.live_agent(&session.session_id) {
-                    spans.push(Span::styled(
-                        format!("\u{25cf} {}", agent.kind_label()),
-                        Style::default()
-                            .fg(Color::Green)
-                            .add_modifier(Modifier::BOLD),
-                    ));
+                // Compact agent badge in its own column: `● bg` / `● live` (+ a
+                // dim state/status qualifier). Rows claude never reported show
+                // nothing here. Joined strictly by full session_id.
+                //
+                // Deliberately keyed on REPORTED, not live: an agent that
+                // reported completion must still render its badge — green and
+                // steady — so the board shows what claude knows. Only Enter's
+                // routing cares about liveness, and it asks claude directly
+                // (`App::is_live_now`) rather than reading this map.
+                if let Some(agent) = app.reported_agent(&session.session_id) {
+                    // Dot and kind label are separate spans purely so they can
+                    // share one state color yet differ in pulse: the whole badge
+                    // is colored by state, but ONLY the dot pulses — a blinking
+                    // text label would be noise on a board of live sessions.
+                    let base = badge_color(agent);
+                    let badge = Style::default().fg(base).add_modifier(Modifier::BOLD);
+                    // The pulse is APP-driven off the tick the loop already
+                    // redraws on — see [`blink_visible`] for why the terminal
+                    // cannot be asked to animate it. Only an ACTIVE agent
+                    // pulses; a blocked/idle one is steady in both phases.
+                    //
+                    // It pulses by COLOR: the glyph itself is drawn every phase,
+                    // so this row's TEXT never changes and the terminal is never
+                    // forced to re-detect a link in the label beside it — see
+                    // [`pulse_color`].
+                    let dot = if agents::is_active(agent) && !blink_visible(app.tick) {
+                        badge.fg(pulse_color(base))
+                    } else {
+                        badge
+                    };
+                    spans.push(Span::styled(BADGE_DOT, dot));
+                    spans.push(Span::styled(format!(" {}", agent.kind_label()), badge));
                     if let Some(qualifier) = agent.qualifier() {
                         spans.push(Span::raw(" "));
                         spans.push(Span::styled(
@@ -317,18 +390,215 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
     app.scroll = state.offset();
 }
 
+/// The BASE color of a reported agent's whole badge — both the `\u{25cf}` dot
+/// AND the `bg`/`live` kind label, which must always agree.
+///
+/// Pure, and derived from [`crate::agents::classify`] like every other
+/// qualifier-shaped output, so the `state`/`status` value set is never re-matched
+/// here — this maps from the BUCKET, not from the raw wire strings. The palette
+/// reads as urgency: YELLOW = needs you, GREEN = ready (idle or finished), GRAY =
+/// quietly working.
+///
+/// Color is exactly what marks activity: an ACTIVE bucket's dot alternates
+/// between this base and [`pulse_color`]'s dim partner, while a resting bucket's
+/// holds this base in both phases (see [`crate::agents::is_active`]). The kind
+/// label never pulses, so it always carries this base — which is what keeps the
+/// state readable through the dot's off phase.
+///
+/// Lives here rather than beside `classify` because it is the only
+/// qualifier-derived output that is a RENDERING decision: keeping it in `agents`
+/// would drag ratatui into the fail-soft JSONL parser layer, which stays
+/// framework-independent.
+///
+/// TERMINAL-SAFE STYLING: these are NAMED ANSI colors, never RGB, so they adapt
+/// to the user's terminal theme and survive a light background.
+/// [`BADGE_WORKING`] is `Gray` rather than `DarkGray` to keep the working badge
+/// legible on dark terminals; `DarkGray` is its PULSE partner, not its resting
+/// color (see [`pulse_color`]).
+///
+/// `pub(crate)` only so [`AgentActivity`]'s docs can point at the palette their
+/// buckets feed; `render_list` is its one caller.
+#[must_use]
+pub(crate) fn badge_color(agent: &ReportedAgent) -> Color {
+    match agents::classify(agent) {
+        AgentActivity::NeedsInput => Color::Yellow,
+        // Green reads "nothing is wanted from you": idle is ready to take a turn,
+        // done has finished cleanly. Both are steady, so green never has to carry
+        // the activity signal on its own.
+        AgentActivity::Idle | AgentActivity::Done => Color::Green,
+        // Unknown/absent tracks the working bucket, matching `is_active`.
+        AgentActivity::Working | AgentActivity::Other => BADGE_WORKING,
+    }
+}
+
+/// The dim partner a PULSING dot alternates to, given its [`badge_color`] base.
+///
+/// **The pulse changes a cell's STYLE and NEVER its SYMBOL.** That is the whole
+/// reason this function exists. The dot used to pulse by swapping its glyph for a
+/// blank, which MUTATES the row's text; we emit plain-text URLs (no OSC 8), so
+/// the terminal auto-detects links by TEXT PATTERN and a mutated line forces it
+/// to re-scan and re-render that line's URL underline — a session label carrying
+/// a URL visibly flickered every phase. A style-only change leaves the text
+/// identical, so there is nothing to re-detect. Do NOT "optimize" this back to a
+/// blank span.
+///
+/// Pure, and the ONE place a bucket's dim partner is declared: a future bucket
+/// that pulses off a different base adds its arm here, next to the pair it dims.
+///
+/// Both sides are NAMED ANSI colors, never RGB and never `Modifier::DIM`:
+/// attribute support is inconsistent across terminals, which is exactly how the
+/// ANSI blink attribute shipped inert (see [`blink_visible`]). A named color
+/// always renders.
+///
+/// The fallback is IDENTITY — FAIL-SOFT, so an undeclared base renders steady
+/// rather than panicking or guessing at a dim value it cannot know is legible.
+/// That is deliberate, but it IS a trap: a future PULSING bucket whose base has
+/// no arm above would silently stop pulsing, green-but-broken. The exhaustive
+/// bucket walk in `every_pulsing_buckets_badge_color_has_a_distinct_dim_partner`
+/// is what turns that silence into a loud test failure.
+#[must_use]
+fn pulse_color(base: Color) -> Color {
+    match base {
+        BADGE_WORKING => BADGE_WORKING_DIM,
+        // FAIL-SOFT identity — and the trap the walk above pins shut.
+        other => other,
+    }
+}
+
+/// Whether the board's pulse is in its ON phase at `tick`.
+///
+/// The ONE phase source on the board: the live badge's dot and the search line's
+/// cursor both read it, so they move together instead of drifting. What each
+/// side DOES with the phase differs, and deliberately so — the dot swaps color
+/// ([`pulse_color`]), while the cursor shows/hides ([`SEARCH_CURSOR_HIDDEN`]).
+/// The name is the cursor's literal reading and the dot's ON/OFF phase; anything
+/// animated later phases off this too.
+///
+/// Pure, so the pulse's timing is unit-testable without a terminal or a clock:
+/// `tick` is just the count of `AppEvent::Tick`s so far ([`App::tick`]), which
+/// advances at the [`crate::watch::TICK`] cadence the render loop ALREADY
+/// redraws on. Each phase runs [`BLINK_TICKS`] ticks, so ticks 0-1 are ON, 2-3
+/// OFF, 4-5 ON, and so on.
+///
+/// This is the pulse's whole mechanism, and it is app-driven ON PURPOSE. The
+/// obvious alternative — style the dot with the ANSI blink attribute (SGR 5,
+/// ratatui's slow-blink `Modifier`) and let the terminal animate it — DOES NOT
+/// WORK: most modern terminals (iTerm2, Ghostty, WezTerm, Alacritty, macOS
+/// Terminal) ignore that attribute, so the dot renders steady and the feature is
+/// silently dropped. It was tried, and it is why this function exists; do not
+/// "simplify" back to it. That same inconsistency is why the dot's OFF phase is a
+/// named color rather than `Modifier::DIM`.
+///
+/// A wrapping `tick` is harmless here: one full cycle is `2 * BLINK_TICKS`
+/// ticks, and `u64::MAX + 1` is a power of two and therefore a whole number of
+/// cycles, so the phase stays aligned across the rollover.
+#[must_use]
+fn blink_visible(tick: u64) -> bool {
+    // Which phase of the cycle `tick` falls in: the 2 is the cycle's phase count
+    // (shown, then hidden), so the even phases are the shown ones.
+    (tick / BLINK_TICKS).is_multiple_of(2)
+}
+
+/// The status banner line for the SELECTED session, or `None` when claude never
+/// reported that session as an agent (the preview then renders unchanged).
+///
+/// Read-only over state that already exists: the selected id (`App::selected`)
+/// joined through the existing `App::reported_agent` accessor, with the phrasing
+/// owned by [`agents::friendly_status`] — no new `App` state, no new I/O, and no
+/// second interpretation of the `state`/`status` value set.
+///
+/// Keyed on REPORTED, not live, so a FINISHED agent still gets its banner (`bg
+/// done`) rather than silently losing it.
+///
+/// Exposed to `super::update` so the link hit-test can ask the SAME question the
+/// view does — "does this session have a banner?" — and derive the same
+/// transcript rect via [`preview_split`]; the two must agree, or a click would
+/// resolve to the wrong transcript row.
+pub(crate) fn preview_banner(app: &App) -> Option<Line<'static>> {
+    let agent = app.reported_agent(app.selected.as_deref()?)?;
+    // Cyan + BOLD marks the line as the board speaking rather than transcript
+    // content (the search prompt uses the same accent). NAMED so it adapts to
+    // the terminal theme — no RGB (TERMINAL-SAFE STYLING).
+    Some(Line::from(Span::styled(
+        agents::friendly_status(agent),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )))
+}
+
+/// Split the preview pane's `area` into its `(banner, transcript)` rects.
+///
+/// The pane's inner area — inside the block's borders, which steal one cell per
+/// side (this mirrors `Block::inner` for `Borders::ALL`) — is divided into a
+/// PINNED banner row and the scrolling transcript beneath it. `has_banner` is
+/// [`preview_banner`]`(..).is_some()`, i.e. "claude REPORTED the selected
+/// session as an agent" — NOT "the selected session is live". The two parted
+/// ways when the shell-out grew `--all`: an agent that reported completion is
+/// still reported, so it has a banner, while claude would not call it live.
+/// Passing liveness here would desync this geometry from [`super::update`]'s
+/// hit-test (which asks [`preview_banner`]) for every `done` session — banner
+/// drawn, clicks resolved one row off. It is also unaskable here: liveness now
+/// means a shell-out to claude ([`App::is_live_now`]), which a render must never
+/// do.
+///
+/// The banner is a dedicated LAYOUT row rather than a line prepended into the
+/// scrolled `Text` because the preview is bottom-anchored by DEFAULT
+/// (`App::preview_follow_bottom`, re-armed on every selection change): a
+/// prepended line is pinned off the top of the viewport for any transcript
+/// taller than the pane — which is every realistic reported session — leaving
+/// the banner reachable only via `Home`. As its own row it stays put while the
+/// transcript scrolls beneath it.
+///
+/// When `has_banner` is false the transcript IS the whole inner rect and the
+/// banner rect is empty, so a BANNER-LESS session's geometry is exactly what it
+/// was before the banner existed.
+///
+/// Pure, and the ONE place this geometry is derived: `render_preview` draws
+/// against these rects and [`super::update`]'s link hit-test resolves clicks
+/// against the same transcript rect, so the scroll offset and the cached line
+/// widths are measured from the same origin the text was drawn at.
+pub(crate) fn preview_split(area: Rect, has_banner: bool) -> (Rect, Rect) {
+    let inner = Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    if !has_banner {
+        return (Rect::default(), inner);
+    }
+    // A pane too short to hold both degrades to a banner-only view rather than
+    // overlapping the two: `min` keeps the reservation inside the pane and the
+    // transcript collapses to zero rows.
+    let banner_h = inner.height.min(PREVIEW_BANNER_ROWS);
+    let banner = Rect {
+        height: banner_h,
+        ..inner
+    };
+    let transcript = Rect {
+        y: inner.y.saturating_add(banner_h),
+        height: inner.height.saturating_sub(banner_h),
+        ..inner
+    };
+    (banner, transcript)
+}
+
 /// The readable transcript preview for the selected session, vertically
-/// scrollable and anchored to the newest turn by default.
+/// scrollable and anchored to the newest turn by default, under a REPORTED
+/// session's PINNED status banner (see [`preview_split`]).
 ///
 /// The scroll offset lives in `App` but its bounds are only known here (the
-/// inner width/height and the wrapped content height), so — mirroring how
+/// transcript's width/height and the wrapped content height), so — mirroring how
 /// `render_list` writes back `app.scroll` — this clamps the offset against the
 /// wrapped content and writes both the resolved offset and the viewport height
-/// back into `App`.
+/// back into `App`. Those are the TRANSCRIPT's bounds, not the pane's: a pinned
+/// banner costs the scrollable area one row, so a page key sizes a page from
+/// what actually scrolls.
 ///
 /// A vertical scrollbar is drawn over the block's own right border (the
 /// idiomatic ratatui composition: the `Scrollbar` widget is rendered as a
-/// SEPARATE pass on a one-row vertical inset of the same `area`, so its track
+/// SEPARATE pass over the transcript's rows at full pane width, so its track
 /// lands exactly on the border column rather than stealing a content column)
 /// whenever the wrapped content overflows the viewport. When the content fits
 /// entirely (`content_h <= inner_height`), the scrollbar is skipped entirely —
@@ -338,16 +608,30 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
 fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default().borders(Borders::ALL).title(" preview ");
 
-    // Borders steal one row/col on each side; the inner area is what wraps. The
-    // inner width is also the table shrink-to-fit budget, so it must be resolved
-    // BEFORE rendering the preview text (which fits GFM tables to it).
-    let inner_width = area.width.saturating_sub(2);
-    let inner_height = area.height.saturating_sub(2);
+    // A REPORTED session leads with a status banner so the user can see WHY it
+    // is stopped (or that it is working, or that it has finished) without
+    // decoding the row badge. It is PINNED as its own layout row (see
+    // `preview_split`) — the transcript scrolls beneath it — so the default
+    // bottom-anchored viewport cannot scroll it away. A session claude never
+    // reported reserves no row and renders unchanged.
+    let banner = preview_banner(app);
+    let (banner_area, transcript_area) = preview_split(area, banner.is_some());
+    // The transcript's width is also the table shrink-to-fit budget, so it must
+    // be resolved BEFORE rendering the preview text (which fits GFM tables to
+    // it). The banner split is vertical only, so this width — and therefore the
+    // width-scoped preview cache — is the same with or without a banner.
+    let inner_width = transcript_area.width;
+    let inner_height = transcript_area.height;
 
     let text = app.preview_text(inner_width);
-    if text.lines.is_empty() {
-        // Nothing selected: keep the scroll bookkeeping sane and still record the
-        // viewport height so a later selection can size a page.
+    // Nothing selected (no text AND no banner, since a banner implies a SELECTED
+    // session claude reported). A reported session whose transcript is still
+    // empty falls through instead: its banner is the one thing worth drawing, and
+    // keeping the banner unconditional is what lets the hit-test below derive the
+    // same geometry from `banner.is_some()` alone.
+    if text.lines.is_empty() && banner.is_none() {
+        // Keep the scroll bookkeeping sane and still record the viewport height
+        // so a later selection can size a page.
         app.preview_viewport_h = inner_height;
         app.preview_scroll = 0;
         frame.render_widget(
@@ -357,6 +641,19 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
             area,
         );
         return;
+    }
+
+    // The block is drawn as its OWN pass instead of via `Paragraph::block` so the
+    // pinned banner and the scrolling transcript can occupy separate rects inside
+    // one border. For a banner-less session this paints exactly what
+    // `Paragraph::new(text).block(block)` painted: `preview_split`'s inner rect is
+    // `Block::inner` for `Borders::ALL`, and the paragraph's own style is default.
+    frame.render_widget(block, area);
+    if let Some(banner) = banner {
+        // Deliberately NOT wrapped: a pinned row cannot grow, so an over-long
+        // banner truncates at the pane edge rather than silently stealing a
+        // transcript row and desyncing the hit-test's geometry.
+        frame.render_widget(Paragraph::new(banner), banner_area);
     }
 
     // The wrapped height sums each styled line's display width (via `Line::width`).
@@ -374,10 +671,9 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
 
     frame.render_widget(
         Paragraph::new(text)
-            .block(block)
             .wrap(Wrap { trim: false })
             .scroll((offset, 0)),
-        area,
+        transcript_area,
     );
 
     if content_h > usize::from(inner_height) {
@@ -429,14 +725,19 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
             .style(Style::default().add_modifier(Modifier::DIM))
             .begin_symbol(Some(begin_symbol))
             .end_symbol(Some(end_symbol));
-        // A vertical margin of 1 keeps the track off the block's top/bottom
-        // border corners and title, landing it on the border's own column.
+        // The track spans exactly the TRANSCRIPT's rows — the thing it scrolls —
+        // which keeps it off the block's top/bottom border corners and title, and
+        // starts it below the pinned banner on a session that has one (the banner
+        // does not scroll, so no track cell should address it). Full pane width, so
+        // the rightmost column it draws on is the block's own right border.
         frame.render_stateful_widget(
             scrollbar,
-            area.inner(Margin {
-                vertical: 1,
-                horizontal: 0,
-            }),
+            Rect {
+                x: area.x,
+                y: transcript_area.y,
+                width: area.width,
+                height: transcript_area.height,
+            },
             &mut scrollbar_state,
         );
     }
@@ -602,11 +903,23 @@ fn scrollbar_thumb_position(
 }
 
 /// The search input line, echoing the live query.
+///
+/// The trailing cursor pulses off the SAME [`blink_visible`] phase of
+/// [`App::tick`] as the live badge's dot, so the board has exactly ONE blink
+/// mechanism and the two pulse together rather than drifting against each other.
+/// This cursor carried the ANSI blink attribute (ratatui's slow-blink
+/// `Modifier`) originally and therefore never actually blinked — see
+/// [`blink_visible`] for why the terminal cannot be asked to animate it.
 fn render_search(frame: &mut Frame, app: &App, area: Rect) {
+    let cursor = if blink_visible(app.tick) {
+        SEARCH_CURSOR
+    } else {
+        SEARCH_CURSOR_HIDDEN
+    };
     let line = Line::from(vec![
         Span::styled("search: ", Style::default().fg(Color::Cyan)),
         Span::raw(app.query.clone()),
-        Span::styled("▏", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+        Span::raw(cursor),
     ]);
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -1527,6 +1840,1265 @@ mod tests {
         }
     }
 
+    // --- status preview banner ---------------------------------------------
+
+    /// Preview pane size for the banner tests: narrow and SHORT enough that the
+    /// `sample_session` fixture's transcript overflows it, which is the case the
+    /// banner has to survive (a reported session's transcript grows, and the
+    /// preview bottom-anchors by default). Each test re-asserts the overflow
+    /// rather than trusting this comment.
+    const BANNER_PANE: (u16, u16) = (80, 8);
+
+    /// The sample session, optionally joined to a REPORTED agent carrying
+    /// `state`. `state` picks the bucket: `Some("done")` is reported but NOT
+    /// live, which is exactly the pair the banner must not conflate.
+    ///
+    /// Left in `App`'s DEFAULT scroll state on purpose: `preview_follow_bottom`
+    /// starts true and is re-armed on every selection change, so this is the
+    /// state a user actually sees. Nudging it to the top here would hide whether
+    /// the banner survives the anchor it ships with.
+    fn banner_app(state: Option<&str>) -> App {
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        if let Some(state) = state {
+            let mut reported = HashMap::new();
+            reported.insert(
+                "sess-normal-1".to_string(),
+                ReportedAgent {
+                    kind: "background".to_string(),
+                    id: None,
+                    state: Some(state.to_string()),
+                    status: None,
+                    name: None,
+                },
+            );
+            app.set_reported_agents(reported);
+        }
+        app
+    }
+
+    /// The drawn text of one row INSIDE the preview's borders.
+    fn row_text(buffer: &ratatui::buffer::Buffer, y: u16, width: u16) -> String {
+        (1..width - 1)
+            .filter_map(|x| buffer.cell((x, y)).map(|cell| cell.symbol().to_string()))
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    /// Render the preview at `(width, height)` and return every drawn row INSIDE
+    /// its borders, top to bottom.
+    fn inner_rows(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height))
+            .expect("build an in-memory test terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_preview(frame, app, area);
+            })
+            .expect("render_preview must not panic");
+        let buffer = terminal.backend().buffer();
+        (1..height - 1)
+            .map(|y| row_text(buffer, y, width))
+            .collect()
+    }
+
+    /// The wrapped height of `app`'s preview text at the pane's inner width —
+    /// the same `wrapped_rows` model `render_preview` scrolls against — so a test
+    /// can prove its fixture really overflows the viewport.
+    fn content_height(app: &mut App, width: u16) -> usize {
+        let inner_width = width - 2;
+        let text = app.preview_text(inner_width);
+        wrapped_rows(text.lines.iter().map(Line::width), inner_width)
+    }
+
+    #[test]
+    fn the_status_banner_is_pinned_to_the_top_of_a_default_bottom_anchored_preview() {
+        let (width, height) = BANNER_PANE;
+        let mut reported = banner_app(Some("blocked"));
+
+        // The state the banner must survive: `App`'s DEFAULT anchor over a
+        // transcript TALLER than the pane. A banner prepended into the scrolled
+        // text is pinned off the top here — reachable only via `Home`.
+        assert!(
+            reported.preview_follow_bottom,
+            "the preview must be bottom-anchored by default, or this test proves nothing"
+        );
+        let inner_height = height - 2;
+        let content_h = content_height(&mut reported, width);
+        assert!(
+            content_h > usize::from(inner_height),
+            "the fixture must overflow the pane, or this test proves nothing \
+             (content_h={content_h}, inner_height={inner_height})"
+        );
+
+        let rows = inner_rows(&mut reported, width, height);
+        assert_eq!(
+            rows[0], "bg needs input",
+            "a reported session must LEAD with its status banner in the default view"
+        );
+        assert!(
+            reported.preview_scroll > 0,
+            "the transcript beneath the banner must really be scrolled to the \
+             newest turn, not parked at the top where a banner survives for free"
+        );
+
+        // The banner steals a row from the pane, not from the transcript's tail:
+        // the newest line stays on the bottom row, so the transcript scrolls
+        // BENEATH the banner rather than being pushed down by it.
+        let mut plain = banner_app(None);
+        let plain_rows = inner_rows(&mut plain, width, height);
+        assert_eq!(
+            rows.last(),
+            plain_rows.last(),
+            "the newest transcript line must stay anchored to the pane's bottom row"
+        );
+        assert_ne!(
+            plain_rows[0], "bg needs input",
+            "the baseline row must be real transcript, or this test proves nothing"
+        );
+        // The banner costs the transcript EXACTLY one row of viewport — no
+        // silent gap under it, no second reserved row.
+        assert_eq!(
+            reported.preview_viewport_h,
+            plain.preview_viewport_h - 1,
+            "the pinned banner must cost the transcript exactly one row"
+        );
+    }
+
+    /// A FINISHED agent must keep its banner: the pane keys on REPORTED, not on
+    /// live, so a `done` session still leads with `bg done` rather than silently
+    /// losing the row the moment the agent wraps up.
+    ///
+    /// Guards the seam that liveness's corrected semantics could plausibly have
+    /// broken — gating the BANNER on liveness (instead of only Enter's routing)
+    /// would blank this row.
+    #[test]
+    fn a_done_session_still_leads_with_its_status_banner() {
+        let (width, height) = BANNER_PANE;
+        let mut app = banner_app(Some("done"));
+
+        let rows = inner_rows(&mut app, width, height);
+        assert_eq!(
+            rows[0], "bg done",
+            "a reported-but-finished session must still show its banner"
+        );
+    }
+
+    #[test]
+    fn the_status_banner_is_styled_with_a_named_color_and_bold() {
+        // Styling is asserted separately from content (PATTERNS testing rules).
+        let (width, height) = BANNER_PANE;
+        let mut app = banner_app(Some("blocked"));
+        let mut terminal = Terminal::new(TestBackend::new(width, height))
+            .expect("build an in-memory test terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_preview(frame, &mut app, area);
+            })
+            .expect("render_preview must not panic");
+        let cell = terminal
+            .backend()
+            .buffer()
+            .cell((1, 1))
+            .expect("the banner's first cell is inside the rendered buffer");
+        assert_eq!(
+            cell.fg,
+            Color::Cyan,
+            "a NAMED ansi color (never RGB) marks the banner as board copy"
+        );
+        assert!(cell.modifier.contains(Modifier::BOLD));
+    }
+
+    /// A session file that EXISTS but holds no renderable turns yet — the real
+    /// shape of a live agent that was just started, whose transcript renders to
+    /// zero lines.
+    ///
+    /// Deliberately OUTSIDE the `store/` discovery root: it is handed straight to
+    /// a synthetic `Session` and must never be discovered, or it would break the
+    /// exact discovered/session counts `store`'s own tests pin.
+    fn empty_transcript_fixture() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("preview")
+            .join("sess-live-empty-1.jsonl")
+    }
+
+    /// A SELECTED, LIVE session whose transcript renders EMPTY must still draw
+    /// its banner: the one thing worth showing about a just-started agent is
+    /// that it is running, and falling through to the empty-pane placeholder
+    /// would both hide that and contradict `update`'s hit-test, which derives
+    /// the transcript rect from `banner.is_some()` alone.
+    #[test]
+    fn a_live_session_with_an_empty_transcript_still_draws_its_banner() {
+        let (width, height) = BANNER_PANE;
+        let mut session = sample_session();
+        session.file = empty_transcript_fixture();
+        let mut app = App::new(vec![session], Scope::All, PathBuf::from("/tmp/launch"));
+        let mut reported = HashMap::new();
+        reported.insert(
+            "sess-normal-1".to_string(),
+            ReportedAgent {
+                kind: "background".to_string(),
+                id: None,
+                state: Some("blocked".to_string()),
+                status: None,
+                name: None,
+            },
+        );
+        app.set_reported_agents(reported);
+
+        // The fixture must really render to nothing, or this test proves nothing
+        // — it would just be re-testing the ordinary banner path.
+        assert!(
+            app.preview_text(width - 2).lines.is_empty(),
+            "the fixture must render an EMPTY transcript for this test to reach \
+             the empty-pane seam"
+        );
+
+        let rows = inner_rows(&mut app, width, height);
+        assert_eq!(
+            rows[0], "bg needs input",
+            "a live session must still lead with its status banner when its \
+             transcript is empty"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("No session selected.")),
+            "a SELECTED live session must never fall through to the \
+             nothing-selected placeholder: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn the_status_banner_passes_an_unknown_state_through_verbatim() {
+        // Fail-soft end to end: schema drift reaches the user unhidden.
+        let app = banner_app(Some("compacting"));
+        let banner = preview_banner(&app).expect("a reported session yields a banner");
+        let text: String = banner.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "bg compacting");
+    }
+
+    /// The bordered preview block, as `render_preview` builds it. Shared with the
+    /// geometry tests below so they measure against the REAL block rather than a
+    /// look-alike.
+    fn preview_block() -> Block<'static> {
+        Block::default().borders(Borders::ALL).title(" preview ")
+    }
+
+    #[test]
+    fn preview_split_reserves_one_row_for_a_banner_and_nothing_for_a_banner_less_pane() {
+        // Off-origin on purpose: the preview is the RIGHT pane, so a split that
+        // assumed x/y of 0 would pass at the origin and fail on a real board.
+        let area = Rect {
+            x: 37,
+            y: 4,
+            width: 43,
+            height: 16,
+        };
+        // The rect a transcript occupied BEFORE the banner existed is ratatui's
+        // own `Block::inner` — that is where `Paragraph::block` drew it. Asserting
+        // against ratatui rather than against a restatement of our arithmetic is
+        // what makes "banner-less geometry unchanged" a proof and not a tautology.
+        let was = preview_block().inner(area);
+
+        let (banner, transcript) = preview_split(area, false);
+        assert_eq!(
+            transcript, was,
+            "a banner-less pane must hand the transcript the whole inner rect, exactly as before"
+        );
+        assert!(
+            banner.is_empty(),
+            "a banner-less pane must reserve no banner row"
+        );
+
+        let (banner, transcript) = preview_split(area, true);
+        assert_eq!(
+            banner,
+            Rect {
+                height: PREVIEW_BANNER_ROWS,
+                ..was
+            },
+            "the banner pins to the pane's FIRST inner row"
+        );
+        assert_eq!(
+            transcript,
+            Rect {
+                y: was.y + PREVIEW_BANNER_ROWS,
+                height: was.height - PREVIEW_BANNER_ROWS,
+                ..was
+            },
+            "the transcript starts one row lower and gives that row back"
+        );
+        assert_eq!(
+            transcript.width, was.width,
+            "the split is VERTICAL only: a banner and a banner-less pane share \
+             one width, and therefore one width-scoped preview cache"
+        );
+    }
+
+    #[test]
+    fn preview_split_degrades_to_banner_only_rather_than_overlapping_in_a_short_pane() {
+        // Inner height 1: there is room for the banner OR a transcript row, not
+        // both. The transcript collapses instead of sharing the banner's row.
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 3,
+        };
+        let (banner, transcript) = preview_split(area, true);
+        assert_eq!(banner.height, PREVIEW_BANNER_ROWS);
+        assert_eq!(transcript.height, 0);
+        assert_eq!(
+            transcript.y,
+            banner.y + banner.height,
+            "the transcript must start BELOW the banner even with no room left"
+        );
+
+        // A pane with no inner rows at all reserves nothing and never underflows.
+        for height in [0u16, 1, 2] {
+            let (banner, transcript) = preview_split(Rect { height, ..area }, true);
+            assert!(
+                banner.is_empty() && transcript.is_empty(),
+                "a pane of height {height} has no inner rows to split"
+            );
+        }
+    }
+
+    #[test]
+    fn a_banner_less_preview_draws_byte_for_byte_what_one_blocked_paragraph_drew() {
+        // The banner made `render_preview` draw the block and the transcript as
+        // two passes into two rects. For a session claude never reported that must
+        // still paint exactly the single `Paragraph::new(text).block(block)` it
+        // replaced — rebuilt here from ratatui's own widgets and compared cell by
+        // cell.
+        let (width, height) = BANNER_PANE;
+        let mut app = banner_app(None);
+        let mut actual = Terminal::new(TestBackend::new(width, height))
+            .expect("build an in-memory test terminal");
+        actual
+            .draw(|frame| {
+                let area = frame.area();
+                render_preview(frame, &mut app, area);
+            })
+            .expect("render_preview must not panic");
+
+        // The reference: one blocked, wrapped, scrolled paragraph over the WHOLE
+        // pane, at the offset the render above resolved.
+        let text = app.preview_text(width - 2);
+        let offset = app.preview_scroll;
+        assert!(
+            offset > 0,
+            "a scrolled pane, or this compares only offset 0"
+        );
+        let mut expected = Terminal::new(TestBackend::new(width, height))
+            .expect("build an in-memory test terminal");
+        expected
+            .draw(|frame| {
+                frame.render_widget(
+                    Paragraph::new(text)
+                        .block(preview_block())
+                        .wrap(Wrap { trim: false })
+                        .scroll((offset, 0)),
+                    frame.area(),
+                );
+            })
+            .expect("the reference paragraph must not panic");
+
+        // Every column but the rightmost, which is where the scrollbar draws its
+        // own separate pass (the reference has none). That column is pinned
+        // cell-by-cell, for banner-less sessions, by the scrollbar-geometry tests
+        // above — so nothing here is left unasserted.
+        let cells = |terminal: &Terminal<TestBackend>| -> Vec<(String, Style)> {
+            let buffer = terminal.backend().buffer().clone();
+            (0..height)
+                .flat_map(|y| (0..width - 1).map(move |x| (x, y)))
+                .filter_map(|(x, y)| {
+                    buffer
+                        .cell((x, y))
+                        .map(|c| (c.symbol().to_string(), c.style()))
+                })
+                .collect()
+        };
+        assert_eq!(
+            cells(&actual),
+            cells(&expected),
+            "a banner-less pane's geometry, content and styling must be untouched by the banner"
+        );
+    }
+
+    // --- live badge (list row) --------------------------------------------
+
+    /// A synthetic `ReportedAgent` carrying only what the classifier reads, so each
+    /// badge test below states just the kind + qualifier source it cares about.
+    fn agent(kind: &str, state: Option<&str>, status: Option<&str>) -> ReportedAgent {
+        ReportedAgent {
+            kind: kind.to_string(),
+            id: None,
+            state: state.map(str::to_owned),
+            status: status.map(str::to_owned),
+            name: None,
+        }
+    }
+
+    /// Each bucket's color AND pulse together, over both qualifier sources.
+    /// Table-driven so the full state -> (color, active) contract reads as one
+    /// matrix — the pairing is the point: gray is only honest about a working
+    /// agent because it PULSES, and green/yellow only read as "waiting" because
+    /// they do not. `is_active` is re-asserted here (it has its own bucket table
+    /// in `agents`) precisely because that pairing, not either half alone, is
+    /// what makes the palette legible.
+    #[test]
+    fn each_bucket_maps_to_its_badge_color_and_pulse() {
+        // (qualifier, expected color, expected active/pulsing)
+        let cases = [
+            // Waiting on the user -> the most prominent color, but STEADY.
+            (Some("blocked"), Color::Yellow, false),
+            // The other "it wants you" spelling: same bucket, so the SAME yellow
+            // and the same steadiness.
+            (Some("waiting"), Color::Yellow, false),
+            // Up but not working -> steady, and green earns its place here
+            // rather than being the old hardcoded badge color.
+            (Some("idle"), Color::Green, false),
+            // Quietly working -> gray, and the pulse is what marks it active.
+            (Some("working"), Color::Gray, true),
+            // ...and its other spelling must be indistinguishable.
+            (Some("busy"), Color::Gray, true),
+            // Finished -> green like idle (nothing is wanted from you) and
+            // STEADY, because there is no work left to animate.
+            (Some("done"), Color::Green, false),
+            // FAIL-SOFT: schema drift tracks the working bucket...
+            (Some("compacting"), Color::Gray, true),
+            // ...and so does a record with no qualifier at all. Neither may
+            // hide activity behind a steady dot.
+            (None, Color::Gray, true),
+        ];
+
+        for (qualifier, color, active) in cases {
+            // Sourced from `state`...
+            let from_state = agent("background", qualifier, None);
+            assert_eq!(
+                badge_color(&from_state),
+                color,
+                "state={qualifier:?} should be {color:?}"
+            );
+            assert_eq!(
+                agents::is_active(&from_state),
+                active,
+                "state={qualifier:?} should have active={active}"
+            );
+
+            // ...and identically via the `status` fallback (no `state` at all),
+            // so the badge never depends on WHICH field the wire used.
+            let from_status = agent("interactive", None, qualifier);
+            assert_eq!(
+                badge_color(&from_status),
+                color,
+                "status={qualifier:?} should be {color:?}"
+            );
+            assert_eq!(
+                agents::is_active(&from_status),
+                active,
+                "status={qualifier:?} should have active={active}"
+            );
+        }
+    }
+
+    /// `qualifier`'s state-then-status precedence must reach the badge too: the
+    /// real shape for a waiting background agent is state `blocked` alongside
+    /// status `idle`. Both buckets are steady, so only the COLOR proves which
+    /// field won — and it must be `state` (yellow), not `status` (green).
+    #[test]
+    fn state_beats_status_for_the_badge_color() {
+        let both = agent("background", Some("blocked"), Some("idle"));
+        assert_eq!(badge_color(&both), Color::Yellow);
+        assert!(!agents::is_active(&both));
+    }
+
+    /// The pulse's timing, over a FULL cycle: the dot is shown for `BLINK_TICKS`
+    /// ticks, hidden for `BLINK_TICKS`, then shown again — 500ms on / 500ms off
+    /// at the 250ms `watch::TICK` this counts. Pure, so the cadence is pinned
+    /// without a terminal or a clock.
+    #[test]
+    fn blink_visible_alternates_phases_every_blink_ticks() {
+        assert_eq!(
+            BLINK_TICKS, 2,
+            "the tick expectations below are written for a 2-tick phase; \
+             retune them alongside BLINK_TICKS"
+        );
+        for tick in [0, 1] {
+            assert!(
+                blink_visible(tick),
+                "tick {tick} is in the opening ON phase"
+            );
+        }
+        for tick in [2, 3] {
+            assert!(!blink_visible(tick), "tick {tick} is in the OFF phase");
+        }
+        for tick in [4, 5] {
+            assert!(
+                blink_visible(tick),
+                "tick {tick} wraps into the next cycle's ON phase"
+            );
+        }
+    }
+
+    /// `App::tick` uses `wrapping_add`, so the counter rolls over instead of
+    /// panicking. The phase must survive that: one cycle is `2 * BLINK_TICKS`
+    /// ticks and `u64::MAX + 1` is a whole number of cycles, so the OFF phase
+    /// ending at `u64::MAX` is followed by tick 0 opening an ON phase.
+    #[test]
+    fn blink_visible_phase_stays_aligned_across_the_tick_wrap() {
+        assert!(
+            blink_visible(u64::MAX - 2),
+            "the last ON tick before the wrap"
+        );
+        assert!(!blink_visible(u64::MAX - 1));
+        assert!(
+            !blink_visible(u64::MAX),
+            "the last tick before the wrap is OFF"
+        );
+        assert!(
+            blink_visible(u64::MAX.wrapping_add(1)),
+            "the wrap lands on tick 0, which must open a clean ON phase"
+        );
+    }
+
+    /// One list row's drawn live badge, read back from the rendered buffer.
+    ///
+    /// Cells, not spans: this is what the terminal would actually paint, so a
+    /// style that gets patched away at render time (e.g. by the List's
+    /// `highlight_style`) cannot slip past these assertions.
+    struct DrawnBadge {
+        /// The row's full drawn text, so a test can tell WHICH session's badge
+        /// this is without depending on row order or group-head placement.
+        row: String,
+        dot_fg: Color,
+        /// The kind label drawn beside the dot (`bg`), as text.
+        label: String,
+        /// Per-cell `(fg, modifier)` of that label — kept per-cell so a badge
+        /// styled unevenly across its own label cannot average out to a pass.
+        label_cells: Vec<(Color, Modifier)>,
+    }
+
+    /// Scan a rendered list buffer for every DRAWN badge dot, locating each by
+    /// its `●` glyph rather than by a hardcoded column — a layout tweak then
+    /// fails this test loudly instead of silently reading the wrong cells.
+    ///
+    /// Every REPORTED row is found in every pulse phase: the glyph is
+    /// unconditional and the pulse only restyles it, so an absent dot means the
+    /// row has no agent — never that it is mid-pulse. The phase is read off
+    /// `dot_fg`, not off presence.
+    fn drawn_badges(buffer: &ratatui::buffer::Buffer, width: u16, height: u16) -> Vec<DrawnBadge> {
+        let mut badges = Vec::new();
+        for y in 0..height {
+            let Some(dot_x) = (0..width).find(|&x| {
+                buffer
+                    .cell((x, y))
+                    .is_some_and(|cell| cell.symbol() == BADGE_DOT)
+            }) else {
+                continue; // Not a reported row.
+            };
+            let dot = buffer
+                .cell((dot_x, y))
+                .expect("the dot cell was just located in this buffer");
+
+            // The kind label is the contiguous non-space run after the dot's
+            // single separating space; the dim qualifier beyond it is separated
+            // by a raw space, so the run stops exactly at the label's end.
+            let mut label = String::new();
+            let mut label_cells = Vec::new();
+            for x in (dot_x + 2)..width {
+                let Some(cell) = buffer.cell((x, y)) else {
+                    break;
+                };
+                if cell.symbol() == " " {
+                    break;
+                }
+                label.push_str(cell.symbol());
+                label_cells.push((cell.fg, cell.modifier));
+            }
+
+            badges.push(DrawnBadge {
+                row: row_text(buffer, y, width),
+                dot_fg: dot.fg,
+                label,
+                label_cells,
+            });
+        }
+        badges
+    }
+
+    /// One session per KNOWN qualifier: `(state, badge color, does it pulse)`.
+    ///
+    /// Color and pulse are asserted as a PAIR because they are one signal: gray
+    /// is only honest about a working agent while that agent's dot is pulsing.
+    /// Every qualifier gets its own row rather than one row per bucket, so a
+    /// bucket that silently stopped covering one of its two spellings fails here.
+    const BADGE_CASES: [(&str, Color, bool); 6] = [
+        // Waiting on the user: the most prominent color, but STEADY.
+        ("blocked", Color::Yellow, false),
+        // The same bucket under its other token: yellow, and steady TOO. This
+        // row is the pulse lie being fixed — `waiting` once rendered as working.
+        ("waiting", Color::Yellow, false),
+        // Up but not working: steady, and green is EARNED by this bucket
+        // rather than being the badge's old hardcoded color.
+        ("idle", Color::Green, false),
+        // Quietly working: gray, and the pulse is what marks it active.
+        ("working", Color::Gray, true),
+        // The same bucket under its other token: gray, and pulsing TOO.
+        ("busy", Color::Gray, true),
+        // Finished: green (nothing is wanted from you) and steady. Only
+        // observable at all because the poller passes `--all`.
+        ("done", Color::Green, false),
+    ];
+
+    /// A board carrying one REPORTED session per [`BADGE_CASES`] bucket, each
+    /// labeled with its state so a drawn row is identifiable. Being badged says
+    /// nothing about liveness — `done` is reported and badged all the same.
+    ///
+    /// Rendering all the buckets in a SINGLE `render_list` pass is the point — it
+    /// proves each row derives its own badge from its own joined agent, which a
+    /// per-row render could not.
+    fn badge_board() -> App {
+        let mut sessions = Vec::new();
+        let mut reported = HashMap::new();
+        for (state, _, _) in BADGE_CASES {
+            let mut session = sample_session();
+            session.session_id = format!("sess-{state}");
+            session.label = format!("sess-{state}");
+            reported.insert(
+                session.session_id.clone(),
+                ReportedAgent {
+                    kind: "background".to_string(),
+                    id: None,
+                    state: Some(state.to_string()),
+                    status: None,
+                    name: None,
+                },
+            );
+            sessions.push(session);
+        }
+        let mut app = App::new(sessions, Scope::All, PathBuf::from("/tmp/launch"));
+        app.set_reported_agents(reported);
+        app
+    }
+
+    /// Wide enough for a whole badge row (badge + qualifier + label), tall
+    /// enough for the group head plus every [`BADGE_CASES`] row (plus the
+    /// block's two border rows) with slack — a row scrolled out of view would
+    /// silently weaken every assertion below.
+    const BADGE_BOARD_SIZE: (u16, u16) = (60, 12);
+
+    /// Draw `app`'s list into an in-memory terminal and hand back the buffer —
+    /// the cells a real terminal would paint.
+    fn drawn_list(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height))
+            .expect("build an in-memory test terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_list(frame, app, area);
+            })
+            .expect("render_list must not panic");
+        terminal.backend().buffer().clone()
+    }
+
+    /// The `x` at which `needle` starts on row `y`, matched cell by cell.
+    ///
+    /// Returns a COLUMN, not a byte offset, which is the unit the no-shift
+    /// assertion needs: it is what the reader's eye tracks.
+    fn column_of(buffer: &ratatui::buffer::Buffer, y: u16, width: u16, needle: &str) -> u16 {
+        (0..width)
+            .find(|&x| {
+                needle.chars().enumerate().all(|(i, ch)| {
+                    let cx = x + u16::try_from(i).expect("a needle shorter than a terminal row");
+                    buffer
+                        .cell((cx, y))
+                        .is_some_and(|cell| cell.symbol() == ch.to_string())
+                })
+            })
+            .unwrap_or_else(|| panic!("{needle:?} must be drawn on row {y}"))
+    }
+
+    /// The `y` of the single row whose drawn text contains `needle`.
+    fn row_of(buffer: &ratatui::buffer::Buffer, width: u16, height: u16, needle: &str) -> u16 {
+        let rows: Vec<u16> = (0..height)
+            .filter(|&y| row_text(buffer, y, width).contains(needle))
+            .collect();
+        assert_eq!(
+            rows.len(),
+            1,
+            "{needle:?} must identify exactly one drawn row, found {rows:?}"
+        );
+        rows[0]
+    }
+
+    /// Refinements 3 + 4: the WHOLE badge (dot + kind label) is colored by the
+    /// agent's state, and every reported row — pulsing or not — shows its dot.
+    #[test]
+    fn render_list_colors_the_whole_badge_by_state() {
+        let mut app = badge_board();
+        // Pinned to the ON phase so every dot carries its BASE color: this test
+        // is about the palette, and the phases themselves are pinned below.
+        app.tick = 0;
+        assert!(blink_visible(app.tick), "tick 0 must be the ON phase");
+
+        let (width, height) = BADGE_BOARD_SIZE;
+        let buffer = drawn_list(&mut app, width, height);
+
+        let badges = drawn_badges(&buffer, width, height);
+        assert_eq!(
+            badges.len(),
+            BADGE_CASES.len(),
+            "each reported session must draw exactly one badge dot: {:?}",
+            badges.iter().map(|b| &b.row).collect::<Vec<_>>()
+        );
+
+        for (state, color, _) in BADGE_CASES {
+            let badge = badges
+                .iter()
+                .find(|badge| badge.row.contains(&format!("sess-{state}")))
+                .unwrap_or_else(|| panic!("a badge row for the {state:?} session"));
+
+            // Content first (structure, not styling): proves the cells read
+            // below are really the kind label and not a drifted offset.
+            assert_eq!(
+                badge.label, "bg",
+                "the dot must be followed by the kind label ({state:?} row: {:?})",
+                badge.row
+            );
+            assert!(
+                !badge.label_cells.is_empty(),
+                "the {state:?} label must have drawn cells to assert over"
+            );
+
+            // Refinement 4: dot and label agree on the state color.
+            assert_eq!(
+                badge.dot_fg, color,
+                "the {state:?} dot must be {color:?}, got {:?}",
+                badge.dot_fg
+            );
+            for (fg, modifier) in &badge.label_cells {
+                assert_eq!(
+                    *fg, badge.dot_fg,
+                    "the {state:?} kind label must carry the SAME fg as its dot"
+                );
+                assert_eq!(*fg, color, "the {state:?} kind label must be {color:?}");
+                // `contains`, not equality: the List's `highlight_style` layers
+                // REVERSED (and its own BOLD) onto whichever row is selected, so
+                // the selected badge's cells legitimately carry more than BOLD.
+                assert!(
+                    modifier.contains(Modifier::BOLD),
+                    "the {state:?} kind label must survive to the buffer BOLD, got {modifier:?}"
+                );
+            }
+        }
+    }
+
+    /// THE core invariant: the dot's glyph is drawn in BOTH pulse phases, for
+    /// EVERY reported bucket — pulsing or steady. The pulse restyles the cell; it
+    /// must never blank it.
+    ///
+    /// This is the bug being fixed, pinned at its narrowest. Swapping the glyph
+    /// for a blank mutated the row's text, which forced the terminal to re-detect
+    /// the plain-text URL in the label beside it and flicker its underline every
+    /// 500ms (see `pulse_color`). A constant glyph is what makes that
+    /// unrepresentable.
+    #[test]
+    fn render_list_draws_every_badge_dot_in_both_pulse_phases() {
+        let (width, height) = BADGE_BOARD_SIZE;
+
+        for (tick, on) in [(0, true), (BLINK_TICKS, false)] {
+            let mut app = badge_board();
+            app.tick = tick;
+            assert_eq!(
+                blink_visible(app.tick),
+                on,
+                "tick {tick} must be the {} phase",
+                if on { "ON" } else { "OFF" }
+            );
+
+            let buffer = drawn_list(&mut app, width, height);
+            let drawn: Vec<String> = drawn_badges(&buffer, width, height)
+                .into_iter()
+                .map(|badge| badge.row)
+                .collect();
+
+            for (state, _, _) in BADGE_CASES {
+                let row = format!("sess-{state}");
+                assert!(
+                    drawn.iter().any(|drawn_row| drawn_row.contains(&row)),
+                    "at tick {tick} (the {} phase) the {state:?} dot must STILL be drawn — \
+                     the pulse changes color, never the glyph; drawn rows: {drawn:?}",
+                    if on { "ON" } else { "OFF" }
+                );
+            }
+        }
+    }
+
+    /// The other half of the invariant: what the pulse DOES change is the dot's
+    /// color, and only for an ACTIVE bucket. A steady bucket's dot must be
+    /// identical in both phases.
+    ///
+    /// The base color is asserted against `BADGE_CASES` (the palette's own
+    /// contract) and the off-phase color against `pulse_color` — that split is
+    /// deliberate: this test pins the WIRING (the renderer dims via `pulse_color`,
+    /// off the same base), while `pulse_color`'s literal values are pinned by its
+    /// own unit test. `assert_ne` is the user-visible claim underneath both: the
+    /// dot must actually change.
+    #[test]
+    fn render_list_pulses_only_an_active_dots_color() {
+        let (width, height) = BADGE_BOARD_SIZE;
+
+        // (state -> the dot's fg) at one tick.
+        let phase = |tick: u64| -> HashMap<String, Color> {
+            let mut app = badge_board();
+            app.tick = tick;
+            let buffer = drawn_list(&mut app, width, height);
+            drawn_badges(&buffer, width, height)
+                .into_iter()
+                .filter_map(|badge| {
+                    BADGE_CASES.iter().find_map(|(state, _, _)| {
+                        badge
+                            .row
+                            .contains(&format!("sess-{state}"))
+                            .then(|| ((*state).to_string(), badge.dot_fg))
+                    })
+                })
+                .collect()
+        };
+
+        let on = phase(0);
+        let off = phase(BLINK_TICKS);
+
+        for (state, color, pulses) in BADGE_CASES {
+            let on_fg = on[state];
+            let off_fg = off[state];
+
+            assert_eq!(
+                on_fg, color,
+                "the {state:?} dot must carry its base badge color in the ON phase"
+            );
+
+            if pulses {
+                assert_ne!(
+                    on_fg, off_fg,
+                    "the {state:?} dot is ACTIVE, so its color MUST change between \
+                     phases — that color change IS the pulse"
+                );
+                assert_eq!(
+                    off_fg,
+                    pulse_color(color),
+                    "the {state:?} dot's OFF phase must be its declared dim partner"
+                );
+            } else {
+                assert_eq!(
+                    on_fg, off_fg,
+                    "the {state:?} bucket is at rest, so its dot must be steady: \
+                     a pulse here would claim work is in flight"
+                );
+            }
+        }
+    }
+
+    /// The label's half of the claim, and the one the dot tests above cannot
+    /// make: the pulse restyles the DOT ONLY. The kind label beside it keeps its
+    /// steady `badge_color` in BOTH phases.
+    ///
+    /// Asserted in the OFF phase ON PURPOSE, on a PULSING row. In the ON phase
+    /// the steady style and the pulsing one are the SAME color, so a label
+    /// wrongly wired to the dot's style is INDISTINGUISHABLE there and sails
+    /// through; a resting row's dot never dims, so it cannot separate them
+    /// either. The OFF phase of a pulsing row is the only frame where the two
+    /// differ — so this asserts, in that ONE frame, that they have DIVERGED:
+    /// color unifies the badge (the label still carries the dot's BASE), the
+    /// pulse does not (the dot has dimmed away from it).
+    ///
+    /// This is what keeps the pulse a DOT pulse. A blinking text label would be
+    /// noise on a board of live sessions, and `render_list`'s two spans exist
+    /// solely to make that split expressible.
+    #[test]
+    fn render_list_never_pulses_the_kind_label() {
+        let (width, height) = BADGE_BOARD_SIZE;
+        let mut app = badge_board();
+        app.tick = BLINK_TICKS;
+        assert!(
+            !blink_visible(app.tick),
+            "tick {BLINK_TICKS} must be the OFF phase — the only phase in which a \
+             steady label and a pulsing one differ at all"
+        );
+
+        let buffer = drawn_list(&mut app, width, height);
+        let badges = drawn_badges(&buffer, width, height);
+
+        let mut pulsing = 0;
+        for (state, color, pulses) in BADGE_CASES {
+            let badge = badges
+                .iter()
+                .find(|badge| badge.row.contains(&format!("sess-{state}")))
+                .unwrap_or_else(|| panic!("a badge row for the {state:?} session"));
+
+            // Content first (structure, not styling): proves the cells read
+            // below are really the kind label and not a drifted offset.
+            assert_eq!(
+                badge.label, "bg",
+                "the dot must be followed by the kind label ({state:?} row: {:?})",
+                badge.row
+            );
+            assert!(
+                !badge.label_cells.is_empty(),
+                "the {state:?} label must have drawn cells to assert over"
+            );
+
+            for (fg, _) in &badge.label_cells {
+                assert_eq!(
+                    *fg, color,
+                    "the {state:?} kind label must still be its steady {color:?} in the \
+                     OFF phase — the label NEVER pulses, only the dot does"
+                );
+            }
+
+            if !pulses {
+                continue;
+            }
+            pulsing += 1;
+
+            assert_eq!(
+                badge.dot_fg,
+                pulse_color(color),
+                "the {state:?} dot must have dimmed in the OFF phase, or this row \
+                 cannot show the divergence below"
+            );
+            // The divergence, in ONE frame: the dot has left the base color its
+            // label still holds. This IS the requirement — a label that tracked
+            // the dot's style would match here instead.
+            for (fg, _) in &badge.label_cells {
+                assert_ne!(
+                    badge.dot_fg, *fg,
+                    "the {state:?} row is ACTIVE and in the OFF phase, so its dot must \
+                     have pulsed AWAY from its label's steady color: the two diverge \
+                     here, and a label wired to the dot's pulsing style would not"
+                );
+            }
+        }
+
+        assert!(
+            pulsing > 0,
+            "at least one BADGE_CASES bucket must pulse, or the divergence is never \
+             asserted and this test passes vacuously"
+        );
+    }
+
+    /// `pulse_color`'s literal palette, pinned in one place so the render tests
+    /// above can assert the WIRING without also re-encoding the values.
+    ///
+    /// NAMED ANSI on both sides (TERMINAL-SAFE STYLING): `DarkGray` is the dim
+    /// gray, so the OFF phase reads as the same badge at lower intensity. Not
+    /// `Modifier::DIM` — an attribute most terminals honor inconsistently, which
+    /// is the exact trap that made the ANSI blink attribute ship inert.
+    #[test]
+    fn pulse_color_dims_the_working_base_and_passes_anything_else_through() {
+        assert_eq!(pulse_color(BADGE_WORKING), BADGE_WORKING_DIM);
+        assert_eq!(BADGE_WORKING, Color::Gray, "the pulsing bucket's base");
+        assert_eq!(BADGE_WORKING_DIM, Color::DarkGray, "its dim partner");
+        // FAIL-SOFT identity for a base with no declared partner. Harmless for a
+        // RESTING bucket (it never dims), and pinned shut for a pulsing one by
+        // `every_pulsing_buckets_badge_color_has_a_distinct_dim_partner`.
+        assert_eq!(pulse_color(Color::Yellow), Color::Yellow);
+        assert_eq!(pulse_color(Color::Green), Color::Green);
+    }
+
+    /// The qualifier that classifies into `bucket`.
+    ///
+    /// EXHAUSTIVE on purpose: adding an `AgentActivity` bucket fails to compile
+    /// here, which drags the author to the walk below — the one thing that keeps
+    /// `pulse_color`'s silent identity fallback from swallowing a new pulsing
+    /// bucket. (The walk's own list must then gain the bucket; a `match` cannot
+    /// force that, so `ALL_BUCKETS` says so.)
+    fn qualifier_reaching(bucket: AgentActivity) -> Option<&'static str> {
+        match bucket {
+            AgentActivity::NeedsInput => Some("blocked"),
+            AgentActivity::Idle => Some("idle"),
+            AgentActivity::Working => Some("working"),
+            AgentActivity::Done => Some("done"),
+            // The fail-soft bucket: an unrecognized qualifier, or none at all.
+            AgentActivity::Other => Some("compacting"),
+        }
+    }
+
+    /// Every `AgentActivity` bucket. Keep in sync with the enum — the exhaustive
+    /// `match` in [`qualifier_reaching`] is what fails to compile and sends the
+    /// author here when a bucket is added.
+    const ALL_BUCKETS: [AgentActivity; 5] = [
+        AgentActivity::NeedsInput,
+        AgentActivity::Idle,
+        AgentActivity::Working,
+        AgentActivity::Done,
+        AgentActivity::Other,
+    ];
+
+    /// The trap in `pulse_color`'s identity fallback, pinned shut.
+    ///
+    /// That fallback is the right FAIL-SOFT default — an undeclared base renders
+    /// steady rather than panicking. But it means a future PULSING bucket whose
+    /// base has no declared dim partner would SILENTLY stop pulsing: green tests,
+    /// dead feature, which is exactly how this feature shipped broken twice. So
+    /// walk EVERY bucket and demand that every one `is_active` says pulses has a
+    /// partner that actually differs from its base.
+    ///
+    /// It passes trivially today (one pulsing base, one arm). It exists for the
+    /// day someone adds a second.
+    #[test]
+    fn every_pulsing_buckets_badge_color_has_a_distinct_dim_partner() {
+        for bucket in ALL_BUCKETS {
+            let agent = agent("background", qualifier_reaching(bucket), None);
+            assert_eq!(
+                agents::classify(&agent),
+                bucket,
+                "qualifier_reaching({bucket:?}) must actually classify into that bucket, \
+                 or this walk silently stops covering it"
+            );
+
+            if !agents::is_active(&agent) {
+                continue; // A resting bucket never dims, so it needs no partner.
+            }
+            let base = badge_color(&agent);
+            assert_ne!(
+                pulse_color(base),
+                base,
+                "the {bucket:?} bucket PULSES, so its base {base:?} needs a dim partner \
+                 declared in pulse_color — without one it falls through the identity \
+                 fallback and renders steady, and nothing else would tell you"
+            );
+        }
+    }
+
+    // --- search cursor pulse ----------------------------------------------
+
+    /// The query echoed by the search-cursor tests. Non-empty and free of
+    /// spaces, so [`column_of`] can locate it as one contiguous run.
+    const CURSOR_QUERY: &str = "needle";
+    /// Wide enough for `search: ` + [`CURSOR_QUERY`] + the cursor, with slack.
+    const SEARCH_LINE_WIDTH: u16 = 40;
+
+    /// Draw `app`'s search line into an in-memory terminal and hand back the
+    /// buffer — the cells a real terminal would paint.
+    fn drawn_search(app: &App, width: u16) -> ratatui::buffer::Buffer {
+        let mut terminal =
+            Terminal::new(TestBackend::new(width, 1)).expect("build an in-memory test terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_search(frame, app, area);
+            })
+            .expect("render_search must not panic");
+        terminal.backend().buffer().clone()
+    }
+
+    /// A whole drawn row, borders included — the diagnostic counterpart to
+    /// [`row_text`], which strips column 0 because the LIST it was written for
+    /// sits inside a `Block`. The search line has no border, so reusing
+    /// `row_text` here would silently eat the leading `s` of `search: `.
+    fn full_row_text(buffer: &ratatui::buffer::Buffer, y: u16, width: u16) -> String {
+        (0..width)
+            .filter_map(|x| buffer.cell((x, y)).map(|cell| cell.symbol().to_string()))
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    /// A board whose search line echoes [`CURSOR_QUERY`] at `tick`.
+    fn cursor_board(tick: u64) -> App {
+        let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp/launch"));
+        app.query = CURSOR_QUERY.to_string();
+        app.tick = tick;
+        app
+    }
+
+    /// The column the cursor occupies: immediately after the DRAWN query.
+    ///
+    /// Derived from where the query actually landed rather than hardcoded, so a
+    /// change to the `search: ` prefix fails these tests loudly instead of
+    /// silently reading the wrong cell.
+    fn cursor_column(buffer: &ratatui::buffer::Buffer, width: u16) -> u16 {
+        let query_x = column_of(buffer, 0, width, CURSOR_QUERY);
+        query_x + u16::try_from(CURSOR_QUERY.chars().count()).expect("a query shorter than a row")
+    }
+
+    /// The search cursor is drawn in the pulse's VISIBLE phase — asserted as the
+    /// GLYPH in the buffer, never as a style modifier: this cursor shipped
+    /// carrying the ANSI blink attribute and never blinked once, which a
+    /// modifier assertion would have called green.
+    #[test]
+    fn render_search_draws_the_cursor_in_the_pulses_visible_phase() {
+        let app = cursor_board(0);
+        assert!(blink_visible(app.tick), "tick 0 must be a visible phase");
+
+        let buffer = drawn_search(&app, SEARCH_LINE_WIDTH);
+        let x = cursor_column(&buffer, SEARCH_LINE_WIDTH);
+
+        assert_eq!(
+            buffer
+                .cell((x, 0))
+                .expect("the cursor column must be inside the drawn line")
+                .symbol(),
+            SEARCH_CURSOR,
+            "the cursor glyph must be drawn right after the query in the visible phase; \
+             drawn line: {:?}",
+            full_row_text(&buffer, 0, SEARCH_LINE_WIDTH)
+        );
+    }
+
+    /// The other half of the pulse: at `BLINK_TICKS` the glyph is GONE from its
+    /// column, replaced by a same-width blank. Without this the "pulse" is a
+    /// permanently-lit cursor.
+    #[test]
+    fn render_search_hides_the_cursor_in_the_pulses_hidden_phase() {
+        let app = cursor_board(BLINK_TICKS);
+        assert!(
+            !blink_visible(app.tick),
+            "tick {BLINK_TICKS} must be a hidden phase"
+        );
+
+        let buffer = drawn_search(&app, SEARCH_LINE_WIDTH);
+        let x = cursor_column(&buffer, SEARCH_LINE_WIDTH);
+
+        assert_eq!(
+            buffer
+                .cell((x, 0))
+                .expect("the cursor column must be inside the drawn line")
+                .symbol(),
+            SEARCH_CURSOR_HIDDEN,
+            "the cursor's column must be BLANK in the hidden phase; drawn line: {:?}",
+            full_row_text(&buffer, 0, SEARCH_LINE_WIDTH)
+        );
+    }
+
+    /// The anti-shift pin: the query must not move as the cursor pulses.
+    ///
+    /// Note the cursor is currently the LAST span on the line, so blanking the
+    /// hidden phase and dropping the span paint identical cells — this test
+    /// cannot tell those apart, and does not claim to. What it does pin is that
+    /// nothing the pulse touches ever reflows the query beside it, which is what
+    /// would read as a broken board rather than a pulse.
+    #[test]
+    fn render_search_keeps_the_query_column_stable_across_both_pulse_phases() {
+        let columns: Vec<u16> = [0, BLINK_TICKS]
+            .into_iter()
+            .map(|tick| {
+                let buffer = drawn_search(&cursor_board(tick), SEARCH_LINE_WIDTH);
+                column_of(&buffer, 0, SEARCH_LINE_WIDTH, CURSOR_QUERY)
+            })
+            .collect();
+
+        assert_eq!(
+            columns[0], columns[1],
+            "the query must start at the SAME column in the visible (tick 0, col {}) \
+             and hidden (tick {BLINK_TICKS}, col {}) phases",
+            columns[0], columns[1]
+        );
+    }
+
+    /// Wide/tall enough for a whole board: header + list rows + search + help.
+    const FULL_BOARD_SIZE: (u16, u16) = (80, 14);
+
+    /// Draw the WHOLE board and hand back the buffer.
+    fn drawn_board(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height))
+            .expect("build an in-memory test terminal");
+        terminal
+            .draw(|frame| render(frame, app))
+            .expect("render must not panic");
+        terminal.backend().buffer().clone()
+    }
+
+    /// Whether row `y` of `buffer` has `glyph` drawn anywhere on it.
+    fn row_has_glyph(buffer: &ratatui::buffer::Buffer, y: u16, width: u16, glyph: &str) -> bool {
+        (0..width).any(|x| {
+            buffer
+                .cell((x, y))
+                .is_some_and(|cell| cell.symbol() == glyph)
+        })
+    }
+
+    /// The fg of the badge dot drawn on row `y` — the leftmost `●`, which is the
+    /// badge's (the list is the left pane).
+    fn dot_fg_on_row(buffer: &ratatui::buffer::Buffer, y: u16, width: u16) -> Color {
+        let x = (0..width)
+            .find(|&x| {
+                buffer
+                    .cell((x, y))
+                    .is_some_and(|cell| cell.symbol() == BADGE_DOT)
+            })
+            .unwrap_or_else(|| panic!("a badge dot must be drawn on row {y} in EVERY phase"));
+        buffer
+            .cell((x, y))
+            .expect("the dot cell was just located in this buffer")
+            .fg
+    }
+
+    /// There is exactly ONE phase source on the board: the search cursor and an
+    /// active badge's dot both read `blink_visible(App::tick)`, so they pulse
+    /// TOGETHER rather than drifting against each other.
+    ///
+    /// Reading both out of a SINGLE rendered frame is the point — two separate
+    /// renders could not prove they agree within one paint.
+    ///
+    /// The two are read through DIFFERENT properties because they pulse
+    /// differently BY DESIGN, and that asymmetry is the fix, not an oversight:
+    /// the cursor shows/hides (nothing on the search line is auto-detected by the
+    /// terminal, so mutating that line's text is free), while the dot must hold
+    /// its glyph and swap COLOR instead, or the URL sharing its row flickers (see
+    /// `pulse_color`). So "in phase" here reads: the cursor is drawn exactly when
+    /// the dot carries its BASE color, and blanked exactly when the dot carries
+    /// its dim partner.
+    #[test]
+    fn the_search_cursor_and_an_active_badge_dot_pulse_in_phase() {
+        let (width, height) = FULL_BOARD_SIZE;
+
+        for (tick, on) in [(0, true), (BLINK_TICKS, false)] {
+            let mut app = badge_board();
+            app.tick = tick;
+
+            let buffer = drawn_board(&mut app, width, height);
+            // `render`'s layout is header(1) | body(fill) | search(1) | help(1).
+            let search_y = height - 2;
+            let cursor_drawn = row_has_glyph(&buffer, search_y, width, SEARCH_CURSOR);
+            // `working` is an ACTIVE bucket, so its dot is one whose phase should
+            // track the cursor's.
+            let working_y = row_of(&buffer, width, height, "sess-working");
+            let dot_fg = dot_fg_on_row(&buffer, working_y, width);
+
+            assert_eq!(
+                cursor_drawn,
+                on,
+                "at tick {tick} the search cursor must{} be drawn; line: {:?}",
+                if on { "" } else { " NOT" },
+                full_row_text(&buffer, search_y, width)
+            );
+            let dot_on = dot_fg == badge_color(&agent("background", Some("working"), None));
+            assert_eq!(
+                dot_on,
+                on,
+                "at tick {tick} the active dot must carry its {} color; row: {:?}",
+                if on { "BASE" } else { "dim partner's" },
+                row_text(&buffer, working_y, width)
+            );
+            assert_eq!(
+                cursor_drawn, dot_on,
+                "the cursor and the active dot must share one phase at tick {tick}: \
+                 both are driven by blink_visible(App::tick), so the cursor is drawn \
+                 exactly when the dot is at full color"
+            );
+        }
+    }
+
     // --- new-session agent picker overlay ---------------------------------
 
     use crate::defined_agents::DefinedAgent;
@@ -1596,6 +3168,222 @@ mod tests {
         assert!(
             app.pending_agent.is_some(),
             "rendering must not disturb the open picker"
+        );
+    }
+
+    // --- the pulse against a URL-bearing row ------------------------------
+
+    /// A realistic board: several reported agents across buckets (exactly ONE
+    /// pulsing), a selected session whose preview pane is populated from a real
+    /// fixture, and a session label carrying a URL sharing its row with a badge —
+    /// the exact shape of the user's flicker report.
+    fn linked_label_board() -> App {
+        // (session_id, state, label)
+        let cases: [(&str, &str, &str); 5] = [
+            (
+                "sess-url",
+                "blocked",
+                "Let's evaluate https://docs.rs/ratatui-markdown/latest/ratatui_markdown/ \
+                 rather than rolling our own renderer",
+            ),
+            ("sess-working", "working", "Refactor the JSONL parser"),
+            ("sess-done", "done", "Ship the release workflow"),
+            ("sess-blocked", "blocked", "Waiting on the webhook fix"),
+            ("sess-idle", "idle", "Audit the terminal restore path"),
+        ];
+        let mut sessions = Vec::new();
+        let mut reported = HashMap::new();
+        for (offset, (id, state, label)) in cases.into_iter().enumerate() {
+            let mut session = sample_session();
+            session.session_id = id.to_string();
+            session.label = label.to_string();
+            // Real, distinct datestamps so `short_time` renders a full column.
+            session.timestamp = Some(
+                OffsetDateTime::from_unix_timestamp(
+                    1_752_000_000 + i64::try_from(offset).expect("a small fixture index") * 3_600,
+                )
+                .expect("a valid fixture timestamp"),
+            );
+            reported.insert(
+                session.session_id.clone(),
+                ReportedAgent {
+                    kind: "background".to_string(),
+                    id: None,
+                    state: Some(state.to_string()),
+                    status: None,
+                    name: None,
+                },
+            );
+            sessions.push(session);
+        }
+        let mut app = App::new(sessions, Scope::All, PathBuf::from("/tmp/launch"));
+        app.set_reported_agents(reported);
+        // The URL row is the selected one, so its badge and its URL share a row
+        // AND its preview pane is populated from the fixture on disk.
+        app.selected = Some("sess-url".to_string());
+        app.query = "the".to_string();
+        app
+    }
+
+    /// A realistic viewport: tall enough to show every session, and wide enough
+    /// that the URL-bearing ROW is drawn with a URL PREFIX on screen.
+    ///
+    /// A prefix, NOT the whole URL — the list pane is a fraction of this width
+    /// (`DEFAULT_LIST_PERCENT`), so the label is truncated well before the URL
+    /// ends. That is deliberate and enough: the invariant is that the pulse does
+    /// not disturb the URL text the terminal SEES, and a terminal only scans the
+    /// VISIBLE line. Do not widen this board to fit the whole URL — this shape
+    /// is the user's reported one, and the invariant does not depend on it.
+    const LINKED_BOARD_SIZE: (u16, u16) = (120, 40);
+
+    /// The URL carried by [`linked_label_board`]'s `sess-url` row, which is
+    /// `blocked` and therefore STEADY — which is exactly why the fixture below
+    /// exists to move it onto the pulsing row.
+    const FIXTURE_URL: &str = "https://docs.rs/ratatui-markdown/latest/ratatui_markdown/";
+
+    /// [`linked_label_board`] with [`FIXTURE_URL`] moved onto the PULSING row —
+    /// the worst case for the flicker report, since that row is the only one
+    /// whose cells the pulse touches at all.
+    fn url_on_the_pulsing_row() -> App {
+        let mut app = linked_label_board();
+        let working = app
+            .sessions
+            .iter_mut()
+            .find(|s| s.session_id == "sess-working")
+            .expect("the pulsing fixture row");
+        working.label = format!("Assess {FIXTURE_URL} rather than rolling our own");
+        app.query = String::new();
+        app
+    }
+
+    /// The board at `tick`, drawn through the FULL `render` entry point.
+    fn linked_board_at(tick: u64) -> ratatui::buffer::Buffer {
+        let (width, height) = LINKED_BOARD_SIZE;
+        let mut app = url_on_the_pulsing_row();
+        app.tick = tick;
+        drawn_board(&mut app, width, height)
+    }
+
+    /// A CONTROL, and the determinism guard underneath every phase test here:
+    /// two renders at the SAME tick with NO state change must paint identical
+    /// buffers. Any diff would mean the render path reads a clock / iterates a
+    /// `HashMap` / sorts unstably — which would repaint cells on every event
+    /// regardless of the pulse, and would also make the phase diffs below
+    /// meaningless (they could not attribute a changed cell to the pulse).
+    #[test]
+    fn two_renders_at_the_same_tick_paint_identical_buffers() {
+        let (width, height) = LINKED_BOARD_SIZE;
+        let mut app = linked_label_board();
+        app.tick = 0;
+        let first = drawn_board(&mut app, width, height);
+        let second = drawn_board(&mut app, width, height);
+
+        let changed = first.diff(&second);
+        assert!(
+            changed.is_empty(),
+            "a same-tick re-render must not churn; changed cells: {:?}",
+            changed
+                .iter()
+                .map(|(x, y, cell)| (*x, *y, cell.symbol()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// THE bug, pinned at the buffer: when a URL shares a row with a PULSING
+    /// badge, the pulse must not change any SYMBOL on that row — only styles.
+    ///
+    /// This is what the flicker actually was. We emit plain-text URLs (no OSC 8),
+    /// so the terminal auto-detects links by TEXT PATTERN; mutating any of the
+    /// line's text forces it to re-scan and re-render that line's URL underline.
+    /// The dot's old glyph->blank swap was such a mutation. A style-only change
+    /// leaves the text byte-identical, so there is nothing to re-detect.
+    ///
+    /// SCOPED TO THE AGENT'S ROW ON PURPOSE — do not "strengthen" this
+    /// board-wide. The search cursor legitimately DOES change symbol between
+    /// phases (show/hide is correct for a cursor, and its line carries no URL to
+    /// disturb), so a whole-board version would fail on the cursor's cell for a
+    /// reason that has nothing to do with this invariant.
+    ///
+    /// The non-empty assertion is load-bearing: it proves `Buffer::diff` reports
+    /// STYLE-ONLY differences at all (`Cell`'s `PartialEq` compares fg/bg/
+    /// modifier alongside the symbol). Without it, a `diff` that only noticed
+    /// symbols would make this test pass vacuously — green over the very bug it
+    /// claims to pin.
+    #[test]
+    fn the_pulse_changes_only_style_and_never_a_symbol_on_a_url_bearing_row() {
+        let (width, height) = LINKED_BOARD_SIZE;
+        let on = linked_board_at(0);
+        let off = linked_board_at(BLINK_TICKS);
+
+        let y = row_of(&on, width, height, "Assess");
+        let changed: Vec<_> = on
+            .diff(&off)
+            .into_iter()
+            .filter(|(_, cy, _)| *cy == y)
+            .collect();
+
+        assert!(
+            !changed.is_empty(),
+            "the pulse must actually change SOMETHING on the URL row, or this test \
+             proves nothing — a Buffer::diff blind to style-only changes would make \
+             it pass vacuously"
+        );
+        for (x, cy, after) in changed {
+            let before = on
+                .cell((x, cy))
+                .expect("a changed cell must exist in both buffers");
+            assert_eq!(
+                before.symbol(),
+                after.symbol(),
+                "the pulse changed the SYMBOL at ({x},{cy}) from {:?} to {:?} — it may \
+                 only restyle cells. Mutating this row's text forces the terminal to \
+                 re-detect the URL in the label and flicker its underline; row: {:?}",
+                before.symbol(),
+                after.symbol(),
+                row_text(&on, y, width).trim_end()
+            );
+        }
+    }
+
+    /// The stronger, complementary half: the pulse must not touch the URL's own
+    /// cells AT ALL — not even their style. If every changed cell on the row sits
+    /// left of the URL, we never re-emit the link text under any encoding.
+    ///
+    /// Under the symbol invariant above this became a much sharper claim than it
+    /// was written as. It once tolerated the dot's glyph swap (that cell is left
+    /// of the URL, so the diff stayed in bounds while the terminal still re-read
+    /// the mutated line); now the pulse's ONLY reachable effect is a style change
+    /// on a single cell, and this pins that the cell is not one the link is made
+    /// of.
+    #[test]
+    fn the_pulse_never_rewrites_a_url_cell_on_a_pulsing_row() {
+        let (width, height) = LINKED_BOARD_SIZE;
+        let on = linked_board_at(0);
+        let off = linked_board_at(BLINK_TICKS);
+
+        let y = row_of(&on, width, height, "Assess");
+        let url_x = column_of(&on, y, width, "https");
+        let changed: Vec<_> = on
+            .diff(&off)
+            .into_iter()
+            .filter(|(_, cy, _)| *cy == y)
+            .collect();
+
+        // Local vacuity guard: `all` over an EMPTY diff is TRUE, so a pulse that
+        // died entirely would pass the bounds claim below while proving nothing.
+        // Its sibling above guards the same board, but this test must not depend
+        // on another test being present to be meaningful.
+        assert!(
+            !changed.is_empty(),
+            "the pulse must actually change SOMETHING on the URL row, or the bounds \
+             assertion below holds vacuously over an empty diff"
+        );
+        assert!(
+            changed.iter().all(|(x, _, _)| *x < url_x),
+            "the pulse must never rewrite a cell of the URL text itself (URL starts \
+             at x={url_x}); changed columns: {:?}; row: {:?}",
+            changed.iter().map(|(x, _, _)| *x).collect::<Vec<_>>(),
+            row_text(&on, y, width).trim_end()
         );
     }
 }

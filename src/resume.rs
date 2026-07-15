@@ -74,6 +74,24 @@ pub struct Ready {
     /// ([`NEW_SESSION_NONZERO_HINT`]). Reusing the resume wording on a new-session
     /// failure would be actively misleading.
     pub nonzero_hint: &'static str,
+    /// The session id to re-probe if this child exits non-zero — `Some` ONLY on
+    /// the PLAIN-resume path.
+    ///
+    /// This is the TOCTOU race-recovery seam (`crate::run`): a plain `claude -r`
+    /// that exits non-zero may have been refused because the session went live
+    /// between the gate's probe and the spawn, so the driver re-probes THIS id and,
+    /// if claude now reports it live, routes the user to Attach/Fork instead of
+    /// guessing with [`RESUME_NONZERO_HINT`].
+    ///
+    /// `None` STRUCTURALLY means "recovery does not apply", which is why this is
+    /// one field rather than a flag beside an id — the two can never disagree, and
+    /// no caller can ask to recover without saying which session. It is `None` for
+    /// every other hand-off, each for its own reason: a FORK of a live session is
+    /// expected to succeed (a non-zero exit there is a real failure, not a race),
+    /// an ATTACH is already the live path, and a NEW session has no session to
+    /// probe. Set at the [`check`] seam from the AUTHORITATIVE id read from inside
+    /// the file — never re-derived by sniffing `argv` for `--fork-session`.
+    pub race_probe_id: Option<String>,
 }
 
 /// Neutral hint shown on the board when a resumed `claude` exits NON-ZERO.
@@ -83,6 +101,21 @@ pub struct Ready {
 /// message only points at the next moves rather than diagnosing.
 pub const RESUME_NONZERO_HINT: &str =
     "claude exited with an error — if this session is running, use Fork (Ctrl-F) or Attach.";
+
+/// Status shown when a plain resume exited non-zero AND a fresh probe confirms
+/// the session IS live — the TOCTOU race, caught after the fact.
+///
+/// Unlike [`RESUME_NONZERO_HINT`] this one DOES assert, because both halves were
+/// observed rather than guessed: claude exited non-zero, and claude's own active
+/// list reports the session right now. It still stops short of claiming the two
+/// are causally linked ("and" — not "because"), since a user Ctrl-C'ing a healthy
+/// session that is also live would produce the same pair. That is why the board
+/// also opens the Attach/Fork overlay: the accurate claim earns the accurate
+/// route, and the user is never told a session "is running" on anything less than
+/// the probe's word.
+pub const RESUME_RACE_STATUS: &str =
+    "claude exited with an error, and this session is now running as an agent — \
+     Attach or Fork (Ctrl-F) instead of resuming.";
 
 /// Neutral hint shown when a NEW session's `claude` exits NON-ZERO.
 ///
@@ -105,6 +138,29 @@ pub const NEW_SESSION_NONZERO_HINT: &str =
 /// with "No job matching").
 pub const ATTACH_NO_JOB_ID: &str = "This interactive session has no attachable agent job; \
      open it in its own terminal, or Fork instead.";
+
+/// Refusal shown when Attach is chosen but claude's ACTIVE list no longer
+/// reports the session as a running agent.
+///
+/// The overlay can sit open indefinitely while the user decides, so the agent may
+/// well have finished in between — which is why the Attach hand-off re-probes
+/// instead of trusting the probe that opened the overlay. With no live record
+/// there is no authoritative job id, and `claude attach` would be spawned against
+/// a dead or absent one (exit 1, "No job matching"). Refuse instead.
+///
+/// **Worded for what was OBSERVED, not for a cause we cannot know.** The probe
+/// fails soft toward "not live", so an empty answer means "the agent finished"
+/// and "we could not ask claude" ALIKE (see [`crate::agents::live_agents`]).
+/// Saying "the agent finished" would fabricate certainty; saying claude *no
+/// longer reports it* is true in both worlds, because it describes the report
+/// rather than the session.
+///
+/// It names the routes that are valid in both worlds too, rather than acting for
+/// the user: a plain resume re-probes at its own gate and is backstopped by
+/// claude's own refusal check, and a fork of a finished session is just an
+/// ordinary fork. Attach is the ONLY choice that needs a live job id.
+pub const ATTACH_NOT_LIVE: &str = "claude no longer reports this session as a running agent, \
+     so there is nothing to attach to. Press Enter to resume it, or Ctrl-F to fork.";
 
 /// Why a resume did not hand off to `claude`.
 ///
@@ -292,6 +348,11 @@ pub fn check(session: &Session, fork: bool) -> Result<Ready, ResumeError> {
             fork,
         } => Ok(Ready {
             argv: build_argv(&session_id, fork),
+            // Only a PLAIN resume can lose the liveness race — a fork of a live
+            // session is expected to work, so a non-zero exit there is a genuine
+            // failure and must keep the neutral hint. Deriving the flag from the
+            // same `fork` the argv is built from keeps the two in lockstep.
+            race_probe_id: (!fork).then(|| session_id.clone()),
             cwd,
             nonzero_hint: RESUME_NONZERO_HINT,
         }),
@@ -320,6 +381,9 @@ pub fn check_attach(session: &Session, agent_id: Option<&str>) -> Result<Ready, 
     match plan(session, false) {
         ResumePlan::Ready { cwd, .. } => Ok(Ready {
             argv: build_attach_argv(job_id),
+            // Attach IS the live path; there is no plain resume to have lost a
+            // race, so there is nothing to recover.
+            race_probe_id: None,
             cwd,
             nonzero_hint: RESUME_NONZERO_HINT,
         }),
@@ -346,6 +410,9 @@ pub fn check_new(launch_dir: &Path, agent: Option<&str>) -> Result<Ready, Resume
         Ok(Ready {
             cwd: launch_dir.to_path_buf(),
             argv: build_new_argv(agent),
+            // A brand-new session has no session id yet (claude mints one), so
+            // there is nothing to probe and nothing to recover.
+            race_probe_id: None,
             nonzero_hint: NEW_SESSION_NONZERO_HINT,
         })
     } else {
@@ -480,6 +547,103 @@ mod tests {
             .join("store")
             .join(folder)
             .join(file)
+    }
+
+    /// A real, resumable session file whose IN-FILE `cwd` exists on this host,
+    /// so `check` reaches `Ready` instead of refusing. Returns the `Session` and
+    /// the temp dir to clean up.
+    ///
+    /// The committed fixtures all carry `/Users/me/...`, which does not exist on
+    /// a test host — fine for the refusal tests, useless for pinning what a
+    /// CONFIRMED plan carries.
+    fn resumable_session(tag: &str, id: &str) -> (Session, PathBuf) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("snapback-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create the temp cwd");
+        let file = dir.join(format!("{id}.jsonl"));
+        std::fs::write(
+            &file,
+            format!(
+                r#"{{"type":"user","sessionId":"{id}","cwd":"{cwd}","message":{{"role":"user","content":"hi"}}}}"#,
+                id = id,
+                cwd = dir.display(),
+            ),
+        )
+        .expect("write the resumable fixture");
+        let session = Session {
+            file,
+            session_id: id.to_string(),
+            cwd: dir.clone(),
+            git_branch: None,
+            timestamp: None,
+            repo: "repo".into(),
+            label: String::new(),
+            content_index: String::new(),
+        };
+        (session, dir)
+    }
+
+    /// Which hand-offs may attempt TOCTOU race recovery, decided at the ONE seam
+    /// that builds them.
+    ///
+    /// A plain resume carries the AUTHORITATIVE id (read from inside the file,
+    /// not the stale in-memory copy) so the driver can re-probe it. A fork
+    /// carries `None`: a fork of a live session is expected to SUCCEED, so its
+    /// non-zero exit is a real failure and re-routing it to "Fork instead" would
+    /// loop the user. `None` is what makes that structural rather than a
+    /// convention — and it is derived from the same `fork` flag the argv is built
+    /// from, never by sniffing the argv for `--fork-session`.
+    #[test]
+    fn only_a_plain_resume_carries_a_race_probe_id() {
+        let (session, dir) = resumable_session("race-id", "sess-live");
+
+        let plain = check(&session, false).expect("an existing cwd must proceed");
+        assert_eq!(plain.argv.join(" "), "claude -r sess-live");
+        assert_eq!(
+            plain.race_probe_id.as_deref(),
+            Some("sess-live"),
+            "a plain resume is the one hand-off that can lose the liveness race, \
+             so it must carry the id to re-probe"
+        );
+
+        let forked = check(&session, true).expect("an existing cwd must proceed");
+        assert_eq!(forked.argv.join(" "), "claude -r sess-live --fork-session");
+        assert_eq!(
+            forked.race_probe_id, None,
+            "a fork of a live session is expected to work: its non-zero exit is a \
+             genuine failure, and recovery must be structurally impossible"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The probe id is the AUTHORITATIVE one re-read from inside the file, not
+    /// the possibly-stale `Session::session_id` the board loaded earlier — the
+    /// same rule the argv already follows. Probing a stale id would ask claude
+    /// about the wrong session.
+    #[test]
+    fn the_race_probe_id_is_the_authoritative_id_from_inside_the_file() {
+        let (mut session, dir) = resumable_session("race-auth", "sess-in-file");
+        // What the board holds in memory has drifted from the file.
+        session.session_id = "stale-in-memory".into();
+
+        let ready = check(&session, false).expect("an existing cwd must proceed");
+
+        assert_eq!(
+            ready.race_probe_id.as_deref(),
+            Some("sess-in-file"),
+            "the probe id must come from inside the file, like the argv's"
+        );
+        assert!(
+            ready.argv.join(" ").contains("sess-in-file"),
+            "sanity: the argv is authoritative too, and the two must agree"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -623,10 +787,16 @@ mod tests {
                 cwd,
                 argv,
                 nonzero_hint,
+                race_probe_id,
             }) => {
                 assert_eq!(cwd, existing);
                 assert_eq!(argv, vec!["claude".to_string()]);
                 assert_eq!(nonzero_hint, NEW_SESSION_NONZERO_HINT);
+                assert_eq!(
+                    race_probe_id, None,
+                    "a new session has no session id to probe, so race recovery \
+                     must be structurally impossible here"
+                );
             }
             Err(e) => panic!("an existing launch dir must proceed: {e:?}"),
         }

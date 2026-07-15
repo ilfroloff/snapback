@@ -18,7 +18,7 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Text};
 use time::OffsetDateTime;
 
-use crate::agents::LiveAgent;
+use crate::agents::ReportedAgent;
 use crate::defined_agents::DefinedAgent;
 use crate::search::{SearchIndex, SearchMode};
 use crate::store::{preview, Session};
@@ -270,6 +270,44 @@ pub fn resolve_list_width(list_width: Option<u16>, body_width: u16) -> u16 {
     clamp_list_width(requested, body_width)
 }
 
+/// How the board asks claude which sessions are LIVE right now.
+///
+/// Boxed so it is injectable at the one seam that matters — see
+/// [`App::live_probe`]. Returns claude's ACTIVE agents keyed by full
+/// `sessionId`; an empty map means "none, or we could not ask", which both
+/// resolve to the same fail-soft answer: not live, let claude decide.
+///
+/// It yields the RECORDS, not bare ids, so ONE probe answers both hand-off
+/// questions — *is it live* (membership) and *what is its attach job `id`* (the
+/// matched record's own). See [`crate::agents::live_agents`].
+type LiveProbe = Box<dyn Fn() -> HashMap<String, ReportedAgent>>;
+
+/// The probe a fresh [`App`] starts with: the real shell-out to claude.
+#[cfg(not(test))]
+fn default_live_probe() -> HashMap<String, ReportedAgent> {
+    crate::agents::live_agents()
+}
+
+/// The probe a fresh [`App`] starts with UNDER TEST: none. Panics.
+///
+/// Two things this makes impossible, both of which this seam exists to prevent:
+///
+/// 1. **A test spawning `claude`.** The suite never spawns it (PATTERNS.md), and
+///    the real default would — the gate calls it on every Enter, and the Attach
+///    hand-off calls it again.
+/// 2. **A test passing for the wrong reason.** Defaulting to an empty map would
+///    silently mean "nothing is live", so a test that forgot to seed would
+///    plain-resume and look correct while asserting nothing about the gate. This
+///    forces every test that reaches a liveness decision to STATE what claude
+///    reports, via [`App::set_live_probe`].
+#[cfg(test)]
+fn default_live_probe() -> HashMap<String, ReportedAgent> {
+    panic!(
+        "a test reached the liveness gate without seeding the live set — call \
+         App::set_live_probe to state what claude reports (never spawn `claude`)"
+    )
+}
+
 /// The full TUI state model.
 ///
 /// Selection is stored as a stable `session_id` (never a list index) so it
@@ -327,10 +365,38 @@ pub struct App {
     /// Transient board status (e.g. a resume refusal for a deleted worktree).
     /// Rendered on the help line and cleared on the next actionable keypress.
     pub status: Option<String>,
-    /// Currently-running sessions, keyed by full `session_id` (joined from
-    /// `claude agents --json`). Refreshed OFF the UI thread; drives the live
-    /// badges and the smart-Enter choice. Empty when the signal is unavailable.
-    pub live: HashMap<String, LiveAgent>,
+    /// Count of `AppEvent::Tick`s since launch, advanced at the `watch::TICK`
+    /// cadence and wrapping rather than overflowing.
+    ///
+    /// The board's only clock, and it exists for exactly one reason: it phases
+    /// the live-badge pulse via [`super::view::blink_visible`]. The pulse is
+    /// APP-driven because the terminal-driven alternative does not work — most
+    /// modern terminals ignore the ANSI blink attribute, so a `SLOW_BLINK` dot
+    /// renders steady. This reuses the redraw cadence that already exists; it
+    /// adds no tick, thread, or event source of its own.
+    pub tick: u64,
+    /// Sessions claude REPORTED as agents, keyed by full `session_id` (joined
+    /// from `claude agents --json --all`). Refreshed OFF the UI thread; drives
+    /// the badges and the preview status banner. Empty when the signal is
+    /// unavailable.
+    ///
+    /// A DISPLAY signal only, and that is the WHOLE of its authority: `--all`
+    /// includes agents that reported completion, so membership here does not mean
+    /// the session is running. **Nothing may hand off on it** — not the resume
+    /// gate (ask [`is_live_now`](Self::is_live_now)) and not the Attach job `id`
+    /// either (ask [`live_agent_now`](Self::live_agent_now)). Both once read this
+    /// map; both now re-ask claude at the moment they act, because a hand-off
+    /// decided from a ~1.3s-stale snapshot is the bug shape this seam exists to
+    /// prevent. It renders badges and the banner, nothing more.
+    pub reported_agents: HashMap<String, ReportedAgent>,
+    /// How [`live_agent_now`](Self::live_agent_now) and
+    /// [`is_live_now`](Self::is_live_now) ask claude which sessions are live.
+    /// Defaults to the real [`crate::agents::live_agents`] shell-out.
+    ///
+    /// A seam, not a strategy: it exists so tests seed the live set directly
+    /// rather than spawning `claude` (which the suite never does), in the spirit
+    /// of `resume::build_argv`. Production swaps it exactly never.
+    live_probe: LiveProbe,
     /// The open running-session choice overlay, if any. `Some` while the
     /// Attach/Fork/Cancel prompt owns the keyboard.
     pub pending_live: Option<PendingLive>,
@@ -392,7 +458,9 @@ impl App {
             preview_rect: Rect::default(),
             list_width: None,
             status: None,
-            live: HashMap::new(),
+            tick: 0,
+            reported_agents: HashMap::new(),
+            live_probe: Box::new(default_live_probe),
             pending_live: None,
             pending_agent: None,
             last_new_agent: None,
@@ -633,27 +701,86 @@ impl App {
         self.status = None;
     }
 
-    // --- live agents + running-session choice overlay ---------------------
+    // --- reported agents + running-session choice overlay -----------------
 
-    /// Replace the live-agent set (delivered off-thread by the agents poller).
-    /// Keyed by full `session_id`; the poller refreshes the whole map each cycle
-    /// so stale entries self-heal without an explicit clear.
-    pub fn set_live(&mut self, live: HashMap<String, LiveAgent>) {
-        self.live = live;
+    /// Replace the reported-agent set (delivered off-thread by the agents
+    /// poller). Keyed by full `session_id`; the poller refreshes the whole map
+    /// each cycle so stale entries self-heal without an explicit clear.
+    pub fn set_reported_agents(&mut self, agents: HashMap<String, ReportedAgent>) {
+        self.reported_agents = agents;
     }
 
-    /// The live-agent record for `session_id`, if that session is running now
-    /// (drives the badge; `None` for a non-live row).
+    /// The reported-agent record for `session_id`, if claude knows it as an agent
+    /// (drives the badge + banner; `None` for a row it never reported).
+    ///
+    /// Says NOTHING about liveness — an agent that reported completion is
+    /// reported too, and both the badge and the banner must still see it in order
+    /// to render it green and steady. Use
+    /// [`is_live_now`](Self::is_live_now) to gate behavior on "running now", and
+    /// [`live_agent_now`](Self::live_agent_now) for a hand-off's job `id`.
+    ///
+    /// RENDERING ONLY. This is the badge/banner accessor: the view draws from the
+    /// polled snapshot precisely BECAUSE a render must never shell out. Nothing
+    /// that hands off to `claude` may read it.
     #[must_use]
-    pub fn live_agent(&self, session_id: &str) -> Option<&LiveAgent> {
-        self.live.get(session_id)
+    pub fn reported_agent(&self, session_id: &str) -> Option<&ReportedAgent> {
+        self.reported_agents.get(session_id)
     }
 
-    /// Whether `session_id` is currently a live agent — the smart-Enter gate
-    /// (join is a strict full-`session_id` match).
+    /// Ask claude, RIGHT NOW, for the ACTIVE agent record it holds for
+    /// `session_id` — the one authoritative read every hand-off makes.
+    ///
+    /// `Some(agent)` means claude is holding the session open AND carries its
+    /// attach job `id`; `None` means it is not in claude's active list (finished,
+    /// or the probe failed — see below). Both answers a hand-off needs come from
+    /// this SINGLE read, which is the point: liveness and the job id can never be
+    /// resolved against different snapshots.
+    ///
+    /// Deliberately NOT a read of [`reported_agents`](Self::reported_agents):
+    /// that map is a ~1.3s-stale `--all` snapshot whose `done` qualifier means
+    /// "the agent reported completion", not "claude will permit `-r`". The two
+    /// can disagree transiently, and claude is the only authority on its own
+    /// refusal.
+    ///
+    /// Routed through [`live_probe`](Self::live_probe) so tests seed the live set
+    /// instead of spawning `claude`. Fail-soft: an unavailable signal is an empty
+    /// map ⇒ `None` ⇒ the caller degrades toward letting claude decide (see
+    /// [`crate::agents::live_agents`]). It SHELLS OUT — call it at a hand-off,
+    /// never from a render.
     #[must_use]
-    pub fn is_live(&self, session_id: &str) -> bool {
-        self.live.contains_key(session_id)
+    pub fn live_agent_now(&self, session_id: &str) -> Option<ReportedAgent> {
+        // The probe hands back an owned, freshly-parsed map, so `remove` lifts the
+        // record out without a clone; the map dies at the end of the statement.
+        (self.live_probe)().remove(session_id)
+    }
+
+    /// Ask claude, RIGHT NOW, whether it is holding `session_id` open — the
+    /// smart-Enter gate's predicate and the race-recovery probe.
+    ///
+    /// MEMBERSHIP in claude's fresh ACTIVE list, with nothing inferred and no
+    /// bucket — expressed over [`live_agent_now`](Self::live_agent_now) so
+    /// liveness and the attach job `id` are answered by ONE probe rather than two
+    /// notions of "live". `Some` ⇒ live is exactly membership: the bare
+    /// `claude agents --json` IS the active list.
+    #[must_use]
+    pub fn is_live_now(&self, session_id: &str) -> bool {
+        self.live_agent_now(session_id).is_some()
+    }
+
+    /// Seed the ACTIVE list [`live_agent_now`](Self::live_agent_now) and
+    /// [`is_live_now`](Self::is_live_now) read, so a test can state "claude says
+    /// these are live" — and what their job ids are — without spawning `claude`.
+    ///
+    /// `#[cfg(test)]` on purpose: the seam exists ONLY for tests, and gating it
+    /// this way is what guarantees the production board can never be handed
+    /// anything but the real probe.
+    ///
+    /// The closure is called ONCE PER PROBE, so a test can hand back a DIFFERENT
+    /// answer per call — which is what lets the Attach tests express a session
+    /// that was live at the Enter gate and gone by the hand-off.
+    #[cfg(test)]
+    pub fn set_live_probe(&mut self, probe: impl Fn() -> HashMap<String, ReportedAgent> + 'static) {
+        self.live_probe = Box::new(probe);
     }
 
     /// Look up a loaded session by its stable id.
@@ -1493,8 +1620,8 @@ mod tests {
 
     // --- live-agent join + overlay state ----------------------------------
 
-    fn live_agent(kind: &str) -> LiveAgent {
-        LiveAgent {
+    fn reported_agent(kind: &str) -> ReportedAgent {
+        ReportedAgent {
             kind: kind.to_string(),
             id: None,
             state: None,
@@ -1503,28 +1630,37 @@ mod tests {
         }
     }
 
-    /// Task VERIFY-2: a session whose id matches a live `sessionId` is flagged
-    /// live with the correct kind; a non-matching id is NOT.
+    /// The reported-agent join is a STRICT full-`session_id` match: a matching id
+    /// resolves its record (kind and all), a non-matching one resolves nothing,
+    /// and a PREFIX must never match.
+    ///
+    /// Still load-bearing after the resume gate stopped reading this map: it is
+    /// the join the badge, the banner, and — most sharply — the Attach job `id`
+    /// lookup all ride on, and a prefix match there would attach to the wrong
+    /// agent.
     #[test]
-    fn live_set_joins_strictly_by_full_session_id() {
+    fn the_reported_agent_join_is_strictly_by_full_session_id() {
         let mut app = app_all(vec![
             session("live-id", "r1", Some("main"), "/tmp/a"),
             session("dead-id", "r2", Some("main"), "/tmp/b"),
         ]);
-        let mut live = HashMap::new();
-        live.insert("live-id".to_string(), live_agent("background"));
-        app.set_live(live);
+        let mut reported = HashMap::new();
+        reported.insert("live-id".to_string(), reported_agent("background"));
+        app.set_reported_agents(reported);
 
-        assert!(app.is_live("live-id"), "the matching id is live");
         assert_eq!(
-            app.live_agent("live-id").map(LiveAgent::kind_label),
+            app.reported_agent("live-id").map(ReportedAgent::kind_label),
             Some("bg"),
             "kind carries through the join"
         );
-        assert!(!app.is_live("dead-id"), "a non-matching id is not live");
-        assert!(app.live_agent("dead-id").is_none());
-        // A partial / prefix id must NOT match (strict full-id join).
-        assert!(!app.is_live("live"));
+        assert!(
+            app.reported_agent("dead-id").is_none(),
+            "a non-matching id resolves no record"
+        );
+        assert!(
+            app.reported_agent("live").is_none(),
+            "a PREFIX must not match: the join is the full session id or nothing"
+        );
     }
 
     #[test]

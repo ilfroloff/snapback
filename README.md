@@ -111,10 +111,40 @@ is highlighted in the list.
 finished ones update, deleted ones drop out — all in place, with your selection
 and scroll position preserved.
 
-**Live sessions.** Sessions running right now are marked with a badge. Because a
-running session can't be plain-resumed, pressing `Enter` on one offers **Attach**
-(reconnect to a running background agent), **Fork**, or **Cancel** — so a live
-agent is never a dead end.
+**Agent sessions at a glance.** Every session Claude Code is running — or has
+recently finished running — as an agent carries a colored badge: a dot and a
+short tag that share one color, so you can read the state of your agents straight
+off the list.
+
+- **yellow** — it **needs input**: stopped, waiting on you to answer.
+- **green** — nothing is wanted from you: the session is either idle or finished.
+  The word beside the badge says which.
+- **gray, pulsing** — working right now.
+
+The pulse is the tell for activity: only the working badge pulses, once a second,
+and only its dot — which fades between bright and dim rather than blinking out,
+so no text on the row ever moves or redraws and a busy board doesn't flicker.
+Colors follow your terminal's theme.
+
+Open the preview on a badged session and it leads with the same status in words,
+pinned above the transcript so it stays in view while the transcript scrolls
+beneath it — you can see why a session is sitting there before deciding what to
+do about it. It reports what Claude Code reports, in Claude Code's own words, with
+one exception: the two states that both mean *the session is waiting on you*
+(`blocked` and `waiting`) are spelled out as `needs input`. Anything else is
+passed through as-is rather than guessed at.
+
+Because a session that's still running can't be plain-resumed, pressing `Enter`
+on one offers **Attach** (reconnect to a running background agent), **Fork**, or
+**Cancel** — so a live agent is never a dead end. A finished session resumes
+normally; its badge tells you it's done without getting in the way.
+
+Which of those you get is decided by asking Claude Code at the moment you press
+`Enter`, not by the badge you're looking at. Badges refresh about once a second,
+and a session can start or finish in between — so if one is secretly still
+running, you get the Attach/Fork choice rather than an error. And if a resume
+does fail because the session came back to life underneath you, the board says so
+and offers the same choice instead of leaving you to guess.
 
 **Start a new session, with an agent.** `Ctrl-N` starts a fresh session in the
 folder you launched from. If you keep Claude Code agents defined, it offers a

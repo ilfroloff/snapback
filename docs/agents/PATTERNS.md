@@ -12,10 +12,24 @@ The JSONL format is external and undocumented, so treat every read as hostile:
   `#[derive(Deserialize)]` structs. Schema drift must never be fatal.
 - Skip an unparseable line, a non-object value, or an unreadable file; keep
   going. One bad line never aborts a file; one bad file never aborts the scan.
-- The same discipline governs `claude agents --json` (`agents::parse_agents_json`):
-  a missing binary, non-zero exit, non-JSON, or a non-array top level all
-  collapse to an **empty set**, never a panic. There is exactly one place the
-  wire shape is interpreted per source.
+- The same discipline governs both `claude agents --json` readings
+  (`agents::parse_agents_json`, shared by the `--all` board poll and the bare
+  liveness probe): a missing binary, non-zero exit, non-JSON, or a non-array top
+  level all collapse to an **empty set**, never a panic. There is exactly one
+  place the wire shape is interpreted per source.
+- **Fail-soft has a DIRECTION, and it is chosen per consumer.** The display
+  classifier fails toward *active* (drift must not hide a busy session);
+  `agents::live_agents` fails toward *not live* (empty ⇒ plain resume ⇒
+  claude's own check backstops it). Opposite, and both correct — a classifier
+  facing an unknown bucket should assume the worst, whereas a membership test has
+  no bucket to be unsure about and an authority one step downstream. State the
+  direction and its reason whenever you add a fail-soft path.
+- **A fail-soft answer may COLLAPSE premises — then say only what you observed.**
+  `live_agents`' empty map means "finished" and "could not ask" alike, so the
+  Attach refusal (`resume::ATTACH_NOT_LIVE`) is worded for the report ("claude no
+  longer reports this session as a running agent"), never for a cause the probe
+  cannot distinguish. Do not fabricate certainty a degraded signal cannot carry;
+  name the routes that hold in every collapsed world instead.
 - DEFINED-agent discovery (`defined_agents`) is the same: a missing
   `.claude/agents` dir, an unreadable file, or malformed YAML frontmatter is
   skipped (`parse_frontmatter` returns `None`), collapsing to a (possibly empty)
@@ -39,10 +53,16 @@ it. Follow this split when adding behavior:
 
 - Pure, tested: `resume::plan` / `plan_from_parts` / `build_argv` /
   `build_new_argv` / `status_for_exit`; `defined_agents::select_agents` /
-  `parse_frontmatter`; `update::key_to_action` / `wheel_target`; every `App`
-  state transition (incl. `pick_default_index` and the agent-picker cycle);
-  `view`'s `wrapped_rows` / `clamp_preview_offset` / `centered_rect` /
-  `highlight_runs`.
+  `parse_frontmatter`; `agents::classify` and the two outputs derived from it
+  (`friendly_status` / `is_active`) plus both argv builders (`agents_argv` /
+  `live_agents_argv`); `update::key_to_action` /
+  `wheel_target`; every `App` state transition (incl. `pick_default_index` and
+  the agent-picker cycle); `view`'s `wrapped_rows` / `clamp_preview_offset` /
+  `preview_split` / `centered_rect` / `highlight_runs` / `blink_visible` (the
+  board's ONE pulse phase, a pure fn of `App::tick`) / `badge_color` and its
+  `pulse_color` partner (also derived from `classify`, but a rendering decision,
+  so the palette sits in the view rather than dragging ratatui into the parser
+  layer).
 - Thin, impure: `resume::launch` (chdir + spawn + wait), `defined_agents::discover_agents`
   (the FS walk over `select_agents` / `parse_frontmatter`), the `watch` threads,
   `tui::run` (draw loop). Keep these small and delegate to tested helpers.
@@ -74,15 +94,67 @@ in the new filtered list; if it vanished, clamp the previous position to the
 nearest surviving row. Path canonicalization (the scope predicate) runs only on
 reload / scope-toggle (`recompute_scope`), never per keystroke.
 
+The preview's own scroll is **bottom-anchored by default**
+(`App::preview_follow_bottom` starts true, is re-armed on every selection change
+and preview show, and `clamp_preview_offset` then pins to `max_offset`). So
+anything that must STAY visible is a **layout row, never a line prepended into
+the scrolled `Text`** — a prepended line is scrolled off for any transcript
+taller than the pane, which is the normal case. The status banner is the
+instance: `view::preview_split(area, has_banner)` carves the pane's inner rect
+into a pinned banner row and the transcript beneath it, and returns the WHOLE
+inner rect when there is no banner (so a banner-less pane's geometry is exactly
+`Block::inner`, unchanged). Three rules follow:
+
+- `preview_split` is the ONE place that geometry is derived. `render_preview`
+  draws against its rects and `update::link_under_pointer` hit-tests against the
+  same transcript rect. A click resolves through `App::preview_scroll` and the
+  width-scoped hit cache, both measured from that rect's origin — derive it
+  anywhere else and a click silently opens the wrong link.
+- `has_banner` is **`view::preview_banner(app).is_some()` — never liveness**.
+  Since the poller passes `--all`, an agent that reported completion still has a
+  banner while claude would not call it live; keying the geometry on liveness
+  would draw the banner but hit-test one row off for every `done` session. Name
+  it for the banner, not for liveness. Liveness is also *unaskable* here: it now
+  means a shell-out to claude (`App::is_live_now`), which a render must never do.
+- The split is **vertical only**, so a banner and a banner-less pane share one
+  inner width and therefore one `preview_cache` entry. Keep it that way: a
+  banner-dependent width would thrash the cache on every agents poll.
+
 ## 6. Off-UI-thread for anything that can block
 
-The render loop must never block. A shell-out (`claude agents --json`), a FS
-watch, and the input read all run on their own threads and deliver `AppEvent`s
-onto the merged channel. Threads exit when the receiver drops (bounded to the
-board session) and the input reader is **joined on `EventLoop` drop** so it
-releases stdin before `claude` is spawned onto the same fd. New background work
-follows the same pattern: own thread, `AppEvent` variant, self-terminating on
-send failure.
+The render loop must never block. A **recurring** shell-out (`claude agents
+--json --all`), a FS watch, and the input read all run on their own threads and
+deliver `AppEvent`s onto the merged channel. Threads exit when the receiver drops
+(bounded to the board session) and the input reader is **joined on `EventLoop`
+drop** so it releases stdin before `claude` is spawned onto the same fd. New
+background work follows the same pattern: own thread, `AppEvent` variant,
+self-terminating on send failure.
+
+The rule is about the **poll cadence**, not about the word "shell-out". A
+ONE-SHOT at hand-off is a different thing and is allowed — `agents::live_agents`
+is the instance, directly analogous to `resume`'s authoritative re-read of
+`cwd`/`sessionId` at the same moment. Two conditions keep it honest, and both
+must be argued at the call site rather than assumed:
+
+- It must not touch the poller. The `--all` poll stays **one call per cycle**;
+  the probe adds no tick, thread, or event source, so background cost is
+  unchanged.
+- Be **accurate about what it costs**, per branch. Where nothing renders between
+  the probe and the terminal teardown (plain resume; a confirmed Attach) it is
+  invisible. Where the board draws again — the Enter gate's overlay, and Attach's
+  two refusals — it lands ~0.26s after the keypress: a real, deliberate hitch. Do
+  not paper over it with a zero-render claim that only holds on one branch.
+
+It runs at **EVERY hand-off, not just the first**: the Enter gate asks, and the
+Attach hand-off asks AGAIN rather than reusing the gate's answer or the polled
+map. `route_handoff` is where that second ask lives. The reason is the same one
+that moved the gate here — an authoritative decision must not be made from a
+stale snapshot — and it is sharper at Attach, because the overlay can sit open
+indefinitely, so the gate's answer has no bounded freshness at all. **Nothing
+hands off on polled data; the poll draws badges.** Fork is the deliberate
+exception that proves the shape: it has no liveness question to ask (a fork works
+live or finished), so it must NOT be dragged behind the probe — it is the route
+the not-live refusal points at.
 
 ## 7. Restrained, terminal-safe styling
 
@@ -92,6 +164,68 @@ small palette of **named** ANSI `Color`s (they adapt to the user's terminal
 theme). Do **not** hardcode RGB (it can vanish on a light background) and do not
 syntax-highlight code (code is DIM). The markdown pass in `store::preview` is
 hand-rolled and self-contained — no external markdown crate.
+
+This is why the live badge honors "Claude's palette" as the named `Yellow` /
+`Green` / `Gray` rather than brand hex: named colors stay legible on a light
+terminal, and the semantics survive. Three further rules hold there.
+
+**Color unifies, pulse does not.** The dot and the kind label are separate spans
+ONLY so they can share one `view::badge_color` while the pulse stays on the dot
+alone (a blinking text label is noise on a board of live sessions).
+
+**The pulse changes STYLE, never a SYMBOL.** The dot's `●` is drawn in EVERY
+phase for every reported agent; what alternates is its color — `view::badge_color`
+against `view::pulse_color`'s dim partner (`Gray` <-> `DarkGray`). It must stay
+that way, and the reason is not cosmetic: we emit **plain-text URLs (no OSC 8)**,
+so the terminal auto-detects links by TEXT PATTERN. Any change to a line's text
+forces it to re-scan and re-render that line's URL underline — so the dot's
+original glyph->blank swap made a session label containing a URL flicker every
+500ms, on a row the pulse was supposed to leave alone. A style-only change leaves
+the text byte-identical and there is nothing to re-detect. Do not "optimize" it
+back into a blank span. `pulse_color` is also the ONE place a bucket's dim
+partner is declared, and its fallback is identity (fail-soft), so a new pulsing
+bucket without an arm there would silently render steady — the bucket walk in
+`every_pulsing_buckets_badge_color_has_a_distinct_dim_partner` is what makes that
+loud. Use a named color, never `Modifier::DIM`: attribute support is inconsistent
+across terminals, which is the same trap described next.
+
+The search cursor is the deliberate exception: it show/hides, because a cursor's
+job IS to appear and disappear and its line carries nothing auto-detected. The
+asymmetry is the point, not an oversight.
+
+**Animate from the tick, never from the terminal.** Do NOT reach for the ANSI
+blink attribute (ratatui's slow-blink `Modifier`) to animate anything: most
+modern terminals (iTerm2, Ghostty, WezTerm, Alacritty, macOS Terminal) IGNORE it
+and render steady, so the feature silently does not ship. The badge dot and
+`render_search`'s cursor were both built that way once, and neither ever blinked
+for the user. They now animate off state the board already owns: `App::tick`
+counts `AppEvent::Tick`s (`wrapping_add`, so a long-running board cannot
+overflow), and the pure `view::blink_visible(tick)` phases it — `2 *
+watch::TICK` = 500ms on / 500ms off (~1Hz). That reuses the existing redraw
+cadence and adds no tick, thread, or event source.
+
+`blink_visible` is THE phase source, not one of two: the dot and the cursor both
+read it and therefore one `BLINK_TICKS`, so they pulse together. Anything
+animated later phases off it too — a second counter or cadence would drift
+visibly against the first. Two testing rules follow for any future animation:
+
+- **Assert drawn cells, not modifiers.** A test that pins "the modifier is set"
+  passes green against an animation the user never sees; that is exactly how the
+  dead blink shipped. Render both phases through `TestBackend` and assert what the
+  cell actually carries — for the dot, that its symbol is UNCHANGED and its style
+  is not (diff the two phases' `Buffer`s; `Cell`'s `PartialEq` covers fg/bg/
+  modifier, so a style-only change does surface). Scope such a diff to the row
+  under test: the search cursor legitimately changes symbol, so a board-wide
+  version fails for an unrelated reason. This bans a modifier as a PROXY for a
+  pulse — not reading a modifier back off an already-rendered cell, which is what
+  `DrawnBadge` does to pin the badge's `BOLD` (use `contains`: the List's
+  `highlight_style` patches `REVERSED | BOLD` onto the selected row).
+- **Break-check the phase test.** Every phase test must be watched failing (make
+  the glyph conditional; make `pulse_color` the identity; make both phases use
+  `badge_color`; invert the phase). A pulse test that has never failed is the
+  exact shape of the ones that shipped green over a dead blink — twice. Watch for
+  the vacuous pass in particular: assert the diff is NON-empty, or a `diff` that
+  noticed nothing would call the bug fixed.
 
 Ahead of the markdown pass, each message body runs through an **allowlist-driven
 control-wrapper collapse** (`store::preview::collapse_control_wrappers`). Claude
@@ -112,8 +246,13 @@ and each collapsed segment to its marker line.
 No magic numbers. Tunables are named `const`s with a rationale comment near the
 top of their module: `DEBOUNCE` / `TICK` / `AGENTS_REFRESH` (`watch`),
 `LABEL_MAX` (`label`), `CONTENT_INDEX_CAP` (`parse`), `PREVIEW_LINES` /
-`TABLE_MAX_WIDTH` (`preview`), `PREVIEW_WHEEL_STEP` / `LIST_WHEEL_STEP` (`app`).
-Add new tunables the same way.
+`TABLE_MAX_WIDTH` (`preview`), `PREVIEW_WHEEL_STEP` / `LIST_WHEEL_STEP` (`app`),
+`BLINK_TICKS` (`view`). Add new tunables the same way.
+
+A const whose rationale depends on ANOTHER const says so and names it:
+`BLINK_TICKS` is meaningless without `watch::TICK` (they multiply into the pulse's
+500ms phase), so its doc comment shows the arithmetic and points at `TICK`. That
+is what makes the coupling discoverable when the other value is retuned.
 
 ## 9. `#[allow(dead_code)]` is narrow and justified
 
@@ -154,7 +293,7 @@ Tests are **inline** `#[cfg(test)] mod tests` at the bottom of each source file
   normal session, a no-summary session, a malformed-line session, a worktree
   cwd, a sidecar (no `cwd`), and a nested subagent. Reach it via
   `env!("CARGO_MANIFEST_DIR")`. Add a fixture when you add a format edge case.
-- **Synthetic models**: build `Session`/`LiveAgent` values directly in tests
+- **Synthetic models**: build `Session`/`ReportedAgent` values directly in tests
   (see the `session(...)` helpers) rather than round-tripping through disk.
 - **Isolated temp dirs**: watcher/app tests create a unique
   `snapback-<tag>-<pid>-<nanos>` dir under `std::env::temp_dir()` and never
@@ -167,3 +306,31 @@ Tests are **inline** `#[cfg(test)] mod tests` at the bottom of each source file
   spans.
 
 Every new pure function gets a unit test in the same file.
+
+## Watch every test fail before you trust it
+
+A test that has never been observed red is an unverified claim. Before reporting
+work green: temporarily break what the test pins, confirm it FAILS, restore. If
+it still passes, it was never testing what you thought.
+
+This is not a hypothetical discipline — the live-status work shipped three tests
+that passed against broken code, each for a different reason:
+
+| What shipped green | Why it lied |
+| --- | --- |
+| `assert!(dot.modifier.contains(SLOW_BLINK))` | Pinned that a **modifier was set**, not that anything rendered. Most terminals ignore the ANSI blink attribute, so the dot never pulsed — the test certified the mechanism that didn't work. |
+| A banner test calling `preview_top()` in its fixture | The fixture **arranged away** the bug. The board bottom-anchors by default, so the real banner scrolled off-screen; only the test's un-real scroll position made it visible. |
+| A test board with exactly one bucket | The mutant "colour the label like the dot" survived **all 257 tests** — the requirement simply had no case that could distinguish it. |
+
+The lessons those encode, in order of how often they bite:
+
+- **Assert what the user would see** (drawn cells / observable behavior), never a
+  proxy for it (a modifier is set, a fn was called, a flag is true). A proxy can
+  be true while the feature is dead.
+- **A fixture that arranges away the failure is worse than no test**, because it
+  reads as coverage. Ask what the fixture had to be for the bug to hide.
+- **Vacuous passes are the default failure mode**, not an edge case. If breaking
+  the code doesn't turn the test red, the test is decoration.
+- **Report what made a check capable of failing**, not that it passed. See the
+  execution checklist in [AGENTS.md](../../AGENTS.md) and the lint gate's own two
+  false-clean modes in [OPERATIONS.md](OPERATIONS.md).
