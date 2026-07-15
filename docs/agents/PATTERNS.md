@@ -55,7 +55,9 @@ it. Follow this split when adding behavior:
   `build_new_argv` / `status_for_exit`; `defined_agents::select_agents` /
   `parse_frontmatter`; `agents::classify` and the two outputs derived from it
   (`friendly_status` / `is_active`) plus both argv builders (`agents_argv` /
-  `live_agents_argv`); `update::key_to_action` /
+  `live_agents_argv`) and `agents_from_output` (the shell-out's
+  non-zero-exit-means-no-signal decision, split from the spawn so it is testable
+  without one); `update::key_to_action` /
   `wheel_target`; every `App` state transition (incl. `pick_default_index` and
   the agent-picker cycle); `view`'s `wrapped_rows` / `clamp_preview_offset` /
   `preview_split` / `centered_rect` / `highlight_runs` / `blink_visible` (the

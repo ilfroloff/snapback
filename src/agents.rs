@@ -359,21 +359,44 @@ fn live_agents_argv() -> Vec<String> {
     agents_argv_base()
 }
 
+/// Decide what a finished agents shell-out MEANS: the parsed records when it
+/// exited zero, an EMPTY map when it did not.
+///
+/// Pure, and split out of [`run_agents`] exactly as
+/// [`crate::resume::status_for_exit`] is split out of [`crate::resume::launch`]:
+/// "a non-zero exit is no signal" is a DECISION, and a decision left inside the
+/// impure wrapper is only reachable by spawning `claude` — which the suite never
+/// does. Taking the status as a plain `bool` rather than an `Output` is what
+/// makes it assertable at all.
+///
+/// The status is checked BEFORE the parse, and that order is the contract: a
+/// failed run's stdout is not a reading even when it happens to parse cleanly, so
+/// it must never reach [`parse_agents_json`] — which remains the ONLY place the
+/// wire shape is interpreted.
+#[must_use]
+fn agents_from_output(success: bool, stdout: &str) -> HashMap<String, ReportedAgent> {
+    if !success {
+        return HashMap::new(); // Non-zero exit -> treat as "no signal".
+    }
+    parse_agents_json(stdout)
+}
+
 /// Run an agents shell-out and parse it, or yield EMPTY on any failure (missing
 /// binary, non-zero exit, unreadable / non-JSON output).
 ///
-/// The one impure step both readings share. Output is CAPTURED (no TTY
-/// inherited), so it never contends with an interactive `claude` on the terminal.
-/// Never panics; every error path returns an empty map.
+/// The one impure step both readings share, and it owns the SPAWN alone — what
+/// the result means is [`agents_from_output`]'s pure decision. Output is CAPTURED
+/// (no TTY inherited), so it never contends with an interactive `claude` on the
+/// terminal. Never panics; every error path returns an empty map.
 fn run_agents(argv: &[String]) -> HashMap<String, ReportedAgent> {
     let output = match Command::new(&argv[0]).args(&argv[1..]).output() {
         Ok(output) => output,
         Err(_) => return HashMap::new(), // `claude` not on PATH, spawn failed, etc.
     };
-    if !output.status.success() {
-        return HashMap::new(); // Non-zero exit -> treat as "no signal".
-    }
-    parse_agents_json(&String::from_utf8_lossy(&output.stdout))
+    agents_from_output(
+        output.status.success(),
+        &String::from_utf8_lossy(&output.stdout),
+    )
 }
 
 /// Shell out to [`agents_argv`] (`claude agents --json --all`) and return the
@@ -758,6 +781,66 @@ mod tests {
         // An interactive session exposes no agent-view job `id` -> not
         // attachable (the gate the Attach hand-off relies on).
         assert_eq!(inter.id, None);
+    }
+
+    /// A well-formed one-record agents array. Shared by the success/failure pair
+    /// below so that the EXIT STATUS is the only thing differing between them.
+    const ONE_AGENT_JSON: &str =
+        r#"[{"sessionId":"sess-1","kind":"background","state":"working","id":"job-1"}]"#;
+
+    /// The success path: a zero exit hands stdout to the shared parser and the
+    /// records come back — including the attach job `id`, since this seam is what
+    /// `live_agents` reads them through.
+    #[test]
+    fn a_successful_run_parses_its_stdout_into_records() {
+        let agents = agents_from_output(true, ONE_AGENT_JSON);
+        assert_eq!(agents.len(), 1);
+
+        let agent = agents
+            .get("sess-1")
+            .expect("the record is keyed by its full sessionId");
+        assert_eq!(agent.kind_label(), "bg");
+        assert_eq!(agent.id.as_deref(), Some("job-1"));
+        assert_eq!(agent.qualifier(), Some("working"));
+    }
+
+    /// A NON-ZERO exit is "no signal" — and the stdout here is VALID JSON on
+    /// purpose, which is the entire point of the case.
+    ///
+    /// Garbage stdout would pass this for the WRONG reason: the parser rejects it
+    /// anyway, so an empty result would prove nothing about the status check and
+    /// would stay green with the check deleted. Only parseable stdout makes the
+    /// status the sole thing that can produce the empty map.
+    ///
+    /// The direction is load-bearing for `live_agents`, whose caller reads
+    /// MEMBERSHIP as liveness: without this check, a failed run's stdout could
+    /// report sessions as live and divert Enter into the Attach/Fork overlay
+    /// instead of resuming.
+    #[test]
+    fn a_failed_run_yields_empty_even_when_its_stdout_is_valid_json() {
+        assert!(
+            agents_from_output(false, ONE_AGENT_JSON).is_empty(),
+            "a non-zero exit is no signal: its stdout must never be read, even \
+             when it parses cleanly"
+        );
+        // The same bytes DO parse on a zero exit, so the emptiness above is the
+        // status check's doing rather than an unreadable fixture quietly passing.
+        assert!(
+            !agents_from_output(true, ONE_AGENT_JSON).is_empty(),
+            "the fixture must be parseable, else the assertion above is vacuous"
+        );
+    }
+
+    /// FAIL-SOFT on the success path too: a zero exit whose output the parser
+    /// cannot read collapses to empty rather than panicking. The parse itself is
+    /// covered above; this pins that the seam delegating to it degrades the same
+    /// way.
+    #[test]
+    fn a_successful_run_with_non_json_stdout_yields_empty() {
+        assert!(
+            agents_from_output(true, "claude: unexpected error").is_empty(),
+            "unparseable stdout on a clean exit is still no signal"
+        );
     }
 
     /// Schema drift (missing optional fields, unknown extra fields, or a
