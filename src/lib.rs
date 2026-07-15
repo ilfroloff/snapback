@@ -82,7 +82,7 @@ pub fn run() {
                 // non-zero child exit becomes a neutral transient board status; a
                 // spawn/chdir failure likewise, rather than a crash.
                 match resume::launch(&ready) {
-                    Ok(Some(status)) => app.set_status(status),
+                    Ok(Some(status)) => after_nonzero_resume(&mut app, &ready, status),
                     Ok(None) => {}
                     Err(err) => app.set_status(err.message().to_string()),
                 }
@@ -99,6 +99,41 @@ pub fn run() {
                 std::process::exit(1);
             }
         }
+    }
+}
+
+/// Handle a child that exited NON-ZERO, recovering the TOCTOU resume race when
+/// that is provably what happened.
+///
+/// A plain `claude -r <id>` can be refused because the session went live between
+/// the gate's probe and the spawn — the window is small but real, since claude
+/// re-evaluates liveness at spawn time. When that happens the generic
+/// [`resume::RESUME_NONZERO_HINT`] is a guess, and the user is left to work out
+/// the route themselves.
+///
+/// So on the plain-resume path ONLY (`Ready::race_probe_id` is `Some` — every
+/// other hand-off is structurally excluded), re-ask claude. If the session IS
+/// live now, say so and open the Attach/Fork overlay, which persists across the
+/// loop into the next `tui::run`. If it is NOT live, the failure was something
+/// else entirely and the neutral hint stands UNCHANGED — we must not claim a
+/// session is running on anything but the probe's word.
+///
+/// The recovery is deliberately NEVER derived from claude's error TEXT: that
+/// wording is undocumented and would drift, and stdout/stderr are inherited by the
+/// child anyway (see [`resume::launch`] — piping them to read would hide claude's
+/// output from the user and risk a deadlock). The probe is the only authority.
+///
+/// Runs AFTER `launch` returns, with the board torn down and no `claude` in
+/// flight, so it costs the happy path nothing.
+fn after_nonzero_resume(app: &mut App, ready: &resume::Ready, status: String) {
+    match &ready.race_probe_id {
+        Some(id) if app.is_live_now(id) => {
+            app.set_status(resume::RESUME_RACE_STATUS);
+            app.open_live_choice(id.clone());
+        }
+        // Not a plain resume, or the session genuinely is not live: keep the
+        // neutral hint the plan carried and assert nothing about the cause.
+        _ => app.set_status(status),
     }
 }
 
@@ -146,4 +181,165 @@ fn print_session_list() {
     }
 
     println!("# total resumable sessions: {}", sessions.len());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    use agents::ReportedAgent;
+    use tui::Scope;
+
+    /// An app with claude's ACTIVE list seeded to `live`.
+    ///
+    /// No `claude` is ever spawned: the probe is injected, exactly as at the
+    /// resume gate's own tests. Recovery routes on the id carried by the `Ready`,
+    /// so no loaded session is needed here.
+    ///
+    /// Membership is all this path asks (`is_live_now`), so the seeded records
+    /// carry no attach job id — the Attach hand-off's question is pinned where it
+    /// is answered, in `tui::update`.
+    fn app_with_live(live: &[&str]) -> App {
+        let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp"));
+        let live: HashMap<String, ReportedAgent> = live
+            .iter()
+            .map(|id| {
+                (
+                    (*id).to_string(),
+                    ReportedAgent {
+                        kind: "interactive".to_string(),
+                        id: None,
+                        state: None,
+                        status: None,
+                        name: None,
+                    },
+                )
+            })
+            .collect();
+        app.set_live_probe(move || live.clone());
+        app
+    }
+
+    /// A plain-resume `Ready` — the ONE hand-off that can lose the liveness race,
+    /// and so the only one carrying a `race_probe_id`.
+    fn plain_resume_ready(session_id: &str) -> resume::Ready {
+        resume::Ready {
+            cwd: PathBuf::from("/tmp"),
+            argv: resume::build_argv(session_id, false),
+            nonzero_hint: resume::RESUME_NONZERO_HINT,
+            race_probe_id: Some(session_id.to_string()),
+        }
+    }
+
+    /// THE race, recovered after the fact. A plain resume exited non-zero and a
+    /// FRESH probe says claude is holding the session — so the refusal is
+    /// explained, and the user is routed to the way through (Attach/Fork) instead
+    /// of being handed a generic guess.
+    ///
+    /// The overlay is the observable part that matters: it lives on `App`, which
+    /// the driver owns across the loop, so it survives into the next `tui::run`.
+    #[test]
+    fn a_nonzero_plain_resume_on_a_now_live_session_routes_to_the_overlay() {
+        let mut app = app_with_live(&["sess-raced"]);
+        let ready = plain_resume_ready("sess-raced");
+
+        after_nonzero_resume(&mut app, &ready, resume::RESUME_NONZERO_HINT.to_string());
+
+        let pending = app
+            .pending_live
+            .clone()
+            .expect("claude reports the session live, so the board must offer Attach/Fork");
+        assert_eq!(pending.session_id, "sess-raced");
+        assert_eq!(
+            app.status.as_deref(),
+            Some(resume::RESUME_RACE_STATUS),
+            "the probe confirmed it, so the board may say the session is running"
+        );
+    }
+
+    /// The honesty half, and the one that must never regress: a non-zero exit
+    /// with the session NOT live is some OTHER failure — a user Ctrl-C, a broken
+    /// config, anything. We know nothing, so we claim nothing and leave the
+    /// neutral hint exactly as it was.
+    #[test]
+    fn a_nonzero_plain_resume_on_a_session_that_is_not_live_keeps_the_neutral_hint() {
+        let mut app = app_with_live(&[]);
+        let ready = plain_resume_ready("sess-plain");
+
+        after_nonzero_resume(&mut app, &ready, resume::RESUME_NONZERO_HINT.to_string());
+
+        assert!(
+            app.pending_live.is_none(),
+            "nothing says this session is running, so it must not be routed to \
+             the running-session overlay"
+        );
+        assert_eq!(
+            app.status.as_deref(),
+            Some(resume::RESUME_NONZERO_HINT),
+            "the neutral hint must survive unchanged"
+        );
+        let status = app.status.clone().unwrap();
+        assert!(
+            !status.contains("is now running"),
+            "the board must NEVER claim a session is running without the probe's \
+             word: {status}"
+        );
+    }
+
+    /// Recovery is scoped by CONSTRUCTION, not by sniffing argv: a fork carries
+    /// no `race_probe_id`, so it cannot recover even though the session IS live.
+    ///
+    /// That is correct — a fork of a live session is expected to work, so its
+    /// non-zero exit is a genuine failure and re-routing it to "Fork instead"
+    /// would be a loop. The live set is seeded LIVE here on purpose: only the
+    /// `None` id keeps the neutral hint, so this fails if the guard is dropped.
+    #[test]
+    fn a_nonzero_fork_never_recovers_even_when_the_session_is_live() {
+        let mut app = app_with_live(&["sess-forked"]);
+        let ready = resume::Ready {
+            cwd: PathBuf::from("/tmp"),
+            argv: resume::build_argv("sess-forked", true),
+            nonzero_hint: resume::RESUME_NONZERO_HINT,
+            // A fork is structurally excluded from race recovery.
+            race_probe_id: None,
+        };
+
+        after_nonzero_resume(&mut app, &ready, resume::RESUME_NONZERO_HINT.to_string());
+
+        assert!(
+            app.pending_live.is_none(),
+            "a fork's non-zero exit is a real failure, not a lost race"
+        );
+        assert_eq!(app.status.as_deref(), Some(resume::RESUME_NONZERO_HINT));
+    }
+
+    /// A new session carries its OWN hint, and recovery must not overwrite it
+    /// with the resume-worded one. Pins that the `_ =>` arm passes the plan's
+    /// status through untouched rather than reaching for a resume default.
+    #[test]
+    fn a_nonzero_new_session_keeps_its_own_hint() {
+        let mut app = app_with_live(&[]);
+        let ready = resume::Ready {
+            cwd: PathBuf::from("/tmp"),
+            argv: resume::build_new_argv(None),
+            nonzero_hint: resume::NEW_SESSION_NONZERO_HINT,
+            race_probe_id: None,
+        };
+
+        after_nonzero_resume(
+            &mut app,
+            &ready,
+            resume::NEW_SESSION_NONZERO_HINT.to_string(),
+        );
+
+        assert!(app.pending_live.is_none());
+        assert_eq!(
+            app.status.as_deref(),
+            Some(resume::NEW_SESSION_NONZERO_HINT),
+            "a new session has no session to probe and its own hint must stand"
+        );
+    }
 }

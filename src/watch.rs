@@ -28,7 +28,7 @@ use crossterm::event::{self, Event as CrosstermEvent};
 use notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_mini::{new_debouncer, DebounceEventResult, DebouncedEventKind, Debouncer};
 
-use crate::agents::{self, LiveAgent};
+use crate::agents::{self, ReportedAgent};
 
 /// Debounce window for coalescing filesystem event storms into one reload.
 ///
@@ -39,8 +39,8 @@ pub const DEBOUNCE: Duration = Duration::from_millis(200);
 /// Default cadence of the periodic [`AppEvent::Tick`] in the merged loop.
 pub const TICK: Duration = Duration::from_millis(250);
 
-/// Cadence of the OFF-THREAD `claude agents --json` poll that refreshes the
-/// live-session badges.
+/// Cadence of the OFF-THREAD `claude agents --json --all` poll that refreshes the
+/// reported-agent badges.
 ///
 /// Deliberately coarser than [`TICK`]: it spawns a child process, so it runs on
 /// its own thread at a relaxed interval rather than on the render cadence, and
@@ -66,10 +66,15 @@ pub enum AppEvent {
     /// Emitted at most once per debounce window regardless of how many raw
     /// filesystem events fired within it.
     SessionsChanged,
-    /// A refreshed live-agent set from `claude agents --json`, computed OFF the
-    /// UI thread by the agents poller and delivered on the same channel so the
-    /// shell-out never blocks rendering.
-    LiveAgents(HashMap<String, LiveAgent>),
+    /// A refreshed reported-agent set from `claude agents --json --all`, computed
+    /// OFF the UI thread by the agents poller and delivered on the same channel
+    /// so the shell-out never blocks rendering.
+    ///
+    /// Reported, not live: the set includes agents that reported completion, and
+    /// it is a DISPLAY signal only — every hand-off (the resume gate, and Attach
+    /// for its job id) probes claude directly rather than reading it (see
+    /// [`crate::agents::live_agents`]).
+    ReportedAgents(HashMap<String, ReportedAgent>),
     /// A periodic wake-up. The update loop does nothing costly on this.
     Tick,
 }
@@ -165,10 +170,10 @@ impl EventLoop {
         })
     }
 
-    /// Start the OFF-THREAD live-agent poller (real runtime path only).
+    /// Start the OFF-THREAD reported-agent poller (real runtime path only).
     ///
-    /// Spawns a dedicated thread that runs `claude agents --json` every
-    /// `interval` and delivers each result as [`AppEvent::LiveAgents`] on the
+    /// Spawns a dedicated thread that runs `claude agents --json --all` every
+    /// `interval` and delivers each result as [`AppEvent::ReportedAgents`] on the
     /// shared channel, so the shell-out can NEVER block rendering. It is not
     /// started by [`new`](Self::new) so the event-loop unit tests never spawn
     /// `claude`; [`crate::tui::run`] opts in once per board session. The thread
@@ -262,19 +267,20 @@ fn spawn_tick_thread(tx: Sender<AppEvent>, interval: Duration) {
     });
 }
 
-/// Poll `claude agents --json` OFF-THREAD, emitting an [`AppEvent::LiveAgents`]
-/// immediately and then every `interval`, until the receiver drops.
+/// Poll `claude agents --json --all` OFF-THREAD, emitting an
+/// [`AppEvent::ReportedAgents`] immediately and then every `interval`, until the
+/// receiver drops.
 ///
-/// The first poll fires BEFORE any sleep so live badges appear on load; each
+/// The first poll fires BEFORE any sleep so badges appear on load; each
 /// subsequent poll refreshes them on the autorefresh cadence. The shell-out is
-/// fail-soft (see [`crate::agents::live_agents`]): a missing `claude` or bad
+/// fail-soft (see [`crate::agents::reported_agents`]): a missing `claude` or bad
 /// output just delivers an empty set. Exits when a send fails (the TUI receiver
 /// has gone away), so — like the tick thread — it never accumulates across the
 /// resume round trips that recreate the [`EventLoop`].
 fn spawn_agents_thread(tx: Sender<AppEvent>, interval: Duration) {
     thread::spawn(move || loop {
-        let live = agents::live_agents();
-        if tx.send(AppEvent::LiveAgents(live)).is_err() {
+        let reported = agents::reported_agents();
+        if tx.send(AppEvent::ReportedAgents(reported)).is_err() {
             break; // TUI receiver gone.
         }
         thread::sleep(interval);

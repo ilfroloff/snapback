@@ -41,7 +41,7 @@ use std::path::Path;
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use ratatui::layout::{Margin, Position, Rect};
+use ratatui::layout::{Position, Rect};
 
 use crate::defined_agents;
 use crate::resume::{self, Ready};
@@ -211,12 +211,19 @@ pub fn handle_event(app: &mut App, event: AppEvent, root: &Path) -> Outcome {
             app.apply_sessions(SessionStore::load_from(root));
             Outcome::Continue
         }
-        AppEvent::LiveAgents(live) => {
+        AppEvent::ReportedAgents(agents) => {
             // Delivered off-thread by the agents poller; just swap the map in.
-            app.set_live(live);
+            app.set_reported_agents(agents);
             Outcome::Continue
         }
-        AppEvent::Tick => Outcome::Continue,
+        AppEvent::Tick => {
+            // The tick already drove a redraw; counting it turns that existing
+            // cadence into the board's clock, which `view::blink_visible` phases
+            // the live-badge pulse from. `wrapping_add` so a board left running
+            // for eons rolls over instead of overflow-panicking in debug.
+            app.tick = app.tick.wrapping_add(1);
+            Outcome::Continue
+        }
     }
 }
 
@@ -324,31 +331,52 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     }
 }
 
-/// The preview pane's INNER rect (inside the borders), matching how
-/// `view::render_preview` derives its inner width/height. Borders steal one cell
-/// on each side; [`Rect::inner`] saturates, so a degenerate pane yields a
-/// zero-area rect that hit-tests to nothing rather than panicking.
-fn preview_inner(rect: Rect) -> Rect {
-    rect.inner(Margin {
-        horizontal: 1,
-        vertical: 1,
-    })
+/// The url of the rendered preview link under a pointer at screen `(col, row)`,
+/// or `None` when the pointer is over no link.
+///
+/// The transcript does NOT own the whole preview pane: a REPORTED session pins a
+/// status banner to the pane's first inner row (`view::preview_banner`), so its
+/// transcript starts one row lower. Deriving the rect from the SAME
+/// [`view::preview_split`] the view drew with is what keeps this honest — the
+/// scroll offset and the cached line widths are both measured from that rect's
+/// origin, so a click on screen row N resolves to the transcript line actually
+/// drawn there. A session claude never reported splits off nothing and hit-tests
+/// against the full inner rect, exactly as it did before the banner existed.
+///
+/// REPORTED, not live: an agent that reported completion still has a banner, so
+/// asking the banner — never liveness — is what keeps this rect identical to the
+/// one the view drew against. Liveness is a hand-off question answered by
+/// [`App::is_live_now`], and it would be the wrong question here twice over: it
+/// shells out to claude, and it would disagree with the drawn banner.
+///
+/// The wrapped-layout context (per-line widths + link regions) comes from the
+/// SAME width-scoped cache the view drew from, and the url from the pure
+/// [`view::link_at`]. Terminal- and process-free, so the geometry is unit
+/// testable; [`open_link_under_pointer`] is the thin impure wrapper over it.
+fn link_under_pointer(app: &mut App, col: u16, row: u16) -> Option<String> {
+    let has_banner = view::preview_banner(app).is_some();
+    let (_, transcript) = view::preview_split(app.preview_rect, has_banner);
+    let (line_widths, regions) = app.preview_hit_context(transcript.width);
+    view::link_at(
+        col,
+        row,
+        transcript,
+        app.preview_scroll,
+        &line_widths,
+        &regions,
+    )
+    .map(str::to_string)
 }
 
 /// Open the url of a rendered preview link under a left-click at screen
 /// `(col, row)`, if any.
 ///
-/// Pulls the wrapped-layout context (per-line widths + link regions) from the
-/// SAME width-scoped cache the view drew from, so hit-testing matches the screen;
-/// resolves the url with the pure [`view::link_at`]; and hands a hit to the
-/// fire-and-forget, off-thread [`resume::open_url`]. A click that misses every
-/// link is a no-op. Fails soft end to end — a bad url or missing opener never
-/// crashes the board.
+/// Thin driver over [`link_under_pointer`]: hands a hit to the fire-and-forget,
+/// off-thread [`resume::open_url`]. A click that misses every link is a no-op.
+/// Fails soft end to end — a bad url or missing opener never crashes the board.
 fn open_link_under_pointer(app: &mut App, col: u16, row: u16) {
-    let inner = preview_inner(app.preview_rect);
-    let (line_widths, regions) = app.preview_hit_context(inner.width);
-    if let Some(url) = view::link_at(col, row, inner, app.preview_scroll, &line_widths, &regions) {
-        resume::open_url(url);
+    if let Some(url) = link_under_pointer(app, col, row) {
+        resume::open_url(&url);
     }
 }
 
@@ -368,10 +396,33 @@ fn apply_action(app: &mut App, action: Action) -> Outcome {
             // Smart Enter: `claude -r` REFUSES to plain-resume a LIVE session, so
             // Enter (not Ctrl-F) on a running row opens the Attach/Fork/Cancel
             // choice instead. Ctrl-F fork stays a direct hand-off for ANY session.
+            //
+            // The gate asks CLAUDE, one-shot, right here — it must NOT read the
+            // polled `--all` map. That map is up to ~1.3s stale (a ~0.26s poll
+            // then a 1s sleep) and its `done` qualifier means "the agent reported
+            // completion", NOT "claude will permit `-r`". Deciding from it is a
+            // TOCTOU race we lose: claude re-evaluates liveness at spawn time and
+            // refuses, and the user hit exactly that on a `● bg done` row. Probing
+            // here shrinks the window to ~0.26s and, more importantly, replaces an
+            // inference about claude's gate with claude's own answer.
+            //
+            // On AGENTS.md's "OFF-UI-THREAD blocking work": that rule exists so the
+            // 1s POLL never blocks rendering, and the poll is untouched — still one
+            // call per cycle, still on its own thread. This is a ONE-SHOT at
+            // hand-off, directly analogous to `resume`'s authoritative re-read of
+            // `cwd`/`sessionId` at the same moment. Be precise about the cost,
+            // though, because it is NOT free on both branches:
+            //
+            // * Plain resume (the common case): nothing renders between this probe
+            //   and the terminal teardown, so the ~0.26s is invisible.
+            // * Overlay: the overlay itself draws ~0.26s after Enter — a small,
+            //   deliberate hitch, accepted because the alternative is handing the
+            //   user claude's refusal instead of the Attach/Fork choice.
             if !fork {
-                if let Some(session) = app.selected_session() {
-                    if app.is_live(&session.session_id) {
-                        let id = session.session_id.clone();
+                // Clone the id so the `&Session` borrow ends before the probe and
+                // `open_live_choice` touch `app`.
+                if let Some(id) = app.selected_session().map(|s| s.session_id.clone()) {
+                    if app.is_live_now(&id) {
                         app.open_live_choice(id);
                         return Outcome::Continue;
                     }
@@ -526,16 +577,54 @@ fn confirm_live_choice(app: &mut App) -> Outcome {
 /// [`Outcome::Resume`]; a refusal sets a board status. The `map` drops the
 /// `&Session` borrow before `set_status` mutably touches `app`.
 ///
-/// For Attach, the target is the matched live agent's agent-view job `id` (the
-/// SHORT id from `claude agents --json`) — resolved here and handed to
-/// [`resume::check_attach`], which gates the interactive (no-id) case. The
-/// clone releases the `live` borrow before `session_by_id` re-borrows `app`.
+/// **Attach re-asks claude here, at the hand-off.** Its target is the agent-view
+/// job `id` (the SHORT id from `claude agents --json`) taken from
+/// [`App::live_agent_now`]'s fresh record — NEVER from the polled `--all` map.
+/// That map is the same ~1.3s-stale snapshot the resume gate was moved off, and
+/// reading an attach id from it is the identical bug one layer down: an
+/// authoritative decision made from stale data. Here it is worse than at the
+/// gate, because the overlay can sit open INDEFINITELY while the user decides —
+/// even the probe that opened it is stale by the time Attach is chosen, so the
+/// window is unbounded rather than ~1.3s. The rule is uniform: every hand-off
+/// re-asks, nothing hands off on polled data.
+///
+/// Three answers, kept distinct because they have distinct causes:
+///
+/// * **Live, with a job id** — attach to it.
+/// * **Live, no job id** (interactive) — [`resume::ATTACH_NO_JOB_ID`], via
+///   [`resume::check_attach`]'s own pure gate.
+/// * **Not in the active list** — [`resume::ATTACH_NOT_LIVE`]. It finished while
+///   the overlay was open, or the probe failed; either way there is no
+///   authoritative id, so we must NOT spawn `claude attach` with a dead one.
+///
+/// Fork deliberately does NOT probe: a fork of a live session is expected to
+/// work, so it has no liveness question to ask and stays valid even when Attach
+/// has just been refused — which is exactly the route [`resume::ATTACH_NOT_LIVE`]
+/// points at.
+///
+/// On PATTERNS.md §6 (off-UI-thread), stated per branch rather than assumed: this
+/// is a ONE-SHOT at hand-off, adding no tick/thread/event source and leaving the
+/// `--all` poll untouched at one call per cycle. On the ATTACH branch nothing
+/// renders between the probe and the terminal teardown, so its ~0.26s is
+/// invisible; on the two REFUSAL branches the board redraws ~0.26s after the
+/// keypress — a small, deliberate hitch, accepted because the alternative is
+/// handing the user a broken `claude attach`.
 fn route_handoff(app: &mut App, session_id: &str, kind: Handoff) -> Outcome {
-    let agent_id = app.live_agent(session_id).and_then(|a| a.id.clone());
-    let checked = app.session_by_id(session_id).map(|s| match kind {
-        Handoff::Attach => resume::check_attach(s, agent_id.as_deref()),
-        Handoff::Fork => resume::check(s, true),
-    });
+    let checked = match kind {
+        Handoff::Attach => {
+            // The probe's record is OWNED, so it holds no borrow on `app` when
+            // `session_by_id` re-borrows below.
+            let Some(agent) = app.live_agent_now(session_id) else {
+                app.set_status(resume::ATTACH_NOT_LIVE.to_string());
+                return Outcome::Continue;
+            };
+            app.session_by_id(session_id)
+                .map(|s| resume::check_attach(s, agent.id.as_deref()))
+        }
+        Handoff::Fork => app
+            .session_by_id(session_id)
+            .map(|s| resume::check(s, true)),
+    };
     match checked {
         Some(Ok(ready)) => Outcome::Resume(ready),
         Some(Err(err)) => {
@@ -658,8 +747,13 @@ mod tests {
 
     use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::agents::LiveAgent;
+    use ratatui::backend::TestBackend;
+    use ratatui::style::Modifier;
+    use ratatui::Terminal;
+
+    use crate::agents::ReportedAgent;
     use crate::store::Session;
     use crate::tui::app::{Scope, MIN_PANE_WIDTH};
 
@@ -686,8 +780,8 @@ mod tests {
         }
     }
 
-    fn live_agent(kind: &str) -> LiveAgent {
-        LiveAgent {
+    fn reported_agent(kind: &str) -> ReportedAgent {
+        ReportedAgent {
             kind: kind.to_string(),
             // Interactive by default (no attachable job id); the background
             // helper below supplies one when a test needs an attachable agent.
@@ -698,13 +792,105 @@ mod tests {
         }
     }
 
-    /// An app over one session, optionally marked live, with the row selected.
-    fn app_with(id: &str, live_kind: Option<&str>) -> App {
+    /// A record as claude's ACTIVE list (`claude agents --json`, no `--all`)
+    /// reports it: a BACKGROUND agent carries the short agent-view job id that
+    /// `claude attach` matches, an INTERACTIVE one has no attachable job.
+    fn live_agent(kind: &str, job_id: Option<&str>) -> ReportedAgent {
+        ReportedAgent {
+            kind: kind.to_string(),
+            id: job_id.map(str::to_owned),
+            state: None,
+            status: None,
+            name: None,
+        }
+    }
+
+    /// Claude's ACTIVE list as a map, from `(session_id, kind, job_id)` triples.
+    fn live_map(agents: &[(&str, &str, Option<&str>)]) -> HashMap<String, ReportedAgent> {
+        agents
+            .iter()
+            .map(|(id, kind, job)| ((*id).to_string(), live_agent(kind, *job)))
+            .collect()
+    }
+
+    /// Seed what claude's ACTIVE list reports, as explicit records:
+    /// `(session_id, kind, job_id)`.
+    ///
+    /// The only seam that can state a job id, so any test where the ATTACH TARGET
+    /// matters must build its premise here.
+    fn seed_live_agents(app: &mut App, agents: &[(&str, &str, Option<&str>)]) {
+        let live = live_map(agents);
+        app.set_live_probe(move || live.clone());
+    }
+
+    /// Seed a probe that answers `first` on its FIRST call and `later` on every
+    /// call after it.
+    ///
+    /// The board asks claude once per HAND-OFF, so the two answers are exactly
+    /// "what claude said at the Enter gate" and "what claude says at the hand-off
+    /// the user then chose". A session can finish in the gap — the overlay sits
+    /// open as long as the user takes to decide — and expressing that gap is the
+    /// entire reason the Attach path re-asks instead of reusing either the gate's
+    /// answer or the polled map.
+    fn seed_live_then(
+        app: &mut App,
+        first: &[(&str, &str, Option<&str>)],
+        later: &[(&str, &str, Option<&str>)],
+    ) {
+        let first = live_map(first);
+        let later = live_map(later);
+        let calls = std::cell::Cell::new(0u32);
+        app.set_live_probe(move || {
+            let nth = calls.get();
+            calls.set(nth + 1);
+            if nth == 0 {
+                first.clone()
+            } else {
+                later.clone()
+            }
+        });
+    }
+
+    /// Seed claude's ACTIVE list by MEMBERSHIP alone: each id is reported live as
+    /// an INTERACTIVE session, carrying no attachable job.
+    ///
+    /// Membership is the whole of what the resume gate asks, so these records
+    /// state nothing the gate tests do not mean. The absent job id is also the
+    /// SAFE default for anything that wanders onto the Attach path through this
+    /// seam: it refuses (`ATTACH_NO_JOB_ID`) rather than inventing a plausible id
+    /// and passing. A test that needs an attachable agent must SAY so, via
+    /// `seed_live_agents`.
+    ///
+    /// Every test that reaches the gate MUST call one of these — `App`'s
+    /// test-mode default probe panics rather than spawning `claude` — so each one
+    /// states its own premise instead of inheriting a silent "nothing is live".
+    fn seed_live(app: &mut App, live: &[&str]) {
+        let agents: Vec<(&str, &str, Option<&str>)> =
+            live.iter().map(|id| (*id, "interactive", None)).collect();
+        seed_live_agents(app, &agents);
+    }
+
+    /// An app over one session, optionally joined to a reported agent of `kind`.
+    ///
+    /// `Some(kind)` means "claude reports this session as a running agent", so
+    /// the live set is seeded to match — the badge map and the probe agree here,
+    /// which is the STEADY-STATE case. The tests where they deliberately DISAGREE
+    /// (the TOCTOU race) build their app via `app_with_agent_state`.
+    ///
+    /// The agreement extends to the KIND, because the probe's record is what the
+    /// Attach hand-off now resolves its job id from: a background agent exposes an
+    /// attachable job, an interactive one does not.
+    fn app_with(id: &str, agent_kind: Option<&str>) -> App {
         let mut app = App::new(vec![session(id)], Scope::All, PathBuf::from("/tmp"));
-        if let Some(kind) = live_kind {
-            let mut live = HashMap::new();
-            live.insert(id.to_string(), live_agent(kind));
-            app.set_live(live);
+        match agent_kind {
+            Some(kind) => {
+                let mut reported = HashMap::new();
+                reported.insert(id.to_string(), reported_agent(kind));
+                app.set_reported_agents(reported);
+                let job = (kind == "background").then_some("job-steady");
+                seed_live_agents(&mut app, &[(id, kind, job)]);
+            }
+            None => seed_live(&mut app, &[]),
         }
         assert_eq!(app.selected.as_deref(), Some(id));
         app
@@ -1010,6 +1196,188 @@ mod tests {
         );
     }
 
+    // --- preview link hit-testing across the pinned banner ------------------
+
+    /// Board size for the link hit-tests: wide enough for a usable preview pane,
+    /// short enough that `link_session`'s transcript overflows it.
+    const BOARD: (u16, u16) = (100, 20);
+
+    /// The url behind `link_session`'s one markdown link.
+    const LINK_URL: &str = "https://example.com/page";
+
+    /// Filler lines ahead of that link. Enough that the rendered transcript is
+    /// TALLER than `BOARD`'s preview pane, so the default bottom anchor resolves
+    /// to a NON-ZERO scroll offset — the hit-test has to survive a scrolled pane,
+    /// not just a pristine one.
+    const LINK_FILLER_LINES: usize = 24;
+
+    /// An isolated temp dir for the link fixture (PATTERNS: never touch the real
+    /// `~/.claude/projects`).
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is after the unix epoch")
+            .as_nanos();
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "snapback-update-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    /// A session whose transcript overflows the preview pane and ends in ONE
+    /// markdown link, written to a real file under `dir`.
+    ///
+    /// A real file, not a synthetic `LinkRegion`: the hit-test resolves clicks
+    /// through the SAME width-scoped preview cache the view draws from, so only a
+    /// real render can prove the two agree about where the link landed.
+    fn link_session(dir: &Path) -> Session {
+        let file = dir.join("sess-link.jsonl");
+        let mut body: String = (1..=LINK_FILLER_LINES)
+            .map(|i| format!("filler line {i}\\n"))
+            .collect();
+        body.push_str(&format!("open [docs]({LINK_URL}) here"));
+        let jsonl = format!(
+            concat!(
+                r#"{{"type":"user","sessionId":"sess-link","cwd":"/tmp","#,
+                r#""timestamp":"2026-07-01T10:00:00.000Z","#,
+                r#""message":{{"role":"user","content":"{body}"}}}}"#,
+                "\n",
+            ),
+            body = body,
+        );
+        std::fs::write(&file, jsonl).expect("write the link fixture");
+        Session {
+            file,
+            session_id: "sess-link".to_string(),
+            cwd: PathBuf::from("/tmp"),
+            git_branch: Some("main".to_string()),
+            timestamp: None,
+            repo: "repo".to_string(),
+            label: "link session".to_string(),
+            content_index: String::new(),
+        }
+    }
+
+    /// An app over [`link_session`], optionally joined to a REPORTED agent in
+    /// `state`.
+    /// Left in `App`'s DEFAULT scroll state — bottom-anchored, as a user sees it.
+    fn link_app(dir: &Path, agent_state: Option<&str>) -> App {
+        let mut app = App::new(vec![link_session(dir)], Scope::All, PathBuf::from("/tmp"));
+        if let Some(state) = agent_state {
+            let mut reported = HashMap::new();
+            reported.insert(
+                "sess-link".to_string(),
+                ReportedAgent {
+                    kind: "background".to_string(),
+                    id: None,
+                    state: Some(state.to_string()),
+                    status: None,
+                    name: None,
+                },
+            );
+            app.set_reported_agents(reported);
+        }
+        assert_eq!(app.selected.as_deref(), Some("sess-link"));
+        app
+    }
+
+    /// Render the whole board into an in-memory terminal exactly as the real loop
+    /// does. `view::render` is what writes `App::preview_rect` and the resolved
+    /// `App::preview_scroll` back into the app, so the hit-tests below run against
+    /// the geometry the user is actually looking at.
+    fn render_board(app: &mut App) -> ratatui::buffer::Buffer {
+        let (width, height) = BOARD;
+        let mut terminal = Terminal::new(TestBackend::new(width, height))
+            .expect("build an in-memory test terminal");
+        terminal
+            .draw(|frame| view::render(frame, app))
+            .expect("render must not panic");
+        terminal.backend().buffer().clone()
+    }
+
+    /// Where the transcript's link label was actually DRAWN, as screen
+    /// `(col, row)`.
+    ///
+    /// Found by the UNDERLINED modifier the preview marks a link label with
+    /// (`store::preview` underlines the label and hides the url), scanning the
+    /// pane the view reported. Never a COMPUTED row — that would just restate the
+    /// geometry under test and pass no matter what it drifted to.
+    fn drawn_link_cell(buffer: &ratatui::buffer::Buffer, preview: Rect) -> (u16, u16) {
+        let found = (preview.y..preview.bottom())
+            .flat_map(|y| (preview.x..preview.right()).map(move |x| (x, y)))
+            .find(|&(x, y)| {
+                buffer
+                    .cell((x, y))
+                    .is_some_and(|c| c.modifier.contains(Modifier::UNDERLINED))
+            });
+        found.expect(
+            "the fixture's link label must be drawn inside the preview pane, \
+             or these tests prove nothing",
+        )
+    }
+
+    #[test]
+    fn a_click_on_a_drawn_link_opens_it_for_a_banner_less_session() {
+        // No banner: the transcript owns the pane's whole inner rect, and the
+        // hit-test must NOT shift by a row that was never reserved.
+        let dir = unique_temp_dir("link-plain");
+        let mut app = link_app(&dir, None);
+        let buffer = render_board(&mut app);
+        assert!(
+            view::preview_banner(&app).is_none(),
+            "a session with no joined agent reserves no banner row"
+        );
+        assert!(
+            app.preview_scroll > 0,
+            "the fixture must overflow the pane, or this never tests a scrolled hit"
+        );
+
+        let (col, row) = drawn_link_cell(&buffer, app.preview_rect);
+        assert_eq!(
+            link_under_pointer(&mut app, col, row).as_deref(),
+            Some(LINK_URL),
+            "a click on the cell the link was DRAWN on must resolve to its url"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_click_on_a_drawn_link_opens_it_beneath_a_pinned_status_banner() {
+        // A reported session pins a banner to the pane's first inner row, so its
+        // transcript starts one row lower. The click must follow the transcript,
+        // not the pane.
+        let dir = unique_temp_dir("link-live");
+        let mut app = link_app(&dir, Some("blocked"));
+        let buffer = render_board(&mut app);
+        assert!(
+            view::preview_banner(&app).is_some(),
+            "a joined reported agent must pin a banner, or this is just the plain case"
+        );
+        assert!(
+            app.preview_scroll > 0,
+            "the fixture must overflow the pane, or this never tests a scrolled hit"
+        );
+
+        let (col, row) = drawn_link_cell(&buffer, app.preview_rect);
+        assert_eq!(
+            link_under_pointer(&mut app, col, row).as_deref(),
+            Some(LINK_URL),
+            "a click on the cell the link was DRAWN on must resolve to its url \
+             even though the pinned banner pushed the transcript down a row"
+        );
+        // Precision, not just presence: the row ABOVE the label is a different
+        // transcript line, so it must NOT resolve to the same link.
+        assert_ne!(
+            link_under_pointer(&mut app, col, row - 1).as_deref(),
+            Some(LINK_URL),
+            "the row above the label is another transcript line, not the link"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_left_click_in_the_preview_body_without_a_link_is_a_harmless_no_op() {
         // The new preview-link arm must never start a drag, open the overlay, or
@@ -1128,6 +1496,433 @@ mod tests {
         );
     }
 
+    /// A session written to a REAL file whose `cwd` REALLY exists, so
+    /// `resume::check`'s authoritative re-read and existence gate both PASS and
+    /// Enter can reach an actual `Outcome::Resume`.
+    ///
+    /// The synthetic `session()` above cannot: its file does not exist, so every
+    /// Enter refuses and the resume path is indistinguishable from a no-op. To
+    /// prove a `done` session PLAIN-RESUMES (not merely "did not open the
+    /// overlay"), the gate has to be allowed to succeed.
+    fn resumable_session(dir: &Path, id: &str) -> Session {
+        let file = dir.join(format!("{id}.jsonl"));
+        let jsonl = format!(
+            concat!(
+                r#"{{"type":"user","sessionId":"{id}","cwd":"{cwd}","#,
+                r#""timestamp":"2026-07-14T10:00:00.000Z","#,
+                r#""message":{{"role":"user","content":"hi"}}}}"#,
+                "\n",
+            ),
+            id = id,
+            cwd = dir.display(),
+        );
+        std::fs::write(&file, jsonl).expect("write the resumable fixture");
+        Session {
+            file,
+            session_id: id.to_string(),
+            cwd: dir.to_path_buf(),
+            git_branch: Some("main".to_string()),
+            timestamp: None,
+            repo: "repo".to_string(),
+            label: format!("label {id}"),
+            content_index: String::new(),
+        }
+    }
+
+    /// An app over one REPORTABLE, resumable session joined to a background agent
+    /// carrying `state` — the shape `claude agents --json --all` reports — and,
+    /// SEPARATELY, what claude's active list says via `live`.
+    ///
+    /// The two are independent parameters on purpose: the whole bug is that the
+    /// polled `--all` badge state and claude's live answer CAN DISAGREE. A helper
+    /// that derived one from the other could not express the race at all.
+    fn app_with_agent_state(dir: &Path, id: &str, state: &str, live: &[&str]) -> App {
+        let mut app = App::new(
+            vec![resumable_session(dir, id)],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
+        let mut reported = HashMap::new();
+        reported.insert(
+            id.to_string(),
+            ReportedAgent {
+                kind: "background".to_string(),
+                // A real `--all` record carries its agent-view job id; supplying
+                // one means a wrongly-opened overlay would be fully functional,
+                // so this test fails ONLY on the routing decision itself.
+                id: Some("job-1".to_string()),
+                state: Some(state.to_string()),
+                status: None,
+                name: None,
+            },
+        );
+        app.set_reported_agents(reported);
+        seed_live(&mut app, live);
+        assert_eq!(app.selected.as_deref(), Some(id));
+        app
+    }
+
+    /// THE regression `--all` could cause. The agent map carries agents that
+    /// reported completion, so a MEMBERSHIP test against THAT map would divert
+    /// Enter into the Attach/Fork/Cancel overlay for every session that ever
+    /// finished — i.e. for the large majority of rows — breaking the board's
+    /// PRIMARY interaction.
+    ///
+    /// The intent is unchanged from when the gate classified `done`; only the
+    /// premise is now stated the way the gate actually asks it — claude's active
+    /// list does NOT report this session. Asserts the OBSERVABLE outcome, never a
+    /// predicate's return value: a real `Outcome::Resume` carrying the PLAIN
+    /// `claude -r <id>` argv. No `claude` is spawned — the probe is seeded, and
+    /// `handle_event` stops at the pure refusal gate and hands the argv back for
+    /// the driver to launch.
+    #[test]
+    fn enter_on_a_done_agent_absent_from_the_live_set_plain_resumes() {
+        let dir = unique_temp_dir("done-resume");
+        // Badged `done`, and claude confirms it is not holding it: no overlay.
+        let mut app = app_with_agent_state(&dir, "sess-done", "done", &[]);
+
+        let out = press(&mut app, KeyCode::Enter);
+
+        assert!(
+            app.pending_live.is_none(),
+            "claude does not report this session as live, so Enter must not open \
+             the Attach/Fork/Cancel overlay"
+        );
+        let Outcome::Resume(ready) = out else {
+            panic!(
+                "Enter on a `done` session must escalate to the resume hand-off; \
+                 status: {:?}",
+                app.status
+            );
+        };
+        assert_eq!(
+            ready.argv.join(" "),
+            "claude -r sess-done",
+            "a finished session must PLAIN-resume: no --fork-session, no attach"
+        );
+        assert_eq!(
+            app.status, None,
+            "a clean plain-resume leaves no refusal on the board"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **THE TOCTOU case — the bug this whole seam exists for.**
+    ///
+    /// The `--all` poll badged this session `done` (up to ~1.3s ago), but claude's
+    /// active list reports it LIVE right now. The two disagree, which is exactly
+    /// what the old gate could not represent: it inferred `state != "done"` ⇒
+    /// live, so it plain-resumed, and `claude -r` refused with "Session … is
+    /// currently running as a background agent (bg)". The user hit this on a
+    /// `● bg done` row.
+    ///
+    /// Claude is the authority, so the fresh probe wins over the stale badge and
+    /// Enter must offer Attach/Fork. This test is the one that pins the whole
+    /// change: it fails against ANY gate that reads the polled map.
+    #[test]
+    fn enter_on_a_done_badged_session_that_claude_reports_live_opens_the_overlay() {
+        let dir = unique_temp_dir("done-but-live");
+        // The stale badge says `done`; claude says it is still running.
+        let mut app = app_with_agent_state(&dir, "sess-raced", "done", &["sess-raced"]);
+
+        let out = press(&mut app, KeyCode::Enter);
+
+        assert!(
+            matches!(out, Outcome::Continue),
+            "a session claude is holding open must NOT hand off to `claude -r`, \
+             which would be refused"
+        );
+        let pending = app.pending_live.clone().expect(
+            "claude reports this session LIVE, so Enter must open the \
+             Attach/Fork overlay even though the polled badge still says `done` \
+             — trusting the stale badge here is the TOCTOU bug",
+        );
+        assert_eq!(pending.session_id, "sess-raced");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of the gate, over the IDENTICAL fixture: a session claude
+    /// reports as still WORKING keeps opening the overlay.
+    ///
+    /// Paired with the `done`-absent test above, this proves Enter routes on
+    /// MEMBERSHIP of the freshly-probed live set: the two differ only by what the
+    /// probe reports.
+    #[test]
+    fn enter_on_a_working_agent_in_the_live_set_opens_the_overlay() {
+        let dir = unique_temp_dir("working-overlay");
+        let mut app = app_with_agent_state(&dir, "sess-working", "working", &["sess-working"]);
+
+        let out = press(&mut app, KeyCode::Enter);
+
+        assert!(matches!(out, Outcome::Continue));
+        let pending = app
+            .pending_live
+            .clone()
+            .expect("a working agent is live, so Enter must open the overlay");
+        assert_eq!(pending.session_id, "sess-working");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The inverse disagreement, and the reason the probe's fail-soft direction
+    /// is REVERSED from the deleted classifier's: a session badged `working` that
+    /// claude does NOT report live must plain-resume.
+    ///
+    /// This is also the probe-failure path (a missing `claude`, a non-zero exit,
+    /// or bad JSON all yield an EMPTY set, which is indistinguishable from "found
+    /// nothing"): we degrade toward letting claude decide, and claude's own check
+    /// backstops us. The old gate failed the other way and would have trapped
+    /// this session behind an overlay it did not need.
+    #[test]
+    fn enter_on_a_working_badged_session_absent_from_the_live_set_plain_resumes() {
+        let dir = unique_temp_dir("working-not-live");
+        let mut app = app_with_agent_state(&dir, "sess-stale", "working", &[]);
+
+        let out = press(&mut app, KeyCode::Enter);
+
+        assert!(
+            app.pending_live.is_none(),
+            "claude is the authority: if its active list does not report the \
+             session, Enter plain-resumes regardless of the badge"
+        );
+        let Outcome::Resume(ready) = out else {
+            panic!("expected a plain resume; status: {:?}", app.status);
+        };
+        assert_eq!(ready.argv.join(" "), "claude -r sess-stale");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A probe that FAILS (missing binary / non-zero exit / bad JSON) yields an
+    /// empty set, which must plain-resume rather than block the board.
+    ///
+    /// Fail-soft toward "let claude decide": we would rather hand the user
+    /// claude's own real message than invent a refusal from a signal we could not
+    /// read. Distinct from the test above in premise — nothing is badged live
+    /// here at all — so the empty set is the ONLY thing driving the outcome.
+    #[test]
+    fn a_failed_probe_falls_back_to_a_plain_resume() {
+        let dir = unique_temp_dir("probe-failed");
+        let mut app = App::new(
+            vec![resumable_session(&dir, "sess-nosignal")],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
+        // Exactly what `agents::live_agents` returns when the shell-out fails in
+        // any way.
+        seed_live(&mut app, &[]);
+
+        let out = press(&mut app, KeyCode::Enter);
+
+        assert!(
+            app.pending_live.is_none(),
+            "an unavailable signal must never strand the user in an overlay"
+        );
+        let Outcome::Resume(ready) = out else {
+            panic!("expected a plain resume; status: {:?}", app.status);
+        };
+        assert_eq!(ready.argv.join(" "), "claude -r sess-nosignal");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An app over a REALLY resumable session that the `--all` poll badges as a
+    /// live background agent carrying `polled_job`.
+    ///
+    /// `polled_job` is the STALE snapshot the Attach hand-off must never read, so
+    /// every test below seeds it with an id that DIFFERS from whatever claude
+    /// reports at hand-off. The probe is left for the caller: what claude says at
+    /// the hand-off is the variable under test.
+    fn app_with_polled_job(dir: &Path, id: &str, polled_job: &str) -> App {
+        let mut app = App::new(
+            vec![resumable_session(dir, id)],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
+        let mut reported = HashMap::new();
+        reported.insert(
+            id.to_string(),
+            ReportedAgent {
+                kind: "background".to_string(),
+                id: Some(polled_job.to_string()),
+                state: Some("working".to_string()),
+                status: None,
+                name: None,
+            },
+        );
+        app.set_reported_agents(reported);
+        assert_eq!(app.selected.as_deref(), Some(id));
+        app
+    }
+
+    /// **The Attach job id comes from the PROBE, never from the polled `--all`
+    /// map** — the same authoritative-read rule the resume gate follows, one layer
+    /// down.
+    ///
+    /// The two ids DIFFER on purpose: the poll says `stale-job`, claude's active
+    /// list says `fresh-job`. A fixture where they agreed would pass against
+    /// EITHER source and so could not tell them apart — the "test board with
+    /// exactly one bucket" mistake PATTERNS.md records. Asserts the observable
+    /// argv the driver would spawn, not which function was called.
+    #[test]
+    fn attach_takes_its_job_id_from_the_probe_not_the_polled_map() {
+        let dir = unique_temp_dir("attach-fresh-job");
+        let mut app = app_with_polled_job(&dir, "sess-attach", "stale-job");
+        // Asked at the hand-off, claude reports a DIFFERENT job id than the poll
+        // is still carrying.
+        seed_live_agents(
+            &mut app,
+            &[("sess-attach", "background", Some("fresh-job"))],
+        );
+
+        press(&mut app, KeyCode::Enter); // gate: live -> overlay, defaulting to Attach
+        assert_eq!(
+            app.pending_live.as_ref().unwrap().selected,
+            LiveChoice::Attach
+        );
+        let out = press(&mut app, KeyCode::Enter); // confirm Attach
+
+        let Outcome::Resume(ready) = out else {
+            panic!(
+                "Attach on a live background agent must hand off; status: {:?}",
+                app.status
+            );
+        };
+        assert_eq!(
+            ready.argv.join(" "),
+            "claude attach fresh-job",
+            "the attach target must be the job id claude reported AT THE HAND-OFF; \
+             `stale-job` here means it was read back off the ~1.3s-stale `--all` map"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Live at Enter, FINISHED by the time Attach is confirmed: never spawn
+    /// `claude attach` with a dead job id.
+    ///
+    /// The overlay can sit open indefinitely, so this gap is unbounded — the
+    /// probe that OPENED the overlay is itself stale by the time the user picks.
+    /// Claude is up and answering here (another agent is still live); it simply no
+    /// longer reports OURS. That is what separates this from the probe-failure
+    /// test below, and it pins that the refusal keys on our session's ABSENCE
+    /// rather than on an empty answer: an implementation that attached to whatever
+    /// job the list happened to carry would spawn `claude attach other-job` and
+    /// fail here. The `--all` map meanwhile still badges ours live with
+    /// `stale-job`, so reading THAT would hand off to a finished job.
+    #[test]
+    fn a_session_that_finishes_while_the_overlay_is_open_never_attaches_a_dead_id() {
+        let dir = unique_temp_dir("attach-vanished");
+        let mut app = app_with_polled_job(&dir, "sess-gone", "stale-job");
+        seed_live_then(
+            &mut app,
+            // At the Enter gate: live, with a real job id.
+            &[("sess-gone", "background", Some("fresh-job"))],
+            // At the Attach hand-off: ours has finished; an unrelated agent runs on.
+            &[("sess-other", "background", Some("other-job"))],
+        );
+
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            app.pending_live.is_some(),
+            "it was live at Enter, so the overlay opens"
+        );
+
+        let out = press(&mut app, KeyCode::Enter); // confirm Attach
+
+        assert!(
+            matches!(out, Outcome::Continue),
+            "a session claude no longer holds must NOT hand off to `claude attach` \
+             with a dead job id"
+        );
+        assert_eq!(
+            app.status.as_deref(),
+            Some(resume::ATTACH_NOT_LIVE),
+            "the board must report what was OBSERVED — claude no longer reports it \
+             — and name the routes that still work"
+        );
+        assert!(app.pending_live.is_none(), "the overlay closes on confirm");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A probe that FAILS at the Attach hand-off (missing binary / non-zero exit /
+    /// bad JSON all yield an empty map) refuses fail-soft: no panic, no spawn.
+    ///
+    /// Distinct from the test above in PREMISE — claude answered nothing at all
+    /// here, rather than answering without our session — and the fail-soft
+    /// direction deliberately COLLAPSES the two: with no authoritative id there is
+    /// nothing to attach to either way, so both refuse identically. We decline to
+    /// distinguish "finished" from "could not ask" precisely because the probe
+    /// cannot, which is why the copy states the report rather than a cause.
+    #[test]
+    fn a_probe_failure_at_the_attach_hand_off_refuses_instead_of_attaching() {
+        let dir = unique_temp_dir("attach-probe-failed");
+        let mut app = app_with_polled_job(&dir, "sess-nosignal", "stale-job");
+        seed_live_then(
+            &mut app,
+            &[("sess-nosignal", "background", Some("fresh-job"))],
+            // The shell-out fails: an empty answer, indistinguishable from "none".
+            &[],
+        );
+
+        press(&mut app, KeyCode::Enter);
+        assert!(app.pending_live.is_some());
+
+        let out = press(&mut app, KeyCode::Enter); // confirm Attach
+
+        assert!(
+            matches!(out, Outcome::Continue),
+            "an unreadable signal must never spawn a guessed-at `claude attach`"
+        );
+        assert_eq!(app.status.as_deref(), Some(resume::ATTACH_NOT_LIVE));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fork does NOT probe, and must not be dragged behind Attach's re-ask: it is
+    /// the route `ATTACH_NOT_LIVE` points the user at, so it has to stay valid
+    /// exactly when Attach is refused.
+    ///
+    /// A fork of a live session is expected to work and a fork of a finished one
+    /// is an ordinary fork, so liveness is not Fork's question to ask. The probe
+    /// reports NOTHING by the time Fork is confirmed; the hand-off must proceed
+    /// regardless.
+    #[test]
+    fn fork_from_the_overlay_hands_off_without_asking_the_probe() {
+        let dir = unique_temp_dir("overlay-fork");
+        let mut app = app_with_polled_job(&dir, "sess-fork", "stale-job");
+        seed_live_then(
+            &mut app,
+            &[("sess-fork", "background", Some("fresh-job"))],
+            &[],
+        );
+
+        press(&mut app, KeyCode::Enter); // gate: live -> overlay (Attach)
+        press(&mut app, KeyCode::Right); // -> Fork
+        assert_eq!(
+            app.pending_live.as_ref().unwrap().selected,
+            LiveChoice::Fork
+        );
+        let out = press(&mut app, KeyCode::Enter); // confirm Fork
+
+        let Outcome::Resume(ready) = out else {
+            panic!(
+                "Fork must hand off whatever the probe says; status: {:?}",
+                app.status
+            );
+        };
+        assert_eq!(
+            ready.argv.join(" "),
+            "claude -r sess-fork --fork-session",
+            "Fork has no liveness question to ask, so it must never be gated on one"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Esc dismisses the overlay without acting.
     #[test]
     fn esc_dismisses_the_choice_overlay() {
@@ -1154,18 +1949,56 @@ mod tests {
         );
     }
 
-    /// A `LiveAgents` event swaps the live set in (off-thread delivery path).
+    /// A `ReportedAgents` event swaps the agent set in (off-thread delivery path).
     #[test]
-    fn live_agents_event_updates_the_live_set() {
+    fn reported_agents_event_updates_the_agent_set() {
         let mut app = app_with("s", None);
-        assert!(!app.is_live("s"));
-        let mut live = HashMap::new();
-        live.insert("s".to_string(), live_agent("background"));
-        handle_event(&mut app, AppEvent::LiveAgents(live), Path::new("/tmp"));
-        assert!(
-            app.is_live("s"),
-            "a LiveAgents event must update the live set"
+        assert!(app.reported_agent("s").is_none());
+        let mut reported = HashMap::new();
+        reported.insert("s".to_string(), reported_agent("background"));
+        handle_event(
+            &mut app,
+            AppEvent::ReportedAgents(reported),
+            Path::new("/tmp"),
         );
+        assert_eq!(
+            app.reported_agent("s").map(ReportedAgent::kind_label),
+            Some("bg"),
+            "a ReportedAgents event must update the agent set"
+        );
+    }
+
+    /// The tick is the board's clock: `view::blink_visible` phases the live-badge
+    /// pulse off it, so a `Tick` that does not ADVANCE it leaves the dot frozen —
+    /// exactly the "dot never pulses" bug this counter exists to fix. The view
+    /// tests set `App::tick` by hand, so this is the only place the wiring from
+    /// the real event to that field is pinned.
+    #[test]
+    fn tick_event_advances_the_board_clock() {
+        let mut app = app_with("s", None);
+        assert_eq!(app.tick, 0, "a fresh board starts at tick 0");
+
+        for expected in 1..=3 {
+            let out = handle_event(&mut app, AppEvent::Tick, Path::new("/tmp"));
+            assert!(
+                matches!(out, Outcome::Continue),
+                "a tick never ends the board"
+            );
+            assert_eq!(
+                app.tick, expected,
+                "each Tick must advance the clock by one"
+            );
+        }
+    }
+
+    /// The tick counter WRAPS rather than overflowing: a board left running long
+    /// enough to saturate a `u64` must keep drawing, not panic in a debug build.
+    #[test]
+    fn tick_event_wraps_instead_of_overflowing() {
+        let mut app = app_with("s", None);
+        app.tick = u64::MAX;
+        handle_event(&mut app, AppEvent::Tick, Path::new("/tmp"));
+        assert_eq!(app.tick, 0, "the clock must wrap from u64::MAX back to 0");
     }
 
     #[test]

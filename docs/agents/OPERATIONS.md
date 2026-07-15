@@ -39,6 +39,33 @@ cargo clippy --all-targets
 The `dead_code` lint is load-bearing here — do not silence it broadly (see
 [PATTERNS.md](PATTERNS.md) rule 9).
 
+### The lint gate reports clean in two ways that are lies
+
+Both have already shipped a warning past a review pass here. Neither is
+hypothetical.
+
+1. **`--all-targets` is not optional.** Bare `cargo clippy` lints only the
+   default target: it never builds the test/bench/example targets, so anything
+   that only fires there is invisible. The concrete case: a fn whose sole caller
+   is `#[cfg(not(test))]`-gated is **dead under `lib test`** and warns — but only
+   with `--all-targets`. Bare `cargo clippy` on that same tree is genuinely,
+   silently clean.
+2. **A re-run tells you nothing.** Cargo caches lint results. A second
+   `cargo clippy --all-targets` on an unchanged tree prints `Finished` and no
+   warnings *whether or not the first run warned*. So "I ran clippy, it was
+   clean" is not evidence unless that run actually rebuilt — and a run that
+   finishes in ~0.05s did not.
+
+Force a real run before believing the gate:
+
+```sh
+touch src/lib.rs && cargo clippy --all-targets   # or: cargo clean -p snapback
+```
+
+The general rule this serves lives in [AGENTS.md](../../AGENTS.md)'s execution
+checklist: **a check that could not have gone red is not evidence.** When
+reporting a gate green, report what made it capable of being red.
+
 ## Run
 
 ```sh

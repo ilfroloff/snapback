@@ -433,9 +433,9 @@ fn run_inner(terminal: &mut DefaultTerminal, app: &mut App, root: &Path) -> Resu
     // terminal.
     hard_reset()?;
     let events = EventLoop::new(root, TICK)?;
-    // Refresh the live-session badges OFF the UI thread on their own cadence, so
-    // the `claude agents --json` shell-out can never block rendering. Delivered
-    // as `AppEvent::LiveAgents` on the merged channel and applied in `update`.
+    // Refresh the agent badges OFF the UI thread on their own cadence, so the
+    // `claude agents --json --all` shell-out can never block rendering. Delivered
+    // as `AppEvent::ReportedAgents` on the merged channel and applied in `update`.
     events.spawn_agents_poller(crate::watch::AGENTS_REFRESH);
 
     let outcome = loop {

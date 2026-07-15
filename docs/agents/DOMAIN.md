@@ -53,7 +53,7 @@ never fatal:
 | Field | Read as | Used for |
 | --- | --- | --- |
 | `cwd` | first non-null | authoritative working dir; **absence ⇒ not a session** |
-| `sessionId` | first non-null (else file stem) | stable id, resume target, live-agent join key |
+| `sessionId` | first non-null (else file stem) | stable id, resume target, reported-agent join key |
 | `gitBranch` | last non-null (`None` ⇒ `(detached)`) | branch grouping level |
 | `timestamp` | last non-null, RFC 3339 | sort + display (per-message too, in preview) |
 | `type` | `"summary"` / `"user"` / `"assistant"` | label, preview, content index |
@@ -107,17 +107,146 @@ content haystack starts to feel heavy, the first step is a lazily-populated,
 `content_index`, so only changed sessions are re-extracted; an **FTS5** table
 over transcript text is the step past that. Until then it is not worth it.
 
-### Live agents (`src/agents.rs`)
+### Reported agents (`src/agents.rs`)
 
 `claude -r <id>` refuses to plain-resume a session that is **currently running**
-as an agent. The authoritative "is this live now" signal is `claude agents
---json` (a TTY-free JSON array of active agents), joined to sessions by the
-**full** `sessionId`. Fields used: `kind` (`background`→`bg`,
-`interactive`→`live`), `id` (the **short agent-view job id**, e.g. `ca56b543` —
-distinct from the full `sessionId`; present only on **background** agents and
-the authoritative target for Attach), `state`/`status` (dim qualifier), `name`.
-Parsing is fail-soft: any failure ⇒ empty live set ⇒ the board degrades to plain
-behavior.
+as an agent. `claude agents --json` (a TTY-free JSON array) is the only
+machine-readable window onto that, and `snapback` reads it **twice, differently**
+— one parser (`parse_agents_json`), two questions:
+
+| Reading | Command | Asked | Question |
+| --- | --- | --- | --- |
+| **Board signal** (`reported_agents`) | `--json --all` | polled ~1s off-thread | "what should each row's badge say?" |
+| **Hand-off signal** (`live_agents`) | `--json` (**no `--all`**) | one-shot at EVERY hand-off | "will `claude -r` refuse *right now*?" **and** "what job id does `claude attach` take?" |
+
+The hand-off reading returns the **records**, not bare ids, so both of its
+questions are answered by ONE authoritative read: liveness is membership, and the
+attach target is the matched record's own `id`. The rule is uniform — **every
+hand-off re-asks claude; nothing hands off on polled data.**
+
+Both join to sessions by the **full** `sessionId`. Fields used: `kind`
+(`background`→`bg`, `interactive`→`live`), `id` (the **short agent-view job id**,
+e.g. `ca56b543` — distinct from the full `sessionId`; present only on
+**background** agents, so an interactive session has nothing to attach to;
+the authoritative target for Attach **when read from the `live_agents` probe** —
+never from the `--all` map, which is a stale snapshot of a job that may have
+ended), `state`/`status` (the activity qualifier, see below), `name`. Parsing is
+fail-soft: any failure ⇒ empty map.
+
+The board's shell-out passes **`--all`** because the bare command lists only the
+currently-active agents: `done` never appears without it, so a finished session
+would render as though claude had never heard of it.
+
+#### Why the gate does not read the `--all` map
+
+**`--all`'s `state: "done"` means "the agent reported completion", NOT "claude
+will permit `-r`"** — the two can disagree transiently, **claude is the only
+authority**, and the gate therefore probes claude's active list at hand-off
+rather than inferring from a polled snapshot.
+
+That finding was paid for: the gate used to read the polled map and infer
+`state != "done"` ⇒ live. It agrees in steady state (active = 37, `--all`-not-done
+= 37, exactly), but it is a **guess about claude's gate**, and the snapshot is up
+to **~1.3s stale** (a ~0.26s poll then a 1s sleep). Claude re-evaluates liveness
+at *spawn* time, so when the two disagreed the user pressed Enter on a
+`● bg done` row and got claude's refusal instead of a resume — a TOCTOU race.
+
+The bare command needs no inference because **it IS claude's active list**:
+membership is liveness, structurally. So the two readings are kept apart on
+purpose, and the split is load-bearing in both directions:
+
+- Adding `--all` to the probe would report every finished session as live and
+  divert all ~123 of them into the overlay instead of resuming.
+- Gating on the `--all` map's membership would do the same.
+- Gating on its *bucket* is the race described above.
+
+`live_agents` **fails soft toward "not live"** (empty map ⇒ plain resume), which
+is the **opposite** direction from the display classifier's fail-toward-active
+posture. That is deliberate: a classifier facing an unknown bucket should assume
+"might be running", but membership has no bucket to be unsure about — the only
+error left is "we could not ask", and claude's own check backstops that one step
+later. Degrading toward *let claude decide* is correct.
+
+At the **Attach** hand-off that same direction collapses two premises: an empty
+answer means "the agent finished" and "we could not ask" alike. Both must refuse
+(`resume::ATTACH_NOT_LIVE`) — without an authoritative id, `claude attach` would
+be handed a dead or absent job — so the copy states what was **observed** ("claude
+no longer reports this session as a running agent") rather than a cause the probe
+cannot distinguish, and points at the routes valid either way (resume re-probes
+and is backstopped by claude; a fork of a finished session is an ordinary fork).
+
+The map is named for what it holds (`App::reported_agents`), so no identifier
+claims liveness it cannot back. Its authority is **rendering, and nothing else**:
+badges and the banner draw from it precisely because a render must never shell
+out. The Attach **job id** was once read from it too — that was the same
+stale-snapshot bug as gating liveness on it, one layer down, and worse: the
+overlay can sit open indefinitely, so the staleness window is unbounded rather
+than ~1.3s. It now comes from the `live_agents` probe taken at the hand-off.
+
+#### Activity buckets (`AgentActivity`)
+
+The `state`/`status` value set is **undocumented**, so it is interpreted in
+exactly ONE place: `classify` buckets the resolved qualifier (`state`, else
+`status` — `ReportedAgent::qualifier`'s precedence) into an `AgentActivity`.
+Every qualifier-shaped output derives from that enum, so they cannot drift apart:
+
+| Bucket | Qualifier(s) | Badge color | Dot pulses | Banner reads |
+| --- | --- | --- | --- | --- |
+| `NeedsInput` | `blocked`, `waiting` | `Yellow` | no | `needs input` (the ONE translated bucket — both tokens) |
+| `Idle` | `idle` | `Green` | no | `idle` (verbatim) |
+| `Working` | `working`, `busy` | `Gray` | **yes** (-> `DarkGray`) | verbatim (`working` / `busy`) |
+| `Done` | `done` | `Green` | no | `done` (verbatim) |
+| `Other` | anything else, or none | `Gray` | yes (-> `DarkGray`) | verbatim, or the kind label alone |
+
+**Every column is a DISPLAY decision — no bucket answers "live?".** The table
+once carried that column and it was the bug: liveness is not a property of a
+qualifier, it is `live_agents`' membership answer straight from claude (see
+above).
+
+A pulsing bucket alternates its dot between the badge color and the dim partner
+shown above; the dot's `●` is drawn in every phase, and a steady bucket simply
+holds the badge color. The pulse is a COLOR change, never a glyph swap — the
+rule and the reason it is not negotiable live in
+[PATTERNS.md](PATTERNS.md#7-restrained-terminal-safe-styling).
+
+Two tokens per bucket is deliberate: `waiting`/`blocked` and `busy`/`working` are
+one concept each under two spellings, and splitting them would give the same
+agent a different badge depending on which token the wire used.
+
+`Other` is the fail-soft posture made visible: an unknown qualifier is passed
+through to the user rather than dropped or relabeled, and counts as ACTIVE, so
+schema drift never hides a busy session behind a steady dot. The colors read as
+urgency — yellow needs you, green is ready (idle or finished), gray is quietly
+working — and the PULSE, not the color, is what marks activity.
+
+#### Observed value distribution
+
+A **sampled observation dated 2026-07-14 on one machine — NOT a contract.** The
+value set is undocumented and may drift at any claude release; this records
+*provenance*, so the next author knows what the buckets were built against and
+that the sample is a snapshot, not a guarantee.
+
+| Command | Entries | `state` | `status` |
+| --- | --- | --- | --- |
+| `claude agents --json` | 37 | `blocked`×34, `working`×1, absent×2 | `idle`×19, `busy`×1, `waiting`×1, absent×16 |
+| `claude agents --json --all` | 160 | `done`×123, `blocked`×34, `working`×1, absent×2 | — |
+
+Notes from that sample: `done` occurred **only** under `--all` (0 occurrences
+without it), which is the direct evidence for the flag. The token `running` does
+**not** exist in the observed domain — an earlier revision guessed it, and the
+resulting dead match arm is why this table is recorded here rather than inferred.
+
+The 37 vs. 123 split is also why the two readings must stay apart: `--all`
+carries **123** records the gate must never treat as live.
+
+**Known, accepted risk:** `parse_agents_json` is **last-one-wins per
+`sessionId`**. The sample showed **zero** duplicate `sessionId`s across all 160
+entries, but that is a sampled observation, not a structural guarantee. If it
+ever broke and a `done` record overwrote an active one, the row's **badge** would
+read `done` while the session ran. That is now cosmetic rather than behavioral:
+the resume gate does not read this map, so Enter still probes claude and still
+routes to Attach/Fork correctly. Deliberately **not** engineered around (YAGNI);
+recorded so the failure mode is recognizable if it ever surfaces.
 
 ## User-facing modes (`tui::app`)
 
