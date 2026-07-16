@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/ilfroloff/snapback/compare/v0.1.0...v0.2.0) - 2026-07-16
+
+### Added
+
+- fold background-fork lineages behind one expandable row
+- make a live session's state legible at a glance
+
+### Other
+
+- *(agents)* make the shell-out's exit-status decision testable
+
 ## [0.1.0](https://github.com/ilfroloff/snapback/releases/tag/v0.1.0) - 2026-07-16
 
 ### Added
