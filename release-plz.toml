@@ -1,11 +1,15 @@
 # release-plz configuration for snapback.
 #
-# snapback is a SINGLE, non-published binary crate (Cargo.toml sets
-# `publish = false`). It is installed from source with
-# `cargo install --git <repo> --tag vX.Y.Z`, so the git TAG - not crates.io - is
-# the only source of truth for "what version is released". This file wires
+# snapback is a SINGLE, non-published binary crate. It is installed from source
+# with `cargo install --git <repo> --tag vX.Y.Z`, so the git TAG - not crates.io
+# - is the only source of truth for "what version is released". This file wires
 # release-plz to that reality: derive versions from git tags, cut a `v{version}`
 # git tag + GitHub Release on each release, and never touch a cargo registry.
+#
+# THIS FILE is the only thing keeping the crate unpublished. Cargo.toml carries
+# no `publish` key by design: one there would mark the package non-publishable to
+# release-plz and silently disable tagging altogether (see `publish` below, and
+# the warning in Cargo.toml).
 #
 # Per this repo's NO MAGIC VALUES rule (see AGENTS.md / Cargo.toml), every value
 # below is set explicitly and carries the reason it holds that value - including
@@ -36,8 +40,11 @@ name = "snapback"
 # release is exactly v0.1.0.
 git_only = true
 
-# Never run `cargo publish`. This mirrors Cargo.toml's own `publish = false` and
-# makes the intent explicit at the release-plz layer. (release-plz forbids
+# Never run `cargo publish`. This is the SOLE publish guard - it mirrors nothing.
+# Cargo.toml deliberately has no `publish` key, because `publish = false` there
+# makes release-plz classify the package as non-publishable and skip it entirely,
+# git tag and GitHub Release included. Guarding here instead blocks the registry
+# step while leaving the package on the release path. (release-plz forbids
 # `git_only = true` together with `publish = true`, so this must stay false.)
 publish = false
 
