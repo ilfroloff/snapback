@@ -31,8 +31,15 @@ description = "Browse, search, and resume Claude Code sessions from a ratatui TU
 ratatui = "=0.30.2"
 # Terminal control + input events (matches the crossterm backend used by ratatui 0.30).
 crossterm = "=0.29.0"
-# fzf-grade fuzzy matcher. Pinned exact; all matcher calls isolated in src/search.rs.
+# Substring matcher (AtomKind::Substring in code, never fuzzy). Backs the
+# HIGHLIGHT seam only -- the per-keystroke filter is memchr below. Pinned exact;
+# all nucleo calls isolated in src/search.rs.
 nucleo = "=0.5.0"
+# SIMD byte-substring search (memmem). IS the per-keystroke filter: it answers
+# membership per atom over the prebuilt haystacks, with nucleo not involved
+# (src/search.rs). Already in the tree transitively via nucleo (nucleo-matcher)
+# and serde_json; pinned exact.
+memchr = "=2.8.2"
 # Filesystem watcher for autorefresh over ~/.claude/projects.
 notify = "=8.2.0"
 # ~200ms debounce that coalesces notify event storms into one "sessions changed".

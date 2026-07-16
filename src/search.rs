@@ -1,34 +1,132 @@
-//! Substring search over sessions (nucleo).
+//! Substring search over sessions: a SIMD membership filter, a nucleo highlight.
 //!
 //! Isolates every `nucleo` call so an API change touches one module (Risks
-//! table). Builds a matcher over each session's searchable haystack
-//! (name/label AND the capped `content_index`) and exposes a [`filter`] that
-//! returns ranked indices. Supports two modes behind one interface:
-//! name/label-only (default, instant) and name+content; matching stays
-//! incremental (re-filter on each keystroke without rebuilding the haystack),
-//! and the haystack rebuilds only for changed sessions on `SessionsChanged`.
+//! table). Builds the searchable haystacks for each session (name/label AND the
+//! capped `content_index`) and exposes a [`filter`] that returns matching
+//! indices. Supports two modes behind one interface: name/label-only (default,
+//! instant) and name+content; matching stays incremental (re-filter on each
+//! keystroke without rebuilding the haystack), and the haystack rebuilds only
+//! for changed sessions on `SessionsChanged`.
 //!
-//! # Which nucleo API
+//! # The filter answers membership, not rank
+//!
+//! Per keystroke the filter asks ONE question per entry — does every query atom
+//! occur as a substring? — and answers it with `memchr::memmem` (SIMD, no
+//! allocation, no UTF-8 → UTF-32 conversion). **nucleo is not on this path.**
+//!
+//! It used to be. The filter scored survivors with [`Pattern::score`] and sorted
+//! by that score — a rank that provably could never reach the screen, because
+//! `App::order_filtered` re-sorts every result by `(Reverse(timestamp),
+//! session_id)`, a total order with ZERO ties (measured: 66 entries → 66 distinct
+//! keys). With unique keys even sort stability is irrelevant: the score was
+//! computed and then thrown away. It was not cheap. `Utf32Str::new` is zero-copy
+//! only for pure-ASCII haystacks; for any haystack holding a non-ASCII byte it
+//! allocates and fills a whole `Vec<char>` at ~8.6 ns/byte, and **86% of real
+//! entries are non-ASCII** once `serde_json` decodes `\uXXXX` escapes (the raw
+//! files are pure ASCII — the decoded `content_index` is what nucleo saw). So
+//! 76–81% of every keystroke rebuilt megabytes of UTF-32 to order a list that was
+//! about to be re-ordered by timestamp.
+//!
+//! Only the `Some`/`None` membership bit was ever load-bearing, and memmem
+//! answers exactly that. Measured against the real corpus, dropping the rank
+//! stage took the worst keystroke (`n`, 65/66 entries matching) from **13.9 ms to
+//! 417 ns**, and typing `n`→`np`→`npx` from **25.8 ms to ~43 µs**. The win grows
+//! with the corpus: cost is now purely linear in haystack bytes (~27 µs per
+//! 1.2 MB) with no per-entry conversion, so the worst case sits below the old
+//! best case.
+//!
+//! # Smart case is decided PER ATOM
+//!
+//! nucleo's [`CaseMatching::Smart`] makes each atom independently case-sensitive
+//! iff **that atom** carries an uppercase char — `foo BAR` matches `foo`
+//! case-insensitively and `BAR` case-sensitively, within one query. The decision
+//! therefore rides each [`AtomFinder`], never the query as a whole, and each atom
+//! picks its own haystack accordingly. A per-QUERY branch would look equivalent
+//! and silently break mixed queries.
+//!
+//! This branch is **mandatory, not an optimization**. Answering an
+//! uppercase-bearing query from the lowercased haystack would include rows nucleo
+//! excludes: measured, `NPX` finds 6 entries there while nucleo matches 0. That
+//! is an inclusion regression, not a ranking nuance.
+//!
+//! # Why BOTH haystacks are kept
+//!
+//! Each entry carries a CASED haystack and a LOWERCASED sibling, and both are
+//! live: the case-SENSITIVE atom branch searches the cased one, the
+//! case-INSENSITIVE branch the lowercased one. It is tempting to conclude that
+//! removing nucleo's scoring left the cased haystack dead — it did not. Deleting
+//! it would leave every uppercase-bearing query (`TODO`, `API`, `React`)
+//! searching a lowercased haystack case-sensitively, matching nothing.
+//!
+//! Lowercasing happens ONCE per entry at build/refresh, never per keystroke. The
+//! cost is ~2× the (64 KB-capped) content in memory: bounded and cheap at this
+//! scale.
+//!
+//! # Scope-limited matching
+//!
+//! The candidate set is narrowed before any of this runs.
+//! [`results`](SearchIndex::results) matches EVERY entry, while
+//! [`results_within`](SearchIndex::results_within) runs the SAME core over only a
+//! caller-supplied subset of entry indices. The TUI drives the per-keystroke
+//! re-filter through `results_within` with its in-scope set, so an out-of-scope
+//! session is never scanned only to be discarded after the fact. Both entry
+//! points share one private core, and any out-of-range candidate index is skipped
+//! fail-soft.
+//!
+//! # Where this filter and nucleo disagree
+//!
+//! The filter is no longer nucleo's match set *by construction*, so the (narrow)
+//! divergences are stated rather than assumed. Each is accepted deliberately:
+//!
+//! * **Unicode normalization.** nucleo's [`Normalization::Smart`] accent-folds
+//!   (`resume` matching `résumé`); a byte search does not, so such a match is
+//!   excluded. **Unchanged** — the old gate rejected it identically, before
+//!   nucleo was ever consulted.
+//! * **Per-string vs per-char lowercasing.** We lowercase via
+//!   [`str::to_lowercase`], which is context-sensitive per string (Greek final
+//!   sigma `Σ`→`ς`, `İ`→`i̇`), whereas nucleo folds per char. For some non-ASCII
+//!   text this is marginally more restrictive than nucleo. **Unchanged** — same
+//!   reason.
+//! * **The non-ASCII tail off-by-one.** Here the filter is the more CORRECT of
+//!   the two, and diverges from the highlight; see
+//!   [`set_query`](SearchIndex::set_query).
+//! * **The smart-case predicate on a non-ASCII atom.** nucleo's `ignore_case`
+//!   field is private, so the decision is re-derived rather than read. For an
+//!   ASCII atom the re-derivation is EXACT (`char::is_uppercase` over ASCII is
+//!   precisely nucleo's `is_ascii_uppercase`), which covers the realistic input
+//!   space. For a non-ASCII atom nucleo consults a case-folding table rather than
+//!   the Unicode `Uppercase` property, so the two can differ on exotica such as
+//!   titlecase digraphs (`ǅ`), where nucleo would match case-sensitively and we
+//!   match case-insensitively.
+//!
+//! # Which nucleo API, and what is left of it
 //!
 //! `nucleo = 0.5.0` re-exports the finished low-level `nucleo-matcher` types
 //! (`Pattern`, `Atom`/`AtomKind`, `Matcher`, `Config`, `Utf32Str`,
 //! `CaseMatching`, `Normalization`). We deliberately use that synchronous
 //! low-level path rather than the high-level threaded `Nucleo`/`Injector`
-//! worker: at this scale (~170 sessions) a per-keystroke score pass is instant,
-//! and a synchronous matcher gives deterministic ranking (no background
-//! `tick()`/snapshot races) that is trivial to unit-test.
+//! worker: a synchronous matcher is deterministic (no background
+//! `tick()`/snapshot races) and trivial to unit-test.
+//!
+//! nucleo now backs exactly ONE thing: the highlight seam
+//! ([`match_indices`](SearchIndex::match_indices)), which marks the matched chars
+//! of a single visible row label — bounded, tiny work, and the one place a
+//! char-position answer is actually required. The filter no longer calls it.
 //!
 //! Matching is **substring, not fuzzy**: each keystroke rebuilds the small
 //! [`Pattern`] via [`Pattern::new`] with a fixed [`AtomKind::Substring`], so a
-//! query matches only where it appears as a contiguous run (case-insensitive,
-//! smart-case) — the atom kind is forced in code and never depends on user-typed
-//! atom syntax. Incrementality still comes from reusing one [`Matcher`] and the
-//! prebuilt haystack strings across keystrokes (only the tiny pattern is
-//! rebuilt); a `SessionsChanged` refresh rebuilds only the entries whose session
-//! actually changed.
+//! query marks only where it appears as a contiguous run (smart-case) — the atom
+//! kind is forced in code and never depends on user-typed atom syntax. The filter
+//! holds that rule independently, in [`atoms_match`]: memmem is substring search
+//! by nature, so the two agree on the atom kind without sharing a `Pattern`.
+//! Incrementality comes from the prebuilt haystack strings, untouched across
+//! keystrokes (only the tiny pattern and the atom finders are rebuilt); a
+//! `SessionsChanged` refresh rebuilds only the entries whose session actually
+//! changed.
 //!
-//! Everything nucleo-shaped is contained below. The rest of the crate sees only
-//! [`SearchIndex`], [`SearchMode`], and [`filter`].
+//! Everything nucleo-shaped is contained below, and so is every `memchr` call.
+//! The rest of the crate sees only [`SearchIndex`], [`SearchMode`], and
+//! [`filter`].
 //!
 //! # A note on `#[allow(dead_code)]`
 //!
@@ -45,12 +143,13 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
+use memchr::memmem;
 use nucleo::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo::{Config, Matcher, Utf32Str};
 
 use crate::store::Session;
 
-/// Which haystack the matcher scores against.
+/// Which haystack the filter searches.
 ///
 /// The two modes are the "one interface, two modes" contract: the default is
 /// name/label-only (instant, the common case); toggling in content widens the
@@ -74,7 +173,7 @@ impl SearchMode {
         }
     }
 
-    /// Whether this mode scores against `content_index` as well as the name.
+    /// Whether this mode searches `content_index` as well as the name.
     // The view layer matches the enum directly; this predicate is the tested
     // form of that check, kept for callers that want a boolean.
     #[allow(dead_code)]
@@ -86,25 +185,41 @@ impl SearchMode {
 
 /// One session's prebuilt, searchable haystacks, keyed by its stable id.
 ///
-/// Both haystack strings are built once (at [`SearchIndex::build`]/refresh) and
+/// Every haystack string is built once (at [`SearchIndex::build`]/refresh) and
 /// never touched during per-keystroke scoring — that is what keeps re-filter
 /// incremental. `fingerprint` is a cheap change key over the searchable fields
 /// so a refresh can reuse an unchanged entry instead of rebuilding it.
+///
+/// Each mode carries TWO haystacks, and BOTH are live: the CASED one (`name` /
+/// `content`) backs the case-SENSITIVE atom branch, and a LOWERCASED sibling
+/// (`name_lower` / `content_lower`) backs the case-INSENSITIVE branch — see the
+/// module docs. Neither is redundant: dropping the cased pair would break every
+/// uppercase-bearing query, and dropping the lowercased pair would force a
+/// re-casing allocation per entry per keystroke. The cost is ~2× the
+/// (64 KB-capped) content in memory.
 struct Entry {
     /// Stable session id; the key used to reuse entries across a refresh.
     session_id: String,
     /// Cheap hash of the searchable fields (`label` + `content_index`); an
     /// entry is rebuilt on refresh only when this changes.
     fingerprint: u64,
-    /// Haystack for [`SearchMode::NameOnly`] — the display label.
+    /// CASED haystack for [`SearchMode::NameOnly`] — the display label. Searched
+    /// by the case-sensitive atom branch.
     name: String,
-    /// Haystack for [`SearchMode::NameAndContent`] — label + `content_index`,
-    /// so a content-mode match still ranks a name hit (the name is included).
+    /// CASED haystack for [`SearchMode::NameAndContent`] — label + `content_index`,
+    /// so a content-mode query still matches a name hit (the name is included).
+    /// Searched by the case-sensitive atom branch.
     content: String,
+    /// LOWERCASED `name`, searched by the case-insensitive [`SearchMode::NameOnly`]
+    /// atom branch.
+    name_lower: String,
+    /// LOWERCASED `content`, searched by the case-insensitive
+    /// [`SearchMode::NameAndContent`] atom branch.
+    content_lower: String,
 }
 
 impl Entry {
-    /// Build both haystacks for `session`, tagging it with `fingerprint`.
+    /// Build every haystack for `session`, tagging it with `fingerprint`.
     fn build(session: &Session, fingerprint: u64) -> Self {
         let mut content =
             String::with_capacity(session.label.len() + 1 + session.content_index.len());
@@ -113,19 +228,84 @@ impl Entry {
             content.push('\n');
             content.push_str(&session.content_index);
         }
+        // Lowercase ONCE here (build/refresh), never per keystroke. `to_lowercase`
+        // is unicode-aware, so a case-insensitive atom matches mixed-case text.
+        // It folds per string, not per char, so it is not byte-for-byte nucleo's
+        // own folding — see the module-level divergence list for that narrow
+        // per-string vs. per-char exception.
+        let name_lower = session.label.to_lowercase();
+        let content_lower = content.to_lowercase();
         Entry {
             session_id: session.session_id.clone(),
             fingerprint,
             name: session.label.clone(),
             content,
+            name_lower,
+            content_lower,
         }
     }
 
-    /// The haystack this entry exposes for `mode`.
+    /// The CASED haystack for `mode` — searched by a case-SENSITIVE atom.
     fn haystack(&self, mode: SearchMode) -> &str {
         match mode {
             SearchMode::NameOnly => &self.name,
             SearchMode::NameAndContent => &self.content,
+        }
+    }
+
+    /// The LOWERCASED haystack for `mode` — searched by a case-INSENSITIVE atom.
+    fn gate_haystack(&self, mode: SearchMode) -> &str {
+        match mode {
+            SearchMode::NameOnly => &self.name_lower,
+            SearchMode::NameAndContent => &self.content_lower,
+        }
+    }
+}
+
+/// One query atom compiled to a SIMD substring searcher, carrying the smart-case
+/// decision nucleo would have made for **that atom**.
+///
+/// `case_sensitive` mirrors nucleo's [`CaseMatching::Smart`], which is decided
+/// **PER ATOM**, never per query: an atom matches case-sensitively iff it carries
+/// an uppercase char, so `foo BAR` searches case-insensitively for `foo` and
+/// case-sensitively for `BAR` in the one query. The flag rides the atom precisely
+/// so that stays true — a per-query decision would look equivalent and silently
+/// break every mixed-case query.
+///
+/// The needle is baked to match: lowercased bytes for a case-insensitive atom
+/// (searched against the entry's lowercased haystack), cased bytes for a
+/// case-sensitive one (searched against the cased haystack). Both haystacks are
+/// prebuilt, so a keystroke allocates nothing per entry.
+struct AtomFinder {
+    /// SIMD substring searcher over this atom's needle bytes. Owned
+    /// (`into_owned`) so it can outlive the query string it was built from and
+    /// live in the [`SearchIndex`] across keystrokes.
+    finder: memmem::Finder<'static>,
+    /// Whether this atom matches case-sensitively (it carries an uppercase char),
+    /// and therefore which of the entry's two haystacks it searches.
+    case_sensitive: bool,
+}
+
+impl AtomFinder {
+    /// Compile one (already unescaped, non-empty) query `atom`.
+    ///
+    /// The uppercase test re-derives nucleo's decision because `Atom::ignore_case`
+    /// is a private field — it cannot be read back. For an ASCII atom the
+    /// re-derivation is EXACT: `char::is_uppercase` over ASCII is precisely
+    /// nucleo's `is_ascii_uppercase` test. See the module docs for the narrow
+    /// non-ASCII divergence.
+    fn new(atom: &str) -> Self {
+        let case_sensitive = atom.chars().any(char::is_uppercase);
+        // Bake the needle into the case it will be searched in, so the scan
+        // itself is a raw byte compare with nothing to fold per keystroke.
+        let needle = if case_sensitive {
+            atom.to_string()
+        } else {
+            atom.to_lowercase()
+        };
+        AtomFinder {
+            finder: memmem::Finder::new(needle.as_bytes()).into_owned(),
+            case_sensitive,
         }
     }
 }
@@ -141,11 +321,11 @@ impl Entry {
 /// * a `SessionsChanged` reload calls [`refresh`](Self::refresh), which rebuilds
 ///   only the entries whose session changed (keyed by `session_id`) and keeps
 ///   the active query and mode;
-/// * [`results`](Self::results) returns the ranked indices into the *current*
+/// * [`results`](Self::results) returns the matching indices into the *current*
 ///   entry order (which mirrors the `sessions` slice last passed in).
 ///
 /// A one-shot [`filter`] free function is provided too for callers that just
-/// want a single ranked pass without holding an index.
+/// want a single pass without holding an index.
 pub struct SearchIndex {
     /// Per-session haystacks, in the same order as the last `sessions` slice.
     entries: Vec<Entry>,
@@ -153,13 +333,20 @@ pub struct SearchIndex {
     query: String,
     /// The active mode (preserved across refreshes).
     mode: SearchMode,
-    /// Reused scratch matcher — carries nucleo's internal allocations.
+    /// Reused scratch matcher — carries nucleo's internal allocations. Used ONLY
+    /// by the highlight seam ([`match_indices`](Self::match_indices)).
     matcher: Matcher,
     /// The active query compiled to [`AtomKind::Substring`] atoms — rebuilt per
-    /// keystroke by [`set_query`](Self::set_query) via [`Pattern::new`]. Shared
-    /// by both the filter and the highlight seam so they score with the identical
-    /// atom kind.
+    /// keystroke by [`set_query`](Self::set_query) via [`Pattern::new`]. Backs the
+    /// highlight seam ([`match_indices`](Self::match_indices)) ONLY; the filter
+    /// answers membership from `atom_finders` instead.
     pattern: Pattern,
+    /// The active query's atoms compiled to SIMD substring searchers, each
+    /// carrying its own smart-case decision, rebuilt once per keystroke by
+    /// [`set_query`](Self::set_query). This IS the filter: [`results`](Self::results)
+    /// reuses these across every entry so no per-entry needle setup or allocation
+    /// happens during a scan.
+    atom_finders: Vec<AtomFinder>,
     /// How many entries the last build/refresh actually (re)built. Instrumented
     /// so the partial-rebuild behaviour is observable (and unit-testable).
     last_rebuilt: usize,
@@ -180,8 +367,10 @@ impl SearchIndex {
             query: String::new(),
             mode: SearchMode::default(),
             matcher: Matcher::new(Config::DEFAULT),
-            // `Pattern::default()` has no atoms => treated as "empty query".
+            // `Pattern::default()` has no atoms => nothing to highlight.
             pattern: Pattern::default(),
+            // No atoms => the empty query, and `results` returns all.
+            atom_finders: Vec::new(),
             last_rebuilt: 0,
         }
     }
@@ -203,7 +392,7 @@ impl SearchIndex {
     /// the indices returned by [`results`](Self::results) address that slice.
     ///
     /// This is the `SessionsChanged` path: rebuild only what changed, keep the
-    /// query, re-rank.
+    /// query, re-filter.
     pub fn refresh(&mut self, sessions: &[Session]) {
         // Move the previous entries into a lookup by stable id so we can reuse
         // the ones that did not change.
@@ -235,22 +424,22 @@ impl SearchIndex {
         // untouched: the query survives the refresh.
     }
 
-    /// Set the active query, rebuilding the (small) substring [`Pattern`].
+    /// Set the active query, rebuilding the (small) substring [`Pattern`] and the
+    /// per-atom SIMD finders.
     ///
-    /// Called once per keystroke. Only the [`Pattern`] is rebuilt — the prebuilt
-    /// haystacks are never touched here.
+    /// Called once per keystroke. Only these two tiny structures are rebuilt — the
+    /// prebuilt haystacks are never touched here.
     ///
     /// The pattern is built with [`AtomKind::Substring`] via [`Pattern::new`]
-    /// rather than the fuzzy default, so a query matches ONLY where it appears as
-    /// a contiguous run of characters (literal, no scattered subsequence). Case
-    /// stays smart-case ([`CaseMatching::Smart`]). `Pattern::new` fixes the atom
-    /// kind programmatically and does NOT interpret the `'`/`^`/`$`/`!` atom
-    /// syntax, so substring matching never depends on what the user types; it
-    /// only splits on whitespace (so `foo bar` requires both `foo` and `bar` as
-    /// substrings, matching the previous whitespace semantics). Both the filter
-    /// ([`results`](Self::results)) and the highlight seam
-    /// ([`match_indices`](Self::match_indices)) score against this one
-    /// `self.pattern`, so they always agree on the atom kind.
+    /// rather than the fuzzy default, so the highlight marks ONLY a contiguous run
+    /// of characters (literal, no scattered subsequence). Case stays smart-case
+    /// ([`CaseMatching::Smart`]). `Pattern::new` fixes the atom kind
+    /// programmatically and does NOT interpret the `'`/`^`/`$`/`!` atom syntax, so
+    /// matching never depends on what the user types; it only splits on whitespace
+    /// (so `foo bar` requires both `foo` and `bar` as substrings). The filter
+    /// enforces the same substring rule independently — memmem searches substrings
+    /// by nature — and [`gate_atoms`] mirrors nucleo's splitter so both demand the
+    /// same atoms.
     pub fn set_query(&mut self, query: &str) {
         self.query.clear();
         self.query.push_str(query);
@@ -258,16 +447,34 @@ impl SearchIndex {
         // path (`exact.rs::substring_match_non_ascii`) scans candidate starts
         // only up to `haystack.len() - needle.len()` EXCLUSIVE (the ASCII memmem
         // path correctly uses `+ 1`). So a substring match that ends at the very
-        // LAST char of a haystack containing any non-ASCII char is missed. It is
-        // narrow (ASCII haystacks are unaffected) and, because the filter and the
-        // highlight both score this one pattern, it applies to them IDENTICALLY —
-        // they never disagree. Living with it keeps nucleo pinned + isolated.
+        // LAST char of a haystack containing any non-ASCII char is missed.
+        //
+        // The filter and the highlight DIVERGE here, and that is accepted
+        // deliberately. They used to score this one `Pattern`, so the quirk hit
+        // both identically; now the memmem filter FINDS such a match while this
+        // pattern still misses it, so the row can appear with no highlight. The
+        // filter is the more CORRECT of the two — it errs toward MORE matches, and
+        // an un-highlighted row is already an expected sight (a content-only match
+        // shows none, by design). It also needs a non-ASCII haystack AND a match
+        // ending at its very last char. Reproducing the upstream bug in the filter
+        // to keep the two symmetrical would forfeit a real correctness gain to
+        // protect a comment; the divergence is pinned by a test instead
+        // (`non_ascii_tail_match_filters_in_though_nucleo_highlight_misses_it`).
         self.pattern = Pattern::new(
             query,
             CaseMatching::Smart,
             Normalization::Smart,
             AtomKind::Substring,
         );
+        // Compile the filter's substring searchers ONCE per keystroke, reused
+        // across every entry by the scan in `matching_candidates`. Split the query
+        // into the same atoms nucleo requires and bake each one's smart-case
+        // decision into its own finder.
+        self.atom_finders = gate_atoms(query)
+            .into_iter()
+            .filter(|atom| !atom.is_empty())
+            .map(|atom| AtomFinder::new(&atom))
+            .collect();
     }
 
     /// The active query text.
@@ -325,38 +532,81 @@ impl SearchIndex {
         self.last_rebuilt
     }
 
-    /// Rank the current sessions against the active query and mode.
+    /// Match the current sessions against the active query and mode.
     ///
-    /// Returns entry indices (into the current order, i.e. the last `sessions`
-    /// slice) sorted best-match-first. An empty query returns every session in
-    /// the stable input order.
-    pub fn results(&mut self) -> Vec<usize> {
-        // No atoms => empty/whitespace query: return all in stable order.
-        if self.pattern.atoms.is_empty() {
-            return (0..self.entries.len()).collect();
+    /// Returns the entry indices (into the current order, i.e. the last
+    /// `sessions` slice) that match, in the input order. An empty query returns
+    /// every session.
+    ///
+    /// A thin wrapper over [`matching_candidates`](Self::matching_candidates)
+    /// with EVERY entry as the candidate set;
+    /// [`results_within`](Self::results_within) is the same core over a
+    /// caller-supplied subset.
+    // The running TUI now matches a scope-limited candidate set via
+    // `results_within`, so this whole-index variant is no longer on the bin
+    // runtime path; it is retained for the one-shot `filter` convenience and the
+    // membership/mode/refresh unit tests that drive it directly.
+    #[allow(dead_code)]
+    pub fn results(&self) -> Vec<usize> {
+        let all: Vec<usize> = (0..self.entries.len()).collect();
+        self.matching_candidates(&all)
+    }
+
+    /// Match a SCOPE-LIMITED candidate set against the active query and mode.
+    ///
+    /// `candidates` are entry indices (into the current order, mirroring the
+    /// `sessions`/`scoped` slices the TUI holds); only they are scanned, so an
+    /// out-of-scope session is never searched just to be discarded afterward.
+    /// Returns the matching candidates in the order given.
+    ///
+    /// Fail-soft: any candidate index outside the current entries is silently
+    /// skipped (never a panic / out-of-bounds), consistent with the crate's
+    /// fail-soft posture. An empty (or whitespace-only) query returns the
+    /// in-range candidates unchanged, mirroring [`results`](Self::results)'s
+    /// empty-query "return all" behaviour over its own candidate set.
+    pub fn results_within(&self, candidates: &[usize]) -> Vec<usize> {
+        self.matching_candidates(candidates)
+    }
+
+    /// Shared membership core behind [`results`](Self::results) (every entry) and
+    /// [`results_within`](Self::results_within) (a scope-limited subset).
+    ///
+    /// Answers membership for exactly the given `candidates` (entry indices) and
+    /// returns the matches **in the order given** — this deliberately imposes no
+    /// order of its own. `App::order_filtered` owns display order, re-sorting
+    /// every result by a tie-free total order, which is precisely why ranking them
+    /// here would be wasted work (see the module docs). Out-of-range candidate
+    /// indices are skipped fail-soft, and an empty query (no atoms)
+    /// short-circuits to the in-range candidates.
+    fn matching_candidates(&self, candidates: &[usize]) -> Vec<usize> {
+        // No atoms => empty/whitespace query: return the in-range candidates in
+        // the order given (mirrors results()'s stable-order "return all" case).
+        if self.atom_finders.is_empty() {
+            return candidates
+                .iter()
+                .copied()
+                .filter(|&i| i < self.entries.len())
+                .collect();
         }
 
-        // Borrow the three fields disjointly so the scoring closure can hold an
-        // immutable pattern/entries borrow and a mutable matcher borrow at once.
         let mode = self.mode;
-        let pattern = &self.pattern;
-        let matcher = &mut self.matcher;
         let entries = &self.entries;
+        let finders = &self.atom_finders;
 
-        let mut buf: Vec<char> = Vec::new();
-        let mut scored: Vec<(usize, u32)> = entries
+        candidates
             .iter()
-            .enumerate()
-            .filter_map(|(i, entry)| {
-                let haystack = Utf32Str::new(entry.haystack(mode), &mut buf);
-                pattern.score(haystack, matcher).map(|score| (i, score))
+            .copied()
+            .filter(|&i| {
+                // Fail-soft: skip any candidate index out of range (never panic).
+                entries.get(i).is_some_and(|entry| {
+                    // A SIMD byte-substring scan per atom, over whichever haystack
+                    // that atom's smart-case decision calls for. No UTF-32
+                    // conversion, no allocation, no scoring: membership is the
+                    // only bit anything downstream reads.
+                    atoms_match(entry.haystack(mode), entry.gate_haystack(mode), finders)
+                })
             })
-            .collect();
-
-        // Score descending; ties broken by original index so ordering is stable
-        // and deterministic (keeps the repo->branch->timestamp input order).
-        scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        scored.into_iter().map(|(i, _)| i).collect()
+            .collect()
     }
 
     /// The CHAR indices within `display` that the active query matches.
@@ -416,18 +666,84 @@ fn fingerprint(session: &Session) -> u64 {
     hasher.finish()
 }
 
-/// One-shot substring filter: rank `sessions` against `query` in `mode`.
+/// Split `query` into the substring atoms nucleo's [`Pattern::new`] would require,
+/// so the filter demands exactly the atoms the highlight seam does.
 ///
-/// Returns session indices INTO `sessions`, sorted best-match-first. An empty
-/// (or whitespace-only) query returns every index in the stable input order.
-/// `mode` is the single toggle between name-only and name+content matching.
+/// Mirrors nucleo's `pattern_atoms` splitter plus its substring-atom unescape:
+/// split on an ASCII space that is NOT escaped by an immediately preceding
+/// backslash, drop the empty atoms, and unescape `\ ` → ` ` inside each atom (any
+/// other backslash stays literal, exactly as nucleo keeps it in the needle).
+/// Backslash-free queries — the entire realistic input space for the search box —
+/// reduce to a plain space split; the escape handling is what keeps the filter
+/// from wrongly rejecting a phrase typed with an escaped space.
+///
+/// The returned atoms are CASED: the smart-case decision is made per atom by
+/// [`AtomFinder::new`], which needs the original casing to make it.
+fn gate_atoms(query: &str) -> Vec<String> {
+    let mut atoms: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut prev_backslash = false;
+    for c in query.chars() {
+        if c == ' ' {
+            if prev_backslash {
+                // Escaped space: turn the pending "\ " into a literal space so the
+                // atom is the phrase nucleo will look for, not two atoms.
+                current.pop();
+                current.push(' ');
+                prev_backslash = false;
+            } else {
+                // Unescaped space: an atom boundary. Drop empties (runs of spaces).
+                if !current.is_empty() {
+                    atoms.push(std::mem::take(&mut current));
+                }
+            }
+            continue;
+        }
+        current.push(c);
+        prev_backslash = c == '\\';
+    }
+    if !current.is_empty() {
+        atoms.push(current);
+    }
+    atoms
+}
+
+/// True iff EVERY atom occurs as a byte substring of the haystack its own
+/// smart-case decision selects — `cased` for a case-sensitive atom, `lowercased`
+/// for a case-insensitive one.
+///
+/// This is the whole filter. `memchr::memmem` is SIMD substring search over raw
+/// bytes: no UTF-8 → UTF-32 conversion and no per-entry allocation. Byte
+/// substring is exactly char substring here, since UTF-8 is self-synchronizing —
+/// a valid needle can only ever match at a char boundary.
+///
+/// The two haystacks must be the SAME text differing only in case; the per-atom
+/// choice between them is what makes `foo BAR` fold `foo` but not `BAR`. Every
+/// atom is required (AND semantics). An empty `finders` slice trivially passes —
+/// the caller handles the empty-query "return all" case before reaching here.
+fn atoms_match(cased: &str, lowercased: &str, finders: &[AtomFinder]) -> bool {
+    finders.iter().all(|atom| {
+        let haystack = if atom.case_sensitive {
+            cased
+        } else {
+            lowercased
+        };
+        atom.finder.find(haystack.as_bytes()).is_some()
+    })
+}
+
+/// One-shot substring filter: match `sessions` against `query` in `mode`.
+///
+/// Returns the session indices INTO `sessions` that match, in the input order.
+/// An empty (or whitespace-only) query returns every index. `mode` is the single
+/// toggle between name-only and name+content matching.
 ///
 /// This builds a throwaway [`SearchIndex`]; long-lived callers (the TUI) should
 /// hold a [`SearchIndex`] and drive it incrementally instead.
 ///
 /// The TUI holds a live index rather than calling this, so it is unused on the
-/// bin runtime path; it is the primary driver of the ranking/mode unit tests and
-/// a documented one-shot convenience, hence retained + `dead_code` allowed.
+/// bin runtime path; it is the primary driver of the membership/mode unit tests
+/// and a documented one-shot convenience, hence retained + `dead_code` allowed.
 #[allow(dead_code)]
 #[must_use]
 pub fn filter(query: &str, sessions: &[Session], mode: SearchMode) -> Vec<usize> {
@@ -440,7 +756,56 @@ pub fn filter(query: &str, sessions: &[Session], mode: SearchMode) -> Vec<usize>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
+
+    /// Collect matched indices into a SET.
+    ///
+    /// The filter's contract is WHICH entries match, never in what order: it
+    /// returns candidates in the order given and `App::order_filtered` imposes
+    /// display order. Asserting on a set is what keeps these tests pinning the
+    /// contract rather than an implementation detail — see
+    /// [`filter_membership_ignores_match_closeness`].
+    fn as_set(indices: &[usize]) -> BTreeSet<usize> {
+        indices.iter().copied().collect()
+    }
+
+    /// The match set nucleo ITSELF produces for `query` — the pre-change filter
+    /// path, reconstructed.
+    ///
+    /// Before this module answered membership with memmem, the filter scored
+    /// every entry's CASED haystack with this exact `Pattern` and kept the
+    /// `Some`s. Keeping that path alive as an ORACLE is what makes the parity
+    /// claim a proof: hand-written expectations would encode whatever the author
+    /// believed nucleo's smart-case rules to be, which is precisely the thing
+    /// under test (the `NPX` trap is a measured case where that belief is wrong).
+    /// Asking nucleo cannot be wrong about nucleo.
+    ///
+    /// The deliberate divergences are NOT covered by this oracle and must be kept
+    /// out of any corpus compared against it — see the module docs, and
+    /// [`non_ascii_tail_match_filters_in_though_nucleo_highlight_misses_it`].
+    fn nucleo_match_set(query: &str, sessions: &[Session], mode: SearchMode) -> BTreeSet<usize> {
+        let pattern = Pattern::new(
+            query,
+            CaseMatching::Smart,
+            Normalization::Smart,
+            AtomKind::Substring,
+        );
+        if pattern.atoms.is_empty() {
+            return (0..sessions.len()).collect();
+        }
+        let mut matcher = Matcher::new(Config::DEFAULT);
+        let mut buf: Vec<char> = Vec::new();
+        sessions
+            .iter()
+            .map(|s| Entry::build(s, fingerprint(s)))
+            .enumerate()
+            .filter_map(|(i, entry)| {
+                let haystack = Utf32Str::new(entry.haystack(mode), &mut buf);
+                pattern.score(haystack, &mut matcher).map(|_| i)
+            })
+            .collect()
+    }
 
     /// Build a synthetic session with a given id, label, and content text.
     fn session(id: &str, label: &str, content: &str) -> Session {
@@ -492,28 +857,33 @@ mod tests {
         );
     }
 
-    /// A closer match must rank above a looser one.
+    /// Match CLOSENESS decides membership not at all — and never decided what
+    /// the user saw either.
+    ///
+    /// This test used to assert that the exact `cat` RANKED ABOVE the mid-word
+    /// `concatenate`. That rank had no runtime consumer and provably could not
+    /// reach the screen: `App::recompute_filtered` hands every result straight to
+    /// `App::order_filtered`, which re-sorts by `(Reverse(timestamp),
+    /// session_id)` — a TOTAL order with zero ties (measured: 66 entries → 66
+    /// distinct keys), so not even sort stability could leak the old rank out.
+    /// The property was pinned for its own sake, which is exactly why the filter
+    /// could stop scoring with nucleo at no user-visible cost. The name is kept
+    /// pointed at that finding so the next reader does not "restore" a rank
+    /// nothing reads. What IS contractual is MEMBERSHIP: both spellings match.
     #[test]
-    fn ranking_orders_closer_match_above_looser() {
+    fn filter_membership_ignores_match_closeness() {
         // Both contain "cat" as a CONTIGUOUS substring: s0 mid-word inside
-        // "con[cat]enate", s1 as the exact short word. The exact/word-boundary
-        // hit must rank first.
+        // "con[cat]enate", s1 as the exact short word.
         let sessions = [
             session("far", "concatenate helper", ""),
             session("near", "cat", ""),
         ];
 
-        let ranked = filter("cat", &sessions, SearchMode::NameOnly);
-        assert!(
-            ranked.contains(&0) && ranked.contains(&1),
-            "both should match"
-        );
-
-        let pos_far = ranked.iter().position(|&i| i == 0).unwrap();
-        let pos_near = ranked.iter().position(|&i| i == 1).unwrap();
-        assert!(
-            pos_near < pos_far,
-            "the exact 'cat' must rank above the mid-word 'concatenate': {ranked:?}"
+        let matched = filter("cat", &sessions, SearchMode::NameOnly);
+        assert_eq!(
+            as_set(&matched),
+            BTreeSet::from([0, 1]),
+            "a mid-word hit and an exact hit are equally members: {matched:?}"
         );
     }
 
@@ -803,6 +1173,510 @@ mod tests {
             index.last_rebuilt(),
             built,
             "set_query must not rebuild the haystack"
+        );
+    }
+
+    /// `gate_atoms` splits a query into the same atoms nucleo requires: on
+    /// unescaped ASCII spaces, dropping empties, and unescaping `\ ` → ` `.
+    #[test]
+    fn gate_atoms_splits_like_nucleo() {
+        assert_eq!(gate_atoms("foo"), vec!["foo"]);
+        assert_eq!(gate_atoms("foo bar"), vec!["foo", "bar"]);
+        // Runs of spaces produce no empty atoms.
+        assert_eq!(gate_atoms("  foo   bar  "), vec!["foo", "bar"]);
+        // Empty / whitespace-only yields no atoms (the "match all" case).
+        assert!(gate_atoms("").is_empty());
+        assert!(gate_atoms("   ").is_empty());
+        // An escaped space keeps the phrase as ONE atom (nucleo's `\ ` unescape),
+        // so the gate looks for the literal "foo bar" rather than two atoms.
+        assert_eq!(gate_atoms(r"foo\ bar"), vec!["foo bar"]);
+        // A stray backslash stays literal in the atom, exactly as nucleo keeps it.
+        assert_eq!(gate_atoms(r"a\b"), vec![r"a\b".to_string()]);
+    }
+
+    /// `atoms_match` requires every atom as a BYTE substring (not a subsequence)
+    /// of the haystack its own case decision selects; an empty atom list
+    /// trivially passes.
+    #[test]
+    fn atoms_match_requires_every_atom_as_byte_substring() {
+        let finders: Vec<AtomFinder> = ["foo", "bar"].iter().map(|a| AtomFinder::new(a)).collect();
+        // All-lowercase atoms are case-insensitive, so they read the lowercased
+        // haystack; here the two haystacks carry the same text.
+        assert!(atoms_match("a foo and a bar", "a foo and a bar", &finders));
+        assert!(
+            !atoms_match("only foo here", "only foo here", &finders),
+            "a missing atom fails the match"
+        );
+        // No atoms => trivially passes (the empty query is handled earlier).
+        assert!(atoms_match("anything", "anything", &[]));
+        // Substring, not subsequence: "ac" is not a byte substring of "abc".
+        let ac: Vec<AtomFinder> = vec![AtomFinder::new("ac")];
+        assert!(
+            !atoms_match("abc", "abc", &ac),
+            "a scattered subsequence must not match"
+        );
+
+        // The PER-ATOM haystack selection. The two haystacks are fed DELIBERATELY
+        // different text ("a BAR" vs "a bar"), because identical arguments would
+        // pass whichever haystack the code picked and could not tell the branches
+        // apart — the exact fixture mistake that hides an inclusion regression.
+        let upper: Vec<AtomFinder> = vec![AtomFinder::new("BAR")];
+        assert!(
+            atoms_match("a BAR", "a bar", &upper),
+            "an uppercase atom is case-SENSITIVE and reads the cased haystack"
+        );
+        assert!(
+            !atoms_match("a bar", "a bar", &upper),
+            "a case-sensitive atom must not match lowercase text"
+        );
+        let lower: Vec<AtomFinder> = vec![AtomFinder::new("bar")];
+        assert!(
+            atoms_match("a BAR", "a bar", &lower),
+            "a lowercase atom is case-INSENSITIVE and reads the lowercased haystack"
+        );
+    }
+
+    /// Multi-atom content query: two whitespace-separated atoms present only in
+    /// the CONTENT match in name+content mode; if only one atom is present, the
+    /// entry is excluded (every atom is required).
+    #[test]
+    fn multi_atom_content_query_requires_all_atoms() {
+        let sessions = [session(
+            "s0",
+            "unrelated title",
+            "the deploy pipeline ran green",
+        )];
+        assert_eq!(
+            filter("deploy pipeline", &sessions, SearchMode::NameAndContent),
+            vec![0],
+            "both atoms present only in content must match in name+content mode"
+        );
+        assert!(
+            filter("deploy rollback", &sessions, SearchMode::NameAndContent).is_empty(),
+            "a missing atom (rollback) must exclude the entry"
+        );
+    }
+
+    /// The gate is case-insensitive over content: a lowercase query matches
+    /// mixed-case content (nucleo agrees, since a lowercase query is smart-case
+    /// insensitive), through the prebuilt lowercased haystack.
+    #[test]
+    fn gate_is_case_insensitive_over_content() {
+        let sessions = [session("s0", "notes", "Deployed the API Gateway")];
+        assert_eq!(
+            filter("gateway", &sessions, SearchMode::NameAndContent),
+            vec![0],
+            "a lowercase query matches mixed-case content case-insensitively"
+        );
+    }
+
+    /// A query matches an ASCII substring embedded in NON-ASCII content without
+    /// panicking, kept off the tail so the upstream non-ASCII substring
+    /// off-by-one (noted in `set_query`) never applies.
+    #[test]
+    fn non_ascii_content_substring_matches_without_panic() {
+        let sessions = [session(
+            "s0",
+            "café notes",
+            "réfléchi ☕ the deploy pipeline shipped ☕ fin",
+        )];
+        // ASCII query, ASCII substring mid-way through non-ASCII content: the
+        // memmem filter finds it by byte scan. Not at the tail.
+        assert_eq!(
+            filter("deploy", &sessions, SearchMode::NameAndContent),
+            vec![0],
+            "an ASCII substring inside non-ASCII content matches"
+        );
+        // A non-ASCII query over the non-ASCII label also matches without
+        // panicking (again not at the tail: " notes" follows).
+        assert_eq!(
+            filter("café", &sessions, SearchMode::NameOnly),
+            vec![0],
+            "a non-ASCII substring at the label head matches"
+        );
+    }
+
+    /// A name hit and a content-only hit are BOTH members in name+content mode —
+    /// where the hit landed is not a contract.
+    ///
+    /// This test used to assert the name hit RANKED ABOVE the content-only hit,
+    /// under a heading claiming ranking was "preserved through the gate". Same
+    /// finding as [`filter_membership_ignores_match_closeness`]: that order was
+    /// re-sorted away by `App::order_filtered` before any of it reached a row, so
+    /// it pinned nothing a user could observe. Both entries being INCLUDED is the
+    /// real contract, and it is the one that would actually break if name+content
+    /// mode stopped folding the label into the content haystack.
+    #[test]
+    fn membership_includes_both_name_hit_and_content_only_hit() {
+        // s0 carries "deploy" in its NAME; s1 only deep in its CONTENT.
+        let sessions = [
+            session("name_hit", "deploy dashboard", "unrelated body prose"),
+            session(
+                "content_hit",
+                "weekly status",
+                "a long note that eventually mentions deploy near the end",
+            ),
+        ];
+        let matched = filter("deploy", &sessions, SearchMode::NameAndContent);
+        assert_eq!(
+            as_set(&matched),
+            BTreeSet::from([0, 1]),
+            "a name hit and a content-only hit are both members: {matched:?}"
+        );
+    }
+
+    /// PARITY: the memmem filter returns nucleo's OWN match set, across every
+    /// query shape that has its own code path, in BOTH modes.
+    ///
+    /// Proved against [`nucleo_match_set`] — the pre-change scoring path itself —
+    /// rather than against hand-written expectations, so the assertion cannot
+    /// quietly encode the author's belief about smart case instead of nucleo's
+    /// behaviour.
+    ///
+    /// The corpus is built so the module's documented divergences never fire (no
+    /// accent-folded match, no match on a non-ASCII haystack's last char); those
+    /// are pinned separately and deliberately, not swept in here.
+    #[test]
+    fn membership_matches_nucleo_across_query_shapes_and_modes() {
+        let sessions = [
+            // Lowercase `npx`, content-only: the uppercase trap's bait.
+            session("s0", "build notes", "ran npx create-react-app here"),
+            // Uppercase `NPX` in content, and `Npx` in a label.
+            session("s1", "release checklist", "the NPX shim is pinned"),
+            session("s2", "Npx wrapper", "unrelated body prose"),
+            // The per-atom smart-case pair, for the query `foo BAR`. The capital
+            // `F` in the LABEL is load-bearing and must not be "tidied" to `foo`:
+            // it is the only thing that makes per-ATOM and per-QUERY case
+            // distinguishable. Correct (per atom): `foo` folds and matches `Foo`,
+            // `BAR` does not fold and matches s3 only. Broken (per query): the
+            // uppercase `BAR` turns the WHOLE query case-sensitive, `foo` stops
+            // matching `Foo`, and s3 silently drops out. With a lowercase `foo`
+            // label both readings agree and the bug walks straight through.
+            session("s3", "Foo dashboard", "the BAR chart shipped"),
+            session("s4", "Foo dashboard", "the bar chart shipped"),
+            // An escaped-space phrase, plus the two atoms apart (never adjacent).
+            session("s5", "deploy pipeline notes", "shipped green"),
+            session(
+                "s6",
+                "pipeline for deploy",
+                "atoms present but not adjacent",
+            ),
+            // Non-ASCII haystack, matched away from the tail.
+            session("s7", "café notes", "réfléchi ☕ the deploy ran ☕ fin"),
+            // Matches nothing.
+            session("s8", "unrelated", "nothing to see"),
+        ];
+
+        let queries = [
+            "npx",               // all-lowercase
+            "NPX",               // uppercase (smart-case => case-sensitive)
+            "Npx",               // mixed-case
+            "foo BAR",           // mixed-case MULTI-atom: per-atom smart case
+            "deploy pipeline",   // multi-atom
+            r"deploy\ pipeline", // escaped space => ONE atom, the literal phrase
+            "café",              // non-ASCII query
+            "",                  // empty
+            "   ",               // whitespace-only
+            "zzzqqq",            // matches nothing
+        ];
+
+        for query in queries {
+            for mode in [SearchMode::NameOnly, SearchMode::NameAndContent] {
+                assert_eq!(
+                    as_set(&filter(query, &sessions, mode)),
+                    nucleo_match_set(query, &sessions, mode),
+                    "membership must equal nucleo's match set for {query:?} in {mode:?}"
+                );
+            }
+        }
+    }
+
+    /// The measured INCLUSION-REGRESSION trap: an uppercase-bearing query must
+    /// return the EMPTY set over a corpus whose lowercased haystack is full of
+    /// matches.
+    ///
+    /// This is not a hypothetical. Against the real corpus, `NPX` finds **6**
+    /// entries in the lowercased haystack and nucleo matches **0** — so a filter
+    /// that answered from the lowercased haystack regardless of case (or branched
+    /// on case per QUERY rather than per ATOM) would wrongly surface 6 rows.
+    /// nucleo's `CaseMatching::Smart` makes an uppercase-bearing atom
+    /// case-SENSITIVE, and this test fails loudly if that branch ever regresses.
+    #[test]
+    fn uppercase_query_excludes_lowercase_only_matches() {
+        let sessions = [
+            session("s0", "build notes", "ran npx create-react-app"),
+            session("s1", "more notes", "npx tsc --noEmit"),
+        ];
+
+        // The bait: lowercased, every entry matches. If this ever stops holding,
+        // the assertions below would pass vacuously over an empty corpus.
+        assert_eq!(
+            as_set(&filter("npx", &sessions, SearchMode::NameAndContent)),
+            BTreeSet::from([0, 1]),
+            "the lowercase query must match both entries"
+        );
+
+        // The trap: uppercase atoms are case-sensitive, and no entry carries
+        // `NPX`/`Npx` in its cased text.
+        for query in ["NPX", "Npx"] {
+            let matched = filter(query, &sessions, SearchMode::NameAndContent);
+            assert!(
+                matched.is_empty(),
+                "{query:?} is case-sensitive under smart case and must match nothing, got {matched:?}"
+            );
+        }
+    }
+
+    /// The ACCEPTED divergence: a match ending at the very LAST char of a
+    /// non-ASCII haystack is found by the filter but missed by nucleo's
+    /// highlight, so such a row renders with no highlight.
+    ///
+    /// Upstream `nucleo-matcher` 0.3.1 scans candidate starts only to
+    /// `haystack.len() - needle.len()` EXCLUSIVE on its non-ASCII substring path
+    /// (`exact.rs::substring_match_non_ascii`), so it never considers the final
+    /// start position. Filter and highlight used to share one `Pattern` and so
+    /// missed it identically; they no longer do.
+    ///
+    /// This is tolerated on purpose, per the resolved design decision. The filter
+    /// is the MORE CORRECT of the two — it errs toward more matches — the case
+    /// needs a non-ASCII haystack AND a tail-anchored match, and an un-highlighted
+    /// row is already an expected sight (a content-only match shows none, by
+    /// design). Reproducing the upstream bug in the filter to keep the two
+    /// symmetrical was explicitly rejected. This test exists so the divergence can
+    /// never become silent drift.
+    #[test]
+    fn non_ascii_tail_match_filters_in_though_nucleo_highlight_misses_it() {
+        // "café fin": non-ASCII (é), and "fin" ends at the very last char.
+        let sessions = [session("s0", "café fin", "")];
+
+        assert_eq!(
+            filter("fin", &sessions, SearchMode::NameOnly),
+            vec![0],
+            "the memmem filter finds a tail-anchored match in a non-ASCII haystack"
+        );
+
+        // The pre-change filter path DROPPED this row outright: this is a
+        // deliberate inclusion change, not merely a highlight quirk.
+        assert!(
+            nucleo_match_set("fin", &sessions, SearchMode::NameOnly).is_empty(),
+            "the old nucleo-scored filter excluded this row; the memmem filter keeps it"
+        );
+
+        let mut index = SearchIndex::new();
+        index.set_query("fin");
+        assert!(
+            index.match_indices("café fin").is_empty(),
+            "nucleo's highlight misses the same match (upstream tail off-by-one), \
+             so the row draws unhighlighted — accepted, not a bug to fix here"
+        );
+
+        // The divergence is confined to the tail: move the match off the last
+        // char and nucleo agrees again, which is what makes it narrow.
+        let off_tail = [session("s0", "café fin.", "")];
+        assert_eq!(
+            filter("fin", &off_tail, SearchMode::NameOnly),
+            vec![0],
+            "filter still matches one char off the tail"
+        );
+        index.set_query("fin");
+        assert_eq!(
+            index.match_indices("café fin."),
+            vec![5, 6, 7],
+            "and nucleo highlights it once the match is not tail-anchored"
+        );
+    }
+
+    /// A refresh rebuilds the lowercased GATE haystack only for changed sessions:
+    /// the reused entry keeps a working gate, and the rebuilt one reflects the
+    /// new text.
+    #[test]
+    fn refresh_rebuilds_lowercased_gate_only_for_changed_session() {
+        let v1 = [
+            session("s1", "alpha", "steady gate body"),
+            session("s2", "beta", "changing gate body"),
+        ];
+        let mut index = SearchIndex::build(&v1);
+        index.set_mode(SearchMode::NameAndContent);
+
+        // v2: s1 is byte-identical (reused); s2's content changed.
+        let v2 = [
+            session("s1", "alpha", "steady gate body"),
+            session("s2", "beta", "now mentions redeploy"),
+        ];
+        index.refresh(&v2);
+        assert_eq!(
+            index.last_rebuilt(),
+            1,
+            "only the changed session's lowercased haystack is rebuilt"
+        );
+
+        // The REUSED entry still matches through its preserved lowercased gate.
+        index.set_query("steady");
+        assert_eq!(
+            index.results(),
+            vec![0],
+            "the reused session still gates via its preserved lowercased haystack"
+        );
+
+        // The REBUILT entry reflects its new content through the gate.
+        index.set_query("redeploy");
+        assert_eq!(
+            index.results(),
+            vec![1],
+            "the rebuilt session matches its new content"
+        );
+    }
+
+    /// `results_within` ranks ONLY the given candidate entries: a session that
+    /// matches the query but is absent from `candidates` is excluded, even though
+    /// the whole-index `results` surfaces it.
+    #[test]
+    fn results_within_restricts_to_candidates() {
+        let sessions = [
+            session("s0", "deploy dashboard", ""),
+            session("s1", "deploy pipeline", ""),
+            session("s2", "unrelated notes", ""),
+        ];
+        let mut index = SearchIndex::build(&sessions);
+        index.set_query("deploy");
+
+        // Whole-index results surface both matches (s0, s1), not s2.
+        let all = index.results();
+        assert!(
+            all.contains(&0) && all.contains(&1) && !all.contains(&2),
+            "results ranks both matching entries and excludes the non-match: {all:?}"
+        );
+
+        // Restricting the candidate set to {1, 2} drops the matching s0 (not a
+        // candidate) and the non-matching s2, leaving only s1.
+        assert_eq!(
+            index.results_within(&[1, 2]),
+            vec![1],
+            "results_within keeps only candidates that match; the out-of-set s0 is excluded"
+        );
+    }
+
+    /// Parity: `results_within` over EVERY index yields the same match SET as the
+    /// whole-index `results` for the same query and mode.
+    ///
+    /// Set-equality, not sequence-equality: the two entry points share one core
+    /// and the contract they must agree on is which entries match. Asserting the
+    /// sequence would additionally pin the traversal order of a list
+    /// `App::order_filtered` re-sorts anyway.
+    #[test]
+    fn results_within_over_all_indices_matches_results() {
+        let sessions = [
+            session("s0", "deploy dashboard", "shipped the release"),
+            session(
+                "s1",
+                "weekly status",
+                "a note mentioning deploy near the end",
+            ),
+            session("s2", "unrelated", "nothing to see"),
+        ];
+        let mut index = SearchIndex::build(&sessions);
+        index.set_mode(SearchMode::NameAndContent);
+        index.set_query("deploy");
+
+        let all: Vec<usize> = (0..sessions.len()).collect();
+        let within = index.results_within(&all);
+        assert_eq!(
+            as_set(&within),
+            as_set(&index.results()),
+            "results_within over all indices must match results for the same query/mode"
+        );
+        assert_eq!(
+            as_set(&within),
+            BTreeSet::from([0, 1]),
+            "and both must be the real match set, not a shared empty one: {within:?}"
+        );
+    }
+
+    /// An empty candidate slice ranks nothing, and an out-of-range candidate
+    /// index is skipped fail-soft (never a panic / out-of-bounds).
+    #[test]
+    fn results_within_empty_and_out_of_range_candidates_are_safe() {
+        let sessions = [
+            session("s0", "deploy dashboard", ""),
+            session("s1", "deploy pipeline", ""),
+        ];
+        let mut index = SearchIndex::build(&sessions);
+        index.set_query("deploy");
+
+        // No candidates => no results, even though the query matches entries.
+        assert!(
+            index.results_within(&[]).is_empty(),
+            "an empty candidate set yields no results"
+        );
+
+        // Out-of-range indices (>= len) are skipped without panicking; only the
+        // valid, matching candidate survives.
+        assert_eq!(
+            index.results_within(&[0, 99, 42]),
+            vec![0],
+            "out-of-range candidate indices are skipped fail-soft"
+        );
+    }
+
+    /// The gate contract holds INSIDE a restricted candidate set: multi-atom
+    /// (every atom required), case-insensitive, and substring — not a scattered
+    /// subsequence.
+    #[test]
+    fn results_within_preserves_gate_semantics() {
+        let sessions = [
+            session("s0", "ignored", "the Deploy Pipeline ran green"),
+            session("s1", "ignored", "deploy only, nothing else"),
+            session("s2", "ignored", "deploy pipeline present here too"),
+        ];
+        let mut index = SearchIndex::build(&sessions);
+        index.set_mode(SearchMode::NameAndContent);
+
+        // Candidate set excludes s2, proving restriction AND gate semantics at
+        // once. Multi-atom + case-insensitive: "deploy pipeline" matches s0
+        // (mixed-case) but not s1 (missing the "pipeline" atom).
+        index.set_query("deploy pipeline");
+        assert_eq!(
+            index.results_within(&[0, 1]),
+            vec![0],
+            "both atoms required, case-insensitively, within the candidate set"
+        );
+
+        // Substring, not subsequence: "dpp" is a scattered subsequence of
+        // "deploy pipeline" but never a contiguous run, so it matches nothing.
+        index.set_query("dpp");
+        assert!(
+            index.results_within(&[0, 1]).is_empty(),
+            "a scattered subsequence must not match within the candidate set"
+        );
+    }
+
+    /// An empty / whitespace-only query returns the given candidates unchanged
+    /// (order preserved), mirroring results()'s empty-query "return all"; an
+    /// out-of-range index is still dropped fail-soft.
+    #[test]
+    fn results_within_empty_query_returns_candidates_as_is() {
+        let sessions = [
+            session("s0", "first", ""),
+            session("s1", "second", ""),
+            session("s2", "third", ""),
+        ];
+        let mut index = SearchIndex::build(&sessions);
+
+        // Empty query: candidates returned as-is, in the order supplied.
+        index.set_query("");
+        assert_eq!(
+            index.results_within(&[2, 0]),
+            vec![2, 0],
+            "an empty query returns the candidates unchanged, order preserved"
+        );
+
+        // Whitespace-only parses to zero atoms and behaves the same; the
+        // out-of-range 99 is dropped fail-soft.
+        index.set_query("   ");
+        assert_eq!(
+            index.results_within(&[1, 99]),
+            vec![1],
+            "whitespace-only returns in-range candidates as-is, skipping out-of-range"
         );
     }
 }

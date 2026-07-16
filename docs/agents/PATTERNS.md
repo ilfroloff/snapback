@@ -88,15 +88,40 @@ status with no teardown flash; only a confirmed `Ready` escalates to
 
 ## 4. Isolate volatile dependencies
 
-All `nucleo` calls live in `src/search.rs` and nowhere else — the pin is exact
-and the API is evolving, so an upgrade touches one module. The rest of the crate
-sees only `SearchIndex`, `SearchMode`, and `filter`. Matching is **substring,
-not fuzzy**: patterns are built with `AtomKind::Substring` in code (never from
-user-typed atom syntax). The filter and the highlight seam score the **same**
-`Pattern` so they can never disagree. When you touch search, preserve the
-incrementality contract: `set_query` rebuilds only the small pattern per
+All `nucleo` and `memchr` calls live in `src/search.rs` and nowhere else — the
+pins are exact and nucleo's API is evolving, so an upgrade touches one module.
+The rest of the crate sees only `SearchIndex`, `SearchMode`, and `filter`.
+Matching is **substring, not fuzzy**: patterns are built with
+`AtomKind::Substring` in code (never from user-typed atom syntax), and the
+filter enforces the same rule independently because memmem searches substrings
+by nature. When you touch search, preserve the incrementality contract:
+`set_query` rebuilds only the small pattern and the per-atom finders per
 keystroke; `refresh` rebuilds haystacks only for sessions whose fingerprint
 changed.
+
+`results` answers **membership only** — every atom present as a byte substring,
+via `memchr::memmem` — and returns candidates in the order given. nucleo is not
+on that path; it backs the **highlight seam** (`match_indices`) alone. Do not
+re-introduce ranking: `App::order_filtered` re-sorts every result by a **tie-free
+total order**, so a rank cannot reach the screen, and computing one cost 76–81%
+of each keystroke through nucleo's `Utf32Str` UTF-32 conversion.
+
+Two invariants are easy to break and expensive to get wrong:
+
+- **Smart case is per ATOM, not per query.** `CaseMatching::Smart` makes each
+  atom case-sensitive iff *that atom* carries an uppercase char, so `foo BAR`
+  folds `foo` but not `BAR`. The decision rides each `AtomFinder`. A per-query
+  branch looks equivalent and silently breaks mixed queries — and answering an
+  uppercase query from the lowercased haystack is an *inclusion regression*
+  (measured: `NPX` finds 6 entries there, nucleo matches 0), not a nuance.
+- **Both haystacks are live.** The cased one backs the case-sensitive branch, the
+  lowercased one the case-insensitive branch. Neither is dead; deleting the cased
+  one breaks every uppercase query.
+
+`gate_atoms` mirrors nucleo's splitter so the filter and the highlight demand the
+same atoms; keep them in lockstep. Where the two deliberately diverge (the
+upstream non-ASCII tail off-by-one, unicode normalization, the per-atom case
+predicate on non-ASCII atoms), the module docs enumerate it and a test pins it.
 
 ## 5. Selection and scroll survive reloads
 

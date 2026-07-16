@@ -101,17 +101,53 @@ group head per repo→branch group, git-log style.
 A capped (`CONTENT_INDEX_CAP` = 64 KB) in-memory string of readable transcript
 text (user/assistant text blocks + summaries; tool params/thinking omitted),
 truncated on a UTF-8 char boundary. Extracted **once at load**; the name+content
-search mode scores against it per keystroke without re-reading disk.
+search mode searches it without re-reading disk.
+
+Per keystroke, `search` answers **membership only**: does every query atom occur
+as a byte substring? `memchr::memmem` (SIMD, no allocation, no UTF-8 → UTF-32
+conversion) decides it directly over the prebuilt haystacks, and **nucleo is not
+on this path** — it backs the highlight seam alone.
+
+The reason is that `App::order_filtered` imposes the timestamp/group order and
+**discards any rank**, over a key (`(Reverse(timestamp), session_id)`) that is a
+**total order with zero ties** (measured: 66 entries → 66 distinct keys). A rank
+therefore provably could not reach the screen, yet producing one dominated the
+keystroke: nucleo's `Utf32Str` conversion allocates a full `Vec<char>` for any
+non-ASCII haystack at ~8.6 ns/byte, and **86% of entries are non-ASCII** once
+`serde_json` decodes `\uXXXX` escapes (the raw files are pure ASCII — the decoded
+`content_index` is what nucleo saw). So scoring every session's 64 KB of content
+rebuilt megabytes of UTF-32 on the UI thread to order a list about to be
+re-ordered by timestamp. Measured against the real corpus (66 entries, 1.29 MB of
+haystack, 2026-07-17), dropping the rank stage moved the worst keystroke `n` from
+**14.3 ms → 3.8 µs** and `the` from **13.5 ms → 5.3 µs**, with the whole-corpus
+worst case (`zzzqqq`, nothing found, full scan) at **28.7 µs** — below the old
+best case. Cost is now linear in haystack bytes with no per-entry conversion, so
+the win grows with the corpus.
+
+Each haystack is kept in **two** copies (bounded by the 64 KB cap) and both are
+load-bearing: smart case is decided **per atom**, so an atom carrying an
+uppercase char searches the *cased* copy case-sensitively while a lowercase atom
+searches the *lowercased* copy. That branch is not an optimization — answering an
+uppercase query from the lowercased copy is an inclusion regression (measured:
+`NPX` finds 6 entries there, nucleo matches 0).
+
+The candidate set is scope-limited BEFORE any of this. The `App` pushes its
+cached in-scope index set into the search pass (`SearchIndex::results_within`)
+rather than filtering the whole corpus and intersecting afterward, so in the
+default current-folder scope the per-keystroke pass scans only the in-scope
+sessions. The index still holds every session (scope is a runtime toggle and
+`Scope::All` needs the full set), so this narrows the work per keystroke without
+changing what is indexed.
 
 There is deliberately **no on-disk index** (YAGNI at the observed few-hundred
-sessions — ~270 when last measured, 2026-07-15): the whole
-content corpus is a few single-digit MB held in memory and nucleo matches it per
-keystroke instantly, so a SQLite/FTS index would be pure overhead. If the store
-ever grows into the **thousands** of sessions and the initial load or the
-content haystack starts to feel heavy, the first step is a lazily-populated,
-**mtime-keyed on-disk cache** (e.g. `~/.cache/snapback/`) of each session's
-`content_index`, so only changed sessions are re-extracted; an **FTS5** table
-over transcript text is the step past that. Until then it is not worth it.
+sessions — ~270 when last measured, 2026-07-15): the whole content corpus is a
+few single-digit MB held in memory and the gate keeps per-keystroke matching
+instant, so a SQLite/FTS index would be pure overhead. If the store ever grows
+into the **thousands** of sessions and the initial load or the content haystack
+starts to feel heavy, the first step is a lazily-populated, **mtime-keyed
+on-disk cache** (e.g. `~/.cache/snapback/`) of each session's `content_index`,
+so only changed sessions are re-extracted; an **FTS5** table over transcript
+text is the step past that. Until then it is not worth it.
 
 ### Fork lineage (`store::lineage`)
 
