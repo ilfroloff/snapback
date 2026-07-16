@@ -1456,6 +1456,7 @@ dependencies = [
  "anyhow",
  "crossterm",
  "dirs",
+ "memchr",
  "notify",
  "notify-debouncer-mini",
  "nucleo",

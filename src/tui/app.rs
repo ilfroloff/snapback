@@ -519,7 +519,8 @@ pub struct App {
     /// change invalidates the whole cache (see `preview_cache`). `None` until
     /// the first preview render.
     preview_width: Option<u16>,
-    /// Live nucleo index over `sessions` (isolated in [`crate::search`]).
+    /// Live substring index over `sessions` (isolated in [`crate::search`],
+    /// which also confines every `memchr`/`nucleo` call).
     index: SearchIndex,
 }
 
@@ -1083,10 +1084,18 @@ impl App {
     /// [`order_filtered`](Self::order_filtered), then FOLD each collapsed fork
     /// lineage down to its head.
     ///
-    /// An empty query takes the whole scope set; a non-empty query keeps only
-    /// the scope members that the nucleo index matched. Both paths funnel
-    /// through [`order_filtered`](Self::order_filtered), so display ordering is
-    /// applied uniformly and the result is never left in raw store order.
+    /// An empty query takes the whole scope set; a non-empty query pushes the
+    /// scope membership set INTO the search pass
+    /// ([`results_within`](crate::search::SearchIndex::results_within)), so only
+    /// in-scope sessions are ever scanned — an out-of-scope match is never
+    /// searched just to be discarded. Both paths funnel through
+    /// [`order_filtered`](Self::order_filtered), so display ordering is applied
+    /// uniformly and the result is never left in raw store order.
+    ///
+    /// [`order_filtered`](Self::order_filtered) is the SOLE source of display
+    /// order — the search pass deliberately returns candidates in the order given
+    /// and ranks nothing, because this key is a tie-free total order that would
+    /// discard any rank anyway.
     ///
     /// The fold is deliberately LAST, AFTER the ordering: it leaves `filtered`
     /// holding only the indices the user can actually SEE. That single choice is
@@ -1098,13 +1107,7 @@ impl App {
         if self.query.is_empty() {
             self.filtered = self.scoped.clone();
         } else {
-            let matched: HashSet<usize> = self.index.results().into_iter().collect();
-            self.filtered = self
-                .scoped
-                .iter()
-                .copied()
-                .filter(|i| matched.contains(i))
-                .collect();
+            self.filtered = self.index.results_within(&self.scoped);
         }
         self.order_filtered();
         let folded = lineage::fold(&self.sessions, &self.filtered, &self.expanded);
@@ -1932,6 +1935,40 @@ mod tests {
             "only the current-folder session shows"
         );
         assert_eq!(app.selected.as_deref(), Some("in"));
+        let _ = std::fs::remove_dir_all(&here);
+    }
+
+    #[test]
+    fn current_folder_scope_excludes_out_of_scope_query_match() {
+        let here = unique_temp_dir("scope-query-here");
+        let launch = resolve_dir(&here);
+        let inside = here.to_str().unwrap();
+
+        // Two in-scope sessions and one out-of-scope, ALL matching the query
+        // ("label" is in every default label, "label for <id>"). In-scope
+        // timestamps: in-new (200) newer than in-old (100), so the current-folder
+        // display order is [in-new, in-old]; the out-of-scope "out" is dropped.
+        let sessions = vec![
+            session_ts("in-old", "r1", Some("main"), inside, 100),
+            session_ts("out", "r2", Some("main"), "/tmp/somewhere-else", 300),
+            session_ts("in-new", "r1", Some("main"), inside, 200),
+        ];
+        let mut app = App::new(sessions, Scope::CurrentFolder, launch);
+        for c in "label".chars() {
+            app.push_query_char(c);
+        }
+
+        let shown: Vec<&str> = app
+            .filtered
+            .iter()
+            .map(|&i| app.sessions[i].session_id.as_str())
+            .collect();
+        assert_eq!(
+            shown,
+            vec!["in-new", "in-old"],
+            "out-of-scope match is excluded; in-scope matches keep timestamp-desc order"
+        );
+
         let _ = std::fs::remove_dir_all(&here);
     }
 

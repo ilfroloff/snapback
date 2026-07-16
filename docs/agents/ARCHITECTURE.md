@@ -18,7 +18,8 @@ content search. It depends on nothing outside its own `Cargo.toml`.
 | --- | --- | --- | --- |
 | Terminal UI | `ratatui` | `=0.30.2` | crossterm backend |
 | Terminal control + input | `crossterm` | `=0.29.0` | matches ratatui 0.30 |
-| Substring matcher | `nucleo` | `=0.5.0` | isolated in `src/search.rs` |
+| Highlight matcher | `nucleo` | `=0.5.0` | isolated in `src/search.rs`; backs the highlight seam only — NOT the filter |
+| Substring filter | `memchr` | `=2.8.2` | SIMD `memmem`; IS the per-keystroke filter, answering membership per atom (`src/search.rs`); already transitive via `nucleo`/`serde_json` |
 | FS watch | `notify` | `=8.2.0` | recursive, over the store root |
 | Debounce | `notify-debouncer-mini` | `=0.7.0` | ~200ms coalescing |
 | JSONL parse | `serde_json` | `=1.0.150` | as `Value`, never typed structs |
@@ -58,7 +59,7 @@ the render framework.** That is why `agents::classify` buckets the undocumented
 | `store::label` | `src/store/label.rs` | Label preference (summary → first real user prompt → session id). |
 | `store::lineage` | `src/store/lineage.rs` | Background-fork lineage identity + folding: `lineage_key` (`(repo, branch, root_uuid)`), `head_of` (the newest member), and `fold` — the single entry point, which reduces a display list to the visible indices plus a head→hidden-count map. Presentation-only: it hides indices, it cannot drop a session. Pure and framework-free. See [DOMAIN.md](DOMAIN.md#fork-lineage-storelineage) for the mechanism it models. |
 | `store::preview` | `src/store/preview.rs` | Transcript → `RenderedPreview` (styled ratatui `Text` + clickable `LinkRegion`s), self-contained markdown pass. |
-| `search` | `src/search.rs` | The **only** place `nucleo` is called: substring index, incremental re-filter, highlight seam. |
+| `search` | `src/search.rs` | The **only** place `nucleo` or `memchr` is called: substring index, incremental re-filter, highlight seam. Per keystroke the filter answers MEMBERSHIP with `memchr::memmem` over prebuilt haystacks — no nucleo, no UTF-32 conversion, no ranking (`App::order_filtered` owns display order). Smart case is decided per ATOM, selecting the cased or lowercased haystack. nucleo backs `match_indices` (the highlight) alone. |
 | `agents` | `src/agents.rs` | Agent detection via `claude agents --json`, read TWO ways through ONE fail-soft parser. `reported_agents` (`--all`, polled ~1s off-thread) is the DISPLAY signal: `classify` buckets each qualifier into an `AgentActivity` that the preview banner, list-badge color and pulse (which alternates that color, never the glyph) derive from. `live_agents` (bare, NO `--all`, one-shot at EVERY hand-off) is the HAND-OFF signal: the bare command IS claude's active list, so MEMBERSHIP is liveness — no inference — and the same records carry the Attach job `id`, so one authoritative read answers both. The split exists because `--all`'s `done` means "the agent reported completion", not "claude will permit `-r`"; inferring liveness from that polled snapshot was a TOCTOU race, and reading an attach id from it was the same bug one layer down. Framework-free: it interprets the value set, while the color it maps to is the view's call. |
 | `defined_agents` | `src/defined_agents.rs` | DEFINED-agent discovery for a new session: fail-soft frontmatter scan of `~/.claude/agents/*.md` + `<launch_dir>/.claude/agents/*.md`, deduped (project over user). Distinct from `agents` (live vs. defined). |
 | `watch` | `src/watch.rs` | Debounced FS watcher + `EventLoop` that merges input/watcher/tick/agents onto one channel. |

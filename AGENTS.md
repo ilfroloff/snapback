@@ -39,9 +39,13 @@ one place.
   ONE complete return-to-known-state, not one mode per bug, and stays WRITE-ONLY:
   never emit a cursor-position (DSR `CSI 6n`) query on the return path — it
   deadlocks on a dirty child's stdin. (`src/tui/mod.rs`, `src/resume.rs`)
-- **NUCLEO ISOLATION.** Every `nucleo` call stays in `src/search.rs`. Matching
-  is SUBSTRING (`AtomKind::Substring`), not fuzzy; the filter and highlight
-  share one `Pattern`. (`src/search.rs`)
+- **NUCLEO ISOLATION.** Every `nucleo` AND `memchr` call stays in `src/search.rs`.
+  Matching is SUBSTRING (`AtomKind::Substring`), not fuzzy. The FILTER answers
+  MEMBERSHIP with `memchr::memmem` and never calls nucleo; smart case is decided
+  **PER ATOM**, never per query, and each atom searches the cased or lowercased
+  haystack accordingly — BOTH are load-bearing. nucleo is confined to the
+  HIGHLIGHT seam (`match_indices`). Never rank the filter's results: display
+  order is `App::order_filtered`'s alone. (`src/search.rs`)
 - **STABLE-ID STATE.** Track selection by `session_id`, never list index, so it
   survives autorefresh reloads. (`src/tui/app.rs`)
 - **OFF-UI-THREAD blocking work.** RECURRING shell-outs / FS watch / input run on
@@ -141,6 +145,105 @@ Full command reference and the validation checklist:
 
 ## Changelog
 
+- **2026-07-17** — Took nucleo off the per-keystroke FILTER entirely: it answers
+  MEMBERSHIP with `memchr::memmem` over the prebuilt haystacks, and nucleo is now
+  confined to the HIGHLIGHT seam (`match_indices`). Measured against the real
+  corpus (66 indexable entries, 1.29 MB of haystack, `--release`, p50 of 50):
+  `n` **14.336 ms → 3.791 µs**, `np` 11.358 ms → 24.333 µs, `npx` 1.345 ms →
+  31.542 µs, `the` 13.450 ms → 5.292 µs; typing `n`→`np`→`npx` **27.0 ms →
+  59.7 µs**. The whole-corpus worst case — nothing found, so the full 1.29 MB is
+  scanned — is **28.7 µs**, BELOW the old BEST case. Membership was identical on
+  every query (65/65, 35/35, 6/6, 64/64) in a same-moment A/B of both paths
+  against ONE corpus snapshot, which is the only honest method here: the store
+  DRIFTS under measurement (this very session is written into it — `zzzqqq` went
+  from 0 hits to 1 between the plan's measurement and this one), so a number
+  written down earlier is not a baseline.
+  **The reported symptom was not the bug.** The report named `npx`, which cost
+  1.3 ms. The lag was the PREFIXES: `n` (14.3 ms) and `np` (11.4 ms). The old
+  gate's selectivity collapses for short/common atoms — `n` passes 65/66 and
+  `the` 64/66, so nearly every entry reached the scorer, while `npx` passes 6/66.
+  "Common tokens defeat the gate" was true, but for `n`/`np`/`the`, never for the
+  token reported. Anyone re-checking by PASTING `npx` skips the expensive
+  keystrokes and sees a deceptively fast path; type the word.
+  **The rank was computed and then thrown away.** `App::order_filtered` re-sorts
+  every result by `(Reverse(timestamp), session_id)` — a TOTAL order with ZERO
+  ties (measured: 66 entries → 66 distinct keys) — so with unique keys even sort
+  stability is irrelevant and nucleo's rank provably could not reach the screen.
+  `DOMAIN.md` already said this outright ("`App::order_filtered` still imposes the
+  timestamp/group order and discards nucleo's rank") while the module treated that
+  rank as its deliverable; the aside WAS the finding, and it is now the
+  justification rather than a footnote. Producing the discarded rank cost 76-81%
+  of every keystroke — and not in `pattern.score` (16-24%) but in `Utf32Str::new`,
+  which is zero-copy only for pure-ASCII haystacks and otherwise allocates a whole
+  `Vec<char>` at ~8.6 ns/byte. **86% of entries are non-ASCII** once `serde_json`
+  decodes `\uXXXX` escapes, so nearly every entry paid it. Testing the FILE is the
+  wrong test here — raw JSONL is pure ASCII; the DECODED `content_index` is what
+  nucleo saw.
+  **Smart case is decided PER ATOM, and the branch is MANDATORY, not an
+  optimization.** `CaseMatching::Smart` makes each atom independently
+  case-sensitive iff THAT atom carries an uppercase char, so `foo BAR` folds `foo`
+  and does not fold `BAR` within one query. A per-QUERY branch looks equivalent
+  and silently breaks every mixed query; the decision therefore rides each
+  `AtomFinder`. Getting this wrong is an INCLUSION regression, not a ranking
+  nuance: measured, `NPX` finds **6** entries in the lowercased haystack while
+  nucleo matches **0**, so answering an uppercase query from that haystack invents
+  six rows. Pinned from both sides — a corpus where the lowercase bait matches
+  everything and `NPX`/`Npx` must return EMPTY, and a mixed-case fixture whose
+  label is deliberately `Foo` rather than `foo`, since with a lowercase label the
+  per-atom and per-query readings AGREE and the bug walks straight through.
+  **The cased haystack is NOT dead, and that is the trap this change leaves
+  behind.** With scoring gone it reads as an orphan of the old "option b"
+  exact-parity trade, and deleting it is a one-line change that passes a casual
+  read. It now backs the case-SENSITIVE atom branch: delete it and every
+  uppercase-bearing query (`TODO`, `API`, `React`) searches lowercased text
+  case-sensitively and matches nothing. Both haystacks are live; neither is
+  redundant.
+  **Filter and highlight now DIVERGE on the upstream non-ASCII tail off-by-one,
+  accepted deliberately.** `nucleo-matcher` 0.3.1 scans candidate starts only to
+  `haystack.len() - needle.len()` EXCLUSIVE on its non-ASCII substring path, so a
+  match ending at the very last char of a haystack holding any non-ASCII char is
+  missed. Both used to score ONE `Pattern` and so missed it identically — the old
+  comment's "they never disagree" claim rested on exactly that, and is now false
+  and rewritten. The memmem filter FINDS such a match while the highlight still
+  misses it, so the row can draw unhighlighted. Tolerated because the filter is
+  the MORE CORRECT of the two (it errs toward more matches), it needs a non-ASCII
+  haystack AND a tail-anchored match, and an un-highlighted row is already an
+  expected sight — a content-only match shows none, by design. Replicating the
+  upstream bug in the filter to keep the two symmetrical was REJECTED: that
+  forfeits a real correctness gain to protect a comment. A test pins it so it can
+  never become silent drift.
+  The three rank-order tests were REWRITTEN to assert membership, never deleted:
+  they pinned a property no runtime consumer reads, and that fact is the finding —
+  so the names now record it (`filter_membership_ignores_match_closeness`) and a
+  future reader is told not to "restore" an order nothing can observe. Parity is
+  proved against nucleo ITSELF, by keeping the old scoring path alive in the test
+  module as an oracle: hand-written expectations would encode the author's belief
+  about smart case, which is precisely the thing under test — and the `NPX` trap
+  is a measured case where that belief is wrong. Asking nucleo cannot be wrong
+  about nucleo.
+  Three narrow, enumerated divergences from nucleo remain, all pre-existing in
+  direction: unicode normalization (`resume` matching `résumé`) and per-string vs
+  per-char lowercasing were ALREADY excluded by the old gate before nucleo was
+  consulted, so nothing moved; and the per-atom case predicate is re-derived
+  rather than read, because `Atom::ignore_case` is private — EXACT for ASCII
+  atoms (`char::is_uppercase` over ASCII is precisely nucleo's
+  `is_ascii_uppercase`), differing from nucleo's case-folding table only on
+  exotica such as titlecase digraphs.
+  **Sequencing, deliberate:** this lands BEFORE any `content_index` widening
+  (`src/store/parse.rs` untouched; measured recall is 28.5% and under separate
+  investigation). Under the old gate→rank architecture widening cost
+  MULTIPLICATIVELY — more bytes AND more gate survivors, both feeding the UTF-32
+  conversion (measured on `cargo`: 11.4 ms → 34.7 ms with everything indexed).
+  With no rank stage, cost is purely LINEAR in haystack bytes, which is what makes
+  the recall work affordable. Re-measure if widening lands.
+  Docs refreshed: the NUCLEO ISOLATION rule (both its "filter and highlight share
+  one `Pattern`" and "gate→rank" clauses were falsified, and `memchr` is now
+  pinned to `src/search.rs` by the same rule); `PATTERNS.md` §4 gains the per-atom
+  and both-haystacks-live invariants; `ARCHITECTURE.md`'s dependency rows split by
+  role (nucleo = highlight, memchr = filter); `DOMAIN.md` rewrites the gate→rank
+  paragraph, keeping the measured facts that survive (64 KB cap, the dual-haystack
+  memory trade, no on-disk index) and promoting the discarded-rank observation
+  from aside to justification.
 - **2026-07-16** — Fixed releases cutting no git tag and no GitHub Release.
   Removed `publish = false` from `Cargo.toml`: it made cargo-metadata report the
   package's `publish` as `[]`, and release-plz's `release` command filters
@@ -504,6 +607,29 @@ Full command reference and the validation checklist:
   "Continuous integration & releases" section (and drops the stale "no CI config"
   claim), `README.md` gains a `cargo install --git ... --tag vX.Y.Z` path, and the
   Git-commits rule now notes that commit type drives the bump.
+- **2026-07-10** — Scope-limited the per-keystroke search: `App::recompute_filtered`
+  now pushes the cached in-scope index set INTO the search pass via a new
+  `SearchIndex::results_within(&candidates)` instead of ranking the whole corpus
+  and intersecting the result with the scope set through a `HashSet`. In the
+  default current-folder scope this stops gating/scoring (and UTF-32-converting)
+  out-of-scope sessions that would only be discarded. The index still holds every
+  session (scope is a runtime toggle and `Scope::All` needs the full set), so
+  nothing about what is indexed changed, and display order is byte-identical
+  (`order_filtered` still owns ordering). `results` and `results_within` share one
+  private gate→rank core (`ranked_candidates`); out-of-range candidates are skipped
+  fail-soft. Pure performance + cleanup, no user-facing change. Docs refreshed
+  (`DOMAIN.md` content index, `search` module docs).
+- **2026-07-09** — Fixed name+content search lag by making `search` a two-stage
+  `gate→rank` pipeline: a `memchr::memmem` byte-substring gate over a prebuilt
+  lowercased haystack rejects non-matching sessions before nucleo scores only the
+  survivors over the cased haystack. nucleo's `Utf32Str` conversion allocates a
+  full `Vec<char>` for any non-ASCII haystack, so scoring every session's 64 KB
+  content per keystroke rebuilt megabytes of UTF-32 on the UI thread. Exact-parity
+  ("option b"): the cased haystack keeps nucleo's ranking/inclusion/smart-case
+  byte-for-byte, at the cost of a second lowercased haystack copy (bounded by the
+  64 KB cap). `memchr` promoted from transitive to a direct exact pin (`=2.8.2`).
+  Docs refreshed (`DOMAIN.md` content index, `ARCHITECTURE.md` stack + search row,
+  `PATTERNS.md` isolate-deps, this rule).
 - **2026-07-09** — Split the header version indicator by build profile. Release
   builds still show `v<crate-version>`; local debug builds now show
   `dev+<git-short-hash>` with a trailing `-dirty` when the working tree had
