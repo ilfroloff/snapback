@@ -1,0 +1,30 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.1.0](https://github.com/ilfroloff/snapback/releases/tag/v0.1.0) - 2026-07-16
+
+### Added
+
+- *(tui/view)* distinguish dev builds in the header version label
+- pick an agent when starting a new session
+- add snapback TUI for browsing and resuming Claude Code sessions
+
+### Fixed
+
+- *(tui)* restore the terminal to a known-good state on child return
+
+### Other
+
+- require an explicit release token and narrow the built-in one
+- run only on pull requests for any branch
+- restructure the README to lead with the user problem
+- automate versioning and releases with release-plz
+- gate formatting, lint, and tests on a pinned toolchain
+- add cargo aliases for local run, install, and release
+- Initial commit
