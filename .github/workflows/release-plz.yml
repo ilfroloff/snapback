@@ -13,11 +13,40 @@ name: "🔖 Release"
 # No crates.io publish ever happens - snapback is a non-published binary crate
 # installed from a tagged git ref (see release-plz.toml + README.md).
 #
-# NO CI LOOP: the release PR, commits, and tags are created with the built-in
-# GITHUB_TOKEN, and GitHub deliberately does NOT trigger further workflow runs
-# from GITHUB_TOKEN-authored events. So this workflow never re-triggers ci.yml
-# (or itself). Supplying RELEASE_PLZ_TOKEN below opts INTO running ci.yml on the
-# release PR; without it the PR still opens and tags still cut, just with no CI.
+# RELEASE_PLZ_TOKEN IS REQUIRED - there is deliberately no fallback. The step
+# below reads that secret and nothing else, so a missing, revoked, or misnamed
+# token fails loudly at the point of use. An earlier
+# `secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN` fallback did the opposite:
+# with no secret configured it quietly handed release-plz the built-in token,
+# which surfaced only as an opaque 403 on POST /repos/.../pulls once the run had
+# already reached the PR-creation step. That masking is precisely why this now
+# fails hard instead of degrading.
+#
+# The built-in GITHUB_TOKEN cannot open the release PR AT ALL unless
+# Settings -> Actions -> General -> Workflow permissions -> "Allow GitHub
+# Actions to create and approve pull requests" is enabled - release-plz's own
+# quickstart lists enabling that setting as a required step. That is a
+# REPO-level gate: the `permissions:` block below only scopes what GITHUB_TOKEN
+# is allowed to do within a run, and cannot override it. Without the setting the
+# PR creation 403s outright; nothing opens.
+#
+# Even with that setting enabled, GITHUB_TOKEN-authored events do not trigger
+# other workflows - ci.yml would not run on the release PR, and any future
+# tag-triggered workflow would not fire on the `vX.Y.Z` tag. A PAT is authored by
+# a real account, so it clears both problems at once.
+#
+# NO LOOP - and note that the REASON changed. Loop-safety no longer rests on
+# "GITHUB_TOKEN-authored events don't retrigger workflows", because the PAT
+# removes exactly that property. It now rests entirely on the trigger filter:
+# `on: push: branches: [main]` carries no `tags:` filter, so neither the
+# `release-plz-*` branch push nor the `v*` tag push re-enters this workflow. The
+# only re-entry is a human merging the release PR into main, which is precisely
+# the event that is supposed to run the `release` command. Still do not add a
+# `tags:` filter here - but the reason is that the run would be POINTLESS, not
+# that it would loop. `git_only = true` in release-plz.toml means a tag-triggered
+# re-run just reads the existing `v*` tags, finds the tag already cut with
+# Cargo.toml already at that version, and cuts nothing: no new tag, so nothing
+# triggers again. The cost is one redundant re-run per release, not a loop.
 
 on:
   push:
@@ -26,11 +55,24 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-# Least privilege: release-plz needs to push tags/commits (contents) and to
-# open/update the release PR (pull-requests). Nothing else.
+# Least privilege - and note this block scopes ONLY the built-in GITHUB_TOKEN
+# (`github.token`). It has NO effect on release-plz, which authenticates with
+# RELEASE_PLZ_TOKEN from the step's env below; widening or narrowing anything
+# here neither grants nor removes a single release-plz permission.
+#
+# Every remaining consumer of the built-in token is read-only:
+#   - actions/checkout@v4 takes no `token:` input, so it defaults to
+#     `github.token` and needs `contents: read` to fetch the repo.
+#   - actions-rust-lang/setup-rust-toolchain@v1, and the taiki-e/install-action
+#     that release-plz/action@v0.5 invokes internally to fetch
+#     cargo-semver-checks, only READ the GitHub API (release downloads, rate
+#     limits).
+#
+# `pull-requests` is therefore gone, not set to `none`: unlisted scopes already
+# default to none, and nothing uses the built-in token to touch a PR anymore -
+# the release PR is opened by the PAT.
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 # One release run at a time per branch, and never cancel an in-flight one so a
 # tag/release is never left half-created.
@@ -49,8 +91,19 @@ jobs:
           # release-plz derives versions from git tags (git_only), so it needs
           # the FULL history + tags, not the default shallow clone.
           fetch-depth: 0
-          # Don't persist the checkout token in .git/config; release-plz
-          # authenticates through the token passed in env below instead.
+          # LOAD-BEARING - do not "clean this up". VERIFIED: with credentials
+          # not persisted, release-plz pushes fine, authenticating through the
+          # token env var on the step below - the `release-plz-*` branches landed
+          # while PR creation was still 403ing. NOT tested: whether `true`
+          # actually breaks it. The INFERENCE is that persisting would write
+          # checkout's own default token into .git/config and git would prefer it
+          # for pushes, re-attributing them to the built-in token and killing the
+          # workflow triggers the PAT exists to preserve. The release-plz docs
+          # point the same way - they work around this by instructing you to pass
+          # the PAT to actions/checkout too, which implies checkout's persisted
+          # credentials are what git uses for pushes. Leaving persistence off
+          # sidesteps the question entirely and keeps the token out of
+          # .git/config.
           persist-credentials: false
 
       - name: "🦀 Set up Rust toolchain (from rust-toolchain.toml)"
@@ -63,8 +116,10 @@ jobs:
       - name: "🔖 Run release-plz (release-pr + release)"
         uses: release-plz/action@v0.5
         env:
-          # Prefer a user-supplied PAT / GitHub App token (RELEASE_PLZ_TOKEN) so
-          # ci.yml runs on the release PR; fall back to the built-in token, which
-          # still opens the PR and cuts tags but won't trigger ci.yml. The
-          # fallback keeps this workflow functional with zero secrets configured.
-          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
+          # REQUIRED, with deliberately NO `|| secrets.GITHUB_TOKEN` fallback -
+          # see the header. The fallback turned a missing/revoked/misnamed token
+          # into an opaque 403 at PR creation rather than an obvious auth
+          # failure, which is what made that bug hard to diagnose. release-plz
+          # takes this one env var as its credential for both the GitHub API
+          # calls and the git pushes.
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
