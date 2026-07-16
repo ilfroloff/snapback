@@ -130,6 +130,16 @@ Full command reference and the validation checklist:
 
 ## Changelog
 
+- **2026-07-16** — Fixed releases cutting no git tag and no GitHub Release.
+  Removed `publish = false` from `Cargo.toml`: it made cargo-metadata report the
+  package's `publish` as `[]`, and release-plz's `release` command filters
+  non-publishable packages out before reaching the git-only path that creates the
+  tag and the Release — so the "🔖 Release" run went green having released
+  nothing (v0.1.0 merged untagged). The non-published guarantee now rests solely
+  on `release-plz.toml` (`git_only = true` + `publish = false`), which is the
+  arrangement release-plz's own git-only setup expects. Comments in `Cargo.toml`
+  and `release-plz.toml` plus the release section of `OPERATIONS.md` were
+  reconciled to that mechanism. No code or config-value changes.
 - **2026-07-13** — Restructured `README.md` into a pain-first, user-facing doc:
   expanded the "why" into a concrete cross-folder scenario, tightened the payoff,
   de-jargoned the (unchanged, still-complete) key map, and reduced the feature

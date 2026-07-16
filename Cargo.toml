@@ -3,13 +3,20 @@ name = "snapback"
 # Baseline release version. From here on the version is bumped automatically by
 # release-plz from Conventional Commits (feat -> minor, fix/perf -> patch; see
 # release-plz.toml), and each release is cut as a `v{version}` git tag + GitHub
-# Release. This crate is never published to crates.io (publish = false below); it
-# is installed straight from a tagged git ref (see README.md). The first release
-# tags v0.1.0.
+# Release, installed straight from that tagged git ref (see README.md). The first
+# release tags v0.1.0.
 version = "0.1.0"
 edition = "2021"
 description = "Browse, search, and resume Claude Code sessions from a ratatui TUI."
-publish = false
+
+# DO NOT add a `publish` key here - not even `publish = false`. It silently
+# disables releasing: cargo-metadata then reports this package's `publish` as
+# `[]`, release-plz's `release` command drops non-publishable packages before it
+# ever reaches the git-only path that creates BOTH the tag and the GitHub
+# Release, and the run still goes GREEN having cut nothing. The no-publish guard
+# lives in release-plz.toml (`git_only = true` + `publish = false`), where it
+# stops release-plz from ever running `cargo publish` without hiding this package
+# from the release path.
 
 # Personal, standalone tool. The module tree lives in the library crate
 # (src/lib.rs) so it compiles once, and two thin binary shims (src/main.rs ->

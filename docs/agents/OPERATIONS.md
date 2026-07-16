@@ -83,10 +83,17 @@ Versioning is driven by the **Conventional Commit** type of each merged commit
 - Merging the release PR lands the new version in `Cargo.toml`/`Cargo.lock` and
   makes release-plz cut the `vX.Y.Z` **git tag** + **GitHub Release**.
 
-This crate is **never published to crates.io** (`publish = false`); the git tag
-is the sole source of truth for "what is released" (`git_only = true`), so there
-is no registry step. Users install a tagged version straight from git — see the
-README [Install](../../README.md#install) section.
+This crate is **never published to crates.io**, and that guarantee rests on
+`release-plz.toml` — `publish = false` there stops the registry step, while
+`git_only = true` makes the git tag the sole source of truth for "what is
+released". Users install a tagged version straight from git — see the README
+[Install](../../README.md#install) section.
+
+`Cargo.toml` intentionally sets **no `publish` key**, and must not gain one.
+`publish = false` there marks the package non-publishable, and release-plz's
+`release` command discards non-publishable packages *before* the git-only branch
+that cuts the tag and the GitHub Release — the workflow then succeeds having
+released nothing. Keep the guard in `release-plz.toml` only.
 
 The release PR, commits, and tags are created with the built-in `GITHUB_TOKEN`,
 which by design does **not** trigger other workflow runs, so `🚀 CI` is never
