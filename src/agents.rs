@@ -91,9 +91,11 @@ const QUALIFIER_BUSY: &str = "busy";
 const QUALIFIER_DONE: &str = "done";
 
 /// User-facing copy for [`AgentActivity::NeedsInput`] — the ONE translated
-/// bucket. Phrased as what the SESSION wants ("needs input"), so the banner
-/// tells the user why it stopped instead of restating the raw token
-/// ([`QUALIFIER_BLOCKED`] or [`QUALIFIER_WAITING`]).
+/// bucket. Phrased as what the SESSION wants ("needs input"), so BOTH the
+/// preview banner ([`friendly_status`]) AND the board list row
+/// ([`crate::tui::view::render_list`], via [`qualifier_copy`]) tell the user why
+/// it stopped instead of restating the raw token ([`QUALIFIER_BLOCKED`] or
+/// [`QUALIFIER_WAITING`]).
 const NEEDS_INPUT_COPY: &str = "needs input";
 
 /// The slice of a REPORTED agent the board UI needs, joined to a session by the
@@ -205,29 +207,50 @@ pub fn classify(agent: &ReportedAgent) -> AgentActivity {
     }
 }
 
-/// A one-line, human-readable status for a reported agent: the kind label (`bg`
-/// / `live`) plus its qualifier — e.g. `bg needs input`, `live working`.
+/// The display PHRASE for a reported agent's qualifier — the shared translation
+/// both consumers speak, so the undocumented `state`/`status` value set is turned
+/// into user-facing copy in exactly ONE place.
 ///
-/// Pure, and derived from [`classify`] so the value set is interpreted in
-/// exactly one place. Translates ONLY [`AgentActivity::NeedsInput`] — BOTH of
-/// its qualifiers ([`QUALIFIER_BLOCKED`] and [`QUALIFIER_WAITING`]) render as
-/// [`NEEDS_INPUT_COPY`], since the bucket is the thing being named and two
-/// spellings of "it wants you" must not read as two different states. Every
-/// other bucket renders the raw qualifier VERBATIM (fail-soft: an unknown value
-/// is shown, never hidden or relabeled), and an agent with no qualifier at all
-/// renders the kind label alone.
+/// `None` when the agent has no qualifier at all (nothing to say). Otherwise it
+/// translates ONLY [`AgentActivity::NeedsInput`] — BOTH of its spellings
+/// ([`QUALIFIER_BLOCKED`] and [`QUALIFIER_WAITING`]) collapse to
+/// [`NEEDS_INPUT_COPY`], since the BUCKET is the thing being named and two
+/// spellings of "it wants you" must not read as two different states — and passes
+/// every other bucket's raw qualifier through VERBATIM (fail-soft: an unknown
+/// value is shown, never hidden or relabeled).
+///
+/// Its two consumers are the preview banner ([`friendly_status`], which fuses the
+/// phrase onto the kind label) and the board list row
+/// ([`crate::tui::view::render_list`], which draws the phrase as its own span so
+/// it can weight [`AgentActivity::NeedsInput`] louder than the rest). Both read
+/// the SAME phrase here, so they can never disagree about what a qualifier says.
+///
+/// Reuses [`classify`] and [`ReportedAgent::qualifier`] rather than re-matching
+/// the raw tokens, so this seam can never drift from the badge color or the pulse
+/// about which field won or what bucket it meant.
 #[must_use]
-pub fn friendly_status(agent: &ReportedAgent) -> String {
-    let label = agent.kind_label();
-    let Some(qualifier) = agent.qualifier() else {
-        return label.to_string(); // Nothing to qualify -> the label stands alone.
-    };
-    let phrase = match classify(agent) {
+pub fn qualifier_copy(agent: &ReportedAgent) -> Option<&str> {
+    let qualifier = agent.qualifier()?;
+    Some(match classify(agent) {
         AgentActivity::NeedsInput => NEEDS_INPUT_COPY,
         AgentActivity::Idle
         | AgentActivity::Working
         | AgentActivity::Done
         | AgentActivity::Other => qualifier,
+    })
+}
+
+/// A one-line, human-readable status for a reported agent: the kind label (`bg`
+/// / `live`) plus its qualifier — e.g. `bg needs input`, `live working`.
+///
+/// Pure, and the phrase comes from [`qualifier_copy`] so the value set is
+/// interpreted in exactly one place (shared with the board list row). An agent
+/// with no qualifier at all renders the kind label alone.
+#[must_use]
+pub fn friendly_status(agent: &ReportedAgent) -> String {
+    let label = agent.kind_label();
+    let Some(phrase) = qualifier_copy(agent) else {
+        return label.to_string(); // Nothing to qualify -> the label stands alone.
     };
     format!("{label} {phrase}")
 }
@@ -485,6 +508,60 @@ mod tests {
             status: status.map(str::to_owned),
             name: None,
         }
+    }
+
+    /// `qualifier_copy` is the shared translation the preview banner AND the
+    /// board list row both speak, so it is pinned directly here rather than only
+    /// through `friendly_status`: `NeedsInput` is the ONE bucket translated (both
+    /// spellings, from either qualifier source), every other bucket passes its raw
+    /// token through verbatim, and an agent with no qualifier at all yields `None`.
+    #[test]
+    fn qualifier_copy_translates_only_needs_input_and_passes_the_rest_through() {
+        // NeedsInput is the one translated bucket — both spellings, from either
+        // qualifier source, collapse to the same actionable copy.
+        assert_eq!(
+            qualifier_copy(&agent("background", Some("blocked"), None)),
+            Some("needs input")
+        );
+        assert_eq!(
+            qualifier_copy(&agent("interactive", None, Some("waiting"))),
+            Some("needs input")
+        );
+
+        // Every other KNOWN bucket keeps its raw token verbatim.
+        assert_eq!(
+            qualifier_copy(&agent("background", Some("idle"), None)),
+            Some("idle")
+        );
+        assert_eq!(
+            qualifier_copy(&agent("background", Some("working"), None)),
+            Some("working")
+        );
+        assert_eq!(
+            qualifier_copy(&agent("interactive", None, Some("busy"))),
+            Some("busy")
+        );
+        assert_eq!(
+            qualifier_copy(&agent("background", Some("done"), None)),
+            Some("done")
+        );
+
+        // FAIL-SOFT: schema drift passes through untouched rather than being
+        // dropped or relabeled.
+        assert_eq!(
+            qualifier_copy(&agent("background", Some("compacting"), None)),
+            Some("compacting")
+        );
+
+        // No `state` and no `status` -> nothing to translate.
+        assert_eq!(qualifier_copy(&agent("background", None, None)), None);
+
+        // Inherited state-over-status precedence: `blocked` (state) wins over
+        // `idle` (status), so the copy is the NeedsInput translation, not `idle`.
+        assert_eq!(
+            qualifier_copy(&agent("background", Some("blocked"), Some("idle"))),
+            Some("needs input")
+        );
     }
 
     /// Task 1.3: `blocked` is the ONE translated value — it must reach the user

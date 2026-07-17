@@ -428,13 +428,36 @@ exactly ONE place: `classify` buckets the resolved qualifier (`state`, else
 `status` — `ReportedAgent::qualifier`'s precedence) into an `AgentActivity`.
 Every qualifier-shaped output derives from that enum, so they cannot drift apart:
 
-| Bucket | Qualifier(s) | Badge color | Dot pulses | Banner reads |
-| --- | --- | --- | --- | --- |
-| `NeedsInput` | `blocked`, `waiting` | `Yellow` | no | `needs input` (the ONE translated bucket — both tokens) |
-| `Idle` | `idle` | `Green` | no | `idle` (verbatim) |
-| `Working` | `working`, `busy` | `Gray` | **yes** (-> `DarkGray`) | verbatim (`working` / `busy`) |
-| `Done` | `done` | `Green` | no | `done` (verbatim) |
-| `Other` | anything else, or none | `Gray` | yes (-> `DarkGray`) | verbatim, or the kind label alone |
+| Bucket | Qualifier(s) | Badge color | Badge glyph | Dot pulses | Banner / row reads |
+| --- | --- | --- | --- | --- | --- |
+| `NeedsInput` | `blocked`, `waiting` | `Yellow` (label/phrase) | `!` (`Red`) | no | `needs input` (the ONE translated bucket — both tokens) |
+| `Idle` | `idle` | `Green` | `●` | no | `idle` (verbatim) |
+| `Working` | `working`, `busy` | `Gray` | `●` | **yes** (-> `DarkGray`) | verbatim (`working` / `busy`) |
+| `Done` | `done` | `Green` | `●` | no | `done` (verbatim) |
+| `Other` | anything else, or none | `Gray` | `●` | yes (-> `DarkGray`) | verbatim, or the kind label alone |
+
+The **Badge glyph** column is a second, SHAPE channel on top of the color one:
+`NeedsInput` marks its badge with `!` (via `tui::view::badge_glyph`, chosen by
+bucket) instead of the `●` every other bucket draws, so the ONE row asking for
+the user still reads as different in a monochrome terminal, or to a color-blind
+reader, where the yellow-only signal does not. It is plain one-cell ASCII, so it
+renders everywhere and shifts no layout. The glyph is bucket-derived and stable
+across pulse phases — the pulse changes only COLOR, never the symbol (see below).
+
+That `!` also **reddens**: `tui::view::badge_glyph_color` gives it `Red` while the
+kind label and qualifier keep the bucket's `Yellow`, so only the single glyph cell
+diverges (see the parenthetical in the **Badge color** / **Badge glyph** columns).
+Red is an ACCENT layered on the shape channel — one steady cell, NOT a row-wide or
+pulsing alarm, which the design avoids because nearly every active agent is
+`blocked` and an alarm on all of them would cry wolf.
+
+The **Banner / row reads** column is one phrase with two consumers: `classify`
+feeds a single `agents::qualifier_copy`, so the preview banner
+(`friendly_status`, kind label fused in) and the board **list row** speak the
+SAME translated copy — the row no longer prints the raw token. Only the WEIGHT
+differs, and that is a `tui::view` rendering call, not a bucket property:
+`NeedsInput` draws its `needs input` at the badge's own color + `BOLD` (as loud
+as the dot and kind label), every other bucket stays `DIM`.
 
 **Every column is a DISPLAY decision — no bucket answers "live?".** The table
 once carried that column and it was the bug: liveness is not a property of a
@@ -442,9 +465,11 @@ qualifier, it is `live_agents`' membership answer straight from claude (see
 above).
 
 A pulsing bucket alternates its dot between the badge color and the dim partner
-shown above; the dot's `●` is drawn in every phase, and a steady bucket simply
-holds the badge color. The pulse is a COLOR change, never a glyph swap — the
-rule and the reason it is not negotiable live in
+shown above; the badge glyph (`●`, or `!` for `NeedsInput` — see the **Badge
+glyph** column) is drawn in every phase, and a steady bucket simply holds the
+badge color. The pulse is a COLOR change, never a glyph swap; the glyph a row
+draws is chosen once by bucket and never varies with the phase — the rule and the
+reason it is not negotiable live in
 [PATTERNS.md](PATTERNS.md#7-restrained-terminal-safe-styling).
 
 Two tokens per bucket is deliberate: `waiting`/`blocked` and `busy`/`working` are
