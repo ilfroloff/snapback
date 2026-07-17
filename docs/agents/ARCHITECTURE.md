@@ -12,6 +12,12 @@ Code** sessions stored as JSONL under `~/.claude/projects/`. It exists because
 the built-in `/resume` picker is per-project with no cross-folder view and no
 content search. It depends on nothing outside its own `Cargo.toml`.
 
+That last sentence still holds despite `npm/` existing. The npm package is a
+**distribution channel, not a dependency**: it carries prebuilt binaries and
+copies one onto your `PATH`. The installed program is the same self-contained
+Rust binary, with no node anywhere near it. Nothing under `src/` may ever import,
+shell out to, or assume node.
+
 ## Stack
 
 | Concern | Crate | Pin | Notes |
@@ -69,6 +75,7 @@ the render framework.** That is why `agents::classify` buckets the undocumented
 | `tui::update` | `src/tui/update.rs` | Elm-style event→state dispatch: `key_to_action`, `handle_event`, mouse routing (wheel scroll, splitter drag, preview link click-to-open), and the two overlay state machines (running-session choice + new-session agent picker). |
 | `tui::view` | `src/tui/view.rs` | Rendering: two-pane grouped list + preview, header/search/help lines, running-session overlay + new-session agent picker. The header's right-aligned version indicator branches on `cfg!(debug_assertions)`: release builds show `v<crate-version>`, dev builds `dev+<git-hash>[-dirty]` (pure `format_version_label`). Owns the pure wrap-mapping (`wrapped_line_height`/`link_at`) that hit-tests a click to a preview link, the pure `preview_split` that carves a REPORTED session's pinned status-banner row off the preview pane (the transcript rect `update` must hit-test against — keyed on having a banner, never on liveness, since a `done` agent has one but is not live), and the badge's palette (`badge_color`, mapping an `AgentActivity` to a named ANSI color). Draws a folded head's `(+N)` and indents an expanded lineage's children, with the pure `fit_label` reserving the marker's columns BEFORE the label's so a narrow pane clips the label instead of the marker. A child's turn count (`child_msgs` / `fit_child_msgs`) is the mirror of that rule: it is drawn WHOLE or dropped entirely, never clipped, since a truncated count reads back as a plausible wrong number rather than a short one. |
 | `build` | `build.rs` | Build script (compile-time, not a runtime module): fail-soft `git rev-parse`/`status` into `SNAPBACK_GIT_HASH`/`SNAPBACK_GIT_DIRTY` env vars for the dev version indicator; degrades to `unknown`/`0` outside a repo. |
+| *(packaging)* | `npm/cli.js` | **Not part of the program** — an install-time wrapper, published to npm as `snapback-tui`, that hands out the prebuilt binaries so installing needs no Rust toolchain. `install` copies the platform's binary onto `PATH` under both names and exits; node is gone from that point on. Bare `npx snapback-tui` also spawns the TUI (stdio inherited, SIGINT/SIGTSTP left to the child so the TUI's own terminal restore is not pre-empted), but that path is a convenience, not the blessed one. See [OPERATIONS.md](OPERATIONS.md#the-npm-package). |
 
 ## Runtime architecture
 

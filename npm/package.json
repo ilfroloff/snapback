@@ -1,0 +1,47 @@
+{
+  "name": "snapback-tui",
+  "version": "0.0.0",
+  "description": "Browse, search, and resume Claude Code sessions from a ratatui TUI.",
+  "keywords": [
+    "claude",
+    "claude-code",
+    "tui",
+    "sessions",
+    "resume",
+    "cli"
+  ],
+  "homepage": "https://github.com/ilfroloff/snapback#readme",
+  "bugs": {
+    "url": "https://github.com/ilfroloff/snapback/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ilfroloff/snapback.git",
+    "directory": "npm"
+  },
+  "license": "Apache-2.0",
+  "author": "Illia Fralou",
+  "type": "commonjs",
+  "bin": {
+    "snapback-tui": "cli.js"
+  },
+  "files": [
+    "cli.js",
+    "bin/"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "preferUnplugged": true,
+  "scripts": {
+    "prepublishOnly": "node ./scripts/preflight.js"
+  }
+}

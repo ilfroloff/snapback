@@ -1,0 +1,8 @@
+# Platform binaries are BUILD OUTPUT, produced by .github/workflows/npm-release.yml
+# from the tagged source and assembled here just before `npm publish`. They are
+# never committed: they are ~4MB of compiled artifacts whose only source of truth
+# is the tag they were built from. See docs/agents/OPERATIONS.md.
+bin/
+
+# `npm pack` output from a local packaging check.
+*.tgz

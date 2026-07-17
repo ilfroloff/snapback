@@ -1,0 +1,220 @@
+name: "📦 Publish to npm"
+
+# Cross-compiles the tagged source for every supported platform and publishes the
+# binaries to npm as `snapback-tui`, so `npx snapback-tui install` works without a
+# Rust toolchain. See docs/agents/OPERATIONS.md ("How a release happens").
+#
+# WHY A TAG TRIGGER, and why it actually fires: `🔖 Release` (release-plz.yml)
+# cuts the `vX.Y.Z` tag using RELEASE_PLZ_TOKEN, a PAT authored by a real
+# account. That is load-bearing HERE: a tag pushed with the built-in GITHUB_TOKEN
+# would NOT trigger this workflow (GitHub suppresses workflow triggers on
+# GITHUB_TOKEN-authored events, precisely to stop loops), and this file would
+# never run. release-plz.yml's header already records the PAT as the thing that
+# preserves downstream triggers; this workflow is the downstream that depends on
+# it. Verified against reality: the v0.1.0 tag is authored by a real account, not
+# github-actions[bot].
+#
+# NO LOOP: nothing here pushes a commit or a tag. It only reads the tag, builds,
+# and publishes to a registry.
+#
+# NOT release-plz's job: release-plz is deliberately git-only (`publish = false`
+# in release-plz.toml) and must stay that way — that flag governs `cargo publish`
+# to crates.io, which we never want. npm is a separate registry and a separate
+# artifact (prebuilt binaries, not source), so it is a separate workflow keyed off
+# the tag release-plz produces. Do not try to fold this into release-plz.toml.
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Least privilege, matching release-plz.yml's stance.
+#
+# `contents: read` is all the build needs. Note what is deliberately ABSENT:
+# `contents: write`. Attaching the built binaries to the GitHub Release would be a
+# nice-to-have, but it is not what this workflow is for, and it would widen a
+# publishing workflow's write scope for a feature nobody asked for. If that is
+# wanted later, add it THEN, with the permission scoped to the job that needs it.
+#
+# `id-token: write` is required for npm provenance (see the publish step) and is
+# scoped to that job only, not granted workflow-wide.
+permissions:
+  contents: read
+
+# Never publish the same tag twice concurrently, and never cancel a publish
+# midway — a half-published version cannot be re-published (npm forbids reusing a
+# version number), so an interrupted run is expensive to recover from.
+concurrency:
+  group: npm-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: "🔨 Build ${{ matrix.key }}"
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # A partial matrix must never reach the publish job. `fail-fast` stops the
+      # other builds early; the real backstop is npm/scripts/preflight.js, which
+      # refuses to publish a tarball with any platform's binary missing.
+      fail-fast: true
+      matrix:
+        include:
+          # Every target is built on its OWN architecture, never cross-compiled.
+          # That is what lets each build EXEC the binary it just produced, which
+          # the equivalence check below depends on — a cross-compiled binary
+          # could not be run, and the check would silently degrade into nothing.
+          - key: darwin-arm64
+            target: aarch64-apple-darwin
+            runner: macos-15
+          # `macos-15-intel`, NOT `macos-13` (retired December 2025) and NOT
+          # `macos-latest` (Apple Silicon — it would build arm64 and mislabel it
+          # x64, which no test here would catch: the binary would run fine on the
+          # CI host and fail only on a real Intel Mac). This is the LAST x86_64
+          # macOS image GitHub will offer; it goes away in August 2027, after
+          # which darwin-x64 cannot be built natively and this entry must either
+          # cross-compile from arm64 (giving up the equivalence check below) or
+          # be dropped.
+          - key: darwin-x64
+            target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - key: linux-x64
+            target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - key: linux-arm64
+            target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+
+      # Reads rust-toolchain.toml for the channel, exactly like ci.yml and
+      # release-plz.yml — the pinned toolchain is the single source of truth, so
+      # a released binary is built by the same compiler that gated the PR.
+      - name: "🦀 Set up Rust toolchain (from rust-toolchain.toml)"
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+
+      # musl gives a STATICALLY linked Linux binary, so it runs on any distro
+      # regardless of that distro's glibc version. A glibc build would silently
+      # bind to the runner's glibc and then fail on any older system with a
+      # "GLIBC_2.xx not found" error at exec time — an error the user cannot act
+      # on and we would never see in CI.
+      - name: "🐧 Install musl tooling"
+        if: startsWith(matrix.runner, 'ubuntu')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: "🔨 Build"
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # PINS THE CONTRACT THE NPM PACKAGE RELIES ON. npm/cli.js ships ONE binary
+      # per platform and installs it under BOTH names, because src/main.rs and
+      # src/bin/sb.rs are the same shim and the crate documents "no argv[0]
+      # dispatch, so sb and snapback are the same program under two names".
+      # That is a promise in a comment, and the packaging turns it into a
+      # correctness dependency — so verify it against the real binaries instead of
+      # trusting it. If anyone ever teaches the program to behave differently
+      # depending on the name it was launched under, this goes red HERE, at
+      # release time, rather than shipping an `sb` that quietly is not `sb`.
+      # An empty store keeps --print-list deterministic and off the runner's HOME.
+      - name: "🔍 Verify sb and snapback are the same program"
+        run: |
+          cd target/${{ matrix.target }}/release
+          empty="$(mktemp -d)"
+          diff <(./snapback --help) <(./sb --help)
+          diff <(CLAUDE_PROJECTS_DIR="$empty" ./snapback --print-list) \
+               <(CLAUDE_PROJECTS_DIR="$empty" ./sb --print-list)
+          echo "OK: sb is byte-identical in behaviour to snapback"
+
+      # Stage under the platform key npm/cli.js resolves at runtime
+      # (`${process.platform}-${process.arch}`). Only `snapback` is staged: `sb`
+      # is created as a copy at install time, per the contract verified above.
+      - name: "📦 Stage binary"
+        run: |
+          mkdir -p "dist/${{ matrix.key }}"
+          cp "target/${{ matrix.target }}/release/snapback" "dist/${{ matrix.key }}/snapback"
+
+      - name: "⬆️ Upload"
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.key }}
+          path: dist
+          # An empty upload would sail through and surface as a missing binary in
+          # the published tarball. Fail here, where the cause is visible.
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: "🚀 Publish snapback-tui"
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Required for npm provenance, and granted ONLY to this job. Provenance
+      # publishes a signed, public attestation linking the tarball to this repo,
+      # this workflow, and this commit — so an installer can verify the binaries
+      # came from the tagged source rather than from someone's laptop. It is the
+      # closest thing to a supply-chain guarantee available for shipping compiled
+      # artifacts through npm, which is exactly what this package does.
+      id-token: write
+    steps:
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+
+      - name: "⬇️ Download every platform binary"
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          merge-multiple: true
+          path: npm/bin
+
+      # The tarball is assembled from artifacts, so the exec bit does not survive
+      # the round trip (the artifact format does not preserve it). npm/cli.js
+      # chmods on install too, but a non-executable binary in the tarball is a
+      # broken package for anyone who runs it in place (bare `npx snapback-tui`).
+      - name: "🔑 Restore the executable bit"
+        run: chmod +x npm/bin/*/snapback
+
+      - name: "🟢 Set up Node"
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      # THE VERSION COMES FROM THE TAG, and package.json's committed 0.0.0 is a
+      # deliberate placeholder, not an oversight. release-plz.toml sets
+      # `git_only = true`, making the git tag the sole source of truth for "what
+      # version is released"; a version committed in package.json would be a
+      # SECOND source of truth that nothing keeps in sync, and it would drift the
+      # first time someone bumped one and not the other. Stamping it here means
+      # the npm version cannot disagree with the tag — there is nothing to
+      # disagree with.
+      #
+      # Cargo.toml is cross-checked rather than trusted: release-plz lands the
+      # bump in Cargo.toml and cuts the tag from it, so the two agreeing is an
+      # invariant of a healthy release. If they ever disagree, the release is
+      # malformed and publishing the wrong version to an immutable registry is
+      # not the way to find out.
+      - name: "🏷️ Stamp the version from the tag"
+        working-directory: npm
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          cargo_version="$(grep -m1 '^version = ' ../Cargo.toml | cut -d'"' -f2)"
+          if [ "$version" != "$cargo_version" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} disagrees with Cargo.toml (${cargo_version}). Refusing to publish."
+            exit 1
+          fi
+          npm version --no-git-tag-version --allow-same-version "$version"
+          echo "Publishing snapback-tui@${version}"
+
+      # `--access public` is REQUIRED for a first publish even on an unscoped
+      # name, and harmless after. `--provenance` needs the id-token permission
+      # above. prepublishOnly runs npm/scripts/preflight.js, which is the last
+      # gate: it refuses the 0.0.0 placeholder and any missing/truncated binary.
+      - name: "🚀 Publish"
+        working-directory: npm
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

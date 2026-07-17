@@ -29,9 +29,36 @@ them in a keystroke. It gives you:
 
 ## Install
 
-`snapback` builds from source, so you need the **Rust toolchain**
-([rustup.rs](https://rustup.rs), stable) to install it and **`claude` on your
-`PATH`** to resume into. There is no prebuilt binary.
+You need **`claude` on your `PATH`** to resume into. Everything else is one
+command.
+
+```sh
+npx snapback-tui install
+# or
+bunx snapback-tui install
+```
+
+That installs prebuilt binaries — **no Rust toolchain required** — and then gets
+out of the way: `install` puts the native `snapback` and `sb` on your `PATH`, so
+you run them directly with no Node in between.
+
+```sh
+snapback       # and you're in
+```
+
+Prebuilt for macOS (arm64/x64) and Linux (x64/arm64). To install somewhere other
+than `~/.local/bin`, set `SNAPBACK_INSTALL_DIR`. To uninstall, delete the two
+binaries — `install` prints the exact command. You can also run it without
+installing (`npx snapback-tui`), which is fine for a look, though the installed
+binaries are the better way to live with it.
+
+> The npm package is named **`snapback-tui`**, not `snapback`: the bare name on
+> npm belongs to an unrelated package. The commands it installs are still
+> `snapback` and `sb`.
+
+### From source
+
+Needs the **Rust toolchain** ([rustup.rs](https://rustup.rs)):
 
 ```sh
 # from a local checkout (installs snapback and its sb alias onto your PATH):
@@ -41,11 +68,11 @@ cargo install --path .
 cargo install --git https://github.com/ilfroloff/snapback
 
 # or a specific pinned release (reproducible):
-cargo install --git https://github.com/ilfroloff/snapback --tag v0.1.0
+cargo install --git https://github.com/ilfroloff/snapback --tag v0.2.0
 ```
 
-Releases are tagged `vX.Y.Z` — pick one from the repo's Releases page. All three
-forms install the same program under two names, `snapback` and the short alias
+Releases are tagged `vX.Y.Z` — pick one from the repo's Releases page. Every form
+above installs the same program under two names, `snapback` and the short alias
 `sb`; use whichever you prefer.
 
 Optional override:
