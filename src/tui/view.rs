@@ -85,12 +85,38 @@ const GIT_DIRTY: &str = env!("SNAPBACK_GIT_DIRTY");
 /// `watch::TICK`: if that cadence ever changes, retune this to keep ~1Hz.
 const BLINK_TICKS: u64 = 2;
 
-/// The glyph of a live badge's dot.
+/// The default badge glyph: a filled dot.
 ///
-/// Drawn for EVERY reported agent in EVERY pulse phase, active or not: the pulse
-/// alternates the dot's COLOR and must never touch its symbol (see
-/// [`pulse_color`] for why).
+/// The glyph a row draws is chosen per BUCKET by [`badge_glyph`] — this `●` for
+/// every bucket EXCEPT [`AgentActivity::NeedsInput`], which draws
+/// [`BADGE_NEEDS_INPUT`] instead. WITHIN a row the glyph is then fixed: the pulse
+/// alternates the badge's COLOR and must never touch its symbol (see
+/// [`pulse_color`] for why), so whichever glyph a row picked is drawn identically
+/// in both pulse phases, active or not.
 const BADGE_DOT: &str = "\u{25cf}";
+
+/// The badge glyph marking the ONE bucket that wants the user:
+/// [`AgentActivity::NeedsInput`].
+///
+/// A second, SHAPE channel on top of the yellow-only color signal: `!` still
+/// stands out in a monochrome terminal, or to a color-blind reader, where the
+/// yellow dot reads the same as every other. Plain ASCII on purpose — it renders
+/// everywhere, unlike an emoji or a wide glyph, and stays one cell wide so it
+/// causes no layout shift against [`BADGE_DOT`]. Chosen strictly by BUCKET (see
+/// [`badge_glyph`]); `NeedsInput` is steady, so this is drawn identically in both
+/// pulse phases — the pulse still only ever changes color, never the symbol.
+const BADGE_NEEDS_INPUT: &str = "!";
+
+/// The red accent color of the [`AgentActivity::NeedsInput`] badge glyph (`!`).
+///
+/// Confined to that single `!` cell (see [`badge_glyph_color`]): the kind label
+/// and qualifier keep [`badge_color`]'s yellow, so red is an ACCENT that lifts the
+/// one bucket that wants the user above the palette, NOT a row-wide alarm — a
+/// steady red on one cell, not the pulsing red the design deliberately avoids.
+///
+/// A NAMED ANSI color, never RGB (TERMINAL-SAFE STYLING), so it adapts to the
+/// terminal theme; red reads as "act now" across themes.
+const BADGE_NEEDS_INPUT_COLOR: Color = Color::Red;
 
 /// The base badge color of the buckets that PULSE (`Working`, and `Other`
 /// tracking it — see [`crate::agents::is_active`]).
@@ -388,9 +414,11 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                     ),
                     Span::raw("  "),
                 ];
-                // Compact agent badge in its own column: `● bg` / `● live` (+ a
-                // dim state/status qualifier). Rows claude never reported show
-                // nothing here. Joined strictly by full session_id.
+                // Compact agent badge in its own column: `● bg` / `● live`, plus
+                // the translated qualifier phrase — LOUD for `NeedsInput` (`needs
+                // input` at badge weight) and DIM for every other bucket. Rows
+                // claude never reported show nothing here. Joined strictly by full
+                // session_id.
                 //
                 // Deliberately keyed on REPORTED, not live: an agent that
                 // reported completion must still render its badge — green and
@@ -399,11 +427,17 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 // (`App::is_live_now`) rather than reading this map.
                 if let Some(agent) = app.reported_agent(&session.session_id) {
                     // Dot and kind label are separate spans purely so they can
-                    // share one state color yet differ in pulse: the whole badge
-                    // is colored by state, but ONLY the dot pulses — a blinking
-                    // text label would be noise on a board of live sessions.
+                    // differ in both color and pulse: the label carries the badge
+                    // base, ONLY the dot pulses, and — for `NeedsInput` — only the
+                    // dot reddens (see below). A blinking OR reddening text label
+                    // would be noise on a board of live sessions.
                     let base = badge_color(agent);
                     let badge = Style::default().fg(base).add_modifier(Modifier::BOLD);
+                    // The glyph's own base color: the red accent for `NeedsInput`
+                    // (see [`badge_glyph_color`]), otherwise the badge base. Only
+                    // this one cell diverges — the label and qualifier keep `base`.
+                    let glyph_base = badge_glyph_color(agent);
+                    let glyph = Style::default().fg(glyph_base).add_modifier(Modifier::BOLD);
                     // The pulse is APP-driven off the tick the loop already
                     // redraws on — see [`blink_visible`] for why the terminal
                     // cannot be asked to animate it. Only an ACTIVE agent
@@ -414,18 +448,38 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                     // forced to re-detect a link in the label beside it — see
                     // [`pulse_color`].
                     let dot = if agents::is_active(agent) && !blink_visible(app.tick) {
-                        badge.fg(pulse_color(base))
+                        glyph.fg(pulse_color(glyph_base))
                     } else {
-                        badge
+                        glyph
                     };
-                    spans.push(Span::styled(BADGE_DOT, dot));
+                    // The glyph is chosen by BUCKET, not by phase: `NeedsInput`
+                    // marks its badge with a RED `!` (a shape + color accent that
+                    // survives a monochrome or color-blind reader the yellow dot
+                    // does not), every other bucket keeps a state-colored `●`. The
+                    // pulse still only restyles this cell — whichever glyph the
+                    // bucket picked is drawn identically in both phases (see
+                    // [`badge_glyph`]).
+                    spans.push(Span::styled(badge_glyph(agent), dot));
                     spans.push(Span::styled(format!(" {}", agent.kind_label()), badge));
-                    if let Some(qualifier) = agent.qualifier() {
+                    // The translated qualifier phrase, weighted BY BUCKET. The one
+                    // bucket that wants the user — `NeedsInput` — draws `needs
+                    // input` (via the shared `agents::qualifier_copy`) at the
+                    // badge's own color + BOLD, so it reads as loudly as the dot
+                    // and kind label it shares that color with, instead of being
+                    // the quietest text on the row. Every OTHER bucket keeps its
+                    // raw qualifier DIM, exactly as before. Drawn as its OWN span,
+                    // never via `friendly_status` — that fuses the kind label into
+                    // the phrase, and the label is already its own span above.
+                    if let Some(phrase) = agents::qualifier_copy(agent) {
+                        let style = if agents::classify(agent) == AgentActivity::NeedsInput {
+                            Style::default()
+                                .fg(badge_color(agent))
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().add_modifier(Modifier::DIM)
+                        };
                         spans.push(Span::raw(" "));
-                        spans.push(Span::styled(
-                            qualifier.to_string(),
-                            Style::default().add_modifier(Modifier::DIM),
-                        ));
+                        spans.push(Span::styled(phrase.to_string(), style));
                     }
                     spans.push(Span::raw("  "));
                 }
@@ -531,8 +585,37 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
     app.scroll = state.offset();
 }
 
-/// The BASE color of a reported agent's whole badge — both the `\u{25cf}` dot
-/// AND the `bg`/`live` kind label, which must always agree.
+/// The badge glyph for a reported agent, chosen by BUCKET.
+///
+/// [`BADGE_NEEDS_INPUT`] (`!`) for the ONE bucket that wants the user
+/// ([`AgentActivity::NeedsInput`]), [`BADGE_DOT`] (`●`) for every other bucket.
+/// Derived from [`crate::agents::classify`] — the bucket — never from the raw
+/// `state`/`status` tokens, so it can never disagree with [`badge_color`] or the
+/// pulse about what the qualifier meant.
+///
+/// This is a SHAPE channel layered on top of the color one: `NeedsInput` already
+/// colors its badge `Yellow`, but a shape survives a monochrome terminal or a
+/// color-blind reader that a yellow-only signal does not. The choice is by bucket
+/// and therefore STABLE across pulse phases: `NeedsInput` is steady, so its `!` is
+/// drawn identically in both phases, and the pulse continues to change only the
+/// badge's COLOR, never its symbol (see [`pulse_color`]).
+#[must_use]
+fn badge_glyph(agent: &ReportedAgent) -> &'static str {
+    if agents::classify(agent) == AgentActivity::NeedsInput {
+        BADGE_NEEDS_INPUT
+    } else {
+        BADGE_DOT
+    }
+}
+
+/// The BASE color of a reported agent's badge — the `bg`/`live` kind label, the
+/// qualifier phrase, and (via [`badge_glyph_color`]) the `●` dot.
+///
+/// The dot and the label agree on this color for every bucket EXCEPT
+/// [`AgentActivity::NeedsInput`], whose `!` glyph diverges to the
+/// [`BADGE_NEEDS_INPUT_COLOR`] red accent while its label and qualifier keep this
+/// yellow — see [`badge_glyph_color`]. The divergence is one glyph cell, on
+/// purpose.
 ///
 /// Pure, and derived from [`crate::agents::classify`] like every other
 /// qualifier-shaped output, so the `state`/`status` value set is never re-matched
@@ -558,7 +641,8 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
 /// color (see [`pulse_color`]).
 ///
 /// `pub(crate)` only so [`AgentActivity`]'s docs can point at the palette their
-/// buckets feed; `render_list` is its one caller.
+/// buckets feed; `render_list` (the label/qualifier) and [`badge_glyph_color`]
+/// (the dot) are its callers.
 #[must_use]
 pub(crate) fn badge_color(agent: &ReportedAgent) -> Color {
     match agents::classify(agent) {
@@ -569,6 +653,30 @@ pub(crate) fn badge_color(agent: &ReportedAgent) -> Color {
         AgentActivity::Idle | AgentActivity::Done => Color::Green,
         // Unknown/absent tracks the working bucket, matching `is_active`.
         AgentActivity::Working | AgentActivity::Other => BADGE_WORKING,
+    }
+}
+
+/// The color of a reported agent's badge GLYPH (the `●`/`!` cell).
+///
+/// Equal to [`badge_color`] for every bucket EXCEPT
+/// [`AgentActivity::NeedsInput`], whose `!` marker ([`badge_glyph`]) diverges to
+/// the [`BADGE_NEEDS_INPUT_COLOR`] red accent. The kind label and qualifier keep
+/// [`badge_color`]'s yellow, so ONLY this one glyph cell reddens — an accent that
+/// lifts the one bucket that wants the user above the palette, layered on top of
+/// the shape channel the `!` already provides, without turning the row into an
+/// alarm.
+///
+/// Pure and derived from [`crate::agents::classify`] — the BUCKET — so it can
+/// never disagree with [`badge_glyph`] about which bucket earns the accent.
+/// `NeedsInput` is steady ([`crate::agents::is_active`] is false for it), so the
+/// red never pulses; every other bucket returns exactly [`badge_color`], so the
+/// pulse and the resting palette are untouched.
+#[must_use]
+fn badge_glyph_color(agent: &ReportedAgent) -> Color {
+    if agents::classify(agent) == AgentActivity::NeedsInput {
+        BADGE_NEEDS_INPUT_COLOR
+    } else {
+        badge_color(agent)
     }
 }
 
@@ -2615,21 +2723,25 @@ mod tests {
         label_cells: Vec<(Color, Modifier)>,
     }
 
-    /// Scan a rendered list buffer for every DRAWN badge dot, locating each by
-    /// its `●` glyph rather than by a hardcoded column — a layout tweak then
-    /// fails this test loudly instead of silently reading the wrong cells.
+    /// Scan a rendered list buffer for every DRAWN badge, locating each by its
+    /// badge glyph — `●`, or `!` for a `NeedsInput` row (`badge_glyph` picks one
+    /// per bucket) — rather than by a hardcoded column, so a layout tweak fails
+    /// this test loudly instead of silently reading the wrong cells. The FIRST
+    /// cell matching EITHER glyph is the badge: the timestamp and label to its
+    /// left contain neither symbol, so the leftmost match is still the badge, and
+    /// both glyphs are one cell wide so the `dot_x + 2` label offset is unchanged.
     ///
-    /// Every REPORTED row is found in every pulse phase: the glyph is
-    /// unconditional and the pulse only restyles it, so an absent dot means the
-    /// row has no agent — never that it is mid-pulse. The phase is read off
+    /// Every REPORTED row is found in every pulse phase: the glyph is drawn
+    /// unconditionally and the pulse only restyles it, so an absent badge means
+    /// the row has no agent — never that it is mid-pulse. The phase is read off
     /// `dot_fg`, not off presence.
     fn drawn_badges(buffer: &ratatui::buffer::Buffer, width: u16, height: u16) -> Vec<DrawnBadge> {
         let mut badges = Vec::new();
         for y in 0..height {
             let Some(dot_x) = (0..width).find(|&x| {
-                buffer
-                    .cell((x, y))
-                    .is_some_and(|cell| cell.symbol() == BADGE_DOT)
+                buffer.cell((x, y)).is_some_and(|cell| {
+                    cell.symbol() == BADGE_DOT || cell.symbol() == BADGE_NEEDS_INPUT
+                })
             }) else {
                 continue; // Not a reported row.
             };
@@ -2770,6 +2882,8 @@ mod tests {
 
     /// Refinements 3 + 4: the WHOLE badge (dot + kind label) is colored by the
     /// agent's state, and every reported row — pulsing or not — shows its dot.
+    /// The dot and label share that state color for every bucket EXCEPT
+    /// `NeedsInput`, whose `!` reddens to the accent while its label stays yellow.
     #[test]
     fn render_list_colors_the_whole_badge_by_state() {
         let mut app = badge_board();
@@ -2807,17 +2921,8 @@ mod tests {
                 "the {state:?} label must have drawn cells to assert over"
             );
 
-            // Refinement 4: dot and label agree on the state color.
-            assert_eq!(
-                badge.dot_fg, color,
-                "the {state:?} dot must be {color:?}, got {:?}",
-                badge.dot_fg
-            );
+            // The kind label always carries the bucket's badge color.
             for (fg, modifier) in &badge.label_cells {
-                assert_eq!(
-                    *fg, badge.dot_fg,
-                    "the {state:?} kind label must carry the SAME fg as its dot"
-                );
                 assert_eq!(*fg, color, "the {state:?} kind label must be {color:?}");
                 // `contains`, not equality: the List's `highlight_style` layers
                 // REVERSED (and its own BOLD) onto whichever row is selected, so
@@ -2827,17 +2932,234 @@ mod tests {
                     "the {state:?} kind label must survive to the buffer BOLD, got {modifier:?}"
                 );
             }
+
+            // The dot carries that SAME color, EXCEPT `NeedsInput`, whose `!`
+            // diverges to the red accent while its label stays yellow — the
+            // one-cell divergence that is the whole point of the red marker.
+            let expected_dot_fg = if matches!(state, "blocked" | "waiting") {
+                BADGE_NEEDS_INPUT_COLOR
+            } else {
+                color
+            };
+            assert_eq!(
+                badge.dot_fg, expected_dot_fg,
+                "the {state:?} dot must be {expected_dot_fg:?}, got {:?}",
+                badge.dot_fg
+            );
         }
     }
 
-    /// THE core invariant: the dot's glyph is drawn in BOTH pulse phases, for
-    /// EVERY reported bucket — pulsing or steady. The pulse restyles the cell; it
-    /// must never blank it.
+    /// The whole point of the change: the ONE bucket that wants the user reads
+    /// LOUD on the list row. A `NeedsInput` row draws its translated `needs input`
+    /// copy at the badge's own color + BOLD (matching the dot and kind label),
+    /// while every OTHER bucket keeps its raw qualifier DIM — so the state that
+    /// demands action is no longer the quietest text on the row.
+    ///
+    /// Both claims are read off the DRAWN cells (PATTERNS.md's "assert drawn
+    /// cells" rule): a style the List patches away is one the user never sees.
+    #[test]
+    fn render_list_makes_the_needs_input_qualifier_prominent() {
+        let mut app = badge_board();
+        app.tick = 0; // Phase is irrelevant to a steady bucket; pin it anyway.
+
+        let (width, height) = BADGE_BOARD_SIZE;
+        let buffer = drawn_list(&mut app, width, height);
+
+        // Locate a NeedsInput row by its UNIQUE session label — NEVER by the
+        // phrase `needs input`, which two rows (`blocked` and `waiting`) now share,
+        // so `row_of` would panic on the ambiguity.
+        let needs_input = row_of(&buffer, width, height, "sess-blocked");
+        let phrase = "needs input";
+        let phrase_x = column_of(&buffer, needs_input, width, phrase);
+        for (i, ch) in phrase.chars().enumerate() {
+            let cell = buffer
+                .cell((
+                    phrase_x + u16::try_from(i).expect("a phrase shorter than a row"),
+                    needs_input,
+                ))
+                .expect("a drawn `needs input` cell");
+            assert_eq!(cell.symbol(), ch.to_string());
+            assert_eq!(
+                cell.fg,
+                Color::Yellow,
+                "the `needs input` phrase must carry the badge's own color, matching \
+                 its dot and kind label ({:?})",
+                cell.fg
+            );
+            // `contains`, since the List's `highlight_style` layers REVERSED|BOLD
+            // onto the selected row and this row may be it.
+            assert!(
+                cell.modifier.contains(Modifier::BOLD),
+                "the `needs input` phrase must draw at badge weight (BOLD), got {:?}",
+                cell.modifier
+            );
+            assert!(
+                !cell.modifier.contains(Modifier::DIM),
+                "THE regression guard: `needs input` must NEVER be dim — that \
+                 de-emphasis is exactly what made it the quietest text on the row"
+            );
+        }
+
+        // The contrast: a NON-NeedsInput bucket keeps its raw qualifier DIM. Read
+        // on `sess-idle`, which is NOT the default selection (that is the first
+        // row, `sess-blocked`), so `highlight_style` cannot layer BOLD over the
+        // DIM claim below.
+        let idle = row_of(&buffer, width, height, "sess-idle");
+        let idle_qualifier = "idle";
+        let idle_x = column_of(&buffer, idle, width, idle_qualifier);
+        for i in 0..idle_qualifier.chars().count() {
+            let cell = buffer
+                .cell((
+                    idle_x + u16::try_from(i).expect("a qualifier shorter than a row"),
+                    idle,
+                ))
+                .expect("a drawn `idle` qualifier cell");
+            assert!(
+                cell.modifier.contains(Modifier::DIM),
+                "a non-NeedsInput qualifier stays DIM, exactly as before: {:?}",
+                cell.modifier
+            );
+            assert!(
+                !cell.modifier.contains(Modifier::BOLD),
+                "and it must NOT draw at badge weight — only NeedsInput does"
+            );
+        }
+    }
+
+    /// The SHAPE channel: the ONE bucket that wants the user marks its badge with
+    /// `!`, not the `●` every other bucket draws — a second signal layered on the
+    /// yellow color, so a monochrome terminal or a color-blind reader still sees
+    /// which row is asking. Read off the DRAWN cells (PATTERNS.md's rule).
+    ///
+    /// The glyph is chosen by BUCKET, never by pulse phase: `NeedsInput` is steady,
+    /// so its badge cell — glyph AND style — is IDENTICAL in both phases. The pulse
+    /// still only ever changes COLOR, and only for an ACTIVE bucket, so it can
+    /// never touch this steady `!`.
+    #[test]
+    fn render_list_marks_needs_input_rows_with_a_bang() {
+        let (width, height) = BADGE_BOARD_SIZE;
+
+        // The badge cell (symbol + full style) drawn on the row labeled `label`,
+        // located by the leftmost cell carrying EITHER badge glyph.
+        let badge_cell = |tick: u64, label: &str| -> ratatui::buffer::Cell {
+            let mut app = badge_board();
+            app.tick = tick;
+            let buffer = drawn_list(&mut app, width, height);
+            let y = row_of(&buffer, width, height, label);
+            let x = (0..width)
+                .find(|&x| {
+                    buffer.cell((x, y)).is_some_and(|cell| {
+                        cell.symbol() == BADGE_NEEDS_INPUT || cell.symbol() == BADGE_DOT
+                    })
+                })
+                .unwrap_or_else(|| panic!("a badge glyph must be drawn on the {label:?} row"));
+            buffer
+                .cell((x, y))
+                .expect("the badge cell was just located in this buffer")
+                .clone()
+        };
+
+        // Both NeedsInput spellings wear the `!`, Yellow + BOLD, and are STEADY:
+        // the badge cell is byte-identical across the two pulse phases.
+        for label in ["sess-blocked", "sess-waiting"] {
+            let on = badge_cell(0, label);
+            assert_eq!(
+                on.symbol(),
+                BADGE_NEEDS_INPUT,
+                "the {label:?} NeedsInput row must mark its badge with `!`, the shape \
+                 channel a monochrome or color-blind reader still sees"
+            );
+            assert_eq!(
+                on.fg, BADGE_NEEDS_INPUT_COLOR,
+                "the `!` wears the red accent — the label and qualifier stay yellow, \
+                 so only this one glyph cell reddens ({:?})",
+                on.fg
+            );
+            // `contains`, since the List's `highlight_style` layers REVERSED|BOLD
+            // onto the selected row and this row may be it.
+            assert!(
+                on.modifier.contains(Modifier::BOLD),
+                "the `!` draws at badge weight (BOLD), got {:?}",
+                on.modifier
+            );
+
+            let off = badge_cell(BLINK_TICKS, label);
+            assert_eq!(
+                on, off,
+                "NeedsInput is steady, so its `!` badge cell must be IDENTICAL in \
+                 both pulse phases — the pulse changes color, never this glyph, and \
+                 never a resting bucket at all"
+            );
+        }
+
+        // Every OTHER bucket keeps the `●` dot — the shape channel is the one
+        // bucket's alone, so nothing else changes.
+        for label in ["sess-idle", "sess-working", "sess-done"] {
+            assert_eq!(
+                badge_cell(0, label).symbol(),
+                BADGE_DOT,
+                "the {label:?} row is not NeedsInput, so it must keep the `●` dot"
+            );
+        }
+    }
+
+    /// `badge_glyph` picks the shape channel by BUCKET: `!` for the ONE bucket that
+    /// wants the user, `●` for every other. Derived from `classify`, so it covers
+    /// both spellings of each two-token bucket and fails soft to `●` for an unknown
+    /// or absent qualifier.
+    #[test]
+    fn badge_glyph_marks_only_needs_input_with_a_bang() {
+        let glyph = |state: &str| badge_glyph(&agent("background", Some(state), None));
+
+        // The ONE bucket that wants the user — both its spellings.
+        assert_eq!(glyph("blocked"), BADGE_NEEDS_INPUT);
+        assert_eq!(glyph("waiting"), BADGE_NEEDS_INPUT);
+
+        // Every other KNOWN bucket keeps the dot.
+        assert_eq!(glyph("idle"), BADGE_DOT);
+        assert_eq!(glyph("working"), BADGE_DOT);
+        assert_eq!(glyph("busy"), BADGE_DOT);
+        assert_eq!(glyph("done"), BADGE_DOT);
+
+        // FAIL-SOFT: an unknown qualifier is `Other`, which keeps the dot...
+        assert_eq!(glyph("compacting"), BADGE_DOT);
+        // ...and so does a record with no qualifier at all.
+        assert_eq!(badge_glyph(&agent("background", None, None)), BADGE_DOT);
+    }
+
+    /// `badge_glyph_color` reddens ONLY the `NeedsInput` glyph; every other bucket
+    /// keeps its `badge_color`. The label/qualifier color is `badge_color` in all
+    /// cases (asserted where they are drawn), so this pins the single-cell accent
+    /// at its source, over both spellings and the fail-soft buckets.
+    #[test]
+    fn badge_glyph_color_reddens_only_needs_input() {
+        let color = |state: &str| badge_glyph_color(&agent("background", Some(state), None));
+
+        // The ONE bucket that wants the user — both spellings — wears the accent.
+        assert_eq!(color("blocked"), BADGE_NEEDS_INPUT_COLOR);
+        assert_eq!(color("waiting"), BADGE_NEEDS_INPUT_COLOR);
+
+        // Every other bucket's glyph keeps exactly its `badge_color`.
+        for state in ["idle", "working", "busy", "done", "compacting"] {
+            let a = agent("background", Some(state), None);
+            assert_eq!(badge_glyph_color(&a), badge_color(&a), "state={state:?}");
+        }
+        // ...including a record with no qualifier at all (the `Other` bucket).
+        let none = agent("background", None, None);
+        assert_eq!(badge_glyph_color(&none), badge_color(&none));
+    }
+
+    /// THE core invariant: each row's badge glyph is drawn in BOTH pulse phases,
+    /// for EVERY reported bucket — pulsing or steady. The pulse restyles the cell;
+    /// it must never blank it. `drawn_badges` finds the badge by EITHER glyph
+    /// (`●`, or `!` for the `NeedsInput` rows), so `blocked`/`waiting` are located
+    /// by their `!` here — the glyph is chosen by bucket, but it stays constant
+    /// across phases WITHIN a row all the same.
     ///
     /// This is the bug being fixed, pinned at its narrowest. Swapping the glyph
     /// for a blank mutated the row's text, which forced the terminal to re-detect
     /// the plain-text URL in the label beside it and flicker its underline every
-    /// 500ms (see `pulse_color`). A constant glyph is what makes that
+    /// 500ms (see `pulse_color`). A phase-constant glyph is what makes that
     /// unrepresentable.
     #[test]
     fn render_list_draws_every_badge_dot_in_both_pulse_phases() {
@@ -2910,9 +3232,17 @@ mod tests {
             let on_fg = on[state];
             let off_fg = off[state];
 
+            // The dot's ON-phase base is `badge_color`, EXCEPT `NeedsInput`, whose
+            // `!` reddens to the accent. Only the pulsing buckets (never
+            // `NeedsInput`) then dim off this base.
+            let glyph_base = if matches!(state, "blocked" | "waiting") {
+                BADGE_NEEDS_INPUT_COLOR
+            } else {
+                color
+            };
             assert_eq!(
-                on_fg, color,
-                "the {state:?} dot must carry its base badge color in the ON phase"
+                on_fg, glyph_base,
+                "the {state:?} dot must carry its base glyph color in the ON phase"
             );
 
             if pulses {
@@ -3927,6 +4257,101 @@ mod tests {
                 "{unselected}{CHILD_GUTTER}{}  {id}",
                 short_time(at(ANCESTOR_TS))
             ),
+        );
+    }
+
+    /// A fork lineage whose members BOTH wear a `NeedsInput` badge, so the wider
+    /// `needs input` phrase (11 cols against `blocked`'s 7) eats into the row
+    /// before the child's turn-count split — the width interaction Task 2.6
+    /// guards. No lone control row: this fixture exists only to stress that split.
+    fn needs_input_lineage_board() -> App {
+        let sessions = vec![
+            lineage_session(
+                ANCESTOR_ID,
+                "fork-root",
+                LINEAGE_LABEL,
+                ANCESTOR_TS,
+                ANCESTOR_MSGS,
+            ),
+            lineage_session(BG_ID, "fork-root", LINEAGE_LABEL, BG_TS, BG_MSGS),
+        ];
+        let mut reported = HashMap::new();
+        for id in [ANCESTOR_ID, BG_ID] {
+            reported.insert(
+                id.to_string(),
+                ReportedAgent {
+                    kind: "background".to_string(),
+                    id: None,
+                    state: Some("blocked".to_string()),
+                    status: None,
+                    name: None,
+                },
+            );
+        }
+        let mut app = App::new(sessions, Scope::All, PathBuf::from("/tmp/launch"));
+        app.set_reported_agents(reported);
+        app
+    }
+
+    /// Task 2.6: the wider `needs input` phrase must degrade through the EXISTING
+    /// all-or-nothing `fit_child_msgs` rule, never corrupt the row. On a
+    /// `NeedsInput` lineage rendered too narrow to afford the child's turn count
+    /// beyond its badge, the render must not panic and the count must drop WHOLE —
+    /// a count clipped mid-number is a confidently wrong number.
+    #[test]
+    fn render_list_degrades_a_needs_input_lineage_child_count_all_or_nothing() {
+        let (_, height) = LINEAGE_BOARD_SIZE;
+        // Wide enough to draw the `needs input` badge and the child's 8-char id,
+        // but too narrow to fit the turn count beyond them — the regime where the
+        // wider phrase forces `fit_child_msgs`'s all-or-nothing drop. The guard
+        // assertions below fail loudly if a layout tweak moves the row out of it,
+        // so this width can never silently stop testing the degradation.
+        let width = 56;
+
+        let mut app = needs_input_lineage_board();
+        app.expand_selected();
+        // Rendering through a real TestBackend at all is the "no panic" half of
+        // the claim — `drawn_list` unwraps the draw.
+        let buffer = drawn_list(&mut app, width, height);
+
+        // The child is addressable by its FULL id, which also confirms the width
+        // is in the intended regime: the badge sits left of the id, so a clipped
+        // id would make `row_of` panic here rather than pass on a wrong row.
+        let id = short_id(ANCESTOR_ID);
+        let child = row_of(&buffer, width, height, &id);
+        let text = row_text(&buffer, child, width);
+
+        // The row really does wear the wider badge this test is about.
+        assert!(
+            text.contains("needs input"),
+            "the child must draw the `needs input` badge whose extra width squeezes \
+             the count: {text:?}"
+        );
+
+        // All-or-nothing: the count is dropped WHOLE. `fit_child_msgs` reserves
+        // exactly what it draws, so the badge can only push the count off entirely,
+        // leaving the id the row's last field with no fragment shoved past it.
+        assert!(
+            !text.contains(CHILD_MSGS_SUFFIX),
+            "at this width the count cannot fit beyond the wider badge, so none of \
+             it may be drawn — a clipped `{ANCESTOR_MSGS} msgs` reads back as a \
+             plausible wrong number: {text:?}"
+        );
+        assert!(
+            text.trim_end().ends_with(&id),
+            "with the count dropped, the id must remain the row's last drawn field: \
+             anything after it is a count fragment the List cut mid-number: {text:?}"
+        );
+
+        // The folded default renders without panic at the same width too, its head
+        // now carrying BOTH the `needs input` badge and the `(+1)` hidden-count.
+        let mut folded_app = needs_input_lineage_board();
+        let folded = drawn_list(&mut folded_app, width, height);
+        let head = row_of(&folded, width, height, "(+1)");
+        assert!(
+            row_text(&folded, head, width).contains("needs input"),
+            "the folded NeedsInput head must draw its `needs input` badge and its \
+             `(+1)` marker together without panic or corruption"
         );
     }
 

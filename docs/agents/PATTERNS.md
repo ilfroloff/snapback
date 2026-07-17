@@ -53,8 +53,9 @@ it. Follow this split when adding behavior:
 
 - Pure, tested: `resume::plan` / `plan_from_parts` / `build_argv` /
   `build_new_argv` / `status_for_exit`; `defined_agents::select_agents` /
-  `parse_frontmatter`; `agents::classify` and the two outputs derived from it
-  (`friendly_status` / `is_active`) plus both argv builders (`agents_argv` /
+  `parse_frontmatter`; `agents::classify` and the outputs derived from it
+  (`qualifier_copy`, the shared banner/list-row phrase that `friendly_status`
+  fuses onto the kind label, plus `is_active`) and both argv builders (`agents_argv` /
   `live_agents_argv`) and `agents_from_output` (the shell-out's
   non-zero-exit-means-no-signal decision, split from the spawn so it is testable
   without one); `store::lineage`'s `lineage_key` / `head_of` / `fold` (the whole
@@ -211,10 +212,13 @@ terminal, and the semantics survive. Three further rules hold there.
 ONLY so they can share one `view::badge_color` while the pulse stays on the dot
 alone (a blinking text label is noise on a board of live sessions).
 
-**The pulse changes STYLE, never a SYMBOL.** The dot's `●` is drawn in EVERY
-phase for every reported agent; what alternates is its color — `view::badge_color`
-against `view::pulse_color`'s dim partner (`Gray` <-> `DarkGray`). It must stay
-that way, and the reason is not cosmetic: we emit **plain-text URLs (no OSC 8)**,
+**The pulse changes STYLE, never a SYMBOL.** Each row's badge glyph — `●`, or `!`
+for the `NeedsInput` bucket (`view::badge_glyph` chooses one per bucket, a shape
+channel over the yellow-only color) — is drawn in EVERY phase; what alternates is
+its color — `view::badge_color` against `view::pulse_color`'s dim partner (`Gray`
+<-> `DarkGray`). The glyph is bucket-chosen, but WITHIN a row it is fixed across
+the phases. It must stay that way, and the reason is not cosmetic: we emit
+**plain-text URLs (no OSC 8)**,
 so the terminal auto-detects links by TEXT PATTERN. Any change to a line's text
 forces it to re-scan and re-render that line's URL underline — so the dot's
 original glyph->blank swap made a session label containing a URL flicker every
