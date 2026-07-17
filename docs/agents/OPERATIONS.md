@@ -87,15 +87,18 @@ for the full key map.
 
 ## Continuous integration & releases
 
-Two GitHub Actions workflows, both installing the pinned toolchain from
+Three GitHub Actions workflows, all installing the pinned toolchain from
 `rust-toolchain.toml` via `actions-rust-lang/setup-rust-toolchain`:
 
-- **`🚀 CI`** (`.github/workflows/ci.yml`) — on every push and PR to `main`,
-  runs the same gates as the [validation checklist](#validation-checklist-before-finishing-a-change):
+- **`🚀 CI`** (`.github/workflows/ci.yml`) — on every PR, runs the same gates as
+  the [validation checklist](#validation-checklist-before-finishing-a-change):
   `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`,
   `cargo build`, `cargo test`.
 - **`🔖 Release`** (`.github/workflows/release-plz.yml`) — on every push to
   `main`, runs [release-plz](https://release-plz.dev) (config: `release-plz.toml`).
+- **`📦 Publish to npm`** (`.github/workflows/npm-release.yml`) — on every
+  `v*` tag, cross-compiles the four supported platforms and publishes the
+  prebuilt binaries to npm as `snapback-tui` (package source: `npm/`).
 
 ### How a release happens
 
@@ -109,12 +112,47 @@ Versioning is driven by the **Conventional Commit** type of each merged commit
   merges only update that PR — nothing is tagged yet.
 - Merging the release PR lands the new version in `Cargo.toml`/`Cargo.lock` and
   makes release-plz cut the `vX.Y.Z` **git tag** + **GitHub Release**.
+- That tag then fires **`📦 Publish to npm`**, which builds the four platform
+  binaries from the tagged source and publishes them as `snapback-tui`.
 
 This crate is **never published to crates.io**, and that guarantee rests on
 `release-plz.toml` — `publish = false` there stops the registry step, while
 `git_only = true` makes the git tag the sole source of truth for "what is
-released". Users install a tagged version straight from git — see the README
-[Install](../../README.md#install) section.
+released". Note the scope of that flag: it governs **`cargo publish`**, not
+"never publish anything". npm ships prebuilt *binaries*, not crate source, from a
+separate workflow keyed off the tag — the two do not conflict, and the npm
+publish must not be folded into `release-plz.toml`.
+
+Users install from npm (`npx snapback-tui install`) or from the tagged git ref —
+see the README [Install](../../README.md#install) section.
+
+### The npm package
+
+`npm/` is the package source; `npm/bin/` is build output and is **never
+committed** (gitignored) — the binaries' only source of truth is the tag they
+were built from.
+
+Three things there are deliberate and will look wrong to a future reader:
+
+- **`package.json` carries `version: "0.0.0"`.** It is a placeholder. The git tag
+  is the sole source of truth for the version, so the workflow stamps it in at
+  publish time and cross-checks it against `Cargo.toml`. A real version committed
+  here would be a second source of truth that nothing keeps in sync.
+- **Only `snapback` is shipped per platform; `sb` is a copy made at install
+  time.** The two binaries are the same program (`src/main.rs` and `src/bin/sb.rs`
+  are the same shim; the crate documents "no `argv[0]` dispatch"). Shipping both
+  doubles the tarball (measured: 3.1MB → 6.2MB) to carry identical logic twice.
+  The build job **verifies** that contract against the real binaries on every
+  target rather than trusting the comment.
+- **The package runs no lifecycle scripts on install.** `bun` blocks
+  `postinstall` for untrusted packages by default, so the usual
+  download-in-postinstall design would silently no-op under `bunx`. Everything
+  happens in the `bin` entry, which `npx`/`bunx` invoke directly.
+
+`npm/scripts/preflight.js` runs from `prepublishOnly` and is the last gate: it
+refuses the placeholder version and any missing or truncated binary. It matters
+because both failure modes are silent and land on the user, and an npm version
+number can never be re-published once burned.
 
 `Cargo.toml` intentionally sets **no `publish` key**, and must not gain one.
 `publish = false` there marks the package non-publishable, and release-plz's
@@ -122,12 +160,25 @@ released". Users install a tagged version straight from git — see the README
 that cuts the tag and the GitHub Release — the workflow then succeeds having
 released nothing. Keep the guard in `release-plz.toml` only.
 
-The release PR, commits, and tags are created with the built-in `GITHUB_TOKEN`,
-which by design does **not** trigger other workflow runs, so `🚀 CI` is never
-re-triggered by `🔖 Release` and there is no CI loop. Two repo-side prerequisites
-enable this automation: the "Allow GitHub Actions to create and approve pull
-requests" setting, and (optionally) a `RELEASE_PLZ_TOKEN` secret if `🚀 CI` should
-also run on the release PR.
+The release PR, commits, and tags are created with **`RELEASE_PLZ_TOKEN`**, a PAT
+authored by a real account. That secret is **required**, with no fallback —
+`release-plz.yml` reads it and nothing else, so a missing or revoked token fails
+loudly at the point of use instead of 403ing later wearing a disguise.
+
+The PAT is what makes the tag **trigger `📦 Publish to npm`**. A tag pushed with
+the built-in `GITHUB_TOKEN` would trigger no workflow at all — GitHub suppresses
+downstream triggers on `GITHUB_TOKEN`-authored events to break loops — so under
+the built-in token the npm publish would silently never run. A PAT-authored tag
+is an ordinary event and fires it.
+
+No loop follows from that, and the reason is the trigger filters, not the token:
+`🔖 Release` is `push: branches: [main]` with no `tags:` filter, and
+`📦 Publish to npm` is `push: tags: ['v*']` and pushes nothing. Neither can
+re-enter the other.
+
+One repo-side prerequisite remains for the release PR: the "Allow GitHub Actions
+to create and approve pull requests" setting. Publishing to npm needs an
+**`NPM_TOKEN`** secret (an npm automation token).
 
 ## Environment
 
