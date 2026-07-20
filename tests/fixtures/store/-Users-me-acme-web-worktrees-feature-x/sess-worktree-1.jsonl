@@ -1,3 +1,4 @@
 {"type":"summary","summary":"Worktree feature work"}
+{"type":"agent-setting","agentSetting":"lead","sessionId":"sess-worktree-1"}
 {"type":"user","sessionId":"sess-worktree-1","cwd":"/Users/me/acme/web-worktrees/feature-x","gitBranch":"feature-x","timestamp":"2026-07-04T07:00:00.000Z","message":{"role":"user","content":"Work on the feature-x branch"}}
 {"type":"assistant","sessionId":"sess-worktree-1","cwd":"/Users/me/acme/web-worktrees/feature-x","gitBranch":"feature-x","timestamp":"2026-07-04T07:00:03.000Z","message":{"role":"assistant","content":"Starting the feature work."}}

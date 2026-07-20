@@ -483,6 +483,38 @@ mod tests {
     }
 
     #[test]
+    fn agent_records_never_enter_the_content_index() {
+        // `agent-setting` / `agent-name` carry no `message`/`summary`, so
+        // `append_readable` ignores them: an agent name — or a free-form job title
+        // in `agentName` — must never become a false search hit. The user turn's
+        // text still indexes, proving the file parsed and the exclusion is the
+        // record type, not an empty file.
+        let lines = [
+            r#"{"type":"attachment","sessionId":"s","cwd":"/w","uuid":"att-1","parentUuid":null,"attachment":{}}"#,
+            r#"{"type":"agent-setting","agentSetting":"technical-brainstormer","sessionId":"s"}"#,
+            r#"{"type":"agent-name","agentName":"Plan Node.js and Nest.js upgrade migration","sessionId":"s"}"#,
+            r#"{"type":"user","sessionId":"s","cwd":"/w","uuid":"u-1","parentUuid":"att-1","message":{"role":"user","content":"please refactor"}}"#,
+        ];
+        let parsed = parse_lines("agent-records-index", &lines).expect("file has a cwd");
+
+        assert!(
+            parsed.content_index.contains("please refactor"),
+            "the user turn must index: {:?}",
+            parsed.content_index
+        );
+        assert!(
+            !parsed.content_index.contains("technical-brainstormer"),
+            "an agent-setting name must never enter the search index: {:?}",
+            parsed.content_index
+        );
+        assert!(
+            !parsed.content_index.contains("Node.js"),
+            "an agent-name job title must never enter the search index: {:?}",
+            parsed.content_index
+        );
+    }
+
+    #[test]
     fn readable_text_handles_string_and_blocks() {
         assert_eq!(readable_text(&serde_json::json!("hello")), "hello");
         let blocks = serde_json::json!([

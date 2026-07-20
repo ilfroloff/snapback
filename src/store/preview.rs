@@ -9,6 +9,15 @@
 //! inline code, fenced code blocks, blockquotes, ordered/unordered lists, and
 //! GFM pipe tables.
 //!
+//! The `claude` separator also carries the BOUND agent handle in effect at that
+//! turn (`● claude · @lead · 12:55`), read from two record types: `agent-setting`
+//! (the interactive bind — a clean handle, authoritative) and `agent-name` (the
+//! background job's name, a fallback trusted only when it names a KNOWN defined
+//! agent, since that field also carries free-form job titles). Attribution is
+//! POSITIONAL — the agent is threaded as streaming state (exactly like the
+//! per-message day rollover), so a turn shows the agent set *before* it, and a late
+//! record never retroactively labels earlier turns.
+//!
 //! Ahead of the markdown pass, each message BODY runs through an allowlist-driven
 //! control-wrapper collapse ([`collapse_control_wrappers`]). Claude Code injects a
 //! fixed set of PAIRED pseudo-tags (`<command-name>`, `<system-reminder>`,
@@ -31,6 +40,7 @@
 //! caller caches the result per session id, so markdown parsing never stalls the
 //! UI on a large transcript.
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -92,8 +102,12 @@ pub struct RenderedPreview {
 /// Render a session's transcript for the preview pane, fitting GFM tables to
 /// `width` (the preview pane's inner content width, in columns). Returns the
 /// styled text together with the clickable link regions found within it.
-pub fn render(session: &Session, width: usize) -> RenderedPreview {
-    render_file_collect(&session.file, PREVIEW_LINES, width)
+///
+/// `known_agents` is the set of DEFINED agent names (`~/.claude/agents/*.md`); it
+/// gates the noisy `agent-name` fallback so a free-form background-job title never
+/// renders as a bogus handle (see [`render_record`]).
+pub fn render(session: &Session, width: usize, known_agents: &HashSet<&str>) -> RenderedPreview {
+    render_file_collect(&session.file, PREVIEW_LINES, width, known_agents)
 }
 
 /// Render `path` into a [`RenderedPreview`]: the styled transcript plus the
@@ -105,7 +119,12 @@ pub fn render(session: &Session, width: usize) -> RenderedPreview {
 /// keeps only the most-recent `max_lines` rows rebases the regions the same way —
 /// any link that scrolled off the top is dropped, never left pointing at a stale
 /// row.
-fn render_file_collect(path: &Path, max_lines: usize, width: usize) -> RenderedPreview {
+fn render_file_collect(
+    path: &Path,
+    max_lines: usize,
+    width: usize,
+    known_agents: &HashSet<&str>,
+) -> RenderedPreview {
     let file = match File::open(path) {
         Ok(f) => f,
         Err(_) => {
@@ -122,6 +141,11 @@ fn render_file_collect(path: &Path, max_lines: usize, width: usize) -> RenderedP
     // Day of the previously ANNOTATED turn, threaded through the loop so a
     // per-message timestamp can switch to `MM-DD HH:MM` on a day rollover.
     let mut prev_day: Option<Date> = None;
+    // Bound agent in effect at this point in the file: `agent-setting` / `agent-name`
+    // records set it as they stream past, and each assistant turn is labeled with it.
+    // POSITIONAL — never a file-level hoist — so a late record cannot retroactively
+    // label the turns that precede it.
+    let mut agent = AgentState::default();
     for line in reader.lines() {
         let line = match line {
             Ok(l) => l,
@@ -138,7 +162,9 @@ fn render_file_collect(path: &Path, max_lines: usize, width: usize) -> RenderedP
         if !record.is_object() {
             continue;
         }
-        if let Some((block, block_links)) = render_record(&record, &mut prev_day, width) {
+        if let Some((block, block_links)) =
+            render_record(&record, &mut agent, known_agents, &mut prev_day, width)
+        {
             let offset = lines.len();
             links.extend(rebased(block_links, offset));
             lines.extend(block);
@@ -180,8 +206,18 @@ fn rebased(links: Vec<LinkRegion>, offset: usize) -> Vec<LinkRegion> {
 /// per-message timestamp can roll over to `MM-DD HH:MM` when the day changes; it
 /// is advanced only when this record actually renders a timestamped marker (a
 /// skipped or timestamp-less turn never disturbs the rollover tracking).
+///
+/// `agent` carries the bound agent in effect at this point in the file: an
+/// `agent-setting` or (validated) `agent-name` record updates it — contributing no
+/// lines — and each assistant turn is labeled with its [`effective`] value.
+/// `known_agents` gates the `agent-name` fallback. State is threaded — never
+/// hoisted — so attribution is positional; see the module doc.
+///
+/// [`effective`]: AgentState::effective
 fn render_record(
     record: &Value,
+    agent: &mut AgentState,
+    known_agents: &HashSet<&str>,
     prev_day: &mut Option<Date>,
     width: usize,
 ) -> Option<(Vec<Line<'static>>, Vec<LinkRegion>)> {
@@ -192,6 +228,7 @@ fn render_record(
             let lines = vec![marker_line_with_time(
                 format!("# {s}"),
                 summary_style(),
+                None,
                 record,
                 prev_day,
             )];
@@ -212,7 +249,13 @@ fn render_record(
             }
             let mut lines = vec![
                 Line::from(""),
-                marker_line_with_time("\u{25b6} you".to_string(), you_style(), record, prev_day),
+                marker_line_with_time(
+                    "\u{25b6} you".to_string(),
+                    you_style(),
+                    None,
+                    record,
+                    prev_day,
+                ),
             ];
             // Body links are relative to the body; rebase them past the blank +
             // marker lines that lead every turn.
@@ -232,6 +275,7 @@ fn render_record(
                 marker_line_with_time(
                     "\u{25cf} claude".to_string(),
                     claude_style(),
+                    agent.effective(),
                     record,
                     prev_day,
                 ),
@@ -240,32 +284,116 @@ fn render_record(
             lines.extend(body);
             Some((lines, rebased(body_links, offset)))
         }
+        Some("agent-setting") => {
+            // Positional state, not a rendered line: record the interactive BIND in
+            // effect from here on so later assistant turns can be labeled. Read
+            // FAIL-SOFT — a missing / null / non-string `agentSetting` (or a blank
+            // one) clears the bind rather than panicking. `"claude"` is stored
+            // as-is (a later default re-emission must reset the bind); the
+            // `● claude · @claude` suppression is `agent_handle`'s job at render.
+            // Contributes no lines, so the tail-cap and link rebasing are untouched.
+            agent.bound = trimmed_field(record, "agentSetting");
+            None
+        }
+        Some("agent-name") => {
+            // The background job's display NAME — a fallback source for the bound
+            // agent, but the SAME field also carries free-form job titles (e.g.
+            // "audit high severity errors"), so it is trusted ONLY when it names a
+            // known DEFINED agent; a title clears the fallback rather than rendering
+            // as a bogus `@handle`. `agent-setting` still wins over this (see
+            // `AgentState::effective`). Read FAIL-SOFT; contributes no lines.
+            agent.job = trimmed_field(record, "agentName")
+                .filter(|name| known_agents.contains(name.as_str()));
+            None
+        }
         _ => None,
     }
 }
 
-/// Build a turn-marker line, appending a DIM per-message timestamp annotation
-/// (e.g. ` · 14:23`) when THIS record carries a parseable RFC 3339 `timestamp`.
+/// A record's string `key`, trimmed, or `None` when it is absent / null /
+/// non-string / blank. The one FAIL-SOFT reader both agent records share.
+fn trimmed_field(record: &Value, key: &str) -> Option<String> {
+    record
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// The bound agent in effect at a point in the transcript, tracked from the two
+/// records that can name it. `agent-setting` (the interactive bind) is
+/// authoritative; `agent-name` (the background job's name) is a fallback trusted
+/// only when it names a known agent, since that same field also carries free-form
+/// job titles. Both are streaming positional state (like the day rollover), never
+/// a file-level hoist.
+#[derive(Default)]
+struct AgentState {
+    /// Latest `agentSetting` — a clean handle, stored verbatim (incl. `"claude"`).
+    bound: Option<String>,
+    /// Latest KNOWN `agentName` — validated against the defined-agent set; a
+    /// free-form title leaves this `None`.
+    job: Option<String>,
+}
+
+impl AgentState {
+    /// The agent to label a turn with: the interactive bind wins; else the
+    /// validated job name. (`agent_handle` still suppresses the default/blank.)
+    fn effective(&self) -> Option<&str> {
+        self.bound.as_deref().or(self.job.as_deref())
+    }
+}
+
+/// The catch-all default agent. Claude Code writes `agentSetting: "claude"` when
+/// no specialized agent is bound, and the `● claude` marker already names it, so
+/// rendering `● claude · @claude` would be pure noise — [`agent_handle`] suppresses
+/// it. (NO MAGIC VALUES: the default is named here, not spelled inline.)
+const DEFAULT_AGENT: &str = "claude";
+
+/// The DIM `@handle` to render for the bound agent, or `None` when there is nothing
+/// worth showing: the name is absent, empty/whitespace-only, or the catch-all
+/// [`DEFAULT_AGENT`] (already implied by the `● claude` marker). This is the SINGLE
+/// place the render-suppression decision lives. PURE — see the unit test.
+fn agent_handle(agent: Option<&str>) -> Option<String> {
+    let name = agent?.trim();
+    if name.is_empty() || name == DEFAULT_AGENT {
+        return None;
+    }
+    Some(format!("@{name}"))
+}
+
+/// One DIM ` · <text>` marker annotation. BOTH the bound-agent handle and the
+/// per-message timestamp render through this ONE builder, so they share a single
+/// ` · ` separator convention and DIM style and cannot drift apart (DRY).
+fn annotation_span(text: &str) -> Span<'static> {
+    Span::styled(format!(" \u{b7} {text}"), marker_style())
+}
+
+/// Build a turn-marker line, appending — in order — a DIM `@agent` handle (when a
+/// non-default `agent` is in effect) then a DIM per-message timestamp annotation
+/// (e.g. ` · 14:23`, when THIS record carries a parseable RFC 3339 `timestamp`), so
+/// a bound assistant turn reads `● claude · @lead · 12:55`.
 ///
 /// The marker span keeps its own (bold) style unchanged; only the trailing
-/// annotation is DIM. FAIL-SOFT: a missing or unparseable timestamp renders the
-/// marker exactly as before (no annotation) and leaves `prev_day` untouched. On
-/// success `prev_day` advances to this record's day so the next annotated turn
-/// can detect a rollover.
+/// annotations are DIM. FAIL-SOFT: a missing or unparseable timestamp renders the
+/// marker with no timestamp annotation and leaves `prev_day` untouched; a suppressed
+/// or absent agent renders no handle. On a timestamp success `prev_day` advances to
+/// this record's day so the next annotated turn can detect a rollover.
 fn marker_line_with_time(
     marker: String,
     style: Style,
+    agent: Option<&str>,
     record: &Value,
     prev_day: &mut Option<Date>,
 ) -> Line<'static> {
     let mut spans = vec![Span::styled(marker, style)];
+    if let Some(handle) = agent_handle(agent) {
+        spans.push(annotation_span(&handle));
+    }
     if let Some(ts) = record_timestamp(record) {
         let annotation = timestamp_annotation(ts, *prev_day);
         *prev_day = Some(ts.date());
-        spans.push(Span::styled(
-            format!(" \u{b7} {annotation}"),
-            marker_style(),
-        ));
+        spans.push(annotation_span(&annotation));
     }
     Line::from(spans)
 }
@@ -1441,9 +1569,23 @@ mod tests {
     }
 
     /// Text-only convenience over [`render_file_collect`] for the transcript-shape
-    /// tests that assert markers/structure rather than link regions.
+    /// tests that assert markers/structure rather than link regions. No known
+    /// agents, so the `agent-name` fallback stays inert; see [`render_file_known`]
+    /// for tests that exercise it.
     fn render_file(path: &Path, max_lines: usize, width: usize) -> Text<'static> {
-        render_file_collect(path, max_lines, width).text
+        render_file_collect(path, max_lines, width, &HashSet::new()).text
+    }
+
+    /// Like [`render_file`] but with an explicit set of known DEFINED agents, so a
+    /// test can exercise the validated `agent-name` fallback.
+    fn render_file_known(
+        path: &Path,
+        max_lines: usize,
+        width: usize,
+        known: &[&str],
+    ) -> Text<'static> {
+        let known: HashSet<&str> = known.iter().copied().collect();
+        render_file_collect(path, max_lines, width, &known).text
     }
 
     /// Flatten a `Text` back to a plain string (span contents joined, lines by
@@ -1839,7 +1981,7 @@ mod tests {
         );
         std::fs::write(&file, jsonl).expect("write temp jsonl");
 
-        let rendered = render_file_collect(&file, PREVIEW_LINES, WIDE);
+        let rendered = render_file_collect(&file, PREVIEW_LINES, WIDE, &HashSet::new());
         assert_eq!(rendered.links.len(), 1, "one link region end to end");
         let region = &rendered.links[0];
         assert_eq!(region.url, "https://example.com/page");
@@ -1995,6 +2137,312 @@ mod tests {
                 m.spans.len(),
                 1,
                 "a missing/unparseable timestamp renders the marker with no annotation span"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- bound agent handle -----------------------------------------------
+
+    #[test]
+    fn agent_handle_suppresses_default_and_blank_names() {
+        // A real agent yields an `@handle`.
+        assert_eq!(agent_handle(Some("lead")).as_deref(), Some("@lead"));
+        // The catch-all default is already named by the `● claude` marker.
+        assert_eq!(agent_handle(Some("claude")), None);
+        // Blank / whitespace-only / absent all suppress.
+        assert_eq!(agent_handle(Some("")), None);
+        assert_eq!(agent_handle(Some("   ")), None);
+        assert_eq!(agent_handle(None), None);
+        // A padded name is trimmed before the handle is built.
+        assert_eq!(agent_handle(Some("  lead  ")).as_deref(), Some("@lead"));
+    }
+
+    #[test]
+    fn claude_marker_carries_the_bound_agent_handle() {
+        // The worktree fixture binds `lead` (line 2) ahead of its assistant turn.
+        let text = render_file(
+            &fixture(
+                "-Users-me-acme-web-worktrees-feature-x",
+                "sess-worktree-1.jsonl",
+            ),
+            PREVIEW_LINES,
+            WIDE,
+        );
+        let claude = line_led_by(&text, "\u{25cf} claude").expect("a claude marker line");
+        // Exact span ORDER: `● claude` (bold) · @lead (dim) · timestamp (dim).
+        assert_eq!(claude.spans.len(), 3, "marker + handle + timestamp");
+        assert_eq!(claude.spans[0].content.as_ref(), "\u{25cf} claude");
+        assert!(
+            claude.spans[0].style.add_modifier.contains(Modifier::BOLD),
+            "the marker stays bold"
+        );
+        assert_eq!(claude.spans[1].content.as_ref(), " \u{b7} @lead");
+        assert!(
+            claude.spans[1].style.add_modifier.contains(Modifier::DIM),
+            "the handle is dim"
+        );
+        // The timestamp annotation still follows the handle (same day as the user
+        // turn, so `HH:MM`).
+        assert_eq!(claude.spans[2].content.as_ref(), " \u{b7} 07:00");
+        assert!(
+            claude.spans[2].style.add_modifier.contains(Modifier::DIM),
+            "the timestamp is dim"
+        );
+    }
+
+    #[test]
+    fn a_late_agent_setting_does_not_label_earlier_turns() {
+        // The `eec8fc7c` store shape: the ONLY `agent-setting` sits AFTER the
+        // assistant turn it would (wrongly) attribute. Positional threading must
+        // leave that earlier turn BARE — this fails loudly if someone "fixes" the
+        // design by hoisting the file's agent.
+        let dir = unique_temp_dir("late-agent");
+        let file = dir.join("sess.jsonl");
+        let jsonl = concat!(
+            r#"{"type":"assistant","sessionId":"s","cwd":"/x","timestamp":"2026-07-04T07:00:00.000Z","message":{"role":"assistant","content":"early turn"}}"#,
+            "\n",
+            r#"{"type":"agent-setting","agentSetting":"lead","sessionId":"s"}"#,
+            "\n",
+        );
+        std::fs::write(&file, jsonl).expect("write temp jsonl");
+
+        let text = render_file(&file, PREVIEW_LINES, WIDE);
+        let claude = line_led_by(&text, "\u{25cf} claude").expect("a claude marker line");
+        // Marker + timestamp only — NO handle span between them.
+        assert_eq!(
+            claude.spans.len(),
+            2,
+            "an agent set after the turn must not label it: {:?}",
+            claude.spans
+        );
+        assert!(
+            !claude.spans.iter().any(|s| s.content.contains('@')),
+            "no handle on a turn that precedes its agent-setting"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_malformed_agent_setting_never_panics_and_renders_no_handle() {
+        // Missing field, null, a number, and an empty string must all FAIL SOFT to
+        // no binding — never a panic, never a stray handle.
+        let dir = unique_temp_dir("bad-agent");
+        let file = dir.join("sess.jsonl");
+        let jsonl = concat!(
+            r#"{"type":"agent-setting","sessionId":"s"}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"s","cwd":"/x","message":{"role":"assistant","content":"a"}}"#,
+            "\n",
+            r#"{"type":"agent-setting","agentSetting":null,"sessionId":"s"}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"s","cwd":"/x","message":{"role":"assistant","content":"b"}}"#,
+            "\n",
+            r#"{"type":"agent-setting","agentSetting":42,"sessionId":"s"}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"s","cwd":"/x","message":{"role":"assistant","content":"c"}}"#,
+            "\n",
+            r#"{"type":"agent-setting","agentSetting":"","sessionId":"s"}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"s","cwd":"/x","message":{"role":"assistant","content":"d"}}"#,
+            "\n",
+        );
+        std::fs::write(&file, jsonl).expect("write temp jsonl");
+
+        let text = render_file(&file, PREVIEW_LINES, WIDE);
+        let markers: Vec<&Line> = text
+            .lines
+            .iter()
+            .filter(|l| l.spans.first().map(|s| s.content.as_ref()) == Some("\u{25cf} claude"))
+            .collect();
+        assert_eq!(markers.len(), 4, "all four assistant turns render");
+        for m in markers {
+            assert!(
+                !m.spans.iter().any(|s| s.content.contains('@')),
+                "a malformed agent-setting must render no handle: {:?}",
+                m.spans
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_default_agent_renders_a_bare_claude_marker() {
+        // `agentSetting: "claude"` is the catch-all default; the `● claude` marker
+        // already names it, so it must never render `● claude · @claude`.
+        let dir = unique_temp_dir("default-agent");
+        let file = dir.join("sess.jsonl");
+        let jsonl = concat!(
+            r#"{"type":"agent-setting","agentSetting":"claude","sessionId":"s"}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"s","cwd":"/x","message":{"role":"assistant","content":"hi"}}"#,
+            "\n",
+        );
+        std::fs::write(&file, jsonl).expect("write temp jsonl");
+
+        let text = render_file(&file, PREVIEW_LINES, WIDE);
+        let claude = line_led_by(&text, "\u{25cf} claude").expect("a claude marker line");
+        assert_eq!(
+            claude.spans.len(),
+            1,
+            "the default agent adds no handle span: {:?}",
+            claude.spans
+        );
+        assert!(
+            !flatten(&text).contains("@claude"),
+            "the default agent must never render `@claude`"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- agent-name fallback (validated) ----------------------------------
+
+    #[test]
+    fn agent_state_precedence_prefers_the_interactive_bind() {
+        let mut s = AgentState::default();
+        assert_eq!(s.effective(), None, "nothing set => no agent");
+        s.job = Some("technical-brainstormer".to_string());
+        assert_eq!(
+            s.effective(),
+            Some("technical-brainstormer"),
+            "the validated job name is used when there is no interactive bind"
+        );
+        s.bound = Some("lead".to_string());
+        assert_eq!(
+            s.effective(),
+            Some("lead"),
+            "an interactive agent-setting bind wins over the job name"
+        );
+        s.bound = None;
+        assert_eq!(
+            s.effective(),
+            Some("technical-brainstormer"),
+            "clearing the bind falls back to the job name"
+        );
+    }
+
+    #[test]
+    fn a_known_agent_name_labels_the_turn_when_there_is_no_agent_setting() {
+        // The background-agent shape: no `agent-setting`, only `agent-name`. When it
+        // names a KNOWN agent the turn is labeled from it.
+        let dir = unique_temp_dir("known-agent-name");
+        let file = dir.join("sess.jsonl");
+        let jsonl = concat!(
+            r#"{"type":"agent-name","agentName":"lead","sessionId":"s"}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"s","cwd":"/x","message":{"role":"assistant","content":"hi"}}"#,
+            "\n",
+        );
+        std::fs::write(&file, jsonl).expect("write temp jsonl");
+
+        let text = render_file_known(
+            &file,
+            PREVIEW_LINES,
+            WIDE,
+            &["lead", "technical-brainstormer"],
+        );
+        let claude = line_led_by(&text, "\u{25cf} claude").expect("a claude marker line");
+        assert_eq!(claude.spans.len(), 2, "marker + handle: {:?}", claude.spans);
+        assert_eq!(claude.spans[1].content.as_ref(), " \u{b7} @lead");
+        assert!(claude.spans[1].style.add_modifier.contains(Modifier::DIM));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unknown_agent_name_is_a_title_and_renders_bare() {
+        // `agent-name` also carries free-form job titles; one that is NOT a known
+        // agent must never render as a handle. THIS is the guard that keeps
+        // `● claude · @Drop initial commit bcdc05e` off the screen.
+        let dir = unique_temp_dir("title-agent-name");
+        let file = dir.join("sess.jsonl");
+        let jsonl = concat!(
+            r#"{"type":"agent-name","agentName":"Drop initial commit bcdc05e","sessionId":"s"}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"s","cwd":"/x","message":{"role":"assistant","content":"hi"}}"#,
+            "\n",
+        );
+        std::fs::write(&file, jsonl).expect("write temp jsonl");
+
+        let text = render_file_known(&file, PREVIEW_LINES, WIDE, &["lead"]);
+        let claude = line_led_by(&text, "\u{25cf} claude").expect("a claude marker line");
+        assert_eq!(
+            claude.spans.len(),
+            1,
+            "a free-form title must add no handle span: {:?}",
+            claude.spans
+        );
+        assert!(!flatten(&text).contains('@'), "no handle anywhere");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn agent_setting_wins_over_a_concurrent_agent_name() {
+        // A session carrying BOTH: `agent-setting` (the interactive bind) is
+        // authoritative even when `agent-name` also names a known agent.
+        let dir = unique_temp_dir("both-agents");
+        let file = dir.join("sess.jsonl");
+        let jsonl = concat!(
+            r#"{"type":"agent-setting","agentSetting":"lead","sessionId":"s"}"#,
+            "\n",
+            r#"{"type":"agent-name","agentName":"technical-brainstormer","sessionId":"s"}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"s","cwd":"/x","message":{"role":"assistant","content":"hi"}}"#,
+            "\n",
+        );
+        std::fs::write(&file, jsonl).expect("write temp jsonl");
+
+        let text = render_file_known(
+            &file,
+            PREVIEW_LINES,
+            WIDE,
+            &["lead", "technical-brainstormer"],
+        );
+        let claude = line_led_by(&text, "\u{25cf} claude").expect("a claude marker line");
+        assert_eq!(claude.spans[1].content.as_ref(), " \u{b7} @lead");
+        assert!(
+            !flatten(&text).contains("technical-brainstormer"),
+            "the agent-setting bind wins; the job name must not appear"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_malformed_agent_name_never_panics_and_renders_no_handle() {
+        // Missing field, null, a number, and an empty string must all FAIL SOFT.
+        let dir = unique_temp_dir("bad-agent-name");
+        let file = dir.join("sess.jsonl");
+        let jsonl = concat!(
+            r#"{"type":"agent-name","sessionId":"s"}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"s","cwd":"/x","message":{"role":"assistant","content":"a"}}"#,
+            "\n",
+            r#"{"type":"agent-name","agentName":null,"sessionId":"s"}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"s","cwd":"/x","message":{"role":"assistant","content":"b"}}"#,
+            "\n",
+            r#"{"type":"agent-name","agentName":42,"sessionId":"s"}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"s","cwd":"/x","message":{"role":"assistant","content":"c"}}"#,
+            "\n",
+            r#"{"type":"agent-name","agentName":"","sessionId":"s"}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"s","cwd":"/x","message":{"role":"assistant","content":"d"}}"#,
+            "\n",
+        );
+        std::fs::write(&file, jsonl).expect("write temp jsonl");
+
+        let text = render_file_known(&file, PREVIEW_LINES, WIDE, &["lead", ""]);
+        let markers: Vec<&Line> = text
+            .lines
+            .iter()
+            .filter(|l| l.spans.first().map(|s| s.content.as_ref()) == Some("\u{25cf} claude"))
+            .collect();
+        assert_eq!(markers.len(), 4, "all four turns render");
+        for m in markers {
+            assert!(
+                !m.spans.iter().any(|s| s.content.contains('@')),
+                "a malformed agent-name renders no handle: {:?}",
+                m.spans
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
