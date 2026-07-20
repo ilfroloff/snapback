@@ -19,7 +19,7 @@ use ratatui::text::{Line, Text};
 use time::OffsetDateTime;
 
 use crate::agents::ReportedAgent;
-use crate::defined_agents::DefinedAgent;
+use crate::defined_agents::{self, DefinedAgent};
 use crate::search::{SearchIndex, SearchMode};
 use crate::store::lineage::{self, LineageKey};
 use crate::store::{preview, Session};
@@ -401,6 +401,14 @@ pub struct App {
     pub scope: Scope,
     /// Canonicalized launch directory for the current-folder predicate.
     pub launch_dir: PathBuf,
+    /// Names of DEFINED agents (`~/.claude/agents/*.md` + project overrides),
+    /// discovered ONCE at construction. Gates the preview's `agent-name` fallback
+    /// so a free-form background-job title never renders as a bogus `@handle`
+    /// (see [`store::preview::render`]). A DISPLAY-only allowlist, never a launch
+    /// gate — kept distinct from the picker's on-demand [`DefinedAgent`] list.
+    ///
+    /// [`store::preview::render`]: crate::store::preview::render
+    pub agent_names: Vec<String>,
     /// Whether the preview pane is visible.
     pub show_preview: bool,
     /// Vertical scroll offset (in WRAPPED rows) of the preview pane. Requested by
@@ -531,6 +539,13 @@ impl App {
     pub fn new(sessions: Vec<Session>, scope: Scope, launch_dir: PathBuf) -> Self {
         let index = SearchIndex::build(&sessions);
         let search_mode = index.mode();
+        // Discover DEFINED agents ONCE (a one-shot FS scan, like the picker's) so
+        // the preview can validate the `agent-name` fallback without re-reading disk
+        // per render.
+        let agent_names: Vec<String> = defined_agents::discover_agents(&launch_dir)
+            .into_iter()
+            .map(|a| a.name)
+            .collect();
         let mut app = App {
             sessions,
             filtered: Vec::new(),
@@ -540,6 +555,7 @@ impl App {
             search_mode,
             scope,
             launch_dir,
+            agent_names,
             show_preview: true,
             preview_scroll: 0,
             preview_follow_bottom: true,
@@ -1284,7 +1300,10 @@ impl App {
         let id = self.selected.clone()?;
         if !self.preview_cache.contains_key(&id) {
             let session = self.sessions.iter().find(|s| s.session_id == id)?;
-            let rendered = preview::render(session, usize::from(inner_width));
+            // Defined-agent names gate the preview's `agent-name` fallback so a
+            // free-form background-job title never renders as a bogus handle.
+            let known_agents: HashSet<&str> = self.agent_names.iter().map(String::as_str).collect();
+            let rendered = preview::render(session, usize::from(inner_width), &known_agents);
             self.preview_cache.insert(id.clone(), rendered);
         }
         self.preview_cache.get(&id)

@@ -56,8 +56,10 @@ never fatal:
 | `sessionId` | first non-null (else file stem) | stable id, resume target, reported-agent join key |
 | `gitBranch` | last non-null (`None` ⇒ `(detached)`) | branch grouping level |
 | `timestamp` | last non-null, RFC 3339 | sort + display (per-message too, in preview) |
-| `type` | `"summary"` / `"user"` / `"assistant"` | label, preview, content index, [turn count](#turn-count-storeparse) |
+| `type` | `"summary"` / `"user"` / `"assistant"` / `"agent-setting"` / `"agent-name"` | label, preview, content index, [turn count](#turn-count-storeparse) |
 | `summary` | on `type:"summary"` | preferred label + searchable text |
+| `agentSetting` | on `type:"agent-setting"`, string (fail-soft) | the [bound agent](#bound-agent-storepreview) handle on preview turns (interactive bind — authoritative); read **positionally**, never hoisted |
+| `agentName` | on `type:"agent-name"`, string (fail-soft) | the background job's name; a **fallback** bound-agent source for the preview handle, trusted ONLY when it names a known agent (the field also carries free-form titles) — see [bound agent](#bound-agent-storepreview) |
 | `message.content` | string **or** typed-block array | user prompt, preview body, content index |
 | `isSidechain` | bool | skip sub-agent turns when picking a label/preview |
 | `uuid` | per record | a record's identity in the transcript **tree** |
@@ -205,9 +207,9 @@ mis-assumed:
   `assistant`, `user`, `attachment`, `system`. Roughly **27% of the tree is not
   conversation**.
 - **Types with no `uuid` sit outside the tree entirely** and must be ignored by
-  lineage code: `last-prompt`, `mode`, `agent-setting`, `permission-mode`,
-  `file-history-snapshot`. They carry **no `parentUuid` key at all** — which is
-  why absent must never be read as `null`.
+  lineage code: `last-prompt`, `mode`, `agent-setting`, `agent-name`,
+  `permission-mode`, `file-history-snapshot`. They carry **no `parentUuid` key at
+  all** — which is why absent must never be read as `null`.
 - **It really branches.** The large majority of files contain a record with more
   than one child; only a minority are strictly linear. **Never assume a single
   chain.** (The lineage code only needs the root, so it never walks children —
@@ -483,6 +485,46 @@ read `done` while the session ran. That is now cosmetic rather than behavioral:
 the resume gate does not read this map, so Enter still probes claude and still
 routes to Attach/Fork correctly. Deliberately **not** engineered around (YAGNI);
 recorded so the failure mode is recognizable if it ever surfaces.
+
+### Bound agent (`store::preview`)
+
+A transcript records which agent it ran under, and the preview pane renders that
+name as a DIM `@handle` on the `claude` turn marker (`● claude · @lead · 12:55`).
+The name comes from **two** record types, because interactive and background
+launches persist it differently:
+
+| Record | Emitted by | Value | Trust |
+| --- | --- | --- | --- |
+| `{"type":"agent-setting","agentSetting":"<name>"}` | an **interactive** session bound to an agent | always a clean handle (a handful of values store-wide) | **authoritative** — rendered verbatim |
+| `{"type":"agent-name","agentName":"<name>"}` | a **background** agent job | the job's display name — the agent handle when defaulted, but ALSO free-form titles ("Plan Node.js and Nest.js upgrade migration") | **fallback** — rendered only when it names a known agent |
+
+`agent-setting` wins when both are present. `agent-name` is the majority signal on
+long-running background sessions (which carry no `agent-setting` at all), so
+ignoring it would leave exactly those sessions bare — but the field is shared with
+free-form job titles, so it is trusted ONLY when the value matches a **defined
+agent** (`App::agent_names`, discovered once from `~/.claude/agents/*.md`, passed
+into `render`). A title therefore renders bare rather than as a bogus
+`@handle`. Both fields are read fail-soft (`.and_then(Value::as_str)`); the catch-all
+default `"claude"` and any blank name suppress the handle (the `● claude` marker
+already says `claude`).
+
+Attribution is **positional**, not hoisted: the agent (both records) is threaded
+through the render loop as streaming state (exactly like the per-message day
+rollover), so a turn is labeled with the agent in effect *at that point in the
+file*. A late `agent-setting` — a real store shape, where the only record sits on
+the last line of a session whose turns began far earlier — must therefore leave
+those earlier turns bare. Reading it positionally is both more faithful and strictly
+simpler than a file-level hoist (no second read, no new `Session` field), and
+neither record carries readable prose, so they never enter the
+[content index](#content-index-storeparse).
+
+This is the third and last of **three distinct agent concepts** — keep them apart:
+
+| Concept | Source | What it is |
+| --- | --- | --- |
+| **Live** (reported) agent | `claude agents --json` (`src/agents.rs`) | a **running process** — drives the board badge and the resume gate (see [Reported agents](#reported-agents-srcagentsrs)) |
+| **Defined** agent | `~/.claude/agents/*.md` (`src/defined_agents.rs`) | an **on-disk definition** a new session can be launched under (`claude --agent <name>`, see [Hand-off invocations](#hand-off-invocations-srcresumers)) |
+| **Bound** agent | `agent-setting` / `agent-name` records (`store::preview`) | the **agent a recorded session actually ran under** — a preview-only label, this section; the **Defined** set above is what validates the noisy `agent-name` source |
 
 ## User-facing modes (`tui::app`)
 

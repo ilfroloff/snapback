@@ -328,7 +328,7 @@ mod tests {
         // flatten the text back to plain text (span contents joined) to assert the
         // structural markers survive. Width is the table shrink-to-fit budget; a
         // comfortable 80 columns here.
-        let rendered = preview::render(s, 80);
+        let rendered = preview::render(s, 80, &std::collections::HashSet::new());
         let plain: String = rendered
             .text
             .lines
