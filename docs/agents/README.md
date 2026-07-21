@@ -30,11 +30,11 @@ find the same rule in two places, that is a bug to fix.
 | Store layout, JSONL fields, label/grouping/fork-lineage/turn-count/live-agent semantics | DOMAIN |
 | Fail-soft / authoritative-from-file / isolation / styling rules, testing conventions | PATTERNS |
 | Commands, env vars, CI + release automation, validation checklist | OPERATIONS |
-| Critical rules + engineering principles + changelog | AGENTS.md |
+| Critical rules + engineering principles | AGENTS.md |
 
 ## Maintenance
 
 These docs are generated and refreshed by the `project-agent-docs` skill from
 the real repository. When the code structure changes, re-run that skill rather
-than hand-patching, so stale references are removed in the same pass. Log the
-refresh in the `AGENTS.md` changelog, following the entry conventions there.
+than hand-patching, so stale references are removed in the same pass. Git history
+is the refresh log — do not keep a changelog inside these docs.
