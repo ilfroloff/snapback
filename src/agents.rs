@@ -90,13 +90,30 @@ const QUALIFIER_BUSY: &str = "busy";
 /// [`live_agents`] instead.
 const QUALIFIER_DONE: &str = "done";
 
-/// User-facing copy for [`AgentActivity::NeedsInput`] — the ONE translated
-/// bucket. Phrased as what the SESSION wants ("needs input"), so BOTH the
-/// preview banner ([`friendly_status`]) AND the board list row
+/// User-facing copy for [`AgentActivity::NeedsInput`] — the FIRST of the two
+/// translated buckets (the other is [`INTERRUPTED_COPY`]). Phrased as what the
+/// SESSION wants ("needs input"), so BOTH the preview banner
+/// ([`friendly_status`]) AND the board list row
 /// ([`crate::tui::view::render_list`], via [`qualifier_copy`]) tell the user why
 /// it stopped instead of restating the raw token ([`QUALIFIER_BLOCKED`] or
 /// [`QUALIFIER_WAITING`]).
 const NEEDS_INPUT_COPY: &str = "needs input";
+
+/// User-facing copy for [`AgentActivity::WorkingButIdle`] — the SECOND
+/// translated bucket, and the only one with no single claude token behind it:
+/// there is no `interrupted` qualifier on the wire, so this names the CONTRADICTION
+/// snapback detected (a working `state` its own `status` calls `idle`) rather
+/// than restating either half of the pair (which would read as a bare, endless
+/// `working`).
+///
+/// The word is the product owner's, chosen to match claude's own vocabulary —
+/// "interrupted" is the term claude uses for a background agent that was stopped,
+/// so it is the phrasing users already recognize. It deliberately reads as a
+/// CAUSE the raw signal cannot prove; the accepted false-positive risk (a healthy
+/// agent briefly at `working`/`idle`) is documented in DOMAIN.md, and the
+/// internal enum name stays descriptive ([`AgentActivity::WorkingButIdle`]) so
+/// the code never asserts that cause.
+const INTERRUPTED_COPY: &str = "interrupted";
 
 /// The slice of a REPORTED agent the board UI needs, joined to a session by the
 /// full `sessionId`.
@@ -181,6 +198,17 @@ pub enum AgentActivity {
     Idle,
     /// Actively working a turn ([`QUALIFIER_WORKING`] / [`QUALIFIER_BUSY`]).
     Working,
+    /// claude reports a working `state` its own `status` contradicts as `idle`;
+    /// the single bucket snapback authors rather than passes through verbatim.
+    /// Display-only, never gates resume.
+    ///
+    /// The internal name stays DESCRIPTIVE — it names exactly what was observed
+    /// (a working `state` contradicted by an `idle` `status`) and asserts no
+    /// cause, unlike the user-facing word. It renders gray + STEADY (see
+    /// [`is_active`]): the pulse would claim work is in flight while claude's own
+    /// `status` says nothing is churning. Keyed on `state`, so it fires only for
+    /// background agents (interactive sessions report no `state`).
+    WorkingButIdle,
     /// Reported completion ([`QUALIFIER_DONE`]); only observable under `--all`.
     /// Badges green and steady — it does NOT decide whether `-r` is permitted.
     Done,
@@ -196,8 +224,27 @@ pub enum AgentActivity {
 /// field won. Anything outside the known values — including a missing qualifier
 /// — is [`AgentActivity::Other`], matching the module's fail-soft posture toward
 /// `claude agents --json` schema drift.
+///
+/// The ONE exception reads the raw `state`/`status` PAIR rather than the
+/// collapsed qualifier: [`AgentActivity::WorkingButIdle`] fires when a working
+/// `state` is contradicted by an `idle` `status`, and it is checked BEFORE the
+/// qualifier match — which would otherwise collapse the pair to `state=working`
+/// and hide the contradiction as a plain [`AgentActivity::Working`].
+/// [`ReportedAgent::qualifier`] itself is left untouched, so every other seam
+/// still speaks through the same collapsed precedence.
 #[must_use]
 pub fn classify(agent: &ReportedAgent) -> AgentActivity {
+    // Surface claude's own self-contradiction before the qualifier collapses it:
+    // a background agent that died at startup keeps reporting a working `state`
+    // while its `status` reads `idle`. Display-only (see `WorkingButIdle`); it
+    // never reaches a liveness or resume decision.
+    if matches!(
+        agent.state.as_deref(),
+        Some(QUALIFIER_WORKING | QUALIFIER_BUSY)
+    ) && agent.status.as_deref() == Some(QUALIFIER_IDLE)
+    {
+        return AgentActivity::WorkingButIdle;
+    }
     match agent.qualifier() {
         Some(QUALIFIER_BLOCKED | QUALIFIER_WAITING) => AgentActivity::NeedsInput,
         Some(QUALIFIER_IDLE) => AgentActivity::Idle,
@@ -212,12 +259,18 @@ pub fn classify(agent: &ReportedAgent) -> AgentActivity {
 /// into user-facing copy in exactly ONE place.
 ///
 /// `None` when the agent has no qualifier at all (nothing to say). Otherwise it
-/// translates ONLY [`AgentActivity::NeedsInput`] — BOTH of its spellings
-/// ([`QUALIFIER_BLOCKED`] and [`QUALIFIER_WAITING`]) collapse to
-/// [`NEEDS_INPUT_COPY`], since the BUCKET is the thing being named and two
-/// spellings of "it wants you" must not read as two different states — and passes
-/// every other bucket's raw qualifier through VERBATIM (fail-soft: an unknown
-/// value is shown, never hidden or relabeled).
+/// translates the TWO authored buckets and passes every other bucket's raw
+/// qualifier through VERBATIM (fail-soft: an unknown value is shown, never hidden
+/// or relabeled):
+///
+/// * [`AgentActivity::NeedsInput`] — BOTH of its spellings ([`QUALIFIER_BLOCKED`]
+///   and [`QUALIFIER_WAITING`]) collapse to [`NEEDS_INPUT_COPY`], since the BUCKET
+///   is the thing being named and two spellings of "it wants you" must not read as
+///   two different states.
+/// * [`AgentActivity::WorkingButIdle`] → [`INTERRUPTED_COPY`], because that bucket
+///   has no single wire token to pass through — it is the CONTRADICTION between a
+///   working `state` and an `idle` `status`, which read verbatim would be a bare,
+///   endless `working`.
 ///
 /// Its two consumers are the preview banner ([`friendly_status`], which fuses the
 /// phrase onto the kind label) and the board list row
@@ -233,6 +286,9 @@ pub fn qualifier_copy(agent: &ReportedAgent) -> Option<&str> {
     let qualifier = agent.qualifier()?;
     Some(match classify(agent) {
         AgentActivity::NeedsInput => NEEDS_INPUT_COPY,
+        // The one bucket with no wire token to pass through: it names the
+        // state/status CONTRADICTION, not either half of it (see `INTERRUPTED_COPY`).
+        AgentActivity::WorkingButIdle => INTERRUPTED_COPY,
         AgentActivity::Idle
         | AgentActivity::Working
         | AgentActivity::Done
@@ -261,7 +317,9 @@ pub fn friendly_status(agent: &ReportedAgent) -> String {
 /// Pure, and derived from [`classify`] so "active" can never disagree with the
 /// banner about what the qualifier meant. The RESTING buckets are steady:
 /// [`AgentActivity::NeedsInput`] (stopped, waiting on the user),
-/// [`AgentActivity::Idle`] (up, but not working a turn), and
+/// [`AgentActivity::Idle`] (up, but not working a turn),
+/// [`AgentActivity::WorkingButIdle`] (claude's own `status` says nothing is
+/// churning, so a pulse would claim work that is not in flight), and
 /// [`AgentActivity::Done`] (finished — nothing is happening to animate).
 ///
 /// [`AgentActivity::Other`] — an unknown or absent qualifier — counts as ACTIVE
@@ -270,7 +328,10 @@ pub fn friendly_status(agent: &ReportedAgent) -> String {
 #[must_use]
 pub fn is_active(agent: &ReportedAgent) -> bool {
     match classify(agent) {
-        AgentActivity::NeedsInput | AgentActivity::Idle | AgentActivity::Done => false,
+        AgentActivity::NeedsInput
+        | AgentActivity::Idle
+        | AgentActivity::WorkingButIdle
+        | AgentActivity::Done => false,
         AgentActivity::Working | AgentActivity::Other => true,
     }
 }
@@ -512,13 +573,14 @@ mod tests {
 
     /// `qualifier_copy` is the shared translation the preview banner AND the
     /// board list row both speak, so it is pinned directly here rather than only
-    /// through `friendly_status`: `NeedsInput` is the ONE bucket translated (both
-    /// spellings, from either qualifier source), every other bucket passes its raw
-    /// token through verbatim, and an agent with no qualifier at all yields `None`.
+    /// through `friendly_status`: the TWO authored buckets (`NeedsInput`, both
+    /// spellings from either qualifier source; and `WorkingButIdle`) translate,
+    /// every other bucket passes its raw token through verbatim, and an agent with
+    /// no qualifier at all yields `None`.
     #[test]
-    fn qualifier_copy_translates_only_needs_input_and_passes_the_rest_through() {
-        // NeedsInput is the one translated bucket — both spellings, from either
-        // qualifier source, collapse to the same actionable copy.
+    fn qualifier_copy_translates_the_authored_buckets_and_passes_the_rest_through() {
+        // NeedsInput is translated — both spellings, from either qualifier
+        // source, collapse to the same actionable copy.
         assert_eq!(
             qualifier_copy(&agent("background", Some("blocked"), None)),
             Some("needs input")
@@ -526,6 +588,14 @@ mod tests {
         assert_eq!(
             qualifier_copy(&agent("interactive", None, Some("waiting"))),
             Some("needs input")
+        );
+
+        // WorkingButIdle is the SECOND translated bucket: its working/idle
+        // contradiction has no wire token, so it reads as the product word rather
+        // than either half of the pair.
+        assert_eq!(
+            qualifier_copy(&agent("background", Some("working"), Some("idle"))),
+            Some("interrupted")
         );
 
         // Every other KNOWN bucket keeps its raw token verbatim.
@@ -727,6 +797,54 @@ mod tests {
                 "status={qualifier:?} should have active={active}"
             );
         }
+
+        // The joint-read bucket can't ride the single-qualifier loop above: it
+        // needs BOTH a working `state` AND an `idle` `status`. It rests STEADY —
+        // a pulse would claim work claude's own `status` says is not running.
+        assert!(
+            !is_active(&agent("background", Some("working"), Some("idle"))),
+            "working/idle is claude's stalled-agent shape; it must not pulse"
+        );
+    }
+
+    /// The joint-read bucket end to end: ONLY a working `state` CONTRADICTED by
+    /// an `idle` `status` is `WorkingButIdle`. It reads `interrupted` (the second
+    /// translated bucket) and rests steady, while every neighbouring shape stays
+    /// exactly what it was — the contradiction is the whole trigger, so dropping
+    /// either half falls back to a plain `Working` or `Idle`.
+    #[test]
+    fn working_state_with_idle_status_is_interrupted_and_steady() {
+        // The stalled-agent shape claude never reconciles: working state that its
+        // own status calls idle.
+        let interrupted = agent("background", Some("working"), Some("idle"));
+        assert_eq!(classify(&interrupted), AgentActivity::WorkingButIdle);
+        assert_eq!(friendly_status(&interrupted), "bg interrupted");
+        assert!(
+            !is_active(&interrupted),
+            "the pulse would claim work claude's own status says is not running"
+        );
+
+        // `busy` is the other spelling of a working state, so it triggers too.
+        let interrupted_busy = agent("background", Some("busy"), Some("idle"));
+        assert_eq!(classify(&interrupted_busy), AgentActivity::WorkingButIdle);
+        assert_eq!(friendly_status(&interrupted_busy), "bg interrupted");
+
+        // Neither half alone is the contradiction, so each falls back to the
+        // ordinary bucket it always had:
+        // - a working state with NO idle status is a plain, PULSING Working...
+        let working_none = agent("background", Some("working"), None);
+        assert_eq!(classify(&working_none), AgentActivity::Working);
+        assert!(is_active(&working_none));
+        // ...including a working state whose status is some OTHER value: the
+        // trigger is `idle` specifically, not merely "status present".
+        let working_busy = agent("background", Some("working"), Some("busy"));
+        assert_eq!(classify(&working_busy), AgentActivity::Working);
+        assert!(is_active(&working_busy));
+        // - ...and an idle status with NO working state is a plain, steady Idle.
+        let idle_only = agent("interactive", None, Some("idle"));
+        assert_eq!(classify(&idle_only), AgentActivity::Idle);
+        assert_eq!(friendly_status(&idle_only), "live idle");
+        assert!(!is_active(&idle_only));
     }
 
     /// The BOARD poll's exact invocation, pinned without spawning `claude` (the
