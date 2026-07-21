@@ -149,19 +149,26 @@ off the list.
 - **green** — nothing is wanted from you: the session is either idle or finished.
   The word beside the badge says which.
 - **gray, pulsing** — working right now.
+- **gray, steady** — **interrupted**: a background agent Claude Code still lists
+  as working even though it was stopped, so the badge holds still instead of
+  pulsing as if a turn were in flight.
 
-The pulse is the tell for activity: only the working badge pulses, once a second,
-and only its dot — which fades between bright and dim rather than blinking out,
-so no text on the row ever moves or redraws and a busy board doesn't flicker.
-Colors follow your terminal's theme.
+The pulse is the tell for activity: only a genuinely working badge pulses, once a
+second, and only its dot — which fades between bright and dim rather than blinking
+out, so no text on the row ever moves or redraws and a busy board doesn't flicker.
+A steady gray badge is the interrupted one; the missing pulse is what sets it
+apart. Colors follow your terminal's theme.
 
 Open the preview on a badged session and it leads with the same status in words,
 pinned above the transcript so it stays in view while the transcript scrolls
 beneath it — you can see why a session is sitting there before deciding what to
 do about it. It reports what Claude Code reports, in Claude Code's own words, with
-one exception: the two states that both mean *the session is waiting on you*
-(`blocked` and `waiting`) are spelled out as `needs input`. Anything else is
-passed through as-is rather than guessed at.
+two exceptions. The two states that both mean *the session is waiting on you*
+(`blocked` and `waiting`) are spelled out as `needs input`. And a background agent
+Claude Code still calls `working` while its own status reads `idle` — the shape of
+one that was interrupted and never cleaned up — is labelled `interrupted` (Claude
+Code's own word) and held steady. Anything else is passed through as-is rather
+than guessed at.
 
 Because a session that's still running can't be plain-resumed, pressing `Enter`
 on one offers **Attach** (reconnect to a running background agent), **Fork**, or

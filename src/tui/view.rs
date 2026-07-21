@@ -688,8 +688,13 @@ pub(crate) fn badge_color(agent: &ReportedAgent) -> Color {
         // done has finished cleanly. Both are steady, so green never has to carry
         // the activity signal on its own.
         AgentActivity::Idle | AgentActivity::Done => Color::Green,
-        // Unknown/absent tracks the working bucket, matching `is_active`.
-        AgentActivity::Working | AgentActivity::Other => BADGE_WORKING,
+        // Gray is the working base, and the interrupted bucket shares it: it IS a
+        // working `state`, only one claude's own `status` contradicts. It renders
+        // the same gray but STEADY (see `is_active`), so the missing pulse — not a
+        // second color — is what tells it apart from a genuinely churning agent.
+        AgentActivity::Working | AgentActivity::WorkingButIdle | AgentActivity::Other => {
+            BADGE_WORKING
+        }
     }
 }
 
@@ -2741,6 +2746,22 @@ mod tests {
                 "status={qualifier:?} should have active={active}"
             );
         }
+
+        // The joint-read bucket needs BOTH fields, so it sits outside the
+        // single-qualifier loop: a working `state` its own `status` calls `idle`
+        // is `WorkingButIdle`. It carries the working gray — but STEADY, so the
+        // MISSING pulse, not a second color, is the whole tell.
+        let interrupted = agent("background", Some("working"), Some("idle"));
+        assert_eq!(
+            badge_color(&interrupted),
+            BADGE_WORKING,
+            "the interrupted bucket shares the working gray base"
+        );
+        assert_eq!(BADGE_WORKING, Color::Gray, "and that base is gray");
+        assert!(
+            !agents::is_active(&interrupted),
+            "it must be steady: the pulse would claim work claude's status denies"
+        );
     }
 
     /// `qualifier`'s state-then-status precedence must reach the badge too: the
@@ -2872,28 +2893,37 @@ mod tests {
         badges
     }
 
-    /// One session per KNOWN qualifier: `(state, badge color, does it pulse)`.
+    /// One session per KNOWN shape: `(row label, state, status, badge color,
+    /// does it pulse)`.
     ///
     /// Color and pulse are asserted as a PAIR because they are one signal: gray
     /// is only honest about a working agent while that agent's dot is pulsing.
     /// Every qualifier gets its own row rather than one row per bucket, so a
     /// bucket that silently stopped covering one of its two spellings fails here.
-    const BADGE_CASES: [(&str, Color, bool); 6] = [
+    ///
+    /// The `label` is decoupled from `state` for exactly one row: `WorkingButIdle`
+    /// shares the `working` STATE with the plain working bucket, so it needs its
+    /// own `interrupted` label to stay a distinct, findable row while still
+    /// carrying the `state`/`status` PAIR its classification is read from.
+    const BADGE_CASES: [(&str, &str, Option<&str>, Color, bool); 7] = [
         // Waiting on the user: the most prominent color, but STEADY.
-        ("blocked", Color::Yellow, false),
+        ("blocked", "blocked", None, Color::Yellow, false),
         // The same bucket under its other token: yellow, and steady TOO. This
         // row is the pulse lie being fixed — `waiting` once rendered as working.
-        ("waiting", Color::Yellow, false),
+        ("waiting", "waiting", None, Color::Yellow, false),
         // Up but not working: steady, and green is EARNED by this bucket
         // rather than being the badge's old hardcoded color.
-        ("idle", Color::Green, false),
+        ("idle", "idle", None, Color::Green, false),
         // Quietly working: gray, and the pulse is what marks it active.
-        ("working", Color::Gray, true),
+        ("working", "working", None, Color::Gray, true),
         // The same bucket under its other token: gray, and pulsing TOO.
-        ("busy", Color::Gray, true),
+        ("busy", "busy", None, Color::Gray, true),
+        // The joint-read bucket: a working `state` its own `status` calls `idle`.
+        // Same working gray, but STEADY — the missing pulse is the whole tell.
+        ("interrupted", "working", Some("idle"), Color::Gray, false),
         // Finished: green (nothing is wanted from you) and steady. Only
         // observable at all because the poller passes `--all`.
-        ("done", Color::Green, false),
+        ("done", "done", None, Color::Green, false),
     ];
 
     /// A board carrying one REPORTED session per [`BADGE_CASES`] bucket, each
@@ -2906,17 +2936,17 @@ mod tests {
     fn badge_board() -> App {
         let mut sessions = Vec::new();
         let mut reported = HashMap::new();
-        for (state, _, _) in BADGE_CASES {
+        for (label, state, status, _, _) in BADGE_CASES {
             let mut session = sample_session();
-            session.session_id = format!("sess-{state}");
-            session.label = format!("sess-{state}");
+            session.session_id = format!("sess-{label}");
+            session.label = format!("sess-{label}");
             reported.insert(
                 session.session_id.clone(),
                 ReportedAgent {
                     kind: "background".to_string(),
                     id: None,
                     state: Some(state.to_string()),
-                    status: None,
+                    status: status.map(str::to_owned),
                     name: None,
                 },
             );
@@ -3000,47 +3030,47 @@ mod tests {
             badges.iter().map(|b| &b.row).collect::<Vec<_>>()
         );
 
-        for (state, color, _) in BADGE_CASES {
+        for (label, _, _, color, _) in BADGE_CASES {
             let badge = badges
                 .iter()
-                .find(|badge| badge.row.contains(&format!("sess-{state}")))
-                .unwrap_or_else(|| panic!("a badge row for the {state:?} session"));
+                .find(|badge| badge.row.contains(&format!("sess-{label}")))
+                .unwrap_or_else(|| panic!("a badge row for the {label:?} session"));
 
             // Content first (structure, not styling): proves the cells read
             // below are really the kind label and not a drifted offset.
             assert_eq!(
                 badge.label, "bg",
-                "the dot must be followed by the kind label ({state:?} row: {:?})",
+                "the dot must be followed by the kind label ({label:?} row: {:?})",
                 badge.row
             );
             assert!(
                 !badge.label_cells.is_empty(),
-                "the {state:?} label must have drawn cells to assert over"
+                "the {label:?} label must have drawn cells to assert over"
             );
 
             // The kind label always carries the bucket's badge color.
             for (fg, modifier) in &badge.label_cells {
-                assert_eq!(*fg, color, "the {state:?} kind label must be {color:?}");
+                assert_eq!(*fg, color, "the {label:?} kind label must be {color:?}");
                 // `contains`, not equality: the List's `highlight_style` layers
                 // REVERSED (and its own BOLD) onto whichever row is selected, so
                 // the selected badge's cells legitimately carry more than BOLD.
                 assert!(
                     modifier.contains(Modifier::BOLD),
-                    "the {state:?} kind label must survive to the buffer BOLD, got {modifier:?}"
+                    "the {label:?} kind label must survive to the buffer BOLD, got {modifier:?}"
                 );
             }
 
             // The dot carries that SAME color, EXCEPT `NeedsInput`, whose `!`
             // diverges to the red accent while its label stays yellow — the
             // one-cell divergence that is the whole point of the red marker.
-            let expected_dot_fg = if matches!(state, "blocked" | "waiting") {
+            let expected_dot_fg = if matches!(label, "blocked" | "waiting") {
                 BADGE_NEEDS_INPUT_COLOR
             } else {
                 color
             };
             assert_eq!(
                 badge.dot_fg, expected_dot_fg,
-                "the {state:?} dot must be {expected_dot_fg:?}, got {:?}",
+                "the {label:?} dot must be {expected_dot_fg:?}, got {:?}",
                 badge.dot_fg
             );
         }
@@ -3190,8 +3220,9 @@ mod tests {
         }
 
         // Every OTHER bucket keeps the `●` dot — the shape channel is the one
-        // bucket's alone, so nothing else changes.
-        for label in ["sess-idle", "sess-working", "sess-done"] {
+        // bucket's alone, so nothing else changes (including the interrupted
+        // bucket: it is not NeedsInput, so it must not borrow the `!`).
+        for label in ["sess-idle", "sess-working", "sess-interrupted", "sess-done"] {
             assert_eq!(
                 badge_cell(0, label).symbol(),
                 BADGE_DOT,
@@ -3278,11 +3309,11 @@ mod tests {
                 .map(|badge| badge.row)
                 .collect();
 
-            for (state, _, _) in BADGE_CASES {
-                let row = format!("sess-{state}");
+            for (label, _, _, _, _) in BADGE_CASES {
+                let row = format!("sess-{label}");
                 assert!(
                     drawn.iter().any(|drawn_row| drawn_row.contains(&row)),
-                    "at tick {tick} (the {} phase) the {state:?} dot must STILL be drawn — \
+                    "at tick {tick} (the {} phase) the {label:?} dot must STILL be drawn — \
                      the pulse changes color, never the glyph; drawn rows: {drawn:?}",
                     if on { "ON" } else { "OFF" }
                 );
@@ -3304,7 +3335,7 @@ mod tests {
     fn render_list_pulses_only_an_active_dots_color() {
         let (width, height) = BADGE_BOARD_SIZE;
 
-        // (state -> the dot's fg) at one tick.
+        // (row label -> the dot's fg) at one tick.
         let phase = |tick: u64| -> HashMap<String, Color> {
             let mut app = badge_board();
             app.tick = tick;
@@ -3312,11 +3343,11 @@ mod tests {
             drawn_badges(&buffer, width, height)
                 .into_iter()
                 .filter_map(|badge| {
-                    BADGE_CASES.iter().find_map(|(state, _, _)| {
+                    BADGE_CASES.iter().find_map(|(label, _, _, _, _)| {
                         badge
                             .row
-                            .contains(&format!("sess-{state}"))
-                            .then(|| ((*state).to_string(), badge.dot_fg))
+                            .contains(&format!("sess-{label}"))
+                            .then(|| ((*label).to_string(), badge.dot_fg))
                     })
                 })
                 .collect()
@@ -3325,38 +3356,38 @@ mod tests {
         let on = phase(0);
         let off = phase(BLINK_TICKS);
 
-        for (state, color, pulses) in BADGE_CASES {
-            let on_fg = on[state];
-            let off_fg = off[state];
+        for (label, _, _, color, pulses) in BADGE_CASES {
+            let on_fg = on[label];
+            let off_fg = off[label];
 
             // The dot's ON-phase base is `badge_color`, EXCEPT `NeedsInput`, whose
             // `!` reddens to the accent. Only the pulsing buckets (never
             // `NeedsInput`) then dim off this base.
-            let glyph_base = if matches!(state, "blocked" | "waiting") {
+            let glyph_base = if matches!(label, "blocked" | "waiting") {
                 BADGE_NEEDS_INPUT_COLOR
             } else {
                 color
             };
             assert_eq!(
                 on_fg, glyph_base,
-                "the {state:?} dot must carry its base glyph color in the ON phase"
+                "the {label:?} dot must carry its base glyph color in the ON phase"
             );
 
             if pulses {
                 assert_ne!(
                     on_fg, off_fg,
-                    "the {state:?} dot is ACTIVE, so its color MUST change between \
+                    "the {label:?} dot is ACTIVE, so its color MUST change between \
                      phases — that color change IS the pulse"
                 );
                 assert_eq!(
                     off_fg,
                     pulse_color(color),
-                    "the {state:?} dot's OFF phase must be its declared dim partner"
+                    "the {label:?} dot's OFF phase must be its declared dim partner"
                 );
             } else {
                 assert_eq!(
                     on_fg, off_fg,
-                    "the {state:?} bucket is at rest, so its dot must be steady: \
+                    "the {label:?} bucket is at rest, so its dot must be steady: \
                      a pulse here would claim work is in flight"
                 );
             }
@@ -3394,28 +3425,28 @@ mod tests {
         let badges = drawn_badges(&buffer, width, height);
 
         let mut pulsing = 0;
-        for (state, color, pulses) in BADGE_CASES {
+        for (label, _, _, color, pulses) in BADGE_CASES {
             let badge = badges
                 .iter()
-                .find(|badge| badge.row.contains(&format!("sess-{state}")))
-                .unwrap_or_else(|| panic!("a badge row for the {state:?} session"));
+                .find(|badge| badge.row.contains(&format!("sess-{label}")))
+                .unwrap_or_else(|| panic!("a badge row for the {label:?} session"));
 
             // Content first (structure, not styling): proves the cells read
             // below are really the kind label and not a drifted offset.
             assert_eq!(
                 badge.label, "bg",
-                "the dot must be followed by the kind label ({state:?} row: {:?})",
+                "the dot must be followed by the kind label ({label:?} row: {:?})",
                 badge.row
             );
             assert!(
                 !badge.label_cells.is_empty(),
-                "the {state:?} label must have drawn cells to assert over"
+                "the {label:?} label must have drawn cells to assert over"
             );
 
             for (fg, _) in &badge.label_cells {
                 assert_eq!(
                     *fg, color,
-                    "the {state:?} kind label must still be its steady {color:?} in the \
+                    "the {label:?} kind label must still be its steady {color:?} in the \
                      OFF phase — the label NEVER pulses, only the dot does"
                 );
             }
@@ -3428,7 +3459,7 @@ mod tests {
             assert_eq!(
                 badge.dot_fg,
                 pulse_color(color),
-                "the {state:?} dot must have dimmed in the OFF phase, or this row \
+                "the {label:?} dot must have dimmed in the OFF phase, or this row \
                  cannot show the divergence below"
             );
             // The divergence, in ONE frame: the dot has left the base color its
@@ -3437,7 +3468,7 @@ mod tests {
             for (fg, _) in &badge.label_cells {
                 assert_ne!(
                     badge.dot_fg, *fg,
-                    "the {state:?} row is ACTIVE and in the OFF phase, so its dot must \
+                    "the {label:?} row is ACTIVE and in the OFF phase, so its dot must \
                      have pulsed AWAY from its label's steady color: the two diverge \
                      here, and a label wired to the dot's pulsing style would not"
                 );
@@ -3470,31 +3501,39 @@ mod tests {
         assert_eq!(pulse_color(Color::Green), Color::Green);
     }
 
-    /// The qualifier that classifies into `bucket`.
+    /// A synthetic agent that classifies into `bucket`.
+    ///
+    /// Returns the whole [`ReportedAgent`] rather than a lone qualifier because
+    /// [`AgentActivity::WorkingButIdle`] is read from the raw `state`/`status`
+    /// PAIR (a working `state` contradicted by an `idle` `status`), which a
+    /// single qualifier token cannot express.
     ///
     /// EXHAUSTIVE on purpose: adding an `AgentActivity` bucket fails to compile
     /// here, which drags the author to the walk below — the one thing that keeps
     /// `pulse_color`'s silent identity fallback from swallowing a new pulsing
     /// bucket. (The walk's own list must then gain the bucket; a `match` cannot
     /// force that, so `ALL_BUCKETS` says so.)
-    fn qualifier_reaching(bucket: AgentActivity) -> Option<&'static str> {
+    fn agent_reaching(bucket: AgentActivity) -> ReportedAgent {
         match bucket {
-            AgentActivity::NeedsInput => Some("blocked"),
-            AgentActivity::Idle => Some("idle"),
-            AgentActivity::Working => Some("working"),
-            AgentActivity::Done => Some("done"),
+            AgentActivity::NeedsInput => agent("background", Some("blocked"), None),
+            AgentActivity::Idle => agent("background", Some("idle"), None),
+            AgentActivity::Working => agent("background", Some("working"), None),
+            // The one joint-read bucket: a working `state` AND an idle `status`.
+            AgentActivity::WorkingButIdle => agent("background", Some("working"), Some("idle")),
+            AgentActivity::Done => agent("background", Some("done"), None),
             // The fail-soft bucket: an unrecognized qualifier, or none at all.
-            AgentActivity::Other => Some("compacting"),
+            AgentActivity::Other => agent("background", Some("compacting"), None),
         }
     }
 
     /// Every `AgentActivity` bucket. Keep in sync with the enum — the exhaustive
-    /// `match` in [`qualifier_reaching`] is what fails to compile and sends the
+    /// `match` in [`agent_reaching`] is what fails to compile and sends the
     /// author here when a bucket is added.
-    const ALL_BUCKETS: [AgentActivity; 5] = [
+    const ALL_BUCKETS: [AgentActivity; 6] = [
         AgentActivity::NeedsInput,
         AgentActivity::Idle,
         AgentActivity::Working,
+        AgentActivity::WorkingButIdle,
         AgentActivity::Done,
         AgentActivity::Other,
     ];
@@ -3513,11 +3552,11 @@ mod tests {
     #[test]
     fn every_pulsing_buckets_badge_color_has_a_distinct_dim_partner() {
         for bucket in ALL_BUCKETS {
-            let agent = agent("background", qualifier_reaching(bucket), None);
+            let agent = agent_reaching(bucket);
             assert_eq!(
                 agents::classify(&agent),
                 bucket,
-                "qualifier_reaching({bucket:?}) must actually classify into that bucket, \
+                "agent_reaching({bucket:?}) must actually classify into that bucket, \
                  or this walk silently stops covering it"
             );
 

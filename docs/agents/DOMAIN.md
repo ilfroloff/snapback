@@ -466,9 +466,10 @@ Every qualifier-shaped output derives from that enum, so they cannot drift apart
 
 | Bucket | Qualifier(s) | Badge color | Badge glyph | Dot pulses | Banner / row reads |
 | --- | --- | --- | --- | --- | --- |
-| `NeedsInput` | `blocked`, `waiting` | `Yellow` (label/phrase) | `!` (`Red`) | no | `needs input` (the ONE translated bucket — both tokens) |
+| `NeedsInput` | `blocked`, `waiting` | `Yellow` (label/phrase) | `!` (`Red`) | no | `needs input` (translated — both tokens) |
 | `Idle` | `idle` | `Green` | `●` | no | `idle` (verbatim) |
 | `Working` | `working`, `busy` | `Gray` | `●` | **yes** (-> `DarkGray`) | verbatim (`working` / `busy`) |
+| `WorkingButIdle` | `state`=`working`/`busy` **AND** `status`=`idle` | `Gray` | `●` | **no** | `interrupted` (**translated**, no wire token) |
 | `Done` | `done` | `Green` | `●` | no | `done` (verbatim) |
 | `Other` | anything else, or none | `Gray` | `●` | yes (-> `DarkGray`) | verbatim, or the kind label alone |
 
@@ -495,6 +496,25 @@ differs, and that is a `tui::view` rendering call, not a bucket property:
 `NeedsInput` draws its `needs input` at the badge's own color + `BOLD` (as loud
 as the dot and kind label), every other bucket stays `DIM`.
 
+**`WorkingButIdle` is the only bucket classified from the raw `state`/`status`
+PAIR rather than the collapsed qualifier, and the only translated one with no
+wire token behind it** (`NeedsInput` relabels tokens `claude` actually sends;
+this one names a contradiction `claude` never spells out). When `claude`
+interrupts a background agent it
+does **not** reconcile the job: `claude agents --json` keeps reporting
+`state=working` while that same record's `status` reads `idle`. `classify`
+detects that self-contradiction **before** the qualifier collapse (which would
+otherwise hide it as a plain `Working`) and buckets it here. It then renders the
+working `Gray` but **STEADY** — the absent pulse, not a second color, is what
+sets it apart — and translates the phrase to `interrupted` (there is no
+`interrupted` token on the wire; the word names the contradiction, in `claude`'s
+own vocabulary). This is **display-only**: like every other bucket it never
+answers "live?" and never gates resume/attach, which stay on `live_agents`
+membership. The internal name stays descriptive (`WorkingButIdle`) precisely
+because the signal cannot prove the *cause* the UI word implies; the accepted
+false-positive (a healthy agent briefly at `working`/`idle`) self-heals to
+`Working`+pulse on the next poll once `status` flips to `busy`.
+
 **Every column is a DISPLAY decision — no bucket answers "live?".** The table
 once carried that column and it was the bug: liveness is not a property of a
 qualifier, it is `live_agents`' membership answer straight from claude (see
@@ -515,8 +535,10 @@ agent a different badge depending on which token the wire used.
 `Other` is the fail-soft posture made visible: an unknown qualifier is passed
 through to the user rather than dropped or relabeled, and counts as ACTIVE, so
 schema drift never hides a busy session behind a steady dot. The colors read as
-urgency — yellow needs you, green is ready (idle or finished), gray is quietly
-working — and the PULSE, not the color, is what marks activity.
+urgency — yellow needs you, green is ready (idle or finished), gray is working —
+and the PULSE, not the color, is what marks activity: a **pulsing** gray dot is
+churning (`Working`/`Other`), a **steady** gray dot is not (`WorkingButIdle`,
+the interrupted agent claude never reconciled).
 
 #### Observed value distribution
 
