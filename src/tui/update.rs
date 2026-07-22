@@ -23,6 +23,7 @@
 //! | `Ctrl-N` | start a new session in the launch directory (pick an agent when any are defined) |
 //! | `Tab` | toggle name-only vs. name+content search |
 //! | `Ctrl-A` | toggle scope (current-folder <-> all) |
+//! | `Ctrl-X` then `x`/`d`/`h` | leader chord: hide / hard-delete / toggle show-hidden (any other key cancels) |
 //! | `Ctrl-/` | toggle the preview pane |
 //! | `PgUp` / `PgDn` | scroll the preview a page (always) |
 //! | `Ctrl-U` / `Ctrl-D` | scroll the preview a quarter page (always) |
@@ -45,11 +46,12 @@ use crossterm::event::{
 use ratatui::layout::{Position, Rect};
 
 use crate::defined_agents;
+use crate::delete;
 use crate::resume::{self, Ready};
 use crate::store::SessionStore;
 use crate::watch::AppEvent;
 
-use super::app::{App, LiveChoice};
+use super::app::{App, ModalAction, ModalLayout};
 use super::view;
 
 /// A decoded intent from a single keypress.
@@ -101,6 +103,10 @@ pub enum Action {
     Insert(char),
     /// Delete the last query character.
     Backspace,
+    /// Enter the `Ctrl-X` leader chord: arm [`App::pending_chord`] so the NEXT key
+    /// routes through the pure [`chord_key`] machine (hide / hard-delete /
+    /// show-hidden / cancel) instead of the board.
+    Chord,
     /// A key with no binding in the current state.
     Ignore,
 }
@@ -140,6 +146,10 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool) -> Action {
             KeyCode::Char('a') | KeyCode::Char('A') => Action::ToggleScope,
             KeyCode::Char('n') | KeyCode::Char('N') => Action::NewSession,
             KeyCode::Char('c') | KeyCode::Char('C') => Action::Quit,
+            // Ctrl-X (0x18 CAN) is the hide/delete leader chord. Unbound and
+            // terminal-safe — unlike Ctrl-H/I/M, which alias Backspace/Tab/Enter.
+            // It only ARMS the chord; the follow-up key decides (see `chord_key`).
+            KeyCode::Char('x') | KeyCode::Char('X') => Action::Chord,
             // Quarter-page preview scroll (readline-style). Acts regardless of
             // the query, like the arrows, so search never blocks preview scrolling.
             KeyCode::Char('u') | KeyCode::Char('U') => Action::PreviewHalfUp,
@@ -188,21 +198,24 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool) -> Action {
 ///   and a left-click on a rendered preview link opens its url in the default
 ///   browser ([`handle_mouse`]); all are independent of the overlay gate (a click
 ///   cannot start an orphaned drag or open a link while the overlay is open — see
-///   [`App::begin_split_drag`] and the `pending_live` guard).
+///   [`App::begin_split_drag`] and the `App::overlay_active` gate).
 /// * `SessionsChanged` -> reload the store from `root` and re-apply query+scope,
 ///   preserving selection-by-id and scroll (see [`App::apply_sessions`]).
 /// * `Tick` -> nothing costly (just a redraw upstream).
 pub fn handle_event(app: &mut App, event: AppEvent, root: &Path) -> Outcome {
     match event {
         AppEvent::Input(Event::Key(key)) if is_actionable(key) => {
-            // While the running-session choice overlay is open it OWNS the
-            // keyboard: keys navigate/confirm/cancel the overlay, never the board.
-            if app.pending_live.is_some() {
-                return handle_live_choice_key(app, key);
+            // While a modal overlay (the running-session choice, the new-session
+            // agent picker, or the hard-delete confirm) is open it OWNS the
+            // keyboard: keys navigate/confirm/cancel the modal, never the board.
+            if app.modal.is_some() {
+                return handle_modal_key(app, key, root);
             }
-            // The new-session agent picker likewise owns the keyboard while open.
-            if app.pending_agent.is_some() {
-                return handle_agent_pick_key(app, key);
+            // A pending `Ctrl-X` leader chord OWNS the next key too: route it through
+            // the chord machine BEFORE normal handling so a printable follow-up
+            // (`x`/`d`/`h`) completes the chord instead of leaking into the query.
+            if app.pending_chord {
+                return handle_chord_key(app, key);
             }
             // A transient status (e.g. a resume refusal) lives exactly until the
             // next key; clear it first so this keypress may set a fresh one.
@@ -210,11 +223,11 @@ pub fn handle_event(app: &mut App, event: AppEvent, root: &Path) -> Outcome {
             apply_action(app, key_to_action(key, app.query.is_empty()))
         }
         // Mouse wheel scroll and splitter drag. A dedicated arm BEFORE the
-        // input catch-all and INDEPENDENT of the `pending_live` overlay gate
-        // above: neither routes into the overlay handler — they just scroll a
-        // pane / resize the split and never crash in any mode (query active,
-        // overlay open, ...). A stray click cannot start an orphaned drag
-        // while the overlay is open (`App::begin_split_drag` gates it).
+        // input catch-all and INDEPENDENT of the modal overlay gate above:
+        // neither routes into the modal handler — they just scroll a pane /
+        // resize the split and never crash in any mode (query active, modal
+        // open, ...). A stray click cannot start an orphaned drag while the
+        // modal is open (`App::begin_split_drag` gates it).
         AppEvent::Input(Event::Mouse(mouse)) => {
             handle_mouse(app, mouse);
             Outcome::Continue
@@ -303,7 +316,7 @@ fn on_splitter(col: u16, row: u16, list: Rect, preview: Rect) -> bool {
 /// in the default browser — fire-and-forget, off the render loop. Any other event
 /// (other buttons, horizontal wheel, plain moves) is ignored. Never touches the
 /// query, and the overlay gate is enforced by [`App::begin_split_drag`] (drag) and
-/// a `pending_live` guard (link open), so this never crashes or starts an
+/// the [`App::overlay_active`] gate (link open), so this never crashes or starts an
 /// orphaned drag / stray link-open in any mode.
 ///
 /// Arm order matters: the seam-drag arm is tried BEFORE the preview-link arm, so a
@@ -509,61 +522,139 @@ fn apply_action(app: &mut App, action: Action) -> Outcome {
             app.pop_query_char();
             Outcome::Continue
         }
+        Action::Chord => {
+            // Arm the leader chord; `handle_event` routes the next key through
+            // `handle_chord_key` before it can reach the board or the query.
+            app.pending_chord = true;
+            Outcome::Continue
+        }
         Action::Ignore => Outcome::Continue,
     }
 }
 
-/// A decoded intent while the running-session choice overlay owns the keyboard.
-enum LiveNav {
-    /// Move the highlight forward (`→`/`↓`/`Tab`/`l`/`j`).
+/// The three keys a pending `Ctrl-X` chord binds, plus cancel — the PURE decision
+/// half of the leader chord (PATTERNS §10, keys -> actions -> outcomes). The impure
+/// completion (hide / open confirm / toggle) lives in [`handle_chord_key`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChordOutcome {
+    /// `x` — toggle the selected session's hidden state (soft delete / un-hide).
+    Hide,
+    /// `d` — open the hard-delete confirm modal for the selected session.
+    Delete,
+    /// `h` — toggle whether user-hidden sessions are revealed inline.
+    ShowHidden,
+    /// `Esc` / `Ctrl-C` / any unbound key — abandon the chord with no side effect.
+    Cancel,
+}
+
+/// Resolve the key that FOLLOWS `Ctrl-X` into a [`ChordOutcome`]. Pure so the
+/// leader chord's decision is unit-testable without a terminal.
+///
+/// Any Ctrl-modified key cancels (so `Ctrl-C` still reads as a quit-shaped abort
+/// mid-leader and no completion is bound to a Ctrl combo), and any non-`x`/`d`/`h`
+/// key cancels too, so a mistyped follow-up abandons the chord rather than doing
+/// something surprising. `x`/`d`/`h` accept their shifted forms so a held Shift on
+/// the follow-up still completes the chord.
+fn chord_key(key: KeyEvent) -> ChordOutcome {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return ChordOutcome::Cancel;
+    }
+    match key.code {
+        KeyCode::Char('x') | KeyCode::Char('X') => ChordOutcome::Hide,
+        KeyCode::Char('d') | KeyCode::Char('D') => ChordOutcome::Delete,
+        KeyCode::Char('h') | KeyCode::Char('H') => ChordOutcome::ShowHidden,
+        _ => ChordOutcome::Cancel,
+    }
+}
+
+/// Apply the key that FOLLOWS a pending `Ctrl-X` chord, then LEAVE the chord — a
+/// leader chord resolves on exactly one key, hit or miss.
+///
+/// `x` hides / un-hides the selected session (persisting the change), `d` opens the
+/// hard-delete confirm (it does NOT delete here — the confirm handler does), `h`
+/// toggles the show-hidden view, and anything else (`Esc` / `Ctrl-C` / an unbound
+/// key) abandons the chord with no side effect. The pending state is cleared FIRST
+/// so an early return can never wedge the board in the chord. Routed BEFORE
+/// `key_to_action` in [`handle_event`], so a printable completion never leaks into
+/// the query.
+fn handle_chord_key(app: &mut App, key: KeyEvent) -> Outcome {
+    app.pending_chord = false;
+    // The follow-up is an actionable keypress, so clear any transient status first
+    // (a hide may then set its own persist-error status).
+    app.clear_status();
+    match chord_key(key) {
+        ChordOutcome::Hide => app.toggle_hidden_selected(),
+        ChordOutcome::ShowHidden => app.toggle_show_hidden(),
+        ChordOutcome::Delete => app.open_delete_confirm(),
+        ChordOutcome::Cancel => {}
+    }
+    Outcome::Continue
+}
+
+/// A decoded intent while a modal overlay owns the keyboard. Collapses the old
+/// `LiveNav` + `AgentNav`, which were variant-identical.
+enum ModalNav {
+    /// Move the highlight forward (`→`/`↓`/`Tab`/`l`/`j`; horizontal keys Row-only).
     Next,
-    /// Move the highlight backward (`←`/`↑`/`h`/`k`).
+    /// Move the highlight backward (`←`/`↑`/`h`/`k`; horizontal keys Row-only).
     Prev,
     /// Act on the highlighted choice (`Enter`).
     Confirm,
-    /// Dismiss the overlay (`Esc`/`Ctrl-C`).
+    /// Dismiss the modal (`Esc`/`Ctrl-C`).
     Cancel,
-    /// A key with no binding in the overlay.
+    /// A key with no binding in the modal.
     Ignore,
 }
 
-/// Map a keypress to a [`LiveNav`] while the choice overlay is open.
-fn live_choice_key(key: KeyEvent) -> LiveNav {
+/// Map a keypress to a [`ModalNav`] while a modal is open.
+///
+/// The vertical keys (`↑`/`↓`, plus `k`/`j` and `Tab` forward) serve BOTH layouts.
+/// The horizontal keys (`←`/`→`/`h`/`l`) are DERIVED from `layout`: a `Row` (button
+/// strip) binds them, a `List` (vertical picker) deliberately does NOT — the two
+/// overlays' key maps must not be unioned by accident. `Left`/`Right` are ALSO
+/// bound on the BOARD (`CollapseLineage`/`ExpandLineage`); `handle_event`'s modal
+/// gate keeps those dispatch contexts apart, so they never see the same keypress.
+fn modal_key(key: KeyEvent, layout: ModalLayout) -> ModalNav {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
-            KeyCode::Char('c') | KeyCode::Char('C') => LiveNav::Cancel,
-            _ => LiveNav::Ignore,
+            KeyCode::Char('c') | KeyCode::Char('C') => ModalNav::Cancel,
+            _ => ModalNav::Ignore,
         };
     }
+    let horizontal = matches!(layout, ModalLayout::Row);
     match key.code {
-        KeyCode::Left | KeyCode::Up | KeyCode::Char('h') | KeyCode::Char('k') => LiveNav::Prev,
-        KeyCode::Right | KeyCode::Down | KeyCode::Tab | KeyCode::Char('l') | KeyCode::Char('j') => {
-            LiveNav::Next
-        }
-        KeyCode::Enter => LiveNav::Confirm,
-        KeyCode::Esc => LiveNav::Cancel,
-        _ => LiveNav::Ignore,
+        KeyCode::Up | KeyCode::Char('k') => ModalNav::Prev,
+        KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => ModalNav::Next,
+        KeyCode::Left | KeyCode::Char('h') if horizontal => ModalNav::Prev,
+        KeyCode::Right | KeyCode::Char('l') if horizontal => ModalNav::Next,
+        KeyCode::Enter => ModalNav::Confirm,
+        KeyCode::Esc => ModalNav::Cancel,
+        _ => ModalNav::Ignore,
     }
 }
 
-/// Apply an overlay keypress: navigation stays on the board; Confirm routes the
-/// highlighted choice; Esc/Ctrl-C dismiss.
-fn handle_live_choice_key(app: &mut App, key: KeyEvent) -> Outcome {
-    match live_choice_key(key) {
-        LiveNav::Next => {
-            app.live_choice_next();
+/// Apply a modal keypress: navigation stays on the board; Confirm routes the
+/// highlighted choice's action; Esc/Ctrl-C dismiss. The layout (hence the key map)
+/// is read off the open modal.
+fn handle_modal_key(app: &mut App, key: KeyEvent, root: &Path) -> Outcome {
+    let Some(layout) = app.modal.as_ref().map(|m| m.layout) else {
+        return Outcome::Continue;
+    };
+    match modal_key(key, layout) {
+        ModalNav::Next => {
+            app.modal_next();
             Outcome::Continue
         }
-        LiveNav::Prev => {
-            app.live_choice_prev();
+        ModalNav::Prev => {
+            app.modal_prev();
             Outcome::Continue
         }
-        LiveNav::Cancel => {
-            app.live_choice_cancel();
+        ModalNav::Cancel => {
+            app.close_modal();
             Outcome::Continue
         }
-        LiveNav::Confirm => confirm_live_choice(app),
-        LiveNav::Ignore => Outcome::Continue,
+        ModalNav::Confirm => confirm_modal(app, root),
+        ModalNav::Ignore => Outcome::Continue,
     }
 }
 
@@ -576,22 +667,78 @@ enum Handoff {
     Fork,
 }
 
-/// Resolve the highlighted overlay choice into a driver [`Outcome`].
+/// Resolve the highlighted modal choice into a driver [`Outcome`] — the ONE
+/// confirm handler behind every modal (it absorbed the old `confirm_live_choice`
+/// and `confirm_agent_pick`).
 ///
-/// The overlay closes on any confirm. Attach/Fork run the terminal-up refusal
-/// gate and, on success, escalate to [`Outcome::Resume`] so the driver spawns
-/// them through the IDENTICAL teardown→spawn→wait→return round trip as a plain
-/// resume; a refusal (deleted worktree / unreadable file) sets a board status.
-fn confirm_live_choice(app: &mut App) -> Outcome {
-    let Some(pending) = app.pending_live.clone() else {
+/// The modal closes on any confirm. `Cancel` (or an out-of-range highlight) just
+/// returns to the board. `Attach`/`Fork` run the terminal-up refusal gate against
+/// the modal's target `session_id` and, on success, escalate to [`Outcome::Resume`]
+/// so the driver spawns them through the IDENTICAL teardown→spawn→wait→return round
+/// trip as a plain resume; a refusal (deleted worktree / unreadable file / no live
+/// agent) sets a board status. `New` records the pick as the last-chosen agent
+/// FIRST — BEFORE the gate, so the next `Ctrl-N` repeats it even across a refusal —
+/// then runs the new-session gate.
+///
+/// The `clone` releases the `app.modal` borrow before `close_modal` /
+/// `set_status` / `set_last_new_agent` / the gates re-borrow `app`, preserving the
+/// borrow discipline both old confirm handlers relied on.
+fn confirm_modal(app: &mut App, root: &Path) -> Outcome {
+    let Some(modal) = app.modal.clone() else {
         return Outcome::Continue;
     };
-    app.live_choice_cancel();
-    match pending.selected {
-        LiveChoice::Cancel => Outcome::Continue,
-        LiveChoice::Attach => route_handoff(app, &pending.session_id, Handoff::Attach),
-        LiveChoice::Fork => route_handoff(app, &pending.session_id, Handoff::Fork),
+    let action = modal.selected_action().cloned();
+    app.close_modal();
+    match action {
+        None | Some(ModalAction::Cancel) => Outcome::Continue,
+        Some(ModalAction::Attach) => match modal.session_id.as_deref() {
+            Some(id) => route_handoff(app, id, Handoff::Attach),
+            None => Outcome::Continue,
+        },
+        Some(ModalAction::Fork) => match modal.session_id.as_deref() {
+            Some(id) => route_handoff(app, id, Handoff::Fork),
+            None => Outcome::Continue,
+        },
+        Some(ModalAction::Delete) => match modal.session_id.as_deref() {
+            Some(id) => confirm_delete(app, id, root),
+            None => Outcome::Continue,
+        },
+        Some(ModalAction::New(agent)) => {
+            // Record the pick BEFORE the gate (so it survives a refusal), then run
+            // the same new-session gate the no-agent fast path uses.
+            app.set_last_new_agent(agent.clone());
+            launch_new_session(app, agent.as_deref())
+        }
     }
+}
+
+/// Execute a confirmed HARD delete of `session_id`, then refresh the board.
+///
+/// The pure [`delete::can_delete`] guard runs against a FRESH liveness probe
+/// ([`App::is_live_now`]) — the same re-ask posture the resume gate uses at
+/// hand-off, never a stale poll — so a session claude is actively running is
+/// REFUSED with a board status and nothing is unlinked. On `Ok` the session is
+/// CLONED first, ending the `&Session` borrow before the mutable reload re-borrows
+/// `app` (the clone-then-mutate discipline the other confirm handlers follow);
+/// [`delete::remove`] unlinks the transcript and its sibling id dir, and the board
+/// reloads from the SAME `root` the autorefresh reload uses
+/// ([`SessionStore::load_from`]), so the removed row leaves the board and the
+/// selection clamps to its neighbour by stable id. A remove error fails SOFT to a
+/// board status, leaving the store as-is.
+fn confirm_delete(app: &mut App, session_id: &str, root: &Path) -> Outcome {
+    if let Err(refusal) = delete::can_delete(app.is_live_now(session_id)) {
+        app.set_status(refusal);
+        return Outcome::Continue;
+    }
+    let Some(session) = app.session_by_id(session_id).cloned() else {
+        return Outcome::Continue;
+    };
+    if let Err(err) = delete::remove(&session) {
+        app.set_status(err.to_string());
+        return Outcome::Continue;
+    }
+    app.apply_sessions(SessionStore::load_from(root));
+    Outcome::Continue
 }
 
 /// Run the refusal gate for a chosen hand-off and escalate a confirmed plan to
@@ -687,79 +834,6 @@ fn launch_new_session(app: &mut App, agent: Option<&str>) -> Outcome {
             Outcome::Continue
         }
     }
-}
-
-/// A decoded intent while the new-session agent picker owns the keyboard.
-enum AgentNav {
-    /// Move the highlight down one row (`↓`/`Tab`/`j`).
-    Next,
-    /// Move the highlight up one row (`↑`/`k`).
-    Prev,
-    /// Start the session bound to the highlighted agent (`Enter`).
-    Confirm,
-    /// Dismiss the picker without starting a session (`Esc`/`Ctrl-C`).
-    Cancel,
-    /// A key with no binding in the picker.
-    Ignore,
-}
-
-/// Map a keypress to an [`AgentNav`] while the agent picker is open. The picker
-/// is a vertical list, so Up/Down (and `k`/`j`, mirroring the board's nav keys)
-/// move the highlight; `Tab` also steps forward for parity with the running-
-/// session overlay.
-fn agent_pick_key(key: KeyEvent) -> AgentNav {
-    if key.modifiers.contains(KeyModifiers::CONTROL) {
-        return match key.code {
-            KeyCode::Char('c') | KeyCode::Char('C') => AgentNav::Cancel,
-            _ => AgentNav::Ignore,
-        };
-    }
-    match key.code {
-        KeyCode::Up | KeyCode::Char('k') => AgentNav::Prev,
-        KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => AgentNav::Next,
-        KeyCode::Enter => AgentNav::Confirm,
-        KeyCode::Esc => AgentNav::Cancel,
-        _ => AgentNav::Ignore,
-    }
-}
-
-/// Apply a picker keypress: navigation stays on the board; Confirm starts the
-/// chosen agent's session; Esc/Ctrl-C dismiss.
-fn handle_agent_pick_key(app: &mut App, key: KeyEvent) -> Outcome {
-    match agent_pick_key(key) {
-        AgentNav::Next => {
-            app.agent_pick_next();
-            Outcome::Continue
-        }
-        AgentNav::Prev => {
-            app.agent_pick_prev();
-            Outcome::Continue
-        }
-        AgentNav::Cancel => {
-            app.agent_pick_cancel();
-            Outcome::Continue
-        }
-        AgentNav::Confirm => confirm_agent_pick(app),
-        AgentNav::Ignore => Outcome::Continue,
-    }
-}
-
-/// Resolve the highlighted picker row into a driver [`Outcome`].
-///
-/// Records the chosen agent as the last pick (so the next `Ctrl-N` repeats it),
-/// closes the picker, and runs the new-session gate for it — a confirmed plan
-/// escalates to [`Outcome::Resume`] through the IDENTICAL teardown→spawn→wait→
-/// return round trip as a resume; a refusal sets a board status. The clone
-/// releases the `pending_agent` borrow before `set_last_new_agent` / `check_new`
-/// re-borrow `app`.
-fn confirm_agent_pick(app: &mut App) -> Outcome {
-    let Some(pending) = app.pending_agent.clone() else {
-        return Outcome::Continue;
-    };
-    let agent = pending.selected_agent().map(str::to_owned);
-    app.set_last_new_agent(agent.clone());
-    app.agent_pick_cancel();
-    launch_new_session(app, agent.as_deref())
 }
 
 #[cfg(test)]
@@ -1039,10 +1113,7 @@ mod tests {
             app.selected, first,
             "a wheel over the list advances the selection"
         );
-        assert!(
-            app.pending_live.is_none(),
-            "a list wheel must not open an overlay"
-        );
+        assert!(app.modal.is_none(), "a list wheel must not open an overlay");
     }
 
     #[test]
@@ -1063,16 +1134,13 @@ mod tests {
             height: 20,
         };
         press(&mut app, KeyCode::Enter); // open the overlay
-        assert!(app.pending_live.is_some());
-        let highlight = app.pending_live.as_ref().unwrap().selected;
+        assert!(app.modal.is_some());
+        let highlight = app.modal.as_ref().unwrap().selected;
 
         wheel(&mut app, MouseEventKind::ScrollDown, 60, 10);
-        assert!(
-            app.pending_live.is_some(),
-            "a wheel must not dismiss the overlay"
-        );
+        assert!(app.modal.is_some(), "a wheel must not dismiss the overlay");
         assert_eq!(
-            app.pending_live.as_ref().unwrap().selected,
+            app.modal.as_ref().unwrap().selected,
             highlight,
             "a wheel must not move the overlay highlight"
         );
@@ -1206,7 +1274,7 @@ mod tests {
         app.list_rect = list;
         app.preview_rect = preview;
         press(&mut app, KeyCode::Enter); // open the overlay
-        assert!(app.pending_live.is_some());
+        assert!(app.modal.is_some());
 
         wheel(&mut app, MouseEventKind::Down(MouseButton::Left), 50, 10);
         assert!(
@@ -1214,7 +1282,7 @@ mod tests {
             "a click on the seam during the overlay must not start a drag"
         );
         assert!(
-            app.pending_live.is_some(),
+            app.modal.is_some(),
             "the click must not disturb the overlay either"
         );
     }
@@ -1421,7 +1489,7 @@ mod tests {
             "a preview-body click must not start a splitter drag"
         );
         assert!(
-            app.pending_live.is_none(),
+            app.modal.is_none(),
             "a preview-body click must not open the overlay"
         );
     }
@@ -1453,33 +1521,37 @@ mod tests {
     #[test]
     fn enter_on_live_session_opens_choice_overlay_then_cancel_returns_to_board() {
         let mut app = app_with("live-1", Some("background"));
-        assert!(app.pending_live.is_none());
+        assert!(app.modal.is_none());
 
         let out = press(&mut app, KeyCode::Enter);
         assert!(matches!(out, Outcome::Continue));
-        let pending = app
-            .pending_live
+        let modal = app
+            .modal
             .clone()
             .expect("Enter on a live row opens the overlay");
-        assert_eq!(pending.session_id, "live-1");
-        assert_eq!(pending.selected, LiveChoice::Attach, "defaults to Attach");
+        assert_eq!(modal.session_id.as_deref(), Some("live-1"));
+        assert_eq!(
+            modal.selected_action(),
+            Some(&ModalAction::Attach),
+            "defaults to the Attach choice"
+        );
 
         // Overlay owns the keyboard: → cycles Attach -> Fork -> Cancel.
         press(&mut app, KeyCode::Right);
         assert_eq!(
-            app.pending_live.as_ref().unwrap().selected,
-            LiveChoice::Fork
+            app.modal.as_ref().unwrap().selected_action(),
+            Some(&ModalAction::Fork)
         );
         press(&mut app, KeyCode::Right);
         assert_eq!(
-            app.pending_live.as_ref().unwrap().selected,
-            LiveChoice::Cancel
+            app.modal.as_ref().unwrap().selected_action(),
+            Some(&ModalAction::Cancel)
         );
 
         // Confirming Cancel dismisses the overlay and stays on the board.
         let out = press(&mut app, KeyCode::Enter);
         assert!(matches!(out, Outcome::Continue));
-        assert!(app.pending_live.is_none(), "Cancel returns to the board");
+        assert!(app.modal.is_none(), "Cancel returns to the board");
     }
 
     /// Confirming Attach on an INTERACTIVE live session (no agent-view job id)
@@ -1492,8 +1564,8 @@ mod tests {
         // Enter opens the overlay defaulting to Attach; a second Enter confirms it.
         press(&mut app, KeyCode::Enter);
         assert_eq!(
-            app.pending_live.as_ref().unwrap().selected,
-            LiveChoice::Attach
+            app.modal.as_ref().unwrap().selected_action(),
+            Some(&ModalAction::Attach)
         );
         let out = press(&mut app, KeyCode::Enter);
 
@@ -1502,7 +1574,7 @@ mod tests {
             matches!(out, Outcome::Continue),
             "an interactive session must not escalate to a hand-off"
         );
-        assert!(app.pending_live.is_none(), "the overlay closes on confirm");
+        assert!(app.modal.is_none(), "the overlay closes on confirm");
         assert_eq!(app.status.as_deref(), Some(resume::ATTACH_NO_JOB_ID));
     }
 
@@ -1516,7 +1588,7 @@ mod tests {
         // a status — the key invariant is the OVERLAY state was never entered.
         assert!(matches!(out, Outcome::Continue));
         assert!(
-            app.pending_live.is_none(),
+            app.modal.is_none(),
             "a non-live Enter must not open the overlay"
         );
     }
@@ -1611,7 +1683,7 @@ mod tests {
         let out = press(&mut app, KeyCode::Enter);
 
         assert!(
-            app.pending_live.is_none(),
+            app.modal.is_none(),
             "claude does not report this session as live, so Enter must not open \
              the Attach/Fork/Cancel overlay"
         );
@@ -1660,12 +1732,12 @@ mod tests {
             "a session claude is holding open must NOT hand off to `claude -r`, \
              which would be refused"
         );
-        let pending = app.pending_live.clone().expect(
+        let modal = app.modal.clone().expect(
             "claude reports this session LIVE, so Enter must open the \
              Attach/Fork overlay even though the polled badge still says `done` \
              — trusting the stale badge here is the TOCTOU bug",
         );
-        assert_eq!(pending.session_id, "sess-raced");
+        assert_eq!(modal.session_id.as_deref(), Some("sess-raced"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1684,11 +1756,11 @@ mod tests {
         let out = press(&mut app, KeyCode::Enter);
 
         assert!(matches!(out, Outcome::Continue));
-        let pending = app
-            .pending_live
+        let modal = app
+            .modal
             .clone()
             .expect("a working agent is live, so Enter must open the overlay");
-        assert_eq!(pending.session_id, "sess-working");
+        assert_eq!(modal.session_id.as_deref(), Some("sess-working"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1710,7 +1782,7 @@ mod tests {
         let out = press(&mut app, KeyCode::Enter);
 
         assert!(
-            app.pending_live.is_none(),
+            app.modal.is_none(),
             "claude is the authority: if its active list does not report the \
              session, Enter plain-resumes regardless of the badge"
         );
@@ -1744,7 +1816,7 @@ mod tests {
         let out = press(&mut app, KeyCode::Enter);
 
         assert!(
-            app.pending_live.is_none(),
+            app.modal.is_none(),
             "an unavailable signal must never strand the user in an overlay"
         );
         let Outcome::Resume(ready) = out else {
@@ -1806,8 +1878,8 @@ mod tests {
 
         press(&mut app, KeyCode::Enter); // gate: live -> overlay, defaulting to Attach
         assert_eq!(
-            app.pending_live.as_ref().unwrap().selected,
-            LiveChoice::Attach
+            app.modal.as_ref().unwrap().selected_action(),
+            Some(&ModalAction::Attach)
         );
         let out = press(&mut app, KeyCode::Enter); // confirm Attach
 
@@ -1853,7 +1925,7 @@ mod tests {
 
         press(&mut app, KeyCode::Enter);
         assert!(
-            app.pending_live.is_some(),
+            app.modal.is_some(),
             "it was live at Enter, so the overlay opens"
         );
 
@@ -1870,7 +1942,7 @@ mod tests {
             "the board must report what was OBSERVED — claude no longer reports it \
              — and name the routes that still work"
         );
-        assert!(app.pending_live.is_none(), "the overlay closes on confirm");
+        assert!(app.modal.is_none(), "the overlay closes on confirm");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1896,7 +1968,7 @@ mod tests {
         );
 
         press(&mut app, KeyCode::Enter);
-        assert!(app.pending_live.is_some());
+        assert!(app.modal.is_some());
 
         let out = press(&mut app, KeyCode::Enter); // confirm Attach
 
@@ -1930,8 +2002,8 @@ mod tests {
         press(&mut app, KeyCode::Enter); // gate: live -> overlay (Attach)
         press(&mut app, KeyCode::Right); // -> Fork
         assert_eq!(
-            app.pending_live.as_ref().unwrap().selected,
-            LiveChoice::Fork
+            app.modal.as_ref().unwrap().selected_action(),
+            Some(&ModalAction::Fork)
         );
         let out = press(&mut app, KeyCode::Enter); // confirm Fork
 
@@ -1955,9 +2027,9 @@ mod tests {
     fn esc_dismisses_the_choice_overlay() {
         let mut app = app_with("live-1", Some("interactive"));
         press(&mut app, KeyCode::Enter);
-        assert!(app.pending_live.is_some());
+        assert!(app.modal.is_some());
         press(&mut app, KeyCode::Esc);
-        assert!(app.pending_live.is_none(), "Esc dismisses the overlay");
+        assert!(app.modal.is_none(), "Esc dismisses the overlay");
     }
 
     /// Ctrl-F fork stays a direct hand-off for a LIVE session (no overlay).
@@ -1971,7 +2043,7 @@ mod tests {
         );
         assert!(matches!(out, Outcome::Continue));
         assert!(
-            app.pending_live.is_none(),
+            app.modal.is_none(),
             "Ctrl-F must not open the choice overlay, even for a live session"
         );
     }
@@ -2212,30 +2284,80 @@ mod tests {
 
     #[test]
     fn agent_pick_key_maps_navigation_confirm_and_cancel() {
-        // The picker is a vertical list: Up/Down (and k/j, plus Tab forward)
-        // navigate; Enter confirms; Esc / Ctrl-C cancel.
-        assert!(matches!(agent_pick_key(key(KeyCode::Down)), AgentNav::Next));
+        // A List (vertical picker): Up/Down (and k/j, plus Tab forward) navigate;
+        // Enter confirms; Esc / Ctrl-C cancel.
+        let list = ModalLayout::List;
         assert!(matches!(
-            agent_pick_key(key(KeyCode::Char('j'))),
-            AgentNav::Next
-        ));
-        assert!(matches!(agent_pick_key(key(KeyCode::Tab)), AgentNav::Next));
-        assert!(matches!(agent_pick_key(key(KeyCode::Up)), AgentNav::Prev));
-        assert!(matches!(
-            agent_pick_key(key(KeyCode::Char('k'))),
-            AgentNav::Prev
+            modal_key(key(KeyCode::Down), list),
+            ModalNav::Next
         ));
         assert!(matches!(
-            agent_pick_key(key(KeyCode::Enter)),
-            AgentNav::Confirm
+            modal_key(key(KeyCode::Char('j')), list),
+            ModalNav::Next
+        ));
+        assert!(matches!(modal_key(key(KeyCode::Tab), list), ModalNav::Next));
+        assert!(matches!(modal_key(key(KeyCode::Up), list), ModalNav::Prev));
+        assert!(matches!(
+            modal_key(key(KeyCode::Char('k')), list),
+            ModalNav::Prev
         ));
         assert!(matches!(
-            agent_pick_key(key(KeyCode::Esc)),
-            AgentNav::Cancel
+            modal_key(key(KeyCode::Enter), list),
+            ModalNav::Confirm
         ));
         assert!(matches!(
-            agent_pick_key(ctrl(KeyCode::Char('c'))),
-            AgentNav::Cancel
+            modal_key(key(KeyCode::Esc), list),
+            ModalNav::Cancel
+        ));
+        assert!(matches!(
+            modal_key(ctrl(KeyCode::Char('c')), list),
+            ModalNav::Cancel
+        ));
+
+        // The List deliberately does NOT bind the horizontal keys — they must not
+        // be unioned into a vertical picker's key map.
+        assert!(matches!(
+            modal_key(key(KeyCode::Left), list),
+            ModalNav::Ignore
+        ));
+        assert!(matches!(
+            modal_key(key(KeyCode::Right), list),
+            ModalNav::Ignore
+        ));
+        assert!(matches!(
+            modal_key(key(KeyCode::Char('h')), list),
+            ModalNav::Ignore
+        ));
+        assert!(matches!(
+            modal_key(key(KeyCode::Char('l')), list),
+            ModalNav::Ignore
+        ));
+
+        // A Row (button strip) DOES bind the horizontal keys on top of the shared
+        // vertical ones — the only divergence between the two key maps.
+        let row = ModalLayout::Row;
+        assert!(matches!(modal_key(key(KeyCode::Left), row), ModalNav::Prev));
+        assert!(matches!(
+            modal_key(key(KeyCode::Char('h')), row),
+            ModalNav::Prev
+        ));
+        assert!(matches!(
+            modal_key(key(KeyCode::Right), row),
+            ModalNav::Next
+        ));
+        assert!(matches!(
+            modal_key(key(KeyCode::Char('l')), row),
+            ModalNav::Next
+        ));
+        // The shared vertical keys and cancel still work in the Row layout.
+        assert!(matches!(modal_key(key(KeyCode::Up), row), ModalNav::Prev));
+        assert!(matches!(
+            modal_key(key(KeyCode::Enter), row),
+            ModalNav::Confirm
+        ));
+        assert!(matches!(
+            modal_key(key(KeyCode::Esc), row),
+            ModalNav::Cancel
         ));
     }
 
@@ -2250,7 +2372,7 @@ mod tests {
             Outcome::Resume(ready) => assert_eq!(ready.argv.join(" "), "claude"),
             _ => panic!("the default pick must start a bare claude"),
         }
-        assert!(app.pending_agent.is_none(), "confirm closes the picker");
+        assert!(app.modal.is_none(), "confirm closes the picker");
     }
 
     #[test]
@@ -2260,8 +2382,8 @@ mod tests {
         // Down once from the default row -> the first agent (planner).
         press(&mut app, KeyCode::Down);
         assert_eq!(
-            app.pending_agent.as_ref().unwrap().selected_agent(),
-            Some("planner")
+            app.modal.as_ref().unwrap().selected_action(),
+            Some(&ModalAction::New(Some("planner".to_string())))
         );
         let out = press(&mut app, KeyCode::Enter);
         match out {
@@ -2275,8 +2397,8 @@ mod tests {
         // The pick is remembered in-memory: the NEXT picker pre-highlights it.
         app.open_agent_picker(vec![def_agent("planner"), def_agent("reviewer")]);
         assert_eq!(
-            app.pending_agent.as_ref().unwrap().selected_agent(),
-            Some("planner"),
+            app.modal.as_ref().unwrap().selected_action(),
+            Some(&ModalAction::New(Some("planner".to_string()))),
             "the last pick pre-highlights on the next Ctrl-N"
         );
     }
@@ -2287,7 +2409,7 @@ mod tests {
         app.open_agent_picker(vec![def_agent("planner")]);
         let out = press(&mut app, KeyCode::Esc);
         assert!(matches!(out, Outcome::Continue));
-        assert!(app.pending_agent.is_none(), "Esc dismisses the picker");
+        assert!(app.modal.is_none(), "Esc dismisses the picker");
     }
 
     #[test]
@@ -2301,9 +2423,373 @@ mod tests {
             app.query.is_empty(),
             "a key during the picker must not type into the query"
         );
-        assert!(
-            app.pending_agent.is_some(),
-            "an inert key leaves the picker open"
+        assert!(app.modal.is_some(), "an inert key leaves the picker open");
+    }
+
+    // --- Ctrl-X leader chord: hide / show-hidden / hard-delete ------------
+
+    /// Feed one key EVENT (carrying its modifiers) through `handle_event` against
+    /// `root`. The chord tests need both `Ctrl-X` (a modified key) and a specific
+    /// reload root, which the `press`/`ctrl` helpers cannot express together.
+    fn feed(app: &mut App, ev: KeyEvent, root: &Path) -> Outcome {
+        handle_event(app, AppEvent::Input(Event::Key(ev)), root)
+    }
+
+    /// Write a minimal, PARSEABLE `<id>.jsonl` into a store's encoded-cwd dir so a
+    /// real `SessionStore::load_from` discovers it — the hard-delete tests assert
+    /// the file truly leaves the store, which a synthetic in-memory session cannot
+    /// prove. `ts` orders the sessions deterministically.
+    fn write_store_session(dir: &Path, id: &str, ts: &str) {
+        let jsonl = format!(
+            concat!(
+                r#"{{"type":"user","sessionId":"{id}","cwd":"/tmp/proj","#,
+                r#""timestamp":"{ts}","message":{{"role":"user","content":"hi"}}}}"#,
+                "\n",
+            ),
+            id = id,
+            ts = ts,
         );
+        std::fs::write(dir.join(format!("{id}.jsonl")), jsonl).expect("write a store fixture");
+    }
+
+    /// Task 4.1 (pure): the chord machine maps each completion key and cancels on
+    /// everything else — Esc, an unbound key, and a Ctrl combo alike.
+    #[test]
+    fn chord_key_maps_completions_and_cancels_on_anything_else() {
+        assert_eq!(chord_key(key(KeyCode::Char('x'))), ChordOutcome::Hide);
+        assert_eq!(chord_key(key(KeyCode::Char('d'))), ChordOutcome::Delete);
+        assert_eq!(chord_key(key(KeyCode::Char('h'))), ChordOutcome::ShowHidden);
+        assert_eq!(
+            chord_key(key(KeyCode::Esc)),
+            ChordOutcome::Cancel,
+            "Esc abandons the chord"
+        );
+        assert_eq!(
+            chord_key(key(KeyCode::Char('z'))),
+            ChordOutcome::Cancel,
+            "an unbound key abandons the chord"
+        );
+        assert_eq!(
+            chord_key(ctrl(KeyCode::Char('c'))),
+            ChordOutcome::Cancel,
+            "Ctrl-C abandons the chord rather than being swallowed"
+        );
+    }
+
+    /// Task 4.1 (leak guard): `Ctrl-X` then a printable follow-up completes the
+    /// chord — it must NOT append to the search query, even while a query is active.
+    #[test]
+    fn ctrl_x_then_a_printable_key_completes_the_chord_without_leaking_into_the_query() {
+        let _guard = crate::config::env_lock();
+        let state = unique_temp_dir("leak-state");
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &state);
+
+        let mut app = App::new(
+            vec![session("leak-a")],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        // An ACTIVE query is the exact condition a printable follow-up could corrupt.
+        app.query = "foo".to_string();
+
+        feed(&mut app, ctrl(KeyCode::Char('x')), Path::new("/tmp"));
+        assert!(app.pending_chord, "Ctrl-X arms the leader chord");
+
+        // `h` (show-hidden) needs no selection or persistence to prove the guard,
+        // and must be CONSUMED by the chord rather than typed into the query.
+        feed(&mut app, key(KeyCode::Char('h')), Path::new("/tmp"));
+        assert_eq!(
+            app.query, "foo",
+            "the chord follow-up must not leak into the query"
+        );
+        assert!(
+            app.show_hidden,
+            "the printable follow-up completed the chord (show-hidden on)"
+        );
+        assert!(
+            !app.pending_chord,
+            "the chord resolves after exactly one key"
+        );
+
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// Task 4.4: `Ctrl-X x` on a non-hidden selected session hides it, PERSISTS the
+    /// hide, shrinks the visible list, and clamps the selection to the nearest row.
+    #[test]
+    fn ctrl_x_x_hides_the_selected_session_persists_and_clamps_selection() {
+        let _guard = crate::config::env_lock();
+        let state = unique_temp_dir("hide-state");
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &state);
+
+        let mut app = App::new(
+            vec![session("sbx-a"), session("sbx-b"), session("sbx-c")],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        // Stand on the LAST row so hiding it must clamp, not stay put.
+        app.move_selection(2);
+        assert_eq!(app.selected.as_deref(), Some("sbx-c"));
+        assert_eq!(app.filtered.len(), 3, "all three rows are visible to start");
+
+        feed(&mut app, ctrl(KeyCode::Char('x')), Path::new("/tmp"));
+        feed(&mut app, key(KeyCode::Char('x')), Path::new("/tmp"));
+
+        assert_eq!(
+            app.filtered.len(),
+            2,
+            "hiding a row shrinks the visible list"
+        );
+        assert_eq!(
+            app.selected.as_deref(),
+            Some("sbx-b"),
+            "the selection clamps to the nearest surviving row, not the hidden one"
+        );
+        assert!(
+            app.hidden_ids.contains("sbx-c"),
+            "the row is in the hidden set"
+        );
+        assert!(
+            crate::hidden::load_hidden(&crate::config::state_dir()).contains("sbx-c"),
+            "the hide is persisted to the state dir"
+        );
+
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// Task 4.4: `Ctrl-X x` on a HIDDEN row (with show-hidden on) un-hides it and
+    /// persists the removal from the hidden set.
+    #[test]
+    fn ctrl_x_x_on_a_hidden_row_unhides_it_when_show_hidden_is_on() {
+        let _guard = crate::config::env_lock();
+        let state = unique_temp_dir("unhide-state");
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &state);
+
+        let mut app = App::new(
+            vec![session("sbx-a"), session("sbx-b")],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        // Precondition: sbx-b is hidden AND the show-hidden view is on, so the
+        // hidden row is on screen for the un-hide. `toggle_show_hidden` flips the
+        // view on (false -> true) and re-filters with the new hidden id in place.
+        app.hidden_ids.insert("sbx-b".to_string());
+        app.toggle_show_hidden();
+        assert!(app.show_hidden);
+        app.move_selection(1);
+        assert_eq!(
+            app.selected.as_deref(),
+            Some("sbx-b"),
+            "standing on the hidden row"
+        );
+
+        feed(&mut app, ctrl(KeyCode::Char('x')), Path::new("/tmp"));
+        feed(&mut app, key(KeyCode::Char('x')), Path::new("/tmp"));
+
+        assert!(
+            !app.hidden_ids.contains("sbx-b"),
+            "Ctrl-X x un-hides the hidden row"
+        );
+        assert!(
+            !crate::hidden::load_hidden(&crate::config::state_dir()).contains("sbx-b"),
+            "the un-hide is persisted"
+        );
+
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// Task 4.4: `Ctrl-X h` toggles the show-hidden view on and back off.
+    #[test]
+    fn ctrl_x_h_toggles_the_show_hidden_view() {
+        let _guard = crate::config::env_lock();
+        let state = unique_temp_dir("showhidden-state");
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &state);
+
+        let mut app = App::new(
+            vec![session("sbx-a")],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        assert!(!app.show_hidden, "hidden rows are off the board by default");
+
+        feed(&mut app, ctrl(KeyCode::Char('x')), Path::new("/tmp"));
+        feed(&mut app, key(KeyCode::Char('h')), Path::new("/tmp"));
+        assert!(app.show_hidden, "Ctrl-X h reveals hidden rows");
+
+        feed(&mut app, ctrl(KeyCode::Char('x')), Path::new("/tmp"));
+        feed(&mut app, key(KeyCode::Char('h')), Path::new("/tmp"));
+        assert!(!app.show_hidden, "Ctrl-X h again hides them");
+
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// Task 4.3 / 4.4: `Ctrl-X d` opens a confirm defaulting to Cancel; confirming
+    /// Delete on a NON-live session unlinks the transcript, reloads the board from
+    /// the real store, and clamps the selection to the surviving row.
+    #[test]
+    fn ctrl_x_d_then_confirm_deletes_a_non_live_session_and_reloads() {
+        let _guard = crate::config::env_lock();
+        let root = unique_temp_dir("delete-store");
+        let state = unique_temp_dir("delete-state");
+        std::env::set_var("CLAUDE_PROJECTS_DIR", &root);
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &state);
+
+        // A real 2-session store; sbdel-del is NEWER so it is selected first.
+        let proj = root.join("-tmp-proj");
+        std::fs::create_dir_all(&proj).expect("create the encoded-cwd dir");
+        write_store_session(&proj, "sbdel-del", "2026-07-14T10:00:00.000Z");
+        write_store_session(&proj, "sbdel-keep", "2026-07-10T10:00:00.000Z");
+
+        let mut app = App::new(
+            SessionStore::load_from(&root),
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        seed_live(&mut app, &[]); // nothing is live
+        assert_eq!(
+            app.selected.as_deref(),
+            Some("sbdel-del"),
+            "the newer session is selected first"
+        );
+        let del_file = proj.join("sbdel-del.jsonl");
+        assert!(del_file.is_file(), "the fixture exists before the delete");
+
+        // Ctrl-X d opens the confirm (default Cancel); move to Delete, then Enter.
+        feed(&mut app, ctrl(KeyCode::Char('x')), &root);
+        feed(&mut app, key(KeyCode::Char('d')), &root);
+        assert_eq!(
+            app.modal.as_ref().unwrap().selected_action(),
+            Some(&ModalAction::Cancel),
+            "the delete confirm defaults to Cancel for safety"
+        );
+        feed(&mut app, key(KeyCode::Left), &root); // Row layout: Cancel -> Delete
+        assert_eq!(
+            app.modal.as_ref().unwrap().selected_action(),
+            Some(&ModalAction::Delete)
+        );
+        let out = feed(&mut app, key(KeyCode::Enter), &root);
+        assert!(matches!(out, Outcome::Continue));
+
+        assert!(!del_file.exists(), "the transcript file is unlinked");
+        assert!(
+            proj.join("sbdel-keep.jsonl").is_file(),
+            "the other session's file is untouched"
+        );
+        assert!(
+            app.session_by_id("sbdel-del").is_none(),
+            "the deleted session left the reloaded board"
+        );
+        assert_eq!(
+            app.selected.as_deref(),
+            Some("sbdel-keep"),
+            "the selection clamps to the surviving row after the reload"
+        );
+        assert!(app.modal.is_none(), "the confirm closed");
+
+        std::env::remove_var("CLAUDE_PROJECTS_DIR");
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// Task 4.3 / 4.4: confirming Delete on a LIVE session is REFUSED — the live
+    /// guard sets a board status and nothing is unlinked or reloaded.
+    #[test]
+    fn ctrl_x_d_confirm_on_a_live_session_is_refused_and_removes_nothing() {
+        let _guard = crate::config::env_lock();
+        let root = unique_temp_dir("delete-live-store");
+        let state = unique_temp_dir("delete-live-state");
+        std::env::set_var("CLAUDE_PROJECTS_DIR", &root);
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &state);
+
+        let proj = root.join("-tmp-proj");
+        std::fs::create_dir_all(&proj).expect("create the encoded-cwd dir");
+        write_store_session(&proj, "sblive-1", "2026-07-14T10:00:00.000Z");
+
+        let mut app = App::new(
+            SessionStore::load_from(&root),
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        seed_live(&mut app, &["sblive-1"]); // claude reports it running
+        assert_eq!(app.selected.as_deref(), Some("sblive-1"));
+        let file = proj.join("sblive-1.jsonl");
+
+        feed(&mut app, ctrl(KeyCode::Char('x')), &root);
+        feed(&mut app, key(KeyCode::Char('d')), &root);
+        feed(&mut app, key(KeyCode::Left), &root); // -> Delete
+        let out = feed(&mut app, key(KeyCode::Enter), &root);
+        assert!(matches!(out, Outcome::Continue));
+
+        assert!(
+            file.is_file(),
+            "a live session's transcript is NOT unlinked"
+        );
+        assert!(
+            app.session_by_id("sblive-1").is_some(),
+            "the live session stays on the board"
+        );
+        assert_eq!(
+            app.status.as_deref(),
+            Some(crate::delete::DELETE_LIVE_REFUSAL),
+            "the live-session refusal is shown"
+        );
+        assert!(
+            app.modal.is_none(),
+            "the confirm closes even when the delete is refused"
+        );
+
+        std::env::remove_var("CLAUDE_PROJECTS_DIR");
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// Task 4.4: cancelling the chord (`Ctrl-X` then `Esc`) opens no modal and
+    /// leaves BOTH the store and the persisted hidden set untouched.
+    #[test]
+    fn ctrl_x_then_esc_cancels_the_chord_leaving_the_store_and_hidden_set_untouched() {
+        let _guard = crate::config::env_lock();
+        let root = unique_temp_dir("cancel-store");
+        let state = unique_temp_dir("cancel-state");
+        std::env::set_var("CLAUDE_PROJECTS_DIR", &root);
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &state);
+
+        let proj = root.join("-tmp-proj");
+        std::fs::create_dir_all(&proj).expect("create the encoded-cwd dir");
+        write_store_session(&proj, "sbcancel-1", "2026-07-14T10:00:00.000Z");
+
+        let mut app = App::new(
+            SessionStore::load_from(&root),
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        assert_eq!(app.selected.as_deref(), Some("sbcancel-1"));
+
+        feed(&mut app, ctrl(KeyCode::Char('x')), &root);
+        assert!(app.pending_chord, "Ctrl-X arms the chord");
+        let out = feed(&mut app, key(KeyCode::Esc), &root);
+        assert!(matches!(out, Outcome::Continue));
+
+        assert!(!app.pending_chord, "Esc abandons the chord");
+        assert!(app.modal.is_none(), "cancel opens no modal");
+        assert!(app.hidden_ids.is_empty(), "cancel hides nothing");
+        assert!(
+            proj.join("sbcancel-1.jsonl").is_file(),
+            "cancel removes nothing from the store"
+        );
+        assert!(
+            crate::hidden::load_hidden(&crate::config::state_dir()).is_empty(),
+            "cancel persists no hide"
+        );
+
+        std::env::remove_var("CLAUDE_PROJECTS_DIR");
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&state);
     }
 }

@@ -20,6 +20,8 @@ use time::OffsetDateTime;
 
 use crate::agents::ReportedAgent;
 use crate::defined_agents::{self, DefinedAgent};
+use crate::{config, delete, hidden};
+
 use crate::search::{SearchIndex, SearchMode};
 use crate::store::lineage::{self, LineageKey};
 use crate::store::{preview, Session};
@@ -40,6 +42,13 @@ pub const MIN_PANE_WIDTH: u16 = 15;
 /// the splitter — matches the historical `Constraint::Percentage(48)` split
 /// this feature replaces.
 const DEFAULT_LIST_PERCENT: u32 = 48;
+
+/// Prefix of the board status shown when persisting the hidden-id set fails.
+/// Hidden state is a CONVENIENCE, so a write error degrades to a message rather
+/// than aborting the board; the in-memory set stays authoritative for the rest
+/// of the session (FAIL-SOFT). Named rather than inlined so the one user-facing
+/// wording lives in exactly one place (NO MAGIC VALUES).
+const HIDDEN_SAVE_ERROR_PREFIX: &str = "could not save hidden sessions";
 
 /// Which set of sessions the list shows.
 ///
@@ -99,87 +108,98 @@ pub enum Row {
     },
 }
 
-/// One of the three routes offered when `Enter` lands on a LIVE session — one
-/// that `claude -r` would refuse to plain-resume.
-///
-/// Modeled as explicit state (rather than an ad-hoc branch) so the running-session
-/// choice is a small, unit-testable state machine.
+/// The layout a [`Modal`] renders in — the ONLY structural fork the generic modal
+/// supports, and the thing its key map is derived from: a `Row` binds the
+/// horizontal `←`/`→`/`h`/`l` keys (a button strip); a `List` deliberately does
+/// NOT (a vertical picker navigated with `↑`/`↓`/`k`/`j`/`Tab` alone). Namespaced
+/// under `ModalLayout` so the `Row` variant does not collide with the list-row
+/// [`Row`] enum above.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LiveChoice {
-    /// Reattach to the running session by id (`claude attach <id>`); fail-soft
-    /// and funnelled through the shared `launch` round trip.
+pub enum ModalLayout {
+    /// A horizontal strip of buttons (the running-session Attach/Fork/Cancel
+    /// choice; a delete confirm). Binds the horizontal keys on top of the shared
+    /// vertical ones.
+    Row,
+    /// A vertical list of rows (the new-session agent picker). Vertical keys only.
+    List,
+}
+
+/// What confirming a [`ModalChoice`] does — a plain tag the ONE generic confirm
+/// handler matches on, so a single handler serves every modal: the running-session
+/// overlay (`Attach`/`Fork`/`Cancel`), the new-session picker (`New`), and the
+/// hard-delete confirm (`Delete`). Carries no borrowed data so it can ride on a
+/// choice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModalAction {
+    /// Attach to the running session's background agent (`claude attach <job-id>`),
+    /// keyed on the modal's target `session_id`. Only a background (`bg`) agent
+    /// carries an attachable job id; an interactive (`live`) session has none, so
+    /// the choice refuses with a clear hint (Fork instead).
     Attach,
-    /// Fork the session (`claude -r <id> --fork-session`).
+    /// Fork the target session (`claude -r <id> --fork-session`).
     Fork,
-    /// Dismiss the overlay and stay on the board.
+    /// Start a brand-new session, optionally bound to the named agent. `None` is
+    /// the "default (no agent)" row (a bare `claude`); the agent name rides the
+    /// choice so the confirm handler needs no index-to-agent lookup.
+    New(Option<String>),
+    /// HARD-delete the target session's transcript from disk, keyed on the modal's
+    /// `session_id`. The confirm handler runs the pure `delete::can_delete` live
+    /// guard first, then the FS removal; the modal only OPENS the prompt, it never
+    /// deletes on its own. Default-highlighted on Cancel for safety.
+    Delete,
+    /// Dismiss the modal, returning to the board.
     Cancel,
 }
 
-impl LiveChoice {
-    /// The choices in overlay order (used for cycling the highlight).
-    pub const ORDER: [LiveChoice; 3] = [LiveChoice::Attach, LiveChoice::Fork, LiveChoice::Cancel];
-
-    /// Position of this choice within [`ORDER`](Self::ORDER).
-    fn index(self) -> usize {
-        match self {
-            LiveChoice::Attach => 0,
-            LiveChoice::Fork => 1,
-            LiveChoice::Cancel => 2,
-        }
-    }
-
-    /// The button label shown in the overlay.
-    #[must_use]
-    pub fn label(self) -> &'static str {
-        match self {
-            LiveChoice::Attach => "Attach",
-            LiveChoice::Fork => "Fork",
-            LiveChoice::Cancel => "Cancel",
-        }
-    }
-}
-
-/// The open running-session choice overlay: which session it targets and which
-/// option is currently highlighted.
+/// One selectable choice in a [`Modal`]: its button/row label, an optional dim
+/// description (the picker's per-agent blurb; unused by the `Row` layout), and the
+/// [`ModalAction`] the confirm handler runs when it is highlighted.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingLive {
-    /// Stable `session_id` of the live session the choice acts on.
-    pub session_id: String,
-    /// The currently highlighted choice.
-    pub selected: LiveChoice,
+pub struct ModalChoice {
+    /// The user-facing button/row label.
+    pub label: String,
+    /// An optional dim description trailing the label (List layout only).
+    pub description: Option<String>,
+    /// What confirming this choice does.
+    pub action: ModalAction,
 }
 
-/// The open NEW-SESSION agent picker: the discovered agents plus the highlighted
-/// row.
+/// A titled, centered prompt with N labelled choices and a wrapping-cycle
+/// highlight — the ONE overlay model behind the running-session choice, the
+/// new-session agent picker, and (later) a delete confirm.
 ///
-/// Row `0` is always a synthetic "default (no agent)" entry, so a valid `selected`
-/// spans `0..=agents.len()`: `0` launches bare `claude` and `i + 1` binds
-/// `agents[i]`. Modeled as explicit state (mirroring [`PendingLive`]) so the
-/// picker is a small, unit-testable state machine that owns the keyboard while open.
+/// Modeled as explicit state so the whole overlay is a small, unit-testable state
+/// machine that owns the keyboard while open. `selected` is a `rem_euclid` index
+/// over `choices` (wraps both directions, both layouts). `session_id` is the
+/// target a session-addressed action routes to (`Some` for Attach/Fork/delete);
+/// the picker leaves it `None` because a new session has no source.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingAgent {
-    /// Discovered selectable agents in display order (the default entry is NOT in
-    /// here — it is the implicit row `0`).
-    pub agents: Vec<DefinedAgent>,
-    /// The highlighted row in `0..=agents.len()` (`0` = default / no agent).
+pub struct Modal {
+    /// The bordered box title (rendered padded with a space either side).
+    pub title: String,
+    /// The prompt line drawn above the choices.
+    pub message: String,
+    /// The layout — and, with it, the key map — this modal renders in.
+    pub layout: ModalLayout,
+    /// The selectable choices in display order.
+    pub choices: Vec<ModalChoice>,
+    /// The highlighted choice, an index into `choices` (wraps via `rem_euclid`).
     pub selected: usize,
+    /// The session a session-addressed action (Attach/Fork/delete) targets;
+    /// `None` for the picker, which starts a fresh session with no target.
+    pub session_id: Option<String>,
 }
 
-impl PendingAgent {
-    /// Total selectable rows, including the leading default (no-agent) entry.
-    fn len(&self) -> usize {
-        self.agents.len() + 1
-    }
-
-    /// The agent name for the highlighted row, or `None` for the default entry
-    /// (row `0`). Also `None` if `selected` somehow points past the list — the
-    /// safe, launch-bare fallback rather than a panic.
+impl Modal {
+    /// The action of the highlighted choice, or `None` if `selected` somehow
+    /// points past `choices` — the safe fallback (confirm treats it as a no-op)
+    /// rather than a panic. `selected` is kept in range by [`App::cycle_modal`] and
+    /// seeded in range by every constructor, so the `None` arm is purely defensive
+    /// (the folded-in equivalent of the picker's old `checked_sub` launch-bare
+    /// fallback: an out-of-range highlight never launches or panics).
     #[must_use]
-    pub fn selected_agent(&self) -> Option<&str> {
-        self.selected
-            .checked_sub(1)
-            .and_then(|i| self.agents.get(i))
-            .map(|a| a.name.as_str())
+    pub fn selected_action(&self) -> Option<&ModalAction> {
+        self.choices.get(self.selected).map(|c| &c.action)
     }
 }
 
@@ -472,12 +492,12 @@ pub struct App {
     /// rather than spawning `claude` (which the suite never does), in the spirit
     /// of `resume::build_argv`. Production swaps it exactly never.
     live_probe: LiveProbe,
-    /// The open running-session choice overlay, if any. `Some` while the
-    /// Attach/Fork/Cancel prompt owns the keyboard.
-    pub pending_live: Option<PendingLive>,
-    /// The open new-session agent picker, if any. `Some` while the agent-pick
-    /// overlay owns the keyboard (`Ctrl-N` when defined agents exist).
-    pub pending_agent: Option<PendingAgent>,
+    /// The open modal overlay, if any. `Some` while a titled prompt owns the
+    /// keyboard — the running-session Attach/Fork/Cancel choice, or the
+    /// new-session agent picker (`Ctrl-N` when defined agents exist). The two are
+    /// now one `Option<Modal>`, so their mutual exclusion is structural rather
+    /// than conventional.
+    pub modal: Option<Modal>,
     /// The agent chosen for the most recent new session (`None` = default / no
     /// agent). In-memory ONLY — never persisted to disk — so the NEXT `Ctrl-N`
     /// pre-highlights it for a one-keystroke repeat.
@@ -511,6 +531,36 @@ pub struct App {
     /// Contrast `expanded` above, which must cross reloads and therefore may not
     /// be.
     hidden: HashMap<usize, usize>,
+    /// The PERSISTED set of user-hidden session ids — snapback's OWN visibility
+    /// preference, loaded once at construction from
+    /// [`config::state_dir`] and re-saved
+    /// on every hide/un-hide. When [`show_hidden`](Self::show_hidden) is off,
+    /// [`recompute_filtered`](Self::recompute_filtered) drops these ids so their
+    /// rows leave the board entirely.
+    ///
+    /// DISTINCT from the fold's [`hidden`](Self::hidden) map directly above, and
+    /// named so the two never blur: the fold's is a DERIVED head-index ->
+    /// folded-member-COUNT map, rebuilt every recompute to feed the `(+N)` marker;
+    /// THIS is a user-chosen, cross-restart set of `session_id`s. Different
+    /// vocabulary on purpose — `hidden_ids` / "hide" here vs. the fold's `hidden`
+    /// / "fold".
+    pub hidden_ids: HashSet<String>,
+    /// Whether user-hidden sessions are currently revealed inline (drawn dimmed
+    /// with a `[hidden]` marker). `false` by default: hidden rows stay off the
+    /// board until the show-hidden toggle brings them back for review or un-hide.
+    pub show_hidden: bool,
+    /// Whether a `Ctrl-X` leader chord is pending — the moment between the leader
+    /// keypress and its follow-up (`x` hide, `d` hard-delete, `h` show-hidden,
+    /// anything else cancels). While `true` the view draws the which-key hint and
+    /// [`handle_event`](crate::tui::update) routes the NEXT key through the pure
+    /// `chord_key` machine BEFORE normal key handling, so a printable follow-up
+    /// never leaks into the search query.
+    ///
+    /// A plain marker rather than a data-carrying enum because there is exactly ONE
+    /// leader (`Ctrl-X`) with no per-chord state; folded into
+    /// [`overlay_active`](Self::overlay_active) so mouse actions stay gated while
+    /// it is pending (PATTERNS §10).
+    pub pending_chord: bool,
     /// Readable, markdown-styled transcript preview, keyed by `session_id`.
     ///
     /// The rendered layout (GFM tables shrink-to-fit) depends on the preview
@@ -567,13 +617,20 @@ impl App {
             tick: 0,
             reported_agents: HashMap::new(),
             live_probe: Box::new(default_live_probe),
-            pending_live: None,
-            pending_agent: None,
+            modal: None,
             last_new_agent: None,
             dragging_split: false,
             scoped: Vec::new(),
             expanded: HashSet::new(),
             hidden: HashMap::new(),
+            // Load the persisted hidden set ONCE at startup. Resolve the dir here
+            // (and again at save time) rather than caching a path, so a
+            // `SNAPBACK_CONFIG_DIR` override is honored per call and tests can
+            // inject an isolated dir. Fail-soft: a missing/unreadable file is an
+            // empty set (nothing hidden yet), never a startup error.
+            hidden_ids: hidden::load_hidden(&config::state_dir()),
+            show_hidden: false,
+            pending_chord: false,
             preview_cache: HashMap::new(),
             preview_width: None,
             index,
@@ -630,6 +687,31 @@ impl App {
             .copied()
             .filter(|&i| lineage::lineage_key(&self.sessions[i]).as_ref() == Some(key))
             .collect()
+    }
+
+    /// Every session id that hides or exposes TOGETHER with the selection: all
+    /// members of its fork lineage, so a folded lineage (its `(+N)` nested forks
+    /// included) flips as one unit rather than shedding only its head. Gathered
+    /// from the FULL store — not the visible `filtered` — so already-folded or
+    /// already-hidden forks are swept in too. A selection with no derivable lineage
+    /// (a rootless session) is its own singleton.
+    fn lineage_member_ids(&self, selected_id: &str) -> Vec<String> {
+        match self.selected_lineage() {
+            Some(key) => {
+                let members: Vec<String> = self
+                    .sessions
+                    .iter()
+                    .filter(|s| lineage::lineage_key(s).as_ref() == Some(&key))
+                    .map(|s| s.session_id.clone())
+                    .collect();
+                if members.is_empty() {
+                    vec![selected_id.to_string()]
+                } else {
+                    members
+                }
+            }
+            None => vec![selected_id.to_string()],
+        }
     }
 
     /// The single selection setter: assign the selected id and, when it actually
@@ -764,6 +846,61 @@ impl App {
         self.set_selected(Some(self.sessions[head].session_id.clone()));
         self.expanded.remove(&key);
         self.reapply_preserving_selection();
+    }
+
+    // --- hide (soft delete) ------------------------------------------------
+
+    /// Toggle the SELECTED session's membership in the persisted hidden set, then
+    /// re-filter the board and persist the change.
+    ///
+    /// Hiding a row while [`show_hidden`](Self::show_hidden) is off drops it from
+    /// the visible list; the selection then clamps to the nearest surviving row
+    /// (via [`reapply_preserving_selection`](Self::reapply_preserving_selection),
+    /// the same clamp a vanished reload id takes). A hidden row is DELIBERATELY
+    /// NOT auto-revealed — contrast the fold's
+    /// [`reveal_hidden`](Self::reveal_hidden), which re-opens a merely-folded row:
+    /// a soft-hidden row is meant to stay off the board. Un-hiding (toggling an
+    /// already-hidden id) puts it back on the next re-filter.
+    ///
+    /// A background-fork LINEAGE hides and exposes as ONE unit: the whole `(+N)`
+    /// family flips together (see [`lineage_member_ids`](Self::lineage_member_ids)),
+    /// so a folded head can never shed only itself and let the fold re-head to a
+    /// surviving fork — the lineage leaves and returns to the board whole.
+    ///
+    /// A no-op when nothing is selected. Wired to the `Ctrl-X x` soft-hide chord.
+    pub fn toggle_hidden_selected(&mut self) {
+        let Some(id) = self.selected.clone() else {
+            return;
+        };
+        let members = self.lineage_member_ids(&id);
+        delete::toggle_hidden(&mut self.hidden_ids, &members, &id);
+        self.persist_hidden();
+        self.reapply_preserving_selection();
+    }
+
+    /// Toggle whether user-hidden sessions are revealed inline, then re-filter.
+    ///
+    /// Turning it ON brings the hidden rows back (the view draws them dimmed and
+    /// marked); turning it OFF drops them again. The selection is preserved by id
+    /// and clamped if it left the newly-recomputed visible set. Pure visibility —
+    /// nothing is persisted, since the toggle is a transient view state, not a
+    /// stored preference. Wired to the `Ctrl-X h` show-hidden chord.
+    pub fn toggle_show_hidden(&mut self) {
+        self.show_hidden = !self.show_hidden;
+        self.reapply_preserving_selection();
+    }
+
+    /// Persist the hidden-id set to snapback's own state dir, FAIL-SOFT.
+    ///
+    /// Resolves the dir at SAVE time (never a cached path) so a `SNAPBACK_CONFIG_DIR`
+    /// override is honored per call. A write error is surfaced as a transient board
+    /// status but leaves the in-memory set AUTHORITATIVE for the rest of the
+    /// session: the hidden state is a convenience, so a failed write must never
+    /// abort the hide or the board.
+    fn persist_hidden(&mut self) {
+        if let Err(err) = hidden::save_hidden(&config::state_dir(), &self.hidden_ids) {
+            self.set_status(format!("{HIDDEN_SAVE_ERROR_PREFIX}: {err}"));
+        }
     }
 
     /// Toggle the preview pane visibility. Showing it (re)anchors to the newest
@@ -977,82 +1114,164 @@ impl App {
         self.sessions.iter().find(|s| s.session_id == session_id)
     }
 
-    /// Open the Attach/Fork/Cancel overlay for a running session (Enter on a
-    /// live row), defaulting the highlight to Attach.
+    /// Open the running-session choice overlay (Attach/Fork/Cancel) for a live
+    /// session (Enter on a running row, or the race-recovery path), defaulting the
+    /// highlight to the first choice. A `Row`-layout [`Modal`] targeting
+    /// `session_id`.
+    ///
+    /// The Attach choice reconnects to the running session's background agent
+    /// (`claude attach <job-id>`), from which it can be watched, continued, or
+    /// stopped through claude's OWN agents — never a snapback-owned "completed"
+    /// flag. Only background (`bg`) agents carry a job id, so on an interactive
+    /// (`live`) session the choice refuses with a clear hint (Fork instead).
     pub fn open_live_choice(&mut self, session_id: String) {
-        self.pending_live = Some(PendingLive {
-            session_id,
-            selected: LiveChoice::Attach,
+        self.open_modal(Modal {
+            title: "session is running".to_string(),
+            message: "This session is running — it can't be plain-resumed.".to_string(),
+            layout: ModalLayout::Row,
+            choices: vec![
+                ModalChoice {
+                    label: "Attach".to_string(),
+                    description: None,
+                    action: ModalAction::Attach,
+                },
+                ModalChoice {
+                    label: "Fork".to_string(),
+                    description: None,
+                    action: ModalAction::Fork,
+                },
+                ModalChoice {
+                    label: "Cancel".to_string(),
+                    description: None,
+                    action: ModalAction::Cancel,
+                },
+            ],
+            selected: 0,
+            session_id: Some(session_id),
         });
     }
 
-    /// Move the overlay highlight forward (wraps). No-op if no overlay is open.
-    pub fn live_choice_next(&mut self) {
-        self.cycle_live_choice(1);
+    /// Open the HARD-delete confirmation overlay for the selected session — a
+    /// `Row`-layout [`Modal`] with `[Delete] [Cancel]`, DEFAULT-HIGHLIGHTED ON
+    /// CANCEL so a stray Enter can never trigger an irreversible delete. Targets
+    /// the selected `session_id`; the confirm handler runs the live guard and the
+    /// FS removal (`ModalAction::Delete`). This method only OPENS the prompt — it
+    /// never deletes. A no-op when nothing is selected.
+    pub fn open_delete_confirm(&mut self) {
+        let Some(id) = self.selected.clone() else {
+            return;
+        };
+        let choices = vec![
+            ModalChoice {
+                label: "Delete".to_string(),
+                description: None,
+                action: ModalAction::Delete,
+            },
+            ModalChoice {
+                label: "Cancel".to_string(),
+                description: None,
+                action: ModalAction::Cancel,
+            },
+        ];
+        // Derive the default highlight from the Cancel choice's position rather
+        // than a bare index, so the safe default survives a choice reorder.
+        let selected = choices
+            .iter()
+            .position(|c| c.action == ModalAction::Cancel)
+            .unwrap_or(0);
+        self.open_modal(Modal {
+            title: "delete session".to_string(),
+            message: "Permanently delete this session's transcript from disk? \
+                      This can't be undone."
+                .to_string(),
+            layout: ModalLayout::Row,
+            choices,
+            selected,
+            session_id: Some(id),
+        });
     }
 
-    /// Move the overlay highlight backward (wraps). No-op if no overlay is open.
-    pub fn live_choice_prev(&mut self) {
-        self.cycle_live_choice(-1);
+    /// Open `modal` as the active overlay, taking the keyboard until it closes.
+    pub fn open_modal(&mut self, modal: Modal) {
+        self.modal = Some(modal);
     }
 
-    /// Shift the highlighted choice by `delta` around [`LiveChoice::ORDER`].
-    fn cycle_live_choice(&mut self, delta: isize) {
-        if let Some(pending) = self.pending_live.as_mut() {
-            let n = LiveChoice::ORDER.len() as isize;
-            let next = (pending.selected.index() as isize + delta).rem_euclid(n) as usize;
-            pending.selected = LiveChoice::ORDER[next];
+    /// Move the highlighted choice forward (wraps). No-op if no modal is open.
+    pub fn modal_next(&mut self) {
+        self.cycle_modal(1);
+    }
+
+    /// Move the highlighted choice backward (wraps). No-op if no modal is open.
+    pub fn modal_prev(&mut self) {
+        self.cycle_modal(-1);
+    }
+
+    /// Shift the highlighted choice by `delta`, wrapping across `choices` via
+    /// `rem_euclid` (serves both layouts, both directions). A choiceless modal is
+    /// left untouched so `rem_euclid(0)` can never panic.
+    fn cycle_modal(&mut self, delta: isize) {
+        if let Some(modal) = self.modal.as_mut() {
+            let n = modal.choices.len() as isize;
+            if n == 0 {
+                return;
+            }
+            modal.selected = (modal.selected as isize + delta).rem_euclid(n) as usize;
         }
     }
 
-    /// Dismiss the overlay, returning to the board.
-    pub fn live_choice_cancel(&mut self) {
-        self.pending_live = None;
+    /// Dismiss the open modal, returning to the board. No-op if none is open.
+    pub fn close_modal(&mut self) {
+        self.modal = None;
     }
 
     // --- new-session agent picker -----------------------------------------
 
-    /// Whether ANY modal overlay currently owns the board (the running-session
-    /// choice or the new-session agent picker). Used to gate mouse actions
-    /// (splitter drag / link open) that must not fire while a modal is up.
+    /// Whether an overlay currently owns the board. The SINGLE gate predicate
+    /// callers use (never `self.modal.is_some()` inline) to keep mouse actions
+    /// (splitter drag / link open) from firing while an overlay is up — so a later
+    /// gate extension lives in exactly one place.
+    ///
+    /// True while a [`Modal`] is open OR a `Ctrl-X` leader chord is
+    /// [pending](Self::pending_chord): both take the keyboard, so both must equally
+    /// gate the mouse (a stray click mid-chord must not start a drag or open a
+    /// link), per PATTERNS §10.
     #[must_use]
     pub fn overlay_active(&self) -> bool {
-        self.pending_live.is_some() || self.pending_agent.is_some()
+        self.modal.is_some() || self.pending_chord
     }
 
-    /// Open the new-session agent picker over `agents`, pre-highlighting the
-    /// last-picked agent (or the default entry when none was picked or it is
-    /// gone) via [`pick_default_index`]. The caller only opens this when
-    /// discovery found at least one agent — an empty launch dir skips straight to
-    /// a bare `claude`, so the common no-agent case keeps its zero-extra-keystroke
-    /// path.
+    /// Open the new-session agent picker over `agents` as a `List`-layout
+    /// [`Modal`], pre-highlighting the last-picked agent (or the default entry when
+    /// none was picked or it is gone) via [`pick_default_index`]. Choice 0 is the
+    /// synthetic "default (no agent)" entry ([`ModalAction::New`]`(None)`); each
+    /// discovered agent follows as `New(Some(name))`, carrying its own name so
+    /// confirm needs no index-to-agent lookup.
+    ///
+    /// The caller only opens this when discovery found at least one agent — an
+    /// empty launch dir skips straight to a bare `claude`, so the common no-agent
+    /// case keeps its zero-extra-keystroke path.
     pub fn open_agent_picker(&mut self, agents: Vec<DefinedAgent>) {
         let selected = pick_default_index(self.last_new_agent.as_deref(), &agents);
-        self.pending_agent = Some(PendingAgent { agents, selected });
-    }
-
-    /// Move the picker highlight down one row (wraps). No-op if it is not open.
-    pub fn agent_pick_next(&mut self) {
-        self.cycle_agent_pick(1);
-    }
-
-    /// Move the picker highlight up one row (wraps). No-op if it is not open.
-    pub fn agent_pick_prev(&mut self) {
-        self.cycle_agent_pick(-1);
-    }
-
-    /// Shift the highlighted picker row by `delta`, wrapping across the default
-    /// entry and the discovered agents.
-    fn cycle_agent_pick(&mut self, delta: isize) {
-        if let Some(pending) = self.pending_agent.as_mut() {
-            let n = pending.len() as isize;
-            pending.selected = (pending.selected as isize + delta).rem_euclid(n) as usize;
+        let mut choices = vec![ModalChoice {
+            label: "default (no agent)".to_string(),
+            description: None,
+            action: ModalAction::New(None),
+        }];
+        for agent in agents {
+            choices.push(ModalChoice {
+                label: agent.name.clone(),
+                description: agent.description,
+                action: ModalAction::New(Some(agent.name)),
+            });
         }
-    }
-
-    /// Dismiss the picker without starting a session, returning to the board.
-    pub fn agent_pick_cancel(&mut self) {
-        self.pending_agent = None;
+        self.open_modal(Modal {
+            title: "new session".to_string(),
+            message: "Start a new session — pick an agent:".to_string(),
+            layout: ModalLayout::List,
+            choices,
+            selected,
+            session_id: None,
+        });
     }
 
     /// Remember the agent chosen for the last new session (`None` = default / no
@@ -1124,6 +1343,17 @@ impl App {
             self.filtered = self.scoped.clone();
         } else {
             self.filtered = self.index.results_within(&self.scoped);
+        }
+        // Drop user-hidden sessions unless the show-hidden toggle is on. Slotted
+        // AFTER the query pass and BEFORE ordering + folding, so hidden rows never
+        // reach `order_filtered` or `lineage::fold`: to the rest of the pipeline a
+        // hidden row simply is not in the visible set. When `show_hidden` is on the
+        // rows stay and the view marks them (see `render_list`). This is a
+        // PRESENTATION filter — the sessions are still loaded, parsed and indexed;
+        // only their visibility changes.
+        if !self.show_hidden {
+            self.filtered
+                .retain(|&i| !self.hidden_ids.contains(&self.sessions[i].session_id));
         }
         self.order_filtered();
         let folded = lineage::fold(&self.sessions, &self.filtered, &self.expanded);
@@ -1714,6 +1944,202 @@ mod tests {
         assert_eq!(app.selected_pos(), Some(2));
     }
 
+    // --- soft-hide (persisted visibility) ---------------------------------
+
+    /// Task 3.2: the persisted hidden set is a PRESENTATION filter. A hidden id
+    /// is dropped from the visible list by default and kept (for the view to
+    /// mark) when the show-hidden toggle is on.
+    #[test]
+    fn a_hidden_id_is_excluded_by_default_and_present_when_show_hidden() {
+        let _guard = crate::config::env_lock();
+        let dir = unique_temp_dir("hidden-filter");
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &dir);
+
+        // Session ids are prefixed so a leaked `SNAPBACK_CONFIG_DIR` (this test
+        // sets it process-wide) can never collide with another concurrent test's
+        // session ids, since `App::new` loads the hidden set from that env.
+        let mut app = app_all(vec![
+            session("sbhide-a", "r1", Some("main"), "/tmp/a"),
+            session("sbhide-b", "r2", Some("main"), "/tmp/b"),
+            session("sbhide-c", "r3", Some("main"), "/tmp/c"),
+        ]);
+        assert_eq!(
+            visible_ids(&app),
+            vec!["sbhide-a", "sbhide-b", "sbhide-c"],
+            "nothing is hidden yet, so every session is visible"
+        );
+
+        // Hide the middle session in the persisted set and re-filter.
+        app.hidden_ids.insert("sbhide-b".to_string());
+        app.recompute_filtered();
+        assert_eq!(
+            visible_ids(&app),
+            vec!["sbhide-a", "sbhide-c"],
+            "a hidden id is dropped from the board by default"
+        );
+
+        // Reveal hidden rows: the hidden id returns, still in display order, so
+        // the view can render it dimmed and marked.
+        app.show_hidden = true;
+        app.recompute_filtered();
+        assert_eq!(
+            visible_ids(&app),
+            vec!["sbhide-a", "sbhide-b", "sbhide-c"],
+            "show_hidden keeps hidden rows in the visible set"
+        );
+
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Task 3.3: hiding the SELECTED row shrinks the visible list and clamps the
+    /// selection to the nearest surviving row (never auto-revealing the hidden
+    /// row — the contrast with the fold's `reveal_hidden`); toggling show-hidden
+    /// brings the row back without un-hiding it.
+    #[test]
+    fn hiding_the_selected_row_clamps_selection_and_show_hidden_restores_it() {
+        let _guard = crate::config::env_lock();
+        let dir = unique_temp_dir("hide-selected");
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &dir);
+
+        // Prefixed ids: see the note in the filter test above (leaked env dir).
+        let mut app = app_all(vec![
+            session("sbhide-a", "r1", Some("main"), "/tmp/a"),
+            session("sbhide-b", "r2", Some("main"), "/tmp/b"),
+            session("sbhide-c", "r3", Some("main"), "/tmp/c"),
+        ]);
+        // Stand on the LAST row so hiding it must clamp, not stay put.
+        app.move_selection(2);
+        assert_eq!(app.selected.as_deref(), Some("sbhide-c"));
+
+        app.toggle_hidden_selected();
+        assert_eq!(
+            visible_ids(&app),
+            vec!["sbhide-a", "sbhide-b"],
+            "hiding the selected row shrinks the visible list"
+        );
+        assert_eq!(
+            app.selected.as_deref(),
+            Some("sbhide-b"),
+            "the selection clamps to the nearest surviving row, and the hidden \
+             row is NOT auto-revealed to keep the cursor on it"
+        );
+
+        // Reveal hidden rows: the hidden row is back, but it stays HIDDEN in the
+        // persisted set (show-hidden reveals, it does not un-hide).
+        app.toggle_show_hidden();
+        assert_eq!(
+            visible_ids(&app),
+            vec!["sbhide-a", "sbhide-b", "sbhide-c"],
+            "toggling show-hidden brings the hidden row back onto the board"
+        );
+        assert!(
+            app.hidden_ids.contains("sbhide-c"),
+            "revealing a hidden row must not remove it from the persisted set"
+        );
+
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Hiding a folded fork lineage hides EVERY nested member, and exposing brings
+    /// the whole lineage back — the family flips as a unit and never sheds only its
+    /// head (which would let the fold re-head to a surviving fork).
+    #[test]
+    fn ctrl_x_x_hides_and_exposes_a_whole_fork_lineage_together() {
+        let _guard = crate::config::env_lock();
+        let dir = unique_temp_dir("hide-lineage");
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &dir);
+
+        // A 3-fork lineage (shared root) folds to one visible head; an unrelated
+        // singleton must NOT be swept in.
+        let mut app = app_all(vec![
+            session_fork("sbfork-new", "/tmp/p", "root-1", 300), // newest → head
+            session_fork("sbfork-mid", "/tmp/p", "root-1", 200),
+            session_fork("sbfork-old", "/tmp/p", "root-1", 100),
+            session_ts("sbsolo", "repo", Some("main"), "/tmp/p", 50),
+        ]);
+        assert!(
+            visible_ids(&app).contains(&"sbfork-new"),
+            "the folded lineage head is on the board before hiding"
+        );
+
+        // Hide the folded lineage head.
+        app.set_selected(Some("sbfork-new".to_string()));
+        app.toggle_hidden_selected();
+
+        for member in ["sbfork-new", "sbfork-mid", "sbfork-old"] {
+            assert!(
+                app.hidden_ids.contains(member),
+                "{member} must be hidden with the rest of its lineage"
+            );
+        }
+        let visible = visible_ids(&app);
+        assert!(
+            !["sbfork-new", "sbfork-mid", "sbfork-old"]
+                .iter()
+                .any(|m| visible.contains(m)),
+            "no lineage member survives on the board: {visible:?}"
+        );
+        assert!(
+            visible.contains(&"sbsolo"),
+            "the unrelated singleton is untouched"
+        );
+
+        // Reveal, then expose the lineage from its head: every member clears.
+        app.toggle_show_hidden();
+        app.set_selected(Some("sbfork-new".to_string()));
+        app.toggle_hidden_selected();
+        assert!(
+            ["sbfork-new", "sbfork-mid", "sbfork-old"]
+                .iter()
+                .all(|m| !app.hidden_ids.contains(*m)),
+            "exposing the lineage clears every member from the hidden set"
+        );
+
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Task 3.4: a hide is PERSISTED. After hiding through the public toggle, a
+    /// fresh `App` built over the same `SNAPBACK_CONFIG_DIR` loads the hide at
+    /// construction, so the session stays hidden across a restart.
+    #[test]
+    fn a_hidden_session_survives_a_rebuild_from_the_same_state_dir() {
+        let _guard = crate::config::env_lock();
+        let dir = unique_temp_dir("hide-persist");
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &dir);
+
+        // Prefixed ids: see the note in the filter test above (leaked env dir).
+        let sessions = vec![
+            session("sbhide-a", "r1", Some("main"), "/tmp/a"),
+            session("sbhide-b", "r2", Some("main"), "/tmp/b"),
+        ];
+        // Hide the second session through the public toggle, which writes to the
+        // injected dir.
+        let mut app = app_all(sessions.clone());
+        app.move_selection(1);
+        assert_eq!(app.selected.as_deref(), Some("sbhide-b"));
+        app.toggle_hidden_selected();
+        assert!(app.hidden_ids.contains("sbhide-b"));
+
+        // A fresh App over the SAME sessions and the SAME state dir must read the
+        // hide back from disk at construction — before any interaction.
+        let rebuilt = app_all(sessions);
+        assert!(
+            rebuilt.hidden_ids.contains("sbhide-b"),
+            "the persisted hide is loaded by App::new from the state dir"
+        );
+        assert_eq!(
+            visible_ids(&rebuilt),
+            vec!["sbhide-a"],
+            "a session hidden in a previous run stays hidden across a restart"
+        );
+
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // --- preview scroll anchoring + bounds --------------------------------
 
     #[test]
@@ -2208,38 +2634,43 @@ mod tests {
     #[test]
     fn opening_and_cycling_the_choice_overlay_is_a_wrapping_state_machine() {
         let mut app = app_all(vec![session("s", "r", Some("main"), "/tmp/s")]);
-        assert!(app.pending_live.is_none());
+        assert!(app.modal.is_none());
 
         app.open_live_choice("s".to_string());
-        let pending = app.pending_live.clone().expect("overlay open");
-        assert_eq!(pending.session_id, "s");
-        assert_eq!(pending.selected, LiveChoice::Attach, "defaults to Attach");
+        let modal = app.modal.clone().expect("overlay open");
+        assert_eq!(modal.session_id.as_deref(), Some("s"));
+        assert_eq!(modal.layout, ModalLayout::Row, "a button strip");
+        assert_eq!(
+            modal.selected_action(),
+            Some(&ModalAction::Attach),
+            "defaults to the Attach choice"
+        );
 
-        app.live_choice_next();
+        app.modal_next();
         assert_eq!(
-            app.pending_live.as_ref().unwrap().selected,
-            LiveChoice::Fork
+            app.modal.as_ref().unwrap().selected_action(),
+            Some(&ModalAction::Fork)
         );
-        app.live_choice_next();
+        app.modal_next();
         assert_eq!(
-            app.pending_live.as_ref().unwrap().selected,
-            LiveChoice::Cancel
+            app.modal.as_ref().unwrap().selected_action(),
+            Some(&ModalAction::Cancel)
         );
-        app.live_choice_next();
+        app.modal_next();
         assert_eq!(
-            app.pending_live.as_ref().unwrap().selected,
-            LiveChoice::Attach,
+            app.modal.as_ref().unwrap().selected_action(),
+            Some(&ModalAction::Attach),
             "the highlight wraps"
         );
-        app.live_choice_prev();
+        app.modal_prev();
         assert_eq!(
-            app.pending_live.as_ref().unwrap().selected,
-            LiveChoice::Cancel,
+            app.modal.as_ref().unwrap().selected_action(),
+            Some(&ModalAction::Cancel),
             "prev wraps the other way"
         );
 
-        app.live_choice_cancel();
-        assert!(app.pending_live.is_none(), "cancel returns to the board");
+        app.close_modal();
+        assert!(app.modal.is_none(), "cancel returns to the board");
     }
 
     // --- new-session agent picker -----------------------------------------
@@ -2266,40 +2697,45 @@ mod tests {
     #[test]
     fn agent_picker_opens_cycles_and_maps_the_selected_agent() {
         let mut app = app_all(vec![session("s", "r", Some("main"), "/tmp/s")]);
-        assert!(app.pending_agent.is_none());
+        assert!(app.modal.is_none());
 
         app.open_agent_picker(vec![def_agent("alpha"), def_agent("beta")]);
-        let pending = app.pending_agent.clone().expect("picker open");
-        // No prior pick -> row 0 (default / no agent).
-        assert_eq!(pending.selected, 0);
-        assert_eq!(pending.selected_agent(), None, "row 0 is the default entry");
+        let modal = app.modal.clone().expect("picker open");
+        assert_eq!(modal.layout, ModalLayout::List, "a vertical picker");
+        // No prior pick -> choice 0 (default / no agent).
+        assert_eq!(modal.selected, 0);
+        assert_eq!(
+            modal.selected_action(),
+            Some(&ModalAction::New(None)),
+            "choice 0 is the default (no-agent) entry"
+        );
 
         // Down cycles default -> alpha -> beta -> (wrap) default.
-        app.agent_pick_next();
+        app.modal_next();
         assert_eq!(
-            app.pending_agent.as_ref().unwrap().selected_agent(),
-            Some("alpha")
+            app.modal.as_ref().unwrap().selected_action(),
+            Some(&ModalAction::New(Some("alpha".to_string())))
         );
-        app.agent_pick_next();
+        app.modal_next();
         assert_eq!(
-            app.pending_agent.as_ref().unwrap().selected_agent(),
-            Some("beta")
+            app.modal.as_ref().unwrap().selected_action(),
+            Some(&ModalAction::New(Some("beta".to_string())))
         );
-        app.agent_pick_next();
+        app.modal_next();
         assert_eq!(
-            app.pending_agent.as_ref().unwrap().selected_agent(),
-            None,
+            app.modal.as_ref().unwrap().selected_action(),
+            Some(&ModalAction::New(None)),
             "the highlight wraps back to the default entry"
         );
         // Up wraps the other way to the last agent.
-        app.agent_pick_prev();
+        app.modal_prev();
         assert_eq!(
-            app.pending_agent.as_ref().unwrap().selected_agent(),
-            Some("beta")
+            app.modal.as_ref().unwrap().selected_action(),
+            Some(&ModalAction::New(Some("beta".to_string())))
         );
 
-        app.agent_pick_cancel();
-        assert!(app.pending_agent.is_none(), "cancel returns to the board");
+        app.close_modal();
+        assert!(app.modal.is_none(), "cancel returns to the board");
     }
 
     #[test]
@@ -2309,8 +2745,8 @@ mod tests {
         app.open_agent_picker(vec![def_agent("alpha"), def_agent("beta")]);
         // The last pick pre-highlights its row so Ctrl-N then Enter repeats it.
         assert_eq!(
-            app.pending_agent.as_ref().unwrap().selected_agent(),
-            Some("beta"),
+            app.modal.as_ref().unwrap().selected_action(),
+            Some(&ModalAction::New(Some("beta".to_string()))),
             "the picker opens on the last-picked agent"
         );
     }

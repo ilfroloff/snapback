@@ -13,6 +13,36 @@ Resolved by `store::discover::store_root()`:
 2. `~/.claude/projects`, else
 3. `.claude/projects` (last resort if the home dir cannot be resolved).
 
+## snapback-owned state (`src/hidden.rs`)
+
+The store above is READ-ONLY to `snapback` with one exception (hard delete, below).
+`snapback`'s one persistent write of its own is the **soft-hidden session id set**,
+kept in a SEPARATE directory it owns — never inside the Claude store. Its path is
+resolved by the `config` module (`src/config.rs`), the SINGLE place that reads the
+environment for any snapback-owned path:
+
+1. `config::config_dir()` = `$SNAPBACK_CONFIG_DIR` if set and non-empty (the
+   test/override seam, mirroring `$CLAUDE_PROJECTS_DIR`), else `~/.config/snapback`.
+   The default is `~/.config/snapback` on EVERY platform — deliberately NOT
+   `dirs::config_dir()` (which is `~/Library/Application Support` on macOS) — so the
+   state keeps one predictable, greppable home regardless of OS. Built from
+   `dirs::home_dir()` joined with `.config`; home-less fallback is a relative
+   `.config/snapback`, never a panic.
+2. `config::state_dir()` = `config_dir()/state`, where persistent state lives.
+
+The set is a single file, `<config>/state/hidden_sessions` (default
+`~/.config/snapback/state/hidden_sessions`): newline-delimited session ids,
+serialized in SORTED order for stable diffs. Reads are fail-soft (a missing file or
+an unparseable line ⇒ that entry skipped, an empty set, never a panic); writes are
+atomic (temp file + rename), matching the JSONL fail-soft discipline.
+
+Hiding is a **visibility preference, not a status flag**. A hidden session is
+still discovered, parsed, and indexed at load — its bytes stay on disk — and is
+dropped only in `recompute_filtered` when `show_hidden` is off. Because the set
+asserts nothing about run state, a hidden LIVE session keeps its live badge in the
+show-hidden view, so it does NOT resurrect the rejected "Completed"/archived
+status flag (see the ADR note in the delete plan).
+
 ## On-disk layout
 
 ```
@@ -29,6 +59,12 @@ Resolved by `store::discover::store_root()`:
 (real dashes are indistinguishable from separators), so it is never decoded to
 reconstruct a path. Fixtures illustrating each shape live under
 `tests/fixtures/store/`.
+
+**The one write into this tree** is hard delete (`Ctrl-X d`, `delete::remove`):
+it unlinks a single session's own `<id>.jsonl` AND removes its sibling `<id>/`
+directory (subagents included) when present — never any other path, and only
+behind a confirmation modal plus the `can_delete` live guard. Everything else in
+this tree stays read-only.
 
 ### The three file kinds
 
@@ -557,7 +593,8 @@ This is the third and last of **three distinct agent concepts** — keep them ap
 | --- | --- | --- |
 | **Scope** | `CurrentFolder` (default) / `All` | current-folder = sessions whose **canonical** `cwd` exactly equals the canonical launch dir; all = every session, grouped by folder. Toggled by `Ctrl-A` / `--all`. |
 | **Search mode** | `NameOnly` (default) / `NameAndContent` | which haystack the substring matcher scores; toggled by `Tab`. |
-| **Live choice** | `Attach` / `Fork` / `Cancel` | the overlay shown when `Enter` lands on a running session. |
+| **Show hidden** | off (default) / on | whether soft-hidden sessions appear (dimmed, marked `[hidden]`, live badge intact). Toggled by `Ctrl-X h`; a row is hidden/un-hidden by `Ctrl-X x`. The set persists — see [snapback-owned state](#snapback-owned-state-srchiddenrs). |
+| **Modal** | `Row` \| `List` layout in one `Option<Modal>` | the SINGLE overlay type. `Enter` on a running session builds the `Attach` / `Fork` / `Cancel` choice (a `Row`); `Ctrl-N` with defined agents builds the agent picker (a `List`); `Ctrl-X d` builds the hard-delete confirm (a `Row`). Each choice carries a `ModalAction` tag the one confirm handler (`confirm_modal`) routes on. |
 
 The current-folder scope is an **exact** canonical `cwd` match by design: a
 repo's *other* worktree folders do not appear until you switch to all-folders or

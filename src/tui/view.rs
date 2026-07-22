@@ -24,7 +24,7 @@ use crate::agents::{self, AgentActivity, ReportedAgent};
 use crate::search::SearchMode;
 use crate::store::preview::LinkRegion;
 
-use super::app::{resolve_list_width, App, LiveChoice, Row, Scope};
+use super::app::{resolve_list_width, App, Modal, ModalChoice, ModalLayout, Row, Scope};
 
 /// Render the whole UI for one frame.
 ///
@@ -45,14 +45,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     render_body(frame, app, body_area);
     render_search(frame, app, search_area);
     render_help(frame, app, help_area);
-    // The running-session choice sits ON TOP of the board when open.
-    if app.pending_live.is_some() {
-        render_live_choice(frame, app);
-    }
-    // The new-session agent picker likewise overlays the board. The two are
-    // mutually exclusive (each owns the keyboard while open), so at most one draws.
-    if app.pending_agent.is_some() {
-        render_agent_pick(frame, app);
+    // A modal (the running-session choice or the new-session agent picker) sits
+    // ON TOP of the board when open. The two overlays are now one `Option<Modal>`,
+    // so at most one ever draws — a fact made structural, not conventional.
+    if let Some(modal) = &app.modal {
+        render_modal(frame, modal);
     }
 }
 
@@ -164,6 +161,12 @@ const LINEAGE_MARKER_GAP: &str = "  ";
 /// What a width-truncated label ends with. One column, so the arithmetic in
 /// [`fit_label`] stays in columns without a width table.
 const LABEL_ELLIPSIS: &str = "…";
+
+/// The footnote a soft-hidden session row wears while the show-hidden toggle is
+/// on: a dim `[hidden]` marker so the user can see what they hid (and un-hide
+/// it). Carries its own leading gap, exactly as [`LINEAGE_MARKER_GAP`] folds its
+/// gap into the `(+N)` marker, so the reserved width matches the drawn width.
+const HIDDEN_ROW_MARKER: &str = "  [hidden]";
 
 /// How many leading chars of a `session_id` a lineage CHILD row shows.
 ///
@@ -404,6 +407,13 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 child,
             } => {
                 let session = &app.sessions[*i];
+                // A soft-hidden (persisted) session only reaches here when
+                // `show_hidden` is on — `recompute_filtered` drops it otherwise.
+                // Such a row is drawn DIM with a `[hidden]` footnote (below) so the
+                // user can see what they hid and un-hide it. Note this reads the
+                // persisted `hidden_ids` set, NOT the fold's per-row `hidden` count
+                // matched above — the two are deliberately distinct.
+                let soft_hidden = app.hidden_ids.contains(&session.session_id);
                 let mut spans = vec![
                     // An expanded lineage member hangs off the head above it;
                     // every other row keeps the gutter it has always had.
@@ -520,7 +530,13 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                             Style::default().add_modifier(Modifier::DIM),
                         ));
                     }
-                    return ListItem::new(Line::from(spans));
+                    if soft_hidden {
+                        spans.push(Span::styled(
+                            HIDDEN_ROW_MARKER,
+                            Style::default().add_modifier(Modifier::DIM),
+                        ));
+                    }
+                    return dim_row_if(ListItem::new(Line::from(spans)), soft_hidden);
                 }
 
                 // A folded head's `(+N)`, reserved BEFORE the label so a narrow
@@ -561,7 +577,13 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                         Style::default().add_modifier(Modifier::DIM),
                     ));
                 }
-                ListItem::new(Line::from(spans))
+                if soft_hidden {
+                    spans.push(Span::styled(
+                        HIDDEN_ROW_MARKER,
+                        Style::default().add_modifier(Modifier::DIM),
+                    ));
+                }
+                dim_row_if(ListItem::new(Line::from(spans)), soft_hidden)
             }
         })
         .collect();
@@ -583,6 +605,21 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
     // Persist the offset ratatui computed so scroll is stable across redraws
     // and preserved across reloads.
     app.scroll = state.offset();
+}
+
+/// Dim an ENTIRE list row when it is a soft-hidden session shown under the
+/// show-hidden toggle, so the demoted row reads that way at a glance while its
+/// own spans (badge color, `[hidden]` marker) still compose over the base.
+///
+/// TERMINAL-SAFE STYLING: a named `Modifier`, never RGB or an embedded ANSI
+/// escape (AGENTS.md). `DIM` is the same footnote treatment the timestamp,
+/// lineage `(+N)` marker, and child id/count already use.
+fn dim_row_if(item: ListItem<'_>, hidden: bool) -> ListItem<'_> {
+    if hidden {
+        item.style(Style::default().add_modifier(Modifier::DIM))
+    } else {
+        item
+    }
 }
 
 /// The badge glyph for a reported agent, chosen by BUCKET.
@@ -1173,10 +1210,41 @@ fn render_search(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(line), area);
 }
 
-/// The bottom help line: the keybinding cheat sheet, or a transient board
-/// status (e.g. a resume refusal) when one is set. A status wins the line and is
-/// flattened to a single row (newlines -> spaces) since the help area is 1 tall.
+/// The which-key hint that takes over the help line while a `Ctrl-X` leader chord
+/// is pending: the follow-up keys and what each does. The `x` verb tracks the
+/// selected row — `hide` for a visible session, `expose` for one already hidden
+/// (there `x` un-hides it) — so the hint names what the next keypress actually does.
+/// One place for the wording (NO MAGIC VALUES); keep it in step with
+/// [`update::chord_key`](crate::tui::update). Rendered with a NAMED color +
+/// modifier only, no RGB or ANSI (PATTERNS §7, TERMINAL-SAFE STYLING).
+fn chord_hint(selected_hidden: bool) -> String {
+    let x = if selected_hidden { "expose" } else { "hide" };
+    format!("^X  x {x} · d delete · h show/hide hidden · Esc cancel")
+}
+
+/// The bottom help line: the keybinding cheat sheet, a transient board status
+/// (e.g. a resume refusal) when one is set, or the [`CHORD_HINT`] while a `Ctrl-X`
+/// leader chord is pending. A status wins over the cheat sheet and is flattened to
+/// a single row (newlines -> spaces) since the help area is 1 tall; the chord hint
+/// wins over both, since the chord owns the keyboard the moment it is armed.
 fn render_help(frame: &mut Frame, app: &App, area: Rect) {
+    if app.pending_chord {
+        // The leader chord took the keyboard: show its follow-up keys so the chord
+        // is discoverable the moment `Ctrl-X` is hit. The `x` verb flips to "expose"
+        // when the selected row is already hidden, since there `x` un-hides it.
+        let selected_hidden = app
+            .selected
+            .as_ref()
+            .is_some_and(|id| app.hidden_ids.contains(id));
+        let hint = Line::from(vec![Span::styled(
+            chord_hint(selected_hidden),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )]);
+        frame.render_widget(Paragraph::new(hint), area);
+        return;
+    }
     let line = match &app.status {
         Some(status) => {
             let flat = status.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1188,136 +1256,165 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
             )])
         }
         None => Line::from(vec![Span::styled(
-            "↑↓/jk move · ←/→ fold/expand · Enter resume · ^F fork · ^N new · type to search · Tab name/content · ^A scope · ^/ preview · PgUp/PgDn·^U/^D·Home/End·wheel scroll · q/Esc quit",
+            "↑↓/jk move · ←/→ fold/expand · Enter resume · ^F fork · ^N new · ^X hide/del · type to search · Tab name/content · ^A scope · ^/ preview · PgUp/PgDn·^U/^D·Home/End·wheel scroll · q/Esc quit",
             Style::default().add_modifier(Modifier::DIM),
         )]),
     };
     frame.render_widget(Paragraph::new(line), area);
 }
 
-/// The running-session choice overlay: a small centered prompt offering Attach /
-/// Fork / Cancel for a session `claude -r` would refuse to plain-resume.
-///
-/// Drawn last (on top of the board) with a [`Clear`] so the board shows through
-/// only outside the box. The highlighted choice is reversed; the target session
-/// id and the routing live in [`App`], so this is pure presentation.
-fn render_live_choice(frame: &mut Frame, app: &App) {
-    let Some(pending) = &app.pending_live else {
-        return;
-    };
-    let area = centered_rect(frame.area(), 62, 7);
+/// Shared width (columns) of every modal overlay. ONE constant retiring the
+/// running-session choice's old literal `62` and the picker's old
+/// `AGENT_PICK_WIDTH` — the latter existed only to match the former's footprint,
+/// so the two were always meant to be identical. [`centered_rect`] shrinks it to
+/// fit on a tiny terminal.
+const MODAL_WIDTH: u16 = 62;
 
-    let mut options: Vec<Span> = Vec::new();
-    for (idx, choice) in LiveChoice::ORDER.iter().enumerate() {
-        if idx > 0 {
-            options.push(Span::raw("    "));
+/// Non-message rows a `Row`-layout modal draws, borders excluded: a blank spacer,
+/// the button strip, a blank spacer, and the footer help line. The message (one or
+/// more wrapped rows) is added on top, so the box grows to fit a long prompt rather
+/// than clipping it.
+const MODAL_ROW_CHROME_ROWS: u16 = 4;
+
+/// Non-message, non-entry rows a `List`-layout modal draws around its selectable
+/// list: a blank spacer above the list, a blank spacer below it, and a footer help
+/// line. The box height is message rows + entries + this chrome + two borders, so a
+/// picker grows with its choice count (the picker's old `AGENT_PICK_CHROME_ROWS`
+/// reasoning, kept) and any modal grows with a wrapped message.
+const MODAL_LIST_CHROME_ROWS: u16 = 3;
+
+/// Word-wrap `text` into lines no wider than `width` columns, breaking on
+/// whitespace; a single word longer than `width` is kept whole (it clips rather
+/// than splitting mid-word — fine for the short, controlled prompts a modal
+/// carries). Always returns at least one line so an empty message still reserves a
+/// row. Pure, so the wrapped line count that sizes the modal box is unit-testable.
+/// Counts by `char` — exact for the ASCII prompts these modals use.
+fn wrap_message(text: &str, width: u16) -> Vec<String> {
+    let width = usize::from(width.max(1));
+    let mut lines: Vec<String> = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let need = if line.is_empty() {
+            word.chars().count()
+        } else {
+            line.chars().count() + 1 + word.chars().count()
+        };
+        if !line.is_empty() && need > width {
+            lines.push(std::mem::take(&mut line));
         }
-        let mut style = Style::default().add_modifier(Modifier::BOLD);
-        if *choice == pending.selected {
-            style = style.add_modifier(Modifier::REVERSED);
+        if !line.is_empty() {
+            line.push(' ');
         }
-        options.push(Span::styled(format!(" {} ", choice.label()), style));
+        line.push_str(word);
     }
-
-    let lines = vec![
-        Line::from(Span::styled(
-            "This session is running — it can't be plain-resumed.",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(options),
-        Line::from(""),
-        Line::from(Span::styled(
-            "\u{2190}/\u{2192} choose \u{b7} Enter confirm \u{b7} Esc cancel",
-            Style::default().add_modifier(Modifier::DIM),
-        )),
-    ];
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" session is running ");
-    frame.render_widget(Clear, area);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .alignment(Alignment::Center),
-        area,
-    );
+    lines.push(line);
+    lines
 }
 
-/// Fixed width (columns) of the new-session agent picker overlay, matching the
-/// running-session choice overlay's footprint so the two modals feel of a piece;
-/// [`centered_rect`] shrinks it to fit on a tiny terminal.
-const AGENT_PICK_WIDTH: u16 = 62;
-
-/// Non-entry rows the agent picker always draws around its selectable list: a
-/// title line, a blank spacer above the list, a blank spacer below it, and a
-/// footer help line. Named so the overlay height (entries + this chrome + the two
-/// border rows) carries no bare magic number.
-const AGENT_PICK_CHROME_ROWS: u16 = 4;
-
-/// The new-session agent picker overlay: a centered vertical list of the
-/// discovered agents, preceded by a "default (no agent)" entry, with the
-/// highlighted row reversed.
+/// The generic modal overlay: a centered bordered box with a title, a message, its
+/// choices (a `Row` button strip or a vertical `List`), and a footer help line.
 ///
 /// Drawn last (on top of the board) with a [`Clear`] so the board shows through
-/// only outside the box. The selectable rows and the highlight live in [`App`], so
-/// this is pure presentation. Row 0 is the synthetic default (no-agent) entry; the
-/// rest map to `pending.agents` in order (mirroring `PendingAgent::selected_agent`).
-fn render_agent_pick(frame: &mut Frame, app: &App) {
-    let Some(pending) = &app.pending_agent else {
-        return;
+/// only outside the box. The choices, the highlight, and the routing all live on
+/// the [`Modal`] in [`App`], so this is pure presentation. Styled with named
+/// colors + modifiers only (terminal-safe). The message accent and footer are
+/// derived from the layout, preserving each overlay's original chrome: a `Row`
+/// reads as a warning/confirm (`Yellow`, `←/→ … Enter confirm`, centered), a
+/// `List` as a picker (`Cyan`, `↑/↓ … Enter start`, left-aligned).
+fn render_modal(frame: &mut Frame, modal: &Modal) {
+    let (accent, footer) = match modal.layout {
+        ModalLayout::Row => (
+            Color::Yellow,
+            "\u{2190}/\u{2192} choose \u{b7} Enter confirm \u{b7} Esc cancel",
+        ),
+        ModalLayout::List => (Color::Cyan, "↑/↓ choose · Enter start · Esc cancel"),
     };
 
-    let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(Span::styled(
-        "Start a new session — pick an agent:",
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )));
+    // Wrap the message to the box's inner width (borders excluded) so a long prompt
+    // — e.g. the delete confirmation — shows in full instead of clipping at the
+    // border; the box height below counts the wrapped rows so the two agree.
+    let message = wrap_message(&modal.message, MODAL_WIDTH.saturating_sub(2));
+    let message_rows = message.len() as u16;
+    let mut lines: Vec<Line> = message
+        .into_iter()
+        .map(|l| {
+            Line::from(Span::styled(
+                l,
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            ))
+        })
+        .collect();
     lines.push(Line::from(""));
-    // Row 0: the default (no-agent) entry; then one row per discovered agent.
-    lines.push(agent_entry_line(
-        "default (no agent)",
-        None,
-        pending.selected == 0,
-    ));
-    for (i, agent) in pending.agents.iter().enumerate() {
-        lines.push(agent_entry_line(
-            &agent.name,
-            agent.description.as_deref(),
-            pending.selected == i + 1,
-        ));
-    }
+
+    // The choices, plus the box height (message rows + chrome + borders; a list also
+    // grows with its entry count).
+    let height = match modal.layout {
+        ModalLayout::Row => {
+            lines.push(Line::from(modal_button_row(&modal.choices, modal.selected)));
+            message_rows
+                .saturating_add(MODAL_ROW_CHROME_ROWS)
+                .saturating_add(2)
+        }
+        ModalLayout::List => {
+            for (i, choice) in modal.choices.iter().enumerate() {
+                lines.push(modal_list_row(
+                    &choice.label,
+                    choice.description.as_deref(),
+                    i == modal.selected,
+                ));
+            }
+            (modal.choices.len() as u16)
+                .saturating_add(message_rows)
+                .saturating_add(MODAL_LIST_CHROME_ROWS)
+                .saturating_add(2)
+        }
+    };
+
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "↑/↓ choose · Enter start · Esc cancel",
+        footer,
         Style::default().add_modifier(Modifier::DIM),
     )));
 
-    // Height: entry rows (default + each agent) + the fixed chrome + two borders.
-    let entry_rows = pending.agents.len() as u16 + 1;
-    let height = entry_rows
-        .saturating_add(AGENT_PICK_CHROME_ROWS)
-        .saturating_add(2);
-    let area = centered_rect(frame.area(), AGENT_PICK_WIDTH, height);
-
+    let area = centered_rect(frame.area(), MODAL_WIDTH, height);
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" new session ");
+        .title(format!(" {} ", modal.title));
     frame.render_widget(Clear, area);
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    let mut paragraph = Paragraph::new(lines).block(block);
+    if matches!(modal.layout, ModalLayout::Row) {
+        // Center the whole box (message, buttons, footer), as the old
+        // running-session overlay did.
+        paragraph = paragraph.alignment(Alignment::Center);
+    }
+    frame.render_widget(paragraph, area);
 }
 
-/// One row of the agent picker: a `› ` marker + reversed, bold name when
-/// selected (the same highlight glyph the list uses), else a padded name, with an
-/// optional dim description trailing. Owns its text (`'static`) so it composes
-/// into the picker `Paragraph`.
-fn agent_entry_line(name: &str, description: Option<&str>, selected: bool) -> Line<'static> {
-    let (marker, name_style) = if selected {
+/// A `Row`-layout modal's horizontal button strip: each choice as ` label `
+/// (bold, the highlighted one also reversed), separated by four spaces — the old
+/// running-session overlay's button styling, verbatim.
+fn modal_button_row(choices: &[ModalChoice], selected: usize) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span> = Vec::new();
+    for (i, choice) in choices.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("    "));
+        }
+        let mut style = Style::default().add_modifier(Modifier::BOLD);
+        if i == selected {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        spans.push(Span::styled(format!(" {} ", choice.label), style));
+    }
+    spans
+}
+
+/// One row of a `List`-layout modal: a `› ` marker + reversed, bold label when
+/// selected (the same highlight glyph the session list uses), else a padded label,
+/// with an optional dim description trailing. Owns its text (`'static`) so it
+/// composes into the modal `Paragraph`. (The picker's old `agent_entry_line`,
+/// generalized to any list modal.)
+fn modal_list_row(label: &str, description: Option<&str>, selected: bool) -> Line<'static> {
+    let (marker, label_style) = if selected {
         (
             "› ",
             Style::default()
@@ -1329,7 +1426,7 @@ fn agent_entry_line(name: &str, description: Option<&str>, selected: bool) -> Li
     };
     let mut spans = vec![
         Span::raw(marker),
-        Span::styled(name.to_string(), name_style),
+        Span::styled(label.to_string(), label_style),
     ];
     if let Some(desc) = description {
         spans.push(Span::raw("  "));
@@ -3658,14 +3755,73 @@ mod tests {
         }
     }
 
+    /// Task 4.2: while a `Ctrl-X` leader chord is pending, the which-key hint takes
+    /// over the help line so the follow-up keys are discoverable — asserted on the
+    /// DRAWN cells, not on the source string.
+    #[test]
+    fn a_pending_chord_takes_over_the_help_line_with_the_which_key_hint() {
+        let (width, height) = FULL_BOARD_SIZE;
+        let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp/launch"));
+        app.pending_chord = true;
+
+        let buffer = drawn_board(&mut app, width, height);
+        // `render`'s layout is header(1) | body(fill) | search(1) | help(1), so the
+        // help line — where the hint takes over — is the LAST row.
+        let help_y = height - 1;
+        let text = full_row_text(&buffer, help_y, width);
+
+        assert!(
+            text.contains(&chord_hint(false)),
+            "a pending chord must draw the which-key hint on the help line; drawn: {text:?}"
+        );
+        for needle in ["x hide", "d delete", "h show/hide hidden", "Esc cancel"] {
+            assert!(
+                text.contains(needle),
+                "the which-key hint must list {needle:?}; drawn: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn chord_hint_flips_the_x_verb_with_the_selected_rows_hidden_state() {
+        // A visible row hides; a hidden row exposes (there `x` un-hides it).
+        assert!(chord_hint(false).contains("x hide"));
+        assert!(!chord_hint(false).contains("expose"));
+        assert!(chord_hint(true).contains("x expose"));
+        assert!(!chord_hint(true).contains("x hide"));
+    }
+
+    #[test]
+    fn wrap_message_splits_a_long_prompt_and_keeps_a_short_one_whole() {
+        // A short prompt stays on one line.
+        assert_eq!(
+            wrap_message("Delete this?", 60),
+            vec!["Delete this?".to_string()]
+        );
+        // The delete confirmation is wider than the box, so it wraps; every wrapped
+        // line fits the width and no word is dropped or reordered.
+        let msg = "Permanently delete this session's transcript from disk? \
+                   This can't be undone.";
+        let lines = wrap_message(msg, 60);
+        assert!(lines.len() >= 2, "a long prompt must wrap: {lines:?}");
+        assert!(lines.iter().all(|l| l.chars().count() <= 60));
+        assert_eq!(
+            lines.join(" "),
+            msg.split_whitespace().collect::<Vec<_>>().join(" "),
+            "wrapping preserves every word in order"
+        );
+        // A degenerate zero width never panics and still yields one line.
+        assert_eq!(wrap_message("", 0).len(), 1);
+    }
+
     // --- new-session agent picker overlay ---------------------------------
 
     use crate::defined_agents::DefinedAgent;
 
     #[test]
-    fn agent_entry_line_marks_the_selected_row_and_trails_the_description() {
-        // A selected row leads with the highlight marker and reverses the name.
-        let sel = agent_entry_line("planner", Some("plans work"), true);
+    fn modal_list_row_marks_the_selected_row_and_trails_the_description() {
+        // A selected row leads with the highlight marker and reverses the label.
+        let sel = modal_list_row("planner", Some("plans work"), true);
         let text: String = sel.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
             text.starts_with("› "),
@@ -3676,14 +3832,14 @@ mod tests {
             .spans
             .iter()
             .find(|s| s.content.as_ref() == "planner")
-            .expect("the name span is present");
+            .expect("the label span is present");
         assert!(
             name.style.add_modifier.contains(Modifier::REVERSED),
-            "the selected name is reversed"
+            "the selected label is reversed"
         );
 
         // An unselected, description-less row is padded and not reversed.
-        let unsel = agent_entry_line("planner", None, false);
+        let unsel = modal_list_row("planner", None, false);
         let text: String = unsel.spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(
             text, "  planner",
@@ -3693,10 +3849,10 @@ mod tests {
             .spans
             .iter()
             .find(|s| s.content.as_ref() == "planner")
-            .expect("the name span is present");
+            .expect("the label span is present");
         assert!(
             !name.style.add_modifier.contains(Modifier::REVERSED),
-            "an unselected name is not reversed"
+            "an unselected label is not reversed"
         );
     }
 
@@ -3725,9 +3881,77 @@ mod tests {
             .draw(|frame| render(frame, &mut app))
             .expect("render must not panic with the agent picker open");
         assert!(
-            app.pending_agent.is_some(),
+            app.modal.is_some(),
             "rendering must not disturb the open picker"
         );
+    }
+
+    #[test]
+    fn render_draws_the_running_session_choice_overlay_without_panicking() {
+        // Full-frame render with the Row-layout running-session overlay open must
+        // lay out and draw the button strip over the board without panicking.
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.open_live_choice("sess-live".to_string());
+        let mut terminal =
+            Terminal::new(TestBackend::new(80, 24)).expect("build an in-memory test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("render must not panic with the running-session overlay open");
+        assert!(
+            app.modal.is_some(),
+            "rendering must not disturb the open overlay"
+        );
+    }
+
+    #[test]
+    fn the_delete_confirm_modal_shows_its_full_message_without_clipping() {
+        use crate::tui::app::{Modal, ModalAction, ModalChoice, ModalLayout};
+        // The delete prompt is wider than the modal, so it must wrap across rows —
+        // both the opening and the closing clause have to reach the screen. Regression
+        // guard for the clipped "... This" the old single-line render produced.
+        let (width, height) = (80u16, 24u16);
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.modal = Some(Modal {
+            title: "delete session".to_string(),
+            message: "Permanently delete this session's transcript from disk? \
+                      This can't be undone."
+                .to_string(),
+            layout: ModalLayout::Row,
+            choices: vec![
+                ModalChoice {
+                    label: "Delete".to_string(),
+                    description: None,
+                    action: ModalAction::Delete,
+                },
+                ModalChoice {
+                    label: "Cancel".to_string(),
+                    description: None,
+                    action: ModalAction::Cancel,
+                },
+            ],
+            selected: 1,
+            session_id: Some("sess-live".to_string()),
+        });
+
+        let buffer = drawn_board(&mut app, width, height);
+        let screen: String = (0..height)
+            .map(|y| full_row_text(&buffer, y, width))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for needle in ["Permanently delete", "can't be undone."] {
+            assert!(
+                screen.contains(needle),
+                "the wrapped delete message must show {needle:?} in full; screen:\n{screen}"
+            );
+        }
     }
 
     // --- the pulse against a URL-bearing row ------------------------------
@@ -4422,6 +4646,68 @@ mod tests {
             !text.contains(LABEL_ELLIPSIS),
             "a row with nothing hidden reserves nothing, so its label must be \
              clipped by the List and never fitted: {text:?}"
+        );
+    }
+
+    /// Task 3.5: while show-hidden is on, a soft-hidden session row is drawn with
+    /// a `[hidden]` marker AND dimmed. Both claims are read off the DRAWN cells
+    /// (PATTERNS §7 "assert drawn cells, not modifiers"), and the styling is a
+    /// named `Modifier`, never RGB or an embedded ANSI escape.
+    #[test]
+    fn render_list_marks_and_dims_a_hidden_row_under_show_hidden() {
+        // Two plain sessions in one group; ids chosen so the SHOWN row sorts
+        // first (and is thus the default selection), leaving the hidden row
+        // unselected so its dim is not entangled with the selection's REVERSED.
+        let mut shown = sample_session();
+        shown.session_id = "sess-a-shown".to_string();
+        shown.label = "sess-a-shown".to_string();
+        let mut hush = sample_session();
+        hush.session_id = "sess-z-hush".to_string();
+        hush.label = "sess-z-hush".to_string();
+
+        let mut app = App::new(vec![shown, hush], Scope::All, PathBuf::from("/tmp/launch"));
+        app.hidden_ids.insert("sess-z-hush".to_string());
+        // Reveal hidden rows (false -> true) and re-filter so the hidden row draws.
+        app.toggle_show_hidden();
+
+        let (width, height) = (40u16, 8u16);
+        let buffer = drawn_list(&mut app, width, height);
+
+        // The marker lands on the hidden session's row (content first, so the
+        // cells asserted below are really that row).
+        let y = row_of(&buffer, width, height, "[hidden]");
+        let row = row_text(&buffer, y, width);
+        assert!(
+            row.contains("sess-z-hush"),
+            "the [hidden] marker must sit on the hidden session's own row: {row:?}"
+        );
+
+        // Every non-blank drawn cell of that row is DIM — the whole row reads as
+        // demoted, not just the marker.
+        for x in 1..width - 1 {
+            let cell = buffer.cell((x, y)).expect("a cell within the list border");
+            if cell.symbol() == " " {
+                continue;
+            }
+            assert!(
+                cell.modifier.contains(Modifier::DIM),
+                "a revealed hidden row must be drawn DIM; cell {:?} at x={x} was {:?}",
+                cell.symbol(),
+                cell.modifier
+            );
+        }
+
+        // The control: the non-hidden row is NOT dimmed, so the dim is a property
+        // of being hidden, not of the whole list.
+        let sy = row_of(&buffer, width, height, "sess-a-shown");
+        let sx = column_of(&buffer, sy, width, "sess-a-shown");
+        let scell = buffer
+            .cell((sx, sy))
+            .expect("a cell within the list border");
+        assert!(
+            !scell.modifier.contains(Modifier::DIM),
+            "a non-hidden row's label must not be dimmed, got {:?}",
+            scell.modifier
         );
     }
 }

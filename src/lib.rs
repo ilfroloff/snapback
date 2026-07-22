@@ -16,7 +16,10 @@
 
 mod agents;
 mod cli;
+pub mod config;
 mod defined_agents;
+pub mod delete;
+pub mod hidden;
 mod resume;
 mod search;
 mod store;
@@ -248,11 +251,11 @@ mod tests {
 
         after_nonzero_resume(&mut app, &ready, resume::RESUME_NONZERO_HINT.to_string());
 
-        let pending = app
-            .pending_live
+        let modal = app
+            .modal
             .clone()
             .expect("claude reports the session live, so the board must offer Attach/Fork");
-        assert_eq!(pending.session_id, "sess-raced");
+        assert_eq!(modal.session_id.as_deref(), Some("sess-raced"));
         assert_eq!(
             app.status.as_deref(),
             Some(resume::RESUME_RACE_STATUS),
@@ -272,7 +275,7 @@ mod tests {
         after_nonzero_resume(&mut app, &ready, resume::RESUME_NONZERO_HINT.to_string());
 
         assert!(
-            app.pending_live.is_none(),
+            app.modal.is_none(),
             "nothing says this session is running, so it must not be routed to \
              the running-session overlay"
         );
@@ -310,7 +313,7 @@ mod tests {
         after_nonzero_resume(&mut app, &ready, resume::RESUME_NONZERO_HINT.to_string());
 
         assert!(
-            app.pending_live.is_none(),
+            app.modal.is_none(),
             "a fork's non-zero exit is a real failure, not a lost race"
         );
         assert_eq!(app.status.as_deref(), Some(resume::RESUME_NONZERO_HINT));
@@ -335,7 +338,7 @@ mod tests {
             resume::NEW_SESSION_NONZERO_HINT.to_string(),
         );
 
-        assert!(app.pending_live.is_none());
+        assert!(app.modal.is_none());
         assert_eq!(
             app.status.as_deref(),
             Some(resume::NEW_SESSION_NONZERO_HINT),
