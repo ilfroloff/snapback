@@ -19,10 +19,10 @@
 //!   already torn the terminal down, so `claude` starts on a clean terminal and
 //!   the re-initialized board picks up on the next loop iteration.
 //!
-//! The pure, separable pieces — [`build_argv`], [`read_authoritative`], and the
-//! existence check in [`plan_from_parts`] — are unit tested. The impure driver
-//! ([`launch`]) performs `chdir` + spawn + wait and is kept thin over those
-//! tested helpers.
+//! The pure, separable pieces — the [`argv_for`] hand-off seam (over
+//! [`build_argv`] and its siblings), [`read_authoritative`], and the existence
+//! check in [`plan_from_parts`] — are unit tested. The impure driver ([`launch`])
+//! performs `chdir` + spawn + wait and is kept thin over those tested helpers.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -186,9 +186,68 @@ impl ResumeError {
     }
 }
 
+/// Which `claude` hand-off to build an argv for.
+///
+/// A plain tag carrying NO borrowed data, so it can ride on a modal choice and be
+/// matched by a confirm handler while the per-action inputs travel separately in
+/// [`HandoffCtx`]. The variants map one-to-one onto the internal builders
+/// [`argv_for`] delegates to: `Resume`/`Fork` → [`build_argv`], `Attach` →
+/// [`build_attach_argv`], `New` → [`build_new_argv`].
+#[derive(Debug, Clone, Copy)]
+pub enum SessionAction {
+    /// Plain resume of an existing session (`claude -r <id>`).
+    Resume,
+    /// Fork an existing session (`claude -r <id> --fork-session`).
+    Fork,
+    /// Reattach to a running agent job (`claude attach <job-id>`).
+    Attach,
+    /// Start a brand-new session (`claude [--agent <name>]`).
+    New,
+}
+
+/// The per-action inputs [`argv_for`] reads to build a hand-off's argv.
+///
+/// Each [`SessionAction`] reads ONLY the field its invocation needs — a
+/// Resume/Fork the `session_id`, an Attach the `job_id`, a New session the
+/// optional `agent` — so the `check_*` gate that owns the data fills just that one
+/// field (`..Default::default()`) and the rest stay inert (never emitted for the
+/// non-matching actions). Bundling the inputs here keeps the seam a single
+/// `(action, ctx)` call rather than widening it into a positional grab bag.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HandoffCtx<'a> {
+    /// Authoritative session id for a `Resume`/`Fork` (read from inside the file).
+    /// Defaults to `""` (an inert non-input) for the actions that never read it.
+    pub session_id: &'a str,
+    /// Short agent-view job id for an `Attach` (never the full session UUID).
+    /// Defaults to `""` (an inert non-input) for the actions that never read it.
+    pub job_id: &'a str,
+    /// Optional agent name for a `New` session; `None` (or blank) launches bare.
+    pub agent: Option<&'a str>,
+}
+
+/// Build the `claude` argv for `action`, reading the one input it needs from
+/// `ctx`.
+///
+/// The single consolidated seam every hand-off argv funnels through: the
+/// `check_*` refusal gates delegate here instead of calling the individual
+/// builders, so a plain resume, a fork, an Attach, and a New session all describe
+/// their invocation in one tested place. It stays argv-ONLY — `cwd`,
+/// `nonzero_hint`, and `race_probe_id` are the gates' responsibility, never this
+/// one's. Pure so the exact invocation per action is directly assertable.
+#[must_use]
+pub fn argv_for(action: SessionAction, ctx: &HandoffCtx) -> Vec<String> {
+    match action {
+        SessionAction::Resume => build_argv(ctx.session_id, false),
+        SessionAction::Fork => build_argv(ctx.session_id, true),
+        SessionAction::Attach => build_attach_argv(ctx.job_id),
+        SessionAction::New => build_new_argv(ctx.agent),
+    }
+}
+
 /// Build the `claude` argv for a resume (`claude -r <id>`) or fork
-/// (`claude -r <id> --fork-session`). Pure so it is directly assertable; `argv[0]`
-/// is the program to spawn.
+/// (`claude -r <id> --fork-session`). Reached through [`argv_for`]
+/// (`Resume`/`Fork`); kept a standalone pure fn so the exact invocation stays
+/// directly assertable. `argv[0]` is the program to spawn.
 #[must_use]
 pub fn build_argv(session_id: &str, fork: bool) -> Vec<String> {
     let mut argv = vec![
@@ -212,8 +271,8 @@ pub fn build_argv(session_id: &str, fork: bool) -> Vec<String> {
 /// for a full UUID. This stays a DUMB builder — it just formats whatever id it
 /// is handed; picking the authoritative short id is [`attach_job_id`]'s job. It
 /// fails soft on a stale/finished id (exit 1), so a non-zero exit surfaces a
-/// board status rather than hanging. Pure so the exact invocation is directly
-/// assertable.
+/// board status rather than hanging. Reached through [`argv_for`] (`Attach`); pure
+/// so the exact invocation is directly assertable.
 #[must_use]
 pub fn build_attach_argv(job_id: &str) -> Vec<String> {
     vec![
@@ -232,8 +291,9 @@ pub fn build_attach_argv(job_id: &str) -> Vec<String> {
 /// fresh session starts bound to that agent; when it is `None` — or `Some` of an
 /// empty/whitespace string, treated identically so a blank pick can never emit a
 /// bare `--agent` with no value — the invocation is just the program: `claude`.
-/// Pure so the exact invocation is directly assertable, and it funnels through the
-/// SAME [`launch`] round trip as every other hand-off.
+/// Reached through [`argv_for`] (`New`); pure so the exact invocation is directly
+/// assertable, and it funnels through the SAME [`launch`] round trip as every
+/// other hand-off.
 #[must_use]
 pub fn build_new_argv(agent: Option<&str>) -> Vec<String> {
     let mut argv = vec!["claude".to_string()];
@@ -347,7 +407,17 @@ pub fn check(session: &Session, fork: bool) -> Result<Ready, ResumeError> {
             session_id,
             fork,
         } => Ok(Ready {
-            argv: build_argv(&session_id, fork),
+            argv: argv_for(
+                if fork {
+                    SessionAction::Fork
+                } else {
+                    SessionAction::Resume
+                },
+                &HandoffCtx {
+                    session_id: &session_id,
+                    ..Default::default()
+                },
+            ),
             // Only a PLAIN resume can lose the liveness race — a fork of a live
             // session is expected to work, so a non-zero exit there is a genuine
             // failure and must keep the neutral hint. Deriving the flag from the
@@ -380,7 +450,13 @@ pub fn check_attach(session: &Session, agent_id: Option<&str>) -> Result<Ready, 
     let job_id = attach_job_id(agent_id).map_err(ResumeError::Refused)?;
     match plan(session, false) {
         ResumePlan::Ready { cwd, .. } => Ok(Ready {
-            argv: build_attach_argv(job_id),
+            argv: argv_for(
+                SessionAction::Attach,
+                &HandoffCtx {
+                    job_id,
+                    ..Default::default()
+                },
+            ),
             // Attach IS the live path; there is no plain resume to have lost a
             // race, so there is nothing to recover.
             race_probe_id: None,
@@ -409,7 +485,13 @@ pub fn check_new(launch_dir: &Path, agent: Option<&str>) -> Result<Ready, Resume
     if launch_dir.is_dir() {
         Ok(Ready {
             cwd: launch_dir.to_path_buf(),
-            argv: build_new_argv(agent),
+            argv: argv_for(
+                SessionAction::New,
+                &HandoffCtx {
+                    agent,
+                    ..Default::default()
+                },
+            ),
             // A brand-new session has no session id yet (claude mints one), so
             // there is nothing to probe and nothing to recover.
             race_probe_id: None,
@@ -778,6 +860,80 @@ mod tests {
         // collapses to a bare `claude`, identical to the `None` case.
         assert_eq!(build_new_argv(Some("")).join(" "), "claude");
         assert_eq!(build_new_argv(Some("   ")).join(" "), "claude");
+    }
+
+    #[test]
+    fn argv_for_resume_builds_a_plain_claude_dash_r() {
+        // The consolidated seam produces the same plain-resume invocation as the
+        // builder it delegates to, reading only `session_id` from the ctx.
+        let argv = argv_for(
+            SessionAction::Resume,
+            &HandoffCtx {
+                session_id: "abc-123",
+                ..Default::default()
+            },
+        );
+        assert_eq!(argv.join(" "), "claude -r abc-123");
+    }
+
+    #[test]
+    fn argv_for_fork_appends_fork_session() {
+        // Fork routes through the same `session_id` input, adding `--fork-session`.
+        let argv = argv_for(
+            SessionAction::Fork,
+            &HandoffCtx {
+                session_id: "abc-123",
+                ..Default::default()
+            },
+        );
+        assert_eq!(argv.join(" "), "claude -r abc-123 --fork-session");
+    }
+
+    #[test]
+    fn argv_for_attach_uses_the_short_job_id() {
+        // Attach reads `job_id` (the SHORT agent-view id), never the session id.
+        let argv = argv_for(
+            SessionAction::Attach,
+            &HandoffCtx {
+                job_id: "ca56b543",
+                ..Default::default()
+            },
+        );
+        assert_eq!(argv.join(" "), "claude attach ca56b543");
+    }
+
+    #[test]
+    fn argv_for_new_is_bare_or_agent_bound_and_guards_blank_agents() {
+        // New with no agent is the bare program; a selected agent binds via
+        // `--agent`; and the empty/whitespace guard survives the seam — a blank
+        // pick never emits a valueless `--agent`.
+        assert_eq!(
+            argv_for(SessionAction::New, &HandoffCtx::default()).join(" "),
+            "claude"
+        );
+        assert_eq!(
+            argv_for(
+                SessionAction::New,
+                &HandoffCtx {
+                    agent: Some("planner"),
+                    ..Default::default()
+                }
+            )
+            .join(" "),
+            "claude --agent planner"
+        );
+        assert_eq!(
+            argv_for(
+                SessionAction::New,
+                &HandoffCtx {
+                    agent: Some("   "),
+                    ..Default::default()
+                }
+            )
+            .join(" "),
+            "claude",
+            "a blank agent pick must never emit a bare --agent through the seam"
+        );
     }
 
     #[test]

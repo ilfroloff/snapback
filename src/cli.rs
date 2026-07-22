@@ -31,6 +31,7 @@ KEYS:
     ←/→           fold / expand a fork lineage (a row marked (+N) stands for more)
     Ctrl-F        fork          Ctrl-N       new session in the launch dir (pick an agent)
     Ctrl-A        toggle scope  Ctrl-/       toggle preview
+    Ctrl-X        leader chord: x hide · d delete · h show/hide hidden
     Tab           toggle name / name+content search
     PgUp/PgDn     preview page  Ctrl-U/Ctrl-D  preview quarter-page
     Home/End      preview top / bottom

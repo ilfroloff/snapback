@@ -27,6 +27,20 @@ one place.
 - **SUBAGENT EXCLUSION BY DEPTH.** Discover only `<root>/<cwd>/<id>.jsonl` at
   depth 2; NEVER descend into `<id>/subagents/`. Do not make discovery
   recursive. (`src/store/discover.rs`)
+- **SNAPBACK-OWNED STATE.** The ONLY persistent state `snapback` writes is the
+  hidden-session id set. It lives under `$SNAPBACK_CONFIG_DIR` (default
+  `~/.config/snapback`), specifically the `state/` subdir — resolved by the
+  `config` module, the SINGLE place that reads the environment for any
+  snapback-owned path — NEVER inside the read-only `~/.claude/projects` store.
+  Read + write are FAIL-SOFT (a missing or garbage file ⇒ an empty set, never a
+  panic) and the write is ATOMIC (temp file + rename). Hiding is a VISIBILITY
+  preference, not a status flag. (`src/config.rs`; `src/hidden.rs`; the persist
+  path in `src/tui/app.rs`)
+- **STORE WRITES ARE GATED.** The ONLY mutation of `~/.claude/projects` is hard
+  delete (`Ctrl-X d`), behind BOTH a confirmation modal AND the pure `can_delete`
+  live-session guard (never unlink a file `claude` is writing). It removes ONLY
+  the selected id's own `<id>.jsonl` + sibling `<id>/` dir; everything else stays
+  read-only. (`src/delete.rs`; `confirm_delete` in `src/tui/update.rs`)
 - **TERMINAL SAFETY.** Resume/fork/attach SPAWN `claude` as a child and RETURN
   to the board — never replace the process image. Restore the terminal (raw
   mode + alt screen + mouse capture) on EVERY exit: quit, error, hand-off, and

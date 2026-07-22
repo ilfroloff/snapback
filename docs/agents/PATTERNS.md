@@ -36,6 +36,16 @@ The JSONL format is external and undocumented, so treat every read as hostile:
   list — never a panic. The frontmatter is hand-parsed (no YAML crate) to keep the
   crate dependency-free, exactly like the hand-rolled markdown pass in
   `store::preview`.
+- **Reading is the default, but not the whole story.** `snapback` is
+  overwhelmingly a reader of a hostile external store, and the Claude store stays
+  read-only save for the one gated hard delete. It does, though, have exactly one
+  file of its OWN — the hidden-session id set (`hidden::load_hidden`) — and that
+  read gets the identical fail-soft discipline: a missing file or an unparseable
+  line collapses to an empty set, never a panic, and its write is atomic (temp +
+  rename) so a crashed write can never leave a half-file that fails the next read.
+  The two write postures (owned state; gated store mutation) are the AGENTS.md
+  critical rules; their store/layout mechanism is in
+  [DOMAIN.md](DOMAIN.md#snapback-owned-state-srchiddenrs).
 
 ## 2. Authoritative-from-file
 
@@ -314,12 +324,16 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    search never blocks navigation).
 2. `apply_action` mutates the `App` and returns an `Outcome`
    (`Continue`/`Quit`/`Resume`).
-3. Modal state owns the keyboard: the running-session overlay via `pending_live`
-   + its `live_choice_key` machine, and the new-session agent picker via
-   `pending_agent` + its `agent_pick_key` machine (`handle_event` checks each in
-   turn before the board). Both are guarded the same way — `App::overlay_active`
-   gates mouse actions (splitter drag / link open) so neither fires while a modal
-   is up. A mouse wheel is handled **before** and **independent of** those gates.
+3. Modal state owns the keyboard: ONE `App.modal: Option<Modal>` serves every
+   overlay — the running-session choice, the new-session agent picker, and the
+   hard-delete confirm — through the generic `modal_key` → `confirm_modal`
+   machine, dispatching each choice's `ModalAction` tag (`Row` layout binds the
+   horizontal keys, `List` does not). The `Ctrl-X` leader chord is a second
+   keyboard owner: while `App.pending_chord` is set, `chord_key` routes the next
+   key (`x` hide, `d` delete-confirm, `h` show-hidden, anything else cancels).
+   `App::overlay_active` (`modal.is_some() || pending_chord`) gates mouse actions
+   (splitter drag / link open) so none fires while either is up. A mouse wheel is
+   handled **before** and **independent of** that gate.
 
 Add a keybinding by extending the `Action` enum + `key_to_action` + `apply_action`
 and covering it with a `key_to_action` unit test. Keep the doc-comment key table

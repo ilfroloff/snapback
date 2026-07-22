@@ -102,6 +102,7 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | `Enter` | **Resume** the selected session, returning to the board when it exits. On a **running** session it opens an **Attach / Fork / Cancel** choice instead |
 | `Ctrl-F` | **Fork** the selected session into a copy — available for any session, running or not |
 | `Ctrl-N` | **Start a new session** in the launch directory; if you have Claude Code agents defined, pick one first (or `default (no agent)`) |
+| `Ctrl-X` then `x` / `d` / `h` | **Leader chord** for hide & delete — `x` **hides** the selected session (reversible, persisted), `d` **hard-deletes** it after a confirmation, `h` toggles **show hidden**. Any other key cancels the chord |
 | `Tab` | Toggle search: **name-only ↔ name+content** |
 | `Ctrl-A` | Toggle scope: **current folder ↔ all folders** |
 | `Ctrl-/` | Toggle the transcript **preview** pane |
@@ -197,6 +198,29 @@ background can't be plain-resumed, so the older copy is often the one that
 folder you launched from. If you keep Claude Code agents defined, it offers a
 quick picker so the new session can start bound to one, and it remembers your
 last pick for the session so a repeat is just `Ctrl-N`, `Enter`.
+
+**Hide & delete.** `Ctrl-X` is a leader chord for trimming the board: press it,
+and a hint shows the follow-ups — `x`, `d`, `h` — while any other key cancels.
+
+- `Ctrl-X x` **hides** the selected session. This is the reversible default: the
+  session stays on disk, it just drops off the board. The hidden set is
+  remembered across restarts, so a session you hide stays hidden next time. Press
+  `Ctrl-X x` again on a revealed row to un-hide it.
+- `Ctrl-X h` **toggles showing hidden sessions**. Hidden rows come back dimmed and
+  marked `[hidden]`, still carrying their live badge if their agent is running —
+  hiding is a visibility choice, not a claim that a session is finished.
+- `Ctrl-X d` **hard-deletes** the selected session — physically removing its
+  transcript from disk. Because that is irreversible, it asks first with a
+  confirmation prompt (defaulted to Cancel), and it refuses a session whose agent
+  is currently running rather than pull a file out from under it. Deletion removes
+  exactly that session's own `<id>.jsonl` and its sibling `<id>/` directory of
+  subagent transcripts — nothing else.
+
+Hiding is the only thing snapback ever writes for itself. The list of hidden
+session ids lives in its own config directory —
+`$SNAPBACK_CONFIG_DIR/state/hidden_sessions` if you set `SNAPBACK_CONFIG_DIR`,
+otherwise `~/.config/snapback/state/hidden_sessions` — never inside the Claude
+Code session store, which snapback otherwise only reads.
 
 **Readable transcript preview.** `Ctrl-/` opens a preview of the selected
 session rendered as clean, scrollable markdown — the real conversation, so you

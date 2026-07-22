@@ -185,6 +185,7 @@ to create and approve pull requests" setting. Publishing to npm needs an
 | Var | Default | Effect |
 | --- | --- | --- |
 | `CLAUDE_PROJECTS_DIR` | `~/.claude/projects` | Overrides the session store root (used by both the TUI and `--print-list`). |
+| `SNAPBACK_CONFIG_DIR` | `~/.config/snapback` | Overrides snapback's OWN config dir (the single env-resolved root for snapback-owned paths; state lives in its `state/` subdir). Resolved only by the `config` module. |
 
 ## Hidden debug mode
 
