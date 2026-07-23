@@ -11,9 +11,12 @@
 //!
 //! * **[`reported_agents`] — `--json --all` — the BOARD's signal.** Polled ~1s
 //!   off-thread; drives badges, colors, the pulse and the preview banner via
-//!   [`classify`]. `--all` is what makes [`AgentActivity::Done`] observable at
-//!   all: the bare command reports only currently-active agents, so without it a
-//!   session that just wrapped up renders as though claude had never heard of it.
+//!   [`classify`]. The bare command lists currently-active agents AND recently
+//!   finished ones (claude keeps a `done` background job in the active list for a
+//!   while before reaping it), so a just-wrapped-up session is briefly observable
+//!   without `--all`. What `--all` adds is the FULL history — every `done` agent,
+//!   including those already reaped from the active list — so a finished session
+//!   keeps its badge instead of vanishing the moment claude drops it.
 //! * **[`live_agents`] — `--json`, NO `--all` — the HAND-OFF's signal.** A
 //!   one-shot probe at hand-off; MEMBERSHIP in what it returns is liveness,
 //!   structurally, because the bare command IS claude's active list. It returns
@@ -80,14 +83,19 @@ const QUALIFIER_BUSY: &str = "busy";
 
 /// The `state`/`status` value for an agent that has REPORTED completion.
 ///
-/// Observable ONLY under `--all` (the bare `claude agents --json` reports just
-/// the currently-active agents), which is precisely why [`agents_argv`] passes
-/// it.
+/// A just-finished agent is briefly visible in the bare `claude agents --json`
+/// too (claude keeps a `done` background job in the active list for a while before
+/// reaping it), but `--all` is what keeps EVERY `done` agent observable — including
+/// those already reaped — so the board does not lose a finished session's badge the
+/// moment claude drops it. That is why [`agents_argv`] passes `--all`.
 ///
 /// It means the agent SAID it finished — NOT that claude will permit `-r`. Those
 /// two can disagree transiently, and claude is the authority on its own refusal,
-/// so this value colors a BADGE and never gates the resume: the gate asks
-/// [`live_agents`] instead.
+/// so this value colors a BADGE and never gates a hand-off: the gates ask
+/// [`live_agents`] instead. That membership is what matters — a just-`done`
+/// background job is STILL a registered agent (until reaped), so `claude -p -r`
+/// refuses it exactly like a working one, and the quick-reply gate refuses it too
+/// (see [`crate::send::gate_send`]); its `done` state changes nothing.
 const QUALIFIER_DONE: &str = "done";
 
 /// User-facing copy for [`AgentActivity::NeedsInput`] — the ONE translated
@@ -355,11 +363,11 @@ fn agents_argv_base() -> Vec<String> {
 /// test suite never does). [`reported_agents`] builds its `Command` from this and
 /// nothing else, so the flags are pinned by `agents_argv_is_claude_agents_json_all`.
 ///
-/// [`AGENTS_ALL_FLAG`] is what makes [`AgentActivity::Done`] observable AT ALL —
-/// the bare command reports only the currently-active agents, so dropping it
-/// silently erases the finished bucket and a session that just wrapped up renders
-/// as though claude had never heard of it. It is not a nicety; it is the flag the
-/// `done` badge exists on.
+/// [`AGENTS_ALL_FLAG`] is what keeps the `done` bucket RELIABLY observable — the
+/// bare command lists a finished job only until claude reaps it from the active
+/// list, so dropping the flag would make a session's `done` badge vanish the moment
+/// claude drops it. It is not a nicety; it is the flag the durable `done` badge
+/// exists on.
 #[must_use]
 fn agents_argv() -> Vec<String> {
     let mut argv = agents_argv_base();
@@ -733,13 +741,13 @@ mod tests {
     /// suite never does) — the same way `resume`'s hand-off argvs are pinned.
     ///
     /// `--all` is the load-bearing half and the reason this test exists: the bare
-    /// command reports only the CURRENTLY-ACTIVE agents, so dropping the flag
-    /// makes `AgentActivity::Done` unobservable — no `done` record ever reaches
-    /// `classify`, and a just-finished session silently loses its badge and its
-    /// banner. Every `done` assertion in this module would still pass, because
-    /// they feed `classify` synthetic agents rather than the wire; only this
-    /// assertion sees the flag. `--json` is pinned alongside it because the human
-    /// table it otherwise prints is not what `parse_agents_json` reads.
+    /// command drops a finished job once claude reaps it from the active list, so
+    /// without the flag a `done` session's badge and banner vanish the moment it is
+    /// reaped — the `done` bucket stops RELIABLY reaching `classify`. Every `done`
+    /// assertion in this module would still pass, because they feed `classify`
+    /// synthetic agents rather than the wire; only this assertion sees the flag.
+    /// `--json` is pinned alongside it because the human table it otherwise prints
+    /// is not what `parse_agents_json` reads.
     #[test]
     fn agents_argv_is_claude_agents_json_all() {
         assert_eq!(

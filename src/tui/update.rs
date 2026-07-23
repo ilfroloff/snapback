@@ -21,6 +21,7 @@
 //! | `Enter` | resume the selected session |
 //! | `Ctrl-F` | fork-resume the selected session |
 //! | `Ctrl-N` | start a new session in the launch directory (pick an agent when any are defined) |
+//! | `Ctrl-R` | quick-reply: send a one-shot message to the selected session without leaving the board (a finished/waiting background agent is stopped first so the reply can land in place) |
 //! | `Tab` | toggle name-only vs. name+content search |
 //! | `Ctrl-A` | toggle scope (current-folder <-> all) |
 //! | `Ctrl-X` then `x`/`d`/`h` | leader chord: hide / hard-delete / toggle show-hidden (any other key cancels) |
@@ -48,11 +49,12 @@ use ratatui::layout::{Position, Rect};
 use crate::defined_agents;
 use crate::delete;
 use crate::resume::{self, Ready};
+use crate::send::{self, ReplyGate, SendRequest};
 use crate::store::SessionStore;
 use crate::watch::AppEvent;
 
 use super::app::{App, ModalAction, ModalLayout};
-use super::view;
+use super::{compose, view};
 
 /// A decoded intent from a single keypress.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +83,11 @@ pub enum Action {
     /// the `claude` hand-off are decided there and a confirmed plan surfaces as
     /// [`Outcome::Resume`].
     NewSession,
+    /// Open the quick-reply compose zone for the selected session (`Ctrl-R`).
+    /// [`apply_action`] runs the live-session gate first — a LIVE session is
+    /// refused (sending in place would branch its transcript) — and only opens the
+    /// compose modal for an idle one.
+    Reply,
     /// Toggle name-only vs. name+content search.
     ToggleSearchMode,
     /// Toggle current-folder vs. all scope.
@@ -127,6 +134,14 @@ pub enum Outcome {
     /// Tear down the terminal and spawn `claude` for this confirmed plan, then
     /// return to the board.
     Resume(Ready),
+    /// Fire a one-shot quick-reply send on a detached thread and KEEP running —
+    /// the board never tears down. Handled inline by [`crate::tui::run`] (which
+    /// owns the event channel the send reports back on), so unlike
+    /// [`Resume`](Self::Resume) it never propagates out to the process driver.
+    /// Carried as data (rather than spawned in the handler) so the send DECISION
+    /// stays pure and unit-testable, the way [`Resume`](Self::Resume) carries a
+    /// confirmed [`Ready`].
+    Send(SendRequest),
 }
 
 /// Map a keypress to an [`Action`]. `query_empty` disambiguates the `j`/`k`/`q`
@@ -145,6 +160,7 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool) -> Action {
             KeyCode::Char('/') | KeyCode::Char('_') => Action::TogglePreview,
             KeyCode::Char('a') | KeyCode::Char('A') => Action::ToggleScope,
             KeyCode::Char('n') | KeyCode::Char('N') => Action::NewSession,
+            KeyCode::Char('r') | KeyCode::Char('R') => Action::Reply,
             KeyCode::Char('c') | KeyCode::Char('C') => Action::Quit,
             // Ctrl-X (0x18 CAN) is the hide/delete leader chord. Unbound and
             // terminal-safe — unlike Ctrl-H/I/M, which alias Backspace/Tab/Enter.
@@ -217,6 +233,18 @@ pub fn handle_event(app: &mut App, event: AppEvent, root: &Path) -> Outcome {
             if app.pending_chord {
                 return handle_chord_key(app, key);
             }
+            // The "stop the waiting agent?" confirmation owns the keyboard until it
+            // resolves into compose (Enter) or is dismissed (Esc).
+            if app.pending_stop.is_some() {
+                return handle_stop_confirm_key(app, key);
+            }
+            // The quick-reply compose zone owns the keyboard while open: every key
+            // routes to the compose handler (Enter sends, Ctrl-J/Alt+Enter add a
+            // newline, Esc cancels, the rest edit the buffer), bypassing
+            // `key_to_action` entirely — mirroring the two overlays above.
+            if app.is_composing() {
+                return compose::handle_compose_key(app, key);
+            }
             // A transient status (e.g. a resume refusal) lives exactly until the
             // next key; clear it first so this keypress may set a fresh one.
             app.clear_status();
@@ -240,6 +268,25 @@ pub fn handle_event(app: &mut App, event: AppEvent, root: &Path) -> Outcome {
         AppEvent::ReportedAgents(agents) => {
             // Delivered off-thread by the agents poller; just swap the map in.
             app.set_reported_agents(agents);
+            Outcome::Continue
+        }
+        AppEvent::SendFinished { session_id, status } => {
+            // A one-shot quick-reply send completed off-thread. Clear the in-flight
+            // indicator (if this is the send it was tracking) and surface the mapped
+            // result (cost / error) on the status line.
+            if app.sending.as_deref() == Some(session_id.as_str()) {
+                app.sending = None;
+            }
+            if let Some(status) = status {
+                app.set_status(status);
+            }
+            // If the finished send targets the row on screen, re-anchor the
+            // preview to the newest turn so the reply — arriving via the separate
+            // `SessionsChanged` reload — lands in view. The reply body itself is
+            // NOT read here; the watcher → reload → preview path renders it.
+            if app.selected.as_deref() == Some(session_id.as_str()) {
+                app.preview_bottom();
+            }
             Outcome::Continue
         }
         AppEvent::Tick => {
@@ -478,6 +525,7 @@ fn apply_action(app: &mut App, action: Action) -> Outcome {
             }
         }
         Action::NewSession => new_session(app),
+        Action::Reply => reply(app),
         Action::ToggleSearchMode => {
             app.toggle_search_mode();
             Outcome::Continue
@@ -820,6 +868,58 @@ fn new_session(app: &mut App) -> Outcome {
     Outcome::Continue
 }
 
+/// Handle `Ctrl-R` (quick reply). Ask claude what it is holding the SELECTED
+/// session as, one-shot, then route via [`send::reply_gate`].
+///
+/// `claude -p -r <id>` refuses to resume a session registered as a live agent, but
+/// `claude stop <job-id>` deregisters the job (keeping the conversation) so the
+/// reply can then land in place. Stopping is only safe when nothing is running, so:
+///
+/// * not held → open compose, reply in place;
+/// * `done` → open compose in stop-then-reply mode (stopping a finished job is
+///   harmless);
+/// * `needs input` → CONFIRM first ([`App::open_stop_confirm`]) — stopping abandons
+///   a waiting agent — then compose;
+/// * `working`/`idle`/unstoppable → refuse ([`send::SEND_LIVE_REFUSED`]).
+///
+/// The probe is the SAME authoritative bare read the resume gate uses
+/// ([`App::live_agent_now`]) — never the polled `--all` map — a one-shot at a
+/// hand-off (the documented OFF-UI-THREAD exception, PATTERNS.md §6). The id is
+/// cloned so the `&Session` borrow ends before the probe and the app mutations.
+fn reply(app: &mut App) -> Outcome {
+    let Some(id) = app.selected_session().map(|s| s.session_id.clone()) else {
+        return Outcome::Continue;
+    };
+    match send::reply_gate(app.live_agent_now(&id).as_ref()) {
+        ReplyGate::Reply => compose::open(app, id, None),
+        ReplyGate::StopThenReply { job_id } => compose::open(app, id, Some(job_id)),
+        ReplyGate::ConfirmStopThenReply { job_id } => app.open_stop_confirm(id, job_id),
+        ReplyGate::Refuse(message) => app.set_status(message),
+    }
+    Outcome::Continue
+}
+
+/// Apply a keypress while the "stop the waiting agent?" confirmation is open.
+///
+/// `Enter` confirms — the waiting agent is stopped as part of the send — so it
+/// resolves the confirmation into compose in stop-then-reply mode; `Esc`/`Ctrl-C`
+/// dismiss and return to the board. Any other key is ignored: this is a deliberate
+/// confirmation, not a fat-finger.
+fn handle_stop_confirm_key(app: &mut App, key: KeyEvent) -> Outcome {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Enter => {
+            if let Some(pending) = app.pending_stop.take() {
+                compose::open(app, pending.session_id, Some(pending.job_id));
+            }
+        }
+        KeyCode::Esc => app.stop_confirm_cancel(),
+        KeyCode::Char('c' | 'C') if ctrl => app.stop_confirm_cancel(),
+        _ => {}
+    }
+    Outcome::Continue
+}
+
 /// Run the new-session existence gate for `agent` (`None` = no agent) while the
 /// terminal is still up, and escalate a confirmed plan to [`Outcome::Resume`]; a
 /// refusal (a deleted launch dir) sets a transient board status. Shared by the
@@ -1001,6 +1101,53 @@ mod tests {
         )
     }
 
+    fn press_ctrl(app: &mut App, code: KeyCode) -> Outcome {
+        handle_event(
+            app,
+            AppEvent::Input(Event::Key(ctrl(code))),
+            Path::new("/tmp"),
+        )
+    }
+
+    /// A real resumable session file (existing in-file cwd) so `send::plan_send`
+    /// reaches `Ready` at Send time. Returns the `Session` and its temp cwd to
+    /// clean up.
+    fn resumable_session_for_send() -> (Session, PathBuf) {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is after the unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "snapback-update-send-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp cwd");
+        let id = "sess-send-e2e";
+        let file = dir.join(format!("{id}.jsonl"));
+        std::fs::write(
+            &file,
+            format!(
+                r#"{{"type":"user","sessionId":"{id}","cwd":"{cwd}","message":{{"role":"user","content":"hi"}}}}"#,
+                id = id,
+                cwd = dir.display(),
+            ),
+        )
+        .expect("write the resumable fixture");
+        let session = Session {
+            file,
+            session_id: id.to_string(),
+            cwd: dir.clone(),
+            git_branch: None,
+            timestamp: None,
+            repo: "repo".to_string(),
+            label: "e2e".to_string(),
+            root_uuid: None,
+            msg_count: 0,
+            content_index: String::new(),
+        };
+        (session, dir)
+    }
+
     fn mouse_ev(kind: MouseEventKind, col: u16, row: u16) -> MouseEvent {
         MouseEvent {
             kind,
@@ -1016,6 +1163,324 @@ mod tests {
             AppEvent::Input(Event::Mouse(mouse_ev(kind, col, row))),
             Path::new("/tmp"),
         )
+    }
+
+    // --- quick reply (Ctrl-R): gate, compose routing, send, completion ----
+
+    /// Ctrl-R on an IDLE session opens the compose zone (force-showing the preview
+    /// and targeting the selected session); on a LIVE session it refuses with the
+    /// hint and opens nothing.
+    #[test]
+    fn ctrl_r_opens_compose_on_idle_and_refuses_a_live_session() {
+        // Idle: compose opens and force-shows the preview.
+        let mut app = app_with("idle", None);
+        app.show_preview = false; // prove Reply force-shows it
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        assert!(
+            app.is_composing(),
+            "Ctrl-R on an idle session opens compose"
+        );
+        assert!(app.show_preview, "opening compose force-shows the preview");
+        assert_eq!(
+            app.compose.as_ref().map(|c| c.target_session_id.as_str()),
+            Some("idle"),
+            "compose targets the selected session"
+        );
+
+        // Live: refuse with the hint, open nothing (sending in place would branch).
+        let mut app = app_with("live-1", Some("background"));
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        assert!(!app.is_composing(), "Ctrl-R must refuse a live session");
+        assert_eq!(app.status.as_deref(), Some(send::SEND_LIVE_REFUSED));
+    }
+
+    /// Ctrl-R routes by the held agent's state: not held → reply; `done` → compose
+    /// in stop-then-reply mode; `needs input` → the stop confirmation first;
+    /// `working`/`idle` → refuse. Stopping a job first is what lets `-p -r` land.
+    #[test]
+    fn ctrl_r_routes_by_agent_state() {
+        // Seed claude's ACTIVE (bare) list with a background agent of a given state,
+        // carrying the short job id `claude stop` would target.
+        fn held(id: &str, state: &str) -> HashMap<String, ReportedAgent> {
+            let mut map = HashMap::new();
+            map.insert(
+                id.to_string(),
+                ReportedAgent {
+                    kind: "background".to_string(),
+                    id: Some("job-x".to_string()),
+                    state: Some(state.to_string()),
+                    status: None,
+                    name: None,
+                },
+            );
+            map
+        }
+        let app_for = |id: &str, state: &str| {
+            let mut app = App::new(vec![session(id)], Scope::All, PathBuf::from("/tmp"));
+            let live = held(id, state);
+            app.set_live_probe(move || live.clone());
+            app
+        };
+
+        // done -> compose opens straight away, in stop-then-reply mode.
+        let mut app = app_for("done-1", "done");
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        assert!(app.is_composing(), "a done agent goes straight to compose");
+        assert_eq!(
+            app.compose.as_ref().and_then(|c| c.stop_job.as_deref()),
+            Some("job-x"),
+            "compose carries the job id to stop first"
+        );
+        assert!(app.pending_stop.is_none());
+
+        // needs input -> the stop confirmation, NOT compose yet.
+        for waiting in ["blocked", "waiting"] {
+            let mut app = app_for("wait-1", waiting);
+            press_ctrl(&mut app, KeyCode::Char('r'));
+            assert!(
+                !app.is_composing(),
+                "{waiting:?} must confirm before composing"
+            );
+            let pending = app
+                .pending_stop
+                .as_ref()
+                .expect("a waiting agent opens the stop confirmation");
+            assert_eq!(pending.session_id, "wait-1");
+            assert_eq!(pending.job_id, "job-x");
+        }
+
+        // working / idle -> refuse outright.
+        for busy in ["working", "idle"] {
+            let mut app = app_for("busy-1", busy);
+            press_ctrl(&mut app, KeyCode::Char('r'));
+            assert!(!app.is_composing(), "{busy:?} must refuse");
+            assert!(app.pending_stop.is_none());
+            assert_eq!(app.status.as_deref(), Some(send::SEND_LIVE_REFUSED));
+        }
+
+        // Not held at all -> a plain in-place reply (no stop).
+        let mut app = App::new(vec![session("free-1")], Scope::All, PathBuf::from("/tmp"));
+        app.set_live_probe(HashMap::new);
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        assert!(
+            app.is_composing(),
+            "an unheld session is replyable in place"
+        );
+        assert_eq!(
+            app.compose.as_ref().and_then(|c| c.stop_job.as_deref()),
+            None,
+            "a plain reply carries no stop job"
+        );
+    }
+
+    /// Confirming the stop prompt (`Enter`) opens compose in stop-then-reply mode;
+    /// `Esc` dismisses it and composes nothing.
+    #[test]
+    fn stop_confirmation_enter_composes_and_esc_cancels() {
+        fn waiting(id: &str) -> HashMap<String, ReportedAgent> {
+            let mut map = HashMap::new();
+            map.insert(
+                id.to_string(),
+                ReportedAgent {
+                    kind: "background".to_string(),
+                    id: Some("job-y".to_string()),
+                    state: Some("blocked".to_string()),
+                    status: None,
+                    name: None,
+                },
+            );
+            map
+        }
+
+        // Enter -> compose opens carrying the job id; the confirmation closes.
+        let mut app = App::new(vec![session("w")], Scope::All, PathBuf::from("/tmp"));
+        let live = waiting("w");
+        app.set_live_probe(move || live.clone());
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        assert!(app.pending_stop.is_some());
+        press(&mut app, KeyCode::Enter);
+        assert!(app.pending_stop.is_none(), "confirming closes the prompt");
+        assert!(app.is_composing(), "confirming opens compose");
+        assert_eq!(
+            app.compose.as_ref().and_then(|c| c.stop_job.as_deref()),
+            Some("job-y")
+        );
+
+        // Esc -> dismiss, compose nothing.
+        let mut app = App::new(vec![session("w")], Scope::All, PathBuf::from("/tmp"));
+        let live = waiting("w");
+        app.set_live_probe(move || live.clone());
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        assert!(app.pending_stop.is_some());
+        press(&mut app, KeyCode::Esc);
+        assert!(app.pending_stop.is_none(), "Esc dismisses the prompt");
+        assert!(!app.is_composing(), "Esc composes nothing");
+    }
+
+    /// While composing, ordinary keys edit the buffer, Ctrl-J inserts a newline,
+    /// and Esc cancels compose (never the app).
+    #[test]
+    fn composing_routes_keys_to_the_buffer_and_esc_cancels_only_compose() {
+        let mut app = app_with("idle", None);
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        assert!(app.is_composing());
+
+        // Type "hi", a Ctrl-J newline, then "x".
+        press(&mut app, KeyCode::Char('h'));
+        press(&mut app, KeyCode::Char('i'));
+        press_ctrl(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('x'));
+        let text = app
+            .compose
+            .as_ref()
+            .expect("still composing")
+            .textarea
+            .lines()
+            .join("\n");
+        assert_eq!(
+            text, "hi\nx",
+            "keys edit the buffer and Ctrl-J splits the line"
+        );
+
+        // Esc dismisses compose and keeps the app running (does NOT quit).
+        let outcome = press(&mut app, KeyCode::Esc);
+        assert!(
+            matches!(outcome, Outcome::Continue),
+            "Esc cancels compose, not the app"
+        );
+        assert!(!app.is_composing(), "Esc closes the compose zone");
+    }
+
+    /// The caret MOVES while composing: an arrow key repositions the cursor, so a
+    /// following insert lands there rather than at the end. This pins the fix for
+    /// forwarding via the editor's FULL `input` handler — `input_without_shortcuts`
+    /// drops cursor movement, so with it the caret is stuck and this reads "abX".
+    #[test]
+    fn composing_arrow_keys_move_the_caret() {
+        let mut app = app_with("idle", None);
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Char('b'));
+        press(&mut app, KeyCode::Left); // caret between a and b
+        press(&mut app, KeyCode::Char('X'));
+        let text = app
+            .compose
+            .as_ref()
+            .expect("still composing")
+            .textarea
+            .lines()
+            .join("\n");
+        assert_eq!(
+            text, "aXb",
+            "Left must move the caret so the insert lands between a and b"
+        );
+    }
+
+    /// A non-empty compose Send re-reads the authoritative id from the file, builds
+    /// the send argv, sets the "sending…" status, closes compose, and returns
+    /// `Outcome::Send` for the driver to spawn — the board never tears down.
+    #[test]
+    fn sending_a_compose_returns_a_send_request_and_clears_compose() {
+        let (session, dir) = resumable_session_for_send();
+        let mut app = App::new(vec![session], Scope::All, dir.clone());
+        seed_live(&mut app, &[]);
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        press(&mut app, KeyCode::Char('h'));
+        press(&mut app, KeyCode::Char('i'));
+
+        let outcome = press(&mut app, KeyCode::Enter);
+        let Outcome::Send(req) = outcome else {
+            panic!("Send must escalate to Outcome::Send");
+        };
+        assert_eq!(req.session_id, "sess-send-e2e");
+        assert_eq!(
+            req.argv.join(" "),
+            "claude -p -r sess-send-e2e --output-format json hi"
+        );
+        assert_eq!(req.cwd, dir, "the child runs in the authoritative cwd");
+        assert!(!app.is_composing(), "compose closes on send");
+        assert_eq!(app.status.as_deref(), Some(send::SEND_IN_FLIGHT));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An empty / whitespace Send is a no-op: compose stays open with a nudge, and
+    /// nothing is dispatched.
+    #[test]
+    fn sending_an_empty_compose_keeps_composing_and_sends_nothing() {
+        let mut app = app_with("idle", None);
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        let outcome = press(&mut app, KeyCode::Enter);
+        assert!(
+            matches!(outcome, Outcome::Continue),
+            "an empty send must not dispatch"
+        );
+        assert!(app.is_composing(), "compose stays open on an empty send");
+    }
+
+    /// Task 5.4: a finished send for the SELECTED session re-anchors the preview to
+    /// the newest turn, and that survives the `SessionsChanged` reload that brings
+    /// the reply in — so the reply lands in view. It also shows the mapped result.
+    #[test]
+    fn a_finished_send_reanchors_the_previewed_session_and_survives_reload() {
+        let mut app = app_with("s", None);
+        // The user scrolled up while the send was in flight (follow-bottom off).
+        app.preview_top();
+        assert!(!app.preview_follow_bottom);
+
+        handle_event(
+            &mut app,
+            AppEvent::SendFinished {
+                session_id: "s".to_string(),
+                status: Some("sent — $0.0136".to_string()),
+            },
+            Path::new("/tmp"),
+        );
+        assert!(
+            app.preview_follow_bottom,
+            "a finished send re-anchors the previewed row to the newest turn"
+        );
+        assert_eq!(
+            app.status.as_deref(),
+            Some("sent — $0.0136"),
+            "the mapped result shows on the status line"
+        );
+
+        // A reload that preserves the selection must keep the re-anchor, so the
+        // reply renders bottom-anchored.
+        app.apply_sessions(vec![session("s")]);
+        assert!(
+            app.preview_follow_bottom,
+            "the reload must not drop the re-anchor"
+        );
+    }
+
+    /// A finished send for an OFF-SCREEN session shows its status but leaves the
+    /// viewed transcript's scroll alone.
+    #[test]
+    fn a_finished_send_for_another_session_does_not_touch_the_view() {
+        let mut app = App::new(
+            vec![session("a"), session("b")],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
+        app.preview_top(); // follow-bottom off, viewing "a"
+        let selected = app.selected.clone();
+
+        handle_event(
+            &mut app,
+            AppEvent::SendFinished {
+                session_id: "b".to_string(),
+                status: Some("sent".to_string()),
+            },
+            Path::new("/tmp"),
+        );
+        assert_eq!(app.selected, selected, "selection is unchanged");
+        assert!(
+            !app.preview_follow_bottom,
+            "a send to an off-screen session must not re-anchor the view"
+        );
+        assert_eq!(app.status.as_deref(), Some("sent"));
     }
 
     // --- mouse wheel: hit-test routing + preview scroll clamps -------------

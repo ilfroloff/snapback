@@ -32,6 +32,10 @@ KEYS:
     Ctrl-F        fork          Ctrl-N       new session in the launch dir (pick an agent)
     Ctrl-A        toggle scope  Ctrl-/       toggle preview
     Ctrl-X        leader chord: x hide · d delete · h show/hide hidden
+    Ctrl-R        quick reply — send a one-shot message to the selected session
+                  without leaving the board; a finished/waiting background agent
+                  is stopped first so the reply lands in place (Enter sends,
+                  Ctrl-J or Alt+Enter newline, Esc cancels)
     Tab           toggle name / name+content search
     PgUp/PgDn     preview page  Ctrl-U/Ctrl-D  preview quarter-page
     Home/End      preview top / bottom

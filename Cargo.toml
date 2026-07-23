@@ -31,6 +31,14 @@ description = "Browse, search, and resume Claude Code sessions from a ratatui TU
 ratatui = "=0.30.2"
 # Terminal control + input events (matches the crossterm backend used by ratatui 0.30).
 crossterm = "=0.29.0"
+# Multiline text editor widget for the quick-reply compose zone. DEFAULT features
+# only (its `crossterm` feature, so `From<crossterm::KeyEvent> for Input` is
+# available and it renders on the same backend); the optional `search` feature —
+# which would pull `regex` — is intentionally NOT enabled (no regex in the tree).
+# Exact-pin because it is pre-1.0 (0.9.2 caret-unifies with the modular
+# ratatui-core 0.1.x stack). All `ratatui_textarea` references stay confined to
+# src/tui/compose.rs (+ the `App::compose` field), the way nucleo lives in search.
+ratatui-textarea = "=0.9.2"
 # Substring matcher (AtomKind::Substring in code, never fuzzy). Backs the
 # HIGHLIGHT seam only -- the per-keystroke filter is memchr below. Pinned exact;
 # all nucleo calls isolated in src/search.rs.

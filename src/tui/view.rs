@@ -32,17 +32,46 @@ use super::app::{resolve_list_width, App, Modal, ModalChoice, ModalLayout, Row, 
 /// `ListState`) can be written back into the model, keeping scroll preserved
 /// across reloads, and so the preview text can be lazily rendered + cached.
 pub fn render(frame: &mut Frame, app: &mut App) {
-    // header (1) | body (fill) | search (1) | help (1)
-    let [header_area, body_area, search_area, help_area] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Fill(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .areas(frame.area());
+    let area = frame.area();
+    // A docked compose zone lives INSIDE the preview pane (no extra top-level row);
+    // only when the pane is too short does compose claim a full-width bottom bar
+    // between the body and the search line.
+    let (header_area, body_area, compose_bar, search_area, help_area) =
+        if compose_uses_bottom_bar(app.is_composing(), area.height) {
+            // header (1) | body (fill) | compose bar (grows with the draft) | search (1) | help (1)
+            let [header_area, body_area, compose_area, search_area, help_area] =
+                Layout::vertical([
+                    Constraint::Length(1),
+                    Constraint::Fill(1),
+                    Constraint::Length(compose_zone_height(app, area.width)),
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                ])
+                .areas(area);
+            (
+                header_area,
+                body_area,
+                Some(compose_area),
+                search_area,
+                help_area,
+            )
+        } else {
+            // header (1) | body (fill) | search (1) | help (1)
+            let [header_area, body_area, search_area, help_area] = Layout::vertical([
+                Constraint::Length(1),
+                Constraint::Fill(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .areas(area);
+            (header_area, body_area, None, search_area, help_area)
+        };
 
     render_header(frame, app, header_area);
     render_body(frame, app, body_area);
+    if let Some(compose_bar) = compose_bar {
+        render_compose_zone(frame, app, compose_bar);
+    }
     render_search(frame, app, search_area);
     render_help(frame, app, help_area);
     // A modal (the running-session choice or the new-session agent picker) sits
@@ -50,6 +79,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // so at most one ever draws — a fact made structural, not conventional.
     if let Some(modal) = &app.modal {
         render_modal(frame, modal);
+    }
+    // The "stop the waiting agent?" confirmation overlays the board before compose
+    // opens; likewise mutually exclusive with the other modals.
+    if app.pending_stop.is_some() {
+        render_stop_confirm(frame, app);
     }
 }
 
@@ -230,6 +264,64 @@ const SCROLLBAR_ARROW_HIDDEN: &str = " ";
 /// single, never-wrapped line, so a taller reservation would only add dead
 /// space above the transcript and a shorter one would hide the banner outright.
 const PREVIEW_BANNER_ROWS: u16 = 1;
+
+/// The compose box starts at ONE visible text row and grows with the draft up to
+/// [`COMPOSE_MAX_TEXT_ROWS`]; the `TextArea` scrolls internally beyond that.
+const COMPOSE_MIN_TEXT_ROWS: u16 = 1;
+
+/// The tallest the compose box grows before it scrolls internally — capped so a
+/// long draft never swallows the transcript above a docked box.
+const COMPOSE_MAX_TEXT_ROWS: u16 = 6;
+
+/// The TALLEST the bordered compose zone can get: [`COMPOSE_MAX_TEXT_ROWS`] plus the
+/// block's top and bottom border. The dock decision reserves room for THIS (not the
+/// current height), so a box that grows as the user types never has to flip from
+/// docked to bottom-bar mid-draft.
+const COMPOSE_MAX_ZONE_HEIGHT: u16 = COMPOSE_MAX_TEXT_ROWS + 2;
+
+/// Transcript rows kept visible above a DOCKED compose zone. A preview pane that
+/// cannot spare this many (on top of the banner and a full-height compose zone)
+/// falls back to the full-width bottom bar rather than crushing the transcript.
+const COMPOSE_MIN_TRANSCRIPT_ROWS: u16 = 3;
+
+/// Minimum preview-pane INNER height (inside the block borders) to DOCK the compose
+/// zone in the preview: the pinned banner row, a usable slice of transcript, and a
+/// FULL-HEIGHT compose zone (using the max keeps the decision stable as the box
+/// grows). Below this, compose renders as a full-width bottom bar (see
+/// [`compose_uses_bottom_bar`]) so it is never squeezed against the transcript.
+const COMPOSE_MIN_DOCK_HEIGHT: u16 =
+    PREVIEW_BANNER_ROWS + COMPOSE_MIN_TRANSCRIPT_ROWS + COMPOSE_MAX_ZONE_HEIGHT;
+
+/// Board rows outside the body — the header, the search line, and the help line
+/// (one row each). Lets the compose-placement decision recover the preview pane's
+/// height from the whole board without threading laid-out rects into a pure
+/// function.
+const BOARD_CHROME_ROWS: u16 = 3;
+
+/// The compose box's CURRENT visible text-row count for a bordered box `box_width`
+/// columns wide: the wrapped height of the draft (via the shared [`wrapped_rows`]
+/// model, matching the editor's soft-wrap) clamped to `[COMPOSE_MIN_TEXT_ROWS,
+/// COMPOSE_MAX_TEXT_ROWS]`, so the box starts at one line and grows with the content
+/// up to the cap. `box_width` is the zone's OUTER width; the editor loses the block's
+/// two border columns. The per-line display widths come from
+/// [`super::compose::ComposeState::content_line_widths`], keeping `TextArea` access
+/// out of the view.
+fn compose_text_rows(app: &App, box_width: u16) -> u16 {
+    let inner = box_width.saturating_sub(2).max(1);
+    let rows = app
+        .compose
+        .as_ref()
+        .map_or(0, |c| wrapped_rows(c.content_line_widths(), inner));
+    u16::try_from(rows)
+        .unwrap_or(COMPOSE_MAX_TEXT_ROWS)
+        .clamp(COMPOSE_MIN_TEXT_ROWS, COMPOSE_MAX_TEXT_ROWS)
+}
+
+/// Total rows the bordered compose zone occupies for a box `box_width` wide:
+/// [`compose_text_rows`] plus the block's two borders.
+fn compose_zone_height(app: &App, box_width: u16) -> u16 {
+    compose_text_rows(app, box_width) + 2
+}
 
 /// Build the header's version label from compile-time metadata.
 ///
@@ -800,8 +892,16 @@ fn blink_visible(tick: u64) -> bool {
 /// view does — "does this session have a banner?" — and derive the same
 /// transcript rect via [`preview_split`]; the two must agree, or a click would
 /// resolve to the wrong transcript row.
+///
+/// An IN-FLIGHT quick-reply send takes precedence: while `App::sending` names the
+/// selected session, the banner is a live [`sending_banner`] indicator instead of
+/// the agent status, so the reply feels instant.
 pub(crate) fn preview_banner(app: &App) -> Option<Line<'static>> {
-    let agent = app.reported_agent(app.selected.as_deref()?)?;
+    let selected = app.selected.as_deref()?;
+    if app.sending.as_deref() == Some(selected) {
+        return Some(sending_banner(app, selected));
+    }
+    let agent = app.reported_agent(selected)?;
     // Cyan + BOLD marks the line as the board speaking rather than transcript
     // content (the search prompt uses the same accent). NAMED so it adapts to
     // the terminal theme — no RGB (TERMINAL-SAFE STYLING).
@@ -811,6 +911,35 @@ pub(crate) fn preview_banner(app: &App) -> Option<Line<'static>> {
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     )))
+}
+
+/// Braille spinner frames for the in-flight send indicator. Plain glyphs (no ANSI),
+/// consistent with the board's other unicode marks; one advances per redraw tick.
+const SPINNER_FRAMES: [&str; 10] = [
+    "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}", "\u{2827}",
+    "\u{2807}", "\u{280f}",
+];
+
+/// The spinner glyph for the current `tick` (advances ~every [`crate::watch::TICK`]).
+fn spinner_frame(tick: u64) -> &'static str {
+    SPINNER_FRAMES[(tick as usize) % SPINNER_FRAMES.len()]
+}
+
+/// The live indicator shown while a quick-reply send to `session_id` is in flight:
+/// a spinner plus "sending…" — or "cooking…" once claude is actively working the
+/// turn (as the agents poll reports it), so the two phases read distinctly. Cyan +
+/// BOLD like the agent banner it stands in for; animated off `App::tick`.
+fn sending_banner(app: &App, session_id: &str) -> Line<'static> {
+    let cooking = app
+        .reported_agent(session_id)
+        .is_some_and(|a| agents::classify(a) == AgentActivity::Working);
+    let label = if cooking { "cooking" } else { "sending" };
+    Line::from(Span::styled(
+        format!("{} {label}\u{2026}", spinner_frame(app.tick)),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ))
 }
 
 /// Split the preview pane's `area` into its `(banner, transcript)` rects.
@@ -870,6 +999,88 @@ pub(crate) fn preview_split(area: Rect, has_banner: bool) -> (Rect, Rect) {
     (banner, transcript)
 }
 
+/// The preview pane's INNER height for a board `board_height` rows tall, in the
+/// NORMAL (no bottom-bar) layout: the body is the board minus [`BOARD_CHROME_ROWS`],
+/// and the preview block steals two rows of border. Pure so the placement decision
+/// is unit-testable without laying out a frame.
+fn preview_pane_inner_height(board_height: u16) -> u16 {
+    board_height
+        .saturating_sub(BOARD_CHROME_ROWS)
+        .saturating_sub(2) // preview block top + bottom border
+}
+
+/// Whether the compose zone must render as a FULL-WIDTH BOTTOM BAR rather than
+/// docking in the preview pane — only when composing AND the preview pane is too
+/// short to hold the banner, a usable transcript, and the compose zone together
+/// ([`COMPOSE_MIN_DOCK_HEIGHT`]). Pure and unit-testable; the renderer's own dock
+/// check ([`render_preview`]) mirrors it against the (possibly shorter) pane area,
+/// so the two never disagree.
+fn compose_uses_bottom_bar(composing: bool, board_height: u16) -> bool {
+    composing && preview_pane_inner_height(board_height) < COMPOSE_MIN_DOCK_HEIGHT
+}
+
+/// Split the preview pane's `area` into `(banner, transcript, compose)` rects.
+///
+/// Reuses [`preview_split`] for the banner + transcript, then carves the bottom
+/// `compose_height` rows off the transcript for the docked compose zone.
+/// `compose_height == 0` means NOT docking: the compose rect is empty and the
+/// transcript is the full [`preview_split`] rect, so a non-composing pane is
+/// byte-identical to before this feature. Pure so the geometry is unit-testable.
+fn preview_compose_split(area: Rect, has_banner: bool, compose_height: u16) -> (Rect, Rect, Rect) {
+    let (banner, transcript) = preview_split(area, has_banner);
+    if compose_height == 0 {
+        return (banner, transcript, Rect::default());
+    }
+    // Degrade gracefully: `min` keeps the reservation inside the transcript, so a
+    // pane that only just clears the dock threshold collapses the transcript to
+    // zero rows rather than overlapping the two.
+    let compose_h = transcript.height.min(compose_height);
+    let shrunk = Rect {
+        height: transcript.height.saturating_sub(compose_h),
+        ..transcript
+    };
+    let compose = Rect {
+        y: shrunk.y.saturating_add(shrunk.height),
+        height: compose_h,
+        ..transcript
+    };
+    (banner, shrunk, compose)
+}
+
+/// Render the quick-reply compose zone (a bordered multiline editor) into `area`,
+/// titled with the TARGET session's label so the recipient is unambiguous even if
+/// the previewed row was scrolled away from it.
+///
+/// Styled ONLY with ratatui `Style` + NAMED colors (TERMINAL-SAFE STYLING): the
+/// cyan border marks the box as the board speaking, like the search prompt and the
+/// status banner. The `TextArea` widget draws its own buffer and cursor into the
+/// block's inner rect — the one place a `ratatui_textarea` value is rendered,
+/// mirroring how it is the one place one is edited (see [`super::compose`]).
+fn render_compose_zone(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(compose) = &app.compose else {
+        return;
+    };
+    let label = app
+        .session_by_id(&compose.target_session_id)
+        .map(|s| s.label.as_str())
+        .filter(|l| !l.is_empty())
+        .unwrap_or(compose.target_session_id.as_str());
+    // Stop-then-reply mode (a held bg agent) notes that sending stops the agent
+    // first, so the title never implies a plain in-place reply.
+    let title = if compose.stop_job.is_some() {
+        format!(" stop & reply to {label} ")
+    } else {
+        format!(" reply to {label} ")
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(&compose.textarea, inner);
+}
+
 /// The readable transcript preview for the selected session, vertically
 /// scrollable and anchored to the newest turn by default, under a REPORTED
 /// session's PINNED status banner (see [`preview_split`]).
@@ -901,7 +1112,21 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     // bottom-anchored viewport cannot scroll it away. A session claude never
     // reported reserves no row and renders unchanged.
     let banner = preview_banner(app);
-    let (banner_area, transcript_area) = preview_split(area, banner.is_some());
+    // Dock the compose zone in the bottom of the pane when composing AND the pane
+    // is tall enough; otherwise `render` gave compose a full-width bottom bar and
+    // the transcript keeps the whole pane. Mirrors `compose_uses_bottom_bar`,
+    // evaluated against THIS pane's height (which is already the shorter body in the
+    // bottom-bar layout, so the two agree).
+    let dock_compose =
+        app.is_composing() && area.height.saturating_sub(2) >= COMPOSE_MIN_DOCK_HEIGHT;
+    // The docked zone grows with the draft (0 = not docking); its width is the pane.
+    let compose_h = if dock_compose {
+        compose_zone_height(app, area.width)
+    } else {
+        0
+    };
+    let (banner_area, transcript_area, compose_area) =
+        preview_compose_split(area, banner.is_some(), compose_h);
     // The transcript's width is also the table shrink-to-fit budget, so it must
     // be resolved BEFORE rendering the preview text (which fits GFM tables to
     // it). The banner split is vertical only, so this width — and therefore the
@@ -915,7 +1140,7 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     // empty falls through instead: its banner is the one thing worth drawing, and
     // keeping the banner unconditional is what lets the hit-test below derive the
     // same geometry from `banner.is_some()` alone.
-    if text.lines.is_empty() && banner.is_none() {
+    if text.lines.is_empty() && banner.is_none() && !dock_compose {
         // Keep the scroll bookkeeping sane and still record the viewport height
         // so a later selection can size a page.
         app.preview_viewport_h = inner_height;
@@ -1026,6 +1251,13 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
             },
             &mut scrollbar_state,
         );
+    }
+
+    // A DOCKED compose zone occupies the bottom rows the transcript was shrunk away
+    // from (see `preview_compose_split`); the full-width bottom-bar fallback is
+    // drawn by `render` instead, so this only fires when `dock_compose`.
+    if dock_compose {
+        render_compose_zone(frame, app, compose_area);
     }
 }
 
@@ -1245,20 +1477,28 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(Paragraph::new(hint), area);
         return;
     }
-    let line = match &app.status {
-        Some(status) => {
-            let flat = status.split_whitespace().collect::<Vec<_>>().join(" ");
-            Line::from(vec![Span::styled(
-                flat,
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )])
-        }
-        None => Line::from(vec![Span::styled(
-            "↑↓/jk move · ←/→ fold/expand · Enter resume · ^F fork · ^N new · ^X hide/del · type to search · Tab name/content · ^A scope · ^/ preview · PgUp/PgDn·^U/^D·Home/End·wheel scroll · q/Esc quit",
+    let line = if let Some(status) = &app.status {
+        // A transient status (a refusal, or a send's "sending…" / cost / error)
+        // wins the line, flattened to a single row.
+        let flat = status.split_whitespace().collect::<Vec<_>>().join(" ");
+        Line::from(vec![Span::styled(
+            flat,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )])
+    } else if app.is_composing() {
+        // The compose zone owns the keyboard: show its chords instead of the board
+        // keymap. Ctrl-J is the primary newline; Alt+Enter the guaranteed fallback.
+        Line::from(vec![Span::styled(
+            "Enter send · Ctrl-J newline (or Alt+Enter) · Esc cancel",
             Style::default().add_modifier(Modifier::DIM),
-        )]),
+        )])
+    } else {
+        Line::from(vec![Span::styled(
+            "↑↓/jk move · ←/→ fold/expand · Enter resume · ^F fork · ^N new · ^R reply · ^X hide/del · type to search · Tab name/content · ^A scope · ^/ preview · PgUp/PgDn·^U/^D·Home/End·wheel scroll · q/Esc quit",
+            Style::default().add_modifier(Modifier::DIM),
+        )])
     };
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -1309,6 +1549,59 @@ fn wrap_message(text: &str, width: u16) -> Vec<String> {
     }
     lines.push(line);
     lines
+}
+
+/// The "stop the waiting agent?" confirmation overlay, shown when `Ctrl-R` targets
+/// a `needs input` background agent. Confirming stops the waiting agent (ending its
+/// live job, conversation kept) so the reply can land in place; the two moves are
+/// spelled out because stopping is not free.
+///
+/// Drawn last (on top of the board) with a [`Clear`]. Pure presentation — the
+/// target session and the job id live on [`App::pending_stop`]; styled with named
+/// colors only (TERMINAL-SAFE STYLING).
+fn render_stop_confirm(frame: &mut Frame, app: &App) {
+    let Some(pending) = &app.pending_stop else {
+        return;
+    };
+    let label = app
+        .session_by_id(&pending.session_id)
+        .map(|s| s.label.as_str())
+        .filter(|l| !l.is_empty())
+        .unwrap_or(pending.session_id.as_str());
+    let area = centered_rect(frame.area(), 64, 8);
+
+    let lines = vec![
+        Line::from(Span::styled(
+            "This session is a waiting agent.",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::raw(format!(
+            "Stop it and reply in place?  —  {label}"
+        ))),
+        Line::from(Span::styled(
+            "(ends the live agent; its conversation is kept)",
+            Style::default().add_modifier(Modifier::DIM),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Enter  stop & reply    \u{b7}    Esc  cancel",
+            Style::default().add_modifier(Modifier::DIM),
+        )),
+    ];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" stop the waiting agent? ");
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .alignment(Alignment::Center),
+        area,
+    );
 }
 
 /// The generic modal overlay: a centered bordered box with a title, a message, its
@@ -2067,6 +2360,237 @@ mod tests {
             msg_count: 0,
             content_index: String::new(),
         }
+    }
+
+    // --- quick-reply compose zone: placement + split geometry + render -----
+
+    /// The compose zone docks in the preview on a tall board and falls back to the
+    /// full-width bottom bar on a short one; a non-composing board never bottom-bars.
+    #[test]
+    fn compose_docks_on_a_tall_board_and_bottom_bars_on_a_short_one() {
+        // Not composing -> never a bottom bar, whatever the height.
+        assert!(!compose_uses_bottom_bar(false, 8));
+        assert!(!compose_uses_bottom_bar(false, 40));
+        // preview_pane_inner_height(h) = h - BOARD_CHROME_ROWS - 2, so this height
+        // is exactly the dock threshold.
+        let just_docks = COMPOSE_MIN_DOCK_HEIGHT + BOARD_CHROME_ROWS + 2;
+        assert!(
+            !compose_uses_bottom_bar(true, just_docks),
+            "just tall enough must dock, not bottom-bar"
+        );
+        assert!(
+            !compose_uses_bottom_bar(true, just_docks + 6),
+            "taller still docks"
+        );
+        // One row short of the threshold -> bottom bar; a tiny board too.
+        assert!(
+            compose_uses_bottom_bar(true, just_docks - 1),
+            "one row short of docking must bottom-bar"
+        );
+        assert!(compose_uses_bottom_bar(true, 8), "a tiny board bottom-bars");
+    }
+
+    /// `preview_compose_split` carves the compose zone off the bottom of the
+    /// transcript when docking, and is a no-op (empty compose, full transcript) when
+    /// not — so a non-composing pane keeps its exact prior geometry.
+    #[test]
+    fn preview_compose_split_reserves_the_zone_only_when_docking() {
+        let pane = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 20,
+        };
+        // Not docking (height 0): identical to the 2-way split, empty compose rect.
+        let (b0, t0) = preview_split(pane, false);
+        let (b1, t1, c1) = preview_compose_split(pane, false, 0);
+        assert_eq!((b1, t1), (b0, t0), "no dock must not disturb the split");
+        assert_eq!(c1.height, 0, "no compose rect when not docking");
+
+        // Docking with a given height: the zone comes out of the transcript bottom,
+        // the two do not overlap, and together they tile the original transcript.
+        let zone = 5u16;
+        let (_b, transcript, compose) = preview_compose_split(pane, false, zone);
+        assert_eq!(compose.height, zone);
+        assert_eq!(
+            t0.height,
+            transcript.height + compose.height,
+            "the compose zone is taken FROM the transcript, not added beside it"
+        );
+        assert_eq!(
+            compose.y,
+            transcript.y + transcript.height,
+            "compose sits directly below the (shrunk) transcript"
+        );
+        assert_eq!(
+            transcript.y, t0.y,
+            "the transcript still starts where it did"
+        );
+        assert_eq!(compose.width, transcript.width);
+    }
+
+    /// The compose box starts at one text row and GROWS with the draft — one row per
+    /// logical line, and extra rows for a long soft-wrapped line — capped at
+    /// [`COMPOSE_MAX_TEXT_ROWS`].
+    #[test]
+    fn compose_box_grows_from_one_line_up_to_the_cap() {
+        use crate::tui::compose::ComposeState;
+
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.compose = Some(ComposeState::new("sess-normal-1".to_string(), None));
+
+        // Empty draft -> one text row (zone height = 1 + 2 borders).
+        assert_eq!(compose_text_rows(&app, 40), COMPOSE_MIN_TEXT_ROWS);
+        assert_eq!(compose_zone_height(&app, 40), COMPOSE_MIN_TEXT_ROWS + 2);
+
+        // Three logical lines -> three text rows.
+        let ta = &mut app.compose.as_mut().unwrap().textarea;
+        ta.insert_newline();
+        ta.insert_newline();
+        assert_eq!(compose_text_rows(&app, 40), 3);
+
+        // Well past the cap -> clamped to the max.
+        for _ in 0..20 {
+            app.compose.as_mut().unwrap().textarea.insert_newline();
+        }
+        assert_eq!(
+            compose_text_rows(&app, 40),
+            COMPOSE_MAX_TEXT_ROWS,
+            "grows only to the cap"
+        );
+
+        // A single long line soft-wraps to more than one row at a narrow width.
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.compose = Some(ComposeState::new("s".to_string(), None));
+        app.compose
+            .as_mut()
+            .unwrap()
+            .textarea
+            .insert_str("word ".repeat(40)); // ~200 columns on one logical line
+        assert!(
+            compose_text_rows(&app, 30) > 1,
+            "a long line wraps to more than one row at width 30"
+        );
+    }
+
+    /// Opening compose draws a bordered "reply to <label>" box — docked in the
+    /// preview on a tall board, and as a full-width bottom bar on a short one — and
+    /// never panics through a real backend.
+    #[test]
+    fn composing_renders_the_reply_box_docked_and_as_a_bottom_bar() {
+        use crate::tui::compose::ComposeState;
+
+        let open = |app: &mut App| {
+            app.show_preview = true;
+            app.compose = Some(ComposeState::new("sess-normal-1".to_string(), None));
+        };
+        let full = |buffer: &ratatui::buffer::Buffer, w: u16, h: u16| -> String {
+            (0..h)
+                .map(|y| full_row_text(buffer, y, w))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let width = 80u16;
+
+        // Tall board: the reply box docks inside the preview pane.
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        open(&mut app);
+        let tall = 30u16;
+        assert!(
+            !compose_uses_bottom_bar(app.is_composing(), tall),
+            "this board must dock"
+        );
+        let buffer = drawn_board(&mut app, width, tall);
+        assert!(
+            full(&buffer, width, tall).contains("reply to"),
+            "the docked reply box must be titled"
+        );
+
+        // Short board: the reply box falls back to a full-width bottom bar.
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        open(&mut app);
+        let short = COMPOSE_MIN_DOCK_HEIGHT + BOARD_CHROME_ROWS + 1; // one short of docking
+        assert!(
+            compose_uses_bottom_bar(app.is_composing(), short),
+            "this board must bottom-bar"
+        );
+        let buffer = drawn_board(&mut app, width, short);
+        assert!(
+            full(&buffer, width, short).contains("reply to"),
+            "the bottom-bar reply box must be titled"
+        );
+    }
+
+    /// While a send is in flight for the selected session, the preview banner shows
+    /// a "sending…" indicator (even with no reported agent), and becomes "cooking…"
+    /// once claude reports the session working — standing in for the agent banner.
+    #[test]
+    fn preview_banner_shows_the_in_flight_send_indicator() {
+        let banner_text = |app: &App| -> Option<String> {
+            preview_banner(app).map(|line| {
+                line.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+        };
+
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        // Nothing in flight and no reported agent -> no banner.
+        assert!(banner_text(&app).is_none());
+
+        // In flight -> "sending…", even without a reported agent.
+        app.sending = Some("sess-normal-1".to_string());
+        let text = banner_text(&app).expect("an in-flight send shows a banner");
+        assert!(
+            text.contains("sending"),
+            "in-flight reads 'sending': {text:?}"
+        );
+        assert!(!text.contains("cooking"));
+
+        // Once claude reports it working -> "cooking…".
+        let mut reported = HashMap::new();
+        reported.insert(
+            "sess-normal-1".to_string(),
+            ReportedAgent {
+                kind: "background".to_string(),
+                id: None,
+                state: Some("working".to_string()),
+                status: None,
+                name: None,
+            },
+        );
+        app.set_reported_agents(reported);
+        let text = banner_text(&app).expect("still in flight");
+        assert!(text.contains("cooking"), "working -> 'cooking': {text:?}");
+
+        // Send done -> the indicator yields back to the agent banner.
+        app.sending = None;
+        let text = banner_text(&app).expect("the reported agent still has a banner");
+        assert!(
+            !text.contains("sending") && !text.contains("cooking"),
+            "no longer in flight: {text:?}"
+        );
     }
 
     #[test]

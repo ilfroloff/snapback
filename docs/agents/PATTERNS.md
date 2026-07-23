@@ -154,11 +154,16 @@ into a pinned banner row and the transcript beneath it, and returns the WHOLE
 inner rect when there is no banner (so a banner-less pane's geometry is exactly
 `Block::inner`, unchanged). Three rules follow:
 
-- `preview_split` is the ONE place that geometry is derived. `render_preview`
-  draws against its rects and `update::link_under_pointer` hit-tests against the
-  same transcript rect. A click resolves through `App::preview_scroll` and the
-  width-scoped hit cache, both measured from that rect's origin — derive it
-  anywhere else and a click silently opens the wrong link.
+- `preview_split` is the ONE place the banner/transcript geometry is derived.
+  `render_preview` draws against its rects and `update::link_under_pointer`
+  hit-tests against the same transcript rect. A click resolves through
+  `App::preview_scroll` and the width-scoped hit cache, both measured from that
+  rect's origin — derive it anywhere else and a click silently opens the wrong
+  link. The compose split (`preview_compose_split`) is built ON `preview_split`,
+  carving the docked compose zone off the bottom of that same transcript rect
+  rather than re-deriving it; a docked compose zone shrinks the transcript, but
+  link hit-testing is gated off while composing (`overlay_active`), so the two
+  never disagree.
 - `has_banner` is **`view::preview_banner(app).is_some()` — never liveness**.
   Since the poller passes `--all`, an agent that reported completion still has a
   banner while claude would not call it live; keying the geometry on liveness
@@ -177,7 +182,14 @@ deliver `AppEvent`s onto the merged channel. Threads exit when the receiver drop
 (bounded to the board session) and the input reader is **joined on `EventLoop`
 drop** so it releases stdin before `claude` is spawned onto the same fd. New
 background work follows the same pattern: own thread, `AppEvent` variant,
-self-terminating on send failure.
+self-terminating on send failure. The quick-reply send (`send::spawn_send`) is the
+newest instance: a **one-shot** detached thread — spawned per `Ctrl-R` send, not a
+poller — that runs the multi-second `claude -p` child to completion and delivers a
+single `AppEvent::SendFinished`. It mirrors `resume::open_url` (fire-and-forget off
+the render loop), never `resume::launch` (which spawns+waits after a teardown), so
+the board keeps drawing while the child runs. The pure send DECISION is returned as
+`Outcome::Send` and the spawn happens in the `run` driver, keeping the effect out of
+the pure event handler.
 
 The rule is about the **poll cadence**, not about the word "shell-out". A
 ONE-SHOT at hand-off is a different thing and is allowed — `agents::live_agents`
@@ -323,22 +335,29 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    only while the query is empty; arrows, Enter, Tab, and `Ctrl-*` always act so
    search never blocks navigation).
 2. `apply_action` mutates the `App` and returns an `Outcome`
-   (`Continue`/`Quit`/`Resume`).
+   (`Continue`/`Quit`/`Resume`/`Send`). `Send` carries a confirmed `SendRequest`
+   the driver spawns without a teardown (the board stays up), the way `Resume`
+   carries a confirmed `Ready` — the decision is data, the effect is the driver's.
 3. Modal state owns the keyboard: ONE `App.modal: Option<Modal>` serves every
-   overlay — the running-session choice, the new-session agent picker, and the
-   hard-delete confirm — through the generic `modal_key` → `confirm_modal`
+   titled overlay — the running-session choice, the new-session agent picker, and
+   the hard-delete confirm — through the generic `modal_key` → `confirm_modal`
    machine, dispatching each choice's `ModalAction` tag (`Row` layout binds the
-   horizontal keys, `List` does not). The `Ctrl-X` leader chord is a second
-   keyboard owner: while `App.pending_chord` is set, `chord_key` routes the next
-   key (`x` hide, `d` delete-confirm, `h` show-hidden, anything else cancels).
-   `App::overlay_active` (`modal.is_some() || pending_chord`) gates mouse actions
-   (splitter drag / link open) so none fires while either is up. A mouse wheel is
-   handled **before** and **independent of** that gate.
+   horizontal keys, `List` does not). Three more keyboard owners sit alongside it:
+   the `Ctrl-X` leader chord (while `App.pending_chord` is set, `chord_key` routes
+   the next key — `x` hide, `d` delete-confirm, `h` show-hidden, anything else
+   cancels), the "stop the waiting agent?" confirmation via `App.pending_stop` (a
+   plain Enter/Esc gate before compose, for the `needs input` quick-reply path),
+   and the quick-reply compose zone via `App.compose` + its `compose_key_to_action`
+   machine. `handle_event` checks each in turn before the board.
+   `App::overlay_active` (`modal.is_some() || compose.is_some() ||
+   pending_stop.is_some() || pending_chord`) gates mouse actions (splitter drag /
+   link open) so none fires while any is up. A mouse wheel is handled **before**
+   and **independent of** that gate.
 
 Add a keybinding by extending the `Action` enum + `key_to_action` + `apply_action`
 and covering it with a `key_to_action` unit test. Keep the doc-comment key table
-in `update.rs`, the `USAGE`/`KEYS` block in `cli.rs`, and the help line in
-`view.rs` in sync.
+in `update.rs`, the `USAGE`/`KEYS` block in `cli.rs`, the help line in `view.rs`,
+and the README key map in sync.
 
 ## Testing patterns
 

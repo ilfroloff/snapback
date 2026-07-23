@@ -164,6 +164,19 @@ pub struct ModalChoice {
     pub action: ModalAction,
 }
 
+/// The open "stop the waiting agent?" confirmation, shown when `Ctrl-R` targets a
+/// `needs input` background agent: stopping it to reply in place would abandon a
+/// live agent, so the user confirms first (`Enter`) or cancels (`Esc`). A simple
+/// yes/no gate (no navigation), so it holds only what a confirmed stop-then-reply
+/// needs: the target session and the job id to `claude stop`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingStop {
+    /// Stable `session_id` the reply will target once confirmed.
+    pub session_id: String,
+    /// Short agent-view job id to `claude stop` before the reply.
+    pub job_id: String,
+}
+
 /// A titled, centered prompt with N labelled choices and a wrapping-cycle
 /// highlight — the ONE overlay model behind the running-session choice, the
 /// new-session agent picker, and (later) a delete confirm.
@@ -498,6 +511,21 @@ pub struct App {
     /// now one `Option<Modal>`, so their mutual exclusion is structural rather
     /// than conventional.
     pub modal: Option<Modal>,
+    /// The open quick-reply compose zone, if any. `Some` while the compose modal
+    /// owns the keyboard (`Ctrl-R` on an idle session). Its type
+    /// ([`super::compose::ComposeState`]) is the ONLY place outside
+    /// [`super::compose`] that touches `ratatui_textarea`, the way `search`
+    /// confines nucleo.
+    pub compose: Option<super::compose::ComposeState>,
+    /// The open "stop the waiting agent?" confirmation, if any. `Some` while that
+    /// modal owns the keyboard (`Ctrl-R` on a `needs input` background agent, before
+    /// compose opens).
+    pub pending_stop: Option<PendingStop>,
+    /// `session_id` of a quick-reply send that is IN FLIGHT (dispatched, not yet
+    /// finished), or `None`. Drives the animated "sending… / cooking…" indicator in
+    /// the preview so the reply feels instant; set when the send is handed off and
+    /// cleared when its `AppEvent::SendFinished` lands.
+    pub sending: Option<String>,
     /// The agent chosen for the most recent new session (`None` = default / no
     /// agent). In-memory ONLY — never persisted to disk — so the NEXT `Ctrl-N`
     /// pre-highlights it for a one-keystroke repeat.
@@ -618,6 +646,9 @@ impl App {
             reported_agents: HashMap::new(),
             live_probe: Box::new(default_live_probe),
             modal: None,
+            compose: None,
+            pending_stop: None,
+            sending: None,
             last_new_agent: None,
             dragging_split: false,
             scoped: Vec::new(),
@@ -1231,13 +1262,36 @@ impl App {
     /// (splitter drag / link open) from firing while an overlay is up — so a later
     /// gate extension lives in exactly one place.
     ///
-    /// True while a [`Modal`] is open OR a `Ctrl-X` leader chord is
-    /// [pending](Self::pending_chord): both take the keyboard, so both must equally
+    /// True while a [`Modal`] is open, the quick-reply compose zone or the
+    /// stop-the-agent confirmation owns the keyboard, OR a `Ctrl-X` leader chord is
+    /// [pending](Self::pending_chord): each takes the keyboard, so each must equally
     /// gate the mouse (a stray click mid-chord must not start a drag or open a
     /// link), per PATTERNS §10.
     #[must_use]
     pub fn overlay_active(&self) -> bool {
-        self.modal.is_some() || self.pending_chord
+        self.modal.is_some()
+            || self.compose.is_some()
+            || self.pending_stop.is_some()
+            || self.pending_chord
+    }
+
+    /// Open the "stop the waiting agent?" confirmation for a `needs input` agent.
+    pub fn open_stop_confirm(&mut self, session_id: String, job_id: String) {
+        self.pending_stop = Some(PendingStop { session_id, job_id });
+    }
+
+    /// Dismiss the stop confirmation, returning to the board.
+    pub fn stop_confirm_cancel(&mut self) {
+        self.pending_stop = None;
+    }
+
+    /// Whether the quick-reply compose zone owns the keyboard. Gates key routing
+    /// in [`super::update::handle_event`] (all keys go to the compose handler,
+    /// bypassing `key_to_action`) and drives the compose-zone layout in
+    /// [`super::view`].
+    #[must_use]
+    pub fn is_composing(&self) -> bool {
+        self.compose.is_some()
     }
 
     /// Open the new-session agent picker over `agents` as a `List`-layout

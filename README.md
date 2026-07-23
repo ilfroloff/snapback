@@ -102,6 +102,7 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | `Enter` | **Resume** the selected session, returning to the board when it exits. On a **running** session it opens an **Attach / Fork / Cancel** choice instead |
 | `Ctrl-F` | **Fork** the selected session into a copy — available for any session, running or not |
 | `Ctrl-N` | **Start a new session** in the launch directory; if you have Claude Code agents defined, pick one first (or `default (no agent)`) |
+| `Ctrl-R` | **Quick reply** — send a one-shot message to the selected session without leaving the board; a finished (`done`) or waiting (`needs input`) background agent is stopped first (with a confirm for a waiting one) so the reply lands in place. Opens a compose box (`Enter` sends, `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels) |
 | `Ctrl-X` then `x` / `d` / `h` | **Leader chord** for hide & delete — `x` **hides** the selected session (reversible, persisted), `d` **hard-deletes** it after a confirmation, `h` toggles **show hidden**. Any other key cancels the chord |
 | `Tab` | Toggle search: **name-only ↔ name+content** |
 | `Ctrl-A` | Toggle scope: **current folder ↔ all folders** |
@@ -198,6 +199,23 @@ background can't be plain-resumed, so the older copy is often the one that
 folder you launched from. If you keep Claude Code agents defined, it offers a
 quick picker so the new session can start bound to one, and it remembers your
 last pick for the session so a repeat is just `Ctrl-N`, `Enter`.
+
+**Quick reply without leaving the board.** Sometimes you just want to ask
+yesterday's session a fast question. `Ctrl-R` opens a compose box for the selected
+session and sends your message with a one-shot `claude -p` — it replays the full
+context, appends the exchange in place, and the reply shows up in the preview, all
+while the board stays up. The box is a real multiline editor — arrows move the
+caret, long lines soft-wrap, and it grows from one line as you type (`Ctrl-J` or
+`Alt+Enter` for a newline, `Enter` to send). While the reply is in flight the
+preview shows a live **sending… / cooking…** indicator, and the status line reports
+what the reply cost (or the reason if it fails).
+
+Background agents get special handling, because `claude` won't resume a session
+it's still holding as an agent. A **finished** (`done`) agent is stopped first
+(its conversation is kept) so the reply can land in place; a **waiting**
+(`needs input`) agent asks you to confirm before it's stopped. An agent that's
+actively **working** is left alone — use Attach to answer it in its own channel,
+or Fork (`Ctrl-F`) to branch a copy.
 
 **Hide & delete.** `Ctrl-X` is a leader chord for trimming the board: press it,
 and a hint shows the follow-ups — `x`, `d`, `h` — while any other key cancels.

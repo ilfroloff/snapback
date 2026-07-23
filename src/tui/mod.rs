@@ -8,6 +8,7 @@
 //! event loop in [`run`].
 
 pub mod app;
+pub mod compose;
 pub mod update;
 pub mod view;
 
@@ -443,6 +444,14 @@ fn run_inner(terminal: &mut DefaultTerminal, app: &mut App, root: &Path) -> Resu
         match events.recv() {
             Some(event) => match update::handle_event(app, event, root) {
                 Outcome::Continue => {}
+                // A confirmed quick-reply send: fire it on a detached thread and
+                // KEEP drawing — the board never tears down (contrast
+                // `Outcome::Resume`). The child reports back via
+                // `AppEvent::SendFinished` on this same channel, so the completion
+                // status and the reloaded reply both land on the live board.
+                Outcome::Send(req) => {
+                    crate::send::spawn_send(req, events.sender());
+                }
                 done => break done,
             },
             // All senders dropped (input + watcher + tick gone): exit cleanly.

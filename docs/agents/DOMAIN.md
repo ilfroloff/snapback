@@ -407,9 +407,11 @@ never from the `--all` map, which is a stale snapshot of a job that may have
 ended), `state`/`status` (the activity qualifier, see below), `name`. Parsing is
 fail-soft: any failure ⇒ empty map.
 
-The board's shell-out passes **`--all`** because the bare command lists only the
-currently-active agents: `done` never appears without it, so a finished session
-would render as though claude had never heard of it.
+The board's shell-out passes **`--all`** because the bare command lists a finished
+job only until claude reaps it from the active list (a just-`done` background job
+lingers there for a while, then drops out): without the flag a finished session's
+badge would vanish the moment claude reaps it, so `--all` is what keeps every
+`done` session — reaped or not — reliably badged.
 
 #### Why the gate does not read the `--all` map
 
@@ -640,3 +642,55 @@ incomplete; the picker always offers a `default (no agent)` bare launch and neve
 blocks on it. `Ctrl-N` opens the picker only when at least one agent is
 discovered (otherwise it launches bare `claude` directly), pre-highlighting the
 last-picked agent, which `App` remembers **in-memory only** (never persisted).
+
+## Quick reply — non-interactive send (`src/send.rs`)
+
+`Ctrl-R` sends a one-shot message to the selected session WITHOUT the teardown
+hand-off above. `claude -p -r <id> --output-format json "<msg>"` resumes the
+session non-interactively (its stdio is a pipe, no TTY), replays the full
+context, **appends the exchange in place** to the same `<id>.jsonl` — same
+`sessionId`, no new file — prints a JSON result (`is_error`, `total_cost_usd`,
+`result`, …), and exits. Tools run and are recorded in-file just as in an
+interactive turn. Because it needs no terminal, it runs on a detached thread while
+the board stays up, and the reply renders through the ordinary `SessionWatcher` →
+`SessionsChanged` → reload → preview path.
+
+The load-bearing constraint: **claude will not resume a session it is holding as a
+live agent.** `claude -p -r <id>` on such a session exits non-zero, verbatim:
+
+> `Error: Session <id> is currently running as a background agent (bg). Use claude`
+> `agents to find and attach to it, or add --fork-session to branch off a copy.`
+
+This holds in EVERY held state — `done` included: a just-finished background job
+stays a registered agent (in the bare `agents::live_agents` list) until claude
+reaps it, and claude refuses it exactly like a working one.
+
+**The unlock: `claude stop <job-id>`** deregisters the job — "Its conversation is
+kept" — after which `-p -r` resumes and appends **in place** (verified on the wire:
+`stop` → the session leaves the bare list → the reply grows the same `<id>.jsonl`).
+Stopping is only safe when nothing is running to interrupt, so `send::reply_gate`
+decides from the agent's STATE (one-shot bare probe, classified by
+`agents::classify`), and `Ctrl-R` in `tui::update` routes on it:
+
+| Live state | `Ctrl-R` |
+| --- | --- |
+| not held | reply in place (no stop) |
+| `done` | stop the finished job, then reply — straight to compose |
+| `needs input` | **confirm** (`App::pending_stop`, a small modal — stopping abandons a waiting agent), then stop + reply |
+| `working` / `idle` / no job id | refuse (`SEND_LIVE_REFUSED`) — Attach or Fork instead |
+
+The stop step (`build_stop_argv`, the SHORT agent-view job id from the probe's
+`ReportedAgent.id`) runs in `run_send` BEFORE the send, **best-effort**: if the job
+was already reaped between the gate and the send, the stop fails but the reply still
+lands; if the session really is still held, the reply's own error is what surfaces.
+No permission flags are passed: a send inherits the user's existing settings.
+
+**Report the send HONESTLY.** Because claude prints its refusal to **stderr** and
+exits non-zero with an EMPTY stdout, a driver that nulls stderr and ignores the exit
+code would map the empty stdout to the neutral `"sent"` — a false success over a
+failed send (the exact bug that shipped first). So `run_send` captures stderr AND
+honors the exit code (`status_for_output`): a clean exit maps the JSON payload
+(cost / `is_error` / neutral) via `status_for_send`, while a non-zero exit surfaces
+claude's own reason via `status_for_failed_send` (`send failed: <reason>`),
+sanitized (ANSI/control stripped, one line, length-capped) so no raw escape reaches
+the status line.
