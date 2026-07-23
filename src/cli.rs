@@ -36,11 +36,19 @@ KEYS:
                   without leaving the board; a finished/waiting background agent
                   is stopped first so the reply lands in place (Enter sends,
                   Ctrl-J or Alt+Enter newline, Esc cancels)
+    Ctrl-K        stop / interrupt the selected session's live background agent
+                  (claude stop); a finished agent stops at once, any other live
+                  agent confirms first (Enter stops, Esc cancels)
     Tab           toggle name / name+content search
     PgUp/PgDn     preview page  Ctrl-U/Ctrl-D  preview quarter-page
     Home/End      preview top / bottom
     wheel         scroll preview / list (mouse mode on; hold Shift/Option to select)
-    q, Esc        quit          (type to search)";
+    q, Esc        quit          (type to search)
+
+BACK TO THE BOARD (typed inside a resumed Claude session, not a snapback key):
+    /bg           detach the session — it keeps running as a bg agent — and snap
+                  back to the board; /exit ends it. Prefer these over Ctrl-Z, which
+                  only detaches cleanly when you're attached to a background agent.";
 
 /// Parsed launch options.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

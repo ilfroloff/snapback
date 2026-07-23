@@ -166,6 +166,81 @@ pub fn reply_gate(record: Option<&ReportedAgent>) -> ReplyGate {
     }
 }
 
+/// Board status while an interrupt (`Ctrl-K`) is in flight, set the moment the stop
+/// is dispatched. Replaced by [`status_for_stop`]'s result when the
+/// [`AppEvent::InterruptFinished`](crate::watch::AppEvent::InterruptFinished) lands.
+pub const INTERRUPT_IN_FLIGHT: &str = "stopping…";
+
+/// Refusal shown when `Ctrl-K` targets a session claude is NOT holding as an agent:
+/// there is no live job to stop. A resumable transcript on disk is not a running
+/// process, so stopping is meaningless — say so rather than shell out to fail.
+pub const INTERRUPT_NOT_LIVE: &str =
+    "This session isn't running as an agent — there's nothing to stop.";
+
+/// Refusal shown when `Ctrl-K` targets a LIVE session with no stoppable job id — an
+/// interactive session (running in another terminal) that `claude agents` lists
+/// without an `id`. `claude stop` only takes the short background job id, so an
+/// interactive one can't be stopped from here; point at the terminal that owns it.
+pub const INTERRUPT_NO_JOB_ID: &str =
+    "This session is running interactively, not as a background agent — \
+     stop it from the terminal that's running it.";
+
+/// What `Ctrl-K` should do for the selected session, decided from what claude is
+/// holding it as right now.
+///
+/// The interrupt counterpart of [`ReplyGate`], with the OPPOSITE intent: a reply
+/// must never interrupt live work, whereas an interrupt exists to stop it — so a
+/// `working` (mid-turn) agent is a valid target here, not a refusal. Only a
+/// background job carries the short id `claude stop` takes; an interactive live
+/// session (no id) can't be stopped from here, and a session claude isn't holding at
+/// all has nothing to stop. Stopping abandons live work, so every state EXCEPT a
+/// finished (`done`) one confirms first.
+#[derive(Debug, PartialEq, Eq)]
+pub enum InterruptGate {
+    /// A FINISHED (`done`) agent — stop it immediately (harmless; nothing runs).
+    StopNow {
+        /// The short agent-view job id to `claude stop`.
+        job_id: String,
+    },
+    /// A LIVE agent (`working` / `needs input` / `idle` / other) — stopping abandons
+    /// live work, so CONFIRM first; on confirm, run `claude stop <job-id>`.
+    Confirm {
+        /// The short agent-view job id to `claude stop`.
+        job_id: String,
+    },
+    /// Nothing stoppable — refuse with a message (not a live agent, or interactive
+    /// with no job id).
+    Refuse(&'static str),
+}
+
+/// Decide [`InterruptGate`] from the session's current live-agent record (`None`
+/// when claude is not holding it).
+///
+/// Pure so the whole decision tree is unit-tested without a probe, reusing the one
+/// classifier ([`agents::classify`]). Mirrors [`reply_gate`]'s shape but routes by
+/// the interrupt intent: not held → refuse (nothing to stop); held without a
+/// stoppable job id → refuse (interactive, can't stop from here); `done` → stop
+/// immediately (harmless); every other live state → confirm first (stopping abandons
+/// live work).
+#[must_use]
+pub fn interrupt_gate(record: Option<&ReportedAgent>) -> InterruptGate {
+    let Some(agent) = record else {
+        return InterruptGate::Refuse(INTERRUPT_NOT_LIVE); // nothing running to stop
+    };
+    let Some(job_id) = agent.id.as_deref().filter(|id| !id.trim().is_empty()) else {
+        // Live but not stoppable by job id (e.g. an interactive session).
+        return InterruptGate::Refuse(INTERRUPT_NO_JOB_ID);
+    };
+    let job_id = job_id.to_string();
+    match agents::classify(agent) {
+        AgentActivity::Done => InterruptGate::StopNow { job_id },
+        AgentActivity::Working
+        | AgentActivity::NeedsInput
+        | AgentActivity::Idle
+        | AgentActivity::Other => InterruptGate::Confirm { job_id },
+    }
+}
+
 /// A confirmed send request handed from the compose zone (pure decision) to the
 /// driver ([`crate::tui::run`]), which spawns it via [`spawn_send`].
 ///
@@ -187,6 +262,24 @@ pub struct SendRequest {
     /// path for a held (`done`/`needs input`) background agent. `None` for a plain
     /// in-place reply to a session claude is not holding.
     pub stop_job: Option<String>,
+}
+
+/// A confirmed interrupt handed from the pure event handler to the driver
+/// ([`crate::tui::run`]), which spawns it via [`spawn_interrupt`].
+///
+/// The interrupt counterpart of [`SendRequest`]: the pure handler builds the argv
+/// and the driver fires the detached thread, keeping the process spawn OUT of the
+/// event handler. `claude stop <job-id>` acts on the GLOBAL background-job registry,
+/// so it does not need the session's project dir — it runs in `cwd` (the launch dir)
+/// only because a child needs some valid working directory. Using the launch dir
+/// (never a re-read of the session's `cwd`) is deliberate: a deleted worktree must
+/// never block stopping its still-live job.
+#[derive(Debug, Clone)]
+pub struct InterruptRequest {
+    /// The full argv to spawn; `argv[0]` is the program (always `claude`).
+    pub argv: Vec<String>,
+    /// A valid directory to run the child in (the launch dir). Never the process cwd.
+    pub cwd: PathBuf,
 }
 
 /// Build the `claude` argv for a one-shot send:
@@ -454,6 +547,63 @@ fn run_child(argv: &[String], cwd: &Path) -> Result<(bool, String, String), ()> 
     ))
 }
 
+/// Neutral success status for a completed interrupt — `claude stop` exited clean.
+const STOP_OK: &str = "stopped";
+
+/// Error status when `claude stop` could not even be spawned (no `claude` on PATH).
+const STOP_SPAWN_FAILED: &str = "could not start claude to stop the agent";
+
+/// Prefix a surfaced `claude stop` failure carries, so it never reads as success.
+const STOP_FAILED_PREFIX: &str = "stop failed: ";
+
+/// Fallback when `claude stop` exited non-zero but left nothing readable to quote.
+const STOP_FAILED_GENERIC: &str = "stop failed — claude could not stop this agent";
+
+/// Spawn a confirmed interrupt on its OWN detached thread and deliver exactly one
+/// [`AppEvent::InterruptFinished`] when it completes — the UI thread never blocks.
+///
+/// The interrupt sibling of [`spawn_send`]: same fire-and-forget shape (run the
+/// child in `cwd`, null stdin, capture both streams, reap it), mapped through
+/// [`status_for_stop`]. FAIL-SOFT: a spawn error yields a neutral error status
+/// rather than a panic, and a failure to report back (the board went away) is
+/// ignored.
+pub fn spawn_interrupt(req: InterruptRequest, tx: Sender<AppEvent>) {
+    std::thread::spawn(move || {
+        let status = match run_child(&req.argv, &req.cwd) {
+            Ok((success, stdout, stderr)) => status_for_stop(success, &stdout, &stderr),
+            Err(()) => STOP_SPAWN_FAILED.to_string(),
+        };
+        // A send failure means the receiver (TUI) has gone away; ignore it.
+        let _ = tx.send(AppEvent::InterruptFinished { status });
+    });
+}
+
+/// Map a finished `claude stop` (exit status + captured streams) to a board status.
+///
+/// On a clean exit it is the neutral [`STOP_OK`]. On a NON-ZERO exit — notably
+/// stopping a job id that is already gone — claude's OWN reason is surfaced (the
+/// first non-empty stderr, else stdout, line), sanitized for the one-row status line
+/// (ANSI/control stripped, one line, length-capped — TERMINAL-SAFE STYLING), so a
+/// failed stop never reads as success. Reuses [`sanitize_status`]/[`strip_error_prefix`]
+/// so the interrupt and the send map external errors identically. Pure and
+/// unit-tested.
+#[must_use]
+pub fn status_for_stop(success: bool, stdout: &str, stderr: &str) -> String {
+    if success {
+        return STOP_OK.to_string();
+    }
+    let line = stderr
+        .lines()
+        .chain(stdout.lines())
+        .map(sanitize_status)
+        .map(|l| strip_error_prefix(&l).to_string())
+        .find(|l| !l.is_empty());
+    match line {
+        Some(line) => format!("{STOP_FAILED_PREFIX}{line}"),
+        None => STOP_FAILED_GENERIC.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -617,6 +767,87 @@ mod tests {
             ReplyGate::Refuse(SEND_LIVE_REFUSED),
             "a blank job id is not stoppable -> refuse"
         );
+    }
+
+    /// The interrupt gate has the OPPOSITE intent to the reply gate: it exists to
+    /// stop live work, so `working` is a valid target (Confirm), not a refusal.
+    /// Not held → refuse (nothing to stop); no/blank job id → refuse (interactive);
+    /// `done` → stop immediately; every other live state → confirm. Stop paths carry
+    /// the SHORT job id.
+    #[test]
+    fn interrupt_gate_routes_by_agent_state() {
+        // Not held at all -> nothing to stop.
+        assert_eq!(
+            interrupt_gate(None),
+            InterruptGate::Refuse(INTERRUPT_NOT_LIVE)
+        );
+
+        // done -> stop immediately (harmless), carrying the job id.
+        assert_eq!(
+            interrupt_gate(Some(&bg("done", Some("job-1")))),
+            InterruptGate::StopNow {
+                job_id: "job-1".to_string()
+            }
+        );
+
+        // Every OTHER live state confirms first — including `working`, which the
+        // reply gate refuses. This is the interrupt's whole point.
+        for live in [
+            "working",
+            "busy",
+            "idle",
+            "compacting",
+            "blocked",
+            "waiting",
+        ] {
+            assert_eq!(
+                interrupt_gate(Some(&bg(live, Some("job-2")))),
+                InterruptGate::Confirm {
+                    job_id: "job-2".to_string()
+                },
+                "{live:?} must confirm before stopping"
+            );
+        }
+
+        // Live but no stoppable job id (interactive) -> refuse with the right hint.
+        assert_eq!(
+            interrupt_gate(Some(&bg("working", None))),
+            InterruptGate::Refuse(INTERRUPT_NO_JOB_ID),
+            "an interactive live session has no job id -> refuse"
+        );
+        assert_eq!(
+            interrupt_gate(Some(&bg("done", Some("   ")))),
+            InterruptGate::Refuse(INTERRUPT_NO_JOB_ID),
+            "a blank job id is not stoppable -> refuse"
+        );
+    }
+
+    /// A clean stop is the neutral success; a NON-ZERO stop surfaces claude's own
+    /// reason (never a false `"stopped"`), with the duplicated `Error:` label
+    /// stripped; an empty failure degrades to the generic message.
+    #[test]
+    fn status_for_stop_maps_success_and_failure() {
+        assert_eq!(status_for_stop(true, "", ""), STOP_OK);
+
+        let status = status_for_stop(false, "", "Error: No job matching 70933ea6");
+        assert!(
+            status.starts_with(STOP_FAILED_PREFIX),
+            "a failed stop must read as a failure: {status}"
+        );
+        assert!(
+            status.contains("No job matching"),
+            "it must quote claude's own reason: {status}"
+        );
+        assert!(
+            !status.contains("Error:"),
+            "the Error: label is stripped: {status}"
+        );
+        assert!(
+            !status.contains("stopped"),
+            "a failed stop must NEVER read as stopped: {status}"
+        );
+
+        assert_eq!(status_for_stop(false, "   \n", "  \n"), STOP_FAILED_GENERIC);
     }
 
     /// The honesty seam: a NON-ZERO send exit must surface claude's OWN reason, not

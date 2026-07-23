@@ -177,6 +177,19 @@ pub struct PendingStop {
     pub job_id: String,
 }
 
+/// The open "stop this agent?" confirmation, shown when `Ctrl-K` (interrupt) targets
+/// a LIVE agent that is not already finished: stopping it abandons live work, so the
+/// user confirms first (`Enter`) or cancels (`Esc`). A simple yes/no gate (no
+/// navigation). Distinct from [`PendingStop`], which is the reply's stop-THEN-reply
+/// pre-step; this one resolves into an actual `claude stop` and nothing more.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingInterrupt {
+    /// Stable `session_id` the interrupt targets — kept only to label the modal.
+    pub session_id: String,
+    /// Short agent-view job id to `claude stop` on confirm.
+    pub job_id: String,
+}
+
 /// A quick-reply send that is IN FLIGHT (dispatched, not yet finished).
 ///
 /// Carries everything the preview needs to render the reply OPTIMISTICALLY while
@@ -543,6 +556,11 @@ pub struct App {
     /// modal owns the keyboard (`Ctrl-R` on a `needs input` background agent, before
     /// compose opens).
     pub pending_stop: Option<PendingStop>,
+    /// The open "stop this agent?" interrupt confirmation, if any. `Some` while that
+    /// modal owns the keyboard (`Ctrl-K` on a live, not-yet-finished agent). Distinct
+    /// from [`pending_stop`](Self::pending_stop): this resolves into a bare
+    /// `claude stop`, not a reply.
+    pub pending_interrupt: Option<PendingInterrupt>,
     /// The quick-reply send that is IN FLIGHT (dispatched, not yet finished), or
     /// `None`. Drives the optimistic in-preview echo of the message plus the
     /// animated "sending… / cooking…" indicator so the reply feels instant; set
@@ -669,6 +687,7 @@ impl App {
             reported_agents: HashMap::new(),
             live_probe: Box::new(default_live_probe),
             modal: None,
+            pending_interrupt: None,
             compose: None,
             pending_stop: None,
             sending: None,
@@ -1285,16 +1304,17 @@ impl App {
     /// (splitter drag / link open) from firing while an overlay is up — so a later
     /// gate extension lives in exactly one place.
     ///
-    /// True while a [`Modal`] is open, the quick-reply compose zone or the
-    /// stop-the-agent confirmation owns the keyboard, OR a `Ctrl-X` leader chord is
-    /// [pending](Self::pending_chord): each takes the keyboard, so each must equally
-    /// gate the mouse (a stray click mid-chord must not start a drag or open a
-    /// link), per PATTERNS §10.
+    /// True while a [`Modal`] is open, the quick-reply compose zone, the
+    /// stop-then-reply confirmation, or the interrupt confirmation owns the
+    /// keyboard, OR a `Ctrl-X` leader chord is [pending](Self::pending_chord): each
+    /// takes the keyboard, so each must equally gate the mouse (a stray click
+    /// mid-chord must not start a drag or open a link), per PATTERNS §10.
     #[must_use]
     pub fn overlay_active(&self) -> bool {
         self.modal.is_some()
             || self.compose.is_some()
             || self.pending_stop.is_some()
+            || self.pending_interrupt.is_some()
             || self.pending_chord
     }
 
@@ -1306,6 +1326,17 @@ impl App {
     /// Dismiss the stop confirmation, returning to the board.
     pub fn stop_confirm_cancel(&mut self) {
         self.pending_stop = None;
+    }
+
+    /// Open the "stop this agent?" interrupt confirmation for a live, not-yet-finished
+    /// agent (`Ctrl-K`).
+    pub fn open_interrupt_confirm(&mut self, session_id: String, job_id: String) {
+        self.pending_interrupt = Some(PendingInterrupt { session_id, job_id });
+    }
+
+    /// Dismiss the interrupt confirmation, returning to the board.
+    pub fn interrupt_confirm_cancel(&mut self) {
+        self.pending_interrupt = None;
     }
 
     /// Whether the quick-reply compose zone owns the keyboard. Gates key routing

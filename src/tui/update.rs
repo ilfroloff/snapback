@@ -22,6 +22,7 @@
 //! | `Ctrl-F` | fork-resume the selected session |
 //! | `Ctrl-N` | start a new session in the launch directory (pick an agent when any are defined) |
 //! | `Ctrl-R` | quick-reply: send a one-shot message to the selected session without leaving the board (a finished/waiting background agent is stopped first so the reply can land in place) |
+//! | `Ctrl-K` | stop / interrupt the selected session's live background agent (`claude stop`); a finished agent stops at once, any other live agent confirms first |
 //! | `Tab` | toggle name-only vs. name+content search |
 //! | `Ctrl-A` | toggle scope (current-folder <-> all) |
 //! | `Ctrl-X` then `x`/`d`/`h` | leader chord: hide / hard-delete / toggle show-hidden (any other key cancels) |
@@ -49,7 +50,7 @@ use ratatui::layout::{Position, Rect};
 use crate::defined_agents;
 use crate::delete;
 use crate::resume::{self, Ready};
-use crate::send::{self, ReplyGate, SendRequest};
+use crate::send::{self, InterruptGate, InterruptRequest, ReplyGate, SendRequest};
 use crate::store::SessionStore;
 use crate::watch::AppEvent;
 
@@ -88,6 +89,11 @@ pub enum Action {
     /// refused (sending in place would branch its transcript) — and only opens the
     /// compose modal for an idle one.
     Reply,
+    /// Stop / interrupt the selected session's live background agent (`Ctrl-K`).
+    /// [`apply_action`] runs the interrupt gate ([`send::interrupt_gate`]): a
+    /// finished agent is stopped immediately, any other live agent confirms first,
+    /// and a non-live or interactive session is refused with a hint.
+    Interrupt,
     /// Toggle name-only vs. name+content search.
     ToggleSearchMode,
     /// Toggle current-folder vs. all scope.
@@ -142,6 +148,13 @@ pub enum Outcome {
     /// stays pure and unit-testable, the way [`Resume`](Self::Resume) carries a
     /// confirmed [`Ready`].
     Send(SendRequest),
+    /// Fire a one-shot interrupt (`claude stop <job-id>`) on a detached thread and
+    /// KEEP running — like [`Send`](Self::Send), the board never tears down. Handled
+    /// inline by [`crate::tui::run`]; the stop reports back via
+    /// [`AppEvent::InterruptFinished`](crate::watch::AppEvent::InterruptFinished).
+    /// Carried as data (rather than spawned in the handler) so the interrupt DECISION
+    /// stays pure and unit-testable, the way [`Send`](Self::Send) carries a request.
+    Interrupt(InterruptRequest),
 }
 
 /// Map a keypress to an [`Action`]. `query_empty` disambiguates the `j`/`k`/`q`
@@ -161,6 +174,7 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool) -> Action {
             KeyCode::Char('a') | KeyCode::Char('A') => Action::ToggleScope,
             KeyCode::Char('n') | KeyCode::Char('N') => Action::NewSession,
             KeyCode::Char('r') | KeyCode::Char('R') => Action::Reply,
+            KeyCode::Char('k') | KeyCode::Char('K') => Action::Interrupt,
             KeyCode::Char('c') | KeyCode::Char('C') => Action::Quit,
             // Ctrl-X (0x18 CAN) is the hide/delete leader chord. Unbound and
             // terminal-safe — unlike Ctrl-H/I/M, which alias Backspace/Tab/Enter.
@@ -238,6 +252,11 @@ pub fn handle_event(app: &mut App, event: AppEvent, root: &Path) -> Outcome {
             if app.pending_stop.is_some() {
                 return handle_stop_confirm_key(app, key);
             }
+            // The "stop this agent?" interrupt confirmation likewise owns the keyboard
+            // until it resolves into a stop (Enter) or is dismissed (Esc).
+            if app.pending_interrupt.is_some() {
+                return handle_interrupt_confirm_key(app, key);
+            }
             // The quick-reply compose zone owns the keyboard while open: every key
             // routes to the compose handler (Enter sends, Ctrl-J/Alt+Enter add a
             // newline, Esc cancels, the rest edit the buffer), bypassing
@@ -287,6 +306,14 @@ pub fn handle_event(app: &mut App, event: AppEvent, root: &Path) -> Outcome {
             if app.selected.as_deref() == Some(session_id.as_str()) {
                 app.preview_bottom();
             }
+            Outcome::Continue
+        }
+        AppEvent::InterruptFinished { status } => {
+            // A one-shot interrupt (`claude stop`) completed off-thread; surface its
+            // result. The live badge clears on the next agents poll (~1s), and the
+            // transcript is unchanged (stopping keeps the conversation), so there is
+            // nothing else to reconcile.
+            app.set_status(status);
             Outcome::Continue
         }
         AppEvent::Tick => {
@@ -526,6 +553,7 @@ fn apply_action(app: &mut App, action: Action) -> Outcome {
         }
         Action::NewSession => new_session(app),
         Action::Reply => reply(app),
+        Action::Interrupt => interrupt(app),
         Action::ToggleSearchMode => {
             app.toggle_search_mode();
             Outcome::Continue
@@ -918,6 +946,80 @@ fn handle_stop_confirm_key(app: &mut App, key: KeyEvent) -> Outcome {
         _ => {}
     }
     Outcome::Continue
+}
+
+/// Handle `Ctrl-K` (interrupt). Ask claude what it is holding the SELECTED session
+/// as, one-shot, then route via [`send::interrupt_gate`].
+///
+/// Unlike a reply, an interrupt is MEANT to stop live work, so a `working` agent is
+/// a valid target here. `claude stop <job-id>` deregisters the job (keeping the
+/// conversation); it needs the SHORT agent-view id, which only a background job has:
+///
+/// * not held / no job id → refuse ([`send::INTERRUPT_NOT_LIVE`] /
+///   [`send::INTERRUPT_NO_JOB_ID`]);
+/// * `done` → stop immediately (harmless; nothing runs);
+/// * any other live state → CONFIRM first ([`App::open_interrupt_confirm`]) —
+///   stopping abandons live work — then stop on confirm.
+///
+/// The probe is the SAME authoritative bare read the resume/reply gates use
+/// ([`App::live_agent_now`]) — never the polled `--all` map — a one-shot at a
+/// hand-off (the documented OFF-UI-THREAD exception, PATTERNS.md §6). The id is
+/// cloned so the `&Session` borrow ends before the probe and the app mutations.
+fn interrupt(app: &mut App) -> Outcome {
+    let Some(id) = app.selected_session().map(|s| s.session_id.clone()) else {
+        return Outcome::Continue;
+    };
+    match send::interrupt_gate(app.live_agent_now(&id).as_ref()) {
+        InterruptGate::StopNow { job_id } => dispatch_interrupt(app, &job_id),
+        InterruptGate::Confirm { job_id } => {
+            app.open_interrupt_confirm(id, job_id);
+            Outcome::Continue
+        }
+        InterruptGate::Refuse(message) => {
+            app.set_status(message);
+            Outcome::Continue
+        }
+    }
+}
+
+/// Build the interrupt request, set the in-flight status, and escalate to the driver
+/// so the spawn stays OUT of this pure handler (mirroring how a send returns
+/// [`Outcome::Send`]). `claude stop` acts on the global job registry, so the child
+/// runs in the launch dir — never a re-read of the session's `cwd`, which a deleted
+/// worktree could have removed even while its job is still live.
+fn dispatch_interrupt(app: &mut App, job_id: &str) -> Outcome {
+    let req = InterruptRequest {
+        argv: send::build_stop_argv(job_id),
+        cwd: app.launch_dir.clone(),
+    };
+    app.set_status(send::INTERRUPT_IN_FLIGHT);
+    Outcome::Interrupt(req)
+}
+
+/// Apply a keypress while the "stop this agent?" interrupt confirmation is open.
+///
+/// `Enter` confirms — the agent is stopped — so it resolves into
+/// [`Outcome::Interrupt`]; `Esc`/`Ctrl-C` dismiss and return to the board. Any other
+/// key is ignored: this is a deliberate confirmation, not a fat-finger.
+fn handle_interrupt_confirm_key(app: &mut App, key: KeyEvent) -> Outcome {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Enter => {
+            if let Some(pending) = app.pending_interrupt.take() {
+                return dispatch_interrupt(app, &pending.job_id);
+            }
+            Outcome::Continue
+        }
+        KeyCode::Esc => {
+            app.interrupt_confirm_cancel();
+            Outcome::Continue
+        }
+        KeyCode::Char('c' | 'C') if ctrl => {
+            app.interrupt_confirm_cancel();
+            Outcome::Continue
+        }
+        _ => Outcome::Continue,
+    }
 }
 
 /// Run the new-session existence gate for `agent` (`None` = no agent) while the
@@ -1315,6 +1417,129 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         assert!(app.pending_stop.is_none(), "Esc dismisses the prompt");
         assert!(!app.is_composing(), "Esc composes nothing");
+    }
+
+    /// Ctrl-K routes by the live agent's state: `done` → stop immediately (escalates
+    /// to `Outcome::Interrupt`); every OTHER live state → the interrupt confirmation
+    /// first; not held → refuse (nothing to stop); interactive (no job id) → refuse.
+    /// The stop argv carries the SHORT job id and runs in the launch dir.
+    #[test]
+    fn ctrl_k_routes_by_agent_state() {
+        fn held(id: &str, state: &str, job: Option<&str>) -> HashMap<String, ReportedAgent> {
+            let mut map = HashMap::new();
+            map.insert(
+                id.to_string(),
+                ReportedAgent {
+                    kind: "background".to_string(),
+                    id: job.map(str::to_owned),
+                    state: Some(state.to_string()),
+                    status: None,
+                    name: None,
+                },
+            );
+            map
+        }
+        let app_for = |id: &str, state: &str, job: Option<&str>| {
+            let mut app = App::new(vec![session(id)], Scope::All, PathBuf::from("/tmp"));
+            let live = held(id, state, job);
+            app.set_live_probe(move || live.clone());
+            app
+        };
+
+        // done -> stop immediately: Outcome::Interrupt with the stop argv, no confirm.
+        let mut app = app_for("done-1", "done", Some("job-k"));
+        let outcome = press_ctrl(&mut app, KeyCode::Char('k'));
+        let Outcome::Interrupt(req) = outcome else {
+            panic!("a done agent stops immediately");
+        };
+        assert_eq!(req.argv.join(" "), "claude stop job-k");
+        assert_eq!(
+            req.cwd,
+            PathBuf::from("/tmp"),
+            "stop runs in the launch dir"
+        );
+        assert!(
+            app.pending_interrupt.is_none(),
+            "done needs no confirmation"
+        );
+        assert_eq!(app.status.as_deref(), Some(send::INTERRUPT_IN_FLIGHT));
+
+        // Every OTHER live state confirms first — including `working`, which the reply
+        // gate (Ctrl-R) refuses. Interrupting live work is the whole point here.
+        for state in ["working", "idle", "blocked", "waiting"] {
+            let mut app = app_for("live-1", state, Some("job-k"));
+            let outcome = press_ctrl(&mut app, KeyCode::Char('k'));
+            assert!(
+                matches!(outcome, Outcome::Continue),
+                "{state:?} opens a confirm, not an immediate stop"
+            );
+            let Some(pending) = app.pending_interrupt.as_ref() else {
+                panic!("{state:?} must open the interrupt confirmation");
+            };
+            assert_eq!(pending.session_id, "live-1");
+            assert_eq!(pending.job_id, "job-k");
+        }
+
+        // Not held at all -> nothing to stop.
+        let mut app = App::new(vec![session("free-1")], Scope::All, PathBuf::from("/tmp"));
+        app.set_live_probe(HashMap::new);
+        press_ctrl(&mut app, KeyCode::Char('k'));
+        assert!(app.pending_interrupt.is_none());
+        assert_eq!(app.status.as_deref(), Some(send::INTERRUPT_NOT_LIVE));
+
+        // Live but interactive (no stoppable job id) -> refuse with the right hint.
+        let mut app = app_for("inter-1", "working", None);
+        press_ctrl(&mut app, KeyCode::Char('k'));
+        assert!(app.pending_interrupt.is_none());
+        assert_eq!(app.status.as_deref(), Some(send::INTERRUPT_NO_JOB_ID));
+    }
+
+    /// Confirming the interrupt prompt (`Enter`) escalates to `Outcome::Interrupt`
+    /// carrying the stop argv and closes the prompt; `Esc` dismisses it and stops
+    /// nothing.
+    #[test]
+    fn interrupt_confirmation_enter_stops_and_esc_cancels() {
+        fn working(id: &str) -> HashMap<String, ReportedAgent> {
+            let mut map = HashMap::new();
+            map.insert(
+                id.to_string(),
+                ReportedAgent {
+                    kind: "background".to_string(),
+                    id: Some("job-z".to_string()),
+                    state: Some("working".to_string()),
+                    status: None,
+                    name: None,
+                },
+            );
+            map
+        }
+
+        // Enter -> the stop is dispatched carrying the job id; the confirmation closes.
+        let mut app = App::new(vec![session("w")], Scope::All, PathBuf::from("/tmp"));
+        let live = working("w");
+        app.set_live_probe(move || live.clone());
+        press_ctrl(&mut app, KeyCode::Char('k'));
+        assert!(app.pending_interrupt.is_some());
+        let outcome = press(&mut app, KeyCode::Enter);
+        let Outcome::Interrupt(req) = outcome else {
+            panic!("confirming dispatches the stop");
+        };
+        assert_eq!(req.argv.join(" "), "claude stop job-z");
+        assert!(
+            app.pending_interrupt.is_none(),
+            "confirming closes the prompt"
+        );
+        assert_eq!(app.status.as_deref(), Some(send::INTERRUPT_IN_FLIGHT));
+
+        // Esc -> dismiss, stop nothing.
+        let mut app = App::new(vec![session("w")], Scope::All, PathBuf::from("/tmp"));
+        let live = working("w");
+        app.set_live_probe(move || live.clone());
+        press_ctrl(&mut app, KeyCode::Char('k'));
+        assert!(app.pending_interrupt.is_some());
+        let outcome = press(&mut app, KeyCode::Esc);
+        assert!(matches!(outcome, Outcome::Continue));
+        assert!(app.pending_interrupt.is_none(), "Esc dismisses the prompt");
     }
 
     /// While composing, ordinary keys edit the buffer, Ctrl-J inserts a newline,

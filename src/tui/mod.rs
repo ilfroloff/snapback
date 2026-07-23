@@ -452,6 +452,12 @@ fn run_inner(terminal: &mut DefaultTerminal, app: &mut App, root: &Path) -> Resu
                 Outcome::Send(req) => {
                     crate::send::spawn_send(req, events.sender());
                 }
+                // A confirmed interrupt: fire `claude stop` on a detached thread and
+                // KEEP drawing, exactly like `Outcome::Send`. The stop reports back
+                // via `AppEvent::InterruptFinished` on this same channel.
+                Outcome::Interrupt(req) => {
+                    crate::send::spawn_interrupt(req, events.sender());
+                }
                 done => break done,
             },
             // All senders dropped (input + watcher + tick gone): exit cleanly.

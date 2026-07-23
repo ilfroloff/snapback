@@ -47,7 +47,7 @@ an inline test asserting the exact string, so drift here is caught by
 | Dispatch a DEFINED agent | `claude --agent <name>` | `src/resume.rs` |
 | Attach to a live background job | `claude attach <job-id>` | `resume::build_attach_argv` |
 | Quick-send a reply (non-interactive) | `claude -p -r <session-id> --output-format json <message>` | `send::build_send_argv` (`src/send.rs`) |
-| Release a held job before a reply | `claude stop <job-id>` | `send::build_stop_argv` |
+| Release a held job before a reply, or interrupt a selected agent (`Ctrl-K`) | `claude stop <job-id>` | `send::build_stop_argv` |
 | Detect live agents (gate probe) | `claude agents --json` | `agents::agents_argv` (`src/agents.rs`) |
 | Detect live agents (incl. just-finished) | `claude agents --json --all` | `agents::agents_argv` |
 
@@ -193,6 +193,25 @@ Because they are undocumented in `--help`, a version bump can change or remove
 them without a visible help diff. If `snapback`'s attach/send paths regress after
 a `claude` update, re-verify these two first with `claude stop --help` /
 `claude attach --help`.
+
+## Returning to snapback from inside a session
+
+`snapback` regains control only when the spawned `claude` child hands the terminal
+back (the dashboard loop in [ARCHITECTURE.md](ARCHITECTURE.md#the-persistent-dashboard-loop-librun)
+blocks in `resume::launch` until then). From inside a resumed session there are
+three ways to trigger that, and they are NOT equivalent — the README steers users
+to the first two:
+
+| Action | What it does | Hand-back |
+| --- | --- | --- |
+| `/bg` (alias `/background`) | Slash command: detaches the session to keep running as a background agent and frees the terminal. Control returns to the board, and the session reappears on the list with a live `bg` badge (Attach / quick-reply / fork later). Works the same in a plain-resumed and an attached session. | Clean. |
+| `/exit` | Slash command: ends the session and returns to the board. | Clean. |
+| `Ctrl+Z` | Only a clean detach when ATTACHED to a background agent (Claude Code intercepts it — see the `attach` row above). In a REGULAR interactive session it is an OS `SIGTSTP` suspend and can hand the terminal back dirty. | Dirty in the regular case — `hard_reset` repaints from a known-good state on return (see the terminal-safety seams). |
+
+`Ctrl+Z` is the path the return-leg terminal recovery exists to survive, not the
+recommended way out. There is currently no Claude Code keybinding action that
+backgrounds a session (`~/.claude/keybindings.json` exposes no `/bg` equivalent
+and does not bind slash commands), so `/bg` must be typed.
 
 ## Selected subcommand flags
 

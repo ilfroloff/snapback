@@ -92,6 +92,18 @@ pub enum AppEvent {
         /// nothing to say).
         status: Option<String>,
     },
+    /// A one-shot interrupt (`claude stop <job-id>`) finished, delivered OFF the UI
+    /// thread by the detached interrupt driver (see [`crate::send::spawn_interrupt`]).
+    ///
+    /// Like [`SendFinished`](Self::SendFinished) it fires EXACTLY ONCE per interrupt,
+    /// from a thread spawned for that one stop. `status` is the mapped result
+    /// (`"stopped"` on success, a reason on failure — see
+    /// [`crate::send::status_for_stop`]); there is nothing to key by row because
+    /// stopping leaves the transcript unchanged.
+    InterruptFinished {
+        /// Mapped board status for the completed interrupt.
+        status: String,
+    },
     /// A periodic wake-up. The update loop does nothing costly on this.
     Tick,
 }

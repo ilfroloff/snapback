@@ -103,6 +103,7 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | `Ctrl-F` | **Fork** the selected session into a copy — available for any session, running or not |
 | `Ctrl-N` | **Start a new session** in the launch directory; if you have Claude Code agents defined, pick one first (or `default (no agent)`) |
 | `Ctrl-R` | **Quick reply** — send a one-shot message to the selected session without leaving the board; a finished (`done`) or waiting (`needs input`) background agent is stopped first (with a confirm for a waiting one) so the reply lands in place. Opens a compose box (`Enter` sends, `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels) |
+| `Ctrl-K` | **Stop / interrupt** the selected session's live background agent (`claude stop`). A finished (`done`) agent stops immediately; any other live agent (`working`, `needs input`, `idle`) confirms first, since stopping ends the live job (its conversation is kept). An interactive session running in another terminal can't be stopped from here |
 | `Ctrl-X` then `x` / `d` / `h` | **Leader chord** for hide & delete — `x` **hides** the selected session (reversible, persisted), `d` **hard-deletes** it after a confirmation, `h` toggles **show hidden**. Any other key cancels the chord |
 | `Tab` | Toggle search: **name-only ↔ name+content** |
 | `Ctrl-A` | Toggle scope: **current folder ↔ all folders** |
@@ -123,6 +124,24 @@ select/copy text natively, hold **Shift** (or **Option/⌥** on iTerm2 and macOS
 Terminal). The header shows the active scope, the search mode, and a
 `matched / total` count, with a version on the right — a release build shows the
 version number, a local dev build is marked as such.
+
+### Getting back to the board from inside a session
+
+Once you've resumed into a Claude Code session, the tidy ways back to snapback are
+slash commands you type in Claude, not a snapback key:
+
+- **`/bg`** — detaches the session so it keeps running as a background agent and
+  drops you straight back onto the board. It behaves the same whether you resumed
+  a regular session or attached to a running one, and the session reappears on the
+  list with a live `bg` badge — so you can Attach, quick-reply (`Ctrl-R`), or fork
+  it later.
+- **`/exit`** — ends the session and returns you to the board.
+
+Prefer either over `Ctrl-Z` as a way out: it only detaches cleanly when you're
+*attached* to a background agent (Claude Code intercepts it). In a regular
+interactive session it's an OS suspend (`SIGTSTP`) that can hand the terminal back
+dirty — snapback repaints from a known-good state on return, but `/bg` (keep it
+running) and `/exit` (end it) are the clean exits.
 
 ---
 

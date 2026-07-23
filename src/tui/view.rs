@@ -85,6 +85,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if app.pending_stop.is_some() {
         render_stop_confirm(frame, app);
     }
+    // The "stop this agent?" interrupt confirmation (Ctrl-K); mutually exclusive with
+    // the other modals (each owns the keyboard while open).
+    if app.pending_interrupt.is_some() {
+        render_interrupt_confirm(frame, app);
+    }
 }
 
 /// Prefix for a release build's version indicator (`v0.1.0`); the leading `v`
@@ -1528,7 +1533,7 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         )])
     } else {
         Line::from(vec![Span::styled(
-            "↑↓/jk move · ←/→ fold/expand · Enter resume · ^F fork · ^N new · ^R reply · ^X hide/del · type to search · Tab name/content · ^A scope · ^/ preview · PgUp/PgDn·^U/^D·Home/End·wheel scroll · q/Esc quit",
+            "↑↓/jk move · ←/→ fold/expand · Enter resume · ^F fork · ^N new · ^R reply · ^K stop · ^X hide/del · type to search · Tab name/content · ^A scope · ^/ preview · PgUp/PgDn·^U/^D·Home/End·wheel scroll · q/Esc quit",
             Style::default().add_modifier(Modifier::DIM),
         )])
     };
@@ -1627,6 +1632,57 @@ fn render_stop_confirm(frame: &mut Frame, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" stop the waiting agent? ");
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .alignment(Alignment::Center),
+        area,
+    );
+}
+
+/// The "stop this agent?" interrupt confirmation overlay, shown when `Ctrl-K`
+/// targets a live, not-yet-finished agent. Confirming runs `claude stop <job-id>`,
+/// ending the live job (its conversation is kept) — an interrupt, so the wording
+/// says nothing about a reply, unlike [`render_stop_confirm`].
+///
+/// Drawn last (on top of the board) with a [`Clear`]. Pure presentation — the target
+/// session and the job id live on [`App::pending_interrupt`]; styled with named
+/// colors only (TERMINAL-SAFE STYLING).
+fn render_interrupt_confirm(frame: &mut Frame, app: &App) {
+    let Some(pending) = &app.pending_interrupt else {
+        return;
+    };
+    let label = app
+        .session_by_id(&pending.session_id)
+        .map(|s| s.label.as_str())
+        .filter(|l| !l.is_empty())
+        .unwrap_or(pending.session_id.as_str());
+    let area = centered_rect(frame.area(), 64, 8);
+
+    let lines = vec![
+        Line::from(Span::styled(
+            "This session is running as an agent.",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::raw(format!("Stop it?  —  {label}"))),
+        Line::from(Span::styled(
+            "(ends the live agent; its conversation is kept)",
+            Style::default().add_modifier(Modifier::DIM),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Enter  stop    \u{b7}    Esc  cancel",
+            Style::default().add_modifier(Modifier::DIM),
+        )),
+    ];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" stop this agent? ");
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines)
