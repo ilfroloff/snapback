@@ -22,7 +22,7 @@ use time::OffsetDateTime;
 
 use crate::agents::{self, AgentActivity, ReportedAgent};
 use crate::search::SearchMode;
-use crate::store::preview::LinkRegion;
+use crate::store::preview::{self, LinkRegion};
 
 use super::app::{resolve_list_width, App, Modal, ModalChoice, ModalLayout, Row, Scope};
 
@@ -898,8 +898,13 @@ fn blink_visible(tick: u64) -> bool {
 /// the agent status, so the reply feels instant.
 pub(crate) fn preview_banner(app: &App) -> Option<Line<'static>> {
     let selected = app.selected.as_deref()?;
-    if app.sending.as_deref() == Some(selected) {
-        return Some(sending_banner(app, selected));
+    // A quick-reply in flight owns the preview: the message and the
+    // sending/cooking indicator render INLINE at the transcript's tail
+    // ([`sending_tail`] / [`preview::pending_reply_turns`]), so there is no pinned
+    // banner row. The click hit-test asks THIS fn for the geometry, so returning
+    // `None` here keeps render and hit-test agreeing that no banner is drawn.
+    if app.sending_to(selected).is_some() {
+        return None;
     }
     let agent = app.reported_agent(selected)?;
     // Cyan + BOLD marks the line as the board speaking rather than transcript
@@ -925,20 +930,42 @@ fn spinner_frame(tick: u64) -> &'static str {
     SPINNER_FRAMES[(tick as usize) % SPINNER_FRAMES.len()]
 }
 
-/// The live indicator shown while a quick-reply send to `session_id` is in flight:
-/// a spinner plus "sending…" — or "cooking…" once claude is actively working the
-/// turn (as the agents poll reports it), so the two phases read distinctly. Cyan +
-/// BOLD like the agent banner it stands in for; animated off `App::tick`.
-fn sending_banner(app: &App, session_id: &str) -> Line<'static> {
+/// The optimistic reply turns appended to the transcript of the CURRENTLY selected
+/// session while a quick-reply send to it is in flight, or `None` when no send is
+/// in flight for the selected row.
+///
+/// So the reply feels instant, the message you just sent shows immediately under a
+/// synthetic `▶ you` turn, followed by a live `● claude` "sending…/cooking…"
+/// placeholder — the same two phases the pinned banner once showed, now INLINE in
+/// the transcript flow (see [`preview::pending_reply_turns`]).
+///
+/// The `▶ you` echo is dropped the instant claude writes the REAL user turn to
+/// disk — detected by the session's turn count growing past the count captured at
+/// send time ([`super::app::Sending::baseline_msg_count`]) — so the real turn (which
+/// arrives via the ordinary watcher → reload path and is styled identically) simply
+/// takes its place, never doubling the line. The `● claude` placeholder stays until
+/// the send completes and [`App::sending`] is cleared.
+fn sending_tail(app: &App, inner_width: u16) -> Option<Vec<Line<'static>>> {
+    let selected = app.selected.as_deref()?;
+    let sending = app.sending_to(selected)?;
+    // Once claude has written the real user turn, the session's turn count exceeds
+    // the send-time baseline; until then, echo the message so it is visible during
+    // the disk-write latency.
+    let landed = app
+        .session_by_id(selected)
+        .is_some_and(|s| s.msg_count > sending.baseline_msg_count);
+    let echo = (!landed).then_some(sending.message.as_str());
+    // "sending…" until claude reports the session working, then "cooking…", so the
+    // two phases still read distinctly.
     let cooking = app
-        .reported_agent(session_id)
+        .reported_agent(selected)
         .is_some_and(|a| agents::classify(a) == AgentActivity::Working);
-    let label = if cooking { "cooking" } else { "sending" };
-    Line::from(Span::styled(
-        format!("{} {label}\u{2026}", spinner_frame(app.tick)),
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
+    let phase = if cooking { "cooking" } else { "sending" };
+    let label = format!("{} {phase}\u{2026}", spinner_frame(app.tick));
+    Some(preview::pending_reply_turns(
+        echo,
+        &label,
+        usize::from(inner_width),
     ))
 }
 
@@ -1134,7 +1161,17 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     let inner_width = transcript_area.width;
     let inner_height = transcript_area.height;
 
-    let text = app.preview_text(inner_width);
+    // Optimistic reply turns for an in-flight send, resolved BEFORE the mutable
+    // preview borrow so the message you just sent shows immediately at the tail.
+    let reply_tail = sending_tail(app, inner_width);
+    // A send in flight for the selected row also FOLLOWS the bottom, so the echo —
+    // and then the real turns as they land — stay in view without a manual scroll.
+    let follow_bottom = app.preview_follow_bottom || reply_tail.is_some();
+
+    let mut text = app.preview_text(inner_width);
+    if let Some(tail) = reply_tail {
+        text.lines.extend(tail);
+    }
     // Nothing selected (no text AND no banner, since a banner implies a SELECTED
     // session claude reported). A reported session whose transcript is still
     // empty falls through instead: its banner is the one thing worth drawing, and
@@ -1169,12 +1206,7 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
 
     // The wrapped height sums each styled line's display width (via `Line::width`).
     let content_h = wrapped_rows(text.lines.iter().map(Line::width), inner_width);
-    let offset = clamp_preview_offset(
-        app.preview_follow_bottom,
-        app.preview_scroll,
-        content_h,
-        inner_height,
-    );
+    let offset = clamp_preview_offset(follow_bottom, app.preview_scroll, content_h, inner_height);
     // Persist the resolved geometry so the scroll keys stay in bounds and can
     // size a page on the next keypress.
     app.preview_scroll = offset;
@@ -2537,18 +2569,27 @@ mod tests {
         );
     }
 
-    /// While a send is in flight for the selected session, the preview banner shows
-    /// a "sending…" indicator (even with no reported agent), and becomes "cooking…"
-    /// once claude reports the session working — standing in for the agent banner.
+    /// While a send is in flight for the selected session the pinned banner is
+    /// SUPPRESSED (so it cannot desync the hit-test) and the send renders INLINE at
+    /// the transcript tail: the echoed message under a `▶ you` turn plus a
+    /// "sending…" placeholder that becomes "cooking…" once claude reports working.
+    /// The `▶ you` echo drops the instant the real turn lands on disk; when the send
+    /// finishes the banner yields back to the agent status.
     #[test]
-    fn preview_banner_shows_the_in_flight_send_indicator() {
-        let banner_text = |app: &App| -> Option<String> {
-            preview_banner(app).map(|line| {
-                line.spans
-                    .iter()
-                    .map(|s| s.content.as_ref())
-                    .collect::<String>()
-            })
+    fn an_in_flight_send_renders_inline_and_suppresses_the_banner() {
+        use super::super::app::Sending;
+
+        let flatten_lines = |lines: &[Line<'static>]| -> String {
+            lines
+                .iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
         };
 
         let mut app = App::new(
@@ -2556,17 +2597,33 @@ mod tests {
             Scope::All,
             PathBuf::from("/tmp/launch"),
         );
-        // Nothing in flight and no reported agent -> no banner.
-        assert!(banner_text(&app).is_none());
+        app.selected = Some("sess-normal-1".to_string());
 
-        // In flight -> "sending…", even without a reported agent.
-        app.sending = Some("sess-normal-1".to_string());
-        let text = banner_text(&app).expect("an in-flight send shows a banner");
+        // Nothing in flight and no reported agent -> no banner, no inline tail.
+        assert!(preview_banner(&app).is_none());
+        assert!(sending_tail(&app, 80).is_none());
+
+        // In flight, nothing on disk yet (msg_count still the baseline) -> the
+        // pinned banner is suppressed and the tail echoes the message + "sending…".
+        app.sending = Some(Sending {
+            session_id: "sess-normal-1".to_string(),
+            message: "please summarize this".to_string(),
+            baseline_msg_count: 0,
+        });
         assert!(
-            text.contains("sending"),
-            "in-flight reads 'sending': {text:?}"
+            preview_banner(&app).is_none(),
+            "an in-flight send suppresses the pinned banner"
         );
-        assert!(!text.contains("cooking"));
+        let tail = flatten_lines(&sending_tail(&app, 80).expect("an in-flight send has a tail"));
+        assert!(
+            tail.contains("\u{25b6} you") && tail.contains("please summarize this"),
+            "the sent message is echoed under a `you` turn: {tail:?}"
+        );
+        assert!(
+            tail.contains("\u{25cf} claude") && tail.contains("sending"),
+            "a pending claude turn reads 'sending': {tail:?}"
+        );
+        assert!(!tail.contains("cooking"));
 
         // Once claude reports it working -> "cooking…".
         let mut reported = HashMap::new();
@@ -2581,15 +2638,35 @@ mod tests {
             },
         );
         app.set_reported_agents(reported);
-        let text = banner_text(&app).expect("still in flight");
-        assert!(text.contains("cooking"), "working -> 'cooking': {text:?}");
+        let tail = flatten_lines(&sending_tail(&app, 80).expect("still in flight"));
+        assert!(tail.contains("cooking"), "working -> 'cooking': {tail:?}");
 
-        // Send done -> the indicator yields back to the agent banner.
-        app.sending = None;
-        let text = banner_text(&app).expect("the reported agent still has a banner");
+        // The real user turn lands on disk (turn count grows past the baseline) ->
+        // the echo steps aside, leaving only the pending claude placeholder so the
+        // real turn (rendered by the reload) is not doubled.
+        app.sessions[0].msg_count = 1;
+        let tail = flatten_lines(&sending_tail(&app, 80).expect("still in flight"));
         assert!(
-            !text.contains("sending") && !text.contains("cooking"),
-            "no longer in flight: {text:?}"
+            !tail.contains("please summarize this") && !tail.contains("\u{25b6} you"),
+            "the echo yields to the real turn once it lands: {tail:?}"
+        );
+        assert!(
+            tail.contains("\u{25cf} claude") && tail.contains("cooking"),
+            "the pending claude placeholder stays until the send finishes: {tail:?}"
+        );
+
+        // Send done -> no inline tail; the banner yields back to the agent status.
+        app.sending = None;
+        assert!(sending_tail(&app, 80).is_none());
+        let banner = preview_banner(&app).expect("the reported agent still has a banner");
+        let banner_text = banner
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        assert!(
+            !banner_text.contains("sending") && !banner_text.contains("cooking"),
+            "no longer in flight: {banner_text:?}"
         );
     }
 

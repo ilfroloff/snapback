@@ -655,6 +655,20 @@ interactive turn. Because it needs no terminal, it runs on a detached thread whi
 the board stays up, and the reply renders through the ordinary `SessionWatcher` →
 `SessionsChanged` → reload → preview path.
 
+**Optimistic in-flight echo.** Because `claude -p` writes the user turn only after a
+network round trip, the reload path alone would leave the preview showing stale
+content for the first seconds after Send. So while the send is in flight (`App::sending`,
+which carries the message and the session's turn count AT SEND TIME), the preview
+appends two synthetic turns via `store::preview::pending_reply_turns`: the sent
+message under a `▶ you` turn plus a live `● claude` **sending… / cooking…**
+placeholder, and it FOLLOWS the bottom so both stay in view. The `▶ you` echo is
+dropped the instant the real turn lands on disk — detected by the reloaded
+`Session::msg_count` growing past `Sending::baseline_msg_count` — so the real turn
+(styled identically) takes its place with no doubling; the placeholder stays until
+`AppEvent::SendFinished` clears `App::sending`. The pinned status banner is SUPPRESSED
+while a send is in flight (`view::preview_banner` returns `None`, keeping render and
+the click hit-test agreeing on the geometry), since the inline turns replace it.
+
 The load-bearing constraint: **claude will not resume a session it is holding as a
 live agent.** `claude -p -r <id>` on such a session exits non-zero, verbatim:
 

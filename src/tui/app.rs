@@ -177,6 +177,28 @@ pub struct PendingStop {
     pub job_id: String,
 }
 
+/// A quick-reply send that is IN FLIGHT (dispatched, not yet finished).
+///
+/// Carries everything the preview needs to render the reply OPTIMISTICALLY while
+/// `claude -p -r` runs: the target session, the message that was sent, and the
+/// session's turn count AT SEND TIME. The count is the dedup signal — while the
+/// reloaded session still reports `baseline_msg_count`, claude has not yet written
+/// the user turn, so the preview echoes a synthetic one; the moment the real turn
+/// lands (count grows) the echo yields to it, so the swap never doubles the line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sending {
+    /// Authoritative `sessionId` the reply targets (re-read from the file at Send
+    /// time, so it is what identifies the in-flight row — STABLE-ID STATE).
+    pub session_id: String,
+    /// The message text that was sent, echoed under a synthetic `▶ you` turn until
+    /// claude writes the real one to disk.
+    pub message: String,
+    /// The target session's [`Session::msg_count`](crate::store::Session::msg_count)
+    /// when the send was dispatched. The echo shows only while the reloaded count
+    /// still equals this — i.e. nothing new has landed on disk yet.
+    pub baseline_msg_count: usize,
+}
+
 /// A titled, centered prompt with N labelled choices and a wrapping-cycle
 /// highlight — the ONE overlay model behind the running-session choice, the
 /// new-session agent picker, and (later) a delete confirm.
@@ -521,11 +543,12 @@ pub struct App {
     /// modal owns the keyboard (`Ctrl-R` on a `needs input` background agent, before
     /// compose opens).
     pub pending_stop: Option<PendingStop>,
-    /// `session_id` of a quick-reply send that is IN FLIGHT (dispatched, not yet
-    /// finished), or `None`. Drives the animated "sending… / cooking…" indicator in
-    /// the preview so the reply feels instant; set when the send is handed off and
-    /// cleared when its `AppEvent::SendFinished` lands.
-    pub sending: Option<String>,
+    /// The quick-reply send that is IN FLIGHT (dispatched, not yet finished), or
+    /// `None`. Drives the optimistic in-preview echo of the message plus the
+    /// animated "sending… / cooking…" indicator so the reply feels instant; set
+    /// when the send is handed off and cleared when its `AppEvent::SendFinished`
+    /// lands. See [`Sending`].
+    pub sending: Option<Sending>,
     /// The agent chosen for the most recent new session (`None` = default / no
     /// agent). In-memory ONLY — never persisted to disk — so the NEXT `Ctrl-N`
     /// pre-highlights it for a one-keystroke repeat.
@@ -1292,6 +1315,14 @@ impl App {
     #[must_use]
     pub fn is_composing(&self) -> bool {
         self.compose.is_some()
+    }
+
+    /// The in-flight quick-reply send targeting `session_id`, or `None` when no
+    /// send is in flight for that session. The preview's optimistic echo and its
+    /// banner-suppression both key off this so render and the click hit-test agree.
+    #[must_use]
+    pub fn sending_to(&self, session_id: &str) -> Option<&Sending> {
+        self.sending.as_ref().filter(|s| s.session_id == session_id)
     }
 
     /// Open the new-session agent picker over `agents` as a `List`-layout

@@ -212,8 +212,8 @@ fn submit_compose(app: &mut App) -> Outcome {
         return Outcome::Continue;
     }
 
-    let file = match app.session_by_id(&session_id) {
-        Some(session) => session.file.clone(),
+    let (file, baseline_msg_count) = match app.session_by_id(&session_id) {
+        Some(session) => (session.file.clone(), session.msg_count),
         None => {
             app.compose = None;
             app.set_status(COMPOSE_SESSION_GONE);
@@ -229,9 +229,15 @@ fn submit_compose(app: &mut App) -> Outcome {
             let argv = send::build_send_argv(&authoritative_id, &message);
             app.compose = None;
             app.set_status(send::SEND_IN_FLIGHT);
-            // Mark the send in flight so the preview shows a live "sending…"
-            // indicator until the completion event lands.
-            app.sending = Some(authoritative_id.clone());
+            // Mark the send in flight so the preview echoes the message under a
+            // synthetic `▶ you` turn plus a live "sending… / cooking…" indicator
+            // until the completion event lands. `baseline_msg_count` lets the echo
+            // step aside the instant claude writes the real turn to disk.
+            app.sending = Some(super::app::Sending {
+                session_id: authoritative_id.clone(),
+                message,
+                baseline_msg_count,
+            });
             Outcome::Send(SendRequest {
                 argv,
                 cwd,

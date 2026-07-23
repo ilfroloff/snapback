@@ -274,7 +274,7 @@ pub fn handle_event(app: &mut App, event: AppEvent, root: &Path) -> Outcome {
             // A one-shot quick-reply send completed off-thread. Clear the in-flight
             // indicator (if this is the send it was tracking) and surface the mapped
             // result (cost / error) on the status line.
-            if app.sending.as_deref() == Some(session_id.as_str()) {
+            if app.sending_to(&session_id).is_some() {
                 app.sending = None;
             }
             if let Some(status) = status {

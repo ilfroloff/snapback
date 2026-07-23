@@ -206,9 +206,12 @@ session and sends your message with a one-shot `claude -p` — it replays the fu
 context, appends the exchange in place, and the reply shows up in the preview, all
 while the board stays up. The box is a real multiline editor — arrows move the
 caret, long lines soft-wrap, and it grows from one line as you type (`Ctrl-J` or
-`Alt+Enter` for a newline, `Enter` to send). While the reply is in flight the
-preview shows a live **sending… / cooking…** indicator, and the status line reports
-what the reply cost (or the reason if it fails).
+`Alt+Enter` for a newline, `Enter` to send). The moment you send, your message
+appears in the preview under a **you** turn, followed by a live **claude
+sending… / cooking…** placeholder — so the exchange reads normally while the reply
+is still in flight. The placeholder is replaced in place as `claude` writes the
+real turns, and the status line reports what the reply cost (or the reason if it
+fails).
 
 Background agents get special handling, because `claude` won't resume a session
 it's still holding as an agent. A **finished** (`done`) agent is stopped first
