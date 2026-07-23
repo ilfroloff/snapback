@@ -204,7 +204,9 @@ confirm subagents/sidecars were excluded). It is intentionally omitted from
 - `claude` on `PATH` — the binary that resume/fork/attach spawn, and the source
   of live-agent badges. If it is missing or fails to launch, the hand-off fails
   soft to a board status message and live detection degrades to "nothing is
-  live", so the live-agent badges disappear.
+  live", so the live-agent badges disappear. Its flags, commands, version pin,
+  and the exact argv `snapback` builds are in
+  [CLAUDE_CLI.md](CLAUDE_CLI.md).
 
 ## Validation checklist before finishing a change
 
