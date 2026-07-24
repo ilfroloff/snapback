@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/ilfroloff/snapback/compare/v0.4.0...v0.5.0) - 2026-07-24
+
+### Added
+
+- mark an interrupted background agent with a steady badge
+
+### Other
+
+- publish to npm via trusted publishing (OIDC), dropping the token
+
 ## [0.4.0](https://github.com/ilfroloff/snapback/compare/v0.3.0...v0.4.0) - 2026-07-23
 
 ### Added
