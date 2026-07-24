@@ -139,7 +139,10 @@ one place.
   TWO bounded one-shots are deliberate, documented exceptions (`PATTERNS.md` §6):
   the liveness probe at hand-off, and the worktree resolve at
   construction/reload. Both are argued at the call site, and NEITHER may move
-  onto a keystroke or the render path. (`src/watch.rs`, `src/worktrees.rs`)
+  onto a keystroke or the render path. The `Ctrl-X y` clipboard copy is NOT a
+  third: its tool runs as a THREADED child, started by the driver on its own
+  thread and reporting back as one `AppEvent::CopyFinished`, so no keystroke
+  waits on it. (`src/watch.rs`, `src/worktrees.rs`, `src/tui/clipboard.rs`)
 - **PURE, GIT-FREE STORE CORE.** `src/store/*` decides everything from the bytes
   it was given: `repo_of`'s worktree collapse is a pure string heuristic, and NO
   module under `src/store/` may shell out (to `git` or anything else) or read
@@ -168,7 +171,10 @@ one place.
   only **outcomes and refusals**. A fact that is true over an interval lives in
   typed state and renders on the surface that owns it. Failures and refusals stay
   sticky until the next actionable keypress; confirmations and nudges expire after
-  `STATUS_DWELL_TICKS`. See [PATTERNS.md](docs/agents/PATTERNS.md#11-status-line-ownership).
+  `STATUS_DWELL_TICKS`. Some confirmations are deliberately sticky too — the
+  `Ctrl-X y` copy's line, and a lineage delete's tally — and
+  [PATTERNS.md](docs/agents/PATTERNS.md#11-status-line-ownership) owns which and
+  why.
 
 ## Engineering principles (mandatory)
 

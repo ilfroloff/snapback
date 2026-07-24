@@ -113,11 +113,17 @@ pub fn run() {
                 app.apply_reload(store.reload());
             }
             // `run` only breaks its own loop on Quit/Resume; Continue never
-            // escapes, and a quick-reply Send, an interrupt, and a background-agent
-            // launch are all handled INSIDE `run_inner` (the board stays up, so none
-            // of them propagates here) — treat them all as a clean exit for totality.
+            // escapes, and a quick-reply Send, an interrupt, a background-agent
+            // launch, and a clipboard copy (its request and its completion) are all
+            // handled INSIDE `run_inner` (the board stays up, so none of them
+            // propagates here) — treat them all as a clean exit for totality.
             Ok(
-                Outcome::Continue | Outcome::Send(_) | Outcome::Interrupt(_) | Outcome::BgLaunch(_),
+                Outcome::Continue
+                | Outcome::Send(_)
+                | Outcome::Interrupt(_)
+                | Outcome::BgLaunch(_)
+                | Outcome::Copy(_)
+                | Outcome::FinishCopy { .. },
             ) => break,
             Err(err) => {
                 // `tui::run` restores the terminal on every exit once it is live

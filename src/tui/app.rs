@@ -1387,10 +1387,10 @@ pub struct App {
     pub show_hidden: bool,
     /// Whether a `Ctrl-X` leader chord is pending — the moment between the leader
     /// keypress and its follow-up (`x` hide, `d` hard-delete, `h` show-hidden,
-    /// anything else cancels). While `true` the view draws the which-key hint and
-    /// [`handle_event`](crate::tui::update) routes the NEXT key through the pure
-    /// `chord_key` machine BEFORE normal key handling, so a printable follow-up
-    /// never leaks into the search query.
+    /// `r` forced rescan, `y` copy session ID, anything else cancels). While `true` the
+    /// view draws the which-key hint and [`handle_event`](crate::tui::update)
+    /// routes the NEXT key through the pure `chord_key` machine BEFORE normal key
+    /// handling, so a printable follow-up never leaks into the search query.
     ///
     /// A plain marker rather than a data-carrying enum because there is exactly ONE
     /// leader (`Ctrl-X`) with no per-chord state; folded into

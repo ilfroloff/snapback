@@ -8,6 +8,9 @@
 //! poller's badge/banner map, while `SendFinished`, `InterruptFinished` and
 //! `BgLaunchFinished` each land ONE one-shot child's result — the last of which
 //! also closes the in-flight new-session draft card it names (and only that one).
+//! `CopyFinished` lands a `Ctrl-X y` clipboard tool's result too, but hands it
+//! back to the driver ([`Outcome::FinishCopy`]) because only the driver holds the
+//! writer its OSC 52 fallback needs.
 //! Because such a result can arrive after the board it belongs to is gone,
 //! [`handle_event`] closes the compose surface on any [`Outcome`] that
 //! [ends the board session](Outcome::ends_board_session) as well.
@@ -15,10 +18,10 @@
 //! This module is the *decision* half of the loop: [`key_to_action`] maps a key
 //! to an [`Action`], and [`handle_event`] applies an [`AppEvent`] to the [`App`]
 //! and returns an [`Outcome`] telling the driver (in [`crate::tui`]) whether to
-//! continue, quit, hand off a resume, or fire one of the three no-teardown
-//! children (`Send` / `Interrupt` / `BgLaunch`). All of it is terminal-free and
-//! unit tested; the terminal-driving loop that calls it lives in
-//! [`crate::tui::run`].
+//! continue, quit, hand off a resume, fire one of the three no-teardown children
+//! (`Send` / `Interrupt` / `BgLaunch`), or start / finish a `Ctrl-X y` clipboard
+//! copy (`Copy` / `FinishCopy`). All of it is terminal-free and unit tested; the
+//! terminal-driving loop that calls it lives in [`crate::tui::run`].
 //!
 //! ## Keybindings
 //!
@@ -34,7 +37,7 @@
 //! | `Ctrl-K` | stop / interrupt the selected session's live background agent (`claude stop`); an agent whose run is OVER (`done` / `stopped` / `failed`) stops at once, every other live agent confirms first, and a session claude is not holding — or one running interactively, which carries no job id — is refused (see [`send::interrupt_gate`]) |
 //! | `Tab` | toggle name-only vs. name+content search. Widening to content also opens the preview on the most recent match, exactly as typing does: it goes through the same query funnel, and the mode is the gate that key just opened |
 //! | `Ctrl-A` | flip the scope: current folder <-> project (the launch repo and all of its git worktrees). ONE key for both, because the second is a refinement of the same question the first answers, not a separate mode. Launched with `--all`/`-a` it becomes a three-stop cycle through all folders as well — the whole store is on this key only when the launch flag put it there |
-//! | `Ctrl-X` then `x`/`d`/`h`/`r` | leader chord: hide / hard-delete (this row, or its whole fork lineage) / toggle show-hidden / re-read every transcript from disk (any other key cancels) |
+//! | `Ctrl-X` then `x`/`d`/`h`/`r`/`y` | leader chord: hide / hard-delete (this row, or its whole fork lineage) / toggle show-hidden / re-read every transcript from disk / copy session ID (the selected session's full id, to the clipboard; the id also shows on the status line) (any other key cancels) |
 //! | `Ctrl-/` | toggle the preview pane |
 //! | `PgUp` / `PgDn` | scroll the preview a page (always) |
 //! | `Ctrl-U` / `Ctrl-D` | scroll the preview a quarter page (always) |
@@ -68,6 +71,8 @@
 //! it at the caret, and the board appends it to the query with newlines flattened
 //! to spaces. A paste can never submit, resume, or quit.
 
+use std::io::Write;
+
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -81,7 +86,7 @@ use crate::store::SessionStore;
 use crate::watch::AppEvent;
 
 use super::app::{App, Interrupting, ModalAction, ModalLayout};
-use super::{compose, view};
+use super::{clipboard, compose, view};
 
 /// A decoded intent from a single keypress.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,7 +175,7 @@ pub enum Action {
     BackspaceWord,
     /// Enter the `Ctrl-X` leader chord: arm [`App::pending_chord`] so the NEXT key
     /// routes through the pure [`chord_key`] machine (hide / hard-delete /
-    /// show-hidden / cancel) instead of the board.
+    /// show-hidden / forced rescan / copy session ID / cancel) instead of the board.
     Chord,
     /// A key with no binding in the current state.
     Ignore,
@@ -219,6 +224,31 @@ pub enum Outcome {
     /// nothing. The interactive escape hatch (`Ctrl-O`) still takes
     /// [`Resume`](Self::Resume), because that one really does hand the terminal over.
     BgLaunch(BgLaunchRequest),
+    /// Copy this FULL `session_id` to the system clipboard and KEEP running — the
+    /// `Ctrl-X y` request, like [`Send`](Self::Send) a no-teardown effect handled
+    /// inline by [`crate::tui::run`]. The driver reads the environment, picks the
+    /// route ([`clipboard::clipboard_route`]), and either starts the clipboard-tool
+    /// worker ([`clipboard::spawn_tool_copy`], which reports back via
+    /// [`AppEvent::CopyFinished`]) or — over SSH, or with no tool for this
+    /// OS/display — writes the OSC 52 fallback at once through [`finish_copy`].
+    /// Carried as data (rather than copied in the handler) so the copy DECISION
+    /// stays pure and unit-testable, the way [`Send`](Self::Send) carries a request.
+    Copy(String),
+    /// Complete a finished `Ctrl-X y` copy: set its honest, sticky status and, when
+    /// no tool copied the id, write the OSC 52 fallback — [`finish_copy`], which the
+    /// driver runs with the terminal's own writer on the UI thread, between draws.
+    ///
+    /// [`handle_event`] returns this for [`AppEvent::CopyFinished`] instead of
+    /// completing the copy itself because the fallback is a terminal WRITE and only
+    /// the driver holds the terminal. Routing the event through [`handle_event`]
+    /// (rather than intercepting it in the driver) keeps that function the ONE place
+    /// every [`AppEvent`] is routed, with an exhaustive match and no dead arm.
+    FinishCopy {
+        /// The authoritative full `sessionId` the copy targeted.
+        session_id: String,
+        /// Whether a clipboard tool copied it (exited 0 with the id on its stdin).
+        copied: bool,
+    },
 }
 
 impl Outcome {
@@ -226,7 +256,8 @@ impl Outcome {
     /// down and the merged event channel with it.
     ///
     /// True for [`Quit`](Self::Quit) and every [`Resume`](Self::Resume); false for
-    /// the three no-teardown effects, which keep drawing on the SAME channel. Pure,
+    /// the no-teardown effects (`Send`, `Interrupt`, `BgLaunch`, and the clipboard
+    /// copy's `Copy` / `FinishCopy`), which keep drawing on the SAME channel. Pure,
     /// so "does the board survive this?" is one greppable answer rather than a
     /// `matches!` repeated per call site.
     #[must_use]
@@ -265,9 +296,10 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool
             KeyCode::Char('r') | KeyCode::Char('R') => Action::Reply,
             KeyCode::Char('k') | KeyCode::Char('K') => Action::Interrupt,
             KeyCode::Char('c') | KeyCode::Char('C') => Action::Quit,
-            // Ctrl-X (0x18 CAN) is the board-trimming leader chord (hide /
-            // hard-delete / show-hidden / forced rescan). Unbound and
-            // terminal-safe — unlike Ctrl-H/I/M, which alias Backspace/Tab/Enter.
+            // Ctrl-X (0x18 CAN) is the board's leader chord: act on the selected
+            // row (hide / hard-delete / copy session ID) or on the board (show-hidden /
+            // forced rescan). Unbound and terminal-safe — unlike Ctrl-H/I/M,
+            // which alias Backspace/Tab/Enter.
             // It only ARMS the chord; the follow-up key decides (see `chord_key`).
             KeyCode::Char('x') | KeyCode::Char('X') => Action::Chord,
             // Quarter-page preview scroll (readline-style). Acts regardless of
@@ -396,7 +428,8 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
             }
             // A pending `Ctrl-X` leader chord OWNS the next key too: route it through
             // the chord machine BEFORE normal handling so a printable follow-up
-            // (`x`/`d`/`h`/`r`) completes the chord instead of leaking into the query.
+            // (`x`/`d`/`h`/`r`/`y`) completes the chord instead of leaking into the
+            // query.
             if app.pending_chord {
                 return handle_chord_key(app, key, store);
             }
@@ -529,6 +562,12 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
             }
             Outcome::Continue
         }
+        // A `Ctrl-X y` clipboard-tool copy finished off-thread. Completing it is the
+        // DRIVER's job, not this handler's: when no tool copied the id, the OSC 52
+        // fallback has to be written to the terminal, and only the driver holds the
+        // terminal's writer. So the result is handed straight back to it (see
+        // `Outcome::FinishCopy`), and the status is set there, from this result.
+        AppEvent::CopyFinished { session_id, copied } => Outcome::FinishCopy { session_id, copied },
         AppEvent::Tick => {
             // The tick already drove a redraw; counting it turns that existing
             // cadence into the board's clock, which `view::blink_visible` phases
@@ -1065,9 +1104,117 @@ fn apply_action(app: &mut App, action: Action) -> Outcome {
     }
 }
 
-/// The four keys a pending `Ctrl-X` chord binds, plus cancel — the PURE decision
+/// Status-line prefix for a `Ctrl-X y` copy a clipboard TOOL confirmed (it exited 0
+/// with the id on its stdin), kept as a named `const` so the copy message has ONE
+/// source of truth (NO MAGIC VALUES) that [`copy_status`] and any future doc/test
+/// reference share. A trailing space separates it from the id. Only a tool's exit
+/// code earns "Copied"; the OSC 52 path says "Sent" ([`OSC52_SENT_STATUS_PREFIX`]).
+const COPY_STATUS_PREFIX: &str = "Copied session ID ";
+
+/// Status-line opener for a `Ctrl-X y` copy that went out as an OSC 52 escape (over
+/// SSH, with no clipboard tool for this OS/display, or after every tool failed).
+///
+/// It says "Sent", NEVER "Copied": snapback cannot know whether the terminal
+/// honoured the escape — some drop it silently, and the write-only discipline
+/// forbids asking. The full id follows it directly, so the id always lands in the
+/// first columns of the help row.
+const OSC52_SENT_STATUS_PREFIX: &str = "Sent session ID ";
+
+/// The caveat after the id on the OSC 52 path: where the id went, and that it may
+/// not have arrived. It comes AFTER the id on purpose — an 80-column help row
+/// truncates this caveat, never the id, which is the text the user selects by hand
+/// when the terminal ignores the escape.
+const OSC52_SENT_STATUS_CAVEAT: &str = " to the terminal via OSC 52 (some terminals ignore it)";
+
+/// Status shown when `Ctrl-X y` is pressed with nothing selected (empty or
+/// fully-filtered list). A named `const` so the no-op branch and its test agree
+/// on one string.
+const NO_SELECTION_STATUS: &str = "No session selected";
+
+/// The board status for an `id` a clipboard tool COPIED. Pure so it is
+/// unit-testable and the single source of the copy message.
+///
+/// A `session_id` is a UUID with no interior whitespace, so it survives
+/// `view::render_help`'s whitespace flattening intact and reads back verbatim on
+/// the help line.
+fn copy_status(id: &str) -> String {
+    format!("{COPY_STATUS_PREFIX}{id}")
+}
+
+/// The board status for an `id` SENT to the terminal as an OSC 52 escape: the full
+/// id first, then the caveat. Pure so the wording is assertable without a
+/// terminal, and never "Copied" (see [`OSC52_SENT_STATUS_PREFIX`]).
+pub(super) fn osc52_sent_status(id: &str) -> String {
+    format!("{OSC52_SENT_STATUS_PREFIX}{id}{OSC52_SENT_STATUS_CAVEAT}")
+}
+
+/// Decide the `Ctrl-X y` completion for the current selection — the copy's PURE
+/// decision half, reached from [`handle_chord_key`]. It performs NO I/O at all.
+///
+/// With a selection it returns [`Outcome::Copy`] carrying the selected session's
+/// FULL `session_id`, owned through the stable-id accessor [`App::selected_session`]
+/// (STABLE-ID STATE). The driver performs the copy, and the status comes from its
+/// RESULT ([`finish_copy`]), so nothing claims "Copied" before a tool has. It sets
+/// no status of its own: [`handle_chord_key`] has already cleared the line.
+///
+/// No selection is a graceful no-op: no copy is requested (never an empty payload)
+/// and the sticky [`NO_SELECTION_STATUS`] is set; it never panics.
+fn copy_selected_id(app: &mut App) -> Outcome {
+    // Own the id so the `&Session` borrow ends before `app` is mutably re-borrowed
+    // below (the clone-then-mutate discipline the resume path uses).
+    match app.selected_session().map(|s| s.session_id.clone()) {
+        Some(id) => Outcome::Copy(id),
+        None => {
+            app.set_status(NO_SELECTION_STATUS);
+            Outcome::Continue
+        }
+    }
+}
+
+/// Complete a `Ctrl-X y` copy with its HONEST, sticky status. This is the one
+/// function that performs the OSC 52 write, and the writer is INJECTED (`w`), so a
+/// test hands it a `Vec<u8>` and no escape ever reaches the test run's terminal.
+///
+/// `copied` is a RESULT, never a hope: `true` only when a clipboard tool exited 0
+/// with the id on its stdin (see [`AppEvent::CopyFinished`]). Then the status is
+/// [`copy_status`] and NO escape is written, because the id is already on the
+/// clipboard. Otherwise — SSH, no tool for this OS/display, or every tool missing
+/// or failing — the id goes out as a write-only OSC 52 escape
+/// ([`clipboard::copy_to_clipboard`]) and the status says it was SENT
+/// ([`osc52_sent_status`]).
+///
+/// The driver (`tui::run_inner`) calls this on the UI thread with the terminal's own
+/// writer, never from the tool worker. Frame-safety: that is the EVENT-HANDLING
+/// phase, BETWEEN ratatui draws, and `copy_to_clipboard` flushes. Being write-only,
+/// the escape moves no cursor and mutates no cells, so the next `terminal.draw`
+/// diffs against an unchanged screen (same reasoning as `tui::mod`'s `hard_reset`).
+/// A write from the worker thread could instead interleave with a frame the UI
+/// thread is flushing.
+pub fn finish_copy<W: Write>(app: &mut App, w: &mut W, session_id: &str, copied: bool) {
+    let status = if copied {
+        copy_status(session_id)
+    } else {
+        // Best-effort: the status below carries the full id whatever happens, and a
+        // stdout that cannot take a few bytes cannot draw the board either, so the
+        // `io::Result` is deliberately discarded (like `resume::open_url`'s spawn).
+        let _ = clipboard::copy_to_clipboard(w, session_id);
+        osc52_sent_status(session_id)
+    };
+    // STICKY (`set_status`, NOT `set_status_transient`) on purpose — a deliberate
+    // exception to PATTERNS §11's "confirmations expire". The line confirms what
+    // ACTUALLY happened (a tool copied the id, or it was only sent as OSC 52), and on
+    // the OSC 52 path it is also the fallback: the FULL id is what the user selects
+    // by hand (Shift/Option-drag past mouse capture) when the terminal ignores the
+    // escape, and a `STATUS_DWELL_TICKS` x `watch::TICK` = 4 s dwell is too short
+    // for that. It still clears on the next actionable keypress, like any sticky
+    // status.
+    app.set_status(status);
+}
+
+/// The five keys a pending `Ctrl-X` chord binds, plus cancel — the PURE decision
 /// half of the leader chord (PATTERNS §10, keys -> actions -> outcomes). The impure
-/// completion (hide / open confirm / toggle / rescan) lives in [`handle_chord_key`].
+/// completion (hide / open confirm / toggle / rescan / copy session ID) lives in
+/// [`handle_chord_key`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChordOutcome {
     /// `x` — toggle the selected session's hidden state (soft delete / un-hide).
@@ -1078,6 +1225,10 @@ enum ChordOutcome {
     ShowHidden,
     /// `r` — drop every cached parse and re-read the whole store.
     Rescan,
+    /// `y` — copy session ID: hand the driver the selected session's FULL
+    /// `session_id` to copy ([`Outcome::Copy`] — an OS clipboard tool first, OSC 52
+    /// only as the fallback), and the status line then says what actually happened.
+    Copy,
     /// `Esc` / `Ctrl-C` / any unbound key — abandon the chord with no side effect.
     Cancel,
 }
@@ -1099,6 +1250,7 @@ fn chord_key(key: KeyEvent) -> ChordOutcome {
         KeyCode::Char('d') | KeyCode::Char('D') => ChordOutcome::Delete,
         KeyCode::Char('h') | KeyCode::Char('H') => ChordOutcome::ShowHidden,
         KeyCode::Char('r') | KeyCode::Char('R') => ChordOutcome::Rescan,
+        KeyCode::Char('y') | KeyCode::Char('Y') => ChordOutcome::Copy,
         _ => ChordOutcome::Cancel,
     }
 }
@@ -1108,11 +1260,13 @@ fn chord_key(key: KeyEvent) -> ChordOutcome {
 ///
 /// `x` hides / un-hides the selected session (persisting the change), `d` opens the
 /// hard-delete confirm (it does NOT delete here — the confirm handler does), `h`
-/// toggles the show-hidden view, `r` forces a full re-read of the store, and
-/// anything else (`Esc` / `Ctrl-C` / an unbound key) abandons the chord with no side
-/// effect. The pending state is cleared FIRST so an early return can never wedge the
-/// board in the chord. Routed BEFORE `key_to_action` in [`handle_event`], so a
-/// printable completion never leaks into the query.
+/// toggles the show-hidden view, `r` forces a full re-read of the store, `y` requests
+/// a clipboard copy of the selected session's full id ([`copy_selected_id`], which
+/// hands the driver an [`Outcome::Copy`]), and anything else (`Esc` / `Ctrl-C` / an
+/// unbound key) abandons the chord with no side effect. The pending state is cleared
+/// FIRST so an early return can never wedge the board in the chord. Routed BEFORE
+/// `key_to_action` in [`handle_event`], so a printable completion never leaks into
+/// the query.
 ///
 /// `r` is the store cache's ESCAPE HATCH, and it is a user-reachable key rather
 /// than an internal call for exactly that reason: reloads reuse the parse of every
@@ -1135,6 +1289,10 @@ fn handle_chord_key(app: &mut App, key: KeyEvent, store: &mut SessionStore) -> O
             reload_board(app, store);
             app.set_status_transient(rescan_status(app.sessions.len()));
         }
+        // The one verb whose side effect belongs to the DRIVER: the clipboard copy
+        // runs a tool on its own thread or writes an OSC 52 escape, so the request
+        // leaves here as data (`Outcome::Copy`) rather than as `Continue`.
+        ChordOutcome::Copy => return copy_selected_id(app),
         ChordOutcome::Cancel => {}
     }
     Outcome::Continue
@@ -4363,6 +4521,88 @@ mod tests {
     }
 
     #[test]
+    fn copy_id_with_a_selection_decides_to_yank_the_full_id() {
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        let mut app = app_with(id, None);
+        // The decision performs no I/O at all: it hands the driver the FULL id as
+        // the copy request, and claims nothing on the status line — the status
+        // comes from the copy's RESULT (`finish_copy`), never from the keypress.
+        let Outcome::Copy(requested) = copy_selected_id(&mut app) else {
+            panic!("a selection must request the copy");
+        };
+        assert_eq!(requested, id, "the request carries the FULL session id");
+        assert_eq!(app.status, None, "nothing is claimed before the copy ran");
+    }
+
+    #[test]
+    fn copy_id_with_no_selection_decides_to_write_nothing() {
+        // Empty store => nothing is selected. The decision must request NO copy —
+        // `Continue`, not `Copy`, is the real, assertable proof that nothing is
+        // copied or written (not a proxy through the status string) — plus the
+        // sticky no-selection status. The `Ctrl-X y` dispatch of this branch is
+        // pinned by `ctrl_x_y_completes_the_chord_without_leaking_into_the_query`.
+        let mut app = App::new(vec![], Scope::All, PathBuf::from("/tmp"));
+        assert!(app.selected_session().is_none());
+        assert!(matches!(copy_selected_id(&mut app), Outcome::Continue));
+        assert_eq!(app.status.as_deref(), Some(NO_SELECTION_STATUS));
+    }
+
+    /// The OSC 52 path's status puts the FULL id first and the caveat after it, so
+    /// an 80-column help row truncates the caveat and never the id — the id is what
+    /// the user selects by hand when the terminal ignores the escape. It names OSC
+    /// 52 and never says "copied": nothing confirmed that the terminal took it.
+    #[test]
+    fn the_osc52_sent_status_puts_the_full_id_before_the_caveat_and_never_says_copied() {
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        let status = osc52_sent_status(id);
+        let id_at = status.find(id).expect("the status carries the full id");
+        let caveat_at = status
+            .find(OSC52_SENT_STATUS_CAVEAT)
+            .expect("the status carries the caveat");
+        assert!(
+            id_at + id.len() <= caveat_at,
+            "the id must come BEFORE the caveat: {status:?}"
+        );
+        assert!(
+            id_at + id.len() <= 80,
+            "the whole id must fit an 80-column help row: {status:?}"
+        );
+        assert!(status.contains("OSC 52"), "say how it was sent: {status:?}");
+        assert!(
+            !status.to_lowercase().contains("copied"),
+            "the OSC 52 path must never claim a copy: {status:?}"
+        );
+    }
+
+    /// Both copy status lines name the thing the way the `Ctrl-X y` verb is labelled
+    /// on every key-doc surface (`y copy session ID`): a tool-confirmed copy reads
+    /// EXACTLY `Copied session ID <uuid>`, and the OSC 52 line says `session ID
+    /// <uuid>` too, so a relabel cannot leave one route naming it differently.
+    #[test]
+    fn both_copy_statuses_say_session_id_the_way_the_key_docs_label_the_verb() {
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        assert_eq!(copy_status(id), format!("Copied session ID {id}"));
+        let sent = osc52_sent_status(id);
+        assert!(
+            sent.contains(&format!("session ID {id}")),
+            "the OSC 52 line names the session ID the same way: {sent:?}"
+        );
+    }
+
+    #[test]
+    fn a_bare_y_types_into_the_query() {
+        // The copy lives on `Ctrl-X y`, never a bare letter: a bare `y` TYPES, with
+        // or without a query. The `query_empty = true` half is the one with teeth —
+        // it is what fails if the withdrawn bare-`y` copy binding ever returns.
+        for empty in [true, false] {
+            assert_eq!(
+                key_to_action(key(KeyCode::Char('y')), empty, false),
+                Action::Insert('y')
+            );
+        }
+    }
+
+    #[test]
     fn esc_and_ctrl_c_always_quit() {
         assert_eq!(key_to_action(key(KeyCode::Esc), true, false), Action::Quit);
         assert_eq!(key_to_action(key(KeyCode::Esc), false, false), Action::Quit);
@@ -5357,6 +5597,14 @@ mod tests {
             session_id: "s".to_string(),
         })
         .ends_board_session());
+        // The clipboard copy's request and its completion both keep the board up:
+        // the worker reports back on the SAME channel.
+        assert!(!Outcome::Copy("s".to_string()).ends_board_session());
+        assert!(!Outcome::FinishCopy {
+            session_id: "s".to_string(),
+            copied: false,
+        }
+        .ends_board_session());
     }
 
     /// An in-flight card must not outlive the board session that dispatched it.
@@ -5577,7 +5825,7 @@ mod tests {
         assert!(!app.is_composing());
     }
 
-    // --- Ctrl-X leader chord: hide / show-hidden / hard-delete / rescan ---
+    // --- Ctrl-X leader chord: hide / show-hidden / hard-delete / rescan / copy session ID ---
 
     /// Feed one key EVENT (carrying its modifiers) through `handle_event` against
     /// `store`. The chord tests need both `Ctrl-X` (a modified key) and a real
@@ -5678,6 +5926,17 @@ mod tests {
         assert_eq!(chord_key(key(KeyCode::Char('d'))), ChordOutcome::Delete);
         assert_eq!(chord_key(key(KeyCode::Char('h'))), ChordOutcome::ShowHidden);
         assert_eq!(chord_key(key(KeyCode::Char('r'))), ChordOutcome::Rescan);
+        assert_eq!(chord_key(key(KeyCode::Char('y'))), ChordOutcome::Copy);
+        assert_eq!(
+            chord_key(key(KeyCode::Char('Y'))),
+            ChordOutcome::Copy,
+            "a held Shift on the follow-up still copies"
+        );
+        assert_eq!(
+            chord_key(ctrl(KeyCode::Char('y'))),
+            ChordOutcome::Cancel,
+            "Ctrl-X Ctrl-Y cancels: no completion is bound to a Ctrl combo"
+        );
         assert_eq!(
             chord_key(key(KeyCode::Esc)),
             ChordOutcome::Cancel,
@@ -5823,6 +6082,150 @@ mod tests {
 
         std::env::remove_var("SNAPBACK_CONFIG_DIR");
         let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// Leak guard for the copy: `Ctrl-X y` completes the chord through the real
+    /// routing — the `y` must NOT append to an active query, and the copy's status
+    /// is what lands on the line.
+    ///
+    /// The list is EMPTY on purpose, so the copy takes its no-selection branch: no
+    /// copy is requested and the sticky no-selection status is set. The selected
+    /// case is driven end to end by the two `ctrl_x_y_on_a_selection_*` tests below.
+    #[test]
+    fn ctrl_x_y_completes_the_chord_without_leaking_into_the_query() {
+        let mut app = App::new(vec![], Scope::All, PathBuf::from("/tmp/launch"));
+        assert!(
+            app.selected_session().is_none(),
+            "an empty list selects nothing, so no copy can be requested"
+        );
+        app.push_query_str("foo");
+        let mut store = store_at(Path::new("/tmp"));
+
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        assert!(app.pending_chord, "Ctrl-X arms the leader chord");
+
+        let out = feed(&mut app, key(KeyCode::Char('y')), &mut store);
+        assert!(matches!(out, Outcome::Continue));
+        assert_eq!(
+            app.query(),
+            "foo",
+            "the chord's `y` must not leak into the query"
+        );
+        assert!(
+            !app.pending_chord,
+            "the chord resolves after exactly one key"
+        );
+        assert_eq!(
+            app.status.as_deref(),
+            Some(NO_SELECTION_STATUS),
+            "`y` completed the chord as a copy (the no-selection status)"
+        );
+        assert_eq!(
+            app.status_ttl, None,
+            "the no-selection status is STICKY (no dwell timer), like a refusal"
+        );
+    }
+
+    /// Drive `Ctrl-X y` on a REAL selected session through `handle_event`, assert
+    /// the keypress only REQUESTS the copy (the full id, and nothing claimed on the
+    /// line), then land the worker's `CopyFinished` through `handle_event` and
+    /// complete it the way the driver does — `finish_copy` — but into `term`, an
+    /// injected `Vec<u8>`, so no escape can reach the test run's terminal and no
+    /// clipboard tool is ever spawned. Returns the app for the caller's assertions.
+    fn copy_selected_through_the_driver_seams(id: &str, copied: bool, term: &mut Vec<u8>) -> App {
+        let mut app = app_with(id, None);
+        let mut store = store_at(Path::new("/tmp"));
+
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        let Outcome::Copy(requested) = feed(&mut app, key(KeyCode::Char('y')), &mut store) else {
+            panic!("Ctrl-X y on a selection must hand the driver a copy request");
+        };
+        assert_eq!(requested, id, "the request carries the FULL session id");
+        assert_eq!(
+            app.status, None,
+            "the keypress claims nothing: the status comes from the copy's RESULT"
+        );
+        assert!(
+            !app.pending_chord,
+            "the chord resolves after exactly one key"
+        );
+
+        let finished = AppEvent::CopyFinished {
+            session_id: requested,
+            copied,
+        };
+        let Outcome::FinishCopy { session_id, copied } =
+            handle_event(&mut app, finished, &mut store)
+        else {
+            panic!("a CopyFinished must go back to the driver to be completed");
+        };
+        assert_eq!(session_id, id);
+        finish_copy(&mut app, term, &session_id, copied);
+        app
+    }
+
+    /// Tick the board PAST the transient dwell, so a status that survives is
+    /// provably sticky rather than merely young.
+    fn tick_past_the_dwell(app: &mut App) {
+        let mut store = store_at(Path::new("/tmp"));
+        for _ in 0..=STATUS_DWELL_TICKS {
+            handle_event(app, AppEvent::Tick, &mut store);
+        }
+    }
+
+    /// (i) A clipboard TOOL copied the id: the line says so with the full id, NO
+    /// OSC 52 escape is written (the id is already on the clipboard), and the line
+    /// outlives the transient dwell.
+    #[test]
+    fn ctrl_x_y_on_a_selection_with_a_tool_copy_says_copied_writes_nothing_and_sticks() {
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        let mut term: Vec<u8> = Vec::new();
+        let mut app = copy_selected_through_the_driver_seams(id, true, &mut term);
+
+        assert!(
+            term.is_empty(),
+            "a tool copied the id, so no OSC 52 escape may be written: {:?}",
+            String::from_utf8_lossy(&term)
+        );
+        let copied = copy_status(id);
+        assert_eq!(app.status.as_deref(), Some(copied.as_str()));
+        assert_eq!(app.status_ttl, None, "set sticky, not transient");
+        tick_past_the_dwell(&mut app);
+        assert_eq!(
+            app.status.as_deref(),
+            Some(copied.as_str()),
+            "the Copied line must survive more than STATUS_DWELL_TICKS ticks"
+        );
+    }
+
+    /// (ii) No tool copied it (none to try, or every one failed): the id goes out
+    /// as EXACTLY the OSC 52 escape, the line says it was SENT — the full id, and
+    /// never "Copied" — and it outlives the transient dwell too.
+    #[test]
+    fn ctrl_x_y_on_a_selection_without_a_tool_copy_sends_osc52_says_sent_and_sticks() {
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        let mut term: Vec<u8> = Vec::new();
+        let mut app = copy_selected_through_the_driver_seams(id, false, &mut term);
+
+        assert_eq!(
+            term,
+            clipboard::osc52_clipboard_sequence(id),
+            "the fallback writes exactly the OSC 52 escape for the full id"
+        );
+        let sent = osc52_sent_status(id);
+        assert_eq!(app.status.as_deref(), Some(sent.as_str()));
+        assert!(sent.contains(id), "the line carries the full id: {sent:?}");
+        assert!(
+            !sent.to_lowercase().contains("copied"),
+            "the OSC 52 path must never claim a copy: {sent:?}"
+        );
+        assert_eq!(app.status_ttl, None, "set sticky, not transient");
+        tick_past_the_dwell(&mut app);
+        assert_eq!(
+            app.status.as_deref(),
+            Some(sent.as_str()),
+            "the Sent line must survive more than STATUS_DWELL_TICKS ticks"
+        );
     }
 
     /// Task 4.4: `Ctrl-X x` on a non-hidden selected session hides it, PERSISTS the

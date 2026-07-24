@@ -198,6 +198,25 @@ pub enum AppEvent {
         /// downgrade is never auto-dismissed.
         success: bool,
     },
+    /// A one-shot `Ctrl-X y` clipboard-tool copy finished (`pbcopy`, `wl-copy`,
+    /// `xclip` or `xsel`, with the id on its stdin), delivered OFF the UI thread by
+    /// the detached copy worker (see [`crate::tui::clipboard::spawn_tool_copy`]).
+    ///
+    /// Like [`SendFinished`](Self::SendFinished) it fires EXACTLY ONCE per copy,
+    /// from a thread spawned for that one copy. It carries a RESULT rather than a
+    /// status, because completing it is not the update loop's alone: when no tool
+    /// copied the id, the OSC 52 fallback still has to be WRITTEN, and only the
+    /// driver holds the terminal's writer. The update loop therefore hands it back
+    /// to the driver as [`crate::tui::update::Outcome::FinishCopy`].
+    CopyFinished {
+        /// The authoritative full `sessionId` the copy targeted — what the status
+        /// echoes, and what the OSC 52 fallback carries.
+        session_id: String,
+        /// Whether a clipboard tool exited 0 with the whole id on its stdin.
+        /// `false` when every candidate was missing, failed to take the id, or
+        /// exited non-zero.
+        copied: bool,
+    },
     /// A periodic wake-up. The update loop does nothing costly on this.
     Tick,
 }
