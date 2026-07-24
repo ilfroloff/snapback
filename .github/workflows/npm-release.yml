@@ -38,8 +38,9 @@ env:
 # publishing workflow's write scope for a feature nobody asked for. If that is
 # wanted later, add it THEN, with the permission scoped to the job that needs it.
 #
-# `id-token: write` is required for npm provenance (see the publish step) and is
-# scoped to that job only, not granted workflow-wide.
+# `id-token: write` is required for both the OIDC publish AUTH and provenance
+# (see the publish job) and is scoped to that job only, not granted
+# workflow-wide.
 permissions:
   contents: read
 
@@ -152,12 +153,17 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      # Required for npm provenance, and granted ONLY to this job. Provenance
-      # publishes a signed, public attestation linking the tarball to this repo,
-      # this workflow, and this commit — so an installer can verify the binaries
-      # came from the tagged source rather than from someone's laptop. It is the
-      # closest thing to a supply-chain guarantee available for shipping compiled
-      # artifacts through npm, which is exactly what this package does.
+      # Does DOUBLE duty, and both halves are why there is NO npm token here:
+      #  1. AUTH — npm trusted publishing (OIDC). npm exchanges this short-lived
+      #     id-token for a one-time publish credential, so nothing long-lived is
+      #     stored in the repo. It REQUIRES a trusted publisher configured on the
+      #     npmjs.com `snapback-tui` page (GitHub Actions -> org `ilfroloff`, repo
+      #     `snapback`, workflow `npm-release.yml`); without it the publish is
+      #     rejected. Provenance also only works from a PUBLIC repo — this one is.
+      #  2. PROVENANCE — the same token signs a public attestation linking the
+      #     tarball to this repo, workflow, and commit, so an installer can verify
+      #     the binaries came from the tagged source rather than someone's laptop.
+      # Granted ONLY to this job.
       id-token: write
     steps:
       - name: "📥 Checkout"
@@ -182,6 +188,15 @@ jobs:
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
+
+      # OIDC trusted publishing needs npm >= 11.5.1, but node 22 ships npm 10 —
+      # which cannot do the OIDC handshake and fails in a MISLEADING way: the
+      # registry treats the failed handshake as an anonymous user, and an
+      # anonymous user cannot publish, so it surfaces as a 404, not an auth error.
+      # Upgrading npm is the fix. (`registry-url` above stays, and no
+      # NODE_AUTH_TOKEN is set — that is exactly npm's documented OIDC setup.)
+      - name: "⬆️ Upgrade npm for OIDC trusted publishing"
+        run: npm install -g npm@latest
 
       # THE VERSION COMES FROM THE TAG, and package.json's committed 0.0.0 is a
       # deliberate placeholder, not an oversight. release-plz.toml sets
@@ -209,12 +224,15 @@ jobs:
           npm version --no-git-tag-version --allow-same-version "$version"
           echo "Publishing snapback-tui@${version}"
 
-      # `--access public` is REQUIRED for a first publish even on an unscoped
-      # name, and harmless after. `--provenance` needs the id-token permission
-      # above. prepublishOnly runs npm/scripts/preflight.js, which is the last
-      # gate: it refuses the 0.0.0 placeholder and any missing/truncated binary.
+      # NO `env:` — auth is OIDC trusted publishing via the id-token granted to
+      # this job (see its permissions block). `--access public` is a no-op now
+      # the package exists, kept as an explicit guard should the package ever be
+      # re-created from scratch. `--provenance` is kept EXPLICIT even though
+      # trusted publishing is documented to attach it automatically: the automatic
+      # path has been reported unreliable, and an explicit flag can only be
+      # redundant, never wrong. prepublishOnly runs npm/scripts/preflight.js, the
+      # last gate: it refuses the 0.0.0 placeholder and any missing/truncated
+      # binary.
       - name: "🚀 Publish"
         working-directory: npm
         run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
