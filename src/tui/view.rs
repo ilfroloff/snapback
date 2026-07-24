@@ -169,6 +169,24 @@ const BADGE_WORKING: Color = Color::Gray;
 /// intensity on any theme (TERMINAL-SAFE STYLING) rather than as a second state.
 const BADGE_WORKING_DIM: Color = Color::DarkGray;
 
+/// The badge color of the TERMINAL [`AgentActivity::Ended`] bucket — a background
+/// job claude reports as `stopped` or `failed`.
+///
+/// `DarkGray` reads as DORMANT: dim and quiet, so an ENDED job sits visibly below
+/// the live palette (yellow / green / working-gray) without claiming a state it no
+/// longer holds. It is DELIBERATELY not green — green is [`AgentActivity::Done`]'s
+/// "finished cleanly", and a stopped-or-failed job did not necessarily finish, so
+/// it must not read as ready.
+///
+/// STEADY, with NO pulse partner: [`crate::agents::is_active`] is false for
+/// `Ended`, so its dot never dims and [`pulse_color`] needs no arm for it (the
+/// identity fallback is correct here, and `Ended` being a RESTING bucket is exactly
+/// why `every_pulsing_buckets_badge_color_has_a_distinct_dim_partner` skips it).
+///
+/// A NAMED ANSI color, never RGB (TERMINAL-SAFE STYLING), so it adapts to the
+/// terminal theme and survives a light background.
+const BADGE_ENDED: Color = Color::DarkGray;
+
 /// The selection marker `List` draws at the left of the highlighted row.
 ///
 /// Named because it is also RESERVED width: ratatui pads EVERY row by this
@@ -785,6 +803,9 @@ pub(crate) fn badge_color(agent: &ReportedAgent) -> Color {
         // done has finished cleanly. Both are steady, so green never has to carry
         // the activity signal on its own.
         AgentActivity::Idle | AgentActivity::Done => Color::Green,
+        // A terminal (stopped/failed) job: dim and steady, and NOT green — it
+        // ended, so it must not read as a clean finish. See [`BADGE_ENDED`].
+        AgentActivity::Ended => BADGE_ENDED,
         // Unknown/absent tracks the working bucket, matching `is_active`.
         AgentActivity::Working | AgentActivity::Other => BADGE_WORKING,
     }
@@ -3363,6 +3384,10 @@ mod tests {
             // Finished -> green like idle (nothing is wanted from you) and
             // STEADY, because there is no work left to animate.
             (Some("done"), Color::Green, false),
+            // Terminal (stopped/failed) -> DARKGRAY and STEADY: the job ended, so
+            // it must not pulse and must not read green like a clean finish.
+            (Some("stopped"), Color::DarkGray, false),
+            (Some("failed"), Color::DarkGray, false),
             // FAIL-SOFT: schema drift tracks the working bucket...
             (Some("compacting"), Color::Gray, true),
             // ...and so does a record with no qualifier at all. Neither may
@@ -4140,6 +4165,8 @@ mod tests {
             AgentActivity::Idle => Some("idle"),
             AgentActivity::Working => Some("working"),
             AgentActivity::Done => Some("done"),
+            // Terminal (stopped/failed): resting, so the walk below skips it.
+            AgentActivity::Ended => Some("stopped"),
             // The fail-soft bucket: an unrecognized qualifier, or none at all.
             AgentActivity::Other => Some("compacting"),
         }
@@ -4148,11 +4175,12 @@ mod tests {
     /// Every `AgentActivity` bucket. Keep in sync with the enum — the exhaustive
     /// `match` in [`qualifier_reaching`] is what fails to compile and sends the
     /// author here when a bucket is added.
-    const ALL_BUCKETS: [AgentActivity; 5] = [
+    const ALL_BUCKETS: [AgentActivity; 6] = [
         AgentActivity::NeedsInput,
         AgentActivity::Idle,
         AgentActivity::Working,
         AgentActivity::Done,
+        AgentActivity::Ended,
         AgentActivity::Other,
     ];
 

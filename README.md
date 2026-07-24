@@ -169,6 +169,8 @@ off the list.
 - **green** — nothing is wanted from you: the session is either idle or finished.
   The word beside the badge says which.
 - **gray, pulsing** — working right now.
+- **dim gray, steady** — the agent has ended: it was stopped or its run failed.
+  The word beside the badge says which.
 
 The pulse is the tell for activity: only the working badge pulses, once a second,
 and only its dot — which fades between bright and dim rather than blinking out,

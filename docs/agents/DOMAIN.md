@@ -472,6 +472,7 @@ Every qualifier-shaped output derives from that enum, so they cannot drift apart
 | `Idle` | `idle` | `Green` | `●` | no | `idle` (verbatim) |
 | `Working` | `working`, `busy` | `Gray` | `●` | **yes** (-> `DarkGray`) | verbatim (`working` / `busy`) |
 | `Done` | `done` | `Green` | `●` | no | `done` (verbatim) |
+| `Ended` | `stopped`, `failed` | `DarkGray` | `●` | no | verbatim (`stopped` / `failed`) |
 | `Other` | anything else, or none | `Gray` | `●` | yes (-> `DarkGray`) | verbatim, or the kind label alone |
 
 The **Badge glyph** column is a second, SHAPE channel on top of the color one:
@@ -517,8 +518,18 @@ agent a different badge depending on which token the wire used.
 `Other` is the fail-soft posture made visible: an unknown qualifier is passed
 through to the user rather than dropped or relabeled, and counts as ACTIVE, so
 schema drift never hides a busy session behind a steady dot. The colors read as
-urgency — yellow needs you, green is ready (idle or finished), gray is quietly
-working — and the PULSE, not the color, is what marks activity.
+urgency — yellow needs you, green is ready (idle or finished), `DarkGray` is a job
+that has ended, gray is quietly working — and the PULSE, not the color, is what
+marks activity.
+
+`Ended` is the counterpart to that default, and the two must not be conflated:
+`stopped` and `failed` are KNOWN terminal tokens, so they are recognized and read
+STEADY (the job is over, nothing is in flight to animate) and `DarkGray` (dim, and
+deliberately not `Done`'s green — a stopped or failed job did not necessarily
+finish cleanly). Their raw token still passes through verbatim. The fail-soft
+ACTIVE default is PRESERVED for genuinely-unknown tokens — `Ended` only carves the
+two real terminals out of `Other`, so a dead job stops pulsing as if live while
+true schema drift still errs toward showing activity.
 
 #### Observed value distribution
 
@@ -689,7 +700,7 @@ decides from the agent's STATE (one-shot bare probe, classified by
 | Live state | `Ctrl-R` |
 | --- | --- |
 | not held | reply in place (no stop) |
-| `done` | stop the finished job, then reply — straight to compose |
+| `done` / `stopped` / `failed` | stop the ended job, then reply — straight to compose |
 | `needs input` | **confirm** (`App::pending_stop`, a small modal — stopping abandons a waiting agent), then stop + reply |
 | `working` / `idle` / no job id | refuse (`SEND_LIVE_REFUSED`) — Attach or Fork instead |
 

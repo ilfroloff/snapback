@@ -121,8 +121,9 @@ pub enum SendPlan {
 pub enum ReplyGate {
     /// Not a live agent — open compose and reply in place directly.
     Reply,
-    /// A FINISHED (`done`) agent — stop it (harmless; nothing runs), then reply.
-    /// Opens compose straight away; the send stops `job_id` first.
+    /// A FINISHED (`done`) or TERMINAL (`stopped` / `failed`) agent — the job is
+    /// over, so stopping it is harmless; stop it, then reply. Opens compose
+    /// straight away; the send stops `job_id` first.
     StopThenReply {
         /// The short agent-view job id to `claude stop`.
         job_id: String,
@@ -142,11 +143,12 @@ pub enum ReplyGate {
 ///
 /// Pure so the whole decision tree is unit-tested without a probe. It reuses the
 /// one classifier ([`agents::classify`]) so "what state is this" is answered in one
-/// place. `done` → stop-then-reply (safe); `needs input` → confirm first (stopping
-/// abandons a waiting agent); `working`/`idle`/unknown → refuse (stopping would
-/// interrupt live work, and the user should Attach/Fork). A held agent with no
-/// stoppable job id (`id == None`, e.g. an interactive session) can't be stopped,
-/// so it refuses too. Not held at all → reply in place directly.
+/// place. `done` — or a TERMINAL `stopped` / `failed` — → stop-then-reply (safe:
+/// the job has ended, so stopping it interrupts nothing); `needs input` → confirm
+/// first (stopping abandons a waiting agent); `working`/`idle`/unknown → refuse
+/// (stopping would interrupt live work, and the user should Attach/Fork). A held
+/// agent with no stoppable job id (`id == None`, e.g. an interactive session) can't
+/// be stopped, so it refuses too. Not held at all → reply in place directly.
 #[must_use]
 pub fn reply_gate(record: Option<&ReportedAgent>) -> ReplyGate {
     let Some(agent) = record else {
@@ -158,7 +160,7 @@ pub fn reply_gate(record: Option<&ReportedAgent>) -> ReplyGate {
     };
     let job_id = job_id.to_string();
     match agents::classify(agent) {
-        AgentActivity::Done => ReplyGate::StopThenReply { job_id },
+        AgentActivity::Done | AgentActivity::Ended => ReplyGate::StopThenReply { job_id },
         AgentActivity::NeedsInput => ReplyGate::ConfirmStopThenReply { job_id },
         AgentActivity::Working | AgentActivity::Idle | AgentActivity::Other => {
             ReplyGate::Refuse(SEND_LIVE_REFUSED)
@@ -194,10 +196,11 @@ pub const INTERRUPT_NO_JOB_ID: &str =
 /// background job carries the short id `claude stop` takes; an interactive live
 /// session (no id) can't be stopped from here, and a session claude isn't holding at
 /// all has nothing to stop. Stopping abandons live work, so every state EXCEPT a
-/// finished (`done`) one confirms first.
+/// finished (`done`) or terminal (`stopped` / `failed`) one confirms first.
 #[derive(Debug, PartialEq, Eq)]
 pub enum InterruptGate {
-    /// A FINISHED (`done`) agent — stop it immediately (harmless; nothing runs).
+    /// A FINISHED (`done`) or TERMINAL (`stopped` / `failed`) agent — the job is
+    /// already over, so stop it immediately (harmless; nothing runs).
     StopNow {
         /// The short agent-view job id to `claude stop`.
         job_id: String,
@@ -219,9 +222,9 @@ pub enum InterruptGate {
 /// Pure so the whole decision tree is unit-tested without a probe, reusing the one
 /// classifier ([`agents::classify`]). Mirrors [`reply_gate`]'s shape but routes by
 /// the interrupt intent: not held → refuse (nothing to stop); held without a
-/// stoppable job id → refuse (interactive, can't stop from here); `done` → stop
-/// immediately (harmless); every other live state → confirm first (stopping abandons
-/// live work).
+/// stoppable job id → refuse (interactive, can't stop from here); `done` — or a
+/// TERMINAL `stopped` / `failed` — → stop immediately (harmless; the job is already
+/// over); every other live state → confirm first (stopping abandons live work).
 #[must_use]
 pub fn interrupt_gate(record: Option<&ReportedAgent>) -> InterruptGate {
     let Some(agent) = record else {
@@ -233,7 +236,7 @@ pub fn interrupt_gate(record: Option<&ReportedAgent>) -> InterruptGate {
     };
     let job_id = job_id.to_string();
     match agents::classify(agent) {
-        AgentActivity::Done => InterruptGate::StopNow { job_id },
+        AgentActivity::Done | AgentActivity::Ended => InterruptGate::StopNow { job_id },
         AgentActivity::Working
         | AgentActivity::NeedsInput
         | AgentActivity::Idle
@@ -736,6 +739,18 @@ mod tests {
             }
         );
 
+        // A terminal (stopped/failed) agent is over just like `done`, so it takes
+        // the same stop-then-reply path — stopping a dead job is harmless.
+        for terminal in ["stopped", "failed"] {
+            assert_eq!(
+                reply_gate(Some(&bg(terminal, Some("job-1")))),
+                ReplyGate::StopThenReply {
+                    job_id: "job-1".to_string()
+                },
+                "{terminal:?} is terminal -> stop then reply like done"
+            );
+        }
+
         // needs input (blocked / waiting) -> CONFIRM before stopping a live agent.
         for waiting in ["blocked", "waiting"] {
             assert_eq!(
@@ -789,6 +804,18 @@ mod tests {
                 job_id: "job-1".to_string()
             }
         );
+
+        // A terminal (stopped/failed) agent is already over, so it stops
+        // immediately like `done` rather than confirming.
+        for terminal in ["stopped", "failed"] {
+            assert_eq!(
+                interrupt_gate(Some(&bg(terminal, Some("job-1")))),
+                InterruptGate::StopNow {
+                    job_id: "job-1".to_string()
+                },
+                "{terminal:?} is terminal -> stop immediately like done"
+            );
+        }
 
         // Every OTHER live state confirms first — including `working`, which the
         // reply gate refuses. This is the interrupt's whole point.
