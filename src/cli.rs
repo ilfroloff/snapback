@@ -54,6 +54,8 @@ KEYS:
                   · h show/hide hidden · r re-read every transcript from disk
                   (the board already autorefreshes and reuses unchanged files;
                   r is the force, for a row that looks stale)
+                  · y copy session ID (the selected session's full id; it also
+                  shows on the status line)
     Ctrl-R        quick reply — send a one-shot message to the selected session
                   without leaving the board. An agent whose run is over (done,
                   stopped, failed) is stopped first so the reply lands in place;

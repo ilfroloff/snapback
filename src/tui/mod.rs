@@ -8,11 +8,13 @@
 //! event loop in [`run`].
 
 pub mod app;
+pub mod clipboard;
 pub mod compose;
 pub mod update;
 pub mod view;
 
 use std::io::{self, Write};
+use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -29,7 +31,7 @@ use crossterm::terminal::{
 use ratatui::DefaultTerminal;
 
 use crate::store::SessionStore;
-use crate::watch::EventLoop;
+use crate::watch::{AppEvent, EventLoop};
 
 pub use app::{App, Scope};
 pub use update::Outcome;
@@ -548,6 +550,22 @@ fn run_inner(
                 Outcome::BgLaunch(req) => {
                     crate::send::spawn_bg_launch(req, events.sender());
                 }
+                // A `Ctrl-X y` copy request: read the environment HERE, at the edge,
+                // pick the route, then either start the clipboard-tool worker (it
+                // reports back via `AppEvent::CopyFinished` on this same channel) or,
+                // with no tool to try, write the OSC 52 fallback now — on this UI
+                // thread, between draws. See `start_copy`.
+                Outcome::Copy(session_id) => {
+                    let tools = clipboard::clipboard_route(clipboard::ClipboardEnv::from_env());
+                    start_copy(app, &mut io::stdout(), session_id, tools, events.sender());
+                }
+                // The worker's result, handed back by `handle_event`: set the honest
+                // status and, when no tool copied the id, write the OSC 52 fallback —
+                // here on the UI thread, never on the worker, so the escape can never
+                // interleave with a frame.
+                Outcome::FinishCopy { session_id, copied } => {
+                    update::finish_copy(app, &mut io::stdout(), &session_id, copied);
+                }
                 done => break done,
             },
             // All senders dropped (input + watcher + tick gone): exit cleanly.
@@ -556,6 +574,33 @@ fn run_inner(
     };
 
     Ok(outcome)
+}
+
+/// Start a `Ctrl-X y` copy of `session_id` along `tools`, the route
+/// [`clipboard::clipboard_route`] picked — the driver half of [`Outcome::Copy`].
+///
+/// With a tool to try, the copy runs on its OWN thread
+/// ([`clipboard::spawn_tool_copy`], the shape of `send::spawn_send`) and reports
+/// back as `AppEvent::CopyFinished` on `tx`; nothing is written here and the board
+/// keeps drawing. With NO tool (SSH, or none for this OS/display) there is nothing
+/// to wait for, so the OSC 52 fallback is written at once, on the UI thread between
+/// draws, through [`update::finish_copy`].
+///
+/// `w` and `tools` are parameters so a test can pass a `Vec<u8>` and a harmless
+/// stand-in tool: no test writes a live escape to its terminal, and none spawns a
+/// real clipboard tool.
+fn start_copy<W: Write>(
+    app: &mut App,
+    w: &mut W,
+    session_id: String,
+    tools: &'static [clipboard::ClipboardTool],
+    tx: Sender<AppEvent>,
+) {
+    if tools.is_empty() {
+        update::finish_copy(app, w, &session_id, false);
+    } else {
+        clipboard::spawn_tool_copy(tools, session_id, tx);
+    }
 }
 
 #[cfg(test)]
@@ -836,6 +881,68 @@ mod tests {
         assert!(
             buf.windows(3).any(|w| w == b"[3J"),
             "hard reset must purge native scrollback (CSI 3J), got {seq:?}"
+        );
+    }
+
+    /// A real 36-char session UUID, the payload `Ctrl-X y` copies.
+    const COPY_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    /// A board with nothing on it: `start_copy` needs an `App` for its status line,
+    /// not a selection (the selection was already resolved into the id).
+    fn empty_board() -> App {
+        App::new(Vec::new(), Scope::All, std::path::PathBuf::from("/tmp"))
+    }
+
+    /// With NO tool on the route (SSH, or none for this OS/display) the driver
+    /// writes the OSC 52 fallback AT ONCE, into the writer it was handed, sets the
+    /// "sent" status, and starts no worker — nothing ever reports back.
+    #[test]
+    fn start_copy_with_no_tool_writes_osc52_at_once_and_starts_no_worker() {
+        let mut app = empty_board();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut term: Vec<u8> = Vec::new();
+
+        start_copy(&mut app, &mut term, COPY_ID.to_string(), &[], tx);
+
+        assert_eq!(term, clipboard::osc52_clipboard_sequence(COPY_ID));
+        assert_eq!(
+            app.status.as_deref(),
+            Some(update::osc52_sent_status(COPY_ID).as_str())
+        );
+        assert!(
+            rx.recv_timeout(Duration::from_secs(1)).is_err(),
+            "no worker was started, so no CopyFinished may arrive"
+        );
+    }
+
+    /// With a tool on the route the driver writes NOTHING and sets no status: the
+    /// copy runs on the worker thread, which reports exactly one `CopyFinished`.
+    /// `cat` is a harmless stand-in (it drains stdin and exits 0), never a real
+    /// clipboard tool.
+    #[test]
+    fn start_copy_with_a_tool_writes_nothing_and_the_worker_reports_back_once() {
+        const STAND_IN: &[clipboard::ClipboardTool] = &[clipboard::ClipboardTool {
+            program: "cat",
+            args: &[],
+        }];
+        let mut app = empty_board();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut term: Vec<u8> = Vec::new();
+
+        start_copy(&mut app, &mut term, COPY_ID.to_string(), STAND_IN, tx);
+
+        assert!(term.is_empty(), "the tool path writes no escape");
+        assert_eq!(app.status, None, "the status waits for the worker's result");
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(AppEvent::CopyFinished { session_id, copied }) => {
+                assert_eq!(session_id, COPY_ID);
+                assert!(copied, "the stand-in exited 0 with the id on its stdin");
+            }
+            other => panic!("expected one CopyFinished, got {other:?}"),
+        }
+        assert!(
+            rx.recv_timeout(Duration::from_secs(10)).is_err(),
+            "exactly one CopyFinished per copy"
         );
     }
 }

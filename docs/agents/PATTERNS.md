@@ -468,6 +468,23 @@ the pure event handler. `send::spawn_interrupt` and `send::spawn_bg_launch` are 
 same shape for `claude stop` and `claude --bg`; a new one-shot child belongs here
 rather than behind a teardown whenever it needs no TTY.
 
+The `Ctrl-X y` clipboard copy is that same THREADED shape, and it is NOT a third
+synchronous one-shot beside the two exceptions below. `handle_chord_key` returns
+`Outcome::Copy(id)`, and the driver (`run_inner` → `start_copy`) reads the
+environment at that edge, picks the route (`tui::clipboard::clipboard_route`),
+and, when the route has a tool, starts `clipboard::spawn_tool_copy`: a detached
+worker thread per copy, like `Send`/`Interrupt`/`BgLaunch`. The worker pipes the id into each candidate tool's
+STDIN, with stdout and stderr `Stdio::null()` as `resume::open_url` nulls its
+opener's, so a tool can neither paint over the board nor hold open a pipe
+anything waits on. Exit 0 means copied and ends the walk; a missing tool, a
+failed stdin write or a non-zero exit moves on to the next candidate. It then
+delivers exactly ONE `AppEvent::CopyFinished { session_id, copied }`, and a tool
+that hangs blocks only its own worker. The worker NEVER writes to the terminal.
+The OSC 52 fallback is written by `update::finish_copy` on the UI thread,
+between draws: at once from `start_copy` when the route has no tool, or when the
+`CopyFinished` that `handle_event` hands back as `Outcome::FinishCopy` says
+`copied: false`.
+
 The rule is about the **poll cadence**, not about the word "shell-out". A
 ONE-SHOT at hand-off is a different thing and is allowed — `agents::live_agents`
 is the instance, directly analogous to `resume`'s authoritative re-read of
@@ -680,8 +697,10 @@ CADENCES and LIMITS, so a retune knows what it is next to:
 Add a new tunable the same way. The rule is not only about numbers — a literal
 with a meaning gets a name whatever its type: the undocumented `claude agents`
 wire tokens (`agents::KIND_*` / `QUALIFIER_*`), the raw control bytes the
-terminal seam writes because crossterm publishes no typed command for them
-(`tui`'s `CAN` / `ST` / `KITTY_DISABLE_KEYBOARD` / `DECSTR` / `DECCKM_OFF`), and
+terminal seams write because crossterm publishes no typed command for them
+(`tui`'s `CAN` / `ST` / `KITTY_DISABLE_KEYBOARD` / `DECSTR` / `DECCKM_OFF`, and
+`tui::clipboard`'s OSC 52 wire bytes `OSC_INTRODUCER` / `OSC52_COMMAND` /
+`OSC52_CLIPBOARD_SELECTOR` / `OSC_PARAM_SEPARATOR` / `OSC_STRING_TERMINATOR`), and
 the path literals the grouping heuristic scans for (`store::group`'s
 `PATH_SEPARATOR` / `HIDDEN_DIR_PREFIX`). `tui::TICK` is not a second knob — it is
 an alias of `watch::TICK`, which stays the one definition.
@@ -726,15 +745,20 @@ take the narrow allow instead.
 
 Input handling is a three-stage pipeline, all terminal-free and testable:
 
-1. `key_to_action(key, query_empty)` → an `Action` (every printable char types
-   into the query; arrows, Enter, Tab, and `Ctrl-*` always act so search never
-   blocks navigation).
+1. `key_to_action(key, query_empty, has_preview_matches)` → an `Action` (every
+   printable char types into the query; arrows, Enter, Tab, and `Ctrl-*` always
+   act so search never blocks navigation).
 2. `apply_action` mutates the `App` and returns an `Outcome`
    (`Continue`/`Quit`/`Resume`/`Send`/`Interrupt`/`BgLaunch`). `Send`, `Interrupt`
    and `BgLaunch` carry a confirmed `SendRequest` / `InterruptRequest` /
    `BgLaunchRequest` the driver spawns without a teardown (the board stays up), the
    way `Resume` carries a confirmed `Ready` — the decision is data, the effect is
    the driver's. Add a new effect this way, not by spawning inside the handler.
+   The `Ctrl-X y` copy is the same shape in two steps: the chord's
+   `handle_chord_key` returns `Outcome::Copy` (the full id) for the driver to
+   start, and `handle_event` turns the worker's `AppEvent::CopyFinished` into
+   `Outcome::FinishCopy` rather than finishing it itself, because its OSC 52
+   fallback is a terminal write only the driver may make (§6).
    Which of the two shapes a new action takes is decided by the CHILD, not by what
    it is called: a background-agent launch is `--bg` (returns at once, needs no
    TTY) so it stays on the no-teardown side, while its `Ctrl-O` twin hands the
@@ -750,8 +774,8 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    modal nor a future `List` one can inherit a verb it has no meaning for. Four
    more keyboard owners sit alongside it: the `Ctrl-X` leader chord (while
    `App.pending_chord` is set, `chord_key` routes the next key — `x` hide, `d`
-   delete-confirm, `h` show-hidden, `r` forced full store re-read, anything else
-   cancels), the "stop the
+   delete-confirm, `h` show-hidden, `r` forced full store re-read,
+   `y` copy session ID, anything else cancels), the "stop the
    waiting agent?" confirmation via `App.pending_stop` (a plain Enter/Esc gate
    before compose, for the `needs input` quick-reply path), its `Ctrl-K` sibling
    `App.pending_interrupt` (the same Enter/Esc gate, but resolving to a bare
@@ -857,6 +881,13 @@ fix. A key the user presses is the unit; assert the state the press produced.
 Then satisfy the KEEP KEY DOCS IN SYNC rule in [AGENTS.md](../../AGENTS.md), which
 owns the list of surfaces that must agree — do not re-enumerate them here.
 
+A `Ctrl-X` FOLLOW-UP is added the parallel way, never as an `Action`: a
+`ChordOutcome` variant + its `chord_key` arm (bare letter, shifted form too) + its
+`handle_chord_key` completion, pinned by the `chord_key` table test AND one test
+that feeds `Ctrl-X` then the letter through `handle_event`. Its verb also has to
+fit `view::chord_hint`, whose widest form is budgeted against an 80-column help
+row — the COLUMN BUDGET note there says how to pay for a new one.
+
 A binding that is only meaningful sometimes is **CONDITIONAL, and falls through**
 rather than going inert. `key_to_action` takes the conditions as parameters
 (`query_empty`, `has_preview_matches`) so the decision stays pure and the
@@ -921,6 +952,28 @@ and nudges do not squat on the keymap row. This keeps each fact told exactly
 once and prevents interval-scoped facts from colonizing a keypress-scoped
 surface.
 
+Some confirmations are deliberately sticky (`set_status`) all the same:
+
+- **The `Ctrl-X y` copy's line, on BOTH routes.** `update::finish_copy` makes
+  one `set_status` call for whichever route ran, and says why above it:
+  `Copied session ID <uuid>` when a clipboard tool exited 0, and the OSC 52
+  path's `osc52_sent_status` line (`Sent session ID <uuid> …`), which never says
+  "Copied". The line reports which route ACTUALLY ran, which the user cannot see
+  any other way. On the OSC 52 path it is also the copy's FALLBACK: when the
+  terminal ignores the escape, the full id on the status line is what the user
+  selects by hand (Shift/Option-drag past mouse capture), and a
+  `STATUS_DWELL_TICKS` × `watch::TICK` = 4 s dwell is too short for that.
+- **A lineage delete's tally.** `confirm_delete` sets
+  `delete::status_for_delete`'s line with `set_status`, even when every member
+  went (`3 deleted`). That one line can carry `skipped (running)` refusals and
+  `failed to remove` errors beside the count, and those must stay. A clean
+  SINGLE delete says nothing at all: the row leaving the board is the message.
+
+Both still clear on the next actionable keypress like any sticky status. Do not
+"fix" either to `set_status_transient`. A new confirmation earns stickiness only
+by the same kind of argument: the user has to act on the text itself, or the line
+carries a failure or refusal beside the success.
+
 ## Testing patterns
 
 Tests are **inline** `#[cfg(test)] mod tests` at the bottom of each source file
@@ -956,7 +1009,12 @@ Tests are **inline** `#[cfg(test)] mod tests` at the bottom of each source file
   `build_argv` — no real `claude` process is ever spawned, and no real `git`
   either (the worktree set is stated through `App::set_worktree_probe`, and the
   porcelain parser is fed captured sample text; see
-  [§6](#6-off-ui-thread-for-anything-that-can-block) for the probe seam).
+  [§6](#6-off-ui-thread-for-anything-that-can-block) for the probe seam). No
+  real clipboard tool runs either: `clipboard::spawn_tool_copy` and
+  `tui::start_copy` take the tool list as a parameter, so a test hands in a
+  harmless stand-in (`sh`, `cat`, `false`), and the OSC 52 fallback reaches a
+  `Vec<u8>` through the `Write`-generic `update::finish_copy`, never the test
+  run's terminal.
 - **Assert structure, not styling**: preview tests flatten `Text` to plain
   strings to check markers, and separately assert `Style`/`Modifier` on specific
   spans.

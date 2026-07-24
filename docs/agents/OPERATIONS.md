@@ -221,6 +221,7 @@ switch. That `NPM_TOKEN` secret can be deleted once one OIDC release succeeds.)
 | --- | --- | --- |
 | `CLAUDE_PROJECTS_DIR` | `~/.claude/projects` | Overrides the session store root (used by both the TUI and `--print-list`). |
 | `SNAPBACK_CONFIG_DIR` | `~/.config/snapback` | Overrides snapback's OWN config dir (the single env-resolved root for snapback-owned paths; state lives in its `state/` subdir). Resolved only by the `config` module. |
+| `SSH_CONNECTION` / `SSH_TTY` / `WAYLAND_DISPLAY` / `DISPLAY` | set by `sshd` / the desktop session | Session FACTS, not overrides. Read only by `tui::clipboard::ClipboardEnv::from_env` (present and non-empty counts as set) to pick the `Ctrl-X y` copy's clipboard tool, or none, in which case the copy falls back to OSC 52. The route table is the `tui::clipboard` row of the [module map](ARCHITECTURE.md#module-map). |
 
 ## Hidden debug mode
 
@@ -242,6 +243,10 @@ confirm subagents/sidecars were excluded). It is intentionally omitted from
   live", so the live-agent badges disappear. Its flags, commands, version pin,
   and the exact argv `snapback` builds are in
   [CLAUDE_CLI.md](CLAUDE_CLI.md).
+- A clipboard tool, OPTIONAL — `pbcopy` (built into macOS), or `wl-copy` /
+  `xclip` / `xsel` on a Linux desktop — for `Ctrl-X y`. Without a working one,
+  and always over SSH, the copy falls back to a write-only OSC 52 escape, and
+  the status line says `Sent session ID …`, never `Copied`.
 
 ## Validation checklist before finishing a change
 

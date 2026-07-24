@@ -112,7 +112,7 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | `Ctrl-O` (in that picker) | **Start the highlighted agent interactively at once**, skipping the draft — the same thing `Ctrl-O` means inside the draft box, so either route out of the picker is one keypress |
 | `Ctrl-R` | **Quick reply** — send a one-shot message to the selected session without leaving the board. A background agent whose run is over (`done`, `stopped`, `failed`) is stopped first so the reply lands in place; a waiting one (`needs input`) asks you to confirm that stop; one that is still live (`working`, `idle`, `interrupted`, or a state this version doesn't recognize) is left alone and refused. Opens a compose box (`Enter` sends, `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels) |
 | `Ctrl-K` | **Stop / interrupt** the selected session's live background agent (`claude stop`). An agent whose run is over (`done`, `stopped`, `failed`) stops immediately; every other live agent (`working`, `needs input`, `idle`, `interrupted`, unrecognized) confirms first, since stopping ends the live job (its conversation is kept). A session that isn't running as an agent has nothing to stop, and an interactive session running in another terminal can't be stopped from here |
-| `Ctrl-X` then `x` / `d` / `h` / `r` | **Leader chord** for trimming and refreshing the board — `x` **hides** the selected session (reversible, persisted), `d` **hard-deletes** it after a confirmation that can take just that row or its whole `(+N)` stack, `h` toggles **show hidden**, `r` **re-reads every transcript from disk**. Any other key cancels the chord |
+| `Ctrl-X` then `x` / `d` / `h` / `r` / `y` | **Leader chord** that acts on the selected row (`x`, `d`, `y`) or on the whole board (`h`, `r`) — `x` **hides** the selected session (reversible, persisted), `d` **hard-deletes** it after a confirmation that can take just that row or its whole `(+N)` stack, `h` toggles **show hidden**, `r` **re-reads every transcript from disk**, `y` is **copy session ID**: the selected session's full id goes to your clipboard and shows on the status line. Any other key cancels the chord |
 | `Tab` | Toggle search: **name-only ↔ name+content**. Widening to content also opens the preview on the most recent match, the same way typing does |
 | `Ctrl-A` | Flip scope: **current folder ↔ project** — the project being the repo you launched in and all of its git worktrees. Started with `-a` it is a three-stop cycle instead (current folder → project → all folders), which is the only way to reach all folders |
 | `Ctrl-/` | Toggle the transcript **preview** pane |
@@ -128,6 +128,15 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | any printable char | Type to search |
 | paste (`Cmd`/`Ctrl-V`, middle-click) | Your terminal's own paste, taken as **text**: into a compose or draft box at the cursor, **newlines intact** (no more sending just the first line); on the board, appended to the query with newlines as spaces. It never sends, resumes, or confirms |
 | `Esc` / `Ctrl-C` | Quit |
+
+The `Ctrl-X y` copy goes through your OS clipboard tool — `pbcopy` on macOS;
+`wl-copy`, `xclip` or `xsel` on Linux — and the status line says
+`Copied session ID …` only when that tool reports success. Over SSH, with no
+tool to use, or when the tool fails, it falls back to a write-only OSC 52
+escape, which reaches your clipboard only if the terminal — and tmux, via
+`set -g set-clipboard on` — lets programs set it; that line says
+`Sent session ID …`, never `Copied`. Either way the full id stays on the status
+line until your next key, so you can select it by hand.
 
 Mouse mode is on so the wheel can scroll and the pane border can be dragged; to
 select/copy text natively, hold **Shift** (or **Option/⌥** on iTerm2 and macOS
@@ -406,8 +415,9 @@ sits still: that badge is snapback's *inference* from Claude Code contradicting
 itself, not a report that the run ended, and it isn't worth stopping live work over
 a guess. Use `Ctrl-K` if you do want it stopped — it will ask first.
 
-**Hide & delete.** `Ctrl-X` is a leader chord for trimming the board: press it,
-and a hint shows the follow-ups — `x`, `d`, `h`, `r` — while any other key cancels.
+**Hide, delete & copy.** `Ctrl-X` is a leader chord that acts on the selected
+row or on the whole board: press it, and a hint shows the follow-ups — `x`, `d`,
+`h`, `r`, `y` — while any other key cancels.
 
 - `Ctrl-X x` **hides** the selected session. This is the reversible default: the
   session stays on disk, it just drops off the board. A `(+N)` stack always hides
@@ -424,6 +434,15 @@ and a hint shows the follow-ups — `x`, `d`, `h`, `r` — while any other key c
   reads the whole store again, which is the answer if a row ever looks out of date
   — on a network drive with a coarse clock, say. It reports how many sessions it
   landed on, and costs nothing but the re-read.
+- `Ctrl-X y` is **copy session ID**: it puts the selected session's full id —
+  the one `claude -r <id>` takes, or a bug report wants — on your system
+  clipboard, and shows it on the status line until your next key. On your own
+  machine it goes through the OS clipboard tool (`pbcopy` on macOS; `wl-copy`,
+  `xclip` or `xsel` on Linux), and the line reads `Copied session ID …`. Over
+  SSH, or with no working tool, the id is sent to your terminal as an OSC 52
+  escape instead, and the line says `Sent`, not `Copied`: some terminals (and
+  tmux without `set -g set-clipboard on`) ignore that escape, and the id on the
+  status line is still there to select by hand.
 - `Ctrl-X d` **hard-deletes** the selected session — physically removing its
   transcript from disk. Because that is irreversible, it asks first with a
   confirmation prompt (defaulted to Cancel). On a row that stands for a `(+N)`

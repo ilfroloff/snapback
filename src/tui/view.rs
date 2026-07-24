@@ -2470,11 +2470,18 @@ fn render_search(frame: &mut Frame, app: &mut App, area: Rect) {
 ///
 /// COLUMN BUDGET: the help row is ONE line and is truncated, never wrapped, so
 /// the longest form is what has to fit — `expose` (the wider verb) lands it at
-/// exactly 80 columns. Anything added here costs the tail of an 80-column
-/// terminal, so weigh a new verb against `Esc cancel` rather than appending.
+/// 77 columns. Anything added here costs the tail of an 80-column terminal, so a
+/// new verb is paid for by shrinking existing wording, never by appending. The
+/// `y` verb paid twice. Appended to the old `h show/hide hidden` wording, `y copy`
+/// made 89 columns, so `h` shrank to `h hidden` (the toggle is still the one `h`
+/// does). Relabelled `y copy session ID`, because a bare "copy" did not say what
+/// it copies, it made 90 columns with `· Esc cancel`, so `Esc cancel` went — the
+/// trade this note had set aside for the next verb: it was the one entry naming
+/// no action, and any key the chord does not bind still cancels it, `Esc`
+/// included. `d delete row/lineage` keeps naming both of its targets.
 fn chord_hint(selected_hidden: bool) -> String {
     let x = if selected_hidden { "expose" } else { "hide" };
-    format!("^X  x {x} · d delete row/lineage · h show/hide hidden · r reload · Esc cancel")
+    format!("^X  x {x} · d delete row/lineage · h hidden · r reload · y copy session ID")
 }
 
 /// The compose zone's key hints, per open draft. Pure so the wording is assertable
@@ -9973,9 +9980,9 @@ mod tests {
         for needle in [
             "x hide",
             "d delete row/lineage",
-            "h show/hide hidden",
+            "h hidden",
             "r reload",
-            "Esc cancel",
+            "y copy session ID",
         ] {
             assert!(
                 text.contains(needle),
@@ -9986,7 +9993,7 @@ mod tests {
 
     /// The hint's own column budget: its LONGEST form must still fit an
     /// 80-column terminal, since the help row is truncated rather than wrapped
-    /// and the tail carries `Esc cancel`.
+    /// and the tail carries the `y copy session ID` verb.
     #[test]
     fn the_chord_hint_fits_an_eighty_column_terminal() {
         let widest = chord_hint(true);
