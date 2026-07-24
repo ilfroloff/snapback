@@ -177,8 +177,23 @@ No loop follows from that, and the reason is the trigger filters, not the token:
 re-enter the other.
 
 One repo-side prerequisite remains for the release PR: the "Allow GitHub Actions
-to create and approve pull requests" setting. Publishing to npm needs an
-**`NPM_TOKEN`** secret (an npm automation token).
+to create and approve pull requests" setting.
+
+Publishing to npm uses **trusted publishing (OIDC)** — no stored token. The
+publish job's `id-token: write` lets npm exchange a short-lived GitHub identity
+for a one-time publish credential (and sign provenance with it), so nothing
+long-lived lives in the repo. Two things make it work, and both are prerequisites
+rather than nice-to-haves:
+
+- The workflow upgrades npm to **≥ 11.5.1** before publishing — OIDC needs it and
+  node 22 ships npm 10, which fails the handshake as a misleading 404.
+- A **trusted publisher** must be configured ONCE on the npmjs.com `snapback-tui`
+  page (GitHub Actions → org `ilfroloff`, repo `snapback`, workflow
+  `npm-release.yml`). Without it the next release's publish is rejected — a failed
+  publish does not burn the version, but it does fail the run.
+
+(History: `v0.4.0` was published with a granular access token before the OIDC
+switch. That `NPM_TOKEN` secret can be deleted once one OIDC release succeeds.)
 
 ## Environment
 
