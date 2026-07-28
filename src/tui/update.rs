@@ -4,12 +4,21 @@
 //! re-applies query/scope while preserving selection-by-id and scroll; on
 //! `Tick` does nothing costly. Restores selection by locating the selected
 //! `session_id` in the new filtered list (clamps to nearest if it vanished).
+//! The remaining variants are off-thread deliveries: `ReportedAgents` swaps in the
+//! poller's badge/banner map, while `SendFinished`, `InterruptFinished` and
+//! `BgLaunchFinished` each land ONE one-shot child's result — the last of which
+//! also closes the in-flight new-session draft card it names (and only that one).
+//! Because such a result can arrive after the board it belongs to is gone,
+//! [`handle_event`] closes the compose surface on any [`Outcome`] that
+//! [ends the board session](Outcome::ends_board_session) as well.
 //!
 //! This module is the *decision* half of the loop: [`key_to_action`] maps a key
 //! to an [`Action`], and [`handle_event`] applies an [`AppEvent`] to the [`App`]
 //! and returns an [`Outcome`] telling the driver (in [`crate::tui`]) whether to
-//! continue, quit, or hand off a resume. All of it is terminal-free and unit
-//! tested; the terminal-driving loop that calls it lives in [`crate::tui::run`].
+//! continue, quit, hand off a resume, or fire one of the three no-teardown
+//! children (`Send` / `Interrupt` / `BgLaunch`). All of it is terminal-free and
+//! unit tested; the terminal-driving loop that calls it lives in
+//! [`crate::tui::run`].
 //!
 //! ## Keybindings
 //!
@@ -20,7 +29,10 @@
 //! | `Left` / `Right` | fold / expand the selected row's fork lineage (always) |
 //! | `Enter` | resume the selected session |
 //! | `Ctrl-F` | fork-resume the selected session |
-//! | `Ctrl-N` | start a new session in the launch directory (pick an agent when any are defined) |
+//! | `Ctrl-N` | start a new session in the launch directory. When agents are defined a picker opens first and `Enter` on a pick opens a draft pane for the session's first message; with none defined that draft opens straight away. In the draft, `Enter` starts a BACKGROUND agent without leaving the board, `Ctrl-O` runs it interactively instead, `Esc` cancels |
+//! | `Ctrl-O` (in the agent picker) | start the highlighted agent INTERACTIVELY at once, skipping the draft — the same verb `Ctrl-O` names inside the draft, so BOTH routes out of the picker cost exactly one key. Bound on the picker alone — inert on every other modal |
+//! | `Ctrl-R` | quick-reply: send a one-shot message to the selected session without leaving the board. An agent whose run is OVER (`done` / `stopped` / `failed`) is stopped first so the reply lands in place; `needs input` confirms first; `working` / `idle` / `interrupted` / an unrecognized qualifier is refused (see [`send::reply_gate`]) |
+//! | `Ctrl-K` | stop / interrupt the selected session's live background agent (`claude stop`); an agent whose run is OVER (`done` / `stopped` / `failed`) stops at once, every other live agent confirms first, and a session claude is not holding — or one running interactively, which carries no job id — is refused (see [`send::interrupt_gate`]) |
 //! | `Tab` | toggle name-only vs. name+content search |
 //! | `Ctrl-A` | toggle scope (current-folder <-> all) |
 //! | `Ctrl-X` then `x`/`d`/`h` | leader chord: hide / hard-delete / toggle show-hidden (any other key cancels) |
@@ -30,6 +42,7 @@
 //! | `Home` / `End` | jump the preview to top / bottom (always) |
 //! | `Backspace` | delete the last query character |
 //! | printable char | type-to-search (append to the query) |
+//! | terminal paste | inserted as TEXT — never as keystrokes (see below) |
 //! | `q` | quit (only while the query is empty; otherwise typed) |
 //! | `Esc` / `Ctrl-C` | quit (always) |
 //!
@@ -37,6 +50,20 @@
 //! browse state they navigate/quit; once you are typing a query they become
 //! ordinary search input. Arrows, `Enter`, `Tab`, and every `Ctrl-` binding
 //! work regardless of the query, so search is never blocked.
+//!
+//! ## Terminal paste
+//!
+//! `tui::init_terminal` enables BRACKETED PASTE, so the terminal hands a clipboard
+//! drop over as ONE [`crossterm::event::Event::Paste`] rather than as a stream of
+//! `KeyEvent`s. There is NO `Ctrl-V` binding and there must not be one: the paste
+//! is the terminal's own (`Cmd+V`, middle-click, …), which keeps working over SSH
+//! and inside tmux where an app-side clipboard read would not.
+//!
+//! [`handle_paste`] routes it through the SAME six-owner precedence the key arm
+//! uses, and the row above is deliberately terse because the interesting part is
+//! that routing — the four overlay owners swallow a paste, the compose zone inserts
+//! it at the caret, and the board appends it to the query with newlines flattened
+//! to spaces. A paste can never submit, resume, or quit.
 
 use std::path::Path;
 
@@ -48,11 +75,12 @@ use ratatui::layout::{Position, Rect};
 use crate::defined_agents;
 use crate::delete;
 use crate::resume::{self, Ready};
+use crate::send::{self, BgLaunchRequest, InterruptGate, InterruptRequest, ReplyGate, SendRequest};
 use crate::store::SessionStore;
 use crate::watch::AppEvent;
 
 use super::app::{App, ModalAction, ModalLayout};
-use super::view;
+use super::{compose, view};
 
 /// A decoded intent from a single keypress.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +109,18 @@ pub enum Action {
     /// the `claude` hand-off are decided there and a confirmed plan surfaces as
     /// [`Outcome::Resume`].
     NewSession,
+    /// Open the quick-reply compose zone for the selected session (`Ctrl-R`).
+    /// [`apply_action`] runs the reply gate ([`send::reply_gate`]) first, because
+    /// `claude -p -r` REFUSES a session claude is holding as an agent: an agent
+    /// whose run is over is stopped first and compose opens, a `needs input` one
+    /// confirms before that stop, and a still-live one is refused with a hint.
+    Reply,
+    /// Stop / interrupt the selected session's live background agent (`Ctrl-K`).
+    /// [`apply_action`] runs the interrupt gate ([`send::interrupt_gate`]): an
+    /// agent whose run is over is stopped immediately, every other live agent
+    /// confirms first, and a non-live or interactive session is refused with a
+    /// hint.
+    Interrupt,
     /// Toggle name-only vs. name+content search.
     ToggleSearchMode,
     /// Toggle current-folder vs. all scope.
@@ -127,6 +167,47 @@ pub enum Outcome {
     /// Tear down the terminal and spawn `claude` for this confirmed plan, then
     /// return to the board.
     Resume(Ready),
+    /// Fire a one-shot quick-reply send on a detached thread and KEEP running —
+    /// the board never tears down. Handled inline by [`crate::tui::run`] (which
+    /// owns the event channel the send reports back on), so unlike
+    /// [`Resume`](Self::Resume) it never propagates out to the process driver.
+    /// Carried as data (rather than spawned in the handler) so the send DECISION
+    /// stays pure and unit-testable, the way [`Resume`](Self::Resume) carries a
+    /// confirmed [`Ready`].
+    Send(SendRequest),
+    /// Fire a one-shot interrupt (`claude stop <job-id>`) on a detached thread and
+    /// KEEP running — like [`Send`](Self::Send), the board never tears down. Handled
+    /// inline by [`crate::tui::run`]; the stop reports back via
+    /// [`AppEvent::InterruptFinished`](crate::watch::AppEvent::InterruptFinished).
+    /// Carried as data (rather than spawned in the handler) so the interrupt DECISION
+    /// stays pure and unit-testable, the way [`Send`](Self::Send) carries a request.
+    Interrupt(InterruptRequest),
+    /// Fire a one-shot background-agent launch (`claude [--agent <name>] --bg
+    /// <prompt>`) on a detached thread and KEEP running — like [`Send`](Self::Send)
+    /// and [`Interrupt`](Self::Interrupt), the board never tears down. Handled
+    /// inline by [`crate::tui::run`]; the launch reports back via
+    /// [`AppEvent::BgLaunchFinished`](crate::watch::AppEvent::BgLaunchFinished).
+    ///
+    /// This is why starting a background agent does NOT route through
+    /// [`Resume`](Self::Resume): a `--bg` launch returns immediately and needs no
+    /// TTY, so tearing the terminal down for it would flash the board away for
+    /// nothing. The interactive escape hatch (`Ctrl-O`) still takes
+    /// [`Resume`](Self::Resume), because that one really does hand the terminal over.
+    BgLaunch(BgLaunchRequest),
+}
+
+impl Outcome {
+    /// Whether this outcome ENDS the current board session — the terminal comes
+    /// down and the merged event channel with it.
+    ///
+    /// True for [`Quit`](Self::Quit) and every [`Resume`](Self::Resume); false for
+    /// the three no-teardown effects, which keep drawing on the SAME channel. Pure,
+    /// so "does the board survive this?" is one greppable answer rather than a
+    /// `matches!` repeated per call site.
+    #[must_use]
+    pub fn ends_board_session(&self) -> bool {
+        matches!(self, Outcome::Quit | Outcome::Resume(_))
+    }
 }
 
 /// Map a keypress to an [`Action`]. `query_empty` disambiguates the `j`/`k`/`q`
@@ -145,6 +226,8 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool) -> Action {
             KeyCode::Char('/') | KeyCode::Char('_') => Action::TogglePreview,
             KeyCode::Char('a') | KeyCode::Char('A') => Action::ToggleScope,
             KeyCode::Char('n') | KeyCode::Char('N') => Action::NewSession,
+            KeyCode::Char('r') | KeyCode::Char('R') => Action::Reply,
+            KeyCode::Char('k') | KeyCode::Char('K') => Action::Interrupt,
             KeyCode::Char('c') | KeyCode::Char('C') => Action::Quit,
             // Ctrl-X (0x18 CAN) is the hide/delete leader chord. Unbound and
             // terminal-safe — unlike Ctrl-H/I/M, which alias Backspace/Tab/Enter.
@@ -202,7 +285,35 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool) -> Action {
 /// * `SessionsChanged` -> reload the store from `root` and re-apply query+scope,
 ///   preserving selection-by-id and scroll (see [`App::apply_sessions`]).
 /// * `Tick` -> nothing costly (just a redraw upstream).
+///
+/// Every return runs through ONE teardown seam: an outcome that
+/// [ends the board session](Outcome::ends_board_session) also tears the compose
+/// surface down, because neither half of it can outlive the channel it reports on
+/// (see [`dispatch`]).
 pub fn handle_event(app: &mut App, event: AppEvent, root: &Path) -> Outcome {
+    let outcome = dispatch(app, event, root);
+    if outcome.ends_board_session() {
+        // The compose surface is bounded by the board session, and the IN-FLIGHT
+        // draft card is why that has to be enforced here rather than left to each
+        // route. It is the one part of the surface that outlives its editor, so
+        // `Ctrl-F` / `Enter` on a row stay routable underneath it — and the
+        // `BgLaunchFinished` that would have closed it cannot survive the hand-off:
+        // `tui::run_inner` builds a fresh `EventLoop` per board session and drops
+        // the old receiver, while `lib::run` re-enters the board on the SAME `App`.
+        // A card left standing there would replace EVERY session's transcript with
+        // a placeholder and hold `overlay_active` true (killing link clicks and
+        // splitter drags) until another compose was opened and cancelled.
+        app.close_compose();
+    }
+    outcome
+}
+
+/// The body of [`handle_event`]: route one event to its handler.
+///
+/// Split out only so the teardown seam above sees every outcome — the routes below
+/// return from several places, and a rule that must hold for ALL of them cannot be
+/// a line each of them remembers to run.
+fn dispatch(app: &mut App, event: AppEvent, root: &Path) -> Outcome {
     match event {
         AppEvent::Input(Event::Key(key)) if is_actionable(key) => {
             // While a modal overlay (the running-session choice, the new-session
@@ -216,6 +327,23 @@ pub fn handle_event(app: &mut App, event: AppEvent, root: &Path) -> Outcome {
             // (`x`/`d`/`h`) completes the chord instead of leaking into the query.
             if app.pending_chord {
                 return handle_chord_key(app, key);
+            }
+            // The "stop the waiting agent?" confirmation owns the keyboard until it
+            // resolves into compose (Enter) or is dismissed (Esc).
+            if app.pending_stop.is_some() {
+                return handle_stop_confirm_key(app, key);
+            }
+            // The "stop this agent?" interrupt confirmation likewise owns the keyboard
+            // until it resolves into a stop (Enter) or is dismissed (Esc).
+            if app.pending_interrupt.is_some() {
+                return handle_interrupt_confirm_key(app, key);
+            }
+            // The quick-reply compose zone owns the keyboard while open: every key
+            // routes to the compose handler (Enter sends, Ctrl-J/Alt+Enter add a
+            // newline, Esc cancels, the rest edit the buffer), bypassing
+            // `key_to_action` entirely — mirroring the two overlays above.
+            if app.is_composing() {
+                return compose::handle_compose_key(app, key);
             }
             // A transient status (e.g. a resume refusal) lives exactly until the
             // next key; clear it first so this keypress may set a fresh one.
@@ -232,6 +360,14 @@ pub fn handle_event(app: &mut App, event: AppEvent, root: &Path) -> Outcome {
             handle_mouse(app, mouse);
             Outcome::Continue
         }
+        // A terminal PASTE (bracketed paste, enabled in `tui::init_terminal`). A
+        // dedicated arm BEFORE the input catch-all that used to swallow it, and
+        // routed by [`handle_paste`] through the SAME precedence the key arm above
+        // uses — see that fn for what each keyboard owner does with one.
+        AppEvent::Input(Event::Paste(text)) => {
+            handle_paste(app, &text);
+            Outcome::Continue
+        }
         AppEvent::Input(_) => Outcome::Continue,
         AppEvent::SessionsChanged => {
             app.apply_sessions(SessionStore::load_from(root));
@@ -240,6 +376,52 @@ pub fn handle_event(app: &mut App, event: AppEvent, root: &Path) -> Outcome {
         AppEvent::ReportedAgents(agents) => {
             // Delivered off-thread by the agents poller; just swap the map in.
             app.set_reported_agents(agents);
+            Outcome::Continue
+        }
+        AppEvent::SendFinished { session_id, status } => {
+            // A one-shot quick-reply send completed off-thread. Clear the in-flight
+            // indicator (if this is the send it was tracking) and surface the mapped
+            // result (cost / error) on the status line.
+            if app.sending_to(&session_id).is_some() {
+                app.sending = None;
+            }
+            if let Some(status) = status {
+                app.set_status(status);
+            }
+            // If the finished send targets the row on screen, re-anchor the
+            // preview to the newest turn so the reply — arriving via the separate
+            // `SessionsChanged` reload — lands in view. The reply body itself is
+            // NOT read here; the watcher → reload → preview path renders it.
+            if app.selected.as_deref() == Some(session_id.as_str()) {
+                app.preview_bottom();
+            }
+            Outcome::Continue
+        }
+        AppEvent::InterruptFinished { status } => {
+            // A one-shot interrupt (`claude stop`) completed off-thread; surface its
+            // result. The live badge clears on the next agents poll (~1s), and the
+            // transcript is unchanged (stopping keeps the conversation), so there is
+            // nothing else to reconcile.
+            app.set_status(status);
+            Outcome::Continue
+        }
+        AppEvent::BgLaunchFinished { launch_id, status } => {
+            // A one-shot background-agent launch completed off-thread; surface its
+            // result (started / started-but-warned / the failure reason) and close
+            // the draft card that was reporting THIS launch in flight. There is
+            // deliberately nothing else to do: the new agent has no id the board
+            // knows yet, and it arrives on the list through the ordinary watcher →
+            // reload path like any other session.
+            //
+            // The identity check is the `sending_to` guard above, and it is
+            // load-bearing for the same reason: the card outlives its editor, so a
+            // result can land on a surface that is no longer this launch's — a
+            // quick reply, or a second draft — and closing blindly would throw away
+            // a buffer the user is still typing into.
+            app.set_status(status);
+            if app.launching_draft(launch_id).is_some() {
+                app.close_compose();
+            }
             Outcome::Continue
         }
         AppEvent::Tick => {
@@ -257,6 +439,176 @@ pub fn handle_event(app: &mut App, event: AppEvent, root: &Path) -> Outcome {
 /// are ignored so a keystroke is never handled twice.
 fn is_actionable(key: KeyEvent) -> bool {
     matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+}
+
+/// The most CHARACTERS one terminal paste may contribute, to the compose draft and
+/// to the board query alike.
+///
+/// The limit is about COST, not layout: `view::COMPOSE_MAX_TEXT_ROWS` already caps
+/// the compose box at 6 rows and the editor scrolls beyond that, so an enormous
+/// paste never breaks the geometry. What it does break is the per-frame work behind
+/// it — `compose::ComposeState::screen_rows` CLONES the whole `TextArea` (lines,
+/// undo history and screen map) on every redraw to probe its wrapped height, at the
+/// `watch::TICK` cadence for as long as the draft is open. On the board the same
+/// text feeds `search::SearchIndex::set_query`, which rebuilds the pattern and one
+/// substring finder per space-separated atom.
+///
+/// 4096 is chosen to sit far above anything a human composes or pastes into a
+/// one-shot reply — a stack trace, a failing test's output, a diff hunk — while
+/// keeping both of those costs the same order of magnitude as typed input. ONE
+/// const covers both destinations deliberately: "how much text can arrive in a
+/// single paste?" deserves one greppable answer, and the board query's cost curve
+/// (linear in atoms) is gentler than the draft's, so a cap safe for the draft is
+/// safe there too.
+const PASTE_MAX_CHARS: usize = 4_096;
+
+/// The status a paste longer than [`PASTE_MAX_CHARS`] reports.
+///
+/// TRUNCATE, not reject, and say so: rejecting a too-long paste outright throws away
+/// the part that DID fit and leaves the user nothing to edit down, while truncating
+/// keeps the head they can see. What makes truncation acceptable is that it is never
+/// silent — this line takes the help row (a status wins it, even while composing),
+/// so a shortened paste is always reported rather than discovered later in a sent
+/// reply.
+///
+/// A fn rather than a `const` because the NUMBER is the message: naming the cap is
+/// what turns "some of it was dropped" into "here is exactly how much landed", and
+/// a `&'static str` cannot interpolate it.
+fn paste_truncated_status() -> String {
+    format!("pasted text was too long — kept the first {PASTE_MAX_CHARS} characters")
+}
+
+/// One terminal paste, normalized and capped — what the routing below is allowed to
+/// insert anywhere.
+struct AcceptedPaste {
+    /// The accepted text: line endings normalized to `\n`, at most
+    /// [`PASTE_MAX_CHARS`] chars.
+    text: String,
+    /// Whether the cap dropped a tail, so the caller can say so.
+    truncated: bool,
+}
+
+/// Normalize and cap one pasted string — the SINGLE gate every pasted character
+/// passes before it can reach a draft or the query. Pure, so both the line-ending
+/// rules and the cap are unit-testable without a terminal.
+///
+/// Two jobs, deliberately fused so neither can be skipped at a call site:
+///
+/// * **Line endings collapse to `\n`.** A terminal may deliver a paste with CRLF
+///   (Windows clipboards, and anything copied out of a CRLF file) or with a LONE CR
+///   — the classic form for an embedded newline inside a bracketed paste. Left
+///   as-is, a stray `\r` reaches the draft as an invisible control character and the
+///   query as a byte no session label can contain, so the text silently stops
+///   matching. `\r\n` collapses to ONE `\n`, never two.
+/// * **The cap is counted in CHARS, and taken from the NORMALIZED stream.** Counting
+///   chars rather than bytes is what makes truncation UTF-8 safe by construction:
+///   there is no index to land mid-codepoint on, so a paste ending in emoji or CJK
+///   cannot panic the way a naive byte slice would. Counting AFTER normalization
+///   means a CRLF pair costs one character, exactly like the `\n` it becomes.
+fn accept_paste(raw: &str) -> AcceptedPaste {
+    let mut text = String::new();
+    let mut taken = 0usize;
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if taken == PASTE_MAX_CHARS {
+            // Something is left, so the tail was dropped.
+            return AcceptedPaste {
+                text,
+                truncated: true,
+            };
+        }
+        let c = if c == '\r' {
+            // CRLF is ONE newline: swallow the LF that follows a CR.
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            '\n'
+        } else {
+            c
+        };
+        text.push(c);
+        taken += 1;
+    }
+    AcceptedPaste {
+        text,
+        truncated: false,
+    }
+}
+
+/// Flatten an accepted paste into the SINGLE-LINE board query: every newline
+/// becomes a space. Pure.
+///
+/// The alternative — keep the first line and drop the rest — silently discards what
+/// the user pasted, and the query's own tokenization says it is not needed:
+/// `search::gate_atoms` splits the query on unescaped spaces into substring atoms
+/// that must ALL match, so `foo\nbar` flattens to exactly the `foo bar` the user
+/// could have typed, with the same meaning. Nothing is lost, and the result composes
+/// with type-to-search rather than defining a second rule beside it. Runs of
+/// newlines become runs of spaces, which the atom splitter already drops as empty
+/// atoms.
+///
+/// Only `\n` needs handling: [`accept_paste`] has already turned every `\r` into
+/// one.
+fn flatten_for_query(text: &str) -> String {
+    text.replace('\n', " ")
+}
+
+/// Route one terminal paste (bracketed paste, enabled in [`crate::tui::init_terminal`]).
+///
+/// The paste arm mirrors the KEY arm's precedence exactly, because the reason the
+/// key arm has that order applies unchanged: a surface that owns the keyboard must
+/// not have text land on the surface behind it. All six owners, in order:
+///
+/// 1. **Modal** ([`handle_modal_key`]) — IGNORED. A modal is a fixed choice
+///    (Attach/Fork/Cancel, the agent picker, the delete confirm); it has no text
+///    field, so the only things a paste could do are pick an option the user did not
+///    choose or leak into the board's query underneath an overlay that hides it.
+/// 2. **`Ctrl-X` leader chord** ([`handle_chord_key`]) — IGNORED, and it does NOT
+///    resolve the chord. The chord resolves on exactly one KEY, hit or miss; a paste
+///    carries no chord completion, and cancelling on one would let a stray paste
+///    silently disarm a chord whose hint is still on screen. The next key still
+///    decides.
+/// 3. **Stop confirmation** ([`handle_stop_confirm_key`]) — IGNORED. A plain
+///    Enter/Esc gate: a paste is neither, and must not stop an agent.
+/// 4. **Interrupt confirmation** ([`handle_interrupt_confirm_key`]) — IGNORED, same
+///    reason.
+/// 5. **Compose** — INSERTED at the caret as text, via [`compose::insert_paste`].
+///    This is the fix: the newline inside a paste becomes a newline in the draft
+///    instead of the `Enter` that used to submit it.
+/// 6. **Board** — APPENDED to the search query, newlines flattened to spaces
+///    ([`flatten_for_query`]), exactly as if typed.
+///
+/// Returns nothing on purpose. A paste can never produce [`Outcome::Send`],
+/// [`Outcome::Resume`] or any other board-ending outcome, and that is structural
+/// here rather than a promise: no branch reaches a submit path.
+fn handle_paste(app: &mut App, raw: &str) {
+    // Owners 1-4: swallow. Same order, same reasons, as the key arm in `dispatch`.
+    if app.modal.is_some()
+        || app.pending_chord
+        || app.pending_stop.is_some()
+        || app.pending_interrupt.is_some()
+    {
+        return;
+    }
+
+    let accepted = accept_paste(raw);
+    if accepted.text.is_empty() {
+        return;
+    }
+
+    if app.is_composing() {
+        // Owner 5: the draft takes it verbatim, newlines and all.
+        compose::insert_paste(app, &accepted.text);
+    } else {
+        // Owner 6: the board. Clear the transient status first, exactly as an
+        // actionable keypress does, so a stale refusal does not outlive this input.
+        app.clear_status();
+        app.push_query_str(&flatten_for_query(&accepted.text));
+    }
+
+    if accepted.truncated {
+        app.set_status(paste_truncated_status());
+    }
 }
 
 /// Which pane a mouse wheel targets, resolved by [`wheel_target`].
@@ -478,6 +830,8 @@ fn apply_action(app: &mut App, action: Action) -> Outcome {
             }
         }
         Action::NewSession => new_session(app),
+        Action::Reply => reply(app),
+        Action::Interrupt => interrupt(app),
         Action::ToggleSearchMode => {
             app.toggle_search_mode();
             Outcome::Continue
@@ -600,6 +954,11 @@ enum ModalNav {
     Prev,
     /// Act on the highlighted choice (`Enter`).
     Confirm,
+    /// Start the highlighted choice INTERACTIVELY, skipping the draft (`Ctrl-O`) —
+    /// the new-session picker's second verb, alongside `Enter`'s background draft.
+    /// Bound on the `List` layout only (see [`modal_key`]) and further narrowed to
+    /// [`ModalAction::New`] rows by [`launch_pick_interactively`].
+    Interactive,
     /// Dismiss the modal (`Esc`/`Ctrl-C`).
     Cancel,
     /// A key with no binding in the modal.
@@ -614,10 +973,19 @@ enum ModalNav {
 /// overlays' key maps must not be unioned by accident. `Left`/`Right` are ALSO
 /// bound on the BOARD (`CollapseLineage`/`ExpandLineage`); `handle_event`'s modal
 /// gate keeps those dispatch contexts apart, so they never see the same keypress.
+///
+/// `Ctrl-O` is derived from `layout` for the same reason: only the `List` picker
+/// has an interactive start to offer, so it must stay INERT on the running-session
+/// Attach/Fork strip and the delete confirm rather than becoming a modal-wide key.
+/// The action-level narrowing lives in [`launch_pick_interactively`] — the layout is
+/// the key map's business, the choice's meaning is the handler's.
 fn modal_key(key: KeyEvent, layout: ModalLayout) -> ModalNav {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
             KeyCode::Char('c') | KeyCode::Char('C') => ModalNav::Cancel,
+            KeyCode::Char('o') | KeyCode::Char('O') if matches!(layout, ModalLayout::List) => {
+                ModalNav::Interactive
+            }
             _ => ModalNav::Ignore,
         };
     }
@@ -654,8 +1022,49 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, root: &Path) -> Outcome {
             Outcome::Continue
         }
         ModalNav::Confirm => confirm_modal(app, root),
+        ModalNav::Interactive => launch_pick_interactively(app),
         ModalNav::Ignore => Outcome::Continue,
     }
+}
+
+/// Start the picker's highlighted agent INTERACTIVELY (`Ctrl-O`), skipping the
+/// draft pane `Enter` opens.
+///
+/// The second verb on the new-session picker, beside `Enter`'s background draft.
+/// It reads the SAME [`ModalAction::New`] payload the confirm handler does (so the
+/// agent name still rides the choice, needing no index-to-agent lookup), closes the
+/// picker, and runs the ordinary new-session gate — the identical hand-off `Enter`
+/// used to perform, moved onto its own key.
+///
+/// BOTH verbs stay ONE key at the picker, which is what makes the swap safe: the
+/// background draft became the default without charging the interactive start a
+/// keystroke for it. `Ctrl-O` names the same thing here as it does inside the draft
+/// pane ([`compose`]'s `Ctrl-O`) — "open interactive claude" — so the key reads
+/// consistently on both surfaces.
+///
+/// The `ModalAction` match is the second of two gates: [`modal_key`] already
+/// restricts the key to the `List` layout, and this restricts it to a choice that
+/// actually names a new session. Any other action — Attach, Fork, Delete, Cancel,
+/// or an out-of-range highlight — is a NO-OP, so a future `List`-layout modal
+/// cannot inherit an interactive start it has no meaning for.
+///
+/// The pick is recorded as the last-chosen agent FIRST — BEFORE the gate, so the
+/// next `Ctrl-N` repeats it even across a refusal. This is one of the THREE points
+/// a new session is actually started (the others are the draft pane's `Enter` and
+/// its own `Ctrl-O`), and only those record: merely OPENING a draft must not
+/// rewrite that memory, or a cancelled draft would.
+fn launch_pick_interactively(app: &mut App) -> Outcome {
+    let Some(ModalAction::New(agent)) = app
+        .modal
+        .as_ref()
+        .and_then(super::app::Modal::selected_action)
+        .cloned()
+    else {
+        return Outcome::Continue;
+    };
+    app.close_modal();
+    app.set_last_new_agent(agent.clone());
+    launch_new_session(app, agent.as_deref(), None)
 }
 
 /// Which teardown-safe hand-off a confirmed overlay choice runs.
@@ -676,13 +1085,18 @@ enum Handoff {
 /// the modal's target `session_id` and, on success, escalate to [`Outcome::Resume`]
 /// so the driver spawns them through the IDENTICAL teardown→spawn→wait→return round
 /// trip as a plain resume; a refusal (deleted worktree / unreadable file / no live
-/// agent) sets a board status. `New` records the pick as the last-chosen agent
-/// FIRST — BEFORE the gate, so the next `Ctrl-N` repeats it even across a refusal —
-/// then runs the new-session gate.
+/// agent) sets a board status. `New` DRAFTS: it hands the keyboard to the compose
+/// zone for the new session's first message, which then chooses `--bg` (`Enter`)
+/// or interactive ([`compose`]'s `Ctrl-O`). The picker's own `Ctrl-O`
+/// ([`launch_pick_interactively`]) is the one-key bypass to an interactive start.
+///
+/// `New` records NOTHING here. The memory behind `Ctrl-N`'s pre-highlight is "the
+/// agent of the last new session actually STARTED", and a draft can still be
+/// cancelled, so it is written at the three real launch points instead.
 ///
 /// The `clone` releases the `app.modal` borrow before `close_modal` /
-/// `set_status` / `set_last_new_agent` / the gates re-borrow `app`, preserving the
-/// borrow discipline both old confirm handlers relied on.
+/// `set_status` / `compose::open_background` / the gates re-borrow `app`,
+/// preserving the borrow discipline both old confirm handlers relied on.
 fn confirm_modal(app: &mut App, root: &Path) -> Outcome {
     let Some(modal) = app.modal.clone() else {
         return Outcome::Continue;
@@ -704,10 +1118,11 @@ fn confirm_modal(app: &mut App, root: &Path) -> Outcome {
             None => Outcome::Continue,
         },
         Some(ModalAction::New(agent)) => {
-            // Record the pick BEFORE the gate (so it survives a refusal), then run
-            // the same new-session gate the no-agent fast path uses.
-            app.set_last_new_agent(agent.clone());
-            launch_new_session(app, agent.as_deref())
+            // `Enter` opens the DRAFT — the same pane the no-agent fast path opens.
+            // Nothing is launched and nothing is recorded yet; the draft's own
+            // `Enter` (`--bg`) or `Ctrl-O` (interactive) decides both.
+            compose::open_background(app, agent);
+            Outcome::Continue
         }
     }
 }
@@ -804,30 +1219,175 @@ fn route_handoff(app: &mut App, session_id: &str, kind: Handoff) -> Outcome {
 }
 
 /// Handle `Ctrl-N`. When defined agents exist for the launch dir, OPEN the agent
-/// picker (pre-highlighted on the last pick) and stay on the board; otherwise
-/// launch a bare `claude` immediately, so the common no-agent case keeps its
-/// zero-extra-keystroke path. Discovery is FAIL-SOFT — any error yields an empty
-/// list, which just means the bare-launch branch (see
-/// [`defined_agents::discover_agents`]).
+/// picker (pre-highlighted on the last pick) and stay on the board; otherwise open
+/// the BACKGROUND draft pane straight away, bound to no agent.
+///
+/// Both branches land on the SAME draft, because drafting is what a new session
+/// defaults to now — a one-row picker offering only "default (no agent)" would be
+/// pure friction, and skipping it costs nothing: the draft's own `Ctrl-O` still
+/// reaches an interactive start in one key, exactly as the picker's `Ctrl-O` does.
+/// Discovery is FAIL-SOFT — any error yields an empty list, which just means the
+/// draft branch (see [`defined_agents::discover_agents`]).
 fn new_session(app: &mut App) -> Outcome {
     let agents = defined_agents::discover_agents(&app.launch_dir);
     if agents.is_empty() {
-        // No selectable agents: a one-entry picker would be pure friction —
-        // launch straight into a bare `claude`, exactly as before agents existed.
-        return launch_new_session(app, None);
+        // No selectable agents: skip the pointless one-row picker and draft
+        // directly, with no agent bound.
+        compose::open_background(app, None);
+        return Outcome::Continue;
     }
     app.open_agent_picker(agents);
     Outcome::Continue
 }
 
-/// Run the new-session existence gate for `agent` (`None` = no agent) while the
-/// terminal is still up, and escalate a confirmed plan to [`Outcome::Resume`]; a
-/// refusal (a deleted launch dir) sets a transient board status. Shared by the
-/// no-agent fast path and the picker confirm so the gate + status handling live
-/// in one place. `check_new` returns an owned `Result`, so the `&launch_dir`
-/// borrow is released before we mutably touch `app` for `set_status`.
-fn launch_new_session(app: &mut App, agent: Option<&str>) -> Outcome {
-    match resume::check_new(&app.launch_dir, agent) {
+/// Handle `Ctrl-R` (quick reply). Ask claude what it is holding the SELECTED
+/// session as, one-shot, then route via [`send::reply_gate`].
+///
+/// `claude -p -r <id>` refuses to resume a session registered as a live agent, but
+/// `claude stop <job-id>` deregisters the job (keeping the conversation) so the
+/// reply can then land in place. Stopping is only safe when nothing is running, so:
+///
+/// * not held → open compose, reply in place;
+/// * `done`, or a TERMINAL `stopped`/`failed` → open compose in stop-then-reply
+///   mode (the run is over, so stopping it interrupts nothing);
+/// * `needs input` → CONFIRM first ([`App::open_stop_confirm`]) — stopping abandons
+///   a waiting agent — then compose;
+/// * `working`/`idle`/`interrupted`/an unrecognized qualifier/unstoppable → refuse
+///   ([`send::SEND_LIVE_REFUSED`]).
+///
+/// The probe is the SAME authoritative bare read the resume gate uses
+/// ([`App::live_agent_now`]) — never the polled `--all` map — a one-shot at a
+/// hand-off (the documented OFF-UI-THREAD exception, PATTERNS.md §6). The id is
+/// cloned so the `&Session` borrow ends before the probe and the app mutations.
+fn reply(app: &mut App) -> Outcome {
+    let Some(id) = app.selected_session().map(|s| s.session_id.clone()) else {
+        return Outcome::Continue;
+    };
+    match send::reply_gate(app.live_agent_now(&id).as_ref()) {
+        ReplyGate::Reply => compose::open(app, id, None),
+        ReplyGate::StopThenReply { job_id } => compose::open(app, id, Some(job_id)),
+        ReplyGate::ConfirmStopThenReply { job_id } => app.open_stop_confirm(id, job_id),
+        ReplyGate::Refuse(message) => app.set_status(message),
+    }
+    Outcome::Continue
+}
+
+/// Apply a keypress while the "stop the waiting agent?" confirmation is open.
+///
+/// `Enter` confirms — the waiting agent is stopped as part of the send — so it
+/// resolves the confirmation into compose in stop-then-reply mode; `Esc`/`Ctrl-C`
+/// dismiss and return to the board. Any other key is ignored: this is a deliberate
+/// confirmation, not a fat-finger.
+fn handle_stop_confirm_key(app: &mut App, key: KeyEvent) -> Outcome {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Enter => {
+            if let Some(pending) = app.pending_stop.take() {
+                compose::open(app, pending.session_id, Some(pending.job_id));
+            }
+        }
+        KeyCode::Esc => app.stop_confirm_cancel(),
+        KeyCode::Char('c' | 'C') if ctrl => app.stop_confirm_cancel(),
+        _ => {}
+    }
+    Outcome::Continue
+}
+
+/// Handle `Ctrl-K` (interrupt). Ask claude what it is holding the SELECTED session
+/// as, one-shot, then route via [`send::interrupt_gate`].
+///
+/// Unlike a reply, an interrupt is MEANT to stop live work, so a `working` agent is
+/// a valid target here. `claude stop <job-id>` deregisters the job (keeping the
+/// conversation); it needs the SHORT agent-view id, which only a background job has:
+///
+/// * not held / no job id → refuse ([`send::INTERRUPT_NOT_LIVE`] /
+///   [`send::INTERRUPT_NO_JOB_ID`]);
+/// * `done`, or a TERMINAL `stopped`/`failed` → stop immediately (harmless;
+///   nothing runs);
+/// * any other live state → CONFIRM first ([`App::open_interrupt_confirm`]) —
+///   stopping abandons live work — then stop on confirm.
+///
+/// The probe is the SAME authoritative bare read the resume/reply gates use
+/// ([`App::live_agent_now`]) — never the polled `--all` map — a one-shot at a
+/// hand-off (the documented OFF-UI-THREAD exception, PATTERNS.md §6). The id is
+/// cloned so the `&Session` borrow ends before the probe and the app mutations.
+fn interrupt(app: &mut App) -> Outcome {
+    let Some(id) = app.selected_session().map(|s| s.session_id.clone()) else {
+        return Outcome::Continue;
+    };
+    match send::interrupt_gate(app.live_agent_now(&id).as_ref()) {
+        InterruptGate::StopNow { job_id } => dispatch_interrupt(app, &job_id),
+        InterruptGate::Confirm { job_id } => {
+            app.open_interrupt_confirm(id, job_id);
+            Outcome::Continue
+        }
+        InterruptGate::Refuse(message) => {
+            app.set_status(message);
+            Outcome::Continue
+        }
+    }
+}
+
+/// Build the interrupt request, set the in-flight status, and escalate to the driver
+/// so the spawn stays OUT of this pure handler (mirroring how a send returns
+/// [`Outcome::Send`]). `claude stop` acts on the global job registry, so the child
+/// runs in the launch dir — never a re-read of the session's `cwd`, which a deleted
+/// worktree could have removed even while its job is still live.
+fn dispatch_interrupt(app: &mut App, job_id: &str) -> Outcome {
+    let req = InterruptRequest {
+        argv: send::build_stop_argv(job_id),
+        cwd: app.launch_dir.clone(),
+    };
+    app.set_status(send::INTERRUPT_IN_FLIGHT);
+    Outcome::Interrupt(req)
+}
+
+/// Apply a keypress while the "stop this agent?" interrupt confirmation is open.
+///
+/// `Enter` confirms — the agent is stopped — so it resolves into
+/// [`Outcome::Interrupt`]; `Esc`/`Ctrl-C` dismiss and return to the board. Any other
+/// key is ignored: this is a deliberate confirmation, not a fat-finger.
+fn handle_interrupt_confirm_key(app: &mut App, key: KeyEvent) -> Outcome {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Enter => {
+            if let Some(pending) = app.pending_interrupt.take() {
+                return dispatch_interrupt(app, &pending.job_id);
+            }
+            Outcome::Continue
+        }
+        KeyCode::Esc => {
+            app.interrupt_confirm_cancel();
+            Outcome::Continue
+        }
+        KeyCode::Char('c' | 'C') if ctrl => {
+            app.interrupt_confirm_cancel();
+            Outcome::Continue
+        }
+        _ => Outcome::Continue,
+    }
+}
+
+/// Run the new-session existence gate for `agent` (`None` = no agent) and an
+/// optional first `prompt` while the terminal is still up, and escalate a confirmed
+/// plan to [`Outcome::Resume`]; a refusal (a deleted launch dir) sets a transient
+/// board status. Shared by the TWO interactive routes — the picker's `Ctrl-O`
+/// ([`launch_pick_interactively`]) and the draft pane's `Ctrl-O` — so the gate +
+/// status handling live in one place. `check_new` returns an owned `Result`, so
+/// the `&launch_dir` borrow is released before we mutably touch `app` for
+/// `set_status`.
+///
+/// Those two callers differ only in whether a draft was typed, so `prompt` is what
+/// separates them: the picker's `Ctrl-O` passes `None` and emits the bare argv
+/// snapback has always emitted for a new session, while the draft pane passes
+/// `Some(prompt)` whenever its buffer is non-empty. A `Some(prompt)` AUTO-SUBMITS
+/// as the session's first turn (see [`resume::build_new_argv`]).
+pub(super) fn launch_new_session(
+    app: &mut App,
+    agent: Option<&str>,
+    prompt: Option<&str>,
+) -> Outcome {
+    match resume::check_new(&app.launch_dir, agent, prompt) {
         Ok(ready) => Outcome::Resume(ready),
         Err(err) => {
             app.set_status(err.message().to_string());
@@ -850,7 +1410,8 @@ mod tests {
 
     use crate::agents::ReportedAgent;
     use crate::store::Session;
-    use crate::tui::app::{Scope, MIN_PANE_WIDTH};
+    use crate::tui::app::{NewSessionDraft, Scope, MIN_PANE_WIDTH};
+    use crate::tui::compose::ComposeTarget;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -993,12 +1554,107 @@ mod tests {
         app
     }
 
+    /// The job id an open REPLY compose zone will `claude stop` before sending.
+    ///
+    /// `None` covers "no compose open", "a plain in-place reply", and "a background
+    /// draft" alike — every caller here is asserting the reply path, where the
+    /// first and last cannot occur.
+    fn composing_stop_job(app: &App) -> Option<&str> {
+        match app.compose.as_ref().map(|c| &c.target) {
+            Some(ComposeTarget::Reply { stop_job, .. }) => stop_job.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Type `text` into the open compose zone one KEYPRESS at a time, through
+    /// `handle_event` — so the draft is built by the same routing the user's typing
+    /// goes through, not by reaching into the `TextArea` behind it. A `\n` is sent
+    /// as the `Ctrl-J` newline chord, since a bare `Enter` would submit.
+    fn type_into_draft(app: &mut App, text: &str) {
+        for c in text.chars() {
+            if c == '\n' {
+                press_ctrl(app, KeyCode::Char('j'));
+            } else {
+                press(app, KeyCode::Char(c));
+            }
+        }
+    }
+
     fn press(app: &mut App, code: KeyCode) -> Outcome {
         handle_event(
             app,
             AppEvent::Input(Event::Key(key(code))),
             Path::new("/tmp"),
         )
+    }
+
+    fn press_ctrl(app: &mut App, code: KeyCode) -> Outcome {
+        handle_event(
+            app,
+            AppEvent::Input(Event::Key(ctrl(code))),
+            Path::new("/tmp"),
+        )
+    }
+
+    /// Deliver `text` as ONE terminal paste — the `Event::Paste` crossterm emits
+    /// between `ESC[200~` and `ESC[201~` once bracketed paste is enabled. The
+    /// whole point of the routing under test is that this is NOT a stream of
+    /// keypresses, so the helper never decomposes it into one.
+    fn paste(app: &mut App, text: &str) -> Outcome {
+        handle_event(
+            app,
+            AppEvent::Input(Event::Paste(text.to_string())),
+            Path::new("/tmp"),
+        )
+    }
+
+    /// The open compose buffer's text, joined the way a submit would read it.
+    fn draft_text(app: &App) -> String {
+        app.compose
+            .as_ref()
+            .expect("compose is open")
+            .textarea
+            .lines()
+            .join("\n")
+    }
+
+    /// A real resumable session file (existing in-file cwd) so `send::plan_send`
+    /// reaches `Ready` at Send time. Returns the `Session` and its temp cwd to
+    /// clean up.
+    fn resumable_session_for_send() -> (Session, PathBuf) {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is after the unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "snapback-update-send-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp cwd");
+        let id = "sess-send-e2e";
+        let file = dir.join(format!("{id}.jsonl"));
+        std::fs::write(
+            &file,
+            format!(
+                r#"{{"type":"user","sessionId":"{id}","cwd":"{cwd}","message":{{"role":"user","content":"hi"}}}}"#,
+                id = id,
+                cwd = dir.display(),
+            ),
+        )
+        .expect("write the resumable fixture");
+        let session = Session {
+            file,
+            session_id: id.to_string(),
+            cwd: dir.clone(),
+            git_branch: None,
+            timestamp: None,
+            repo: "repo".to_string(),
+            label: "e2e".to_string(),
+            root_uuid: None,
+            msg_count: 0,
+            content_index: String::new(),
+        };
+        (session, dir)
     }
 
     fn mouse_ev(kind: MouseEventKind, col: u16, row: u16) -> MouseEvent {
@@ -1016,6 +1672,817 @@ mod tests {
             AppEvent::Input(Event::Mouse(mouse_ev(kind, col, row))),
             Path::new("/tmp"),
         )
+    }
+
+    // --- quick reply (Ctrl-R): gate, compose routing, send, completion ----
+
+    /// Ctrl-R on an IDLE session opens the compose zone (force-showing the preview
+    /// and targeting the selected session); on a LIVE session it refuses with the
+    /// hint and opens nothing.
+    #[test]
+    fn ctrl_r_opens_compose_on_idle_and_refuses_a_live_session() {
+        // Idle: compose opens and force-shows the preview.
+        let mut app = app_with("idle", None);
+        app.show_preview = false; // prove Reply force-shows it
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        assert!(
+            app.is_composing(),
+            "Ctrl-R on an idle session opens compose"
+        );
+        assert!(app.show_preview, "opening compose force-shows the preview");
+        assert_eq!(
+            app.compose.as_ref().map(|c| &c.target),
+            Some(&ComposeTarget::Reply {
+                session_id: "idle".to_string(),
+                stop_job: None,
+            }),
+            "compose targets the selected session, as a plain in-place reply"
+        );
+
+        // Live: refuse with the hint, open nothing (sending in place would branch).
+        let mut app = app_with("live-1", Some("background"));
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        assert!(!app.is_composing(), "Ctrl-R must refuse a live session");
+        assert_eq!(app.status.as_deref(), Some(send::SEND_LIVE_REFUSED));
+    }
+
+    /// Ctrl-R routes by the held agent's state: not held → reply; `done` → compose
+    /// in stop-then-reply mode; `needs input` → the stop confirmation first;
+    /// `working`/`idle` → refuse. Stopping a job first is what lets `-p -r` land.
+    #[test]
+    fn ctrl_r_routes_by_agent_state() {
+        // Seed claude's ACTIVE (bare) list with a background agent of a given state,
+        // carrying the short job id `claude stop` would target.
+        fn held(id: &str, state: &str) -> HashMap<String, ReportedAgent> {
+            let mut map = HashMap::new();
+            map.insert(
+                id.to_string(),
+                ReportedAgent {
+                    kind: "background".to_string(),
+                    id: Some("job-x".to_string()),
+                    state: Some(state.to_string()),
+                    status: None,
+                    name: None,
+                },
+            );
+            map
+        }
+        let app_for = |id: &str, state: &str| {
+            let mut app = App::new(vec![session(id)], Scope::All, PathBuf::from("/tmp"));
+            let live = held(id, state);
+            app.set_live_probe(move || live.clone());
+            app
+        };
+
+        // done -> compose opens straight away, in stop-then-reply mode.
+        let mut app = app_for("done-1", "done");
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        assert!(app.is_composing(), "a done agent goes straight to compose");
+        assert_eq!(
+            composing_stop_job(&app),
+            Some("job-x"),
+            "compose carries the job id to stop first"
+        );
+        assert!(app.pending_stop.is_none());
+
+        // needs input -> the stop confirmation, NOT compose yet.
+        for waiting in ["blocked", "waiting"] {
+            let mut app = app_for("wait-1", waiting);
+            press_ctrl(&mut app, KeyCode::Char('r'));
+            assert!(
+                !app.is_composing(),
+                "{waiting:?} must confirm before composing"
+            );
+            let pending = app
+                .pending_stop
+                .as_ref()
+                .expect("a waiting agent opens the stop confirmation");
+            assert_eq!(pending.session_id, "wait-1");
+            assert_eq!(pending.job_id, "job-x");
+        }
+
+        // working / idle -> refuse outright.
+        for busy in ["working", "idle"] {
+            let mut app = app_for("busy-1", busy);
+            press_ctrl(&mut app, KeyCode::Char('r'));
+            assert!(!app.is_composing(), "{busy:?} must refuse");
+            assert!(app.pending_stop.is_none());
+            assert_eq!(app.status.as_deref(), Some(send::SEND_LIVE_REFUSED));
+        }
+
+        // Not held at all -> a plain in-place reply (no stop).
+        let mut app = App::new(vec![session("free-1")], Scope::All, PathBuf::from("/tmp"));
+        app.set_live_probe(HashMap::new);
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        assert!(
+            app.is_composing(),
+            "an unheld session is replyable in place"
+        );
+        assert_eq!(
+            composing_stop_job(&app),
+            None,
+            "a plain reply carries no stop job"
+        );
+    }
+
+    /// Confirming the stop prompt (`Enter`) opens compose in stop-then-reply mode;
+    /// `Esc` dismisses it and composes nothing.
+    #[test]
+    fn stop_confirmation_enter_composes_and_esc_cancels() {
+        fn waiting(id: &str) -> HashMap<String, ReportedAgent> {
+            let mut map = HashMap::new();
+            map.insert(
+                id.to_string(),
+                ReportedAgent {
+                    kind: "background".to_string(),
+                    id: Some("job-y".to_string()),
+                    state: Some("blocked".to_string()),
+                    status: None,
+                    name: None,
+                },
+            );
+            map
+        }
+
+        // Enter -> compose opens carrying the job id; the confirmation closes.
+        let mut app = App::new(vec![session("w")], Scope::All, PathBuf::from("/tmp"));
+        let live = waiting("w");
+        app.set_live_probe(move || live.clone());
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        assert!(app.pending_stop.is_some());
+        press(&mut app, KeyCode::Enter);
+        assert!(app.pending_stop.is_none(), "confirming closes the prompt");
+        assert!(app.is_composing(), "confirming opens compose");
+        assert_eq!(composing_stop_job(&app), Some("job-y"));
+
+        // Esc -> dismiss, compose nothing.
+        let mut app = App::new(vec![session("w")], Scope::All, PathBuf::from("/tmp"));
+        let live = waiting("w");
+        app.set_live_probe(move || live.clone());
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        assert!(app.pending_stop.is_some());
+        press(&mut app, KeyCode::Esc);
+        assert!(app.pending_stop.is_none(), "Esc dismisses the prompt");
+        assert!(!app.is_composing(), "Esc composes nothing");
+    }
+
+    /// Ctrl-K routes by the live agent's state: `done` → stop immediately (escalates
+    /// to `Outcome::Interrupt`); every OTHER live state → the interrupt confirmation
+    /// first; not held → refuse (nothing to stop); interactive (no job id) → refuse.
+    /// The stop argv carries the SHORT job id and runs in the launch dir.
+    #[test]
+    fn ctrl_k_routes_by_agent_state() {
+        fn held(id: &str, state: &str, job: Option<&str>) -> HashMap<String, ReportedAgent> {
+            let mut map = HashMap::new();
+            map.insert(
+                id.to_string(),
+                ReportedAgent {
+                    kind: "background".to_string(),
+                    id: job.map(str::to_owned),
+                    state: Some(state.to_string()),
+                    status: None,
+                    name: None,
+                },
+            );
+            map
+        }
+        let app_for = |id: &str, state: &str, job: Option<&str>| {
+            let mut app = App::new(vec![session(id)], Scope::All, PathBuf::from("/tmp"));
+            let live = held(id, state, job);
+            app.set_live_probe(move || live.clone());
+            app
+        };
+
+        // done -> stop immediately: Outcome::Interrupt with the stop argv, no confirm.
+        let mut app = app_for("done-1", "done", Some("job-k"));
+        let outcome = press_ctrl(&mut app, KeyCode::Char('k'));
+        let Outcome::Interrupt(req) = outcome else {
+            panic!("a done agent stops immediately");
+        };
+        assert_eq!(req.argv.join(" "), "claude stop job-k");
+        assert_eq!(
+            req.cwd,
+            PathBuf::from("/tmp"),
+            "stop runs in the launch dir"
+        );
+        assert!(
+            app.pending_interrupt.is_none(),
+            "done needs no confirmation"
+        );
+        assert_eq!(app.status.as_deref(), Some(send::INTERRUPT_IN_FLIGHT));
+
+        // Every OTHER live state confirms first — including `working`, which the reply
+        // gate (Ctrl-R) refuses. Interrupting live work is the whole point here.
+        for state in ["working", "idle", "blocked", "waiting"] {
+            let mut app = app_for("live-1", state, Some("job-k"));
+            let outcome = press_ctrl(&mut app, KeyCode::Char('k'));
+            assert!(
+                matches!(outcome, Outcome::Continue),
+                "{state:?} opens a confirm, not an immediate stop"
+            );
+            let Some(pending) = app.pending_interrupt.as_ref() else {
+                panic!("{state:?} must open the interrupt confirmation");
+            };
+            assert_eq!(pending.session_id, "live-1");
+            assert_eq!(pending.job_id, "job-k");
+        }
+
+        // Not held at all -> nothing to stop.
+        let mut app = App::new(vec![session("free-1")], Scope::All, PathBuf::from("/tmp"));
+        app.set_live_probe(HashMap::new);
+        press_ctrl(&mut app, KeyCode::Char('k'));
+        assert!(app.pending_interrupt.is_none());
+        assert_eq!(app.status.as_deref(), Some(send::INTERRUPT_NOT_LIVE));
+
+        // Live but interactive (no stoppable job id) -> refuse with the right hint.
+        let mut app = app_for("inter-1", "working", None);
+        press_ctrl(&mut app, KeyCode::Char('k'));
+        assert!(app.pending_interrupt.is_none());
+        assert_eq!(app.status.as_deref(), Some(send::INTERRUPT_NO_JOB_ID));
+    }
+
+    /// Confirming the interrupt prompt (`Enter`) escalates to `Outcome::Interrupt`
+    /// carrying the stop argv and closes the prompt; `Esc` dismisses it and stops
+    /// nothing.
+    #[test]
+    fn interrupt_confirmation_enter_stops_and_esc_cancels() {
+        fn working(id: &str) -> HashMap<String, ReportedAgent> {
+            let mut map = HashMap::new();
+            map.insert(
+                id.to_string(),
+                ReportedAgent {
+                    kind: "background".to_string(),
+                    id: Some("job-z".to_string()),
+                    state: Some("working".to_string()),
+                    status: None,
+                    name: None,
+                },
+            );
+            map
+        }
+
+        // Enter -> the stop is dispatched carrying the job id; the confirmation closes.
+        let mut app = App::new(vec![session("w")], Scope::All, PathBuf::from("/tmp"));
+        let live = working("w");
+        app.set_live_probe(move || live.clone());
+        press_ctrl(&mut app, KeyCode::Char('k'));
+        assert!(app.pending_interrupt.is_some());
+        let outcome = press(&mut app, KeyCode::Enter);
+        let Outcome::Interrupt(req) = outcome else {
+            panic!("confirming dispatches the stop");
+        };
+        assert_eq!(req.argv.join(" "), "claude stop job-z");
+        assert!(
+            app.pending_interrupt.is_none(),
+            "confirming closes the prompt"
+        );
+        assert_eq!(app.status.as_deref(), Some(send::INTERRUPT_IN_FLIGHT));
+
+        // Esc -> dismiss, stop nothing.
+        let mut app = App::new(vec![session("w")], Scope::All, PathBuf::from("/tmp"));
+        let live = working("w");
+        app.set_live_probe(move || live.clone());
+        press_ctrl(&mut app, KeyCode::Char('k'));
+        assert!(app.pending_interrupt.is_some());
+        let outcome = press(&mut app, KeyCode::Esc);
+        assert!(matches!(outcome, Outcome::Continue));
+        assert!(app.pending_interrupt.is_none(), "Esc dismisses the prompt");
+    }
+
+    /// While composing, ordinary keys edit the buffer, Ctrl-J inserts a newline,
+    /// and Esc cancels compose (never the app).
+    #[test]
+    fn composing_routes_keys_to_the_buffer_and_esc_cancels_only_compose() {
+        let mut app = app_with("idle", None);
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        assert!(app.is_composing());
+
+        // Type "hi", a Ctrl-J newline, then "x".
+        press(&mut app, KeyCode::Char('h'));
+        press(&mut app, KeyCode::Char('i'));
+        press_ctrl(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('x'));
+        let text = app
+            .compose
+            .as_ref()
+            .expect("still composing")
+            .textarea
+            .lines()
+            .join("\n");
+        assert_eq!(
+            text, "hi\nx",
+            "keys edit the buffer and Ctrl-J splits the line"
+        );
+
+        // Esc dismisses compose and keeps the app running (does NOT quit).
+        let outcome = press(&mut app, KeyCode::Esc);
+        assert!(
+            matches!(outcome, Outcome::Continue),
+            "Esc cancels compose, not the app"
+        );
+        assert!(!app.is_composing(), "Esc closes the compose zone");
+    }
+
+    // --- terminal paste (Event::Paste) routing -----------------------------
+
+    /// THE regression: a multi-line paste into the reply compose zone must land in
+    /// the draft WHOLE and send NOTHING.
+    ///
+    /// Without bracketed paste the terminal delivered the clipboard as a stream of
+    /// `KeyEvent`s, so the first embedded newline arrived as a bare `Enter` —
+    /// `ComposeAction::Send` — which sent line one as the reply, closed compose,
+    /// typed the remainder into the board's SEARCH QUERY, and let a further newline
+    /// reach `KeyCode::Enter => Action::Resume`, tearing the board down to spawn
+    /// `claude`. An ordinary Cmd+V was a truncated send plus an unintended session
+    /// hand-off. A pasted newline is DATA, so it must reach the editor as text.
+    #[test]
+    fn pasting_multiline_text_while_composing_keeps_the_whole_draft() {
+        let mut app = app_with("idle", None);
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        assert!(app.is_composing());
+
+        let outcome = paste(&mut app, "line one\nline two\nline three");
+
+        assert!(
+            matches!(outcome, Outcome::Continue),
+            "a paste must never submit: no Send, no Resume, no teardown"
+        );
+        assert!(
+            app.is_composing(),
+            "a paste must not close the compose zone"
+        );
+        assert_eq!(
+            draft_text(&app),
+            "line one\nline two\nline three",
+            "every pasted line must survive in the draft"
+        );
+        assert!(
+            app.query.is_empty(),
+            "no part of the paste may leak into the board's search query"
+        );
+    }
+
+    /// The SAME regression on the OTHER submit-capable box, which has the LARGER
+    /// blast radius: `compose::compose_key_to_action` is shared by both targets and
+    /// maps a bare `Enter` to Send, and `submit_compose` routes a background draft
+    /// to [`Outcome::BgLaunch`] — so a clipboard drop arriving as keystrokes did not
+    /// merely truncate a reply, it STARTED a background agent on line one and threw
+    /// the rest at the board.
+    ///
+    /// `handle_paste` keys off `is_composing()` alone, so it is target-agnostic by
+    /// construction; this pins that rather than trusting it, and the closing `Enter`
+    /// proves the draft really was one keypress away from launching.
+    #[test]
+    fn pasting_multiline_text_into_a_background_draft_launches_nothing() {
+        let mut app = app_with("idle", None);
+        app.open_agent_picker(vec![def_agent("planner")]);
+        press(&mut app, KeyCode::Enter); // the default row: a draft bound to no agent
+        assert_eq!(
+            app.compose.as_ref().map(|c| &c.target),
+            Some(&ComposeTarget::NewBackgroundAgent { agent: None }),
+            "the picker's Enter must open the background draft"
+        );
+
+        type_into_draft(&mut app, "keep ");
+        let outcome = paste(&mut app, "line one\nline two\nline three");
+
+        assert!(
+            matches!(outcome, Outcome::Continue),
+            "a paste must never launch: no BgLaunch, no Resume, no teardown"
+        );
+        assert!(app.is_composing(), "a paste must not close the draft");
+        assert_eq!(
+            draft_text(&app),
+            "keep line one\nline two\nline three",
+            "every pasted line must survive in the draft"
+        );
+        assert!(
+            app.query.is_empty(),
+            "no part of the paste may leak into the board's search query"
+        );
+        assert_eq!(
+            app.status, None,
+            "nothing was dispatched, so nothing may report itself in flight"
+        );
+
+        // Not a vacuous premise: the very next `Enter` DOES launch, so the paste
+        // above walked past a LIVE submit path rather than an inert one.
+        assert!(
+            matches!(press(&mut app, KeyCode::Enter), Outcome::BgLaunch(_)),
+            "Enter on this draft launches — which is exactly what the paste avoided"
+        );
+    }
+
+    /// A paste lands AT THE CARET, like any other insert — it does not replace the
+    /// draft and does not jump to the end.
+    #[test]
+    fn pasting_while_composing_inserts_at_the_caret() {
+        let mut app = app_with("idle", None);
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        type_into_draft(&mut app, "ab");
+        press(&mut app, KeyCode::Left); // caret between a and b
+        paste(&mut app, "X\nY");
+        assert_eq!(draft_text(&app), "aX\nYb");
+    }
+
+    /// On the BOARD the query is a single line, so a multi-line paste is FLATTENED
+    /// to spaces rather than truncated to its first line: `search::gate_atoms`
+    /// splits the query on spaces into substring atoms that must all match, so
+    /// `foo\nbar` becomes exactly the `foo bar` the user could have typed — nothing
+    /// pasted is silently discarded.
+    #[test]
+    fn pasting_on_the_board_flattens_newlines_into_the_query() {
+        let mut app = app_with("idle", None);
+        let outcome = paste(&mut app, "alpha\nbravo");
+        assert!(matches!(outcome, Outcome::Continue));
+        assert_eq!(app.query, "alpha bravo");
+        assert!(!app.is_composing(), "a board paste opens no editor");
+
+        // It APPENDS, exactly like type-to-search.
+        paste(&mut app, "\ncharlie");
+        assert_eq!(app.query, "alpha bravo charlie");
+    }
+
+    /// Every OTHER keyboard owner SWALLOWS a paste, in the same precedence order the
+    /// key arm uses. None of them has a text field, so the only alternatives are to
+    /// act on a choice the user did not make or to leak the text into the board's
+    /// query underneath an overlay that hides it — both worse than nothing.
+    #[test]
+    fn a_paste_is_swallowed_while_an_overlay_owns_the_keyboard() {
+        // Modal: the running-session Attach/Fork/Cancel choice.
+        let mut app = app_with("live-1", Some("background"));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.modal.is_some(), "Enter on a live row opens the choice");
+        assert!(matches!(paste(&mut app, "junk\ntext"), Outcome::Continue));
+        assert!(app.modal.is_some(), "a paste must not resolve the modal");
+        assert!(app.query.is_empty(), "and must not reach the query");
+
+        // Leader chord: `Ctrl-X` is armed and still waiting for its KEY.
+        let mut app = app_with("idle", None);
+        press_ctrl(&mut app, KeyCode::Char('x'));
+        assert!(app.pending_chord);
+        assert!(matches!(paste(&mut app, "junk\ntext"), Outcome::Continue));
+        assert!(
+            app.pending_chord,
+            "a paste carries no chord completion, so the chord keeps waiting"
+        );
+        assert!(app.query.is_empty());
+
+        // Stop confirmation (Ctrl-R on a `needs input` agent).
+        let mut app = App::new(vec![session("w")], Scope::All, PathBuf::from("/tmp"));
+        let mut waiting = HashMap::new();
+        waiting.insert(
+            "w".to_string(),
+            ReportedAgent {
+                kind: "background".to_string(),
+                id: Some("job-w".to_string()),
+                state: Some("blocked".to_string()),
+                status: None,
+                name: None,
+            },
+        );
+        app.set_live_probe(move || waiting.clone());
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        assert!(app.pending_stop.is_some());
+        assert!(matches!(paste(&mut app, "junk\ntext"), Outcome::Continue));
+        assert!(app.pending_stop.is_some(), "the confirmation still stands");
+        assert!(!app.is_composing(), "a paste must not confirm into compose");
+        assert!(app.query.is_empty());
+
+        // Interrupt confirmation (Ctrl-K on a `working` agent).
+        let mut app = App::new(vec![session("w")], Scope::All, PathBuf::from("/tmp"));
+        let mut working = HashMap::new();
+        working.insert(
+            "w".to_string(),
+            ReportedAgent {
+                kind: "background".to_string(),
+                id: Some("job-z".to_string()),
+                state: Some("working".to_string()),
+                status: None,
+                name: None,
+            },
+        );
+        app.set_live_probe(move || working.clone());
+        press_ctrl(&mut app, KeyCode::Char('k'));
+        assert!(app.pending_interrupt.is_some());
+        assert!(matches!(paste(&mut app, "junk\ntext"), Outcome::Continue));
+        assert!(
+            app.pending_interrupt.is_some(),
+            "the confirmation still stands"
+        );
+        assert!(app.query.is_empty());
+    }
+
+    /// Every line ending collapses to `\n` before a paste is used anywhere: a CRLF
+    /// pair becomes ONE newline, and a LONE CR — the classic embedded-newline form
+    /// inside a bracketed paste — becomes one too. Left alone, a stray `\r` is an
+    /// invisible control char in the draft and an unmatchable byte in the query.
+    #[test]
+    fn accept_paste_normalizes_every_line_ending_to_lf() {
+        let accepted = accept_paste("crlf\r\ncr\rlf\ntail");
+        assert_eq!(accepted.text, "crlf\ncr\nlf\ntail");
+        assert!(!accepted.truncated);
+
+        // A CRLF is ONE newline, never two.
+        assert_eq!(accept_paste("a\r\n\r\nb").text, "a\n\nb");
+        // A trailing CR still normalizes (nothing follows it to pair with).
+        assert_eq!(accept_paste("a\r").text, "a\n");
+    }
+
+    /// The cap counts CHARACTERS, so truncation can never split a UTF-8 codepoint —
+    /// the panic a naive byte slice would take on multibyte text. A paste of exactly
+    /// the cap is not flagged truncated; one char more is.
+    #[test]
+    fn accept_paste_caps_by_chars_without_splitting_a_codepoint() {
+        // 3-byte chars, so a byte-indexed cap would land mid-codepoint.
+        let at_cap: String = "☃".repeat(PASTE_MAX_CHARS);
+        let accepted = accept_paste(&at_cap);
+        assert_eq!(accepted.text.chars().count(), PASTE_MAX_CHARS);
+        assert!(
+            !accepted.truncated,
+            "a paste of exactly the cap loses nothing"
+        );
+
+        let over_cap = format!("{at_cap}☃tail");
+        let accepted = accept_paste(&over_cap);
+        assert!(accepted.truncated, "one char past the cap is a truncation");
+        assert_eq!(accepted.text.chars().count(), PASTE_MAX_CHARS);
+        assert_eq!(
+            accepted.text.len(),
+            PASTE_MAX_CHARS * 3,
+            "the cut lands on a char boundary, not at byte PASTE_MAX_CHARS"
+        );
+        assert_eq!(accepted.text, at_cap);
+
+        // A CRLF pair costs ONE char against the cap, like the newline it becomes:
+        // 2 * PASTE_MAX_CHARS raw chars normalize to exactly the cap and fit.
+        let crlfs = "\r\n".repeat(PASTE_MAX_CHARS);
+        let accepted = accept_paste(&crlfs);
+        assert!(
+            !accepted.truncated,
+            "the cap counts NORMALIZED chars, so a CRLF pair costs one"
+        );
+        assert_eq!(accepted.text, "\n".repeat(PASTE_MAX_CHARS));
+    }
+
+    /// The board query is one line, so newlines flatten to spaces.
+    #[test]
+    fn flatten_for_query_turns_newlines_into_spaces() {
+        assert_eq!(flatten_for_query("alpha\nbravo"), "alpha bravo");
+        assert_eq!(flatten_for_query("no newlines"), "no newlines");
+        // Runs of newlines become runs of spaces; `search::gate_atoms` drops the
+        // empty atoms between them, so this needs no collapsing of its own.
+        assert_eq!(flatten_for_query("a\n\n\nb"), "a   b");
+    }
+
+    /// A CR-only paste reaches the DRAFT as real newlines. `TextArea::insert_str`
+    /// splits on `\n` and strips a trailing `\r` per line, so it handles CRLF by
+    /// itself — a lone CR it does NOT, and this is what normalizing before the
+    /// insert buys.
+    #[test]
+    fn pasting_cr_line_endings_becomes_real_newlines_in_the_draft() {
+        let mut app = app_with("idle", None);
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        paste(&mut app, "first\rsecond\r\nthird");
+        assert_eq!(draft_text(&app), "first\nsecond\nthird");
+    }
+
+    /// An over-long paste is TRUNCATED rather than rejected — the head still lands —
+    /// and never silently: the status line says the tail was dropped, on both
+    /// destinations.
+    #[test]
+    fn an_over_long_paste_is_truncated_and_says_so() {
+        let huge = "x".repeat(PASTE_MAX_CHARS + 100);
+
+        // Into the draft.
+        let mut app = app_with("idle", None);
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        paste(&mut app, &huge);
+        assert_eq!(
+            draft_text(&app).chars().count(),
+            PASTE_MAX_CHARS,
+            "the head still lands — truncate, never reject"
+        );
+        assert_eq!(
+            app.status.as_deref(),
+            Some(paste_truncated_status().as_str()),
+            "a shortened paste must not be silent"
+        );
+
+        // Into the board query.
+        let mut app = app_with("idle", None);
+        paste(&mut app, &huge);
+        assert_eq!(app.query.chars().count(), PASTE_MAX_CHARS);
+        assert_eq!(
+            app.status.as_deref(),
+            Some(paste_truncated_status().as_str())
+        );
+
+        // A paste WITHIN the cap sets no status at all.
+        let mut app = app_with("idle", None);
+        paste(&mut app, "small");
+        assert_eq!(app.status, None);
+    }
+
+    /// The truncation status must name the CAP, so "some of it was dropped" becomes
+    /// "here is exactly how much landed" — the number is the whole point of the
+    /// message.
+    #[test]
+    fn the_truncation_status_names_the_cap() {
+        let status = paste_truncated_status();
+        assert!(
+            status.contains(&PASTE_MAX_CHARS.to_string()),
+            "the status must state how much was kept, got {status:?}"
+        );
+    }
+
+    /// The caret MOVES while composing: an arrow key repositions the cursor, so a
+    /// following insert lands there rather than at the end. This pins the fix for
+    /// forwarding via the editor's FULL `input` handler — `input_without_shortcuts`
+    /// drops cursor movement, so with it the caret is stuck and this reads "abX".
+    #[test]
+    fn composing_arrow_keys_move_the_caret() {
+        let mut app = app_with("idle", None);
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Char('b'));
+        press(&mut app, KeyCode::Left); // caret between a and b
+        press(&mut app, KeyCode::Char('X'));
+        let text = app
+            .compose
+            .as_ref()
+            .expect("still composing")
+            .textarea
+            .lines()
+            .join("\n");
+        assert_eq!(
+            text, "aXb",
+            "Left must move the caret so the insert lands between a and b"
+        );
+    }
+
+    /// A non-empty compose Send re-reads the authoritative id from the file, builds
+    /// the send argv, sets the "sending…" status, closes compose, and returns
+    /// `Outcome::Send` for the driver to spawn — the board never tears down.
+    #[test]
+    fn sending_a_compose_returns_a_send_request_and_clears_compose() {
+        let (session, dir) = resumable_session_for_send();
+        let mut app = App::new(vec![session], Scope::All, dir.clone());
+        seed_live(&mut app, &[]);
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        press(&mut app, KeyCode::Char('h'));
+        press(&mut app, KeyCode::Char('i'));
+
+        let outcome = press(&mut app, KeyCode::Enter);
+        let Outcome::Send(req) = outcome else {
+            panic!("Send must escalate to Outcome::Send");
+        };
+        assert_eq!(req.session_id, "sess-send-e2e");
+        assert_eq!(
+            req.argv.join(" "),
+            "claude -p -r sess-send-e2e --output-format json hi"
+        );
+        assert_eq!(req.cwd, dir, "the child runs in the authoritative cwd");
+        assert!(!app.is_composing(), "compose closes on send");
+        assert_eq!(app.status.as_deref(), Some(send::SEND_IN_FLIGHT));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `stop_job` the reply gate resolved must reach the EMITTED
+    /// `SendRequest`, not merely the compose target: the request is the only thing
+    /// the driver ever sees, and `send::spawn_send` runs `claude stop <job-id>`
+    /// from it to deregister the held job so `-p -r` can reclaim the session.
+    /// Dropping it on the way out would leave a stop-then-reply send silently
+    /// racing a still-registered job. Both directions are pinned end to end, so
+    /// neither a lost id nor an invented one passes.
+    #[test]
+    fn a_reply_carries_its_stop_job_into_the_emitted_request() {
+        let (session, dir) = resumable_session_for_send();
+        let id = session.session_id.clone();
+
+        // A `done` background agent: Ctrl-R composes straight away, in
+        // stop-then-reply mode, so the send must carry that job id.
+        let mut app = App::new(vec![session.clone()], Scope::All, dir.clone());
+        let mut live = HashMap::new();
+        live.insert(
+            id.clone(),
+            ReportedAgent {
+                kind: "background".to_string(),
+                id: Some("job-e2e".to_string()),
+                state: Some("done".to_string()),
+                status: None,
+                name: None,
+            },
+        );
+        app.set_live_probe(move || live.clone());
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        assert_eq!(composing_stop_job(&app), Some("job-e2e"));
+        type_into_draft(&mut app, "hi");
+        let Outcome::Send(req) = press(&mut app, KeyCode::Enter) else {
+            panic!("a held reply must still escalate to Outcome::Send");
+        };
+        assert_eq!(
+            req.stop_job.as_deref(),
+            Some("job-e2e"),
+            "the request must carry the job the driver has to stop first"
+        );
+
+        // The other direction: a plain in-place reply stops nothing, so an
+        // unconditional stop id would be just as wrong as a dropped one.
+        let mut app = App::new(vec![session], Scope::All, dir.clone());
+        seed_live(&mut app, &[]);
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        assert_eq!(composing_stop_job(&app), None);
+        type_into_draft(&mut app, "hi");
+        let Outcome::Send(req) = press(&mut app, KeyCode::Enter) else {
+            panic!("a plain reply must escalate to Outcome::Send");
+        };
+        assert_eq!(
+            req.stop_job, None,
+            "a reply to an unheld session must stop nothing"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An empty / whitespace Send is a no-op: compose stays open with a nudge, and
+    /// nothing is dispatched.
+    #[test]
+    fn sending_an_empty_compose_keeps_composing_and_sends_nothing() {
+        let mut app = app_with("idle", None);
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        let outcome = press(&mut app, KeyCode::Enter);
+        assert!(
+            matches!(outcome, Outcome::Continue),
+            "an empty send must not dispatch"
+        );
+        assert!(app.is_composing(), "compose stays open on an empty send");
+    }
+
+    /// Task 5.4: a finished send for the SELECTED session re-anchors the preview to
+    /// the newest turn, and that survives the `SessionsChanged` reload that brings
+    /// the reply in — so the reply lands in view. It also shows the mapped result.
+    #[test]
+    fn a_finished_send_reanchors_the_previewed_session_and_survives_reload() {
+        let mut app = app_with("s", None);
+        // The user scrolled up while the send was in flight (follow-bottom off).
+        app.preview_top();
+        assert!(!app.preview_follow_bottom);
+
+        handle_event(
+            &mut app,
+            AppEvent::SendFinished {
+                session_id: "s".to_string(),
+                status: Some("sent — $0.0136".to_string()),
+            },
+            Path::new("/tmp"),
+        );
+        assert!(
+            app.preview_follow_bottom,
+            "a finished send re-anchors the previewed row to the newest turn"
+        );
+        assert_eq!(
+            app.status.as_deref(),
+            Some("sent — $0.0136"),
+            "the mapped result shows on the status line"
+        );
+
+        // A reload that preserves the selection must keep the re-anchor, so the
+        // reply renders bottom-anchored.
+        app.apply_sessions(vec![session("s")]);
+        assert!(
+            app.preview_follow_bottom,
+            "the reload must not drop the re-anchor"
+        );
+    }
+
+    /// A finished send for an OFF-SCREEN session shows its status but leaves the
+    /// viewed transcript's scroll alone.
+    #[test]
+    fn a_finished_send_for_another_session_does_not_touch_the_view() {
+        let mut app = App::new(
+            vec![session("a"), session("b")],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
+        app.preview_top(); // follow-bottom off, viewing "a"
+        let selected = app.selected.clone();
+
+        handle_event(
+            &mut app,
+            AppEvent::SendFinished {
+                session_id: "b".to_string(),
+                status: Some("sent".to_string()),
+            },
+            Path::new("/tmp"),
+        );
+        assert_eq!(app.selected, selected, "selection is unchanged");
+        assert!(
+            !app.preview_follow_bottom,
+            "a send to an off-screen session must not re-anchor the view"
+        );
+        assert_eq!(app.status.as_deref(), Some("sent"));
     }
 
     // --- mouse wheel: hit-test routing + preview scroll clamps -------------
@@ -2362,21 +3829,21 @@ mod tests {
     }
 
     #[test]
-    fn picker_confirm_on_the_default_row_starts_a_bare_claude() {
+    fn picker_ctrl_o_on_the_default_row_starts_a_bare_claude() {
         // `app_with` uses `/tmp` as the launch dir (exists), so the new-session
-        // gate proceeds and the default (row 0) confirms to a bare `claude`.
+        // gate proceeds and the default (row 0) starts a bare `claude`.
         let mut app = app_with("s", None);
         app.open_agent_picker(vec![def_agent("planner"), def_agent("reviewer")]);
-        let out = press(&mut app, KeyCode::Enter);
+        let out = press_ctrl(&mut app, KeyCode::Char('o'));
         match out {
             Outcome::Resume(ready) => assert_eq!(ready.argv.join(" "), "claude"),
             _ => panic!("the default pick must start a bare claude"),
         }
-        assert!(app.modal.is_none(), "confirm closes the picker");
+        assert!(app.modal.is_none(), "Ctrl-O closes the picker");
     }
 
     #[test]
-    fn picker_confirm_on_an_agent_row_binds_it_and_remembers_the_pick() {
+    fn picker_ctrl_o_on_an_agent_row_binds_it_and_remembers_the_pick() {
         let mut app = app_with("s", None);
         app.open_agent_picker(vec![def_agent("planner"), def_agent("reviewer")]);
         // Down once from the default row -> the first agent (planner).
@@ -2385,7 +3852,7 @@ mod tests {
             app.modal.as_ref().unwrap().selected_action(),
             Some(&ModalAction::New(Some("planner".to_string())))
         );
-        let out = press(&mut app, KeyCode::Enter);
+        let out = press_ctrl(&mut app, KeyCode::Char('o'));
         match out {
             Outcome::Resume(ready) => {
                 assert_eq!(ready.argv.join(" "), "claude --agent planner");
@@ -2394,12 +3861,12 @@ mod tests {
             }
             _ => panic!("an agent pick must start `claude --agent planner`"),
         }
-        // The pick is remembered in-memory: the NEXT picker pre-highlights it.
+        // An ACTUAL launch is remembered in-memory: the NEXT picker pre-highlights it.
         app.open_agent_picker(vec![def_agent("planner"), def_agent("reviewer")]);
         assert_eq!(
             app.modal.as_ref().unwrap().selected_action(),
             Some(&ModalAction::New(Some("planner".to_string()))),
-            "the last pick pre-highlights on the next Ctrl-N"
+            "the last started agent pre-highlights on the next Ctrl-N"
         );
     }
 
@@ -2424,6 +3891,807 @@ mod tests {
             "a key during the picker must not type into the query"
         );
         assert!(app.modal.is_some(), "an inert key leaves the picker open");
+    }
+
+    // --- the Ctrl-N draft pane and the picker's Ctrl-O bypass ---------------
+
+    /// A REGRESSION PIN for the verb swap: the interactive start MOVED from `Enter`
+    /// to `Ctrl-O`, and it must have moved unchanged. Both rows are asserted by
+    /// their FULL argv, because "the feature still works" would also pass against a
+    /// drafted positional leaking into the interactive start.
+    #[test]
+    fn picker_ctrl_o_starts_interactively_with_the_unchanged_argv() {
+        for (downs, expected) in [(0usize, "claude"), (1, "claude --agent planner")] {
+            let mut app = app_with("s", None);
+            app.open_agent_picker(vec![def_agent("planner"), def_agent("reviewer")]);
+            for _ in 0..downs {
+                press(&mut app, KeyCode::Down);
+            }
+            match press_ctrl(&mut app, KeyCode::Char('o')) {
+                Outcome::Resume(ready) => {
+                    assert_eq!(
+                        ready.argv.join(" "),
+                        expected,
+                        "Ctrl-O must emit the bare new-session argv — no prompt positional"
+                    );
+                    assert_eq!(ready.nonzero_hint, resume::NEW_SESSION_NONZERO_HINT);
+                    assert_eq!(ready.race_probe_id, None);
+                }
+                _ => panic!("Ctrl-O on the picker must hand off a resume"),
+            }
+            assert!(!app.is_composing(), "Ctrl-O must NOT open the draft pane");
+        }
+    }
+
+    /// `Enter` on a highlighted picker row closes the picker and opens the
+    /// background draft pane for THAT row's agent — the default row carrying `None`
+    /// rather than a blank name. Drafting is what a new session defaults to now.
+    #[test]
+    fn picker_enter_opens_the_background_draft_for_the_highlighted_agent() {
+        // Row 0: the "default (no agent)" entry.
+        let mut app = app_with("s", None);
+        app.show_preview = false; // prove the draft pane force-shows it
+        app.open_agent_picker(vec![def_agent("planner"), def_agent("reviewer")]);
+        let out = press(&mut app, KeyCode::Enter);
+        assert!(
+            matches!(out, Outcome::Continue),
+            "opening a pane launches nothing"
+        );
+        assert!(app.modal.is_none(), "Enter closes the picker");
+        assert!(app.show_preview, "the draft pane force-shows the preview");
+        assert_eq!(
+            app.compose.as_ref().map(|c| &c.target),
+            Some(&ComposeTarget::NewBackgroundAgent { agent: None })
+        );
+
+        // Row 1: the first named agent.
+        let mut app = app_with("s", None);
+        app.open_agent_picker(vec![def_agent("planner"), def_agent("reviewer")]);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.compose.as_ref().map(|c| &c.target),
+            Some(&ComposeTarget::NewBackgroundAgent {
+                agent: Some("planner".to_string())
+            })
+        );
+    }
+
+    /// `Ctrl-N` with ZERO defined agents skips the pointless one-row picker and
+    /// opens the draft pane directly, bound to no agent — it must NOT resume.
+    ///
+    /// `HOME` is redirected so `defined_agents::discover_agents` finds neither a
+    /// user- nor a project-level `.claude/agents`; without that the developer's own
+    /// agents would decide which branch this test exercises.
+    #[test]
+    fn ctrl_n_with_no_defined_agents_opens_the_draft_pane_with_no_agent() {
+        let _guard = crate::config::env_lock();
+        let home = unique_temp_dir("no-agents-home");
+        let launch = unique_temp_dir("no-agents-launch");
+        let previous_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home);
+
+        let mut app = App::new(vec![session("s")], Scope::All, launch.clone());
+        app.show_preview = false; // prove the draft pane force-shows it
+        let out = press_ctrl(&mut app, KeyCode::Char('n'));
+
+        match previous_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&launch);
+
+        assert!(
+            matches!(out, Outcome::Continue),
+            "the no-agent path must draft, not hand off a resume"
+        );
+        assert!(
+            app.modal.is_none(),
+            "a one-row picker would be pure friction"
+        );
+        assert!(app.show_preview, "the draft pane force-shows the preview");
+        assert_eq!(
+            app.compose.as_ref().map(|c| &c.target),
+            Some(&ComposeTarget::NewBackgroundAgent { agent: None })
+        );
+    }
+
+    /// `Ctrl-O` belongs to the PICKER alone: on the running-session Attach/Fork
+    /// strip and the hard-delete confirm it is inert — it must not close the modal,
+    /// launch anything, or (worst) act on the highlighted choice.
+    #[test]
+    fn ctrl_o_is_inert_on_every_modal_but_the_picker() {
+        // The Row-layout key map never yields Interactive, whatever is highlighted.
+        assert!(matches!(
+            modal_key(ctrl(KeyCode::Char('o')), ModalLayout::Row),
+            ModalNav::Ignore
+        ));
+        assert!(matches!(
+            modal_key(ctrl(KeyCode::Char('o')), ModalLayout::List),
+            ModalNav::Interactive
+        ));
+
+        // The running-session choice: still open, nothing handed off.
+        let mut app = app_with("s", Some("background"));
+        app.open_live_choice("s".to_string());
+        let out = press_ctrl(&mut app, KeyCode::Char('o'));
+        assert!(matches!(out, Outcome::Continue));
+        assert!(app.modal.is_some(), "Ctrl-O must not dismiss the overlay");
+        assert!(
+            !app.is_composing(),
+            "Ctrl-O must not compose from Attach/Fork"
+        );
+
+        // The hard-delete confirm: likewise inert, and nothing was deleted.
+        let mut app = app_with("s", None);
+        app.open_delete_confirm();
+        let out = press_ctrl(&mut app, KeyCode::Char('o'));
+        assert!(matches!(out, Outcome::Continue));
+        assert!(app.modal.is_some(), "Ctrl-O must not dismiss the confirm");
+        assert!(!app.is_composing());
+    }
+
+    /// `Ctrl-B` was REMOVED from the picker with no alias and no deprecation, so it
+    /// must be as inert there as any unbound chord: no draft, no launch, and the
+    /// picker still open. The guard that the removal is real rather than renamed.
+    #[test]
+    fn ctrl_b_is_now_inert_on_the_picker() {
+        assert!(matches!(
+            modal_key(ctrl(KeyCode::Char('b')), ModalLayout::List),
+            ModalNav::Ignore
+        ));
+
+        let mut app = app_with("s", None);
+        app.open_agent_picker(vec![def_agent("planner"), def_agent("reviewer")]);
+        press(&mut app, KeyCode::Down);
+        let out = press_ctrl(&mut app, KeyCode::Char('b'));
+        assert!(
+            matches!(out, Outcome::Continue),
+            "an unbound chord launches nothing"
+        );
+        assert!(app.modal.is_some(), "Ctrl-B must leave the picker open");
+        assert!(!app.is_composing(), "Ctrl-B must not open the draft pane");
+    }
+
+    /// OPENING a draft must NOT record its row as the last-picked agent: nothing has
+    /// been launched yet (the draft can still be cancelled), and the memory behind
+    /// `Ctrl-N`'s pre-highlight means "the agent of the last new session actually
+    /// started". Pinned through the ONLY surface that reads it — the next picker's
+    /// pre-highlight — with `Ctrl-O` on the same row as the control, so this cannot
+    /// pass by that memory being dead.
+    #[test]
+    fn opening_the_draft_does_not_record_the_pick_as_the_last_new_agent() {
+        let agents = || vec![def_agent("planner"), def_agent("reviewer")];
+
+        // Draft on row 2 (reviewer), then cancel: nothing was launched.
+        let mut app = app_with("s", None);
+        app.open_agent_picker(agents());
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.is_composing(), "Esc cancels the draft");
+
+        app.open_agent_picker(agents());
+        assert_eq!(
+            app.modal.as_ref().map(|m| m.selected),
+            Some(0),
+            "a drafted (never launched) pick must not pre-highlight the next Ctrl-N"
+        );
+
+        // Control: `Ctrl-O` on that same row DOES record it.
+        let mut app = app_with("s", None);
+        app.open_agent_picker(agents());
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press_ctrl(&mut app, KeyCode::Char('o'));
+        app.open_agent_picker(agents());
+        assert_eq!(
+            app.modal.as_ref().map(|m| m.selected),
+            Some(2),
+            "an interactive start pre-highlights the agent it used"
+        );
+    }
+
+    /// `Enter` in the draft pane launches in the BACKGROUND: it escalates to
+    /// `Outcome::BgLaunch` (never `Outcome::Resume` — the board must not tear down),
+    /// carrying `claude --agent <name> --bg <prompt>` run in the launch dir, and
+    /// sets the in-flight status.
+    #[test]
+    fn draft_enter_escalates_to_a_background_launch_not_a_resume() {
+        let mut app = app_with("s", None);
+        app.open_agent_picker(vec![def_agent("planner")]);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        type_into_draft(&mut app, "ship the thing");
+
+        match press(&mut app, KeyCode::Enter) {
+            Outcome::BgLaunch(req) => {
+                assert_eq!(
+                    req.argv.join(" "),
+                    "claude --agent planner --bg ship the thing"
+                );
+                assert_eq!(req.cwd, app.launch_dir, "the child runs in the launch dir");
+            }
+            Outcome::Resume(_) => {
+                panic!("a background launch must NOT route through the teardown round trip")
+            }
+            _ => panic!("a drafted prompt must escalate to a background launch"),
+        }
+        assert!(!app.is_composing(), "launching closes the draft pane");
+        assert_eq!(app.status.as_deref(), Some(send::BG_LAUNCH_IN_FLIGHT));
+        assert!(
+            app.sending.is_none(),
+            "a launch is not a reply: nothing to echo into a transcript"
+        );
+    }
+
+    /// A BACKGROUND launch is a real start, so it records its agent as the pick the
+    /// next `Ctrl-N` pre-highlights — the same memory the interactive routes write.
+    /// Pinned through that pre-highlight (the only surface reading it), with an
+    /// EMPTY draft on another row as the control: a nudge is not a launch, so it
+    /// must leave the memory alone.
+    #[test]
+    fn a_background_launch_records_the_agent_as_the_last_new_agent() {
+        let agents = || vec![def_agent("planner"), def_agent("reviewer")];
+
+        // Row 2 (reviewer), drafted and launched with `--bg`.
+        let mut app = app_with("s", None);
+        app.open_agent_picker(agents());
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        type_into_draft(&mut app, "ship the thing");
+        assert!(
+            matches!(press(&mut app, KeyCode::Enter), Outcome::BgLaunch(_)),
+            "the draft must actually launch for this to be a launch record"
+        );
+
+        app.open_agent_picker(agents());
+        assert_eq!(
+            app.modal.as_ref().map(|m| m.selected),
+            Some(2),
+            "a background launch pre-highlights the agent it started"
+        );
+
+        // Control: an empty draft nudges instead of launching, so it records nothing.
+        let mut app = app_with("s", None);
+        app.open_agent_picker(agents());
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.is_composing(), "an empty draft stays open");
+        app.close_compose();
+        app.open_agent_picker(agents());
+        assert_eq!(
+            app.modal.as_ref().map(|m| m.selected),
+            Some(0),
+            "a nudged (never launched) draft must not pre-highlight the next Ctrl-N"
+        );
+    }
+
+    /// `Enter` on an EMPTY draft nudges and keeps the pane open — a background agent
+    /// with no first message would just sit there, so this is not a launch.
+    #[test]
+    fn draft_enter_on_an_empty_buffer_nudges_and_keeps_the_pane_open() {
+        for blank in ["", "   \n  "] {
+            let mut app = app_with("s", None);
+            app.open_agent_picker(vec![def_agent("planner")]);
+            press(&mut app, KeyCode::Enter);
+            type_into_draft(&mut app, blank);
+            let out = press(&mut app, KeyCode::Enter);
+            assert!(
+                matches!(out, Outcome::Continue),
+                "an empty draft must launch nothing"
+            );
+            assert!(app.is_composing(), "the draft pane stays open to type into");
+            let status = app.status.as_deref().expect("a nudge is shown");
+            assert!(
+                status.contains("background agent"),
+                "the nudge must say why an empty draft is useless: {status}"
+            );
+        }
+    }
+
+    /// The draft CARD and the compose editor open and close as ONE surface.
+    ///
+    /// They are separate fields precisely so the view need not read the compose
+    /// target — which is exactly the shape that could drift — so this pins that
+    /// every route out of a draft clears both. A REPLY is the control: it previews
+    /// a real session, so it must open no card at all.
+    #[test]
+    fn the_draft_card_and_the_editor_open_and_close_together() {
+        // Confirming the picker's "default (no agent)" row drafts: editor AND card.
+        // Driven through the picker rather than a bare `Ctrl-N` so the test does not
+        // depend on which agents the host machine happens to define.
+        let mut app = app_with("s", None);
+        app.open_agent_picker(vec![def_agent("planner")]);
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            app.is_composing(),
+            "confirming a pick opens the draft editor"
+        );
+        assert_eq!(
+            app.draft,
+            Some(NewSessionDraft {
+                agent: None,
+                launch_id: None,
+            }),
+            "the draft pane must own a card so the preview stops showing a transcript"
+        );
+
+        // Esc drops both — a cancelled draft may not leave a placeholder pane up.
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.is_composing(), "Esc closes the editor");
+        assert!(app.draft.is_none(), "Esc must close the card with it");
+
+        // The picker route carries the picked agent onto the card.
+        let mut app = app_with("s", None);
+        app.open_agent_picker(vec![def_agent("planner")]);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.draft.as_ref().and_then(|d| d.agent.as_deref()),
+            Some("planner"),
+            "the card names the agent the picker confirmed"
+        );
+
+        // Control: a quick REPLY previews a real session, so it opens NO card.
+        let mut app = app_with("idle", None);
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        assert!(app.is_composing(), "Ctrl-R opens the reply editor");
+        assert!(
+            app.draft.is_none(),
+            "a reply must not blank out the transcript it is addressed to"
+        );
+    }
+
+    /// A DISPATCHED draft keeps its card, marked in flight, until the launch reports
+    /// back — the pane still has no session to show, so snapping back to an
+    /// unrelated transcript at the moment of launch would reintroduce the very
+    /// confusion the card removes. The completion event already on the channel is
+    /// what ends it: no tick, thread, or event source is added for this.
+    #[test]
+    fn a_dispatched_draft_keeps_its_card_until_the_launch_reports_back() {
+        let mut app = app_with("s", None);
+        app.open_agent_picker(vec![def_agent("planner")]);
+        press(&mut app, KeyCode::Enter);
+        type_into_draft(&mut app, "ship the thing");
+        let Outcome::BgLaunch(req) = press(&mut app, KeyCode::Enter) else {
+            panic!("the draft must actually dispatch for this to be an in-flight card");
+        };
+
+        assert!(!app.is_composing(), "there is nothing left to type");
+        assert_eq!(
+            app.draft,
+            Some(NewSessionDraft {
+                agent: None,
+                launch_id: Some(req.launch_id),
+            }),
+            "the card stays, stamped with the launch it now reports"
+        );
+
+        // THAT launch's one-shot completion event closes it (spawn failures
+        // included: the driver emits exactly one of these whatever the child did).
+        let out = handle_event(
+            &mut app,
+            AppEvent::BgLaunchFinished {
+                launch_id: req.launch_id,
+                status: "background agent started".to_string(),
+            },
+            Path::new("/tmp"),
+        );
+        assert!(matches!(out, Outcome::Continue));
+        assert!(app.draft.is_none(), "the result ends the card");
+        assert_eq!(app.status.as_deref(), Some("background agent started"));
+    }
+
+    /// `Ctrl-O` in the draft pane runs the agent INTERACTIVELY instead: the draft
+    /// becomes claude's trailing positional through the ordinary
+    /// `Outcome::Resume` teardown round trip, never a `--bg` launch — and, being a
+    /// real launch, it records the agent the next `Ctrl-N` pre-highlights.
+    #[test]
+    fn draft_ctrl_o_hands_off_interactively_with_the_prompt_as_a_positional() {
+        let mut app = app_with("s", None);
+        app.open_agent_picker(vec![def_agent("planner")]);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        type_into_draft(&mut app, "ship the thing");
+
+        match press_ctrl(&mut app, KeyCode::Char('o')) {
+            Outcome::Resume(ready) => {
+                assert_eq!(
+                    ready.argv.join(" "),
+                    "claude --agent planner ship the thing"
+                );
+                assert!(
+                    !ready.argv.iter().any(|a| a == "--bg"),
+                    "the interactive hand-off must not carry --bg: {:?}",
+                    ready.argv
+                );
+                assert_eq!(ready.nonzero_hint, resume::NEW_SESSION_NONZERO_HINT);
+            }
+            Outcome::BgLaunch(_) => panic!("Ctrl-O must NOT launch in the background"),
+            _ => panic!("Ctrl-O must hand off an interactive resume"),
+        }
+        assert!(!app.is_composing(), "handing off closes the draft pane");
+        // The CARD too, not just the editor: this route tears the terminal down, and
+        // a card left behind here is exactly the stranded placeholder that survives
+        // into the next board session (the completion event it waits for cannot).
+        assert!(app.draft.is_none(), "handing off closes the card with it");
+
+        // The draft's own `Ctrl-O` is one of the three REAL launch points, so it
+        // writes the same memory the picker's `Ctrl-O` and the `--bg` submit do.
+        app.open_agent_picker(vec![def_agent("planner"), def_agent("reviewer")]);
+        assert_eq!(
+            app.modal.as_ref().map(|m| m.selected),
+            Some(1),
+            "the draft's interactive launch pre-highlights the agent it started"
+        );
+    }
+
+    /// `Ctrl-O` on an EMPTY draft launches BARE — no positional at all — i.e.
+    /// exactly what the picker's own `Ctrl-O` emits.
+    #[test]
+    fn draft_ctrl_o_on_an_empty_buffer_launches_bare() {
+        let mut app = app_with("s", None);
+        app.open_agent_picker(vec![def_agent("planner")]);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        type_into_draft(&mut app, "   ");
+
+        match press_ctrl(&mut app, KeyCode::Char('o')) {
+            Outcome::Resume(ready) => assert_eq!(
+                ready.argv.join(" "),
+                "claude --agent planner",
+                "a whitespace draft must emit no positional"
+            ),
+            _ => panic!("Ctrl-O must hand off an interactive resume"),
+        }
+    }
+
+    /// A REFUSED `Ctrl-O` tears the surface down too, even though the board stays up.
+    ///
+    /// This is the one interactive route the shared teardown seam does not cover: a
+    /// `check_new` refusal returns `Outcome::Continue`, which by design does NOT end
+    /// the board session, so `handle_event` never reaches `close_compose` and
+    /// `open_interactive`'s own call is all that stands between the user and a
+    /// surface left up over a launch that never happened. Delete that one line and
+    /// every other `Ctrl-O` test still passes — the seam masks them — while the user
+    /// is handed a refusal status behind an editor that is still taking keystrokes
+    /// for a hand-off that was declined.
+    #[test]
+    fn draft_ctrl_o_tears_the_surface_down_when_the_gate_refuses() {
+        // A launch dir that is GONE is what `resume::check_new` refuses on; no
+        // `claude` is spawned on this path (the gate is pure existence + argv).
+        let missing = PathBuf::from("/no/such/snapback/launch/dir/anywhere");
+        assert!(
+            !missing.exists(),
+            "the launch dir must be absent for the gate to refuse"
+        );
+        let mut app = App::new(vec![session("s")], Scope::All, missing);
+        seed_live(&mut app, &[]);
+
+        app.open_agent_picker(vec![def_agent("planner")]);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        type_into_draft(&mut app, "ship the thing");
+        assert!(
+            app.is_composing() && app.draft.is_some(),
+            "the draft surface must be up for its teardown to be testable"
+        );
+
+        let out = press_ctrl(&mut app, KeyCode::Char('o'));
+        assert!(
+            matches!(out, Outcome::Continue),
+            "a refused new-session gate keeps the board, so no teardown seam fires"
+        );
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|s| s.contains("no longer exists")),
+            "the refusal must surface as a board status: {:?}",
+            app.status
+        );
+        assert!(
+            !app.is_composing(),
+            "the editor must not survive a declined hand-off"
+        );
+        assert!(
+            app.draft.is_none(),
+            "nor the card: nothing was dispatched for it to report, and no \
+             BgLaunchFinished will ever arrive to close it"
+        );
+        assert!(
+            !app.overlay_active(),
+            "a surface stranded by a refusal leaves the mouse gated on the board"
+        );
+    }
+
+    /// `Ctrl-O` is INERT on a reply draft — there is no new-session launch to escape
+    /// to — and it must leave the reply's buffer and target untouched.
+    #[test]
+    fn ctrl_o_is_inert_on_a_reply_draft() {
+        let mut app = app_with("idle", None);
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        type_into_draft(&mut app, "hello");
+
+        let out = press_ctrl(&mut app, KeyCode::Char('o'));
+        assert!(
+            matches!(out, Outcome::Continue),
+            "a reply has no interactive launch to escape to"
+        );
+        assert!(app.is_composing(), "the reply compose zone stays open");
+        assert_eq!(
+            app.compose.as_ref().map(|c| &c.target),
+            Some(&ComposeTarget::Reply {
+                session_id: "idle".to_string(),
+                stop_job: None,
+            })
+        );
+        assert_eq!(
+            app.compose
+                .as_ref()
+                .map(|c| c.textarea.lines().join("\n"))
+                .as_deref(),
+            Some("hello"),
+            "an inert chord must not edit the buffer either"
+        );
+    }
+
+    /// Which outcomes END the board session — the predicate the compose surface's
+    /// teardown hangs on.
+    ///
+    /// Both directions are load-bearing, and the FALSE side is the sharper one: the
+    /// three no-teardown effects keep drawing on the same channel, so counting
+    /// `BgLaunch` here would close the draft card at the moment of dispatch — which
+    /// is precisely the snap-back-to-an-unrelated-transcript the card exists to
+    /// prevent.
+    #[test]
+    fn ends_board_session_is_true_for_the_teardown_outcomes_only() {
+        let ready = resume::Ready {
+            cwd: PathBuf::from("/tmp"),
+            argv: vec!["claude".to_string()],
+            nonzero_hint: resume::NEW_SESSION_NONZERO_HINT,
+            race_probe_id: None,
+        };
+        assert!(Outcome::Quit.ends_board_session());
+        assert!(Outcome::Resume(ready).ends_board_session());
+
+        assert!(!Outcome::Continue.ends_board_session());
+        assert!(!Outcome::BgLaunch(crate::send::BgLaunchRequest {
+            launch_id: 0,
+            argv: vec!["claude".to_string()],
+            cwd: PathBuf::from("/tmp"),
+        })
+        .ends_board_session());
+        assert!(!Outcome::Send(crate::send::SendRequest {
+            session_id: "s".to_string(),
+            argv: vec!["claude".to_string()],
+            cwd: PathBuf::from("/tmp"),
+            stop_job: None,
+        })
+        .ends_board_session());
+        assert!(!Outcome::Interrupt(crate::send::InterruptRequest {
+            argv: vec!["claude".to_string()],
+            cwd: PathBuf::from("/tmp"),
+        })
+        .ends_board_session());
+    }
+
+    /// An in-flight card must not outlive the board session that dispatched it.
+    ///
+    /// The editor closes at dispatch, so `Ctrl-F` / `Enter` on a row stay routable
+    /// while the card is up — and both hand the terminal over. The completion event
+    /// that would have ended the card cannot survive that: `run_inner` builds a new
+    /// `EventLoop` per board session and drops the old receiver, so the launch
+    /// reports back into a channel nobody is reading and the SAME `App` re-enters
+    /// the board still holding the card. That strands the preview on a placeholder
+    /// for every session, with `overlay_active` stuck true (dead link clicks, dead
+    /// splitter drags), recoverable only by opening and cancelling another compose.
+    /// Every hand-off therefore ends the card with the board session it belonged to.
+    #[test]
+    fn handing_off_while_a_launch_is_in_flight_leaves_no_stranded_card() {
+        let dir = unique_temp_dir("stranded-card");
+        for fork in [true, false] {
+            let mut app = App::new(
+                vec![resumable_session(&dir, "sess-handoff")],
+                Scope::All,
+                PathBuf::from("/tmp"),
+            );
+            seed_live(&mut app, &[]);
+            app.open_agent_picker(vec![def_agent("planner")]);
+            press(&mut app, KeyCode::Enter);
+            type_into_draft(&mut app, "ship the thing");
+            assert!(
+                matches!(press(&mut app, KeyCode::Enter), Outcome::BgLaunch(_)),
+                "the draft must dispatch for the card to be in flight"
+            );
+            assert!(app.draft.is_some(), "the dispatched card is up");
+
+            let out = if fork {
+                press_ctrl(&mut app, KeyCode::Char('f'))
+            } else {
+                press(&mut app, KeyCode::Enter)
+            };
+            assert!(
+                matches!(out, Outcome::Resume(_)),
+                "the row must really hand off, or this proves nothing (fork={fork})"
+            );
+            assert!(
+                app.draft.is_none(),
+                "the in-flight card must not survive the hand-off (fork={fork})"
+            );
+            assert!(
+                !app.overlay_active(),
+                "a stranded card leaves the mouse gated forever (fork={fork})"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A finished launch may only close the card IT dispatched — NEVER a compose
+    /// the user opened after dispatching.
+    ///
+    /// The card deliberately outlives `Enter`, so the completion event lands on
+    /// whatever surface happens to be open when it arrives. Closing blindly there
+    /// destroys a quick reply mid-sentence: the typed buffer is gone with no
+    /// warning, and the only thing the user did was not sit still for the second
+    /// or two the launch took. The guard is the `App::sending_to` shape — the
+    /// request carries an identity, the completion event carries it back, and the
+    /// handler acts only on a match.
+    #[test]
+    fn a_finished_launch_never_closes_a_compose_opened_after_it() {
+        let mut app = app_with("idle", None);
+        app.open_agent_picker(vec![def_agent("planner")]);
+        press(&mut app, KeyCode::Enter);
+        type_into_draft(&mut app, "ship the thing");
+        let Outcome::BgLaunch(req) = press(&mut app, KeyCode::Enter) else {
+            panic!("the draft must dispatch for this interleaving to exist");
+        };
+
+        // The user does not wait for the child: a quick reply is opened and typed
+        // into while `claude --bg` is still running.
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        type_into_draft(&mut app, "and this");
+        assert!(app.is_composing(), "Ctrl-R must open the reply editor");
+
+        let out = handle_event(
+            &mut app,
+            AppEvent::BgLaunchFinished {
+                launch_id: req.launch_id,
+                status: "background agent started".to_string(),
+            },
+            Path::new("/tmp"),
+        );
+
+        assert!(matches!(out, Outcome::Continue));
+        assert!(
+            app.is_composing(),
+            "the launch's own completion must not tear down a reply opened after it"
+        );
+        assert_eq!(
+            app.compose
+                .as_ref()
+                .map(|c| c.textarea.lines().join("\n"))
+                .as_deref(),
+            Some("and this"),
+            "the typed reply must survive an unrelated launch finishing"
+        );
+
+        // Control: a SECOND draft opened after the dispatch is equally untouchable —
+        // the stale event names the first launch, and the new card never launched.
+        app.close_compose();
+        app.open_agent_picker(vec![def_agent("planner")]);
+        press(&mut app, KeyCode::Enter);
+        handle_event(
+            &mut app,
+            AppEvent::BgLaunchFinished {
+                launch_id: req.launch_id,
+                status: "background agent started".to_string(),
+            },
+            Path::new("/tmp"),
+        );
+        assert!(
+            app.is_composing() && app.draft.is_some(),
+            "a stale launch result must not close a draft opened after it"
+        );
+    }
+
+    /// Two launches dispatched from ONE board session are told apart, so an
+    /// OUT-OF-ORDER completion cannot close a card that was never its own.
+    ///
+    /// Id UNIQUENESS is what makes `launching_draft` an IDENTITY check rather than
+    /// the weaker "is any card in flight". Freeze the minting counter and every
+    /// dispatch stamps the same id, so the FIRST launch's result closes the SECOND
+    /// launch's card — throwing away the placeholder for a child that is still
+    /// running, on exactly the interleaving (two dispatches, one board, results in
+    /// any order) the guard exists for. Nothing else in the suite forces the two ids
+    /// apart: the sibling test's second draft is never dispatched, so it carries no
+    /// id to collide with.
+    #[test]
+    fn a_second_dispatchs_card_survives_the_first_launchs_result() {
+        let mut app = app_with("idle", None);
+
+        // Launch A.
+        app.open_agent_picker(vec![def_agent("planner")]);
+        press(&mut app, KeyCode::Enter);
+        type_into_draft(&mut app, "first thing");
+        let Outcome::BgLaunch(first) = press(&mut app, KeyCode::Enter) else {
+            panic!("the first draft must dispatch for this interleaving to exist");
+        };
+
+        // Launch B, drafted and dispatched while A is still running.
+        app.open_agent_picker(vec![def_agent("planner")]);
+        press(&mut app, KeyCode::Enter);
+        type_into_draft(&mut app, "second thing");
+        let Outcome::BgLaunch(second) = press(&mut app, KeyCode::Enter) else {
+            panic!("the second draft must dispatch for this interleaving to exist");
+        };
+        assert_ne!(
+            first.launch_id, second.launch_id,
+            "each dispatch must mint its OWN id, or the guard degrades into \
+             'is any card in flight' and cannot tell the two launches apart"
+        );
+
+        // A finishes SECOND-to-last in wall-clock order but names the FIRST launch:
+        // the card on screen belongs to B and must be left alone.
+        let out = handle_event(
+            &mut app,
+            AppEvent::BgLaunchFinished {
+                launch_id: first.launch_id,
+                status: "background agent started".to_string(),
+            },
+            Path::new("/tmp"),
+        );
+        assert!(matches!(out, Outcome::Continue));
+        assert_eq!(
+            app.draft,
+            Some(NewSessionDraft {
+                agent: None,
+                launch_id: Some(second.launch_id),
+            }),
+            "the first launch's result must leave the second launch's card in flight"
+        );
+
+        // Control: B's OWN result does end B's card, so the id asserted above is a
+        // matchable one and this is not a card that simply never closes.
+        handle_event(
+            &mut app,
+            AppEvent::BgLaunchFinished {
+                launch_id: second.launch_id,
+                status: "background agent started".to_string(),
+            },
+            Path::new("/tmp"),
+        );
+        assert!(
+            app.draft.is_none(),
+            "the second launch's own result ends its card"
+        );
+    }
+
+    /// A finished launch surfaces its mapped status on the board and nothing else:
+    /// there is no row to re-anchor and no in-flight echo to clear, because a
+    /// brand-new agent has no session id the board knows yet.
+    #[test]
+    fn a_finished_bg_launch_only_surfaces_its_status() {
+        let mut app = app_with("s", None);
+        let out = handle_event(
+            &mut app,
+            AppEvent::BgLaunchFinished {
+                // No card is up (this board never drafted), so no id can match —
+                // the status must land all the same.
+                launch_id: 0,
+                status: "background agent started".to_string(),
+            },
+            Path::new("/tmp"),
+        );
+        assert!(matches!(out, Outcome::Continue));
+        assert_eq!(app.status.as_deref(), Some("background agent started"));
+        assert!(app.sending.is_none());
+        assert!(!app.is_composing());
     }
 
     // --- Ctrl-X leader chord: hide / show-hidden / hard-delete ------------

@@ -26,6 +26,11 @@ use crate::search::{SearchIndex, SearchMode};
 use crate::store::lineage::{self, LineageKey};
 use crate::store::{preview, Session};
 
+// The transcript's wrap model is the VIEW's (it is a fact about the widget that
+// paints the pane, not about this state), so the cache here stores what that module
+// measures rather than re-deriving a second answer.
+use super::view;
+
 /// Lines the preview scrolls per mouse-wheel notch. Small (the terminal reports
 /// discrete notches, not pixel deltas) so a trackpad flick stays controllable.
 const PREVIEW_WHEEL_STEP: i32 = 2;
@@ -162,6 +167,102 @@ pub struct ModalChoice {
     pub description: Option<String>,
     /// What confirming this choice does.
     pub action: ModalAction,
+}
+
+/// The open "stop the waiting agent?" confirmation, shown when `Ctrl-R` targets a
+/// `needs input` background agent: stopping it to reply in place would abandon a
+/// live agent, so the user confirms first (`Enter`) or cancels (`Esc`). A simple
+/// yes/no gate (no navigation), so it holds only what a confirmed stop-then-reply
+/// needs: the target session and the job id to `claude stop`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingStop {
+    /// Stable `session_id` the reply will target once confirmed.
+    pub session_id: String,
+    /// Short agent-view job id to `claude stop` before the reply.
+    pub job_id: String,
+}
+
+/// The open "stop this agent?" confirmation, shown when `Ctrl-K` (interrupt) targets
+/// a LIVE agent that is not already finished: stopping it abandons live work, so the
+/// user confirms first (`Enter`) or cancels (`Esc`). A simple yes/no gate (no
+/// navigation). Distinct from [`PendingStop`], which is the reply's stop-THEN-reply
+/// pre-step; this one resolves into an actual `claude stop` and nothing more.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingInterrupt {
+    /// Stable `session_id` the interrupt targets — kept only to label the modal.
+    pub session_id: String,
+    /// Short agent-view job id to `claude stop` on confirm.
+    pub job_id: String,
+}
+
+/// A quick-reply send that is IN FLIGHT (dispatched, not yet finished).
+///
+/// Carries everything the preview needs to render the reply OPTIMISTICALLY while
+/// `claude -p -r` runs: the target session, the message that was sent, and the
+/// session's turn count AT SEND TIME. The count is the dedup signal — while the
+/// reloaded session still reports `baseline_msg_count`, claude has not yet written
+/// the user turn, so the preview echoes a synthetic one; the moment the real turn
+/// lands (count grows) the echo yields to it, so the swap never doubles the line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sending {
+    /// Authoritative `sessionId` the reply targets (re-read from the file at Send
+    /// time, so it is what identifies the in-flight row — STABLE-ID STATE).
+    pub session_id: String,
+    /// The message text that was sent, echoed under a synthetic `▶ you` turn until
+    /// claude writes the real one to disk.
+    pub message: String,
+    /// The target session's [`Session::msg_count`](crate::store::Session::msg_count)
+    /// when the send was dispatched. The echo shows only while the reloaded count
+    /// still equals this — i.e. nothing new has landed on disk yet.
+    pub baseline_msg_count: usize,
+}
+
+/// The open NEW-SESSION draft — the PANE-level twin of the compose editor.
+///
+/// Its whole job is to let the VIEW know a background draft is open WITHOUT
+/// reading [`super::compose::ComposeState`]: the compose editor answers "what does
+/// the keyboard do", this answers "what does the preview pane show". Keeping them
+/// apart is the point — while this is set the preview renders a placeholder card
+/// instead of the SELECTED session's transcript, so a docked compose box can never
+/// sit over an unrelated conversation and read as a reply to it.
+///
+/// Deliberately holds NOTHING about a session: a brand-new agent has no
+/// `sessionId` yet, no row on the board, and no transcript. The agent name is here
+/// only because the card names it; once the agent exists, its own `agent-setting`
+/// record (already rendered by [`crate::store::preview`]) is what says which agent
+/// it was.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NewSessionDraft {
+    /// The picked agent, or `None` for the picker's "default (no agent)" row.
+    pub agent: Option<String>,
+    /// The launch this card is reporting, or `None` while it is still being typed.
+    ///
+    /// Stamped by [`App::dispatch_draft`] the moment `Enter` hands a
+    /// [`crate::send::BgLaunchRequest`] to the driver, and cleared when THAT
+    /// launch's one-shot
+    /// [`AppEvent::BgLaunchFinished`](crate::watch::AppEvent::BgLaunchFinished)
+    /// lands. Exactly the shape of [`Sending`] — set at dispatch, cleared by the
+    /// completion event already on the channel — so the card can report the launch
+    /// without a tick, thread, or event source of its own.
+    ///
+    /// It is an ID rather than a flag for the same reason [`Sending`] carries a
+    /// `session_id`: the card outlives the editor, so by the time a result arrives
+    /// the surface underneath may be something else entirely (a quick reply, a
+    /// second draft). [`App::launching_draft`] is the matching identity check, and
+    /// without it a completing launch tears down whatever is open — including a
+    /// half-typed reply.
+    pub launch_id: Option<u64>,
+}
+
+impl NewSessionDraft {
+    /// Whether this card is reporting a DISPATCHED launch (rather than an editable
+    /// draft). The rendering predicate behind the card's in-flight line — one
+    /// reading of [`launch_id`](Self::launch_id), so "in flight" and "which launch"
+    /// can never disagree.
+    #[must_use]
+    pub fn is_launching(&self) -> bool {
+        self.launch_id.is_some()
+    }
 }
 
 /// A titled, centered prompt with N labelled choices and a wrapping-cycle
@@ -395,6 +496,25 @@ fn default_live_probe() -> HashMap<String, ReportedAgent> {
     )
 }
 
+/// One session's preview as rendered at [`App::preview_width`] — the styled text
+/// and its link regions, plus everything else that is a function of that same
+/// (session, width) pair.
+///
+/// The derived count lives INSIDE the entry rather than in a second map on the side
+/// so it cannot outlive what it describes: the entry is the unit that is inserted and
+/// dropped, so every existing invalidation (a width change, a reload) already carries
+/// the count with it and no future one can remember half of it.
+struct CachedPreview {
+    /// The styled transcript + clickable link regions from one `preview::render`.
+    rendered: preview::RenderedPreview,
+    /// Screen rows `rendered.text` occupies once WORD-wrapped at
+    /// [`App::preview_width`] — measured by `view::wrapped_text_rows`, i.e. by the
+    /// same wrapper that paints the pane, never by a model of our own. Cached
+    /// because that wrapper walks the whole transcript and the pane redraws several
+    /// times a second.
+    wrapped_rows: usize,
+}
+
 /// The full TUI state model.
 ///
 /// Selection is stored as a stable `session_id` (never a list index) so it
@@ -498,6 +618,48 @@ pub struct App {
     /// now one `Option<Modal>`, so their mutual exclusion is structural rather
     /// than conventional.
     pub modal: Option<Modal>,
+    /// The open compose editor, if any. `Some` while the compose modal owns the
+    /// keyboard — for EITHER draft: a quick reply (`Ctrl-R` on an idle session) or
+    /// a new background agent (`Ctrl-N`), told apart by its
+    /// [`ComposeTarget`](super::compose::ComposeTarget). Its type
+    /// ([`super::compose::ComposeState`]) is the ONLY place outside
+    /// [`super::compose`] that touches `ratatui_textarea`, the way `search`
+    /// confines nucleo.
+    pub compose: Option<super::compose::ComposeState>,
+    /// The open NEW-SESSION draft, if any — see [`NewSessionDraft`].
+    ///
+    /// Independent of [`compose`](Self::compose) ON PURPOSE: the view asks THIS
+    /// whether the preview pane shows a draft card, and never inspects the compose
+    /// target to decide. The two are written only by
+    /// [`open_compose`](Self::open_compose) / [`close_compose`](Self::close_compose)
+    /// / [`dispatch_draft`](Self::dispatch_draft), so they cannot drift apart.
+    pub draft: Option<NewSessionDraft>,
+    /// The open "stop the waiting agent?" confirmation, if any. `Some` while that
+    /// modal owns the keyboard (`Ctrl-R` on a `needs input` background agent, before
+    /// compose opens).
+    pub pending_stop: Option<PendingStop>,
+    /// The open "stop this agent?" interrupt confirmation, if any. `Some` while that
+    /// modal owns the keyboard (`Ctrl-K` on a live, not-yet-finished agent). Distinct
+    /// from [`pending_stop`](Self::pending_stop): this resolves into a bare
+    /// `claude stop`, not a reply.
+    pub pending_interrupt: Option<PendingInterrupt>,
+    /// The quick-reply send that is IN FLIGHT (dispatched, not yet finished), or
+    /// `None`. Drives the optimistic in-preview echo of the message plus the
+    /// animated "sending… / cooking…" indicator so the reply feels instant; set
+    /// when the send is handed off and cleared when its `AppEvent::SendFinished`
+    /// lands. See [`Sending`].
+    pub sending: Option<Sending>,
+    /// The id the NEXT background launch is stamped with, handed out by
+    /// [`dispatch_draft`](Self::dispatch_draft).
+    ///
+    /// Monotonic and board-local: it exists only so a completion event can be told
+    /// apart from a later one, which is what
+    /// [`launching_draft`](Self::launching_draft) checks. A brand-new agent has no
+    /// `sessionId` to key by (that is the whole reason
+    /// [`crate::send::BgLaunchRequest`] is thinner than its send sibling), so the
+    /// board mints its own identity for the round trip and nothing outside it ever
+    /// sees this number.
+    next_bg_launch_id: u64,
     /// The agent chosen for the most recent new session (`None` = default / no
     /// agent). In-memory ONLY — never persisted to disk — so the NEXT `Ctrl-N`
     /// pre-highlights it for a one-keystroke repeat.
@@ -567,12 +729,14 @@ pub struct App {
     /// pane's inner width, so the cache is scoped to a single width tracked in
     /// [`preview_width`](Self::preview_width): a width change CLEARS it rather
     /// than keying every entry by `(id, width)`. This keeps the cache to one
-    /// `Text` per session and mirrors the reload-clear in `apply_sessions`;
+    /// entry per session and mirrors the reload-clear in `apply_sessions`;
     /// re-render on resize is cheap because only the selected session is ever
-    /// rendered. Each entry carries the styled `Text` AND its clickable link
-    /// regions (see [`preview::RenderedPreview`]); the two are produced from one
-    /// pass at a fixed width, so a region's columns always match the drawn text.
-    preview_cache: HashMap<String, preview::RenderedPreview>,
+    /// rendered. Each entry carries the styled `Text`, its clickable link
+    /// regions (see [`preview::RenderedPreview`]) and the transcript's wrapped
+    /// row count (see [`CachedPreview`]); all three are produced from one pass at
+    /// a fixed width, so a region's columns and a row count always match the
+    /// drawn text.
+    preview_cache: HashMap<String, CachedPreview>,
     /// Inner content width the `preview_cache` entries were rendered for. A
     /// change invalidates the whole cache (see `preview_cache`). `None` until
     /// the first preview render.
@@ -618,6 +782,12 @@ impl App {
             reported_agents: HashMap::new(),
             live_probe: Box::new(default_live_probe),
             modal: None,
+            pending_interrupt: None,
+            compose: None,
+            draft: None,
+            pending_stop: None,
+            sending: None,
+            next_bg_launch_id: 0,
             last_new_agent: None,
             dragging_split: false,
             scoped: Vec::new(),
@@ -772,6 +942,27 @@ impl App {
     /// Append a character to the query and re-filter (type-to-search).
     pub fn push_query_char(&mut self, c: char) {
         self.query.push(c);
+        self.index.set_query(&self.query);
+        self.reapply_preserving_selection();
+    }
+
+    /// Append a whole STRING to the query and re-filter ONCE — the terminal-paste
+    /// sibling of [`push_query_char`](Self::push_query_char).
+    ///
+    /// A paste arrives as one `Event::Paste`, so it re-filters once for the whole
+    /// text rather than once per character; `set_query` rebuilds the pattern and the
+    /// per-atom finders on each call, so looping `push_query_char` would pay that
+    /// rebuild N times for a single user action. An empty string is a no-op (no
+    /// pointless re-filter).
+    ///
+    /// The caller owns the SHAPE of `text` — the query is a single line, so
+    /// `update::flatten_for_query` has already turned any newline into a space
+    /// before this is reached.
+    pub fn push_query_str(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.query.push_str(text);
         self.index.set_query(&self.query);
         self.reapply_preserving_selection();
     }
@@ -1231,13 +1422,147 @@ impl App {
     /// (splitter drag / link open) from firing while an overlay is up — so a later
     /// gate extension lives in exactly one place.
     ///
-    /// True while a [`Modal`] is open OR a `Ctrl-X` leader chord is
-    /// [pending](Self::pending_chord): both take the keyboard, so both must equally
-    /// gate the mouse (a stray click mid-chord must not start a drag or open a
-    /// link), per PATTERNS §10.
+    /// True while a [`Modal`] is open, the quick-reply compose zone, the
+    /// stop-then-reply confirmation, or the interrupt confirmation owns the
+    /// keyboard, OR a `Ctrl-X` leader chord is [pending](Self::pending_chord): each
+    /// takes the keyboard, so each must equally gate the mouse (a stray click
+    /// mid-chord must not start a drag or open a link), per PATTERNS §10.
+    ///
+    /// A [`draft`](Self::draft) counts for a related reason: it owns the PANE
+    /// rather than the keyboard. While its card is drawn the transcript is not, so
+    /// the cached link regions describe text that is no longer on screen — a click
+    /// resolved against them would open a link from a session the user cannot see.
+    /// It outlives the editor by AT MOST one in-flight launch (whichever comes
+    /// first: that launch's own result, or the end of the board session), which is
+    /// the window this arm covers on its own.
     #[must_use]
     pub fn overlay_active(&self) -> bool {
-        self.modal.is_some() || self.pending_chord
+        self.modal.is_some()
+            || self.compose.is_some()
+            || self.draft.is_some()
+            || self.pending_stop.is_some()
+            || self.pending_interrupt.is_some()
+            || self.pending_chord
+    }
+
+    /// Open the "stop the waiting agent?" confirmation for a `needs input` agent.
+    pub fn open_stop_confirm(&mut self, session_id: String, job_id: String) {
+        self.pending_stop = Some(PendingStop { session_id, job_id });
+    }
+
+    /// Dismiss the stop confirmation, returning to the board.
+    pub fn stop_confirm_cancel(&mut self) {
+        self.pending_stop = None;
+    }
+
+    /// Open the "stop this agent?" interrupt confirmation for a live, not-yet-finished
+    /// agent (`Ctrl-K`).
+    pub fn open_interrupt_confirm(&mut self, session_id: String, job_id: String) {
+        self.pending_interrupt = Some(PendingInterrupt { session_id, job_id });
+    }
+
+    /// Dismiss the interrupt confirmation, returning to the board.
+    pub fn interrupt_confirm_cancel(&mut self) {
+        self.pending_interrupt = None;
+    }
+
+    /// Whether the compose editor owns the keyboard — EITHER draft, since which one
+    /// is open is a `ComposeTarget` rather than a second piece of state. Gates key
+    /// routing in [`super::update::handle_event`] (all keys go to the compose
+    /// handler, bypassing `key_to_action`) and drives the compose-zone layout in
+    /// [`super::view`].
+    ///
+    /// NOT the predicate for "the preview pane is a draft card" — that is
+    /// [`draft`](Self::draft), which outlives this by one in-flight launch.
+    #[must_use]
+    pub fn is_composing(&self) -> bool {
+        self.compose.is_some()
+    }
+
+    // --- the compose surface: editor + draft card, opened and closed as one ---
+
+    /// Open the compose surface: the editor `state`, plus `draft` when this is a
+    /// NEW-SESSION draft (`None` for a quick reply, which previews a real session).
+    ///
+    /// The ONE writer that installs either, so "a background draft always has a
+    /// card and a reply never does" is structural rather than a convention each
+    /// call site has to remember. Composing FORCE-SHOWS the preview, since both the
+    /// card and the docked editor live in that pane (the renderer falls back to a
+    /// full-width bottom bar when the pane is too short).
+    pub fn open_compose(
+        &mut self,
+        state: super::compose::ComposeState,
+        draft: Option<NewSessionDraft>,
+    ) {
+        self.show_preview = true;
+        self.compose = Some(state);
+        self.draft = draft;
+    }
+
+    /// Tear the compose surface DOWN — editor and draft card together.
+    ///
+    /// THE single teardown, so the two can never desync: `Esc`, every refusal, a
+    /// vanished session, the interactive hand-off, and the finished background
+    /// launch all end here rather than clearing one field and forgetting the other.
+    pub fn close_compose(&mut self) {
+        self.compose = None;
+        self.draft = None;
+    }
+
+    /// Hand the drafted launch over to the driver: close the EDITOR but keep the
+    /// card, stamped with the id of the launch it now reports (which is returned,
+    /// so the request carries the same id back on completion).
+    ///
+    /// The one point where the two fields deliberately part, and only for as long
+    /// as the child runs: there is nothing left to type, but the pane still has no
+    /// session to show, so the card stays and reports the launch it just
+    /// dispatched. The one-shot `AppEvent::BgLaunchFinished` — which
+    /// `send::spawn_bg_launch` emits exactly once, spawn failures included — closes
+    /// it, but ONLY through [`launching_draft`](Self::launching_draft): by the time
+    /// it lands the surface may be a quick reply or a second draft, and neither is
+    /// this launch's to close.
+    ///
+    /// `#[must_use]` for the same reason as its sibling checks, and more sharply:
+    /// the returned id is the WHOLE of that identity guard. A caller that drops it
+    /// still stamps the card, but dispatches a launch whose completion carries an id
+    /// nothing can match — so `launching_draft` never fires and the card is stranded
+    /// for the rest of the board session.
+    #[must_use = "the launch id must ride out on the request, or the card is unmatchable"]
+    pub fn dispatch_draft(&mut self) -> u64 {
+        // `wrapping_add` for the same reason `tick` uses it: a board left running
+        // forever must roll over rather than overflow-panic in debug. Two launches
+        // 2^64 apart cannot be in flight together, so a wrapped id cannot collide.
+        let launch_id = self.next_bg_launch_id;
+        self.next_bg_launch_id = self.next_bg_launch_id.wrapping_add(1);
+        self.compose = None;
+        if let Some(draft) = self.draft.as_mut() {
+            draft.launch_id = Some(launch_id);
+        }
+        launch_id
+    }
+
+    /// The in-flight draft card reporting `launch_id`, or `None` when the pane has
+    /// moved on to something else.
+    ///
+    /// The launch twin of [`sending_to`](Self::sending_to), and load-bearing for
+    /// the same reason: a completion event says only that ONE dispatch finished,
+    /// never that whatever is on screen now belongs to it. The card outlives its
+    /// editor, so the surface underneath when the result lands may be a quick reply
+    /// (`Ctrl-R`) or a second draft — closing either would discard a typed buffer
+    /// the user never abandoned.
+    #[must_use]
+    pub fn launching_draft(&self, launch_id: u64) -> Option<&NewSessionDraft> {
+        self.draft
+            .as_ref()
+            .filter(|d| d.launch_id == Some(launch_id))
+    }
+
+    /// The in-flight quick-reply send targeting `session_id`, or `None` when no
+    /// send is in flight for that session. The preview's optimistic echo and its
+    /// banner-suppression both key off this so render and the click hit-test agree.
+    #[must_use]
+    pub fn sending_to(&self, session_id: &str) -> Option<&Sending> {
+        self.sending.as_ref().filter(|s| s.session_id == session_id)
     }
 
     /// Open the new-session agent picker over `agents` as a `List`-layout
@@ -1516,13 +1841,15 @@ impl App {
     /// and inserting it on a miss.
     ///
     /// A change in `inner_width` CLEARS the whole cache first: GFM tables
-    /// shrink-to-fit, so both the layout and the link-region columns depend on the
-    /// width (see `preview_cache`). `None` when nothing is selected or the selected
-    /// id is no longer among the loaded sessions. This is the single source both
-    /// [`preview_text`](Self::preview_text) and
-    /// [`preview_hit_context`](Self::preview_hit_context) read, so the text drawn
-    /// and the regions hit-tested can never come from different renders.
-    fn ensure_preview(&mut self, inner_width: u16) -> Option<&preview::RenderedPreview> {
+    /// shrink-to-fit, so the layout, the link-region columns AND the wrapped row
+    /// count all depend on the width (see `preview_cache`). `None` when nothing is
+    /// selected or the selected id is no longer among the loaded sessions. This is
+    /// the single source [`preview_text`](Self::preview_text),
+    /// [`preview_hit_context`](Self::preview_hit_context) and
+    /// [`preview_wrapped_rows`](Self::preview_wrapped_rows) read, so the text drawn,
+    /// the regions hit-tested and the height scrolled against can never come from
+    /// different renders.
+    fn ensure_preview(&mut self, inner_width: u16) -> Option<&CachedPreview> {
         if self.preview_width != Some(inner_width) {
             self.preview_cache.clear();
             self.preview_width = Some(inner_width);
@@ -1534,7 +1861,17 @@ impl App {
             // free-form background-job title never renders as a bogus handle.
             let known_agents: HashSet<&str> = self.agent_names.iter().map(String::as_str).collect();
             let rendered = preview::render(session, usize::from(inner_width), &known_agents);
-            self.preview_cache.insert(id.clone(), rendered);
+            // Measure ONCE, here, where the text and the width it was rendered for
+            // are both in hand — the wrapper walks every line, so a per-frame
+            // measurement would put a whole-transcript pass on the draw path.
+            let wrapped_rows = view::wrapped_text_rows(&rendered.text.lines, inner_width);
+            self.preview_cache.insert(
+                id.clone(),
+                CachedPreview {
+                    rendered,
+                    wrapped_rows,
+                },
+            );
         }
         self.preview_cache.get(&id)
     }
@@ -1546,24 +1883,44 @@ impl App {
     /// Empty `Text` when nothing is selected.
     pub fn preview_text(&mut self, inner_width: u16) -> Text<'static> {
         self.ensure_preview(inner_width)
-            .map(|p| p.text.clone())
+            .map(|p| p.rendered.text.clone())
             .unwrap_or_default()
     }
 
+    /// Screen rows the selected session's transcript occupies once WORD-wrapped at
+    /// `inner_width` — the transcript's true content height, which is what the
+    /// bottom anchor, the scroll clamp and the scrollbar are all derived from.
+    ///
+    /// Read off the SAME width-scoped cache the text is drawn from
+    /// ([`ensure_preview`](Self::ensure_preview)), measured there by
+    /// `view::wrapped_text_rows`, so the height can never describe a different render
+    /// than the one on screen. `0` when nothing is selected.
+    ///
+    /// It counts the TRANSCRIPT and nothing else. A pane showing something else —
+    /// the new-session draft card — or showing more than that — the optimistic tail
+    /// of an in-flight reply — measures the difference itself at the draw site, since
+    /// neither was ever in this cache.
+    pub fn preview_wrapped_rows(&mut self, inner_width: u16) -> usize {
+        self.ensure_preview(inner_width)
+            .map_or(0, |p| p.wrapped_rows)
+    }
+
     /// The wrapped-layout context needed to hit-test a mouse click into a preview
-    /// link: each content line's DISPLAY width (feeding the SAME wrap model the
-    /// scrollbar/`content_h` path uses, via `view::wrapped_line_height`) and the
-    /// clickable [`LinkRegion`](preview::LinkRegion)s — both pulled from the SAME
-    /// width-scoped cache the view drew from, so a hit-test can never disagree with
-    /// what is on screen. Empty when nothing is selected.
+    /// link: each content line's DISPLAY width (feeding the APPROXIMATE
+    /// character-packing model in `view::wrapped_line_height`, the hit-test's alone —
+    /// the transcript's height comes from
+    /// [`preview_wrapped_rows`](Self::preview_wrapped_rows)) and the clickable
+    /// [`LinkRegion`](preview::LinkRegion)s — both pulled from the SAME width-scoped
+    /// cache the view drew from, so a hit-test can never disagree with what is on
+    /// screen. Empty when nothing is selected.
     pub fn preview_hit_context(
         &mut self,
         inner_width: u16,
     ) -> (Vec<usize>, Vec<preview::LinkRegion>) {
         match self.ensure_preview(inner_width) {
             Some(p) => (
-                p.text.lines.iter().map(Line::width).collect(),
-                p.links.clone(),
+                p.rendered.text.lines.iter().map(Line::width).collect(),
+                p.rendered.links.clone(),
             ),
             None => (Vec::new(), Vec::new()),
         }
@@ -2237,6 +2594,92 @@ mod tests {
         );
     }
 
+    // --- preview cache: the wrapped height rides with the text it describes --
+
+    /// A session whose transcript is a checked-in fixture, so the cache has real
+    /// rendered turns to measure rather than an empty `Text` (a synthetic
+    /// [`session`] points at a `/tmp` path that does not exist, which renders to
+    /// nothing — every height below would be 0 and every assertion vacuous).
+    fn fixture_session(id: &str, folder: &str, file: &str) -> Session {
+        let mut s = session(id, "project", Some("main"), "/tmp/project");
+        s.file = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("store")
+            .join(folder)
+            .join(file);
+        s
+    }
+
+    /// The longer of the two fixture transcripts (a full four-turn session).
+    const LONG_FIXTURE: (&str, &str) = ("-Users-me-project-alpha", "sess-normal-1.jsonl");
+    /// The shorter one, so a reload can make a session visibly GROW.
+    const SHORT_FIXTURE: (&str, &str) = ("-Users-me-project-beta", "sess-nosummary-1.jsonl");
+
+    /// The cached row count always describes the cached text: same session, same
+    /// width, measured the same way the pane measures what it draws.
+    ///
+    /// This is the whole reason the count lives inside the cache entry instead of a
+    /// map beside it — the two cannot be invalidated apart.
+    #[test]
+    fn the_cached_preview_height_describes_the_cached_preview_text() {
+        let (folder, file) = LONG_FIXTURE;
+        let mut app = app_all(vec![fixture_session("s1", folder, file)]);
+        for width in [80u16, 40, 12] {
+            let text = app.preview_text(width);
+            assert_eq!(
+                app.preview_wrapped_rows(width),
+                view::wrapped_text_rows(&text.lines, width),
+                "the cached height must be the height of the cached text at {width}"
+            );
+        }
+    }
+
+    /// A width change RE-MEASURES the height rather than serving the one cached for
+    /// the old width — the same invalidation the text itself gets, since a narrower
+    /// pane both re-lays the text out and re-wraps it.
+    #[test]
+    fn a_width_change_remeasures_the_cached_preview_height() {
+        let (folder, file) = LONG_FIXTURE;
+        let mut app = app_all(vec![fixture_session("s1", folder, file)]);
+
+        let wide = app.preview_wrapped_rows(60);
+        let narrow = app.preview_wrapped_rows(12);
+        assert!(
+            narrow > wide,
+            "a narrower pane must wrap the same transcript into more rows \
+             (wide={wide}, narrow={narrow})"
+        );
+        assert_eq!(
+            app.preview_wrapped_rows(60),
+            wide,
+            "and widening back must return the wide answer, not a sticky one"
+        );
+    }
+
+    /// A reload DROPS the cached height with the text it was measured from.
+    ///
+    /// The transcript on disk grows while the board is open (that is what a live
+    /// agent does), so a height that outlived its reload would keep the pane's bottom
+    /// anchored to a session that is no longer there.
+    #[test]
+    fn a_reload_drops_the_cached_preview_height() {
+        let (short_folder, short_file) = SHORT_FIXTURE;
+        let (long_folder, long_file) = LONG_FIXTURE;
+        let mut app = app_all(vec![fixture_session("s1", short_folder, short_file)]);
+
+        let before = app.preview_wrapped_rows(40);
+        // The SAME session id, now backed by a longer transcript: the shape of a
+        // session that gained turns between reloads.
+        app.apply_sessions(vec![fixture_session("s1", long_folder, long_file)]);
+        let after = app.preview_wrapped_rows(40);
+        assert!(
+            after > before,
+            "a reloaded transcript must be re-measured, not answered from the \
+             pre-reload cache (before={before}, after={after})"
+        );
+    }
+
     // --- splitter drag: clamp math + state machine -------------------------
 
     #[test]
@@ -2415,6 +2858,56 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&here);
+    }
+
+    // --- pasted query text (the whole-string sibling of typing) ------------
+
+    /// A PASTED query re-filters the board, exactly as typing the same text
+    /// would.
+    ///
+    /// [`App::push_query_str`] exists to pay `set_query`'s pattern rebuild ONCE
+    /// for a whole paste instead of once per char, so what it owes is not "the
+    /// query string grew" but "the LIST narrowed to what the query matches" —
+    /// the same debt `push_query_char` settles above. Both calls below are
+    /// asserted, because appending re-filters too: a paste onto a non-empty
+    /// query must narrow again, not leave the previous result standing.
+    ///
+    /// The spaces are what a multi-line paste ARRIVES as here:
+    /// `update::flatten_for_query` has already turned `label\nalpha` into
+    /// `label alpha`, which `search::gate_atoms` splits into substring atoms
+    /// that must ALL match.
+    #[test]
+    fn pasting_query_text_refilters_the_board() {
+        let mut app = app_all(vec![
+            session_ts("alpha-one", "repo", Some("main"), "/tmp/a", 300),
+            session_ts("alpha-two", "repo", Some("main"), "/tmp/b", 200),
+            session_ts("bravo", "repo", Some("main"), "/tmp/c", 100),
+        ]);
+        assert_eq!(
+            visible_ids(&app),
+            vec!["alpha-one", "alpha-two", "bravo"],
+            "premise: an empty query shows every row, so the paste has something to cut"
+        );
+
+        // The flattened form of a pasted `label\nalpha`: every label carries
+        // `label`, only the two `alpha` rows carry both atoms.
+        app.push_query_str("label alpha");
+        assert_eq!(app.query, "label alpha");
+        assert_eq!(
+            visible_ids(&app),
+            vec!["alpha-one", "alpha-two"],
+            "both atoms gate the list: `bravo` matches `label` alone"
+        );
+
+        // A second paste APPENDS to the query — and re-filters the narrowed list
+        // again rather than freezing it.
+        app.push_query_str(" two");
+        assert_eq!(app.query, "label alpha two");
+        assert_eq!(
+            visible_ids(&app),
+            vec!["alpha-two"],
+            "the appended atom cuts `alpha-one`, which matches only the first two"
+        );
     }
 
     // --- grouping for render ----------------------------------------------
@@ -2748,6 +3241,44 @@ mod tests {
             app.modal.as_ref().unwrap().selected_action(),
             Some(&ModalAction::New(Some("beta".to_string()))),
             "the picker opens on the last-picked agent"
+        );
+    }
+
+    /// An IN-FLIGHT draft card counts as an active overlay even though the editor
+    /// has already closed and no keyboard owner is left.
+    ///
+    /// It owns the PANE: while the card is drawn the transcript is not, so the
+    /// cached link regions describe text no longer on screen and a click resolved
+    /// against them would open a link from a session the user cannot see. That
+    /// window is exactly the one the editor no longer covers.
+    #[test]
+    fn an_in_flight_draft_card_still_gates_the_mouse() {
+        let mut app = app_all(vec![session("s", "r", Some("main"), "/tmp/s")]);
+        app.open_compose(
+            super::super::compose::ComposeState::new_background(None),
+            Some(NewSessionDraft::default()),
+        );
+        let launch_id = app.dispatch_draft();
+        assert!(!app.is_composing(), "the editor is gone once dispatched");
+        assert!(
+            app.launching_draft(launch_id).is_some(),
+            "the card must be stamped with the id it was dispatched under, or the \
+             completion has nothing to match"
+        );
+        assert!(
+            app.overlay_active(),
+            "the card still owns the pane, so the mouse must stay gated"
+        );
+        app.begin_split_drag();
+        assert!(
+            !app.is_dragging_split(),
+            "a stray click over the card must not start a splitter drag"
+        );
+
+        app.close_compose();
+        assert!(
+            !app.overlay_active(),
+            "the board is back once the card closes"
         );
     }
 

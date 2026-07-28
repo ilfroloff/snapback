@@ -101,7 +101,10 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | `←` / `→` | **Fold** / **expand** a stack of look-alike rows that are really one conversation — a row marked `(+N)` stands for `N` more |
 | `Enter` | **Resume** the selected session, returning to the board when it exits. On a **running** session it opens an **Attach / Fork / Cancel** choice instead |
 | `Ctrl-F` | **Fork** the selected session into a copy — available for any session, running or not |
-| `Ctrl-N` | **Start a new session** in the launch directory; if you have Claude Code agents defined, pick one first (or `default (no agent)`) |
+| `Ctrl-N` | **Start a new session** in the launch directory; if you have Claude Code agents defined, pick one first (or `default (no agent)`). Then a **draft box** opens for the session's first message: `Enter` launches it with `claude --bg` and leaves you on the board, `Ctrl-O` runs it interactively instead, `Esc` cancels. Your message is sent as the session's first turn either way |
+| `Ctrl-O` (in that picker) | **Start the highlighted agent interactively at once**, skipping the draft — the same thing `Ctrl-O` means inside the draft box, so either route out of the picker is one keypress |
+| `Ctrl-R` | **Quick reply** — send a one-shot message to the selected session without leaving the board. A background agent whose run is over (`done`, `stopped`, `failed`) is stopped first so the reply lands in place; a waiting one (`needs input`) asks you to confirm that stop; one that is still live (`working`, `idle`, `interrupted`, or a state this version doesn't recognize) is left alone and refused. Opens a compose box (`Enter` sends, `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels) |
+| `Ctrl-K` | **Stop / interrupt** the selected session's live background agent (`claude stop`). An agent whose run is over (`done`, `stopped`, `failed`) stops immediately; every other live agent (`working`, `needs input`, `idle`, `interrupted`, unrecognized) confirms first, since stopping ends the live job (its conversation is kept). A session that isn't running as an agent has nothing to stop, and an interactive session running in another terminal can't be stopped from here |
 | `Ctrl-X` then `x` / `d` / `h` | **Leader chord** for hide & delete — `x` **hides** the selected session (reversible, persisted), `d` **hard-deletes** it after a confirmation, `h` toggles **show hidden**. Any other key cancels the chord |
 | `Tab` | Toggle search: **name-only ↔ name+content** |
 | `Ctrl-A` | Toggle scope: **current folder ↔ all folders** |
@@ -114,6 +117,7 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | click a preview link | Open its url in your browser |
 | `Backspace` | Delete the last query character |
 | any printable char | Type to search |
+| paste (`Cmd`/`Ctrl-V`, middle-click) | Your terminal's own paste, taken as **text**: into a compose or draft box at the cursor, **newlines intact** (no more sending just the first line); on the board, appended to the query with newlines as spaces. It never sends, resumes, or confirms |
 | `q` | **Quit** — while the query is empty; once you're typing, it's a search character |
 | `Esc` / `Ctrl-C` | Quit |
 
@@ -122,6 +126,25 @@ select/copy text natively, hold **Shift** (or **Option/⌥** on iTerm2 and macOS
 Terminal). The header shows the active scope, the search mode, and a
 `matched / total` count, with a version on the right — a release build shows the
 version number, a local dev build is marked as such.
+
+### Getting back to the board from inside a session
+
+Once you've resumed into a Claude Code session, the tidy ways back to snapback are
+slash commands you type in Claude, not a snapback key:
+
+- **`/bg`** — detaches the session so it keeps running as a background agent and
+  drops you straight back onto the board. It behaves the same whether you resumed
+  a regular session or attached to a running one, and the session reappears on the
+  list with a live `bg` badge — so you can Attach it, fork it, or stop it
+  (`Ctrl-K`). Quick reply (`Ctrl-R`) waits until its run is over: while the agent
+  is genuinely live, snapback refuses rather than interrupt it.
+- **`/exit`** — ends the session and returns you to the board.
+
+Prefer either over `Ctrl-Z` as a way out: it only detaches cleanly when you're
+*attached* to a background agent (Claude Code intercepts it). In a regular
+interactive session it's an OS suspend (`SIGTSTP`) that can hand the terminal back
+dirty — snapback repaints from a known-good state on return, but `/bg` (keep it
+running) and `/exit` (end it) are the clean exits.
 
 ---
 
@@ -152,12 +175,20 @@ off the list.
 - **gray, steady** — **interrupted**: a background agent Claude Code still lists
   as working even though it was stopped, so the badge holds still instead of
   pulsing as if a turn were in flight.
+- **dim gray, steady** — the agent has ended: it was stopped or its run failed.
+  The word beside the badge says which.
 
-The pulse is the tell for activity: only a genuinely working badge pulses, once a
-second, and only its dot — which fades between bright and dim rather than blinking
-out, so no text on the row ever moves or redraws and a busy board doesn't flicker.
-A steady gray badge is the interrupted one; the missing pulse is what sets it
-apart. Colors follow your terminal's theme.
+The pulse is the tell for activity, and it is the *first* thing to read — not the
+shade. Only a genuinely working badge pulses, once a second, and only its dot,
+which fades between the bright and the dim gray rather than blinking out, so no
+text on the row ever moves or redraws and a busy board doesn't flicker. That fade
+passes through exactly the dim gray an ended agent wears, so a glance at the dot
+alone can't tell a working agent from a finished one — but a working dot *moves*
+and the other two hold still. Two things keep it unambiguous: the word beside the
+badge never pulses, so it always shows the badge's real color; and once you can see
+a dot is steady, the shade separates the two at rest — the working gray is the
+interrupted one, the dimmer gray is a run that has ended. Colors follow your
+terminal's theme.
 
 Open the preview on a badged session and it leads with the same status in words,
 pinned above the transcript so it stays in view while the transcript scrolls
@@ -201,10 +232,62 @@ real session you can resume, and that matters: a session that's running in the
 background can't be plain-resumed, so the older copy is often the one that
 *will* open. It's one keypress away instead of lost in a row of twins.
 
-**Start a new session, with an agent.** `Ctrl-N` starts a fresh session in the
+**Hand an agent a job and stay put.** `Ctrl-N` starts a fresh session in the
 folder you launched from. If you keep Claude Code agents defined, it offers a
-quick picker so the new session can start bound to one, and it remembers your
-last pick for the session so a repeat is just `Ctrl-N`, `Enter`.
+quick picker so the new session can start bound to one, and it remembers the last
+agent you actually started so a repeat is just `Ctrl-N`, `Enter`, `Enter`.
+
+`Enter` on a pick — or `Ctrl-N` on its own, if you have no agents defined — opens
+a draft box rather than starting anything. The preview pane clears to a
+placeholder while you draft — which agent is about to run, the folder it will run
+in, and the keys you can press. Nothing else. That blankness is deliberate: the
+session doesn't exist yet, and a draft box floating over the last conversation you
+had open reads like a reply to *it*.
+
+Type what you want done and press `Enter`: snapback runs `claude --bg`, the agent
+starts working in the background, and you never leave the board — it shows up on
+the list a moment later with a live badge, ready to `Ctrl-K` stop or `Ctrl-R`
+reply to like any other.
+
+**Or take the terminal instead.** `Ctrl-O` runs the agent interactively, handing
+you the terminal as usual. It works from the draft box (if you change your mind
+mid-sentence, your draft comes along as the first turn) *and* straight from the
+picker, where it skips the draft entirely. So both ways out are a single
+keypress — the background one just happens to be the one `Enter` falls on now.
+
+One thing to know either way: your draft is sent as the session's **first turn**,
+immediately. Claude Code's CLI has no way to put text in the input box for you to
+edit before sending — the only mechanism it offers is passing the prompt on the
+command line, which submits it — so write it as the instruction you mean, not as
+a note to yourself. The status line then reports whether the agent started, and
+says so plainly if Claude Code had a complaint (an agent name it doesn't
+recognize, for instance, starts the session *without* that agent — snapback tells
+you rather than reporting a clean start).
+
+**Quick reply without leaving the board.** Sometimes you just want to ask
+yesterday's session a fast question. `Ctrl-R` opens a compose box for the selected
+session and sends your message with a one-shot `claude -p` — it replays the full
+context, appends the exchange in place, and the reply shows up in the preview, all
+while the board stays up. The box is a real multiline editor — arrows move the
+caret, long lines soft-wrap, and it grows from one line as you type (`Ctrl-J` or
+`Alt+Enter` for a newline, `Enter` to send). The moment you send, your message
+appears in the preview under a **you** turn, followed by a live **claude
+sending… / cooking…** placeholder — so the exchange reads normally while the reply
+is still in flight. The placeholder is replaced in place as `claude` writes the
+real turns, and the status line reports what the reply cost (or the reason if it
+fails).
+
+Background agents get special handling, because `claude` won't resume a session
+it's still holding as an agent. An agent whose run is **over** — `done`, or
+`stopped`/`failed` — is stopped first (its conversation is kept) so the reply can
+land in place. A **waiting** (`needs input`) agent asks you to confirm before it's
+stopped, since that abandons an agent that's still live. Anything still live is
+left alone and the reply is refused: `working`, `idle`, `interrupted`, or a state
+this version doesn't recognize — use Attach to answer it in its own channel, or
+Fork (`Ctrl-F`) to branch a copy. `interrupted` refuses on purpose even though it
+sits still: that badge is snapback's *inference* from Claude Code contradicting
+itself, not a report that the run ended, and it isn't worth stopping live work over
+a guess. Use `Ctrl-K` if you do want it stopped — it will ask first.
 
 **Hide & delete.** `Ctrl-X` is a leader chord for trimming the board: press it,
 and a hint shows the follow-ups — `x`, `d`, `h` — while any other key cancels.

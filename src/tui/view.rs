@@ -1,7 +1,11 @@
 //! View rendering.
 //!
 //! Draws the two-pane layout: a session list on the left, a readable transcript
-//! preview on the right, plus a header/help line and a search input line. In the
+//! preview on the right, plus a header/help line and a search input line. The
+//! right pane is not always a transcript: the compose editor docks into its
+//! bottom while composing, and a `Ctrl-N` background draft replaces the
+//! transcript outright with a placeholder card ([`draft_card`]), since the session
+//! it stands for does not exist yet. In the
 //! all-folders scope the list shows repo -> branch group heads (git-log-style
 //! folder head shown once per group); in the current-folder scope it is a flat,
 //! datestamp-led, newest-first list with no group heads. Every session row leads
@@ -9,10 +13,11 @@
 //! hand-written ANSI).
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
     ScrollbarState, Wrap,
@@ -22,9 +27,12 @@ use time::OffsetDateTime;
 
 use crate::agents::{self, AgentActivity, ReportedAgent};
 use crate::search::SearchMode;
-use crate::store::preview::LinkRegion;
+use crate::store::preview::{self, LinkRegion};
 
-use super::app::{resolve_list_width, App, Modal, ModalChoice, ModalLayout, Row, Scope};
+use super::app::{
+    resolve_list_width, App, Modal, ModalChoice, ModalLayout, NewSessionDraft, Row, Scope,
+};
+use super::compose::{ComposeState, ComposeTarget};
 
 /// Render the whole UI for one frame.
 ///
@@ -32,17 +40,46 @@ use super::app::{resolve_list_width, App, Modal, ModalChoice, ModalLayout, Row, 
 /// `ListState`) can be written back into the model, keeping scroll preserved
 /// across reloads, and so the preview text can be lazily rendered + cached.
 pub fn render(frame: &mut Frame, app: &mut App) {
-    // header (1) | body (fill) | search (1) | help (1)
-    let [header_area, body_area, search_area, help_area] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Fill(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .areas(frame.area());
+    let area = frame.area();
+    // A docked compose zone lives INSIDE the preview pane (no extra top-level row);
+    // only when the pane is too short does compose claim a full-width bottom bar
+    // between the body and the search line.
+    let (header_area, body_area, compose_bar, search_area, help_area) =
+        if compose_uses_bottom_bar(app.is_composing(), area.height) {
+            // header (1) | body (fill) | compose bar (grows with the draft) | search (1) | help (1)
+            let [header_area, body_area, compose_area, search_area, help_area] =
+                Layout::vertical([
+                    Constraint::Length(1),
+                    Constraint::Fill(1),
+                    Constraint::Length(compose_zone_height(app)),
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                ])
+                .areas(area);
+            (
+                header_area,
+                body_area,
+                Some(compose_area),
+                search_area,
+                help_area,
+            )
+        } else {
+            // header (1) | body (fill) | search (1) | help (1)
+            let [header_area, body_area, search_area, help_area] = Layout::vertical([
+                Constraint::Length(1),
+                Constraint::Fill(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .areas(area);
+            (header_area, body_area, None, search_area, help_area)
+        };
 
     render_header(frame, app, header_area);
     render_body(frame, app, body_area);
+    if let Some(compose_bar) = compose_bar {
+        render_compose_zone(frame, app, compose_bar);
+    }
     render_search(frame, app, search_area);
     render_help(frame, app, help_area);
     // A modal (the running-session choice or the new-session agent picker) sits
@@ -50,6 +87,16 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // so at most one ever draws — a fact made structural, not conventional.
     if let Some(modal) = &app.modal {
         render_modal(frame, modal);
+    }
+    // The "stop the waiting agent?" confirmation overlays the board before compose
+    // opens; likewise mutually exclusive with the other modals.
+    if app.pending_stop.is_some() {
+        render_stop_confirm(frame, app);
+    }
+    // The "stop this agent?" interrupt confirmation (Ctrl-K); mutually exclusive with
+    // the other modals (each owns the keyboard while open).
+    if app.pending_interrupt.is_some() {
+        render_interrupt_confirm(frame, app);
     }
 }
 
@@ -129,6 +176,24 @@ const BADGE_WORKING: Color = Color::Gray;
 /// `DarkGray` is the NAMED ANSI dim gray, so it reads as the same badge at lower
 /// intensity on any theme (TERMINAL-SAFE STYLING) rather than as a second state.
 const BADGE_WORKING_DIM: Color = Color::DarkGray;
+
+/// The badge color of the TERMINAL [`AgentActivity::Ended`] bucket — a background
+/// job claude reports as `stopped` or `failed`.
+///
+/// `DarkGray` reads as DORMANT: dim and quiet, so an ENDED job sits visibly below
+/// the live palette (yellow / green / working-gray) without claiming a state it no
+/// longer holds. It is DELIBERATELY not green — green is [`AgentActivity::Done`]'s
+/// "finished cleanly", and a stopped-or-failed job did not necessarily finish, so
+/// it must not read as ready.
+///
+/// STEADY, with NO pulse partner: [`crate::agents::is_active`] is false for
+/// `Ended`, so its dot never dims and [`pulse_color`] needs no arm for it (the
+/// identity fallback is correct here, and `Ended` being a RESTING bucket is exactly
+/// why `every_pulsing_buckets_badge_color_has_a_distinct_dim_partner` skips it).
+///
+/// A NAMED ANSI color, never RGB (TERMINAL-SAFE STYLING), so it adapts to the
+/// terminal theme and survives a light background.
+const BADGE_ENDED: Color = Color::DarkGray;
 
 /// The selection marker `List` draws at the left of the highlighted row.
 ///
@@ -230,6 +295,68 @@ const SCROLLBAR_ARROW_HIDDEN: &str = " ";
 /// single, never-wrapped line, so a taller reservation would only add dead
 /// space above the transcript and a shorter one would hide the banner outright.
 const PREVIEW_BANNER_ROWS: u16 = 1;
+
+/// The compose box starts at ONE visible text row and grows with the draft up to
+/// [`COMPOSE_MAX_TEXT_ROWS`]; the `TextArea` scrolls internally beyond that.
+const COMPOSE_MIN_TEXT_ROWS: u16 = 1;
+
+/// The tallest the compose box grows before it scrolls internally — capped so a
+/// long draft never swallows the transcript above a docked box.
+const COMPOSE_MAX_TEXT_ROWS: u16 = 6;
+
+/// The TALLEST the bordered compose zone can get: [`COMPOSE_MAX_TEXT_ROWS`] plus the
+/// block's top and bottom border. The dock decision reserves room for THIS (not the
+/// current height), so a box that grows as the user types never has to flip from
+/// docked to bottom-bar mid-draft.
+const COMPOSE_MAX_ZONE_HEIGHT: u16 = COMPOSE_MAX_TEXT_ROWS + 2;
+
+/// Transcript rows kept visible above a DOCKED compose zone. A preview pane that
+/// cannot spare this many (on top of the banner and a full-height compose zone)
+/// falls back to the full-width bottom bar rather than crushing the transcript.
+const COMPOSE_MIN_TRANSCRIPT_ROWS: u16 = 3;
+
+/// Minimum preview-pane INNER height (inside the block borders) to DOCK the compose
+/// zone in the preview: the pinned banner row, a usable slice of transcript, and a
+/// FULL-HEIGHT compose zone (using the max keeps the decision stable as the box
+/// grows). Below this, compose renders as a full-width bottom bar (see
+/// [`compose_uses_bottom_bar`]) so it is never squeezed against the transcript.
+const COMPOSE_MIN_DOCK_HEIGHT: u16 =
+    PREVIEW_BANNER_ROWS + COMPOSE_MIN_TRANSCRIPT_ROWS + COMPOSE_MAX_ZONE_HEIGHT;
+
+/// Board rows outside the body — the header, the search line, and the help line
+/// (one row each). Lets the compose-placement decision recover the preview pane's
+/// height from the whole board without threading laid-out rects into a pure
+/// function.
+const BOARD_CHROME_ROWS: u16 = 3;
+
+/// The compose box's CURRENT visible text-row count: the draft's own soft-wrapped
+/// height, clamped to `[COMPOSE_MIN_TEXT_ROWS, COMPOSE_MAX_TEXT_ROWS]`, so the box
+/// starts at one line and grows with the content up to the cap.
+///
+/// The row count is ASKED OF THE EDITOR
+/// ([`super::compose::ComposeState::screen_rows`]) rather than re-derived here, which
+/// is also why this takes no width: the widget already knows the width it was drawn
+/// at, so the docked box (inside the preview pane's border) and the full-width bottom
+/// bar cannot end up sized against different widths. The view deliberately does NOT
+/// reuse the transcript's measurement ([`wrapped_text_rows`]) for this: that asks a
+/// ratatui `Paragraph` how IT would wrap, and the editor is a different widget with
+/// its own wrap mode and tab expansion, so a shared answer would be a coincidence
+/// rather than a contract.
+fn compose_text_rows(app: &App) -> u16 {
+    let rows = app
+        .compose
+        .as_ref()
+        .map_or(0, super::compose::ComposeState::screen_rows);
+    u16::try_from(rows)
+        .unwrap_or(COMPOSE_MAX_TEXT_ROWS)
+        .clamp(COMPOSE_MIN_TEXT_ROWS, COMPOSE_MAX_TEXT_ROWS)
+}
+
+/// Total rows the bordered compose zone occupies: [`compose_text_rows`] plus the
+/// block's two borders.
+fn compose_zone_height(app: &App) -> u16 {
+    compose_text_rows(app) + 2
+}
 
 /// Build the header's version label from compile-time metadata.
 ///
@@ -688,10 +815,15 @@ pub(crate) fn badge_color(agent: &ReportedAgent) -> Color {
         // done has finished cleanly. Both are steady, so green never has to carry
         // the activity signal on its own.
         AgentActivity::Idle | AgentActivity::Done => Color::Green,
+        // A terminal (stopped/failed) job: dim and steady, and NOT green — it
+        // ended, so it must not read as a clean finish. See [`BADGE_ENDED`].
+        AgentActivity::Ended => BADGE_ENDED,
         // Gray is the working base, and the interrupted bucket shares it: it IS a
         // working `state`, only one claude's own `status` contradicts. It renders
         // the same gray but STEADY (see `is_active`), so the missing pulse — not a
         // second color — is what tells it apart from a genuinely churning agent.
+        // That is the split from `Ended` above: same rest, different cause, so it
+        // keeps the working gray instead of dimming to `BADGE_ENDED`.
         AgentActivity::Working | AgentActivity::WorkingButIdle | AgentActivity::Other => {
             BADGE_WORKING
         }
@@ -805,8 +937,32 @@ fn blink_visible(tick: u64) -> bool {
 /// view does — "does this session have a banner?" — and derive the same
 /// transcript rect via [`preview_split`]; the two must agree, or a click would
 /// resolve to the wrong transcript row.
+///
+/// An IN-FLIGHT quick-reply send takes precedence: while `App::sending` names the
+/// selected session there is NO pinned banner at all — this returns `None`, and
+/// the sending/cooking indicator renders INLINE at the transcript's tail instead
+/// ([`sending_tail`]), so the exchange reads as ordinary turns. Returning `None`
+/// is also what keeps the render and the click hit-test agreeing on the geometry.
 pub(crate) fn preview_banner(app: &App) -> Option<Line<'static>> {
-    let agent = app.reported_agent(app.selected.as_deref()?)?;
+    // A NEW-SESSION draft owns the pane: the card replaces the transcript, so the
+    // SELECTED session's status line has nothing left to sit above and would only
+    // describe a session the user is no longer looking at. The click hit-test asks
+    // THIS fn for the geometry, so returning `None` keeps render and hit-test
+    // agreeing that no banner row is reserved (same contract as the in-flight send
+    // below).
+    if app.draft.is_some() {
+        return None;
+    }
+    let selected = app.selected.as_deref()?;
+    // A quick-reply in flight owns the preview: the message and the
+    // sending/cooking indicator render INLINE at the transcript's tail
+    // ([`sending_tail`] / [`preview::pending_reply_turns`]), so there is no pinned
+    // banner row. The click hit-test asks THIS fn for the geometry, so returning
+    // `None` here keeps render and hit-test agreeing that no banner is drawn.
+    if app.sending_to(selected).is_some() {
+        return None;
+    }
+    let agent = app.reported_agent(selected)?;
     // Cyan + BOLD marks the line as the board speaking rather than transcript
     // content (the search prompt uses the same accent). NAMED so it adapts to
     // the terminal theme — no RGB (TERMINAL-SAFE STYLING).
@@ -818,10 +974,78 @@ pub(crate) fn preview_banner(app: &App) -> Option<Line<'static>> {
     )))
 }
 
+/// Braille spinner frames for the in-flight send indicator. Plain glyphs (no ANSI),
+/// consistent with the board's other unicode marks; one advances per redraw tick.
+const SPINNER_FRAMES: [&str; 10] = [
+    "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}", "\u{2827}",
+    "\u{2807}", "\u{280f}",
+];
+
+/// The spinner glyph for the current `tick` (advances ~every [`crate::watch::TICK`]).
+fn spinner_frame(tick: u64) -> &'static str {
+    SPINNER_FRAMES[(tick as usize) % SPINNER_FRAMES.len()]
+}
+
+/// The optimistic reply turns appended to the transcript of the CURRENTLY selected
+/// session while a quick-reply send to it is in flight, or `None` when no send is
+/// in flight for the selected row.
+///
+/// So the reply feels instant, the message you just sent shows immediately under a
+/// synthetic `▶ you` turn, followed by a live `● claude` "sending…/cooking…"
+/// placeholder — the same two phases the pinned banner once showed, now INLINE in
+/// the transcript flow (see [`preview::pending_reply_turns`]).
+///
+/// The `▶ you` echo is dropped the instant claude writes the REAL user turn to
+/// disk — detected by the session's turn count growing past the count captured at
+/// send time ([`super::app::Sending::baseline_msg_count`]) — so the real turn (which
+/// arrives via the ordinary watcher → reload path and is styled identically) simply
+/// takes its place, never doubling the line. The `● claude` placeholder stays until
+/// the send completes and [`App::sending`] is cleared.
+fn sending_tail(app: &App, inner_width: u16) -> Option<Vec<Line<'static>>> {
+    let selected = app.selected.as_deref()?;
+    let sending = app.sending_to(selected)?;
+    // Once claude has written the real user turn, the session's turn count exceeds
+    // the send-time baseline; until then, echo the message so it is visible during
+    // the disk-write latency.
+    let landed = app
+        .session_by_id(selected)
+        .is_some_and(|s| s.msg_count > sending.baseline_msg_count);
+    let echo = (!landed).then_some(sending.message.as_str());
+    // "sending…" until claude reports the session working, then "cooking…", so the
+    // two phases still read distinctly.
+    let cooking = app
+        .reported_agent(selected)
+        .is_some_and(|a| agents::classify(a) == AgentActivity::Working);
+    let phase = if cooking { "cooking" } else { "sending" };
+    let label = format!("{} {phase}\u{2026}", spinner_frame(app.tick));
+    Some(preview::pending_reply_turns(
+        echo,
+        &label,
+        usize::from(inner_width),
+    ))
+}
+
+/// The preview pane's INNER rect — inside the block's borders, which steal one cell
+/// per side (this mirrors `Block::inner` for `Borders::ALL`).
+///
+/// The ONE place the pane's border inset is applied, so every rect carved out of the
+/// pane — the banner row, the transcript, and the DOCKED compose zone — is measured
+/// from the same origin and the same width. That matters most for the compose zone:
+/// it is drawn INSIDE this rect and then draws a border of its OWN, so anything that
+/// re-derived its geometry from the pane's outer `area` would size it two columns too
+/// wide, and a wrapping draft would under-grow.
+fn preview_inner(area: Rect) -> Rect {
+    Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    }
+}
+
 /// Split the preview pane's `area` into its `(banner, transcript)` rects.
 ///
-/// The pane's inner area — inside the block's borders, which steal one cell per
-/// side (this mirrors `Block::inner` for `Borders::ALL`) — is divided into a
+/// The pane's inner area ([`preview_inner`]) is divided into a
 /// PINNED banner row and the scrolling transcript beneath it. `has_banner` is
 /// [`preview_banner`]`(..).is_some()`, i.e. "claude REPORTED the selected
 /// session as an agent" — NOT "the selected session is live". The two parted
@@ -850,12 +1074,7 @@ pub(crate) fn preview_banner(app: &App) -> Option<Line<'static>> {
 /// against the same transcript rect, so the scroll offset and the cached line
 /// widths are measured from the same origin the text was drawn at.
 pub(crate) fn preview_split(area: Rect, has_banner: bool) -> (Rect, Rect) {
-    let inner = Rect {
-        x: area.x.saturating_add(1),
-        y: area.y.saturating_add(1),
-        width: area.width.saturating_sub(2),
-        height: area.height.saturating_sub(2),
-    };
+    let inner = preview_inner(area);
     if !has_banner {
         return (Rect::default(), inner);
     }
@@ -873,6 +1092,203 @@ pub(crate) fn preview_split(area: Rect, has_banner: bool) -> (Rect, Rect) {
         ..inner
     };
     (banner, transcript)
+}
+
+/// The preview pane's INNER height for a board `board_height` rows tall, in the
+/// NORMAL (no bottom-bar) layout: the body is the board minus [`BOARD_CHROME_ROWS`],
+/// and the preview block steals two rows of border. Pure so the placement decision
+/// is unit-testable without laying out a frame.
+fn preview_pane_inner_height(board_height: u16) -> u16 {
+    board_height
+        .saturating_sub(BOARD_CHROME_ROWS)
+        .saturating_sub(2) // preview block top + bottom border
+}
+
+/// Whether the compose zone must render as a FULL-WIDTH BOTTOM BAR rather than
+/// docking in the preview pane — only when composing AND the preview pane is too
+/// short to hold the banner, a usable transcript, and the compose zone together
+/// ([`COMPOSE_MIN_DOCK_HEIGHT`]). Pure and unit-testable; the renderer's own dock
+/// check ([`render_preview`]) mirrors it against the (possibly shorter) pane area,
+/// so the two never disagree.
+fn compose_uses_bottom_bar(composing: bool, board_height: u16) -> bool {
+    composing && preview_pane_inner_height(board_height) < COMPOSE_MIN_DOCK_HEIGHT
+}
+
+/// Split the preview pane's `area` into `(banner, transcript, compose)` rects.
+///
+/// Reuses [`preview_split`] for the banner + transcript, then carves the bottom
+/// `compose_height` rows off the transcript for the docked compose zone.
+/// `compose_height == 0` means NOT docking: the compose rect is empty and the
+/// transcript is the full [`preview_split`] rect, so a non-composing pane is
+/// byte-identical to before this feature. Pure so the geometry is unit-testable.
+fn preview_compose_split(area: Rect, has_banner: bool, compose_height: u16) -> (Rect, Rect, Rect) {
+    let (banner, transcript) = preview_split(area, has_banner);
+    if compose_height == 0 {
+        return (banner, transcript, Rect::default());
+    }
+    // Degrade gracefully: `min` keeps the reservation inside the transcript, so a
+    // pane that only just clears the dock threshold collapses the transcript to
+    // zero rows rather than overlapping the two.
+    let compose_h = transcript.height.min(compose_height);
+    let shrunk = Rect {
+        height: transcript.height.saturating_sub(compose_h),
+        ..transcript
+    };
+    let compose = Rect {
+        y: shrunk.y.saturating_add(shrunk.height),
+        height: compose_h,
+        ..transcript
+    };
+    (banner, shrunk, compose)
+}
+
+/// The draft pane's title when the picked agent is the "default (no agent)" row —
+/// named rather than inlined so the one place that phrase appears is greppable
+/// against the picker row it mirrors.
+const BG_DRAFT_DEFAULT_AGENT: &str = "default agent";
+
+/// The draft card's headline prefix. Says "new session" rather than naming a row,
+/// because there is no row: the session does not exist yet.
+const DRAFT_CARD_HEADLINE: &str = "new session";
+
+/// The separator between the draft card's headline and the agent it will run as —
+/// the same middot the board uses between header facts, so the card reads as the
+/// board speaking rather than as transcript content.
+const DRAFT_CARD_SEPARATOR: &str = " \u{b7} ";
+
+/// The draft card's in-flight line, shown after `Enter` while `claude --bg` runs.
+/// Prefixed by the shared [`spinner_frame`], so it animates off the board's own
+/// tick — no second cadence (PATTERNS §7).
+const DRAFT_CARD_LAUNCHING: &str = "starting in the background\u{2026}";
+
+/// The compose hints of a BACKGROUND draft. One const, two surfaces: the help line
+/// ([`compose_hint`]) and the draft card, which must not restate them differently.
+///
+/// It deliberately does NOT carry the reply arm's "paste keeps newlines" clause,
+/// on COLUMN BUDGET alone — a pasted newline was every bit as destructive here (see
+/// [`compose_hint`] for the measurement). This string is already 97 columns, so on
+/// the one-line help row the clause would be painted past the end of an 80-column
+/// terminal, and on the draft card — which wraps rather than clipping — it would
+/// cost a further wrapped row of a placeholder whose whole point is to stay
+/// near-empty.
+const BG_DRAFT_HINT: &str = "Enter start in background · Ctrl-O run interactively · \
+                             Ctrl-J newline (or Alt+Enter) · Esc cancel";
+
+/// The draft card's agent segment: `@handle` for a picked agent, or the picker's
+/// own [`BG_DRAFT_DEFAULT_AGENT`] wording for its default row (a bare `@` would be
+/// a handle that does not exist). A blank/whitespace name degrades to the default
+/// rather than rendering an empty `@`. Pure so the wording is unit-testable.
+fn draft_agent_label(agent: Option<&str>) -> String {
+    match agent.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(name) => format!("@{name}"),
+        None => BG_DRAFT_DEFAULT_AGENT.to_string(),
+    }
+}
+
+/// The PLACEHOLDER card the preview pane shows while a new-session draft is open,
+/// in place of the selected session's transcript.
+///
+/// It is deliberately near-EMPTY, and that is the whole point: it stands for a
+/// session that does not exist yet, so anything resembling a conversation would be
+/// a lie. Three facts and nothing else — what is being started, WHERE it will run
+/// (the launch dir is the one thing a new session commits to that the user cannot
+/// otherwise see), and the keys that act on it. Once dispatched, the key hints give
+/// way to the in-flight line, since none of those keys still apply.
+///
+/// Pure (`(&NewSessionDraft, &Path, tick) -> Vec<Line>`), so the card's content is
+/// assertable without a terminal. Styled with NAMED colors + modifiers only
+/// (TERMINAL-SAFE STYLING).
+fn draft_card(draft: &NewSessionDraft, launch_dir: &Path, tick: u64) -> Vec<Line<'static>> {
+    let headline = Line::from(vec![
+        Span::styled(
+            DRAFT_CARD_HEADLINE,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(DRAFT_CARD_SEPARATOR),
+        Span::styled(
+            draft_agent_label(draft.agent.as_deref()),
+            Style::default().fg(Color::Green),
+        ),
+    ]);
+    let dir = Line::from(Span::styled(
+        launch_dir.to_string_lossy().into_owned(),
+        Style::default().add_modifier(Modifier::DIM),
+    ));
+    let tail = if draft.is_launching() {
+        Line::from(Span::styled(
+            format!("{} {DRAFT_CARD_LAUNCHING}", spinner_frame(tick)),
+            Style::default().fg(Color::Yellow),
+        ))
+    } else {
+        Line::from(Span::styled(
+            BG_DRAFT_HINT,
+            Style::default().add_modifier(Modifier::DIM),
+        ))
+    };
+    vec![headline, dir, Line::default(), tail]
+}
+
+/// The compose zone's block title for the open draft.
+///
+/// A REPLY names the TARGET session's label, so the recipient is unambiguous even
+/// if the previewed row was scrolled away from it; stop-then-reply mode (a held bg
+/// agent) says so, since sending stops the agent first and the title must never
+/// imply a plain in-place reply. A BACKGROUND draft names the picked agent instead
+/// — there is no session yet to name — and says "background", because `Enter`
+/// there starts an agent rather than answering one.
+///
+/// Pure (a `(&App, &ComposeState) -> String` map) so the wording is assertable
+/// without a terminal.
+fn compose_title(app: &App, compose: &ComposeState) -> String {
+    match &compose.target {
+        ComposeTarget::Reply {
+            session_id,
+            stop_job,
+        } => {
+            let label = app
+                .session_by_id(session_id)
+                .map(|s| s.label.as_str())
+                .filter(|l| !l.is_empty())
+                .unwrap_or(session_id.as_str());
+            if stop_job.is_some() {
+                format!(" stop & reply to {label} ")
+            } else {
+                format!(" reply to {label} ")
+            }
+        }
+        ComposeTarget::NewBackgroundAgent { agent } => {
+            let name = agent
+                .as_deref()
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .unwrap_or(BG_DRAFT_DEFAULT_AGENT);
+            format!(" new background agent: {name} ")
+        }
+    }
+}
+
+/// Render the compose zone (a bordered multiline editor) into `area`, titled by
+/// [`compose_title`] for whichever draft is open.
+///
+/// Styled ONLY with ratatui `Style` + NAMED colors (TERMINAL-SAFE STYLING): the
+/// cyan border marks the box as the board speaking, like the search prompt and the
+/// status banner. The `TextArea` widget draws its own buffer and cursor into the
+/// block's inner rect — the one place a `ratatui_textarea` value is rendered,
+/// mirroring how it is the one place one is edited (see [`super::compose`]).
+fn render_compose_zone(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(compose) = &app.compose else {
+        return;
+    };
+    let title = compose_title(app, compose);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(&compose.textarea, inner);
 }
 
 /// The readable transcript preview for the selected session, vertically
@@ -906,7 +1322,23 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     // bottom-anchored viewport cannot scroll it away. A session claude never
     // reported reserves no row and renders unchanged.
     let banner = preview_banner(app);
-    let (banner_area, transcript_area) = preview_split(area, banner.is_some());
+    // Dock the compose zone in the bottom of the pane when composing AND the pane
+    // is tall enough; otherwise `render` gave compose a full-width bottom bar and
+    // the transcript keeps the whole pane. Mirrors `compose_uses_bottom_bar`,
+    // evaluated against THIS pane's height (which is already the shorter body in the
+    // bottom-bar layout, so the two agree).
+    let dock_compose = app.is_composing() && preview_inner(area).height >= COMPOSE_MIN_DOCK_HEIGHT;
+    // The docked zone grows with the draft (0 = not docking). Its WIDTH is not a
+    // parameter here: `preview_compose_split` carves it out of `preview_inner`, and
+    // the box's height is read off the editor itself, which knows the width it was
+    // last drawn at — so there is no second width to get wrong.
+    let compose_h = if dock_compose {
+        compose_zone_height(app)
+    } else {
+        0
+    };
+    let (banner_area, transcript_area, compose_area) =
+        preview_compose_split(area, banner.is_some(), compose_h);
     // The transcript's width is also the table shrink-to-fit budget, so it must
     // be resolved BEFORE rendering the preview text (which fits GFM tables to
     // it). The banner split is vertical only, so this width — and therefore the
@@ -914,13 +1346,55 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     let inner_width = transcript_area.width;
     let inner_height = transcript_area.height;
 
-    let text = app.preview_text(inner_width);
+    // A NEW-SESSION draft REPLACES the transcript with a placeholder card. This is
+    // the whole separation `App::draft` exists for: the pane asks the draft what to
+    // show and never inspects the compose target, so a docked compose box is never
+    // drawn over an unrelated conversation (which reads as a reply to it). It also
+    // outlives the editor for one in-flight launch, which is why the card — not
+    // `is_composing` — is what this branches on.
+    let card = app
+        .draft
+        .as_ref()
+        .map(|draft| draft_card(draft, &app.launch_dir, app.tick));
+    let showing_card = card.is_some();
+
+    // Optimistic reply turns for an in-flight send, resolved BEFORE the mutable
+    // preview borrow so the message you just sent shows immediately at the tail.
+    // Suppressed under a card: the echo belongs to the SELECTED session's
+    // transcript, which is not what the pane is showing.
+    let reply_tail = if card.is_some() {
+        None
+    } else {
+        sending_tail(app, inner_width)
+    };
+    // The tail is measured HERE, before it is folded into the transcript below,
+    // because the cached transcript height knows nothing about it: the echo turns
+    // exist only for the seconds a send is in flight and were never in the cache.
+    // Adding the two counts is exact — `WordWrapper` wraps each logical line on its
+    // own and never joins two of them onto one row, so a wrapped row count is
+    // additive over lines.
+    let tail_rows = reply_tail
+        .as_ref()
+        .map_or(0, |tail| wrapped_text_rows(tail, inner_width));
+    // A send in flight for the selected row also FOLLOWS the bottom, so the echo —
+    // and then the real turns as they land — stay in view without a manual scroll.
+    // The card anchors to the TOP instead: it is short, and its headline is the
+    // first thing to read.
+    let follow_bottom = card.is_none() && (app.preview_follow_bottom || reply_tail.is_some());
+
+    let mut text = match card {
+        Some(lines) => Text::from(lines),
+        None => app.preview_text(inner_width),
+    };
+    if let Some(tail) = reply_tail {
+        text.lines.extend(tail);
+    }
     // Nothing selected (no text AND no banner, since a banner implies a SELECTED
     // session claude reported). A reported session whose transcript is still
     // empty falls through instead: its banner is the one thing worth drawing, and
     // keeping the banner unconditional is what lets the hit-test below derive the
     // same geometry from `banner.is_some()` alone.
-    if text.lines.is_empty() && banner.is_none() {
+    if text.lines.is_empty() && banner.is_none() && !dock_compose {
         // Keep the scroll bookkeeping sane and still record the viewport height
         // so a later selection can size a page.
         app.preview_viewport_h = inner_height;
@@ -947,17 +1421,36 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.render_widget(Paragraph::new(banner), banner_area);
     }
 
-    // The wrapped height sums each styled line's display width (via `Line::width`).
-    let content_h = wrapped_rows(text.lines.iter().map(Line::width), inner_width);
-    let offset = clamp_preview_offset(
-        app.preview_follow_bottom,
-        app.preview_scroll,
-        content_h,
-        inner_height,
-    );
+    // The wrapped height of what this pane is ACTUALLY showing, measured with the
+    // same word wrapper the `Paragraph` below draws with (see `wrapped_text_rows`).
+    // The transcript's own count is CACHED per session at this width, since
+    // re-wrapping a whole transcript every frame is not free; the two things that are
+    // NOT that cached transcript are measured fresh, and both would otherwise be
+    // MIS-counted:
+    //   - a draft CARD replaces the transcript outright, so the cached count would
+    //     describe text that is not on screen — and being far too tall, it would let
+    //     a leftover scroll offset survive the clamp and push the short card out of
+    //     view entirely;
+    //   - an in-flight reply TAIL is appended after the cache was filled, so the
+    //     cached count alone under-counts it (`tail_rows`, resolved above).
+    let content_h = if showing_card {
+        wrapped_text_rows(&text.lines, inner_width)
+    } else {
+        app.preview_wrapped_rows(inner_width) + tail_rows
+    };
+    let offset = clamp_preview_offset(follow_bottom, app.preview_scroll, content_h, inner_height);
     // Persist the resolved geometry so the scroll keys stay in bounds and can
-    // size a page on the next keypress.
-    app.preview_scroll = offset;
+    // size a page on the next keypress — EXCEPT under a draft card, which is not
+    // the transcript that offset describes. The card is a handful of lines, so on
+    // any ordinary pane it clamps every offset to 0; writing that back would rewind
+    // the session behind the draft to the top and hand it back there when the draft
+    // is cancelled, losing the position the user was reading. The card still RENDERS
+    // from `offset` — measured against the CARD (see `content_h` above), so it is 0
+    // unless the card itself overflows a very narrow pane — only the write-back is
+    // skipped, so `preview_scroll` keeps describing the transcript throughout.
+    if !showing_card {
+        app.preview_scroll = offset;
+    }
     app.preview_viewport_h = inner_height;
 
     frame.render_widget(
@@ -1032,35 +1525,87 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
             &mut scrollbar_state,
         );
     }
+
+    // A DOCKED compose zone occupies the bottom rows the transcript was shrunk away
+    // from (see `preview_compose_split`); the full-width bottom-bar fallback is
+    // drawn by `render` instead, so this only fires when `dock_compose`.
+    if dock_compose {
+        render_compose_zone(frame, app, compose_area);
+    }
 }
 
-/// WRAPPED row count of ONE logical line of display `width` at `inner_width`,
-/// matching `Wrap { trim: false }`: `ceil(width / inner_width)`, and at least one
-/// row (a blank line still takes a row). The SINGLE wrap-height model shared by
-/// the scrollbar/content-height path ([`wrapped_rows`]) and mouse link
-/// hit-testing ([`visual_to_content`] / [`link_at`]), so the two can never
-/// disagree about where a content line lands on screen.
+/// The transcript's REAL wrapped height: how many screen rows `lines` occupy once
+/// `Wrap { trim: false }` has wrapped them at `inner_width`.
+///
+/// ASKED OF THE WIDGET, never modeled here. `Paragraph::line_count` runs the very
+/// same `WordWrapper` that `Paragraph::render` runs, so this cannot drift from what
+/// is painted; `ratatui_widgets::reflow` is a private module, so that accessor is the
+/// only way to reach the wrapper (hence the crate's `unstable-rendered-line-info`
+/// feature — see Cargo.toml).
+///
+/// The alternative — a character-packing `ceil(width / inner)` count
+/// ([`wrapped_line_height`]) — is not an approximation with a safe direction, it is a
+/// DIFFERENT function, wrong BOTH ways and user-visibly so, since `max_offset` is
+/// derived from whatever this returns:
+///
+/// - it UNDER-counts wherever a row ends early at a word boundary (ordinary prose:
+///   `alpha bravo charlie delta` packs to 3 rows at width 10, wraps to 4), and a
+///   short `max_offset` makes the tail of a long transcript unreachable — "follow
+///   bottom" stops short of the newest turn and the thumb never reaches the track's
+///   end;
+/// - it OVER-counts wherever the wrapper swallows the whitespace it broke on (the
+///   checked-in `sess-normal-1` fixture packs to 223 rows at inner width 1 against
+///   187 painted), and a long `max_offset` scrolls the pane off the end of its own
+///   content into blank rows.
+///
+/// NO BLOCK is set on the measured paragraph, deliberately: `line_count` adds
+/// `Block::vertical_space` when one is, and the preview's border is drawn in a
+/// SEPARATE pass over its own rect (see [`render_preview`]), so a block here would
+/// count those two rows twice.
+///
+/// Re-running the wrapper over a whole transcript is not free, so the result is
+/// CACHED per session at the pane width by [`App::preview_wrapped_rows`]; only the
+/// short things that are NOT the cached transcript (a draft card, an in-flight reply
+/// tail) are measured per frame. The clone is what `Paragraph` needs to own its text
+/// and is far cheaper than the per-frame `preview_text` clone already on the draw
+/// path.
+pub(crate) fn wrapped_text_rows(lines: &[Line<'_>], inner_width: u16) -> usize {
+    Paragraph::new(Text::from(lines.to_vec()))
+        .wrap(Wrap { trim: false })
+        .line_count(inner_width)
+}
+
+/// APPROXIMATE wrapped row count of ONE logical line of display `width` at
+/// `inner_width`: `ceil(width / inner_width)`, and at least one row (a blank line
+/// still takes a row).
+///
+/// This is a CHARACTER-PACKING model and `Wrap { trim: false }` is WORD wrapping, so
+/// the two agree only while no line has to break inside a row — and where they part
+/// they part in EITHER direction (a row ending early at a word boundary costs a row
+/// this misses; whitespace swallowed at a break saves one this still charges for).
+/// Mouse link hit-testing ([`visual_to_content`] / [`link_at`]) is its only remaining
+/// caller, and it keeps the model for one reason: the wrapper itself is unreachable
+/// (`ratatui_widgets::reflow` is private) and `Paragraph::line_count` answers only a
+/// TOTAL, never the per-line map a hit-test needs. The drift that implies is real and
+/// confined to wrapped lines: a click below one can resolve to the wrong content line
+/// — off by however many rows the two models disagree about above it — so a link may
+/// open from a neighbouring line or miss. Every line that fits `inner_width` (the
+/// common case) is EXACT.
+///
+/// The transcript's own height does NOT come from here — see [`wrapped_text_rows`] —
+/// and neither does the compose box's, which word-wraps and is measured by asking the
+/// editor (see [`compose_text_rows`]).
 fn wrapped_line_height(width: usize, inner_width: u16) -> usize {
     // Guard a zero-width viewport (degenerate layout) so we never divide by zero.
     let inner = usize::from(inner_width.max(1));
     width.div_ceil(inner).max(1)
 }
 
-/// Total WRAPPED row count for a set of per-line display widths at `inner_width`.
-/// Sums [`wrapped_line_height`] over every line. Pure so the bottom-anchor math is
-/// unit-testable without a terminal.
-fn wrapped_rows<I: IntoIterator<Item = usize>>(line_widths: I, inner_width: u16) -> usize {
-    line_widths
-        .into_iter()
-        .map(|w| wrapped_line_height(w, inner_width))
-        .sum()
-}
-
 /// Map a `visual_row` (rows from the top of the wrapped content) to the
 /// `(content_row, sub_row)` it lands on — which logical line, and which wrapped
-/// sub-row within that line — using the SAME [`wrapped_line_height`] model as the
-/// scrollbar. `None` when the visual row is past the end of the content. Pure so
-/// the mapping is unit-testable from widths alone.
+/// sub-row within that line — using the APPROXIMATE [`wrapped_line_height`] model.
+/// `None` when the visual row is past the end of the content. Pure so the mapping is
+/// unit-testable from widths alone.
 fn visual_to_content(
     line_widths: &[usize],
     inner_width: u16,
@@ -1090,10 +1635,19 @@ fn visual_to_content(
 /// Because a region spans the label's full content-column range, a link that
 /// SOFT-WRAPS across visual rows is hit on ANY of its wrapped segments for free
 /// (each segment's cells map back into the same content-column range) — no special
-/// case. v1: the char-wrap column model is EXACT for any link on a line that fits
-/// the inner width (the common case; no wrapping there); for a link on a
-/// soft-wrapped line it uses the same ceil model the scrollbar does, so
-/// hit-testing never diverges from the MEASURED layout. Pure and terminal-free.
+/// case.
+///
+/// The row mapping is an APPROXIMATION, and knowingly so: it packs characters
+/// ([`wrapped_line_height`]) while the pane word-wraps, so once a line above the
+/// click has broken at a word boundary the two disagree and the click can resolve to
+/// the WRONG content line — opening a neighbouring line's link, or none. Exact for
+/// every line that fits the inner width, which is the common case. It stays an
+/// approximation because the real wrapper (`ratatui_widgets::reflow::WordWrapper`) is
+/// private and the one public accessor over it, `Paragraph::line_count`, returns a
+/// total rather than the per-line map this needs — closing the gap would mean
+/// reimplementing the wrapper, which would be a SECOND model to drift. The
+/// transcript's HEIGHT does not share this compromise: it is measured exactly (see
+/// [`wrapped_text_rows`]). Pure and terminal-free.
 pub(crate) fn link_at<'a>(
     col: u16,
     row: u16,
@@ -1227,8 +1781,45 @@ fn chord_hint(selected_hidden: bool) -> String {
     format!("^X  x {x} · d delete · h show/hide hidden · Esc cancel")
 }
 
+/// The compose zone's key hints, per open draft. Pure so the wording is assertable
+/// without a terminal.
+///
+/// The background draft's `Ctrl-O` hint is worded "run interactively" and NOTHING
+/// more, deliberately. The prompt reaches claude as a trailing positional and
+/// AUTO-SUBMITS as the first turn — no pre-fill mechanism exists (see
+/// [`crate::resume::build_new_argv`]) — so any wording that hinted at reviewing or
+/// editing the draft inside claude would promise something the CLI cannot do.
+///
+/// "paste keeps newlines" names no key on purpose: the terminal's own paste is not
+/// a snapback binding (there is no `Ctrl-V`), so caret notation here would advertise
+/// one that does not exist. The line states what a paste DOES rather than reassuring
+/// that it is allowed.
+///
+/// It rides the REPLY arm ONLY, and NOT because the reply box is the only one a
+/// pasted newline used to break — it is not.
+/// [`compose_key_to_action`](crate::tui::compose::compose_key_to_action) is SHARED
+/// by both targets and maps a bare `Enter` to Send, so the same paste that sent a
+/// truncated reply launched a background agent on the draft's first line. The split
+/// is COLUMN BUDGET alone, measured with the `unicode-width` the renderer counts in:
+/// the help row is ONE line that never wraps, the reply hint is 55 columns and the
+/// clause 23, so it lands at 78 and still fits an 80-column terminal, while
+/// [`BG_DRAFT_HINT`] is already 97 there (`Esc cancel` starts at column 88, off
+/// screen) and the clause would be painted at columns 98-120 — nowhere. What a paste
+/// does is documented in full where there is room for it: `KEYS` in `cli.rs` and the
+/// README key map.
+fn compose_hint(target: &ComposeTarget) -> &'static str {
+    match target {
+        ComposeTarget::Reply { .. } => {
+            "Enter send · Ctrl-J newline (or Alt+Enter) · paste keeps newlines · Esc cancel"
+        }
+        // The SAME const the draft card shows, so the two surfaces cannot describe
+        // the same keys differently.
+        ComposeTarget::NewBackgroundAgent { .. } => BG_DRAFT_HINT,
+    }
+}
+
 /// The bottom help line: the keybinding cheat sheet, a transient board status
-/// (e.g. a resume refusal) when one is set, or the [`CHORD_HINT`] while a `Ctrl-X`
+/// (e.g. a resume refusal) when one is set, or the [`chord_hint`] while a `Ctrl-X`
 /// leader chord is pending. A status wins over the cheat sheet and is flattened to
 /// a single row (newlines -> spaces) since the help area is 1 tall; the chord hint
 /// wins over both, since the chord owns the keyboard the moment it is armed.
@@ -1250,20 +1841,38 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(Paragraph::new(hint), area);
         return;
     }
-    let line = match &app.status {
-        Some(status) => {
-            let flat = status.split_whitespace().collect::<Vec<_>>().join(" ");
-            Line::from(vec![Span::styled(
-                flat,
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )])
-        }
-        None => Line::from(vec![Span::styled(
-            "↑↓/jk move · ←/→ fold/expand · Enter resume · ^F fork · ^N new · ^X hide/del · type to search · Tab name/content · ^A scope · ^/ preview · PgUp/PgDn·^U/^D·Home/End·wheel scroll · q/Esc quit",
+    let line = if let Some(status) = &app.status {
+        // A transient status (a refusal, or a send's "sending…" / cost / error)
+        // wins the line, flattened to a single row.
+        let flat = status.split_whitespace().collect::<Vec<_>>().join(" ");
+        Line::from(vec![Span::styled(
+            flat,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )])
+    } else if let Some(compose) = &app.compose {
+        // The compose zone owns the keyboard: show its chords instead of the board
+        // keymap. Ctrl-J is the primary newline; Alt+Enter the guaranteed fallback.
+        Line::from(vec![Span::styled(
+            compose_hint(&compose.target),
             Style::default().add_modifier(Modifier::DIM),
-        )]),
+        )])
+    } else {
+        // The board keymap — one of the four surfaces AGENTS.md's KEEP KEY DOCS IN
+        // SYNC names. It does NOT mention the terminal's paste, on COLUMN BUDGET:
+        // this line is already 210 columns (measured with the `unicode-width` the
+        // renderer counts in) against a help row that is ONE line and never wraps, so
+        // on an 80-column terminal it is cut mid-`^K stop` and everything from
+        // `^X hide/del` (column 87) rightward is already unpainted. A 23-column
+        // "paste keeps newlines" clause would land at columns 211-233 — nowhere, on
+        // any realistic width. What a board paste DOES (append to the query with
+        // newlines flattened to spaces, and never resume) is documented where there
+        // is room to say it: `KEYS` in `cli.rs` and the README key map.
+        Line::from(vec![Span::styled(
+            "↑↓/jk move · ←/→ fold/expand · Enter resume · ^F fork · ^N new · ^R reply · ^K stop · ^X hide/del · type to search · Tab name/content · ^A scope · ^/ preview · PgUp/PgDn·^U/^D·Home/End·wheel scroll · q/Esc quit",
+            Style::default().add_modifier(Modifier::DIM),
+        )])
     };
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -1316,6 +1925,110 @@ fn wrap_message(text: &str, width: u16) -> Vec<String> {
     lines
 }
 
+/// The "stop the waiting agent?" confirmation overlay, shown when `Ctrl-R` targets
+/// a `needs input` background agent. Confirming stops the waiting agent (ending its
+/// live job, conversation kept) so the reply can land in place; the two moves are
+/// spelled out because stopping is not free.
+///
+/// Drawn last (on top of the board) with a [`Clear`]. Pure presentation — the
+/// target session and the job id live on [`App::pending_stop`]; styled with named
+/// colors only (TERMINAL-SAFE STYLING).
+fn render_stop_confirm(frame: &mut Frame, app: &App) {
+    let Some(pending) = &app.pending_stop else {
+        return;
+    };
+    let label = app
+        .session_by_id(&pending.session_id)
+        .map(|s| s.label.as_str())
+        .filter(|l| !l.is_empty())
+        .unwrap_or(pending.session_id.as_str());
+    let area = centered_rect(frame.area(), 64, 8);
+
+    let lines = vec![
+        Line::from(Span::styled(
+            "This session is a waiting agent.",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::raw(format!(
+            "Stop it and reply in place?  —  {label}"
+        ))),
+        Line::from(Span::styled(
+            "(ends the live agent; its conversation is kept)",
+            Style::default().add_modifier(Modifier::DIM),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Enter  stop & reply    \u{b7}    Esc  cancel",
+            Style::default().add_modifier(Modifier::DIM),
+        )),
+    ];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" stop the waiting agent? ");
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .alignment(Alignment::Center),
+        area,
+    );
+}
+
+/// The "stop this agent?" interrupt confirmation overlay, shown when `Ctrl-K`
+/// targets a live, not-yet-finished agent. Confirming runs `claude stop <job-id>`,
+/// ending the live job (its conversation is kept) — an interrupt, so the wording
+/// says nothing about a reply, unlike [`render_stop_confirm`].
+///
+/// Drawn last (on top of the board) with a [`Clear`]. Pure presentation — the target
+/// session and the job id live on [`App::pending_interrupt`]; styled with named
+/// colors only (TERMINAL-SAFE STYLING).
+fn render_interrupt_confirm(frame: &mut Frame, app: &App) {
+    let Some(pending) = &app.pending_interrupt else {
+        return;
+    };
+    let label = app
+        .session_by_id(&pending.session_id)
+        .map(|s| s.label.as_str())
+        .filter(|l| !l.is_empty())
+        .unwrap_or(pending.session_id.as_str());
+    let area = centered_rect(frame.area(), 64, 8);
+
+    let lines = vec![
+        Line::from(Span::styled(
+            "This session is running as an agent.",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::raw(format!("Stop it?  —  {label}"))),
+        Line::from(Span::styled(
+            "(ends the live agent; its conversation is kept)",
+            Style::default().add_modifier(Modifier::DIM),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Enter  stop    \u{b7}    Esc  cancel",
+            Style::default().add_modifier(Modifier::DIM),
+        )),
+    ];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" stop this agent? ");
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .alignment(Alignment::Center),
+        area,
+    );
+}
+
 /// The generic modal overlay: a centered bordered box with a title, a message, its
 /// choices (a `Row` button strip or a vertical `List`), and a footer help line.
 ///
@@ -1325,14 +2038,20 @@ fn wrap_message(text: &str, width: u16) -> Vec<String> {
 /// colors + modifiers only (terminal-safe). The message accent and footer are
 /// derived from the layout, preserving each overlay's original chrome: a `Row`
 /// reads as a warning/confirm (`Yellow`, `←/→ … Enter confirm`, centered), a
-/// `List` as a picker (`Cyan`, `↑/↓ … Enter start`, left-aligned).
+/// `List` as a picker (`Cyan`, `↑/↓ … Enter draft`, left-aligned).
 fn render_modal(frame: &mut Frame, modal: &Modal) {
     let (accent, footer) = match modal.layout {
         ModalLayout::Row => (
             Color::Yellow,
             "\u{2190}/\u{2192} choose \u{b7} Enter confirm \u{b7} Esc cancel",
         ),
-        ModalLayout::List => (Color::Cyan, "↑/↓ choose · Enter start · Esc cancel"),
+        // The picker has TWO verbs, so its footer names both: Enter drafts the
+        // session's first message (staying on the board), Ctrl-O starts the agent
+        // interactively at once (leaving it). One key each — neither is buried.
+        ModalLayout::List => (
+            Color::Cyan,
+            "↑/↓ choose · Enter draft · ^O interactive · Esc cancel",
+        ),
     };
 
     // Wrap the message to the box's inner width (borders excluded) so a long prompt
@@ -1656,24 +2375,157 @@ mod tests {
 
     // --- preview wrapped-height math --------------------------------------
 
-    #[test]
-    fn wrapped_rows_counts_each_line_ceil_over_inner_width() {
-        // 10 -> ceil(10/8)=2, empty(0) -> 1, 25 -> ceil(25/8)=4  => 7 rows.
-        assert_eq!(wrapped_rows([10usize, 0, 25], 8), 7);
+    /// The width every measurement case below is wrapped at. Narrow enough that
+    /// ordinary words have to break across rows, which is where the two candidate
+    /// models part company.
+    const MEASURE_WIDTH: u16 = 10;
+    /// Rows the scratch buffer in [`painted_rows`] offers. Comfortably more than any
+    /// case needs, so a model that OVER-counts is caught by the comparison rather
+    /// than silently clipped by the buffer.
+    const MEASURE_ROWS: u16 = 40;
+
+    /// Rows the RENDERER actually painted for `lines` at [`MEASURE_WIDTH`]: one past
+    /// the last row carrying a non-blank cell.
+    ///
+    /// The ground truth every height claim below is checked against — read off the
+    /// drawn buffer, never asked of the same code under test. Every case here ends on
+    /// a non-blank line so "last painted row" is well defined (a case that ended on a
+    /// blank line would be indistinguishable from one row fewer).
+    fn painted_rows(lines: &[Line<'static>]) -> usize {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: MEASURE_WIDTH,
+            height: MEASURE_ROWS,
+        };
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(
+            Paragraph::new(Text::from(lines.to_vec())).wrap(Wrap { trim: false }),
+            area,
+            &mut buffer,
+        );
+        (0..MEASURE_ROWS)
+            .rev()
+            .find(|&y| {
+                (0..MEASURE_WIDTH)
+                    .any(|x| buffer.cell((x, y)).is_some_and(|cell| cell.symbol() != " "))
+            })
+            .map_or(0, |y| usize::from(y) + 1)
     }
 
-    #[test]
-    fn wrapped_rows_empty_and_exact_lines() {
-        // Blank lines each take a row; an exact multiple does not gain a phantom.
-        assert_eq!(wrapped_rows([0usize, 0, 0], 5), 3);
-        assert_eq!(wrapped_rows([16usize], 8), 2, "16/8 is exactly 2 rows");
-        assert_eq!(wrapped_rows([7usize], 8), 1, "shorter than width => 1 row");
+    /// Measurement cases, each `(name, lines)`. Between them they cover a line that
+    /// fits, an exact multiple of the width, a blank line in the middle (it still
+    /// costs a row), a WORD-WRAPPING line (where character packing under-counts), and
+    /// an unbreakable word (where the wrapper falls back to breaking mid-word).
+    fn measure_cases() -> Vec<(&'static str, Vec<Line<'static>>)> {
+        let line = |s: &str| Line::from(s.to_string());
+        vec![
+            ("fits the width", vec![line("short")]),
+            ("exactly the width", vec![line("0123456789")]),
+            (
+                "a blank line between two full ones",
+                vec![line("0123456789"), line(""), line("abcdefghij")],
+            ),
+            (
+                "words that must break across rows",
+                vec![line("alpha bravo charlie delta")],
+            ),
+            (
+                "one unbreakable word",
+                vec![line("xxxxxxxxxxxxxxxxxxxxxxxxx")],
+            ),
+            (
+                "several turns of prose",
+                vec![
+                    line("the quick brown fox"),
+                    line("jumps over the lazy dog"),
+                    line("end"),
+                ],
+            ),
+        ]
     }
 
+    /// The load-bearing verification: the height the transcript is scrolled against
+    /// is the height the renderer paints, case for case.
+    ///
+    /// `Paragraph::line_count` is trusted here only because this pins it against the
+    /// pinned `ratatui =0.30.2`'s own output — the two run the same `WordWrapper`, but
+    /// "the same" is a claim about a private module, so it is checked rather than
+    /// assumed.
     #[test]
-    fn wrapped_rows_guards_zero_inner_width() {
-        // A degenerate zero-width viewport must not divide by zero.
-        assert_eq!(wrapped_rows([5usize], 0), 5);
+    fn the_measured_height_is_the_height_the_renderer_paints() {
+        for (name, lines) in measure_cases() {
+            assert_eq!(
+                wrapped_text_rows(&lines, MEASURE_WIDTH),
+                painted_rows(&lines),
+                "measured height must equal the rows drawn for {name:?}"
+            );
+        }
+    }
+
+    /// The character-packing model is not a safe approximation of word wrap in EITHER
+    /// direction, which is why the transcript had to stop using it.
+    ///
+    /// It under-counts ordinary prose (a row that ends early at a word boundary costs
+    /// a row it never charged for) — the case that made the newest turn unreachable —
+    /// and it over-counts a very narrow pane, where the wrapper drops the whitespace
+    /// it broke on and packing still bills for it. Both are asserted against the rows
+    /// actually PAINTED, so neither is a claim about a model.
+    ///
+    /// Without this the agreement test above could pass while both models happened to
+    /// agree, proving nothing about which one is in use.
+    #[test]
+    fn character_packing_and_word_wrap_disagree_in_both_directions() {
+        let packed_rows = |lines: &[Line<'static>], width: u16| -> usize {
+            lines
+                .iter()
+                .map(|l| wrapped_line_height(l.width(), width))
+                .sum()
+        };
+
+        // UNDER-count: 25 columns of words in a 10-column pane packs to 3 rows, but
+        // each row ends at a word boundary, so four are painted.
+        let prose = vec![Line::from("alpha bravo charlie delta".to_string())];
+        assert_eq!(packed_rows(&prose, MEASURE_WIDTH), 3);
+        assert_eq!(wrapped_text_rows(&prose, MEASURE_WIDTH), 4);
+        assert_eq!(painted_rows(&prose), 4, "and 4 is what reaches the screen");
+
+        // OVER-count: at one column the wrapper swallows the space it breaks on, so
+        // the 11-column line needs only its 10 non-blank cells.
+        let narrow = [Line::from("alpha bravo".to_string())];
+        assert_eq!(packed_rows(&narrow, 1), 11);
+        assert_eq!(wrapped_text_rows(&narrow, 1), 10);
+    }
+
+    /// A wrapped row count is ADDITIVE over logical lines: the wrapper breaks each
+    /// one on its own and never packs two of them onto a shared row.
+    ///
+    /// `render_preview` leans on this to add the in-flight reply tail's rows to the
+    /// CACHED transcript count instead of re-wrapping the whole transcript every
+    /// frame while a send is running.
+    #[test]
+    fn a_wrapped_row_count_is_additive_over_lines() {
+        for (name, lines) in measure_cases() {
+            let split_at = lines.len() / 2;
+            let (head, tail) = lines.split_at(split_at);
+            assert_eq!(
+                wrapped_text_rows(&lines, MEASURE_WIDTH),
+                wrapped_text_rows(head, MEASURE_WIDTH) + wrapped_text_rows(tail, MEASURE_WIDTH),
+                "measuring {name:?} in two parts must total the whole"
+            );
+        }
+    }
+
+    /// A degenerate zero-width pane measures zero rows — which is what the renderer
+    /// paints there (no column to paint into), so the scroll clamp and the scrollbar
+    /// both fall through to "nothing to scroll" rather than to a divide-by-zero or an
+    /// invented height.
+    #[test]
+    fn a_zero_width_pane_measures_no_rows() {
+        assert_eq!(
+            wrapped_text_rows(&[Line::from("anything at all".to_string())], 0),
+            0
+        );
     }
 
     // --- preview link hit-testing (content<->screen mapping) --------------
@@ -2074,6 +2926,918 @@ mod tests {
         }
     }
 
+    // --- quick-reply compose zone: placement + split geometry + render -----
+
+    /// The compose zone docks in the preview on a tall board and falls back to the
+    /// full-width bottom bar on a short one; a non-composing board never bottom-bars.
+    #[test]
+    fn compose_docks_on_a_tall_board_and_bottom_bars_on_a_short_one() {
+        // Not composing -> never a bottom bar, whatever the height.
+        assert!(!compose_uses_bottom_bar(false, 8));
+        assert!(!compose_uses_bottom_bar(false, 40));
+        // preview_pane_inner_height(h) = h - BOARD_CHROME_ROWS - 2, so this height
+        // is exactly the dock threshold.
+        let just_docks = COMPOSE_MIN_DOCK_HEIGHT + BOARD_CHROME_ROWS + 2;
+        assert!(
+            !compose_uses_bottom_bar(true, just_docks),
+            "just tall enough must dock, not bottom-bar"
+        );
+        assert!(
+            !compose_uses_bottom_bar(true, just_docks + 6),
+            "taller still docks"
+        );
+        // One row short of the threshold -> bottom bar; a tiny board too.
+        assert!(
+            compose_uses_bottom_bar(true, just_docks - 1),
+            "one row short of docking must bottom-bar"
+        );
+        assert!(compose_uses_bottom_bar(true, 8), "a tiny board bottom-bars");
+    }
+
+    /// `preview_compose_split` carves the compose zone off the bottom of the
+    /// transcript when docking, and is a no-op (empty compose, full transcript) when
+    /// not — so a non-composing pane keeps its exact prior geometry.
+    #[test]
+    fn preview_compose_split_reserves_the_zone_only_when_docking() {
+        let pane = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 20,
+        };
+        // Not docking (height 0): identical to the 2-way split, empty compose rect.
+        let (b0, t0) = preview_split(pane, false);
+        let (b1, t1, c1) = preview_compose_split(pane, false, 0);
+        assert_eq!((b1, t1), (b0, t0), "no dock must not disturb the split");
+        assert_eq!(c1.height, 0, "no compose rect when not docking");
+
+        // Docking with a given height: the zone comes out of the transcript bottom,
+        // the two do not overlap, and together they tile the original transcript.
+        let zone = 5u16;
+        let (_b, transcript, compose) = preview_compose_split(pane, false, zone);
+        assert_eq!(compose.height, zone);
+        assert_eq!(
+            t0.height,
+            transcript.height + compose.height,
+            "the compose zone is taken FROM the transcript, not added beside it"
+        );
+        assert_eq!(
+            compose.y,
+            transcript.y + transcript.height,
+            "compose sits directly below the (shrunk) transcript"
+        );
+        assert_eq!(
+            transcript.y, t0.y,
+            "the transcript still starts where it did"
+        );
+        assert_eq!(compose.width, transcript.width);
+    }
+
+    /// The compose box starts at one text row and GROWS with the draft — one row per
+    /// logical line, and extra rows for a long soft-wrapped line — capped at
+    /// [`COMPOSE_MAX_TEXT_ROWS`].
+    #[test]
+    fn compose_box_grows_from_one_line_up_to_the_cap() {
+        use crate::tui::compose::ComposeState;
+
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.compose = Some(ComposeState::new_reply("sess-normal-1".to_string(), None));
+
+        // Empty draft -> one text row (zone height = 1 + 2 borders).
+        assert_eq!(compose_text_rows(&app), COMPOSE_MIN_TEXT_ROWS);
+        assert_eq!(compose_zone_height(&app), COMPOSE_MIN_TEXT_ROWS + 2);
+
+        // Three logical lines -> three text rows.
+        let ta = &mut app.compose.as_mut().unwrap().textarea;
+        ta.insert_newline();
+        ta.insert_newline();
+        assert_eq!(compose_text_rows(&app), 3);
+
+        // Well past the cap -> clamped to the max.
+        for _ in 0..20 {
+            app.compose.as_mut().unwrap().textarea.insert_newline();
+        }
+        assert_eq!(
+            compose_text_rows(&app),
+            COMPOSE_MAX_TEXT_ROWS,
+            "grows only to the cap"
+        );
+
+        // A single long line soft-wraps to more than one row. The board is DRAWN
+        // first because the editor measures itself at the width it was last drawn
+        // at: without that frame its area is still zero wide, it wraps nothing, and
+        // this would pass vacuously against the one logical line.
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.show_preview = true;
+        app.compose = Some(ComposeState::new_reply("s".to_string(), None));
+        app.compose
+            .as_mut()
+            .unwrap()
+            .textarea
+            .insert_str("word ".repeat(40)); // ~200 columns on one logical line
+        let _ = drawn_board(&mut app, DOCK_BOARD.0, DOCK_BOARD.1);
+        assert!(
+            compose_text_rows(&app) > 1,
+            "a long line wraps to more than one row in the drawn box"
+        );
+    }
+
+    /// A DOCKED compose zone is laid out at the preview pane's INNER width — the one
+    /// rect `render_compose_zone` is handed — and never at the pane's outer width.
+    ///
+    /// This is the invariant the docked box lost: it sits inside the pane's border
+    /// and then draws a border of its OWN, so anything that measured it against
+    /// `area.width` believed it was two columns wider than it is. Pinning the split's
+    /// compose rect against [`preview_inner`] keeps the two derivations from parting
+    /// again — and the `- 2` below is asserted explicitly so a change that quietly
+    /// dropped the pane's inset would fail here rather than only in a render.
+    #[test]
+    fn the_docked_compose_zone_is_laid_out_at_the_pane_inner_width() {
+        let pane = Rect {
+            x: 3,
+            y: 1,
+            width: 40,
+            height: 20,
+        };
+        for has_banner in [false, true] {
+            let (_, _, compose) = preview_compose_split(pane, has_banner, COMPOSE_MAX_ZONE_HEIGHT);
+            assert_eq!(
+                compose.width,
+                preview_inner(pane).width,
+                "the compose rect must be the pane's INNER width (banner: {has_banner})"
+            );
+            assert_eq!(
+                compose.width,
+                pane.width - 2,
+                "which is the pane's own border inset, not its outer width"
+            );
+            assert_eq!(
+                compose.x,
+                preview_inner(pane).x,
+                "and it must start inside the pane's left border"
+            );
+        }
+    }
+
+    /// A DOCKED compose-zone board: 60 columns with the splitter PINNED, so the
+    /// preview pane is exactly 30 columns, and tall enough to clear the dock
+    /// threshold. Both halves are fixed rather than defaulted because the tests below
+    /// need to know where the editor actually wraps.
+    const DOCK_BOARD: (u16, u16) = (60, 30);
+    /// The splitter position [`DOCK_BOARD`] is drawn with, leaving a 30-column
+    /// preview pane beside it.
+    const DOCK_LIST_WIDTH: u16 = 30;
+    /// The editor's REAL inner width on [`DOCK_BOARD`]: the 30-column preview pane,
+    /// less the pane's own border (2), less the compose block's border (2). Spelled
+    /// out because those four columns are exactly what the docked path used to lose
+    /// track of — and PINNED to the drawn box by [`drawn_editor_width`] rather than
+    /// trusted, so a layout change that moved the editor fails the cases below instead
+    /// of leaving their premise reasoning about a width the editor no longer has.
+    const DOCK_EDITOR_WIDTH: u16 = 26;
+
+    /// A BOTTOM-BAR compose board: one row short of the dock threshold, so the zone
+    /// claims a full-width bar between the body and the search line.
+    const BAR_BOARD: (u16, u16) = (30, COMPOSE_MIN_DOCK_HEIGHT + BOARD_CHROME_ROWS + 1);
+    /// The editor's inner width on [`BAR_BOARD`]: the whole 30-column board, less the
+    /// bar's own border (2). The bar has no pane around it, which is why this path was
+    /// always right about its width — and why it still needs its own test, since the
+    /// WRAP MODEL was wrong on both paths. Pinned to the drawn box like its docked
+    /// counterpart.
+    const BAR_EDITOR_WIDTH: u16 = 28;
+
+    /// Three words too long to share a row in either box above: word wrap puts each on
+    /// its own row ([`WRAPPING_DRAFT_ROWS`]), while the character-packing
+    /// `ceil(width / inner)` model the compose path used to apply reports one row
+    /// FEWER. That gap is what makes the tests below able to tell the two apart.
+    const WRAPPING_DRAFT: &str = "aaaaaaaaaaaaaa bbbbbbbbbbbbbb cccccccccccccc";
+    /// Rows [`WRAPPING_DRAFT`] occupies once word-wrapped at either editor width.
+    const WRAPPING_DRAFT_ROWS: usize = 3;
+
+    /// What a reply box's title starts with ([`compose_title`]), used to FIND the box
+    /// in a drawn board.
+    const COMPOSE_TITLE_MARKER: &str = "reply to";
+    /// The bottom-left corner a `Borders::ALL` block closes with. Used to find the
+    /// compose box's last drawn row without trusting the height the code under test
+    /// computed.
+    const BOX_BOTTOM_LEFT: char = '└';
+    /// The bottom-RIGHT corner of that same row. Paired with [`BOX_BOTTOM_LEFT`] it
+    /// spans the box exactly as drawn, which is how [`drawn_editor_width`] recovers the
+    /// width without trusting the geometry the code under test computed either.
+    const BOX_BOTTOM_RIGHT: char = '┘';
+
+    /// The compose box's TEXT rows exactly as DRAWN: everything between its titled top
+    /// border and the border row that closes it.
+    ///
+    /// Both bounds are read off the BUFFER rather than from `compose_zone_height`, so
+    /// a box that grew wrongly is measured by what reached the screen instead of by
+    /// its own mistake.
+    fn drawn_compose_text_rows(
+        buffer: &ratatui::buffer::Buffer,
+        width: u16,
+        height: u16,
+    ) -> Vec<String> {
+        let rows: Vec<String> = (0..height)
+            .map(|y| full_row_text(buffer, y, width))
+            .collect();
+        let top = rows
+            .iter()
+            .position(|row| row.contains(COMPOSE_TITLE_MARKER))
+            .expect("the compose box must be drawn, titled");
+        let bottom = rows
+            .iter()
+            .enumerate()
+            .skip(top + 1)
+            .find(|(_, row)| row.contains(BOX_BOTTOM_LEFT))
+            .map(|(y, _)| y)
+            .expect("the compose box must be closed by a bottom border");
+        rows[top + 1..bottom].to_vec()
+    }
+
+    /// The width the compose EDITOR was really drawn at: the columns its closing
+    /// border row spans, less that border's own two.
+    ///
+    /// Read off the BUFFER for the same reason the row count is — the drawn cells are
+    /// the only place the box's real geometry exists — so the width constants above can
+    /// be pinned to the layout instead of merely describing it.
+    fn drawn_editor_width(buffer: &ratatui::buffer::Buffer, width: u16, height: u16) -> u16 {
+        let rows: Vec<String> = (0..height)
+            .map(|y| full_row_text(buffer, y, width))
+            .collect();
+        let top = rows
+            .iter()
+            .position(|row| row.contains(COMPOSE_TITLE_MARKER))
+            .expect("the compose box must be drawn, titled");
+        let closing: Vec<char> = rows
+            .iter()
+            .skip(top + 1)
+            .find(|row| row.contains(BOX_BOTTOM_LEFT))
+            .expect("the compose box must be closed by a bottom border")
+            .chars()
+            .collect();
+        let left = closing
+            .iter()
+            .position(|c| *c == BOX_BOTTOM_LEFT)
+            .expect("the closing row carries the box's bottom-left corner");
+        let right = closing
+            .iter()
+            .position(|c| *c == BOX_BOTTOM_RIGHT)
+            .expect("the closing row carries the box's bottom-right corner");
+        u16::try_from(right.saturating_sub(left) + 1)
+            .expect("a drawn box is never wider than a terminal")
+            .saturating_sub(2) // the box's own left + right border
+    }
+
+    /// Assert the drawn compose box holds the WHOLE wrapping draft, first row first.
+    ///
+    /// The symptom being pinned is a scroll, not a crop: an under-grown box keeps the
+    /// CARET visible, so the tail rows are all still there and only the head is gone.
+    /// Checking `rows[0]` is therefore the assertion that fails, and the row count is
+    /// what says why.
+    fn assert_whole_draft_is_visible(
+        buffer: &ratatui::buffer::Buffer,
+        width: u16,
+        height: u16,
+        editor_width: u16,
+    ) {
+        // `editor_width` is what the ceil-model guard at the bottom reasons about, so
+        // tie it to the box that was actually drawn FIRST: a layout change that moved
+        // the editor then fails here, rather than leaving that guard — and with it the
+        // whole case — checking a width nothing on screen has any more.
+        assert_eq!(
+            drawn_editor_width(buffer, width, height),
+            editor_width,
+            "the compose editor must really be drawn {editor_width} columns wide"
+        );
+        let rows = drawn_compose_text_rows(buffer, width, height);
+        let words: Vec<&str> = WRAPPING_DRAFT.split(' ').collect();
+        assert_eq!(
+            rows.len(),
+            WRAPPING_DRAFT_ROWS,
+            "the box must grow to the draft's wrapped height; drawn rows: {rows:?}"
+        );
+        assert!(
+            rows[0].contains(words[0]),
+            "the draft's FIRST row must still be on screen, not scrolled away; \
+             drawn rows: {rows:?}"
+        );
+        for word in &words {
+            assert!(
+                rows.iter().any(|row| row.contains(word)),
+                "{word:?} must be visible somewhere in the box; drawn rows: {rows:?}"
+            );
+        }
+        // The character-packing model, run over the same draft at the same editor
+        // width: one row short. Without this the case could pass while both models
+        // agreed, proving nothing about which one is in use.
+        assert!(
+            wrapped_line_height(WRAPPING_DRAFT.len(), editor_width) < WRAPPING_DRAFT_ROWS,
+            "this draft must be one the ceil model gets WRONG at width {editor_width}"
+        );
+    }
+
+    /// A soft-wrapping draft grows the DOCKED compose box instead of the editor
+    /// scrolling the draft's first row out of view.
+    ///
+    /// The docked box is where both defects landed: it is measured for a zone that
+    /// lives INSIDE the preview pane's border and draws a border of its own, and it
+    /// was measured with the transcript's character-packing wrap model rather than the
+    /// editor's word wrap. Either alone under-grew the box, and an under-grown box
+    /// scrolls to keep the caret visible — so the row the user just started typing on
+    /// disappears upward. Asserted on DRAWN CELLS, because that is the only place the
+    /// symptom was ever visible.
+    #[test]
+    fn a_wrapping_draft_grows_the_docked_compose_box_rather_than_scrolling_its_first_row_away() {
+        use crate::tui::compose::ComposeState;
+
+        let (width, height) = DOCK_BOARD;
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.show_preview = true;
+        app.list_width = Some(DOCK_LIST_WIDTH);
+        app.compose = Some(ComposeState::new_reply("sess-normal-1".to_string(), None));
+        assert!(
+            !compose_uses_bottom_bar(app.is_composing(), height),
+            "this board must DOCK, or it tests the other path"
+        );
+
+        // Draw ONCE before typing: the editor measures itself at the width it was last
+        // drawn at, and before its first frame that width is zero — so without this
+        // frame the box would be sized from logical lines and the test would chase a
+        // ghost.
+        let _ = drawn_board(&mut app, width, height);
+        app.compose
+            .as_mut()
+            .expect("compose is open")
+            .textarea
+            .insert_str(WRAPPING_DRAFT);
+        let buffer = drawn_board(&mut app, width, height);
+
+        assert_whole_draft_is_visible(&buffer, width, height, DOCK_EDITOR_WIDTH);
+    }
+
+    /// The same draft in the FULL-WIDTH BOTTOM BAR: it too grows to the wrapped
+    /// height rather than scrolling its first row away.
+    ///
+    /// This path always knew its own width, so it isolates the WRAP MODEL half of the
+    /// bug — and covering both placements is what keeps them from drifting apart
+    /// again, which is how the docked one broke alone.
+    #[test]
+    fn a_wrapping_draft_grows_the_bottom_bar_compose_box_rather_than_scrolling_its_first_row_away()
+    {
+        use crate::tui::compose::ComposeState;
+
+        let (width, height) = BAR_BOARD;
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.show_preview = true;
+        app.compose = Some(ComposeState::new_reply("sess-normal-1".to_string(), None));
+        assert!(
+            compose_uses_bottom_bar(app.is_composing(), height),
+            "this board must BOTTOM-BAR, or it tests the other path"
+        );
+
+        let _ = drawn_board(&mut app, width, height);
+        app.compose
+            .as_mut()
+            .expect("compose is open")
+            .textarea
+            .insert_str(WRAPPING_DRAFT);
+        let buffer = drawn_board(&mut app, width, height);
+
+        assert_whole_draft_is_visible(&buffer, width, height, BAR_EDITOR_WIDTH);
+    }
+
+    /// Opening compose draws a bordered "reply to <label>" box — docked in the
+    /// preview on a tall board, and as a full-width bottom bar on a short one — and
+    /// never panics through a real backend.
+    #[test]
+    fn composing_renders_the_reply_box_docked_and_as_a_bottom_bar() {
+        use crate::tui::compose::ComposeState;
+
+        let open = |app: &mut App| {
+            app.show_preview = true;
+            app.compose = Some(ComposeState::new_reply("sess-normal-1".to_string(), None));
+        };
+        let full = |buffer: &ratatui::buffer::Buffer, w: u16, h: u16| -> String {
+            (0..h)
+                .map(|y| full_row_text(buffer, y, w))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let width = 80u16;
+
+        // Tall board: the reply box docks inside the preview pane.
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        open(&mut app);
+        let tall = 30u16;
+        assert!(
+            !compose_uses_bottom_bar(app.is_composing(), tall),
+            "this board must dock"
+        );
+        let buffer = drawn_board(&mut app, width, tall);
+        assert!(
+            full(&buffer, width, tall).contains("reply to"),
+            "the docked reply box must be titled"
+        );
+
+        // Short board: the reply box falls back to a full-width bottom bar.
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        open(&mut app);
+        let short = COMPOSE_MIN_DOCK_HEIGHT + BOARD_CHROME_ROWS + 1; // one short of docking
+        assert!(
+            compose_uses_bottom_bar(app.is_composing(), short),
+            "this board must bottom-bar"
+        );
+        let buffer = drawn_board(&mut app, width, short);
+        assert!(
+            full(&buffer, width, short).contains("reply to"),
+            "the bottom-bar reply box must be titled"
+        );
+    }
+
+    /// A draft SUPPRESSES the selected session's pinned status banner.
+    ///
+    /// Two reasons, and the second is a correctness one: the banner describes a
+    /// session the pane is no longer showing, and `preview_split` keys the
+    /// transcript rect off `preview_banner(..).is_some()` — the same fn
+    /// `update`'s click hit-test asks — so a banner drawn above the card would
+    /// leave render and hit-test disagreeing by a row.
+    #[test]
+    fn a_draft_suppresses_the_selected_sessions_banner() {
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        let mut reported = HashMap::new();
+        reported.insert(
+            "sess-normal-1".to_string(),
+            ReportedAgent {
+                kind: "background".to_string(),
+                id: Some("job-1".to_string()),
+                state: Some("running".to_string()),
+                status: None,
+                name: None,
+            },
+        );
+        app.set_reported_agents(reported);
+        assert!(
+            preview_banner(&app).is_some(),
+            "a reported session banners while browsing, or this proves nothing"
+        );
+
+        crate::tui::compose::open_background(&mut app, Some("planner".to_string()));
+        assert!(
+            preview_banner(&app).is_none(),
+            "a draft owns the pane, so no banner row may be reserved"
+        );
+    }
+
+    /// The draft card carries THREE facts and nothing else — what is starting,
+    /// where it will run, and the keys that act on it.
+    ///
+    /// The line COUNT is asserted on purpose: the card stands for a session that
+    /// does not exist yet, so its emptiness is the feature. Anything that later
+    /// tries to fill it with invented content fails here rather than shipping a
+    /// pane that looks like a conversation.
+    #[test]
+    fn the_draft_card_names_the_agent_and_the_dir_and_stays_empty() {
+        let dir = PathBuf::from("/tmp/launch");
+        let flat = |lines: &[Line<'static>]| -> Vec<String> {
+            lines.iter().map(|l| l.to_string()).collect()
+        };
+
+        let card = draft_card(
+            &NewSessionDraft {
+                agent: Some("planner".to_string()),
+                launch_id: None,
+            },
+            &dir,
+            0,
+        );
+        let rows = flat(&card);
+        assert_eq!(
+            rows.len(),
+            4,
+            "the card is a placeholder, not a page: {rows:?}"
+        );
+        assert_eq!(
+            rows[0],
+            format!("new session{DRAFT_CARD_SEPARATOR}@planner")
+        );
+        assert_eq!(rows[1], "/tmp/launch", "the card states where it will run");
+        assert_eq!(
+            rows[2], "",
+            "one blank row separates the facts from the keys"
+        );
+        assert_eq!(
+            rows[3], BG_DRAFT_HINT,
+            "the hint is shared with the help line"
+        );
+
+        // The picker's default row is NAMED, never a bare `@`; a blank agent name
+        // degrades to the same wording rather than rendering an empty handle.
+        for agent in [None, Some(""), Some("   ")] {
+            let rows = flat(&draft_card(
+                &NewSessionDraft {
+                    agent: agent.map(str::to_owned),
+                    launch_id: None,
+                },
+                &dir,
+                0,
+            ));
+            assert_eq!(
+                rows[0],
+                format!("new session{DRAFT_CARD_SEPARATOR}{BG_DRAFT_DEFAULT_AGENT}"),
+                "a nameless pick must read as the default row: {agent:?}"
+            );
+        }
+
+        // Once dispatched, the keys no longer apply, so the hint gives way to the
+        // in-flight line — animated off the board's OWN tick, not a second cadence.
+        let launching = |tick: u64| {
+            flat(&draft_card(
+                &NewSessionDraft {
+                    agent: Some("planner".to_string()),
+                    // Any stamped id means "in flight"; the card renders the same
+                    // line whichever dispatch it names.
+                    launch_id: Some(1),
+                },
+                &dir,
+                tick,
+            ))
+        };
+        let at_zero = launching(0);
+        assert_eq!(at_zero.len(), 4, "the in-flight card grows no rows");
+        assert!(
+            at_zero[3].contains(DRAFT_CARD_LAUNCHING),
+            "a dispatched card reports the launch: {at_zero:?}"
+        );
+        assert!(
+            !at_zero[3].contains("Esc cancel"),
+            "the key hints must not survive a dispatch: {at_zero:?}"
+        );
+        assert_ne!(
+            at_zero[3],
+            launching(1)[3],
+            "the in-flight line must animate off App::tick"
+        );
+    }
+
+    /// The BACKGROUND draft REPLACES the previewed transcript with a placeholder
+    /// card — docked compose on a tall board, a full-width bottom bar on a short
+    /// one, the card in the pane either way.
+    ///
+    /// The load-bearing assertion is the NEGATIVE one: the selected session's
+    /// transcript must NOT be behind the draft. A compose box docked over an
+    /// unrelated conversation reads as a reply to that conversation, which is
+    /// exactly the bug this card exists to fix — and it is the DEFAULT `Ctrl-N`
+    /// path, so it is the first thing a user sees.
+    #[test]
+    fn the_background_draft_pane_renders_a_placeholder_card_not_a_transcript() {
+        let open = |app: &mut App, agent: Option<&str>| {
+            // Through the REAL open path, not a hand-built state, so the test
+            // exercises whatever that path installs.
+            crate::tui::compose::open_background(app, agent.map(str::to_owned));
+        };
+        let full = |buffer: &ratatui::buffer::Buffer, w: u16, h: u16| -> String {
+            (0..h)
+                .map(|y| full_row_text(buffer, y, w))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let width = 80u16;
+
+        // Control: with NO draft open, the selected session's transcript IS drawn —
+        // so the negative assertion below can actually fail.
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        let tall = 30u16;
+        let browsing = full(&drawn_board(&mut app, width, tall), width, tall);
+        assert!(
+            browsing.contains("webhook"),
+            "the fixture's transcript must be visible while browsing, or the \
+             negative assertion below proves nothing:\n{browsing}"
+        );
+
+        // Tall board: the draft card fills the pane and compose docks beneath it.
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        open(&mut app, Some("planner"));
+        assert!(
+            !compose_uses_bottom_bar(app.is_composing(), tall),
+            "this board must dock"
+        );
+        let drawn = full(&drawn_board(&mut app, width, tall), width, tall);
+        assert!(
+            !drawn.contains("webhook"),
+            "the draft must not dock over the selected session's transcript:\n{drawn}"
+        );
+        assert!(
+            drawn.contains("new session"),
+            "the pane must show a new-session placeholder card:\n{drawn}"
+        );
+        assert!(
+            drawn.contains("@planner"),
+            "the card must name the picked agent:\n{drawn}"
+        );
+        assert!(
+            drawn.contains("/tmp/launch"),
+            "the card must show the launch directory:\n{drawn}"
+        );
+        assert!(
+            drawn.contains("background agent: planner"),
+            "the docked compose box must still be titled for the picked agent:\n{drawn}"
+        );
+        assert!(
+            drawn.contains("Ctrl-O run interactively"),
+            "the draft's key hints must offer the interactive escape hatch:\n{drawn}"
+        );
+
+        // Short board: compose falls back to a full-width bottom bar, the card still
+        // owns the pane, and the default (no agent) row is named rather than blank.
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        open(&mut app, None);
+        let short = COMPOSE_MIN_DOCK_HEIGHT + BOARD_CHROME_ROWS + 1; // one short of docking
+        assert!(
+            compose_uses_bottom_bar(app.is_composing(), short),
+            "this board must bottom-bar"
+        );
+        let drawn = full(&drawn_board(&mut app, width, short), width, short);
+        assert!(
+            !drawn.contains("webhook"),
+            "the bottom-bar fallback must not leave the transcript in the pane:\n{drawn}"
+        );
+        assert!(
+            // Matched against the CARD's own row, not a bare `BG_DRAFT_DEFAULT_AGENT`:
+            // the compose box's title carries that phrase too, so the loose form
+            // passes even with the card's label blanked out.
+            drawn.contains(&format!(
+                "{DRAFT_CARD_HEADLINE}{DRAFT_CARD_SEPARATOR}{BG_DRAFT_DEFAULT_AGENT}"
+            )),
+            "the card must name the default row rather than leave it blank:\n{drawn}"
+        );
+        assert!(
+            drawn.contains(&format!("background agent: {BG_DRAFT_DEFAULT_AGENT}")),
+            "the bottom-bar compose box must name the default row:\n{drawn}"
+        );
+    }
+
+    /// Opening — and cancelling — a draft hands the transcript back at the scroll
+    /// position it had.
+    ///
+    /// The card is four lines, so it never overflows: every offset clamps to 0.
+    /// `render_preview` writes its resolved offset back to `App::preview_scroll`,
+    /// which is right for a transcript and wrong for a card — the card is not what
+    /// that offset describes. Persisting it rewinds the session BEHIND the draft to
+    /// the top, so `Esc` hands back a pane scrolled somewhere the user never put it,
+    /// and the position they were reading is gone. Asserted as the drawn pane rather
+    /// than as the field alone: what the user loses is the view, not the number.
+    #[test]
+    fn a_cancelled_draft_hands_the_transcript_back_at_the_scroll_it_had() {
+        let width = 40u16;
+        let height = 12u16;
+        let draw = |app: &mut App| -> String {
+            let mut terminal = Terminal::new(TestBackend::new(width, height))
+                .expect("build an in-memory test terminal");
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    render_preview(frame, app, area);
+                })
+                .expect("render_preview must not panic");
+            let buffer = terminal.backend().buffer().clone();
+            (0..height)
+                .map(|y| full_row_text(&buffer, y, width))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        // A genuine INTERIOR scroll — the user read back up the transcript and
+        // stopped there — so only preserving it can reproduce this pane.
+        app.preview_follow_bottom = false;
+        app.preview_scroll = 3;
+        let browsing = draw(&mut app);
+        assert_eq!(
+            app.preview_scroll, 3,
+            "the fixture must overflow this pane far enough for 3 to be a real \
+             offset, or every assertion below passes vacuously"
+        );
+
+        crate::tui::compose::open_background(&mut app, Some("planner".to_string()));
+        let carded = draw(&mut app);
+        assert!(
+            carded.contains(DRAFT_CARD_HEADLINE),
+            "the card must own the pane, or the card path was never taken:\n{carded}"
+        );
+        assert_eq!(
+            app.preview_scroll, 3,
+            "the card's own geometry must not overwrite the transcript's scroll"
+        );
+
+        app.close_compose();
+        assert_eq!(
+            draw(&mut app),
+            browsing,
+            "cancelling a draft must hand the pane back exactly as it was"
+        );
+    }
+
+    /// The compose title and key hints branch on the TARGET, and the background
+    /// draft's `Ctrl-O` hint must stay honest: the prompt auto-submits as the first
+    /// turn (no pre-fill exists), so the wording may not promise a review or an edit.
+    #[test]
+    fn compose_wording_branches_by_target_and_never_promises_a_review() {
+        use crate::tui::compose::ComposeState;
+
+        let app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+
+        // Reply: named for the target session; stop-then-reply says so.
+        let plain = ComposeState::new_reply("sess-normal-1".to_string(), None);
+        assert!(compose_title(&app, &plain).contains("reply to"));
+        let held = ComposeState::new_reply("sess-normal-1".to_string(), Some("job".to_string()));
+        assert!(compose_title(&app, &held).contains("stop & reply to"));
+
+        // Background: named for the agent, and a blank name falls back to the
+        // default label rather than rendering an empty title.
+        assert_eq!(
+            compose_title(&app, &ComposeState::new_background(Some("planner".into()))),
+            " new background agent: planner "
+        );
+        for blank in [None, Some(String::new()), Some("   ".to_string())] {
+            assert_eq!(
+                compose_title(&app, &ComposeState::new_background(blank.clone())),
+                format!(" new background agent: {BG_DRAFT_DEFAULT_AGENT} "),
+                "a blank agent name must not render an empty title: {blank:?}"
+            );
+        }
+
+        // The reply hint offers NO interactive escape hatch, and says what a pasted
+        // newline does (it used to submit the draft's first line).
+        let reply_hint = compose_hint(&plain.target);
+        assert_eq!(
+            reply_hint,
+            "Enter send · Ctrl-J newline (or Alt+Enter) · paste keeps newlines · Esc cancel",
+        );
+        assert!(
+            !reply_hint.contains("Ctrl-O"),
+            "the reply hints must not grow a key the reply target ignores: {reply_hint}"
+        );
+
+        // The background hint names both verbs, honestly.
+        let bg_hint = compose_hint(&ComposeState::new_background(None).target);
+        assert!(bg_hint.contains("Enter start in background"), "{bg_hint}");
+        assert!(bg_hint.contains("Ctrl-O run interactively"), "{bg_hint}");
+        for dishonest in ["review", "edit", "before sending", "prefill", "pre-fill"] {
+            assert!(
+                !bg_hint.to_lowercase().contains(dishonest),
+                "the prompt AUTO-SUBMITS, so the hint must not imply {dishonest:?}: {bg_hint}"
+            );
+        }
+    }
+
+    /// While a send is in flight for the selected session the pinned banner is
+    /// SUPPRESSED (so it cannot desync the hit-test) and the send renders INLINE at
+    /// the transcript tail: the echoed message under a `▶ you` turn plus a
+    /// "sending…" placeholder that becomes "cooking…" once claude reports working.
+    /// The `▶ you` echo drops the instant the real turn lands on disk; when the send
+    /// finishes the banner yields back to the agent status.
+    #[test]
+    fn an_in_flight_send_renders_inline_and_suppresses_the_banner() {
+        use super::super::app::Sending;
+
+        let flatten_lines = |lines: &[Line<'static>]| -> String {
+            lines
+                .iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.selected = Some("sess-normal-1".to_string());
+
+        // Nothing in flight and no reported agent -> no banner, no inline tail.
+        assert!(preview_banner(&app).is_none());
+        assert!(sending_tail(&app, 80).is_none());
+
+        // In flight, nothing on disk yet (msg_count still the baseline) -> the
+        // pinned banner is suppressed and the tail echoes the message + "sending…".
+        app.sending = Some(Sending {
+            session_id: "sess-normal-1".to_string(),
+            message: "please summarize this".to_string(),
+            baseline_msg_count: 0,
+        });
+        assert!(
+            preview_banner(&app).is_none(),
+            "an in-flight send suppresses the pinned banner"
+        );
+        let tail = flatten_lines(&sending_tail(&app, 80).expect("an in-flight send has a tail"));
+        assert!(
+            tail.contains("\u{25b6} you") && tail.contains("please summarize this"),
+            "the sent message is echoed under a `you` turn: {tail:?}"
+        );
+        assert!(
+            tail.contains("\u{25cf} claude") && tail.contains("sending"),
+            "a pending claude turn reads 'sending': {tail:?}"
+        );
+        assert!(!tail.contains("cooking"));
+
+        // Once claude reports it working -> "cooking…".
+        let mut reported = HashMap::new();
+        reported.insert(
+            "sess-normal-1".to_string(),
+            ReportedAgent {
+                kind: "background".to_string(),
+                id: None,
+                state: Some("working".to_string()),
+                status: None,
+                name: None,
+            },
+        );
+        app.set_reported_agents(reported);
+        let tail = flatten_lines(&sending_tail(&app, 80).expect("still in flight"));
+        assert!(tail.contains("cooking"), "working -> 'cooking': {tail:?}");
+
+        // The real user turn lands on disk (turn count grows past the baseline) ->
+        // the echo steps aside, leaving only the pending claude placeholder so the
+        // real turn (rendered by the reload) is not doubled.
+        app.sessions[0].msg_count = 1;
+        let tail = flatten_lines(&sending_tail(&app, 80).expect("still in flight"));
+        assert!(
+            !tail.contains("please summarize this") && !tail.contains("\u{25b6} you"),
+            "the echo yields to the real turn once it lands: {tail:?}"
+        );
+        assert!(
+            tail.contains("\u{25cf} claude") && tail.contains("cooking"),
+            "the pending claude placeholder stays until the send finishes: {tail:?}"
+        );
+
+        // Send done -> no inline tail; the banner yields back to the agent status.
+        app.sending = None;
+        assert!(sending_tail(&app, 80).is_none());
+        let banner = preview_banner(&app).expect("the reported agent still has a banner");
+        let banner_text = banner
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        assert!(
+            !banner_text.contains("sending") && !banner_text.contains("cooking"),
+            "no longer in flight: {banner_text:?}"
+        );
+    }
+
     #[test]
     fn render_preview_pins_scrollbar_thumb_to_track_bottom_when_scrolled_to_end() {
         // A freshly selected session starts `preview_follow_bottom = true`
@@ -2107,10 +3871,8 @@ mod tests {
         // the (now cached) preview text, to confirm this viewport genuinely
         // overflows and to know the exact bottom-pinned offset independent of
         // this fixture's specific turn count.
-        let inner_width = width - 2;
         let inner_height = height - 2;
-        let text = app.preview_text(inner_width);
-        let content_h = wrapped_rows(text.lines.iter().map(Line::width), inner_width);
+        let content_h = content_height(&mut app, width);
         assert!(
             content_h > usize::from(inner_height),
             "fixture must overflow the viewport for the scrollbar to render \
@@ -2238,10 +4000,8 @@ mod tests {
             })
             .expect("render_preview must not panic on a narrow, tall viewport");
 
-        let inner_width = width - 2;
         let inner_height = height - 2;
-        let text = app.preview_text(inner_width);
-        let content_h = wrapped_rows(text.lines.iter().map(Line::width), inner_width);
+        let content_h = content_height(&mut app, width);
         let max_offset = (content_h - usize::from(inner_height)) as u16;
         assert!(
             app.preview_scroll > 0 && app.preview_scroll < max_offset,
@@ -2277,6 +4037,155 @@ mod tests {
                 "a genuine partial scroll must detach the thumb from the {label} track row"
             );
         }
+    }
+
+    // --- transcript content height (what the pane can reach) ----------------
+
+    /// A preview pane narrow enough that the `sample_session` fixture's turns WORD-
+    /// WRAP, and short enough that the wrapped result overflows it several times
+    /// over. 12 columns leaves an inner width of 10, where the fixture's prose breaks
+    /// at word boundaries the character-packing model never charged for — which is
+    /// the whole point: at a comfortable width the two models agree and nothing here
+    /// could fail.
+    const WRAPPING_PANE: (u16, u16) = (12, 10);
+
+    /// The last thing said in the `sample_session` fixture, and the last thing the
+    /// pane must be able to show. Its final wrapped row is one word, so the assertion
+    /// below reads a single drawn row rather than reconstructing the wrap.
+    const FIXTURE_LAST_WORD: &str = "logging.";
+
+    /// The rows the character-packing model would have claimed for `app`'s transcript
+    /// at the pane's inner width — the count `content_h` used to be derived from.
+    ///
+    /// Kept in the tests alone: production has one model now, and this exists so a
+    /// case can PROVE it is one the two disagree about instead of asserting into a
+    /// coincidence.
+    fn packed_content_height(app: &mut App, width: u16) -> usize {
+        let inner_width = width - 2;
+        app.preview_text(inner_width)
+            .lines
+            .iter()
+            .map(|l| wrapped_line_height(l.width(), inner_width))
+            .sum()
+    }
+
+    /// Following the bottom of a WORD-WRAPPED transcript really reaches its last
+    /// line.
+    ///
+    /// The symptom the whole change exists for: `max_offset` is
+    /// `content_h - inner_height`, so a content height that under-counts the wrap
+    /// leaves the tail of the transcript unreachable — the pane bottom-anchors, and
+    /// still stops short of the newest turn, with no key that can get there. Asserted
+    /// on the DRAWN bottom row, since "the offset is bigger now" is a proxy and this
+    /// is the thing the user was missing.
+    #[test]
+    fn following_the_bottom_reaches_the_last_line_of_a_word_wrapped_transcript() {
+        let (width, height) = WRAPPING_PANE;
+        let mut app = banner_app(None);
+        assert!(
+            app.preview_follow_bottom,
+            "the pane must be bottom-anchored, or this tests nothing a user sees"
+        );
+
+        let packed = packed_content_height(&mut app, width);
+        let wrapped = content_height(&mut app, width);
+        assert!(
+            packed < wrapped,
+            "this fixture/width must be one the two models DISAGREE about, or the \
+             old code passes too (packed={packed}, wrapped={wrapped})"
+        );
+
+        let rows = inner_rows(&mut app, width, height);
+        assert_eq!(
+            rows.last().map(String::as_str),
+            Some(FIXTURE_LAST_WORD),
+            "the newest turn's last row must be the pane's bottom row; drawn rows: {rows:?}"
+        );
+    }
+
+    /// The optimistic turns of an in-flight quick reply count toward the height the
+    /// pane scrolls against.
+    ///
+    /// They are appended to the transcript AFTER the cache was filled, so a height
+    /// read from the cache alone is short by exactly the tail — and the message the
+    /// user just sent, plus the live "sending…" line, sits below the bottom of the
+    /// pane while it is the one thing they are watching for.
+    #[test]
+    fn an_in_flight_reply_tail_counts_toward_the_scrolled_height() {
+        use super::super::app::Sending;
+
+        let (width, height) = WRAPPING_PANE;
+        let inner_width = width - 2;
+        let mut app = banner_app(None);
+        app.selected = Some("sess-normal-1".to_string());
+        let transcript_only = content_height(&mut app, width);
+
+        app.sending = Some(Sending {
+            session_id: "sess-normal-1".to_string(),
+            message: "ping".to_string(),
+            baseline_msg_count: 0,
+        });
+        let tail = sending_tail(&app, inner_width).expect("a send is in flight");
+        let tail_rows = wrapped_text_rows(&tail, inner_width);
+        assert!(tail_rows > 0, "the tail must have rows to be missed");
+
+        let rows = inner_rows(&mut app, width, height);
+        assert_eq!(
+            usize::from(app.preview_scroll),
+            transcript_only + tail_rows - usize::from(height - 2),
+            "the resolved offset must be measured over the transcript AND the tail"
+        );
+        assert!(
+            rows.last().is_some_and(|row| row.contains("sending")),
+            "the live 'sending…' line must be the pane's bottom row; drawn rows: {rows:?}"
+        );
+    }
+
+    /// A pane wide enough for the draft card to FIT (so any scroll of it is a bug)
+    /// while the fixture's transcript still overflows it and bottom-anchors well past
+    /// zero — the two conditions the card trap needs, both re-asserted below rather
+    /// than trusted here.
+    const CARD_PANE: (u16, u16) = (40, 8);
+
+    /// A new-session draft CARD is measured as itself, never as the transcript it
+    /// replaced.
+    ///
+    /// The card is a handful of lines and the transcript behind it is not, so
+    /// borrowing that height leaves a `max_offset` the card cannot fill: the offset
+    /// the user's reading position left behind survives the clamp and pushes the card
+    /// off the top of the pane, so `Ctrl-N` opens onto a blank box.
+    #[test]
+    fn a_draft_card_is_measured_as_itself_not_as_the_transcript_it_replaced() {
+        let (width, height) = CARD_PANE;
+        let inner_height = usize::from(height - 2);
+        let mut app = banner_app(None);
+        // Read to the bottom of a transcript that overflows this pane: the offset
+        // left behind is what a stale height would keep alive.
+        let rows = inner_rows(&mut app, width, height);
+        assert!(
+            content_height(&mut app, width) > inner_height && app.preview_scroll > 0,
+            "the transcript must overflow and really be scrolled, or nothing can \
+             survive into the card; drawn rows: {rows:?}"
+        );
+
+        crate::tui::compose::open_background(&mut app, Some("planner".to_string()));
+        let card = draft_card(
+            app.draft.as_ref().expect("the draft card is open"),
+            &app.launch_dir,
+            app.tick,
+        );
+        assert!(
+            wrapped_text_rows(&card, width - 2) <= inner_height,
+            "the card must FIT this pane, so any offset at all is the transcript's \
+             leaking through"
+        );
+
+        let rows = inner_rows(&mut app, width, height);
+        assert!(
+            rows[0].contains(DRAFT_CARD_HEADLINE),
+            "the card must start on the pane's first row, not be scrolled off by a \
+             height borrowed from the transcript; drawn rows: {rows:?}"
+        );
     }
 
     // --- status preview banner ---------------------------------------------
@@ -2345,13 +4254,11 @@ mod tests {
             .collect()
     }
 
-    /// The wrapped height of `app`'s preview text at the pane's inner width —
-    /// the same `wrapped_rows` model `render_preview` scrolls against — so a test
-    /// can prove its fixture really overflows the viewport.
+    /// The wrapped height of `app`'s preview text at the pane's inner width — the
+    /// very count `render_preview` scrolls against, read from the same cache — so a
+    /// test can prove its fixture really overflows the viewport.
     fn content_height(app: &mut App, width: u16) -> usize {
-        let inner_width = width - 2;
-        let text = app.preview_text(inner_width);
-        wrapped_rows(text.lines.iter().map(Line::width), inner_width)
+        app.preview_wrapped_rows(width - 2)
     }
 
     #[test]
@@ -2711,6 +4618,10 @@ mod tests {
             // Finished -> green like idle (nothing is wanted from you) and
             // STEADY, because there is no work left to animate.
             (Some("done"), Color::Green, false),
+            // Terminal (stopped/failed) -> DARKGRAY and STEADY: the job ended, so
+            // it must not pulse and must not read green like a clean finish.
+            (Some("stopped"), Color::DarkGray, false),
+            (Some("failed"), Color::DarkGray, false),
             // FAIL-SOFT: schema drift tracks the working bucket...
             (Some("compacting"), Color::Gray, true),
             // ...and so does a record with no qualifier at all. Neither may
@@ -2762,6 +4673,11 @@ mod tests {
             !agents::is_active(&interrupted),
             "it must be steady: the pulse would claim work claude's status denies"
         );
+        // Both RESTING background buckets are in this test's coverage and their
+        // SHADES are pinned apart above — the `stopped`/`failed` rows in the loop
+        // demand `DarkGray`, this row demands the working `Gray` — so a collapse of
+        // either onto the other's color fails here rather than silently erasing the
+        // only thing that distinguishes two badges that both hold still.
     }
 
     /// `qualifier`'s state-then-status precedence must reach the badge too: the
@@ -2905,7 +4821,12 @@ mod tests {
     /// shares the `working` STATE with the plain working bucket, so it needs its
     /// own `interrupted` label to stay a distinct, findable row while still
     /// carrying the `state`/`status` PAIR its classification is read from.
-    const BADGE_CASES: [(&str, &str, Option<&str>, Color, bool); 7] = [
+    ///
+    /// The two STEADY non-green rows — `interrupted` (`WorkingButIdle`) and
+    /// `stopped`/`failed` (`Ended`) — are both here on purpose: they rest alike but
+    /// differ in SHADE, so rendering them side by side is what would catch either
+    /// one being collapsed into the other's color.
+    const BADGE_CASES: [(&str, &str, Option<&str>, Color, bool); 9] = [
         // Waiting on the user: the most prominent color, but STEADY.
         ("blocked", "blocked", None, Color::Yellow, false),
         // The same bucket under its other token: yellow, and steady TOO. This
@@ -2924,6 +4845,11 @@ mod tests {
         // Finished: green (nothing is wanted from you) and steady. Only
         // observable at all because the poller passes `--all`.
         ("done", "done", None, Color::Green, false),
+        // The terminal bucket, under BOTH its tokens: dim gray and steady. Dim
+        // rather than the working gray above (the job is over, not churning) and
+        // not `done`'s green (it did not necessarily finish cleanly).
+        ("stopped", "stopped", None, Color::DarkGray, false),
+        ("failed", "failed", None, Color::DarkGray, false),
     ];
 
     /// A board carrying one REPORTED session per [`BADGE_CASES`] bucket, each
@@ -2961,7 +4887,12 @@ mod tests {
     /// enough for the group head plus every [`BADGE_CASES`] row (plus the
     /// block's two border rows) with slack — a row scrolled out of view would
     /// silently weaken every assertion below.
-    const BADGE_BOARD_SIZE: (u16, u16) = (60, 12);
+    ///
+    /// Height is `BADGE_CASES.len()` + 1 group head + 2 borders + 2 slack rows, so
+    /// it must GROW whenever a bucket row is added; the `badges.len() ==
+    /// BADGE_CASES.len()` assertion in
+    /// `render_list_colors_the_whole_badge_by_state` is what fails if it does not.
+    const BADGE_BOARD_SIZE: (u16, u16) = (60, 14);
 
     /// Draw `app`'s list into an in-memory terminal and hand back the buffer —
     /// the cells a real terminal would paint.
@@ -3521,6 +5452,8 @@ mod tests {
             // The one joint-read bucket: a working `state` AND an idle `status`.
             AgentActivity::WorkingButIdle => agent("background", Some("working"), Some("idle")),
             AgentActivity::Done => agent("background", Some("done"), None),
+            // Terminal (stopped/failed): resting, so the walk below skips it.
+            AgentActivity::Ended => agent("background", Some("stopped"), None),
             // The fail-soft bucket: an unrecognized qualifier, or none at all.
             AgentActivity::Other => agent("background", Some("compacting"), None),
         }
@@ -3529,12 +5462,13 @@ mod tests {
     /// Every `AgentActivity` bucket. Keep in sync with the enum — the exhaustive
     /// `match` in [`agent_reaching`] is what fails to compile and sends the
     /// author here when a bucket is added.
-    const ALL_BUCKETS: [AgentActivity; 6] = [
+    const ALL_BUCKETS: [AgentActivity; 7] = [
         AgentActivity::NeedsInput,
         AgentActivity::Idle,
         AgentActivity::Working,
         AgentActivity::WorkingButIdle,
         AgentActivity::Done,
+        AgentActivity::Ended,
         AgentActivity::Other,
     ];
 
@@ -3701,7 +5635,12 @@ mod tests {
     }
 
     /// Wide/tall enough for a whole board: header + list rows + search + help.
-    const FULL_BOARD_SIZE: (u16, u16) = (80, 14);
+    ///
+    /// Its users draw a [`badge_board`], so the height must clear every
+    /// [`BADGE_CASES`] row on top of the header/search/help chrome and the list
+    /// block's borders + group head — a row scrolled out of view fails their
+    /// `row_of` lookup rather than passing vacuously, so this grows with the table.
+    const FULL_BOARD_SIZE: (u16, u16) = (80, 17);
 
     /// Draw the WHOLE board and hand back the buffer.
     fn drawn_board(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
@@ -3922,6 +5861,16 @@ mod tests {
         assert!(
             app.modal.is_some(),
             "rendering must not disturb the open picker"
+        );
+        // The picker has TWO verbs, so its footer must advertise both — a key the
+        // user cannot discover may as well not be bound (KEEP KEY DOCS IN SYNC).
+        let drawn = (0..24)
+            .map(|y| full_row_text(terminal.backend().buffer(), y, 80))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            drawn.contains("Enter draft") && drawn.contains("^O interactive"),
+            "the picker footer must name both Enter and Ctrl-O:\n{drawn}"
         );
     }
 

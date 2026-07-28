@@ -8,6 +8,7 @@
 //! event loop in [`run`].
 
 pub mod app;
+pub mod compose;
 pub mod update;
 pub mod view;
 
@@ -18,8 +19,8 @@ use std::time::Duration;
 use anyhow::Result;
 use crossterm::cursor::{SetCursorStyle, Show};
 use crossterm::event::{
-    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableMouseCapture,
-    PopKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableMouseCapture, PopKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::style::{Attribute, SetAttribute};
@@ -37,22 +38,33 @@ pub use update::Outcome;
 const TICK: Duration = crate::watch::TICK;
 
 /// Enter the alternate screen, enable raw mode, turn on mouse capture (for
-/// wheel/trackpad scrolling), and install a panic hook that restores the
-/// terminal — mouse mode included — before unwinding.
+/// wheel/trackpad scrolling) and BRACKETED PASTE, and install a panic hook that
+/// restores the terminal — both of those modes included — before unwinding.
 ///
 /// Built on `ratatui::try_init`, which performs raw mode, the alternate screen,
-/// and a panic hook that calls `ratatui::restore`. That restore does NOT disable
-/// mouse capture, so after `try_init` we WRAP the panic hook (see
-/// [`install_mouse_safe_panic_hook`]) and only then enable mouse capture, so
-/// EVERY exit — quit, error, resume hand-off, or panic — leaves mouse mode off.
+/// and a panic hook that calls `ratatui::restore`. That restore disables NEITHER
+/// mouse capture nor bracketed paste, so after `try_init` we WRAP the panic hook
+/// (see [`install_mode_safe_panic_hook`]) and only then enable the two modes, so
+/// EVERY exit — quit, error, resume hand-off, or panic — leaves both OFF.
 /// The returned [`DefaultTerminal`] is a `CrosstermBackend` writing to stdout.
+///
+/// Bracketed paste (`CSI ?2004h`) is what makes crossterm deliver a clipboard drop
+/// as ONE [`crossterm::event::Event::Paste`] instead of a stream of `KeyEvent`s.
+/// Without it a multi-line paste into the quick-reply compose zone sent its first
+/// line as the reply (a bare `Enter` is `Send`), typed the remainder into the
+/// board's search query, and let a further newline reach the board's `Enter` =
+/// resume binding — a truncated send plus an unintended `claude` hand-off. The
+/// mode therefore belongs to snapback now, which is why it must also be disabled
+/// on every teardown path (see [`restore_terminal`]) and RE-ARMED after every
+/// child return (see [`reassert_board_screen`]).
 pub fn init_terminal() -> Result<DefaultTerminal> {
     let terminal = ratatui::try_init()?;
-    // Wrap ratatui's (restore-only) panic hook BEFORE enabling mouse capture so
-    // even a panic between here and the first draw disables mouse mode.
-    install_mouse_safe_panic_hook();
-    if let Err(err) = execute!(io::stdout(), EnableMouseCapture) {
-        // A failed enable must not leak the raw mode / alt screen try_init set up.
+    // Wrap ratatui's (restore-only) panic hook BEFORE enabling the two modes, so
+    // even a panic between here and the first draw turns both back off.
+    install_mode_safe_panic_hook();
+    if let Err(err) = execute!(io::stdout(), EnableMouseCapture, EnableBracketedPaste) {
+        // A failed enable must not leak the raw mode / alt screen try_init set up,
+        // nor a half-applied mode pair — `restore_terminal` disables both.
         restore_terminal();
         return Err(err.into());
     }
@@ -60,17 +72,23 @@ pub fn init_terminal() -> Result<DefaultTerminal> {
 }
 
 /// Restore the terminal to its original state: disable mouse capture, disable
-/// raw mode, and leave the alternate screen.
+/// bracketed paste, disable raw mode, and leave the alternate screen.
 ///
 /// This is the teardown seam for the resume round trip: [`run`] calls it before
 /// returning an [`Outcome::Resume`], so `claude` is spawned onto a clean,
-/// non-raw terminal with mouse mode OFF, and the loop in `main` re-initializes
-/// afterwards. Mouse capture is disabled FIRST (while still on the alt screen),
-/// then `ratatui::restore` drops raw mode and the alt screen; both steps are
-/// idempotent, so re-initializing each loop iteration is safe. Errors are
+/// non-raw terminal with mouse mode and bracketed paste OFF, and the loop in
+/// `main` re-initializes afterwards. Both modes are disabled FIRST (while still on
+/// the alt screen), then `ratatui::restore` drops raw mode and the alt screen; every
+/// step is idempotent, so re-initializing each loop iteration is safe. Errors are
 /// ignored — restoring on the way out is best-effort by design.
+///
+/// Bracketed paste is disabled here for the same reason mouse capture is: snapback
+/// ENABLES it in [`init_terminal`], so leaving it on would hand the user's shell —
+/// or the spawned `claude` child — a mode it never asked for, wrapping its pastes
+/// in `ESC[200~`/`ESC[201~` markers it may not consume.
 pub fn restore_terminal() {
     let _ = disable_mouse(&mut io::stdout());
+    let _ = disable_paste(&mut io::stdout());
     ratatui::restore();
 }
 
@@ -79,6 +97,15 @@ pub fn restore_terminal() {
 /// sequence can be asserted in a unit test without a real TTY.
 fn disable_mouse<W: Write>(w: &mut W) -> io::Result<()> {
     execute!(w, DisableMouseCapture)
+}
+
+/// Write crossterm's `DisableBracketedPaste` sequence (`CSI ?2004l`) to `w`
+/// (flushed by `execute!`). The teardown half of the mode [`init_terminal`]
+/// enables; factored out and generic over [`Write`] for exactly the reason
+/// [`disable_mouse`] is — so the escape can be asserted in a unit test without a
+/// real TTY.
+fn disable_paste<W: Write>(w: &mut W) -> io::Result<()> {
+    execute!(w, DisableBracketedPaste)
 }
 
 /// `CAN` (Cancel, byte `0x18`) — ECMA-48 §8.3.5. Received mid-sequence it
@@ -215,17 +242,28 @@ fn reset_terminal_state<W: Write>(w: &mut W) -> io::Result<()> {
     Ok(())
 }
 
-/// Turn OFF the terminal modes a spawned `claude` child may have enabled but
-/// that `snapback` never uses, so a child that exited on `Ctrl-Z` without
-/// restoring, or exited abnormally, cannot leak them into the board.
+/// Turn OFF the input modes a spawned `claude` child may have left enabled, so a
+/// child that exited on `Ctrl-Z` without restoring, or exited abnormally, cannot
+/// leak WHATEVER IT SET into the board.
 ///
 /// Bracketed paste (`CSI ?2004`) and focus reporting (`CSI ?1004`) both inject
 /// synthetic bytes into stdin while active (`ESC[200~…ESC[201~` around pastes,
-/// `ESC[I` / `ESC[O` on focus changes); leaked into the board those corrupt its
-/// input. [`init_terminal`] enables NEITHER, so disabling them is a safe no-op
-/// when the child already cleaned up. Factored out and generic over [`Write`] so
-/// the reset sequence can be asserted in a unit test without a real TTY (mirrors
-/// [`disable_mouse`]).
+/// `ESC[I` / `ESC[O` on focus changes). Focus reporting snapback never uses at all,
+/// so for that one this disable is the whole story.
+///
+/// Bracketed paste is different, and the difference is the point: snapback now OWNS
+/// that mode — [`init_terminal`] enables it so a paste arrives as one
+/// [`crossterm::event::Event::Paste`] rather than as a stream of keystrokes. This
+/// disable therefore does NOT mean "snapback never wants it"; it CLEARS whatever
+/// level the child left behind, and [`reassert_board_screen`] re-asserts the
+/// board's OWN enable immediately afterwards. Clear-then-assert is deliberate and
+/// must stay in that order: it is the "ONE complete return-to-known-state"
+/// principle [`hard_reset`] is built on, applied to a mode both processes touch.
+/// Do not delete this disable on the grounds that the board turns paste back on —
+/// the re-assert is what makes the sequence safe, not redundant.
+///
+/// Factored out and generic over [`Write`] so the reset sequence can be asserted in
+/// a unit test without a real TTY (mirrors [`disable_mouse`] / [`disable_paste`]).
 fn reset_child_modes<W: Write>(w: &mut W) -> io::Result<()> {
     execute!(w, DisableBracketedPaste, DisableFocusChange)
 }
@@ -250,13 +288,19 @@ fn reset_child_modes<W: Write>(w: &mut W) -> io::Result<()> {
 ///    screen and back, paid only on child return, never per frame.
 /// 2. [`EnableMouseCapture`] — re-arm wheel/trackpad scrolling that the screen
 ///    round-trip (or the child) may have dropped.
-/// 3. [`Clear`]`(`[`ClearType::All`]`)` — `CSI 2J`, erase the visible screen. A
+/// 3. [`EnableBracketedPaste`] — re-arm the mode [`init_terminal`] owns, for the
+///    same reason and on the same pattern as mouse capture. It MUST live here
+///    rather than in [`init_terminal`] alone: [`hard_reset`] runs
+///    [`reset_child_modes`] (which disables paste, clearing the child's level) and
+///    `DECSTR` on the way back, so the board's own enable has to land AFTER both or
+///    a returning child would silently leave paste off for the rest of the session.
+/// 4. [`Clear`]`(`[`ClearType::All`]`)` — `CSI 2J`, erase the visible screen. A
 ///    WRITE-ONLY clear: unlike [`ratatui::Terminal::clear`] it emits `2J`
 ///    directly and never issues a cursor-position query, so it cannot block on a
 ///    stdin reply from a dirty child (see [`hard_reset`]). The matching
 ///    back-buffer reset is unnecessary here — [`init_terminal`] hands
 ///    [`run_inner`] a brand-new terminal whose first `draw` repaints every cell.
-/// 4. [`Clear`]`(`[`ClearType::Purge`]`)` — `CSI 3J`, erase the emulator's saved
+/// 5. [`Clear`]`(`[`ClearType::Purge`]`)` — `CSI 3J`, erase the emulator's saved
 ///    lines. This is load-bearing: without it the native scrollback bleeds
 ///    through the repainted board (the reported corruption).
 fn reassert_board_screen<W: Write>(w: &mut W) -> io::Result<()> {
@@ -265,9 +309,27 @@ fn reassert_board_screen<W: Write>(w: &mut W) -> io::Result<()> {
         LeaveAlternateScreen,
         EnterAlternateScreen,
         EnableMouseCapture,
+        EnableBracketedPaste,
         Clear(ClearType::All),
         Clear(ClearType::Purge),
     )
+}
+
+/// Clear the child's leaked input modes and THEN re-assert the board's own screen
+/// and modes — the ordered pair [`hard_reset`] performs as its last step.
+///
+/// This exists as ONE helper, rather than two calls in [`hard_reset`], because the
+/// ORDER between them is the contract and a contract that spans two call sites
+/// cannot be pinned by a test: bracketed paste is turned OFF by
+/// [`reset_child_modes`] (`CSI ?2004l`, clearing whatever the child left) and back
+/// ON by [`reassert_board_screen`] (`CSI ?2004h`, the board's own enable). Run in
+/// the other order the board ends up with paste DISABLED after every child return
+/// and every paste silently reverts to the keystroke stream this whole seam exists
+/// to avoid. Composing them here makes that reorder a one-line change in a
+/// [`Write`]-generic function whose emitted bytes a unit test asserts, with no TTY.
+fn reset_child_modes_and_reassert_board<W: Write>(w: &mut W) -> io::Result<()> {
+    reset_child_modes(w)?;
+    reassert_board_screen(w)
 }
 
 /// Assert ONE COMPLETE return-to-known-good-state reset after returning from a
@@ -279,13 +341,13 @@ fn reassert_board_screen<W: Write>(w: &mut W) -> io::Result<()> {
 /// mode per reported bug: a child that exits dirty on `Ctrl-Z` can leave ANY of
 /// the modes it touched set, so the seam sweeps the full set the board depends on
 /// — escape parser, kitty keyboard protocol, cursor shape/visibility, minor DEC
-/// modes, input modes, alt screen, mouse — every time. The kitty keyboard
-/// protocol is the load-bearing addition: a `claude` child that pushed
-/// progressive enhancement and exited without popping leaves an enhancement level
-/// active that re-encodes ordinary keys and scrambles the board's input; it is
-/// NOT one of the modes `restore_terminal` / the older seams ever cleared, so it
-/// persisted across the round trip and was the primary cause of the reported
-/// still-unstable `Ctrl-Z`.
+/// modes, input modes, alt screen, mouse, bracketed paste — every time. The
+/// kitty keyboard protocol is the load-bearing addition: a `claude` child that
+/// pushed progressive enhancement and exited without popping leaves an
+/// enhancement level active that re-encodes ordinary keys and scrambles the
+/// board's input; it is NOT one of the modes `restore_terminal` / the older
+/// seams ever cleared, so it persisted across the round trip and was the
+/// primary cause of the reported still-unstable `Ctrl-Z`.
 ///
 /// [`init_terminal`] re-runs on every board (re)entry and its
 /// [`ratatui::try_init`] re-enables raw mode — [`restore_terminal`] cleared
@@ -331,13 +393,19 @@ fn reassert_board_screen<W: Write>(w: &mut W) -> io::Result<()> {
 ///    the alt-screen + mouse re-assert in step 4 still wins.
 /// 3. [`enable_raw_mode`] — cheap, idempotent confirmation of raw mode (already
 ///    re-applied by `try_init`), so this seam's post-condition — alt screen +
-///    raw mode + mouse capture — is self-contained rather than assumed.
-/// 4. [`reset_child_modes`] — turn off input modes the child may have leaked
-///    (bracketed paste `?2004l`, focus reporting `?1004l`).
-/// 5. [`reassert_board_screen`] — round-trip `Leave`→`EnterAlternateScreen` to
-///    force a FRESH alt buffer (defeating the no-op re-enter), re-arm mouse
-///    capture, clear the visible screen with `Clear(ClearType::All)` (`CSI 2J`),
-///    and purge the native SCROLLBACK with `Clear(ClearType::Purge)` (`CSI 3J`).
+///    raw mode + mouse capture + bracketed paste — is self-contained rather than
+///    assumed.
+/// 4. [`reset_child_modes_and_reassert_board`] — the ordered pair that ends the
+///    seam, kept in ONE helper because the order between its halves is the
+///    contract (see its doc):
+///    * [`reset_child_modes`] first — turn off input modes the child may have
+///      leaked (bracketed paste `?2004l`, focus reporting `?1004l`).
+///    * [`reassert_board_screen`] second — round-trip
+///      `Leave`→`EnterAlternateScreen` to force a FRESH alt buffer (defeating the
+///      no-op re-enter), re-arm mouse capture AND bracketed paste (`?2004h`, the
+///      board's own enable, which must land after the disable above), clear the
+///      visible screen with `Clear(ClearType::All)` (`CSI 2J`), and purge the
+///      native SCROLLBACK with `Clear(ClearType::Purge)` (`CSI 3J`).
 ///
 /// A write-only `2J` is sufficient — no back-buffer reset needed — because
 /// [`init_terminal`] builds a BRAND-NEW [`DefaultTerminal`] with empty buffers on
@@ -366,22 +434,28 @@ fn hard_reset() -> Result<()> {
     // mouse re-assert, so DECSTR's soft reset cannot undo `?1049` / `?100x`.
     reset_terminal_state(&mut out)?;
     enable_raw_mode()?;
-    reset_child_modes(&mut out)?;
-    reassert_board_screen(&mut out)?;
+    // Clear the child's leaked input modes, THEN re-assert the board's own screen
+    // and modes. One helper, because the order between the two is the contract:
+    // bracketed paste is disabled by the first and re-enabled by the second.
+    reset_child_modes_and_reassert_board(&mut out)?;
     Ok(())
 }
 
-/// Wrap the current panic hook so a panic disables mouse capture before the
-/// existing hook runs.
+/// Wrap the current panic hook so a panic disables mouse capture AND bracketed
+/// paste before the existing hook runs.
 ///
 /// Called right after [`ratatui::try_init`], so the hook it wraps is ratatui's,
-/// which restores raw mode + the main screen but leaves mouse capture ON. This
-/// closes the last teardown path — a panic — that would otherwise leak mouse
-/// mode into the user's shell. Disabling mouse is best-effort (errors ignored).
-fn install_mouse_safe_panic_hook() {
+/// which restores raw mode + the main screen but leaves both of those modes ON.
+/// This closes the last teardown path — a panic — that would otherwise leak them
+/// into the user's shell: a leftover mouse mode turns clicks into escape bytes, and
+/// a leftover bracketed paste wraps the shell's own pastes in `ESC[200~`/`ESC[201~`
+/// markers it may print literally. Both disables are best-effort (errors ignored),
+/// and both mirror what [`restore_terminal`] does on the non-panicking paths.
+fn install_mode_safe_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_mouse(&mut io::stdout());
+        let _ = disable_paste(&mut io::stdout());
         previous(info);
     }));
 }
@@ -443,6 +517,30 @@ fn run_inner(terminal: &mut DefaultTerminal, app: &mut App, root: &Path) -> Resu
         match events.recv() {
             Some(event) => match update::handle_event(app, event, root) {
                 Outcome::Continue => {}
+                // A confirmed quick-reply send: fire it on a detached thread and
+                // KEEP drawing — the board never tears down (contrast
+                // `Outcome::Resume`). The child reports back via
+                // `AppEvent::SendFinished` on this same channel, so the completion
+                // status and the reloaded reply both land on the live board.
+                Outcome::Send(req) => {
+                    crate::send::spawn_send(req, events.sender());
+                }
+                // A confirmed interrupt: fire `claude stop` on a detached thread and
+                // KEEP drawing, exactly like `Outcome::Send`. The stop reports back
+                // via `AppEvent::InterruptFinished` on this same channel.
+                Outcome::Interrupt(req) => {
+                    crate::send::spawn_interrupt(req, events.sender());
+                }
+                // A confirmed background-agent launch: fire `claude --bg` on a
+                // detached thread and KEEP drawing, exactly like `Outcome::Send`.
+                // `--bg` returns as soon as the agent is registered and needs no
+                // TTY, so there is nothing here worth a teardown; the launch
+                // reports back via `AppEvent::BgLaunchFinished` on this same
+                // channel, and the agent itself appears on the board through the
+                // watcher reload.
+                Outcome::BgLaunch(req) => {
+                    crate::send::spawn_bg_launch(req, events.sender());
+                }
                 done => break done,
             },
             // All senders dropped (input + watcher + tick gone): exit cleanly.
@@ -473,6 +571,23 @@ mod tests {
         );
     }
 
+    /// The teardown sequence must also include `DisableBracketedPaste`: snapback
+    /// ENABLES that mode in `init_terminal`, so quitting, erroring out, handing off
+    /// to `claude`, or panicking must all hand the mode back off — otherwise the
+    /// user's shell keeps wrapping its own pastes in `ESC[200~`/`ESC[201~`.
+    /// Asserted via the `Write`-generic helper against a `Vec<u8>` (no TTY), exactly
+    /// like its `disable_mouse` sibling above.
+    #[test]
+    fn teardown_emits_the_disable_bracketed_paste_sequence() {
+        let mut buf: Vec<u8> = Vec::new();
+        disable_paste(&mut buf).expect("write DisableBracketedPaste");
+        assert!(
+            buf.windows(6).any(|w| w == b"?2004l"),
+            "teardown must emit DisableBracketedPaste (?2004l), got {:?}",
+            String::from_utf8_lossy(&buf)
+        );
+    }
+
     /// The hard-reset seam must turn OFF the input modes a spawned `claude` child
     /// could leave enabled — bracketed paste (`CSI ?2004`) and focus reporting
     /// (`CSI ?1004`) — so a `Ctrl-Z` that exits `claude` dirty, or an abnormal
@@ -493,6 +608,47 @@ mod tests {
         assert!(
             buf.windows(6).any(|w| w == b"?1004l"),
             "hard reset must disable focus reporting (?1004l), got {seq:?}"
+        );
+    }
+
+    /// Bracketed paste is turned OFF (clearing the child's level) and then back ON
+    /// (the board's own enable) on every return from a spawned `claude` child, IN
+    /// THAT ORDER. Reverse the two and the board comes back with paste disabled
+    /// forever after the first resume, so every subsequent paste degrades to the
+    /// keystroke stream that sends a reply's first line and resumes on its second.
+    ///
+    /// The order is pinned against the ONE production helper that owns it
+    /// (`reset_child_modes_and_reassert_board`, which `hard_reset` calls) rather
+    /// than by writing both halves into a buffer here. That distinction is the
+    /// whole value of this test: a version that called `reset_child_modes` and
+    /// `reassert_board_screen` itself would only assert the order the TEST chose
+    /// and would stay green through a real reorder of the production calls.
+    #[test]
+    fn hard_reset_disables_then_re_enables_bracketed_paste_in_order() {
+        let mut buf: Vec<u8> = Vec::new();
+        reset_child_modes_and_reassert_board(&mut buf).expect("write the child-return sequence");
+        let seq = String::from_utf8_lossy(&buf);
+
+        // crossterm's DisableBracketedPaste is `CSI ?2004 l`, EnableBracketedPaste
+        // `CSI ?2004 h`; the trailing letter is the only difference, so each match
+        // is exact.
+        let off = buf
+            .windows(6)
+            .position(|w| w == b"?2004l")
+            .unwrap_or_else(|| {
+                panic!("the child return must first disable bracketed paste (?2004l), got {seq:?}")
+            });
+        let on = buf
+            .windows(6)
+            .position(|w| w == b"?2004h")
+            .unwrap_or_else(|| {
+                panic!("the child return must re-enable bracketed paste (?2004h), got {seq:?}")
+            });
+
+        assert!(
+            off < on,
+            "the child's leaked paste level must be cleared BEFORE the board \
+             re-asserts its own enable, or the board returns with paste off; got {seq:?}"
         );
     }
 

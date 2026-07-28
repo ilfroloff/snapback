@@ -13,23 +13,28 @@ find the same rule in two places, that is a bug to fix.
    module map, runtime architecture (the dashboard loop, the event loop, the
    load pipeline, terminal-safety seams).
 3. [DOMAIN.md](DOMAIN.md) — **the session format**: store layout, the
-   session/subagent/sidecar distinction, the JSONL fields relied on, and the
-   derived concepts (label, grouping, content index, fork lineage, turn count,
-   live agents, scopes).
+   session/subagent/sidecar distinction, the JSONL fields relied on, the derived
+   concepts (label, grouping, content index, fork lineage, turn count, live
+   agents, scopes), and the per-state routing tables — the hand-offs, the
+   `Ctrl-R` / `Ctrl-K` gates, and the terminal-paste owner table.
 4. [PATTERNS.md](PATTERNS.md) — **how to build new things**: the repeated
    implementation rules and the testing conventions to match.
 5. [OPERATIONS.md](OPERATIONS.md) — build/test/lint/run commands, the
    `CLAUDE_PROJECTS_DIR` override, the hidden `--print-list` mode, the CI +
    release-plz automation, and the pre-finish validation checklist.
+6. [CLAUDE_CLI.md](CLAUDE_CLI.md) — **the external `claude` binary**: version
+   pin, the argv `snapback` spawns, top-level flags, commands, and the hidden
+   `stop`/`attach` commands it depends on.
 
 ## Section ownership (avoid duplication)
 
 | Topic | Lives in |
 | --- | --- |
 | Module responsibilities, stack, runtime wiring | ARCHITECTURE |
-| Store layout, JSONL fields, label/grouping/fork-lineage/turn-count/live-agent semantics | DOMAIN |
+| Store layout, JSONL fields, label/grouping/fork-lineage/turn-count/live-agent semantics, and the routing tables (hand-off, `Ctrl-R`, `Ctrl-K`, `Event::Paste`) | DOMAIN |
 | Fail-soft / authoritative-from-file / isolation / styling rules, testing conventions | PATTERNS |
 | Commands, env vars, CI + release automation, validation checklist | OPERATIONS |
+| External `claude` CLI surface (flags, commands, version pin, spawned argv) | CLAUDE_CLI |
 | Critical rules + engineering principles | AGENTS.md |
 
 ## Maintenance
@@ -38,3 +43,8 @@ These docs are generated and refreshed by the `project-agent-docs` skill from
 the real repository. When the code structure changes, re-run that skill rather
 than hand-patching, so stale references are removed in the same pass. Git history
 is the refresh log — do not keep a changelog inside these docs.
+
+Exception: [CLAUDE_CLI.md](CLAUDE_CLI.md) documents the external `claude` binary,
+not this repo, so the skill cannot regenerate it. Refresh it by re-capturing from
+the live CLI per its own
+[Refreshing this doc](CLAUDE_CLI.md#refreshing-this-doc) section.

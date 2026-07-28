@@ -110,6 +110,50 @@ pub fn render(session: &Session, width: usize, known_agents: &HashSet<&str>) -> 
     render_file_collect(&session.file, PREVIEW_LINES, width, known_agents)
 }
 
+/// The optimistic trailing turns shown in the preview while a quick-reply send is
+/// in flight, so the message you just sent — and the fact that claude is working on
+/// it — appear immediately, before claude has written either to disk.
+///
+/// `echo_message` is `Some(text)` only while the sent user turn is NOT yet on disk
+/// (the caller gates this on the session's turn count). The echoed `▶ you` turn is
+/// styled and wrapped exactly like a real one — same marker, same markdown body
+/// pass — so the instant claude appends the real turn the caller passes `None` and
+/// the swap is seamless (never a doubled line). `working_label` (e.g. `⠙ cooking…`)
+/// is the live spinner + phase word, always shown as claude's pending turn: a DIM
+/// placeholder, like `[thinking]`, until the send completes.
+///
+/// Appended to the on-disk transcript by the view; the reply itself still renders
+/// through the ordinary watcher → reload → [`render`] path once on disk. Pure (no
+/// I/O, no `App`), so the shape is unit-testable without a terminal.
+#[must_use]
+pub fn pending_reply_turns(
+    echo_message: Option<&str>,
+    working_label: &str,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if let Some(message) = echo_message {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            YOU_MARKER.to_string(),
+            you_style(),
+        )));
+        // Same body pass as a real user turn, so the echo wraps and styles
+        // identically to the turn that will replace it.
+        lines.extend(collapse_body_lines_collect(message, width).0);
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        CLAUDE_MARKER.to_string(),
+        claude_style(),
+    )));
+    lines.push(Line::from(Span::styled(
+        working_label.to_string(),
+        marker_style(),
+    )));
+    lines
+}
+
 /// Render `path` into a [`RenderedPreview`]: the styled transcript plus the
 /// clickable [`LinkRegion`]s, keeping the last `max_lines` visual lines.
 ///
@@ -249,13 +293,7 @@ fn render_record(
             }
             let mut lines = vec![
                 Line::from(""),
-                marker_line_with_time(
-                    "\u{25b6} you".to_string(),
-                    you_style(),
-                    None,
-                    record,
-                    prev_day,
-                ),
+                marker_line_with_time(YOU_MARKER.to_string(), you_style(), None, record, prev_day),
             ];
             // Body links are relative to the body; rebase them past the blank +
             // marker lines that lead every turn.
@@ -273,7 +311,7 @@ fn render_record(
             let mut lines = vec![
                 Line::from(""),
                 marker_line_with_time(
-                    "\u{25cf} claude".to_string(),
+                    CLAUDE_MARKER.to_string(),
                     claude_style(),
                     agent.effective(),
                     record,
@@ -487,6 +525,13 @@ fn summary_style() -> Style {
         .fg(Color::Yellow)
         .add_modifier(Modifier::BOLD)
 }
+
+/// The `▶ you` user-turn marker (glyph + label). One source of truth for both the
+/// real render ([`render_record`]) and the optimistic echo ([`pending_reply_turns`]),
+/// so the two are byte-identical and the swap on disk-landing is seamless.
+const YOU_MARKER: &str = "\u{25b6} you";
+/// The `● claude` assistant-turn marker (glyph + label); see [`YOU_MARKER`].
+const CLAUDE_MARKER: &str = "\u{25cf} claude";
 
 /// `▶ you` turn separator.
 fn you_style() -> Style {
@@ -1623,6 +1668,39 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    /// The optimistic reply tail echoes the sent message under a `▶ you` turn plus
+    /// a pending `● claude` placeholder while a quick-reply is in flight, then drops
+    /// the echo — leaving only the placeholder — once the caller signals the real
+    /// turn has landed (`echo_message = None`). Styled exactly like real turns, no
+    /// embedded ANSI.
+    #[test]
+    fn pending_reply_turns_echoes_then_yields_to_the_real_turn() {
+        // Before the real turn lands: echo the message + a "sending…" placeholder.
+        let with_echo = pending_reply_turns(Some("hello there"), "\u{280b} sending\u{2026}", WIDE);
+        let text = flatten(&Text::from(with_echo));
+        assert!(text.contains(YOU_MARKER), "echoes a `you` turn:\n{text}");
+        assert!(text.contains("hello there"), "echoes the message:\n{text}");
+        assert!(
+            text.contains(CLAUDE_MARKER) && text.contains("sending"),
+            "has a pending claude placeholder:\n{text}"
+        );
+
+        // After it lands: no echoed `you` turn, only the pending claude placeholder,
+        // so the real turn (rendered by the reload) is never doubled.
+        let no_echo = pending_reply_turns(None, "\u{280b} cooking\u{2026}", WIDE);
+        let text = flatten(&Text::from(no_echo));
+        assert!(
+            !text.contains(YOU_MARKER),
+            "no echoed `you` turn once landed:\n{text}"
+        );
+        assert!(
+            text.contains(CLAUDE_MARKER) && text.contains("cooking"),
+            "keeps the placeholder until the send finishes:\n{text}"
+        );
+        // Styling is via ratatui Style, never embedded ANSI (TERMINAL-SAFE STYLING).
+        assert!(!text.contains('\u{1b}'), "reply tail must not embed ANSI");
     }
 
     #[test]

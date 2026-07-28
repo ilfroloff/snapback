@@ -219,7 +219,9 @@ confirm subagents/sidecars were excluded). It is intentionally omitted from
 - `claude` on `PATH` — the binary that resume/fork/attach spawn, and the source
   of live-agent badges. If it is missing or fails to launch, the hand-off fails
   soft to a board status message and live detection degrades to "nothing is
-  live", so the live-agent badges disappear.
+  live", so the live-agent badges disappear. Its flags, commands, version pin,
+  and the exact argv `snapback` builds are in
+  [CLAUDE_CLI.md](CLAUDE_CLI.md).
 
 ## Validation checklist before finishing a change
 
@@ -230,7 +232,7 @@ confirm subagents/sidecars were excluded). It is intentionally omitted from
 4. `cargo fmt` — formatted.
 5. If discovery/parsing/model changed: `snapback --print-list` against a real or
    fixture store still shows the expected resumable set (no subagents/sidecars).
-6. If keys/flags changed: the key table in `update.rs`, the `USAGE`/`KEYS` in
-   `cli.rs`, the help line in `view.rs`, and the README key map all agree.
+6. If keys/flags — or what a key ROUTES TO — changed: every surface named by the
+   KEEP KEY DOCS IN SYNC rule in [../../AGENTS.md](../../AGENTS.md) agrees.
 7. Refresh the agent docs per the self-healing stage in
    [../../AGENTS.md](../../AGENTS.md).

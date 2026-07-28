@@ -209,10 +209,11 @@ pub enum SessionAction {
 ///
 /// Each [`SessionAction`] reads ONLY the field its invocation needs — a
 /// Resume/Fork the `session_id`, an Attach the `job_id`, a New session the
-/// optional `agent` — so the `check_*` gate that owns the data fills just that one
-/// field (`..Default::default()`) and the rest stay inert (never emitted for the
-/// non-matching actions). Bundling the inputs here keeps the seam a single
-/// `(action, ctx)` call rather than widening it into a positional grab bag.
+/// optional `agent` and `prompt` — so the `check_*` gate that owns the data fills
+/// just those fields (`..Default::default()`) and the rest stay inert (never
+/// emitted for the non-matching actions). Bundling the inputs here keeps the seam
+/// a single `(action, ctx)` call rather than widening it into a positional grab
+/// bag.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HandoffCtx<'a> {
     /// Authoritative session id for a `Resume`/`Fork` (read from inside the file).
@@ -223,6 +224,11 @@ pub struct HandoffCtx<'a> {
     pub job_id: &'a str,
     /// Optional agent name for a `New` session; `None` (or blank) launches bare.
     pub agent: Option<&'a str>,
+    /// Optional first prompt for a `New` session, emitted as claude's trailing
+    /// POSITIONAL argument. `None` (the default, and every other action's value)
+    /// launches with no positional — byte-identical to a bare interactive start.
+    /// See [`build_new_argv`] for what the positional does and does NOT do.
+    pub prompt: Option<&'a str>,
 }
 
 /// Build the `claude` argv for `action`, reading the one input it needs from
@@ -240,7 +246,7 @@ pub fn argv_for(action: SessionAction, ctx: &HandoffCtx) -> Vec<String> {
         SessionAction::Resume => build_argv(ctx.session_id, false),
         SessionAction::Fork => build_argv(ctx.session_id, true),
         SessionAction::Attach => build_attach_argv(ctx.job_id),
-        SessionAction::New => build_new_argv(ctx.agent),
+        SessionAction::New => build_new_argv(ctx.agent, ctx.prompt),
     }
 }
 
@@ -283,19 +289,46 @@ pub fn build_attach_argv(job_id: &str) -> Vec<String> {
 }
 
 /// Build the `claude` argv for STARTING a brand-new interactive session
-/// (bare `claude`, no `-r`), optionally bound to a selected agent.
+/// (bare `claude`, no `-r`), optionally bound to a selected agent and optionally
+/// carrying a first prompt.
 ///
 /// Unlike [`build_argv`] (resume/fork) and [`build_attach_argv`] (reattach), a
 /// new session has no source file and no session id to pass — `claude` mints one
 /// itself. When `agent` is `Some(non-empty)`, `--agent <name>` is appended so the
 /// fresh session starts bound to that agent; when it is `None` — or `Some` of an
 /// empty/whitespace string, treated identically so a blank pick can never emit a
-/// bare `--agent` with no value — the invocation is just the program: `claude`.
-/// Reached through [`argv_for`] (`New`); pure so the exact invocation is directly
-/// assertable, and it funnels through the SAME [`launch`] round trip as every
-/// other hand-off.
+/// bare `--agent` with no value — no agent flag is emitted.
+///
+/// # The prompt is a trailing POSITIONAL, and it AUTO-SUBMITS
+///
+/// `prompt` is appended as claude's trailing positional argument
+/// (`claude [options] [command] [prompt]`, documented as "Your prompt"). That
+/// makes it the session's FIRST TURN, sent the moment claude starts — the user
+/// does not get to read or edit it first.
+///
+/// A PRE-FILL — putting the text in claude's input box UNSUBMITTED, for the user
+/// to edit before sending — was CHECKED FOR in `claude --help` and **does not
+/// exist**. The two near-misses are not it:
+///
+/// * `-n, --name <name>` sets a session DISPLAY NAME (shown in the prompt box, the
+///   `/resume` picker and the terminal title). It labels the session; it puts
+///   nothing in the input.
+/// * The `--input-format` / `--output-format` / streaming-input family is
+///   documented `--print`-only ("only works with --print"), i.e. non-interactive
+///   SDK mode — the opposite of the interactive session this argv starts.
+///
+/// So the trailing positional is the ONLY available mechanism, and its
+/// auto-submitting behaviour is a property of the CLI rather than a choice made
+/// here. Anything user-facing that offers this must say "run interactively" and
+/// must NOT imply a review step (AGENTS.md KEEP KEY DOCS IN SYNC covers the
+/// surfaces that wording lives on).
+///
+/// `None` emits no positional at all, so a promptless new session is
+/// byte-identical to what it has always been. Reached through [`argv_for`]
+/// (`New`); pure so the exact invocation is directly assertable, and it funnels
+/// through the SAME [`launch`] round trip as every other hand-off.
 #[must_use]
-pub fn build_new_argv(agent: Option<&str>) -> Vec<String> {
+pub fn build_new_argv(agent: Option<&str>, prompt: Option<&str>) -> Vec<String> {
     let mut argv = vec!["claude".to_string()];
     if let Some(name) = agent {
         let name = name.trim();
@@ -303,6 +336,9 @@ pub fn build_new_argv(agent: Option<&str>) -> Vec<String> {
             argv.push("--agent".to_string());
             argv.push(name.to_string());
         }
+    }
+    if let Some(prompt) = prompt {
+        argv.push(prompt.to_string());
     }
     argv
 }
@@ -468,7 +504,7 @@ pub fn check_attach(session: &Session, agent_id: Option<&str>) -> Result<Ready, 
 }
 
 /// Terminal-up gate for STARTING a brand-new session in the launch directory,
-/// optionally bound to a selected `agent`.
+/// optionally bound to a selected `agent` and optionally opening with `prompt`.
 ///
 /// The counterpart of [`check`] for a session that does not exist yet. There is
 /// deliberately NO authoritative re-read here: a new session has no source file
@@ -477,11 +513,19 @@ pub fn check_attach(session: &Session, agent_id: Option<&str>) -> Result<Ready, 
 /// existence gate — the very predicate `plan_from_parts` applies to a resume: if
 /// `launch_dir` is still a directory, produce a [`Ready`] that `chdir`s there and
 /// spawns `claude` (bare, or `claude --agent <name>` when `agent` is
-/// `Some(non-empty)`) via the identical [`launch`] round trip; if it vanished
-/// (deleted out from under the board), refuse with a clear board status rather
-/// than crash. The plan carries [`NEW_SESSION_NONZERO_HINT`] so a non-zero exit
-/// surfaces the new-session hint, not the resume one.
-pub fn check_new(launch_dir: &Path, agent: Option<&str>) -> Result<Ready, ResumeError> {
+/// `Some(non-empty)`, plus a trailing positional prompt when `prompt` is `Some`)
+/// via the identical [`launch`] round trip; if it vanished (deleted out from under
+/// the board), refuse with a clear board status rather than crash. The plan
+/// carries [`NEW_SESSION_NONZERO_HINT`] so a non-zero exit surfaces the
+/// new-session hint, not the resume one.
+///
+/// A `Some(prompt)` AUTO-SUBMITS as the session's first turn — see
+/// [`build_new_argv`] for why no pre-fill alternative exists.
+pub fn check_new(
+    launch_dir: &Path,
+    agent: Option<&str>,
+    prompt: Option<&str>,
+) -> Result<Ready, ResumeError> {
     if launch_dir.is_dir() {
         Ok(Ready {
             cwd: launch_dir.to_path_buf(),
@@ -489,6 +533,7 @@ pub fn check_new(launch_dir: &Path, agent: Option<&str>) -> Result<Ready, Resume
                 SessionAction::New,
                 &HandoffCtx {
                     agent,
+                    prompt,
                     ..Default::default()
                 },
             ),
@@ -841,15 +886,15 @@ mod tests {
     #[test]
     fn new_argv_is_bare_claude_when_no_agent() {
         // A brand-new session with no agent mints its own id, so the invocation is
-        // just the program — no `-r`, no id, no `--agent`.
-        assert_eq!(build_new_argv(None).join(" "), "claude");
+        // just the program — no `-r`, no id, no `--agent`, no positional.
+        assert_eq!(build_new_argv(None, None).join(" "), "claude");
     }
 
     #[test]
     fn new_argv_appends_agent_flag_when_an_agent_is_selected() {
         // A selected agent binds the fresh session via `--agent <name>`.
         assert_eq!(
-            build_new_argv(Some("code-reviewer")).join(" "),
+            build_new_argv(Some("code-reviewer"), None).join(" "),
             "claude --agent code-reviewer"
         );
     }
@@ -858,8 +903,30 @@ mod tests {
     fn new_argv_treats_empty_or_whitespace_agent_as_none() {
         // A blank / whitespace pick must never emit a valueless `--agent`; it
         // collapses to a bare `claude`, identical to the `None` case.
-        assert_eq!(build_new_argv(Some("")).join(" "), "claude");
-        assert_eq!(build_new_argv(Some("   ")).join(" "), "claude");
+        assert_eq!(build_new_argv(Some(""), None).join(" "), "claude");
+        assert_eq!(build_new_argv(Some("   "), None).join(" "), "claude");
+    }
+
+    /// A first prompt rides as the TRAILING POSITIONAL — the only mechanism the
+    /// CLI offers (no pre-fill exists; see `build_new_argv`'s docs) — and stays ONE
+    /// argv element so a multiline draft reaches claude intact. `None` emits no
+    /// positional at all, keeping a promptless start byte-identical to before.
+    #[test]
+    fn new_argv_appends_the_prompt_as_a_trailing_positional() {
+        assert_eq!(
+            build_new_argv(Some("planner"), Some("ship the thing")).join(" "),
+            "claude --agent planner ship the thing"
+        );
+        assert_eq!(
+            build_new_argv(None, Some("ship the thing")).join(" "),
+            "claude ship the thing"
+        );
+        // The positional is LAST, after any `--agent <name>` pair.
+        let argv = build_new_argv(Some("planner"), Some("line one\nline two"));
+        assert_eq!(argv.last().map(String::as_str), Some("line one\nline two"));
+        assert_eq!(argv.len(), 4, "a newline must not re-split the prompt");
+        // No prompt -> no positional (today's behaviour, unchanged).
+        assert_eq!(build_new_argv(Some("planner"), None).len(), 3);
     }
 
     #[test]
@@ -934,6 +1001,47 @@ mod tests {
             "claude",
             "a blank agent pick must never emit a bare --agent through the seam"
         );
+        // The optional first prompt threads through the SAME seam as the agent,
+        // landing as the trailing positional rather than a parallel argv path.
+        assert_eq!(
+            argv_for(
+                SessionAction::New,
+                &HandoffCtx {
+                    agent: Some("planner"),
+                    prompt: Some("ship the thing"),
+                    ..Default::default()
+                }
+            )
+            .join(" "),
+            "claude --agent planner ship the thing"
+        );
+    }
+
+    /// The `prompt` field is inert for every action that is not `New` — a
+    /// Resume/Fork/Attach must never grow a stray positional just because the ctx
+    /// could carry one.
+    #[test]
+    fn a_prompt_in_the_ctx_is_inert_for_every_action_but_new() {
+        for (action, expected) in [
+            (SessionAction::Resume, "claude -r abc-123"),
+            (SessionAction::Fork, "claude -r abc-123 --fork-session"),
+            (SessionAction::Attach, "claude attach ca56b543"),
+        ] {
+            let argv = argv_for(
+                action,
+                &HandoffCtx {
+                    session_id: "abc-123",
+                    job_id: "ca56b543",
+                    agent: Some("planner"),
+                    prompt: Some("ship the thing"),
+                },
+            );
+            assert_eq!(
+                argv.join(" "),
+                expected,
+                "{action:?} must ignore the agent and prompt inputs"
+            );
+        }
     }
 
     #[test]
@@ -944,7 +1052,7 @@ mod tests {
         // new-session non-zero hint, NOT the resume-worded one.
         let existing = std::env::temp_dir();
         assert!(existing.is_dir(), "temp_dir should exist");
-        match check_new(&existing, None) {
+        match check_new(&existing, None, None) {
             Ok(Ready {
                 cwd,
                 argv,
@@ -968,11 +1076,36 @@ mod tests {
     fn check_new_carries_the_selected_agent_into_the_argv() {
         // A selected agent threads through the gate into `claude --agent <name>`.
         let existing = std::env::temp_dir();
-        match check_new(&existing, Some("planner")) {
+        match check_new(&existing, Some("planner"), None) {
             Ok(ready) => {
                 assert_eq!(ready.argv.join(" "), "claude --agent planner");
                 assert_eq!(ready.nonzero_hint, NEW_SESSION_NONZERO_HINT);
             }
+            Err(e) => panic!("an existing launch dir must proceed: {e:?}"),
+        }
+    }
+
+    /// The interactive escape hatch (`Ctrl-O` in the background draft pane) reuses
+    /// this very gate, so a drafted prompt reaches the SAME teardown round trip as
+    /// every other hand-off — carried as the trailing positional, with the
+    /// new-session hint intact and race recovery still structurally impossible.
+    #[test]
+    fn check_new_carries_a_drafted_prompt_into_the_argv() {
+        let existing = std::env::temp_dir();
+        match check_new(&existing, Some("planner"), Some("ship the thing")) {
+            Ok(ready) => {
+                assert_eq!(
+                    ready.argv.join(" "),
+                    "claude --agent planner ship the thing"
+                );
+                assert_eq!(ready.nonzero_hint, NEW_SESSION_NONZERO_HINT);
+                assert_eq!(ready.race_probe_id, None);
+            }
+            Err(e) => panic!("an existing launch dir must proceed: {e:?}"),
+        }
+        // No agent, just a prompt.
+        match check_new(&existing, None, Some("ship the thing")) {
+            Ok(ready) => assert_eq!(ready.argv.join(" "), "claude ship the thing"),
             Err(e) => panic!("an existing launch dir must proceed: {e:?}"),
         }
     }
@@ -983,7 +1116,7 @@ mod tests {
         // status, never a crash.
         let missing = PathBuf::from("/no/such/snapback/launch/dir/anywhere");
         assert!(!missing.exists(), "test path must not exist");
-        match check_new(&missing, None) {
+        match check_new(&missing, None, None) {
             Err(ResumeError::Refused(message)) => {
                 assert!(message.contains("no longer exists"), "{message}");
             }

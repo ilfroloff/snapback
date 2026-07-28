@@ -22,6 +22,7 @@ pub mod delete;
 pub mod hidden;
 mod resume;
 mod search;
+mod send;
 mod store;
 mod tui;
 mod watch;
@@ -92,8 +93,12 @@ pub fn run() {
                 app.apply_sessions(SessionStore::load_from(&root));
             }
             // `run` only breaks its own loop on Quit/Resume; Continue never
-            // escapes, but treat it as a clean exit for totality.
-            Ok(Outcome::Continue) => break,
+            // escapes, and a quick-reply Send, an interrupt, and a background-agent
+            // launch are all handled INSIDE `run_inner` (the board stays up, so none
+            // of them propagates here) — treat them all as a clean exit for totality.
+            Ok(
+                Outcome::Continue | Outcome::Send(_) | Outcome::Interrupt(_) | Outcome::BgLaunch(_),
+            ) => break,
             Err(err) => {
                 // `tui::run` restores the terminal on every exit once it is live
                 // — including this error path — so it is already out of raw mode
@@ -327,7 +332,7 @@ mod tests {
         let mut app = app_with_live(&[]);
         let ready = resume::Ready {
             cwd: PathBuf::from("/tmp"),
-            argv: resume::build_new_argv(None),
+            argv: resume::build_new_argv(None, None),
             nonzero_hint: resume::NEW_SESSION_NONZERO_HINT,
             race_probe_id: None,
         };

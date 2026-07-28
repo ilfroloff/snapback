@@ -62,7 +62,12 @@ Decision logic is pure and unit-tested; side effects sit in thin wrappers over
 it. Follow this split when adding behavior:
 
 - Pure, tested: `resume::plan` / `plan_from_parts` / `build_argv` /
-  `build_new_argv` / `status_for_exit`; `defined_agents::select_agents` /
+  `build_new_argv` / `status_for_exit`; every decision in `send` — `reply_gate` /
+  `interrupt_gate` (the whole routing tree, asserted with no process spawned),
+  `build_send_argv` / `build_stop_argv` / `build_bg_launch_argv`, `plan_send` /
+  `plan_bg_launch`, and the `status_for_output` / `status_for_failed_send` /
+  `status_for_stop` / `status_for_bg_launch` mapping;
+  `compose::compose_key_to_action`; `defined_agents::select_agents` /
   `parse_frontmatter`; `agents::classify` and the outputs derived from it
   (`qualifier_copy`, the shared banner/list-row phrase that `friendly_status`
   fuses onto the kind label, plus `is_active`) and both argv builders (`agents_argv` /
@@ -71,10 +76,12 @@ it. Follow this split when adding behavior:
   without one); `store::lineage`'s `lineage_key` / `head_of` / `fold` (the whole
   fold is one pure fn of `(sessions, filtered, expanded)`, so the `(+N)` board can
   be tested as a list transformation with no terminal and no store);
-  `update::key_to_action` / `wheel_target`; every `App` state transition (incl.
+  `update::key_to_action` / `wheel_target` / `accept_paste` (line-ending
+  normalization plus the char-counted cap, fused so neither can be skipped at a
+  call site) / `flatten_for_query`; every `App` state transition (incl.
   `pick_default_index`, the agent-picker cycle, and `child_indices`, which marks
   the indented rows by reusing `lineage::head_of` rather than re-deriving a head);
-  `view`'s `wrapped_rows` / `clamp_preview_offset` / `preview_split` /
+  `view`'s `wrapped_text_rows` / `clamp_preview_offset` / `preview_split` /
   `centered_rect` / `highlight_runs` / `fit_label` (the marker-vs-label width
   reservation, pure so it is tested as arithmetic rather than only through a
   rendered pane) / `child_msgs` and `fit_child_msgs` (a lineage child's
@@ -154,17 +161,57 @@ into a pinned banner row and the transcript beneath it, and returns the WHOLE
 inner rect when there is no banner (so a banner-less pane's geometry is exactly
 `Block::inner`, unchanged). Three rules follow:
 
-- `preview_split` is the ONE place that geometry is derived. `render_preview`
-  draws against its rects and `update::link_under_pointer` hit-tests against the
-  same transcript rect. A click resolves through `App::preview_scroll` and the
-  width-scoped hit cache, both measured from that rect's origin — derive it
-  anywhere else and a click silently opens the wrong link.
+- `preview_split` is the ONE place the banner/transcript geometry is derived.
+  `render_preview` draws against its rects and `update::link_under_pointer`
+  hit-tests against the same transcript rect. A click resolves through
+  `App::preview_scroll` and the width-scoped hit cache, both measured from that
+  rect's origin — derive it anywhere else and a click silently opens the wrong
+  link. The compose split (`preview_compose_split`) is built ON `preview_split`,
+  carving the docked compose zone off the bottom of that same transcript rect
+  rather than re-deriving it; a docked compose zone shrinks the transcript, but
+  link hit-testing is gated off while composing (`overlay_active`), so the two
+  never disagree. Both rects trace back to `preview_inner`, the ONE place the
+  pane's border inset is applied — which matters most for the docked compose
+  zone, because it then draws a border of its OWN: measure it from the pane's
+  OUTER rect and its editor is four columns narrower than whatever measured it,
+  so a wrapping draft under-grows and the editor scrolls its own first row away.
+  That is why the box's height is asked of the editor rather than modeled here at
+  all (see `ComposeState::screen_rows`).
+- **A height is ASKED OF THE WIDGET that draws it, never modeled beside it.** Both
+  wrapping panes now do this and for the same reason: the compose box asks the
+  editor (`ComposeState::screen_rows`), and the transcript asks ratatui
+  (`view::wrapped_text_rows` → `Paragraph::line_count`, the only public door to the
+  private `reflow::WordWrapper` — hence the `unstable-rendered-line-info` feature
+  on the exact `ratatui` pin). A `ceil(width / inner)` character-packing count is a
+  DIFFERENT function of the same text, wrong in BOTH directions: it under-counts
+  where a row ends early at a word boundary (which made the tail of a long
+  transcript unreachable, since `max_offset = content_h - inner_height`) and
+  over-counts where the wrapper swallows the whitespace it broke on. That model
+  survives in exactly one place — `wrapped_line_height`, backing the mouse
+  hit-test's per-line map, which `line_count`'s single TOTAL cannot answer — and it
+  is documented there as an approximation with the click drift it implies. The
+  transcript's count is measured ONCE per (session, width), inside the
+  `preview_cache` entry, so it can never be invalidated apart from the text it
+  describes; whatever is NOT that cached transcript (the draft card, an in-flight
+  reply's echo turns) is measured at the draw site.
 - `has_banner` is **`view::preview_banner(app).is_some()` — never liveness**.
   Since the poller passes `--all`, an agent that reported completion still has a
   banner while claude would not call it live; keying the geometry on liveness
   would draw the banner but hit-test one row off for every `done` session. Name
   it for the banner, not for liveness. Liveness is also *unaskable* here: it now
   means a shell-out to claude (`App::is_live_now`), which a render must never do.
+  Anything that REPLACES the transcript must therefore suppress the banner inside
+  that one fn rather than skipping it at the draw site: the in-flight quick reply
+  does (its echo turns take the banner's place inline) and so does the new-session
+  draft card (there is no session to describe). Skip it at the draw site instead
+  and the hit-test still reserves a row that was never painted.
+- **A replacement pane must not write its own offset back.** `render_preview`
+  persists the clamped offset into `App::preview_scroll` so the scroll keys stay in
+  bounds, and that is right only while the transcript is what was measured. The
+  draft card is four lines, so it clamps every offset to 0; writing that back
+  rewound the previewed session to the top the moment a draft opened and handed it
+  back there on `Esc`. `preview_scroll` describes the TRANSCRIPT, so a pane showing
+  something else renders from the clamped value and leaves the field alone.
 - The split is **vertical only**, so a banner and a banner-less pane share one
   inner width and therefore one `preview_cache` entry. Keep it that way: a
   banner-dependent width would thrash the cache on every agents poll.
@@ -177,7 +224,16 @@ deliver `AppEvent`s onto the merged channel. Threads exit when the receiver drop
 (bounded to the board session) and the input reader is **joined on `EventLoop`
 drop** so it releases stdin before `claude` is spawned onto the same fd. New
 background work follows the same pattern: own thread, `AppEvent` variant,
-self-terminating on send failure.
+self-terminating on send failure. The quick-reply send (`send::spawn_send`) is the
+reference instance: a **one-shot** detached thread — spawned per `Ctrl-R` send, not a
+poller — that runs the multi-second `claude -p` child to completion and delivers a
+single `AppEvent::SendFinished`. It mirrors `resume::open_url` (fire-and-forget off
+the render loop), never `resume::launch` (which spawns+waits after a teardown), so
+the board keeps drawing while the child runs. The pure send DECISION is returned as
+`Outcome::Send` and the spawn happens in the `run` driver, keeping the effect out of
+the pure event handler. `send::spawn_interrupt` and `send::spawn_bg_launch` are the
+same shape for `claude stop` and `claude --bg`; a new one-shot child belongs here
+rather than behind a teardown whenever it needs no TTY.
 
 The rule is about the **poll cadence**, not about the word "shell-out". A
 ONE-SHOT at hand-off is a different thing and is allowed — `agents::live_agents`
@@ -299,7 +355,8 @@ No magic numbers. Tunables are named `const`s with a rationale comment near the
 top of their module: `DEBOUNCE` / `TICK` / `AGENTS_REFRESH` (`watch`),
 `LABEL_MAX` (`label`), `CONTENT_INDEX_CAP` (`parse`), `PREVIEW_LINES` /
 `TABLE_MAX_WIDTH` (`preview`), `PREVIEW_WHEEL_STEP` / `LIST_WHEEL_STEP` (`app`),
-`BLINK_TICKS` (`view`). Add new tunables the same way.
+`PASTE_MAX_CHARS` (`tui::update`), `BLINK_TICKS` (`view`). Add new tunables the
+same way.
 
 A const whose rationale depends on ANOTHER const says so and names it:
 `BLINK_TICKS` is meaningless without `watch::TICK` (they multiply into the pulse's
@@ -323,22 +380,69 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    only while the query is empty; arrows, Enter, Tab, and `Ctrl-*` always act so
    search never blocks navigation).
 2. `apply_action` mutates the `App` and returns an `Outcome`
-   (`Continue`/`Quit`/`Resume`).
+   (`Continue`/`Quit`/`Resume`/`Send`/`Interrupt`/`BgLaunch`). `Send`, `Interrupt`
+   and `BgLaunch` carry a confirmed `SendRequest` / `InterruptRequest` /
+   `BgLaunchRequest` the driver spawns without a teardown (the board stays up), the
+   way `Resume` carries a confirmed `Ready` — the decision is data, the effect is
+   the driver's. Add a new effect this way, not by spawning inside the handler.
+   Which of the two shapes a new action takes is decided by the CHILD, not by what
+   it is called: a background-agent launch is `--bg` (returns at once, needs no
+   TTY) so it stays on the no-teardown side, while its `Ctrl-O` twin hands the
+   terminal over and is therefore an ordinary `Resume`.
 3. Modal state owns the keyboard: ONE `App.modal: Option<Modal>` serves every
-   overlay — the running-session choice, the new-session agent picker, and the
-   hard-delete confirm — through the generic `modal_key` → `confirm_modal`
+   titled overlay — the running-session choice, the new-session agent picker, and
+   the hard-delete confirm — through the generic `modal_key` → `confirm_modal`
    machine, dispatching each choice's `ModalAction` tag (`Row` layout binds the
-   horizontal keys, `List` does not). The `Ctrl-X` leader chord is a second
-   keyboard owner: while `App.pending_chord` is set, `chord_key` routes the next
-   key (`x` hide, `d` delete-confirm, `h` show-hidden, anything else cancels).
-   `App::overlay_active` (`modal.is_some() || pending_chord`) gates mouse actions
-   (splitter drag / link open) so none fires while either is up. A mouse wheel is
-   handled **before** and **independent of** that gate.
+   horizontal keys, `List` does not). A key that belongs to ONE overlay rather than
+   to modals in general is narrowed twice, at both stages: the picker's `Ctrl-O` is
+   bound on the `List` layout in `modal_key` and acted on only for a
+   `ModalAction::New` choice in `launch_pick_interactively`, so neither a new `Row`
+   modal nor a future `List` one can inherit a verb it has no meaning for. Four
+   more keyboard owners sit alongside it: the `Ctrl-X` leader chord (while
+   `App.pending_chord` is set, `chord_key` routes the next key — `x` hide, `d`
+   delete-confirm, `h` show-hidden, anything else cancels), the "stop the
+   waiting agent?" confirmation via `App.pending_stop` (a plain Enter/Esc gate
+   before compose, for the `needs input` quick-reply path), its `Ctrl-K` sibling
+   `App.pending_interrupt` (the same Enter/Esc gate, but resolving to a bare
+   `Outcome::Interrupt` rather than into compose), and the compose zone via
+   `App.compose` + its `compose_key_to_action` machine — ONE keyboard owner for
+   BOTH drafts, since which one is open is a `ComposeTarget` rather than a
+   second piece of state. `handle_event` checks each in turn before the board.
+   `App::overlay_active` (`modal.is_some() || compose.is_some() ||
+   draft.is_some() || pending_stop.is_some() || pending_interrupt.is_some() ||
+   pending_chord`) gates mouse actions (splitter drag / link open) so none fires
+   while any is up. A mouse wheel is handled **before** and **independent of** that
+   gate. A new keyboard owner must be added to `overlay_active` too, or the mouse
+   will act underneath it.
+
+   A **terminal paste** is routed by that same list, and `update::handle_paste`
+   walks it in the identical order — the per-owner table is
+   [DOMAIN.md](DOMAIN.md#terminal-paste-routing-eventpaste). Two rules follow for
+   anyone editing this area. A new keyboard owner must be added to `handle_paste`
+   as well, not only to `handle_event` and `overlay_active`, or pasted text lands
+   on the surface underneath it. And `handle_paste` returns no `Outcome` on
+   purpose: a paste is DATA, so it structurally cannot send, resume, or answer a
+   confirmation. That is the shape of the fix for the bug where a pasted newline
+   arrived as a bare `Enter` — `ComposeAction::Send` — and submitted a draft's
+   first line before resuming on its second. `compose_key_to_action` is SHARED by
+   both compose targets, so that hit BOTH boxes: a quick reply sent one line, and a
+   `Ctrl-N` background draft launched an agent on one.
+
+   `draft` is the one arm that is not a keyboard owner: it owns the **pane**. While
+   the new-session draft card is drawn the transcript is not, so the cached link
+   regions describe text no longer on screen and a click would open a link from a
+   session the user cannot see. It outlives the compose editor by AT MOST one
+   in-flight launch, which is the window nothing else covers — so a pane owner
+   earns an arm here for the same reason a keyboard owner does. "At most" is the
+   operative bound: a pane owner that outlives its keyboard owner also outlives the
+   gate that used to end it, so it needs its own end conditions — see
+   [DOMAIN.md](DOMAIN.md#background-agent-draft-pane-ctrl-n) for the two the card
+   carries.
 
 Add a keybinding by extending the `Action` enum + `key_to_action` + `apply_action`
-and covering it with a `key_to_action` unit test. Keep the doc-comment key table
-in `update.rs`, the `USAGE`/`KEYS` block in `cli.rs`, and the help line in
-`view.rs` in sync.
+and covering it with a `key_to_action` unit test. Then satisfy the KEEP KEY DOCS IN
+SYNC rule in [AGENTS.md](../../AGENTS.md), which owns the list of surfaces that
+must agree — do not re-enumerate them here.
 
 ## Testing patterns
 
