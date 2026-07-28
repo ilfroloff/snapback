@@ -7,9 +7,11 @@ system prompt: keep it loaded, follow it exactly.
 
 `snapback` (alias `sb`) is a single self-contained Rust **ratatui TUI** that
 browses, searches, and resumes **Claude Code** sessions stored as JSONL under
-`~/.claude/projects/`. Ship changes that keep the data core correct against a
-hostile, undocumented on-disk format and keep the terminal safe across the
-resume round trip.
+`~/.claude/projects/`, and — without leaving the board — quick-replies to
+(`Ctrl-R`) or stops (`Ctrl-K`) the agents claude runs, and starts new ones in
+the background (`Ctrl-N`, which drafts their first message). Ship changes that
+keep the data core correct against a hostile, undocumented on-disk format and
+keep the terminal safe across the resume round trip.
 
 ## Critical rules
 
@@ -36,15 +38,22 @@ one place.
   panic) and the write is ATOMIC (temp file + rename). Hiding is a VISIBILITY
   preference, not a status flag. (`src/config.rs`; `src/hidden.rs`; the persist
   path in `src/tui/app.rs`)
-- **STORE WRITES ARE GATED.** The ONLY mutation of `~/.claude/projects` is hard
-  delete (`Ctrl-X d`), behind BOTH a confirmation modal AND the pure `can_delete`
-  live-session guard (never unlink a file `claude` is writing). It removes ONLY
-  the selected id's own `<id>.jsonl` + sibling `<id>/` dir; everything else stays
-  read-only. (`src/delete.rs`; `confirm_delete` in `src/tui/update.rs`)
+- **STORE WRITES ARE GATED, AND ALL BUT ONE ARE DELEGATED.** The only mutation
+  `snapback` itself performs on `~/.claude/projects` is hard delete (`Ctrl-X d`),
+  behind BOTH a confirmation modal AND the pure `can_delete` live-session guard
+  (never unlink a file `claude` is writing); it removes ONLY the selected id's own
+  `<id>.jsonl` + sibling `<id>/` dir. Every OTHER change to a transcript is made by
+  a `claude` CHILD and must stay that way — a quick reply appends in place because
+  `claude -p -r` writes it, NEVER because snapback edits a session file. Do not add
+  a direct writer. (`src/delete.rs`; `confirm_delete` in `src/tui/update.rs`;
+  `src/send.rs`)
 - **TERMINAL SAFETY.** Resume/fork/attach SPAWN `claude` as a child and RETURN
   to the board — never replace the process image. Restore the terminal (raw
-  mode + alt screen + mouse capture) on EVERY exit: quit, error, hand-off, and
-  panic. On EVERY return from a child, hard-reset the terminal — a deterministic
+  mode + alt screen + every mode snapback ENABLES — mouse capture and bracketed
+  paste) on EVERY exit: quit, error, hand-off, and panic. A mode snapback turns on
+  is owned end to end: enabled in `init_terminal`, disabled in `restore_terminal`
+  AND the panic hook, and re-armed in `reassert_board_screen` after a child return.
+  On EVERY return from a child, hard-reset the terminal — a deterministic
   full re-init onto a fresh screen — so a dirty hand-back (notably a Ctrl-Z that
   exits `claude` without restoring the terminal) repaints from a known-good state
   with no stale cells, native scrollback, leaked keyboard/input modes (notably a
@@ -74,7 +83,11 @@ one place.
   `src/watch.rs`)
 - **KEEP KEY DOCS IN SYNC.** A key/flag change must update the table in
   `update.rs`, `USAGE`/`KEYS` in `cli.rs`, the help line in `view.rs`, and the
-  README key map together.
+  README key map together. This is the ONE list of those surfaces; the other docs
+  point here. It binds ROUTING too, not just bindings: when a key's gate gains a
+  case (a new `AgentActivity` bucket, a new refusal), every place that ENUMERATES
+  that routing is stale until updated — the four above plus the gate tables in
+  [DOMAIN.md](docs/agents/DOMAIN.md). A partial enumeration is a wrong one.
 
 ## Engineering principles (mandatory)
 
@@ -142,6 +155,7 @@ Full command reference and the validation checklist:
 | Session format, JSONL fields, domain concepts | [docs/agents/DOMAIN.md](docs/agents/DOMAIN.md) |
 | Implementation + testing conventions | [docs/agents/PATTERNS.md](docs/agents/PATTERNS.md) |
 | Commands, env, `--print-list`, CI + release automation, checklist | [docs/agents/OPERATIONS.md](docs/agents/OPERATIONS.md) |
+| External `claude` CLI flags/commands + version pin + spawned argv | [docs/agents/CLAUDE_CLI.md](docs/agents/CLAUDE_CLI.md) |
 | Commit message rules + examples | [GIT_COMMIT_INSTRUCTIONS.md](GIT_COMMIT_INSTRUCTIONS.md) |
 | Reading order / doc ownership | [docs/agents/README.md](docs/agents/README.md) |
 | End-user features + full key map | [README.md](README.md) |

@@ -11,9 +11,12 @@
 //!
 //! * **[`reported_agents`] — `--json --all` — the BOARD's signal.** Polled ~1s
 //!   off-thread; drives badges, colors, the pulse and the preview banner via
-//!   [`classify`]. `--all` is what makes [`AgentActivity::Done`] observable at
-//!   all: the bare command reports only currently-active agents, so without it a
-//!   session that just wrapped up renders as though claude had never heard of it.
+//!   [`classify`]. The bare command lists currently-active agents AND recently
+//!   finished ones (claude keeps a `done` background job in the active list for a
+//!   while before reaping it), so a just-wrapped-up session is briefly observable
+//!   without `--all`. What `--all` adds is the FULL history — every `done` agent,
+//!   including those already reaped from the active list — so a finished session
+//!   keeps its badge instead of vanishing the moment claude drops it.
 //! * **[`live_agents`] — `--json`, NO `--all` — the HAND-OFF's signal.** A
 //!   one-shot probe at hand-off; MEMBERSHIP in what it returns is liveness,
 //!   structurally, because the bare command IS claude's active list. It returns
@@ -80,15 +83,47 @@ const QUALIFIER_BUSY: &str = "busy";
 
 /// The `state`/`status` value for an agent that has REPORTED completion.
 ///
-/// Observable ONLY under `--all` (the bare `claude agents --json` reports just
-/// the currently-active agents), which is precisely why [`agents_argv`] passes
-/// it.
+/// A just-finished agent is briefly visible in the bare `claude agents --json`
+/// too (claude keeps a `done` background job in the active list for a while before
+/// reaping it), but `--all` is what keeps EVERY `done` agent observable — including
+/// those already reaped — so the board does not lose a finished session's badge the
+/// moment claude drops it. That is why [`agents_argv`] passes `--all`.
 ///
 /// It means the agent SAID it finished — NOT that claude will permit `-r`. Those
 /// two can disagree transiently, and claude is the authority on its own refusal,
-/// so this value colors a BADGE and never gates the resume: the gate asks
-/// [`live_agents`] instead.
+/// so this value colors a BADGE and never gates a hand-off: the gates ask
+/// [`live_agents`] instead. That membership is what matters — a just-`done`
+/// background job is STILL a registered agent (until reaped), so `claude -p -r`
+/// refuses it outright, exactly like a working one. The quick-reply gate
+/// ([`crate::send::reply_gate`]) therefore does not send straight into it either:
+/// it first `claude stop`s the job — safe precisely BECAUSE the run is over — and
+/// only then replies in place.
 const QUALIFIER_DONE: &str = "done";
+
+/// The `state`/`status` value for a background agent claude has STOPPED — its run
+/// is over.
+///
+/// A TERMINAL state, so it buckets as [`AgentActivity::Ended`]: it badges STEADY
+/// (nothing is in flight to animate) and is deliberately NOT green ([`QUALIFIER_DONE`]'s
+/// "finished cleanly" reading), since a stopped job ended without that clean-finish
+/// connotation. Recognizing it — rather than letting it fall through to the fail-soft
+/// [`AgentActivity::Other`], which pulses — is the whole point of this bucket: a dead
+/// job must not read as live. The raw token still passes through VERBATIM so the row
+/// shows what claude reported.
+///
+/// Distinct from the OTHER steady background bucket,
+/// [`AgentActivity::WorkingButIdle`]: this one is claude REPORTING a terminal token
+/// outright, while that one is inferred from a `state`/`status` contradiction claude
+/// never reconciled. Different causes, different colors, both steady.
+const QUALIFIER_STOPPED: &str = "stopped";
+
+/// The `state`/`status` value for a background agent whose run FAILED.
+///
+/// Buckets with [`QUALIFIER_STOPPED`] as [`AgentActivity::Ended`] for the same
+/// reason — the job has ENDED, so a pulse would falsely claim work is in flight —
+/// and its raw token likewise passes through verbatim so the user sees claude's own
+/// word (`failed`) rather than a relabel.
+const QUALIFIER_FAILED: &str = "failed";
 
 /// User-facing copy for [`AgentActivity::NeedsInput`] — the FIRST of the two
 /// translated buckets (the other is [`INTERRUPTED_COPY`]). Phrased as what the
@@ -181,9 +216,16 @@ impl ReportedAgent {
 /// schema drift is a one-line change in [`classify`] rather than a hunt for raw
 /// string matches scattered across the UI.
 ///
-/// Every consumer is a DISPLAY decision, and that is the boundary: no bucket
-/// gates the resume. Liveness is not inferred from a qualifier — it is
-/// [`live_agents`]' membership answer, straight from claude.
+/// The boundary it must not cross: **no bucket answers "is this live?"**.
+/// Liveness is not inferred from a qualifier — it is [`live_agents`]' membership
+/// answer, straight from claude, which is why no bucket gates the resume.
+///
+/// Most consumers are DISPLAY decisions. The two exceptions are the `Ctrl-R` /
+/// `Ctrl-K` gates ([`crate::send::reply_gate`], [`crate::send::interrupt_gate`]),
+/// which classify a RECORD THE PROBE JUST RETURNED to route a stop — so liveness
+/// is still membership and only the "what is it doing" question is bucketed. Even
+/// there the inferred bucket ([`AgentActivity::WorkingButIdle`]) is granted no
+/// action of its own: it rides with the live states, so nothing acts on a guess.
 ///
 /// Payload-free on purpose — a variant answers "which bucket", never "what did
 /// the wire say". The raw qualifier stays available on the [`ReportedAgent`]
@@ -212,6 +254,22 @@ pub enum AgentActivity {
     /// Reported completion ([`QUALIFIER_DONE`]); only observable under `--all`.
     /// Badges green and steady — it does NOT decide whether `-r` is permitted.
     Done,
+    /// A TERMINAL background state — the job has ENDED, whether cleanly stopped or
+    /// failed ([`QUALIFIER_STOPPED`] / [`QUALIFIER_FAILED`]). Badges STEADY
+    /// (nothing is in flight to animate) and DIM/neutral rather than green, and its
+    /// raw token passes through VERBATIM so the row still reads `stopped` / `failed`.
+    ///
+    /// Distinct from [`Done`](Self::Done) (which reports a CLEAN completion and
+    /// badges green) and from [`Other`](Self::Other) (the fail-soft default that
+    /// counts as ACTIVE): these two tokens are KNOWN terminals, so recognizing them
+    /// is exactly what stops a dead job from pulsing as if it were still live.
+    ///
+    /// Also distinct from [`WorkingButIdle`](Self::WorkingButIdle), the OTHER
+    /// steady background bucket: this one is claude REPORTING a terminal token
+    /// outright, that one is INFERRED from a contradiction claude never reconciled.
+    /// Both rest steady; they differ in cause and in color (dim here, working gray
+    /// there), so neither replaces the other.
+    Ended,
     /// An unrecognized qualifier, or none at all. FAIL-SOFT: never dropped and
     /// never guessed at — callers pass the raw value through untouched.
     Other,
@@ -232,6 +290,14 @@ pub enum AgentActivity {
 /// and hide the contradiction as a plain [`AgentActivity::Working`].
 /// [`ReportedAgent::qualifier`] itself is left untouched, so every other seam
 /// still speaks through the same collapsed precedence.
+///
+/// That early return cannot shadow the other resting-terminal bucket,
+/// [`AgentActivity::Ended`]: the two are DISJOINT by construction. The
+/// contradiction check requires `state` to be [`QUALIFIER_WORKING`] /
+/// [`QUALIFIER_BUSY`], while [`AgentActivity::Ended`]'s tokens
+/// ([`QUALIFIER_STOPPED`] / [`QUALIFIER_FAILED`]) can never be either — so a
+/// `stopped` job whose `status` also reads `idle` still buckets as `Ended`, and
+/// both buckets stay reachable regardless of arm order.
 #[must_use]
 pub fn classify(agent: &ReportedAgent) -> AgentActivity {
     // Surface claude's own self-contradiction before the qualifier collapses it:
@@ -250,6 +316,7 @@ pub fn classify(agent: &ReportedAgent) -> AgentActivity {
         Some(QUALIFIER_IDLE) => AgentActivity::Idle,
         Some(QUALIFIER_WORKING | QUALIFIER_BUSY) => AgentActivity::Working,
         Some(QUALIFIER_DONE) => AgentActivity::Done,
+        Some(QUALIFIER_STOPPED | QUALIFIER_FAILED) => AgentActivity::Ended,
         _ => AgentActivity::Other,
     }
 }
@@ -292,6 +359,7 @@ pub fn qualifier_copy(agent: &ReportedAgent) -> Option<&str> {
         AgentActivity::Idle
         | AgentActivity::Working
         | AgentActivity::Done
+        | AgentActivity::Ended
         | AgentActivity::Other => qualifier,
     })
 }
@@ -319,19 +387,25 @@ pub fn friendly_status(agent: &ReportedAgent) -> String {
 /// [`AgentActivity::NeedsInput`] (stopped, waiting on the user),
 /// [`AgentActivity::Idle`] (up, but not working a turn),
 /// [`AgentActivity::WorkingButIdle`] (claude's own `status` says nothing is
-/// churning, so a pulse would claim work that is not in flight), and
-/// [`AgentActivity::Done`] (finished — nothing is happening to animate).
+/// churning, so a pulse would claim work that is not in flight),
+/// [`AgentActivity::Done`] (finished cleanly), and [`AgentActivity::Ended`]
+/// (stopped or failed — the job is over) — in none of these is anything happening
+/// to animate.
 ///
 /// [`AgentActivity::Other`] — an unknown or absent qualifier — counts as ACTIVE
 /// on purpose: schema drift fails toward showing activity rather than silently
-/// hiding a busy session behind a steady dot.
+/// hiding a busy session behind a steady dot. That fail-soft default is PRESERVED
+/// for genuinely-unknown tokens; [`AgentActivity::Ended`] only removes the two
+/// KNOWN terminal tokens (`stopped` / `failed`) from it, so a truly dead job no
+/// longer pulses while real drift still does.
 #[must_use]
 pub fn is_active(agent: &ReportedAgent) -> bool {
     match classify(agent) {
         AgentActivity::NeedsInput
         | AgentActivity::Idle
         | AgentActivity::WorkingButIdle
-        | AgentActivity::Done => false,
+        | AgentActivity::Done
+        | AgentActivity::Ended => false,
         AgentActivity::Working | AgentActivity::Other => true,
     }
 }
@@ -416,11 +490,11 @@ fn agents_argv_base() -> Vec<String> {
 /// test suite never does). [`reported_agents`] builds its `Command` from this and
 /// nothing else, so the flags are pinned by `agents_argv_is_claude_agents_json_all`.
 ///
-/// [`AGENTS_ALL_FLAG`] is what makes [`AgentActivity::Done`] observable AT ALL —
-/// the bare command reports only the currently-active agents, so dropping it
-/// silently erases the finished bucket and a session that just wrapped up renders
-/// as though claude had never heard of it. It is not a nicety; it is the flag the
-/// `done` badge exists on.
+/// [`AGENTS_ALL_FLAG`] is what keeps the `done` bucket RELIABLY observable — the
+/// bare command lists a finished job only until claude reaps it from the active
+/// list, so dropping the flag would make a session's `done` badge vanish the moment
+/// claude drops it. It is not a nicety; it is the flag the durable `done` badge
+/// exists on.
 #[must_use]
 fn agents_argv() -> Vec<String> {
     let mut argv = agents_argv_base();
@@ -721,6 +795,36 @@ mod tests {
         assert!(!is_active(&from_status));
     }
 
+    /// `stopped` and `failed` are TERMINAL: the job has ended, so both bucket as
+    /// `Ended`, render their raw token verbatim, and are STEADY — the exact
+    /// opposite of the `Other` fail-soft default that made them pulse before.
+    ///
+    /// This is the regression this fix pins: a dead background job must not wear a
+    /// pulsing "live" badge. Both spellings are checked from either qualifier
+    /// source, and the raw token is passed through untouched (never translated).
+    #[test]
+    fn stopped_and_failed_classify_as_ended_render_verbatim_and_are_not_active() {
+        for token in ["stopped", "failed"] {
+            let from_state = agent("background", Some(token), None);
+            assert_eq!(
+                classify(&from_state),
+                AgentActivity::Ended,
+                "{token:?} is a terminal state -> Ended"
+            );
+            assert_eq!(friendly_status(&from_state), format!("bg {token}"));
+            assert!(
+                !is_active(&from_state),
+                "a job that has ended has nothing to pulse: {token:?}"
+            );
+
+            // Identical via the `status` fallback (no `state` at all).
+            let from_status = agent("interactive", None, Some(token));
+            assert_eq!(classify(&from_status), AgentActivity::Ended);
+            assert_eq!(friendly_status(&from_status), format!("live {token}"));
+            assert!(!is_active(&from_status));
+        }
+    }
+
     /// FAIL-SOFT: schema drift in the undocumented value set must pass through
     /// to the user untouched rather than being dropped or guessed at.
     #[test]
@@ -772,6 +876,11 @@ mod tests {
             (Some("busy"), true),
             // Finished -> steady: there is no work left to animate.
             (Some("done"), false),
+            // Terminal states -> steady: the job has ENDED (stopped or failed),
+            // so a pulse would falsely claim work is in flight. These are the
+            // rows this fix adds; they pulsed as `Other` before it.
+            (Some("stopped"), false),
+            (Some("failed"), false),
             // FAIL-SOFT: schema drift tracks the working bucket...
             (Some("compacting"), true),
             // ...and so does a record with no qualifier at all. Neither may
@@ -847,17 +956,75 @@ mod tests {
         assert!(!is_active(&idle_only));
     }
 
+    /// The two RESTING background buckets are DISTINCT and both REACHABLE — the
+    /// invariant that a merge of their two histories is most likely to break by
+    /// dropping one, collapsing them into one, or ordering `classify`'s arms so the
+    /// earlier one shadows the later.
+    ///
+    /// They answer different questions: `Ended` is claude REPORTING a terminal
+    /// token, `WorkingButIdle` is a contradiction claude never reconciled. Both
+    /// hold steady, and the fail-soft ACTIVE default must survive BOTH of them so
+    /// genuine schema drift still pulses.
+    #[test]
+    fn ended_and_interrupted_are_distinct_resting_buckets_and_unknown_still_pulses() {
+        // Distinct buckets, not two names for one.
+        assert_ne!(
+            AgentActivity::Ended,
+            AgentActivity::WorkingButIdle,
+            "the two resting buckets must not be collapsed into one"
+        );
+
+        // Both KNOWN terminal tokens reach `Ended` — neither is shadowed by the
+        // contradiction check that runs before the qualifier match.
+        for token in ["stopped", "failed"] {
+            let ended = agent("background", Some(token), None);
+            assert_eq!(classify(&ended), AgentActivity::Ended, "{token:?} -> Ended");
+            assert!(!is_active(&ended), "{token:?} has ended; it must be steady");
+            // Passed through VERBATIM: `Ended` is not one of the translated buckets.
+            assert_eq!(qualifier_copy(&ended), Some(token));
+        }
+
+        // The contradiction reaches `WorkingButIdle` — not shadowed by the
+        // qualifier match, which would otherwise collapse it to a plain `Working`.
+        let interrupted = agent("background", Some("working"), Some("idle"));
+        assert_eq!(classify(&interrupted), AgentActivity::WorkingButIdle);
+        assert!(!is_active(&interrupted), "interrupted must be steady too");
+        assert_eq!(qualifier_copy(&interrupted), Some(INTERRUPTED_COPY));
+
+        // ORDER-PROOF: the two triggers are disjoint, so a terminal token wins even
+        // when the record ALSO carries the `idle` status the contradiction keys on.
+        // If the contradiction check ever widened to swallow this shape, a stopped
+        // job would silently read `interrupted` in the working gray instead.
+        let stopped_and_idle = agent("background", Some("stopped"), Some("idle"));
+        assert_eq!(
+            classify(&stopped_and_idle),
+            AgentActivity::Ended,
+            "a reported terminal token outranks the inferred contradiction"
+        );
+
+        // The FAIL-SOFT default survives both new buckets: a genuinely unknown
+        // qualifier is still `Other`, still passed through, and still PULSES, so
+        // schema drift never hides a busy session behind a steady dot.
+        let unknown = agent("background", Some("compacting"), None);
+        assert_eq!(classify(&unknown), AgentActivity::Other);
+        assert!(
+            is_active(&unknown),
+            "an unknown qualifier must keep the active default and pulse"
+        );
+        assert_eq!(qualifier_copy(&unknown), Some("compacting"));
+    }
+
     /// The BOARD poll's exact invocation, pinned without spawning `claude` (the
     /// suite never does) — the same way `resume`'s hand-off argvs are pinned.
     ///
     /// `--all` is the load-bearing half and the reason this test exists: the bare
-    /// command reports only the CURRENTLY-ACTIVE agents, so dropping the flag
-    /// makes `AgentActivity::Done` unobservable — no `done` record ever reaches
-    /// `classify`, and a just-finished session silently loses its badge and its
-    /// banner. Every `done` assertion in this module would still pass, because
-    /// they feed `classify` synthetic agents rather than the wire; only this
-    /// assertion sees the flag. `--json` is pinned alongside it because the human
-    /// table it otherwise prints is not what `parse_agents_json` reads.
+    /// command drops a finished job once claude reaps it from the active list, so
+    /// without the flag a `done` session's badge and banner vanish the moment it is
+    /// reaped — the `done` bucket stops RELIABLY reaching `classify`. Every `done`
+    /// assertion in this module would still pass, because they feed `classify`
+    /// synthetic agents rather than the wire; only this assertion sees the flag.
+    /// `--json` is pinned alongside it because the human table it otherwise prints
+    /// is not what `parse_agents_json` reads.
     #[test]
     fn agents_argv_is_claude_agents_json_all() {
         assert_eq!(

@@ -8,9 +8,10 @@ session model, see [DOMAIN.md](DOMAIN.md).
 
 `snapback` (short alias `sb`) is a single self-contained Rust binary: a
 [ratatui](https://ratatui.rs) TUI that browses, searches, and resumes **Claude
-Code** sessions stored as JSONL under `~/.claude/projects/`. It exists because
-the built-in `/resume` picker is per-project with no cross-folder view and no
-content search. It depends on nothing outside its own `Cargo.toml`.
+Code** sessions stored as JSONL under `~/.claude/projects/`, plus the two board
+actions that need no teardown — quick reply (`Ctrl-R`) and interrupt (`Ctrl-K`).
+It exists because the built-in `/resume` picker is per-project with no cross-folder
+view and no content search. It depends on nothing outside its own `Cargo.toml`.
 
 That last sentence still holds despite `npm/` existing. The npm package is a
 **distribution channel, not a dependency**: it carries prebuilt binaries and
@@ -22,8 +23,9 @@ shell out to, or assume node.
 
 | Concern | Crate | Pin | Notes |
 | --- | --- | --- | --- |
-| Terminal UI | `ratatui` | `=0.30.2` | crossterm backend |
+| Terminal UI | `ratatui` | `=0.30.2` | crossterm backend, plus `unstable-rendered-line-info` for `Paragraph::line_count` — the transcript's height must come from the wrapper that paints it, and `reflow::WordWrapper` is private, so that accessor is the only door. An upstream-unstable API is exactly why the pin stays exact |
 | Terminal control + input | `crossterm` | `=0.29.0` | matches ratatui 0.30 |
+| Compose editor | `ratatui-textarea` | `=0.9.2` | multiline input behind BOTH drafts (the `Ctrl-R` quick reply and the `Ctrl-N` background draft); isolated in `src/tui/compose.rs`; default features only (`search`/`regex` NOT enabled) |
 | Highlight matcher | `nucleo` | `=0.5.0` | isolated in `src/search.rs`; backs the highlight seam only — NOT the filter |
 | Substring filter | `memchr` | `=2.8.2` | SIMD `memmem`; IS the per-keystroke filter, answering membership per atom (`src/search.rs`); already transitive via `nucleo`/`serde_json` |
 | FS watch | `notify` | `=8.2.0` | recursive, over the store root |
@@ -66,17 +68,19 @@ the render framework.** That is why `agents::classify` buckets the undocumented
 | `store::lineage` | `src/store/lineage.rs` | Background-fork lineage identity + folding: `lineage_key` (`(repo, branch, root_uuid)`), `head_of` (the newest member), and `fold` — the single entry point, which reduces a display list to the visible indices plus a head→hidden-count map. Presentation-only: it hides indices, it cannot drop a session. Pure and framework-free. See [DOMAIN.md](DOMAIN.md#fork-lineage-storelineage) for the mechanism it models. |
 | `store::preview` | `src/store/preview.rs` | Transcript → `RenderedPreview` (styled ratatui `Text` + clickable `LinkRegion`s), self-contained markdown pass. |
 | `search` | `src/search.rs` | The **only** place `nucleo` or `memchr` is called: substring index, incremental re-filter, highlight seam. Per keystroke the filter answers MEMBERSHIP with `memchr::memmem` over prebuilt haystacks — no nucleo, no UTF-32 conversion, no ranking (`App::order_filtered` owns display order). Smart case is decided per ATOM, selecting the cased or lowercased haystack. nucleo backs `match_indices` (the highlight) alone. |
-| `agents` | `src/agents.rs` | Agent detection via `claude agents --json`, read TWO ways through ONE fail-soft parser. `reported_agents` (`--all`, polled ~1s off-thread) is the DISPLAY signal: `classify` buckets each qualifier into an `AgentActivity` that the preview banner, the list row's translated qualifier (both via `qualifier_copy`), list-badge color and pulse (which alternates that color, never the glyph) derive from. `live_agents` (bare, NO `--all`, one-shot at EVERY hand-off) is the HAND-OFF signal: the bare command IS claude's active list, so MEMBERSHIP is liveness — no inference — and the same records carry the Attach job `id`, so one authoritative read answers both. The split exists because `--all`'s `done` means "the agent reported completion", not "claude will permit `-r`"; inferring liveness from that polled snapshot was a TOCTOU race, and reading an attach id from it was the same bug one layer down. Framework-free: it interprets the value set, while the color it maps to is the view's call. |
+| `agents` | `src/agents.rs` | Agent detection via `claude agents --json`, read TWO ways through ONE fail-soft parser. `reported_agents` (`--all`, polled ~1s off-thread) is the DISPLAY signal: `classify` buckets each qualifier into an `AgentActivity` that the preview banner, the list row's translated qualifier (both via `qualifier_copy`), list-badge color and pulse (which alternates that color, never the glyph) derive from. `live_agents` (bare, NO `--all`) is the HAND-OFF signal, taken one-shot at EVERY hand-off — the resume/attach gate and the `Ctrl-R`/`Ctrl-K` gates alike — and its records also carry the short job `id` that `claude attach`/`claude stop` take. Why the two readings must never be merged, and why an authoritative decision never reads the polled map, is [DOMAIN.md](DOMAIN.md#why-the-gate-does-not-read-the---all-map) — do not restate it here. Framework-free: it interprets the value set, while the color it maps to is the view's call. |
 | `defined_agents` | `src/defined_agents.rs` | DEFINED-agent discovery for a new session: fail-soft frontmatter scan of `~/.claude/agents/*.md` + `<launch_dir>/.claude/agents/*.md`, deduped (project over user). Distinct from `agents` (live vs. defined). |
 | `watch` | `src/watch.rs` | Debounced FS watcher + `EventLoop` that merges input/watcher/tick/agents onto one channel. |
 | `resume` | `src/resume.rs` | Resume/fork/attach/new-session hand-off: re-read authoritative parts (or, for a new session, gate on the launch dir + optional `--agent <name>`), existence gate, spawn `claude`, return. Each `Ready` carries its own neutral non-zero hint (resume vs. new-session). |
 | `config` | `src/config.rs` | The SINGLE place that reads the environment to resolve snapback-owned paths: `config_dir()` (`$SNAPBACK_CONFIG_DIR` else `~/.config/snapback` — deliberately non-XDG on macOS, so one greppable home on every OS) and `state_dir()` (`<config>/state`, where `hidden` persists). No other module reads the env for these locations; future config/cache/state resolvers land here. |
 | `hidden` | `src/hidden.rs` | snapback's OWN persistent state (the ONLY thing it writes for itself): the soft-hidden session id set, in the `state/` subdir under the config dir (path resolved by `config`, file `hidden_sessions`), NOT the read-only store. Pure `parse_hidden`/`serialize_hidden` (newline-delimited, sorted for stable diffs) + fail-soft `load_hidden` / atomic `save_hidden` (temp file + rename). |
 | `delete` | `src/delete.rs` | The gated store-mutation core: pure `can_delete` (refuse a live session) and `toggle_hidden` (flip membership, return the new state), plus the thin `remove` driver that unlinks a session's own `<id>.jsonl` AND its sibling `<id>/` dir — only ever that id's own dir, never another path. |
-| `tui` | `src/tui/mod.rs` | Terminal setup/teardown (+ panic hook) and the draw/event `run` loop. |
-| `tui::app` | `src/tui/app.rs` | The `App` model — all TUI state, pure state transitions, no terminal I/O. Owns the fold state: `expanded` (a set of `LineageKey`s, EMPTY by default so every lineage starts folded) and the derived `hidden` head→count map, applied by `lineage::fold` as the last step of `recompute_filtered` so `filtered` holds only VISIBLE indices. |
-| `tui::update` | `src/tui/update.rs` | Elm-style event→state dispatch: `key_to_action`, `handle_event`, mouse routing (wheel scroll, splitter drag, preview link click-to-open), the `Ctrl-X` leader chord (`chord_key`), and ONE generic modal key machine (`modal_key` → `confirm_modal`) that serves the running-session choice, the new-session agent picker, and the hard-delete confirm (`confirm_delete`) alike. |
-| `tui::view` | `src/tui/view.rs` | Rendering: two-pane grouped list + preview, header/search/help lines, the single generic modal overlay (`render_modal`, `Row` button strip or `List` picker), and the which-key chord hint that takes over the help line while a `Ctrl-X` chord is pending. The header's right-aligned version indicator branches on `cfg!(debug_assertions)`: release builds show `v<crate-version>`, dev builds `dev+<git-hash>[-dirty]` (pure `format_version_label`). Owns the pure wrap-mapping (`wrapped_line_height`/`link_at`) that hit-tests a click to a preview link, the pure `preview_split` that carves a REPORTED session's pinned status-banner row off the preview pane (the transcript rect `update` must hit-test against — keyed on having a banner, never on liveness, since a `done` agent has one but is not live), and the badge's palette (`badge_color`, mapping an `AgentActivity` to a named ANSI color). Draws a folded head's `(+N)` and indents an expanded lineage's children, with the pure `fit_label` reserving the marker's columns BEFORE the label's so a narrow pane clips the label instead of the marker. A child's turn count (`child_msgs` / `fit_child_msgs`) is the mirror of that rule: it is drawn WHOLE or dropped entirely, never clipped, since a truncated count reads back as a plausible wrong number rather than a short one. |
+| `send` | `src/send.rs` | Non-UI core for the THREE board actions that run without a terminal teardown: the quick reply (`Ctrl-R`, a one-shot `claude -p -r <id> --output-format json` that appends in place), the interrupt (`Ctrl-K`, `claude stop <job-id>`), and the background-agent launch (`Enter` in the new-session `Ctrl-N` draft pane, `claude [--agent <name>] --bg <prompt>`). Pure, tested decisions — `build_send_argv` / `build_stop_argv` / `build_bg_launch_argv`, the authoritative `plan_send` re-read and its promptless sibling `plan_bg_launch` (a launch-dir existence gate; a session that does not exist yet has no file to be authoritative about), the `status_for_output` / `status_for_failed_send` / `status_for_stop` / `status_for_bg_launch` maps that report failures HONESTLY (claude's own stderr reason, never a false `sent`/`stopped`/`started`), and the two gate state machines over the same one-shot probe record: `reply_gate` (never interrupt live work) and `interrupt_gate` (its mirror with the opposite intent, so `working` is a valid target there). Both route by `agents::classify` and both treat an unstoppable record — held with no job id — as a refusal ahead of the bucket; the full routing tables are in [DOMAIN.md](DOMAIN.md#quick-reply--non-interactive-send-srcsendrs). `status_for_bg_launch` is the strictest of the status maps, and deliberately not a copy of `status_for_output`: `--bg` can fail SILENTLY (an unknown `--agent` exits **0**, warns on stderr, and starts the session without it), so a zero exit with a non-empty stderr is *started-but-warned*, never a clean start. Three impure twins — `spawn_send` (optional stop, then the send), `spawn_interrupt`, and `spawn_bg_launch` — each run on a detached thread (mirroring `resume::open_url`) and deliver one `AppEvent::SendFinished` / `AppEvent::InterruptFinished` / `AppEvent::BgLaunchFinished`. Passes NO permission flags (inherits the user's settings). |
+| `tui` | `src/tui/mod.rs` | Terminal setup/teardown (+ panic hook) and the draw/event `run` loop; also fires a confirmed quick-reply send (`Outcome::Send`), interrupt (`Outcome::Interrupt`), or background-agent launch (`Outcome::BgLaunch`) on a detached thread without tearing the board down. TWO terminal modes are snapback's own here — mouse capture and bracketed paste — and `reset_child_modes_and_reassert_board` is the ordered seam that clears a child's leftovers before re-asserting them. |
+| `tui::app` | `src/tui/app.rs` | The `App` model — all TUI state, pure state transitions, no terminal I/O. Owns the width-scoped preview cache, whose entry holds everything derived from one `(session, width)` render — styled text, link regions AND the transcript's wrapped row count — in ONE value, so no invalidation can drop half of it. Owns the fold state: `expanded` (a set of `LineageKey`s, EMPTY by default so every lineage starts folded) and the derived `hidden` head→count map, applied by `lineage::fold` as the last step of `recompute_filtered` so `filtered` holds only VISIBLE indices. Owns the compose SURFACE as two fields, not one: `compose` (the editor — what the keyboard does) and `draft: Option<NewSessionDraft>` (the new-session placeholder card — what the preview pane shows). Those three methods — `open_compose` / `close_compose` / `dispatch_draft` — are the only WRITERS, which is what keeps a refusal from clearing one and forgetting the other; the one state they can leave apart (a dispatched card with no editor) is bounded separately, by `launching_draft` and by the board session. See [DOMAIN.md](DOMAIN.md#background-agent-draft-pane-ctrl-n). |
+| `tui::update` | `src/tui/update.rs` | Elm-style event→state dispatch: `key_to_action`, `handle_event`, mouse routing (wheel scroll, splitter drag, preview link click-to-open), terminal-paste routing (`handle_paste` over the pure `accept_paste` / `flatten_for_query`, walking the same six-owner precedence as the key arm — see [DOMAIN.md](DOMAIN.md#terminal-paste-routing-eventpaste)), the `Ctrl-X` leader chord (`chord_key`), ONE generic modal key machine (`modal_key` → `confirm_modal`) that serves the running-session choice, the new-session agent picker, and the hard-delete confirm (`confirm_delete`) alike — plus the picker's SECOND verb, `Ctrl-O` → `launch_pick_interactively`, gated twice so it stays the picker's alone (`modal_key` binds it on the `List` layout only, and the handler acts only on a `ModalAction::New` choice). `Enter` on a `New` choice opens the background draft pane instead of launching, so BOTH routes out of the picker cost exactly one key and `Ctrl-O` names the same verb there as it does in the draft, the `Ctrl-R` quick-reply gate (`reply` classifies a one-shot liveness probe via `send::reply_gate`, then opens compose, opens the `App::pending_stop` "stop the waiting agent?" confirmation, or refuses), and the `Ctrl-K` interrupt gate (`interrupt` classifies the SAME probe via `send::interrupt_gate`, then dispatches the stop straight away, opens the `App::pending_interrupt` confirmation, or refuses). `AppEvent::SendFinished` re-anchors the previewed transcript to the newest turn, and `AppEvent::BgLaunchFinished` closes the draft card whose `launch_id` it names. `handle_event` also owns ONE teardown seam over every route: an `Outcome` that `ends_board_session` (`Quit`, any `Resume`) closes the compose surface, since neither the editor nor an in-flight card can outlive the event channel it reports on. |
+| `tui::compose` | `src/tui/compose.rs` | The compose modal: owns the `ratatui_textarea` dependency (the only place it is referenced, like `search` owns nucleo). ONE editor and ONE key router serve TWO drafts, forked by `ComposeTarget` rather than by parallel state — a `Reply` to an existing session (`Ctrl-R`) and a `NewBackgroundAgent` draft (`Ctrl-N`, via `Enter` on the agent picker or straight away when no agents are defined). Opening the background draft also installs the pane-level `App::draft` card through `App::open_compose`, so the preview stops showing an unrelated session; the reply passes `None` there, because it previews the real session it addresses. Pure `compose_key_to_action` (Enter=submit, Ctrl-J/Alt+Enter=newline, Ctrl-O=run interactively, Esc=cancel, else forward to the editor) + the `handle_compose_key` driver that edits the buffer or resolves a submit into `Outcome::Send` (reply), `Outcome::BgLaunch` (background), or `Outcome::Resume` (the `Ctrl-O` escape hatch, which is INERT on a reply). `insert_paste` is the second, non-key entry point — a terminal paste goes in through `TextArea::insert_str` as TEXT and returns no `Outcome`, so a pasted newline can never reach the `Enter`=submit arm. The auto-growing box's HEIGHT is this module's answer too, not the view's: `ComposeState::screen_rows` PROBES the widget for the draft's wrapped row count (the pinned `=0.9.2` publishes none), so the editor's own word wrap is the single source of truth and no second wrap model in the renderer can drift from it. |
+| `tui::view` | `src/tui/view.rs` | Rendering: two-pane grouped list + preview, header/search/help lines, the single generic modal overlay (`render_modal`, `Row` button strip or `List` picker), the two mutually-exclusive stop confirmations (`render_stop_confirm` for the `Ctrl-R` "stop the waiting agent?" prompt, `render_interrupt_confirm` for the `Ctrl-K` "stop this agent?" one, worded without any mention of a reply), and the which-key chord hint that takes over the help line while a `Ctrl-X` chord is pending. The header's right-aligned version indicator branches on `cfg!(debug_assertions)`: release builds show `v<crate-version>`, dev builds `dev+<git-hash>[-dirty]` (pure `format_version_label`). Owns the transcript's HEIGHT (`wrapped_text_rows`, which asks `Paragraph::line_count` — the same `WordWrapper` that paints the pane — so the bottom anchor and the scrollbar can reach the newest turn; cached per session+width in `App`, with only a draft card or an in-flight reply tail measured per frame) and, separately, the APPROXIMATE wrap-mapping (`wrapped_line_height`/`link_at`) that hit-tests a click to a preview link, the pure `preview_split` that carves a REPORTED session's pinned status-banner row off the preview pane (the transcript rect `update` must hit-test against — keyed on having a banner, never on liveness, since a `done` agent has one but is not live), and the badge's palette (`badge_color`, mapping an `AgentActivity` to a named ANSI color). Draws a folded head's `(+N)` and indents an expanded lineage's children, with the pure `fit_label` reserving the marker's columns BEFORE the label's so a narrow pane clips the label instead of the marker. A child's turn count (`child_msgs` / `fit_child_msgs`) is the mirror of that rule: it is drawn WHOLE or dropped entirely, never clipped, since a truncated count reads back as a plausible wrong number rather than a short one. While composing, the pure `compose_uses_bottom_bar` / `preview_compose_split` decide whether the compose zone docks in the bottom of the preview pane or falls back to a full-width bottom bar on a short terminal — both placements read their rect from the pure `preview_inner`, the ONE place the pane's border inset is applied, and their height from the editor (`ComposeState::screen_rows`) rather than from a wrap model of their own; `render_compose_zone` draws the bordered `TextArea`, titled by the pure `compose_title` and hinted by the pure `compose_hint` — both branching on `ComposeTarget`, so a reply names its session while a background draft names its agent and offers `Ctrl-O run interactively` (worded to avoid promising a review the CLI cannot give). While a quick-reply send is in flight, `sending_tail` appends the optimistic echo turns (`store::preview::pending_reply_turns`) to the previewed transcript and follows the bottom, and `preview_banner` returns `None` so the inline turns replace the pinned banner without desyncing the hit-test. While a NEW-SESSION draft is open, the pure `draft_card` replaces the transcript entirely with a near-empty placeholder (agent, launch dir, key hints — or a spinner line once the launch is dispatched), keyed on `App::draft` rather than on the compose target, and `preview_banner` returns `None` for the same hit-test reason. |
 | `build` | `build.rs` | Build script (compile-time, not a runtime module): fail-soft `git rev-parse`/`status` into `SNAPBACK_GIT_HASH`/`SNAPBACK_GIT_DIRTY` env vars for the dev version indicator; degrades to `unknown`/`0` outside a repo. |
 | *(packaging)* | `npm/cli.js` | **Not part of the program** — an install-time wrapper, published to npm as `snapback-tui`, that hands out the prebuilt binaries so installing needs no Rust toolchain. `install` copies the platform's binary onto `PATH` under both names and exits; node is gone from that point on. Bare `npx snapback-tui` also spawns the TUI (stdio inherited, SIGINT/SIGTSTP left to the child so the TUI's own terminal restore is not pre-empted), but that path is a convenience, not the blessed one. See [OPERATIONS.md](OPERATIONS.md#the-npm-package). |
 
@@ -110,9 +114,11 @@ loops: `terminal.draw(view::render)` then `events.recv()` →
 `update::handle_event`. `App` is pure state; `view` reads it (and writes back
 layout-derived values like pane rects, scroll offsets, and viewport height so
 mouse hit-testing and paging work without the model knowing the layout). A
-left-click in the preview is mapped screen→content by `view::link_at` (reusing the
-same `wrapped_line_height` wrap model as the scrollbar) against the cached
-`LinkRegion`s, and a hit is opened off the render loop via `resume::open_url`.
+left-click in the preview is mapped screen→content by `view::link_at` — over
+`wrapped_line_height`, an APPROXIMATE character-packing model kept only here, since
+the exact wrapper answers a total and never the per-line map a hit-test needs —
+against the cached `LinkRegion`s, and a hit is opened off the render loop via
+`resume::open_url`.
 
 ### Event sources (`watch::EventLoop`)
 
@@ -120,7 +126,11 @@ Four producers merged onto one `mpsc` channel of `AppEvent`:
 
 1. **Input** — a crossterm reader thread (`AppEvent::Input`) that polls with a
    timeout so it can observe a shutdown flag; joined on `EventLoop` drop so the
-   reader releases stdin **before** `claude` is spawned onto the same fd.
+   reader releases stdin **before** `claude` is spawned onto the same fd. It
+   forwards every crossterm `Event` variant verbatim, so what `tui::update`
+   routes is decided entirely there — keys, mouse, and (since `init_terminal`
+   enables bracketed paste) `Event::Paste`, the whole clipboard drop in one event
+   rather than a stream of keystrokes.
 2. **Watcher** — a recursive `notify` watch over the store root, debounced
    ~200ms; an entire settle batch coalesces to one `AppEvent::SessionsChanged`.
 3. **Tick** — a ~250ms `AppEvent::Tick` that drives redraw/autorefresh
@@ -132,6 +142,37 @@ Four producers merged onto one `mpsc` channel of `AppEvent`:
    never blocks rendering. It feeds badges/banner only; the resume gate's
    liveness probe is a separate one-shot at hand-off and is NOT an event source
    (see [PATTERNS.md](PATTERNS.md#6-off-ui-thread-for-anything-that-can-block)).
+
+Three more NON-recurring producers join on demand, all via `EventLoop::sender` and
+all one-shot per keypress rather than pollers, so the render loop never blocks on
+the child:
+
+- a confirmed quick-reply send (`Ctrl-R`) fires `send::spawn_send` on a detached
+  thread that runs `claude -p -r <id>` to completion and delivers exactly ONE
+  `AppEvent::SendFinished`;
+- a confirmed interrupt (`Ctrl-K`) fires `send::spawn_interrupt` the same way for
+  `claude stop <job-id>`, delivering exactly ONE `AppEvent::InterruptFinished`;
+- a confirmed background-agent launch (`Enter` in the new-session draft pane) fires
+  `send::spawn_bg_launch` for `claude [--agent <name>] --bg <prompt>`, delivering
+  exactly ONE `AppEvent::BgLaunchFinished`. It is keyed by no SESSION — a brand-new
+  agent has no `sessionId` yet, and the agent itself arrives through the watcher
+  reload — but it IS keyed by its own dispatch: `App::dispatch_draft` mints a
+  board-local `launch_id`, the `BgLaunchRequest` carries it out and the event
+  carries it back, and `App::launching_draft` is what decides whether the card on
+  screen is still that launch's to close. That single event is what ends the card
+  the dispatch left standing, so the in-flight placeholder needs no clock of its
+  own.
+
+All three are **emitted** exactly once, spawn failures included — but emitted is
+not delivered, and the difference is bounded by the board session. `run_inner`
+builds a NEW `EventLoop` per board session and drops the old receiver at every
+hand-off, while `lib::run` re-enters the board on the SAME `App`; a child still
+running across that seam reports into a channel nobody reads. Nothing keyed to a
+transcript minds (the watcher reload covers it), but the draft card is UI state
+waiting on its event, so it cannot be left to one that may never arrive:
+`update::handle_event` tears the compose surface down on any outcome that
+[ends the board session](#the-persistent-dashboard-loop-librun) — `Quit` and every
+`Resume` — which bounds the card to the board that dispatched it.
 
 ### The load pipeline (`store`)
 
@@ -152,10 +193,19 @@ during the load: folding is a view of the store, not part of it.
 ### Terminal safety seams
 
 `tui::init_terminal` enters the alt screen + raw mode, wraps ratatui's panic
-hook to also disable mouse capture, then enables mouse capture.
-`restore_terminal` is idempotent and runs on **every** exit — clean quit, error,
-resume hand-off, and panic — so the user's shell always gets a clean terminal
-back. This is what makes the resume round trip and re-initialization safe.
+hook to also disable mouse capture **and bracketed paste**, then enables those
+two modes. `restore_terminal` is idempotent, disables both, and runs on **every**
+exit — clean quit, error, resume hand-off, and panic — so the user's shell always
+gets a clean terminal back. This is what makes the resume round trip and
+re-initialization safe.
+
+Bracketed paste (`CSI ?2004h`) is enabled for a specific reason: it makes
+crossterm deliver a clipboard drop as one `Event::Paste` instead of a keystroke
+stream in which the first embedded newline reads as `Enter` — which sent a quick
+reply's first line, closed compose, typed the rest into the search query, and let
+a later newline hit the board's resume binding. Enabling it is therefore what
+`tui::update` routes against; the ownership obligations that come with turning a
+mode on are the TERMINAL SAFETY rule in [AGENTS.md](../../AGENTS.md).
 
 The **return** leg is defended symmetrically: `run_inner` calls `hard_reset`
 before the first draw. `init_terminal` re-enters the alt screen + raw + mouse on
@@ -178,10 +228,18 @@ modes (`DECSTR`, `CSI ! p`), and forces normal cursor keys (`DECCKM`-off,
 `CSI ? 1 l`); (3) confirms raw mode; (4) disables input modes the child may have
 leaked (bracketed paste, focus reporting); (5) round-trips
 `LeaveAlternateScreen`→`EnterAlternateScreen` to force a *fresh* alt buffer,
-re-arms mouse capture, clears the visible screen with `Clear(ClearType::All)`
-(`CSI 2J`), and purges the native scrollback with `Clear(ClearType::Purge)`
-(`CSI 3J`). Every escape it emits is **write-only** — the seam issues NO
-cursor-position (DSR `CSI 6n`) query.
+re-arms mouse capture **and bracketed paste**, clears the visible screen with
+`Clear(ClearType::All)` (`CSI 2J`), and purges the native scrollback with
+`Clear(ClearType::Purge)` (`CSI 3J`). Every escape it emits is **write-only** —
+the seam issues NO cursor-position (DSR `CSI 6n`) query.
+
+Steps (4) and (5) are one helper (`reset_child_modes_and_reassert_board`) because
+the ORDER between them is a contract, not an accident: bracketed paste is turned
+OFF by (4), clearing whatever level the child left, and back ON by (5), the
+board's own enable. Reversed, the board returns from every resume with paste
+disabled and the keystroke-stream bug silently comes back. Composing them in one
+`Write`-generic function is what lets a unit test pin `?2004l` before `?2004h`
+against real production code rather than against an order the test chose.
 
 The kitty keyboard reset in step (2) is the priority fix for the reported
 *still-unstable* `Ctrl-Z`: a `claude` child that pushed progressive enhancement

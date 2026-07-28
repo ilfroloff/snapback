@@ -29,14 +29,41 @@ OPTIONS:
 KEYS:
     ↑/↓, j/k      move          Enter        resume (returns to the board on exit)
     ←/→           fold / expand a fork lineage (a row marked (+N) stands for more)
-    Ctrl-F        fork          Ctrl-N       new session in the launch dir (pick an agent)
-    Ctrl-A        toggle scope  Ctrl-/       toggle preview
+    Ctrl-F        fork          Ctrl-A       toggle scope
+    Ctrl-/        toggle preview
+    Ctrl-N        new session in the launch dir: pick an agent when any are
+                  defined, then draft the session's first message — Enter starts
+                  it as a BACKGROUND agent without leaving the board, Ctrl-O runs
+                  it interactively instead, Ctrl-J or Alt+Enter newline, Esc
+                  cancels. The message is sent as the first turn either way
+    Ctrl-O        in the agent picker: start that agent interactively at once,
+                  skipping the draft — the same verb Ctrl-O has inside the draft
     Ctrl-X        leader chord: x hide · d delete · h show/hide hidden
+    Ctrl-R        quick reply — send a one-shot message to the selected session
+                  without leaving the board. An agent whose run is over (done,
+                  stopped, failed) is stopped first so the reply lands in place;
+                  a waiting one (needs input) confirms first; a working, idle,
+                  interrupted or unrecognized agent is refused — Attach or Fork
+                  instead (Enter sends, Ctrl-J or Alt+Enter newline, Esc cancels)
+    Ctrl-K        stop / interrupt the selected session's live background agent
+                  (claude stop); an agent whose run is over (done, stopped,
+                  failed) stops at once, every other live agent confirms first;
+                  a session claude isn't holding, or one running interactively,
+                  has no job to stop (Enter stops, Esc cancels)
     Tab           toggle name / name+content search
     PgUp/PgDn     preview page  Ctrl-U/Ctrl-D  preview quarter-page
     Home/End      preview top / bottom
     wheel         scroll preview / list (mouse mode on; hold Shift/Option to select)
-    q, Esc        quit          (type to search)";
+    paste         your terminal's own paste (Cmd/Ctrl-V, middle-click) is inserted
+                  as TEXT: into a compose draft at the cursor, newlines and all, or
+                  appended to the search query with newlines flattened to spaces.
+                  It never sends, resumes, or answers a confirmation
+    q, Esc        quit          (type to search)
+
+BACK TO THE BOARD (typed inside a resumed Claude session, not a snapback key):
+    /bg           detach the session — it keeps running as a bg agent — and snap
+                  back to the board; /exit ends it. Prefer these over Ctrl-Z, which
+                  only detaches cleanly when you're attached to a background agent.";
 
 /// Parsed launch options.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

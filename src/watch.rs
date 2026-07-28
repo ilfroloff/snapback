@@ -75,6 +75,57 @@ pub enum AppEvent {
     /// for its job id) probes claude directly rather than reading it (see
     /// [`crate::agents::live_agents`]).
     ReportedAgents(HashMap<String, ReportedAgent>),
+    /// A one-shot quick-reply send finished (`claude -p -r <id>`), delivered OFF
+    /// the UI thread by the detached send driver (see [`crate::send::spawn_send`]).
+    ///
+    /// Contrast the recurring [`ReportedAgents`](Self::ReportedAgents): this fires
+    /// EXACTLY ONCE per send, from a thread spawned for that one send, not from a
+    /// poller. `status` is the mapped result (cost on success, an error hint on
+    /// failure — see [`crate::send::status_for_send`]); `session_id` is the
+    /// authoritative id the send targeted, so the handler can tell whether the
+    /// finished send is the row currently previewed and re-anchor it to the
+    /// newest turn.
+    SendFinished {
+        /// Authoritative `sessionId` the send targeted.
+        session_id: String,
+        /// Mapped board status for the completed send (`None` only if there was
+        /// nothing to say).
+        status: Option<String>,
+    },
+    /// A one-shot interrupt (`claude stop <job-id>`) finished, delivered OFF the UI
+    /// thread by the detached interrupt driver (see [`crate::send::spawn_interrupt`]).
+    ///
+    /// Like [`SendFinished`](Self::SendFinished) it fires EXACTLY ONCE per interrupt,
+    /// from a thread spawned for that one stop. `status` is the mapped result
+    /// (`"stopped"` on success, a reason on failure — see
+    /// [`crate::send::status_for_stop`]); there is nothing to key by row because
+    /// stopping leaves the transcript unchanged.
+    InterruptFinished {
+        /// Mapped board status for the completed interrupt.
+        status: String,
+    },
+    /// A one-shot background-agent launch (`claude [--agent <name>] --bg <prompt>`)
+    /// finished, delivered OFF the UI thread by the detached launch driver (see
+    /// [`crate::send::spawn_bg_launch`]).
+    ///
+    /// Like [`SendFinished`](Self::SendFinished) it fires EXACTLY ONCE per launch,
+    /// from a thread spawned for that one launch. `status` is the mapped result
+    /// (started / started-but-warned / a reason on failure — see
+    /// [`crate::send::status_for_bg_launch`]).
+    ///
+    /// There is nothing to key by ROW — a brand-new agent has no `sessionId` until
+    /// claude mints one, and it reaches the board through the ordinary watcher →
+    /// reload path — but there IS something to key by DISPATCH. `launch_id` is the
+    /// board-local id [`crate::tui::app::App::dispatch_draft`] stamped on the card,
+    /// echoed back so the handler closes the card that launch belongs to and never
+    /// a compose the user opened while waiting.
+    BgLaunchFinished {
+        /// The dispatch this result belongs to (see
+        /// [`crate::tui::app::App::launching_draft`]).
+        launch_id: u64,
+        /// Mapped board status for the completed launch.
+        status: String,
+    },
     /// A periodic wake-up. The update loop does nothing costly on this.
     Tick,
 }
@@ -181,6 +232,21 @@ impl EventLoop {
     /// bounded to the board session like the tick thread.
     pub fn spawn_agents_poller(&self, interval: Duration) {
         spawn_agents_thread(self.tx.clone(), interval);
+    }
+
+    /// A clone of the merged channel's sender, for spawning a one-shot off-thread
+    /// producer that delivers back onto the SAME receiver.
+    ///
+    /// Used by [`crate::tui::run`] to hand the detached quick-reply send driver
+    /// ([`crate::send::spawn_send`]) a channel for its lone
+    /// [`AppEvent::SendFinished`], the same way [`spawn_agents_poller`] clones it
+    /// for the recurring agents poll. Cloning a `Sender` keeps the channel open;
+    /// the send thread's clone drops when it finishes.
+    ///
+    /// [`spawn_agents_poller`]: Self::spawn_agents_poller
+    #[must_use]
+    pub fn sender(&self) -> Sender<AppEvent> {
+        self.tx.clone()
     }
 
     /// Block until the next merged event, or `None` once all senders drop.

@@ -60,11 +60,18 @@ status flag (see the ADR note in the delete plan).
 reconstruct a path. Fixtures illustrating each shape live under
 `tests/fixtures/store/`.
 
-**The one write into this tree** is hard delete (`Ctrl-X d`, `delete::remove`):
-it unlinks a single session's own `<id>.jsonl` AND removes its sibling `<id>/`
-directory (subagents included) when present — never any other path, and only
-behind a confirmation modal plus the `can_delete` live guard. Everything else in
-this tree stays read-only.
+**The one write `snapback` makes into this tree itself** is hard delete
+(`Ctrl-X d`, `delete::remove`): it unlinks a single session's own `<id>.jsonl` AND
+removes its sibling `<id>/` directory (subagents included) when present — never any
+other path, and only behind a confirmation modal plus the `can_delete` live guard.
+
+A transcript can still GROW under snapback without snapback writing it: the quick
+reply ([`Ctrl-R`](#quick-reply--non-interactive-send-srcsendrs)) appends an
+exchange to the same `<id>.jsonl` because the `claude -p -r` CHILD appends it. The
+distinction is the rule, not a technicality — snapback opens no session file for
+writing, so the format's authorship stays entirely with Claude Code and no
+half-written record can be snapback's doing. Everything else in this tree stays
+read-only.
 
 ### The three file kinds
 
@@ -391,7 +398,14 @@ machine-readable window onto that, and `snapback` reads it **twice, differently*
 | Reading | Command | Asked | Question |
 | --- | --- | --- | --- |
 | **Board signal** (`reported_agents`) | `--json --all` | polled ~1s off-thread | "what should each row's badge say?" |
-| **Hand-off signal** (`live_agents`) | `--json` (**no `--all`**) | one-shot at EVERY hand-off | "will `claude -r` refuse *right now*?" **and** "what job id does `claude attach` take?" |
+| **Hand-off signal** (`live_agents`) | `--json` (**no `--all`**) | one-shot at EVERY hand-off | "will `claude -r` refuse *right now*?" **and** "what job id does `claude attach`/`claude stop` take?" |
+
+The hand-off reading serves FOUR gates, not just Enter: resume, Attach, the
+`Ctrl-R` [reply gate](#quick-reply--non-interactive-send-srcsendrs) and the
+`Ctrl-K` [interrupt gate](#interrupt--stopping-a-live-agent-ctrl-k-srcsendrs).
+The last two also CLASSIFY the record (via `agents::classify`) rather than reading
+membership alone — the only place a bucket informs an action rather than a pixel,
+and it is still claude's own fresh answer, never the polled `--all` map.
 
 The hand-off reading returns the **records**, not bare ids, so both of its
 questions are answered by ONE authoritative read: liveness is membership, and the
@@ -407,9 +421,11 @@ never from the `--all` map, which is a stale snapshot of a job that may have
 ended), `state`/`status` (the activity qualifier, see below), `name`. Parsing is
 fail-soft: any failure ⇒ empty map.
 
-The board's shell-out passes **`--all`** because the bare command lists only the
-currently-active agents: `done` never appears without it, so a finished session
-would render as though claude had never heard of it.
+The board's shell-out passes **`--all`** because the bare command lists a finished
+job only until claude reaps it from the active list (a just-`done` background job
+lingers there for a while, then drops out): without the flag a finished session's
+badge would vanish the moment claude reaps it, so `--all` is what keeps every
+`done` session — reaped or not — reliably badged.
 
 #### Why the gate does not read the `--all` map
 
@@ -471,6 +487,7 @@ Every qualifier-shaped output derives from that enum, so they cannot drift apart
 | `Working` | `working`, `busy` | `Gray` | `●` | **yes** (-> `DarkGray`) | verbatim (`working` / `busy`) |
 | `WorkingButIdle` | `state`=`working`/`busy` **AND** `status`=`idle` | `Gray` | `●` | **no** | `interrupted` (**translated**, no wire token) |
 | `Done` | `done` | `Green` | `●` | no | `done` (verbatim) |
+| `Ended` | `stopped`, `failed` | `DarkGray` | `●` | no | verbatim (`stopped` / `failed`) |
 | `Other` | anything else, or none | `Gray` | `●` | yes (-> `DarkGray`) | verbatim, or the kind label alone |
 
 The **Badge glyph** column is a second, SHAPE channel on top of the color one:
@@ -508,17 +525,21 @@ otherwise hide it as a plain `Working`) and buckets it here. It then renders the
 working `Gray` but **STEADY** — the absent pulse, not a second color, is what
 sets it apart — and translates the phrase to `interrupted` (there is no
 `interrupted` token on the wire; the word names the contradiction, in `claude`'s
-own vocabulary). This is **display-only**: like every other bucket it never
-answers "live?" and never gates resume/attach, which stay on `live_agents`
-membership. The internal name stays descriptive (`WorkingButIdle`) precisely
+own vocabulary). It is granted **no action of its own**: like every other bucket
+it never answers "live?" and never gates resume/attach, which stay on
+`live_agents` membership, and at the `Ctrl-R`/`Ctrl-K` gates it deliberately rides
+with the LIVE states rather than with `Ended`, so nothing is ever stopped on the
+strength of the inference. The internal name stays descriptive (`WorkingButIdle`) precisely
 because the signal cannot prove the *cause* the UI word implies; the accepted
 false-positive (a healthy agent briefly at `working`/`idle`) self-heals to
 `Working`+pulse on the next poll once `status` flips to `busy`.
 
-**Every column is a DISPLAY decision — no bucket answers "live?".** The table
-once carried that column and it was the bug: liveness is not a property of a
+**Every column above is a DISPLAY decision — no bucket answers "live?".** The
+table once carried that column and it was the bug: liveness is not a property of a
 qualifier, it is `live_agents`' membership answer straight from claude (see
-above).
+above). The buckets DO route the `Ctrl-R`/`Ctrl-K` stop decisions, but only over a
+record the probe just returned, so even there liveness is membership and the
+bucket answers the narrower "what is it doing right now".
 
 A pulsing bucket alternates its dot between the badge color and the dim partner
 shown above; the badge glyph (`●`, or `!` for `NeedsInput` — see the **Badge
@@ -535,10 +556,50 @@ agent a different badge depending on which token the wire used.
 `Other` is the fail-soft posture made visible: an unknown qualifier is passed
 through to the user rather than dropped or relabeled, and counts as ACTIVE, so
 schema drift never hides a busy session behind a steady dot. The colors read as
-urgency — yellow needs you, green is ready (idle or finished), gray is working —
-and the PULSE, not the color, is what marks activity: a **pulsing** gray dot is
-churning (`Working`/`Other`), a **steady** gray dot is not (`WorkingButIdle`,
-the interrupted agent claude never reconciled).
+urgency — yellow needs you, green is ready (idle or finished), gray is a working
+base, dim gray is at rest.
+
+**The PULSE — specifically its ABSENCE — is what marks activity, not the shade of
+the dot at any one instant.** That distinction is load-bearing because
+`view::BADGE_ENDED` and `view::BADGE_WORKING_DIM` are the SAME named color
+(`DarkGray`): a `Working`/`Other` dot therefore sits at exactly the `Ended` shade
+for half of every ~1s cycle, so a snapshot of the dot cannot tell a churning agent
+from a dead job. What separates them is that one MOVES and the other holds. Two
+things keep the row readable anyway, and neither is the dot's instantaneous color:
+
+- **Only the dot pulses.** The kind label and the qualifier phrase always carry
+  `badge_color`'s base (`render_list` styles them off `base`, never
+  `pulse_color`), so a `Working` row's label stays `Gray` while an `Ended` row's
+  reads `DarkGray` in every phase — a stable channel through the dot's off phase.
+- **Among the STEADY dots, shade then separates the two resting gray buckets**:
+  `WorkingButIdle` holds the working `Gray`, `Ended` holds the dim `DarkGray`.
+
+So: gray dot that moves ⇒ churning (`Working`/`Other`); gray dot that holds ⇒
+`WorkingButIdle`, the interrupted agent claude never reconciled; dim gray dot that
+holds ⇒ `Ended`. Read the pulse first, the shade second — never the shade alone.
+
+`Ended` is the counterpart to that default, and the two must not be conflated:
+`stopped` and `failed` are KNOWN terminal tokens, so they are recognized and read
+STEADY (the job is over, nothing is in flight to animate) and `DarkGray` (dim, and
+deliberately not `Done`'s green — a stopped or failed job did not necessarily
+finish cleanly). Their raw token still passes through verbatim. The fail-soft
+ACTIVE default is PRESERVED for genuinely-unknown tokens — `Ended` only carves the
+two real terminals out of `Other`, so a dead job stops pulsing as if live while
+true schema drift still errs toward showing activity.
+
+**`Ended` and `WorkingButIdle` are two DISTINCT resting buckets, never collapsed
+into one.** Different causes: `Ended` is claude REPORTING a terminal token
+outright, `WorkingButIdle` is a contradiction claude never reconciled. Different
+colors: dim `DarkGray` versus the working `Gray`. Since both hold STEADY, shade is
+what separates the two of THEM from each other — but only once the absent pulse has
+already ruled out a churning agent, whose dot passes through that same `DarkGray`
+every cycle (above). They also gate differently, and that is the sharper split:
+`Ended` is stoppable evidence, `WorkingButIdle` is not (see
+[Quick reply](#quick-reply--non-interactive-send-srcsendrs)). They are further
+**disjoint by construction** —
+`WorkingButIdle` requires `state`=`working`/`busy`, which `stopped`/`failed` can
+never be — so neither can shadow the other whichever order `classify` tests them
+in, and a `stopped` job whose `status` also reads `idle` still buckets as `Ended`.
 
 #### Observed value distribution
 
@@ -616,12 +677,39 @@ This is the third and last of **three distinct agent concepts** — keep them ap
 | **Scope** | `CurrentFolder` (default) / `All` | current-folder = sessions whose **canonical** `cwd` exactly equals the canonical launch dir; all = every session, grouped by folder. Toggled by `Ctrl-A` / `--all`. |
 | **Search mode** | `NameOnly` (default) / `NameAndContent` | which haystack the substring matcher scores; toggled by `Tab`. |
 | **Show hidden** | off (default) / on | whether soft-hidden sessions appear (dimmed, marked `[hidden]`, live badge intact). Toggled by `Ctrl-X h`; a row is hidden/un-hidden by `Ctrl-X x`. The set persists — see [snapback-owned state](#snapback-owned-state-srchiddenrs). |
-| **Modal** | `Row` \| `List` layout in one `Option<Modal>` | the SINGLE overlay type. `Enter` on a running session builds the `Attach` / `Fork` / `Cancel` choice (a `Row`); `Ctrl-N` with defined agents builds the agent picker (a `List`); `Ctrl-X d` builds the hard-delete confirm (a `Row`). Each choice carries a `ModalAction` tag the one confirm handler (`confirm_modal`) routes on. |
+| **Modal** | `Row` \| `List` layout in one `Option<Modal>` | the SINGLE type for a TITLED, choice-bearing overlay. `Enter` on a running session builds the `Attach` / `Fork` / `Cancel` choice (a `Row`); `Ctrl-N` with defined agents builds the agent picker (a `List`); `Ctrl-X d` builds the hard-delete confirm (a `Row`). Each choice carries a `ModalAction` tag the one confirm handler (`confirm_modal`) routes on. The plain Enter/Esc stop confirmations (`Ctrl-R`, `Ctrl-K`), the compose zone and the `Ctrl-X` chord are separate keyboard owners, NOT `Modal`s — see [PATTERNS.md](PATTERNS.md#10-keys-actions-outcomes). |
 
 The current-folder scope is an **exact** canonical `cwd` match by design: a
 repo's *other* worktree folders do not appear until you switch to all-folders or
 `cd` into them. Selection is tracked by stable `session_id` so it survives an
 autorefresh reload.
+
+### Terminal paste routing (`Event::Paste`)
+
+`tui::init_terminal` enables **bracketed paste**, so the terminal delivers a
+clipboard drop as ONE `crossterm::event::Event::Paste` carrying the whole string.
+`update::handle_paste` routes it through the SAME precedence the key arm uses —
+a partial enumeration here is a wrong one, so all six keyboard owners are stated:
+
+| Owner (in precedence order) | What a paste does | Why |
+| --- | --- | --- |
+| **Modal** (`handle_modal_key`) | ignored | A fixed choice with no text field. Acting would pick an option the user did not choose; falling through would type into a query the overlay is covering. |
+| **`Ctrl-X` chord** (`handle_chord_key`) | ignored, chord stays ARMED | The chord resolves on exactly one KEY, hit or miss. A paste carries no completion, and cancelling on one would silently disarm a chord whose hint is still on screen. |
+| **Stop confirm** (`handle_stop_confirm_key`) | ignored | A plain Enter/Esc gate; a paste is neither, and must never stop an agent. |
+| **Interrupt confirm** (`handle_interrupt_confirm_key`) | ignored | Same. |
+| **Compose** (`App::is_composing`) | inserted at the caret, newlines intact (`compose::insert_paste` → `TextArea::insert_str`) | The fix: as keystrokes, the first embedded newline was a bare `Enter` = `ComposeAction::Send`. |
+| **Board** | appended to the query, newlines flattened to spaces | The query is one line and `search::gate_atoms` splits it on spaces into substring atoms, so `foo\nbar` becomes exactly the `foo bar` the user could have typed. First-line-only would silently discard input. |
+
+Two rules hold on every path, both in `update::accept_paste`: line endings
+normalize to `\n` (`\r\n` collapses to one, a lone `\r` becomes one), and the text
+is capped at `PASTE_MAX_CHARS`, counted in **chars** so truncation can never split
+a UTF-8 codepoint. Over-long pastes **truncate** rather than being rejected — the
+head still lands — and say so on the status line, so it is never silent.
+
+`handle_paste` returns no `Outcome`. A paste is DATA and structurally cannot send,
+resume, launch, or quit. There is deliberately **no `Ctrl-V` binding**: the paste
+is the terminal's own, which keeps working over SSH and inside tmux where an
+app-side clipboard read would not, and `Ctrl-V` stays the editor's page-down.
 
 ## Hand-off invocations (`src/resume.rs`)
 
@@ -634,7 +722,7 @@ different mechanism, same verb.
 | Resume | `claude -r <id>` (`<id>` = full `sessionId`) |
 | Fork | `claude -r <id> --fork-session` (`<id>` = full `sessionId`) |
 | Attach | `claude attach <job-id>` (one-shot reattach; `<job-id>` = the **short agent-view id** from `claude agents --json`, **not** the `sessionId`) |
-| New session | `claude [--agent <name>]` (bare interactive launch, no `-r` — mints its own id; started in `App::launch_dir` via `Ctrl-N`, optionally bound to a picked agent) |
+| New session | `claude [--agent <name>] [<prompt>]` (interactive launch, no `-r` — mints its own id; started in `App::launch_dir` via `Ctrl-N`, optionally bound to a picked agent, and optionally opening on a drafted `<prompt>` — see [the background draft pane](#background-agent-draft-pane-ctrl-n)) |
 
 `claude attach` matches the agent-view **job id** (the short id), not the full
 `sessionId` — a full UUID exits 1 ("No job matching"). Only **background** agents
@@ -660,5 +748,237 @@ with YAML frontmatter under `~/.claude/agents/*.md` (user) and
 is a convenience — built-in/plugin agents are not files, so it is inherently
 incomplete; the picker always offers a `default (no agent)` bare launch and never
 blocks on it. `Ctrl-N` opens the picker only when at least one agent is
-discovered (otherwise it launches bare `claude` directly), pre-highlighting the
-last-picked agent, which `App` remembers **in-memory only** (never persisted).
+discovered (otherwise it opens the draft pane below directly, with no agent
+bound), pre-highlighting the last-STARTED agent, which `App` remembers
+**in-memory only** (never persisted).
+
+### Background-agent draft pane (`Ctrl-N`)
+
+Drafting is what a new session DEFAULTS to. `Enter` on the picker's highlighted
+row — and `Ctrl-N` itself when no agents are defined — opens the compose editor as
+a **draft pane** (`compose::ComposeTarget::NewBackgroundAgent`) rather than
+launching, and from there:
+
+| Key | argv | Route |
+| --- | --- | --- |
+| `Enter` | `claude [--agent <name>] --bg <prompt>` | `Outcome::BgLaunch` → `send::spawn_bg_launch` → one `AppEvent::BgLaunchFinished`. **No teardown** — the board stays up. |
+| `Ctrl-O` | `claude [--agent <name>] [<prompt>]` | `Outcome::Resume` → the ordinary teardown round trip, via `resume::check_new`. |
+
+`Enter` therefore lives in the [`send`](#quick-reply--non-interactive-send-srcsendrs)
+family, not the hand-off one: `--bg` registers the agent and returns immediately
+with no TTY, so tearing the board down for it would buy nothing. An empty draft
+refuses `Enter` (a background agent with no prompt does nothing) but is fine for
+`Ctrl-O`, which then launches bare — exactly what the picker's own `Ctrl-O` emits.
+
+**The pane shows a PLACEHOLDER, not a transcript.** A draft opens
+`App::draft: Option<NewSessionDraft>` alongside the compose editor, and while it
+is set `view::draft_card` replaces the previewed transcript with a near-empty card
+naming the agent, the launch dir, and the draft's keys. The two fields are
+separate on purpose: the editor answers *what the keyboard does*, the draft
+answers *what the pane shows*, and the view never reads `ComposeTarget` to decide
+the second. Without it the compose box docked over whichever row was selected, so
+a new-session draft read as a reply to an unrelated conversation — the DEFAULT
+`Ctrl-N` path, and therefore the first thing a user saw. The card's emptiness is
+the feature: the session does not exist yet, so anything conversation-shaped there
+would be a fiction.
+
+Replacing the transcript drags in two rules PATTERNS owns: the card suppresses the
+pinned banner inside `view::preview_banner` (see
+[PATTERNS.md §5](PATTERNS.md#5-selection-and-scroll-survive-reloads)) and a draft
+counts in `App::overlay_active` (see
+[PATTERNS.md §10](PATTERNS.md#10-keys-actions-outcomes)).
+
+`App::open_compose` / `close_compose` / `dispatch_draft` are the ONLY writers of
+the pair, so `Esc` (and every refusal) can never clear one and leave the other.
+The first two move both fields together; the third is where they deliberately
+part, and only there: `Enter` closes the editor and keeps the card, stamped with
+the `launch_id` of the dispatch it now reports, because there is nothing left to
+type but still no session to preview. That is the `App::sending` shape reused, not
+a second mechanism: an identity set at dispatch, matched by a completion event
+already on the channel, with no tick, thread, or event source added.
+
+**A card that outlives its editor needs TWO bounds, because its event carries
+neither.** `send::spawn_bg_launch` emits exactly one `AppEvent::BgLaunchFinished`,
+spawn failures included — but "emitted once" answers neither "for which dispatch?"
+nor "will it be delivered?", and the card is the only UI state that has to survive
+long enough to care:
+
+- **Which dispatch.** The card is still up when the result lands, but the SURFACE
+  underneath may have moved on — the user can open a quick reply (`Ctrl-R`) or a
+  second draft while `--bg` runs. So the event carries the `launch_id` back and
+  `App::launching_draft` checks it, exactly as `App::sending_to` checks a session
+  id before clearing an in-flight send. Without that check a completing launch
+  closes whatever compose is open and discards a half-typed message.
+- **Whether it arrives.** Delivery is bounded by the board session: `tui::run_inner`
+  builds a new `EventLoop` per board and drops the old receiver, so a launch still
+  running when the user hands off (`Enter`/`Ctrl-F` on a row stay routable — the
+  editor is closed) reports into a dead channel while `lib::run` re-enters the board
+  on the same `App`. `update::handle_event` therefore closes the compose surface on
+  any outcome that ENDS the board session (`Outcome::ends_board_session`: `Quit` and
+  every `Resume`), so the card can never strand the preview on a placeholder for
+  sessions it has nothing to do with.
+
+The picker's SECOND verb is that same `Ctrl-O`: it starts the highlighted agent
+interactively AT ONCE, skipping the draft. Both verbs therefore stay ONE key at
+the picker, which is what makes the default safe — neither flow pays a keystroke
+for the other — and `Ctrl-O` reads as "open interactive claude" on the picker and
+inside the draft alike. `Ctrl-B` is not bound anywhere.
+
+**`last_new_agent` is written where a launch ACTUALLY happens**, never where a
+draft merely opens, so a cancelled draft cannot rewrite it. That is three points:
+the picker's `Ctrl-O` (before the existence gate, so it survives a refusal),
+`compose::submit_bg_launch` (past the empty-buffer nudge — an empty draft is not a
+launch), and `compose::open_interactive`. The memory means "the agent of the last
+new session actually started", which is exactly what pre-highlights the next
+`Ctrl-N`.
+
+Two constraints shape the rest:
+
+- **The prompt AUTO-SUBMITS as the first turn.** It rides as claude's trailing
+  positional, which is the only mechanism the CLI offers — there is no pre-fill.
+  See [CLAUDE_CLI.md](CLAUDE_CLI.md#the-trailing-positional-auto-submits-and-there-is-no-pre-fill)
+  for the flags that were checked and rejected, and why every user-facing string
+  says "run interactively" rather than promising a review.
+- **Nothing about the launch is recorded but the agent name.** No virtual/pending
+  row is created, and the short job id `--bg` reports is NOT reconciled back to a
+  `sessionId` (it isn't one). The new agent reaches the board through the ordinary
+  watcher → reload path, and the transcript's own `agent-setting` record — already
+  rendered by `store::preview` — is what says which agent it is. The one exception
+  is `last_new_agent` above, which is picker state, not a board row.
+
+  The draft card is NOT a counter-example: it is a PANE, and it is the reason a
+  row was never an option. `apply_sessions` replaces `sessions` wholesale, so a
+  synthetic row dies on the next autorefresh; its empty `content_index` would
+  drop it under any active query; `Ctrl-X x` on it would persist a fabricated id
+  into the one file snapback owns; and `resume.rs` forbids deriving the short id
+  from a `sessionId` anyway. A pane needs none of that — it holds no id, survives
+  no reload, and disappears when the draft does.
+
+The launch's honesty seam (`send::status_for_bg_launch`) is deliberately stricter
+than the send's, because `--bg` can fail SILENTLY: an unrecognized `--agent` exits
+**0**, warns on stderr, and starts the session without that agent. A zero exit with
+a non-empty stderr is therefore reported as *started, but claude warned…* rather
+than as a clean start — see
+[CLAUDE_CLI.md](CLAUDE_CLI.md#--bg-can-fail-silently-on-a-zero-exit).
+
+## Quick reply — non-interactive send (`src/send.rs`)
+
+`Ctrl-R` sends a one-shot message to the selected session WITHOUT the teardown
+hand-off above. `claude -p -r <id> --output-format json "<msg>"` resumes the
+session non-interactively (its stdio is a pipe, no TTY), replays the full
+context, **appends the exchange in place** to the same `<id>.jsonl` — same
+`sessionId`, no new file — prints a JSON result (`is_error`, `total_cost_usd`,
+`result`, …), and exits. Tools run and are recorded in-file just as in an
+interactive turn. Because it needs no terminal, it runs on a detached thread while
+the board stays up, and the reply renders through the ordinary `SessionWatcher` →
+`SessionsChanged` → reload → preview path.
+
+**Optimistic in-flight echo.** Because `claude -p` writes the user turn only after a
+network round trip, the reload path alone would leave the preview showing stale
+content for the first seconds after Send. So while the send is in flight (`App::sending`,
+which carries the message and the session's turn count AT SEND TIME), the preview
+appends two synthetic turns via `store::preview::pending_reply_turns`: the sent
+message under a `▶ you` turn plus a live `● claude` **sending… / cooking…**
+placeholder, and it FOLLOWS the bottom so both stay in view. The `▶ you` echo is
+dropped the instant the real turn lands on disk — detected by the reloaded
+`Session::msg_count` growing past `Sending::baseline_msg_count` — so the real turn
+(styled identically) takes its place with no doubling; the placeholder stays until
+`AppEvent::SendFinished` clears `App::sending`. The pinned status banner is SUPPRESSED
+while a send is in flight (`view::preview_banner` returns `None`, keeping render and
+the click hit-test agreeing on the geometry), since the inline turns replace it.
+
+The load-bearing constraint: **claude will not resume a session it is holding as a
+live agent.** `claude -p -r <id>` on such a session exits non-zero, verbatim:
+
+> `Error: Session <id> is currently running as a background agent (bg). Use claude`
+> `agents to find and attach to it, or add --fork-session to branch off a copy.`
+
+This holds in EVERY held state — `done` included: a just-finished background job
+stays a registered agent (in the bare `agents::live_agents` list) until claude
+reaps it, and claude refuses it exactly like a working one.
+
+**The unlock: `claude stop <job-id>`** deregisters the job — "Its conversation is
+kept" — after which `-p -r` resumes and appends **in place** (verified on the wire:
+`stop` → the session leaves the bare list → the reply grows the same `<id>.jsonl`).
+Stopping is only safe when nothing is running to interrupt, so `send::reply_gate`
+decides from the agent's STATE (one-shot bare probe via `App::live_agent_now` —
+never the polled `--all` map — classified by the one `agents::classify`), and
+`Ctrl-R` in `tui::update` routes on it:
+
+| Probe result | Bucket | `Ctrl-R` (`send::reply_gate`) |
+| --- | --- | --- |
+| claude is not holding the session | — | reply in place, no stop (compose opens) |
+| held, but the record carries no stoppable job id (an **interactive** session) | — | refuse (`SEND_LIVE_REFUSED`) |
+| `done` | `Done` | stop the ended job, then reply — straight to compose |
+| `stopped`, `failed` | `Ended` | same: stop, then reply |
+| `blocked`, `waiting` | `NeedsInput` | **confirm** (`App::pending_stop`, a small modal — stopping abandons a waiting agent), then stop + reply |
+| `working`, `busy` | `Working` | refuse (`SEND_LIVE_REFUSED`) — Attach or Fork instead |
+| `state`=`working`/`busy` **AND** `status`=`idle` | `WorkingButIdle` (reads `interrupted`) | refuse |
+| `idle` | `Idle` | refuse |
+| anything else, or no qualifier at all | `Other` | refuse |
+
+The **job-id check runs BEFORE the bucket** and wins in every state: an agent
+`claude stop` cannot address is unstoppable whatever it is doing, so even a `done`
+interactive session refuses.
+
+**The two STEADY buckets part ways here, and that split is the point.** `Ended`
+takes the stop-then-reply path while `WorkingButIdle` refuses with the live states,
+even though both badge at rest. The difference is EVIDENCE: `Ended` is claude
+REPORTING a terminal token, so "the run is over" is claude's own answer, whereas
+`WorkingButIdle` is snapback INFERRING it from a `state`/`status` contradiction
+whose documented false positive is a healthy agent caught mid-flip. Acting on that
+inference would stop live work on a guess, so the bucket stays display-only exactly
+as [its own rules](#activity-buckets-agentactivity) promise. A badge that merely
+LOOKS at rest is not licence to stop a job.
+
+The stop step (`build_stop_argv`, the SHORT agent-view job id from the probe's
+`ReportedAgent.id`) runs in `run_send` BEFORE the send, **best-effort**: if the job
+was already reaped between the gate and the send, the stop fails but the reply still
+lands; if the session really is still held, the reply's own error is what surfaces.
+No permission flags are passed: a send inherits the user's existing settings.
+
+**Report the send HONESTLY.** Because claude prints its refusal to **stderr** and
+exits non-zero with an EMPTY stdout, a driver that nulls stderr and ignores the exit
+code would map the empty stdout to the neutral `"sent"` — a false success over a
+failed send (the exact bug that shipped first). So `run_send` captures stderr AND
+honors the exit code (`status_for_output`): a clean exit maps the JSON payload
+(cost / `is_error` / neutral) via `status_for_send`, while a non-zero exit surfaces
+claude's own reason via `status_for_failed_send` (`send failed: <reason>`),
+sanitized (ANSI/control stripped, one line, length-capped) so no raw escape reaches
+the status line.
+
+## Interrupt — stopping a live agent (`Ctrl-K`, `src/send.rs`)
+
+`Ctrl-K` runs the SAME `claude stop <job-id>` the reply path uses as its unlock,
+but as the whole point rather than a preparatory step: it ends the selected
+session's live background job from the board (the conversation is kept; the job
+registration drops). It is a one-shot on a detached thread like a send —
+`Outcome::Interrupt` → `send::spawn_interrupt` → one `AppEvent::InterruptFinished`
+— so the board never tears down.
+
+`send::interrupt_gate` mirrors `reply_gate`'s shape over the same one-shot probe,
+with the **opposite intent**: a reply must never interrupt live work, whereas an
+interrupt exists to end it, so a `working` agent is a valid target here rather than
+a refusal.
+
+| Probe result | Bucket | `Ctrl-K` (`send::interrupt_gate`) |
+| --- | --- | --- |
+| claude is not holding the session | — | refuse (`INTERRUPT_NOT_LIVE`) — a transcript on disk is not a running process |
+| held, but no stoppable job id (an **interactive** session) | — | refuse (`INTERRUPT_NO_JOB_ID`) — point at the terminal that owns it |
+| `done` | `Done` | stop NOW, no confirmation (nothing is running to abandon) |
+| `stopped`, `failed` | `Ended` | same: stop now |
+| every other bucket — `Working`, `WorkingButIdle`, `NeedsInput`, `Idle`, `Other` | | **confirm** first (`App::pending_interrupt`, `view::render_interrupt_confirm`), then stop |
+
+`WorkingButIdle` confirms rather than stopping outright for the same evidence gap
+the reply gate turns on: the inferred rest cannot prove the run ended, and skipping
+the guard would kill live work on that false positive with no way back. The confirm
+costs one keypress.
+
+`claude stop` acts on the GLOBAL background-job registry, so the child runs in
+`App::launch_dir` — deliberately NOT a re-read of the session's own `cwd`, since a
+deleted worktree must never block stopping its still-live job. That is the one
+hand-off in the crate that does not re-read the authoritative `cwd`, and the reason
+is that the job id, not the session's directory, is what identifies the target.
+`status_for_stop` maps the result: a clean exit is the neutral `stopped`, a
+non-zero one surfaces claude's own sanitized reason (`stop failed: <reason>`), so a
+failed stop never reads as a successful one.
