@@ -1778,7 +1778,7 @@ fn render_search(frame: &mut Frame, app: &App, area: Rect) {
 /// modifier only, no RGB or ANSI (PATTERNS §7, TERMINAL-SAFE STYLING).
 fn chord_hint(selected_hidden: bool) -> String {
     let x = if selected_hidden { "expose" } else { "hide" };
-    format!("^X  x {x} · d delete · h show/hide hidden · Esc cancel")
+    format!("^X  x {x} · d delete row/lineage · h show/hide hidden · Esc cancel")
 }
 
 /// The compose zone's key hints, per open draft. Pure so the wording is assertable
@@ -2329,6 +2329,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
+    use super::super::app::ModalAction;
     use super::*;
     use crate::store::Session;
 
@@ -4842,8 +4843,8 @@ mod tests {
         // The joint-read bucket: a working `state` its own `status` calls `idle`.
         // Same working gray, but STEADY — the missing pulse is the whole tell.
         ("interrupted", "working", Some("idle"), Color::Gray, false),
-        // Finished: green (nothing is wanted from you) and steady. Only
-        // observable at all because the poller passes `--all`.
+        // Finished: green (nothing is wanted from you) and steady. The poller
+        // passes `--all` so EVERY `done` agent stays observable, reaped or not.
         ("done", "done", None, Color::Green, false),
         // The terminal bucket, under BOTH its tokens: dim gray and steady. Dim
         // rather than the working gray above (the job is over, not churning) and
@@ -5752,7 +5753,14 @@ mod tests {
             text.contains(&chord_hint(false)),
             "a pending chord must draw the which-key hint on the help line; drawn: {text:?}"
         );
-        for needle in ["x hide", "d delete", "h show/hide hidden", "Esc cancel"] {
+        // `d` names BOTH targets the confirm offers, so the chord hint stays in
+        // step with the delete modal's own choices (AGENTS.md KEEP KEY DOCS IN SYNC).
+        for needle in [
+            "x hide",
+            "d delete row/lineage",
+            "h show/hide hidden",
+            "Esc cancel",
+        ] {
             assert!(
                 text.contains(needle),
                 "the which-key hint must list {needle:?}; drawn: {text:?}"
@@ -5897,49 +5905,326 @@ mod tests {
 
     #[test]
     fn the_delete_confirm_modal_shows_its_full_message_without_clipping() {
-        use crate::tui::app::{Modal, ModalAction, ModalChoice, ModalLayout};
-        // The delete prompt is wider than the modal, so it must wrap across rows —
-        // both the opening and the closing clause have to reach the screen. Regression
-        // guard for the clipped "... This" the old single-line render produced.
+        // The delete prompt is far wider than the modal, so it must wrap across
+        // rows — the opening clause, the irreversibility warning AND the blast
+        // radius all have to reach the screen. Regression guard for the clipped
+        // "... This" the old single-line render produced.
+        //
+        // Opened through the REAL `open_delete_confirm` rather than a synthetic
+        // Modal, so the copy under test is the copy that ships: the blast-radius
+        // sentence is the honest half (the guard now admits parked background
+        // agents, so the user must be told the agent itself survives and can write
+        // a fresh transcript), and a hand-copied fixture would keep passing while
+        // that sentence changed or vanished.
         let (width, height) = (80u16, 24u16);
         let mut app = App::new(
             vec![sample_session()],
             Scope::All,
             PathBuf::from("/tmp/launch"),
         );
-        app.modal = Some(Modal {
-            title: "delete session".to_string(),
-            message: "Permanently delete this session's transcript from disk? \
-                      This can't be undone."
-                .to_string(),
-            layout: ModalLayout::Row,
-            choices: vec![
-                ModalChoice {
-                    label: "Delete".to_string(),
-                    description: None,
-                    action: ModalAction::Delete,
-                },
-                ModalChoice {
-                    label: "Cancel".to_string(),
-                    description: None,
-                    action: ModalAction::Cancel,
-                },
-            ],
-            selected: 1,
-            session_id: Some("sess-live".to_string()),
-        });
+        app.open_delete_confirm();
+        assert!(app.modal.is_some(), "the confirm is open");
 
         let buffer = drawn_board(&mut app, width, height);
         let screen: String = (0..height)
             .map(|y| full_row_text(&buffer, y, width))
             .collect::<Vec<_>>()
             .join("\n");
-        for needle in ["Permanently delete", "can't be undone."] {
+        // Read only the modal's OWN columns — the same centered span
+        // `centered_rect` places it in, minus its borders. Flattening the whole
+        // row would splice the panes' borders and the preview's text into the
+        // middle of a wrapped sentence, which says nothing about clipping.
+        let inner_x = usize::from((width - MODAL_WIDTH) / 2 + 1);
+        let inner_w = usize::from(MODAL_WIDTH - 2);
+        // Wrapping breaks lines at spaces, so collapsing runs of whitespace lets a
+        // phrase split across two rows read back as the phrase — while text
+        // genuinely CLIPPED away is still missing.
+        let flat = (0..height)
+            .map(|y| {
+                full_row_text(&buffer, y, width)
+                    .chars()
+                    .skip(inner_x)
+                    .take(inner_w)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for needle in [
+            "Permanently delete this transcript from disk?",
+            "This can't be undone.",
+            "a background agent keeps running in Claude Code until you stop it there",
+            "can write a new transcript.",
+            // The button strip is part of the same wrapped box.
+            "Delete this",
+            "Cancel",
+        ] {
             assert!(
-                screen.contains(needle),
-                "the wrapped delete message must show {needle:?} in full; screen:\n{screen}"
+                flat.contains(needle),
+                "the wrapped delete confirm must show {needle:?} in full; screen:\n{screen}"
             );
         }
+    }
+
+    /// A `members`-strong fork lineage in one folder with `hidden` of it soft-HIDDEN
+    /// — the DISCLOSING shape of the delete confirm, which the test above does not
+    /// cover (it opens a LONE session, where `delete_confirm_message` adds nothing).
+    ///
+    /// Built from [`sample_session`] so the confirm renders over a real board, and
+    /// through `hidden_ids` + `root_uuid` rather than a synthetic `Modal` so the
+    /// modal under test is the one `open_delete_confirm` actually builds. The
+    /// selected id is the NEWEST member, which is the lineage head.
+    ///
+    /// The PARTIAL shape — older members hidden, the head not — is NOT reachable by
+    /// hiding: `App::toggle_hidden_selected` flips a whole lineage as ONE unit. It is
+    /// reachable the way a user meets it, a set PERSISTED while the lineage was
+    /// smaller plus a later fork joining as the new head, so the set is seeded and the
+    /// board is then rebuilt through `apply_sessions` — the PUBLIC reload path that
+    /// such a fork actually arrives on. The rebuild is the point: a board left as
+    /// `App::new` filtered it would still count the hidden members into the head's
+    /// `(+N)` marker, a board the running app cannot draw.
+    fn hidden_lineage_board(members: usize, hidden: usize) -> App {
+        let ids: Vec<String> = (0..members).map(|i| format!("disc-{i:02}")).collect();
+        let sessions: Vec<Session> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let mut s = sample_session();
+                s.session_id = id.clone();
+                s.label = id.clone();
+                s.root_uuid = Some("disc-root".to_string());
+                // Distinct stamps so the newest — `disc-00` — is the head
+                // deterministically.
+                s.timestamp = Some(
+                    OffsetDateTime::from_unix_timestamp(
+                        1_752_000_000 - i64::try_from(i).expect("a small fixture index") * 3_600,
+                    )
+                    .expect("a valid fixture timestamp"),
+                );
+                s
+            })
+            .collect();
+        let mut app = App::new(sessions.clone(), Scope::All, PathBuf::from("/tmp/launch"));
+        // `App::new` LOADS the persisted hidden set, so start from a known one —
+        // the counts below are exact, and an inherited id must not reach them.
+        app.hidden_ids.clear();
+        // Hide from the OLD end, so the selected head stays visible: the surprising
+        // shape is a board showing one row while the button counts several.
+        app.hidden_ids
+            .extend(ids.iter().rev().take(hidden).cloned());
+        // Re-derive `filtered`, the fold counts and the selection from that set. The
+        // head survives the reload by id, so the selection lands where a startup's
+        // `select_first` would leave it.
+        app.apply_sessions(sessions);
+        app
+    }
+
+    /// The disclosure is not free, and this pins the price the doc block on
+    /// `app::delete_confirm_message` quotes.
+    ///
+    /// The added sentence costs exactly ONE wrapped row (4 → 5), so the `Row` box
+    /// grows 10 → 11. `centered_rect` CLAMPS that height and `render_modal` draws
+    /// top-down with no vertical scroll, so the extra row pushes the button strip
+    /// and the `Esc cancel` footer off a short terminal one row sooner than the
+    /// non-disclosing confirm did: the strip needs 9 rows where it needed 8, the
+    /// footer 11 where it needed 10.
+    ///
+    /// Both numbers and their non-disclosing baselines are asserted, because the
+    /// point is the DELTA — a test that only pinned the disclosing side would keep
+    /// passing if the plain prompt regressed to match it. Nothing here is estimated:
+    /// this test IS the measurement the doc block cites, kept so the doc cannot
+    /// drift away from the render.
+    #[test]
+    fn the_disclosing_delete_confirm_costs_one_row_and_keeps_cancel_default() {
+        /// Terminal heights the sweep covers — well below and well above every
+        /// threshold under test, so a moved threshold shows up as a changed answer
+        /// rather than as a sweep that ran out of room.
+        const SWEEP: std::ops::RangeInclusive<u16> = 4..=16;
+
+        // The shortest terminal that still draws `needle` somewhere on screen.
+        let shortest_showing = |app: &mut App, needle: &str| -> Option<u16> {
+            SWEEP.clone().find(|&h| {
+                let buffer = drawn_board(app, 80, h);
+                let screen: String = (0..h)
+                    .map(|y| full_row_text(&buffer, y, 80))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                screen.contains(needle)
+            })
+        };
+
+        // --- the disclosing confirm -------------------------------------
+        let mut app = hidden_lineage_board(3, 2);
+        app.open_delete_confirm();
+        let modal = app.modal.clone().expect("the confirm is open");
+        assert!(
+            modal
+                .message
+                .starts_with("3 in this lineage, 2 of them hidden."),
+            "the fixture must be on the DISCLOSING path: {:?}",
+            modal.message
+        );
+        assert_eq!(
+            wrap_message(&modal.message, MODAL_WIDTH - 2).len(),
+            5,
+            "the disclosure costs exactly one wrapped row over the plain prompt's four"
+        );
+        assert_eq!(
+            shortest_showing(&mut app, "Delete lineage (3)"),
+            Some(9),
+            "a disclosing confirm needs a 9-row terminal to draw its button strip"
+        );
+        assert_eq!(
+            shortest_showing(&mut app, "Esc cancel"),
+            Some(11),
+            "a disclosing confirm needs an 11-row terminal to draw its footer"
+        );
+        // The residual cost is legibility, never the safe default: `Cancel` is
+        // preselected, so Esc/Enter still cancel with the strip off screen.
+        assert_eq!(
+            modal.choices[modal.selected].label, "Cancel",
+            "the safe default stays preselected on the disclosing path"
+        );
+
+        // --- the plain confirm, same lineage, nothing hidden -------------
+        // Built with `hidden` at zero rather than cleared afterwards: clearing the
+        // set behind `filtered` would put the baseline board back into the
+        // unreachable state the fixture exists to avoid.
+        let mut plain = hidden_lineage_board(3, 0);
+        plain.open_delete_confirm();
+        let plain_modal = plain.modal.clone().expect("the confirm is open");
+        assert_eq!(
+            wrap_message(&plain_modal.message, MODAL_WIDTH - 2).len(),
+            4,
+            "the non-disclosing prompt is unchanged at four wrapped rows"
+        );
+        assert_eq!(
+            shortest_showing(&mut plain, "Delete lineage (3)"),
+            Some(8),
+            "the non-disclosing confirm still draws its strip on an 8-row terminal"
+        );
+        assert_eq!(
+            shortest_showing(&mut plain, "Esc cancel"),
+            Some(10),
+            "the non-disclosing confirm still draws its footer on a 10-row terminal"
+        );
+    }
+
+    /// The rejected alternative, pinned so the doc block's WIDTH rationale stays
+    /// falsifiable: putting the counts in the `Delete lineage` label instead of the
+    /// message costs `Cancel` — the SAFE DEFAULT — ten columns of legibility.
+    ///
+    /// `render_modal` never wraps a `Row` strip (it only centers it), so the strip
+    /// truncates instead of reflowing. This renders BOTH strips, the shipped one and
+    /// the alternative, and pins the narrowest terminal each still draws `Cancel`
+    /// whole on. The labelled strip is deliberately not shipped code — it is the
+    /// measurement the rationale rests on, and without it those numbers are a claim
+    /// no test can contradict.
+    #[test]
+    fn counts_in_the_lineage_label_would_cost_cancel_ten_columns() {
+        // The real disclosing copy, so the box being measured is the shipped box.
+        let mut app = hidden_lineage_board(3, 2);
+        app.open_delete_confirm();
+        let message = app.modal.clone().expect("the confirm is open").message;
+
+        let narrowest_whole_cancel = |lineage_label: &str| -> Option<u16> {
+            (20u16..=70).find(|&w| {
+                let modal = Modal {
+                    title: "delete session".to_string(),
+                    message: message.clone(),
+                    layout: ModalLayout::Row,
+                    choices: ["Delete this", lineage_label, "Cancel"]
+                        .into_iter()
+                        .map(|label| ModalChoice {
+                            label: label.to_string(),
+                            description: None,
+                            action: ModalAction::Cancel,
+                        })
+                        .collect(),
+                    selected: 2,
+                    session_id: None,
+                };
+                let mut terminal =
+                    Terminal::new(TestBackend::new(w, 24)).expect("build a test terminal");
+                terminal
+                    .draw(|frame| render_modal(frame, &modal))
+                    .expect("render must not panic at any width");
+                let buffer = terminal.backend().buffer().clone();
+                (0..24u16)
+                    .map(|y| full_row_text(&buffer, y, w))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    .contains("Cancel")
+            })
+        };
+        assert_eq!(
+            narrowest_whole_cancel("Delete lineage (5)"),
+            Some(50),
+            "the shipped strip keeps Cancel whole down to a 50-column terminal"
+        );
+        assert_eq!(
+            narrowest_whole_cancel("Delete lineage (5, 2 hidden)"),
+            Some(60),
+            "counts in the label cost Cancel ten columns — the reason they live in \
+             the message instead"
+        );
+    }
+
+    /// How far the LEADING counts actually survive being clipped — the honest
+    /// bound on `delete_confirm_message`'s clip-resistance argument.
+    ///
+    /// `wrap_message` wraps to the modal-width CONSTANT, not to the clamped area, so
+    /// a terminal narrower than the box drops each message row's TAIL. Leading with
+    /// the counts is the most durable placement available, but it is NOT absolute:
+    /// a MULTI-DIGIT count can still be truncated into a shorter, plausible number.
+    /// This pins both ends of that — the width where both counts still read, and the
+    /// width where the second one is silently cut into a wrong one — so the doc
+    /// block cannot claim a safety it does not have.
+    #[test]
+    fn the_disclosed_counts_survive_clipping_to_a_third_of_the_box() {
+        // 12 members, 10 hidden: the smallest shape where BOTH counts are
+        // multi-digit, which is the only shape the truncation risk shows up in.
+        let mut app = hidden_lineage_board(12, 10);
+        app.open_delete_confirm();
+        let message = app.modal.clone().expect("the confirm is open").message;
+        assert!(
+            message.starts_with("12 in this lineage, 10 of them hidden."),
+            "the fixture must produce two multi-digit counts: {message:?}"
+        );
+
+        // The modal's first MESSAGE row at terminal width `w` — the row directly
+        // under its titled top border, which is where the counts are. Anchored on
+        // the TITLE rather than on a border glyph, because the board behind the
+        // overlay draws bordered panes of its own.
+        let first_message_row = |app: &mut App, w: u16| -> String {
+            let buffer = drawn_board(app, w, 24);
+            (0..24u16)
+                .map(|y| full_row_text(&buffer, y, w))
+                .skip_while(|row| !row.contains("delete session"))
+                .nth(1)
+                .expect("the modal draws a message row under its titled top border")
+                // Trim the box's own side borders off the ends.
+                .trim_matches('\u{2502}')
+                .to_string()
+        };
+
+        // Half the box's width: clipped, but every digit of both counts survives.
+        let at_30 = first_message_row(&mut app, 30);
+        assert!(
+            at_30.starts_with("12 in this lineage, 10"),
+            "both counts must still read whole at 30 columns: {at_30:?}"
+        );
+
+        // A third of the box's width: the hidden count is cut from 10 to 1. This is
+        // the residual risk the doc block names rather than denies — a plausible
+        // wrong number, not a visibly broken one.
+        assert_eq!(
+            first_message_row(&mut app, 23),
+            "12 in this lineage, 1",
+            "at 23 columns the multi-digit hidden count clips into a shorter one"
+        );
     }
 
     // --- the pulse against a URL-bearing row ------------------------------

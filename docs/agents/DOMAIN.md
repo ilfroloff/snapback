@@ -63,7 +63,8 @@ reconstruct a path. Fixtures illustrating each shape live under
 **The one write `snapback` makes into this tree itself** is hard delete
 (`Ctrl-X d`, `delete::remove`): it unlinks a single session's own `<id>.jsonl` AND
 removes its sibling `<id>/` directory (subagents included) when present — never any
-other path, and only behind a confirmation modal plus the `can_delete` live guard.
+other path, and only behind a confirmation modal plus the `can_delete_target`
+WRITER guard.
 
 A transcript can still GROW under snapback without snapback writing it: the quick
 reply ([`Ctrl-R`](#quick-reply--non-interactive-send-srcsendrs)) appends an
@@ -72,6 +73,79 @@ distinction is the rule, not a technicality — snapback opens no session file f
 writing, so the format's authorship stays entirely with Claude Code and no
 half-written record can be snapback's doing. Everything else in this tree stays
 read-only.
+
+The confirm targets the selected session ALONE or its whole
+[fork lineage](#fork-lineage-storelineage) — the same grouping the hide flips as
+one unit, and for the same reason: deleting only a folded HEAD leaves its members
+on disk and the fold simply re-heads to a surviving fork, so the row never leaves
+the board. `delete::remove` is still strictly per-session; a lineage is a loop
+over it, each member guarded on its own, with refused members skipped rather than
+aborting the rest.
+
+That grouping sweeps the FULL store, so a soft-HIDDEN member is counted in the
+button's `(N)` and deleted with the rest — hiding is a visibility preference, not
+a tombstone. The confirm therefore DISCLOSES the gap instead of narrowing the set:
+the pure `tui::app::delete_confirm_message` leads the prompt with `N in this
+lineage, M of them hidden` when `N > 1` **and** `M > 0`, so the count is
+predictable BEFORE the confirm rather than only explicable after it. Both
+conditions matter: a LONE session — hidden or not — has no lineage button, so
+there is no `(N)` to be surprised by and the prompt stays exactly as it was.
+
+The counts lead the sentence and the sentence leads the message because the modal
+wraps to a constant width and clips each row's TAIL on a narrow terminal (the
+button strip is worse — it is never wrapped at all, so the same counts in the label
+push `Cancel` off the strip ten columns sooner). The sentence is kept terse for a
+second reason: it is wrapped into a box whose height `centered_rect` clamps, so
+each wrapped row it adds pushes the button strip off a short terminal one row
+sooner. It costs exactly one row, and both prices are pinned by render tests in
+`tui::view`.
+
+The guard asks **"is anything writing this file?"**, not "does claude know this
+session?". Those are different questions and conflating them was a defect: claude
+appends by RE-OPENING the transcript path, so a PARKED background agent holds no
+file descriptor on it and has no write to corrupt (measured on one machine: 72 of
+74 active records were background and stopped, `lsof` showing zero open
+transcripts). Bare membership therefore refused ~97% of the rows claude reports,
+including ones idle for weeks. So an OPEN INTERACTIVE session is refused (its next
+keystroke appends here) and a background agent is judged by its
+[activity bucket](#activity-buckets-agentactivity): `NeedsInput`,
+`WorkingButIdle`, `Done` and `Ended` are parked and deletable; `Working`, `Idle`
+and `Other` are refused, the last of those because an unreadable qualifier must
+not authorize an irreversible unlink.
+
+Those are `can_delete`'s two refusals, and they cover only TWO of the three
+writers. The third is snapback's OWN: a
+[quick reply](#quick-reply--non-interactive-send-srcsendrs) `claude stop`s the
+held job before it runs `claude -p -r <id>` — precisely so `-r` is accepted — so
+for the whole span of a send the target is ABSENT from the active list
+`can_delete` reads, while a `claude` child snapback spawned appends to that very
+transcript. The probe cannot see that writer by construction, and the board stays
+fully interactive during a send, so `Ctrl-X d` genuinely is reachable in the
+window. What the confirm therefore calls is `delete::can_delete_target`: the
+in-flight answer from `App::sending_to` FIRST, because it is the more specific
+fact (mid-send the claude-side verdict is `Ok` by construction, so asking it
+first would report nothing at all), then `can_delete`. Its refusal
+(`DELETE_SENDING_REFUSAL`) names snapback rather than claude, since telling the
+user to close a claude window would point at the wrong process. It stays a
+COMPOSITION of two facts with two sources and two remedies, not a wider
+`can_delete`.
+
+The two FINISHED arms, `Done` and `Ended`, were once thought unreachable here: an
+earlier note argued the guard reads the BARE list and that both sampled bare lists
+held zero `done` records (across 37 entries and 74 — see the
+[sampled distribution](#observed-value-distribution)), so a finished session would
+arrive unreported and be allowed by the not-reported arm instead. That inference
+from an ABSENCE was wrong. `claude` keeps a `done` background job in its ACTIVE
+list for a while before reaping it, so the arm is LIVE rather than contingent —
+and the old note's warning against deleting it as dead code stands vindicated.
+`delete::can_delete`'s doc comment owns that correction and is the only place the
+reasoning is written down.
+
+What is left for a parked agent is **resurrection, not corruption** — attaching
+and replying later re-creates the file with only the new lines — and the confirm
+modal STATES that rather than refusing over it. The `pid` on the wire is
+deliberately unused: it is absent on roughly half the records and does not
+correlate with recent writes.
 
 ### The three file kinds
 
@@ -525,21 +599,49 @@ otherwise hide it as a plain `Working`) and buckets it here. It then renders the
 working `Gray` but **STEADY** — the absent pulse, not a second color, is what
 sets it apart — and translates the phrase to `interrupted` (there is no
 `interrupted` token on the wire; the word names the contradiction, in `claude`'s
-own vocabulary). It is granted **no action of its own**: like every other bucket
-it never answers "live?" and never gates resume/attach, which stay on
-`live_agents` membership, and at the `Ctrl-R`/`Ctrl-K` gates it deliberately rides
+own vocabulary). Like every other bucket it never answers "live?" and never
+gates resume/attach, which stay on `live_agents` membership — but it is **not**
+display-only, and its two non-display consumers read it DELIBERATELY DIFFERENTLY.
+At the `Ctrl-R`/`Ctrl-K` gates it is granted **no action of its own**: it rides
 with the LIVE states rather than with `Ended`, so nothing is ever stopped on the
-strength of the inference. The internal name stays descriptive (`WorkingButIdle`) precisely
-because the signal cannot prove the *cause* the UI word implies; the accepted
-false-positive (a healthy agent briefly at `working`/`idle`) self-heals to
-`Working`+pulse on the next poll once `status` flips to `busy`.
+strength of the inference. At the hard-delete writer guard (`delete::can_delete`)
+it is an ALLOW arm, because that gate asks the narrower "is a write in flight?"
+and `claude` appends by re-opening the path — so retuning what lands here widens
+an irreversible unlink and not just a steady dot. The internal name stays
+descriptive (`WorkingButIdle`) precisely because the signal cannot prove the
+*cause* the UI word implies; the accepted false-positive (a healthy agent briefly
+at `working`/`idle`) self-heals to `Working`+pulse on the next poll once `status`
+flips to `busy`.
 
-**Every column above is a DISPLAY decision — no bucket answers "live?".** The
-table once carried that column and it was the bug: liveness is not a property of a
-qualifier, it is `live_agents`' membership answer straight from claude (see
-above). The buckets DO route the `Ctrl-R`/`Ctrl-K` stop decisions, but only over a
-record the probe just returned, so even there liveness is membership and the
-bucket answers the narrower "what is it doing right now".
+**Every column above is a DISPLAY decision, and no bucket answers "live?".** The
+table once carried a liveness column and it was the bug: liveness is not a
+property of a qualifier, it is `live_agents`' membership answer straight from
+claude (see above). Resume and attach ride that membership too, and nothing in
+this table may widen them.
+
+The BUCKET itself, though, is no longer display-only. It has exactly TWO
+non-display consumers, and both classify only a record the probe JUST returned,
+so even there liveness is membership and the bucket answers the narrower "what is
+it doing right now":
+
+* the hard-delete writer guard (`delete::can_delete`, see
+  [the one write into this tree](#on-disk-layout)), which asks "is a WRITER
+  present?" and allows `NeedsInput` / `WorkingButIdle` / `Done` / `Ended` while
+  refusing `Working` / `Idle` / `Other` — two of the gate's THREE refusals, the
+  third (snapback's own in-flight quick reply, added by
+  `delete::can_delete_target`) reading no bucket at all. That gate is
+  IRREVERSIBLE, so a change to `classify` is now weighed against it as well as
+  against the badge it draws;
+* the `Ctrl-R`/`Ctrl-K` stop routing (`send::reply_gate` /
+  `send::interrupt_gate`), which is reversible by comparison — it ends a job but
+  keeps the conversation.
+
+ALL FOUR of those allow arms can fire: the BARE list the guard reads carries a
+`done` job for the whole window before claude reaps it, so retuning `Done` moves
+an irreversible unlink exactly as retuning `NeedsInput`, `WorkingButIdle` or
+`Ended` does — never just a badge. Why that arm once read as unreachable is
+settled at [the one write into this tree](#on-disk-layout) and is not re-argued
+here.
 
 A pulsing bucket alternates its dot between the badge color and the dim partner
 shown above; the badge glyph (`●`, or `!` for `NeedsInput` — see the **Badge
@@ -603,26 +705,42 @@ in, and a `stopped` job whose `status` also reads `idle` still buckets as `Ended
 
 #### Observed value distribution
 
-A **sampled observation dated 2026-07-14 on one machine — NOT a contract.** The
-value set is undocumented and may drift at any claude release; this records
-*provenance*, so the next author knows what the buckets were built against and
-that the sample is a snapshot, not a guarantee.
+**Sampled observations on one machine — NOT a contract.** The value set is
+undocumented and may drift at any claude release; this records *provenance*, so the
+next author knows what the buckets were built against and that each sample is a
+snapshot, not a guarantee. Add a row here when a fresh probe is taken, rather than
+citing it only from the code that relied on it.
+
+Sample A, dated 2026-07-14:
 
 | Command | Entries | `state` | `status` |
 | --- | --- | --- | --- |
 | `claude agents --json` | 37 | `blocked`×34, `working`×1, absent×2 | `idle`×19, `busy`×1, `waiting`×1, absent×16 |
 | `claude agents --json --all` | 160 | `done`×123, `blocked`×34, `working`×1, absent×2 | — |
 
-Notes from that sample: `done` occurred **only** under `--all` (0 occurrences
-without it), which is the direct evidence for the flag. The token `running` does
-**not** exist in the observed domain — an earlier revision guessed it, and the
-resulting dead match arm is why this table is recorded here rather than inferred.
+Sample B, dated 2026-07-28 — the bare list only, taken when the delete guard was
+re-derived:
 
-The 37 vs. 123 split is also why the two readings must stay apart: `--all`
+| Command | Entries | `state` | `status` |
+| --- | --- | --- | --- |
+| `claude agents --json` | 74 | `done`×0; 72 background `blocked`/`waiting`, 2 interactive | — |
+
+Notes across both samples: `done` occurred **only** under `--all` — **zero**
+occurrences in either bare list (37 entries, then 74) — which is the direct
+evidence for the flag. It is NOT evidence that a bare list cannot carry `done`:
+claude holds a finished job there until it reaps it, so both probes simply landed
+outside that window. Reading the absence as a guarantee is what once had the
+`Done` delete arm written up as unreachable, and it was wrong — sample a
+distribution to learn what the values ARE, never to conclude which ones a gate
+can never see. The token `running` does **not** exist in the observed domain — an
+earlier revision guessed it, and the resulting dead match arm is why this table is
+recorded here rather than inferred.
+
+Sample A's 37 vs. 123 split is also why the two readings must stay apart: `--all`
 carries **123** records the gate must never treat as live.
 
 **Known, accepted risk:** `parse_agents_json` is **last-one-wins per
-`sessionId`**. The sample showed **zero** duplicate `sessionId`s across all 160
+`sessionId`**. Sample A showed **zero** duplicate `sessionId`s across all 160
 entries, but that is a sampled observation, not a structural guarantee. If it
 ever broke and a `done` record overwrote an active one, the row's **badge** would
 read `done` while the session ran. That is now cosmetic rather than behavioral:
@@ -677,7 +795,7 @@ This is the third and last of **three distinct agent concepts** — keep them ap
 | **Scope** | `CurrentFolder` (default) / `All` | current-folder = sessions whose **canonical** `cwd` exactly equals the canonical launch dir; all = every session, grouped by folder. Toggled by `Ctrl-A` / `--all`. |
 | **Search mode** | `NameOnly` (default) / `NameAndContent` | which haystack the substring matcher scores; toggled by `Tab`. |
 | **Show hidden** | off (default) / on | whether soft-hidden sessions appear (dimmed, marked `[hidden]`, live badge intact). Toggled by `Ctrl-X h`; a row is hidden/un-hidden by `Ctrl-X x`. The set persists — see [snapback-owned state](#snapback-owned-state-srchiddenrs). |
-| **Modal** | `Row` \| `List` layout in one `Option<Modal>` | the SINGLE type for a TITLED, choice-bearing overlay. `Enter` on a running session builds the `Attach` / `Fork` / `Cancel` choice (a `Row`); `Ctrl-N` with defined agents builds the agent picker (a `List`); `Ctrl-X d` builds the hard-delete confirm (a `Row`). Each choice carries a `ModalAction` tag the one confirm handler (`confirm_modal`) routes on. The plain Enter/Esc stop confirmations (`Ctrl-R`, `Ctrl-K`), the compose zone and the `Ctrl-X` chord are separate keyboard owners, NOT `Modal`s — see [PATTERNS.md](PATTERNS.md#10-keys-actions-outcomes). |
+| **Modal** | `Row` \| `List` layout in one `Option<Modal>` | the SINGLE type for a TITLED, choice-bearing overlay. `Enter` on a running session builds the `Attach` / `Fork` / `Cancel` choice (a `Row`); `Ctrl-N` with defined agents builds the agent picker (a `List`); `Ctrl-X d` builds the hard-delete confirm (a `Row`: `Delete this` / `Delete lineage (N)` — offered only for a real multi-member lineage, carrying the member ids resolved at OPEN time — / `Cancel`, default-highlighted on Cancel by that choice's position). Each choice carries a `ModalAction` tag the one confirm handler (`confirm_modal`) routes on. The plain Enter/Esc stop confirmations (`Ctrl-R`, `Ctrl-K`), the compose zone and the `Ctrl-X` chord are separate keyboard owners, NOT `Modal`s — see [PATTERNS.md](PATTERNS.md#10-keys-actions-outcomes). |
 
 The current-folder scope is an **exact** canonical `cwd` match by design: a
 repo's *other* worktree folders do not appear until you switch to all-folders or

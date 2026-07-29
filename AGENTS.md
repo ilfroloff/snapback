@@ -40,12 +40,34 @@ one place.
   path in `src/tui/app.rs`)
 - **STORE WRITES ARE GATED, AND ALL BUT ONE ARE DELEGATED.** The only mutation
   `snapback` itself performs on `~/.claude/projects` is hard delete (`Ctrl-X d`),
-  behind BOTH a confirmation modal AND the pure `can_delete` live-session guard
-  (never unlink a file `claude` is writing); it removes ONLY the selected id's own
-  `<id>.jsonl` + sibling `<id>/` dir. Every OTHER change to a transcript is made by
-  a `claude` CHILD and must stay that way — a quick reply appends in place because
-  `claude -p -r` writes it, NEVER because snapback edits a session file. Do not add
-  a direct writer. (`src/delete.rs`; `confirm_delete` in `src/tui/update.rs`;
+  behind BOTH a confirmation modal AND the pure `can_delete_target` WRITER guard.
+  Every OTHER change to a transcript is made by a `claude` CHILD and must stay
+  that way — a quick reply appends in place because `claude -p -r` writes it,
+  NEVER because snapback edits a session file. Do not add a direct writer.
+  That guard asks "is anything WRITING this file?", NEVER "does claude know this
+  session?" — membership refused ~97% of reported rows for no safety gain. Refuse
+  an OPEN INTERACTIVE session and a still-RUNNING background agent; ALLOW the
+  parked ones, INCLUDING the reported-finished and terminal buckets (`Done`,
+  `Ended`) whose run is over — `can_delete`'s doc comment owns why. An unreadable
+  qualifier fails toward REFUSING. Express it over `AgentActivity` DIRECTLY —
+  never reuse `agents::is_active`, a badge-pulse decision that must never widen an
+  irreversible gate, and never widen it to a bucket the send gates treat as live
+  without re-deriving the writer question. THREE writers, not two: claude's probe
+  structurally CANNOT see snapback's OWN in-flight quick reply, because a send
+  `claude stop`s the job on its way in, so the target is ABSENT from that active
+  list for exactly the span a snapback-spawned child is appending to it. So the
+  gate the confirm calls is `can_delete_target` — `can_delete` COMPOSED with
+  `App::sending_to`, refusing that third case in its own words
+  (`DELETE_SENDING_REFUSAL`) because the writer to name there is snapback, not
+  claude; keep it a composition of two facts, never a wider `can_delete`.
+  A confirm may target the selected id ALONE or its whole fork lineage
+  (`lineage_member_ids`, the SAME grouping hide uses — never a second rule):
+  guard each member individually, let one refusal
+  skip only itself, and spend exactly ONE liveness probe for the whole set. That
+  lineage sweeps the FULL store, so it takes soft-HIDDEN members too — keep that,
+  and keep the confirm DISCLOSING how many of them are hidden. It removes ONLY
+  each target id's own `<id>.jsonl` + sibling `<id>/` dir; everything else stays
+  read-only. (`src/delete.rs`; `confirm_delete` in `src/tui/update.rs`;
   `src/send.rs`)
 - **TERMINAL SAFETY.** Resume/fork/attach SPAWN `claude` as a child and RETURN
   to the board — never replace the process image. Restore the terminal (raw

@@ -35,7 +35,7 @@
 //! | `Ctrl-K` | stop / interrupt the selected session's live background agent (`claude stop`); an agent whose run is OVER (`done` / `stopped` / `failed`) stops at once, every other live agent confirms first, and a session claude is not holding — or one running interactively, which carries no job id — is refused (see [`send::interrupt_gate`]) |
 //! | `Tab` | toggle name-only vs. name+content search |
 //! | `Ctrl-A` | toggle scope (current-folder <-> all) |
-//! | `Ctrl-X` then `x`/`d`/`h` | leader chord: hide / hard-delete / toggle show-hidden (any other key cancels) |
+//! | `Ctrl-X` then `x`/`d`/`h` | leader chord: hide / hard-delete (this row, or its whole fork lineage) / toggle show-hidden (any other key cancels) |
 //! | `Ctrl-/` | toggle the preview pane |
 //! | `PgUp` / `PgDn` | scroll the preview a page (always) |
 //! | `Ctrl-U` / `Ctrl-D` | scroll the preview a quarter page (always) |
@@ -1113,10 +1113,14 @@ fn confirm_modal(app: &mut App, root: &Path) -> Outcome {
             Some(id) => route_handoff(app, id, Handoff::Fork),
             None => Outcome::Continue,
         },
-        Some(ModalAction::Delete) => match modal.session_id.as_deref() {
-            Some(id) => confirm_delete(app, id, root),
+        Some(ModalAction::Delete) => match modal.session_id.clone() {
+            Some(id) => confirm_delete(app, &[id], root),
             None => Outcome::Continue,
         },
+        // The lineage's member ids were resolved when the choice was BUILT (see
+        // `ModalAction::DeleteLineage`), so nothing is re-derived from a selection
+        // a reload may have moved while the modal sat open.
+        Some(ModalAction::DeleteLineage(ids)) => confirm_delete(app, &ids, root),
         Some(ModalAction::New(agent)) => {
             // `Enter` opens the DRAFT — the same pane the no-agent fast path opens.
             // Nothing is launched and nothing is recorded yet; the draft's own
@@ -1127,32 +1131,80 @@ fn confirm_modal(app: &mut App, root: &Path) -> Outcome {
     }
 }
 
-/// Execute a confirmed HARD delete of `session_id`, then refresh the board.
+/// Execute a confirmed HARD delete of `ids` — one selected session, or every
+/// member of its fork lineage — then refresh the board.
 ///
-/// The pure [`delete::can_delete`] guard runs against a FRESH liveness probe
-/// ([`App::is_live_now`]) — the same re-ask posture the resume gate uses at
-/// hand-off, never a stale poll — so a session claude is actively running is
-/// REFUSED with a board status and nothing is unlinked. On `Ok` the session is
-/// CLONED first, ending the `&Session` borrow before the mutable reload re-borrows
-/// `app` (the clone-then-mutate discipline the other confirm handlers follow);
-/// [`delete::remove`] unlinks the transcript and its sibling id dir, and the board
-/// reloads from the SAME `root` the autorefresh reload uses
-/// ([`SessionStore::load_from`]), so the removed row leaves the board and the
-/// selection clamps to its neighbour by stable id. A remove error fails SOFT to a
-/// board status, leaving the store as-is.
-fn confirm_delete(app: &mut App, session_id: &str, root: &Path) -> Outcome {
-    if let Err(refusal) = delete::can_delete(app.is_live_now(session_id)) {
-        app.set_status(refusal);
-        return Outcome::Continue;
+/// **ONE probe for the whole set, and that is a hard requirement.** The pure
+/// [`delete::can_delete_target`] writer guard needs each target's freshly-probed
+/// record, so this takes claude's WHOLE active list once ([`App::live_agents_now`])
+/// and judges every member against that single map. Asking through the per-session
+/// accessor instead would spawn `claude` once per member — N blocking shell-outs
+/// on the UI thread, precisely what AGENTS.md's OFF-UI-THREAD rule forbids — and
+/// would judge the family against N different instants.
+///
+/// On PATTERNS.md §6, stated per branch rather than assumed: this is a ONE-SHOT
+/// at a hand-off-shaped moment (an irreversible confirm), exactly like the Enter
+/// gate and [`route_handoff`]. It adds no tick, no thread and no event source,
+/// and leaves the `--all` poll untouched at one call per cycle. Unlike a resume
+/// there is no teardown to hide behind: the board REDRAWS after a delete, so the
+/// ~0.26s lands as a visible hitch between Enter and the refreshed list on EVERY
+/// branch here. That is deliberate — an irreversible unlink must be decided on
+/// claude's current answer, not on a snapshot up to ~1.3s old.
+///
+/// Each member is guarded INDIVIDUALLY and the pass is partial by design: a
+/// refused member is skipped and the rest still go, because all-or-nothing would
+/// let one busy fork block a whole lineage. Removal errors are counted apart from
+/// refusals (never folded together — see [`delete::status_for_delete`]), and one
+/// failure never aborts the remaining members. Each session is CLONED before
+/// removal, ending the `&Session` borrow before the mutable reload re-borrows
+/// `app`.
+///
+/// EVERY id is accounted for, including one whose row is no longer on the board:
+/// `ids` was captured when the modal opened and a `SessionsChanged` reload can
+/// drop a member while it sits there. Such a target is neither removed nor
+/// refused, so the loop has nothing to record — [`delete::status_for_delete`]
+/// reconciles it out of `ids.len()` instead, which is what stops a 3-member
+/// lineage from reporting `2 deleted` with the third silently unmentioned.
+///
+/// The board reloads ONCE after the loop, and only when something was actually
+/// removed, from the SAME `root` the autorefresh reload uses
+/// ([`SessionStore::load_from`]) — so the removed rows leave the board and the
+/// selection clamps to a survivor by stable id.
+fn confirm_delete(app: &mut App, ids: &[String], root: &Path) -> Outcome {
+    // ONE shell-out for the whole target set (see the note above).
+    let live = app.live_agents_now();
+    let mut removed = 0usize;
+    let mut refusals: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    for id in ids {
+        // BOTH writers, not just claude's: a quick reply snapback still has in
+        // flight deregisters the job from claude's active list on its way in, so
+        // the probe above cannot see it (see `delete::can_delete_target`).
+        let reply_in_flight = app.sending_to(id).is_some();
+        if let Err(refusal) = delete::can_delete_target(live.get(id), reply_in_flight) {
+            refusals.push(refusal);
+            continue;
+        }
+        // A member that is no longer on the board (a reload dropped it while the
+        // confirm sat open) is neither a refusal nor an FS failure, so there is
+        // nothing to push here — but it IS still one of `ids`, and the status
+        // reconciles it back out of that count rather than losing it.
+        let Some(session) = app.session_by_id(id).cloned() else {
+            continue;
+        };
+        match delete::remove(&session) {
+            Ok(()) => removed += 1,
+            Err(err) => errors.push(err.to_string()),
+        }
     }
-    let Some(session) = app.session_by_id(session_id).cloned() else {
-        return Outcome::Continue;
-    };
-    if let Err(err) = delete::remove(&session) {
-        app.set_status(err.to_string());
-        return Outcome::Continue;
+
+    if removed > 0 {
+        app.apply_sessions(SessionStore::load_from(root));
     }
-    app.apply_sessions(SessionStore::load_from(root));
+    if let Some(status) = delete::status_for_delete(ids.len(), removed, &refusals, &errors) {
+        app.set_status(status);
+    }
     Outcome::Continue
 }
 
@@ -4720,6 +4772,71 @@ mod tests {
         std::fs::write(dir.join(format!("{id}.jsonl")), jsonl).expect("write a store fixture");
     }
 
+    /// Write a store session that belongs to a FORK LINEAGE: a null-parent ROOT
+    /// record carrying `root_uuid`, plus one ordinary turn.
+    ///
+    /// Two files written with the SAME `root_uuid` (and cwd, and branch) are what
+    /// a background fork produces — claude copies the transcript verbatim, root
+    /// record included — so they derive one `lineage_key` and the board folds them
+    /// into a single `(+N)` head. That folded head is the shape the lineage delete
+    /// exists for.
+    fn write_lineage_session(dir: &Path, id: &str, ts: &str, root_uuid: &str) {
+        let jsonl = format!(
+            concat!(
+                r#"{{"type":"attachment","uuid":"{root}","parentUuid":null,"#,
+                r#""sessionId":"{id}","cwd":"/tmp/proj","timestamp":"{ts}"}}"#,
+                "\n",
+                r#"{{"type":"user","sessionId":"{id}","cwd":"/tmp/proj","#,
+                r#""timestamp":"{ts}","message":{{"role":"user","content":"hi"}}}}"#,
+                "\n",
+            ),
+            root = root_uuid,
+            id = id,
+            ts = ts,
+        );
+        std::fs::write(dir.join(format!("{id}.jsonl")), jsonl).expect("write a lineage fixture");
+    }
+
+    /// Seed claude's ACTIVE list with FULL records — `(session_id, kind, state)` —
+    /// and hand back a counter of how many times the board PROBED it.
+    ///
+    /// `seed_live` cannot express the delete tests: it reports every id as an
+    /// INTERACTIVE session, which the writer guard refuses outright, so a
+    /// background agent's activity bucket would never be reached. `kind` and
+    /// `state` are exactly the two fields that guard reads.
+    ///
+    /// The counter is the PROBE BUDGET seam: a lineage delete must stay ONE
+    /// shell-out no matter how many members it has, and a count is the only way to
+    /// see a per-member regression (N spawns on the UI thread) that no other
+    /// assertion would notice.
+    fn seed_live_records(
+        app: &mut App,
+        agents: &[(&str, &str, Option<&str>)],
+    ) -> std::rc::Rc<std::cell::Cell<u32>> {
+        let live: HashMap<String, ReportedAgent> = agents
+            .iter()
+            .map(|(id, kind, state)| {
+                (
+                    (*id).to_string(),
+                    ReportedAgent {
+                        kind: (*kind).to_string(),
+                        id: None,
+                        state: state.map(str::to_owned),
+                        status: None,
+                        name: None,
+                    },
+                )
+            })
+            .collect();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let seen = std::rc::Rc::clone(&calls);
+        app.set_live_probe(move || {
+            seen.set(seen.get() + 1);
+            live.clone()
+        });
+        calls
+    }
+
     /// Task 4.1 (pure): the chord machine maps each completion key and cancels on
     /// everything else — Esc, an unbound key, and a Ctrl combo alike.
     #[test]
@@ -4964,10 +5081,79 @@ mod tests {
         let _ = std::fs::remove_dir_all(&state);
     }
 
-    /// Task 4.3 / 4.4: confirming Delete on a LIVE session is REFUSED — the live
-    /// guard sets a board status and nothing is unlinked or reloaded.
+    /// A quick reply STILL IN FLIGHT blocks the hard delete, even though claude
+    /// reports the session as nothing at all.
+    ///
+    /// The end-to-end shape of the two features' race: `send::run_send` `claude
+    /// stop`s the held job before running `claude -p -r <id>`, so for the whole
+    /// span of the send the target is ABSENT from claude's active list — the probe
+    /// this confirm spends is empty and `can_delete` alone would say "nothing is
+    /// holding the file open" — while snapback's own child appends to that exact
+    /// transcript. Nothing blocks keys during a send, so this window is reachable.
+    ///
+    /// Seeding an EMPTY live map is therefore the whole point: it proves the
+    /// refusal comes from snapback's own state and not from claude's list.
     #[test]
-    fn ctrl_x_d_confirm_on_a_live_session_is_refused_and_removes_nothing() {
+    fn ctrl_x_d_confirm_while_a_reply_is_in_flight_is_refused_and_removes_nothing() {
+        let _guard = crate::config::env_lock();
+        let root = unique_temp_dir("delete-sending-store");
+        let state = unique_temp_dir("delete-sending-state");
+        std::env::set_var("CLAUDE_PROJECTS_DIR", &root);
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &state);
+
+        let proj = root.join("-tmp-proj");
+        std::fs::create_dir_all(&proj).expect("create the encoded-cwd dir");
+        write_store_session(&proj, "sbsend-1", "2026-07-14T10:00:00.000Z");
+
+        let mut app = App::new(
+            SessionStore::load_from(&root),
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        // Claude reports NOTHING: the send already deregistered the job.
+        seed_live(&mut app, &[]);
+        // ...but snapback still has the reply in flight to this very id.
+        app.sending = Some(crate::tui::app::Sending {
+            session_id: "sbsend-1".to_string(),
+            message: "still landing".to_string(),
+            baseline_msg_count: 0,
+        });
+        assert_eq!(app.selected.as_deref(), Some("sbsend-1"));
+        let file = proj.join("sbsend-1.jsonl");
+
+        feed(&mut app, ctrl(KeyCode::Char('x')), &root);
+        feed(&mut app, key(KeyCode::Char('d')), &root);
+        feed(&mut app, key(KeyCode::Left), &root); // -> Delete this
+        let out = feed(&mut app, key(KeyCode::Enter), &root);
+        assert!(matches!(out, Outcome::Continue));
+
+        assert!(
+            file.is_file(),
+            "a transcript with a reply still landing is NOT unlinked"
+        );
+        assert!(
+            app.session_by_id("sbsend-1").is_some(),
+            "the session stays on the board"
+        );
+        assert_eq!(
+            app.status.as_deref(),
+            Some(crate::delete::DELETE_SENDING_REFUSAL),
+            "the send refusal names snapback's own writer, not a claude window"
+        );
+
+        std::env::remove_var("CLAUDE_PROJECTS_DIR");
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+    }
+
+    /// Task 4.3 / 4.4: confirming Delete on a session claude holds open
+    /// INTERACTIVELY is REFUSED — the writer guard sets a board status and nothing
+    /// is unlinked or reloaded.
+    ///
+    /// `seed_live` reports its ids as interactive sessions, which is the arm that
+    /// must stay refused: a claude window someone is typing in appends to this
+    /// very file on the next keystroke.
+    #[test]
+    fn ctrl_x_d_confirm_on_an_open_interactive_session_is_refused_and_removes_nothing() {
         let _guard = crate::config::env_lock();
         let root = unique_temp_dir("delete-live-store");
         let state = unique_temp_dir("delete-live-state");
@@ -4983,33 +5169,486 @@ mod tests {
             Scope::All,
             PathBuf::from("/tmp/launch"),
         );
-        seed_live(&mut app, &["sblive-1"]); // claude reports it running
+        seed_live(&mut app, &["sblive-1"]); // claude holds it open interactively
         assert_eq!(app.selected.as_deref(), Some("sblive-1"));
         let file = proj.join("sblive-1.jsonl");
 
         feed(&mut app, ctrl(KeyCode::Char('x')), &root);
         feed(&mut app, key(KeyCode::Char('d')), &root);
-        feed(&mut app, key(KeyCode::Left), &root); // -> Delete
+        feed(&mut app, key(KeyCode::Left), &root); // -> Delete this
         let out = feed(&mut app, key(KeyCode::Enter), &root);
         assert!(matches!(out, Outcome::Continue));
 
         assert!(
             file.is_file(),
-            "a live session's transcript is NOT unlinked"
+            "an open interactive session's transcript is NOT unlinked"
         );
         assert!(
             app.session_by_id("sblive-1").is_some(),
-            "the live session stays on the board"
+            "the session stays on the board"
         );
         assert_eq!(
             app.status.as_deref(),
-            Some(crate::delete::DELETE_LIVE_REFUSAL),
-            "the live-session refusal is shown"
+            Some(crate::delete::DELETE_INTERACTIVE_REFUSAL),
+            "the interactive refusal is shown verbatim for a single target"
         );
         assert!(
             app.modal.is_none(),
             "the confirm closes even when the delete is refused"
         );
+
+        std::env::remove_var("CLAUDE_PROJECTS_DIR");
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// The behavior change users actually feel: a PARKED background agent — one
+    /// claude reports as active but has stopped, waiting on the user — is now
+    /// deletable straight through the `Ctrl-X d` key path.
+    ///
+    /// This is the majority shape of claude's active list, and the old membership
+    /// guard refused every one of it. Nothing is writing such a transcript (claude
+    /// re-opens the path to append), so the delete goes through.
+    #[test]
+    fn ctrl_x_d_confirm_deletes_a_parked_background_agent() {
+        let _guard = crate::config::env_lock();
+        let root = unique_temp_dir("delete-parked-store");
+        let state = unique_temp_dir("delete-parked-state");
+        std::env::set_var("CLAUDE_PROJECTS_DIR", &root);
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &state);
+
+        let proj = root.join("-tmp-proj");
+        std::fs::create_dir_all(&proj).expect("create the encoded-cwd dir");
+        write_store_session(&proj, "sbparked-1", "2026-07-14T10:00:00.000Z");
+
+        let mut app = App::new(
+            SessionStore::load_from(&root),
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        // claude REPORTS it as an active agent — it is simply parked on `blocked`.
+        seed_live_records(&mut app, &[("sbparked-1", "background", Some("blocked"))]);
+        assert_eq!(app.selected.as_deref(), Some("sbparked-1"));
+        let file = proj.join("sbparked-1.jsonl");
+        assert!(file.is_file(), "the fixture exists before the delete");
+
+        feed(&mut app, ctrl(KeyCode::Char('x')), &root);
+        feed(&mut app, key(KeyCode::Char('d')), &root);
+        feed(&mut app, key(KeyCode::Left), &root); // -> Delete this
+        let out = feed(&mut app, key(KeyCode::Enter), &root);
+        assert!(matches!(out, Outcome::Continue));
+
+        assert!(
+            !file.exists(),
+            "a parked background agent's transcript IS deletable — claude reporting \
+             it says nothing about a writer"
+        );
+        assert!(
+            app.session_by_id("sbparked-1").is_none(),
+            "the deleted session left the reloaded board"
+        );
+        assert_eq!(
+            app.status, None,
+            "a clean single delete says nothing; the row leaving the board is the message"
+        );
+
+        std::env::remove_var("CLAUDE_PROJECTS_DIR");
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// The lineage choice takes the WHOLE fork family: every member's transcript
+    /// AND its sibling `<id>/` dir goes, and an unrelated session is untouched.
+    ///
+    /// This is the asymmetry the choice closes. Hide already flips a lineage as
+    /// one unit, so deleting only the folded HEAD left the members behind and the
+    /// fold just re-headed to a surviving fork — the row never left the board.
+    #[test]
+    fn ctrl_x_d_delete_lineage_removes_every_member_and_its_sibling_dir() {
+        let _guard = crate::config::env_lock();
+        let root = unique_temp_dir("delete-lineage-store");
+        let state = unique_temp_dir("delete-lineage-state");
+        std::env::set_var("CLAUDE_PROJECTS_DIR", &root);
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &state);
+
+        // Two members of ONE lineage (same root uuid, cwd and branch) plus an
+        // unrelated session that must survive. The newer member is the head.
+        let proj = root.join("-tmp-proj");
+        std::fs::create_dir_all(&proj).expect("create the encoded-cwd dir");
+        write_lineage_session(
+            &proj,
+            "sblin-head",
+            "2026-07-14T10:00:00.000Z",
+            "root-uuid-1",
+        );
+        write_lineage_session(
+            &proj,
+            "sblin-old",
+            "2026-07-12T10:00:00.000Z",
+            "root-uuid-1",
+        );
+        write_store_session(&proj, "sblin-other", "2026-07-10T10:00:00.000Z");
+        // The older member carries subagent transcripts, so the sibling dir has
+        // something to prove it went with the file.
+        let old_subagents = proj.join("sblin-old").join("subagents");
+        std::fs::create_dir_all(&old_subagents).expect("create the subagents dir");
+        std::fs::write(old_subagents.join("agent-1.jsonl"), "{}\n").expect("write a subagent");
+
+        let mut app = App::new(
+            SessionStore::load_from(&root),
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        seed_live_records(&mut app, &[]); // nothing is live
+        assert_eq!(
+            app.selected.as_deref(),
+            Some("sblin-head"),
+            "the newest lineage member heads the folded row"
+        );
+
+        feed(&mut app, ctrl(KeyCode::Char('x')), &root);
+        feed(&mut app, key(KeyCode::Char('d')), &root);
+        let choices = &app.modal.as_ref().expect("the confirm is open").choices;
+        assert_eq!(
+            choices.len(),
+            3,
+            "a real lineage offers [Delete this] [Delete lineage (N)] [Cancel]"
+        );
+        assert_eq!(
+            choices[1].label, "Delete lineage (2)",
+            "the button states the REAL member count"
+        );
+        assert_eq!(
+            app.modal.as_ref().unwrap().selected_action(),
+            Some(&ModalAction::Cancel),
+            "the confirm still defaults to Cancel with the extra button in the strip"
+        );
+
+        feed(&mut app, key(KeyCode::Left), &root); // Cancel -> Delete lineage
+        assert!(
+            matches!(
+                app.modal.as_ref().unwrap().selected_action(),
+                Some(&ModalAction::DeleteLineage(_))
+            ),
+            "the middle button is the lineage delete"
+        );
+        let out = feed(&mut app, key(KeyCode::Enter), &root);
+        assert!(matches!(out, Outcome::Continue));
+
+        assert!(
+            !proj.join("sblin-head.jsonl").exists(),
+            "the head's transcript is gone"
+        );
+        assert!(
+            !proj.join("sblin-old.jsonl").exists(),
+            "the FOLDED member's transcript is gone too — that is the whole point"
+        );
+        assert!(
+            !proj.join("sblin-old").exists(),
+            "each member's sibling <id>/ dir goes with it"
+        );
+        assert!(
+            proj.join("sblin-other.jsonl").is_file(),
+            "an unrelated session is untouched"
+        );
+        assert!(
+            app.session_by_id("sblin-head").is_none() && app.session_by_id("sblin-old").is_none(),
+            "the whole lineage left the reloaded board"
+        );
+        assert_eq!(
+            app.status.as_deref(),
+            Some("2 deleted"),
+            "a lineage reports what it did"
+        );
+
+        std::env::remove_var("CLAUDE_PROJECTS_DIR");
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// A MIXED lineage is PARTIAL, not all-or-nothing: the members that pass the
+    /// writer guard are deleted, the running one is skipped, and the status reports
+    /// the split.
+    ///
+    /// All-or-nothing would let one busy fork block its whole family — the exact
+    /// dead end the lineage choice exists to remove.
+    #[test]
+    fn ctrl_x_d_delete_lineage_skips_a_running_member_and_reports_the_split() {
+        let _guard = crate::config::env_lock();
+        let root = unique_temp_dir("delete-mixed-store");
+        let state = unique_temp_dir("delete-mixed-state");
+        std::env::set_var("CLAUDE_PROJECTS_DIR", &root);
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &state);
+
+        let proj = root.join("-tmp-proj");
+        std::fs::create_dir_all(&proj).expect("create the encoded-cwd dir");
+        write_lineage_session(
+            &proj,
+            "sbmix-head",
+            "2026-07-14T10:00:00.000Z",
+            "root-uuid-2",
+        );
+        write_lineage_session(
+            &proj,
+            "sbmix-busy",
+            "2026-07-13T10:00:00.000Z",
+            "root-uuid-2",
+        );
+        write_lineage_session(
+            &proj,
+            "sbmix-old",
+            "2026-07-12T10:00:00.000Z",
+            "root-uuid-2",
+        );
+
+        let mut app = App::new(
+            SessionStore::load_from(&root),
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        // ONE member is genuinely working a turn; the others are not reported.
+        seed_live_records(&mut app, &[("sbmix-busy", "background", Some("working"))]);
+        assert_eq!(app.selected.as_deref(), Some("sbmix-head"));
+
+        feed(&mut app, ctrl(KeyCode::Char('x')), &root);
+        feed(&mut app, key(KeyCode::Char('d')), &root);
+        feed(&mut app, key(KeyCode::Left), &root); // -> Delete lineage (3)
+        let out = feed(&mut app, key(KeyCode::Enter), &root);
+        assert!(matches!(out, Outcome::Continue));
+
+        assert!(
+            proj.join("sbmix-busy.jsonl").is_file(),
+            "the working member is skipped, not unlinked"
+        );
+        assert!(
+            !proj.join("sbmix-head.jsonl").exists() && !proj.join("sbmix-old.jsonl").exists(),
+            "one busy fork must not block the rest of the lineage"
+        );
+        assert_eq!(
+            app.status.as_deref(),
+            Some("2 deleted, 1 skipped (running)"),
+            "the split is reported honestly, with the skip counted as a refusal"
+        );
+        assert!(
+            app.session_by_id("sbmix-busy").is_some(),
+            "the surviving member is still on the reloaded board"
+        );
+
+        std::env::remove_var("CLAUDE_PROJECTS_DIR");
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// A lineage member that LEFT THE BOARD while the confirm sat open is
+    /// COUNTED, not silently dropped.
+    ///
+    /// The member ids ride the `DeleteLineage` choice from the moment the modal
+    /// OPENED, so a `SessionsChanged` reload can drop one out from under them —
+    /// simulated here exactly as it happens, by the transcript disappearing from
+    /// the store and the board reloading. That target is neither unlinked nor
+    /// refused, so before the reconciliation the board reported `2 deleted` for a
+    /// family of THREE and the third id was mentioned nowhere at all.
+    #[test]
+    fn ctrl_x_d_delete_lineage_counts_a_member_that_left_the_board() {
+        let _guard = crate::config::env_lock();
+        let root = unique_temp_dir("delete-gone-store");
+        let state = unique_temp_dir("delete-gone-state");
+        std::env::set_var("CLAUDE_PROJECTS_DIR", &root);
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &state);
+
+        // THREE members of one lineage: two survive to the confirm, one does not,
+        // so "2 deleted" and "3 targets" are distinguishable rather than equal.
+        let proj = root.join("-tmp-proj");
+        std::fs::create_dir_all(&proj).expect("create the encoded-cwd dir");
+        for (id, ts) in [
+            ("sbgone-head", "2026-07-14T10:00:00.000Z"),
+            ("sbgone-mid", "2026-07-13T10:00:00.000Z"),
+            ("sbgone-away", "2026-07-12T10:00:00.000Z"),
+        ] {
+            write_lineage_session(&proj, id, ts, "root-uuid-5");
+        }
+
+        let mut app = App::new(
+            SessionStore::load_from(&root),
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        seed_live_records(&mut app, &[]); // nothing is live
+
+        // Opening the confirm CAPTURES all three member ids.
+        feed(&mut app, ctrl(KeyCode::Char('x')), &root);
+        feed(&mut app, key(KeyCode::Char('d')), &root);
+        assert_eq!(
+            app.modal.as_ref().expect("the confirm is open").choices[1].label,
+            "Delete lineage (3)",
+            "all three members are targeted when the modal opens"
+        );
+
+        // ...and now one of them leaves the board while the modal sits open.
+        std::fs::remove_file(proj.join("sbgone-away.jsonl")).expect("drop a member from the store");
+        handle_event(&mut app, AppEvent::SessionsChanged, &root);
+        assert!(
+            app.session_by_id("sbgone-away").is_none(),
+            "the reload dropped that member from the board"
+        );
+        assert!(
+            app.modal.is_some(),
+            "the reload leaves the confirm standing, still holding the stale ids"
+        );
+
+        feed(&mut app, key(KeyCode::Left), &root); // -> Delete lineage (3)
+        let out = feed(&mut app, key(KeyCode::Enter), &root);
+        assert!(matches!(out, Outcome::Continue));
+
+        assert!(
+            !proj.join("sbgone-head.jsonl").exists() && !proj.join("sbgone-mid.jsonl").exists(),
+            "the two members still on the board are deleted"
+        );
+        assert_eq!(
+            app.status.as_deref(),
+            Some("2 deleted, 1 already gone"),
+            "all THREE targets are accounted for — the vanished one is reported, \
+             not swallowed by a tally that only counts what the pass touched"
+        );
+
+        std::env::remove_var("CLAUDE_PROJECTS_DIR");
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// PROBE BUDGET: a lineage delete shells out to claude EXACTLY ONCE, however
+    /// many members it has.
+    ///
+    /// Nothing else can see this. Judging each member through the per-session
+    /// accessor would still delete the right files and still report the right
+    /// split, while spawning `claude` once per member — N blocking shell-outs on
+    /// the render loop (AGENTS.md OFF-UI-THREAD). Counting the probe is the only
+    /// assertion that goes red for it.
+    #[test]
+    fn a_lineage_delete_probes_claude_exactly_once() {
+        let _guard = crate::config::env_lock();
+        let root = unique_temp_dir("delete-probe-store");
+        let state = unique_temp_dir("delete-probe-state");
+        std::env::set_var("CLAUDE_PROJECTS_DIR", &root);
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &state);
+
+        // THREE members, so a per-member probe counts 3 and a single probe counts
+        // 1 — the two are distinguishable rather than coincidentally equal.
+        let proj = root.join("-tmp-proj");
+        std::fs::create_dir_all(&proj).expect("create the encoded-cwd dir");
+        write_lineage_session(
+            &proj,
+            "sbprobe-a",
+            "2026-07-14T10:00:00.000Z",
+            "root-uuid-3",
+        );
+        write_lineage_session(
+            &proj,
+            "sbprobe-b",
+            "2026-07-13T10:00:00.000Z",
+            "root-uuid-3",
+        );
+        write_lineage_session(
+            &proj,
+            "sbprobe-c",
+            "2026-07-12T10:00:00.000Z",
+            "root-uuid-3",
+        );
+
+        let mut app = App::new(
+            SessionStore::load_from(&root),
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        let probes = seed_live_records(&mut app, &[]);
+
+        feed(&mut app, ctrl(KeyCode::Char('x')), &root);
+        feed(&mut app, key(KeyCode::Char('d')), &root);
+        assert_eq!(
+            probes.get(),
+            0,
+            "OPENING the confirm asks claude nothing — the probe belongs to the confirm"
+        );
+
+        feed(&mut app, key(KeyCode::Left), &root); // -> Delete lineage (3)
+        feed(&mut app, key(KeyCode::Enter), &root);
+
+        assert_eq!(
+            probes.get(),
+            1,
+            "three members, ONE shell-out: every member is judged against the same \
+             freshly-probed map"
+        );
+        assert!(
+            !proj.join("sbprobe-a.jsonl").exists()
+                && !proj.join("sbprobe-b.jsonl").exists()
+                && !proj.join("sbprobe-c.jsonl").exists(),
+            "the count above must be over a delete that actually happened"
+        );
+
+        std::env::remove_var("CLAUDE_PROJECTS_DIR");
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// A LONE session offers no lineage button: the strip stays
+    /// `[Delete this] [Cancel]`, so nothing suggests a family that does not exist.
+    #[test]
+    fn ctrl_x_d_offers_no_lineage_choice_for_a_lone_session() {
+        let _guard = crate::config::env_lock();
+        let root = unique_temp_dir("delete-lone-store");
+        let state = unique_temp_dir("delete-lone-state");
+        std::env::set_var("CLAUDE_PROJECTS_DIR", &root);
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &state);
+
+        let proj = root.join("-tmp-proj");
+        std::fs::create_dir_all(&proj).expect("create the encoded-cwd dir");
+        // A rootless session (no lineage at all) AND a session that HAS a root but
+        // no twin: both are families of one, and neither may offer the button.
+        write_store_session(&proj, "sblone-rootless", "2026-07-14T10:00:00.000Z");
+        write_lineage_session(
+            &proj,
+            "sblone-solo",
+            "2026-07-12T10:00:00.000Z",
+            "root-uuid-4",
+        );
+
+        let mut app = App::new(
+            SessionStore::load_from(&root),
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        seed_live_records(&mut app, &[]);
+
+        // Row 0 is the newer rootless session; one step down is the solo lineage.
+        for (step, id) in [(0isize, "sblone-rootless"), (1, "sblone-solo")] {
+            app.move_selection(step);
+            assert_eq!(app.selected.as_deref(), Some(id), "standing on {id}");
+            feed(&mut app, ctrl(KeyCode::Char('x')), &root);
+            feed(&mut app, key(KeyCode::Char('d')), &root);
+            let modal = app.modal.as_ref().expect("the confirm is open");
+            assert_eq!(
+                modal
+                    .choices
+                    .iter()
+                    .map(|c| c.action.clone())
+                    .collect::<Vec<_>>(),
+                vec![ModalAction::Delete, ModalAction::Cancel],
+                "{id}: a family of one offers no lineage button"
+            );
+            assert_eq!(
+                modal.selected_action(),
+                Some(&ModalAction::Cancel),
+                "{id}: still defaulted to Cancel"
+            );
+            feed(&mut app, key(KeyCode::Esc), &root);
+        }
 
         std::env::remove_var("CLAUDE_PROJECTS_DIR");
         std::env::remove_var("SNAPBACK_CONFIG_DIR");

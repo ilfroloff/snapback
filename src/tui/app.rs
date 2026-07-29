@@ -55,6 +55,95 @@ const DEFAULT_LIST_PERCENT: u32 = 48;
 /// wording lives in exactly one place (NO MAGIC VALUES).
 const HIDDEN_SAVE_ERROR_PREFIX: &str = "could not save hidden sessions";
 
+/// The HARD-delete confirm's standing prompt: the irreversibility warning plus
+/// the BLAST RADIUS, which the writer guard's admission of parked background
+/// agents makes load-bearing — the agent survives in Claude Code, and attaching
+/// then replying later writes a fresh transcript under the same session.
+///
+/// Named rather than inlined so [`delete_confirm_message`] composes it instead of
+/// re-spelling it, and so the copy under test is the copy that ships.
+const DELETE_CONFIRM_PROMPT: &str = "Permanently delete this transcript from disk? This \
+     can't be undone. It removes the file only: a background agent keeps running in Claude \
+     Code until you stop it there, and attaching then replying later can write a new \
+     transcript.";
+
+/// The HARD-delete confirm's message: [`DELETE_CONFIRM_PROMPT`], led by a
+/// DISCLOSURE sentence when the lineage button would take members the board is
+/// not showing.
+///
+/// `members` is the size of the set `Delete lineage (N)` acts on; `hidden` is how
+/// many of those are in [`App::hidden_ids`]. The disclosure exists because the two
+/// can differ: [`App::lineage_member_ids`] sweeps the FULL store, so a
+/// soft-hidden member is counted in `(N)` and deleted with the rest (deliberate —
+/// hiding is a visibility preference, not a tombstone, so a lineage delete takes
+/// the whole lineage). The button can therefore read `Delete lineage (5)` with
+/// only three of those rows on screen, and an IRREVERSIBLE action the user cannot
+/// predict is not acceptable. This changes what is TOLD, never what is taken.
+///
+/// It says nothing extra when `hidden` is 0, and nothing when `members <= 1`
+/// (there is no lineage button to disclose for).
+///
+/// **The counts lead the sentence, and the sentence leads the message**, because
+/// that is the most clip-RESISTANT place to put them. The message is wrapped by
+/// `view::wrap_message` to the modal-width CONSTANT rather than to the clamped
+/// area, so on a terminal narrower than the box every message row loses its TAIL;
+/// leading with the counts puts them in the first columns of the FIRST row, where
+/// they survive far more clipping than a mid-strip button label would — both counts
+/// still read whole at 30 columns, under half the box's width.
+///
+/// A better position, NOT a safe one. A MULTI-DIGIT count can still be cut into a
+/// shorter, plausible one: at 23 columns a 12-member/10-hidden lineage reads
+/// `12 in this lineage, 1`, precisely the wrong-number risk `view::fit_child_msgs`
+/// refuses to take. That needs a terminal about a third of the box's width — where
+/// the same counts in the button label would be gone entirely rather than merely
+/// wrong — so this is the better end of a trade, not the absence of one.
+///
+/// The alternative — those counts in the `Delete lineage` LABEL — was measured and
+/// rejected on WIDTH, drawn through a `TestBackend`. It grows the button strip from
+/// 49 to 59 columns, and `view::render_modal` never wraps that strip (a `Row` modal
+/// only centers it), so it TRUNCATES: `Cancel` — the SAFE DEFAULT — would need a
+/// 60-column terminal to draw whole, where the plain strip needs 50. Ten columns of
+/// legibility off the one button that undoes a mistake.
+///
+/// **The shipped option is not free either, and its cost is on the HEIGHT axis.**
+/// The sentence adds ONE wrapped row (4 → 5 at the 60-column inner width).
+/// `view::centered_rect` clamps the box and `render_modal` draws top-down with no
+/// vertical scroll, so the button strip now needs a terminal 9 rows tall instead of
+/// 8 and the `Esc cancel` footer 11 instead of 10 — a terminal exactly 8 rows tall
+/// loses a strip it used to draw. One row is what THIS sentence costs, NOT a floor
+/// under any disclosure (a short enough prefix reflows nothing); the first draft
+/// cost TWO, which is why the shipped one is terse.
+///
+/// What a too-short terminal loses is legibility, never the safe default:
+/// [`App::open_delete_confirm`] leaves `Cancel` PRESELECTED, and Esc/Enter still
+/// cancel with the strip off screen.
+///
+/// `view::tests` pins exactly this much:
+/// `the_disclosing_delete_confirm_costs_one_row_and_keeps_cancel_default` sweeps
+/// rendered terminal heights for 4 → 5 wrapped rows and the 9/11 thresholds against
+/// their 8/10 non-disclosing baselines;
+/// `counts_in_the_lineage_label_would_cost_cancel_ten_columns` the 50-vs-60-column
+/// `Cancel` comparison; `the_disclosed_counts_survive_clipping_to_a_third_of_the_box`
+/// the 30- and 23-column readings. The box heights those thresholds come from are
+/// derivation, NOT measurement — nothing branches on them and no test pins them; the
+/// thresholds survive a changed `view::MODAL_ROW_CHROME_ROWS` because the sweep
+/// searches rendered TEXT and the clamp makes a taller box clip differently without
+/// moving the strip's first visible row.
+///
+/// Pure so the copy is testable without a store, a modal, or a terminal
+/// (PATTERNS §3).
+#[must_use]
+fn delete_confirm_message(members: usize, hidden: usize) -> String {
+    if members <= 1 || hidden == 0 {
+        return DELETE_CONFIRM_PROMPT.to_string();
+    }
+    // Deliberately terse: every word costs wrapped rows, and a wrapped row costs
+    // the button strip a whole terminal size (see above). The button beside it
+    // already reads `Delete lineage (N)`, so the sentence states the SPLIT rather
+    // than re-explaining what the button does.
+    format!("{members} in this lineage, {hidden} of them hidden. {DELETE_CONFIRM_PROMPT}")
+}
+
 /// Which set of sessions the list shows.
 ///
 /// The default is [`Scope::CurrentFolder`]: only sessions whose canonicalized
@@ -148,10 +237,26 @@ pub enum ModalAction {
     /// choice so the confirm handler needs no index-to-agent lookup.
     New(Option<String>),
     /// HARD-delete the target session's transcript from disk, keyed on the modal's
-    /// `session_id`. The confirm handler runs the pure `delete::can_delete` live
-    /// guard first, then the FS removal; the modal only OPENS the prompt, it never
-    /// deletes on its own. Default-highlighted on Cancel for safety.
+    /// `session_id`. The confirm handler runs the pure `delete::can_delete_target`
+    /// writer guard first, then the FS removal; the modal only OPENS the prompt, it
+    /// never deletes on its own. Default-highlighted on Cancel for safety.
     Delete,
+    /// HARD-delete EVERY session in the target's fork lineage — the same grouping
+    /// `Ctrl-X x` hides as one unit — carrying the member ids the choice was BUILT
+    /// with.
+    ///
+    /// The ids ride the action rather than being re-derived at confirm time, and
+    /// that is a correctness property, not a convenience (the precedent is
+    /// [`ModalAction::New`], which carries its agent name for the same reason).
+    /// `App::lineage_member_ids` resolves the lineage from the CURRENT SELECTION,
+    /// while a `SessionsChanged` reload can clamp that selection to an unrelated
+    /// row with the modal still open — so re-deriving on confirm could delete a
+    /// lineage the user never saw named. Carrying them also makes the `(N)` in the
+    /// button label and the set actually deleted the SAME value by construction.
+    ///
+    /// The confirm handler guards each member individually and deletes the ones
+    /// that pass; one busy fork must not block the rest of the family.
+    DeleteLineage(Vec<String>),
     /// Dismiss the modal, returning to the board.
     Cancel,
 }
@@ -1267,7 +1372,30 @@ impl App {
     pub fn live_agent_now(&self, session_id: &str) -> Option<ReportedAgent> {
         // The probe hands back an owned, freshly-parsed map, so `remove` lifts the
         // record out without a clone; the map dies at the end of the statement.
-        (self.live_probe)().remove(session_id)
+        self.live_agents_now().remove(session_id)
+    }
+
+    /// Ask claude, RIGHT NOW, for its WHOLE active agent list — the one read a
+    /// caller with SEVERAL sessions to judge must use.
+    ///
+    /// [`live_agent_now`](Self::live_agent_now) is this, narrowed to one id (and
+    /// is expressed over it, so the two can never resolve against different
+    /// snapshots). Reach for this one when N sessions are decided TOGETHER — the
+    /// lineage hard-delete is the case: judging its members through the
+    /// single-session accessor would spawn `claude` once PER MEMBER, N blocking
+    /// shell-outs deep in the render loop, which is exactly what AGENTS.md's
+    /// OFF-UI-THREAD rule forbids. One probe, one map, every member judged against
+    /// the same instant — which also makes the verdicts mutually consistent
+    /// rather than spread across N moments.
+    ///
+    /// Same posture as its narrowed sibling: SHELLS OUT, so call it at a hand-off
+    /// or a confirm, never from a render; fail-soft to an empty map (see
+    /// [`crate::agents::live_agents`]); routed through
+    /// [`live_probe`](Self::live_probe) so tests seed it instead of spawning
+    /// `claude`.
+    #[must_use]
+    pub fn live_agents_now(&self) -> HashMap<String, ReportedAgent> {
+        (self.live_probe)()
     }
 
     /// Ask claude, RIGHT NOW, whether it is holding `session_id` open — the
@@ -1343,38 +1471,78 @@ impl App {
     }
 
     /// Open the HARD-delete confirmation overlay for the selected session — a
-    /// `Row`-layout [`Modal`] with `[Delete] [Cancel]`, DEFAULT-HIGHLIGHTED ON
-    /// CANCEL so a stray Enter can never trigger an irreversible delete. Targets
-    /// the selected `session_id`; the confirm handler runs the live guard and the
-    /// FS removal (`ModalAction::Delete`). This method only OPENS the prompt — it
-    /// never deletes. A no-op when nothing is selected.
+    /// `Row`-layout [`Modal`] reading `[Delete this] [Delete lineage (N)] [Cancel]`,
+    /// DEFAULT-HIGHLIGHTED ON CANCEL so a stray Enter can never trigger an
+    /// irreversible delete. This method only OPENS the prompt — it never deletes.
+    /// A no-op when nothing is selected.
+    ///
+    /// The LINEAGE choice appears only when the selection's fork lineage actually
+    /// has more than one member, and its `(N)` is that real count. It exists
+    /// because hide is already a GROUP operation
+    /// ([`toggle_hidden_selected`](Self::toggle_hidden_selected)) while delete was
+    /// single-id, and the asymmetry showed: hard-deleting a folded HEAD left its
+    /// members behind and the fold simply re-headed to a surviving fork, so the
+    /// row never left the board and the delete read as broken. The member ids are
+    /// resolved HERE, from [`lineage_member_ids`](Self::lineage_member_ids) — the
+    /// same grouping the hide uses, never a second rule — and ride the
+    /// [`ModalAction::DeleteLineage`] choice, so the count shown and the set
+    /// deleted cannot disagree even if a reload moves the selection while the
+    /// modal is open.
+    ///
+    /// That grouping sweeps the FULL store, so `(N)` can exceed what is on
+    /// screen: a soft-HIDDEN member counts and is deleted. Deliberate — it is
+    /// hide's own rule reused rather than a second one, and hiding a copy is a
+    /// visibility preference, not a claim the copy is gone. `(N)` therefore
+    /// states the real size of the family the button takes, which is exactly the
+    /// number that must not surprise anyone afterwards — and when some of that
+    /// family is off screen, [`delete_confirm_message`] SAYS SO, so the number is
+    /// predictable before the confirm rather than only explicable after it.
+    ///
+    /// The message states the BLAST RADIUS honestly, because the writer guard now
+    /// admits parked background agents: what goes is the transcript on disk, the
+    /// agent itself keeps existing in Claude Code until stopped there, and
+    /// attaching + replying later can write a fresh transcript under that session.
     pub fn open_delete_confirm(&mut self) {
         let Some(id) = self.selected.clone() else {
             return;
         };
-        let choices = vec![
-            ModalChoice {
-                label: "Delete".to_string(),
+        let members = self.lineage_member_ids(&id);
+        // Counted from the SAME member list the button carries, so the disclosure
+        // and the set deleted can never describe different families.
+        let hidden = members
+            .iter()
+            .filter(|id| self.hidden_ids.contains(*id))
+            .count();
+        let message = delete_confirm_message(members.len(), hidden);
+        let mut choices = vec![ModalChoice {
+            label: "Delete this".to_string(),
+            description: None,
+            action: ModalAction::Delete,
+        }];
+        // Only offer the lineage when there IS one: a lone session would otherwise
+        // get a second button that does exactly what the first does.
+        if members.len() > 1 {
+            choices.push(ModalChoice {
+                label: format!("Delete lineage ({})", members.len()),
                 description: None,
-                action: ModalAction::Delete,
-            },
-            ModalChoice {
-                label: "Cancel".to_string(),
-                description: None,
-                action: ModalAction::Cancel,
-            },
-        ];
+                action: ModalAction::DeleteLineage(members),
+            });
+        }
+        choices.push(ModalChoice {
+            label: "Cancel".to_string(),
+            description: None,
+            action: ModalAction::Cancel,
+        });
         // Derive the default highlight from the Cancel choice's position rather
-        // than a bare index, so the safe default survives a choice reorder.
+        // than a bare index, so the safe default survives a choice reorder — and,
+        // now, the optional middle button that shifts Cancel's index.
         let selected = choices
             .iter()
             .position(|c| c.action == ModalAction::Cancel)
             .unwrap_or(0);
         self.open_modal(Modal {
             title: "delete session".to_string(),
-            message: "Permanently delete this session's transcript from disk? \
-                      This can't be undone."
-                .to_string(),
+            message,
             layout: ModalLayout::Row,
             choices,
             selected,
@@ -3164,6 +3332,154 @@ mod tests {
 
         app.close_modal();
         assert!(app.modal.is_none(), "cancel returns to the board");
+    }
+
+    // --- hard-delete confirm copy -----------------------------------------
+
+    /// The confirm must let the user PREDICT what `Delete lineage (N)` unlinks.
+    /// `lineage_member_ids` sweeps the full store, so `N` counts soft-hidden
+    /// members that are not on screen — deliberate, and therefore something to
+    /// DISCLOSE rather than to change.
+    ///
+    /// Pinned as a pure function of `(members, hidden)` so the copy is testable
+    /// without a store, a modal or a terminal, and so the three shapes that
+    /// matter can be stated side by side: nothing hidden, some hidden, and
+    /// everything but the pivot hidden.
+    ///
+    /// The COUNTS lead the added sentence and the sentence leads the message on
+    /// purpose (see `delete_confirm_message`): the message is wrapped to the
+    /// modal-width constant, so a narrower terminal clips each row's TAIL, and
+    /// only a leading count is safe from being cut into a plausible wrong number.
+    #[test]
+    fn delete_confirm_message_discloses_hidden_lineage_members_and_stays_quiet_otherwise() {
+        // No lineage at all, and a lineage with nothing hidden: the prompt alone.
+        // Anything else would put a count in front of a single-session delete.
+        assert_eq!(delete_confirm_message(1, 0), DELETE_CONFIRM_PROMPT);
+        assert_eq!(
+            delete_confirm_message(5, 0),
+            DELETE_CONFIRM_PROMPT,
+            "a fully visible lineage has nothing to disclose"
+        );
+
+        // Some hidden: the counts lead, and the prompt still arrives in full.
+        let some = delete_confirm_message(5, 2);
+        assert!(
+            some.starts_with("5 in this lineage, 2 of them hidden"),
+            "the counts must lead the message, where a clip reaches them last: {some:?}"
+        );
+        assert!(
+            some.ends_with(DELETE_CONFIRM_PROMPT),
+            "the irreversibility + blast-radius prompt is never displaced: {some:?}"
+        );
+        // The sentence is a BUDGET, not just copy: it is wrapped into the modal at
+        // a fixed width and every wrapped row it adds costs the button strip a
+        // terminal size (see `delete_confirm_message`, and the view test that pins
+        // the resulting height). Pin the length here too, so a future edit that
+        // "just adds a few words" fails next to the wording it changed rather than
+        // only in the render test.
+        assert_eq!(
+            some.len() - DELETE_CONFIRM_PROMPT.len(),
+            37,
+            "the disclosure's own length is budgeted: {some:?}"
+        );
+
+        // Everything but the pivot hidden — the shape where the button's count is
+        // most surprising, since only ONE of the three rows is on the board.
+        let mostly = delete_confirm_message(3, 2);
+        assert!(
+            mostly.starts_with("3 in this lineage, 2 of them hidden"),
+            "the near-invisible lineage discloses both counts: {mostly:?}"
+        );
+        // A hidden PIVOT (revealed via show-hidden) is counted too: every member
+        // is judged the same way, never all-but-one.
+        assert!(
+            delete_confirm_message(3, 3).starts_with("3 in this lineage, 3 of them hidden"),
+            "a wholly hidden lineage discloses all of it"
+        );
+
+        // A single session can never be told about a lineage, whatever the hidden
+        // set says about it — there is no lineage button on that modal.
+        assert_eq!(
+            delete_confirm_message(1, 1),
+            DELETE_CONFIRM_PROMPT,
+            "a lone session gets no lineage sentence"
+        );
+    }
+
+    /// The wiring half: the real `open_delete_confirm` counts the hidden members
+    /// from the SAME id list the lineage button carries, and the disclosure does
+    /// not change what is taken — `(N)` and the action's ids stay the full
+    /// lineage, hidden members included.
+    ///
+    /// The count is an INTERSECTION of `hidden_ids` with the lineage, not a
+    /// property of `hidden_ids` at large, so the fixture keeps a hidden session in
+    /// a DIFFERENT lineage throughout: `hidden_ids.len()`, or any count that merely
+    /// asks whether anything is hidden, would over-report against it.
+    #[test]
+    fn open_delete_confirm_discloses_hidden_members_without_narrowing_the_lineage() {
+        let mut app = app_all(vec![
+            session_fork("sbdisc-new", "/tmp/p", "root-1", 300), // newest → head
+            session_fork("sbdisc-mid", "/tmp/p", "root-1", 200),
+            session_fork("sbdisc-old", "/tmp/p", "root-1", 100),
+            // A NON-member: same folder, different root uuid, so a different
+            // lineage. Nothing it does may reach the confirm below.
+            session_fork("sbdisc-other", "/tmp/p", "root-2", 400),
+        ]);
+        // Two members soft-hidden: the board shows one row, the button says three.
+        app.hidden_ids.insert("sbdisc-mid".to_string());
+        app.hidden_ids.insert("sbdisc-old".to_string());
+        app.set_selected(Some("sbdisc-new".to_string()));
+
+        app.open_delete_confirm();
+        let modal = app.modal.clone().expect("the confirm is open");
+        assert!(
+            modal
+                .message
+                .starts_with("3 in this lineage, 2 of them hidden"),
+            "the confirm discloses the off-screen members: {:?}",
+            modal.message
+        );
+        assert_eq!(
+            modal.choices[1].label, "Delete lineage (3)",
+            "the button's count is unchanged — the disclosure tells, it does not narrow"
+        );
+        assert_eq!(
+            modal.choices[1].action,
+            ModalAction::DeleteLineage(vec![
+                "sbdisc-new".to_string(),
+                "sbdisc-mid".to_string(),
+                "sbdisc-old".to_string(),
+            ]),
+            "hidden members are still deleted with the rest of the lineage"
+        );
+
+        // MIXED: one member hidden, one NON-member hidden. The disclosure must say
+        // one — `hidden_ids.len()` would say two, and so would any count taken
+        // before the lineage is intersected in.
+        app.hidden_ids.clear();
+        app.hidden_ids.insert("sbdisc-mid".to_string());
+        app.hidden_ids.insert("sbdisc-other".to_string());
+        app.open_delete_confirm();
+        let mixed = app.modal.clone().expect("the confirm is open");
+        assert!(
+            mixed
+                .message
+                .starts_with("3 in this lineage, 1 of them hidden"),
+            "only the hidden LINEAGE member is counted, not the hidden outsider: {:?}",
+            mixed.message
+        );
+
+        // Reveal the members and leave ONLY the outsider hidden. `hidden_ids` is
+        // still non-empty, but none of it is in the family the button takes, so the
+        // confirm must say nothing extra: a disjoint hidden set discloses nothing.
+        app.hidden_ids.clear();
+        app.hidden_ids.insert("sbdisc-other".to_string());
+        app.open_delete_confirm();
+        let revealed = app.modal.clone().expect("the confirm is open");
+        assert_eq!(
+            revealed.message, DELETE_CONFIRM_PROMPT,
+            "a hidden session outside the lineage is not a member `(N)` takes"
+        );
     }
 
     // --- new-session agent picker -----------------------------------------
