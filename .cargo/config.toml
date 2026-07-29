@@ -8,5 +8,6 @@
 # Key is quoted because the ':' makes it a non-bare TOML key.
 link = "install --path ."
 "link:dev" = "install --debug --path ."
+unlink = "uninstall snapback"
 # Optimized production build. Extend with more steps here as the pipeline grows.
 release = "build --release"
