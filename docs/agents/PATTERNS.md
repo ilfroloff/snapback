@@ -79,8 +79,11 @@ it. Follow this split when adding behavior:
   `update::key_to_action` / `wheel_target` / `accept_paste` (line-ending
   normalization plus the char-counted cap, fused so neither can be skipped at a
   call site) / `flatten_for_query`; every `App` state transition (incl.
-  `pick_default_index`, the agent-picker cycle, and `child_indices`, which marks
-  the indented rows by reusing `lineage::head_of` rather than re-deriving a head);
+  `pick_default_index`, the agent-picker cycle, `child_indices`, which marks
+  the indented rows by reusing `lineage::head_of` rather than re-deriving a head,
+  and `delete_confirm_message`, the delete confirm's copy as a function of
+  `(members, hidden)` — so the sentence that discloses off-screen lineage members
+  is testable without a store, a modal or a terminal);
   `view`'s `wrapped_text_rows` / `clamp_preview_offset` / `preview_split` /
   `centered_rect` / `highlight_runs` / `fit_label` (the marker-vs-label width
   reservation, pure so it is tested as arithmetic rather than only through a
@@ -246,13 +249,24 @@ must be argued at the call site rather than assumed:
   unchanged.
 - Be **accurate about what it costs**, per branch. Where nothing renders between
   the probe and the terminal teardown (plain resume; a confirmed Attach) it is
-  invisible. Where the board draws again — the Enter gate's overlay, and Attach's
-  two refusals — it lands ~0.26s after the keypress: a real, deliberate hitch. Do
-  not paper over it with a zero-render claim that only holds on one branch.
+  invisible. Where the board draws again — the Enter gate's overlay, Attach's
+  two refusals, and EVERY branch of the delete confirm — it lands ~0.26s after the
+  keypress: a real, deliberate hitch. Do not paper over it with a zero-render
+  claim that only holds on one branch.
+- **One shot means one, whatever the target count.** The hard-delete confirm
+  (`confirm_delete`) judges a whole fork lineage, so it takes claude's active list
+  ONCE for the entire set (`App::live_agents_now`) and evaluates every member
+  against that single map. Reaching for the per-session accessor in the loop would
+  turn one probe into N blocking spawns on the render loop — the poll cadence rule
+  broken by a different route — and would judge one family against N different
+  instants.
 
-It runs at **EVERY hand-off, not just the first**: the Enter gate asks, and the
+It runs at **EVERY hand-off, not just the first**: the Enter gate asks, the
 Attach hand-off asks AGAIN rather than reusing the gate's answer or the polled
-map. `route_handoff` is where that second ask lives. The reason is the same one
+map, and the hard-delete confirm asks for itself. `route_handoff` is where that
+second ask lives; `confirm_delete` is the third site, and it counts as
+hand-off-shaped for the same reason — an irreversible unlink is exactly the kind
+of decision that must not be made from a stale snapshot. The reason is the same one
 that moved the gate here — an authoritative decision must not be made from a
 stale snapshot — and it is sharper at Attach, because the overlay can sit open
 indefinitely, so the gate's answer has no bounded freshness at all. **Nothing

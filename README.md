@@ -105,7 +105,7 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | `Ctrl-O` (in that picker) | **Start the highlighted agent interactively at once**, skipping the draft — the same thing `Ctrl-O` means inside the draft box, so either route out of the picker is one keypress |
 | `Ctrl-R` | **Quick reply** — send a one-shot message to the selected session without leaving the board. A background agent whose run is over (`done`, `stopped`, `failed`) is stopped first so the reply lands in place; a waiting one (`needs input`) asks you to confirm that stop; one that is still live (`working`, `idle`, `interrupted`, or a state this version doesn't recognize) is left alone and refused. Opens a compose box (`Enter` sends, `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels) |
 | `Ctrl-K` | **Stop / interrupt** the selected session's live background agent (`claude stop`). An agent whose run is over (`done`, `stopped`, `failed`) stops immediately; every other live agent (`working`, `needs input`, `idle`, `interrupted`, unrecognized) confirms first, since stopping ends the live job (its conversation is kept). A session that isn't running as an agent has nothing to stop, and an interactive session running in another terminal can't be stopped from here |
-| `Ctrl-X` then `x` / `d` / `h` | **Leader chord** for hide & delete — `x` **hides** the selected session (reversible, persisted), `d` **hard-deletes** it after a confirmation, `h` toggles **show hidden**. Any other key cancels the chord |
+| `Ctrl-X` then `x` / `d` / `h` | **Leader chord** for hide & delete — `x` **hides** the selected session (reversible, persisted), `d` **hard-deletes** it after a confirmation that can take just that row or its whole `(+N)` stack, `h` toggles **show hidden**. Any other key cancels the chord |
 | `Tab` | Toggle search: **name-only ↔ name+content** |
 | `Ctrl-A` | Toggle scope: **current folder ↔ all folders** |
 | `Ctrl-/` | Toggle the transcript **preview** pane |
@@ -173,8 +173,8 @@ off the list.
   The word beside the badge says which.
 - **gray, pulsing** — working right now.
 - **gray, steady** — **interrupted**: a background agent Claude Code still lists
-  as working even though it was stopped, so the badge holds still instead of
-  pulsing as if a turn were in flight.
+  as working while its own status for it reads idle, so the badge holds still
+  instead of pulsing as if a turn were in flight.
 - **dim gray, steady** — the agent has ended: it was stopped or its run failed.
   The word beside the badge says which.
 
@@ -293,18 +293,45 @@ a guess. Use `Ctrl-K` if you do want it stopped — it will ask first.
 and a hint shows the follow-ups — `x`, `d`, `h` — while any other key cancels.
 
 - `Ctrl-X x` **hides** the selected session. This is the reversible default: the
-  session stays on disk, it just drops off the board. The hidden set is
-  remembered across restarts, so a session you hide stays hidden next time. Press
-  `Ctrl-X x` again on a revealed row to un-hide it.
+  session stays on disk, it just drops off the board. A `(+N)` stack always hides
+  and returns whole, so the row genuinely leaves rather than being replaced by
+  the next copy behind it. The hidden set is remembered across restarts, so a
+  session you hide stays hidden next time. Press `Ctrl-X x` again on a revealed
+  row to un-hide it.
 - `Ctrl-X h` **toggles showing hidden sessions**. Hidden rows come back dimmed and
   marked `[hidden]`, still carrying their live badge if their agent is running —
   hiding is a visibility choice, not a claim that a session is finished.
 - `Ctrl-X d` **hard-deletes** the selected session — physically removing its
   transcript from disk. Because that is irreversible, it asks first with a
-  confirmation prompt (defaulted to Cancel), and it refuses a session whose agent
-  is currently running rather than pull a file out from under it. Deletion removes
-  exactly that session's own `<id>.jsonl` and its sibling `<id>/` directory of
-  subagent transcripts — nothing else.
+  confirmation prompt (defaulted to Cancel). On a row that stands for a `(+N)`
+  stack the prompt also offers **Delete lineage** — the whole family of look-alike
+  copies at once, which is what hiding already does. Without it, deleting the top
+  row would leave the copies behind and the next one would simply take its place,
+  so the row never actually left the board. Deletion removes exactly each target
+  session's own `<id>.jsonl` and its sibling `<id>/` directory of subagent
+  transcripts — nothing else.
+
+  What it refuses is a session something might be **writing**: one you have open
+  in a Claude Code window, a background agent Claude Code still has up — working
+  a turn, sitting idle between turns, or reporting something snapback can't read
+  (an unreadable signal never gets to authorize an irreversible delete) — or one
+  snapback itself is still replying to. A quick reply (`Ctrl-R`) keeps writing
+  after the board comes back, so a delete aimed at that session waits until the
+  reply has landed. Fair game is a background agent that isn't churning: one
+  *waiting on you*, one Claude Code still reports as working while its own status
+  reads idle (**interrupted**), or one that has reported it finished. Claude Code
+  keeps listing agents long after they go quiet, and refusing all of them made
+  delete useless for almost every row on the board. Two things worth knowing before you
+  confirm, and the prompt says both: removing the transcript doesn't stop the
+  agent — it stays in Claude Code until you stop it there — and if you later
+  attach to it and reply, a new transcript is written under that session. In a
+  lineage, members that are still running are skipped and the rest are deleted;
+  the board reports the split.
+
+  A lineage delete takes the whole family, including copies you've hidden —
+  hiding is a visibility choice, so it doesn't spare a copy here. When some of
+  them are hidden the prompt leads with the numbers (`3 in this lineage, 2 of
+  them hidden`), so the count on the button is never more than you expected.
 
 Hiding is the only thing snapback ever writes for itself. The list of hidden
 session ids lives in its own config directory —

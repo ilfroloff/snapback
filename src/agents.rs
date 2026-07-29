@@ -21,7 +21,10 @@
 //!   one-shot probe at hand-off; MEMBERSHIP in what it returns is liveness,
 //!   structurally, because the bare command IS claude's active list. It returns
 //!   the RECORDS, so the same authoritative read also carries each live agent's
-//!   attach job [`id`](ReportedAgent::id).
+//!   attach job [`id`](ReportedAgent::id) — and the `kind` + qualifier that
+//!   [`classify`]'s ONE non-display consumer reads, the hard-delete writer guard
+//!   ([`crate::delete::can_delete`]). That guard judges a target off THIS probe,
+//!   never off the polled `--all` map.
 //!
 //! The durable finding behind the split: **`--all`'s `state: "done"` means "the
 //! agent reported completion", NOT "claude will permit `-r`".** The two can
@@ -53,6 +56,20 @@ use std::collections::HashMap;
 use std::process::Command;
 
 use serde_json::Value;
+
+/// The `kind` value for an agent claude runs in the BACKGROUND — the job shape
+/// that carries an attachable [`id`](ReportedAgent::id) and a `state`.
+const KIND_BACKGROUND: &str = "background";
+
+/// The `kind` value for a session claude holds open INTERACTIVELY: a window
+/// someone is typing in.
+///
+/// Public because it is a WRITER-presence signal, not merely a badge label:
+/// [`crate::delete::can_delete`] refuses a HARD delete on this kind, since the
+/// next keystroke in that window appends to the very transcript being unlinked.
+/// Declared here, beside the qualifier vocabulary, so the one module that names
+/// claude's wire tokens stays the only one — the guard must never re-spell it.
+pub const KIND_INTERACTIVE: &str = "interactive";
 
 /// The `state`/`status` value reported for an agent that has STOPPED and is
 /// waiting on the user to answer. Worth translating: read bare, "blocked"
@@ -194,8 +211,8 @@ impl ReportedAgent {
     #[must_use]
     pub fn kind_label(&self) -> &str {
         match self.kind.as_str() {
-            "background" => "bg",
-            "interactive" => "live",
+            KIND_BACKGROUND => "bg",
+            KIND_INTERACTIVE => "live",
             other => other,
         }
     }
@@ -212,20 +229,34 @@ impl ReportedAgent {
 ///
 /// This enum is the SINGLE interpretation of that undocumented value set: the
 /// preview banner ([`friendly_status`]), the list-badge pulse ([`is_active`]),
-/// and the badge color ([`crate::tui::view::badge_color`]) all map from it, so a
-/// schema drift is a one-line change in [`classify`] rather than a hunt for raw
-/// string matches scattered across the UI.
+/// the badge color ([`crate::tui::view::badge_color`]) and the hard-delete
+/// writer guard ([`crate::delete::can_delete`]) all map from it, so a schema
+/// drift is a one-line change in [`classify`] rather than a hunt for raw string
+/// matches scattered across the UI.
 ///
-/// The boundary it must not cross: **no bucket answers "is this live?"**.
-/// Liveness is not inferred from a qualifier — it is [`live_agents`]' membership
-/// answer, straight from claude, which is why no bucket gates the resume.
+/// **The boundary, stated precisely — the buckets are no longer display-only:**
 ///
-/// Most consumers are DISPLAY decisions. The two exceptions are the `Ctrl-R` /
-/// `Ctrl-K` gates ([`crate::send::reply_gate`], [`crate::send::interrupt_gate`]),
-/// which classify a RECORD THE PROBE JUST RETURNED to route a stop — so liveness
-/// is still membership and only the "what is it doing" question is bucketed. Even
-/// there the inferred bucket ([`AgentActivity::WorkingButIdle`]) is granted no
-/// action of its own: it rides with the live states, so nothing acts on a guess.
+/// * No bucket answers **"live?"**. Liveness is never inferred from a qualifier;
+///   it is [`live_agents`]' MEMBERSHIP answer, straight from claude.
+/// * No bucket gates **RESUME or ATTACH**. Those ride that same membership, and
+///   nothing here may widen them.
+/// * The buckets DO decide non-display questions, in exactly two places. Both
+///   classify a RECORD THE PROBE JUST RETURNED, so liveness is still membership
+///   and only the "what is it doing" question is bucketed:
+///   * **"is a WRITER present?"** — [`crate::delete::can_delete`], which reads
+///     the bucket before a HARD delete unlinks the transcript. That unlink is
+///     IRREVERSIBLE, so retuning a bucket is no longer only a repaint.
+///   * **"how should a stop be routed?"** — the `Ctrl-R` / `Ctrl-K` gates
+///     ([`crate::send::reply_gate`], [`crate::send::interrupt_gate`]).
+///
+/// [`AgentActivity::WorkingButIdle`] is the sharp edge, and the two consumers
+/// deliberately read it DIFFERENTLY. In the send gates it is granted no action of
+/// its own — it rides with the LIVE states, so nothing acts on a guess. In the
+/// writer guard it is an ALLOW arm, because the question there is narrower ("is a
+/// write in flight?") and claude appends by re-opening the path. So widening this
+/// bucket does not merely steady a dot: it makes transcripts deletable that were
+/// refused before. Judge any retune here against BOTH matrices as well as the
+/// badge.
 ///
 /// Payload-free on purpose — a variant answers "which bucket", never "what did
 /// the wire say". The raw qualifier stays available on the [`ReportedAgent`]
@@ -242,7 +273,9 @@ pub enum AgentActivity {
     Working,
     /// claude reports a working `state` its own `status` contradicts as `idle`;
     /// the single bucket snapback authors rather than passes through verbatim.
-    /// Display-only, never gates resume.
+    /// It gates no resume and no attach — but it IS an ALLOW arm of
+    /// [`crate::delete::can_delete`]'s writer guard, so retuning it moves an
+    /// irreversible unlink and not just a dot (see [`AgentActivity`]).
     ///
     /// The internal name stays DESCRIPTIVE — it names exactly what was observed
     /// (a working `state` contradicted by an `idle` `status`) and asserts no
@@ -251,8 +284,15 @@ pub enum AgentActivity {
     /// `status` says nothing is churning. Keyed on `state`, so it fires only for
     /// background agents (interactive sessions report no `state`).
     WorkingButIdle,
-    /// Reported completion ([`QUALIFIER_DONE`]); only observable under `--all`.
-    /// Badges green and steady — it does NOT decide whether `-r` is permitted.
+    /// Reported completion ([`QUALIFIER_DONE`]). Badges green and steady, and it
+    /// does NOT decide whether `-r` is permitted.
+    ///
+    /// Not display-only either: it is a LIVE ALLOW arm of
+    /// [`crate::delete::can_delete`]'s writer guard, because the BARE list this
+    /// module's docs describe holds a `done` job until claude reaps it. So
+    /// retuning what lands in this bucket moves an IRREVERSIBLE unlink and not
+    /// just a dot, exactly as it does for [`AgentActivity::WorkingButIdle`]; that
+    /// guard's doc comment owns why the arm once read as unreachable and is not.
     Done,
     /// A TERMINAL background state — the job has ENDED, whether cleanly stopped or
     /// failed ([`QUALIFIER_STOPPED`] / [`QUALIFIER_FAILED`]). Badges STEADY
@@ -302,8 +342,10 @@ pub enum AgentActivity {
 pub fn classify(agent: &ReportedAgent) -> AgentActivity {
     // Surface claude's own self-contradiction before the qualifier collapses it:
     // a background agent that died at startup keeps reporting a working `state`
-    // while its `status` reads `idle`. Display-only (see `WorkingButIdle`); it
-    // never reaches a liveness or resume decision.
+    // while its `status` reads `idle`. It reaches no liveness, resume or attach
+    // decision — but it DOES reach the hard-delete writer guard, which ALLOWS on
+    // this bucket (see `WorkingButIdle`), so widening this branch widens an
+    // irreversible unlink.
     if matches!(
         agent.state.as_deref(),
         Some(QUALIFIER_WORKING | QUALIFIER_BUSY)
@@ -574,22 +616,26 @@ pub fn reported_agents() -> HashMap<String, ReportedAgent> {
 /// Probe claude's ACTIVE agent list (`claude agents --json`, no `--all`) and
 /// return the agents it is holding open RIGHT NOW, keyed by full `sessionId`.
 ///
-/// The authoritative answer to BOTH hand-off questions, from ONE read:
+/// The authoritative answer to EVERY hand-off-shaped question, from ONE read:
 ///
 /// * **"Will `claude -r <id>` refuse?"** — MEMBERSHIP, and the reason that is
 ///   enough is structural: the bare command IS claude's active list, so there is
 ///   no bucket to infer from and nothing to be uncertain about.
 /// * **"What does `claude attach` take?"** — the matched record's own short
 ///   agent-view [`id`](ReportedAgent::id).
+/// * **"Is anything WRITING this transcript?"** — the matched record's `kind`
+///   and its [`classify`] bucket, read by [`crate::delete::can_delete`] before a
+///   HARD delete unlinks the file. Membership alone cannot answer this one: most
+///   of this list is PARKED, so the record's own fields decide.
 ///
-/// It returns the RECORDS rather than bare ids precisely so the second question
-/// has an authoritative answer. The parse has the `id` in hand either way;
-/// discarding it would force the attach path back onto [`reported_agents`]' map
-/// — an authoritative decision made from a ~1.3s-stale snapshot, which is the
+/// It returns the RECORDS rather than bare ids precisely so the questions past
+/// membership have an authoritative answer. The parse has the `id` in hand either
+/// way; discarding it would force the attach path back onto [`reported_agents`]'
+/// map — an authoritative decision made from a ~1.3s-stale snapshot, which is the
 /// exact class of bug that moving the liveness gate here fixed. One shell-out,
-/// one parse, both answers, no second notion of "which agent is this".
+/// one parse, every answer, no second notion of "which agent is this".
 ///
-/// [`reported_agents`]' `--all` map cannot answer either question: it is up to
+/// [`reported_agents`]' `--all` map cannot answer any of them: it is up to
 /// ~1.3s stale and its `done` qualifier means "the agent reported completion",
 /// not "claude will permit `-r`".
 ///
@@ -772,9 +818,10 @@ mod tests {
         assert_eq!(friendly_status(&busy), "live busy");
     }
 
-    /// `done` is a bucket of its own: an agent that REPORTED completion. Observed
-    /// only under `--all`, rendered verbatim, and steady — there is no work left
-    /// to animate.
+    /// `done` is a bucket of its own: an agent that REPORTED completion, rendered
+    /// verbatim and steady — there is no work left to animate. `--all` is what
+    /// keeps EVERY `done` agent observable, but a just-finished one is briefly in
+    /// the bare list too, until claude reaps it (see `QUALIFIER_DONE`).
     ///
     /// It says nothing about whether `claude -r` will be permitted, and nothing
     /// here asks: that is `live_agents`' answer, pinned at the gate in
