@@ -7,3 +7,8 @@
 
 # `ai-to-go` artifacts
 /docs/plans
+
+# Local `wtp` git-worktree checkouts (`.wtp.yml` sets `base_dir: .agents/worktrees`).
+# Scoped to `worktrees/` only: agent definitions elsewhere in `.agents/` stay committable.
+/.agents/worktrees/
+/.wtp.yml
