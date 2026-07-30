@@ -38,6 +38,13 @@ const PREVIEW_WHEEL_STEP: i32 = 2;
 /// Rows the list selection moves per mouse-wheel notch.
 const LIST_WHEEL_STEP: isize = 1;
 
+/// How many `AppEvent::Tick`s a transient confirmation/nudge lives on the help line.
+///
+/// `16 * watch::TICK` (250ms) = 4s — long enough to read a short confirmation,
+/// short enough not to squat on the keymap row. `STATUS_DWELL_TICKS` is multiplied
+/// by `watch::TICK`, so the two must be tuned together (PATTERNS §8).
+pub(crate) const STATUS_DWELL_TICKS: u16 = 16;
+
 /// Minimum columns either pane keeps when the list/preview splitter is
 /// dragged, so neither pane can be crushed to zero width or dragged past the
 /// other (which would invert the layout).
@@ -320,6 +327,17 @@ pub struct Sending {
     /// when the send was dispatched. The echo shows only while the reloaded count
     /// still equals this — i.e. nothing new has landed on disk yet.
     pub baseline_msg_count: usize,
+}
+
+/// A `claude stop` interrupt that is IN FLIGHT (dispatched, not yet finished).
+///
+/// Carries the session id the interrupt targeted so a completion event can be
+/// attributed to the surface that dispatched it and ignored if the board has
+/// moved on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Interrupting {
+    /// Authoritative `sessionId` the interrupt targeted.
+    pub session_id: String,
 }
 
 /// The open NEW-SESSION draft — the PANE-level twin of the compose editor.
@@ -683,8 +701,20 @@ pub struct App {
     /// resize into a degenerate layout.
     pub list_width: Option<u16>,
     /// Transient board status (e.g. a resume refusal for a deleted worktree).
-    /// Rendered on the help line and cleared on the next actionable keypress.
+    /// Rendered on the help line and cleared on the next actionable keypress, OR
+    /// when its sibling `status_ttl` counts down to zero.
+    ///
+    /// `status` and `status_ttl` are written only by `set_status`,
+    /// `set_status_transient`, `clear_status`, and `tick_status`, so they cannot
+    /// drift apart — the same invariant that keeps `compose`/`draft` paired.
     pub status: Option<String>,
+    /// Remaining ticks for a **transient** status, or `None` for a sticky one.
+    ///
+    /// `None` means "cleared only by the next actionable keypress" (today's
+    /// behaviour for refusals and failures). `Some(n)` decrements on every
+    /// `AppEvent::Tick` and clears `status` when it reaches zero. Paired with
+    /// `status` by the single-writer invariant above.
+    pub status_ttl: Option<u16>,
     /// Count of `AppEvent::Tick`s since launch, advanced at the `watch::TICK`
     /// cadence and wrapping rather than overflowing.
     ///
@@ -750,10 +780,15 @@ pub struct App {
     pub pending_interrupt: Option<PendingInterrupt>,
     /// The quick-reply send that is IN FLIGHT (dispatched, not yet finished), or
     /// `None`. Drives the optimistic in-preview echo of the message plus the
-    /// animated "sending… / cooking…" indicator so the reply feels instant; set
-    /// when the send is handed off and cleared when its `AppEvent::SendFinished`
-    /// lands. See [`Sending`].
+    /// animated `cooking…` placeholder so the reply feels instant; set when the
+    /// send is handed off and cleared when its `AppEvent::SendFinished` lands.
+    /// See [`Sending`].
     pub sending: Option<Sending>,
+    /// The `claude stop` interrupt that is IN FLIGHT (dispatched, not yet finished),
+    /// or `None`. Set when the stop is handed off and cleared when its
+    /// `AppEvent::InterruptFinished` lands for the same session id.
+    /// See [`Interrupting`].
+    pub interrupting: Option<Interrupting>,
     /// The id the NEXT background launch is stamped with, handed out by
     /// [`dispatch_draft`](Self::dispatch_draft).
     ///
@@ -883,6 +918,7 @@ impl App {
             preview_rect: Rect::default(),
             list_width: None,
             status: None,
+            status_ttl: None,
             tick: 0,
             reported_agents: HashMap::new(),
             live_probe: Box::new(default_live_probe),
@@ -892,6 +928,7 @@ impl App {
             draft: None,
             pending_stop: None,
             sending: None,
+            interrupting: None,
             next_bg_launch_id: 0,
             last_new_agent: None,
             dragging_split: false,
@@ -1310,16 +1347,43 @@ impl App {
 
     // --- transient status --------------------------------------------------
 
-    /// Set a transient board status (e.g. a resume refusal). Shown until the
-    /// next actionable keypress clears it.
+    /// Set a **sticky** board status (e.g. a resume refusal or a failure).
+    /// Shown until the next actionable keypress clears it.
     pub fn set_status(&mut self, message: impl Into<String>) {
         self.status = Some(message.into());
+        self.status_ttl = None;
     }
 
-    /// Clear any transient board status. Called at the start of handling an
-    /// actionable keypress so a message survives exactly until the next input.
+    /// Set a **transient** board status (e.g. a confirmation or a gentle nudge).
+    /// Shown for [`STATUS_DWELL_TICKS`] ticks, then auto-cleared by
+    /// [`tick_status`]. Failures and refusals stay sticky via [`set_status`].
+    pub fn set_status_transient(&mut self, message: impl Into<String>) {
+        self.status = Some(message.into());
+        self.status_ttl = Some(STATUS_DWELL_TICKS);
+    }
+
+    /// Clear any board status and its dwell timer. Called at the start of
+    /// handling an actionable keypress so a message survives exactly until the
+    /// next input.
     pub fn clear_status(&mut self) {
         self.status = None;
+        self.status_ttl = None;
+    }
+
+    /// Decrement the status dwell timer and clear a transient status that has
+    /// expired. Called from the `AppEvent::Tick` arm; uses `saturating_sub` so
+    /// it never interacts with the wrapping `app.tick`.
+    pub fn tick_status(&mut self) {
+        match self.status_ttl {
+            None => {}
+            Some(0) => self.clear_status(),
+            Some(n) => {
+                self.status_ttl = Some(n.saturating_sub(1));
+                if self.status_ttl == Some(0) {
+                    self.clear_status();
+                }
+            }
+        }
     }
 
     // --- reported agents + running-session choice overlay -----------------
@@ -1731,6 +1795,17 @@ impl App {
     #[must_use]
     pub fn sending_to(&self, session_id: &str) -> Option<&Sending> {
         self.sending.as_ref().filter(|s| s.session_id == session_id)
+    }
+
+    /// The in-flight `claude stop` interrupt targeting `session_id`, or `None`
+    /// when no interrupt is in flight for that session. The interrupt's twin of
+    /// [`sending_to`](Self::sending_to): a completion event must only clear the state
+    /// it belongs to, so a stale result cannot land on a surface that has moved on.
+    #[must_use]
+    pub fn interrupting_on(&self, session_id: &str) -> Option<&Interrupting> {
+        self.interrupting
+            .as_ref()
+            .filter(|i| i.session_id == session_id)
     }
 
     /// Open the new-session agent picker over `agents` as a `List`-layout
@@ -3608,5 +3683,73 @@ mod tests {
             !app.is_dragging_split(),
             "a stray click during the picker must not start a splitter drag"
         );
+    }
+
+    // --- status dwell --------------------------------------------------------
+
+    /// Task 3.9: a transient status lives for exactly `STATUS_DWELL_TICKS` ticks,
+    /// then auto-clears. It must NOT vanish before the final tick.
+    #[test]
+    fn transient_status_dwells_and_expires() {
+        let mut app = app_all(vec![]);
+        app.set_status_transient("sent");
+        assert_eq!(app.status.as_deref(), Some("sent"));
+        assert_eq!(app.status_ttl, Some(STATUS_DWELL_TICKS));
+
+        // One tick short of expiry: still visible.
+        for _ in 1..STATUS_DWELL_TICKS {
+            app.tick_status();
+            assert_eq!(
+                app.status.as_deref(),
+                Some("sent"),
+                "transient status survives until the dwell expires"
+            );
+        }
+
+        // The final tick clears it.
+        app.tick_status();
+        assert!(
+            app.status.is_none(),
+            "transient status must clear after STATUS_DWELL_TICKS ticks"
+        );
+        assert!(app.status_ttl.is_none());
+    }
+
+    /// Task 3.9: a sticky status (failure / refusal) ignores `tick_status` and
+    /// stays until an actionable keypress clears it.
+    #[test]
+    fn sticky_status_survives_the_dwell() {
+        let mut app = app_all(vec![]);
+        app.set_status("send failed: boom");
+        assert_eq!(app.status_ttl, None);
+
+        for i in 0..STATUS_DWELL_TICKS {
+            app.tick_status();
+            assert_eq!(
+                app.status.as_deref(),
+                Some("send failed: boom"),
+                "sticky status must survive tick {i}"
+            );
+        }
+        assert_eq!(app.status_ttl, None);
+    }
+
+    /// Task 3.9: overwriting a transient status with a sticky one restores the
+    /// sticky lifetime — the dwell timer must not outlive the new message.
+    #[test]
+    fn set_status_restores_stickiness_after_transient() {
+        let mut app = app_all(vec![]);
+        app.set_status_transient("sent");
+        app.set_status("send failed: boom");
+        assert_eq!(app.status_ttl, None);
+
+        for i in 0..STATUS_DWELL_TICKS {
+            app.tick_status();
+            assert_eq!(
+                app.status.as_deref(),
+                Some("send failed: boom"),
+                "restored sticky status must survive tick {i}"
+            );
+        }
     }
 }

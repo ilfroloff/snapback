@@ -326,6 +326,14 @@ overflow), and the pure `view::blink_visible(tick)` phases it — `2 *
 watch::TICK` = 500ms on / 500ms off (~1Hz). That reuses the existing redraw
 cadence and adds no tick, thread, or event source.
 
+Expiry is animated the same way. A transient status is stored as a
+remaining-ticks countdown (`App::status_ttl`) and decremented by
+`App::tick_status` on each `AppEvent::Tick`. It is neither a wall-clock timeout
+nor an absolute deadline, and it adds no second cadence: it reuses the board's
+existing tick and redraw loop, so confirmations fade within ≤250 ms of the
+countdown reaching zero without ever drifting from the pulse or needing its own
+event source.
+
 `blink_visible` is THE phase source, not one of two: the dot and the cursor both
 read it and therefore one `BLINK_TICKS`, so they pulse together. Anything
 animated later phases off it too — a second counter or cadence would drift
@@ -374,8 +382,10 @@ same way.
 
 A const whose rationale depends on ANOTHER const says so and names it:
 `BLINK_TICKS` is meaningless without `watch::TICK` (they multiply into the pulse's
-500ms phase), so its doc comment shows the arithmetic and points at `TICK`. That
-is what makes the coupling discoverable when the other value is retuned.
+500ms phase), so its doc comment shows the arithmetic and points at `TICK`.
+Likewise, `tui::app::STATUS_DWELL_TICKS` is meaningless without `watch::TICK`
+(`16 * 250 ms = 4 s`), so its doc comment names `TICK` and shows the arithmetic.
+That naming is what makes the coupling discoverable when the other value is retuned.
 
 ## 9. `#[allow(dead_code)]` is narrow and justified
 
@@ -457,6 +467,29 @@ Add a keybinding by extending the `Action` enum + `key_to_action` + `apply_actio
 and covering it with a `key_to_action` unit test. Then satisfy the KEEP KEY DOCS IN
 SYNC rule in [AGENTS.md](../../AGENTS.md), which owns the list of surfaces that
 must agree — do not re-enumerate them here.
+
+## 11. Status-line ownership
+
+`App::status` carries only **outcomes and refusals** — facts true at a single
+point in time: a send result, a resume refusal, a paste-too-long warning, an
+empty-buffer nudge. A fact that is true over an **interval** lives in typed
+state and renders on the surface that owns it:
+
+- the quick reply's in-flight echo lives in `App::sending` and renders **inline**
+  in the preview pane (`view::sending_tail`), not on the help line;
+- a background-agent launch lives in `App::draft.launch_id` and renders on the
+  draft card (`view::draft_card`), not on the help line;
+- an interrupt in flight lives in `App::interrupting` and deliberately has **no**
+  visible label — `claude stop` is fast and the badge clears on the next agents
+  poll — but the guard still prevents a stale completion from landing on a
+  surface that has moved on.
+
+The help line renders `App::status` and nothing else. `set_status` is sticky
+(failures and refusals persist until the next actionable keypress);
+`set_status_transient` expires after `STATUS_DWELL_TICKS` ticks so confirmations
+and nudges do not squat on the keymap row. This keeps each fact told exactly
+once and prevents interval-scoped facts from colonizing a keypress-scoped
+surface.
 
 ## Testing patterns
 

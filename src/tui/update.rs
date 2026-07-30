@@ -79,7 +79,7 @@ use crate::send::{self, BgLaunchRequest, InterruptGate, InterruptRequest, ReplyG
 use crate::store::SessionStore;
 use crate::watch::AppEvent;
 
-use super::app::{App, ModalAction, ModalLayout};
+use super::app::{App, Interrupting, ModalAction, ModalLayout};
 use super::{compose, view};
 
 /// A decoded intent from a single keypress.
@@ -378,14 +378,21 @@ fn dispatch(app: &mut App, event: AppEvent, root: &Path) -> Outcome {
             app.set_reported_agents(agents);
             Outcome::Continue
         }
-        AppEvent::SendFinished { session_id, status } => {
+        AppEvent::SendFinished {
+            session_id,
+            status,
+            success,
+        } => {
             // A one-shot quick-reply send completed off-thread. Clear the in-flight
             // indicator (if this is the send it was tracking) and surface the mapped
-            // result (cost / error) on the status line.
+            // result (cost / error) on the status line. Successes are transient
+            // confirmations; failures and refusals stay sticky.
             if app.sending_to(&session_id).is_some() {
                 app.sending = None;
             }
-            if let Some(status) = status {
+            if success {
+                app.set_status_transient(status);
+            } else {
                 app.set_status(status);
             }
             // If the finished send targets the row on screen, re-anchor the
@@ -397,15 +404,34 @@ fn dispatch(app: &mut App, event: AppEvent, root: &Path) -> Outcome {
             }
             Outcome::Continue
         }
-        AppEvent::InterruptFinished { status } => {
+        AppEvent::InterruptFinished {
+            session_id,
+            status,
+            success,
+        } => {
             // A one-shot interrupt (`claude stop`) completed off-thread; surface its
             // result. The live badge clears on the next agents poll (~1s), and the
             // transcript is unchanged (stopping keeps the conversation), so there is
-            // nothing else to reconcile.
-            app.set_status(status);
+            // nothing else to reconcile. Successes are transient; failures sticky.
+            //
+            // Clear the in-flight guard only when the ids match, so a stale result
+            // cannot land on a surface that has moved on — the interrupt twin of the
+            // `sending_to` guard above.
+            if app.interrupting_on(&session_id).is_some() {
+                app.interrupting = None;
+            }
+            if success {
+                app.set_status_transient(status);
+            } else {
+                app.set_status(status);
+            }
             Outcome::Continue
         }
-        AppEvent::BgLaunchFinished { launch_id, status } => {
+        AppEvent::BgLaunchFinished {
+            launch_id,
+            status,
+            success,
+        } => {
             // A one-shot background-agent launch completed off-thread; surface its
             // result (started / started-but-warned / the failure reason) and close
             // the draft card that was reporting THIS launch in flight. There is
@@ -418,7 +444,11 @@ fn dispatch(app: &mut App, event: AppEvent, root: &Path) -> Outcome {
             // result can land on a surface that is no longer this launch's — a
             // quick reply, or a second draft — and closing blindly would throw away
             // a buffer the user is still typing into.
-            app.set_status(status);
+            if success {
+                app.set_status_transient(status);
+            } else {
+                app.set_status(status);
+            }
             if app.launching_draft(launch_id).is_some() {
                 app.close_compose();
             }
@@ -430,6 +460,9 @@ fn dispatch(app: &mut App, event: AppEvent, root: &Path) -> Outcome {
             // the live-badge pulse from. `wrapping_add` so a board left running
             // for eons rolls over instead of overflow-panicking in debug.
             app.tick = app.tick.wrapping_add(1);
+            // Age transient statuses (confirmations/nudges) on the same cadence.
+            // Failures/refusals stay sticky until the next actionable keypress.
+            app.tick_status();
             Outcome::Continue
         }
     }
@@ -607,7 +640,7 @@ fn handle_paste(app: &mut App, raw: &str) {
     }
 
     if accepted.truncated {
-        app.set_status(paste_truncated_status());
+        app.set_status_transient(paste_truncated_status());
     }
 }
 
@@ -1368,7 +1401,7 @@ fn interrupt(app: &mut App) -> Outcome {
         return Outcome::Continue;
     };
     match send::interrupt_gate(app.live_agent_now(&id).as_ref()) {
-        InterruptGate::StopNow { job_id } => dispatch_interrupt(app, &job_id),
+        InterruptGate::StopNow { job_id } => dispatch_interrupt(app, &id, &job_id),
         InterruptGate::Confirm { job_id } => {
             app.open_interrupt_confirm(id, job_id);
             Outcome::Continue
@@ -1380,17 +1413,20 @@ fn interrupt(app: &mut App) -> Outcome {
     }
 }
 
-/// Build the interrupt request, set the in-flight status, and escalate to the driver
-/// so the spawn stays OUT of this pure handler (mirroring how a send returns
+/// Build the interrupt request, mark the interrupt in flight, and escalate to the
+/// driver so the spawn stays OUT of this pure handler (mirroring how a send returns
 /// [`Outcome::Send`]). `claude stop` acts on the global job registry, so the child
 /// runs in the launch dir — never a re-read of the session's `cwd`, which a deleted
 /// worktree could have removed even while its job is still live.
-fn dispatch_interrupt(app: &mut App, job_id: &str) -> Outcome {
+fn dispatch_interrupt(app: &mut App, session_id: &str, job_id: &str) -> Outcome {
     let req = InterruptRequest {
         argv: send::build_stop_argv(job_id),
         cwd: app.launch_dir.clone(),
+        session_id: session_id.to_string(),
     };
-    app.set_status(send::INTERRUPT_IN_FLIGHT);
+    app.interrupting = Some(Interrupting {
+        session_id: session_id.to_string(),
+    });
     Outcome::Interrupt(req)
 }
 
@@ -1404,7 +1440,7 @@ fn handle_interrupt_confirm_key(app: &mut App, key: KeyEvent) -> Outcome {
     match key.code {
         KeyCode::Enter => {
             if let Some(pending) = app.pending_interrupt.take() {
-                return dispatch_interrupt(app, &pending.job_id);
+                return dispatch_interrupt(app, &pending.session_id, &pending.job_id);
             }
             Outcome::Continue
         }
@@ -1462,7 +1498,7 @@ mod tests {
 
     use crate::agents::ReportedAgent;
     use crate::store::Session;
-    use crate::tui::app::{NewSessionDraft, Scope, MIN_PANE_WIDTH};
+    use crate::tui::app::{NewSessionDraft, Scope, MIN_PANE_WIDTH, STATUS_DWELL_TICKS};
     use crate::tui::compose::ComposeTarget;
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1921,7 +1957,10 @@ mod tests {
             app.pending_interrupt.is_none(),
             "done needs no confirmation"
         );
-        assert_eq!(app.status.as_deref(), Some(send::INTERRUPT_IN_FLIGHT));
+        assert!(
+            app.interrupting_on("done-1").is_some(),
+            "done agent marks the interrupt in flight"
+        );
 
         // Every OTHER live state confirms first — including `working`, which the reply
         // gate (Ctrl-R) refuses. Interrupting live work is the whole point here.
@@ -1988,7 +2027,14 @@ mod tests {
             app.pending_interrupt.is_none(),
             "confirming closes the prompt"
         );
-        assert_eq!(app.status.as_deref(), Some(send::INTERRUPT_IN_FLIGHT));
+        assert!(
+            app.interrupting_on("w").is_some(),
+            "confirming marks the interrupt in flight"
+        );
+        assert_eq!(
+            app.status, None,
+            "no visible 'stopping…' label is set (option c): the badge covers it"
+        );
 
         // Esc -> dismiss, stop nothing.
         let mut app = App::new(vec![session("w")], Scope::All, PathBuf::from("/tmp"));
@@ -1999,6 +2045,106 @@ mod tests {
         let outcome = press(&mut app, KeyCode::Esc);
         assert!(matches!(outcome, Outcome::Continue));
         assert!(app.pending_interrupt.is_none(), "Esc dismisses the prompt");
+    }
+
+    /// A finished `InterruptFinished` carrying a STALE session id must not clear a
+    /// newer `app.interrupting` guard. The interrupt twin of the launch-identity
+    /// regression tests: the board may have moved on and dispatched another stop,
+    /// so attribution is by id, not by "any interrupt is in flight".
+    #[test]
+    fn a_stale_interrupt_finished_does_not_clear_a_newer_interrupting() {
+        let mut app = App::new(
+            vec![session("a"), session("b")],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
+        let live = {
+            let mut map = HashMap::new();
+            map.insert(
+                "a".to_string(),
+                ReportedAgent {
+                    kind: "background".to_string(),
+                    id: Some("job-a".to_string()),
+                    state: Some("done".to_string()),
+                    status: None,
+                    name: None,
+                },
+            );
+            map.insert(
+                "b".to_string(),
+                ReportedAgent {
+                    kind: "background".to_string(),
+                    id: Some("job-b".to_string()),
+                    state: Some("done".to_string()),
+                    status: None,
+                    name: None,
+                },
+            );
+            map
+        };
+        app.set_live_probe(move || live.clone());
+
+        // Dispatch the first interrupt for session a.
+        assert_eq!(app.selected.as_deref(), Some("a"));
+        assert!(
+            matches!(
+                press_ctrl(&mut app, KeyCode::Char('k')),
+                Outcome::Interrupt(_)
+            ),
+            "Ctrl-K on a done background agent dispatches immediately"
+        );
+        assert!(
+            app.interrupting_on("a").is_some(),
+            "the first interrupt is in flight"
+        );
+
+        // Move to b and dispatch a second interrupt.
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.selected.as_deref(), Some("b"));
+        assert!(
+            matches!(
+                press_ctrl(&mut app, KeyCode::Char('k')),
+                Outcome::Interrupt(_)
+            ),
+            "Ctrl-K on the second session dispatches a second stop"
+        );
+        assert!(
+            app.interrupting_on("b").is_some(),
+            "the second interrupt is now in flight"
+        );
+
+        // The first interrupt reports back. It must surface its result, but it must
+        // NOT clear the guard that belongs to the newer interrupt.
+        let out = handle_event(
+            &mut app,
+            AppEvent::InterruptFinished {
+                session_id: "a".to_string(),
+                status: "stopped".to_string(),
+                success: true,
+            },
+            Path::new("/tmp"),
+        );
+        assert!(matches!(out, Outcome::Continue));
+        assert!(
+            app.interrupting_on("b").is_some(),
+            "a stale interrupt result must not clear the newer interrupting guard"
+        );
+        assert!(app.interrupting_on("a").is_none());
+
+        // The newer interrupt's own completion clears the guard.
+        handle_event(
+            &mut app,
+            AppEvent::InterruptFinished {
+                session_id: "b".to_string(),
+                status: "stopped".to_string(),
+                success: true,
+            },
+            Path::new("/tmp"),
+        );
+        assert!(
+            app.interrupting.is_none(),
+            "the matching completion clears the guard"
+        );
     }
 
     /// While composing, ordinary keys edit the buffer, Ctrl-J inserts a newline,
@@ -2336,6 +2482,39 @@ mod tests {
         assert_eq!(app.status, None);
     }
 
+    /// The paste-too-long nudge is a transient confirmation, not a sticky refusal.
+    /// It expires after `STATUS_DWELL_TICKS` ticks so it does not squat on the
+    /// keymap row; a sticky status would survive the same dwell window.
+    #[test]
+    fn paste_too_long_nudge_expires_after_dwell() {
+        let huge = "x".repeat(PASTE_MAX_CHARS + 100);
+        let mut app = app_with("idle", None);
+        paste(&mut app, &huge);
+
+        assert_eq!(
+            app.status.as_deref(),
+            Some(paste_truncated_status().as_str()),
+            "the nudge appears immediately"
+        );
+        assert_eq!(
+            app.status_ttl,
+            Some(STATUS_DWELL_TICKS),
+            "the nudge is transient, not sticky"
+        );
+
+        // Drain the dwell window through the event loop (not direct tick_status),
+        // proving the dispatch wiring ages the paste nudge.
+        for _ in 0..STATUS_DWELL_TICKS {
+            handle_event(&mut app, AppEvent::Tick, Path::new("/tmp"));
+        }
+
+        assert_eq!(
+            app.status, None,
+            "the paste nudge must clear after STATUS_DWELL_TICKS ticks"
+        );
+        assert_eq!(app.status_ttl, None);
+    }
+
     /// The truncation status must name the CAP, so "some of it was dropped" becomes
     /// "here is exactly how much landed" — the number is the whole point of the
     /// message.
@@ -2374,7 +2553,7 @@ mod tests {
     }
 
     /// A non-empty compose Send re-reads the authoritative id from the file, builds
-    /// the send argv, sets the "sending…" status, closes compose, and returns
+    /// the send argv, marks the send in flight, closes compose, and returns
     /// `Outcome::Send` for the driver to spawn — the board never tears down.
     #[test]
     fn sending_a_compose_returns_a_send_request_and_clears_compose() {
@@ -2396,7 +2575,10 @@ mod tests {
         );
         assert_eq!(req.cwd, dir, "the child runs in the authoritative cwd");
         assert!(!app.is_composing(), "compose closes on send");
-        assert_eq!(app.status.as_deref(), Some(send::SEND_IN_FLIGHT));
+        assert!(
+            app.sending_to("sess-send-e2e").is_some(),
+            "the send is marked in flight at its real home (the preview pane)"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2486,7 +2668,8 @@ mod tests {
             &mut app,
             AppEvent::SendFinished {
                 session_id: "s".to_string(),
-                status: Some("sent — $0.0136".to_string()),
+                status: "sent — $0.0136".to_string(),
+                success: true,
             },
             Path::new("/tmp"),
         );
@@ -2525,7 +2708,8 @@ mod tests {
             &mut app,
             AppEvent::SendFinished {
                 session_id: "b".to_string(),
-                status: Some("sent".to_string()),
+                status: "sent".to_string(),
+                success: true,
             },
             Path::new("/tmp"),
         );
@@ -3619,6 +3803,68 @@ mod tests {
         assert_eq!(app.tick, 0, "the clock must wrap from u64::MAX back to 0");
     }
 
+    /// Task 3.10: the `AppEvent::Tick` wiring drives `tick_status`, so a transient
+    /// status expires after `STATUS_DWELL_TICKS` ticks while a sticky one stays.
+    #[test]
+    fn tick_event_expires_transient_status() {
+        let mut app = app_with("s", None);
+        app.set_status_transient("sent");
+        assert_eq!(app.status.as_deref(), Some("sent"));
+
+        for i in 0..STATUS_DWELL_TICKS {
+            assert_eq!(
+                app.status.as_deref(),
+                Some("sent"),
+                "transient status must survive tick {i}"
+            );
+            handle_event(&mut app, AppEvent::Tick, Path::new("/tmp"));
+        }
+        assert!(
+            app.status.is_none(),
+            "transient status must clear after STATUS_DWELL_TICKS Tick events"
+        );
+        assert!(app.status_ttl.is_none());
+    }
+
+    #[test]
+    fn tick_event_keeps_sticky_status() {
+        let mut app = app_with("s", None);
+        app.set_status("send failed: boom");
+
+        for i in 0..=STATUS_DWELL_TICKS {
+            assert_eq!(
+                app.status.as_deref(),
+                Some("send failed: boom"),
+                "sticky status must survive tick {i}"
+            );
+            handle_event(&mut app, AppEvent::Tick, Path::new("/tmp"));
+        }
+        assert_eq!(app.status.as_deref(), Some("send failed: boom"));
+    }
+
+    /// Task 3.12: a failure from the honesty seam (`status_for_output` on a
+    /// non-zero exit) is classified sticky, so it MUST survive the dwell window.
+    #[test]
+    fn failure_status_survives_the_dwell() {
+        let mut app = app_with("s", None);
+        let (status, success) = send::status_for_output(false, "", "boom");
+        assert!(!success, "the fixture must be a sticky failure");
+        app.set_status(status);
+
+        for i in 0..=STATUS_DWELL_TICKS {
+            assert!(
+                app.status.is_some(),
+                "failure status must survive tick {i}: {:?}",
+                app.status
+            );
+            handle_event(&mut app, AppEvent::Tick, Path::new("/tmp"));
+        }
+        assert!(
+            app.status.is_some(),
+            "failure status must still be present after the dwell"
+        );
+    }
+
     #[test]
     fn arrows_always_move() {
         assert_eq!(key_to_action(key(KeyCode::Up), true), Action::MoveUp);
@@ -4149,7 +4395,7 @@ mod tests {
     /// `Enter` in the draft pane launches in the BACKGROUND: it escalates to
     /// `Outcome::BgLaunch` (never `Outcome::Resume` — the board must not tear down),
     /// carrying `claude --agent <name> --bg <prompt>` run in the launch dir, and
-    /// sets the in-flight status.
+    /// marks the draft card launching in the preview pane.
     #[test]
     fn draft_enter_escalates_to_a_background_launch_not_a_resume() {
         let mut app = app_with("s", None);
@@ -4172,7 +4418,12 @@ mod tests {
             _ => panic!("a drafted prompt must escalate to a background launch"),
         }
         assert!(!app.is_composing(), "launching closes the draft pane");
-        assert_eq!(app.status.as_deref(), Some(send::BG_LAUNCH_IN_FLIGHT));
+        assert!(
+            app.draft
+                .as_ref()
+                .is_some_and(crate::tui::app::NewSessionDraft::is_launching),
+            "the draft card is marked launching in the preview pane"
+        );
         assert!(
             app.sending.is_none(),
             "a launch is not a reply: nothing to echo into a transcript"
@@ -4332,6 +4583,7 @@ mod tests {
             AppEvent::BgLaunchFinished {
                 launch_id: req.launch_id,
                 status: "background agent started".to_string(),
+                success: true,
             },
             Path::new("/tmp"),
         );
@@ -4529,6 +4781,7 @@ mod tests {
         assert!(!Outcome::Interrupt(crate::send::InterruptRequest {
             argv: vec!["claude".to_string()],
             cwd: PathBuf::from("/tmp"),
+            session_id: "s".to_string(),
         })
         .ends_board_session());
     }
@@ -4615,6 +4868,7 @@ mod tests {
             AppEvent::BgLaunchFinished {
                 launch_id: req.launch_id,
                 status: "background agent started".to_string(),
+                success: true,
             },
             Path::new("/tmp"),
         );
@@ -4643,6 +4897,7 @@ mod tests {
             AppEvent::BgLaunchFinished {
                 launch_id: req.launch_id,
                 status: "background agent started".to_string(),
+                success: true,
             },
             Path::new("/tmp"),
         );
@@ -4695,6 +4950,7 @@ mod tests {
             AppEvent::BgLaunchFinished {
                 launch_id: first.launch_id,
                 status: "background agent started".to_string(),
+                success: true,
             },
             Path::new("/tmp"),
         );
@@ -4715,6 +4971,7 @@ mod tests {
             AppEvent::BgLaunchFinished {
                 launch_id: second.launch_id,
                 status: "background agent started".to_string(),
+                success: true,
             },
             Path::new("/tmp"),
         );
@@ -4737,6 +4994,7 @@ mod tests {
                 // the status must land all the same.
                 launch_id: 0,
                 status: "background agent started".to_string(),
+                success: true,
             },
             Path::new("/tmp"),
         );

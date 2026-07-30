@@ -110,6 +110,12 @@ one place.
   case (a new `AgentActivity` bucket, a new refusal), every place that ENUMERATES
   that routing is stale until updated — the four above plus the gate tables in
   [DOMAIN.md](docs/agents/DOMAIN.md). A partial enumeration is a wrong one.
+- **STATUS-LINE OWNERSHIP.** `App::status` is a keypress-scoped surface: it carries
+  only **outcomes and refusals** (a send result, a launch warning, a paste nudge,
+  a resume refusal). A fact that is true over an interval lives in typed state and
+  renders on the surface that owns it. Failures and refusals stay sticky until the
+  next actionable keypress; confirmations and nudges expire after
+  `STATUS_DWELL_TICKS`. See [PATTERNS.md](docs/agents/PATTERNS.md#11-status-line-ownership).
 
 ## Engineering principles (mandatory)
 

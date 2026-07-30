@@ -70,11 +70,6 @@ pub const SEND_LIVE_REFUSED: &str =
     "This session is running as an agent — claude won't resume it in place. \
      Attach to answer it, or Fork (Ctrl-F) to branch a copy.";
 
-/// Board status while a send is in flight, set the moment the compose zone hands
-/// off. Replaced by [`status_for_send`]'s result (cost / error) when the
-/// [`AppEvent::SendFinished`] lands.
-pub const SEND_IN_FLIGHT: &str = "sending…";
-
 /// Neutral success status when the JSON parsed but carried no `total_cost_usd`,
 /// or when stdout was unreadable/empty (the child ran, but said nothing we can
 /// price). Never claims a cost it did not observe.
@@ -191,11 +186,6 @@ pub fn reply_gate(record: Option<&ReportedAgent>) -> ReplyGate {
     }
 }
 
-/// Board status while an interrupt (`Ctrl-K`) is in flight, set the moment the stop
-/// is dispatched. Replaced by [`status_for_stop`]'s result when the
-/// [`AppEvent::InterruptFinished`](crate::watch::AppEvent::InterruptFinished) lands.
-pub const INTERRUPT_IN_FLIGHT: &str = "stopping…";
-
 /// Refusal shown when `Ctrl-K` targets a session claude is NOT holding as an agent:
 /// there is no live job to stop. A resumable transcript on disk is not a running
 /// process, so stopping is meaningless — say so rather than shell out to fail.
@@ -310,12 +300,18 @@ pub struct SendRequest {
 /// only because a child needs some valid working directory. Using the launch dir
 /// (never a re-read of the session's `cwd`) is deliberate: a deleted worktree must
 /// never block stopping its still-live job.
+///
+/// Carries the target `session_id` so the completion event can be attributed to the
+/// surface that dispatched it and ignored if the board has moved on.
 #[derive(Debug, Clone)]
 pub struct InterruptRequest {
     /// The full argv to spawn; `argv[0]` is the program (always `claude`).
     pub argv: Vec<String>,
     /// A valid directory to run the child in (the launch dir). Never the process cwd.
     pub cwd: PathBuf,
+    /// Authoritative `sessionId` the completion event is keyed by, so the handler
+    /// can tell whether the finished interrupt targets the row currently on screen.
+    pub session_id: String,
 }
 
 /// Build the `claude` argv for a one-shot send:
@@ -386,31 +382,34 @@ pub fn plan_send(file: &Path) -> SendPlan {
     }
 }
 
-/// Map the `--output-format json` stdout to an optional board status.
+/// Map the `--output-format json` stdout to a board status and its class.
 ///
 /// FAIL-SOFT by construction (AGENTS.md): the payload is parsed as
 /// `serde_json::Value`, never a hard-typed struct, and no field access can panic
-/// on an absent/mistyped key. On `is_error == true` it returns an error status;
-/// on success it surfaces `total_cost_usd` (e.g. `"sent — $0.0136"`) when present,
-/// else a neutral `"sent"`; unparseable/empty stdout also degrades to the neutral
-/// `"sent"` (the child ran, but printed nothing we can read — never a panic,
-/// never a false cost). Always `Some` so the caller has a status to show; the
-/// `Option` keeps the type uniform with [`AppEvent::SendFinished`]'s field.
+/// on an absent/mistyped key. On `is_error == true` it returns an error status
+/// classified as **sticky**; on success it surfaces `total_cost_usd`
+/// (e.g. `"sent — $0.0136"`) when present, else a neutral `"sent"`, both
+/// classified as **transient**; unparseable/empty stdout also degrades to the
+/// neutral `"sent"` (the child ran, but printed nothing we can read — never a
+/// panic, never a false cost). Returns `(text, transient)` so the UI layer never
+/// has to infer the class from the text.
 #[must_use]
-pub fn status_for_send(raw_stdout: &str) -> Option<String> {
+pub fn status_for_send(raw_stdout: &str) -> (String, bool) {
     let Ok(value) = serde_json::from_str::<Value>(raw_stdout) else {
-        return Some(SEND_OK.to_string()); // unparseable / empty -> neutral, no panic
+        // Unparseable / empty -> neutral, no panic.
+        return (SEND_OK.to_string(), true);
     };
     if value.get("is_error").and_then(Value::as_bool) == Some(true) {
-        return Some(SEND_ERROR.to_string());
+        return (SEND_ERROR.to_string(), false);
     }
     match value.get("total_cost_usd").and_then(Value::as_f64) {
-        Some(cost) => Some(format!("sent — ${cost:.4}")),
-        None => Some(SEND_OK.to_string()),
+        Some(cost) => (format!("sent — ${cost:.4}"), true),
+        None => (SEND_OK.to_string(), true),
     }
 }
 
-/// Combine a finished send's exit status + captured streams into a board status.
+/// Combine a finished send's exit status + captured streams into a board status
+/// and its class.
 ///
 /// This is the honesty seam: a send that FAILED must never read as the neutral
 /// success. On a clean (zero) exit the JSON payload is mapped by
@@ -418,14 +417,13 @@ pub fn status_for_send(raw_stdout: &str) -> Option<String> {
 /// notably claude refusing to resume a session it holds as an agent, which exits
 /// `1` with the reason on `stderr` and nothing on `stdout` — the reason is
 /// surfaced by [`status_for_failed_send`] instead, so the user sees why rather
-/// than a false `"sent"`. Pure so both branches are unit-tested without spawning.
+/// than a false `"sent"`. Returns `(text, transient)`; failures are sticky.
 #[must_use]
-pub fn status_for_output(success: bool, stdout: &str, stderr: &str) -> String {
+pub fn status_for_output(success: bool, stdout: &str, stderr: &str) -> (String, bool) {
     if success {
-        // Always `Some` in practice; the fallback keeps the type total.
-        status_for_send(stdout).unwrap_or_else(|| SEND_OK.to_string())
+        status_for_send(stdout)
     } else {
-        status_for_failed_send(stdout, stderr)
+        (status_for_failed_send(stdout, stderr), false)
     }
 }
 
@@ -531,11 +529,12 @@ fn sanitize_status(s: &str) -> String {
 /// error is surfaced.
 pub fn spawn_send(req: SendRequest, tx: Sender<AppEvent>) {
     std::thread::spawn(move || {
-        let status = run_send(&req);
+        let (status, success) = run_send(&req);
         // A send failure means the receiver (TUI) has gone away; ignore it.
         let _ = tx.send(AppEvent::SendFinished {
             session_id: req.session_id,
             status,
+            success,
         });
     });
 }
@@ -552,14 +551,14 @@ pub fn spawn_send(req: SendRequest, tx: Sender<AppEvent>) {
 /// stderr and exits non-zero with an empty stdout, so nulling stderr / ignoring the
 /// code would report the neutral `"sent"` over a failed send — the false positive
 /// this avoids. What the user sees is always the REPLY's result.
-fn run_send(req: &SendRequest) -> Option<String> {
+fn run_send(req: &SendRequest) -> (String, bool) {
     if let Some(job_id) = req.stop_job.as_deref() {
         // Deregister the held job so `-p -r` is accepted; ignore the outcome (see above).
         let _ = run_child(&build_stop_argv(job_id), &req.cwd);
     }
     match run_child(&req.argv, &req.cwd) {
-        Ok((success, stdout, stderr)) => Some(status_for_output(success, &stdout, &stderr)),
-        Err(()) => Some(SEND_SPAWN_FAILED.to_string()),
+        Ok((success, stdout, stderr)) => status_for_output(success, &stdout, &stderr),
+        Err(()) => (SEND_SPAWN_FAILED.to_string(), false),
     }
 }
 
@@ -605,28 +604,33 @@ const STOP_FAILED_GENERIC: &str = "stop failed — claude could not stop this ag
 /// ignored.
 pub fn spawn_interrupt(req: InterruptRequest, tx: Sender<AppEvent>) {
     std::thread::spawn(move || {
-        let status = match run_child(&req.argv, &req.cwd) {
+        let (status, success) = match run_child(&req.argv, &req.cwd) {
             Ok((success, stdout, stderr)) => status_for_stop(success, &stdout, &stderr),
-            Err(()) => STOP_SPAWN_FAILED.to_string(),
+            Err(()) => (STOP_SPAWN_FAILED.to_string(), false),
         };
         // A send failure means the receiver (TUI) has gone away; ignore it.
-        let _ = tx.send(AppEvent::InterruptFinished { status });
+        let _ = tx.send(AppEvent::InterruptFinished {
+            session_id: req.session_id,
+            status,
+            success,
+        });
     });
 }
 
-/// Map a finished `claude stop` (exit status + captured streams) to a board status.
+/// Map a finished `claude stop` (exit status + captured streams) to a board status
+/// and its class.
 ///
-/// On a clean exit it is the neutral [`STOP_OK`]. On a NON-ZERO exit — notably
-/// stopping a job id that is already gone — claude's OWN reason is surfaced (the
-/// first non-empty stderr, else stdout, line), sanitized for the one-row status line
-/// (ANSI/control stripped, one line, length-capped — TERMINAL-SAFE STYLING), so a
-/// failed stop never reads as success. Reuses [`sanitize_status`]/[`strip_error_prefix`]
-/// so the interrupt and the send map external errors identically. Pure and
-/// unit-tested.
+/// On a clean exit it is the neutral [`STOP_OK`] (transient). On a NON-ZERO exit
+/// — notably stopping a job id that is already gone — claude's OWN reason is
+/// surfaced (the first non-empty stderr, else stdout, line), sanitized for the
+/// one-row status line (ANSI/control stripped, one line, length-capped —
+/// TERMINAL-SAFE STYLING), so a failed stop never reads as success (sticky).
+/// Reuses [`sanitize_status`]/[`strip_error_prefix`] so the interrupt and the send
+/// map external errors identically. Pure and unit-tested.
 #[must_use]
-pub fn status_for_stop(success: bool, stdout: &str, stderr: &str) -> String {
+pub fn status_for_stop(success: bool, stdout: &str, stderr: &str) -> (String, bool) {
     if success {
-        return STOP_OK.to_string();
+        return (STOP_OK.to_string(), true);
     }
     let line = stderr
         .lines()
@@ -634,18 +638,16 @@ pub fn status_for_stop(success: bool, stdout: &str, stderr: &str) -> String {
         .map(sanitize_status)
         .map(|l| strip_error_prefix(&l).to_string())
         .find(|l| !l.is_empty());
-    match line {
-        Some(line) => format!("{STOP_FAILED_PREFIX}{line}"),
-        None => STOP_FAILED_GENERIC.to_string(),
-    }
+    (
+        match line {
+            Some(line) => format!("{STOP_FAILED_PREFIX}{line}"),
+            None => STOP_FAILED_GENERIC.to_string(),
+        },
+        false,
+    )
 }
 
 // --- background-agent launch (the new-session Ctrl-N draft pane) ------------
-
-/// Board status while a background-agent launch is in flight, set the moment the
-/// draft pane hands off. Replaced by [`status_for_bg_launch`]'s result when the
-/// [`AppEvent::BgLaunchFinished`] lands. The sibling of [`SEND_IN_FLIGHT`].
-pub const BG_LAUNCH_IN_FLIGHT: &str = "starting the background agent…";
 
 /// Neutral success: `claude --bg` exited clean AND printed nothing on stderr, so
 /// the agent started with exactly what was asked for. Deliberately the NARROWEST
@@ -757,16 +759,16 @@ pub fn plan_bg_launch(launch_dir: &Path) -> Result<PathBuf, String> {
 }
 
 /// Map a finished background launch (exit status + captured streams) to a board
-/// status.
+/// status and its class.
 ///
 /// This is the launch's honesty seam, and it is NOT [`status_for_output`] with a
 /// different noun — it has a third outcome the send path does not need:
 ///
-/// | Exit | stderr (sanitized) | Status |
-/// | --- | --- | --- |
-/// | non-zero | anything | [`BG_LAUNCH_FAILED_PREFIX`] + claude's own reason |
-/// | zero | NON-EMPTY | [`BG_LAUNCH_WARNED_PREFIX`] + that reason |
-/// | zero | empty | [`BG_LAUNCH_OK`] |
+/// | Exit | stderr (sanitized) | Status | Class |
+/// | --- | --- | --- | --- |
+/// | non-zero | anything | [`BG_LAUNCH_FAILED_PREFIX`] + claude's own reason | sticky |
+/// | zero | NON-EMPTY | [`BG_LAUNCH_WARNED_PREFIX`] + that reason | sticky |
+/// | zero | empty | [`BG_LAUNCH_OK`] | transient |
 ///
 /// The middle row is the whole point. `claude --agent <unknown-name> --bg` exits
 /// **0**: it warns on stderr that it does not know the agent and then starts the
@@ -782,7 +784,7 @@ pub fn plan_bg_launch(launch_dir: &Path) -> Result<PathBuf, String> {
 /// control characters stripped (TERMINAL-SAFE STYLING), length-capped. Pure and
 /// unit-tested — no process is ever spawned.
 #[must_use]
-pub fn status_for_bg_launch(success: bool, stdout: &str, stderr: &str) -> String {
+pub fn status_for_bg_launch(success: bool, stdout: &str, stderr: &str) -> (String, bool) {
     // The first line of `text` that survives sanitizing, with claude's duplicated
     // `Error: ` label stripped. Sanitize FIRST so a colored label is visible to the
     // strip (the rule `status_for_failed_send` documents).
@@ -793,15 +795,18 @@ pub fn status_for_bg_launch(success: bool, stdout: &str, stderr: &str) -> String
             .find(|line| !line.is_empty())
     };
     if !success {
-        return match first_line(stderr).or_else(|| first_line(stdout)) {
-            Some(line) => format!("{BG_LAUNCH_FAILED_PREFIX}{line}"),
-            None => BG_LAUNCH_FAILED_GENERIC.to_string(),
-        };
+        return (
+            match first_line(stderr).or_else(|| first_line(stdout)) {
+                Some(line) => format!("{BG_LAUNCH_FAILED_PREFIX}{line}"),
+                None => BG_LAUNCH_FAILED_GENERIC.to_string(),
+            },
+            false,
+        );
     }
     // Zero exit: a clean stderr is the ONLY clean start (see the table above).
     match first_line(stderr) {
-        Some(line) => format!("{BG_LAUNCH_WARNED_PREFIX}{line}"),
-        None => BG_LAUNCH_OK.to_string(),
+        Some(line) => (format!("{BG_LAUNCH_WARNED_PREFIX}{line}"), false),
+        None => (BG_LAUNCH_OK.to_string(), true),
     }
 }
 
@@ -823,15 +828,16 @@ pub fn status_for_bg_launch(success: bool, stdout: &str, stderr: &str) -> String
 /// record already answers that and `store::preview` already renders it.
 pub fn spawn_bg_launch(req: BgLaunchRequest, tx: Sender<AppEvent>) {
     std::thread::spawn(move || {
-        let status = match run_child(&req.argv, &req.cwd) {
+        let (status, success) = match run_child(&req.argv, &req.cwd) {
             Ok((success, stdout, stderr)) => status_for_bg_launch(success, &stdout, &stderr),
-            Err(()) => BG_LAUNCH_SPAWN_FAILED.to_string(),
+            Err(()) => (BG_LAUNCH_SPAWN_FAILED.to_string(), false),
         };
         // A send failure means the receiver (TUI) has gone away; ignore it. The
         // request's own id rides back so the board can tell WHICH dispatch this is.
         let _ = tx.send(AppEvent::BgLaunchFinished {
             launch_id: req.launch_id,
             status,
+            success,
         });
     });
 }
@@ -886,7 +892,7 @@ mod tests {
         let raw = r#"{"type":"result","subtype":"success","is_error":false,
                       "session_id":"s","num_turns":2,"total_cost_usd":0.0136,
                       "result":"done"}"#;
-        let status = status_for_send(raw).expect("always Some");
+        let (status, _) = status_for_send(raw);
         assert!(
             status.contains("0.0136"),
             "the cost must be surfaced: {status}"
@@ -904,7 +910,7 @@ mod tests {
     fn status_reports_an_error_payload() {
         let raw = r#"{"type":"result","is_error":true,"total_cost_usd":0.01,
                       "result":"tool blew up"}"#;
-        let status = status_for_send(raw).expect("always Some");
+        let (status, _) = status_for_send(raw);
         let lower = status.to_lowercase();
         assert!(
             lower.contains("error") || lower.contains("fail"),
@@ -933,7 +939,7 @@ mod tests {
             r#"{"total_cost_usd":"not-a-number"}"#, // mistyped cost -> neutral, no panic
             r#"{"is_error":"yes"}"#,                // mistyped flag -> not treated as error
         ] {
-            let status = status_for_send(raw).expect("neutral fallback is still Some");
+            let (status, _) = status_for_send(raw);
             assert!(
                 status.starts_with("sent"),
                 "unreadable stdout must degrade to a neutral status, got {status:?} for {raw:?}"
@@ -1142,9 +1148,9 @@ mod tests {
     /// stripped; an empty failure degrades to the generic message.
     #[test]
     fn status_for_stop_maps_success_and_failure() {
-        assert_eq!(status_for_stop(true, "", ""), STOP_OK);
+        assert_eq!(status_for_stop(true, "", ""), (STOP_OK.to_string(), true));
 
-        let status = status_for_stop(false, "", "Error: No job matching 70933ea6");
+        let (status, _) = status_for_stop(false, "", "Error: No job matching 70933ea6");
         assert!(
             status.starts_with(STOP_FAILED_PREFIX),
             "a failed stop must read as a failure: {status}"
@@ -1162,7 +1168,10 @@ mod tests {
             "a failed stop must NEVER read as stopped: {status}"
         );
 
-        assert_eq!(status_for_stop(false, "   \n", "  \n"), STOP_FAILED_GENERIC);
+        assert_eq!(
+            status_for_stop(false, "   \n", "  \n"),
+            (STOP_FAILED_GENERIC.to_string(), false)
+        );
     }
 
     /// The honesty seam: a NON-ZERO send exit must surface claude's OWN reason, not
@@ -1175,7 +1184,7 @@ mod tests {
         let stderr = "Error: Session abc is currently running as a background agent \
                       (bg). Use `claude agents` to find and attach to it, or add \
                       --fork-session to branch off a copy.";
-        let status = status_for_output(false, "", stderr);
+        let (status, _) = status_for_output(false, "", stderr);
         assert!(
             status.starts_with(SEND_FAILED_PREFIX),
             "a failed send must read as a failure, got {status:?}"
@@ -1196,7 +1205,7 @@ mod tests {
 
         // A clean exit is unchanged: the cost still comes through.
         let ok = status_for_output(true, r#"{"is_error":false,"total_cost_usd":0.0136}"#, "");
-        assert_eq!(ok, "sent — $0.0136");
+        assert_eq!(ok, ("sent — $0.0136".to_string(), true));
     }
 
     /// A non-zero exit with NO readable stdout/stderr degrades to the generic
@@ -1206,18 +1215,18 @@ mod tests {
     fn failed_send_fallbacks_and_is_error_precedence() {
         assert_eq!(
             status_for_output(false, "", "   \n  \n"),
-            SEND_FAILED_GENERIC
+            (SEND_FAILED_GENERIC.to_string(), false)
         );
         assert_eq!(
             status_for_output(false, "not json", ""),
-            SEND_FAILED_GENERIC
+            (SEND_FAILED_GENERIC.to_string(), false)
         );
         let from_json = status_for_output(
             false,
             r#"{"is_error":true,"result":"tool exploded"}"#,
             "some stderr noise",
         );
-        assert_eq!(from_json, "send failed: tool exploded");
+        assert_eq!(from_json, ("send failed: tool exploded".to_string(), false));
     }
 
     /// A raw ANSI escape / control chars from claude's stderr must never reach the
@@ -1226,7 +1235,7 @@ mod tests {
     #[test]
     fn failed_send_strips_ansi_and_control_chars_from_the_reason() {
         let stderr = "\u{1b}[33mError: it \t broke\u{1b}[39m\nsecond line";
-        let status = status_for_output(false, "", stderr);
+        let (status, _) = status_for_output(false, "", stderr);
         assert_eq!(status, "send failed: it broke");
         assert!(
             !status.contains('\u{1b}') && !status.contains('['),
@@ -1362,21 +1371,22 @@ mod tests {
         let status = status_for_bg_launch(true, "job 70933ea6 started", stderr);
 
         assert!(
-            status.starts_with(BG_LAUNCH_WARNED_PREFIX),
+            status.0.starts_with(BG_LAUNCH_WARNED_PREFIX),
             "a warned launch must read as started-but, got {status:?}"
         );
         assert!(
-            status.contains("unknown agent"),
-            "it must quote claude's own warning: {status}"
+            status.0.contains("unknown agent"),
+            "it must quote claude's own warning: {status:?}"
         );
         assert_ne!(
-            status, BG_LAUNCH_OK,
+            status,
+            (BG_LAUNCH_OK.to_string(), true),
             "a zero exit is NOT enough to claim a clean start"
         );
         // The user must still learn the agent IS running — this is not a failure.
         assert!(
-            !status.starts_with(BG_LAUNCH_FAILED_PREFIX),
-            "a warned launch is not a failed one: {status}"
+            !status.0.starts_with(BG_LAUNCH_FAILED_PREFIX),
+            "a warned launch is not a failed one: {status:?}"
         );
     }
 
@@ -1388,14 +1398,17 @@ mod tests {
     fn status_for_bg_launch_maps_clean_success_and_failure() {
         // Zero exit, nothing on stderr -> the neutral success. Whitespace-only
         // stderr is "nothing" too (it survives no sanitize).
-        assert_eq!(status_for_bg_launch(true, "started", ""), BG_LAUNCH_OK);
+        assert_eq!(
+            status_for_bg_launch(true, "started", ""),
+            (BG_LAUNCH_OK.to_string(), true)
+        );
         assert_eq!(
             status_for_bg_launch(true, "started", "  \n \n"),
-            BG_LAUNCH_OK
+            (BG_LAUNCH_OK.to_string(), true)
         );
 
         // Non-zero -> claude's reason, prefixed as a failure.
-        let status = status_for_bg_launch(false, "", "Error: not a git repository");
+        let (status, _) = status_for_bg_launch(false, "", "Error: not a git repository");
         assert!(
             status.starts_with(BG_LAUNCH_FAILED_PREFIX),
             "a failed launch must read as a failure: {status}"
@@ -1417,11 +1430,11 @@ mod tests {
         // failure degrades to the generic message rather than a success.
         assert_eq!(
             status_for_bg_launch(false, "it blew up", ""),
-            format!("{BG_LAUNCH_FAILED_PREFIX}it blew up")
+            (format!("{BG_LAUNCH_FAILED_PREFIX}it blew up"), false)
         );
         assert_eq!(
             status_for_bg_launch(false, "  \n", " \n"),
-            BG_LAUNCH_FAILED_GENERIC
+            (BG_LAUNCH_FAILED_GENERIC.to_string(), false)
         );
     }
 
@@ -1434,16 +1447,16 @@ mod tests {
         let warned = status_for_bg_launch(true, "", noisy);
         assert_eq!(
             warned,
-            format!("{BG_LAUNCH_WARNED_PREFIX}Warning: it broke")
+            (format!("{BG_LAUNCH_WARNED_PREFIX}Warning: it broke"), false)
         );
         let failed = status_for_bg_launch(false, "", noisy);
         assert_eq!(
             failed,
-            format!("{BG_LAUNCH_FAILED_PREFIX}Warning: it broke")
+            (format!("{BG_LAUNCH_FAILED_PREFIX}Warning: it broke"), false)
         );
         for status in [&warned, &failed] {
             assert!(
-                !status.contains('\u{1b}') && !status.contains('['),
+                !status.0.contains('\u{1b}') && !status.0.contains('['),
                 "no escape residue may remain: {status:?}"
             );
         }
