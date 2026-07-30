@@ -88,9 +88,12 @@ pub enum AppEvent {
     SendFinished {
         /// Authoritative `sessionId` the send targeted.
         session_id: String,
-        /// Mapped board status for the completed send (`None` only if there was
-        /// nothing to say).
-        status: Option<String>,
+        /// Mapped board status for the completed send.
+        status: String,
+        /// Whether the status is a transient confirmation (`true`) or a sticky
+        /// failure/refusal (`false`). Classified by the send mapper so the UI never
+        /// infers it from the text.
+        success: bool,
     },
     /// A one-shot interrupt (`claude stop <job-id>`) finished, delivered OFF the UI
     /// thread by the detached interrupt driver (see [`crate::send::spawn_interrupt`]).
@@ -98,11 +101,20 @@ pub enum AppEvent {
     /// Like [`SendFinished`](Self::SendFinished) it fires EXACTLY ONCE per interrupt,
     /// from a thread spawned for that one stop. `status` is the mapped result
     /// (`"stopped"` on success, a reason on failure — see
-    /// [`crate::send::status_for_stop`]); there is nothing to key by row because
-    /// stopping leaves the transcript unchanged.
+    /// [`crate::send::status_for_stop`]). The transcript itself is unchanged by
+    /// stopping, so there is nothing to reconcile beyond surfacing the result — but
+    /// the completion still carries the target `session_id` so the handler only
+    /// clears the in-flight guard when the interrupt that finished is the one the
+    /// board is still tracking, and a stale result cannot land on a surface that has
+    /// moved on.
     InterruptFinished {
+        /// Authoritative `sessionId` the interrupt targeted.
+        session_id: String,
         /// Mapped board status for the completed interrupt.
         status: String,
+        /// Whether the status is a transient confirmation (`true`) or a sticky
+        /// failure/refusal (`false`).
+        success: bool,
     },
     /// A one-shot background-agent launch (`claude [--agent <name>] --bg <prompt>`)
     /// finished, delivered OFF the UI thread by the detached launch driver (see
@@ -125,6 +137,10 @@ pub enum AppEvent {
         launch_id: u64,
         /// Mapped board status for the completed launch.
         status: String,
+        /// Whether the status is a transient clean start (`true`) or a sticky
+        /// warned/failed start (`false`). The warned case stays sticky so a silent
+        /// downgrade is never auto-dismissed.
+        success: bool,
     },
     /// A periodic wake-up. The update loop does nothing costly on this.
     Tick,

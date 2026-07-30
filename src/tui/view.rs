@@ -940,7 +940,7 @@ fn blink_visible(tick: u64) -> bool {
 ///
 /// An IN-FLIGHT quick-reply send takes precedence: while `App::sending` names the
 /// selected session there is NO pinned banner at all — this returns `None`, and
-/// the sending/cooking indicator renders INLINE at the transcript's tail instead
+/// the `cooking…` placeholder renders INLINE at the transcript's tail instead
 /// ([`sending_tail`]), so the exchange reads as ordinary turns. Returning `None`
 /// is also what keeps the render and the click hit-test agreeing on the geometry.
 pub(crate) fn preview_banner(app: &App) -> Option<Line<'static>> {
@@ -955,7 +955,7 @@ pub(crate) fn preview_banner(app: &App) -> Option<Line<'static>> {
     }
     let selected = app.selected.as_deref()?;
     // A quick-reply in flight owns the preview: the message and the
-    // sending/cooking indicator render INLINE at the transcript's tail
+    // `cooking…` placeholder render INLINE at the transcript's tail
     // ([`sending_tail`] / [`preview::pending_reply_turns`]), so there is no pinned
     // banner row. The click hit-test asks THIS fn for the geometry, so returning
     // `None` here keeps render and hit-test agreeing that no banner is drawn.
@@ -991,9 +991,13 @@ fn spinner_frame(tick: u64) -> &'static str {
 /// in flight for the selected row.
 ///
 /// So the reply feels instant, the message you just sent shows immediately under a
-/// synthetic `▶ you` turn, followed by a live `● claude` "sending…/cooking…"
-/// placeholder — the same two phases the pinned banner once showed, now INLINE in
-/// the transcript flow (see [`preview::pending_reply_turns`]).
+/// synthetic `▶ you` turn, followed by a live `● claude` **cooking…** placeholder —
+/// INLINE in the transcript flow (see [`preview::pending_reply_turns`]).
+///
+/// The placeholder says one true thing only: it is claude's pending turn. The old
+/// two-phase "sending… / cooking…" wording derived from a ≤1s-stale agents poll,
+/// nothing branched on the distinction, and "sending" named what snapback did, not
+/// what claude was doing — so it collapsed to a single `cooking…` label.
 ///
 /// The `▶ you` echo is dropped the instant claude writes the REAL user turn to
 /// disk — detected by the session's turn count growing past the count captured at
@@ -1011,13 +1015,10 @@ fn sending_tail(app: &App, inner_width: u16) -> Option<Vec<Line<'static>>> {
         .session_by_id(selected)
         .is_some_and(|s| s.msg_count > sending.baseline_msg_count);
     let echo = (!landed).then_some(sending.message.as_str());
-    // "sending…" until claude reports the session working, then "cooking…", so the
-    // two phases still read distinctly.
-    let cooking = app
-        .reported_agent(selected)
-        .is_some_and(|a| agents::classify(a) == AgentActivity::Working);
-    let phase = if cooking { "cooking" } else { "sending" };
-    let label = format!("{} {phase}\u{2026}", spinner_frame(app.tick));
+    // One label only: a `● claude` turn must describe what claude is doing. The
+    // old two-phase wording derived from a ≤1s-stale agents poll, nothing branched
+    // on it, and "sending" named what snapback did, not claude.
+    let label = format!("{} {REPLY_COOKING_LABEL}", spinner_frame(app.tick));
     Some(preview::pending_reply_turns(
         echo,
         &label,
@@ -1160,6 +1161,13 @@ const DRAFT_CARD_SEPARATOR: &str = " \u{b7} ";
 /// Prefixed by the shared [`spinner_frame`], so it animates off the board's own
 /// tick — no second cadence (PATTERNS §7).
 const DRAFT_CARD_LAUNCHING: &str = "starting in the background\u{2026}";
+
+/// The placeholder under a `● claude` turn while a quick-reply send is in flight.
+///
+/// It names what **claude** is doing on its pending turn, never what snapback did:
+/// "sending" would describe snapback's dispatch, which is already represented by the
+/// `▶ you` echo directly above. The word is therefore "cooking" and nothing else.
+const REPLY_COOKING_LABEL: &str = "cooking\u{2026}";
 
 /// The compose hints of a BACKGROUND draft. One const, two surfaces: the help line
 /// ([`compose_hint`]) and the draft card, which must not restate them differently.
@@ -1842,8 +1850,8 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let line = if let Some(status) = &app.status {
-        // A transient status (a refusal, or a send's "sending…" / cost / error)
-        // wins the line, flattened to a single row.
+        // A transient status (a refusal, or a send's cost / error) wins the
+        // line, flattened to a single row.
         let flat = status.split_whitespace().collect::<Vec<_>>().join(" ");
         Line::from(vec![Span::styled(
             flat,
@@ -3740,8 +3748,9 @@ mod tests {
 
     /// While a send is in flight for the selected session the pinned banner is
     /// SUPPRESSED (so it cannot desync the hit-test) and the send renders INLINE at
-    /// the transcript tail: the echoed message under a `▶ you` turn plus a
-    /// "sending…" placeholder that becomes "cooking…" once claude reports working.
+    /// the transcript tail: the echoed message under a `▶ you` turn plus a single
+    /// `● claude` **cooking…** placeholder. The placeholder no longer depends on the
+    /// agents poll; it reads `cooking…` before and after claude reports working.
     /// The `▶ you` echo drops the instant the real turn lands on disk; when the send
     /// finishes the banner yields back to the agent status.
     #[test]
@@ -3773,7 +3782,7 @@ mod tests {
         assert!(sending_tail(&app, 80).is_none());
 
         // In flight, nothing on disk yet (msg_count still the baseline) -> the
-        // pinned banner is suppressed and the tail echoes the message + "sending…".
+        // pinned banner is suppressed and the tail echoes the message + "cooking…".
         app.sending = Some(Sending {
             session_id: "sess-normal-1".to_string(),
             message: "please summarize this".to_string(),
@@ -3789,12 +3798,13 @@ mod tests {
             "the sent message is echoed under a `you` turn: {tail:?}"
         );
         assert!(
-            tail.contains("\u{25cf} claude") && tail.contains("sending"),
-            "a pending claude turn reads 'sending': {tail:?}"
+            tail.contains("\u{25cf} claude") && tail.contains("cooking"),
+            "a pending claude turn reads 'cooking': {tail:?}"
         );
-        assert!(!tail.contains("cooking"));
+        assert!(!tail.contains("sending"));
 
-        // Once claude reports it working -> "cooking…".
+        // Once claude reports it working the placeholder STILL reads "cooking…" —
+        // the label is poll-independent.
         let mut reported = HashMap::new();
         reported.insert(
             "sess-normal-1".to_string(),
@@ -3808,7 +3818,10 @@ mod tests {
         );
         app.set_reported_agents(reported);
         let tail = flatten_lines(&sending_tail(&app, 80).expect("still in flight"));
-        assert!(tail.contains("cooking"), "working -> 'cooking': {tail:?}");
+        assert!(
+            tail.contains("cooking") && !tail.contains("sending"),
+            "reported working must still read 'cooking', never 'sending': {tail:?}"
+        );
 
         // The real user turn lands on disk (turn count grows past the baseline) ->
         // the echo steps aside, leaving only the pending claude placeholder so the
@@ -3836,6 +3849,122 @@ mod tests {
         assert!(
             !banner_text.contains("sending") && !banner_text.contains("cooking"),
             "no longer in flight: {banner_text:?}"
+        );
+    }
+
+    /// A dispatched quick reply is reported EXACTLY ONCE: on the preview pane's
+    /// `sending_tail`, not duplicated on the help line. The help line keeps its
+    /// ordinary keymap cheat sheet while the reply is in flight.
+    #[test]
+    fn a_dispatched_reply_is_reported_on_the_preview_not_the_help_line() {
+        use super::super::app::Sending;
+
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.selected = Some("sess-normal-1".to_string());
+        app.sending = Some(Sending {
+            session_id: "sess-normal-1".to_string(),
+            message: "please summarize this".to_string(),
+            baseline_msg_count: 0,
+        });
+
+        let width = 80u16;
+        let height = 20u16;
+        let buffer = drawn_board(&mut app, width, height);
+        let help_row = (0..width)
+            .map(|x| {
+                buffer
+                    .cell((x, height - 1))
+                    .map(|c| c.symbol())
+                    .unwrap_or(" ")
+            })
+            .collect::<String>();
+        assert!(
+            !help_row.contains("cooking"),
+            "the help line must not show the in-flight reply: {help_row:?}"
+        );
+
+        let board_text = (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            board_text.contains("please summarize this"),
+            "the echoed message must appear in the preview pane: {board_text}"
+        );
+        assert!(
+            board_text.contains("cooking"),
+            "the in-flight placeholder must appear in the preview pane: {board_text}"
+        );
+    }
+
+    /// Task 3.11 (view side): an empty-buffer `Enter` in compose sets a transient
+    /// nudge that wins the help line over the compose hint; the next compose
+    /// keystroke clears it and the help line shows the hint again — specifically
+    /// the reply's "Enter send" wording.
+    #[test]
+    fn empty_enter_nudge_yields_back_the_compose_hint_on_the_help_line() {
+        use crate::tui::compose::COMPOSE_EMPTY_HINT;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (width, height) = DOCK_BOARD;
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        crate::tui::compose::open(&mut app, "sess-normal-1".to_string(), None);
+        assert!(
+            !compose_uses_bottom_bar(app.is_composing(), height),
+            "this board must dock so the help line is the ordinary one"
+        );
+
+        let help_row = |buffer: &ratatui::buffer::Buffer| -> String {
+            full_row_text(buffer, height - 1, width)
+        };
+
+        // Empty buffer: Enter sets the transient nudge and the help line shows it.
+        let _ = crate::tui::compose::handle_compose_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert_eq!(app.status.as_deref(), Some(COMPOSE_EMPTY_HINT));
+        let buffer = drawn_board(&mut app, width, height);
+        let nudge_row = help_row(&buffer);
+        assert!(
+            nudge_row.contains(COMPOSE_EMPTY_HINT),
+            "the help line must show the empty-buffer nudge: {nudge_row:?}"
+        );
+        assert!(
+            !nudge_row.contains("Enter send"),
+            "the nudge must hide the compose hint: {nudge_row:?}"
+        );
+
+        // The next keystroke clears the status; the help line returns to the compose hint.
+        let _ = crate::tui::compose::handle_compose_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        );
+        assert!(
+            app.status.is_none(),
+            "the next keystroke must clear the nudge"
+        );
+        let buffer = drawn_board(&mut app, width, height);
+        let hint_row = help_row(&buffer);
+        assert!(
+            hint_row.contains("Enter send"),
+            "the help line must show the compose hint again: {hint_row:?}"
+        );
+        assert!(
+            !hint_row.contains(COMPOSE_EMPTY_HINT),
+            "the expired nudge must not linger: {hint_row:?}"
         );
     }
 
@@ -4109,8 +4238,8 @@ mod tests {
     ///
     /// They are appended to the transcript AFTER the cache was filled, so a height
     /// read from the cache alone is short by exactly the tail — and the message the
-    /// user just sent, plus the live "sending…" line, sits below the bottom of the
-    /// pane while it is the one thing they are watching for.
+    /// user just sent, plus the live "cooking…" placeholder, sits below the bottom
+    /// of the pane while it is the one thing they are watching for.
     #[test]
     fn an_in_flight_reply_tail_counts_toward_the_scrolled_height() {
         use super::super::app::Sending;
@@ -4137,8 +4266,8 @@ mod tests {
             "the resolved offset must be measured over the transcript AND the tail"
         );
         assert!(
-            rows.last().is_some_and(|row| row.contains("sending")),
-            "the live 'sending…' line must be the pane's bottom row; drawn rows: {rows:?}"
+            rows.last().is_some_and(|row| row.contains("cooking")),
+            "the live 'cooking…' placeholder must be the pane's bottom row; drawn rows: {rows:?}"
         );
     }
 

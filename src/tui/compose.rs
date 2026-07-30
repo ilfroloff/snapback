@@ -48,7 +48,7 @@ use super::update::Outcome;
 /// Status shown when Send is pressed on an empty / whitespace-only reply buffer:
 /// the compose zone stays open (nothing was sent), so this is a gentle nudge
 /// rather than a refusal.
-const COMPOSE_EMPTY_HINT: &str = "nothing to send — type a message first";
+pub(crate) const COMPOSE_EMPTY_HINT: &str = "nothing to send — type a message first";
 
 /// The [`COMPOSE_EMPTY_HINT`] of the background draft: `Enter` on an empty buffer
 /// keeps the pane open rather than launching. Its own const because the nudge is
@@ -302,6 +302,10 @@ pub fn open_background(app: &mut App, agent: Option<String>) {
 /// with editor meaning we override: `Enter` (Send) and the newline chords never
 /// reach `input`, so it never mistakes `Enter` for a newline.
 pub fn handle_compose_key(app: &mut App, key: KeyEvent) -> Outcome {
+    // Compose owns the keyboard while open; clear any transient status first, the
+    // same way `update::dispatch` clears before a board action. The Enter that sets
+    // a nudge still leaves it visible, and the next keystroke clears it.
+    app.clear_status();
     match compose_key_to_action(key) {
         ComposeAction::Newline => {
             if let Some(compose) = app.compose.as_mut() {
@@ -381,8 +385,8 @@ fn submit_compose(app: &mut App) -> Outcome {
 /// [`AppEvent::BgLaunchFinished`](crate::watch::AppEvent::BgLaunchFinished).
 /// An empty/whitespace draft keeps the pane open with a gentle nudge (a background
 /// agent with no prompt would do nothing); otherwise the launch dir is gated
-/// ([`send::plan_bg_launch`]), the argv built, the in-flight status set, and a
-/// [`BgLaunchRequest`] handed to the driver.
+/// ([`send::plan_bg_launch`]), the argv built, the draft card is marked launching
+/// in place, and a [`BgLaunchRequest`] handed to the driver.
 ///
 /// The ONE thing recorded is the AGENT, as the pick `Ctrl-N`'s picker pre-highlights
 /// next time — because this is a real launch, and that memory means "the agent of
@@ -397,7 +401,7 @@ fn submit_compose(app: &mut App) -> Outcome {
 fn submit_bg_launch(app: &mut App, message: String, agent: Option<String>) -> Outcome {
     if message.trim().is_empty() {
         // Nothing to run: keep the draft pane open so the user can type.
-        app.set_status(COMPOSE_EMPTY_BG_HINT);
+        app.set_status_transient(COMPOSE_EMPTY_BG_HINT);
         return Outcome::Continue;
     }
     app.set_last_new_agent(agent.clone());
@@ -411,7 +415,6 @@ fn submit_bg_launch(app: &mut App, message: String, agent: Option<String>) -> Ou
             // the completion can be matched back to it rather than to whatever
             // surface is open by then.
             let launch_id = app.dispatch_draft();
-            app.set_status(send::BG_LAUNCH_IN_FLIGHT);
             Outcome::BgLaunch(BgLaunchRequest {
                 launch_id,
                 argv,
@@ -473,9 +476,9 @@ fn open_interactive(app: &mut App) -> Outcome {
 ///
 /// Guards an empty/whitespace buffer (keep composing, gentle status). Otherwise it
 /// re-reads the AUTHORITATIVE `(cwd, session_id)` from inside the file
-/// ([`send::plan_send`]) — never the stale in-memory copy — builds the argv, sets
-/// the "sending…" status, clears the compose state, and hands a [`SendRequest`] to
-/// the driver as [`Outcome::Send`]. A refusal (deleted worktree / unreadable file)
+/// ([`send::plan_send`]) — never the stale in-memory copy — builds the argv,
+/// marks the send in flight, clears the compose state, and hands a [`SendRequest`]
+/// to the driver as [`Outcome::Send`]. A refusal (deleted worktree / unreadable file)
 /// sets a board status and stays on the board.
 fn submit_reply(
     app: &mut App,
@@ -485,7 +488,7 @@ fn submit_reply(
 ) -> Outcome {
     if message.trim().is_empty() {
         // Nothing to send: keep the compose zone open so the user can type.
-        app.set_status(COMPOSE_EMPTY_HINT);
+        app.set_status_transient(COMPOSE_EMPTY_HINT);
         return Outcome::Continue;
     }
 
@@ -505,11 +508,10 @@ fn submit_reply(
         } => {
             let argv = send::build_send_argv(&authoritative_id, &message);
             app.close_compose();
-            app.set_status(send::SEND_IN_FLIGHT);
             // Mark the send in flight so the preview echoes the message under a
-            // synthetic `▶ you` turn plus a live "sending… / cooking…" indicator
-            // until the completion event lands. `baseline_msg_count` lets the echo
-            // step aside the instant claude writes the real turn to disk.
+            // synthetic `▶ you` turn plus a live `cooking…` indicator until the
+            // completion event lands. `baseline_msg_count` lets the echo step aside
+            // the instant claude writes the real turn to disk.
             app.sending = Some(super::app::Sending {
                 session_id: authoritative_id.clone(),
                 message,
@@ -532,7 +534,11 @@ fn submit_reply(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
+    use crate::store::Session;
+    use crate::tui::app::Scope;
 
     /// Rows the tests below draw the editor into. The widget's screen map — and so
     /// [`ComposeState::screen_rows`] — is built from the drawn WIDTH alone, never the
@@ -811,5 +817,46 @@ mod tests {
             before,
             "measuring the draft must not relocate the caret"
         );
+    }
+
+    /// Task 3.11: `Enter` on an empty reply buffer sets a transient nudge, and the
+    /// NEXT compose keystroke clears it so the compose hint is visible again.
+    #[test]
+    fn empty_enter_nudge_is_cleared_by_next_compose_keystroke() {
+        let mut app = App::new(
+            vec![Session {
+                file: PathBuf::from("/tmp/s.jsonl"),
+                session_id: "s".to_string(),
+                cwd: PathBuf::from("/tmp/s"),
+                git_branch: Some("main".to_string()),
+                timestamp: None,
+                repo: "repo".to_string(),
+                label: "label s".to_string(),
+                root_uuid: None,
+                msg_count: 0,
+                content_index: String::new(),
+            }],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
+        app.open_compose(ComposeState::new_reply("s".to_string(), None), None);
+
+        // Empty buffer: Enter sets the transient nudge.
+        let out = handle_compose_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(out, Outcome::Continue));
+        assert_eq!(app.status.as_deref(), Some(COMPOSE_EMPTY_HINT));
+        assert!(app.status_ttl.is_some());
+
+        // The next keystroke clears the status, mirroring `update::dispatch`.
+        let out = handle_compose_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        );
+        assert!(matches!(out, Outcome::Continue));
+        assert!(
+            app.status.is_none(),
+            "the next compose keystroke must clear the nudge"
+        );
+        assert!(app.status_ttl.is_none());
     }
 }

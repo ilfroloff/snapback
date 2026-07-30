@@ -272,10 +272,11 @@ while the board stays up. The box is a real multiline editor — arrows move the
 caret, long lines soft-wrap, and it grows from one line as you type (`Ctrl-J` or
 `Alt+Enter` for a newline, `Enter` to send). The moment you send, your message
 appears in the preview under a **you** turn, followed by a live **claude
-sending… / cooking…** placeholder — so the exchange reads normally while the reply
-is still in flight. The placeholder is replaced in place as `claude` writes the
+cooking…** placeholder — so the exchange reads normally while the reply is still
+in flight. The placeholder is replaced in place as `claude` writes the
 real turns, and the status line reports what the reply cost (or the reason if it
-fails).
+fails). Confirmations and nudges fade after a few seconds; failures and refusals
+stay until you press a key, so nothing is silently downgraded.
 
 Background agents get special handling, because `claude` won't resume a session
 it's still holding as an agent. An agent whose run is **over** — `done`, or

@@ -996,8 +996,8 @@ network round trip, the reload path alone would leave the preview showing stale
 content for the first seconds after Send. So while the send is in flight (`App::sending`,
 which carries the message and the session's turn count AT SEND TIME), the preview
 appends two synthetic turns via `store::preview::pending_reply_turns`: the sent
-message under a `▶ you` turn plus a live `● claude` **sending… / cooking…**
-placeholder, and it FOLLOWS the bottom so both stay in view. The `▶ you` echo is
+message under a `▶ you` turn plus a live `● claude` **cooking…** placeholder,
+and it FOLLOWS the bottom so both stay in view. The `▶ you` echo is
 dropped the instant the real turn lands on disk — detected by the reloaded
 `Session::msg_count` growing past `Sending::baseline_msg_count` — so the real turn
 (styled identically) takes its place with no doubling; the placeholder stays until
@@ -1014,6 +1014,18 @@ live agent.** `claude -p -r <id>` on such a session exits non-zero, verbatim:
 This holds in EVERY held state — `done` included: a just-finished background job
 stays a registered agent (in the bare `agents::live_agents` list) until claude
 reaps it, and claude refuses it exactly like a working one.
+
+**Status-line ownership.** The help line below the search box is a keypress-scoped
+surface: it carries only **outcomes and refusals** (a send result, a launch
+warning, a paste-too-long nudge, a resume refusal). A fact that is true over an
+interval lives in typed state and renders on the pane that owns it: the quick
+reply's in-flight echo lives in `App::sending` and renders **inline** in the
+preview; a background-agent launch lives in `App::draft.launch_id` and renders on
+the draft card. `App::status` therefore never shows a transient `"sending…"` or
+`"starting…"` label; those are already visible on the surfaces that own them.
+Confirmations and nudges expire after `STATUS_DWELL_TICKS` ticks so they do not
+squat on the keymap row; failures and refusals stay sticky until the next
+actionable keypress, so a failed send or stop is never silently downgraded.
 
 **The unlock: `claude stop <job-id>`** deregisters the job — "Its conversation is
 kept" — after which `-p -r` resumes and appends **in place** (verified on the wire:
@@ -1100,3 +1112,12 @@ is that the job id, not the session's directory, is what identifies the target.
 `status_for_stop` maps the result: a clean exit is the neutral `stopped`, a
 non-zero one surfaces claude's own sanitized reason (`stop failed: <reason>`), so a
 failed stop never reads as a successful one.
+
+**The interrupt carries a dispatch identity.** `AppEvent::InterruptFinished` rides
+back with the `session_id` of the row that dispatched it, and `App::interrupting`
+stores that same id while the stop is in flight. The completion clears the guard
+only when the ids match, exactly as `App::sending_to` guards a quick reply and
+`App::launching_draft` guards a background launch. `claude stop` is a fast registry
+operation and the row badge clears on the next agents poll, so there is no
+dedicated `"stopping…"` label; the guard exists solely so a stale completion cannot
+land on a surface that has moved on.
