@@ -70,9 +70,28 @@ reporting a gate green, report what made it capable of being red.
 
 ```sh
 ./target/release/snapback   # browse the CURRENT folder's sessions (default)
-snapback -a                 # or --all: every folder, grouped repo → branch
+snapback -p                 # or --project: the repo you launched in AND all of
+                            # its git worktrees, grouped by branch under one
+                            # project head
+snapback -a                 # or --all: every folder, grouped repo → branch, AND
+                            # the only way to put that scope on Ctrl-A
 snapback -h                 # help
 ```
+
+`-a` means TWO things — start in the all scope, and keep it as the third stop of
+the `Ctrl-A` cycle — and only the FIRST takes part in the precedence rule below.
+The all scope is reachable no other way: there is no in-board chord for it, so a
+board launched without `-a` flips between the current folder and the project
+alone.
+
+`-p` and `-a` select the same STARTING setting, so passing both is a
+contradiction and the **last one on the command line wins** (`-p -a` ⇒ all;
+`-a -p` ⇒ project). The cycle stop is orthogonal and is never unset: `-a -p`
+starts in the project scope and can still cycle to all folders, while `-p` alone
+starts in the same scope and cannot. `-p`
+outside a git repo, or with no `git` on `PATH`, is harmless: it falls back to the
+repo root derived from the launch path — narrower than git could make it, never
+an empty board.
 
 `snapback` and `sb` are two thin binary shims over the library crate. Both are
 produced by one install and run the same program (no `argv[0]` dispatch):
@@ -82,8 +101,9 @@ cargo install --path .   # installs both snapback and sb
 ```
 
 There is no separate search mode: you start in browse and typing filters live.
-`Tab` widens name-only → name+content; `Ctrl-A` toggles scope. See the README
-for the full key map.
+`Tab` widens name-only → name+content; `Ctrl-A` flips the scope (current folder →
+project → current folder), or cycles all three states when the board was launched
+with `-a`. See the README for the full key map.
 
 ## Continuous integration & releases
 

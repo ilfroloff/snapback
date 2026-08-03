@@ -205,11 +205,62 @@ An `ai-title`/`aiTitle` tier is deliberately **not** considered.
 
 ### Repo / branch grouping (`store::group`)
 
-`repo_of(cwd)` derives a repo label from the raw path string:
+The module answers ONE question two ways. `repo_root_of(cwd)` returns the repo
+root PATH a cwd hangs off; `repo_of(cwd)` LABELS that same root for a group
+head. One marker scan, two consumers — a layout either counts for both or for
+neither. The rules below are that scan:
 
-- `*-worktrees[/...]` or `*.worktrees[/...]` → the text before the marker,
-  rendered `<parent>/<base>` (the base dir alone is often ambiguous, e.g. `fe`).
-- otherwise → the cwd basename.
+- `*-worktrees[/...]` or `*.worktrees[/...]` → the text before the marker. The
+  sibling-suffix layouts; the dot form also covers a `<root>/.worktrees/<branch>`
+  container, whose children are branches rather than a nested segment.
+- `<root>/.<tool>/worktrees[/...]` → the text before the hidden container. ONE
+  generalized rule, not a list of tool names: a **hidden** (`.`-prefixed) segment
+  whose IMMEDIATE child segment is `worktrees` marks a worktree container, and
+  the repo root is the prefix before that hidden segment. It covers `wtp`'s
+  default `.wtp/worktrees`, any user-configured `wtp` `base_dir` such as
+  `.agents/worktrees` (this repo's own layout), and git's own `.git/worktrees`,
+  without hard-coding a marker per tool — which matters because `base_dir` is
+  user-configurable, so an enumeration of literals would miss real layouts.
+  A path with nothing before the hidden segment has no root to label and falls
+  through to the basename.
+- otherwise → the cwd basename. In particular a **visible** `worktrees/` dir is
+  an ordinary directory and deliberately does NOT collapse
+  (`/Users/me/code/worktrees/thing` → `thing`): a bare `/worktrees/` substring is
+  never matched on its own, because the false-positive risk is not worth it. The
+  hidden parent is exactly what separates a container from such a directory.
+
+All matched rules are evaluated together and the FIRST occurrence in the path
+wins (the minimum match offset), so the result does not depend on rule order.
+The winning prefix IS the repo root — what `repo_root_of` returns; a plain
+checkout is its own root and comes back untouched. `repo_of` then renders that
+root `<parent>/<base>` (the base dir alone is often ambiguous, e.g. `fe`) unless
+the parent is empty or equal to the base — but only for a worktree cwd; a cwd
+that IS its own root is labelled by its basename alone.
+
+**That asymmetry is why membership must compare ROOTS, not labels.** A repo
+(`snapback`) and its own worktree (`ilfroloff/snapback`) carry two different
+labels for one project, so a label comparison says "different project" precisely
+for the folders the project scope exists to unite.
+
+**Accepted limitations,** both pinned by inline fixtures in `src/store/group.rs`:
+
+- The hidden-container rule matches on shape alone, so any hidden dir with a
+  `worktrees` child collapses — `<root>/.cache/worktrees/tmp` labels as
+  `<parent>/<root>` even though it holds no worktree. The cost of the narrow
+  alternative (missing a user-configured `base_dir`) is the higher one.
+- First-occurrence means a marker INSIDE the repo wins over the container rule:
+  `<root>/target/wtp-worktrees/<branch>` roots at `<root>/target/wtp`, so its
+  sessions fall outside `<root>`'s project scope. Ranking the rules against each
+  other would fix that one path and make every other path unpredictable, so the
+  first-occurrence rule stands.
+
+This is a **pure string heuristic** — it never runs git, and it is the only
+worktree logic in the `store` core. The git-backed question ("which worktrees
+does *this* project have right now?") belongs to `src/worktrees.rs` and the
+[project scope](#user-facing-modes-tuiapp). That scope uses BOTH: git for the
+live set, `repo_root_of` for the removed worktrees git can no longer name. A repo
+whose worktrees match no marker here still aggregates correctly through the git
+arm, for exactly as long as those worktrees exist.
 
 The branch level comes from the authoritative `gitBranch` (missing ⇒
 `(detached)`). Sessions sort repo↑ / branch↑ / timestamp↓; the list renders one
@@ -254,9 +305,10 @@ The candidate set is scope-limited BEFORE any of this. The `App` pushes its
 cached in-scope index set into the search pass (`SearchIndex::results_within`)
 rather than filtering the whole corpus and intersecting afterward, so in the
 default current-folder scope the per-keystroke pass scans only the in-scope
-sessions. The index still holds every session (scope is a runtime toggle and
-`Scope::All` needs the full set), so this narrows the work per keystroke without
-changing what is indexed.
+sessions. The index still holds every session (scope is a runtime cycle, and both
+wider scopes — `Scope::Project` and `Scope::All` — reach sessions outside the
+launch folder), so this narrows the work per keystroke without changing what is
+indexed.
 
 There is deliberately **no on-disk index** (YAGNI at the observed few-hundred
 sessions — ~270 when last measured, 2026-07-15): the whole content corpus is a
@@ -792,15 +844,93 @@ This is the third and last of **three distinct agent concepts** — keep them ap
 
 | Concept | Values | Meaning |
 | --- | --- | --- |
-| **Scope** | `CurrentFolder` (default) / `All` | current-folder = sessions whose **canonical** `cwd` exactly equals the canonical launch dir; all = every session, grouped by folder. Toggled by `Ctrl-A` / `--all`. |
+| **Scope** | `CurrentFolder` (default) / `Project` / `All` | THREE concentric answers to "which sessions are mine right now", declared widest-last so the variant order is the cycle order. current-folder = sessions whose **canonical** `cwd` exactly equals the canonical launch dir; project = sessions whose `cwd` is EITHER a member of the launch project's live worktree set (`src/worktrees.rs`) OR under the same repo ROOT (see below — two arms, and the scope needs both); all = every session. `All` renders repo→branch group heads; `Project` renders branch groups under the ONE project label instead of per-folder repo labels (see below); `CurrentFolder` is the flat, head-less list, and it ALONE, because it is the only scope that cannot span more than one folder. Selected at launch by `--project`/`-p` or `--all`/`-a`, and flipped by `Ctrl-A` between the first two — `All` joins that key ONLY on a board launched with `-a`, which is the sole route to it (see below). |
 | **Search mode** | `NameOnly` (default) / `NameAndContent` | which haystack the substring matcher scores; toggled by `Tab`. |
 | **Show hidden** | off (default) / on | whether soft-hidden sessions appear (dimmed, marked `[hidden]`, live badge intact). Toggled by `Ctrl-X h`; a row is hidden/un-hidden by `Ctrl-X x`. The set persists — see [snapback-owned state](#snapback-owned-state-srchiddenrs). |
 | **Modal** | `Row` \| `List` layout in one `Option<Modal>` | the SINGLE type for a TITLED, choice-bearing overlay. `Enter` on a running session builds the `Attach` / `Fork` / `Cancel` choice (a `Row`); `Ctrl-N` with defined agents builds the agent picker (a `List`); `Ctrl-X d` builds the hard-delete confirm (a `Row`: `Delete this` / `Delete lineage (N)` — offered only for a real multi-member lineage, carrying the member ids resolved at OPEN time — / `Cancel`, default-highlighted on Cancel by that choice's position). Each choice carries a `ModalAction` tag the one confirm handler (`confirm_modal`) routes on. The plain Enter/Esc stop confirmations (`Ctrl-R`, `Ctrl-K`), the compose zone and the `Ctrl-X` chord are separate keyboard owners, NOT `Modal`s — see [PATTERNS.md](PATTERNS.md#10-keys-actions-outcomes). |
 
 The current-folder scope is an **exact** canonical `cwd` match by design: a
-repo's *other* worktree folders do not appear until you switch to all-folders or
-`cd` into them. Selection is tracked by stable `session_id` so it survives an
-autorefresh reload.
+repo's *other* worktree folders do not appear there, no matter how the paths
+relate. That precision is deliberate and is NOT the only precise option — it is
+the narrowest of three. `Ctrl-A` widens to the **project** scope, which is the
+answer for a repo's other worktrees, and by default wraps straight back.
+
+**`All` is the launch flag's alone** (`Scope::toggled`'s `all_enabled`
+parameter, from `cli::Args::all_scope_enabled`). It is the whole store — every
+session of every repo on the machine — so it is the widest and least often
+wanted answer, and it used to sit MID-cycle where a stray `Ctrl-A` landed on it.
+`--all`/`-a` therefore means two things: start there, AND keep it as the third
+stop of the key. Three consequences to keep straight:
+
+- The flag is **orthogonal to the last-flag-wins precedence** on the initial
+  scope. `-a -p` starts in the project scope and can still reach all folders;
+  `-p` alone starts in the same scope and cannot.
+- There is deliberately **no in-board chord** for it, and adding one would undo
+  this. `Scope::Project` now spans a project's whole history, deleted worktrees
+  included, so the middle stop is what a wide press was usually reaching for.
+- The empty-list advice is **derived from `Scope::toggled`, not restated**
+  (`view::empty_list_message` takes the same flag), so an empty project stops
+  offering "Press Ctrl-A to show all folders" on a board where that key cannot.
+
+The project scope is the one scope that asks **git**, and it differs from the
+other two in four ways worth keeping straight:
+
+- **TWO membership arms, and it needs both.** `App::in_scope` says yes to a
+  session whose `cwd` is EITHER of:
+  - a member of the worktree roots `git worktree list --porcelain` reports for
+    the launch dir (`src/worktrees.rs`), canonicalized with the same
+    `resolve_dir` the exact-cwd test uses. Authoritative, and the only arm that
+    can relate folders no string rule could — `git worktree add` accepts any
+    path, so a live worktree may sit nowhere near the repo.
+  - under the same repo ROOT (`worktrees::project_root`, over the pure
+    [`group::repo_root_of`](#repo--branch-grouping-storegroup)). This arm exists
+    because git reports what exists NOW: a REMOVED worktree's sessions match no
+    live root, and were reachable only under `All`. Measured on this repo's own
+    store, that was 47 of 149 project sessions — a third of the project's
+    history, invisible in the view meant to show it.
+
+  The two are compared as **root PATHS, never `repo_of` LABELS**. `repo_of`
+  spells a plain checkout `<base>` and a worktree `<parent>/<base>`, so a repo
+  and its own worktree carry different labels and a label comparison answers
+  "different project" exactly where it matters most. Both live on the ONE marker
+  scan in `store::group`: `repo_root_of` slices the path, `repo_of` labels what
+  it sliced.
+- **Autoreloaded, not a launch-time snapshot.** The git set is resolved once in
+  `App::new` and RE-RESOLVED on every reload, inside `App::apply_sessions` — so a
+  worktree created while the board is running joins the scope on the next
+  refresh, with no restart, no polling, and no extra event source (a new worktree
+  can only matter once its first session writes a JSONL, which the existing
+  debounced watcher already turns into a reload). It is never resolved on the
+  render path or on the `Ctrl-A` keystroke: a subprocess on a key press is
+  exactly the blocking work that may not sit on the UI thread, so the scope
+  predicate reads a CACHE.
+- **Fail-soft toward the repo root, never toward "nothing".** An EMPTY worktree
+  set means "could not resolve" — no `git` on `PATH`, a launch dir that is not a
+  repository, a non-zero exit, non-UTF-8 output — and the root arm carries the
+  scope on its own from there: narrower than git could make it (worktrees parked
+  outside the root drop out), never "no session matches", so launching with `-p`
+  outside any git repo is harmless. The header follows: `project:<label>` prefers
+  the label git resolved for the whole set (taken from the MAIN worktree, which
+  git lists first) and falls back to the repo ROOT's name
+  (`worktrees::project_root_name`) — not the launch dir's, because a worktree
+  folder is named after its BRANCH and the list is drawn from the whole project.
+- **One project, one group head — unconditionally.** Membership alone does not
+  aggregate a project on screen: `Session::repo` is `repo_of`'s label for the
+  session's OWN folder, fixed at parse time, so heading groups by that field
+  splits one project into two heads (`snapback` and `ilfroloff/snapback`) even
+  with every session in scope. `Scope::Project` therefore heads every group with
+  the project label instead (`tui::app::group_key`), leaving the branch level
+  below it untouched: one head per branch, under one project. It cannot
+  over-merge, because membership is already restricted to that project — every
+  visible row belongs to it by construction. There is no unresolved case to
+  exempt: the root arm has no git dependency, so a project-scoped list always
+  spans folders, always draws grouped, and `App::project_head` is always `Some`.
+  The override is `Scope::Project`'s ALONE: `Scope::All` shows many projects at
+  once and has no single project to name, so it keeps the per-folder labels.
+  `App::order_filtered` and `build_rows` share the one `group_key`, or the
+  ordering would scatter a group the row builder then re-heads.
+
+Selection is tracked by stable `session_id` so it survives an autorefresh reload.
 
 ### Terminal paste routing (`Event::Paste`)
 
@@ -852,7 +982,11 @@ from claude's authoritative `id`; it is never derived by splitting the UUID.
 Before any hand-off, `cwd` and `sessionId` are **re-read from inside the file**
 (authoritative at hand-off time) and the `cwd` must still exist on disk;
 otherwise the board surfaces a refusal (deleted worktrees are common) and stays
-up. Attach still `chdir`s into that authoritative `cwd`, but its argv is keyed on
+up. That gate covers resume AND fork, and it is what bounds the
+[project scope's root arm](#user-facing-modes-tuiapp): a removed worktree's
+sessions are back on the board, and are browsable, searchable, hideable and
+deletable — but not resumable, because the directory they ran in is gone.
+Attach still `chdir`s into that authoritative `cwd`, but its argv is keyed on
 the agent-view job id rather than the re-read `sessionId`. **New session** is the
 exception: it has no source file to re-read, so `resume::check_new` gates on the
 existence of `App::launch_dir` itself and uses that dir as the authoritative

@@ -852,6 +852,27 @@ mod tests {
         }
     }
 
+    /// A FORK of a deleted worktree's session is refused too, by the same gate.
+    ///
+    /// Newly load-bearing: the project scope now keeps a REMOVED worktree's
+    /// sessions on the board (they share the repo root git can no longer relate
+    /// them by), so rows whose `cwd` is gone are routinely selectable. They are
+    /// meant to be browsable, searchable, hideable and deletable but NOT
+    /// resumable — and fork is the OTHER door onto the same hand-off, the one
+    /// the not-live refusal points users at, so it must not become a way around
+    /// the existence check.
+    #[test]
+    fn existence_check_refuses_a_missing_cwd_for_a_fork_too() {
+        let missing = PathBuf::from("/no/such/snapback/worktree/anywhere");
+        assert!(!missing.exists(), "test path must not exist");
+        match plan_from_parts(missing, "sess-x".into(), true) {
+            ResumePlan::Refuse { message } => {
+                assert!(message.contains("no longer exists"), "{message}");
+            }
+            ResumePlan::Ready { .. } => panic!("a missing cwd must refuse a fork as well"),
+        }
+    }
+
     #[test]
     fn existence_check_proceeds_for_an_existing_dir() {
         let existing = std::env::temp_dir();

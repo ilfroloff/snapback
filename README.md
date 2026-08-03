@@ -19,8 +19,10 @@ them in a keystroke. It gives you:
    actually said or done in it.
 3. **Always current** — the list refreshes itself as sessions are created,
    changed, or removed. No restart.
-4. **Focused by default** — you start scoped to the folder you're in; one key
-   widens to every folder when you want the big picture.
+4. **Focused by default** — you start scoped to the folder you're in, and one key
+   widens to the whole project (every git worktree of the repo you launched in)
+   and back. Every folder on the machine is a step further out, and stays behind
+   a launch flag rather than on that key.
 5. **One keystroke to jump back in** — resume or fork the selected session, or
    start a brand-new one (optionally bound to one of your Claude Code agents),
    all without leaving the board.
@@ -82,11 +84,17 @@ Optional override:
 ## Usage
 
 ```sh
-snapback       # browse the CURRENT folder's sessions (default scope)
-sb             # same thing (short alias)
-snapback -a    # browse EVERY folder's sessions, grouped repo → branch
-snapback --all # (long form of -a)
-snapback -h    # help
+snapback           # browse the CURRENT folder's sessions (default scope)
+sb                 # same thing (short alias)
+snapback -p        # browse THIS PROJECT's sessions — the repo you launched in
+                   # and all of its git worktrees, grouped by branch under one
+                   # project head
+snapback --project # (long form of -p)
+snapback -a        # browse EVERY folder's sessions, grouped repo → branch —
+                   # and put that scope on Ctrl-A, which is the only way to
+                   # reach it
+snapback --all     # (long form of -a)
+snapback -h        # help
 ```
 
 There is no separate "search mode": you always start in browse, and typing
@@ -107,7 +115,7 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | `Ctrl-K` | **Stop / interrupt** the selected session's live background agent (`claude stop`). An agent whose run is over (`done`, `stopped`, `failed`) stops immediately; every other live agent (`working`, `needs input`, `idle`, `interrupted`, unrecognized) confirms first, since stopping ends the live job (its conversation is kept). A session that isn't running as an agent has nothing to stop, and an interactive session running in another terminal can't be stopped from here |
 | `Ctrl-X` then `x` / `d` / `h` | **Leader chord** for hide & delete — `x` **hides** the selected session (reversible, persisted), `d` **hard-deletes** it after a confirmation that can take just that row or its whole `(+N)` stack, `h` toggles **show hidden**. Any other key cancels the chord |
 | `Tab` | Toggle search: **name-only ↔ name+content** |
-| `Ctrl-A` | Toggle scope: **current folder ↔ all folders** |
+| `Ctrl-A` | Flip scope: **current folder ↔ project** — the project being the repo you launched in and all of its git worktrees. Started with `-a` it is a three-stop cycle instead (current folder → project → all folders), which is the only way to reach all folders |
 | `Ctrl-/` | Toggle the transcript **preview** pane |
 | `PgUp` / `PgDn` | Scroll the preview a full page |
 | `Ctrl-U` / `Ctrl-D` | Scroll the preview a quarter page |
@@ -151,8 +159,25 @@ running) and `/exit` (end it) are the clean exits.
 ## Features
 
 **Folder scoping.** By default you only see sessions from the folder you're in
-right now, so the list stays about the project in front of you. `--all` / `-a`
-starts wide, and `Ctrl-A` flips between the two without restarting.
+right now, so the list stays about the project in front of you. `--project` /
+`-p` starts one step wider — the repo you launched in **and all of its git
+worktrees**, so work split across worktrees shows up as one project instead of
+scattered folders — and `--all` / `-a` starts wide. `Ctrl-A` flips between the
+first two without restarting.
+
+All folders is the whole store — every session of every repo on the machine — so
+it is the **launch flag's alone**: `--all` / `-a` both starts there and adds it
+as a third stop on `Ctrl-A`. Without the flag that key cannot reach it, which
+keeps a one-key press inside the project you are working on.
+
+The project scope asks git which worktrees the repo has, and re-asks on every
+refresh, so a worktree you add while snapback is running joins the list on its
+own. It also keeps the worktrees you have since **deleted** — git can only report
+the ones that still exist, so those sessions used to be findable under `--all`
+alone. They stay browsable, searchable and hideable; they just can't be resumed,
+because the folder they ran in is gone. Outside a git repo — or if git can't
+answer — the scope falls back to the repo folder your launch directory sits in,
+rather than showing an empty board.
 
 **Search by name or by content.** Typing filters instantly by name. Press `Tab`
 to also search inside the transcripts, so you can find a session by what was
