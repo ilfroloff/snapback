@@ -54,7 +54,7 @@
 //! | `Ctrl-K` | stop / interrupt the selected session's live agent, by whichever handle claude's record carries (see [`send::interrupt_gate`]). A stoppable job id → `claude stop`: an agent whose run is OVER (`done` / `stopped` / `failed`) stops at once, every other live agent confirms first. NO job id but a `pid` → confirm, then re-ask claude at `Enter` and send that pid a SIGTERM (never SIGKILL) only if claude still reports the same pid with no job id; a record that is gone, now carries a job id, or reports another pid refuses instead (see [`send::signal_plan`]). A session claude is not holding, or one it reports with neither a job id nor a pid — or with no job id and a pid no signal could take (`0`, past `i32::MAX`, or the board's own process id) — is refused |
 //! | `Tab` | toggle name-only vs. name+content search. Widening to content also opens the preview on the most recent match, exactly as typing does: it goes through the same query funnel, and the mode is the gate that key just opened |
 //! | `Ctrl-A` | flip the scope: current folder <-> project (the launch repo and all of its git worktrees). ONE key for both, because the second is a refinement of the same question the first answers, not a separate mode. Launched with `--all`/`-a` it becomes a three-stop cycle through all folders as well — the whole store is on this key only when the launch flag put it there |
-//! | `Ctrl-X` then `x`/`d`/`h`/`r`/`y`/`f`/`w`/`↓` | leader chord: hide (from a row that visibly stands for others — a folded `(+N)` head, or an expanded head with `↳` rows beneath it — that row and the members it stands for on screen, so the fold cannot re-head, while members off the board (filtered out by the query, out of scope, already hidden) stay as they are; any other row that session alone: a `↳` row, or a head whose other members are all off the board; un-hiding from such a head exposes every member it stands for, one hidden on its own included — see [`App::toggle_hidden_selected`]) / hard-delete (this row; on a multi-member lineage's HEAD row — the row not drawn `↳` — the confirm also offers its whole fork lineage, never on a `↳` row, and still on a head standing alone, since the confirm counts the lineage and discloses its hidden members; a member whose quick reply, headless fork or move snapback still has in flight is refused, see [`delete::can_delete_target`]) / toggle show-hidden / re-read every transcript from disk / copy session ID (the selected session's full id, to the clipboard; the id also shows on the status line) / fold or expand the selected row's fork lineage (fold an open one, open a folded `(+N)` head, nothing otherwise — see [`App::toggle_selected_lineage`]) / move the selected session to another worktree of the launch project (the parent folder included, its own folder omitted): opens a picker, see the next row; refused, with no picker, while that session's own move, quick reply or headless fork is still in flight / `↓` opens a subagent's own transcript in the preview — the SUBAGENT VIEW (the `◆ delegated to …` click row below) — on the first RUNNING subagent in launch order (unfinished and not failed, and it or a subagent it launched wrote in the last 10 minutes), else the most recently written one, and, pressed again in the view, leaves it as `Esc` does; a typed query stays. It reads no file: the selected session's subagents are read in the background whenever the selection moves or one of them writes, and `↓` refuses on a sticky status line while that read has not landed, or when the session has none (see [`App::open_subagent_target`]) (any other key cancels) |
+//! | `Ctrl-X` then `x`/`d`/`h`/`r`/`y`/`f`/`w`/`↓`/`?` | leader chord: hide (from a row that visibly stands for others — a folded `(+N)` head, or an expanded head with `↳` rows beneath it — that row and the members it stands for on screen, so the fold cannot re-head, while members off the board (filtered out by the query, out of scope, already hidden) stay as they are; any other row that session alone: a `↳` row, or a head whose other members are all off the board; un-hiding from such a head exposes every member it stands for, one hidden on its own included — see [`App::toggle_hidden_selected`]) / hard-delete (this row; on a multi-member lineage's HEAD row — the row not drawn `↳` — the confirm also offers its whole fork lineage, never on a `↳` row, and still on a head standing alone, since the confirm counts the lineage and discloses its hidden members; a member whose quick reply, headless fork or move snapback still has in flight is refused, see [`delete::can_delete_target`]) / toggle show-hidden / re-read every transcript from disk / copy session ID (the selected session's full id, to the clipboard; the id also shows on the status line) / fold or expand the selected row's fork lineage (fold an open one, open a folded `(+N)` head, nothing otherwise — see [`App::toggle_selected_lineage`]) / move the selected session to another worktree of the launch project (the parent folder included, its own folder omitted): opens a picker, see the next row; refused, with no picker, while that session's own move, quick reply or headless fork is still in flight / `↓` opens a subagent's own transcript in the preview — the SUBAGENT VIEW (the `◆ delegated to …` click row below) — on the first RUNNING subagent in launch order (unfinished and not failed, and it or a subagent it launched wrote in the last 10 minutes), else the most recently written one, and, pressed again in the view, leaves it as `Esc` does; a typed query stays. It reads no file: the selected session's subagents are read in the background whenever the selection moves or one of them writes, and `↓` refuses on a sticky status line while that read has not landed, or when the session has none (see [`App::open_subagent_target`]) / `?` opens the key-map modal (the terminal-independent twin of `F1`) (any other key cancels) |
 //! | `Enter` in the move picker | move the session to the chosen worktree; the board stays up. A worker thread re-reads the transcript, refuses a session claude lists as active — and, unlike every other gate, refuses too when claude cannot be asked (`claude agents --json` fails; see `crate::claude_move::liveness_refusal`) — then runs one headless `claude -p … -r <id>` in the session's current folder and sends it one `set_cwd` request (see `crate::claude_move`); the status line says `moved to <folder>`, or why not. While it runs the row wears `moving…` and refuses `Enter`, `Ctrl-F`, `Ctrl-R`, `Ctrl-X d` and another `Ctrl-X w`. On a multi-member lineage's HEAD row `Enter` first opens a `Move this` / `Move lineage (N)` / `Cancel` confirm, highlighted on `Cancel`, disclosing hidden members as the delete confirm does ([`App::open_move_scope_confirm`]); `Move this` is the move above. `Move lineage (N)` is BEST EFFORT: a member snapback is still replying to, forking or moving is skipped, the rest move one at a time on ONE worker, each through the same steps, the run stops at the first `needs_trust` (the target's verdict, shared by every member), every member wears `moving…` until the last finishes, and ONE sticky tally says how many moved and why the rest did not (see `crate::claude_move::status_for_lineage_move`). On a `↳` row or a lone session `Enter` moves at once |
 //! | `Ctrl-L` (in a compose box) | pick the model — and optionally the effort — for THIS compose only: the `Ctrl-R` reply, the `Ctrl-F` fork or the `Ctrl-N` draft it is pressed in (see [`compose::compose_key_to_action`]). The box's `model:` label names what it runs on: a reply's or fork's default is `session (<model>)`, the model its session last answered with, which claude normally restores by itself (`default` when an `ANTHROPIC_MODEL` / `ANTHROPIC_DEFAULT_*_MODEL` override, or a transcript with no answering model, means it would not); a draft's is `default (<value>) (new sessions only)` from the user's `claude` settings. `--model` / `--effort` are sent ONLY for a pick other than that default — on the reply, the fork's `Enter` and `Ctrl-O` run, the draft's background launch and the draft's `Ctrl-O` run. The picker's first row returns to the default, `Enter` sets the highlighted row into the compose, `Esc` returns with the text and the previous pick intact. Every new compose starts at its default; nothing is remembered. `Enter` (resume), the Attach/Fork choice's Fork, Attach and the `Ctrl-X w` move never send a model |
 //! | `Left` / `Right` (in the model picker) | step the highlighted MODEL row's `--effort` down / up through unset → `low` → `medium` → `high` → `xhigh` → `max`, wrapping both ways; `Enter` then sets the model and the effort together into the compose. Inert on the picker's default row (no model, so no effort) and on every other list modal, so the agent picker keeps ignoring them; they never reach the board's search caret underneath |
@@ -74,7 +74,8 @@
 //! | mouse: drag in the preview | select transcript text in reading order, reverse-videoed — DRAWN text only: each row ends at its last drawn character, never at the pane's edge, and a drag over blank space alone selects nothing, so its release copies nothing. HOLD the drag past the transcript's top or bottom edge and the pane glides that way, a small step every `AUTOSCROLL_FRAME` — faster the further past the edge — so the selection keeps growing into rows that were never on screen until the button comes up (see [`App::autoscroll_preview_selection`]); a plain move while the button is held counts as the release the terminal lost. The release copies the WHOLE selection the way `Ctrl-X y` copies — [`Outcome::Copy`], the clipboard tool first, OSC 52 as the fallback — with a transient status. Never the in-flight reply's tail. A wheel notch, any key or a resize ends it. A drag that starts on a node header, a `◆ delegated to …` line or a link selects, and toggles, switches or opens nothing. Off under any overlay and a new-session draft's card, but ON while a quick reply or fork box is open (each previews the real transcript; the drag neither moves its caret nor touches its text), and never started on the pinned row, the running list or a docked compose zone (see [`press_starts_selection`]) |
 //! | mouse: double-click in the preview | select the WORD under the pointer (Unicode word boundaries, on the drawn row) and copy it on release, exactly as a drag copies. Two presses on the SAME cell within [`DOUBLE_CLICK_INTERVAL`] (see [`is_double_click`]); a blank word selects nothing; a quick third click keeps the word. The FIRST release is a plain click — it toggles a node header, switches to a subagent or opens a link, as above — and the SECOND copies the word and toggles, switches or opens nothing, so a node header double-clicked is opened once and stays open. Any key, wheel notch or reload resets the count (a fold toggle does not: it is the first click's own effect), and a press that turned into a drag is not a first click. Same gate as a drag ([`press_starts_selection`]), so it too works while a quick reply or fork box is open |
 //! | `Esc` | unwind one level: clear the search query when one is typed; else leave the subagent view for the session's own transcript; else quit |
-//! | `Ctrl-C` | quit (always) |
+//! | `Ctrl-C` | quit from the board; while a modal, a confirmation, the key map or a pending `Ctrl-X` chord is open it closes or cancels that instead, and in a compose box it never quits (`Esc` cancels the box) |
+//! | `F1`, `Ctrl-X ?`, `Ctrl+Shift+/` (`Ctrl-?`) | open the full key-map MODAL (a table of every binding); `↑`/`↓` (or `k`/`j`)/`PgUp`/`PgDn`/`Home`/`End` and the mouse wheel scroll it; `Esc`, `Ctrl-C`, `F1` or `Ctrl+Shift+/` (in any form it arrives as) closes it — `Ctrl-X ?` only opens it, since inside the modal the `Ctrl-X` leader is inert. It owns the keyboard like every modal. `Ctrl-X ?` (two plain keys) is the way in that works in every terminal and `F1` works in most (GNOME Terminal binds it to its own Help, and a Mac laptop keyboard needs `Fn`+`F1`): a terminal often cannot deliver `Ctrl+Shift+/` at all (`Ctrl-?` is the legacy 0x7F, which arrives as Backspace). Without the kitty keyboard protocol it cannot be told from `Ctrl-/`, so `Ctrl-?`, `Ctrl-/` and the legacy 0x1F (`Ctrl-7`) all count (see [`App::show_key_map`]) |
 //!
 //! No bare printable character is a command: every one of them types into the
 //! query, so no search term can navigate or quit on its way in. Arrows, `Enter`,
@@ -203,6 +204,12 @@ pub enum Action {
     LayoutTowardPreview,
     /// Step the pane layout one stop toward the full-width list (`Shift-Right`).
     LayoutTowardList,
+    /// Toggle the key-map modal (`F1` or `Ctrl+Shift+/`, see
+    /// [`is_key_map_toggle`]; `Ctrl-X ?` reaches the same toggle through the
+    /// chord instead). A function key or a `Ctrl` chord rather than a bare
+    /// character, so no search term can trigger it on its way in. The modal owns
+    /// the keyboard while open (see [`App::show_key_map`]).
+    ToggleKeyMap,
     /// Scroll the preview up one page (`PgUp`).
     PreviewPageUp,
     /// Scroll the preview down one page (`PgDn`).
@@ -384,6 +391,30 @@ impl Outcome {
     }
 }
 
+/// Whether `key` is the key-map chord, `Ctrl+Shift+/` (`Ctrl-?`).
+///
+/// A terminal cannot tell it from `Ctrl-/` without the kitty keyboard protocol,
+/// which snapback does not enable, so EVERY form crossterm may deliver for the
+/// gesture counts: `?` with `Ctrl`, `/` with `Ctrl` (+`Shift`), and `7` with
+/// `Ctrl` — the legacy 0x1F byte, which crossterm 0.29 decodes as `Ctrl-7`
+/// (`event/sys/unix/parse.rs`). Always carries `Ctrl`, so a bare `?` or `/` still
+/// types into search.
+#[must_use]
+fn is_key_map_chord(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('?' | '/' | '7'))
+}
+
+/// Whether `key` opens or closes the key-map modal: [`is_key_map_chord`] or `F1`,
+/// the unmodified function key, which most terminals deliver (not GNOME Terminal,
+/// which keeps it for its own Help, and a Mac laptop keyboard needs `Fn`). `F1` is no
+/// printable, so it never competes with type-to-search. The modal's own handler
+/// asks this too, so the key that opens it is the key that closes it.
+#[must_use]
+fn is_key_map_toggle(key: KeyEvent) -> bool {
+    is_key_map_chord(key) || key.code == KeyCode::F(1)
+}
+
 /// Map a keypress to an [`Action`]. `query_empty` gates the SHIFTED arrows alone:
 /// match navigation is only meaningful once a query exists to have marked
 /// something, so an empty query leaves them plain selection movement.
@@ -415,6 +446,10 @@ pub fn key_to_action(
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+    if is_key_map_toggle(key) {
+        return Action::ToggleKeyMap;
+    }
 
     if ctrl {
         return match key.code {
@@ -558,7 +593,8 @@ pub fn key_to_action(
 /// Apply one merged [`AppEvent`] to the app, returning the driver's next step.
 ///
 /// * `Input(Key)` (a press/repeat) -> decode + apply an [`Action`].
-/// * `Input(Mouse)` -> a wheel notch scrolls the pane under the pointer, a
+/// * `Input(Mouse)` -> a wheel notch scrolls the pane under the pointer (the
+///   key-map modal instead, while it is open), a
 ///   left-button PRESS over the preview transcript only records where it landed,
 ///   and its RELEASE decides what it was ([`handle_mouse`] over the pure
 ///   [`mouse_effect`]). A press that DRAGGED selects transcript text and its
@@ -670,9 +706,12 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
                 // hard-delete confirm) is open it OWNS the keyboard: keys
                 // navigate/confirm/cancel the modal, never the board.
                 Some(KeyboardOwner::Modal) => handle_modal_key(app, key, store),
+                // The key-map modal owns the keyboard the same way: it scrolls and
+                // closes, and every other key is inert.
+                Some(KeyboardOwner::KeyMap) => handle_key_map_key(app, key),
                 // A pending `Ctrl-X` leader chord OWNS the next key too: route it
                 // through the chord machine BEFORE normal handling so a printable
-                // follow-up (`x`/`d`/`h`/`r`/`y`/`f`/`w`, or `↓`) completes the chord
+                // follow-up (`x`/`d`/`h`/`r`/`y`/`f`/`w`/`?`, or `↓`) completes the chord
                 // instead of leaking into the query.
                 Some(KeyboardOwner::Chord) => handle_chord_key(app, key, store),
                 // The "stop the waiting agent?" confirmation owns the keyboard until
@@ -708,8 +747,9 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
         // Mouse wheel scroll, preview fold-node toggles, subagent switches, preview
         // link clicks and preview drag-selection. A dedicated arm BEFORE the input
         // catch-all and INDEPENDENT of the modal overlay gate above: none routes
-        // into the modal handler — a wheel just scrolls a pane and never crashes in
-        // any mode (query active, modal open, ...), and a press neither toggles a
+        // into the modal handler — a wheel just scrolls a pane (the key-map table, while
+        // that modal is open) and never crashes in any mode (query active, modal
+        // open, ...), and a press neither toggles a
         // node, switches to a subagent, opens a link nor starts a selection while an
         // overlay is up (`App::preview_pointer_blocked` gates it; an open QUICK
         // REPLY or FORK box does not, since none of the four touches what the box
@@ -1108,7 +1148,7 @@ fn flatten_for_query(text: &str) -> String {
 ///
 /// The paste arm routes by the KEY arm's [`App::keyboard_owner`], because the
 /// reason the key arm has that order applies unchanged: a surface that owns the
-/// keyboard must not have text land on the surface behind it. All six owners, in
+/// keyboard must not have text land on the surface behind it. All seven owners, in
 /// order:
 ///
 /// 1. **Modal** ([`handle_modal_key`]) — IGNORED. A modal is a fixed choice
@@ -1116,29 +1156,32 @@ fn flatten_for_query(text: &str) -> String {
 ///    it has no text
 ///    field, so the only things a paste could do are pick an option the user did not
 ///    choose or leak into the board's query underneath an overlay that hides it.
-/// 2. **`Ctrl-X` leader chord** ([`handle_chord_key`]) — IGNORED, and it does NOT
+/// 2. **Key-map modal** ([`handle_key_map_key`]) — IGNORED. A read-only table with
+///    no text field, over a board whose query it hides.
+/// 3. **`Ctrl-X` leader chord** ([`handle_chord_key`]) — IGNORED, and it does NOT
 ///    resolve the chord. The chord resolves on exactly one KEY, hit or miss; a paste
 ///    carries no chord completion, and cancelling on one would let a stray paste
 ///    silently disarm a chord whose hint is still on screen. The next key still
 ///    decides.
-/// 3. **Stop confirmation** ([`handle_stop_confirm_key`]) — IGNORED. A plain
+/// 4. **Stop confirmation** ([`handle_stop_confirm_key`]) — IGNORED. A plain
 ///    Enter/Esc gate: a paste is neither, and must not stop an agent.
-/// 4. **Interrupt confirmation** ([`handle_interrupt_confirm_key`]) — IGNORED, same
+/// 5. **Interrupt confirmation** ([`handle_interrupt_confirm_key`]) — IGNORED, same
 ///    reason.
-/// 5. **Compose** — INSERTED at the caret as text, via [`compose::insert_paste`].
+/// 6. **Compose** — INSERTED at the caret as text, via [`compose::insert_paste`].
 ///    This is the fix: the newline inside a paste becomes a newline in the draft
 ///    instead of the `Enter` that used to submit it.
-/// 6. **Board** — INSERTED at the search query's caret, newlines flattened to
+/// 7. **Board** — INSERTED at the search query's caret, newlines flattened to
 ///    spaces ([`flatten_for_query`]), exactly as if typed.
 ///
 /// Returns nothing on purpose. A paste can never produce [`Outcome::Send`],
 /// [`Outcome::Resume`] or any other board-ending outcome, and that is structural
 /// here rather than a promise: no branch reaches a submit path.
 fn handle_paste(app: &mut App, raw: &str) {
-    // The owner the key arm in `dispatch` would route to. Owners 1-4: swallow.
+    // The owner the key arm in `dispatch` would route to. Owners 1-5: swallow.
     let to_compose = match app.keyboard_owner() {
         Some(
             KeyboardOwner::Modal
+            | KeyboardOwner::KeyMap
             | KeyboardOwner::Chord
             | KeyboardOwner::StopConfirm
             | KeyboardOwner::InterruptConfirm,
@@ -1153,10 +1196,10 @@ fn handle_paste(app: &mut App, raw: &str) {
     }
 
     if to_compose {
-        // Owner 5: the draft takes it verbatim, newlines and all.
+        // Owner 6: the draft takes it verbatim, newlines and all.
         compose::insert_paste(app, &accepted.text);
     } else {
-        // Owner 6: the board. Clear the transient status first, exactly as an
+        // Owner 7: the board. Clear the transient status first, exactly as an
         // actionable keypress does, so a stale refusal does not outlive this input.
         app.clear_status();
         app.push_query_str(&flatten_for_query(&accepted.text));
@@ -1222,6 +1265,22 @@ fn wheel_target(col: u16, row: u16, preview: Rect, list: Rect, composing: bool) 
     }
 }
 
+/// Rows one wheel notch scrolls the key-map modal, or `None` when it is not open.
+///
+/// The modal hides the list and the preview but they stay under the pointer, so a
+/// notch that fell through to [`wheel_target`] would move the selection nobody can
+/// see. While it is open the notch belongs to the modal wherever the pointer is,
+/// by the step an arrow key takes ([`KEY_MAP_LINE_ROWS`]). Pure, like
+/// [`wheel_target`], so the routing is assertable without a terminal.
+#[must_use]
+fn key_map_wheel_rows(key_map_open: bool, up: bool) -> Option<isize> {
+    key_map_open.then_some(if up {
+        -KEY_MAP_LINE_ROWS
+    } else {
+        KEY_MAP_LINE_ROWS
+    })
+}
+
 /// What one mouse event asks of the world beyond the [`App`] — decided by
 /// [`mouse_effect`] with no process spawned and no terminal touched, so a test can
 /// press, drag and release over a drawn link without a browser ever opening.
@@ -1262,8 +1321,9 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Outcome {
 
 /// Decide a mouse event — the state change it makes, and the effect it asks for.
 ///
-/// A vertical wheel notch scrolls whichever pane the pointer is over — unless a
-/// draft is open, which takes the LIST out of the wheel's reach so a notch there
+/// A vertical wheel notch scrolls the key-map modal while it is open
+/// ([`key_map_wheel_rows`]), wherever the pointer is. Otherwise it scrolls
+/// whichever pane the pointer is over — unless a draft is open, which takes the LIST out of the wheel's reach so a notch there
 /// is swallowed ([`wheel_target`] owns that rule and the reason for it) — and
 /// drops any selection first.
 ///
@@ -1323,19 +1383,23 @@ fn mouse_effect(app: &mut App, mouse: MouseEvent, now: Instant) -> MouseEffect {
             // is how a selection moves the pane.
             app.clear_preview_selection();
             let up = mouse.kind == MouseEventKind::ScrollUp;
-            match wheel_target(
-                mouse.column,
-                mouse.row,
-                app.preview_rect,
-                app.list_rect,
-                app.is_composing(),
-            ) {
-                WheelTarget::Preview => app.preview_wheel(up),
-                WheelTarget::List => app.list_wheel(up),
-                // Deliberately empty: no scroll, no selection move, no status
-                // line. The notch is spent and the board is byte-for-byte what
-                // it was, which is the whole point of the arm.
-                WheelTarget::Ignore => {}
+            if let Some(rows) = key_map_wheel_rows(app.show_key_map, up) {
+                app.scroll_key_map(rows);
+            } else {
+                match wheel_target(
+                    mouse.column,
+                    mouse.row,
+                    app.preview_rect,
+                    app.list_rect,
+                    app.is_composing(),
+                ) {
+                    WheelTarget::Preview => app.preview_wheel(up),
+                    WheelTarget::List => app.list_wheel(up),
+                    // Deliberately empty: no scroll, no selection move, no status
+                    // line. The notch is spent and the board is byte-for-byte what
+                    // it was, which is the whole point of the arm.
+                    WheelTarget::Ignore => {}
+                }
             }
         }
         // A left press inside the transcript starts a POTENTIAL drag-select and
@@ -1888,6 +1952,10 @@ fn apply_action(app: &mut App, action: Action) -> Outcome {
             app.step_pane_layout(true);
             Outcome::Continue
         }
+        Action::ToggleKeyMap => {
+            app.toggle_key_map();
+            Outcome::Continue
+        }
         Action::PreviewPageUp => {
             app.preview_page_up();
             Outcome::Continue
@@ -2165,6 +2233,9 @@ enum ChordOutcome {
     /// ([`App::open_subagent_target`]), the way OpenCode's `Down` enters a
     /// session's subagents; pressed while the view is up, leave it.
     Subagents,
+    /// `?` — open the key-map modal, the twin of `F1` that works in every terminal
+    /// (two plain keys, no function-key binding to lose).
+    KeyMap,
     /// `Esc` / `Ctrl-C` / any unbound key — abandon the chord with no side effect.
     Cancel,
 }
@@ -2191,6 +2262,9 @@ fn chord_key(key: KeyEvent) -> ChordOutcome {
         KeyCode::Char('f') | KeyCode::Char('F') => ChordOutcome::Fold,
         KeyCode::Char('w') | KeyCode::Char('W') => ChordOutcome::Move,
         KeyCode::Down => ChordOutcome::Subagents,
+        // Reached only after `Ctrl-X`, so the printable `?` is a chord verb, not a
+        // bare printable command; Shift is whatever the layout needs for it.
+        KeyCode::Char('?') => ChordOutcome::KeyMap,
         _ => ChordOutcome::Cancel,
     }
 }
@@ -2206,8 +2280,8 @@ fn chord_key(key: KeyEvent) -> ChordOutcome {
 /// fork lineage, `w` opens the move-to-worktree picker ([`App::open_move_picker`];
 /// the move itself runs at its confirm), `↓` opens the subagent view on the
 /// selected session's open target, or leaves the view when it is up
-/// ([`toggle_subagent_view`]), and anything else (`Esc` / `Ctrl-C` / an unbound
-/// key) abandons the chord with no side effect.
+/// ([`toggle_subagent_view`]), `?` opens the key-map modal, and anything else
+/// (`Esc` / `Ctrl-C` / an unbound key) abandons the chord with no side effect.
 /// The pending state is cleared FIRST so an early return can never wedge the
 /// board in the chord. Routed BEFORE `key_to_action` in
 /// [`handle_event`], so a printable completion never leaks into the query. The
@@ -2242,6 +2316,7 @@ fn handle_chord_key(app: &mut App, key: KeyEvent, store: &mut SessionStore) -> O
         ChordOutcome::Fold => app.toggle_selected_lineage(),
         ChordOutcome::Move => app.open_move_picker(),
         ChordOutcome::Subagents => toggle_subagent_view(app),
+        ChordOutcome::KeyMap => app.toggle_key_map(),
         ChordOutcome::Cancel => {}
     }
     Outcome::Continue
@@ -2402,6 +2477,40 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, store: &mut SessionStore) -> O
         ModalNav::Interactive => launch_pick_interactively(app),
         ModalNav::Ignore => Outcome::Continue,
     }
+}
+
+/// Rows `PgUp`/`PgDn` move the key-map modal: a fixed step because the viewport
+/// is only known to the render, which clamps whatever offset this leaves.
+const KEY_MAP_PAGE_ROWS: usize = 10;
+
+/// Rows one arrow key, or one mouse-wheel notch ([`key_map_wheel_rows`]), moves
+/// the key-map modal.
+const KEY_MAP_LINE_ROWS: isize = 1;
+
+/// Keys inside the key-map modal: scroll, or close on `Esc`, `Ctrl-C` (as every
+/// modal), `F1` or `Ctrl+Shift+/` ([`is_key_map_toggle`]). `Ctrl-X ?` is no
+/// toggle here: the `Ctrl-X` leader is inert inside the modal. Everything else is
+/// inert, never typed into the query underneath. The offset may overshoot;
+/// `view::render_key_map` clamps it.
+fn handle_key_map_key(app: &mut App, key: KeyEvent) -> Outcome {
+    if is_key_map_toggle(key) || key.code == KeyCode::Esc {
+        app.toggle_key_map();
+    } else if key.modifiers.contains(KeyModifiers::CONTROL) {
+        if matches!(key.code, KeyCode::Char('c' | 'C')) {
+            app.toggle_key_map();
+        }
+    } else {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => app.scroll_key_map(-KEY_MAP_LINE_ROWS),
+            KeyCode::Down | KeyCode::Char('j') => app.scroll_key_map(KEY_MAP_LINE_ROWS),
+            KeyCode::PageUp => app.scroll_key_map(-(KEY_MAP_PAGE_ROWS as isize)),
+            KeyCode::PageDown => app.scroll_key_map(KEY_MAP_PAGE_ROWS as isize),
+            KeyCode::Home => app.scroll_key_map(isize::MIN),
+            KeyCode::End => app.scroll_key_map(isize::MAX),
+            _ => {}
+        }
+    }
+    Outcome::Continue
 }
 
 /// Start the picker's highlighted agent INTERACTIVELY (`Ctrl-O`), skipping the
@@ -4427,7 +4536,7 @@ mod tests {
         assert_eq!(app.query(), "alpha bravo");
         assert!(!app.is_composing(), "a board paste opens no editor");
 
-        // It APPENDS, exactly like type-to-search.
+        // It lands at the cursor (the end here), exactly like type-to-search.
         paste(&mut app, "\ncharlie");
         assert_eq!(app.query(), "alpha bravo charlie");
     }
@@ -4445,6 +4554,15 @@ mod tests {
         assert!(matches!(paste(&mut app, "junk\ntext"), Outcome::Continue));
         assert!(app.modal.is_some(), "a paste must not resolve the modal");
         assert!(app.query().is_empty(), "and must not reach the query");
+
+        // Key-map modal: a read-only table over a board whose query it hides.
+        let mut app = app_with("idle", None);
+        app.push_query_char('q');
+        press(&mut app, KeyCode::F(1));
+        assert!(app.show_key_map);
+        assert!(matches!(paste(&mut app, "junk\ntext"), Outcome::Continue));
+        assert!(app.show_key_map, "a paste must not close the key map");
+        assert_eq!(app.query(), "q", "and must not reach the query");
 
         // Leader chord: `Ctrl-X` is armed and still waiting for its KEY.
         let mut app = app_with("idle", None);
@@ -6118,6 +6236,65 @@ mod tests {
             "a wheel over the list advances the selection"
         );
         assert!(app.modal.is_none(), "a list wheel must not open an overlay");
+    }
+
+    /// The pure decision: an open key map takes every notch (up = toward the top,
+    /// by the arrow keys' step), a closed one declines so the pane routing runs.
+    #[test]
+    fn key_map_wheel_rows_scrolls_only_while_the_key_map_is_open() {
+        assert_eq!(key_map_wheel_rows(true, true), Some(-KEY_MAP_LINE_ROWS));
+        assert_eq!(key_map_wheel_rows(true, false), Some(KEY_MAP_LINE_ROWS));
+        assert_eq!(key_map_wheel_rows(false, true), None);
+        assert_eq!(key_map_wheel_rows(false, false), None);
+    }
+
+    /// End to end through [`handle_event`], over the LIST: with the key map open a
+    /// notch scrolls the table by the arrow keys' step and leaves the selection and
+    /// the preview exactly as they were; closed again, the same notch moves the
+    /// selection.
+    #[test]
+    fn a_wheel_over_the_list_scrolls_the_key_map_and_not_the_board() {
+        let mut app = App::new(
+            vec![session("a"), session("b"), session("c")],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
+        seed_live(&mut app, &[]);
+        app.list_rect = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 20,
+        };
+        app.preview_rect = Rect {
+            x: 40,
+            y: 0,
+            width: 40,
+            height: 20,
+        };
+        let first = app.selected.clone();
+        press(&mut app, KeyCode::F(1));
+        assert!(app.show_key_map);
+
+        wheel(&mut app, MouseEventKind::ScrollDown, 5, 5);
+        wheel(&mut app, MouseEventKind::ScrollDown, 5, 5);
+        assert_eq!(app.key_map_scroll, 2 * KEY_MAP_LINE_ROWS as usize);
+        wheel(&mut app, MouseEventKind::ScrollUp, 5, 5);
+        assert_eq!(app.key_map_scroll, KEY_MAP_LINE_ROWS as usize);
+        assert_eq!(app.selected, first, "the list behind the modal stays put");
+        // And over the preview pane: the table scrolls, the transcript does not.
+        wheel(&mut app, MouseEventKind::ScrollDown, 60, 5);
+        assert_eq!(app.key_map_scroll, 2 * KEY_MAP_LINE_ROWS as usize);
+        assert_eq!(app.preview_scroll, 0, "the preview behind it stays put");
+        assert!(app.show_key_map, "a wheel never closes the modal");
+
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.show_key_map);
+        wheel(&mut app, MouseEventKind::ScrollDown, 5, 5);
+        assert_ne!(
+            app.selected, first,
+            "closed, the wheel walks the list again"
+        );
     }
 
     /// An open draft takes the LIST out of the wheel's reach: a notch there does
@@ -11114,6 +11291,149 @@ mod tests {
         );
     }
 
+    /// Every form a terminal may deliver for `Ctrl+Shift+/` opens the key map,
+    /// with or without a query; a bare `?` or `/` stays ordinary search input.
+    #[test]
+    fn the_key_map_chord_is_recognised_in_every_delivered_form() {
+        let forms = [
+            ctrl(KeyCode::Char('?')),
+            ctrl_shift(KeyCode::Char('?')),
+            ctrl_shift(KeyCode::Char('/')),
+            ctrl(KeyCode::Char('/')),
+            ctrl(KeyCode::Char('7')),
+        ];
+        for empty in [true, false] {
+            for form in forms {
+                assert_eq!(
+                    key_to_action(form, empty, false, false),
+                    Action::ToggleKeyMap
+                );
+            }
+        }
+        for c in ['?', '/'] {
+            assert_eq!(
+                key_to_action(key(KeyCode::Char(c)), true, false, false),
+                Action::Insert(c)
+            );
+        }
+        assert_eq!(
+            key_to_action(key(KeyCode::F(1)), true, false, false),
+            Action::ToggleKeyMap,
+            "F1 is the key-map key"
+        );
+        assert_eq!(
+            key_to_action(key(KeyCode::F(2)), true, false, false),
+            Action::Ignore,
+            "only F1 is bound"
+        );
+    }
+
+    /// Feed one raw `KeyEvent` through the REAL pipeline ([`handle_event`]), the way
+    /// the input thread delivers it.
+    fn deliver(app: &mut App, ev: KeyEvent) -> Outcome {
+        handle_event(
+            app,
+            AppEvent::Input(Event::Key(ev)),
+            &mut store_at(Path::new("/tmp")),
+        )
+    }
+
+    /// Every form a terminal may deliver for the key-map gesture opens the modal
+    /// from the bare board, through `handle_event` (not just `key_to_action`), and
+    /// the same form closes it again. `0x1F` is what most terminals send for
+    /// `Ctrl-/` and `Ctrl-_`; crossterm 0.29 decodes it as `Ctrl-7`
+    /// (`event/sys/unix/parse.rs`: `0x1C..=0x1F` => `'4'..='7'` + CONTROL).
+    #[test]
+    fn every_delivered_form_of_the_key_map_gesture_opens_and_closes_the_modal() {
+        let forms = [
+            ctrl(KeyCode::Char('/')),
+            ctrl_shift(KeyCode::Char('/')),
+            ctrl(KeyCode::Char('?')),
+            ctrl_shift(KeyCode::Char('?')),
+            ctrl(KeyCode::Char('7')),
+            key(KeyCode::F(1)),
+        ];
+        for form in forms {
+            let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp/launch"));
+            deliver(&mut app, form);
+            assert!(app.show_key_map, "{form:?} must open the modal");
+            deliver(&mut app, form);
+            assert!(!app.show_key_map, "{form:?} must close it again");
+        }
+    }
+
+    /// Delivered forms that must NOT open it: `Ctrl-_` (shift-folded underscore)
+    /// and the raw `0x1F` char are not what crossterm produces, and a key RELEASE
+    /// is not actionable, so an `F1` release alone never toggles (no double
+    /// toggle under the kitty protocol). `Ctrl-_` is an ordinary unbound `Ctrl`
+    /// key: it lands in the ctrl block's "ignore other Ctrl keys" fallback, with or
+    /// without a query, and `Ignore` rather than `Insert` is the point — a stray
+    /// press must not type a `_` into the search or move the pane layout.
+    #[test]
+    fn near_miss_forms_and_releases_do_not_toggle_the_key_map() {
+        for empty in [true, false] {
+            assert_eq!(
+                key_to_action(ctrl(KeyCode::Char('_')), empty, false, false),
+                Action::Ignore
+            );
+        }
+        let mut app = app_with("s", None);
+        press_ctrl(&mut app, KeyCode::Char('_'));
+        assert_eq!(app.query(), "", "Ctrl-_ must not type into the query");
+        assert_eq!(app.pane_layout(), PaneLayout::Even, "nor move the layout");
+        assert!(!app.show_key_map);
+
+        for ev in [
+            ctrl(KeyCode::Char('_')),
+            key(KeyCode::Char('\u{1f}')),
+            key(KeyCode::Char('?')),
+            key(KeyCode::Char('/')),
+        ] {
+            let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp/launch"));
+            deliver(&mut app, ev);
+            assert!(!app.show_key_map, "{ev:?} must not open the modal");
+        }
+        let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp/launch"));
+        let mut release = key(KeyCode::F(1));
+        release.kind = KeyEventKind::Release;
+        deliver(&mut app, release);
+        assert!(!app.show_key_map, "a release is not actionable");
+        let mut repeat = key(KeyCode::F(1));
+        repeat.kind = KeyEventKind::Repeat;
+        deliver(&mut app, repeat);
+        assert!(app.show_key_map, "a repeat acts like a press");
+    }
+
+    /// `Ctrl-X ?` (and `Ctrl-X` + a shifted `?`) opens the modal from the bare
+    /// board, leaves the chord, and types nothing into the query.
+    #[test]
+    fn ctrl_x_question_mark_opens_the_key_map() {
+        for follow in [key(KeyCode::Char('?')), shift(KeyCode::Char('?'))] {
+            let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp/launch"));
+            press_ctrl(&mut app, KeyCode::Char('x'));
+            assert!(app.pending_chord);
+            deliver(&mut app, follow);
+            assert!(app.show_key_map, "{follow:?} after Ctrl-X opens the modal");
+            assert!(!app.pending_chord, "the chord resolved");
+            assert_eq!(app.query(), "", "the `?` never leaks into the query");
+        }
+        // A bare `?` with no leader still types into search.
+        let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp/launch"));
+        press(&mut app, KeyCode::Char('?'));
+        assert!(!app.show_key_map);
+        assert_eq!(app.query(), "?");
+    }
+
+    /// `F1` works with a query typed, and does not type anything.
+    #[test]
+    fn f1_opens_the_key_map_mid_query_without_typing() {
+        let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp/launch"));
+        app.push_query_char('x');
+        press(&mut app, KeyCode::F(1));
+        assert!(app.show_key_map);
+        assert_eq!(app.query(), "x");
+    }
+
     #[test]
     fn a_bare_y_types_into_the_query() {
         // The copy lives on `Ctrl-X y`, never a bare letter: a bare `y` TYPES, with
@@ -11212,33 +11532,6 @@ mod tests {
         );
     }
 
-    /// The retired preview toggle, `Ctrl-/`, is now an ordinary unbound `Ctrl`
-    /// key: it lands in the ctrl block's "ignore other Ctrl keys" fallback, in BOTH
-    /// encodings a terminal sends it as (`/`, and the 0x1f control code surfaced as
-    /// `_`), with or without a query. `Ignore` rather than `Insert` is the point —
-    /// a stray press of the old key must not type a `/` into the search.
-    #[test]
-    fn the_retired_ctrl_slash_is_ignored_and_never_types() {
-        for empty in [true, false] {
-            assert_eq!(
-                key_to_action(ctrl(KeyCode::Char('/')), empty, false, false),
-                Action::Ignore
-            );
-            assert_eq!(
-                key_to_action(ctrl(KeyCode::Char('_')), empty, false, false),
-                Action::Ignore
-            );
-        }
-
-        // Through the whole handler: the board, the query and the layout are all
-        // exactly what they were.
-        let mut app = app_with("s", None);
-        press_ctrl(&mut app, KeyCode::Char('/'));
-        press_ctrl(&mut app, KeyCode::Char('_'));
-        assert_eq!(app.query(), "", "Ctrl-/ must not type into the query");
-        assert_eq!(app.pane_layout(), PaneLayout::Even, "nor move the layout");
-    }
-
     /// `Shift-←` / `Shift-→` step the layout UNCONDITIONALLY: with and without a
     /// query, and with search hits present — every combination of the two
     /// conditions the SHIFTED VERTICAL arrows depend on. The `marked = true` rows are
@@ -11283,6 +11576,102 @@ mod tests {
             key_to_action(key(KeyCode::Right), false, false, false),
             Action::CaretForward
         );
+    }
+
+    /// End to end through [`handle_event`]: the chord opens the modal, which owns
+    /// the keyboard (keys scroll or are inert, never typed), swallows a paste, and
+    /// closes on `Esc`, `Ctrl-C` or the chord again.
+    #[test]
+    fn the_key_map_modal_owns_the_keyboard_through_the_whole_pipeline() {
+        let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp/launch"));
+        assert!(!app.show_key_map, "off by default");
+
+        press_ctrl(&mut app, KeyCode::Char('?'));
+        assert!(app.show_key_map, "the chord opens it");
+
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Char('?'));
+        assert_eq!(app.query(), "", "keys never type under the modal");
+        press_ctrl(&mut app, KeyCode::Char('n'));
+        assert!(
+            app.modal.is_none() && !app.is_composing(),
+            "Ctrl-N is inert"
+        );
+
+        press(&mut app, KeyCode::PageDown);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.key_map_scroll, KEY_MAP_PAGE_ROWS + 1);
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Home);
+        assert_eq!(app.key_map_scroll, 0);
+        press(&mut app, KeyCode::End);
+        assert!(app.key_map_scroll > 0);
+
+        let outcome = press(&mut app, KeyCode::Esc);
+        assert!(
+            matches!(outcome, Outcome::Continue),
+            "Esc closes, never quits"
+        );
+        assert!(!app.show_key_map);
+        assert_eq!(app.key_map_scroll, 0);
+
+        press_ctrl(&mut app, KeyCode::Char('/'));
+        assert!(app.show_key_map);
+        press_ctrl(&mut app, KeyCode::Char('/'));
+        assert!(!app.show_key_map, "the same chord closes it");
+
+        press_ctrl(&mut app, KeyCode::Char('?'));
+        let outcome = press_ctrl(&mut app, KeyCode::Char('c'));
+        assert!(
+            matches!(outcome, Outcome::Continue),
+            "Ctrl-C closes like a modal"
+        );
+        assert!(!app.show_key_map);
+
+        app.push_query_char('x');
+        press_ctrl(&mut app, KeyCode::Char('?'));
+        assert!(app.show_key_map, "opens mid-query");
+        assert_eq!(app.query(), "x");
+    }
+
+    /// `PgUp`/`PgDn` and `k`/`j` scroll the modal's table the way their names say.
+    /// Started mid-table, because the offset saturates at the top and a flipped
+    /// sign would otherwise hide behind that clamp.
+    #[test]
+    fn key_map_scroll_keys_move_the_table_in_their_own_direction() {
+        let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp/launch"));
+        press(&mut app, KeyCode::F(1));
+        assert!(app.show_key_map);
+        app.key_map_scroll = 25;
+
+        press(&mut app, KeyCode::PageUp);
+        assert_eq!(app.key_map_scroll, 25 - KEY_MAP_PAGE_ROWS, "PgUp is up");
+        press(&mut app, KeyCode::PageDown);
+        assert_eq!(app.key_map_scroll, 25, "PgDn is down");
+
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.key_map_scroll, 24, "k is up");
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.key_map_scroll, 25, "j is down");
+        assert_eq!(app.query(), "", "j and k scroll, never type");
+    }
+
+    /// The `Ctrl-X` leader is inert inside the modal: it arms nothing, does not
+    /// close it, and a `?` after it neither toggles the modal nor types.
+    #[test]
+    fn ctrl_x_is_inert_inside_the_key_map_modal() {
+        let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp/launch"));
+        press(&mut app, KeyCode::F(1));
+        assert!(app.show_key_map);
+
+        press_ctrl(&mut app, KeyCode::Char('x'));
+        assert!(!app.pending_chord, "Ctrl-X arms no chord under the modal");
+        assert!(app.show_key_map, "Ctrl-X does not close it");
+
+        press(&mut app, KeyCode::Char('?'));
+        assert!(app.show_key_map, "a following ? does not close it");
+        assert!(!app.pending_chord);
+        assert_eq!(app.query(), "", "and types nothing");
     }
 
     #[test]
@@ -12935,6 +13324,7 @@ mod tests {
             ChordOutcome::Cancel,
             "only ↓ opens the subagent view"
         );
+        assert_eq!(chord_key(key(KeyCode::Char('?'))), ChordOutcome::KeyMap);
         assert_eq!(
             chord_key(key(KeyCode::Char('F'))),
             ChordOutcome::Fold,

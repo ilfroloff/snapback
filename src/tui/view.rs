@@ -114,6 +114,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if let Some(modal) = app.modal.as_mut() {
         render_modal(frame, modal);
     }
+    // The key-map modal (`F1`, `Ctrl-X ?`, `Ctrl+Shift+/`); opened from the bare
+    // board, so it never coexists with the overlays below or a compose.
+    if app.show_key_map {
+        render_key_map(frame, app);
+    }
     // The "stop the waiting agent?" confirmation overlays the board before compose
     // opens; likewise mutually exclusive with the other modals.
     if app.pending_stop.is_some() {
@@ -5311,7 +5316,10 @@ fn render_search(frame: &mut Frame, app: &mut App, area: Rect) {
 /// `d del row/stack` became `d delete` (the confirm itself offers the stack on
 /// its top row) and `y copy ID` became `y ID` (the status line still says
 /// `Copied session ID …`), with the verb itself singular, which lands it at
-/// exactly 80.
+/// exactly 80. `?` (the key-map modal, the terminal-independent twin of `F1`) is
+/// bound but NOT listed: the line is full, and the board hint's `F1 keys` points at
+/// the same modal in most terminals; where F1 does not arrive, `Ctrl-X ?` is found
+/// through `sb --help`, `docs/GUIDE.md` or the key map itself.
 fn chord_hint(selected_hidden: bool) -> String {
     let x = if selected_hidden { "show" } else { "hide" };
     format!("^X x {x} · d delete · h hidden · r reload · y ID · f fold · w move · ↓ subagent")
@@ -5372,11 +5380,285 @@ const FORK_HINT: &str = "Enter fork · ^O run interactively · ^L model · ^J ne
 /// row (pinned by `every_compose_hint_form_fits_an_eighty_column_terminal`).
 const COMPLETION_HINT: &str = "↑/↓ choose · Enter/Tab pick · Esc close list";
 
-/// The bottom help line: the keybinding cheat sheet, a transient board status
-/// (e.g. a resume refusal) when one is set, or the [`chord_hint`] while a `Ctrl-X`
-/// leader chord is pending. A status wins over the cheat sheet and is flattened to
-/// a single row (newlines -> spaces) since the help area is 1 tall; the chord hint
-/// wins over both, since the chord owns the keyboard the moment it is armed.
+/// The default board hint — no pending chord, no status, not composing, and the
+/// key-map modal ([`render_key_map`]) not open. It replaced a line that listed
+/// every binding in well over 80 columns and clipped silently past column 80 (see
+/// git history).
+///
+/// It names only keys a user cannot guess. Those a list UI makes self-evident
+/// (arrows move, `Enter` resumes, `Esc` quits) are left out. What stays is
+/// snapback's own: `Tab` widens the search into transcript content; the three
+/// agent actions (`Ctrl-N` new, `Ctrl-R` reply, `Ctrl-K` stop); the `Ctrl-X`
+/// leader, whose follow-ups [`chord_hint`] shows the moment it is pressed; and
+/// `F1`, the key-map modal, for everything else. That is `F1`, not
+/// `Ctrl+Shift+/`, because a terminal often cannot deliver the latter (it arrives
+/// as Backspace or nothing).
+///
+/// 65 columns by `unicode-width`, kept inside the 80-column help row by
+/// `default_help_hint_fits_the_target_width`.
+const DEFAULT_HELP_HINT: &str = "Tab content · ^N new · ^R reply · ^K stop · ^X hide/del · F1 keys";
+
+/// One section of the key-map modal: a heading and its `(keys, action)` rows.
+struct KeyMapSection {
+    title: &'static str,
+    rows: &'static [(&'static str, &'static str)],
+}
+
+/// The key-map modal's content, the ONE place its wording lives. Phrasing follows
+/// `cli.rs`'s `KEYS` and `docs/GUIDE.md` (AGENTS.md's KEEP KEY DOCS IN SYNC)
+/// rather than describing the bindings a third way; it is a summary, those hold
+/// the full routing.
+const KEY_MAP: &[KeyMapSection] = &[
+    KeyMapSection {
+        title: "Sessions",
+        rows: &[
+            ("↑/↓", "move the selection"),
+            (
+                "Enter",
+                "resume (a running session offers Attach / Fork / Cancel)",
+            ),
+            (
+                "Ctrl-F",
+                "fork the selected session: a box for the fork's first message",
+            ),
+            (
+                "Ctrl-N",
+                "new session: pick an agent, then draft its first message",
+            ),
+            ("Ctrl-R", "quick reply without leaving the board"),
+            (
+                "Ctrl-K",
+                "stop / interrupt the selected session's live agent",
+            ),
+            (
+                "Ctrl-A",
+                "scope: folder / project (/ all folders when launched with -a)",
+            ),
+        ],
+    },
+    KeyMapSection {
+        title: "Search",
+        rows: &[
+            ("type", "search; Tab toggles name / name+content"),
+            (
+                "Esc",
+                "clear the search; else leave a subagent's transcript; else quit",
+            ),
+            (
+                "←/→",
+                "move the search cursor (Alt+←/→, Alt+B/F or Ctrl+←/→ by word)",
+            ),
+            ("Backspace", "delete the character before the cursor"),
+            ("Alt+Bksp", "delete a word (also Ctrl-W, Alt+H)"),
+            (
+                "S-↑/↓",
+                "previous / next line the query marks in the preview",
+            ),
+        ],
+    },
+    KeyMapSection {
+        title: "Panes",
+        rows: &[
+            ("S-←/→", "layout stop: 0:1 · 1:3 · 1:1 · 3:1 · 1:0"),
+            ("PgUp/PgDn", "preview page (Ctrl-U / Ctrl-D quarter page)"),
+            ("Home/End", "preview top / bottom (Ctrl-T / Ctrl-E)"),
+            (
+                "mouse",
+                "wheel scrolls; click unfolds, opens a link or a subagent; drag copies",
+            ),
+            (
+                "dbl-click",
+                "in the preview: select the word under the pointer and copy it",
+            ),
+        ],
+    },
+    KeyMapSection {
+        title: "Ctrl-X chord",
+        rows: &[
+            (
+                "Ctrl-X x",
+                "hide / un-hide the session (on a stack's row, the copies it shows too)",
+            ),
+            ("Ctrl-X d", "hard-delete the row or its lineage (confirms)"),
+            ("Ctrl-X h", "show / hide hidden sessions"),
+            ("Ctrl-X r", "re-read every transcript from disk"),
+            ("Ctrl-X y", "copy the session ID"),
+            ("Ctrl-X f", "fold / expand the fork lineage"),
+            ("Ctrl-X w", "move the session to another worktree"),
+            ("Ctrl-X ↓", "show a subagent's transcript; again to go back"),
+            ("Ctrl-X ?", "this key map"),
+        ],
+    },
+    KeyMapSection {
+        title: "In a subagent's transcript",
+        rows: &[
+            ("←/→", "previous / next subagent, in launch order"),
+            ("↑ or Esc", "back to the session's own transcript"),
+        ],
+    },
+    KeyMapSection {
+        title: "In a reply, fork or draft box",
+        rows: &[
+            (
+                "Enter",
+                "send the reply / make the fork / start the draft in the background",
+            ),
+            (
+                "Ctrl-O",
+                "run the fork or draft interactively (in the agent picker too)",
+            ),
+            ("Ctrl-J", "newline (Alt+Enter too)"),
+            (
+                "Ctrl-L",
+                "pick the model (and effort) for this message only",
+            ),
+            (
+                "/ or @",
+                "pick list: skills and commands / files and agents",
+            ),
+            ("Esc", "cancel"),
+        ],
+    },
+    KeyMapSection {
+        title: "In a picker",
+        rows: &[
+            (
+                "←/→",
+                "model picker: step the highlighted model's effort (default · low · medium · high · xhigh · max)",
+            ),
+            (
+                "Enter",
+                "move picker: move the session to the chosen worktree (a stack's top row asks this session or the whole lineage first)",
+            ),
+        ],
+    },
+    KeyMapSection {
+        title: "General",
+        rows: &[
+            (
+                "paste",
+                "inserted as text, never sends: newlines kept in a box, spaces in the search",
+            ),
+            (
+                "F1",
+                "open this key map (also Ctrl-X ?, Ctrl+Shift+/, Ctrl-/); Esc, Ctrl-C, F1 or Ctrl+Shift+/ closes it",
+            ),
+            (
+                "Ctrl-C",
+                "quit from the board; inside this key map or another modal it closes it instead",
+            ),
+        ],
+    },
+];
+
+/// Width of the key-map modal: wider than [`MODAL_WIDTH`] because every row is a
+/// key column plus a sentence. [`centered_rect`] shrinks it to a narrow terminal.
+const KEY_MAP_WIDTH: u16 = 76;
+
+/// Rows the key-map modal spends below its table: the footer.
+const KEY_MAP_FOOTER_ROWS: u16 = 1;
+
+/// Blank columns between the key column and the action column.
+const KEY_MAP_GAP: usize = 2;
+
+/// What the key-map modal's footer says about leaving and scrolling. The close
+/// keys lead so a terminal narrower than the modal clips the scroll keys first.
+const KEY_MAP_FOOTER: &str = "Esc Ctrl-C F1 Ctrl+Shift+/ close · ↑/↓ j/k PgUp/PgDn Home/End scroll";
+
+/// The key-map table as drawn lines for a modal `inner_width` columns wide:
+/// a bold-cyan heading per section, then one row per binding with the keys bold
+/// yellow in an aligned column and the action in the default foreground,
+/// word-wrapped under its own column. The key column is clipped to half the
+/// width on a narrow terminal. Pure, so layout and width are unit-testable.
+fn key_map_lines(inner_width: usize) -> Vec<Line<'static>> {
+    let widest_key = KEY_MAP
+        .iter()
+        .flat_map(|section| section.rows)
+        .map(|(keys, _)| UnicodeWidthStr::width(*keys))
+        .max()
+        .unwrap_or(0);
+    let key_w = widest_key.min(inner_width / 2);
+    let action_w = inner_width.saturating_sub(key_w + KEY_MAP_GAP).max(1);
+    let key_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (i, section) in KEY_MAP.iter().enumerate() {
+        if i > 0 {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled(
+            section.title,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for (keys, action) in section.rows {
+            let clipped: String = keys.chars().take(key_w).collect();
+            let pad = key_w.saturating_sub(UnicodeWidthStr::width(clipped.as_str()));
+            let wrapped = wrap_message(action, u16::try_from(action_w).unwrap_or(u16::MAX));
+            for (n, text) in wrapped.into_iter().enumerate() {
+                let lead = if n == 0 {
+                    Span::styled(format!("{clipped}{}", " ".repeat(pad)), key_style)
+                } else {
+                    Span::raw(" ".repeat(key_w))
+                };
+                lines.push(Line::from(vec![
+                    lead,
+                    Span::raw(" ".repeat(KEY_MAP_GAP)),
+                    Span::raw(text),
+                ]));
+            }
+        }
+    }
+    lines
+}
+
+/// The key-map modal (`F1`, `Ctrl-X ?`, `Ctrl+Shift+/`), drawn over the board with a [`Clear`].
+/// Sized to its table and clamped by [`centered_rect`]; when the terminal is too
+/// short the table scrolls (`App::key_map_scroll`), clamped here against the real
+/// viewport and written back, as a `List` modal's scroll is.
+fn render_key_map(frame: &mut Frame, app: &mut App) {
+    let screen = frame.area();
+    let inner_width = usize::from(
+        KEY_MAP_WIDTH
+            .min(screen.width)
+            .saturating_sub(MODAL_BORDER_COLS),
+    );
+    let lines = key_map_lines(inner_width);
+    let asked = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(KEY_MAP_FOOTER_ROWS)
+        .saturating_add(MODAL_BORDER_ROWS);
+    let area = centered_rect(screen, KEY_MAP_WIDTH, asked);
+    let viewport = usize::from(
+        area.height
+            .saturating_sub(KEY_MAP_FOOTER_ROWS)
+            .saturating_sub(MODAL_BORDER_ROWS),
+    );
+    app.key_map_scroll = app.key_map_scroll.min(lines.len().saturating_sub(viewport));
+    let mut shown: Vec<Line<'static>> = lines
+        .into_iter()
+        .skip(app.key_map_scroll)
+        .take(viewport)
+        .collect();
+    shown.push(Line::from(Span::styled(
+        KEY_MAP_FOOTER,
+        Style::default().add_modifier(Modifier::DIM),
+    )));
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(shown).block(Block::default().borders(Borders::ALL).title(" Keys ")),
+        area,
+    );
+}
+
+/// The bottom help line: the [`chord_hint`] while a `Ctrl-X` leader chord is
+/// pending, else a transient board status (e.g. a resume refusal) when one is
+/// set, else the [`compose_hint`] while composing, else the trimmed
+/// [`DEFAULT_HELP_HINT`] cheat sheet. The row is always ONE row tall; the full
+/// key map lives in its own modal ([`render_key_map`]). A status is flattened to
+/// a single row (newlines -> spaces).
 fn render_help(frame: &mut Frame, app: &App, area: Rect) {
     if app.pending_chord {
         // The leader chord took the keyboard: show its follow-up keys so the chord
@@ -5395,142 +5677,58 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(Paragraph::new(hint), area);
         return;
     }
-    let line = if let Some(status) = &app.status {
-        // A transient status (a refusal, or a send's cost / error) wins the
-        // line, flattened to a single row.
+    if let Some(status) = &app.status {
+        // A transient status (a refusal, or a send's cost / error)
+        // wins the line, flattened to a single row.
         let flat = status.split_whitespace().collect::<Vec<_>>().join(" ");
-        Line::from(vec![Span::styled(
+        let line = Line::from(vec![Span::styled(
             flat,
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
-        )])
-    } else if let Some(compose) = &app.compose {
+        )]);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
+    if let Some(compose) = &app.compose {
         // The compose zone owns the keyboard: show its chords instead of the board
         // keymap. Ctrl-J is the primary newline; Alt+Enter the guaranteed fallback.
-        Line::from(vec![Span::styled(
+        let line = Line::from(vec![Span::styled(
             compose_hint(&compose.target, compose.completion.visible.is_some()),
             Style::default().add_modifier(Modifier::DIM),
-        )])
-    } else {
-        // The board keymap — one of the five surfaces AGENTS.md's KEEP KEY DOCS IN
-        // SYNC names. It does NOT mention the terminal's paste, on COLUMN BUDGET:
-        // this line is already 253 columns (measured with the `unicode-width` the
-        // renderer counts in) against a help row that is ONE line and never wraps, so
-        // on an 80-column terminal it is cut the instant `^K stop` ends and
-        // everything from `^X hide/del` (column 84) rightward is already unpainted.
-        // A 23-column "paste keeps newlines" clause would land at columns 254-276 —
-        // nowhere, on any realistic width. What a board paste DOES (insert at the
-        // query's cursor with newlines flattened to spaces, and never resume) is
-        // documented where there is room to say it: `KEYS` in `cli.rs` and the key
-        // map in `docs/GUIDE.md`.
-        //
-        // The QUERY WORD-DELETE keys are omitted for exactly the same reason, and
-        // just as deliberately. Even the tersest honest clause (`· ⌥⌫ del word`,
-        // 14 columns) would be painted at columns 253-266 — off the end of any
-        // realistic width — and terse is the one thing this binding cannot be:
-        // `Alt-Backspace`, `Ctrl-W` and `Alt-H` ALL do it, on purpose, so that the
-        // board answers the same set the compose box does whatever the terminal
-        // sends for Option, and naming one of the three would advertise a key set
-        // narrower than the one that works. All three are documented on every
-        // OTHER surface KEEP KEY DOCS IN SYNC names — the ones with room for that
-        // sentence: the keybinding table in `update.rs`'s module doc, `KEYS` in
-        // `cli.rs`, the key map in `docs/GUIDE.md`, and the `Alt`-binding rule in
-        // PATTERNS.md's "Keys, actions, outcomes". Plain `Backspace` (one
-        // character) is unmentioned here on the same budget.
-        //
-        // `S-↑↓ match` sits with the search cluster rather than with the scroll
-        // keys, because it is search navigation that happens to move a pane — and
-        // it is spelled `S-` rather than `⇧` so it needs no glyph the terminal may
-        // not have. It is off-screen at 80 columns like everything past `^X`, and
-        // that is the same budget every clause here is judged against; the key is
-        // documented in full in `KEYS` and `docs/GUIDE.md`.
-        //
-        // `S-←→ layout` is spelled the same way for the same reason, and names the
-        // pair rather than the five stops they walk — those take a sentence, and
-        // `KEYS` and `docs/GUIDE.md` have room for it.
-        //
-        // `A-←→·^←→ word` is the query's word hop, beside `type to search` in the
-        // search cluster (columns 115-127, off-screen at 80 like everything past
-        // `^X`): it cannot sit next to `←→ query cursor` without pushing `^K stop`
-        // past column 80. `A-` is `Alt` spelled like `S-`, for the same no-glyph
-        // reason. `Alt-b` / `Alt-f` go unnamed because they are not a third gesture
-        // but the other bytes a terminal may send for `A-←→` itself, so the clause
-        // names every gesture that works; the byte forms are spelled out in `KEYS`,
-        // the key map in `docs/GUIDE.md` and `update.rs`'s table.
-        //
-        // `^T/^E` sits beside `Home/End` in the scroll cluster (its twin action, not
-        // a separate one) rather than beside `^U/^D`: the scroll cluster already
-        // begins past column 187, so wherever in it a new token lands is equally
-        // off-screen at 80 columns — this placement is purely for readability.
-        //
-        // `^K stop` covers all of `Ctrl-K`'s routes with one word, deliberately:
-        // the job-id route runs `claude stop` and the pid route sends a SIGTERM,
-        // which is a REQUEST to stop, so "stop" is true of both without promising
-        // that a process ended. It also cannot grow. It ends at EXACTLY column 80,
-        // so any extra glyph (`^K stop/signal`, say) would cut its own tail on an
-        // 80-column terminal. The routes are spelled out where there is room:
-        // `KEYS` in `cli.rs`, the key map in `docs/GUIDE.md` and the table in
-        // `update.rs`.
-        //
-        // `^R reply` stays one word too. Its refusals (a live agent, a session with
-        // no job to stop first, and a session whose own reply is still being sent)
-        // are refusals, not routes, and each explains itself on this line when it
-        // fires. The key sits at columns 63-70 of a line cut at 80, so it has
-        // no room to list them anyway. They are spelled out on the same three
-        // surfaces as `^K`'s routes.
-        //
-        // The compose box's `^L` (pick THIS reply's or draft's model) is absent for
-        // the reason `^J` is: it is a key of the COMPOSE box, not of the board, and
-        // this line lists the board's keys alone. The compose hint that replaces this
-        // line while a box is open names it ([`compose_hint`]), and the model picker
-        // it opens names its own `←/→` effort keys in its prompt and footer — so the
-        // `←→` below means the search query's cursor ON THE BOARD only.
-        //
-        // The lineage fold is `Ctrl-X f`, named where the chord is armed
-        // ([`chord_hint`]); `^X hide/del` here was never the chord's full verb list.
-        //
-        // `drag copy` names the preview drag-selection beside the board's other
-        // mouse gesture, `wheel scroll`, in two words: the drag selects and its
-        // release copies. A double-click selects and copies a word the same way and
-        // is spelled out in `KEYS` and `docs/GUIDE.md`, not here. Like everything past
-        // `^X` it is off-screen at 80 columns.
-        // The rest — a click on its release still opens a link, unfolds a node or
-        // switches the pane to the subagent a `◆ delegated to …` line names, a drag
-        // held past the pane's top or bottom edge scrolls it and keeps selecting,
-        // the copy goes the way `Ctrl-X y`'s does, Shift/Option for the terminal's
-        // own selection — is spelled out in `KEYS` and `docs/GUIDE.md`, where there
-        // is room.
-        //
-        // `Esc clear/back/quit` names `Esc`'s three steps in order: clear a typed
-        // query, else go BACK from the subagent view to the session's own
-        // transcript, else quit (`update::key_to_action`).
-        //
-        // The leading arrows name what the plain arrows do NOW
-        // ([`board_arrows_hint`]): `↑↓` the selection and `←→` the search query's
-        // cursor, or — while the pane shows the subagent view, query or not — `↑`
-        // back to the session's own transcript and `←→` the step to the previous /
-        // next subagent.
-        Line::from(vec![Span::styled(
-            format!("{} · Enter resume · ^F fork · ^N new · ^R reply · ^K stop · ^X hide/del · type to search · A-←→·^←→ word · Tab name/content · S-↑↓ match · ^A scope · S-←→ layout · PgUp/PgDn·^U/^D·^T/^E·Home/End·wheel scroll · drag copy · Esc clear/back/quit", board_arrows_hint(app.in_subagent_view())),
-            Style::default().add_modifier(Modifier::DIM),
-        )])
-    };
+        )]);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
+    // The board keymap — one of the surfaces AGENTS.md's KEEP KEY DOCS IN SYNC
+    // names. See `DEFAULT_HELP_HINT`'s doc comment for what it names and why. It
+    // does NOT mention the terminal's paste, on COLUMN BUDGET: what a board paste
+    // DOES (insert at the query's cursor with newlines flattened to spaces, and never
+    // resume) is documented where there is room to say it: `KEYS` in `cli.rs` and
+    // the `docs/GUIDE.md` key map — same as every binding this line does not list.
+    let line = Line::from(vec![Span::styled(
+        board_hint(app.in_subagent_view()),
+        Style::default().add_modifier(Modifier::DIM),
+    )]);
     frame.render_widget(Paragraph::new(line), area);
 }
 
-/// What the board keymap says the plain arrows do (`update::key_to_action`):
-/// `↑`/`↓` move the selection and `←`/`→` the search query's cursor, or — while
-/// the preview shows the subagent view, query or not — `↑` goes back to the
-/// session's own transcript and `←`/`→` step to the previous / next subagent.
-/// The view's form leaves out `↓`, which still moves there: naming it would push
-/// `^K stop` past column 80, and each form must keep the keymap's leading keys
-/// inside 80 columns (the board's ends there exactly). PURE.
-fn board_arrows_hint(in_subagent_view: bool) -> &'static str {
+/// The board hint while the preview shows the subagent view
+/// (`App::in_subagent_view`). There the plain arrows stop being obvious — `↑`
+/// goes BACK to the session's own transcript and `←`/`→` step to the previous /
+/// next subagent (`update::key_to_action`) — so they lead the line, and
+/// `Tab content` gives up its columns for them. Kept under
+/// the 80-column help row by `default_help_hint_fits_the_target_width`.
+const SUBAGENT_HELP_HINT: &str =
+    "↑ back · ←→ subagent · ^N new · ^R reply · ^K stop · ^X hide/del · F1 keys";
+
+/// Which board hint the help line shows: [`SUBAGENT_HELP_HINT`] while the pane
+/// shows the subagent view, else [`DEFAULT_HELP_HINT`]. PURE.
+fn board_hint(in_subagent_view: bool) -> &'static str {
     if in_subagent_view {
-        "↑ back · ←→ subagent"
+        SUBAGENT_HELP_HINT
     } else {
-        "↑↓ move · ←→ query cursor"
+        DEFAULT_HELP_HINT
     }
 }
 
@@ -6678,6 +6876,7 @@ mod tests {
 
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use unicode_width::UnicodeWidthStr;
 
     use super::super::app::ModalAction;
     use super::*;
@@ -18415,9 +18614,10 @@ mod tests {
             }
         }
     }
-    /// The board keymap names what the plain `←`/`→` do NOW: the search query's
-    /// cursor on the board, the subagent step while the pane shows the subagent
-    /// view — and either way an 80-column terminal still draws `^K stop` whole.
+    /// The board keymap names the plain `←`/`→` only where they are not obvious:
+    /// never on the board (they move the search cursor), but as the subagent step
+    /// while the pane shows the subagent view — and either way an 80-column
+    /// terminal draws the whole line, `F1 keys` included.
     #[test]
     fn the_board_keymap_names_what_the_plain_arrows_do_now() {
         let mut session = sample_session();
@@ -18430,7 +18630,7 @@ mod tests {
         };
 
         let board = help(&mut app, 300);
-        assert!(board.contains("←→ query cursor"), "{board:?}");
+        assert!(!board.contains("query cursor"), "{board:?}");
         assert!(!board.contains("←→ subagent"), "{board:?}");
 
         app.open_subagent_view("a1b2c3d4e5f6a7b8c", "parser-auditor");
@@ -18444,11 +18644,13 @@ mod tests {
             }
             let narrow = help(&mut app, 80);
             assert!(narrow.contains("^K stop"), "in_view={in_view}: {narrow:?}");
+            assert!(narrow.contains("F1 keys"), "in_view={in_view}: {narrow:?}");
         }
     }
 
-    /// The keymap's `↑` follows the key too: `↑↓ move` on the board, `↑ back`
-    /// while the pane shows the subagent view, where `↑` leaves it.
+    /// The keymap's `↑` follows the key too: unnamed on the board, where it just
+    /// moves, and `↑ back` while the pane shows the subagent view, where `↑`
+    /// leaves it.
     #[test]
     fn the_board_keymap_names_up_as_back_in_the_subagent_view() {
         let mut session = sample_session();
@@ -18461,7 +18663,7 @@ mod tests {
         };
 
         let board = help(&mut app);
-        assert!(board.starts_with("↑↓ move · "), "{board:?}");
+        assert!(board.starts_with("Tab content · "), "{board:?}");
         assert!(!board.contains("↑ back"), "{board:?}");
 
         app.open_subagent_view("a1b2c3d4e5f6a7b8c", "parser-auditor");
@@ -21187,6 +21389,198 @@ mod tests {
         assert!(!chord_hint(false).contains("show"));
         assert!(chord_hint(true).contains("x show"));
         assert!(!chord_hint(true).contains("x hide"));
+    }
+
+    /// The trimmed default hint must fit an 80-column terminal with room to
+    /// spare — a real assertion, not only the doc-comment's prose measurement,
+    /// so a future edit that widens the string past budget fails loudly here
+    /// instead of silently clipping on a real terminal (the bug this line
+    /// replaced).
+    #[test]
+    fn default_help_hint_fits_the_target_width() {
+        const HELP_ROW_BUDGET: usize = 80;
+        for hint in [DEFAULT_HELP_HINT, SUBAGENT_HELP_HINT] {
+            let width = UnicodeWidthStr::width(hint);
+            // Comfortable room to spare, not just barely under budget.
+            assert!(
+                width + 4 <= HELP_ROW_BUDGET,
+                "{hint:?} ({width} cols) leaves less than 4 columns of headroom \
+                 under the {HELP_ROW_BUDGET}-column budget"
+            );
+        }
+    }
+
+    /// It names the keys a user cannot guess and none a list UI makes
+    /// self-evident, so re-adding an obvious one fails here.
+    #[test]
+    fn default_help_hint_names_only_the_non_obvious_keys() {
+        for needle in [
+            "Tab content",
+            "^N new",
+            "^R reply",
+            "^K stop",
+            "^X hide/del",
+            "F1 keys",
+        ] {
+            assert!(
+                DEFAULT_HELP_HINT.contains(needle),
+                "DEFAULT_HELP_HINT must mention {needle:?}: {DEFAULT_HELP_HINT:?}"
+            );
+        }
+        for obvious in ["↑", "↓", "Enter", "Esc"] {
+            assert!(
+                !DEFAULT_HELP_HINT.contains(obvious),
+                "DEFAULT_HELP_HINT must not spend columns on {obvious:?}: {DEFAULT_HELP_HINT:?}"
+            );
+        }
+    }
+
+    /// The table carries a representative handful of bindings, including ones the
+    /// trimmed default line no longer advertises, and the toggle chord itself.
+    #[test]
+    fn key_map_spot_checks_a_handful_of_bindings() {
+        let text: String = key_map_lines(80)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        for needle in [
+            "Ctrl-F",
+            "Ctrl-N",
+            "Ctrl-R",
+            "Ctrl-K",
+            "Ctrl-X d",
+            "Ctrl-X ?",
+            "F1",
+            "Ctrl-L",
+            "Ctrl-A",
+            "S-←/→",
+            "Ctrl+Shift+/",
+            "Backspace",
+            "Alt+B/F",
+            "dbl-click",
+            "effort",
+            "move picker",
+            "paste",
+            "hide / un-hide",
+        ] {
+            assert!(text.contains(needle), "key map must mention {needle:?}");
+        }
+    }
+
+    /// The footer names every key that closes and scrolls the modal and fits the
+    /// modal's inner width unclipped, so what it promises is what the handler does.
+    #[test]
+    fn key_map_footer_names_every_close_and_scroll_key_within_the_modal() {
+        for key in [
+            "Esc",
+            "Ctrl-C",
+            "F1",
+            "Ctrl+Shift+/",
+            "↑/↓",
+            "j/k",
+            "PgUp/PgDn",
+            "Home",
+            "End",
+        ] {
+            assert!(KEY_MAP_FOOTER.contains(key), "footer must name {key:?}");
+        }
+        let inner = usize::from(KEY_MAP_WIDTH - MODAL_BORDER_COLS);
+        assert!(UnicodeWidthStr::width(KEY_MAP_FOOTER) <= inner);
+    }
+
+    /// The `Ctrl-C` row tells the truth about the modal it is drawn in: it closes
+    /// there, it does not quit.
+    #[test]
+    fn key_map_ctrl_c_row_says_it_closes_the_modal() {
+        let row = KEY_MAP
+            .iter()
+            .flat_map(|section| section.rows.iter())
+            .find(|(key, _)| *key == "Ctrl-C")
+            .expect("a Ctrl-C row");
+        assert!(row.1.contains("closes"), "Ctrl-C row: {:?}", row.1);
+        assert!(!row.1.contains("always"), "Ctrl-C row: {:?}", row.1);
+    }
+
+    /// Every drawn line fits its width (down to the narrowest the clip keeps
+    /// readable) and no width panics, zero included; the table is never dim and
+    /// uses only named colors.
+    #[test]
+    fn key_map_lines_fit_every_width_and_never_panic() {
+        for width in 0..=200usize {
+            let lines = key_map_lines(width);
+            assert!(!lines.is_empty());
+            // Below this a single long word can outrun the action column; the
+            // paragraph clips it rather than the table breaking words.
+            if width >= 40 {
+                for line in &lines {
+                    let w: usize = line
+                        .spans
+                        .iter()
+                        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                        .sum();
+                    assert!(w <= width, "width {width}: line of {w} columns: {line:?}");
+                }
+            }
+        }
+        for line in key_map_lines(80) {
+            for span in line.spans {
+                assert!(!span.style.add_modifier.contains(Modifier::DIM));
+                assert!(matches!(
+                    span.style.fg,
+                    None | Some(Color::Yellow) | Some(Color::Cyan)
+                ));
+            }
+        }
+    }
+
+    /// The key column is aligned: every wrapped continuation and every row's
+    /// action starts at the same column.
+    #[test]
+    fn key_map_action_column_is_aligned() {
+        let lines = key_map_lines(40);
+        let starts: std::collections::HashSet<usize> = lines
+            .iter()
+            .filter(|l| l.spans.len() == 3)
+            .map(|l| {
+                UnicodeWidthStr::width(l.spans[0].content.as_ref())
+                    + UnicodeWidthStr::width(l.spans[1].content.as_ref())
+            })
+            .collect();
+        assert_eq!(starts.len(), 1, "one action column, got {starts:?}");
+    }
+
+    /// Open, the modal is drawn over the board and the help row stays the one-row
+    /// default hint; a too-short terminal clamps and writes back the scroll.
+    #[test]
+    fn key_map_modal_draws_over_the_board_and_clamps_scroll() {
+        let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp/launch"));
+        app.show_key_map = true;
+        let tall = 80u16;
+        let buffer = drawn_board(&mut app, 100, tall);
+        let painted = (0..tall)
+            .map(|y| full_row_text(&buffer, y, 100))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(painted.contains("Ctrl-X d"), "table drawn:\n{painted}");
+        assert!(
+            painted.contains(DEFAULT_HELP_HINT),
+            "help row stays one line"
+        );
+        assert_eq!(app.key_map_scroll, 0, "tall terminal clamps scroll to 0");
+
+        app.key_map_scroll = usize::MAX / 2;
+        let short = 12u16;
+        let buffer = drawn_board(&mut app, 50, short);
+        assert!(app.key_map_scroll > 0 && app.key_map_scroll < usize::MAX / 2);
+        let painted = (0..short)
+            .map(|y| full_row_text(&buffer, y, 50))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            painted.contains("close"),
+            "footer survives a short terminal"
+        );
     }
 
     #[test]

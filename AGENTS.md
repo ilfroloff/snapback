@@ -343,13 +343,16 @@ one place.
   `src/watch.rs`, `src/worktrees.rs`)
 - **KEEP KEY DOCS IN SYNC.** A key/flag change must update, together: the
   keybinding table in `update.rs`'s module doc; `USAGE`/`KEYS` in `cli.rs`; the
-  help line, the draft card and the preview's running list in `view.rs` (EVERY
-  key string that renders there: the board keymap, `chord_hint`'s which-key list,
-  `compose_hint`'s reply hint, `FORK_HINT`, `BG_DRAFT_HINT`, and the
-  `COMPLETION_HINT` every compose box shows while the pick list is open; the
-  card's `draft_hint` names `BG_DRAFT_HINT`, or `COMPLETION_HINT` while the list
-  is open; the running list's `RUNNING_LIST_HINT`, or `RUNNING_LIST_VIEW_HINT`
-  in the subagent view); the key map in `docs/GUIDE.md`; and
+  help line, the draft card, the key-map modal and the preview's running list in
+  `view.rs` (EVERY key string that renders there: the board keymap
+  (`DEFAULT_HELP_HINT`, or `SUBAGENT_HELP_HINT` in the subagent view),
+  `chord_hint`'s which-key list, `compose_hint`'s reply hint, `FORK_HINT`,
+  `BG_DRAFT_HINT`, and the `COMPLETION_HINT` every compose box shows while the
+  pick list is open; the card's `draft_hint` names `BG_DRAFT_HINT`, or
+  `COMPLETION_HINT` while the list is open; the key-map modal's `KEY_MAP` table,
+  which lists EVERY board key, so a new or renamed key lands there too; the
+  running list's `RUNNING_LIST_HINT`, or `RUNNING_LIST_VIEW_HINT` in the subagent
+  view); the key map in `docs/GUIDE.md`; and
   any prose enumeration of a key set in `docs/agents/*` (for example,
   PATTERNS.md's follow-bottom re-arm passage). This is the ONE list of those
   surfaces; the other docs point here.
@@ -360,12 +363,12 @@ one place.
   every compose box shares (`Ctrl-L`, `/` or `@`) is ONE shared "in a compose
   box" entry in each key map — the `update.rs` table, `KEYS`, `docs/GUIDE.md` —
   that the `Ctrl-R`, `Ctrl-F` and `Ctrl-N` entries point to, never copies.
-  The help line is ONE row, cut rather than wrapped: `chord_hint`, the reply hint,
-  `FORK_HINT` and `COMPLETION_HINT` are column-budgeted to fit 80 whole (each
-  pinned by a test), while the board keymap
-  and `BG_DRAFT_HINT` run past 80 and are cut there, so an 80-column terminal
-  draws only their leading keys. It binds ROUTING too, not just bindings: when a
-  key's gate gains a case (a new `AgentActivity` bucket, a new refusal), every
+  The help line is ONE row, cut rather than wrapped: the board keymap,
+  `chord_hint`, the reply hint, `FORK_HINT` and `COMPLETION_HINT` are
+  column-budgeted to fit 80 whole (each pinned by a test), while `BG_DRAFT_HINT`
+  runs past 80 and is cut there, so an 80-column terminal draws only its leading
+  keys. It binds ROUTING too, not just bindings: when a key's gate gains a case
+  (a new `AgentActivity` bucket, a new refusal), every
   place that ENUMERATES that routing is stale until updated — the five above plus
   the gate tables in [DOMAIN.md](docs/agents/DOMAIN.md). A partial enumeration is
   a wrong one.
