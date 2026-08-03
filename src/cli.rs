@@ -116,6 +116,7 @@ KEYS:
                   ↑, Esc, or Ctrl-X ↓ again, goes back; a search stays as
                   typed. Refused while the session's subagents are still being
                   read, or when it has none
+                  · ? open the key-map table (same as F1)
     Ctrl-R        quick reply — send a one-shot message to the selected session
                   without leaving the board. An agent whose run is over (done,
                   stopped, failed) is stopped first so the reply lands in place;
@@ -194,7 +195,8 @@ KEYS:
                   stay plain ↑/↓ (a subagent's transcript marks nothing, so there
                   Shift+↑ goes back), so they never take a key away from you. One
                   stop per marked line, not per repeated word
-    wheel         scroll preview / list (mouse mode on). While a compose or draft
+    wheel         scroll preview / list (mouse mode on); the key-map table while
+                  it is open, wherever the pointer is. While a compose or draft
                   box is open the list stops taking notches — a wheel over it
                   does nothing, so the session you are writing to cannot slide
                   away under the pointer. Anywhere else the wheel still scrolls
@@ -235,7 +237,18 @@ KEYS:
                   spaces. It never sends, resumes, or answers a confirmation
     Esc           clear the search query; with none typed, leave a subagent's
                   transcript for the session's own; with neither, quit
-    Ctrl-C        quit          (always)
+    Ctrl-C        quit from the board; while a modal, a confirmation, the key map
+                  or a Ctrl-X chord is open it closes or cancels that instead, and
+                  in a compose box it never quits (Esc cancels the box)
+    F1            open the full key-map table in a modal (also Ctrl-X ?, which works
+                  in every terminal; F1 works in most: GNOME Terminal keeps it for
+                  its own Help and a Mac laptop needs Fn+F1): ↑/↓ (or k/j) PgUp/PgDn
+                  Home/End and the wheel scroll, Esc, Ctrl-C or F1 closes it
+                  (Ctrl-X ? only opens it). Ctrl+Shift+/ (and
+                  Ctrl-?, Ctrl-/) open and close it too, but many terminals
+                  cannot send them — Ctrl-? often arrives as Backspace, and
+                  without the kitty keyboard protocol Ctrl+Shift+/ is
+                  indistinguishable from Ctrl-/
 
 BACK TO THE BOARD (typed inside a resumed Claude session, not a snapback key):
     /bg           detach the session — it keeps running as a bg agent — and snap

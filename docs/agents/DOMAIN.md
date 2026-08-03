@@ -3350,12 +3350,13 @@ prefetch: with it, that prefetch never runs the repository's git configuration (
 `tui::init_terminal` enables **bracketed paste**, so the terminal delivers a
 clipboard drop as ONE `crossterm::event::Event::Paste` carrying the whole string.
 `update::handle_paste` routes it through the SAME precedence the key arm uses
-(`App::keyboard_owner`, the board being the sixth, when no `KeyboardOwner` is
-open) — a partial enumeration here is a wrong one, so all six are stated:
+(`App::keyboard_owner`, the board being the seventh, when no `KeyboardOwner` is
+open) — a partial enumeration here is a wrong one, so all seven are stated:
 
 | Owner (in precedence order) | What a paste does | Why |
 | --- | --- | --- |
 | **Modal** (`handle_modal_key`) | ignored | A fixed choice with no text field. Acting would pick an option the user did not choose; falling through would type into whatever the overlay is covering — the query, or, under a compose's `Ctrl-L` model picker, that compose's draft. |
+| **Key map** (`handle_key_map_key`) | ignored | A read-only table with no text field, over a board whose query it hides; a paste must not close it either. |
 | **`Ctrl-X` chord** (`handle_chord_key`) | ignored, chord stays ARMED | The chord resolves on exactly one KEY, hit or miss. A paste carries no completion, and cancelling on one would silently disarm a chord whose hint is still on screen. |
 | **Stop confirm** (`handle_stop_confirm_key`) | ignored | A plain Enter/Esc gate; a paste is neither, and must never stop an agent. |
 | **Interrupt confirm** (`handle_interrupt_confirm_key`) | ignored | Same. |
@@ -3503,8 +3504,9 @@ fork cannot answer permission prompts, like `Ctrl-R`.
 consumer is `App::apply_reload` (`consume_fork_jump`, after `restore_selection`),
 the funnel every reload takes: on the first reload whose store holds the fork,
 the cursor moves to it only if it is still on the origin AND nothing owns the
-keyboard (`App::keyboard_owned`: a modal, a compose's model picker among them; a
-pending `Ctrl-X` chord; the stop or interrupt confirm; an open compose box).
+keyboard (`App::keyboard_owned`: a modal, a compose's model picker among them; the
+key map; a pending `Ctrl-X` chord; the stop or interrupt confirm; an open compose
+box).
 Those
 are the `KeyboardOwner` variants, the one list `update::dispatch` routes a key by.
 Moving the selection under an owner would change the row it shows or acts on: a

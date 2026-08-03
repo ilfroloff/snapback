@@ -596,6 +596,9 @@ keyboard_owners! {
         /// open over), the move picker and its lineage scope confirm, the delete
         /// confirm.
         Modal,
+        /// The key-map modal ([`App::show_key_map`]), opened from the bare board
+        /// only (`F1`, `Ctrl-X ?`, `Ctrl+Shift+/`).
+        KeyMap,
         /// A pending `Ctrl-X` leader chord ([`App::pending_chord`]).
         Chord,
         /// The stop-then-reply confirmation ([`App::pending_stop`]).
@@ -612,6 +615,7 @@ impl KeyboardOwner {
     fn is_open(self, app: &App) -> bool {
         match self {
             Self::Modal => app.modal.is_some(),
+            Self::KeyMap => app.show_key_map,
             Self::Chord => app.pending_chord,
             Self::StopConfirm => app.pending_stop.is_some(),
             Self::InterruptConfirm => app.pending_interrupt.is_some(),
@@ -2778,6 +2782,19 @@ pub struct App {
     /// [`preview_pointer_blocked`](Self::preview_pointer_blocked) so mouse actions stay gated while
     /// it is pending (PATTERNS §10).
     pub pending_chord: bool,
+    /// Whether the key-map MODAL (`F1`, `Ctrl-X ?`, `Ctrl+Shift+/`) is open: a
+    /// read-only table of every binding drawn over the board.
+    ///
+    /// Owns the keyboard like every modal (`update::handle_key_map_key` takes the
+    /// key before the board does) and so gates the pointer
+    /// ([`preview_pointer_blocked`](Self::preview_pointer_blocked)) and the paste.
+    /// It is opened from the bare board only, so it never coexists with a chord,
+    /// compose or [`Modal`]. `false` by default.
+    pub show_key_map: bool,
+    /// First row of the key-map table the modal shows. Written by
+    /// [`scroll_key_map`](Self::scroll_key_map) and clamped back by the render,
+    /// which alone knows the viewport (as [`Modal::scroll`]). Reset on close.
+    pub key_map_scroll: usize,
     /// Readable, markdown-styled transcript preview, keyed by `session_id`.
     ///
     /// The rendered layout (GFM tables shrink-to-fit) depends on the preview
@@ -3058,6 +3075,8 @@ impl App {
             state_dir_pin: None,
             show_hidden: false,
             pending_chord: false,
+            show_key_map: false,
+            key_map_scroll: 0,
             preview_cache: HashMap::new(),
             preview_width: None,
             expanded_peers: HashSet::new(),
@@ -3756,6 +3775,19 @@ impl App {
     /// of a keypress, and the board draws before it reads the next key.
     pub fn take_preview_anchor(&mut self) -> Option<usize> {
         self.preview_anchor_line.take()
+    }
+
+    /// Open or close the key-map modal (`F1`, `Ctrl-X ?`, `Ctrl+Shift+/`). Closing forgets the
+    /// scroll, so every opening starts at the top.
+    pub fn toggle_key_map(&mut self) {
+        self.show_key_map = !self.show_key_map;
+        self.key_map_scroll = 0;
+    }
+
+    /// Move the key-map modal by `rows` (negative = up), saturating at zero; the
+    /// render clamps the far end against the real viewport.
+    pub fn scroll_key_map(&mut self, rows: isize) {
+        self.key_map_scroll = self.key_map_scroll.saturating_add_signed(rows);
     }
 
     // --- preview scroll ----------------------------------------------------
@@ -4600,7 +4632,7 @@ impl App {
     /// gate refuses leaves its release nothing to act on, and is no first half of a
     /// double-click either.
     ///
-    /// True while a [`Modal`] is open, the stop-then-reply confirmation or the
+    /// True while a [`Modal`] or the key-map modal is open, the stop-then-reply confirmation or the
     /// interrupt confirmation owns the keyboard, OR a `Ctrl-X` leader chord is
     /// [pending](Self::pending_chord): each takes the keyboard for a decision, so
     /// each must equally gate the mouse (a stray click mid-chord must not toggle a
@@ -4634,6 +4666,7 @@ impl App {
     #[must_use]
     pub fn preview_pointer_blocked(&self) -> bool {
         self.modal.is_some()
+            || self.show_key_map
             || self.draft.is_some()
             || self.pending_stop.is_some()
             || self.pending_interrupt.is_some()
@@ -15415,6 +15448,7 @@ mod tests {
                     app.open_model_picker();
                 }),
             ],
+            KeyboardOwner::KeyMap => vec![("key-map modal", |app| app.toggle_key_map())],
             KeyboardOwner::Chord => vec![("Ctrl-X chord", |app| app.pending_chord = true)],
             KeyboardOwner::StopConfirm => vec![("stop confirm", |app| {
                 app.open_stop_confirm("A".to_string(), "job-a".to_string());
@@ -15442,6 +15476,11 @@ mod tests {
     fn close(app: &mut App, owner: KeyboardOwner) {
         match owner {
             KeyboardOwner::Modal => app.close_modal(),
+            KeyboardOwner::KeyMap => {
+                if app.show_key_map {
+                    app.toggle_key_map();
+                }
+            }
             KeyboardOwner::Chord => app.pending_chord = false,
             KeyboardOwner::StopConfirm => app.stop_confirm_cancel(),
             KeyboardOwner::InterruptConfirm => app.interrupt_confirm_cancel(),
@@ -15505,5 +15544,29 @@ mod tests {
             jumped.is_empty(),
             "the cursor jumped under these owners: {jumped:?}"
         );
+    }
+
+    /// The key-map modal owns the keyboard, so it gates the mouse like every
+    /// modal, and closing resets its scroll.
+    #[test]
+    fn key_map_modal_gates_the_mouse_and_resets_scroll_on_close() {
+        let mut app = app_all(vec![session("s", "r", Some("main"), "/tmp/s")]);
+        assert!(!app.show_key_map, "off by default");
+
+        app.toggle_key_map();
+        assert!(app.show_key_map);
+        assert!(app.preview_pointer_blocked(), "the modal gates the pointer");
+
+        app.scroll_key_map(5);
+        app.scroll_key_map(-2);
+        assert_eq!(app.key_map_scroll, 3);
+        app.scroll_key_map(-100);
+        assert_eq!(app.key_map_scroll, 0, "saturates at the top");
+        app.scroll_key_map(4);
+
+        app.toggle_key_map();
+        assert!(!app.show_key_map);
+        assert_eq!(app.key_map_scroll, 0, "closing forgets the scroll");
+        assert!(!app.preview_pointer_blocked());
     }
 }

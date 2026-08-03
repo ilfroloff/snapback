@@ -648,7 +648,7 @@ inner rect when there is no banner (so a banner-less pane's geometry is exactly
   toggle, a subagent switch, a link open and a selection — are also gated off
   while a surface that hides the
   transcript or takes the keyboard for a decision is up (`preview_pointer_blocked`:
-  a modal, a confirmation, a pending chord, or the draft
+  a modal, the key map, a confirmation, a pending chord, or the draft
   card), so none fires over
   a draft card. An open QUICK REPLY or FORK box is not in that list: its docked box is outside
   the transcript rect by construction, so a press in the box selects nothing while
@@ -1643,14 +1643,19 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    not the layout: each constructor names its own (`Modal::footer`, one const per
    overlay kind), because the `List` pickers (agent, model, move) share a key map but not what the
    keys do — a layout-derived footer advertised the agent picker's
-   `Enter draft · ^O interactive` on the model picker, where `Ctrl-O` is inert. Four
-   more keyboard owners sit alongside it: the
+   `Enter draft · ^O interactive` on the model picker, where `Ctrl-O` is inert. Five
+   more keyboard owners sit alongside it: the KEY-MAP modal (`App.show_key_map`,
+   opened from the bare board by `F1`, `Ctrl-X ?` or `Ctrl+Shift+/` in any form it
+   arrives as — `is_key_map_toggle` — and closed by `Esc`, `Ctrl-C`, `F1` or
+   `Ctrl+Shift+/`; `Ctrl-X ?` only opens it, because the leader ranks below the
+   map and is inert inside it; its handler `handle_key_map_key` scrolls and closes,
+   and every other key is inert, never typed into the query beneath), the
    `Ctrl-X` leader chord (while
    `App.pending_chord` is set, `chord_key` routes the next key — `x` hide, `d`
    delete-confirm, `h` show-hidden, `r` forced full store re-read, `y` copy
    session ID, `f` fold / expand the selected row's lineage, `w` open the
-   move-to-worktree picker, `↓` open the subagent view or leave it, anything
-   else cancels), the "stop the
+   move-to-worktree picker, `↓` open the subagent view or leave it, `?` open the
+   key map, anything else cancels), the "stop the
    waiting agent?" confirmation via `App.pending_stop` (a plain Enter/Esc gate
    before compose, for the `needs input` quick-reply path), its `Ctrl-K` sibling
    `App.pending_interrupt` (the same Enter/Esc gate, but resolving to a bare
@@ -1659,7 +1664,7 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    zone via
    `App.compose` + its `compose_key_to_action` machine — ONE keyboard owner for
    every compose target (reply, fork, new-session draft), since which one is open
-   is a `ComposeTarget` rather than a second piece of state. The five are the
+   is a `ComposeTarget` rather than a second piece of state. The six are the
    variants of ONE enum, `app::KeyboardOwner`, declared in the order a key
    reaches them (`KeyboardOwner::PRECEDENCE`); `App::keyboard_owner` names the
    first one open, and `handle_event` routes the key by an exhaustive `match` on
@@ -1668,8 +1673,9 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    model picker OVER the still-open compose: while the picker is up it owns every
    key, and its close (`Enter` after writing the pick, or `Esc`) hands the keyboard
    straight back to the untouched draft, with no state saved or restored.
-   `App::preview_pointer_blocked` (`modal.is_some() || draft.is_some() ||
-   pending_stop.is_some() || pending_interrupt.is_some() || pending_chord`) gates
+   `App::preview_pointer_blocked` (`modal.is_some() || show_key_map ||
+   draft.is_some() || pending_stop.is_some() || pending_interrupt.is_some() ||
+   pending_chord`) gates
    the mouse's four actions over the preview — toggling a fold node, switching
    the pane to a subagent, opening a preview link, and starting a preview
    selection (a drag-select, or a double-click's word-select) — so none fires
@@ -1696,7 +1702,11 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    a press the gate refuses leaves its release nothing to act on, and is no first
    half of a double-click either. A mouse
    wheel is handled **before** and **independent of** that gate: it never routes
-   into an overlay handler, it only scrolls a pane, and it (like any keypress)
+   into an overlay handler, it only scrolls a pane — or, while the key map is
+   open, that table: `mouse_effect` asks the pure `key_map_wheel_rows` (a notch is
+   `KEY_MAP_LINE_ROWS`, the step an arrow key takes) BEFORE `wheel_target`, wherever
+   the pointer is, because the list and preview under a modal that hides them would
+   otherwise move a selection nobody can see — and it (like any keypress)
    clears an active preview text selection first. The selection is
    content-anchored, so the scroll alone would not strand it; the notch ends it
    because a notch during a HELD drag would otherwise have to extend that drag
@@ -1713,7 +1723,7 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    the LIST (below) and every key, since all of them are the box's — and the one
    click that would change which transcript the pane shows, the subagent switch.
 
-   The wheel takes exactly ONE condition, and `update::wheel_target` owns it as a
+   Past the key map, the wheel takes exactly ONE condition, and `update::wheel_target` owns it as a
    parameter (`composing`) the way `key_to_action` owns its own. It hit-tests
    THREE zones — inside the preview, inside the list, outside both — and
    `composing` narrows exactly ONE of them: **while the compose zone is open the
@@ -1830,7 +1840,12 @@ A `Ctrl-X` FOLLOW-UP is added the parallel way, never as an `Action`: a
 `handle_chord_key` completion, pinned by the `chord_key` table test AND one test
 that feeds `Ctrl-X` then the letter through `handle_event`. Its verb also has to
 fit `view::chord_hint`, whose widest form is budgeted against an 80-column help
-row — the COLUMN BUDGET note there says how to pay for a new one.
+row — the COLUMN BUDGET note there says how to pay for a new one. The one
+exception is `?` (`ChordOutcome::KeyMap`): bound, pinned and listed in every key
+map, but NOT in `chord_hint`, whose line is already exactly 80 columns; the board
+hint's `F1 keys` points at the same modal in most terminals; where F1 does not
+arrive (GNOME Terminal keeps it, a Mac laptop needs `Fn`), `Ctrl-X ?` is found
+through `sb --help`, `docs/GUIDE.md` or the key map itself.
 
 A COMPOSE key (`Ctrl-J`, `Ctrl-O`, `Ctrl-L`) is added a third way: a
 `ComposeAction` variant + its `compose_key_to_action` arm (both letter cases, for
