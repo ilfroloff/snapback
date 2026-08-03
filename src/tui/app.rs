@@ -2,8 +2,9 @@
 //!
 //! Holds all TUI state: `sessions`, `filtered` indices, `selected` session id,
 //! `scroll` offset, `query`, `search_mode` (name | name+content), `scope`
-//! (current-folder | all), and the preview cache. Selection is tracked by
-//! stable `session_id` (not list index) so it survives autorefresh.
+//! (current-folder | project | all) with the project's cached worktree set, and
+//! the preview cache. Selection is tracked by stable `session_id` (not list
+//! index) so it survives autorefresh.
 //!
 //! Everything in this module is pure state manipulation with no terminal I/O,
 //! so it is unit-testable without a real terminal. The terminal-driving loop
@@ -25,6 +26,10 @@ use crate::{config, delete, hidden};
 use crate::search::{SearchIndex, SearchMode};
 use crate::store::lineage::{self, LineageKey};
 use crate::store::{preview, Session};
+// The scope predicate and the worktree resolver MUST canonicalize paths the same
+// way or membership compares apples to oranges, so both call the one
+// `resolve_dir` that lives beside the worktree set it has to match.
+use crate::worktrees::{project_root, project_root_name, resolve_dir, WorktreeSet};
 
 // The transcript's wrap model is the VIEW's (it is a fact about the widget that
 // paints the pane, not about this state), so the cache here stores what that module
@@ -153,25 +158,73 @@ fn delete_confirm_message(members: usize, hidden: usize) -> String {
 
 /// Which set of sessions the list shows.
 ///
-/// The default is [`Scope::CurrentFolder`]: only sessions whose canonicalized
-/// `cwd` equals the canonicalized launch directory. [`Scope::All`] shows every
-/// session (still grouped by folder). Toggled by a keybinding and by the
-/// `--all`/`-a` CLI flag.
+/// Three concentric answers to "which sessions are mine right now", declared
+/// WIDEST-LAST so the variant order is the cycle order: the exact launch folder
+/// ([`Scope::CurrentFolder`], the default), every live worktree of that folder's
+/// project ([`Scope::Project`]), then the whole store ([`Scope::All`]). Selected
+/// at launch by a CLI flag, and cycled by a keybinding — though only the first
+/// two are on that key by default; see [`Scope::toggled`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
     /// Only sessions launched from the current working directory (exact
     /// canonical `cwd` match).
     CurrentFolder,
+    /// Every session launched from ANY worktree of the current project — the
+    /// live ones AND the ones that have since been removed.
+    ///
+    /// Membership is [`in_scope`]'s two-armed test: the project's worktree roots
+    /// as `git worktree list --porcelain` reports them ([`crate::worktrees`]),
+    /// which is why it can span folders a pure path heuristic could never
+    /// relate, OR a shared repo ROOT, which is why a deleted worktree's sessions
+    /// stay in the project instead of dropping to the all scope. The git set is
+    /// resolved once at launch and AUTORELOADED on every session reload, so a
+    /// worktree created mid-run joins the view without restarting the board.
+    ///
+    /// FAIL-SOFT: an unresolved set (no `git`, not a repository, a non-zero exit)
+    /// is EMPTY, and the root arm carries the scope on its own from there —
+    /// narrower than git could make it, never "nothing matches".
+    Project,
     /// Every session, grouped by folder.
+    ///
+    /// Reachable ONLY by launching with `--all`/`-a`
+    /// ([`crate::cli::Args::all_scope_enabled`]) — there is no in-board chord
+    /// for it, and [`Scope::toggled`] skips it otherwise.
     All,
 }
 
 impl Scope {
-    /// Flip between the two scopes.
+    /// Advance to the next scope.
+    ///
+    /// Without `all_enabled` this is a two-state FLIP — current folder <->
+    /// project — and with it the historical three-stop cycle, current folder ->
+    /// project -> all -> current folder. Either way it WIDENS at every step
+    /// before wrapping, so one key walks steadily outward and never means
+    /// "narrow" partway through.
+    ///
+    /// [`Scope::All`] is off the key by default because it is the whole store —
+    /// every session of every repo on the machine, the widest and least often
+    /// wanted answer — and it used to sit MID-cycle, one stray press away.
+    /// `Scope::Project` now spans a project's whole history, deleted worktrees
+    /// included (see [`in_scope`]), so the middle stop is what the wide press
+    /// was usually reaching for anyway.
+    ///
+    /// `all_enabled` is a PARAMETER rather than something this reads off the
+    /// board, exactly as [`in_scope`] takes its worktree set: the cycle is then
+    /// assertable on its own, with no [`App`] to build.
     #[must_use]
-    pub fn toggled(self) -> Self {
+    pub fn toggled(self, all_enabled: bool) -> Self {
         match self {
-            Scope::CurrentFolder => Scope::All,
+            Scope::CurrentFolder => Scope::Project,
+            Scope::Project if all_enabled => Scope::All,
+            // The flip's return leg: no `-a`, so there is nothing wider to
+            // reach and the key wraps here instead.
+            Scope::Project => Scope::CurrentFolder,
+            // `All` wraps to the narrowest scope whether or not the flag is on.
+            // With it, that closes the three-stop cycle. WITHOUT it the state is
+            // only reachable by a bug — but the function is total, and the safe
+            // answer to "where next" is OUT of the widest scope: returning
+            // `Scope::All` here would strand the user in the one scope they
+            // never asked for, with no key that leaves it.
             Scope::All => Scope::CurrentFolder,
         }
     }
@@ -445,26 +498,55 @@ pub fn pick_default_index(last: Option<&str>, agents: &[DefinedAgent]) -> usize 
     }
 }
 
-/// Canonicalize `p`, falling back to the raw path when it cannot be resolved
-/// (e.g. a session whose worktree was deleted). Used by the exact-cwd scope
-/// predicate so a launch dir and a session `cwd` are compared in the same
-/// resolved form (symlinks, `.`/`..`, and `/tmp`->`/private/tmp` collapsed).
-#[must_use]
-pub fn resolve_dir(p: &Path) -> PathBuf {
-    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
-}
-
-/// The folder-scoping predicate (Task 5.4): is `session` in `scope`?
+/// The folder-scoping predicate: is `session` in `scope`?
 ///
 /// [`Scope::All`] always matches. [`Scope::CurrentFolder`] matches only when the
 /// session's resolved `cwd` is byte-equal to `launch` — an EXACT canonical match
 /// (design decision: precise, a repo's other worktree folders do not appear).
-/// `launch` MUST already be resolved via [`resolve_dir`].
+/// [`Scope::Project`] matches on EITHER of two independent answers to "is this
+/// folder part of my project", and needs both:
+///
+/// * MEMBERSHIP in `worktrees`, the launch project's LIVE worktree roots as git
+///   reports them. Authoritative, and the only answer that can relate two
+///   folders no path rule could — a worktree parked anywhere on the filesystem.
+/// * A shared REPO ROOT ([`crate::worktrees::project_root`]). Weaker, but it
+///   answers for a worktree that has been REMOVED, which git structurally
+///   cannot: `git worktree list` reports what exists NOW, so a deleted
+///   worktree's sessions match no live root and were reachable only in the all
+///   scope. On this repo's own store that was a third of the project's history.
+///
+/// Roots are compared, never [`crate::store::group::repo_of`] LABELS: that
+/// function spells a plain checkout `<base>` and a worktree `<parent>/<base>`,
+/// so a repo and its own worktree carry different labels and a label comparison
+/// is silently wrong exactly where it matters most.
+///
+/// `launch` MUST already be resolved via [`resolve_dir`], and so must every root
+/// in `worktrees` (which [`crate::worktrees::resolve`] guarantees) — every side
+/// of every comparison is canonicalized by the same function or membership
+/// silently misses across symlinks. `session.cwd` is passed RAW to
+/// `project_root`, which owns the derive-then-canonicalize order for the deleted
+/// case; see its docs.
+///
+/// The root arm has NO git dependency, so an EMPTY `worktrees` — "could not
+/// resolve", never "nothing matches" — still scopes the project to its whole
+/// repo root rather than collapsing to the launch folder. That is a change of
+/// the old fail-soft posture, and a deliberate one: the folder the user launched
+/// in was never the honest answer to "show me this project", only the answer
+/// available without git.
+///
+/// PURE: the worktree set is a parameter rather than something this reaches for,
+/// so the predicate never resolves git and stays testable from a seeded set. It
+/// does canonicalize, which is why it runs on reload / scope-toggle only and
+/// never per keystroke (`App::recompute_scope`).
 #[must_use]
-pub fn in_scope(scope: Scope, session: &Session, launch: &Path) -> bool {
+pub fn in_scope(scope: Scope, session: &Session, launch: &Path, worktrees: &WorktreeSet) -> bool {
     match scope {
         Scope::All => true,
         Scope::CurrentFolder => resolve_dir(&session.cwd) == launch,
+        Scope::Project => {
+            worktrees.contains(&resolve_dir(&session.cwd))
+                || project_root(&session.cwd) == project_root(launch)
+        }
     }
 }
 
@@ -498,15 +580,55 @@ fn child_indices(sessions: &[Session], filtered: &[usize]) -> HashSet<usize> {
         .collect()
 }
 
+/// The `(repo, branch)` group a session renders under.
+///
+/// The branch half is always the session's own. The repo half is normally
+/// [`Session::repo`] too — but `project_head`, when `Some`, REPLACES it for
+/// every session, which is what makes one project draw as one head.
+///
+/// It has to, because [`Session::repo`] is not a project identity: it is
+/// [`crate::store::group::repo_of`]'s label for the session's own FOLDER,
+/// assigned once at parse time, and that function deliberately renders a plain
+/// checkout as `<base>` while rendering a worktree as `<parent>/<base>`. The
+/// main checkout and its worktrees therefore carry different labels even though
+/// they are one project, and heading groups by that field splits the project in
+/// two on screen. Only [`Scope::Project`] can fix it: there, and only there, the
+/// board KNOWS which project it is showing, because git resolved the membership
+/// set — and membership is already restricted to that one project's worktrees,
+/// so an override can only ever unify heads that belong together, never merge
+/// two projects.
+///
+/// The row builder and the display ordering share this one function on purpose:
+/// [`App::order_filtered`] sorts same-key rows together and
+/// [`build_rows`] emits one head per contiguous run of equal keys, so a second
+/// notion of "the same group" would let a group's rows scatter and re-emit its
+/// head.
+#[must_use]
+fn group_key(session: &Session, project_head: Option<&str>) -> (String, String) {
+    (
+        project_head.unwrap_or(&session.repo).to_string(),
+        session.branch_display().to_string(),
+    )
+}
+
 /// Flatten `filtered` (indices into `sessions`, in scope-aware display order)
 /// into rows for the list.
 ///
-/// In [`Scope::All`] this emits a group head the first time a repo->branch group
-/// appears, then that group's session rows. Because `filtered` is kept in
-/// display order (group-most-recent-desc, then timestamp-desc within a group)
-/// same-group rows are contiguous, so each group yields exactly ONE head. In
-/// [`Scope::CurrentFolder`] group heads are suppressed entirely and the result
-/// is a flat, timestamp-desc list of session rows.
+/// In [`Scope::All`] and [`Scope::Project`] this emits a group head the first
+/// time a repo->branch group appears, then that group's session rows. Because
+/// `filtered` is kept in display order (group-most-recent-desc, then
+/// timestamp-desc within a group) same-group rows are contiguous, so each group
+/// yields exactly ONE head. [`Scope::CurrentFolder`] suppresses heads entirely
+/// and yields a flat, timestamp-desc list — and it is the ONLY scope that does,
+/// because it is the only one that cannot span more than one folder. Where rows
+/// come from several folders, the head is what tells them apart.
+///
+/// `scope` is the scope the user selected, unconditionally. There used to be a
+/// `render_scope` translation here, on the premise that an UNRESOLVED project
+/// scope matched a single folder and therefore had to draw flat like
+/// [`Scope::CurrentFolder`]. That premise is gone: [`in_scope`]'s repo-root arm
+/// has no git dependency, so an unresolved project scope still spans every
+/// folder of the repo and still needs its heads.
 ///
 /// Folding cannot disturb that one-head-per-group invariant, because a lineage is
 /// keyed by `(repo, branch, root)` (D4): every member of one lineage shares the
@@ -515,12 +637,20 @@ fn child_indices(sessions: &[Session], filtered: &[usize]) -> HashSet<usize> {
 ///
 /// `hidden` is [`lineage::fold`]'s head-index -> hidden-count map; an index absent
 /// from it hides nothing and renders as a plain row.
+///
+/// `project_head` overrides the repo half of every group key — see
+/// [`group_key`]. Pass [`App::project_head`]'s answer: it is `Some` for EVERY
+/// row in the project scope — resolved worktree set or not, for the same reason
+/// the paragraph above gives — and `None` in every other scope. So `Some` and
+/// "draws grouped" arrive together, and there is no state in which this emits
+/// project heads with no project label to head them by.
 #[must_use]
 pub fn build_rows(
     sessions: &[Session],
     filtered: &[usize],
     scope: Scope,
     hidden: &HashMap<usize, usize>,
+    project_head: Option<&str>,
 ) -> Vec<Row> {
     let children = child_indices(sessions, filtered);
     // One place builds a session row, so the flat and grouped lists can never
@@ -532,7 +662,9 @@ pub fn build_rows(
     };
 
     let mut rows = Vec::with_capacity(filtered.len() + 8);
-    // Current-folder scope is a flat, head-less list.
+    // Current-folder scope is a flat, head-less list — and it ALONE, which is why
+    // this asks for that one scope rather than excluding `All`: a scope that can
+    // span folders (`Project`, `All`) must keep its heads.
     if scope == Scope::CurrentFolder {
         rows.extend(filtered.iter().map(|&i| session_row(i)));
         return rows;
@@ -540,7 +672,7 @@ pub fn build_rows(
     let mut current: Option<(String, String)> = None;
     for &i in filtered {
         let session = &sessions[i];
-        let key = (session.repo.clone(), session.branch_display().to_string());
+        let key = group_key(session, project_head);
         if current.as_ref() != Some(&key) {
             rows.push(Row::Group {
                 repo: key.0.clone(),
@@ -619,6 +751,38 @@ fn default_live_probe() -> HashMap<String, ReportedAgent> {
     )
 }
 
+/// How the board asks git which worktrees the launch project has right now.
+///
+/// Boxed for the same one reason [`LiveProbe`] is — see [`App::worktree_probe`]:
+/// the answer comes from a subprocess, and a test must be able to STATE it
+/// instead of running one. Takes the launch dir rather than closing over it so
+/// the reload path can re-ask with the same probe.
+type WorktreeProbe = Box<dyn Fn(&Path) -> WorktreeSet>;
+
+/// The probe a fresh [`App`] starts with: the real shell-out to git.
+#[cfg(not(test))]
+fn default_worktree_probe(launch_dir: &Path) -> WorktreeSet {
+    crate::worktrees::resolve(launch_dir)
+}
+
+/// The probe a fresh [`App`] starts with UNDER TEST: none resolved, ever.
+///
+/// Returns the EMPTY set rather than panicking like [`default_live_probe`],
+/// because the two seams guard opposite failures. A liveness answer that
+/// defaulted to "nothing is live" would let a test pass for the wrong reason, so
+/// that one demands a decision. An empty worktree set demands nothing: it is the
+/// documented "could not resolve" answer, under which [`in_scope`] carries
+/// [`Scope::Project`] on its git-free repo-root arm — so the ~40 [`App::new`]
+/// call sites that say nothing about worktrees still get the answer a user with
+/// no `git` on `PATH` would, and NONE of them spawns git.
+///
+/// A test that means to exercise the cross-worktree scope seeds the set through
+/// [`App::set_worktree_probe`].
+#[cfg(test)]
+fn default_worktree_probe(_launch_dir: &Path) -> WorktreeSet {
+    WorktreeSet::empty()
+}
+
 /// One session's preview as rendered at [`App::preview_width`] — the styled text
 /// and its link regions, plus everything else that is a function of that same
 /// (session, width) pair.
@@ -649,7 +813,9 @@ pub struct App {
     pub sessions: Vec<Session>,
     /// Indices into [`sessions`](Self::sessions) that pass scope+query, kept in
     /// scope-aware DISPLAY order: flat timestamp-desc for the current-folder
-    /// scope; group-most-recent-desc then timestamp-desc for the all scope.
+    /// scope; group-most-recent-desc then timestamp-desc for the project and the
+    /// all scope. Whether the worktree set resolved does not enter into it —
+    /// [`order_filtered`](Self::order_filtered) owns that rule and argues why.
     pub filtered: Vec<usize>,
     /// Stable id of the selected session (survives reload); `None` when the
     /// filtered list is empty.
@@ -660,8 +826,20 @@ pub struct App {
     pub query: String,
     /// Name-only vs. name+content search (mirrors the search index mode).
     pub search_mode: SearchMode,
-    /// Current-folder vs. all scope.
+    /// Which sessions the board is showing: current folder, project, or all.
     pub scope: Scope,
+    /// Whether [`Scope::All`] is on the `Ctrl-A` cycle at all — the second
+    /// meaning of the `--all`/`-a` launch flag
+    /// ([`crate::cli::Args::all_scope_enabled`]), which is why it is state
+    /// rather than a fact about [`scope`](Self::scope): a board launched
+    /// `-a -p` starts in the project scope and can still reach the whole store.
+    ///
+    /// Read ONLY where the user asks "what does this key do next" —
+    /// [`Scope::toggled`] and the empty list's advice — and passed to both as a
+    /// parameter, never consulted from inside them. It filters nothing, so
+    /// setting it after [`App::new`] (as the launch path does) cannot leave the
+    /// list disagreeing with it.
+    pub all_scope_enabled: bool,
     /// Canonicalized launch directory for the current-folder predicate.
     pub launch_dir: PathBuf,
     /// Names of DEFINED agents (`~/.claude/agents/*.md` + project overrides),
@@ -747,6 +925,25 @@ pub struct App {
     /// rather than spawning `claude` (which the suite never does), in the spirit
     /// of `resume::build_argv`. Production swaps it exactly never.
     live_probe: LiveProbe,
+    /// The launch project's live worktree roots — the membership set
+    /// [`Scope::Project`] scopes by, CACHED so the scope predicate never runs
+    /// git.
+    ///
+    /// Resolved ONCE in [`App::new`] and refreshed on reload, never on a
+    /// keystroke: `toggle_scope` reaches this scope through a key, and a
+    /// subprocess on a key press is exactly the blocking work that may not sit on
+    /// the UI thread. Empty means "could not resolve" (see [`WorktreeSet`]): the
+    /// live-membership arm then contributes nothing and [`Scope::Project`] rests
+    /// on [`in_scope`]'s repo-root arm alone, which needs no git and still spans
+    /// the project.
+    pub worktrees: WorktreeSet,
+    /// How [`worktrees`](Self::worktrees) is (re-)resolved. Defaults to the real
+    /// [`crate::worktrees::resolve`] shell-out.
+    ///
+    /// A seam, not a strategy, exactly like [`live_probe`](Self::live_probe):
+    /// tests seed a worktree set rather than spawning git (which the suite never
+    /// does). Production swaps it exactly never.
+    worktree_probe: WorktreeProbe,
     /// The open modal overlay, if any. `Some` while a titled prompt owns the
     /// keyboard — the running-session Attach/Fork/Cancel choice, or the
     /// new-session agent picker (`Ctrl-N` when defined agents exist). The two are
@@ -908,6 +1105,10 @@ impl App {
             query: String::new(),
             search_mode,
             scope,
+            // OFF unless the launch flag says otherwise (`crate::run` sets it
+            // from `cli::Args`), so the widest scope stays off the key for every
+            // board that did not ask for it.
+            all_scope_enabled: false,
             launch_dir,
             agent_names,
             show_preview: true,
@@ -922,6 +1123,10 @@ impl App {
             tick: 0,
             reported_agents: HashMap::new(),
             live_probe: Box::new(default_live_probe),
+            // Seeded a few lines down, once the probe it is resolved by is in
+            // place.
+            worktrees: WorktreeSet::empty(),
+            worktree_probe: Box::new(default_worktree_probe),
             modal: None,
             pending_interrupt: None,
             compose: None,
@@ -947,6 +1152,13 @@ impl App {
             preview_width: None,
             index,
         };
+        // Resolve the launch project's worktree set ONCE, here, BEFORE the first
+        // `recompute_scope`: it is launch context in the same sense `launch_dir`
+        // is, so a board started with `Scope::Project` is already scoped on its
+        // very first frame instead of one reload later. Going through the probe
+        // field (rather than calling the default directly) is what keeps this the
+        // SAME resolution path the reload takes.
+        app.worktrees = (app.worktree_probe)(&app.launch_dir);
         app.recompute_scope();
         app.recompute_filtered();
         app.select_first();
@@ -1123,10 +1335,12 @@ impl App {
         self.reapply_preserving_selection();
     }
 
-    /// Toggle current-folder vs. all scope and re-filter (recomputes the scope
-    /// membership set, which is what canonicalizes paths).
+    /// Advance one step along [`Scope::toggled`] — current folder <-> project,
+    /// or the full three-stop cycle when
+    /// [`all_scope_enabled`](Self::all_scope_enabled) — and re-filter
+    /// (recomputes the scope membership set, which is what canonicalizes paths).
     pub fn toggle_scope(&mut self) {
-        self.scope = self.scope.toggled();
+        self.scope = self.scope.toggled(self.all_scope_enabled);
         self.recompute_scope();
         self.reapply_preserving_selection();
     }
@@ -1489,6 +1703,23 @@ impl App {
     #[cfg(test)]
     pub fn set_live_probe(&mut self, probe: impl Fn() -> HashMap<String, ReportedAgent> + 'static) {
         self.live_probe = Box::new(probe);
+    }
+
+    /// Seed what git reports as the launch project's worktrees, so a test can
+    /// state "these folders are one project" without a repository or a
+    /// subprocess.
+    ///
+    /// `#[cfg(test)]` for the same reason [`set_live_probe`](Self::set_live_probe)
+    /// is: the seam exists ONLY for tests, so the production board can never be
+    /// handed anything but the real resolver.
+    ///
+    /// Installing a probe does NOT re-resolve on its own — the cached set is
+    /// refreshed at the same two moments production refreshes it (construction
+    /// and reload), which is exactly what lets a test prove the scope reads a
+    /// CACHE and not git.
+    #[cfg(test)]
+    pub fn set_worktree_probe(&mut self, probe: impl Fn(&Path) -> WorktreeSet + 'static) {
+        self.worktree_probe = Box::new(probe);
     }
 
     /// Look up a loaded session by its stable id.
@@ -1854,6 +2085,15 @@ impl App {
     /// active query+scope, and PRESERVE the selection by stable id and the
     /// scroll offset. If the selected id vanished, the selection clamps to the
     /// nearest surviving row.
+    ///
+    /// This is also where the launch project's worktree set is RE-RESOLVED, and
+    /// it needs no wiring at any caller: every reload path already funnels
+    /// through here — the `SessionsChanged` watcher event and the post-resume
+    /// reload in `lib::run` (the two the autoreload exists for), plus the
+    /// post-delete reload — so all of them pick a worktree created mid-run up by
+    /// construction, and a future reload path gets the same behavior for free.
+    /// Off-UI-thread: a reload is a bounded one-shot, unlike `recompute_scope` /
+    /// `toggle_scope`, which run on a keystroke and must never ask git.
     pub fn apply_sessions(&mut self, sessions: Vec<Session>) {
         let prev_id = self.selected.clone();
         let prev_pos = self.selected_pos();
@@ -1862,6 +2102,11 @@ impl App {
         self.index.refresh(&self.sessions);
         // The transcript on disk may have changed; drop stale preview text.
         self.preview_cache.clear();
+        // Re-resolve BEFORE `recompute_scope` so this reload is already scoped by
+        // the CURRENT worktree set rather than one reload behind it. The same
+        // expression `App::new` seeds with, on purpose: launch and reload must not
+        // be able to disagree about what a project is.
+        self.worktrees = (self.worktree_probe)(&self.launch_dir);
         self.recompute_scope();
         self.recompute_filtered();
 
@@ -1877,8 +2122,12 @@ impl App {
     fn recompute_scope(&mut self) {
         let scope = self.scope;
         let launch = self.launch_dir.as_path();
+        // The CACHED worktree set, never a fresh one: this runs on a keystroke
+        // (`toggle_scope`), and resolving git here would put a subprocess on the UI
+        // thread. The set is refreshed at launch and on reload instead.
+        let worktrees = &self.worktrees;
         self.scoped = (0..self.sessions.len())
-            .filter(|&i| in_scope(scope, &self.sessions[i], launch))
+            .filter(|&i| in_scope(scope, &self.sessions[i], launch, worktrees))
             .collect();
     }
 
@@ -1933,12 +2182,29 @@ impl App {
     ///
     /// [`Scope::CurrentFolder`] is a flat list ordered by timestamp DESC (with
     /// `None` last), tie-broken by `session_id` ascending for determinism.
-    /// [`Scope::All`] orders groups by each group's most-recent (max) timestamp
-    /// DESC (a group whose sessions are all `None` sorts last), then by group
-    /// key ascending so same-group rows stay contiguous, then by session
-    /// timestamp DESC (`None` last), then `session_id` ascending. The per-group
-    /// max is precomputed once so the sort stays O(n log n).
+    /// [`Scope::All`] AND [`Scope::Project`] order groups by each group's
+    /// most-recent (max) timestamp DESC (a group whose sessions are all `None`
+    /// sorts last), then by group key ascending so same-group rows stay
+    /// contiguous, then by session timestamp DESC (`None` last), then
+    /// `session_id` ascending. The per-group max is precomputed once so the sort
+    /// stays O(n log n).
+    ///
+    /// The flat arm is [`Scope::CurrentFolder`]'s ALONE, because it is the only
+    /// scope that cannot span more than one folder: a project's worktrees are
+    /// several folders on several branches, so [`Scope::Project`] needs the same
+    /// repo->branch grouping [`Scope::All`] does to stay readable. That holds
+    /// whether or not git resolved — [`in_scope`]'s repo-root arm spans the
+    /// repo either way — which is why the arm is chosen from `self.scope`
+    /// directly, with no fallback translation in between.
+    ///
+    /// The grouped arm keys on [`group_key`], the SAME function
+    /// [`build_rows`] heads on, so the project scope's unified head cannot sort
+    /// rows apart that it then draws under one head — which would re-emit that
+    /// head once per run.
     fn order_filtered(&mut self) {
+        // Taken before the sort, which borrows `self.filtered` mutably; the head
+        // is owned already, so nothing here keeps a borrow of `self` alive.
+        let project_head = self.project_head();
         match self.scope {
             Scope::CurrentFolder => {
                 let sessions = &self.sessions;
@@ -1947,7 +2213,8 @@ impl App {
                     (Reverse(s.timestamp), s.session_id.clone())
                 });
             }
-            Scope::All => {
+            Scope::All | Scope::Project => {
+                let head = project_head.as_deref();
                 // Precompute each group's most-recent timestamp once. Option's
                 // Ord gives `Some > None` and later-time-greater, so `max`
                 // yields the group's newest session (or `None` if all are).
@@ -1955,14 +2222,13 @@ impl App {
                     HashMap::new();
                 for &i in &self.filtered {
                     let s = &self.sessions[i];
-                    let key = (s.repo.clone(), s.branch_display().to_string());
-                    let entry = group_max.entry(key).or_default();
+                    let entry = group_max.entry(group_key(s, head)).or_default();
                     *entry = (*entry).max(s.timestamp);
                 }
                 let sessions = &self.sessions;
                 self.filtered.sort_by_cached_key(|&i| {
                     let s = &sessions[i];
-                    let key = (s.repo.clone(), s.branch_display().to_string());
+                    let key = group_key(s, head);
                     let gmax = group_max.get(&key).copied().flatten();
                     (
                         Reverse(gmax),
@@ -2051,11 +2317,83 @@ impl App {
 
     // --- render helpers (consumed by tui::view) ---------------------------
 
-    /// The rows for the current filtered list — grouped in the all scope, flat
-    /// in the current-folder scope (see [`build_rows`]).
+    /// The ONE repo head every row groups and renders under in the project
+    /// scope, or `None` when the rows keep their own [`Session::repo`] labels.
+    ///
+    /// UNCONDITIONAL in [`Scope::Project`], and that is the whole invariant: a
+    /// project-scoped list is grouped (see [`build_rows`]), and a grouped list
+    /// with no head override falls back to [`Session::repo`] — which spells a
+    /// checkout and its own worktree differently, splitting one project into a
+    /// `snapback` head and an `ilfroloff/snapback` head. That split is what the
+    /// override exists to remove, so there is no state in which the scope draws
+    /// grouped and this may answer `None`.
+    ///
+    /// It used to require a RESOLVED worktree set as well, matched by a
+    /// `render_scope` that drew an unresolved project flat. Both halves of that
+    /// went together, and both are gone: [`in_scope`]'s repo-root arm needs no
+    /// git, so an unresolved project scope still spans the repo and still draws
+    /// grouped. Naming it is [`Self::project_label`]'s job, and it is TOTAL
+    /// precisely so this can be unconditional.
+    ///
+    /// Owned (`Option<String>`), because the name it carries is not always a
+    /// substring of anything `&self` holds — see [`Self::project_label`].
+    #[must_use]
+    pub fn project_head(&self) -> Option<String> {
+        match self.scope {
+            Scope::Project => Some(self.project_label()),
+            _ => None,
+        }
+    }
+
+    /// What to CALL this project: the label git resolved for the whole worktree
+    /// set, else the name of the REPO ROOT the launch dir sits in.
+    ///
+    /// That is the same preference — and the same fallback function,
+    /// [`project_root_name`] — that `tui::view`'s `project_name` applies to the
+    /// HEADER, so the one group head and the header name the project identically
+    /// for EVERY launch dir, degenerate ones included. Two compositions of one
+    /// naming rule are two chances to drift, so the agreement is asserted, not
+    /// assumed: three `tui::view` tests compare the two answers directly —
+    /// `head_and_header_name_a_non_utf8_launch_dir_the_same_way`,
+    /// `project_scope_header_names_the_launch_dir_when_a_resolved_set_has_no_label`
+    /// and `project_scope_header_names_the_repo_root_not_the_worktree_launched_from`.
+    ///
+    /// The resolved label wins because the scope spans several folders; naming
+    /// the one worktree that happened to launch snapback would misdescribe a list
+    /// drawn from all of them. The fallback names the repo ROOT for exactly that
+    /// reason — a worktree dir is named after its BRANCH — and for a plain
+    /// checkout the two are the same directory.
+    ///
+    /// Total (a `String`, never `None`) — see [`Self::project_head`] for why an
+    /// absent head is not an option here: it is not "one unnamed head", it is the
+    /// per-folder heads coming back.
+    ///
+    /// ALLOCATES, and that is what buys the agreement: a lossy repair is a new
+    /// `String` that cannot be borrowed back out of `&self`. The cost is ONE
+    /// allocation per [`App::rows`] / [`App::order_filtered`] call, not one per
+    /// row — [`group_key`] already builds two `String`s for every row it keys
+    /// (from this very label), and `order_filtered` already had to own the label
+    /// to sort under it.
+    fn project_label(&self) -> String {
+        self.worktrees
+            .label()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| project_root_name(&self.launch_dir))
+    }
+
+    /// The rows for the current filtered list: grouped under repo->branch heads
+    /// in the all and project scopes, flat and head-less in the current-folder
+    /// scope alone. In the project scope every head is the one project label
+    /// ([`project_head`](Self::project_head)).
     #[must_use]
     pub fn rows(&self) -> Vec<Row> {
-        build_rows(&self.sessions, &self.filtered, self.scope, &self.hidden)
+        build_rows(
+            &self.sessions,
+            &self.filtered,
+            self.scope,
+            &self.hidden,
+            self.project_head().as_deref(),
+        )
     }
 
     /// The row index (into [`rows`](Self::rows)) of the selected session, for
@@ -2435,6 +2773,9 @@ mod tests {
             Scope::All,
             launch,
         );
+        // The board starts in the all scope, so it is a `-a` board: the flag
+        // that put it there is also what keeps that scope on the key.
+        app.all_scope_enabled = true;
         // Open the in-folder lineage; leave the out-of-folder one alone.
         app.expand_selected();
         assert_eq!(visible_ids(&app), vec!["bg", "ancestor", "out-head"]);
@@ -2444,7 +2785,10 @@ mod tests {
         app.move_selection(2);
         assert_eq!(app.selected.as_deref(), Some("out-head"));
 
+        // Walk the WHOLE three-scope cycle back to where it started, so every
+        // step of the key is covered rather than just the first two.
         app.toggle_scope();
+        assert_eq!(app.scope, Scope::CurrentFolder);
         assert_eq!(
             visible_ids(&app),
             vec!["bg", "ancestor"],
@@ -2453,6 +2797,17 @@ mod tests {
         );
 
         app.toggle_scope();
+        assert_eq!(app.scope, Scope::Project);
+        assert_eq!(
+            visible_ids(&app),
+            vec!["bg", "ancestor"],
+            "the project scope spans the launch dir's repo ROOT, and the \
+             outside rows sit in an unrelated root, so neither arm admits them \
+             — and it likewise leaves the fold alone"
+        );
+
+        app.toggle_scope();
+        assert_eq!(app.scope, Scope::All);
         assert_eq!(
             visible_ids(&app),
             vec!["bg", "ancestor", "out-head"],
@@ -3014,6 +3369,13 @@ mod tests {
 
     // --- scope predicate (exact canonical cwd match) ----------------------
 
+    /// The worktree set a scope test uses when it is not about worktrees: the
+    /// UNRESOLVED one, which is also what every `App::new` starts with under
+    /// test.
+    fn no_worktrees() -> WorktreeSet {
+        WorktreeSet::empty()
+    }
+
     #[test]
     fn scope_predicate_matches_exact_canonical_cwd() {
         let here = unique_temp_dir("scope-here");
@@ -3024,12 +3386,22 @@ mod tests {
         let outside = session("out", "r", Some("main"), other.to_str().unwrap());
 
         // Current-folder: only the exact-cwd session is in scope.
-        assert!(in_scope(Scope::CurrentFolder, &inside, &launch));
-        assert!(!in_scope(Scope::CurrentFolder, &outside, &launch));
+        assert!(in_scope(
+            Scope::CurrentFolder,
+            &inside,
+            &launch,
+            &no_worktrees()
+        ));
+        assert!(!in_scope(
+            Scope::CurrentFolder,
+            &outside,
+            &launch,
+            &no_worktrees()
+        ));
 
         // All: everything is in scope.
-        assert!(in_scope(Scope::All, &inside, &launch));
-        assert!(in_scope(Scope::All, &outside, &launch));
+        assert!(in_scope(Scope::All, &inside, &launch, &no_worktrees()));
+        assert!(in_scope(Scope::All, &outside, &launch, &no_worktrees()));
 
         let _ = std::fs::remove_dir_all(&here);
         let _ = std::fs::remove_dir_all(&other);
@@ -3047,8 +3419,383 @@ mod tests {
             Some("main"),
             "/nonexistent/snapback-test/other",
         );
-        assert!(in_scope(Scope::CurrentFolder, &gone, &launch));
-        assert!(!in_scope(Scope::CurrentFolder, &elsewhere, &launch));
+        assert!(in_scope(
+            Scope::CurrentFolder,
+            &gone,
+            &launch,
+            &no_worktrees()
+        ));
+        assert!(!in_scope(
+            Scope::CurrentFolder,
+            &elsewhere,
+            &launch,
+            &no_worktrees()
+        ));
+    }
+
+    // --- project scope (membership in the launch project's worktrees) -----
+
+    /// The reason the cross-worktree scope exists: a session started in a
+    /// SIBLING worktree of the same project is in scope even though its cwd is
+    /// nowhere near the launch dir — the exact-match scope can never say yes to
+    /// it, and no path heuristic could relate the two folders either.
+    #[test]
+    fn project_scope_matches_any_worktree_of_the_project() {
+        let main = unique_temp_dir("project-main");
+        let sibling = unique_temp_dir("project-sibling");
+        let stranger = unique_temp_dir("project-stranger");
+        let launch = resolve_dir(&main);
+        // Seeded ALREADY CANONICALIZED, exactly as `worktrees::resolve` hands
+        // them over — raw temp paths would not compare equal on a platform whose
+        // temp dir is a symlink (macOS `/tmp` -> `/private/tmp`).
+        let worktrees = WorktreeSet::from_resolved(
+            [resolve_dir(&main), resolve_dir(&sibling)],
+            Some("acme/web".to_string()),
+        );
+
+        let here = session("here", "r", Some("main"), main.to_str().unwrap());
+        let next_door = session("next", "r", Some("feature"), sibling.to_str().unwrap());
+        let outsider = session("out", "r", Some("main"), stranger.to_str().unwrap());
+
+        assert!(in_scope(Scope::Project, &here, &launch, &worktrees));
+        assert!(
+            in_scope(Scope::Project, &next_door, &launch, &worktrees),
+            "a sibling worktree of the same project is the whole case this \
+             scope exists for"
+        );
+        assert!(
+            !in_scope(Scope::Project, &outsider, &launch, &worktrees),
+            "a folder outside the set stays out: `Project` is not `All`"
+        );
+        assert!(
+            !in_scope(Scope::CurrentFolder, &next_door, &launch, &worktrees),
+            "premise: the exact-cwd scope still refuses the sibling, so the \
+             assertion above is about `Project` and not about the fixture"
+        );
+
+        let _ = std::fs::remove_dir_all(&main);
+        let _ = std::fs::remove_dir_all(&sibling);
+        let _ = std::fs::remove_dir_all(&stranger);
+    }
+
+    /// FAIL-SOFT: no git, not a repository, or a non-zero exit all arrive here as
+    /// an EMPTY set, and an empty set means "could not resolve" — never "nothing
+    /// matches". The repo-root arm needs no git, so the scope still spans the
+    /// whole repo; it just cannot see worktrees parked outside it.
+    ///
+    /// This REPLACES an assertion that an unresolved set made `Project` behave
+    /// byte-for-byte like `CurrentFolder`. That contract is deliberately gone —
+    /// see [`in_scope`] — and it is the launch dir's SIBLING WORKTREE, not the
+    /// unrelated repo, that tells the two readings apart.
+    #[test]
+    fn project_scope_without_a_resolved_set_still_spans_the_repo_root() {
+        let repo = unique_temp_dir("project-unresolved-repo");
+        let other = unique_temp_dir("project-unresolved-other");
+        let launch = resolve_dir(&repo);
+        let unresolved = WorktreeSet::empty();
+        let sibling = repo.join(".wtp/worktrees/feature/sibling");
+
+        let inside = session("in", "r", Some("main"), repo.to_str().unwrap());
+        let next_door = session("next", "r", Some("feature"), sibling.to_str().unwrap());
+        let outside = session("out", "r", Some("main"), other.to_str().unwrap());
+
+        assert!(
+            in_scope(Scope::Project, &inside, &launch, &unresolved),
+            "the launch dir itself is never lost, whatever git says"
+        );
+        assert!(
+            in_scope(Scope::Project, &next_door, &launch, &unresolved),
+            "and a sibling worktree of the same repo is in WITHOUT git — this is \
+             the arm that carries the scope when nothing resolved"
+        );
+        assert!(
+            !in_scope(Scope::CurrentFolder, &next_door, &launch, &unresolved),
+            "premise: the exact-cwd scope refuses that sibling, so the assertion \
+             above is a real difference and not a property of the fixture"
+        );
+        assert!(
+            !in_scope(Scope::Project, &outside, &launch, &unresolved),
+            "an unrelated repo stays out: `Project` is still not `All`"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    /// THE CASE THIS WIDENING EXISTS FOR: a worktree that has been REMOVED. Git
+    /// reports what exists now, so those sessions match no live root — on this
+    /// repo's own store that was a third of the project's history, reachable only
+    /// under `All`. The repo-root arm keeps them in the project.
+    ///
+    /// The fixture also pins the LABEL TRAP inside the same premise: the repo and
+    /// its worktree carry DIFFERENT `repo_of` labels, so a scope built on label
+    /// equality would answer "different project" for two folders of one project.
+    /// Roots are what get compared.
+    #[test]
+    fn project_scope_keeps_a_deleted_worktrees_sessions_in_the_project() {
+        use crate::store::group;
+
+        let repo = unique_temp_dir("deleted-wt-repo");
+        let stranger = unique_temp_dir("deleted-wt-stranger");
+        let launch = resolve_dir(&repo);
+        // Never created: this is a worktree the user has since removed.
+        let deleted = repo.join(".wtp/worktrees/feature/gone");
+        // Git only knows the main checkout now.
+        let live = WorktreeSet::from_resolved([launch.clone()], Some("acme/web".to_string()));
+
+        let gone = session("gone", "r", Some("feature"), deleted.to_str().unwrap());
+        let outsider = session("out", "r", Some("main"), stranger.to_str().unwrap());
+
+        assert!(!deleted.exists(), "premise: the worktree is really gone");
+        assert!(
+            !live.contains(&resolve_dir(&deleted)),
+            "premise: git cannot report a worktree that no longer exists, so the \
+             live-set arm says NO and the assertion below is about the other arm"
+        );
+        assert_ne!(
+            group::repo_of(&repo),
+            group::repo_of(&deleted),
+            "premise: the two folders' LABELS disagree ({} vs {}), so comparing \
+             labels here would be silently wrong",
+            group::repo_of(&repo),
+            group::repo_of(&deleted)
+        );
+
+        assert!(
+            in_scope(Scope::Project, &gone, &launch, &live),
+            "a removed worktree's sessions stay in their project"
+        );
+        assert!(
+            !in_scope(Scope::CurrentFolder, &gone, &launch, &live),
+            "premise: the exact-cwd scope still refuses it"
+        );
+        assert!(
+            !in_scope(Scope::Project, &outsider, &launch, &live),
+            "and widening to the repo root admits the repo, not the filesystem"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&stranger);
+    }
+
+    /// The two arms are INDEPENDENT, and this is the half the root rule cannot
+    /// do: `git worktree add` accepts any path, so a live worktree may sit
+    /// nowhere near the repo. Only git can relate it — which is why the live-set
+    /// arm stays even though the root arm now carries the fail-soft case.
+    #[test]
+    fn project_scope_still_takes_a_live_worktree_parked_outside_the_repo_root() {
+        let repo = unique_temp_dir("outside-root-repo");
+        let elsewhere = unique_temp_dir("outside-root-elsewhere");
+        let launch = resolve_dir(&repo);
+        let live = WorktreeSet::from_resolved(
+            [launch.clone(), resolve_dir(&elsewhere)],
+            Some("acme/web".to_string()),
+        );
+
+        let far = session("far", "r", Some("feature"), elsewhere.to_str().unwrap());
+
+        assert_ne!(
+            project_root(&elsewhere),
+            project_root(&launch),
+            "premise: no path rule relates these two folders"
+        );
+        assert!(
+            in_scope(Scope::Project, &far, &launch, &live),
+            "git said it is a worktree of this project, so it is in"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&elsewhere);
+    }
+
+    /// One key, three scopes, WIDENING at every step and then wrapping — so the
+    /// user walks outward from the exact folder to the whole store and back
+    /// without the key ever meaning "narrow" partway through.
+    ///
+    /// This is the `--all`/`-a` shape. The default shape is the flip pinned by
+    /// [`the_all_scope_is_off_the_key_without_its_launch_flag`].
+    #[test]
+    fn scope_cycles_current_folder_then_project_then_all() {
+        assert_eq!(Scope::CurrentFolder.toggled(true), Scope::Project);
+        assert_eq!(Scope::Project.toggled(true), Scope::All);
+        assert_eq!(Scope::All.toggled(true), Scope::CurrentFolder);
+        assert_eq!(
+            Scope::CurrentFolder
+                .toggled(true)
+                .toggled(true)
+                .toggled(true),
+            Scope::CurrentFolder,
+            "the cycle is CLOSED: three presses land where they started, so no \
+             scope can be entered and not left"
+        );
+    }
+
+    /// The DEFAULT shape of the key: a two-state flip, with the whole store
+    /// unreachable from inside the board.
+    ///
+    /// `Scope::All` is every session of every repo on the machine — the widest,
+    /// least often wanted answer — and it used to sit MID-cycle, one stray press
+    /// away. It is now the launch flag's alone.
+    ///
+    /// The `All` arm is asserted too, even though the flip cannot produce that
+    /// state: a total function must answer for it, and the answer must be the
+    /// one that LEAVES the widest scope. Returning `All` there would strand a
+    /// board that reached it by any other route — a `-a` flag read from stale
+    /// state, a future caller, a bug — in a scope with no key out.
+    #[test]
+    fn the_all_scope_is_off_the_key_without_its_launch_flag() {
+        assert_eq!(Scope::CurrentFolder.toggled(false), Scope::Project);
+        assert_eq!(
+            Scope::Project.toggled(false),
+            Scope::CurrentFolder,
+            "the flip wraps HERE without `-a`, instead of reaching the store"
+        );
+        assert_eq!(
+            Scope::CurrentFolder.toggled(false).toggled(false),
+            Scope::CurrentFolder,
+            "two presses close it, so the flip is a cycle of exactly two"
+        );
+        assert_eq!(
+            Scope::All.toggled(false),
+            Scope::CurrentFolder,
+            "and an `All` reached some other way still has a way OUT"
+        );
+    }
+
+    /// The WIRING half of the two tests above, and it is not redundant with
+    /// them: the pure cycle can be exactly right while `toggle_scope` hands it a
+    /// constant `true`, which would leave the whole store on the key for every
+    /// launch — the precise bug this change exists to remove. So the key is
+    /// pressed here, against a board, in both flag states.
+    #[test]
+    fn the_board_key_reaches_the_all_scope_only_when_the_launch_flag_set_it() {
+        let mut app = App::new(Vec::new(), Scope::CurrentFolder, PathBuf::from("/tmp"));
+        assert!(!app.all_scope_enabled, "premise: this board saw no `-a`");
+
+        app.toggle_scope();
+        assert_eq!(app.scope, Scope::Project);
+        app.toggle_scope();
+        assert_eq!(
+            app.scope,
+            Scope::CurrentFolder,
+            "two presses come back around, never reaching the store"
+        );
+
+        app.all_scope_enabled = true;
+        app.toggle_scope();
+        assert_eq!(app.scope, Scope::Project);
+        app.toggle_scope();
+        assert_eq!(
+            app.scope,
+            Scope::All,
+            "and only the launch flag puts the store back on the key"
+        );
+    }
+
+    /// `recompute_scope` runs on a KEYSTROKE, so it may not resolve git — the
+    /// off-UI-thread rule. It reads the set cached at launch instead, which is
+    /// what this pins: a probe installed afterwards is neither called nor
+    /// believed until a refresh path asks it.
+    #[test]
+    fn toggling_into_the_project_scope_never_re_resolves_the_worktree_set() {
+        let here = unique_temp_dir("project-cached-here");
+        let sibling = unique_temp_dir("project-cached-sibling");
+        let launch = resolve_dir(&here);
+        let sessions = vec![
+            session("here", "r", Some("main"), here.to_str().unwrap()),
+            session("sib", "r", Some("feature"), sibling.to_str().unwrap()),
+        ];
+        let mut app = App::new(sessions, Scope::CurrentFolder, launch);
+
+        // A probe that WOULD widen the scope, counting how often it is asked.
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let asked = std::rc::Rc::clone(&calls);
+        let wide = WorktreeSet::from_resolved([resolve_dir(&here), resolve_dir(&sibling)], None);
+        app.set_worktree_probe(move |_| {
+            asked.set(asked.get() + 1);
+            wide.clone()
+        });
+
+        app.toggle_scope();
+
+        assert_eq!(app.scope, Scope::Project);
+        assert_eq!(
+            calls.get(),
+            0,
+            "a scope keystroke must never spawn git: the set is resolved at \
+             launch and on reload, never here"
+        );
+        assert_eq!(
+            visible_ids(&app),
+            vec!["here"],
+            "and the scope therefore answers from the CACHED set — the sibling \
+             the new probe would admit is still out"
+        );
+
+        let _ = std::fs::remove_dir_all(&here);
+        let _ = std::fs::remove_dir_all(&sibling);
+    }
+
+    /// The other half of that rule, and the reason the set is re-resolved in
+    /// `apply_sessions` at all: a worktree created AFTER launch has to join the
+    /// project scope on the next reload, WITHOUT a restart. A set captured only
+    /// in `App::new` would go stale the moment the user ran `git worktree add`,
+    /// and the reload is the earliest moment a new worktree can matter — its
+    /// first session is exactly what triggers one.
+    ///
+    /// The zero-probe-calls-on-keystroke half is pinned by
+    /// [`toggling_into_the_project_scope_never_re_resolves_the_worktree_set`];
+    /// this test asserts the POSITIVE side, and asserts the pre-reload state too
+    /// so it cannot pass without the reload having changed anything.
+    #[test]
+    fn reloading_the_sessions_re_resolves_the_worktree_set() {
+        let here = unique_temp_dir("project-reload-here");
+        let sibling = unique_temp_dir("project-reload-sibling");
+        let launch = resolve_dir(&here);
+        let sessions = vec![
+            session("here", "r", Some("main"), here.to_str().unwrap()),
+            session("sib", "r", Some("feature"), sibling.to_str().unwrap()),
+        ];
+        // Launch while git still knows nothing of the sibling: the two temp dirs
+        // are unrelated repo ROOTS, so only git could ever relate them, and the
+        // test-default probe resolves an EMPTY set. `Project` admits `here` alone.
+        let mut app = App::new(sessions.clone(), Scope::Project, launch);
+        assert_eq!(
+            visible_ids(&app),
+            vec!["here"],
+            "premise: the sibling is OUT before the reload, so the assertion \
+             below cannot pass vacuously"
+        );
+
+        // `git worktree add` happened: git now reports the sibling too.
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let asked = std::rc::Rc::clone(&calls);
+        let wide = WorktreeSet::from_resolved([resolve_dir(&here), resolve_dir(&sibling)], None);
+        app.set_worktree_probe(move |_| {
+            asked.set(asked.get() + 1);
+            wide.clone()
+        });
+
+        app.apply_sessions(sessions);
+
+        assert_eq!(
+            calls.get(),
+            1,
+            "a reload asks git ONCE — enough to pick the new worktree up, and \
+             not once per session"
+        );
+        // Sorted: which worktree's group sorts first is display ordering, not
+        // scope membership, and this test is about membership.
+        let mut shown = visible_ids(&app);
+        shown.sort_unstable();
+        assert_eq!(
+            shown,
+            vec!["here", "sib"],
+            "the worktree added after launch is in scope now, with no restart"
+        );
+
+        let _ = std::fs::remove_dir_all(&here);
+        let _ = std::fs::remove_dir_all(&sibling);
     }
 
     #[test]
@@ -3174,7 +3921,7 @@ mod tests {
             session("s3", "repo-b", Some("main"), "/tmp/s3"),
         ];
         let filtered = vec![0usize, 1, 2, 3];
-        let rows = build_rows(&sessions, &filtered, Scope::All, &HashMap::new());
+        let rows = build_rows(&sessions, &filtered, Scope::All, &HashMap::new(), None);
 
         // Distinct groups: (repo-a,main), (repo-a,dev), (repo-b,main) -> 3 heads.
         let heads: Vec<&Row> = rows
@@ -3211,7 +3958,7 @@ mod tests {
     #[test]
     fn detached_branch_groups_under_detached_head() {
         let sessions = vec![session("s0", "repo-a", None, "/tmp/s0")];
-        let rows = build_rows(&sessions, &[0], Scope::All, &HashMap::new());
+        let rows = build_rows(&sessions, &[0], Scope::All, &HashMap::new(), None);
         assert_eq!(
             rows[0],
             Row::Group {
@@ -3308,17 +4055,556 @@ mod tests {
         let _ = std::fs::remove_dir_all(&here);
     }
 
+    /// A RESOLVED project spans several worktrees on several branches, so the
+    /// project scope renders GROUPED (heads, groups newest-first) exactly as the
+    /// all scope does — the flat, head-less list belongs to the one scope that
+    /// cannot span more than one folder.
+    ///
+    /// The fixture is deliberately one where the two orders DISAGREE: by bare
+    /// timestamp the rows would read m-new, d-mid, m-old, so `main`'s older
+    /// session following its newer one is only explicable by grouping.
+    #[test]
+    fn project_scope_groups_like_the_all_scope() {
+        let here = unique_temp_dir("project-rows");
+        let launch = resolve_dir(&here);
+        let cwd = here.to_str().unwrap();
+        let sessions = vec![
+            session_ts("m-new", WORKTREE_LABEL, Some("main"), cwd, 300),
+            session_ts("d-mid", WORKTREE_LABEL, Some("dev"), cwd, 200),
+            session_ts("m-old", WORKTREE_LABEL, Some("main"), cwd, 100),
+        ];
+        let app = app_project(sessions, launch, vec![resolve_dir(&here)]);
+
+        assert_eq!(
+            visible_ids(&app),
+            vec!["m-new", "m-old", "d-mid"],
+            "groups ordered by their most-recent session, rows ts-desc INSIDE a \
+             group — not one flat timestamp-desc run"
+        );
+        assert_eq!(
+            app.rows(),
+            vec![
+                Row::Group {
+                    repo: PROJECT_LABEL.into(),
+                    branch: "main".into()
+                },
+                plain_row(0), // m-new (300)
+                plain_row(2), // m-old (100)
+                Row::Group {
+                    repo: PROJECT_LABEL.into(),
+                    branch: "dev".into()
+                },
+                plain_row(1), // d-mid (200)
+            ],
+            "the project scope emits one group head per branch: {:?}",
+            app.rows()
+        );
+
+        let _ = std::fs::remove_dir_all(&here);
+    }
+
+    /// The head-less path is `CurrentFolder`'s ALONE. Asserted directly on
+    /// [`build_rows`] so it holds for the row builder itself, not merely for the
+    /// one scope an `App` happened to be in.
+    #[test]
+    fn build_rows_emits_group_heads_in_project_scope() {
+        let sessions = vec![
+            session("s0", "repo-a", Some("main"), "/tmp/s0"),
+            session("s1", "repo-b", Some("dev"), "/tmp/s1"),
+        ];
+        let rows = build_rows(&sessions, &[0, 1], Scope::Project, &HashMap::new(), None);
+
+        assert_eq!(
+            rows,
+            vec![
+                Row::Group {
+                    repo: "repo-a".into(),
+                    branch: "main".into()
+                },
+                plain_row(0),
+                Row::Group {
+                    repo: "repo-b".into(),
+                    branch: "dev".into()
+                },
+                plain_row(1),
+            ],
+            "a scope that can span folders must keep its heads: {rows:?}"
+        );
+    }
+
     #[test]
     fn build_rows_suppresses_heads_in_current_folder_scope() {
         let sessions = vec![
             session("s0", "repo-a", Some("main"), "/tmp/s0"),
             session("s1", "repo-b", Some("dev"), "/tmp/s1"),
         ];
-        let rows = build_rows(&sessions, &[0, 1], Scope::CurrentFolder, &HashMap::new());
+        let rows = build_rows(
+            &sessions,
+            &[0, 1],
+            Scope::CurrentFolder,
+            &HashMap::new(),
+            None,
+        );
         assert_eq!(
             rows,
             vec![plain_row(0), plain_row(1)],
             "the folder scope emits only session rows, no heads: {rows:?}"
+        );
+    }
+
+    // --- one project, one head (project-scope rendering) -------------------
+
+    /// The label `repo_of` gives the MAIN checkout of this repo, and the DIFFERENT
+    /// one it gives that repo's worktrees: a plain checkout renders as `<base>`,
+    /// a worktree as `<parent>/<base>`. Both are correct labels for the folder
+    /// they describe, and both belong to ONE project — which is exactly why the
+    /// project scope cannot head its groups by `session.repo`.
+    const MAIN_LABEL: &str = "snapback";
+    const WORKTREE_LABEL: &str = "ilfroloff/snapback";
+
+    /// The label git resolves for the whole worktree set, i.e. the text the ONE
+    /// project head must be drawn with.
+    ///
+    /// Deliberately matches NEITHER [`MAIN_LABEL`] nor [`WORKTREE_LABEL`], so a
+    /// head bearing this text can only have come from the RESOLVED label. Reusing
+    /// a session's own `repo` here — as these fixtures once did — would let a
+    /// `project_head` that simply echoed some `session.repo` pass, which is
+    /// precisely the reading these tests exist to rule out. The header test in
+    /// `tui::view` pins its project name the same way, with the same string.
+    const PROJECT_LABEL: &str = "acme/web";
+
+    /// An app in [`Scope::Project`] whose worktree set RESOLVED to `roots`
+    /// (already canonicalized), carrying `label`.
+    ///
+    /// Seeded through the probe plus one reload rather than by poking the field,
+    /// so the fixture arrives by the very path a real launch/reload takes.
+    ///
+    /// `label` is a parameter because `None` is a REACHABLE state of a resolved
+    /// set — `WorktreeSet::from_resolved` is public and takes it — not merely a
+    /// hypothetical one.
+    fn app_project_labeled(
+        sessions: Vec<Session>,
+        launch: PathBuf,
+        roots: Vec<PathBuf>,
+        label: Option<String>,
+    ) -> App {
+        let mut app = App::new(sessions.clone(), Scope::Project, launch);
+        let set = WorktreeSet::from_resolved(roots, label);
+        app.set_worktree_probe(move |_| set.clone());
+        app.apply_sessions(sessions);
+        app
+    }
+
+    /// The ordinary case: a set that resolved a project label too.
+    fn app_project(sessions: Vec<Session>, launch: PathBuf, roots: Vec<PathBuf>) -> App {
+        app_project_labeled(sessions, launch, roots, Some(PROJECT_LABEL.to_string()))
+    }
+
+    /// The group heads a board is currently drawing, in order.
+    fn heads(app: &App) -> Vec<(String, String)> {
+        app.rows()
+            .into_iter()
+            .filter_map(|r| match r {
+                Row::Group { repo, branch } => Some((repo, branch)),
+                Row::Session { .. } => None,
+            })
+            .collect()
+    }
+
+    /// The whole point of the scope: "aggregate sessions by the root project".
+    /// Membership already unifies the main checkout with its worktrees, but they
+    /// carry DIFFERENT `session.repo` labels, so heading groups by that field
+    /// splits one project across two heads. Under a RESOLVED set the head comes
+    /// from the project label instead, and one project draws as one head.
+    #[test]
+    fn project_scope_renders_every_worktree_under_one_project_head() {
+        let main = unique_temp_dir("one-head-main");
+        let worktree = unique_temp_dir("one-head-wt");
+        let launch = resolve_dir(&main);
+        let sessions = vec![
+            session_ts(
+                "s-main",
+                MAIN_LABEL,
+                Some("main"),
+                main.to_str().unwrap(),
+                300,
+            ),
+            session_ts(
+                "s-wt",
+                WORKTREE_LABEL,
+                Some("main"),
+                worktree.to_str().unwrap(),
+                200,
+            ),
+        ];
+        let app = app_project(
+            sessions,
+            launch,
+            vec![resolve_dir(&main), resolve_dir(&worktree)],
+        );
+
+        assert_eq!(
+            visible_ids(&app),
+            vec!["s-main", "s-wt"],
+            "premise: both worktrees' sessions are in scope, so the head count \
+             below is about rendering and not about membership"
+        );
+        assert_eq!(
+            heads(&app),
+            vec![(PROJECT_LABEL.to_string(), "main".to_string())],
+            "one project, ONE head, named from the RESOLVED project label — a \
+             label no session in this fixture carries, so echoing any \
+             `session.repo` cannot produce it: {:?}",
+            app.rows()
+        );
+
+        let _ = std::fs::remove_dir_all(&main);
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    /// Unifying the repo head must not flatten the level BELOW it: a project
+    /// spans branches, and telling them apart is what the grouped list is for.
+    ///
+    /// The fixture also pins the ONE thing that can go wrong once heads stop
+    /// tracking `session.repo` — the timestamps INTERLEAVE the two `main`
+    /// sessions with the `feature` one under the old per-folder key (300, 250,
+    /// 200 reads main, feature, main), so if the display ordering and the row
+    /// builder disagreed about what a group is, `main` would be sorted apart and
+    /// draw its head TWICE. Sharing [`group_key`] is what keeps it one run.
+    #[test]
+    fn project_scope_keeps_the_branch_groups_under_the_one_head() {
+        let main = unique_temp_dir("branch-groups-main");
+        let worktree = unique_temp_dir("branch-groups-wt");
+        let launch = resolve_dir(&main);
+        let sessions = vec![
+            session_ts(
+                "s-main",
+                MAIN_LABEL,
+                Some("main"),
+                main.to_str().unwrap(),
+                300,
+            ),
+            session_ts(
+                "s-wt-feature",
+                WORKTREE_LABEL,
+                Some("feature"),
+                worktree.to_str().unwrap(),
+                250,
+            ),
+            session_ts(
+                "s-wt-main",
+                WORKTREE_LABEL,
+                Some("main"),
+                worktree.to_str().unwrap(),
+                200,
+            ),
+        ];
+        let app = app_project(
+            sessions,
+            launch,
+            vec![resolve_dir(&main), resolve_dir(&worktree)],
+        );
+
+        assert_eq!(
+            heads(&app),
+            vec![
+                (PROJECT_LABEL.to_string(), "main".to_string()),
+                (PROJECT_LABEL.to_string(), "feature".to_string()),
+            ],
+            "two branches -> two branch groups, each head drawn ONCE and both \
+             under the one RESOLVED project label, which no session here \
+             carries: {:?}",
+            app.rows()
+        );
+        assert_eq!(
+            visible_ids(&app),
+            vec!["s-main", "s-wt-main", "s-wt-feature"],
+            "and the main-checkout session sits INSIDE the branch group it \
+             shares with a worktree session, contiguous with it rather than \
+             sorted away from it"
+        );
+
+        let _ = std::fs::remove_dir_all(&main);
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    /// The blast radius, pinned: the head override belongs to the project scope
+    /// ALONE. In the all scope the same fixture still heads each folder by its
+    /// own `repo_of` label, because there "one project" is not a question the
+    /// board can answer — it is showing every project at once.
+    ///
+    /// The app is walked from a RESOLVED project scope into the all scope rather
+    /// than started in it, so the worktree set (and its label) is sitting in the
+    /// cache the whole time. Starting fresh in the all scope would leave the set
+    /// empty, and the guard would then hold for the wrong reason — there would be
+    /// no label available to leak in the first place.
+    #[test]
+    fn all_scope_still_heads_each_worktree_by_its_own_repo_label() {
+        let main = unique_temp_dir("all-heads-main");
+        let worktree = unique_temp_dir("all-heads-wt");
+        let sessions = vec![
+            session_ts(
+                "s-main",
+                MAIN_LABEL,
+                Some("main"),
+                main.to_str().unwrap(),
+                300,
+            ),
+            session_ts(
+                "s-wt",
+                WORKTREE_LABEL,
+                Some("main"),
+                worktree.to_str().unwrap(),
+                200,
+            ),
+        ];
+        let mut app = app_project(
+            sessions,
+            resolve_dir(&main),
+            vec![resolve_dir(&main), resolve_dir(&worktree)],
+        );
+        // A `-a` board: the all scope is on the key only where the launch flag
+        // put it, and this test's whole subject is that scope.
+        app.all_scope_enabled = true;
+        app.toggle_scope();
+        assert_eq!(app.scope, Scope::All, "premise: `Project` -> `All`");
+        assert!(
+            !app.worktrees.is_empty(),
+            "premise: the resolved set is still cached, so the label the all \
+             scope must NOT use is genuinely available"
+        );
+
+        assert_eq!(
+            heads(&app),
+            vec![
+                (MAIN_LABEL.to_string(), "main".to_string()),
+                (WORKTREE_LABEL.to_string(), "main".to_string()),
+            ],
+            "the all scope is UNCHANGED — two labels, two heads: {:?}",
+            app.rows()
+        );
+
+        let _ = std::fs::remove_dir_all(&main);
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    /// The RE-DERIVED fail-soft rendering contract, and it is the opposite of
+    /// what it used to be.
+    ///
+    /// It used to be "an unresolved project scope renders exactly like the
+    /// current-folder scope", which followed from an unresolved scope matching
+    /// exactly one folder. [`in_scope`]'s repo-root arm needs no git, so an
+    /// unresolved project scope still spans every folder of the repo — and a
+    /// scope that spans folders MUST keep its heads, or rows from different
+    /// worktrees sit in one undifferentiated list.
+    ///
+    /// One head is the other half. A grouped list with no head override falls
+    /// back to `session.repo`, which spells a checkout and its worktree
+    /// differently, so the project would split in two exactly where nothing
+    /// resolved it. The fixture gives its two sessions the two REAL labels of one
+    /// project, so that split is what a `None` head would produce here.
+    ///
+    /// The fixture also keeps the flat and grouped ORDERS apart, so the id
+    /// assertion cannot pass by coincidence: by bare timestamp the rows read a
+    /// (300), b (250), c (100), while grouped the `main` group leads — its
+    /// newest, 300, beats `dev`'s 250 — and takes BOTH its sessions first,
+    /// giving a, c, b. Only the grouped arm can produce the order asserted here.
+    #[test]
+    fn an_unresolved_project_scope_still_draws_one_head_over_the_whole_repo() {
+        let repo = unique_temp_dir("unresolved-render");
+        let launch = resolve_dir(&repo);
+        let repo_cwd = repo.to_str().unwrap();
+        let worktree = repo.join(".wtp/worktrees/dev");
+        let wt_cwd = worktree.to_str().unwrap();
+        let sessions = vec![
+            session_ts("a", MAIN_LABEL, Some("main"), repo_cwd, 300),
+            session_ts("b", WORKTREE_LABEL, Some("dev"), wt_cwd, 250),
+            session_ts("c", WORKTREE_LABEL, Some("main"), wt_cwd, 100),
+        ];
+        // The test-default probe resolves an EMPTY set, which is what "no git,
+        // not a repo, non-zero exit" all arrive here as.
+        let project = App::new(sessions.clone(), Scope::Project, launch.clone());
+        let folder = App::new(sessions, Scope::CurrentFolder, launch.clone());
+
+        assert!(project.worktrees.is_empty(), "premise: nothing resolved");
+        assert_eq!(
+            visible_ids(&folder),
+            vec!["a"],
+            "premise: the current-folder scope sees the launch dir alone, so the \
+             widening below is a real difference"
+        );
+        assert_eq!(
+            visible_ids(&project),
+            vec!["a", "c", "b"],
+            "the whole repo is in scope, in GROUPED order (a, c, b) — the flat \
+             arm would have given a, b, c"
+        );
+
+        let repo_name = launch
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("the temp repo dir has a UTF-8 final component")
+            .to_string();
+        assert_eq!(
+            heads(&project),
+            vec![
+                (repo_name.clone(), "main".to_string()),
+                (repo_name, "dev".to_string()),
+            ],
+            "ONE project head over both branches — never the two per-folder \
+             labels the sessions carry: {:?}",
+            project.rows()
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// A set with ROOTS but no LABEL still draws exactly one head.
+    ///
+    /// This used to be the case that could split the project in two: the render
+    /// shape keyed on `roots.is_empty()` while [`App::project_head`] keyed on
+    /// `label()`, so a set answering YES to one and NO to the other drew GROUPED
+    /// with no project label to head by — one head PER FOLDER, the very split the
+    /// override removes. [`App::project_head`] is now unconditional in the
+    /// project scope, which closes it structurally; this pins the state anyway,
+    /// because it is the one that used to be able to reintroduce the split.
+    ///
+    /// `parse_porcelain` cannot build that shape — it labels from the first root
+    /// it inserts, so roots and label arrive together — but
+    /// [`WorktreeSet::from_resolved`] takes the two independently and both it and
+    /// the `worktrees` field are public, which is all it takes to reach.
+    ///
+    /// The one head then still needs a NAME, and it is the project ROOT's — the
+    /// same [`project_root_name`] fallback the header uses (`tui::view`'s
+    /// `project_name`), so head and header cannot disagree about what to call the
+    /// project. This launch dir is a plain temp dir, so it IS its own root and
+    /// the two spellings coincide; the branch-named case is
+    /// [`the_one_head_is_named_after_the_repo_root_not_the_branch_launched_from`].
+    #[test]
+    fn a_resolved_set_with_no_label_still_draws_one_head_named_from_the_repo_root() {
+        let main = unique_temp_dir("no-label-main");
+        let worktree = unique_temp_dir("no-label-wt");
+        let launch = resolve_dir(&main);
+        let launch_name = launch
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("the temp launch dir has a UTF-8 final component")
+            .to_string();
+        let sessions = vec![
+            session_ts(
+                "s-main",
+                MAIN_LABEL,
+                Some("main"),
+                main.to_str().unwrap(),
+                300,
+            ),
+            session_ts(
+                "s-wt",
+                WORKTREE_LABEL,
+                Some("main"),
+                worktree.to_str().unwrap(),
+                200,
+            ),
+        ];
+        // Roots but NO label: membership resolved, the project simply unnamed.
+        let app = app_project_labeled(
+            sessions,
+            launch,
+            vec![resolve_dir(&main), resolve_dir(&worktree)],
+            None,
+        );
+
+        assert!(
+            !app.worktrees.is_empty(),
+            "premise: membership DID resolve, so this renders grouped"
+        );
+        assert_eq!(
+            app.worktrees.label(),
+            None,
+            "premise: and it resolved without a label"
+        );
+        assert_eq!(
+            heads(&app),
+            vec![(launch_name, "main".to_string())],
+            "ONE head still — named from the repo ROOT, which this plain temp \
+             dir IS, never split back into the per-folder labels: {:?}",
+            app.rows()
+        );
+
+        let _ = std::fs::remove_dir_all(&main);
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    /// The rest of [`App::project_label`]'s totality, which the fixture above
+    /// cannot reach: the two launch dirs that have no ordinary NAME — one with no
+    /// final component, one that is not UTF-8 at all. A resolved set must still
+    /// produce a head for both, because `None` here does not mean "an unnamed
+    /// head", it means the per-folder heads coming back.
+    ///
+    /// Both arms take the fallback the HEADER takes, down to the `to_string_lossy`
+    /// repair; `tui::view`'s `head_and_header_name_a_non_utf8_launch_dir_the_same_way`
+    /// pins the two answers against each other, while this one pins the head's
+    /// exact text.
+    ///
+    /// The set is poked in directly (as the header's own tests do): this pins
+    /// [`App::project_head`] alone, so a rendering fixture would only add noise
+    /// between the launch dir and the answer.
+    #[test]
+    fn a_resolved_set_still_names_a_head_when_the_launch_dir_has_no_usable_name() {
+        let head_for = |launch: PathBuf| {
+            let mut app = App::new(Vec::new(), Scope::Project, launch);
+            app.worktrees = WorktreeSet::from_resolved([PathBuf::from("/any/root")], None);
+            app.project_head()
+        };
+
+        assert_eq!(
+            head_for(PathBuf::from("/")),
+            Some("/".to_string()),
+            "no final component -> named by the whole path, the same fallback \
+             the header takes"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert_eq!(
+                head_for(PathBuf::from(std::ffi::OsStr::from_bytes(b"/tmp/\xff"))),
+                Some("\u{FFFD}".to_string()),
+                "unspellable in UTF-8 -> the same lossy repair the header makes, \
+                 still ONE head"
+            );
+        }
+    }
+
+    /// A worktree DIRECTORY is named after its BRANCH, so naming the one head
+    /// after the launch dir would head a list drawn from the whole project with
+    /// a branch name — the very misdescription that makes the resolved git label
+    /// beat the fallbacks in the first place. The fallback names the repo ROOT
+    /// instead, which is also what git would have said.
+    ///
+    /// Reachable whenever git resolved nothing, which is now a state that still
+    /// renders a head: launching `-p` from a worktree with no `git` on `PATH` is
+    /// exactly it.
+    #[test]
+    fn the_one_head_is_named_after_the_repo_root_not_the_branch_launched_from() {
+        let launch = PathBuf::from(
+            "/Volumes/Development/ilfroloff/snapback/.agents/worktrees/feature/quick-send",
+        );
+        let app = App::new(Vec::new(), Scope::Project, launch.clone());
+
+        assert!(
+            app.worktrees.is_empty(),
+            "premise: nothing resolved, so the head takes the FALLBACK name"
+        );
+        assert_eq!(
+            app.project_head(),
+            Some("snapback".to_string()),
+            "the project is `snapback`; `quick-send` is one of its branches"
+        );
+        assert_ne!(
+            app.project_head().as_deref(),
+            launch.file_name().and_then(|n| n.to_str()),
+            "and it is emphatically not the launch dir's own name"
         );
     }
 

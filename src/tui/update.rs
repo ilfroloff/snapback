@@ -34,7 +34,7 @@
 //! | `Ctrl-R` | quick-reply: send a one-shot message to the selected session without leaving the board. An agent whose run is OVER (`done` / `stopped` / `failed`) is stopped first so the reply lands in place; `needs input` confirms first; `working` / `idle` / `interrupted` / an unrecognized qualifier is refused (see [`send::reply_gate`]) |
 //! | `Ctrl-K` | stop / interrupt the selected session's live background agent (`claude stop`); an agent whose run is OVER (`done` / `stopped` / `failed`) stops at once, every other live agent confirms first, and a session claude is not holding — or one running interactively, which carries no job id — is refused (see [`send::interrupt_gate`]) |
 //! | `Tab` | toggle name-only vs. name+content search |
-//! | `Ctrl-A` | toggle scope (current-folder <-> all) |
+//! | `Ctrl-A` | flip the scope: current folder <-> project (the launch repo and all of its git worktrees). ONE key for both, because the second is a refinement of the same question the first answers, not a separate mode. Launched with `--all`/`-a` it becomes a three-stop cycle through all folders as well — the whole store is on this key only when the launch flag put it there |
 //! | `Ctrl-X` then `x`/`d`/`h` | leader chord: hide / hard-delete (this row, or its whole fork lineage) / toggle show-hidden (any other key cancels) |
 //! | `Ctrl-/` | toggle the preview pane |
 //! | `PgUp` / `PgDn` | scroll the preview a page (always) |
@@ -123,7 +123,11 @@ pub enum Action {
     Interrupt,
     /// Toggle name-only vs. name+content search.
     ToggleSearchMode,
-    /// Toggle current-folder vs. all scope.
+    /// Flip the scope: current folder <-> project (`Ctrl-A`), or cycle it
+    /// through all folders as well when the board was launched with
+    /// `--all`/`-a`. The project state spans the launch repo's git worktrees;
+    /// see [`super::app::Scope::toggled`] for the cycle itself and for why the
+    /// widest state is off the key by default.
     ToggleScope,
     /// Toggle the preview pane.
     TogglePreview,

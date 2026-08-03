@@ -94,15 +94,27 @@ one place.
 - **STABLE-ID STATE.** Track selection by `session_id`, never list index, so it
   survives autorefresh reloads. (`src/tui/app.rs`)
 - **OFF-UI-THREAD blocking work.** RECURRING shell-outs / FS watch / input run on
-  their own threads and deliver `AppEvent`s; the render loop never blocks. A
-  one-shot at hand-off is a deliberate, documented exception (`PATTERNS.md` §6).
-  (`src/watch.rs`)
+  their own threads and deliver `AppEvent`s; the render loop never blocks. TWO
+  bounded one-shots are deliberate, documented exceptions (`PATTERNS.md` §6): the
+  liveness probe at hand-off, and the worktree resolve at construction/reload.
+  Both are argued at the call site, and NEITHER may move onto a keystroke or the
+  render path — a scope toggle reads a cached set, it never resolves.
+  (`src/watch.rs`, `src/worktrees.rs`)
+- **PURE, GIT-FREE STORE CORE.** `src/store/*` decides everything from the bytes
+  it was given: `repo_of`'s worktree collapse is a pure string heuristic, and NO
+  module under `src/store/` may shell out (to `git` or anything else) or read
+  ambient state to answer a per-session question — it does not scale past a
+  handful of sessions and it is not fail-soft. The ONE `git` shell-out lives in
+  `src/worktrees.rs`, outside the store, where it runs ONCE per launch/reload for
+  the launch dir alone; that placement is the whole reason the module exists.
+  Keep the dependency one-way: `tui` -> `worktrees` -> `store::group`.
+  (`src/store/*`, `src/worktrees.rs`)
 - **TERMINAL-SAFE STYLING.** Style with ratatui `Style`/`Modifier` + NAMED ANSI
   colors only. NEVER embed ANSI escapes or hardcode RGB. (`src/store/preview.rs`,
   `src/tui/view.rs`)
 - **NARROW `#[allow(dead_code)]`.** Binary-crate lint quirk: attach it to the
   single item with a reason. NEVER a crate/module-wide blanket. (`src/search.rs`,
-  `src/watch.rs`)
+  `src/watch.rs`, `src/worktrees.rs`)
 - **KEEP KEY DOCS IN SYNC.** A key/flag change must update the table in
   `update.rs`, `USAGE`/`KEYS` in `cli.rs`, the help line in `view.rs`, and the
   README key map together. This is the ONE list of those surfaces; the other docs

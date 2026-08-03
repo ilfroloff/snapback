@@ -6,9 +6,10 @@
 //! Architecture (data-core-first): the framework-independent data layer
 //! (`store`) is unit-tested before any TUI code lands. The `tui` module is the
 //! elm-style shell; `watch` feeds autorefresh events; `search` isolates nucleo;
-//! `resume` spawns `claude` as a child and RETURNS so `snapback` stays a
-//! persistent dashboard (quitting a resumed session drops you back onto the
-//! board).
+//! `worktrees` resolves the launch project's live worktree set (the one git
+//! shell-out, kept out of the pure `store` core); `resume` spawns `claude` as a
+//! child and RETURNS so `snapback` stays a persistent dashboard (quitting a
+//! resumed session drops you back onto the board).
 //!
 //! This is a personal tool; see `README.md`. The expensive module tree lives
 //! here in the library crate so it compiles once, and the `snapback` and `sb`
@@ -26,6 +27,7 @@ mod send;
 mod store;
 mod tui;
 mod watch;
+mod worktrees;
 
 use std::io::IsTerminal;
 
@@ -70,6 +72,11 @@ pub fn run() {
     // trips so selection/query/scope/scroll survive, and only exits when the
     // user quits `snapback` itself (`q` / `Esc` / `Ctrl-C`).
     let mut app = App::new(sessions, args.scope, launch_dir);
+    // The OTHER half of `--all`/`-a` (see `cli::Args::all_scope_enabled`): the
+    // scope above says where the board STARTS, this says the all scope stays on
+    // the `Ctrl-A` cycle. It is board state rather than a constructor argument
+    // because it filters nothing — see `App::all_scope_enabled`.
+    app.all_scope_enabled = args.all_scope_enabled;
     loop {
         match tui::run(&mut app, &root) {
             // User quit the board (or all event senders dropped).
@@ -90,6 +97,11 @@ pub fn run() {
                     Ok(None) => {}
                     Err(err) => app.set_status(err.message().to_string()),
                 }
+                // One call reloads BOTH halves of the board's world: the store
+                // read below, and — inside `apply_sessions` — the launch
+                // project's worktree set, which the child may have changed (a
+                // `git worktree add` in the resumed session). No extra wiring
+                // here on purpose; see `App::apply_sessions`.
                 app.apply_sessions(SessionStore::load_from(&root));
             }
             // `run` only breaks its own loop on Quit/Resume; Continue never

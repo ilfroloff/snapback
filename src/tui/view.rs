@@ -5,12 +5,15 @@
 //! right pane is not always a transcript: the compose editor docks into its
 //! bottom while composing, and a `Ctrl-N` background draft replaces the
 //! transcript outright with a placeholder card ([`draft_card`]), since the session
-//! it stands for does not exist yet. In the
-//! all-folders scope the list shows repo -> branch group heads (git-log-style
-//! folder head shown once per group); in the current-folder scope it is a flat,
-//! datestamp-led, newest-first list with no group heads. Every session row leads
-//! with its datestamp column. Groups and selection are styled with ratatui (no
-//! hand-written ANSI).
+//! it stands for does not exist yet. Two of the three scopes show group heads
+//! (git-log-style, once per group): the all-folders scope heads each repo ->
+//! branch group, and the project scope heads its branch groups under the ONE
+//! resolved project label, since every row it draws belongs to that project. The
+//! current-folder scope is the flat, datestamp-led, newest-first list with no
+//! group heads, and the ONLY scope that draws flat — see
+//! [`super::app::build_rows`], which owns why an unresolved project scope is not
+//! a second one. Every session row leads with its datestamp column. Groups and
+//! selection are styled with ratatui (no hand-written ANSI).
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -380,18 +383,42 @@ fn format_version_label(debug_build: bool, git_hash: &str, dirty: bool) -> Strin
     format!("{DEV_VERSION_PREFIX}{git_hash}{dirty}")
 }
 
+/// The launch directory's own name for the header, falling back to its full path
+/// when it has no final component (`/`). Shared by the folder- and
+/// project-scoped labels so the two can never disagree about what to call the
+/// place snapback was started in.
+fn launch_dir_name(app: &App) -> String {
+    app.launch_dir
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| app.launch_dir.to_string_lossy().into_owned())
+}
+
+/// What to call the project in the header: the label git resolved for the whole
+/// worktree set, or the name of the repo ROOT the launch dir sits in when
+/// nothing resolved.
+///
+/// The resolved label is PREFERRED because the project scope spans several
+/// folders — naming the one worktree you happened to launch from would
+/// misdescribe a list drawn from all of them. The fallback obeys the same
+/// argument rather than contradicting it: an unresolved set still leaves the
+/// scope spanning the whole repo (`App::in_scope`'s root arm needs no git), so
+/// the header names that root, not the branch-named folder inside it. Uses
+/// [`crate::worktrees::project_root_name`], the one place that fallback is
+/// written, which is what keeps this and `App::project_label` in step.
+fn project_name(app: &App) -> String {
+    app.worktrees
+        .label()
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| crate::worktrees::project_root_name(&app.launch_dir))
+}
+
 /// The top status line: title, active scope, search mode, and counts on the
 /// left, with the crate version indicator right-aligned on the same row.
 fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     let scope = match app.scope {
-        Scope::CurrentFolder => {
-            let dir = app
-                .launch_dir
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| app.launch_dir.to_string_lossy().into_owned());
-            format!("folder:{dir}")
-        }
+        Scope::CurrentFolder => format!("folder:{}", launch_dir_name(app)),
+        Scope::Project => format!("project:{}", project_name(app)),
         Scope::All => "all folders".to_string(),
     };
     let mode = match app.search_mode {
@@ -453,6 +480,31 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
+/// What an empty list says, and where it points next.
+///
+/// Each narrow scope names the scope `Ctrl-A` ACTUALLY reaches from it — the
+/// next state in [`Scope::toggled`], not the widest one. Pure so that claim is
+/// assertable: an empty board's only advice is this sentence, and a sentence
+/// that names the wrong destination sends the user one key past what they
+/// wanted — or, worse, promises a destination the key cannot reach at all,
+/// which is what `all_enabled` is here to prevent.
+fn empty_list_message(scope: Scope, all_enabled: bool) -> &'static str {
+    match scope {
+        Scope::CurrentFolder => {
+            "No sessions in this folder.\nPress Ctrl-A to widen to this project's worktrees."
+        }
+        Scope::Project if all_enabled => {
+            "No sessions in this project.\nPress Ctrl-A to show all folders."
+        }
+        // Ctrl-A only NARROWS from here without `-a`, so there is no widening
+        // left to offer. Saying nothing beats naming a key that walks back to
+        // the scope the user already found empty.
+        Scope::Project => "No sessions in this project.",
+        // Already the widest scope: there is nothing left to widen to.
+        Scope::All => "No sessions found.",
+    }
+}
+
 /// The grouped session list with git-log-style folder heads and a highlighted
 /// selection. The `ListState` offset is seeded from and written back to
 /// `app.scroll` so scroll survives reloads.
@@ -461,12 +513,7 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default().borders(Borders::ALL).title(" sessions ");
 
     if rows.is_empty() {
-        let msg = match app.scope {
-            Scope::CurrentFolder => {
-                "No sessions in this folder.\nPress Ctrl-A to show all folders."
-            }
-            Scope::All => "No sessions found.",
-        };
+        let msg = empty_list_message(app.scope, app.all_scope_enabled);
         frame.render_widget(
             Paragraph::new(msg)
                 .block(block)
@@ -2368,6 +2415,252 @@ mod tests {
         // `cargo test` compiles in debug mode, so the live label takes the dev
         // branch; asserts the wiring (cfg + env vars), not a specific commit.
         assert!(version_label().starts_with(DEV_VERSION_PREFIX));
+    }
+
+    // --- header scope label -----------------------------------------------
+
+    /// Width the header cases draw at: wide enough that no label is clipped
+    /// before the `matched / total` counts, so a missing word is a real miss.
+    const HEADER_WIDTH: u16 = 120;
+
+    /// The header row `app` paints, as text.
+    fn drawn_header(app: &App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(HEADER_WIDTH, 1))
+            .expect("build an in-memory test terminal");
+        terminal
+            .draw(|frame| render_header(frame, app, frame.area()))
+            .expect("render_header must not panic");
+        full_row_text(terminal.backend().buffer(), 0, HEADER_WIDTH)
+    }
+
+    /// The project scope spans SEVERAL folders, so naming the one you launched
+    /// in would be a lie about what the list is showing. The header takes the
+    /// label git resolved for the whole worktree set instead.
+    #[test]
+    fn project_scope_header_names_the_resolved_project_not_the_launch_folder() {
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::Project,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.worktrees = crate::worktrees::WorktreeSet::from_resolved(
+            [PathBuf::from("/tmp/launch"), PathBuf::from("/tmp/other-wt")],
+            Some("acme/web".to_string()),
+        );
+
+        let header = drawn_header(&app);
+
+        assert!(
+            header.contains("project:acme/web"),
+            "the header must name the project git resolved: {header}"
+        );
+        assert!(
+            !header.contains("project:launch"),
+            "naming the launch folder would misdescribe a cross-worktree list: {header}"
+        );
+    }
+
+    /// Fail-soft, and consistent with what the list actually shows: an
+    /// unresolved set still scopes `Project` to the launch dir's repo ROOT, so
+    /// the header names that root rather than going blank. `/tmp/launch` is a
+    /// plain checkout, i.e. its own root, so the name is the folder's own here;
+    /// the case where the two differ is
+    /// [`project_scope_header_names_the_repo_root_not_the_worktree_launched_from`].
+    #[test]
+    fn project_scope_header_falls_back_to_the_repo_root_name() {
+        // The test-default worktree probe resolves nothing, which is the
+        // "git missing / not a repo" answer.
+        let app = App::new(
+            vec![sample_session()],
+            Scope::Project,
+            PathBuf::from("/tmp/launch"),
+        );
+
+        assert!(
+            drawn_header(&app).contains("project:launch"),
+            "an unresolved project is still named after its repo ROOT, which \
+             for this plain checkout is the launch folder itself"
+        );
+    }
+
+    /// The OTHER door into that same fallback: a set whose membership RESOLVED
+    /// but that carries no label (`WorktreeSet::from_resolved(roots, None)`,
+    /// reachable through the public constructor and the public `worktrees`
+    /// field). The list side pins this state — see `App`'s
+    /// `a_resolved_set_with_no_label_still_draws_one_head_named_from_the_repo_root`
+    /// — but the header side did not, so the two halves of "head and header
+    /// agree" rested on reading two implementations of one naming rule rather
+    /// than on an assertion here.
+    ///
+    /// Distinct from the unresolved case above in the premise, not the text:
+    /// membership resolved, so the list draws GROUPED under one head, and the
+    /// header must name the launch dir for that head to have anything to agree
+    /// with.
+    #[test]
+    fn project_scope_header_names_the_launch_dir_when_a_resolved_set_has_no_label() {
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::Project,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.worktrees = crate::worktrees::WorktreeSet::from_resolved(
+            [PathBuf::from("/tmp/launch"), PathBuf::from("/tmp/other-wt")],
+            None,
+        );
+
+        assert!(
+            !app.worktrees.is_empty(),
+            "premise: membership DID resolve — this is not the unresolved case"
+        );
+        assert_eq!(
+            app.worktrees.label(),
+            None,
+            "premise: and it resolved without a label"
+        );
+
+        let header = drawn_header(&app);
+        assert!(
+            header.contains("project:launch"),
+            "a resolved set with no label still names the launch dir: {header}"
+        );
+        assert_eq!(
+            app.project_head().as_deref(),
+            Some(project_name(&app).as_str()),
+            "and the one group head reads exactly as the header does"
+        );
+    }
+
+    /// The header names the PROJECT, and a worktree folder is named after its
+    /// BRANCH — so when git resolved no label, the fallback must climb to the
+    /// repo root rather than print the branch. Otherwise a `-p` board launched
+    /// from `.agents/worktrees/feature/quick-send` announces itself as
+    /// `project:quick-send` over a list drawn from the whole of `snapback`.
+    ///
+    /// This is now a REACHABLE state rather than a curiosity: an unresolved set
+    /// no longer collapses the project scope to one folder, so the fallback name
+    /// heads a genuinely cross-worktree list.
+    #[test]
+    fn project_scope_header_names_the_repo_root_not_the_worktree_launched_from() {
+        let launch = PathBuf::from(
+            "/Volumes/Development/ilfroloff/snapback/.agents/worktrees/feature/quick-send",
+        );
+        // The test-default probe resolves nothing: no `git`, or not a repo.
+        let app = App::new(vec![sample_session()], Scope::Project, launch);
+
+        assert!(app.worktrees.is_empty(), "premise: nothing resolved");
+
+        let header = drawn_header(&app);
+        assert!(
+            header.contains("project:snapback"),
+            "the header names the project, not the branch folder: {header}"
+        );
+        assert!(
+            !header.contains("project:quick-send"),
+            "naming the branch would misdescribe a whole-project list: {header}"
+        );
+        assert_eq!(
+            app.project_head().as_deref(),
+            Some(project_name(&app).as_str()),
+            "and the one group head still reads exactly as the header does"
+        );
+    }
+
+    /// The one launch dir where head and header could drift: a path with no UTF-8
+    /// spelling. The header repairs it with `to_string_lossy`; the head must make
+    /// the same repair, or a `-p` board names one project two different things at
+    /// once — a head reading one way and the header above it reading another.
+    /// The head can only follow because `App`'s `project_label` returns an owned
+    /// `String`; a borrowed name cannot carry a repair.
+    ///
+    /// `#[cfg(unix)]` because only there can a `PathBuf` be built from bytes that
+    /// are not UTF-8.
+    #[cfg(unix)]
+    #[test]
+    fn head_and_header_name_a_non_utf8_launch_dir_the_same_way() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::Project,
+            PathBuf::from(OsStr::from_bytes(b"/tmp/\xff")),
+        );
+        app.worktrees =
+            crate::worktrees::WorktreeSet::from_resolved([PathBuf::from("/any/root")], None);
+
+        let name = project_name(&app);
+        assert_eq!(
+            name, "\u{FFFD}",
+            "the header repairs an unspellable name rather than dropping it"
+        );
+        assert_eq!(
+            app.project_head().as_deref(),
+            Some(name.as_str()),
+            "the one group head must read exactly as the header does"
+        );
+        assert!(
+            drawn_header(&app).contains(&format!("project:{name}")),
+            "and that is what the board actually paints"
+        );
+    }
+
+    /// An empty board's ONLY advice is this sentence, so it has to name the
+    /// scope `Ctrl-A` actually reaches from here — the next state in the cycle,
+    /// not the widest one. Derived from [`Scope::toggled`] rather than restated,
+    /// so adding a fourth scope cannot leave the advice one key stale.
+    #[test]
+    fn an_empty_list_points_at_the_scope_ctrl_a_reaches_next() {
+        assert_eq!(
+            Scope::CurrentFolder.toggled(true),
+            Scope::Project,
+            "the cycle this advice describes"
+        );
+        assert!(
+            empty_list_message(Scope::CurrentFolder, true).contains("project"),
+            "from the folder scope Ctrl-A widens to the PROJECT, not to all folders"
+        );
+
+        assert_eq!(Scope::Project.toggled(true), Scope::All);
+        assert!(
+            empty_list_message(Scope::Project, true).contains("all folders"),
+            "from the project scope Ctrl-A widens to all folders"
+        );
+
+        assert!(
+            !empty_list_message(Scope::All, true).contains("Ctrl-A"),
+            "the widest scope has nothing to widen to, so it must not offer the key"
+        );
+    }
+
+    /// The same rule under the DEFAULT launch, where `Ctrl-A` cannot reach the
+    /// all scope at all: the advice must stop promising a destination the key no
+    /// longer has. Derived from [`Scope::toggled`] for the same reason — a
+    /// sentence naming a scope the key does not reach is worse than no sentence,
+    /// because an empty board has nothing else to go on.
+    #[test]
+    fn an_empty_project_stops_promising_all_folders_without_the_launch_flag() {
+        assert_eq!(
+            Scope::Project.toggled(false),
+            Scope::CurrentFolder,
+            "the cycle this advice describes: no `-a`, so the key NARROWS here"
+        );
+        let msg = empty_list_message(Scope::Project, false);
+        assert!(
+            !msg.contains("all folders"),
+            "the key cannot show all folders on this launch, so the board must \
+             not offer it: {msg}"
+        );
+        assert!(
+            !msg.contains("Ctrl-A"),
+            "and there is nothing wider to point at, so it names no key at all: \
+             {msg}"
+        );
+
+        assert!(
+            empty_list_message(Scope::CurrentFolder, false).contains("project"),
+            "the folder scope still widens to the project either way — the flag \
+             takes away the third stop, not the first"
+        );
     }
 
     #[test]

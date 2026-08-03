@@ -73,7 +73,19 @@ it. Follow this split when adding behavior:
   fuses onto the kind label, plus `is_active`) and both argv builders (`agents_argv` /
   `live_agents_argv`) and `agents_from_output` (the shell-out's
   non-zero-exit-means-no-signal decision, split from the spawn so it is testable
-  without one); `store::lineage`'s `lineage_key` / `head_of` / `fold` (the whole
+  without one); `worktrees`' whole trio, split from its spawn the same way —
+  `git_worktree_argv` (the invocation is a contract with an external CLI, so it
+  is asserted without running one), `set_from_output` (the same
+  non-zero-exit-means-no-signal decision, plus non-UTF-8 output rejected WHOLE
+  rather than lossily repaired, since a replacement character inside a path is a
+  directory that exists nowhere) and `parse_porcelain` (which takes its
+  canonicalizer as a PARAMETER, so the parse stays hermetic — no filesystem, no
+  git — and is pinned against real captured porcelain bytes); `store::group`'s
+  `repo_root_of` / `repo_of` (ONE pure marker scan, two consumers — the root path
+  and its label — with inline path fixtures, including a NEGATIVE case that must
+  not collapse and a pinned known limitation); `App::in_scope` (the scope
+  predicate, which takes the worktree set as a parameter rather than reaching for
+  it, so it never resolves git and is tested from a seeded set); `store::lineage`'s `lineage_key` / `head_of` / `fold` (the whole
   fold is one pure fn of `(sessions, filtered, expanded)`, so the `(+N)` board can
   be tested as a list transformation with no terminal and no store);
   `update::key_to_action` / `wheel_target` / `accept_paste` (line-ending
@@ -98,8 +110,10 @@ it. Follow this split when adding behavior:
   `classify`, but a rendering decision, so the palette sits in the view rather
   than dragging ratatui into the parser layer).
 - Thin, impure: `resume::launch` (chdir + spawn + wait), `defined_agents::discover_agents`
-  (the FS walk over `select_agents` / `parse_frontmatter`), the `watch` threads,
-  `tui::run` (draw loop). Keep these small and delegate to tested helpers.
+  (the FS walk over `select_agents` / `parse_frontmatter`), `worktrees::resolve`
+  (spawn + capture, delegating every decision to `set_from_output`), the `watch`
+  threads, `tui::run` (draw loop). Keep these small and delegate to tested
+  helpers.
 
 The terminal-up **refusal gate** is an instance of this: `resume::check` (and its
 sibling `resume::check_new` for starting a fresh session in the launch dir) runs
@@ -274,6 +288,33 @@ hands off on polled data; the poll draws badges.** Fork is the deliberate
 exception that proves the shape: it has no liveness question to ask (a fork works
 live or finished), so it must NOT be dragged behind the probe — it is the route
 the not-live refusal points at.
+
+The **second** allowed one-shot is `worktrees::resolve` (`git -C <dir> worktree
+list --porcelain`), and it is worth stating separately because its moment is not
+a hand-off: it runs at **construction and on reload** — `App::new` and
+`App::apply_sessions` — which puts it in the same category as the synchronous
+store reload that already happens there, one bounded child per reload rather than
+a cadence. The same two conditions apply and are met: it adds no tick, thread, or
+event source (so background cost is unchanged), and its cost is a single local
+`git` invocation folded into a reload the board is already blocked on, not a
+hitch on a frame that would otherwise have rendered. What it may NOT do is move:
+`recompute_scope` and `toggle_scope` run on a keystroke, so they read the CACHED
+set and never resolve, and the render path never resolves at all. A test pins
+that boundary directly by counting probe invocations across a `toggle_scope`.
+
+That resolver is reached through an **injected probe**, the same seam
+`App::live_probe` uses: a boxed `Fn` field on `App`, with the real shell-out as
+the `#[cfg(not(test))]` default and a `#[cfg(test)]` default plus a
+`set_*_probe` setter for tests. It is a SEAM, not a strategy — production swaps
+it exactly never — and it exists so the suite can state an answer instead of
+spawning a child. The two defaults differ on purpose, and the difference is the
+pattern to copy: `default_live_probe` PANICS under test, because a liveness
+answer that silently defaulted to "nothing is live" would let a test pass for the
+wrong reason; `default_worktree_probe` returns the EMPTY set, because empty is
+the module's documented "could not resolve" answer, under which the scope falls
+back to its git-free repo-root arm — so no `App::new` call site spawns git and
+every one of them still gets the answer a user with no `git` on `PATH` would.
+Pick the default that makes an unconsidered case obvious, not merely convenient.
 
 ## 7. Restrained, terminal-safe styling
 
@@ -526,7 +567,10 @@ Tests are **inline** `#[cfg(test)] mod tests` at the bottom of each source file
   touch the real `~/.claude/projects`. Clean up with `remove_dir_all`.
 - **Test the pure helper, not the impure driver**: exit handling is tested via
   `status_for_exit`, teardown via the `Write`-generic `disable_mouse`, argv via
-  `build_argv` — no real `claude` process is ever spawned.
+  `build_argv` — no real `claude` process is ever spawned, and no real `git`
+  either (the worktree set is stated through `App::set_worktree_probe`, and the
+  porcelain parser is fed captured sample text; see
+  [§6](#6-off-ui-thread-for-anything-that-can-block) for the probe seam).
 - **Assert structure, not styling**: preview tests flatten `Text` to plain
   strings to check markers, and separately assert `Style`/`Modifier` on specific
   spans.
