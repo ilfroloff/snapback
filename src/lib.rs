@@ -16,10 +16,10 @@
 
 mod agents;
 mod cli;
-pub mod config;
+mod config;
 mod defined_agents;
-pub mod delete;
-pub mod hidden;
+mod delete;
+mod hidden;
 mod resume;
 mod search;
 mod send;
