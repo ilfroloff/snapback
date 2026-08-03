@@ -7,6 +7,12 @@
 //! (never decoded from the folder name); falls back `session_id` to the file
 //! stem. Any file with no `cwd` is dropped (sidecar agent-name/ai-title files
 //! are not resumable).
+//!
+//! Skipping is never SILENT about its reason: [`parse_file`] answers a
+//! three-way [`FileVerdict`], because "read it, and it is not a session" and
+//! "could not read it" are different facts and only the first is a statement
+//! about the file. Fail-soft is unchanged either way — both yield no row and
+//! neither can panic.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -21,6 +27,59 @@ use super::label;
 /// grows into the thousands this is the boundary to move to an on-disk cache.
 pub const CONTENT_INDEX_CAP: usize = 64 * 1024;
 
+/// What one candidate file turned out to be — the three answers a fail-soft read
+/// can give, kept apart because only TWO of them are statements about the file.
+///
+/// [`NotASession`](Self::NotASession) is a verdict about CONTENT: bytes were read
+/// end to end and carried no `cwd`. It stays true for exactly as long as those
+/// bytes do not move, so a caller that keys on the bytes may CACHE it.
+///
+/// [`Unreadable`](Self::Unreadable) is a fact about the read ATTEMPT — EMFILE, a
+/// permissions blip, a network home directory that blinked — and says nothing
+/// whatever about the file. It must NEVER be cached: a cache keyed on
+/// `(mtime, len)` would re-serve it for as long as the file sits still, and a
+/// finished transcript's stamp never moves again, so one transient error would
+/// become a session missing for the life of the process. Collapsing the two into
+/// an `Option` is what makes that state representable at all, which is why this
+/// type exists rather than a flag threaded alongside one.
+///
+/// Generic over the payload so the distinction SURVIVES the derivation step above
+/// it (`ParsedFile` -> `store::Session`) instead of being flattened back to an
+/// `Option` and re-invented one layer up.
+pub enum FileVerdict<T> {
+    /// Read end to end, and it carries a `cwd`: a resumable session.
+    Session(T),
+    /// Read end to end, and it carries NO `cwd`: a sidecar agent-name/ai-title
+    /// file, which is not resumable. CACHEABLE — it describes the bytes.
+    NotASession,
+    /// The bytes could not be read. NOT cacheable, at any level.
+    Unreadable,
+}
+
+impl<T> FileVerdict<T> {
+    /// Re-wrap the payload, carrying both non-session verdicts through unchanged.
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> FileVerdict<U> {
+        match self {
+            FileVerdict::Session(payload) => FileVerdict::Session(f(payload)),
+            FileVerdict::NotASession => FileVerdict::NotASession,
+            FileVerdict::Unreadable => FileVerdict::Unreadable,
+        }
+    }
+
+    /// The payload, if the file is a session.
+    ///
+    /// For callers that cannot ACT on the distinction: the hand-off re-reads
+    /// (`resume::read_authoritative`, `send::plan_send`) refuse on either
+    /// non-session verdict, and refusing is the fail-soft direction for both.
+    /// They cache nothing, so there is nothing there to latch.
+    pub fn session(self) -> Option<T> {
+        match self {
+            FileVerdict::Session(payload) => Some(payload),
+            FileVerdict::NotASession | FileVerdict::Unreadable => None,
+        }
+    }
+}
+
 /// The raw fields extracted from one JSONL file in a single streaming pass.
 ///
 /// Derivation (label, repo, timestamp parsing) happens above this in
@@ -28,7 +87,7 @@ pub const CONTENT_INDEX_CAP: usize = 64 * 1024;
 /// read straight out of the file.
 pub struct ParsedFile {
     /// `cwd` read from inside the file (first non-null). Guaranteed present:
-    /// files with no `cwd` return `None` from [`parse_file`].
+    /// files with no `cwd` answer [`FileVerdict::NotASession`] instead.
     pub cwd: String,
     /// `sessionId` from inside the file (first non-null), else the file stem.
     pub session_id: String,
@@ -72,12 +131,17 @@ pub struct ParsedFile {
     pub content_index: String,
 }
 
-/// Stream one JSONL file fail-soft and extract its metadata.
+/// Stream one JSONL file fail-soft and say what it is.
 ///
-/// Returns `None` when the file cannot be opened or carries no `cwd` (a sidecar
-/// agent-name/ai-title file, which is not a resumable session).
-pub fn parse_file(path: &Path) -> Option<ParsedFile> {
-    let file = File::open(path).ok()?;
+/// Three-way on purpose (see [`FileVerdict`]): a file that carries no `cwd` is
+/// NOT a session and that is a durable fact about it, whereas a file that could
+/// not be read yields no fact at all. Both produce no row and neither can panic
+/// — the distinction exists for what a CALLER may remember, not for what it
+/// shows.
+pub fn parse_file(path: &Path) -> FileVerdict<ParsedFile> {
+    let Ok(file) = File::open(path) else {
+        return FileVerdict::Unreadable;
+    };
     let reader = BufReader::new(file);
 
     let mut cwd: Option<String> = None;
@@ -91,10 +155,27 @@ pub fn parse_file(path: &Path) -> Option<ParsedFile> {
     let mut content_index = String::new();
 
     for line in reader.lines() {
-        // A read error on a single line is skipped, never fatal.
         let line = match line {
             Ok(l) => l,
-            Err(_) => continue,
+            // Two very different failures arrive on this one arm, and telling
+            // them apart is the SAME distinction [`FileVerdict`] draws, one
+            // level down.
+            //
+            // `BufRead::lines` reports non-UTF-8 bytes as `InvalidData`. That is
+            // a fact about the CONTENT — one malformed line — so it is skipped,
+            // exactly like an unparseable JSON line below. Bailing here would
+            // drop a whole real transcript over one bad byte sequence, which is
+            // the fail-soft rule inverted.
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => continue,
+            // Anything else is the READ failing part-way: EIO/ESTALE on a
+            // network home directory, EISDIR on a path that is not a file. That
+            // is no verdict about content at all, so skipping the line would
+            // hand back a TRUNCATED parse whose `msg_count` / `timestamp` /
+            // `content_index` the caller would then cache as the session's
+            // authoritative shape. Skipping is also unbounded: a reader that
+            // errors persistently never reaches EOF, so `continue` spins
+            // forever. Give no verdict instead.
+            Err(_) => return FileVerdict::Unreadable,
         };
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -184,12 +265,15 @@ pub fn parse_file(path: &Path) -> Option<ParsedFile> {
         }
     }
 
-    // No cwd => not a resumable session; drop the file entirely.
-    let cwd = cwd?;
+    // Read end to end, and no cwd anywhere in it => not a resumable session.
+    // A VERDICT about this file, reached only on the path that saw every line.
+    let Some(cwd) = cwd else {
+        return FileVerdict::NotASession;
+    };
     let session_id = session_id.unwrap_or_else(|| file_stem(path));
     truncate_on_char_boundary(&mut content_index, CONTENT_INDEX_CAP);
 
-    Some(ParsedFile {
+    FileVerdict::Session(ParsedFile {
         cwd,
         session_id,
         git_branch,
@@ -294,9 +378,101 @@ mod tests {
         let dir = unique_temp_dir(tag);
         let file = dir.join(format!("sess-{tag}.jsonl"));
         std::fs::write(&file, lines.join("\n")).expect("write transcript");
-        let parsed = parse_file(&file);
+        let parsed = parse_file(&file).session();
         std::fs::remove_dir_all(&dir).ok();
         parsed
+    }
+
+    #[test]
+    fn a_file_with_no_cwd_is_not_a_session_rather_than_unreadable() {
+        // The sidecar verdict, stated as itself. This is the ONLY non-session
+        // answer a caller may remember, so it must not be reachable from a file
+        // that simply could not be read.
+        let dir = unique_temp_dir("sidecar-verdict");
+        let file = dir.join("sidecar.jsonl");
+        std::fs::write(&file, r#"{"type":"summary","summary":"Sidecar title"}"#)
+            .expect("write sidecar");
+
+        assert!(
+            matches!(parse_file(&file), FileVerdict::NotASession),
+            "a file read end to end with no cwd is a verdict about the file"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_opened_is_unreadable_not_a_verdict() {
+        // The open failure: EMFILE, a permissions blip, a home directory that
+        // blinked. Indistinguishable from "no cwd" as an `Option`, and the two
+        // must never be confused — one is cacheable and this one is not.
+        let dir = unique_temp_dir("open-fails");
+
+        assert!(
+            matches!(
+                parse_file(&dir.join("not-here.jsonl")),
+                FileVerdict::Unreadable
+            ),
+            "a file that could not be opened says nothing about its content"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The mid-file case, which is the worse one: the open SUCCEEDS and the read
+    /// fails part-way, so a skip-the-line policy hands back a truncated parse
+    /// whose `msg_count` / `timestamp` the caller would take as authoritative.
+    ///
+    /// Unix-only because it needs a read that genuinely fails after a successful
+    /// open: `open(2)` on a directory succeeds and the first `read(2)` returns
+    /// `EISDIR`, which is the portable stand-in for the `EIO`/`ESTALE` a network
+    /// home directory gives mid-transcript. (Discovery only ever yields regular
+    /// files, so this path is reached from a real store by I/O errors alone.)
+    #[cfg(unix)]
+    #[test]
+    fn a_read_that_fails_mid_file_is_unreadable_not_a_truncated_session() {
+        let dir = unique_temp_dir("mid-file-read-error");
+
+        assert!(
+            matches!(parse_file(&dir), FileVerdict::Unreadable),
+            "a read that died part-way through is not a verdict about content"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_non_utf8_line_is_skipped_rather_than_costing_the_transcript() {
+        // The other half of the mid-file distinction, and the reason it is not
+        // simply "any line error bails". `BufRead::lines` reports non-UTF-8 bytes
+        // as `InvalidData`, which is a fact about the CONTENT — one malformed
+        // line — and the fail-soft rule is to skip it. Bailing here would drop a
+        // whole real transcript over one bad byte sequence.
+        let dir = unique_temp_dir("non-utf8-line");
+        let file = dir.join("sess.jsonl");
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(
+            br#"{"type":"user","sessionId":"s","cwd":"/w","uuid":"u-1","parentUuid":null,"message":{"content":"first"}}"#,
+        );
+        bytes.push(b'\n');
+        bytes.extend_from_slice(&[0xff, 0xfe, 0xfd]); // not valid UTF-8
+        bytes.push(b'\n');
+        bytes.extend_from_slice(
+            br#"{"type":"assistant","sessionId":"s","cwd":"/w","uuid":"a-1","parentUuid":"u-1","message":{"content":"second"}}"#,
+        );
+        std::fs::write(&file, bytes).expect("write transcript");
+
+        let parsed = match parse_file(&file) {
+            FileVerdict::Session(parsed) => parsed,
+            _ => panic!("one non-UTF-8 line must never cost the whole transcript"),
+        };
+        assert_eq!(
+            parsed.msg_count, 2,
+            "the records either side of the bad line still count"
+        );
+        assert_eq!(parsed.cwd, "/w", "and the session itself survives");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The real leading shape of a session file: out-of-tree bookkeeping records

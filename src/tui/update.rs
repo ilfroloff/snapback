@@ -35,7 +35,7 @@
 //! | `Ctrl-K` | stop / interrupt the selected session's live background agent (`claude stop`); an agent whose run is OVER (`done` / `stopped` / `failed`) stops at once, every other live agent confirms first, and a session claude is not holding — or one running interactively, which carries no job id — is refused (see [`send::interrupt_gate`]) |
 //! | `Tab` | toggle name-only vs. name+content search |
 //! | `Ctrl-A` | flip the scope: current folder <-> project (the launch repo and all of its git worktrees). ONE key for both, because the second is a refinement of the same question the first answers, not a separate mode. Launched with `--all`/`-a` it becomes a three-stop cycle through all folders as well — the whole store is on this key only when the launch flag put it there |
-//! | `Ctrl-X` then `x`/`d`/`h` | leader chord: hide / hard-delete (this row, or its whole fork lineage) / toggle show-hidden (any other key cancels) |
+//! | `Ctrl-X` then `x`/`d`/`h`/`r` | leader chord: hide / hard-delete (this row, or its whole fork lineage) / toggle show-hidden / re-read every transcript from disk (any other key cancels) |
 //! | `Ctrl-/` | toggle the preview pane |
 //! | `PgUp` / `PgDn` | scroll the preview a page (always) |
 //! | `Ctrl-U` / `Ctrl-D` | scroll the preview a quarter page (always) |
@@ -64,8 +64,6 @@
 //! that routing — the four overlay owners swallow a paste, the compose zone inserts
 //! it at the caret, and the board appends it to the query with newlines flattened
 //! to spaces. A paste can never submit, resume, or quit.
-
-use std::path::Path;
 
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -233,7 +231,8 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool) -> Action {
             KeyCode::Char('r') | KeyCode::Char('R') => Action::Reply,
             KeyCode::Char('k') | KeyCode::Char('K') => Action::Interrupt,
             KeyCode::Char('c') | KeyCode::Char('C') => Action::Quit,
-            // Ctrl-X (0x18 CAN) is the hide/delete leader chord. Unbound and
+            // Ctrl-X (0x18 CAN) is the board-trimming leader chord (hide /
+            // hard-delete / show-hidden / forced rescan). Unbound and
             // terminal-safe — unlike Ctrl-H/I/M, which alias Backspace/Tab/Enter.
             // It only ARMS the chord; the follow-up key decides (see `chord_key`).
             KeyCode::Char('x') | KeyCode::Char('X') => Action::Chord,
@@ -286,16 +285,16 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool) -> Action {
 ///   browser ([`handle_mouse`]); all are independent of the overlay gate (a click
 ///   cannot start an orphaned drag or open a link while the overlay is open — see
 ///   [`App::begin_split_drag`] and the `App::overlay_active` gate).
-/// * `SessionsChanged` -> reload the store from `root` and re-apply query+scope,
-///   preserving selection-by-id and scroll (see [`App::apply_sessions`]).
+/// * `SessionsChanged` -> reload `store` and re-apply query+scope, preserving
+///   selection-by-id and scroll (see [`reload_board`]).
 /// * `Tick` -> nothing costly (just a redraw upstream).
 ///
 /// Every return runs through ONE teardown seam: an outcome that
 /// [ends the board session](Outcome::ends_board_session) also tears the compose
 /// surface down, because neither half of it can outlive the channel it reports on
 /// (see [`dispatch`]).
-pub fn handle_event(app: &mut App, event: AppEvent, root: &Path) -> Outcome {
-    let outcome = dispatch(app, event, root);
+pub fn handle_event(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome {
+    let outcome = dispatch(app, event, store);
     if outcome.ends_board_session() {
         // The compose surface is bounded by the board session, and the IN-FLIGHT
         // draft card is why that has to be enforced here rather than left to each
@@ -317,20 +316,20 @@ pub fn handle_event(app: &mut App, event: AppEvent, root: &Path) -> Outcome {
 /// Split out only so the teardown seam above sees every outcome — the routes below
 /// return from several places, and a rule that must hold for ALL of them cannot be
 /// a line each of them remembers to run.
-fn dispatch(app: &mut App, event: AppEvent, root: &Path) -> Outcome {
+fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome {
     match event {
         AppEvent::Input(Event::Key(key)) if is_actionable(key) => {
             // While a modal overlay (the running-session choice, the new-session
             // agent picker, or the hard-delete confirm) is open it OWNS the
             // keyboard: keys navigate/confirm/cancel the modal, never the board.
             if app.modal.is_some() {
-                return handle_modal_key(app, key, root);
+                return handle_modal_key(app, key, store);
             }
             // A pending `Ctrl-X` leader chord OWNS the next key too: route it through
             // the chord machine BEFORE normal handling so a printable follow-up
-            // (`x`/`d`/`h`) completes the chord instead of leaking into the query.
+            // (`x`/`d`/`h`/`r`) completes the chord instead of leaking into the query.
             if app.pending_chord {
-                return handle_chord_key(app, key);
+                return handle_chord_key(app, key, store);
             }
             // The "stop the waiting agent?" confirmation owns the keyboard until it
             // resolves into compose (Enter) or is dismissed (Esc).
@@ -374,7 +373,7 @@ fn dispatch(app: &mut App, event: AppEvent, root: &Path) -> Outcome {
         }
         AppEvent::Input(_) => Outcome::Continue,
         AppEvent::SessionsChanged => {
-            app.apply_sessions(SessionStore::load_from(root));
+            reload_board(app, store);
             Outcome::Continue
         }
         AppEvent::ReportedAgents(agents) => {
@@ -470,6 +469,19 @@ fn dispatch(app: &mut App, event: AppEvent, root: &Path) -> Outcome {
             Outcome::Continue
         }
     }
+}
+
+/// Reload the board from `store` — the ONE seam every reload path funnels
+/// through (the `SessionsChanged` watcher event, the post-delete reload, and the
+/// `Ctrl-X r` forced rescan), the way [`App::apply_reload`] is the one funnel on
+/// the model side.
+///
+/// The reload is INCREMENTAL: the store re-parses only the transcripts whose
+/// `(mtime, len)` moved and hands back which ones those were, so the derived
+/// caches drop exactly those rows. Discovery still runs in full every time, so a
+/// created or deleted session always lands on the board.
+fn reload_board(app: &mut App, store: &mut SessionStore) {
+    app.apply_reload(store.reload());
 }
 
 /// Only press/repeat key events act; release events (kitty protocol / Windows)
@@ -923,9 +935,9 @@ fn apply_action(app: &mut App, action: Action) -> Outcome {
     }
 }
 
-/// The three keys a pending `Ctrl-X` chord binds, plus cancel — the PURE decision
+/// The four keys a pending `Ctrl-X` chord binds, plus cancel — the PURE decision
 /// half of the leader chord (PATTERNS §10, keys -> actions -> outcomes). The impure
-/// completion (hide / open confirm / toggle) lives in [`handle_chord_key`].
+/// completion (hide / open confirm / toggle / rescan) lives in [`handle_chord_key`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChordOutcome {
     /// `x` — toggle the selected session's hidden state (soft delete / un-hide).
@@ -934,6 +946,8 @@ enum ChordOutcome {
     Delete,
     /// `h` — toggle whether user-hidden sessions are revealed inline.
     ShowHidden,
+    /// `r` — drop every cached parse and re-read the whole store.
+    Rescan,
     /// `Esc` / `Ctrl-C` / any unbound key — abandon the chord with no side effect.
     Cancel,
 }
@@ -942,9 +956,9 @@ enum ChordOutcome {
 /// leader chord's decision is unit-testable without a terminal.
 ///
 /// Any Ctrl-modified key cancels (so `Ctrl-C` still reads as a quit-shaped abort
-/// mid-leader and no completion is bound to a Ctrl combo), and any non-`x`/`d`/`h`
-/// key cancels too, so a mistyped follow-up abandons the chord rather than doing
-/// something surprising. `x`/`d`/`h` accept their shifted forms so a held Shift on
+/// mid-leader and no completion is bound to a Ctrl combo), and any unbound key
+/// cancels too, so a mistyped follow-up abandons the chord rather than doing
+/// something surprising. Each binding accepts its shifted form so a held Shift on
 /// the follow-up still completes the chord.
 fn chord_key(key: KeyEvent) -> ChordOutcome {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -954,6 +968,7 @@ fn chord_key(key: KeyEvent) -> ChordOutcome {
         KeyCode::Char('x') | KeyCode::Char('X') => ChordOutcome::Hide,
         KeyCode::Char('d') | KeyCode::Char('D') => ChordOutcome::Delete,
         KeyCode::Char('h') | KeyCode::Char('H') => ChordOutcome::ShowHidden,
+        KeyCode::Char('r') | KeyCode::Char('R') => ChordOutcome::Rescan,
         _ => ChordOutcome::Cancel,
     }
 }
@@ -963,12 +978,20 @@ fn chord_key(key: KeyEvent) -> ChordOutcome {
 ///
 /// `x` hides / un-hides the selected session (persisting the change), `d` opens the
 /// hard-delete confirm (it does NOT delete here — the confirm handler does), `h`
-/// toggles the show-hidden view, and anything else (`Esc` / `Ctrl-C` / an unbound
-/// key) abandons the chord with no side effect. The pending state is cleared FIRST
-/// so an early return can never wedge the board in the chord. Routed BEFORE
-/// `key_to_action` in [`handle_event`], so a printable completion never leaks into
-/// the query.
-fn handle_chord_key(app: &mut App, key: KeyEvent) -> Outcome {
+/// toggles the show-hidden view, `r` forces a full re-read of the store, and
+/// anything else (`Esc` / `Ctrl-C` / an unbound key) abandons the chord with no side
+/// effect. The pending state is cleared FIRST so an early return can never wedge the
+/// board in the chord. Routed BEFORE `key_to_action` in [`handle_event`], so a
+/// printable completion never leaks into the query.
+///
+/// `r` is the store cache's ESCAPE HATCH, and it is a user-reachable key rather
+/// than an internal call for exactly that reason: reloads reuse the parse of every
+/// file whose `(mtime, len)` did not move, so a filesystem that lies about either
+/// (a coarse-granularity network volume, a badly skewed clock) could in principle
+/// leave a row stale with nothing on the board to say so. One keypress rules that
+/// out. It reports the count it landed on, so pressing it is never a no-op on
+/// screen — a keypress OUTCOME, hence the status line (PATTERNS §11).
+fn handle_chord_key(app: &mut App, key: KeyEvent, store: &mut SessionStore) -> Outcome {
     app.pending_chord = false;
     // The follow-up is an actionable keypress, so clear any transient status first
     // (a hide may then set its own persist-error status).
@@ -977,9 +1000,19 @@ fn handle_chord_key(app: &mut App, key: KeyEvent) -> Outcome {
         ChordOutcome::Hide => app.toggle_hidden_selected(),
         ChordOutcome::ShowHidden => app.toggle_show_hidden(),
         ChordOutcome::Delete => app.open_delete_confirm(),
+        ChordOutcome::Rescan => {
+            store.invalidate();
+            reload_board(app, store);
+            app.set_status_transient(rescan_status(app.sessions.len()));
+        }
         ChordOutcome::Cancel => {}
     }
     Outcome::Continue
+}
+
+/// The `Ctrl-X r` outcome line. Pure so the wording is assertable without a store.
+fn rescan_status(sessions: usize) -> String {
+    format!("reloaded {sessions} session(s) from disk")
 }
 
 /// A decoded intent while a modal overlay owns the keyboard. Collapses the old
@@ -1041,7 +1074,7 @@ fn modal_key(key: KeyEvent, layout: ModalLayout) -> ModalNav {
 /// Apply a modal keypress: navigation stays on the board; Confirm routes the
 /// highlighted choice's action; Esc/Ctrl-C dismiss. The layout (hence the key map)
 /// is read off the open modal.
-fn handle_modal_key(app: &mut App, key: KeyEvent, root: &Path) -> Outcome {
+fn handle_modal_key(app: &mut App, key: KeyEvent, store: &mut SessionStore) -> Outcome {
     let Some(layout) = app.modal.as_ref().map(|m| m.layout) else {
         return Outcome::Continue;
     };
@@ -1058,7 +1091,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, root: &Path) -> Outcome {
             app.close_modal();
             Outcome::Continue
         }
-        ModalNav::Confirm => confirm_modal(app, root),
+        ModalNav::Confirm => confirm_modal(app, store),
         ModalNav::Interactive => launch_pick_interactively(app),
         ModalNav::Ignore => Outcome::Continue,
     }
@@ -1134,7 +1167,7 @@ enum Handoff {
 /// The `clone` releases the `app.modal` borrow before `close_modal` /
 /// `set_status` / `compose::open_background` / the gates re-borrow `app`,
 /// preserving the borrow discipline both old confirm handlers relied on.
-fn confirm_modal(app: &mut App, root: &Path) -> Outcome {
+fn confirm_modal(app: &mut App, store: &mut SessionStore) -> Outcome {
     let Some(modal) = app.modal.clone() else {
         return Outcome::Continue;
     };
@@ -1151,13 +1184,13 @@ fn confirm_modal(app: &mut App, root: &Path) -> Outcome {
             None => Outcome::Continue,
         },
         Some(ModalAction::Delete) => match modal.session_id.clone() {
-            Some(id) => confirm_delete(app, &[id], root),
+            Some(id) => confirm_delete(app, &[id], store),
             None => Outcome::Continue,
         },
         // The lineage's member ids were resolved when the choice was BUILT (see
         // `ModalAction::DeleteLineage`), so nothing is re-derived from a selection
         // a reload may have moved while the modal sat open.
-        Some(ModalAction::DeleteLineage(ids)) => confirm_delete(app, &ids, root),
+        Some(ModalAction::DeleteLineage(ids)) => confirm_delete(app, &ids, store),
         Some(ModalAction::New(agent)) => {
             // `Enter` opens the DRAFT — the same pane the no-agent fast path opens.
             // Nothing is launched and nothing is recorded yet; the draft's own
@@ -1204,10 +1237,11 @@ fn confirm_modal(app: &mut App, root: &Path) -> Outcome {
 /// lineage from reporting `2 deleted` with the third silently unmentioned.
 ///
 /// The board reloads ONCE after the loop, and only when something was actually
-/// removed, from the SAME `root` the autorefresh reload uses
-/// ([`SessionStore::load_from`]) — so the removed rows leave the board and the
-/// selection clamps to a survivor by stable id.
-fn confirm_delete(app: &mut App, ids: &[String], root: &Path) -> Outcome {
+/// removed, through the SAME [`reload_board`] seam the autorefresh reload uses —
+/// so the removed rows leave the board and the selection clamps to a survivor by
+/// stable id. A deleted file is simply no longer discovered, so it takes its
+/// cached parse with it: the store cache can never resurrect a removed session.
+fn confirm_delete(app: &mut App, ids: &[String], store: &mut SessionStore) -> Outcome {
     // ONE shell-out for the whole target set (see the note above).
     let live = app.live_agents_now();
     let mut removed = 0usize;
@@ -1237,7 +1271,7 @@ fn confirm_delete(app: &mut App, ids: &[String], root: &Path) -> Outcome {
     }
 
     if removed > 0 {
-        app.apply_sessions(SessionStore::load_from(root));
+        reload_board(app, store);
     }
     if let Some(status) = delete::status_for_delete(ids.len(), removed, &refusals, &errors) {
         app.set_status(status);
@@ -1493,8 +1527,8 @@ mod tests {
     use super::*;
 
     use std::collections::HashMap;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use ratatui::backend::TestBackend;
     use ratatui::style::Modifier;
@@ -1504,6 +1538,13 @@ mod tests {
     use crate::store::Session;
     use crate::tui::app::{NewSessionDraft, Scope, MIN_PANE_WIDTH, STATUS_DWELL_TICKS};
     use crate::tui::compose::ComposeTarget;
+
+    /// A store over `root` for a test that drives [`handle_event`]. Most routing
+    /// tests never reload at all, so the root is usually a placeholder — where a
+    /// reload IS exercised (the delete tests), it is the test's own temp store.
+    fn store_at(root: &Path) -> SessionStore {
+        SessionStore::new(root)
+    }
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1676,7 +1717,7 @@ mod tests {
         handle_event(
             app,
             AppEvent::Input(Event::Key(key(code))),
-            Path::new("/tmp"),
+            &mut store_at(Path::new("/tmp")),
         )
     }
 
@@ -1684,7 +1725,7 @@ mod tests {
         handle_event(
             app,
             AppEvent::Input(Event::Key(ctrl(code))),
-            Path::new("/tmp"),
+            &mut store_at(Path::new("/tmp")),
         )
     }
 
@@ -1696,7 +1737,7 @@ mod tests {
         handle_event(
             app,
             AppEvent::Input(Event::Paste(text.to_string())),
-            Path::new("/tmp"),
+            &mut store_at(Path::new("/tmp")),
         )
     }
 
@@ -1762,7 +1803,7 @@ mod tests {
         handle_event(
             app,
             AppEvent::Input(Event::Mouse(mouse_ev(kind, col, row))),
-            Path::new("/tmp"),
+            &mut store_at(Path::new("/tmp")),
         )
     }
 
@@ -2126,7 +2167,7 @@ mod tests {
                 status: "stopped".to_string(),
                 success: true,
             },
-            Path::new("/tmp"),
+            &mut store_at(Path::new("/tmp")),
         );
         assert!(matches!(out, Outcome::Continue));
         assert!(
@@ -2143,7 +2184,7 @@ mod tests {
                 status: "stopped".to_string(),
                 success: true,
             },
-            Path::new("/tmp"),
+            &mut store_at(Path::new("/tmp")),
         );
         assert!(
             app.interrupting.is_none(),
@@ -2509,7 +2550,7 @@ mod tests {
         // Drain the dwell window through the event loop (not direct tick_status),
         // proving the dispatch wiring ages the paste nudge.
         for _ in 0..STATUS_DWELL_TICKS {
-            handle_event(&mut app, AppEvent::Tick, Path::new("/tmp"));
+            handle_event(&mut app, AppEvent::Tick, &mut store_at(Path::new("/tmp")));
         }
 
         assert_eq!(
@@ -2675,7 +2716,7 @@ mod tests {
                 status: "sent — $0.0136".to_string(),
                 success: true,
             },
-            Path::new("/tmp"),
+            &mut store_at(Path::new("/tmp")),
         );
         assert!(
             app.preview_follow_bottom,
@@ -2715,7 +2756,7 @@ mod tests {
                 status: "sent".to_string(),
                 success: true,
             },
-            Path::new("/tmp"),
+            &mut store_at(Path::new("/tmp")),
         );
         assert_eq!(app.selected, selected, "selection is unchanged");
         assert!(
@@ -3746,7 +3787,7 @@ mod tests {
         let out = handle_event(
             &mut app,
             AppEvent::Input(Event::Key(ctrl(KeyCode::Char('f')))),
-            Path::new("/tmp"),
+            &mut store_at(Path::new("/tmp")),
         );
         assert!(matches!(out, Outcome::Continue));
         assert!(
@@ -3765,7 +3806,7 @@ mod tests {
         handle_event(
             &mut app,
             AppEvent::ReportedAgents(reported),
-            Path::new("/tmp"),
+            &mut store_at(Path::new("/tmp")),
         );
         assert_eq!(
             app.reported_agent("s").map(ReportedAgent::kind_label),
@@ -3785,7 +3826,7 @@ mod tests {
         assert_eq!(app.tick, 0, "a fresh board starts at tick 0");
 
         for expected in 1..=3 {
-            let out = handle_event(&mut app, AppEvent::Tick, Path::new("/tmp"));
+            let out = handle_event(&mut app, AppEvent::Tick, &mut store_at(Path::new("/tmp")));
             assert!(
                 matches!(out, Outcome::Continue),
                 "a tick never ends the board"
@@ -3803,7 +3844,7 @@ mod tests {
     fn tick_event_wraps_instead_of_overflowing() {
         let mut app = app_with("s", None);
         app.tick = u64::MAX;
-        handle_event(&mut app, AppEvent::Tick, Path::new("/tmp"));
+        handle_event(&mut app, AppEvent::Tick, &mut store_at(Path::new("/tmp")));
         assert_eq!(app.tick, 0, "the clock must wrap from u64::MAX back to 0");
     }
 
@@ -3821,7 +3862,7 @@ mod tests {
                 Some("sent"),
                 "transient status must survive tick {i}"
             );
-            handle_event(&mut app, AppEvent::Tick, Path::new("/tmp"));
+            handle_event(&mut app, AppEvent::Tick, &mut store_at(Path::new("/tmp")));
         }
         assert!(
             app.status.is_none(),
@@ -3841,7 +3882,7 @@ mod tests {
                 Some("send failed: boom"),
                 "sticky status must survive tick {i}"
             );
-            handle_event(&mut app, AppEvent::Tick, Path::new("/tmp"));
+            handle_event(&mut app, AppEvent::Tick, &mut store_at(Path::new("/tmp")));
         }
         assert_eq!(app.status.as_deref(), Some("send failed: boom"));
     }
@@ -3861,7 +3902,7 @@ mod tests {
                 "failure status must survive tick {i}: {:?}",
                 app.status
             );
-            handle_event(&mut app, AppEvent::Tick, Path::new("/tmp"));
+            handle_event(&mut app, AppEvent::Tick, &mut store_at(Path::new("/tmp")));
         }
         assert!(
             app.status.is_some(),
@@ -4589,7 +4630,7 @@ mod tests {
                 status: "background agent started".to_string(),
                 success: true,
             },
-            Path::new("/tmp"),
+            &mut store_at(Path::new("/tmp")),
         );
         assert!(matches!(out, Outcome::Continue));
         assert!(app.draft.is_none(), "the result ends the card");
@@ -4874,7 +4915,7 @@ mod tests {
                 status: "background agent started".to_string(),
                 success: true,
             },
-            Path::new("/tmp"),
+            &mut store_at(Path::new("/tmp")),
         );
 
         assert!(matches!(out, Outcome::Continue));
@@ -4903,7 +4944,7 @@ mod tests {
                 status: "background agent started".to_string(),
                 success: true,
             },
-            Path::new("/tmp"),
+            &mut store_at(Path::new("/tmp")),
         );
         assert!(
             app.is_composing() && app.draft.is_some(),
@@ -4956,7 +4997,7 @@ mod tests {
                 status: "background agent started".to_string(),
                 success: true,
             },
-            Path::new("/tmp"),
+            &mut store_at(Path::new("/tmp")),
         );
         assert!(matches!(out, Outcome::Continue));
         assert_eq!(
@@ -4977,7 +5018,7 @@ mod tests {
                 status: "background agent started".to_string(),
                 success: true,
             },
-            Path::new("/tmp"),
+            &mut store_at(Path::new("/tmp")),
         );
         assert!(
             app.draft.is_none(),
@@ -5000,7 +5041,7 @@ mod tests {
                 status: "background agent started".to_string(),
                 success: true,
             },
-            Path::new("/tmp"),
+            &mut store_at(Path::new("/tmp")),
         );
         assert!(matches!(out, Outcome::Continue));
         assert_eq!(app.status.as_deref(), Some("background agent started"));
@@ -5008,13 +5049,15 @@ mod tests {
         assert!(!app.is_composing());
     }
 
-    // --- Ctrl-X leader chord: hide / show-hidden / hard-delete ------------
+    // --- Ctrl-X leader chord: hide / show-hidden / hard-delete / rescan ---
 
     /// Feed one key EVENT (carrying its modifiers) through `handle_event` against
-    /// `root`. The chord tests need both `Ctrl-X` (a modified key) and a specific
-    /// reload root, which the `press`/`ctrl` helpers cannot express together.
-    fn feed(app: &mut App, ev: KeyEvent, root: &Path) -> Outcome {
-        handle_event(app, AppEvent::Input(Event::Key(ev)), root)
+    /// `store`. The chord tests need both `Ctrl-X` (a modified key) and a real
+    /// reload store, which the `press`/`ctrl` helpers cannot express together.
+    /// The store is threaded (rather than built per call) so a test's successive
+    /// keypresses meet the SAME warm cache the board does.
+    fn feed(app: &mut App, ev: KeyEvent, store: &mut SessionStore) -> Outcome {
+        handle_event(app, AppEvent::Input(Event::Key(ev)), store)
     }
 
     /// Write a minimal, PARSEABLE `<id>.jsonl` into a store's encoded-cwd dir so a
@@ -5106,6 +5149,7 @@ mod tests {
         assert_eq!(chord_key(key(KeyCode::Char('x'))), ChordOutcome::Hide);
         assert_eq!(chord_key(key(KeyCode::Char('d'))), ChordOutcome::Delete);
         assert_eq!(chord_key(key(KeyCode::Char('h'))), ChordOutcome::ShowHidden);
+        assert_eq!(chord_key(key(KeyCode::Char('r'))), ChordOutcome::Rescan);
         assert_eq!(
             chord_key(key(KeyCode::Esc)),
             ChordOutcome::Cancel,
@@ -5123,6 +5167,92 @@ mod tests {
         );
     }
 
+    /// The store cache seen from the board: an ordinary `SessionsChanged` reload
+    /// reads NOTHING when no transcript moved, and `Ctrl-X r` — the escape hatch
+    /// — drops the cache and reads the whole store again.
+    ///
+    /// Both halves are in one test because each is the other's control: without
+    /// the steady state first, a rescan that forgot to `invalidate` would read
+    /// every file anyway (they would all still be inside
+    /// `MTIME_SETTLE_WINDOW`) and the second assertion could not fail. Waiting
+    /// out that window is the only reason this test is not instant.
+    ///
+    /// Reaching the steady state takes TWO reloads after the sleep, and that is
+    /// the settle window working rather than a wasted round trip: the launch
+    /// load ran while the fixtures were still inside the window, so its parses
+    /// were deliberately not cached — they read bytes that could still have been
+    /// replaced without moving either half of the stamp. The first reload past
+    /// the window is the one that takes a parse worth keeping; the second is the
+    /// one that costs nothing.
+    #[test]
+    fn a_steady_reload_reads_nothing_while_ctrl_x_r_re_reads_the_whole_store() {
+        let _guard = crate::config::env_lock();
+        let root = unique_temp_dir("rescan-store");
+        let state = unique_temp_dir("rescan-state");
+        std::env::set_var("CLAUDE_PROJECTS_DIR", &root);
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &state);
+
+        let proj = root.join("-tmp-proj");
+        std::fs::create_dir_all(&proj).expect("create the encoded-cwd dir");
+        write_store_session(&proj, "sbres-a", "2026-07-14T10:00:00.000Z");
+        write_store_session(&proj, "sbres-b", "2026-07-10T10:00:00.000Z");
+
+        let mut store = store_at(&root);
+        let mut app = App::new(
+            store.reload().sessions,
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        assert_eq!(store.last_parsed(), 2, "the launch load reads both files");
+
+        // Carry the fixtures past the settle window, after which their stamps
+        // may be trusted at all.
+        std::thread::sleep(crate::store::MTIME_SETTLE_WINDOW + Duration::from_millis(200));
+
+        // The first reload past the window re-reads both — nothing from inside
+        // it was kept — and that is what fills the cache.
+        handle_event(&mut app, AppEvent::SessionsChanged, &mut store);
+        assert_eq!(
+            store.last_parsed(),
+            2,
+            "a parse taken inside the settle window is never carried over"
+        );
+
+        handle_event(&mut app, AppEvent::SessionsChanged, &mut store);
+        assert_eq!(
+            store.last_parsed(),
+            0,
+            "a watcher reload over an unchanged store must parse nothing"
+        );
+        assert_eq!(store.last_discovered(), 2, "discovery still runs in full");
+        assert_eq!(app.sessions.len(), 2, "and the board still holds both rows");
+
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        let out = feed(&mut app, key(KeyCode::Char('r')), &mut store);
+
+        assert!(matches!(out, Outcome::Continue));
+        assert_eq!(
+            store.last_parsed(),
+            2,
+            "Ctrl-X r must DROP the cache, not merely reload it"
+        );
+        assert_eq!(app.sessions.len(), 2, "the board is rebuilt, not emptied");
+        assert_eq!(
+            app.status.as_deref(),
+            Some(rescan_status(2).as_str()),
+            "the rescan reports what it landed on, so the key is never a silent no-op"
+        );
+        assert!(
+            !app.pending_chord,
+            "the chord resolves after exactly one key"
+        );
+
+        std::env::remove_var("CLAUDE_PROJECTS_DIR");
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
     /// Task 4.1 (leak guard): `Ctrl-X` then a printable follow-up completes the
     /// chord — it must NOT append to the search query, even while a query is active.
     #[test]
@@ -5138,13 +5268,14 @@ mod tests {
         );
         // An ACTIVE query is the exact condition a printable follow-up could corrupt.
         app.query = "foo".to_string();
+        let mut store = store_at(Path::new("/tmp"));
 
-        feed(&mut app, ctrl(KeyCode::Char('x')), Path::new("/tmp"));
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
         assert!(app.pending_chord, "Ctrl-X arms the leader chord");
 
         // `h` (show-hidden) needs no selection or persistence to prove the guard,
         // and must be CONSUMED by the chord rather than typed into the query.
-        feed(&mut app, key(KeyCode::Char('h')), Path::new("/tmp"));
+        feed(&mut app, key(KeyCode::Char('h')), &mut store);
         assert_eq!(
             app.query, "foo",
             "the chord follow-up must not leak into the query"
@@ -5179,9 +5310,10 @@ mod tests {
         app.move_selection(2);
         assert_eq!(app.selected.as_deref(), Some("sbx-c"));
         assert_eq!(app.filtered.len(), 3, "all three rows are visible to start");
+        let mut store = store_at(Path::new("/tmp"));
 
-        feed(&mut app, ctrl(KeyCode::Char('x')), Path::new("/tmp"));
-        feed(&mut app, key(KeyCode::Char('x')), Path::new("/tmp"));
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('x')), &mut store);
 
         assert_eq!(
             app.filtered.len(),
@@ -5231,9 +5363,10 @@ mod tests {
             Some("sbx-b"),
             "standing on the hidden row"
         );
+        let mut store = store_at(Path::new("/tmp"));
 
-        feed(&mut app, ctrl(KeyCode::Char('x')), Path::new("/tmp"));
-        feed(&mut app, key(KeyCode::Char('x')), Path::new("/tmp"));
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('x')), &mut store);
 
         assert!(
             !app.hidden_ids.contains("sbx-b"),
@@ -5261,13 +5394,14 @@ mod tests {
             PathBuf::from("/tmp/launch"),
         );
         assert!(!app.show_hidden, "hidden rows are off the board by default");
+        let mut store = store_at(Path::new("/tmp"));
 
-        feed(&mut app, ctrl(KeyCode::Char('x')), Path::new("/tmp"));
-        feed(&mut app, key(KeyCode::Char('h')), Path::new("/tmp"));
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('h')), &mut store);
         assert!(app.show_hidden, "Ctrl-X h reveals hidden rows");
 
-        feed(&mut app, ctrl(KeyCode::Char('x')), Path::new("/tmp"));
-        feed(&mut app, key(KeyCode::Char('h')), Path::new("/tmp"));
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('h')), &mut store);
         assert!(!app.show_hidden, "Ctrl-X h again hides them");
 
         std::env::remove_var("SNAPBACK_CONFIG_DIR");
@@ -5291,8 +5425,10 @@ mod tests {
         write_store_session(&proj, "sbdel-del", "2026-07-14T10:00:00.000Z");
         write_store_session(&proj, "sbdel-keep", "2026-07-10T10:00:00.000Z");
 
+        let mut store = store_at(&root);
+
         let mut app = App::new(
-            SessionStore::load_from(&root),
+            store.reload().sessions,
             Scope::All,
             PathBuf::from("/tmp/launch"),
         );
@@ -5306,19 +5442,19 @@ mod tests {
         assert!(del_file.is_file(), "the fixture exists before the delete");
 
         // Ctrl-X d opens the confirm (default Cancel); move to Delete, then Enter.
-        feed(&mut app, ctrl(KeyCode::Char('x')), &root);
-        feed(&mut app, key(KeyCode::Char('d')), &root);
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('d')), &mut store);
         assert_eq!(
             app.modal.as_ref().unwrap().selected_action(),
             Some(&ModalAction::Cancel),
             "the delete confirm defaults to Cancel for safety"
         );
-        feed(&mut app, key(KeyCode::Left), &root); // Row layout: Cancel -> Delete
+        feed(&mut app, key(KeyCode::Left), &mut store); // Row layout: Cancel -> Delete
         assert_eq!(
             app.modal.as_ref().unwrap().selected_action(),
             Some(&ModalAction::Delete)
         );
-        let out = feed(&mut app, key(KeyCode::Enter), &root);
+        let out = feed(&mut app, key(KeyCode::Enter), &mut store);
         assert!(matches!(out, Outcome::Continue));
 
         assert!(!del_file.exists(), "the transcript file is unlinked");
@@ -5367,8 +5503,10 @@ mod tests {
         std::fs::create_dir_all(&proj).expect("create the encoded-cwd dir");
         write_store_session(&proj, "sbsend-1", "2026-07-14T10:00:00.000Z");
 
+        let mut store = store_at(&root);
+
         let mut app = App::new(
-            SessionStore::load_from(&root),
+            store.reload().sessions,
             Scope::All,
             PathBuf::from("/tmp/launch"),
         );
@@ -5383,10 +5521,10 @@ mod tests {
         assert_eq!(app.selected.as_deref(), Some("sbsend-1"));
         let file = proj.join("sbsend-1.jsonl");
 
-        feed(&mut app, ctrl(KeyCode::Char('x')), &root);
-        feed(&mut app, key(KeyCode::Char('d')), &root);
-        feed(&mut app, key(KeyCode::Left), &root); // -> Delete this
-        let out = feed(&mut app, key(KeyCode::Enter), &root);
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('d')), &mut store);
+        feed(&mut app, key(KeyCode::Left), &mut store); // -> Delete this
+        let out = feed(&mut app, key(KeyCode::Enter), &mut store);
         assert!(matches!(out, Outcome::Continue));
 
         assert!(
@@ -5426,8 +5564,10 @@ mod tests {
         std::fs::create_dir_all(&proj).expect("create the encoded-cwd dir");
         write_store_session(&proj, "sblive-1", "2026-07-14T10:00:00.000Z");
 
+        let mut store = store_at(&root);
+
         let mut app = App::new(
-            SessionStore::load_from(&root),
+            store.reload().sessions,
             Scope::All,
             PathBuf::from("/tmp/launch"),
         );
@@ -5435,10 +5575,10 @@ mod tests {
         assert_eq!(app.selected.as_deref(), Some("sblive-1"));
         let file = proj.join("sblive-1.jsonl");
 
-        feed(&mut app, ctrl(KeyCode::Char('x')), &root);
-        feed(&mut app, key(KeyCode::Char('d')), &root);
-        feed(&mut app, key(KeyCode::Left), &root); // -> Delete this
-        let out = feed(&mut app, key(KeyCode::Enter), &root);
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('d')), &mut store);
+        feed(&mut app, key(KeyCode::Left), &mut store); // -> Delete this
+        let out = feed(&mut app, key(KeyCode::Enter), &mut store);
         assert!(matches!(out, Outcome::Continue));
 
         assert!(
@@ -5484,8 +5624,10 @@ mod tests {
         std::fs::create_dir_all(&proj).expect("create the encoded-cwd dir");
         write_store_session(&proj, "sbparked-1", "2026-07-14T10:00:00.000Z");
 
+        let mut store = store_at(&root);
+
         let mut app = App::new(
-            SessionStore::load_from(&root),
+            store.reload().sessions,
             Scope::All,
             PathBuf::from("/tmp/launch"),
         );
@@ -5495,10 +5637,10 @@ mod tests {
         let file = proj.join("sbparked-1.jsonl");
         assert!(file.is_file(), "the fixture exists before the delete");
 
-        feed(&mut app, ctrl(KeyCode::Char('x')), &root);
-        feed(&mut app, key(KeyCode::Char('d')), &root);
-        feed(&mut app, key(KeyCode::Left), &root); // -> Delete this
-        let out = feed(&mut app, key(KeyCode::Enter), &root);
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('d')), &mut store);
+        feed(&mut app, key(KeyCode::Left), &mut store); // -> Delete this
+        let out = feed(&mut app, key(KeyCode::Enter), &mut store);
         assert!(matches!(out, Outcome::Continue));
 
         assert!(
@@ -5558,8 +5700,10 @@ mod tests {
         std::fs::create_dir_all(&old_subagents).expect("create the subagents dir");
         std::fs::write(old_subagents.join("agent-1.jsonl"), "{}\n").expect("write a subagent");
 
+        let mut store = store_at(&root);
+
         let mut app = App::new(
-            SessionStore::load_from(&root),
+            store.reload().sessions,
             Scope::All,
             PathBuf::from("/tmp/launch"),
         );
@@ -5570,8 +5714,8 @@ mod tests {
             "the newest lineage member heads the folded row"
         );
 
-        feed(&mut app, ctrl(KeyCode::Char('x')), &root);
-        feed(&mut app, key(KeyCode::Char('d')), &root);
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('d')), &mut store);
         let choices = &app.modal.as_ref().expect("the confirm is open").choices;
         assert_eq!(
             choices.len(),
@@ -5588,7 +5732,7 @@ mod tests {
             "the confirm still defaults to Cancel with the extra button in the strip"
         );
 
-        feed(&mut app, key(KeyCode::Left), &root); // Cancel -> Delete lineage
+        feed(&mut app, key(KeyCode::Left), &mut store); // Cancel -> Delete lineage
         assert!(
             matches!(
                 app.modal.as_ref().unwrap().selected_action(),
@@ -5596,7 +5740,7 @@ mod tests {
             ),
             "the middle button is the lineage delete"
         );
-        let out = feed(&mut app, key(KeyCode::Enter), &root);
+        let out = feed(&mut app, key(KeyCode::Enter), &mut store);
         assert!(matches!(out, Outcome::Continue));
 
         assert!(
@@ -5666,8 +5810,10 @@ mod tests {
             "root-uuid-2",
         );
 
+        let mut store = store_at(&root);
+
         let mut app = App::new(
-            SessionStore::load_from(&root),
+            store.reload().sessions,
             Scope::All,
             PathBuf::from("/tmp/launch"),
         );
@@ -5675,10 +5821,10 @@ mod tests {
         seed_live_records(&mut app, &[("sbmix-busy", "background", Some("working"))]);
         assert_eq!(app.selected.as_deref(), Some("sbmix-head"));
 
-        feed(&mut app, ctrl(KeyCode::Char('x')), &root);
-        feed(&mut app, key(KeyCode::Char('d')), &root);
-        feed(&mut app, key(KeyCode::Left), &root); // -> Delete lineage (3)
-        let out = feed(&mut app, key(KeyCode::Enter), &root);
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('d')), &mut store);
+        feed(&mut app, key(KeyCode::Left), &mut store); // -> Delete lineage (3)
+        let out = feed(&mut app, key(KeyCode::Enter), &mut store);
         assert!(matches!(out, Outcome::Continue));
 
         assert!(
@@ -5734,16 +5880,18 @@ mod tests {
             write_lineage_session(&proj, id, ts, "root-uuid-5");
         }
 
+        let mut store = store_at(&root);
+
         let mut app = App::new(
-            SessionStore::load_from(&root),
+            store.reload().sessions,
             Scope::All,
             PathBuf::from("/tmp/launch"),
         );
         seed_live_records(&mut app, &[]); // nothing is live
 
         // Opening the confirm CAPTURES all three member ids.
-        feed(&mut app, ctrl(KeyCode::Char('x')), &root);
-        feed(&mut app, key(KeyCode::Char('d')), &root);
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('d')), &mut store);
         assert_eq!(
             app.modal.as_ref().expect("the confirm is open").choices[1].label,
             "Delete lineage (3)",
@@ -5752,7 +5900,7 @@ mod tests {
 
         // ...and now one of them leaves the board while the modal sits open.
         std::fs::remove_file(proj.join("sbgone-away.jsonl")).expect("drop a member from the store");
-        handle_event(&mut app, AppEvent::SessionsChanged, &root);
+        handle_event(&mut app, AppEvent::SessionsChanged, &mut store);
         assert!(
             app.session_by_id("sbgone-away").is_none(),
             "the reload dropped that member from the board"
@@ -5762,8 +5910,8 @@ mod tests {
             "the reload leaves the confirm standing, still holding the stale ids"
         );
 
-        feed(&mut app, key(KeyCode::Left), &root); // -> Delete lineage (3)
-        let out = feed(&mut app, key(KeyCode::Enter), &root);
+        feed(&mut app, key(KeyCode::Left), &mut store); // -> Delete lineage (3)
+        let out = feed(&mut app, key(KeyCode::Enter), &mut store);
         assert!(matches!(out, Outcome::Continue));
 
         assert!(
@@ -5822,23 +5970,25 @@ mod tests {
             "root-uuid-3",
         );
 
+        let mut store = store_at(&root);
+
         let mut app = App::new(
-            SessionStore::load_from(&root),
+            store.reload().sessions,
             Scope::All,
             PathBuf::from("/tmp/launch"),
         );
         let probes = seed_live_records(&mut app, &[]);
 
-        feed(&mut app, ctrl(KeyCode::Char('x')), &root);
-        feed(&mut app, key(KeyCode::Char('d')), &root);
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('d')), &mut store);
         assert_eq!(
             probes.get(),
             0,
             "OPENING the confirm asks claude nothing — the probe belongs to the confirm"
         );
 
-        feed(&mut app, key(KeyCode::Left), &root); // -> Delete lineage (3)
-        feed(&mut app, key(KeyCode::Enter), &root);
+        feed(&mut app, key(KeyCode::Left), &mut store); // -> Delete lineage (3)
+        feed(&mut app, key(KeyCode::Enter), &mut store);
 
         assert_eq!(
             probes.get(),
@@ -5881,8 +6031,10 @@ mod tests {
             "root-uuid-4",
         );
 
+        let mut store = store_at(&root);
+
         let mut app = App::new(
-            SessionStore::load_from(&root),
+            store.reload().sessions,
             Scope::All,
             PathBuf::from("/tmp/launch"),
         );
@@ -5892,8 +6044,8 @@ mod tests {
         for (step, id) in [(0isize, "sblone-rootless"), (1, "sblone-solo")] {
             app.move_selection(step);
             assert_eq!(app.selected.as_deref(), Some(id), "standing on {id}");
-            feed(&mut app, ctrl(KeyCode::Char('x')), &root);
-            feed(&mut app, key(KeyCode::Char('d')), &root);
+            feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+            feed(&mut app, key(KeyCode::Char('d')), &mut store);
             let modal = app.modal.as_ref().expect("the confirm is open");
             assert_eq!(
                 modal
@@ -5909,7 +6061,7 @@ mod tests {
                 Some(&ModalAction::Cancel),
                 "{id}: still defaulted to Cancel"
             );
-            feed(&mut app, key(KeyCode::Esc), &root);
+            feed(&mut app, key(KeyCode::Esc), &mut store);
         }
 
         std::env::remove_var("CLAUDE_PROJECTS_DIR");
@@ -5932,16 +6084,18 @@ mod tests {
         std::fs::create_dir_all(&proj).expect("create the encoded-cwd dir");
         write_store_session(&proj, "sbcancel-1", "2026-07-14T10:00:00.000Z");
 
+        let mut store = store_at(&root);
+
         let mut app = App::new(
-            SessionStore::load_from(&root),
+            store.reload().sessions,
             Scope::All,
             PathBuf::from("/tmp/launch"),
         );
         assert_eq!(app.selected.as_deref(), Some("sbcancel-1"));
 
-        feed(&mut app, ctrl(KeyCode::Char('x')), &root);
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
         assert!(app.pending_chord, "Ctrl-X arms the chord");
-        let out = feed(&mut app, key(KeyCode::Esc), &root);
+        let out = feed(&mut app, key(KeyCode::Esc), &mut store);
         assert!(matches!(out, Outcome::Continue));
 
         assert!(!app.pending_chord, "Esc abandons the chord");

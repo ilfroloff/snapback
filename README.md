@@ -113,7 +113,7 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | `Ctrl-O` (in that picker) | **Start the highlighted agent interactively at once**, skipping the draft — the same thing `Ctrl-O` means inside the draft box, so either route out of the picker is one keypress |
 | `Ctrl-R` | **Quick reply** — send a one-shot message to the selected session without leaving the board. A background agent whose run is over (`done`, `stopped`, `failed`) is stopped first so the reply lands in place; a waiting one (`needs input`) asks you to confirm that stop; one that is still live (`working`, `idle`, `interrupted`, or a state this version doesn't recognize) is left alone and refused. Opens a compose box (`Enter` sends, `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels) |
 | `Ctrl-K` | **Stop / interrupt** the selected session's live background agent (`claude stop`). An agent whose run is over (`done`, `stopped`, `failed`) stops immediately; every other live agent (`working`, `needs input`, `idle`, `interrupted`, unrecognized) confirms first, since stopping ends the live job (its conversation is kept). A session that isn't running as an agent has nothing to stop, and an interactive session running in another terminal can't be stopped from here |
-| `Ctrl-X` then `x` / `d` / `h` | **Leader chord** for hide & delete — `x` **hides** the selected session (reversible, persisted), `d` **hard-deletes** it after a confirmation that can take just that row or its whole `(+N)` stack, `h` toggles **show hidden**. Any other key cancels the chord |
+| `Ctrl-X` then `x` / `d` / `h` / `r` | **Leader chord** for trimming and refreshing the board — `x` **hides** the selected session (reversible, persisted), `d` **hard-deletes** it after a confirmation that can take just that row or its whole `(+N)` stack, `h` toggles **show hidden**, `r` **re-reads every transcript from disk**. Any other key cancels the chord |
 | `Tab` | Toggle search: **name-only ↔ name+content** |
 | `Ctrl-A` | Flip scope: **current folder ↔ project** — the project being the repo you launched in and all of its git worktrees. Started with `-a` it is a three-stop cycle instead (current folder → project → all folders), which is the only way to reach all folders |
 | `Ctrl-/` | Toggle the transcript **preview** pane |
@@ -200,7 +200,10 @@ is highlighted in the list.
 
 **Autorefresh.** The list keeps itself current as you work: new sessions appear,
 finished ones update, deleted ones drop out — all in place, with your selection
-and scroll position preserved.
+and scroll position preserved. It re-reads only the transcripts that actually
+changed, so a board left open beside a busy agent costs close to nothing, however
+many sessions you have accumulated. `Ctrl-X r` forces a full re-read if you ever
+want one.
 
 **Agent sessions at a glance.** Every session Claude Code is running — or has
 recently finished running — as an agent carries a colored badge: a dot and a
@@ -330,7 +333,7 @@ itself, not a report that the run ended, and it isn't worth stopping live work o
 a guess. Use `Ctrl-K` if you do want it stopped — it will ask first.
 
 **Hide & delete.** `Ctrl-X` is a leader chord for trimming the board: press it,
-and a hint shows the follow-ups — `x`, `d`, `h` — while any other key cancels.
+and a hint shows the follow-ups — `x`, `d`, `h`, `r` — while any other key cancels.
 
 - `Ctrl-X x` **hides** the selected session. This is the reversible default: the
   session stays on disk, it just drops off the board. A `(+N)` stack always hides
@@ -341,6 +344,12 @@ and a hint shows the follow-ups — `x`, `d`, `h` — while any other key cancel
 - `Ctrl-X h` **toggles showing hidden sessions**. Hidden rows come back dimmed and
   marked `[hidden]`, still carrying their live badge if their agent is running —
   hiding is a visibility choice, not a claim that a session is finished.
+- `Ctrl-X r` **re-reads every transcript from disk**. You should not normally need
+  it: the board already refreshes itself as files change, and it keeps the reading
+  it took of any transcript nothing has written to since. `r` throws that away and
+  reads the whole store again, which is the answer if a row ever looks out of date
+  — on a network drive with a coarse clock, say. It reports how many sessions it
+  landed on, and costs nothing but the re-read.
 - `Ctrl-X d` **hard-deletes** the selected session — physically removing its
   transcript from disk. Because that is irreversible, it asks first with a
   confirmation prompt (defaulted to Cancel). On a row that stands for a `(+N)`

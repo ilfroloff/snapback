@@ -60,7 +60,7 @@ the render framework.** That is why `agents::classify` buckets the undocumented
 | --- | --- | --- |
 | `run` | `src/lib.rs` | Crate root + persistent-dashboard loop: parse args, load store, run the board, spawn `claude` on resume, recover a lost liveness race (`after_nonzero_resume`), reload, repeat. Hidden `--print-list` dump. `src/main.rs` and `src/bin/sb.rs` are thin shims that only call `run`. |
 | `cli` | `src/cli.rs` | Argument parsing (`--all`/`-a`, `--project`/`-p`, `--help`/`-h`, hidden `--print-list`); resolves the canonical launch dir. The two scope flags are mutually exclusive in meaning but not in syntax — the LAST one on the command line wins (the plain single-pass assignment, so an alias carrying `-p` stays overridable by a trailing `-a`). `-a` carries a SECOND, orthogonal meaning that precedence does not touch: `Args::all_scope_enabled`, which is what puts the all scope on the `Ctrl-A` cycle and is the only route to it. |
-| `store` | `src/store/mod.rs` | Data core entry: `Session` model + `SessionStore::load{,_from}` pipeline; sorts repo→branch→timestamp-desc. |
+| `store` | `src/store/mod.rs` | Data core entry: `Session` model + the `SessionStore` reload pipeline; sorts repo→branch→timestamp-desc. **STATEFUL**, and the one cache in the crate that is not derived state: it owns a store root and an in-memory `path -> (FileStamp, Session)` map, so `reload` re-parses only the files whose `(mtime, len)` moved and hands back a `Reload` naming which sessions it re-read. Discovery is never cached (see [the load pipeline](#the-load-pipeline-store)). `load{,_from}` remain as one-shot wrappers over an empty cache, for `--print-list` and tests. |
 | `store::discover` | `src/store/discover.rs` | Store-root resolution + depth-pinned file enumeration (the subagent-exclusion rule). |
 | `store::parse` | `src/store/parse.rs` | Fail-soft, streaming per-file JSONL scan → `ParsedFile`. |
 | `store::group` | `src/store/group.rs` | `repo_of(cwd)` repo/branch grouping heuristic (worktree collapse). A PURE string function — it never asks git, which is what keeps the collapse a property of the path alone; the git-backed answer is `worktrees`' job. |
@@ -177,11 +177,20 @@ waiting on its event, so it cannot be left to one that may never arrive:
 
 ### The load pipeline (`store`)
 
-`discover` (depth-pinned, subagent-excluding) → `parse` (fail-soft, per file in
-parallel via rayon) → derive (`label`, `repo`, timestamp, `root_uuid`,
-`msg_count`, `content_index`) → sort repo↑ / branch↑ / timestamp↓. Every
-correctness constraint lives here and is covered by unit tests. See
-[DOMAIN.md](DOMAIN.md) for the data model.
+`discover` (depth-pinned, subagent-excluding) → **reuse or** `parse` (fail-soft,
+per file in parallel via rayon) → derive (`label`, `repo`, timestamp,
+`root_uuid`, `msg_count`, `content_index`) → sort repo↑ / branch↑ / timestamp↓.
+Every correctness constraint lives here and is covered by unit tests. See
+[DOMAIN.md](DOMAIN.md) for the data model and
+[the incremental reload](DOMAIN.md#incremental-reload-storesessionstore) for what
+the reuse step may and may not decide.
+
+**Discovery runs in full on every reload; only PARSING is incremental.** That
+split is the whole safety argument: the cache answers what a discovered file
+CONTAINS, so its worst failure is a briefly stale row, and it is structurally
+incapable of the failure that would matter — a session on disk that never
+reaches the board. The new cache is rebuilt from the discovered set rather than
+edited, so a deleted file's entry leaves with it.
 
 `root_uuid` and `msg_count` both fall out of the SAME streaming pass — no second
 read, no walk, no index — which is why the lineage needs no cache of its own and
@@ -191,16 +200,33 @@ buffer (see [DOMAIN.md](DOMAIN.md#turn-count-storeparse)). `store::lineage` then
 runs **above** this pipeline, at display time (`App::recompute_filtered`), never
 during the load: folding is a view of the store, not part of it.
 
-Every reload lands in ONE funnel, `App::apply_sessions`, and that is also where
+Every reload lands in ONE funnel, `App::apply_reload`, and that is also where
 the launch project's worktree set is **re-resolved** (`worktrees`, above) before
 `recompute_scope` runs — so `Scope::Project` picks up a worktree created mid-run
 without a restart, and a reload is scoped by the current set rather than one
 reload behind it. The funnel needs no wiring at its callers: the
 `AppEvent::SessionsChanged` watcher reload, the post-resume reload in `lib::run`,
-and the post-delete reload all already go through it, so a future reload path
-inherits the same behavior. The set is resolved at exactly two moments —
-construction and reload — and NEVER in `recompute_scope` / `toggle_scope`, which
-run on a keystroke.
+the post-delete reload and the `Ctrl-X r` forced rescan all already go through it
+(the three `tui` ones via `update::reload_board`), so a future reload path
+inherits the same behavior. `apply_sessions` is the same funnel entered from a
+session list that did not come through the store cache — it states "assume every
+row moved" — and is what tests with synthetic sessions call. The set is resolved
+at exactly two moments — construction and reload — and NEVER in
+`recompute_scope` / `toggle_scope`, which run on a keystroke.
+
+The `Reload` the funnel receives also names the sessions the store actually
+re-read, and that is what lets the derived caches survive a reload: the preview
+cache evicts only those entries (plus any whose session left the board) and
+`SearchIndex::refresh` reuses the rest on its own fingerprint. Clearing either
+wholesale would re-render every transcript the board touches at the watcher's
+cadence and spend the saved parse one layer up.
+
+The single `SessionStore` is owned by `lib::run` and threaded into `tui::run` →
+`update::handle_event`, replacing the store root that used to travel there: the
+cache is keyed by paths under one root, so root and cache are one value and
+cannot drift onto different trees. Threading it (rather than rebuilding one per
+reload) is also what makes the launch load warm the cache the board then reloads
+against.
 
 ### Terminal safety seams
 

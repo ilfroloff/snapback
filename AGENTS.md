@@ -29,6 +29,18 @@ one place.
 - **SUBAGENT EXCLUSION BY DEPTH.** Discover only `<root>/<cwd>/<id>.jsonl` at
   depth 2; NEVER descend into `<id>/subagents/`. Do not make discovery
   recursive. (`src/store/discover.rs`)
+- **THE PARSE CACHE NEVER DECIDES WHICH FILES EXIST — OR WHETHER A FILE IS A
+  SESSION IT COULD NOT READ.** `SessionStore` reuses the parse of a file whose
+  `(mtime, len)` stamp did not move, so it may leave a row STALE; it must never
+  be able to leave one MISSING, and only that asymmetry makes it acceptable at
+  all. Two things hold that line and both are load-bearing: DISCOVERY is never
+  cached, and only a VERDICT ABOUT CONTENT is — a read that finished, taken at an
+  instant the stamp can vouch for. A failed read is not a verdict and is never
+  stored; a stored one would outlive every retry, because a finished transcript's
+  stamp never moves again. Keep the cache IN MEMORY (derived state, not the owned
+  state below). Mechanism and the stamp rules:
+  [DOMAIN.md](docs/agents/DOMAIN.md#incremental-reload-storesessionstore).
+  (`src/store/mod.rs`)
 - **SNAPBACK-OWNED STATE.** The ONLY persistent state `snapback` writes is the
   hidden-session id set. It lives under `$SNAPBACK_CONFIG_DIR` (default
   `~/.config/snapback`), specifically the `state/` subdir — resolved by the

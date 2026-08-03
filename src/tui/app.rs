@@ -25,7 +25,7 @@ use crate::{config, delete, hidden};
 
 use crate::search::{SearchIndex, SearchMode};
 use crate::store::lineage::{self, LineageKey};
-use crate::store::{preview, Session};
+use crate::store::{preview, Reload, Session};
 // The scope predicate and the worktree resolver MUST canonicalize paths the same
 // way or membership compares apples to oranges, so both call the one
 // `resolve_dir` that lives beside the worktree set it has to match.
@@ -1194,9 +1194,12 @@ pub struct App {
     /// pane's inner width, so the cache is scoped to a single width tracked in
     /// [`preview_width`](Self::preview_width): a width change CLEARS it rather
     /// than keying every entry by `(id, width)`. This keeps the cache to one
-    /// entry per session and mirrors the reload-clear in `apply_sessions`;
-    /// re-render on resize is cheap because only the selected session is ever
-    /// rendered. Each entry carries the styled `Text`, its clickable link
+    /// entry per session; re-render on resize is cheap because only the selected
+    /// session is ever rendered. A RELOAD is narrower than a resize — it evicts
+    /// only the transcripts that moved on disk (see
+    /// [`apply_reload`](Self::apply_reload)), since re-rendering a transcript
+    /// nothing wrote to would spend the incremental store reload's saving here.
+    /// Each entry carries the styled `Text`, its clickable link
     /// regions (see [`preview::RenderedPreview`]) and the transcript's wrapped
     /// row count (see [`CachedPreview`]); all three are produced from one pass at
     /// a fixed width, so a region's columns and a row count always match the
@@ -2210,27 +2213,57 @@ impl App {
 
     // --- autorefresh reload -----------------------------------------------
 
-    /// Replace the session list (a `SessionsChanged` reload), re-apply the
-    /// active query+scope, and PRESERVE the selection by stable id and the
-    /// scroll offset. If the selected id vanished, the selection clamps to the
-    /// nearest surviving row.
+    /// Replace the session list from a list that did NOT come through the store
+    /// cache, so every row counts as changed.
+    ///
+    /// A thin statement of that fact over [`apply_reload`](Self::apply_reload),
+    /// which is the funnel proper.
+    // Only tests build a session list by hand; every runtime reload has a
+    // `Reload` in hand already (PATTERNS §9, the binary-crate lint quirk).
+    #[allow(dead_code)]
+    pub fn apply_sessions(&mut self, sessions: Vec<Session>) {
+        self.apply_reload(Reload::everything(sessions));
+    }
+
+    /// Apply one store reload: re-apply the active query+scope and PRESERVE the
+    /// selection by stable id and the scroll offset. If the selected id
+    /// vanished, the selection clamps to the nearest surviving row.
     ///
     /// This is also where the launch project's worktree set is RE-RESOLVED, and
     /// it needs no wiring at any caller: every reload path already funnels
     /// through here — the `SessionsChanged` watcher event and the post-resume
     /// reload in `lib::run` (the two the autoreload exists for), plus the
-    /// post-delete reload — so all of them pick a worktree created mid-run up by
-    /// construction, and a future reload path gets the same behavior for free.
-    /// Off-UI-thread: a reload is a bounded one-shot, unlike `recompute_scope` /
-    /// `toggle_scope`, which run on a keystroke and must never ask git.
-    pub fn apply_sessions(&mut self, sessions: Vec<Session>) {
+    /// post-delete reload and the `Ctrl-X r` rescan — so all of them pick a
+    /// worktree created mid-run up by construction, and a future reload path gets
+    /// the same behavior for free. Off-UI-thread: a reload is a bounded one-shot,
+    /// unlike `recompute_scope` / `toggle_scope`, which run on a keystroke and
+    /// must never ask git.
+    ///
+    /// The [`Reload`] says WHICH transcripts were re-read, and that is what keeps
+    /// the derived caches honest without throwing them away: an incremental
+    /// reload hands back byte-identical sessions for everything it reused, so
+    /// re-rendering those transcripts would spend the saved parse one layer up.
+    /// The preview cache therefore drops only the entries this reload actually
+    /// re-read (plus any whose session left the board, which would otherwise
+    /// never be collected), and the search index reuses the rest on its own
+    /// fingerprint (see
+    /// [`SearchIndex::refresh`](crate::search::SearchIndex::refresh)).
+    pub fn apply_reload(&mut self, reload: Reload) {
         let prev_id = self.selected.clone();
         let prev_pos = self.selected_pos();
 
-        self.sessions = sessions;
+        self.sessions = reload.sessions;
         self.index.refresh(&self.sessions);
-        // The transcript on disk may have changed; drop stale preview text.
-        self.preview_cache.clear();
+        // Drop stale preview text for the transcripts that moved on disk, and
+        // only those. `changed` is a SUPERSET of what really differs, so this
+        // errs toward re-rendering rather than toward showing stale text.
+        let live: HashSet<&str> = self
+            .sessions
+            .iter()
+            .map(|s| s.session_id.as_str())
+            .collect();
+        self.preview_cache
+            .retain(|id, _| live.contains(id.as_str()) && !reload.changed.contains(id));
         // Re-resolve BEFORE `recompute_scope` so this reload is already scoped by
         // the CURRENT worktree set rather than one reload behind it. The same
         // expression `App::new` seeds with, on purpose: launch and reload must not
@@ -2640,6 +2673,16 @@ impl App {
             );
         }
         self.preview_cache.get(&id)
+    }
+
+    /// How many rendered transcripts the preview cache holds.
+    ///
+    /// Test-only: the cache is an internal, but its EVICTION rule is a boundary
+    /// worth pinning — a leaked entry for a departed session is invisible
+    /// otherwise.
+    #[cfg(test)]
+    fn preview_cache_len(&self) -> usize {
+        self.preview_cache.len()
     }
 
     /// Readable, markdown-styled transcript for the selected session, fit to
@@ -3440,11 +3483,85 @@ mod tests {
         );
     }
 
-    /// A reload DROPS the cached height with the text it was measured from.
+    /// The reload boundary: a transcript the store REUSED keeps its rendered
+    /// preview, and one the store RE-READ loses it.
     ///
-    /// The transcript on disk grows while the board is open (that is what a live
-    /// agent does), so a height that outlived its reload would keep the pane's bottom
-    /// anchored to a session that is no longer there.
+    /// This is what stops the incremental parse from being spent one layer up —
+    /// clearing the whole cache per reload re-renders every transcript the board
+    /// touches, at the watcher's cadence, for files nothing wrote to.
+    ///
+    /// The two fixtures stand in for one transcript before and after a write;
+    /// the `changed` set is what decides whether the board notices. Pointing a
+    /// "reused" session at the longer file is deliberately a state the store
+    /// cannot produce — it is what makes the cache observable at all, since a
+    /// served cache and a re-render are otherwise identical by construction.
+    #[test]
+    fn a_reload_evicts_only_the_previews_it_re_read() {
+        let (short_folder, short_file) = SHORT_FIXTURE;
+        let (long_folder, long_file) = LONG_FIXTURE;
+        let mut app = app_all(vec![fixture_session("s1", short_folder, short_file)]);
+
+        let before = app.preview_wrapped_rows(40);
+
+        app.apply_reload(Reload {
+            sessions: vec![fixture_session("s1", long_folder, long_file)],
+            changed: HashSet::new(),
+        });
+        assert_eq!(
+            app.preview_wrapped_rows(40),
+            before,
+            "a session the store reused must keep its rendered preview"
+        );
+
+        app.apply_reload(Reload {
+            sessions: vec![fixture_session("s1", long_folder, long_file)],
+            changed: HashSet::from(["s1".to_string()]),
+        });
+        assert!(
+            app.preview_wrapped_rows(40) > before,
+            "a session the store re-read must be re-rendered"
+        );
+    }
+
+    /// A session that LEFT the board takes its cached preview with it, whatever
+    /// the reload reported — the cache would otherwise grow for the life of the
+    /// process on a board whose sessions come and go.
+    #[test]
+    fn a_reload_drops_the_preview_of_a_session_that_left_the_board() {
+        let (folder, file) = LONG_FIXTURE;
+        let mut app = app_all(vec![
+            fixture_session("s1", folder, file),
+            fixture_session("s2", folder, file),
+        ]);
+
+        app.selected = Some("s1".to_string());
+        app.preview_text(40);
+        app.selected = Some("s2".to_string());
+        app.preview_text(40);
+        assert_eq!(app.preview_cache_len(), 2, "both transcripts are cached");
+
+        // s2 is gone from disk, and the reload reports nothing as re-read.
+        app.apply_reload(Reload {
+            sessions: vec![fixture_session("s1", folder, file)],
+            changed: HashSet::new(),
+        });
+        assert_eq!(
+            app.preview_cache_len(),
+            1,
+            "the departed session's preview must be collected, not stranded"
+        );
+    }
+
+    /// A reload that re-read EVERYTHING drops the cached height along with the
+    /// text it was measured from.
+    ///
+    /// Specifically the all-changed path: it goes through `apply_sessions` ->
+    /// `Reload::everything`, what a caller states when its sessions did not come
+    /// through the store's cache at all, so it never exercises the production
+    /// `retain` predicate. That predicate — evict only what this reload actually
+    /// re-read — is pinned by `a_reload_evicts_only_the_previews_it_re_read`.
+    /// Between the two, a height cannot outlive the text it was measured from on
+    /// either path.
     #[test]
     fn a_reload_drops_the_cached_preview_height() {
         let (short_folder, short_file) = SHORT_FIXTURE;

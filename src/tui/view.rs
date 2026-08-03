@@ -1865,9 +1865,14 @@ fn render_search(frame: &mut Frame, app: &App, area: Rect) {
 /// One place for the wording (NO MAGIC VALUES); keep it in step with
 /// [`update::chord_key`](crate::tui::update). Rendered with a NAMED color +
 /// modifier only, no RGB or ANSI (PATTERNS §7, TERMINAL-SAFE STYLING).
+///
+/// COLUMN BUDGET: the help row is ONE line and is truncated, never wrapped, so
+/// the longest form is what has to fit — `expose` (the wider verb) lands it at
+/// exactly 80 columns. Anything added here costs the tail of an 80-column
+/// terminal, so weigh a new verb against `Esc cancel` rather than appending.
 fn chord_hint(selected_hidden: bool) -> String {
     let x = if selected_hidden { "expose" } else { "hide" };
-    format!("^X  x {x} · d delete row/lineage · h show/hide hidden · Esc cancel")
+    format!("^X  x {x} · d delete row/lineage · h show/hide hidden · r reload · Esc cancel")
 }
 
 /// The compose zone's key hints, per open draft. Pure so the wording is assertable
@@ -6580,6 +6585,7 @@ mod tests {
             "x hide",
             "d delete row/lineage",
             "h show/hide hidden",
+            "r reload",
             "Esc cancel",
         ] {
             assert!(
@@ -6587,6 +6593,19 @@ mod tests {
                 "the which-key hint must list {needle:?}; drawn: {text:?}"
             );
         }
+    }
+
+    /// The hint's own column budget: its LONGEST form must still fit an
+    /// 80-column terminal, since the help row is truncated rather than wrapped
+    /// and the tail carries `Esc cancel`.
+    #[test]
+    fn the_chord_hint_fits_an_eighty_column_terminal() {
+        let widest = chord_hint(true);
+        assert!(
+            widest.chars().count() <= 80,
+            "the which-key hint must not overflow an 80-column help row: {} cols in {widest:?}",
+            widest.chars().count()
+        );
     }
 
     #[test]

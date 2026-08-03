@@ -51,7 +51,9 @@ KEYS:
     Ctrl-O        in the agent picker: start that agent interactively at once,
                   skipping the draft — the same verb Ctrl-O has inside the draft
     Ctrl-X        leader chord: x hide · d delete (this row or its lineage)
-                  · h show/hide hidden
+                  · h show/hide hidden · r re-read every transcript from disk
+                  (the board already autorefreshes and reuses unchanged files;
+                  r is the force, for a row that looks stale)
     Ctrl-R        quick reply — send a one-shot message to the selected session
                   without leaving the board. An agent whose run is over (done,
                   stopped, failed) is stopped first so the reply lands in place;

@@ -357,11 +357,13 @@ pub fn build_stop_argv(job_id: &str) -> Vec<String> {
 /// rules: AUTHORITATIVE-FROM-FILE (reuse [`parse::parse_file`], the ONE parser,
 /// never decode the folder name) and refuse rather than guess. A file that is
 /// gone or carries no `cwd` (a sidecar) refuses; a `cwd` whose directory was
-/// deleted (a removed worktree) refuses. Pure so the refusal path is unit tested
-/// against a real temp file exactly like `resume::plan_refuses_...`.
+/// deleted (a removed worktree) refuses. The parser's two non-session verdicts
+/// COLLAPSE into that one refusal, whose wording already names only what was
+/// observed rather than a cause it cannot distinguish. Pure so the refusal path
+/// is unit tested against a real temp file exactly like `resume::plan_refuses_...`.
 #[must_use]
 pub fn plan_send(file: &Path) -> SendPlan {
-    let Some(parsed) = parse::parse_file(file) else {
+    let Some(parsed) = parse::parse_file(file).session() else {
         return SendPlan::Refuse(format!(
             "Could not read a cwd from the session file; refusing to send:\n    {}",
             file.display()

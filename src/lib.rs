@@ -50,7 +50,12 @@ pub fn run() {
 
     let launch_dir = cli::launch_dir();
     let root = store::discover::store_root();
-    let sessions = SessionStore::load_from(&root);
+    // ONE store for the whole process: it caches each transcript's parse, so
+    // every reload below re-reads only the files a `claude` child actually
+    // touched. Built here rather than per reload precisely so the launch load
+    // warms the cache the board then reloads against.
+    let mut store = SessionStore::new(&root);
+    let sessions = store.reload().sessions;
 
     // Guard against a non-TTY / headless environment: a ratatui TUI needs a
     // real terminal, so instead of entering raw mode (which would fail) print a
@@ -78,7 +83,7 @@ pub fn run() {
     // because it filters nothing — see `App::all_scope_enabled`.
     app.all_scope_enabled = args.all_scope_enabled;
     loop {
-        match tui::run(&mut app, &root) {
+        match tui::run(&mut app, &mut store) {
             // User quit the board (or all event senders dropped).
             Ok(Outcome::Quit) => break,
             Ok(Outcome::Resume(ready)) => {
@@ -98,11 +103,13 @@ pub fn run() {
                     Err(err) => app.set_status(err.message().to_string()),
                 }
                 // One call reloads BOTH halves of the board's world: the store
-                // read below, and — inside `apply_sessions` — the launch
-                // project's worktree set, which the child may have changed (a
-                // `git worktree add` in the resumed session). No extra wiring
-                // here on purpose; see `App::apply_sessions`.
-                app.apply_sessions(SessionStore::load_from(&root));
+                // read below, and — inside `apply_reload` — the launch project's
+                // worktree set, which the child may have changed (a `git worktree
+                // add` in the resumed session). No extra wiring here on purpose;
+                // see `App::apply_reload`. The resumed session is usually the
+                // only transcript the child grew, so this reads a handful of
+                // files rather than the whole store.
+                app.apply_reload(store.reload());
             }
             // `run` only breaks its own loop on Quit/Resume; Continue never
             // escapes, and a quick-reply Send, an interrupt, and a background-agent
