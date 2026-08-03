@@ -474,7 +474,8 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    modal nor a future `List` one can inherit a verb it has no meaning for. Four
    more keyboard owners sit alongside it: the `Ctrl-X` leader chord (while
    `App.pending_chord` is set, `chord_key` routes the next key — `x` hide, `d`
-   delete-confirm, `h` show-hidden, anything else cancels), the "stop the
+   delete-confirm, `h` show-hidden, `r` forced full store re-read, anything else
+   cancels), the "stop the
    waiting agent?" confirmation via `App.pending_stop` (a plain Enter/Esc gate
    before compose, for the `needs input` quick-reply path), its `Ctrl-K` sibling
    `App.pending_interrupt` (the same Enter/Esc gate, but resolving to a bare

@@ -384,9 +384,11 @@ pub fn status_for_exit(code: Option<i32>, hint: &str) -> Option<String> {
 /// since the store was last loaded, and the `/`->`-` folder encoding is lossy).
 /// Returns `None` if the file is gone or carries no `cwd` (a sidecar
 /// agent-name/ai-title file, which is not resumable). Reuses the data core's
-/// fail-soft [`parse::parse_file`] so parsing lives in exactly one place.
+/// fail-soft [`parse::parse_file`] so parsing lives in exactly one place; its
+/// two non-session verdicts COLLAPSE here deliberately, because refusing the
+/// hand-off is the fail-soft direction for both and nothing here is remembered.
 fn read_authoritative(file: &Path) -> Option<(PathBuf, String)> {
-    let parsed = parse::parse_file(file)?;
+    let parsed = parse::parse_file(file).session()?;
     Some((PathBuf::from(parsed.cwd), parsed.session_id))
 }
 

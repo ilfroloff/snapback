@@ -13,7 +13,6 @@ pub mod update;
 pub mod view;
 
 use std::io::{self, Write};
-use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -29,6 +28,7 @@ use crossterm::terminal::{
 };
 use ratatui::DefaultTerminal;
 
+use crate::store::SessionStore;
 use crate::watch::EventLoop;
 
 pub use app::{App, Scope};
@@ -478,13 +478,13 @@ fn install_mode_safe_panic_hook() {
 /// before returning. A bare `?` in the body would otherwise leave the terminal
 /// in raw mode on the error path — `DefaultTerminal` does not restore on drop
 /// and the panic hook only fires on panic, not on `Err`.
-pub fn run(app: &mut App, root: &Path) -> Result<Outcome> {
+pub fn run(app: &mut App, store: &mut SessionStore) -> Result<Outcome> {
     let mut terminal = init_terminal()?;
     // `init_terminal()?` failing needs no restore — nothing was enabled yet.
     // From here on the terminal is live, so run the fallible body, capture its
     // result, ALWAYS restore, then surface the result. `restore_terminal` is
     // idempotent, so restoring here and re-initializing next loop is safe.
-    let result = run_inner(&mut terminal, app, root);
+    let result = run_inner(&mut terminal, app, store);
     restore_terminal();
     result
 }
@@ -497,7 +497,11 @@ pub fn run(app: &mut App, root: &Path) -> Result<Outcome> {
 /// restore. Dropping the local `events` here also joins the input reader before
 /// [`run`] returns (see [`EventLoop`]'s `Drop`), so the reader has released
 /// stdin before `main` spawns `claude`.
-fn run_inner(terminal: &mut DefaultTerminal, app: &mut App, root: &Path) -> Result<Outcome> {
+fn run_inner(
+    terminal: &mut DefaultTerminal,
+    app: &mut App,
+    store: &mut SessionStore,
+) -> Result<Outcome> {
     // A returning `claude` child can hand back a dirty terminal (alt screen
     // dropped, stale cells, leaked input modes) — notably a `Ctrl-Z` that exits
     // `claude` without restoring the terminal.
@@ -506,7 +510,10 @@ fn run_inner(terminal: &mut DefaultTerminal, app: &mut App, root: &Path) -> Resu
     // propagates through the captured result and [`run`] still restores the
     // terminal.
     hard_reset()?;
-    let events = EventLoop::new(root, TICK)?;
+    // The watcher and the store read the same root by construction — it is the
+    // store's own — so the two can never drift onto different trees.
+    let root = store.root().to_path_buf();
+    let events = EventLoop::new(&root, TICK)?;
     // Refresh the agent badges OFF the UI thread on their own cadence, so the
     // `claude agents --json --all` shell-out can never block rendering. Delivered
     // as `AppEvent::ReportedAgents` on the merged channel and applied in `update`.
@@ -515,7 +522,7 @@ fn run_inner(terminal: &mut DefaultTerminal, app: &mut App, root: &Path) -> Resu
     let outcome = loop {
         terminal.draw(|frame| view::render(frame, app))?;
         match events.recv() {
-            Some(event) => match update::handle_event(app, event, root) {
+            Some(event) => match update::handle_event(app, event, store) {
                 Outcome::Continue => {}
                 // A confirmed quick-reply send: fire it on a detached thread and
                 // KEEP drawing — the board never tears down (contrast

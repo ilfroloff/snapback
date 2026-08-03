@@ -313,12 +313,87 @@ indexed.
 There is deliberately **no on-disk index** (YAGNI at the observed few-hundred
 sessions — ~270 when last measured, 2026-07-15): the whole content corpus is a
 few single-digit MB held in memory and the gate keeps per-keystroke matching
-instant, so a SQLite/FTS index would be pure overhead. If the store ever grows
-into the **thousands** of sessions and the initial load or the content haystack
-starts to feel heavy, the first step is a lazily-populated, **mtime-keyed
-on-disk cache** (e.g. `~/.cache/snapback/`) of each session's `content_index`,
-so only changed sessions are re-extracted; an **FTS5** table over transcript
-text is the step past that. Until then it is not worth it.
+instant, so a SQLite/FTS index would be pure overhead. The mtime-keyed half of
+that idea has since landed **in memory**, where it costs nothing to be wrong —
+see [incremental reload](#incremental-reload-storesessionstore) — and it is what
+keeps a reload from re-extracting every haystack. The remaining escalation is
+unchanged and still not worth it: if the store ever grows into the **thousands**
+of sessions, PERSIST that cache (e.g. `~/.cache/snapback/`) so a cold start pays
+nothing either; an **FTS5** table over transcript text is the step past that.
+
+### Incremental reload (`store::SessionStore`)
+
+The store re-reads only what moved. `SessionStore` holds an in-memory
+`path -> (FileStamp, Session)` cache and, per reload, reuses the parse of every
+discovered file whose `FileStamp` — `(mtime, len)`, compared as a PAIR — is
+unchanged. Measured on a 403-file / 182 MB store (2026-08-03): a full parse costs
+~0.43 s of CPU, a reload that reuses everything ~9 ms, and one appended
+transcript re-reads exactly 1 file of 403. The watcher is recursive over the
+whole store root, so before this every write by every `claude` process anywhere
+— including the background agents `Ctrl-N` starts — re-parsed the entire store
+up to 5×/second.
+
+Five rules hold it up, and none is negotiable:
+
+- **DISCOVERY IS NEVER CACHED.** It runs in full on every reload, and the new
+  cache is REBUILT from the discovered set rather than edited in place. So a
+  created session is parsed the first reload that sees it and a deleted one
+  leaves the board with its entry. The cache answers what a discovered file
+  CONTAINS; it is never asked which files exist.
+- **ONLY A VERDICT ABOUT CONTENT IS CACHED.** A read that FINISHED has two
+  possible answers, and both are durable facts about the bytes: this is a
+  session, or it carries no `cwd` and so is not one (a sidecar — cached too, or
+  every reload would re-read it). A read that FAILED is a third thing and is no
+  answer about the file at all: `EMFILE`, a permissions blip, a network home
+  directory that blinked. `parse::FileVerdict` keeps the three apart precisely so
+  the failure cannot be stored. Stored, it would be re-served for as long as the
+  file sits still — and a finished transcript's stamp never moves again, so one
+  blip would cost that session for the LIFE OF THE PROCESS. Unstored, it costs
+  this reload only and the next one reads the file again.
+
+  A read that dies MID-FILE is the same distinction one level down, drawn the
+  same way: non-UTF-8 bytes (`InvalidData`) are a fact about the content, so that
+  line is skipped and the transcript around it survives, while an I/O error is
+  not, so the file yields NO verdict rather than a truncated one whose
+  `msg_count` / `timestamp` / `content_index` would be cached as the session's
+  authoritative shape.
+- **BOTH HALVES OF THE STAMP, TOGETHER.** An append moves both, but an in-place
+  rewrite can move only the mtime and a same-instant truncate-and-rewrite only
+  the length.
+- **A FRESH MTIME IS NEVER TRUSTED, AND THE WINDOW IS SPENT ON THE WAY IN**
+  (`MTIME_SETTLE_WINDOW`, 2 s). Filesystem timestamp granularity is coarse —
+  HFS+ records whole seconds, SMB/FAT round to two — and the store may sit on any
+  of them, so within one granule a file can be rewritten to the same length and
+  still report the same mtime. A parse taken inside that window read bytes the
+  stamp cannot vouch for, so it is DISCARDED rather than cached (`cacheable`,
+  judged at the PARSE instant). Judging it at the REUSE instant instead reads
+  identically and is unsound: mtime floors to 100, a reload at 100.3 parses and
+  caches, a write at 100.7 to the same length leaves the mtime still floored at
+  100, and a reload at 102.5 sees age 2.5 with a matching stamp and trusts bytes
+  that were gone before it ever asked. Wall time alone must never promote a parse
+  to trusted. The clocks compared are DIFFERENT clocks (the filesystem's,
+  possibly a server's, against the local one), so skew is handled by failing
+  toward a re-parse: an mtime in the future is never settled. Cost is bounded to
+  the handful of transcripts being written right now, which is exactly where a
+  cache is worth least.
+- **THE CACHE IS IN MEMORY, NEVER ON DISK.** It is derived, disposable state, not
+  snapback-owned state — see the [one file snapback
+  writes](#snapback-owned-state-srchiddenrs).
+
+The first two together rule out the failure a cache must never have here: a row
+may be briefly STALE, never missing. Discovery stops the cache deciding which
+files EXIST, and the content-verdict rule stops it deciding that a file it could
+not read is not a session. That asymmetry is the only thing that makes a cache
+acceptable in front of a tool whose whole purpose is finding sessions.
+
+A reload reports the ids it re-read (`Reload::changed`), which is a SUPERSET of
+what really differs (a file inside the settle window is listed even if its bytes
+did not move). Consumers evict derived caches from it, so over-reporting costs a
+re-render while under-reporting would show stale text.
+
+`Ctrl-X r` is the escape hatch: it drops the cache and re-reads everything, so a
+filesystem that lies about either half of the stamp can never leave a row wrong
+permanently. Nothing else clears it.
 
 ### Fork lineage (`store::lineage`)
 
@@ -847,6 +922,7 @@ This is the third and last of **three distinct agent concepts** — keep them ap
 | **Scope** | `CurrentFolder` (default) / `Project` / `All` | THREE concentric answers to "which sessions are mine right now", declared widest-last so the variant order is the cycle order. current-folder = sessions whose **canonical** `cwd` exactly equals the canonical launch dir; project = sessions whose `cwd` is EITHER a member of the launch project's live worktree set (`src/worktrees.rs`) OR under the same repo ROOT (see below — two arms, and the scope needs both); all = every session. `All` renders repo→branch group heads; `Project` renders branch groups under the ONE project label instead of per-folder repo labels (see below); `CurrentFolder` is the flat, head-less list, and it ALONE, because it is the only scope that cannot span more than one folder. Selected at launch by `--project`/`-p` or `--all`/`-a`, and flipped by `Ctrl-A` between the first two — `All` joins that key ONLY on a board launched with `-a`, which is the sole route to it (see below). |
 | **Search mode** | `NameOnly` (default) / `NameAndContent` | which haystack the substring matcher scores; toggled by `Tab`. |
 | **Show hidden** | off (default) / on | whether soft-hidden sessions appear (dimmed, marked `[hidden]`, live badge intact). Toggled by `Ctrl-X h`; a row is hidden/un-hidden by `Ctrl-X x`. The set persists — see [snapback-owned state](#snapback-owned-state-srchiddenrs). |
+| **Forced rescan** | `Ctrl-X r` | not a mode: a one-shot that drops the store's parse cache and re-reads every transcript, reporting the count it landed on. The board autorefreshes and reuses unchanged files by itself, so this is the escape hatch for a row that looks stale — see [incremental reload](#incremental-reload-storesessionstore). |
 | **Modal** | `Row` \| `List` layout in one `Option<Modal>` | the SINGLE type for a TITLED, choice-bearing overlay. `Enter` on a running session builds the `Attach` / `Fork` / `Cancel` choice (a `Row`); `Ctrl-N` with defined agents builds the agent picker (a `List`); `Ctrl-X d` builds the hard-delete confirm (a `Row`: `Delete this` / `Delete lineage (N)` — offered only for a real multi-member lineage, carrying the member ids resolved at OPEN time — / `Cancel`, default-highlighted on Cancel by that choice's position). Each choice carries a `ModalAction` tag the one confirm handler (`confirm_modal`) routes on. The plain Enter/Esc stop confirmations (`Ctrl-R`, `Ctrl-K`), the compose zone and the `Ctrl-X` chord are separate keyboard owners, NOT `Modal`s — see [PATTERNS.md](PATTERNS.md#10-keys-actions-outcomes). |
 
 The current-folder scope is an **exact** canonical `cwd` match by design: a
