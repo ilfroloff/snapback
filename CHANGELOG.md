@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1](https://github.com/ilfroloff/snapback/compare/v0.6.0...v0.6.1) - 2026-08-03
+
+### Fixed
+
+- stop release-plz scoring internal renames as downstream breaks
+- unify status-line ownership and bound transient confirmations
+- gate a hard delete on a writer, not on claude knowing the session
+
+### Other
+
+- adopt a shared wtp worktree layout
+- *(cargo)* allow uninstalling the locally installed binaries
+
 ## [0.6.0](https://github.com/ilfroloff/snapback/compare/v0.5.0...v0.6.0) - 2026-07-28
 
 ### Added
