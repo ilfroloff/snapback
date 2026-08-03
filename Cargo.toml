@@ -5,7 +5,7 @@ name = "snapback"
 # release-plz.toml), and each release is cut as a `v{version}` git tag + GitHub
 # Release, installed straight from that tagged git ref (see README.md). The first
 # release tags v0.1.0.
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 description = "Browse, search, and resume Claude Code sessions from a ratatui TUI."
 
