@@ -389,12 +389,21 @@ That naming is what makes the coupling discoverable when the other value is retu
 
 ## 9. `#[allow(dead_code)]` is narrow and justified
 
-`snapback` is a **binary** crate, so `pub` does not make an item reachable and
-the `dead_code` lint fires on any public API the `main` runtime path does not
-call — even when it is fully exercised by unit tests. Where that happens, attach
-a **narrowly-scoped** `#[allow(dead_code)]` to the single item with a one-line
-reason. **Never** use a crate- or module-wide blanket allow — the lint must stay
-sharp everywhere else.
+`snapback` is a **library** crate (`src/lib.rs`) plus two thin binary shims that
+call into it. `run()` is the ONLY public API — every other module is declared
+`mod`, not `pub mod` — so `dead_code` is measured against the private module
+tree plus the unit tests, and it fires on any item no runtime path reaches, even
+one fully exercised by those tests. Where that happens, attach a
+**narrowly-scoped** `#[allow(dead_code)]` to the single item with a one-line
+reason. **Never** use a crate- or module-wide blanket allow — the lint must
+stay sharp everywhere else.
+
+That prohibition binds `src/lib.rs` itself: marking a module `pub` from the crate
+root suppresses `dead_code` for everything inside it in one stroke, which is a
+module-wide blanket allow by the back door. A `pub mod` there also turns the
+module's public items into crate API that `cargo-semver-checks` polices, so an
+internal rename starts scoring as a downstream break. Keep the module private and
+take the narrow allow instead.
 
 ## 10. Keys, actions, outcomes
 

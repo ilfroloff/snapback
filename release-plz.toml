@@ -1,6 +1,7 @@
 # release-plz configuration for snapback.
 #
-# snapback is a SINGLE, non-published binary crate. It is installed from source
+# snapback is a SINGLE, non-published package - one library crate plus the two
+# thin binaries (`snapback` and `sb`) built from it. It is installed from source
 # with `cargo install --git <repo> --tag vX.Y.Z`, so the git TAG - not crates.io
 # - is the only source of truth for "what version is released". This file wires
 # release-plz to that reality: derive versions from git tags, cut a `v{version}`
@@ -47,6 +48,22 @@ git_only = true
 # step while leaving the package on the release path. (release-plz forbids
 # `git_only = true` together with `publish = true`, so this must stay false.)
 publish = false
+
+# Never run `cargo-semver-checks`. release-plz runs it against any package that
+# has a LIBRARY target, and snapback has one SOLELY so the `snapback` and `sb`
+# binaries share a single compile of the module tree - not because anything
+# consumes snapback as a library. Nothing downstream can depend on that API: the
+# crate is never published (a git tag plus npm binary tarballs are the whole
+# distribution), `tests/` holds fixtures and no integration tests, and the only
+# external callers of the lib are those two binary shims, which call `run()` and
+# nothing else. A semver verdict here has no consumer to protect. Neither
+# `publish = false` above nor `git_only = true` turns the check off - it is
+# governed by `semver_check` alone, which defaults to on, so it must be set
+# explicitly here. Left on, an internal rename scores as a downstream break and
+# inflates the release: replacing `DELETE_LIVE_REFUSAL` with three finer-grained
+# refusal consts was reported as a removed public item and escalated a fix:-only
+# release from 0.6.1 to 0.7.0.
+semver_check = false
 
 # Cut an annotated git tag for every release. This is the release-plz default
 # (true), pinned here because the tag IS the release for a crate installed
