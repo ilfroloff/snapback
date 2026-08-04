@@ -9,14 +9,16 @@
 //!
 //! The two readings answer different questions and MUST NOT be conflated:
 //!
-//! * **[`reported_agents`] — `--json --all` — the BOARD's signal.** Polled ~1s
-//!   off-thread; drives badges, colors, the pulse and the preview banner via
-//!   [`classify`]. The bare command lists currently-active agents AND recently
-//!   finished ones (claude keeps a `done` background job in the active list for a
-//!   while before reaping it), so a just-wrapped-up session is briefly observable
-//!   without `--all`. What `--all` adds is the FULL history — every `done` agent,
-//!   including those already reaped from the active list — so a finished session
-//!   keeps its badge instead of vanishing the moment claude drops it.
+//! * **[`reported_agents`] — `--json --all` — the BOARD's signal.** Polled ~5s
+//!   off-thread while the board is active (skipped entirely once it has been
+//!   idle past `AGENTS_IDLE_AFTER`); drives badges, colors, the pulse and the
+//!   preview banner via [`classify`]. The bare command lists currently-active
+//!   agents AND recently finished ones (claude keeps a `done` background job in
+//!   the active list for a while before reaping it), so a just-wrapped-up
+//!   session is briefly observable without `--all`. What `--all` adds is the
+//!   FULL history — every `done` agent, including those already reaped from
+//!   the active list — so a finished session keeps its badge instead of
+//!   vanishing the moment claude drops it.
 //! * **[`live_agents`] — `--json`, NO `--all` — the HAND-OFF's signal.** A
 //!   one-shot probe at hand-off; MEMBERSHIP in what it returns is liveness,
 //!   structurally, because the bare command IS claude's active list. It returns
@@ -32,8 +34,9 @@
 //! session, and a session can go live between two polls — and **claude is the
 //! only authority** on its own refusal. So the resume gate probes claude's active
 //! list AT HAND-OFF rather than inferring liveness from a polled snapshot that is
-//! up to ~1.3s stale. Inferring `state != "done"` ⇒ live agrees in steady state
-//! but is a GUESS about claude's gate; membership in the bare list is not.
+//! up to ~5.3s stale while active, and unboundedly stale while idle past
+//! `AGENTS_IDLE_AFTER`. Inferring `state != "done"` ⇒ live agrees in steady
+//! state but is a GUESS about claude's gate; membership in the bare list is not.
 //!
 //! Both readings parse FAIL-SOFT: a missing binary, a non-zero exit, non-JSON
 //! output, or schema drift all collapse to an EMPTY set — never a panic — so the
@@ -190,8 +193,9 @@ pub struct ReportedAgent {
     ///
     /// **Read from [`live_agents`]' records ONLY — never from
     /// [`reported_agents`]'.** Both readings parse into this same struct, so the
-    /// field exists on both; but an `id` off the `--all` map is a ~1.3s-stale
-    /// snapshot of a job that may have ended, and spawning `claude attach` with it
+    /// field exists on both; but an `id` off the `--all` map is a ~5.3s-stale
+    /// (unboundedly stale while idle past `AGENTS_IDLE_AFTER`) snapshot of a
+    /// job that may have ended, and spawning `claude attach` with it
     /// is an authoritative decision made from stale data — the same bug shape as
     /// gating liveness on that map. The attach target comes from the probe that
     /// also confirmed the agent is live, in one read.
@@ -607,7 +611,8 @@ fn run_agents(argv: &[String]) -> HashMap<String, ReportedAgent> {
 /// permitted. Ask [`live_agents`] for that.
 ///
 /// MUST be called off the UI thread — it spawns a child process (see
-/// [`crate::watch::EventLoop::spawn_agents_poller`], which polls it ~1s).
+/// [`crate::watch::EventLoop::spawn_agents_poller`], which polls it ~5s while
+/// active and skips the poll entirely once idle past `AGENTS_IDLE_AFTER`).
 #[must_use]
 pub fn reported_agents() -> HashMap<String, ReportedAgent> {
     run_agents(&agents_argv())
@@ -631,13 +636,15 @@ pub fn reported_agents() -> HashMap<String, ReportedAgent> {
 /// It returns the RECORDS rather than bare ids precisely so the questions past
 /// membership have an authoritative answer. The parse has the `id` in hand either
 /// way; discarding it would force the attach path back onto [`reported_agents`]'
-/// map — an authoritative decision made from a ~1.3s-stale snapshot, which is the
-/// exact class of bug that moving the liveness gate here fixed. One shell-out,
-/// one parse, every answer, no second notion of "which agent is this".
+/// map — an authoritative decision made from a ~5.3s-stale (unboundedly stale
+/// while idle past `AGENTS_IDLE_AFTER`) snapshot, which is the exact class of
+/// bug that moving the liveness gate here fixed. One shell-out, one parse,
+/// every answer, no second notion of "which agent is this".
 ///
 /// [`reported_agents`]' `--all` map cannot answer any of them: it is up to
-/// ~1.3s stale and its `done` qualifier means "the agent reported completion",
-/// not "claude will permit `-r`".
+/// ~5.3s stale while the board is active, and unboundedly stale once idle
+/// past `AGENTS_IDLE_AFTER`, and its `done` qualifier means "the agent
+/// reported completion", not "claude will permit `-r`".
 ///
 /// **FAIL-SOFT toward "not live", and that direction is deliberate.** Any failure
 /// (missing binary, non-zero exit, bad JSON, schema drift) yields an EMPTY map ⇒

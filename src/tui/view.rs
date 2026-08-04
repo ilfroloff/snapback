@@ -712,9 +712,11 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                     //
                     // Note what is NOT claimed here: the sketch's "plain-resumable"
                     // would be an assertion about claude's gate, and the badge
-                    // beside it comes from the ~1s poll. Liveness is unaskable in
-                    // a render (see `preview_split`) and a polled snapshot is not
-                    // authority for it, so the row REPORTS what claude said and
+                    // beside it comes from the ~5s poll (skipped entirely, and
+                    // thus stale indefinitely, while the board is idle past
+                    // AGENTS_IDLE_AFTER). Liveness is unaskable in a render (see
+                    // `preview_split`) and a polled snapshot is not authority
+                    // for it, so the row REPORTS what claude said and
                     // leaves the verdict to the hand-off probe.
                     spans.push(Span::raw(short_id(&session.session_id)));
 
@@ -1076,7 +1078,7 @@ fn spinner_frame(tick: u64) -> &'static str {
 /// INLINE in the transcript flow (see [`preview::pending_reply_turns`]).
 ///
 /// The placeholder says one true thing only: it is claude's pending turn. The old
-/// two-phase "sending… / cooking…" wording derived from a ≤1s-stale agents poll,
+/// two-phase "sending… / cooking…" wording derived from a ≤5s-stale agents poll,
 /// nothing branched on the distinction, and "sending" named what snapback did, not
 /// what claude was doing — so it collapsed to a single `cooking…` label.
 ///
@@ -1097,7 +1099,7 @@ fn sending_tail(app: &App, inner_width: u16) -> Option<Vec<Line<'static>>> {
         .is_some_and(|s| s.msg_count > sending.baseline_msg_count);
     let echo = (!landed).then_some(sending.message.as_str());
     // One label only: a `● claude` turn must describe what claude is doing. The
-    // old two-phase wording derived from a ≤1s-stale agents poll, nothing branched
+    // old two-phase wording derived from a ≤5s-stale agents poll, nothing branched
     // on it, and "sending" named what snapback did, not claude.
     let label = format!("{} {REPLY_COOKING_LABEL}", spinner_frame(app.tick));
     Some(preview::pending_reply_turns(

@@ -26,9 +26,12 @@ one place.
 - **AUTHORITATIVE-FROM-FILE.** Read `cwd`/`sessionId` from INSIDE the file,
   never decode the `<encoded-cwd>` folder name (the `/`→`-` encoding is lossy).
   Re-read them at hand-off time. (`src/store/parse.rs`, `src/resume.rs`)
-- **SUBAGENT EXCLUSION BY DEPTH.** Discover only `<root>/<cwd>/<id>.jsonl` at
-  depth 2; NEVER descend into `<id>/subagents/`. Do not make discovery
-  recursive. (`src/store/discover.rs`)
+- **SUBAGENT EXCLUSION BY DEPTH.** The only consumable session shape is
+  `<root>/<cwd>/<id>.jsonl` at depth 2. The shared predicate
+  `store::discover::is_session_path` decides this by name-shape alone and is
+  used by BOTH discovery and the watcher filter; never duplicate the rule.
+  NEVER descend into `<id>/subagents/`. Do not make discovery recursive.
+  (`src/store/discover.rs`, `src/watch.rs`)
 - **THE PARSE CACHE NEVER DECIDES WHICH FILES EXIST — OR WHETHER A FILE IS A
   SESSION IT COULD NOT READ.** `SessionStore` reuses the parse of a file whose
   `(mtime, len)` stamp did not move, so it may leave a row STALE; it must never
@@ -106,12 +109,15 @@ one place.
 - **STABLE-ID STATE.** Track selection by `session_id`, never list index, so it
   survives autorefresh reloads. (`src/tui/app.rs`)
 - **OFF-UI-THREAD blocking work.** RECURRING shell-outs / FS watch / input run on
-  their own threads and deliver `AppEvent`s; the render loop never blocks. TWO
-  bounded one-shots are deliberate, documented exceptions (`PATTERNS.md` §6): the
-  liveness probe at hand-off, and the worktree resolve at construction/reload.
-  Both are argued at the call site, and NEITHER may move onto a keystroke or the
-  render path — a scope toggle reads a cached set, it never resolves.
-  (`src/watch.rs`, `src/worktrees.rs`)
+  their own threads and deliver `AppEvent`s; the render loop never blocks. The
+  watcher filters each debounce batch through `is_session_path` before emitting
+  `SessionsChanged`; the agents poller runs on `AGENTS_REFRESH` (5 s) and skips
+  the shell-out once the board has been idle past `AGENTS_IDLE_AFTER` (60 s).
+  TWO bounded one-shots are deliberate, documented
+  exceptions (`PATTERNS.md` §6): the liveness probe at hand-off, and the
+  worktree resolve at construction/reload. Both are argued at the call site,
+  and NEITHER may move onto a keystroke or the render path — a scope toggle
+  reads a cached set, it never resolves. (`src/watch.rs`, `src/worktrees.rs`)
 - **PURE, GIT-FREE STORE CORE.** `src/store/*` decides everything from the bytes
   it was given: `repo_of`'s worktree collapse is a pure string heuristic, and NO
   module under `src/store/` may shell out (to `git` or anything else) or read

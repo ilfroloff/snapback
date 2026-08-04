@@ -333,6 +333,17 @@ whole store root, so before this every write by every `claude` process anywhere
 — including the background agents `Ctrl-N` starts — re-parsed the entire store
 up to 5×/second.
 
+A second, complementary filter sits in front of this pipeline: the watcher
+itself (`watch::SessionWatcher::spawn`) classifies every path in a debounce
+batch with the same depth-2 `.jsonl` predicate discovery uses
+(`store::discover::is_session_path`, via `watch::classify_watch_path`) and only
+calls into `reload` when at least one path could plausibly be a session
+(`watch::batch_needs_reload`). A write to an irrelevant file elsewhere under the
+store root — a subagent transcript, a stray non-`.jsonl` file — never reaches
+this cache at all, rather than reaching it and reusing every stamp. An
+unclassifiable path always falls through to reload, so this filter can only
+skip work, never miss a real change.
+
 Five rules hold it up, and none is negotiable:
 
 - **DISCOVERY IS NEVER CACHED.** It runs in full on every reload, and the new
@@ -528,9 +539,10 @@ probe's question, asked at hand-off (see [Why the gate does not read the `--all`
 map](#why-the-gate-does-not-read-the---all-map)).
 
 Folding is **content-derived and never liveness-gated**. That is deliberate and
-easy to "improve" wrongly: the agents poll fires about once a second, so folding
-on whether a twin is live would restructure the list once per second, with rows
-appearing and vanishing under the cursor.
+easy to "improve" wrongly: the agents poll fires every `watch::AGENTS_REFRESH`
+(5s while the board is active), so folding on whether a twin is live would
+restructure the list on every poll, with rows appearing and vanishing under the
+cursor.
 
 `--print-list` prints **every** session, unfolded — it is a discovery/parse dump,
 and folding it would hide exactly what it exists to verify.
@@ -598,7 +610,7 @@ machine-readable window onto that, and `snapback` reads it **twice, differently*
 
 | Reading | Command | Asked | Question |
 | --- | --- | --- | --- |
-| **Board signal** (`reported_agents`) | `--json --all` | polled ~1s off-thread | "what should each row's badge say?" |
+| **Board signal** (`reported_agents`) | `--json --all` | polled off-thread every `watch::AGENTS_REFRESH` (5s), skipped once the board has been idle past `watch::AGENTS_IDLE_AFTER` (60s) | "what should each row's badge say?" |
 | **Hand-off signal** (`live_agents`) | `--json` (**no `--all`**) | one-shot at EVERY hand-off | "will `claude -r` refuse *right now*?" **and** "what job id does `claude attach`/`claude stop` take?" |
 
 The hand-off reading serves FOUR gates, not just Enter: resume, Attach, the
@@ -638,9 +650,12 @@ rather than inferring from a polled snapshot.
 That finding was paid for: the gate used to read the polled map and infer
 `state != "done"` ⇒ live. It agrees in steady state (active = 37, `--all`-not-done
 = 37, exactly), but it is a **guess about claude's gate**, and the snapshot is up
-to **~1.3s stale** (a ~0.26s poll then a 1s sleep). Claude re-evaluates liveness
-at *spawn* time, so when the two disagreed the user pressed Enter on a
-`● bg done` row and got claude's refusal instead of a resume — a TOCTOU race.
+to **~5.3s stale** (a ~0.3s poll then a 5s sleep) while the board is active, and
+unboundedly stale while the board has been idle past `AGENTS_IDLE_AFTER` (60s),
+since the poll is skipped entirely until the next activity event. Claude
+re-evaluates liveness at *spawn* time, so when the two disagreed the user
+pressed Enter on a `● bg done` row and got claude's refusal instead of a
+resume — a TOCTOU race.
 
 The bare command needs no inference because **it IS claude's active list**:
 membership is liveness, structurally. So the two readings are kept apart on
@@ -672,7 +687,7 @@ badges and the banner draw from it precisely because a render must never shell
 out. The Attach **job id** was once read from it too — that was the same
 stale-snapshot bug as gating liveness on it, one layer down, and worse: the
 overlay can sit open indefinitely, so the staleness window is unbounded rather
-than ~1.3s. It now comes from the `live_agents` probe taken at the hand-off.
+than ~5.3s. It now comes from the `live_agents` probe taken at the hand-off.
 
 #### Activity buckets (`AgentActivity`)
 

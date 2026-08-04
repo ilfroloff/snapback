@@ -1010,7 +1010,8 @@ pub struct App {
     /// gate (ask [`is_live_now`](Self::is_live_now)) and not the Attach job `id`
     /// either (ask [`live_agent_now`](Self::live_agent_now)). Both once read this
     /// map; both now re-ask claude at the moment they act, because a hand-off
-    /// decided from a ~1.3s-stale snapshot is the bug shape this seam exists to
+    /// decided from a ~5.3s-stale (unboundedly stale while idle past
+    /// `AGENTS_IDLE_AFTER`) snapshot is the bug shape this seam exists to
     /// prevent. It renders badges and the banner, nothing more.
     pub reported_agents: HashMap<String, ReportedAgent>,
     /// How [`live_agent_now`](Self::live_agent_now) and
@@ -1768,7 +1769,8 @@ impl App {
     /// resolved against different snapshots.
     ///
     /// Deliberately NOT a read of [`reported_agents`](Self::reported_agents):
-    /// that map is a ~1.3s-stale `--all` snapshot whose `done` qualifier means
+    /// that map is a ~5.3s-stale (unboundedly stale while idle past
+    /// `AGENTS_IDLE_AFTER`) `--all` snapshot whose `done` qualifier means
     /// "the agent reported completion", not "claude will permit `-r`". The two
     /// can disagree transiently, and claude is the only authority on its own
     /// refusal.
