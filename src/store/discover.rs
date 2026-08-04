@@ -6,7 +6,7 @@
 //! subagent transcripts (~62% of files) masquerade as sessions and must be
 //! excluded (see the Risks table). Returns candidate file paths.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Resolve the store root: `$CLAUDE_PROJECTS_DIR` if set and non-empty, else
 /// `~/.claude/projects`.
@@ -21,6 +21,31 @@ pub fn store_root() -> PathBuf {
     }
     // Last resort if the home directory cannot be resolved.
     PathBuf::from(".claude").join("projects")
+}
+
+/// Pure name-shape predicate: does `path` look like a consumable session file
+/// relative to `root`?
+///
+/// True iff `path` is exactly two components below `root` and its final
+/// component ends in `.jsonl`. This is intentionally a shape-only check: it
+/// does NOT inspect metadata, so it can classify a path even after the file
+/// has been removed. That matters for the watcher, which must decide whether a
+/// deletion event is worth a reload.
+///
+/// This is the same rule `discover` uses; extracting it keeps the watcher and
+/// discovery from drifting apart.
+pub fn is_session_path(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let mut components = relative.components();
+    let (Some(Component::Normal(_)), Some(Component::Normal(file)), None) =
+        (components.next(), components.next(), components.next())
+    else {
+        return false;
+    };
+    file.to_str()
+        .is_some_and(|name| name.rsplit_once('.').is_some_and(|(_, ext)| ext == "jsonl"))
 }
 
 /// Enumerate resumable session files: `<root>/<encoded-cwd>/<session-id>.jsonl`.
@@ -60,11 +85,59 @@ pub fn discover(root: &Path) -> Vec<PathBuf> {
             // `<session-id>/` directories here is what excludes subagents.
             let is_file = file.file_type().map(|t| t.is_file()).unwrap_or(false);
             let path = file.path();
-            if is_file && path.extension().is_some_and(|e| e == "jsonl") {
+            if is_file && is_session_path(root, &path) {
                 out.push(path);
             }
         }
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_session_path_depth_two_jsonl() {
+        let root = Path::new("/store");
+        assert!(is_session_path(root, &root.join("cwd").join("sess.jsonl")));
+    }
+
+    #[test]
+    fn is_session_path_depth_one_false() {
+        let root = Path::new("/store");
+        assert!(!is_session_path(root, &root.join("sess.jsonl")));
+    }
+
+    #[test]
+    fn is_session_path_depth_three_subagent_false() {
+        let root = Path::new("/store");
+        assert!(!is_session_path(
+            root,
+            &root
+                .join("cwd")
+                .join("sess")
+                .join("subagents")
+                .join("agent-1.jsonl")
+        ));
+    }
+
+    #[test]
+    fn is_session_path_depth_two_txt_false() {
+        let root = Path::new("/store");
+        assert!(!is_session_path(root, &root.join("cwd").join("notes.txt")));
+    }
+
+    #[test]
+    fn is_session_path_depth_two_json_false() {
+        let root = Path::new("/store");
+        assert!(!is_session_path(root, &root.join("cwd").join("data.json")));
+    }
+
+    #[test]
+    fn is_session_path_outside_root_false() {
+        let root = Path::new("/store");
+        assert!(!is_session_path(root, Path::new("/other/cwd/sess.jsonl")));
+    }
 }

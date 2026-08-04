@@ -249,11 +249,13 @@ on one offers **Attach** (reconnect to a running background agent), **Fork**, or
 normally; its badge tells you it's done without getting in the way.
 
 Which of those you get is decided by asking Claude Code at the moment you press
-`Enter`, not by the badge you're looking at. Badges refresh about once a second,
-and a session can start or finish in between — so if one is secretly still
-running, you get the Attach/Fork choice rather than an error. And if a resume
-does fail because the session came back to life underneath you, the board says so
-and offers the same choice instead of leaving you to guess.
+`Enter`, not by the badge you're looking at. Badges refresh every few seconds
+while you're active (and pause briefly once the board's been idle for a while,
+picking back up as soon as you touch it again), and a session can start or
+finish in between — so if one is secretly still running, you get the
+Attach/Fork choice rather than an error. And if a resume does fail because the
+session came back to life underneath you, the board says so and offers the
+same choice instead of leaving you to guess.
 
 **No more look-alike duplicates.** Every time you hand a prompt to a background
 agent, Claude Code quietly copies the session into a new file and carries on

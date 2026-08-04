@@ -415,8 +415,8 @@ and each collapsed segment to its marker line.
 ## 8. Name every constant
 
 No magic numbers. Tunables are named `const`s with a rationale comment near the
-top of their module: `DEBOUNCE` / `TICK` / `AGENTS_REFRESH` (`watch`),
-`LABEL_MAX` (`label`), `CONTENT_INDEX_CAP` (`parse`), `PREVIEW_LINES` /
+top of their module: `DEBOUNCE` / `TICK` / `AGENTS_REFRESH` / `AGENTS_IDLE_AFTER`
+(`watch`), `LABEL_MAX` (`label`), `CONTENT_INDEX_CAP` (`parse`), `PREVIEW_LINES` /
 `TABLE_MAX_WIDTH` (`preview`), `PREVIEW_WHEEL_STEP` / `LIST_WHEEL_STEP` (`app`),
 `PASTE_MAX_CHARS` (`tui::update`), `BLINK_TICKS` (`view`). Add new tunables the
 same way.

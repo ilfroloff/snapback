@@ -413,9 +413,11 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
             success,
         } => {
             // A one-shot interrupt (`claude stop`) completed off-thread; surface its
-            // result. The live badge clears on the next agents poll (~1s), and the
-            // transcript is unchanged (stopping keeps the conversation), so there is
-            // nothing else to reconcile. Successes are transient; failures sticky.
+            // result. The live badge clears on the next agents poll (~5s while the
+            // board is active; skipped, and thus unbounded, while idle past
+            // AGENTS_IDLE_AFTER), and the transcript is unchanged (stopping keeps
+            // the conversation), so there is nothing else to reconcile. Successes
+            // are transient; failures sticky.
             //
             // Clear the in-flight guard only when the ids match, so a stale result
             // cannot land on a surface that has moved on — the interrupt twin of the
@@ -833,16 +835,18 @@ fn apply_action(app: &mut App, action: Action) -> Outcome {
             // choice instead. Ctrl-F fork stays a direct hand-off for ANY session.
             //
             // The gate asks CLAUDE, one-shot, right here — it must NOT read the
-            // polled `--all` map. That map is up to ~1.3s stale (a ~0.26s poll
-            // then a 1s sleep) and its `done` qualifier means "the agent reported
-            // completion", NOT "claude will permit `-r`". Deciding from it is a
-            // TOCTOU race we lose: claude re-evaluates liveness at spawn time and
-            // refuses, and the user hit exactly that on a `● bg done` row. Probing
-            // here shrinks the window to ~0.26s and, more importantly, replaces an
-            // inference about claude's gate with claude's own answer.
+            // polled `--all` map. That map is up to ~5.26s stale while the board
+            // is active (a ~0.26s shell-out then a 5s sleep), and unboundedly
+            // stale while idle past AGENTS_IDLE_AFTER, and its `done` qualifier
+            // means "the agent reported completion", NOT "claude will permit `-r`".
+            // Deciding from it is a TOCTOU race we lose: claude re-evaluates
+            // liveness at spawn time and refuses, and the user hit exactly that
+            // on a `● bg done` row. Probing here shrinks the window to ~0.26s and,
+            // more importantly, replaces an inference about claude's gate with
+            // claude's own answer.
             //
             // On AGENTS.md's "OFF-UI-THREAD blocking work": that rule exists so the
-            // 1s POLL never blocks rendering, and the poll is untouched — still one
+            // 5s POLL never blocks rendering, and the poll is untouched — still one
             // call per cycle, still on its own thread. This is a ONE-SHOT at
             // hand-off, directly analogous to `resume`'s authoritative re-read of
             // `cwd`/`sessionId` at the same moment. Be precise about the cost,
@@ -1219,7 +1223,8 @@ fn confirm_modal(app: &mut App, store: &mut SessionStore) -> Outcome {
 /// there is no teardown to hide behind: the board REDRAWS after a delete, so the
 /// ~0.26s lands as a visible hitch between Enter and the refreshed list on EVERY
 /// branch here. That is deliberate — an irreversible unlink must be decided on
-/// claude's current answer, not on a snapshot up to ~1.3s old.
+/// claude's current answer, not on a snapshot up to ~5.3s old (unboundedly old
+/// while idle past `AGENTS_IDLE_AFTER`).
 ///
 /// Each member is guarded INDIVIDUALLY and the pass is partial by design: a
 /// refused member is skipped and the rest still go, because all-or-nothing would
@@ -1286,12 +1291,13 @@ fn confirm_delete(app: &mut App, ids: &[String], store: &mut SessionStore) -> Ou
 /// **Attach re-asks claude here, at the hand-off.** Its target is the agent-view
 /// job `id` (the SHORT id from `claude agents --json`) taken from
 /// [`App::live_agent_now`]'s fresh record — NEVER from the polled `--all` map.
-/// That map is the same ~1.3s-stale snapshot the resume gate was moved off, and
-/// reading an attach id from it is the identical bug one layer down: an
-/// authoritative decision made from stale data. Here it is worse than at the
-/// gate, because the overlay can sit open INDEFINITELY while the user decides —
-/// even the probe that opened it is stale by the time Attach is chosen, so the
-/// window is unbounded rather than ~1.3s. The rule is uniform: every hand-off
+/// That map is the same ~5.3s-stale (unboundedly stale while idle past
+/// `AGENTS_IDLE_AFTER`) snapshot the resume gate was moved off, and reading an
+/// attach id from it is the identical bug one layer down: an authoritative
+/// decision made from stale data. Here it is worse than at the gate, because
+/// the overlay can sit open INDEFINITELY while the user decides — even the
+/// probe that opened it is stale by the time Attach is chosen, so the window
+/// is unbounded rather than ~5.3s. The rule is uniform: every hand-off
 /// re-asks, nothing hands off on polled data.
 ///
 /// Three answers, kept distinct because they have distinct causes:
@@ -3457,7 +3463,8 @@ mod tests {
 
     /// **THE TOCTOU case — the bug this whole seam exists for.**
     ///
-    /// The `--all` poll badged this session `done` (up to ~1.3s ago), but claude's
+    /// The `--all` poll badged this session `done` (up to ~5.3s ago, or longer if
+    /// the board has since been idle past `AGENTS_IDLE_AFTER`), but claude's
     /// active list reports it LIVE right now. The two disagree, which is exactly
     /// what the old gate could not represent: it inferred `state != "done"` ⇒
     /// live, so it plain-resumed, and `claude -r` refused with "Session … is
@@ -3641,7 +3648,7 @@ mod tests {
             ready.argv.join(" "),
             "claude attach fresh-job",
             "the attach target must be the job id claude reported AT THE HAND-OFF; \
-             `stale-job` here means it was read back off the ~1.3s-stale `--all` map"
+             `stale-job` here means it was read back off the ~5.3s-stale `--all` map"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
