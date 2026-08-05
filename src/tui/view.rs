@@ -103,6 +103,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
 }
 
+/// What sits between two header segments: a middot with breathing room either
+/// side. Declared once so every segment — including the counter's optional
+/// `· N hidden` tail — is joined by the SAME string, rather than by a literal
+/// copied per call site that can drift a space.
+const HEADER_SEPARATOR: &str = "  ·  ";
+
 /// Prefix for a release build's version indicator (`v0.1.0`); the leading `v`
 /// is the conventional marker readers expect before a semver string.
 const RELEASE_VERSION_PREFIX: &str = "v";
@@ -415,6 +421,27 @@ fn project_name(app: &App) -> String {
 
 /// The top status line: title, active scope, search mode, and counts on the
 /// left, with the crate version indicator right-aligned on the same row.
+///
+/// BOTH sides of the counter come from [`App::session_counts`], and both count
+/// LINEAGES — the renderer does no counting arithmetic of its own. Pairing a
+/// local `app.filtered.len()` with that call's denominator is what once printed
+/// `115 / 146`: a post-fold row count over a session-FILE count, two units on
+/// one line. See [`crate::tui::app::SessionCounts`] for the invariants.
+///
+/// The denominator is NOT the store's size: it measures the launch PROJECT (the
+/// whole store only under [`Scope::All`]), so a folder-scoped board reads
+/// `5 / 30` — the lineages it draws over the ones a `Ctrl-A` widen would reach —
+/// instead of advertising every session on the machine. Fully soft-hidden
+/// lineages leave that denominator for a trailing `· N hidden` segment, drawn
+/// only when N is non-zero; with show-hidden on they are back on the board and
+/// back inside the denominator, so the segment goes away rather than counting
+/// visible rows twice.
+///
+/// The segment is LAST for a width reason as well as a reading one: the version
+/// label is right-aligned over this same `area`, so a narrow terminal loses the
+/// rightmost text of this line first. No new width logic guards that — the row
+/// has always been two overlaid paragraphs — but the order means the first thing
+/// to go is the least load-bearing one, not the counter or the scope.
 fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     let scope = match app.scope {
         Scope::CurrentFolder => format!("folder:{}", launch_dir_name(app)),
@@ -425,8 +452,10 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         SearchMode::NameOnly => "name",
         SearchMode::NameAndContent => "name+content",
     };
+    let counts = app.session_counts();
+    let dim = Style::default().add_modifier(Modifier::DIM);
 
-    let header = Line::from(vec![
+    let mut header = vec![
         Span::styled(
             " snapback ",
             Style::default()
@@ -436,15 +465,20 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         ),
         Span::raw("  "),
         Span::styled(scope, Style::default().fg(Color::Green)),
-        Span::raw("  ·  search: "),
+        Span::raw(HEADER_SEPARATOR),
+        Span::raw("search: "),
         Span::styled(mode, Style::default().fg(Color::Yellow)),
-        Span::raw("  ·  "),
+        Span::raw(HEADER_SEPARATOR),
         Span::styled(
-            format!("{} / {} sessions", app.filtered.len(), app.sessions.len()),
-            Style::default().add_modifier(Modifier::DIM),
+            format!("{} / {} sessions", counts.visible, counts.total),
+            dim,
         ),
-    ]);
-    frame.render_widget(Paragraph::new(header), area);
+    ];
+    if counts.hidden > 0 {
+        header.push(Span::raw(HEADER_SEPARATOR));
+        header.push(Span::styled(format!("{} hidden", counts.hidden), dim));
+    }
+    frame.render_widget(Paragraph::new(Line::from(header)), area);
 
     let version = Line::from(Span::styled(
         version_label(),
@@ -2661,6 +2695,371 @@ mod tests {
             "the folder scope still widens to the project either way — the flag \
              takes away the third stop, not the first"
         );
+    }
+
+    // --- header counter: lineages on both sides, and the hidden segment -----
+
+    /// The launch dir every counter case below starts in. A plain checkout, so
+    /// `worktrees::project_root` resolves it to itself and the worktree paths
+    /// underneath it collapse onto the same root — the git-free arm of
+    /// `App::in_scope`, which is the only one available under test (the test
+    /// worktree probe resolves nothing).
+    const COUNTER_LAUNCH: &str = "/tmp/sbcount-proj";
+
+    /// A `Session` at `cwd` for the counter cases. Only the id and the `cwd`
+    /// decide what the counter does, so everything else is inert — except
+    /// `root_uuid`, which the fold case needs and which every other case must
+    /// leave at `None` so its rows stay unfolded.
+    fn counted_session(id: &str, cwd: &str, root_uuid: Option<&str>) -> Session {
+        Session {
+            file: PathBuf::from(format!("/tmp/{id}.jsonl")),
+            session_id: id.to_string(),
+            cwd: PathBuf::from(cwd),
+            git_branch: Some("main".to_string()),
+            timestamp: None,
+            repo: "sbcount-proj".to_string(),
+            label: id.to_string(),
+            root_uuid: root_uuid.map(ToString::to_string),
+            msg_count: 0,
+            content_index: String::new(),
+        }
+    }
+
+    /// A store whose four sessions separate the three populations the counter
+    /// could plausibly measure: ONE in the launch folder, TWO more in worktrees
+    /// of the same project, and one in an unrelated project. So `1` is the
+    /// folder's own count, `3` the project's, and `4` the store's — three
+    /// distinct numbers, which is what makes a wrong denominator visible.
+    ///
+    /// The ids carry a `sbcount-` prefix because `App::new` loads the REAL
+    /// hidden set from `$SNAPBACK_CONFIG_DIR` unless a case overrides it, and a
+    /// collision there would silently move the counts.
+    fn counter_store() -> Vec<Session> {
+        vec![
+            counted_session("sbcount-here", COUNTER_LAUNCH, None),
+            counted_session(
+                "sbcount-wt1",
+                "/tmp/sbcount-proj/.agents/worktrees/feat",
+                None,
+            ),
+            counted_session(
+                "sbcount-wt2",
+                "/tmp/sbcount-proj/.agents/worktrees/fix",
+                None,
+            ),
+            counted_session("sbcount-away", "/tmp/sbcount-other", None),
+        ]
+    }
+
+    /// A board over [`counter_store`] in `scope`.
+    fn counter_board(scope: Scope) -> App {
+        App::new(counter_store(), scope, PathBuf::from(COUNTER_LAUNCH))
+    }
+
+    /// `--all` is the one scope that is not about a project, so its denominator
+    /// stays the whole store — the counter exactly as it read before the project
+    /// population existed.
+    #[test]
+    fn the_all_scope_counter_still_measures_the_whole_store() {
+        let app = counter_board(Scope::All);
+
+        let header = drawn_header(&app);
+        assert!(
+            header.contains("4 / 4 sessions"),
+            "the all scope counts every session in the store: {header}"
+        );
+        assert!(
+            !header.contains("hidden"),
+            "nothing is hidden, so no segment is drawn at all: {header}"
+        );
+    }
+
+    /// The default scope's denominator is deliberately WIDER than its own rows:
+    /// it counts the PROJECT, so the header says how much a `Ctrl-A` widen would
+    /// reveal instead of advertising every session on the machine (the old
+    /// `sessions.len()` denominator) or restating the row count.
+    #[test]
+    fn the_folder_scope_counter_measures_the_whole_project() {
+        let app = counter_board(Scope::CurrentFolder);
+
+        let header = drawn_header(&app);
+        assert!(
+            header.contains("1 / 3 sessions"),
+            "one row drawn, three in the project: {header}"
+        );
+        assert!(
+            !header.contains("1 / 1 sessions"),
+            "the folder's own count would make the denominator say nothing: \
+             {header}"
+        );
+        assert!(
+            !header.contains("1 / 4 sessions"),
+            "and the store total counts a session from another project: {header}"
+        );
+        assert!(
+            !header.contains("hidden"),
+            "nothing is hidden here, so the segment is absent entirely — a \
+             `· 0 hidden` would sit on every board that never hid a row: {header}"
+        );
+    }
+
+    /// Widening to the project must not move the denominator — it is the same
+    /// population either way, which is the whole point of counting it in the
+    /// narrow scope. Only the NUMERATOR catches up.
+    #[test]
+    fn the_project_scope_counter_measures_the_same_population_as_the_folder_scope() {
+        let folder = counter_board(Scope::CurrentFolder);
+        let project = counter_board(Scope::Project);
+
+        assert_eq!(
+            folder.session_counts().total,
+            project.session_counts().total,
+            "one project, one denominator, whichever side of Ctrl-A you are on"
+        );
+        assert_eq!(
+            folder.session_counts().hidden,
+            project.session_counts().hidden,
+            "and one hidden segment with it"
+        );
+        assert!(
+            drawn_header(&project).contains("3 / 3 sessions"),
+            "and the widened board draws every session it was counting"
+        );
+    }
+
+    /// A soft-hidden session leaves the denominator (the board cannot show it)
+    /// and is accounted for in its own trailing segment, so the two numbers
+    /// still add up to the project's real size — in lineages, which for this
+    /// rootless fixture is one per file.
+    #[test]
+    fn a_hidden_session_leaves_the_denominator_for_its_own_segment() {
+        let mut app = counter_board(Scope::CurrentFolder);
+        app.hidden_ids.insert("sbcount-wt1".to_string());
+        // A reload is the public path that re-runs the whole pipeline; the
+        // counts must survive it without a scope toggle (see the caching case
+        // below).
+        app.apply_sessions(counter_store());
+
+        let header = drawn_header(&app);
+        assert!(
+            header.contains("1 / 2 sessions"),
+            "the hidden project session is out of the denominator: {header}"
+        );
+        assert!(
+            header.contains("1 hidden"),
+            "and it is disclosed instead of vanishing: {header}"
+        );
+        let counts = app.session_counts();
+        assert_eq!(
+            counts.total + counts.hidden,
+            3,
+            "the two numbers must reconcile to the project's lineages"
+        );
+    }
+
+    /// With show-hidden on the rows are back on the board, so they belong INSIDE
+    /// the denominator — and the segment must go away, or the header counts the
+    /// same visible rows twice.
+    #[test]
+    fn revealing_hidden_rows_folds_them_back_into_the_denominator() {
+        let mut app = counter_board(Scope::CurrentFolder);
+        app.hidden_ids.insert("sbcount-wt1".to_string());
+        app.apply_sessions(counter_store());
+        app.toggle_show_hidden();
+
+        let header = drawn_header(&app);
+        assert!(
+            header.contains("1 / 3 sessions"),
+            "a revealed session is counted like any other: {header}"
+        );
+        assert!(
+            !header.contains("hidden"),
+            "so disclosing it separately would double-count it: {header}"
+        );
+    }
+
+    /// A fork lineage is ONE conversation on BOTH sides of the `/`. Its members
+    /// are one row on screen — the head, wearing the `(+N)` that advertises the
+    /// rest — so counting the files behind that row into the denominator is what
+    /// printed `115 / 146` on a board of 115 rows.
+    #[test]
+    fn a_folded_fork_lineage_counts_once_on_both_sides() {
+        let store = vec![
+            counted_session("sbcount-fork-a", COUNTER_LAUNCH, Some("root-1")),
+            counted_session("sbcount-fork-b", COUNTER_LAUNCH, Some("root-1")),
+        ];
+        let app = App::new(store, Scope::Project, PathBuf::from(COUNTER_LAUNCH));
+
+        assert_eq!(
+            app.filtered.len(),
+            1,
+            "premise: the lineage folds to a single head"
+        );
+        assert!(
+            app.query.is_empty(),
+            "premise: nothing is filtered by a query"
+        );
+        let header = drawn_header(&app);
+        assert!(
+            header.contains("1 / 1 sessions"),
+            "one conversation, drawn and counted: {header}"
+        );
+        assert!(
+            !header.contains("1 / 2 sessions"),
+            "the two FILES behind that row are not two rows the board could show: \
+             {header}"
+        );
+    }
+
+    /// Opening a `(+N)` family re-emits its members into `filtered`, and the
+    /// counter must not notice. Beyond the arithmetic this is a stability
+    /// property: `restore_selection` -> `reveal_hidden` auto-expands on
+    /// autorefresh, so a fold-sensitive header would move on its own whenever a
+    /// background job appended to a transcript.
+    #[test]
+    fn expanding_a_lineage_leaves_the_header_untouched() {
+        let store = vec![
+            counted_session("sbcount-fork-a", COUNTER_LAUNCH, Some("root-1")),
+            counted_session("sbcount-fork-b", COUNTER_LAUNCH, Some("root-1")),
+            counted_session("sbcount-lone", COUNTER_LAUNCH, None),
+        ];
+        let mut app = App::new(store, Scope::Project, PathBuf::from(COUNTER_LAUNCH));
+        let folded = drawn_header(&app);
+        assert!(
+            folded.contains("2 / 2 sessions"),
+            "premise: two conversations, both drawn: {folded}"
+        );
+
+        assert_eq!(
+            app.selected.as_deref(),
+            Some("sbcount-fork-a"),
+            "premise: the fold's head is the row the expand acts on"
+        );
+        app.expand_selected();
+
+        assert_eq!(
+            app.filtered.len(),
+            3,
+            "premise: the expand really did add a row"
+        );
+        assert_eq!(
+            drawn_header(&app),
+            folded,
+            "an expanded lineage is still one conversation"
+        );
+    }
+
+    /// The hidden segment counts CONVERSATIONS too, and only fully hidden ones: a
+    /// lineage with one member hidden and another still drawing is a visible row,
+    /// so it belongs in the denominator and discloses nothing.
+    #[test]
+    fn a_partially_hidden_lineage_is_counted_as_a_visible_one() {
+        let store = || {
+            vec![
+                counted_session("sbcount-fork-a", COUNTER_LAUNCH, Some("root-1")),
+                counted_session("sbcount-fork-b", COUNTER_LAUNCH, Some("root-1")),
+            ]
+        };
+        let mut app = App::new(store(), Scope::Project, PathBuf::from(COUNTER_LAUNCH));
+        app.hidden_ids.insert("sbcount-fork-b".to_string());
+        app.apply_sessions(store());
+
+        let header = drawn_header(&app);
+        assert!(
+            header.contains("1 / 1 sessions"),
+            "the half-hidden conversation is still a row on the board: {header}"
+        );
+        assert!(
+            !header.contains("hidden"),
+            "and nothing about it is hidden from the user: {header}"
+        );
+    }
+
+    /// The caching guard. The population is resolved ONCE per reload/scope
+    /// toggle because deciding it canonicalizes every `cwd`; the hidden split is
+    /// not cached with it. So a hide, a reveal, an un-hide and a reload must each
+    /// leave the counter truthful with NO scope toggle anywhere in between —
+    /// none of these paths runs `recompute_scope` except the reload at the end.
+    #[test]
+    fn the_counts_survive_hiding_revealing_and_reloading_without_a_scope_toggle() {
+        let _guard = crate::config::env_lock();
+        let dir = unique_temp_dir("header-counts");
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &dir);
+
+        // Two rows in the launch folder, so hiding one leaves a selection to
+        // stand on; the third project session keeps the denominator wider than
+        // the folder throughout.
+        let store = || {
+            vec![
+                counted_session("sbcount-here-a", COUNTER_LAUNCH, None),
+                counted_session("sbcount-here-b", COUNTER_LAUNCH, None),
+                counted_session(
+                    "sbcount-wt1",
+                    "/tmp/sbcount-proj/.agents/worktrees/feat",
+                    None,
+                ),
+            ]
+        };
+        let mut app = App::new(store(), Scope::CurrentFolder, PathBuf::from(COUNTER_LAUNCH));
+        assert!(
+            drawn_header(&app).contains("2 / 3 sessions"),
+            "premise: two rows drawn out of a three-session project"
+        );
+
+        // Hide the second row. `toggle_hidden_selected` never recomputes the
+        // scope, so a cached hidden split would go stale right here.
+        app.move_selection(1);
+        assert_eq!(app.selected.as_deref(), Some("sbcount-here-b"));
+        app.toggle_hidden_selected();
+        let header = drawn_header(&app);
+        assert!(
+            header.contains("1 / 2 sessions") && header.contains("1 hidden"),
+            "a hide re-splits the cached population on the spot: {header}"
+        );
+
+        // Reveal, un-hide the row, and put the reveal back the way it was.
+        app.toggle_show_hidden();
+        app.move_selection(1);
+        assert_eq!(app.selected.as_deref(), Some("sbcount-here-b"));
+        app.toggle_hidden_selected();
+        app.toggle_show_hidden();
+        let header = drawn_header(&app);
+        assert!(
+            header.contains("2 / 3 sessions"),
+            "un-hiding puts the session back in the denominator: {header}"
+        );
+        assert!(
+            !header.contains("hidden"),
+            "and nothing is left to disclose: {header}"
+        );
+
+        // A reload is the OTHER path that must not need a toggle: it rebuilds
+        // the population itself.
+        app.apply_sessions(store());
+        assert!(
+            drawn_header(&app).contains("2 / 3 sessions"),
+            "a reload rebuilds the same population without a scope toggle"
+        );
+
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An isolated temp dir for the one counter case that PERSISTS a hide, so it
+    /// never touches the real state dir. Mirrors the
+    /// `snapback-<tag>-<pid>-<nanos>` convention used across the crate's tests.
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "snapback-view-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
     }
 
     #[test]

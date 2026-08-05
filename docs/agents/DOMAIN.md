@@ -855,6 +855,56 @@ relate. That precision is deliberate and is NOT the only precise option — it i
 the narrowest of three. `Ctrl-A` widens to the **project** scope, which is the
 answer for a repo's other worktrees, and by default wraps straight back.
 
+**The header counter counts LINEAGES, on BOTH sides, and it measures the
+PROJECT rather than what the scope narrowed to.** Every number on that line —
+numerator, denominator and the `· N hidden` segment — is a count of
+CONVERSATIONS ([fork lineages](#fork-lineage-storelineage)),
+never of session files. A lineage is ONE unit throughout: head plus the members
+it folds away counts once. All three come from `App::session_counts`
+(`count_lineages`), and the renderer does no counting of its own — pairing a
+local `filtered.len()` with that call's denominator is exactly what once printed
+`115 / 146` on a board that could draw at most 115 rows, a post-fold row count
+over a file count.
+
+The denominator is `App::population`: a cached, lineage-GROUPED set that holds
+`Scope::Project` membership even while the board is in the default folder scope,
+so `5 / 30 sessions` reads "5 conversations drawn, 30 in the project" — what a
+`Ctrl-A` would open up. The store's own size, the denominator before that, was
+the one number that answered nothing: in a worktree it advertised hundreds of
+rows the board would never draw. `Scope::All` is the single exception, because a
+board showing every repo on the machine is not about a project: there the
+population IS the store. A lineage leaves the denominator for the trailing
+segment only when EVERY member is soft-hidden — a partially hidden lineage still
+draws a row, so it stays counted and discloses nothing — and the segment is
+drawn only when N is non-zero; with show-hidden on the rows are back on the
+board and back INSIDE the denominator, so it goes away rather than counting
+visible rows twice. `total + hidden` is therefore always the number of lineages
+in the population. Consequences worth keeping straight:
+
+- **Numerator == denominator** in `Scope::Project` and `Scope::All` whenever the
+  query is empty and show-hidden is off: the board is drawing exactly the
+  population it counts. `Scope::CurrentFolder` deliberately does NOT reconcile,
+  and must not be "fixed" to — its denominator is wider than its rows on
+  purpose, and the gap is the advertisement. A query moves the numerator ALONE.
+- **Fold state moves neither number.** Expanding a `(+N)` family re-emits its
+  members into `filtered`, so the numerator re-groups that list rather than
+  taking its length. This is load-bearing beyond the arithmetic: a fold-sensitive
+  number would drift on its own, because `restore_selection` → `reveal_hidden`
+  auto-expands on autorefresh whenever a background job appends to a transcript.
+- The population, **and its grouping**, are rebuilt **only** in
+  `App::recompute_scope`. Deciding membership canonicalizes every `cwd`, the work
+  that may not sit on a keystroke or a frame; the grouping is pure and could live
+  anywhere, but it allocates a `(repo, branch, root)` key per member over a set
+  that under `All` is the whole store, and it changes only when the population
+  does. The hidden split is NOT cached with them — it is derived per call from
+  `hidden_ids` with hash lookups alone, which is what lets a hide, an un-hide or
+  a show-hidden flip stay truthful without re-resolving a single path.
+- **Deleting a folded lineage drops the header total by 1 while
+  `status_for_delete` reports "3 deleted".** Accepted, and the two surfaces are
+  answering different questions: the header agrees with the rows on screen, the
+  status line agrees with the files on disk. Do not reconcile them by putting
+  files back into the counter.
+
 **`All` is the launch flag's alone** (`Scope::toggled`'s `all_enabled`
 parameter, from `cli::Args::all_scope_enabled`). It is the whole store — every
 session of every repo on the machine — so it is the widest and least often

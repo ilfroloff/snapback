@@ -132,8 +132,22 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 Mouse mode is on so the wheel can scroll and the pane border can be dragged; to
 select/copy text natively, hold **Shift** (or **Option/⌥** on iTerm2 and macOS
 Terminal). The header shows the active scope, the search mode, and a
-`matched / total` count, with a version on the right — a release build shows the
+`shown / total` count, with a version on the right — a release build shows the
 version number, a local dev build is marked as such.
+
+Both numbers count **conversations**, not files: a folded fork lineage is one
+row wearing a `(+2)`, and it counts once on each side — so opening or closing a
+`(+N)` never moves the counter.
+
+That **total is this project**, not the whole store: in the default folder scope
+it counts every conversation of the repo you launched from, worktrees included,
+so `5 / 30 sessions` reads "5 here, 30 in the project" and tells you what
+`Ctrl-A` would open up. (`--all` is the exception — showing every repo on the
+machine, it counts every conversation on the machine.) In the project and
+`--all` scopes with no search typed, the two sides therefore match: `115 / 115`.
+Conversations you've hidden with `Ctrl-X x` are not in that total; they're
+disclosed after it instead, as `· 3 hidden`, and fold back into the total while
+`Ctrl-X h` is revealing them.
 
 ### Getting back to the board from inside a session
 
