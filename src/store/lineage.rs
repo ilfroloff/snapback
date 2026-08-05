@@ -67,6 +67,44 @@ pub fn lineage_key(session: &Session) -> Option<LineageKey> {
     })
 }
 
+/// Partition `indices` into the lineages they belong to: one entry per
+/// CONVERSATION, holding that conversation's session indices.
+///
+/// The counting rule the header is built on, and the same grouping
+/// `tui::app::child_indices` marks child rows with — one function, so a row that
+/// draws as a child can never be counted as a lineage of its own.
+///
+/// FAIL-SOFT, exactly as [`fold`] is: a session with no derivable
+/// [`lineage_key`] joins no group and comes back as a lineage of ONE. That is
+/// the same treatment it gets on screen (never folded, always its own row), so a
+/// degraded parse costs a fold, never a miscount.
+///
+/// Groups arrive in FIRST-APPEARANCE order and every group is non-empty, so a
+/// caller may assert on the shape rather than only on the count, despite the
+/// `HashMap` inside. Order is otherwise irrelevant to the counter.
+///
+/// [`fold`] deliberately does NOT call this: it must consult `expanded` BY KEY,
+/// so it needs the keyed map this throws away. Both read [`lineage_key`], which
+/// is where the identity itself lives.
+#[must_use]
+pub fn group_members(sessions: &[Session], indices: &[usize]) -> Vec<Vec<usize>> {
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut slot_of: HashMap<LineageKey, usize> = HashMap::new();
+    for &i in indices {
+        match lineage_key(&sessions[i]) {
+            Some(key) => match slot_of.get(&key) {
+                Some(&slot) => groups[slot].push(i),
+                None => {
+                    slot_of.insert(key, groups.len());
+                    groups.push(vec![i]);
+                }
+            },
+            None => groups.push(vec![i]),
+        }
+    }
+    groups
+}
+
 /// D1's rank for one lineage member: newest FIRST, a timestamp-less member last,
 /// exact ties broken by `session_id` ascending.
 ///
@@ -217,6 +255,63 @@ mod tests {
             .iter()
             .map(|&i| sessions[i].session_id.clone())
             .collect()
+    }
+
+    /// The grouping the header counts in: members of one lineage collapse to one
+    /// entry, and the entries arrive in first-appearance order so the shape is
+    /// assertable and not just the count.
+    #[test]
+    fn group_members_gathers_one_lineage_into_one_entry() {
+        let sessions = vec![
+            session("bg", BRANCH, Some("fork-root"), Some(300)),
+            session("interloper", BRANCH, Some("other-root"), Some(200)),
+            session("fg", BRANCH, Some("fork-root"), Some(100)),
+        ];
+
+        let groups = group_members(&sessions, &[0, 1, 2]);
+
+        assert_eq!(
+            groups,
+            vec![vec![0, 2], vec![1]],
+            "the fork pair is ONE conversation and the interloper another, in the \
+             order they were handed in"
+        );
+    }
+
+    /// FAIL-SOFT, and it is what keeps the counter honest about a degraded parse:
+    /// a session with no derivable root is a lineage of ONE, exactly as it is on
+    /// screen. Gathering the rootless ones together would count two unrelated
+    /// conversations as one.
+    #[test]
+    fn group_members_gives_a_rootless_session_its_own_lineage() {
+        let sessions = vec![
+            session("no-root-a", "main", None, Some(100)),
+            session("no-root-b", "main", None, Some(200)),
+        ];
+
+        let groups = group_members(&sessions, &[0, 1]);
+
+        assert_eq!(groups, vec![vec![0], vec![1]]);
+    }
+
+    /// The lineage identity is `(repo, branch, root)` (D4), and the grouping must
+    /// read it whole: a shared root across branches is two lineages, matching the
+    /// two rows [`fold`] leaves on the board.
+    #[test]
+    fn group_members_splits_a_shared_root_across_branches() {
+        let sessions = vec![
+            session("bde-on-master", "master", Some("bde050d4"), Some(100)),
+            session(
+                "bde-on-feature",
+                "feature/fold-fork-lineages",
+                Some("bde050d4"),
+                Some(200),
+            ),
+        ];
+
+        let groups = group_members(&sessions, &[0, 1]);
+
+        assert_eq!(groups.len(), 2, "two branches, two conversations");
     }
 
     #[test]

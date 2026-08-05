@@ -550,6 +550,101 @@ pub fn in_scope(scope: Scope, session: &Session, launch: &Path, worktrees: &Work
     }
 }
 
+/// The three numbers the header's counter is built from — ALL THREE COUNTED IN
+/// LINEAGES (conversations), never in session files.
+///
+/// The unit is the whole point. A fork lineage is ONE unit everywhere on this
+/// line: head plus the members it folds away counts once in `visible`, once in
+/// `total`, and — when every one of them is hidden — once in `hidden`. The
+/// counter used to mix units, taking its numerator from the post-fold display
+/// list (already lineages) and its denominator from the population's session
+/// FILES, and read `115 / 146` on a board that could never draw more than 115
+/// rows.
+///
+/// Invariants, all pinned by tests:
+///
+/// - `total + hidden` == the number of lineages in [`App::population`],
+///   whatever the scope and whatever is hidden. (The replacement for the old
+///   `total + hidden == population.len()`, which counted files.)
+/// - With an EMPTY query and show-hidden off, `visible == total` in
+///   [`Scope::Project`] and [`Scope::All`] — the board is drawing exactly the
+///   population it counts.
+/// - [`Scope::CurrentFolder`] is the deliberate exception: `visible` counts the
+///   folder's lineages while `total` counts the PROJECT's, and the gap is the
+///   feature (see [`App::population`]).
+/// - Expanding or collapsing a lineage moves NEITHER number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionCounts {
+    /// How many lineages the board is DRAWING — the NUMERATOR of
+    /// `N / M sessions`, and the one number a query moves.
+    pub visible: usize,
+    /// How many lineages the board could show — the DENOMINATOR. See
+    /// [`App::population`] for which sessions those are grouped from.
+    pub total: usize,
+    /// How many lineages of that population the user has SOFT-HIDDEN ENTIRELY,
+    /// and which `total` therefore leaves out. A PARTIALLY hidden lineage still
+    /// draws a row, so it counts in `total` (and in `visible`), never here.
+    /// Always `0` while [`show_hidden`](App::show_hidden) is on, because the
+    /// rows are back on the board and are counted INSIDE `total` there —
+    /// reporting them again would count visible rows twice.
+    pub hidden: usize,
+}
+
+/// Count the header's three numbers over ONE grouping rule, so the two sides of
+/// `N / M` can never be assembled from different units at a call site. That
+/// separation is exactly what produced the `115 / 146` the type's doc describes,
+/// which is why the numerator is computed HERE and not read off `filtered.len()`
+/// by the renderer.
+///
+/// `population` is [`App::population`]: the counted set, ALREADY grouped into
+/// lineages. `filtered` is the display list — post-fold, so a collapsed lineage
+/// is one entry and an expanded one is its head plus its children — which is why
+/// the numerator re-groups it instead of taking its length.
+///
+/// A lineage is HIDDEN only when EVERY member is in `hidden_ids`. Hiding flips a
+/// whole family at once in practice (`App::toggle_hidden_selected` ->
+/// `lineage_member_ids`), but the strict test is what keeps a partially hidden
+/// lineage — one member hidden, another still drawing — counted as the visible
+/// row it is. `all` over an empty group would answer `true`; it cannot arise,
+/// because [`lineage::group_members`] only ever emits non-empty groups.
+///
+/// Pure so the arithmetic is assertable without an [`App`], a store or a
+/// terminal, and cheap BY CONSTRUCTION: it walks sets someone else already
+/// decided and asks `hidden_ids` a hash question per member, never a path one.
+/// That is what lets a hide/un-hide or a show-hidden flip re-derive the counter
+/// on the spot, with none of the canonicalization [`App::recompute_scope`] pays
+/// for the population itself.
+#[must_use]
+fn count_lineages(
+    sessions: &[Session],
+    population: &[Vec<usize>],
+    filtered: &[usize],
+    hidden_ids: &HashSet<String>,
+    show_hidden: bool,
+) -> SessionCounts {
+    let visible = lineage::group_members(sessions, filtered).len();
+    if show_hidden {
+        return SessionCounts {
+            visible,
+            total: population.len(),
+            hidden: 0,
+        };
+    }
+    let hidden = population
+        .iter()
+        .filter(|members| {
+            members
+                .iter()
+                .all(|&i| hidden_ids.contains(&sessions[i].session_id))
+        })
+        .count();
+    SessionCounts {
+        visible,
+        total: population.len() - hidden,
+        hidden,
+    }
+}
+
 /// The session indices in `filtered` that are EXPANDED lineage members standing
 /// beneath a visible head — i.e. every member of a lineage that still shows more
 /// than one row, except that lineage's own head.
@@ -563,15 +658,16 @@ pub fn in_scope(scope: Scope, session: &Session, launch: &Path, worktrees: &Work
 /// The head is [`lineage::head_of`], never "whichever member came first", so the
 /// D1 rule lives in exactly one place and this cannot drift from the head
 /// [`lineage::fold`] chose. Pure so the child marking is unit-testable on its own.
+///
+/// Groups through [`lineage::group_members`], the SAME partition
+/// [`count_lineages`] counts — so "this row is a child" and "this row is not its
+/// own conversation" are one decision, and the header can never disagree with
+/// the indent about how many lineages are on screen. Rootless sessions come back
+/// as lineages of one there and are dropped by the `len() > 1` test below,
+/// exactly as a keyed map that never held them would.
 fn child_indices(sessions: &[Session], filtered: &[usize]) -> HashSet<usize> {
-    let mut members: HashMap<lineage::LineageKey, Vec<usize>> = HashMap::new();
-    for &i in filtered {
-        if let Some(key) = lineage::lineage_key(&sessions[i]) {
-            members.entry(key).or_default().push(i);
-        }
-    }
-    members
-        .into_values()
+    lineage::group_members(sessions, filtered)
+        .into_iter()
         .filter(|group| group.len() > 1)
         .flat_map(|group| {
             let head = lineage::head_of(sessions, &group);
@@ -1008,6 +1104,38 @@ pub struct App {
     /// Indices (into `sessions`) that pass the scope predicate, cached so a
     /// per-keystroke query re-filter never re-canonicalizes paths.
     scoped: Vec<usize>,
+    /// The population the header COUNTS, GROUPED INTO LINEAGES: one entry per
+    /// conversation, holding that conversation's indices into `sessions`. Its
+    /// LENGTH is the denominator of `N / M sessions`, and its entries are what
+    /// the `· N hidden` segment is taken from.
+    ///
+    /// Grouped, not flat, because the counter's unit is the CONVERSATION: a
+    /// folded fork lineage draws one row and must therefore count once on both
+    /// sides of the `/`. A flat index set makes `len()` a file count, and that
+    /// is the arithmetic that read `115 / 146` on a board of 115 rows.
+    ///
+    /// Deliberately WIDER than `scoped` in the default scope. It holds the whole
+    /// launch PROJECT — [`Scope::Project`] membership — even while the board is
+    /// narrowed to one folder, because the old denominator was `sessions.len()`:
+    /// the whole store, which in a worktree advertises hundreds of rows the
+    /// board will never draw. `5 / 30` instead states how much the `Ctrl-A`
+    /// widen would reveal. [`Scope::All`] is the ONE exception: there the board
+    /// is not about a project, so the population stays the whole store and that
+    /// header reads as it always did.
+    ///
+    /// Cached for the same reason `scoped` is, and it is the harder constraint:
+    /// deciding project membership canonicalizes every `cwd`, so it is computed
+    /// ONLY in [`recompute_scope`](Self::recompute_scope) — never per render,
+    /// never per keystroke. The GROUPING is cached in the same place for a
+    /// weaker but real reason, argued at that call site: it is pure (no path
+    /// work, so it is free to live anywhere) but it allocates a three-`String`
+    /// key per member over a set that can be the whole store, which is not work
+    /// to repeat on every frame for a number that only a reload or a scope
+    /// toggle can change. The hidden SPLIT is deliberately NOT cached beside
+    /// either: [`session_counts`](Self::session_counts) derives that from
+    /// `hidden_ids` on demand, so a hide, an un-hide or a show-hidden flip stays
+    /// truthful without re-resolving a single path.
+    population: Vec<Vec<usize>>,
     /// The fork lineages the user has EXPANDED. EMPTY IS THE DEFAULT, and it
     /// means every lineage is folded: a background fork shows one row until the
     /// user opens it.
@@ -1138,6 +1266,7 @@ impl App {
             last_new_agent: None,
             dragging_split: false,
             scoped: Vec::new(),
+            population: Vec::new(),
             expanded: HashSet::new(),
             hidden: HashMap::new(),
             // Load the persisted hidden set ONCE at startup. Resolve the dir here
@@ -2116,9 +2245,10 @@ impl App {
 
     // --- internals --------------------------------------------------------
 
-    /// Recompute the scope membership set (`scoped`). This is the only path
-    /// that canonicalizes `cwd`s, so it runs on reload / scope-toggle, never on
-    /// a per-keystroke query change.
+    /// Recompute the scope membership set (`scoped`) and the header's counted
+    /// [`population`](Self::population). This is the only path that
+    /// canonicalizes `cwd`s, so it runs on reload / scope-toggle, never on a
+    /// per-keystroke query change.
     fn recompute_scope(&mut self) {
         let scope = self.scope;
         let launch = self.launch_dir.as_path();
@@ -2129,6 +2259,30 @@ impl App {
         self.scoped = (0..self.sessions.len())
             .filter(|&i| in_scope(scope, &self.sessions[i], launch, worktrees))
             .collect();
+        let counted: Vec<usize> = match scope {
+            // The whole store — the counter's original denominator, kept because
+            // a board showing every repo on the machine is not about one project.
+            Scope::All => (0..self.sessions.len()).collect(),
+            // Already exactly this membership: reuse the pass above rather than
+            // canonicalizing every `cwd` a second time on one `Ctrl-A`.
+            Scope::Project => self.scoped.clone(),
+            // The one scope whose counted population is WIDER than its rows, and
+            // the only arm that costs a second pass. It is the default scope, so
+            // this is the pass that matters — and it is affordable exactly
+            // because it lands here and not on a keystroke or a frame.
+            Scope::CurrentFolder => (0..self.sessions.len())
+                .filter(|&i| in_scope(Scope::Project, &self.sessions[i], launch, worktrees))
+                .collect(),
+        };
+        // Group the counted set into conversations HERE rather than per call.
+        // Unlike the membership above, this is PURE — it reads no path and could
+        // legally sit in `session_counts` — but it allocates a `(repo, branch,
+        // root)` key per member, and under `All` that member set is the entire
+        // store. The result changes only when the population does, i.e. on
+        // exactly the two events that reach this function, so paying for it on a
+        // frame or a keystroke would buy nothing. What must stay per-call is the
+        // hidden split, and that one does (`count_lineages`).
+        self.population = lineage::group_members(&self.sessions, &counted);
     }
 
     /// Recompute `filtered` from the cached scope set and the active query, sort
@@ -2316,6 +2470,37 @@ impl App {
     }
 
     // --- render helpers (consumed by tui::view) ---------------------------
+
+    /// The header counter's three numbers — ALL of them, in LINEAGES — over the
+    /// current scope's counted [`population`](Self::population) and the board's
+    /// current display list.
+    ///
+    /// The numerator comes from here too, and that is the fix: `tui::view` used
+    /// to pair `filtered.len()` with this call's `total`, which put a post-fold
+    /// row count over a session-FILE count. One accessor, one grouping rule, one
+    /// unit — see [`SessionCounts`].
+    ///
+    /// An ACCESSOR rather than a public field because the population is a cache
+    /// with an invariant — it is only ever written by
+    /// [`recompute_scope`](Self::recompute_scope) — and `tui::view` is a SIBLING
+    /// module that would otherwise be able to hand out a stale one.
+    ///
+    /// Derived per call, not cached: the split depends on
+    /// [`hidden_ids`](Self::hidden_ids) and [`show_hidden`](Self::show_hidden),
+    /// which change on keypresses that must never re-canonicalize a path, and
+    /// [`count_lineages`] costs a hash lookup per counted session plus one
+    /// grouping pass over the (already narrow) display list. The expensive half
+    /// is the population and its grouping, and those ARE cached.
+    #[must_use]
+    pub fn session_counts(&self) -> SessionCounts {
+        count_lineages(
+            &self.sessions,
+            &self.population,
+            &self.filtered,
+            &self.hidden_ids,
+            self.show_hidden,
+        )
+    }
 
     /// The ONE repo head every row groups and renders under in the project
     /// scope, or `None` when the rows keep their own [`Session::repo`] labels.
@@ -3848,6 +4033,334 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&here);
+    }
+
+    // --- header counter population (the denominator and its hidden split) --
+
+    /// The three sessions the population cases are decided on: one in the launch
+    /// folder, one in a worktree of the same project, one in another project
+    /// entirely. `/tmp/sbpop-proj` exists nowhere, so `resolve_dir` hands every
+    /// path back raw on BOTH sides of the comparison and the case needs no
+    /// fixture on disk.
+    fn population_store() -> Vec<Session> {
+        vec![
+            session("sbpop-here", "sbpop-proj", Some("main"), "/tmp/sbpop-proj"),
+            session(
+                "sbpop-wt",
+                "sbpop-proj",
+                Some("feat"),
+                "/tmp/sbpop-proj/.agents/worktrees/feat",
+            ),
+            session("sbpop-away", "other", Some("main"), "/tmp/sbpop-other"),
+        ]
+    }
+
+    /// A store shaped like the board that exposed the unit bug: a two-member fork
+    /// lineage and a lone session, ALL in the launch folder — three FILES, two
+    /// CONVERSATIONS. Any counter that reads files says three somewhere.
+    fn lineage_population_store() -> Vec<Session> {
+        let forked = |id: &str| {
+            let mut s = session(id, "sbpop-proj", Some("main"), "/tmp/sbpop-proj");
+            s.root_uuid = Some("sbpop-root".to_string());
+            s
+        };
+        vec![
+            forked("sbpop-fork-a"),
+            forked("sbpop-fork-b"),
+            session("sbpop-lone", "sbpop-proj", Some("main"), "/tmp/sbpop-proj"),
+        ]
+    }
+
+    /// The counted population is the launch PROJECT while the board is narrowed
+    /// to one folder — deliberately wider than the rows, so the header can say
+    /// what a `Ctrl-A` would reveal — and the whole store ONLY under `All`,
+    /// where the board is not about a project at all.
+    #[test]
+    fn the_counted_population_is_the_project_in_every_scope_but_all() {
+        let launch = PathBuf::from("/tmp/sbpop-proj");
+
+        let folder = App::new(population_store(), Scope::CurrentFolder, launch.clone());
+        assert_eq!(
+            folder.filtered.len(),
+            1,
+            "premise: the folder scope draws its one exact-cwd match"
+        );
+        assert_eq!(
+            folder.session_counts().total,
+            2,
+            "but it COUNTS the project: the folder's session plus the worktree's"
+        );
+
+        let project = App::new(population_store(), Scope::Project, launch.clone());
+        assert_eq!(
+            project.session_counts().total,
+            folder.session_counts().total,
+            "widening to the project must not move the denominator"
+        );
+        assert_eq!(
+            project.session_counts().visible,
+            2,
+            "only the NUMERATOR catches up with the population it was counting"
+        );
+
+        let all = App::new(population_store(), Scope::All, launch);
+        assert_eq!(
+            all.session_counts().total,
+            3,
+            "the all scope counts the store, the other project's session included"
+        );
+    }
+
+    /// The user-visible fix. With an empty query and nothing hidden, a project-
+    /// scoped board draws exactly the population it counts, so the two sides of
+    /// the `/` MATCH — even though a folded fork lineage means three files sit
+    /// behind those two rows. `115 / 146` was this assertion failing.
+    #[test]
+    fn the_project_scope_counter_reconciles_to_the_rows_on_screen() {
+        for scope in [Scope::Project, Scope::All] {
+            let app = App::new(
+                lineage_population_store(),
+                scope,
+                PathBuf::from("/tmp/sbpop-proj"),
+            );
+            let counts = app.session_counts();
+
+            assert_eq!(
+                app.filtered.len(),
+                2,
+                "premise ({scope:?}): the fork pair folds to one head beside the lone row"
+            );
+            assert_eq!(
+                counts.visible, counts.total,
+                "an unqueried, unhidden board counts what it draws ({scope:?}): {counts:?}"
+            );
+            assert_eq!(
+                counts.total, 2,
+                "and both numbers are CONVERSATIONS, not the three files ({scope:?})"
+            );
+        }
+    }
+
+    /// Load-bearing: neither number may move when a lineage opens or closes. It
+    /// is what stops the counter printing `112 / 111`, and it is not only a user
+    /// action — `restore_selection` -> `reveal_hidden` auto-expands on
+    /// autorefresh, so a fold-sensitive number would drift on its own the moment
+    /// a background job wrote a file.
+    #[test]
+    fn expanding_and_collapsing_a_lineage_moves_neither_number() {
+        let mut app = App::new(
+            lineage_population_store(),
+            Scope::Project,
+            PathBuf::from("/tmp/sbpop-proj"),
+        );
+        let folded = app.session_counts();
+        assert_eq!(folded.visible, 2, "premise: the lineage starts folded");
+
+        app.set_selected(Some("sbpop-fork-a".to_string()));
+        app.expand_selected();
+        assert_eq!(
+            app.filtered.len(),
+            3,
+            "premise: expanding really did put the third row on the board"
+        );
+        assert_eq!(
+            app.session_counts(),
+            folded,
+            "an expanded lineage is still ONE conversation on both sides"
+        );
+
+        app.collapse_selected();
+        assert_eq!(app.filtered.len(), 2, "premise: it folded back");
+        assert_eq!(app.session_counts(), folded, "and the counter never moved");
+    }
+
+    /// A query narrows the BOARD, not the project: only the numerator moves.
+    #[test]
+    fn a_query_shrinks_only_the_numerator() {
+        let mut app = App::new(
+            lineage_population_store(),
+            Scope::Project,
+            PathBuf::from("/tmp/sbpop-proj"),
+        );
+        let before = app.session_counts();
+
+        app.push_query_str("sbpop-lone");
+
+        let after = app.session_counts();
+        assert_eq!(after.visible, 1, "one conversation matches: {after:?}");
+        assert_eq!(
+            after.total, before.total,
+            "the population is unchanged by a search"
+        );
+        assert_eq!(after.hidden, before.hidden);
+    }
+
+    /// A PARTIALLY hidden lineage still draws a row, so it stays counted on both
+    /// sides and discloses nothing. Hiding normally flips a whole family at once
+    /// (`toggle_hidden_selected` -> `lineage_member_ids`), but the counter must
+    /// not assume it.
+    #[test]
+    fn a_partially_hidden_lineage_still_counts_as_visible() {
+        let mut app = App::new(
+            lineage_population_store(),
+            Scope::Project,
+            PathBuf::from("/tmp/sbpop-proj"),
+        );
+        app.hidden_ids.insert("sbpop-fork-b".to_string());
+        app.apply_sessions(lineage_population_store());
+
+        let counts = app.session_counts();
+        assert_eq!(
+            counts,
+            SessionCounts {
+                visible: 2,
+                total: 2,
+                hidden: 0
+            },
+            "one member hidden leaves the conversation on the board: {counts:?}"
+        );
+
+        app.hidden_ids.insert("sbpop-fork-a".to_string());
+        app.apply_sessions(lineage_population_store());
+
+        let counts = app.session_counts();
+        assert_eq!(
+            counts,
+            SessionCounts {
+                visible: 1,
+                total: 1,
+                hidden: 1
+            },
+            "hiding the LAST member is what moves it into the segment: {counts:?}"
+        );
+    }
+
+    /// A scope toggle rebuilds the population, and it is the ONLY keystroke
+    /// allowed to: it is the one that already canonicalizes.
+    #[test]
+    fn toggling_the_scope_rebuilds_the_counted_population() {
+        let mut app = App::new(
+            population_store(),
+            Scope::Project,
+            PathBuf::from("/tmp/sbpop-proj"),
+        );
+        app.all_scope_enabled = true;
+        assert_eq!(app.session_counts().total, 2, "premise: the project's two");
+
+        app.toggle_scope();
+        assert_eq!(app.scope, Scope::All);
+        assert_eq!(
+            app.session_counts().total,
+            3,
+            "the all scope widens the denominator to the whole store"
+        );
+
+        app.toggle_scope();
+        assert_eq!(app.scope, Scope::CurrentFolder);
+        assert_eq!(
+            app.session_counts().total,
+            2,
+            "and wrapping back to the folder narrows it to the project again"
+        );
+    }
+
+    /// The counted population of [`lineage_population_store`], as
+    /// `recompute_scope` groups it: the fork pair is ONE entry, the lone session
+    /// another. Written out literally so the pure cases below state the shape
+    /// they depend on instead of borrowing it from a grouping pass.
+    fn population_lineages() -> Vec<Vec<usize>> {
+        vec![vec![0, 1], vec![2]]
+    }
+
+    /// The pure split, in the counter's unit: a lineage whose members are ALL
+    /// hidden leaves `total` for `hidden`, and the two always add back up to the
+    /// number of lineages in the population — the invariant that lets
+    /// `N / M sessions · K hidden` reconcile.
+    #[test]
+    fn count_lineages_moves_a_fully_hidden_lineage_out_of_the_total() {
+        let sessions = lineage_population_store();
+        let population = population_lineages();
+        let hidden_ids: HashSet<String> = ["sbpop-fork-a", "sbpop-fork-b"]
+            .into_iter()
+            .map(ToString::to_string)
+            .collect();
+
+        let counts = count_lineages(&sessions, &population, &[2], &hidden_ids, false);
+        assert_eq!(counts.visible, 1, "one conversation is left drawing");
+        assert_eq!(counts.total, 1, "the hidden one is not on the board");
+        assert_eq!(counts.hidden, 1, "and is disclosed instead of vanishing");
+        assert_eq!(
+            counts.total + counts.hidden,
+            population.len(),
+            "the two numbers always reconcile to the population's LINEAGES — two \
+             here, not the three files behind them"
+        );
+    }
+
+    /// The strict test, stated on its own: one hidden member out of two leaves a
+    /// row on the board, so the lineage is still counted and nothing is
+    /// disclosed. A `any()` test here would drop a drawn row from `total`.
+    #[test]
+    fn count_lineages_keeps_a_partially_hidden_lineage_in_the_total() {
+        let sessions = lineage_population_store();
+        let population = population_lineages();
+        let hidden_ids: HashSet<String> = ["sbpop-fork-b".to_string()].into_iter().collect();
+
+        let counts = count_lineages(&sessions, &population, &[0, 2], &hidden_ids, false);
+        assert_eq!(counts.total, 2, "the half-hidden conversation still draws");
+        assert_eq!(counts.hidden, 0, "so there is nothing to disclose");
+        assert_eq!(counts.visible, 2);
+    }
+
+    /// The numerator groups the DISPLAY list, so an expanded lineage's children
+    /// do not each count as a conversation. `filtered.len()` — what the renderer
+    /// used to print — says three here.
+    #[test]
+    fn count_lineages_counts_an_expanded_lineage_once() {
+        let sessions = lineage_population_store();
+        let population = population_lineages();
+        let hidden_ids = HashSet::new();
+
+        let folded = count_lineages(&sessions, &population, &[0, 2], &hidden_ids, false);
+        let open = count_lineages(&sessions, &population, &[0, 1, 2], &hidden_ids, false);
+
+        assert_eq!(folded.visible, 2);
+        assert_eq!(
+            open, folded,
+            "re-emitting a lineage's members must not move the counter"
+        );
+    }
+
+    /// With show-hidden on the rows are back on the board, so they are counted
+    /// INSIDE `total` and reported as zero hidden — the view draws no segment for
+    /// a zero, which is exactly what stops it counting visible rows twice.
+    #[test]
+    fn count_lineages_folds_revealed_lineages_back_into_the_total() {
+        let sessions = lineage_population_store();
+        let population = population_lineages();
+        let hidden_ids: HashSet<String> = ["sbpop-fork-a", "sbpop-fork-b"]
+            .into_iter()
+            .map(ToString::to_string)
+            .collect();
+
+        let counts = count_lineages(&sessions, &population, &[0, 2], &hidden_ids, true);
+        assert_eq!(counts.total, 2, "a revealed row is counted like any other");
+        assert_eq!(counts.hidden, 0, "so there is nothing left to disclose");
+    }
+
+    /// The split is an INTERSECTION with the counted population, never a
+    /// property of `hidden_ids` at large: a session hidden in ANOTHER project
+    /// must not be subtracted from this project's count. `hidden_ids.len()`
+    /// would say one here.
+    #[test]
+    fn count_lineages_ignores_a_hidden_id_outside_the_population() {
+        let sessions = lineage_population_store();
+        let population = population_lineages();
+        let hidden_ids: HashSet<String> = ["sbpop-away".to_string()].into_iter().collect();
+
+        let counts = count_lineages(&sessions, &population, &[0, 2], &hidden_ids, false);
+        assert_eq!(counts.total, 2, "nothing in this population is hidden");
+        assert_eq!(counts.hidden, 0, "and nothing about it is disclosed");
     }
 
     // --- pasted query text (the whole-string sibling of typing) ------------
