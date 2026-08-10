@@ -7,11 +7,10 @@ system prompt: keep it loaded, follow it exactly.
 
 `snapback` (alias `sb`) is a single self-contained Rust **ratatui TUI** that
 browses, searches, and resumes **Claude Code** sessions stored as JSONL under
-`~/.claude/projects/`, and — without leaving the board — quick-replies to
-(`Ctrl-R`) or stops (`Ctrl-K`) the agents claude runs, and starts new ones in
-the background (`Ctrl-N`, which drafts their first message). Ship changes that
-keep the data core correct against a hostile, undocumented on-disk format and
-keep the terminal safe across the resume round trip.
+`~/.claude/projects/`, and — without leaving the board — replies to, stops, and
+starts the agents claude runs. Ship changes that keep the data core correct
+against a hostile, undocumented on-disk format and keep the terminal safe across
+the resume round trip.
 
 ## Critical rules
 
@@ -64,30 +63,27 @@ one place.
   that way — a quick reply appends in place because `claude -p -r` writes it,
   NEVER because snapback edits a session file. Do not add a direct writer.
   That guard asks "is anything WRITING this file?", NEVER "does claude know this
-  session?" — membership refused ~97% of reported rows for no safety gain. Refuse
-  an OPEN INTERACTIVE session and a still-RUNNING background agent; ALLOW the
-  parked ones, INCLUDING the reported-finished and terminal buckets (`Done`,
-  `Ended`) whose run is over — `can_delete`'s doc comment owns why. An unreadable
-  qualifier fails toward REFUSING. Express it over `AgentActivity` DIRECTLY —
-  never reuse `agents::is_active`, a badge-pulse decision that must never widen an
-  irreversible gate, and never widen it to a bucket the send gates treat as live
-  without re-deriving the writer question. THREE writers, not two: claude's probe
-  structurally CANNOT see snapback's OWN in-flight quick reply, because a send
-  `claude stop`s the job on its way in, so the target is ABSENT from that active
-  list for exactly the span a snapback-spawned child is appending to it. So the
-  gate the confirm calls is `can_delete_target` — `can_delete` COMPOSED with
-  `App::sending_to`, refusing that third case in its own words
+  session?". Refuse an OPEN INTERACTIVE session and a still-RUNNING background
+  agent; ALLOW the parked ones, INCLUDING the reported-finished and terminal
+  buckets (`Done`, `Ended`) whose run is over — `can_delete`'s doc comment owns
+  why. An unreadable qualifier fails toward REFUSING. Express it over
+  `AgentActivity` DIRECTLY — never reuse `agents::is_active`, a badge-pulse
+  decision that must never widen an irreversible gate, and never widen it to a
+  bucket the send gates treat as live without re-deriving the writer question.
+  The gate the confirm calls is `can_delete_target` — `can_delete` COMPOSED with
+  `App::sending_to`, refusing snapback's OWN in-flight quick reply (the THIRD
+  writer, which claude's probe structurally CANNOT see) in its own words
   (`DELETE_SENDING_REFUSAL`) because the writer to name there is snapback, not
   claude; keep it a composition of two facts, never a wider `can_delete`.
   A confirm may target the selected id ALONE or its whole fork lineage
   (`lineage_member_ids`, the SAME grouping hide uses — never a second rule):
-  guard each member individually, let one refusal
-  skip only itself, and spend exactly ONE liveness probe for the whole set. That
-  lineage sweeps the FULL store, so it takes soft-HIDDEN members too — keep that,
-  and keep the confirm DISCLOSING how many of them are hidden. It removes ONLY
-  each target id's own `<id>.jsonl` + sibling `<id>/` dir; everything else stays
-  read-only. (`src/delete.rs`; `confirm_delete` in `src/tui/update.rs`;
-  `src/send.rs`)
+  guard each member individually, let one refusal skip only itself, and spend
+  exactly ONE liveness probe for the whole set. That lineage sweeps the FULL
+  store, so it takes soft-HIDDEN members too — keep that, and keep the confirm
+  DISCLOSING how many of them are hidden. It removes ONLY each target id's own
+  `<id>.jsonl` + sibling `<id>/` dir; everything else stays read-only.
+  Mechanism: [DOMAIN.md](docs/agents/DOMAIN.md#on-disk-layout).
+  (`src/delete.rs`; `confirm_delete` in `src/tui/update.rs`; `src/send.rs`)
 - **TERMINAL SAFETY.** Resume/fork/attach SPAWN `claude` as a child and RETURN
   to the board — never replace the process image. Restore the terminal (raw
   mode + alt screen + every mode snapback ENABLES — mouse capture and bracketed
@@ -114,14 +110,14 @@ one place.
   survives autorefresh reloads. (`src/tui/app.rs`)
 - **OFF-UI-THREAD blocking work.** RECURRING shell-outs / FS watch / input run on
   their own threads and deliver `AppEvent`s; the render loop never blocks. The
-  watcher filters each debounce batch through `is_session_path` before emitting
+  watcher filters each debounce batch through the SUBAGENT-EXCLUSION shape rule
+  above — BOTH halves, never a depth of its own — before emitting
   `SessionsChanged`; the agents poller runs on `AGENTS_REFRESH` (5 s) and skips
   the shell-out once the board has been idle past `AGENTS_IDLE_AFTER` (60 s).
-  TWO bounded one-shots are deliberate, documented
-  exceptions (`PATTERNS.md` §6): the liveness probe at hand-off, and the
-  worktree resolve at construction/reload. Both are argued at the call site,
-  and NEITHER may move onto a keystroke or the render path — a scope toggle
-  reads a cached set, it never resolves. (`src/watch.rs`, `src/worktrees.rs`)
+  TWO bounded one-shots are deliberate, documented exceptions (`PATTERNS.md` §6):
+  the liveness probe at hand-off, and the worktree resolve at
+  construction/reload. Both are argued at the call site, and NEITHER may move
+  onto a keystroke or the render path. (`src/watch.rs`, `src/worktrees.rs`)
 - **PURE, GIT-FREE STORE CORE.** `src/store/*` decides everything from the bytes
   it was given: `repo_of`'s worktree collapse is a pure string heuristic, and NO
   module under `src/store/` may shell out (to `git` or anything else) or read
@@ -145,10 +141,9 @@ one place.
   that routing is stale until updated — the four above plus the gate tables in
   [DOMAIN.md](docs/agents/DOMAIN.md). A partial enumeration is a wrong one.
 - **STATUS-LINE OWNERSHIP.** `App::status` is a keypress-scoped surface: it carries
-  only **outcomes and refusals** (a send result, a launch warning, a paste nudge,
-  a resume refusal). A fact that is true over an interval lives in typed state and
-  renders on the surface that owns it. Failures and refusals stay sticky until the
-  next actionable keypress; confirmations and nudges expire after
+  only **outcomes and refusals**. A fact that is true over an interval lives in
+  typed state and renders on the surface that owns it. Failures and refusals stay
+  sticky until the next actionable keypress; confirmations and nudges expire after
   `STATUS_DWELL_TICKS`. See [PATTERNS.md](docs/agents/PATTERNS.md#11-status-line-ownership).
 
 ## Engineering principles (mandatory)
@@ -156,9 +151,8 @@ one place.
 - **SOLID / KISS / DRY** — small single-purpose modules; pure core, thin impure
   drivers; one source of truth (parsing lives in `parse_file`; nucleo in
   `search`).
-- **YAGNI** — no on-disk index, no speculative abstraction (see the "index
-  later" note under Content index in [docs/agents/DOMAIN.md](docs/agents/DOMAIN.md)).
-  Match the existing restraint.
+- **YAGNI** — no on-disk index, no speculative abstraction; match the existing
+  restraint (see [DOMAIN.md](docs/agents/DOMAIN.md#content-index-storeparse)).
 - **NO MAGIC VALUES** — every tunable is a named `const` with a rationale.
 - **PURE + TESTED** — new decision logic is a pure function with an inline unit
   test; keep side effects in thin wrappers.
@@ -172,19 +166,17 @@ one place.
   `GIT_COMMIT_INSTRUCTIONS.md` first.
 - **NEVER** commit gitignored files, and NEVER use `git add -f` or similar force
   commands to bypass `.gitignore` (notably `/target`).
-- **Commit TYPE now drives the released version.** release-plz maps Conventional
-  Commit types to the next `vX.Y.Z` bump on every merge to `main`, so choosing the
-  accurate type per `GIT_COMMIT_INSTRUCTIONS.md` is exactly what the next release
-  is computed from. See the release flow in
-  [docs/agents/OPERATIONS.md](docs/agents/OPERATIONS.md#how-a-release-happens).
+- **Commit TYPE now drives the released version** — the accurate type per
+  `GIT_COMMIT_INSTRUCTIONS.md` is exactly what the next release is computed from.
+  See [docs/agents/OPERATIONS.md](docs/agents/OPERATIONS.md#how-a-release-happens).
 
 ## Self-healing stage (do before finishing)
 
 When your change adds/renames/removes files, modules, commands, keys, flags, or
 format handling, RE-RUN the `project-agent-docs` skill to refresh `README.md`,
-`AGENTS.md`, and `docs/agents/*` against the new reality. Remove or rewrite stale
-references — do not leave them. Deduplicate: if a rule appears in both `AGENTS.md`
-and a `docs/agents/*` file, keep it in one place.
+`AGENTS.md`, and `docs/agents/*` against the new reality rather than hand-editing
+them. Remove or rewrite stale references — do not leave them. Deduplicate: if a
+rule appears in both `AGENTS.md` and a `docs/agents/*` file, keep it in one place.
 
 Do NOT name the model or harness behind a doc update anywhere in these files —
 describe the change, not who or what made it. Do NOT reintroduce a `## Changelog`
@@ -199,10 +191,8 @@ section here; git history is the refresh log.
 4. `cargo build && cargo test && cargo clippy --all-targets && cargo fmt`.
 5. **Watch it fail before you believe it.** A check that was never capable of
    going red is ceremony, not evidence. Break what each new/changed test pins,
-   see it fail, restore. Re-running a passing gate proves nothing — clippy's
-   default target set and its cache both report clean while hiding real warnings.
-   Mechanism: [OPERATIONS.md](docs/agents/OPERATIONS.md) (lint gate) and
-   [PATTERNS.md](docs/agents/PATTERNS.md) (tests).
+   see it fail, restore. Mechanism: [OPERATIONS.md](docs/agents/OPERATIONS.md)
+   (lint gate) and [PATTERNS.md](docs/agents/PATTERNS.md) (tests).
 6. If discovery/parsing/model changed, verify with `snapback --print-list`.
 7. Run the self-healing stage.
 
@@ -226,15 +216,9 @@ Full command reference and the validation checklist:
 
 - [ ] Change honors every critical rule that touches its area.
 - [ ] `cargo build`, `cargo test`, `cargo clippy --all-targets`, `cargo fmt` all
-      clean **on a run that actually rebuilt** — a cached clippy prints nothing
-      whether or not it would have warned (see OPERATIONS.md).
+      clean **on a run that actually rebuilt** (see OPERATIONS.md).
 - [ ] Every new/changed test was OBSERVED FAILING against the un-fixed code.
       Un-failed tests are unverified claims, not coverage.
 - [ ] New pure logic has an inline unit test; new format edge case has a fixture.
 - [ ] Key/flag docs kept in sync across the four locations.
 - [ ] Agent docs refreshed via the self-healing stage.
-
----
-
-Future agents: when project structure changes, use the `project-agent-docs`
-skill to update this documentation rather than hand-editing it.

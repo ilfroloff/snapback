@@ -2,8 +2,8 @@
 
 Commands, scripts, CI, release automation, and the validation checklist. There
 is no `rustfmt.toml`/`clippy.toml` (toolchain defaults apply) and no build system
-beyond Cargo — this is a single binary crate. Two GitHub Actions workflows
-automate the quality gates and the releases (see
+beyond Cargo — one package, built by one `cargo build`. Three GitHub Actions
+workflows automate the quality gates, the release, and the npm publish (see
 [Continuous integration & releases](#continuous-integration--releases)).
 
 ## Build

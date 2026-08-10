@@ -250,8 +250,8 @@ normally; its badge tells you it's done without getting in the way.
 
 Which of those you get is decided by asking Claude Code at the moment you press
 `Enter`, not by the badge you're looking at. Badges refresh every few seconds
-while you're active (and pause briefly once the board's been idle for a while,
-picking back up as soon as you touch it again), and a session can start or
+while you're active (and stop once the board has sat idle for a minute, picking
+back up as soon as you touch it again), and a session can start or
 finish in between — so if one is secretly still running, you get the
 Attach/Fork choice rather than an error. And if a resume does fail because the
 session came back to life underneath you, the board says so and offers the

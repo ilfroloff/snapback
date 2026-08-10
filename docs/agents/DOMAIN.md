@@ -41,7 +41,7 @@ still discovered, parsed, and indexed at load — its bytes stay on disk — and
 dropped only in `recompute_filtered` when `show_hidden` is off. Because the set
 asserts nothing about run state, a hidden LIVE session keeps its live badge in the
 show-hidden view, so it does NOT resurrect the rejected "Completed"/archived
-status flag (see the ADR note in the delete plan).
+status flag.
 
 ## On-disk layout
 
@@ -335,20 +335,24 @@ up to 5×/second.
 
 A second, complementary filter sits in front of this pipeline: the watcher
 itself (`watch::SessionWatcher::spawn`) classifies every path in a debounce
-batch with the same depth-2 `.jsonl` predicate discovery uses
-(`store::discover::is_session_path`, via `watch::classify_watch_path`) and only
-calls into `reload` when at least one path could plausibly be a session
-(`watch::batch_needs_reload`). A write to an irrelevant file elsewhere under the
-store root — a subagent transcript, a stray non-`.jsonl` file — never reaches
-this cache at all, rather than reaching it and reusing every stamp. An
-unclassifiable path always falls through to reload, so this filter can only
-skip work, never miss a real change.
+batch against BOTH halves of the store's shape rule — `store::discover::store_depth`
+for which level it sits at and `store::discover::is_session_path` for whether it
+is a session — and calls into `reload` only when the batch is not provably
+irrelevant. The classifier and its metadata matrix live in
+[ARCHITECTURE.md](ARCHITECTURE.md#event-sources-watcheventloop) and are not
+restated here; what matters for the cache is the consequence. A write to an
+irrelevant
+file elsewhere under the store root — a subagent transcript, a stray non-`.jsonl`
+file — never reaches this cache at all, rather than reaching it and reusing every
+stamp. An unclassifiable path always falls through to reload, so this filter can
+only skip work, never miss a real change.
 
 What the cache may and may not decide is a critical rule, and it is stated ONCE,
 in `AGENTS.md` ("THE PARSE CACHE NEVER DECIDES WHICH FILES EXIST — OR WHETHER A
 FILE IS A SESSION IT COULD NOT READ"). Read it there; it is not restated here.
-What follows is the MECHANISM behind it — how each half is actually held up, plus
-the two stamp rules that live only here.
+What follows is the MECHANISM behind it, in five parts: how each half of that rule
+is actually held up (two), the two stamp rules that live only here, and where the
+cache lives.
 
 - **How discovery stays uncached.** It runs in full on every reload, and the new
   cache is REBUILT from the discovered set rather than edited in place. So a
@@ -1014,8 +1018,10 @@ stop of the key. Three consequences to keep straight:
 The project scope is the one scope that asks **git**, and it differs from the
 other two in four ways worth keeping straight:
 
-- **TWO membership arms, and it needs both.** `App::in_scope` says yes to a
-  session whose `cwd` is EITHER of:
+- **TWO membership arms, and it needs both.** `tui::app::in_scope` — a free
+  function, not an `App` method, precisely because it reaches for nothing: the
+  scope, the session, the launch dir and the worktree set are all PARAMETERS —
+  says yes to a session whose `cwd` is EITHER of:
   - a member of the worktree roots `git worktree list --porcelain` reports for
     the launch dir (`src/worktrees.rs`), canonicalized with the same
     `resolve_dir` the exact-cwd test uses. Authoritative, and the only arm that
@@ -1278,6 +1284,13 @@ dropped the instant the real turn lands on disk — detected by the reloaded
 while a send is in flight (`view::preview_banner` returns `None`, keeping render and
 the click hit-test agreeing on the geometry), since the inline turns replace it.
 
+That echo is also why `App::status` never carries a transient `"sending…"`: an
+in-flight send is true over an INTERVAL, so it renders on the pane that owns it
+rather than on the keypress-scoped help line. The rule lives in
+[AGENTS.md](../../AGENTS.md) and its instances in
+[PATTERNS.md §11](PATTERNS.md#11-status-line-ownership); neither is restated
+here. What this send puts on that line is the honest OUTCOME below.
+
 The load-bearing constraint: **claude will not resume a session it is holding as a
 live agent.** `claude -p -r <id>` on such a session exits non-zero, verbatim:
 
@@ -1287,18 +1300,6 @@ live agent.** `claude -p -r <id>` on such a session exits non-zero, verbatim:
 This holds in EVERY held state — `done` included: a just-finished background job
 stays a registered agent (in the bare `agents::live_agents` list) until claude
 reaps it, and claude refuses it exactly like a working one.
-
-**Status-line ownership.** The help line below the search box is a keypress-scoped
-surface: it carries only **outcomes and refusals** (a send result, a launch
-warning, a paste-too-long nudge, a resume refusal). A fact that is true over an
-interval lives in typed state and renders on the pane that owns it: the quick
-reply's in-flight echo lives in `App::sending` and renders **inline** in the
-preview; a background-agent launch lives in `App::draft.launch_id` and renders on
-the draft card. `App::status` therefore never shows a transient `"sending…"` or
-`"starting…"` label; those are already visible on the surfaces that own them.
-Confirmations and nudges expire after `STATUS_DWELL_TICKS` ticks so they do not
-squat on the keymap row; failures and refusals stay sticky until the next
-actionable keypress, so a failed send or stop is never silently downgraded.
 
 **The unlock: `claude stop <job-id>`** deregisters the job — "Its conversation is
 kept" — after which `-p -r` resumes and appends **in place** (verified on the wire:

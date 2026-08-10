@@ -35,10 +35,14 @@ shell out to, or assume node.
 | Home dir | `dirs` | `=6.0.0` | resolves the default store root |
 | Errors | `anyhow` | `=1.0.103` | propagation in the core + TUI |
 | Parallel scan | `rayon` | `=1.12.0` | per-file parse in `SessionStore::load` |
+| Display width | `unicode-width` | `=0.2.2` | terminal COLUMN count (not char count) for `store::preview`'s markdown table cells, so inline markers and CJK/emoji keep columns aligned; already transitive via `ratatui` |
 
 All versions are pinned **exact** for reproducibility (see `Cargo.toml`
-comments). `Cargo.lock` is committed. Toolchain: stable Rust (developed on
-1.95).
+comments). `Cargo.lock` is committed. Edition 2021. The toolchain is pinned
+exact too — `rust-toolchain.toml` names `1.95.0` + `rustfmt`/`clippy`, and it is
+the single source of truth for local dev AND CI (rustup reads it locally,
+`actions-rust-lang/setup-rust-toolchain` reads it in the workflows), so "stable"
+can never silently move under a lint gate.
 
 ## Module map
 
@@ -71,7 +75,7 @@ the render framework.** That is why `agents::classify` buckets the undocumented
 | `search` | `src/search.rs` | The **only** place `nucleo` or `memchr` is called: substring index, incremental re-filter, highlight seam. Per keystroke the filter answers MEMBERSHIP with `memchr::memmem` over prebuilt haystacks — no nucleo, no UTF-32 conversion, no ranking (`App::order_filtered` owns display order). Smart case is decided per ATOM, selecting the cased or lowercased haystack. nucleo backs `match_indices` (the highlight) alone. |
 | `agents` | `src/agents.rs` | Agent detection via `claude agents --json`, read TWO ways through ONE fail-soft parser. `reported_agents` (`--all`, polled off-thread every `watch::AGENTS_REFRESH`, 5s, skipped while the board is idle — see [DOMAIN.md](DOMAIN.md#why-the-gate-does-not-read-the---all-map)) is the DISPLAY signal: `classify` buckets each qualifier into an `AgentActivity` that the preview banner, the list row's translated qualifier (both via `qualifier_copy`), list-badge color and pulse (which alternates that color, never the glyph) derive from. `live_agents` (bare, NO `--all`) is the HAND-OFF signal, taken one-shot at EVERY hand-off — the resume/attach gate and the `Ctrl-R`/`Ctrl-K` gates alike — and its records also carry the short job `id` that `claude attach`/`claude stop` take. Why the two readings must never be merged, and why an authoritative decision never reads the polled map, is [DOMAIN.md](DOMAIN.md#why-the-gate-does-not-read-the---all-map) — do not restate it here. Framework-free: it interprets the value set, while the color it maps to is the view's call. |
 | `defined_agents` | `src/defined_agents.rs` | DEFINED-agent discovery for a new session: fail-soft frontmatter scan of `~/.claude/agents/*.md` + `<launch_dir>/.claude/agents/*.md`, deduped (project over user). Distinct from `agents` (live vs. defined). |
-| `watch` | `src/watch.rs` | Debounced FS watcher + `EventLoop` that merges input/watcher/tick/agents onto one channel. The watcher filters each debounce batch through the shared `store::discover::is_session_path` predicate (`classify_watch_path` / `batch_needs_reload`) before emitting `SessionsChanged`, so an irrelevant write elsewhere in the store root never triggers a reload. The agents poller backs off to `AGENTS_REFRESH` (5s) and skips the `claude agents` shell-out once the board-activity stamp is older than `AGENTS_IDLE_AFTER` (60s) — see [DOMAIN.md](DOMAIN.md#reported-agents-srcagentsrs). |
+| `watch` | `src/watch.rs` | Debounced FS watcher + `EventLoop` that merges input/watcher/tick/agents onto one channel. The watcher classifies each debounce batch against BOTH halves of the shape rule `store::discover` owns — `store_depth` for WHICH LEVEL a path sits at, `is_session_path` for whether it is a session — and reloads only when the batch is not provably irrelevant (`classify_watch_path` / `batch_needs_reload`), so an irrelevant write elsewhere in the store root never triggers a reload. The agents poller backs off to `AGENTS_REFRESH` (5s) and skips the `claude agents` shell-out once the board-activity stamp is older than `AGENTS_IDLE_AFTER` (60s) — see [DOMAIN.md](DOMAIN.md#reported-agents-srcagentsrs). |
 | `resume` | `src/resume.rs` | Resume/fork/attach/new-session hand-off: re-read authoritative parts (or, for a new session, gate on the launch dir + optional `--agent <name>`), existence gate, spawn `claude`, return. Each `Ready` carries its own neutral non-zero hint (resume vs. new-session). |
 | `config` | `src/config.rs` | The SINGLE place that reads the environment to resolve snapback-owned paths: `config_dir()` (`$SNAPBACK_CONFIG_DIR` else `~/.config/snapback` — deliberately non-XDG on macOS, so one greppable home on every OS) and `state_dir()` (`<config>/state`, where `hidden` persists). No other module reads the env for these locations; future config/cache/state resolvers land here. |
 | `hidden` | `src/hidden.rs` | snapback's OWN persistent state (the ONLY thing it writes for itself): the soft-hidden session id set, in the `state/` subdir under the config dir (path resolved by `config`, file `hidden_sessions`), NOT the read-only store. Pure `parse_hidden`/`serialize_hidden` (newline-delimited, sorted for stable diffs) + fail-soft `load_hidden` / atomic `save_hidden` (temp file + rename). |
@@ -121,6 +125,18 @@ the exact wrapper answers a total and never the per-line map a hit-test needs �
 against the cached `LinkRegion`s, and a hit is opened off the render loop via
 `resume::open_url`.
 
+**An idle board still repaints every `TICK` (250 ms), and that is an ACCEPTED,
+DEFERRED cost — not an oversight.** The loop draws *before* every `recv()`, so
+each `AppEvent::Tick` costs one full render whether or not anything could have
+changed. The tick itself has to keep arriving (`App::tick` is the board's only
+clock: `view::blink_visible` phases the badge pulse off it and `App::tick_status`
+ages transient statuses on it), so the saving would have to come from deciding
+per event whether the next frame can differ from the last — a real change, with a
+real way to be wrong, and nobody has asked for it. Do not "fix" it in passing.
+The idle work that WAS removed is the `claude agents` shell-out
+([event source 4](#event-sources-watcheventloop)), which is a `claude` child per
+cycle rather than a diffed repaint.
+
 ### Event sources (`watch::EventLoop`)
 
 Four producers merged onto one `mpsc` channel of `AppEvent`:
@@ -135,11 +151,17 @@ Four producers merged onto one `mpsc` channel of `AppEvent`:
 2. **Watcher** — a recursive `notify` watch over the store root, debounced
    ~200ms; an entire settle batch coalesces to one `AppEvent::SessionsChanged`
    — but only once the batch is filtered through `classify_watch_path`
-   (`watch::batch_needs_reload`), the same depth-2 `.jsonl` predicate
-   discovery uses. A batch whose paths are all provably outside that shape
-   (too deep, or a proven non-session file/dir) is dropped before the store
-   ever reloads; anything uncertain (missing metadata, an ambiguous depth-1
-   directory) falls through to reload rather than risk missing a real change.
+   (`watch::batch_needs_reload`). That classifier re-uses the store's own shape
+   rule whole rather than re-deriving it: `store::discover::store_depth` says
+   which LEVEL the path sits at (`Root` / `CwdLevel` / `SessionLevel` /
+   `BelowSession` / `Outside`) and `store::discover::is_session_path` says
+   whether it is the depth-2 `.jsonl` discovery consumes. The level is what
+   metadata is then allowed to widen: a batch whose paths are all provably
+   outside the shape (below the session level, or a proven non-session
+   file/dir at or above it) is dropped before the store ever reloads, while
+   anything uncertain (missing metadata, a `CwdLevel` entry that is not
+   provably a file, the root itself, a path outside the root) falls through to
+   reload rather than risk missing a real change.
 3. **Tick** — a ~250ms `AppEvent::Tick` that drives redraw/autorefresh
    visibility (does nothing costly) and advances `App::tick`, the board's only
    clock — `view::blink_visible` phases the live-badge pulse (a color swap, via
@@ -327,7 +349,9 @@ through — while the `CAN`+`ST`+SGR-reset prefix heals the related `Ctrl-Z`
 variant where the child exits mid control-string and the board's own escapes
 render as literal text. The recovery bytes are harmless no-ops on a clean
 terminal, so they are prepended unconditionally on every board (re)entry. `CAN`
-and `ST` have no crossterm typed command, so this seam is the one narrow spot the
-terminal-management layer writes raw control bytes; the "never embed ANSI
-escapes" styling rule governs `view.rs`/`preview.rs` presentation, not terminal
-parser recovery here.
+and `ST` have no crossterm typed command — nor do step (2)'s kitty/DEC escapes
+(`CSI = 0 u`, `DECSTR`, `DECCKM`-off), each a named `const` byte array for the
+same reason — so this seam is the one narrow spot the terminal-management layer
+writes raw control bytes. Anything that DOES have a typed command uses it (the
+SGR reset does); the "never embed ANSI escapes" styling rule governs
+`view.rs`/`preview.rs` presentation, not terminal parser recovery here.
