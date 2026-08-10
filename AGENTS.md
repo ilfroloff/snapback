@@ -29,7 +29,11 @@ one place.
 - **SUBAGENT EXCLUSION BY DEPTH.** The only consumable session shape is
   `<root>/<cwd>/<id>.jsonl` at depth 2. The shared predicate
   `store::discover::is_session_path` decides this by name-shape alone and is
-  used by BOTH discovery and the watcher filter; never duplicate the rule.
+  used by BOTH discovery and the watcher filter; never duplicate the rule. Its
+  sibling `store::discover::store_depth` answers the other half — WHICH LEVEL a
+  path sits at — for the watcher, which must react to each level separately.
+  Those two own the shape between them: the depth literals exist in exactly one
+  `match`, and no consumer counts path components itself.
   NEVER descend into `<id>/subagents/`. Do not make discovery recursive.
   (`src/store/discover.rs`, `src/watch.rs`)
 - **THE PARSE CACHE NEVER DECIDES WHICH FILES EXIST — OR WHETHER A FILE IS A
