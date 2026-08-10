@@ -237,11 +237,45 @@ inner rect when there is no banner (so a banner-less pane's geometry is exactly
 
 The render loop must never block. A **recurring** shell-out (`claude agents
 --json --all`), a FS watch, and the input read all run on their own threads and
-deliver `AppEvent`s onto the merged channel. Threads exit when the receiver drops
-(bounded to the board session) and the input reader is **joined on `EventLoop`
-drop** so it releases stdin before `claude` is spawned onto the same fd. New
-background work follows the same pattern: own thread, `AppEvent` variant,
-self-terminating on send failure. The quick-reply send (`send::spawn_send`) is the
+deliver `AppEvent`s onto the merged channel.
+
+**What ENDS a recurring thread is a shared shutdown FLAG, not a failed send.**
+`EventLoop` owns an `Arc<AtomicBool>` that its `Drop` sets first, before anything
+else, and the two producers that nothing else can stop — the input reader and the
+agents poller — read that flag at the top of every loop turn. Three shapes result,
+and their differences are the pattern to copy:
+
+- The input reader is flag-signalled **and joined**. It never parks
+  indefinitely on stdin — it polls with an `INPUT_POLL_INTERVAL` timeout purely so
+  it can come back and read the flag — and `Drop` sets the flag, then `join()`s
+  the handle. The join is the load-bearing half: it proves the reader has released
+  fd 0 *before* `run` returns and `claude` is spawned onto that same stdin, and it
+  bounds each resume round trip's reader to that iteration so readers never
+  accumulate.
+- The agents poller is flag-**bounded but deliberately NOT joined**. It may be mid
+  shell-out, and a hand-off must never wait on a `claude` child, so teardown
+  states the request and moves on: the thread reads the flag at the top of every
+  turn and exits within one `interval` of the turn that observes it — plus, in
+  the worst case, the shell-out already in flight, because a flag set just after
+  a check is not read again until that turn's `claude` spawn AND its sleep have
+  both finished. Bounded is not immediate, and the slack is the point: it is
+  exactly what teardown buys by refusing to wait on a child.
+- A failed send is the **secondary** exit, and it is **insufficient on its own for
+  any producer whose emission is CONDITIONAL**. The tick thread may still rely on
+  it alone, because it sends every turn unconditionally, so a dropped receiver is
+  guaranteed to reach it. The agents poller may not: the moment it began skipping
+  the shell-out on an idle board, an idle poller sent nothing, noticed nothing,
+  and leaked one thread per resume round trip. Send failure now covers only the
+  window between the receiver dropping and the flag being read. (The watcher is
+  bounded a third way, by OWNERSHIP: `EventLoop` holds the `SessionWatcher`, and
+  dropping it stops the debouncer's thread.)
+
+New recurring background work follows THAT pattern: own thread, `AppEvent`
+variant, the shutdown flag read at the top of every loop turn, a failed send as a
+secondary exit — and a `join()` if, and only if, it holds something the next board
+session or a spawned child needs back (stdin is the one instance). Reason about
+the flag FIRST: "it exits when the send fails" is an argument about a send the
+thread may never attempt. The quick-reply send (`send::spawn_send`) is the
 reference instance: a **one-shot** detached thread — spawned per `Ctrl-R` send, not a
 poller — that runs the multi-second `claude -p` child to completion and delivers a
 single `AppEvent::SendFinished`. It mirrors `resume::open_url` (fire-and-forget off
@@ -315,6 +349,16 @@ the module's documented "could not resolve" answer, under which the scope falls
 back to its git-free repo-root arm — so no `App::new` call site spawns git and
 every one of them still gets the answer a user with no `git` on `PATH` would.
 Pick the default that makes an unconsidered case obvious, not merely convenient.
+
+The same seam appears one level down — as a plain PARAMETER rather than an `App`
+field — wherever the THREAD is the thing under test. `spawn_agents_thread` takes
+its `poll` and its `idle_after`; `spawn_input_thread` takes the terminal read it
+loops on. Both are named exactly once, in `EventLoop`, where production passes
+`agents::reported_agents` and the real crossterm `poll`+`read` pair. Nothing else
+may pass anything else: the seam exists so a test can state a poll's answer
+without spawning `claude`, and state an input event without a TTY, which is what
+makes the loop's own behavior — the idle gate it obeys, the board-activity stamp
+it writes — assertable at all.
 
 ## 7. Restrained, terminal-safe styling
 
@@ -416,10 +460,10 @@ and each collapsed segment to its marker line.
 
 No magic numbers. Tunables are named `const`s with a rationale comment near the
 top of their module: `DEBOUNCE` / `TICK` / `AGENTS_REFRESH` / `AGENTS_IDLE_AFTER`
-(`watch`), `LABEL_MAX` (`label`), `CONTENT_INDEX_CAP` (`parse`), `PREVIEW_LINES` /
-`TABLE_MAX_WIDTH` (`preview`), `PREVIEW_WHEEL_STEP` / `LIST_WHEEL_STEP` (`app`),
-`PASTE_MAX_CHARS` (`tui::update`), `BLINK_TICKS` (`view`). Add new tunables the
-same way.
+(`watch`), `LABEL_MAX` (`label`), `MTIME_SETTLE_WINDOW` (`store`),
+`CONTENT_INDEX_CAP` (`parse`), `PREVIEW_LINES` / `TABLE_MAX_WIDTH` (`preview`),
+`PREVIEW_WHEEL_STEP` / `LIST_WHEEL_STEP` (`app`), `PASTE_MAX_CHARS`
+(`tui::update`), `BLINK_TICKS` (`view`). Add new tunables the same way.
 
 A const whose rationale depends on ANOTHER const says so and names it:
 `BLINK_TICKS` is meaningless without `watch::TICK` (they multiply into the pulse's

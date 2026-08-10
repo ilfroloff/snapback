@@ -152,9 +152,14 @@ Four producers merged onto one `mpsc` channel of `AppEvent`:
    board-activity stamp (touched only by input events and emitted
    `SessionsChanged`) is older than `watch::AGENTS_IDLE_AFTER` (60s), the poller
    skips the shell-out but keeps sleeping on the same interval, so the first
-   activity after idle resumes polling within one cycle. It feeds badges/banner
-   only; the resume gate's liveness probe is a separate one-shot at hand-off and
-   is NOT an event source
+   activity after idle resumes polling within one cycle. Like the reader it
+   observes `EventLoop`'s shutdown flag once per turn — at the TOP, ahead of the
+   idle gate — so it is bounded to the board session even while idle, when it
+   sends nothing that could notice a dropped receiver. Unlike the reader it is
+   NOT joined, so teardown never waits on a `claude` child: it outlives the
+   request by up to one cycle plus whatever shell-out that turn had already
+   begun. It feeds badges/banner only; the resume gate's liveness probe is a
+   separate one-shot at hand-off and is NOT an event source
    (see [PATTERNS.md](PATTERNS.md#6-off-ui-thread-for-anything-that-can-block)).
 
 Three more NON-recurring producers join on demand, all via `EventLoop::sender` and

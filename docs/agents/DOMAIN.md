@@ -344,14 +344,18 @@ this cache at all, rather than reaching it and reusing every stamp. An
 unclassifiable path always falls through to reload, so this filter can only
 skip work, never miss a real change.
 
-Five rules hold it up, and none is negotiable:
+What the cache may and may not decide is a critical rule, and it is stated ONCE,
+in `AGENTS.md` ("THE PARSE CACHE NEVER DECIDES WHICH FILES EXIST — OR WHETHER A
+FILE IS A SESSION IT COULD NOT READ"). Read it there; it is not restated here.
+What follows is the MECHANISM behind it — how each half is actually held up, plus
+the two stamp rules that live only here.
 
-- **DISCOVERY IS NEVER CACHED.** It runs in full on every reload, and the new
+- **How discovery stays uncached.** It runs in full on every reload, and the new
   cache is REBUILT from the discovered set rather than edited in place. So a
   created session is parsed the first reload that sees it and a deleted one
   leaves the board with its entry. The cache answers what a discovered file
   CONTAINS; it is never asked which files exist.
-- **ONLY A VERDICT ABOUT CONTENT IS CACHED.** A read that FINISHED has two
+- **What counts as a verdict, and what does not.** A read that FINISHED has two
   possible answers, and both are durable facts about the bytes: this is a
   session, or it carries no `cwd` and so is not one (a sidecar — cached too, or
   every reload would re-read it). A read that FAILED is a third thing and is no
@@ -387,15 +391,9 @@ Five rules hold it up, and none is negotiable:
   toward a re-parse: an mtime in the future is never settled. Cost is bounded to
   the handful of transcripts being written right now, which is exactly where a
   cache is worth least.
-- **THE CACHE IS IN MEMORY, NEVER ON DISK.** It is derived, disposable state, not
-  snapback-owned state — see the [one file snapback
+- **Where it lives.** In memory: derived, disposable state, not snapback-owned
+  state — see the [one file snapback
   writes](#snapback-owned-state-srchiddenrs).
-
-The first two together rule out the failure a cache must never have here: a row
-may be briefly STALE, never missing. Discovery stops the cache deciding which
-files EXIST, and the content-verdict rule stops it deciding that a file it could
-not read is not a session. That asymmetry is the only thing that makes a cache
-acceptable in front of a tool whose whole purpose is finding sessions.
 
 A reload reports the ids it re-read (`Reload::changed`), which is a SUPERSET of
 what really differs (a file inside the settle window is listed even if its bytes
