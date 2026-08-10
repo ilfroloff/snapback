@@ -83,7 +83,7 @@ it. Follow this split when adding behavior:
   git — and is pinned against real captured porcelain bytes); `store::group`'s
   `repo_root_of` / `repo_of` (ONE pure marker scan, two consumers — the root path
   and its label — with inline path fixtures, including a NEGATIVE case that must
-  not collapse and a pinned known limitation); `App::in_scope` (the scope
+  not collapse and a pinned known limitation); `tui::app::in_scope` (the scope
   predicate, which takes the worktree set as a parameter rather than reaching for
   it, so it never resolves git and is tested from a seeded set); `store::lineage`'s `lineage_key` / `head_of` / `fold` (the whole
   fold is one pure fn of `(sessions, filtered, expanded)`, so the `(+N)` board can
@@ -360,6 +360,15 @@ without spawning `claude`, and state an input event without a TTY, which is what
 makes the loop's own behavior — the idle gate it obeys, the board-activity stamp
 it writes — assertable at all.
 
+What the seam does NOT cover is the production source on the far side of it, and
+that gap is **accepted, not overlooked**: `watch::read_terminal_event` has no
+direct test, because exercising it needs a real TTY — without a controlling
+terminal (CI) crossterm's `poll` errors immediately, so any test of it would
+assert the error path and call that coverage. It carries no decision of its own
+(a `poll` + `read` pair where either half's `Err` propagates unchanged), and
+everything downstream of it is pinned through the seam. Leave it untested rather
+than "fixing" it with a proxy assertion — see the false-clean modes below.
+
 ## 7. Restrained, terminal-safe styling
 
 The preview and list are styled with ratatui `Style` only — **never** embedded
@@ -458,12 +467,32 @@ and each collapsed segment to its marker line.
 
 ## 8. Name every constant
 
-No magic numbers. Tunables are named `const`s with a rationale comment near the
-top of their module: `DEBOUNCE` / `TICK` / `AGENTS_REFRESH` / `AGENTS_IDLE_AFTER`
-(`watch`), `LABEL_MAX` (`label`), `MTIME_SETTLE_WINDOW` (`store`),
-`CONTENT_INDEX_CAP` (`parse`), `PREVIEW_LINES` / `TABLE_MAX_WIDTH` (`preview`),
-`PREVIEW_WHEEL_STEP` / `LIST_WHEEL_STEP` (`app`), `PASTE_MAX_CHARS`
-(`tui::update`), `BLINK_TICKS` (`view`). Add new tunables the same way.
+No magic numbers. Every tunable is a named `const` carrying a rationale comment,
+declared at module scope — near the top where a module owns a handful of them
+(`watch`, `store`, `parse`, `label`), beside the code it governs where it is one
+of many (`tui::view`'s pane/modal/compose geometry). The complete set of
+CADENCES and LIMITS, so a retune knows what it is next to:
+
+| Module | Tunables |
+| --- | --- |
+| `watch` | `DEBOUNCE` (200 ms) · `TICK` (250 ms) · `AGENTS_REFRESH` (5 s) · `AGENTS_IDLE_AFTER` (60 s) · `INPUT_POLL_INTERVAL` (50 ms, private — the reader's wake-up cadence, so short teardown beats a busy spin) |
+| `store` | `MTIME_SETTLE_WINDOW` (2 s) |
+| `store::parse` | `CONTENT_INDEX_CAP` (64 KB) |
+| `store::label` | `LABEL_MAX` (180) |
+| `store::preview` | `PREVIEW_LINES` (600) · `TABLE_MAX_WIDTH` (96) |
+| `send` | `SEND_ERROR_MAX` (200) |
+| `tui::app` | `PREVIEW_WHEEL_STEP` (2) · `LIST_WHEEL_STEP` (1) · `STATUS_DWELL_TICKS` (16) · `MIN_PANE_WIDTH` (15) · `DEFAULT_LIST_PERCENT` (48) |
+| `tui::update` | `PASTE_MAX_CHARS` (4096) · `SPLITTER_TOLERANCE` (1) |
+| `tui::view` | `BLINK_TICKS` (2) · `CHILD_ID_CHARS` (8) · the layout rows `PREVIEW_BANNER_ROWS` / `BOARD_CHROME_ROWS` / `COMPOSE_*` / `MODAL_WIDTH` / `MODAL_*_CHROME_ROWS` |
+
+Add a new tunable the same way. The rule is not only about numbers — a literal
+with a meaning gets a name whatever its type: the undocumented `claude agents`
+wire tokens (`agents::KIND_*` / `QUALIFIER_*`), the raw control bytes the
+terminal seam writes because crossterm publishes no typed command for them
+(`tui`'s `CAN` / `ST` / `KITTY_DISABLE_KEYBOARD` / `DECSTR` / `DECCKM_OFF`), and
+the path literals the grouping heuristic scans for (`store::group`'s
+`PATH_SEPARATOR` / `HIDDEN_DIR_PREFIX`). `tui::TICK` is not a second knob — it is
+an alias of `watch::TICK`, which stays the one definition.
 
 A const whose rationale depends on ANOTHER const says so and names it:
 `BLINK_TICKS` is meaningless without `watch::TICK` (they multiply into the pulse's
