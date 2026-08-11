@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/ilfroloff/snapback/compare/v0.6.1...v0.7.0) - 2026-08-11
+
+### Added
+
+- reload only the transcripts that changed, with a forced rescan key
+- add a project scope spanning the launch repo's worktrees
+
+### Fixed
+
+- bound the background threads and restore non-UTF-8 discovery
+- stop the watcher and the agents poll from burning idle CPU
+- count the project's conversations, not every session file
+
+### Other
+
+- correct the agent guide against the code it describes
+
 ## [0.6.1](https://github.com/ilfroloff/snapback/compare/v0.6.0...v0.6.1) - 2026-08-03
 
 ### Fixed
