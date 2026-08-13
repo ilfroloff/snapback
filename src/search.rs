@@ -59,8 +59,8 @@
 //! searching a lowercased haystack case-sensitively, matching nothing.
 //!
 //! Lowercasing happens ONCE per entry at build/refresh, never per keystroke. The
-//! cost is ~2× the (64 KB-capped) content in memory: bounded and cheap at this
-//! scale.
+//! cost is ~2× the extracted content in memory — bounded by `store::parse`'s
+//! `CONTENT_INDEX_CAP` and cheap at this scale (tens of MB store-wide).
 //!
 //! # Scope-limited matching
 //!
@@ -195,8 +195,8 @@ impl SearchMode {
 /// (`name_lower` / `content_lower`) backs the case-INSENSITIVE branch — see the
 /// module docs. Neither is redundant: dropping the cased pair would break every
 /// uppercase-bearing query, and dropping the lowercased pair would force a
-/// re-casing allocation per entry per keystroke. The cost is ~2× the
-/// (64 KB-capped) content in memory.
+/// re-casing allocation per entry per keystroke. The cost is ~2× the extracted
+/// content in memory, bounded by `store::parse`'s `CONTENT_INDEX_CAP`.
 struct Entry {
     /// Stable session id; the key used to reuse entries across a refresh.
     session_id: String,

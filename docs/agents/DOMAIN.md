@@ -268,10 +268,34 @@ group head per repo→branch group, git-log style.
 
 ### Content index (`store::parse`)
 
-A capped (`CONTENT_INDEX_CAP` = 64 KB) in-memory string of readable transcript
-text (user/assistant text blocks + summaries; tool params/thinking omitted),
-truncated on a UTF-8 char boundary. Extracted **once at load**; the name+content
-search mode searches it without re-reading disk.
+An in-memory string of readable transcript text (user/assistant text blocks +
+summaries; tool params/thinking omitted), extracted **once at load**; the
+name+content search mode searches it without re-reading disk. It is bounded by
+`CONTENT_INDEX_CAP` — a **safety ceiling** of 1 MB against a pathological file,
+truncated on a UTF-8 char boundary — and not by a working budget.
+
+That distinction is load-bearing, because the buffer keeps the **oldest** bytes:
+whatever the bound cuts is the most RECENT work, the same end of the transcript
+the [label](#label-storelabel) is already taken from. At its former 64 KB the cut
+was routine rather than pathological (measured over 388 session files / 190 MB
+raw, 2026-08-13): of 9.38 MB of readable text in the store only 7.97 MB was
+indexed, **37 sessions (9.5%) were truncated**, and **275 typed prompts (15.3%)**
+sat past the bound where no content search could reach them. The distribution
+puts p50 at 12.7 KB and p90 at 63.8 KB — the old bound sat exactly on p90 —
+against a p99 of 175 KB and an observed maximum of 252 KB, which 1 MB is ~4× of.
+
+Raising it is affordable because total indexed bytes are bounded by the CONTENT,
+never by `sessions × cap`. The haystack is held in **four** live copies, and a
+re-derivation has to count all four: this field on the board (`App::sessions`),
+its clone in the parse cache (`SessionStore::reload_at` clones the `Session`
+INTO the cache on insert and back OUT of it on reuse, and `lib::run` keeps that
+store alive beside the board for the whole process), plus `search`'s cased and
+lowercased entries below. So indexing the store whole moved it from ~31.9 MB to
+~37.5 MB: **+5.6 MB (+18%)** for the 15% of typed work that was previously
+unfindable. Those are LENGTH-based figures and so a floor: a freshly parsed
+buffer grows by doubling and `String::truncate` does not shrink capacity, so it
+carries allocation slack until the next reload hands the board a tightly
+allocated clone of the cached copy instead.
 
 Per keystroke, `search` answers **membership only**: does every query atom occur
 as a byte substring? `memchr::memmem` (SIMD, no allocation, no UTF-8 → UTF-32
@@ -285,7 +309,7 @@ therefore provably could not reach the screen, yet producing one dominated the
 keystroke: nucleo's `Utf32Str` conversion allocates a full `Vec<char>` for any
 non-ASCII haystack at ~8.6 ns/byte, and **86% of entries are non-ASCII** once
 `serde_json` decodes `\uXXXX` escapes (the raw files are pure ASCII — the decoded
-`content_index` is what nucleo saw). So scoring every session's 64 KB of content
+`content_index` is what nucleo saw). So scoring every session's content
 rebuilt megabytes of UTF-32 on the UI thread to order a list about to be
 re-ordered by timestamp. Measured against the real corpus (66 entries, 1.29 MB of
 haystack, 2026-07-17), dropping the rank stage moved the worst keystroke `n` from
@@ -294,8 +318,8 @@ worst case (`zzzqqq`, nothing found, full scan) at **28.7 µs** — below the ol
 best case. Cost is now linear in haystack bytes with no per-entry conversion, so
 the win grows with the corpus.
 
-Each haystack is kept in **two** copies (bounded by the 64 KB cap) and both are
-load-bearing: smart case is decided **per atom**, so an atom carrying an
+Each haystack is kept in **two** copies (bounded by the ceiling above) and both
+are load-bearing: smart case is decided **per atom**, so an atom carrying an
 uppercase char searches the *cased* copy case-sensitively while a lowercase atom
 searches the *lowercased* copy. That branch is not an optimization — answering an
 uppercase query from the lowercased copy is an inclusion regression (measured:
@@ -311,9 +335,9 @@ launch folder), so this narrows the work per keystroke without changing what is
 indexed.
 
 There is deliberately **no on-disk index** (YAGNI at the observed few-hundred
-sessions — ~270 when last measured, 2026-07-15): the whole content corpus is a
-few single-digit MB held in memory and the gate keeps per-keystroke matching
-instant, so a SQLite/FTS index would be pure overhead. The mtime-keyed half of
+sessions — 388 when last measured, 2026-08-13): the whole content corpus is a few
+tens of MB held in memory and the gate keeps per-keystroke matching instant, so a
+SQLite/FTS index would be pure overhead. The mtime-keyed half of
 that idea has since landed **in memory**, where it costs nothing to be wrong —
 see [incremental reload](#incremental-reload-storesessionstore) — and it is what
 keeps a reload from re-extracting every haystack. The remaining escalation is
@@ -594,10 +618,11 @@ they are separate notions that happen to overlap.
 
 **It is a real counter, never read off `content_index`.** That buffer stops at
 `CONTENT_INDEX_CAP` ([above](#content-index-storeparse)), so a count derived from
-it would silently stop at ~64 KB and understate exactly the long sessions most
-worth telling apart — a 200-turn file would report 64. The counter sees every
-record, so the cap cannot reach it (pinned by
-`msg_count_keeps_counting_past_the_content_index_cap`).
+it would silently stop at the ceiling and understate exactly the long sessions
+most worth telling apart. The counter sees every record, so the ceiling cannot
+reach it (pinned by `msg_count_keeps_counting_past_the_content_index_cap`, whose
+fixture is sized OFF the ceiling so that retuning it cannot quietly leave the
+fixture too small to prove anything).
 
 **FAIL-SOFT**, like every field here: a file with nothing said in it counts 0 and
 stays a session, and a missing or non-string `type` simply does not count rather

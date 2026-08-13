@@ -22,10 +22,23 @@ use serde_json::Value;
 
 use super::label;
 
-/// Cap the per-session searchable transcript text at ~64 KB. Keeps the in-memory
-/// content index a few MB across the whole store at current scale; if the store
-/// grows into the thousands this is the boundary to move to an on-disk cache.
-pub const CONTENT_INDEX_CAP: usize = 64 * 1024;
+/// SAFETY CEILING on the per-session searchable transcript text — a bound
+/// against one pathological file, NOT a working memory budget. 1 MB is ~4x the
+/// largest readable transcript measured in a real store, so no genuine session
+/// reaches it.
+///
+/// It WAS a 64 KB budget, and the difference is not academic: this buffer keeps
+/// the OLDEST bytes, so whatever the bound cuts is the most RECENT work. At
+/// 64 KB the cut was routine rather than pathological — it landed on the p90 of
+/// the corpus and hid ~15% of everything ever typed from content search. Sizing
+/// the bound off the corpus is what makes it affordable: total indexed bytes are
+/// bounded by the CONTENT, never by `sessions x cap`. Distribution and the
+/// memory it costs: `docs/agents/DOMAIN.md#content-index-storeparse`.
+///
+/// KEEP the ceiling. Without one a single runaway file would define the store's
+/// memory. If the store grows into the thousands of sessions, that is the
+/// boundary to move to an on-disk cache.
+pub const CONTENT_INDEX_CAP: usize = 1024 * 1024;
 
 /// What one candidate file turned out to be — the three answers a fail-soft read
 /// can give, kept apart because only TWO of them are statements about the file.
@@ -115,8 +128,8 @@ pub struct ParsedFile {
     ///
     /// Counted in the streaming pass, NEVER derived from [`content_index`]:
     /// that buffer stops at [`CONTENT_INDEX_CAP`], so a long session's turns
-    /// would silently stop being counted at ~64 KB. This is a real counter over
-    /// every record, so the cap cannot reach it.
+    /// would silently stop being counted at that ceiling. This is a real counter
+    /// over every record, so the ceiling cannot reach it.
     ///
     /// Deliberately a NARROWER set than the four tree types [`root_uuid`]
     /// reasons about — do not unify the two. See the counting site in
@@ -297,7 +310,8 @@ fn file_stem(path: &Path) -> String {
 
 /// Append the readable text of a user/assistant/summary record to the search
 /// index. Text blocks only (tool params/thinking are omitted to keep the index
-/// readable and small); breadth is bounded by [`CONTENT_INDEX_CAP`].
+/// readable — and that omission, not the ceiling, is what keeps it a small
+/// fraction of the raw bytes); breadth is bounded by [`CONTENT_INDEX_CAP`].
 fn append_readable(record: &Value, buf: &mut String) {
     let text = match record.get("type").and_then(Value::as_str) {
         Some("user") | Some("assistant") => record
@@ -628,15 +642,19 @@ mod tests {
     fn msg_count_keeps_counting_past_the_content_index_cap() {
         // The counter is its own pass over every record, NOT a read of
         // `content_index` — which is exactly why the cap objection to the old
-        // `content_index`-as-a-proxy idea does not apply to it. Each turn below
-        // carries ~1 KB of text, so the index fills and stops long before the
-        // records do; the count must not stop with it.
-        let body = "x".repeat(1024);
+        // `content_index`-as-a-proxy idea does not apply to it. The index fills
+        // and stops long before the records do; the count must not stop with it.
+        const TURN_BYTES: usize = 1024;
+        // Sized OFF the ceiling, deliberately: a hardcoded turn count stops
+        // reaching the ceiling the moment `CONTENT_INDEX_CAP` is retuned, and
+        // the assertion below then fails for the uninteresting reason instead of
+        // pinning anything. The margin puts the overrun beyond one turn.
+        let turns = CONTENT_INDEX_CAP / TURN_BYTES + 64;
+        let body = "x".repeat(TURN_BYTES);
         let mut lines: Vec<String> = vec![
             r#"{"type":"attachment","sessionId":"s","cwd":"/w","uuid":"att-1","parentUuid":null,"attachment":{}}"#
                 .to_string(),
         ];
-        let turns = 200;
         for i in 0..turns {
             lines.push(format!(
                 r#"{{"type":"user","sessionId":"s","cwd":"/w","uuid":"u-{i}","parentUuid":"att-1","message":{{"role":"user","content":"{body}"}}}}"#
@@ -655,6 +673,67 @@ mod tests {
             "the cap truncates the searchable text, never the turn count — a \
              count that stopped at the cap would silently understate exactly the \
              long sessions worth telling apart"
+        );
+    }
+
+    #[test]
+    fn the_most_recent_turn_of_a_real_sized_session_stays_findable() {
+        // WHY THIS EXISTS: the index keeps the OLDEST bytes, so whatever
+        // `CONTENT_INDEX_CAP` cuts is the most RECENT work — the end of the
+        // transcript, which is the part people search for. The reported bug had
+        // exactly this shape: a marker typed near the end of an ordinary
+        // session sat past the old 64 KB bound and content search could not
+        // reach it, while every test still passed.
+        //
+        // WHAT A RETUNE WOULD BREAK: this fixture is sized off a LITERAL, never
+        // off `CONTENT_INDEX_CAP`, so lowering the ceiling back under a real
+        // session's size turns it red. Its neighbour above sizes off the
+        // constant deliberately and therefore holds at ANY value — between them,
+        // that one proves the turn count outruns the ceiling and this one proves
+        // the ceiling clears a real transcript. Neither substitutes for the
+        // other.
+        //
+        // 200 KB is ORDINARY, not extreme: measured over a real store the
+        // readable text ran to a p99 of 175 KB and a maximum of 252 KB
+        // (`docs/agents/DOMAIN.md#content-index-storeparse`), so a ceiling that
+        // cannot hold this much is re-introducing the bug rather than tuning it.
+        const ORDINARY_SESSION_BYTES: usize = 200 * 1024;
+        // Padding turn size; only its ratio to the total matters.
+        const TURN_BYTES: usize = 1024;
+        // A token the padding cannot produce, so a hit can only be the LAST
+        // turn. Shaped after the marker in the session that surfaced this, which
+        // sat at readable-text offsets ~187-248 KB — past the old bound.
+        const RECENT_WORK_MARKER: &str = "MRK-2805-last-turn";
+
+        let body = "x".repeat(TURN_BYTES);
+        let mut lines: Vec<String> = vec![
+            r#"{"type":"attachment","sessionId":"s","cwd":"/w","uuid":"att-1","parentUuid":null,"attachment":{}}"#
+                .to_string(),
+        ];
+        for i in 0..ORDINARY_SESSION_BYTES / TURN_BYTES {
+            lines.push(format!(
+                r#"{{"type":"user","sessionId":"s","cwd":"/w","uuid":"u-{i}","parentUuid":"att-1","message":{{"role":"user","content":"{body}"}}}}"#
+            ));
+        }
+        // Said LAST, where a truncation lands.
+        lines.push(format!(
+            r#"{{"type":"user","sessionId":"s","cwd":"/w","uuid":"u-latest","parentUuid":"att-1","message":{{"role":"user","content":"{RECENT_WORK_MARKER}"}}}}"#
+        ));
+        let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let parsed = parse_lines("recent-work", &borrowed).expect("file has a cwd");
+
+        assert!(
+            parsed.content_index.contains(RECENT_WORK_MARKER),
+            "the last thing said in an ordinary {} KB session must stay \
+             searchable, but the index stopped after {} bytes",
+            ORDINARY_SESSION_BYTES / 1024,
+            parsed.content_index.len()
+        );
+        assert!(
+            parsed.content_index.len() > ORDINARY_SESSION_BYTES,
+            "the fixture must really carry {} KB of readable text, or it proves \
+             nothing about a real session",
+            ORDINARY_SESSION_BYTES / 1024
         );
     }
 
