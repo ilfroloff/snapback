@@ -477,7 +477,7 @@ CADENCES and LIMITS, so a retune knows what it is next to:
 | --- | --- |
 | `watch` | `DEBOUNCE` (200 ms) · `TICK` (250 ms) · `AGENTS_REFRESH` (5 s) · `AGENTS_IDLE_AFTER` (60 s) · `INPUT_POLL_INTERVAL` (50 ms, private — the reader's wake-up cadence, so short teardown beats a busy spin) |
 | `store` | `MTIME_SETTLE_WINDOW` (2 s) |
-| `store::parse` | `CONTENT_INDEX_CAP` (64 KB) |
+| `store::parse` | `CONTENT_INDEX_CAP` (1 MB) |
 | `store::label` | `LABEL_MAX` (180) |
 | `store::preview` | `PREVIEW_LINES` (600) · `TABLE_MAX_WIDTH` (96) |
 | `send` | `SEND_ERROR_MAX` (200) |
