@@ -65,9 +65,14 @@ KEYS:
                   failed) stops at once, every other live agent confirms first;
                   a session claude isn't holding, or one running interactively,
                   has no job to stop (Enter stops, Esc cancels)
-    Tab           toggle name / name+content search
+    Tab           toggle name / name+content search. Widening to content also
+                  opens the preview on the most recent match, as typing does
     PgUp/PgDn     preview page  Ctrl-U/Ctrl-D  preview quarter-page
     Home/End      preview top / bottom
+    Shift+↑/↓     jump the preview to the previous / next line the query marks.
+                  Only while something is marked there — with nothing marked they
+                  stay plain move, so they never take a key away from you. One
+                  stop per marked line, not per repeated word
     wheel         scroll preview / list (mouse mode on; hold Shift/Option to select)
     paste         your terminal's own paste (Cmd/Ctrl-V, middle-click) is inserted
                   as TEXT: into a compose draft at the cursor, newlines and all, or

@@ -97,7 +97,17 @@ it. Follow this split when adding behavior:
   `(members, hidden)` — so the sentence that discloses off-screen lineage members
   is testable without a store, a modal or a terminal);
   `view`'s `wrapped_text_rows` / `clamp_preview_offset` / `preview_split` /
-  `centered_rect` / `highlight_runs` / `fit_label` (the marker-vs-label width
+  `centered_rect` / `highlight_runs` and its STYLED sibling
+  `highlight_matched_spans` (the same char-safe run split, but over a line that
+  arrives ALREADY styled — it splits the line's own spans at the matched
+  positions and ADDS a `Modifier` to those runs, so a marked word inside DIM code
+  stays DIM. It promises three things the pane depends on: byte-identical text
+  (hence unchanged display width, which the link hit-test measures in), one line
+  in and one line out (hence an unchanged wrapped-row count), and char-boundary
+  splits only. Its match map is derived in `App::preview_matches` by re-searching
+  the RENDERED lines — never by projecting a `content_index` offset, see
+  [DOMAIN.md](DOMAIN.md#a-content-index-position-never-projects-into-preview-coordinates))
+  / `fit_label` (the marker-vs-label width
   reservation, pure so it is tested as arithmetic rather than only through a
   rendered pane) / `child_msgs` and `fit_child_msgs` (a lineage child's
   turn-count segment and whether the row can afford it — ALL-OR-NOTHING: the
@@ -136,10 +146,32 @@ changed.
 
 `results` answers **membership only** — every atom present as a byte substring,
 via `memchr::memmem` — and returns candidates in the order given. nucleo is not
-on that path; it backs the **highlight seam** (`match_indices`) alone. Do not
+on that path; it backs the **row-LABEL highlight** (`match_indices`) alone. Do not
 re-introduce ranking: `App::order_filtered` re-sorts every result by a **tie-free
 total order**, so a rank cannot reach the screen, and computing one cost 76–81%
 of each keystroke through nucleo's `Utf32Str` UTF-32 conversion.
+
+The preview's marks are the **filter's**, not nucleo's: `atom_match_positions`
+runs the same memmem finders over one rendered line and returns the CHAR
+positions **any atom** covers. Which seam a surface takes follows from what the
+surface IS. A row label is ONE string and the row is on the board because that
+string matched, so nucleo's whole-pattern answer fits it exactly. A transcript is
+MANY strings admitted by atoms occurring anywhere in it, so demanding every atom
+per line marks nothing the moment the words sit on different lines — and an
+unmarked pane cannot explain why the row is there. Consequences to keep: several
+runs on one line are normal, and marks are a **union** (overlapping or abutting
+runs merge into one span, never two).
+
+Where those positions become SPANS — `match_runs`, the one splitter behind both
+the row label and the preview, in `src/tui/view.rs` — a run that would end inside
+a grapheme cluster snaps **out** to the cluster's edges and merges with whatever
+it now touches. It marks at most one extra codepoint; the alternative is worse
+than cosmetic, because `Line::width` sums a **contextual** `unicode-width` PER
+SPAN. Cut an emoji off its VS16 (-1 column) or its skin-tone modifier (+2), and
+the summed width of text that did not change moves — desyncing BOTH caches
+measured on the unsplit lines (`preview_hit_context`'s widths and
+`preview_wrapped_rows`) from the line actually painted, and moving where ratatui's
+wrapper (which segments per span too) breaks the row.
 
 Two invariants are easy to break and expensive to get wrong:
 
@@ -153,8 +185,9 @@ Two invariants are easy to break and expensive to get wrong:
   lowercased one the case-insensitive branch. Neither is dead; deleting the cased
   one breaks every uppercase query.
 
-`gate_atoms` mirrors nucleo's splitter so the filter and the highlight demand the
-same atoms; keep them in lockstep. Where the two deliberately diverge (the
+`gate_atoms` is the ONE splitter: the filter, the preview marks and nucleo's
+label highlight all demand the same atoms from it — never re-split a query
+somewhere else. Where the memmem side and nucleo deliberately diverge (the
 upstream non-ASCII tail off-by-one, unicode normalization, the per-atom case
 predicate on non-ASCII atoms), the module docs enumerate it and a test pins it.
 
@@ -176,7 +209,7 @@ taller than the pane, which is the normal case. The status banner is the
 instance: `view::preview_split(area, has_banner)` carves the pane's inner rect
 into a pinned banner row and the transcript beneath it, and returns the WHOLE
 inner rect when there is no banner (so a banner-less pane's geometry is exactly
-`Block::inner`, unchanged). Three rules follow:
+`Block::inner`, unchanged). The rules that follow from it:
 
 - `preview_split` is the ONE place the banner/transcript geometry is derived.
   `render_preview` draws against its rects and `update::link_under_pointer`
@@ -211,6 +244,61 @@ inner rect when there is no banner (so a banner-less pane's geometry is exactly
   `preview_cache` entry, so it can never be invalidated apart from the text it
   describes; whatever is NOT that cached transcript (the draft card, an in-flight
   reply's echo turns) is measured at the draw site.
+- **A row OFFSET is that same accessor asked for a PREFIX.** The pane scrolls
+  itself onto a search match, and the row it scrolls to is
+  `wrapped_text_rows(&lines[..k], width)` — the wrapped height of everything above
+  matched line `k`, which IS the first screen row that line occupies. That
+  identity holds because `Wrap { trim: false }` wraps each logical line
+  independently and never joins two onto one row, so a wrapped row count is
+  ADDITIVE over lines (the same property the in-flight reply tail is added by).
+  `view::MATCH_JUMP_LEAD_DIVISOR` then backs the offset off by a third of the
+  viewport so the match lands with context above it, and the ordinary
+  `clamp_preview_offset` bounds the result. The approximate model is no more
+  substitutable here than it is for a height: it would park the match rows away
+  from where the wrapper paints it.
+- **The match jump is armed by a USER ACT, not by a session being written.** It is a
+  pending FLAG (`App::preview_match_jump`), and its whole correctness is in where
+  it is armed: `request_preview_match_jump` is called from the selection setter and
+  from the one query-change funnel (`apply_query_change`), and nowhere else — which
+  is why the `Tab` mode toggle goes through that funnel rather than straight to the
+  re-filter: the query text does not move, but the same text now matches more. The
+  setter arms only when the id actually MOVES, and a reload restores the selection by
+  id, so the setter is a no-op there — which is what stops a live session appending
+  turns at the watcher's cadence from yanking the reader's viewport every few hundred
+  milliseconds. The exception is the reload whose selected row VANISHED from disk:
+  restoring then clamps to a neighbour, a different id, and the flag arms. That is
+  benign — the previewed session changed under the reader regardless, and the same
+  branch re-anchors the pane. The flag is CONSUMED in
+  `render_preview`, the only place the pane's width and height are known, and is
+  dropped rather than deferred by EVERY frame that cannot act on it — something
+  else owns the pane (a draft card), nothing is selected, or `Ctrl-/` hid the pane
+  so that function never ran at all (the hidden branch of `render_body` takes it
+  there). Enumerate all of them or the flag survives onto an unrelated later frame:
+  the board draws before it reads the next key, so the frame that cannot act on a
+  request is the last one that will ever see it. Arm any future
+  auto-scroll the same way: inside the branch that fires only when the state actually
+  MOVED, never on the recompute a reload shares.
+  The mode gate lives at the arming site too — the AUTOMATIC jump is
+  `SearchMode::NameAndContent`'s alone, while the explicit `Shift`-arrow step is a
+  keypress and needs no such assumption.
+- **The bottom anchor is ONE flag, and nothing overrides it for a frame.**
+  `App::preview_follow_bottom` answers "is this pane still anchored, or did the
+  reader position it?", so a surface that wants the tail follows it THROUGH that
+  flag — arming it at the user's act — and never ORs its own condition into the
+  render's decision. The in-flight quick reply is the instance and the trap: its
+  tail is `Some` for the WHOLE duration of a send while `render_preview` runs
+  several times a second (the spinner redraws every tick), so `follow ||
+  sending` re-asserted the anchor on every one of those frames and undid — one
+  frame later — whatever the reader or the match jump had just done. A one-shot
+  cannot win against a per-frame recompute; give the decision state that outlasts
+  the frame instead. Every transition is a USER ACT: ANY scroll releases the
+  anchor (in either direction — a scroll states a position, not a subscription),
+  and only `End`, another row, or re-showing the pane re-arms it. The render
+  writes the flag for exactly one thing, the match jump it alone can resolve, and
+  never infers a re-arm from its own CLAMP: an offset the content cannot satisfy
+  is equally a reader scrolling past the end, a pane widened by a resize, and a
+  transcript that shrank, so re-arming on it took a deliberately positioned pane
+  away with no key pressed.
 - `has_banner` is **`view::preview_banner(app).is_some()` — never liveness**.
   Since the poller passes `--all`, an agent that reported completion still has a
   banner while claude would not call it live; keying the geometry on liveness
@@ -377,6 +465,16 @@ small palette of **named** ANSI `Color`s (they adapt to the user's terminal
 theme). Do **not** hardcode RGB (it can vanish on a light background) and do not
 syntax-highlight code (code is DIM). The markdown pass in `store::preview` is
 hand-rolled and self-contained — no external markdown crate.
+
+**A mark laid OVER existing style is a `Modifier`, never a color.** The two
+search-match highlights are the pair to compare: a list row's label is plain text
+the view owns, so it takes a color plus BOLD, whereas a preview line arrives
+already styled by `store::preview`, so `view::PREVIEW_MATCH_MODIFIER`
+(`REVERSED`) is COMPOSED onto whatever style it lands on. A foreground color
+there would erase the line's own meaning — and on the wrong terminal theme, the
+text with it. `REVERSED` in particular is the one attribute this board already
+relies on being honored (the list's selection highlight), unlike the blink
+attribute below.
 
 This is why the live badge honors "Claude's palette" as the named `Yellow` /
 `Green` / `Gray` rather than brand hex: named colors stay legible on a light
@@ -591,6 +689,21 @@ Add a keybinding by extending the `Action` enum + `key_to_action` + `apply_actio
 and covering it with a `key_to_action` unit test. Then satisfy the KEEP KEY DOCS IN
 SYNC rule in [AGENTS.md](../../AGENTS.md), which owns the list of surfaces that
 must agree — do not re-enumerate them here.
+
+A binding that is only meaningful sometimes is **CONDITIONAL, and falls through**
+rather than going inert. `key_to_action` takes the conditions as parameters
+(`query_empty`, `has_preview_matches`) so the decision stays pure and the
+fall-through is what a test can pin; the guarded arm sits ABOVE the unguarded one
+and the unguarded one is reached whenever the guard fails. The shifted arrows are
+the instance: with nothing marked to move between they are bit-for-bit the
+`MoveUp`/`MoveDown` they have always been, so a user who never searches loses
+nothing AND a terminal that drops the modifier degrades to a working key. Prefer
+`Shift`+key over `Alt`+key for anything new here: snapback never pushes the kitty
+keyboard protocol and clears it on every board (re)entry
+(`tui::reset_terminal_state`), so on default macOS terminals `Alt` arrives as a
+composed character that types junk into the query, and a split `ESC` read
+surfaces as a bare `Esc` — which quits the board. `Shift` rides the ordinary
+`CSI 1;2<final>` encoding crossterm already decodes into a `KeyModifiers::SHIFT`.
 
 ## 11. Status-line ownership
 

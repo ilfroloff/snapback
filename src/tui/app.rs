@@ -60,6 +60,20 @@ pub const MIN_PANE_WIDTH: u16 = 15;
 /// this feature replaces.
 const DEFAULT_LIST_PERCENT: u32 = 48;
 
+/// The nudge shown when a content-search hit has NO occurrence inside the
+/// rendered preview, so the pane marks nothing the user can see.
+///
+/// The two pipelines are independent and lossy in different places (see
+/// [DOMAIN.md](../../docs/agents/DOMAIN.md#a-content-index-position-never-projects-into-preview-coordinates)): the
+/// `content_index` reaches turns and wrapper bodies the preview collapses,
+/// drops or tail-caps away. Roughly one hit in eight lands there (a one-off
+/// measurement, upper bound — DOMAIN.md states its provenance), and an
+/// unexplained unmarked pane reads as a broken highlight, so the board says so
+/// instead. A
+/// nudge, not a refusal, so it is TRANSIENT (STATUS-LINE OWNERSHIP); named
+/// rather than inlined so the one wording lives in one place (NO MAGIC VALUES).
+const MATCH_OUTSIDE_PREVIEW: &str = "match is outside the previewed transcript";
+
 /// Prefix of the board status shown when persisting the hidden-id set fails.
 /// Hidden state is a CONVENIENCE, so a write error degrades to a message rather
 /// than aborting the board; the in-memory set stays authoritative for the rest
@@ -896,6 +910,72 @@ struct CachedPreview {
     /// because that wrapper walks the whole transcript and the pane redraws several
     /// times a second.
     wrapped_rows: usize,
+    /// Where the active query occurs in `rendered`: line index -> the matched CHAR
+    /// positions within THAT line's plain text.
+    ///
+    /// Derived by re-searching the RENDERED lines through
+    /// [`SearchIndex::atom_match_positions`] — never by projecting a position out of
+    /// `Session::content_index`, which is a different, lossy extraction with no
+    /// offset function into these lines (see
+    /// [DOMAIN.md](../../docs/agents/DOMAIN.md#a-content-index-position-never-projects-into-preview-coordinates)). Only
+    /// lines with at least one match are present, so an unmatched transcript costs
+    /// an empty map.
+    ///
+    /// That seam marks PER ATOM, with the FILTER's own memmem finders, so the marks
+    /// reproduce the rule the row was admitted by: a multi-atom query marks each
+    /// atom on whichever line carries it, and MULTIPLE runs on one line are normal.
+    /// The row LABEL is the other case — one string, matched as a whole — and stays
+    /// on the nucleo seam.
+    matches: HashMap<usize, HashSet<usize>>,
+    /// The query [`matches`](Self::matches) was computed for — the recompute key.
+    ///
+    /// The MODE is deliberately not part of it: the seam searches the query's atoms
+    /// in the display string alone, so widening the filter to content cannot move
+    /// where the query occurs in these lines.
+    matches_query: String,
+}
+
+/// One rendered preview line as PLAIN text: its spans' contents, concatenated.
+///
+/// This is the string the mark seam is asked about, so the char positions it
+/// answers with address exactly this concatenation — which is what lets the view
+/// split the line's spans at them.
+fn line_text(line: &Line<'_>) -> String {
+    line.spans.iter().map(|s| s.content.as_ref()).collect()
+}
+
+/// Which matched line a `Shift-Up` / `Shift-Down` step lands on.
+///
+/// `lines` is the ascending set of matched line indices; `current` is where the
+/// pane is parked, with `None` meaning "not parked", read as the LAST match — the
+/// same place [`App::preview_match_target`] sends an un-stepped jump, so the first
+/// `Shift-Up` after typing a query moves off the last match rather than back to it.
+///
+/// `current` is treated as a BOUNDARY, not as a set member: the step takes the
+/// nearest match strictly beyond it in the chosen direction. That is what makes a
+/// stale index harmless — a reload can re-render the transcript under a parked
+/// line, and the step still lands on a real match rather than on nothing.
+///
+/// Clamped at both ends: stepping past the last match returns the last match
+/// again (and the caller still jumps, re-centering the pane), never `None` and
+/// never a wrap to the far end, which would teleport the reader.
+fn step_match_line(lines: &[usize], current: Option<usize>, forward: bool) -> Option<usize> {
+    let last = lines.last().copied()?;
+    let current = current.unwrap_or(last);
+    if forward {
+        lines
+            .iter()
+            .copied()
+            .find(|&line| line > current)
+            .or(Some(last))
+    } else {
+        lines
+            .iter()
+            .rev()
+            .copied()
+            .find(|&line| line < current)
+            .or_else(|| lines.first().copied())
+    }
 }
 
 /// The full TUI state model.
@@ -953,9 +1033,34 @@ pub struct App {
     /// which writes the clamped value back (mirroring `scroll`/`ListState`).
     pub preview_scroll: u16,
     /// When set, the preview stays pinned to the BOTTOM (newest turn): the next
-    /// render resolves the offset to `max_offset`. Set on any selection change
-    /// and when the preview is toggled on; cleared by an explicit up/page/Home
-    /// scroll; re-enabled by `End`.
+    /// render resolves the offset to `max_offset`. Cleared, it means the READER
+    /// positioned this pane and [`preview_scroll`](Self::preview_scroll) says where.
+    ///
+    /// That second reading is why nothing else may decide to follow the bottom for a
+    /// frame of its own: this is the ONE piece of state answering "is the pane still
+    /// anchored?", so a condition that is true over an INTERVAL — a quick reply in
+    /// flight — follows the tail by going THROUGH this flag, never by overriding it
+    /// per frame (see `view::render_preview`). The complete set of transitions:
+    ///
+    /// * ARMED at construction, on a real selection change, when the preview is
+    ///   toggled on, by `End` ([`preview_bottom`](Self::preview_bottom)), and when a
+    ///   send to the previewed row FINISHES (so the reply lands in view) — which
+    ///   `End` is how it is said, so that is one site, not two.
+    /// * CLEARED by ANY explicit scroll ([`preview_scroll_by`](Self::preview_scroll_by),
+    ///   [`preview_top`](Self::preview_top)), in either direction, and by a resolved
+    ///   match jump, which is a position the reader asked for exactly as a scroll is.
+    ///
+    /// A scroll states a POSITION, never a subscription: even one that lands on the
+    /// last row leaves the pane to the reader, because the alternative cannot be
+    /// expressed honestly. Whether an offset "reached the last row" is a fact about
+    /// the last DRAWN frame's width and height, so a keypress can only guess it, and
+    /// the draw site's clamp — the one place that knows — cannot tell a reader
+    /// scrolling past the end from a pane widened by a resize or a transcript that
+    /// shrank, and would take a deliberately positioned pane away with no key pressed.
+    ///
+    /// Every transition above is a USER ACT, and that is the invariant to keep: the
+    /// RENDER writes this field for the match jump alone — the one thing it resolves
+    /// that a keypress could not.
     pub preview_follow_bottom: bool,
     /// Last inner viewport height of the preview (rows), written back by the view
     /// so page / quarter-page scrolling can size a page without knowing the layout.
@@ -1210,6 +1315,52 @@ pub struct App {
     /// change invalidates the whole cache (see `preview_cache`). `None` until
     /// the first preview render.
     preview_width: Option<u16>,
+    /// The `(session_id, query)` the [`MATCH_OUTSIDE_PREVIEW`] nudge was last
+    /// fired for, so one state of affairs is reported exactly once.
+    ///
+    /// The nudge is decided by a KEYPRESS (see
+    /// [`note_match_outside_preview`](Self::note_match_outside_preview)), so a live
+    /// session's reload churn cannot re-fire it. What this key still answers for is
+    /// the keys that RE-ASK the same question: a mode toggled off and back on, or a
+    /// selection that leaves the row and comes back, both re-derive a fact the board
+    /// has already stated. Announcing it again would squat on a keypress-scoped
+    /// surface with something that has not changed.
+    preview_match_notice: Option<(String, String)>,
+    /// A pending request to scroll the preview onto a search match, ACTED ON by the
+    /// next `view::render_preview` (the only place the pane's width and viewport
+    /// height are known, so the only place the offset can be computed) and CONSUMED
+    /// by the next frame whether or not that frame can act on it (see
+    /// [`take_preview_match_jump`](Self::take_preview_match_jump)).
+    ///
+    /// Set when the selection actually MOVES to a DIFFERENT session, and on a QUERY
+    /// change — which the `Tab` mode toggle is, since it makes the same text match
+    /// more. That first word is the whole point: a live session appends turns at the
+    /// watcher's cadence, and a reload that re-reads it must leave the reader's
+    /// viewport exactly where they put it. A reload keeps the selection by id, so
+    /// [`set_selected`](Self::set_selected) is a no-op there and a growing transcript
+    /// cannot arm this. The one reload that DOES reach the arming branch is the one
+    /// whose selected row vanished from disk: `restore_selection` then clamps to a
+    /// neighbour, which is a different id. That case is benign — the previewed
+    /// session changed either way, and the same branch re-anchors the pane anyway.
+    preview_match_jump: bool,
+    /// The matched preview LINE the pane is parked on, in the coordinates of
+    /// [`CachedPreview::matches`]. `None` means "not parked", which the step and
+    /// the jump both read as the LAST (most recent) match.
+    ///
+    /// Moved only by the `Shift-Up`/`Shift-Down` step; cleared whenever the query
+    /// or the selection changes, since a line index from one transcript-and-query
+    /// means nothing under another. A STALE index (a reload re-rendered the
+    /// transcript under it) is harmless by construction: both readers treat it as
+    /// a boundary rather than as a set member (see
+    /// [`step_match_line`] and [`preview_match_target`](Self::preview_match_target)).
+    preview_match_line: Option<usize>,
+    /// How many times the preview match map has been recomputed. Test-only
+    /// instrumentation, mirroring [`SearchIndex`]'s own rebuild counter: "the
+    /// cached query key is unchanged" is only a claim about the KEY, whereas the
+    /// property worth pinning is that no second [`SearchIndex::atom_match_positions`]
+    /// pass ran over the rendered lines.
+    #[cfg(test)]
+    preview_match_rebuilds: usize,
     /// Live substring index over `sessions` (isolated in [`crate::search`],
     /// which also confines every `memchr`/`nucleo` call).
     index: SearchIndex,
@@ -1283,6 +1434,11 @@ impl App {
             pending_chord: false,
             preview_cache: HashMap::new(),
             preview_width: None,
+            preview_match_notice: None,
+            preview_match_jump: false,
+            preview_match_line: None,
+            #[cfg(test)]
+            preview_match_rebuilds: 0,
             index,
         };
         // Resolve the launch project's worktree set ONCE, here, BEFORE the first
@@ -1376,11 +1532,20 @@ impl App {
     /// session always opens at its most-recent message. A no-op reassignment of
     /// the same id (common on a query keystroke that keeps the row) leaves any
     /// manual preview scroll intact.
+    ///
+    /// The bottom anchor is also where a pending match jump is armed, because the
+    /// two answer the same question — "where should this transcript open?" — and
+    /// a search hit is a better answer than the tail. Arming it HERE, inside the
+    /// CHANGED branch, is what keeps a reload from moving the pane under a session
+    /// that is merely growing: the reload restores the SAME id, so this whole body
+    /// is skipped. A reload whose selected row vanished from disk does reach it,
+    /// carrying a neighbour's id — by then the previewed session has changed anyway.
     fn set_selected(&mut self, next: Option<String>) {
         if self.selected != next {
             self.selected = next;
             self.preview_follow_bottom = true;
             self.preview_scroll = 0;
+            self.request_preview_match_jump();
         }
     }
 
@@ -1402,6 +1567,13 @@ impl App {
     }
 
     /// Move the selection by `delta` rows, clamped to the filtered bounds.
+    ///
+    /// The other half of the match-gap nudge's trigger, alongside the query funnel:
+    /// opening another session is the second way a content hit can turn out to have
+    /// nothing to mark. It is asked HERE rather than in
+    /// [`set_selected`](Self::set_selected) — the setter every arming shares —
+    /// because a RELOAD reaches that setter too when the selected row vanishes from
+    /// disk, and a background reload may not write a keypress-scoped surface.
     pub fn move_selection(&mut self, delta: isize) {
         if self.filtered.is_empty() {
             self.set_selected(None);
@@ -1411,6 +1583,7 @@ impl App {
         let last = self.filtered.len() as isize - 1;
         let next = (cur + delta).clamp(0, last) as usize;
         self.select_pos(next);
+        self.note_match_outside_preview();
     }
 
     /// Move the list selection one mouse-wheel notch (`up = true` toward the
@@ -1426,11 +1599,28 @@ impl App {
 
     // --- query / mode / scope ---------------------------------------------
 
+    /// Re-apply everything that depends on the query TEXT: the matcher's pattern,
+    /// the pending preview match jump, the filtered list, and the report of a hit
+    /// with nothing to mark.
+    ///
+    /// The ONE funnel every query mutator below goes through, so a future one
+    /// cannot forget the jump (or the pattern rebuild) at a fourth call site.
+    /// Callers own the edit to [`query`](Self::query) itself and call this after.
+    ///
+    /// The nudge goes LAST, after the re-filter has settled which row is selected:
+    /// it is a statement about the previewed session, and a query keystroke can
+    /// move the preview to another one.
+    fn apply_query_change(&mut self) {
+        self.index.set_query(&self.query);
+        self.request_preview_match_jump();
+        self.reapply_preserving_selection();
+        self.note_match_outside_preview();
+    }
+
     /// Append a character to the query and re-filter (type-to-search).
     pub fn push_query_char(&mut self, c: char) {
         self.query.push(c);
-        self.index.set_query(&self.query);
-        self.reapply_preserving_selection();
+        self.apply_query_change();
     }
 
     /// Append a whole STRING to the query and re-filter ONCE — the terminal-paste
@@ -1450,22 +1640,30 @@ impl App {
             return;
         }
         self.query.push_str(text);
-        self.index.set_query(&self.query);
-        self.reapply_preserving_selection();
+        self.apply_query_change();
     }
 
     /// Delete the last query character and re-filter.
     pub fn pop_query_char(&mut self) {
         if self.query.pop().is_some() {
-            self.index.set_query(&self.query);
-            self.reapply_preserving_selection();
+            self.apply_query_change();
         }
     }
 
     /// Toggle name-only vs. name+content search and re-filter.
+    ///
+    /// Goes through the query funnel rather than straight to the re-filter: the
+    /// query TEXT does not move, but the same text now matches a different haystack,
+    /// which is a query change in every way the rest of the board cares about. The
+    /// funnel is what carries the two things a bare re-filter forgets — the pane's
+    /// jump onto a match the widened search just admitted (mode-gated at the arming
+    /// site, so widening arms it and narrowing does not), and the report of a hit
+    /// with nothing to mark. Re-setting the pattern with unchanged text is idempotent
+    /// and costs one compile of a query-length string, which is what taking the ONE
+    /// funnel is worth: a future query-dependent step cannot be forgotten here.
     pub fn toggle_search_mode(&mut self) {
         self.search_mode = self.index.toggle_mode();
-        self.reapply_preserving_selection();
+        self.apply_query_change();
     }
 
     /// Advance one step along [`Scope::toggled`] — current folder <-> project,
@@ -1599,6 +1797,13 @@ impl App {
     /// scroll drops follow-bottom and sets a concrete offset; the view clamps it
     /// to `[0, max_offset]` on the next render. Saturating so it can never
     /// underflow below zero or overflow `u16`.
+    ///
+    /// The ONE funnel for every scroll that moves by a delta — `PgUp`/`PgDn`,
+    /// `Ctrl-U`/`Ctrl-D` and the mouse wheel — so the release is stated once, for
+    /// every one of them, and in ONE direction: down is a position like any other,
+    /// not a request to keep following whatever lands next. `End` is how a reader
+    /// asks for that, and it costs one key
+    /// ([`preview_follow_bottom`](Self::preview_follow_bottom) owns the argument).
     fn preview_scroll_by(&mut self, rows: i32) {
         self.preview_follow_bottom = false;
         let next = (i32::from(self.preview_scroll) + rows).clamp(0, i32::from(u16::MAX));
@@ -1641,6 +1846,115 @@ impl App {
     /// view pins the offset to the newest turn.
     pub fn preview_bottom(&mut self) {
         self.preview_follow_bottom = true;
+    }
+
+    // --- preview match jump ------------------------------------------------
+
+    /// Ask the next preview render to scroll the transcript onto a search match.
+    ///
+    /// The AUTOMATIC half of the jump, and the only place its mode gate lives:
+    /// autoscrolling is [`SearchMode::NameAndContent`]'s alone. In name-only mode
+    /// a hit IS its label — the row the user is already looking at is marked, and
+    /// nothing about the transcript was asked for — so moving the pane there would
+    /// answer a question nobody put. Marking stays on in BOTH modes (it costs no
+    /// movement), and the explicit `Shift-Up`/`Shift-Down` step
+    /// ([`preview_match_step`](Self::preview_match_step)) works in both too, since
+    /// a keypress IS the question.
+    ///
+    /// Clears the parked line: an index into one (transcript, query) means nothing
+    /// under another, so the next jump starts from the last match again.
+    fn request_preview_match_jump(&mut self) {
+        self.preview_match_line = None;
+        if self.search_mode == SearchMode::NameAndContent {
+            self.preview_match_jump = true;
+        }
+    }
+
+    /// Consume the pending match jump: `true` at most once per request.
+    ///
+    /// The view takes it whether or not it can act on it — a draft card is showing,
+    /// nothing is selected, the transcript has no match left — so a request is
+    /// DROPPED rather than deferred onto an unrelated later frame. Every path out of
+    /// `view::render_preview` therefore takes it, and the frame that skips that
+    /// function entirely (`Ctrl-/` hid the pane) takes it in `view::render_body`
+    /// instead: a request describes the pane at the moment of a keypress, and the
+    /// board draws before it reads the next key, so a frame that cannot act on one
+    /// is the end of it.
+    pub fn take_preview_match_jump(&mut self) -> bool {
+        std::mem::take(&mut self.preview_match_jump)
+    }
+
+    /// The selected session's CURRENT match map — the cached one, and only while
+    /// it describes the active query and holds at least one match.
+    ///
+    /// Read without rendering: the board draws before every `recv`, so the entry
+    /// is already warm for the selection, the query and the pane's width by the
+    /// time a keypress arrives. Two things it must refuse, because the cache
+    /// outlives both and a stale `true` here binds a key to nothing the user can
+    /// see: a map whose `matches_query` has moved on, and a pane that is not being
+    /// drawn at all (`Ctrl-/` hides it without clearing the cache).
+    fn current_preview_matches(&self) -> Option<&HashMap<usize, HashSet<usize>>> {
+        if !self.show_preview {
+            return None;
+        }
+        let entry = self.preview_cache.get(self.selected.as_ref()?)?;
+        (entry.matches_query == self.query && !entry.matches.is_empty()).then_some(&entry.matches)
+    }
+
+    /// Whether there is anything for `Shift-Up`/`Shift-Down` to move between.
+    ///
+    /// The keybinding's gate: with nothing to navigate, those keys FALL THROUGH to
+    /// plain selection movement, so a board with no query behaves exactly as it
+    /// did before this key existed (see [`crate::tui::update::key_to_action`]).
+    #[must_use]
+    pub fn has_preview_matches(&self) -> bool {
+        self.current_preview_matches().is_some()
+    }
+
+    /// The matched preview line indices, ascending.
+    ///
+    /// Built only on an actual step, never on the per-keystroke gate above.
+    fn matched_preview_lines(&self) -> Vec<usize> {
+        let mut lines: Vec<usize> = self
+            .current_preview_matches()
+            .map(|m| m.keys().copied().collect())
+            .unwrap_or_default();
+        lines.sort_unstable();
+        lines
+    }
+
+    /// The matched line the next jump should bring into view: the parked one while
+    /// it is still a match, else the LAST (most recent) one.
+    ///
+    /// Newest-first because the transcript is read newest-first: the pane already
+    /// bottom-anchors, so the match nearest that anchor is the one the user is
+    /// closest to. A stale parked index (a reload re-rendered the transcript under
+    /// it) simply is not a key here and falls back to the last match.
+    pub(crate) fn preview_match_target(&self) -> Option<usize> {
+        let matches = self.current_preview_matches()?;
+        match self.preview_match_line {
+            Some(line) if matches.contains_key(&line) => Some(line),
+            _ => matches.keys().copied().max(),
+        }
+    }
+
+    /// Step to the next (`forward`) or previous matched LINE and ask for a jump.
+    ///
+    /// Between matched LINES, not between every textual occurrence: a line can
+    /// carry several marked runs (see [`CachedPreview::matches`]) and they are one
+    /// stop, because a stop is a place to LOOK and a line is what the jump can
+    /// scroll to. Clamped at both ends rather than wrapping — a step past the last
+    /// match re-centers on it, which is what makes the key useful again after the
+    /// user has scrolled away by hand.
+    pub fn preview_match_step(&mut self, forward: bool) {
+        let lines = self.matched_preview_lines();
+        let Some(next) = step_match_line(&lines, self.preview_match_line, forward) else {
+            return;
+        };
+        self.preview_match_line = Some(next);
+        // NOT `request_preview_match_jump`: this is the EXPLICIT half, so it is
+        // neither mode-gated nor allowed to clear the line it just chose.
+        self.preview_match_jump = true;
     }
 
     /// Scroll the preview one mouse-wheel notch (`up = true` toward older turns).
@@ -2671,10 +2985,157 @@ impl App {
                 CachedPreview {
                     rendered,
                     wrapped_rows,
+                    // Left for `refresh_preview_matches` below: an empty map keyed by
+                    // the EMPTY query is exactly "no query has been searched here
+                    // yet", so a non-empty query recomputes on this same call.
+                    matches: HashMap::new(),
+                    matches_query: String::new(),
                 },
             );
         }
+        self.refresh_preview_matches(&id);
         self.preview_cache.get(&id)
+    }
+
+    /// Bring the cached entry's [`matches`](CachedPreview::matches) up to date with
+    /// the active query, recomputing ONLY when the query moved off the entry's key.
+    ///
+    /// The match source is the RENDERED preview lines, re-searched PER ATOM through
+    /// [`SearchIndex::atom_match_positions`] — the filter's own finders, so the pane
+    /// marks by the rule the row was admitted by, and the only rule that can be
+    /// right: a position in `Session::content_index` does not project into these
+    /// lines (see [`CachedPreview::matches`]).
+    ///
+    /// Cost is bounded by the PANE, not by the corpus: one session's preview is
+    /// tail-capped at `store::preview::PREVIEW_LINES`, and this runs at most once
+    /// per query change per cached entry. That is the boundary the per-keystroke
+    /// nucleo regression lived on the other side of — scoring EVERY session's
+    /// megabyte-scale haystack — so keep the recompute keyed and keep it here.
+    fn refresh_preview_matches(&mut self, id: &str) {
+        match self.preview_cache.get(id) {
+            // Already computed for this query: nothing to do (the common case —
+            // the pane redraws several times a second while the query sits still).
+            Some(entry) if entry.matches_query == self.query => return,
+            Some(_) => {}
+            None => return,
+        }
+        #[cfg(test)]
+        {
+            self.preview_match_rebuilds += 1;
+        }
+        // Snapshot each line's plain text FIRST so the `&mut` matcher call below
+        // never overlaps the cache borrow (the same shape `render_list` uses for
+        // its row labels). An empty query skips the walk entirely.
+        let lines: Vec<String> = if self.query.is_empty() {
+            Vec::new()
+        } else {
+            self.preview_cache.get(id).map_or_else(Vec::new, |entry| {
+                entry.rendered.text.lines.iter().map(line_text).collect()
+            })
+        };
+        let matches: HashMap<usize, HashSet<usize>> = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(i, text)| {
+                let matched = self.index.atom_match_positions(text);
+                if matched.is_empty() {
+                    None
+                } else {
+                    Some((i, matched.into_iter().collect()))
+                }
+            })
+            .collect();
+        if let Some(entry) = self.preview_cache.get_mut(id) {
+            entry.matches = matches;
+            entry.matches_query = self.query.clone();
+        }
+    }
+
+    /// Say ONCE, transiently, that a content hit's match is not in the preview.
+    ///
+    /// Called from the KEYPRESS that could have changed the answer — the query
+    /// funnel ([`apply_query_change`](Self::apply_query_change)) and the selection
+    /// move ([`move_selection`](Self::move_selection)) — and from nowhere else.
+    /// `App::status` is a keypress-scoped surface (AGENTS: STATUS-LINE OWNERSHIP)
+    /// whose every other writer is a key handler; deciding this while DRAWING would
+    /// put a message on it that the user's last key did not ask about, and re-put it
+    /// there on every frame that recomputed the map.
+    ///
+    /// A keypress does not know the pane's viewport, and does not need to: the
+    /// question is whether ANY rendered preview LINE holds ANY atom, which is a fact
+    /// about the transcript's rendered TEXT and not about where the pane is scrolled
+    /// to. The one piece of geometry it does need is the WIDTH those lines were
+    /// rendered at, which the width-scoped preview cache already carries
+    /// (`preview_width`). Two honest limits follow. Before the first frame there is
+    /// no width — so a query typed at a board that has never drawn stays unexplained
+    /// until the user's next key, which is the same key that would have re-asked it
+    /// anyway. And a terminal RESIZED between the last frame and this key is
+    /// answered at the previous width; that changes only what a shrink-to-fit table
+    /// looks like, never which turns survived into the preview, and the next frame
+    /// re-renders at the true width regardless.
+    ///
+    /// Only for a NAME+CONTENT hit whose query is also absent from the row label:
+    /// in name-only mode a hit IS its label, and a label hit is right there on the
+    /// row the user is looking at, so there is nothing unexplained to explain.
+    /// What is left is the content hits — roughly one in eight, measured once —
+    /// whose text lives in a turn the preview collapses, drops or tail-caps away,
+    /// where an unmarked pane would otherwise read as a broken highlight. It takes
+    /// NO rendered line holding any atom: a query whose words landed on different
+    /// lines has marks on screen and explains itself.
+    ///
+    /// The label is asked through [`SearchIndex::atom_match_positions`] — the SAME
+    /// seam the pane's own marks come from — and deliberately NOT through nucleo's
+    /// [`match_indices`](Self::match_indices), which draws the row's highlight. This
+    /// is a question about the label's TEXT, and nucleo answers a narrower one: it
+    /// requires EVERY atom in the one string, and it carries the documented non-ASCII
+    /// tail off-by-one ([`SearchIndex::set_query`]), so `café fin` searched for `fin`
+    /// comes back empty. Either miss let the board announce a match "outside the
+    /// previewed transcript" while it sat in the row's own label. Over the filter's
+    /// finders the refusal is exact: nothing gets said unless NO atom is in the label
+    /// AND no atom is in the rendered pane, which is precisely when the hit really is
+    /// somewhere neither shows.
+    ///
+    /// The checks run cheapest-first, because the last of them can render a
+    /// transcript that has not been previewed yet. Keyed by `(session, query)` so
+    /// the same state of affairs, re-reached by a later key (a mode toggled off and
+    /// back on, a selection returning to the row), is stated once rather than on
+    /// every visit.
+    ///
+    /// [`SearchIndex::atom_match_positions`]: crate::search::SearchIndex::atom_match_positions
+    /// [`SearchIndex::set_query`]: crate::search::SearchIndex::set_query
+    fn note_match_outside_preview(&mut self) {
+        if self.query.is_empty()
+            || self.search_mode != SearchMode::NameAndContent
+            || !self.show_preview
+        {
+            return;
+        }
+        let (Some(id), Some(width)) = (self.selected.clone(), self.preview_width) else {
+            return;
+        };
+        let key = (id, self.query.clone());
+        if self.preview_match_notice.as_ref() == Some(&key) {
+            return;
+        }
+        let Some(label) = self
+            .sessions
+            .iter()
+            .find(|s| s.session_id == key.0)
+            .map(|s| s.label.as_str())
+        else {
+            return;
+        };
+        if !self.index.atom_match_positions(label).is_empty() {
+            return;
+        }
+        if !self
+            .ensure_preview(width)
+            .is_some_and(|entry| entry.matches.is_empty())
+        {
+            return;
+        }
+        self.preview_match_notice = Some(key);
+        self.set_status_transient(MATCH_OUTSIDE_PREVIEW);
     }
 
     /// How many rendered transcripts the preview cache holds.
@@ -2714,6 +3175,18 @@ impl App {
     pub fn preview_wrapped_rows(&mut self, inner_width: u16) -> usize {
         self.ensure_preview(inner_width)
             .map_or(0, |p| p.wrapped_rows)
+    }
+
+    /// Where the active query occurs in the selected session's RENDERED preview:
+    /// line index -> matched CHAR positions (see [`CachedPreview::matches`]).
+    ///
+    /// Read off the SAME width-scoped cache the text is drawn from, so a marked
+    /// position can never describe a different render than the one on screen.
+    /// Borrowed rather than cloned: the pane redraws several times a second and
+    /// nothing here needs a copy. Empty when nothing is selected, when the query is
+    /// empty, or when the query occurs nowhere in the rendered lines.
+    pub fn preview_matches(&mut self, inner_width: u16) -> Option<&HashMap<usize, HashSet<usize>>> {
+        self.ensure_preview(inner_width).map(|p| &p.matches)
     }
 
     /// The wrapped-layout context needed to hit-test a mouse click into a preview
@@ -3579,6 +4052,649 @@ mod tests {
             after > before,
             "a reloaded transcript must be re-measured, not answered from the \
              pre-reload cache (before={before}, after={after})"
+        );
+    }
+
+    // --- preview match map: keyed recompute + the honest empty answer -------
+
+    /// A word the `sess-normal-1` fixture really says, so a query for it has
+    /// something to find in the RENDERED preview.
+    const FIXTURE_WORD: &str = "webhook";
+
+    /// The fixture session, labelled so a name-only query for [`FIXTURE_WORD`]
+    /// keeps the row on the board (the filter runs before any preview exists).
+    fn markable_fixture(id: &str) -> Session {
+        let (folder, file) = LONG_FIXTURE;
+        let mut s = fixture_session(id, folder, file);
+        s.label = "Fix the payment webhook retries".to_string();
+        s
+    }
+
+    /// The match map is derived from the RENDERED preview lines, and it addresses
+    /// them: every marked position must fall inside the line it is keyed to.
+    ///
+    /// The alternative — projecting a `content_index` offset into these lines —
+    /// would pass a "something was found" assertion while pointing at the wrong
+    /// text, so the position/line agreement is the thing worth pinning.
+    #[test]
+    fn preview_matches_address_the_rendered_lines_they_are_keyed_to() {
+        let mut app = app_all(vec![markable_fixture("s1")]);
+        app.push_query_str(FIXTURE_WORD);
+        let text = app.preview_text(60);
+        let matches = app
+            .preview_matches(60)
+            .expect("a selected session has a match map")
+            .clone();
+        assert!(
+            !matches.is_empty(),
+            "the query occurs in this transcript and must be found"
+        );
+        for (line_idx, positions) in &matches {
+            let line: String = line_text(
+                text.lines
+                    .get(*line_idx)
+                    .expect("a match keyed to a line that exists"),
+            );
+            let chars: Vec<char> = line.chars().collect();
+            let marked: String = positions
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .map(|p| *chars.get(p).expect("a position inside its own line"))
+                .collect();
+            assert_eq!(
+                marked.to_lowercase(),
+                FIXTURE_WORD,
+                "the marked chars of line {line_idx} must spell the query, not \
+                 whatever sits at a borrowed offset: {line:?}"
+            );
+        }
+    }
+
+    /// The map is recomputed when the QUERY moves and never when it has not.
+    ///
+    /// The second half is the load-bearing one: the pane redraws several times a
+    /// second, so a recompute per read would re-run the filter's memmem atom scan
+    /// over every rendered line on every frame — spending per draw what one keypress
+    /// already answered, which is the shape of cost the ranking pass was removed for.
+    #[test]
+    fn the_preview_match_map_recomputes_only_when_the_query_moves() {
+        let mut app = app_all(vec![markable_fixture("s1")]);
+        app.preview_text(60);
+        let after_first = app.preview_match_rebuilds;
+
+        for _ in 0..5 {
+            app.preview_text(60);
+            app.preview_matches(60);
+        }
+        assert_eq!(
+            app.preview_match_rebuilds, after_first,
+            "an unchanged query must be answered from the cache, not re-searched"
+        );
+
+        app.push_query_str(FIXTURE_WORD);
+        app.preview_text(60);
+        assert_eq!(
+            app.preview_match_rebuilds,
+            after_first + 1,
+            "a query change must recompute exactly once"
+        );
+        let found = app
+            .preview_matches(60)
+            .expect("a selected session has a match map")
+            .len();
+        assert!(found > 0, "and it must find the query it recomputed for");
+
+        app.preview_text(60);
+        assert_eq!(
+            app.preview_match_rebuilds,
+            after_first + 1,
+            "reading the same query again must not recompute"
+        );
+    }
+
+    /// A CONTENT hit whose text did not survive into the rendered preview says so
+    /// — once — instead of showing an unmarked pane that reads as a broken
+    /// highlight.
+    ///
+    /// `content_index` and the preview are independent, lossy extractions of one
+    /// transcript (collapsed wrappers, dropped sidechain turns, the tail cap), so
+    /// a minority of content hits — roughly one in eight, measured once — have
+    /// nothing to mark. This is the honest report of that, not a bug to paper over.
+    #[test]
+    fn a_content_hit_with_nothing_to_mark_is_reported_once() {
+        let mut app = app_all(vec![markable_fixture("s1")]);
+        app.sessions[0].content_index = "collapsed wrapper says frobnicate".to_string();
+        app.apply_sessions(app.sessions.clone());
+        app.toggle_search_mode();
+        assert_eq!(app.search_mode, SearchMode::NameAndContent);
+
+        // The board draws before it reads a key, so the pane's width is already
+        // known when the query arrives. That is the seam the nudge is decided over:
+        // a keypress can ask what the rendered lines hold without drawing anything.
+        app.preview_text(60);
+
+        app.push_query_str("frobnicate");
+        assert!(
+            app.selected.is_some(),
+            "the content hit must keep the row on the board"
+        );
+        assert_eq!(
+            app.status.as_deref(),
+            Some(MATCH_OUTSIDE_PREVIEW),
+            "the KEYPRESS must say the match is outside what the pane is showing — \
+             no frame has been drawn since it"
+        );
+        app.preview_text(60);
+        assert!(
+            app.preview_matches(60).is_some_and(HashMap::is_empty),
+            "this query must occur nowhere in the rendered preview"
+        );
+        assert!(
+            app.status_ttl.is_some(),
+            "a nudge dwells and expires; it is not a sticky refusal"
+        );
+
+        // A live session re-reads its transcript at the watcher's cadence, which
+        // evicts and rebuilds this entry — the nudge must not fire again for the
+        // same session and query.
+        app.clear_status();
+        app.apply_sessions(app.sessions.clone());
+        app.preview_text(60);
+        assert_eq!(
+            app.status, None,
+            "one state of affairs is reported once, not on every reload"
+        );
+    }
+
+    /// Drawing the pane never writes the status line, however new the answer is to
+    /// it.
+    ///
+    /// `App::status` is keypress-scoped (AGENTS: STATUS-LINE OWNERSHIP) — every
+    /// other writer is a key handler — so a render that reports the gap puts a
+    /// message on a surface the user's last key did not ask about, and re-puts it
+    /// there for as long as the frames keep coming. The board below has drawn
+    /// NOTHING when the query arrives, so the keypress cannot answer (there is no
+    /// pane width yet, and nothing on screen to be missing from); the frame that
+    /// finally does learn the answer must still keep it to itself.
+    #[test]
+    fn the_render_path_never_writes_the_match_gap_nudge() {
+        let mut app = app_all(vec![markable_fixture("s1")]);
+        app.sessions[0].content_index = "collapsed wrapper says frobnicate".to_string();
+        app.apply_sessions(app.sessions.clone());
+        app.toggle_search_mode();
+        app.push_query_str("frobnicate");
+
+        // Twice: the first frame is where the map is computed, the second is every
+        // frame after it — a redraw per tick must not re-announce anything either.
+        app.preview_text(60);
+        app.preview_text(60);
+        assert!(
+            app.preview_matches(60).is_some_and(HashMap::is_empty),
+            "the fixture must have nothing to mark, or the silence proves nothing"
+        );
+        assert_eq!(
+            app.status, None,
+            "the render path may not write the status line"
+        );
+    }
+
+    /// A hit whose query IS visible marks it and stays quiet, and so does a
+    /// NAME-only hit: the label is already highlighted on the row, so there is
+    /// nothing unexplained for the status line to explain.
+    ///
+    /// Every board here DRAWS before it is typed at, as the real one does: without a
+    /// pane width the nudge cannot fire at all and each silence below would pass for
+    /// a reason that has nothing to do with the rule it names.
+    #[test]
+    fn a_visible_or_name_only_hit_says_nothing() {
+        let mut app = app_all(vec![markable_fixture("s1")]);
+        app.toggle_search_mode();
+        app.preview_text(60);
+        app.push_query_str(FIXTURE_WORD);
+        assert!(
+            app.preview_matches(60).is_some_and(|m| !m.is_empty()),
+            "this query is visible in the preview"
+        );
+        assert_eq!(app.status, None, "a visible match needs no nudge");
+
+        // PART of a multi-atom hit is enough. The filter admitted the row because
+        // every atom occurs somewhere in the transcript, and one of them landed in
+        // a collapsed turn — but the pane still has something marked on screen, so
+        // there is no unmarked pane to explain. Only a pane where NO line holds ANY
+        // atom is unexplained.
+        let mut app = app_all(vec![markable_fixture("s1")]);
+        app.sessions[0].content_index =
+            format!("{FIXTURE_WORD} in the transcript, frobnicate in a collapsed wrapper");
+        app.apply_sessions(app.sessions.clone());
+        app.toggle_search_mode();
+        app.preview_text(60);
+        app.push_query_str(&format!("{FIXTURE_WORD} frobnicate"));
+        assert!(
+            app.selected.is_some(),
+            "both atoms occur in the content index, so the row is admitted"
+        );
+        assert!(
+            app.preview_matches(60).is_some_and(|m| !m.is_empty()),
+            "one atom of the two must be marked, or this is the all-missing case"
+        );
+        assert_eq!(
+            app.status, None,
+            "a partly marked pane explains itself; only nothing marked does not"
+        );
+
+        // A LABEL-only hit: the query is in the label (which the row highlights)
+        // and nowhere in the transcript. Quiet in either mode — name-only because
+        // a name hit IS its label, name+content because the row still shows why.
+        for widen in [false, true] {
+            let mut session = markable_fixture("s1");
+            session.label = "Fix the quokka retries".to_string();
+            let mut app = app_all(vec![session]);
+            if widen {
+                app.toggle_search_mode();
+            }
+            app.preview_text(60);
+            app.push_query_str("quokka");
+            assert!(
+                app.preview_matches(60).is_some_and(HashMap::is_empty),
+                "this label word must occur nowhere in the transcript"
+            );
+            assert_eq!(
+                app.status, None,
+                "a label hit is explained by its own highlighted row (widen={widen})"
+            );
+        }
+
+        // The MODE gate, reached on its own. A name-only board normally cannot
+        // select a row whose label did not match — the filter dropped it — but the
+        // filter and the label highlight are different matchers and DO diverge on
+        // non-ASCII input (`search`'s module docs enumerate where), so the
+        // selection is forced here to state the rule directly: a board that is not
+        // searching content never nudges about a transcript. The decision is asked
+        // for directly because no key can reach this state: the keys that ask it
+        // would first re-derive the selection the filter just dropped.
+        let mut app = app_all(vec![markable_fixture("s1")]);
+        app.preview_text(60);
+        app.push_query_str("quokka");
+        app.selected = Some("s1".to_string());
+        assert_eq!(app.search_mode, SearchMode::NameOnly);
+        app.note_match_outside_preview();
+        assert!(
+            app.preview_matches(60).is_some_and(HashMap::is_empty),
+            "this query must occur nowhere in the rendered preview"
+        );
+        assert_eq!(
+            app.status, None,
+            "a name-only board never nudges about the transcript"
+        );
+    }
+
+    /// A label hit the ROW HIGHLIGHT misses is still a label hit, and still says
+    /// nothing.
+    ///
+    /// "Is the query in this label?" is a question about the label's TEXT, so it is
+    /// asked through the filter's own finders. Asking nucleo instead borrows that
+    /// seam's documented non-ASCII tail off-by-one (`search::SearchIndex::set_query`):
+    /// a substring ending at the very last char of a haystack holding any non-ASCII
+    /// char is missed, and the board then announced the match missing from the
+    /// transcript while it sat in the row's own label, one line away.
+    #[test]
+    fn a_label_hit_the_row_highlight_misses_still_says_nothing() {
+        let mut session = markable_fixture("s1");
+        // `é` is non-ASCII and `fin` ends at the last char — both halves are needed
+        // to reach the quirk.
+        session.label = "café fin".to_string();
+        let mut app = app_all(vec![session]);
+        app.toggle_search_mode();
+        assert_eq!(app.search_mode, SearchMode::NameAndContent);
+        // The board draws before it reads a key, so the pane has a width to answer at.
+        app.preview_text(60);
+
+        app.push_query_str("fin");
+        assert_eq!(
+            app.selected.as_deref(),
+            Some("s1"),
+            "the filter finds the tail-anchored label match, so the row is on the board"
+        );
+        assert!(
+            app.index.match_indices("café fin").is_empty(),
+            "the row draws UNHIGHLIGHTED here (upstream tail off-by-one) — that is \
+             what makes this the case the nudge used to misreport"
+        );
+        assert!(
+            app.preview_matches(60).is_some_and(HashMap::is_empty),
+            "and the query must occur nowhere in the rendered preview, or the \
+             silence below has a second reason"
+        );
+        assert_eq!(
+            app.status, None,
+            "the match is in the row's own label; the board must not announce it \
+             outside the previewed transcript"
+        );
+    }
+
+    /// Every marked line as `(its text, its marked runs joined by '+')`, sorted by
+    /// line — what a reader actually sees emphasised, in a form a failure prints
+    /// readably.
+    ///
+    /// Runs, not positions: per-atom marking puts SEVERAL runs on one line, and a
+    /// bare position set cannot tell "marked the query" from "marked whatever sits
+    /// at a borrowed offset".
+    fn marked_runs(
+        text: &Text<'static>,
+        matches: &HashMap<usize, HashSet<usize>>,
+    ) -> Vec<(String, String)> {
+        let mut lines: Vec<usize> = matches.keys().copied().collect();
+        lines.sort_unstable();
+        lines
+            .into_iter()
+            .map(|i| {
+                let line = line_text(
+                    text.lines
+                        .get(i)
+                        .expect("a match keyed to a line that exists"),
+                );
+                let positions = &matches[&i];
+                let mut runs: Vec<String> = Vec::new();
+                let mut run = String::new();
+                for (p, ch) in line.chars().enumerate() {
+                    if positions.contains(&p) {
+                        run.push(ch);
+                    } else if !run.is_empty() {
+                        runs.push(std::mem::take(&mut run));
+                    }
+                }
+                if !run.is_empty() {
+                    runs.push(run);
+                }
+                (line, runs.join("+"))
+            })
+            .collect()
+    }
+
+    /// A multi-atom query marks EACH atom on the lines that carry it, even when no
+    /// single line carries them all.
+    ///
+    /// This is the filter's own admission rule, reproduced in the pane: the row is
+    /// on the board because every atom occurs SOMEWHERE in the transcript, so the
+    /// marks have to answer per atom too. A whole-string matcher answers only when
+    /// one string holds every atom, which marks nothing here — and then the pane
+    /// silently claims the hit is elsewhere.
+    #[test]
+    fn a_multi_atom_query_marks_each_atom_on_the_line_that_carries_it() {
+        let mut app = app_all(vec![markable_fixture("s1")]);
+        // The transcript's own words, so the content filter admits this row for
+        // exactly the occurrences the pane is then asked to explain.
+        app.sessions[0].content_index =
+            "The webhook keeps failing, can you fix the retries? Thanks, also add logging."
+                .to_string();
+        app.apply_sessions(app.sessions.clone());
+        app.toggle_search_mode();
+        assert_eq!(app.search_mode, SearchMode::NameAndContent);
+        // The pane's width, known because the board drew before it read this key —
+        // which is what lets the KEYPRESS below decide whether anything is marked
+        // (`App::status` is keypress-scoped; the render may not write it).
+        app.preview_text(60);
+
+        app.push_query_str("webhook logging");
+        assert!(
+            app.selected.is_some(),
+            "both atoms occur in the transcript, so the row must stay on the board"
+        );
+        assert_eq!(
+            app.status, None,
+            "the match IS in the preview, so the keypress must not say it is outside it"
+        );
+        let text = app.preview_text(60);
+        let matches = app
+            .preview_matches(60)
+            .expect("a selected session has a match map")
+            .clone();
+        let marked = marked_runs(&text, &matches);
+
+        assert!(
+            marked
+                .iter()
+                .any(|(line, runs)| line.contains("keeps failing") && runs == "webhook"),
+            "the line carrying only 'webhook' must be marked: {marked:?}"
+        );
+        assert!(
+            marked
+                .iter()
+                .any(|(line, runs)| line.contains("also add logging") && runs == "logging"),
+            "the line carrying only 'logging' must be marked: {marked:?}"
+        );
+        assert!(
+            app.has_preview_matches(),
+            "with both atoms marked, Shift-Up/Shift-Down must have somewhere to go"
+        );
+    }
+
+    /// One line carrying two atoms marks BOTH runs, and a line carrying one of them
+    /// is marked for that one alone.
+    ///
+    /// The second half is what a whole-string matcher gets wrong: it needs every
+    /// atom in the SAME string, so a line saying only 'webhook' draws unmarked
+    /// while the line above it is marked twice.
+    #[test]
+    fn a_line_carrying_two_atoms_marks_both_runs() {
+        let mut app = app_all(vec![markable_fixture("s1")]);
+        // Both atoms live in the label, so the default name-only filter admits the
+        // row without a content_index of its own.
+        app.push_query_str("webhook retries");
+        assert!(app.selected.is_some(), "the label carries both atoms");
+
+        let text = app.preview_text(60);
+        let matches = app
+            .preview_matches(60)
+            .expect("a selected session has a match map")
+            .clone();
+        let marked = marked_runs(&text, &matches);
+
+        assert!(
+            marked
+                .iter()
+                .any(|(line, runs)| line.contains("keeps failing") && runs == "webhook+retries"),
+            "a line carrying both atoms marks both runs: {marked:?}"
+        );
+        assert!(
+            marked
+                .iter()
+                .any(|(line, runs)| line.contains("retry logic") && runs == "webhook"),
+            "a line carrying one atom is marked for that atom alone: {marked:?}"
+        );
+    }
+
+    // --- in-preview match jump ---------------------------------------------
+
+    /// The step is a BOUNDARY search, not a set-membership walk, and `None` reads
+    /// as the last match — the place an un-stepped jump already parked the pane.
+    #[test]
+    fn step_match_line_walks_the_matches_and_clamps_at_both_ends() {
+        let lines = [2usize, 9, 20];
+
+        // Un-parked: back off the LAST match, or stay on it going forward.
+        assert_eq!(step_match_line(&lines, None, false), Some(9));
+        assert_eq!(step_match_line(&lines, None, true), Some(20));
+
+        // Ordinary steps, both ways.
+        assert_eq!(step_match_line(&lines, Some(2), true), Some(9));
+        assert_eq!(step_match_line(&lines, Some(9), true), Some(20));
+        assert_eq!(step_match_line(&lines, Some(20), false), Some(9));
+        assert_eq!(step_match_line(&lines, Some(9), false), Some(2));
+
+        // Clamped at both ends: a step past the edge re-centers rather than
+        // wrapping to the far end, which would teleport the reader.
+        assert_eq!(step_match_line(&lines, Some(20), true), Some(20));
+        assert_eq!(step_match_line(&lines, Some(2), false), Some(2));
+
+        // A STALE index (a reload re-rendered the transcript under a parked line)
+        // is treated as a boundary, so the step still lands on a real match.
+        assert_eq!(step_match_line(&lines, Some(12), true), Some(20));
+        assert_eq!(step_match_line(&lines, Some(12), false), Some(9));
+        assert_eq!(step_match_line(&lines, Some(99), false), Some(20));
+        assert_eq!(step_match_line(&lines, Some(0), true), Some(2));
+
+        // Nothing marked: nothing to step to.
+        assert_eq!(step_match_line(&[], None, true), None);
+        assert_eq!(step_match_line(&[], Some(3), false), None);
+    }
+
+    /// Typing arms the jump — but only while the board is searching CONTENT.
+    ///
+    /// In name-only mode a hit IS its label, so the row the user is already looking
+    /// at carries the whole answer and moving the pane would answer a question
+    /// nobody asked. Marking still happens in both modes; only the MOVEMENT is
+    /// mode-gated.
+    #[test]
+    fn a_query_change_arms_the_jump_only_while_searching_content() {
+        let mut app = app_all(vec![markable_fixture("s1")]);
+        assert_eq!(app.search_mode, SearchMode::NameOnly, "the default mode");
+        app.push_query_str(FIXTURE_WORD);
+        assert!(
+            !app.take_preview_match_jump(),
+            "a name-only board must not scroll the preview"
+        );
+
+        let mut app = app_all(vec![markable_fixture("s1")]);
+        app.toggle_search_mode();
+        assert_eq!(app.search_mode, SearchMode::NameAndContent);
+        app.push_query_str(FIXTURE_WORD);
+        assert!(
+            app.take_preview_match_jump(),
+            "a content search must offer to show where the hit is"
+        );
+        assert!(
+            !app.take_preview_match_jump(),
+            "the request is consumed once, not re-fired every frame"
+        );
+
+        // Backspacing is a query change too, and so is a paste.
+        app.pop_query_char();
+        assert!(app.take_preview_match_jump(), "backspace re-arms the jump");
+
+        // So is WIDENING the search with Tab. The query text did not move, but the
+        // same text now matches more — including, typically, the session the user
+        // could not find by name — so the pane owes the same answer a keystroke
+        // gets. Toggling back is the mode gate's own case: a name-only board never
+        // moves the pane.
+        let mut app = app_all(vec![markable_fixture("s1")]);
+        app.push_query_str(FIXTURE_WORD);
+        assert!(!app.take_preview_match_jump(), "name-only armed nothing");
+        app.toggle_search_mode();
+        assert!(
+            app.take_preview_match_jump(),
+            "widening the search to content must offer to show where the hit is"
+        );
+        app.toggle_search_mode();
+        assert!(
+            !app.take_preview_match_jump(),
+            "narrowing back to name-only must not move the pane"
+        );
+    }
+
+    /// A SELECTION change arms the jump; a reload that KEEPS the row does not.
+    ///
+    /// That asymmetry is the point of the whole mechanism. A live session appends
+    /// turns at the watcher's cadence, and the reload that picks them up must leave
+    /// the reader exactly where they were. It holds because a reload restores the
+    /// selection by id, which makes the selection setter a no-op — so the case worth
+    /// pinning is the one this test covers, a reload whose row SURVIVED. The reload
+    /// that clamps to a neighbour because the row vanished does arm the jump, and is
+    /// benign: it is a different session in the pane by then.
+    #[test]
+    fn the_jump_fires_on_a_selection_change_and_not_on_a_reload_that_keeps_the_row() {
+        let mut app = app_all(vec![markable_fixture("s1"), markable_fixture("s2")]);
+        app.toggle_search_mode();
+        app.push_query_str(FIXTURE_WORD);
+        assert!(app.take_preview_match_jump(), "the query armed it");
+        assert_eq!(app.filtered.len(), 2, "both rows must survive the query");
+
+        // A reload that re-reads every transcript — the live-session case.
+        app.apply_sessions(app.sessions.clone());
+        assert!(
+            !app.take_preview_match_jump(),
+            "a reload must not yank the reader's viewport"
+        );
+
+        // Moving the selection is the user's own act, and does.
+        app.move_selection(1);
+        assert!(
+            app.take_preview_match_jump(),
+            "opening another session must offer its match"
+        );
+
+        // A selection change also forgets where the pane was parked: a line index
+        // from one transcript means nothing in another.
+        app.preview_match_line = Some(7);
+        app.move_selection(-1);
+        assert_eq!(app.preview_match_line, None);
+    }
+
+    /// The explicit step is NOT mode-gated: a keypress is the question the
+    /// automatic jump refuses to assume.
+    #[test]
+    fn the_shift_arrow_step_works_in_name_only_mode_too() {
+        let mut app = app_all(vec![markable_fixture("s1")]);
+        assert_eq!(app.search_mode, SearchMode::NameOnly);
+        app.push_query_str(FIXTURE_WORD);
+        app.preview_text(60);
+        assert!(
+            app.has_preview_matches(),
+            "the fixture marks this query in both modes"
+        );
+        let _ = app.take_preview_match_jump();
+
+        app.preview_match_step(false);
+        assert!(
+            app.take_preview_match_jump(),
+            "an explicit step must move the pane whatever the search mode"
+        );
+        assert!(
+            app.preview_match_line.is_some(),
+            "and must park on a concrete match"
+        );
+    }
+
+    /// The keybinding's gate answers from the CACHE the pane was drawn from, and
+    /// only while that cache still describes something the user can SEE.
+    ///
+    /// Both refusals exist because the cache outlives its subject: a map left over
+    /// from a previous query, and a pane the user has hidden, would each bind the
+    /// shifted arrows to marks that are not on screen — a key that silently does
+    /// nothing instead of moving the selection.
+    #[test]
+    fn the_match_gate_refuses_a_stale_map_and_a_hidden_pane() {
+        let mut app = app_all(vec![markable_fixture("s1")]);
+        assert!(
+            !app.has_preview_matches(),
+            "an unsearched board has nothing to navigate"
+        );
+
+        app.push_query_str(FIXTURE_WORD);
+        app.preview_text(60);
+        assert!(app.has_preview_matches(), "the query is in this transcript");
+
+        // Hiding the pane leaves the cache intact — the gate must not.
+        app.toggle_preview();
+        assert!(!app.show_preview);
+        assert!(
+            !app.has_preview_matches(),
+            "a hidden pane has nothing to navigate, however warm the cache is"
+        );
+        app.toggle_preview();
+        assert!(
+            app.has_preview_matches(),
+            "and showing it again restores the key"
+        );
+
+        // Move the query WITHOUT re-rendering: the cached map still describes the
+        // old one, so the gate must refuse it.
+        app.query.push('z');
+        assert!(
+            !app.has_preview_matches(),
+            "a stale map must not bind the keys"
         );
     }
 

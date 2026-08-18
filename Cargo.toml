@@ -69,6 +69,16 @@ dirs = "=6.0.0"
 anyhow = "=1.0.103"
 # Parallel per-file scan in SessionStore::load (Task 2.7). Already in the tree via nucleo.
 rayon = "=1.12.0"
+# Extended grapheme-cluster boundaries for the search-match highlight, which
+# splits a rendered line into styled spans. `Line::width` sums unicode-width PER
+# SPAN and that width is a CONTEXTUAL fold, so a boundary inside a cluster (an
+# emoji cut from its VS16 or its skin-tone modifier) changes the summed width of
+# text that did not change, desyncing the preview's cached widths and cached
+# wrapped-row count from the line on screen. Snapping run boundaries out to
+# cluster edges is the fix, and a grapheme table is never hand-rolled. Already in
+# the tree transitively via ratatui-textarea / nucleo-matcher / unicode-truncate;
+# pinned exact.
+unicode-segmentation = "=1.13.3"
 # Terminal display-width of stripped table-cell text so inline markers (**x**,
 # [a](b)) and CJK/emoji measure at their rendered column count, keeping table
 # columns aligned. Already in the tree transitively via ratatui; pinned exact.

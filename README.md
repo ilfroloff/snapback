@@ -114,12 +114,13 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | `Ctrl-R` | **Quick reply** — send a one-shot message to the selected session without leaving the board. A background agent whose run is over (`done`, `stopped`, `failed`) is stopped first so the reply lands in place; a waiting one (`needs input`) asks you to confirm that stop; one that is still live (`working`, `idle`, `interrupted`, or a state this version doesn't recognize) is left alone and refused. Opens a compose box (`Enter` sends, `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels) |
 | `Ctrl-K` | **Stop / interrupt** the selected session's live background agent (`claude stop`). An agent whose run is over (`done`, `stopped`, `failed`) stops immediately; every other live agent (`working`, `needs input`, `idle`, `interrupted`, unrecognized) confirms first, since stopping ends the live job (its conversation is kept). A session that isn't running as an agent has nothing to stop, and an interactive session running in another terminal can't be stopped from here |
 | `Ctrl-X` then `x` / `d` / `h` / `r` | **Leader chord** for trimming and refreshing the board — `x` **hides** the selected session (reversible, persisted), `d` **hard-deletes** it after a confirmation that can take just that row or its whole `(+N)` stack, `h` toggles **show hidden**, `r` **re-reads every transcript from disk**. Any other key cancels the chord |
-| `Tab` | Toggle search: **name-only ↔ name+content** |
+| `Tab` | Toggle search: **name-only ↔ name+content**. Widening to content also opens the preview on the most recent match, the same way typing does |
 | `Ctrl-A` | Flip scope: **current folder ↔ project** — the project being the repo you launched in and all of its git worktrees. Started with `-a` it is a three-stop cycle instead (current folder → project → all folders), which is the only way to reach all folders |
 | `Ctrl-/` | Toggle the transcript **preview** pane |
 | `PgUp` / `PgDn` | Scroll the preview a full page |
 | `Ctrl-U` / `Ctrl-D` | Scroll the preview a quarter page |
 | `Home` / `End` | Jump the preview to the top / bottom |
+| `Shift-↑` / `Shift-↓` | Walk the preview through the lines your query marks — previous / next. Only bound while something IS marked in the previewed transcript; with nothing marked they stay plain **move the selection**, so they never take a key away from you (and a terminal that swallows the modifier still moves). One stop per marked **line**, not per occurrence: a line saying your query twice is marked twice and stopped at once |
 | mouse wheel | Scroll the pane under the pointer |
 | drag the pane border | Resize the list and preview panes |
 | click a preview link | Open its url in your browser |
@@ -196,7 +197,22 @@ rather than showing an empty board.
 **Search by name or by content.** Typing filters instantly by name. Press `Tab`
 to also search inside the transcripts, so you can find a session by what was
 actually said or done in it — not just by what it was titled. The matched text
-is highlighted in the list.
+is highlighted in the list **and marked in the preview**, so a content hit shows
+you where it was said instead of leaving you to scroll for it. In content mode
+the preview also **scrolls itself onto the most recent match** as you type, as
+you move between rows, and the moment `Tab` widens the search, and `Shift-↑` /
+`Shift-↓` walk back and forth through the rest — so finding a hit costs no
+scrolling at all. Content search reaches further
+back than the preview shows, so a hit occasionally lands outside the previewed
+part of the transcript; the board says so rather than showing an unmarked pane.
+
+The preview follows the newest turn of a session that is still being written —
+until you position the pane yourself. Scroll it, jump to a match, or press `Home`,
+and it stays exactly where you left it — including if you scroll back down onto the
+newest turn, which parks the pane there rather than resubscribing it. `End` is how
+you hand it back. Until you do, only selecting a row, typing, `Tab`, a `Shift-`
+arrow, reopening the pane with `Ctrl-/`, or a quick reply of your own finishing
+moves it, never an autorefresh.
 
 **Autorefresh.** The list keeps itself current as you work: new sessions appear,
 finished ones update, deleted ones drop out — all in place, with your selection
