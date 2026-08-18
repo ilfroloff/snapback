@@ -52,6 +52,70 @@
 //! case excludes: measured, `NPX` finds 6 entries there while the smart-case rule
 //! matches 0. That is an inclusion regression, not a ranking nuance.
 //!
+//! # The content AND is bounded to a PROXIMITY WINDOW
+//!
+//! In [`SearchMode::NameAndContent`], a MULTI-atom query matches when every atom
+//! occurs in the LABEL, or when every atom occurs within one window of the others
+//! inside the content haystack. The window is
+//! `max(`[`PROXIMITY_WINDOW_MIN_BYTES`]`, `[`PROXIMITY_WINDOW_QUERY_MULTIPLIER`]`
+//! × the query's byte length)`. A SINGLE-atom query takes the plain [`atoms_match`]
+//! path unchanged, and [`SearchMode::NameOnly`] is untouched in both cases.
+//!
+//! State the window arm's haystack plainly, because it is part of the rule and not
+//! an implementation detail: it runs over the COMBINED string — the label at byte
+//! 0, a newline, then the content index — so a pair STRADDLING that seam
+//! co-occurs. One atom in the label and one in the opening lines of the transcript
+//! is a match that NEITHER literal arm admits on its own. That is deliberate: the
+//! label is the transcript's own opening words, so a hit spanning the join is near
+//! in exactly the sense the window means. It also makes the rule a strict SUPERSET
+//! of the label arm rather than an alternative to it.
+//!
+//! The unbounded AND it replaces barely filtered anything. Measured over the real
+//! store (a ONE-OFF probe, 2026-08-18, 310-330 sessions carrying readable text —
+//! a dated sample, not a maintained metric), a random TWO-word query matched a
+//! median **44.2%** of the corpus, and **48.3%** within the default
+//! current-folder scope. Bounding the SPAN the AND is evaluated over takes that
+//! to **8.2%** at 200 B, **14.4%** at 400 B and **21.5%** at 800 B.
+//!
+//! The defect is that SPAN, not the whitespace splitting. Name-only mode applies
+//! the identical atom rule over a `store::label::LABEL_MAX` (180-char) label and
+//! shows none of it: two words co-occurring in a 12-75 KB transcript say almost
+//! nothing, while two words within a paragraph of each other say the user is
+//! remembering one exchange. So the window rides the CONTENT arm alone.
+//!
+//! Exact-phrase-by-default was considered and REJECTED: 12.3% / 21.4% / 32.0% of
+//! remembered 3 / 5 / 8-word runs contain a NEWLINE, and would silently return
+//! nothing; it also breaks the pasted-snippet path, which flattens newlines to
+//! spaces before it ever reaches here. No query syntax is added either — no
+//! quotes, no phrase mode — for the reason [`set_query`](SearchIndex::set_query)
+//! already gives: what matching MEANS must never depend on what the user types.
+//! The proportional half of the window is what carries a paste instead, and it
+//! recovered 108/108 flattened 3-line snippets in the same probe.
+//!
+//! Mechanically ([`atoms_co_occur_within`]): count each atom's occurrences over
+//! the PREBUILT haystack — that is what today's AND already costs — anchor on the
+//! RAREST atom, and answer the others from a bounded slice around each of its
+//! occurrences. The rarest atom occurred p50=3, p90=11, p99=34 times per matching
+//! session (max 79), so that is a few dozen short scans.
+//!
+//! [`PROXIMITY_MAX_ANCHORS`] bounds that, and it is asked of the ANCHOR — the
+//! RAREST atom — and of nothing else, since only the rarest bounds every other.
+//! Applying the cap per atom would fire on any query carrying an ordinary word
+//! (`the` occurs four figures of times in a real transcript) while the rarest atom
+//! still had a handful of hits, and hand that query straight back the unbounded
+//! AND this section exists to replace. The anchor itself overflows on a
+//! pathological GENERATED file and, harmlessly, on an all-common-word QUERY over
+//! an ORDINARY one — atoms that frequent co-occur inside the window regardless, so
+//! the unbounded answer admits nothing. The other atoms' counts are not
+//! load-bearing either way: the scan costs (anchor hits × atoms × window), so
+//! capping them would buy nothing, and every list is bounded as it is collected
+//! so that finding the rarest never materialises a runaway one.
+//!
+//! The MARKS do not move: [`atom_match_positions`](SearchIndex::atom_match_positions)
+//! stays per atom, per rendered line. The window only makes it likelier that
+//! co-occurring atoms land on ONE line, so a bounded AND produces fewer
+//! "match outside preview" notices, not more.
+//!
 //! # Why BOTH haystacks are kept
 //!
 //! Each entry carries a CASED haystack and a LOWERCASED sibling, and both are
@@ -61,9 +125,32 @@
 //! it would leave every uppercase-bearing query (`TODO`, `API`, `React`)
 //! searching a lowercased haystack case-sensitively, matching nothing.
 //!
+//! The two also share ONE BYTE SPACE, which is now load-bearing rather than
+//! incidental: the proximity window above measures a distance between a hit in
+//! the cased haystack and a hit in the lowercased one, and that is meaningless
+//! unless byte offset `n` names the same place in both. So the lowercased sibling
+//! is folded PER CHAR by [`lowercase_preserving_byte_len`], which keeps any char
+//! whose lowercase form would change its UTF-8 width (`K` U+212A → `k`, 3 bytes →
+//! 1; `Å` U+212B → `å`, 3 → 2; `ẞ` U+1E9E → `ß`, 3 → 2) rather than shifting
+//! every byte that follows it.
+//!
+//! **That fold is the module's ONE fold, and every seam takes it.** The filter
+//! builds its haystacks with it, the row-label highlight gates on it, and the
+//! preview marks search it. This is not tidiness: the surfaces share the
+//! [`AtomFinder`]s, and a finder only answers the SAME question on two surfaces if
+//! each was handed a haystack lowercased by the same rule. Fold one seam with
+//! [`str::to_lowercase`] instead and the two part company on the narrow class the
+//! two rules disagree about — a label reading `ΟΔΟΣ notes` is admitted under
+//! `οδοσ` (per char, always `σ`) and would then draw with NOTHING marked (per
+//! string, a word-final `Σ` is `ς`), and a `K` U+212A label the filter rejects
+//! would draw marked. An admitted row that cannot show why it is on the board is
+//! the defect this module already fixed once.
+//!
 //! Lowercasing happens ONCE per entry at build/refresh, never per keystroke. The
 //! cost is ~2× the extracted content in memory — bounded by `store::parse`'s
-//! `CONTENT_INDEX_CAP` and cheap at this scale (tens of MB store-wide).
+//! `CONTENT_INDEX_CAP` and cheap at this scale (tens of MB store-wide). The
+//! marking seams fold per CALL instead — they are handed one short rendered line
+//! or one row label, not a transcript.
 //!
 //! # Scope-limited matching
 //!
@@ -122,6 +209,13 @@
 //! the author believed smart case to be — precisely the thing under test; the
 //! `NPX` trap is a measured case where that belief is wrong).
 //!
+//! nucleo's AND is UNBOUNDED, so the oracle pins parity only WITHIN the
+//! proximity window: its corpus strings sit far under
+//! [`PROXIMITY_WINDOW_MIN_BYTES`], which is what keeps the two comparable at all.
+//! Widening a corpus entry past that bound would make the oracle disagree by
+//! design — the disagreement IS the fix — so the bounded rule is pinned by its
+//! own tests instead.
+//!
 //! The oracle's corpus is built so the following never fire, because on each of
 //! them this module deliberately differs from nucleo:
 //!
@@ -129,10 +223,14 @@
 //!   (`resume` matching `résumé`); a byte search does not, so such a match is
 //!   excluded — from admission AND from both marking rules, which is what keeps
 //!   them consistent.
-//! * **Per-string vs per-char lowercasing.** We lowercase via
-//!   [`str::to_lowercase`], which is context-sensitive per string (Greek final
-//!   sigma `Σ`→`ς`, `İ`→`i̇`), whereas nucleo folds per char. For some non-ASCII
-//!   text this is marginally more restrictive.
+//! * **Length-preserving lowercasing.** Every lowercased haystack in the module —
+//!   the filter's, the label gate's, the preview marks' — is folded per char by
+//!   [`lowercase_preserving_byte_len`], which KEEPS any char whose
+//!   lowercase form would change its UTF-8 byte length — the price of the one
+//!   shared byte space the proximity window needs. nucleo folds per char with no
+//!   such constraint, so a char like `İ` (lowercase: two chars) folds for nucleo
+//!   and not here. For that narrow class of non-ASCII text this module is the more
+//!   restrictive of the two.
 //! * **The non-ASCII tail off-by-one.** nucleo-matcher 0.3.1's non-ASCII
 //!   substring path (`exact.rs::substring_match_non_ascii`) scans candidate
 //!   starts only up to `haystack.len() - needle.len()` EXCLUSIVE, so it misses a
@@ -165,6 +263,53 @@ use std::ops::Range;
 use memchr::memmem;
 
 use crate::store::Session;
+
+/// Floor for the proximity window, in BYTES: how far apart two atoms may sit in
+/// the content haystack and still count as co-occurring.
+///
+/// 200 B is about a paragraph — the span a user who remembers one exchange is
+/// actually pointing at. Unbounded, a two-word AND matched a median 44.2% of the
+/// corpus; at this floor it matches 8.2% (one-off probe, 2026-08-18 — see the
+/// module docs). Lower starts dropping a genuine memory of a single exchange;
+/// higher drifts back toward "both words appear in this session somewhere",
+/// which is the defect being fixed.
+const PROXIMITY_WINDOW_MIN_BYTES: usize = 200;
+
+/// How many times the query's own byte length the window grows to, when that
+/// beats the floor above.
+///
+/// A LONG query describes a LONG span of text — a pasted snippet is the case
+/// that matters — so its atoms are legitimately further apart than a typed
+/// pair's. 3x is the slack that recovered 108/108 flattened 3-line pastes in the
+/// same probe while leaving short typed queries sitting on the floor.
+const PROXIMITY_WINDOW_QUERY_MULTIPLIER: usize = 3;
+
+/// How many occurrences of the RAREST atom the window scan anchors on before it
+/// gives up and answers the UNBOUNDED AND instead.
+///
+/// A SCAN-COST guard, not a tuning knob, and it is asked of the RAREST atom
+/// ALONE — the one the scan anchors on, and the only one whose count bounds all
+/// of them (the rarest overflowing means EVERY atom does). Cap every atom
+/// instead and any query carrying an English word fires it (`the` turns up four
+/// figures of times in an ordinary transcript) while the rarest atom still has a
+/// handful of hits, handing a query the window could answer cheaply straight
+/// back the unbounded AND the window exists to replace.
+///
+/// Anchored there, the number is sized by the right statistic: over the real
+/// store the RAREST atom occurred p50=3, p90=11, p99=34 times per matching
+/// session, with an observed maximum of 79 (a one-off probe, 2026-08-18 — a
+/// dated sample, not a maintained metric), so ~6x that maximum clears any query
+/// that names something specific.
+///
+/// TWO things overflow it, and the fallback is sound for both. A pathological
+/// GENERATED file gets today's unbounded answer rather than a scan proportional
+/// to its own pathology. And an all-common-word QUERY trips it over a perfectly
+/// ORDINARY file — `the a` against ~100 KB of prose puts even the rarest atom in
+/// four figures — which is why this is not exclusively a bad-file guard. That
+/// case is harmless rather than a hole: atoms that frequent already sit within
+/// one window of each other, so the unbounded answer admits nothing the window
+/// would have rejected.
+const PROXIMITY_MAX_ANCHORS: usize = 512;
 
 /// Which haystack the filter searches.
 ///
@@ -245,12 +390,12 @@ impl Entry {
             content.push('\n');
             content.push_str(&session.content_index);
         }
-        // Lowercase ONCE here (build/refresh), never per keystroke. `to_lowercase`
-        // is unicode-aware, so a case-insensitive atom matches mixed-case text.
-        // It folds per string, not per char — see the module-level oracle
-        // divergence list for that narrow per-string vs. per-char exception.
-        let name_lower = session.label.to_lowercase();
-        let content_lower = content.to_lowercase();
+        // Lowercase ONCE here (build/refresh), never per keystroke — and in a way
+        // that keeps the lowercased haystack byte-for-byte addressable against the
+        // cased one, because the proximity window measures DISTANCES across the
+        // two. See [`lowercase_preserving_byte_len`].
+        let name_lower = lowercase_preserving_byte_len(&session.label);
+        let content_lower = lowercase_preserving_byte_len(&content);
         Entry {
             session_id: session.session_id.clone(),
             fingerprint,
@@ -355,6 +500,11 @@ pub struct SearchIndex {
     /// ([`atom_match_positions`](Self::atom_match_positions)) — reuse the SAME
     /// finders, which is what makes a mark and an admission the same decision.
     atom_finders: Vec<AtomFinder>,
+    /// The active query's proximity window in BYTES, derived once per keystroke
+    /// by [`proximity_window`] and read by every entry in the scan. It depends on
+    /// the QUERY alone, so computing it per entry would be the same number paid
+    /// for hundreds of times.
+    proximity_window: usize,
     /// How many entries the last build/refresh actually (re)built. Instrumented
     /// so the partial-rebuild behaviour is observable (and unit-testable).
     last_rebuilt: usize,
@@ -377,6 +527,7 @@ impl SearchIndex {
             // No atoms => the empty query: `results` returns all, and neither
             // marking rule marks anything.
             atom_finders: Vec::new(),
+            proximity_window: proximity_window(0),
             last_rebuilt: 0,
         }
     }
@@ -452,6 +603,9 @@ impl SearchIndex {
             .filter(|atom| !atom.is_empty())
             .map(|atom| AtomFinder::new(&atom))
             .collect();
+        // Derived from the QUERY, so it is computed once here rather than
+        // recomputed identically for every entry in the scan.
+        self.proximity_window = proximity_window(query.len());
     }
 
     /// The active query text.
@@ -569,18 +723,26 @@ impl SearchIndex {
         let mode = self.mode;
         let entries = &self.entries;
         let finders = &self.atom_finders;
+        let window = self.proximity_window;
 
         candidates
             .iter()
             .copied()
             .filter(|&i| {
                 // Fail-soft: skip any candidate index out of range (never panic).
-                entries.get(i).is_some_and(|entry| {
+                entries.get(i).is_some_and(|entry| match mode {
                     // A SIMD byte-substring scan per atom, over whichever haystack
                     // that atom's smart-case decision calls for. No UTF-32
                     // conversion, no allocation, no scoring: membership is the
                     // only bit anything downstream reads.
-                    atoms_match(entry.haystack(mode), entry.gate_haystack(mode), finders)
+                    SearchMode::NameOnly => {
+                        atoms_match(entry.haystack(mode), entry.gate_haystack(mode), finders)
+                    }
+                    // The same scan, but a MULTI-atom AND is bounded to a
+                    // proximity window — a whole transcript is too wide a span for
+                    // co-occurrence to mean anything. Name-only is deliberately
+                    // untouched: its haystack is one short label already.
+                    SearchMode::NameAndContent => content_mode_matches(entry, finders, window),
                 })
             })
             .collect()
@@ -613,7 +775,7 @@ impl SearchIndex {
     /// Returns CHAR indices into `display` (never byte offsets), sorted
     /// ascending and deduplicated. An empty/whitespace query parses to zero
     /// atoms and yields an empty set — nothing to highlight.
-    pub fn match_indices(&mut self, display: &str) -> Vec<u32> {
+    pub fn match_indices(&self, display: &str) -> Vec<u32> {
         // No atoms => empty/whitespace query: nothing is highlighted.
         if self.atom_finders.is_empty() {
             return Vec::new();
@@ -622,7 +784,14 @@ impl SearchIndex {
         // pair of haystacks each atom's smart-case decision selects. One atom
         // missing from `display` means no highlight at all, even where the
         // others land.
-        if !atoms_match(display, &display.to_lowercase(), &self.atom_finders) {
+        // Lowercased the way the FILTER lowercases its haystacks, not by
+        // `to_lowercase`: the gate is only "the same question" if it folds the
+        // same way the label arm that admitted the row does.
+        if !atoms_match(
+            display,
+            &lowercase_preserving_byte_len(display),
+            &self.atom_finders,
+        ) {
             return Vec::new();
         }
         // Past the gate, WHICH chars is the per-atom question, and the preview's
@@ -654,7 +823,10 @@ impl SearchIndex {
     /// Smart case rides each atom exactly as it does in the filter — these ARE the
     /// filter's finders — so `foo BAR` marks `foo` case-insensitively and `BAR`
     /// case-sensitively inside one call, each against the haystack casing its own
-    /// decision calls for.
+    /// decision calls for. The case-INSENSITIVE branch folds `text` with
+    /// [`lowercase_preserving_byte_len`], the SAME fold the filter builds its
+    /// haystacks with, because sharing the finders is only half of asking the same
+    /// question — the other half is folding the haystack the same way.
     ///
     /// Returns ascending, deduplicated CHAR positions (never byte offsets). Runs
     /// that overlap or abut, whether from one atom or several, merge into one
@@ -671,18 +843,23 @@ impl SearchIndex {
         // two atoms covering one char mark it once, and the output comes out sorted
         // and deduplicated by construction.
         let mut marked = vec![false; text.chars().count()];
-        // Both case branches' byte -> CHAR maps, built ONCE per call rather than per
-        // atom. Both are built unconditionally: `text` here is a single rendered
-        // line, so branching to skip one buys nothing worth the extra state.
-        let cased_starts = char_starts(text);
-        let (lowered, lowered_starts) = lowered_with_char_starts(text);
+        // ONE byte -> CHAR map serves BOTH case branches, because the lowercased
+        // sibling is folded by the same [`lowercase_preserving_byte_len`] the
+        // FILTER builds its haystacks with. That fold is byte-length preserving per
+        // char, so byte offset `n` names the same char in both strings and a second
+        // map would be a copy of this one. Folding the way the filter folds is not
+        // an optimization: a finder only answers the same question on both surfaces
+        // if the haystack it is handed was lowercased by the same rule, or a row the
+        // filter admitted draws with nothing marked.
+        let starts = char_starts(text);
+        let lowered = lowercase_preserving_byte_len(text);
         for atom in &self.atom_finders {
-            let (haystack, starts) = if atom.case_sensitive {
-                (text, cased_starts.as_slice())
+            let haystack = if atom.case_sensitive {
+                text
             } else {
-                (lowered.as_str(), lowered_starts.as_slice())
+                lowered.as_str()
             };
-            mark_atom(atom, haystack, starts, &mut marked);
+            mark_atom(atom, haystack, &starts, &mut marked);
         }
         marked
             .iter()
@@ -751,6 +928,59 @@ fn gate_atoms(query: &str) -> Vec<String> {
     atoms
 }
 
+/// Lowercase `text` PER CHAR, keeping any char whose lowercase form would change
+/// its UTF-8 byte length.
+///
+/// The point is not the casing, it is the BYTE SPACE. A case-sensitive atom
+/// searches the cased haystack and a case-insensitive one searches this
+/// lowercased sibling, so the proximity window in [`atoms_co_occur_within`]
+/// measures a distance between hits found in DIFFERENT strings. That distance is
+/// meaningless unless byte offset `n` names the same place in both, which
+/// [`str::to_lowercase`] does not guarantee: it can SHRINK a char (`K` U+212A →
+/// `k`, 3 bytes → 1; `Å` U+212B → `å`, 3 → 2; `ẞ` U+1E9E → `ß`, 3 → 2) and it can
+/// LENGTHEN one into several (`İ` → `i` + a combining dot). Either shifts every
+/// later byte and turns a mixed-case query's window into garbage. Keeping such a
+/// char as-is costs only the fold on that char and buys one shared byte space.
+///
+/// Folding per char rather than per string also drops [`str::to_lowercase`]'s one
+/// context-sensitive rule — a Greek capital sigma lowercases to `ς` at a word end
+/// and `σ` elsewhere, where per char it is always `σ` — and THAT is the narrowing
+/// a real user can hit. Per STRING a label reading `ΟΔΟΣ` folded to `οδος`, the
+/// natural lowercase spelling, so a Greek searcher typing `οδος` matched it; per
+/// char the label folds to `οδοσ`, so `οδος` no longer matches and `οδοσ` does.
+/// Always taking `σ` is not a claim about which spelling a searcher means — it is
+/// the only choice that is context-FREE, and therefore the same on both sides of
+/// the window.
+///
+/// The other narrowing is reachable only from a spelling nobody types: a query
+/// `i̇stanbul` (`i` + U+0307) no longer matches a label reading `İstanbul`,
+/// because `İ` lowercases to TWO chars and is therefore left alone. `stanbul`
+/// still finds it. Both are the price of ONE byte space, and this is the only
+/// place in the module that decides it.
+fn lowercase_preserving_byte_len(text: &str) -> String {
+    let mut lowered = String::with_capacity(text.len());
+    for ch in text.chars() {
+        let mut folded = ch.to_lowercase();
+        match (folded.next(), folded.next()) {
+            // Exactly one char AND the same encoded width: safe to substitute.
+            (Some(one), None) if one.len_utf8() == ch.len_utf8() => lowered.push(one),
+            // Anything else would move every byte after it. Keep the original.
+            _ => lowered.push(ch),
+        }
+    }
+    lowered
+}
+
+/// The proximity window, in BYTES, for a query of `query_len` bytes.
+///
+/// `max(floor, multiplier × query length)`: short typed queries sit on the floor,
+/// and a long query — a pasted snippet — earns a window proportional to the span
+/// of text it is describing. See the two constants for the measurements behind
+/// each number.
+fn proximity_window(query_len: usize) -> usize {
+    PROXIMITY_WINDOW_MIN_BYTES.max(query_len.saturating_mul(PROXIMITY_WINDOW_QUERY_MULTIPLIER))
+}
+
 /// True iff EVERY atom occurs as a byte substring of the haystack its own
 /// smart-case decision selects — `cased` for a case-sensitive atom, `lowercased`
 /// for a case-insensitive one.
@@ -772,6 +1002,144 @@ fn atoms_match(cased: &str, lowercased: &str, finders: &[AtomFinder]) -> bool {
             lowercased
         };
         atom.finder.find(haystack.as_bytes()).is_some()
+    })
+}
+
+/// Membership in [`SearchMode::NameAndContent`]: every atom in the LABEL, or
+/// every atom co-occurring inside one `window`-byte neighbourhood of the content
+/// haystack.
+///
+/// FAST PATH: a query of ONE atom takes exactly [`atoms_match`], the pre-window
+/// path, byte for byte. A single atom cannot be far from itself, so the window
+/// has nothing to say about it — and the single-atom query is the most common
+/// keystroke there is, which must not get slower.
+///
+/// BOTH arms are load-bearing. The label arm is not implied by the window arm: a
+/// label is capped at `store::label::LABEL_MAX` CHARS, which can exceed the
+/// window in BYTES, so without it a row could stop being findable by its own
+/// name.
+///
+/// The window arm runs over the COMBINED haystack (label at byte 0, a newline,
+/// then the content index) rather than the content index alone, so a pair
+/// STRADDLING that seam co-occurs. Say it out loud, because it admits rows
+/// neither literal arm does: one atom in the label and one in the transcript's
+/// opening lines is a match. That is the intent — the label IS the transcript's
+/// opening words, so a hit spanning the join is near in the sense the window
+/// means — and it makes this arm a strict superset of the label arm rather than
+/// an alternative to it.
+fn content_mode_matches(entry: &Entry, finders: &[AtomFinder], window: usize) -> bool {
+    let mode = SearchMode::NameAndContent;
+    if finders.len() < 2 {
+        return atoms_match(entry.haystack(mode), entry.gate_haystack(mode), finders);
+    }
+    atoms_match(&entry.name, &entry.name_lower, finders)
+        || atoms_co_occur_within(
+            entry.haystack(mode),
+            entry.gate_haystack(mode),
+            finders,
+            window,
+        )
+}
+
+/// True iff some occurrence of EVERY atom sits within `window` bytes of one
+/// shared anchor — the bounded replacement for an AND evaluated over a whole
+/// transcript.
+///
+/// Distance is measured START to START, in either direction, so the admitted
+/// neighbourhood spans at most twice `window`. Why bounding it at all is the
+/// whole point of this change is argued in the module docs; the short of it is
+/// that two words co-occurring somewhere in a 12-75 KB transcript matched a
+/// median 44.2% of the real corpus and told the user nothing.
+///
+/// Shape: count each atom's occurrences over the PREBUILT haystack (a full pass
+/// per atom, which is what today's AND already costs when an atom is absent),
+/// anchor on the RAREST atom, and answer the others from a BOUNDED slice around
+/// each of its occurrences. A missing atom fails outright — no window can rescue
+/// a word that is not there — and that is the common bail.
+///
+/// [`PROXIMITY_MAX_ANCHORS`] then bounds the anchor's own occurrence count, and
+/// the ANCHOR's alone — see that const for why asking it of a common atom would
+/// re-open the defect this whole path exists to close.
+///
+/// The two haystacks MUST be the same text differing only in case AND sharing one
+/// byte space; [`lowercase_preserving_byte_len`] is what guarantees the second
+/// half, without which every distance computed here is garbage. The
+/// `debug_assert` states it, and the `lo < hi` slice guard keeps a future
+/// violation to a wrong answer rather than a panic.
+fn atoms_co_occur_within(
+    cased: &str,
+    lowercased: &str,
+    finders: &[AtomFinder],
+    window: usize,
+) -> bool {
+    debug_assert_eq!(
+        cased.len(),
+        lowercased.len(),
+        "the cased and lowercased haystacks must share ONE byte space, or every \
+         distance measured across them is meaningless"
+    );
+    let haystack_for = |atom: &AtomFinder| -> &[u8] {
+        if atom.case_sensitive {
+            cased.as_bytes()
+        } else {
+            lowercased.as_bytes()
+        }
+    };
+
+    // Occurrences per atom, each list bounded so no atom can make the scan pay
+    // for its own frequency. Collecting one PAST the cap is how an atom that
+    // overflows stays distinguishable from one that exactly fills it — and the
+    // bound is also why finding the rarest below never materialises a huge list.
+    let mut occurrences: Vec<Vec<usize>> = Vec::with_capacity(finders.len());
+    for atom in finders {
+        let hits: Vec<usize> = atom
+            .finder
+            .find_iter(haystack_for(atom))
+            .take(PROXIMITY_MAX_ANCHORS + 1)
+            .collect();
+        if hits.is_empty() {
+            return false;
+        }
+        occurrences.push(hits);
+    }
+
+    // The rarest atom makes the fewest anchors, hence the fewest bounded slices.
+    let anchor = occurrences
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, hits)| hits.len())
+        .map_or(0, |(index, _)| index);
+
+    // Scan-cost guard, asked of the ANCHOR alone. The anchor is by construction
+    // the RAREST atom, so its overflowing means EVERY atom does. Asking it of
+    // every atom instead would fire on any query carrying an ordinary word (`the`
+    // occurs four figures of times in a real transcript) while the rarest still
+    // had a handful of hits, and hand that query back the unbounded AND this
+    // exists to replace. Two things reach it: a pathological GENERATED file, and
+    // an all-common-word QUERY over an ORDINARY one - the latter harmlessly,
+    // since atoms that frequent co-occur inside the window anyway.
+    // Capping the others would buy nothing regardless: the scan costs
+    // (anchor hits x atoms x window), and their own lists are already bounded
+    // above.
+    if occurrences[anchor].len() > PROXIMITY_MAX_ANCHORS {
+        return true;
+    }
+
+    occurrences[anchor].iter().any(|&at| {
+        finders.iter().enumerate().all(|(index, atom)| {
+            if index == anchor {
+                return true;
+            }
+            let haystack = haystack_for(atom);
+            let lo = at.saturating_sub(window).min(haystack.len());
+            // The slice runs one needle PAST the furthest allowed start, so an
+            // occurrence beginning exactly at the edge still fits inside it whole.
+            let hi = at
+                .saturating_add(window)
+                .saturating_add(atom.finder.needle().len())
+                .min(haystack.len());
+            lo < hi && atom.finder.find(&haystack[lo..hi]).is_some()
+        })
     })
 }
 
@@ -823,39 +1191,16 @@ fn char_span(starts: &[usize], start: usize, end: usize) -> Range<usize> {
 
 /// Byte offset of each CHAR of `text`, ascending — the map [`char_span`] reads to
 /// answer a memmem hit in CHAR positions.
+///
+/// ONE map answers for the cased text AND its lowercased sibling. That is a
+/// consequence of [`lowercase_preserving_byte_len`], not an assumption:
+/// the fold substitutes a char only when the replacement encodes to the SAME
+/// number of bytes, so byte offset `n` names the same char in both strings. A
+/// per-string [`str::to_lowercase`] would not license this — it can lengthen a
+/// char (`İ` → `i` + a combining dot) and shift every later byte — which is
+/// exactly why the marking seam folds the way the filter does.
 fn char_starts(text: &str) -> Vec<usize> {
     text.char_indices().map(|(byte, _)| byte).collect()
-}
-
-/// `text` lowercased the way the filter lowercases its haystacks, paired with the
-/// byte offset at which each SOURCE char begins inside that lowercased string.
-///
-/// The map is what makes a hit in the lowercased haystack addressable in the
-/// ORIGINAL text's char positions, which is what gets marked. It cannot be assumed
-/// 1:1: lowercasing can LENGTHEN a char (`İ` → `i̇`, one char into two), so the
-/// k-th lowercased char is not the k-th source char.
-///
-/// The string itself comes from [`str::to_lowercase`] — the same function the
-/// filter's haystacks are built with — while the offsets are accumulated per char.
-/// The two agree because the ONLY context-sensitive mapping in that function is a
-/// Greek capital sigma, whose two lowercase forms (`σ`, `ς`) are both one char and
-/// two bytes. The `debug_assert` states that invariant where it would break, and
-/// [`char_span`] plus the `get_mut` in [`mark_atom`] keep a future divergence to a
-/// misplaced mark rather than a panic.
-fn lowered_with_char_starts(text: &str) -> (String, Vec<usize>) {
-    let lowered = text.to_lowercase();
-    let mut starts = Vec::with_capacity(text.len());
-    let mut byte = 0usize;
-    for ch in text.chars() {
-        starts.push(byte);
-        byte += ch.to_lowercase().map(char::len_utf8).sum::<usize>();
-    }
-    debug_assert_eq!(
-        byte,
-        lowered.len(),
-        "per-char and per-string lowercasing must agree in byte length"
-    );
-    (lowered, starts)
 }
 
 /// One-shot substring filter: match `sessions` against `query` in `mode`.
@@ -1337,6 +1682,61 @@ mod tests {
         );
     }
 
+    /// The row-LABEL seam and the FILTER must fold the same way, or a row the
+    /// filter admitted draws with nothing marked (and one it rejected draws
+    /// marked).
+    ///
+    /// Both surfaces read the same finders, but a finder only answers the same
+    /// question if the haystack it is handed was lowercased by the same rule. The
+    /// filter folds PER CHAR ([`lowercase_preserving_byte_len`]); marking must
+    /// too. The cases below are exactly where a per-STRING [`str::to_lowercase`]
+    /// parts company with it: the context-sensitive word-final sigma, and the
+    /// three chars whose lowercase is SHORTER than themselves.
+    #[test]
+    fn the_label_seam_folds_the_way_the_filter_folds() {
+        // (label, query, whether the FILTER admits the row on its label)
+        let cases = [
+            // Word-final sigma: per STRING `Σ` closing a word lowercases to `ς`,
+            // per CHAR always to `σ`. The filter admits `οδοσ`, so the label must
+            // draw marked.
+            ("ΟΔΟΣ notes", "οδοσ", true),
+            // ...and the per-STRING spelling is the one the filter rejects, so it
+            // must draw plain.
+            ("ΟΔΟΣ notes", "οδος", false),
+            // `K` U+212A lowercases to a SHORTER `k`, so the fold keeps it and the
+            // filter never admits the ASCII spelling.
+            ("\u{212A}elvin scale", "kelvin", false),
+            // `Å` U+212B → `å` (3 bytes → 2): kept, so likewise.
+            ("\u{212B}ngstrom unit", "\u{e5}ngstrom", false),
+            // `ẞ` U+1E9E → `ß` (3 bytes → 2): kept, so likewise.
+            ("\u{1E9E}trasse map", "\u{df}trasse", false),
+        ];
+
+        for (label, query, admitted) in cases {
+            let sessions = [session("s0", label, "")];
+            assert_eq!(
+                !filter(query, &sessions, SearchMode::NameOnly).is_empty(),
+                admitted,
+                "the filter's verdict on {query:?} over {label:?} is the premise here"
+            );
+
+            let mut index = SearchIndex::new();
+            index.set_query(query);
+            assert_eq!(
+                !index.match_indices(label).is_empty(),
+                admitted,
+                "the row-label highlight must agree with the filter on {query:?} \
+                 over {label:?}"
+            );
+            assert_eq!(
+                !index.atom_match_positions(label).is_empty(),
+                admitted,
+                "the per-atom marking beneath it must agree too — the \
+                 match-outside-preview nudge reads this one directly"
+            );
+        }
+    }
+
     /// Accent folding is not part of the highlight: the label seam matches the
     /// same BYTES the filter does.
     ///
@@ -1470,10 +1870,12 @@ mod tests {
 
     /// A char whose lowercase form is LONGER than itself does not shift the marks.
     ///
-    /// `İ` (U+0130) lowercases to TWO chars (`i` + a combining dot), so the k-th
-    /// char of the lowercased haystack is not the k-th char of the text. Assuming
-    /// they line up marks the wrong chars — here it would run two positions past
-    /// the word and off the end of the string.
+    /// `İ` (U+0130) lowercases to TWO chars (`i` + a combining dot), which under
+    /// [`str::to_lowercase`] would move every byte after it and mark the wrong
+    /// chars — here two positions past the word and off the end of the string.
+    /// [`lowercase_preserving_byte_len`] KEEPS such a char instead, so one
+    /// byte -> char map serves both branches; this pins that the marks land where
+    /// the source text says, not where a shifted fold would put them.
     #[test]
     fn atom_match_positions_survives_a_lengthening_lowercase() {
         let mut index = SearchIndex::new();
@@ -1627,6 +2029,389 @@ mod tests {
         );
     }
 
+    /// THE CHANGE: a multi-atom content AND is bounded to a proximity window.
+    ///
+    /// Two atoms 50 KB apart in one transcript are a coincidence, not a match;
+    /// the same two atoms a paragraph apart are the exchange the user remembers.
+    /// Unbounded — the previous rule — the first case matched too, which is the
+    /// shape that put a random two-word query at a median 44.2% of the real
+    /// corpus.
+    #[test]
+    fn content_atoms_must_co_occur_within_the_window() {
+        let far = [session(
+            "far",
+            "unrelated title",
+            &format!("alpha{}omega", "x".repeat(50_000)),
+        )];
+        let near = [session(
+            "near",
+            "unrelated title",
+            &format!("alpha{}omega", "x".repeat(100)),
+        )];
+
+        // Both atoms ARE present in the far session, so what excludes it below is
+        // the DISTANCE between them and not a missing word. Without this the
+        // assertion could pass over a corpus that never contained the terms.
+        assert_eq!(filter("alpha", &far, SearchMode::NameAndContent), vec![0]);
+        assert_eq!(filter("omega", &far, SearchMode::NameAndContent), vec![0]);
+
+        assert!(
+            filter("alpha omega", &far, SearchMode::NameAndContent).is_empty(),
+            "atoms 50 KB apart in one transcript must not match"
+        );
+        assert_eq!(
+            filter("alpha omega", &near, SearchMode::NameAndContent),
+            vec![0],
+            "the same atoms ~100 bytes apart co-occur and must match"
+        );
+        // The anchor is the RAREST atom, not the first one typed, so reversing
+        // the query cannot change the answer.
+        assert_eq!(
+            filter("omega alpha", &near, SearchMode::NameAndContent),
+            vec![0],
+            "atom order must not decide membership"
+        );
+    }
+
+    /// A SINGLE-atom query takes the pre-window path exactly: one atom cannot be
+    /// far from itself, and this is the most common keystroke there is.
+    #[test]
+    fn a_single_atom_query_is_unaffected_by_the_window() {
+        // The very span the two-atom query above is excluded over.
+        let sessions = [session(
+            "s0",
+            "unrelated title",
+            &format!("alpha{}omega", "x".repeat(50_000)),
+        )];
+        for query in ["alpha", "omega"] {
+            assert_eq!(
+                filter(query, &sessions, SearchMode::NameAndContent),
+                vec![0],
+                "{query:?} is one atom and must match at any depth"
+            );
+        }
+        // An escaped space is ONE atom too (the literal phrase), so it takes the
+        // same unwindowed path rather than being torn into a windowed pair.
+        let phrase = [session("s1", "unrelated title", "ran the deploy pipeline")];
+        assert_eq!(
+            filter(r"deploy\ pipeline", &phrase, SearchMode::NameAndContent),
+            vec![0],
+            "an escaped-space phrase is a single atom, not a windowed AND"
+        );
+    }
+
+    /// The LABEL arm is a separate arm, not a consequence of the window: a label
+    /// whose atoms are further apart in BYTES than the window still matches.
+    ///
+    /// `store::label::LABEL_MAX` caps a label at 180 CHARS, which is up to 720
+    /// BYTES, so "a label always fits inside one window" is false and cannot be
+    /// relied on. This label is 162 chars but 312 bytes.
+    #[test]
+    fn a_label_hit_matches_even_when_the_label_outruns_the_window() {
+        let label = format!("alpha {} omega", "é".repeat(150));
+        assert!(
+            label.chars().count() <= 180,
+            "the fixture must stay a realistic label under LABEL_MAX"
+        );
+        assert!(
+            label.len() > PROXIMITY_WINDOW_MIN_BYTES,
+            "...while outrunning the window in BYTES, or it pins nothing"
+        );
+
+        let sessions = [session(
+            "s0",
+            &label,
+            &format!("noise{}noise", "x".repeat(50_000)),
+        )];
+        assert_eq!(
+            filter("alpha omega", &sessions, SearchMode::NameAndContent),
+            vec![0],
+            "a row must stay findable by its own name in content mode"
+        );
+    }
+
+    /// [`SearchMode::NameOnly`] is untouched: no window, and content is still
+    /// never consulted.
+    ///
+    /// The oversized label is deliberate — a production label is capped — so the
+    /// assertion is about the RULE rather than about labels happening to be
+    /// shorter than the window.
+    #[test]
+    fn name_only_mode_ignores_the_proximity_window() {
+        let oversized = [session(
+            "s0",
+            &format!("alpha{}omega", "x".repeat(50_000)),
+            "",
+        )];
+        assert_eq!(
+            filter("alpha omega", &oversized, SearchMode::NameOnly),
+            vec![0],
+            "name-only keeps the UNBOUNDED AND over its label"
+        );
+
+        let content_only = [session("s1", "unrelated", "alpha omega, adjacent here")];
+        assert!(
+            filter("alpha omega", &content_only, SearchMode::NameOnly).is_empty(),
+            "name-only still never searches content, windowed or not"
+        );
+    }
+
+    /// Once the RAREST atom passes [`PROXIMITY_MAX_ANCHORS`] occurrences the scan
+    /// abandons the window and answers the UNBOUNDED AND — a pathological-FILE
+    /// guard, so a generated file degrades to the previous behaviour instead of
+    /// costing a scan proportional to its own pathology.
+    ///
+    /// The rarest atom is the one that must trip it, and both atoms here are
+    /// equally common precisely so it does. A file where the rarest of the typed
+    /// words still turns up 500+ times is not a transcript anyone wrote; a file
+    /// where only the COMMON word does is every transcript, which is why
+    /// [`a_common_partner_atom_does_not_lift_the_window`] pins that case instead.
+    #[test]
+    fn a_runaway_occurrence_count_falls_back_to_the_unbounded_and() {
+        let gap = "x".repeat(50_000);
+
+        // Just UNDER the cap on BOTH atoms, so the rarest is under it too: the
+        // window still decides, and it excludes a 50 KB separation.
+        let modest = format!(
+            "{}{gap}{}",
+            "alpha ".repeat(PROXIMITY_MAX_ANCHORS - 10),
+            "omega ".repeat(PROXIMITY_MAX_ANCHORS - 10)
+        );
+        let bounded = [session("s0", "unrelated title", &modest)];
+        assert!(
+            filter("alpha omega", &bounded, SearchMode::NameAndContent).is_empty(),
+            "under the anchor cap the window still excludes a 50 KB separation"
+        );
+
+        // Past it on both — hence past it on the rarest — the same shape is
+        // admitted rather than scanned.
+        let flood = format!(
+            "{}{gap}{}",
+            "alpha ".repeat(PROXIMITY_MAX_ANCHORS + 10),
+            "omega ".repeat(PROXIMITY_MAX_ANCHORS + 10)
+        );
+        let runaway = [session("s1", "unrelated title", &flood)];
+        assert_eq!(
+            filter("alpha omega", &runaway, SearchMode::NameAndContent),
+            vec![0],
+            "past the anchor cap the window is abandoned for the unbounded answer"
+        );
+    }
+
+    /// Only the ANCHOR atom's occurrence count may trip the cap. A COMMON partner
+    /// word must not buy a rare one a free pass across a whole transcript.
+    ///
+    /// This is the defect the whole change exists to close, re-entered through a
+    /// side door: an ordinary English word turns up four figures of times in a
+    /// real transcript, so capping EVERY atom means any query carrying one falls
+    /// back to the unbounded AND. The rarest atom is the one the scan anchors on
+    /// and the only one whose count says anything about the FILE being
+    /// pathological.
+    #[test]
+    fn a_common_partner_atom_does_not_lift_the_window() {
+        let common = "the ".repeat(PROXIMITY_MAX_ANCHORS + 100);
+        assert!(
+            common.matches("the").count() > PROXIMITY_MAX_ANCHORS,
+            "the common atom must outrun the cap, or this pins nothing"
+        );
+
+        let far = [session(
+            "far",
+            "unrelated title",
+            &format!("{common}{}frobnicate", "x".repeat(50_000)),
+        )];
+        // Both atoms ARE present, so what must exclude the row is the DISTANCE
+        // between them and not a missing word.
+        assert_eq!(filter("the", &far, SearchMode::NameAndContent), vec![0]);
+        assert_eq!(
+            filter("frobnicate", &far, SearchMode::NameAndContent),
+            vec![0]
+        );
+        assert!(
+            filter("the frobnicate", &far, SearchMode::NameAndContent).is_empty(),
+            "a common partner atom must not lift the window off a 50 KB separation"
+        );
+
+        // The same pair still matches where it genuinely co-occurs, so the
+        // assertion above is not "common atoms never match".
+        let near = [session(
+            "near",
+            "unrelated title",
+            &format!("{common}frobnicate"),
+        )];
+        assert_eq!(
+            filter("the frobnicate", &near, SearchMode::NameAndContent),
+            vec![0],
+            "the common atom next to the rare one still co-occurs"
+        );
+    }
+
+    /// The window is a FLOOR with a proportional escape hatch: a typed query sits
+    /// on the floor, a long (pasted) one earns room to spread out.
+    #[test]
+    fn the_proximity_window_is_a_floor_that_grows_with_the_query() {
+        assert_eq!(proximity_window(0), PROXIMITY_WINDOW_MIN_BYTES);
+        assert_eq!(
+            proximity_window("alpha omega".len()),
+            PROXIMITY_WINDOW_MIN_BYTES,
+            "a typed two-word query sits on the floor"
+        );
+        // Past floor/multiplier the query's own length sets the window.
+        assert_eq!(
+            proximity_window(400),
+            400 * PROXIMITY_WINDOW_QUERY_MULTIPLIER
+        );
+        // An absurd length saturates rather than overflowing.
+        assert!(proximity_window(usize::MAX) >= PROXIMITY_WINDOW_MIN_BYTES);
+
+        // End to end, over ONE corpus: a longer query buys its atoms the right to
+        // sit further apart. This is what carries a pasted snippet
+        // (`tui::update::flatten_for_query`), whose words legitimately span more
+        // text than a typed pair's.
+        let gap = PROXIMITY_WINDOW_MIN_BYTES + 20;
+        let tail = "omega reconciliation instrumentation orchestration normalization \
+                    deduplication serialization backpressure idempotency";
+        let sessions = [session(
+            "s0",
+            "unrelated title",
+            &format!("alpha{}{tail}", "x".repeat(gap)),
+        )];
+
+        let short = "alpha omega";
+        assert!(
+            proximity_window(short.len()) < gap,
+            "the short query must sit on the floor, below the gap"
+        );
+        assert!(
+            filter(short, &sessions, SearchMode::NameAndContent).is_empty(),
+            "a short query's window does not reach across the gap"
+        );
+
+        let long = format!("alpha {tail}");
+        assert!(
+            proximity_window(long.len()) > gap,
+            "the long query must earn a wider window, or it pins nothing"
+        );
+        assert_eq!(
+            filter(&long, &sessions, SearchMode::NameAndContent),
+            vec![0],
+            "a long query's window grows to cover the span it describes"
+        );
+    }
+
+    /// THE OFFSET TRAP: a MIXED-case query measures its window across TWO
+    /// haystacks, so the two must share ONE byte space.
+    ///
+    /// A case-SENSITIVE atom searches the cased haystack while a
+    /// case-INSENSITIVE one searches the lowercased sibling. `str::to_lowercase`
+    /// SHRINKS `K` U+212A (3 bytes → 1), `Å` U+212B (3 → 2) and `ẞ` U+1E9E
+    /// (3 → 2), so under it every byte past such a char sits at a different offset
+    /// in the two strings and the distance between the two hits is garbage. The
+    /// prefix here shifts by more than a whole window, so a naive fold reports two
+    /// ADJACENT words as far apart and drops the row.
+    #[test]
+    fn the_proximity_window_survives_a_length_changing_lowercase() {
+        let shrinking: String = ['\u{212A}', '\u{212B}', '\u{1E9E}']
+            .into_iter()
+            .cycle()
+            .take(300)
+            .collect();
+        assert!(
+            shrinking.len() - shrinking.to_lowercase().len() > PROXIMITY_WINDOW_MIN_BYTES,
+            "the fixture must shift offsets by MORE than one window, or it pins nothing"
+        );
+
+        let sessions = [session(
+            "s0",
+            "unrelated title",
+            &format!("{shrinking} ALPHA beta"),
+        )];
+        // `ALPHA` carries an uppercase char (case-SENSITIVE, cased haystack);
+        // `beta` does not (case-INSENSITIVE, lowercased haystack). In the text
+        // they are six bytes apart.
+        assert_eq!(
+            filter("ALPHA beta", &sessions, SearchMode::NameAndContent),
+            vec![0],
+            "adjacent words must stay adjacent across the cased/lowercased pair"
+        );
+    }
+
+    /// The three measured counter-examples to "same char count means same byte
+    /// length": each lowercases to exactly ONE char that is SHORTER, so a char
+    /// count alone cannot catch them and each must be kept as-is.
+    #[test]
+    fn the_lowercase_fold_keeps_chars_whose_lowercase_changes_byte_length() {
+        for ch in ['\u{212A}', '\u{212B}', '\u{1E9E}'] {
+            let cased = ch.to_string();
+            let lowered: String = ch.to_lowercase().collect();
+            assert_eq!(
+                lowered.chars().count(),
+                1,
+                "{ch:?} lowercases to ONE char, so a char count cannot catch it"
+            );
+            assert!(
+                lowered.len() < cased.len(),
+                "...but a SHORTER one ({} -> {} bytes)",
+                cased.len(),
+                lowered.len()
+            );
+            assert_eq!(
+                lowercase_preserving_byte_len(&cased),
+                cased,
+                "{ch:?} must be kept as-is; folding it would shift every later byte"
+            );
+        }
+
+        // Positive control: the fold is not simply "keep everything". ASCII folds,
+        // and so does a 2-byte char whose lowercase is also 2 bytes.
+        assert_eq!(lowercase_preserving_byte_len("ABC"), "abc");
+        // Folding PER CHAR also drops `to_lowercase`'s one context-sensitive rule:
+        // a Greek capital sigma CLOSING a word lowercases to the final form `ς`
+        // per string, and to the plain `σ` per char. Both are 2 bytes, so this
+        // costs the byte space nothing — it is simply the more predictable of the
+        // two for someone typing `σ` into a search box.
+        assert_eq!(
+            "ΟΣ".to_lowercase(),
+            "ος",
+            "per STRING, a word-final sigma is `ς`"
+        );
+        assert_eq!(
+            lowercase_preserving_byte_len("ΟΣ"),
+            "οσ",
+            "per CHAR it is always `σ`"
+        );
+
+        // The invariant the whole proximity window rests on.
+        let mixed = "Mixed \u{212A}\u{212B}\u{1E9E} Σ İ Text";
+        assert_eq!(
+            lowercase_preserving_byte_len(mixed).len(),
+            mixed.len(),
+            "the lowercased haystack must share the cased one's byte length"
+        );
+    }
+
+    /// The narrow BEHAVIOUR CHANGE the length-preserving fold introduces, pinned
+    /// so it stays a decision rather than a surprise.
+    ///
+    /// `İ` (U+0130) lowercases to TWO chars (`i` + a combining dot), so the fold
+    /// keeps it — and a query spelled with that two-char lowercase stops matching
+    /// a label spelled with `İ`. The plain substring still finds the row.
+    #[test]
+    fn a_two_char_lowercase_no_longer_folds_onto_its_uppercase() {
+        let sessions = [session("s0", "İstanbul notes", "")];
+        for mode in [SearchMode::NameOnly, SearchMode::NameAndContent] {
+            assert!(
+                filter("i\u{307}stanbul", &sessions, mode).is_empty(),
+                "the two-char lowercase spelling no longer folds onto İ in {mode:?}"
+            );
+            assert_eq!(
+                filter("stanbul", &sessions, mode),
+                vec![0],
+                "the row stays findable by the substring that avoids the kept char"
+            );
+        }
+    }
+
     /// The gate is case-insensitive over content: a lowercase query matches
     /// mixed-case content (nucleo agrees, since a lowercase query is smart-case
     /// insensitive), through the prebuilt lowercased haystack.
@@ -1706,6 +2491,14 @@ mod tests {
     /// The corpus is built so the module's documented divergences never fire (no
     /// accent-folded match, no match on a non-ASCII haystack's last char); those
     /// are pinned separately and deliberately, not swept in here.
+    ///
+    /// nucleo's AND is UNBOUNDED, so what this pins is parity WITHIN the
+    /// proximity window: every corpus string sits far under
+    /// [`PROXIMITY_WINDOW_MIN_BYTES`], which is what keeps the two comparable.
+    /// Widening one past that bound would make the oracle disagree BY DESIGN —
+    /// the disagreement is the bounded rule working — so the bound is pinned by
+    /// [`content_atoms_must_co_occur_within_the_window`] and its neighbours
+    /// instead. Do not shrink this corpus or drop a mode to keep it green.
     #[test]
     fn membership_matches_nucleo_across_query_shapes_and_modes() {
         let sessions = [

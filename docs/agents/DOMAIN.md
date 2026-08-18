@@ -324,7 +324,59 @@ are load-bearing: smart case is decided **per atom**, so an atom carrying an
 uppercase char searches the *cased* copy case-sensitively while a lowercase atom
 searches the *lowercased* copy. That branch is not an optimization — answering an
 uppercase query from the lowercased copy is an inclusion regression (measured:
-`NPX` finds 6 entries there, the smart-case rule matches 0).
+`NPX` finds 6 entries there, the smart-case rule matches 0). The two copies also
+share ONE byte space: the lowercased one is folded **per char** and KEEPS any
+char whose lowercase form would change its UTF-8 width (`K` U+212A → `k`, 3 bytes
+→ 1; `Å` U+212B → `å`, 3 → 2; `ẞ` U+1E9E → `ß`, 3 → 2), because the window below
+measures distances ACROSS the pair. The narrow cost is that a char whose
+lowercase is two chars (`İ`) no longer folds at all.
+
+That fold is the module's **one** fold and every seam takes it — the filter's
+haystacks, the row-label highlight and the preview marks alike. The surfaces share
+the per-atom finders, and a finder only answers the same question twice if each
+haystack was lowercased by the same rule; fold one seam with `str::to_lowercase`
+instead and the two part company on exactly the chars above, plus the
+context-sensitive word-final sigma (`ΟΔΟΣ` folds to `οδος` per string and `οδοσ`
+per char). The visible symptom is a row the filter admitted drawing with NOTHING
+highlighted.
+
+In name+content mode the multi-atom AND is **bounded to a proximity window**: a
+query matches when every atom occurs in the label, or when every atom occurs
+within `max(200 B, 3 × the query's byte length)` of the others in the content
+haystack, measured between atom hits. That second arm searches the **combined**
+label + content string, so a pair straddling the join co-occurs — one atom in the
+label and one in the transcript's opening lines is a match neither arm admits
+literally, and it makes the window arm a strict superset of the label arm. A
+single-atom query is unchanged, and name-only mode is untouched.
+
+Unbounded, that AND was barely a filter — a **one-off probe**
+(2026-08-18, 310–330 sessions carrying readable text) put a random
+two-word query at a median **44.2%** of the corpus matched, **48.3%** within the
+default current-folder scope, against **8.2%** at a 200 B window, **14.4%** at
+400 B and **21.5%** at 800 B. The cause is the SPAN the AND is evaluated over, not
+the whitespace splitting: name-only applies the identical atom rule over a
+≤180-char [label](#label-storelabel) and shows none of it. The window is
+proportional to the query so a pasted snippet still matches (the same probe
+recovered 108/108 flattened 3-line pastes); exact-phrase-by-default was REJECTED
+because 12.3% / 21.4% / 32.0% of remembered 3 / 5 / 8-word runs contain a newline
+and would silently return nothing.
+
+The scan anchors on the **rarest** atom, and the ~512-occurrence fallback to the
+unbounded answer is asked of that anchor **alone** — which is what makes the
+rarest-atom measurement (p50=3, p90=11, p99=34 per matching session, max 79, same
+dated probe) the statistic that governs it. Capping per atom instead would fire on
+any query carrying an English word while the rarest atom still had a handful of
+hits, handing that query straight back the unbounded AND the window replaces.
+
+Two things reach the cap, and it is a **scan-cost bound** rather than a bad-file
+guard alone. One is a **pathological generated file**: the rarest atom overflowing
+means every atom does, and today's unbounded answer beats a scan proportional to
+the file's own pathology. The other is an **all-common-word query over an ordinary
+file** — `the a` against ~100 KB of prose puts even the rarest atom in four
+figures. That second case is harmless rather than a hole: atoms that frequent
+already co-occur inside a 200 B window, so the unbounded answer admits nothing the
+window would have rejected. The window bites where it was meant to, on queries
+with at least one atom specific enough to anchor on.
 
 The candidate set is scope-limited BEFORE any of this. The `App` pushes its
 cached in-scope index set into the search pass (`SearchIndex::results_within`)

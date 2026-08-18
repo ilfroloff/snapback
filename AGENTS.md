@@ -106,13 +106,27 @@ one place.
   setting: memmem searches substrings by nature. ONE matcher answers everything,
   under TWO rules. The FILTER answers MEMBERSHIP with `memchr::memmem`; smart case
   is decided **PER ATOM**, never per query, and each atom searches the cased or
-  lowercased haystack accordingly — BOTH are load-bearing. The ROW-LABEL highlight
-  (`match_indices`) applies the WHOLE-STRING rule over those same finders — EVERY
-  atom in the one string, because a label IS one string, and every occurrence of
-  each is marked. The PREVIEW marks apply the PER-ATOM rule
-  (`atom_match_positions`), so a marked pane reproduces the rule the row was
-  admitted by (the atoms occur ANYWHERE in the transcript, not all on one line).
-  Never rank the filter's results: display order is `App::order_filtered`'s alone.
+  lowercased haystack accordingly — BOTH are load-bearing. In `NameAndContent` the
+  MULTI-atom AND is BOUNDED, never unbounded co-occurrence: every atom in the
+  LABEL, or every atom within ONE proximity window of the content haystack. A
+  single-atom query and `NameOnly` keep the plain AND. That window arm runs over
+  the COMBINED label+content string, so a pair straddling that seam co-occurs, and
+  its occurrence cap is asked of the ANCHOR (RAREST) atom ALONE — a cap on a common
+  atom is a cap on English, and it hands the query back the unbounded AND. That cap
+  is a SCAN-COST bound, not only a bad-file guard: an all-common-word query trips it
+  over an ORDINARY file too, harmlessly, since atoms that frequent co-occur inside
+  the window anyway. The window measures byte distances ACROSS the cased/lowercased
+  pair, so EVERY lowercased string in the module — the filter's haystacks and BOTH
+  marking seams' — is folded by the ONE per-char fold that KEEPS any char whose
+  lowercase would change its UTF-8 width. One fold everywhere or the surfaces
+  disagree: same finders, different fold, and an admitted row draws with nothing
+  marked. The ROW-LABEL highlight (`match_indices`) applies the WHOLE-STRING rule
+  over those same finders — EVERY atom in the one string, because a label IS one
+  string, and every occurrence of each is marked. The PREVIEW marks apply the
+  PER-ATOM rule (`atom_match_positions`), so a marked pane reproduces the rule the
+  row was admitted by (the atoms occur ANYWHERE in the transcript, not all on one
+  line). Never rank the filter's results: display order is `App::order_filtered`'s
+  alone.
   (`src/search.rs`)
 - **STABLE-ID STATE.** Track selection by `session_id`, never list index, so it
   survives autorefresh reloads. (`src/tui/app.rs`)

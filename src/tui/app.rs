@@ -2949,7 +2949,7 @@ impl App {
     /// positions. Empty when the query is empty, or when any atom of it is
     /// missing from the visible label (e.g. a content-only hit).
     #[must_use]
-    pub fn match_indices(&mut self, display: &str) -> Vec<u32> {
+    pub fn match_indices(&self, display: &str) -> Vec<u32> {
         self.index.match_indices(display)
     }
 

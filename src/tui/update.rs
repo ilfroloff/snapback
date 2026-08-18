@@ -1580,6 +1580,7 @@ mod tests {
     use ratatui::Terminal;
 
     use crate::agents::ReportedAgent;
+    use crate::search::{filter, SearchMode};
     use crate::store::Session;
     use crate::tui::app::{NewSessionDraft, Scope, MIN_PANE_WIDTH, STATUS_DWELL_TICKS};
     use crate::tui::compose::ComposeTarget;
@@ -2529,6 +2530,58 @@ mod tests {
         // Runs of newlines become runs of spaces; `search::gate_atoms` drops the
         // empty atoms between them, so this needs no collapsing of its own.
         assert_eq!(flatten_for_query("a\n\n\nb"), "a   b");
+    }
+
+    /// A pasted multi-line snippet still finds the session it was copied FROM,
+    /// now that the content AND is bounded to a proximity window.
+    ///
+    /// This is the path the window's proportional half exists for. The paste
+    /// flattens to a one-line query, `search::gate_atoms` makes every word its own
+    /// atom, and a dozen atoms that must co-occur is exactly the shape a fixed
+    /// window would break — so the window grows with the query instead. The
+    /// negative half is what proves it is still a window at all.
+    #[test]
+    fn a_flattened_multi_line_paste_still_matches_the_text_it_came_from() {
+        let pasted = "the deployment pipeline failed while building the release candidate image\n\
+             on the long-lived integration branch the nightly smoke suite also targets\n\
+             right after the database migration step rewrote the session index table";
+        let query = flatten_for_query(pasted);
+        assert!(!query.contains('\n'), "the board query is one line");
+        // The transcript says those words, but NOT byte for byte: the content
+        // index interleaves what the user selected with text they did not, so the
+        // run is wider than the query. That is the shape the window's
+        // proportional half exists for -- a fixed floor would not reach across it.
+        let mut said = session("said");
+        said.content_index = query
+            .split_whitespace()
+            .map(|word| format!("{word} (noted) "))
+            .collect();
+        assert_eq!(
+            filter(
+                &query,
+                std::slice::from_ref(&said),
+                SearchMode::NameAndContent
+            ),
+            vec![0],
+            "a remembered snippet must still find the session it was said in"
+        );
+
+        // The SAME words, scattered across a transcript rather than said together,
+        // are a coincidence: the window is still doing its job.
+        let mut scattered = session("scattered");
+        scattered.content_index = query
+            .split_whitespace()
+            .map(|word| format!("{word}{}", "x".repeat(5_000)))
+            .collect();
+        assert!(
+            filter(
+                &query,
+                std::slice::from_ref(&scattered),
+                SearchMode::NameAndContent
+            )
+            .is_empty(),
+            "the same words spread across a whole transcript must not match"
+        );
     }
 
     /// A CR-only paste reaches the DRAFT as real newlines. `TextArea::insert_str`
