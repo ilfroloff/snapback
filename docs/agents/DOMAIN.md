@@ -299,8 +299,9 @@ allocated clone of the cached copy instead.
 
 Per keystroke, `search` answers **membership only**: does every query atom occur
 as a byte substring? `memchr::memmem` (SIMD, no allocation, no UTF-8 → UTF-32
-conversion) decides it directly over the prebuilt haystacks, and **nucleo is not
-on this path** — it backs the row LABEL's highlight alone.
+conversion) decides it directly over the prebuilt haystacks. **nucleo is on no
+runtime path at all**: it is a dev-dependency, and the same memmem finders answer
+the row LABEL's highlight and the preview's marks.
 
 The reason is that `App::order_filtered` imposes the timestamp/group order and
 **discards any rank**, over a key (`(Reverse(timestamp), session_id)`) that is a
@@ -323,7 +324,7 @@ are load-bearing: smart case is decided **per atom**, so an atom carrying an
 uppercase char searches the *cased* copy case-sensitively while a lowercase atom
 searches the *lowercased* copy. That branch is not an optimization — answering an
 uppercase query from the lowercased copy is an inclusion regression (measured:
-`NPX` finds 6 entries there, nucleo matches 0).
+`NPX` finds 6 entries there, the smart-case rule matches 0).
 
 The candidate set is scope-limited BEFORE any of this. The `App` pushes its
 cached in-scope index set into the search pass (`SearchIndex::results_within`)
@@ -375,9 +376,10 @@ because every atom occurs SOMEWHERE in the transcript, so a rule demanding all o
 them in one rendered LINE marks nothing whenever the words sit on different lines
 — and the pane then reads as broken while the board's own nudge claims the match
 is elsewhere. The row LABEL's HIGHLIGHT is the other shape (one string, matched as
-a whole) and keeps nucleo's `match_indices` — but that is a DRAWING seam, and any
-question about what a label CONTAINS goes to the filter's finders instead (see the
-nudge below). Two consequences are normal and correct:
+a whole) and `match_indices` applies the WHOLE-STRING rule over those same
+finders — but that is a DRAWING seam, and any question about what a label
+CONTAINS goes to the per-atom rule instead (see the nudge below). Two
+consequences are normal and correct:
 SEVERAL marked runs on one line, and marks as a UNION — overlapping or abutting
 runs from different atoms merge into one span.
 
@@ -396,9 +398,10 @@ changed the query or the selection, and only when NO rendered line holds ANY ato
 AND the row LABEL holds none either: a multi-word query whose words landed on
 different lines has marks on screen and explains itself, and a hit sitting in the
 label is not outside anything. Both halves of that refusal are asked through
-`atom_match_positions` — the label one deliberately NOT through nucleo, whose
-whole-string rule and documented non-ASCII tail off-by-one (`café fin` searched
-for `fin`) each made the board announce a match it was drawing one line away.
+`atom_match_positions` — the label one deliberately NOT through the row
+highlight, whose WHOLE-STRING rule wants every atom in the label and so came back
+empty for a two-word query with one word in the label and the other in a
+collapsed turn, making the board announce a match it was drawing one line away.
 Raising `PREVIEW_LINES` is not
 the fix; it trades a bounded render for a slightly smaller gap and leaves the
 collapse cases untouched.

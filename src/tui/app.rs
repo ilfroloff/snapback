@@ -924,8 +924,8 @@ struct CachedPreview {
     /// That seam marks PER ATOM, with the FILTER's own memmem finders, so the marks
     /// reproduce the rule the row was admitted by: a multi-atom query marks each
     /// atom on whichever line carries it, and MULTIPLE runs on one line are normal.
-    /// The row LABEL is the other case — one string, matched as a whole — and stays
-    /// on the nucleo seam.
+    /// The row LABEL is the other case — one string, matched as a whole — and takes
+    /// the WHOLE-STRING rule over the same finders.
     matches: HashMap<usize, HashSet<usize>>,
     /// The query [`matches`](Self::matches) was computed for — the recompute key.
     ///
@@ -1158,7 +1158,7 @@ pub struct App {
     /// [`ComposeTarget`](super::compose::ComposeTarget). Its type
     /// ([`super::compose::ComposeState`]) is the ONLY place outside
     /// [`super::compose`] that touches `ratatui_textarea`, the way `search`
-    /// confines nucleo.
+    /// confines `memchr`.
     pub compose: Option<super::compose::ComposeState>,
     /// The open NEW-SESSION draft, if any — see [`NewSessionDraft`].
     ///
@@ -1362,7 +1362,7 @@ pub struct App {
     #[cfg(test)]
     preview_match_rebuilds: usize,
     /// Live substring index over `sessions` (isolated in [`crate::search`],
-    /// which also confines every `memchr`/`nucleo` call).
+    /// which also confines every `memchr` call).
     index: SearchIndex,
 }
 
@@ -2943,10 +2943,11 @@ impl App {
     /// The CHAR indices within `display` (a row's visible label) that the
     /// active query matches, for search-match highlighting in the list.
     ///
-    /// Delegates to the nucleo seam in [`crate::search`], which scores against
-    /// the display string itself (decoupled from the filtering haystack) and
-    /// returns sorted, deduplicated char positions. Empty when the query is
-    /// empty or does not appear in the visible label (e.g. a content-only hit).
+    /// Delegates to the WHOLE-STRING seam in [`crate::search`], which asks the
+    /// filter's own memmem finders about the display string itself (decoupled
+    /// from the filtering haystack) and returns sorted, deduplicated char
+    /// positions. Empty when the query is empty, or when any atom of it is
+    /// missing from the visible label (e.g. a content-only hit).
     #[must_use]
     pub fn match_indices(&mut self, display: &str) -> Vec<u32> {
         self.index.match_indices(display)
@@ -3084,16 +3085,16 @@ impl App {
     /// lines has marks on screen and explains itself.
     ///
     /// The label is asked through [`SearchIndex::atom_match_positions`] — the SAME
-    /// seam the pane's own marks come from — and deliberately NOT through nucleo's
+    /// seam the pane's own marks come from — and deliberately NOT through
     /// [`match_indices`](Self::match_indices), which draws the row's highlight. This
-    /// is a question about the label's TEXT, and nucleo answers a narrower one: it
-    /// requires EVERY atom in the one string, and it carries the documented non-ASCII
-    /// tail off-by-one ([`SearchIndex::set_query`]), so `café fin` searched for `fin`
-    /// comes back empty. Either miss let the board announce a match "outside the
-    /// previewed transcript" while it sat in the row's own label. Over the filter's
-    /// finders the refusal is exact: nothing gets said unless NO atom is in the label
-    /// AND no atom is in the rendered pane, which is precisely when the hit really is
-    /// somewhere neither shows.
+    /// is a question about the label's TEXT, and the highlight answers a narrower
+    /// one: it applies the WHOLE-STRING rule, requiring EVERY atom in the one string
+    /// it was given, so `deploy pipeline` over a label reading `deploy the gateway`
+    /// comes back empty even though `deploy` is right there. That miss would let the
+    /// board announce a match "outside the previewed transcript" while it sat in the
+    /// row's own label. Per atom the refusal is exact: nothing gets said unless NO
+    /// atom is in the label AND no atom is in the rendered pane, which is precisely
+    /// when the hit really is somewhere neither shows.
     ///
     /// The checks run cheapest-first, because the last of them can render a
     /// transcript that has not been previewed yet. Keyed by `(session, query)` so
@@ -3102,7 +3103,6 @@ impl App {
     /// every visit.
     ///
     /// [`SearchIndex::atom_match_positions`]: crate::search::SearchIndex::atom_match_positions
-    /// [`SearchIndex::set_query`]: crate::search::SearchIndex::set_query
     fn note_match_outside_preview(&mut self) {
         if self.query.is_empty()
             || self.search_mode != SearchMode::NameAndContent
@@ -4334,38 +4334,48 @@ mod tests {
     /// nothing.
     ///
     /// "Is the query in this label?" is a question about the label's TEXT, so it is
-    /// asked through the filter's own finders. Asking nucleo instead borrows that
-    /// seam's documented non-ASCII tail off-by-one (`search::SearchIndex::set_query`):
-    /// a substring ending at the very last char of a haystack holding any non-ASCII
-    /// char is missed, and the board then announced the match missing from the
-    /// transcript while it sat in the row's own label, one line away.
+    /// asked PER ATOM, over the filter's own finders. The row highlight
+    /// (`search::SearchIndex::match_indices`) answers a NARROWER question — it wants
+    /// EVERY atom in the one string it was given — so a two-word query with one word
+    /// in the label and the other in a collapsed turn draws the row UNHIGHLIGHTED
+    /// while the label plainly holds part of the answer. Asking that whole-string
+    /// seam here would let the board announce the match missing from the transcript
+    /// while it sat in the row's own label, one line away.
     #[test]
     fn a_label_hit_the_row_highlight_misses_still_says_nothing() {
+        const LABEL: &str = "Fix the quokka retries";
         let mut session = markable_fixture("s1");
-        // `é` is non-ASCII and `fin` ends at the last char — both halves are needed
-        // to reach the quirk.
-        session.label = "café fin".to_string();
+        session.label = LABEL.to_string();
         let mut app = app_all(vec![session]);
+        // The OTHER atom lives in a turn the preview collapses away, so the row is
+        // admitted on the pair while the pane itself has nothing to mark.
+        app.sessions[0].content_index = "collapsed wrapper says frobnicate".to_string();
+        app.apply_sessions(app.sessions.clone());
         app.toggle_search_mode();
         assert_eq!(app.search_mode, SearchMode::NameAndContent);
         // The board draws before it reads a key, so the pane has a width to answer at.
         app.preview_text(60);
 
-        app.push_query_str("fin");
+        app.push_query_str("quokka frobnicate");
         assert_eq!(
             app.selected.as_deref(),
             Some("s1"),
-            "the filter finds the tail-anchored label match, so the row is on the board"
+            "both atoms occur across label + content index, so the row is on the board"
         );
         assert!(
-            app.index.match_indices("café fin").is_empty(),
-            "the row draws UNHIGHLIGHTED here (upstream tail off-by-one) — that is \
-             what makes this the case the nudge used to misreport"
+            app.index.match_indices(LABEL).is_empty(),
+            "the row draws UNHIGHLIGHTED here — the highlight requires EVERY atom in \
+             the label and `frobnicate` is not in it — which is what makes this the \
+             case the nudge would misreport"
+        );
+        assert!(
+            !app.index.atom_match_positions(LABEL).is_empty(),
+            "yet one atom IS in the label, and that is the hit the nudge must respect"
         );
         assert!(
             app.preview_matches(60).is_some_and(HashMap::is_empty),
-            "and the query must occur nowhere in the rendered preview, or the \
-             silence below has a second reason"
+            "and neither atom occurs in the rendered preview, or the silence below \
+             has a second reason"
         );
         assert_eq!(
             app.status, None,

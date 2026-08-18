@@ -603,12 +603,12 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
         usize::from(block.inner(area).width).saturating_sub(LIST_HIGHLIGHT_SYMBOL.chars().count());
 
     // Under a NON-EMPTY query, precompute which CHAR positions of each visible
-    // session label the query matched, so the row can highlight them. This
-    // needs `&mut app` (nucleo's matcher carries scratch state), so it is done
-    // in a pass BEFORE the immutable item-building borrow below. We snapshot the
-    // labels first (a short, display-capped clone each) so the `&mut` match call
-    // never overlaps the `&app.sessions` borrow. An empty query skips the work
-    // entirely — nothing is highlighted.
+    // session label the query matched, so the row can highlight them. This is
+    // asked through `&mut app` (the highlight seam borrows the index mutably), so
+    // it is done in a pass BEFORE the immutable item-building borrow below. We
+    // snapshot the labels first (a short, display-capped clone each) so the `&mut`
+    // match call never overlaps the `&app.sessions` borrow. An empty query skips
+    // the work entirely — nothing is highlighted.
     let highlights: HashMap<usize, HashSet<usize>> = if app.query.is_empty() {
         HashMap::new()
     } else {
