@@ -23,9 +23,10 @@ description = "Browse, search, and resume Claude Code sessions from a ratatui TU
 # snapback, src/bin/sb.rs -> sb) are autodiscovered by Cargo. `cargo install
 # --path .` installs both binaries. See ./README.md.
 
-# Exact version pins for reproducibility. `nucleo` is pinned per the plan's Risks
-# table (evolving API, isolated behind src/search.rs); the rest are pinned exact
-# to keep the toolchain deterministic for this personal binary.
+# Exact version pins for reproducibility, to keep the toolchain deterministic for
+# this personal binary. The matcher isolation the Risks table asks for now rests
+# on `memchr` alone (src/search.rs); `nucleo` has left the runtime entirely and
+# survives under [dev-dependencies] as a test oracle.
 [dependencies]
 # Terminal rendering. Default features include the crossterm backend, plus
 # `unstable-rendered-line-info` for `Paragraph::line_count`: the transcript's
@@ -44,16 +45,12 @@ crossterm = "=0.29.0"
 # which would pull `regex` — is intentionally NOT enabled (no regex in the tree).
 # Exact-pin because it is pre-1.0 (0.9.2 caret-unifies with the modular
 # ratatui-core 0.1.x stack). All `ratatui_textarea` references stay confined to
-# src/tui/compose.rs (+ the `App::compose` field), the way nucleo lives in search.
+# src/tui/compose.rs (+ the `App::compose` field), the way memchr lives in search.
 ratatui-textarea = "=0.9.2"
-# Substring matcher (AtomKind::Substring in code, never fuzzy). Backs the
-# HIGHLIGHT seam only -- the per-keystroke filter is memchr below. Pinned exact;
-# all nucleo calls isolated in src/search.rs.
-nucleo = "=0.5.0"
-# SIMD byte-substring search (memmem). IS the per-keystroke filter: it answers
-# membership per atom over the prebuilt haystacks, with nucleo not involved
-# (src/search.rs). Already in the tree transitively via nucleo (nucleo-matcher)
-# and serde_json; pinned exact.
+# SIMD byte-substring search (memmem). IS the matcher: it answers membership per
+# atom over the prebuilt haystacks AND marks both the row label and the preview
+# (src/search.rs). Substring by nature, never fuzzy. Already in the tree
+# transitively via serde_json; pinned exact.
 memchr = "=2.8.2"
 # Filesystem watcher for autorefresh over ~/.claude/projects.
 notify = "=8.2.0"
@@ -67,7 +64,9 @@ time = { version = "=0.3.53", features = ["parsing", "formatting", "macros"] }
 dirs = "=6.0.0"
 # Ergonomic error propagation across the data core and TUI.
 anyhow = "=1.0.103"
-# Parallel per-file scan in SessionStore::load (Task 2.7). Already in the tree via nucleo.
+# Parallel per-file scan in SessionStore::load (Task 2.7). It used to ride along
+# transitively via nucleo; nucleo is dev-only now, so this direct pin is what
+# keeps rayon in the runtime graph at all. Pinned exact.
 rayon = "=1.12.0"
 # Extended grapheme-cluster boundaries for the search-match highlight, which
 # splits a rendered line into styled spans. `Line::width` sums unicode-width PER
@@ -76,10 +75,18 @@ rayon = "=1.12.0"
 # text that did not change, desyncing the preview's cached widths and cached
 # wrapped-row count from the line on screen. Snapping run boundaries out to
 # cluster edges is the fix, and a grapheme table is never hand-rolled. Already in
-# the tree transitively via ratatui-textarea / nucleo-matcher / unicode-truncate;
+# the tree transitively via ratatui-textarea / ratatui-core / unicode-truncate;
 # pinned exact.
 unicode-segmentation = "=1.13.3"
 # Terminal display-width of stripped table-cell text so inline markers (**x**,
 # [a](b)) and CJK/emoji measure at their rendered column count, keeping table
 # columns aligned. Already in the tree transitively via ratatui; pinned exact.
 unicode-width = "=0.2.2"
+
+# Test-only. `nucleo` is the membership ORACLE, and nothing else: the parity test
+# in src/search.rs compares this crate's match set against nucleo's own, so the
+# per-atom smart-case rule is proved rather than asserted from belief. It is a
+# dev-dependency precisely so the shipped binary carries no matcher but memchr —
+# keep it here, and keep the pin exact, until the oracle itself is retired.
+[dev-dependencies]
+nucleo = "=0.5.0"

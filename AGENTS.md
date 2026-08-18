@@ -99,17 +99,21 @@ one place.
   ONE complete return-to-known-state, not one mode per bug, and stays WRITE-ONLY:
   never emit a cursor-position (DSR `CSI 6n`) query on the return path — it
   deadlocks on a dirty child's stdin. (`src/tui/mod.rs`, `src/resume.rs`)
-- **NUCLEO ISOLATION.** Every `nucleo` AND `memchr` call stays in `src/search.rs`.
-  Matching is SUBSTRING (`AtomKind::Substring`), not fuzzy. The FILTER answers
-  MEMBERSHIP with `memchr::memmem` and never calls nucleo; smart case is decided
-  **PER ATOM**, never per query, and each atom searches the cased or lowercased
-  haystack accordingly — BOTH are load-bearing. nucleo is confined to the
-  ROW-LABEL highlight (`match_indices`), which answers about ONE string matched as
-  a WHOLE. The PREVIEW marks are the FILTER's, not nucleo's: `atom_match_positions`
-  marks PER ATOM through the same memmem finders, so a marked pane reproduces the
-  rule the row was admitted by (the atoms occur ANYWHERE in the transcript, not all
-  on one line). Never rank the filter's results: display order is
-  `App::order_filtered`'s alone. (`src/search.rs`)
+- **MATCHER ISOLATION.** Every `memchr` call stays in `src/search.rs`. `nucleo` is
+  a **dev-dependency** and survives ONLY as the test-only parity ORACLE inside that
+  same module — NO runtime path may reach it, and nothing outside `mod tests` may
+  `use` it. Matching is SUBSTRING, not fuzzy, by the mechanism rather than by a
+  setting: memmem searches substrings by nature. ONE matcher answers everything,
+  under TWO rules. The FILTER answers MEMBERSHIP with `memchr::memmem`; smart case
+  is decided **PER ATOM**, never per query, and each atom searches the cased or
+  lowercased haystack accordingly — BOTH are load-bearing. The ROW-LABEL highlight
+  (`match_indices`) applies the WHOLE-STRING rule over those same finders — EVERY
+  atom in the one string, because a label IS one string, and every occurrence of
+  each is marked. The PREVIEW marks apply the PER-ATOM rule
+  (`atom_match_positions`), so a marked pane reproduces the rule the row was
+  admitted by (the atoms occur ANYWHERE in the transcript, not all on one line).
+  Never rank the filter's results: display order is `App::order_filtered`'s alone.
+  (`src/search.rs`)
 - **STABLE-ID STATE.** Track selection by `session_id`, never list index, so it
   survives autorefresh reloads. (`src/tui/app.rs`)
 - **OFF-UI-THREAD blocking work.** RECURRING shell-outs / FS watch / input run on
@@ -153,7 +157,7 @@ one place.
 ## Engineering principles (mandatory)
 
 - **SOLID / KISS / DRY** — small single-purpose modules; pure core, thin impure
-  drivers; one source of truth (parsing lives in `parse_file`; nucleo in
+  drivers; one source of truth (parsing lives in `parse_file`; the matcher in
   `search`).
 - **YAGNI** — no on-disk index, no speculative abstraction; match the existing
   restraint (see [DOMAIN.md](docs/agents/DOMAIN.md#content-index-storeparse)).

@@ -1,7 +1,7 @@
 //! The compose zone: multiline input + its key dispatch.
 //!
 //! This module OWNS the `ratatui_textarea` dependency the way `search.rs` owns
-//! nucleo: every reference to the text-editor widget lives here (plus the
+//! `memchr`: every reference to the text-editor widget lives here (plus the
 //! `App::compose` field, whose type is [`ComposeState`]). The compose zone is a
 //! modal — while it is open it owns the keyboard, exactly like the running-session
 //! and agent-pick overlays — and leaves by submitting (`Enter`), running

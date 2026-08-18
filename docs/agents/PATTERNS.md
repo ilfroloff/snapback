@@ -133,34 +133,35 @@ status with no teardown flash; only a confirmed `Ready` escalates to
 
 ## 4. Isolate volatile dependencies
 
-All `nucleo` and `memchr` calls live in `src/search.rs` and nowhere else — the
-pins are exact and nucleo's API is evolving, so an upgrade touches one module.
-The rest of the crate sees only `SearchIndex`, `SearchMode`, and `filter`.
-Matching is **substring, not fuzzy**: patterns are built with
-`AtomKind::Substring` in code (never from user-typed atom syntax), and the
-filter enforces the same rule independently because memmem searches substrings
-by nature. When you touch search, preserve the incrementality contract:
-`set_query` rebuilds only the small pattern and the per-atom finders per
-keystroke; `refresh` rebuilds haystacks only for sessions whose fingerprint
-changed.
+All `memchr` calls live in `src/search.rs` and nowhere else — the pins are exact,
+so a matcher upgrade touches one module. `nucleo` is a **dev-dependency**: it is
+reachable from `mod tests` in that same file and from no runtime path at all, and
+it exists solely as the parity ORACLE (below). The rest of the crate sees only
+`SearchIndex`, `SearchMode`, and `filter`. Matching is **substring, not fuzzy**,
+and that follows from the mechanism rather than from a setting: memmem searches
+substrings by nature, and no user-typed atom syntax can widen it. When you touch
+search, preserve the incrementality contract: `set_query` rebuilds only the
+per-atom finders per keystroke; `refresh` rebuilds haystacks only for sessions
+whose fingerprint changed.
 
 `results` answers **membership only** — every atom present as a byte substring,
-via `memchr::memmem` — and returns candidates in the order given. nucleo is not
-on that path; it backs the **row-LABEL highlight** (`match_indices`) alone. Do not
+via `memchr::memmem` — and returns candidates in the order given. Do not
 re-introduce ranking: `App::order_filtered` re-sorts every result by a **tie-free
 total order**, so a rank cannot reach the screen, and computing one cost 76–81%
 of each keystroke through nucleo's `Utf32Str` UTF-32 conversion.
 
-The preview's marks are the **filter's**, not nucleo's: `atom_match_positions`
-runs the same memmem finders over one rendered line and returns the CHAR
-positions **any atom** covers. Which seam a surface takes follows from what the
-surface IS. A row label is ONE string and the row is on the board because that
-string matched, so nucleo's whole-pattern answer fits it exactly. A transcript is
-MANY strings admitted by atoms occurring anywhere in it, so demanding every atom
-per line marks nothing the moment the words sit on different lines — and an
-unmarked pane cannot explain why the row is there. Consequences to keep: several
-runs on one line are normal, and marks are a **union** (overlapping or abutting
-runs merge into one span, never two).
+ONE matcher serves every surface, under TWO rules, and which rule a surface takes
+follows from what the surface IS. A row label is ONE string and the row is on the
+board because that string matched, so `match_indices` applies the **whole-string**
+rule — every atom in that string — and then marks through the per-atom machinery,
+so every occurrence of each atom is marked rather than one chosen run. A
+transcript is MANY strings admitted by atoms occurring anywhere in it, so
+`atom_match_positions` runs the same memmem finders over one rendered line and
+returns the CHAR positions **any atom** covers; demanding every atom per line
+would mark nothing the moment the words sit on different lines, and an unmarked
+pane cannot explain why the row is there. Consequences to keep: several runs on
+one line are normal, and marks are a **union** (overlapping or abutting runs merge
+into one span, never two).
 
 Where those positions become SPANS — `match_runs`, the one splitter behind both
 the row label and the preview, in `src/tui/view.rs` — a run that would end inside
@@ -180,16 +181,26 @@ Two invariants are easy to break and expensive to get wrong:
   folds `foo` but not `BAR`. The decision rides each `AtomFinder`. A per-query
   branch looks equivalent and silently breaks mixed queries — and answering an
   uppercase query from the lowercased haystack is an *inclusion regression*
-  (measured: `NPX` finds 6 entries there, nucleo matches 0), not a nuance.
+  (measured: `NPX` finds 6 entries there, the smart-case rule matches 0), not a
+  nuance.
 - **Both haystacks are live.** The cased one backs the case-sensitive branch, the
   lowercased one the case-insensitive branch. Neither is dead; deleting the cased
   one breaks every uppercase query.
 
-`gate_atoms` is the ONE splitter: the filter, the preview marks and nucleo's
-label highlight all demand the same atoms from it — never re-split a query
-somewhere else. Where the memmem side and nucleo deliberately diverge (the
-upstream non-ASCII tail off-by-one, unicode normalization, the per-atom case
-predicate on non-ASCII atoms), the module docs enumerate it and a test pins it.
+`gate_atoms` is the ONE splitter: the filter, the row-label highlight and the
+preview marks all take the same atoms from it — never re-split a query somewhere
+else.
+
+`nucleo` earns its dev-dependency as the **oracle**, and nothing else:
+`membership_matches_nucleo_across_query_shapes_and_modes` compares this module's
+match set against nucleo's own, so the per-atom smart-case rule is proved rather
+than asserted from belief — hand-written expectations would encode whatever the
+author believed smart case to be, which is the thing under test. The oracle's
+corpus is built to avoid the places this module deliberately differs (unicode
+normalization, per-string vs per-char lowercasing, the upstream non-ASCII tail
+off-by-one, the case predicate on non-ASCII atoms); the module docs enumerate
+them. Keep the import inside `mod tests`: a runtime `use nucleo` puts the matcher
+back in the shipped binary.
 
 ## 5. Selection and scroll survive reloads
 

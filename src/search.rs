@@ -1,7 +1,7 @@
-//! Substring search over sessions: a SIMD membership filter that also marks the
-//! preview, and a nucleo highlight for the row label.
+//! Substring search over sessions: ONE SIMD membership matcher that admits the
+//! rows AND marks both surfaces that show why.
 //!
-//! Isolates every `nucleo` call so an API change touches one module (Risks
+//! Isolates every `memchr` call so the matcher lives in one module (Risks
 //! table). Builds the searchable haystacks for each session (name/label AND the
 //! capped `content_index`) and exposes a [`filter`] that returns matching
 //! indices. Supports two modes behind one interface: name/label-only (default,
@@ -38,17 +38,19 @@
 //!
 //! # Smart case is decided PER ATOM
 //!
-//! nucleo's [`CaseMatching::Smart`] makes each atom independently case-sensitive
-//! iff **that atom** carries an uppercase char — `foo BAR` matches `foo`
-//! case-insensitively and `BAR` case-sensitively, within one query. The decision
-//! therefore rides each [`AtomFinder`], never the query as a whole, and each atom
-//! picks its own haystack accordingly. A per-QUERY branch would look equivalent
-//! and silently break mixed queries.
+//! An atom matches case-sensitively iff **that atom** carries an uppercase char
+//! — `foo BAR` matches `foo` case-insensitively and `BAR` case-sensitively,
+//! within one query. (This is nucleo's `CaseMatching::Smart` rule, adopted
+//! wholesale when nucleo answered membership and kept because it is the right
+//! rule, not because anything still compares against it at runtime.) The
+//! decision therefore rides each [`AtomFinder`], never the query as a whole, and
+//! each atom picks its own haystack accordingly. A per-QUERY branch would look
+//! equivalent and silently break mixed queries.
 //!
 //! This branch is **mandatory, not an optimization**. Answering an
-//! uppercase-bearing query from the lowercased haystack would include rows nucleo
-//! excludes: measured, `NPX` finds 6 entries there while nucleo matches 0. That
-//! is an inclusion regression, not a ranking nuance.
+//! uppercase-bearing query from the lowercased haystack would include rows smart
+//! case excludes: measured, `NPX` finds 6 entries there while the smart-case rule
+//! matches 0. That is an inclusion regression, not a ranking nuance.
 //!
 //! # Why BOTH haystacks are kept
 //!
@@ -74,77 +76,75 @@
 //! points share one private core, and any out-of-range candidate index is skipped
 //! fail-soft.
 //!
-//! # Where this filter and nucleo disagree
+//! # ONE mechanism, TWO rules
 //!
-//! The filter is no longer nucleo's match set *by construction*, so the (narrow)
-//! divergences are stated rather than assumed. Each is accepted deliberately:
+//! There is a single matcher below — the per-atom [`AtomFinder`]s — and every
+//! surface reads it. What differs between surfaces is the RULE applied, and the
+//! rule follows from the SHAPE of what is being asked about:
 //!
-//! * **Unicode normalization.** nucleo's [`Normalization::Smart`] accent-folds
-//!   (`resume` matching `résumé`); a byte search does not, so such a match is
-//!   excluded. **Unchanged** — the old gate rejected it identically, before
-//!   nucleo was ever consulted.
-//! * **Per-string vs per-char lowercasing.** We lowercase via
-//!   [`str::to_lowercase`], which is context-sensitive per string (Greek final
-//!   sigma `Σ`→`ς`, `İ`→`i̇`), whereas nucleo folds per char. For some non-ASCII
-//!   text this is marginally more restrictive than nucleo. **Unchanged** — same
-//!   reason.
-//! * **The non-ASCII tail off-by-one.** Here the filter is the more CORRECT of
-//!   the two, and diverges from the highlight; see
-//!   [`set_query`](SearchIndex::set_query).
-//! * **The smart-case predicate on a non-ASCII atom.** nucleo's `ignore_case`
-//!   field is private, so the decision is re-derived rather than read. For an
-//!   ASCII atom the re-derivation is EXACT (`char::is_uppercase` over ASCII is
-//!   precisely nucleo's `is_ascii_uppercase`), which covers the realistic input
-//!   space. For a non-ASCII atom nucleo consults a case-folding table rather than
-//!   the Unicode `Uppercase` property, so the two can differ on exotica such as
-//!   titlecase digraphs (`ǅ`), where nucleo would match case-sensitively and we
-//!   match case-insensitively.
+//! * **WHOLE-STRING, for a row LABEL.**
+//!   [`match_indices`](SearchIndex::match_indices) answers only when EVERY atom
+//!   occurs in the one string it was given, because a label IS one string and the
+//!   row is on the board because that string matched. The predicate is the
+//!   filter's own [`atoms_match`] — literally the question that admitted the row.
+//! * **PER ATOM, for a previewed TRANSCRIPT.** A transcript is MANY strings, and
+//!   the filter admitted the session because the atoms occur ANYWHERE in it. So
+//!   [`atom_match_positions`](SearchIndex::atom_match_positions) marks each atom
+//!   wherever it lands on one rendered line, union across atoms. Demanding every
+//!   atom per LINE would mark nothing the moment a two-word query's words sat on
+//!   different lines, and an unmarked pane cannot explain why the row is there.
 //!
-//! # Which nucleo API, and what is left of it
+//! Both rules mark through the SAME per-atom machinery and both take their atoms
+//! from the one splitter ([`gate_atoms`]), so "which words" and "where do they
+//! occur" are each decided once. A consequence worth stating: a label marks EVERY
+//! occurrence of an atom, not one chosen run — `fix search, then fix preview`
+//! searched for `fix` marks both, exactly as the preview would.
 //!
-//! `nucleo = 0.5.0` re-exports the finished low-level `nucleo-matcher` types
-//! (`Pattern`, `Atom`/`AtomKind`, `Matcher`, `Config`, `Utf32Str`,
-//! `CaseMatching`, `Normalization`). We deliberately use that synchronous
-//! low-level path rather than the high-level threaded `Nucleo`/`Injector`
-//! worker: a synchronous matcher is deterministic (no background
-//! `tick()`/snapshot races) and trivial to unit-test.
-//!
-//! nucleo now backs exactly ONE thing: the ROW-LABEL highlight
-//! ([`match_indices`](SearchIndex::match_indices)), which marks the matched chars
-//! of a single visible row label — bounded, tiny work. The filter no longer calls
-//! it, and neither do the preview's marks.
-//!
-//! # Two marking seams, because there are two shapes of surface
-//!
-//! [`match_indices`](SearchIndex::match_indices) asks nucleo about ONE string and
-//! answers only when EVERY atom occurs in it (`Pattern::indices` propagates an
-//! atom's miss to the whole pattern). That is exactly right for a row LABEL: one
-//! string, and the row is on the board because that string matched.
-//!
-//! A previewed TRANSCRIPT is many strings, and the filter admitted the session
-//! because the atoms occur ANYWHERE in it. So the preview marks through
-//! [`atom_match_positions`](SearchIndex::atom_match_positions), which runs the
-//! filter's OWN [`AtomFinder`]s over one rendered line and returns the char
-//! positions any atom covers — PER ATOM, union across atoms. Asking the
-//! whole-pattern seam per line would mark nothing the moment a two-word query's
-//! words sat on different lines, and an unmarked pane cannot explain why the row is
-//! there. Both seams take their atoms from the one splitter ([`gate_atoms`]), so
-//! "which words" is never re-decided.
-//!
-//! Matching is **substring, not fuzzy**: each keystroke rebuilds the small
-//! [`Pattern`] via [`Pattern::new`] with a fixed [`AtomKind::Substring`], so a
-//! query marks only where it appears as a contiguous run (smart-case) — the atom
-//! kind is forced in code and never depends on user-typed atom syntax. The filter
-//! holds that rule independently, in [`atoms_match`]: memmem is substring search
-//! by nature, so the two agree on the atom kind without sharing a `Pattern`.
-//! Incrementality comes from the prebuilt haystack strings, untouched across
-//! keystrokes (only the tiny pattern and the atom finders are rebuilt); a
+//! Matching is **substring, not fuzzy**, and that is a property of the mechanism
+//! rather than a setting: memmem searches substrings by nature, so a query marks
+//! only where it appears as a contiguous run (smart-case), and no user-typed atom
+//! syntax can change it. Incrementality comes from the prebuilt haystack strings,
+//! untouched across keystrokes (only the tiny finder list is rebuilt); a
 //! `SessionsChanged` refresh rebuilds only the entries whose session actually
 //! changed.
 //!
-//! Everything nucleo-shaped is contained below, and so is every `memchr` call.
-//! The rest of the crate sees only [`SearchIndex`], [`SearchMode`], and
-//! [`filter`].
+//! Every `memchr` call is contained below. The rest of the crate sees only
+//! [`SearchIndex`], [`SearchMode`], and [`filter`].
+//!
+//! # nucleo survives as the ORACLE, not as the matcher
+//!
+//! nucleo used to answer membership, then only the label highlight; it now
+//! answers neither and is a **dev-dependency**. What it is still good for is
+//! being unable to be wrong about itself: the parity test
+//! `membership_matches_nucleo_across_query_shapes_and_modes` compares this
+//! module's match set against nucleo's own, so the smart-case rule above is a
+//! proof rather than a belief (hand-written expectations would encode whatever
+//! the author believed smart case to be — precisely the thing under test; the
+//! `NPX` trap is a measured case where that belief is wrong).
+//!
+//! The oracle's corpus is built so the following never fire, because on each of
+//! them this module deliberately differs from nucleo:
+//!
+//! * **Unicode normalization.** nucleo's `Normalization::Smart` accent-folds
+//!   (`resume` matching `résumé`); a byte search does not, so such a match is
+//!   excluded — from admission AND from both marking rules, which is what keeps
+//!   them consistent.
+//! * **Per-string vs per-char lowercasing.** We lowercase via
+//!   [`str::to_lowercase`], which is context-sensitive per string (Greek final
+//!   sigma `Σ`→`ς`, `İ`→`i̇`), whereas nucleo folds per char. For some non-ASCII
+//!   text this is marginally more restrictive.
+//! * **The non-ASCII tail off-by-one.** nucleo-matcher 0.3.1's non-ASCII
+//!   substring path (`exact.rs::substring_match_non_ascii`) scans candidate
+//!   starts only up to `haystack.len() - needle.len()` EXCLUSIVE, so it misses a
+//!   match ending at the very LAST char of a haystack holding any non-ASCII char
+//!   (`café fin` searched for `fin`). memmem has no such bound, so here this
+//!   module is the more CORRECT of the two.
+//! * **The smart-case predicate on a non-ASCII atom.** The rule here is the
+//!   Unicode `Uppercase` property (`char::is_uppercase`), which over ASCII — the
+//!   realistic input space — is exactly nucleo's `is_ascii_uppercase`. nucleo
+//!   consults a case-folding table instead, so the two can differ on exotica such
+//!   as titlecase digraphs (`ǅ`), where nucleo would match case-sensitively and
+//!   this module matches case-insensitively.
 //!
 //! # A note on `#[allow(dead_code)]`
 //!
@@ -152,7 +152,7 @@
 //! `dead_code` lint fires on any public API the `main` runtime path does not
 //! call, even when the item is fully exercised by this module's unit tests. A
 //! few items below are exactly that: the deliberate, unit-tested search API
-//! surface (the single nucleo isolation seam per the Risks table) that the TUI
+//! surface (the single matcher isolation seam per the Risks table) that the TUI
 //! either reaches through a sibling method or does not yet consume. Each such
 //! item carries a *narrowly-scoped* `#[allow(dead_code)]` with a reason — never
 //! a crate- or module-wide blanket — so the lint stays sharp everywhere else.
@@ -163,8 +163,6 @@ use std::hash::{Hash, Hasher};
 use std::ops::Range;
 
 use memchr::memmem;
-use nucleo::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
-use nucleo::{Config, Matcher, Utf32Str};
 
 use crate::store::Session;
 
@@ -249,9 +247,8 @@ impl Entry {
         }
         // Lowercase ONCE here (build/refresh), never per keystroke. `to_lowercase`
         // is unicode-aware, so a case-insensitive atom matches mixed-case text.
-        // It folds per string, not per char, so it is not byte-for-byte nucleo's
-        // own folding — see the module-level divergence list for that narrow
-        // per-string vs. per-char exception.
+        // It folds per string, not per char — see the module-level oracle
+        // divergence list for that narrow per-string vs. per-char exception.
         let name_lower = session.label.to_lowercase();
         let content_lower = content.to_lowercase();
         Entry {
@@ -281,15 +278,14 @@ impl Entry {
     }
 }
 
-/// One query atom compiled to a SIMD substring searcher, carrying the smart-case
-/// decision nucleo would have made for **that atom**.
+/// One query atom compiled to a SIMD substring searcher, carrying **that atom's
+/// own** smart-case decision.
 ///
-/// `case_sensitive` mirrors nucleo's [`CaseMatching::Smart`], which is decided
-/// **PER ATOM**, never per query: an atom matches case-sensitively iff it carries
-/// an uppercase char, so `foo BAR` searches case-insensitively for `foo` and
-/// case-sensitively for `BAR` in the one query. The flag rides the atom precisely
-/// so that stays true — a per-query decision would look equivalent and silently
-/// break every mixed-case query.
+/// `case_sensitive` is decided **PER ATOM**, never per query: an atom matches
+/// case-sensitively iff it carries an uppercase char, so `foo BAR` searches
+/// case-insensitively for `foo` and case-sensitively for `BAR` in the one query.
+/// The flag rides the atom precisely so that stays true — a per-query decision
+/// would look equivalent and silently break every mixed-case query.
 ///
 /// The needle is baked to match: lowercased bytes for a case-insensitive atom
 /// (searched against the entry's lowercased haystack), cased bytes for a
@@ -308,11 +304,10 @@ struct AtomFinder {
 impl AtomFinder {
     /// Compile one (already unescaped, non-empty) query `atom`.
     ///
-    /// The uppercase test re-derives nucleo's decision because `Atom::ignore_case`
-    /// is a private field — it cannot be read back. For an ASCII atom the
-    /// re-derivation is EXACT: `char::is_uppercase` over ASCII is precisely
-    /// nucleo's `is_ascii_uppercase` test. See the module docs for the narrow
-    /// non-ASCII divergence.
+    /// The uppercase test is the Unicode `Uppercase` property, which over ASCII —
+    /// the realistic input space for a search box — is exactly an
+    /// `is_ascii_uppercase` test. See the module docs for the narrow non-ASCII
+    /// divergence from the oracle.
     fn new(atom: &str) -> Self {
         let case_sensitive = atom.chars().any(char::is_uppercase);
         // Bake the needle into the case it will be searched in, so the scan
@@ -334,8 +329,7 @@ impl AtomFinder {
 /// This is the structure the TUI (Phase 5) holds across the app lifetime:
 ///
 /// * type-to-search calls [`set_query`](Self::set_query) once per keystroke —
-///   only the [`Pattern`] is rebuilt (as substring atoms), the haystacks are
-///   untouched;
+///   only the per-atom finders are rebuilt, the haystacks are untouched;
 /// * a mode toggle calls [`set_mode`](Self::set_mode);
 /// * a `SessionsChanged` reload calls [`refresh`](Self::refresh), which rebuilds
 ///   only the entries whose session changed (keyed by `session_id`) and keeps
@@ -352,20 +346,13 @@ pub struct SearchIndex {
     query: String,
     /// The active mode (preserved across refreshes).
     mode: SearchMode,
-    /// Reused scratch matcher — carries nucleo's internal allocations. Used ONLY
-    /// by the row-LABEL highlight ([`match_indices`](Self::match_indices)).
-    matcher: Matcher,
-    /// The active query compiled to [`AtomKind::Substring`] atoms — rebuilt per
-    /// keystroke by [`set_query`](Self::set_query) via [`Pattern::new`]. Backs the
-    /// row-LABEL highlight ([`match_indices`](Self::match_indices)) ONLY; the filter
-    /// answers membership from `atom_finders` instead.
-    pattern: Pattern,
     /// The active query's atoms compiled to SIMD substring searchers, each
     /// carrying its own smart-case decision, rebuilt once per keystroke by
-    /// [`set_query`](Self::set_query). This IS the filter: [`results`](Self::results)
+    /// [`set_query`](Self::set_query). This IS the search: [`results`](Self::results)
     /// reuses these across every entry so no per-entry needle setup or allocation
-    /// happens during a scan. The preview's marks
-    /// ([`atom_match_positions`](Self::atom_match_positions)) reuse the SAME
+    /// happens during a scan, and BOTH marking rules — the row label's
+    /// ([`match_indices`](Self::match_indices)) and the preview's
+    /// ([`atom_match_positions`](Self::atom_match_positions)) — reuse the SAME
     /// finders, which is what makes a mark and an admission the same decision.
     atom_finders: Vec<AtomFinder>,
     /// How many entries the last build/refresh actually (re)built. Instrumented
@@ -387,10 +374,8 @@ impl SearchIndex {
             entries: Vec::new(),
             query: String::new(),
             mode: SearchMode::default(),
-            matcher: Matcher::new(Config::DEFAULT),
-            // `Pattern::default()` has no atoms => nothing to highlight.
-            pattern: Pattern::default(),
-            // No atoms => the empty query, and `results` returns all.
+            // No atoms => the empty query: `results` returns all, and neither
+            // marking rule marks anything.
             atom_finders: Vec::new(),
             last_rebuilt: 0,
         }
@@ -441,56 +426,27 @@ impl SearchIndex {
 
         self.entries = entries;
         self.last_rebuilt = rebuilt;
-        // `self.query`, `self.mode`, and `self.pattern` are intentionally left
-        // untouched: the query survives the refresh.
+        // `self.query`, `self.mode`, and `self.atom_finders` are intentionally
+        // left untouched: the query survives the refresh.
     }
 
-    /// Set the active query, rebuilding the (small) substring [`Pattern`] and the
-    /// per-atom SIMD finders.
+    /// Set the active query, rebuilding the per-atom SIMD finders.
     ///
-    /// Called once per keystroke. Only these two tiny structures are rebuilt — the
+    /// Called once per keystroke. Only that one tiny structure is rebuilt — the
     /// prebuilt haystacks are never touched here.
     ///
-    /// The pattern is built with [`AtomKind::Substring`] via [`Pattern::new`]
-    /// rather than the fuzzy default, so the highlight marks ONLY a contiguous run
-    /// of characters (literal, no scattered subsequence). Case stays smart-case
-    /// ([`CaseMatching::Smart`]). `Pattern::new` fixes the atom kind
-    /// programmatically and does NOT interpret the `'`/`^`/`$`/`!` atom syntax, so
-    /// matching never depends on what the user types; it only splits on whitespace
-    /// (so `foo bar` requires both `foo` and `bar` as substrings). The filter
-    /// enforces the same substring rule independently — memmem searches substrings
-    /// by nature — and [`gate_atoms`] mirrors nucleo's splitter so both demand the
-    /// same atoms.
+    /// Matching is SUBSTRING, not fuzzy: memmem searches substrings by nature, so
+    /// a query matches only a contiguous run of characters (literal, no scattered
+    /// subsequence). [`gate_atoms`] does the only splitting — on unescaped
+    /// whitespace, so `foo bar` requires both `foo` and `bar` — and never
+    /// interprets any `'`/`^`/`$`/`!` atom syntax, so what matching means can
+    /// never depend on what the user types. Smart case is then decided PER ATOM
+    /// by [`AtomFinder::new`].
     pub fn set_query(&mut self, query: &str) {
         self.query.clear();
         self.query.push_str(query);
-        // NOTE (upstream nucleo-matcher 0.3.1 quirk): the non-ASCII substring
-        // path (`exact.rs::substring_match_non_ascii`) scans candidate starts
-        // only up to `haystack.len() - needle.len()` EXCLUSIVE (the ASCII memmem
-        // path correctly uses `+ 1`). So a substring match that ends at the very
-        // LAST char of a haystack containing any non-ASCII char is missed.
-        //
-        // The filter and the highlight DIVERGE here, and that is accepted
-        // deliberately. They used to score this one `Pattern`, so the quirk hit
-        // both identically; now the memmem filter FINDS such a match while this
-        // pattern still misses it, so the row can appear with no highlight. The
-        // filter is the more CORRECT of the two — it errs toward MORE matches, and
-        // an un-highlighted row is already an expected sight (a content-only match
-        // shows none, by design). It also needs a non-ASCII haystack AND a match
-        // ending at its very last char. Reproducing the upstream bug in the filter
-        // to keep the two symmetrical would forfeit a real correctness gain to
-        // protect a comment; the divergence is pinned by a test instead
-        // (`non_ascii_tail_match_filters_in_though_nucleo_highlight_misses_it`).
-        self.pattern = Pattern::new(
-            query,
-            CaseMatching::Smart,
-            Normalization::Smart,
-            AtomKind::Substring,
-        );
-        // Compile the filter's substring searchers ONCE per keystroke, reused
-        // across every entry by the scan in `matching_candidates`. Split the query
-        // into the same atoms nucleo requires and bake each one's smart-case
-        // decision into its own finder.
+        // Compile the substring searchers ONCE per keystroke, reused across every
+        // entry by the scan in `matching_candidates` and by both marking rules.
         self.atom_finders = gate_atoms(query)
             .into_iter()
             .filter(|atom| !atom.is_empty())
@@ -630,67 +586,70 @@ impl SearchIndex {
             .collect()
     }
 
-    /// The CHAR indices within `display` that the active query matches.
+    /// The CHAR indices within `display` that the active query matches — the
+    /// ROW-LABEL highlight seam, under the WHOLE-STRING rule.
     ///
-    /// This is the ROW-LABEL highlight seam, and the only remaining nucleo call:
-    /// it scores the query against the given DISPLAY string (a row's visible
-    /// label) SPECIFICALLY — deliberately decoupled from the filtering haystack
-    /// (which, in name+content mode, also spans `content_index`) — so a highlight
-    /// only ever marks what is actually visible in the row. A content-only match
-    /// therefore returns an empty set (the term is absent from the visible label),
-    /// and the row shows no highlight, which is the intended behaviour.
+    /// Asked about the given DISPLAY string (a row's visible label)
+    /// SPECIFICALLY — deliberately decoupled from the filtering haystack (which,
+    /// in name+content mode, also spans `content_index`) — so a highlight only
+    /// ever marks what is actually visible in the row. A content-only match
+    /// therefore returns an empty set (the term is absent from the visible
+    /// label), and the row shows no highlight, which is the intended behaviour.
     ///
-    /// WHOLE-pattern by nature: nucleo answers only when EVERY atom occurs in
-    /// `display`, which is what a label wants and what a transcript LINE must not
-    /// be asked — see [`atom_match_positions`](Self::atom_match_positions).
+    /// WHOLE-STRING: it answers only when EVERY atom occurs in `display`, and
+    /// that predicate is the FILTER's own [`atoms_match`] — the same question,
+    /// over the same [`AtomFinder`]s, that admitted the row. That rule is what a
+    /// LABEL wants (one string, on the board because that string matched) and
+    /// what a transcript LINE must not be asked — see
+    /// [`atom_match_positions`](Self::atom_match_positions), which is the other
+    /// RULE over this one mechanism.
     ///
-    /// Reuses the same live [`Pattern`]/[`Matcher`] the filter already holds (no
-    /// fresh allocation per keystroke). The returned positions are CHAR indices
-    /// into `display` (nucleo yields `u32` positions into the `Utf32Str`, i.e.
-    /// char positions), sorted ascending and deduplicated. An empty/whitespace
-    /// query parses to zero atoms and yields an empty set — nothing to
-    /// highlight.
+    /// Positions come from the per-atom marking that seam already owns, so the
+    /// label marks EVERY occurrence of every atom rather than one "best" run: a
+    /// label reading `fix search, then fix preview` searched for `fix` marks
+    /// both. That is the preview's marking rule, and reproducing it costs no new
+    /// code.
+    ///
+    /// Returns CHAR indices into `display` (never byte offsets), sorted
+    /// ascending and deduplicated. An empty/whitespace query parses to zero
+    /// atoms and yields an empty set — nothing to highlight.
     pub fn match_indices(&mut self, display: &str) -> Vec<u32> {
         // No atoms => empty/whitespace query: nothing is highlighted.
-        if self.pattern.atoms.is_empty() {
+        if self.atom_finders.is_empty() {
             return Vec::new();
         }
-
-        let mut buf: Vec<char> = Vec::new();
-        let haystack = Utf32Str::new(display, &mut buf);
-        let mut indices: Vec<u32> = Vec::new();
-
-        // `Pattern::indices` appends each atom's char positions into `indices`
-        // (positions into the Utf32Str, i.e. char indices) WITHOUT clearing or
-        // sorting, and returns `None` when the pattern does not match `display`
-        // — e.g. a content-only hit whose term never appears in the visible
-        // label. Treat a non-match as "no highlight".
-        if self
-            .pattern
-            .indices(haystack, &mut self.matcher, &mut indices)
-            .is_none()
-        {
+        // The WHOLE-STRING gate, asked of the filter's own predicate over the
+        // pair of haystacks each atom's smart-case decision selects. One atom
+        // missing from `display` means no highlight at all, even where the
+        // others land.
+        if !atoms_match(display, &display.to_lowercase(), &self.atom_finders) {
             return Vec::new();
         }
-
-        // Per nucleo's own guidance for highlighting: unique + sorted positions.
-        indices.sort_unstable();
-        indices.dedup();
-        indices
+        // Past the gate, WHICH chars is the per-atom question, and the preview's
+        // seam already answers it in ascending, deduplicated CHAR positions.
+        // `try_from` cannot realistically fail (a row label is display-sized);
+        // dropping an out-of-range position is the fail-soft way to say so.
+        self.atom_match_positions(display)
+            .into_iter()
+            .filter_map(|pos| u32::try_from(pos).ok())
+            .collect()
     }
 
     /// The CHAR positions within `text` that the active query's atoms cover — the
-    /// PREVIEW-MARK seam.
+    /// PER-ATOM rule, and the marking core both rules share.
     ///
     /// Marks **PER ATOM**, through the very [`AtomFinder`]s the FILTER answers
     /// membership with: every occurrence of every atom, wherever it falls, and the
-    /// UNION of those runs is what the caller marks. nucleo is not on this path.
+    /// UNION of those runs is what the caller marks. Asked with NO whole-string
+    /// precondition, which is what makes it right for a previewed transcript and
+    /// is why [`match_indices`](Self::match_indices) applies that precondition
+    /// itself before reusing this.
     ///
-    /// Why this is not [`match_indices`](Self::match_indices) — the whole-pattern
-    /// seam, which would mark nothing whenever a two-word query's words sat on
-    /// different lines — is argued once in the module docs ("Two marking seams").
-    /// The short of it: marking per atom reproduces the FILTER's own admission
-    /// rule, so a marked pane explains why the row is on the board.
+    /// Why a transcript LINE must not be asked the whole-string question — it
+    /// would mark nothing whenever a two-word query's words sat on different lines
+    /// — is argued once in the module docs ("ONE mechanism, TWO rules"). The short
+    /// of it: marking per atom reproduces the FILTER's own admission rule, so a
+    /// marked pane explains why the row is on the board.
     ///
     /// Smart case rides each atom exactly as it does in the filter — these ARE the
     /// filter's finders — so `foo BAR` marks `foo` case-insensitively and `BAR`
@@ -744,22 +703,22 @@ fn fingerprint(session: &Session) -> u64 {
     hasher.finish()
 }
 
-/// Split `query` into the substring atoms nucleo's [`Pattern::new`] would require,
-/// so the filter demands exactly the atoms the label highlight does.
+/// Split `query` into the substring atoms every rule below demands.
 ///
-/// The ONE splitter: the filter, the preview marks
-/// ([`atom_match_positions`](SearchIndex::atom_match_positions), through the
-/// finders built here) and nucleo's label highlight all take their atoms from it.
-/// Re-splitting a query anywhere else is how two surfaces start disagreeing about
-/// which words the user typed.
+/// The ONE splitter, and now the rule itself rather than a mirror of anyone
+/// else's: the filter, the label highlight
+/// ([`match_indices`](SearchIndex::match_indices)) and the preview marks
+/// ([`atom_match_positions`](SearchIndex::atom_match_positions)) all take their
+/// atoms from the finders built here. Re-splitting a query anywhere else is how
+/// two surfaces start disagreeing about which words the user typed.
 ///
-/// Mirrors nucleo's `pattern_atoms` splitter plus its substring-atom unescape:
-/// split on an ASCII space that is NOT escaped by an immediately preceding
+/// Split on an ASCII space that is NOT escaped by an immediately preceding
 /// backslash, drop the empty atoms, and unescape `\ ` → ` ` inside each atom (any
-/// other backslash stays literal, exactly as nucleo keeps it in the needle).
-/// Backslash-free queries — the entire realistic input space for the search box —
-/// reduce to a plain space split; the escape handling is what keeps the filter
-/// from wrongly rejecting a phrase typed with an escaped space.
+/// other backslash stays literal in the needle). Backslash-free queries — the
+/// entire realistic input space for the search box — reduce to a plain space
+/// split; the escape handling is what keeps a phrase typed with an escaped space
+/// from being wrongly torn in two. It matches nucleo's `pattern_atoms` splitter,
+/// which is what lets the parity oracle compare like for like.
 ///
 /// The returned atoms are CASED: the smart-case decision is made per atom by
 /// [`AtomFinder::new`], which needs the original casing to make it.
@@ -771,7 +730,7 @@ fn gate_atoms(query: &str) -> Vec<String> {
         if c == ' ' {
             if prev_backslash {
                 // Escaped space: turn the pending "\ " into a literal space so the
-                // atom is the phrase nucleo will look for, not two atoms.
+                // atom is the phrase to look for, not two atoms.
                 current.pop();
                 current.push(' ');
                 prev_backslash = false;
@@ -926,6 +885,12 @@ mod tests {
     use std::collections::BTreeSet;
     use std::path::PathBuf;
 
+    // The ONLY nucleo import left in the crate, and it is test-scoped: nucleo is
+    // a dev-dependency backing [`nucleo_match_set`], the membership ORACLE. The
+    // runtime below never touches it.
+    use nucleo::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
+    use nucleo::{Config, Matcher, Utf32Str};
+
     /// Collect matched indices into a SET.
     ///
     /// The filter's contract is WHICH entries match, never in what order: it
@@ -946,11 +911,11 @@ mod tests {
     /// claim a proof: hand-written expectations would encode whatever the author
     /// believed nucleo's smart-case rules to be, which is precisely the thing
     /// under test (the `NPX` trap is a measured case where that belief is wrong).
-    /// Asking nucleo cannot be wrong about nucleo.
+    /// Asking nucleo cannot be wrong about nucleo. This is the ONLY reason nucleo
+    /// is still a (dev-)dependency at all.
     ///
     /// The deliberate divergences are NOT covered by this oracle and must be kept
-    /// out of any corpus compared against it — see the module docs, and
-    /// [`non_ascii_tail_match_filters_in_though_nucleo_highlight_misses_it`].
+    /// out of any corpus compared against it — see the module docs.
     fn nucleo_match_set(query: &str, sessions: &[Session], mode: SearchMode) -> BTreeSet<usize> {
         let pattern = Pattern::new(
             query,
@@ -1273,9 +1238,6 @@ mod tests {
 
         // "🚀 deploy now": 🚀(0) ' '(1) d(2) e(3) p(4) l(5) o(6) y(7) ... The
         // emoji is one char but four bytes, so char and byte positions diverge.
-        // (Trailing " now" keeps the match off the final char, sidestepping the
-        // upstream nucleo non-ASCII substring tail off-by-one noted in
-        // `set_query`; the point here is CHAR- vs byte-index alignment.)
         assert_eq!(
             index.match_indices("🚀 deploy now"),
             vec![2, 3, 4, 5, 6, 7],
@@ -1301,14 +1263,101 @@ mod tests {
 
         // Multi-byte char INSIDE the run: "a🚀bc" is a(0) 🚀(1) b(2) c(3); the
         // rocket is one CHAR but four bytes. Matching "🚀b" marks char run [1, 2]
-        // — a naive byte-offset approach would report [1, 5]. (The trailing "c"
-        // keeps the run off the final char, sidestepping the upstream nucleo
-        // non-ASCII substring tail off-by-one noted in `set_query`.)
+        // — a naive byte-offset approach would report [1, 5].
         index.set_query("🚀b");
         assert_eq!(
             index.match_indices("a🚀bc"),
             vec![1, 2],
             "the run spans a multi-byte char and stays on char indices"
+        );
+    }
+
+    /// EVERY occurrence of an atom is highlighted in the label, not just one.
+    ///
+    /// The label seam marks through the same per-atom machinery the preview does
+    /// (pinned at
+    /// [`atom_match_positions_marks_every_occurrence_including_overlaps`]), so a
+    /// word said twice in a label is emphasized twice. Every other
+    /// `match_indices` test uses a single-occurrence label, so this is the one
+    /// that would catch a seam that reported only its "best" hit.
+    #[test]
+    fn match_indices_marks_every_occurrence_of_an_atom() {
+        let mut index = SearchIndex::new();
+        index.set_query("fix");
+
+        // "fix search, then fix preview": `fix` at chars 0..3 AND 17..20.
+        assert_eq!(
+            index.match_indices("fix search, then fix preview"),
+            vec![0, 1, 2, 17, 18, 19],
+            "both occurrences of the atom must be marked, not just one"
+        );
+
+        // Per atom, per occurrence: each atom of a multi-atom query marks every
+        // place IT lands, and the union comes out sorted and deduplicated.
+        index.set_query("fix run");
+        assert_eq!(
+            index.match_indices("fix run, fix run"),
+            vec![0, 1, 2, 4, 5, 6, 9, 10, 11, 13, 14, 15],
+            "every occurrence of every atom is marked"
+        );
+
+        // Overlapping occurrences merge into one span rather than leaving the
+        // tail char plain — the same union rule the preview marks by.
+        index.set_query("aa");
+        assert_eq!(
+            index.match_indices("aaa"),
+            vec![0, 1, 2],
+            "overlapping occurrences merge into one marked span"
+        );
+    }
+
+    /// A tail-anchored match in a NON-ASCII label is highlighted.
+    ///
+    /// The filter has always found this (`memmem` has no tail off-by-one); the
+    /// highlight used to miss it, so the row drew unhighlighted. Both sides now
+    /// answer from the same memmem finders, so filter and highlight agree and
+    /// there is no tail case left to except.
+    #[test]
+    fn match_indices_marks_a_tail_anchored_non_ascii_match() {
+        let sessions = [session("s0", "café fin", "")];
+        assert_eq!(
+            filter("fin", &sessions, SearchMode::NameOnly),
+            vec![0],
+            "the filter finds a tail-anchored match in a non-ASCII haystack"
+        );
+
+        let mut index = SearchIndex::new();
+        index.set_query("fin");
+        // "café fin": c(0) a(1) f(2) é(3) ' '(4) f(5) i(6) n(7) — `é` is two
+        // BYTES but one char, and `fin` ends at the very last char.
+        assert_eq!(
+            index.match_indices("café fin"),
+            vec![5, 6, 7],
+            "the row the filter admitted must draw highlighted, tail or not"
+        );
+    }
+
+    /// Accent folding is not part of the highlight: the label seam matches the
+    /// same BYTES the filter does.
+    ///
+    /// A row whose label reads `résumé` can only be on the board under a
+    /// `resume` query because its CONTENT matched, and a content-only hit shows
+    /// no label highlight by design. Folding here would have marked the label of
+    /// a row the filter never admitted on its label at all.
+    #[test]
+    fn match_indices_does_not_accent_fold() {
+        let mut index = SearchIndex::new();
+        index.set_query("resume");
+        assert!(
+            index.match_indices("résumé notes").is_empty(),
+            "the highlight matches bytes, so an accent-folded near-miss marks nothing"
+        );
+        // The unaccented spelling still marks, so the assertion above is not
+        // vacuously true over a query that matches nothing anywhere.
+        assert_eq!(
+            index.match_indices("resume notes"),
+            vec![0, 1, 2, 3, 4, 5],
+            "the literal spelling still highlights"
         );
     }
 
@@ -1413,9 +1462,8 @@ mod tests {
             vec![2, 3, 4, 5, 6, 7]
         );
 
-        // Unlike the nucleo seam, a match at the very LAST char of a non-ASCII
-        // string is found here — the filter's own byte scan has no tail off-by-one,
-        // and the marks now follow the filter.
+        // A match at the very LAST char of a non-ASCII string is found: a byte
+        // scan has no tail off-by-one to work around.
         index.set_query("fin");
         assert_eq!(index.atom_match_positions("café fin"), vec![5, 6, 7]);
     }
@@ -1747,65 +1795,6 @@ mod tests {
                 "{query:?} is case-sensitive under smart case and must match nothing, got {matched:?}"
             );
         }
-    }
-
-    /// The ACCEPTED divergence: a match ending at the very LAST char of a
-    /// non-ASCII haystack is found by the filter but missed by nucleo's
-    /// highlight, so such a row renders with no highlight.
-    ///
-    /// Upstream `nucleo-matcher` 0.3.1 scans candidate starts only to
-    /// `haystack.len() - needle.len()` EXCLUSIVE on its non-ASCII substring path
-    /// (`exact.rs::substring_match_non_ascii`), so it never considers the final
-    /// start position. Filter and highlight used to share one `Pattern` and so
-    /// missed it identically; they no longer do.
-    ///
-    /// This is tolerated on purpose, per the resolved design decision. The filter
-    /// is the MORE CORRECT of the two — it errs toward more matches — the case
-    /// needs a non-ASCII haystack AND a tail-anchored match, and an un-highlighted
-    /// row is already an expected sight (a content-only match shows none, by
-    /// design). Reproducing the upstream bug in the filter to keep the two
-    /// symmetrical was explicitly rejected. This test exists so the divergence can
-    /// never become silent drift.
-    #[test]
-    fn non_ascii_tail_match_filters_in_though_nucleo_highlight_misses_it() {
-        // "café fin": non-ASCII (é), and "fin" ends at the very last char.
-        let sessions = [session("s0", "café fin", "")];
-
-        assert_eq!(
-            filter("fin", &sessions, SearchMode::NameOnly),
-            vec![0],
-            "the memmem filter finds a tail-anchored match in a non-ASCII haystack"
-        );
-
-        // The pre-change filter path DROPPED this row outright: this is a
-        // deliberate inclusion change, not merely a highlight quirk.
-        assert!(
-            nucleo_match_set("fin", &sessions, SearchMode::NameOnly).is_empty(),
-            "the old nucleo-scored filter excluded this row; the memmem filter keeps it"
-        );
-
-        let mut index = SearchIndex::new();
-        index.set_query("fin");
-        assert!(
-            index.match_indices("café fin").is_empty(),
-            "nucleo's highlight misses the same match (upstream tail off-by-one), \
-             so the row draws unhighlighted — accepted, not a bug to fix here"
-        );
-
-        // The divergence is confined to the tail: move the match off the last
-        // char and nucleo agrees again, which is what makes it narrow.
-        let off_tail = [session("s0", "café fin.", "")];
-        assert_eq!(
-            filter("fin", &off_tail, SearchMode::NameOnly),
-            vec![0],
-            "filter still matches one char off the tail"
-        );
-        index.set_query("fin");
-        assert_eq!(
-            index.match_indices("café fin."),
-            vec![5, 6, 7],
-            "and nucleo highlights it once the match is not tail-anchored"
-        );
     }
 
     /// A refresh rebuilds the lowercased GATE haystack only for changed sessions:

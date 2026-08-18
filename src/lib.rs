@@ -5,11 +5,12 @@
 //!
 //! Architecture (data-core-first): the framework-independent data layer
 //! (`store`) is unit-tested before any TUI code lands. The `tui` module is the
-//! elm-style shell; `watch` feeds autorefresh events; `search` isolates nucleo;
-//! `worktrees` resolves the launch project's live worktree set (the one git
-//! shell-out, kept out of the pure `store` core); `resume` spawns `claude` as a
-//! child and RETURNS so `snapback` stays a persistent dashboard (quitting a
-//! resumed session drops you back onto the board).
+//! elm-style shell; `watch` feeds autorefresh events; `search` isolates the
+//! substring matcher (`memchr::memmem`); `worktrees` resolves the launch
+//! project's live worktree set (the one git shell-out, kept out of the pure
+//! `store` core); `resume` spawns `claude` as a child and RETURNS so `snapback`
+//! stays a persistent dashboard (quitting a resumed session drops you back onto
+//! the board).
 //!
 //! This is a personal tool; see `README.md`. The expensive module tree lives
 //! here in the library crate so it compiles once, and the `snapback` and `sb`
