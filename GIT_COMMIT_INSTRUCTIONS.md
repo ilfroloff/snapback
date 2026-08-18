@@ -116,7 +116,7 @@ Example 7:
 
 - `fix(store/discover): keep subagent transcripts out of the session list`
 - `feat(tui): widen search to match transcript content on toggle`
-- `refactor(search): isolate every nucleo call behind one index`
+- `refactor(search): isolate every matcher call behind one index`
 
 ## 3. Focus on WHY, not WHAT
 

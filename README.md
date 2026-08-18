@@ -196,7 +196,17 @@ rather than showing an empty board.
 
 **Search by name or by content.** Typing filters instantly by name. Press `Tab`
 to also search inside the transcripts, so you can find a session by what was
-actually said or done in it — not just by what it was titled. The matched text
+actually said or done in it — not just by what it was titled. Several words have
+to turn up **near each other** in a transcript, not merely somewhere in the same
+one: two words that drift thousands of lines apart are a coincidence, not
+something you remember, and treating them as a match put most of the board on
+screen for almost any pair. Common words are held to that same distance — an
+everyday word turns up on nearly every page, so letting one off would put the
+board back on screen. Paste a remembered snippet in and the search widens
+to fit what you pasted, so a copied line still finds where it was said. A session
+whose **name** carries every word matches however far apart the rest of it sits,
+and a word in the name counts as near the transcript's opening lines.
+The matched text
 is highlighted in the list **and marked in the preview**, so a content hit shows
 you where it was said instead of leaving you to scroll for it. In content mode
 the preview also **scrolls itself onto the most recent match** as you type, as

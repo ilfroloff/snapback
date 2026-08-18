@@ -811,6 +811,68 @@ mod tests {
         Arc::new(AtomicU64::new(stamped))
     }
 
+    /// How long a phase may wait for its FIRST debounced `SessionsChanged`.
+    ///
+    /// A liveness bound, not a timing assertion: nothing here claims the signal
+    /// arrives QUICKLY, only that it arrives at all, so a watcher that went
+    /// silent fails with a message naming the phase instead of hanging the
+    /// suite. Set far above any plausible scheduling delay — orders of magnitude
+    /// over [`DEBOUNCE`] — so a merely loaded runner can never trip it.
+    const ARRIVAL_BUDGET: Duration = Duration::from_secs(5);
+
+    /// How long the channel must stay SILENT before a phase counts as settled.
+    ///
+    /// Derived from [`DEBOUNCE`] so the two move together. A second batch cannot
+    /// mature sooner than one debounce window after the first, so one window
+    /// would already be enough to prove coalescing; three leaves a loaded runner
+    /// two further windows to deliver a straggler before the test is willing to
+    /// call the channel quiet.
+    const SETTLE_WINDOW: Duration = DEBOUNCE.saturating_mul(3);
+
+    /// Count the `SessionsChanged` signals ONE phase produces, returning only
+    /// once the channel has been quiet for [`SETTLE_WINDOW`].
+    ///
+    /// What it guarantees, in order: at least one signal arrived within
+    /// [`ARRIVAL_BUDGET`] (otherwise the phase never happened and this panics
+    /// naming `phase`); every further signal that arrived within a rolling
+    /// [`SETTLE_WINDOW`] of the previous one is in the count; and the channel is
+    /// QUIET on return, so the next phase starts from a slate this one emptied.
+    /// It asserts the watcher only ever emits that variant, as
+    /// [`drain_changes`] does.
+    ///
+    /// It deliberately does NOT bound how long a phase takes. That is the whole
+    /// point: sleeping a fixed span and counting whatever turned up measures the
+    /// RUNNER's speed rather than the watcher's coalescing, and it is only right
+    /// while every phase's signal happens to land inside its own window.
+    fn settled_changes(rx: &Receiver<AppEvent>, phase: &str) -> usize {
+        let mut count = 0;
+        // The first signal gets the generous liveness budget; each one after it
+        // only has to beat the settle window, which is what "quiet" means.
+        let mut budget = ARRIVAL_BUDGET;
+        loop {
+            match rx.recv_timeout(budget) {
+                Ok(ev) => {
+                    assert!(
+                        matches!(ev, AppEvent::SessionsChanged),
+                        "watcher must only emit SessionsChanged, got {ev:?}"
+                    );
+                    count += 1;
+                    budget = SETTLE_WINDOW;
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    assert!(
+                        count > 0,
+                        "{phase} emitted no SessionsChanged within {ARRIVAL_BUDGET:?}"
+                    );
+                    return count;
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    panic!("the watcher hung up before {phase} settled")
+                }
+            }
+        }
+    }
+
     /// Drain and count the `SessionsChanged` signals queued on `rx`, asserting
     /// the watcher only ever emits that variant.
     fn drain_changes(rx: &Receiver<AppEvent>) -> usize {
@@ -829,11 +891,22 @@ mod tests {
     /// must collapse into exactly ONE debounced `SessionsChanged` (not
     /// one-per-write); a subsequent remove is likewise a single change.
     ///
-    /// The write storm and the remove are measured in their own settled
-    /// windows: on macOS the OS delivers create/modify vs. remove
-    /// notifications far enough apart that they mature in separate debounce
-    /// windows, which is real OS behavior, not a coalescing failure. Isolating
-    /// each phase keeps the "N writes -> 1 event" assertion deterministic.
+    /// The seed, the storm and the remove are measured as SEPARATE phases: on
+    /// macOS the OS delivers create/modify vs. remove notifications far enough
+    /// apart that they mature in separate debounce windows, which is real OS
+    /// behavior, not a coalescing failure. Isolating each phase keeps the
+    /// "N writes -> 1 event" assertion meaningful.
+    ///
+    /// Every phase boundary is a SETTLE, never a sleep. Sleeping a fixed span
+    /// and counting whatever turned up is only right while each phase's signal
+    /// lands inside its own window, so it measures the RUNNER rather than the
+    /// watcher. Miss that on the SEED and the failure surfaces on the STORM: the
+    /// leaked seed signal and the storm's own signal both arrive in the storm's
+    /// window, it reads 2, and coalescing takes the blame for a phase that was
+    /// never emptied. [`settled_changes`] waits for the signal to ARRIVE and
+    /// then for the channel to go QUIET, so every phase provably starts from a
+    /// slate the previous one cleared and the assertion claims only what it
+    /// says: one storm, one signal.
     #[test]
     fn rapid_writes_coalesce_to_single_sessions_changed() {
         let dir = unique_temp_dir("coalesce");
@@ -843,35 +916,44 @@ mod tests {
         let _watcher =
             SessionWatcher::spawn(&dir, tx, Arc::clone(&activity)).expect("spawn watcher");
 
-        // Let the recursive watch establish, pre-create the file at depth 2 so
-        // the storm below is pure modifies to a session-shaped path, then
-        // discard the settle/create events so we measure only the storm.
+        // Let the recursive watch establish (there is no signal for "the backend
+        // is live", so this one span stays a sleep), then pre-create the file at
+        // depth 2 so the storm below is pure modifies to a session-shaped path.
+        // The setup's own signals — the new `<cwd>` dir is an AMBIGUOUS path,
+        // the seed write a session one — are settled away rather than
+        // sleep-drained, so the storm is measured on a channel this phase is
+        // known to have emptied. How MANY they were is not the claim here,
+        // since whether the two matured in one debounce window is the OS's
+        // business; only that none of them are left to land on the storm.
         let cwd = dir.join("encoded-cwd");
         fs::create_dir(&cwd).expect("create encoded-cwd dir");
         let file = cwd.join("sess-temp.jsonl");
         thread::sleep(Duration::from_millis(300));
         fs::write(&file, b"{\"seed\":true}\n").expect("seed jsonl");
-        thread::sleep(Duration::from_millis(600));
-        drain_changes(&rx);
+        settled_changes(&rx, "the setup writes");
         rearm(&activity);
 
         // Event storm: many rapid writes to the SAME path within one debounce
-        // window. Generous slack (>> 200ms) so the debouncer has fired once.
+        // window. The loop's own duration is reported on failure, since a storm
+        // that outran the debounce window is a straddled write burst rather than
+        // a coalescing bug, and the two read identically from the count alone.
+        let storm_started = Instant::now();
         for i in 0..12 {
             fs::write(&file, format!("{{\"n\":{i}}}\n")).expect("write jsonl");
         }
-        thread::sleep(Duration::from_millis(600));
+        let storm_took = storm_started.elapsed();
         assert_eq!(
-            drain_changes(&rx),
+            settled_changes(&rx, "the write storm"),
             1,
-            "a 12-write storm must collapse to exactly ONE SessionsChanged, not one-per-write"
+            "a 12-write storm must collapse to exactly ONE SessionsChanged, not \
+             one-per-write (the writes themselves took {storm_took:?}, against a \
+             {DEBOUNCE:?} debounce window)"
         );
 
         // A remove is a distinct change: exactly one more debounced signal.
         fs::remove_file(&file).expect("remove jsonl");
-        thread::sleep(Duration::from_millis(600));
         assert_eq!(
-            drain_changes(&rx),
+            settled_changes(&rx, "the remove"),
             1,
             "the remove must emit exactly ONE debounced SessionsChanged"
         );

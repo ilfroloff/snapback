@@ -144,11 +144,19 @@ search, preserve the incrementality contract: `set_query` rebuilds only the
 per-atom finders per keystroke; `refresh` rebuilds haystacks only for sessions
 whose fingerprint changed.
 
-`results` answers **membership only** — every atom present as a byte substring,
-via `memchr::memmem` — and returns candidates in the order given. Do not
-re-introduce ranking: `App::order_filtered` re-sorts every result by a **tie-free
-total order**, so a rank cannot reach the screen, and computing one cost 76–81%
-of each keystroke through nucleo's `Utf32Str` UTF-32 conversion.
+`results` answers **membership only** — never a rank — via `memchr::memmem`, and
+returns candidates in the order given. Do not re-introduce ranking:
+`App::order_filtered` re-sorts every result by a **tie-free total order**, so a
+rank cannot reach the screen, and computing one cost 76–81% of each keystroke
+through nucleo's `Utf32Str` UTF-32 conversion.
+
+Membership is "every atom present as a byte substring" in name-only mode and for
+a single atom. A **multi-atom name+content** query is narrower: the AND is
+**bounded to a proximity window**, so the atoms must sit in the label or within
+one window of each other in the combined haystack — see
+[DOMAIN.md](DOMAIN.md#content-index-storeparse) for the window, the anchor and
+the rarest-atom cap. Widening that back to plain co-occurrence is the defect, not a
+simplification.
 
 ONE matcher serves every surface, under TWO rules, and which rule a surface takes
 follows from what the surface IS. A row label is ONE string and the row is on the
@@ -162,6 +170,13 @@ would mark nothing the moment the words sit on different lines, and an unmarked
 pane cannot explain why the row is there. Consequences to keep: several runs on
 one line are normal, and marks are a **union** (overlapping or abutting runs merge
 into one span, never two).
+
+Sharing the finders is only half of asking the same question. The other half is
+the **fold**: every lowercased string the module searches — the filter's
+haystacks and both marking seams' — goes through the one per-char,
+byte-length-preserving fold. Reach for `str::to_lowercase` on any one of them and
+the surfaces diverge on the chars that fold differently, which shows up as a row
+the filter admitted drawing with nothing marked.
 
 Where those positions become SPANS — `match_runs`, the one splitter behind both
 the row label and the preview, in `src/tui/view.rs` — a run that would end inside

@@ -603,17 +603,14 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
         usize::from(block.inner(area).width).saturating_sub(LIST_HIGHLIGHT_SYMBOL.chars().count());
 
     // Under a NON-EMPTY query, precompute which CHAR positions of each visible
-    // session label the query matched, so the row can highlight them. This is
-    // asked through `&mut app` (the highlight seam borrows the index mutably), so
-    // it is done in a pass BEFORE the immutable item-building borrow below. We
-    // snapshot the labels first (a short, display-capped clone each) so the `&mut`
-    // match call never overlaps the `&app.sessions` borrow. An empty query skips
+    // session label the query matched, so the row can highlight them. The
+    // highlight seam only READS the index, so this reads each label in place —
+    // no snapshot clone and no borrow to sequence around. An empty query skips
     // the work entirely — nothing is highlighted.
     let highlights: HashMap<usize, HashSet<usize>> = if app.query.is_empty() {
         HashMap::new()
     } else {
-        let labels: Vec<(usize, String)> = rows
-            .iter()
+        rows.iter()
             .filter_map(|row| match row {
                 // A child row draws no label (it shows what DIFFERS from its
                 // head instead), so it has nothing to highlight.
@@ -621,14 +618,11 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                     index,
                     child: false,
                     ..
-                } => Some((*index, app.sessions[*index].label.clone())),
+                } => Some(*index),
                 Row::Session { child: true, .. } | Row::Group { .. } => None,
             })
-            .collect();
-        labels
-            .into_iter()
-            .filter_map(|(i, label)| {
-                let matched = app.match_indices(&label);
+            .filter_map(|i| {
+                let matched = app.match_indices(&app.sessions[i].label);
                 if matched.is_empty() {
                     None
                 } else {
