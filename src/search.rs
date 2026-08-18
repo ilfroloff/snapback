@@ -1,4 +1,5 @@
-//! Substring search over sessions: a SIMD membership filter, a nucleo highlight.
+//! Substring search over sessions: a SIMD membership filter that also marks the
+//! preview, and a nucleo highlight for the row label.
 //!
 //! Isolates every `nucleo` call so an API change touches one module (Risks
 //! table). Builds the searchable haystacks for each session (name/label AND the
@@ -108,10 +109,27 @@
 //! worker: a synchronous matcher is deterministic (no background
 //! `tick()`/snapshot races) and trivial to unit-test.
 //!
-//! nucleo now backs exactly ONE thing: the highlight seam
+//! nucleo now backs exactly ONE thing: the ROW-LABEL highlight
 //! ([`match_indices`](SearchIndex::match_indices)), which marks the matched chars
-//! of a single visible row label — bounded, tiny work, and the one place a
-//! char-position answer is actually required. The filter no longer calls it.
+//! of a single visible row label — bounded, tiny work. The filter no longer calls
+//! it, and neither do the preview's marks.
+//!
+//! # Two marking seams, because there are two shapes of surface
+//!
+//! [`match_indices`](SearchIndex::match_indices) asks nucleo about ONE string and
+//! answers only when EVERY atom occurs in it (`Pattern::indices` propagates an
+//! atom's miss to the whole pattern). That is exactly right for a row LABEL: one
+//! string, and the row is on the board because that string matched.
+//!
+//! A previewed TRANSCRIPT is many strings, and the filter admitted the session
+//! because the atoms occur ANYWHERE in it. So the preview marks through
+//! [`atom_match_positions`](SearchIndex::atom_match_positions), which runs the
+//! filter's OWN [`AtomFinder`]s over one rendered line and returns the char
+//! positions any atom covers — PER ATOM, union across atoms. Asking the
+//! whole-pattern seam per line would mark nothing the moment a two-word query's
+//! words sat on different lines, and an unmarked pane cannot explain why the row is
+//! there. Both seams take their atoms from the one splitter ([`gate_atoms`]), so
+//! "which words" is never re-decided.
 //!
 //! Matching is **substring, not fuzzy**: each keystroke rebuilds the small
 //! [`Pattern`] via [`Pattern::new`] with a fixed [`AtomKind::Substring`], so a
@@ -142,6 +160,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::ops::Range;
 
 use memchr::memmem;
 use nucleo::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
@@ -334,18 +353,20 @@ pub struct SearchIndex {
     /// The active mode (preserved across refreshes).
     mode: SearchMode,
     /// Reused scratch matcher — carries nucleo's internal allocations. Used ONLY
-    /// by the highlight seam ([`match_indices`](Self::match_indices)).
+    /// by the row-LABEL highlight ([`match_indices`](Self::match_indices)).
     matcher: Matcher,
     /// The active query compiled to [`AtomKind::Substring`] atoms — rebuilt per
     /// keystroke by [`set_query`](Self::set_query) via [`Pattern::new`]. Backs the
-    /// highlight seam ([`match_indices`](Self::match_indices)) ONLY; the filter
+    /// row-LABEL highlight ([`match_indices`](Self::match_indices)) ONLY; the filter
     /// answers membership from `atom_finders` instead.
     pattern: Pattern,
     /// The active query's atoms compiled to SIMD substring searchers, each
     /// carrying its own smart-case decision, rebuilt once per keystroke by
     /// [`set_query`](Self::set_query). This IS the filter: [`results`](Self::results)
     /// reuses these across every entry so no per-entry needle setup or allocation
-    /// happens during a scan.
+    /// happens during a scan. The preview's marks
+    /// ([`atom_match_positions`](Self::atom_match_positions)) reuse the SAME
+    /// finders, which is what makes a mark and an admission the same decision.
     atom_finders: Vec<AtomFinder>,
     /// How many entries the last build/refresh actually (re)built. Instrumented
     /// so the partial-rebuild behaviour is observable (and unit-testable).
@@ -611,13 +632,17 @@ impl SearchIndex {
 
     /// The CHAR indices within `display` that the active query matches.
     ///
-    /// This is the highlight seam: it scores the query against the given
-    /// DISPLAY string (a row's visible label) SPECIFICALLY — deliberately
-    /// decoupled from the filtering haystack (which, in name+content mode, also
-    /// spans `content_index`) — so a highlight only ever marks what is actually
-    /// visible in the row. A content-only match therefore returns an empty set
-    /// (the term is absent from the visible label), and the row shows no
-    /// highlight, which is the intended behaviour.
+    /// This is the ROW-LABEL highlight seam, and the only remaining nucleo call:
+    /// it scores the query against the given DISPLAY string (a row's visible
+    /// label) SPECIFICALLY — deliberately decoupled from the filtering haystack
+    /// (which, in name+content mode, also spans `content_index`) — so a highlight
+    /// only ever marks what is actually visible in the row. A content-only match
+    /// therefore returns an empty set (the term is absent from the visible label),
+    /// and the row shows no highlight, which is the intended behaviour.
+    ///
+    /// WHOLE-pattern by nature: nucleo answers only when EVERY atom occurs in
+    /// `display`, which is what a label wants and what a transcript LINE must not
+    /// be asked — see [`atom_match_positions`](Self::atom_match_positions).
     ///
     /// Reuses the same live [`Pattern`]/[`Matcher`] the filter already holds (no
     /// fresh allocation per keystroke). The returned positions are CHAR indices
@@ -653,6 +678,59 @@ impl SearchIndex {
         indices.dedup();
         indices
     }
+
+    /// The CHAR positions within `text` that the active query's atoms cover — the
+    /// PREVIEW-MARK seam.
+    ///
+    /// Marks **PER ATOM**, through the very [`AtomFinder`]s the FILTER answers
+    /// membership with: every occurrence of every atom, wherever it falls, and the
+    /// UNION of those runs is what the caller marks. nucleo is not on this path.
+    ///
+    /// Why this is not [`match_indices`](Self::match_indices) — the whole-pattern
+    /// seam, which would mark nothing whenever a two-word query's words sat on
+    /// different lines — is argued once in the module docs ("Two marking seams").
+    /// The short of it: marking per atom reproduces the FILTER's own admission
+    /// rule, so a marked pane explains why the row is on the board.
+    ///
+    /// Smart case rides each atom exactly as it does in the filter — these ARE the
+    /// filter's finders — so `foo BAR` marks `foo` case-insensitively and `BAR`
+    /// case-sensitively inside one call, each against the haystack casing its own
+    /// decision calls for.
+    ///
+    /// Returns ascending, deduplicated CHAR positions (never byte offsets). Runs
+    /// that overlap or abut, whether from one atom or several, merge into one
+    /// marked span rather than double-styling a char. Empty for an empty or
+    /// whitespace-only query, and for text no atom occurs in.
+    pub fn atom_match_positions(&self, text: &str) -> Vec<usize> {
+        // No atoms => empty/whitespace query: nothing is marked. Deliberately NOT
+        // the filter's "no atoms => every candidate": an unqueried pane marks
+        // nothing, it does not mark everything.
+        if self.atom_finders.is_empty() || text.is_empty() {
+            return Vec::new();
+        }
+        // One flag per CHAR of `text`. Marking into it is what merges the union:
+        // two atoms covering one char mark it once, and the output comes out sorted
+        // and deduplicated by construction.
+        let mut marked = vec![false; text.chars().count()];
+        // Both case branches' byte -> CHAR maps, built ONCE per call rather than per
+        // atom. Both are built unconditionally: `text` here is a single rendered
+        // line, so branching to skip one buys nothing worth the extra state.
+        let cased_starts = char_starts(text);
+        let (lowered, lowered_starts) = lowered_with_char_starts(text);
+        for atom in &self.atom_finders {
+            let (haystack, starts) = if atom.case_sensitive {
+                (text, cased_starts.as_slice())
+            } else {
+                (lowered.as_str(), lowered_starts.as_slice())
+            };
+            mark_atom(atom, haystack, starts, &mut marked);
+        }
+        marked
+            .iter()
+            .enumerate()
+            .filter_map(|(pos, &hit)| hit.then_some(pos))
+            .collect()
+    }
 }
 
 /// Compute a cheap change key over a session's *searchable* fields.
@@ -667,7 +745,13 @@ fn fingerprint(session: &Session) -> u64 {
 }
 
 /// Split `query` into the substring atoms nucleo's [`Pattern::new`] would require,
-/// so the filter demands exactly the atoms the highlight seam does.
+/// so the filter demands exactly the atoms the label highlight does.
+///
+/// The ONE splitter: the filter, the preview marks
+/// ([`atom_match_positions`](SearchIndex::atom_match_positions), through the
+/// finders built here) and nucleo's label highlight all take their atoms from it.
+/// Re-splitting a query anywhere else is how two surfaces start disagreeing about
+/// which words the user typed.
 ///
 /// Mirrors nucleo's `pattern_atoms` splitter plus its substring-atom unescape:
 /// split on an ASCII space that is NOT escaped by an immediately preceding
@@ -730,6 +814,89 @@ fn atoms_match(cased: &str, lowercased: &str, finders: &[AtomFinder]) -> bool {
         };
         atom.finder.find(haystack.as_bytes()).is_some()
     })
+}
+
+/// Mark every CHAR that one atom covers in `haystack` — the case branch that
+/// atom's own smart-case decision selected — translating each byte hit back into
+/// source char positions through `starts`.
+///
+/// Occurrences are taken OVERLAPPING: the scan resumes one byte past a hit's
+/// START, not past its end, so `aa` over `aaa` covers all three chars. The caller
+/// marks a union, and a reader looking at `aaa` sees the whole word emphasized;
+/// stopping at non-overlapping hits would leave the tail char plain for no reason
+/// anyone could see. Resuming mid-char is harmless — UTF-8 is self-synchronizing,
+/// so a valid needle can only ever match at a char boundary.
+///
+/// Fail-soft on the mark itself (`get_mut`): a position outside `marked` is
+/// skipped rather than panicking, so a byte/char map that ever disagreed with the
+/// text would misplace a mark, never take the board down.
+fn mark_atom(atom: &AtomFinder, haystack: &str, starts: &[usize], marked: &mut [bool]) {
+    let needle_len = atom.finder.needle().len();
+    if needle_len == 0 {
+        return;
+    }
+    let bytes = haystack.as_bytes();
+    let mut from = 0;
+    while let Some(offset) = atom.finder.find(&bytes[from..]) {
+        let start = from + offset;
+        for pos in char_span(starts, start, start + needle_len) {
+            if let Some(mark) = marked.get_mut(pos) {
+                *mark = true;
+            }
+        }
+        from = start + 1;
+    }
+}
+
+/// The SOURCE char positions a haystack byte range `start..end` covers.
+///
+/// `starts` is ascending, so each end is a binary search rather than a re-scan of
+/// the text: the char whose bytes contain `start`, through the last char that
+/// begins before `end`. That keeps a line with many hits linear-ish instead of
+/// counting chars from the top of the line once per hit.
+fn char_span(starts: &[usize], start: usize, end: usize) -> Range<usize> {
+    let first = starts
+        .partition_point(|&byte| byte <= start)
+        .saturating_sub(1);
+    let last = starts.partition_point(|&byte| byte < end);
+    first..last
+}
+
+/// Byte offset of each CHAR of `text`, ascending — the map [`char_span`] reads to
+/// answer a memmem hit in CHAR positions.
+fn char_starts(text: &str) -> Vec<usize> {
+    text.char_indices().map(|(byte, _)| byte).collect()
+}
+
+/// `text` lowercased the way the filter lowercases its haystacks, paired with the
+/// byte offset at which each SOURCE char begins inside that lowercased string.
+///
+/// The map is what makes a hit in the lowercased haystack addressable in the
+/// ORIGINAL text's char positions, which is what gets marked. It cannot be assumed
+/// 1:1: lowercasing can LENGTHEN a char (`İ` → `i̇`, one char into two), so the
+/// k-th lowercased char is not the k-th source char.
+///
+/// The string itself comes from [`str::to_lowercase`] — the same function the
+/// filter's haystacks are built with — while the offsets are accumulated per char.
+/// The two agree because the ONLY context-sensitive mapping in that function is a
+/// Greek capital sigma, whose two lowercase forms (`σ`, `ς`) are both one char and
+/// two bytes. The `debug_assert` states that invariant where it would break, and
+/// [`char_span`] plus the `get_mut` in [`mark_atom`] keep a future divergence to a
+/// misplaced mark rather than a panic.
+fn lowered_with_char_starts(text: &str) -> (String, Vec<usize>) {
+    let lowered = text.to_lowercase();
+    let mut starts = Vec::with_capacity(text.len());
+    let mut byte = 0usize;
+    for ch in text.chars() {
+        starts.push(byte);
+        byte += ch.to_lowercase().map(char::len_utf8).sum::<usize>();
+    }
+    debug_assert_eq!(
+        byte,
+        lowered.len(),
+        "per-char and per-string lowercasing must agree in byte length"
+    );
+    (lowered, starts)
 }
 
 /// One-shot substring filter: match `sessions` against `query` in `mode`.
@@ -1045,8 +1212,8 @@ mod tests {
         assert!(index.is_empty(), "a fresh index holds no sessions");
     }
 
-    /// The highlight seam marks a contiguous substring hit exactly, and marks
-    /// NOTHING for a scattered (non-contiguous) subsequence — the seam agrees
+    /// The row-LABEL highlight seam marks a contiguous substring hit exactly, and
+    /// marks NOTHING for a scattered (non-contiguous) subsequence — the seam agrees
     /// with the substring filter.
     #[test]
     fn match_indices_returns_matched_char_positions() {
@@ -1143,6 +1310,161 @@ mod tests {
             vec![1, 2],
             "the run spans a multi-byte char and stays on char indices"
         );
+    }
+
+    /// The chars `atom_match_positions` marked, run by run, joined with `+`.
+    ///
+    /// Runs rather than raw positions: per-atom marking puts SEVERAL runs on one
+    /// string, and a position list cannot tell "marked the query" from "marked
+    /// whatever sits at a borrowed offset".
+    fn marked_runs(index: &SearchIndex, text: &str) -> String {
+        let positions = index.atom_match_positions(text);
+        let mut runs: Vec<String> = Vec::new();
+        let mut run = String::new();
+        let mut previous: Option<usize> = None;
+        for (pos, ch) in text.chars().enumerate() {
+            if !positions.contains(&pos) {
+                continue;
+            }
+            if previous.is_some_and(|p| p + 1 != pos) {
+                runs.push(std::mem::take(&mut run));
+            }
+            run.push(ch);
+            previous = Some(pos);
+        }
+        if !run.is_empty() {
+            runs.push(run);
+        }
+        runs.join("+")
+    }
+
+    /// The PREVIEW-MARK seam marks PER ATOM: a string carrying only ONE atom of a
+    /// multi-atom query is still marked, for that atom.
+    ///
+    /// This is where it parts company with [`SearchIndex::match_indices`], which
+    /// answers only when EVERY atom occurs in the one string it was given. That
+    /// whole-string rule is right for a row label and wrong for a transcript LINE:
+    /// the filter admitted the session because the atoms occur anywhere in it, so a
+    /// line holding one of them is showing the user part of the answer.
+    #[test]
+    fn atom_match_positions_marks_each_atom_independently() {
+        let mut index = SearchIndex::new();
+        index.set_query("deploy pipeline");
+
+        // Both atoms in one string: BOTH runs are marked (not just the first).
+        assert_eq!(
+            marked_runs(&index, "the deploy pipeline ran"),
+            "deploy+pipeline"
+        );
+        // One atom only: still marked, for the atom that is there. The
+        // whole-string seam marks nothing here.
+        assert_eq!(marked_runs(&index, "the deploy ran green"), "deploy");
+        assert_eq!(marked_runs(&index, "the pipeline ran green"), "pipeline");
+        assert!(
+            index.match_indices("the deploy ran green").is_empty(),
+            "the row-LABEL seam requires every atom in the one string; that is the \
+             rule this seam deliberately does not share"
+        );
+        // Neither atom: nothing to mark.
+        assert!(index.atom_match_positions("nothing to see").is_empty());
+    }
+
+    /// EVERY occurrence is marked, including ones that overlap — the caller marks a
+    /// union, so a repeated word is emphasized everywhere it is said.
+    #[test]
+    fn atom_match_positions_marks_every_occurrence_including_overlaps() {
+        let mut index = SearchIndex::new();
+
+        // Repeated word: both occurrences, as two runs.
+        index.set_query("webhook");
+        assert_eq!(
+            marked_runs(&index, "the webhook and the webhook again"),
+            "webhook+webhook"
+        );
+
+        // Overlapping occurrences ("aa" at 0 and at 1) merge into ONE run covering
+        // all three chars, rather than leaving the tail char plain.
+        index.set_query("aa");
+        assert_eq!(marked_runs(&index, "aaa"), "aaa");
+
+        // Two atoms whose runs ABUT merge into one run too — the union is marked
+        // once, never as two overlapping spans.
+        index.set_query("dep loy");
+        assert_eq!(marked_runs(&index, "deploy now"), "deploy");
+    }
+
+    /// Positions are CHAR indices, not byte offsets, on BOTH case branches.
+    #[test]
+    fn atom_match_positions_uses_char_positions_not_byte_offsets() {
+        let mut index = SearchIndex::new();
+
+        // "🚀 deploy now": the rocket is one char but FOUR bytes, so a byte offset
+        // would report 5..11 where the char positions are 2..8.
+        index.set_query("deploy");
+        assert_eq!(
+            index.atom_match_positions("🚀 deploy now"),
+            vec![2, 3, 4, 5, 6, 7]
+        );
+
+        // The same through the CASE-SENSITIVE branch, which searches the cased text.
+        index.set_query("Deploy");
+        assert_eq!(
+            index.atom_match_positions("🚀 Deploy now"),
+            vec![2, 3, 4, 5, 6, 7]
+        );
+
+        // Unlike the nucleo seam, a match at the very LAST char of a non-ASCII
+        // string is found here — the filter's own byte scan has no tail off-by-one,
+        // and the marks now follow the filter.
+        index.set_query("fin");
+        assert_eq!(index.atom_match_positions("café fin"), vec![5, 6, 7]);
+    }
+
+    /// A char whose lowercase form is LONGER than itself does not shift the marks.
+    ///
+    /// `İ` (U+0130) lowercases to TWO chars (`i` + a combining dot), so the k-th
+    /// char of the lowercased haystack is not the k-th char of the text. Assuming
+    /// they line up marks the wrong chars — here it would run two positions past
+    /// the word and off the end of the string.
+    #[test]
+    fn atom_match_positions_survives_a_lengthening_lowercase() {
+        let mut index = SearchIndex::new();
+        index.set_query("stanbul");
+        // "İstanbul": chars İ(0) s(1) t(2) a(3) n(4) b(5) u(6) l(7).
+        assert_eq!(
+            index.atom_match_positions("İstanbul"),
+            vec![1, 2, 3, 4, 5, 6, 7]
+        );
+        assert_eq!(marked_runs(&index, "İstanbul"), "stanbul");
+    }
+
+    /// Smart case rides each ATOM here exactly as it does in the filter, because
+    /// these are the filter's own finders: `foo BAR` folds `foo` and does not fold
+    /// `BAR`, within one call.
+    #[test]
+    fn atom_match_positions_keeps_smart_case_per_atom() {
+        let mut index = SearchIndex::new();
+        index.set_query("foo BAR");
+
+        // The lowercase atom folds (marks `Foo`); the uppercase one does not fold
+        // and finds the cased `BAR`.
+        assert_eq!(marked_runs(&index, "Foo and BAR"), "Foo+BAR");
+        // Same string, lowercase `bar`: the case-SENSITIVE atom must not mark it.
+        assert_eq!(marked_runs(&index, "Foo and bar"), "Foo");
+    }
+
+    /// An empty or whitespace-only query parses to zero atoms and marks nothing,
+    /// and so does empty text.
+    #[test]
+    fn atom_match_positions_is_empty_without_atoms_or_text() {
+        let mut index = SearchIndex::new();
+
+        index.set_query("");
+        assert!(index.atom_match_positions("anything at all").is_empty());
+        index.set_query("   ");
+        assert!(index.atom_match_positions("anything at all").is_empty());
+        index.set_query("anything");
+        assert!(index.atom_match_positions("").is_empty());
     }
 
     /// Incremental re-filter: narrowing the query per keystroke re-ranks over

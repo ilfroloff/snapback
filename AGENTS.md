@@ -104,8 +104,12 @@ one place.
   MEMBERSHIP with `memchr::memmem` and never calls nucleo; smart case is decided
   **PER ATOM**, never per query, and each atom searches the cased or lowercased
   haystack accordingly — BOTH are load-bearing. nucleo is confined to the
-  HIGHLIGHT seam (`match_indices`). Never rank the filter's results: display
-  order is `App::order_filtered`'s alone. (`src/search.rs`)
+  ROW-LABEL highlight (`match_indices`), which answers about ONE string matched as
+  a WHOLE. The PREVIEW marks are the FILTER's, not nucleo's: `atom_match_positions`
+  marks PER ATOM through the same memmem finders, so a marked pane reproduces the
+  rule the row was admitted by (the atoms occur ANYWHERE in the transcript, not all
+  on one line). Never rank the filter's results: display order is
+  `App::order_filtered`'s alone. (`src/search.rs`)
 - **STABLE-ID STATE.** Track selection by `session_id`, never list index, so it
   survives autorefresh reloads. (`src/tui/app.rs`)
 - **OFF-UI-THREAD blocking work.** RECURRING shell-outs / FS watch / input run on

@@ -27,6 +27,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 use time::OffsetDateTime;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::agents::{self, AgentActivity, ReportedAgent};
 use crate::search::SearchMode;
@@ -305,6 +306,35 @@ const SCROLLBAR_ARROW_HIDDEN: &str = " ";
 /// space above the transcript and a shorter one would hide the banner outright.
 const PREVIEW_BANNER_ROWS: u16 = 1;
 
+/// How a search match is marked INSIDE the preview transcript.
+///
+/// A `Modifier`, never a color: a preview line arrives already styled by
+/// `store::preview` (headings, DIM code, colored markers), so the mark must
+/// COMPOSE onto whatever style it lands on — a fixed foreground would erase that
+/// style and, on the wrong terminal theme, the text with it (TERMINAL-SAFE
+/// STYLING). `REVERSED` is the one attribute this board already relies on being
+/// honored (the list's selection highlight), unlike the blink attribute most
+/// terminals silently ignore. It deliberately differs from the row label's
+/// blue+BOLD: the label is plain text this view owns, whereas here BOLD/DIM are
+/// already spoken for by the markdown pass.
+const PREVIEW_MATCH_MODIFIER: Modifier = Modifier::REVERSED;
+
+/// How far down the viewport a jumped-to search match is parked: one
+/// [`MATCH_JUMP_LEAD_DIVISOR`]th of the transcript's height from the top, so a
+/// pane of height `h` shows `h / 3` rows of LEAD-IN above the match and the rest
+/// below it.
+///
+/// Not the top (`0`), which strands the match with no context above it and reads
+/// as if the transcript began there; not the middle (`2`), which spends half the
+/// pane on what the user has already been told. A third is the smallest lead that
+/// still shows the turn a match belongs to while leaving the majority of the pane
+/// for what follows — the direction a transcript is read in.
+///
+/// It is a MINIMUM, not a promise: the offset is clamped like every other
+/// (`clamp_preview_offset`), so a match in the first rows of a transcript keeps
+/// its natural position rather than scrolling above the start.
+const MATCH_JUMP_LEAD_DIVISOR: u16 = 3;
+
 /// The compose box starts at ONE visible text row and grows with the draft up to
 /// [`COMPOSE_MAX_TEXT_ROWS`]; the `TextArea` scrolls internally beyond that.
 const COMPOSE_MIN_TEXT_ROWS: u16 = 1;
@@ -511,6 +541,14 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
         app.list_rect = area;
         app.preview_rect = Rect::default();
         render_list(frame, app, area);
+        // `render_preview` is the match jump's only consumer, and it does not run
+        // here — so this frame is where a request armed with no pane on screen has
+        // to die. Left armed it would fire on the frame the pane comes BACK on,
+        // overriding the newest-turn anchor `App::toggle_preview` just set, for a
+        // query the user typed before they re-opened the pane. Dropping it HERE
+        // (rather than refusing to arm it) covers every route into the flag,
+        // including the explicit `Shift`-arrow step.
+        let _ = app.take_preview_match_jump();
     }
 }
 
@@ -1467,19 +1505,52 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     let tail_rows = reply_tail
         .as_ref()
         .map_or(0, |tail| wrapped_text_rows(tail, inner_width));
-    // A send in flight for the selected row also FOLLOWS the bottom, so the echo —
-    // and then the real turns as they land — stay in view without a manual scroll.
+    // Whether the pane is still anchored to the newest row — `App::preview_follow_bottom`
+    // and nothing else, because that field is the ONE answer to "is this pane still
+    // anchored, or did the reader position it?" (see its doc comment for the full set
+    // of transitions).
+    //
+    // An in-flight reply follows the tail THROUGH that anchor rather than around it:
+    // a fresh selection arms it and `End` re-arms it, so the ordinary reply still
+    // streams into view with no keypress. It must not be ORed in here. `reply_tail`
+    // is `Some` for the WHOLE duration of a send and this runs on every frame — the
+    // spinner redraws each tick — so an OR re-asserted the anchor on every one of
+    // those frames and snapped the pane back to `max_offset` one frame after the
+    // reader (or the match jump below) had positioned it.
+    //
     // The card anchors to the TOP instead: it is short, and its headline is the
     // first thing to read.
-    let follow_bottom = card.is_none() && (app.preview_follow_bottom || reply_tail.is_some());
+    let follow_bottom = card.is_none() && app.preview_follow_bottom;
 
     let mut text = match card {
         Some(lines) => Text::from(lines),
         None => app.preview_text(inner_width),
     };
+    // Under an active query, mark the query's occurrences INSIDE the transcript —
+    // the content-search counterpart of the row-label highlight, and marked by
+    // re-searching these rendered lines rather than by projecting a position out
+    // of `content_index` (see `App::preview_matches`). Suppressed under a draft
+    // card, which is a placeholder for a session that does not exist yet: there is
+    // no transcript there to have matched. Applied BEFORE the reply tail is
+    // appended, so the map's line indices still address `text` one-for-one.
+    if !showing_card {
+        if let Some(matches) = app.preview_matches(inner_width) {
+            for (i, line) in text.lines.iter_mut().enumerate() {
+                if let Some(matched) = matches.get(&i) {
+                    *line = highlight_matched_spans(line, matched, PREVIEW_MATCH_MODIFIER);
+                }
+            }
+        }
+    }
     if let Some(tail) = reply_tail {
         text.lines.extend(tail);
     }
+    // Take the pending match jump ABOVE the early return below, so EVERY path out
+    // of this function consumes it. It is a one-shot describing the pane as it was
+    // when a key was pressed; a path that leaves it armed defers it onto an
+    // unrelated later frame instead of dropping it (see `App::take_preview_match_jump`).
+    let pending_jump = app.take_preview_match_jump();
+
     // Nothing selected (no text AND no banner, since a banner implies a SELECTED
     // session claude reported). A reported session whose transcript is still
     // empty falls through instead: its banner is the one thing worth drawing, and
@@ -1529,7 +1600,42 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         app.preview_wrapped_rows(inner_width) + tail_rows
     };
-    let offset = clamp_preview_offset(follow_bottom, app.preview_scroll, content_h, inner_height);
+    // Resolve the pending match jump HERE, at the one site that knows the pane's
+    // width and height — the two things the offset is a function of — and that
+    // already writes the resolved scroll state back. The offset is measured with
+    // the SAME wrapper that paints the pane, over the transcript's own prefix:
+    // `Wrap { trim: false }` wraps each logical line independently and never joins
+    // two onto one row, so a wrapped row count is ADDITIVE over lines and the
+    // prefix's count IS the matched line's first screen row. The approximate
+    // character-packing model (`wrapped_line_height`) is wrong in both directions
+    // and would park the match somewhere else entirely.
+    //
+    // Already taken above, acted on only for a transcript: under a draft CARD the
+    // matched line indices address text that is not on screen (the card replaced
+    // it), so the request is DROPPED rather than deferred onto whatever frame
+    // follows the card.
+    let jump = if pending_jump && !showing_card {
+        app.preview_match_target()
+            .and_then(|line| text.lines.get(..line))
+            .map(|prefix| match_jump_offset(wrapped_text_rows(prefix, inner_width), inner_height))
+    } else {
+        None
+    };
+    // A jump overrides the bottom anchor — that is the whole request — and says so
+    // in `App` too, or the next frame would re-anchor and undo it. The jump is a
+    // ONE-SHOT and this function runs many times per second, so the override has to
+    // live in state that OUTLASTS the frame; `preview_follow_bottom` is that state
+    // and the reader takes it back the ordinary ways (scroll, another row, `End`).
+    let follow_bottom = follow_bottom && jump.is_none();
+    let offset = clamp_preview_offset(
+        follow_bottom,
+        jump.unwrap_or(app.preview_scroll),
+        content_h,
+        inner_height,
+    );
+    if jump.is_some() {
+        app.preview_follow_bottom = false;
+    }
     // Persist the resolved geometry so the scroll keys stay in bounds and can
     // size a page on the next keypress — EXCEPT under a draft card, which is not
     // the transcript that offset describes. The card is a handful of lines, so on
@@ -1783,6 +1889,21 @@ fn clamp_preview_offset(
     }
 }
 
+/// The preview offset that parks a matched line one
+/// [`MATCH_JUMP_LEAD_DIVISOR`]th of the way down the viewport, given how many
+/// wrapped ROWS sit above that line.
+///
+/// `rows_above` must be the EXACT wrapped-row count of the lines preceding the
+/// match — the first screen row that line occupies — which is why the caller
+/// measures it with `Paragraph::line_count` over the transcript's own prefix
+/// rather than modelling the wrap (see [`wrapped_text_rows`]). Saturating, so a
+/// match inside the first `viewport_h / MATCH_JUMP_LEAD_DIVISOR` rows resolves to
+/// 0 (the transcript's start) instead of underflowing. Pure and terminal-free.
+fn match_jump_offset(rows_above: usize, viewport_h: u16) -> u16 {
+    let lead = usize::from(viewport_h / MATCH_JUMP_LEAD_DIVISOR);
+    rows_above.saturating_sub(lead).min(usize::from(u16::MAX)) as u16
+}
+
 /// A conservative, provably-sufficient real-offset distance from an edge such
 /// that ratatui's own thumb-geometry rounding (`rounding_divide(position *
 /// track_length, content_h)`, per `ratatui-widgets`' `Scrollbar`) can never
@@ -1957,16 +2078,23 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         // The board keymap — one of the four surfaces AGENTS.md's KEEP KEY DOCS IN
         // SYNC names. It does NOT mention the terminal's paste, on COLUMN BUDGET:
-        // this line is already 210 columns (measured with the `unicode-width` the
+        // this line is already 223 columns (measured with the `unicode-width` the
         // renderer counts in) against a help row that is ONE line and never wraps, so
         // on an 80-column terminal it is cut mid-`^K stop` and everything from
         // `^X hide/del` (column 87) rightward is already unpainted. A 23-column
-        // "paste keeps newlines" clause would land at columns 211-233 — nowhere, on
+        // "paste keeps newlines" clause would land at columns 224-246 — nowhere, on
         // any realistic width. What a board paste DOES (append to the query with
         // newlines flattened to spaces, and never resume) is documented where there
         // is room to say it: `KEYS` in `cli.rs` and the README key map.
+        //
+        // `S-↑↓ match` sits with the search cluster rather than with the scroll
+        // keys, because it is search navigation that happens to move a pane — and
+        // it is spelled `S-` rather than `⇧` so it needs no glyph the terminal may
+        // not have. It is off-screen at 80 columns like everything past `^X`, and
+        // that is the same budget every clause here is judged against; the key is
+        // documented in full in `KEYS` and the README.
         Line::from(vec![Span::styled(
-            "↑↓/jk move · ←/→ fold/expand · Enter resume · ^F fork · ^N new · ^R reply · ^K stop · ^X hide/del · type to search · Tab name/content · ^A scope · ^/ preview · PgUp/PgDn·^U/^D·Home/End·wheel scroll · q/Esc quit",
+            "↑↓/jk move · ←/→ fold/expand · Enter resume · ^F fork · ^N new · ^R reply · ^K stop · ^X hide/del · type to search · Tab name/content · S-↑↓ match · ^A scope · ^/ preview · PgUp/PgDn·^U/^D·Home/End·wheel scroll · q/Esc quit",
             Style::default().add_modifier(Modifier::DIM),
         )])
     };
@@ -2375,29 +2503,146 @@ fn fit_label(label: &str, content_width: usize, used: usize, marker: usize) -> S
         .collect()
 }
 
-/// Break `label` into consecutive `(text, is_match)` runs on CHAR boundaries.
+/// Break `text` into consecutive `(slice, is_match)` runs on EXTENDED
+/// GRAPHEME-CLUSTER boundaries — the one splitter behind both highlights.
 ///
-/// A char at CHAR position `p` is a match iff `matched` contains `p`; adjacent
-/// chars of the same match-state are coalesced into one run so the span count
-/// stays small. Iterates `chars().enumerate()`, so every boundary is a valid
-/// char boundary — multi-byte / unicode labels are safe (never a raw byte
-/// slice) — and any index in `matched` that is past the label's last char is
-/// simply never encountered, so an out-of-range index (e.g. from a
-/// width-truncated label) is ignored rather than panicking.
+/// `char_offset` is the CHAR position of `text`'s first char within the string
+/// `matched` addresses, so a caller walking a line span by span can keep counting
+/// across spans (a row label passes 0). A cluster is a match iff `matched` holds
+/// ANY of its char positions, which is what snaps a run OUT to the cluster's
+/// edges: the run may cover one extra codepoint, and it can never cut a cluster
+/// in half. Runs that meet after that snap coalesce, exactly as abutting matches
+/// always have, so no two adjacent spans ever carry the same state.
 ///
-/// Pure and terminal-free so the run breakdown is unit-testable on its own; the
-/// same helper backs both the flat and the grouped list (they share one session
-/// row renderer).
-fn highlight_runs(label: &str, matched: &HashSet<usize>) -> Vec<(String, bool)> {
-    let mut runs: Vec<(String, bool)> = Vec::new();
-    for (char_pos, ch) in label.chars().enumerate() {
-        let is_match = matched.contains(&char_pos);
-        match runs.last_mut() {
-            Some((text, run_match)) if *run_match == is_match => text.push(ch),
-            _ => runs.push((ch.to_string(), is_match)),
+/// Cutting a cluster is not cosmetic. `Line::width` sums `unicode-width` PER SPAN
+/// and that width is a CONTEXTUAL fold, so an emoji severed from its VS16 or its
+/// skin-tone modifier measures differently from the same bytes unsplit — and both
+/// the cached line widths (`App::preview_hit_context`) and the cached
+/// wrapped-row count are measured on the UNSPLIT lines. Ratatui's word wrapper
+/// segments per span too, so a cut cluster also changes where the wrap falls.
+/// (Cluster edges are not a total guarantee — unicode-width folds across a few
+/// cross-cluster ligature contexts as well — but they cover the emoji sequences a
+/// transcript actually carries.)
+///
+/// Every boundary is a valid char boundary by construction, so multi-byte text is
+/// safe (never a raw byte slice), and any index in `matched` past the last char is
+/// simply never encountered — an out-of-range index (e.g. from a width-truncated
+/// label) is ignored rather than panicking. It walks the text ONCE, the same
+/// single pass the char-by-char split it replaced made.
+///
+/// Pure and terminal-free so the run breakdown is unit-testable on its own.
+fn match_runs<'a>(
+    text: &'a str,
+    char_offset: usize,
+    matched: &HashSet<usize>,
+) -> Vec<(&'a str, bool)> {
+    let mut runs: Vec<(&str, bool)> = Vec::new();
+    let mut char_pos = char_offset;
+    let mut run_start = 0usize;
+    let mut run_match: Option<bool> = None;
+    for (byte_pos, cluster) in text.grapheme_indices(true) {
+        let chars = cluster.chars().count();
+        let is_match = (char_pos..char_pos + chars).any(|p| matched.contains(&p));
+        char_pos += chars;
+        match run_match {
+            Some(open) if open != is_match => {
+                runs.push((&text[run_start..byte_pos], open));
+                run_start = byte_pos;
+                run_match = Some(is_match);
+            }
+            Some(_) => {}
+            None => run_match = Some(is_match),
         }
     }
+    if let Some(open) = run_match {
+        runs.push((&text[run_start..], open));
+    }
     runs
+}
+
+/// Break `label` into consecutive owned `(text, is_match)` runs — [`match_runs`]
+/// for a string the view owns end to end, so char positions start at 0 and the
+/// runs are handed on as `Span` contents.
+///
+/// Pure and terminal-free; the same helper backs both the flat and the grouped
+/// list (they share one session row renderer).
+fn highlight_runs(label: &str, matched: &HashSet<usize>) -> Vec<(String, bool)> {
+    match_runs(label, 0, matched)
+        .into_iter()
+        .map(|(text, is_match)| (text.to_string(), is_match))
+        .collect()
+}
+
+/// Re-style `line` so the chars at `matched` CHAR positions carry `emphasis`,
+/// leaving every other char exactly as it was.
+///
+/// The styled sibling of [`highlight_runs`], and the difference is the whole
+/// point: a row label is unstyled text this view owns, whereas a preview line
+/// arrives ALREADY styled by `store::preview` (markers, headings, DIM code, the
+/// underlined link labels). So this splits the line's own spans at the matched
+/// positions and ADDS the modifier to the matched runs, rather than replacing
+/// their style — a marked word inside a DIM code span stays DIM.
+///
+/// Three invariants hold, and the rest of the pane depends on all three:
+///
+/// - **The text is byte-identical.** Only styles move, so display width and
+///   `Line::width` are unchanged — which is what keeps `App::preview_hit_context`'s
+///   link columns and the cached wrapped-row count describing what is drawn.
+/// - **One line in, one line out.** No span is dropped even when empty, so the
+///   line count the scroll clamp was measured against cannot move.
+/// - **Cluster boundaries only.** It splits through [`match_runs`], so a span is
+///   never sliced mid-codepoint OR mid-grapheme-cluster — the second is what keeps
+///   the first invariant true, since a summed-per-span width is not the unsplit
+///   width once a cluster is cut. A position past the line's last char is simply
+///   never reached (out-of-range indices are ignored, not a panic).
+///
+/// `matched` addresses the LINE's plain text (`app::line_text`'s concatenation),
+/// so the walk counts chars ACROSS spans rather than restarting per span. Cluster
+/// boundaries are read per span, which is the same unit ratatui's wrapper reads
+/// them in; a cluster the RENDERER already split across two spans stays split,
+/// because this fn only promises not to add a cut of its own.
+/// Pure and terminal-free.
+fn highlight_matched_spans(
+    line: &Line<'_>,
+    matched: &HashSet<usize>,
+    emphasis: Modifier,
+) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(line.spans.len());
+    let mut char_pos = 0usize;
+    for span in &line.spans {
+        // Runs are coalesced per span so a fully unmatched span stays ONE span
+        // (the common case: most preview lines carry no match at all).
+        let runs = match_runs(&span.content, char_pos, matched);
+        char_pos += span.content.chars().count();
+        if runs.is_empty() {
+            // An empty span carries no chars but is kept anyway: dropping it would
+            // be a structural change to a line this fn promises only to re-style.
+            spans.push(Span::styled(
+                String::new(),
+                emphasized(span.style, false, emphasis),
+            ));
+            continue;
+        }
+        spans.extend(runs.into_iter().map(|(text, is_match)| {
+            Span::styled(text.to_string(), emphasized(span.style, is_match, emphasis))
+        }));
+    }
+    let mut out = Line::from(spans);
+    // The LINE's own style and alignment are the span styles' backdrop; carrying
+    // them over is part of "only the matched runs changed".
+    out.style = line.style;
+    out.alignment = line.alignment;
+    out
+}
+
+/// `base`, plus `emphasis` when this run matched — the one place the match
+/// modifier is composed ONTO an existing style rather than replacing it.
+fn emphasized(base: Style, is_match: bool, emphasis: Modifier) -> Style {
+    if is_match {
+        base.add_modifier(emphasis)
+    } else {
+        base
+    }
 }
 
 /// Style `label` into spans, giving matched-char runs the `highlight` style and
@@ -3581,6 +3826,58 @@ mod tests {
         );
     }
 
+    /// A mark that covers only PART of a grapheme cluster still takes the whole
+    /// cluster: the run's end snaps UP past the emoji's skin-tone modifier, and
+    /// (the same rule read the other way) its start snaps DOWN onto the base
+    /// codepoint. Marking one extra codepoint is harmless; a span boundary inside
+    /// a cluster is not — see [`match_runs`].
+    #[test]
+    fn match_runs_snaps_a_partial_mark_out_to_the_whole_cluster() {
+        // "e👍🏽f": char 1 is the emoji base, char 2 its Fitzpatrick modifier.
+        let text = "e\u{1F44D}\u{1F3FD}f";
+        for marked in [1usize, 2] {
+            let matched: HashSet<usize> = [marked].into_iter().collect();
+            assert_eq!(
+                match_runs(text, 0, &matched),
+                vec![("e", false), ("\u{1F44D}\u{1F3FD}", true), ("f", false)],
+                "a mark on char {marked} alone still takes the cluster whole"
+            );
+        }
+    }
+
+    /// Two clusters that each snap outward until they touch become ONE run, the
+    /// same coalescing abutting marks have always had — never two adjacent spans
+    /// carrying the same state.
+    #[test]
+    fn match_runs_merges_clusters_that_meet_after_snapping() {
+        // "a👍🏽👍🏽b": chars 1,2 are the first cluster and 3,4 the second, so a mark
+        // on 2 and 3 lands inside a different cluster at each end.
+        let text = "a\u{1F44D}\u{1F3FD}\u{1F44D}\u{1F3FD}b";
+        let matched: HashSet<usize> = [2, 3].into_iter().collect();
+        assert_eq!(
+            match_runs(text, 0, &matched),
+            vec![
+                ("a", false),
+                ("\u{1F44D}\u{1F3FD}\u{1F44D}\u{1F3FD}", true),
+                ("b", false),
+            ],
+            "the two snapped runs merge instead of emitting two abutting spans"
+        );
+    }
+
+    /// `char_offset` is what lets a caller walk a multi-span line: the positions
+    /// address the whole line's text, so each span resumes counting where the
+    /// previous one stopped rather than restarting at 0.
+    #[test]
+    fn match_runs_counts_char_positions_from_the_offset() {
+        let matched: HashSet<usize> = [6].into_iter().collect();
+        assert_eq!(
+            match_runs("ab", 5, &matched),
+            vec![("a", false), ("b", true)],
+            "with the span starting at char 5, position 6 is its SECOND char"
+        );
+    }
+
     #[test]
     fn highlight_label_spans_applies_highlight_only_to_matched_runs() {
         let matched: HashSet<usize> = [0].into_iter().collect();
@@ -3600,6 +3897,227 @@ mod tests {
             spans[1].style, base,
             "an unmatched char keeps the base style"
         );
+    }
+
+    // --- preview match highlight (the styled sibling) ----------------------
+
+    /// A preview line's plain text: the spans' contents, concatenated — the same
+    /// string `app::line_text` hands the matcher, so a test's expectations about
+    /// char positions are the ones the production path uses.
+    fn spans_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// A styled two-span line: DIM `code ` then BOLD `word`, under a line-level
+    /// style and alignment of its own — both non-default on purpose, so an
+    /// assertion that they survived is capable of failing.
+    fn styled_line() -> Line<'static> {
+        Line::from(vec![
+            Span::styled("code ", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled("word", Style::default().add_modifier(Modifier::BOLD)),
+        ])
+        .style(Style::default().fg(Color::Cyan))
+        .alignment(Alignment::Center)
+    }
+
+    /// The mark COMPOSES onto each span's own style instead of replacing it: a
+    /// matched run inside DIM code stays DIM and gains the modifier, and the
+    /// unmatched remainder of that same span is untouched.
+    #[test]
+    fn preview_match_highlight_preserves_each_spans_own_style() {
+        // "code word": chars 0..=3 are "code" (inside the DIM span), chars 5..=8
+        // are "word" (inside the BOLD span).
+        let matched: HashSet<usize> = [0, 1, 2, 3, 5, 6, 7, 8].into_iter().collect();
+        let out = highlight_matched_spans(&styled_line(), &matched, PREVIEW_MATCH_MODIFIER);
+        let styled: Vec<(String, Style)> = out
+            .spans
+            .iter()
+            .map(|s| (s.content.to_string(), s.style))
+            .collect();
+        assert_eq!(
+            styled,
+            vec![
+                (
+                    "code".to_string(),
+                    Style::default()
+                        .add_modifier(Modifier::DIM)
+                        .add_modifier(PREVIEW_MATCH_MODIFIER)
+                ),
+                (
+                    " ".to_string(),
+                    Style::default().add_modifier(Modifier::DIM)
+                ),
+                (
+                    "word".to_string(),
+                    Style::default()
+                        .add_modifier(Modifier::BOLD)
+                        .add_modifier(PREVIEW_MATCH_MODIFIER)
+                ),
+            ],
+            "each run keeps the style of the span it came from, plus the mark"
+        );
+    }
+
+    /// The width the overflow fixture below is measured at. [`overflowing_line`]
+    /// is 40 columns wide, so it wraps to exactly TWO full rows here and a single
+    /// invented column tips it to three — which is the only shape in which a
+    /// width-changing split can be caught moving a row.
+    const OVERFLOW_WRAP_WIDTH: u16 = 20;
+    /// Rows [`overflowing_line`] occupies at [`OVERFLOW_WRAP_WIDTH`] when nothing
+    /// has changed its width. Stated so the fixture's overflow is asserted, not
+    /// assumed.
+    const OVERFLOW_WRAP_ROWS: usize = 2;
+
+    /// A styled line that OVERFLOWS [`OVERFLOW_WRAP_WIDTH`], with the emoji +
+    /// skin-tone cluster parked right where the first row fills up.
+    ///
+    /// Both halves are load-bearing. It is 40 columns at 20, so row one ends
+    /// exactly full and one extra column pushes the `ddd` word — and then the long
+    /// `e` word behind it — onto rows of their own. And the mark's run boundary
+    /// falls INSIDE the cluster, the split that silently invents those columns.
+    fn overflowing_line() -> Line<'static> {
+        Line::from(vec![
+            Span::styled(
+                "aaaa bbbb cccc ",
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+            Span::styled(
+                "\u{1F44D}\u{1F3FD}ddd eeeeeeeeeeeeeeeeeee",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ])
+        .style(Style::default().fg(Color::Cyan))
+        .alignment(Alignment::Center)
+    }
+
+    /// The pane's geometry rides on this: `App::preview_hit_context` maps a click
+    /// through each line's DISPLAY WIDTH and the wrapped-row count is cached per
+    /// (session, width), so a re-styled line that changed either would silently
+    /// move every link and every scroll bound.
+    ///
+    /// Measured against a fixture that WRAPS. A line that fits the width leaves
+    /// both sides of the row assertion at 1 for any implementation at all, broken
+    /// ones included — the assertion has to be able to see a row move.
+    #[test]
+    fn preview_match_highlight_changes_no_width_and_no_line_count() {
+        let line = overflowing_line();
+        // Char 15 is the emoji's base codepoint; char 16 is its skin-tone
+        // modifier. Marking only the base puts the run boundary mid-cluster.
+        let matched: HashSet<usize> = [15].into_iter().collect();
+        let out = highlight_matched_spans(&line, &matched, PREVIEW_MATCH_MODIFIER);
+        assert_eq!(spans_text(&out), spans_text(&line), "the text is identical");
+        assert_eq!(out.width(), line.width(), "the display width is identical");
+        assert_eq!(
+            wrapped_text_rows(std::slice::from_ref(&line), OVERFLOW_WRAP_WIDTH),
+            OVERFLOW_WRAP_ROWS,
+            "the fixture must overflow the measuring width, or the next assertion \
+             compares 1 to 1 and cannot fail"
+        );
+        assert_eq!(
+            wrapped_text_rows(std::slice::from_ref(&out), OVERFLOW_WRAP_WIDTH),
+            wrapped_text_rows(std::slice::from_ref(&line), OVERFLOW_WRAP_WIDTH),
+            "the wrapped row count is identical"
+        );
+        assert_eq!(out.style, line.style, "the line's own style survives");
+        assert_eq!(out.alignment, line.alignment, "the alignment survives");
+    }
+
+    /// A span boundary must never land inside a grapheme cluster.
+    ///
+    /// `Line::width` sums `unicode-width` PER SPAN and that width is a CONTEXTUAL
+    /// fold, so cutting a cluster changes the measured width of text that did not
+    /// change: +2 columns for an emoji severed from its skin-tone modifier, -1 for
+    /// one severed from its VS16. Both cached widths (`App::preview_hit_context`)
+    /// and the cached wrapped-row count are measured on the UNSPLIT lines, so a
+    /// cut cluster desyncs them from the line actually painted. The run therefore
+    /// snaps OUT to the cluster's edges — marking one extra codepoint, never
+    /// splitting one.
+    #[test]
+    fn preview_match_highlight_never_splits_a_grapheme_cluster() {
+        // (the cluster, which of ITS chars the mark lands on)
+        for (cluster, marked_char) in [
+            // Thumbs-up + Fitzpatrick modifier: severing it costs +2 columns.
+            ("\u{1F44D}\u{1F3FD}", 0),
+            // Heart + VS16 (emoji presentation): severing it costs -1 column.
+            ("\u{2764}\u{FE0F}", 0),
+            // A flag — two regional indicators. The mark lands on the SECOND, so
+            // the run's START has to snap DOWN, not just its end up.
+            ("\u{1F1FA}\u{1F1F8}", 1),
+        ] {
+            let line = Line::from(Span::raw(format!("x{cluster}y")));
+            let matched: HashSet<usize> = [1 + marked_char].into_iter().collect();
+            let out = highlight_matched_spans(&line, &matched, PREVIEW_MATCH_MODIFIER);
+            let runs: Vec<&str> = out.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(
+                runs,
+                vec!["x", cluster, "y"],
+                "{:?}: the cluster is marked whole",
+                cluster.escape_unicode().to_string()
+            );
+            assert_eq!(
+                out.width(),
+                line.width(),
+                "{:?}: the summed span width still describes the painted text",
+                cluster.escape_unicode().to_string()
+            );
+        }
+    }
+
+    /// Multi-byte chars: positions are CHAR positions, so a 4-byte emoji is
+    /// marked whole and a CJK span is never sliced mid-codepoint. Out-of-range
+    /// positions (a match past this line's end) are ignored, never a panic.
+    #[test]
+    fn preview_match_highlight_is_char_safe_for_multibyte_lines() {
+        let line = Line::from(vec![
+            Span::raw("🚀 "),
+            Span::styled("日本語", Style::default().add_modifier(Modifier::ITALIC)),
+        ]);
+        // char 0 = 🚀, char 3 = 本, plus two positions past the end.
+        let matched: HashSet<usize> = [0, 3, 99, 400].into_iter().collect();
+        let out = highlight_matched_spans(&line, &matched, PREVIEW_MATCH_MODIFIER);
+        let runs: Vec<(String, bool)> = out
+            .spans
+            .iter()
+            .map(|s| {
+                (
+                    s.content.to_string(),
+                    s.style.add_modifier.contains(PREVIEW_MATCH_MODIFIER),
+                )
+            })
+            .collect();
+        assert_eq!(
+            runs,
+            vec![
+                ("🚀".to_string(), true),
+                (" ".to_string(), false),
+                ("日".to_string(), false),
+                ("本".to_string(), true),
+                ("語".to_string(), false),
+            ],
+            "runs split on char boundaries, out-of-range positions ignored"
+        );
+        assert_eq!(spans_text(&out), spans_text(&line));
+        assert_eq!(
+            out.width(),
+            line.width(),
+            "CJK/emoji columns survive the split"
+        );
+    }
+
+    /// An unmatched line is handed back structurally unchanged — same span count
+    /// (an EMPTY span included), same styles — so the common case (most lines
+    /// match nothing) adds nothing and no line is quietly restructured.
+    #[test]
+    fn preview_match_highlight_leaves_an_unmatched_line_alone() {
+        let mut line = styled_line();
+        line.spans
+            .push(Span::styled("", Style::default().fg(Color::Red)));
+        let out = highlight_matched_spans(&line, &HashSet::new(), PREVIEW_MATCH_MODIFIER);
+        assert_eq!(out.spans.len(), line.spans.len(), "no span was split");
+        for (got, want) in out.spans.iter().zip(line.spans.iter()) {
+            assert_eq!(got.content, want.content);
+            assert_eq!(got.style, want.style, "no mark on an unmatched line");
+        }
     }
 
     // --- preview scrollbar geometry -----------------------------------------
@@ -5014,6 +5532,1197 @@ mod tests {
             rows[0].contains(DRAFT_CARD_HEADLINE),
             "the card must start on the pane's first row, not be scrolled off by a \
              height borrowed from the transcript; drawn rows: {rows:?}"
+        );
+    }
+
+    // --- in-preview search-match marking ------------------------------------
+
+    /// A preview pane wide enough that the fixture's turns are not wrapped into
+    /// pieces too small to read a marked word off, and tall enough to show them.
+    const MARK_PANE: (u16, u16) = (60, 20);
+
+    /// A word the `sess-normal-1` fixture says in its SUMMARY and in two turns, so
+    /// a query for it is both a label hit (name-only mode keeps the row) and a
+    /// transcript hit (something to mark).
+    const MARK_QUERY: &str = "webhook";
+
+    /// The sample session carrying the label the store would derive from its
+    /// summary, so a name-only query for [`MARK_QUERY`] keeps the row on the board.
+    fn markable_session() -> Session {
+        let mut session = sample_session();
+        session.label = "Fix the payment webhook retries".to_string();
+        session
+    }
+
+    // --- in-preview match jump ---------------------------------------------
+
+    /// Preview pane for the jump tests. NARROW enough that the turns below have to
+    /// word-wrap (which is what makes the wrapper's answer differ from a
+    /// character-packing one) and SHORT enough that the transcript overflows it,
+    /// so a scroll offset is a real position rather than a clamped zero.
+    const JUMP_PANE: (u16, u16) = (44, 14);
+
+    /// The word the jump tests search for. It sits INSIDE a longer token, so the
+    /// mark is a substring hit rather than a whole line.
+    const JUMP_QUERY: &str = "beacon";
+
+    /// A turn body carrying [`JUMP_QUERY`]. Three tokens, each longer than half the
+    /// pane's inner width, so the wrapper has to break after each one — which is
+    /// exactly where a `ceil(width / inner)` model disagrees with it.
+    const JUMP_BODY_HIT: &str =
+        "telemetry-beacon-pipeline synchronization-checkpoint instrumentation-rollout";
+
+    /// The same shape with no [`JUMP_QUERY`] in it, so a turn can pad the transcript
+    /// without adding a match.
+    const JUMP_BODY_MISS: &str =
+        "synchronization-checkpoint instrumentation-rollout deployment-verification";
+
+    /// Which of the turns below say [`JUMP_QUERY`]. Two of them, both well ABOVE the
+    /// end of the transcript, so the jump's offset is what positions the pane rather
+    /// than the bottom clamp — and so there is a second match to step back to.
+    const JUMP_HIT_TURNS: [usize; 2] = [1, 4];
+
+    /// How many turns the generated transcript holds. Enough to overflow
+    /// [`JUMP_PANE`] several times over, with the last hit turn far from the tail.
+    const JUMP_TURNS: usize = 12;
+
+    /// Write a transcript into `dir` shaped for the geometry tests, and hand back a
+    /// `Session` over it.
+    ///
+    /// Generated rather than checked in: what these tests need is a WRAPPING,
+    /// OVERFLOWING pane with a match at a known depth, which is a statement about
+    /// geometry, not about the JSONL format — the checked-in fixtures exist for
+    /// format edge cases and are (rightly) too small to overflow anything.
+    fn jump_session_at(dir: &Path, id: &str) -> Session {
+        jump_session_of(dir, id, JUMP_TURNS)
+    }
+
+    /// The same transcript, `turns` turns long.
+    ///
+    /// A session GROWS while the board is open — claude writing the reply is exactly
+    /// that — and rewriting the file longer is what a reload then sees. It is the only
+    /// way to tell a pane that is FOLLOWING the newest turn from one merely parked on
+    /// today's last row: both draw the same pane until the transcript moves.
+    fn jump_session_of(dir: &Path, id: &str, turns: usize) -> Session {
+        let path = dir.join(format!("{id}.jsonl"));
+        let mut out =
+            String::from(r#"{"type":"summary","summary":"Telemetry rollout","leafUuid":"j1"}"#);
+        out.push('\n');
+        for turn in 0..turns {
+            let body = if JUMP_HIT_TURNS.contains(&turn) {
+                JUMP_BODY_HIT
+            } else {
+                JUMP_BODY_MISS
+            };
+            let role = if turn % 2 == 0 { "user" } else { "assistant" };
+            out.push_str(&format!(
+                r#"{{"type":"{role}","sessionId":"{id}","cwd":"/Users/me/project-alpha","gitBranch":"main","timestamp":"2026-07-01T10:00:00.000Z","message":{{"role":"{role}","content":"{body}"}}}}"#
+            ));
+            out.push('\n');
+        }
+        std::fs::write(&path, out).expect("write the generated transcript");
+        Session {
+            file: path,
+            session_id: id.to_string(),
+            cwd: PathBuf::from("/Users/me/project-alpha"),
+            git_branch: Some("main".to_string()),
+            timestamp: None,
+            repo: "project-alpha".to_string(),
+            label: "Telemetry rollout".to_string(),
+            root_uuid: None,
+            msg_count: turns,
+            // A CONTENT hit and not a label one, which is the case the autoscroll
+            // exists for: the row says nothing about the query, so the pane has to.
+            content_index: JUMP_BODY_HIT.to_string(),
+        }
+    }
+
+    /// A board over [`jump_session`], already searching for [`JUMP_QUERY`] in
+    /// name+content mode — the only mode the automatic jump fires in.
+    fn jump_app(dir: &Path) -> App {
+        let mut app = App::new(
+            vec![jump_session_at(dir, "sess-jump-1")],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.toggle_search_mode();
+        assert_eq!(app.search_mode, SearchMode::NameAndContent);
+        app.push_query_str(JUMP_QUERY);
+        assert!(
+            app.selected.is_some(),
+            "the query must keep the row on the board, or nothing is previewed"
+        );
+        app
+    }
+
+    /// The FIRST wrapped row `line` occupies at `inner_width`, painted by the same
+    /// wrapper the pane uses.
+    ///
+    /// The ground truth the jump is checked against: it is read off a real render of
+    /// that one line, never derived from the offset arithmetic under test.
+    fn first_wrapped_row(line: &Line<'static>, inner_width: u16) -> String {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: inner_width,
+            height: 1,
+        };
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(
+            Paragraph::new(Text::from(vec![line.clone()])).wrap(Wrap { trim: false }),
+            area,
+            &mut buffer,
+        );
+        (0..inner_width)
+            .filter_map(|x| buffer.cell((x, 0)).map(|cell| cell.symbol().to_string()))
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    /// Everything the jump tests need to state their preconditions: the pane's
+    /// inner geometry, the transcript, and where the target match sits in it.
+    struct JumpGeometry {
+        inner_w: u16,
+        inner_h: u16,
+        /// Rows the pane leaves ABOVE a jumped-to match.
+        lead: usize,
+        /// The whole transcript's wrapped height.
+        content_h: usize,
+        /// The matched line the next jump targets.
+        target: usize,
+        /// Wrapped rows above `target` — the row it starts on, per the WRAPPER.
+        rows_above: usize,
+        /// The same count per the APPROXIMATE character-packing model.
+        packed_above: usize,
+        /// Every marked line, ascending.
+        marked: Vec<usize>,
+        lines: Vec<Line<'static>>,
+    }
+
+    /// Measure the pane the jump is about to be asserted against.
+    fn jump_geometry(app: &mut App, (width, height): (u16, u16)) -> JumpGeometry {
+        let inner_w = width - 2;
+        let inner_h = height - 2;
+        let lines = app.preview_text(inner_w).lines;
+        let target = app
+            .preview_match_target()
+            .expect("the query must mark something in this transcript");
+        let mut marked: Vec<usize> = app
+            .preview_matches(inner_w)
+            .expect("a selected session has a match map")
+            .keys()
+            .copied()
+            .collect();
+        marked.sort_unstable();
+        JumpGeometry {
+            inner_w,
+            inner_h,
+            lead: usize::from(inner_h / MATCH_JUMP_LEAD_DIVISOR),
+            content_h: wrapped_text_rows(&lines, inner_w),
+            target,
+            rows_above: wrapped_text_rows(&lines[..target], inner_w),
+            packed_above: lines[..target]
+                .iter()
+                .map(|line| wrapped_line_height(line.width(), inner_w))
+                .sum(),
+            marked,
+            lines,
+        }
+    }
+
+    /// The offset arithmetic, stated as arithmetic.
+    #[test]
+    fn match_jump_offset_leaves_a_third_of_the_viewport_above_the_match() {
+        // A match deep in a transcript keeps `lead` rows of context above it.
+        assert_eq!(match_jump_offset(23, 12), 23 - 12 / MATCH_JUMP_LEAD_DIVISOR);
+        // A match INSIDE the lead cannot scroll above the transcript's start.
+        assert_eq!(match_jump_offset(4, 12), 0);
+        assert_eq!(match_jump_offset(0, 12), 0);
+        // A degenerate pane asks for no lead at all rather than dividing badly.
+        assert_eq!(match_jump_offset(7, 0), 7);
+        assert_eq!(match_jump_offset(7, 2), 7);
+        // A transcript taller than `u16` saturates instead of wrapping around.
+        assert_eq!(match_jump_offset(usize::MAX, 30), u16::MAX);
+    }
+
+    /// THE core claim: the offset the jump resolves puts the matched line exactly
+    /// where the wrapper paints it.
+    ///
+    /// It is asserted against a real render, never against the same arithmetic that
+    /// produced it: the row drawn at the lead must be the target line's own first
+    /// wrapped row, taken from a separate paint of that one line. Three
+    /// preconditions keep it from passing for the wrong reason — the transcript
+    /// must OVERFLOW (or every offset clamps to 0), the match must sit far enough
+    /// from BOTH ends that neither clamp is what positions it, and the approximate
+    /// character-packing model must DISAGREE with the wrapper here (otherwise the
+    /// test cannot tell the two apart, which is the whole thing it exists to do).
+    #[test]
+    fn the_match_jump_parks_the_matched_line_where_the_wrapper_paints_it() {
+        let dir = unique_temp_dir("jump-offset");
+        let (width, height) = JUMP_PANE;
+        let mut app = jump_app(&dir);
+        let geo = jump_geometry(&mut app, JUMP_PANE);
+
+        assert!(
+            geo.marked.len() > 1,
+            "the transcript must say the query more than once, or 'the most recent \
+             match' is not a choice this test can check"
+        );
+        assert_eq!(
+            Some(geo.target),
+            geo.marked.last().copied(),
+            "the pane opens on the MOST RECENT match — the end the transcript is \
+             read from, and the end its bottom anchor already sits at"
+        );
+        assert!(
+            geo.content_h > usize::from(geo.inner_h),
+            "the transcript must overflow the pane, or every offset clamps to 0"
+        );
+        assert!(
+            geo.rows_above > geo.lead,
+            "the match must sit below the lead, or the top clamp positions it"
+        );
+        assert!(
+            geo.rows_above - geo.lead <= geo.content_h - usize::from(geo.inner_h),
+            "and far enough from the end that the bottom clamp does not"
+        );
+        assert_ne!(
+            geo.packed_above, geo.rows_above,
+            "the approximate packing model must disagree with the wrapper here, or \
+             this test cannot tell a wrong measurement from a right one"
+        );
+
+        let drawn = preview_buffer(&mut app, width, height);
+        let row = row_text(&drawn, 1 + geo.lead as u16, width);
+        assert_eq!(
+            row,
+            first_wrapped_row(&geo.lines[geo.target], geo.inner_w),
+            "the matched line must be painted exactly `lead` rows down; drawn: {:?}",
+            (0..height)
+                .map(|y| row_text(&drawn, y, width))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            marked_runs(&drawn, width, height)
+                .iter()
+                .any(|run| run == JUMP_QUERY),
+            "and the line parked there must be the MARKED one"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A reload leaves the reader's viewport exactly where they put it.
+    ///
+    /// This is what the jump costs if it is armed in the wrong place. A live session
+    /// appends turns at the watcher's cadence, so a jump on reload would yank the
+    /// pane back to a match every few hundred milliseconds while the user is reading
+    /// somewhere else. Asserted as the whole drawn pane, because what would be lost
+    /// is the view, not a field.
+    #[test]
+    fn a_reload_leaves_the_readers_viewport_alone() {
+        let dir = unique_temp_dir("jump-reload");
+        let (width, height) = JUMP_PANE;
+        let mut app = jump_app(&dir);
+        let jumped = preview_buffer(&mut app, width, height);
+        let jump_offset = app.preview_scroll;
+        assert!(
+            jump_offset > 0,
+            "the jump must have moved the pane, or there is nothing to disturb"
+        );
+
+        // The user then reads somewhere else entirely.
+        app.preview_top();
+        let reading = preview_buffer(&mut app, width, height);
+        assert_ne!(
+            app.preview_scroll, jump_offset,
+            "the fixture must leave the reader off the match"
+        );
+        let parked = app.preview_scroll;
+
+        // The watcher's reload: every transcript re-read, the selection kept by id.
+        app.apply_sessions(app.sessions.clone());
+        let after = preview_buffer(&mut app, width, height);
+        assert_eq!(
+            app.preview_scroll, parked,
+            "a reload must not move the preview's offset"
+        );
+        assert_eq!(
+            buffer_rows(&after, width, height),
+            buffer_rows(&reading, width, height),
+            "and must repaint the same pane the reader was looking at"
+        );
+        assert_ne!(
+            buffer_rows(&after, width, height),
+            buffer_rows(&jumped, width, height),
+            "the two panes must differ, or this proves nothing"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Selecting another session offers ITS match, the same way typing does.
+    #[test]
+    fn the_jump_fires_when_the_selection_moves_to_another_session() {
+        let dir = unique_temp_dir("jump-select");
+        let (width, height) = JUMP_PANE;
+        let mut app = App::new(
+            vec![
+                jump_session_at(&dir, "sess-jump-1"),
+                jump_session_at(&dir, "sess-jump-2"),
+            ],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.toggle_search_mode();
+        app.push_query_str(JUMP_QUERY);
+        assert_eq!(app.filtered.len(), 2, "both rows must survive the query");
+        preview_buffer(&mut app, width, height);
+        let first = app.preview_scroll;
+
+        // Read to the top of THIS session, then move to the next one.
+        app.preview_top();
+        preview_buffer(&mut app, width, height);
+        assert_eq!(app.preview_scroll, 0, "the reader is at the top");
+
+        app.move_selection(1);
+        preview_buffer(&mut app, width, height);
+        assert_eq!(
+            app.preview_scroll, first,
+            "a newly selected session must open on its match, not at the top or the tail"
+        );
+        assert!(
+            !app.preview_follow_bottom,
+            "a jump replaces the bottom anchor rather than fighting it next frame"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A name-only board marks the query but never moves the pane.
+    #[test]
+    fn a_name_only_board_marks_without_scrolling() {
+        let dir = unique_temp_dir("jump-name-only");
+        let (width, height) = JUMP_PANE;
+
+        // Name-only: the LABEL carries the query, so the row survives the filter.
+        let mut labelled = jump_session_at(&dir, "sess-jump-1");
+        labelled.label = format!("{JUMP_QUERY} telemetry rollout");
+        let mut app = App::new(vec![labelled], Scope::All, PathBuf::from("/tmp/launch"));
+        assert_eq!(app.search_mode, SearchMode::NameOnly);
+        app.push_query_str(JUMP_QUERY);
+        preview_buffer(&mut app, width, height);
+        let name_only_offset = app.preview_scroll;
+        assert!(
+            app.has_preview_matches(),
+            "marking still happens in name-only mode"
+        );
+
+        // The bottom anchor, untouched: what the board has always done.
+        let mut plain = App::new(
+            vec![jump_session_at(&dir, "sess-jump-1")],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        preview_buffer(&mut plain, width, height);
+        assert_eq!(
+            name_only_offset, plain.preview_scroll,
+            "a name-only search must leave the pane where an unsearched board puts it"
+        );
+
+        // The same board searching CONTENT does move — so the assertion above is
+        // about the MODE, not about a jump that never works.
+        let mut content = jump_app(&dir);
+        preview_buffer(&mut content, width, height);
+        assert_ne!(
+            content.preview_scroll, name_only_offset,
+            "content mode must scroll onto the match"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A jump requested while a DRAFT CARD owns the pane is dropped, not deferred.
+    ///
+    /// The card replaces the transcript, so the matched line indices address text
+    /// that is not on screen. Deferring the request would fire it on whatever frame
+    /// follows the card — moving a pane the user had already put somewhere.
+    #[test]
+    fn a_draft_card_swallows_the_match_jump() {
+        let dir = unique_temp_dir("jump-card");
+        let (width, height) = JUMP_PANE;
+        let mut app = jump_app(&dir);
+        // What the jump WOULD have done, measured on its own board.
+        let mut reference = jump_app(&dir);
+        preview_buffer(&mut reference, width, height);
+        let jump_offset = reference.preview_scroll;
+
+        // The card takes the pane before the jump is ever drawn.
+        crate::tui::compose::open_background(&mut app, Some("planner".to_string()));
+        let carded = preview_buffer(&mut app, width, height);
+        assert!(
+            (0..height)
+                .map(|y| row_text(&carded, y, width))
+                .any(|row| row.contains(DRAFT_CARD_HEADLINE)),
+            "the card must own the pane"
+        );
+
+        app.close_compose();
+        preview_buffer(&mut app, width, height);
+        assert_ne!(
+            app.preview_scroll, jump_offset,
+            "the request must be dropped with the card, not deferred onto the \
+             transcript that comes back"
+        );
+        assert!(
+            app.preview_follow_bottom,
+            "and the pane keeps the anchor it had"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Widening the search with `Tab` opens the pane on the match it just admitted.
+    ///
+    /// The row here is one the user found BY NAME and is already looking at, so the
+    /// mode flip moves no selection — the flip itself is the whole event. The gate
+    /// on the automatic jump is the mode, so opening that gate is a query change in
+    /// every way that matters: the same text now matches the transcript too, and the
+    /// pane owes the same answer a keystroke gets. It used to sit at the tail until
+    /// the user typed one more character.
+    #[test]
+    fn widening_the_search_to_content_opens_the_pane_on_the_match() {
+        let dir = unique_temp_dir("jump-widen");
+        let (width, height) = JUMP_PANE;
+
+        // What typing this query in content mode does, measured on its own board.
+        let mut reference = jump_app(&dir);
+        preview_buffer(&mut reference, width, height);
+        let jump_offset = reference.preview_scroll;
+
+        // The LABEL says the query too, so the row is on the board in both modes and
+        // no selection changes across the toggle.
+        let mut labelled = jump_session_at(&dir, "sess-jump-1");
+        labelled.label = format!("{JUMP_QUERY} telemetry rollout");
+        let mut app = App::new(vec![labelled], Scope::All, PathBuf::from("/tmp/launch"));
+        assert_eq!(app.search_mode, SearchMode::NameOnly, "the default mode");
+        app.push_query_str(JUMP_QUERY);
+        preview_buffer(&mut app, width, height);
+        let parked = app.preview_scroll;
+        assert_ne!(
+            parked, jump_offset,
+            "a name-only board must start away from the match, or this proves nothing"
+        );
+        let before = app.selected.clone();
+
+        app.toggle_search_mode();
+        assert_eq!(
+            app.selected, before,
+            "the row never left the board, so no selection change can be what moves \
+             the pane below"
+        );
+        preview_buffer(&mut app, width, height);
+        assert_eq!(
+            app.preview_scroll, jump_offset,
+            "Tab must open the pane on the match, not leave it at the tail until \
+             the next keystroke"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A jump requested while the pane is HIDDEN is dropped, not deferred.
+    ///
+    /// `Ctrl-/` takes the pane away without clearing anything behind it, so a query
+    /// typed while it is gone still arms the one-shot and `render_preview` — its only
+    /// consumer — never runs. Left armed, it fires on the frame the pane comes BACK
+    /// on: the user re-opens the preview expecting the newest turn (what the toggle
+    /// promises) and lands on a match from a query they have since moved on from.
+    #[test]
+    fn a_hidden_pane_swallows_the_match_jump() {
+        let dir = unique_temp_dir("jump-hidden");
+        let (width, height) = JUMP_PANE;
+
+        // The two places this pane can end up: on the match, or at the newest turn.
+        let mut reference = jump_app(&dir);
+        preview_buffer(&mut reference, width, height);
+        let jump_offset = reference.preview_scroll;
+        let mut anchored = App::new(
+            vec![jump_session_at(&dir, "sess-jump-1")],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        preview_buffer(&mut anchored, width, height);
+        let bottom_offset = anchored.preview_scroll;
+        assert_ne!(
+            jump_offset, bottom_offset,
+            "the fixture must tell a jump from the bottom anchor, or this proves nothing"
+        );
+
+        let mut app = App::new(
+            vec![jump_session_at(&dir, "sess-jump-1")],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.toggle_search_mode();
+        app.toggle_preview();
+        assert!(!app.show_preview, "Ctrl-/ takes the pane away");
+
+        // Searching with no pane on screen: the board still draws, and that frame is
+        // where the request has to die.
+        let mut terminal =
+            Terminal::new(TestBackend::new(80, 24)).expect("build an in-memory test terminal");
+        app.push_query_str(JUMP_QUERY);
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("the board must draw with no preview pane");
+
+        // And the pane comes back where its own toggle puts it.
+        app.toggle_preview();
+        preview_buffer(&mut app, width, height);
+        assert_eq!(
+            app.preview_scroll, bottom_offset,
+            "a re-opened pane must show the newest turn, not act on a request no \
+             frame could see"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A jump requested with NOTHING selected is dropped, not deferred.
+    ///
+    /// The empty pane returns before the one-shot's only consumer, so the request
+    /// outlives the frame that could not act on it. It then fires on a later frame in
+    /// NAME-ONLY mode — whose whole rule is that it never moves the pane — because
+    /// the mode gate lives at the arming site and a leaked flag is already past it.
+    #[test]
+    fn an_empty_pane_swallows_the_match_jump() {
+        let dir = unique_temp_dir("jump-empty");
+        let (width, height) = JUMP_PANE;
+        const MISS: &str = "no-such-word-anywhere";
+
+        // Where an unsearched board parks this transcript: the newest turn.
+        let mut anchored = App::new(
+            vec![jump_session_at(&dir, "sess-jump-1")],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        preview_buffer(&mut anchored, width, height);
+        let bottom_offset = anchored.preview_scroll;
+
+        let mut app = App::new(
+            vec![jump_session_at(&dir, "sess-jump-1")],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.toggle_search_mode();
+        app.push_query_str(MISS);
+        assert!(
+            app.selected.is_none(),
+            "the query must empty the board, or the empty pane is never reached"
+        );
+        let empty = preview_buffer(&mut app, width, height);
+        assert!(
+            (0..height)
+                .map(|y| row_text(&empty, y, width))
+                .any(|row| row.contains("No session selected")),
+            "the empty pane must be what that frame drew"
+        );
+
+        // The user gives up and searches by NAME instead. Name-only arms nothing, so
+        // anything that moves the pane from here is the request left over above.
+        app.toggle_search_mode();
+        assert_eq!(app.search_mode, SearchMode::NameOnly);
+        for _ in 0..MISS.chars().count() {
+            app.pop_query_char();
+        }
+        app.push_query_str("telemetry");
+        assert!(
+            app.selected.is_some(),
+            "the label carries this word, so the row comes back"
+        );
+        let geo = jump_geometry(&mut app, JUMP_PANE);
+        assert_ne!(
+            match_jump_offset(geo.rows_above, geo.inner_h),
+            bottom_offset,
+            "the fixture must tell a leaked jump from the anchor, or this proves nothing"
+        );
+
+        preview_buffer(&mut app, width, height);
+        assert_eq!(
+            app.preview_scroll, bottom_offset,
+            "a name-only board sits at the newest turn: a dropped request must not \
+             fire on a later frame"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `Shift-Up` / `Shift-Down` walk the pane between MARKED LINES, and clamp.
+    #[test]
+    fn the_shift_arrow_step_walks_between_marked_lines() {
+        let dir = unique_temp_dir("jump-step");
+        let (width, height) = JUMP_PANE;
+        let mut app = jump_app(&dir);
+        preview_buffer(&mut app, width, height);
+        let geo = jump_geometry(&mut app, JUMP_PANE);
+        let last = app.preview_scroll;
+        assert_eq!(
+            last,
+            match_jump_offset(geo.rows_above, geo.inner_h),
+            "the pane opens on the last match"
+        );
+
+        // Back one match.
+        app.preview_match_step(false);
+        preview_buffer(&mut app, width, height);
+        let previous = app.preview_scroll;
+        assert!(
+            previous < last,
+            "stepping back must move toward the older match, got {previous} then {last}"
+        );
+        let earlier = app
+            .preview_match_target()
+            .expect("the step parks on a concrete match");
+        assert!(earlier < geo.target, "and on an EARLIER line");
+        assert_eq!(
+            row_text(
+                &preview_buffer(&mut app, width, height),
+                1 + geo.lead as u16,
+                width
+            ),
+            first_wrapped_row(&geo.lines[earlier], geo.inner_w),
+            "the earlier match must be parked at the same lead"
+        );
+
+        // Clamped at the first match rather than wrapping to the far end.
+        app.preview_match_step(false);
+        preview_buffer(&mut app, width, height);
+        assert_eq!(
+            app.preview_scroll, previous,
+            "a step past the first match re-centers on it"
+        );
+
+        // Forward again, back to where it started.
+        app.preview_match_step(true);
+        preview_buffer(&mut app, width, height);
+        assert_eq!(app.preview_scroll, last, "and forward returns to the last");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Put a quick reply in flight for the PREVIEWED session — so the pane has a live
+    /// tail that wants the bottom — and hand back the rows that tail occupies.
+    ///
+    /// The baseline is the transcript's own turn count, so the `▶ you` echo has not
+    /// been overtaken by a real turn on disk yet: the tail is at its tallest, which is
+    /// the state a send spends its first seconds in.
+    fn send_in_flight(app: &mut App, id: &str, inner_w: u16) -> usize {
+        app.sending = Some(super::super::app::Sending {
+            session_id: id.to_string(),
+            message: "any update on the rollout?".to_string(),
+            baseline_msg_count: JUMP_TURNS,
+        });
+        let tail =
+            sending_tail(app, inner_w).expect("the send must be in flight for the previewed row");
+        wrapped_text_rows(&tail, inner_w)
+    }
+
+    /// The offset that shows the last row of a transcript plus an in-flight reply's
+    /// tail — where a pane that follows the bottom sits.
+    fn bottom_offset(content_h: usize, tail_rows: usize, inner_h: u16) -> u16 {
+        (content_h + tail_rows - usize::from(inner_h)) as u16
+    }
+
+    /// A match jump holds the pane for the WHOLE of an in-flight reply, not for the
+    /// one frame that resolved it.
+    ///
+    /// The jump is a one-shot; a send is in flight for its whole multi-second life and
+    /// its spinner redraws the board every tick. So a pane that followed the bottom
+    /// whenever a send was in flight agreed with the jump on the frame that resolved
+    /// it and snapped back to the newest turn on the very next one — which is every
+    /// frame the reader actually looks at. One frame proves nothing here, so both are
+    /// asserted, on the DRAWN row: what the reader lost was the view.
+    #[test]
+    fn the_match_jump_outlives_the_frames_of_an_in_flight_reply() {
+        let dir = unique_temp_dir("jump-sending");
+        let (width, height) = JUMP_PANE;
+        let mut app = jump_app(&dir);
+        let geo = jump_geometry(&mut app, JUMP_PANE);
+        let tail_rows = send_in_flight(&mut app, "sess-jump-1", geo.inner_w);
+
+        // The tail must want a DIFFERENT offset than the jump, or nothing here can
+        // tell the two apart.
+        let bottom = bottom_offset(geo.content_h, tail_rows, geo.inner_h);
+        let parked = match_jump_offset(geo.rows_above, geo.inner_h);
+        assert!(
+            parked < bottom,
+            "the match must sit above the in-flight tail, or the jump and the bottom \
+             anchor agree (parked={parked}, bottom={bottom})"
+        );
+
+        // Frame N: the jump resolves.
+        let matched_row = first_wrapped_row(&geo.lines[geo.target], geo.inner_w);
+        let first = preview_buffer(&mut app, width, height);
+        assert_eq!(app.preview_scroll, parked, "frame N must honour the jump");
+        assert_eq!(
+            row_text(&first, 1 + geo.lead as u16, width),
+            matched_row,
+            "frame N must park the matched line at the lead; drawn: {:?}",
+            (0..height)
+                .map(|y| row_text(&first, y, width))
+                .collect::<Vec<_>>()
+        );
+
+        // Frame N+1: nothing happened but the spinner's redraw — which is what the
+        // send does several times a second until it completes.
+        app.tick += 1;
+        let second = preview_buffer(&mut app, width, height);
+        assert_eq!(
+            app.preview_scroll, parked,
+            "the next frame must not undo the jump the reader just asked for"
+        );
+        assert_eq!(
+            row_text(&second, 1 + geo.lead as u16, width),
+            matched_row,
+            "and must still be painting the matched line at the lead; drawn: {:?}",
+            (0..height)
+                .map(|y| row_text(&second, y, width))
+                .collect::<Vec<_>>()
+        );
+
+        // `End` is how the reader hands the pane back, and the SAME in-flight reply
+        // then streams in at the tail — so holding the jump cannot have cost the
+        // ordinary reply its auto-follow.
+        app.preview_bottom();
+        let ended = preview_buffer(&mut app, width, height);
+        assert_eq!(
+            app.preview_scroll, bottom,
+            "End must hand the pane back to the newest row"
+        );
+        assert!(
+            row_text(&ended, height - 2, width).contains(REPLY_COOKING_LABEL),
+            "and the in-flight reply must be what is drawn there; drawn: {:?}",
+            (0..height)
+                .map(|y| row_text(&ended, y, width))
+                .collect::<Vec<_>>()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pane the reader positioned during a send STAYS there — including when they
+    /// scroll DOWN past the last row.
+    ///
+    /// The release half of the anchor: `preview_follow_bottom` cleared means "the
+    /// reader put this pane here", and only a key that says otherwise (`End`, another
+    /// row, the preview toggle) takes it back. A scroll states a POSITION, never a
+    /// subscription: paging down past the end of everything there is lands on the last
+    /// row and stops, so the reply still being written does not drag the pane along.
+    /// Proven by GROWING the transcript afterwards, since a pane parked on today's
+    /// last row and a pane following the newest one draw identically until one
+    /// arrives.
+    #[test]
+    fn a_scroll_past_the_end_leaves_the_pane_where_the_reader_put_it() {
+        let dir = unique_temp_dir("jump-scroll-back");
+        let (width, height) = JUMP_PANE;
+        let mut app = jump_app(&dir);
+        let geo = jump_geometry(&mut app, JUMP_PANE);
+        let tail_rows = send_in_flight(&mut app, "sess-jump-1", geo.inner_w);
+        let bottom = bottom_offset(geo.content_h, tail_rows, geo.inner_h);
+
+        // Spend the query's pending jump on a frame of its own, so what positions the
+        // pane below is the reader's own scrolling and nothing else.
+        preview_buffer(&mut app, width, height);
+
+        // The reader reads the start of the transcript while the reply cooks.
+        app.preview_top();
+        preview_buffer(&mut app, width, height);
+        assert_eq!(
+            app.preview_scroll, 0,
+            "the pane must stay where the reader put it"
+        );
+        app.tick += 1;
+        preview_buffer(&mut app, width, height);
+        assert_eq!(
+            app.preview_scroll, 0,
+            "and stay there on the next frame too, not just the first"
+        );
+
+        // Then they page back down, past the end of everything there is.
+        let pages = geo.content_h / usize::from(geo.inner_h) + 2;
+        for _ in 0..pages {
+            app.preview_page_down();
+        }
+        assert!(
+            app.preview_scroll > bottom,
+            "the fixture must really ask for rows past the last one (asked {}, \
+             bottom={bottom})",
+            app.preview_scroll
+        );
+        assert!(
+            !app.preview_follow_bottom,
+            "a scroll states where to look, never a request to keep following the \
+             newest turn"
+        );
+        let landed = preview_buffer(&mut app, width, height);
+        assert_eq!(
+            app.preview_scroll, bottom,
+            "the overshoot clamps onto the newest row"
+        );
+        assert!(
+            row_text(&landed, height - 2, width).contains(REPLY_COOKING_LABEL),
+            "which is where the in-flight reply is; drawn: {:?}",
+            (0..height)
+                .map(|y| row_text(&landed, y, width))
+                .collect::<Vec<_>>()
+        );
+        let top = row_text(&landed, 1, width);
+
+        // Claude writes the reply: the transcript GROWS under the pane. A pane that
+        // had been handed back to the tail would ride down with it; this one was
+        // never handed back, so it keeps showing the rows the reader stopped on.
+        const LANDED_TURNS: usize = JUMP_TURNS + 4;
+        app.apply_sessions(vec![jump_session_of(&dir, "sess-jump-1", LANDED_TURNS)]);
+        let grown = content_height(&mut app, width);
+        assert!(
+            grown > geo.content_h + usize::from(geo.inner_h),
+            "the reply must add more than a viewport, or a parked pane could still \
+             show the tail (was {}, now {grown})",
+            geo.content_h
+        );
+        // The tail shrinks as the transcript grows: the turn count has passed the
+        // send-time baseline, so the `▶ you` echo yields to the real turn on disk and
+        // only the pending `● claude` placeholder is left.
+        let landed_tail = wrapped_text_rows(
+            &sending_tail(&app, geo.inner_w).expect("the send is still in flight"),
+            geo.inner_w,
+        );
+        assert!(
+            landed_tail < tail_rows,
+            "the echo must have yielded to the real turn (was {tail_rows}, now \
+             {landed_tail})"
+        );
+        let following = bottom_offset(grown, landed_tail, geo.inner_h);
+        assert!(
+            following > bottom,
+            "the new turns must move the bottom, or a followed pane would sit still \
+             too (was {bottom}, now {following})"
+        );
+        let after = preview_buffer(&mut app, width, height);
+        assert_eq!(
+            app.preview_scroll, bottom,
+            "scrolling to the end is not a subscription to whatever lands next"
+        );
+        assert_eq!(
+            row_text(&after, 1, width),
+            top,
+            "so the reader keeps reading the row they were on; drawn: {:?}",
+            (0..height)
+                .map(|y| row_text(&after, y, width))
+                .collect::<Vec<_>>()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Park the reader a quarter page above the newest turn and hand back that
+    /// offset, with the query's pending jump already spent on a frame of its own.
+    ///
+    /// Near the tail on purpose: that is where a LATER clamp — a wider pane, a
+    /// shorter transcript — can cut the offset short, which is the state the two
+    /// CLAMP tests below are about; far from it, nothing clamps and they prove
+    /// nothing.
+    fn reader_parked_near_the_tail(app: &mut App, (width, height): (u16, u16)) -> u16 {
+        preview_buffer(app, width, height);
+        app.preview_bottom();
+        preview_buffer(app, width, height);
+        app.preview_half_up();
+        let chosen = app.preview_scroll;
+        assert!(
+            !app.preview_follow_bottom,
+            "scrolling up must hand the pane to the reader"
+        );
+        preview_buffer(app, width, height);
+        assert_eq!(
+            app.preview_scroll, chosen,
+            "and the pane must sit where they put it, or nothing below is clamped"
+        );
+        chosen
+    }
+
+    /// A RESIZE that cuts a reader's offset short must not hand the pane back to the
+    /// tail.
+    ///
+    /// Widening the pane wraps the same transcript into fewer rows, so an offset the
+    /// reader chose can stop existing and the clamp cuts it back to the last row.
+    /// That is the geometry moving under a reader who pressed nothing, and the draw
+    /// site may not read it as a request: only a key re-arms the anchor. Inferring
+    /// one here gave the pane away on the next turn that landed.
+    ///
+    /// Proven by GROWING the transcript afterwards, since a pane parked on today's
+    /// last row and one following the newest draw identically until one arrives.
+    #[test]
+    fn a_resize_that_clamps_the_offset_leaves_the_pane_where_the_reader_put_it() {
+        let dir = unique_temp_dir("anchor-resize");
+        let (narrow, height) = JUMP_PANE;
+        // Twice the columns: the same turns wrap into far fewer rows, which is what
+        // makes the reader's offset unreachable at the new size.
+        let wide = narrow * 2;
+        let mut app = jump_app(&dir);
+        let chosen = reader_parked_near_the_tail(&mut app, JUMP_PANE);
+
+        // The terminal is widened. Nothing the reader did.
+        preview_buffer(&mut app, wide, height);
+        let clamped = app.preview_scroll;
+        assert!(
+            clamped < chosen,
+            "the resize must really cut the offset short, or the re-arm this pins \
+             was never reached (was {chosen}, now {clamped})"
+        );
+        let held = preview_buffer(&mut app, wide, height);
+        let top = row_text(&held, 1, wide);
+
+        // The session gains turns — the only thing that can tell a pane parked on the
+        // last row from one following the newest.
+        const GROWN_TURNS: usize = JUMP_TURNS + 8;
+        app.apply_sessions(vec![jump_session_of(&dir, "sess-jump-1", GROWN_TURNS)]);
+        let following = content_height(&mut app, wide) - usize::from(height - 2);
+        assert!(
+            following > usize::from(clamped),
+            "the new turns must move the bottom, or a followed pane would sit still \
+             too (bottom={following}, pane={clamped})"
+        );
+        let after = preview_buffer(&mut app, wide, height);
+        assert_eq!(
+            app.preview_scroll, clamped,
+            "a resize is not a request to follow the newest turn"
+        );
+        assert_eq!(
+            row_text(&after, 1, wide),
+            top,
+            "so the reader keeps reading the row they were on; drawn: {:?}",
+            (0..height)
+                .map(|y| row_text(&after, y, wide))
+                .collect::<Vec<_>>()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A transcript that SHRINKS under a reader's offset must not hand the pane back
+    /// to the tail either.
+    ///
+    /// The same clamp, reached the other way: the pane held still and the content
+    /// moved. A re-read that renders fewer rows than the reader had scrolled past
+    /// leaves an offset the content cannot satisfy, and the clamp cuts it to the last
+    /// row exactly as the resize did — a fact about the transcript's new height, and
+    /// no more a request than the resize was.
+    #[test]
+    fn a_shrinking_transcript_leaves_the_pane_where_the_reader_put_it() {
+        let dir = unique_temp_dir("anchor-shrink");
+        let (width, height) = JUMP_PANE;
+        // Short enough that the reader's offset is past everything left, and still
+        // long enough to hold both hit turns (so the row keeps its marks).
+        const SHRUNK_TURNS: usize = 6;
+        let mut app = jump_app(&dir);
+        let chosen = reader_parked_near_the_tail(&mut app, JUMP_PANE);
+
+        // The transcript is re-read shorter. Nothing the reader did.
+        app.apply_sessions(vec![jump_session_of(&dir, "sess-jump-1", SHRUNK_TURNS)]);
+        preview_buffer(&mut app, width, height);
+        let clamped = app.preview_scroll;
+        assert!(
+            clamped < chosen,
+            "the shrink must really cut the offset short, or the re-arm this pins \
+             was never reached (was {chosen}, now {clamped})"
+        );
+        let held = preview_buffer(&mut app, width, height);
+        let top = row_text(&held, 1, width);
+
+        // And the turns come back.
+        app.apply_sessions(vec![jump_session_at(&dir, "sess-jump-1")]);
+        let following = content_height(&mut app, width) - usize::from(height - 2);
+        assert!(
+            following > usize::from(clamped),
+            "the restored turns must move the bottom, or a followed pane would sit \
+             still too (bottom={following}, pane={clamped})"
+        );
+        let after = preview_buffer(&mut app, width, height);
+        assert_eq!(
+            app.preview_scroll, clamped,
+            "a transcript changing height is not a request to follow the newest turn"
+        );
+        assert_eq!(
+            row_text(&after, 1, width),
+            top,
+            "so the reader keeps reading the row they were on; drawn: {:?}",
+            (0..height)
+                .map(|y| row_text(&after, y, width))
+                .collect::<Vec<_>>()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every drawn row of a preview buffer, borders included, for whole-pane
+    /// comparisons.
+    fn buffer_rows(buffer: &ratatui::buffer::Buffer, width: u16, height: u16) -> Vec<String> {
+        (0..height)
+            .map(|y| full_row_text(buffer, y, width))
+            .collect()
+    }
+
+    /// Render ONLY the preview pane and hand back the buffer, so a marked cell can
+    /// be read without the list's own `REVERSED` selection highlight in the frame.
+    fn preview_buffer(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height))
+            .expect("build an in-memory test terminal");
+        terminal
+            .draw(|frame| render_preview(frame, app, frame.area()))
+            .expect("render_preview must not panic");
+        terminal.backend().buffer().clone()
+    }
+
+    /// Every contiguous run of cells carrying [`PREVIEW_MATCH_MODIFIER`], as text.
+    ///
+    /// Reads what was DRAWN rather than what the model intended: a mark that never
+    /// reached a cell is not a highlight (PATTERNS — assert drawn cells).
+    fn marked_runs(buffer: &ratatui::buffer::Buffer, width: u16, height: u16) -> Vec<String> {
+        let mut runs: Vec<String> = Vec::new();
+        for y in 0..height {
+            let mut run = String::new();
+            for x in 0..width {
+                let marked = buffer.cell((x, y)).is_some_and(|cell| {
+                    cell.modifier.contains(PREVIEW_MATCH_MODIFIER)
+                        && !cell.symbol().trim().is_empty()
+                });
+                match (marked, run.is_empty()) {
+                    (true, _) => run.push_str(
+                        buffer
+                            .cell((x, y))
+                            .expect("a cell that was just read")
+                            .symbol(),
+                    ),
+                    (false, false) => runs.push(std::mem::take(&mut run)),
+                    (false, true) => {}
+                }
+            }
+            if !run.is_empty() {
+                runs.push(run);
+            }
+        }
+        runs
+    }
+
+    /// The transcript marks the active query where it occurs — and marks NOTHING
+    /// else, so the pane cannot claim a hit the query did not make.
+    ///
+    /// This is the content-search counterpart of the row-label highlight, and it is
+    /// derived by re-searching the RENDERED lines: a position taken from
+    /// `content_index` would address a different, lossy extraction of the same
+    /// transcript and land on unrelated text here.
+    #[test]
+    fn the_preview_marks_the_query_where_it_occurs_in_the_transcript() {
+        let (width, height) = MARK_PANE;
+        let mut app = App::new(
+            vec![markable_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+
+        // Control: with no query, nothing is marked — so the assertion below can
+        // actually fail.
+        let clean = preview_buffer(&mut app, width, height);
+        assert!(
+            marked_runs(&clean, width, height).is_empty(),
+            "an unsearched transcript must carry no marks"
+        );
+
+        app.push_query_str(MARK_QUERY);
+        assert!(
+            app.selected.is_some(),
+            "the query must keep the session on the board, or nothing is previewed"
+        );
+        let drawn = preview_buffer(&mut app, width, height);
+        let runs = marked_runs(&drawn, width, height);
+        assert!(
+            !runs.is_empty(),
+            "the query occurs in this transcript and must be marked; rows: {:?}",
+            (0..height)
+                .map(|y| row_text(&drawn, y, width))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            runs.iter().all(|run| run == MARK_QUERY),
+            "only the query may be marked, got: {runs:?}"
+        );
+    }
+
+    /// Marking is a property of the QUERY, not of which haystack the filter is
+    /// searching: both modes mark the same occurrences, because the seam scores the
+    /// query against the display string either way.
+    #[test]
+    fn the_preview_marks_the_query_in_both_search_modes() {
+        let (width, height) = MARK_PANE;
+        let mut session = markable_session();
+        // A content hit as well as a label hit, so the row survives EITHER mode.
+        session.content_index = "the webhook keeps failing".to_string();
+        let mut app = App::new(vec![session], Scope::All, PathBuf::from("/tmp/launch"));
+        app.push_query_str(MARK_QUERY);
+        assert_eq!(app.search_mode, SearchMode::NameOnly, "the default mode");
+        let name_only = marked_runs(&preview_buffer(&mut app, width, height), width, height);
+        assert!(!name_only.is_empty(), "name-only mode must mark the query");
+
+        app.toggle_search_mode();
+        assert_eq!(app.search_mode, SearchMode::NameAndContent);
+        assert!(
+            app.selected.is_some(),
+            "the row must survive the wider mode too"
+        );
+        let both = marked_runs(&preview_buffer(&mut app, width, height), width, height);
+        assert_eq!(both, name_only, "widening the filter marks the same runs");
+    }
+
+    /// A NEW-SESSION draft card is a placeholder for a session that does not exist
+    /// yet: it has no transcript, so nothing on it can be a search hit.
+    ///
+    /// The trap this pins is precise. The match map is keyed by the TRANSCRIPT's
+    /// line indices, and the card replaces those lines with four of its own — so an
+    /// unsuppressed mark lands on whatever characters of the card happen to sit at
+    /// the transcript's matched positions, marking words the user never searched
+    /// for.
+    #[test]
+    fn a_draft_card_carries_no_search_marks() {
+        let (width, height) = CARD_PANE;
+        let mut app = App::new(
+            vec![markable_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        // A query whose matches land at LOW char positions on the transcript's
+        // first lines — i.e. positions the short card lines also have, so a
+        // leaked mark would really be drawn.
+        app.push_query_str("the");
+        let transcript = preview_buffer(&mut app, width, height);
+        assert!(
+            !marked_runs(&transcript, width, height).is_empty(),
+            "the transcript must mark this query, or the card proves nothing"
+        );
+
+        crate::tui::compose::open_background(&mut app, Some("planner".to_string()));
+        let carded = preview_buffer(&mut app, width, height);
+        let rows: Vec<String> = (0..height)
+            .map(|y| row_text(&carded, y, width))
+            .collect::<Vec<_>>();
+        assert!(
+            rows.iter().any(|row| row.contains(DRAFT_CARD_HEADLINE)),
+            "the pane must be showing the card: {rows:?}"
+        );
+        assert!(
+            marked_runs(&carded, width, height).is_empty(),
+            "a draft card must carry no search marks: {rows:?}"
         );
     }
 

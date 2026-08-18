@@ -33,13 +33,14 @@
 //! | `Ctrl-O` (in the agent picker) | start the highlighted agent INTERACTIVELY at once, skipping the draft — the same verb `Ctrl-O` names inside the draft, so BOTH routes out of the picker cost exactly one key. Bound on the picker alone — inert on every other modal |
 //! | `Ctrl-R` | quick-reply: send a one-shot message to the selected session without leaving the board. An agent whose run is OVER (`done` / `stopped` / `failed`) is stopped first so the reply lands in place; `needs input` confirms first; `working` / `idle` / `interrupted` / an unrecognized qualifier is refused (see [`send::reply_gate`]) |
 //! | `Ctrl-K` | stop / interrupt the selected session's live background agent (`claude stop`); an agent whose run is OVER (`done` / `stopped` / `failed`) stops at once, every other live agent confirms first, and a session claude is not holding — or one running interactively, which carries no job id — is refused (see [`send::interrupt_gate`]) |
-//! | `Tab` | toggle name-only vs. name+content search |
+//! | `Tab` | toggle name-only vs. name+content search. Widening to content also opens the preview on the most recent match, exactly as typing does: it goes through the same query funnel, and the mode is the gate that key just opened |
 //! | `Ctrl-A` | flip the scope: current folder <-> project (the launch repo and all of its git worktrees). ONE key for both, because the second is a refinement of the same question the first answers, not a separate mode. Launched with `--all`/`-a` it becomes a three-stop cycle through all folders as well — the whole store is on this key only when the launch flag put it there |
 //! | `Ctrl-X` then `x`/`d`/`h`/`r` | leader chord: hide / hard-delete (this row, or its whole fork lineage) / toggle show-hidden / re-read every transcript from disk (any other key cancels) |
 //! | `Ctrl-/` | toggle the preview pane |
 //! | `PgUp` / `PgDn` | scroll the preview a page (always) |
 //! | `Ctrl-U` / `Ctrl-D` | scroll the preview a quarter page (always) |
 //! | `Home` / `End` | jump the preview to top / bottom (always) |
+//! | `Shift-Up` / `Shift-Down` | scroll the preview onto the previous / next MARKED line, but only while the query marks something in the previewed transcript; with nothing marked they fall through to plain selection movement. One stop per marked LINE, not per occurrence — a line saying the query twice is marked, and stopped at, once |
 //! | `Backspace` | delete the last query character |
 //! | printable char | type-to-search (append to the query) |
 //! | terminal paste | inserted as TEXT — never as keystrokes (see below) |
@@ -49,7 +50,10 @@
 //! `j`/`k`/`q` are disambiguated by whether the query is empty: in the default
 //! browse state they navigate/quit; once you are typing a query they become
 //! ordinary search input. Arrows, `Enter`, `Tab`, and every `Ctrl-` binding
-//! work regardless of the query, so search is never blocked.
+//! work regardless of the query, so search is never blocked. The SHIFTED arrows
+//! are disambiguated the same way, by whether there is anything marked to move
+//! between — and fall through to the unshifted binding when there is not, so a
+//! terminal that drops the modifier still moves the selection.
 //!
 //! ## Terminal paste
 //!
@@ -141,6 +145,10 @@ pub enum Action {
     PreviewTop,
     /// Jump the preview to the bottom / re-follow the newest turn (`End`).
     PreviewBottom,
+    /// Scroll the preview onto the NEXT marked line (`Shift-Down`).
+    PreviewMatchNext,
+    /// Scroll the preview onto the PREVIOUS marked line (`Shift-Up`).
+    PreviewMatchPrev,
     /// Append a character to the query (type-to-search).
     Insert(char),
     /// Delete the last query character.
@@ -214,11 +222,21 @@ impl Outcome {
 
 /// Map a keypress to an [`Action`]. `query_empty` disambiguates the `j`/`k`/`q`
 /// keys: they navigate/quit only in the default browse state and are otherwise
-/// ordinary search input.
+/// ordinary search input. `has_preview_matches` ([`App::has_preview_matches`])
+/// decides whether the SHIFTED arrows have anywhere to go.
+///
+/// The shifted arrows are bound CONDITIONALLY and fall through to plain selection
+/// movement otherwise, which buys two things at once. With no query — or a query
+/// the previewed transcript does not say — `Shift-Up` is bit-for-bit the
+/// `MoveUp` it has always been, so nothing a user already relies on changes. And
+/// on a terminal that drops the modifier (or a multiplexer that eats the `CSI
+/// 1;2A` form), the key arrives as a bare arrow and still moves the selection,
+/// which is the graceful degradation rather than a dead key.
 #[must_use]
-pub fn key_to_action(key: KeyEvent, query_empty: bool) -> Action {
+pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool) -> Action {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
     if ctrl {
         return match key.code {
@@ -245,6 +263,18 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool) -> Action {
     }
 
     match key.code {
+        // Search-match navigation, on the SHIFTED arrows and only while there is
+        // something marked to move between. It steps between marked LINES, not
+        // between every occurrence: a line can carry several marked runs and is
+        // still one stop, because a stop is a place to look and a line is what the
+        // jump can scroll to. Deliberately NOT on Alt: snapback never pushes the kitty
+        // keyboard protocol and actively clears it on every board (re)entry
+        // (`tui::reset_terminal_state`), so Alt+arrow arrives on default macOS
+        // terminals as a composed character that types junk into the query, and a
+        // split ESC read surfaces as a bare `Esc` — which quits the board. `Shift`
+        // needs none of that: it rides the ordinary `CSI 1;2A`/`B` encoding.
+        KeyCode::Up if shift && !query_empty && has_preview_matches => Action::PreviewMatchPrev,
+        KeyCode::Down if shift && !query_empty && has_preview_matches => Action::PreviewMatchNext,
         KeyCode::Up => Action::MoveUp,
         KeyCode::Down => Action::MoveDown,
         // Fork-lineage fold toggle, on the canonical tree idiom. Bound OUTSIDE
@@ -351,7 +381,8 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
             // A transient status (e.g. a resume refusal) lives exactly until the
             // next key; clear it first so this keypress may set a fresh one.
             app.clear_status();
-            apply_action(app, key_to_action(key, app.query.is_empty()))
+            let action = key_to_action(key, app.query.is_empty(), app.has_preview_matches());
+            apply_action(app, action)
         }
         // Mouse wheel scroll and splitter drag. A dedicated arm BEFORE the
         // input catch-all and INDEPENDENT of the modal overlay gate above:
@@ -919,6 +950,14 @@ fn apply_action(app: &mut App, action: Action) -> Outcome {
         }
         Action::PreviewBottom => {
             app.preview_bottom();
+            Outcome::Continue
+        }
+        Action::PreviewMatchNext => {
+            app.preview_match_step(true);
+            Outcome::Continue
+        }
+        Action::PreviewMatchPrev => {
+            app.preview_match_step(false);
             Outcome::Continue
         }
         Action::Insert(c) => {
@@ -1558,6 +1597,14 @@ mod tests {
 
     fn ctrl(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    /// The SHIFT-modified form crossterm decodes `CSI 1;2A` / `CSI 1;2B` into
+    /// (`parse_csi_modifier_key_code` maps the final `A`/`B` to `Up`/`Down` and the
+    /// `2` parameter to this modifier), which is what a terminal sends for
+    /// `Shift-Up` / `Shift-Down`.
+    fn shift(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::SHIFT)
     }
 
     /// A synthetic session addressable by id (cwd/file are not exercised by the
@@ -3919,27 +3966,84 @@ mod tests {
 
     #[test]
     fn arrows_always_move() {
-        assert_eq!(key_to_action(key(KeyCode::Up), true), Action::MoveUp);
-        assert_eq!(key_to_action(key(KeyCode::Down), true), Action::MoveDown);
+        assert_eq!(key_to_action(key(KeyCode::Up), true, false), Action::MoveUp);
+        assert_eq!(
+            key_to_action(key(KeyCode::Down), true, false),
+            Action::MoveDown
+        );
         // Arrows navigate even mid-query.
-        assert_eq!(key_to_action(key(KeyCode::Up), false), Action::MoveUp);
-        assert_eq!(key_to_action(key(KeyCode::Down), false), Action::MoveDown);
+        assert_eq!(
+            key_to_action(key(KeyCode::Up), false, false),
+            Action::MoveUp
+        );
+        assert_eq!(
+            key_to_action(key(KeyCode::Down), false, false),
+            Action::MoveDown
+        );
+        // And an UNSHIFTED arrow keeps moving even when the preview HAS marks —
+        // the new binding takes the shifted form alone.
+        assert_eq!(key_to_action(key(KeyCode::Up), false, true), Action::MoveUp);
+        assert_eq!(
+            key_to_action(key(KeyCode::Down), false, true),
+            Action::MoveDown
+        );
+    }
+
+    /// With nothing marked to move between, the SHIFTED arrows are bit-for-bit the
+    /// plain arrows they have always been.
+    ///
+    /// This is the whole safety argument for putting a binding on a modifier the
+    /// board never used: a user who never searches loses nothing, and a terminal or
+    /// multiplexer that drops the modifier degrades to a working key rather than a
+    /// dead one. Every state where the guard is unsatisfied is walked, so the
+    /// fall-through cannot be half-implemented.
+    #[test]
+    fn shifted_arrows_fall_through_to_plain_move_with_nothing_marked() {
+        for (query_empty, marked) in [(true, false), (false, false), (true, true)] {
+            assert_eq!(
+                key_to_action(shift(KeyCode::Up), query_empty, marked),
+                Action::MoveUp,
+                "Shift-Up must still move (query_empty={query_empty}, marked={marked})"
+            );
+            assert_eq!(
+                key_to_action(shift(KeyCode::Down), query_empty, marked),
+                Action::MoveDown,
+                "Shift-Down must still move (query_empty={query_empty}, marked={marked})"
+            );
+        }
+    }
+
+    /// Only with a query AND something marked in the previewed transcript do the
+    /// shifted arrows become match navigation.
+    #[test]
+    fn shifted_arrows_step_the_preview_matches_when_something_is_marked() {
+        assert_eq!(
+            key_to_action(shift(KeyCode::Up), false, true),
+            Action::PreviewMatchPrev
+        );
+        assert_eq!(
+            key_to_action(shift(KeyCode::Down), false, true),
+            Action::PreviewMatchNext
+        );
     }
 
     #[test]
     fn jk_navigate_only_when_query_empty() {
         assert_eq!(
-            key_to_action(key(KeyCode::Char('j')), true),
+            key_to_action(key(KeyCode::Char('j')), true, false),
             Action::MoveDown
         );
-        assert_eq!(key_to_action(key(KeyCode::Char('k')), true), Action::MoveUp);
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('k')), true, false),
+            Action::MoveUp
+        );
         // Once typing, j/k are ordinary search input.
         assert_eq!(
-            key_to_action(key(KeyCode::Char('j')), false),
+            key_to_action(key(KeyCode::Char('j')), false, false),
             Action::Insert('j')
         );
         assert_eq!(
-            key_to_action(key(KeyCode::Char('k')), false),
+            key_to_action(key(KeyCode::Char('k')), false, false),
             Action::Insert('k')
         );
     }
@@ -3954,11 +4058,11 @@ mod tests {
         // teeth; it is what fails if these are ever gated like the letter keys.
         for empty in [true, false] {
             assert_eq!(
-                key_to_action(key(KeyCode::Left), empty),
+                key_to_action(key(KeyCode::Left), empty, false),
                 Action::CollapseLineage
             );
             assert_eq!(
-                key_to_action(key(KeyCode::Right), empty),
+                key_to_action(key(KeyCode::Right), empty, false),
                 Action::ExpandLineage
             );
         }
@@ -3966,28 +4070,34 @@ mod tests {
 
     #[test]
     fn q_quits_only_when_query_empty() {
-        assert_eq!(key_to_action(key(KeyCode::Char('q')), true), Action::Quit);
         assert_eq!(
-            key_to_action(key(KeyCode::Char('q')), false),
+            key_to_action(key(KeyCode::Char('q')), true, false),
+            Action::Quit
+        );
+        assert_eq!(
+            key_to_action(key(KeyCode::Char('q')), false, false),
             Action::Insert('q')
         );
     }
 
     #[test]
     fn esc_and_ctrl_c_always_quit() {
-        assert_eq!(key_to_action(key(KeyCode::Esc), true), Action::Quit);
-        assert_eq!(key_to_action(key(KeyCode::Esc), false), Action::Quit);
-        assert_eq!(key_to_action(ctrl(KeyCode::Char('c')), false), Action::Quit);
+        assert_eq!(key_to_action(key(KeyCode::Esc), true, false), Action::Quit);
+        assert_eq!(key_to_action(key(KeyCode::Esc), false, false), Action::Quit);
+        assert_eq!(
+            key_to_action(ctrl(KeyCode::Char('c')), false, false),
+            Action::Quit
+        );
     }
 
     #[test]
     fn enter_resumes_and_ctrl_f_forks() {
         assert_eq!(
-            key_to_action(key(KeyCode::Enter), true),
+            key_to_action(key(KeyCode::Enter), true, false),
             Action::Resume { fork: false }
         );
         assert_eq!(
-            key_to_action(ctrl(KeyCode::Char('f')), false),
+            key_to_action(ctrl(KeyCode::Char('f')), false, false),
             Action::Resume { fork: true }
         );
     }
@@ -3999,11 +4109,11 @@ mod tests {
         // user is mid-query. Both `n` and `N` (Shift) decode the same.
         for empty in [true, false] {
             assert_eq!(
-                key_to_action(ctrl(KeyCode::Char('n')), empty),
+                key_to_action(ctrl(KeyCode::Char('n')), empty, false),
                 Action::NewSession
             );
             assert_eq!(
-                key_to_action(ctrl(KeyCode::Char('N')), empty),
+                key_to_action(ctrl(KeyCode::Char('N')), empty, false),
                 Action::NewSession
             );
         }
@@ -4013,20 +4123,20 @@ mod tests {
     fn toggles_are_reachable_regardless_of_query() {
         // Tab toggles search mode; Ctrl-A scope; Ctrl-/ preview.
         assert_eq!(
-            key_to_action(key(KeyCode::Tab), false),
+            key_to_action(key(KeyCode::Tab), false, false),
             Action::ToggleSearchMode
         );
         assert_eq!(
-            key_to_action(ctrl(KeyCode::Char('a')), false),
+            key_to_action(ctrl(KeyCode::Char('a')), false, false),
             Action::ToggleScope
         );
         assert_eq!(
-            key_to_action(ctrl(KeyCode::Char('/')), false),
+            key_to_action(ctrl(KeyCode::Char('/')), false, false),
             Action::TogglePreview
         );
         // The 0x1f fallback encoding of Ctrl-/ also toggles the preview.
         assert_eq!(
-            key_to_action(ctrl(KeyCode::Char('_')), false),
+            key_to_action(ctrl(KeyCode::Char('_')), false, false),
             Action::TogglePreview
         );
     }
@@ -4037,25 +4147,28 @@ mod tests {
         // or not the user is mid-query.
         for empty in [true, false] {
             assert_eq!(
-                key_to_action(key(KeyCode::PageUp), empty),
+                key_to_action(key(KeyCode::PageUp), empty, false),
                 Action::PreviewPageUp
             );
             assert_eq!(
-                key_to_action(key(KeyCode::PageDown), empty),
+                key_to_action(key(KeyCode::PageDown), empty, false),
                 Action::PreviewPageDown
             );
-            assert_eq!(key_to_action(key(KeyCode::Home), empty), Action::PreviewTop);
             assert_eq!(
-                key_to_action(key(KeyCode::End), empty),
+                key_to_action(key(KeyCode::Home), empty, false),
+                Action::PreviewTop
+            );
+            assert_eq!(
+                key_to_action(key(KeyCode::End), empty, false),
                 Action::PreviewBottom
             );
             // Ctrl-U / Ctrl-D quarter-page, also independent of query state.
             assert_eq!(
-                key_to_action(ctrl(KeyCode::Char('u')), empty),
+                key_to_action(ctrl(KeyCode::Char('u')), empty, false),
                 Action::PreviewHalfUp
             );
             assert_eq!(
-                key_to_action(ctrl(KeyCode::Char('d')), empty),
+                key_to_action(ctrl(KeyCode::Char('d')), empty, false),
                 Action::PreviewHalfDown
             );
         }
@@ -4064,15 +4177,15 @@ mod tests {
     #[test]
     fn printable_characters_type_into_the_query() {
         assert_eq!(
-            key_to_action(key(KeyCode::Char('a')), true),
+            key_to_action(key(KeyCode::Char('a')), true, false),
             Action::Insert('a')
         );
         assert_eq!(
-            key_to_action(key(KeyCode::Char('z')), false),
+            key_to_action(key(KeyCode::Char('z')), false, false),
             Action::Insert('z')
         );
         assert_eq!(
-            key_to_action(key(KeyCode::Backspace), false),
+            key_to_action(key(KeyCode::Backspace), false, false),
             Action::Backspace
         );
     }

@@ -1478,6 +1478,7 @@ dependencies = [
  "rayon",
  "serde_json",
  "time",
+ "unicode-segmentation",
  "unicode-width",
 ]
 
