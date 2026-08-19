@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/ilfroloff/snapback/compare/v0.7.0...v0.8.0) - 2026-08-19
+
+### Added
+
+- mark and scroll to search hits inside the previewed transcript
+
+### Fixed
+
+- stop a two-word content query from matching half the board
+- make the row-label highlight agree with the search filter
+- *(store/parse)* let content search reach a session's recent work
+
 ## [0.7.0](https://github.com/ilfroloff/snapback/compare/v0.6.1...v0.7.0) - 2026-08-11
 
 ### Added
