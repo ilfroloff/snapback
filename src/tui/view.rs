@@ -89,7 +89,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // A modal (the running-session choice or the new-session agent picker) sits
     // ON TOP of the board when open. The two overlays are now one `Option<Modal>`,
     // so at most one ever draws — a fact made structural, not conventional.
-    if let Some(modal) = &app.modal {
+    // Borrowed MUTABLY for the same reason the list is: a `List` modal's scroll
+    // window is resolved against the clamped box and written back (`Modal::scroll`).
+    if let Some(modal) = app.modal.as_mut() {
         render_modal(frame, modal);
     }
     // The "stop the waiting agent?" confirmation overlays the board before compose
@@ -459,6 +461,16 @@ fn project_name(app: &App) -> String {
 /// rightmost text of this line first. No new width logic guards that — the row
 /// has always been two overlaid paragraphs — but the order means the first thing
 /// to go is the least load-bearing one, not the counter or the scope.
+///
+/// An active `Ctrl-X m` model override renders as a `model: <alias>` segment
+/// beside the search mode, and it sits THERE for the same width argument read the
+/// other way: it is the most load-bearing thing on the row, so it goes early
+/// rather than in the tail a narrow terminal drops. It is a sticky mode that
+/// silently re-prices every later hand-off, and the header is the only surface
+/// that can say so over the whole interval it is true (AGENTS.md STATUS-LINE
+/// OWNERSHIP — the status line carries outcomes, not standing facts). With no
+/// override the segment is absent entirely, so an un-overridden board's header is
+/// byte-identical to what it has always drawn.
 fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     let scope = match app.scope {
         Scope::CurrentFolder => format!("folder:{}", launch_dir_name(app)),
@@ -485,12 +497,20 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         Span::raw(HEADER_SEPARATOR),
         Span::raw("search: "),
         Span::styled(mode, Style::default().fg(Color::Yellow)),
-        Span::raw(HEADER_SEPARATOR),
-        Span::styled(
-            format!("{} / {} sessions", counts.visible, counts.total),
-            dim,
-        ),
     ];
+    if let Some(model) = &app.model_override {
+        header.push(Span::raw(HEADER_SEPARATOR));
+        header.push(Span::raw("model: "));
+        header.push(Span::styled(
+            model.clone(),
+            Style::default().fg(Color::Magenta),
+        ));
+    }
+    header.push(Span::raw(HEADER_SEPARATOR));
+    header.push(Span::styled(
+        format!("{} / {} sessions", counts.visible, counts.total),
+        dim,
+    ));
     if counts.hidden > 0 {
         header.push(Span::raw(HEADER_SEPARATOR));
         header.push(Span::styled(format!("{} hidden", counts.hidden), dim));
@@ -2228,9 +2248,27 @@ fn render_search(frame: &mut Frame, app: &mut App, area: Rect) {
 /// the longest form is what has to fit — `expose` (the wider verb) lands it at
 /// exactly 80 columns. Anything added here costs the tail of an 80-column
 /// terminal, so weigh a new verb against `Esc cancel` rather than appending.
+///
+/// `m model` was PAID FOR rather than appended: `h`'s verb went from
+/// `show/hide hidden` to `hidden`, which is the same 10 columns back, so the
+/// widest form is still exactly 80 and `Esc cancel` still lands on screen. `h` was
+/// the one to shorten because it is the only verb here whose full wording carries
+/// no argument of its own — `x` flips to say what the next press does, and `d`
+/// names BOTH targets its confirm offers — and because a key that toggles is
+/// honestly described by its SUBJECT: `h hidden` says which rows it is about, and
+/// the direction is whichever one the board is not in.
+///
+/// The `--model` LAUNCH FLAG pre-arms the very override `m` picks, and is
+/// deliberately NOT named here: this string is a which-key list of the follow-up
+/// KEYS a pending chord binds, so a flag has no key to sit beside — and the budget
+/// above is already exactly spent, so naming it would cost `Esc cancel` its place
+/// on an 80-column terminal. It is documented where a flag belongs (`USAGE` in
+/// `cli.rs`, the key/flag table in [`update`](crate::tui::update), and the README),
+/// and it needs no mention here anyway: `m` re-picks whatever the flag armed, and
+/// the header shows the armed value the whole time.
 fn chord_hint(selected_hidden: bool) -> String {
     let x = if selected_hidden { "expose" } else { "hide" };
-    format!("^X  x {x} · d delete row/lineage · h show/hide hidden · r reload · Esc cancel")
+    format!("^X  x {x} · d delete row/lineage · h hidden · m model · r reload · Esc cancel")
 }
 
 /// The compose zone's key hints, per open draft. Pure so the wording is assertable
@@ -2313,14 +2351,15 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         // The board keymap — one of the five surfaces AGENTS.md's KEEP KEY DOCS IN
         // SYNC names. It does NOT mention the terminal's paste, on COLUMN BUDGET:
-        // this line is already 224 columns (measured with the `unicode-width` the
+        // this line is already 230 columns (measured with the `unicode-width` the
         // renderer counts in) against a help row that is ONE line and never wraps, so
         // on an 80-column terminal it is cut the instant `^K stop` ends and
-        // everything from `^X hide/del` (column 84) rightward is already unpainted.
-        // A 23-column "paste keeps newlines" clause would land at columns 225-247 —
-        // nowhere, on any realistic width. What a board paste DOES (append to the
-        // query with newlines flattened to spaces, and never resume) is documented
-        // where there is room to say it: `KEYS` in `cli.rs` and the README key map.
+        // everything from `^X hide/del/model` (column 84) rightward is already
+        // unpainted. A 23-column "paste keeps newlines" clause would land at columns
+        // 231-253 — nowhere, on any realistic width. What a board paste DOES (append
+        // to the query with newlines flattened to spaces, and never resume) is
+        // documented where there is room to say it: `KEYS` in `cli.rs` and the README
+        // key map.
         //
         // The QUERY WORD-DELETE keys are omitted for exactly the same reason, and
         // just as deliberately. Even the tersest honest clause (`· ⌥⌫ del word`,
@@ -2345,10 +2384,25 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         //
         // `^T/^E` sits beside `Home/End` in the scroll cluster (its twin action, not
         // a separate one) rather than beside `^U/^D`: the scroll cluster already
-        // begins past column 171, so wherever in it a new token lands is equally
+        // begins past column 177, so wherever in it a new token lands is equally
         // off-screen at 80 columns — this placement is purely for readability.
+        //
+        // The chord's third verb is folded INTO its existing token (`hide/del` ->
+        // `hide/del/model`) rather than added as a segment of its own: this line
+        // enumerates the KEYS, and `^X` is one key whose follow-ups the which-key
+        // hint spells out the moment it is armed ([`chord_hint`]). Six more columns
+        // past the 224 this line already ran to cost nothing that was ever painted,
+        // and a second `^X …` segment would read as a second binding.
+        //
+        // The `--model` LAUNCH FLAG that pre-arms the same override is absent for the
+        // same reason the paste is: this is a KEYMAP, and a flag is typed before the
+        // board exists rather than pressed on it — there is no key to name it beside,
+        // and every column here past 80 is unpainted anyway. It lives in `USAGE` in
+        // `cli.rs`, the key/flag table in `tui::update`, and the README key map. What
+        // the board DOES show of it is the header's `model: <alias>` segment, which
+        // is armed identically whichever door set it.
         Line::from(vec![Span::styled(
-            "↑↓ move · ←/→ fold/expand · Enter resume · ^F fork · ^N new · ^R reply · ^K stop · ^X hide/del · type to search · Tab name/content · S-↑↓ match · ^A scope · ^/ preview · PgUp/PgDn·^U/^D·^T/^E·Home/End·wheel scroll · Esc quit",
+            "↑↓ move · ←/→ fold/expand · Enter resume · ^F fork · ^N new · ^R reply · ^K stop · ^X hide/del/model · type to search · Tab name/content · S-↑↓ match · ^A scope · ^/ preview · PgUp/PgDn·^U/^D·^T/^E·Home/End·wheel scroll · Esc quit",
             Style::default().add_modifier(Modifier::DIM),
         )])
     };
@@ -2369,11 +2423,44 @@ const MODAL_WIDTH: u16 = 62;
 const MODAL_ROW_CHROME_ROWS: u16 = 4;
 
 /// Non-message, non-entry rows a `List`-layout modal draws around its selectable
-/// list: a blank spacer above the list, a blank spacer below it, and a footer help
+/// list: a spacer row above the list, a spacer row below it, and a footer help
 /// line. The box height is message rows + entries + this chrome + two borders, so a
 /// picker grows with its choice count (the picker's old `AGENT_PICK_CHROME_ROWS`
 /// reasoning, kept) and any modal grows with a wrapped message.
+///
+/// The two spacers are where the scrolled-list affordance is PAID FOR: when rows
+/// sit off the window they carry [`modal_more_line`]'s dim `N more` marker instead
+/// of being blank, so the overflow hint costs the box zero extra rows (see
+/// [`modal_list_window`]).
 const MODAL_LIST_CHROME_ROWS: u16 = 3;
+
+/// The most choice rows a `List`-layout modal ASKS for before it scrolls instead
+/// of growing.
+///
+/// Without a cap the box grows one row per choice without bound — the agent picker
+/// draws one row per user-defined agent, and the model picker one per alias — so on
+/// a tall terminal an overlay stops reading as an overlay and covers the board it
+/// is supposed to sit on. Twelve is measured against the classic 24-row terminal:
+/// a one-row message plus [`MODAL_LIST_CHROME_ROWS`] plus two borders is six rows
+/// of chrome, so a full 12-row window lands an 18-row box that still leaves six
+/// rows of board visible around it. Whatever the cap, the terminal's own height
+/// clamps the box further ([`centered_rect`]) and [`modal_list_window`] scrolls the
+/// remainder into reach either way — this only decides how much is offered at once.
+const MODAL_LIST_MAX_ROWS: u16 = 12;
+
+/// Rows a modal's `Borders::ALL` block costs its content: one top, one bottom.
+/// Named because BOTH the height a modal asks for and the viewport
+/// [`render_modal`] derives back out of the clamped box subtract it, and the two
+/// must be the same number or the list window disagrees with the box drawing it.
+const MODAL_BORDER_ROWS: u16 = 2;
+
+/// The marker on a scrolled `List` modal's UPPER spacer row: rows exist above the
+/// window. An arrow rather than an ellipsis so the direction to press is the thing
+/// the glyph says.
+const MODAL_MORE_ABOVE: &str = "\u{2191}";
+/// The [`MODAL_MORE_ABOVE`] counterpart on the LOWER spacer row: rows exist below
+/// the window.
+const MODAL_MORE_BELOW: &str = "\u{2193}";
 
 /// Word-wrap `text` into lines no wider than `width` columns, breaking on
 /// whitespace; a single word longer than `width` is kept whole (it clips rather
@@ -2517,7 +2604,17 @@ fn render_interrupt_confirm(frame: &mut Frame, app: &App) {
 /// derived from the layout, preserving each overlay's original chrome: a `Row`
 /// reads as a warning/confirm (`Yellow`, `←/→ … Enter confirm`, centered), a
 /// `List` as a picker (`Cyan`, `↑/↓ … Enter draft`, left-aligned).
-fn render_modal(frame: &mut Frame, modal: &Modal) {
+///
+/// A `List` also SCROLLS, which is why this takes `&mut`: the box asks for at most
+/// [`MODAL_LIST_MAX_ROWS`] of list, [`centered_rect`] clamps even that on a short
+/// terminal, and [`modal_list_window`] then resolves which slice of the choices the
+/// surviving rows show — writing the resolved offset back onto the modal the way
+/// [`render_list`] writes back `App::scroll`, because only a render knows the
+/// viewport. Without it the box drew every choice top-down and a clamped height
+/// simply lost the tail: a picker's later rows were unreachable rather than
+/// scrolled, and both pickers grow with data (one row per defined agent, one per
+/// model alias) rather than being fixed-size.
+fn render_modal(frame: &mut Frame, modal: &mut Modal) {
     let (accent, footer) = match modal.layout {
         ModalLayout::Row => (
             Color::Yellow,
@@ -2537,6 +2634,24 @@ fn render_modal(frame: &mut Frame, modal: &Modal) {
     // border; the box height below counts the wrapped rows so the two agree.
     let message = wrap_message(&modal.message, MODAL_WIDTH.saturating_sub(2));
     let message_rows = message.len() as u16;
+
+    // The height the box ASKS for (message rows + chrome + borders; a list also
+    // grows with its entry count, up to the cap). `centered_rect` clamps it, and for
+    // a `List` the surviving rows are what the window below is measured against —
+    // so the height is resolved BEFORE the rows are built, not alongside them.
+    let height = match modal.layout {
+        ModalLayout::Row => message_rows
+            .saturating_add(MODAL_ROW_CHROME_ROWS)
+            .saturating_add(MODAL_BORDER_ROWS),
+        ModalLayout::List => u16::try_from(modal.choices.len())
+            .unwrap_or(u16::MAX)
+            .min(MODAL_LIST_MAX_ROWS)
+            .saturating_add(message_rows)
+            .saturating_add(MODAL_LIST_CHROME_ROWS)
+            .saturating_add(MODAL_BORDER_ROWS),
+    };
+    let area = centered_rect(frame.area(), MODAL_WIDTH, height);
+
     let mut lines: Vec<Line> = message
         .into_iter()
         .map(|l| {
@@ -2546,39 +2661,53 @@ fn render_modal(frame: &mut Frame, modal: &Modal) {
             ))
         })
         .collect();
-    lines.push(Line::from(""));
 
-    // The choices, plus the box height (message rows + chrome + borders; a list also
-    // grows with its entry count).
-    let height = match modal.layout {
+    match modal.layout {
         ModalLayout::Row => {
+            lines.push(Line::from(""));
             lines.push(Line::from(modal_button_row(&modal.choices, modal.selected)));
-            message_rows
-                .saturating_add(MODAL_ROW_CHROME_ROWS)
-                .saturating_add(2)
+            lines.push(Line::from(""));
         }
         ModalLayout::List => {
-            for (i, choice) in modal.choices.iter().enumerate() {
+            // How many choice rows the CLAMPED box actually has room for — the same
+            // subtraction the height was built from, run backwards.
+            let viewport = usize::from(
+                area.height
+                    .saturating_sub(message_rows)
+                    .saturating_sub(MODAL_LIST_CHROME_ROWS)
+                    .saturating_sub(MODAL_BORDER_ROWS),
+            );
+            let total = modal.choices.len();
+            modal.scroll = modal_list_window(total, modal.selected, viewport, modal.scroll);
+            let shown = total.min(modal.scroll.saturating_add(viewport)) - modal.scroll;
+            // The two spacers carry the overflow hint instead of being blank, so the
+            // affordance costs the box nothing.
+            lines.push(modal_more_line(MODAL_MORE_ABOVE, modal.scroll));
+            for (i, choice) in modal
+                .choices
+                .iter()
+                .enumerate()
+                .skip(modal.scroll)
+                .take(viewport)
+            {
                 lines.push(modal_list_row(
                     &choice.label,
                     choice.description.as_deref(),
                     i == modal.selected,
                 ));
             }
-            (modal.choices.len() as u16)
-                .saturating_add(message_rows)
-                .saturating_add(MODAL_LIST_CHROME_ROWS)
-                .saturating_add(2)
+            lines.push(modal_more_line(
+                MODAL_MORE_BELOW,
+                total.saturating_sub(modal.scroll.saturating_add(shown)),
+            ));
         }
-    };
+    }
 
-    lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         footer,
         Style::default().add_modifier(Modifier::DIM),
     )));
 
-    let area = centered_rect(frame.area(), MODAL_WIDTH, height);
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" {} ", modal.title));
@@ -2638,6 +2767,64 @@ fn modal_list_row(label: &str, description: Option<&str>, selected: bool) -> Lin
         ));
     }
     Line::from(spans)
+}
+
+/// Resolve a `List`-layout modal's scroll window: given `len` choices, the
+/// `selected` index, a `viewport` of that many drawable rows and the offset the
+/// modal is CURRENTLY scrolled to, return the index of the first row to draw.
+///
+/// The rule is ratatui `ListState`'s, which is the board list's rule (PATTERNS §5,
+/// via `render_list`) rather than a second scrolling idiom: keep the current offset
+/// wherever the selection is still inside it, and otherwise move by the least
+/// amount that brings the selection back — to the top when it sits above the
+/// window, to the bottom when it sits below. That is what makes SELECTION FOLLOW
+/// SCROLL: whatever `App::cycle_modal` picked, including a `rem_euclid` wrap from
+/// one end of the list to the other, the returned window contains it.
+///
+/// Total and saturating over every degenerate input, because the viewport is
+/// derived from a terminal the user can size freely: a `viewport` of 0 (a box with
+/// no room for a single row) answers 0 and draws nothing rather than underflowing,
+/// a `viewport` of 1 pins the window to the selection, a list SHORTER than the
+/// viewport answers 0 (there is nothing to scroll), and a `selected` past the end
+/// is clamped by the final `max_scroll` bound rather than trusted.
+///
+/// Pure, so the window arithmetic is unit-tested without a terminal.
+#[must_use]
+fn modal_list_window(len: usize, selected: usize, viewport: usize, current: usize) -> usize {
+    if viewport == 0 {
+        return 0;
+    }
+    let max_scroll = len.saturating_sub(viewport);
+    let mut scroll = current.min(max_scroll);
+    if selected < scroll {
+        scroll = selected;
+    } else if selected >= scroll.saturating_add(viewport) {
+        // `selected >= scroll + viewport >= viewport >= 1`, so this cannot wrap;
+        // saturating anyway keeps the fn total for a caller that hands in a
+        // `selected` past the end.
+        scroll = selected.saturating_sub(viewport).saturating_add(1);
+    }
+    scroll.min(max_scroll)
+}
+
+/// The dim `↑ N more` / `↓ N more` marker a scrolled `List` modal draws on the
+/// spacer row [`MODAL_LIST_CHROME_ROWS`] already reserves, or a blank line when
+/// nothing is off-window in that direction.
+///
+/// It costs the box no height at all — the spacer was there and blank — which is
+/// why the affordance is here rather than as a row of its own: a picker that had to
+/// grow to admit it would be fighting the very clamp this viewport exists to
+/// survive. Named ANSI arrows + `Modifier::DIM` only, no RGB and no raw escapes
+/// (TERMINAL-SAFE STYLING); the leading two spaces line the marker up with
+/// [`modal_list_row`]'s unselected indent so it reads as part of the list.
+fn modal_more_line(arrow: &str, hidden: usize) -> Line<'static> {
+    if hidden == 0 {
+        return Line::from("");
+    }
+    Line::from(Span::styled(
+        format!("  {arrow} {hidden} more"),
+        Style::default().add_modifier(Modifier::DIM),
+    ))
 }
 
 /// A centered `width`x`height` (cells) rect within `area`, clamped so it never
@@ -3102,6 +3289,92 @@ mod tests {
             app.project_head().as_deref(),
             Some(project_name(&app).as_str()),
             "and the one group head still reads exactly as the header does"
+        );
+    }
+
+    /// The sticky `Ctrl-X m` override is a standing fact, so the HEADER carries it
+    /// for as long as it is true — the status line could only announce the keypress
+    /// that set it (AGENTS.md STATUS-LINE OWNERSHIP).
+    ///
+    /// The absent case is the load-bearing half: with no override the header must
+    /// read exactly as it always has, since that is the same "invisible until used"
+    /// property the argv seam pins on its side.
+    #[test]
+    fn the_header_shows_an_active_model_override_and_nothing_without_one() {
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::CurrentFolder,
+            PathBuf::from("/tmp/launch"),
+        );
+
+        let bare = drawn_header(&app);
+        assert!(
+            !bare.contains("model"),
+            "an un-overridden board must not mention a model at all: {bare}"
+        );
+
+        app.set_model_override(Some("opusplan".to_string()));
+        let overridden = drawn_header(&app);
+        assert!(
+            overridden.contains("model: opusplan"),
+            "the active override must be named on the header: {overridden}"
+        );
+        // Everything the header already said is still there, in order — the segment
+        // is an insertion, not a replacement.
+        assert!(
+            overridden.contains("folder:launch") && overridden.contains("search: name"),
+            "the scope and search-mode segments survive: {overridden}"
+        );
+        let model_at = overridden.find("model:").expect("the segment is drawn");
+        let counts_at = overridden.find("sessions").expect("the counter is drawn");
+        assert!(
+            model_at < counts_at,
+            "the override goes AHEAD of the counter, where a narrow terminal keeps \
+             it: {overridden}"
+        );
+
+        app.set_model_override(None);
+        assert_eq!(
+            drawn_header(&app),
+            bare,
+            "clearing the override restores the byte-identical original header"
+        );
+    }
+
+    /// The segment is drawn for a VALUE, so it must never be drawn empty. Only
+    /// `--model ""` can ask for that (the picker offers no blank row), and the argv
+    /// seam emits no flag for it — a rendered `model: ` would announce an override
+    /// that changes nothing about the next hand-off.
+    ///
+    /// The alias at the end is the control: it proves the segment is suppressed by
+    /// the value being blank, not suppressed outright.
+    #[test]
+    fn a_blank_model_override_draws_no_header_segment() {
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::CurrentFolder,
+            PathBuf::from("/tmp/launch"),
+        );
+        let bare = drawn_header(&app);
+
+        app.set_model_override(Some(String::new()));
+        assert_eq!(
+            drawn_header(&app),
+            bare,
+            "an empty --model value leaves the header exactly as an unset one"
+        );
+
+        app.set_model_override(Some("   ".to_string()));
+        assert_eq!(
+            drawn_header(&app),
+            bare,
+            "whitespace-only is blank as well, not a model named with spaces"
+        );
+
+        app.set_model_override(Some("sonnet".to_string()));
+        assert!(
+            drawn_header(&app).contains("model: sonnet"),
+            "control: a real alias still draws the segment"
         );
     }
 
@@ -4294,6 +4567,103 @@ mod tests {
         let clamped = centered_rect(tiny, 62, 7);
         assert_eq!((clamped.width, clamped.height), (20, 3));
         assert_eq!((clamped.x, clamped.y), (0, 0));
+    }
+
+    // --- the List modal's scroll window -----------------------------------
+
+    /// The whole window rule, stated as arithmetic: the offset is KEPT while the
+    /// selection is inside it and moved by the least amount that brings it back
+    /// otherwise. Every case is one the modal can actually reach — `cycle_modal`
+    /// steps by one and WRAPS, so both ends are ordinary keystrokes, not edge cases.
+    #[test]
+    fn the_list_window_keeps_its_offset_until_the_selection_leaves_it() {
+        // A list that FITS never scrolls, whatever the caller asks for: there is
+        // nothing off-window, so an inherited offset must be discarded rather than
+        // blanking rows the box has room for.
+        assert_eq!(modal_list_window(3, 2, 10, 0), 0);
+        assert_eq!(modal_list_window(3, 0, 10, 7), 0);
+        assert_eq!(modal_list_window(10, 9, 10, 4), 0);
+
+        // Selection INSIDE the current window: the offset is untouched, which is
+        // what stops the list re-centring on every keypress.
+        assert_eq!(modal_list_window(20, 5, 5, 3), 3);
+        assert_eq!(modal_list_window(20, 7, 5, 3), 3);
+
+        // Selection ABOVE the window: scroll up exactly onto it.
+        assert_eq!(modal_list_window(20, 2, 5, 6), 2);
+
+        // Selection BELOW the window: scroll down the least that shows it, which
+        // puts it on the LAST visible row (`selected + 1 - viewport`).
+        assert_eq!(modal_list_window(20, 9, 5, 3), 5);
+
+        // Both ends, reached the way the wrap actually reaches them.
+        assert_eq!(modal_list_window(20, 0, 5, 12), 0, "top pins to zero");
+        assert_eq!(
+            modal_list_window(20, 19, 5, 0),
+            15,
+            "bottom pins to max_scroll = len - viewport"
+        );
+
+        // An offset past the end (a shrunken list) is clamped, never trusted.
+        assert_eq!(modal_list_window(20, 19, 5, 99), 15);
+    }
+
+    /// The degenerate viewports a freely-resized terminal produces. A short enough
+    /// box leaves ZERO rows for the list, and the arithmetic must answer rather than
+    /// underflow — `selected + 1 - viewport` is the subtraction that would.
+    #[test]
+    fn the_list_window_survives_a_viewport_of_zero_or_one() {
+        // Zero rows: nothing is drawable, so the answer is 0 and no subtraction
+        // happens at all.
+        assert_eq!(modal_list_window(20, 19, 0, 7), 0);
+        assert_eq!(modal_list_window(0, 0, 0, 0), 0);
+
+        // One row: the window IS the selection, from either direction.
+        assert_eq!(modal_list_window(20, 0, 1, 9), 0);
+        assert_eq!(modal_list_window(20, 9, 1, 0), 9);
+        assert_eq!(modal_list_window(20, 19, 1, 19), 19);
+
+        // An empty list cannot select anything; the window is still 0.
+        assert_eq!(modal_list_window(0, 0, 5, 3), 0);
+
+        // A `selected` past the end (defensive — `cycle_modal` keeps it in range)
+        // is bounded by `max_scroll` instead of running off it.
+        assert_eq!(modal_list_window(4, 99, 2, 0), 2);
+    }
+
+    /// The overflow marker is drawn ONLY when something is actually off-window, and
+    /// carries the count rather than a bare arrow — "there is more" is far less
+    /// useful than "there are seven more" when deciding whether to keep pressing.
+    #[test]
+    fn the_more_marker_appears_only_when_rows_are_off_window() {
+        let blank = modal_more_line(MODAL_MORE_ABOVE, 0);
+        assert_eq!(
+            blank
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>(),
+            "",
+            "nothing hidden means the spacer stays a spacer"
+        );
+
+        let more = modal_more_line(MODAL_MORE_BELOW, 7);
+        let text = more
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains('7'), "the marker names the count: {text:?}");
+        assert!(
+            text.contains(MODAL_MORE_BELOW),
+            "and the direction to press: {text:?}"
+        );
+        assert!(
+            more.spans
+                .iter()
+                .all(|s| s.style.add_modifier.contains(Modifier::DIM)),
+            "the marker is chrome, not a choice"
+        );
     }
 
     // --- search-match highlight run splitting -----------------------------
@@ -9555,7 +9925,8 @@ mod tests {
         for needle in [
             "x hide",
             "d delete row/lineage",
-            "h show/hide hidden",
+            "h hidden",
+            "m model",
             "r reload",
             "Esc cancel",
         ] {
@@ -9691,6 +10062,348 @@ mod tests {
             drawn.contains("Enter draft") && drawn.contains("^O interactive"),
             "the picker footer must name both Enter and Ctrl-O:\n{drawn}"
         );
+    }
+
+    /// Flatten a whole rendered board to one searchable string, rows joined by
+    /// newlines. The `List`-modal viewport tests below look for a SELECTED row's
+    /// `› label` — a two-token needle the highlight glyph makes specific to the
+    /// modal — so they need the screen, not one row.
+    fn drawn_screen(app: &mut App, width: u16, height: u16) -> String {
+        let buffer = drawn_board(app, width, height);
+        (0..height)
+            .map(|y| full_row_text(&buffer, y, width))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The `› ` needle that says a choice is BOTH drawn and highlighted — the same
+    /// marker [`modal_list_row`] gives a selected row.
+    fn selected_needle(app: &App) -> String {
+        let modal = app.modal.as_ref().expect("a modal is open");
+        format!("\u{203a} {}", modal.choices[modal.selected].label)
+    }
+
+    /// The viewport's whole point, swept over terminal height the way
+    /// `the_disclosing_delete_confirm_costs_one_row_and_keeps_cancel_default` sweeps
+    /// it: a `List` modal's SELECTED row is drawn at every height that has room for
+    /// a list row at all, not only on a terminal tall enough for the whole list.
+    ///
+    /// The picker's LAST row is selected, reached the way a user reaches it — one
+    /// `modal_prev` off the pre-highlight, which `cycle_modal` wraps to the end — so
+    /// the row under test is the one furthest from where a top-down draw starts. That
+    /// is exactly the row the old render lost: `centered_rect` clamps the box and
+    /// nothing scrolled, so on a short terminal the tail simply was not painted.
+    ///
+    /// The needle is derived from the modal rather than hard-coded, so the sweep
+    /// keeps testing the last row whatever the alias set is — which now varies at
+    /// RUNTIME, since the picker offers what the installed `claude` accepts and
+    /// falls back to the `app::MODEL_ALIASES` seed only until that probe lands. This
+    /// case is the SEED one (no probe delivered); the probed one is pinned below.
+    #[test]
+    fn a_short_terminal_still_draws_the_model_pickers_selected_row() {
+        /// Terminal heights the sweep covers. Seven is the shortest box that has a
+        /// single list row at all (one message row + `MODAL_LIST_CHROME_ROWS` +
+        /// `MODAL_BORDER_ROWS` = six rows of chrome), and twenty is comfortably
+        /// taller than the whole picker, so the sweep spans "scrolled to one row" to
+        /// "not scrolled at all".
+        const SWEEP: std::ops::RangeInclusive<u16> = 7..=20;
+
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.open_model_picker();
+        // Wrap onto the last alias — the row a top-down draw reaches last.
+        app.modal_prev();
+        let needle = selected_needle(&app);
+        let last = app.modal.as_ref().expect("the picker is open").selected;
+        assert_eq!(
+            last,
+            app.modal
+                .as_ref()
+                .expect("the picker is open")
+                .choices
+                .len()
+                - 1,
+            "the fixture must be on the LAST row"
+        );
+
+        for height in SWEEP {
+            let screen = drawn_screen(&mut app, 80, height);
+            assert!(
+                screen.contains(&needle),
+                "a {height}-row terminal must still draw the selected {needle:?}; \
+                 screen:\n{screen}"
+            );
+        }
+    }
+
+    /// The same sweep against the PROBED set, with `opusplan` pinned by name.
+    ///
+    /// Two things make this a different claim from the seed sweep above rather than
+    /// a copy of it. The probed list is TEN rows (nine aliases plus the synthetic
+    /// clear row) against the seed's six, so every terminal in the sweep below
+    /// sixteen rows genuinely scrolls. And `opusplan` — the alias this whole feature
+    /// exists to surface, since `claude --help` hides it — is LAST in the binary's
+    /// own array order, which the picker offers verbatim. It is therefore the FIRST
+    /// row a top-down draw with no viewport would lose, which is exactly why its
+    /// reachability is worth pinning by name and not only by "the selected row".
+    #[test]
+    fn the_probed_pickers_last_row_opusplan_is_reachable_on_a_short_terminal() {
+        /// Terminal heights the sweep covers — the seed sweep's range, so the two
+        /// cases are compared over the same terminals. Seven is the shortest box
+        /// with a single list row at all; twenty is taller than the whole picker.
+        const SWEEP: std::ops::RangeInclusive<u16> = 7..=20;
+        /// The alias array the installed `claude 2.1.233` accepts, in wire order —
+        /// stated here so this test needs no 290 MB binary. `opusplan` last is the
+        /// property under test, not an incidental detail of the fixture.
+        const PROBED: [&str; 9] = [
+            "sonnet",
+            "opus",
+            "haiku",
+            "fable",
+            "best",
+            "sonnet[1m]",
+            "opus[1m]",
+            "fable[1m]",
+            "opusplan",
+        ];
+
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.set_model_aliases(PROBED.iter().map(|a| (*a).to_string()).collect());
+        app.open_model_picker();
+        // Wrap onto the last alias — the row a top-down draw reaches last.
+        app.modal_prev();
+
+        let modal = app.modal.as_ref().expect("the picker is open");
+        assert_eq!(
+            modal.choices.len(),
+            PROBED.len() + 1,
+            "the probed picker is nine aliases plus the synthetic clear row"
+        );
+        assert_eq!(
+            modal.choices[modal.selected].label, "opusplan",
+            "opusplan must be the LAST row — that is what makes it the first one a \
+             viewport-less draw loses"
+        );
+        let needle = selected_needle(&app);
+
+        for height in SWEEP {
+            let screen = drawn_screen(&mut app, 80, height);
+            assert!(
+                screen.contains(&needle),
+                "a {height}-row terminal must still reach {needle:?}; screen:\n{screen}"
+            );
+        }
+    }
+
+    /// A probe that returns MORE aliases than the window holds must SCROLL, not clip.
+    ///
+    /// This stopped being hypothetical when the row count became upstream data:
+    /// nothing in snapback bounds how many aliases a future `claude` ships, and the
+    /// picker offers every one of them. Same shape as the agent-picker cap test, but
+    /// it has to be stated for the model picker too — that one is bounded by the
+    /// user's own agent files, this one by another program's release notes.
+    #[test]
+    fn a_probe_longer_than_the_cap_scrolls_the_model_picker_rather_than_clipping() {
+        /// Aliases the stated probe returns — comfortably past
+        /// `MODAL_LIST_MAX_ROWS`, so the CAP is what bounds the box.
+        const ALIASES: usize = 20;
+        /// A terminal tall enough to draw all of them, so nothing here is the
+        /// terminal clamp in disguise.
+        const TALL: u16 = 40;
+
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.set_model_aliases((0..ALIASES).map(|i| format!("model-{i:02}")).collect());
+        app.open_model_picker();
+        // +1 for the synthetic "default (settings)" row.
+        let total = ALIASES + 1;
+        let off_window = total - usize::from(MODAL_LIST_MAX_ROWS);
+        let last = format!("model-{:02}", ALIASES - 1);
+
+        // Opened at the top: the tail is off-window and the LOWER spacer says how
+        // much of it there is.
+        let screen = drawn_screen(&mut app, 80, TALL);
+        assert!(
+            !screen.contains(&last),
+            "the cap must stop the box growing with the probe's answer; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains(&format!("{MODAL_MORE_BELOW} {off_window} more")),
+            "and the spacer must disclose how many aliases are below; screen:\n{screen}"
+        );
+
+        // Wrap onto the last alias: it must be REACHABLE rather than clipped away.
+        app.modal_prev();
+        let needle = selected_needle(&app);
+        let screen = drawn_screen(&mut app, 80, TALL);
+        assert!(
+            screen.contains(&needle),
+            "the window must follow the selection onto {last}; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains(&format!("{MODAL_MORE_ABOVE} {off_window} more")),
+            "and disclose the aliases now above it; screen:\n{screen}"
+        );
+    }
+
+    /// The other half: a list LONGER than the cap is bounded on a tall terminal
+    /// too, and says so.
+    ///
+    /// The agent picker draws one row per user-defined agent, so it is unbounded by
+    /// data — twenty agents on a forty-row terminal used to draw a twenty-six-row box
+    /// over a board it is meant to overlay. `MODAL_LIST_MAX_ROWS` caps the window and
+    /// the spacer rows carry the count that is off-window, so the rows beyond it are
+    /// discoverable rather than merely absent.
+    #[test]
+    fn a_long_agent_picker_is_capped_and_says_how_many_rows_are_off_window() {
+        /// Agents in the fixture — comfortably past `MODAL_LIST_MAX_ROWS`, so the cap
+        /// is the thing under test rather than the terminal's height.
+        const AGENTS: usize = 20;
+        /// A terminal tall enough to draw all of them, so nothing here is the
+        /// terminal clamp in disguise.
+        const TALL: u16 = 40;
+
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.open_agent_picker(
+            (0..AGENTS)
+                .map(|i| DefinedAgent {
+                    name: format!("agent-{i:02}"),
+                    description: None,
+                })
+                .collect(),
+        );
+        // +1 for the synthetic "default (no agent)" row.
+        let total = AGENTS + 1;
+        let off_window = total - usize::from(MODAL_LIST_MAX_ROWS);
+
+        // A marker is `<arrow> <count> more`, so ask for it by SHAPE over every
+        // count it could carry. A bare `<arrow> ` needle would also match the
+        // picker's own `↑/↓ choose` footer and quietly never be able to go red.
+        let marker = |screen: &str, arrow: &str| {
+            (1..=total).any(|n| screen.contains(&format!("{arrow} {n} more")))
+        };
+
+        // Opened at the top: the tail is off-window and the LOWER spacer says how
+        // much of it there is.
+        let screen = drawn_screen(&mut app, 80, TALL);
+        assert!(
+            !screen.contains("agent-19"),
+            "the cap must stop the box growing with the agent count; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains(&format!("{MODAL_MORE_BELOW} {off_window} more")),
+            "and the spacer must disclose how many rows are below; screen:\n{screen}"
+        );
+        assert!(
+            !marker(&screen, MODAL_MORE_ABOVE),
+            "nothing is above the window at the top; screen:\n{screen}"
+        );
+
+        // Wrap onto the last agent: the window follows the selection, and now it is
+        // the HEAD of the list that is off-window.
+        app.modal_prev();
+        let needle = selected_needle(&app);
+        let screen = drawn_screen(&mut app, 80, TALL);
+        assert!(
+            screen.contains(&needle),
+            "the window must follow the selection to the last row; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains(&format!("{MODAL_MORE_ABOVE} {off_window} more")),
+            "and disclose the rows now above it; screen:\n{screen}"
+        );
+        assert!(
+            !marker(&screen, MODAL_MORE_BELOW),
+            "nothing is below the window at the bottom; screen:\n{screen}"
+        );
+    }
+
+    /// The offset is KEPT between frames rather than re-derived, which is what makes
+    /// the modal scroll like the board list instead of re-centring per keypress.
+    ///
+    /// Asserted through `Modal::scroll` after real renders, because that field is the
+    /// state the render writes back (`App::scroll`'s idiom) — a test that only read
+    /// the screen could not tell a kept offset from a recomputed one that happened to
+    /// agree.
+    #[test]
+    fn the_modal_scroll_offset_is_written_back_and_then_left_alone() {
+        /// Six rows of chrome plus four list rows, so the window is four of the
+        /// picker's rows and moving within it must not scroll.
+        const SHORT: u16 = 10;
+
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.open_model_picker();
+        let total = app
+            .modal
+            .as_ref()
+            .expect("the picker is open")
+            .choices
+            .len();
+        assert!(
+            total > 4,
+            "the fixture needs more rows than the 4-row window"
+        );
+
+        let scroll_now = |app: &App| app.modal.as_ref().expect("open").scroll;
+
+        // Row 0 selected: nothing above it, so the window sits at the top.
+        drawn_screen(&mut app, 80, SHORT);
+        assert_eq!(scroll_now(&app), 0, "a top selection needs no scroll");
+
+        // Step down INSIDE the window: the offset must not move.
+        app.modal_next();
+        drawn_screen(&mut app, 80, SHORT);
+        assert_eq!(
+            scroll_now(&app),
+            0,
+            "moving inside the window keeps it still"
+        );
+
+        // Step past the bottom: the offset moves by exactly one.
+        for _ in 1..4 {
+            app.modal_next();
+        }
+        drawn_screen(&mut app, 80, SHORT);
+        assert_eq!(
+            scroll_now(&app),
+            1,
+            "leaving the window scrolls the least that brings the row back"
+        );
+
+        // Down to the last row: the offset stops at `len - viewport`.
+        for _ in 4..total - 1 {
+            app.modal_next();
+        }
+        drawn_screen(&mut app, 80, SHORT);
+        assert_eq!(
+            scroll_now(&app),
+            total - 4,
+            "the bottom pins the window to max_scroll"
+        );
+
+        // One more press WRAPS to row 0 — a single keystroke crossing the whole
+        // list, which is the move a window that only ever nudged by one would lose.
+        app.modal_next();
+        drawn_screen(&mut app, 80, SHORT);
+        assert_eq!(scroll_now(&app), 0, "the wrap pins the window back to zero");
     }
 
     #[test]
@@ -9836,8 +10549,11 @@ mod tests {
     /// `app::delete_confirm_message` quotes.
     ///
     /// The added sentence costs exactly ONE wrapped row (4 → 5), so the `Row` box
-    /// grows 10 → 11. `centered_rect` CLAMPS that height and `render_modal` draws
-    /// top-down with no vertical scroll, so the extra row pushes the button strip
+    /// grows 10 → 11. `centered_rect` CLAMPS that height and `render_modal` draws a
+    /// `Row` top-down with no vertical scroll — only the `List` layout scrolls
+    /// ([`modal_list_window`]), and deliberately so: a button strip is fixed chrome
+    /// the user cannot page through, where a picker's rows are data — so the extra
+    /// row pushes the button strip
     /// and the `Esc cancel` footer off a short terminal one row sooner than the
     /// non-disclosing confirm did: the strip needs 9 rows where it needed 8, the
     /// footer 11 where it needed 10.
@@ -9942,7 +10658,7 @@ mod tests {
 
         let narrowest_whole_cancel = |lineage_label: &str| -> Option<u16> {
             (20u16..=70).find(|&w| {
-                let modal = Modal {
+                let mut modal = Modal {
                     title: "delete session".to_string(),
                     message: message.clone(),
                     layout: ModalLayout::Row,
@@ -9956,11 +10672,12 @@ mod tests {
                         .collect(),
                     selected: 2,
                     session_id: None,
+                    scroll: 0,
                 };
                 let mut terminal =
                     Terminal::new(TestBackend::new(w, 24)).expect("build a test terminal");
                 terminal
-                    .draw(|frame| render_modal(frame, &modal))
+                    .draw(|frame| render_modal(frame, &mut modal))
                     .expect("render must not panic at any width");
                 let buffer = terminal.backend().buffer().clone();
                 (0..24u16)

@@ -62,10 +62,18 @@ Decision logic is pure and unit-tested; side effects sit in thin wrappers over
 it. Follow this split when adding behavior:
 
 - Pure, tested: `resume::plan` / `plan_from_parts` / `build_argv` /
-  `build_new_argv` / `status_for_exit`; every decision in `send` — `reply_gate` /
+  `build_new_argv` / `status_for_exit`, plus the two the `--model` override added —
+  `push_model_flag` (the ONE place the flag is formatted, over the same
+  `flag_value` trim/blank guard `--agent` uses, and shared verbatim by `send`) and
+  `nonzero_hint_for` (which picks the hint from that SAME predicate, so a blank
+  override that emits nothing cannot blame a model that was never sent); every
+  decision in `send` — `reply_gate` /
   `interrupt_gate` (the whole routing tree, asserted with no process spawned),
   `build_send_argv` / `build_stop_argv` / `build_bg_launch_argv`, `plan_send` /
-  `plan_bg_launch`, and the `status_for_output` / `status_for_failed_send` /
+  `plan_bg_launch`, the `status_for_send` success map with its `answering_models` /
+  `model_readout` halves (the `modelUsage` readout, fail-soft over an absent,
+  empty, non-object or mistyped map), and the `status_for_output` /
+  `status_for_failed_send` /
   `status_for_stop` / `status_for_bg_launch` mapping;
   `compose::compose_key_to_action`; `defined_agents::select_agents` /
   `parse_frontmatter`; `agents::classify` and the outputs derived from it
@@ -73,7 +81,11 @@ it. Follow this split when adding behavior:
   fuses onto the kind label, plus `is_active`) and both argv builders (`agents_argv` /
   `live_agents_argv`) and `agents_from_output` (the shell-out's
   non-zero-exit-means-no-signal decision, split from the spawn so it is testable
-  without one); `worktrees`' whole trio, split from its spawn the same way —
+  without one); `model_aliases::parse_model_aliases`, split from its read for the
+  same reason and to sharper effect — it is the SINGLE interpreter of the `--model`
+  alias array's byte format, so it is pinned against byte windows captured from
+  four real `claude` binaries rather than against a 290 MB file the suite has no
+  business shipping; `worktrees`' whole trio, split from its spawn the same way —
   `git_worktree_argv` (the invocation is a contract with an external CLI, so it
   is asserted without running one), `set_from_output` (the same
   non-zero-exit-means-no-signal decision, plus non-UTF-8 output rejected WHOLE
@@ -85,7 +97,11 @@ it. Follow this split when adding behavior:
   and its label — with inline path fixtures, including a NEGATIVE case that must
   not collapse and a pinned known limitation); `tui::app::in_scope` (the scope
   predicate, which takes the worktree set as a parameter rather than reaching for
-  it, so it never resolves git and is tested from a seeded set); `store::lineage`'s `lineage_key` / `head_of` / `fold` (the whole
+  it, so it never resolves git and is tested from a seeded set) and
+  `tui::app::offered_model_aliases` (the model picker's whole vocabulary decision
+  — the probe's answer verbatim, or the seed when it is empty — pure so the one
+  decision the runtime alias read turns on is asserted directly rather than only
+  through a rendered modal); `store::lineage`'s `lineage_key` / `head_of` / `fold` (the whole
   fold is one pure fn of `(sessions, filtered, expanded)`, so the `(+N)` board can
   be tested as a list transformation with no terminal and no store);
   `update::key_to_action` / `wheel_target` / `accept_paste` (line-ending
@@ -101,7 +117,10 @@ it. Follow this split when adding behavior:
   left over inside the first of them — pure arithmetic over a prefix map, so the
   windowed draw is tested without a terminal) / `clamp_preview_offset` /
   `preview_split` /
-  `centered_rect` / `highlight_runs` and its STYLED sibling
+  `centered_rect` / `modal_list_window` (a `List` modal's scroll window — the same
+  keep-the-offset-until-the-selection-leaves-it rule ratatui's `ListState` gives the
+  board list, so the two pickers scroll rather than losing their tail off a short
+  terminal, and total over a viewport of 0 or 1) / `highlight_runs` and its STYLED sibling
   `highlight_matched_spans` (the same char-safe run split, but over a line that
   arrives ALREADY styled — it splits the line's own spans at the matched
   positions and ADDS a `Modifier` to those runs, so a marked word inside DIM code
@@ -125,9 +144,11 @@ it. Follow this split when adding behavior:
   than dragging ratatui into the parser layer).
 - Thin, impure: `resume::launch` (chdir + spawn + wait), `defined_agents::discover_agents`
   (the FS walk over `select_agents` / `parse_frontmatter`), `worktrees::resolve`
-  (spawn + capture, delegating every decision to `set_from_output`), the `watch`
-  threads, `tui::run` (draw loop). Keep these small and delegate to tested
-  helpers.
+  (spawn + capture, delegating every decision to `set_from_output`),
+  `model_aliases::installed_model_aliases` (locate on `$PATH`, canonicalize,
+  chunk-read — it decides only WHERE to look and delegates what the bytes mean to
+  `parse_model_aliases`), the `watch` threads, `tui::run` (draw loop). Keep these
+  small and delegate to tested helpers.
 
 The terminal-up **refusal gate** is an instance of this: `resume::check` (and its
 sibling `resume::check_new` for starting a fresh session in the launch dir) runs
@@ -247,6 +268,19 @@ preserved and only clamped). On reload, restore the selection by locating the id
 in the new filtered list; if it vanished, clamp the previous position to the
 nearest surviving row. Path canonicalization (the scope predicate) runs only on
 reload / scope-toggle (`recompute_scope`), never per keystroke.
+
+**The offset lives on the model; only the RENDER knows the viewport, so the render
+resolves it and writes it back.** One rule, three instances — a fourth copies it
+rather than inventing a second idiom. `render_list` seeds ratatui's `ListState`
+from `App::scroll` and stores `state.offset()` back; `render_preview` clamps
+`App::preview_scroll` against the measured content and stores the clamped value;
+`render_modal` resolves `Modal::scroll` through the pure `modal_list_window`
+against the box `centered_rect` actually granted. The modal's window follows the
+SELECTION for the same reason the list's does — a `List` modal grows with data (one
+row per defined agent, one per model alias) while `centered_rect` clamps its
+height, so without a window the tail was simply not drawn: later rows were
+UNREACHABLE rather than scrolled. Its two spacer rows carry the `↑ N more` /
+`↓ N more` affordance, so disclosing the off-window rows costs the box no height.
 
 The preview's own scroll is **bottom-anchored by default**
 (`App::preview_follow_bottom` starts true, is re-armed on every selection change
@@ -468,6 +502,17 @@ the pure event handler. `send::spawn_interrupt` and `send::spawn_bg_launch` are 
 same shape for `claude stop` and `claude --bg`; a new one-shot child belongs here
 rather than behind a teardown whenever it needs no TTY.
 
+`watch::spawn_model_alias_thread` is the fourth of that shape and the one that
+spawns no child at all: it READS the installed `claude` binary for its `--model`
+alias set and delivers a single `AppEvent::ModelAliases`, started once per board
+session rather than per keypress. Its shutdown-flag argument is structural rather
+than negotiated — a thread that sends once and returns has no loop to bound, so
+it cannot accumulate one per resume round trip, which is the failure the flag
+exists to prevent. Note what it is NOT: it is the rule's ORDINARY case (own
+thread, `AppEvent`, render loop never blocked), **not** a third entry on the
+exception list below. That list is for work that runs ON the UI thread, and
+nothing that delivers an event belongs on it.
+
 The rule is about the **poll cadence**, not about the word "shell-out". A
 ONE-SHOT at hand-off is a different thing and is allowed — `agents::live_agents`
 is the instance, directly analogous to `resume`'s authoritative re-read of
@@ -535,12 +580,15 @@ Pick the default that makes an unconsidered case obvious, not merely convenient.
 The same seam appears one level down — as a plain PARAMETER rather than an `App`
 field — wherever the THREAD is the thing under test. `spawn_agents_thread` takes
 its `poll` and its `idle_after`; `spawn_input_thread` takes the terminal read it
-loops on. Both are named exactly once, in `EventLoop`, where production passes
-`agents::reported_agents` and the real crossterm `poll`+`read` pair. Nothing else
-may pass anything else: the seam exists so a test can state a poll's answer
-without spawning `claude`, and state an input event without a TTY, which is what
-makes the loop's own behavior — the idle gate it obeys, the board-activity stamp
-it writes — assertable at all.
+loops on; `spawn_model_alias_thread` takes the `probe` it runs once. All three are
+named exactly once, in `EventLoop`, where production passes
+`agents::reported_agents`, the real crossterm `poll`+`read` pair, and
+`model_aliases::installed_model_aliases`. Nothing else may pass anything else: the
+seam exists so a test can state a poll's answer without spawning `claude`, state
+an input event without a TTY, and state an alias set without walking a 290 MB
+binary — which is what makes each thread's own behavior assertable at all (the
+idle gate the poller obeys, the board-activity stamp it writes, and the probe's
+load-bearing property that the SPAWN returns before the scan does).
 
 What the seam does NOT cover is the production source on the far side of it, and
 that gap is **accepted, not overlooked**: `watch::read_terminal_event` has no
@@ -548,8 +596,13 @@ direct test, because exercising it needs a real TTY — without a controlling
 terminal (CI) crossterm's `poll` errors immediately, so any test of it would
 assert the error path and call that coverage. It carries no decision of its own
 (a `poll` + `read` pair where either half's `Err` propagates unchanged), and
-everything downstream of it is pinned through the seam. Leave it untested rather
-than "fixing" it with a proxy assertion — see the false-clean modes below.
+everything downstream of it is pinned through the seam. The `run_inner` lines that
+START these threads (`spawn_agents_poller`, `spawn_model_alias_probe`) are
+accepted the same way and for the same reason: `run_inner` needs a real terminal,
+so there is nothing to assert them from, while the thread's shape is pinned
+through the seam and the event's effect through `update::dispatch` — the gap is
+one call, not a behaviour. Leave all of these untested rather than "fixing" them
+with a proxy assertion — see the false-clean modes below.
 
 ## 7. Restrained, terminal-safe styling
 
@@ -675,7 +728,7 @@ CADENCES and LIMITS, so a retune knows what it is next to:
 | `send` | `SEND_ERROR_MAX` (200) |
 | `tui::app` | `PREVIEW_WHEEL_STEP` (2) · `LIST_WHEEL_STEP` (1) · `STATUS_DWELL_TICKS` (16) · `MIN_PANE_WIDTH` (15) · `DEFAULT_LIST_PERCENT` (48) |
 | `tui::update` | `PASTE_MAX_CHARS` (4096) · `SPLITTER_TOLERANCE` (1) |
-| `tui::view` | `BLINK_TICKS` (2) · `CHILD_ID_CHARS` (8) · the layout rows `PREVIEW_BANNER_ROWS` / `BOARD_CHROME_ROWS` / `COMPOSE_*` / `MODAL_WIDTH` / `MODAL_*_CHROME_ROWS` |
+| `tui::view` | `BLINK_TICKS` (2) · `CHILD_ID_CHARS` (8) · the layout rows `PREVIEW_BANNER_ROWS` / `BOARD_CHROME_ROWS` / `COMPOSE_*` / `MODAL_WIDTH` / `MODAL_*_CHROME_ROWS` / `MODAL_BORDER_ROWS` / `MODAL_LIST_MAX_ROWS` (12 — the most rows a `List` picker offers before it scrolls, so an overlay stays an overlay on a tall terminal) |
 
 Add a new tunable the same way. The rule is not only about numbers — a literal
 with a meaning gets a name whatever its type: the undocumented `claude agents`
@@ -740,7 +793,8 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    TTY) so it stays on the no-teardown side, while its `Ctrl-O` twin hands the
    terminal over and is therefore an ordinary `Resume`.
 3. Modal state owns the keyboard: ONE `App.modal: Option<Modal>` serves every
-   titled overlay — the running-session choice, the new-session agent picker, and
+   titled overlay — the running-session choice, the new-session agent picker, the
+   `Ctrl-X m` model picker, and
    the hard-delete confirm — through the generic `modal_key` → `confirm_modal`
    machine, dispatching each choice's `ModalAction` tag (`Row` layout binds the
    horizontal keys, `List` does not). A key that belongs to ONE overlay rather than
@@ -750,8 +804,10 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    modal nor a future `List` one can inherit a verb it has no meaning for. Four
    more keyboard owners sit alongside it: the `Ctrl-X` leader chord (while
    `App.pending_chord` is set, `chord_key` routes the next key — `x` hide, `d`
-   delete-confirm, `h` show-hidden, `r` forced full store re-read, anything else
-   cancels), the "stop the
+   delete-confirm, `h` show-hidden, `m` model picker, `r` forced full store
+   re-read, anything else
+   cancels; `m` lives here because `Ctrl-M` cannot be bound at all — the terminal
+   delivers it as Enter, like `Ctrl-H`/`Ctrl-I`), the "stop the
    waiting agent?" confirmation via `App.pending_stop` (a plain Enter/Esc gate
    before compose, for the `needs input` quick-reply path), its `Ctrl-K` sibling
    `App.pending_interrupt` (the same Enter/Esc gate, but resolving to a bare

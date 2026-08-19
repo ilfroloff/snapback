@@ -23,7 +23,10 @@ find the same rule in two places, that is a bug to fix.
    `CLAUDE_PROJECTS_DIR` override, the hidden `--print-list` mode, the CI +
    release-plz automation, and the pre-finish validation checklist.
 6. [CLAUDE_CLI.md](CLAUDE_CLI.md) — **the external `claude` binary**: version
-   pin, the argv `snapback` spawns, top-level flags, commands, and the hidden
+   pin, the argv `snapback` spawns, top-level flags, commands, the `--model`
+   alias set (which `claude --help` reports incompletely, so it is captured from
+   the binary instead — a point-in-time record for humans, since `snapback` reads
+   the same array off the installed binary at runtime), and the hidden
    `stop`/`attach` commands it depends on.
 
 ## Section ownership (avoid duplication)
@@ -34,7 +37,8 @@ find the same rule in two places, that is a bug to fix.
 | Store layout, JSONL fields, label/grouping/fork-lineage/turn-count/live-agent semantics, and the routing tables (hand-off, `Ctrl-R`, `Ctrl-K`, `Event::Paste`) | DOMAIN |
 | Fail-soft / authoritative-from-file / isolation / styling rules, testing conventions | PATTERNS |
 | Commands, env vars, CI + release automation, validation checklist | OPERATIONS |
-| External `claude` CLI surface (flags, commands, version pin, spawned argv) | CLAUDE_CLI |
+| External `claude` CLI surface (flags, commands, version pin, spawned argv, the captured `--model` alias set + its refresh command) | CLAUDE_CLI |
+| The runtime reader of that alias set (`model_aliases`) and how its answer reaches the board | ARCHITECTURE |
 | Critical rules + engineering principles | AGENTS.md |
 
 ## Maintenance

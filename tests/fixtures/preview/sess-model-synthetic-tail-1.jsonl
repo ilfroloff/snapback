@@ -1,0 +1,5 @@
+{"type":"summary","summary":"Session that ran into its limit"}
+{"type":"agent-setting","agentSetting":"lead","sessionId":"sess-model-synthetic-tail-1"}
+{"type":"user","sessionId":"sess-model-synthetic-tail-1","cwd":"/Users/me/project-alpha","gitBranch":"main","timestamp":"2026-07-04T10:00:00.000Z","message":{"role":"user","content":"Plan the migration"}}
+{"type":"assistant","sessionId":"sess-model-synthetic-tail-1","cwd":"/Users/me/project-alpha","gitBranch":"main","timestamp":"2026-07-04T10:00:05.000Z","message":{"role":"assistant","model":"claude-opus-4-8","content":"Here is the migration plan."}}
+{"type":"assistant","sessionId":"sess-model-synthetic-tail-1","cwd":"/Users/me/project-alpha","gitBranch":"main","timestamp":"2026-07-04T10:02:00.000Z","isApiErrorMessage":true,"message":{"role":"assistant","model":"<synthetic>","content":"You've hit your session limit. Resets at 3pm."}}

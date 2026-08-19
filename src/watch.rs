@@ -32,6 +32,7 @@ use notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_mini::{new_debouncer, DebounceEventResult, DebouncedEventKind, Debouncer};
 
 use crate::agents::{self, ReportedAgent};
+use crate::model_aliases;
 use crate::store::discover::{is_session_path, store_depth, StoreDepth};
 
 /// Debounce window for coalescing filesystem event storms into one reload.
@@ -198,6 +199,24 @@ pub enum AppEvent {
         /// downgrade is never auto-dismissed.
         success: bool,
     },
+    /// The `--model` aliases the INSTALLED `claude` binary accepts, read off that
+    /// binary OFF the UI thread and delivered on the same channel so the ~290 MB
+    /// scan can never block rendering (see
+    /// [`crate::model_aliases::installed_model_aliases`]).
+    ///
+    /// Like [`SendFinished`](Self::SendFinished), and unlike the recurring
+    /// [`ReportedAgents`](Self::ReportedAgents), this fires EXACTLY ONCE per board
+    /// session, from a thread spawned for that one scan rather than from a poller:
+    /// the answer describes an installed binary, which cannot change underneath a
+    /// running board without the install being replaced.
+    ///
+    /// An EMPTY vector is the probe's documented "could not read it" answer and is
+    /// delivered as such rather than swallowed, because the board's response is the
+    /// same either way — keep the compile-time seed
+    /// ([`crate::tui::app::MODEL_ALIASES`]). Nothing waits on this event: the
+    /// `Ctrl-X m` picker draws the seed until it lands, and draws it forever if it
+    /// never does.
+    ModelAliases(Vec<String>),
     /// A periodic wake-up. The update loop does nothing costly on this.
     Tick,
 }
@@ -459,6 +478,31 @@ impl EventLoop {
         );
     }
 
+    /// Start the OFF-THREAD `--model` alias probe (real runtime path only).
+    ///
+    /// Spawns a dedicated thread that reads the accepted alias set out of the
+    /// installed `claude` binary and delivers it ONCE as
+    /// [`AppEvent::ModelAliases`], so the walk of that ~290 MB file (measured at
+    /// ~125 ms release, ~2.2 s debug) can never block rendering. Not started by
+    /// [`new`](Self::new), for the same reason
+    /// [`spawn_agents_poller`](Self::spawn_agents_poller) is not: the event-loop
+    /// unit tests must never read a real install.
+    ///
+    /// This is the ONE production call site, and where the real probe
+    /// ([`crate::model_aliases::installed_model_aliases`]) is named.
+    ///
+    /// [`crate::tui::run`] calls it once per BOARD SESSION rather than once per
+    /// process, which is deliberate on both counts. The SCAN still happens at most
+    /// once — `installed_model_aliases` memoizes into a process-lifetime `OnceLock`,
+    /// so a later session's thread only re-delivers the cached answer — while
+    /// re-delivering is what makes the result survive a resume round trip: each
+    /// board session builds a FRESH [`EventLoop`] and drops the previous receiver,
+    /// so a probe still in flight across a hand-off would otherwise have its one send
+    /// fail and its answer be lost for the rest of the process.
+    pub fn spawn_model_alias_probe(&self) {
+        spawn_model_alias_thread(self.tx.clone(), model_aliases::installed_model_aliases);
+    }
+
     /// A clone of the merged channel's sender, for spawning a one-shot off-thread
     /// producer that delivers back onto the SAME receiver.
     ///
@@ -590,6 +634,38 @@ where
             Err(_) => break,
         }
     })
+}
+
+/// Run `probe` OFF-THREAD and deliver its answer as a single
+/// [`AppEvent::ModelAliases`].
+///
+/// A ONE-SHOT in [`crate::send::spawn_send`]'s shape, NOT
+/// [`spawn_agents_thread`]'s: it sends once and the thread returns, so there is no
+/// loop to bound and no shutdown flag to read. PATTERNS §6 insists on reasoning
+/// about the flag FIRST precisely because a LOOPING producer can outlive its
+/// receiver and accumulate one thread per resume round trip; a thread that sends
+/// once and ends structurally cannot. A failed send is not an exit condition here
+/// either, merely a dropped result — the receiver went away, and the next board
+/// session spawns this again.
+///
+/// It is NOT a third entry on the list of documented one-shot EXCEPTIONS in
+/// AGENTS.md's OFF-UI-THREAD rule. Those two — the liveness probe at hand-off and
+/// the worktree resolve — are exceptions because they run ON the UI thread and are
+/// argued at their call sites for it. This runs on its own thread and delivers an
+/// `AppEvent`, which is that rule's ORDINARY case, so nothing here needs excusing.
+///
+/// `probe` is a PARAMETER for the same reason [`spawn_agents_thread`]'s `poll` is:
+/// a SEAM production swaps exactly never, so the suite can STATE an answer instead
+/// of walking a 290 MB binary it has no business shipping.
+/// [`EventLoop::spawn_model_alias_probe`] is the only site that names a real one.
+fn spawn_model_alias_thread<F>(tx: Sender<AppEvent>, probe: F)
+where
+    F: FnOnce() -> Vec<String> + Send + 'static,
+{
+    thread::spawn(move || {
+        // A send failure means the receiver (TUI) has gone away; ignore it.
+        let _ = tx.send(AppEvent::ModelAliases(probe()));
+    });
 }
 
 /// Emit an [`AppEvent::Tick`] every `interval` until the receiver drops.
@@ -1408,6 +1484,95 @@ mod tests {
             "the poller must exit within one interval of the shutdown flag being set, \
              even though an idle board never attempts the send that used to be its only exit"
         );
+    }
+
+    // --- spawn_model_alias_thread: the one-shot `--model` probe ---------------
+
+    /// The load-bearing property of the alias probe, stated at its real seam: the
+    /// spawn RETURNS before the probe does.
+    ///
+    /// That is the entire licence for `model_aliases`' deliberately unoptimized
+    /// ~2.2 s debug scan — nothing waits on it, so the board draws its seed and
+    /// keeps going. Pinned by stating a probe that blocks, and asserting the spawn
+    /// came back first; a version that ran the probe inline (or joined its thread)
+    /// fails on the clock rather than merely being slower.
+    ///
+    /// The rest of the shape is asserted in the same pass because it is one thread's
+    /// whole life: it delivers the stated answer VERBATIM, exactly ONCE, and then
+    /// ENDS — proved by the receiver disconnecting, since the thread owns the only
+    /// sender. A poller would keep it open.
+    #[test]
+    fn the_model_alias_probe_runs_off_thread_and_delivers_exactly_once() {
+        /// How long the stated probe blocks before answering. Comfortably longer
+        /// than a spawn takes, so an INLINE call cannot beat it by luck; short
+        /// enough to keep the suite fast.
+        const PROBE_BLOCKS: Duration = Duration::from_millis(300);
+
+        let (tx, rx) = mpsc::channel::<AppEvent>();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let probe_calls = Arc::clone(&calls);
+
+        let spawned_at = Instant::now();
+        spawn_model_alias_thread(tx, move || {
+            thread::sleep(PROBE_BLOCKS);
+            probe_calls.fetch_add(1, Ordering::Relaxed);
+            vec!["sonnet".to_string(), "opusplan".to_string()]
+        });
+        let returned_in = spawned_at.elapsed();
+
+        assert!(
+            returned_in < PROBE_BLOCKS,
+            "spawning must return before the probe finishes — it returned in \
+             {returned_in:?} against a probe that blocks for {PROBE_BLOCKS:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "the probe cannot have run yet, so nothing on the caller's thread \
+             waited for the scan"
+        );
+
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(AppEvent::ModelAliases(aliases)) => assert_eq!(
+                aliases,
+                ["sonnet", "opusplan"],
+                "the delivered set must be the one the probe returned, verbatim"
+            ),
+            other => panic!("the probe must deliver ModelAliases, got {other:?}"),
+        }
+
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Err(RecvTimeoutError::Disconnected) => {}
+            other => panic!(
+                "a ONE-SHOT sends once and its thread ends, dropping the only sender; \
+                 got {other:?}"
+            ),
+        }
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "exactly one probe: this is not a poller"
+        );
+    }
+
+    /// FAIL-SOFT: the probe's documented "could not read it" answer is an EMPTY set,
+    /// and it is DELIVERED rather than swallowed.
+    ///
+    /// Keeping the delivery honest is what lets the consumer own the fallback: an
+    /// empty list means "keep the seed" one place only (`app::offered_model_aliases`),
+    /// so a thread that quietly dropped empties would be a second, silent policy.
+    #[test]
+    fn a_probe_that_found_nothing_still_delivers_its_empty_answer() {
+        let (tx, rx) = mpsc::channel::<AppEvent>();
+        spawn_model_alias_thread(tx, Vec::new);
+
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(AppEvent::ModelAliases(aliases)) => assert!(
+                aliases.is_empty(),
+                "a probe that found nothing delivers nothing, got {aliases:?}"
+            ),
+            other => panic!("an empty answer is still an answer, got {other:?}"),
+        }
     }
 
     // --- classify_with_metadata matrix tests (pure, no filesystem) ---

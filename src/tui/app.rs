@@ -138,8 +138,10 @@ const DELETE_CONFIRM_PROMPT: &str = "Permanently delete this transcript from dis
 ///
 /// **The shipped option is not free either, and its cost is on the HEIGHT axis.**
 /// The sentence adds ONE wrapped row (4 → 5 at the 60-column inner width).
-/// `view::centered_rect` clamps the box and `render_modal` draws top-down with no
-/// vertical scroll, so the button strip now needs a terminal 9 rows tall instead of
+/// `view::centered_rect` clamps the box and `render_modal` draws a `Row` layout
+/// top-down with no vertical scroll — the scrolling viewport it grew is the `List`
+/// layout's, where the rows are a picker's DATA rather than a fixed button strip —
+/// so the button strip now needs a terminal 9 rows tall instead of
 /// 8 and the `Esc cancel` footer 11 instead of 10 — a terminal exactly 8 rows tall
 /// loses a strip it used to draw. One row is what THIS sentence costs, NOT a floor
 /// under any disclosure (a short enough prefix reflows nothing); the first draft
@@ -293,15 +295,16 @@ pub enum ModalLayout {
     /// choice; a delete confirm). Binds the horizontal keys on top of the shared
     /// vertical ones.
     Row,
-    /// A vertical list of rows (the new-session agent picker). Vertical keys only.
+    /// A vertical list of rows (the new-session agent picker; the `Ctrl-X m` model
+    /// picker). Vertical keys only.
     List,
 }
 
 /// What confirming a [`ModalChoice`] does — a plain tag the ONE generic confirm
 /// handler matches on, so a single handler serves every modal: the running-session
-/// overlay (`Attach`/`Fork`/`Cancel`), the new-session picker (`New`), and the
-/// hard-delete confirm (`Delete`). Carries no borrowed data so it can ride on a
-/// choice.
+/// overlay (`Attach`/`Fork`/`Cancel`), the new-session picker (`New`), the
+/// hard-delete confirm (`Delete`/`DeleteLineage`), and the model picker
+/// (`SetModel`). Carries no borrowed data so it can ride on a choice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModalAction {
     /// Attach to the running session's background agent (`claude attach <job-id>`),
@@ -336,6 +339,20 @@ pub enum ModalAction {
     /// The confirm handler guards each member individually and deletes the ones
     /// that pass; one busy fork must not block the rest of the family.
     DeleteLineage(Vec<String>),
+    /// Set the board's sticky `--model` override to the named alias, or CLEAR it
+    /// with `None` (the picker's "default (settings)" row, which emits no flag at
+    /// all).
+    ///
+    /// The alias rides the choice for the same reason [`ModalAction::New`]'s agent
+    /// name does — confirm needs no index-to-alias lookup — and the `Option` means
+    /// the clear and the set are ONE action rather than two, so the picker's first
+    /// row is an ordinary row and no handler can implement "clear" differently from
+    /// "set to nothing".
+    ///
+    /// The only [`ModalAction`] that changes board state and hands off NOTHING: it
+    /// spawns no child and ends no board session, since the override applies to the
+    /// NEXT hand-off rather than performing one.
+    SetModel(Option<String>),
     /// Dismiss the modal, returning to the board.
     Cancel,
 }
@@ -462,13 +479,15 @@ impl NewSessionDraft {
 
 /// A titled, centered prompt with N labelled choices and a wrapping-cycle
 /// highlight — the ONE overlay model behind the running-session choice, the
-/// new-session agent picker, and (later) a delete confirm.
+/// new-session agent picker, the hard-delete confirm, and the `Ctrl-X m` model
+/// picker.
 ///
 /// Modeled as explicit state so the whole overlay is a small, unit-testable state
 /// machine that owns the keyboard while open. `selected` is a `rem_euclid` index
 /// over `choices` (wraps both directions, both layouts). `session_id` is the
 /// target a session-addressed action routes to (`Some` for Attach/Fork/delete);
-/// the picker leaves it `None` because a new session has no source.
+/// both pickers leave it `None` — a new session has no source, and the model
+/// override addresses the board rather than any one row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Modal {
     /// The bordered box title (rendered padded with a space either side).
@@ -482,8 +501,23 @@ pub struct Modal {
     /// The highlighted choice, an index into `choices` (wraps via `rem_euclid`).
     pub selected: usize,
     /// The session a session-addressed action (Attach/Fork/delete) targets;
-    /// `None` for the picker, which starts a fresh session with no target.
+    /// `None` for the two pickers, which target no existing row.
     pub session_id: Option<String>,
+    /// First VISIBLE choice — the `List` layout's scroll offset, so a picker with
+    /// more rows than the terminal can hold still reaches all of them.
+    ///
+    /// Seeded at 0 and owned end to end by the view, exactly as `App::scroll` is
+    /// owned by `view::render_list` and `App::preview_scroll` by
+    /// `view::render_preview`: only the render knows the viewport height, so
+    /// [`view::render_modal`](crate::tui::view) resolves this against the CLAMPED
+    /// box and writes the resolved value back (PATTERNS §5). Inert for the `Row`
+    /// layout, which has no list to scroll.
+    ///
+    /// It is an offset rather than a derived function of `selected` for the same
+    /// reason the board list keeps one: a memoryless window would have to re-centre
+    /// on every keypress, where an offset only moves when the selection actually
+    /// leaves it.
+    pub scroll: usize,
 }
 
 impl Modal {
@@ -514,6 +548,95 @@ pub fn pick_default_index(last: Option<&str>, agents: &[DefinedAgent]) -> usize 
             .position(|a| a.name == name)
             .map_or(0, |i| i + 1),
         None => 0,
+    }
+}
+
+/// The `--model` aliases the picker offers at COLD START — a SEED, not the source
+/// of truth.
+///
+/// [`crate::model_aliases::installed_model_aliases`] reads the accepted set out of
+/// the INSTALLED `claude` binary, off the UI thread, and delivers it as
+/// [`AppEvent::ModelAliases`](crate::watch::AppEvent::ModelAliases). From that
+/// moment the probe's answer is what the picker offers, verbatim. This list is only
+/// what the board can show in the frames before that lands — and what it falls back
+/// to when the probe finds nothing (see [`offered_model_aliases`]).
+///
+/// **A stale seed is now COSMETIC rather than a bug, and it must NOT be
+/// hand-refreshed.** It used to be the picker's entire vocabulary, so a missing
+/// alias was simply unreachable and re-syncing this list against each `claude`
+/// release was the fix; that hand-synced artifact is exactly what the probe exists
+/// to delete, and re-adopting the habit would quietly restore it. As it stands the
+/// seed is wrong on four of the installed binary's nine entries (`best` and the
+/// three `[1m]` long-context variants are missing) and that costs nothing: the
+/// probe corrects it within the first frames of a board session.
+///
+/// It carries no `default` entry, and that is a SHAPE agreement rather than a
+/// trim: the probe never emits one — the accepted set the binary carries has no
+/// `default`, which was snapback's own synthetic word for "no override" — so the
+/// seed and the live answer are the same kind of list and the row builder has one
+/// case, not two. Clearing the override is [`MODEL_DEFAULT_LABEL`]'s row, which
+/// states it more strictly by emitting no flag at all.
+/// (NO MAGIC VALUES: the set is named here, never spelled inline.)
+pub const MODEL_ALIASES: [&str; 5] = ["fable", "haiku", "opus", "opusplan", "sonnet"];
+
+/// The picker's synthetic first row — the one that CLEARS the override.
+///
+/// It is NOT an alias and has no counterpart in the probe's output: the accepted
+/// set read off the binary carries no `default`, so this row says "let your claude
+/// settings decide" the only way that is exactly true, by emitting no `--model`
+/// flag at all ([`ModalAction::SetModel`]`(None)`). Mirrors the agent picker's
+/// "default (no agent)" row.
+const MODEL_DEFAULT_LABEL: &str = "default (settings)";
+
+/// The aliases the picker offers: the runtime `probed` set when there is one, the
+/// [`MODEL_ALIASES`] seed when there is not.
+///
+/// Pure, so the one decision this feature turns on is unit-tested rather than only
+/// observed through a rendered modal. `probed` is
+/// [`crate::model_aliases::installed_model_aliases`]' answer as delivered by
+/// [`App::set_model_aliases`], and it is EMPTY in two situations — the probe has
+/// not answered yet, and the probe answered with nothing (no `claude` on `PATH`, an
+/// unreadable binary, no match). Collapsing them is deliberate: both say "there is
+/// no live answer", the board's move is the same either way, and folding them makes
+/// seed-until-delivered and degrade-on-failure the SAME line of code rather than
+/// two that could drift apart.
+///
+/// The probe's answer is passed through **UNFILTERED and in UPSTREAM ARRAY
+/// ORDER** — not sorted, not deduplicated, not screened against the seed, and not
+/// stripped of entries snapback does not recognise. That restraint is the whole
+/// point of the change. Any curated filter here would re-create the hand-synced
+/// artifact this replaced (a list snapback must be re-released to widen) and would
+/// do it INVISIBLY, since a newly-shipped alias would simply never appear. An alias
+/// snapback has never heard of is precisely the case the probe exists to serve: it
+/// renders bare (see [`model_alias_hint`]) and reaches `--model` raw, which is
+/// claude's to accept or reject.
+#[must_use]
+fn offered_model_aliases(probed: &[String]) -> Vec<&str> {
+    if probed.is_empty() {
+        return MODEL_ALIASES.to_vec();
+    }
+    probed.iter().map(String::as_str).collect()
+}
+
+/// The dim one-line blurb the picker trails a KNOWN alias with, or `None`.
+///
+/// BEST-EFFORT COSMETIC, and deliberately partial. The rows come from the runtime
+/// probe ([`offered_model_aliases`]), so the picker routinely offers aliases this
+/// match has never heard of; those render BARE, and that is correct behaviour
+/// rather than a gap to fill. It must NEVER gate which rows appear: a hint table
+/// that decided the vocabulary would be the hand-synced list all over again, and it
+/// would fail CLOSED — hiding exactly the newly-shipped alias the probe went to the
+/// trouble of finding.
+///
+/// Only `opusplan` earns one today, and it is the reason the picker exists at all:
+/// it runs Opus for PLAN mode and the resting model otherwise — "plan with Opus,
+/// implement with Sonnet" as one alias — and it is absent from `claude --help`, so
+/// a user cannot discover that from the CLI. Pure so the wording is assertable.
+#[must_use]
+fn model_alias_hint(alias: &str) -> Option<&'static str> {
+    match alias {
+        "opusplan" => Some("Opus while planning, the resting model otherwise"),
+        _ => None,
     }
 }
 
@@ -1287,6 +1410,61 @@ pub struct App {
     /// agent). In-memory ONLY — never persisted to disk — so the NEXT `Ctrl-N`
     /// pre-highlights it for a one-keystroke repeat.
     last_new_agent: Option<String>,
+    /// The `--model` aliases the INSTALLED `claude` accepts, read off that binary at
+    /// runtime — EMPTY until the one-shot probe delivers, and empty again if it
+    /// found nothing.
+    ///
+    /// DERIVED, IN-MEMORY state: it describes another program's binary, snapback
+    /// owns none of it, and nothing here ever reaches disk. AGENTS.md settles that
+    /// category twice over — THE PARSE CACHE keeps derived state in memory, and
+    /// SNAPBACK-OWNED STATE keeps the hidden-session id set the only thing snapback
+    /// persists. Written only by [`set_model_aliases`](Self::set_model_aliases),
+    /// from [`AppEvent::ModelAliases`](crate::watch::AppEvent::ModelAliases); read
+    /// only by [`offered_model_aliases`], which decides what the picker offers.
+    ///
+    /// Starting EMPTY is what makes "the picker draws the seed until the probe
+    /// delivers" STRUCTURAL rather than incidental. There is no pending flag to
+    /// consult and nothing a render could wait on: the field just holds a list, the
+    /// picker builds its rows from whatever it holds at the instant `Ctrl-X m` opens
+    /// it, and an empty list means the seed. That is also why the ~290 ms/~2.2 s
+    /// scan is allowed to be deliberately unoptimized — nothing is blocked on it.
+    model_aliases: Vec<String>,
+    /// The STICKY `--model` override picked with `Ctrl-X m`, or pre-armed by the
+    /// `--model <value>` launch flag (`None` = no override: the model your `claude`
+    /// settings choose). Every later interactive hand-off — Resume, Fork and New —
+    /// carries it until it is cleared, which is why the header renders it
+    /// persistently: a mode that changes every hand-off must not be invisible.
+    ///
+    /// **A launch-time `--model` is a PER-INVOCATION REQUEST, not stored state, so
+    /// it does not widen the SNAPBACK-OWNED STATE rule.** The distinction that rule
+    /// draws is about what snapback WRITES, and the flag writes nothing: the value
+    /// arrives on this run's argv, is held in this field for this board session, and
+    /// is gone when the process is. It lands through
+    /// [`set_model_override`](Self::set_model_override) — the same single setter the
+    /// picker uses — precisely so there is no second path that could grow one. A
+    /// shell alias carrying `--model` looks persistent from the outside, but the
+    /// durable thing there is the ALIAS, which is the user's own file and not
+    /// snapback's; nothing under `$SNAPBACK_CONFIG_DIR` learns the value, and the
+    /// hidden-session id set remains the only thing snapback persists.
+    ///
+    /// IN-MEMORY ONLY, and never persisted. AGENTS.md's SNAPBACK-OWNED STATE rule
+    /// limits everything snapback writes to disk to the hidden-session id set, so
+    /// this deliberately does NOT join it: a restart forgets the override and the
+    /// board goes back to emitting no flag at all. That is also the safer default —
+    /// a persisted model choice would silently re-price every session started days
+    /// later, with nothing on disk to explain it.
+    ///
+    /// Held as the raw alias string rather than an enum over [`MODEL_ALIASES`]
+    /// because `--model` also accepts a full model id: the picker offers the
+    /// aliases, and the argv seam ([`crate::resume::argv_for`]) formats whatever
+    /// this holds without validating it — an unknown value is claude's to reject.
+    ///
+    /// The ONE thing it can never hold is a BLANK string:
+    /// [`set_model_override`](Self::set_model_override) normalizes an empty or
+    /// whitespace-only value to `None`, so `Some(_)` always means a value that
+    /// actually reaches claude and the header can render it unconditionally. That is
+    /// a "no value asked for" rule, NOT validation of the value — see that setter.
+    pub model_override: Option<String>,
     /// Whether the list/preview splitter is currently being dragged (mouse
     /// button down on the seam). Private: only the drag methods below need
     /// it, mirroring `scoped`/`preview_cache`/`index`.
@@ -1368,7 +1546,8 @@ pub struct App {
     pub show_hidden: bool,
     /// Whether a `Ctrl-X` leader chord is pending — the moment between the leader
     /// keypress and its follow-up (`x` hide, `d` hard-delete, `h` show-hidden,
-    /// anything else cancels). While `true` the view draws the which-key hint and
+    /// `m` model override, `r` rescan, anything else cancels). While `true` the
+    /// view draws the which-key hint and
     /// [`handle_event`](crate::tui::update) routes the NEXT key through the pure
     /// `chord_key` machine BEFORE normal key handling, so a printable follow-up
     /// never leaks into the search query.
@@ -1528,6 +1707,13 @@ impl App {
             interrupting: None,
             next_bg_launch_id: 0,
             last_new_agent: None,
+            // No live answer yet, so the picker offers the `MODEL_ALIASES` seed. The
+            // probe delivers onto the event channel some frames from now; nothing
+            // waits for it here (see the field docs).
+            model_aliases: Vec::new(),
+            // No override: every hand-off emits no `--model` at all, exactly as it
+            // did before the picker existed. Nothing on disk can seed this.
+            model_override: None,
             dragging_split: false,
             scoped: Vec::new(),
             population: Vec::new(),
@@ -2413,6 +2599,9 @@ impl App {
             ],
             selected: 0,
             session_id: Some(session_id),
+            // The view resolves and writes back the list window; every modal opens
+            // at the top.
+            scroll: 0,
         });
     }
 
@@ -2493,6 +2682,9 @@ impl App {
             choices,
             selected,
             session_id: Some(id),
+            // The view resolves and writes back the list window; every modal opens
+            // at the top.
+            scroll: 0,
         });
     }
 
@@ -2721,6 +2913,9 @@ impl App {
             choices,
             selected,
             session_id: None,
+            // The view resolves and writes back the list window; every modal opens
+            // at the top.
+            scroll: 0,
         });
     }
 
@@ -2728,6 +2923,116 @@ impl App {
     /// agent), so the next `Ctrl-N` pre-highlights it. In-memory only.
     pub fn set_last_new_agent(&mut self, agent: Option<String>) {
         self.last_new_agent = agent;
+    }
+
+    /// Open the model picker (`Ctrl-X m`) as a `List`-layout [`Modal`], one row per
+    /// alias [`offered_model_aliases`] hands back, pre-highlighting whatever the
+    /// override is now.
+    ///
+    /// The rows are built HERE, at open time, from whatever
+    /// [`model_aliases`](Self::model_aliases) holds at that instant — the runtime
+    /// probe's answer once it has landed, the [`MODEL_ALIASES`] seed before then.
+    /// That is the whole of the seed-until-delivered behaviour: no waiting, no
+    /// pending state, and a picker opened in the first frames of a session simply
+    /// shows the seed. Nothing rebuilds an ALREADY-OPEN picker either — a modal is a
+    /// snapshot of the choice it was opened on, and re-writing its rows underneath
+    /// the user would move the selection they are looking at.
+    ///
+    /// Choice 0 is the synthetic "default (settings)" row, which CLEARS the
+    /// override ([`ModalAction::SetModel`]`(None)`) so no flag is emitted and the
+    /// user's `claude` settings decide again. It is the only row not drawn from the
+    /// alias list, because "no override" is not something `--model` can express.
+    ///
+    /// The pre-highlight is found by matching the built choices against the current
+    /// override rather than by index arithmetic, so it cannot drift from the rows
+    /// (an override that is no longer offered falls back to row 0, never panics) —
+    /// which now covers a real case rather than a hypothetical one: the offered set
+    /// can CHANGE mid-session, the moment the probe replaces the seed.
+    /// Mirrors [`open_agent_picker`](Self::open_agent_picker) throughout — same
+    /// layout, same "synthetic default first" shape, same one-key confirm.
+    pub fn open_model_picker(&mut self) {
+        let mut choices = vec![ModalChoice {
+            label: MODEL_DEFAULT_LABEL.to_string(),
+            description: Some("no --model flag; your claude settings decide".to_string()),
+            action: ModalAction::SetModel(None),
+        }];
+        for alias in offered_model_aliases(&self.model_aliases) {
+            choices.push(ModalChoice {
+                label: alias.to_string(),
+                description: model_alias_hint(alias).map(ToOwned::to_owned),
+                action: ModalAction::SetModel(Some(alias.to_string())),
+            });
+        }
+        let current = ModalAction::SetModel(self.model_override.clone());
+        let selected = choices
+            .iter()
+            .position(|choice| choice.action == current)
+            .unwrap_or(0);
+        self.open_modal(Modal {
+            title: "model".to_string(),
+            message: "Model for the next resume / fork / new session:".to_string(),
+            layout: ModalLayout::List,
+            choices,
+            selected,
+            session_id: None,
+            // The view resolves and writes back the list window; every modal opens
+            // at the top.
+            scroll: 0,
+        });
+    }
+
+    /// Set (or, with `None`, clear) the sticky `--model` override.
+    ///
+    /// The single writer of [`model_override`](Self::model_override), mirroring
+    /// [`set_last_new_agent`](Self::set_last_new_agent). In-memory only — nothing
+    /// here touches disk, per AGENTS.md SNAPBACK-OWNED STATE.
+    ///
+    /// TWO callers reach it and both are one-liners over this one write: the
+    /// `Ctrl-X m` picker's [`ModalAction::SetModel`] confirm, and `lib::run` seeding
+    /// the `--model` launch flag. Keeping it one setter is what stops a launch flag
+    /// and a picked row from meaning subtly different things — the flag pre-arms the
+    /// state the picker owns, rather than a parallel one it would have to be
+    /// reconciled with. It is also why the guard below is written HERE: one setter
+    /// covers both doors, and no later caller can reintroduce the state.
+    ///
+    /// **A BLANK or whitespace-only value normalizes to `None` — no value asked for
+    /// is no override.** That is the same answer `cli::parse_from` already gives a
+    /// TRAILING `--model` with nothing after it; a value that is present but empty
+    /// now agrees with it. Only `--model ""` can reach here that way, since the
+    /// picker offers no blank row. The argv seam
+    /// ([`crate::resume::push_model_flag`]'s shared trim/blank guard) already
+    /// emitted nothing for it, so without this the board held an override that was
+    /// visible in the header and did nothing.
+    ///
+    /// **It is NOT validation and must not become one.** Nothing about the string is
+    /// inspected beyond it being blank: an unknown-but-non-blank value is stored
+    /// verbatim and stays claude's to reject
+    /// ([`crate::resume::MODEL_NONZERO_HINT`]), because snapback holds no list it
+    /// could check one against without going stale on the next claude release.
+    pub fn set_model_override(&mut self, model: Option<String>) {
+        self.model_override = model.filter(|value| !value.trim().is_empty());
+    }
+
+    /// Adopt the `--model` alias set read off the installed `claude` binary.
+    ///
+    /// The single writer of [`model_aliases`](Self::model_aliases), and a plain swap
+    /// — the blocking scan ran on its own thread and its answer arrived as
+    /// [`AppEvent::ModelAliases`](crate::watch::AppEvent::ModelAliases), so there is
+    /// no I/O here. Mirrors
+    /// [`set_reported_agents`](Self::set_reported_agents): an off-thread reading
+    /// lands in one field and the surfaces that care read it later.
+    ///
+    /// An EMPTY `aliases` is accepted as-is rather than rejected. It is the probe's
+    /// documented "could not read it" answer, and storing it changes nothing —
+    /// [`offered_model_aliases`] reads empty as "keep the seed", so a failed probe
+    /// can never produce an empty picker.
+    ///
+    /// It deliberately touches NO other state. In particular it sets no status:
+    /// which aliases are on offer is a fact true over an INTERVAL, so it renders on
+    /// the surface that owns it — the picker — never on the keypress-scoped help
+    /// line (AGENTS.md: STATUS-LINE OWNERSHIP). Nothing on disk learns it either.
+    pub fn set_model_aliases(&mut self, aliases: Vec<String>) {
+        self.model_aliases = aliases;
     }
 
     // --- autorefresh reload -----------------------------------------------
@@ -7313,6 +7618,312 @@ mod tests {
             app.modal.as_ref().unwrap().selected_action(),
             Some(&ModalAction::New(Some("beta".to_string()))),
             "the picker opens on the last-picked agent"
+        );
+    }
+
+    // --- model picker (Ctrl-X m) ------------------------------------------
+
+    /// The alias array the installed `claude 2.1.233` accepts, in wire order — the
+    /// answer `model_aliases::installed_model_aliases` delivers on this machine, and
+    /// byte-identical across the four versions `src/model_aliases.rs` pins.
+    ///
+    /// Spelled out here rather than reached for so these tests state a PROBE RESULT
+    /// without reading a 290 MB binary. It deliberately differs from
+    /// [`MODEL_ALIASES`] in both LENGTH and ORDER (nine against five, `sonnet` first
+    /// rather than last) — a fixture that agreed with the seed could not tell the
+    /// probe's answer from the seed's and would pass against a picker that ignored
+    /// the probe entirely.
+    const PROBED: [&str; 9] = [
+        "sonnet",
+        "opus",
+        "haiku",
+        "fable",
+        "best",
+        "sonnet[1m]",
+        "opus[1m]",
+        "fable[1m]",
+        "opusplan",
+    ];
+
+    /// `PROBED` as the setter takes it.
+    fn probed() -> Vec<String> {
+        PROBED.iter().map(|a| (*a).to_string()).collect()
+    }
+
+    /// The picker's cold-start rows: the synthetic clear-the-override row first,
+    /// then the [`MODEL_ALIASES`] SEED — which is what a board draws in the frames
+    /// before the runtime probe delivers, and forever if it never does.
+    ///
+    /// The seed carries no `default` of its own: the probe never emits one, so
+    /// dropping it keeps the two lists the same SHAPE, and row 0 already says "let
+    /// the settings decide" more strictly (no flag at all, rather than
+    /// `--model default`).
+    #[test]
+    fn the_model_picker_opens_on_the_seed_before_the_probe_answers() {
+        let mut app = app_all(vec![session("s", "r", Some("main"), "/tmp/s")]);
+        app.open_model_picker();
+        let modal = app.modal.clone().expect("the model picker is open");
+
+        assert_eq!(modal.layout, ModalLayout::List, "a vertical picker");
+        assert_eq!(modal.session_id, None, "the override targets no single row");
+        assert_eq!(
+            modal.choices.len(),
+            MODEL_ALIASES.len() + 1,
+            "one row per seeded alias, plus the synthetic clear row"
+        );
+        assert_eq!(modal.choices[0].label, MODEL_DEFAULT_LABEL);
+        assert_eq!(modal.choices[0].action, ModalAction::SetModel(None));
+
+        // Asserted BEFORE the rows, so it is the seed's own shape that is pinned and
+        // not merely a consequence of the row list below happening to omit it.
+        assert!(
+            !MODEL_ALIASES.contains(&"default"),
+            "the seed must not carry a `default` the probe can never emit: \
+             {MODEL_ALIASES:?}"
+        );
+        let labels: Vec<&str> = modal.choices.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                MODEL_DEFAULT_LABEL,
+                "fable",
+                "haiku",
+                "opus",
+                "opusplan",
+                "sonnet"
+            ]
+        );
+        for (row, alias) in modal.choices.iter().skip(1).zip(labels.iter().skip(1)) {
+            assert_eq!(
+                row.action,
+                ModalAction::SetModel(Some((*alias).to_string())),
+                "each alias row carries its own name, so confirm needs no lookup"
+            );
+        }
+    }
+
+    /// The point of the whole change: once the probe delivers, the picker offers
+    /// THAT set — verbatim, complete, and in the binary's own order.
+    ///
+    /// Asserted against a fixture that differs from the seed in length AND order, so
+    /// a picker still reading the seed fails, and one that sorted or deduplicated
+    /// the probe's answer fails too. `best` and the three `[1m]` variants are named
+    /// individually because they are exactly the four the seed is missing — the gap
+    /// this feature closes without a snapback release.
+    #[test]
+    fn a_delivered_probe_replaces_the_seed_verbatim_and_in_upstream_order() {
+        let mut app = app_all(vec![session("s", "r", Some("main"), "/tmp/s")]);
+        app.set_model_aliases(probed());
+        app.open_model_picker();
+        let modal = app.modal.clone().expect("the model picker is open");
+
+        let labels: Vec<&str> = modal.choices.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(
+            labels[0], MODEL_DEFAULT_LABEL,
+            "the clear row still leads; it is not an alias and the probe never sends one"
+        );
+        assert_eq!(
+            &labels[1..],
+            PROBED.as_slice(),
+            "the probe's answer must arrive unfiltered, unsorted and in wire order"
+        );
+        for missing in ["best", "sonnet[1m]", "opus[1m]", "fable[1m]"] {
+            assert!(
+                !MODEL_ALIASES.contains(&missing) && labels.contains(&missing),
+                "{missing} is absent from the seed and must reach the picker through \
+                 the probe: {labels:?}"
+            );
+        }
+        for (row, alias) in modal.choices.iter().skip(1).zip(PROBED) {
+            assert_eq!(
+                row.action,
+                ModalAction::SetModel(Some(alias.to_string())),
+                "each probed row carries its own name, so confirm needs no lookup"
+            );
+        }
+    }
+
+    /// [`offered_model_aliases`] is the ONE decision, stated directly.
+    ///
+    /// EMPTY collapses two premises — the probe has not answered yet, and the probe
+    /// answered with nothing — onto the same seed, so a failed probe degrades rather
+    /// than emptying the picker. A non-empty answer is passed through untouched: no
+    /// sort, no dedupe, no screening against the seed, and no dropping of entries
+    /// snapback does not recognise. A curated filter there would rebuild the
+    /// hand-synced list this replaced, and would hide exactly the new alias the
+    /// probe went looking for.
+    #[test]
+    fn the_offered_aliases_are_the_probe_verbatim_or_the_seed_when_it_is_empty() {
+        assert_eq!(
+            offered_model_aliases(&[]),
+            MODEL_ALIASES.to_vec(),
+            "no live answer — not yet delivered, or delivered empty — keeps the seed"
+        );
+
+        assert_eq!(
+            offered_model_aliases(&probed()),
+            PROBED.to_vec(),
+            "a live answer is offered whole and in its own order"
+        );
+
+        // Shapes a curated filter would have quietly removed: an alias snapback has
+        // never heard of, a duplicate, and an order that is not sorted.
+        let odd = ["zeta-9".to_string(), "opus".to_string(), "opus".to_string()];
+        assert_eq!(
+            offered_model_aliases(&odd),
+            vec!["zeta-9", "opus", "opus"],
+            "an unknown alias, a duplicate and an unsorted order all pass through — \
+             what `--model` accepts is claude's to decide, never snapback's"
+        );
+    }
+
+    /// A probed alias with no blurb renders BARE, and that is the correct outcome.
+    ///
+    /// [`model_alias_hint`] is cosmetic and knows one alias; the rows come from the
+    /// probe. Pinned because the tempting "fix" — only offering aliases the hint
+    /// table recognises — fails CLOSED and would hide every newly-shipped alias.
+    #[test]
+    fn an_alias_the_hint_table_never_heard_of_is_still_offered_bare() {
+        let mut app = app_all(vec![session("s", "r", Some("main"), "/tmp/s")]);
+        app.set_model_aliases(vec!["zeta-9".to_string(), "opusplan".to_string()]);
+        app.open_model_picker();
+        let modal = app.modal.clone().expect("the model picker is open");
+
+        assert_eq!(model_alias_hint("zeta-9"), None, "nothing to say about it");
+        let unknown = modal
+            .choices
+            .iter()
+            .find(|c| c.label == "zeta-9")
+            .expect("an unrecognised alias is still a row");
+        assert_eq!(
+            unknown.description, None,
+            "it renders bare rather than being dropped"
+        );
+        assert_eq!(
+            unknown.action,
+            ModalAction::SetModel(Some("zeta-9".to_string())),
+            "and it is pickable — the value reaches --model raw"
+        );
+    }
+
+    /// `opusplan` is the alias the picker exists to surface — it is absent from
+    /// `claude --help`, so its behaviour is undiscoverable from the CLI — and it is
+    /// the ONLY row that needs a blurb.
+    #[test]
+    fn only_opusplan_carries_a_hint_and_it_names_plan_mode() {
+        let mut app = app_all(vec![session("s", "r", Some("main"), "/tmp/s")]);
+        app.open_model_picker();
+        let modal = app.modal.clone().expect("the model picker is open");
+
+        let opusplan = modal
+            .choices
+            .iter()
+            .find(|c| c.label == "opusplan")
+            .expect("opusplan is offered");
+        let hint = opusplan.description.as_deref().expect("opusplan explains");
+        assert!(
+            hint.contains("Opus") && hint.contains("plan"),
+            "the hint must say Opus runs while planning: {hint:?}"
+        );
+        for row in modal.choices.iter().filter(|c| c.label != "opusplan") {
+            // Row 0 keeps its own blurb (what CLEARING does); no other alias has one.
+            if row.label == MODEL_DEFAULT_LABEL {
+                continue;
+            }
+            assert_eq!(
+                row.description, None,
+                "{:?} needs no blurb; only opusplan is non-obvious",
+                row.label
+            );
+        }
+        assert_eq!(model_alias_hint("sonnet"), None);
+    }
+
+    /// The picker opens ON the current override, so `Ctrl-X m` then `Enter` is a
+    /// no-op rather than a silent reset — and a value that is no longer offered
+    /// falls back to row 0 instead of panicking on an out-of-range index.
+    #[test]
+    fn the_model_picker_pre_highlights_the_current_override() {
+        let mut app = app_all(vec![session("s", "r", Some("main"), "/tmp/s")]);
+
+        // No override -> the clear row.
+        app.open_model_picker();
+        assert_eq!(
+            app.modal.as_ref().unwrap().selected_action(),
+            Some(&ModalAction::SetModel(None))
+        );
+
+        app.set_model_override(Some("opus".to_string()));
+        app.open_model_picker();
+        assert_eq!(
+            app.modal.as_ref().unwrap().selected_action(),
+            Some(&ModalAction::SetModel(Some("opus".to_string()))),
+            "the picker opens on the model already in effect"
+        );
+
+        // A full model id (valid for `--model`, not an offered alias) is not a row.
+        app.set_model_override(Some("claude-sonnet-5".to_string()));
+        app.open_model_picker();
+        assert_eq!(
+            app.modal.as_ref().unwrap().selected,
+            0,
+            "an override with no row of its own falls back to the clear row"
+        );
+    }
+
+    /// The override is IN-MEMORY board state, written only through its setter, and
+    /// `None` genuinely clears it (never "set to the empty string", which the argv
+    /// seam would then have to guard a second time).
+    #[test]
+    fn the_model_override_is_set_and_cleared_through_its_setter() {
+        let mut app = app_all(vec![session("s", "r", Some("main"), "/tmp/s")]);
+        assert_eq!(
+            app.model_override, None,
+            "a fresh board emits no --model at all"
+        );
+
+        app.set_model_override(Some("haiku".to_string()));
+        assert_eq!(app.model_override.as_deref(), Some("haiku"));
+
+        app.set_model_override(None);
+        assert_eq!(
+            app.model_override, None,
+            "clearing must restore the no-flag state, not leave an empty value"
+        );
+    }
+
+    /// `--model ""` is the ONE door a blank value can arrive through (the picker
+    /// offers no blank row), and it must land as no override rather than as an
+    /// override of nothing — the argv seam already emits no flag for it, so the
+    /// board would otherwise hold one that is visible and inert.
+    ///
+    /// Pinned at the SETTER because that is where the guard belongs: both doors
+    /// write through it, so neither the launch flag nor a future third caller can
+    /// reintroduce the state every reader would then have to defend against.
+    ///
+    /// The last case is the line this must not cross: an unknown value is NOT
+    /// blank, so it is stored verbatim and stays claude's to reject.
+    #[test]
+    fn a_blank_model_override_is_no_override_at_all() {
+        let mut app = app_all(vec![session("s", "r", Some("main"), "/tmp/s")]);
+
+        app.set_model_override(Some(String::new()));
+        assert_eq!(
+            app.model_override, None,
+            "asking for no value is asking for no override"
+        );
+
+        app.set_model_override(Some("  \t ".to_string()));
+        assert_eq!(
+            app.model_override, None,
+            "whitespace-only is blank too — it would emit no flag either"
+        );
+
+        app.set_model_override(Some("no-such-model".to_string()));
+        assert_eq!(
+            app.model_override.as_deref(),
+            Some("no-such-model"),
+            "this is not validation: an unknown value passes through untouched"
         );
     }
 

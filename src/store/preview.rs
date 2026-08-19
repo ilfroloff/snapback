@@ -10,13 +10,20 @@
 //! GFM pipe tables.
 //!
 //! The `claude` separator also carries the BOUND agent handle in effect at that
-//! turn (`● claude · @lead · 12:55`), read from two record types: `agent-setting`
-//! (the interactive bind — a clean handle, authoritative) and `agent-name` (the
-//! background job's name, a fallback trusted only when it names a KNOWN defined
-//! agent, since that field also carries free-form job titles). Attribution is
-//! POSITIONAL — the agent is threaded as streaming state (exactly like the
-//! per-message day rollover), so a turn shows the agent set *before* it, and a late
-//! record never retroactively labels earlier turns.
+//! turn (`● claude · @lead · sonnet-5 · 12:55`), read from two record types:
+//! `agent-setting` (the interactive bind — a clean handle, authoritative) and
+//! `agent-name` (the background job's name, a fallback trusted only when it names a
+//! KNOWN defined agent, since that field also carries free-form job titles).
+//! Attribution is POSITIONAL — the agent is threaded as streaming state (exactly
+//! like the per-message day rollover), so a turn shows the agent set *before* it,
+//! and a late record never retroactively labels earlier turns.
+//!
+//! It carries the ANSWERING MODEL the same way, and positional for the same reason
+//! — but with no threading at all, because `message.model` sits on the very record
+//! being rendered ([`record_model`]). A session that switches model mid-file
+//! therefore labels each turn with its own, which real sessions do. `<synthetic>`,
+//! the pseudo-model Claude Code stamps on records it injects itself, is suppressed
+//! by [`model_label`], as is the total absence of a model (the common case).
 //!
 //! Ahead of the markdown pass, each message BODY runs through an allowlist-driven
 //! control-wrapper collapse ([`collapse_control_wrappers`]). Claude Code injects a
@@ -428,6 +435,58 @@ fn agent_handle(agent: Option<&str>) -> Option<String> {
     Some(format!("@{name}"))
 }
 
+/// The vendor prefix every Claude Code model id carries (`claude-sonnet-5`). The
+/// whole board is Claude, so repeating the vendor on every turn is noise — it is
+/// the ONLY thing [`model_label`] strips. (NO MAGIC VALUES: named here, like
+/// [`DEFAULT_AGENT`], never spelled inline.) Ids WITHOUT it (the bare `opus` /
+/// `sonnet` aliases that also appear on disk) are rendered unchanged.
+const MODEL_VENDOR_PREFIX: &str = "claude-";
+
+/// The model label to render for a turn — the model that actually ANSWERED it —
+/// or `None` when there is nothing worth showing. This is the SINGLE place that
+/// suppression decision lives, mirroring [`agent_handle`]. PURE — see the unit test.
+///
+/// Suppressed: an absent / null / non-string `message.model` (all of which reach
+/// here as `None` — see [`record_model`]) and a blank one; plus any `<…>`-wrapped
+/// PSEUDO-model. `<synthetic>` is the one that matters: Claude Code stamps it on
+/// records it injects ITSELF (a session-limit or auth notice), so it names no model
+/// that answered anything, and it is the LAST assistant model in real sessions —
+/// exactly where a naive "latest model" label would render it.
+///
+/// Otherwise the id is LOSSLESS beyond [`MODEL_VENDOR_PREFIX`]: `claude-sonnet-5`
+/// reads `sonnet-5`, and a dated id keeps its date (`claude-haiku-4-5-20251001` ->
+/// `haiku-4-5-20251001`) rather than being truncated into an ambiguous one.
+///
+/// # Two surfaces, one rule
+///
+/// `pub(crate)` rather than private because it now answers for BOTH places a model
+/// id reaches the screen: the DIM preview marker here, and the quick-reply
+/// completion status built from `modelUsage`
+/// ([`crate::send::status_for_send`]). Those two channels exist to be COMPARED —
+/// what the transcript recorded against what the send reported — so they must
+/// shorten and suppress identically or a difference in spelling would read as a
+/// difference in model. Hence one owner, exported, rather than a sibling copy.
+#[must_use]
+pub(crate) fn model_label(model: Option<&str>) -> Option<String> {
+    let id = model?.trim();
+    if id.is_empty() {
+        return None;
+    }
+    // Any `<…>`-wrapped id is a PSEUDO-model, not a model that answered anything.
+    // Matched by SHAPE rather than by listing `<synthetic>`, so a future sibling
+    // pseudo-model is suppressed the day it appears instead of leaking to the board.
+    if id.starts_with('<') && id.ends_with('>') {
+        return None;
+    }
+    let label = id.strip_prefix(MODEL_VENDOR_PREFIX).unwrap_or(id);
+    // A bare prefix and nothing else is malformed; render no annotation rather
+    // than an empty ` · `.
+    if label.is_empty() {
+        return None;
+    }
+    Some(label.to_string())
+}
+
 /// One DIM ` · <text>` marker annotation. BOTH the bound-agent handle and the
 /// per-message timestamp render through this ONE builder, so they share a single
 /// ` · ` separator convention and DIM style and cannot drift apart (DRY).
@@ -436,15 +495,17 @@ fn annotation_span(text: &str) -> Span<'static> {
 }
 
 /// Build a turn-marker line, appending — in order — a DIM `@agent` handle (when a
-/// non-default `agent` is in effect) then a DIM per-message timestamp annotation
+/// non-default `agent` is in effect), a DIM answering-model label (when THIS record
+/// carries a showable [`record_model`]), then a DIM per-message timestamp annotation
 /// (e.g. ` · 14:23`, when THIS record carries a parseable RFC 3339 `timestamp`), so
-/// a bound assistant turn reads `● claude · @lead · 12:55`.
+/// a bound assistant turn reads `● claude · @lead · sonnet-5 · 12:55`.
 ///
 /// The marker span keeps its own (bold) style unchanged; only the trailing
 /// annotations are DIM. FAIL-SOFT: a missing or unparseable timestamp renders the
 /// marker with no timestamp annotation and leaves `prev_day` untouched; a suppressed
-/// or absent agent renders no handle. On a timestamp success `prev_day` advances to
-/// this record's day so the next annotated turn can detect a rollover.
+/// or absent agent renders no handle; a suppressed or absent model renders no label.
+/// On a timestamp success `prev_day` advances to this record's day so the next
+/// annotated turn can detect a rollover.
 fn marker_line_with_time(
     marker: String,
     style: Style,
@@ -456,12 +517,31 @@ fn marker_line_with_time(
     if let Some(handle) = agent_handle(agent) {
         spans.push(annotation_span(&handle));
     }
+    if let Some(label) = model_label(record_model(record)) {
+        spans.push(annotation_span(&label));
+    }
     if let Some(ts) = record_timestamp(record) {
         let annotation = timestamp_annotation(ts, *prev_day);
         *prev_day = Some(ts.date());
         spans.push(annotation_span(&annotation));
     }
     Line::from(spans)
+}
+
+/// A record's own `message.model` — the model that ANSWERED this turn, and the ONLY
+/// on-disk evidence of it (no `model` RECORD type exists, so a session's model is
+/// never persisted as a file-level fact). Read from the record being rendered, which
+/// is what makes the label POSITIONAL for free: a session that changes model mid-file
+/// labels each turn with ITS OWN model, and no late turn can relabel an earlier one.
+/// In practice only `assistant` records carry the field.
+///
+/// FAIL-SOFT: absent / null / non-string all read as `None`, which is the NORMAL
+/// case — a fifth of real sessions carry no model at all — never an error state.
+fn record_model(record: &Value) -> Option<&str> {
+    record
+        .get("message")
+        .and_then(|m| m.get("model"))
+        .and_then(Value::as_str)
 }
 
 /// Parse a record's own `timestamp` field as RFC 3339 (the same parser the store
@@ -2009,6 +2089,18 @@ mod tests {
             .join(file)
     }
 
+    /// A fixture under `tests/fixtures/preview/` — deliberately OUTSIDE the `store/`
+    /// discovery root, so a preview-only format edge case is handed straight to the
+    /// renderer and can never disturb the exact discovered/session counts `store`'s
+    /// own tests pin.
+    fn preview_fixture(file: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("preview")
+            .join(file)
+    }
+
     /// Text-only convenience over [`render_file_collect`] for the transcript-shape
     /// tests that assert markers/structure rather than link regions. No known
     /// agents, so the `agent-name` fallback stays inert; see [`render_file_known`]
@@ -2045,6 +2137,16 @@ mod tests {
         text.lines
             .iter()
             .find(|l| l.spans.first().map(|s| s.content.as_ref()) == Some(needle))
+    }
+
+    /// EVERY line led by `needle`, in transcript order — for the tests that assert a
+    /// PER-TURN annotation across a multi-turn session, where checking only the first
+    /// turn would pass against a hoisted (file-level) value.
+    fn lines_led_by<'a>(text: &'a Text, needle: &str) -> Vec<&'a Line<'a>> {
+        text.lines
+            .iter()
+            .filter(|l| l.spans.first().map(|s| s.content.as_ref()) == Some(needle))
+            .collect()
     }
 
     fn unique_temp_dir(tag: &str) -> PathBuf {
@@ -3403,6 +3505,191 @@ mod tests {
             assert!(
                 !m.spans.iter().any(|s| s.content.contains('@')),
                 "a malformed agent-name renders no handle: {:?}",
+                m.spans
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- answering model label --------------------------------------------
+
+    #[test]
+    fn model_label_strips_the_vendor_prefix_and_suppresses_pseudo_models() {
+        // A normal id: the vendor prefix goes, nothing else does.
+        assert_eq!(
+            model_label(Some("claude-sonnet-5")).as_deref(),
+            Some("sonnet-5")
+        );
+        // A DATED id keeps its date — collapsing it would render two different
+        // releases identically, which is worse than a long label.
+        assert_eq!(
+            model_label(Some("claude-haiku-4-5-20251001")).as_deref(),
+            Some("haiku-4-5-20251001")
+        );
+        // An id with NO vendor prefix (the bare aliases that also appear on disk)
+        // is rendered unchanged.
+        assert_eq!(model_label(Some("opus")).as_deref(), Some("opus"));
+        // `<synthetic>` names no model that answered — it rides records Claude Code
+        // injects itself — so it is suppressed rather than labeled.
+        assert_eq!(model_label(Some("<synthetic>")), None);
+        // ANY `<…>`-wrapped pseudo-model, not just the one we have seen on disk.
+        assert_eq!(model_label(Some("<unknown>")), None);
+        // Absent / empty / whitespace-only all suppress.
+        assert_eq!(model_label(None), None);
+        assert_eq!(model_label(Some("")), None);
+        assert_eq!(model_label(Some("   ")), None);
+        // A padded id is trimmed before the prefix is stripped.
+        assert_eq!(
+            model_label(Some("  claude-opus-5  ")).as_deref(),
+            Some("opus-5")
+        );
+        // A bare prefix and nothing else renders no label, never an empty ` · `.
+        assert_eq!(model_label(Some("claude-")), None);
+    }
+
+    #[test]
+    fn record_model_is_fail_soft_over_absent_null_and_non_string() {
+        let present = serde_json::json!({"message": {"model": "claude-opus-5"}});
+        assert_eq!(record_model(&present), Some("claude-opus-5"));
+        // An absent `message`, an absent `model`, a null, a non-string, and a
+        // non-object `message` must ALL read as no model — never a panic.
+        for raw in [
+            serde_json::json!({}),
+            serde_json::json!({"message": {}}),
+            serde_json::json!({"message": {"model": null}}),
+            serde_json::json!({"message": {"model": 42}}),
+            serde_json::json!({"message": "not an object"}),
+        ] {
+            assert_eq!(record_model(&raw), None, "{raw} must read as no model");
+        }
+    }
+
+    #[test]
+    fn the_claude_marker_carries_the_answering_model_between_handle_and_time() {
+        let text = render_file(&preview_fixture("sess-model-synthetic-tail-1.jsonl"), WIDE);
+        let claude = lines_led_by(&text, "\u{25cf} claude");
+        let first = claude.first().expect("a claude marker line");
+        // Exact span ORDER: `● claude` (bold) · @lead · opus-4-8 · timestamp (dim).
+        assert_eq!(
+            first.spans.len(),
+            4,
+            "marker + handle + model + timestamp: {:?}",
+            first.spans
+        );
+        assert_eq!(first.spans[0].content.as_ref(), "\u{25cf} claude");
+        assert_eq!(first.spans[1].content.as_ref(), " \u{b7} @lead");
+        assert_eq!(first.spans[2].content.as_ref(), " \u{b7} opus-4-8");
+        assert!(
+            first.spans[2].style.add_modifier.contains(Modifier::DIM),
+            "the model label is dim"
+        );
+        assert_eq!(first.spans[3].content.as_ref(), " \u{b7} 10:00");
+        // Styled with ratatui only — never embedded ANSI.
+        assert!(
+            !flatten(&text).contains('\u{1b}'),
+            "the model label must not embed ANSI"
+        );
+    }
+
+    #[test]
+    fn a_synthetic_model_turn_renders_bare() {
+        // The `<synthetic>` pseudo-model is the LAST assistant model in this
+        // fixture — exactly where a naive "latest model" label would render it.
+        let text = render_file(&preview_fixture("sess-model-synthetic-tail-1.jsonl"), WIDE);
+        let claude = lines_led_by(&text, "\u{25cf} claude");
+        assert_eq!(claude.len(), 2, "both assistant turns render");
+        let last = claude[1];
+        // Marker + handle + timestamp only — NO model span between them.
+        assert_eq!(
+            last.spans.len(),
+            3,
+            "a pseudo-model adds no label span: {:?}",
+            last.spans
+        );
+        assert_eq!(last.spans[1].content.as_ref(), " \u{b7} @lead");
+        assert_eq!(last.spans[2].content.as_ref(), " \u{b7} 10:02");
+        assert!(
+            !flatten(&text).contains("synthetic"),
+            "the pseudo-model must never reach the screen"
+        );
+    }
+
+    #[test]
+    fn a_two_model_session_labels_each_turn_with_its_own_model() {
+        // THE anti-hoist test: this session genuinely changes model mid-file (real
+        // sessions do), so a file-level "the session's model" would be false for one
+        // of these two turns whichever value it picked.
+        let text = render_file(&preview_fixture("sess-model-switch-1.jsonl"), WIDE);
+        let claude = lines_led_by(&text, "\u{25cf} claude");
+        assert_eq!(claude.len(), 2, "both assistant turns render");
+        assert_eq!(claude[0].spans[1].content.as_ref(), " \u{b7} opus-4-8");
+        assert_eq!(claude[1].spans[1].content.as_ref(), " \u{b7} sonnet-5");
+        // The label rides the ASSISTANT record, so a user turn never carries one.
+        for you in lines_led_by(&text, "\u{25b6} you") {
+            assert_eq!(
+                you.spans.len(),
+                2,
+                "a user turn is marker + timestamp only: {:?}",
+                you.spans
+            );
+        }
+    }
+
+    #[test]
+    fn a_turn_with_no_model_renders_exactly_as_it_did_before() {
+        // 21% of real sessions carry no `message.model` at all — the NORMAL case,
+        // which must render byte-identically to the pre-label marker line.
+        let text = render_file(&preview_fixture("sess-model-absent-1.jsonl"), WIDE);
+        let claude = lines_led_by(&text, "\u{25cf} claude");
+        assert_eq!(claude.len(), 2, "both assistant turns render");
+        // Marker + timestamp, exactly as before this label existed.
+        assert_eq!(
+            claude[0]
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["\u{25cf} claude", " \u{b7} 10:00"],
+        );
+        assert_eq!(
+            claude[1]
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["\u{25cf} claude", " \u{b7} 10:00"],
+        );
+    }
+
+    #[test]
+    fn a_malformed_model_never_panics_and_renders_no_label() {
+        // A missing `message`, a null, a number, an empty string, and a `<…>`
+        // pseudo-model must all FAIL SOFT to no label. No timestamps here, so a
+        // bare marker line is exactly ONE span and a stray annotation is loud.
+        let dir = unique_temp_dir("bad-model");
+        let file = dir.join("sess.jsonl");
+        let jsonl = concat!(
+            r#"{"type":"assistant","sessionId":"s","cwd":"/x","message":{"role":"assistant","content":"a"}}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"s","cwd":"/x","message":{"role":"assistant","model":null,"content":"b"}}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"s","cwd":"/x","message":{"role":"assistant","model":42,"content":"c"}}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"s","cwd":"/x","message":{"role":"assistant","model":"","content":"d"}}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"s","cwd":"/x","message":{"role":"assistant","model":"<synthetic>","content":"e"}}"#,
+            "\n",
+        );
+        std::fs::write(&file, jsonl).expect("write temp jsonl");
+
+        let text = render_file(&file, WIDE);
+        let markers = lines_led_by(&text, "\u{25cf} claude");
+        assert_eq!(markers.len(), 5, "all five assistant turns render");
+        for m in markers {
+            assert_eq!(
+                m.spans.len(),
+                1,
+                "a malformed model renders no label: {:?}",
                 m.spans
             );
         }
