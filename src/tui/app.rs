@@ -1031,7 +1031,15 @@ pub struct App {
     /// Vertical scroll offset (in WRAPPED rows) of the preview pane. Requested by
     /// the scroll keys and clamped to content bounds by `view::render_preview`,
     /// which writes the clamped value back (mirroring `scroll`/`ListState`).
-    pub preview_scroll: u16,
+    ///
+    /// `u32`, not `u16`, because a wrapped-row count is a function of the
+    /// TRANSCRIPT's length and the pane's width, and neither is bounded by
+    /// anything this type could rely on: a long session wrapped into a narrow pane
+    /// passes 65,535 rows, at which point a `u16` offset wraps silently and the
+    /// pane jumps to the top mid-scroll. The one place the offset must still be
+    /// `u16` is the `Paragraph::scroll` call in `view::render_preview`, where
+    /// ratatui's own `Position.y` sets the width — see the narrowing there.
+    pub preview_scroll: u32,
     /// When set, the preview stays pinned to the BOTTOM (newest turn): the next
     /// render resolves the offset to `max_offset`. Cleared, it means the READER
     /// positioned this pane and [`preview_scroll`](Self::preview_scroll) says where.
@@ -1796,7 +1804,14 @@ impl App {
     /// Move the preview by `rows` (positive = down/toward newer). Any explicit
     /// scroll drops follow-bottom and sets a concrete offset; the view clamps it
     /// to `[0, max_offset]` on the next render. Saturating so it can never
-    /// underflow below zero or overflow `u16`.
+    /// underflow below zero or overflow `u32`.
+    ///
+    /// The sum is taken in `i64`, which is the narrowest signed width that can
+    /// hold every input pair: the offset spans `0..=u32::MAX` and the delta spans
+    /// `i32::MIN..=i32::MAX`, so `|offset + rows| < 2^33`. `i32` — what this used
+    /// while the offset was a `u16` — can no longer even represent `u32::MAX`, so
+    /// widening the FIELD without widening this arithmetic would have moved the
+    /// wrap one line down rather than removing it.
     ///
     /// The ONE funnel for every scroll that moves by a delta — `PgUp`/`PgDn`,
     /// `Ctrl-U`/`Ctrl-D` and the mouse wheel — so the release is stated once, for
@@ -1806,8 +1821,8 @@ impl App {
     /// ([`preview_follow_bottom`](Self::preview_follow_bottom) owns the argument).
     fn preview_scroll_by(&mut self, rows: i32) {
         self.preview_follow_bottom = false;
-        let next = (i32::from(self.preview_scroll) + rows).clamp(0, i32::from(u16::MAX));
-        self.preview_scroll = next as u16;
+        let next = i64::from(self.preview_scroll) + i64::from(rows);
+        self.preview_scroll = u32::try_from(next.max(0)).unwrap_or(u32::MAX);
     }
 
     /// The page size for page/quarter-page scrolling: the last known viewport
@@ -1959,7 +1974,7 @@ impl App {
 
     /// Scroll the preview one mouse-wheel notch (`up = true` toward older turns).
     /// Reuses the saturating clamp in [`preview_scroll_by`](Self::preview_scroll_by),
-    /// so rapid notches neither underflow below zero nor overflow `u16`.
+    /// so rapid notches neither underflow below zero nor overflow `u32`.
     pub fn preview_wheel(&mut self, up: bool) {
         let step = if up {
             -PREVIEW_WHEEL_STEP
@@ -3906,6 +3921,31 @@ mod tests {
         app.preview_page_up();
         assert_eq!(app.preview_scroll, 0, "top saturates (no underflow)");
 
+        // The CEILING half, at the widened bound. The offset is a `u32`, so this is
+        // where a page down has to stop — and reaching it at all needs the `i64`
+        // sum, since the `i32` this used to add in cannot hold `u32::MAX`.
+        app.preview_scroll = u32::MAX - 1;
+        app.preview_page_down();
+        assert_eq!(
+            app.preview_scroll,
+            u32::MAX,
+            "a page down saturates at the ceiling"
+        );
+        app.preview_page_down();
+        assert_eq!(
+            app.preview_scroll,
+            u32::MAX,
+            "and stays there (no overflow, no wrap to zero)"
+        );
+        // Coming back down from the ceiling is ordinary arithmetic, not a second
+        // saturation: a widening that silently truncated would land elsewhere.
+        app.preview_page_up();
+        assert_eq!(
+            app.preview_scroll,
+            u32::MAX - 10,
+            "a page up from the ceiling steps back by exactly one page"
+        );
+
         app.preview_top();
         assert!(!app.preview_follow_bottom);
         assert_eq!(app.preview_scroll, 0);
@@ -3914,6 +3954,43 @@ mod tests {
         assert!(
             app.preview_follow_bottom,
             "End re-enables follow-bottom so the view pins to the newest turn"
+        );
+    }
+
+    /// The band between `u16::MAX` and `u32::MAX` must be SCROLLABLE, not merely
+    /// representable.
+    ///
+    /// A transcript that wraps past 65,535 rows parks the reader here, and the keys
+    /// have to move through it by whole pages. Under the pre-widening offset every
+    /// position in this band collapsed onto 65,535: a page down did nothing, and a
+    /// page up jumped the reader thousands of rows toward the top of the session.
+    /// The values are chosen ABOVE `u16::MAX` on purpose — the same assertions with
+    /// small numbers pass against the narrow implementation and prove nothing.
+    #[test]
+    fn preview_scroll_keys_move_through_offsets_above_u16_max() {
+        let mut app = app_all(vec![session("a", "r1", Some("main"), "/tmp/a")]);
+        app.preview_viewport_h = 40; // set by the view; sizes a page
+
+        app.preview_scroll = 100_000;
+        assert!(
+            app.preview_scroll > u32::from(u16::MAX),
+            "the fixture must start beyond the old ceiling, or this tests nothing"
+        );
+
+        app.preview_page_down();
+        assert_eq!(
+            app.preview_scroll, 100_040,
+            "a page down past u16::MAX advances by a page rather than pinning"
+        );
+        app.preview_half_down();
+        assert_eq!(
+            app.preview_scroll, 100_050,
+            "and a quarter page advances by a quarter page"
+        );
+        app.preview_page_up();
+        assert_eq!(
+            app.preview_scroll, 100_010,
+            "a page up steps back through the same band"
         );
     }
 

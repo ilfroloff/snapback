@@ -2930,15 +2930,23 @@ mod tests {
             app.preview_scroll, 0,
             "wheel-up cannot underflow past the top"
         );
-        // Repeated down notches near the ceiling never overflow past u16::MAX.
-        app.preview_scroll = u16::MAX - 1;
+        // A notch in the range a `u16` offset could not even express is an ORDINARY
+        // scroll, not a saturated one: the wheel moves THROUGH it by the step.
+        app.preview_scroll = 100_000;
         wheel(&mut app, MouseEventKind::ScrollDown, 60, 10);
-        assert_eq!(app.preview_scroll, u16::MAX);
+        assert_eq!(
+            app.preview_scroll, 100_002,
+            "a notch past u16::MAX advances by the wheel step rather than pinning"
+        );
+        // Repeated down notches near the ceiling never overflow past u32::MAX.
+        app.preview_scroll = u32::MAX - 1;
+        wheel(&mut app, MouseEventKind::ScrollDown, 60, 10);
+        assert_eq!(app.preview_scroll, u32::MAX);
         wheel(&mut app, MouseEventKind::ScrollDown, 60, 10);
         assert_eq!(
             app.preview_scroll,
-            u16::MAX,
-            "wheel-down saturates at u16::MAX"
+            u32::MAX,
+            "wheel-down saturates at u32::MAX"
         );
     }
 
