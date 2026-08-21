@@ -1644,21 +1644,40 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     app.preview_viewport_h = inner_height;
 
+    // THE ONE NARROWING, and the reason the widening above stops one line short of
+    // the draw call. `Paragraph::scroll` takes a `Position { x: u16, y: u16 }`, so
+    // the widget's row offset is a `u16` — a ratatui constraint, not a choice this
+    // module gets to make, and not something `App::preview_scroll` can be typed
+    // around. Saturating rather than a bare `as`, so an offset the widget cannot
+    // hold parks on the last row it CAN address instead of wrapping to the top.
+    //
+    // Today the narrowing is lossless in practice, because
+    // `store::preview::PREVIEW_LINES` still tail-caps a transcript at 600 rendered
+    // lines: `content_h` — and therefore every offset `clamp_preview_offset` can
+    // produce from it — stays orders of magnitude under `u16::MAX`, so the
+    // saturation cannot fire on any real pane.
+    //
+    // The windowed render removes both halves of that at once: it hands the widget
+    // only the rows the pane can show, so this becomes a small RESIDUAL offset
+    // inside that window, and the `PREVIEW_LINES` cap is deleted because nothing
+    // depends on it any more. Until that lands, this line is exactly where a
+    // 65,536-row transcript would clip — so a scroll-geometry regression that
+    // bisects here is a widening bug, and one that bisects there is a window bug.
+    let widget_offset = u16::try_from(offset).unwrap_or(u16::MAX);
     frame.render_widget(
         Paragraph::new(text)
             .wrap(Wrap { trim: false })
-            .scroll((offset, 0)),
+            .scroll((widget_offset, 0)),
         transcript_area,
     );
 
     if content_h > usize::from(inner_height) {
         // The max offset `clamp_preview_offset` can ever produce for THIS
-        // geometry (mirrors that fn's own formula); needed here to know when
-        // a boundary arrow should show and to size the thumb-detachment remap
-        // below.
-        let max_offset = content_h
-            .saturating_sub(usize::from(inner_height))
-            .min(usize::from(u16::MAX)) as u16;
+        // geometry (mirrors that fn's own formula, including its `u32` domain);
+        // needed here to know when a boundary arrow should show and to size the
+        // thumb-detachment remap below.
+        let max_offset =
+            u32::try_from(content_h.saturating_sub(usize::from(inner_height))).unwrap_or(u32::MAX);
         // `ScrollbarState`'s `content_length` must span the OFFSET domain (the
         // number of distinct scroll positions), not the raw wrapped row count:
         // ratatui's thumb only touches the bottom of the track when
@@ -1843,7 +1862,7 @@ pub(crate) fn link_at<'a>(
     col: u16,
     row: u16,
     inner: Rect,
-    scroll_offset: u16,
+    scroll_offset: u32,
     line_widths: &[usize],
     regions: &'a [LinkRegion],
 ) -> Option<&'a str> {
@@ -1852,7 +1871,13 @@ pub(crate) fn link_at<'a>(
     }
     let rel_col = usize::from(col - inner.x);
     let rel_row = usize::from(row - inner.y);
-    let visual_row = usize::from(scroll_offset) + rel_row;
+    // `scroll_offset` is `App::preview_scroll`, so it carries the pane's `u32`
+    // offset domain into this `usize` row walk. Saturating both steps: a click can
+    // only ever resolve to a row `visual_to_content` walks off the end of, which is
+    // already the "no link here" answer.
+    let visual_row = usize::try_from(scroll_offset)
+        .unwrap_or(usize::MAX)
+        .saturating_add(rel_row);
     let (content_row, sub_row) = visual_to_content(line_widths, inner.width, visual_row)?;
     let content_col = sub_row * usize::from(inner.width) + rel_col;
     regions
@@ -1866,16 +1891,22 @@ pub(crate) fn link_at<'a>(
 /// Resolve the final vertical preview offset: pin to the bottom when following,
 /// else clamp the requested offset into `[0, max_offset]` where
 /// `max_offset = content_h - viewport_h`. Saturating throughout, so a short
-/// transcript never underflows past zero and a huge one never overflows `u16`.
+/// transcript never underflows past zero and a huge one never overflows `u32`.
+///
+/// `content_h` is a `usize` wrapped-row count and the offset it produces is a
+/// `u32`, which is wide enough to be a real bound rather than a second cap: a
+/// transcript that wraps past 65,535 rows in a narrow pane resolves to the row it
+/// actually sits on instead of pinning at `u16::MAX` — where "follow the bottom"
+/// would stop short of the newest turn and every deeper offset would collapse
+/// onto one indistinguishable position.
 fn clamp_preview_offset(
     follow_bottom: bool,
-    requested: u16,
+    requested: u32,
     content_h: usize,
     viewport_h: u16,
-) -> u16 {
-    let max_offset = content_h
-        .saturating_sub(usize::from(viewport_h))
-        .min(usize::from(u16::MAX)) as u16;
+) -> u32 {
+    let max_offset =
+        u32::try_from(content_h.saturating_sub(usize::from(viewport_h))).unwrap_or(u32::MAX);
     if follow_bottom {
         max_offset
     } else {
@@ -1890,12 +1921,16 @@ fn clamp_preview_offset(
 /// `rows_above` must be the EXACT wrapped-row count of the lines preceding the
 /// match — the first screen row that line occupies — which is why the caller
 /// measures it with `Paragraph::line_count` over the transcript's own prefix
-/// rather than modelling the wrap (see [`wrapped_text_rows`]). Saturating, so a
-/// match inside the first `viewport_h / MATCH_JUMP_LEAD_DIVISOR` rows resolves to
-/// 0 (the transcript's start) instead of underflowing. Pure and terminal-free.
-fn match_jump_offset(rows_above: usize, viewport_h: u16) -> u16 {
+/// rather than modelling the wrap (see [`wrapped_text_rows`]). Saturating at BOTH
+/// ends: a match inside the first `viewport_h / MATCH_JUMP_LEAD_DIVISOR` rows
+/// resolves to 0 (the transcript's start) instead of underflowing, and a
+/// `rows_above` beyond `u32::MAX` pins at the ceiling instead of wrapping.
+/// Returns the same `u32` offset domain as [`clamp_preview_offset`], so a match
+/// past 65,535 wrapped rows is jumped to rather than clipped short of.
+/// Pure and terminal-free.
+fn match_jump_offset(rows_above: usize, viewport_h: u16) -> u32 {
     let lead = usize::from(viewport_h / MATCH_JUMP_LEAD_DIVISOR);
-    rows_above.saturating_sub(lead).min(usize::from(u16::MAX)) as u16
+    u32::try_from(rows_above.saturating_sub(lead)).unwrap_or(u32::MAX)
 }
 
 /// A conservative, provably-sufficient real-offset distance from an edge such
@@ -1933,8 +1968,8 @@ fn min_detach_distance(content_h: usize, track_length: usize) -> usize {
 /// (via `.max`/`.min` rather than a `.clamp` that could panic on an inverted
 /// range) instead of a nonsensical clamp.
 fn scrollbar_thumb_position(
-    offset: u16,
-    max_offset: u16,
+    offset: u32,
+    max_offset: u32,
     content_length: usize,
     content_h: usize,
     track_length: u16,
@@ -1950,7 +1985,14 @@ fn scrollbar_thumb_position(
     let mid = last / 2;
     let lo = margin.min(mid);
     let hi = last.saturating_sub(margin.saturating_mul(2)).max(lo);
-    usize::from(offset).max(lo).min(hi)
+    // The offset shares the pane's `u32` domain (see `clamp_preview_offset`) while
+    // the track math is `usize`. Saturating rather than `as`: on any platform where
+    // `usize` is narrower than `u32`, the `max`/`min` chained onto it still bounds
+    // the result, so a saturated value can only land ON the track, never off it.
+    usize::try_from(offset)
+        .unwrap_or(usize::MAX)
+        .max(lo)
+        .min(hi)
 }
 
 /// The search input line, echoing the live query.
@@ -3645,6 +3687,47 @@ mod tests {
         assert_eq!(clamp_preview_offset(true, 0, 3, 10), 0);
     }
 
+    /// A wrapped-row count is a function of the transcript's length AND the pane's
+    /// width, so it has no `u16`-shaped bound: a long session in a narrow pane
+    /// passes 65,535 rows. This is the case the offset domain was widened for, and
+    /// the values are deliberately ABOVE `u16::MAX` — a test that merely used the
+    /// wider TYPE would pass against the narrow implementation too.
+    ///
+    /// Every clause below is a distinct way the old width failed. `max_offset`
+    /// saturated at 65,535, so "follow the bottom" stopped ~10,000 rows short of
+    /// the newest turn and never reached it again. Every offset past 65,535
+    /// collapsed onto that one value, so the whole tail of the transcript was a
+    /// single indistinguishable position. And an over-request clamped to the
+    /// ceiling rather than to the content's real last row.
+    #[test]
+    fn a_transcript_taller_than_u16_max_clamps_at_its_real_last_row() {
+        // 75,535 wrapped rows in a 50-row viewport => a bottom offset of 75,485,
+        // which is 9,950 rows BEYOND anything a `u16` offset could address.
+        let content_h = usize::from(u16::MAX) + 10_000;
+        let viewport_h = 50u16;
+        let max_offset = 75_485u32;
+        assert!(
+            max_offset > u32::from(u16::MAX),
+            "the fixture must exceed u16"
+        );
+
+        assert_eq!(
+            clamp_preview_offset(true, 0, content_h, viewport_h),
+            max_offset,
+            "following the bottom must reach the transcript's real last row"
+        );
+        assert_eq!(
+            clamp_preview_offset(false, 70_000, content_h, viewport_h),
+            70_000,
+            "an in-range offset past u16::MAX is a position, not a saturation"
+        );
+        assert_eq!(
+            clamp_preview_offset(false, 200_000, content_h, viewport_h),
+            max_offset,
+            "an over-request clamps to the content's last row, not to a type ceiling"
+        );
+    }
+
     // --- scrollbar thumb detachment (no rounding "stuck at the edge") -----
 
     #[test]
@@ -5219,7 +5302,7 @@ mod tests {
             "fixture must overflow the viewport for the scrollbar to render \
              (content_h={content_h}, inner_height={inner_height})"
         );
-        let max_offset = (content_h - usize::from(inner_height)) as u16;
+        let max_offset = (content_h - usize::from(inner_height)) as u32;
         assert_eq!(
             app.preview_scroll, max_offset,
             "follow-bottom must pin the offset to the last page"
@@ -5343,7 +5426,7 @@ mod tests {
 
         let inner_height = height - 2;
         let content_h = content_height(&mut app, width);
-        let max_offset = (content_h - usize::from(inner_height)) as u16;
+        let max_offset = (content_h - usize::from(inner_height)) as u32;
         assert!(
             app.preview_scroll > 0 && app.preview_scroll < max_offset,
             "the requested offset (5) must remain a genuine INTERIOR scroll for \
@@ -5472,7 +5555,7 @@ mod tests {
 
         let rows = inner_rows(&mut app, width, height);
         assert_eq!(
-            usize::from(app.preview_scroll),
+            app.preview_scroll as usize,
             transcript_only + tail_rows - usize::from(height - 2),
             "the resolved offset must be measured over the transcript AND the tail"
         );
@@ -5729,15 +5812,23 @@ mod tests {
     #[test]
     fn match_jump_offset_leaves_a_third_of_the_viewport_above_the_match() {
         // A match deep in a transcript keeps `lead` rows of context above it.
-        assert_eq!(match_jump_offset(23, 12), 23 - 12 / MATCH_JUMP_LEAD_DIVISOR);
+        assert_eq!(
+            match_jump_offset(23, 12),
+            u32::from(23 - 12 / MATCH_JUMP_LEAD_DIVISOR)
+        );
         // A match INSIDE the lead cannot scroll above the transcript's start.
         assert_eq!(match_jump_offset(4, 12), 0);
         assert_eq!(match_jump_offset(0, 12), 0);
         // A degenerate pane asks for no lead at all rather than dividing badly.
         assert_eq!(match_jump_offset(7, 0), 7);
         assert_eq!(match_jump_offset(7, 2), 7);
-        // A transcript taller than `u16` saturates instead of wrapping around.
-        assert_eq!(match_jump_offset(usize::MAX, 30), u16::MAX);
+        // A match BEYOND `u16::MAX` wrapped rows is an ordinary position in the
+        // `u32` offset domain, jumped to exactly — not pinned at 65,535, which is
+        // where the pre-widening return type parked every one of them.
+        assert_eq!(match_jump_offset(200_000, 30), 200_000 - 10);
+        // Only a `usize` past `u32::MAX` saturates, and it saturates at the WIDER
+        // ceiling.
+        assert_eq!(match_jump_offset(usize::MAX, 30), u32::MAX);
     }
 
     /// THE core claim: the offset the jump resolves puts the matched line exactly
@@ -6225,8 +6316,8 @@ mod tests {
 
     /// The offset that shows the last row of a transcript plus an in-flight reply's
     /// tail — where a pane that follows the bottom sits.
-    fn bottom_offset(content_h: usize, tail_rows: usize, inner_h: u16) -> u16 {
-        (content_h + tail_rows - usize::from(inner_h)) as u16
+    fn bottom_offset(content_h: usize, tail_rows: usize, inner_h: u16) -> u32 {
+        (content_h + tail_rows - usize::from(inner_h)) as u32
     }
 
     /// A match jump holds the pane for the WHOLE of an in-flight reply, not for the
@@ -6428,7 +6519,7 @@ mod tests {
     /// shorter transcript — can cut the offset short, which is the state the two
     /// CLAMP tests below are about; far from it, nothing clamps and they prove
     /// nothing.
-    fn reader_parked_near_the_tail(app: &mut App, (width, height): (u16, u16)) -> u16 {
+    fn reader_parked_near_the_tail(app: &mut App, (width, height): (u16, u16)) -> u32 {
         preview_buffer(app, width, height);
         app.preview_bottom();
         preview_buffer(app, width, height);
@@ -6484,7 +6575,7 @@ mod tests {
         app.apply_sessions(vec![jump_session_of(&dir, "sess-jump-1", GROWN_TURNS)]);
         let following = content_height(&mut app, wide) - usize::from(height - 2);
         assert!(
-            following > usize::from(clamped),
+            following > clamped as usize,
             "the new turns must move the bottom, or a followed pane would sit still \
              too (bottom={following}, pane={clamped})"
         );
@@ -6539,7 +6630,7 @@ mod tests {
         app.apply_sessions(vec![jump_session_at(&dir, "sess-jump-1")]);
         let following = content_height(&mut app, width) - usize::from(height - 2);
         assert!(
-            following > usize::from(clamped),
+            following > clamped as usize,
             "the restored turns must move the bottom, or a followed pane would sit \
              still too (bottom={following}, pane={clamped})"
         );
@@ -7069,7 +7160,10 @@ mod tests {
         // The reference: one blocked, wrapped, scrolled paragraph over the WHOLE
         // pane, at the offset the render above resolved.
         let text = app.preview_text(width - 2);
-        let offset = app.preview_scroll;
+        // Narrowed exactly as `render_preview` narrows it for `Paragraph::scroll`
+        // (ratatui's `Position.y` is `u16`), so the reference paragraph is drawn
+        // from the same value the pane under test handed the widget.
+        let offset = u16::try_from(app.preview_scroll).expect("this fixture fits a u16 offset");
         assert!(
             offset > 0,
             "a scrolled pane, or this compares only offset 0"
