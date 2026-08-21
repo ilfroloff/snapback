@@ -832,17 +832,77 @@ impl SearchIndex {
     /// that overlap or abut, whether from one atom or several, merge into one
     /// marked span rather than double-styling a char. Empty for an empty or
     /// whitespace-only query, and for text no atom occurs in.
+    ///
+    /// A ONE-SHOT convenience over
+    /// [`atom_match_positions_with`](Self::atom_match_positions_with): it allocates
+    /// a fresh [`MarkScratch`] per call, which is what a single ask wants (a row
+    /// label, "does this label hold any atom") and what a pane's worth of lines
+    /// does not — see that method for the loop shape.
     pub fn atom_match_positions(&self, text: &str) -> Vec<usize> {
+        self.atom_match_positions_with(text, &mut MarkScratch::new())
+    }
+
+    /// [`atom_match_positions`](Self::atom_match_positions) over a CALLER-OWNED
+    /// [`MarkScratch`] — the PER-LINE entry point.
+    ///
+    /// The same function, byte for byte: the scratch decides only who owns the
+    /// working buffers, never what is marked. A caller marking many lines (the
+    /// preview pane's match map) hands one scratch to every line so the buffers are
+    /// allocated once for the pass instead of once per line; a caller with one
+    /// question uses the wrapper above and never sees this.
+    ///
+    /// # The gate comes first
+    ///
+    /// Marks are a UNION across atoms, so a text NO atom occurs in is a text
+    /// nothing is marked in — which makes [`any_atom_occurs`] an exact
+    /// precondition rather than a heuristic prefilter, asked of the same finders
+    /// over the same per-atom haystack choice the marking loop below would make.
+    /// It is asked FIRST because a pane is overwhelmingly lines the query is not
+    /// in, and every one of them used to pay for a zeroed flag per char and a
+    /// byte -> char map before any finder was asked anything.
+    ///
+    /// The lowercased sibling is folded before the gate rather than after it,
+    /// because a case-INSENSITIVE atom has no other haystack to be found in: the
+    /// fold is part of ASKING the question, not part of answering it. It goes into
+    /// the scratch's buffer, so on the per-line path it costs no allocation.
+    pub fn atom_match_positions_with(&self, text: &str, scratch: &mut MarkScratch) -> Vec<usize> {
         // No atoms => empty/whitespace query: nothing is marked. Deliberately NOT
         // the filter's "no atoms => every candidate": an unqueried pane marks
         // nothing, it does not mark everything.
         if self.atom_finders.is_empty() || text.is_empty() {
             return Vec::new();
         }
+        // Destructured so each buffer is borrowed on its own — the map below is read
+        // from `starts` while `marked` is written.
+        let MarkScratch {
+            marked,
+            lowered,
+            starts,
+        } = scratch;
+        // The haystack a case-INSENSITIVE atom searches, folded by the module's ONE
+        // fold. `fold_lowercase_into` clears the buffer first, so a reused scratch
+        // never prepends the previous line.
+        fold_lowercase_into(text, lowered);
+        if !any_atom_occurs(text, lowered, &self.atom_finders) {
+            return Vec::new();
+        }
+        // Past the gate — and only past it — the per-CHAR machinery.
+        //
         // One flag per CHAR of `text`. Marking into it is what merges the union:
         // two atoms covering one char mark it once, and the output comes out sorted
-        // and deduplicated by construction.
-        let mut marked = vec![false; text.chars().count()];
+        // and deduplicated by construction. `clear` then `resize` re-zeroes every
+        // flag against THIS line's length, so neither a previous line's marks nor
+        // its length can survive into this one.
+        let ascii = text.is_ascii();
+        // Pure ASCII is one byte per char, so the byte length IS the char count and
+        // the counting pass is a length read.
+        let chars = if ascii {
+            text.len()
+        } else {
+            text.chars().count()
+        };
+        marked.clear();
+        marked.resize(chars, false);
         // ONE byte -> CHAR map serves BOTH case branches, because the lowercased
         // sibling is folded by the same [`lowercase_preserving_byte_len`] the
         // FILTER builds its haystacks with. That fold is byte-length preserving per
@@ -851,21 +911,113 @@ impl SearchIndex {
         // an optimization: a finder only answers the same question on both surfaces
         // if the haystack it is handed was lowercased by the same rule, or a row the
         // filter admitted draws with nothing marked.
-        let starts = char_starts(text);
-        let lowered = lowercase_preserving_byte_len(text);
+        //
+        // For pure ASCII that map is the IDENTITY, so it is not built at all — see
+        // [`CharMap`].
+        let map = if ascii {
+            CharMap::Ascii { chars }
+        } else {
+            char_starts_into(text, starts);
+            CharMap::Explicit(starts)
+        };
         for atom in &self.atom_finders {
             let haystack = if atom.case_sensitive {
                 text
             } else {
                 lowered.as_str()
             };
-            mark_atom(atom, haystack, &starts, &mut marked);
+            mark_atom(atom, haystack, &map, marked);
         }
         marked
             .iter()
             .enumerate()
             .filter_map(|(pos, &hit)| hit.then_some(pos))
             .collect()
+    }
+}
+
+/// The working buffers one line's marking needs, owned by the CALLER so a pane's
+/// worth of lines allocates them once instead of once per line.
+///
+/// [`SearchIndex::atom_match_positions_with`] marks through these three: a flag per
+/// CHAR of the line, the line's lowercased sibling (the haystack a case-insensitive
+/// atom searches), and — for non-ASCII text only — the byte -> char map. The
+/// preview asks for marks once per rendered line, so allocating them per call put
+/// three allocations on every line of a pane that is overwhelmingly lines the query
+/// is not in.
+///
+/// It carries NO state between lines, and must not start to. Every buffer is reset
+/// against the line being marked BEFORE anything reads it — `lowered` by the fold,
+/// `marked` by a `clear` + `resize`, `starts` by [`char_starts_into`] — so the
+/// answer for a line never depends on which line ran before it, and marking through
+/// a reused scratch and through a fresh one are the same function. That equivalence
+/// is what makes this a pure performance detail; it is pinned by
+/// `a_reused_scratch_marks_each_line_as_a_fresh_one_would`.
+pub struct MarkScratch {
+    /// One flag per CHAR of the line being marked — the union of every atom's runs.
+    marked: Vec<bool>,
+    /// The line folded by the module's ONE fold ([`fold_lowercase_into`]).
+    lowered: String,
+    /// The byte offset of each CHAR of the line. Filled only for text that needs
+    /// it: an ASCII line takes [`CharMap::Ascii`] and never touches this.
+    starts: Vec<usize>,
+}
+
+impl Default for MarkScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MarkScratch {
+    /// An empty scratch, ready for its first line.
+    ///
+    /// Deliberately un-sized: the buffers grow to the widest line the caller
+    /// actually hands them, which a preview reaches within its first few lines, so
+    /// a reserved capacity would be a magic number guessing at a pane's width.
+    #[must_use]
+    pub fn new() -> Self {
+        MarkScratch {
+            marked: Vec::new(),
+            lowered: String::new(),
+            starts: Vec::new(),
+        }
+    }
+}
+
+/// How a haystack BYTE offset becomes a SOURCE char position.
+///
+/// Two representations of ONE map, and the ASCII arm is an identity rather than a
+/// shortcut: in pure-ASCII text every char is exactly one byte, so byte offset `n`
+/// IS char position `n` and the explicit table would be `0, 1, .. len - 1` — a
+/// `Vec<usize>` allocated, filled and then binary-searched to hand back the index
+/// it was looked up by. Text holding any non-ASCII byte keeps the explicit table,
+/// unchanged.
+enum CharMap<'a> {
+    /// Pure-ASCII text of `chars` chars — equivalently, `chars` bytes.
+    Ascii { chars: usize },
+    /// The ascending byte offset of each CHAR, as built by [`char_starts_into`].
+    Explicit(&'a [usize]),
+}
+
+impl CharMap<'_> {
+    /// The SOURCE char positions a haystack byte range `start..end` covers.
+    ///
+    /// [`Explicit`](CharMap::Explicit) delegates to [`char_span`]'s binary search
+    /// over the real table. [`Ascii`](CharMap::Ascii) returns what that same search
+    /// WOULD answer over the identity table `0, 1, .. chars - 1`, in closed form:
+    /// `partition_point(|byte| byte <= start) - 1` is `start`, and
+    /// `partition_point(|byte| byte < end)` is `end`. Identical answer, no table —
+    /// which is the whole point of the arm.
+    ///
+    /// The bound is fail-soft company for `mark_atom`'s `get_mut`, not arithmetic
+    /// a real hit can reach: a hit satisfies `start < end <= haystack.len()`, and
+    /// for ASCII that length IS `chars`.
+    fn char_span(&self, start: usize, end: usize) -> Range<usize> {
+        match *self {
+            CharMap::Ascii { chars } => start.min(chars)..end.min(chars),
+            CharMap::Explicit(starts) => char_span(starts, start, end),
+        }
     }
 }
 
@@ -959,16 +1111,46 @@ fn gate_atoms(query: &str) -> Vec<String> {
 /// place in the module that decides it.
 fn lowercase_preserving_byte_len(text: &str) -> String {
     let mut lowered = String::with_capacity(text.len());
+    fold_lowercase_into(text, &mut lowered);
+    lowered
+}
+
+/// [`lowercase_preserving_byte_len`]'s fold, written into a CALLER-OWNED buffer.
+///
+/// One rule, ONE implementation: the allocating form above is this function plus a
+/// `String`, and the per-line marking seam reuses a single buffer across a pane's
+/// worth of lines rather than allocating one per line. A second fold rule is the
+/// one thing this module cannot afford — the module docs say why — so there is only
+/// this one, and both spellings of it go through here.
+///
+/// The ASCII branch IS that rule, not an exception to it. An ASCII char's
+/// [`char::to_lowercase`] yields exactly ONE char and that char is ASCII, so its
+/// UTF-8 width is unchanged and the general arm below always substitutes it — which
+/// is exactly what [`u8::to_ascii_lowercase`] does, per byte, with no Unicode table
+/// lookup and no `char` decode. It therefore writes the same bytes by construction.
+/// Text holding ANY non-ASCII byte falls through to the general arm unchanged,
+/// which is what keeps the `İ` and word-final-sigma behaviour described above
+/// exactly as it is.
+///
+/// The buffer is CLEARED first, so a reused one never prepends the previous text.
+fn fold_lowercase_into(text: &str, out: &mut String) {
+    out.clear();
+    if text.is_ascii() {
+        out.extend(
+            text.bytes()
+                .map(|byte| char::from(byte.to_ascii_lowercase())),
+        );
+        return;
+    }
     for ch in text.chars() {
         let mut folded = ch.to_lowercase();
         match (folded.next(), folded.next()) {
             // Exactly one char AND the same encoded width: safe to substitute.
-            (Some(one), None) if one.len_utf8() == ch.len_utf8() => lowered.push(one),
+            (Some(one), None) if one.len_utf8() == ch.len_utf8() => out.push(one),
             // Anything else would move every byte after it. Keep the original.
-            _ => lowered.push(ch),
+            _ => out.push(ch),
         }
     }
-    lowered
 }
 
 /// The proximity window, in BYTES, for a query of `query_len` bytes.
@@ -996,6 +1178,28 @@ fn proximity_window(query_len: usize) -> usize {
 /// the caller handles the empty-query "return all" case before reaching here.
 fn atoms_match(cased: &str, lowercased: &str, finders: &[AtomFinder]) -> bool {
     finders.iter().all(|atom| {
+        let haystack = if atom.case_sensitive {
+            cased
+        } else {
+            lowercased
+        };
+        atom.finder.find(haystack.as_bytes()).is_some()
+    })
+}
+
+/// True iff ANY atom occurs in the haystack its own smart-case decision selects —
+/// the OR sibling of [`atoms_match`]'s AND, over the same finders and the same
+/// per-atom choice between the two haystacks.
+///
+/// This is the PER-ATOM marking rule's own precondition, and it is EXACT rather
+/// than a prefilter that might be wrong in the cheap direction:
+/// [`atom_match_positions`](SearchIndex::atom_match_positions) marks the UNION of
+/// every atom's occurrences and every atom's needle is non-empty (the splitter
+/// drops empty atoms), so "some atom occurs" and "some char is marked" are the same
+/// fact. Answering it here lets the per-char machinery be skipped outright on the
+/// lines a pane is mostly made of, rather than built and then found empty.
+fn any_atom_occurs(cased: &str, lowercased: &str, finders: &[AtomFinder]) -> bool {
+    finders.iter().any(|atom| {
         let haystack = if atom.case_sensitive {
             cased
         } else {
@@ -1145,7 +1349,7 @@ fn atoms_co_occur_within(
 
 /// Mark every CHAR that one atom covers in `haystack` — the case branch that
 /// atom's own smart-case decision selected — translating each byte hit back into
-/// source char positions through `starts`.
+/// source char positions through `map`.
 ///
 /// Occurrences are taken OVERLAPPING: the scan resumes one byte past a hit's
 /// START, not past its end, so `aa` over `aaa` covers all three chars. The caller
@@ -1154,10 +1358,14 @@ fn atoms_co_occur_within(
 /// anyone could see. Resuming mid-char is harmless — UTF-8 is self-synchronizing,
 /// so a valid needle can only ever match at a char boundary.
 ///
+/// The map arrives as a [`CharMap`] rather than a raw table so the ASCII identity
+/// reaches this loop: an ASCII line's byte offset IS its char position, and asking
+/// the enum lets that answer come back without a table ever being built.
+///
 /// Fail-soft on the mark itself (`get_mut`): a position outside `marked` is
 /// skipped rather than panicking, so a byte/char map that ever disagreed with the
 /// text would misplace a mark, never take the board down.
-fn mark_atom(atom: &AtomFinder, haystack: &str, starts: &[usize], marked: &mut [bool]) {
+fn mark_atom(atom: &AtomFinder, haystack: &str, map: &CharMap<'_>, marked: &mut [bool]) {
     let needle_len = atom.finder.needle().len();
     if needle_len == 0 {
         return;
@@ -1166,7 +1374,7 @@ fn mark_atom(atom: &AtomFinder, haystack: &str, starts: &[usize], marked: &mut [
     let mut from = 0;
     while let Some(offset) = atom.finder.find(&bytes[from..]) {
         let start = from + offset;
-        for pos in char_span(starts, start, start + needle_len) {
+        for pos in map.char_span(start, start + needle_len) {
             if let Some(mark) = marked.get_mut(pos) {
                 *mark = true;
             }
@@ -1189,8 +1397,8 @@ fn char_span(starts: &[usize], start: usize, end: usize) -> Range<usize> {
     first..last
 }
 
-/// Byte offset of each CHAR of `text`, ascending — the map [`char_span`] reads to
-/// answer a memmem hit in CHAR positions.
+/// Byte offset of each CHAR of `text`, ascending, written into a CALLER-OWNED
+/// buffer — the map [`char_span`] reads to answer a memmem hit in CHAR positions.
 ///
 /// ONE map answers for the cased text AND its lowercased sibling. That is a
 /// consequence of [`lowercase_preserving_byte_len`], not an assumption:
@@ -1199,8 +1407,18 @@ fn char_span(starts: &[usize], start: usize, end: usize) -> Range<usize> {
 /// per-string [`str::to_lowercase`] would not license this — it can lengthen a
 /// char (`İ` → `i` + a combining dot) and shift every later byte — which is
 /// exactly why the marking seam folds the way the filter does.
-fn char_starts(text: &str) -> Vec<usize> {
-    text.char_indices().map(|(byte, _)| byte).collect()
+///
+/// In-place because this map is built per LINE: the buffer lives in the caller's
+/// [`MarkScratch`] and is reused down a pane, so one pass allocates it once rather
+/// than once per line. It is CLEARED first, so a longer previous line's tail can
+/// never survive into a shorter one — a stale entry there would name a byte offset
+/// past the end of the text being marked.
+///
+/// Only [`CharMap::Explicit`] reaches this. Pure-ASCII text takes the identity arm
+/// and builds no table at all.
+fn char_starts_into(text: &str, out: &mut Vec<usize>) {
+    out.clear();
+    out.extend(text.char_indices().map(|(byte, _)| byte));
 }
 
 /// One-shot substring filter: match `sessions` against `query` in `mode`.
@@ -1761,13 +1979,16 @@ mod tests {
         );
     }
 
-    /// The chars `atom_match_positions` marked, run by run, joined with `+`.
+    /// The chars of `text` at `positions`, run by run, joined with `+`.
     ///
     /// Runs rather than raw positions: per-atom marking puts SEVERAL runs on one
     /// string, and a position list cannot tell "marked the query" from "marked
     /// whatever sits at a borrowed offset".
-    fn marked_runs(index: &SearchIndex, text: &str) -> String {
-        let positions = index.atom_match_positions(text);
+    ///
+    /// Takes the positions as an ARGUMENT so the same rendering serves both entry
+    /// points — [`marked_runs`] asks the one-shot form, while the equivalence
+    /// table below asks it of a list a caller-owned scratch produced.
+    fn runs_at(text: &str, positions: &[usize]) -> String {
         let mut runs: Vec<String> = Vec::new();
         let mut run = String::new();
         let mut previous: Option<usize> = None;
@@ -1785,6 +2006,11 @@ mod tests {
             runs.push(run);
         }
         runs.join("+")
+    }
+
+    /// [`runs_at`] over whatever `atom_match_positions` marked in `text`.
+    fn marked_runs(index: &SearchIndex, text: &str) -> String {
+        runs_at(text, &index.atom_match_positions(text))
     }
 
     /// The PREVIEW-MARK seam marks PER ATOM: a string carrying only ONE atom of a
@@ -1915,6 +2141,270 @@ mod tests {
         assert!(index.atom_match_positions("anything at all").is_empty());
         index.set_query("anything");
         assert!(index.atom_match_positions("").is_empty());
+    }
+
+    /// The GATE is asked FIRST: a line no atom occurs in returns without the
+    /// per-char machinery ever being built.
+    ///
+    /// "Marks nothing" alone would pass just as green over the OLD shape, which
+    /// sized a flag per char and built a byte -> char map, marked nothing into
+    /// them, and then collected an empty result. The [`MarkScratch`] is what
+    /// separates the two, because its buffers ARE that machinery: their length
+    /// after the call says whether the call built any. A preview pane is
+    /// overwhelmingly lines the query is not in, so this is the path almost every
+    /// line takes.
+    ///
+    /// The fold is asserted too. It runs BEFORE the gate, so a lowercased sibling
+    /// in the buffer is the evidence the gate was reached and ASKED, rather than
+    /// the call bailing out at the empty-atoms guard above it.
+    #[test]
+    fn the_mark_gate_returns_before_any_per_char_machinery_is_built() {
+        let mut index = SearchIndex::new();
+        index.set_query("deploy");
+
+        let ascii_miss = "Nothing To See Here";
+        let mut ascii = MarkScratch::new();
+        assert!(
+            index
+                .atom_match_positions_with(ascii_miss, &mut ascii)
+                .is_empty(),
+            "no atom occurs, so nothing is marked"
+        );
+        assert_eq!(
+            ascii.lowered, "nothing to see here",
+            "the fold ran, so the gate was reached and asked — this is not the \
+             empty-atoms bail-out above it"
+        );
+        assert!(
+            ascii.marked.is_empty(),
+            "no flag-per-char was sized for a line the gate rejected"
+        );
+        assert!(
+            ascii.starts.is_empty(),
+            "and no byte -> char map was built for it"
+        );
+
+        // The same over NON-ASCII text — the arm that would otherwise fill the
+        // explicit table, so BOTH buffers are on the line here.
+        let non_ascii_miss = "οὐδὲν λέγω ☕";
+        let mut non_ascii = MarkScratch::new();
+        assert!(
+            index
+                .atom_match_positions_with(non_ascii_miss, &mut non_ascii)
+                .is_empty(),
+            "no atom occurs in the non-ASCII line either"
+        );
+        assert!(non_ascii.marked.is_empty(), "no flags for a rejected line");
+        assert!(
+            non_ascii.starts.is_empty(),
+            "and no explicit table for a rejected line"
+        );
+
+        // Positive control: PAST the gate both buffers ARE filled, so the
+        // emptiness above is the gate's doing rather than a buffer that nothing
+        // in this module ever writes.
+        let hit = "café deploy ☕";
+        let mut past = MarkScratch::new();
+        assert!(
+            !index.atom_match_positions_with(hit, &mut past).is_empty(),
+            "the control must actually pass the gate"
+        );
+        assert_eq!(past.marked.len(), hit.chars().count());
+        assert_eq!(past.starts.len(), hit.chars().count());
+    }
+
+    /// Pure-ASCII text marks through the IDENTITY map: byte offset `n` IS char
+    /// position `n`, so no table is allocated, filled, or searched.
+    ///
+    /// Positions alone cannot tell the two arms apart — an explicit table over
+    /// ASCII answers identically, which is exactly why the arm is sound and
+    /// exactly why a position assertion cannot pin WHICH arm ran. The scratch can:
+    /// `starts` stays empty for the ASCII line and fills for the very next line,
+    /// which differs from it in nothing but one accented char.
+    #[test]
+    fn pure_ascii_text_marks_through_the_identity_char_map() {
+        let mut index = SearchIndex::new();
+        index.set_query("deploy");
+        let mut scratch = MarkScratch::new();
+
+        // "the deploy ran": d(4) through y(9).
+        let ascii_line = "the deploy ran";
+        assert_eq!(
+            index.atom_match_positions_with(ascii_line, &mut scratch),
+            vec![4, 5, 6, 7, 8, 9]
+        );
+        assert_eq!(
+            scratch.marked.len(),
+            ascii_line.len(),
+            "one flag per CHAR, and for ASCII the byte length IS the char count"
+        );
+        assert!(
+            scratch.starts.is_empty(),
+            "the identity arm builds no byte -> char table"
+        );
+
+        // The same sentence with ONE accented char: "the café deploy ran" puts
+        // `deploy` at chars 9..15 while its BYTES start at 10, so the explicit
+        // table is both built and load-bearing.
+        let non_ascii_line = "the café deploy ran";
+        assert_eq!(
+            index.atom_match_positions_with(non_ascii_line, &mut scratch),
+            vec![9, 10, 11, 12, 13, 14]
+        );
+        assert_eq!(
+            scratch.starts.len(),
+            non_ascii_line.chars().count(),
+            "non-ASCII keeps the explicit table, so the emptiness above is a \
+             BRANCH rather than a field nothing ever fills"
+        );
+    }
+
+    /// The ASCII arm's closed form and the explicit table's binary search answer
+    /// the SAME char span, over every byte range a real hit can produce.
+    ///
+    /// This is the arithmetic the identity arm rests on, asserted AS arithmetic
+    /// rather than inferred from one marked line: an ASCII table is literally
+    /// `0, 1, .. len - 1`, so searching it can only ever hand back the index it
+    /// was looked up by. The domain is the one a hit satisfies
+    /// (`start < end <= len`, per [`mark_atom`]); outside it the two forms
+    /// deliberately differ and only the fail-soft `get_mut` ever sees the result.
+    #[test]
+    fn the_ascii_char_map_answers_what_the_explicit_table_would() {
+        const ASCII_TEXT: &str = "the deploy pipeline ran";
+
+        let mut starts = Vec::new();
+        char_starts_into(ASCII_TEXT, &mut starts);
+        assert_eq!(
+            starts,
+            (0..ASCII_TEXT.len()).collect::<Vec<usize>>(),
+            "an ASCII table IS the identity — the whole premise of the arm"
+        );
+
+        let identity = CharMap::Ascii {
+            chars: ASCII_TEXT.len(),
+        };
+        let explicit = CharMap::Explicit(&starts);
+        for start in 0..ASCII_TEXT.len() {
+            for end in (start + 1)..=ASCII_TEXT.len() {
+                assert_eq!(
+                    identity.char_span(start, end),
+                    explicit.char_span(start, end),
+                    "the closed form must answer what the table answers for {start}..{end}"
+                );
+            }
+        }
+    }
+
+    /// Lines to drive ONE reused [`MarkScratch`] through, ordered so that every
+    /// transition the reset contract has to survive actually happens.
+    ///
+    /// Each entry earns its place by the transition it creates with the one
+    /// before it, so the order is the fixture: a marked line whose marks sit
+    /// where the SHORTER line after it has none (a `marked` that were resized but
+    /// never cleared would union the two), a marked line followed by a rejected
+    /// one, a long non-ASCII line followed by a shorter non-ASCII one (a `starts`
+    /// that were not cleared would keep offsets past the new line's end), and
+    /// mixed case beside lower case (a `lowered` that were not cleared would
+    /// search the previous line's text).
+    const SCRATCH_REUSE_LINES: &[&str] = &[
+        "deploy the deploy pipeline and deploy the pipeline once more",
+        "the pipeline deploy ok",
+        "deploy is running now",
+        "ok",
+        "café deploy ☕ pipeline once more",
+        "café deploy",
+        "café ☕",
+        "   ",
+        "Deploy DEPLOY deploy",
+        "no match on this one",
+    ];
+
+    /// A reused scratch answers for each line exactly what a fresh one answers.
+    ///
+    /// This is the whole licence for the buffers being caller-owned: the scratch
+    /// decides who OWNS the working memory, never what is marked. The reference
+    /// column is [`SearchIndex::atom_match_positions`], which allocates its own
+    /// scratch per call, so nothing can leak into it from the line before —
+    /// making any divergence a leak in the reused one.
+    ///
+    /// Both orders are walked, because a SHRINK and a GROW are different
+    /// transitions and one pass can only test one of them per adjacent pair.
+    #[test]
+    fn a_reused_scratch_marks_each_line_as_a_fresh_one_would() {
+        for query in ["deploy", "deploy pipeline", "Deploy"] {
+            let mut index = SearchIndex::new();
+            index.set_query(query);
+
+            let forward = SCRATCH_REUSE_LINES.to_vec();
+            let mut backward = forward.clone();
+            backward.reverse();
+            for order in [forward, backward] {
+                let mut reused = MarkScratch::new();
+                let mut any_marked = false;
+                let mut any_unmarked = false;
+                for line in &order {
+                    let fresh = index.atom_match_positions(line);
+                    assert_eq!(
+                        index.atom_match_positions_with(line, &mut reused),
+                        fresh,
+                        "reusing a scratch changed the marks for {line:?} under {query:?}"
+                    );
+                    any_marked |= !fresh.is_empty();
+                    any_unmarked |= fresh.is_empty();
+                }
+                assert!(
+                    any_marked && any_unmarked,
+                    "the corpus must actually cross both transitions under {query:?}, \
+                     or the equality above holds over nothing"
+                );
+            }
+        }
+    }
+
+    /// `(query, text, the chars marked)` — the mark seam's answer pinned as DATA
+    /// across the corners the two entry points share: ASCII and non-ASCII text,
+    /// each matching and not, both folds (the ASCII per-byte one and the general
+    /// per-char one), and the per-atom case decision.
+    ///
+    /// The expected column is what makes the equality below capable of failing.
+    /// The one-shot form IS the scratch form over a fresh buffer, so comparing
+    /// only those two against each other could never go red on its own.
+    const MARK_EQUIVALENCE_CASES: &[(&str, &str, &str)] = &[
+        ("deploy", "the deploy ran", "deploy"),
+        ("deploy", "the release ran", ""),
+        ("deploy", "The DEPLOY ran", "DEPLOY"),
+        ("deploy", "café deploy ☕", "deploy"),
+        ("deploy", "café ☕ release", ""),
+        ("Deploy", "Deploy and deploy", "Deploy"),
+        ("οδοσ", "ΟΔΟΣ notes", "ΟΔΟΣ"),
+        ("stanbul", "İstanbul", "stanbul"),
+        ("deploy pipeline", "deploy the pipeline", "deploy+pipeline"),
+    ];
+
+    /// Both entry points mark the same chars, and those chars are the ones the
+    /// table says.
+    #[test]
+    fn the_scratch_form_marks_exactly_what_the_one_shot_form_marks() {
+        // ONE scratch across the whole table, so the reused column is asked the
+        // way a pane asks it: every case arriving after a differently shaped
+        // predecessor rather than after nothing.
+        let mut reused = MarkScratch::new();
+        for (query, text, expected) in MARK_EQUIVALENCE_CASES {
+            let mut index = SearchIndex::new();
+            index.set_query(query);
+            let one_shot = index.atom_match_positions(text);
+            assert_eq!(
+                index.atom_match_positions_with(text, &mut reused),
+                one_shot,
+                "the scratch decides who owns the buffers, never what is marked \
+                 ({query:?} over {text:?})"
+            );
+            assert_eq!(
+                runs_at(text, &one_shot),
+                *expected,
+                "{query:?} must mark {expected:?} in {text:?}"
+            );
+        }
     }
 
     /// Incremental re-filter: narrowing the query per keystroke re-ranks over

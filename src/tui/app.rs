@@ -23,7 +23,7 @@ use crate::agents::ReportedAgent;
 use crate::defined_agents::{self, DefinedAgent};
 use crate::{config, delete, hidden};
 
-use crate::search::{SearchIndex, SearchMode};
+use crate::search::{MarkScratch, SearchIndex, SearchMode};
 use crate::store::lineage::{self, LineageKey};
 use crate::store::{preview, Reload, Session};
 // The scope predicate and the worktree resolver MUST canonicalize paths the same
@@ -3002,10 +3002,13 @@ impl App {
     /// the active query, recomputing ONLY when the query moved off the entry's key.
     ///
     /// The match source is the RENDERED preview lines, re-searched PER ATOM through
-    /// [`SearchIndex::atom_match_positions`] — the filter's own finders, so the pane
-    /// marks by the rule the row was admitted by, and the only rule that can be
+    /// [`SearchIndex::atom_match_positions_with`] — the filter's own finders, so the
+    /// pane marks by the rule the row was admitted by, and the only rule that can be
     /// right: a position in `Session::content_index` does not project into these
-    /// lines (see [`CachedPreview::matches`]).
+    /// lines (see [`CachedPreview::matches`]). The `_with` form is the same
+    /// function as its one-shot sibling, over a scratch this pass owns: a whole
+    /// transcript's lines share ONE set of working buffers rather than allocating a
+    /// set each.
     ///
     /// Cost is bounded by the PANE, not by the corpus: one session's preview is
     /// tail-capped at `store::preview::PREVIEW_LINES`, and this runs at most once
@@ -3024,31 +3027,50 @@ impl App {
         {
             self.preview_match_rebuilds += 1;
         }
-        // Snapshot each line's plain text FIRST so the `&mut` matcher call below
-        // never overlaps the cache borrow (the same shape `render_list` uses for
-        // its row labels). An empty query skips the walk entirely.
-        let lines: Vec<String> = if self.query.is_empty() {
-            Vec::new()
+        // DISJOINT field borrows, so the matcher can be asked while the cached lines
+        // are still borrowed. The lines used to be snapshotted into a `Vec<String>`
+        // first — the whole rendered transcript copied on every query change — for
+        // one reason only: the matcher took `&mut self` and could not overlap the
+        // cache borrow. It takes `&self` now, so the copy buys nothing and the walk
+        // reads the cached lines in place.
+        let Self {
+            preview_cache,
+            index,
+            query,
+            ..
+        } = self;
+        // ONE scratch for the whole pane, not one per line. Its buffers grow to the
+        // widest line on the first few lines and are then reused down the
+        // transcript, which is what a pane of mostly non-matching lines otherwise
+        // spends its time allocating and dropping.
+        let mut scratch = MarkScratch::new();
+        // An empty query marks nothing, so the walk is skipped outright rather than
+        // asked line by line.
+        let matches: HashMap<usize, HashSet<usize>> = if query.is_empty() {
+            HashMap::new()
         } else {
-            self.preview_cache.get(id).map_or_else(Vec::new, |entry| {
-                entry.rendered.text.lines.iter().map(line_text).collect()
+            preview_cache.get(id).map_or_else(HashMap::new, |entry| {
+                entry
+                    .rendered
+                    .text
+                    .lines
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, line)| {
+                        let matched =
+                            index.atom_match_positions_with(&line_text(line), &mut scratch);
+                        if matched.is_empty() {
+                            None
+                        } else {
+                            Some((i, matched.into_iter().collect()))
+                        }
+                    })
+                    .collect()
             })
         };
-        let matches: HashMap<usize, HashSet<usize>> = lines
-            .iter()
-            .enumerate()
-            .filter_map(|(i, text)| {
-                let matched = self.index.atom_match_positions(text);
-                if matched.is_empty() {
-                    None
-                } else {
-                    Some((i, matched.into_iter().collect()))
-                }
-            })
-            .collect();
-        if let Some(entry) = self.preview_cache.get_mut(id) {
+        if let Some(entry) = preview_cache.get_mut(id) {
             entry.matches = matches;
-            entry.matches_query = self.query.clone();
+            entry.matches_query = query.clone();
         }
     }
 
