@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1](https://github.com/ilfroloff/snapback/compare/v0.8.0...v0.8.1) - 2026-08-29
+
+### Fixed
+
+- stop the preview from cutting a long transcript short
+
+### Other
+
+- *(tui)* widen the preview scroll offset past a 16-bit ceiling
+- cut the per-keystroke cost of marking search hits in the preview
+
 ## [0.8.0](https://github.com/ilfroloff/snapback/compare/v0.7.0...v0.8.0) - 2026-08-19
 
 ### Added
