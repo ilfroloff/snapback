@@ -96,7 +96,11 @@ it. Follow this split when adding behavior:
   and `delete_confirm_message`, the delete confirm's copy as a function of
   `(members, hidden)` — so the sentence that discloses off-screen lineage members
   is testable without a store, a modal or a terminal);
-  `view`'s `wrapped_text_rows` / `clamp_preview_offset` / `preview_split` /
+  `view`'s `wrapped_text_rows` / `wrapped_row_prefix` / `row_window` (which
+  logical lines a viewport at a given wrapped-row offset reaches, and the rows
+  left over inside the first of them — pure arithmetic over a prefix map, so the
+  windowed draw is tested without a terminal) / `clamp_preview_offset` /
+  `preview_split` /
   `centered_rect` / `highlight_runs` and its STYLED sibling
   `highlight_matched_spans` (the same char-safe run split, but over a line that
   arrives ALREADY styled — it splits the line's own spans at the matched
@@ -184,10 +188,15 @@ a grapheme cluster snaps **out** to the cluster's edges and merges with whatever
 it now touches. It marks at most one extra codepoint; the alternative is worse
 than cosmetic, because `Line::width` sums a **contextual** `unicode-width` PER
 SPAN. Cut an emoji off its VS16 (-1 column) or its skin-tone modifier (+2), and
-the summed width of text that did not change moves — desyncing BOTH caches
-measured on the unsplit lines (`preview_hit_context`'s widths and
-`preview_wrapped_rows`) from the line actually painted, and moving where ratatui's
-wrapper (which segments per span too) breaks the row.
+the summed width of text that did not change moves — desyncing the one cache
+measured on the unsplit lines (the wrapped-row prefix map behind
+`preview_wrapped_rows`, `preview_window` and `preview_hit_context` alike) from the
+line actually painted, and moving where ratatui's wrapper (which segments per span
+too) breaks the row. That map is now the whole pane's shared answer, which makes a
+split costlier than it was: it is built over the UNMARKED transcript and then used
+to WINDOW a marked one AND to hit-test a click into it, so a split that moved a row
+would start the pane on the wrong line and resolve a click to the wrong one, not
+merely mis-measure a height.
 
 Two invariants are easy to break and expensive to get wrong:
 
@@ -262,21 +271,54 @@ inner rect when there is no banner (so a banner-less pane's geometry is exactly
   DIFFERENT function of the same text, wrong in BOTH directions: it under-counts
   where a row ends early at a word boundary (which made the tail of a long
   transcript unreachable, since `max_offset = content_h - inner_height`) and
-  over-counts where the wrapper swallows the whitespace it broke on. That model
-  survives in exactly one place — `wrapped_line_height`, backing the mouse
-  hit-test's per-line map, which `line_count`'s single TOTAL cannot answer — and it
-  is documented there as an approximation with the click drift it implies. The
-  transcript's count is measured ONCE per (session, width), inside the
-  `preview_cache` entry, so it can never be invalidated apart from the text it
-  describes; whatever is NOT that cached transcript (the draft card, an in-flight
-  reply's echo turns) is measured at the draw site.
-- **A row OFFSET is that same accessor asked for a PREFIX.** The pane scrolls
-  itself onto a search match, and the row it scrolls to is
-  `wrapped_text_rows(&lines[..k], width)` — the wrapped height of everything above
-  matched line `k`, which IS the first screen row that line occupies. That
-  identity holds because `Wrap { trim: false }` wraps each logical line
-  independently and never joins two onto one row, so a wrapped row count is
-  ADDITIVE over lines (the same property the in-flight reply tail is added by).
+  over-counts where the wrapper swallows the whitespace it broke on. No production
+  path models a wrap any more — `wrapped_line_height` survives in `mod tests` alone,
+  as the FOIL a fixture proves itself against, so a case cannot pass by accidentally
+  agreeing with the wrapper. The
+  transcript is measured ONCE per (session, width), inside the `preview_cache`
+  entry, so it can never be invalidated apart from the text it describes; whatever
+  is NOT that cached transcript (the draft card, an in-flight reply's echo turns)
+  is measured at the draw site.
+- **The measurement is a MAP, not a total, and the draw is WINDOWED.**
+  `view::wrapped_row_prefix` asks that same accessor once per LOGICAL LINE and
+  keeps the running sum, so entry `n` is the screen row line `n` starts on and the
+  LAST entry is the whole transcript's height — the number a single whole-text
+  `line_count` used to answer, replaced rather than joined. What the map buys is
+  O(log n) answers to "which line holds row `r`, and how far into it?"
+  (`view::row_window`), which is what lets `render_preview` hand the `Paragraph`
+  only the lines the viewport can reach and scroll it by a small RESIDUAL inside
+  the first of them. A `Paragraph` re-wraps everything it is given on every frame,
+  so a whole transcript cost the draw its whole length per frame; the window costs
+  it the viewport's height. Two things ride on that identity and must stay
+  ABSOLUTE, never window-relative: `App::preview_scroll` (and therefore the
+  scrollbar, the clamp and `link_at`'s hit-test) counts rows from the top of the
+  TRANSCRIPT, and the match map is keyed by transcript line, so a window adds its
+  own start index back before looking one up.
+- **The CLICK reads that same map, and `view::line_at_row` is the one place a row
+  becomes a line.** `row_window` starts the window with it and `link_at` resolves a
+  click with it, so the paint and the hit-test cannot disagree about which line sits
+  where — the failure a second derivation guarantees. Which LINE a click lands on is
+  therefore EXACT at any length or scroll position. What stays approximate is the
+  COLUMN inside that one line (`sub_row * inner_width`, character-packed because the
+  wrapper will not say where inside a line it broke), so the error is bounded by ONE
+  logical line's wrapped extent and can never reach another line whichever way that
+  column slips — and it slips BOTH ways. `link_at`'s doc comment owns the two
+  directions and what each one costs a click; do not restate them. Answering the line
+  from a per-line model instead — a packing walk down the whole transcript — grew the
+  error with every wrapping line above the click, bounded by nothing once the
+  preview's 600-line tail cap was deleted.
+- **That map's soundness is one property, and it is PINNED.** Summing per-line
+  counts equals the whole-text count only because `Wrap { trim: false }` wraps
+  each logical line independently and never joins two onto one row — the same
+  additivity the in-flight reply tail is added by. It is a claim about a private
+  ratatui module held by an exact pin, so
+  `per_line_wrapped_row_counts_sum_to_the_whole_text_count` asserts it over
+  wrapping ASCII and double-width CJK/emoji. A bump that breaks it must go red
+  there first, because every offset the pane computes derives from that sum.
+- **A row OFFSET is one index into that map.** The pane scrolls itself onto a
+  search match, and the row it scrolls to is `row_prefix[k]` for matched line `k`
+  — the first screen row that line occupies, read in O(1) rather than re-wrapping
+  the transcript's whole prefix on each keypress.
   `view::MATCH_JUMP_LEAD_DIVISOR` then backs the offset off by a third of the
   viewport so the match lands with context above it, and the ordinary
   `clamp_preview_offset` bounds the result. The approximate model is no more
@@ -603,7 +645,7 @@ CADENCES and LIMITS, so a retune knows what it is next to:
 | `store` | `MTIME_SETTLE_WINDOW` (2 s) |
 | `store::parse` | `CONTENT_INDEX_CAP` (1 MB) |
 | `store::label` | `LABEL_MAX` (180) |
-| `store::preview` | `PREVIEW_LINES` (600) · `TABLE_MAX_WIDTH` (96) |
+| `store::preview` | `TABLE_MAX_WIDTH` (96) |
 | `send` | `SEND_ERROR_MAX` (200) |
 | `tui::app` | `PREVIEW_WHEEL_STEP` (2) · `LIST_WHEEL_STEP` (1) · `STATUS_DWELL_TICKS` (16) · `MIN_PANE_WIDTH` (15) · `DEFAULT_LIST_PERCENT` (48) |
 | `tui::update` | `PASTE_MAX_CHARS` (4096) · `SPLITTER_TOLERANCE` (1) |

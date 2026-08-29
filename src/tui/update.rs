@@ -809,20 +809,22 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
 /// [`App::is_live_now`], and it would be the wrong question here twice over: it
 /// shells out to claude, and it would disagree with the drawn banner.
 ///
-/// The wrapped-layout context (per-line widths + link regions) comes from the
-/// SAME width-scoped cache the view drew from, and the url from the pure
-/// [`view::link_at`]. Terminal- and process-free, so the geometry is unit
-/// testable; [`open_link_under_pointer`] is the thin impure wrapper over it.
+/// The wrapped-layout context (the per-line wrapped-row prefix map + the link
+/// regions) comes from the SAME width-scoped cache the view drew from — the very
+/// map the draw windowed itself by, so the click and the paint resolve a screen row
+/// to a logical line through one shared answer rather than two models. The url comes
+/// from the pure [`view::link_at`]. Terminal- and process-free, so the geometry is
+/// unit testable; [`open_link_under_pointer`] is the thin impure wrapper over it.
 fn link_under_pointer(app: &mut App, col: u16, row: u16) -> Option<String> {
     let has_banner = view::preview_banner(app).is_some();
     let (_, transcript) = view::preview_split(app.preview_rect, has_banner);
-    let (line_widths, regions) = app.preview_hit_context(transcript.width);
+    let (row_prefix, regions) = app.preview_hit_context(transcript.width);
     view::link_at(
         col,
         row,
         transcript,
         app.preview_scroll,
-        &line_widths,
+        &row_prefix,
         &regions,
     )
     .map(str::to_string)

@@ -36,9 +36,12 @@
 //! RGB, which can vanish on a light background). Code — inline and fenced — is
 //! DIM (and fenced code is indented), never syntax-highlighted with fixed colors.
 //!
-//! The most-recent `PREVIEW_LINES` rendered lines are kept (tail-cap), and the
-//! caller caches the result per session id, so markdown parsing never stalls the
-//! UI on a large transcript.
+//! The WHOLE transcript is rendered — there is no tail cap — and the caller caches
+//! the result per session id, so markdown parsing never stalls the UI on a large
+//! transcript. The cap that used to keep only the most-recent 600 rendered lines
+//! existed to bound the DRAW, which re-wrapped everything it was handed on every
+//! frame; the pane now draws a window of the rows its viewport can reach
+//! (`tui::view::row_window`), so the cap bought nothing but a truncated transcript.
 
 use std::collections::HashSet;
 use std::fs::File;
@@ -53,9 +56,6 @@ use time::{Date, OffsetDateTime};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::Session;
-
-/// Keep the LAST N rendered lines (most-recent turns).
-pub const PREVIEW_LINES: usize = 600;
 
 /// Upper bound on a rendered GFM table's total display width (columns +
 /// separators). The PRIMARY table budget is the preview pane's inner content
@@ -107,7 +107,7 @@ pub struct RenderedPreview {
 /// gates the noisy `agent-name` fallback so a free-form background-job title never
 /// renders as a bogus handle (see [`render_record`]).
 pub fn render(session: &Session, width: usize, known_agents: &HashSet<&str>) -> RenderedPreview {
-    render_file_collect(&session.file, PREVIEW_LINES, width, known_agents)
+    render_file_collect(&session.file, width, known_agents)
 }
 
 /// The optimistic trailing turns shown in the preview while a quick-reply send is
@@ -155,20 +155,19 @@ pub fn pending_reply_turns(
 }
 
 /// Render `path` into a [`RenderedPreview`]: the styled transcript plus the
-/// clickable [`LinkRegion`]s, keeping the last `max_lines` visual lines.
+/// clickable [`LinkRegion`]s, over the WHOLE file.
 ///
 /// Each record's block contributes its lines and its (block-relative) link
 /// regions; both are rebased onto the growing transcript by the running line
-/// offset so a region's `content_row` addresses the FINAL text. The tail-cap that
-/// keeps only the most-recent `max_lines` rows rebases the regions the same way —
-/// any link that scrolled off the top is dropped, never left pointing at a stale
-/// row.
-fn render_file_collect(
-    path: &Path,
-    max_lines: usize,
-    width: usize,
-    known_agents: &HashSet<&str>,
-) -> RenderedPreview {
+/// offset so a region's `content_row` addresses the FINAL text. That running
+/// rebase is now the ONLY one: a tail cap used to drop everything above the last
+/// 600 rendered lines and shift every surviving region up by the same amount, so a
+/// long conversation's early turns simply were not in the preview and a link above
+/// the cut was dropped. Nothing needs the cap any more — the pane draws a window of
+/// the rows its viewport can reach rather than re-wrapping the whole transcript per
+/// frame — so the transcript arrives whole and a region keeps the row it was
+/// rendered on.
+fn render_file_collect(path: &Path, width: usize, known_agents: &HashSet<&str>) -> RenderedPreview {
     let file = match File::open(path) {
         Ok(f) => f,
         Err(_) => {
@@ -215,19 +214,8 @@ fn render_file_collect(
         }
     }
 
-    // Keep the tail (most-recent turns); split_off returns lines[start..].
-    let start = lines.len().saturating_sub(max_lines);
-    let tail = lines.split_off(start);
-    // Rebase regions onto the kept tail, dropping any that fell off the top.
-    let links = links
-        .into_iter()
-        .filter_map(|mut r| {
-            r.content_row = r.content_row.checked_sub(start)?;
-            Some(r)
-        })
-        .collect();
     RenderedPreview {
-        text: Text::from(tail),
+        text: Text::from(lines),
         links,
     }
 }
@@ -329,7 +317,7 @@ fn render_record(
             // one) clears the bind rather than panicking. `"claude"` is stored
             // as-is (a later default re-emission must reset the bind); the
             // `● claude · @claude` suppression is `agent_handle`'s job at render.
-            // Contributes no lines, so the tail-cap and link rebasing are untouched.
+            // Contributes no lines, so the link rebasing is untouched.
             agent.bound = trimmed_field(record, "agentSetting");
             None
         }
@@ -1029,7 +1017,7 @@ fn ordered_item(line: &str) -> Option<(u64, &str)> {
 // that also carry per-column alignment), then zero or more body rows. The result
 // is monospace-aligned, styled `Line`s (bold header, DIM box-drawing separators)
 // appended to the preview like any other block — so preview scroll, per-message
-// timestamps, search-highlight, and the 600-line tail-cap keep working unchanged.
+// timestamps and search-highlight keep working unchanged.
 //
 // Column widths are measured on each cell's MARKER-STRIPPED display text via
 // `unicode-width` (see `cell_display_width`): `**x**` and `[a](b)` occupy their
@@ -1617,20 +1605,15 @@ mod tests {
     /// tests that assert markers/structure rather than link regions. No known
     /// agents, so the `agent-name` fallback stays inert; see [`render_file_known`]
     /// for tests that exercise it.
-    fn render_file(path: &Path, max_lines: usize, width: usize) -> Text<'static> {
-        render_file_collect(path, max_lines, width, &HashSet::new()).text
+    fn render_file(path: &Path, width: usize) -> Text<'static> {
+        render_file_collect(path, width, &HashSet::new()).text
     }
 
     /// Like [`render_file`] but with an explicit set of known DEFINED agents, so a
     /// test can exercise the validated `agent-name` fallback.
-    fn render_file_known(
-        path: &Path,
-        max_lines: usize,
-        width: usize,
-        known: &[&str],
-    ) -> Text<'static> {
+    fn render_file_known(path: &Path, width: usize, known: &[&str]) -> Text<'static> {
         let known: HashSet<&str> = known.iter().copied().collect();
-        render_file_collect(path, max_lines, width, &known).text
+        render_file_collect(path, width, &known).text
     }
 
     /// Flatten a `Text` back to a plain string (span contents joined, lines by
@@ -1707,7 +1690,6 @@ mod tests {
     fn render_keeps_turn_separators_and_tool_markers() {
         let text = render_file(
             &fixture("-Users-me-project-alpha", "sess-normal-1.jsonl"),
-            PREVIEW_LINES,
             WIDE,
         );
         let plain = flatten(&text);
@@ -1731,7 +1713,6 @@ mod tests {
     fn turn_separators_are_styled_bold() {
         let text = render_file(
             &fixture("-Users-me-project-alpha", "sess-normal-1.jsonl"),
-            PREVIEW_LINES,
             WIDE,
         );
         for sep in ["\u{25b6} you", "\u{25cf} claude"] {
@@ -2059,7 +2040,7 @@ mod tests {
         );
         std::fs::write(&file, jsonl).expect("write temp jsonl");
 
-        let rendered = render_file_collect(&file, PREVIEW_LINES, WIDE, &HashSet::new());
+        let rendered = render_file_collect(&file, WIDE, &HashSet::new());
         assert_eq!(rendered.links.len(), 1, "one link region end to end");
         let region = &rendered.links[0];
         assert_eq!(region.url, "https://example.com/page");
@@ -2072,6 +2053,78 @@ mod tests {
         let row = &rendered.text.lines[region.content_row];
         let text: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(&text[region.col_start..region.col_end], "docs");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// How many rendered lines the tail cap used to keep. Named here ONLY so the
+    /// test below can prove a transcript reaches past it; nothing in the renderer
+    /// knows this number any more.
+    const FORMER_TAIL_CAP: usize = 600;
+
+    /// A transcript longer than the cap that used to truncate it renders WHOLE — its
+    /// oldest turns included, with their links still pointing at the rows they were
+    /// rendered on.
+    ///
+    /// This is the deletion's user-visible payoff, and both halves were real losses.
+    /// The cap kept only the most-recent 600 rendered lines, so a long conversation
+    /// simply had no beginning in the preview: scrolling to the top showed the middle
+    /// of a turn with nothing above it, and the board's content search could admit a
+    /// row on words the pane could never show. A link above the cut was DROPPED
+    /// outright by the same pass, since its row no longer existed.
+    #[test]
+    fn a_transcript_past_the_former_tail_cap_keeps_its_oldest_turns_and_their_links() {
+        let dir = unique_temp_dir("no-tail-cap");
+        let file = dir.join("sess.jsonl");
+        // Each turn renders as a blank line, a marker line and one body line, so
+        // this clears the old cap several times over.
+        let turns = FORMER_TAIL_CAP;
+        let mut jsonl = String::new();
+        for turn in 0..turns {
+            let body = if turn == 0 {
+                "the oldest turn says [origin](https://example.com/origin) here".to_string()
+            } else {
+                format!("turn {turn} body")
+            };
+            jsonl.push_str(&format!(
+                r#"{{"type":"user","sessionId":"s","cwd":"/x","timestamp":"2026-07-01T10:00:00.000Z","message":{{"role":"user","content":"{body}"}}}}"#
+            ));
+            jsonl.push('\n');
+        }
+        std::fs::write(&file, jsonl).expect("write temp jsonl");
+
+        let rendered = render_file_collect(&file, WIDE, &HashSet::new());
+        assert!(
+            rendered.text.lines.len() > FORMER_TAIL_CAP,
+            "the fixture must render past the old cap, or this proves nothing \
+             (lines={})",
+            rendered.text.lines.len()
+        );
+        let flat = flatten(&rendered.text);
+        assert!(
+            flat.contains("the oldest turn says"),
+            "the first turn must survive into the preview"
+        );
+        assert!(
+            flat.contains(&format!("turn {} body", turns - 1)),
+            "and so must the last"
+        );
+
+        // The oldest turn's link keeps the row it was rendered on, rather than being
+        // dropped for sitting above a cut.
+        let region = rendered
+            .links
+            .first()
+            .expect("the oldest turn's link must survive");
+        assert_eq!(region.url, "https://example.com/origin");
+        assert!(
+            region.content_row < FORMER_TAIL_CAP,
+            "the surviving link must really sit above the old cut (row={})",
+            region.content_row
+        );
+        let row = &rendered.text.lines[region.content_row];
+        let text: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(&text[region.col_start..region.col_end], "origin");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2166,7 +2219,6 @@ mod tests {
     fn render_file_annotates_the_you_marker_with_a_timestamp() {
         let text = render_file(
             &fixture("-Users-me-project-alpha", "sess-normal-1.jsonl"),
-            PREVIEW_LINES,
             WIDE,
         );
         let you = line_led_by(&text, "\u{25b6} you").expect("a you marker line");
@@ -2203,7 +2255,7 @@ mod tests {
         std::fs::write(&file, jsonl).expect("write temp jsonl");
 
         // Must not panic and must never drop the message.
-        let text = render_file(&file, PREVIEW_LINES, WIDE);
+        let text = render_file(&file, WIDE);
         let markers: Vec<&Line> = text
             .lines
             .iter()
@@ -2244,7 +2296,6 @@ mod tests {
                 "-Users-me-acme-web-worktrees-feature-x",
                 "sess-worktree-1.jsonl",
             ),
-            PREVIEW_LINES,
             WIDE,
         );
         let claude = line_led_by(&text, "\u{25cf} claude").expect("a claude marker line");
@@ -2285,7 +2336,7 @@ mod tests {
         );
         std::fs::write(&file, jsonl).expect("write temp jsonl");
 
-        let text = render_file(&file, PREVIEW_LINES, WIDE);
+        let text = render_file(&file, WIDE);
         let claude = line_led_by(&text, "\u{25cf} claude").expect("a claude marker line");
         // Marker + timestamp only — NO handle span between them.
         assert_eq!(
@@ -2327,7 +2378,7 @@ mod tests {
         );
         std::fs::write(&file, jsonl).expect("write temp jsonl");
 
-        let text = render_file(&file, PREVIEW_LINES, WIDE);
+        let text = render_file(&file, WIDE);
         let markers: Vec<&Line> = text
             .lines
             .iter()
@@ -2358,7 +2409,7 @@ mod tests {
         );
         std::fs::write(&file, jsonl).expect("write temp jsonl");
 
-        let text = render_file(&file, PREVIEW_LINES, WIDE);
+        let text = render_file(&file, WIDE);
         let claude = line_led_by(&text, "\u{25cf} claude").expect("a claude marker line");
         assert_eq!(
             claude.spans.len(),
@@ -2413,12 +2464,7 @@ mod tests {
         );
         std::fs::write(&file, jsonl).expect("write temp jsonl");
 
-        let text = render_file_known(
-            &file,
-            PREVIEW_LINES,
-            WIDE,
-            &["lead", "technical-brainstormer"],
-        );
+        let text = render_file_known(&file, WIDE, &["lead", "technical-brainstormer"]);
         let claude = line_led_by(&text, "\u{25cf} claude").expect("a claude marker line");
         assert_eq!(claude.spans.len(), 2, "marker + handle: {:?}", claude.spans);
         assert_eq!(claude.spans[1].content.as_ref(), " \u{b7} @lead");
@@ -2441,7 +2487,7 @@ mod tests {
         );
         std::fs::write(&file, jsonl).expect("write temp jsonl");
 
-        let text = render_file_known(&file, PREVIEW_LINES, WIDE, &["lead"]);
+        let text = render_file_known(&file, WIDE, &["lead"]);
         let claude = line_led_by(&text, "\u{25cf} claude").expect("a claude marker line");
         assert_eq!(
             claude.spans.len(),
@@ -2469,12 +2515,7 @@ mod tests {
         );
         std::fs::write(&file, jsonl).expect("write temp jsonl");
 
-        let text = render_file_known(
-            &file,
-            PREVIEW_LINES,
-            WIDE,
-            &["lead", "technical-brainstormer"],
-        );
+        let text = render_file_known(&file, WIDE, &["lead", "technical-brainstormer"]);
         let claude = line_led_by(&text, "\u{25cf} claude").expect("a claude marker line");
         assert_eq!(claude.spans[1].content.as_ref(), " \u{b7} @lead");
         assert!(
@@ -2509,7 +2550,7 @@ mod tests {
         );
         std::fs::write(&file, jsonl).expect("write temp jsonl");
 
-        let text = render_file_known(&file, PREVIEW_LINES, WIDE, &["lead", ""]);
+        let text = render_file_known(&file, WIDE, &["lead", ""]);
         let markers: Vec<&Line> = text
             .lines
             .iter()
@@ -2721,7 +2762,7 @@ mod tests {
         );
         std::fs::write(&file, jsonl).expect("write temp jsonl");
 
-        let text = render_file(&file, PREVIEW_LINES, WIDE);
+        let text = render_file(&file, WIDE);
         let plain = flatten(&text);
         assert!(
             plain.contains("\u{25b7} /init --force"),

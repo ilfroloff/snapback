@@ -405,8 +405,8 @@ INDEPENDENT, lossy extractions of the same transcript, and no offset function
 maps one onto the other. They disagree in both directions: the index keeps
 sidechain turns and the FULL body of every control wrapper, and drops markers,
 timestamps and blank lines; the preview collapses each wrapper to a one-line
-marker, drops sidechain user turns, discards a link's url, truncates table cells,
-and keeps only the last `PREVIEW_LINES` rendered lines. The gap is wide, not
+marker, drops sidechain user turns, discards a link's url, and truncates table
+cells. The gap is wide, not
 marginal: a one-off probe over the real store (2026-08-14, 336 sessions / 24,587
 query × session hits) put **~17% of readable bytes inside collapsed wrappers
 alone**. Read that as an upper bound and a rough one — the probe APPROXIMATED the
@@ -418,7 +418,7 @@ So an in-preview search mark is derived by RE-SEARCHING the rendered lines —
 never by projecting a byte or char offset out of `content_index`. Any such
 mapping is a coincidence that holds on short sessions and silently marks
 unrelated text on long ones. The cost stays bounded because the re-search is per
-PANE (one session's ≤ `PREVIEW_LINES` lines, recomputed only when the query moves
+SESSION (one rendered transcript's lines, recomputed only when the query moves
 off the cache entry's key), never per corpus — the boundary the per-keystroke
 ranking pass was removed from.
 
@@ -442,8 +442,11 @@ carrying two different atoms, is marked twice and stopped at once.
 
 The two pipelines also disagree about what EXISTS: a query can match the index
 and occur nowhere in the rendered preview — the same one-off probe put it near
-**one content hit in eight**, again an upper bound, mostly sessions past the
-600-line tail cap and text inside collapsed wrappers. That is reported, not
+**one content hit in eight**, again an upper bound, and dated: that measurement
+was taken while a 600-line tail cap also truncated the preview, and the cap is
+gone, so read the figure as evidence the gap exists rather than as its size. What
+remains of it is text inside collapsed wrappers and dropped sidechain turns. That
+is reported, not
 hidden — the board says the match lies outside the previewed transcript, once per
 (session, query), on the transient status line. It says so from the KEYPRESS that
 changed the query or the selection, and only when NO rendered line holds ANY atom
@@ -454,9 +457,8 @@ label is not outside anything. Both halves of that refusal are asked through
 highlight, whose WHOLE-STRING rule wants every atom in the label and so came back
 empty for a two-word query with one word in the label and the other in a
 collapsed turn, making the board announce a match it was drawing one line away.
-Raising `PREVIEW_LINES` is not
-the fix; it trades a bounded render for a slightly smaller gap and leaves the
-collapse cases untouched.
+The remaining gap is the COLLAPSE, and closing it means changing what the renderer
+keeps — not bounding it differently.
 
 ### Incremental reload (`store::SessionStore`)
 
