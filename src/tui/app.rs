@@ -16,7 +16,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use ratatui::layout::Rect;
-use ratatui::text::{Line, Text};
+use ratatui::text::Line;
+// `Text` reaches only the test-only whole-transcript accessor now that the draw
+// takes a window of `Line`s instead (see `App::preview_text`).
+#[cfg(test)]
+use ratatui::text::Text;
 use time::OffsetDateTime;
 
 use crate::agents::ReportedAgent;
@@ -65,8 +69,8 @@ const DEFAULT_LIST_PERCENT: u32 = 48;
 ///
 /// The two pipelines are independent and lossy in different places (see
 /// [DOMAIN.md](../../docs/agents/DOMAIN.md#a-content-index-position-never-projects-into-preview-coordinates)): the
-/// `content_index` reaches turns and wrapper bodies the preview collapses,
-/// drops or tail-caps away. Roughly one hit in eight lands there (a one-off
+/// `content_index` reaches turns and wrapper bodies the preview collapses or
+/// drops. Roughly one hit in eight lands there (a one-off
 /// measurement, upper bound — DOMAIN.md states its provenance), and an
 /// unexplained unmarked pane reads as a broken highlight, so the board says so
 /// instead. A
@@ -904,12 +908,19 @@ fn default_worktree_probe(_launch_dir: &Path) -> WorktreeSet {
 struct CachedPreview {
     /// The styled transcript + clickable link regions from one `preview::render`.
     rendered: preview::RenderedPreview,
-    /// Screen rows `rendered.text` occupies once WORD-wrapped at
-    /// [`App::preview_width`] — measured by `view::wrapped_text_rows`, i.e. by the
-    /// same wrapper that paints the pane, never by a model of our own. Cached
-    /// because that wrapper walks the whole transcript and the pane redraws several
-    /// times a second.
-    wrapped_rows: usize,
+    /// Where every rendered line STARTS once WORD-wrapped at
+    /// [`App::preview_width`]: entry `n` is the screen row `rendered.text.lines[n]`
+    /// begins on, so the map is one longer than the transcript and its LAST entry is
+    /// the transcript's whole wrapped height (see
+    /// [`wrapped_rows`](Self::wrapped_rows)).
+    ///
+    /// Measured by `view::wrapped_row_prefix`, i.e. by the same wrapper that paints
+    /// the pane, never by a model of our own. Cached because that wrapper walks the
+    /// whole transcript and the pane redraws several times a second — and kept as a
+    /// MAP rather than a total because that is what lets the draw hand the widget
+    /// only the lines the viewport can reach, and lets a search jump read a matched
+    /// line's first row as one index instead of re-wrapping everything above it.
+    row_prefix: Vec<usize>,
     /// Where the active query occurs in `rendered`: line index -> the matched CHAR
     /// positions within THAT line's plain text.
     ///
@@ -933,6 +944,42 @@ struct CachedPreview {
     /// in the display string alone, so widening the filter to content cannot move
     /// where the query occurs in these lines.
     matches_query: String,
+}
+
+impl CachedPreview {
+    /// Screen rows the whole transcript occupies at [`App::preview_width`] — the
+    /// LAST entry of [`row_prefix`](Self::row_prefix), which is exactly what a
+    /// whole-text `view::wrapped_text_rows` would answer for the same lines.
+    fn wrapped_rows(&self) -> usize {
+        self.row_prefix.last().copied().unwrap_or(0)
+    }
+}
+
+/// The slice of a rendered preview a viewport can actually reach, cloned out of the
+/// width-scoped cache so the draw can style it without touching what is cached.
+///
+/// The pane hands the widget THIS rather than the whole transcript: a `Paragraph`
+/// re-wraps every line it is given on every frame, so drawing a 16,000-line
+/// transcript through a 40-row viewport spent all of that work on rows nobody could
+/// see. Which lines those are is a binary search over
+/// [`CachedPreview::row_prefix`] (see `view::row_window`).
+pub(crate) struct PreviewWindow {
+    /// The logical lines to draw, in transcript order.
+    pub lines: Vec<Line<'static>>,
+    /// Index of `lines[0]` in the WHOLE rendered transcript.
+    ///
+    /// Load-bearing, and the one thing a window is easy to get silently wrong:
+    /// everything else keyed to the transcript — the marks from
+    /// [`App::preview_matches`] above all — is keyed ABSOLUTELY, so a window that
+    /// does not start at line 0 must add this back before looking one up. Reading a
+    /// mark at the window-relative index instead paints the right emphasis on the
+    /// wrong words, with nothing to notice it by.
+    pub start: usize,
+    /// Wrapped rows to skip INSIDE `lines[0]`: what is left of the pane's absolute
+    /// offset once the window has absorbed every whole line above it. This is the
+    /// offset the `Paragraph` itself is scrolled by, and it is bounded by ONE
+    /// logical line's wrapped height rather than by the transcript's.
+    pub residual: usize,
 }
 
 /// One rendered preview line as PLAIN text: its spans' contents, concatenated.
@@ -1036,9 +1083,15 @@ pub struct App {
     /// TRANSCRIPT's length and the pane's width, and neither is bounded by
     /// anything this type could rely on: a long session wrapped into a narrow pane
     /// passes 65,535 rows, at which point a `u16` offset wraps silently and the
-    /// pane jumps to the top mid-scroll. The one place the offset must still be
-    /// `u16` is the `Paragraph::scroll` call in `view::render_preview`, where
-    /// ratatui's own `Position.y` sets the width — see the narrowing there.
+    /// pane jumps to the top mid-scroll.
+    ///
+    /// It counts rows from the top of the WHOLE TRANSCRIPT, and it is never the
+    /// number handed to a widget. `view::render_preview` draws a WINDOW of logical
+    /// lines and scrolls the `Paragraph` by the RESIDUAL inside the first of them —
+    /// a value bounded by ONE logical line's wrapped height, which is what the `u16`
+    /// `Paragraph::scroll` demands and what makes this field's own width free to be
+    /// the honest one. Everything else derived from this stays absolute too: the
+    /// clamp, the scrollbar and `view::link_at`'s hit-test all count transcript rows.
     pub preview_scroll: u32,
     /// When set, the preview stays pinned to the BOTTOM (newest turn): the next
     /// render resolves the offset to `max_offset`. Cleared, it means the READER
@@ -1314,10 +1367,16 @@ pub struct App {
     /// [`apply_reload`](Self::apply_reload)), since re-rendering a transcript
     /// nothing wrote to would spend the incremental store reload's saving here.
     /// Each entry carries the styled `Text`, its clickable link
-    /// regions (see [`preview::RenderedPreview`]) and the transcript's wrapped
-    /// row count (see [`CachedPreview`]); all three are produced from one pass at
-    /// a fixed width, so a region's columns and a row count always match the
-    /// drawn text.
+    /// regions (see [`preview::RenderedPreview`]) and the transcript's wrapped-row
+    /// PREFIX MAP (see [`CachedPreview`]); all three are produced from one pass at
+    /// a fixed width, so a region's columns and the row a line starts on always
+    /// match the drawn text.
+    ///
+    /// UNBOUNDED by design, and measured before it was left that way: visiting all
+    /// 351 sessions of a real store held ~39.7 MB of rendered lines. That is the
+    /// worst case for a board nobody closes, it is reclaimed on any resize, and a
+    /// second eviction policy on top of the existing ones would buy back a fraction
+    /// of it in exchange for a cache that can be wrong.
     preview_cache: HashMap<String, CachedPreview>,
     /// Inner content width the `preview_cache` entries were rendered for. A
     /// change invalidates the whole cache (see `preview_cache`). `None` until
@@ -2974,12 +3033,21 @@ impl App {
     /// A change in `inner_width` CLEARS the whole cache first: GFM tables
     /// shrink-to-fit, so the layout, the link-region columns AND the wrapped row
     /// count all depend on the width (see `preview_cache`). `None` when nothing is
-    /// selected or the selected id is no longer among the loaded sessions. This is
-    /// the single source [`preview_text`](Self::preview_text),
-    /// [`preview_hit_context`](Self::preview_hit_context) and
-    /// [`preview_wrapped_rows`](Self::preview_wrapped_rows) read, so the text drawn,
-    /// the regions hit-tested and the height scrolled against can never come from
-    /// different renders.
+    /// selected or the selected id is no longer among the loaded sessions.
+    ///
+    /// This is the single source EVERY preview accessor reads, so the lines drawn,
+    /// the marks laid on them, the height scrolled against and the regions
+    /// hit-tested can never come from different renders. The complete set, since a
+    /// partial enumeration is a wrong one:
+    /// [`preview_window`](Self::preview_window) (the lines drawn),
+    /// [`preview_matches`](Self::preview_matches) (the marks on them),
+    /// [`preview_wrapped_rows`](Self::preview_wrapped_rows) (the height),
+    /// [`preview_line_count`](Self::preview_line_count) (is there a transcript at
+    /// all), [`preview_rows_above`](Self::preview_rows_above) (the match jump),
+    /// [`preview_hit_context`](Self::preview_hit_context) (the click hit-test),
+    /// [`note_match_outside_preview`](Self::note_match_outside_preview) (whether the
+    /// query occurs in the pane), and the test-only
+    /// [`preview_text`](Self::preview_text).
     fn ensure_preview(&mut self, inner_width: u16) -> Option<&CachedPreview> {
         if self.preview_width != Some(inner_width) {
             self.preview_cache.clear();
@@ -2995,12 +3063,22 @@ impl App {
             // Measure ONCE, here, where the text and the width it was rendered for
             // are both in hand — the wrapper walks every line, so a per-frame
             // measurement would put a whole-transcript pass on the draw path.
-            let wrapped_rows = view::wrapped_text_rows(&rendered.text.lines, inner_width);
+            //
+            // KNOWN COST, deliberately unsolved: this map is the one remaining
+            // whole-transcript pass, and it runs on the FIRST FRAME AFTER A ROW IS
+            // SELECTED. Measured at ~24 ms for a 16,000-line transcript, so a
+            // pathological one stalls exactly one frame on selection — visible as a
+            // hitch while arrowing onto that row, and gone by the next frame because
+            // the entry is then cached for as long as the width holds. Moving it off
+            // the UI thread would buy one frame at the price of a partially-measured
+            // pane (the scroll clamp, the scrollbar and the jump all read this map),
+            // which is a worse trade than the hitch.
+            let row_prefix = view::wrapped_row_prefix(&rendered.text.lines, inner_width);
             self.preview_cache.insert(
                 id.clone(),
                 CachedPreview {
                     rendered,
-                    wrapped_rows,
+                    row_prefix,
                     // Left for `refresh_preview_matches` below: an empty map keyed by
                     // the EMPTY query is exactly "no query has been searched here
                     // yet", so a non-empty query recomputes on this same call.
@@ -3025,11 +3103,11 @@ impl App {
     /// transcript's lines share ONE set of working buffers rather than allocating a
     /// set each.
     ///
-    /// Cost is bounded by the PANE, not by the corpus: one session's preview is
-    /// tail-capped at `store::preview::PREVIEW_LINES`, and this runs at most once
-    /// per query change per cached entry. That is the boundary the per-keystroke
-    /// nucleo regression lived on the other side of — scoring EVERY session's
-    /// megabyte-scale haystack — so keep the recompute keyed and keep it here.
+    /// Cost is bounded by ONE SESSION, not by the corpus: this walks the selected
+    /// transcript's rendered lines and runs at most once per query change per cached
+    /// entry. That is the boundary the per-keystroke nucleo regression lived on the
+    /// other side of — scoring EVERY session's megabyte-scale haystack — so keep the
+    /// recompute keyed and keep it here.
     fn refresh_preview_matches(&mut self, id: &str) {
         match self.preview_cache.get(id) {
             // Already computed for this query: nothing to do (the common case —
@@ -3116,7 +3194,7 @@ impl App {
     /// in name-only mode a hit IS its label, and a label hit is right there on the
     /// row the user is looking at, so there is nothing unexplained to explain.
     /// What is left is the content hits — roughly one in eight, measured once —
-    /// whose text lives in a turn the preview collapses, drops or tail-caps away,
+    /// whose text lives in a turn the preview collapses or drops,
     /// where an unmarked pane would otherwise read as a broken highlight. It takes
     /// NO rendered line holding any atom: a query whose words landed on different
     /// lines has marks on screen and explains itself.
@@ -3190,6 +3268,13 @@ impl App {
     /// tables shrink-to-fit and never wrap. Lazily rendered and cached by id;
     /// a change in `inner_width` clears the cache first (see `preview_cache`).
     /// Empty `Text` when nothing is selected.
+    ///
+    /// TEST-ONLY, and only since the draw was windowed: this clones the WHOLE
+    /// transcript, which is exactly the per-frame cost
+    /// [`preview_window`](Self::preview_window) exists to avoid. What is left are
+    /// the tests that legitimately want all of it — measuring a whole transcript,
+    /// or asserting what the renderer produced — plus warming the cache.
+    #[cfg(test)]
     pub fn preview_text(&mut self, inner_width: u16) -> Text<'static> {
         self.ensure_preview(inner_width)
             .map(|p| p.rendered.text.clone())
@@ -3201,9 +3286,9 @@ impl App {
     /// bottom anchor, the scroll clamp and the scrollbar are all derived from.
     ///
     /// Read off the SAME width-scoped cache the text is drawn from
-    /// ([`ensure_preview`](Self::ensure_preview)), measured there by
-    /// `view::wrapped_text_rows`, so the height can never describe a different render
-    /// than the one on screen. `0` when nothing is selected.
+    /// ([`ensure_preview`](Self::ensure_preview)) as the last entry of the prefix map
+    /// measured there by `view::wrapped_row_prefix`, so the height can never describe
+    /// a different render than the one on screen. `0` when nothing is selected.
     ///
     /// It counts the TRANSCRIPT and nothing else. A pane showing something else —
     /// the new-session draft card — or showing more than that — the optimistic tail
@@ -3211,7 +3296,64 @@ impl App {
     /// neither was ever in this cache.
     pub fn preview_wrapped_rows(&mut self, inner_width: u16) -> usize {
         self.ensure_preview(inner_width)
-            .map_or(0, |p| p.wrapped_rows)
+            .map_or(0, CachedPreview::wrapped_rows)
+    }
+
+    /// How many LOGICAL lines the selected session's rendered transcript holds.
+    ///
+    /// The draw asks this — rather than the wrapped height — for the one question
+    /// "is there a transcript here at all?", because a wrapped height cannot answer
+    /// it: at a degenerate zero-width pane EVERY line measures zero rows, and a
+    /// real transcript would read as an empty one.
+    pub fn preview_line_count(&mut self, inner_width: u16) -> usize {
+        self.ensure_preview(inner_width)
+            .map_or(0, |p| p.rendered.text.lines.len())
+    }
+
+    /// The screen row the selected session's `line`-th rendered line STARTS on, once
+    /// word-wrapped at `inner_width` — an O(1) read of the cached prefix map.
+    ///
+    /// This is what a search jump scrolls to. It used to be measured by re-wrapping
+    /// the transcript's whole prefix on the keypress, which cloned every line above
+    /// the target and ran the wrapper over all of them; on a held key that repeated
+    /// per repeat. The map already knows the answer.
+    ///
+    /// `None` when nothing is selected or `line` is past the transcript — a stale
+    /// target from a reload that re-rendered under it, which must NOT be jumped to.
+    pub(crate) fn preview_rows_above(&mut self, inner_width: u16, line: usize) -> Option<usize> {
+        self.ensure_preview(inner_width)?
+            .row_prefix
+            .get(line)
+            .copied()
+    }
+
+    /// The selected session's rendered lines a `viewport_h`-row viewport at absolute
+    /// wrapped-row `offset` can reach — see [`PreviewWindow`] for what comes back and
+    /// why the absolute `start` matters.
+    ///
+    /// The window is resolved by binary search over the cached prefix map, so the
+    /// cost of a frame is the viewport's height and not the transcript's. An empty
+    /// window (nothing selected, or an offset past the end) is a pane that draws
+    /// nothing, which is what those states show anyway.
+    pub(crate) fn preview_window(
+        &mut self,
+        inner_width: u16,
+        offset: usize,
+        viewport_h: u16,
+    ) -> PreviewWindow {
+        let Some(entry) = self.ensure_preview(inner_width) else {
+            return PreviewWindow {
+                lines: Vec::new(),
+                start: 0,
+                residual: 0,
+            };
+        };
+        let (range, residual) = view::row_window(&entry.row_prefix, offset, viewport_h);
+        PreviewWindow {
+            start: range.start,
+            lines: entry.rendered.text.lines[range].to_vec(),
+            residual,
+        }
     }
 
     /// Where the active query occurs in the selected session's RENDERED preview:
@@ -3227,22 +3369,25 @@ impl App {
     }
 
     /// The wrapped-layout context needed to hit-test a mouse click into a preview
-    /// link: each content line's DISPLAY width (feeding the APPROXIMATE
-    /// character-packing model in `view::wrapped_line_height`, the hit-test's alone —
-    /// the transcript's height comes from
-    /// [`preview_wrapped_rows`](Self::preview_wrapped_rows)) and the clickable
+    /// link: the per-line wrapped-row PREFIX MAP
+    /// ([`row_prefix`](CachedPreview::row_prefix)) and the clickable
     /// [`LinkRegion`](preview::LinkRegion)s — both pulled from the SAME width-scoped
     /// cache the view drew from, so a hit-test can never disagree with what is on
     /// screen. Empty when nothing is selected.
+    ///
+    /// It hands over the very map the DRAW windows by, and that shared identity is
+    /// the point: `view::link_at` resolves a clicked row to a logical line through
+    /// the same binary search `view::row_window` starts the window with, so the two
+    /// cannot disagree about which line was painted where. Answering that from a
+    /// per-line model instead — as a walk over each line's display WIDTH did — makes
+    /// the click's error grow with every wrapping line above it, without limit on a
+    /// long transcript.
     pub fn preview_hit_context(
         &mut self,
         inner_width: u16,
     ) -> (Vec<usize>, Vec<preview::LinkRegion>) {
         match self.ensure_preview(inner_width) {
-            Some(p) => (
-                p.rendered.text.lines.iter().map(Line::width).collect(),
-                p.rendered.links.clone(),
-            ),
+            Some(p) => (p.row_prefix.clone(), p.rendered.links.clone()),
             None => (Vec::new(), Vec::new()),
         }
     }
@@ -4258,7 +4403,7 @@ mod tests {
     /// highlight.
     ///
     /// `content_index` and the preview are independent, lossy extractions of one
-    /// transcript (collapsed wrappers, dropped sidechain turns, the tail cap), so
+    /// transcript (collapsed wrappers, dropped sidechain turns), so
     /// a minority of content hits — roughly one in eight, measured once — have
     /// nothing to mark. This is the honest report of that, not a bug to paper over.
     #[test]

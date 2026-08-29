@@ -212,9 +212,10 @@ you where it was said instead of leaving you to scroll for it. In content mode
 the preview also **scrolls itself onto the most recent match** as you type, as
 you move between rows, and the moment `Tab` widens the search, and `Shift-↑` /
 `Shift-↓` walk back and forth through the rest — so finding a hit costs no
-scrolling at all. Content search reaches further
-back than the preview shows, so a hit occasionally lands outside the previewed
-part of the transcript; the board says so rather than showing an unmarked pane.
+scrolling at all. Content search also reads the parts
+the preview folds away — an injected reminder, a slash command's output — so a hit
+occasionally lands somewhere the pane cannot show it; the board says so rather
+than leaving you looking at an unmarked pane.
 
 The preview follows the newest turn of a session that is still being written —
 until you position the pane yourself. Scroll it, jump to a match, or press `Home`,
@@ -417,7 +418,8 @@ otherwise `~/.config/snapback/state/hidden_sessions` — never inside the Claude
 Code session store, which snapback otherwise only reads.
 
 **Readable transcript preview.** `Ctrl-/` opens a preview of the selected
-session rendered as clean, scrollable markdown — the real conversation, so you
+session rendered as clean, scrollable markdown — the real conversation, whole,
+from its first turn to its last, however long it ran. So you
 can confirm it's the right session before jumping back in. Links are clickable.
 
 ---

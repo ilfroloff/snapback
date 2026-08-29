@@ -1490,15 +1490,24 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         sending_tail(app, inner_width)
     };
-    // The tail is measured HERE, before it is folded into the transcript below,
-    // because the cached transcript height knows nothing about it: the echo turns
-    // exist only for the seconds a send is in flight and were never in the cache.
-    // Adding the two counts is exact — `WordWrapper` wraps each logical line on its
-    // own and never joins two of them onto one row, so a wrapped row count is
-    // additive over lines.
-    let tail_rows = reply_tail
+    // Both of the things that are NOT the cached transcript are measured HERE, into
+    // the SAME kind of prefix map the cache holds for the transcript, because the
+    // cache knows about neither: a draft CARD replaces the transcript outright, and
+    // the echo turns of an in-flight reply exist only for the seconds a send is
+    // running. Both are a handful of lines, so measuring them per frame is free.
+    //
+    // Adding their rows to the cached transcript's is exact — `WordWrapper` wraps
+    // each logical line on its own and never joins two of them onto one row, so a
+    // wrapped row count is additive over lines.
+    let card_prefix = card
         .as_ref()
-        .map_or(0, |tail| wrapped_text_rows(tail, inner_width));
+        .map(|lines| wrapped_row_prefix(lines, inner_width));
+    let tail_prefix = reply_tail
+        .as_ref()
+        .map(|tail| wrapped_row_prefix(tail, inner_width));
+    let tail_rows = tail_prefix
+        .as_ref()
+        .map_or(0, |prefix| prefix.last().copied().unwrap_or(0));
     // Whether the pane is still anchored to the newest row — `App::preview_follow_bottom`
     // and nothing else, because that field is the ONE answer to "is this pane still
     // anchored, or did the reader position it?" (see its doc comment for the full set
@@ -1516,41 +1525,26 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     // first thing to read.
     let follow_bottom = card.is_none() && app.preview_follow_bottom;
 
-    let mut text = match card {
-        Some(lines) => Text::from(lines),
-        None => app.preview_text(inner_width),
-    };
-    // Under an active query, mark the query's occurrences INSIDE the transcript —
-    // the content-search counterpart of the row-label highlight, and marked by
-    // re-searching these rendered lines rather than by projecting a position out
-    // of `content_index` (see `App::preview_matches`). Suppressed under a draft
-    // card, which is a placeholder for a session that does not exist yet: there is
-    // no transcript there to have matched. Applied BEFORE the reply tail is
-    // appended, so the map's line indices still address `text` one-for-one.
-    if !showing_card {
-        if let Some(matches) = app.preview_matches(inner_width) {
-            for (i, line) in text.lines.iter_mut().enumerate() {
-                if let Some(matched) = matches.get(&i) {
-                    *line = highlight_matched_spans(line, matched, PREVIEW_MATCH_MODIFIER);
-                }
-            }
-        }
-    }
-    if let Some(tail) = reply_tail {
-        text.lines.extend(tail);
-    }
     // Take the pending match jump ABOVE the early return below, so EVERY path out
     // of this function consumes it. It is a one-shot describing the pane as it was
     // when a key was pressed; a path that leaves it armed defers it onto an
     // unrelated later frame instead of dropping it (see `App::take_preview_match_jump`).
     let pending_jump = app.take_preview_match_jump();
 
+    // How many LOGICAL lines the cached transcript holds. Asked instead of its
+    // wrapped height for the emptiness test alone: at a degenerate zero-width pane
+    // every line wraps to zero rows, and a real transcript would read as absent.
+    // Also the call that WARMS the cache for this (session, width), which
+    // `preview_match_target` below reads without being able to fill.
+    let transcript_lines = app.preview_line_count(inner_width);
+
     // Nothing selected (no text AND no banner, since a banner implies a SELECTED
     // session claude reported). A reported session whose transcript is still
     // empty falls through instead: its banner is the one thing worth drawing, and
     // keeping the banner unconditional is what lets the hit-test below derive the
     // same geometry from `banner.is_some()` alone.
-    if text.lines.is_empty() && banner.is_none() && !dock_compose {
+    let nothing_to_draw = !showing_card && reply_tail.is_none() && transcript_lines == 0;
+    if nothing_to_draw && banner.is_none() && !dock_compose {
         // Keep the scroll bookkeeping sane and still record the viewport height
         // so a later selection can size a page.
         app.preview_viewport_h = inner_height;
@@ -1577,11 +1571,11 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.render_widget(Paragraph::new(banner), banner_area);
     }
 
-    // The wrapped height of what this pane is ACTUALLY showing, measured with the
-    // same word wrapper the `Paragraph` below draws with (see `wrapped_text_rows`).
-    // The transcript's own count is CACHED per session at this width, since
-    // re-wrapping a whole transcript every frame is not free; the two things that are
-    // NOT that cached transcript are measured fresh, and both would otherwise be
+    // The wrapped height of what this pane is ACTUALLY showing — the WHOLE of it,
+    // window or no window, because this is what the scroll clamp, the bottom anchor
+    // and the scrollbar all describe. The transcript's own count is the last entry
+    // of the prefix map CACHED per session at this width; the two things that are
+    // NOT that cached transcript were measured above, and both would otherwise be
     // MIS-counted:
     //   - a draft CARD replaces the transcript outright, so the cached count would
     //     describe text that is not on screen — and being far too tall, it would let
@@ -1589,29 +1583,30 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     //     view entirely;
     //   - an in-flight reply TAIL is appended after the cache was filled, so the
     //     cached count alone under-counts it (`tail_rows`, resolved above).
-    let content_h = if showing_card {
-        wrapped_text_rows(&text.lines, inner_width)
-    } else {
-        app.preview_wrapped_rows(inner_width) + tail_rows
+    let transcript_rows = app.preview_wrapped_rows(inner_width);
+    let content_h = match &card_prefix {
+        Some(prefix) => prefix.last().copied().unwrap_or(0),
+        None => transcript_rows + tail_rows,
     };
     // Resolve the pending match jump HERE, at the one site that knows the pane's
     // width and height — the two things the offset is a function of — and that
-    // already writes the resolved scroll state back. The offset is measured with
-    // the SAME wrapper that paints the pane, over the transcript's own prefix:
-    // `Wrap { trim: false }` wraps each logical line independently and never joins
-    // two onto one row, so a wrapped row count is ADDITIVE over lines and the
-    // prefix's count IS the matched line's first screen row. The approximate
-    // character-packing model (`wrapped_line_height`) is wrong in both directions
-    // and would park the match somewhere else entirely.
+    // already writes the resolved scroll state back. The row the matched line starts
+    // on is READ OFF the cached prefix map rather than re-measured: that map was
+    // built with the SAME wrapper that paints the pane, so `row_prefix[line]` IS the
+    // matched line's first screen row — where re-wrapping the transcript's whole
+    // prefix on every keypress used to clone every line above the target to ask the
+    // same question. An approximate character-packing model is wrong in both
+    // directions and would park the match somewhere else entirely.
     //
     // Already taken above, acted on only for a transcript: under a draft CARD the
     // matched line indices address text that is not on screen (the card replaced
     // it), so the request is DROPPED rather than deferred onto whatever frame
     // follows the card.
     let jump = if pending_jump && !showing_card {
-        app.preview_match_target()
-            .and_then(|line| text.lines.get(..line))
-            .map(|prefix| match_jump_offset(wrapped_text_rows(prefix, inner_width), inner_height))
+        let target = app.preview_match_target();
+        target
+            .and_then(|line| app.preview_rows_above(inner_width, line))
+            .map(|rows_above| match_jump_offset(rows_above, inner_height))
     } else {
         None
     };
@@ -1644,34 +1639,92 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     app.preview_viewport_h = inner_height;
 
-    // THE ONE NARROWING, and the reason the widening above stops one line short of
-    // the draw call. `Paragraph::scroll` takes a `Position { x: u16, y: u16 }`, so
-    // the widget's row offset is a `u16` — a ratatui constraint, not a choice this
-    // module gets to make, and not something `App::preview_scroll` can be typed
-    // around. Saturating rather than a bare `as`, so an offset the widget cannot
-    // hold parks on the last row it CAN address instead of wrapping to the top.
+    // --- the windowed draw ---------------------------------------------------
     //
-    // Today the narrowing is lossless in practice, because
-    // `store::preview::PREVIEW_LINES` still tail-caps a transcript at 600 rendered
-    // lines: `content_h` — and therefore every offset `clamp_preview_offset` can
-    // produce from it — stays orders of magnitude under `u16::MAX`, so the
-    // saturation cannot fire on any real pane.
+    // The widget is handed ONLY the logical lines this viewport can reach, and is
+    // scrolled by the RESIDUAL — the rows to skip inside the first of them — rather
+    // than by the pane's absolute offset. `Paragraph` re-wraps every line it is
+    // given on every frame, so handing it the whole transcript spent that work on
+    // rows nobody could see: measured at 18.2 ms per frame at the bottom of a
+    // 16,000-line transcript against a flat ~0.06 ms windowed, independent of length.
     //
-    // The windowed render removes both halves of that at once: it hands the widget
-    // only the rows the pane can show, so this becomes a small RESIDUAL offset
-    // inside that window, and the `PREVIEW_LINES` cap is deleted because nothing
-    // depends on it any more. Until that lands, this line is exactly where a
-    // 65,536-row transcript would clip — so a scroll-geometry regression that
-    // bisects here is a widening bug, and one that bisects there is a window bug.
-    let widget_offset = u16::try_from(offset).unwrap_or(u16::MAX);
+    // It also retires the one place `App::preview_scroll`'s `u32` had to narrow.
+    // `Paragraph::scroll` takes a `Position { x: u16, y: u16 }` — a ratatui
+    // constraint, not a choice this module gets to make — and an absolute offset
+    // past `u16::MAX` used to clip there, kept out of reach only by a tail cap on
+    // the transcript that no longer exists. The residual is bounded by ONE logical
+    // line's wrapped height instead of by the transcript's, so the conversion below
+    // survives a transcript of any length; it stays saturating rather than a bare
+    // `as` so that even a single line wrapping past 65,535 rows (a pathological
+    // paste into a one-column pane) parks on the last row the widget can address
+    // instead of wrapping back to the top.
+    let offset_rows = usize::try_from(offset).unwrap_or(usize::MAX);
+    // `card` and `card_prefix` are built together and travel together, so they are
+    // taken together — there is no state where the pane has a card but no map of it.
+    let (mut window, mut residual) =
+        if let Some((lines, prefix)) = card.as_ref().zip(card_prefix.as_ref()) {
+            // A draft CARD replaces the transcript, so it is windowed as itself. It
+            // was never in the cache, and its marks were never computed — a
+            // placeholder for a session that does not exist yet has no transcript to
+            // have matched.
+            let (range, residual) = row_window(prefix, offset_rows, inner_height);
+            (lines[range].to_vec(), residual)
+        } else {
+            let window = app.preview_window(inner_width, offset_rows, inner_height);
+            let mut lines = window.lines;
+            // Mark the query's occurrences INSIDE the transcript — the content-search
+            // counterpart of the row-label highlight, derived by re-searching the
+            // rendered lines rather than by projecting a position out of
+            // `content_index` (see `App::preview_matches`). Only the WINDOW is
+            // marked, since only the window is drawn.
+            //
+            // The map is keyed to the WHOLE transcript, so each line is looked up at
+            // its ABSOLUTE index — `window.start` back-added. Dropping that term
+            // marks real occurrences onto the wrong words whenever the pane is
+            // scrolled, and nothing on screen says so.
+            if let Some(matches) = app.preview_matches(inner_width) {
+                for (i, line) in lines.iter_mut().enumerate() {
+                    if let Some(matched) = matches.get(&(window.start + i)) {
+                        *line = highlight_matched_spans(line, matched, PREVIEW_MATCH_MODIFIER);
+                    }
+                }
+            }
+            (lines, window.residual)
+        };
+    // The optimistic reply turns sit BELOW the transcript, so they join the window
+    // only once the viewport reaches them — and when the viewport has scrolled
+    // PAST the transcript entirely, they carry the residual too, since the window's
+    // first line is then one of theirs. They are never marked: they are not in the
+    // cache the match map describes.
+    if let (Some(tail), Some(prefix)) = (&reply_tail, &tail_prefix) {
+        if offset_rows.saturating_add(usize::from(inner_height)) > transcript_rows {
+            let (range, tail_residual) = row_window(
+                prefix,
+                offset_rows.saturating_sub(transcript_rows),
+                inner_height,
+            );
+            if window.is_empty() {
+                residual = tail_residual;
+            }
+            window.extend_from_slice(&tail[range]);
+        }
+    }
+    let widget_offset = u16::try_from(residual).unwrap_or(u16::MAX);
     frame.render_widget(
-        Paragraph::new(text)
+        Paragraph::new(Text::from(window))
             .wrap(Wrap { trim: false })
             .scroll((widget_offset, 0)),
         transcript_area,
     );
 
     if content_h > usize::from(inner_height) {
+        // Every number below describes the WHOLE transcript, never the window the
+        // widget was just handed — which is the point of a scrollbar: it says how
+        // much there is and where in it the reader stands. `content_h` is the whole
+        // wrapped height and `offset` the absolute row it is scrolled to, both
+        // resolved above and both untouched by the windowing, so the thumb's travel
+        // spans the transcript rather than collapsing to one viewport's worth.
+        //
         // The max offset `clamp_preview_offset` can ever produce for THIS
         // geometry (mirrors that fn's own formula, including its `u32` domain);
         // needed here to know when a boundary arrow should show and to size the
@@ -1753,10 +1806,9 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
 /// only way to reach the wrapper (hence the crate's `unstable-rendered-line-info`
 /// feature — see Cargo.toml).
 ///
-/// The alternative — a character-packing `ceil(width / inner)` count
-/// ([`wrapped_line_height`]) — is not an approximation with a safe direction, it is a
-/// DIFFERENT function, wrong BOTH ways and user-visibly so, since `max_offset` is
-/// derived from whatever this returns:
+/// The alternative — a character-packing `ceil(width / inner)` count — is not an
+/// approximation with a safe direction, it is a DIFFERENT function, wrong BOTH ways
+/// and user-visibly so, since `max_offset` is derived from whatever this returns:
 ///
 /// - it UNDER-counts wherever a row ends early at a word boundary (ordinary prose:
 ///   `alpha bravo charlie delta` packs to 3 rows at width 10, wraps to 4), and a
@@ -1773,97 +1825,195 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
 /// SEPARATE pass over its own rect (see [`render_preview`]), so a block here would
 /// count those two rows twice.
 ///
-/// Re-running the wrapper over a whole transcript is not free, so the result is
-/// CACHED per session at the pane width by [`App::preview_wrapped_rows`]; only the
-/// short things that are NOT the cached transcript (a draft card, an in-flight reply
-/// tail) are measured per frame. The clone is what `Paragraph` needs to own its text
-/// and is far cheaper than the per-frame `preview_text` clone already on the draw
-/// path.
+/// Re-running the wrapper over a whole transcript is not free, so a transcript is
+/// measured ONCE per (session, width) into the prefix map below
+/// ([`wrapped_row_prefix`], built at cache fill); only the short things that are NOT
+/// the cached transcript (a draft card, an in-flight reply tail) are measured per
+/// frame. The clone is what `Paragraph` needs to own its text.
 pub(crate) fn wrapped_text_rows(lines: &[Line<'_>], inner_width: u16) -> usize {
     Paragraph::new(Text::from(lines.to_vec()))
         .wrap(Wrap { trim: false })
         .line_count(inner_width)
 }
 
-/// APPROXIMATE wrapped row count of ONE logical line of display `width` at
-/// `inner_width`: `ceil(width / inner_width)`, and at least one row (a blank line
-/// still takes a row).
+/// The EXACT per-line wrapped-row prefix map over `lines` at `inner_width`: entry
+/// `n` is how many screen rows `lines[..n]` occupy, so the map is ONE LONGER than
+/// the lines it describes, starts at `0`, and its LAST entry is the whole run's
+/// wrapped height — the very number [`wrapped_text_rows`] answers for the same
+/// slice. It replaces that whole-text call rather than joining it.
 ///
-/// This is a CHARACTER-PACKING model and `Wrap { trim: false }` is WORD wrapping, so
-/// the two agree only while no line has to break inside a row — and where they part
-/// they part in EITHER direction (a row ending early at a word boundary costs a row
-/// this misses; whitespace swallowed at a break saves one this still charges for).
-/// Mouse link hit-testing ([`visual_to_content`] / [`link_at`]) is its only remaining
-/// caller, and it keeps the model for one reason: the wrapper itself is unreachable
-/// (`ratatui_widgets::reflow` is private) and `Paragraph::line_count` answers only a
-/// TOTAL, never the per-line map a hit-test needs. The drift that implies is real and
-/// confined to wrapped lines: a click below one can resolve to the wrong content line
-/// — off by however many rows the two models disagree about above it — so a link may
-/// open from a neighbouring line or miss. Every line that fits `inner_width` (the
-/// common case) is EXACT.
+/// Measured line by line through that same widget seam, which is sound for one
+/// reason and only that one: `Wrap { trim: false }` runs `WordWrapper`, which
+/// breaks each LOGICAL line on its own and never joins two of them onto a shared
+/// row, so a wrapped row count is ADDITIVE over lines and a sum of per-line counts
+/// IS the whole-text count. That property is a claim about a private module, so it
+/// is PINNED by a test rather than assumed (see
+/// `per_line_wrapped_row_counts_sum_to_the_whole_text_count`); a ratatui bump that
+/// broke it would make every offset below wrong, silently.
 ///
-/// The transcript's own height does NOT come from here — see [`wrapped_text_rows`] —
-/// and neither does the compose box's, which word-wraps and is measured by asking the
-/// editor (see [`compose_text_rows`]).
-fn wrapped_line_height(width: usize, inner_width: u16) -> usize {
-    // Guard a zero-width viewport (degenerate layout) so we never divide by zero.
-    let inner = usize::from(inner_width.max(1));
-    width.div_ceil(inner).max(1)
+/// What the map buys is a MAP where there was only a total. With it the pane can
+/// answer, in O(log n), which logical line a wrapped-row offset lands in and how
+/// far into it ([`row_window`]) — so a draw hands the widget only the lines the
+/// viewport can reach, and a search jump reads the row a matched line starts on as
+/// a single index rather than re-wrapping every line above it.
+pub(crate) fn wrapped_row_prefix(lines: &[Line<'_>], inner_width: u16) -> Vec<usize> {
+    let mut prefix = Vec::with_capacity(lines.len() + 1);
+    let mut rows = 0usize;
+    prefix.push(rows);
+    for line in lines {
+        rows += wrapped_text_rows(std::slice::from_ref(line), inner_width);
+        prefix.push(rows);
+    }
+    prefix
 }
 
-/// Map a `visual_row` (rows from the top of the wrapped content) to the
+/// Which LOGICAL line of a [`wrapped_row_prefix`] map holds absolute wrapped `row` —
+/// a binary search, and the ONE place that question is answered.
+///
+/// Both consumers must agree or the pane contradicts itself: the windowed draw
+/// ([`row_window`]) decides which line to START painting at, and the mouse hit-test
+/// ([`visual_to_content`]) decides which line was painted at a clicked row. Two
+/// derivations of that — the draw off this exact map, the click off a model of its
+/// own — is precisely how a click resolves to a line the pane never painted there.
+///
+/// A `row` past the map's total answers with the index ONE PAST the last line, since
+/// the map holds one more entry than it has lines. The draw clamps that (an offset
+/// past the end simply paints nothing); the hit-test rejects it (see
+/// [`visual_to_content`]).
+fn line_at_row(row_prefix: &[usize], row: usize) -> usize {
+    // The LAST entry still `<= row` is the line that occupies it: entries repeat for
+    // any zero-height line, and the line that owns the row is the last of them.
+    row_prefix
+        .partition_point(|&rows| rows <= row)
+        .saturating_sub(1)
+}
+
+/// The half-open range of LOGICAL lines a `viewport_h`-row viewport can reach when
+/// it starts at wrapped row `offset`, plus the rows to skip INSIDE the first of
+/// them (the RESIDUAL the widget is then scrolled by).
+///
+/// `row_prefix` is a [`wrapped_row_prefix`] map, so both bounds are BINARY SEARCHES
+/// over it rather than a walk: the window starts at the line holding `offset`
+/// ([`line_at_row`]), and ends after the last line that begins before
+/// `offset + viewport_h`. `offset - row_prefix[start]` is what is left over once the
+/// window has absorbed every whole line above it, so
+/// `row_prefix[start] + residual == offset` and the first row painted is the row the
+/// pane was scrolled to.
+///
+/// Saturating and clamped at both ends: an `offset` past the content yields an EMPTY
+/// range (the pane draws nothing, which is what scrolling off the end shows anyway)
+/// rather than an out-of-bounds slice, and a zero-height viewport never inverts the
+/// range. Pure and terminal-free.
+pub(crate) fn row_window(
+    row_prefix: &[usize],
+    offset: usize,
+    viewport_h: u16,
+) -> (std::ops::Range<usize>, usize) {
+    // `row_prefix` describes one MORE position than it has lines (it ends with the
+    // total), so the last addressable line index is one short of its length.
+    let lines = row_prefix.len().saturating_sub(1);
+    let start = line_at_row(row_prefix, offset);
+    let residual = offset.saturating_sub(row_prefix.get(start).copied().unwrap_or(0));
+    let last_row = offset.saturating_add(usize::from(viewport_h));
+    let end = row_prefix
+        .partition_point(|&rows| rows < last_row)
+        .min(lines)
+        .max(start);
+    (start..end, residual)
+}
+
+/// Map a `visual_row` (rows from the top of the wrapped transcript) to the
 /// `(content_row, sub_row)` it lands on — which logical line, and which wrapped
-/// sub-row within that line — using the APPROXIMATE [`wrapped_line_height`] model.
-/// `None` when the visual row is past the end of the content. Pure so the mapping is
-/// unit-testable from widths alone.
-fn visual_to_content(
-    line_widths: &[usize],
-    inner_width: u16,
-    visual_row: usize,
-) -> Option<(usize, usize)> {
-    let mut acc = 0usize;
-    for (content_row, &width) in line_widths.iter().enumerate() {
-        let height = wrapped_line_height(width, inner_width);
-        if visual_row < acc + height {
-            return Some((content_row, visual_row - acc));
-        }
-        acc += height;
+/// sub-row within that line.
+///
+/// BOTH halves are EXACT, and that is the whole reason `row_prefix` is what this
+/// takes: the map was measured by the very wrapper that paints the pane
+/// ([`wrapped_row_prefix`]), so the line is one binary search ([`line_at_row`]) and
+/// the sub-row is what is left of the visual row once that line's own start row is
+/// subtracted. Nothing is accumulated across the lines above the click, so nothing
+/// can drift with the transcript's length. A per-line MODEL walked from the top is
+/// what this replaced, and its error grew with every wrapping line above the click.
+///
+/// `None` when the visual row is past the end of the content — [`line_at_row`]
+/// answers such a row with the index one past the last line, which is exactly the
+/// case a hit-test must refuse rather than clamp. Pure so the mapping is
+/// unit-testable from a map alone.
+fn visual_to_content(row_prefix: &[usize], visual_row: usize) -> Option<(usize, usize)> {
+    // The map describes one MORE position than it has lines (it ends with the
+    // total), so the last addressable line index is one short of its length.
+    let lines = row_prefix.len().saturating_sub(1);
+    let content_row = line_at_row(row_prefix, visual_row);
+    if content_row >= lines {
+        return None;
     }
-    None
+    let sub_row = visual_row.saturating_sub(row_prefix[content_row]);
+    Some((content_row, sub_row))
 }
 
 /// The url of a preview link under a mouse click at screen `(col, row)`, or `None`.
 ///
 /// `inner` is the preview pane's INNER rect (inside the borders), `scroll_offset`
 /// the resolved vertical offset in wrapped rows (`App::preview_scroll`), and
-/// `line_widths` the per-content-line display widths of the drawn text. The click
-/// is translated to content coordinates and matched against a [`LinkRegion`]:
-/// screen row -> wrapped visual row (via `scroll_offset`) -> `(content_row,
-/// sub_row)` -> content column. A region whose `col_start..col_end` on that row
-/// contains the content column yields its url.
+/// `row_prefix` the whole transcript's per-line wrapped-row map — the SAME
+/// [`wrapped_row_prefix`] the pane windowed its draw by, read off the same
+/// width-scoped cache (`App::preview_hit_context`). The click is translated to
+/// content coordinates and matched against a [`LinkRegion`]: screen row -> wrapped
+/// visual row (via `scroll_offset`) -> `(content_row, sub_row)` -> content column. A
+/// region whose `col_start..col_end` on that row contains the content column yields
+/// its url.
 ///
 /// Because a region spans the label's full content-column range, a link that
 /// SOFT-WRAPS across visual rows is hit on ANY of its wrapped segments for free
 /// (each segment's cells map back into the same content-column range) — no special
 /// case.
 ///
-/// The row mapping is an APPROXIMATION, and knowingly so: it packs characters
-/// ([`wrapped_line_height`]) while the pane word-wraps, so once a line above the
-/// click has broken at a word boundary the two disagree and the click can resolve to
-/// the WRONG content line — opening a neighbouring line's link, or none. Exact for
-/// every line that fits the inner width, which is the common case. It stays an
-/// approximation because the real wrapper (`ratatui_widgets::reflow::WordWrapper`) is
-/// private and the one public accessor over it, `Paragraph::line_count`, returns a
-/// total rather than the per-line map this needs — closing the gap would mean
-/// reimplementing the wrapper, which would be a SECOND model to drift. The
-/// transcript's HEIGHT does not share this compromise: it is measured exactly (see
-/// [`wrapped_text_rows`]). Pure and terminal-free.
+/// `scroll_offset` stays ABSOLUTE — rows from the top of the whole transcript —
+/// even though the pane hands the widget only a WINDOW of logical lines and scrolls
+/// it by a small residual (see [`row_window`]). That is not a coincidence to be
+/// preserved by luck: the window starts at the logical line holding absolute row
+/// `scroll_offset`, and its residual is what is left of that offset once the whole
+/// lines above it are absorbed, so the first row PAINTED is absolute row
+/// `scroll_offset` either way. Screen rows therefore still count from the top of the
+/// transcript, and `row_prefix` must likewise stay the WHOLE transcript's map —
+/// handing this the window's map instead would resolve every click on a scrolled
+/// pane to a line near the top of the file.
+///
+/// WHICH LINE a click lands on is EXACT, however long the transcript and wherever it
+/// is scrolled: it is a binary search of the map the wrapper itself measured
+/// ([`visual_to_content`]), the same map the draw windows by, so no error is
+/// accumulated over the lines above the click. That replaced a per-line
+/// character-packing walk whose error GREW with every wrapping line above the click
+/// — unbounded once the preview's old 600-line tail cap was removed, since the cap
+/// was all that had ever bounded it.
+///
+/// What stays APPROXIMATE is the COLUMN within that one line: `sub_row *
+/// inner.width` packs characters while the wrapper breaks at word boundaries, so a
+/// sub-row's true start falls on EITHER side of that product. Break EARLY at a word
+/// boundary and the row spent FEWER source characters than the product assumes, so
+/// the computed column runs to the RIGHT of the true one; SWALLOW the whitespace
+/// broken on — consumed with no cell painted for it — and the row spent MORE, so the
+/// column runs to the LEFT
+/// (`character_packing_and_word_wrap_disagree_in_both_directions` pins both halves).
+/// Its error is bounded either way by ONE logical line's own wrapped extent, and it
+/// can never address a DIFFERENT line, because [`line_at_row`] gated the
+/// `content_row` exactly and that gate is DIRECTION-INDEPENDENT — which is why the
+/// second direction costs the bound nothing. So the worst case is a click on a
+/// wrapped line's CONTINUATION row missing the link painted there — or, on a line
+/// carrying several links, resolving to a LATER one where the column overshoots and
+/// an EARLIER one where it undershoots. The FIRST row of every line — and every row
+/// of every line that fits `inner.width`, which is the common case — is exact.
+///
+/// It stays an approximation because the real wrapper
+/// (`ratatui_widgets::reflow::WordWrapper`) is private and the one public accessor
+/// over it, `Paragraph::line_count`, answers how TALL a line is and never where
+/// inside it each row broke; closing that gap would mean reimplementing the wrapper,
+/// which would be a SECOND model to drift. Pure and terminal-free.
 pub(crate) fn link_at<'a>(
     col: u16,
     row: u16,
     inner: Rect,
     scroll_offset: u32,
-    line_widths: &[usize],
+    row_prefix: &[usize],
     regions: &'a [LinkRegion],
 ) -> Option<&'a str> {
     if !inner.contains(Position { x: col, y: row }) {
@@ -1872,13 +2022,17 @@ pub(crate) fn link_at<'a>(
     let rel_col = usize::from(col - inner.x);
     let rel_row = usize::from(row - inner.y);
     // `scroll_offset` is `App::preview_scroll`, so it carries the pane's `u32`
-    // offset domain into this `usize` row walk. Saturating both steps: a click can
-    // only ever resolve to a row `visual_to_content` walks off the end of, which is
-    // already the "no link here" answer.
+    // offset domain into this `usize` row lookup. Saturating both steps: the worst a
+    // saturated one can produce is a row past the end of the map, which
+    // `visual_to_content` already answers with the "no link here" `None`.
     let visual_row = usize::try_from(scroll_offset)
         .unwrap_or(usize::MAX)
         .saturating_add(rel_row);
-    let (content_row, sub_row) = visual_to_content(line_widths, inner.width, visual_row)?;
+    let (content_row, sub_row) = visual_to_content(row_prefix, visual_row)?;
+    // The one packed step left. A word-wrapped sub-row starts on EITHER side of
+    // `sub_row * inner.width`, so this can overshoot OR undershoot the true column —
+    // never reaching another line either way, since the content row came from the map
+    // above rather than from this arithmetic.
     let content_col = sub_row * usize::from(inner.width) + rel_col;
     regions
         .iter()
@@ -1919,12 +2073,13 @@ fn clamp_preview_offset(
 /// wrapped ROWS sit above that line.
 ///
 /// `rows_above` must be the EXACT wrapped-row count of the lines preceding the
-/// match — the first screen row that line occupies — which is why the caller
-/// measures it with `Paragraph::line_count` over the transcript's own prefix
-/// rather than modelling the wrap (see [`wrapped_text_rows`]). Saturating at BOTH
-/// ends: a match inside the first `viewport_h / MATCH_JUMP_LEAD_DIVISOR` rows
-/// resolves to 0 (the transcript's start) instead of underflowing, and a
-/// `rows_above` beyond `u32::MAX` pins at the ceiling instead of wrapping.
+/// match — the first screen row that line occupies — which is why the caller READS
+/// it off the cached per-line prefix map (`App::preview_rows_above`, one index into
+/// [`wrapped_row_prefix`]) rather than modelling the wrap or re-measuring the
+/// transcript's own prefix on the keypress. Saturating at BOTH ends: a match inside
+/// the first `viewport_h / MATCH_JUMP_LEAD_DIVISOR` rows resolves to 0 (the
+/// transcript's start) instead of underflowing, and a `rows_above` beyond
+/// `u32::MAX` pins at the ceiling instead of wrapping.
 /// Returns the same `u32` offset domain as [`clamp_preview_offset`], so a match
 /// past 65,535 wrapped rows is jumped to rather than clipped short of.
 /// Pure and terminal-free.
@@ -2552,9 +2707,9 @@ fn fit_label(label: &str, content_width: usize, used: usize, marker: usize) -> S
 ///
 /// Cutting a cluster is not cosmetic. `Line::width` sums `unicode-width` PER SPAN
 /// and that width is a CONTEXTUAL fold, so an emoji severed from its VS16 or its
-/// skin-tone modifier measures differently from the same bytes unsplit — and both
-/// the cached line widths (`App::preview_hit_context`) and the cached
-/// wrapped-row count are measured on the UNSPLIT lines. Ratatui's word wrapper
+/// skin-tone modifier measures differently from the same bytes unsplit — and the
+/// cached wrapped-row prefix map, which BOTH the windowed draw and the click
+/// hit-test read, is measured on the UNSPLIT lines. Ratatui's word wrapper
 /// segments per span too, so a cut cluster also changes where the wrap falls.
 /// (Cluster edges are not a total guarantee — unicode-width folds across a few
 /// cross-cluster ligature contexts as well — but they cover the emoji sequences a
@@ -3452,6 +3607,47 @@ mod tests {
         }
     }
 
+    /// APPROXIMATE wrapped row count of ONE logical line of display `width` at
+    /// `inner_width`: `ceil(width / inner_width)`, and at least one row (a blank line
+    /// still takes a row).
+    ///
+    /// A TEST FOIL, and only that — which is why it lives in `mod tests`. No
+    /// production path models a wrap any more: the transcript's height AND the
+    /// per-line map of where each line starts are both asked of the widget
+    /// (`wrapped_text_rows` / `wrapped_row_prefix`), and the click hit-test resolves a
+    /// clicked ROW through that same map. What survives of character packing in
+    /// production is the COLUMN step inside `link_at`, over the ONE line the map
+    /// already resolved exactly.
+    ///
+    /// It is kept because several fixtures below have to PROVE they are a case the
+    /// two models disagree about: on a fixture where they happen to agree, a test
+    /// cannot tell a right measurement from a wrong one, and passes for the wrong
+    /// reason.
+    fn wrapped_line_height(width: usize, inner_width: u16) -> usize {
+        // Guard a zero-width viewport (degenerate layout) so we never divide by zero.
+        let inner = usize::from(inner_width.max(1));
+        width.div_ceil(inner).max(1)
+    }
+
+    /// The foil's own shape, pinned so a case built on it cannot be arguing from a
+    /// broken model of the thing it claims to differ from.
+    #[test]
+    fn wrapped_line_height_is_ceil_over_inner_width_min_one() {
+        assert_eq!(
+            wrapped_line_height(0, 8),
+            1,
+            "a blank line still takes a row"
+        );
+        assert_eq!(wrapped_line_height(7, 8), 1, "shorter than width => 1 row");
+        assert_eq!(wrapped_line_height(16, 8), 2, "an exact multiple is 2 rows");
+        assert_eq!(wrapped_line_height(17, 8), 3, "one over wraps to a 3rd row");
+        assert_eq!(
+            wrapped_line_height(5, 0),
+            5,
+            "zero inner width divides by 1"
+        );
+    }
+
     /// The character-packing model is not a safe approximation of word wrap in EITHER
     /// direction, which is why the transcript had to stop using it.
     ///
@@ -3517,46 +3713,233 @@ mod tests {
         );
     }
 
+    // --- the wrapped-row prefix map ---------------------------------------
+
+    /// Measurement cases that go past ASCII: CJK and emoji occupy TWO terminal
+    /// columns each, so where the wrapper breaks them is a function of width in a way
+    /// a byte or char count cannot predict — the case a per-line measurement is most
+    /// likely to disagree with a whole-text one on.
+    fn wide_glyph_cases() -> Vec<(&'static str, Vec<Line<'static>>)> {
+        let line = |s: &str| Line::from(s.to_string());
+        vec![
+            (
+                "CJK filling the width exactly",
+                vec![line("\u{4f60}\u{597d}\u{4e16}\u{754c}\u{518d}")],
+            ),
+            (
+                "CJK straddling the width",
+                vec![line(
+                    "\u{4f60}\u{597d}\u{4e16}\u{754c}\u{518d}\u{89c1}\u{4e86}",
+                )],
+            ),
+            (
+                "emoji between ASCII words",
+                vec![
+                    line("ship \u{1f680} it"),
+                    line("\u{1f600}\u{1f601}\u{1f602}\u{1f603}\u{1f604}\u{1f605}"),
+                    line("done"),
+                ],
+            ),
+            (
+                "mixed scripts on one line",
+                vec![line("build \u{4f60}\u{597d} now \u{1f680} ok")],
+            ),
+        ]
+    }
+
+    /// THE TRIPWIRE the whole prefix map rests on: measuring each logical line ON ITS
+    /// OWN and summing gives exactly the whole-text count.
+    ///
+    /// `Wrap { trim: false }` runs `WordWrapper`, which breaks each logical line
+    /// independently and never joins two of them onto a shared row — so a wrapped row
+    /// count is additive, and `wrapped_row_prefix`'s per-line walk can stand in for
+    /// the whole-text measurement it replaced. That is a claim about a PRIVATE ratatui
+    /// module (`ratatui_widgets::reflow`), held by a `=0.30.2` pin. If a bump ever
+    /// changes it, every offset the pane computes — the scroll clamp, the search jump,
+    /// the window's own start row — goes quietly wrong at once. This is the test that
+    /// has to go red first, which is why it is driven over wrapping ASCII AND
+    /// double-width CJK/emoji rather than the easy cases.
+    #[test]
+    fn per_line_wrapped_row_counts_sum_to_the_whole_text_count() {
+        for (name, lines) in measure_cases().into_iter().chain(wide_glyph_cases()) {
+            let prefix = wrapped_row_prefix(&lines, MEASURE_WIDTH);
+            assert_eq!(
+                prefix.len(),
+                lines.len() + 1,
+                "the map must describe one more position than there are lines ({name:?})"
+            );
+            assert_eq!(prefix.first().copied(), Some(0), "the map starts at row 0");
+            assert_eq!(
+                prefix.last().copied(),
+                Some(wrapped_text_rows(&lines, MEASURE_WIDTH)),
+                "per-line counts must sum to the whole-text count for {name:?}"
+            );
+            // And every intermediate entry, not just the total: a map that only got
+            // the sum right could still start a window on the wrong row.
+            for n in 0..=lines.len() {
+                assert_eq!(
+                    prefix[n],
+                    wrapped_text_rows(&lines[..n], MEASURE_WIDTH),
+                    "entry {n} of {name:?} must be the wrapped height of the lines above it"
+                );
+            }
+        }
+    }
+
+    /// Marking a line SPLITS its spans, and that must not move a single row.
+    ///
+    /// The prefix map is built at cache fill, over the UNMARKED transcript, and then
+    /// used to window and scroll a MARKED one. That only holds because
+    /// `highlight_matched_spans` re-styles without touching text: were a span split a
+    /// break opportunity for the wrapper, every offset below a mark would drift by the
+    /// rows the split added, and only on a searched pane.
+    #[test]
+    fn splitting_a_line_at_its_marks_does_not_change_its_wrapped_height() {
+        for (name, lines) in measure_cases().into_iter().chain(wide_glyph_cases()) {
+            // Mark every other char, which is the worst case: it splits each span at
+            // as many cluster boundaries as the line has.
+            let marked: HashSet<usize> = (0..200).step_by(2).collect();
+            let highlighted: Vec<Line<'static>> = lines
+                .iter()
+                .map(|line| highlight_matched_spans(line, &marked, PREVIEW_MATCH_MODIFIER))
+                .collect();
+            assert!(
+                highlighted.iter().any(|line| line.spans.len() > 1),
+                "the fixture must really have been split, or this proves nothing ({name:?})"
+            );
+            assert_eq!(
+                wrapped_row_prefix(&highlighted, MEASURE_WIDTH),
+                wrapped_row_prefix(&lines, MEASURE_WIDTH),
+                "marking {name:?} must not move a row"
+            );
+        }
+    }
+
+    /// The window resolution, stated as arithmetic over a prefix map: two lines of one
+    /// row, then one of three rows, then one of one row — seven rows over four lines.
+    #[test]
+    fn row_window_finds_the_line_holding_an_offset_and_the_rows_left_inside_it() {
+        // rows: line 0 -> [0], line 1 -> [1], line 2 -> [2,3,4], line 3 -> [5]
+        let prefix = [0usize, 1, 2, 5, 6];
+
+        // TOP: the window starts at line 0 with nothing to skip, and reaches every
+        // line that begins inside the viewport.
+        assert_eq!(row_window(&prefix, 0, 2), (0..2, 0));
+        assert_eq!(row_window(&prefix, 0, 6), (0..4, 0));
+
+        // MIDDLE, on a line boundary: no residual.
+        assert_eq!(row_window(&prefix, 2, 3), (2..3, 0));
+
+        // MIDDLE, INSIDE a wrapped line: the window still starts at that line, and
+        // the leftover rows become the residual the widget is scrolled by.
+        assert_eq!(row_window(&prefix, 3, 2), (2..3, 1));
+        assert_eq!(row_window(&prefix, 4, 2), (2..4, 2));
+
+        // BOTTOM: the last line alone.
+        assert_eq!(row_window(&prefix, 5, 4), (3..4, 0));
+
+        // PAST THE END: an empty window rather than an out-of-bounds slice.
+        assert_eq!(row_window(&prefix, 6, 4), (4..4, 0));
+        assert_eq!(row_window(&prefix, 99, 4), (4..4, 93));
+
+        // A zero-height viewport keeps the line the offset landed in and no more, so
+        // the range can never invert (a degenerate layout must not panic on a slice).
+        assert_eq!(row_window(&prefix, 3, 0), (2..3, 1));
+    }
+
+    /// The window's start row is EXACTLY the offset asked for: `row_prefix[start]`
+    /// plus the residual. This is the identity the whole draw rests on — the pane
+    /// paints from `offset` whether the widget was handed the transcript or a slice of
+    /// it — so it is asserted over every measurement fixture at every reachable offset
+    /// rather than at a few sampled ones.
+    #[test]
+    fn a_window_start_plus_its_residual_is_the_offset_it_was_asked_for() {
+        for (name, lines) in measure_cases().into_iter().chain(wide_glyph_cases()) {
+            let prefix = wrapped_row_prefix(&lines, MEASURE_WIDTH);
+            let total = prefix.last().copied().expect("a non-empty prefix map");
+            for offset in 0..total {
+                let (range, residual) = row_window(&prefix, offset, 3);
+                assert_eq!(
+                    prefix[range.start] + residual,
+                    offset,
+                    "{name:?} at offset {offset} must start on the row it was asked for"
+                );
+                assert!(
+                    range.start < lines.len(),
+                    "{name:?} at offset {offset} must land on a real line"
+                );
+                assert!(
+                    residual < prefix[range.start + 1] - prefix[range.start],
+                    "{name:?} at offset {offset} must leave a residual INSIDE its line, \
+                     not past it"
+                );
+            }
+        }
+    }
+
     // --- preview link hit-testing (content<->screen mapping) --------------
 
     #[test]
-    fn wrapped_line_height_is_ceil_over_inner_width_min_one() {
-        assert_eq!(
-            wrapped_line_height(0, 8),
-            1,
-            "a blank line still takes a row"
-        );
-        assert_eq!(wrapped_line_height(7, 8), 1, "shorter than width => 1 row");
-        assert_eq!(wrapped_line_height(16, 8), 2, "an exact multiple is 2 rows");
-        assert_eq!(wrapped_line_height(17, 8), 3, "one over wraps to a 3rd row");
-        assert_eq!(
-            wrapped_line_height(5, 0),
-            5,
-            "zero inner width divides by 1"
-        );
-    }
-
-    #[test]
     fn visual_to_content_maps_rows_across_wrapped_lines() {
-        // Line 0 wraps to 3 rows (45/20), line 1 is 1 row, line 2 is 1 row.
-        let widths = [45usize, 0, 10];
-        assert_eq!(visual_to_content(&widths, 20, 0), Some((0, 0)));
+        // Line 0 occupies 3 rows, line 1 one row, line 2 one row.
+        let prefix = [0usize, 3, 4, 5];
+        assert_eq!(visual_to_content(&prefix, 0), Some((0, 0)));
         assert_eq!(
-            visual_to_content(&widths, 20, 2),
+            visual_to_content(&prefix, 2),
             Some((0, 2)),
             "3rd wrap row of line 0"
         );
         assert_eq!(
-            visual_to_content(&widths, 20, 3),
+            visual_to_content(&prefix, 3),
             Some((1, 0)),
             "line 1 starts after 3 rows"
         );
-        assert_eq!(visual_to_content(&widths, 20, 4), Some((2, 0)));
+        assert_eq!(visual_to_content(&prefix, 4), Some((2, 0)));
         assert_eq!(
-            visual_to_content(&widths, 20, 5),
+            visual_to_content(&prefix, 5),
             None,
             "past the end of content"
         );
+    }
+
+    /// The map, not a model, decides which line a row belongs to — so a line the
+    /// WRAPPER broke early is followed exactly instead of drifting.
+    ///
+    /// The prefix below is one no `ceil(width / inner)` walk can produce for these
+    /// widths: at inner width 20, packing calls each of these 21-cell lines 2 rows,
+    /// while the wrapper paints 3. Row 6 is line 2's first row by the map and line 3's
+    /// by the model, and the gap grows by one with every wrapping line above it —
+    /// which is the drift a hit-test used to inherit over a whole transcript.
+    #[test]
+    fn visual_to_content_follows_the_map_where_a_packing_model_would_have_drifted() {
+        let widths = [21usize; 4];
+        let packed: Vec<usize> = widths.iter().map(|&w| wrapped_line_height(w, 20)).collect();
+        assert_eq!(
+            packed,
+            vec![2, 2, 2, 2],
+            "the model would say two rows each"
+        );
+        // What the wrapper actually does with them: three rows each.
+        let prefix = [0usize, 3, 6, 9, 12];
+        assert_eq!(
+            visual_to_content(&prefix, 6),
+            Some((2, 0)),
+            "row 6 opens line 2; a packed walk reaches line 3 by then"
+        );
+        assert_eq!(
+            visual_to_content(&prefix, 11),
+            Some((3, 2)),
+            "and the last row belongs to the last line, not past the end"
+        );
+        assert_eq!(visual_to_content(&prefix, 12), None, "past the end");
+    }
+
+    /// A degenerate map answers `None` rather than indexing into nothing: an empty
+    /// pane (no selection) and a transcript with no lines both arrive here.
+    #[test]
+    fn visual_to_content_is_none_for_a_map_that_describes_no_lines() {
+        assert_eq!(visual_to_content(&[], 0), None, "no map at all");
+        assert_eq!(visual_to_content(&[0], 0), None, "a map of zero lines");
     }
 
     /// A 20-wide inner pane at origin (1,1); most link tests share it.
@@ -3582,25 +3965,25 @@ mod tests {
     fn link_at_returns_url_inside_a_link_and_none_just_outside() {
         let inner = inner_rect();
         // Three unwrapped content lines; a link on line 2 at columns 4..8.
-        let widths = [3usize, 0, 10];
+        let prefix = [0usize, 1, 2, 3];
         let regions = [region(2, 4, 8, "u")];
         // Inside the label (content col 4..7) -> the url.
         assert_eq!(
-            link_at(inner.x + 4, inner.y + 2, inner, 0, &widths, &regions),
+            link_at(inner.x + 4, inner.y + 2, inner, 0, &prefix, &regions),
             Some("u")
         );
         assert_eq!(
-            link_at(inner.x + 7, inner.y + 2, inner, 0, &widths, &regions),
+            link_at(inner.x + 7, inner.y + 2, inner, 0, &prefix, &regions),
             Some("u")
         );
         // One cell past the end (col_end is exclusive) -> None.
         assert_eq!(
-            link_at(inner.x + 8, inner.y + 2, inner, 0, &widths, &regions),
+            link_at(inner.x + 8, inner.y + 2, inner, 0, &prefix, &regions),
             None
         );
         // One cell before the start -> None.
         assert_eq!(
-            link_at(inner.x + 3, inner.y + 2, inner, 0, &widths, &regions),
+            link_at(inner.x + 3, inner.y + 2, inner, 0, &prefix, &regions),
             None
         );
     }
@@ -3608,18 +3991,18 @@ mod tests {
     #[test]
     fn link_at_is_none_on_blank_rows_and_outside_the_pane() {
         let inner = inner_rect();
-        let widths = [3usize, 0, 10];
+        let prefix = [0usize, 1, 2, 3];
         let regions = [region(2, 4, 8, "u")];
         // A click on the blank content line 1 hits no region.
         assert_eq!(
-            link_at(inner.x + 4, inner.y + 1, inner, 0, &widths, &regions),
+            link_at(inner.x + 4, inner.y + 1, inner, 0, &prefix, &regions),
             None
         );
         // A click left of the inner rect is rejected outright.
-        assert_eq!(link_at(0, inner.y + 2, inner, 0, &widths, &regions), None);
+        assert_eq!(link_at(0, inner.y + 2, inner, 0, &prefix, &regions), None);
         // A click below the content (inside the pane, past the last line) -> None.
         assert_eq!(
-            link_at(inner.x + 4, inner.y + 5, inner, 0, &widths, &regions),
+            link_at(inner.x + 4, inner.y + 5, inner, 0, &prefix, &regions),
             None
         );
     }
@@ -3627,19 +4010,19 @@ mod tests {
     #[test]
     fn link_at_hits_a_soft_wrapped_link_on_its_second_visual_row() {
         let inner = inner_rect();
-        // One content line 45 cells wide wraps into 3 visual rows (inner width 20).
-        // A link at content columns 25..30 lives on the SECOND wrapped row.
-        let widths = [45usize];
+        // One content line occupying 3 visual rows (inner width 20). A link at
+        // content columns 25..30 lives on the SECOND wrapped row.
+        let prefix = [0usize, 3];
         let regions = [region(0, 25, 30, "w")];
         // Second visual row, column 7 => content col 20 + 7 = 27, inside 25..30.
         assert_eq!(
-            link_at(inner.x + 7, inner.y + 1, inner, 0, &widths, &regions),
+            link_at(inner.x + 7, inner.y + 1, inner, 0, &prefix, &regions),
             Some("w"),
             "a wrapped link is clickable on its second visual segment"
         );
         // The SAME column on the first visual row is content col 7 -> no link.
         assert_eq!(
-            link_at(inner.x + 7, inner.y, inner, 0, &widths, &regions),
+            link_at(inner.x + 7, inner.y, inner, 0, &prefix, &regions),
             None
         );
     }
@@ -3648,16 +4031,16 @@ mod tests {
     fn link_at_respects_the_scroll_offset() {
         let inner = inner_rect();
         // Five unwrapped lines; a link on line 3 spanning columns 0..3.
-        let widths = [3usize, 3, 3, 3, 3];
+        let prefix = [0usize, 1, 2, 3, 4, 5];
         let regions = [region(3, 0, 3, "s")];
         // Scrolled down 2 rows, screen row rel 1 => visual row 3 => content line 3.
         assert_eq!(
-            link_at(inner.x + 1, inner.y + 1, inner, 2, &widths, &regions),
+            link_at(inner.x + 1, inner.y + 1, inner, 2, &prefix, &regions),
             Some("s")
         );
         // Without the scroll, the same screen cell is content line 1 -> no link.
         assert_eq!(
-            link_at(inner.x + 1, inner.y + 1, inner, 0, &widths, &regions),
+            link_at(inner.x + 1, inner.y + 1, inner, 0, &prefix, &regions),
             None
         );
     }
@@ -4067,10 +4450,11 @@ mod tests {
         .alignment(Alignment::Center)
     }
 
-    /// The pane's geometry rides on this: `App::preview_hit_context` maps a click
-    /// through each line's DISPLAY WIDTH and the wrapped-row count is cached per
-    /// (session, width), so a re-styled line that changed either would silently
-    /// move every link and every scroll bound.
+    /// The pane's geometry rides on this: a line's DISPLAY WIDTH is what the wrapper
+    /// breaks on, and the prefix map it produces is cached per (session, width) and
+    /// then read by BOTH the windowed draw and the click hit-test
+    /// (`App::preview_hit_context`) — so a re-styled line that changed either would
+    /// silently move every link and every scroll bound.
     ///
     /// Measured against a fixture that WRAPS. A line that fits the width leaves
     /// both sides of the row assertion at 1 for any implementation at all, broken
@@ -4104,9 +4488,10 @@ mod tests {
     /// `Line::width` sums `unicode-width` PER SPAN and that width is a CONTEXTUAL
     /// fold, so cutting a cluster changes the measured width of text that did not
     /// change: +2 columns for an emoji severed from its skin-tone modifier, -1 for
-    /// one severed from its VS16. Both cached widths (`App::preview_hit_context`)
-    /// and the cached wrapped-row count are measured on the UNSPLIT lines, so a
-    /// cut cluster desyncs them from the line actually painted. The run therefore
+    /// one severed from its VS16. The cached wrapped-row prefix map — which the
+    /// windowed draw and the click hit-test BOTH read — is measured on the UNSPLIT
+    /// lines, so a cut cluster desyncs it from the line actually painted, and it is
+    /// the wrapper's own break points that move with it. The run therefore
     /// snaps OUT to the cluster's edges — marking one extra codepoint, never
     /// splitting one.
     #[test]
@@ -5610,6 +5995,532 @@ mod tests {
             "the card must start on the pane's first row, not be scrolled off by a \
              height borrowed from the transcript; drawn rows: {rows:?}"
         );
+    }
+
+    // --- the windowed transcript render -------------------------------------
+
+    /// A preview pane the transcripts below overflow several times over, and NARROW
+    /// enough that most of their lines word-wrap — so an offset routinely lands in
+    /// the MIDDLE of a logical line and the window has a residual to get right.
+    const WINDOW_PANE: (u16, u16) = (44, 12);
+
+    /// The rows a WHOLE-transcript `Paragraph` paints at `offset` — the render the
+    /// windowed one replaced, rebuilt here as the reference to match against.
+    ///
+    /// Deliberately NOT derived from the window: it hands the widget every line and
+    /// the absolute offset, exactly as `render_preview` did before, so a window that
+    /// starts a line early or a residual off by a row shows up as a row of text that
+    /// disagrees.
+    fn unwindowed_rows(
+        lines: &[Line<'static>],
+        offset: u16,
+        (inner_w, inner_h): (u16, u16),
+    ) -> Vec<String> {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: inner_w,
+            height: inner_h,
+        };
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(
+            Paragraph::new(Text::from(lines.to_vec()))
+                .wrap(Wrap { trim: false })
+                .scroll((offset, 0)),
+            area,
+            &mut buffer,
+        );
+        (0..inner_h)
+            .map(|y| {
+                (0..inner_w)
+                    .filter_map(|x| buffer.cell((x, y)).map(|cell| cell.symbol().to_string()))
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// A board over a generated, wrapping, overflowing transcript with NO query, so
+    /// the window can be compared against the whole-transcript render without marks
+    /// entering into it.
+    fn window_app(dir: &Path) -> App {
+        App::new(
+            vec![jump_session_at(dir, "sess-window-1")],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        )
+    }
+
+    /// THE window's contract: at EVERY offset the pane can be scrolled to, handing
+    /// the widget only the lines the viewport can reach paints exactly what handing
+    /// it the whole transcript painted.
+    ///
+    /// Driven over every offset from the top to past the end rather than a sample,
+    /// because the ways a window goes wrong are positional: it starts one logical
+    /// line early or late, or it drops the residual and snaps to that line's FIRST
+    /// row. Each of those is invisible at offset 0 and at any offset that happens to
+    /// fall on a line boundary, which is most of them on an unwrapped fixture — hence
+    /// a pane narrow enough to wrap, re-asserted below.
+    #[test]
+    fn a_windowed_render_paints_what_the_whole_transcript_render_painted() {
+        let (width, height) = WINDOW_PANE;
+        let inner = (width - 2, height - 2);
+        let dir = unique_temp_dir("window-parity");
+        let mut app = window_app(&dir);
+
+        let lines = app.preview_text(inner.0).lines;
+        let prefix = wrapped_row_prefix(&lines, inner.0);
+        let content_h = prefix.last().copied().expect("a non-empty prefix map");
+        assert!(
+            content_h > usize::from(inner.1) * 2,
+            "the fixture must overflow this pane several times over (content_h={content_h})"
+        );
+        assert!(
+            prefix.windows(2).any(|pair| pair[1] - pair[0] > 1),
+            "some line must WRAP, or every offset lands on a line boundary and the \
+             residual is never exercised"
+        );
+        let max_offset = content_h - usize::from(inner.1);
+
+        app.preview_follow_bottom = false;
+        // Past the end too: the clamp must still land the pane on the last page.
+        for offset in 0..=(max_offset + 5) {
+            app.preview_scroll = u32::try_from(offset).expect("a small test offset");
+            let drawn = inner_rows(&mut app, width, height);
+            let expected = unwindowed_rows(
+                &lines,
+                u16::try_from(offset.min(max_offset)).expect("a small test offset"),
+                inner,
+            );
+            assert_eq!(
+                drawn, expected,
+                "the windowed render must match the whole-transcript render at offset {offset}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An offset landing PART WAY into a wrapped logical line paints that line's
+    /// LATER rows, not its first.
+    ///
+    /// The trap the residual exists for: a window whose first line is the one holding
+    /// the offset, drawn with no residual, silently rewinds the pane to that line's
+    /// start — a scroll that visibly refuses to move by a row at a time through long
+    /// turns. Asserted against the whole-transcript render at the SAME offset, and
+    /// against the fact that the two rows differ from each other, so it cannot pass by
+    /// both being the line's first row.
+    #[test]
+    fn an_offset_inside_a_wrapped_line_paints_that_line_from_the_right_row() {
+        let (width, height) = WINDOW_PANE;
+        let inner = (width - 2, height - 2);
+        let dir = unique_temp_dir("window-residual");
+        let mut app = window_app(&dir);
+
+        let lines = app.preview_text(inner.0).lines;
+        let prefix = wrapped_row_prefix(&lines, inner.0);
+        // A line that wraps to at least three rows, and an offset one row INTO it —
+        // so the pane's top row is that line's SECOND row.
+        let (line_idx, _) = prefix
+            .windows(2)
+            .enumerate()
+            .find(|(_, pair)| pair[1] - pair[0] >= 3)
+            .expect("the fixture must hold a line wrapping to three rows or more");
+        let offset = prefix[line_idx] + 1;
+
+        app.preview_follow_bottom = false;
+        app.preview_scroll = u32::try_from(offset).expect("a small test offset");
+        let drawn = inner_rows(&mut app, width, height);
+
+        let at_line_start = unwindowed_rows(
+            &lines,
+            u16::try_from(prefix[line_idx]).expect("a small test offset"),
+            inner,
+        );
+        assert_ne!(
+            drawn[0], at_line_start[0],
+            "the fixture's wrapped line must have DIFFERENT first and second rows, or \
+             a dropped residual is undetectable"
+        );
+        assert_eq!(
+            drawn[0], at_line_start[1],
+            "the pane's top row must be the wrapped line's SECOND row; drawn: {drawn:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A window that does not start at line 0 still marks the RIGHT words.
+    ///
+    /// The marks are keyed to the whole transcript, so a window has to add its own
+    /// start index back before looking one up. Reading the map at the window-relative
+    /// index instead marks real occurrences onto whatever text happens to sit that
+    /// many lines below the window's top — a wrong highlight with nothing on screen to
+    /// betray it, which is why this asserts the marked CELLS say the query and that a
+    /// scrolled pane really is windowed past line 0.
+    #[test]
+    fn marks_inside_a_window_that_starts_past_line_zero_land_on_the_query() {
+        let (width, height) = WINDOW_PANE;
+        let inner_w = width - 2;
+        let dir = unique_temp_dir("window-marks");
+        let mut app = jump_app(&dir);
+
+        // Park the pane on the LAST match, which sits well below the top of the
+        // transcript — so the window it is drawn in cannot start at line 0.
+        let geometry = jump_geometry(&mut app, WINDOW_PANE);
+        assert!(
+            geometry.rows_above > usize::from(geometry.inner_h),
+            "the target match must be more than one viewport down, or the window \
+             starts at line 0 and this proves nothing (rows_above={})",
+            geometry.rows_above
+        );
+        app.preview_follow_bottom = false;
+        app.preview_scroll = u32::try_from(geometry.rows_above).expect("a small test offset");
+
+        let window = app.preview_window(inner_w, geometry.rows_above, height - 2);
+        assert!(
+            window.start > 0,
+            "the drawn window must really start past line 0, or the absolute-index \
+             lookup is never exercised"
+        );
+
+        let drawn = preview_buffer(&mut app, width, height);
+        let runs = marked_runs(&drawn, width, height);
+        assert!(
+            !runs.is_empty(),
+            "the match this pane is parked on must be marked; rows: {:?}",
+            (0..height)
+                .map(|y| row_text(&drawn, y, width))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            runs.iter().all(|run| run == JUMP_QUERY),
+            "only the query may be marked in a scrolled window, got: {runs:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ratatui's own vertical thumb glyph, read off the drawn cells below.
+    const THUMB_GLYPH: &str = "\u{2588}";
+
+    /// The scrollbar keeps describing the WHOLE transcript once the transcript stops
+    /// being what the widget is handed.
+    ///
+    /// A scrollbar sized from the window would be a full-length thumb on every frame:
+    /// the window IS the viewport, so it always fits. What makes it a scrollbar is
+    /// that its travel spans everything there is to read — so a pane scrolled to the
+    /// middle of a long transcript shows a SHORT thumb detached from both ends of the
+    /// track, and only the transcript's true bottom shows the end arrow.
+    #[test]
+    fn the_scrollbar_describes_the_whole_transcript_not_the_window() {
+        let (width, height) = WINDOW_PANE;
+        let inner_h = height - 2;
+        let dir = unique_temp_dir("window-scrollbar");
+        let mut app = window_app(&dir);
+
+        let content_h = content_height(&mut app, width);
+        let max_offset = content_h - usize::from(inner_h);
+        assert!(
+            max_offset > usize::from(inner_h),
+            "the transcript must be several viewports long, or the thumb's travel \
+             says nothing (max_offset={max_offset})"
+        );
+
+        // Track rows, excluding the two reserved boundary-arrow slots.
+        let track = 2..height - 2;
+        let thumb_rows = |buffer: &ratatui::buffer::Buffer| -> Vec<u16> {
+            track
+                .clone()
+                .filter(|&y| {
+                    buffer
+                        .cell((width - 1, y))
+                        .is_some_and(|cell| cell.symbol() == THUMB_GLYPH)
+                })
+                .collect()
+        };
+
+        app.preview_follow_bottom = false;
+        app.preview_scroll = u32::try_from(max_offset / 2).expect("a small test offset");
+        let middle = preview_buffer(&mut app, width, height);
+        let thumb = thumb_rows(&middle);
+        assert!(
+            !thumb.is_empty() && thumb.len() < track.len(),
+            "a mid-scroll thumb must be present and SHORTER than the track — a \
+             window-sized scrollbar would fill it; thumb rows: {thumb:?}"
+        );
+        assert_eq!(
+            middle.cell((width - 1, height - 2)).map(|c| c.symbol()),
+            Some(SCROLLBAR_ARROW_HIDDEN),
+            "the end arrow belongs to the transcript's bottom, not the window's"
+        );
+
+        // And the transcript's real bottom — an offset the window itself cannot tell
+        // apart from the mid-scroll one, since both hand the widget one viewport.
+        app.preview_scroll = u32::try_from(max_offset).expect("a small test offset");
+        let bottom = preview_buffer(&mut app, width, height);
+        assert_eq!(
+            bottom.cell((width - 1, height - 2)).map(|c| c.symbol()),
+            Some(SCROLLBAR_END_ARROW),
+            "only the whole transcript's last page may show the end arrow"
+        );
+        assert!(
+            thumb_rows(&bottom).last() > thumb.last(),
+            "and the thumb must have travelled DOWN the track between the two"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The url behind the link fixture below, and the label it renders as.
+    const WINDOW_LINK_URL: &str = "https://example.com/windowed";
+    const WINDOW_LINK_LABEL: &str = "docs";
+
+    /// A transcript of SHORT turns — every rendered line fits the pane, so no line
+    /// above the click is word-broken and the test below is about the WINDOW alone —
+    /// ending in one markdown link, far enough down that the pane must scroll to
+    /// reach it.
+    ///
+    /// That is also what this fixture CANNOT see, and why it has a sibling: with
+    /// nothing wrapped above the click, a hit-test that mapped rows with a
+    /// character-packing model of its own resolves the same line as the wrapper, so
+    /// the drift such a model accumulates is invisible here. The wrapping case is
+    /// [`wrapped_link_session`].
+    fn window_link_session(dir: &Path) -> Session {
+        let file = dir.join("sess-window-link.jsonl");
+        let mut body: String = (1..=30).map(|i| format!("turn {i}\\n")).collect();
+        body.push_str(&format!(
+            "open [{WINDOW_LINK_LABEL}]({WINDOW_LINK_URL}) here"
+        ));
+        let jsonl = format!(
+            concat!(
+                r#"{{"type":"user","sessionId":"sess-window-link","cwd":"/tmp","#,
+                r#""timestamp":"2026-07-01T10:00:00.000Z","#,
+                r#""message":{{"role":"user","content":"{body}"}}}}"#,
+                "\n",
+            ),
+            body = body,
+        );
+        std::fs::write(&file, jsonl).expect("write the windowed link fixture");
+        Session {
+            file,
+            session_id: "sess-window-link".to_string(),
+            cwd: PathBuf::from("/tmp"),
+            git_branch: Some("main".to_string()),
+            timestamp: None,
+            repo: "repo".to_string(),
+            label: "windowed link session".to_string(),
+            root_uuid: None,
+            msg_count: 0,
+            content_index: String::new(),
+        }
+    }
+
+    /// A mouse click resolves the link under it on a SCROLLED, windowed pane.
+    ///
+    /// `link_at` hit-tests in ABSOLUTE wrapped rows, and the windowed render is what
+    /// turns that from a tautology into a claim: the widget is scrolled by a small
+    /// RESIDUAL inside a slice now, so if the pane's absolute offset and its painted
+    /// top row ever came apart, every click on a scrolled pane would open a link from
+    /// somewhere else in the file. Aimed at the cell the label was actually PAINTED
+    /// in — found by the UNDERLINED modifier the preview marks a label with, never
+    /// computed from the geometry under test.
+    #[test]
+    fn a_click_resolves_the_link_under_it_on_a_scrolled_windowed_pane() {
+        let (width, height) = WINDOW_PANE;
+        let inner_w = width - 2;
+        let dir = unique_temp_dir("window-link");
+        let mut app = App::new(
+            vec![window_link_session(&dir)],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+
+        // The default bottom anchor scrolls the pane to the tail, where the link is.
+        let buffer = preview_buffer(&mut app, width, height);
+        assert!(
+            app.preview_scroll > 0,
+            "the fixture must overflow the pane, or nothing here is windowed"
+        );
+        let offset = usize::try_from(app.preview_scroll).expect("a small test offset");
+        assert!(
+            app.preview_window(inner_w, offset, height - 2).start > 0,
+            "the drawn window must really start past line 0, or an absolute offset \
+             and a window-relative one are indistinguishable"
+        );
+
+        let inner = Rect {
+            x: 1,
+            y: 1,
+            width: inner_w,
+            height: height - 2,
+        };
+        let (col, row) = (inner.y..inner.bottom())
+            .flat_map(|y| (inner.x..inner.right()).map(move |x| (x, y)))
+            .find(|&(x, y)| {
+                buffer
+                    .cell((x, y))
+                    .is_some_and(|c| c.modifier.contains(Modifier::UNDERLINED))
+            })
+            .expect("the fixture's link label must be drawn inside the pane");
+
+        let (row_prefix, regions) = app.preview_hit_context(inner_w);
+        assert_eq!(
+            link_at(col, row, inner, app.preview_scroll, &row_prefix, &regions),
+            Some(WINDOW_LINK_URL),
+            "a click on the cell the label was DRAWN on must open its url"
+        );
+        assert_eq!(
+            link_at(
+                col,
+                row - 1,
+                inner,
+                app.preview_scroll,
+                &row_prefix,
+                &regions
+            ),
+            None,
+            "and the row above it is another transcript line, not the link"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The url behind the WRAPPING link fixture below.
+    const WRAP_LINK_URL: &str = "https://example.com/below-wrapping-lines";
+
+    /// A turn body whose rendered line must WORD-WRAP into more rows than a
+    /// `ceil(width / inner)` model charges for.
+    ///
+    /// Three tokens, each longer than half [`WINDOW_PANE`]'s inner width, so the
+    /// wrapper has to break after every one of them while packing bills the same
+    /// text at one row fewer — the per-line disagreement that used to ACCUMULATE
+    /// down a transcript.
+    const WRAP_LINK_BODY: &str =
+        "synchronization-checkpoint instrumentation-rollout deployment-verification";
+
+    /// How many wrapping turns sit ABOVE the link. Enough that the two models are
+    /// many rows apart by the time the click happens, so the drift is the reason a
+    /// pre-fix hit-test misses rather than an off-by-one that could go either way.
+    const WRAP_LINK_TURNS: usize = 24;
+
+    /// A transcript of LONG turns — every rendered body line WRAPS at the pane's
+    /// inner width — ending in one markdown link, far enough down that the pane must
+    /// scroll to reach it.
+    ///
+    /// The wrapping lines ABOVE the link are the whole point, and the deliberate
+    /// opposite of [`window_link_session`]'s short turns: they are what a per-line
+    /// character-packing walk mis-counts, one row at a time, all the way down to the
+    /// click.
+    fn wrapped_link_session(dir: &Path) -> Session {
+        let file = dir.join("sess-wrap-link.jsonl");
+        let mut out = String::new();
+        for turn in 0..WRAP_LINK_TURNS {
+            out.push_str(&format!(
+                concat!(
+                    r#"{{"type":"user","sessionId":"sess-wrap-link","cwd":"/tmp","#,
+                    r#""timestamp":"2026-07-01T10:00:00.000Z","#,
+                    r#""message":{{"role":"user","content":"{turn} {body}"}}}}"#,
+                    "\n",
+                ),
+                turn = turn,
+                body = WRAP_LINK_BODY,
+            ));
+        }
+        out.push_str(&format!(
+            concat!(
+                r#"{{"type":"user","sessionId":"sess-wrap-link","cwd":"/tmp","#,
+                r#""timestamp":"2026-07-01T10:00:00.000Z","#,
+                r#""message":{{"role":"user","content":"open [docs]({url}) here"}}}}"#,
+                "\n",
+            ),
+            url = WRAP_LINK_URL,
+        ));
+        std::fs::write(&file, out).expect("write the wrapping link fixture");
+        Session {
+            file,
+            session_id: "sess-wrap-link".to_string(),
+            cwd: PathBuf::from("/tmp"),
+            git_branch: Some("main".to_string()),
+            timestamp: None,
+            repo: "repo".to_string(),
+            label: "wrapping link session".to_string(),
+            root_uuid: None,
+            msg_count: 0,
+            content_index: String::new(),
+        }
+    }
+
+    /// A click still resolves its own link with WRAPPING lines above it.
+    ///
+    /// The case [`window_link_session`]'s short turns cannot reach, and the one the
+    /// deleted `PREVIEW_LINES` cap used to bound: the hit-test's row mapping used to
+    /// walk a character-packing model over every line above the click, so each
+    /// word-broken line above it cost one row of drift and the click resolved that
+    /// many lines too far down the file — a neighbouring line's url, or none. With no
+    /// line cap left, nothing bounded how far that could go.
+    ///
+    /// The fixture PROVES it is such a case before it asserts anything, by measuring
+    /// the same drift the old mapping accumulated; a fixture whose lines happen to
+    /// fit the pane would pass against the bug.
+    #[test]
+    fn a_click_below_wrapping_lines_resolves_the_link_under_it() {
+        let (width, height) = WINDOW_PANE;
+        let inner_w = width - 2;
+        let dir = unique_temp_dir("wrap-link");
+        let mut app = App::new(
+            vec![wrapped_link_session(&dir)],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+
+        // The default bottom anchor scrolls the pane to the tail, where the link is.
+        let buffer = preview_buffer(&mut app, width, height);
+        let lines = app.preview_text(inner_w).lines;
+        let exact = wrapped_row_prefix(&lines, inner_w)
+            .last()
+            .copied()
+            .expect("a non-empty prefix map");
+        let packed: usize = lines
+            .iter()
+            .map(|l| wrapped_line_height(l.width(), inner_w))
+            .sum();
+        assert!(
+            exact > packed + usize::from(height),
+            "the fixture's lines must WRAP enough that a packed walk drifts by more \
+             than a viewport before the click — else the pre-fix mapping could still \
+             land on the right line (exact={exact}, packed={packed})"
+        );
+        assert!(
+            app.preview_scroll > 0,
+            "the fixture must overflow the pane, or nothing here is scrolled"
+        );
+
+        let inner = Rect {
+            x: 1,
+            y: 1,
+            width: inner_w,
+            height: height - 2,
+        };
+        let (col, row) = (inner.y..inner.bottom())
+            .flat_map(|y| (inner.x..inner.right()).map(move |x| (x, y)))
+            .find(|&(x, y)| {
+                buffer
+                    .cell((x, y))
+                    .is_some_and(|c| c.modifier.contains(Modifier::UNDERLINED))
+            })
+            .expect("the fixture's link label must be drawn inside the pane");
+
+        let (row_prefix, regions) = app.preview_hit_context(inner_w);
+        assert_eq!(
+            link_at(col, row, inner, app.preview_scroll, &row_prefix, &regions),
+            Some(WRAP_LINK_URL),
+            "a click on the cell the label was DRAWN on must open its url, however \
+             many wrapped lines sit above it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // --- in-preview search-match marking ------------------------------------
