@@ -1,3 +1,7 @@
+<p align="center">
+  <img src=".github/assets/logo.gif" width="120" alt="snapback" />
+</p>
+
 # snapback — browse, search & resume Claude Code sessions across every folder
 
 You run Claude Code in a lot of places: several repos, a pile of git worktrees,
