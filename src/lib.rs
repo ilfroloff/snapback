@@ -76,7 +76,7 @@ pub fn run() {
 
     // `snapback` is a persistent dashboard: it OWNS the `App` across resume round
     // trips so selection/query/scope/scroll survive, and only exits when the
-    // user quits `snapback` itself (`q` / `Esc` / `Ctrl-C`).
+    // user quits `snapback` itself (`Esc` / `Ctrl-C`).
     let mut app = App::new(sessions, args.scope, launch_dir);
     // The OTHER half of `--all`/`-a` (see `cli::Args::all_scope_enabled`): the
     // scope above says where the board STARTS, this says the all scope stays on
