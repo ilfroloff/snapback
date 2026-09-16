@@ -712,9 +712,9 @@ take the narrow allow instead.
 
 Input handling is a three-stage pipeline, all terminal-free and testable:
 
-1. `key_to_action(key, query_empty)` → an `Action` (`j`/`k`/`q` navigate/quit
-   only while the query is empty; arrows, Enter, Tab, and `Ctrl-*` always act so
-   search never blocks navigation).
+1. `key_to_action(key, query_empty)` → an `Action` (every printable char types
+   into the query; arrows, Enter, Tab, and `Ctrl-*` always act so search never
+   blocks navigation).
 2. `apply_action` mutates the `App` and returns an `Outcome`
    (`Continue`/`Quit`/`Resume`/`Send`/`Interrupt`/`BgLaunch`). `Send`, `Interrupt`
    and `BgLaunch` carry a confirmed `SendRequest` / `InterruptRequest` /

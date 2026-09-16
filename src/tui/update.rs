@@ -25,7 +25,6 @@
 //! | Key | Action |
 //! | --- | ------ |
 //! | `Up` / `Down` | move selection (always) |
-//! | `j` / `k` | move selection (only while the query is empty; otherwise typed) |
 //! | `Left` / `Right` | fold / expand the selected row's fork lineage (always) |
 //! | `Enter` | resume the selected session |
 //! | `Ctrl-F` | fork-resume the selected session |
@@ -44,16 +43,15 @@
 //! | `Backspace` | delete the last query character |
 //! | printable char | type-to-search (append to the query) |
 //! | terminal paste | inserted as TEXT — never as keystrokes (see below) |
-//! | `q` | quit (only while the query is empty; otherwise typed) |
 //! | `Esc` / `Ctrl-C` | quit (always) |
 //!
-//! `j`/`k`/`q` are disambiguated by whether the query is empty: in the default
-//! browse state they navigate/quit; once you are typing a query they become
-//! ordinary search input. Arrows, `Enter`, `Tab`, and every `Ctrl-` binding
-//! work regardless of the query, so search is never blocked. The SHIFTED arrows
-//! are disambiguated the same way, by whether there is anything marked to move
-//! between — and fall through to the unshifted binding when there is not, so a
-//! terminal that drops the modifier still moves the selection.
+//! No bare printable character is a command: every one of them types into the
+//! query, so no search term can navigate or quit on its way in. Arrows, `Enter`,
+//! `Tab`, and every `Ctrl-` binding work regardless of the query, so search is
+//! never blocked either. The SHIFTED arrows are the one conditional binding,
+//! disambiguated by whether there is anything marked to move between — and they
+//! fall through to the unshifted binding when there is not, so a terminal that
+//! drops the modifier still moves the selection.
 //!
 //! ## Terminal paste
 //!
@@ -220,10 +218,11 @@ impl Outcome {
     }
 }
 
-/// Map a keypress to an [`Action`]. `query_empty` disambiguates the `j`/`k`/`q`
-/// keys: they navigate/quit only in the default browse state and are otherwise
-/// ordinary search input. `has_preview_matches` ([`App::has_preview_matches`])
-/// decides whether the SHIFTED arrows have anywhere to go.
+/// Map a keypress to an [`Action`]. `query_empty` gates the SHIFTED arrows alone:
+/// match navigation is only meaningful once a query exists to have marked
+/// something, so an empty query leaves them plain selection movement.
+/// `has_preview_matches` ([`App::has_preview_matches`]) decides whether the
+/// SHIFTED arrows have anywhere to go.
 ///
 /// The shifted arrows are bound CONDITIONALLY and fall through to plain selection
 /// movement otherwise, which buys two things at once. With no query — or a query
@@ -298,9 +297,6 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool
             let _ = c;
             Action::Ignore
         }
-        KeyCode::Char('j') if query_empty => Action::MoveDown,
-        KeyCode::Char('k') if query_empty => Action::MoveUp,
-        KeyCode::Char('q') if query_empty => Action::Quit,
         KeyCode::Char(c) => Action::Insert(c),
         _ => Action::Ignore,
     }
@@ -4228,34 +4224,32 @@ mod tests {
     }
 
     #[test]
-    fn jk_navigate_only_when_query_empty() {
-        assert_eq!(
-            key_to_action(key(KeyCode::Char('j')), true, false),
-            Action::MoveDown
-        );
-        assert_eq!(
-            key_to_action(key(KeyCode::Char('k')), true, false),
-            Action::MoveUp
-        );
-        // Once typing, j/k are ordinary search input.
-        assert_eq!(
-            key_to_action(key(KeyCode::Char('j')), false, false),
-            Action::Insert('j')
-        );
-        assert_eq!(
-            key_to_action(key(KeyCode::Char('k')), false, false),
-            Action::Insert('k')
-        );
+    fn jk_always_type_into_the_query() {
+        // `j`/`k` are search characters like every other letter — the selection
+        // moves on the arrows, which are not printable and cannot be typed by
+        // accident. The `query_empty = true` half is the one with teeth; it is
+        // what fails if a bare-letter navigation binding is ever reintroduced.
+        for empty in [true, false] {
+            assert_eq!(
+                key_to_action(key(KeyCode::Char('j')), empty, false),
+                Action::Insert('j')
+            );
+            assert_eq!(
+                key_to_action(key(KeyCode::Char('k')), empty, false),
+                Action::Insert('k')
+            );
+        }
     }
 
     #[test]
     fn left_right_fold_and_expand_regardless_of_query() {
         // `←` folds a fork lineage back to its head, `→` expands it. Neither key
-        // is printable, so — unlike `j`/`k`/`q` directly above — they must NOT be
-        // gated on the query: a `(+N)` head found BY searching is exactly the row
-        // a user most wants to open, and gating would make it unopenable without
-        // first clearing the query. The `query_empty = false` half is the one with
-        // teeth; it is what fails if these are ever gated like the letter keys.
+        // is printable, so — unlike the letters, which type — they can never be
+        // swallowed by type-to-search, and that is precisely why they must NOT be
+        // gated on the query either: a `(+N)` head found BY searching is exactly
+        // the row a user most wants to open, and gating would make it unopenable
+        // without first clearing the query. The `query_empty = false` half is the
+        // one with teeth; it is what fails if these are ever gated on the query.
         for empty in [true, false] {
             assert_eq!(
                 key_to_action(key(KeyCode::Left), empty, false),
@@ -4269,15 +4263,17 @@ mod tests {
     }
 
     #[test]
-    fn q_quits_only_when_query_empty() {
-        assert_eq!(
-            key_to_action(key(KeyCode::Char('q')), true, false),
-            Action::Quit
-        );
-        assert_eq!(
-            key_to_action(key(KeyCode::Char('q')), false, false),
-            Action::Insert('q')
-        );
+    fn q_always_types_into_the_query() {
+        // `q` types, it never quits — an unconfirmed exit on the first letter of
+        // "query" is a board thrown away by typo. `Esc`/`Ctrl-C` are the quit
+        // keys. The `query_empty = true` half is the one with teeth; it is what
+        // fails if the bare-`q` quit binding is ever reintroduced.
+        for empty in [true, false] {
+            assert_eq!(
+                key_to_action(key(KeyCode::Char('q')), empty, false),
+                Action::Insert('q')
+            );
+        }
     }
 
     #[test]

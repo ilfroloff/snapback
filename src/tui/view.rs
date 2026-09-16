@@ -2269,14 +2269,14 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         // The board keymap — one of the four surfaces AGENTS.md's KEEP KEY DOCS IN
         // SYNC names. It does NOT mention the terminal's paste, on COLUMN BUDGET:
-        // this line is already 223 columns (measured with the `unicode-width` the
+        // this line is already 218 columns (measured with the `unicode-width` the
         // renderer counts in) against a help row that is ONE line and never wraps, so
-        // on an 80-column terminal it is cut mid-`^K stop` and everything from
-        // `^X hide/del` (column 87) rightward is already unpainted. A 23-column
-        // "paste keeps newlines" clause would land at columns 224-246 — nowhere, on
-        // any realistic width. What a board paste DOES (append to the query with
-        // newlines flattened to spaces, and never resume) is documented where there
-        // is room to say it: `KEYS` in `cli.rs` and the README key map.
+        // on an 80-column terminal it is cut the instant `^K stop` ends and
+        // everything from `^X hide/del` (column 84) rightward is already unpainted.
+        // A 23-column "paste keeps newlines" clause would land at columns 219-241 —
+        // nowhere, on any realistic width. What a board paste DOES (append to the
+        // query with newlines flattened to spaces, and never resume) is documented
+        // where there is room to say it: `KEYS` in `cli.rs` and the README key map.
         //
         // `S-↑↓ match` sits with the search cluster rather than with the scroll
         // keys, because it is search navigation that happens to move a pane — and
@@ -2285,7 +2285,7 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         // that is the same budget every clause here is judged against; the key is
         // documented in full in `KEYS` and the README.
         Line::from(vec![Span::styled(
-            "↑↓/jk move · ←/→ fold/expand · Enter resume · ^F fork · ^N new · ^R reply · ^K stop · ^X hide/del · type to search · Tab name/content · S-↑↓ match · ^A scope · ^/ preview · PgUp/PgDn·^U/^D·Home/End·wheel scroll · q/Esc quit",
+            "↑↓ move · ←/→ fold/expand · Enter resume · ^F fork · ^N new · ^R reply · ^K stop · ^X hide/del · type to search · Tab name/content · S-↑↓ match · ^A scope · ^/ preview · PgUp/PgDn·^U/^D·Home/End·wheel scroll · Esc quit",
             Style::default().add_modifier(Modifier::DIM),
         )])
     };

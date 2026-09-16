@@ -105,7 +105,6 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | Key | Action |
 | --- | ------ |
 | `↑` / `↓` | Move the selection |
-| `j` / `k` | Move the selection — while the query is empty; once you're typing, they're search characters |
 | `←` / `→` | **Fold** / **expand** a stack of look-alike rows that are really one conversation — a row marked `(+N)` stands for `N` more |
 | `Enter` | **Resume** the selected session, returning to the board when it exits. On a **running** session it opens an **Attach / Fork / Cancel** choice instead |
 | `Ctrl-F` | **Fork** the selected session into a copy — available for any session, running or not |
@@ -127,7 +126,6 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | `Backspace` | Delete the last query character |
 | any printable char | Type to search |
 | paste (`Cmd`/`Ctrl-V`, middle-click) | Your terminal's own paste, taken as **text**: into a compose or draft box at the cursor, **newlines intact** (no more sending just the first line); on the board, appended to the query with newlines as spaces. It never sends, resumes, or confirms |
-| `q` | **Quit** — while the query is empty; once you're typing, it's a search character |
 | `Esc` / `Ctrl-C` | Quit |
 
 Mouse mode is on so the wheel can scroll and the pane border can be dragged; to
