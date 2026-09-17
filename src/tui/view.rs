@@ -2267,7 +2267,7 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().add_modifier(Modifier::DIM),
         )])
     } else {
-        // The board keymap — one of the four surfaces AGENTS.md's KEEP KEY DOCS IN
+        // The board keymap — one of the five surfaces AGENTS.md's KEEP KEY DOCS IN
         // SYNC names. It does NOT mention the terminal's paste, on COLUMN BUDGET:
         // this line is already 224 columns (measured with the `unicode-width` the
         // renderer counts in) against a help row that is ONE line and never wraps, so
