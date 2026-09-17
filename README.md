@@ -121,7 +121,7 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | `Ctrl-U` / `Ctrl-D` | Scroll the preview a quarter page |
 | `Home` / `End` | Jump the preview to the top / bottom |
 | `Shift-↑` / `Shift-↓` | Walk the preview through the lines your query marks — previous / next. Only bound while something IS marked in the previewed transcript; with nothing marked they stay plain **move the selection**, so they never take a key away from you (and a terminal that swallows the modifier still moves). One stop per marked **line**, not per occurrence: a line saying your query twice is marked twice and stopped at once |
-| mouse wheel | Scroll the pane under the pointer |
+| mouse wheel | Scroll the pane under the pointer — except while a compose or draft box is open, when the session list stops taking notches: a wheel over it does **nothing**, so the session you are writing to can never slide out from under you. Everywhere else it is unchanged, and a notch anywhere but the list still scrolls the transcript |
 | drag the pane border | Resize the list and preview panes |
 | click a preview link | Open its url in your browser |
 | `Backspace` | Delete the last query character |

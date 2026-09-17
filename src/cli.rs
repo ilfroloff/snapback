@@ -73,7 +73,11 @@ KEYS:
                   Only while something is marked there — with nothing marked they
                   stay plain move, so they never take a key away from you. One
                   stop per marked line, not per repeated word
-    wheel         scroll preview / list (mouse mode on; hold Shift/Option to select)
+    wheel         scroll preview / list (mouse mode on; hold Shift/Option to
+                  select). While a compose or draft box is open the list stops
+                  taking notches — a wheel over it does nothing, so the session
+                  you are writing to cannot slide away under the pointer.
+                  Anywhere else the wheel still scrolls the transcript
     paste         your terminal's own paste (Cmd/Ctrl-V, middle-click) is inserted
                   as TEXT: into a compose draft at the cursor, newlines and all, or
                   appended to the search query with newlines flattened to spaces.

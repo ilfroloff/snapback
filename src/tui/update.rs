@@ -700,6 +700,10 @@ enum WheelTarget {
     Preview,
     /// Move the list selection.
     List,
+    /// Swallow the notch: scroll nothing, move nothing, say nothing. The one
+    /// outcome with no effect at all, and it exists for exactly one case —
+    /// a notch over the list while a draft is open ([`wheel_target`] owns why).
+    Ignore,
 }
 
 /// Hit-test a wheel event at `(col, row)` against the pinned pane rects.
@@ -709,12 +713,36 @@ enum WheelTarget {
 /// you scroll). The hidden-preview case leaves `preview` EMPTY, so a point over
 /// the now-full-width list still routes to the list. Pure so it is unit testable
 /// from coordinates + rects without a terminal.
-fn wheel_target(col: u16, row: u16, preview: Rect, list: Rect) -> WheelTarget {
+///
+/// `composing` is the ONE condition that changes any of that, taken as a
+/// parameter the way [`key_to_action`] takes its own (PATTERNS §10), so the whole
+/// routing decision stays here and pure. It narrows exactly ONE of the three
+/// zones: while a draft is open the LIST is not a wheel target, and a notch over
+/// it resolves to [`WheelTarget::Ignore`] — nothing happens. Only the list arm
+/// earns that, because alone among the three it does not scroll a viewport: it
+/// MOVES THE SELECTION, and the selection is what the preview shows. An open
+/// draft targets ONE session id, so a notch that strayed over the list would take
+/// the session being replied to off screen (and reset its scroll) while the draft
+/// went on addressing it. The notch is DROPPED rather than redirected — a pointer
+/// parked over the list is not asking for the preview, and silently scrolling a
+/// pane it is not over would be a second surprise in place of the first.
+///
+/// The other two zones are deliberately untouched. Inside `preview` a notch
+/// scrolls the transcript being written to, exactly as always; the docked editor
+/// needs no arm of its own because it is drawn INSIDE that rect. OUTSIDE BOTH
+/// rects the preview stays the default surface, so the bottom-bar composer, the
+/// search line and the help line — all of which render outside the two panes —
+/// keep scrolling the transcript mid-draft instead of going dead.
+fn wheel_target(col: u16, row: u16, preview: Rect, list: Rect, composing: bool) -> WheelTarget {
     let pos = Position { x: col, y: row };
     if preview.contains(pos) {
         WheelTarget::Preview
     } else if list.contains(pos) {
-        WheelTarget::List
+        if composing {
+            WheelTarget::Ignore
+        } else {
+            WheelTarget::List
+        }
     } else {
         WheelTarget::Preview
     }
@@ -743,7 +771,10 @@ fn on_splitter(col: u16, row: u16, list: Rect, preview: Rect) -> bool {
 }
 
 /// Apply a mouse event: a vertical wheel notch scrolls whichever pane the
-/// pointer is over; a left-button press on the list/preview seam begins
+/// pointer is over — unless a draft is open, which takes the LIST out of the
+/// wheel's reach so a notch there is swallowed ([`wheel_target`] owns that rule
+/// and the reason for it); a left-button
+/// press on the list/preview seam begins
 /// dragging the splitter, a left-button drag while dragging resizes it, and a
 /// left-button release always ends the drag. A left-button press INSIDE the
 /// preview pane (but not on the seam) that lands on a rendered link opens its url
@@ -759,9 +790,19 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     match mouse.kind {
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
             let up = mouse.kind == MouseEventKind::ScrollUp;
-            match wheel_target(mouse.column, mouse.row, app.preview_rect, app.list_rect) {
+            match wheel_target(
+                mouse.column,
+                mouse.row,
+                app.preview_rect,
+                app.list_rect,
+                app.is_composing(),
+            ) {
                 WheelTarget::Preview => app.preview_wheel(up),
                 WheelTarget::List => app.list_wheel(up),
+                // Deliberately empty: no scroll, no selection move, no status
+                // line. The notch is spent and the board is byte-for-byte what
+                // it was, which is the whole point of the arm.
+                WheelTarget::Ignore => {}
             }
         }
         MouseEventKind::Down(MouseButton::Left)
@@ -2891,15 +2932,47 @@ mod tests {
             height: 20,
         };
         // Inside preview -> preview; inside list -> list.
-        assert_eq!(wheel_target(60, 10, preview, list), WheelTarget::Preview);
-        assert_eq!(wheel_target(10, 10, preview, list), WheelTarget::List);
+        assert_eq!(
+            wheel_target(60, 10, preview, list, false),
+            WheelTarget::Preview
+        );
+        assert_eq!(
+            wheel_target(10, 10, preview, list, false),
+            WheelTarget::List
+        );
         // Outside both panes (e.g. the header row) -> preview default.
-        assert_eq!(wheel_target(60, 100, preview, list), WheelTarget::Preview);
+        assert_eq!(
+            wheel_target(60, 100, preview, list, false),
+            WheelTarget::Preview
+        );
         // Hidden preview (empty rect): a point in the full-width list still
         // routes to the list.
         assert_eq!(
-            wheel_target(10, 10, Rect::default(), list),
+            wheel_target(10, 10, Rect::default(), list, false),
             WheelTarget::List
+        );
+        // Composing narrows exactly ONE of the three zones, so all three are
+        // pinned here. Over the preview a notch still scrolls the transcript
+        // being written to.
+        assert_eq!(
+            wheel_target(60, 10, preview, list, true),
+            WheelTarget::Preview,
+            "a draft does not take the preview's own wheel away"
+        );
+        // Over the LIST the notch is IGNORED — not redirected to the preview —
+        // because that arm moves the SELECTION out from under the draft.
+        assert_eq!(
+            wheel_target(10, 10, preview, list, true),
+            WheelTarget::Ignore,
+            "the list is not a wheel target while a draft is open"
+        );
+        // Outside BOTH rects the default surface survives untouched: that zone
+        // covers the bottom-bar composer, the search line and the help line, and
+        // a notch over any of them must still scroll the transcript mid-draft.
+        assert_eq!(
+            wheel_target(60, 100, preview, list, true),
+            WheelTarget::Preview,
+            "outside both panes a draft changes nothing: still the preview"
         );
     }
 
@@ -2978,6 +3051,70 @@ mod tests {
             "a wheel over the list advances the selection"
         );
         assert!(app.modal.is_none(), "a list wheel must not open an overlay");
+    }
+
+    /// An open draft takes the LIST out of the wheel's reach: a notch there does
+    /// NOTHING — it neither walks the selection off the session being replied to
+    /// nor is quietly redirected into the preview. The compose zone targets ONE
+    /// session id, so a wheel that moved the selection would leave the user typing
+    /// at a transcript that is no longer on screen. The preview keeps its own
+    /// wheel throughout, which the first notch below proves.
+    #[test]
+    fn a_wheel_over_the_list_while_composing_does_nothing() {
+        let mut app = App::new(
+            vec![session("a"), session("b"), session("c")],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
+        seed_live(&mut app, &[]);
+        app.list_rect = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 20,
+        };
+        app.preview_rect = Rect {
+            x: 40,
+            y: 0,
+            width: 40,
+            height: 20,
+        };
+        // Open the quick reply through the real routing, not by poking `compose`.
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        assert!(app.is_composing(), "Ctrl-R on an idle session composes");
+
+        // Mid-draft the PREVIEW still takes its own notches, and this one parks
+        // the scroll off zero so a redirected or reset notch below cannot hide.
+        wheel(&mut app, MouseEventKind::ScrollDown, 60, 5);
+        assert_eq!(
+            app.preview_scroll, 2,
+            "a draft does not take the preview's own wheel away"
+        );
+        let target = app.selected.clone();
+        let status = app.status.clone();
+
+        // A notch squarely inside the list pane.
+        wheel(&mut app, MouseEventKind::ScrollDown, 5, 5);
+
+        assert_eq!(
+            app.selected, target,
+            "a wheel over the list must not move the selection out from under a draft"
+        );
+        assert_eq!(
+            app.preview_scroll, 2,
+            "and it must not be redirected into the preview either — it does nothing"
+        );
+        assert_eq!(app.status, status, "an ignored notch reports nothing");
+        assert!(app.is_composing(), "and the draft is still open");
+
+        // Only the LIST goes dead. A notch OUTSIDE both rects — where the
+        // bottom-bar composer, the search line and the help line are drawn —
+        // still reaches the default surface and scrolls the transcript.
+        wheel(&mut app, MouseEventKind::ScrollDown, 60, 30);
+        assert_eq!(
+            app.preview_scroll, 4,
+            "outside both panes the default surface survives the draft"
+        );
     }
 
     #[test]

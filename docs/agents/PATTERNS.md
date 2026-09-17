@@ -749,8 +749,34 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    draft.is_some() || pending_stop.is_some() || pending_interrupt.is_some() ||
    pending_chord`) gates mouse actions (splitter drag / link open) so none fires
    while any is up. A mouse wheel is handled **before** and **independent of** that
-   gate. A new keyboard owner must be added to `overlay_active` too, or the mouse
-   will act underneath it.
+   gate: it never routes into an overlay handler, it only scrolls a pane. A new
+   keyboard owner must be added to `overlay_active` too, or the mouse will act
+   underneath it.
+
+   The wheel takes exactly ONE condition, and `update::wheel_target` owns it as a
+   parameter (`composing`) the way `key_to_action` owns its own. It hit-tests
+   THREE zones — inside the preview, inside the list, outside both — and
+   `composing` narrows exactly ONE of them: **while the compose zone is open the
+   list is not a wheel target at all**, and a notch over it resolves to
+   `WheelTarget::Ignore`, which does nothing. The list arm is the reason, and it is
+   the only arm that earns this: alone among the three it does not scroll a
+   VIEWPORT, it MOVES THE SELECTION, and the selection is what the preview shows.
+   A stray notch there would take the session being replied to off screen (and
+   reset its scroll) while the draft went on targeting its id. The notch is DROPPED
+   rather than redirected to the preview — a pointer parked over the list is not
+   asking for the transcript, so scrolling a pane it is not over would just swap
+   one surprise for another. The cost is accepted: the list is a silent dead zone
+   mid-draft, with no feedback that the notch was eaten.
+
+   The other two zones are untouched, and that is load-bearing. Inside the preview
+   a notch scrolls the transcript being written to exactly as always, and the
+   composer needs no arm of its own when docked — it is drawn INSIDE the preview
+   rect (`App::open_compose` force-shows that pane, so there is always one).
+   OUTSIDE BOTH rects the preview stays the default surface, which is what keeps
+   the wheel alive over the SHORT-PANE fallback composer in the bottom bar, the
+   search line and the help line: all three render outside the two body panes, so
+   the strict reading — dead everywhere but the preview — would have made a notch
+   over the box you are typing in inert.
 
    A **terminal paste** is routed by that same list, and `update::handle_paste`
    walks it in the identical order — the per-owner table is
