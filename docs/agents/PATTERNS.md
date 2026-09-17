@@ -373,8 +373,9 @@ inner rect when there is no banner (so a banner-less pane's geometry is exactly
   cannot win against a per-frame recompute; give the decision state that outlasts
   the frame instead. Every transition is a USER ACT: ANY scroll releases the
   anchor (in either direction — a scroll states a position, not a subscription),
-  and only `End`, another row, or re-showing the pane re-arms it. The render
-  writes the flag for exactly one thing, the match jump it alone can resolve, and
+  and only `End` (or its `Ctrl-E` twin), another row, or re-showing the pane
+  re-arms it. The render writes the flag for exactly one thing, the match jump it
+  alone can resolve, and
   never infers a re-arm from its own CLAMP: an offset the content cannot satisfy
   is equally a reader scrolling past the end, a pane widened by a resize, and a
   transcript that shrank, so re-arming on it took a deliberately positioned pane
