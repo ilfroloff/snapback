@@ -12,3 +12,7 @@
 # Scoped to `worktrees/` only: agent definitions elsewhere in `.agents/` stay committable.
 /.agents/worktrees/
 /.wtp.yml
+
+# JetBrains IDE state: local to whoever opens the project, intentionally untracked.
+# Unanchored unlike the rules above, so a nested `.idea/` at any depth is ignored too.
+.idea/
