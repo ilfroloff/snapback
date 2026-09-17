@@ -406,11 +406,13 @@ maps one onto the other. They disagree in both directions: the index keeps
 sidechain turns and the FULL body of every control wrapper, and drops markers,
 timestamps and blank lines; the preview collapses each wrapper to a one-line
 marker, drops sidechain user turns, discards a link's url, and RE-LAYS-OUT a
-table — wrapping one cell across several lines, and — on a pane too narrow to
-seat every column at its floor — replacing the grid with stacked `Header: value`
-records that repeat a header per cell. That last one is not quite lossless: a
-record omits its EMPTY cells, so a column that is empty in EVERY body row emits
-no line at all and its header never appears, though the grid shows that header.
+table — wrapping one cell across several lines, interleaving a rule between every
+pair of body rows (a wrapped row spans several lines, so without one two rows run
+together), and — on a pane too narrow to seat every column at its floor —
+replacing the grid with stacked `Header: value` records that repeat a header per
+cell. That last one is not quite lossless: a record omits its EMPTY cells, so a
+column that is empty in EVERY body row emits no line at all and its header never
+appears, though the grid shows that header.
 What it does carry over it carries intact — and it still breaks any offset
 mapping: one index position lands on a different preview line at a different
 width. The gap is wide, not

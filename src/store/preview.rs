@@ -1090,6 +1090,9 @@ fn ordered_item(line: &str) -> Option<(u64, &str)> {
 //   down its own column (`wrap_spans`), so a row is as many visual lines as its
 //   tallest cell needs. Columns never shrink past `TABLE_MIN_COL_WIDTH`, because
 //   a narrower one would wrap its text into a vertical stack of single chars.
+//   Because a row is no longer one line, the SAME `─┼─` rule that sits under the
+//   header is also drawn between adjacent body rows — without it two multi-line
+//   rows run together into one block with no visible boundary.
 // * RECORDS take over when even that floor-width grid cannot fit the pane — a
 //   narrow pane against many columns. Each row is stacked as `Header: value`
 //   lines with no grid at all, and those lines are left LONG for the pane's own
@@ -1514,7 +1517,8 @@ fn column_floors(natural: &[usize]) -> Vec<usize> {
 ///
 /// * [`render_table_grid`] (the default) shrinks the columns to fit `width` and
 ///   WRAPS an over-wide cell down its column, so a row becomes as many visual
-///   lines as its tallest cell needs.
+///   lines as its tallest cell needs — and draws a rule between adjacent rows so
+///   those multi-line blocks stay tellable apart.
 /// * [`render_table_records`] takes over when even a floor-width grid cannot fit
 ///   the pane (`sum(column_floors) + separators > width`) — more columns at their
 ///   floor than the pane has room for, which takes as few as TWO wide-celled ones
@@ -1581,9 +1585,19 @@ fn render_table(rows: &[&str], width: usize) -> (Vec<Line<'static>>, usize) {
 }
 
 /// The GRID layout: header row, `─┼─` separator, then one block of visual lines
-/// per body row (see [`table_data_lines`]). Columns are shrunk to fit the pane
+/// per body row (see [`table_data_lines`]), with that SAME `─┼─` rule drawn
+/// between each adjacent pair of body rows. Columns are shrunk to fit the pane
 /// budget but never below their floor, and an over-wide cell WRAPS down its
 /// column rather than being cut.
+///
+/// The row rules exist BECAUSE of that wrapping: a row spanning several visual
+/// lines runs straight into the next one, and a 3-line row above a 2-line one
+/// reads as a single five-line block. They are drawn UNCONDITIONALLY rather than
+/// only for tables that wrapped, so the grid has one shape at every width — a
+/// table must not change its chrome when a splitter drag happens to make a cell
+/// fit. Reusing the header separator keeps the grid one vocabulary instead of
+/// inventing a second kind of rule; the header stays distinguishable between two
+/// identical rules because it alone is BOLD.
 ///
 /// Every line here is guaranteed to fit `width`, so the grid can never soft-wrap
 /// under `Wrap { trim: false }` and scatter. That now holds by construction —
@@ -1610,7 +1624,15 @@ fn render_table_grid(
         base_style().add_modifier(Modifier::BOLD),
     ));
     lines.push(table_separator_line(&widths));
-    for row in body_rows {
+    for (i, row) in body_rows.iter().enumerate() {
+        // A rule per row BOUNDARY — between adjacent body rows only. Since a
+        // wrapped row spans several visual lines, consecutive rows otherwise run
+        // together into one block with no way to tell where a row ended. Not
+        // before the first row (the header separator above already marks that
+        // edge) and not after the last (nothing follows it to separate from).
+        if i > 0 {
+            lines.push(table_separator_line(&widths));
+        }
         lines.extend(table_data_lines(row, &widths, aligns, base_style()));
     }
 
@@ -1716,8 +1738,11 @@ fn table_data_lines(
         .collect()
 }
 
-/// Build the DIM box-drawing separator row under the header: `─` fill per column,
-/// `─┼─` at the column junctions so each `┼` lines up with the `│` above it.
+/// Build a DIM box-drawing separator row: `─` fill per column, `─┼─` at the
+/// column junctions so each `┼` lines up with the `│` above it.
+///
+/// ONE rule serves both grid boundaries — under the header and between adjacent
+/// body rows — so the two never drift apart into different-looking chrome.
 fn table_separator_line(widths: &[usize]) -> Line<'static> {
     let mut rule = String::new();
     for (c, width) in widths.iter().enumerate() {
@@ -2196,11 +2221,16 @@ mod tests {
 
     #[test]
     fn table_renders_header_separator_and_aligned_body_rows() {
-        // A well-formed 2-column table: header + separator + two body rows, all
-        // padded to the same total display width (the alignment invariant).
+        // A well-formed 2-column table: header + separator + two body rows with
+        // a rule between them, all padded to the same total display width (the
+        // alignment invariant).
         let body = "| A | B |\n| --- | --- |\n| 1 | 22 |\n| 333 | 4 |";
         let lines = markdown_body_lines(body, WIDE);
-        assert_eq!(lines.len(), 4, "header + separator + 2 body rows");
+        assert_eq!(
+            lines.len(),
+            5,
+            "header + separator + 2 body rows + 1 row rule"
+        );
 
         // Column A width = max(len "A","1","333") = 3; column B = max("B","22","4") = 2.
         // Every rendered line is the same width: 3 + 3 (" │ ") + 2 = 8.
@@ -2259,10 +2289,15 @@ mod tests {
     #[test]
     fn ragged_table_degrades_without_panicking() {
         // A short row (padded) and an over-long row (extra cells dropped) must not
-        // panic; the table still renders header + separator + two body rows.
+        // panic; the table still renders header + separator + two body rows with
+        // a rule between them.
         let body = "| A | B | C |\n| --- | --- | --- |\n| 1 |\n| 2 | 3 | 4 | 5 | 6 |";
         let lines = markdown_body_lines(body, WIDE);
-        assert_eq!(lines.len(), 4, "header + separator + 2 body rows");
+        assert_eq!(
+            lines.len(),
+            5,
+            "header + separator + 2 body rows + 1 row rule"
+        );
         // Every line stays the same width despite the ragged input.
         let widths: Vec<usize> = lines.iter().map(|l| line_text(l).chars().count()).collect();
         assert!(
@@ -2271,7 +2306,8 @@ mod tests {
         );
         // The over-long row kept exactly the header's column count: 3 columns
         // means 2 interior " │ " rules (cells now emit a variable span count).
-        let rules = lines[3]
+        // It is the LAST line: header, separator, row 1, the row rule, row 2.
+        let rules = lines[4]
             .spans
             .iter()
             .filter(|s| s.content.as_ref() == " \u{2502} ")
@@ -2313,10 +2349,12 @@ mod tests {
 
     // --- table wrapping: grid mode ----------------------------------------
 
-    /// The display column a line's first `│` column rule sits at, measured in
-    /// DISPLAY columns rather than chars so a double-width cell cannot fake a match.
-    fn rule_col(s: &str) -> Option<usize> {
-        let idx = s.find('\u{2502}')?;
+    /// The display column a line's first `ch` sits at, measured in DISPLAY columns
+    /// rather than chars so a double-width cell cannot fake a match. Asked with
+    /// `│` of a data line and with `┼` of a separator, which carries the junction
+    /// in that same column instead.
+    fn col_of(s: &str, ch: char) -> Option<usize> {
+        let idx = s.find(ch)?;
         Some(display_width(&s[..idx]))
     }
 
@@ -2362,17 +2400,87 @@ mod tests {
             "all grid lines share one display width: {widths:?}"
         );
 
-        // Every DATA line (index 1 is the `─┼─` separator, which carries `┼` at
-        // that column instead) puts its `│` at one and the same display column.
+        // Every DATA line (a `─┼─` separator carries `┼` at that column instead)
+        // puts its `│` at one and the same display column.
         let cols: Vec<Option<usize>> = texts
             .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != 1)
-            .map(|(_, t)| rule_col(t))
+            .filter(|t| !t.contains('\u{253c}'))
+            .map(|t| col_of(t, '\u{2502}'))
             .collect();
         assert!(
             cols[0].is_some() && cols.iter().all(|c| *c == cols[0]),
             "continuation lines keep the column rule in place: {cols:?}"
+        );
+    }
+
+    #[test]
+    fn a_rule_separates_each_pair_of_grid_body_rows_and_lines_up_with_them() {
+        // Wrapping lets one row span several visual lines, so with nothing drawn
+        // between rows a 3-line row above a 2-line one reads as a single
+        // five-line block — rows and columns stop looking like separate units.
+        // A rule per row BOUNDARY is what says where a row ends, and it reuses
+        // the header separator's `─┼─` vocabulary so the whole grid reads as one
+        // piece of chrome rather than two. That leaves the header framed by two
+        // identical rules; the header stays legible because it alone is BOLD.
+        //
+        // Stated over a fixture whose first two rows WRAP, since a multi-line row
+        // is the case the rules exist for. Each row owns a unique word, so the
+        // blocks between rules can be checked to hold exactly one row each —
+        // proving a rule lands at a row boundary and never mid-row.
+        let body = "| Alpha | Beta |\n| --- | --- |\n\
+                    | the quick brown fox | jumps over lazy dogs |\n\
+                    | second wrapping row | with further wrapped words |\n\
+                    | tail | end |";
+        let lines = markdown_body_lines(body, 30);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+
+        // Split on the rules; a `┼` junction is carried by separator lines alone.
+        let mut blocks: Vec<Vec<&String>> = vec![Vec::new()];
+        for t in &texts {
+            if t.contains('\u{253c}') {
+                blocks.push(Vec::new());
+            } else {
+                blocks.last_mut().expect("seeded with one block").push(t);
+            }
+        }
+        // Header block + 3 body rows = 4 blocks, so 3 rules: the header separator
+        // plus ONE boundary per adjacent PAIR of body rows. No extra rule before
+        // the first body row (the header separator already marks that edge) and
+        // none after the last — either would leave an EMPTY block behind.
+        assert_eq!(
+            blocks.len(),
+            4,
+            "header + 3 rows, one rule between each: {texts:#?}"
+        );
+        assert!(
+            blocks.iter().all(|b| !b.is_empty()),
+            "every rule sits BETWEEN blocks, never doubled, leading or trailing: {texts:#?}"
+        );
+        for (block, word) in blocks.iter().zip(["Alpha", "quick", "second", "tail"]) {
+            let joined = block.iter().map(|t| t.as_str()).collect::<String>();
+            assert!(
+                joined.contains(word),
+                "{word:?} is alone in its block: {joined:?}"
+            );
+        }
+        // The rows really did wrap, or this pins nothing about the case that
+        // motivated the rules in the first place.
+        assert!(blocks[1].len() > 1, "row 1 wrapped: {:?}", blocks[1]);
+        assert!(blocks[2].len() > 1, "row 2 wrapped: {:?}", blocks[2]);
+
+        // A boundary is only legible as part of the grid if its `┼` sits in the
+        // very column the `│` above and below it do.
+        let (rules, data): (Vec<&String>, Vec<&String>) =
+            texts.iter().partition(|t| t.contains('\u{253c}'));
+        let data_cols: Vec<Option<usize>> = data.iter().map(|t| col_of(t, '\u{2502}')).collect();
+        assert!(
+            data_cols[0].is_some() && data_cols.iter().all(|c| *c == data_cols[0]),
+            "every data line puts `│` at one column: {data_cols:?}"
+        );
+        let junctions: Vec<Option<usize>> = rules.iter().map(|t| col_of(t, '\u{253c}')).collect();
+        assert!(
+            junctions.iter().all(|c| *c == data_cols[0]),
+            "every rule puts `┼` at that same column {data_cols:?}: {junctions:?}"
         );
     }
 
@@ -2828,7 +2936,11 @@ mod tests {
         // measured on the stripped text (`**bold**` is 4 columns, not 8).
         let body = "| A | B |\n| --- | --- |\n| `code` | **bold** |\n| x | y |";
         let lines = markdown_body_lines(body, WIDE);
-        assert_eq!(lines.len(), 4, "header + separator + 2 body rows");
+        assert_eq!(
+            lines.len(),
+            5,
+            "header + separator + 2 body rows + 1 row rule"
+        );
 
         let joined = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(
