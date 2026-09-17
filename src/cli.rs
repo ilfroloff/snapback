@@ -68,7 +68,8 @@ KEYS:
     Tab           toggle name / name+content search. Widening to content also
                   opens the preview on the most recent match, as typing does
     PgUp/PgDn     preview page  Ctrl-U/Ctrl-D  preview quarter-page
-    Home/End      preview top / bottom
+    Home/End      preview top / bottom (also Ctrl-T/Ctrl-E; fn+←/→ on a MacBook
+                  keyboard, where Home/End are not their own keys)
     Shift+↑/↓     jump the preview to the previous / next line the query marks.
                   Only while something is marked there — with nothing marked they
                   stay plain move, so they never take a key away from you. One

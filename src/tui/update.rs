@@ -38,7 +38,7 @@
 //! | `Ctrl-/` | toggle the preview pane |
 //! | `PgUp` / `PgDn` | scroll the preview a page (always) |
 //! | `Ctrl-U` / `Ctrl-D` | scroll the preview a quarter page (always) |
-//! | `Home` / `End` | jump the preview to top / bottom (always) |
+//! | `Ctrl-T` / `Ctrl-E`, `Home` / `End` | jump the preview to top / bottom (always) |
 //! | `Shift-Up` / `Shift-Down` | scroll the preview onto the previous / next MARKED line, but only while the query marks something in the previewed transcript; with nothing marked they fall through to plain selection movement. One stop per marked LINE, not per occurrence — a line saying the query twice is marked, and stopped at, once |
 //! | `Backspace` | delete the last query character |
 //! | printable char | type-to-search (append to the query) |
@@ -257,6 +257,11 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool
             // the query, like the arrows, so search never blocks preview scrolling.
             KeyCode::Char('u') | KeyCode::Char('U') => Action::PreviewHalfUp,
             KeyCode::Char('d') | KeyCode::Char('D') => Action::PreviewHalfDown,
+            // Jump-to-top/bottom, alongside `Home`/`End` (a MacBook's `fn+←/→`
+            // reaches those, but not every keyboard/terminal makes that
+            // convenient) — same actions, same follow-bottom semantics.
+            KeyCode::Char('t') | KeyCode::Char('T') => Action::PreviewTop,
+            KeyCode::Char('e') | KeyCode::Char('E') => Action::PreviewBottom,
             _ => Action::Ignore,
         };
     }
@@ -4366,6 +4371,16 @@ mod tests {
             assert_eq!(
                 key_to_action(ctrl(KeyCode::Char('d')), empty, false),
                 Action::PreviewHalfDown
+            );
+            // Ctrl-T / Ctrl-E reach the same top/bottom jump as Home/End, also
+            // independent of query state.
+            assert_eq!(
+                key_to_action(ctrl(KeyCode::Char('t')), empty, false),
+                Action::PreviewTop
+            );
+            assert_eq!(
+                key_to_action(ctrl(KeyCode::Char('e')), empty, false),
+                Action::PreviewBottom
             );
         }
     }
