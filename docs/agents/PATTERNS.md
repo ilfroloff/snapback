@@ -272,9 +272,21 @@ inner rect when there is no banner (so a banner-less pane's geometry is exactly
   where a row ends early at a word boundary (which made the tail of a long
   transcript unreachable, since `max_offset = content_h - inner_height`) and
   over-counts where the wrapper swallows the whitespace it broke on. No production
-  path models a wrap any more — `wrapped_line_height` survives in `mod tests` alone,
+  path MEASURES a wrap any more — `wrapped_line_height` survives in `mod tests` alone,
   as the FOIL a fixture proves itself against, so a case cannot pass by accidentally
-  agreeing with the wrapper. The
+  agreeing with the wrapper.
+
+  The one production path that PERFORMS a wrap is the exception that shows where
+  the line is: `store::preview::wrap_spans` word-wraps a GFM table cell down its
+  column, so a hand-rolled wrapper does sit beside ratatui's. It is safe for one
+  structural reason, not by care — a grid line is clamped to the pane width, so it
+  NEVER reaches ratatui's wrapper, and the two models therefore cannot disagree
+  about a table. The one height it does take — `table_data_lines` sizing a row by
+  its tallest cell — is not a PREDICTION either: it counts lines it has ALREADY
+  PRODUCED itself, never guessing what ratatui's wrapper would do to them. Those
+  lines stay ordinary `Line`s that `wrapped_row_prefix` then measures through the
+  same widget seam as every other line. A second wrapper whose output could
+  soft-wrap again would be the defect this bullet exists to prevent. The
   transcript is measured ONCE per (session, width), inside the `preview_cache`
   entry, so it can never be invalidated apart from the text it describes; whatever
   is NOT that cached transcript (the draft card, an in-flight reply's echo turns)
@@ -645,7 +657,7 @@ CADENCES and LIMITS, so a retune knows what it is next to:
 | `store` | `MTIME_SETTLE_WINDOW` (2 s) |
 | `store::parse` | `CONTENT_INDEX_CAP` (1 MB) |
 | `store::label` | `LABEL_MAX` (180) |
-| `store::preview` | `TABLE_MAX_WIDTH` (96) |
+| `store::preview` | `TABLE_MIN_COL_WIDTH` (10) · `RECORD_RULE_WIDTH` (32) |
 | `send` | `SEND_ERROR_MAX` (200) |
 | `tui::app` | `PREVIEW_WHEEL_STEP` (2) · `LIST_WHEEL_STEP` (1) · `STATUS_DWELL_TICKS` (16) · `MIN_PANE_WIDTH` (15) · `DEFAULT_LIST_PERCENT` (48) |
 | `tui::update` | `PASTE_MAX_CHARS` (4096) · `SPLITTER_TOLERANCE` (1) |
@@ -666,6 +678,17 @@ A const whose rationale depends on ANOTHER const says so and names it:
 Likewise, `tui::app::STATUS_DWELL_TICKS` is meaningless without `watch::TICK`
 (`16 * 250 ms = 4 s`), so its doc comment names `TICK` and shows the arithmetic.
 That naming is what makes the coupling discoverable when the other value is retuned.
+
+A const that is a **SWITCH rather than a limit** says so loudest, because retuning
+it changes which code path runs rather than how far one goes.
+`store::preview::TABLE_MIN_COL_WIDTH` is the instance: it is a table column's width
+floor, but since a grid that cannot seat every column at that floor is abandoned
+for the stacked record layout, the same number decides WHICH LAYOUT a table gets.
+At a 62-column preview it seats 5 columns exactly and sends 6 to records, so a
+nudge either way silently re-shapes ordinary tables. Where a const has a switching
+range like that, pin the switch points in a test rather than trusting the doc
+comment — `the_record_fallback_switch_points_are_pinned_at_a_62_column_pane` is
+what makes a retune's blast radius visible.
 
 ## 9. `#[allow(dead_code)]` is narrow and justified
 

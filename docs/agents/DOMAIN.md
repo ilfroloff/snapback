@@ -405,13 +405,20 @@ INDEPENDENT, lossy extractions of the same transcript, and no offset function
 maps one onto the other. They disagree in both directions: the index keeps
 sidechain turns and the FULL body of every control wrapper, and drops markers,
 timestamps and blank lines; the preview collapses each wrapper to a one-line
-marker, drops sidechain user turns, discards a link's url, and truncates table
-cells. The gap is wide, not
+marker, drops sidechain user turns, discards a link's url, and RE-LAYS-OUT a
+table — wrapping one cell across several lines, and — on a pane too narrow to
+seat every column at its floor — replacing the grid with stacked `Header: value`
+records that repeat a header per cell. That last one is not quite lossless: a
+record omits its EMPTY cells, so a column that is empty in EVERY body row emits
+no line at all and its header never appears, though the grid shows that header.
+What it does carry over it carries intact — and it still breaks any offset
+mapping: one index position lands on a different preview line at a different
+width. The gap is wide, not
 marginal: a one-off probe over the real store (2026-08-14, 336 sessions / 24,587
 query × session hits) put **~17% of readable bytes inside collapsed wrappers
 alone**. Read that as an upper bound and a rough one — the probe APPROXIMATED the
 renderer (a regex wrapper collapse; no markdown inline stripping, table
-truncation or link-url discard) and nothing re-measures it. It is dated evidence
+re-layout or link-url discard) and nothing re-measures it. It is dated evidence
 that the gap is large, not a maintained metric.
 
 So an in-preview search mark is derived by RE-SEARCHING the rendered lines —

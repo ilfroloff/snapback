@@ -53,16 +53,55 @@ use ratatui::text::{Line, Span, Text};
 use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
 use time::{Date, OffsetDateTime};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::Session;
 
-/// Upper bound on a rendered GFM table's total display width (columns +
-/// separators). The PRIMARY table budget is the preview pane's inner content
-/// width, plumbed in as `width` so a table shrinks-to-fit and never soft-wraps
-/// (see [`render_table`]). This cap only bounds the OTHER direction: on a very
-/// wide pane a table is not stretched past a comfortable reading width.
-const TABLE_MAX_WIDTH: usize = 96;
+/// Floor on a GFM table column's rendered width in GRID mode — and, because a
+/// grid that cannot seat every column at its floor is abandoned for the stacked
+/// record layout, the LAYOUT SWITCH between the two (see [`render_table`]).
+///
+/// Now that an over-wide cell WRAPS instead of being cut ([`wrap_spans`]), a
+/// column narrower than this turns its text vertical — one or two chars per
+/// line — which reads worse than no grid at all. Pinned at 10: a typical
+/// transcript cell is a short phrase of ~20 columns, so 10 still seats one or
+/// two words per line.
+///
+/// It is the switch point, not merely a floor, so retuning it moves ordinary
+/// tables between the two layouts: at a 62-column preview (a 120-column terminal
+/// split down the middle) a 5-column table of wide cells fits EXACTLY
+/// (`5 * 10 + 4 * 3 = 62`) and a 6-column one falls back to records. A column
+/// whose NATURAL width is already below the floor only ever costs its natural
+/// width, so a table of short cells is never dumped into records for want of
+/// room it would not have used.
+const TABLE_MIN_COL_WIDTH: usize = 10;
+
+/// Width of the DIM `─` rule that separates two stacked records in the
+/// narrow-pane table fallback (see [`render_table_records`]).
+///
+/// The record layout has no grid to take a width from, so its one piece of chrome
+/// needs a width of its own, and that width is FIXED — deliberately NOT clamped to
+/// the pane. A record line is an ordinary logical line that the preview's own
+/// `Wrap { trim: false }` wraps, and re-introducing a pane clamp here is the one
+/// place this layout would start cutting again.
+///
+/// Fixed therefore means the rule OVERFLOWS a narrower pane and soft-wraps into
+/// several rows of dashes: one row at 32 columns and up, two from 16 through 31,
+/// four at 8. Those are squarely the panes the fallback serves — it fires only
+/// once a floor-width grid no longer fits, i.e. below 36 columns for a 3-column
+/// table of wide cells (`3 * 10 + 2 * 3`) and below 62 for a 5-column one — so a
+/// multi-row separator is the NORMAL case here, not an edge one. That is accepted
+/// rather than worked around because the rule is DECORATIVE: a wrapped separator
+/// still reads as a separator, costs only rows, and loses no transcript text,
+/// whereas the obvious repair — capping it to the pane — is exactly the cut this
+/// layout exists to remove.
+///
+/// Pinned at 32 to bound both ends of that trade: wide enough to read as a rule
+/// rather than a stray dash, and short enough that even at the narrowest panes the
+/// wrap costs a few rows rather than a screenful (a 64-wide rule would cost eight
+/// rows at width 8 where this one costs four).
+const RECORD_RULE_WIDTH: usize = 32;
 
 /// A clickable link inside the rendered preview, in CONTENT coordinates (before
 /// the preview's soft-wrap is applied at draw time).
@@ -72,8 +111,9 @@ const TABLE_MAX_WIDTH: usize = 96;
 /// records where that label lives so the app's own mouse handling can recover the
 /// url on a click: `content_row` indexes into the returned [`Text`]'s lines, and
 /// `col_start..col_end` is the label's DISPLAY-column span on that line. Columns
-/// depend on the render `width` (GFM tables shrink/truncate), so regions are cached
-/// TOGETHER with the `Text` under the same width discipline (see [`App`]).
+/// depend on the render `width` (GFM tables shrink, wrap, and may change layout
+/// entirely), so regions are cached TOGETHER with the `Text` under the same width
+/// discipline (see [`App`]).
 ///
 /// [`App`]: crate::tui::app::App
 #[derive(Debug, Clone, PartialEq)]
@@ -569,6 +609,15 @@ fn table_border_style() -> Style {
     Style::default().add_modifier(Modifier::DIM)
 }
 
+/// The `Header: ` label of a stacked record in the narrow-pane table fallback:
+/// DIM, so the label recedes and the VALUE beside it reads as the content. The
+/// grid says which column a cell is in with position; without a grid the label
+/// has to say it in words, and dimming is what stops those words drowning the
+/// data. Same restraint (a `Modifier`, no fixed color) as the borders above.
+fn record_label_style() -> Style {
+    Style::default().add_modifier(Modifier::DIM)
+}
+
 /// A single DIM marker line.
 fn marker_line(text: String) -> Line<'static> {
     Line::from(Span::styled(text, marker_style()))
@@ -869,9 +918,17 @@ fn regions_from_inline(
 ///
 /// Only the prose branches (paragraph, blockquote, unordered / ordered list item)
 /// inline-parse and can carry links; headers push raw text, fenced code is
-/// verbatim, and GFM table cells are inline-parsed but their shrink-to-fit
-/// truncation/padding makes column mapping unreliable, so — per the v1 scope —
-/// table-cell links are intentionally NOT recorded (never a wrong hit).
+/// verbatim, and GFM table cells are inline-parsed but their link columns are
+/// still NOT recorded, so a table-cell link is never a wrong hit.
+///
+/// The reason is the LAYOUT, not truncation — nothing in a table is cut any more
+/// (see [`render_table`]). A cell's label no longer sits at one known column:
+/// grid mode wraps a cell down its column, so the label may start on any of the
+/// row's visual lines at a per-line offset the padding shifts, and record mode
+/// drops the grid entirely and re-emits the cell behind a `Header: ` prefix on a
+/// line the pane then soft-wraps. Mapping either back to a `(content_row,
+/// col_start..col_end)` region is a second, layout-aware pass; until it exists,
+/// recording nothing keeps the promise that a click never opens the wrong url.
 fn markdown_body_lines_collect(body: &str, width: usize) -> (Vec<Line<'static>>, Vec<LinkRegion>) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut links: Vec<LinkRegion> = Vec::new();
@@ -1023,9 +1080,24 @@ fn ordered_item(line: &str) -> Option<(u64, &str)> {
 // `unicode-width` (see `cell_display_width`): `**x**` and `[a](b)` occupy their
 // RENDERED column count (1 and 1), not their raw byte/char length, so inline
 // styling inside cells cannot skew the grid. CJK/emoji "double-width" cells also
-// measure at their true two columns. The whole table is fit to the preview pane's
-// inner content `width` (shrink-to-fit + `…` truncation), and a final per-line
-// clamp guarantees no row can exceed `width` and soft-wrap.
+// measure at their true two columns.
+//
+// The whole table is fit to the preview pane's inner content `width`, and NOTHING
+// IS EVER CUT to do it — the pane scrolls, so horizontal loss is paid as vertical
+// cost instead. There are two layouts and `render_table` chooses between them:
+//
+// * GRID (the default) shrinks the columns to fit, then WRAPS an over-wide cell
+//   down its own column (`wrap_spans`), so a row is as many visual lines as its
+//   tallest cell needs. Columns never shrink past `TABLE_MIN_COL_WIDTH`, because
+//   a narrower one would wrap its text into a vertical stack of single chars.
+// * RECORDS take over when even that floor-width grid cannot fit the pane — a
+//   narrow pane against many columns. Each row is stacked as `Header: value`
+//   lines with no grid at all, and those lines are left LONG for the pane's own
+//   `Wrap { trim: false }` to handle.
+//
+// The two differ on the no-wrap guarantee, and deliberately: every grid line is
+// clamped to `width` so the grid can never soft-wrap and scatter, while a record
+// line is MEANT to overflow and soft-wrap like any prose paragraph.
 
 /// Per-column text alignment, read from the delimiter row's colons.
 #[derive(Clone, Copy)]
@@ -1124,6 +1196,12 @@ fn spans_display_width(spans: &[Span<'static>]) -> usize {
         .sum()
 }
 
+/// The marker-STRIPPED display text of a run of spans (their visible content
+/// joined), so a stacked record's label reads `Beta` rather than `**Beta**`.
+fn spans_display_text(spans: &[Span<'static>]) -> String {
+    spans.iter().map(|s| s.content.as_ref()).collect()
+}
+
 /// Display width of a table cell's VISIBLE text: parse inline markers, then
 /// measure the stripped result. This is the width columns are aligned to, so a
 /// styled cell (`**x**`, `` `x` ``, `[x](y)`) lines up with a plain one.
@@ -1163,6 +1241,147 @@ fn truncate_spans(spans: &[Span<'static>], width: usize, ellipsis: Style) -> Vec
     out
 }
 
+/// Word-wrap parsed cell `spans` to at most `width` display columns, returning ONE
+/// span run per visual line. The sibling of [`truncate_spans`], and its opposite:
+/// where that one CUTS at the column budget, this one spends vertical space, so a
+/// cell too wide for its column costs LINES rather than characters (see
+/// [`render_table_grid`]).
+///
+/// Breaks at whitespace where it can, and HARD-BREAKS any token wider than the
+/// whole column (a path, a url, an unbroken CJK run) because no word boundary can
+/// help there. Only the whitespace a line actually BROKE on is dropped; every
+/// other char survives into some line.
+///
+/// Every break lands on a GRAPHEME CLUSTER edge, never inside one, and that is
+/// not cosmetic. `Line::width` sums `unicode-width` PER SPAN and that width is a
+/// CONTEXTUAL fold, so a boundary drawn through a cluster — an emoji cut from its
+/// VS16 or its skin-tone modifier, an `e` cut from its combining acute — changes
+/// the summed width of text that did not change. That desyncs the preview's
+/// cached wrapped-row map from the line actually painted, and the pane BOTH
+/// windows its draw by that one map and hit-tests a click against it, so the
+/// damage is a pane starting on the wrong line AND a click opening the wrong
+/// link, not a mis-measured height. The cluster table is never hand-rolled
+/// (`unicode-segmentation`), exactly as in [`crate::tui::view`]'s match runs.
+///
+/// Never panics: a `width` of 0 yields no lines at all, and a single cluster
+/// wider than the whole column takes a line to itself rather than looping
+/// forever. Grid mode keeps that last case unreachable — a column holding a
+/// 2-column cluster has a natural width of at least 2, hence a floor of at least
+/// 2 — but the helper does not rely on its caller for totality.
+fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
+    if width == 0 {
+        return Vec::new();
+    }
+    // One entry per grapheme cluster, carrying the style of the span it came from
+    // and its display width, so a break can only ever land BETWEEN two entries.
+    let mut cells: Vec<(&str, Style, usize)> = Vec::new();
+    for span in spans {
+        for g in span.content.as_ref().graphemes(true) {
+            cells.push((g, span.style, display_width(g)));
+        }
+    }
+
+    let mut lines: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut cur: Vec<(&str, Style, usize)> = Vec::new();
+    let mut cur_w = 0usize;
+
+    let mut i = 0usize;
+    while i < cells.len() {
+        // A run of whitespace is a break OPPORTUNITY: kept when the word after it
+        // still fits this line, dropped when that word starts a new one.
+        let gap_start = i;
+        while i < cells.len() && is_blank_cluster(cells[i].0) {
+            i += 1;
+        }
+        let gap = &cells[gap_start..i];
+        let gap_w: usize = gap.iter().map(|c| c.2).sum();
+
+        let word_start = i;
+        while i < cells.len() && !is_blank_cluster(cells[i].0) {
+            i += 1;
+        }
+        let word = &cells[word_start..i];
+        let word_w: usize = word.iter().map(|c| c.2).sum();
+
+        if word.is_empty() {
+            // Trailing whitespace, so this is the last turn: keep only what still
+            // fits, never open a line for it. `cur_w` is not advanced because
+            // nothing reads it again.
+            if !cur.is_empty() && cur_w + gap_w <= width {
+                cur.extend_from_slice(gap);
+            }
+            break;
+        }
+
+        if !cur.is_empty() {
+            if cur_w + gap_w + word_w > width {
+                lines.push(coalesce_cells(&cur));
+                cur.clear();
+                cur_w = 0;
+            } else {
+                cur.extend_from_slice(gap);
+                cur_w += gap_w;
+            }
+        }
+
+        // Place the word, hard-breaking it across lines for as long as what is left
+        // of it cannot fit one.
+        let mut rest = word;
+        loop {
+            let rest_w: usize = rest.iter().map(|c| c.2).sum();
+            if cur_w + rest_w <= width {
+                cur.extend_from_slice(rest);
+                cur_w += rest_w;
+                break;
+            }
+            let mut take = 0usize;
+            let mut take_w = 0usize;
+            while take < rest.len() && cur_w + take_w + rest[take].2 <= width {
+                take_w += rest[take].2;
+                take += 1;
+            }
+            if take == 0 && cur.is_empty() {
+                // One cluster wider than the whole column: give it a line of its
+                // own. Without this the line would stay empty and never advance.
+                take = 1;
+            }
+            cur.extend_from_slice(&rest[..take]);
+            lines.push(coalesce_cells(&cur));
+            cur.clear();
+            cur_w = 0;
+            rest = &rest[take..];
+            if rest.is_empty() {
+                break;
+            }
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(coalesce_cells(&cur));
+    }
+    lines
+}
+
+/// Is this grapheme cluster whitespace — i.e. a break opportunity for
+/// [`wrap_spans`] rather than content?
+fn is_blank_cluster(g: &str) -> bool {
+    g.chars().all(char::is_whitespace)
+}
+
+/// Rebuild one wrapped line's grapheme cells back into spans, merging each run
+/// that shares a style. The output is span-for-span what [`wrap_spans`] was
+/// handed, minus the break points — so a cell's inline styling (DIM code, a bold
+/// run, an underlined link label) survives the wrap intact.
+fn coalesce_cells(cells: &[(&str, Style, usize)]) -> Vec<Span<'static>> {
+    let mut out: Vec<Span<'static>> = Vec::new();
+    for (text, style, _) in cells {
+        match out.last_mut() {
+            Some(last) if last.style == *style => last.content.to_mut().push_str(text),
+            _ => out.push(Span::styled((*text).to_string(), *style)),
+        }
+    }
+    out
+}
+
 /// Pad fitted cell `spans` (display width `fitted_w`, already `<= width`) out to
 /// exactly `width` columns per `align`, with `base`-styled space runs: left pads
 /// on the right, right pads on the left, center splits the padding.
@@ -1193,21 +1412,20 @@ fn pad_cell_spans(
     out
 }
 
-/// Render one table cell to EXACTLY `width` display columns: inline-parse `raw`
-/// over `base` (so `**bold**`/`` `code` ``/`[a](b)` style inside the cell), then
-/// either pad (when it fits) or truncate-with-`…` and pad. Width is measured on
-/// the stripped display text, so styled and plain cells stay column-aligned.
-fn render_cell_spans(raw: &str, width: usize, align: Align, base: Style) -> Vec<Span<'static>> {
-    let spans = parse_inline(raw, base);
-    let w = spans_display_width(&spans);
-    let (fitted, fitted_w) = if w <= width {
-        (spans, w)
-    } else {
-        let truncated = truncate_spans(&spans, width, base);
-        let tw = spans_display_width(&truncated);
-        (truncated, tw)
-    };
-    pad_cell_spans(fitted, fitted_w, width, align, base)
+/// Wrap one table cell to `width` display columns: inline-parse `raw` over `base`
+/// (so `**bold**`/`` `code` ``/`[a](b)` style inside the cell), word-wrap the
+/// result, then pad EVERY visual line out to exactly `width` per `align`. Returns
+/// one span run per visual line — the cell's height in the grid. Width is
+/// measured on the stripped display text, so styled and plain cells stay
+/// column-aligned on every one of those lines.
+fn wrap_cell_spans(raw: &str, width: usize, align: Align, base: Style) -> Vec<Vec<Span<'static>>> {
+    wrap_spans(&parse_inline(raw, base), width)
+        .into_iter()
+        .map(|line| {
+            let w = spans_display_width(&line);
+            pad_cell_spans(line, w, width, align, base)
+        })
+        .collect()
 }
 
 /// Total display width of a `Line`'s spans (terminal columns).
@@ -1215,11 +1433,19 @@ fn line_display_width(line: &Line<'static>) -> usize {
     spans_display_width(&line.spans)
 }
 
-/// Final no-wrap guarantee: if a built table `line` still exceeds `width` display
-/// columns (only possible when a very narrow pane with many columns pushes even
-/// the 1-column-floored layout plus its structural separators over budget), clamp
-/// it to `width` with `…`, so the row can never soft-wrap under `Wrap { trim:
-/// false }` and scatter the grid.
+/// Final no-wrap guarantee for a GRID line: if one still exceeds `width` display
+/// columns, clamp it to `width` with `…` so the row can never soft-wrap under
+/// `Wrap { trim: false }` and scatter the grid.
+///
+/// This is now a BACKSTOP rather than the mechanism, and it should never fire: a
+/// grid is only chosen when every column's floor fits the pane, so the widths
+/// plus their separators are within budget by construction. It is kept because
+/// the guarantee is load-bearing and cheap to hold, and drift in the arithmetic
+/// above it would otherwise scatter the grid silently.
+///
+/// It must NOT be applied to [`render_table_records`]' lines: those are ordinary
+/// logical lines that are SUPPOSED to overflow and soft-wrap, and clamping them
+/// would reintroduce the very cut the record layout exists to remove.
 fn clamp_line_to_width(line: Line<'static>, width: usize) -> Line<'static> {
     if line_display_width(&line) <= width {
         return line;
@@ -1228,36 +1454,76 @@ fn clamp_line_to_width(line: Line<'static>, width: usize) -> Line<'static> {
 }
 
 /// Shrink `widths` (widest column first) until `sum(widths) <= budget`, so the
-/// table body fits the pane-derived column budget. Columns never drop below 1
-/// column; if even 1-column columns overflow the budget the returned widths may
-/// exceed it — [`clamp_line_to_width`] then guards the final render against wrap.
-fn fit_widths(mut widths: Vec<usize>, budget: usize) -> Vec<usize> {
+/// table body fits the pane-derived column budget. No column ever drops below its
+/// entry in `floors` — [`column_floors`], i.e. `min(natural, TABLE_MIN_COL_WIDTH)`
+/// — because a column below that turns its wrapped text vertical.
+///
+/// Grid mode is only ENTERED when `sum(floors) <= budget` (see [`render_table`]),
+/// so within it this always gets inside the budget and every grid line fits the
+/// pane by construction; [`clamp_line_to_width`] is the backstop, not the
+/// mechanism. A table too wide for the pane therefore lands on the budget
+/// EXACTLY, filling the pane edge to edge.
+///
+/// It only ever DECREMENTS. A table narrower than the budget keeps its natural
+/// width rather than being stretched across the pane: at natural width nothing
+/// wraps, so stretching cannot save a line — it would only pad the columns apart.
+fn fit_widths(mut widths: Vec<usize>, floors: &[usize], budget: usize) -> Vec<usize> {
     while widths.iter().sum::<usize>() > budget {
         let Some((idx, _)) = widths
             .iter()
             .enumerate()
-            .filter(|(_, &w)| w > 1)
+            .filter(|(i, &w)| w > floors.get(*i).copied().unwrap_or(1))
             .max_by_key(|(_, &w)| w)
         else {
-            break; // every column is already at its 1-char floor
+            break; // every column is already at its floor
         };
         widths[idx] -= 1;
     }
     widths
 }
 
+/// The per-column width floor a grid layout must honor: a column never needs more
+/// than its NATURAL width, and never gets less than [`TABLE_MIN_COL_WIDTH`], so
+/// the floor is the smaller of the two.
+///
+/// Summed (plus the structural separators) this is the narrowest grid the table
+/// can be drawn as, and therefore the record-fallback threshold. Taking the `min`
+/// per column rather than the flat `ncols * TABLE_MIN_COL_WIDTH` product is what
+/// keeps a table of SHORT cells out of the record layout: five 3-to-5-column
+/// cells need 19 columns of content, not 50, and demanding the product would dump
+/// a table that fits comfortably.
+fn column_floors(natural: &[usize]) -> Vec<usize> {
+    natural
+        .iter()
+        .map(|&n| n.min(TABLE_MIN_COL_WIDTH))
+        .collect()
+}
+
 /// Render a GFM pipe table beginning at `rows[0]` (the header), with `rows[1]`
 /// the delimiter, fitting the whole table to `width` display columns (the preview
-/// pane's inner content width). Returns the styled lines and the number of INPUT
-/// rows consumed (header + delimiter + body rows). Body rows are consumed until a
-/// blank line or a non-table row (no `|` after trim). Never panics on malformed
-/// input.
+/// pane's inner content width) WITHOUT ever cutting a cell. Returns the styled
+/// lines and the number of INPUT rows consumed (header + delimiter + body rows).
+/// Body rows are consumed until a blank line or a non-table row (no `|` after
+/// trim). Never panics on malformed input.
 ///
 /// Cells ARE inline-parsed (`**bold**` / `` `code` `` / `[a](b)` style inside the
 /// grid). Column widths are measured on each cell's marker-STRIPPED display text
-/// (`**x**` is one column, not five), so styling can never skew alignment. The
-/// table shrinks-to-fit `width` and truncates over-wide cells with `…`; a final
-/// [`clamp_line_to_width`] pass guarantees no row exceeds `width` and soft-wraps.
+/// (`**x**` is one column, not five), so styling can never skew alignment.
+///
+/// This is a CHOOSER over two layouts, and NEITHER of them ever cuts a cell:
+///
+/// * [`render_table_grid`] (the default) shrinks the columns to fit `width` and
+///   WRAPS an over-wide cell down its column, so a row becomes as many visual
+///   lines as its tallest cell needs.
+/// * [`render_table_records`] takes over when even a floor-width grid cannot fit
+///   the pane (`sum(column_floors) + separators > width`) — more columns at their
+///   floor than the pane has room for, which takes as few as TWO wide-celled ones
+///   (`10 + 3 + 10 = 23`) against a narrower pane, not necessarily many. There is
+///   no grid left to scatter, so each row is stacked as `Header: value` lines and
+///   left for the pane's own soft wrap.
+///
+/// Neither layout records link regions for its cells; see
+/// [`markdown_body_lines_collect`] for why.
 fn render_table(rows: &[&str], width: usize) -> (Vec<Line<'static>>, usize) {
     let headers = split_table_row(rows[0]);
     let ncols = headers.len().max(1);
@@ -1282,7 +1548,8 @@ fn render_table(rows: &[&str], width: usize) -> (Vec<Line<'static>>, usize) {
     }
 
     // Natural column width = widest cell's STRIPPED display width (header + body),
-    // min 1 so empty columns still render. Then shrink to fit the pane budget.
+    // min 1 so empty columns still render. It is what the column WANTS; the layout
+    // below decides what it gets.
     let natural: Vec<usize> = (0..ncols)
         .map(|c| {
             let header_w = cell_display_width(&header_cells[c]);
@@ -1294,50 +1561,159 @@ fn render_table(rows: &[&str], width: usize) -> (Vec<Line<'static>>, usize) {
             header_w.max(body_w).max(1)
         })
         .collect();
-    // Reserve the 3-column `" │ "` / `"─┼─"` separators between columns. The
-    // PRIMARY budget is the pane's inner content `width`; `TABLE_MAX_WIDTH` only
-    // caps the other direction (a very wide pane). No scrollbar column is
-    // subtracted: it overlays the block's right border, not a content column.
+    // Reserve the 3-column `" │ "` / `"─┼─"` separators between columns. The ONLY
+    // budget is the pane's inner content `width` — a table is never capped short
+    // of it, so a wide one fills the pane edge to edge and follows a splitter
+    // drag. No scrollbar column is subtracted: it overlays the block's right
+    // border, not a content column.
     let sep_total = 3 * ncols.saturating_sub(1);
-    let budget = width.min(TABLE_MAX_WIDTH).saturating_sub(sep_total);
-    let widths = fit_widths(natural, budget);
 
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    lines.push(table_data_line(
-        &header_cells,
-        &widths,
-        &aligns,
-        base_style().add_modifier(Modifier::BOLD),
-    ));
-    lines.push(table_separator_line(&widths));
-    for row in &body_rows {
-        lines.push(table_data_line(row, &widths, &aligns, base_style()));
-    }
-
-    // Guarantee no row can wrap under `Wrap { trim: false }`.
-    let lines = lines
-        .into_iter()
-        .map(|l| clamp_line_to_width(l, width))
-        .collect();
+    // ONE number governs both the choice and the layout, so a grid is only ever
+    // chosen when its floors are actually affordable inside it.
+    let floors = column_floors(&natural);
+    let min_grid_width = floors.iter().sum::<usize>() + sep_total;
+    let lines = if min_grid_width <= width {
+        render_table_grid(&header_cells, &body_rows, &aligns, natural, &floors, width)
+    } else {
+        render_table_records(&header_cells, &body_rows)
+    };
     (lines, consumed)
 }
 
-/// Build a header/body table row: each cell inline-parsed then truncated + padded
-/// to its column `width` over `cell_style`, joined by DIM `" │ "` column rules.
-fn table_data_line(
+/// The GRID layout: header row, `─┼─` separator, then one block of visual lines
+/// per body row (see [`table_data_lines`]). Columns are shrunk to fit the pane
+/// budget but never below their floor, and an over-wide cell WRAPS down its
+/// column rather than being cut.
+///
+/// Every line here is guaranteed to fit `width`, so the grid can never soft-wrap
+/// under `Wrap { trim: false }` and scatter. That now holds by construction —
+/// grid mode is only entered when the floors fit — and [`clamp_line_to_width`]
+/// stays as the backstop that keeps the guarantee true if the arithmetic above it
+/// ever drifts.
+fn render_table_grid(
+    header_cells: &[String],
+    body_rows: &[Vec<String>],
+    aligns: &[Align],
+    natural: Vec<usize>,
+    floors: &[usize],
+    width: usize,
+) -> Vec<Line<'static>> {
+    let sep_total = 3 * floors.len().saturating_sub(1);
+    let budget = width.saturating_sub(sep_total);
+    let widths = fit_widths(natural, floors, budget);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.extend(table_data_lines(
+        header_cells,
+        &widths,
+        aligns,
+        base_style().add_modifier(Modifier::BOLD),
+    ));
+    lines.push(table_separator_line(&widths));
+    for row in body_rows {
+        lines.extend(table_data_lines(row, &widths, aligns, base_style()));
+    }
+
+    lines
+        .into_iter()
+        .map(|l| clamp_line_to_width(l, width))
+        .collect()
+}
+
+/// The narrow-pane FALLBACK layout: with no grid that can seat every column at
+/// its floor, drop the grid entirely and stack each body row as `Header: value`
+/// lines, separated by a DIM [`RECORD_RULE_WIDTH`] rule.
+///
+/// Each line is an ORDINARY logical line and is deliberately NOT passed through
+/// [`clamp_line_to_width`]: these lines are MEANT to overflow the pane and be
+/// soft-wrapped by the preview's own `Wrap { trim: false }`, exactly as a prose
+/// paragraph is. Clamping them would reintroduce the very cut this layout exists
+/// to remove — and there is no grid left for a wrap to scatter, which is the
+/// whole reason the fallback is safe.
+///
+/// An EMPTY cell contributes no line at all, so a sparse row does not become a
+/// column of bare labels. A table with no body rows has nothing to stack, so its
+/// headers are emitted on their own rather than the table vanishing.
+fn render_table_records(header_cells: &[String], body_rows: &[Vec<String>]) -> Vec<Line<'static>> {
+    if body_rows.is_empty() {
+        return header_cells
+            .iter()
+            .filter(|h| !h.is_empty())
+            .map(|h| Line::from(parse_inline(h, base_style().add_modifier(Modifier::BOLD))))
+            .collect();
+    }
+
+    let rule = "\u{2500}".repeat(RECORD_RULE_WIDTH);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for row in body_rows {
+        let mut record: Vec<Line<'static>> = Vec::new();
+        for (c, cell) in row.iter().enumerate() {
+            if cell.is_empty() {
+                continue;
+            }
+            // The label is the header's marker-STRIPPED text, so it reads `Beta`
+            // rather than `**Beta**` — the same stripping the grid aligns on.
+            let label = header_cells
+                .get(c)
+                .map(|h| spans_display_text(&parse_inline(h, Style::default())))
+                .unwrap_or_default();
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            if !label.is_empty() {
+                spans.push(Span::styled(format!("{label}: "), record_label_style()));
+            }
+            spans.extend(parse_inline(cell, base_style()));
+            record.push(Line::from(spans));
+        }
+        if record.is_empty() {
+            continue; // an all-empty row earns no record and no rule
+        }
+        if !lines.is_empty() {
+            lines.push(Line::from(Span::styled(rule.clone(), table_border_style())));
+        }
+        lines.append(&mut record);
+    }
+    lines
+}
+
+/// Build ONE header/body table row as the N visual lines its tallest cell needs:
+/// each cell is inline-parsed, word-wrapped to its column `width` over
+/// `cell_style` ([`wrap_cell_spans`]) and padded, then the row's lines are joined
+/// by DIM `" │ "` column rules.
+///
+/// CONTINUATION lines carry the rules and the per-column padding exactly as the
+/// first one does, and a cell that ran out of lines contributes a run of spaces —
+/// so every visual line of the row shares one display width and one rule column,
+/// and the grid never scatters. A row always occupies at least one line, even
+/// when every cell in it is empty.
+fn table_data_lines(
     cells: &[String],
     widths: &[usize],
     aligns: &[Align],
     cell_style: Style,
-) -> Line<'static> {
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    for (c, width) in widths.iter().enumerate() {
-        if c > 0 {
-            spans.push(Span::styled(" \u{2502} ".to_string(), table_border_style()));
-        }
-        spans.extend(render_cell_spans(&cells[c], *width, aligns[c], cell_style));
-    }
-    Line::from(spans)
+) -> Vec<Line<'static>> {
+    let wrapped: Vec<Vec<Vec<Span<'static>>>> = widths
+        .iter()
+        .enumerate()
+        .map(|(c, width)| wrap_cell_spans(&cells[c], *width, aligns[c], cell_style))
+        .collect();
+    let height = wrapped.iter().map(Vec::len).max().unwrap_or(0).max(1);
+
+    (0..height)
+        .map(|row| {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            for (c, width) in widths.iter().enumerate() {
+                if c > 0 {
+                    spans.push(Span::styled(" \u{2502} ".to_string(), table_border_style()));
+                }
+                match wrapped[c].get(row) {
+                    Some(line) => spans.extend(line.iter().cloned()),
+                    // This cell is shorter than the row: hold its column open.
+                    None => spans.push(Span::styled(" ".repeat(*width), cell_style)),
+                }
+            }
+            Line::from(spans)
+        })
+        .collect()
 }
 
 /// Build the DIM box-drawing separator row under the header: `─` fill per column,
@@ -1588,9 +1964,16 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    /// A generous preview width for tests that are NOT exercising shrink-to-fit,
-    /// so tables render at their natural width without wrapping or truncation.
-    const WIDE: usize = TABLE_MAX_WIDTH;
+    /// A comfortably wide preview pane for the fixtures whose subject is NOT
+    /// shrink-to-fit, so an ordinary transcript table renders at its natural
+    /// width. A plain test literal, deliberately tied to no production constant:
+    /// nothing caps a table short of its pane, so this number binds these
+    /// fixtures alone and a test that needs another pane just passes one.
+    ///
+    /// It is a comfortable width, NOT a no-wrap guarantee — a cell wider than
+    /// this still wraps and a grid still shrinks to it, which is exactly what
+    /// `overwide_multibyte_cell_wraps_on_grapheme_cluster_boundaries` pins.
+    const WIDE: usize = 96;
 
     fn fixture(folder: &str, file: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1900,27 +2283,337 @@ mod tests {
     }
 
     #[test]
-    fn overwide_multibyte_cell_is_truncated_on_a_char_boundary() {
+    fn overwide_multibyte_cell_wraps_on_grapheme_cluster_boundaries() {
         // A single-column cell far wider than the width budget, built from 2-byte
-        // chars, must truncate with `…` on a CHAR boundary (never a byte slice
-        // mid-scalar) and never panic.
+        // chars, must WRAP onto continuation lines (never be cut) on cluster
+        // boundaries, and never panic.
         let wide = "é".repeat(200);
         let body = format!("| head |\n| --- |\n| {wide} |");
         let lines = markdown_body_lines(&body, WIDE);
-        assert_eq!(lines.len(), 3, "header + separator + 1 body row");
-        let cell = line_text(&lines[2]);
+        // 200 columns of content in a 96-column column: header + separator + the
+        // body row's three visual lines (96 + 96 + 8).
+        assert_eq!(lines.len(), 5, "header + separator + 3 wrapped body lines");
+        let body_text: String = lines[2..].iter().map(line_text).collect();
         assert!(
-            cell.contains('\u{2026}'),
-            "over-wide cell ends with an ellipsis"
+            !body_text.contains('\u{2026}'),
+            "the cell wraps instead of being cut: {body_text}"
+        );
+        assert_eq!(
+            body_text.matches('é').count(),
+            200,
+            "every char of the over-wide cell survived the wrap"
+        );
+        for line in &lines {
+            assert!(
+                display_width(&line_text(line)) <= WIDE,
+                "every grid line still fits the width budget"
+            );
+        }
+    }
+
+    // --- table wrapping: grid mode ----------------------------------------
+
+    /// The display column a line's first `│` column rule sits at, measured in
+    /// DISPLAY columns rather than chars so a double-width cell cannot fake a match.
+    fn rule_col(s: &str) -> Option<usize> {
+        let idx = s.find('\u{2502}')?;
+        Some(display_width(&s[..idx]))
+    }
+
+    #[test]
+    fn narrow_grid_wraps_cells_instead_of_cutting_them() {
+        // Two prose columns at a width that forces both well below their natural
+        // width: every word must still be present, and nothing may be replaced by
+        // an ellipsis.
+        let body = "| Alpha | Beta |\n| --- | --- |\n\
+                    | the quick brown fox | jumps over the lazy dog |";
+        let lines = markdown_body_lines(body, 30);
+        let joined = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            !joined.contains('\u{2026}'),
+            "no cell is cut at a narrow width: {joined}"
+        );
+        for word in ["quick", "brown", "jumps", "lazy", "dog"] {
+            assert!(
+                joined.contains(word),
+                "{word:?} survived the wrap: {joined}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wrapped_grid_row_keeps_its_rules_and_one_display_width() {
+        // A tall row (its cells wrap) plus a short one. The tall row becomes N
+        // visual lines; every one of them keeps the `│` at the same column and
+        // measures the same total width, so the grid never scatters.
+        let body = "| Alpha | Beta |\n| --- | --- |\n\
+                    | the quick brown fox | jumps over the lazy dog |\n| x | y |";
+        let lines = markdown_body_lines(body, 30);
+        assert!(
+            lines.len() > 4,
+            "the tall row spans several visual lines, got {} lines",
+            lines.len()
+        );
+
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        let widths: Vec<usize> = texts.iter().map(|t| display_width(t)).collect();
+        assert!(
+            widths.iter().all(|&w| w == widths[0]),
+            "all grid lines share one display width: {widths:?}"
+        );
+
+        // Every DATA line (index 1 is the `─┼─` separator, which carries `┼` at
+        // that column instead) puts its `│` at one and the same display column.
+        let cols: Vec<Option<usize>> = texts
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 1)
+            .map(|(_, t)| rule_col(t))
+            .collect();
+        assert!(
+            cols[0].is_some() && cols.iter().all(|c| *c == cols[0]),
+            "continuation lines keep the column rule in place: {cols:?}"
+        );
+    }
+
+    #[test]
+    fn a_token_longer_than_its_column_hard_breaks_without_loss() {
+        // A 60-char unbroken token (a path or url) in a column far narrower than
+        // it: word wrap cannot help, so it must HARD-BREAK rather than be cut.
+        // The header cell shares no letter with the token, so counting `a` over
+        // the WHOLE joined output counts the token's chars ALONE: 60 then means
+        // the 60-char token survived whole, and pins no DUPLICATION as well as
+        // no loss.
+        let token = "a".repeat(60);
+        let body = format!("| Url | N |\n| --- | --- |\n| {token} | 1 |");
+        let lines = markdown_body_lines(&body, 20);
+        let joined: String = lines.iter().map(line_text).collect();
+        assert!(
+            !joined.contains('\u{2026}'),
+            "hard-broken, not cut: {joined}"
+        );
+        assert_eq!(
+            joined.matches('a').count(),
+            60,
+            "every char of the over-long token survived: {joined}"
+        );
+    }
+
+    #[test]
+    fn a_wrapped_cell_never_splits_a_grapheme_cluster() {
+        // "é" spelled as `e` + U+0301 (a TWO-scalar cluster) beside a 2-wide emoji.
+        // A wrapper walking chars would strand the combining mark at the head of a
+        // continuation line, changing the summed width of text that did not change
+        // and desyncing the cached wrapped-row count from the painted line.
+        let cell = "e\u{0301}\u{1f600}".repeat(12);
+        let body = format!("| C |\n| --- |\n| {cell} |");
+        let lines = markdown_body_lines(&body, 14);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        let joined: String = texts.concat();
+
+        assert_eq!(
+            joined.matches('\u{1f600}').count(),
+            12,
+            "every emoji survived: {joined:?}"
+        );
+        assert_eq!(
+            joined.matches('\u{0301}').count(),
+            12,
+            "every combining mark survived: {joined:?}"
+        );
+        for t in texts.iter().skip(2) {
+            assert!(
+                !t.starts_with('\u{0301}'),
+                "a continuation line must not open on a stranded combining mark: {t:?}"
+            );
+        }
+        let widths: Vec<usize> = texts.iter().map(|t| display_width(t)).collect();
+        assert!(
+            widths.iter().all(|&w| w == widths[0]),
+            "cluster-safe wrapping keeps every line one width: {widths:?}"
+        );
+    }
+
+    #[test]
+    fn a_wide_pane_is_filled_exactly_and_a_narrow_table_is_not_stretched() {
+        // The pane is the ONLY budget a grid answers to, and it answers in one
+        // direction. Both halves of that are pinned here at a pane far wider than
+        // any test above reaches, because the two are one decision: `fit_widths`
+        // only ever DECREMENTS, so a table wider than the pane comes down to it
+        // exactly, and a table narrower than it is left alone.
+        const PANE: usize = 200;
+
+        // Natural width 150 + 3 + 150 = 303, far past the pane: both columns
+        // shrink until the row measures the pane EDGE TO EDGE. A 197-column
+        // content budget split over two columns plus the 3-column rule is 200 —
+        // no empty gutter beside the table, and no more wrapped rows than the
+        // pane actually forces.
+        let cell = "w".repeat(150);
+        let overwide = format!("| Alpha | Beta |\n| --- | --- |\n| {cell} | {cell} |");
+        let lines = markdown_body_lines(&overwide, PANE);
+        // 150 columns of unbroken content in a ~98-column column hard-breaks onto
+        // two visual lines: header + separator + those 2. Pinned so the width
+        // check below is answering for real lines, not passing over an empty vec.
+        assert_eq!(lines.len(), 4, "header + separator + 2 wrapped body lines");
+        let widths: Vec<usize> = lines.iter().map(|l| display_width(&line_text(l))).collect();
+        assert!(
+            widths.iter().all(|&w| w == PANE),
+            "an over-wide grid fills the pane exactly: {widths:?}"
+        );
+
+        // The other direction: natural width 5 + 3 + 4 = 12 stays 12. Stretching
+        // it could not save a line — nothing wraps at natural width — and would
+        // only open a canyon between two columns.
+        let narrow = "| Alpha | Beta |\n| --- | --- |\n| x | y |";
+        let narrow_lines = markdown_body_lines(narrow, PANE);
+        // Nothing wraps at natural width, so the row stays one visual line:
+        // header + separator + that 1.
+        assert_eq!(narrow_lines.len(), 3, "header + separator + 1 body row");
+        let narrow_widths: Vec<usize> = narrow_lines
+            .iter()
+            .map(|l| display_width(&line_text(l)))
+            .collect();
+        assert!(
+            narrow_widths.iter().all(|&w| w == 12),
+            "a narrow grid keeps its content width, never padded out to the pane: \
+             {narrow_widths:?}"
+        );
+    }
+
+    // --- table wrapping: the record-mode threshold -------------------------
+
+    #[test]
+    fn a_grid_that_cannot_reach_its_floor_falls_back_to_stacked_records() {
+        // 5 columns of WIDE content at 60: every column wants more than the floor,
+        // so `min_grid_width` is 5*10 + 4*3 = 62 > 60 and the grid is abandoned.
+        let body = "| Alpha | Beta | Gamma | Delta | Epsilon |\n\
+                    | --- | --- | --- | --- | --- |\n\
+                    | first value | second value | third value | \
+                    fourth value | fifth value |";
+        let lines = markdown_body_lines(body, 60);
+        let joined = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            !joined.contains('\u{2502}') && !joined.contains('\u{253c}'),
+            "no grid chrome in record mode: {joined}"
         );
         assert!(
-            display_width(&cell) <= WIDE,
-            "truncated to fit the width budget"
+            !joined.contains('\u{2026}'),
+            "nothing is cut in record mode: {joined}"
         );
         assert!(
-            cell.starts_with('é'),
-            "kept the leading multi-byte chars intact"
+            joined.contains("Gamma: third value"),
+            "a record reads `Header: value`: {joined}"
         );
+    }
+
+    #[test]
+    fn a_narrow_content_grid_is_not_dumped_into_records() {
+        // The other side of the threshold, and the reason it is a per-column
+        // `min(natural, floor)` SUM rather than the naive `cols * floor` product:
+        // 5 short columns want 3+4+5+3+4 = 19 content columns plus 12 of separators
+        // = 31, which fits a 60-column pane with room to spare. The product
+        // (5*10 + 12 = 62) would dump this common table into a record dump.
+        let body = "| abc | abcd | abcde | xyz | wxyz |\n\
+                    | --- | --- | --- | --- | --- |\n\
+                    | 1 | 2 | 3 | 4 | 5 |";
+        let lines = markdown_body_lines(body, 60);
+        let joined = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            joined.contains('\u{2502}') && joined.contains('\u{253c}'),
+            "a short-celled 5-column table stays a grid at 60: {joined}"
+        );
+    }
+
+    #[test]
+    fn the_record_fallback_switch_points_are_pinned_at_a_62_column_pane() {
+        // Columns whose natural width all EXCEED the floor, so each contributes a
+        // full `TABLE_MIN_COL_WIDTH`. At a 62-column preview (a 120-column terminal
+        // split in half) the switch lands between 5 and 6 columns:
+        //   4 cols -> 4*10 + 3*3 = 49 <= 62  grid
+        //   5 cols -> 5*10 + 4*3 = 62 <= 62  grid (it fits EXACTLY)
+        //   6 cols -> 6*10 + 5*3 = 75 >  62  record
+        // and one column narrower is all it takes to tip 5 columns over.
+        fn table_of(ncols: usize) -> String {
+            let head = (0..ncols).map(|_| "wide header").collect::<Vec<_>>();
+            let delim = (0..ncols).map(|_| "---").collect::<Vec<_>>();
+            let body = (0..ncols).map(|_| "wide value!!").collect::<Vec<_>>();
+            format!(
+                "| {} |\n| {} |\n| {} |",
+                head.join(" | "),
+                delim.join(" | "),
+                body.join(" | ")
+            )
+        }
+        fn is_grid(body: &str, width: usize) -> bool {
+            markdown_body_lines(body, width)
+                .iter()
+                .any(|l| line_text(l).contains('\u{2502}'))
+        }
+
+        assert!(is_grid(&table_of(4), 62), "4 columns fit 62 as a grid");
+        assert!(
+            is_grid(&table_of(5), 62),
+            "5 columns fit 62 EXACTLY, so the grid is kept"
+        );
+        assert!(
+            !is_grid(&table_of(5), 61),
+            "one column narrower and 5 columns tip into records"
+        );
+        assert!(
+            !is_grid(&table_of(6), 62),
+            "6 columns cannot reach the floor at 62"
+        );
+    }
+
+    #[test]
+    fn a_record_omits_its_empty_cells_and_labels_the_rest() {
+        // A sparse row must not become a column of bare labels, so an EMPTY cell
+        // contributes no line at all. Records are separated by a DIM `─` rule.
+        let body = "| Alpha | Beta | Gamma | Delta | Epsilon |\n\
+                    | --- | --- | --- | --- | --- |\n\
+                    | first value | | third value | | fifth value |\n\
+                    | another one | second here | | fourth here | last value |";
+        let lines = markdown_body_lines(body, 40);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        let joined = texts.join("\n");
+        assert!(
+            !joined.contains("Beta: \n") && !joined.contains("Delta: \n"),
+            "an empty cell emits no line at all: {joined}"
+        );
+        assert_eq!(
+            texts.iter().filter(|t| t.starts_with("Beta:")).count(),
+            1,
+            "only the row that HAS a Beta value labels one: {joined}"
+        );
+        assert!(
+            texts.iter().any(|t| t.starts_with('\u{2500}')),
+            "a dim rule separates two records: {joined}"
+        );
+    }
+
+    #[test]
+    fn a_header_only_table_in_record_mode_still_shows_its_headers() {
+        // A header + delimiter with no body rows has nothing to STACK, so the
+        // record layout would emit nothing at all and the table would vanish from
+        // the transcript — a content loss in the one layout that exists because
+        // nothing may be lost. With no records to label, the headers ARE what is
+        // left to show.
+        // 6 columns of 4-to-7 natural width: 30 + 5 * 3 = 45 > 40, so this routes
+        // to record mode rather than proving the grid's behaviour by accident.
+        let body = "| Alpha | Beta | Gamma | Delta | Epsilon | Zeta |\n\
+                    | --- | --- | --- | --- | --- | --- |";
+        let lines = markdown_body_lines(body, 40);
+        let joined = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            !joined.contains('\u{2502}') && !joined.contains('\u{253c}'),
+            "6 columns at 40 route to record mode, so no grid chrome: {joined}"
+        );
+        for head in ["Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta"] {
+            assert!(
+                joined.contains(head),
+                "{head:?} survived a body-less table: {joined}"
+            );
+        }
     }
 
     // --- inline links + autolinks -----------------------------------------
@@ -2160,15 +2853,28 @@ mod tests {
         );
     }
 
+    /// The 3-column fixture both narrow-width tests below are stated over. Each
+    /// column's natural width is 7 (`1111111`), so `min_grid_width` is
+    /// `7 + 7 + 7 + 2 * 3 = 27`: at 27 columns or more it is a GRID, below that the
+    /// stacked record layout.
+    const NARROW_TABLE: &str = "| alpha | beta | gamma |\n| --- | --- | --- |\n\
+                                | 1111111 | 2222222 | 3333333 |\n\
+                                | 4444444 | 5555555 | 6666666 |";
+
     #[test]
-    fn narrow_width_table_never_exceeds_the_pane_width() {
-        // A wide 3-column table rendered into a small inner width must shrink and
-        // truncate so EVERY produced line fits within `width` — guaranteeing it
-        // can never soft-wrap under `Wrap { trim: false }` and scatter the grid.
-        let body = "| alpha | beta | gamma |\n| --- | --- | --- |\n\
-                    | 1111111 | 2222222 | 3333333 |\n| 4444444 | 5555555 | 6666666 |";
-        for width in [8usize, 16, 24, 30] {
-            let lines = markdown_body_lines(body, width);
+    fn narrow_width_grid_table_never_exceeds_the_pane_width() {
+        // In GRID mode every produced line must fit within `width` — guaranteeing
+        // it can never soft-wrap under `Wrap { trim: false }` and scatter the grid.
+        // Re-scoped to grid mode: below `min_grid_width` (27) the same table routes
+        // to record mode, where a line is ALLOWED to exceed the width (see
+        // `record_mode_lines_may_exceed_the_pane_width`).
+        for width in [27usize, 30, 48, 96] {
+            let lines = markdown_body_lines(NARROW_TABLE, width);
+            let joined = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+            assert!(
+                joined.contains('\u{2502}'),
+                "width {width} must still be a grid, or this proves nothing: {joined}"
+            );
             for line in &lines {
                 let w = display_width(&line_text(line));
                 assert!(
@@ -2177,6 +2883,30 @@ mod tests {
                     line_text(line)
                 );
             }
+        }
+    }
+
+    #[test]
+    fn record_mode_lines_may_exceed_the_pane_width() {
+        // The companion to the grid guarantee above, and the INVERSE of it. Record
+        // lines are ordinary logical lines that ratatui's `Wrap { trim: false }`
+        // wraps, so they are deliberately NOT clamped — clamping them would
+        // reintroduce exactly the cut the record layout exists to remove.
+        for width in [8usize, 16, 24] {
+            let lines = markdown_body_lines(NARROW_TABLE, width);
+            let joined = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+            assert!(
+                !joined.contains('\u{2502}') && !joined.contains('\u{253c}'),
+                "width {width} routes to record mode, so no grid chrome: {joined}"
+            );
+            assert!(
+                !joined.contains('\u{2026}'),
+                "nothing is cut at width {width}: {joined}"
+            );
+            assert!(
+                lines.iter().any(|l| display_width(&line_text(l)) > width),
+                "a record line is allowed to exceed width {width}: {joined}"
+            );
         }
     }
 

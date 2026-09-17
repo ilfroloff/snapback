@@ -34,7 +34,7 @@ shell out to, or assume node.
 | Home dir | `dirs` | `=6.0.0` | resolves the default store root |
 | Errors | `anyhow` | `=1.0.103` | propagation in the core + TUI |
 | Parallel scan | `rayon` | `=1.12.0` | per-file parse in `SessionStore::load` |
-| Grapheme clusters | `unicode-segmentation` | `=1.13.3` | extended cluster boundaries so the search-match highlight's span split (`match_runs` in `src/tui/view.rs`) never cuts a cluster: `Line::width` sums a CONTEXTUAL width PER SPAN, so severing an emoji from its VS16 or skin-tone modifier changes the summed width of unchanged text and desyncs the preview's cached widths and wrapped-row count from the painted line; already transitive via `ratatui-textarea` / `ratatui-core` / `unicode-truncate` |
+| Grapheme clusters | `unicode-segmentation` | `=1.13.3` | extended cluster boundaries so NEITHER per-span split ever cuts a cluster — the search-match highlight's (`match_runs` in `src/tui/view.rs`) nor the table cell wrap's (`wrap_spans` in `src/store/preview.rs`): `Line::width` sums a CONTEXTUAL width PER SPAN, so severing an emoji from its VS16 or skin-tone modifier changes the summed width of unchanged text and desyncs the preview's cached widths and wrapped-row count from the painted line; already transitive via `ratatui-textarea` / `ratatui-core` / `unicode-truncate` |
 | Display width | `unicode-width` | `=0.2.2` | terminal COLUMN count (not char count) for `store::preview`'s markdown table cells, so inline markers and CJK/emoji keep columns aligned; already transitive via `ratatui` |
 
 One **dev-dependency**, `nucleo` (`=0.5.0`): the membership ORACLE the parity test
