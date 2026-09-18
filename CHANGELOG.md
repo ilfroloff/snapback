@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.2](https://github.com/ilfroloff/snapback/compare/v0.8.1...v0.8.2) - 2026-09-18
+
+### Fixed
+
+- keep a mouse wheel from moving the list out from under a draft
+- *(store/preview)* separate wrapped table rows with a rule
+- *(store/preview)* stop the preview from cutting GFM table cells
+
+### Other
+
+- stop tracking IDE-local project settings
+
 ## [0.8.1](https://github.com/ilfroloff/snapback/compare/v0.8.0...v0.8.1) - 2026-08-29
 
 ### Fixed
