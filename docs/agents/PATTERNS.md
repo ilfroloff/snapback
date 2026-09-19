@@ -215,6 +215,19 @@ Two invariants are easy to break and expensive to get wrong:
 preview marks all take the same atoms from it — never re-split a query somewhere
 else.
 
+`last_atom_start` is the ONE exception, and it proves the rule rather than
+bending it. The word-delete keys need a BOUNDARY (the byte index one press
+truncates to), not a list, so it scans instead of splitting and returns an index
+— it never produces atoms for anyone to consume. It still walks the same space
+and backslash rule, including the escape rule AS WRITTEN: a space is escaped when
+the character immediately before it is a backslash, NOT on backslash parity. So
+it lives in `search.rs` beside `gate_atoms` and the two MUST change together;
+`truncating_at_the_boundary_drops_exactly_one_atom` pins them to each other by
+asserting `gate_atoms(before).len() - 1 == gate_atoms(truncated).len()`, which is
+what turns "keep these in sync" from a comment into a failing test. A delete that
+split on a boundary the filter does not recognize would leave the query saying
+something the user cannot see.
+
 `nucleo` earns its dev-dependency as the **oracle**, and nothing else:
 `membership_matches_nucleo_across_query_shapes_and_modes` compares this module's
 match set against nucleo's own, so the per-atom smart-case rule is proved rather
@@ -803,10 +816,18 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    [DOMAIN.md](DOMAIN.md#background-agent-draft-pane-ctrl-n) for the two the card
    carries.
 
-Add a keybinding by extending the `Action` enum + `key_to_action` + `apply_action`
-and covering it with a `key_to_action` unit test. Then satisfy the KEEP KEY DOCS IN
-SYNC rule in [AGENTS.md](../../AGENTS.md), which owns the list of surfaces that
-must agree — do not re-enumerate them here.
+Add a keybinding by extending the `Action` enum + `key_to_action` + `apply_action`.
+Cover it with a `key_to_action` unit test AND one test that presses the key through
+`handle_event`. Both, because they pin different things and neither implies the
+other: the decode test stops at the `Action`, and a handler test that calls the
+`App` method directly starts after it, so the `apply_action` arm BETWEEN them is
+pinned by nothing. That gap is not hypothetical — the word-delete binding
+(`Action::BackspaceWord`) was landed with both halves covered, and swapping its arm
+from `pop_query_word()` to `pop_query_char()` left the ENTIRE suite green while the
+feature silently deleted one character per press, the exact defect it existed to
+fix. A key the user presses is the unit; assert the state the press produced.
+Then satisfy the KEEP KEY DOCS IN SYNC rule in [AGENTS.md](../../AGENTS.md), which
+owns the list of surfaces that must agree — do not re-enumerate them here.
 
 A binding that is only meaningful sometimes is **CONDITIONAL, and falls through**
 rather than going inert. `key_to_action` takes the conditions as parameters
@@ -822,6 +843,20 @@ keyboard protocol and clears it on every board (re)entry
 composed character that types junk into the query, and a split `ESC` read
 surfaces as a bare `Esc` — which quits the board. `Shift` rides the ordinary
 `CSI 1;2<final>` encoding crossterm already decodes into a `KeyModifiers::SHIFT`.
+
+`Alt` is bindable in ONE narrow case: the binding MIRRORS a gesture the compose
+editor already answers, and it ships alongside a non-`Alt` key for the same
+action, so a terminal that composes Option still leaves the user a working key.
+The word-delete set is the instance — `Alt-Backspace` and `Alt-H` are two of the
+three keys `TextArea::input` maps to `delete_word`, and `Ctrl-W` is the third,
+needing no `Alt` at all. Binding all three is what makes the board and the reply
+box answer the identical set whatever the terminal sends for Option. Two ordering
+constraints come with it, both pinned by tests in `update.rs`: an `alt`-guarded
+arm must sit ABOVE the unguarded arm for the same `KeyCode` (a guarded
+`Backspace` placed below the plain one never fires, and the miss is invisible —
+it just deletes one character), and the `KeyCode::Char(_) if alt => Ignore`
+catch-all must sit BELOW every bound `Alt` printable while still existing, since
+it is what stops an unbound `Alt-J` from typing `j` into the query.
 
 ## 11. Status-line ownership
 

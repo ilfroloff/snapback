@@ -79,6 +79,11 @@ KEYS:
                   taking notches — a wheel over it does nothing, so the session
                   you are writing to cannot slide away under the pointer.
                   Anywhere else the wheel still scrolls the transcript
+    Backspace     delete the last query character
+    Alt+Backspace delete the last query WORD — one whole search atom, so a
+                  path or a branch name goes in one press. Ctrl-W and Alt+H do
+                  the same, so it works whatever your terminal sends for
+                  Option, and it is the same set the reply box word-deletes on
     paste         your terminal's own paste (Cmd/Ctrl-V, middle-click) is inserted
                   as TEXT: into a compose draft at the cursor, newlines and all, or
                   appended to the search query with newlines flattened to spaces.

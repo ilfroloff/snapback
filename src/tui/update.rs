@@ -41,6 +41,7 @@
 //! | `Ctrl-T` / `Ctrl-E`, `Home` / `End` | jump the preview to top / bottom (always) |
 //! | `Shift-Up` / `Shift-Down` | scroll the preview onto the previous / next MARKED line, but only while the query marks something in the previewed transcript; with nothing marked they fall through to plain selection movement. One stop per marked LINE, not per occurrence — a line saying the query twice is marked, and stopped at, once |
 //! | `Backspace` | delete the last query character |
+//! | `Alt-Backspace` / `Ctrl-W` / `Alt-H` | delete the last query ATOM — one whole search word, not one character, so a path or a branch name goes in a single press. THREE keys because `TextArea::input` word-deletes on all three in the compose box: binding the same set here is what makes the board and the reply box answer identically, whatever the user's option-as-meta setting turns `Alt-Backspace` into |
 //! | printable char | type-to-search (append to the query) |
 //! | terminal paste | inserted as TEXT — never as keystrokes (see below) |
 //! | `Esc` / `Ctrl-C` | quit (always) |
@@ -151,6 +152,17 @@ pub enum Action {
     Insert(char),
     /// Delete the last query character.
     Backspace,
+    /// Delete the last search ATOM from the query — one whole word, not one
+    /// character (`Alt-Backspace` / `Ctrl-W` / `Alt-H`).
+    ///
+    /// Three keys because the compose box answers all three: `TextArea::input`
+    /// maps each of them to its own word delete, so binding the same set here is
+    /// what makes the board and the reply box agree on every terminal, whatever
+    /// the user's option-as-meta setting turns `Alt-Backspace` into. The boundary
+    /// is the search atom ([`search::last_atom_start`](crate::search::last_atom_start)),
+    /// NOT the widget's notion of a word — a path or a branch name is one thing
+    /// the user typed and one press should take it.
+    BackspaceWord,
     /// Enter the `Ctrl-X` leader chord: arm [`App::pending_chord`] so the NEXT key
     /// routes through the pure [`chord_key`] machine (hide / hard-delete /
     /// show-hidden / cancel) instead of the board.
@@ -262,6 +274,12 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool
             // convenient) — same actions, same follow-bottom semantics.
             KeyCode::Char('t') | KeyCode::Char('T') => Action::PreviewTop,
             KeyCode::Char('e') | KeyCode::Char('E') => Action::PreviewBottom,
+            // Word-delete (readline's `Ctrl-W`, 0x17 ETB), bound INSIDE this
+            // block because it early-returns: an arm for it in the lower match
+            // could never be reached. It is the one word-delete key that needs no
+            // Alt at all, so it works on a terminal configured to send Option as
+            // a composed character rather than as Meta.
+            KeyCode::Char('w') | KeyCode::Char('W') => Action::BackspaceWord,
             _ => Action::Ignore,
         };
     }
@@ -297,11 +315,24 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool
         KeyCode::Enter => Action::Resume { fork: false },
         KeyCode::Esc => Action::Quit,
         KeyCode::Tab => Action::ToggleSearchMode,
+        // Word-delete on the macOS gesture. This arm MUST sit above the plain
+        // `Backspace` arm below: match arms are tried in order and the unguarded
+        // one matches `Alt-Backspace` too, so the other order would delete a
+        // single character and look like it had worked.
+        KeyCode::Backspace if alt => Action::BackspaceWord,
         KeyCode::Backspace => Action::Backspace,
-        KeyCode::Char(c) if alt => {
-            let _ = c;
-            Action::Ignore
-        }
+        // The third word-delete key, bound for the same reason as the other two:
+        // it is in the set `TextArea::input` maps to a word delete, so the reply
+        // box already answers it and the board must answer it identically.
+        // Guarded on `alt` and therefore above the catch-all below, which would
+        // otherwise swallow it.
+        KeyCode::Char('h' | 'H') if alt => Action::BackspaceWord,
+        // Every OTHER alt-modified printable is swallowed rather than typed. An
+        // `Alt`-modified key is a GESTURE the user aimed at some binding, not
+        // text — inserting the bare letter would answer `Alt-J` by typing `j`
+        // into the query, which is both wrong and invisible. Swallowing keeps the
+        // unbound half of the Alt namespace inert and free to bind later.
+        KeyCode::Char(_) if alt => Action::Ignore,
         KeyCode::Char(c) => Action::Insert(c),
         _ => Action::Ignore,
     }
@@ -1012,6 +1043,10 @@ fn apply_action(app: &mut App, action: Action) -> Outcome {
             app.pop_query_char();
             Outcome::Continue
         }
+        Action::BackspaceWord => {
+            app.pop_query_word();
+            Outcome::Continue
+        }
         Action::Chord => {
             // Arm the leader chord; `handle_event` routes the next key through
             // `handle_chord_key` before it can reach the board or the query.
@@ -1652,6 +1687,20 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::SHIFT)
     }
 
+    /// The ALT-modified form a terminal in option-as-meta mode sends: the ESC
+    /// prefix crossterm folds back into [`KeyModifiers::ALT`] (`ESC 0x7F` for
+    /// `Alt-Backspace`, `ESC h` for `Alt-H`).
+    fn alt(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::ALT)
+    }
+
+    /// `Ctrl-Shift-<key>`: the modifier set a terminal reports when the shifted
+    /// letter is held with control. Both this and the plain-CONTROL uppercase
+    /// form reach the same arm, which is what the `w`/`W` pattern is for.
+    fn ctrl_shift(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+    }
+
     /// A synthetic session addressable by id (cwd/file are not exercised by the
     /// routing tests, which assert overlay STATE rather than a real hand-off).
     fn session(id: &str) -> Session {
@@ -1823,6 +1872,14 @@ mod tests {
         handle_event(
             app,
             AppEvent::Input(Event::Key(ctrl(code))),
+            &mut store_at(Path::new("/tmp")),
+        )
+    }
+
+    fn press_alt(app: &mut App, code: KeyCode) -> Outcome {
+        handle_event(
+            app,
+            AppEvent::Input(Event::Key(alt(code))),
             &mut store_at(Path::new("/tmp")),
         )
     }
@@ -4399,6 +4456,121 @@ mod tests {
             key_to_action(key(KeyCode::Backspace), false, false),
             Action::Backspace
         );
+    }
+
+    /// All three word-delete keys decode to [`Action::BackspaceWord`], and plain
+    /// `Backspace` still decodes to [`Action::Backspace`].
+    ///
+    /// The contrast in the last block is the whole test. `Alt-Backspace` is
+    /// matched by the UNGUARDED `KeyCode::Backspace` arm too, so the two arms
+    /// differ only in ORDER: with the guarded one below, every assertion here
+    /// still compiles and `Alt-Backspace` quietly deletes ONE CHARACTER — the
+    /// exact failure this feature exists to fix, and one that looks like it
+    /// worked. Asserting both directions is what makes the order observable.
+    ///
+    /// `Ctrl-W` is asserted because it lives inside the `ctrl` early-return
+    /// block; the same arm written in the lower match would never be reached.
+    /// Its shifted forms are both covered — a terminal may report `Ctrl-Shift-W`
+    /// as the bare uppercase char or with SHIFT alongside CONTROL.
+    ///
+    /// Every case runs with `query_empty` both ways: a word delete is a deletion
+    /// whether or not anything is there to delete, so none of these keys may
+    /// ever grow a query gate.
+    #[test]
+    fn every_word_delete_key_maps_to_backspace_word() {
+        for empty in [true, false] {
+            // The macOS gesture, ESC 0x7F.
+            assert_eq!(
+                key_to_action(alt(KeyCode::Backspace), empty, false),
+                Action::BackspaceWord
+            );
+            // readline's Ctrl-W (0x17), needing no Alt at all.
+            assert_eq!(
+                key_to_action(ctrl(KeyCode::Char('w')), empty, false),
+                Action::BackspaceWord
+            );
+            assert_eq!(
+                key_to_action(ctrl(KeyCode::Char('W')), empty, false),
+                Action::BackspaceWord
+            );
+            assert_eq!(
+                key_to_action(ctrl_shift(KeyCode::Char('W')), empty, false),
+                Action::BackspaceWord
+            );
+            // The third key `TextArea::input` maps to a word delete, so the
+            // board answers the same set the reply box does.
+            assert_eq!(
+                key_to_action(alt(KeyCode::Char('h')), empty, false),
+                Action::BackspaceWord
+            );
+            assert_eq!(
+                key_to_action(alt(KeyCode::Char('H')), empty, false),
+                Action::BackspaceWord
+            );
+
+            // ...and the unmodified key is untouched: one character, as always.
+            assert_eq!(
+                key_to_action(key(KeyCode::Backspace), empty, false),
+                Action::Backspace
+            );
+        }
+    }
+
+    /// An `Alt`-modified printable with no binding is SWALLOWED, never typed.
+    ///
+    /// The bound `Alt-H` above and this are the two halves of one rule: the
+    /// catch-all arm must be reachable for the unbound half of the namespace
+    /// (`Alt-J` must not type `j` into the query) and must NOT be reached for
+    /// the bound half. The sibling test owns the second half — hoisting the
+    /// catch-all above `Char('h' | 'H') if alt` fails THERE, on `Alt-H`. This
+    /// test owns the first: delete the catch-all outright and nothing else in
+    /// the suite notices, because `Alt-J` then falls through to `Char(c)` and
+    /// types a bare `j` into the query.
+    #[test]
+    fn an_unbound_alt_printable_is_ignored_rather_than_typed() {
+        for empty in [true, false] {
+            assert_eq!(
+                key_to_action(alt(KeyCode::Char('j')), empty, false),
+                Action::Ignore
+            );
+            assert_eq!(
+                key_to_action(alt(KeyCode::Char('z')), empty, false),
+                Action::Ignore
+            );
+        }
+    }
+
+    /// A word-delete key pressed END TO END removes an ATOM, not a character.
+    ///
+    /// The decode tests above stop at [`Action::BackspaceWord`] and the `App`
+    /// tests start at `pop_query_word`, which leaves the WIRE between them — the
+    /// `apply_action` arm — pinned by nothing: swap its body for
+    /// `app.pop_query_char()` and both halves still pass while the feature ships
+    /// deleting one character per press, the exact defect it exists to fix. The
+    /// contrast assertion names that impostor result (`alpha bet`) so the failure
+    /// says which way the wire went wrong.
+    ///
+    /// Driven through `handle_event` rather than `apply_action` directly because
+    /// `apply_action` is private to this module's routing and the keypress is the
+    /// thing a user actually performs; all three keys go through the one arm, so
+    /// `Alt-Backspace` and `Ctrl-W` here cover it from both match blocks.
+    #[test]
+    fn a_word_delete_keypress_removes_a_whole_atom_from_the_query() {
+        for press_word_delete in [
+            (|app: &mut App| press_alt(app, KeyCode::Backspace)) as fn(&mut App) -> Outcome,
+            |app: &mut App| press_ctrl(app, KeyCode::Char('w')),
+        ] {
+            let mut app = app_with("idle", None);
+            app.push_query_str("alpha beta");
+
+            press_word_delete(&mut app);
+
+            assert_eq!(
+                app.query, "alpha ",
+                "the keypress must reach `pop_query_word`, not `pop_query_char` \
+                 (which would leave `alpha bet`)"
+            );
+        }
     }
 
     #[test]

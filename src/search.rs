@@ -1080,6 +1080,44 @@ fn gate_atoms(query: &str) -> Vec<String> {
     atoms
 }
 
+/// The BYTE index `query` must be truncated to in order to drop exactly one atom
+/// — the boundary behind the word-delete keys (`Alt-Backspace` / `Ctrl-W` /
+/// `Alt-H`, see [`crate::tui::update::Action::BackspaceWord`]).
+///
+/// Skip the trailing spaces (they belong to the atom being deleted, not to the
+/// one before it), then scan back to the previous UNESCAPED space and return the
+/// index just after it; `0` when there is no such space, so the whole query goes.
+///
+/// It MIRRORS [`gate_atoms`] and the two must change together. A delete that
+/// split on a boundary the filter does not recognize would leave the query
+/// saying something the user cannot see — half an atom is still an atom to the
+/// matcher. That mirroring includes the escape rule AS WRITTEN: like
+/// [`gate_atoms`], a space is escaped when the character IMMEDIATELY before it is
+/// a backslash, NOT when an odd number of backslashes precedes it. So `foo\ bar`
+/// is ONE atom here exactly as it is there, and a query ending `\\ ` is treated
+/// as escaped by both. Do not "fix" the parity in one of them alone.
+///
+/// Scanning bytes is safe for the same reason the split above scans chars: ` `
+/// and `\` are ASCII, and no byte of a multi-byte UTF-8 sequence is ever ASCII,
+/// so every index this returns lands on a char boundary.
+pub(crate) fn last_atom_start(query: &str) -> usize {
+    let bytes = query.as_bytes();
+
+    let mut end = bytes.len();
+    while end > 0 && bytes[end - 1] == b' ' {
+        end -= 1;
+    }
+
+    let mut i = end;
+    while i > 0 {
+        i -= 1;
+        if bytes[i] == b' ' && (i == 0 || bytes[i - 1] != b'\\') {
+            return i + 1;
+        }
+    }
+    0
+}
+
 /// Lowercase `text` PER CHAR, keeping any char whose lowercase form would change
 /// its UTF-8 byte length.
 ///
@@ -2454,6 +2492,59 @@ mod tests {
         assert_eq!(gate_atoms(r"foo\ bar"), vec!["foo bar"]);
         // A stray backslash stays literal in the atom, exactly as nucleo keeps it.
         assert_eq!(gate_atoms(r"a\b"), vec![r"a\b".to_string()]);
+    }
+
+    /// `last_atom_start` returns the byte index one word-delete truncates to.
+    ///
+    /// The cases are the shapes a real query ends in, and each pins a separate
+    /// clause: a plain boundary, the trailing-space run the deleted atom left
+    /// behind, a single atom, nothing at all, and an ESCAPED space — which is
+    /// inside one atom, not a boundary, so the whole phrase goes in one press.
+    #[test]
+    fn last_atom_start_finds_the_boundary_of_the_final_atom() {
+        // `alpha beta` -> `alpha ` : the space itself survives, so a second
+        // press has the trailing-space run below to chew through.
+        assert_eq!(last_atom_start("alpha beta"), 6);
+        // Trailing spaces belong to the atom being deleted, not to the one
+        // before it: skipping them is what stops a press from doing nothing.
+        assert_eq!(last_atom_start("alpha   "), 0);
+        // One atom and no boundary behind it: the whole query goes.
+        assert_eq!(last_atom_start("alpha"), 0);
+        assert_eq!(last_atom_start(""), 0);
+        // An escaped space is INSIDE the atom `foo bar`, so there is no boundary
+        // to stop at and one press clears the phrase.
+        assert_eq!(last_atom_start(r"foo\ bar"), 0);
+    }
+
+    /// The behavioural contract the boundary exists to keep: truncating there
+    /// drops EXACTLY ONE atom, as [`gate_atoms`] counts atoms.
+    ///
+    /// This is the mirror assertion. `last_atom_start` and `gate_atoms` are two
+    /// separate scanners over the same rule, so a change to either that the
+    /// other did not follow shows up here as an off-by-one — including the case
+    /// the doc comments single out, where "escaped" means "one backslash
+    /// immediately before" in both rather than backslash PARITY in one of them.
+    ///
+    /// It lives here rather than in the `App` tests the word-delete key routes
+    /// through because `gate_atoms` is private to this module, and deliberately
+    /// so: re-splitting a query anywhere else is the drift this test guards
+    /// against. `App::pop_query_word` is covered on its own side by the query
+    /// text it leaves behind.
+    #[test]
+    fn truncating_at_the_boundary_drops_exactly_one_atom() {
+        for query in ["alpha beta", "alpha   ", r"foo\ bar", "  lead   trail  "] {
+            let before = gate_atoms(query);
+            assert!(
+                !before.is_empty(),
+                "premise: {query:?} must have an atom to drop"
+            );
+            let after = gate_atoms(&query[..last_atom_start(query)]);
+            assert_eq!(
+                before.len() - 1,
+                after.len(),
+                "one press over {query:?} must drop one atom: {before:?} -> {after:?}"
+            );
+        }
     }
 
     /// `atoms_match` requires every atom as a BYTE substring (not a subsequence)

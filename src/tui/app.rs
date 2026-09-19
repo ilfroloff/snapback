@@ -27,7 +27,7 @@ use crate::agents::ReportedAgent;
 use crate::defined_agents::{self, DefinedAgent};
 use crate::{config, delete, hidden};
 
-use crate::search::{MarkScratch, SearchIndex, SearchMode};
+use crate::search::{self, MarkScratch, SearchIndex, SearchMode};
 use crate::store::lineage::{self, LineageKey};
 use crate::store::{preview, Reload, Session};
 // The scope predicate and the worktree resolver MUST canonicalize paths the same
@@ -1715,6 +1715,28 @@ impl App {
         if self.query.pop().is_some() {
             self.apply_query_change();
         }
+    }
+
+    /// Delete the last search ATOM from the query and re-filter ONCE — the
+    /// word-delete sibling of [`pop_query_char`](Self::pop_query_char).
+    ///
+    /// The boundary is [`search::last_atom_start`], which mirrors the splitter the
+    /// filter itself uses, so one press removes exactly what the user sees as one
+    /// word of the query. Truncating in ONE step rather than looping
+    /// `pop_query_char` is the same economy [`push_query_str`](Self::push_query_str)
+    /// documents: `set_query` rebuilds the pattern and the per-atom finders on
+    /// every call, and this is ONE user action, so it pays that rebuild once
+    /// instead of once per deleted character.
+    ///
+    /// Nothing to remove (an already-empty query) returns without re-filtering at
+    /// all — a no-op keypress must not move the preview or the selection.
+    pub fn pop_query_word(&mut self) {
+        let boundary = search::last_atom_start(&self.query);
+        if boundary == self.query.len() {
+            return;
+        }
+        self.query.truncate(boundary);
+        self.apply_query_change();
     }
 
     /// Toggle name-only vs. name+content search and re-filter.
@@ -5899,6 +5921,144 @@ mod tests {
             visible_ids(&app),
             vec!["alpha-two"],
             "the appended atom cuts `alpha-one`, which matches only the first two"
+        );
+    }
+
+    // --- word-delete (one ATOM per press) ----------------------------------
+
+    /// Three rows whose labels differ in the atoms a word-delete uncovers:
+    /// `alpha-beta` carries both `alpha` and `beta`, `alpha-solo` only `alpha`,
+    /// `gamma` neither. Descending timestamps fix the display order, so the
+    /// assertions below can name rows rather than count them.
+    fn word_delete_board() -> App {
+        app_all(vec![
+            session_ts("alpha-beta", "repo", Some("main"), "/tmp/a", 300),
+            session_ts("alpha-solo", "repo", Some("main"), "/tmp/b", 200),
+            session_ts("gamma", "repo", Some("main"), "/tmp/c", 100),
+        ])
+    }
+
+    /// One press drops exactly one ATOM — and re-filters, which is the half that
+    /// makes it a feature rather than a string edit.
+    ///
+    /// Each case pairs the query text with the LIST it produces, because the two
+    /// can disagree: truncating `self.query` without going through the query
+    /// funnel leaves every text assertion here passing while the board still
+    /// shows the rows the deleted atom was excluding. The atom COUNT itself is
+    /// pinned against the filter's own splitter in
+    /// `search::truncating_at_the_boundary_drops_exactly_one_atom`, next to the
+    /// private `gate_atoms` it must agree with.
+    #[test]
+    fn a_word_delete_drops_one_atom_and_refilters_the_board() {
+        // A plain boundary: the last atom goes, the one before it stays, and the
+        // row `beta` was excluding comes back.
+        let mut app = word_delete_board();
+        app.push_query_str("alpha beta");
+        assert_eq!(
+            visible_ids(&app),
+            vec!["alpha-beta"],
+            "premise: both atoms gate the list"
+        );
+        app.pop_query_word();
+        assert_eq!(app.query, "alpha ", "the boundary space itself survives");
+        assert_eq!(
+            visible_ids(&app),
+            vec!["alpha-beta", "alpha-solo"],
+            "dropping `beta` must widen the list, not just the string"
+        );
+
+        // A TRAILING-SPACE run belongs to the atom being deleted, so the press
+        // reaches past it to `alpha` instead of nibbling the spaces.
+        let mut app = word_delete_board();
+        app.push_query_str("alpha   ");
+        assert_eq!(
+            visible_ids(&app),
+            vec!["alpha-beta", "alpha-solo"],
+            "premise: the trailing spaces are not atoms"
+        );
+        app.pop_query_word();
+        assert_eq!(app.query, "");
+        assert_eq!(
+            visible_ids(&app),
+            vec!["alpha-beta", "alpha-solo", "gamma"],
+            "an emptied query shows every row again"
+        );
+
+        // An ESCAPED space is inside one atom, so the whole phrase goes in one
+        // press. A delete that split on it would leave `foo\` behind — an atom
+        // the user never typed, matching nothing, with nothing on screen to
+        // explain why.
+        let mut app = word_delete_board();
+        app.push_query_str(r"foo\ bar");
+        assert!(
+            visible_ids(&app).is_empty(),
+            "premise: the literal phrase `foo bar` is in no label"
+        );
+        app.pop_query_word();
+        assert_eq!(app.query, "");
+        assert_eq!(
+            visible_ids(&app),
+            vec!["alpha-beta", "alpha-solo", "gamma"],
+            "one press must clear the whole escaped phrase"
+        );
+    }
+
+    /// Two presses clear `alpha beta` completely — the reference behaviour the
+    /// boundary's surviving space implies.
+    ///
+    /// The first press leaves `alpha ` and the second leaves ``, so the trailing
+    /// space is never a dead keypress. Pinning the SEQUENCE is what catches a
+    /// boundary that stops one byte late: `alpha ` -> `alpha ` repeats forever
+    /// and every single-press assertion above still passes.
+    #[test]
+    fn two_word_deletes_clear_a_two_atom_query() {
+        let mut app = word_delete_board();
+        app.push_query_str("alpha beta");
+
+        app.pop_query_word();
+        assert_eq!(app.query, "alpha ");
+
+        app.pop_query_word();
+        assert_eq!(app.query, "", "the second press takes the space with it");
+        assert_eq!(
+            visible_ids(&app),
+            vec!["alpha-beta", "alpha-solo", "gamma"],
+            "a cleared query is an unfiltered board"
+        );
+    }
+
+    /// A word delete with nothing to delete does NOTHING — it does not re-filter
+    /// and it does not disturb the preview.
+    ///
+    /// `pop_query_word` returns before the query funnel when the boundary is the
+    /// query's own length, and that early return is load-bearing: the funnel
+    /// clears the parked match line and re-arms the pane's jump, so a keypress
+    /// that changed no text would still yank the reader's viewport.
+    #[test]
+    fn a_word_delete_on_an_empty_query_changes_nothing() {
+        let mut app = word_delete_board();
+        app.toggle_search_mode();
+        assert_eq!(app.search_mode, SearchMode::NameAndContent);
+        assert!(app.query.is_empty(), "premise: nothing to delete");
+        let _ = app.take_preview_match_jump();
+        app.preview_match_line = Some(7);
+
+        app.pop_query_word();
+
+        assert_eq!(app.query, "", "the query text must not move");
+        assert_eq!(
+            app.preview_match_line,
+            Some(7),
+            "a no-op keypress must not forget where the pane was parked"
+        );
+        assert!(
+            !app.take_preview_match_jump(),
+            "and must not re-arm the jump the funnel would have armed"
+        );
+        assert_eq!(
+            visible_ids(&app),
+            vec!["alpha-beta", "alpha-solo", "gamma"],
+            "the board is unchanged"
         );
     }
 

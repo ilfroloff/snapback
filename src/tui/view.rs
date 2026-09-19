@@ -2278,6 +2278,20 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         // query with newlines flattened to spaces, and never resume) is documented
         // where there is room to say it: `KEYS` in `cli.rs` and the README key map.
         //
+        // The QUERY WORD-DELETE keys are omitted for exactly the same reason, and
+        // just as deliberately. Even the tersest honest clause (`· ⌥⌫ del word`,
+        // 14 columns) would be painted at columns 224-237 — off the end of any
+        // realistic width — and terse is the one thing this binding cannot be:
+        // `Alt-Backspace`, `Ctrl-W` and `Alt-H` ALL do it, on purpose, so that the
+        // board answers the same set the compose box does whatever the terminal
+        // sends for Option, and naming one of the three would advertise a key set
+        // narrower than the one that works. All three are documented on every
+        // OTHER surface KEEP KEY DOCS IN SYNC names — the ones with room for that
+        // sentence: the keybinding table in `update.rs`'s module doc, `KEYS` in
+        // `cli.rs`, the README key map, and the `Alt`-binding rule in
+        // PATTERNS.md's "Keys, actions, outcomes". Plain `Backspace` (one
+        // character) is unmentioned here on the same budget.
+        //
         // `S-↑↓ match` sits with the search cluster rather than with the scroll
         // keys, because it is search navigation that happens to move a pane — and
         // it is spelled `S-` rather than `⇧` so it needs no glyph the terminal may
