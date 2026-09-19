@@ -413,7 +413,7 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
             // A transient status (e.g. a resume refusal) lives exactly until the
             // next key; clear it first so this keypress may set a fresh one.
             app.clear_status();
-            let action = key_to_action(key, app.query.is_empty(), app.has_preview_matches());
+            let action = key_to_action(key, app.query_input.is_empty(), app.has_preview_matches());
             apply_action(app, action)
         }
         // Mouse wheel scroll and splitter drag. A dedicated arm BEFORE the
@@ -2415,7 +2415,7 @@ mod tests {
             "every pasted line must survive in the draft"
         );
         assert!(
-            app.query.is_empty(),
+            app.query().is_empty(),
             "no part of the paste may leak into the board's search query"
         );
     }
@@ -2455,7 +2455,7 @@ mod tests {
             "every pasted line must survive in the draft"
         );
         assert!(
-            app.query.is_empty(),
+            app.query().is_empty(),
             "no part of the paste may leak into the board's search query"
         );
         assert_eq!(
@@ -2493,12 +2493,12 @@ mod tests {
         let mut app = app_with("idle", None);
         let outcome = paste(&mut app, "alpha\nbravo");
         assert!(matches!(outcome, Outcome::Continue));
-        assert_eq!(app.query, "alpha bravo");
+        assert_eq!(app.query(), "alpha bravo");
         assert!(!app.is_composing(), "a board paste opens no editor");
 
         // It APPENDS, exactly like type-to-search.
         paste(&mut app, "\ncharlie");
-        assert_eq!(app.query, "alpha bravo charlie");
+        assert_eq!(app.query(), "alpha bravo charlie");
     }
 
     /// Every OTHER keyboard owner SWALLOWS a paste, in the same precedence order the
@@ -2513,7 +2513,7 @@ mod tests {
         assert!(app.modal.is_some(), "Enter on a live row opens the choice");
         assert!(matches!(paste(&mut app, "junk\ntext"), Outcome::Continue));
         assert!(app.modal.is_some(), "a paste must not resolve the modal");
-        assert!(app.query.is_empty(), "and must not reach the query");
+        assert!(app.query().is_empty(), "and must not reach the query");
 
         // Leader chord: `Ctrl-X` is armed and still waiting for its KEY.
         let mut app = app_with("idle", None);
@@ -2524,7 +2524,7 @@ mod tests {
             app.pending_chord,
             "a paste carries no chord completion, so the chord keeps waiting"
         );
-        assert!(app.query.is_empty());
+        assert!(app.query().is_empty());
 
         // Stop confirmation (Ctrl-R on a `needs input` agent).
         let mut app = App::new(vec![session("w")], Scope::All, PathBuf::from("/tmp"));
@@ -2545,7 +2545,7 @@ mod tests {
         assert!(matches!(paste(&mut app, "junk\ntext"), Outcome::Continue));
         assert!(app.pending_stop.is_some(), "the confirmation still stands");
         assert!(!app.is_composing(), "a paste must not confirm into compose");
-        assert!(app.query.is_empty());
+        assert!(app.query().is_empty());
 
         // Interrupt confirmation (Ctrl-K on a `working` agent).
         let mut app = App::new(vec![session("w")], Scope::All, PathBuf::from("/tmp"));
@@ -2568,7 +2568,7 @@ mod tests {
             app.pending_interrupt.is_some(),
             "the confirmation still stands"
         );
-        assert!(app.query.is_empty());
+        assert!(app.query().is_empty());
     }
 
     /// Every line ending collapses to `\n` before a paste is used anywhere: a CRLF
@@ -2722,7 +2722,7 @@ mod tests {
         // Into the board query.
         let mut app = app_with("idle", None);
         paste(&mut app, &huge);
-        assert_eq!(app.query.chars().count(), PASTE_MAX_CHARS);
+        assert_eq!(app.query().chars().count(), PASTE_MAX_CHARS);
         assert_eq!(
             app.status.as_deref(),
             Some(paste_truncated_status().as_str())
@@ -4566,7 +4566,8 @@ mod tests {
             press_word_delete(&mut app);
 
             assert_eq!(
-                app.query, "alpha ",
+                app.query(),
+                "alpha ",
                 "the keypress must reach `pop_query_word`, not `pop_query_char` \
                  (which would leave `alpha bet`)"
             );
@@ -4733,7 +4734,7 @@ mod tests {
         app.open_agent_picker(vec![def_agent("planner")]);
         press(&mut app, KeyCode::Char('x'));
         assert!(
-            app.query.is_empty(),
+            app.query().is_empty(),
             "a key during the picker must not type into the query"
         );
         assert!(app.modal.is_some(), "an inert key leaves the picker open");
@@ -5770,7 +5771,10 @@ mod tests {
             PathBuf::from("/tmp/launch"),
         );
         // An ACTIVE query is the exact condition a printable follow-up could corrupt.
-        app.query = "foo".to_string();
+        // TYPED through the app's own seam rather than written into the widget, so
+        // the caret ends up where a real query leaves it — at the end of the line,
+        // which is exactly where a leaked keystroke would land.
+        app.push_query_str("foo");
         let mut store = store_at(Path::new("/tmp"));
 
         feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
@@ -5780,7 +5784,8 @@ mod tests {
         // and must be CONSUMED by the chord rather than typed into the query.
         feed(&mut app, key(KeyCode::Char('h')), &mut store);
         assert_eq!(
-            app.query, "foo",
+            app.query(),
+            "foo",
             "the chord follow-up must not leak into the query"
         );
         assert!(

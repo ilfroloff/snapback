@@ -1,11 +1,22 @@
 //! The compose zone: multiline input + its key dispatch.
 //!
-//! This module OWNS the `ratatui_textarea` dependency the way `search.rs` owns
-//! `memchr`: every reference to the text-editor widget lives here (plus the
-//! `App::compose` field, whose type is [`ComposeState`]). The compose zone is a
-//! modal — while it is open it owns the keyboard, exactly like the running-session
-//! and agent-pick overlays — and leaves by submitting (`Enter`), running
-//! interactively (`Ctrl-O`), or cancelling (`Esc`).
+//! This module owns the MULTILINE `ratatui_textarea` editor (plus the
+//! `App::compose` field, whose type is [`ComposeState`]) — one of exactly TWO
+//! sites that reference the crate. The other is the board's ONE-LINE search
+//! query, [`App::query_input`](super::app::App::query_input), edited by `App`'s
+//! query mutators and drawn by `view::render_search`. Each site owns its own
+//! configuration and its own key routing, and neither reads the other's; the
+//! pairing is not a `memchr`-style single-module confinement, and `Cargo.toml`
+//! states the same two-site boundary as the blast radius of a version bump.
+//!
+//! The difference that matters between the two: this editor IS a keyboard owner,
+//! so it may forward raw keys to `TextArea::input`. The board is not, and must
+//! never do so (PATTERNS.md §10 — the widget's own map would steal `Ctrl-C`,
+//! `Ctrl-K`, `Ctrl-X` and `Tab` from the board).
+//!
+//! The compose zone is a modal — while it is open it owns the keyboard, exactly
+//! like the running-session and agent-pick overlays — and leaves by submitting
+//! (`Enter`), running interactively (`Ctrl-O`), or cancelling (`Esc`).
 //!
 //! It is also the only installer of the PANE-level twin,
 //! [`App::draft`](super::app::App::draft): [`open_background`] opens the editor and
@@ -103,8 +114,11 @@ pub enum ComposeTarget {
 pub struct ComposeState {
     /// What this draft is addressed to — a reply, or a new background agent.
     pub target: ComposeTarget,
-    /// The multiline editor buffer. The ONLY `ratatui_textarea` value in the
-    /// program outside this module's functions, shared by BOTH targets.
+    /// The multiline editor buffer, shared by BOTH targets. One of exactly TWO
+    /// `ratatui_textarea` values in the program — the other is the board's
+    /// one-line [`App::query_input`](super::app::App::query_input), which is a
+    /// separate buffer with its own configuration and is never routed through
+    /// this one (see the module doc).
     pub textarea: TextArea<'static>,
 }
 

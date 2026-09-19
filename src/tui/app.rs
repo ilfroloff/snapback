@@ -1,10 +1,10 @@
 //! The `App` model.
 //!
 //! Holds all TUI state: `sessions`, `filtered` indices, `selected` session id,
-//! `scroll` offset, `query`, `search_mode` (name | name+content), `scope`
-//! (current-folder | project | all) with the project's cached worktree set, and
-//! the preview cache. Selection is tracked by stable `session_id` (not list
-//! index) so it survives autorefresh.
+//! `scroll` offset, `query_input` (the one-line search editor), `search_mode`
+//! (name | name+content), `scope` (current-folder | project | all) with the
+//! project's cached worktree set, and the preview cache. Selection is tracked by
+//! stable `session_id` (not list index) so it survives autorefresh.
 //!
 //! Everything in this module is pure state manipulation with no terminal I/O,
 //! so it is unit-testable without a real terminal. The terminal-driving loop
@@ -21,6 +21,7 @@ use ratatui::text::Line;
 // takes a window of `Line`s instead (see `App::preview_text`).
 #[cfg(test)]
 use ratatui::text::Text;
+use ratatui_textarea::{CursorMove, TextArea};
 use time::OffsetDateTime;
 
 use crate::agents::ReportedAgent;
@@ -1045,8 +1046,26 @@ pub struct App {
     pub selected: Option<String>,
     /// First visible list row (scroll offset); preserved across reloads.
     pub scroll: usize,
-    /// Live search query text.
-    pub query: String,
+    /// Live search query text, held in a ONE-LINE editor rather than a `String`.
+    ///
+    /// The widget buys two things a `String` could not: under `WrapMode::None`
+    /// (its default, deliberately left alone) it scrolls HORIZONTALLY to follow
+    /// the caret, so a query wider than the row stops clipping — and the caret
+    /// was the first thing to go, since it drew after the text; and a whole
+    /// pasted query is ONE undo-history entry, so a single `undo()` reverses it.
+    ///
+    /// SINGLE LINE is an INVARIANT, not a setting. [`query`](Self::query) reads
+    /// `lines()[0]` and the search row is one row tall, so a second line would be
+    /// dropped from the filter while the widget tried to paint it into a row that
+    /// does not exist. Every write goes through the mutators below, and the one
+    /// path that can carry a newline — a terminal paste — flattens it to a space
+    /// before it arrives (`update::flatten_for_query`).
+    ///
+    /// The board NEVER drives this through `TextArea::input`. That key map binds
+    /// `Ctrl-C` to copy, `Ctrl-K` to delete-to-line-end, `Ctrl-X` to cut and
+    /// `Tab` to insert-tab — which are the board's quit, stop, leader chord and
+    /// search-mode toggle. Explicit method calls only.
+    pub query_input: TextArea<'static>,
     /// Name-only vs. name+content search (mirrors the search index mode).
     pub search_mode: SearchMode,
     /// Which sessions the board is showing: current folder, project, or all.
@@ -1217,9 +1236,13 @@ pub struct App {
     /// keyboard — for EITHER draft: a quick reply (`Ctrl-R` on an idle session) or
     /// a new background agent (`Ctrl-N`), told apart by its
     /// [`ComposeTarget`](super::compose::ComposeTarget). Its type
-    /// ([`super::compose::ComposeState`]) is the ONLY place outside
-    /// [`super::compose`] that touches `ratatui_textarea`, the way `search`
-    /// confines `memchr`.
+    /// ([`super::compose::ComposeState`]) holds the MULTILINE
+    /// `ratatui_textarea` editor — one of exactly TWO `ratatui_textarea` values
+    /// on this struct, the other being the one-line
+    /// [`query_input`](Self::query_input) beside it. The two never share a
+    /// buffer, a configuration or a key route: this one is a keyboard owner and
+    /// forwards raw keys to the widget, the query is not and never may
+    /// (PATTERNS.md §10).
     pub compose: Option<super::compose::ComposeState>,
     /// The open NEW-SESSION draft, if any — see [`NewSessionDraft`].
     ///
@@ -1433,6 +1456,25 @@ pub struct App {
     index: SearchIndex,
 }
 
+/// Build the board's query editor: an empty, ONE-LINE [`TextArea`].
+///
+/// The single place the widget is configured, mirroring
+/// [`ComposeState::new`](crate::tui::compose::ComposeState::new). Two settings
+/// matter and one non-setting matters more:
+///
+/// * the cursor-line style is cleared — the crate default is `UNDERLINED`, which
+///   would underline the WHOLE query (the compose editor clears it for the same
+///   reason), and styling stays ratatui `Style` only (TERMINAL-SAFE STYLING);
+/// * the wrap mode is LEFT ALONE at the crate default `WrapMode::None`, because
+///   that is precisely what makes the row scroll horizontally to follow the
+///   caret. Setting a wrap mode here re-introduces the clipping this field exists
+///   to fix.
+fn new_query_input() -> TextArea<'static> {
+    let mut input = TextArea::default();
+    input.set_cursor_line_style(ratatui::style::Style::default());
+    input
+}
+
 impl App {
     /// Build an app over `sessions` with the given `scope` and canonicalized
     /// `launch_dir`. Computes the initial filter and selects the first row.
@@ -1452,7 +1494,7 @@ impl App {
             filtered: Vec::new(),
             selected: None,
             scroll: 0,
-            query: String::new(),
+            query_input: new_query_input(),
             search_mode,
             scope,
             // OFF unless the launch flag says otherwise (`crate::run` sets it
@@ -1666,6 +1708,23 @@ impl App {
 
     // --- query / mode / scope ---------------------------------------------
 
+    /// The live query TEXT — the one line of
+    /// [`query_input`](Self::query_input).
+    ///
+    /// The read seam for everything outside this module, so no caller has to know
+    /// the query is a widget. It borrows all of `&self`, which is exactly why the
+    /// `&mut self` mutators below reach for the FIELD PATH
+    /// `self.query_input.lines()[0]` instead: `self.index.set_query(self.query())`
+    /// would hold a whole-`self` borrow across a `&mut self.index` one and not
+    /// compile.
+    ///
+    /// Reading line 0 alone is safe because of the SINGLE-LINE invariant
+    /// documented on the field, not in spite of it.
+    #[must_use]
+    pub fn query(&self) -> &str {
+        &self.query_input.lines()[0]
+    }
+
     /// Re-apply everything that depends on the query TEXT: the matcher's pattern,
     /// the pending preview match jump, the filtered list, and the report of a hit
     /// with nothing to mark.
@@ -1678,15 +1737,21 @@ impl App {
     /// it is a statement about the previewed session, and a query keystroke can
     /// move the preview to another one.
     fn apply_query_change(&mut self) {
-        self.index.set_query(&self.query);
+        // FIELD PATH, not the `query()` accessor: that borrows all of `self` and
+        // cannot be held across the `&mut self.index` this line needs.
+        self.index.set_query(&self.query_input.lines()[0]);
         self.request_preview_match_jump();
         self.reapply_preserving_selection();
         self.note_match_outside_preview();
     }
 
     /// Append a character to the query and re-filter (type-to-search).
+    ///
+    /// The caret only ever sits at the end of the line (no key moves it — caret
+    /// movement inside the query is deliberately unbound), so inserting AT the
+    /// caret is appending.
     pub fn push_query_char(&mut self, c: char) {
-        self.query.push(c);
+        self.query_input.insert_char(c);
         self.apply_query_change();
     }
 
@@ -1701,18 +1766,28 @@ impl App {
     ///
     /// The caller owns the SHAPE of `text` — the query is a single line, so
     /// `update::flatten_for_query` has already turned any newline into a space
-    /// before this is reached.
+    /// before this is reached. That matters more now than it did against a
+    /// `String`: [`TextArea::insert_str`] SPLITS on `\n` and `\r\n`, so an
+    /// unflattened newline would open a second line that the filter cannot see
+    /// and the one-row search line cannot draw.
+    ///
+    /// The whole string goes in as ONE edit, so it is also ONE undo-history entry
+    /// — a single `undo()` reverses an entire pasted query.
     pub fn push_query_str(&mut self, text: &str) {
-        if text.is_empty() {
-            return;
+        // `insert_str` reports whether anything was inserted; an empty string is a
+        // no-op, so there is no pointless re-filter.
+        if self.query_input.insert_str(text) {
+            self.apply_query_change();
         }
-        self.query.push_str(text);
-        self.apply_query_change();
     }
 
     /// Delete the last query character and re-filter.
+    ///
+    /// [`TextArea::delete_char`] deletes BACKWARD from the caret, which sits at
+    /// the end of the line, and reports whether anything went — so an empty query
+    /// re-filters not at all, exactly as popping an empty `String` did.
     pub fn pop_query_char(&mut self) {
-        if self.query.pop().is_some() {
+        if self.query_input.delete_char() {
             self.apply_query_change();
         }
     }
@@ -1730,12 +1805,40 @@ impl App {
     ///
     /// Nothing to remove (an already-empty query) returns without re-filtering at
     /// all — a no-op keypress must not move the preview or the selection.
+    ///
+    /// The removal is ONE [`TextArea::delete_str`], so it is ONE undo-history
+    /// entry: a single `undo()` puts the whole atom back. Looping
+    /// [`pop_query_char`](Self::pop_query_char) would cost one history entry AND
+    /// one pattern rebuild per character.
     pub fn pop_query_word(&mut self) {
-        let boundary = search::last_atom_start(&self.query);
-        if boundary == self.query.len() {
-            return;
-        }
-        self.query.truncate(boundary);
+        // Everything the widget is about to be told is derived here, while the
+        // line is borrowed; the borrow has to END before the `&mut` calls below.
+        let (head_chars, total_chars) = {
+            let query = &self.query_input.lines()[0];
+            let boundary = search::last_atom_start(query);
+            if boundary == query.len() {
+                return;
+            }
+            // `last_atom_start` answers in BYTES (it scans a `&str`); the widget
+            // navigates and deletes in CHARS. Convert rather than pass through.
+            (query[..boundary].chars().count(), query.chars().count())
+        };
+
+        // `delete_str` deletes FORWARD from the caret, which is parked at the END
+        // of the line, so the jump back to the boundary is MANDATORY: from where
+        // the caret rests there is nothing forward of it to delete.
+        self.query_input.move_cursor(CursorMove::Jump(
+            0,
+            u16::try_from(head_chars).unwrap_or(u16::MAX),
+        ));
+        // `Jump` is CLAMPED by the widget — to the line's length, and (via its
+        // `u16` column) to 65_535 on a query longer than that — so ask where the
+        // caret actually LANDED instead of assuming it honoured the request. The
+        // span deleted then always runs from the caret to the end of the line,
+        // which is what one press means however the jump was clamped.
+        let landed = self.query_input.cursor().1;
+        self.query_input
+            .delete_str(total_chars.saturating_sub(landed));
         self.apply_query_change();
     }
 
@@ -1994,7 +2097,7 @@ impl App {
             return None;
         }
         let entry = self.preview_cache.get(self.selected.as_ref()?)?;
-        (entry.matches_query == self.query && !entry.matches.is_empty()).then_some(&entry.matches)
+        (entry.matches_query == self.query() && !entry.matches.is_empty()).then_some(&entry.matches)
     }
 
     /// Whether there is anything for `Shift-Up`/`Shift-Down` to move between.
@@ -2755,7 +2858,7 @@ impl App {
     /// of them would otherwise have to skip hidden rows by hand. Folding earlier
     /// would also hand `order_filtered` a list it no longer decides the shape of.
     fn recompute_filtered(&mut self) {
-        if self.query.is_empty() {
+        if self.query_input.is_empty() {
             self.filtered = self.scoped.clone();
         } else {
             self.filtered = self.index.results_within(&self.scoped);
@@ -3134,7 +3237,7 @@ impl App {
         match self.preview_cache.get(id) {
             // Already computed for this query: nothing to do (the common case —
             // the pane redraws several times a second while the query sits still).
-            Some(entry) if entry.matches_query == self.query => return,
+            Some(entry) if entry.matches_query == self.query_input.lines()[0] => return,
             Some(_) => {}
             None => return,
         }
@@ -3151,9 +3254,13 @@ impl App {
         let Self {
             preview_cache,
             index,
-            query,
+            query_input,
             ..
         } = self;
+        // Read the query line out of the widget ONCE, as a borrow: the disjoint
+        // split above is what lets this coexist with the cache borrow below, and a
+        // clone here would give that up for nothing.
+        let query = &query_input.lines()[0];
         // ONE scratch for the whole pane, not one per line. Its buffers grow to the
         // widest line on the first few lines and are then reused down the
         // transcript, which is what a pane of mostly non-matching lines otherwise
@@ -3241,7 +3348,7 @@ impl App {
     ///
     /// [`SearchIndex::atom_match_positions`]: crate::search::SearchIndex::atom_match_positions
     fn note_match_outside_preview(&mut self) {
-        if self.query.is_empty()
+        if self.query_input.is_empty()
             || self.search_mode != SearchMode::NameAndContent
             || !self.show_preview
         {
@@ -3250,7 +3357,7 @@ impl App {
         let (Some(id), Some(width)) = (self.selected.clone(), self.preview_width) else {
             return;
         };
-        let key = (id, self.query.clone());
+        let key = (id, self.query_input.lines()[0].clone());
         if self.preview_match_notice.as_ref() == Some(&key) {
             return;
         }
@@ -4967,7 +5074,21 @@ mod tests {
 
         // Move the query WITHOUT re-rendering: the cached map still describes the
         // old one, so the gate must refuse it.
-        app.query.push('z');
+        //
+        // The edit SHORTENS the query rather than extending it, and that is not
+        // incidental: `webhoo` is still in this row's label, so the re-filter the
+        // keypress performs leaves the row on the board and leaves it SELECTED.
+        // A query the row stopped matching would drop the selection, and the gate
+        // would then refuse for want of anything selected — passing this assertion
+        // while proving nothing about staleness. The premise below is what holds
+        // that door shut.
+        app.pop_query_char();
+        assert_eq!(
+            app.selected.as_deref(),
+            Some("s1"),
+            "premise: the shortened query still matches, so the ONLY thing wrong \
+             with the cached map is that it describes the previous query"
+        );
         assert!(
             !app.has_preview_matches(),
             "a stale map must not bind the keys"
@@ -5906,7 +6027,7 @@ mod tests {
         // The flattened form of a pasted `label\nalpha`: every label carries
         // `label`, only the two `alpha` rows carry both atoms.
         app.push_query_str("label alpha");
-        assert_eq!(app.query, "label alpha");
+        assert_eq!(app.query(), "label alpha");
         assert_eq!(
             visible_ids(&app),
             vec!["alpha-one", "alpha-two"],
@@ -5916,12 +6037,61 @@ mod tests {
         // A second paste APPENDS to the query — and re-filters the narrowed list
         // again rather than freezing it.
         app.push_query_str(" two");
-        assert_eq!(app.query, "label alpha two");
+        assert_eq!(app.query(), "label alpha two");
         assert_eq!(
             visible_ids(&app),
             vec!["alpha-two"],
             "the appended atom cuts `alpha-one`, which matches only the first two"
         );
+    }
+
+    /// ONE `undo()` reverses a WHOLE pasted query, however long it was.
+    ///
+    /// This is the property the `TextArea` migration was worth its blast radius
+    /// for: [`TextArea::insert_str`] records a SINGLE history entry per call (its
+    /// `History::push` merges nothing), so the `PASTE_MAX_CHARS`-character paste
+    /// the board accepts costs one undo rather than thousands.
+    ///
+    /// What it really guards is [`App::push_query_str`]'s SHAPE. A future
+    /// "simplification" that looped `insert_char` over the string would leave
+    /// every text assertion in this file green — same query, same filtered list —
+    /// while quietly costing one history entry per character. Nothing else here
+    /// can tell those apart.
+    ///
+    /// Asserted per PASTE, in LIFO order, with the first undo landing exactly on
+    /// the boundary between the two: one entry that stops short would leave a
+    /// partial atom, and one that ran long would swallow the earlier paste too.
+    ///
+    /// The widget is driven DIRECTLY here, and only here, because undo is not a
+    /// board feature — no key is bound to it. This pins the guarantee the state
+    /// model provides, not a keypress; the filtered list is deliberately not
+    /// asserted after an undo, since a raw `undo()` bypasses the query funnel.
+    ///
+    /// The board underneath is the word-delete fixture purely so the pastes run
+    /// against real rows; which rows they are is incidental here.
+    #[test]
+    fn one_undo_reverses_a_whole_pasted_query() {
+        let mut app = word_delete_board();
+        app.push_query_str("alpha");
+        app.push_query_str(" beta gamma delta");
+        assert_eq!(app.query(), "alpha beta gamma delta");
+
+        assert!(
+            app.query_input.undo(),
+            "a paste must leave exactly one thing to undo"
+        );
+        assert_eq!(
+            app.query(),
+            "alpha",
+            "ONE undo must reverse the WHOLE 17-character paste, not one character \
+             of it, and must stop at the previous paste rather than through it"
+        );
+
+        assert!(
+            app.query_input.undo(),
+            "the earlier paste is its own history entry"
+        );
+        assert_eq!(app.query(), "", "one entry per paste, whatever its length");
     }
 
     // --- word-delete (one ATOM per press) ----------------------------------
@@ -5960,7 +6130,7 @@ mod tests {
             "premise: both atoms gate the list"
         );
         app.pop_query_word();
-        assert_eq!(app.query, "alpha ", "the boundary space itself survives");
+        assert_eq!(app.query(), "alpha ", "the boundary space itself survives");
         assert_eq!(
             visible_ids(&app),
             vec!["alpha-beta", "alpha-solo"],
@@ -5977,7 +6147,7 @@ mod tests {
             "premise: the trailing spaces are not atoms"
         );
         app.pop_query_word();
-        assert_eq!(app.query, "");
+        assert_eq!(app.query(), "");
         assert_eq!(
             visible_ids(&app),
             vec!["alpha-beta", "alpha-solo", "gamma"],
@@ -5995,7 +6165,7 @@ mod tests {
             "premise: the literal phrase `foo bar` is in no label"
         );
         app.pop_query_word();
-        assert_eq!(app.query, "");
+        assert_eq!(app.query(), "");
         assert_eq!(
             visible_ids(&app),
             vec!["alpha-beta", "alpha-solo", "gamma"],
@@ -6016,10 +6186,10 @@ mod tests {
         app.push_query_str("alpha beta");
 
         app.pop_query_word();
-        assert_eq!(app.query, "alpha ");
+        assert_eq!(app.query(), "alpha ");
 
         app.pop_query_word();
-        assert_eq!(app.query, "", "the second press takes the space with it");
+        assert_eq!(app.query(), "", "the second press takes the space with it");
         assert_eq!(
             visible_ids(&app),
             vec!["alpha-beta", "alpha-solo", "gamma"],
@@ -6039,13 +6209,13 @@ mod tests {
         let mut app = word_delete_board();
         app.toggle_search_mode();
         assert_eq!(app.search_mode, SearchMode::NameAndContent);
-        assert!(app.query.is_empty(), "premise: nothing to delete");
+        assert!(app.query().is_empty(), "premise: nothing to delete");
         let _ = app.take_preview_match_jump();
         app.preview_match_line = Some(7);
 
         app.pop_query_word();
 
-        assert_eq!(app.query, "", "the query text must not move");
+        assert_eq!(app.query(), "", "the query text must not move");
         assert_eq!(
             app.preview_match_line,
             Some(7),

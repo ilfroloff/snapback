@@ -816,6 +816,34 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    [DOMAIN.md](DOMAIN.md#background-agent-draft-pane-ctrl-n) for the two the card
    carries.
 
+The board's search query is a **widget** that is deliberately NOT a keyboard
+owner. `App::query_input` is a `ratatui_textarea::TextArea`, so it measures,
+scrolls and draws its own caret — but every key that reaches it came through the
+pipeline above, and two rules keep it that way.
+
+**SINGLE LINE is an invariant, not a setting.** `App::query` reads `lines()[0]`
+and the search row is one row tall, so a second line is dropped from the filter
+while the widget tries to paint it into a row that does not exist: the two halves
+disagree, and NEITHER reports an error. The guard sits at the one path that can
+carry a newline — a terminal paste — where `update::flatten_for_query` turns each
+one into a space before `push_query_str` is called. It is not implied by the
+mutators: `TextArea::insert_str` really does open a second line, so a NEW way
+into the query must flatten at its own call site or move the guard deliberately.
+
+**NEVER drive the board through `TextArea::input`.** That is the widget's own key
+map, and it collides with the board on four keys at once: `Ctrl-C` is copy where
+the board QUITS, `Ctrl-K` is delete-to-line-end where the board stops the agent,
+`Ctrl-X` is cut where the board opens the leader chord, and `Tab` is insert-tab
+where the board toggles the search mode. Forwarding raw keys would hijack all
+four, and each theft reads as the key doing nothing. The board binds its keys in
+`key_to_action` like any other and drives the widget with EXPLICIT method calls
+(`insert_char`, `insert_str`, `delete_char`, `move_cursor` + `delete_str`), each
+routed through `App::apply_query_change` exactly ONCE so a keypress still costs
+one re-filter. `tui::compose` is the opposite case and stays that way: it IS a
+keyboard owner, so forwarding to `TextArea::input` is correct there — and that is
+precisely why the same crate can answer `Alt-Backspace` in the reply box without
+the board ever inheriting the rest of the map.
+
 Add a keybinding by extending the `Action` enum + `key_to_action` + `apply_action`.
 Cover it with a `key_to_action` unit test AND one test that presses the key through
 `handle_event`. Both, because they pin different things and neither implies the
