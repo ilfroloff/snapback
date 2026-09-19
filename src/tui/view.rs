@@ -270,19 +270,6 @@ const CHILD_MSGS_GAP: &str = "  ";
 /// [`fit_child_msgs`].
 const CHILD_MSGS_SUFFIX: &str = " msgs";
 
-/// The glyph of the search line's cursor.
-const SEARCH_CURSOR: &str = "\u{258f}";
-/// What the pulsing search cursor renders in its hidden phase: a SAME-WIDTH
-/// blank. The cursor is currently the LAST span on its line, so blanking and
-/// dropping it paint identical cells today; the blank is what keeps the column
-/// held if anything is ever appended after it.
-///
-/// Show/hide is right HERE and only here: a cursor's whole job is to appear and
-/// disappear, and nothing on the search line is auto-detected by the terminal, so
-/// mutating this line's text costs nothing. The badge dot deliberately does NOT
-/// work this way — see [`pulse_color`].
-const SEARCH_CURSOR_HIDDEN: &str = " ";
-
 /// The preview scrollbar's `begin_symbol`, shown ONLY when the preview is
 /// pinned to the very top (`offset == 0`) — a clear directional glyph for the
 /// boundary-only arrow, chosen deliberately since we set `begin_symbol`
@@ -607,7 +594,7 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
     // highlight seam only READS the index, so this reads each label in place —
     // no snapshot clone and no borrow to sequence around. An empty query skips
     // the work entirely — nothing is highlighted.
-    let highlights: HashMap<usize, HashSet<usize>> = if app.query.is_empty() {
+    let highlights: HashMap<usize, HashSet<usize>> = if app.query().is_empty() {
         HashMap::new()
     } else {
         rows.iter()
@@ -1008,9 +995,9 @@ fn pulse_color(base: Color) -> Color {
 /// The ONE phase source on the board: the live badge's dot and the search line's
 /// cursor both read it, so they move together instead of drifting. What each
 /// side DOES with the phase differs, and deliberately so — the dot swaps color
-/// ([`pulse_color`]), while the cursor shows/hides ([`SEARCH_CURSOR_HIDDEN`]).
-/// The name is the cursor's literal reading and the dot's ON/OFF phase; anything
-/// animated later phases off this too.
+/// ([`pulse_color`]), while the cursor swaps its `REVERSED` modifier on and off
+/// ([`render_search`]). The name is the cursor's literal reading and the dot's
+/// ON/OFF phase; anything animated later phases off this too.
 ///
 /// Pure, so the pulse's timing is unit-testable without a terminal or a clock:
 /// `tick` is just the count of `AppEvent::Tick`s so far ([`App::tick`]), which
@@ -1398,8 +1385,11 @@ fn compose_title(app: &App, compose: &ComposeState) -> String {
 /// Styled ONLY with ratatui `Style` + NAMED colors (TERMINAL-SAFE STYLING): the
 /// cyan border marks the box as the board speaking, like the search prompt and the
 /// status banner. The `TextArea` widget draws its own buffer and cursor into the
-/// block's inner rect — the one place a `ratatui_textarea` value is rendered,
-/// mirroring how it is the one place one is edited (see [`super::compose`]).
+/// block's inner rect — one of exactly TWO places a `ratatui_textarea` value is
+/// rendered, the other being [`render_search`], which draws the board's one-line
+/// query. The two differ in what they let the widget own: this one takes the
+/// widget's cursor as it comes, while the search line overrides the cursor STYLE
+/// per frame to drive the blink (see [`super::compose`] and [`render_search`]).
 fn render_compose_zone(frame: &mut Frame, app: &App, area: Rect) {
     let Some(compose) = &app.compose else {
         return;
@@ -2150,26 +2140,55 @@ fn scrollbar_thumb_position(
         .min(hi)
 }
 
-/// The search input line, echoing the live query.
+/// The search line's label. Declared once, so the string DRAWN and the columns
+/// RESERVED for it below cannot drift apart.
+const SEARCH_LABEL: &str = "search: ";
+
+/// Columns [`SEARCH_LABEL`] occupies. Derived from the label rather than typed,
+/// so re-wording it re-sizes the column with it (NO MAGIC VALUES). The label is
+/// ASCII, so its byte length IS its column count.
+const SEARCH_LABEL_WIDTH: u16 = SEARCH_LABEL.len() as u16;
+
+/// The search input line: a fixed label, then the query editor itself.
 ///
-/// The trailing cursor pulses off the SAME [`blink_visible`] phase of
-/// [`App::tick`] as the live badge's dot, so the board has exactly ONE blink
-/// mechanism and the two pulse together rather than drifting against each other.
-/// This cursor carried the ANSI blink attribute (ratatui's slow-blink
-/// `Modifier`) originally and therefore never actually blinked — see
-/// [`blink_visible`] for why the terminal cannot be asked to animate it.
-fn render_search(frame: &mut Frame, app: &App, area: Rect) {
-    let cursor = if blink_visible(app.tick) {
-        SEARCH_CURSOR
+/// The query is drawn by its own [`TextArea`](ratatui_textarea::TextArea) rather
+/// than assembled into a `Line` here, and that is the whole point of the row's
+/// split: a `Paragraph` with no scroll CLIPS a query wider than the terminal, and
+/// the caret went first because it drew last. The widget owns its own horizontal
+/// scroll under `WrapMode::None`, so the tail of a long query — and the caret —
+/// stay on screen. It also owns the caret, which is why nothing is appended after
+/// the text any more.
+///
+/// The pulse therefore changes a STYLE rather than a glyph: `REVERSED` in the
+/// visible phase, the plain default in the hidden one. It reads the SAME
+/// [`blink_visible`] phase of [`App::tick`] as the live badge's dot, so the board
+/// still has exactly ONE blink mechanism and the two pulse together rather than
+/// drifting. `REVERSED` is a `Modifier`, not a color (TERMINAL-SAFE STYLING), and
+/// it is the one attribute this board already relies on being honoured — the
+/// list's selection highlight is drawn with it. Do NOT reach for the ANSI blink
+/// attribute: this cursor carried it once and therefore never blinked, which is
+/// what [`blink_visible`] exists to explain.
+///
+/// Takes `&mut App` because the cursor style is set on the widget per frame;
+/// [`render`] already holds one.
+fn render_search(frame: &mut Frame, app: &mut App, area: Rect) {
+    let [label_area, input_area] =
+        Layout::horizontal([Constraint::Length(SEARCH_LABEL_WIDTH), Constraint::Min(0)])
+            .areas(area);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            SEARCH_LABEL,
+            Style::default().fg(Color::Cyan),
+        ))),
+        label_area,
+    );
+    let cursor_style = if blink_visible(app.tick) {
+        Style::default().add_modifier(Modifier::REVERSED)
     } else {
-        SEARCH_CURSOR_HIDDEN
+        Style::default()
     };
-    let line = Line::from(vec![
-        Span::styled("search: ", Style::default().fg(Color::Cyan)),
-        Span::raw(app.query.clone()),
-        Span::raw(cursor),
-    ]);
-    frame.render_widget(Paragraph::new(line), area);
+    app.query_input.set_cursor_style(cursor_style);
+    frame.render_widget(&app.query_input, input_area);
 }
 
 /// The which-key hint that takes over the help line while a `Ctrl-X` leader chord
@@ -3358,7 +3377,7 @@ mod tests {
             "premise: the lineage folds to a single head"
         );
         assert!(
-            app.query.is_empty(),
+            app.query().is_empty(),
             "premise: nothing is filtered by a query"
         );
         let header = drawn_header(&app);
@@ -9074,9 +9093,24 @@ mod tests {
 
     /// Draw `app`'s search line into an in-memory terminal and hand back the
     /// buffer — the cells a real terminal would paint.
-    fn drawn_search(app: &App, width: u16) -> ratatui::buffer::Buffer {
-        let mut terminal =
-            Terminal::new(TestBackend::new(width, 1)).expect("build an in-memory test terminal");
+    ///
+    /// `&mut App` because the query is a [`TextArea`](ratatui_textarea::TextArea)
+    /// whose caret style is set per frame; [`render_search`] takes one for that
+    /// reason, and [`render`] already holds one.
+    fn drawn_search(app: &mut App, width: u16) -> ratatui::buffer::Buffer {
+        drawn_search_at(app, width, 1)
+    }
+
+    /// [`drawn_search`] into an area of an arbitrary HEIGHT.
+    ///
+    /// The real board gives this row exactly one line, so every phase test uses
+    /// the `1` above. A height of 2 exists for ONE purpose: handing the widget
+    /// room it could spill into, so that "the search row stays one row" is a thing
+    /// the buffer can actually disagree with rather than a guarantee of the
+    /// viewport (see `a_pasted_newline_never_opens_a_second_query_line`).
+    fn drawn_search_at(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height))
+            .expect("build an in-memory test terminal");
         terminal
             .draw(|frame| {
                 let area = frame.area();
@@ -9099,9 +9133,13 @@ mod tests {
     }
 
     /// A board whose search line echoes [`CURSOR_QUERY`] at `tick`.
+    ///
+    /// The query is TYPED through [`App::push_query_str`] rather than written into
+    /// the widget, so these render tests drive the same seam a paste does and the
+    /// caret ends up where the app really leaves it — at the end of the line.
     fn cursor_board(tick: u64) -> App {
         let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp/launch"));
-        app.query = CURSOR_QUERY.to_string();
+        app.push_query_str(CURSOR_QUERY);
         app.tick = tick;
         app
     }
@@ -9116,77 +9154,249 @@ mod tests {
         query_x + u16::try_from(CURSOR_QUERY.chars().count()).expect("a query shorter than a row")
     }
 
-    /// The search cursor is drawn in the pulse's VISIBLE phase — asserted as the
-    /// GLYPH in the buffer, never as a style modifier: this cursor shipped
-    /// carrying the ANSI blink attribute and never blinked once, which a
-    /// modifier assertion would have called green.
+    /// Whether the cell at `x` on the drawn search line carries `REVERSED` — the
+    /// caret, now that the query is a [`TextArea`](ratatui_textarea::TextArea).
+    ///
+    /// The widget owns its caret and pulses it by STYLE: it paints a cell at the
+    /// caret column in both phases and differs only in the modifier, so the cell
+    /// is read through `modifier` rather than through `symbol()`. Reading the
+    /// glyph would be blind to the whole pulse.
+    fn cell_is_reversed(buffer: &ratatui::buffer::Buffer, x: u16) -> bool {
+        buffer
+            .cell((x, 0))
+            .expect("the cursor column must be inside the drawn line")
+            .modifier
+            .contains(Modifier::REVERSED)
+    }
+
+    /// The search cursor is drawn in the pulse's VISIBLE phase — asserted as a
+    /// REVERSED CELL in the buffer, which is what the widget actually paints.
+    ///
+    /// Still a BUFFER assertion and not a call-count one, for the original
+    /// reason: this cursor once shipped carrying the ANSI blink attribute and
+    /// never blinked, so only the cells a terminal would really paint are
+    /// evidence. `REVERSED` is a `Modifier` this board already depends on being
+    /// honoured — the list's selection highlight is drawn with it.
     #[test]
     fn render_search_draws_the_cursor_in_the_pulses_visible_phase() {
-        let app = cursor_board(0);
+        let mut app = cursor_board(0);
         assert!(blink_visible(app.tick), "tick 0 must be a visible phase");
 
-        let buffer = drawn_search(&app, SEARCH_LINE_WIDTH);
+        let buffer = drawn_search(&mut app, SEARCH_LINE_WIDTH);
         let x = cursor_column(&buffer, SEARCH_LINE_WIDTH);
 
-        assert_eq!(
-            buffer
-                .cell((x, 0))
-                .expect("the cursor column must be inside the drawn line")
-                .symbol(),
-            SEARCH_CURSOR,
-            "the cursor glyph must be drawn right after the query in the visible phase; \
+        assert!(
+            cell_is_reversed(&buffer, x),
+            "the cell right after the query must be REVERSED in the visible phase; \
              drawn line: {:?}",
             full_row_text(&buffer, 0, SEARCH_LINE_WIDTH)
         );
     }
 
-    /// The other half of the pulse: at `BLINK_TICKS` the glyph is GONE from its
-    /// column, replaced by a same-width blank. Without this the "pulse" is a
-    /// permanently-lit cursor.
+    /// The other half of the pulse: at `BLINK_TICKS` the caret's cell is drawn
+    /// PLAIN. Without this the "pulse" is a permanently-lit cursor.
     #[test]
     fn render_search_hides_the_cursor_in_the_pulses_hidden_phase() {
-        let app = cursor_board(BLINK_TICKS);
+        let mut app = cursor_board(BLINK_TICKS);
         assert!(
             !blink_visible(app.tick),
             "tick {BLINK_TICKS} must be a hidden phase"
         );
 
-        let buffer = drawn_search(&app, SEARCH_LINE_WIDTH);
+        let buffer = drawn_search(&mut app, SEARCH_LINE_WIDTH);
         let x = cursor_column(&buffer, SEARCH_LINE_WIDTH);
 
-        assert_eq!(
-            buffer
-                .cell((x, 0))
-                .expect("the cursor column must be inside the drawn line")
-                .symbol(),
-            SEARCH_CURSOR_HIDDEN,
-            "the cursor's column must be BLANK in the hidden phase; drawn line: {:?}",
+        assert!(
+            !cell_is_reversed(&buffer, x),
+            "the caret's cell must carry NO reverse-video in the hidden phase; \
+             drawn line: {:?}",
             full_row_text(&buffer, 0, SEARCH_LINE_WIDTH)
         );
     }
 
     /// The anti-shift pin: the query must not move as the cursor pulses.
     ///
-    /// Note the cursor is currently the LAST span on the line, so blanking the
-    /// hidden phase and dropping the span paint identical cells — this test
-    /// cannot tell those apart, and does not claim to. What it does pin is that
-    /// nothing the pulse touches ever reflows the query beside it, which is what
-    /// would read as a broken board rather than a pulse.
+    /// Stronger than it could be against the old glyph cursor. That one was the
+    /// LAST span on the line, so blanking it and dropping it painted identical
+    /// cells and this test could not tell them apart. The widget's caret is a
+    /// STYLE toggle over text it draws either way, so the whole row's TEXT is now
+    /// assertable as byte-identical across both phases — which subsumes the query
+    /// column and pins the caret's own column with it.
     #[test]
     fn render_search_keeps_the_query_column_stable_across_both_pulse_phases() {
-        let columns: Vec<u16> = [0, BLINK_TICKS]
+        let rows: Vec<(u16, String)> = [0, BLINK_TICKS]
             .into_iter()
             .map(|tick| {
-                let buffer = drawn_search(&cursor_board(tick), SEARCH_LINE_WIDTH);
-                column_of(&buffer, 0, SEARCH_LINE_WIDTH, CURSOR_QUERY)
+                let buffer = drawn_search(&mut cursor_board(tick), SEARCH_LINE_WIDTH);
+                (
+                    column_of(&buffer, 0, SEARCH_LINE_WIDTH, CURSOR_QUERY),
+                    full_row_text(&buffer, 0, SEARCH_LINE_WIDTH),
+                )
             })
             .collect();
 
         assert_eq!(
-            columns[0], columns[1],
+            rows[0].0, rows[1].0,
             "the query must start at the SAME column in the visible (tick 0, col {}) \
              and hidden (tick {BLINK_TICKS}, col {}) phases",
-            columns[0], columns[1]
+            rows[0].0, rows[1].0
+        );
+        assert_eq!(
+            rows[0].1, rows[1].1,
+            "and the pulse must not change the row's TEXT at all — it is a style toggle"
+        );
+    }
+
+    /// Deliver `text` to `app` as ONE bracketed-terminal paste, through the
+    /// board's real router.
+    ///
+    /// Driven through [`update::handle_event`](crate::tui::update::handle_event)
+    /// rather than [`App::push_query_str`] on purpose: the single-line guard lives
+    /// at the PASTE call site (`update::flatten_for_query`), not inside the
+    /// mutator, so handing the mutator a raw newline would pin the WIDGET's
+    /// behaviour instead of the board's. The store is a placeholder — a paste
+    /// never reloads.
+    fn paste_onto_board(app: &mut App, text: &str) {
+        let _ = crate::tui::update::handle_event(
+            app,
+            crate::watch::AppEvent::Input(crossterm::event::Event::Paste(text.to_string())),
+            &mut crate::store::SessionStore::new(Path::new("/tmp")),
+        );
+    }
+
+    /// The SINGLE-LINE invariant, driven down the one path that can break it.
+    ///
+    /// [`App::query`] reads `query_input.lines()[0]` and nothing else, so a second
+    /// line is text the filter cannot see, the search row cannot draw and no key
+    /// can delete — swallowed silently rather than visibly wrong. The guard is
+    /// load-bearing rather than belt-and-braces: no KEY can produce a newline here
+    /// (`Enter` is `Action::Resume`), a paste can, and `TextArea::insert_str` does
+    /// split on `\n`.
+    ///
+    /// Both halves are asserted, because either alone is satisfiable while the
+    /// other is broken: the widget holds ONE line, AND the row it paints stays one
+    /// row even when handed a second to spill into.
+    #[test]
+    fn a_pasted_newline_never_opens_a_second_query_line() {
+        const ROOM: (u16, u16) = (40, 2);
+        let (width, height) = ROOM;
+
+        let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp/launch"));
+        // Every line-ending shape a bracketed paste carries: LF, CRLF, and the lone
+        // CR that is the classic embedded newline inside one.
+        paste_onto_board(&mut app, "one\ntwo\r\nthree\rfour");
+
+        assert_eq!(
+            app.query_input.lines().len(),
+            1,
+            "a pasted newline must not open a second line; lines: {:?}",
+            app.query_input.lines()
+        );
+        assert_eq!(
+            app.query(),
+            "one two three four",
+            "and nothing pasted may be dropped — each line becomes its own atom"
+        );
+
+        let buffer = drawn_search_at(&mut app, width, height);
+        assert_eq!(
+            full_row_text(&buffer, 0, width),
+            "search: one two three four",
+            "the WHOLE query draws on the first row"
+        );
+        assert_eq!(
+            full_row_text(&buffer, 1, width),
+            "",
+            "and nothing spills onto the second row this area deliberately offers"
+        );
+    }
+
+    /// The clipping defect the migration fixes, pinned at the buffer.
+    ///
+    /// The old search line assembled a `Line` and drew it as an unscrolled
+    /// `Paragraph`, so a query wider than the row was CUT at the right edge — and
+    /// the caret, appended after the text, went first. That is reachable rather
+    /// than theoretical: one paste puts up to `PASTE_MAX_CHARS` here.
+    ///
+    /// The widget scrolls horizontally under `WrapMode::None` to follow its caret,
+    /// so the row shows the query's TAIL. Asserted as tail-present/head-absent
+    /// rather than against a literal row, so a change to the label width or the
+    /// terminal size cannot turn this into a transcription test.
+    #[test]
+    fn a_query_wider_than_the_row_keeps_its_tail_and_the_caret_on_screen() {
+        // Ends that name themselves, so a failure says WHICH end survived.
+        const LONG_QUERY: &str = "HEAD-abcdefghijklmnopqrstuvwxyz-0123456789-TAIL";
+        const NARROW: u16 = 20;
+
+        let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp/launch"));
+        app.push_query_str(LONG_QUERY);
+        assert!(
+            LONG_QUERY.len() > usize::from(NARROW),
+            "premise: the query cannot fit the row, so something HAS to be cut"
+        );
+        assert!(
+            blink_visible(app.tick),
+            "premise: the caret is in a lit phase"
+        );
+
+        let buffer = drawn_search_at(&mut app, NARROW, 1);
+        let row = full_row_text(&buffer, 0, NARROW);
+
+        assert!(
+            row.ends_with("TAIL"),
+            "the row must draw the query's TAIL, which is where the caret is: {row:?}"
+        );
+        assert!(
+            !row.contains("HEAD"),
+            "and the head must have scrolled off — a row still showing it is a row \
+             that clipped the caret instead: {row:?}"
+        );
+        assert!(
+            (0..NARROW).any(|x| cell_is_reversed(&buffer, x)),
+            "the caret itself must stay on screen; it is what the old Paragraph lost \
+             first: {row:?}"
+        );
+    }
+
+    /// A long query stays ONE visual row: it scrolls, it does not WRAP.
+    ///
+    /// The sibling above pins that the row shows the query's TAIL, and it passes
+    /// under a wrap mode too — wrapping also keeps the caret in view, by scrolling
+    /// the viewport DOWN to the caret's wrapped row instead of sideways. So the
+    /// tail assertion alone does not pin `WrapMode::None`; this does.
+    ///
+    /// Why it matters beyond tidiness: the board hands this row exactly ONE line
+    /// ([`render`]'s layout), so a wrapped query has rows that no viewport will
+    /// ever show — the same swallowed-text failure as a second `lines()` entry,
+    /// reached by a different route. Asserted with the deliberate extra row
+    /// [`drawn_search_at`] exists to give, so the buffer can disagree rather than
+    /// the viewport making it true by construction.
+    #[test]
+    fn a_query_wider_than_the_row_scrolls_instead_of_wrapping_onto_a_second_row() {
+        const LONG_QUERY: &str = "HEAD-abcdefghijklmnopqrstuvwxyz-0123456789-TAIL";
+        const NARROW: u16 = 20;
+
+        let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp/launch"));
+        app.push_query_str(LONG_QUERY);
+        assert!(
+            LONG_QUERY.len() > usize::from(NARROW - SEARCH_LABEL_WIDTH),
+            "premise: the query is wider than the column left for it, so a wrapping \
+             widget WOULD need a second row"
+        );
+
+        let buffer = drawn_search_at(&mut app, NARROW, 2);
+
+        assert_eq!(
+            full_row_text(&buffer, 1, NARROW),
+            "",
+            "a query wider than the row must SCROLL, not wrap: text on the second \
+             row means the one-line area the board really gives this widget would \
+             hide it"
+        );
+        assert!(
+            full_row_text(&buffer, 0, NARROW).ends_with("TAIL"),
+            "and the one row it does occupy is still the tail — a blank second row \
+             must not be bought by drawing nothing at all"
         );
     }
 
@@ -9208,12 +9418,19 @@ mod tests {
         terminal.backend().buffer().clone()
     }
 
-    /// Whether row `y` of `buffer` has `glyph` drawn anywhere on it.
-    fn row_has_glyph(buffer: &ratatui::buffer::Buffer, y: u16, width: u16, glyph: &str) -> bool {
+    /// Whether row `y` of `buffer` carries a REVERSED cell anywhere on it — how
+    /// the search line's caret is read now that the query is a
+    /// [`TextArea`](ratatui_textarea::TextArea) and the pulse toggles a style
+    /// rather than swapping a glyph.
+    ///
+    /// Safe to ask of the SEARCH row specifically: the only other `REVERSED` on
+    /// this board is the list's selection highlight, which is drawn in the body,
+    /// never on this one-row line.
+    fn row_has_reversed_cell(buffer: &ratatui::buffer::Buffer, y: u16, width: u16) -> bool {
         (0..width).any(|x| {
             buffer
                 .cell((x, y))
-                .is_some_and(|cell| cell.symbol() == glyph)
+                .is_some_and(|cell| cell.modifier.contains(Modifier::REVERSED))
         })
     }
 
@@ -9240,14 +9457,14 @@ mod tests {
     /// Reading both out of a SINGLE rendered frame is the point — two separate
     /// renders could not prove they agree within one paint.
     ///
-    /// The two are read through DIFFERENT properties because they pulse
-    /// differently BY DESIGN, and that asymmetry is the fix, not an oversight:
-    /// the cursor shows/hides (nothing on the search line is auto-detected by the
-    /// terminal, so mutating that line's text is free), while the dot must hold
-    /// its glyph and swap COLOR instead, or the URL sharing its row flickers (see
-    /// `pulse_color`). So "in phase" here reads: the cursor is drawn exactly when
-    /// the dot carries its BASE color, and blanked exactly when the dot carries
-    /// its dim partner.
+    /// The two are read through DIFFERENT properties because they live on
+    /// different surfaces, not because they pulse differently — both are now
+    /// STYLE-ONLY toggles that leave their line's text byte-identical. The caret
+    /// gains and loses `REVERSED` (the widget owns it and never swaps a glyph),
+    /// while the dot holds its glyph and swaps COLOR, which is what keeps a URL
+    /// sharing its row from flickering (see `pulse_color`). So "in phase" here
+    /// reads: the caret is reversed exactly when the dot carries its BASE color,
+    /// and plain exactly when the dot carries its dim partner.
     #[test]
     fn the_search_cursor_and_an_active_badge_dot_pulse_in_phase() {
         let (width, height) = FULL_BOARD_SIZE;
@@ -9259,7 +9476,7 @@ mod tests {
             let buffer = drawn_board(&mut app, width, height);
             // `render`'s layout is header(1) | body(fill) | search(1) | help(1).
             let search_y = height - 2;
-            let cursor_drawn = row_has_glyph(&buffer, search_y, width, SEARCH_CURSOR);
+            let cursor_drawn = row_has_reversed_cell(&buffer, search_y, width);
             // `working` is an ACTIVE bucket, so its dot is one whose phase should
             // track the cursor's.
             let working_y = row_of(&buffer, width, height, "sess-working");
@@ -9801,8 +10018,23 @@ mod tests {
     /// A realistic board: several reported agents across buckets (exactly ONE
     /// pulsing), a selected session whose preview pane is populated from a real
     /// fixture, and a session label carrying a URL sharing its row with a badge —
-    /// the exact shape of the user's flicker report.
+    /// the exact shape of the user's flicker report. Search-mode `the`, which
+    /// every fixture label carries, so the query marks the rows without cutting
+    /// any of them.
     fn linked_label_board() -> App {
+        linked_label_board_with_query("the")
+    }
+
+    /// [`linked_label_board`] over an arbitrary query — the seam its two callers
+    /// differ at, since one of them wants NO query (see
+    /// [`url_on_the_pulsing_row`]).
+    ///
+    /// The query is typed through [`App::push_query_str`], the same seam a paste
+    /// goes through, rather than written into the widget: a raw write would leave
+    /// the matcher's pattern and the filtered list describing the EMPTY query
+    /// while the search line drew a full one, so the marks under test would be
+    /// drawn from state the board can never actually be in.
+    fn linked_label_board_with_query(query: &str) -> App {
         // (session_id, state, label)
         let cases: [(&str, &str, &str); 5] = [
             (
@@ -9846,7 +10078,14 @@ mod tests {
         // The URL row is the selected one, so its badge and its URL share a row
         // AND its preview pane is populated from the fixture on disk.
         app.selected = Some("sess-url".to_string());
-        app.query = "the".to_string();
+        app.push_query_str(query);
+        // A typed query ARMS the pane's jump onto its first match, and the very
+        // next frame spends it. These fixtures are drawn twice (a same-tick
+        // control, and both pulse phases), so the board has to be handed over
+        // SETTLED — exactly as it would be by the time the next key arrives — or
+        // the first render of a pair would differ from the second for a reason
+        // that has nothing to do with the pulse.
+        let _ = app.take_preview_match_jump();
         app
     }
 
@@ -9869,15 +10108,22 @@ mod tests {
     /// [`linked_label_board`] with [`FIXTURE_URL`] moved onto the PULSING row —
     /// the worst case for the flicker report, since that row is the only one
     /// whose cells the pulse touches at all.
+    ///
+    /// Built with NO query, unlike its sibling: the label below is rewritten after
+    /// the board exists, so a live query would mark substrings of text the filter
+    /// never saw, and the marks are beside the point here. The query is chosen at
+    /// CONSTRUCTION rather than cleared afterwards because the query is a
+    /// [`TextArea`](ratatui_textarea::TextArea) the board only ever appends to and
+    /// deletes from — there is no clear-query mutator to reach for, deliberately
+    /// (it is out of scope), and a test must not be the one caller that needs one.
     fn url_on_the_pulsing_row() -> App {
-        let mut app = linked_label_board();
+        let mut app = linked_label_board_with_query("");
         let working = app
             .sessions
             .iter_mut()
             .find(|s| s.session_id == "sess-working")
             .expect("the pulsing fixture row");
         working.label = format!("Assess {FIXTURE_URL} rather than rolling our own");
-        app.query = String::new();
         app
     }
 
