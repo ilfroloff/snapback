@@ -105,7 +105,6 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | Key | Action |
 | --- | ------ |
 | `↑` / `↓` | Move the selection |
-| `j` / `k` | Move the selection — while the query is empty; once you're typing, they're search characters |
 | `←` / `→` | **Fold** / **expand** a stack of look-alike rows that are really one conversation — a row marked `(+N)` stands for `N` more |
 | `Enter` | **Resume** the selected session, returning to the board when it exits. On a **running** session it opens an **Attach / Fork / Cancel** choice instead |
 | `Ctrl-F` | **Fork** the selected session into a copy — available for any session, running or not |
@@ -119,7 +118,7 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | `Ctrl-/` | Toggle the transcript **preview** pane |
 | `PgUp` / `PgDn` | Scroll the preview a full page |
 | `Ctrl-U` / `Ctrl-D` | Scroll the preview a quarter page |
-| `Home` / `End` | Jump the preview to the top / bottom |
+| `Ctrl-T` / `Ctrl-E`, `Home` / `End` | Jump the preview to the top / bottom (on a MacBook keyboard without dedicated `Home`/`End` keys, `fn+←` / `fn+→` reach the same two) |
 | `Shift-↑` / `Shift-↓` | Walk the preview through the lines your query marks — previous / next. Only bound while something IS marked in the previewed transcript; with nothing marked they stay plain **move the selection**, so they never take a key away from you (and a terminal that swallows the modifier still moves). One stop per marked **line**, not per occurrence: a line saying your query twice is marked twice and stopped at once |
 | mouse wheel | Scroll the pane under the pointer — except while a compose or draft box is open, when the session list stops taking notches: a wheel over it does **nothing**, so the session you are writing to can never slide out from under you. Everywhere else it is unchanged, and a notch anywhere but the list still scrolls the transcript |
 | drag the pane border | Resize the list and preview panes |
@@ -127,7 +126,6 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | `Backspace` | Delete the last query character |
 | any printable char | Type to search |
 | paste (`Cmd`/`Ctrl-V`, middle-click) | Your terminal's own paste, taken as **text**: into a compose or draft box at the cursor, **newlines intact** (no more sending just the first line); on the board, appended to the query with newlines as spaces. It never sends, resumes, or confirms |
-| `q` | **Quit** — while the query is empty; once you're typing, it's a search character |
 | `Esc` / `Ctrl-C` | Quit |
 
 Mouse mode is on so the wheel can scroll and the pane border can be dragged; to
@@ -218,12 +216,12 @@ occasionally lands somewhere the pane cannot show it; the board says so rather
 than leaving you looking at an unmarked pane.
 
 The preview follows the newest turn of a session that is still being written —
-until you position the pane yourself. Scroll it, jump to a match, or press `Home`,
-and it stays exactly where you left it — including if you scroll back down onto the
-newest turn, which parks the pane there rather than resubscribing it. `End` is how
-you hand it back. Until you do, only selecting a row, typing, `Tab`, a `Shift-`
-arrow, reopening the pane with `Ctrl-/`, or a quick reply of your own finishing
-moves it, never an autorefresh.
+until you position the pane yourself. Scroll it, jump to a match, or press `Home`
+(or `Ctrl-T`), and it stays exactly where you left it — including if you scroll
+back down onto the newest turn, which parks the pane there rather than
+resubscribing it. `End` (or `Ctrl-E`) is how you hand it back. Until you do, only
+selecting a row, typing, `Tab`, a `Shift-` arrow, reopening the pane with
+`Ctrl-/`, or a quick reply of your own finishing moves it, never an autorefresh.
 
 **Autorefresh.** The list keeps itself current as you work: new sessions appear,
 finished ones update, deleted ones drop out — all in place, with your selection

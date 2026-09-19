@@ -36,7 +36,7 @@ OPTIONS:
     -h, --help     Print this help and exit
 
 KEYS:
-    ↑/↓, j/k      move          Enter        resume (returns to the board on exit)
+    ↑/↓           move          Enter        resume (returns to the board on exit)
     ←/→           fold / expand a fork lineage (a row marked (+N) stands for more)
     Ctrl-F        fork          Ctrl-/       toggle preview
     Ctrl-A        flip scope: current folder ↔ project (the repo you launched in
@@ -68,7 +68,8 @@ KEYS:
     Tab           toggle name / name+content search. Widening to content also
                   opens the preview on the most recent match, as typing does
     PgUp/PgDn     preview page  Ctrl-U/Ctrl-D  preview quarter-page
-    Home/End      preview top / bottom
+    Home/End      preview top / bottom (also Ctrl-T/Ctrl-E; fn+←/→ on a MacBook
+                  keyboard, where Home/End are not their own keys)
     Shift+↑/↓     jump the preview to the previous / next line the query marks.
                   Only while something is marked there — with nothing marked they
                   stay plain move, so they never take a key away from you. One
@@ -82,7 +83,7 @@ KEYS:
                   as TEXT: into a compose draft at the cursor, newlines and all, or
                   appended to the search query with newlines flattened to spaces.
                   It never sends, resumes, or answers a confirmation
-    q, Esc        quit          (type to search)
+    Esc           quit          (type to search)
 
 BACK TO THE BOARD (typed inside a resumed Claude session, not a snapback key):
     /bg           detach the session — it keeps running as a bg agent — and snap

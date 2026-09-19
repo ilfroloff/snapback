@@ -373,8 +373,9 @@ inner rect when there is no banner (so a banner-less pane's geometry is exactly
   cannot win against a per-frame recompute; give the decision state that outlasts
   the frame instead. Every transition is a USER ACT: ANY scroll releases the
   anchor (in either direction — a scroll states a position, not a subscription),
-  and only `End`, another row, or re-showing the pane re-arms it. The render
-  writes the flag for exactly one thing, the match jump it alone can resolve, and
+  and only `End` (or its `Ctrl-E` twin), another row, or re-showing the pane
+  re-arms it. The render writes the flag for exactly one thing, the match jump it
+  alone can resolve, and
   never infers a re-arm from its own CLAMP: an offset the content cannot satisfy
   is equally a reader scrolling past the end, a pane widened by a resize, and a
   transcript that shrank, so re-arming on it took a deliberately positioned pane
@@ -712,9 +713,9 @@ take the narrow allow instead.
 
 Input handling is a three-stage pipeline, all terminal-free and testable:
 
-1. `key_to_action(key, query_empty)` → an `Action` (`j`/`k`/`q` navigate/quit
-   only while the query is empty; arrows, Enter, Tab, and `Ctrl-*` always act so
-   search never blocks navigation).
+1. `key_to_action(key, query_empty)` → an `Action` (every printable char types
+   into the query; arrows, Enter, Tab, and `Ctrl-*` always act so search never
+   blocks navigation).
 2. `apply_action` mutates the `App` and returns an `Outcome`
    (`Continue`/`Quit`/`Resume`/`Send`/`Interrupt`/`BgLaunch`). `Send`, `Interrupt`
    and `BgLaunch` carry a confirmed `SendRequest` / `InterruptRequest` /
