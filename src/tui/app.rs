@@ -21,7 +21,7 @@ use ratatui::text::Line;
 // takes a window of `Line`s instead (see `App::preview_text`).
 #[cfg(test)]
 use ratatui::text::Text;
-use ratatui_textarea::{CursorMove, TextArea};
+use ratatui_textarea::TextArea;
 use time::OffsetDateTime;
 
 use crate::agents::ReportedAgent;
@@ -1806,39 +1806,43 @@ impl App {
     /// Nothing to remove (an already-empty query) returns without re-filtering at
     /// all — a no-op keypress must not move the preview or the selection.
     ///
-    /// The removal is ONE [`TextArea::delete_str`], so it is ONE undo-history
-    /// entry: a single `undo()` puts the whole atom back. Looping
+    /// The line is REBUILT — cleared, then handed back the head that survives —
+    /// rather than edited in place from a caret parked on the boundary. The
+    /// obvious shape (jump to the boundary, delete forward to the end of the
+    /// line) cannot be made correct at every length:
+    /// [`ratatui_textarea::CursorMove::Jump`] addresses a column as a `u16` and
+    /// CLAMPS to it, so every boundary past 65_535 characters is UNREACHABLE and
+    /// the caret parks SHORT of it — from there a forward delete runs over the
+    /// atoms in between and takes many of them in one press. That length is
+    /// reachable in practice rather than theoretical: a paste APPENDS to the
+    /// query and `update`'s paste cap is 4096 characters, so a run of maximal
+    /// pastes crosses the ceiling. [`TextArea::clear`] counts in `usize`, so the
+    /// rebuild is exact at EVERY length — one press is one atom however long the
+    /// query grew, which is the whole point of the feature.
+    ///
+    /// What that exactness costs is TWO undo-history entries per press (the clear
+    /// and the re-insert) and one pass over the surviving head. Both are
+    /// per-PRESS constants, which is the economy that matters here; looping
     /// [`pop_query_char`](Self::pop_query_char) would cost one history entry AND
-    /// one pattern rebuild per character.
+    /// one pattern rebuild per CHARACTER.
     pub fn pop_query_word(&mut self) {
-        // Everything the widget is about to be told is derived here, while the
-        // line is borrowed; the borrow has to END before the `&mut` calls below.
-        let (head_chars, total_chars) = {
+        // The surviving head is taken by VALUE: the widget calls below need
+        // `&mut self.query_input`, so the borrow of its line has to END first.
+        let head = {
             let query = &self.query_input.lines()[0];
             let boundary = search::last_atom_start(query);
             if boundary == query.len() {
                 return;
             }
-            // `last_atom_start` answers in BYTES (it scans a `&str`); the widget
-            // navigates and deletes in CHARS. Convert rather than pass through.
-            (query[..boundary].chars().count(), query.chars().count())
+            query[..boundary].to_string()
         };
 
-        // `delete_str` deletes FORWARD from the caret, which is parked at the END
-        // of the line, so the jump back to the boundary is MANDATORY: from where
-        // the caret rests there is nothing forward of it to delete.
-        self.query_input.move_cursor(CursorMove::Jump(
-            0,
-            u16::try_from(head_chars).unwrap_or(u16::MAX),
-        ));
-        // `Jump` is CLAMPED by the widget — to the line's length, and (via its
-        // `u16` column) to 65_535 on a query longer than that — so ask where the
-        // caret actually LANDED instead of assuming it honoured the request. The
-        // span deleted then always runs from the caret to the end of the line,
-        // which is what one press means however the jump was clamped.
-        let landed = self.query_input.cursor().1;
-        self.query_input
-            .delete_str(total_chars.saturating_sub(landed));
+        // `clear` empties the one line and leaves the caret at its head;
+        // `insert_str` puts the head back and leaves the caret at the END of it,
+        // which is the only place the caret is ever allowed to rest. An emptied
+        // query re-inserts nothing and `insert_str` reports that as a no-op.
+        self.query_input.clear();
+        self.query_input.insert_str(&head);
         self.apply_query_change();
     }
 
@@ -6194,6 +6198,64 @@ mod tests {
             visible_ids(&app),
             vec!["alpha-beta", "alpha-solo", "gamma"],
             "a cleared query is an unfiltered board"
+        );
+    }
+
+    /// ONE press takes ONE atom even when the surviving head is longer than
+    /// `u16::MAX` characters.
+    ///
+    /// [`ratatui_textarea::CursorMove::Jump`] addresses a column as a `u16` and
+    /// CLAMPS to it, so a head past 65_535 characters cannot be jumped to at all.
+    /// Parking the caret
+    /// there and deleting forward to the end of the line would take MANY atoms in
+    /// a single press — precisely the defect this feature exists to prevent — and
+    /// nothing else in this file can see it, because every other query here is a
+    /// handful of characters long.
+    ///
+    /// That length is reachable, not a synthetic limit: a paste APPENDS to the
+    /// query and `update::PASTE_MAX_CHARS` is 4096, so about sixteen maximal
+    /// pastes in a row cross the ceiling.
+    ///
+    /// The assertion that catches an over-reach is the SURVIVOR. `alpha` sits
+    /// past the ceiling and before the atom being deleted, so a press that runs
+    /// long destroys it while a press that stops short of the boundary leaves it
+    /// whole. Lengths are compared rather than whole strings so a failure prints
+    /// two numbers instead of 70_000 characters.
+    #[test]
+    fn a_word_delete_takes_one_atom_past_the_u16_cursor_ceiling() {
+        let pad = "x".repeat(70_000);
+        let mut app = word_delete_board();
+        app.push_query_str(&format!("{pad} alpha beta"));
+        assert_eq!(
+            app.query().chars().count(),
+            70_011,
+            "premise: the head this press must keep is longer than `u16::MAX`"
+        );
+
+        app.pop_query_word();
+
+        assert_eq!(
+            app.query().chars().count(),
+            70_007,
+            "one press must take `beta` ALONE, leaving the pad, `alpha`, and the \
+             boundary space"
+        );
+        assert!(
+            app.query().ends_with("x alpha "),
+            "the atom before the deleted one must survive the press"
+        );
+
+        app.pop_query_word();
+
+        assert_eq!(
+            app.query().chars().count(),
+            70_001,
+            "and the next press takes `alpha` with the space it left behind — one \
+             atom per press does not stop working past the ceiling"
+        );
+        assert!(
+            app.query().ends_with("x "),
+            "the pad is one atom and is not what either press was aimed at"
         );
     }
 
