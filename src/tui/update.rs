@@ -41,7 +41,7 @@
 //! | `Ctrl-T` / `Ctrl-E`, `Home` / `End` | jump the preview to top / bottom (always) |
 //! | `Shift-Up` / `Shift-Down` | scroll the preview onto the previous / next MARKED line, but only while the query marks something in the previewed transcript; with nothing marked they fall through to plain selection movement. One stop per marked LINE, not per occurrence — a line saying the query twice is marked, and stopped at, once |
 //! | `Backspace` | delete the last query character |
-//! | `Alt-Backspace` / `Ctrl-W` / `Alt-H` | delete the last query ATOM — one whole search word, not one character, so a path or a branch name goes in a single press. THREE keys because `TextArea::input` word-deletes on all three in the compose box: binding the same set here is what makes the board and the reply box answer identically, whatever the user's option-as-meta setting turns `Alt-Backspace` into |
+//! | `Alt-Backspace` / `Ctrl-W` / `Alt-H` | delete the last query ATOM — one whole search word, not one character, so a path or a branch name goes in a single press. THREE keys because `TextArea::input` word-deletes on all three in the compose box: binding the same SET here is what makes the gesture reach the board at all, whatever the user's option-as-meta setting turns `Alt-Backspace` into. The set matches; the EXTENT deliberately does not — the board cuts at the search atom and the compose box at `CharKind`'s punctuation boundary, so `feature/fold-fork-lineages` goes whole here and loses only `lineages` there |
 //! | printable char | type-to-search (append to the query) |
 //! | terminal paste | inserted as TEXT — never as keystrokes (see below) |
 //! | `Esc` / `Ctrl-C` | quit (always) |
@@ -156,12 +156,17 @@ pub enum Action {
     /// character (`Alt-Backspace` / `Ctrl-W` / `Alt-H`).
     ///
     /// Three keys because the compose box answers all three: `TextArea::input`
-    /// maps each of them to its own word delete, so binding the same set here is
-    /// what makes the board and the reply box agree on every terminal, whatever
-    /// the user's option-as-meta setting turns `Alt-Backspace` into. The boundary
-    /// is the search atom ([`search::last_atom_start`](crate::search::last_atom_start)),
-    /// NOT the widget's notion of a word — a path or a branch name is one thing
-    /// the user typed and one press should take it.
+    /// maps each of them to its own word delete, so binding the same SET here is
+    /// what makes the gesture reach the board on every terminal, whatever the
+    /// user's option-as-meta setting turns `Alt-Backspace` into.
+    ///
+    /// The SET is all the two surfaces share. The EXTENT deliberately differs:
+    /// the boundary here is the search atom
+    /// ([`search::last_atom_start`](crate::search::last_atom_start)), NOT the
+    /// widget's `CharKind` word, which breaks on ASCII punctuation — a path or a
+    /// branch name is ONE thing the user typed and one press should take it, so
+    /// `feature/fold-fork-lineages` goes whole on the board where a compose box
+    /// would leave all but `lineages`.
     BackspaceWord,
     /// Enter the `Ctrl-X` leader chord: arm [`App::pending_chord`] so the NEXT key
     /// routes through the pure [`chord_key`] machine (hide / hard-delete /
@@ -323,7 +328,9 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool
         KeyCode::Backspace => Action::Backspace,
         // The third word-delete key, bound for the same reason as the other two:
         // it is in the set `TextArea::input` maps to a word delete, so the reply
-        // box already answers it and the board must answer it identically.
+        // box already answers it and the board must answer it too. Only the KEY
+        // SET is shared — what a press cuts is the board's own rule (see
+        // [`Action::BackspaceWord`]).
         // Guarded on `alt` and therefore above the catch-all below, which would
         // otherwise swallow it.
         KeyCode::Char('h' | 'H') if alt => Action::BackspaceWord,
