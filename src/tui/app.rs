@@ -6116,9 +6116,10 @@ mod tests {
     /// makes it a feature rather than a string edit.
     ///
     /// Each case pairs the query text with the LIST it produces, because the two
-    /// can disagree: truncating `self.query` without going through the query
-    /// funnel leaves every text assertion here passing while the board still
-    /// shows the rows the deleted atom was excluding. The atom COUNT itself is
+    /// can disagree: editing `self.query_input` without going through the query
+    /// funnel leaves every text assertion here — each of which reads the same
+    /// widget back through `App::query` — passing while the board still shows
+    /// the rows the deleted atom was excluding. The atom COUNT itself is
     /// pinned against the filter's own splitter in
     /// `search::truncating_at_the_boundary_drops_exactly_one_atom`, next to the
     /// private `gate_atoms` it must agree with.

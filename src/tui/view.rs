@@ -2188,6 +2188,31 @@ fn render_search(frame: &mut Frame, app: &mut App, area: Rect) {
         Style::default()
     };
     app.query_input.set_cursor_style(cursor_style);
+    // KNOWN CEILING at 65_535 query characters, deliberately left UNFIXED — the
+    // horizontal scroll this row leans on is computed in `u16` inside the pinned
+    // `ratatui-textarea-0.9.2`. `TextArea::scroll_top_col` casts the caret column
+    // DOWN into that width with `self.screen_cursor().col as u16`
+    // (`src/widget.rs:112-113`), and `next_scroll_top` then computes
+    // `cursor + 1 - len` in the same `u16` (`src/widget.rs:85-89`).
+    //
+    // At EXACTLY 65_535 characters the caret sits at column 65_535 and `cursor + 1`
+    // overflows: a panic inside the render loop in any debug/dev build, and a wrap
+    // to a garbage scroll column in release. At 65_536 or more the cast itself
+    // wraps the column small, `top_col` collapses to 0, and this row draws the
+    // query's HEAD with the caret off screen — the precise "keep the tail and the
+    // caret on screen" guarantee the row's split above exists to provide.
+    //
+    // REACHABLE, not theoretical: a paste APPENDS to the query against
+    // `update`'s 4096-character cap, so roughly 16 maximal pastes cross the
+    // ceiling. That is the SAME reachability argument that justified fixing the
+    // matching ceiling on the DELETE side — see the `CursorMove::Jump` clamp
+    // documented on `App::pop_query_word`, which was fixed while this one
+    // knowingly was not.
+    //
+    // Accepted anyway: the ceiling is far beyond any real search query, and a
+    // release build degrades this row's rendering rather than crashing. Fixing it
+    // means capping the query length in the query funnel — a behaviour change to
+    // every input path, not a render-site tweak.
     frame.render_widget(&app.query_input, input_area);
 }
 
