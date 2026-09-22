@@ -878,9 +878,21 @@ action, so a terminal that composes Option still leaves the user a working key.
 The word-delete set is the instance — `Alt-Backspace` and `Alt-H` are two of the
 three keys `TextArea::input` maps to `delete_word`, and `Ctrl-W` is the third,
 needing no `Alt` at all. Binding all three is what makes the board and the reply
-box answer the identical set whatever the terminal sends for Option. Two ordering
-constraints come with it, both pinned by tests in `update.rs`: an `alt`-guarded
-arm must sit ABOVE the unguarded arm for the same `KeyCode` (a guarded
+box answer the identical set whatever the terminal sends for Option.
+
+The exception does not WAIVE the hazard above, it ACCEPTS it: a split `ESC` read
+on a slow or multiplexed link can surface `Alt-Backspace` as a bare `Esc`, and a
+bare `Esc` quits the board — so the two keys this case blesses can drop the user
+off the board instead of deleting a word. It is taken anyway on two grounds.
+`⌥⌫` is the gesture users actually press, and was the originating request for
+the feature; and `Ctrl-W` is the non-`Alt` sibling that always works when the
+`Alt` form does not, so the worst case is a key that is unreliable rather than an
+action that is unreachable. That sibling is the exception's precondition, not a
+nicety — an `Alt` binding with no non-`Alt` twin would be paying this hazard for
+a gesture the user has no other way to make, and is still forbidden.
+
+Two ordering constraints come with it, both pinned by tests in `update.rs`: an
+`alt`-guarded arm must sit ABOVE the unguarded arm for the same `KeyCode` (a guarded
 `Backspace` placed below the plain one never fires, and the miss is invisible —
 it just deletes one character), and the `KeyCode::Char(_) if alt => Ignore`
 catch-all must sit BELOW every bound `Alt` printable while still existing, since
