@@ -265,11 +265,32 @@ impl BlockRegion for UnindexedRows {
     }
 }
 
+/// One turn's marker `Line`, addressed by content row in the SAME coordinate
+/// space as [`LinkRegion::content_row`] (an index into the rendered [`Text`]'s
+/// lines, rebased onto the whole transcript as each block is appended — there is
+/// no tail cap left to rebase it a second time, see [`render_file_collect`]).
+///
+/// Captured so the preview pane's PINNED row can show the marker of whichever turn
+/// is scrolled to the top of the viewport — in EVERY scroll state, including the
+/// default bottom-anchored one (see [`crate::tui::view::render_preview`]) — reusing
+/// a `Line` that is ALREADY rendered elsewhere in the transcript rather than
+/// deriving a second, divergent copy of the marker text (no first-line synopsis,
+/// no tool-only-turn fallback — the marker line verbatim, or nothing).
+#[derive(Debug, Clone)]
+pub struct MarkerLine {
+    /// Line index into the rendered [`Text`] this marker sits on.
+    pub content_row: usize,
+    /// The turn's marker line verbatim — richest form first, every annotation
+    /// being independently optional (see [`marker_line_with_time`]): e.g.
+    /// `● claude · @lead · 12:55` or `▶ you · 14:23`.
+    pub line: Line<'static>,
+}
+
 /// A rendered transcript preview: the styled [`Text`] plus the clickable
-/// [`LinkRegion`]s and [`FoldRegion`]s discovered while building it, and the
-/// [`UnindexedRows`] search must not mark. All of them are produced from one pass
-/// at a fixed `width`, so a region's rows and columns always match the text as
-/// drawn.
+/// [`LinkRegion`]s and [`FoldRegion`]s discovered while building it, the
+/// [`UnindexedRows`] search must not mark, and the turn [`MarkerLine`]s. All of
+/// them are produced from one pass at a fixed `width`, so a region's rows and
+/// columns — and a marker's content row — always match the text as drawn.
 #[derive(Debug, Default)]
 pub struct RenderedPreview {
     /// The styled, markdown-rendered transcript.
@@ -280,6 +301,9 @@ pub struct RenderedPreview {
     pub folds: Vec<FoldRegion>,
     /// Runs of lines the content index never held (see [`UnindexedRows`]).
     pub unindexed: Vec<UnindexedRows>,
+    /// Every turn's marker line, in content-row (i.e. file) order (see
+    /// [`MarkerLine`]).
+    pub markers: Vec<MarkerLine>,
 }
 
 impl RenderedPreview {
@@ -362,18 +386,23 @@ pub fn pending_reply_turns(
 }
 
 /// Render `path` into a [`RenderedPreview`]: the styled transcript plus the
-/// clickable [`LinkRegion`]s, over the WHOLE file.
+/// clickable [`LinkRegion`]s and the turn [`MarkerLine`]s, over the WHOLE file.
 ///
-/// Each record's block contributes its lines and its (block-relative) link
-/// regions; both are rebased onto the growing transcript by the running line
-/// offset so a region's `content_row` addresses the FINAL text. That running
-/// rebase is now the ONLY one: a tail cap used to drop everything above the last
-/// 600 rendered lines and shift every surviving region up by the same amount, so a
-/// long conversation's early turns simply were not in the preview and a link above
-/// the cut was dropped. Nothing needs the cap any more — the pane draws a window of
-/// the rows its viewport can reach rather than re-wrapping the whole transcript per
-/// frame — so the transcript arrives whole and a region keeps the row it was
-/// rendered on.
+/// Each record's block contributes its lines, its (block-relative) link and fold
+/// regions, and — for a "summary" record or an ordinary "user"/"assistant" turn —
+/// its (block-relative) [`MarkerLine`]; all are rebased onto the growing transcript
+/// by the running line offset so a region's `content_row` (and a marker's)
+/// addresses the FINAL text. That running rebase is now the ONLY one: a tail cap
+/// used to drop everything above the last 600 rendered lines and shift every
+/// surviving region up by the same amount, so a long conversation's early turns
+/// simply were not in the preview and a link above the cut was dropped. Nothing
+/// needs the cap any more — the pane draws a window of the rows its viewport can
+/// reach rather than re-wrapping the whole transcript per frame — so the transcript
+/// arrives whole and a region, like a marker, keeps the row it was rendered on.
+///
+/// That the cap is gone is what makes the marker list TOTAL: every turn in the file
+/// has a marker at a live row, so the banner's lookup can never miss because the
+/// turn it wanted was cut off the top.
 fn render_file_collect(
     path: &Path,
     width: usize,
@@ -395,6 +424,7 @@ fn render_file_collect(
     let mut links: Vec<LinkRegion> = Vec::new();
     let mut folds: Vec<FoldRegion> = Vec::new();
     let mut unindexed: Vec<UnindexedRows> = Vec::new();
+    let mut markers: Vec<MarkerLine> = Vec::new();
     // Day of the previously ANNOTATED turn, threaded through the loop so a
     // per-message timestamp can switch to `MM-DD HH:MM` on a day rollover.
     let mut prev_day: Option<Date> = None;
@@ -419,14 +449,16 @@ fn render_file_collect(
         if !record.is_object() {
             continue;
         }
-        if let Some((block, block_links, block_folds, block_unindexed)) = render_record(
-            &record,
-            &mut agent,
-            known_agents,
-            expanded,
-            &mut prev_day,
-            width,
-        ) {
+        if let Some((block, block_links, block_folds, block_unindexed, block_marker)) =
+            render_record(
+                &record,
+                &mut agent,
+                known_agents,
+                expanded,
+                &mut prev_day,
+                width,
+            )
+        {
             // ONE offset, ONE rebase, every kind of region: a node's fold target,
             // the links inside its body and the rows search must skip must never
             // disagree about a row.
@@ -434,6 +466,10 @@ fn render_file_collect(
             links.extend(rebased(block_links, offset));
             folds.extend(rebased(block_folds, offset));
             unindexed.extend(rebased(block_unindexed, offset));
+            if let Some(mut marker) = block_marker {
+                marker.content_row += offset;
+                markers.push(marker);
+            }
             lines.extend(block);
         }
     }
@@ -443,6 +479,7 @@ fn render_file_collect(
         links,
         folds,
         unindexed,
+        markers,
     }
 }
 
@@ -460,13 +497,15 @@ fn rebased<R: BlockRegion>(regions: Vec<R>, offset: usize) -> Vec<R> {
 }
 
 /// One record's rendered block: its lines plus its block-relative link, fold and
-/// unindexed regions, in that order — all four rebased together by
-/// [`render_file_collect`].
+/// unindexed regions, in that order — all rebased together by
+/// [`render_file_collect`] — and its block-relative [`MarkerLine`] when the record
+/// is a turn, rebased there by the same running line offset.
 type Block = (
     Vec<Line<'static>>,
     Vec<LinkRegion>,
     Vec<FoldRegion>,
     Vec<UnindexedRows>,
+    Option<MarkerLine>,
 );
 
 /// Render a single record into a transcript block, or `None` to omit it.
@@ -485,9 +524,20 @@ type Block = (
 /// `expanded` is the open fold keys; only the two fold nodes read it.
 ///
 /// Returns the record's [`Block`]: its lines plus its block-relative
-/// [`LinkRegion`]s, [`FoldRegion`]s and [`UnindexedRows`]. The last two hold at
-/// most one entry today (a record renders at most one node), but they are vecs
-/// so the caller rebases them through the SAME [`rebased`] the links go through.
+/// [`LinkRegion`]s, [`FoldRegion`]s and [`UnindexedRows`]. The fold and unindexed
+/// vecs hold at most one entry today (a record renders at most one node), but they
+/// are vecs so the caller rebases them through the SAME [`rebased`] the links go
+/// through.
+///
+/// The fifth tuple element is the block's own [`MarkerLine`] (block-relative
+/// `content_row`, rebased by the caller like the links) for a "summary" record or
+/// an ordinary "user"/"assistant" turn — the ONE line the pinned preview banner can
+/// show when the user scrolls this turn to the top of the viewport
+/// ([`crate::tui::view::render_preview`]) — `None` for a record that contributes
+/// lines but is not itself a turn. A fold node is that record — a peer-message node
+/// ([`peer_node_lines`]) or an injected-context node ([`injected_node_lines`]):
+/// neither is a turn of this session's conversation, and its header promises a
+/// click the pinned row could not honor.
 ///
 /// [`effective`]: AgentState::effective
 fn render_record(
@@ -502,14 +552,19 @@ fn render_record(
         Some("summary") => {
             let s = record.get("summary").and_then(Value::as_str)?;
             // Keep the literal `# summary` head, now styled as a heading. No links.
-            let lines = vec![marker_line_with_time(
-                format!("# {s}"),
-                summary_style(),
-                None,
-                record,
-                prev_day,
-            )];
-            Some((lines, Vec::new(), Vec::new(), Vec::new()))
+            let marker =
+                marker_line_with_time(format!("# {s}"), summary_style(), None, record, prev_day);
+            let lines = vec![marker.clone()];
+            Some((
+                lines,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Some(MarkerLine {
+                    content_row: 0,
+                    line: marker,
+                }),
+            ))
         }
         Some("user") => {
             // A message from ANOTHER session collapses to a one-line node, and is
@@ -530,7 +585,10 @@ fn render_record(
                 // here and owned by the app, never mutated by the renderer.
                 let (lines, links, folds) =
                     peer_node_lines(&origin, expanded, record, prev_day, width);
-                return Some((lines, links, folds, Vec::new()));
+                // NO marker for the pinned row: the node is not a turn, and its
+                // header's click affordance would be a promise the pinned row
+                // cannot keep. The row keeps naming the turn above the node.
+                return Some((lines, links, folds, Vec::new(), None));
             }
             if record
                 .get("isSidechain")
@@ -551,22 +609,33 @@ fn render_record(
             // would lose its sender label and its `origin.from` fold key. The
             // shared check says the same thing (`label::is_injected` refuses a
             // peer record); running it second keeps the preview from depending on
-            // that alone.
+            // that alone. Like the peer node, it contributes NO marker for the
+            // pinned row: it is not a turn, and the row keeps naming the turn
+            // above it.
             if label::is_injected(record) {
-                return Some(injected_node_lines(
-                    &text, expanded, record, prev_day, width,
-                ));
+                let (lines, links, folds, unindexed) =
+                    injected_node_lines(&text, expanded, record, prev_day, width);
+                return Some((lines, links, folds, unindexed, None));
             }
-            let mut lines = vec![
-                Line::from(""),
-                marker_line_with_time(YOU_MARKER.to_string(), you_style(), None, record, prev_day),
-            ];
+            let marker =
+                marker_line_with_time(YOU_MARKER.to_string(), you_style(), None, record, prev_day);
+            let mut lines = vec![Line::from(""), marker.clone()];
             // Body links are relative to the body; rebase them past the blank +
-            // marker lines that lead every turn.
+            // marker lines that lead every turn. The marker itself sits at row 1
+            // (the blank line at row 0 leads every turn).
             let offset = lines.len();
             let (body, body_links) = collapse_body_lines_collect(&text, width);
             lines.extend(body);
-            Some((lines, rebased(body_links, offset), Vec::new(), Vec::new()))
+            Some((
+                lines,
+                rebased(body_links, offset),
+                Vec::new(),
+                Vec::new(),
+                Some(MarkerLine {
+                    content_row: 1,
+                    line: marker,
+                }),
+            ))
         }
         Some("assistant") => {
             let content = record.get("message").and_then(|m| m.get("content"))?;
@@ -574,19 +643,26 @@ fn render_record(
             if body.is_empty() {
                 return None;
             }
-            let mut lines = vec![
-                Line::from(""),
-                marker_line_with_time(
-                    CLAUDE_MARKER.to_string(),
-                    claude_style(),
-                    agent.effective(),
-                    record,
-                    prev_day,
-                ),
-            ];
+            let marker = marker_line_with_time(
+                CLAUDE_MARKER.to_string(),
+                claude_style(),
+                agent.effective(),
+                record,
+                prev_day,
+            );
+            let mut lines = vec![Line::from(""), marker.clone()];
             let offset = lines.len();
             lines.extend(body);
-            Some((lines, rebased(body_links, offset), Vec::new(), Vec::new()))
+            Some((
+                lines,
+                rebased(body_links, offset),
+                Vec::new(),
+                Vec::new(),
+                Some(MarkerLine {
+                    content_row: 1,
+                    line: marker,
+                }),
+            ))
         }
         Some("agent-setting") => {
             // Positional state, not a rendered line: record the interactive BIND in
@@ -1079,6 +1155,10 @@ fn injected_style() -> Style {
 /// An open node's body is ALSO returned as one [`UnindexedRows`] run: the content
 /// index leaves injected records out, so the pane's search marks must too.
 ///
+/// It returns no [`MarkerLine`], for the peer node's reason: the node is not a
+/// turn, and its header's click affordance would be a promise the pinned row could
+/// not keep, so [`render_record`] completes its [`Block`] with `None`.
+///
 /// PURE: `expanded` is read, never written.
 ///
 /// [`Unfoldable`]: PeerFold::Unfoldable
@@ -1088,7 +1168,12 @@ fn injected_node_lines(
     record: &Value,
     prev_day: &mut Option<Date>,
     width: usize,
-) -> Block {
+) -> (
+    Vec<Line<'static>>,
+    Vec<LinkRegion>,
+    Vec<FoldRegion>,
+    Vec<UnindexedRows>,
+) {
     let key = injected_fold_key(record);
     let fold = peer_fold(key.as_deref(), expanded);
     let mut header = marker_line_with_time(
@@ -3310,6 +3395,39 @@ mod tests {
         );
     }
 
+    /// A peer node contributes NO [`MarkerLine`], collapsed or expanded, while the
+    /// ordinary turns around it keep theirs.
+    ///
+    /// The pinned preview row shows a marker verbatim, and a node's header ends in
+    /// a click affordance the pinned row cannot honor, so the node stays out of
+    /// the list and the row goes on naming the turn above it. Asserted at the
+    /// producer, where a stray marker would otherwise render a perfectly ordinary
+    /// transcript.
+    #[test]
+    fn a_peer_node_contributes_no_marker_to_the_pinned_row() {
+        let path = fixture(PEER_FOLDER, "sess-peer-handback-1.jsonl");
+        for open in [&[][..], &[PEER_STEM][..]] {
+            let rendered = render_file_expanded(&path, WIDE, open);
+            let header_row = rendered
+                .folds
+                .first()
+                .expect("the hand-back renders its fold region")
+                .content_row;
+            assert!(
+                rendered.markers.iter().all(|m| m.content_row != header_row
+                    && m.line
+                        .spans
+                        .first()
+                        .is_none_or(|s| !s.content.starts_with(PEER_MARKER))),
+                "no marker may address the node's header (open={open:?})"
+            );
+            assert!(
+                rendered.markers.iter().any(|m| m.content_row > header_row),
+                "the turn BELOW the node still pins, or the list is vacuous (open={open:?})"
+            );
+        }
+    }
+
     /// A peer record with a BODY but NO `origin.from` renders EXPANDED, carries NO
     /// fold region and shows NO affordance text.
     ///
@@ -3530,6 +3648,51 @@ mod tests {
         );
     }
 
+    /// An injected node contributes NO [`MarkerLine`], collapsed or expanded, for
+    /// the peer node's reason (see `a_peer_node_contributes_no_marker_to_the_pinned_row`),
+    /// while the turns around it keep theirs — so the pinned row never shows a
+    /// skill body's header, nor a `you` marker for text nobody typed.
+    #[test]
+    fn an_injected_node_contributes_no_marker_to_the_pinned_row() {
+        for open in [&[][..], &[SKILL_BODY_KEY][..]] {
+            let rendered = render_file_expanded(&command_fixture(), WIDE, open);
+            let header_rows: Vec<usize> = rendered
+                .text
+                .lines
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| {
+                    l.spans
+                        .first()
+                        .is_some_and(|s| s.content.starts_with(INJECTED_MARKER))
+                })
+                .map(|(row, _)| row)
+                .collect();
+            assert_eq!(
+                header_rows.len(),
+                2,
+                "the fixture renders its two injected nodes (open={open:?})"
+            );
+            assert!(
+                rendered
+                    .markers
+                    .iter()
+                    .all(|m| !header_rows.contains(&m.content_row)
+                        && m.line
+                            .spans
+                            .first()
+                            .is_none_or(|s| !s.content.starts_with(INJECTED_MARKER))),
+                "no marker may address an injected node's header (open={open:?})"
+            );
+            assert!(
+                header_rows
+                    .iter()
+                    .all(|&header| rendered.markers.iter().any(|m| m.content_row > header)),
+                "a turn BELOW each node still pins, or the check is vacuous (open={open:?})"
+            );
+        }
+    }
+
     /// An injected record with NO `uuid` has no fold key: it renders OPEN, claims
     /// no click and promises none — a collapsed node nobody can open would put its
     /// body out of reach. Its body is still unindexed text.
@@ -3581,7 +3744,7 @@ mod tests {
             "origin": {"kind": "peer", "from": PEER_STEM, "body": "the report"},
             "message": {"content": "Another Claude session sent a message: the report"}
         });
-        let (lines, _, folds, unindexed) = render_record(
+        let (lines, _, folds, unindexed, _) = render_record(
             &record,
             &mut AgentState::default(),
             &HashSet::new(),
@@ -3828,6 +3991,95 @@ mod tests {
                 "{sep} separator must be bold"
             );
         }
+    }
+
+    /// Every marker [`render_file_collect`] collects addresses the row its OWN line
+    /// was rendered on — the `summary` head included, whose block is a SINGLE line
+    /// and so carries its marker at block row 0, where a `user` or `assistant`
+    /// turn's leading blank line puts theirs at row 1.
+    ///
+    /// [`RenderedPreview::markers`] has exactly one reader — the pinned preview
+    /// banner, through `App::preview_marker_at` — and a marker rebased onto the
+    /// wrong row still renders a perfectly ordinary transcript, so nothing in the
+    /// drawn text can catch it. That is why the row is pinned HERE, at the producer,
+    /// rather than left to a pane test: the banner's own suite resolves WHICH turn
+    /// owns a scroll offset, and takes these rows as given.
+    ///
+    /// INDEPENDENT on both sides. The summary's expected text is read back out of
+    /// the FIXTURE's own first record, so re-wording the fixture moves the
+    /// expectation with it instead of stranding a hardcoded string; and the rows are
+    /// re-derived by walking the rendered `Text` FORWARD for every marker-led line,
+    /// never by asking the list under test where its markers are.
+    #[test]
+    fn collected_markers_address_their_rendered_rows_summary_head_included() {
+        let path = fixture("-Users-me-project-alpha", "sess-normal-1.jsonl");
+        let raw = std::fs::read_to_string(&path).expect("read the fixture");
+        let record: Value = serde_json::from_str(raw.lines().next().expect("a first record"))
+            .expect("the first record is JSON");
+        assert_eq!(
+            record.get("type").and_then(Value::as_str),
+            Some("summary"),
+            "this fixture must LEAD with a summary record, or the arm under test is \
+             never reached"
+        );
+        // The head renders the fixture's own summary verbatim behind a `# `, so the
+        // expectation comes from the INPUT rather than from anything the renderer
+        // produced.
+        let expected_head = format!(
+            "# {}",
+            record
+                .get("summary")
+                .and_then(Value::as_str)
+                .expect("a summary record names its summary")
+        );
+
+        let rendered = render_file_collect(&path, WIDE, &HashSet::new(), &HashSet::new());
+        let text_of =
+            |line: &Line<'_>| -> String { line.spans.iter().map(|s| s.content.as_ref()).collect() };
+
+        // Walk the rendered transcript forward for every marker-led line — the `# `
+        // head as well as the two turn glyphs. A markdown body header has its hashes
+        // STRIPPED by `markdown_body_lines`, so nothing inside a turn can pose as the
+        // summary head here.
+        let expected: Vec<(usize, String)> = rendered
+            .text
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| {
+                line.spans.first().is_some_and(|span| {
+                    let head = span.content.as_ref();
+                    head == YOU_MARKER || head == CLAUDE_MARKER || head == expected_head
+                })
+            })
+            .map(|(row, line)| (row, text_of(line)))
+            .collect();
+        let actual: Vec<(usize, String)> = rendered
+            .markers
+            .iter()
+            .map(|marker| (marker.content_row, text_of(&marker.line)))
+            .collect();
+
+        // The fixture must carry ordinary turns beside the summary, or the rebase
+        // past the head's one-line block is never exercised.
+        assert!(
+            expected.len() > 1,
+            "the oracle must find the summary AND real turns: {expected:?}"
+        );
+        assert_eq!(
+            actual, expected,
+            "every collected marker must address the row its line was rendered on, \
+             in transcript order"
+        );
+        // The arm this exists for: the head is the FIRST marker and sits at row 0 —
+        // its block contributes exactly one line, so there is no leading blank row to
+        // rebase past, and the banner has a turn to name at the very top of a
+        // summary-led transcript.
+        assert_eq!(
+            actual.first(),
+            Some(&(0, expected_head)),
+            "the summary head must be a pinnable marker at the transcript's first row"
+        );
     }
 
     #[test]

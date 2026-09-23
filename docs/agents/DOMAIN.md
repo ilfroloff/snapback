@@ -198,12 +198,15 @@ other or from `kind`. The re-measurement changes the figure, not the decision: a
 present pid is still no evidence of a write, and an absent one no evidence of
 none.
 
-The pid now has exactly ONE consumer, and it asks a DIFFERENT question: the
+The pid now has TWO consumers, and neither asks the writer question. The
 [`Ctrl-K` interrupt gate's signal route](#the-signal-route-no-job-id-a-pid) asks
 "which process do I signal?" for a reported session that has no stoppable job
-id. That consumer is the only reason `ReportedAgent::pid` exists, and the field's
-doc comment carries the same prohibition as this note, so the pid cannot drift
-into the writer guard without contradicting both.
+id — the only reader of its VALUE, and the reason `ReportedAgent::pid` was
+parsed. The pinned preview row asks only whether one is PRESENT, to decide
+whether a live agent's status and age ride after the turn marker (see
+[reported agents](#reported-agents-srcagentsrs)). The field's doc comment names
+both and carries the same prohibition as this note, so the pid cannot drift into
+the writer guard without contradicting both.
 
 **Known, accepted risk on that route (ratified, not engineered around).** The
 route sends a SIGTERM and nothing stronger: no SIGKILL and no escalation. It
@@ -969,8 +972,18 @@ carries that failure from the moment it arrives until the user next WRITES into
 the session, typed or as a quick reply. Two surfaces show it: the row's
 `[task failed]` marker (`view::FAILED_TASK_MARKER`, outside the agent badge) and a
 banner sentence on the pinned preview row quoting claude's summary unchanged
-(`background task failed at <when>: <summary>`, `view::failed_task_banner`; it
-shares the row with the reported-agent status when both hold). With nothing to
+(`background task failed at <when>: <summary>`, `view::failed_task_banner`). That
+sentence OUTRANKS everything else the pinned row can show — failure > the turn
+marker at the top of the viewport (followed, for a LIVE agent — its record
+carries a `pid` — whose [age](#reported-agents-srcagentsrs) is known, by
+`<status> · <age>`) > the
+reported-agent status (with its age when known) > a blank row — so it stands on
+the row ALONE, with no marker, status or age beside it, and the sticky turn header
+gives way on that session until the user writes into it; the row's reservation,
+and so the preview's
+geometry and click hit-test, do not change
+([PATTERNS.md](PATTERNS.md#5-selection-and-scroll-survive-reloads), the
+`has_banner` rule). With nothing to
 quote — no summary, or one of only whitespace and control characters
 (`view::quotable_summary`) — the sentence stops at `background task failed at
 <when>`, never at a dangling colon. It is a **marker
@@ -1153,13 +1166,28 @@ step that branches on it:
 - `state`/`status`, the activity qualifier (see below).
 - `pid`, the OS process id claude reports: a JSON number, read with `as_u64` and
   narrowed with `u32::try_from`, so an absent, mistyped (a string) or out-of-range
-  value is `None` and never discards the record. Its one consumer is `Ctrl-K`'s
-  [signal route](#the-signal-route-no-job-id-a-pid). It is NOT a writer signal;
-  see [the one write into this tree](#on-disk-layout).
+  value is `None` and never discards the record. Its VALUE has one consumer,
+  `Ctrl-K`'s [signal route](#the-signal-route-no-job-id-a-pid); its PRESENCE is
+  the pinned preview row's LIVE test (`view::reports_live_process`, next
+  bullet). It is NOT a writer signal; see
+  [the one write into this tree](#on-disk-layout).
 - `startedAt`, when claude says the session started: epoch MILLISECONDS as a JSON
   number (13 digits, e.g. `1790152789592`), read with `as_i64`, fail-soft. Its
   one consumer is the preview banner's age phrase (`live busy · 46m`, built by
-  the pure `agents::elapsed_phrase`).
+  the pure `agents::elapsed_phrase`). A known age does NOT mark the agent live.
+  On the pinned preview row `<status> · <age>` rides after the turn marker the
+  row names (`● claude · 10:00  ·  live busy · 46m`) only for a LIVE agent —
+  its record carries a `pid` — whose age is known, marker first, so a narrow
+  pane cuts the age before the marker. Every other session's row is exactly the
+  marker. The rule reads no `classify` bucket and is not `agents::is_active`
+  (which calls an `idle` agent resting). Why the `pid` and not the age: an
+  `--all` capture on 2026-09-26 held 188 records, EVERY one with a `startedAt`
+  but only 2 with a `pid` (`status` `busy` and `idle`); the 186 without were
+  `state` `blocked` 85, `stopped` 81, `done` 19 and `failed` 1, so an age alone
+  put a status beside the turn of nearly every finished or parked session. A
+  transcript with no marker falls back to the status, with its age when known,
+  live or not. A standing failed task outranks all of it
+  ([failed background task](#failed-background-task-storeparse)).
 
 `name` is still on the wire (69/83 background and 3/3 interactive records in the
 2.1.278 bare probe) but is no longer parsed: `ReportedAgent` dropped it because
@@ -1171,7 +1199,10 @@ from the bare one-shot probe (`App::live_agent_now`), never from the polled
 `--all` map. That is the rule `id` already follows, and it matters more here: a
 stale job id makes `claude stop` fail with "No job matching", while a stale pid
 may already belong to an unrelated process. The banner's `startedAt` DOES come
-from the polled `--all` map, because an age is a display fact and not a gate. Its
+from the polled `--all` map, because an age is a display fact and not a gate. So
+does the pinned row's live test, which reads only whether that map's record
+carries a `pid`, never the number: a stale presence draws the suffix one poll
+late, which is the badge's own staleness, and signals nothing. The age's
 "now" is the instant the poller got its answer: the wall-clock stamp
 `watch::AppEvent::ReportedAgents` carries as `reported_at_ms` and
 `App::set_reported_agents` stores, together with the map, in
@@ -1298,7 +1329,7 @@ exactly ONE place: `classify` buckets the resolved qualifier (`state`, else
 `status` — `ReportedAgent::qualifier`'s precedence) into an `AgentActivity`.
 Every qualifier-shaped output derives from that enum, so they cannot drift apart:
 
-| Bucket | Qualifier(s) | Badge color | Badge glyph | Dot pulses | Banner / row reads |
+| Bucket | Qualifier(s) | Badge color | Badge glyph | Dot pulses | Row reads |
 | --- | --- | --- | --- | --- | --- |
 | `NeedsInput` | `blocked`, `waiting` | `Yellow` (label/phrase) | `!` (`Red`) | no | `needs input` (translated — both tokens) |
 | `Idle` | `idle` | `Green` | `●` | no | `idle` (verbatim) |
@@ -1323,13 +1354,16 @@ Red is an ACCENT layered on the shape channel — one steady cell, NOT a row-wid
 pulsing alarm, which the design avoids because nearly every active agent is
 `blocked` and an alarm on all of them would cry wolf.
 
-The **Banner / row reads** column is one phrase with two consumers: `classify`
-feeds a single `agents::qualifier_copy`, so the preview banner
-(`friendly_status`, kind label fused in) and the board **list row** speak the
-SAME translated copy — the row no longer prints the raw token. Only the WEIGHT
-differs, and that is a `tui::view` rendering call, not a bucket property:
-`NeedsInput` draws its `needs input` at the badge's own color + `BOLD` (as loud
-as the dot and kind label), every other bucket stays `DIM`.
+The **Row reads** column is one phrase with two consumers: `classify` feeds a
+single `agents::qualifier_copy`, so the preview banner's status — the fallback for
+a transcript with no marker at all and no
+[failed task](#failed-background-task-storeparse) standing, and the suffix a LIVE
+agent's pinned turn marker carries (`friendly_status`, kind label fused in) — and
+the board
+**list row** speak the SAME translated copy — the row no longer prints the raw
+token. Only the WEIGHT differs, and that is a `tui::view` rendering call, not a
+bucket property: `NeedsInput` draws its `needs input` at the badge's own color +
+`BOLD` (as loud as the dot and kind label), every other bucket stays `DIM`.
 
 **`WorkingButIdle` is the only bucket classified from the raw `state`/`status`
 PAIR rather than the collapsed qualifier, and the only translated one with no
@@ -1669,6 +1703,22 @@ cannot disagree about which records are instructions.
 - **Out of scope:** naming the skill in the fold line (when claude runs a skill
   itself, the turn above only says `[tool_use: Skill]`), and auto-opening a fold
   whose body is the only place a query occurs.
+
+**A fold node — a hand-back or injected context — renders no turn marker, so the
+pinned row names the last turn above it.** Neither node is a turn, and each
+header ends in a click affordance the pinned preview row could not honor, so
+`store::preview` captures no marker for either, collapsed or expanded. The pinned
+row — which names whichever turn owns the line at the top of the viewport —
+therefore goes on naming the LAST turn marker above the node, whichever turn that
+is (the FIRST marker when none precedes it, the same fallback as at the top of any
+transcript), for an open injected node as for a hand-back: while you read inside an
+expanded hand-back, it names that turn, not the sender whose message you are
+reading. That is usually the `● claude` turn that delegated the work, but nothing
+ties the node to it — a background hand-back that lands after later turns names
+the latest of them, and a peer message that follows a `▶ you` turn names
+`▶ you` (the fixture store's `sess-peer-nonstem-1` does exactly that). The
+node's own `◆ message from …` header is what names that sender, and it scrolls
+with the transcript.
 
 ## User-facing modes (`tui::app`)
 
@@ -2034,7 +2084,7 @@ and then on every `Tick` (see
 [the event sources](ARCHITECTURE.md#event-sources-watcheventloop)). So the entry
 clears only once the reply child has finished. It is never cleared early at the
 seam, which would reopen `Ctrl-X d` on a transcript the child may still be
-writing, and it no longer stays set until restart. The pinned status banner is SUPPRESSED
+writing, and it no longer stays set until restart. The pinned banner is SUPPRESSED
 while a send is in flight (`view::preview_banner` returns `None`, keeping render and
 the click hit-test agreeing on the geometry), since the inline turns replace it.
 

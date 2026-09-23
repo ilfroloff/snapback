@@ -12,7 +12,10 @@
 //! * **[`reported_agents`] — `--json --all` — the BOARD's signal.** Polled ~5s
 //!   off-thread while the board is active (skipped entirely once it has been
 //!   idle past `AGENTS_IDLE_AFTER`); drives badges, colors, the pulse and the
-//!   preview banner via [`classify`]. The bare command lists currently-active
+//!   list row's worded qualifier via [`classify`] — which the pinned preview
+//!   banner reaches ONLY through its fallback for a transcript with no marker
+//!   to pin (an empty one, or a session file that can no longer be read). The
+//!   bare command lists currently-active
 //!   agents AND recently finished ones (claude keeps a `done` background job in
 //!   the active list for a while before reaping it), so a just-wrapped-up
 //!   session is briefly observable without `--all`. What `--all` adds is the
@@ -147,11 +150,13 @@ const QUALIFIER_FAILED: &str = "failed";
 
 /// User-facing copy for [`AgentActivity::NeedsInput`] — the FIRST of the two
 /// translated buckets (the other is [`INTERRUPTED_COPY`]). Phrased as what the
-/// SESSION wants ("needs input"), so BOTH the preview banner
-/// ([`friendly_status`]) AND the board list row
-/// ([`crate::tui::view::render_list`], via [`qualifier_copy`]) tell the user why
-/// it stopped instead of restating the raw token ([`QUALIFIER_BLOCKED`] or
-/// [`QUALIFIER_WAITING`]).
+/// SESSION wants ("needs input"), so the board list row
+/// ([`crate::tui::view::render_list`], via [`qualifier_copy`]) — and the pinned
+/// preview banner's status ([`friendly_status`]), both its fallback for a
+/// transcript with no marker to pin (an empty one, or a session file that can no
+/// longer be read) and the suffix a LIVE agent's pinned turn marker carries —
+/// tell the user why it stopped instead of restating the raw token
+/// ([`QUALIFIER_BLOCKED`] or [`QUALIFIER_WAITING`]).
 const NEEDS_INPUT_COPY: &str = "needs input";
 
 /// User-facing copy for [`AgentActivity::WorkingButIdle`] — the SECOND
@@ -224,10 +229,17 @@ pub struct ReportedAgent {
     /// A JSON NUMBER on the wire, read fail-soft and narrowed (see
     /// [`parse_agents_json`]).
     ///
-    /// **ONE consumer, and it is named so a second one cannot arrive quietly:**
-    /// [`crate::send::interrupt_gate`]'s signal route — the `Ctrl-K` case for a
-    /// reported session that has NO stoppable job `id`. `claude stop <job-id>`
-    /// stays the verb wherever a job id exists, so nothing else reads this.
+    /// **TWO consumers, each named so a third one cannot arrive quietly, and only
+    /// the first reads the NUMBER:**
+    ///
+    /// * [`crate::send::interrupt_gate`]'s signal route — the `Ctrl-K` case for a
+    ///   reported session that has NO stoppable job `id`. `claude stop <job-id>`
+    ///   stays the verb wherever a job id exists, so no other route reads the value.
+    /// * the pinned preview row's LIVE test (`tui::view::reports_live_process`),
+    ///   which asks only whether a pid is PRESENT — the wire's per-record sign that
+    ///   claude holds a process for the session — to decide whether the status and
+    ///   age ride after the turn marker. A display fact: it never reads the number,
+    ///   and it decides nothing.
     ///
     /// `pid` and [`ReportedAgent::id`] are two SEPARATE conditions and neither
     /// may be inferred from the other, nor from `kind`. Measured at
@@ -235,20 +247,24 @@ pub struct ReportedAgent {
     /// ones — but an earlier sample carried one on 2/150 BACKGROUND records, so
     /// "has a pid" must never be read as "is interactive".
     ///
-    /// **Read from [`live_agents`]' records ONLY — never from
+    /// **Its VALUE is read from [`live_agents`]' records ONLY — never from
     /// [`reported_agents`]'** (i.e. never through
     /// [`crate::tui::app::App::reported_agent`]). Same rule as
     /// [`ReportedAgent::id`], for a strictly worse reason: a pid off that
     /// ~5.3s-stale (unboundedly stale while idle) `--all` map may already have
     /// been REUSED by an unrelated process, and a signal is irreversible. The
     /// gate's pid comes from [`crate::tui::app::App::live_agent_now`] — the
-    /// one-shot probe that confirmed the session is live in the SAME read.
+    /// one-shot probe that confirmed the session is live in the SAME read. The
+    /// pinned row's presence test is the one read off that polled map, and it is
+    /// safe there for the reason the value is not: a stale PRESENCE draws a suffix
+    /// one poll late, while a stale NUMBER can land a signal on a reused pid.
     ///
     /// **It must NEVER be reachable from [`crate::delete::can_delete`].** That
     /// guard asks "is a WRITER present?"; a pid does not answer that, and
     /// DOMAIN.md's "pid is deliberately unused" note stands for that question
-    /// unchanged. This field answers a different one — "which process do I
-    /// signal?" — and the two must not be conflated.
+    /// unchanged. This field answers different ones — "which process do I
+    /// signal?", and by its presence alone "is this agent live on the pinned
+    /// row?" — and neither may be conflated with the writer question.
     pub pid: Option<u32>,
     /// `startedAt` field: when claude says this session started, as epoch
     /// MILLISECONDS (a 13-digit JSON number on the wire at `claude 2.1.278`,
@@ -330,7 +346,11 @@ impl ReportedAgent {
 /// What a reported agent is doing, bucketed from its `state`/`status` qualifier.
 ///
 /// This enum is the SINGLE interpretation of that undocumented value set: the
-/// preview banner ([`friendly_status`]), the list-badge pulse ([`is_active`]),
+/// list row's worded qualifier ([`qualifier_copy`], which the pinned preview
+/// banner reaches only via [`friendly_status`]: in its fallback for a transcript
+/// with no marker to pin — an empty one, or a session file that can no longer be
+/// read — and in the status a LIVE agent's turn marker carries), the list-badge
+/// pulse ([`is_active`]),
 /// the badge color ([`crate::tui::view::badge_color`]) and the hard-delete
 /// writer guard ([`crate::delete::can_delete`]) all map from it, so a schema
 /// drift is a one-line change in [`classify`] rather than a hunt for raw string
@@ -483,8 +503,11 @@ pub fn classify(agent: &ReportedAgent) -> AgentActivity {
 ///   working `state` and an `idle` `status`, which read verbatim would be a bare,
 ///   endless `working`.
 ///
-/// Its two consumers are the preview banner ([`friendly_status`], which fuses the
-/// phrase onto the kind label) and the board list row
+/// Its two consumers are the pinned preview banner's status
+/// ([`friendly_status`], which fuses the phrase onto the kind label) — its
+/// fallback for a transcript with no marker to pin (an empty one, or a session
+/// file that can no longer be read), and the suffix a LIVE agent's turn marker
+/// carries — and the board list row
 /// ([`crate::tui::view::render_list`], which draws the phrase as its own span so
 /// it can weight [`AgentActivity::NeedsInput`] louder than the rest). Both read
 /// the SAME phrase here, so they can never disagree about what a qualifier says.
@@ -526,8 +549,13 @@ pub fn friendly_status(agent: &ReportedAgent) -> String {
 /// How long before `now_ms` claude says a session started, in ONE coarse unit —
 /// `42s`, `46m`, `3h` — or `None` when there is nothing honest to say.
 ///
-/// Its one consumer is [`crate::tui::view::preview_banner`], which composes it
-/// beside [`friendly_status`] so a wedged child reads `live busy · 46m`.
+/// Its one consumer is the pinned preview banner
+/// ([`crate::tui::view::preview_banner`]), which composes it beside
+/// [`friendly_status`] so a wedged child reads `live busy · 46m` — after a LIVE
+/// agent's turn marker, or alone as the fallback for a transcript with no marker.
+/// A known age does NOT mark the agent live there: a finished record carries a
+/// `startedAt` too, so the row asks the record's [`ReportedAgent::pid`] for that
+/// (`tui::view::reports_live_process`).
 ///
 /// Pure: BOTH instants are parameters, so it never reads a clock. `started_at_ms`
 /// is [`ReportedAgent::started_at_ms`] (epoch millis off the wire), and `now_ms` is
@@ -845,8 +873,9 @@ mod tests {
         ReportedAgent::fixture(kind, state, status)
     }
 
-    /// `qualifier_copy` is the shared translation the preview banner AND the
-    /// board list row both speak, so it is pinned directly here rather than only
+    /// `qualifier_copy` is the shared translation the board list row AND the
+    /// pinned banner's fallback for a transcript with no marker at all both speak,
+    /// so it is pinned directly here rather than only
     /// through `friendly_status`: the TWO authored buckets (`NeedsInput`, both
     /// spellings from either qualifier source; and `WorkingButIdle`) translate,
     /// every other bucket passes its raw token through verbatim, and an agent with
@@ -1268,7 +1297,7 @@ mod tests {
     ///
     /// `--all` is the load-bearing half and the reason this test exists: the bare
     /// command drops a finished job once claude reaps it from the active list, so
-    /// without the flag a `done` session's badge and banner vanish the moment it is
+    /// without the flag a `done` session's badge vanishes the moment it is
     /// reaped — the `done` bucket stops RELIABLY reaching `classify`. Every `done`
     /// assertion in this module would still pass, because they feed `classify`
     /// synthetic agents rather than the wire; only this assertion sees the flag.
