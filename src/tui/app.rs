@@ -1348,6 +1348,25 @@ pub struct App {
     /// Contrast `expanded` above, which must cross reloads and therefore may not
     /// be.
     hidden: HashMap<usize, usize>,
+    /// Session ids showing the anthropics/claude-code#80811 downgrade: a
+    /// background fork carrying an agent NAME that lost the agent BINDING its own
+    /// lineage root still carries (see [`lineage::lost_agent_bindings`]).
+    ///
+    /// DERIVED, and rebuilt ONCE per reload in
+    /// [`apply_reload`](Self::apply_reload) — never per frame and never per row.
+    /// The question is about a lineage, so answering it while drawing row `i`
+    /// would rescan the whole store for every row and make the board O(n²); one
+    /// grouping pass per reload makes it O(n).
+    ///
+    /// Id-keyed rather than index-keyed because it is read beside
+    /// [`hidden_ids`](Self::hidden_ids) with the row's own `session_id` already in
+    /// hand, and an id cannot be invalidated by a reordering reload.
+    ///
+    /// It is a BADGE and nothing else: no key is bound to it, and it gates no
+    /// action. A fact true over an INTERVAL lives in typed state and renders on
+    /// the surface that owns it — the row — never on the keypress-scoped status
+    /// line (AGENTS.md, STATUS-LINE OWNERSHIP).
+    pub lost_agent_bindings: HashSet<String>,
     /// The PERSISTED set of user-hidden session ids — snapback's OWN visibility
     /// preference, loaded once at construction from
     /// [`config::state_dir`] and re-saved
@@ -1482,6 +1501,10 @@ impl App {
     pub fn new(sessions: Vec<Session>, scope: Scope, launch_dir: PathBuf) -> Self {
         let index = SearchIndex::build(&sessions);
         let search_mode = index.mode();
+        // Derived here for the same reason `index` is: it is a function of the
+        // sessions alone, so the very first frame already carries the badge and no
+        // render has to ask. `apply_reload` re-derives it with the same call.
+        let lost_agent_bindings = lineage::lost_agent_bindings(&sessions);
         // Discover DEFINED agents ONCE (a one-shot FS scan, like the picker's) so
         // the preview can validate the `agent-name` fallback without re-reading disk
         // per render.
@@ -1533,6 +1556,7 @@ impl App {
             population: Vec::new(),
             expanded: HashSet::new(),
             hidden: HashMap::new(),
+            lost_agent_bindings,
             // Load the persisted hidden set ONCE at startup. Resolve the dir here
             // (and again at save time) rather than caching a path, so a
             // `SNAPBACK_CONFIG_DIR` override is honored per call and tests can
@@ -2773,6 +2797,10 @@ impl App {
 
         self.sessions = reload.sessions;
         self.index.refresh(&self.sessions);
+        // The #80811 badge set, derived ONCE here from the sessions just applied.
+        // This is the only reload funnel, so every path that can change the store
+        // refreshes the badge by construction — and no render ever recomputes it.
+        self.lost_agent_bindings = lineage::lost_agent_bindings(&self.sessions);
         // Drop stale preview text for the transcripts that moved on disk, and
         // only those. `changed` is a SUPERSET of what really differs, so this
         // errs toward re-rendering rather than toward showing stale text.
@@ -3544,6 +3572,9 @@ mod tests {
             root_uuid: None,
             msg_count: 0,
             content_index: String::new(),
+            background: false,
+            has_agent_name: false,
+            has_agent_setting: false,
         }
     }
 

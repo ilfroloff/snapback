@@ -1722,6 +1722,9 @@ mod tests {
             root_uuid: None,
             msg_count: 0,
             content_index: String::new(),
+            background: false,
+            has_agent_name: false,
+            has_agent_setting: false,
         }
     }
 
@@ -1948,6 +1951,9 @@ mod tests {
             root_uuid: None,
             msg_count: 0,
             content_index: String::new(),
+            background: false,
+            has_agent_name: false,
+            has_agent_setting: false,
         };
         (session, dir)
     }
@@ -3417,6 +3423,9 @@ mod tests {
             root_uuid: None,
             msg_count: 0,
             content_index: String::new(),
+            background: false,
+            has_agent_name: false,
+            has_agent_setting: false,
         }
     }
 
@@ -3691,6 +3700,9 @@ mod tests {
             root_uuid: None,
             msg_count: 0,
             content_index: String::new(),
+            background: false,
+            has_agent_name: false,
+            has_agent_setting: false,
         }
     }
 

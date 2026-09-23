@@ -41,8 +41,12 @@
 //! <prompt>`) — but it belongs here rather than in `resume.rs` for the reason
 //! that defines this module: there is NO terminal teardown, so the board stays up
 //! and the result comes back as an event. Its honesty seam
-//! ([`status_for_bg_launch`]) is deliberately STRICTER than
-//! [`status_for_output`]'s, because a launch can fail SILENTLY on a zero exit.
+//! ([`status_for_bg_launch`]) and the send's ([`status_for_output`]) share ONE
+//! three-row shape, because BOTH can fail SILENTLY on a zero exit: claude prints
+//! its reservation to stderr and exits **0** either way — an unrecognized
+//! `--agent` on the launch, a background-task sweep that terminates the agent the
+//! reply was aimed at on the send. So each treats a zero exit with a non-empty
+//! stderr as *started/sent, but claude warned…* rather than as a clean success.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -91,6 +95,19 @@ const SEND_FAILED_GENERIC: &str = "send failed — claude could not resume this 
 /// Prefix a surfaced claude error carries on the status line, so a failure never
 /// reads like the neutral success ([`SEND_OK`]).
 const SEND_FAILED_PREFIX: &str = "send failed: ";
+
+/// Prefix for a send that LANDED (exit 0) but printed something on stderr.
+///
+/// Worded "sent, but" rather than as a failure because both halves are true: the
+/// reply DID go through, and claude had a reservation about it. It exists because
+/// a zero exit is not proof the send did what was asked — claude can print the
+/// reservation to stderr and still exit **0**, the known case being the
+/// background-task sweep (`Background tasks still running after <n>s;
+/// terminating.`), which kills the background agent the reply was aimed at and
+/// then exits clean. [`SEND_OK`] — or worse, a priced `sent — $…` — would
+/// misreport that silent downgrade as a flawless reply. The launch path's
+/// [`BG_LAUNCH_WARNED_PREFIX`] is the same prefix for the same reason.
+const SEND_WARNED_PREFIX: &str = "sent, but claude warned: ";
 
 /// Max characters of a surfaced claude error kept on the (one-row) status line, so
 /// a verbose message cannot balloon the status past what is useful.
@@ -413,19 +430,65 @@ pub fn status_for_send(raw_stdout: &str) -> (String, bool) {
 /// Combine a finished send's exit status + captured streams into a board status
 /// and its class.
 ///
-/// This is the honesty seam: a send that FAILED must never read as the neutral
-/// success. On a clean (zero) exit the JSON payload is mapped by
-/// [`status_for_send`] (cost / `is_error` / neutral). On a NON-ZERO exit —
-/// notably claude refusing to resume a session it holds as an agent, which exits
-/// `1` with the reason on `stderr` and nothing on `stdout` — the reason is
-/// surfaced by [`status_for_failed_send`] instead, so the user sees why rather
-/// than a false `"sent"`. Returns `(text, transient)`; failures are sticky.
+/// This is the send's honesty seam: a send that failed — or that quietly did LESS
+/// than was asked — must never read as the neutral success. It has the same three
+/// rows as the launch's ([`status_for_bg_launch`]), for the same reason:
+///
+/// | Exit | stderr (sanitized) | Status | Class |
+/// | --- | --- | --- | --- |
+/// | non-zero | anything | [`SEND_FAILED_PREFIX`] + claude's own reason, via [`status_for_failed_send`] | sticky |
+/// | zero | NON-EMPTY | [`SEND_WARNED_PREFIX`] + that reason | sticky |
+/// | zero | empty | [`status_for_send`]'s mapping of the payload (cost / `is_error` / neutral), unchanged | as that map classifies it |
+///
+/// The bottom row is the ordinary case and the top row is the loud one — claude
+/// refusing to resume a session it holds as an agent exits `1` with the reason on
+/// `stderr` and nothing on `stdout`.
+///
+/// The MIDDLE row is the one worth arguing. A zero exit is not proof the send did
+/// what was asked: claude can print a reservation to stderr and still exit **0**,
+/// the known case being the background-task sweep (`Background tasks still
+/// running after <n>s; terminating.`), which kills the background agent the reply
+/// was aimed at and then exits clean — reported, without this row, as a flawless
+/// `sent — $0.0136`. The arm deliberately does NOT match that wording: ANY
+/// surviving stderr warns, so the next zero-exit downgrade that is not this one is
+/// surfaced too. A signature match would be hostage to a string snapback does not
+/// own, which is exactly the fragility the FAIL-SOFT rule warns about; the
+/// accepted cost is a noisier status line, and there is no quieting heuristic.
+///
+/// PRECEDENCE on a zero exit, stated rather than left to be inferred:
+/// [`status_for_send`]'s own FAILURE verdict WINS OUTRIGHT. The middle row may
+/// only replace a status that would have read as a SUCCESS — the priced row or the
+/// neutral [`SEND_OK`] — because it exists to replace a FLATTERING status, never
+/// to overwrite an already-honest one. An `is_error: true` payload therefore comes
+/// back byte-identical to what it returns with a silent stderr.
+///
+/// It DEGRADES toward today's behaviour, never toward a fabricated failure:
+/// "non-empty stderr" means what survives [`first_quotable_line`], so a blank,
+/// whitespace-only or all-escape stderr falls through to the bottom row untouched,
+/// and the quoted text can never carry a raw escape to the ratatui buffer
+/// (TERMINAL-SAFE STYLING). Returns `(text, transient)`; failures AND the warning
+/// are sticky (AGENTS.md STATUS-LINE OWNERSHIP). Pure and unit-tested — no process
+/// is ever spawned.
 #[must_use]
 pub fn status_for_output(success: bool, stdout: &str, stderr: &str) -> (String, bool) {
-    if success {
-        status_for_send(stdout)
-    } else {
-        (status_for_failed_send(stdout, stderr), false)
+    if !success {
+        return (status_for_failed_send(stdout, stderr), false);
+    }
+    let (status, transient) = status_for_send(stdout);
+    // `status_for_send` classifies its two SUCCESS rows (the priced one, the
+    // neutral `SEND_OK`) transient and its one FAILURE row (`is_error: true`)
+    // sticky, so this flag IS the "did that read as a success?" question — named
+    // here rather than used as an anonymous boolean, because the precedence above
+    // turns on the question, not on the class.
+    let read_as_success = transient;
+    if !read_as_success {
+        return (status, transient); // already honest -> never re-worded as a warning
+    }
+    // Zero exit: a stderr that survives sanitizing is claude's reservation about a
+    // send it nonetheless completed (see the table above).
+    match first_quotable_line(stderr) {
+        Some(line) => (format!("{SEND_WARNED_PREFIX}{line}"), false),
+        None => (status, transient),
     }
 }
 
@@ -435,9 +498,9 @@ pub fn status_for_output(success: bool, stdout: &str, stderr: &str) -> (String, 
 /// `is_error` payload's `result` (when `--output-format json` still printed one),
 /// else the first non-empty `stderr` line (the common case — e.g. `Error: Session
 /// <id> is currently running as a background agent (bg)…`), else a generic
-/// fallback. The quoted text is sanitized (ANSI/control stripped, one line,
-/// length-capped) so a raw escape from claude's stderr can never reach the ratatui
-/// buffer (TERMINAL-SAFE STYLING). Pure and unit-tested.
+/// fallback. The quoted text goes through [`first_quotable_line`] (ANSI/control
+/// stripped, one line, length-capped) so a raw escape from claude's stderr can
+/// never reach the ratatui buffer (TERMINAL-SAFE STYLING). Pure and unit-tested.
 #[must_use]
 pub fn status_for_failed_send(stdout: &str, stderr: &str) -> String {
     if let Ok(value) = serde_json::from_str::<Value>(stdout) {
@@ -450,23 +513,42 @@ pub fn status_for_failed_send(stdout: &str, stderr: &str) -> String {
             }
         }
     }
-    // Sanitize FIRST, then strip the `Error: ` label — claude may color the line,
-    // so the label can sit behind an ANSI escape that must be removed before it is
-    // visible to the strip.
-    let stderr_line = stderr
-        .lines()
-        .map(sanitize_status)
-        .map(|l| strip_error_prefix(&l).to_string())
-        .find(|l| !l.is_empty());
-    match stderr_line {
+    match first_quotable_line(stderr) {
         Some(line) => format!("{SEND_FAILED_PREFIX}{line}"),
         None => SEND_FAILED_GENERIC.to_string(),
     }
 }
 
+/// The first line of `text` that survives sanitizing, with claude's duplicated
+/// `Error: ` label stripped — `None` when nothing readable is left.
+///
+/// THREE of the FOUR sites that apply that quoting rule route through it —
+/// [`status_for_failed_send`], [`status_for_output`]'s zero-exit warning, and
+/// [`status_for_bg_launch`] — so the send and the launch render claude's own words
+/// identically: one line, ANSI and control characters stripped (TERMINAL-SAFE
+/// STYLING), length-capped. The FOURTH, [`status_for_stop`], does NOT: it still
+/// holds an inline copy of the same sanitize -> strip-label -> first-non-empty
+/// chain over its own two-stream fallback. So this is the rule's SHARED home, not
+/// its ONLY one — a change here must be mirrored there until that copy is folded in.
+///
+/// The ORDER is load-bearing: sanitize FIRST, then strip the label. claude may
+/// COLOR the line, so the label can sit behind an ANSI escape that has to be
+/// removed before the strip can see it. Doing it the other way round leaves
+/// `send failed: Error: …` on a colored line.
+///
+/// "Empty" therefore means what survives [`sanitize_status`], not what is
+/// non-blank on the wire: a whitespace-only or all-escape `text` yields `None`, so
+/// a caller gating on this can never fabricate a status out of nothing.
+fn first_quotable_line(text: &str) -> Option<String> {
+    text.lines()
+        .map(sanitize_status)
+        .map(|line| strip_error_prefix(&line).to_string())
+        .find(|line| !line.is_empty())
+}
+
 /// Strip a leading `Error: ` label claude prefixes onto a stderr message, so the
 /// status is not doubled up (`send failed: Error: …`). Expects an already-sanitized
-/// line (see [`status_for_failed_send`]).
+/// line (see [`first_quotable_line`], which owns that ordering).
 fn strip_error_prefix(line: &str) -> &str {
     line.strip_prefix("Error: ").unwrap_or(line)
 }
@@ -763,8 +845,10 @@ pub fn plan_bg_launch(launch_dir: &Path) -> Result<PathBuf, String> {
 /// Map a finished background launch (exit status + captured streams) to a board
 /// status and its class.
 ///
-/// This is the launch's honesty seam, and it is NOT [`status_for_output`] with a
-/// different noun — it has a third outcome the send path does not need:
+/// This is the launch's honesty seam. It shares its three-row shape with the
+/// send's ([`status_for_output`]) — the same outcomes under a different noun,
+/// because BOTH paths can fail silently on a zero exit; only the case that proves
+/// it differs:
 ///
 /// | Exit | stderr (sanitized) | Status | Class |
 /// | --- | --- | --- | --- |
@@ -781,24 +865,16 @@ pub fn plan_bg_launch(launch_dir: &Path) -> Result<PathBuf, String> {
 /// STARTED (true) and claude had something to say about it (also true), and the
 /// status says both rather than picking the flattering half.
 ///
-/// Failures reuse [`sanitize_status`] / [`strip_error_prefix`], so the launch, the
-/// send, and the stop all render an external error identically: one line, ANSI and
-/// control characters stripped (TERMINAL-SAFE STYLING), length-capped. Pure and
-/// unit-tested — no process is ever spawned.
+/// Both prefixed rows quote through [`first_quotable_line`] — the rule
+/// [`status_for_stop`] applies too — so the launch, the send, and the stop all
+/// render an external message identically: one line, ANSI and control characters
+/// stripped (TERMINAL-SAFE STYLING), length-capped. Pure and unit-tested — no
+/// process is ever spawned.
 #[must_use]
 pub fn status_for_bg_launch(success: bool, stdout: &str, stderr: &str) -> (String, bool) {
-    // The first line of `text` that survives sanitizing, with claude's duplicated
-    // `Error: ` label stripped. Sanitize FIRST so a colored label is visible to the
-    // strip (the rule `status_for_failed_send` documents).
-    let first_line = |text: &str| {
-        text.lines()
-            .map(sanitize_status)
-            .map(|line| strip_error_prefix(&line).to_string())
-            .find(|line| !line.is_empty())
-    };
     if !success {
         return (
-            match first_line(stderr).or_else(|| first_line(stdout)) {
+            match first_quotable_line(stderr).or_else(|| first_quotable_line(stdout)) {
                 Some(line) => format!("{BG_LAUNCH_FAILED_PREFIX}{line}"),
                 None => BG_LAUNCH_FAILED_GENERIC.to_string(),
             },
@@ -806,7 +882,7 @@ pub fn status_for_bg_launch(success: bool, stdout: &str, stderr: &str) -> (Strin
         );
     }
     // Zero exit: a clean stderr is the ONLY clean start (see the table above).
-    match first_line(stderr) {
+    match first_quotable_line(stderr) {
         Some(line) => (format!("{BG_LAUNCH_WARNED_PREFIX}{line}"), false),
         None => (BG_LAUNCH_OK.to_string(), true),
     }
@@ -1239,6 +1315,133 @@ mod tests {
         let stderr = "\u{1b}[33mError: it \t broke\u{1b}[39m\nsecond line";
         let (status, _) = status_for_output(false, "", stderr);
         assert_eq!(status, "send failed: it broke");
+        assert!(
+            !status.contains('\u{1b}') && !status.contains('['),
+            "no escape residue may remain: {status:?}"
+        );
+    }
+
+    /// THE zero-exit silent downgrade, pinned. `claude -p` can print a reservation
+    /// to stderr and still exit **0** — the background-task sweep terminates the
+    /// agent this very reply was aimed at and then exits clean — so a status built
+    /// from the exit code and stdout alone reports a flawless `sent — $…` over a
+    /// reply whose agent was just killed. A zero exit with anything on stderr must
+    /// say so instead.
+    #[test]
+    fn a_zero_exit_with_stderr_reports_sent_but_warned_never_a_clean_send() {
+        let stderr = "Background tasks still running after 600s; terminating.";
+        let stdout = r#"{"type":"result","is_error":false,"total_cost_usd":0.0136}"#;
+        let (status, transient) = status_for_output(true, stdout, stderr);
+
+        assert!(
+            status.starts_with(SEND_WARNED_PREFIX),
+            "a warned send must read as sent-but, got {status:?}"
+        );
+        assert!(
+            status.contains("Background tasks still running"),
+            "it must quote claude's own warning: {status}"
+        );
+        assert_ne!(
+            (status.as_str(), transient),
+            ("sent — $0.0136", true),
+            "a zero exit is NOT enough to claim a clean, priced send"
+        );
+        assert!(
+            !transient,
+            "a warning is sticky, like every other non-success: {status}"
+        );
+        // It is not a FAILURE either — the reply itself did land.
+        assert!(
+            !status.starts_with(SEND_FAILED_PREFIX),
+            "a warned send is not a failed one: {status}"
+        );
+    }
+
+    /// Decision 1 pinned against the rejected signature match: the arm keys off
+    /// "claude said something on stderr", NOT on the sweep's wording. An UNRELATED
+    /// stderr line on a zero exit warns exactly the same, so narrowing this to a
+    /// substring match on the known text later turns this test red.
+    #[test]
+    fn any_stderr_on_a_zero_exit_warns_not_only_the_known_wording() {
+        let unrelated = "Deprecation notice: the pineapple flag moves to --fruit next release";
+        let (status, transient) = status_for_output(
+            true,
+            r#"{"is_error":false,"total_cost_usd":0.5}"#,
+            unrelated,
+        );
+        assert_eq!(
+            status,
+            format!("{SEND_WARNED_PREFIX}{unrelated}"),
+            "any stderr warns — the arm must not be hostage to one wording"
+        );
+        assert!(!transient, "the warning is sticky: {status}");
+    }
+
+    /// The fabricated-failure guard, and the most important test here: "empty"
+    /// stderr means what survives [`sanitize_status`], so blank, whitespace-only
+    /// AND all-escape stderr alike fall through to today's success mapping
+    /// byte-identically. The new arm degrades toward the current behaviour, never
+    /// toward a failure the send never had.
+    #[test]
+    fn a_stderr_that_sanitizes_to_nothing_keeps_todays_success_mapping() {
+        let priced = r#"{"type":"result","is_error":false,"total_cost_usd":0.0136}"#;
+        let neutral = "not json at all";
+        for quiet in [
+            "",
+            "   ",
+            "  \n \n",
+            "\u{1b}[0m",
+            "\u{1b}[33m\u{1b}[39m\n\t",
+        ] {
+            assert_eq!(
+                status_for_output(true, priced, quiet),
+                ("sent — $0.0136".to_string(), true),
+                "a stderr that sanitizes to nothing keeps the priced success: {quiet:?}"
+            );
+            assert_eq!(
+                status_for_output(true, neutral, quiet),
+                (SEND_OK.to_string(), true),
+                "...and keeps the neutral success too: {quiet:?}"
+            );
+        }
+    }
+
+    /// PRECEDENCE: the warning arm exists to replace a FLATTERING status, never to
+    /// overwrite an admitted failure. A zero exit whose payload carries `is_error:
+    /// true` is already honest, so it comes back byte-identical to today even with
+    /// a non-empty stderr sitting alongside it.
+    #[test]
+    fn an_is_error_payload_keeps_its_failure_over_the_zero_exit_warning() {
+        let stdout = r#"{"type":"result","is_error":true,"total_cost_usd":0.01,
+                         "result":"tool blew up"}"#;
+        assert_eq!(
+            status_for_output(
+                true,
+                stdout,
+                "Background tasks still running after 600s; terminating."
+            ),
+            (SEND_ERROR.to_string(), false),
+            "an already-honest failure must not be re-worded as a warning"
+        );
+        // The stderr changes nothing here, which is the whole point: the verdict is
+        // identical to the one the same payload gets with a silent stderr.
+        assert_eq!(
+            status_for_output(true, stdout, ""),
+            (SEND_ERROR.to_string(), false)
+        );
+    }
+
+    /// The shared quoting helper sanitizes BEFORE stripping the `Error: ` label —
+    /// claude may color the line, so the label can sit behind an ANSI escape that
+    /// must be removed before the strip can see it. Pinned on the send's WARNING
+    /// path too, since that is the path the new prefix opened: no escape residue
+    /// may reach the ratatui buffer (TERMINAL-SAFE STYLING).
+    #[test]
+    fn a_warned_send_sanitizes_before_stripping_the_error_label() {
+        let noisy = "\u{1b}[33mError: it \t broke\u{1b}[39m\nsecond line";
+        let (status, transient) = status_for_output(true, "{}", noisy);
+        assert_eq!(status, format!("{SEND_WARNED_PREFIX}it broke"));
+        assert!(!transient, "the warning is sticky: {status}");
         assert!(
             !status.contains('\u{1b}') && !status.contains('['),
             "no escape residue may remain: {status:?}"

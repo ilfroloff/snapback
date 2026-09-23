@@ -302,6 +302,23 @@ real session you can resume, and that matters: a session that's running in the
 background can't be plain-resumed, so the older copy is often the one that
 *will* open. It's one keypress away instead of lost in a row of twins.
 
+**When a background copy loses its agent.** That same copying step has a bug in
+Claude Code ([#80811](https://github.com/anthropics/claude-code/issues/80811)):
+the new file sometimes arrives **without the agent the original was bound to**.
+The job keeps its name, so nothing looks wrong — but it is no longer running as
+the agent you picked.
+
+snapback marks those rows `[unbound]`. It only says so when it can actually tell:
+the row has to be a background copy that still carries a job name, while the
+**original it was forked from** is right there in the same conversation still
+carrying the binding. A background job that simply never had an agent is not
+marked, because nothing was taken away from it.
+
+It's a marker and nothing more — there's no key on it and it changes nothing. It
+tells you why an agent-bound job may be behaving like a plain one, which is not
+otherwise visible anywhere. Expect it to stop appearing once the upstream bug is
+fixed.
+
 **Hand an agent a job and stay put.** `Ctrl-N` starts a fresh session in the
 folder you launched from. If you keep Claude Code agents defined, it offers a
 quick picker so the new session can start bound to one, and it remembers the last

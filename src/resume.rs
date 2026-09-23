@@ -714,6 +714,9 @@ mod tests {
             root_uuid: None,
             msg_count: 0,
             content_index: String::new(),
+            background: false,
+            has_agent_name: false,
+            has_agent_setting: false,
         };
         (session, dir)
     }
@@ -808,6 +811,9 @@ mod tests {
             root_uuid: None,
             msg_count: 0,
             content_index: String::new(),
+            background: false,
+            has_agent_name: false,
+            has_agent_setting: false,
         };
         match plan(&session, false) {
             ResumePlan::Refuse { message } => {
@@ -833,6 +839,9 @@ mod tests {
             root_uuid: None,
             msg_count: 0,
             content_index: String::new(),
+            background: false,
+            has_agent_name: false,
+            has_agent_setting: false,
         };
         match check(&session, false) {
             Err(ResumeError::Refused(message)) => {
@@ -1225,6 +1234,9 @@ mod tests {
             root_uuid: None,
             msg_count: 0,
             content_index: String::new(),
+            background: false,
+            has_agent_name: false,
+            has_agent_setting: false,
         };
         match check_attach(&session, None) {
             Err(ResumeError::Refused(message)) => {
