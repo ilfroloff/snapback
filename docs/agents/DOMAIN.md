@@ -177,6 +177,7 @@ never fatal:
 | `summary` | on `type:"summary"` | preferred label + searchable text |
 | `agentSetting` | on `type:"agent-setting"`, string (fail-soft) | the [bound agent](#bound-agent-storepreview) handle on preview turns (interactive bind — authoritative); read **positionally**, never hoisted |
 | `agentName` | on `type:"agent-name"`, string (fail-soft) | the background job's name; a **fallback** bound-agent source for the preview handle, trusted ONLY when it names a known agent (the field also carries free-form titles) — see [bound agent](#bound-agent-storepreview) |
+| `sessionKind` | **top-level on ordinary records**, string (fail-soft); only observed value `"bg"` | marks the transcript a **background** job — one half of the [lost agent binding](#lost-agent-binding-storelineage) badge. See [`sessionKind`](#sessionkind) |
 | `message.content` | string **or** typed-block array | user prompt, preview body, content index |
 | `isSidechain` | bool | skip sub-agent turns when picking a label/preview |
 | `uuid` | per record | a record's identity in the transcript **tree** |
@@ -573,7 +574,7 @@ permanently. Nothing else clears it.
 
 When a prompt is handed to a **background** job, Claude Code **forks the
 transcript**: it copies the foreground file's records **verbatim — identical
-record `uuid`s** — into a **NEW `sessionId` file**, stamps that file
+record `uuid`s** — into a **NEW `sessionId` file**, stamps its records
 `sessionKind: "bg"`, and appends there. The foreground file **stops growing** at
 the fork point.
 
@@ -595,13 +596,25 @@ Hiding it irrecoverably would remove a real capability; hence a reversible fold
 
 #### `sessionKind`
 
-A file-level field marking how the session runs; `"bg"` identifies the background
-copy a fork produced. It is **deliberately not read** by any code path — not for
-folding, not for filtering. The lineage is derived from the transcript **tree**
-instead, because that is what makes two files provably the same conversation;
-`sessionKind` only says what a file *is*, never what it is a copy *of*. Recorded
-here because it is the field that explains the duplicate on disk, and the next
-author will find it while looking.
+A field marking how the session runs; `"bg"` identifies a background job.
+
+**Shape.** It is *not* a record type and *not* a single file-level record: it is a
+**top-level envelope key riding on ordinary records** (`user`, `assistant`,
+`attachment`, `system`). Across the records observed in a real store, `"bg"` is the
+**only value it ever takes** — a foreground session simply omits the key. That is an
+observation, not a contract. `parse_file` therefore latches it from
+*any* record and compares against the one discriminant
+(`parse::SESSION_KIND_BACKGROUND`) rather than merely testing for presence, so a
+future second value cannot silently read as "background".
+
+**What it is NOT used for.** It still does **not** drive folding or filtering.
+The lineage is derived from the transcript **tree**, because that is what makes
+two files provably the same conversation; `sessionKind` only says what a file
+*is*, never what it is a copy *of*. Do not reach for it to identify a fork.
+
+**What it IS used for.** Exactly one thing: it is the background half of the
+[lost agent binding](#lost-agent-binding-storelineage) badge, where the question
+really is "what is this file" and the lineage supplies the "copy of what".
 
 #### The transcript is a TREE, not a message list
 
@@ -722,6 +735,87 @@ structural: a background fork copies uuids verbatim; a root uuid never spans a
 That every file yields a root today is likewise a statistic, not a licence: the
 `Option` and its never-folded fallback stay regardless, and are pinned by the
 `sess-rootless-1` fixture rather than by the store.
+
+### Lost agent binding (`store::lineage`)
+
+A board badge surfacing an **upstream Claude Code defect**
+(anthropics/claude-code#80811): a background session silently loses the agent it
+was bound to. It is a **badge only** — no key, no gate, no recovery action — and
+it is presentation-only in exactly the sense the fold is.
+
+#### The three facts it reads
+
+All three are parsed fail-soft in `parse_file`'s single pass and carried on
+`Session`:
+
+| `Session` field | Source record | Meaning |
+| --- | --- | --- |
+| `background` | `sessionKind: "bg"` (envelope key, any record) | this transcript is a background job |
+| `has_agent_name` | `{"type":"agent-name","agentName":"…"}` | it NAMED a job — free-form, never a handle |
+| `has_agent_setting` | `{"type":"agent-setting","agentSetting":"…"}` | it BOUND an agent — a clean handle |
+
+Presence, not value: the badge asks *whether* a record existed, never *which*
+agent. Blank-after-trim counts as absent, matching `preview::trimmed_field`, so
+the badge and the preview's `@handle` cannot disagree about whether an agent was
+named.
+
+#### The rule
+
+`lineage::lost_agent_bindings` flags a session when it is `background`, has
+`has_agent_name`, has **no** `has_agent_setting`, and is **not** its own lineage
+root while that root **does** carry `has_agent_setting`.
+
+The **lineage root** is `lineage::root_of`: the **oldest member that has a
+timestamp**, taken from the far end of the same `member_rank` ordering `head_of`
+takes the top of. The dated filter is load-bearing — `member_rank` leads with
+`Reverse(Option<_>)` and `Reverse(None)` sorts *greatest*, so a plain `max` would
+crown a **timestamp-less** member "oldest". No dated member ⇒ no derivable root ⇒
+no badge.
+
+#### Why the lineage gate exists
+
+The **bare** signature ("bg + named + unbound", read off one row in isolation)
+**over-flags**, because `agentName` is free-form: a real store holds
+`"bugsnag nextjs ssr integration"`, not `"lead"`. A background job that never had
+a binding matches the bare signature while having lost nothing. Gating on the
+root is what turns the badge into a claim about a **loss**: the root carried a
+binding, this member does not, and the two are the same conversation by
+construction.
+
+**Measured over a real store (89 sessions, 2026-09-21):** the gate flags **3**;
+the bare signature would flag **4**. All 3 are genuine — each root bound `lead`
+or `technical-brainstormer`, and each flagged fork's own `agentName` is the
+root's name plus a fork marker (`(2)`, `⑂`). The 4th was cut as a **lineage of
+one** (its own root). Store-wide context: 74 background, 73 named, 76 bound, and
+**68** carry *both* name and binding — the population the badge must never touch.
+A snapshot, not a contract; re-measure before relying on it.
+
+#### Fail-soft
+
+Every way of not knowing yields **no badge**: no `root_uuid`, no dated member, a
+lineage of one, a root on another branch (a lineage is `(repo, branch, root)`, so
+that is different work), and any unreadable `sessionKind` / `agentName` /
+`agentSetting` shape. A degraded parse costs a badge, never a session.
+
+**Not a closed set.** The gate *bounds* over-flagging; it does not eliminate it.
+`Session::timestamp` is the **last** non-null timestamp ("most-recent activity
+wins"), so `root_of` means *earliest last activity* — never *created first*. A
+foreground original that gains its `agent-setting` **after** a background fork was
+taken (resumed, then bound) yet whose activity ends before that fork's is still
+crowned root **with** a binding, so the fork is badged although nothing was ever
+taken from it. What bounds that is the badge being **inert** — no key, no gate, no
+action — so the worst case is one cosmetic marker, never a wrong action.
+
+#### Where it is computed
+
+**Once per reload**, in `App::apply_reload` (and seeded in `App::new`), into
+`App::lost_agent_bindings: HashSet<String>`. Keyed by `session_id` so a
+reordering reload cannot invalidate it. It is **never** recomputed per frame or
+per row: the question is about a lineage, so asking it while drawing row `i`
+would rescan the store per row and make the board O(n²).
+
+The row draws it as `[unbound]` — see the row markers in
+[README.md](../../README.md).
 
 ### Turn count (`store::parse`)
 
@@ -1400,12 +1494,13 @@ Two constraints shape the rest:
   from a `sessionId` anyway. A pane needs none of that — it holds no id, survives
   no reload, and disappears when the draft does.
 
-The launch's honesty seam (`send::status_for_bg_launch`) is deliberately stricter
-than the send's, because `--bg` can fail SILENTLY: an unrecognized `--agent` exits
-**0**, warns on stderr, and starts the session without that agent. A zero exit with
-a non-empty stderr is therefore reported as *started, but claude warned…* rather
-than as a clean start — see
-[CLAUDE_CLI.md](CLAUDE_CLI.md#--bg-can-fail-silently-on-a-zero-exit).
+The launch's honesty seam (`send::status_for_bg_launch`) shares its three-row shape
+with the send's (`status_for_output`), because `--bg` can fail SILENTLY: an
+unrecognized `--agent` exits **0**, warns on stderr, and starts the session without
+that agent. A zero exit with a non-empty stderr is therefore reported as *started,
+but claude warned…* rather than as a clean start — see
+[CLAUDE_CLI.md](CLAUDE_CLI.md#--bg-can-fail-silently-on-a-zero-exit). The send
+carries the same row for its own zero-exit downgrade (below).
 
 ## Quick reply — non-interactive send (`src/send.rs`)
 
@@ -1494,11 +1589,32 @@ No permission flags are passed: a send inherits the user's existing settings.
 exits non-zero with an EMPTY stdout, a driver that nulls stderr and ignores the exit
 code would map the empty stdout to the neutral `"sent"` — a false success over a
 failed send (the exact bug that shipped first). So `run_send` captures stderr AND
-honors the exit code (`status_for_output`): a clean exit maps the JSON payload
-(cost / `is_error` / neutral) via `status_for_send`, while a non-zero exit surfaces
-claude's own reason via `status_for_failed_send` (`send failed: <reason>`),
-sanitized (ANSI/control stripped, one line, length-capped) so no raw escape reaches
-the status line.
+honors the exit code, and `status_for_output` maps the pair in three rows:
+
+| Exit | stderr (sanitized) | Status | Class |
+| --- | --- | --- | --- |
+| non-zero | anything | `send failed: <claude's own reason>` (`status_for_failed_send`) | sticky |
+| zero | NON-EMPTY | `sent, but claude warned: <that reason>` | sticky |
+| zero | empty | `status_for_send`'s payload mapping — cost / `is_error` / neutral | as that map classifies it |
+
+The quoted text is sanitized (ANSI/control stripped, one line, length-capped) so no
+raw escape reaches the status line.
+
+The middle row exists because a **zero exit is not proof the send did what was
+asked**: claude can print a reservation to stderr and still exit 0, and the reply
+then reads as a clean `sent — $0.0136`. The known case is the background-task
+sweep terminating the very agent the reply was aimed at — see
+[CLAUDE_CLI.md](CLAUDE_CLI.md#-p-can-also-fail-silently-on-a-zero-exit). The arm
+deliberately does NOT match that wording: **any** surviving stderr warns, so the
+next zero-exit downgrade that is not this one is surfaced too. A noisier status is
+the accepted cost, and there is no quieting heuristic.
+
+Two rules keep that row honest. **Precedence:** it may only replace a status that
+would have read as a SUCCESS (the priced row or the neutral `sent`) — an `is_error:
+true` payload is already honest, so it comes back unchanged rather than re-worded
+as a warning. **Degrade, never fabricate:** "non-empty stderr" means what survives
+sanitizing, so a blank, whitespace-only or all-escape stream falls through to the
+bottom row untouched. The board must never render a failure the send never had.
 
 ## Interrupt — stopping a live agent (`Ctrl-K`, `src/send.rs`)
 

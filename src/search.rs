@@ -1553,6 +1553,9 @@ mod tests {
             root_uuid: None,
             msg_count: 0,
             content_index: content.to_string(),
+            background: false,
+            has_agent_name: false,
+            has_agent_setting: false,
         }
     }
 

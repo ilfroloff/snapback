@@ -11,8 +11,15 @@
 //! a single visible head. It is presentation-only: [`fold`] hides indices from a
 //! display list, and nothing here can drop a session.
 //!
+//! Because it is the one place that knows which rows are copies of ONE
+//! conversation, it also answers the question that needs a member compared against
+//! its own origin: [`lost_agent_bindings`] flags a background fork that lost the
+//! agent binding its lineage ROOT still carries (anthropics/claude-code#80811).
+//! That is presentation-only too — a badge, nothing more.
+//!
 //! Pure and framework-free — no I/O, no `ratatui`. [`fold`] is the single entry
-//! point the TUI calls.
+//! point the TUI calls for display, [`lost_agent_bindings`] the one it calls per
+//! reload for the badge.
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
@@ -83,9 +90,13 @@ pub fn lineage_key(session: &Session) -> Option<LineageKey> {
 /// caller may assert on the shape rather than only on the count, despite the
 /// `HashMap` inside. Order is otherwise irrelevant to the counter.
 ///
-/// [`fold`] deliberately does NOT call this: it must consult `expanded` BY KEY,
-/// so it needs the keyed map this throws away. Both read [`lineage_key`], which
-/// is where the identity itself lives.
+/// TWO groupings in this module deliberately do NOT come through here, because
+/// both need the `LineageKey` ITSELF, which this throws away: [`fold`] must
+/// consult `expanded` BY KEY, and [`lost_agent_bindings`] must reach each
+/// lineage's own root. Each hand-rolls its own keyed map, so this is the grouping
+/// rule's SHARED home, not its ONLY one — THREE loops read [`lineage_key`], and a
+/// change to the rule must be mirrored across all three. [`lineage_key`] is where
+/// the identity itself lives, and that much they do all share.
 #[must_use]
 pub fn group_members(sessions: &[Session], indices: &[usize]) -> Vec<Vec<usize>> {
     let mut groups: Vec<Vec<usize>> = Vec::new();
@@ -139,6 +150,134 @@ pub fn head_of(sessions: &[Session], members: &[usize]) -> usize {
         .copied()
         .min_by_key(|&i| member_rank(&sessions[i]))
         .expect("head_of requires a non-empty lineage")
+}
+
+/// The lineage's ROOT: the OLDEST member that HAS a timestamp — the original
+/// foreground transcript every later member was forked from.
+///
+/// The exact opposite end of the SAME total order [`head_of`] takes the top of,
+/// so there is still only ONE ordering in this module ([`member_rank`]) and a root
+/// can never be derived by a rule the head disagrees with.
+///
+/// # Why the dated filter is load-bearing
+///
+/// A plain `max_by_key(member_rank)` gets this WRONG. `member_rank` leads with
+/// `Reverse(Option<OffsetDateTime>)`, and `Reverse(None)` sorts GREATEST — so the
+/// maximum of an undated member and a dated one is the UNDATED one, and a
+/// timestamp-less row would be crowned "oldest" purely for lacking the field the
+/// question is about. Restricting to members that HAVE a timestamp first is what
+/// makes the maximum mean "earliest".
+///
+/// # Fail-soft
+///
+/// `None` when no member carries a timestamp: there is then no derivable root, and
+/// callers must treat that as "cannot tell" rather than guessing. A degraded parse
+/// must cost a badge, never a session — the same trade [`fold`] and
+/// [`group_members`] already make for a missing `root_uuid`.
+#[must_use]
+pub fn root_of(sessions: &[Session], members: &[usize]) -> Option<usize> {
+    members
+        .iter()
+        .copied()
+        .filter(|&i| sessions[i].timestamp.is_some())
+        .max_by_key(|&i| member_rank(&sessions[i]))
+}
+
+/// The BARE #80811 signature, read off ONE session in isolation: a background
+/// transcript that NAMES an agent job but carries no agent BINDING.
+///
+/// Deliberately NOT the shipped rule — it OVER-FLAGS, and that is measurable.
+/// `agentName` is free-form (a real store holds `"bugsnag nextjs ssr
+/// integration"`, `"mrk-2812 worktree fix"`), so "named an agent but has no
+/// binding" is also the ordinary shape of a background job that never had a bound
+/// agent to lose. Only [`lost_agent_bindings`]' lineage gate turns this into a
+/// claim about a LOST binding, by requiring that the lineage root HAD one.
+fn bare_downgrade_signature(session: &Session) -> bool {
+    session.background && session.has_agent_name && !session.has_agent_setting
+}
+
+/// Every session that shows the anthropics/claude-code#80811 downgrade: a
+/// BACKGROUND fork that carries an agent NAME but lost the agent BINDING its own
+/// lineage ROOT still carries.
+///
+/// Returns the flagged `session_id`s, derived ONCE per reload. Keyed by id rather
+/// than index so the set cannot be silently mis-read if the session vector is ever
+/// re-ordered (the STABLE-ID rule the selection already follows), and so a row
+/// renderer does a single `contains` with the id already in its hand.
+///
+/// # The rule
+///
+/// A session is flagged when it is `sessionKind: bg`, carries `agent-name`, has NO
+/// `agent-setting`, and is NOT its own lineage root while that root DOES carry
+/// `agent-setting`. Everything else — including every shape the parse could not
+/// read — is not flagged.
+///
+/// # Why the gate, and what it costs
+///
+/// The bare signature alone ([`bare_downgrade_signature`]) reads one row in
+/// isolation and over-flags: `agentName` is free-form, so a background job that
+/// never had a binding matches it while having lost nothing. Gating on the ROOT
+/// is what makes the badge assert a LOSS: the root carried a binding, this
+/// member does not, and the two are the same conversation by construction.
+/// Measured over a real store this flags 3 sessions where the bare signature
+/// flags 4, and all 3 are genuine — each is a fork whose root bound `lead` /
+/// `technical-brainstormer` and whose own name is the root's name plus a fork
+/// marker.
+///
+/// # Cost
+///
+/// O(n): one grouping pass over the store, then one root per lineage. It is
+/// deliberately NOT a per-row question — asking "does my lineage's root carry a
+/// binding?" while drawing each row would rescan the store per row and make the
+/// board O(n²).
+///
+/// # Fail-soft
+///
+/// Every way of not knowing yields NO flag: no derivable `lineage_key` (no
+/// `root_uuid`), no member with a timestamp (no derivable root), a lineage of ONE
+/// (the session IS its own root, so it cannot both carry and lack the binding), and
+/// any unreadable `sessionKind` / `agentName` / `agentSetting` shape, which the
+/// parser has already turned into `false`.
+///
+/// NOT a closed set, though: the gate BOUNDS over-flagging, it does not eliminate
+/// it. `Session::timestamp` is the LAST non-null timestamp in the file, so
+/// [`root_of`] means "earliest LAST activity" — never "created first". A FOREGROUND
+/// original that gains its `agent-setting` AFTER a background fork was taken
+/// (resumed, then bound) yet whose activity ends BEFORE that fork's is still crowned
+/// root WITH a binding, so the fork is flagged although nothing was ever taken from
+/// it. What bounds that is the badge being INERT — no key, no gate, nothing else
+/// reads it — so the worst case is one cosmetic marker, never a wrong action.
+#[must_use]
+pub fn lost_agent_bindings(sessions: &[Session]) -> HashSet<String> {
+    // Group ONCE — the same `(repo, branch, root)` identity `fold` uses, so a
+    // root on another branch is a different lineage and cannot gate a flag here.
+    let mut members: HashMap<LineageKey, Vec<usize>> = HashMap::new();
+    for (i, session) in sessions.iter().enumerate() {
+        if let Some(key) = lineage_key(session) {
+            members.entry(key).or_default().push(i);
+        }
+    }
+
+    let mut flagged = HashSet::new();
+    for group in members.values() {
+        // No dated member => no derivable root => nothing to compare against.
+        let Some(root) = root_of(sessions, group) else {
+            continue;
+        };
+        // The gate: only a root that HELD a binding can have one taken from it.
+        if !sessions[root].has_agent_setting {
+            continue;
+        }
+        for &i in group {
+            // `i != root` also disposes of a lineage of ONE, whose single member
+            // is its own root: it would have to carry and lack `agent-setting`
+            // simultaneously, so the guard is structural rather than a special case.
+            if i != root && bare_downgrade_signature(&sessions[i]) {
+                flagged.insert(sessions[i].session_id.clone());
+            }
+        }
+    }
+    flagged
 }
 
 /// Fold every collapsed lineage in `filtered` down to its head, and gather every
@@ -236,6 +375,9 @@ mod tests {
             root_uuid: root.map(str::to_string),
             msg_count: 0,
             content_index: String::new(),
+            background: false,
+            has_agent_name: false,
+            has_agent_setting: false,
         }
     }
 
@@ -622,6 +764,276 @@ mod tests {
             head_of(&sessions, &[2]),
             2,
             "a timestamp-less lone member still heads its own lineage"
+        );
+    }
+
+    // --- the #80811 downgrade badge ---------------------------------------
+
+    /// The root uuid a fixture lineage's members share. A lineage is
+    /// `(repo, branch, root)`, so members must hold this AND [`BRANCH`] constant
+    /// to be one conversation at all.
+    const FORK_ROOT: &str = "fork-root";
+
+    /// The lineage ROOT of the #80811 shape: the foreground original, which both
+    /// named the job and BOUND an agent to it.
+    ///
+    /// `background: false` is the REAL shape of that original, not a don't-care: a
+    /// foreground session OMITS `sessionKind` entirely (DOMAIN.md, `sessionKind`),
+    /// so a root fixture claiming `bg` would model a file the store never holds.
+    /// The predicate reads the root's binding and never its kind, so this is
+    /// fidelity rather than behaviour — it keeps the positive tests exercising the
+    /// shape the badge was measured against.
+    fn bound_root(id: &str, ts: Option<i64>) -> Session {
+        Session {
+            background: false,
+            has_agent_name: true,
+            has_agent_setting: true,
+            ..session(id, BRANCH, Some(FORK_ROOT), ts)
+        }
+    }
+
+    /// The #80811 member: a background fork that still carries the job NAME but
+    /// has lost the `agent-setting` BINDING its root has.
+    fn downgraded_fork(id: &str, ts: Option<i64>) -> Session {
+        Session {
+            background: true,
+            has_agent_name: true,
+            has_agent_setting: false,
+            ..session(id, BRANCH, Some(FORK_ROOT), ts)
+        }
+    }
+
+    /// Read the flag set back as a sorted id list, so a failure says WHICH rows
+    /// were flagged rather than only how many.
+    fn flagged(sessions: &[Session]) -> Vec<String> {
+        let mut ids: Vec<String> = lost_agent_bindings(sessions).into_iter().collect();
+        ids.sort();
+        ids
+    }
+
+    /// The signature the badge exists for, exactly as it appears on disk: a
+    /// `lead`-bound foreground root at 13:39 and its background fork at 12:52 the
+    /// next day, carrying the job name with no binding.
+    #[test]
+    fn flags_a_background_fork_that_lost_its_roots_binding() {
+        let sessions = vec![
+            downgraded_fork("ca45ce75", Some(300)),
+            bound_root("75ae8db4", Some(100)),
+        ];
+
+        assert_eq!(
+            flagged(&sessions),
+            vec!["ca45ce75".to_string()],
+            "the fork lost a binding its own root still carries"
+        );
+    }
+
+    /// The OVER-FLAG decision 4 rejected, and the reason the lineage gate exists.
+    /// `agentName` is FREE-FORM — a job title like `"bugsnag nextjs ssr
+    /// integration"`, not an agent handle — so a background job whose lineage
+    /// never had a binding matches the BARE signature while having lost nothing.
+    ///
+    /// This is the test that proves the gate does work: it is RED against
+    /// [`bare_downgrade_signature`] alone.
+    #[test]
+    fn does_not_flag_when_the_lineage_root_never_had_a_binding() {
+        let sessions = vec![
+            downgraded_fork("titled-fork", Some(300)),
+            // Same lineage, older, but it never bound an agent either.
+            Session {
+                has_agent_setting: false,
+                ..bound_root("titled-root", Some(100))
+            },
+        ];
+
+        assert!(
+            flagged(&sessions).is_empty(),
+            "a free-form job title is not a lost binding: nothing was taken away"
+        );
+    }
+
+    /// A lineage of ONE is its own root, so it would have to carry and lack
+    /// `agent-setting` at the same moment. Structurally impossible — pinned
+    /// because it is a load-bearing over-flag guard, and because a naive
+    /// implementation that compares a session against "some root" rather than
+    /// against a root that is NOT itself flags every lone background job.
+    ///
+    /// # This test is guarded TWICE, and no SINGLE mutation reddens it
+    ///
+    /// Stated plainly because the execution checklist asks for every test to have
+    /// been OBSERVED failing, and this one cannot be by breaking one thing. Two
+    /// independent clauses in [`lost_agent_bindings`] each suffice on their own:
+    /// the root gate (`!sessions[root].has_agent_setting` -> `continue`) and
+    /// `i != root`. Removing the gate alone leaves this green (it reddens
+    /// `does_not_flag_when_the_lineage_root_never_had_a_binding` instead, which is
+    /// the test that isolates the gate); removing `i != root` alone leaves the
+    /// WHOLE suite green. Only removing BOTH turns this red.
+    ///
+    /// `i != root` cannot be isolated by any fixture, either — given the gate it is
+    /// never a discriminator. Reaching the comparison at all requires
+    /// `sessions[root].has_agent_setting`, while flagging the root would require
+    /// [`bare_downgrade_signature`], hence `!has_agent_setting`, on that same
+    /// session. So it is redundant BY CONSTRUCTION (as the guard's own comment
+    /// says), kept as structural defence against a future refactor that drops or
+    /// loosens the gate.
+    ///
+    /// This test therefore pins the over-flag guard AS A WHOLE. It does not
+    /// isolate either clause, and it should not be read as evidence that both are
+    /// independently load-bearing.
+    #[test]
+    fn does_not_flag_a_lineage_of_one() {
+        let sessions = vec![downgraded_fork("lonely", Some(100))];
+
+        assert!(
+            flagged(&sessions).is_empty(),
+            "a session cannot have lost a binding to itself"
+        );
+    }
+
+    /// FAIL-SOFT, the same treatment `fold` and `group_members` give it: no
+    /// derivable `root_uuid` means no lineage, so there is no root to compare
+    /// against and therefore nothing to assert.
+    #[test]
+    fn does_not_flag_a_session_with_no_root_uuid() {
+        let sessions = vec![
+            Session {
+                root_uuid: None,
+                ..downgraded_fork("rootless", Some(300))
+            },
+            bound_root("has-a-root", Some(100)),
+        ];
+
+        assert!(
+            flagged(&sessions).is_empty(),
+            "no lineage key, no lineage, no claim"
+        );
+    }
+
+    /// A lineage is `(repo, branch, root)` — a shared root across branches is TWO
+    /// lineages (D4). A bound root on ANOTHER branch must not gate a flag on this
+    /// one: that is different work, not this conversation's origin.
+    #[test]
+    fn does_not_flag_across_a_branch_boundary() {
+        let sessions = vec![
+            downgraded_fork("fork-on-feature", Some(300)),
+            Session {
+                git_branch: Some("master".to_string()),
+                ..bound_root("root-on-master", Some(100))
+            },
+        ];
+
+        assert!(
+            flagged(&sessions).is_empty(),
+            "a root on another branch heads a different lineage"
+        );
+    }
+
+    /// Nothing was lost if the binding is still there. The most direct
+    /// false-positive guard there is.
+    #[test]
+    fn does_not_flag_a_member_that_still_carries_its_binding() {
+        let sessions = vec![
+            Session {
+                has_agent_setting: true,
+                ..downgraded_fork("still-bound", Some(300))
+            },
+            bound_root("root", Some(100)),
+        ];
+
+        assert!(
+            flagged(&sessions).is_empty(),
+            "a member holding agent-setting has lost nothing"
+        );
+    }
+
+    /// The badge asserts something about a BACKGROUND job specifically. An
+    /// interactive session matching every other clause is not the #80811 shape —
+    /// it is a foreground transcript, and `sessionKind` is what says so.
+    #[test]
+    fn does_not_flag_a_foreground_session() {
+        let sessions = vec![
+            Session {
+                background: false,
+                ..downgraded_fork("interactive", Some(300))
+            },
+            bound_root("root", Some(100)),
+        ];
+
+        assert!(
+            flagged(&sessions).is_empty(),
+            "no sessionKind:bg, no background downgrade to report"
+        );
+    }
+
+    /// A member naming no agent at all has no binding to have lost — it is an
+    /// ordinary background session, and the overwhelming majority of the store.
+    #[test]
+    fn does_not_flag_a_member_that_never_named_an_agent() {
+        let sessions = vec![
+            Session {
+                has_agent_name: false,
+                ..downgraded_fork("anonymous", Some(300))
+            },
+            bound_root("root", Some(100)),
+        ];
+
+        assert!(flagged(&sessions).is_empty());
+    }
+
+    // --- root_of ----------------------------------------------------------
+
+    /// The edge a naive `max_by_key(member_rank)` gets WRONG: `member_rank` leads
+    /// with `Reverse(Option<_>)` and `Reverse(None)` sorts GREATEST, so a plain
+    /// maximum crowns the TIMESTAMP-LESS member "oldest" — and the badge would
+    /// then compare every member against a row that has no position in time.
+    #[test]
+    fn a_timestamp_less_member_never_becomes_the_root() {
+        let sessions = vec![
+            session("undated", BRANCH, Some(FORK_ROOT), None),
+            session("oldest", BRANCH, Some(FORK_ROOT), Some(100)),
+            session("newest", BRANCH, Some(FORK_ROOT), Some(300)),
+        ];
+
+        assert_eq!(
+            root_of(&sessions, &[0, 1, 2]),
+            Some(1),
+            "the root is the oldest DATED member, never the undated one"
+        );
+        assert_eq!(
+            head_of(&sessions, &[0, 1, 2]),
+            2,
+            "and the head is still the newest, from the same ordering"
+        );
+    }
+
+    /// FAIL-SOFT: with no dated member there is no derivable root, so the answer
+    /// is "cannot tell" rather than an arbitrary pick — and the badge stays off.
+    #[test]
+    fn root_of_is_none_when_no_member_is_dated() {
+        let sessions = vec![
+            session("a", BRANCH, Some(FORK_ROOT), None),
+            session("b", BRANCH, Some(FORK_ROOT), None),
+        ];
+
+        assert_eq!(root_of(&sessions, &[0, 1]), None);
+    }
+
+    /// The whole reason an undated member must not be crowned root, stated as the
+    /// badge behaviour rather than as an ordering detail: the undated row would
+    /// be a rootless "root" carrying no binding, and the gate would go silent.
+    #[test]
+    fn an_undated_member_does_not_suppress_a_real_flag() {
+        let sessions = vec![
+            downgraded_fork("ca45ce75", Some(300)),
+            bound_root("75ae8db4", Some(100)),
+            // A stalled stub with no parseable timestamp, in the same lineage.
+            session("undated-stub", BRANCH, Some(FORK_ROOT), None),
+        ];
+
+        assert_eq!(
+            flagged(&sessions),
+            vec!["ca45ce75".to_string()],
+            "an undated sibling must not become the root and hide the downgrade"
         );
     }
 }

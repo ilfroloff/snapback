@@ -239,6 +239,21 @@ pub struct Session {
     pub msg_count: usize,
     /// Capped, readable transcript text for content search.
     pub content_index: String,
+    /// Whether this transcript belongs to a BACKGROUND job (see
+    /// [`parse::ParsedFile::background`]).
+    pub background: bool,
+    /// Whether this transcript ever NAMED an agent job (see
+    /// [`parse::ParsedFile::has_agent_name`]).
+    pub has_agent_name: bool,
+    /// Whether this transcript ever carried an agent BINDING (see
+    /// [`parse::ParsedFile::has_agent_setting`]).
+    ///
+    /// These three travel together and exist for ONE reader:
+    /// [`lineage::lost_agent_bindings`], which compares a background member
+    /// against its own lineage root to surface the anthropics/claude-code#80811
+    /// downgrade. They are facts about the BYTES, so the parse cache may carry
+    /// them exactly as it carries every other parsed field.
+    pub has_agent_setting: bool,
 }
 
 impl Session {
@@ -281,6 +296,9 @@ impl Session {
                 root_uuid: parsed.root_uuid,
                 msg_count: parsed.msg_count,
                 content_index: parsed.content_index,
+                background: parsed.background,
+                has_agent_name: parsed.has_agent_name,
+                has_agent_setting: parsed.has_agent_setting,
             }
         })
     }

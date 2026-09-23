@@ -243,6 +243,35 @@ const LABEL_ELLIPSIS: &str = "…";
 /// gap into the `(+N)` marker, so the reserved width matches the drawn width.
 const HIDDEN_ROW_MARKER: &str = "  [hidden]";
 
+/// The marker a background session wears when it lost the agent BINDING its own
+/// fork lineage root still carries — the anthropics/claude-code#80811 signature
+/// (see [`lineage::lost_agent_bindings`](crate::store::lineage::lost_agent_bindings)).
+///
+/// # What it asserts, and what it deliberately does not
+///
+/// EXACTLY this: the transcript is `sessionKind: bg`, it carries an `agent-name`,
+/// it carries no `agent-setting`, and the oldest member of its lineage does. That
+/// is an observation about two files on disk, nothing more.
+///
+/// It is NOT a recovery instruction and carries NO remediation payload. A prior
+/// attempt at this badge shipped one — a `SendMessage` action that agent-bound
+/// sessions structurally cannot execute — and the wording is kept a plain state
+/// ("unbound") rather than an imperative so it cannot drift back into advice. No
+/// key is bound to it; it is a badge.
+///
+/// # Width
+///
+/// Deliberately terse — eleven columns, the same order as its neighbours
+/// `[hidden]` and `(+N)` — because a folded, badged row wears BOTH trailing
+/// markers at once and a narrow pane must still fit the pair beside the
+/// timestamp. A longer phrase ("agent unbound") does not fit an 80-column board's
+/// worst case, and a badge that gets clipped to `[agent unboun` asserts nothing.
+/// The precise claim lives in this doc comment, not in the eleven columns.
+///
+/// Carries its own leading gap, exactly as [`HIDDEN_ROW_MARKER`] and
+/// [`LINEAGE_MARKER_GAP`] do, so the width reserved is the width drawn.
+const AGENT_UNBOUND_MARKER: &str = "  [unbound]";
+
 /// How many leading chars of a `session_id` a lineage CHILD row shows.
 ///
 /// Eight: a session id is a uuid, whose first hyphen-delimited group is 8 hex
@@ -759,6 +788,18 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                             Style::default().add_modifier(Modifier::DIM),
                         ));
                     }
+                    // A downgraded member is not always the head: the fork is
+                    // usually NEWER than its root and so heads the lineage, but a
+                    // third member can push it into a child row. The badge is a
+                    // fact about the SESSION, not about its position in the fold,
+                    // so it draws here too — dropped only if the row has no room,
+                    // exactly as the turn count above is.
+                    let used: usize = spans.iter().map(Span::width).sum();
+                    if app.lost_agent_bindings.contains(&session.session_id)
+                        && used + AGENT_UNBOUND_MARKER.chars().count() <= content_width
+                    {
+                        spans.push(unbound_marker_span());
+                    }
                     if soft_hidden {
                         spans.push(Span::styled(
                             HIDDEN_ROW_MARKER,
@@ -774,12 +815,32 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 // `hidden` is 0 for every row with nothing hidden, and such a row
                 // takes the untouched label it always has.
                 let marker = (*hidden > 0).then(|| lineage_marker(*hidden));
-                let label = match &marker {
-                    Some(marker) => {
-                        let used: usize = spans.iter().map(Span::width).sum();
-                        fit_label(&session.label, content_width, used, marker.chars().count())
-                    }
-                    None => session.label.clone(),
+                // The #80811 badge: a single lookup against the set derived once
+                // per reload, using the id this row already holds. Never a scan.
+                let fold_width = marker.as_ref().map_or(0, |m| m.chars().count());
+                let used: usize = spans.iter().map(Span::width).sum();
+                // DROPPED, never clipped, when the row cannot fit it even with no
+                // label at all: a half-drawn `[unboun` asserts nothing, and a
+                // marker that overruns pushes the row's content off the edge.
+                // Same discipline as `fit_child_msgs` on the child row.
+                let unbound = app.lost_agent_bindings.contains(&session.session_id)
+                    && used + fold_width + AGENT_UNBOUND_MARKER.chars().count() <= content_width;
+                // BOTH trailing markers are reserved in ONE budget, so the label
+                // is what gives way and neither marker can be shoved off the edge
+                // — the same discipline `(+N)` alone already followed.
+                let reserved = fold_width
+                    + if unbound {
+                        AGENT_UNBOUND_MARKER.chars().count()
+                    } else {
+                        0
+                    };
+                let label = if reserved > 0 {
+                    // The SAME `used` the reservation above was decided against —
+                    // nothing has pushed to `spans` in between, so re-summing it
+                    // could only ever produce that identical width.
+                    fit_label(&session.label, content_width, used, reserved)
+                } else {
+                    session.label.clone()
                 };
 
                 // The visible label: under an active query, matched chars are
@@ -805,6 +866,9 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                         marker,
                         Style::default().add_modifier(Modifier::DIM),
                     ));
+                }
+                if unbound {
+                    spans.push(unbound_marker_span());
                 }
                 if soft_hidden {
                     spans.push(Span::styled(
@@ -834,6 +898,23 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
     // Persist the offset ratatui computed so scroll is stable across redraws
     // and preserved across reloads.
     app.scroll = state.offset();
+}
+
+/// The styled [`AGENT_UNBOUND_MARKER`] span, built in ONE place so the head row
+/// and a child row can never draw the same fact in two different styles.
+///
+/// `Yellow` — the board's established CAUTION color (the group header and the
+/// `NeedsInput` badge already speak it), so the badge reads as "something here is
+/// off" in the vocabulary the user already has. Deliberately NOT `DIM`: dim is
+/// this row's FOOTNOTE weight, worn by the timestamp, the `(+N)` marker and
+/// `[hidden]`, and a real defect is not a footnote. Equally deliberately not
+/// `BOLD` — the bold-yellow weight belongs to the group header and the agent
+/// badge, and a trailing marker must not outrank the label it sits beside.
+///
+/// TERMINAL-SAFE STYLING: a NAMED ANSI color, never RGB and never an embedded
+/// escape (AGENTS.md).
+fn unbound_marker_span() -> Span<'static> {
+    Span::styled(AGENT_UNBOUND_MARKER, Style::default().fg(Color::Yellow))
 }
 
 /// Dim an ENTIRE list row when it is a soft-hidden session shown under the
@@ -3228,6 +3309,9 @@ mod tests {
             root_uuid: root_uuid.map(ToString::to_string),
             msg_count: 0,
             content_index: String::new(),
+            background: false,
+            has_agent_name: false,
+            has_agent_setting: false,
         }
     }
 
@@ -4674,6 +4758,9 @@ mod tests {
             root_uuid: None,
             msg_count: 0,
             content_index: String::new(),
+            background: false,
+            has_agent_name: false,
+            has_agent_setting: false,
         }
     }
 
@@ -6377,6 +6464,9 @@ mod tests {
             root_uuid: None,
             msg_count: 0,
             content_index: String::new(),
+            background: false,
+            has_agent_name: false,
+            has_agent_setting: false,
         }
     }
 
@@ -6512,6 +6602,9 @@ mod tests {
             root_uuid: None,
             msg_count: 0,
             content_index: String::new(),
+            background: false,
+            has_agent_name: false,
+            has_agent_setting: false,
         }
     }
 
@@ -6685,6 +6778,9 @@ mod tests {
             // A CONTENT hit and not a label one, which is the case the autoscroll
             // exists for: the row says nothing about the query, so the pane has to.
             content_index: JUMP_BODY_HIT.to_string(),
+            background: false,
+            has_agent_name: false,
+            has_agent_setting: false,
         }
     }
 
@@ -10341,6 +10437,9 @@ mod tests {
             root_uuid: Some(root.to_string()),
             msg_count,
             content_index: String::new(),
+            background: false,
+            has_agent_name: false,
+            has_agent_setting: false,
         }
     }
 
@@ -10410,6 +10509,268 @@ mod tests {
         // And a prefix that OVERRUNS the row saturates rather than panicking —
         // a terminal can always be dragged narrower than the layout wants.
         assert_eq!(fit_label("anything", 4, 99, marker), "");
+    }
+
+    /// The [`lineage_board`] fixture with the #80811 shape applied to the pair it
+    /// already holds: the `bg` fork (newer, so it HEADS the lineage) carries an
+    /// agent name with no binding, while the `ancestor` it forked from — the
+    /// lineage ROOT — still carries one. The lone session is left untouched.
+    fn downgraded_lineage_board() -> App {
+        let mut sessions = vec![
+            lineage_session(
+                ANCESTOR_ID,
+                "fork-root",
+                LINEAGE_LABEL,
+                ANCESTOR_TS,
+                ANCESTOR_MSGS,
+            ),
+            lineage_session(BG_ID, "fork-root", LINEAGE_LABEL, BG_TS, BG_MSGS),
+            lineage_session(LONE_ID, "other-root", LONE_LABEL, LONE_TS, LONE_MSGS),
+        ];
+        // The root: the FOREGROUND original, bound to an agent. It omits
+        // `sessionKind` (DOMAIN.md) — the badge reads the root's binding, never its
+        // kind, so modelling the real shape costs nothing and pins nothing false.
+        sessions[0].background = false;
+        sessions[0].has_agent_name = true;
+        sessions[0].has_agent_setting = true;
+        // The fork: named, but the binding is gone.
+        sessions[1].background = true;
+        sessions[1].has_agent_name = true;
+        sessions[1].has_agent_setting = false;
+        // The lone row matches the BARE signature and must STILL not be flagged —
+        // it is its own lineage root, so it lost nothing.
+        sessions[2].background = true;
+        sessions[2].has_agent_name = true;
+        sessions[2].has_agent_setting = false;
+        App::new(sessions, Scope::All, PathBuf::from("/tmp/launch"))
+    }
+
+    /// The badge, read off the DRAWN cells: it lands on the downgraded fork's row
+    /// in the board's caution color, and it says only what was observed.
+    #[test]
+    fn render_list_badges_a_background_fork_that_lost_its_binding() {
+        let mut app = downgraded_lineage_board();
+        let (width, height) = LINEAGE_BOARD_SIZE;
+        let buffer = drawn_list(&mut app, width, height);
+
+        // The fork heads the folded lineage, so it draws the shared label.
+        let head = row_of(&buffer, width, height, LINEAGE_LABEL);
+        let text = row_text(&buffer, head, width);
+        assert!(
+            text.contains(AGENT_UNBOUND_MARKER.trim()),
+            "the downgraded fork must wear the badge: {text:?}"
+        );
+
+        // Style read off the buffer, not off the span we built: a marker the List
+        // restyles away is a marker the user never sees.
+        let needle = AGENT_UNBOUND_MARKER.trim();
+        let x = column_of(&buffer, head, width, needle);
+        for (i, ch) in needle.chars().enumerate() {
+            let cell = buffer
+                .cell((
+                    x + u16::try_from(i).expect("a marker shorter than a row"),
+                    head,
+                ))
+                .expect("a drawn marker cell");
+            assert_eq!(cell.symbol(), ch.to_string());
+            assert_eq!(
+                cell.fg,
+                Color::Yellow,
+                "the badge is a NAMED-ANSI caution color, never dim and never RGB"
+            );
+            assert!(
+                !cell.modifier.contains(Modifier::DIM),
+                "a real defect is not a footnote"
+            );
+        }
+    }
+
+    /// The over-flag guard, drawn: the lone background row matches the BARE
+    /// signature in every respect and must carry NO badge, because it is its own
+    /// lineage root and therefore lost nothing.
+    #[test]
+    fn render_list_does_not_badge_a_lone_background_session() {
+        let mut app = downgraded_lineage_board();
+        let (width, height) = LINEAGE_BOARD_SIZE;
+        let buffer = drawn_list(&mut app, width, height);
+
+        let lone = row_of(&buffer, width, height, LONE_LABEL);
+        let text = row_text(&buffer, lone, width);
+        assert!(
+            !text.contains(AGENT_UNBOUND_MARKER.trim()),
+            "a lineage of one cannot have lost a binding to itself: {text:?}"
+        );
+    }
+
+    /// The board with nothing wrong on it draws no badge anywhere — the guard
+    /// against a marker that is really just always on.
+    #[test]
+    fn render_list_badges_nothing_on_an_ordinary_board() {
+        let mut app = lineage_board();
+        let (width, height) = LINEAGE_BOARD_SIZE;
+        let buffer = drawn_list(&mut app, width, height);
+
+        for row in 0..height {
+            assert!(
+                !row_text(&buffer, row, width).contains(AGENT_UNBOUND_MARKER.trim()),
+                "no session here lost a binding, so no row may claim one"
+            );
+        }
+    }
+
+    /// Wide enough for the badge beside the `(+N)` it shares the row with, but
+    /// NOT for the whole label — the only width at which the badge's share of the
+    /// [`fit_label`] reservation is observable.
+    ///
+    /// The fixture's epoch timestamps draw in full (`1970-01-01 00:03`, sixteen
+    /// columns) where a real same-day row draws five, so this is a markedly
+    /// harsher row than the board's ordinary one.
+    const BADGE_TIGHT_WIDTH: u16 = 60;
+
+    /// The badge is reserved BEFORE the label, exactly as `(+N)` is: at a width
+    /// that cuts the label, the LABEL is what gives way and the badge survives.
+    #[test]
+    fn render_list_keeps_the_badge_when_the_pane_is_too_narrow_for_the_label() {
+        let mut app = downgraded_lineage_board();
+        let (_, height) = LINEAGE_BOARD_SIZE;
+        let width = BADGE_TIGHT_WIDTH;
+        let buffer = drawn_list(&mut app, width, height);
+
+        let head = row_of(&buffer, width, height, AGENT_UNBOUND_MARKER.trim());
+        let text = row_text(&buffer, head, width);
+
+        assert!(
+            !text.contains(LINEAGE_LABEL),
+            "the fixture must be too narrow for the whole label, or it proves \
+             nothing about the reservation: {text:?}"
+        );
+        assert!(
+            text.contains("(+1)") && text.contains(AGENT_UNBOUND_MARKER.trim()),
+            "both trailing markers outrank the label they sit beside: {text:?}"
+        );
+        assert!(
+            text.chars().count() <= usize::from(width),
+            "the row must never overrun its own width: {text:?}"
+        );
+    }
+
+    /// The other end of the same discipline: at a width that cannot fit the badge
+    /// even with NO label, it is DROPPED whole rather than clipped. A half-drawn
+    /// `[unboun` asserts nothing, and a marker that overruns would push the row's
+    /// existing content off the edge.
+    #[test]
+    fn render_list_drops_the_badge_rather_than_clipping_it() {
+        let mut app = downgraded_lineage_board();
+        let (_, height) = LINEAGE_BOARD_SIZE;
+        let width = LINEAGE_NARROW_WIDTH;
+        let buffer = drawn_list(&mut app, width, height);
+
+        // Found by the `(+N)`, which still fits: the badge is what gave way.
+        let head = row_of(&buffer, width, height, "(+1)");
+        let text = row_text(&buffer, head, width);
+
+        assert!(
+            !text.contains('['),
+            "no fragment of the badge may survive the drop: {text:?}"
+        );
+        assert!(
+            text.contains("(+1)"),
+            "the fold marker still fits and must still be drawn: {text:?}"
+        );
+        assert!(
+            text.chars().count() <= usize::from(width),
+            "the row must never overrun its own width: {text:?}"
+        );
+    }
+
+    /// The badge on a CHILD row. A downgraded member is not always its lineage's
+    /// head: give the lineage a THIRD, NEWER member and the #80811 fork is pushed
+    /// beneath it. The badge is a fact about the SESSION, not about where the fold
+    /// put it, so it must follow the fork down — read, as above, off the DRAWN
+    /// cells rather than off a span.
+    #[test]
+    fn render_list_badges_a_downgraded_fork_sitting_in_a_child_row() {
+        // A member NEWER than the downgraded fork, so IT takes the head (D1) and
+        // the fork lands in a child row. Same shapes as the fixture's own members,
+        // distinct so every row stays addressable.
+        const SUCCESSOR_ID: &str = "3a7bd110-9999-aaaa-bbbb-cccccccccccc";
+        const SUCCESSOR_TS: i64 = 300;
+        const SUCCESSOR_MSGS: usize = 58;
+
+        let mut sessions = vec![
+            lineage_session(
+                ANCESTOR_ID,
+                "fork-root",
+                LINEAGE_LABEL,
+                ANCESTOR_TS,
+                ANCESTOR_MSGS,
+            ),
+            lineage_session(BG_ID, "fork-root", LINEAGE_LABEL, BG_TS, BG_MSGS),
+            lineage_session(
+                SUCCESSOR_ID,
+                "fork-root",
+                LINEAGE_LABEL,
+                SUCCESSOR_TS,
+                SUCCESSOR_MSGS,
+            ),
+        ];
+        // The lineage ROOT — oldest, foreground, still bound. It is what makes the
+        // fork's missing binding a LOSS rather than a shape it never had.
+        sessions[0].has_agent_name = true;
+        sessions[0].has_agent_setting = true;
+        // The downgraded fork: named, binding gone. The one row that must be badged.
+        sessions[1].background = true;
+        sessions[1].has_agent_name = true;
+        sessions[1].has_agent_setting = false;
+        // The newest member is left BARE on purpose: it heads the lineage carrying
+        // nothing of its own, so the badge found below cannot have come from the
+        // head row's block.
+
+        let mut app = App::new(sessions, Scope::All, PathBuf::from("/tmp/launch"));
+        app.expand_selected();
+        let (width, height) = LINEAGE_BOARD_SIZE;
+        let buffer = drawn_list(&mut app, width, height);
+
+        // The fork is addressable by its id — what a child row draws INSTEAD of
+        // the label it shares with its head.
+        let child = row_of(&buffer, width, height, &short_id(BG_ID));
+        let text = row_text(&buffer, child, width);
+
+        // The premise, and it has teeth: without it this silently degenerates into
+        // the head-row case the moment the fixture's ordering drifts.
+        assert!(
+            text.contains(CHILD_GUTTER.trim()) && !text.contains(LINEAGE_LABEL),
+            "the downgraded fork must really be drawn as a CHILD here, or this \
+             pins the head row all over again: {text:?}"
+        );
+        assert!(
+            text.contains(AGENT_UNBOUND_MARKER.trim()),
+            "the badge follows the session down into the fold, never only the row \
+             that happens to head it: {text:?}"
+        );
+
+        // Style read off the buffer, not off the span we built: a marker the List
+        // restyles away is a marker the user never sees.
+        let needle = AGENT_UNBOUND_MARKER.trim();
+        let x = column_of(&buffer, child, width, needle);
+        for (i, ch) in needle.chars().enumerate() {
+            let cell = buffer
+                .cell((
+                    x + u16::try_from(i).expect("a marker shorter than a row"),
+                    child,
+                ))
+                .expect("a drawn marker cell");
+            assert_eq!(cell.symbol(), ch.to_string());
+            assert_eq!(
+                cell.fg,
+                Color::Yellow,
+                "the badge is a NAMED-ANSI caution color, never dim and never RGB"
+            );
+            assert!(
+                !cell.modifier.contains(Modifier::DIM),
+                "a real defect is not a footnote"
+            );
+        }
     }
 
     /// The default: three sessions, two rows, and the surviving head says so.

@@ -40,6 +40,18 @@ use super::label;
 /// boundary to move to an on-disk cache.
 pub const CONTENT_INDEX_CAP: usize = 1024 * 1024;
 
+/// The `sessionKind` discriminant Claude Code stamps on the records of a
+/// BACKGROUND session's transcript.
+///
+/// `sessionKind` is a TOP-LEVEL envelope key on ordinary records (`user`,
+/// `assistant`, `attachment`, `system`) — NOT a record type of its own. Across the
+/// records observed in a real store, `"bg"` is the ONLY value it ever takes; a
+/// foreground session simply omits the key. That is an OBSERVATION, not a contract:
+/// the key is undocumented upstream, so the read stays FAIL-SOFT — anything that is
+/// not exactly this string (absent, null, a number, a different word) leaves the
+/// file non-background rather than producing a verdict.
+pub const SESSION_KIND_BACKGROUND: &str = "bg";
+
 /// What one candidate file turned out to be — the three answers a fail-soft read
 /// can give, kept apart because only TWO of them are statements about the file.
 ///
@@ -142,6 +154,27 @@ pub struct ParsedFile {
     pub msg_count: usize,
     /// Capped, readable transcript text for content search.
     pub content_index: String,
+    /// Whether ANY record carried [`SESSION_KIND_BACKGROUND`] — i.e. this
+    /// transcript belongs to a background job rather than an interactive session.
+    ///
+    /// Presence, not the value: the key has exactly one observed value, so
+    /// carrying the string would store the same byte 8000 times per file to answer
+    /// a yes/no question.
+    pub background: bool,
+    /// Whether the file carried an `agent-name` record naming a non-blank title.
+    ///
+    /// `agentName` is the background job's own name and is FREE-FORM — measured
+    /// over a real store it holds things like `"bugsnag nextjs ssr integration"`,
+    /// never an agent handle. It therefore says an agent was NAMED here, never
+    /// which one, which is precisely why it cannot decide a flag by itself.
+    pub has_agent_name: bool,
+    /// Whether the file carried an `agent-setting` record naming a non-blank
+    /// handle.
+    ///
+    /// `agentSetting` is the interactive BIND and is a clean handle (`"lead"`,
+    /// `"technical-brainstormer"` in a real store). This is the binding whose LOSS
+    /// on a background fork is the anthropics/claude-code#80811 signature.
+    pub has_agent_setting: bool,
 }
 
 /// Stream one JSONL file fail-soft and say what it is.
@@ -166,6 +199,9 @@ pub fn parse_file(path: &Path) -> FileVerdict<ParsedFile> {
     let mut root_uuid: Option<String> = None;
     let mut msg_count: usize = 0;
     let mut content_index = String::new();
+    let mut background = false;
+    let mut has_agent_name = false;
+    let mut has_agent_setting = false;
 
     for line in reader.lines() {
         let line = match line {
@@ -256,6 +292,36 @@ pub fn parse_file(path: &Path) -> FileVerdict<ParsedFile> {
         ) {
             msg_count += 1;
         }
+        // The three facts the #80811 board badge is derived from, read in THIS
+        // pass rather than a second one over the same bytes.
+        //
+        // All three are PRESENCE flags, and all three are undocumented, so each
+        // read is FAIL-SOFT by construction: `get` + `as_str` yields `None` for an
+        // absent, null, or wrongly-typed key, and no arm can panic or reject the
+        // file. An unrecognised shape therefore costs the badge, never the session.
+        //
+        // `background` latches on the ENVELOPE key `sessionKind`, which rides on
+        // ordinary records and is compared against the one observed discriminant
+        // ([`SESSION_KIND_BACKGROUND`]) rather than merely tested for presence —
+        // a future second value must not silently read as "background".
+        if !background
+            && record.get("sessionKind").and_then(Value::as_str) == Some(SESSION_KIND_BACKGROUND)
+        {
+            background = true;
+        }
+        // The other two are RECORD TYPES carrying one field each. Blank-after-trim
+        // counts as absent, matching how `preview::trimmed_field` already reads
+        // these exact two fields — the surfaces must not disagree about whether an
+        // agent was named.
+        match record.get("type").and_then(Value::as_str) {
+            Some("agent-name") if !has_agent_name => {
+                has_agent_name = has_trimmed_field(&record, "agentName");
+            }
+            Some("agent-setting") if !has_agent_setting => {
+                has_agent_setting = has_trimmed_field(&record, "agentSetting");
+            }
+            _ => {}
+        }
         // gitBranch + timestamp: last non-null (most-recent activity wins).
         if let Some(b) = record.get("gitBranch").and_then(Value::as_str) {
             git_branch = Some(b.to_string());
@@ -296,7 +362,24 @@ pub fn parse_file(path: &Path) -> FileVerdict<ParsedFile> {
         root_uuid,
         msg_count,
         content_index,
+        background,
+        has_agent_name,
+        has_agent_setting,
     })
+}
+
+/// Whether `record[key]` is a string with non-whitespace content.
+///
+/// The presence half of `preview::trimmed_field`, which reads these same two
+/// undocumented agent fields for the preview's `@handle`. Kept to the identical
+/// rule — a string, trimmed, non-empty — so the badge and the preview can never
+/// disagree about whether a record named an agent at all. FAIL-SOFT: an absent,
+/// null, or non-string value is simply `false`.
+fn has_trimmed_field(record: &Value, key: &str) -> bool {
+    record
+        .get(key)
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.trim().is_empty())
 }
 
 /// The filename without its `.jsonl` extension (the session id in the store
@@ -413,6 +496,130 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- the three #80811 facts --------------------------------------------
+
+    /// The real on-disk shape, as measured in a live store: `sessionKind` is a
+    /// TOP-LEVEL key on an ordinary record (not a record type), while the two
+    /// agent facts are their own record types carrying one field each.
+    #[test]
+    fn reads_the_background_and_agent_facts_from_one_pass() {
+        let parsed = parse_lines(
+            "agent-facts",
+            &[
+                r#"{"type":"user","cwd":"/repo","sessionId":"s","sessionKind":"bg"}"#,
+                r#"{"type":"agent-name","agentName":"pr #152 isolated review","sessionId":"s"}"#,
+                r#"{"type":"agent-setting","agentSetting":"lead","sessionId":"s"}"#,
+            ],
+        )
+        .expect("a file with a cwd is a session");
+
+        assert!(parsed.background, "sessionKind:bg marks a background job");
+        assert!(parsed.has_agent_name, "an agent-name record names a job");
+        assert!(
+            parsed.has_agent_setting,
+            "an agent-setting record binds one"
+        );
+    }
+
+    /// A foreground transcript omits `sessionKind` entirely, and a job that never
+    /// bound an agent carries no `agent-setting`. Absence must read as `false`,
+    /// not as "unknown, assume yes".
+    #[test]
+    fn absent_background_and_agent_keys_read_as_false() {
+        let parsed = parse_lines(
+            "agent-facts-absent",
+            &[r#"{"type":"user","cwd":"/repo","sessionId":"s"}"#],
+        )
+        .expect("a file with a cwd is a session");
+
+        assert!(!parsed.background);
+        assert!(!parsed.has_agent_name);
+        assert!(!parsed.has_agent_setting);
+    }
+
+    /// FAIL-SOFT over every malformed shape these three undocumented keys can
+    /// take — null, a number, an empty/blank string, a wrong-typed `sessionKind`,
+    /// and the key simply missing from its own record type. Each must yield NO
+    /// fact and NO panic: an unrecognised shape costs the badge, never the
+    /// session. Mirrors the malformed-agent fixtures in `preview.rs`.
+    #[test]
+    fn malformed_background_and_agent_records_yield_no_fact() {
+        let malformed = [
+            // sessionKind: wrong type, wrong value, null.
+            r#"{"type":"user","cwd":"/repo","sessionKind":42}"#,
+            r#"{"type":"user","cwd":"/repo","sessionKind":null}"#,
+            r#"{"type":"user","cwd":"/repo","sessionKind":""}"#,
+            r#"{"type":"user","cwd":"/repo","sessionKind":"BG"}"#,
+            r#"{"type":"user","cwd":"/repo","sessionKind":"interactive"}"#,
+            r#"{"type":"user","cwd":"/repo","sessionKind":["bg"]}"#,
+            // agent-name: key missing, null, a number, empty, blank.
+            r#"{"type":"agent-name","cwd":"/repo","sessionId":"s"}"#,
+            r#"{"type":"agent-name","cwd":"/repo","agentName":null}"#,
+            r#"{"type":"agent-name","cwd":"/repo","agentName":42}"#,
+            r#"{"type":"agent-name","cwd":"/repo","agentName":""}"#,
+            r#"{"type":"agent-name","cwd":"/repo","agentName":"   "}"#,
+            // agent-setting: the same five shapes.
+            r#"{"type":"agent-setting","cwd":"/repo","sessionId":"s"}"#,
+            r#"{"type":"agent-setting","cwd":"/repo","agentSetting":null}"#,
+            r#"{"type":"agent-setting","cwd":"/repo","agentSetting":42}"#,
+            r#"{"type":"agent-setting","cwd":"/repo","agentSetting":""}"#,
+            r#"{"type":"agent-setting","cwd":"/repo","agentSetting":"   "}"#,
+            // A null/absent `type`: the agent facts key off the record type, so
+            // neither can latch, and the agent field is ignored wherever it sits.
+            r#"{"type":null,"cwd":"/repo","agentName":"x","agentSetting":"lead"}"#,
+            r#"{"cwd":"/repo","agentName":"x","agentSetting":"lead"}"#,
+        ];
+
+        for line in malformed {
+            let parsed = parse_lines("agent-facts-malformed", &[line])
+                .unwrap_or_else(|| panic!("a file with a cwd is a session: {line}"));
+            assert!(
+                !parsed.background && !parsed.has_agent_name && !parsed.has_agent_setting,
+                "a malformed record must produce no agent fact: {line}"
+            );
+        }
+    }
+
+    /// `sessionKind` is an ENVELOPE key, so it is read independently of `type` —
+    /// a record with a null/absent `type` still says the transcript is a
+    /// background job, while its stray agent fields are correctly ignored
+    /// (they belong to record types, not to the envelope).
+    #[test]
+    fn background_is_read_independently_of_the_record_type() {
+        let parsed = parse_lines(
+            "bg-envelope",
+            &[r#"{"type":null,"cwd":"/repo","sessionKind":"bg","agentName":"x"}"#],
+        )
+        .expect("a file with a cwd is a session");
+
+        assert!(parsed.background, "the envelope key stands on its own");
+        assert!(
+            !parsed.has_agent_name,
+            "an agentName outside an agent-name record names nothing"
+        );
+    }
+
+    /// `sessionKind` rides on ordinary records, so the fact must latch from
+    /// ANYWHERE in the file — including a record that carries neither `cwd` nor
+    /// any agent field — and must survive later records that omit the key.
+    #[test]
+    fn background_latches_from_any_record_in_the_file() {
+        let parsed = parse_lines(
+            "bg-latch",
+            &[
+                r#"{"type":"user","cwd":"/repo","sessionId":"s"}"#,
+                r#"{"type":"attachment","sessionKind":"bg"}"#,
+                r#"{"type":"assistant","sessionId":"s"}"#,
+            ],
+        )
+        .expect("a file with a cwd is a session");
+
+        assert!(
+            parsed.background,
+            "one bg-stamped record anywhere makes the transcript a background job"
+        );
     }
 
     #[test]

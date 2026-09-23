@@ -95,6 +95,27 @@ something else", which is why `send::status_for_bg_launch` treats a zero exit wi
 a non-empty `stderr` as a distinct *started-but-warned* outcome rather than the
 neutral success. Do not simplify that seam back to an exit-code check.
 
+### `-p` can also fail SILENTLY on a zero exit
+
+The one-shot send has the same hazard, so the same seam. When a `-p` turn leaves
+background tasks running past claude's own wait ceiling, claude writes
+`Background tasks still running after <n>s; terminating.` to **stderr**, kills
+those tasks, and exits **0** with an ordinary success payload on stdout
+(upstream: `anthropics/claude-code#95789`). A `Ctrl-R` reply that just had its
+background agent terminated therefore prints a clean, priced `sent — $0.0136`
+unless stderr is consulted — which is why `send::status_for_output` carries the
+same *zero exit + non-empty stderr ⇒ warned* row as the launch seam.
+
+Two properties of that seam are deliberate and must survive any simplification.
+It does NOT match on the message's wording — snapback does not own that string,
+and the next zero-exit downgrade will not be this one — and "non-empty stderr"
+means what survives sanitizing, so a blank or all-escape stream degrades to the
+ordinary success rather than to a fabricated failure.
+
+snapback neither sets nor overrides claude's background-wait ceiling: the ceiling
+is claude's to own, and snapback's job is only to REPORT what it did. Do not add
+an env override to paper over it.
+
 ## Top-level options
 
 Grouped for scanning; the CLI lists them alphabetically. `[P]` = only meaningful
