@@ -82,8 +82,11 @@ it. Follow this split when adding behavior:
   parameters so no test reads a clock;
   `compose::compose_key_to_action`; `defined_agents::select_agents` /
   `parse_frontmatter`; `agents::classify` and the outputs derived from it
-  (`qualifier_copy`, the shared banner/list-row phrase that `friendly_status`
-  fuses onto the kind label, plus `is_active`) and both argv builders (`agents_argv` /
+  (`qualifier_copy`, the LIST ROW's worded qualifier — which `friendly_status`
+  also fuses onto the kind label, for the pinned row's fallback for a transcript
+  with no marker at all and nothing else, and for the status a LIVE agent's pinned
+  turn marker carries — plus `is_active`) and both argv
+  builders (`agents_argv` /
   `live_agents_argv`) and `agents_from_output` (the shell-out's
   non-zero-exit-means-no-signal decision, split from the spawn so it is testable
   without one); `worktrees`' whole trio, split from its spawn the same way —
@@ -268,8 +271,11 @@ The preview's own scroll is **bottom-anchored by default**
 and preview show, and `clamp_preview_offset` then pins to `max_offset`). So
 anything that must STAY visible is a **layout row, never a line prepended into
 the scrolled `Text`** — a prepended line is scrolled off for any transcript
-taller than the pane, which is the normal case. The status banner is the
-instance: `view::preview_split(area, has_banner)` carves the pane's inner rect
+taller than the pane, which is the normal case. The preview's STICKY HEADER — the
+pinned row that names the turn at the top of the viewport, with a live agent's
+status and age after it, unless a failed background task outranks it (the
+`has_banner` rule below) — is the instance:
+`view::preview_split(area, has_banner)` carves the pane's inner rect
 into a pinned banner row and the transcript beneath it, and returns the WHOLE
 inner rect when there is no banner (so a banner-less pane's geometry is exactly
 `Block::inner`, unchanged). The rules that follow from it:
@@ -494,17 +500,41 @@ inner rect when there is no banner (so a banner-less pane's geometry is exactly
   is equally a reader scrolling past the end, a pane widened by a resize, and a
   transcript that shrank, so re-arming on it took a deliberately positioned pane
   away with no key pressed.
-- `has_banner` is **`view::preview_banner(app).is_some()` — never liveness**.
-  Since the poller passes `--all`, an agent that reported completion still has a
-  banner while claude would not call it live; keying the geometry on liveness
-  would draw the banner but hit-test one row off for every `done` session. Name
-  it for the banner, not for liveness. Liveness is also *unaskable* here: it now
-  means a shell-out to claude (`App::is_live_now`), which a render must never do.
-  Anything that REPLACES the transcript must therefore suppress the banner inside
-  that one fn rather than skipping it at the draw site: the in-flight quick reply
-  does (its echo turns take the banner's place inline) and so does the new-session
-  draft card (there is no session to describe). Skip it at the draw site instead
-  and the hit-test still reserves a row that was never painted.
+- `has_banner` is **`view::preview_banner(app).is_some()` — never liveness, and
+  never the reported-agent set**. It is true for EVERY selected session, because
+  the row names the turn you are reading and every transcript has one. What the
+  row SHOWS is a separate question with ONE precedence, resolved in
+  `render_preview`'s banner remap and nowhere else: a FAILED background task the
+  session still carries (`view::failed_task_banner_line` — claude's summary alone,
+  in `FAILED_TASK_COLOR`) > the turn marker at the top of the viewport, followed —
+  for a LIVE agent only — by `HEADER_SEPARATOR` and `<status> · <age>` in the
+  status's Cyan + BOLD (`view::marker_with_live_status`) > the reported status,
+  with its age when known > a blank row. LIVE is the polled record's `pid`
+  (`view::reports_live_process` — a DISPLAY reading of the `--all` map, never the
+  probe's `App::is_live_now`, never `agents::is_active`, never a `classify`
+  bucket), and the suffix also needs `agents::elapsed_phrase` to answer against
+  the poll's stamp; any other session's marker row is EXACTLY the marker, a
+  finished record with a known age included. The marker leads, and the row is
+  never wrapped, so a narrow pane cuts the age, then the status, before any of
+  the marker. So the failure takes the sticky header's place — and
+  the live status's — on that session until the user writes into it, and the
+  reported status alone is only the fallback for a transcript with no marker and
+  no standing failure. None of that
+  touches the reservation: the remap is `Option::map`, so a failure can neither
+  add a row nor revive one a replacement pane suppressed. Keying it on the
+  polled `--all` map hid the pinned turn for every session claude does not list —
+  `claude agents` lists only ACTIVE sessions, so an interactive one nothing holds
+  open is absent — and moved the transcript a row whenever a poll flipped a
+  session in or out. Keying it on liveness is worse: liveness is *unaskable* here,
+  since it means a shell-out to claude (`App::is_live_now`), which a render must
+  never do. Nor may it key on "has markers": those live in the width-scoped cache,
+  which `preview_banner`'s `&App` read cannot build, so the hit-test could ask
+  before the frame that fills it and disagree with the draw. Name it for the
+  banner. Anything that REPLACES the transcript must therefore suppress the banner
+  inside that one fn rather than skipping it at the draw site: the in-flight quick
+  reply does (its echo turns take the banner's place inline) and so does the
+  new-session draft card (there is no session to describe). Skip it at the draw
+  site instead and the hit-test still reserves a row that was never painted.
 - **A replacement pane must not write its own offset back.** `render_preview`
   persists the clamped offset into `App::preview_scroll` so the scroll keys stay in
   bounds, and that is right only while the transcript is what was measured. The
@@ -1064,7 +1094,9 @@ state and renders on the surface that owns it:
   poll — but the guard still prevents a stale completion from landing on a
   surface that has moved on;
 - how long a reported session has been running lives in typed state and renders
-  on the preview banner (`live busy · 46m`), not on the help line: the record's
+  on the preview banner (`live busy · 46m`, after the pinned turn marker for a live
+  agent, alone as the fallback for a marker-less transcript), not on the help
+  line: the record's
   `startedAt` (`ReportedAgent::started_at_ms`) against `App::reported_at_ms`, the
   wall-clock instant the poller's map was answered. The poller stamps it
   (`AppEvent::ReportedAgents { agents, reported_at_ms }`) and the event arm only

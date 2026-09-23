@@ -967,7 +967,8 @@ const TEST_OWN_PID: u32 = 1 << 22;
 /// dropped, so every existing invalidation (a width change, a reload) already carries
 /// the count with it and no future one can remember half of it.
 struct CachedPreview {
-    /// The styled transcript + clickable link regions from one `preview::render`.
+    /// The styled transcript + clickable link regions + turn marker lines from
+    /// one `preview::render`.
     rendered: preview::RenderedPreview,
     /// Where every rendered line STARTS once WORD-wrapped at
     /// [`App::preview_width`]: entry `n` is the screen row `rendered.text.lines[n]`
@@ -1262,7 +1263,15 @@ pub struct App {
     pub tick: u64,
     /// Sessions claude REPORTED as agents, keyed by full `session_id` (joined
     /// from `claude agents --json --all`). Refreshed OFF the UI thread; drives
-    /// the badges and the preview status banner. Empty when the signal is
+    /// the badges and the list row's worded qualifier. It does NOT decide whether
+    /// the preview reserves its pinned banner row (every selected session does —
+    /// see `view::preview_banner`); that row's CONTENT is the marker of the turn
+    /// under the viewport's top, which this map touches only twice: the status and
+    /// age a LIVE agent's marker carries after it (a live agent being one whose
+    /// record here carries a `pid`, and the suffix drawn only when
+    /// [`reported_at_ms`](Self::reported_at_ms) can measure its age),
+    /// and the fallback for a transcript with no marker to pin (an empty one, or a
+    /// session file that can no longer be read). Empty when the signal is
     /// unavailable.
     ///
     /// A DISPLAY signal only, and that is the WHOLE of its authority: `--all`
@@ -2441,11 +2450,14 @@ impl App {
     }
 
     /// The reported-agent record for `session_id`, if claude knows it as an agent
-    /// (drives the badge + banner; `None` for a row it never reported).
+    /// (drives the badge, and the pinned banner's status — its fallback line and
+    /// the suffix a live agent's turn marker carries; `None` for a row it never
+    /// reported).
     ///
-    /// Says NOTHING about liveness — an agent that reported completion is
+    /// A `Some` says NOTHING about liveness — an agent that reported completion is
     /// reported too, and both the badge and the banner must still see it in order
-    /// to render it green and steady. Use
+    /// to render it green and steady. (The pinned row's live suffix reads the
+    /// record's `pid` for DISPLAY only, `view::reports_live_process`.) Use
     /// [`is_live_now`](Self::is_live_now) to gate behavior on "running now", and
     /// [`live_agent_now`](Self::live_agent_now) for a hand-off's job `id`.
     ///
@@ -3856,6 +3868,42 @@ impl App {
         if let Some(next) = next {
             self.preview_scroll = next;
         }
+    }
+
+    /// The marker [`Line`] of the turn sitting at the wrapped visual row `offset` —
+    /// the resolved scroll offset the preview pane is drawn at — or `None` when
+    /// nothing is selected or the transcript carries no marker at or before that row.
+    ///
+    /// Pulled from the SAME width-scoped cache the draw windows by: the turn markers
+    /// (see [`preview::MarkerLine`]) and the per-line wrapped-row PREFIX MAP that
+    /// translates a wrapped row back into a content row (`view::marker_at_top`), so
+    /// the sticky banner's pinned row can never describe a different render — or a
+    /// different wrap — than the transcript on screen. It is the very map
+    /// [`preview_window`](Self::preview_window) takes its window from and
+    /// [`preview_hit_context`](Self::preview_hit_context) hit-tests against, so the
+    /// banner names the turn whose line the pane actually painted on its top row.
+    ///
+    /// `offset` is a `usize` row, not a `u16`: it is the same absolute wrapped-row
+    /// offset the draw resolves (`App::preview_scroll` is a `u32`), and narrowing it
+    /// here would silently pin the wrong turn past 65,535 rows.
+    ///
+    /// The active query's marks come along ([`view::marker_at_top_marked`]), read from
+    /// the SAME [`matches`](CachedPreview::matches) map the window marks its own rows
+    /// by — so a query that hits a marker line cannot draw that one line two ways at
+    /// once, marked in the transcript and unmarked in the pinned row above it. WHICH
+    /// turn is still `view::marker_at_top`'s answer alone.
+    pub(crate) fn preview_marker_at(
+        &mut self,
+        inner_width: u16,
+        offset: usize,
+    ) -> Option<Line<'static>> {
+        let cached = self.ensure_preview(inner_width)?;
+        view::marker_at_top_marked(
+            &cached.rendered.markers,
+            &cached.row_prefix,
+            &cached.matches,
+            offset,
+        )
     }
 }
 

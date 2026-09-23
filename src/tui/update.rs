@@ -1053,19 +1053,17 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
 /// The rect the preview's TRANSCRIPT was actually drawn into — the rect every
 /// hit-test over the pane must resolve a screen cell against.
 ///
-/// The transcript does NOT own the whole preview pane: a REPORTED session — or
-/// one carrying a failed background task — pins a status banner to the pane's
-/// first inner row (`view::preview_banner`), so its transcript starts one row
-/// lower. Deriving the rect from the SAME [`view::preview_split`] the view drew
-/// with is what keeps a hit-test honest — the
+/// The transcript does NOT own the whole preview pane: the selected session pins a
+/// banner to the pane's first inner row (`view::preview_banner`), so its
+/// transcript starts one row lower. Deriving the rect from the SAME
+/// [`view::preview_split`] the view drew with is what keeps a hit-test honest — the
 /// scroll offset and the cached line widths are both measured from that rect's
 /// origin, so a click on screen row N resolves to the transcript line actually
-/// drawn there. A session with no banner splits off nothing and hit-tests
-/// against the full inner rect, exactly as it did before the banner existed.
+/// drawn there. A pane with no banner splits off nothing and hit-tests against the
+/// full inner rect, exactly as it did before the banner existed.
 ///
-/// REPORTED, not live: an agent that reported completion still has a banner, so
-/// asking the banner — never liveness — is what keeps this rect identical to the
-/// one the view drew against. Liveness is a hand-off question answered by
+/// The banner, never liveness: asking the banner is what keeps this rect identical
+/// to the one the view drew against. Liveness is a hand-off question answered by
 /// [`App::is_live_now`], and it would be the wrong question here twice over: it
 /// shells out to claude, and it would disagree with the drawn banner.
 ///
@@ -5077,15 +5075,22 @@ mod tests {
     }
 
     #[test]
-    fn a_click_on_a_drawn_link_opens_it_for_a_banner_less_session() {
+    fn a_click_on_a_drawn_link_opens_it_for_a_banner_less_pane() {
         // No banner: the transcript owns the pane's whole inner rect, and the
-        // hit-test must NOT shift by a row that was never reserved.
+        // hit-test must NOT shift by a row that was never reserved. An in-flight
+        // quick reply is the one banner-less pane that still draws the transcript
+        // (its inline echo turns take the banner's place).
         let dir = unique_temp_dir("link-plain");
         let mut app = link_app(&dir, None);
+        app.sending = vec![crate::tui::app::Sending {
+            session_id: "sess-link".to_string(),
+            message: "thanks".to_string(),
+            baseline_msg_count: 0,
+        }];
         let buffer = render_board(&mut app);
         assert!(
             view::preview_banner(&app).is_none(),
-            "a session with no joined agent reserves no banner row"
+            "an in-flight reply reserves no banner row"
         );
         assert!(
             app.preview_scroll > 0,
@@ -5097,6 +5102,44 @@ mod tests {
             resolve_link_click(&mut app, col, row),
             LinkClick::Opening(LINK_URL.to_string()),
             "a click on the cell the link was DRAWN on must resolve to its url"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_click_on_a_drawn_link_opens_it_beneath_an_unreported_sessions_pinned_row() {
+        // A session claude does NOT report pins the row too — it keys on the
+        // selection — so its transcript starts one row lower, and the hit-test
+        // must follow it there exactly as it does for a reported one.
+        let dir = unique_temp_dir("link-unreported");
+        let mut app = link_app(&dir, None);
+        let buffer = render_board(&mut app);
+        assert!(
+            app.reported_agent("sess-link").is_none(),
+            "the session must really be unreported, or this is the reported case"
+        );
+        assert!(
+            view::preview_banner(&app).is_some(),
+            "an unreported selected session must pin the row"
+        );
+        assert!(
+            app.preview_scroll > 0,
+            "the fixture must overflow the pane, or this never tests a scrolled hit"
+        );
+
+        let (col, row) = drawn_link_cell(&buffer, app.preview_rect);
+        assert_eq!(
+            resolve_link_click(&mut app, col, row),
+            LinkClick::Opening(LINK_URL.to_string()),
+            "a click on the cell the link was DRAWN on must resolve to its url \
+             even though the pinned row pushed the transcript down a row"
+        );
+        // Precision, not just presence: the row ABOVE the label is a different
+        // transcript line, so it must NOT resolve to the same link.
+        assert_ne!(
+            resolve_link_click(&mut app, col, row - 1),
+            LinkClick::Opening(LINK_URL.to_string()),
+            "the row above the label is another transcript line, not the link"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6093,6 +6136,199 @@ mod tests {
         assert!(
             !reclosed.contains(INJECTED_BODY_PHRASE) && reclosed.contains(COLLAPSED_AFFORDANCE),
             "the second click must CLOSE the node again"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- peer-message fold under the pinned row: one geometry, both shapes ----
+
+    /// A click on a FOLDED node's header opens it while the pinned row is
+    /// reserved above the transcript.
+    ///
+    /// Every selected session reserves that row (`view::preview_banner`), so the
+    /// node's header is drawn one row lower than the pane's first inner row, and
+    /// the pane arm must resolve the press against that SAME lower rect
+    /// ([`preview_transcript_rect`]). Asserted on the precondition first, so a
+    /// board that stopped pinning the row could not pass this as the banner-less
+    /// case in disguise.
+    ///
+    /// The probe is the header's MARKER cell, the pane's first CONTENT column, so
+    /// the one press also pins that the splitter's grab band stops at the border
+    /// on the rows beneath the pinned one. And the row directly ABOVE the header,
+    /// the node's blank separator, is pressed first and must stay inert: a
+    /// hit-test that forgot the reserved row resolves that row to the header.
+    #[test]
+    fn a_click_on_a_folded_peer_node_opens_it_beneath_the_pinned_row() {
+        let (mut app, buffer) = peer_app();
+        assert!(
+            view::preview_banner(&app).is_some(),
+            "every selected session pins the row, or this is the banner-less case"
+        );
+        let transcript = preview_transcript_rect(&app);
+        assert_eq!(
+            transcript.y,
+            app.preview_rect.y + 2,
+            "the transcript must start one row below the pane's first inner row"
+        );
+        let width = transcript.width;
+        let (col, row) = drawn_peer_marker_cell(&buffer, app.preview_rect);
+        assert_eq!(
+            col,
+            app.preview_rect.x + 1,
+            "the marker must sit on the pane's first CONTENT column"
+        );
+        assert!(
+            row > transcript.y,
+            "the header must be drawn below the transcript's first row, so the row \
+             above it is transcript rather than the pinned row"
+        );
+
+        wheel(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            col,
+            row - 1,
+        );
+        let untouched = preview_string(&mut app, width);
+        assert!(
+            untouched.contains(COLLAPSED_AFFORDANCE) && !untouched.contains(PEER_BODY_PHRASE),
+            "the row above the header is the node's blank separator and must not \
+             toggle it"
+        );
+
+        wheel(&mut app, MouseEventKind::Down(MouseButton::Left), col, row);
+        assert!(
+            !app.is_dragging_split(),
+            "the marker is content under the pinned row too, never a splitter grab"
+        );
+        let expanded = preview_string(&mut app, width);
+        assert!(
+            expanded.contains(PEER_BODY_PHRASE) && expanded.contains(EXPANDED_AFFORDANCE),
+            "a click on the header drawn beneath the pinned row must open the node"
+        );
+    }
+
+    /// The banner-less half of the same seam: while a quick reply to the selected
+    /// session is in flight, its inline echo turns take the pinned row's place
+    /// (`view::preview_banner` is `None`), so the transcript owns the pane's whole
+    /// inner rect and a fold click must NOT shift by a row that was never
+    /// reserved.
+    ///
+    /// The blank BELOW the collapsed header, the one that leads the next turn, is
+    /// pressed first and must stay inert: a hit-test that reserved a row anyway
+    /// resolves that row to the header's last drawn row.
+    #[test]
+    fn a_click_on_a_folded_peer_node_opens_it_in_a_banner_less_pane() {
+        let (folder, file) = PEER_FIXTURE;
+        let mut app = App::new(
+            vec![fixture_session("s1", folder, file)],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
+        app.sending = vec![crate::tui::app::Sending {
+            session_id: "s1".to_string(),
+            message: "thanks".to_string(),
+            baseline_msg_count: 0,
+        }];
+        let buffer = render_board(&mut app);
+        assert!(
+            view::preview_banner(&app).is_none(),
+            "an in-flight reply reserves no pinned row"
+        );
+        let transcript = preview_transcript_rect(&app);
+        assert_eq!(
+            transcript.y,
+            app.preview_rect.y + 1,
+            "with no pinned row the transcript owns the pane's first inner row"
+        );
+        let width = transcript.width;
+        let (col, row) = drawn_peer_marker_cell(&buffer, app.preview_rect);
+        assert_eq!(
+            col,
+            app.preview_rect.x + 1,
+            "the marker must sit on the pane's first CONTENT column"
+        );
+
+        // The header may soft-wrap, so the next turn's blank is found by where the
+        // next turn's `●` marker was DRAWN: it is the row directly above it.
+        let next_turn = (row + 1..app.preview_rect.bottom())
+            .find(|&y| {
+                buffer
+                    .cell((col, y))
+                    .is_some_and(|c| c.symbol() == "\u{25cf}")
+            })
+            .expect("the fixture draws a claude turn below the node");
+        wheel(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            col,
+            next_turn - 1,
+        );
+        let untouched = preview_string(&mut app, width);
+        assert!(
+            untouched.contains(COLLAPSED_AFFORDANCE) && !untouched.contains(PEER_BODY_PHRASE),
+            "the blank below a collapsed header leads the next turn and must not \
+             toggle the node"
+        );
+
+        wheel(&mut app, MouseEventKind::Down(MouseButton::Left), col, row);
+        assert!(
+            !app.is_dragging_split(),
+            "the marker is content, never a splitter grab"
+        );
+        let expanded = preview_string(&mut app, width);
+        assert!(
+            expanded.contains(PEER_BODY_PHRASE) && expanded.contains(EXPANDED_AFFORDANCE),
+            "a click on the header of a banner-less pane must open the node"
+        );
+    }
+
+    /// A link label that starts its line, on the pane's FIRST content column,
+    /// stays clickable beneath the pinned row: the grab band stops at the border
+    /// there too, and the pane arm resolves the cell against the transcript rect
+    /// the pinned row pushed down.
+    ///
+    /// Stops at the pure [`resolve_link_click`] seam, like its siblings, because
+    /// the arm's link branch would spawn a browser.
+    #[test]
+    fn a_link_on_the_first_content_column_opens_beneath_the_pinned_row() {
+        let dir = unique_temp_dir("link-col0-pinned");
+        let mut app = App::new(
+            vec![link_at_column_zero_session(&dir)],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
+        let buffer = render_board(&mut app);
+        assert!(
+            view::preview_banner(&app).is_some(),
+            "every selected session pins the row, or this is the banner-less case"
+        );
+        let transcript = preview_transcript_rect(&app);
+        assert_eq!(
+            transcript.y,
+            app.preview_rect.y + 2,
+            "the transcript must start one row below the pane's first inner row"
+        );
+
+        let (col, row) = drawn_link_cell(&buffer, app.preview_rect);
+        assert_eq!(
+            col,
+            app.preview_rect.x + 1,
+            "the label must sit on the pane's first CONTENT column"
+        );
+        assert!(
+            !on_splitter(col, row, app.list_rect, app.preview_rect),
+            "the first content column is never a splitter grab"
+        );
+        assert_eq!(
+            resolve_link_click(&mut app, col, row),
+            LinkClick::Opening(LINK_URL.to_string()),
+            "the cell the label was DRAWN on must resolve to its url"
+        );
+        assert_ne!(
+            resolve_link_click(&mut app, col, row - 1),
+            LinkClick::Opening(LINK_URL.to_string()),
+            "the row above the label is the blank that leads its paragraph"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

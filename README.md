@@ -282,23 +282,61 @@ a dot is steady, the shade separates the two at rest — the working gray is the
 interrupted one, the dimmer gray is a run that has ended. Colors follow your
 terminal's theme.
 
-Open the preview on a badged session and it leads with the same status in words,
-pinned above the transcript so it stays in view while the transcript scrolls
-beneath it — you can see why a session is sitting there before deciding what to
-do about it. It reports what Claude Code reports, in Claude Code's own words, with
-two exceptions. The two states that both mean *the session is waiting on you*
+Open the preview on any session — badged or not — and a row stays pinned above
+the transcript, naming **the turn you are reading**: the marker of whichever turn
+owns the line at the top of the viewport — `● claude · @lead · 12:55` — so who
+spoke, under which agent and when stay readable long after that turn's own
+marker has scrolled off the top of a long answer. It is the transcript's own
+marker line reused verbatim, down to the highlight your search puts on it, never
+a second rendering that could drift from the line below. It tracks the turn as
+you scroll, in every position the pane can be in, including the bottom-anchored
+one it opens at; scroll to the very first turn and the pinned row names that
+one, there being nothing above it to name. One exception to *who spoke*: a
+message a subagent hands back is not a turn of its own and has no marker, so
+while you read inside an expanded one the pinned row names the last turn above
+it, not the subagent. That is usually the `● claude` turn that delegated the
+work, but it is whichever turn precedes the message — a hand-back that lands
+after later turns names the latest of them, and a peer message that follows a
+`▶ you` turn names that turn. The `◆ message from …` line that opens the message
+is what names its sender. The same goes for context Claude Code added on your
+behalf, the `◇ added by claude code` line: it is not a turn either and has no
+marker, so inside an opened one the pinned row names the turn above it. The row
+steps aside only while something else holds the pane: a quick reply you sent
+to that session is still in flight, when the reply's own turns take its place at
+the bottom of the transcript, or a `Ctrl-N` draft has replaced the transcript
+altogether. And it gives way to one
+thing: a background task that session started and that failed. Until you next
+write in the session, the pinned row quotes that failure instead of naming the turn
+(see *When a job you sent off fails* below).
+
+The session's *status* in words is on the list row instead, as the word beside the
+badge. It reports what Claude Code reports, in Claude Code's own words, with two
+exceptions. The two states that both mean *the session is waiting on you*
 (`blocked` and `waiting`) are spelled out as `needs input`. And a background agent
 Claude Code still calls `working` while its own status reads `idle` — the shape of
 one that was interrupted and never cleaned up — is labelled `interrupted` (Claude
 Code's own word) and held steady. Anything else is passed through as-is rather
-than guessed at.
+than guessed at. That status reaches the pinned row on its own only when the
+transcript has no turn to name at all — an empty one, or a session file that can
+no longer be read — the one case the preview leads with words rather than with a
+turn (a session without a badge has no status to show, so its row stays blank
+then). Beside a turn, it appears only for an agent that is still running — one
+Claude Code reports a process id for (below).
 
-When Claude Code reports when the session started, the banner also says how long
-ago that was, as of the board's last check: `live busy · 46m`. A reply stuck for
-most of an hour then looks different from one that began a moment ago. The age
-counts from when the session started, not from when it last changed state, and it
-stays off the status line at the bottom, which is only for what your last
-keypress did.
+When Claude Code reports when the session started, the pinned row also says how
+long ago that was, as of the board's last check. For a running agent the status
+and that age ride after the turn marker on the same row —
+`● claude · 10:00  ·  live busy · 46m` — so the turn you are reading and how long
+the agent has been at it both stay in view; on a narrow pane the age is cut off
+first, then the status, and the turn marker last. A session Claude Code reports no
+process id for — typically one waiting on you, stopped, done or failed — pins just
+the turn marker, even when its start time is known; so does a running agent with
+no age to state. With no turn to name, the status carries the age on its own,
+running or not: `live busy · 46m`. A reply stuck for most of an hour then looks
+different from one that began a moment ago. The age counts from when the session
+started, not from when it last changed state, and it stays off the status line at
+the bottom, which is only for what your last keypress did. A failed background
+task (below) still takes the whole row: no turn, status or age beside it.
 
 Because a session that's still running can't be plain-resumed, pressing `Enter`
 on one offers **Attach** (reconnect to a running background agent), **Fork**, or
@@ -358,7 +396,9 @@ Code drops a short notice into that session and moves on. Nothing on the board
 used to say so, so a failed job looked just like one still working.
 
 snapback marks that session's row `[task failed]`, and its preview leads with a
-line quoting Claude Code's own account, word for word, with the time it arrived:
+line quoting Claude Code's own account, word for word, with the time it arrived.
+That line takes the pinned row, in place of the turn you are reading, and stands
+there on its own:
 
 ```text
 background task failed at 2026-09-21 15:30: Agent "Remediate review findings" failed: Agent stalled: no progress for 600s (stream watchdog did not recover)
