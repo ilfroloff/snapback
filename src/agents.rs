@@ -12,7 +12,10 @@
 //! * **[`reported_agents`] — `--json --all` — the BOARD's signal.** Polled ~5s
 //!   off-thread while the board is active (skipped entirely once it has been
 //!   idle past `AGENTS_IDLE_AFTER`); drives badges, colors, the pulse and the
-//!   preview banner via [`classify`]. The bare command lists currently-active
+//!   list row's worded qualifier via [`classify`] — which the pinned preview
+//!   banner reaches ONLY through its fallback for a transcript with no marker
+//!   to pin (an empty one, or a session file that can no longer be read). The
+//!   bare command lists currently-active
 //!   agents AND recently finished ones (claude keeps a `done` background job in
 //!   the active list for a while before reaping it), so a just-wrapped-up
 //!   session is briefly observable without `--all`. What `--all` adds is the
@@ -147,11 +150,12 @@ const QUALIFIER_FAILED: &str = "failed";
 
 /// User-facing copy for [`AgentActivity::NeedsInput`] — the FIRST of the two
 /// translated buckets (the other is [`INTERRUPTED_COPY`]). Phrased as what the
-/// SESSION wants ("needs input"), so BOTH the preview banner
-/// ([`friendly_status`]) AND the board list row
-/// ([`crate::tui::view::render_list`], via [`qualifier_copy`]) tell the user why
-/// it stopped instead of restating the raw token ([`QUALIFIER_BLOCKED`] or
-/// [`QUALIFIER_WAITING`]).
+/// SESSION wants ("needs input"), so the board list row
+/// ([`crate::tui::view::render_list`], via [`qualifier_copy`]) — and the pinned
+/// preview banner's fallback ([`friendly_status`]) for a transcript with no
+/// marker to pin, an empty one, or a session file that can no longer be read —
+/// tell the user why it stopped instead of restating the raw token
+/// ([`QUALIFIER_BLOCKED`] or [`QUALIFIER_WAITING`]).
 const NEEDS_INPUT_COPY: &str = "needs input";
 
 /// User-facing copy for [`AgentActivity::WorkingButIdle`] — the SECOND
@@ -232,7 +236,10 @@ impl ReportedAgent {
 /// What a reported agent is doing, bucketed from its `state`/`status` qualifier.
 ///
 /// This enum is the SINGLE interpretation of that undocumented value set: the
-/// preview banner ([`friendly_status`]), the list-badge pulse ([`is_active`]),
+/// list row's worded qualifier ([`qualifier_copy`], which the pinned preview
+/// banner reaches only through its fallback for a transcript with no marker to
+/// pin — an empty one, or a session file that can no longer be read — via
+/// [`friendly_status`]), the list-badge pulse ([`is_active`]),
 /// the badge color ([`crate::tui::view::badge_color`]) and the hard-delete
 /// writer guard ([`crate::delete::can_delete`]) all map from it, so a schema
 /// drift is a one-line change in [`classify`] rather than a hunt for raw string
@@ -385,8 +392,10 @@ pub fn classify(agent: &ReportedAgent) -> AgentActivity {
 ///   working `state` and an `idle` `status`, which read verbatim would be a bare,
 ///   endless `working`.
 ///
-/// Its two consumers are the preview banner ([`friendly_status`], which fuses the
-/// phrase onto the kind label) and the board list row
+/// Its two consumers are the pinned preview banner's fallback
+/// ([`friendly_status`], which fuses the phrase onto the kind label) for a
+/// transcript with no marker to pin — an empty one, or a session file that can no
+/// longer be read — and the board list row
 /// ([`crate::tui::view::render_list`], which draws the phrase as its own span so
 /// it can weight [`AgentActivity::NeedsInput`] louder than the rest). Both read
 /// the SAME phrase here, so they can never disagree about what a qualifier says.
@@ -698,8 +707,9 @@ mod tests {
         }
     }
 
-    /// `qualifier_copy` is the shared translation the preview banner AND the
-    /// board list row both speak, so it is pinned directly here rather than only
+    /// `qualifier_copy` is the shared translation the board list row AND the
+    /// pinned banner's fallback for a transcript with no marker at all both speak,
+    /// so it is pinned directly here rather than only
     /// through `friendly_status`: the TWO authored buckets (`NeedsInput`, both
     /// spellings from either qualifier source; and `WorkingButIdle`) translate,
     /// every other bucket passes its raw token through verbatim, and an agent with
@@ -1073,7 +1083,7 @@ mod tests {
     ///
     /// `--all` is the load-bearing half and the reason this test exists: the bare
     /// command drops a finished job once claude reaps it from the active list, so
-    /// without the flag a `done` session's badge and banner vanish the moment it is
+    /// without the flag a `done` session's badge vanishes the moment it is
     /// reaped — the `done` bucket stops RELIABLY reaching `classify`. Every `done`
     /// assertion in this module would still pass, because they feed `classify`
     /// synthetic agents rather than the wire; only this assertion sees the flag.

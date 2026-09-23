@@ -135,15 +135,40 @@ pub struct LinkRegion {
     pub url: String,
 }
 
+/// One turn's marker `Line`, addressed by content row in the SAME coordinate
+/// space as [`LinkRegion::content_row`] (an index into the rendered [`Text`]'s
+/// lines, rebased onto the whole transcript as each block is appended — there is
+/// no tail cap left to rebase it a second time, see [`render_file_collect`]).
+///
+/// Captured so the preview pane's PINNED row can show the marker of whichever turn
+/// is scrolled to the top of the viewport — in EVERY scroll state, including the
+/// default bottom-anchored one (see [`crate::tui::view::render_preview`]) — reusing
+/// a `Line` that is ALREADY rendered elsewhere in the transcript rather than
+/// deriving a second, divergent copy of the marker text (no first-line synopsis,
+/// no tool-only-turn fallback — the marker line verbatim, or nothing).
+#[derive(Debug, Clone)]
+pub struct MarkerLine {
+    /// Line index into the rendered [`Text`] this marker sits on.
+    pub content_row: usize,
+    /// The turn's marker line verbatim — richest form first, every annotation
+    /// being independently optional (see [`marker_line_with_time`]): e.g.
+    /// `● claude · @lead · sonnet-5 · 12:55` or `▶ you · 14:23`.
+    pub line: Line<'static>,
+}
+
 /// A rendered transcript preview: the styled [`Text`] plus the clickable
-/// [`LinkRegion`]s discovered while building it. Both are produced from one pass
-/// at a fixed `width`, so a region's columns always match the text as drawn.
+/// [`LinkRegion`]s and turn [`MarkerLine`]s discovered while building it. All
+/// three are produced from one pass at a fixed `width`, so a region's columns —
+/// and a marker's content row — always match the text as drawn.
 #[derive(Debug, Default)]
 pub struct RenderedPreview {
     /// The styled, markdown-rendered transcript.
     pub text: Text<'static>,
     /// Clickable link regions, in content coordinates (see [`LinkRegion`]).
     pub links: Vec<LinkRegion>,
+    /// Every turn's marker line, in content-row (i.e. file) order (see
+    /// [`MarkerLine`]).
+    pub markers: Vec<MarkerLine>,
 }
 
 /// Render a session's transcript for the preview pane, fitting GFM tables to
@@ -202,18 +227,23 @@ pub fn pending_reply_turns(
 }
 
 /// Render `path` into a [`RenderedPreview`]: the styled transcript plus the
-/// clickable [`LinkRegion`]s, over the WHOLE file.
+/// clickable [`LinkRegion`]s and the turn [`MarkerLine`]s, over the WHOLE file.
 ///
-/// Each record's block contributes its lines and its (block-relative) link
-/// regions; both are rebased onto the growing transcript by the running line
-/// offset so a region's `content_row` addresses the FINAL text. That running
-/// rebase is now the ONLY one: a tail cap used to drop everything above the last
-/// 600 rendered lines and shift every surviving region up by the same amount, so a
-/// long conversation's early turns simply were not in the preview and a link above
-/// the cut was dropped. Nothing needs the cap any more — the pane draws a window of
-/// the rows its viewport can reach rather than re-wrapping the whole transcript per
-/// frame — so the transcript arrives whole and a region keeps the row it was
-/// rendered on.
+/// Each record's block contributes its lines, its (block-relative) link regions,
+/// and — for a "user"/"assistant"/"summary" record — its (block-relative)
+/// [`MarkerLine`]; all are rebased onto the growing transcript by the running line
+/// offset so a region's `content_row` (and a marker's) addresses the FINAL text.
+/// That running rebase is now the ONLY one: a tail cap used to drop everything
+/// above the last 600 rendered lines and shift every surviving region up by the
+/// same amount, so a long conversation's early turns simply were not in the preview
+/// and a link above the cut was dropped. Nothing needs the cap any more — the pane
+/// draws a window of the rows its viewport can reach rather than re-wrapping the
+/// whole transcript per frame — so the transcript arrives whole and a region, like a
+/// marker, keeps the row it was rendered on.
+///
+/// That the cap is gone is what makes the marker list TOTAL: every turn in the file
+/// has a marker at a live row, so the banner's lookup can never miss because the
+/// turn it wanted was cut off the top.
 fn render_file_collect(path: &Path, width: usize, known_agents: &HashSet<&str>) -> RenderedPreview {
     let file = match File::open(path) {
         Ok(f) => f,
@@ -221,6 +251,7 @@ fn render_file_collect(path: &Path, width: usize, known_agents: &HashSet<&str>) 
             return RenderedPreview {
                 text: Text::from(format!("No such session file:\n{}", path.display())),
                 links: Vec::new(),
+                markers: Vec::new(),
             }
         }
     };
@@ -228,6 +259,7 @@ fn render_file_collect(path: &Path, width: usize, known_agents: &HashSet<&str>) 
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut links: Vec<LinkRegion> = Vec::new();
+    let mut markers: Vec<MarkerLine> = Vec::new();
     // Day of the previously ANNOTATED turn, threaded through the loop so a
     // per-message timestamp can switch to `MM-DD HH:MM` on a day rollover.
     let mut prev_day: Option<Date> = None;
@@ -252,11 +284,15 @@ fn render_file_collect(path: &Path, width: usize, known_agents: &HashSet<&str>) 
         if !record.is_object() {
             continue;
         }
-        if let Some((block, block_links)) =
+        if let Some((block, block_links, block_marker)) =
             render_record(&record, &mut agent, known_agents, &mut prev_day, width)
         {
             let offset = lines.len();
             links.extend(rebased(block_links, offset));
+            if let Some(mut marker) = block_marker {
+                marker.content_row += offset;
+                markers.push(marker);
+            }
             lines.extend(block);
         }
     }
@@ -264,6 +300,7 @@ fn render_file_collect(path: &Path, width: usize, known_agents: &HashSet<&str>) 
     RenderedPreview {
         text: Text::from(lines),
         links,
+        markers,
     }
 }
 
@@ -292,6 +329,14 @@ fn rebased(links: Vec<LinkRegion>, offset: usize) -> Vec<LinkRegion> {
 /// `known_agents` gates the `agent-name` fallback. State is threaded — never
 /// hoisted — so attribution is positional; see the module doc.
 ///
+/// The third tuple element is the block's own [`MarkerLine`] (block-relative
+/// `content_row`, rebased by the caller like the links) for a "summary",
+/// "user", or "assistant" record — the ONE line the pinned preview banner can
+/// show when the user scrolls this turn to the top of the viewport
+/// ([`crate::tui::view::render_preview`]) — `None` for a record that
+/// contributes lines but is not itself a turn (there is none today, but the
+/// shape stays honest for one that might).
+///
 /// [`effective`]: AgentState::effective
 fn render_record(
     record: &Value,
@@ -299,19 +344,22 @@ fn render_record(
     known_agents: &HashSet<&str>,
     prev_day: &mut Option<Date>,
     width: usize,
-) -> Option<(Vec<Line<'static>>, Vec<LinkRegion>)> {
+) -> Option<(Vec<Line<'static>>, Vec<LinkRegion>, Option<MarkerLine>)> {
     match record.get("type").and_then(Value::as_str) {
         Some("summary") => {
             let s = record.get("summary").and_then(Value::as_str)?;
             // Keep the literal `# summary` head, now styled as a heading. No links.
-            let lines = vec![marker_line_with_time(
-                format!("# {s}"),
-                summary_style(),
-                None,
-                record,
-                prev_day,
-            )];
-            Some((lines, Vec::new()))
+            let marker =
+                marker_line_with_time(format!("# {s}"), summary_style(), None, record, prev_day);
+            let lines = vec![marker.clone()];
+            Some((
+                lines,
+                Vec::new(),
+                Some(MarkerLine {
+                    content_row: 0,
+                    line: marker,
+                }),
+            ))
         }
         Some("user") => {
             if record
@@ -326,16 +374,23 @@ fn render_record(
             if text.is_empty() {
                 return None;
             }
-            let mut lines = vec![
-                Line::from(""),
-                marker_line_with_time(YOU_MARKER.to_string(), you_style(), None, record, prev_day),
-            ];
+            let marker =
+                marker_line_with_time(YOU_MARKER.to_string(), you_style(), None, record, prev_day);
+            let mut lines = vec![Line::from(""), marker.clone()];
             // Body links are relative to the body; rebase them past the blank +
-            // marker lines that lead every turn.
+            // marker lines that lead every turn. The marker itself sits at row 1
+            // (the blank line at row 0 leads every turn).
             let offset = lines.len();
             let (body, body_links) = collapse_body_lines_collect(&text, width);
             lines.extend(body);
-            Some((lines, rebased(body_links, offset)))
+            Some((
+                lines,
+                rebased(body_links, offset),
+                Some(MarkerLine {
+                    content_row: 1,
+                    line: marker,
+                }),
+            ))
         }
         Some("assistant") => {
             let content = record.get("message").and_then(|m| m.get("content"))?;
@@ -343,19 +398,24 @@ fn render_record(
             if body.is_empty() {
                 return None;
             }
-            let mut lines = vec![
-                Line::from(""),
-                marker_line_with_time(
-                    CLAUDE_MARKER.to_string(),
-                    claude_style(),
-                    agent.effective(),
-                    record,
-                    prev_day,
-                ),
-            ];
+            let marker = marker_line_with_time(
+                CLAUDE_MARKER.to_string(),
+                claude_style(),
+                agent.effective(),
+                record,
+                prev_day,
+            );
+            let mut lines = vec![Line::from(""), marker.clone()];
             let offset = lines.len();
             lines.extend(body);
-            Some((lines, rebased(body_links, offset)))
+            Some((
+                lines,
+                rebased(body_links, offset),
+                Some(MarkerLine {
+                    content_row: 1,
+                    line: marker,
+                }),
+            ))
         }
         Some("agent-setting") => {
             // Positional state, not a rendered line: record the interactive BIND in
@@ -2232,6 +2292,95 @@ mod tests {
                 "{sep} separator must be bold"
             );
         }
+    }
+
+    /// Every marker [`render_file_collect`] collects addresses the row its OWN line
+    /// was rendered on — the `summary` head included, whose block is a SINGLE line
+    /// and so carries its marker at block row 0, where a `user` or `assistant`
+    /// turn's leading blank line puts theirs at row 1.
+    ///
+    /// [`RenderedPreview::markers`] has exactly one reader — the pinned preview
+    /// banner, through `App::preview_marker_at` — and a marker rebased onto the
+    /// wrong row still renders a perfectly ordinary transcript, so nothing in the
+    /// drawn text can catch it. That is why the row is pinned HERE, at the producer,
+    /// rather than left to a pane test: the banner's own suite resolves WHICH turn
+    /// owns a scroll offset, and takes these rows as given.
+    ///
+    /// INDEPENDENT on both sides. The summary's expected text is read back out of
+    /// the FIXTURE's own first record, so re-wording the fixture moves the
+    /// expectation with it instead of stranding a hardcoded string; and the rows are
+    /// re-derived by walking the rendered `Text` FORWARD for every marker-led line,
+    /// never by asking the list under test where its markers are.
+    #[test]
+    fn collected_markers_address_their_rendered_rows_summary_head_included() {
+        let path = fixture("-Users-me-project-alpha", "sess-normal-1.jsonl");
+        let raw = std::fs::read_to_string(&path).expect("read the fixture");
+        let record: Value = serde_json::from_str(raw.lines().next().expect("a first record"))
+            .expect("the first record is JSON");
+        assert_eq!(
+            record.get("type").and_then(Value::as_str),
+            Some("summary"),
+            "this fixture must LEAD with a summary record, or the arm under test is \
+             never reached"
+        );
+        // The head renders the fixture's own summary verbatim behind a `# `, so the
+        // expectation comes from the INPUT rather than from anything the renderer
+        // produced.
+        let expected_head = format!(
+            "# {}",
+            record
+                .get("summary")
+                .and_then(Value::as_str)
+                .expect("a summary record names its summary")
+        );
+
+        let rendered = render_file_collect(&path, WIDE, &HashSet::new());
+        let text_of =
+            |line: &Line<'_>| -> String { line.spans.iter().map(|s| s.content.as_ref()).collect() };
+
+        // Walk the rendered transcript forward for every marker-led line — the `# `
+        // head as well as the two turn glyphs. A markdown body header has its hashes
+        // STRIPPED by `markdown_body_lines`, so nothing inside a turn can pose as the
+        // summary head here.
+        let expected: Vec<(usize, String)> = rendered
+            .text
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| {
+                line.spans.first().is_some_and(|span| {
+                    let head = span.content.as_ref();
+                    head == YOU_MARKER || head == CLAUDE_MARKER || head == expected_head
+                })
+            })
+            .map(|(row, line)| (row, text_of(line)))
+            .collect();
+        let actual: Vec<(usize, String)> = rendered
+            .markers
+            .iter()
+            .map(|marker| (marker.content_row, text_of(&marker.line)))
+            .collect();
+
+        // The fixture must carry ordinary turns beside the summary, or the rebase
+        // past the head's one-line block is never exercised.
+        assert!(
+            expected.len() > 1,
+            "the oracle must find the summary AND real turns: {expected:?}"
+        );
+        assert_eq!(
+            actual, expected,
+            "every collected marker must address the row its line was rendered on, \
+             in transcript order"
+        );
+        // The arm this exists for: the head is the FIRST marker and sits at row 0 —
+        // its block contributes exactly one line, so there is no leading blank row to
+        // rebase past, and the banner has a turn to name at the very top of a
+        // summary-led transcript.
+        assert_eq!(
+            actual.first(),
+            Some(&(0, expected_head)),
+            "the summary head must be a pinnable marker at the transcript's first row"
+        );
     }
 
     #[test]

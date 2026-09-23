@@ -903,18 +903,17 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
 /// The url of the rendered preview link under a pointer at screen `(col, row)`,
 /// or `None` when the pointer is over no link.
 ///
-/// The transcript does NOT own the whole preview pane: a REPORTED session pins a
-/// status banner to the pane's first inner row (`view::preview_banner`), so its
+/// The transcript does NOT own the whole preview pane: the selected session pins a
+/// banner to the pane's first inner row (`view::preview_banner`), so its
 /// transcript starts one row lower. Deriving the rect from the SAME
 /// [`view::preview_split`] the view drew with is what keeps this honest — the
 /// scroll offset and the cached line widths are both measured from that rect's
 /// origin, so a click on screen row N resolves to the transcript line actually
-/// drawn there. A session claude never reported splits off nothing and hit-tests
-/// against the full inner rect, exactly as it did before the banner existed.
+/// drawn there. A pane with no banner splits off nothing and hit-tests against the
+/// full inner rect, exactly as it did before the banner existed.
 ///
-/// REPORTED, not live: an agent that reported completion still has a banner, so
-/// asking the banner — never liveness — is what keeps this rect identical to the
-/// one the view drew against. Liveness is a hand-off question answered by
+/// The banner, never liveness: asking the banner is what keeps this rect identical
+/// to the one the view drew against. Liveness is a hand-off question answered by
 /// [`App::is_live_now`], and it would be the wrong question here twice over: it
 /// shells out to claude, and it would disagree with the drawn banner.
 ///
@@ -3542,15 +3541,22 @@ mod tests {
     }
 
     #[test]
-    fn a_click_on_a_drawn_link_opens_it_for_a_banner_less_session() {
+    fn a_click_on_a_drawn_link_opens_it_for_a_banner_less_pane() {
         // No banner: the transcript owns the pane's whole inner rect, and the
-        // hit-test must NOT shift by a row that was never reserved.
+        // hit-test must NOT shift by a row that was never reserved. An in-flight
+        // quick reply is the one banner-less pane that still draws the transcript
+        // (its inline echo turns take the banner's place).
         let dir = unique_temp_dir("link-plain");
         let mut app = link_app(&dir, None);
+        app.sending = Some(crate::tui::app::Sending {
+            session_id: "sess-link".to_string(),
+            message: "thanks".to_string(),
+            baseline_msg_count: 0,
+        });
         let buffer = render_board(&mut app);
         assert!(
             view::preview_banner(&app).is_none(),
-            "a session with no joined agent reserves no banner row"
+            "an in-flight reply reserves no banner row"
         );
         assert!(
             app.preview_scroll > 0,
@@ -3562,6 +3568,44 @@ mod tests {
             link_under_pointer(&mut app, col, row).as_deref(),
             Some(LINK_URL),
             "a click on the cell the link was DRAWN on must resolve to its url"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_click_on_a_drawn_link_opens_it_beneath_an_unreported_sessions_pinned_row() {
+        // A session claude does NOT report pins the row too — it keys on the
+        // selection — so its transcript starts one row lower, and the hit-test
+        // must follow it there exactly as it does for a reported one.
+        let dir = unique_temp_dir("link-unreported");
+        let mut app = link_app(&dir, None);
+        let buffer = render_board(&mut app);
+        assert!(
+            app.reported_agent("sess-link").is_none(),
+            "the session must really be unreported, or this is the reported case"
+        );
+        assert!(
+            view::preview_banner(&app).is_some(),
+            "an unreported selected session must pin the row"
+        );
+        assert!(
+            app.preview_scroll > 0,
+            "the fixture must overflow the pane, or this never tests a scrolled hit"
+        );
+
+        let (col, row) = drawn_link_cell(&buffer, app.preview_rect);
+        assert_eq!(
+            link_under_pointer(&mut app, col, row).as_deref(),
+            Some(LINK_URL),
+            "a click on the cell the link was DRAWN on must resolve to its url \
+             even though the pinned row pushed the transcript down a row"
+        );
+        // Precision, not just presence: the row ABOVE the label is a different
+        // transcript line, so it must NOT resolve to the same link.
+        assert_ne!(
+            link_under_pointer(&mut app, col, row - 1).as_deref(),
+            Some(LINK_URL),
+            "the row above the label is another transcript line, not the link"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

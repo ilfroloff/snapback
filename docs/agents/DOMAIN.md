@@ -847,7 +847,7 @@ exactly ONE place: `classify` buckets the resolved qualifier (`state`, else
 `status` — `ReportedAgent::qualifier`'s precedence) into an `AgentActivity`.
 Every qualifier-shaped output derives from that enum, so they cannot drift apart:
 
-| Bucket | Qualifier(s) | Badge color | Badge glyph | Dot pulses | Banner / row reads |
+| Bucket | Qualifier(s) | Badge color | Badge glyph | Dot pulses | Row reads |
 | --- | --- | --- | --- | --- | --- |
 | `NeedsInput` | `blocked`, `waiting` | `Yellow` (label/phrase) | `!` (`Red`) | no | `needs input` (translated — both tokens) |
 | `Idle` | `idle` | `Green` | `●` | no | `idle` (verbatim) |
@@ -872,13 +872,13 @@ Red is an ACCENT layered on the shape channel — one steady cell, NOT a row-wid
 pulsing alarm, which the design avoids because nearly every active agent is
 `blocked` and an alarm on all of them would cry wolf.
 
-The **Banner / row reads** column is one phrase with two consumers: `classify`
-feeds a single `agents::qualifier_copy`, so the preview banner
-(`friendly_status`, kind label fused in) and the board **list row** speak the
-SAME translated copy — the row no longer prints the raw token. Only the WEIGHT
-differs, and that is a `tui::view` rendering call, not a bucket property:
-`NeedsInput` draws its `needs input` at the badge's own color + `BOLD` (as loud
-as the dot and kind label), every other bucket stays `DIM`.
+The **Row reads** column is one phrase with two consumers: `classify` feeds a
+single `agents::qualifier_copy`, so the preview banner's fallback for a transcript
+with no marker at all (`friendly_status`, kind label fused in) and the board
+**list row** speak the SAME translated copy — the row no longer prints the raw
+token. Only the WEIGHT differs, and that is a `tui::view` rendering call, not a
+bucket property: `NeedsInput` draws its `needs input` at the badge's own color +
+`BOLD` (as loud as the dot and kind label), every other bucket stays `DIM`.
 
 **`WorkingButIdle` is the only bucket classified from the raw `state`/`status`
 PAIR rather than the collapsed qualifier, and the only translated one with no
@@ -1490,7 +1490,7 @@ and it FOLLOWS the bottom so both stay in view. The `▶ you` echo is
 dropped the instant the real turn lands on disk — detected by the reloaded
 `Session::msg_count` growing past `Sending::baseline_msg_count` — so the real turn
 (styled identically) takes its place with no doubling; the placeholder stays until
-`AppEvent::SendFinished` clears `App::sending`. The pinned status banner is SUPPRESSED
+`AppEvent::SendFinished` clears `App::sending`. The pinned banner is SUPPRESSED
 while a send is in flight (`view::preview_banner` returns `None`, keeping render and
 the click hit-test agreeing on the geometry), since the inline turns replace it.
 

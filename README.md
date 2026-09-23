@@ -263,16 +263,30 @@ a dot is steady, the shade separates the two at rest — the working gray is the
 interrupted one, the dimmer gray is a run that has ended. Colors follow your
 terminal's theme.
 
-Open the preview on a badged session and it leads with the same status in words,
-pinned above the transcript so it stays in view while the transcript scrolls
-beneath it — you can see why a session is sitting there before deciding what to
-do about it. It reports what Claude Code reports, in Claude Code's own words, with
-two exceptions. The two states that both mean *the session is waiting on you*
+Open the preview on any session — badged or not — and a row stays pinned above
+the transcript, naming **the turn you are reading**: the marker of whichever turn
+owns the line at the top of the viewport — `● claude · @lead · sonnet-5 · 12:55` —
+so who spoke, under which agent, on which model and when stay readable long after
+that turn's own marker has scrolled off the top of a long answer. It is the
+transcript's own marker line reused verbatim, down to the highlight your search
+puts on it, never a second rendering that could drift from the line below. It
+tracks the turn as you scroll, in every position the pane can be in, including the
+bottom-anchored one it opens at; scroll to the very first turn and the pinned row
+names that one, there being nothing above it to name. The row steps aside only
+while a quick reply you sent to that session is still in flight, when the reply's
+own turns take its place at the bottom of the transcript.
+
+The session's *status* in words is on the list row instead, as the word beside the
+badge. It reports what Claude Code reports, in Claude Code's own words, with two
+exceptions. The two states that both mean *the session is waiting on you*
 (`blocked` and `waiting`) are spelled out as `needs input`. And a background agent
 Claude Code still calls `working` while its own status reads `idle` — the shape of
 one that was interrupted and never cleaned up — is labelled `interrupted` (Claude
 Code's own word) and held steady. Anything else is passed through as-is rather
-than guessed at.
+than guessed at. That status reaches the pinned row only when the transcript has
+no turn to name at all — an empty one, or a session file that can no longer be
+read — the one case the preview leads with words rather than with a turn (a
+session without a badge has no status to show, so its row stays blank then).
 
 Because a session that's still running can't be plain-resumed, pressing `Enter`
 on one offers **Attach** (reconnect to a running background agent), **Fork**, or
