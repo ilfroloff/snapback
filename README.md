@@ -265,14 +265,15 @@ terminal's theme.
 
 Open the preview on any session — badged or not — and a row stays pinned above
 the transcript, naming **the turn you are reading**: the marker of whichever turn
-owns the line at the top of the viewport — `● claude · @lead · sonnet-5 · 12:55` —
-so who spoke, under which agent, on which model and when stay readable long after
-that turn's own marker has scrolled off the top of a long answer. It is the
-transcript's own marker line reused verbatim, down to the highlight your search
-puts on it, never a second rendering that could drift from the line below. It
-tracks the turn as you scroll, in every position the pane can be in, including the
-bottom-anchored one it opens at; scroll to the very first turn and the pinned row
-names that one, there being nothing above it to name. The row steps aside only
+owns the line at the top of the viewport —
+`● claude · @lead · Opus 5.5 · xhigh · 12:55` — so who
+spoke, under which agent, on which model at what effort and when stay readable
+long after that turn's own marker has scrolled off the top of a long answer. It
+is the transcript's own marker line reused verbatim, down to the highlight your
+search puts on it, never a second rendering that could drift from the line below.
+It tracks the turn as you scroll, in every position the pane can be in, including
+the bottom-anchored one it opens at; scroll to the very first turn and the pinned
+row names that one, there being nothing above it to name. The row steps aside only
 while a quick reply you sent to that session is still in flight, when the reply's
 own turns take its place at the bottom of the transcript.
 
@@ -476,13 +477,15 @@ from its first turn to its last, however long it ran. So you
 can confirm it's the right session before jumping back in. Links are clickable.
 
 Each `claude` turn is marked with **which model actually answered it**, beside
-the agent and the time — `● claude · @lead · sonnet-5 · 12:55`. It's read from
-the turn itself rather than assumed for the session, because a long conversation
-really can change model partway through, and each turn is labelled with its own.
-Turns that don't record one are left plain: most sessions don't, and a blank
-there is normal, not a gap. When you `Ctrl-R` reply, the status line names the
-answering model next to the cost (`sent — $0.0136 (sonnet)`) — so if the model
-that answered isn't the one you asked for, you can see it rather than assume.
+the agent and the time — `● claude · @lead · Opus 5.5 · xhigh · 12:55`. It's
+read from the turn itself rather than assumed for the session, because a long
+conversation really can change model partway through, and each turn is labelled
+with its own. Turns that don't record one are left plain: most sessions don't,
+and a blank there is normal, not a gap. The marker also shows the effort level
+the turn ran at (`xhigh` above), read from the turn the same way. When you
+`Ctrl-R` reply, the status line names the answering model next to the cost
+(`sent — $0.0136 (Sonnet 5)`) — so if the model that answered isn't the one you
+asked for, you can see it rather than assume.
 
 ---
 

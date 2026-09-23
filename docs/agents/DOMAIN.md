@@ -178,6 +178,8 @@ never fatal:
 | `agentSetting` | on `type:"agent-setting"`, string (fail-soft) | the [bound agent](#bound-agent-storepreview) handle on preview turns (interactive bind — authoritative); read **positionally**, never hoisted |
 | `agentName` | on `type:"agent-name"`, string (fail-soft) | the background job's name; a **fallback** bound-agent source for the preview handle, trusted ONLY when it names a known agent (the field also carries free-form titles) — see [bound agent](#bound-agent-storepreview) |
 | `message.content` | string **or** typed-block array | user prompt, preview body, content index |
+| `message.model` | per `assistant` record, string (fail-soft) | the [answering model](#answering-model-storepreview) label on preview turns; read **positionally**, never hoisted |
+| `perTurnEffort`, then `effort` | TOP-LEVEL (siblings of `message`), per `assistant` record, string (fail-soft) | the [effort level](#effort-level-record_effort) on preview turns; read **positionally**, never hoisted |
 | `isSidechain` | bool | skip sub-agent turns when picking a label/preview |
 | `uuid` | per record | a record's identity in the transcript **tree** |
 | `parentUuid` | per record; **JSON `null` on the root** | the tree edge; the null-parent record's `uuid` is the fork-lineage identity (see [Fork lineage](#fork-lineage-storelineage)) |
@@ -1085,15 +1087,24 @@ This is the third and last of **three distinct agent concepts** — keep them ap
 
 Every `assistant` record carries `message.model` — the model that actually
 answered THAT turn. The preview renders it as a DIM label between the bound-agent
-handle and the timestamp (`● claude · @lead · sonnet-5 · 12:55`), through the same
-`annotation_span` builder the other two use. One pure function, `model_label`,
-owns the whole decision, mirroring `agent_handle`:
+handle and the [effort level](#effort-level-record_effort)
+(`● claude · @lead · Opus 5.5 · xhigh · 12:55`), through the same
+`annotation_span` builder all four annotations use. One pure function,
+`model_label`, owns the whole decision, mirroring `agent_handle`. It strips the
+`claude-` vendor prefix (`MODEL_VENDOR_PREFIX`) first — the whole board is Claude,
+so repeating the vendor every turn is noise — then reads the SHAPE of what is
+left. A VERSIONED id — a lowercase family, a 1–2 digit major, an optional 1–2
+digit minor and an optional 8-digit date, joined by `-` (`MODEL_ID_SEPARATOR`,
+`MODEL_VERSION_MAX_DIGITS`, `MODEL_DATE_DIGITS`) — is written the way people say
+it; any other shape keeps the prefix-stripped id:
 
 | Input | Label | Why |
 | --- | --- | --- |
-| `claude-sonnet-5` | `sonnet-5` | The `claude-` vendor prefix (`MODEL_VENDOR_PREFIX`) is the ONLY thing stripped — the whole board is Claude, so repeating the vendor every turn is noise. |
-| `claude-haiku-4-5-20251001` | `haiku-4-5-20251001` | LOSSLESS beyond that prefix. Collapsing a dated suffix was considered and rejected as lossy for the ~4/411 sessions that carry one; a truncated id reads back as a plausible WRONG model. |
-| `opus`, `sonnet` (bare aliases, also on disk) | unchanged | Nothing to strip. |
+| `claude-opus-5-5`, `claude-sonnet-5` | `Opus 5.5`, `Sonnet 5` | The shape rule: the family capitalised, the version dotted. |
+| `claude-haiku-4-5-20251001` | `Haiku 4.5 20251001` | The date is KEPT. Collapsing a dated suffix was considered and rejected as lossy for the ~4/411 sessions that carry one; a truncated id reads back as a plausible WRONG model. It follows a SPACE rather than sitting in parentheses because the [quick reply's](#quick-reply--non-interactive-send-srcsendrs) status already wraps its labels in ` (…)`, where a parenthesised date would nest. |
+| `sonnet-5` (no prefix) | `Sonnet 5` | The rule reads what is left AFTER the optional strip, so an un-prefixed id spells exactly as its prefixed twin does. |
+| `opus`, `sonnet` (bare aliases, also on disk) | unchanged | No version, so not the versioned shape; nothing to strip. |
+| `claude-3-5-sonnet-20241022` (legacy, version first), and any other shape: `claude-opus-5-5[1m]`, a 3-digit minor, a 7-digit date, a date where the major goes (`claude-haiku-20251001`), a trailing extra part | the id with only the prefix stripped (`3-5-sonnet-20241022`) | Kept rather than a guessed reformatting. The major/minor digit cap sits BELOW the date's length, so a date is never read as a version. |
 | `<synthetic>`, and any other `<…>`-wrapped id | **suppressed** | See below. |
 | absent / `null` / non-string / blank / a bare `claude-` | **suppressed** | Fail-soft, and the majority case — see below. |
 
@@ -1101,8 +1112,9 @@ owns the whole decision, mirroring `agent_handle`:
 stamps it on records it injects ITSELF (a session-limit or auth notice), so it
 names no model that answered anything — and it is the LAST assistant model in
 **10/411** sessions, exactly where a naive "latest model" label would render it.
-The guard is `starts_with('<') && ends_with('>')` so a future sibling pseudo-model
-is suppressed the day it appears rather than after it leaks to the board.
+The guard, `is_pseudo_model`, is `starts_with('<') && ends_with('>')` over the
+trimmed id, so a future sibling pseudo-model is suppressed the day it appears
+rather than after it leaks to the board.
 
 **Absent is the NORMAL case, not an error state.** **86/411 (21%)** of the
 measured store carries no `message.model` at all, so a turn with no model renders
@@ -1122,9 +1134,46 @@ There is no `model` record type in the store — the model is never persisted pe
 session, only per turn — which is what makes `message.model` the only on-disk
 evidence of which model ran. `model_label` is therefore `pub(crate)` and shared:
 the [quick reply's](#quick-reply--non-interactive-send-srcsendrs) `modelUsage`
-readout shortens and suppresses through the SAME function, so the two channels —
+readout spells and suppresses through the SAME function, so the two channels —
 what the transcript recorded, and what the send reported — can be compared without
 a difference in spelling reading as a difference in model.
+
+#### Effort level (`record_effort`)
+
+The effort level the turn ran at is the third of the four DIM annotations — after
+the model label, before the timestamp — shown as the BARE level exactly as recorded
+(`· xhigh`, never `· xhigh effort`). One pure function, `record_effort`, owns the
+decision:
+
+| Record | Effort shown | Why |
+| --- | --- | --- |
+| top-level `perTurnEffort` is a non-blank string | that value | Read FIRST. The order follows how the Claude Code binary resolves a turn's effort, NOT observed data: no measured record carries two different values (below), so the data could not have decided it. |
+| `perTurnEffort` absent / `null` / non-string / blank; `effort` a non-blank string | the `effort` value | An unusable `perTurnEffort` falls THROUGH rather than ending the search: a `null` one beside a string `effort` is an ordinary on-disk shape. |
+| neither key usable (absent / `null` / non-string / blank) | none — no span, never an empty ` · ` | Fail-soft; the observed Haiku shape. |
+| `message.model` is a pseudo-model (`<synthetic>`, any `<…>`) | none, even when a key is set | Claude Code injected that turn itself, so no model ran it at any effort, and its marker stays `● claude · 12:55`. The check is the SAME `is_pseudo_model` predicate that `model_label` suppresses with, never a second copy. A record with NO model still shows its effort. |
+| either key nested inside `message` | not read | Both keys are siblings of `message`: `{"type":"assistant","message":{"model":"claude-opus-5-5",…},"effort":"xhigh","perTurnEffort":null,…}`. |
+
+The value is trimmed of surrounding whitespace, as `model_label` and
+`agent_handle` treat padding, and otherwise shown as WRITTEN: never re-cased,
+mapped to a word, or suffixed. It is positional for the same reason the model is —
+it sits on the record being rendered, so it needs no streaming state — and the
+pinned row shows it because that row IS the marker line. Two surfaces never show
+an effort: a `▶ you` turn, because no `user` record carries either key (the marker
+builder is shared, so this is the data's absence, not a special case); and the
+quick-reply status, which names models only (`status_for_send`).
+
+Measured on the local store on 2026-09-23 (716 files; 53,703 `assistant` records
+carrying an effort key):
+
+| `message.model` | `effort` | `perTurnEffort` |
+| --- | --- | --- |
+| `claude-opus-5-5`, `claude-fable-5-1` | `"xhigh"` | `"xhigh"` |
+| `claude-opus-5`, `claude-sonnet-5` | `"xhigh"` | `null` or absent |
+| `claude-haiku-4-5-20251001` | absent | `null` |
+| `<synthetic>` (2 of 51 records) | absent | `"xhigh"` — both `isApiErrorMessage` "Please run /login · API Error: 403" turns |
+
+Only `assistant` records carry either key, and no record carries two string values
+that differ.
 
 ## User-facing modes (`tui::app`)
 
@@ -1563,12 +1612,12 @@ background launch below. With no override the argv is byte-identical to before.
 
 **Which model ANSWERED.** A successful send's JSON payload carries `modelUsage`, a
 map keyed by the model that actually ran, so `status_for_send` appends it to the
-cost: `sent — $0.0136 (sonnet)`. It sits next to the cost because on this path the
+cost: `sent — $0.0136 (Sonnet 5)`. It sits next to the cost because on this path the
 two are one fact — a `-p -r` reply replays the whole conversation, so which model
 answered is what the number was spent on — and it is the only SYNCHRONOUS proof of
 the answer, since `--model` is a REQUEST a `--fallback-model` may silently
 substitute and the transcript's own `message.model` cannot be read until the turn
-is on disk. Keys are shortened and suppressed by the SAME
+is on disk. Keys are spelled and suppressed by the SAME
 [`preview::model_label`](#answering-model-storepreview) the transcript marker
 uses. **Every** key is listed (sorted for determinism, then deduped by LABEL), not
 one picked at random: a multi-key map IS the substitution, and reporting one of

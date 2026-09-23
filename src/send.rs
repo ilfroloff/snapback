@@ -447,7 +447,7 @@ fn answering_models(value: &Value) -> Vec<String> {
     labels
 }
 
-/// The ` (sonnet-5)` suffix a success status carries when the payload named the
+/// The ` (Sonnet 5)` suffix a success status carries when the payload named the
 /// model(s) that answered, or `""` when it named none.
 ///
 /// Split from [`status_for_send`] so the "no evidence ⇒ no claim" degradation is one
@@ -476,7 +476,7 @@ fn model_readout(value: &Value) -> String {
 /// # The answering model
 ///
 /// A success also carries WHICH MODEL ANSWERED, read from `modelUsage` and appended
-/// as `sent — $0.0136 (sonnet-4-5-20250929)`. It sits next to the cost deliberately:
+/// as `sent — $0.0136 (Sonnet 4.5 20250929)`. It sits next to the cost deliberately:
 /// on this path the two are one fact — a `-p -r` reply replays the whole
 /// conversation, so which model answered is what the number was spent on. It is
 /// also the only SYNCHRONOUS proof of the answer, since an override is a request
@@ -1117,12 +1117,23 @@ mod tests {
                       "modelUsage":{"claude-sonnet-4-5-20250929":
                         {"inputTokens":4,"outputTokens":100,"costUSD":0.0136}}}"#;
         let (status, transient) = status_for_send(raw);
-        assert_eq!(status, "sent — $0.0136 (sonnet-4-5-20250929)");
+        assert_eq!(status, "sent — $0.0136 (Sonnet 4.5 20250929)");
         assert!(transient, "a priced success stays transient: {status}");
 
         // With no cost to anchor it, the model still rides the neutral success.
         let priceless = r#"{"modelUsage":{"claude-opus-5":{"costUSD":0.0}}}"#;
-        assert_eq!(status_for_send(priceless).0, "sent (opus-5)");
+        assert_eq!(status_for_send(priceless).0, "sent (Opus 5)");
+    }
+
+    /// The readout spells a model exactly as the preview's turn marker does
+    /// (`● claude · Sonnet 5 · 12:55`), so a reply's result line and the turn it
+    /// appends read as one model, not two.
+    #[test]
+    fn status_spells_the_answering_model_as_the_turn_marker_does() {
+        let raw = r#"{"type":"result","is_error":false,"total_cost_usd":0.0136,
+                      "modelUsage":{"claude-sonnet-5":
+                        {"inputTokens":4,"outputTokens":100,"costUSD":0.0136}}}"#;
+        assert_eq!(status_for_send(raw).0, "sent — $0.0136 (Sonnet 5)");
     }
 
     /// THE divergence case: `--fallback-model` can substitute a model mid-turn, and
@@ -1137,9 +1148,9 @@ mod tests {
                         "claude-opus-4-1":{"costUSD":0.4},
                         "claude-haiku-4-5":{"costUSD":0.1}}}"#;
         let (status, _) = status_for_send(raw);
-        assert_eq!(status, "sent — $0.5000 (haiku-4-5, opus-4-1)");
+        assert_eq!(status, "sent — $0.5000 (Haiku 4.5, Opus 4.1)");
         assert!(
-            status.contains("opus-4-1") && status.contains("haiku-4-5"),
+            status.contains("Opus 4.1") && status.contains("Haiku 4.5"),
             "both models must be named, not one: {status}"
         );
     }
@@ -1151,7 +1162,7 @@ mod tests {
     /// shortening is NOT order-preserving over the key order, so the duplicate
     /// labels are not adjacent as they arrive (the keys sort
     /// `claude-sonnet-5` < `haiku-4-5` < `sonnet-5`, whose labels interleave to
-    /// `sonnet-5, haiku-4-5, sonnet-5`) and `dedup`, which only collapses
+    /// `Sonnet 5, Haiku 4.5, Sonnet 5`) and `dedup`, which only collapses
     /// CONSECUTIVE equals, would miss them. Sorting the LABELS is the step that
     /// makes both the collapse and the rendered order hold.
     #[test]
@@ -1162,7 +1173,7 @@ mod tests {
                         "haiku-4-5":{"costUSD":0.1}}}"#;
         assert_eq!(
             status_for_send(raw).0,
-            "sent — $0.5000 (haiku-4-5, sonnet-5)"
+            "sent — $0.5000 (Haiku 4.5, Sonnet 5)"
         );
     }
 

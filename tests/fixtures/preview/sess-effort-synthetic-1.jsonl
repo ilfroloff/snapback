@@ -1,0 +1,4 @@
+{"type":"summary","summary":"Session that lost its login"}
+{"type":"user","sessionId":"sess-effort-synthetic-1","cwd":"/Users/me/project-alpha","gitBranch":"main","timestamp":"2026-09-23T12:50:00.000Z","message":{"role":"user","content":"Plan the migration"}}
+{"type":"assistant","sessionId":"sess-effort-synthetic-1","cwd":"/Users/me/project-alpha","gitBranch":"main","timestamp":"2026-09-23T12:55:00.000Z","message":{"role":"assistant","model":"claude-opus-5-5","content":"Here is the migration plan."},"effort":"xhigh","perTurnEffort":"xhigh"}
+{"type":"assistant","sessionId":"sess-effort-synthetic-1","cwd":"/Users/me/project-alpha","gitBranch":"main","timestamp":"2026-09-23T12:56:00.000Z","isApiErrorMessage":true,"message":{"role":"assistant","model":"<synthetic>","content":"Please run /login · API Error: 403 Request not allowed"},"perTurnEffort":"xhigh"}
