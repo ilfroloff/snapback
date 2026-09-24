@@ -901,26 +901,46 @@ fn wheel_target(col: u16, row: u16, preview: Rect, list: Rect, composing: bool) 
     }
 }
 
-/// Columns either side of the list/preview seam that still count as a
-/// splitter grab, so the border is a comfortably wide target rather than a
-/// single exact column.
+/// How far LEFT of the list/preview seam a splitter grab still reaches, so the
+/// border is a comfortably wide target rather than a single exact column.
+///
+/// One direction only, and the direction is the point — [`on_splitter`] owns why.
 const SPLITTER_TOLERANCE: u16 = 1;
 
 /// Hit-test a mouse point at `(col, row)` against the seam between `list` and
 /// `preview`. The seam sits at the list's right edge (`list.x + list.width`,
 /// which — since `render_body` lays the two panes out with no gap — equals
-/// `preview.x`); a point within [`SPLITTER_TOLERANCE`] columns of that seam
-/// and vertically within the list's row range counts as a hit. A hidden
-/// preview (the empty `Rect::default()` `render_body` sets when
+/// `preview.x`); a point on the seam, or up to [`SPLITTER_TOLERANCE`] columns
+/// LEFT of it, and vertically within the list's row range counts as a hit. A
+/// hidden preview (the empty `Rect::default()` `render_body` sets when
 /// `!show_preview`) never hits — there is no seam to grab. Pure so it is
 /// unit-testable from coordinates + rects, exactly like [`wheel_target`].
+///
+/// The band is ASYMMETRIC ON PURPOSE. Every column it claims must be CHROME,
+/// because the seam arm runs BEFORE the pane arm and so takes a cell away from
+/// whatever was drawn on it. `seam` is the preview block's own left border and
+/// `seam - 1` is the list block's right border (`view::render_list` and
+/// `view::render_preview` both draw a `Borders::ALL` block) — nothing is ever
+/// drawn on either but the frame. But
+/// `seam + 1` is the preview's FIRST CONTENT COLUMN: the border is always
+/// exactly one column, at every terminal size and split ratio, so claiming
+/// `seam + 1` claims live transcript. Content column 0 is where a peer node's
+/// `\u{25c6}` marker sits, and where a markdown link that starts its line sits;
+/// a symmetric band made both of them unclickable — the marker that reads
+/// "(click to expand)" being the one cell that could not be clicked. Two
+/// columns is still a comfortable target. Do NOT re-symmetrise this, and do NOT
+/// fix a variant of it by reordering the arms: the pane arm guards on the OUTER
+/// `preview_rect`, so running it first would hit-test border clicks into content
+/// instead.
 fn on_splitter(col: u16, row: u16, list: Rect, preview: Rect) -> bool {
     if preview.is_empty() {
         return false;
     }
     let seam = list.x + list.width;
     let in_rows = row >= list.y && row < list.y.saturating_add(list.height);
-    in_rows && col.abs_diff(seam) <= SPLITTER_TOLERANCE
+    // Saturating: a seam at column 0 has no border to its left, and the band
+    // simply collapses onto the seam itself rather than wrapping around `u16`.
+    in_rows && col >= seam.saturating_sub(SPLITTER_TOLERANCE) && col <= seam
 }
 
 /// Apply a mouse event: a vertical wheel notch scrolls whichever pane the
@@ -4436,14 +4456,20 @@ mod tests {
     }
 
     #[test]
-    fn on_splitter_hits_the_seam_and_one_column_either_side() {
+    fn on_splitter_claims_the_seam_and_the_border_left_of_it_but_never_pane_content() {
         let (list, preview) = split_panes();
-        // Exactly on the seam (list.x + list.width == preview.x == 50).
+        // Exactly on the seam (list.x + list.width == preview.x == 50) — the
+        // preview block's own left border.
         assert!(on_splitter(50, 10, list, preview));
-        // One column into the list side, and one column into the preview side.
+        // One column LEFT of it: the list block's right border. Chrome too, which
+        // is the whole reason the band reaches that way.
         assert!(on_splitter(49, 10, list, preview));
-        assert!(on_splitter(51, 10, list, preview));
-        // Two columns off either side is past the tolerance band.
+        // One column RIGHT of it is the preview's FIRST CONTENT column, and never a
+        // grab. The seam arm runs before the pane arm, so claiming it would make
+        // whatever is drawn there — a peer node's marker, a link label that starts
+        // the line — unclickable at every terminal size.
+        assert!(!on_splitter(51, 10, list, preview));
+        // And the band reaches no further on the list side than one border column.
         assert!(!on_splitter(48, 10, list, preview));
         assert!(!on_splitter(52, 10, list, preview));
     }
@@ -4623,6 +4649,35 @@ mod tests {
         }
     }
 
+    /// The sibling of [`link_session`] whose link label starts its own line, so the
+    /// label occupies content column 0 — the pane's FIRST content column, one inside
+    /// the preview's left border.
+    ///
+    /// A real file for the same reason its sibling is one: only a real render can
+    /// prove the draw and the hit-test agree about where the label went. The link is
+    /// its own paragraph (a blank line above it) so no soft-wrapped predecessor can
+    /// push it off column 0.
+    fn link_at_column_zero_session(dir: &Path) -> Session {
+        let file = dir.join("sess-link-col0.jsonl");
+        let mut body: String = (1..=LINK_FILLER_LINES)
+            .map(|i| format!("filler line {i}\\n"))
+            .collect();
+        body.push_str(&format!("\\n[docs]({LINK_URL}) opens the report"));
+        let jsonl = format!(
+            concat!(
+                r#"{{"type":"user","sessionId":"sess-link-col0","cwd":"/tmp","#,
+                r#""timestamp":"2026-07-01T10:00:00.000Z","#,
+                r#""message":{{"role":"user","content":"{body}"}}}}"#,
+                "\n",
+            ),
+            body = body,
+        );
+        std::fs::write(&file, jsonl).expect("write the column-zero link fixture");
+        let mut s = session("sess-link-col0");
+        s.file = file;
+        s
+    }
+
     /// An app over [`link_session`], optionally joined to a REPORTED agent in
     /// `state`.
     /// Left in `App`'s DEFAULT scroll state — bottom-anchored, as a user sees it.
@@ -4737,6 +4792,48 @@ mod tests {
             link_under_pointer(&mut app, col, row - 1).as_deref(),
             Some(LINK_URL),
             "the row above the label is another transcript line, not the link"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A link label drawn on the pane's FIRST content column is clickable.
+    ///
+    /// The older half of the marker cell's bug, and the reason this is fixed in the
+    /// grab band rather than special-cased for folds: the splitter's band used to
+    /// claim `seam + 1`, the pane's first content column, so a link that started its
+    /// line was swallowed by the seam arm — years before any peer node was drawn
+    /// there.
+    ///
+    /// Stops at the pure [`link_under_pointer`] seam like its sibling link tests:
+    /// taking the arm's link branch would reach `resume::open_url` and spawn a
+    /// browser. What the arm would have done is pinned by `on_splitter` instead,
+    /// which is exactly the predicate that used to claim this cell.
+    #[test]
+    fn a_click_on_a_link_starting_at_content_column_zero_opens_it() {
+        let dir = unique_temp_dir("link-col0");
+        let mut app = App::new(
+            vec![link_at_column_zero_session(&dir)],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
+        let buffer = render_board(&mut app);
+
+        let (col, row) = drawn_link_cell(&buffer, app.preview_rect);
+        assert_eq!(
+            col,
+            app.preview_rect.x + 1,
+            "the fixture must really draw its label on the pane's first CONTENT \
+             column, or this probes an ordinary interior link"
+        );
+        assert!(
+            !on_splitter(col, row, app.list_rect, app.preview_rect),
+            "the seam arm runs first, so a grab band that claimed this column would \
+             make the link unreachable however precisely the user clicked it"
+        );
+        assert_eq!(
+            link_under_pointer(&mut app, col, row).as_deref(),
+            Some(LINK_URL),
+            "and the pane arm then resolves the cell the label was DRAWN on to its url"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4861,9 +4958,12 @@ mod tests {
     /// The node header's LEFTMOST drawn cell — the marker glyph `store::preview`
     /// opens the line with, which lands on content column 0.
     ///
-    /// That column is also one inside the pane border, hence within
-    /// [`SPLITTER_TOLERANCE`] of the seam, which is exactly what makes it the right
-    /// probe for the seam test and the WRONG one for the toggle tests.
+    /// That is the pane's FIRST CONTENT column, one inside its left border. It is an
+    /// ordinary toggle probe, and the strictest one the header has: the marker is
+    /// the glyph the "(click to expand)" affordance is promising about, so a node
+    /// that cannot be toggled HERE has a header that lies. It is deliberately NOT a
+    /// seam probe — [`SPLITTER_TOLERANCE`] reaches leftward from the seam only,
+    /// because this column belongs to the transcript.
     fn drawn_peer_marker_cell(buffer: &ratatui::buffer::Buffer, preview: Rect) -> (u16, u16) {
         drawn_cell(buffer, preview, "\u{25c6}").expect(
             "the fixture's peer node must be drawn inside the preview pane, \
@@ -5084,31 +5184,44 @@ mod tests {
     /// A click on the seam still RESIZES, even when the row it lands on is a peer
     /// node's header.
     ///
-    /// The column is one INSIDE the pane border — within [`SPLITTER_TOLERANCE`] of
-    /// the seam, and also content column 0 of the header, which a `FoldRegion`
-    /// spans. So the two arms genuinely compete here, and only the seam arm running
-    /// FIRST keeps the drag.
+    /// The probe is the seam itself — the preview block's own left BORDER column,
+    /// chrome the pane's `Block` draws and the transcript never reaches. The pane
+    /// arm guards on `preview_rect`, the OUTER rect, so that border column matches
+    /// BOTH arms and they genuinely compete for it; only the seam arm running FIRST
+    /// keeps the drag.
+    ///
+    /// The cell one column to its RIGHT is the header's own marker, and it belongs
+    /// to the pane: the grab band reaches leftward from the seam only, which is what
+    /// keeps a node's affordance clickable
+    /// (`a_click_on_a_peer_nodes_marker_cell_expands_it`).
     #[test]
     fn a_click_on_the_seam_resizes_instead_of_toggling_a_peer_node() {
         let (mut app, buffer) = peer_app();
         let width = preview_transcript_rect(&app).width;
         let (marker_col, header_row) = drawn_peer_marker_cell(&buffer, app.preview_rect);
-        let seam = app.list_rect.x + app.list_rect.width;
-        let col = seam + SPLITTER_TOLERANCE;
+        let col = app.list_rect.x + app.list_rect.width;
         assert_eq!(
-            col, marker_col,
-            "the probe is the header's own leftmost drawn cell, so the seam arm and \
-             the pane arm are competing for one real cell rather than a contrived one"
+            marker_col,
+            col + 1,
+            "the header's leftmost drawn cell is the pane's first CONTENT column, \
+             one past the border this probe sits on"
+        );
+        assert!(
+            app.preview_rect.contains(Position {
+                x: col,
+                y: header_row,
+            }),
+            "the probe must be inside the rect the PANE arm guards on, or the two \
+             arms never compete for it"
         );
         assert!(
             on_splitter(col, header_row, app.list_rect, app.preview_rect),
             "the probe column must really be a seam grab, or this tests nothing"
         );
-        assert_eq!(
-            fold_under_pointer(&mut app, col, header_row).as_deref(),
-            Some(PEER_KEY),
-            "and it must really be over the node's header too, or the two arms \
-             never compete"
+        assert!(
+            !on_splitter(marker_col, header_row, app.list_rect, app.preview_rect),
+            "and the grab must stop at that border: the marker beside it is the \
+             node's own click target, not the splitter's"
         );
 
         wheel(
@@ -5123,7 +5236,54 @@ mod tests {
         );
         assert!(
             !preview_string(&mut app, width).contains(PEER_BODY_PHRASE),
-            "and it must NOT also toggle the node under it"
+            "and it must NOT also toggle the node on the row it landed on"
+        );
+    }
+
+    /// A click on the node header's MARKER cell — content column 0, the glyph the
+    /// "(click to expand)" affordance is promising about — opens the node.
+    ///
+    /// The regression guard the splitter's grab band needs. That band was symmetric
+    /// around the seam, so it claimed `seam + 1` as well; since the pane's border is
+    /// always exactly one column, `seam + 1` is always the pane's first CONTENT
+    /// column, and the seam arm runs before the pane arm. The one cell that said
+    /// "click to expand" was the one cell that could not be clicked, at every
+    /// terminal size and every split ratio.
+    ///
+    /// Driven END TO END through [`handle_mouse`], not through
+    /// [`fold_under_pointer`]: the defect was never in the resolver — it is which
+    /// arm claims the press.
+    #[test]
+    fn a_click_on_a_peer_nodes_marker_cell_expands_it() {
+        let (mut app, buffer) = peer_app();
+        let width = preview_transcript_rect(&app).width;
+        let (col, row) = drawn_peer_marker_cell(&buffer, app.preview_rect);
+        assert_eq!(
+            col,
+            app.preview_rect.x + 1,
+            "the marker must really be drawn on the pane's first CONTENT column, or \
+             this probes an ordinary interior cell"
+        );
+
+        let collapsed = preview_string(&mut app, width);
+        assert!(
+            collapsed.contains(COLLAPSED_AFFORDANCE) && !collapsed.contains(PEER_BODY_PHRASE),
+            "a peer node starts CLOSED, or the expand assertion below is vacuous"
+        );
+
+        wheel(&mut app, MouseEventKind::Down(MouseButton::Left), col, row);
+        assert!(
+            !app.is_dragging_split(),
+            "the marker is content, not chrome: clicking it must not grab the splitter"
+        );
+        let expanded = preview_string(&mut app, width);
+        assert!(
+            expanded.contains(PEER_BODY_PHRASE),
+            "and the click must open the node the marker labels"
+        );
+        assert!(
+            expanded.contains(EXPANDED_AFFORDANCE),
+            "so the header now offers the click that closes it again"
         );
     }
 
