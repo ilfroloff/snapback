@@ -31,7 +31,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::agents::{self, AgentActivity, ReportedAgent};
 use crate::search::SearchMode;
-use crate::store::preview::{self, LinkRegion};
+use crate::store::preview::{self, FoldRegion, LinkRegion};
 use crate::store::FailedTask;
 
 use super::app::{
@@ -2251,6 +2251,57 @@ fn visual_to_content(row_prefix: &[usize], visual_row: usize) -> Option<(usize, 
     Some((content_row, sub_row))
 }
 
+/// The `(content_row, content_col)` a mouse click at screen `(col, row)` lands on
+/// inside the preview transcript, or `None` when the click is outside `inner` or
+/// past the end of the content.
+///
+/// This is the ONE place a clicked CELL becomes a content coordinate, and both
+/// hit-tests over the preview resolve through it: [`link_at`] and [`fold_at`].
+/// They read DIFFERENT region lists off the same cache entry, and a peer node's
+/// header is a row a fold claims while the body beneath it carries links — so a
+/// second copy of this arithmetic is precisely how a click could toggle a node
+/// whose header the draw painted one row away. One resolver means the two can
+/// only ever agree or both be wrong together.
+///
+/// The row half is EXACT ([`visual_to_content`] binary-searches the very map the
+/// wrapper measured); the column half is the one packed approximation left.
+/// [`link_at`]'s doc comment OWNS both directions of that approximation and what
+/// each costs a click — it is not restated here or on [`fold_at`].
+///
+/// Containment is checked on BOTH axes, and the column half is not a formality:
+/// the mouse arm gates on `App::preview_rect`, the OUTER rect, so the pane's
+/// BORDER columns reach this function already. Answering them by clamping the
+/// column instead would alias every click on the left border onto content column
+/// 0 — a hit on any region that starts there, which is every peer-node header.
+fn content_hit(
+    col: u16,
+    row: u16,
+    inner: Rect,
+    scroll_offset: u32,
+    row_prefix: &[usize],
+) -> Option<(usize, usize)> {
+    if !inner.contains(Position { x: col, y: row }) {
+        return None;
+    }
+    // Both subtractions are proved non-negative by the containment above.
+    let rel_col = usize::from(col - inner.x);
+    let rel_row = usize::from(row - inner.y);
+    // `scroll_offset` is `App::preview_scroll`, so it carries the pane's `u32`
+    // offset domain into this `usize` row lookup. Saturating both steps: the worst a
+    // saturated one can produce is a row past the end of the map, which
+    // `visual_to_content` already answers with the "nothing here" `None`.
+    let visual_row = usize::try_from(scroll_offset)
+        .unwrap_or(usize::MAX)
+        .saturating_add(rel_row);
+    let (content_row, sub_row) = visual_to_content(row_prefix, visual_row)?;
+    // The one packed step left. A word-wrapped sub-row starts on EITHER side of
+    // `sub_row * inner.width`, so this can overshoot OR undershoot the true column —
+    // never reaching another line either way, since the content row came from the map
+    // above rather than from this arithmetic.
+    let content_col = sub_row * usize::from(inner.width) + rel_col;
+    Some((content_row, content_col))
+}
+
 /// The url of a preview link under a mouse click at screen `(col, row)`, or `None`.
 ///
 /// `inner` is the preview pane's INNER rect (inside the borders), `scroll_offset`
@@ -2317,30 +2368,50 @@ pub(crate) fn link_at<'a>(
     row_prefix: &[usize],
     regions: &'a [LinkRegion],
 ) -> Option<&'a str> {
-    if !inner.contains(Position { x: col, y: row }) {
-        return None;
-    }
-    let rel_col = usize::from(col - inner.x);
-    let rel_row = usize::from(row - inner.y);
-    // `scroll_offset` is `App::preview_scroll`, so it carries the pane's `u32`
-    // offset domain into this `usize` row lookup. Saturating both steps: the worst a
-    // saturated one can produce is a row past the end of the map, which
-    // `visual_to_content` already answers with the "no link here" `None`.
-    let visual_row = usize::try_from(scroll_offset)
-        .unwrap_or(usize::MAX)
-        .saturating_add(rel_row);
-    let (content_row, sub_row) = visual_to_content(row_prefix, visual_row)?;
-    // The one packed step left. A word-wrapped sub-row starts on EITHER side of
-    // `sub_row * inner.width`, so this can overshoot OR undershoot the true column —
-    // never reaching another line either way, since the content row came from the map
-    // above rather than from this arithmetic.
-    let content_col = sub_row * usize::from(inner.width) + rel_col;
+    let (content_row, content_col) = content_hit(col, row, inner, scroll_offset, row_prefix)?;
     regions
         .iter()
         .find(|r| {
             r.content_row == content_row && r.col_start <= content_col && content_col < r.col_end
         })
         .map(|r| r.url.as_str())
+}
+
+/// The fold key of a peer-message node whose HEADER sits under a mouse click at
+/// screen `(col, row)`, or `None`.
+///
+/// A direct sibling of [`link_at`]: same arguments, same width-scoped cache entry
+/// (`App::preview_hit_context`), same transcript rect from [`preview_split`], and
+/// — the part that matters — the SAME [`content_hit`] resolution, so a fold and a
+/// link can never disagree about which line a cell belongs to. There is no second
+/// geometry model here; only the region list and what a match yields differ.
+///
+/// A [`FoldRegion`] spans its header's WHOLE display width, so a click anywhere
+/// along the line toggles the node. That also makes a header that SOFT-WRAPS at a
+/// narrow pane hit on any of its wrapped segments for free, exactly as a wrapped
+/// link label is — the header inherits [`link_at`]'s bounded column approximation
+/// unchanged rather than needing geometry of its own, because the row it resolves
+/// to is EXACT and only the column inside that one row is packed. [`link_at`]'s
+/// doc comment owns both directions of that; do not restate them.
+///
+/// Fail-soft like its sibling: a click outside `inner`, on a blank row, or past
+/// the end of the content answers `None` and never indexes past the map. Pure and
+/// terminal-free.
+pub(crate) fn fold_at<'a>(
+    col: u16,
+    row: u16,
+    inner: Rect,
+    scroll_offset: u32,
+    row_prefix: &[usize],
+    regions: &'a [FoldRegion],
+) -> Option<&'a str> {
+    let (content_row, content_col) = content_hit(col, row, inner, scroll_offset, row_prefix)?;
+    regions
+        .iter()
+        .find(|r| {
+            r.content_row == content_row && r.col_start <= content_col && content_col < r.col_end
+        })
+        .map(|r| r.key.as_str())
 }
 
 /// Resolve the final vertical preview offset: pin to the bottom when following,
@@ -4463,6 +4534,53 @@ mod tests {
     }
 
     #[test]
+    fn link_at_is_none_left_or_right_of_the_inner_rect() {
+        let inner = inner_rect();
+        // Three unwrapped content lines; a link FLUSH LEFT on line 2. Only a region
+        // starting at content column 0 can catch a missing COLUMN guard: an indented
+        // one (as `link_at_is_none_on_blank_rows_and_outside_the_pane` uses) passes
+        // whether the guard is there or not, because column 0 is outside it anyway.
+        let prefix = [0usize, 1, 2, 3];
+        let flush = [region(2, 0, 8, "u")];
+        assert_eq!(
+            link_at(inner.x, inner.y + 2, inner, 0, &prefix, &flush),
+            Some("u"),
+            "the pane's own first column still hits a flush-left link"
+        );
+        // One cell LEFT of the pane is the border column, which `App::preview_rect`
+        // — the OUTER rect the mouse arm gates on — still contains, so this is a
+        // reachable click rather than a hypothetical: the guard here is the only
+        // thing that stops it aliasing onto content column 0.
+        assert_eq!(
+            link_at(inner.x - 1, inner.y + 2, inner, 0, &prefix, &flush),
+            None,
+            "the border column left of the pane is outside the transcript"
+        );
+        // The other side: ONE content line wrapped over 3 visual rows, its link
+        // spanning the full 46-column width. A click one cell past the pane's last
+        // column lands inside that range unless the guard refuses it first.
+        let wrapped = [0usize, 3];
+        let wide = [region(0, 0, 46, "w")];
+        assert_eq!(
+            link_at(
+                inner.x + inner.width - 1,
+                inner.y,
+                inner,
+                0,
+                &wrapped,
+                &wide
+            ),
+            Some("w"),
+            "the pane's last column is still inside"
+        );
+        assert_eq!(
+            link_at(inner.x + inner.width, inner.y, inner, 0, &wrapped, &wide),
+            None,
+            "one cell past the pane's last column is outside the transcript"
+        );
+    }
+
+    #[test]
     fn link_at_hits_a_soft_wrapped_link_on_its_second_visual_row() {
         let inner = inner_rect();
         // One content line occupying 3 visual rows (inner width 20). A link at
@@ -4496,6 +4614,127 @@ mod tests {
         // Without the scroll, the same screen cell is content line 1 -> no link.
         assert_eq!(
             link_at(inner.x + 1, inner.y + 1, inner, 0, &prefix, &regions),
+            None
+        );
+    }
+
+    // --- fold hit-test: the SAME geometry as `link_at`, a different region list --
+
+    fn fold_region(content_row: usize, col_start: usize, col_end: usize, key: &str) -> FoldRegion {
+        FoldRegion {
+            content_row,
+            col_start,
+            col_end,
+            key: key.to_string(),
+        }
+    }
+
+    #[test]
+    fn fold_at_returns_the_key_inside_a_node_header_and_none_just_outside() {
+        let inner = inner_rect();
+        // Three unwrapped content lines; a peer node's header on line 2 claiming its
+        // whole 18-column display width, which is how `peer_node_lines` emits it.
+        let prefix = [0usize, 1, 2, 3];
+        let regions = [fold_region(2, 0, 18, "a03505fe4b1c2d3e0")];
+        // The header's FIRST cell and its LAST both toggle the node: the whole line
+        // is the click target, not just the affordance text at its right.
+        assert_eq!(
+            fold_at(inner.x, inner.y + 2, inner, 0, &prefix, &regions),
+            Some("a03505fe4b1c2d3e0")
+        );
+        assert_eq!(
+            fold_at(inner.x + 17, inner.y + 2, inner, 0, &prefix, &regions),
+            Some("a03505fe4b1c2d3e0")
+        );
+        // One cell past the header's end (col_end is exclusive) -> None, so the pane
+        // to the right of a short header stays inert.
+        assert_eq!(
+            fold_at(inner.x + 18, inner.y + 2, inner, 0, &prefix, &regions),
+            None
+        );
+        // A region that does NOT start at column 0 is refused one cell before it, so
+        // the inclusive lower edge is pinned rather than assumed from `col_start` 0.
+        let indented = [fold_region(2, 4, 8, "k")];
+        assert_eq!(
+            fold_at(inner.x + 4, inner.y + 2, inner, 0, &prefix, &indented),
+            Some("k")
+        );
+        assert_eq!(
+            fold_at(inner.x + 3, inner.y + 2, inner, 0, &prefix, &indented),
+            None
+        );
+    }
+
+    #[test]
+    fn fold_at_is_none_on_blank_rows_and_outside_the_pane() {
+        let inner = inner_rect();
+        let prefix = [0usize, 1, 2, 3];
+        // A node's block is [blank, header, body...], so content line 1 here is the
+        // blank separator sitting directly ABOVE the header: the row an off-by-one
+        // would hand the toggle.
+        let regions = [fold_region(2, 0, 18, "k")];
+        assert_eq!(
+            fold_at(inner.x + 4, inner.y + 1, inner, 0, &prefix, &regions),
+            None,
+            "the blank above a node header claims no click"
+        );
+        // A click left of the inner rect is rejected outright, even though the region
+        // starts at content column 0.
+        assert_eq!(fold_at(0, inner.y + 2, inner, 0, &prefix, &regions), None);
+        // A click below the content (inside the pane, past the last line) -> None.
+        assert_eq!(
+            fold_at(inner.x + 4, inner.y + 5, inner, 0, &prefix, &regions),
+            None
+        );
+    }
+
+    #[test]
+    fn fold_at_hits_a_soft_wrapped_node_header_on_its_later_visual_rows() {
+        let inner = inner_rect();
+        // ONE content line occupying 3 visual rows at inner width 20: a long header
+        // (`* message from @a03505fe4b1c2d3e0 * 14:15 * (click to expand)`) at a
+        // narrow pane. The region spans its whole 46-column display width.
+        let prefix = [0usize, 3];
+        let regions = [fold_region(0, 0, 46, "w")];
+        // Every wrapped segment toggles the node — first row, second, and third.
+        assert_eq!(
+            fold_at(inner.x + 5, inner.y, inner, 0, &prefix, &regions),
+            Some("w")
+        );
+        assert_eq!(
+            fold_at(inner.x + 5, inner.y + 1, inner, 0, &prefix, &regions),
+            Some("w"),
+            "a wrapped header is clickable on its second visual segment"
+        );
+        assert_eq!(
+            fold_at(inner.x + 5, inner.y + 2, inner, 0, &prefix, &regions),
+            Some("w")
+        );
+        // And the tail of the LAST segment stops at the header's end: column 6 of the
+        // third row is content column 46, one past it. This is what dies if the
+        // `sub_row * inner.width` term is ever dropped — the same cell would then
+        // resolve to content column 6 and hit.
+        assert_eq!(
+            fold_at(inner.x + 6, inner.y + 2, inner, 0, &prefix, &regions),
+            None,
+            "past the header's display width, even on a continuation row"
+        );
+    }
+
+    #[test]
+    fn fold_at_respects_the_scroll_offset() {
+        let inner = inner_rect();
+        // Five unwrapped lines; a node header on line 3 spanning columns 0..12.
+        let prefix = [0usize, 1, 2, 3, 4, 5];
+        let regions = [fold_region(3, 0, 12, "s")];
+        // Scrolled down 2 rows, screen row rel 1 => visual row 3 => content line 3.
+        assert_eq!(
+            fold_at(inner.x + 1, inner.y + 1, inner, 2, &prefix, &regions),
+            Some("s")
+        );
+        // Without the scroll, the same screen cell is content line 1 -> no node.
+        assert_eq!(
+            fold_at(inner.x + 1, inner.y + 1, inner, 0, &prefix, &regions),
             None
         );
     }
@@ -6975,7 +7214,7 @@ mod tests {
             })
             .expect("the fixture's link label must be drawn inside the pane");
 
-        let (row_prefix, regions) = app.preview_hit_context(inner_w);
+        let (row_prefix, regions, _folds) = app.preview_hit_context(inner_w);
         assert_eq!(
             link_at(col, row, inner, app.preview_scroll, &row_prefix, &regions),
             Some(WINDOW_LINK_URL),
@@ -7126,7 +7365,7 @@ mod tests {
             })
             .expect("the fixture's link label must be drawn inside the pane");
 
-        let (row_prefix, regions) = app.preview_hit_context(inner_w);
+        let (row_prefix, regions, _folds) = app.preview_hit_context(inner_w);
         assert_eq!(
             link_at(col, row, inner, app.preview_scroll, &row_prefix, &regions),
             Some(WRAP_LINK_URL),
