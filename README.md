@@ -117,13 +117,12 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | `←` / `→` (in the model picker) | **Step the highlighted model's effort** down / up: `default effort` (no `--effort`, your settings decide) → `low` → `medium` → `high` → `xhigh` → `max`, wrapping round both ways. `Enter` sets the model and the effort together into the box; `Esc` goes back to the box with your text and its previous choice untouched. They do nothing on the picker's first (default) row, and nothing in the agent picker — and inside either picker they never fold or expand the board underneath |
 | `Tab` | Toggle search: **name-only ↔ name+content**. Widening to content also opens the preview on the most recent match, the same way typing does |
 | `Ctrl-A` | Flip scope: **current folder ↔ project** — the project being the repo you launched in and all of its git worktrees. Started with `-a` it is a three-stop cycle instead (current folder → project → all folders), which is the only way to reach all folders |
-| `Ctrl-/` | Toggle the transcript **preview** pane |
+| `Shift-←` / `Shift-→` | Change the **layout** one step — how the screen is split between the session list and the transcript preview, list:preview: `0:1` (preview only) · `1:3` · `1:1` · `3:1` · `1:0` (list only). You start at `1:1`; `Shift-←` gives the preview more room, `Shift-→` gives the list more, and a press at either end does nothing. Works with or without a search typed. The preview keeps your place as it resizes; coming back from `1:0` it opens on the newest turn. At `0:1` the preview's title names the selected session, and `↑` / `↓` still move between sessions |
 | `PgUp` / `PgDn` | Scroll the preview a full page |
 | `Ctrl-U` / `Ctrl-D` | Scroll the preview a quarter page |
 | `Ctrl-T` / `Ctrl-E`, `Home` / `End` | Jump the preview to the top / bottom (on a MacBook keyboard without dedicated `Home`/`End` keys, `fn+←` / `fn+→` reach the same two) |
 | `Shift-↑` / `Shift-↓` | Walk the preview through the lines your query marks — previous / next. Only bound while something IS marked in the previewed transcript; with nothing marked they stay plain **move the selection**, so they never take a key away from you (and a terminal that swallows the modifier still moves). One stop per marked **line**, not per occurrence: a line saying your query twice is marked twice and stopped at once |
 | mouse wheel | Scroll the pane under the pointer — except while a compose or draft box is open, when the session list stops taking notches: a wheel over it does **nothing**, so the session you are writing to can never slide out from under you. Everywhere else it is unchanged, and a notch anywhere but the list still scrolls the transcript |
-| drag the pane border | Resize the list and preview panes |
 | click a preview link | Open its url in your browser — `http`/`https` only. A link of any other scheme opens **nothing** and instead reports a refusal on the status line that names the link (`not opening <url> - only http/https links open`), so an underlined label that quietly does nothing never leaves you guessing which of the two happened. That refusal is **sticky** — it stays up until your next actionable keypress |
 | click a folded node | Unfold it where it sits, and click it again to fold it back. Two kinds of turn arrive folded to one line: a subagent's hand-back — the `◆ message from @…` node, otherwise ~95 rows of `<agent-message>` frame attributed to **you** — and context Claude Code added on your behalf, such as the instructions a skill or slash command expands into — the `◇ added by claude code` node, otherwise often thousands of rows, also attributed to **you**. Folded each costs one line, and its text is still one click away. Which nodes you left open is remembered for this run only — snapback writes nothing for it |
 | `Backspace` | Delete the last query character |
@@ -141,7 +140,7 @@ escape, which reaches your clipboard only if the terminal — and tmux, via
 `Sent session ID …`, never `Copied`. Either way the full id stays on the status
 line until your next key, so you can select it by hand.
 
-Mouse mode is on so the wheel can scroll and the pane border can be dragged; to
+Mouse mode is on so the wheel can scroll and a preview link can be clicked; to
 select/copy text natively, hold **Shift** (or **Option/⌥** on iTerm2 and macOS
 Terminal). The header shows the active scope, the search mode, and a
 `shown / total` count, with a version on the right — a release build shows the
@@ -238,8 +237,10 @@ until you position the pane yourself. Scroll it, jump to a match, or press `Home
 (or `Ctrl-T`), and it stays exactly where you left it — including if you scroll
 back down onto the newest turn, which parks the pane there rather than
 resubscribing it. `End` (or `Ctrl-E`) is how you hand it back. Until you do, only
-selecting a row, typing, `Tab`, a `Shift-` arrow, reopening the pane with
-`Ctrl-/`, or a quick reply of your own finishing moves it, never an autorefresh.
+selecting a row, typing, `Tab`, `Shift-↑` / `Shift-↓`, bringing the pane back
+from the `1:0` layout, or a quick reply of your own finishing moves it, never an
+autorefresh. Changing the layout between the other stops keeps your place: the
+line at the top of the pane stays at the top at the new width.
 
 **Autorefresh.** The list keeps itself current as you work: new sessions appear,
 finished ones update, deleted ones drop out — all in place, with your selection
@@ -660,8 +661,7 @@ restores. A level the model can't use is quietly lowered by Claude Code (`max` o
 `xhigh` become `high`), a model without effort support ignores it, and a
 `CLAUDE_CODE_EFFORT_LEVEL` in your environment beats it.
 
-**Readable transcript preview.** The preview pane — open by default, toggled by
-`Ctrl-/` — shows the selected
+**Readable transcript preview.** Beside the list sits a preview of the selected
 session rendered as clean, scrollable markdown — the real conversation, whole,
 from its first turn to its last, however long it ran. So you
 can confirm it's the right session before jumping back in. Links show in light
@@ -674,6 +674,9 @@ line — it is that agent's report, not something you said — and context Claud
 Code added on your behalf (the instructions a skill or slash command expands
 into, a command's caveat) to a single `◇ added by claude code` line; either opens
 where it sits on a click.
+`Shift-←` / `Shift-→` step through five fixed layouts, from the preview filling
+the screen to the list filling it, so a long transcript can take the whole width
+and a long list of sessions can too.
 
 Each `claude` turn is marked with **which model actually answered it**, beside
 the agent and the time — `● claude · @lead · Opus 5.5 · xhigh · 12:55`. It's

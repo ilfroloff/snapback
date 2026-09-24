@@ -118,7 +118,7 @@ use super::Session;
 /// Because GRID mode is the only table layout that records clickable
 /// [`LinkRegion`]s (see [`markdown_body_lines_collect`]), this switch also decides
 /// whether a table's links are CLICKABLE AT ALL: the same table answers clicks in a
-/// pane wide enough to seat its floors and goes inert the moment a splitter drag
+/// pane wide enough to seat its floors and goes inert the moment a layout step
 /// pushes it into records. That is a deliberate answer rather than an oversight —
 /// record mode cannot place a region correctly (its lines are re-wrapped by the
 /// pane), and a region that cannot be placed correctly is worse than none — but it
@@ -2616,7 +2616,7 @@ fn column_floors(natural: &[usize]) -> Vec<usize> {
 /// wrapped cell-label fragment, in columns relative to its first line. Record mode
 /// returns none and draws its links [`LinkRender::Inert`] to match — see
 /// [`markdown_body_lines_collect`] for why, and [`TABLE_MIN_COL_WIDTH`] for what
-/// that means for a table that changes layout on a splitter drag.
+/// that means for a table a `Shift-←`/`→` layout step re-flows between the two.
 fn render_table(rows: &[&str], width: usize) -> (Vec<Line<'static>>, Vec<LinkRegion>, usize) {
     let headers = split_table_row(rows[0]);
     let ncols = headers.len().max(1);
@@ -2656,8 +2656,8 @@ fn render_table(rows: &[&str], width: usize) -> (Vec<Line<'static>>, Vec<LinkReg
         .collect();
     // Reserve the 3-column `" │ "` / `"─┼─"` separators between columns. The ONLY
     // budget is the pane's inner content `width` — a table is never capped short
-    // of it, so a wide one fills the pane edge to edge and follows a splitter
-    // drag. No scrollbar column is subtracted: it overlays the block's right
+    // of it, so a wide one fills the pane edge to edge and follows a layout
+    // step. No scrollbar column is subtracted: it overlays the block's right
     // border, not a content column.
     let sep_total = COLUMN_RULE_WIDTH * ncols.saturating_sub(1);
 
@@ -2686,7 +2686,7 @@ fn render_table(rows: &[&str], width: usize) -> (Vec<Line<'static>>, Vec<LinkReg
 /// lines runs straight into the next one, and a 3-line row above a 2-line one
 /// reads as a single five-line block. They are drawn UNCONDITIONALLY rather than
 /// only for tables that wrapped, so the grid has one shape at every width — a
-/// table must not change its chrome when a splitter drag happens to make a cell
+/// table must not change its chrome when a layout step happens to make a cell
 /// fit. Reusing the header separator keeps the grid one vocabulary instead of
 /// inventing a second kind of rule; the header stays distinguishable between two
 /// identical rules because it alone is BOLD.

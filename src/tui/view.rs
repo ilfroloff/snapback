@@ -1,7 +1,9 @@
 //! View rendering.
 //!
 //! Draws the two-pane layout: a session list on the left, a readable transcript
-//! preview on the right, plus a header/help line and a search input line. The
+//! preview on the right — divided by the app's `PaneLayout`, five stops from a
+//! full-width preview to a full-width list — plus a header/help line and a search
+//! input line. The
 //! right pane is not always a transcript: the compose editor docks into its
 //! bottom while composing, and a `Ctrl-N` background draft replaces the
 //! transcript outright with a placeholder card ([`draft_card`]), since the session
@@ -39,7 +41,8 @@ use crate::store::FailedTask;
 
 use super::app::{
     resolve_list_width, App, ComposeDefault, InterruptRoute, Modal, ModalAction, ModalChoice,
-    ModalLayout, NewSessionDraft, Row, Scope, MODEL_DEFAULT_LABEL, MODEL_NEW_SESSION_SCOPE,
+    ModalLayout, NewSessionDraft, PaneLayout, Row, Scope, MODEL_DEFAULT_LABEL,
+    MODEL_NEW_SESSION_SCOPE,
 };
 use super::compose::{ComposeState, ComposeTarget};
 
@@ -674,38 +677,56 @@ fn compose_model_label(pick: Option<&ModelPick>, default: &ComposeDefault) -> Li
     Line::from(spans)
 }
 
-/// The two-pane body: grouped list on the left, preview on the right. The
-/// split between them is a stateful, draggable width
-/// ([`App::list_width`]/[`App::drag_split_to`]) rather than a fixed
-/// percentage; [`resolve_list_width`] re-clamps whatever is stored against
-/// THIS frame's `area.width` every render (mirroring how `render_preview`
-/// re-clamps `preview_scroll` rather than trusting a stale value), so a
-/// terminal resize between drags can never leave a pane degenerate.
+/// The body: grouped list on the left, preview on the right, divided by the
+/// app's [`PaneLayout`] — one of five stops `Shift-←` / `Shift-→` walk.
+///
+/// A SPLIT stop is a share of the body, turned into columns HERE, against THIS
+/// frame's `area.width`, by [`resolve_list_width`] (mirroring how `render_preview`
+/// re-clamps `preview_scroll` rather than trusting a stale value) — so no stored
+/// width exists for a terminal resize to leave degenerate. The two single-pane
+/// stops give the other pane nothing at all: its rect is left EMPTY, which never
+/// matches a hit-test, so a wheel anywhere over the body reaches the pane that
+/// is actually there.
 fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
-    if app.show_preview {
-        let list_width = resolve_list_width(app.list_width, area.width);
-        let [list_area, preview_area] =
-            Layout::horizontal([Constraint::Length(list_width), Constraint::Fill(1)]).areas(area);
-        // Persist the pane rects so a mouse wheel/splitter-drag can be
-        // hit-tested against a pane (or the seam between them).
-        app.list_rect = list_area;
-        app.preview_rect = preview_area;
-        render_list(frame, app, list_area);
-        render_preview(frame, app, preview_area);
-    } else {
-        // Preview hidden: the list owns the whole body. An empty preview rect
-        // never matches a hit-test, so a wheel over the list scrolls the list.
-        app.list_rect = area;
-        app.preview_rect = Rect::default();
-        render_list(frame, app, area);
-        // `render_preview` is the match jump's only consumer, and it does not run
-        // here — so this frame is where a request armed with no pane on screen has
-        // to die. Left armed it would fire on the frame the pane comes BACK on,
-        // overriding the newest-turn anchor `App::toggle_preview` just set, for a
-        // query the user typed before they re-opened the pane. Dropping it HERE
-        // (rather than refusing to arm it) covers every route into the flag,
-        // including the explicit `Shift`-arrow step.
-        let _ = app.take_preview_match_jump();
+    match app.pane_layout() {
+        PaneLayout::PreviewOnly => {
+            // 0:1 — the preview owns the whole body and the list is not drawn.
+            // The selection still moves (`↑`/`↓` act regardless), so the preview
+            // names the row it is showing in its title instead (`preview_title`).
+            app.list_rect = Rect::default();
+            app.preview_rect = area;
+            render_preview(frame, app, area);
+        }
+        PaneLayout::ListOnly => {
+            // 1:0 — the list owns the whole body and the preview is not drawn.
+            app.list_rect = area;
+            app.preview_rect = Rect::default();
+            render_list(frame, app, area);
+            // `render_preview` is the only consumer of BOTH preview one-shots, and
+            // it does not run here — so this frame is where a request armed with no
+            // pane on screen has to die. Left armed, a match jump would fire on the
+            // frame the pane comes BACK on, overriding the newest-turn anchor the
+            // layout setter just set, for a query the user typed before they
+            // re-opened the pane. Dropping it HERE (rather than refusing to arm it)
+            // covers every route into the flag, including the explicit
+            // `Shift`-arrow step. The reading-position anchor is dropped for the
+            // same reason, though the setter never leaves one pending into this
+            // layout today.
+            let _ = app.take_preview_match_jump();
+            let _ = app.take_preview_anchor();
+        }
+        split @ (PaneLayout::PreviewWide | PaneLayout::Even | PaneLayout::ListWide) => {
+            let list_cols = resolve_list_width(split, area.width);
+            let [list_area, preview_area] =
+                Layout::horizontal([Constraint::Length(list_cols), Constraint::Fill(1)])
+                    .areas(area);
+            // Persist the pane rects so a mouse wheel or a click (a fold node or
+            // a link) can be hit-tested against a pane.
+            app.list_rect = list_area;
+            app.preview_rect = preview_area;
+            render_list(frame, app, list_area);
+            render_preview(frame, app, preview_area);
+        }
     }
 }
 
@@ -1964,6 +1985,34 @@ fn render_compose_zone(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(&compose.textarea, inner);
 }
 
+/// The preview block's title whenever the pane is NOT standing in for a hidden
+/// list — which is every layout but [`PaneLayout::PreviewOnly`]. Named once so the
+/// string drawn and the string the tests look for cannot drift apart.
+const PREVIEW_TITLE: &str = " preview ";
+
+/// The preview block's title: [`PREVIEW_TITLE`], or — in the 0:1
+/// [`PaneLayout::PreviewOnly`] layout, where no list is drawn to show which row is
+/// selected — the SELECTED session's label, so the pane still says whose
+/// transcript it is. `↑`/`↓` keep moving the selection there, and the title is
+/// what tells the reader where it went.
+///
+/// Falls back to the session id for an empty label, as [`compose_title`] does, and
+/// to [`PREVIEW_TITLE`] when there is no transcript to name: nothing selected, or a
+/// new-session DRAFT card replacing the transcript — naming the selected row over
+/// a placeholder for a session that does not exist yet would claim the card
+/// belongs to an unrelated conversation. Pure, so the wording is assertable
+/// without a terminal.
+fn preview_title(app: &App) -> String {
+    if app.pane_layout() != PaneLayout::PreviewOnly || app.draft.is_some() {
+        return PREVIEW_TITLE.to_string();
+    }
+    match app.selected_session() {
+        Some(session) if !session.label.is_empty() => format!(" {} ", session.label),
+        Some(session) => format!(" {} ", session.session_id),
+        None => PREVIEW_TITLE.to_string(),
+    }
+}
+
 /// The readable transcript preview for the selected session, vertically
 /// scrollable and anchored to the newest turn by default, under a REPORTED
 /// session's PINNED status banner (see [`preview_split`]).
@@ -1986,7 +2035,9 @@ fn render_compose_zone(frame: &mut Frame, app: &App, area: Rect) {
 /// full-length/inactive thumb, keeping "a scrollbar is visible" a reliable
 /// signal that there is more transcript to see.
 fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
-    let block = Block::default().borders(Borders::ALL).title(" preview ");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(preview_title(app));
 
     // The selected session leads with the marker of whichever turn owns the TOP
     // row of the viewport, so who spoke — under which agent, on which model, when —
@@ -2089,6 +2140,9 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     // when a key was pressed; a path that leaves it armed defers it onto an
     // unrelated later frame instead of dropping it (see `App::take_preview_match_jump`).
     let pending_jump = app.take_preview_match_jump();
+    // The layout step's reading-position anchor is the same kind of one-shot and
+    // is taken here for the same reason.
+    let pending_anchor = app.take_preview_anchor();
 
     // How many LOGICAL lines the cached transcript holds. Asked instead of its
     // wrapped height for the emptiness test alone: at a degenerate zero-width pane
@@ -2174,9 +2228,25 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     // live in state that OUTLASTS the frame; `preview_follow_bottom` is that state
     // and the reader takes it back the ordinary ways (scroll, another row, `End`).
     let follow_bottom = follow_bottom && jump.is_none();
+    // A layout step's reading position, resolved the way the jump is and at the
+    // same site: the line the reader had at the top is read off the prefix map at
+    // THIS width, so it goes back to the top however the new width re-wrapped
+    // everything above it. Unlike the jump it parks the line AT the top, with no
+    // lead — it restores where the reader was rather than presenting a match. It
+    // is only ever noted for a pane the reader positioned, so it needs no write to
+    // `preview_follow_bottom`: that is already off. A jump wins if both were ever
+    // pending, since it answers the more recent question; under a draft CARD the
+    // noted line addresses text that is not on screen, so it is dropped there,
+    // exactly as the jump is.
+    let anchored = match (jump, pending_anchor) {
+        (None, Some(line)) if !showing_card => app
+            .preview_rows_above(inner_width, line)
+            .map(|rows_above| u32::try_from(rows_above).unwrap_or(u32::MAX)),
+        _ => None,
+    };
     let offset = clamp_preview_offset(
         follow_bottom,
-        jump.unwrap_or(app.preview_scroll),
+        jump.or(anchored).unwrap_or(app.preview_scroll),
         content_h,
         inner_height,
     );
@@ -2486,11 +2556,16 @@ pub(crate) fn wrapped_row_prefix(lines: &[Line<'_>], inner_width: u16) -> Vec<us
 /// derivations of that — the draw off this exact map, the click off a model of its
 /// own — is precisely how a click resolves to a line the pane never painted there.
 ///
+/// A THIRD consumer asks it on a keypress rather than a frame: a layout step notes
+/// the line at the top of the pane (`App::set_pane_layout`) so the next render can
+/// put that line back at the top at the new width. It reads the map the last frame
+/// was drawn from, so the line it notes is the one that frame painted there.
+///
 /// A `row` past the map's total answers with the index ONE PAST the last line, since
 /// the map holds one more entry than it has lines. The draw clamps that (an offset
 /// past the end simply paints nothing); the hit-test rejects it (see
 /// [`visual_to_content`]).
-fn line_at_row(row_prefix: &[usize], row: usize) -> usize {
+pub(crate) fn line_at_row(row_prefix: &[usize], row: usize) -> usize {
     // The LAST entry still `<= row` is the line that occupies it: entries repeat for
     // any zero-height line, and the line that owns the row is the last of them.
     row_prefix
@@ -3478,18 +3553,18 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         // The board keymap — one of the five surfaces AGENTS.md's KEEP KEY DOCS IN
         // SYNC names. It does NOT mention the terminal's paste, on COLUMN BUDGET:
-        // this line is already 224 columns (measured with the `unicode-width` the
+        // this line is already 225 columns (measured with the `unicode-width` the
         // renderer counts in) against a help row that is ONE line and never wraps, so
         // on an 80-column terminal it is cut the instant `^K stop` ends and
         // everything from `^X hide/del` (column 84) rightward is already unpainted.
-        // A 23-column "paste keeps newlines" clause would land at columns 225-247 —
+        // A 23-column "paste keeps newlines" clause would land at columns 226-248 —
         // nowhere, on any realistic width. What a board paste DOES (append to the
         // query with newlines flattened to spaces, and never resume) is documented
         // where there is room to say it: `KEYS` in `cli.rs` and the README key map.
         //
         // The QUERY WORD-DELETE keys are omitted for exactly the same reason, and
         // just as deliberately. Even the tersest honest clause (`· ⌥⌫ del word`,
-        // 14 columns) would be painted at columns 224-237 — off the end of any
+        // 14 columns) would be painted at columns 225-238 — off the end of any
         // realistic width — and terse is the one thing this binding cannot be:
         // `Alt-Backspace`, `Ctrl-W` and `Alt-H` ALL do it, on purpose, so that the
         // board answers the same set the compose box does whatever the terminal
@@ -3507,6 +3582,10 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         // not have. It is off-screen at 80 columns like everything past `^X`, and
         // that is the same budget every clause here is judged against; the key is
         // documented in full in `KEYS` and the README.
+        //
+        // `S-←→ layout` is spelled the same way for the same reason, and names the
+        // pair rather than the five stops they walk — those take a sentence, and
+        // `KEYS` and the README have room for it.
         //
         // `^T/^E` sits beside `Home/End` in the scroll cluster (its twin action, not
         // a separate one) rather than beside `^U/^D`: the scroll cluster already
@@ -3535,7 +3614,7 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         // it opens names its own `←/→` effort keys in its prompt and footer — so the
         // `←/→` below means fold/expand ON THE BOARD only.
         Line::from(vec![Span::styled(
-            "↑↓ move · ←/→ fold/expand · Enter resume · ^F fork · ^N new · ^R reply · ^K stop · ^X hide/del · type to search · Tab name/content · S-↑↓ match · ^A scope · ^/ preview · PgUp/PgDn·^U/^D·^T/^E·Home/End·wheel scroll · Esc quit",
+            "↑↓ move · ←/→ fold/expand · Enter resume · ^F fork · ^N new · ^R reply · ^K stop · ^X hide/del · type to search · Tab name/content · S-↑↓ match · ^A scope · S-←→ layout · PgUp/PgDn·^U/^D·^T/^E·Home/End·wheel scroll · Esc quit",
             Style::default().add_modifier(Modifier::DIM),
         )])
     };
@@ -8203,7 +8282,7 @@ mod tests {
             Scope::All,
             PathBuf::from("/tmp/launch"),
         );
-        app.show_preview = true;
+        app.set_pane_layout(DOCK_LAYOUT);
         app.compose = Some(ComposeState::new_reply("s".to_string(), None));
         app.compose
             .as_mut()
@@ -8254,21 +8333,22 @@ mod tests {
         }
     }
 
-    /// A DOCKED compose-zone board: 60 columns with the splitter PINNED, so the
-    /// preview pane is exactly 30 columns, and tall enough to clear the dock
-    /// threshold. Both halves are fixed rather than defaulted because the tests below
-    /// need to know where the editor actually wraps.
+    /// A DOCKED compose-zone board: 60 columns drawn at the 1:1 [`PaneLayout::Even`]
+    /// split (a 28-column list, so a 32-column preview pane), and tall enough to
+    /// clear the dock threshold. Both halves and the layout are fixed rather than
+    /// defaulted because the tests below need to know where the editor actually
+    /// wraps.
     const DOCK_BOARD: (u16, u16) = (60, 30);
-    /// The splitter position [`DOCK_BOARD`] is drawn with, leaving a 30-column
-    /// preview pane beside it.
-    const DOCK_LIST_WIDTH: u16 = 30;
-    /// The editor's REAL inner width on [`DOCK_BOARD`]: the 30-column preview pane,
+    /// The layout [`DOCK_BOARD`] is drawn with. Set explicitly, so a change to the
+    /// board's starting layout cannot quietly move the editor these cases measure.
+    const DOCK_LAYOUT: PaneLayout = PaneLayout::Even;
+    /// The editor's REAL inner width on [`DOCK_BOARD`]: the 32-column preview pane,
     /// less the pane's own border (2), less the compose block's border (2). Spelled
     /// out because those four columns are exactly what the docked path used to lose
     /// track of — and PINNED to the drawn box by [`drawn_editor_width`] rather than
     /// trusted, so a layout change that moved the editor fails the cases below instead
     /// of leaving their premise reasoning about a width the editor no longer has.
-    const DOCK_EDITOR_WIDTH: u16 = 26;
+    const DOCK_EDITOR_WIDTH: u16 = 28;
 
     /// A BOTTOM-BAR compose board: one row short of the dock threshold, so the zone
     /// claims a full-width bar between the body and the search line.
@@ -8430,8 +8510,7 @@ mod tests {
             Scope::All,
             PathBuf::from("/tmp/launch"),
         );
-        app.show_preview = true;
-        app.list_width = Some(DOCK_LIST_WIDTH);
+        app.set_pane_layout(DOCK_LAYOUT);
         app.compose = Some(ComposeState::new_reply("sess-normal-1".to_string(), None));
         assert!(
             !compose_uses_bottom_bar(app.is_composing(), height),
@@ -8470,7 +8549,7 @@ mod tests {
             Scope::All,
             PathBuf::from("/tmp/launch"),
         );
-        app.show_preview = true;
+        app.set_pane_layout(PaneLayout::Even);
         app.compose = Some(ComposeState::new_reply("sess-normal-1".to_string(), None));
         assert!(
             compose_uses_bottom_bar(app.is_composing(), height),
@@ -8496,7 +8575,7 @@ mod tests {
         use crate::tui::compose::ComposeState;
 
         let open = |app: &mut App| {
-            app.show_preview = true;
+            app.set_pane_layout(PaneLayout::Even);
             app.compose = Some(ComposeState::new_reply("sess-normal-1".to_string(), None));
         };
         let full = |buffer: &ratatui::buffer::Buffer, w: u16, h: u16| -> String {
@@ -10777,11 +10856,12 @@ mod tests {
 
     /// A jump requested while the pane is HIDDEN is dropped, not deferred.
     ///
-    /// `Ctrl-/` takes the pane away without clearing anything behind it, so a query
-    /// typed while it is gone still arms the one-shot and `render_preview` — its only
-    /// consumer — never runs. Left armed, it fires on the frame the pane comes BACK
-    /// on: the user re-opens the preview expecting the newest turn (what the toggle
-    /// promises) and lands on a match from a query they have since moved on from.
+    /// The 1:0 [`PaneLayout::ListOnly`] layout takes the pane away without clearing
+    /// anything behind it, so a query typed while it is gone still arms the one-shot
+    /// and `render_preview` — its only consumer — never runs. Left armed, it fires on
+    /// the frame the pane comes BACK on: the user brings the preview back expecting
+    /// the newest turn (what leaving 1:0 promises) and lands on a match from a query
+    /// they have since moved on from.
     #[test]
     fn a_hidden_pane_swallows_the_match_jump() {
         let dir = unique_temp_dir("jump-hidden");
@@ -10809,8 +10889,11 @@ mod tests {
             PathBuf::from("/tmp/launch"),
         );
         app.toggle_search_mode();
-        app.toggle_preview();
-        assert!(!app.show_preview, "Ctrl-/ takes the pane away");
+        app.set_pane_layout(PaneLayout::ListOnly);
+        assert!(
+            !app.pane_layout().shows_preview(),
+            "the 1:0 layout takes the pane away"
+        );
 
         // Searching with no pane on screen: the board still draws, and that frame is
         // where the request has to die.
@@ -10821,13 +10904,322 @@ mod tests {
             .draw(|frame| render(frame, &mut app))
             .expect("the board must draw with no preview pane");
 
-        // And the pane comes back where its own toggle puts it.
-        app.toggle_preview();
+        // And the pane comes back where leaving 1:0 puts it.
+        app.step_pane_layout(false);
         preview_buffer(&mut app, width, height);
         assert_eq!(
             app.preview_scroll, bottom_offset,
             "a re-opened pane must show the newest turn, not act on a request no \
              frame could see"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- pane layout: the five stops, the 0:1 title, the reading position -----
+
+    /// A board wide enough that every split stop's share of it is a whole number of
+    /// columns, and short enough that the anchor fixture below overflows the pane.
+    const LAYOUT_BOARD: (u16, u16) = (100, 20);
+
+    /// How many turns [`numbered_session_at`] writes: enough to overflow
+    /// [`LAYOUT_BOARD`]'s preview several times over at EITHER width the reading-
+    /// position test draws, so neither offset is decided by the bottom clamp.
+    const ANCHOR_TURNS: usize = 16;
+
+    /// The turn the reading-position test parks at the top of the pane — far from
+    /// both ends, so it is the reader's position and not a clamp's.
+    const ANCHOR_TURN: usize = 4;
+
+    /// The marker opening turn `turn`'s body, so a drawn row names the turn it
+    /// belongs to. The generic jump fixture repeats ONE body for every miss turn,
+    /// which cannot tell "the same line came back" from "an identical line did".
+    fn turn_marker(turn: usize) -> String {
+        format!("turn{turn:02}-marker")
+    }
+
+    /// The text after each turn's marker: ~120 columns of SHORT words, so it wraps
+    /// close to evenly — three rows in the 1:1 pane of [`LAYOUT_BOARD`] and two in
+    /// the wider 1:3 one. That one-row difference per turn is what makes a carried
+    /// row offset land on a different line after the step.
+    const ANCHOR_BODY: &str = "alpha bravo charlie delta echo foxtrot golf hotel india \
+         juliet kilo lima mike november oscar papa quebec romeo sierra tango";
+
+    /// A transcript whose every turn is IDENTIFIABLE on screen: [`turn_marker`]
+    /// followed by [`ANCHOR_BODY`], which wraps to a different number of rows at
+    /// the two widths the anchor test draws.
+    fn numbered_session_at(dir: &Path, id: &str, turns: usize) -> Session {
+        let path = dir.join(format!("{id}.jsonl"));
+        let mut out =
+            String::from(r#"{"type":"summary","summary":"Layout anchor","leafUuid":"a1"}"#);
+        out.push('\n');
+        for turn in 0..turns {
+            let role = if turn % 2 == 0 { "user" } else { "assistant" };
+            let body = format!("{} {ANCHOR_BODY}", turn_marker(turn));
+            out.push_str(&format!(
+                r#"{{"type":"{role}","sessionId":"{id}","cwd":"/Users/me/project-alpha","gitBranch":"main","timestamp":"2026-07-01T10:00:00.000Z","message":{{"role":"{role}","content":"{body}"}}}}"#
+            ));
+            out.push('\n');
+        }
+        std::fs::write(&path, out).expect("write the generated transcript");
+        Session {
+            file: path,
+            session_id: id.to_string(),
+            cwd: PathBuf::from("/Users/me/project-alpha"),
+            git_branch: Some("main".to_string()),
+            timestamp: None,
+            repo: "project-alpha".to_string(),
+            label: "Layout anchor".to_string(),
+            root_uuid: None,
+            msg_count: turns,
+            content_index: String::new(),
+            background: false,
+            has_agent_name: false,
+            has_agent_setting: false,
+            failed_task: None,
+        }
+    }
+
+    /// The preview's FIRST transcript row exactly as drawn, read off the buffer: the
+    /// top row of the transcript rect `render_preview` drew into, between the pane's
+    /// side borders.
+    ///
+    /// Derived through the SAME `preview_split` the view draws with, asked the same
+    /// `preview_banner(..).is_some()` question, because every selected session pins
+    /// a row above its transcript — the turn it is reading — so the pane's first
+    /// inner row is that pinned row, never a transcript line.
+    fn preview_top_row(buffer: &ratatui::buffer::Buffer, app: &App) -> String {
+        let (_, transcript) = preview_split(app.preview_rect, preview_banner(app).is_some());
+        let y = transcript.y;
+        (transcript.x..transcript.right())
+            .filter_map(|x| buffer.cell((x, y)).map(|cell| cell.symbol().to_string()))
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    /// Each stop divides the body as its name says, on a drawn board: the three
+    /// splits at 25 / 48 / 75 percent of the width with the preview starting where
+    /// the list ends, and 1:0 giving the list the whole body and the preview an
+    /// EMPTY rect that no hit-test can match.
+    #[test]
+    fn each_pane_layout_divides_the_body_as_its_stop_says() {
+        let (width, height) = LAYOUT_BOARD;
+        for (layout, list_cols) in [
+            (PaneLayout::PreviewWide, 25),
+            (PaneLayout::Even, 48),
+            (PaneLayout::ListWide, 75),
+        ] {
+            let mut app = App::new(
+                vec![markable_session()],
+                Scope::All,
+                PathBuf::from("/tmp/launch"),
+            );
+            app.set_pane_layout(layout);
+            let _ = drawn_board(&mut app, width, height);
+            assert_eq!(
+                app.list_rect.width, list_cols,
+                "{layout:?}: the list's share"
+            );
+            assert_eq!(
+                app.preview_rect.x, list_cols,
+                "{layout:?}: the preview starts where the list ends"
+            );
+            assert_eq!(
+                app.preview_rect.width,
+                width - list_cols,
+                "{layout:?}: and takes the rest"
+            );
+        }
+
+        let mut app = App::new(
+            vec![markable_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.set_pane_layout(PaneLayout::ListOnly);
+        let _ = drawn_board(&mut app, width, height);
+        assert_eq!(
+            app.list_rect.width, width,
+            "1:0 gives the list the whole body"
+        );
+        assert!(
+            app.preview_rect.is_empty(),
+            "and the preview an empty rect, so no hit-test can land on it"
+        );
+    }
+
+    /// 0:1 gives the list an EMPTY area: no list block is drawn anywhere, its rect
+    /// is empty so a wheel or click can never be routed to it, and the preview owns
+    /// the body edge to edge — titled with the selected session's name, since no
+    /// list is left on screen to say which row it is.
+    #[test]
+    fn preview_only_gives_the_list_an_empty_area_and_the_preview_the_whole_body() {
+        let (width, height) = LAYOUT_BOARD;
+        let list_title = "┌ sessions ";
+
+        // The control: at the default 1:1 the list block IS drawn, so the absence
+        // asserted below is a real absence and not a title this board never shows.
+        let mut app = App::new(
+            vec![markable_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        let even = buffer_rows(&drawn_board(&mut app, width, height), width, height);
+        assert!(
+            even.iter().any(|row| row.contains(list_title)),
+            "premise: the 1:1 board draws the list block"
+        );
+
+        app.set_pane_layout(PaneLayout::PreviewOnly);
+        let rows = buffer_rows(&drawn_board(&mut app, width, height), width, height);
+        assert!(
+            app.list_rect.is_empty(),
+            "the list's area is empty: {:?}",
+            app.list_rect
+        );
+        assert_eq!(
+            (app.preview_rect.x, app.preview_rect.width),
+            (0, width),
+            "the preview owns the whole body"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains(list_title)),
+            "no list block is drawn at 0:1; board:\n{}",
+            rows.join("\n")
+        );
+        let top_border = &rows[usize::from(app.preview_rect.y)];
+        assert!(
+            top_border.starts_with("┌ Fix the payment webhook retries "),
+            "the preview's title names the selected session: {top_border:?}"
+        );
+    }
+
+    /// The preview's title is the generic one wherever a list still shows which row
+    /// is selected, and the selected session's name only at 0:1 — falling back to
+    /// the id for an empty label, and to the generic title with nothing selected or
+    /// with a draft card standing in for a session that does not exist yet.
+    #[test]
+    fn the_preview_title_names_the_selected_session_only_when_the_list_is_hidden() {
+        use crate::tui::compose::ComposeState;
+
+        let mut app = App::new(
+            vec![markable_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        for layout in [
+            PaneLayout::PreviewWide,
+            PaneLayout::Even,
+            PaneLayout::ListWide,
+        ] {
+            app.set_pane_layout(layout);
+            assert_eq!(preview_title(&app), PREVIEW_TITLE, "{layout:?}");
+        }
+
+        app.set_pane_layout(PaneLayout::PreviewOnly);
+        assert_eq!(preview_title(&app), " Fix the payment webhook retries ");
+
+        app.sessions[0].label.clear();
+        assert_eq!(
+            preview_title(&app),
+            " sess-normal-1 ",
+            "an empty label falls back to the id"
+        );
+
+        app.open_compose(
+            ComposeState::new_background(None),
+            Some(NewSessionDraft::default()),
+        );
+        assert_eq!(
+            preview_title(&app),
+            PREVIEW_TITLE,
+            "a draft card is not the selected session's transcript"
+        );
+
+        let mut empty = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp/launch"));
+        empty.set_pane_layout(PaneLayout::PreviewOnly);
+        assert_eq!(preview_title(&empty), PREVIEW_TITLE, "nothing selected");
+    }
+
+    /// A layout step keeps the reader's place: the line at the top of the pane
+    /// before the step is the line at the top after it, at the new width.
+    ///
+    /// The premise is what gives this teeth. `preview_scroll` counts WRAPPED rows,
+    /// and the fixture's turns wrap to fewer rows in the wider pane, so the raw row
+    /// offset carried across the step would put a LATER line at the top — the
+    /// assertion below that it does not is what fails if the anchor is ever lost.
+    /// The line is identified by what was DRAWN (its turn's marker), never by the
+    /// offset arithmetic under test.
+    #[test]
+    fn a_layout_step_keeps_the_top_visible_line_at_the_top() {
+        let dir = unique_temp_dir("layout-anchor");
+        let (width, height) = LAYOUT_BOARD;
+        let marker = turn_marker(ANCHOR_TURN);
+        let mut app = App::new(
+            vec![numbered_session_at(&dir, "sess-anchor-1", ANCHOR_TURNS)],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+
+        // The reader parks the anchor turn's line at the top of the 1:1 pane.
+        let _ = drawn_board(&mut app, width, height);
+        let old_inner = app.preview_rect.width - 2;
+        let target = app
+            .preview_text(old_inner)
+            .lines
+            .iter()
+            .position(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+                    .contains(&marker)
+            })
+            .expect("the anchor turn's body is a rendered line");
+        app.preview_top();
+        let old_offset = app
+            .preview_rows_above(old_inner, target)
+            .expect("the target line is in the transcript");
+        app.preview_scroll = u32::try_from(old_offset).expect("a small fixture");
+        let before = drawn_board(&mut app, width, height);
+        assert!(
+            preview_top_row(&before, &app).contains(&marker),
+            "premise: the reader's line is at the top before the step"
+        );
+
+        // `Shift-←`: 1:1 -> 1:3, a wider preview.
+        app.step_pane_layout(false);
+        assert_eq!(app.pane_layout(), PaneLayout::PreviewWide);
+        let after = drawn_board(&mut app, width, height);
+        let new_inner = app.preview_rect.width - 2;
+        assert!(new_inner > old_inner, "premise: the step widened the pane");
+        let new_prefix = app
+            .preview_hit_context(new_inner)
+            .expect("the anchor session is selected, so it has a preview")
+            .0
+            .to_vec();
+        assert_ne!(
+            line_at_row(&new_prefix, old_offset),
+            target,
+            "premise: the old ROW offset names a different line at the new width, \
+             so only the anchor can bring this one back"
+        );
+
+        let top = preview_top_row(&after, &app);
+        assert!(
+            top.contains(&marker),
+            "the line the reader had at the top must still be at the top after the \
+             step; drawn top row: {top:?}"
+        );
+        assert_eq!(
+            usize::try_from(app.preview_scroll).ok(),
+            new_prefix.get(target).copied(),
+            "and the pane is scrolled to exactly where that line starts now"
+        );
+        assert!(
+            !app.preview_follow_bottom,
+            "a restored position is still the reader's, not a subscription"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -11062,7 +11454,8 @@ mod tests {
     ///
     /// The release half of the anchor: `preview_follow_bottom` cleared means "the
     /// reader put this pane here", and only a key that says otherwise (`End`, another
-    /// row, the preview toggle) takes it back. A scroll states a POSITION, never a
+    /// row, bringing the pane back from the 1:0 layout) takes it back. A scroll states
+    /// a POSITION, never a
     /// subscription: paging down past the end of everything there is lands on the last
     /// row and stops, so the reply still being written does not drag the pane along.
     /// Proven by GROWING the transcript afterwards, since a pane parked on today's

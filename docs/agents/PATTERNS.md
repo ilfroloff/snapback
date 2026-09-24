@@ -572,13 +572,27 @@ inner rect when there is no banner (so a banner-less pane's geometry is exactly
   branch re-anchors the pane. The flag is CONSUMED in
   `render_preview`, the only place the pane's width and height are known, and is
   dropped rather than deferred by EVERY frame that cannot act on it — something
-  else owns the pane (a draft card), nothing is selected, or `Ctrl-/` hid the pane
-  so that function never ran at all (the hidden branch of `render_body` takes it
-  there). Enumerate all of them or the flag survives onto an unrelated later frame:
-  the board draws before it reads the next key, so the frame that cannot act on a
-  request is the last one that will ever see it. Arm any future
+  else owns the pane (a draft card), nothing is selected, or the 1:0
+  `PaneLayout::ListOnly` layout hid the pane so that function never ran at all
+  (that branch of `render_body` takes it there). Enumerate all of them or the flag
+  survives onto an unrelated later frame: the board draws before it reads the next
+  key, so the frame that cannot act on a request is the last one that will ever
+  see it. Arm any future
   auto-scroll the same way: inside the branch that fires only when the state actually
   MOVED, never on the recompute a reload shares.
+- **A layout step keeps the reader's place through a second one-shot of the same
+  shape.** `preview_scroll` counts wrapped ROWS, which mean a different line at a
+  different width, so `App::set_pane_layout` notes the LINE at the top of the pane
+  (`view::line_at_row` over the map the last frame was drawn from) into
+  `App::preview_anchor_line`, and `render_preview` puts that line back at the top
+  as `row_prefix[k]` at the new width — no lead, since it restores a position
+  rather than presenting a match. It is consumed on the same paths as the jump,
+  loses to a pending jump, and is noted only for a pane the reader positioned: a
+  pane following the newest turn keeps following it at any width. Two limits are
+  by design: it is line-granular (a top row inside a wrapped line comes back as
+  that line's first row), and a GFM table above the anchor that re-flows between
+  grid and records at the new width shifts it by the lines it gained or lost. A
+  terminal resize does NOT go through it.
   The mode gate lives at the arming site too — the AUTOMATIC jump is
   `SearchMode::NameAndContent`'s alone, while the explicit `Shift`-arrow step is a
   keypress and needs no such assumption.
@@ -594,9 +608,11 @@ inner rect when there is no banner (so a banner-less pane's geometry is exactly
   cannot win against a per-frame recompute; give the decision state that outlasts
   the frame instead. Every transition is a USER ACT: ANY scroll releases the
   anchor (in either direction — a scroll states a position, not a subscription),
-  and only `End` (or its `Ctrl-E` twin), another row, or re-showing the pane
-  re-arms it. The render writes the flag for exactly one thing, the match jump it
-  alone can resolve, and
+  and only `End` (or its `Ctrl-E` twin), another row, or a layout change that
+  brings the pane back from 1:0 (`App::set_pane_layout`, which `Shift-←` and an
+  opening compose both go through) re-arms it. A step between two layouts that
+  both show the pane neither arms nor releases it. The render writes the flag for
+  exactly one thing, the match jump it alone can resolve, and
   never infers a re-arm from its own CLAMP: an offset the content cannot satisfy
   is equally a reader scrolling past the end, a pane widened by a resize, and a
   transcript that shrank, so re-arming on it took a deliberately positioned pane
@@ -994,8 +1010,8 @@ CADENCES and LIMITS, so a retune knows what it is next to:
 | `model_aliases` | `MAX_ALIAS_ARRAY_BYTES` (4096) · `SCAN_CHUNK_BYTES` (1 MiB) · `SCAN_OVERLAP_BYTES` (= `MAX_ALIAS_ARRAY_BYTES` by definition — that equality is what proves no match straddles a chunk unseen, so neither is retuned alone) |
 | `store::preview` | `MODEL_VERSION_MAX_DIGITS` (2) · `MODEL_DATE_DIGITS` (8 — kept above the version cap so a date never reads as a version) · `TABLE_MIN_COL_WIDTH` (10) · `RECORD_RULE_WIDTH` (32) · `COLUMN_RULE_WIDTH` (3) · `ELLIPSIS_WIDTH` (1) · `PEER_STEM_LEN` (17 — the agent-stem length a peer sender must match before it renders as an `@handle`, so a socket path or an agent TYPE name falls back to the generic label) · `PEER_HEADER_BLOCK_ROW` (1 — not a knob but a SHAPE: every fold node's header index — peer and injected alike — inside its own `[blank, header, body…]` block, named so the fold region and the body links rebase off one number) |
 | `send` | `SEND_ERROR_MAX` (200) |
-| `tui::app` | `PREVIEW_WHEEL_STEP` (2) · `LIST_WHEEL_STEP` (1) · `STATUS_DWELL_TICKS` (16) · `MIN_PANE_WIDTH` (15) · `DEFAULT_LIST_PERCENT` (48) |
-| `tui::update` | `PASTE_MAX_CHARS` (4096) · `SPLITTER_TOLERANCE` (1) |
+| `tui::app` | `PREVIEW_WHEEL_STEP` (2) · `LIST_WHEEL_STEP` (1) · `STATUS_DWELL_TICKS` (16) · `MIN_PANE_WIDTH` (15) · the list's share of the body per split `PaneLayout` stop: `PREVIEW_WIDE_LIST_PERCENT` (25) / `DEFAULT_LIST_PERCENT` (48) / `LIST_WIDE_LIST_PERCENT` (75) |
+| `tui::update` | `PASTE_MAX_CHARS` (4096) |
 | `tui::view` | `BLINK_TICKS` (2) · `CHILD_ID_CHARS` (8) · `MATCH_JUMP_LEAD_DIVISOR` (3 — a jumped-to match parks `h / 3` rows down) · `WIDE_GLYPH_COLUMNS` (2) · `LINK_PROBE_BYTE_BUDGET` (131_072) · the layout rows `PREVIEW_BANNER_ROWS` / `BOARD_CHROME_ROWS` / `COMPOSE_*` / `MODAL_WIDTH` / `MODAL_*_CHROME_ROWS` / `MODAL_BORDER_ROWS` / `MODAL_BORDER_COLS` / `MODAL_LIST_MAX_ROWS` (12 — the most CHOICES a `List` picker offers before it scrolls, so an overlay stays an overlay on a tall terminal; a wrapped row's extra lines are paid on top, see [§5](#5-selection-and-scroll-survive-reloads)) |
 
 Add a new tunable the same way. The rule is not only about numbers — a literal
@@ -1110,11 +1126,11 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    straight back to the untouched draft, with no state saved or restored.
    `App::overlay_active` (`modal.is_some() || compose.is_some() ||
    draft.is_some() || pending_stop.is_some() || pending_interrupt.is_some() ||
-   pending_chord`) gates mouse actions (splitter drag / fold toggle / link open)
-   so none fires while any is up. A mouse wheel is handled **before** and
-   **independent of** that gate: it never routes into an overlay handler, it only
-   scrolls a pane. A new keyboard owner must be added to `overlay_active` too, or
-   the mouse will act underneath it.
+   pending_chord`) gates the mouse's two actions — toggling a fold node and
+   opening a preview link — so neither fires while any is up. A mouse wheel is
+   handled **before** and **independent of** that gate: it never routes into an
+   overlay handler, it only scrolls a pane. A new keyboard owner must be added to
+   `overlay_active` too, or the mouse will act underneath it.
 
    The wheel takes exactly ONE condition, and `update::wheel_target` owns it as a
    parameter (`composing`) the way `key_to_action` owns its own. It hit-tests
@@ -1134,7 +1150,8 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    The other two zones are untouched, and that is load-bearing. Inside the preview
    a notch scrolls the transcript being written to exactly as always, and the
    composer needs no arm of its own when docked — it is drawn INSIDE the preview
-   rect (`App::open_compose` force-shows that pane, so there is always one).
+   rect (`App::open_compose` brings a hidden pane back at 1:1, so there is always
+   one).
    OUTSIDE BOTH rects the preview stays the default surface, which is what keeps
    the wheel alive over the SHORT-PANE fallback composer in the bottom bar, the
    search line and the help line: all three render outside the two body panes, so
@@ -1237,10 +1254,16 @@ A binding that is only meaningful sometimes is **CONDITIONAL, and falls through*
 rather than going inert. `key_to_action` takes the conditions as parameters
 (`query_empty`, `has_preview_matches`) so the decision stays pure and the
 fall-through is what a test can pin; the guarded arm sits ABOVE the unguarded one
-and the unguarded one is reached whenever the guard fails. The shifted arrows are
-the instance: with nothing marked to move between they are bit-for-bit the
-`MoveUp`/`MoveDown` they have always been, so a user who never searches loses
-nothing AND a terminal that drops the modifier degrades to a working key. Prefer
+and the unguarded one is reached whenever the guard fails. The shifted VERTICAL
+arrows are the instance: with nothing marked to move between they are
+bit-for-bit the `MoveUp`/`MoveDown` they have always been, so a user who never
+searches loses nothing AND a terminal that drops the modifier degrades to a
+working key. The shifted HORIZONTAL arrows are the contrast: `Shift-←`/`Shift-→`
+step the `PaneLayout` UNCONDITIONALLY, taking neither parameter — but their arms
+still sit above the plain `Left`/`Right` fold arms, because the unguarded arm
+matches the shifted key too and the first matching arm wins
+(`the_layout_arms_win_over_the_plain_fold_arms` pins the order). A dropped
+modifier degrades them to a fold/expand, a working key if not the one pressed. Prefer
 `Shift`+key over `Alt`+key for anything new here: snapback never pushes the kitty
 keyboard protocol and clears it on every board (re)entry
 (`tui::reset_terminal_state`), so on default macOS terminals `Alt` arrives as a

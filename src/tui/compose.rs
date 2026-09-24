@@ -209,7 +209,7 @@ impl ComposeState {
     /// shorter than the un-wrapped text.
     ///
     /// CAVEAT, by design: the widget builds its screen map from the width it was LAST
-    /// RENDERED at, so a terminal resize (or a splitter drag) leaves this one frame
+    /// RENDERED at, so a terminal resize (or a `Shift-←`/`→` layout step) leaves this one frame
     /// stale. Edits refresh the map immediately, and the next redraw — which the
     /// resize itself triggers — self-corrects, so the box settles a frame later rather
     /// than wrongly. Before the editor has EVER been rendered its area is still zero
@@ -320,9 +320,10 @@ pub fn compose_key_to_action(key: KeyEvent) -> ComposeAction {
     }
 }
 
-/// Open the REPLY compose zone for `session_id`, FORCE-SHOWING the preview (the
-/// compose zone docks in the preview pane, or falls back to a full-width bottom
-/// bar on a short terminal — the renderer decides). `stop_job` is the job id to
+/// Open the REPLY compose zone for `session_id`, BRINGING BACK a hidden preview
+/// (a 1:0 board opens at 1:1 — see [`App::open_compose`]), since the compose zone
+/// docks in the preview pane, or falls back to a full-width bottom bar on a short
+/// terminal — the renderer decides. `stop_job` is the job id to
 /// `claude stop` before sending, or `None` for a plain in-place reply. The reply
 /// gate (and, for a waiting agent, the stop confirmation) has already run at the
 /// call site (`Ctrl-R` in `update`).
@@ -332,7 +333,7 @@ pub fn open(app: &mut App, session_id: String, stop_job: Option<String>) {
 }
 
 /// Open the BACKGROUND-AGENT draft pane for `agent` (`None` = the picker's
-/// "default (no agent)" row), FORCE-SHOWING the preview exactly like [`open`].
+/// "default (no agent)" row), bringing back a hidden preview exactly like [`open`].
 ///
 /// The DEFAULT destination of `Ctrl-N`, reached two ways (`update`): the agent
 /// picker's `Enter` confirm, which has already closed the picker — the draft pane
