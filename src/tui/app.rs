@@ -58,15 +58,28 @@ const LIST_WHEEL_STEP: isize = 1;
 /// by `watch::TICK`, so the two must be tuned together (PATTERNS §8).
 pub(crate) const STATUS_DWELL_TICKS: u16 = 16;
 
-/// Minimum columns either pane keeps when the list/preview splitter is
-/// dragged, so neither pane can be crushed to zero width or dragged past the
-/// other (which would invert the layout).
+/// Minimum columns either pane keeps in a SPLIT [`PaneLayout`], so a narrow
+/// terminal can never crush one pane to zero width or push it past the other
+/// (which would invert the layout). The two single-pane layouts are not splits
+/// and do not consult it: there the hidden pane is meant to be gone.
 pub const MIN_PANE_WIDTH: u16 = 15;
 
-/// The list pane's share of the body width before the user has ever dragged
-/// the splitter — matches the historical `Constraint::Percentage(48)` split
-/// this feature replaces.
+/// The list pane's share of the body width in [`PaneLayout::Even`] — the 1:1
+/// layout the board starts in. 48 rather than 50 because it is the historical
+/// `Constraint::Percentage(48)` split, so the default board looks exactly as it
+/// always has.
 const DEFAULT_LIST_PERCENT: u32 = 48;
+
+/// The list pane's share of the body width in [`PaneLayout::PreviewWide`] — the
+/// 1:3 stop, where the preview takes three quarters of the body for reading a
+/// long transcript while the list keeps enough of a column to show which row is
+/// selected.
+const PREVIEW_WIDE_LIST_PERCENT: u32 = 25;
+
+/// The list pane's share of the body width in [`PaneLayout::ListWide`] — the 3:1
+/// stop, the mirror of [`PREVIEW_WIDE_LIST_PERCENT`], for reading long row labels
+/// with the transcript still in view.
+const LIST_WIDE_LIST_PERCENT: u32 = 75;
 
 /// The nudge shown when a content-search hit has NO occurrence inside the
 /// rendered preview, so the pane marks nothing the user can see.
@@ -1210,13 +1223,83 @@ pub fn build_rows(
     rows
 }
 
+/// How the board's body divides its width between the session list and the
+/// preview: FIVE stops on one ladder, read list:preview.
+///
+/// Declared in ladder order — preview-most first — so the variant order IS the
+/// order `Shift-←` / `Shift-→` walk ([`stepped`](Self::stepped)). The three SPLIT
+/// stops are stored as a share of the body in percent, never as a column count:
+/// [`resolve_list_width`] turns the share into columns on EVERY render, against
+/// that frame's width, so there is no stored width for a resize to leave stale.
+///
+/// It is the whole of the layout state. "Is the preview on screen?" is
+/// [`shows_preview`](Self::shows_preview), not a flag beside it, so the answer
+/// cannot disagree with the layout the view actually drew.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PaneLayout {
+    /// 0:1 — the preview takes the whole body and the list is not drawn.
+    PreviewOnly,
+    /// 1:3 — [`PREVIEW_WIDE_LIST_PERCENT`] of the body for the list.
+    PreviewWide,
+    /// 1:1 — [`DEFAULT_LIST_PERCENT`] for the list. Where the board starts.
+    #[default]
+    Even,
+    /// 3:1 — [`LIST_WIDE_LIST_PERCENT`] for the list.
+    ListWide,
+    /// 1:0 — the list takes the whole body and the preview is not drawn.
+    ListOnly,
+}
+
+impl PaneLayout {
+    /// The layout one stop further along the ladder: toward
+    /// [`ListOnly`](Self::ListOnly) when `toward_list` (`Shift-→`), toward
+    /// [`PreviewOnly`](Self::PreviewOnly) otherwise (`Shift-←`).
+    ///
+    /// SATURATES at both ends rather than wrapping: another press at an end does
+    /// nothing, so a held key cannot flip a full-width preview straight into a
+    /// full-width list. Written as an exhaustive match rather than as arithmetic
+    /// on the discriminant, so a sixth stop cannot be added without the compiler
+    /// asking where it goes. Pure.
+    #[must_use]
+    pub fn stepped(self, toward_list: bool) -> Self {
+        match (self, toward_list) {
+            (Self::PreviewOnly | Self::PreviewWide, false) => Self::PreviewOnly,
+            (Self::Even, false) => Self::PreviewWide,
+            (Self::ListWide, false) => Self::Even,
+            (Self::ListOnly, false) => Self::ListWide,
+            (Self::PreviewOnly, true) => Self::PreviewWide,
+            (Self::PreviewWide, true) => Self::Even,
+            (Self::Even, true) => Self::ListWide,
+            (Self::ListWide | Self::ListOnly, true) => Self::ListOnly,
+        }
+    }
+
+    /// Whether the preview pane is drawn at all — every stop but
+    /// [`ListOnly`](Self::ListOnly).
+    #[must_use]
+    pub fn shows_preview(self) -> bool {
+        self != Self::ListOnly
+    }
+
+    /// The list's share of the body in percent for the three SPLIT stops, and
+    /// `None` for the two that give one pane the whole body.
+    fn list_percent(self) -> Option<u32> {
+        match self {
+            Self::PreviewWide => Some(PREVIEW_WIDE_LIST_PERCENT),
+            Self::Even => Some(DEFAULT_LIST_PERCENT),
+            Self::ListWide => Some(LIST_WIDE_LIST_PERCENT),
+            Self::PreviewOnly | Self::ListOnly => None,
+        }
+    }
+}
+
 /// Clamp a requested list-pane width into `[MIN_PANE_WIDTH, body_width -
 /// MIN_PANE_WIDTH]`, so the preview pane always keeps at least
 /// `MIN_PANE_WIDTH` columns too. A `body_width` too narrow to fit both
 /// minimums degrades to an even half-split rather than inverting the panes or
-/// underflowing. Pure so a fresh drag ([`App::drag_split_to`]) and every
-/// render's re-clamp ([`resolve_list_width`], called from
-/// `tui::view::render_body`) share the exact same rule.
+/// underflowing. Pure, and applied to every SPLIT layout on every render
+/// ([`resolve_list_width`], called from `tui::view::render_body`), so a narrow
+/// terminal cannot squeeze either pane out of a 1:3 or 3:1 split.
 #[must_use]
 pub fn clamp_list_width(requested: u16, body_width: u16) -> u16 {
     if body_width < MIN_PANE_WIDTH * 2 {
@@ -1225,17 +1308,27 @@ pub fn clamp_list_width(requested: u16, body_width: u16) -> u16 {
     requested.clamp(MIN_PANE_WIDTH, body_width - MIN_PANE_WIDTH)
 }
 
-/// Resolve the list pane's width in columns for a body `body_width` columns
-/// wide: the persisted drag width when one exists (re-clamped against the
-/// CURRENT `body_width`, so a stale width from a wider terminal never
-/// survives a resize into a degenerate layout), or the historical 48% default
-/// when the user has never dragged the splitter. Called every render
-/// (`tui::view::render_body`) rather than trusting a stored value on its own.
+/// The list pane's width in columns under `layout`, for a body `body_width`
+/// columns wide.
+///
+/// Total over the five stops: [`PaneLayout::PreviewOnly`] gives the list NOTHING,
+/// [`PaneLayout::ListOnly`] gives it the whole body, and a split stop takes its
+/// percentage of THIS `body_width` through [`clamp_list_width`]. Resolved on every
+/// render (`tui::view::render_body`) from the layout alone — there is no stored
+/// column count to go stale when the terminal is resized. Pure.
 #[must_use]
-pub fn resolve_list_width(list_width: Option<u16>, body_width: u16) -> u16 {
-    let requested =
-        list_width.unwrap_or_else(|| (u32::from(body_width) * DEFAULT_LIST_PERCENT / 100) as u16);
-    clamp_list_width(requested, body_width)
+pub fn resolve_list_width(layout: PaneLayout, body_width: u16) -> u16 {
+    match layout.list_percent() {
+        Some(percent) => {
+            // `percent <= 100`, so the share never exceeds `body_width` and the
+            // conversion back cannot fail; saturating anyway rather than `as`.
+            let requested =
+                u16::try_from(u32::from(body_width) * percent / 100).unwrap_or(u16::MAX);
+            clamp_list_width(requested, body_width)
+        }
+        None if layout == PaneLayout::PreviewOnly => 0,
+        None => body_width,
+    }
 }
 
 /// How the board asks claude which sessions are LIVE right now.
@@ -1545,8 +1638,13 @@ pub struct App {
     ///
     /// [`store::preview::render`]: crate::store::preview::render
     pub agent_names: Vec<String>,
-    /// Whether the preview pane is visible.
-    pub show_preview: bool,
+    /// How the body divides its width between the list and the preview — see
+    /// [`PaneLayout`]. Private, and written ONLY by
+    /// [`set_pane_layout`](Self::set_pane_layout): every layout change (a
+    /// `Shift-←`/`Shift-→` step, compose bringing a hidden preview back) owes the
+    /// preview the same bookkeeping, and one writer is what makes that structural.
+    /// Read it through [`pane_layout`](Self::pane_layout).
+    pane_layout: PaneLayout,
     /// Vertical scroll offset (in WRAPPED rows) of the preview pane. Requested by
     /// the scroll keys and clamped to content bounds by `view::render_preview`,
     /// which writes the clamped value back (mirroring `scroll`/`ListState`).
@@ -1575,10 +1673,11 @@ pub struct App {
     /// flight — follows the tail by going THROUGH this flag, never by overriding it
     /// per frame (see `view::render_preview`). The complete set of transitions:
     ///
-    /// * ARMED at construction, on a real selection change, when the preview is
-    ///   toggled on, by `End` ([`preview_bottom`](Self::preview_bottom)), and when a
-    ///   send to the previewed row FINISHES (so the reply lands in view) — which
-    ///   `End` is how it is said, so that is one site, not two.
+    /// * ARMED at construction, on a real selection change, when a layout change
+    ///   brings the preview back from [`PaneLayout::ListOnly`], by `End`
+    ///   ([`preview_bottom`](Self::preview_bottom)), and when a send to the
+    ///   previewed row FINISHES (so the reply lands in view) — which `End` is how it
+    ///   is said, so that is one site, not two.
     /// * CLEARED by ANY explicit scroll ([`preview_scroll_by`](Self::preview_scroll_by),
     ///   [`preview_top`](Self::preview_top)), in either direction, and by a resolved
     ///   match jump, which is a position the reader asked for exactly as a scroll is.
@@ -1603,15 +1702,10 @@ pub struct App {
     /// (`Rect::default`) until the first render.
     pub list_rect: Rect,
     /// Last-rendered preview-pane rectangle (mouse hit-testing). Set to an EMPTY
-    /// rect when the preview is hidden so it never matches a hit-test.
+    /// rect when the preview is hidden ([`PaneLayout::ListOnly`]) so it never
+    /// matches a hit-test — as [`list_rect`](Self::list_rect) is under
+    /// [`PaneLayout::PreviewOnly`].
     pub preview_rect: Rect,
-    /// List pane width in columns, set the first time the user drags the
-    /// splitter between the list and preview panes. `None` until the first
-    /// drag: the view falls back to the historical 48% split
-    /// ([`resolve_list_width`]). Re-clamped against the CURRENT body width on
-    /// every render, so a stale width from a wider terminal never survives a
-    /// resize into a degenerate layout.
-    pub list_width: Option<u16>,
     /// Transient board status (e.g. a resume refusal for a deleted worktree).
     /// Rendered on the help line and cleared on the next actionable keypress, OR
     /// when its sibling `status_ttl` counts down to zero.
@@ -1848,10 +1942,6 @@ pub struct App {
     /// override seen) keeps a reply naming its session's model until the read
     /// lands, which is what claude normally does when no override is set.
     restore_overridden: bool,
-    /// Whether the list/preview splitter is currently being dragged (mouse
-    /// button down on the seam). Private: only the drag methods below need
-    /// it, mirroring `scoped`/`preview_cache`/`index`.
-    dragging_split: bool,
     /// Indices (into `sessions`) that pass the scope predicate, cached so a
     /// per-keystroke query re-filter never re-canonicalizes paths.
     scoped: Vec<usize>,
@@ -2046,6 +2136,31 @@ pub struct App {
     /// a boundary rather than as a set member (see
     /// [`step_match_line`] and [`preview_match_target`](Self::preview_match_target)).
     preview_match_line: Option<usize>,
+    /// A pending request to put this logical transcript line back at the TOP of the
+    /// preview, set by a layout step and ACTED ON by the next `view::render_preview`
+    /// — the same pending-request shape as
+    /// [`preview_match_jump`](Self::preview_match_jump), and for the same reason:
+    /// the keypress knows WHICH line the reader was looking at, but only the render
+    /// knows the pane's NEW width, and so where that line now starts.
+    ///
+    /// Needed because [`preview_scroll`](Self::preview_scroll) counts WRAPPED rows,
+    /// and a row count is a function of the width: carried unchanged across a
+    /// narrower or wider pane it points into a different part of the transcript.
+    /// The line index is the width-free half, so it is what survives the step.
+    ///
+    /// Written only by [`set_pane_layout`](Self::set_pane_layout), and only for a
+    /// pane the READER positioned: a pane following the newest turn keeps
+    /// following it at any width, which already is its reading position. Consumed
+    /// by the next frame whether or not it can act on it
+    /// ([`take_preview_anchor`](Self::take_preview_anchor)).
+    ///
+    /// Line-granular by design: a top row inside a long wrapped line comes back as
+    /// that line's FIRST row. And exact only while the line INDICES agree across
+    /// the two widths, which holds for everything but a GFM table above the anchor
+    /// — the one construct `store::preview` lays out differently per width, so a
+    /// table that re-flows between grid and records shifts the anchor by the lines
+    /// it gained or lost.
+    preview_anchor_line: Option<usize>,
     /// How many times the preview match map has been recomputed. Test-only
     /// instrumentation, mirroring [`SearchIndex`]'s own rebuild counter: "the
     /// cached query key is unchanged" is only a claim about the KEY, whereas the
@@ -2109,13 +2224,12 @@ impl App {
             all_scope_enabled: false,
             launch_dir,
             agent_names,
-            show_preview: true,
+            pane_layout: PaneLayout::default(),
             preview_scroll: 0,
             preview_follow_bottom: true,
             preview_viewport_h: 0,
             list_rect: Rect::default(),
             preview_rect: Rect::default(),
-            list_width: None,
             status: None,
             status_ttl: None,
             tick: 0,
@@ -2147,7 +2261,6 @@ impl App {
             // seed either: a model pick lives on each compose, never on the board.
             settings_model: None,
             restore_overridden: false,
-            dragging_split: false,
             scoped: Vec::new(),
             population: Vec::new(),
             expanded: HashSet::new(),
@@ -2167,6 +2280,7 @@ impl App {
             preview_match_notice: None,
             preview_match_jump: false,
             preview_match_line: None,
+            preview_anchor_line: None,
             #[cfg(test)]
             preview_match_rebuilds: 0,
             index,
@@ -2598,14 +2712,95 @@ impl App {
         }
     }
 
-    /// Toggle the preview pane visibility. Showing it (re)anchors to the newest
-    /// turn so it opens at the bottom, matching a fresh selection.
-    pub fn toggle_preview(&mut self) {
-        self.show_preview = !self.show_preview;
-        if self.show_preview {
+    // --- pane layout -----------------------------------------------------------
+
+    /// How the body is divided right now — see [`PaneLayout`].
+    #[must_use]
+    pub fn pane_layout(&self) -> PaneLayout {
+        self.pane_layout
+    }
+
+    /// Step the layout one stop along the ladder (`Shift-→` toward the list when
+    /// `toward_list`, `Shift-←` toward the preview otherwise). A press at either
+    /// end changes nothing, because [`PaneLayout::stepped`] saturates there.
+    pub fn step_pane_layout(&mut self, toward_list: bool) {
+        self.set_pane_layout(self.pane_layout.stepped(toward_list));
+    }
+
+    /// The ONE writer of [`pane_layout`](Self::pane_layout), so every route into a
+    /// new layout — a `Shift`-arrow step, [`open_compose`](Self::open_compose)
+    /// bringing a hidden preview back — leaves the preview in the same state. What
+    /// a change owes the preview depends only on whether the pane was on screen
+    /// before and after it:
+    ///
+    /// * **Coming back from [`PaneLayout::ListOnly`]** re-anchors to the NEWEST
+    ///   turn, exactly as a fresh selection opens. The pane was not on screen, so
+    ///   there is no reading position to keep, and nothing remembers the one from
+    ///   before it was hidden.
+    /// * **On screen both before and after** — a width change — keeps the reader's
+    ///   place: the top visible line is noted now and put back at the top by the
+    ///   next render, at the new width ([`preview_anchor_line`](Self::preview_anchor_line)).
+    /// * **Going to [`PaneLayout::ListOnly`]** owes the preview nothing; the frame
+    ///   that no longer draws it drops anything pending (`view::render_body`).
+    ///
+    /// Setting the layout it already has is a no-op, which is how a press past
+    /// either end of the ladder stays one.
+    pub fn set_pane_layout(&mut self, next: PaneLayout) {
+        let previous = self.pane_layout;
+        if previous == next {
+            return;
+        }
+        self.pane_layout = next;
+        if !previous.shows_preview() {
+            self.preview_anchor_line = None;
             self.preview_follow_bottom = true;
             self.preview_scroll = 0;
+        } else if next.shows_preview() {
+            self.note_preview_anchor();
         }
+    }
+
+    /// Note the logical line at the top of the preview, for the next render to put
+    /// back there at the pane's new width — or clear the note when there is no
+    /// position of the READER's to keep.
+    ///
+    /// Read off the width-scoped cache the last frame was DRAWN from: `preview_width`
+    /// is that frame's width and `preview_scroll` its resolved offset, so the one
+    /// question left is which line holds that row, and `view::line_at_row` is the
+    /// one place that question is answered — the same binary search the windowed
+    /// draw starts its window with, so the noted line IS the one that was painted
+    /// at the top. An offset scrolled into an in-flight reply's echo turns, past the
+    /// transcript, answers one past its last line, whose start row is where the
+    /// echo begins — so that position survives too.
+    ///
+    /// Nothing is noted for a pane that follows the newest turn (it stays pinned
+    /// there at any width) or before the pane has ever been drawn (there is no
+    /// position yet).
+    fn note_preview_anchor(&mut self) {
+        self.preview_anchor_line = None;
+        if self.preview_follow_bottom {
+            return;
+        }
+        let Some(entry) = self
+            .selected
+            .as_ref()
+            .and_then(|id| self.preview_cache.get(id))
+        else {
+            return;
+        };
+        let top_row = usize::try_from(self.preview_scroll).unwrap_or(usize::MAX);
+        self.preview_anchor_line = Some(view::line_at_row(&entry.row_prefix, top_row));
+    }
+
+    /// Consume the pending reading-position anchor: `Some` at most once per layout
+    /// step.
+    ///
+    /// Taken by EVERY frame, acted on or not — the rule
+    /// [`take_preview_match_jump`](Self::take_preview_match_jump) states for its own
+    /// one-shot, and for the same reason: a request describes the pane at the moment
+    /// of a keypress, and the board draws before it reads the next key.
+    pub fn take_preview_anchor(&mut self) -> Option<usize> {
+        self.preview_anchor_line.take()
     }
 
     // --- preview scroll ----------------------------------------------------
@@ -2700,10 +2895,10 @@ impl App {
     /// nothing is selected, the transcript has no match left — so a request is
     /// DROPPED rather than deferred onto an unrelated later frame. Every path out of
     /// `view::render_preview` therefore takes it, and the frame that skips that
-    /// function entirely (`Ctrl-/` hid the pane) takes it in `view::render_body`
-    /// instead: a request describes the pane at the moment of a keypress, and the
-    /// board draws before it reads the next key, so a frame that cannot act on one
-    /// is the end of it.
+    /// function entirely (the 1:0 [`PaneLayout::ListOnly`] layout hid the pane)
+    /// takes it in `view::render_body` instead: a request describes the pane at the
+    /// moment of a keypress, and the board draws before it reads the next key, so a
+    /// frame that cannot act on one is the end of it.
     pub fn take_preview_match_jump(&mut self) -> bool {
         std::mem::take(&mut self.preview_match_jump)
     }
@@ -2716,9 +2911,10 @@ impl App {
     /// time a keypress arrives. Two things it must refuse, because the cache
     /// outlives both and a stale `true` here binds a key to nothing the user can
     /// see: a map whose `matches_query` has moved on, and a pane that is not being
-    /// drawn at all (`Ctrl-/` hides it without clearing the cache).
+    /// drawn at all (the 1:0 [`PaneLayout::ListOnly`] layout hides it without
+    /// clearing the cache).
     fn current_preview_matches(&self) -> Option<&HashMap<usize, HashSet<usize>>> {
-        if !self.show_preview {
+        if !self.pane_layout.shows_preview() {
             return None;
         }
         let entry = self.preview_cache.get(self.selected.as_ref()?)?;
@@ -2791,43 +2987,6 @@ impl App {
             PREVIEW_WHEEL_STEP
         };
         self.preview_scroll_by(step);
-    }
-
-    // --- splitter drag -------------------------------------------------------
-
-    /// Begin dragging the list/preview splitter (mouse-down on the seam). A
-    /// no-op while ANY modal overlay owns input (the running-session choice or
-    /// the new-session agent picker), so a stray click during an overlay can
-    /// never start a drag that a later `Drag` event would then apply once the
-    /// overlay closes.
-    pub fn begin_split_drag(&mut self) {
-        if !self.overlay_active() {
-            self.dragging_split = true;
-        }
-    }
-
-    /// Whether the splitter is currently being dragged — gates `Drag` event
-    /// routing in `tui::update::handle_mouse`.
-    #[must_use]
-    pub fn is_dragging_split(&self) -> bool {
-        self.dragging_split
-    }
-
-    /// Recompute and persist the list pane's width from an absolute mouse
-    /// column and the current body width, via [`clamp_list_width`] so neither
-    /// pane is crushed below [`MIN_PANE_WIDTH`] or inverted. Safe to call at
-    /// any time — even a degenerate `body_width` (e.g. before the first
-    /// render, or the preview hidden) yields a well-formed width, which is
-    /// re-clamped again on the next render regardless.
-    pub fn drag_split_to(&mut self, col: u16, body_width: u16) {
-        self.list_width = Some(clamp_list_width(col, body_width));
-    }
-
-    /// End a splitter drag (mouse-up). Defensive: clears the flag even if no
-    /// [`begin_split_drag`](Self::begin_split_drag) preceded it, so a stray
-    /// `Up` can never wedge the drag state.
-    pub fn end_split_drag(&mut self) {
-        self.dragging_split = false;
     }
 
     // --- transient status --------------------------------------------------
@@ -3180,16 +3339,15 @@ impl App {
     // --- new-session agent picker -----------------------------------------
 
     /// Whether an overlay currently owns the board. The SINGLE gate predicate
-    /// callers use (never `self.modal.is_some()` inline) to keep mouse actions
-    /// (splitter drag / fold toggle / link open) from firing while an overlay is
-    /// up — so a later gate extension lives in exactly one place.
+    /// callers use (never `self.modal.is_some()` inline) to keep the mouse's two
+    /// actions — toggling a fold node and opening a preview link — from firing
+    /// while an overlay is up, so a later gate extension lives in exactly one place.
     ///
     /// True while a [`Modal`] is open, the quick-reply compose zone, the
     /// stop-then-reply confirmation, or the interrupt confirmation owns the
     /// keyboard, OR a `Ctrl-X` leader chord is [pending](Self::pending_chord): each
     /// takes the keyboard, so each must equally gate the mouse (a stray click
-    /// mid-chord must not start a drag, toggle a fold, or open a link), per
-    /// PATTERNS §10.
+    /// mid-chord must not toggle a fold or open a link), per PATTERNS §10.
     ///
     /// A [`draft`](Self::draft) counts for a related reason: it owns the PANE
     /// rather than the keyboard. While its card is drawn the transcript is not, so
@@ -3256,15 +3414,20 @@ impl App {
     ///
     /// The ONE writer that installs either, so "a background draft always has a
     /// card and a reply never does" is structural rather than a convention each
-    /// call site has to remember. Composing FORCE-SHOWS the preview, since both the
-    /// card and the docked editor live in that pane (the renderer falls back to a
-    /// full-width bottom bar when the pane is too short).
+    /// call site has to remember. Composing BRINGS BACK a hidden preview, since both
+    /// the card and the docked editor live in that pane (the renderer falls back to
+    /// a full-width bottom bar when the pane is too short): a 1:0
+    /// [`PaneLayout::ListOnly`] board opens at the 1:1 [`PaneLayout::Even`], through
+    /// the one layout setter like any other change. Every other layout already
+    /// shows the pane and is left exactly as the user set it.
     pub fn open_compose(
         &mut self,
         state: super::compose::ComposeState,
         draft: Option<NewSessionDraft>,
     ) {
-        self.show_preview = true;
+        if !self.pane_layout.shows_preview() {
+            self.set_pane_layout(PaneLayout::Even);
+        }
         self.compose = Some(state);
         self.draft = draft;
     }
@@ -4151,7 +4314,8 @@ impl App {
     /// [`preview_matches`](Self::preview_matches) (the marks on them),
     /// [`preview_wrapped_rows`](Self::preview_wrapped_rows) (the height),
     /// [`preview_line_count`](Self::preview_line_count) (is there a transcript at
-    /// all), [`preview_rows_above`](Self::preview_rows_above) (the match jump),
+    /// all), [`preview_rows_above`](Self::preview_rows_above) (the match jump and
+    /// the layout step's reading-position anchor),
     /// [`preview_hit_context`](Self::preview_hit_context) (the click hit-test),
     /// [`note_match_outside_preview`](Self::note_match_outside_preview) (whether the
     /// query occurs in the pane), and the test-only
@@ -4354,7 +4518,7 @@ impl App {
     fn note_match_outside_preview(&mut self) {
         if self.query_input.is_empty()
             || self.search_mode != SearchMode::NameAndContent
-            || !self.show_preview
+            || !self.pane_layout.shows_preview()
         {
             return;
         }
@@ -5309,19 +5473,161 @@ mod tests {
         assert_eq!(app.preview_scroll, 4);
     }
 
+    /// Bringing the preview back from 1:0 opens it on the newest turn, as a fresh
+    /// selection does — the job the retired preview toggle's "show" half did. The
+    /// pane was not on screen, so there is no reading position to keep, and
+    /// nothing remembers the one from before it was hidden.
     #[test]
-    fn toggling_the_preview_on_reanchors_to_the_bottom() {
+    fn leaving_list_only_reanchors_the_preview_to_the_bottom() {
         let mut app = app_all(vec![session("a", "r1", Some("main"), "/tmp/a")]);
+        app.set_pane_layout(PaneLayout::ListOnly);
         app.preview_follow_bottom = false;
         app.preview_scroll = 9;
-        app.toggle_preview(); // hide
-        app.toggle_preview(); // show again
-        assert!(app.show_preview);
+        app.step_pane_layout(false);
+        assert_eq!(
+            app.pane_layout(),
+            PaneLayout::ListWide,
+            "one step toward the preview from 1:0 is 3:1"
+        );
         assert!(
             app.preview_follow_bottom,
             "re-showing the preview re-anchors it to the newest turn"
         );
         assert_eq!(app.preview_scroll, 0);
+        assert_eq!(
+            app.take_preview_anchor(),
+            None,
+            "a pane coming back from hidden has no reading position to restore"
+        );
+    }
+
+    /// A step between two layouts that BOTH show the preview is a width change,
+    /// and it must not touch the bottom anchor: a pane following the newest turn
+    /// keeps following it (that IS its reading position at any width), so there is
+    /// no line to note either. And a pane the reader positioned is not re-anchored.
+    #[test]
+    fn a_layout_step_between_visible_layouts_never_re_anchors_the_preview() {
+        let mut app = app_all(vec![session("a", "r1", Some("main"), "/tmp/a")]);
+        assert!(app.preview_follow_bottom, "premise: a fresh board follows");
+        app.step_pane_layout(false);
+        assert!(
+            app.preview_follow_bottom,
+            "a following pane keeps following"
+        );
+        assert_eq!(
+            app.take_preview_anchor(),
+            None,
+            "and notes nothing to restore"
+        );
+
+        app.preview_follow_bottom = false;
+        app.preview_scroll = 9;
+        app.step_pane_layout(true);
+        assert!(
+            !app.preview_follow_bottom,
+            "a positioned pane stays the reader's"
+        );
+        assert_eq!(app.preview_scroll, 9, "the keypress itself moves nothing");
+    }
+
+    /// Every stop on the ladder, in both directions, plus the saturation at each
+    /// end. Walked as a SEQUENCE from the start (`Even`) rather than asserted pair
+    /// by pair, because the property a user feels is the walk: four presses one way
+    /// reach the end and a fifth changes nothing.
+    #[test]
+    fn pane_layout_steps_through_all_five_stops_and_stops_at_both_ends() {
+        assert_eq!(
+            PaneLayout::default(),
+            PaneLayout::Even,
+            "the board starts 1:1"
+        );
+
+        let mut layout = PaneLayout::default();
+        let mut toward_preview = Vec::new();
+        for _ in 0..3 {
+            layout = layout.stepped(false);
+            toward_preview.push(layout);
+        }
+        assert_eq!(
+            toward_preview,
+            [
+                PaneLayout::PreviewWide,
+                PaneLayout::PreviewOnly,
+                PaneLayout::PreviewOnly
+            ],
+            "Shift-← walks 1:1 → 1:3 → 0:1 and then stays"
+        );
+
+        let mut toward_list = Vec::new();
+        for _ in 0..5 {
+            layout = layout.stepped(true);
+            toward_list.push(layout);
+        }
+        assert_eq!(
+            toward_list,
+            [
+                PaneLayout::PreviewWide,
+                PaneLayout::Even,
+                PaneLayout::ListWide,
+                PaneLayout::ListOnly,
+                PaneLayout::ListOnly
+            ],
+            "Shift-→ walks 0:1 → 1:3 → 1:1 → 3:1 → 1:0 and then stays"
+        );
+        assert_eq!(
+            PaneLayout::ListOnly.stepped(false),
+            PaneLayout::ListWide,
+            "and steps back off the list end"
+        );
+    }
+
+    /// Only 1:0 hides the preview; every other stop draws it.
+    #[test]
+    fn only_list_only_hides_the_preview() {
+        for layout in [
+            PaneLayout::PreviewOnly,
+            PaneLayout::PreviewWide,
+            PaneLayout::Even,
+            PaneLayout::ListWide,
+        ] {
+            assert!(layout.shows_preview(), "{layout:?} draws the preview");
+        }
+        assert!(!PaneLayout::ListOnly.shows_preview());
+    }
+
+    /// Opening compose from 1:0 lands on 1:1 — the pane the editor docks in has
+    /// to be on screen — and from any other stop leaves the user's layout alone.
+    #[test]
+    fn open_compose_brings_a_hidden_preview_back_at_even_and_keeps_any_other_layout() {
+        use super::super::compose::ComposeState;
+
+        let mut app = app_all(vec![session("a", "r1", Some("main"), "/tmp/a")]);
+        app.set_pane_layout(PaneLayout::ListOnly);
+        // A position the reader left behind, so the re-anchor below is observable.
+        app.preview_follow_bottom = false;
+        app.preview_scroll = 7;
+        app.open_compose(ComposeState::new_reply("a".to_string(), None), None);
+        assert_eq!(app.pane_layout(), PaneLayout::Even);
+        assert!(
+            app.preview_follow_bottom,
+            "it comes back on the newest turn, through the one setter"
+        );
+        assert_eq!(app.preview_scroll, 0);
+
+        for layout in [
+            PaneLayout::PreviewOnly,
+            PaneLayout::PreviewWide,
+            PaneLayout::ListWide,
+        ] {
+            let mut app = app_all(vec![session("a", "r1", Some("main"), "/tmp/a")]);
+            app.set_pane_layout(layout);
+            app.open_compose(ComposeState::new_reply("a".to_string(), None), None);
+            assert_eq!(
+                app.pane_layout(),
+                layout,
+                "{layout:?} already shows the pane"
+            );
+        }
     }
 
     #[test]
@@ -6505,17 +6811,18 @@ mod tests {
         app.preview_text(60);
         assert!(app.has_preview_matches(), "the query is in this transcript");
 
-        // Hiding the pane leaves the cache intact — the gate must not.
-        app.toggle_preview();
-        assert!(!app.show_preview);
+        // Hiding the pane (the 1:0 layout) leaves the cache intact — the gate must
+        // not.
+        app.set_pane_layout(PaneLayout::ListOnly);
+        assert!(!app.pane_layout().shows_preview());
         assert!(
             !app.has_preview_matches(),
             "a hidden pane has nothing to navigate, however warm the cache is"
         );
-        app.toggle_preview();
+        app.set_pane_layout(PaneLayout::PreviewOnly);
         assert!(
             app.has_preview_matches(),
-            "and showing it again restores the key"
+            "and showing it again — even full-width, with no list — restores the key"
         );
 
         // Move the query WITHOUT re-rendering: the cached map still describes the
@@ -6541,13 +6848,13 @@ mod tests {
         );
     }
 
-    // --- splitter drag: clamp math + state machine -------------------------
+    // --- pane layout: width math -------------------------------------------
 
     #[test]
     fn clamp_list_width_clamps_to_the_minimum_on_both_sides() {
-        // Dragging far left clamps to MIN_PANE_WIDTH.
+        // A request below the floor clamps to MIN_PANE_WIDTH.
         assert_eq!(clamp_list_width(0, 100), MIN_PANE_WIDTH);
-        // Dragging far right leaves the preview MIN_PANE_WIDTH columns.
+        // A request past the other floor leaves the preview MIN_PANE_WIDTH columns.
         assert_eq!(clamp_list_width(1000, 100), 100 - MIN_PANE_WIDTH);
         // A mid-range request passes through untouched.
         assert_eq!(clamp_list_width(40, 100), 40);
@@ -6563,62 +6870,47 @@ mod tests {
         assert!(width <= body, "must never exceed the body width");
     }
 
+    /// Each stop's share of a 100-column body, so every percentage reads straight
+    /// off the result: the three splits at their named shares, and the two
+    /// single-pane stops giving the list nothing or everything.
     #[test]
-    fn resolve_list_width_defaults_to_48_percent_until_a_drag_sets_one() {
-        assert_eq!(resolve_list_width(None, 100), 48);
-        // A stale drag width from a WIDER terminal re-clamps to the current,
-        // narrower body rather than overflowing it.
-        assert_eq!(resolve_list_width(Some(90), 40), 40 - MIN_PANE_WIDTH);
-        // A drag width that already fits passes through untouched.
-        assert_eq!(resolve_list_width(Some(30), 100), 30);
+    fn resolve_list_width_maps_each_layout_to_its_share_of_the_body() {
+        assert_eq!(resolve_list_width(PaneLayout::PreviewOnly, 100), 0);
+        assert_eq!(resolve_list_width(PaneLayout::PreviewWide, 100), 25);
+        assert_eq!(resolve_list_width(PaneLayout::Even, 100), 48);
+        assert_eq!(resolve_list_width(PaneLayout::ListWide, 100), 75);
+        assert_eq!(resolve_list_width(PaneLayout::ListOnly, 100), 100);
     }
 
+    /// A split stop still protects a NARROW terminal: its share is clamped so
+    /// neither pane drops below MIN_PANE_WIDTH, and a body too narrow for both
+    /// floors degrades to a half split rather than inverting. The single-pane
+    /// stops are not splits, so the floor does not apply to them.
     #[test]
-    fn begin_split_drag_is_a_no_op_while_the_live_choice_overlay_is_open() {
-        let mut app = app_all(vec![session("a", "r1", Some("main"), "/tmp/a")]);
-        app.open_live_choice("a".to_string());
-        app.begin_split_drag();
-        assert!(
-            !app.is_dragging_split(),
-            "a stray click during the overlay must not start a drag"
+    fn resolve_list_width_clamps_a_split_on_a_narrow_body() {
+        // 25% of 40 is 10, under the floor; 75% of 40 is 30, past the other one.
+        assert_eq!(
+            resolve_list_width(PaneLayout::PreviewWide, 40),
+            MIN_PANE_WIDTH
         );
-    }
-
-    #[test]
-    fn begin_split_drag_starts_dragging_when_no_overlay_is_open() {
-        let mut app = app_all(vec![session("a", "r1", Some("main"), "/tmp/a")]);
-        assert!(!app.is_dragging_split());
-        app.begin_split_drag();
-        assert!(app.is_dragging_split());
-    }
-
-    #[test]
-    fn drag_split_to_never_inverts_or_panics_on_a_narrow_body() {
-        let mut app = app_all(vec![session("a", "r1", Some("main"), "/tmp/a")]);
-        // Dragging far left/right on a normal body clamps to the minimums.
-        app.drag_split_to(0, 100);
-        assert_eq!(app.list_width, Some(MIN_PANE_WIDTH));
-        app.drag_split_to(u16::MAX, 100);
-        assert_eq!(app.list_width, Some(100 - MIN_PANE_WIDTH));
-        // A degenerate (very narrow) body must never panic or invert.
-        app.drag_split_to(5, 3);
-        assert_eq!(app.list_width, Some(1));
-        // A zero-width body (e.g. before the first render) is also safe.
-        app.drag_split_to(5, 0);
-        assert_eq!(app.list_width, Some(0));
-    }
-
-    #[test]
-    fn end_split_drag_clears_the_flag_even_without_a_preceding_begin() {
-        let mut app = app_all(vec![session("a", "r1", Some("main"), "/tmp/a")]);
-        assert!(!app.is_dragging_split());
-        app.end_split_drag(); // defensive: no panic, stays cleared
-        assert!(!app.is_dragging_split());
-
-        app.begin_split_drag();
-        assert!(app.is_dragging_split());
-        app.end_split_drag();
-        assert!(!app.is_dragging_split());
+        assert_eq!(
+            resolve_list_width(PaneLayout::ListWide, 40),
+            40 - MIN_PANE_WIDTH
+        );
+        // Too narrow for both floors: half, never an underflow.
+        assert_eq!(resolve_list_width(PaneLayout::Even, 10), 5);
+        assert_eq!(resolve_list_width(PaneLayout::PreviewOnly, 10), 0);
+        assert_eq!(resolve_list_width(PaneLayout::ListOnly, 10), 10);
+        // A zero-width body (before the first render) is safe on every stop.
+        for layout in [
+            PaneLayout::PreviewOnly,
+            PaneLayout::PreviewWide,
+            PaneLayout::Even,
+            PaneLayout::ListWide,
+            PaneLayout::ListOnly,
+        ] {
+            assert_eq!(resolve_list_width(layout, 0), 0, "{layout:?}");
+        }
     }
 
     #[test]
@@ -9499,11 +9791,6 @@ mod tests {
             app.overlay_active(),
             "the card still owns the pane, so the mouse must stay gated"
         );
-        app.begin_split_drag();
-        assert!(
-            !app.is_dragging_split(),
-            "a stray click over the card must not start a splitter drag"
-        );
 
         app.close_compose();
         assert!(
@@ -9614,15 +9901,10 @@ mod tests {
     }
 
     #[test]
-    fn agent_picker_counts_as_an_active_overlay_and_blocks_split_drag() {
+    fn agent_picker_counts_as_an_active_overlay() {
         let mut app = app_all(vec![session("s", "r", Some("main"), "/tmp/s")]);
         app.open_agent_picker(vec![def_agent("alpha")]);
         assert!(app.overlay_active(), "an open picker is an active overlay");
-        app.begin_split_drag();
-        assert!(
-            !app.is_dragging_split(),
-            "a stray click during the picker must not start a splitter drag"
-        );
     }
 
     // --- status dwell --------------------------------------------------------

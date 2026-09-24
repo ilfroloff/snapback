@@ -38,7 +38,11 @@ OPTIONS:
 KEYS:
     ↑/↓           move          Enter        resume (returns to the board on exit)
     ←/→           fold / expand a fork lineage (a row marked (+N) stands for more)
-    Ctrl-F        fork          Ctrl-/       toggle preview
+    Shift+←/→     step the list:preview layout one stop — 0:1 · 1:3 · 1:1 · 3:1 ·
+                  1:0 (starts at 1:1; Shift+← toward a full-width preview, Shift+→
+                  toward a full-width list; a press at either end does nothing).
+                  Always bound, query or not; the preview keeps your place
+    Ctrl-F        fork
     Ctrl-A        flip scope: current folder ↔ project (the repo you launched in
                   and all of its git worktrees). Launched with -a it is a
                   three-stop cycle instead: current folder → project → all

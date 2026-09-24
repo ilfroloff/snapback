@@ -42,7 +42,7 @@
 //! | `Ctrl-X` then `x`/`d`/`h`/`r`/`y` | leader chord: hide / hard-delete (this row, or its whole fork lineage) / toggle show-hidden / re-read every transcript from disk / copy session ID (the selected session's full id, to the clipboard; the id also shows on the status line) (any other key cancels) |
 //! | `Ctrl-L` (in a compose box) | pick the model — and optionally the effort — for THIS compose only: the `Ctrl-R` reply or the `Ctrl-N` draft it is pressed in (see [`compose::compose_key_to_action`]). The box's `model:` label names what it runs on: a reply's default is `session (<model>)`, the model its session last answered with, which claude normally restores by itself (`default` when an `ANTHROPIC_MODEL` / `ANTHROPIC_DEFAULT_*_MODEL` override, or a transcript with no answering model, means it would not); a draft's is `default (<value>) (new sessions only)` from the user's `claude` settings. `--model` / `--effort` are sent ONLY for a pick other than that default — on the reply, the draft's background launch and the draft's `Ctrl-O` run. The picker's first row returns to the default, `Enter` sets the highlighted row into the compose, `Esc` returns with the text and the previous pick intact. Every new compose starts at its default; nothing is remembered. `Enter`, `Ctrl-F` and Attach never send a model |
 //! | `Left` / `Right` (in the model picker) | step the highlighted MODEL row's `--effort` down / up through unset → `low` → `medium` → `high` → `xhigh` → `max`, wrapping both ways; `Enter` then sets the model and the effort together into the compose. Inert on the picker's default row (no model, so no effort) and on every other list modal, so the agent picker keeps ignoring them; they never reach the board's fold / expand underneath |
-//! | `Ctrl-/` | toggle the preview pane |
+//! | `Shift-Left` / `Shift-Right` | step the pane layout one stop toward a full-width preview / a full-width list, along `0:1 · 1:3 · 1:1 · 3:1 · 1:0` (list:preview; the board starts at `1:1`). A press at either end does nothing. Always — with or without a query, and whatever is marked. The step keeps the reader's place in the preview; leaving `1:0` opens it on the newest turn (see [`App::set_pane_layout`]) |
 //! | `PgUp` / `PgDn` | scroll the preview a page (always) |
 //! | `Ctrl-U` / `Ctrl-D` | scroll the preview a quarter page (always) |
 //! | `Ctrl-T` / `Ctrl-E`, `Home` / `End` | jump the preview to top / bottom (always) |
@@ -56,10 +56,15 @@
 //! No bare printable character is a command: every one of them types into the
 //! query, so no search term can navigate or quit on its way in. Arrows, `Enter`,
 //! `Tab`, and every `Ctrl-` binding work regardless of the query, so search is
-//! never blocked either. The SHIFTED arrows are the one conditional binding,
+//! never blocked either. `Shift-Up` / `Shift-Down` are the one conditional binding,
 //! disambiguated by whether there is anything marked to move between — and they
 //! fall through to the unshifted binding when there is not, so a terminal that
-//! drops the modifier still moves the selection.
+//! drops the modifier still moves the selection. `Shift-Left` / `Shift-Right` are
+//! NOT conditional: they step the layout whatever the query or the marks, and their
+//! arms sit above the plain `Left` / `Right` ones because the first matching arm
+//! wins. A terminal that drops THAT modifier delivers a plain `Left` / `Right`,
+//! which folds or expands a lineage instead — a working key, just not the one
+//! pressed.
 //!
 //! ## Terminal paste
 //!
@@ -146,8 +151,10 @@ pub enum Action {
     /// see [`super::app::Scope::toggled`] for the cycle itself and for why the
     /// widest state is off the key by default.
     ToggleScope,
-    /// Toggle the preview pane.
-    TogglePreview,
+    /// Step the pane layout one stop toward the full-width preview (`Shift-Left`).
+    LayoutTowardPreview,
+    /// Step the pane layout one stop toward the full-width list (`Shift-Right`).
+    LayoutTowardList,
     /// Scroll the preview up one page (`PgUp`).
     PreviewPageUp,
     /// Scroll the preview down one page (`PgDn`).
@@ -315,6 +322,9 @@ impl Outcome {
 /// on a terminal that drops the modifier (or a multiplexer that eats the `CSI
 /// 1;2A` form), the key arrives as a bare arrow and still moves the selection,
 /// which is the graceful degradation rather than a dead key.
+///
+/// The SHIFTED HORIZONTAL arrows take neither condition: stepping the pane layout
+/// means the same thing with or without a query, marks or no marks.
 #[must_use]
 pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool) -> Action {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -324,9 +334,6 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool
     if ctrl {
         return match key.code {
             KeyCode::Char('f') | KeyCode::Char('F') => Action::Resume { fork: true },
-            // Ctrl-/ toggles the preview. Terminals that map Ctrl-/ to the
-            // control code 0x1f surface it as Char('_'); accept both.
-            KeyCode::Char('/') | KeyCode::Char('_') => Action::TogglePreview,
             KeyCode::Char('a') | KeyCode::Char('A') => Action::ToggleScope,
             KeyCode::Char('n') | KeyCode::Char('N') => Action::NewSession,
             KeyCode::Char('r') | KeyCode::Char('R') => Action::Reply,
@@ -372,6 +379,18 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool
         KeyCode::Down if shift && !query_empty && has_preview_matches => Action::PreviewMatchNext,
         KeyCode::Up => Action::MoveUp,
         KeyCode::Down => Action::MoveDown,
+        // Pane layout, on the SHIFTED horizontal arrows: one stop along the
+        // 0:1 · 1:3 · 1:1 · 3:1 · 1:0 ladder per press (`PaneLayout::stepped`),
+        // `←` toward the preview and `→` toward the list. Unconditional — the
+        // layout means the same thing with or without a query — and on `Shift` for
+        // the same reason the match step is: it rides the ordinary `CSI 1;2D`/`C`
+        // encoding, where `Alt` would reach a default macOS terminal as a composed
+        // character or a split `Esc`. These arms MUST sit above the plain `Left` /
+        // `Right` ones below: match arms are tried in order and the unguarded arm
+        // matches the shifted key too, so the other order would fold a lineage and
+        // never step the layout.
+        KeyCode::Left if shift => Action::LayoutTowardPreview,
+        KeyCode::Right if shift => Action::LayoutTowardList,
         // Fork-lineage fold toggle, on the canonical tree idiom. Bound OUTSIDE
         // the `ctrl` block above on purpose: that namespace is already crowded,
         // and these keys are not printable, so — like the arrows and the preview
@@ -417,18 +436,17 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool
 ///
 /// * `Input(Key)` (a press/repeat) -> decode + apply an [`Action`].
 /// * `Input(Mouse)` -> a wheel notch scrolls the pane under the pointer, a
-///   left-button press/drag/release on the list/preview seam resizes the split,
-///   a left-click on a fold node's header — a peer message or injected
+///   left-click on a fold node's header — a peer message or injected
 ///   context — toggles that node open or closed, and a left-click on a
 ///   rendered preview link is resolved by
 ///   [`handle_mouse`]: a hit on an `http`/`https` url opens it in the default
 ///   browser and reports `opening <url>` transiently, a hit on any other scheme
 ///   opens NOTHING and reports a sticky refusal naming the url, a line too big to
 ///   hit-test reports a sticky [`LinkClick::Unresolvable`] message, and a miss
-///   writes nothing (the mapping lives in [`note_link_click`]); all are independent
-///   of the overlay gate (a click cannot start an orphaned drag, toggle a node, or
-///   open a link while the overlay is open — see [`App::begin_split_drag`] and the
-///   `App::overlay_active` gate).
+///   writes nothing (the mapping lives in [`note_link_click`]); all are routed
+///   independently of the overlay gate, and a click cannot toggle a node or open a
+///   link while an overlay is open (the `App::overlay_active` gate). Nothing else:
+///   the pane widths belong to the keyboard (`Shift-Left` / `Shift-Right`).
 /// * `SessionsChanged` -> reload `store` and re-apply query+scope, preserving
 ///   selection-by-id and scroll (see [`reload_board`]).
 /// * `ModelAliases` -> swap in the alias set the off-thread probe read off the
@@ -457,9 +475,8 @@ pub fn handle_event(app: &mut App, event: AppEvent, store: &mut SessionStore) ->
         // `tui::run_inner` builds a fresh `EventLoop` per board session and drops
         // the old receiver, while `lib::run` re-enters the board on the SAME `App`.
         // A card left standing there would replace EVERY session's transcript with
-        // a placeholder and hold `overlay_active` true (killing link clicks, fold
-        // toggles and splitter drags) until another compose was opened and
-        // cancelled.
+        // a placeholder and hold `overlay_active` true (killing link clicks and fold
+        // toggles) until another compose was opened and cancelled.
         app.close_compose();
     }
     outcome
@@ -509,12 +526,11 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
             let action = key_to_action(key, app.query_input.is_empty(), app.has_preview_matches());
             apply_action(app, action)
         }
-        // Mouse wheel scroll and splitter drag. A dedicated arm BEFORE the
+        // Mouse wheel scroll and preview link clicks. A dedicated arm BEFORE the
         // input catch-all and INDEPENDENT of the modal overlay gate above:
-        // neither routes into the modal handler — they just scroll a pane /
-        // resize the split and never crash in any mode (query active, modal
-        // open, ...). A stray click cannot start an orphaned drag while the
-        // modal is open (`App::begin_split_drag` gates it).
+        // neither routes into the modal handler — a wheel just scrolls a pane and
+        // never crashes in any mode (query active, modal open, ...), and a click
+        // opens no link while an overlay is up (`App::overlay_active` gates it).
         AppEvent::Input(Event::Mouse(mouse)) => {
             handle_mouse(app, mouse);
             Outcome::Continue
@@ -946,76 +962,31 @@ fn wheel_target(col: u16, row: u16, preview: Rect, list: Rect, composing: bool) 
     }
 }
 
-/// How far LEFT of the list/preview seam a splitter grab still reaches, so the
-/// border is a comfortably wide target rather than a single exact column.
-///
-/// One direction only, and the direction is the point — [`on_splitter`] owns why.
-const SPLITTER_TOLERANCE: u16 = 1;
-
-/// Hit-test a mouse point at `(col, row)` against the seam between `list` and
-/// `preview`. The seam sits at the list's right edge (`list.x + list.width`,
-/// which — since `render_body` lays the two panes out with no gap — equals
-/// `preview.x`); a point on the seam, or up to [`SPLITTER_TOLERANCE`] columns
-/// LEFT of it, and vertically within the list's row range counts as a hit. A
-/// hidden preview (the empty `Rect::default()` `render_body` sets when
-/// `!show_preview`) never hits — there is no seam to grab. Pure so it is
-/// unit-testable from coordinates + rects, exactly like [`wheel_target`].
-///
-/// The band is ASYMMETRIC ON PURPOSE. Every column it claims must be CHROME,
-/// because the seam arm runs BEFORE the pane arm and so takes a cell away from
-/// whatever was drawn on it. `seam` is the preview block's own left border and
-/// `seam - 1` is the list block's right border (`view::render_list` and
-/// `view::render_preview` both draw a `Borders::ALL` block) — nothing is ever
-/// drawn on either but the frame. But
-/// `seam + 1` is the preview's FIRST CONTENT COLUMN: the border is always
-/// exactly one column, at every terminal size and split ratio, so claiming
-/// `seam + 1` claims live transcript. Content column 0 is where a peer node's
-/// `\u{25c6}` marker sits, where an injected-context node's `\u{25c7}` marker
-/// sits, and where a markdown link that starts its line sits; a symmetric band
-/// made all three unclickable — each fold marker being the one cell of its
-/// "(click to expand)" header that could not be clicked. Two
-/// columns is still a comfortable target. Do NOT re-symmetrise this, and do NOT
-/// fix a variant of it by reordering the arms: the pane arm guards on the OUTER
-/// `preview_rect`, so running it first would hit-test border clicks into content
-/// instead.
-fn on_splitter(col: u16, row: u16, list: Rect, preview: Rect) -> bool {
-    if preview.is_empty() {
-        return false;
-    }
-    let seam = list.x + list.width;
-    let in_rows = row >= list.y && row < list.y.saturating_add(list.height);
-    // Saturating: a seam at column 0 has no border to its left, and the band
-    // simply collapses onto the seam itself rather than wrapping around `u16`.
-    in_rows && col >= seam.saturating_sub(SPLITTER_TOLERANCE) && col <= seam
-}
-
 /// Apply a mouse event: a vertical wheel notch scrolls whichever pane the
 /// pointer is over — unless a draft is open, which takes the LIST out of the
 /// wheel's reach so a notch there is swallowed ([`wheel_target`] owns that rule
-/// and the reason for it); a left-button
-/// press on the list/preview seam begins
-/// dragging the splitter, a left-button drag while dragging resizes it, and a
-/// left-button release always ends the drag. A left-button press INSIDE the
-/// preview pane (but not on the seam) does one of exactly two things: on a fold
-/// node's HEADER — a peer message or injected context — it toggles that node open
-/// or closed ([`App::toggle_peer_fold`]), and otherwise it is resolved by
-/// [`open_link_under_pointer`]: a hit on an `http`/`https` link opens its url in the
-/// default browser — fire-and-forget, off the render loop — and reports
-/// `opening <url>` transiently; a hit on any OTHER scheme opens nothing and reports a
-/// STICKY refusal naming the url (the gate is [`preview::has_openable_scheme`]); a
-/// line too big to hit-test reports a sticky [`LinkClick::Unresolvable`] message; and
-/// a miss writes nothing. Any other event
-/// (other buttons, horizontal wheel, plain moves) is ignored. Never touches the
-/// query, and the overlay gate is enforced by [`App::begin_split_drag`] (drag) and
-/// the [`App::overlay_active`] gate (fold toggle AND link open), so this never
-/// crashes or starts an orphaned drag / stray toggle / stray link-open in any mode.
+/// and the reason for it). A left-button press INSIDE the preview pane does one of
+/// exactly two things: on a fold node's HEADER — a peer message or injected
+/// context — it toggles that node open or closed ([`App::toggle_peer_fold`]), and
+/// otherwise it is resolved by [`open_link_under_pointer`]: a hit on an
+/// `http`/`https` link opens its url in the default browser — fire-and-forget, off
+/// the render loop — and reports `opening <url>` transiently; a hit on any OTHER
+/// scheme opens nothing and reports a STICKY refusal naming the url (the gate is
+/// [`preview::has_openable_scheme`]); a line too big to hit-test reports a sticky
+/// [`LinkClick::Unresolvable`] message; and a miss writes nothing. Any other event
+/// (other buttons, drags, releases, horizontal wheel, plain moves) is ignored: the
+/// pane widths belong to the keyboard (`Shift-Left` / `Shift-Right`), so the mouse
+/// has no border to drag. Never touches the query, and the [`App::overlay_active`]
+/// gate keeps a click from toggling a node or opening a link under an overlay, so
+/// this never crashes or makes a stray toggle / stray link-open in any mode.
 ///
-/// Arm order matters: the seam-drag arm is tried BEFORE the pane arm, so a click on
-/// the border still resizes rather than toggling a node or opening a link. The pane
-/// arm is the LAST word on a left-press inside `preview_rect` — its guard matches
-/// every such press, so an arm added after it would be unreachable — which is why
-/// the rest of the precedence lives INSIDE it rather than as arms of its own. Read
-/// end to end: seam drag -> fold toggle -> link open.
+/// The pane arm is the LAST word on a left-press inside `preview_rect` — its guard
+/// matches every such press, so an arm added after it would be unreachable — which
+/// is why the precedence lives INSIDE it rather than as arms of its own. Read end
+/// to end: fold toggle -> link open. That guard is the OUTER `preview_rect`, so a
+/// press on the pane's own BORDER reaches the arm too, and it is the hit-tests that
+/// refuse it: `view::content_hit` checks containment in the transcript's INNER rect
+/// on both axes, so a border click aliases onto no content column and does nothing.
 ///
 /// Fold-before-link is FREE, not a tie-break. A node's header line is built from
 /// the marker, the sender, the timestamp and the affordance alone; every link
@@ -1049,15 +1020,9 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                 WheelTarget::Ignore => {}
             }
         }
-        MouseEventKind::Down(MouseButton::Left)
-            if on_splitter(mouse.column, mouse.row, app.list_rect, app.preview_rect) =>
-        {
-            app.begin_split_drag();
-        }
-        // A left-click inside the preview pane (the seam-drag arm above already
-        // claimed the border). Gated by any modal overlay like the drag, so a
-        // click while the running-session choice or the agent picker owns input
-        // never toggles a node or opens a link.
+        // A left-click inside the preview pane. Gated by any overlay, so a click
+        // while the running-session choice or the agent picker owns input never
+        // toggles a node or opens a link.
         //
         // THE one owner of a pane click: this guard matches every left-press
         // inside the pane, so the fold-then-link precedence is resolved in the
@@ -1079,11 +1044,6 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                 open_link_under_pointer(app, mouse.column, mouse.row);
             }
         }
-        MouseEventKind::Drag(MouseButton::Left) if app.is_dragging_split() => {
-            let body_width = app.list_rect.width + app.preview_rect.width;
-            app.drag_split_to(mouse.column, body_width);
-        }
-        MouseEventKind::Up(MouseButton::Left) => app.end_split_drag(),
         _ => {}
     }
 }
@@ -1423,8 +1383,12 @@ fn apply_action(app: &mut App, action: Action) -> Outcome {
             app.toggle_scope();
             Outcome::Continue
         }
-        Action::TogglePreview => {
-            app.toggle_preview();
+        Action::LayoutTowardPreview => {
+            app.step_pane_layout(false);
+            Outcome::Continue
+        }
+        Action::LayoutTowardList => {
+            app.step_pane_layout(true);
             Outcome::Continue
         }
         Action::PreviewPageUp => {
@@ -2373,7 +2337,7 @@ mod tests {
     use crate::resume::ModelPick;
     use crate::search::{filter, SearchMode};
     use crate::store::Session;
-    use crate::tui::app::{NewSessionDraft, Scope, MIN_PANE_WIDTH, STATUS_DWELL_TICKS};
+    use crate::tui::app::{NewSessionDraft, PaneLayout, Scope, STATUS_DWELL_TICKS};
     use crate::tui::compose::ComposeTarget;
 
     /// A store over `root` for a test that drives [`handle_event`]. Most routing
@@ -2605,6 +2569,23 @@ mod tests {
         )
     }
 
+    /// Type `text` into the BOARD's query one keypress at a time, through
+    /// `handle_event` — the board sibling of [`type_into_draft`], for text with no
+    /// newline in it.
+    fn type_into_board(app: &mut App, text: &str) {
+        for c in text.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    fn press_shift(app: &mut App, code: KeyCode) -> Outcome {
+        handle_event(
+            app,
+            AppEvent::Input(Event::Key(shift(code))),
+            &mut store_at(Path::new("/tmp")),
+        )
+    }
+
     /// Deliver `text` as ONE terminal paste — the `Event::Paste` crossterm emits
     /// between `ESC[200~` and `ESC[201~` once bracketed paste is enabled. The
     /// whole point of the routing under test is that this is NOT a stream of
@@ -2695,20 +2676,25 @@ mod tests {
 
     // --- quick reply (Ctrl-R): gate, compose routing, send, completion ----
 
-    /// Ctrl-R on an IDLE session opens the compose zone (force-showing the preview
-    /// and targeting the selected session); on a LIVE session it refuses with the
-    /// hint and opens nothing.
+    /// Ctrl-R on an IDLE session opens the compose zone (bringing a hidden preview
+    /// back at 1:1, and targeting the selected session); on a LIVE session it
+    /// refuses with the hint and opens nothing.
     #[test]
     fn ctrl_r_opens_compose_on_idle_and_refuses_a_live_session() {
-        // Idle: compose opens and force-shows the preview.
+        // Idle: compose opens, and a 1:0 board lands on 1:1 so the pane the reply
+        // box docks in is on screen.
         let mut app = app_with("idle", None);
-        app.show_preview = false; // prove Reply force-shows it
+        app.set_pane_layout(PaneLayout::ListOnly); // prove Reply brings the preview back
         press_ctrl(&mut app, KeyCode::Char('r'));
         assert!(
             app.is_composing(),
             "Ctrl-R on an idle session opens compose"
         );
-        assert!(app.show_preview, "opening compose force-shows the preview");
+        assert_eq!(
+            app.pane_layout(),
+            PaneLayout::Even,
+            "opening a reply from 1:0 lands on 1:1"
+        );
         assert_eq!(
             app.compose.as_ref().map(|c| &c.target),
             Some(&ComposeTarget::Reply {
@@ -4767,149 +4753,6 @@ mod tests {
         );
     }
 
-    // --- splitter drag: hit-test + full down/drag/up sequence --------------
-
-    /// A list/preview pair mirroring `render_body`'s no-gap layout: the
-    /// preview starts exactly where the list ends.
-    fn split_panes() -> (Rect, Rect) {
-        let list = Rect {
-            x: 0,
-            y: 0,
-            width: 50,
-            height: 20,
-        };
-        let preview = Rect {
-            x: 50,
-            y: 0,
-            width: 40,
-            height: 20,
-        };
-        (list, preview)
-    }
-
-    #[test]
-    fn on_splitter_claims_the_seam_and_the_border_left_of_it_but_never_pane_content() {
-        let (list, preview) = split_panes();
-        // Exactly on the seam (list.x + list.width == preview.x == 50) — the
-        // preview block's own left border.
-        assert!(on_splitter(50, 10, list, preview));
-        // One column LEFT of it: the list block's right border. Chrome too, which
-        // is the whole reason the band reaches that way.
-        assert!(on_splitter(49, 10, list, preview));
-        // One column RIGHT of it is the preview's FIRST CONTENT column, and never a
-        // grab. The seam arm runs before the pane arm, so claiming it would make
-        // whatever is drawn there — a peer node's marker, a link label that starts
-        // the line — unclickable at every terminal size.
-        assert!(!on_splitter(51, 10, list, preview));
-        // And the band reaches no further on the list side than one border column.
-        assert!(!on_splitter(48, 10, list, preview));
-        assert!(!on_splitter(52, 10, list, preview));
-    }
-
-    #[test]
-    fn on_splitter_requires_being_within_the_row_range() {
-        let (list, preview) = split_panes();
-        // On the seam column but above/below the pane rows.
-        assert!(!on_splitter(50, 20, list, preview), "row is out of range");
-    }
-
-    #[test]
-    fn on_splitter_never_hits_when_the_preview_is_hidden() {
-        let (list, _) = split_panes();
-        // `render_body` sets an EMPTY rect when the preview is hidden.
-        assert!(!on_splitter(50, 10, list, Rect::default()));
-    }
-
-    #[test]
-    fn mouse_up_always_clears_dragging_even_without_a_prior_down() {
-        let mut app = app_with("s", None);
-        assert!(!app.is_dragging_split());
-        wheel(&mut app, MouseEventKind::Up(MouseButton::Left), 50, 10);
-        assert!(
-            !app.is_dragging_split(),
-            "Up must clear dragging defensively, even with no prior Down"
-        );
-    }
-
-    #[test]
-    fn down_drag_up_on_the_seam_resizes_the_list_and_clears_dragging() {
-        let mut app = app_with("s", None);
-        let (list, preview) = split_panes();
-        app.list_rect = list;
-        app.preview_rect = preview;
-        assert_eq!(app.list_width, None, "no drag has happened yet");
-
-        // Press on the seam begins the drag.
-        wheel(&mut app, MouseEventKind::Down(MouseButton::Left), 50, 10);
-        assert!(app.is_dragging_split());
-
-        // Dragging to column 60 moves the seam (and thus the list width) to 60.
-        wheel(&mut app, MouseEventKind::Drag(MouseButton::Left), 60, 10);
-        assert_eq!(app.list_width, Some(60));
-
-        // Release ends the drag; the resized width sticks.
-        wheel(&mut app, MouseEventKind::Up(MouseButton::Left), 60, 10);
-        assert!(!app.is_dragging_split());
-        assert_eq!(app.list_width, Some(60));
-    }
-
-    #[test]
-    fn a_click_off_the_seam_never_starts_a_drag() {
-        let mut app = app_with("s", None);
-        let (list, preview) = split_panes();
-        app.list_rect = list;
-        app.preview_rect = preview;
-
-        wheel(&mut app, MouseEventKind::Down(MouseButton::Left), 10, 10);
-        assert!(
-            !app.is_dragging_split(),
-            "a click over the list body (not the seam) must not start a drag"
-        );
-
-        // A drag event without an active drag must be a no-op.
-        wheel(&mut app, MouseEventKind::Drag(MouseButton::Left), 30, 10);
-        assert_eq!(app.list_width, None, "no drag was in progress");
-    }
-
-    #[test]
-    fn dragging_the_splitter_far_left_or_right_clamps_without_inverting() {
-        let mut app = app_with("s", None);
-        let (list, preview) = split_panes();
-        app.list_rect = list;
-        app.preview_rect = preview;
-        let body_width = list.width + preview.width;
-
-        wheel(&mut app, MouseEventKind::Down(MouseButton::Left), 50, 10);
-        wheel(&mut app, MouseEventKind::Drag(MouseButton::Left), 0, 10);
-        assert_eq!(app.list_width, Some(MIN_PANE_WIDTH));
-
-        wheel(&mut app, MouseEventKind::Drag(MouseButton::Left), 5000, 10);
-        assert_eq!(app.list_width, Some(body_width - MIN_PANE_WIDTH));
-    }
-
-    #[test]
-    fn a_stray_click_on_the_seam_during_the_overlay_never_starts_a_drag() {
-        // Mirrors `mouse_wheel_is_independent_of_the_overlay_gate`: a click on
-        // the seam while the choice overlay owns input must not start an
-        // orphaned drag that a later Drag/Up would then apply.
-        let mut app = app_with("live-1", Some("background"));
-        let (list, preview) = split_panes();
-        app.list_rect = list;
-        app.preview_rect = preview;
-        press(&mut app, KeyCode::Enter); // open the overlay
-        assert!(app.modal.is_some());
-
-        wheel(&mut app, MouseEventKind::Down(MouseButton::Left), 50, 10);
-        assert!(
-            !app.is_dragging_split(),
-            "a click on the seam during the overlay must not start a drag"
-        );
-        assert!(
-            app.modal.is_some(),
-            "the click must not disturb the overlay either"
-        );
-    }
-
     // --- preview link hit-testing across the pinned banner ------------------
 
     /// Board size for the link hit-tests: wide enough for a usable preview pane,
@@ -5139,37 +4982,6 @@ mod tests {
         )
     }
 
-    /// [`drawn_link_cell`], restricted to a cell the SPLITTER does not claim.
-    ///
-    /// The crowded fixture opens its line with a link, so its first underlined cell is
-    /// at the transcript's column 0 — one column right of the seam, and therefore
-    /// inside `SPLITTER_TOLERANCE`. `handle_mouse` tries the seam-drag arm FIRST by
-    /// design (a click on the border resizes rather than opening a link), so a cell
-    /// there never reaches the link arm at all: an end-to-end click on one would
-    /// measure the splitter and report it as a silent hit-test.
-    ///
-    /// It asks the production [`on_splitter`] rather than restating the tolerance, so
-    /// a retune of the seam's width moves this with it instead of leaving a test that
-    /// aims at a column the splitter has since claimed.
-    fn drawn_link_cell_clear_of_the_seam(
-        buffer: &ratatui::buffer::Buffer,
-        list: Rect,
-        preview: Rect,
-    ) -> (u16, u16) {
-        let found = (preview.y..preview.bottom())
-            .flat_map(|y| (preview.x..preview.right()).map(move |x| (x, y)))
-            .find(|&(x, y)| {
-                !on_splitter(x, y, list, preview)
-                    && buffer
-                        .cell((x, y))
-                        .is_some_and(|c| c.modifier.contains(Modifier::UNDERLINED))
-            });
-        found.expect(
-            "the fixture must draw a link label clear of the splitter seam, \
-             or an end-to-end click measures the splitter instead of the hit-test",
-        )
-    }
-
     #[test]
     fn a_click_on_a_drawn_link_opens_it_for_a_banner_less_pane() {
         // No banner: the transcript owns the pane's whole inner rect, and the
@@ -5279,16 +5091,17 @@ mod tests {
 
     /// A link label drawn on the pane's FIRST content column is clickable.
     ///
-    /// The older half of the marker cell's bug, and the reason this is fixed in the
-    /// grab band rather than special-cased for folds: the splitter's band used to
-    /// claim `seam + 1`, the pane's first content column, so a link that started its
-    /// line was swallowed by the seam arm — years before any peer node was drawn
-    /// there.
+    /// The older half of the marker cell's bug: the mouse splitter this board once
+    /// had claimed `seam + 1`, the pane's first content column, in its grab band, so
+    /// a link that started its line was swallowed by the seam arm — years before any
+    /// peer node was drawn there. The pane widths now belong to the keyboard and no
+    /// arm runs ahead of the pane arm; this pins that the column stays the
+    /// transcript's.
     ///
     /// Stops at the pure [`resolve_link_click`] seam like its sibling link tests:
     /// taking the arm's link branch would reach `resume::open_url` and spawn a
-    /// browser. What the arm would have done is pinned by `on_splitter` instead,
-    /// which is exactly the predicate that used to claim this cell.
+    /// browser. What the arm would do with the press is pinned by its guard instead:
+    /// the cell must lie inside `preview_rect`, the one rect that arm asks about.
     #[test]
     fn a_click_on_a_link_starting_at_content_column_zero_opens_it() {
         let dir = unique_temp_dir("link-col0");
@@ -5307,9 +5120,9 @@ mod tests {
              column, or this probes an ordinary interior link"
         );
         assert!(
-            !on_splitter(col, row, app.list_rect, app.preview_rect),
-            "the seam arm runs first, so a grab band that claimed this column would \
-             make the link unreachable however precisely the user clicked it"
+            app.preview_rect.contains(Position { x: col, y: row }),
+            "the pane arm guards on `preview_rect`, so a cell outside it would make \
+             the link unreachable however precisely the user clicked it"
         );
         assert_eq!(
             resolve_link_click(&mut app, col, row),
@@ -5398,23 +5211,29 @@ mod tests {
 
     #[test]
     fn a_left_click_in_the_preview_body_without_a_link_is_a_harmless_no_op() {
-        // The new preview-link arm must never start a drag, open the overlay, or
-        // panic when the pointer is not over a link. The synthetic session's file
-        // does not exist, so the preview has no link regions — the click resolves
-        // to nothing.
+        // The preview-link arm must never open the overlay or panic when the
+        // pointer is not over a link. The synthetic session's file does not exist,
+        // so the preview has no link regions — the click resolves to nothing.
         const REFUSAL: &str = "a refusal the reader has not read yet";
         let mut app = app_with("s", None);
-        let (list, preview) = split_panes();
-        app.list_rect = list;
-        app.preview_rect = preview;
+        // A list/preview pair mirroring `render_body`'s no-gap split: the preview
+        // starts exactly where the list ends.
+        app.list_rect = Rect {
+            x: 0,
+            y: 0,
+            width: 50,
+            height: 20,
+        };
+        app.preview_rect = Rect {
+            x: 50,
+            y: 0,
+            width: 40,
+            height: 20,
+        };
         app.set_status(REFUSAL);
 
-        // Well inside the preview body (col 70 of the 50..90 preview), not the seam.
+        // Well inside the preview body (col 70 of the 50..90 preview).
         wheel(&mut app, MouseEventKind::Down(MouseButton::Left), 70, 10);
-        assert!(
-            !app.is_dragging_split(),
-            "a preview-body click must not start a splitter drag"
-        );
         assert!(
             app.modal.is_none(),
             "a preview-body click must not open the overlay"
@@ -5535,11 +5354,7 @@ mod tests {
         let control_dir = unique_temp_dir("link-control");
         let mut control = crowded_link_app(&control_dir, CROWDED_CONTROL_LINKS);
         let control_buffer = render_board(&mut control);
-        let (control_col, control_row) = drawn_link_cell_clear_of_the_seam(
-            &control_buffer,
-            control.list_rect,
-            control.preview_rect,
-        );
+        let (control_col, control_row) = drawn_link_cell(&control_buffer, control.preview_rect);
         assert_eq!(
             resolve_link_click(&mut control, control_col, control_row),
             LinkClick::Opening(LINK_URL.to_string()),
@@ -5551,8 +5366,7 @@ mod tests {
         let dir = unique_temp_dir("link-crowded");
         let mut app = crowded_link_app(&dir, CROWDED_LINE_LINKS);
         let buffer = render_board(&mut app);
-        let (col, row) =
-            drawn_link_cell_clear_of_the_seam(&buffer, app.list_rect, app.preview_rect);
+        let (col, row) = drawn_link_cell(&buffer, app.preview_rect);
         assert_eq!(
             resolve_link_click(&mut app, col, row),
             LinkClick::Unresolvable,
@@ -5581,26 +5395,109 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn dragging_while_the_preview_is_hidden_is_a_no_op_and_never_panics() {
-        let mut app = app_with("s", None);
-        app.toggle_preview(); // hide the preview
-        app.list_rect = Rect {
-            x: 0,
-            y: 0,
-            width: 90,
-            height: 20,
-        };
-        app.preview_rect = Rect::default();
+    // --- pane layout: Shift-Left / Shift-Right through the whole handler ------
 
-        // A click anywhere never hits the (nonexistent) seam, so dragging
-        // never starts; a stray Drag/Up is a harmless no-op.
-        wheel(&mut app, MouseEventKind::Down(MouseButton::Left), 50, 10);
-        assert!(!app.is_dragging_split());
-        wheel(&mut app, MouseEventKind::Drag(MouseButton::Left), 60, 10);
-        assert_eq!(app.list_width, None, "no drag was in progress to apply");
-        wheel(&mut app, MouseEventKind::Up(MouseButton::Left), 60, 10);
-        assert!(!app.is_dragging_split());
+    /// The user's walk, pressed through `handle_event`: three `Shift-←` from the
+    /// 1:1 start reach 0:1 and the third changes nothing, then `Shift-→` walks all
+    /// five stops to 1:0 and a press past it changes nothing. Asserting the state
+    /// each PRESS produced is what pins the `apply_action` arm between the decode
+    /// and the `App` method — a swapped arm leaves both halves' own tests green.
+    #[test]
+    fn shift_arrows_walk_the_layout_ladder_and_stop_at_both_ends() {
+        let mut app = app_with("s", None);
+        assert_eq!(app.pane_layout(), PaneLayout::Even, "the board starts 1:1");
+
+        let mut walked = Vec::new();
+        for _ in 0..3 {
+            press_shift(&mut app, KeyCode::Left);
+            walked.push(app.pane_layout());
+        }
+        assert_eq!(
+            walked,
+            [
+                PaneLayout::PreviewWide,
+                PaneLayout::PreviewOnly,
+                PaneLayout::PreviewOnly
+            ],
+            "Shift-← stops at 0:1"
+        );
+
+        let mut walked = Vec::new();
+        for _ in 0..5 {
+            press_shift(&mut app, KeyCode::Right);
+            walked.push(app.pane_layout());
+        }
+        assert_eq!(
+            walked,
+            [
+                PaneLayout::PreviewWide,
+                PaneLayout::Even,
+                PaneLayout::ListWide,
+                PaneLayout::ListOnly,
+                PaneLayout::ListOnly
+            ],
+            "Shift-→ walks every stop and stops at 1:0"
+        );
+        assert_eq!(
+            app.selected.as_deref(),
+            Some("s"),
+            "no step moves the selection"
+        );
+    }
+
+    /// With a query typed, `Shift-←/→` still step the layout — and leave the query
+    /// exactly as it was, so a search in progress survives a change of layout.
+    #[test]
+    fn shift_arrows_step_the_layout_with_a_query_typed() {
+        let mut app = app_with("s", None);
+        type_into_board(&mut app, "lab");
+        assert_eq!(app.query(), "lab", "premise: a query is typed");
+        assert_eq!(
+            app.selected.as_deref(),
+            Some("s"),
+            "premise: the query keeps the row"
+        );
+
+        press_shift(&mut app, KeyCode::Left);
+        assert_eq!(app.pane_layout(), PaneLayout::PreviewWide);
+        press_shift(&mut app, KeyCode::Right);
+        press_shift(&mut app, KeyCode::Right);
+        assert_eq!(app.pane_layout(), PaneLayout::ListWide);
+        assert_eq!(app.query(), "lab", "the query is untouched");
+    }
+
+    /// With search hits MARKED in the previewed transcript — the one state in which
+    /// `Shift-↑`/`Shift-↓` change meaning — `Shift-←/→` still step the layout.
+    ///
+    /// A real transcript on disk and a real drawn frame, because the marks exist
+    /// only once the pane has been rendered: `has_preview_matches` reads the cache
+    /// the draw fills, and a synthetic session with no file never has any.
+    #[test]
+    fn shift_arrows_step_the_layout_with_search_hits_present() {
+        let dir = unique_temp_dir("layout-hits");
+        let mut session = link_session(&dir, LINK_URL);
+        // The row is admitted by CONTENT, so the query below keeps it on the board
+        // in name+content mode.
+        session.content_index = "filler line 1".to_string();
+        let mut app = App::new(vec![session], Scope::All, PathBuf::from("/tmp"));
+        seed_live(&mut app, &[]);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.search_mode, SearchMode::NameAndContent);
+        type_into_board(&mut app, "filler");
+        render_board(&mut app);
+        assert!(
+            app.has_preview_matches(),
+            "premise: the query is marked in the drawn preview, so the SHIFTED \
+             vertical arrows are live"
+        );
+
+        press_shift(&mut app, KeyCode::Left);
+        assert_eq!(app.pane_layout(), PaneLayout::PreviewWide);
+        render_board(&mut app);
+        press_shift(&mut app, KeyCode::Right);
+        assert_eq!(app.pane_layout(), PaneLayout::Even);
+        assert_eq!(app.query(), "filler", "the query is untouched");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // --- peer-message fold: the pane arm's fold-then-link precedence ---------
@@ -5682,8 +5579,8 @@ mod tests {
     /// ordinary toggle probe, and the strictest one the header has: the marker is
     /// the glyph the "(click to expand)" affordance is promising about, so a node
     /// that cannot be toggled HERE has a header that lies. It is deliberately NOT a
-    /// seam probe — [`SPLITTER_TOLERANCE`] reaches leftward from the seam only,
-    /// because this column belongs to the transcript.
+    /// border probe — the border one column to its left is the pane's chrome, and
+    /// this column belongs to the transcript.
     fn drawn_peer_marker_cell(buffer: &ratatui::buffer::Buffer, preview: Rect) -> (u16, u16) {
         drawn_cell(buffer, preview, "\u{25c6}").expect(
             "the fixture's peer node must be drawn inside the preview pane, \
@@ -5694,10 +5591,9 @@ mod tests {
     /// A cell in the MIDDLE of the same header — the `@` opening the sender handle,
     /// the one glyph no other turn marker draws.
     ///
-    /// Clear of the seam's grab tolerance, so a click here reaches the pane arm and
-    /// tests the precedence rather than the splitter. A `FoldRegion` spans the
-    /// header's whole display width, so this cell and the marker cell address the
-    /// same node.
+    /// Well clear of the pane's left edge, so a click here tests the fold-then-link
+    /// precedence rather than the edge. A `FoldRegion` spans the header's whole
+    /// display width, so this cell and the marker cell address the same node.
     fn drawn_peer_handle_cell(buffer: &ratatui::buffer::Buffer, preview: Rect) -> (u16, u16) {
         let cell = drawn_cell(buffer, preview, "@")
             .expect("the node header must draw its sender handle, or this probes nothing");
@@ -5737,8 +5633,8 @@ mod tests {
         let width = preview_transcript_rect(&app).width;
         let (col, row) = drawn_peer_handle_cell(&buffer, app.preview_rect);
         assert!(
-            !on_splitter(col, row, app.list_rect, app.preview_rect),
-            "the probe must reach the PANE arm, not the seam-drag arm above it"
+            app.preview_rect.contains(Position { x: col, y: row }),
+            "the probe must be inside the rect the PANE arm guards on"
         );
 
         let collapsed = preview_string(&mut app, width);
@@ -5769,8 +5665,8 @@ mod tests {
             "and the header must go back to offering the expand"
         );
         assert!(
-            !app.is_dragging_split() && app.modal.is_none(),
-            "toggling a node must not start a drag or open an overlay"
+            app.modal.is_none(),
+            "toggling a node must not open an overlay"
         );
     }
 
@@ -5906,38 +5802,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A click on the seam still RESIZES, even when the row it lands on is a peer
-    /// node's header.
+    /// A click on the preview pane's own left BORDER does nothing, even when the row
+    /// it lands on is a peer node's header.
     ///
-    /// The probe is the seam itself — the preview block's own left BORDER column,
-    /// chrome the pane's `Block` draws and the transcript never reaches. The pane
-    /// arm guards on `preview_rect`, the OUTER rect, so that border column matches
-    /// BOTH arms and they genuinely compete for it; only the seam arm running FIRST
-    /// keeps the drag.
+    /// The probe is the preview block's left border column — chrome the pane's
+    /// `Block` draws and the transcript never reaches. The pane arm guards on
+    /// `preview_rect`, the OUTER rect, so a press on that border DOES reach the arm,
+    /// and nothing runs ahead of it to claim the cell: the pane widths belong to the
+    /// keyboard, so the mouse has no border to drag. What keeps the press inert is
+    /// the hit-test's containment — `view::content_hit` refuses every cell outside
+    /// the transcript's INNER rect, so the border resolves to no content column at
+    /// all. Clamp that column instead and the border aliases onto content column 0,
+    /// the header's marker one cell to its RIGHT, and this press opens the node.
     ///
-    /// The cell one column to its RIGHT is the header's own marker, and it belongs
-    /// to the pane: the grab band reaches leftward from the seam only, which is what
-    /// keeps a node's affordance clickable
-    /// (`a_click_on_a_peer_nodes_marker_cell_expands_it`).
-    ///
-    /// The drag is ALL this asserts after the press. The converse — that the press
-    /// did not ALSO toggle the node under the pointer — is deliberately NOT claimed
-    /// here, because at the seam it is unfalsifiable: `view::content_hit` refuses
-    /// every cell outside the transcript's INNER rect, and the seam is a border
-    /// column, so it resolves to `None` whichever arm reaches it. Reorder the two
-    /// arms and the drag assertion above goes red while the node stays shut anyway
-    /// — an assertion that survives the exact defect it names certifies the bug
-    /// instead of catching it, which is how the symmetric grab band this test's
-    /// sibling fixed went unnoticed. That containment guard is pinned where it
-    /// lives, against flush-left regions at content column 0 (the only shape a
-    /// clamped column can be caught by):
+    /// The marker itself is the node's own click target
+    /// (`a_click_on_a_peer_nodes_marker_cell_expands_it`). The containment guard is
+    /// also pinned where it lives, against flush-left regions at content column 0
+    /// (the only shape a clamped column can be caught by):
     /// `view::tests::link_at_is_none_left_or_right_of_the_inner_rect` and
     /// `view::tests::fold_at_is_none_on_blank_rows_and_outside_the_pane`.
     #[test]
-    fn a_click_on_the_seam_resizes_instead_of_toggling_a_peer_node() {
+    fn a_click_on_the_preview_border_beside_a_peer_node_toggles_nothing() {
         let (mut app, buffer) = peer_app();
+        let width = preview_transcript_rect(&app).width;
         let (marker_col, header_row) = drawn_peer_marker_cell(&buffer, app.preview_rect);
-        let col = app.list_rect.x + app.list_rect.width;
+        let col = app.preview_rect.x;
         assert_eq!(
             marker_col,
             col + 1,
@@ -5949,17 +5838,13 @@ mod tests {
                 x: col,
                 y: header_row,
             }),
-            "the probe must be inside the rect the PANE arm guards on, or the two \
-             arms never compete for it"
+            "the probe must be inside the rect the PANE arm guards on, or the press \
+             never reaches the hit-test and the silence below proves nothing"
         );
+        let collapsed = preview_string(&mut app, width);
         assert!(
-            on_splitter(col, header_row, app.list_rect, app.preview_rect),
-            "the probe column must really be a seam grab, or this tests nothing"
-        );
-        assert!(
-            !on_splitter(marker_col, header_row, app.list_rect, app.preview_rect),
-            "and the grab must stop at that border: the marker beside it is the \
-             node's own click target, not the splitter's"
+            collapsed.contains(COLLAPSED_AFFORDANCE) && !collapsed.contains(PEER_BODY_PHRASE),
+            "a peer node starts CLOSED, or the assertion below is vacuous"
         );
 
         wheel(
@@ -5968,21 +5853,25 @@ mod tests {
             col,
             header_row,
         );
+        let after = preview_string(&mut app, width);
         assert!(
-            app.is_dragging_split(),
-            "a click on the seam must begin a splitter drag"
+            after.contains(COLLAPSED_AFFORDANCE) && !after.contains(PEER_BODY_PHRASE),
+            "a click on the border must not alias onto the marker beside it and \
+             open the node"
         );
+        assert!(app.modal.is_none(), "nor open an overlay");
     }
 
     /// A click on the node header's MARKER cell — content column 0, the glyph the
     /// "(click to expand)" affordance is promising about — opens the node.
     ///
-    /// The regression guard the splitter's grab band needs. That band was symmetric
-    /// around the seam, so it claimed `seam + 1` as well; since the pane's border is
-    /// always exactly one column, `seam + 1` is always the pane's first CONTENT
-    /// column, and the seam arm runs before the pane arm. The one cell that said
-    /// "click to expand" was the one cell that could not be clicked, at every
-    /// terminal size and every split ratio.
+    /// The regression guard for the mouse splitter this board once had. Its grab
+    /// band was symmetric around the seam, so it claimed `seam + 1` as well; since
+    /// the pane's border is always exactly one column, `seam + 1` is always the
+    /// pane's first CONTENT column, and the seam arm ran before the pane arm. The one
+    /// cell that said "click to expand" was the one cell that could not be clicked,
+    /// at every terminal size and every split ratio. The pane widths now belong to
+    /// the keyboard, and this keeps any future arm from taking the cell back.
     ///
     /// Driven END TO END through [`handle_mouse`], not through
     /// [`fold_under_pointer`]: the defect was never in the resolver — it is which
@@ -6006,14 +5895,11 @@ mod tests {
         );
 
         wheel(&mut app, MouseEventKind::Down(MouseButton::Left), col, row);
-        assert!(
-            !app.is_dragging_split(),
-            "the marker is content, not chrome: clicking it must not grab the splitter"
-        );
         let expanded = preview_string(&mut app, width);
         assert!(
             expanded.contains(PEER_BODY_PHRASE),
-            "and the click must open the node the marker labels"
+            "the marker is content, not chrome: the click must open the node the \
+             marker labels"
         );
         assert!(
             expanded.contains(EXPANDED_AFFORDANCE),
@@ -6049,10 +5935,6 @@ mod tests {
         assert!(
             app.modal.is_some(),
             "and must not disturb the overlay either"
-        );
-        assert!(
-            !app.is_dragging_split(),
-            "nor start an orphaned splitter drag"
         );
     }
 
@@ -6170,8 +6052,8 @@ mod tests {
         let width = preview_transcript_rect(&app).width;
         let (col, row) = drawn_injected_marker_cell(&buffer, app.preview_rect);
         assert!(
-            !on_splitter(col, row, app.list_rect, app.preview_rect),
-            "the probe must reach the PANE arm, not the seam-drag arm above it"
+            app.preview_rect.contains(Position { x: col, y: row }),
+            "the probe must be inside the rect the PANE arm guards on"
         );
 
         let collapsed = preview_string(&mut app, width);
@@ -6249,8 +6131,8 @@ mod tests {
     /// case in disguise.
     ///
     /// The probe is the header's MARKER cell, the pane's first CONTENT column, so
-    /// the one press also pins that the splitter's grab band stops at the border
-    /// on the rows beneath the pinned one. And the row directly ABOVE the header,
+    /// the one press also pins that column as the transcript's on the rows beneath
+    /// the pinned one. And the row directly ABOVE the header,
     /// the node's blank separator, is pressed first and must stay inert: a
     /// hit-test that forgot the reserved row resolves that row to the header.
     #[test]
@@ -6293,10 +6175,6 @@ mod tests {
         );
 
         wheel(&mut app, MouseEventKind::Down(MouseButton::Left), col, row);
-        assert!(
-            !app.is_dragging_split(),
-            "the marker is content under the pinned row too, never a splitter grab"
-        );
         let expanded = preview_string(&mut app, width);
         assert!(
             expanded.contains(PEER_BODY_PHRASE) && expanded.contains(EXPANDED_AFFORDANCE),
@@ -6368,10 +6246,6 @@ mod tests {
         );
 
         wheel(&mut app, MouseEventKind::Down(MouseButton::Left), col, row);
-        assert!(
-            !app.is_dragging_split(),
-            "the marker is content, never a splitter grab"
-        );
         let expanded = preview_string(&mut app, width);
         assert!(
             expanded.contains(PEER_BODY_PHRASE) && expanded.contains(EXPANDED_AFFORDANCE),
@@ -6380,9 +6254,9 @@ mod tests {
     }
 
     /// A link label that starts its line, on the pane's FIRST content column,
-    /// stays clickable beneath the pinned row: the grab band stops at the border
-    /// there too, and the pane arm resolves the cell against the transcript rect
-    /// the pinned row pushed down.
+    /// stays clickable beneath the pinned row: the pane arm owns that column there
+    /// too, and resolves the cell against the transcript rect the pinned row pushed
+    /// down.
     ///
     /// Stops at the pure [`resolve_link_click`] seam, like its siblings, because
     /// the arm's link branch would spawn a browser.
@@ -6413,8 +6287,8 @@ mod tests {
             "the label must sit on the pane's first CONTENT column"
         );
         assert!(
-            !on_splitter(col, row, app.list_rect, app.preview_rect),
-            "the first content column is never a splitter grab"
+            app.preview_rect.contains(Position { x: col, y: row }),
+            "the first content column is inside the rect the PANE arm guards on"
         );
         assert_eq!(
             resolve_link_click(&mut app, col, row),
@@ -7557,7 +7431,7 @@ mod tests {
 
     #[test]
     fn toggles_are_reachable_regardless_of_query() {
-        // Tab toggles search mode; Ctrl-A scope; Ctrl-/ preview.
+        // Tab toggles search mode; Ctrl-A scope.
         assert_eq!(
             key_to_action(key(KeyCode::Tab), false, false),
             Action::ToggleSearchMode
@@ -7566,14 +7440,78 @@ mod tests {
             key_to_action(ctrl(KeyCode::Char('a')), false, false),
             Action::ToggleScope
         );
+    }
+
+    /// The retired preview toggle, `Ctrl-/`, is now an ordinary unbound `Ctrl`
+    /// key: it lands in the ctrl block's "ignore other Ctrl keys" fallback, in BOTH
+    /// encodings a terminal sends it as (`/`, and the 0x1f control code surfaced as
+    /// `_`), with or without a query. `Ignore` rather than `Insert` is the point —
+    /// a stray press of the old key must not type a `/` into the search.
+    #[test]
+    fn the_retired_ctrl_slash_is_ignored_and_never_types() {
+        for empty in [true, false] {
+            assert_eq!(
+                key_to_action(ctrl(KeyCode::Char('/')), empty, false),
+                Action::Ignore
+            );
+            assert_eq!(
+                key_to_action(ctrl(KeyCode::Char('_')), empty, false),
+                Action::Ignore
+            );
+        }
+
+        // Through the whole handler: the board, the query and the layout are all
+        // exactly what they were.
+        let mut app = app_with("s", None);
+        press_ctrl(&mut app, KeyCode::Char('/'));
+        press_ctrl(&mut app, KeyCode::Char('_'));
+        assert_eq!(app.query(), "", "Ctrl-/ must not type into the query");
+        assert_eq!(app.pane_layout(), PaneLayout::Even, "nor move the layout");
+    }
+
+    /// `Shift-←` / `Shift-→` step the layout UNCONDITIONALLY: with and without a
+    /// query, and with search hits present — every combination of the two
+    /// conditions the SHIFTED VERTICAL arrows depend on. The `marked = true` rows are
+    /// the ones with teeth: they are the state in which the neighbouring
+    /// `Shift-↑`/`↓` arms change meaning, and they must not drag this pair along.
+    #[test]
+    fn shifted_horizontal_arrows_step_the_layout_regardless_of_query_or_marks() {
+        for (query_empty, marked) in [(true, false), (false, false), (true, true), (false, true)] {
+            assert_eq!(
+                key_to_action(shift(KeyCode::Left), query_empty, marked),
+                Action::LayoutTowardPreview,
+                "Shift-Left (query_empty={query_empty}, marked={marked})"
+            );
+            assert_eq!(
+                key_to_action(shift(KeyCode::Right), query_empty, marked),
+                Action::LayoutTowardList,
+                "Shift-Right (query_empty={query_empty}, marked={marked})"
+            );
+        }
+    }
+
+    /// The layout arms sit ABOVE the plain `Left`/`Right` ones, and this is the
+    /// test that makes the order observable: the unguarded fold arm matches a
+    /// shifted arrow too, so swapping the two would leave every decode above
+    /// compiling while `Shift-←` folded a lineage. Both directions are asserted —
+    /// the shifted keys step, the unshifted ones still fold and expand.
+    #[test]
+    fn the_layout_arms_win_over_the_plain_fold_arms() {
         assert_eq!(
-            key_to_action(ctrl(KeyCode::Char('/')), false, false),
-            Action::TogglePreview
+            key_to_action(shift(KeyCode::Left), false, false),
+            Action::LayoutTowardPreview
         );
-        // The 0x1f fallback encoding of Ctrl-/ also toggles the preview.
         assert_eq!(
-            key_to_action(ctrl(KeyCode::Char('_')), false, false),
-            Action::TogglePreview
+            key_to_action(key(KeyCode::Left), false, false),
+            Action::CollapseLineage
+        );
+        assert_eq!(
+            key_to_action(shift(KeyCode::Right), false, false),
+            Action::LayoutTowardList
+        );
+        assert_eq!(
+            key_to_action(key(KeyCode::Right), false, false),
+            Action::ExpandLineage
         );
     }
 
@@ -7983,7 +7921,7 @@ mod tests {
     fn picker_enter_opens_the_background_draft_for_the_highlighted_agent() {
         // Row 0: the "default (no agent)" entry.
         let mut app = app_with("s", None);
-        app.show_preview = false; // prove the draft pane force-shows it
+        app.set_pane_layout(PaneLayout::ListOnly); // prove the draft pane brings the preview back
         app.open_agent_picker(vec![def_agent("planner"), def_agent("reviewer")]);
         let out = press(&mut app, KeyCode::Enter);
         assert!(
@@ -7991,7 +7929,11 @@ mod tests {
             "opening a pane launches nothing"
         );
         assert!(app.modal.is_none(), "Enter closes the picker");
-        assert!(app.show_preview, "the draft pane force-shows the preview");
+        assert_eq!(
+            app.pane_layout(),
+            PaneLayout::Even,
+            "the draft pane brings a hidden preview back at 1:1"
+        );
         assert_eq!(
             app.compose.as_ref().map(|c| &c.target),
             Some(&ComposeTarget::NewBackgroundAgent { agent: None })
@@ -8025,7 +7967,7 @@ mod tests {
         std::env::set_var("HOME", &home);
 
         let mut app = App::new(vec![session("s")], Scope::All, launch.clone());
-        app.show_preview = false; // prove the draft pane force-shows it
+        app.set_pane_layout(PaneLayout::ListOnly); // prove the draft pane brings the preview back
         let out = press_ctrl(&mut app, KeyCode::Char('n'));
 
         match previous_home {
@@ -8043,7 +7985,11 @@ mod tests {
             app.modal.is_none(),
             "a one-row picker would be pure friction"
         );
-        assert!(app.show_preview, "the draft pane force-shows the preview");
+        assert_eq!(
+            app.pane_layout(),
+            PaneLayout::Even,
+            "the draft pane brings a hidden preview back at 1:1"
+        );
         assert_eq!(
             app.compose.as_ref().map(|c| &c.target),
             Some(&ComposeTarget::NewBackgroundAgent { agent: None })
@@ -8561,8 +8507,7 @@ mod tests {
     /// reports back into a channel nobody is reading and the SAME `App` re-enters
     /// the board still holding the card. That strands the preview on a placeholder
     /// for every session, with `overlay_active` stuck true (dead link clicks, dead
-    /// fold toggles, dead splitter drags), recoverable only by opening and
-    /// cancelling another compose.
+    /// fold toggles), recoverable only by opening and cancelling another compose.
     /// Every hand-off therefore ends the card with the board session it belonged to.
     #[test]
     fn handing_off_while_a_launch_is_in_flight_leaves_no_stranded_card() {
