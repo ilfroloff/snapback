@@ -170,6 +170,22 @@ const NEEDS_INPUT_COPY: &str = "needs input";
 /// the code never asserts that cause.
 const INTERRUPTED_COPY: &str = "interrupted";
 
+/// Milliseconds per second. `startedAt` arrives as epoch MILLISECONDS
+/// ([`ReportedAgent::started_at_ms`]), while [`elapsed_phrase`]'s finest unit is a
+/// whole second.
+const MS_PER_SECOND: i64 = 1_000;
+
+/// Seconds per minute. A SWITCH, not a limit: this is where [`elapsed_phrase`]
+/// stops counting seconds (`59s`) and starts counting minutes (`1m`). Its unit
+/// test pins that switch point.
+const SECS_PER_MINUTE: i64 = 60;
+
+/// Seconds per hour. Also a SWITCH: [`elapsed_phrase`] goes from `59m` to `1h`
+/// here and stays in hours above it. There is no day unit, so a child wedged for
+/// three days reads `72h`. That is still legible, and it keeps the phrase to the
+/// three coarse units the banner was designed around.
+const SECS_PER_HOUR: i64 = 3_600;
+
 /// The slice of a REPORTED agent the board UI needs, joined to a session by the
 /// full `sessionId`.
 ///
@@ -204,8 +220,55 @@ pub struct ReportedAgent {
     pub state: Option<String>,
     /// `status` field (e.g. `"idle"`), if present.
     pub status: Option<String>,
-    /// `name` field, if present.
-    pub name: Option<String>,
+    /// `pid` field: the OS process id claude reports for this session, if any.
+    /// A JSON NUMBER on the wire, read fail-soft and narrowed (see
+    /// [`parse_agents_json`]).
+    ///
+    /// **ONE consumer, and it is named so a second one cannot arrive quietly:**
+    /// [`crate::send::interrupt_gate`]'s signal route — the `Ctrl-K` case for a
+    /// reported session that has NO stoppable job `id`. `claude stop <job-id>`
+    /// stays the verb wherever a job id exists, so nothing else reads this.
+    ///
+    /// `pid` and [`ReportedAgent::id`] are two SEPARATE conditions and neither
+    /// may be inferred from the other, nor from `kind`. Measured at
+    /// `claude 2.1.278`: present on 3/3 interactive records and 0/159 background
+    /// ones — but an earlier sample carried one on 2/150 BACKGROUND records, so
+    /// "has a pid" must never be read as "is interactive".
+    ///
+    /// **Read from [`live_agents`]' records ONLY — never from
+    /// [`reported_agents`]'** (i.e. never through
+    /// [`crate::tui::app::App::reported_agent`]). Same rule as
+    /// [`ReportedAgent::id`], for a strictly worse reason: a pid off that
+    /// ~5.3s-stale (unboundedly stale while idle) `--all` map may already have
+    /// been REUSED by an unrelated process, and a signal is irreversible. The
+    /// gate's pid comes from [`crate::tui::app::App::live_agent_now`] — the
+    /// one-shot probe that confirmed the session is live in the SAME read.
+    ///
+    /// **It must NEVER be reachable from [`crate::delete::can_delete`].** That
+    /// guard asks "is a WRITER present?"; a pid does not answer that, and
+    /// DOMAIN.md's "pid is deliberately unused" note stands for that question
+    /// unchanged. This field answers a different one — "which process do I
+    /// signal?" — and the two must not be conflated.
+    pub pid: Option<u32>,
+    /// `startedAt` field: when claude says this session started, as epoch
+    /// MILLISECONDS (a 13-digit JSON number on the wire at `claude 2.1.278`,
+    /// e.g. `1790152789592`), if present.
+    ///
+    /// **ONE consumer:** [`crate::tui::view::preview_banner`]'s age phrase, so a
+    /// wedged child reads `live busy · 46m` rather than being indistinguishable
+    /// from a healthy one.
+    ///
+    /// Unlike [`ReportedAgent::pid`] this MAY be read off [`reported_agents`]'
+    /// polled `--all` map: an age is a DISPLAY fact, not a gate, so "as of the
+    /// last poll" is an honest answer and a few seconds of staleness cost
+    /// nothing at the `m`/`h` resolution the banner shows. Two sources, two
+    /// questions.
+    ///
+    /// Epoch millis — NOT the MONOTONIC clock [`crate::watch`] counts in, which
+    /// is not comparable to this. The age is therefore computed against a wall
+    /// clock stamped once where the poller's map is applied, never read inside
+    /// the render path.
+    pub started_at_ms: Option<i64>,
 }
 
 impl ReportedAgent {
@@ -226,6 +289,41 @@ impl ReportedAgent {
     #[must_use]
     pub fn qualifier(&self) -> Option<&str> {
         self.state.as_deref().or(self.status.as_deref())
+    }
+}
+
+/// Test-only fixture seam, declared beside the struct it builds so the several
+/// per-module `agent(…)` helpers do not each re-spell every field.
+///
+/// Deliberately NOT a `Default` derive on [`ReportedAgent`]. The parser's
+/// contract is that every field is read EXPLICITLY and fail-soft; a `Default`
+/// would let the next field added arrive filled-in-silently at ~30 fixture sites
+/// and at the parser, which is precisely the drift [`parse_agents_json`] is
+/// written to make visible. A `#[cfg(test)]` constructor gives the fixtures their
+/// convenience without handing production code a way to conjure a record nobody
+/// read off the wire.
+#[cfg(test)]
+impl ReportedAgent {
+    /// A synthetic record carrying only what the classifier reads: the `kind` it
+    /// is badged and gated by, and the `state`/`status` pair [`classify`]
+    /// buckets. Everything else is absent, which is the common case on the wire.
+    pub(crate) fn fixture(kind: &str, state: Option<&str>, status: Option<&str>) -> Self {
+        Self {
+            kind: kind.to_string(),
+            id: None,
+            state: state.map(str::to_owned),
+            status: status.map(str::to_owned),
+            pid: None,
+            started_at_ms: None,
+        }
+    }
+
+    /// Put a `pid` on a fixture, EXPLICITLY and at the call site — the one way a
+    /// test says "this record carries a process id" without a fixture helper
+    /// having to grow a parameter every caller then has to pass `None` to.
+    pub(crate) fn with_pid(mut self, pid: u32) -> Self {
+        self.pid = Some(pid);
+        self
     }
 }
 
@@ -425,6 +523,47 @@ pub fn friendly_status(agent: &ReportedAgent) -> String {
     format!("{label} {phrase}")
 }
 
+/// How long before `now_ms` claude says a session started, in ONE coarse unit —
+/// `42s`, `46m`, `3h` — or `None` when there is nothing honest to say.
+///
+/// Its one consumer is [`crate::tui::view::preview_banner`], which composes it
+/// beside [`friendly_status`] so a wedged child reads `live busy · 46m`.
+///
+/// Pure: BOTH instants are parameters, so it never reads a clock. `started_at_ms`
+/// is [`ReportedAgent::started_at_ms`] (epoch millis off the wire), and `now_ms` is
+/// a wall-clock instant in the same epoch-millis unit that the caller already
+/// holds. Never pass [`crate::watch`]'s monotonic milliseconds here: they count
+/// from process start, so the difference would be meaningless.
+///
+/// `None` in each case where an age would claim something not observed:
+///
+/// * `started_at_ms` is absent. The wire omitted `startedAt`, or sent it
+///   mistyped, and [`parse_agents_json`] kept the record without it.
+/// * It lies AFTER `now_ms`. A start in the future means the two clocks disagree
+///   (claude's and this board's), and both a negative age and one clamped to `0s`
+///   would describe an instant nobody saw.
+/// * The subtraction overflows `i64`. Only a garbage `startedAt` can do that, and
+///   it gets the same fail-soft answer as a missing one.
+///
+/// It TRUNCATES and never rounds, so 59 999 ms reads `59s`, not `1m`: the phrase
+/// never claims more time has passed than has. The unit switches at
+/// [`SECS_PER_MINUTE`] and [`SECS_PER_HOUR`].
+#[must_use]
+pub fn elapsed_phrase(started_at_ms: Option<i64>, now_ms: i64) -> Option<String> {
+    let elapsed_ms = now_ms.checked_sub(started_at_ms?)?;
+    if elapsed_ms < 0 {
+        return None; // Started in the future: the clocks disagree, say nothing.
+    }
+    let secs = elapsed_ms / MS_PER_SECOND;
+    Some(if secs < SECS_PER_MINUTE {
+        format!("{secs}s")
+    } else if secs < SECS_PER_HOUR {
+        format!("{}m", secs / SECS_PER_MINUTE)
+    } else {
+        format!("{}h", secs / SECS_PER_HOUR)
+    })
+}
+
 /// Whether a reported agent is actively WORKING (versus waiting or finished),
 /// deciding if its list-badge dot pulses.
 ///
@@ -498,7 +637,17 @@ pub fn parse_agents_json(raw: &str) -> HashMap<String, ReportedAgent> {
                 id: str_field("id"),
                 state: str_field("state"),
                 status: str_field("status"),
-                name: str_field("name"),
+                // `pid` and `startedAt` are JSON NUMBERS on the wire (measured
+                // at claude 2.1.278), so they need their own readers: passing
+                // either through `str_field` would silently yield `None` on
+                // EVERY real record. Both stay fail-soft — absent, mistyped, or
+                // (for `pid`) out of `u32` range all degrade to `None` and never
+                // discard the record.
+                pid: element
+                    .get("pid")
+                    .and_then(Value::as_u64)
+                    .and_then(|pid| u32::try_from(pid).ok()),
+                started_at_ms: element.get("startedAt").and_then(Value::as_i64),
             },
         );
     }
@@ -688,14 +837,12 @@ mod tests {
 
     /// A synthetic `ReportedAgent` carrying only what the classifier reads, so
     /// each test below states just the kind + qualifier source it cares about.
+    ///
+    /// A test that also needs a process id appends
+    /// [`ReportedAgent::with_pid`] rather than this growing a fourth parameter
+    /// every existing caller would have to pass `None` to.
     fn agent(kind: &str, state: Option<&str>, status: Option<&str>) -> ReportedAgent {
-        ReportedAgent {
-            kind: kind.to_string(),
-            id: None,
-            state: state.map(str::to_owned),
-            status: status.map(str::to_owned),
-            name: None,
-        }
+        ReportedAgent::fixture(kind, state, status)
     }
 
     /// `qualifier_copy` is the shared translation the preview banner AND the
@@ -1068,6 +1215,54 @@ mod tests {
         assert_eq!(qualifier_copy(&unknown), Some("compacting"));
     }
 
+    /// The age phrase: one coarse unit, truncated, switching at the two pinned
+    /// points, and `None` wherever an age would claim something nobody observed.
+    ///
+    /// Both instants are stated, never read from a clock, so each row is exact.
+    /// The rows sit on both sides of each switch (`SECS_PER_MINUTE`,
+    /// `SECS_PER_HOUR`): a retune of either moves a row here before it moves a
+    /// banner.
+    #[test]
+    fn elapsed_phrase_says_one_coarse_unit_and_nothing_it_did_not_observe() {
+        // A real `startedAt` from the 2.1.278 capture, so the arithmetic runs at the
+        // magnitude the wire actually sends (13-digit epoch millis).
+        let start: i64 = 1_790_152_789_592;
+        const SEC: i64 = 1_000;
+        const MIN: i64 = 60 * SEC;
+        const HOUR: i64 = 60 * MIN;
+
+        for (elapsed_ms, expected) in [
+            (0, Some("0s")),
+            (999, Some("0s")), // truncates: under a second is still 0s
+            (SEC, Some("1s")),
+            (MIN - 1, Some("59s")), // the last row before the s -> m switch
+            (MIN, Some("1m")),      // ...and the switch itself
+            (46 * MIN + 59 * SEC, Some("46m")), // the wedged child the banner is for
+            (HOUR - 1, Some("59m")), // the last row before the m -> h switch
+            (HOUR, Some("1h")),     // ...and the switch itself
+            (72 * HOUR + 59 * MIN, Some("72h")), // no day unit: three days is 72h
+            (-1, None),             // a start 1 ms in the FUTURE: the clocks disagree
+            (-HOUR, None),
+        ] {
+            assert_eq!(
+                elapsed_phrase(Some(start), start + elapsed_ms).as_deref(),
+                expected,
+                "{elapsed_ms} ms after the start"
+            );
+        }
+
+        assert_eq!(
+            elapsed_phrase(None, start),
+            None,
+            "no startedAt on the record -> no age"
+        );
+        assert_eq!(
+            elapsed_phrase(Some(i64::MIN), i64::MAX),
+            None,
+            "a garbage startedAt that overflows the subtraction is fail-soft, not a panic"
+        );
+    }
+
     /// The BOARD poll's exact invocation, pinned without spawning `claude` (the
     /// suite never does) — the same way `resume`'s hand-off argvs are pinned.
     ///
@@ -1160,21 +1355,38 @@ mod tests {
     }
 
     /// Task VERIFY-2 (parse side): reported agents are keyed by their FULL
-    /// `sessionId`, with kind/state/status extracted.
+    /// `sessionId`, with kind/state/status/pid/startedAt extracted.
+    ///
+    /// The four records mirror the shapes MEASURED at `claude 2.1.278`, plus the
+    /// two drift shapes the fail-soft reads exist for:
+    ///
+    /// 1. a background record with a job `id` and NEITHER `pid` nor `startedAt`
+    ///    (0/159 background records carried a pid) — and still carrying the
+    ///    `name` key snapback no longer reads, which must be ignored rather than
+    ///    spoil the record;
+    /// 2. an interactive record with NO job id and BOTH numbers present (3/3);
+    /// 3. the same shape with both MISTYPED as JSON strings — the record survives
+    ///    with both fields `None`, which is why neither is read through
+    ///    `str_field`;
+    /// 4. a `pid` too large for a `u32`, pinning the narrowing rather than a
+    ///    panic or a truncation.
     #[test]
     fn parses_reported_agents_keyed_by_full_session_id() {
         let raw = r#"[
-            {"sessionId":"11111111-2222-3333-4444-555555555555","kind":"background","state":"blocked","status":"idle","pid":42,"id":"11111111","name":"bg-one"},
-            {"sessionId":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","kind":"interactive","status":"busy"}
+            {"sessionId":"11111111-2222-3333-4444-555555555555","kind":"background","state":"blocked","status":"idle","id":"11111111","name":"bg-one"},
+            {"sessionId":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","kind":"interactive","status":"busy","pid":29628,"startedAt":1790152789592},
+            {"sessionId":"bbbbbbbb-cccc-dddd-eeee-ffffffffffff","kind":"interactive","status":"busy","pid":"29628","startedAt":"1790152789592"},
+            {"sessionId":"cccccccc-dddd-eeee-ffff-000000000000","kind":"interactive","status":"busy","pid":99999999999}
         ]"#;
         let reported = parse_agents_json(raw);
-        assert_eq!(reported.len(), 2);
+        assert_eq!(reported.len(), 4);
 
         let bg = reported
             .get("11111111-2222-3333-4444-555555555555")
             .expect("background agent present under its full sessionId");
-        // Full struct equality also exercises every field (incl. `name` and the
-        // short agent-view `id` that `claude attach` matches).
+        // Full struct equality also exercises every field (incl. the short
+        // agent-view `id` that `claude attach` matches), and pins that an
+        // absent `pid`/`startedAt` reads as `None` rather than as a zero.
         assert_eq!(
             bg,
             &ReportedAgent {
@@ -1182,7 +1394,8 @@ mod tests {
                 id: Some("11111111".to_string()),
                 state: Some("blocked".to_string()),
                 status: Some("idle".to_string()),
-                name: Some("bg-one".to_string()),
+                pid: None,
+                started_at_ms: None,
             }
         );
         assert_eq!(bg.kind_label(), "bg");
@@ -1195,8 +1408,77 @@ mod tests {
         // No `state` -> qualifier falls back to `status`.
         assert_eq!(inter.qualifier(), Some("busy"));
         // An interactive session exposes no agent-view job `id` -> not
-        // attachable (the gate the Attach hand-off relies on).
+        // attachable (the gate the Attach hand-off relies on)...
         assert_eq!(inter.id, None);
+        // ...but it DOES carry the process id and start instant, as NUMBERS on
+        // the wire: the interrupt gate's signal route reads the first, the
+        // preview banner's age phrase the second.
+        assert_eq!(
+            inter,
+            &ReportedAgent {
+                kind: "interactive".to_string(),
+                id: None,
+                state: None,
+                status: Some("busy".to_string()),
+                pid: Some(29628),
+                started_at_ms: Some(1_790_152_789_592),
+            }
+        );
+
+        // Mistyped as strings -> both `None`, record KEPT. `startedAt`'s 13-digit
+        // value would not fit an `i32` either, so this also pins the width.
+        let mistyped = reported
+            .get("bbbbbbbb-cccc-dddd-eeee-ffffffffffff")
+            .expect("a record with mistyped numbers is still kept");
+        assert_eq!(mistyped.qualifier(), Some("busy"));
+        assert_eq!(
+            (mistyped.pid, mistyped.started_at_ms),
+            (None, None),
+            "a JSON string where a number belongs must degrade to None, never \
+             discard the record"
+        );
+
+        // Out of `u32` range -> `None`, not a truncated pid. Signalling a
+        // truncated pid would hit an arbitrary process.
+        let oversized = reported
+            .get("cccccccc-dddd-eeee-ffff-000000000000")
+            .expect("a record with an out-of-range pid is still kept");
+        assert_eq!(oversized.pid, None);
+    }
+
+    /// The two new fields are INERT to every pre-existing consumer: adding a
+    /// `pid` must not move the badge, the qualifier, the activity bucket or the
+    /// pulse.
+    ///
+    /// This guards the one leak that would be dangerous. `classify` is what
+    /// `delete::can_delete` reads before an IRREVERSIBLE unlink, so if a
+    /// pid could perturb a bucket it would reach that guard sideways — without
+    /// `delete.rs` ever mentioning the field. Pinning it here makes the
+    /// prohibition in `ReportedAgent::pid`'s doc comment executable.
+    #[test]
+    fn a_pid_perturbs_no_pre_existing_decision() {
+        for (kind, state, status) in [
+            ("interactive", None, Some("busy")),
+            ("background", Some("blocked"), None),
+            ("background", Some("working"), Some("idle")),
+            ("background", Some("stopped"), None),
+        ] {
+            let without = agent(kind, state, status);
+            let with = agent(kind, state, status).with_pid(29628);
+            assert_eq!(
+                classify(&without),
+                classify(&with),
+                "a pid must not move the activity bucket for {kind}/{state:?}/{status:?}"
+            );
+            assert_eq!(is_active(&without), is_active(&with));
+            assert_eq!(without.kind_label(), with.kind_label());
+            assert_eq!(without.qualifier(), with.qualifier());
+            assert_eq!(
+                friendly_status(&without),
+                friendly_status(&with),
+                "the preview banner's kind+qualifier phrase must not move either"
+            );
+        }
     }
 
     /// A well-formed one-record agents array. Shared by the success/failure pair
@@ -1276,6 +1558,9 @@ mod tests {
         // `kind` was a NUMBER (not a string) -> fail-soft to empty, no panic.
         assert_eq!(kept.kind, "");
         assert_eq!(kept.qualifier(), None);
-        assert_eq!(kept.name, None);
+        // Every other optional field is absent rather than defaulted, including
+        // the two numeric ones.
+        assert_eq!(kept.pid, None);
+        assert_eq!(kept.started_at_ms, None);
     }
 }

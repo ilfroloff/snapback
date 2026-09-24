@@ -107,7 +107,10 @@ file descriptor on it and has no write to corrupt (measured on one machine: 72 o
 74 active records were background and stopped, `lsof` showing zero open
 transcripts). Bare membership therefore refused ~97% of the rows claude reports,
 including ones idle for weeks. So an OPEN INTERACTIVE session is refused (its next
-keystroke appends here) and a background agent is judged by its
+keystroke appends here — or, for the other process shape claude reports under
+that `kind`, its in-flight `claude -p` reply does; see
+[what `kind: "interactive"` denotes](#what-kind-interactive-denotes)) and a
+background agent is judged by its
 [activity bucket](#activity-buckets-agentactivity): `NeedsInput`,
 `WorkingButIdle`, `Done` and `Ended` are parked and deletable; `Working`, `Idle`
 and `Other` are refused, the last of those because an unreadable qualifier must
@@ -143,9 +146,67 @@ reasoning is written down.
 
 What is left for a parked agent is **resurrection, not corruption** — attaching
 and replying later re-creates the file with only the new lines — and the confirm
-modal STATES that rather than refusing over it. The `pid` on the wire is
-deliberately unused: it is absent on roughly half the records and does not
-correlate with recent writes.
+modal STATES that rather than refusing over it.
+
+**The `pid` on the wire is deliberately unused HERE: it does not prove a write,
+and it stays out of `delete::can_delete`.** That decision answered one question,
+"does a `pid` show that something is WRITING this transcript?", and the answer is
+still no. The figure it was first argued from ("absent on roughly half the
+records, and uncorrelated with recent writes") was taken at an earlier `claude`
+and no longer describes the wire. Re-measured at `claude 2.1.278` on 2026-09-23,
+with the bare and `--all` probes taken within the same second (non-`null` counts):
+
+| `kind` | `id` present | `pid` present |
+| --- | --- | --- |
+| `interactive` | 0/3 (both probes) | 3/3 (both probes) |
+| `background` | 159/159 `--all`, 83/83 bare | **0/159** `--all`, 0/83 bare |
+
+An earlier sample at the same version, taken on 2026-09-21, read interactive `id`
+0/5 and `pid` 5/5, and background `id` 150/150 and `pid` **2/150**. A spot-check
+at `claude 2.1.280` on 2026-09-24 agreed with the first table: interactive `id` 0/2 and `pid` 2/2; background `id` 164/164 and
+`pid` 0/164 under `--all`, 82/82 and 0/82 bare. So the pid is now absent almost
+exactly where a job id already exists, but not exactly, and not by any contract
+claude states. That is why "no job id" and "has a pid" stay two
+SEPARATE conditions everywhere they are read, and neither is inferred from the
+other or from `kind`. The re-measurement changes the figure, not the decision: a
+present pid is still no evidence of a write, and an absent one no evidence of
+none.
+
+The pid now has exactly ONE consumer, and it asks a DIFFERENT question: the
+[`Ctrl-K` interrupt gate's signal route](#the-signal-route-no-job-id-a-pid) asks
+"which process do I signal?" for a reported session that has no stoppable job
+id. That consumer is the only reason `ReportedAgent::pid` exists, and the field's
+doc comment carries the same prohibition as this note, so the pid cannot drift
+into the writer guard without contradicting both.
+
+**Known, accepted risk on that route (ratified, not engineered around).** The
+route sends a SIGTERM and nothing stronger: no SIGKILL and no escalation. It
+guards the pid with an unconditional confirm and a confirm-time re-probe
+(`send::signal_plan`). Two gaps remain, and a third is now guarded:
+
+- **A reused pid can pass the confirm-time re-check.** The re-probe proves that
+  claude STILL REPORTS the same pid for the session. It cannot prove that the
+  process holding that number now is the one claude means: if claude's record
+  outlives its process and the kernel hands the number to something else, the
+  check passes and the SIGTERM reaches the newcomer. A short window also remains
+  between the re-probe and `kill(2)`.
+- **pid `1` is accepted.** `send::signallable_pid` refuses only what is not a
+  strictly positive `pid_t` (`0`, a negative, anything past `i32::MAX`), so that
+  no value can reach a process group or a broadcast, plus the board's own pid
+  (below); `send::signal_target` re-checks the range half. A record naming pid
+  `1` would be confirmed and signalled like any other. For an unprivileged user
+  the OS normally refuses that with `EPERM`, which lands as a sticky `signal
+  failed:` status.
+- **GUARDED: snapback's own pid.** snapback installs no SIGTERM handler, so a
+  SIGTERM to its own process would end the board without its terminal restore.
+  `send::signallable_pid` therefore refuses the board's own pid, so the gate
+  answers `INTERRUPT_PID_UNUSABLE` and no confirm opens. The rule stays pure: it
+  takes that pid as a parameter, captured once at construction as `App::own_pid`
+  from `std::process::id()`. `send::signal_target`, the last check before
+  `kill(2)`, asks only the range half, because `signal_term` hands it the pid
+  alone. That costs nothing: a process's id cannot change while it runs, so the
+  gate's verdict on it cannot go stale, and the only pid that reaches `kill(2)`
+  is the one `signal_plan` matched against a pid that gate accepted.
 
 ### The three file kinds
 
@@ -983,7 +1044,7 @@ machine-readable window onto that, and `snapback` reads it **twice, differently*
 | Reading | Command | Asked | Question |
 | --- | --- | --- | --- |
 | **Board signal** (`reported_agents`) | `--json --all` | polled off-thread every `watch::AGENTS_REFRESH` (5s), skipped once the board has been idle past `watch::AGENTS_IDLE_AFTER` (60s) | "what should each row's badge say?" |
-| **Hand-off signal** (`live_agents`) | `--json` (**no `--all`**) | one-shot at EVERY hand-off | "will `claude -r` refuse *right now*?" **and** "what job id does `claude attach`/`claude stop` take?" |
+| **Hand-off signal** (`live_agents`) | `--json` (**no `--all`**) | one-shot at EVERY hand-off | "will `claude -r` refuse *right now*?" **and** "what job id does `claude attach`/`claude stop` take?" **and**, for a record with no job id, "which `pid` does `Ctrl-K`'s signal route take?" |
 
 The hand-off reading serves FOUR gates, not just Enter: resume, Attach, the
 `Ctrl-R` [reply gate](#quick-reply--non-interactive-send-srcsendrs) and the
@@ -991,26 +1052,111 @@ The hand-off reading serves FOUR gates, not just Enter: resume, Attach, the
 The last two also CLASSIFY the record (via `agents::classify`) rather than reading
 membership alone — the only place a bucket informs an action rather than a pixel,
 and it is still claude's own fresh answer, never the polled `--all` map.
+`Ctrl-K`'s [signal route](#the-signal-route-no-job-id-a-pid) asks it TWICE: once
+at the keypress, to choose the route, and again at the confirm's `Enter`, to
+re-verify the pid before anything is signalled.
 
 The hand-off reading returns the **records**, not bare ids, so both of its
 questions are answered by ONE authoritative read: liveness is membership, and the
 attach target is the matched record's own `id`. The rule is uniform — **every
 hand-off re-asks claude; nothing hands off on polled data.**
 
-Both join to sessions by the **full** `sessionId`. Fields used: `kind`
-(`background`→`bg`, `interactive`→`live`), `id` (the **short agent-view job id**,
-e.g. `ca56b543` — distinct from the full `sessionId`; present only on
-**background** agents, so an interactive session has nothing to attach to;
-the authoritative target for Attach **when read from the `live_agents` probe** —
-never from the `--all` map, which is a stale snapshot of a job that may have
-ended), `state`/`status` (the activity qualifier, see below), `name`. Parsing is
-fail-soft: any failure ⇒ empty map.
+Both join to sessions by the **full** `sessionId`. Fields used, each with the
+step that branches on it:
+
+- `kind` (`background`→`bg`, `interactive`→`live`): the badge's kind label, and
+  the hard-delete guard's interactive refusal. What `interactive` actually
+  denotes is measured, not documented; see
+  [below](#what-kind-interactive-denotes).
+- `id`, the **short agent-view job id** (e.g. `ca56b543`, distinct from the full
+  `sessionId`). Present only on **background** records, so a record without one
+  has no job to attach to or `claude stop`. It is the authoritative target for
+  Attach and `claude stop` **when read from the `live_agents` probe**, never from
+  the `--all` map, which is a stale snapshot of a job that may have ended.
+- `state`/`status`, the activity qualifier (see below).
+- `pid`, the OS process id claude reports: a JSON number, read with `as_u64` and
+  narrowed with `u32::try_from`, so an absent, mistyped (a string) or out-of-range
+  value is `None` and never discards the record. Its one consumer is `Ctrl-K`'s
+  [signal route](#the-signal-route-no-job-id-a-pid). It is NOT a writer signal;
+  see [the one write into this tree](#on-disk-layout).
+- `startedAt`, when claude says the session started: epoch MILLISECONDS as a JSON
+  number (13 digits, e.g. `1790152789592`), read with `as_i64`, fail-soft. Its
+  one consumer is the preview banner's age phrase (`live busy · 46m`, built by
+  the pure `agents::elapsed_phrase`).
+
+`name` is still on the wire (69/83 background and 3/3 interactive records in the
+2.1.278 bare probe) but is no longer parsed: `ReportedAgent` dropped it because
+nothing read it, not because claude stopped sending it. Parsing is fail-soft: any
+failure ⇒ empty map, and one bad field never discards its record.
+
+**Two fields, two sources, two questions.** The signal route's `pid` comes ONLY
+from the bare one-shot probe (`App::live_agent_now`), never from the polled
+`--all` map. That is the rule `id` already follows, and it matters more here: a
+stale job id makes `claude stop` fail with "No job matching", while a stale pid
+may already belong to an unrelated process. The banner's `startedAt` DOES come
+from the polled `--all` map, because an age is a display fact and not a gate. Its
+"now" is the instant the poller got its answer: the wall-clock stamp
+`watch::AppEvent::ReportedAgents` carries as `reported_at_ms` and
+`App::set_reported_agents` stores, together with the map, in
+`App::reported_at_ms`. Render never reads a clock, and `watch`'s MONOTONIC clock
+(the idle gate's) is never used for it, since it is not comparable to epoch
+millis. The age counts from the session's reported START, not from when its
+current qualifier began. For a one-shot `claude -p` child the two coincide; for a
+long-running TUI they need not, and the banner still says only what it claims.
 
 The board's shell-out passes **`--all`** because the bare command lists a finished
 job only until claude reaps it from the active list (a just-`done` background job
 lingers there for a while, then drops out): without the flag a finished session's
 badge would vanish the moment claude reaps it, so `--all` is what keeps every
 `done` session — reaped or not — reliably badged.
+
+#### What `kind: "interactive"` denotes
+
+claude does not document it, and the word promises more than the evidence
+supports. What follows is **evidence measured on one machine, with its limits,
+not a contract**. Each row was read from `ps` (pid, parent, argv) against the
+`pid` of every interactive record the probe returned:
+
+| Sample | `claude` | Interactive records | Process behind each `pid` | `status` |
+| --- | --- | --- | --- | --- |
+| 2026-09-21 (two probes ~8 min apart) | 2.1.278 | 8 | `claude -p -r <id> --output-format json <msg>` (the argv `send::build_send_argv` builds), parented by a `snapback` process | `busy` |
+| 2026-09-23 | 2.1.278 | 3 | the same argv and the same parentage | `busy` ×3 |
+| 2026-09-24 | 2.1.280 | 2 | a pty-backed interactive TUI (`claude …` on a tty, one of them `claude -r <id>`), parented by a `snapback` process that had handed its terminal to it | `busy` ×1, `idle` ×1 |
+
+At 2.1.278 that is **11/11** print-mode children across the two samples, with no
+counter-example. Two NEGATIVE probes were also run at 2.1.278, on 2026-09-21: a
+pty-backed `claude -r <existing-id>` TUI (watched for 15 s) and a `claude --bare`
+TUI (10 s) did not register at all.
+
+So `kind: "interactive"` is best read as **"claude reports a live process for
+this session and no background job"**. It covers at least TWO process shapes: a
+print-mode `claude -p` child mid-reply (every record at 2.1.278) and a real TUI,
+busy or idle (every record at 2.1.280). The reading once held open as the
+alternative — that a real TUI registers too, perhaps only while a turn is in
+flight — is therefore OBSERVED at 2.1.280, and the idle TUI shows registration is
+not keyed to a turn in flight there. Whether the 2.1.278 negative probes reflect
+a version change or only their short windows is not known.
+
+The limits are the reason this is written down rather than built on. It is `ps`
+parentage on one machine where nearly every `claude` starts through snapback, so
+"parented by snapback" describes that machine, not who owns a record anywhere
+else, and nothing snapback can observe proves who owns a pid. Hence three rules
+the code follows:
+
+- **No user-facing string names an owner or picks a reading.** The no-job-id
+  refusals and the signal confirm describe only the record (no attachable job, a
+  process with this pid). The test-only `send::OWNERSHIP_CLAIMS` list pins the
+  phrasings they must never use ("your terminal", "another terminal", "the
+  terminal that's running it", "own terminal", "snapback started"). The
+  refusal-copy test also bars the four refusals such a record can meet
+  (`INTERRUPT_NO_JOB_ID`, `INTERRUPT_PID_UNUSABLE`, `ATTACH_NO_JOB_ID`,
+  `SEND_LIVE_REFUSED`) from calling the session "interactive".
+- **The signal route treats every such pid as possibly someone else's process:**
+  SIGTERM only, behind an unconditional confirm and a confirm-time re-probe. See
+  [the signal route](#the-signal-route-no-job-id-a-pid).
+- **The hard-delete guard's `KIND_INTERACTIVE` refusal holds under either
+  reading.** A TUI appends on its next turn and a `claude -p` child appends its
+  reply, so the record marks a writer both ways.
 
 #### Why the gate does not read the `--all` map
 
@@ -1147,8 +1293,10 @@ it doing right now":
   IRREVERSIBLE, so a change to `classify` is now weighed against it as well as
   against the badge it draws;
 * the `Ctrl-R`/`Ctrl-K` stop routing (`send::reply_gate` /
-  `send::interrupt_gate`), which is reversible by comparison — it ends a job but
-  keeps the conversation.
+  `send::interrupt_gate`) on a record that carries a job id, which is reversible
+  by comparison — it ends a job but keeps the conversation. `Ctrl-K`'s
+  [signal route](#the-signal-route-no-job-id-a-pid), for a record with no job id,
+  reads no bucket at all: it confirms in every state.
 
 ALL FOUR of those allow arms can fire: the BARE list the guard reads carries a
 `done` job for the whole window before claude reaps it, so retuning `Done` moves
@@ -1239,7 +1387,33 @@ re-derived:
 | --- | --- | --- | --- |
 | `claude agents --json` | 74 | `done`×0; 72 background `blocked`/`waiting`, 2 interactive | — |
 
-Notes across both samples: `done` occurred **only** under `--all` — **zero**
+Sample C, dated 2026-09-23 at `claude 2.1.278`, taken for the `Ctrl-K` signal
+route (both probes within the same second; its `id`/`pid` counts are in
+[the one write into this tree](#on-disk-layout)):
+
+| Command | Entries | `state` | `status` |
+| --- | --- | --- | --- |
+| `claude agents --json` | 86 (83 background, 3 interactive) | `blocked`×83, background only | `busy`×3, interactive only |
+| `claude agents --json --all` | 162 (159 background, 3 interactive) | on all 159 background: `blocked` / `done` / `stopped` (split not recorded) | `busy`×3, interactive only |
+
+Sample D, dated 2026-09-24 at `claude 2.1.280`, a spot-check:
+
+| Command | Entries | `state` | `status` |
+| --- | --- | --- | --- |
+| `claude agents --json` | 84 (82 background, 2 interactive) | `blocked`×82, background only | `busy`×1, `idle`×1, interactive only |
+| `claude agents --json --all` | 166 (164 background, 2 interactive) | `blocked`×82, `stopped`×67, `done`×14, `failed`×1 | `busy`×1, `idle`×1, interactive only |
+
+In Samples C and D, `state` and `status` were **kind-exclusive**: every background
+record carried a `state` and no `status`, and every interactive record the
+reverse. Sample A had records carrying BOTH (35 with a `state` and 21 with a
+`status` among 37 entries), which is the pair `WorkingButIdle` reads. So the
+exclusivity is a sample, not a rule: the parser keeps reading both fields and
+`ReportedAgent::qualifier` keeps its `state`-first precedence. Neither bare list
+carried `done`, and the nine-key union (`cwd`, `id`, `kind`, `name`, `pid`,
+`sessionId`, `startedAt`, `state`, `status`) was identical in both samples and
+both probes.
+
+Notes across Samples A and B: `done` occurred **only** under `--all` — **zero**
 occurrences in either bare list (37 entries, then 74) — which is the direct
 evidence for the flag. It is NOT evidence that a bare list cannot carry `done`:
 claude holds a finished job there until it reaps it, so both probes simply landed
@@ -1489,10 +1663,15 @@ different mechanism, same verb.
 
 `claude attach` matches the agent-view **job id** (the short id), not the full
 `sessionId` — a full UUID exits 1 ("No job matching"). Only **background** agents
-carry that id, so Attach applies to them; an **interactive** live session has no
-job id and cannot be attached (the Attach choice refuses with a clear hint,
-pointing at Fork or opening it in its own terminal). The short id comes straight
-from claude's authoritative `id`; it is never derived by splitting the UUID.
+carry that id, so Attach applies to them. A record claude reports without one
+(every `kind: "interactive"` record measured so far) cannot be attached: the
+Attach choice refuses with `resume::ATTACH_NO_JOB_ID`, which states the absent
+job and points at Fork, the one move that works on that record under
+[either reading of its `kind`](#what-kind-interactive-denotes). It names no
+terminal and no owner. `Ctrl-K` can still reach such a record through its
+[signal route](#the-signal-route-no-job-id-a-pid) when claude reports a `pid`.
+The short id comes straight from claude's authoritative `id`; it is never derived
+by splitting the UUID.
 
 Before any hand-off, `cwd` and `sessionId` are **re-read from inside the file**
 (authoritative at hand-off time) and the `cwd` must still exist on disk;
@@ -1683,18 +1862,28 @@ never the polled `--all` map — classified by the one `agents::classify`), and
 | Probe result | Bucket | `Ctrl-R` (`send::reply_gate`) |
 | --- | --- | --- |
 | claude is not holding the session | — | reply in place, no stop (compose opens) |
-| held, but the record carries no stoppable job id (an **interactive** session) | — | refuse (`SEND_LIVE_REFUSED`) |
+| held, but the record carries no stoppable job id (every `kind: "interactive"` record measured so far), with or without a `pid` | — | refuse (`SEND_LIVE_REFUSED`) — try `Ctrl-K` or Fork (`Ctrl-F`) |
 | `done` | `Done` | stop the ended job, then reply — straight to compose |
 | `stopped`, `failed` | `Ended` | same: stop, then reply |
 | `blocked`, `waiting` | `NeedsInput` | **confirm** (`App::pending_stop`, a small modal — stopping abandons a waiting agent), then stop + reply |
-| `working`, `busy` | `Working` | refuse (`SEND_LIVE_REFUSED`) — Attach or Fork instead |
-| `state`=`working`/`busy` **AND** `status`=`idle` | `WorkingButIdle` (reads `interrupted`) | refuse |
-| `idle` | `Idle` | refuse |
-| anything else, or no qualifier at all | `Other` | refuse |
+| `working`, `busy` | `Working` | refuse (`SEND_LIVE_REFUSED`) — try `Ctrl-K` or Fork (`Ctrl-F`) |
+| `state`=`working`/`busy` **AND** `status`=`idle` | `WorkingButIdle` (reads `interrupted`) | refuse (the same message) |
+| `idle` | `Idle` | refuse (the same message) |
+| anything else, or no qualifier at all | `Other` | refuse (the same message) |
 
 The **job-id check runs BEFORE the bucket** and wins in every state: an agent
-`claude stop` cannot address is unstoppable whatever it is doing, so even a `done`
-interactive session refuses.
+`claude stop` cannot address is unstoppable by this path whatever it is doing, so
+even a `done` record with no job id refuses. A `pid` on that record does not
+change this. Signalling is `Ctrl-K`'s own confirmed verb and never a reply's
+preparatory step.
+
+`SEND_LIVE_REFUSED` serves both kinds of refused record, so it names only moves
+that hold for BOTH: Fork, and `Ctrl-K`, offered with "Try" rather than promised
+(`Ctrl-K` has a route for a job id and one for a `pid`, but still refuses a
+record with neither). It used to say "Attach to answer it", and Attach refuses a
+record with no job id (`resume::ATTACH_NO_JOB_ID`), so the hint led to a second
+refusal. Attach is still one keypress away on a job-id record, through `Enter`'s
+running-session choice.
 
 **The two STEADY buckets part ways here, and that split is the point.** `Ended`
 takes the stop-then-reply path while `WorkingButIdle` refuses with the live states,
@@ -1745,12 +1934,20 @@ bottom row untouched. The board must never render a failure the send never had.
 
 ## Interrupt — stopping a live agent (`Ctrl-K`, `src/send.rs`)
 
-`Ctrl-K` runs the SAME `claude stop <job-id>` the reply path uses as its unlock,
-but as the whole point rather than a preparatory step: it ends the selected
-session's live background job from the board (the conversation is kept; the job
-registration drops). It is a one-shot on a detached thread like a send —
-`Outcome::Interrupt` → `send::spawn_interrupt` → one `AppEvent::InterruptFinished`
-— so the board never tears down.
+`Ctrl-K` stops the selected session's live agent by whichever handle claude's
+record carries, and it has TWO mechanisms for that:
+
+- **A stoppable job id → `claude stop <job-id>`**, the SAME command the reply
+  path uses as its unlock, but as the whole point rather than a preparatory step:
+  it ends the selected session's live background job from the board (the
+  conversation is kept; the job registration drops). It is a one-shot on a
+  detached thread like a send — `Outcome::Interrupt` → `send::spawn_interrupt` →
+  one `AppEvent::InterruptFinished` — so the board never tears down.
+- **No job id but a `pid` → a confirmed SIGTERM to that pid**, the
+  [signal route](#the-signal-route-no-job-id-a-pid) below. It is not a `claude`
+  invocation: claude offers no verb for a record without a job id (see
+  [CLAUDE_CLI.md](CLAUDE_CLI.md#background-session-commands)), so the pid claude
+  itself reports is the only handle left.
 
 `send::interrupt_gate` mirrors `reply_gate`'s shape over the same one-shot probe,
 with the **opposite intent**: a reply must never interrupt live work, whereas an
@@ -1760,10 +1957,21 @@ a refusal.
 | Probe result | Bucket | `Ctrl-K` (`send::interrupt_gate`) |
 | --- | --- | --- |
 | claude is not holding the session | — | refuse (`INTERRUPT_NOT_LIVE`) — a transcript on disk is not a running process |
-| held, but no stoppable job id (an **interactive** session) | — | refuse (`INTERRUPT_NO_JOB_ID`) — point at the terminal that owns it |
+| held, no stoppable job id, a `pid` on the record that a signal could take | not read | **confirm** first (`App::pending_interrupt` carrying `InterruptRoute::Signal { pid }`, drawn as "signal this process?"), then [re-probe and SIGTERM](#the-signal-route-no-job-id-a-pid) |
+| held, no stoppable job id, a `pid` no signal could take (`0`, past `i32::MAX`, or the board's own process id) | not read | refuse (`INTERRUPT_PID_UNUSABLE`), so no confirm opens — worded for the record: no attachable job and a process id that cannot be signalled |
+| held, NEITHER a stoppable job id nor a `pid` | — | refuse (`INTERRUPT_NO_JOB_ID`) — worded for the record: no attachable job and no process id, so no handle here to stop or signal it |
 | `done` | `Done` | stop NOW, no confirmation (nothing is running to abandon) |
 | `stopped`, `failed` | `Ended` | same: stop now |
-| every other bucket — `Working`, `WorkingButIdle`, `NeedsInput`, `Idle`, `Other` | | **confirm** first (`App::pending_interrupt`, `view::render_interrupt_confirm`), then stop |
+| every other bucket — `Working`, `WorkingButIdle`, `NeedsInput`, `Idle`, `Other` | | **confirm** first (`App::pending_interrupt` carrying `InterruptRoute::Job { job_id }`, drawn as "stop this agent?"), then stop |
+
+The job-id rows are the delegated route and win whenever a job id exists: the pid
+is read only inside the `else` of the job-id read, so a record carrying BOTH
+handles routes by its job id and its pid is never looked at. Do not widen the pid
+arm to a record that has a job id. "No job id" and "has a pid" are tested as two
+SEPARATE conditions, and neither is inferred from the other or from `kind`
+([why](#on-disk-layout)). `INTERRUPT_NO_JOB_ID` names no terminal and no owner:
+under [either reading of `kind: "interactive"`](#what-kind-interactive-denotes) the
+record is all there is to describe.
 
 `WorkingButIdle` confirms rather than stopping outright for the same evidence gap
 the reply gate turns on: the inferred rest cannot prove the run ended, and skipping
@@ -1773,8 +1981,9 @@ costs one keypress.
 `claude stop` acts on the GLOBAL background-job registry, so the child runs in
 `App::launch_dir` — deliberately NOT a re-read of the session's own `cwd`, since a
 deleted worktree must never block stopping its still-live job. That is the one
-hand-off in the crate that does not re-read the authoritative `cwd`, and the reason
-is that the job id, not the session's directory, is what identifies the target.
+`claude` hand-off in the crate that does not re-read the authoritative `cwd`, and
+the reason is that the job id, not the session's directory, is what identifies the
+target. (The signal route needs no directory at all: `kill(2)` takes a pid.)
 `status_for_stop` maps the result: a clean exit is the neutral `stopped`, a
 non-zero one surfaces claude's own sanitized reason (`stop failed: <reason>`), so a
 failed stop never reads as a successful one.
@@ -1786,4 +1995,72 @@ only when the ids match, exactly as `App::sending_to` guards a quick reply and
 `App::launching_draft` guards a background launch. `claude stop` is a fast registry
 operation and the row badge clears on the next agents poll, so there is no
 dedicated `"stopping…"` label; the guard exists solely so a stale completion cannot
-land on a surface that has moved on.
+land on a surface that has moved on. The signal route sets no such guard, because
+it has no completion to wait for (below).
+
+### The signal route (no job id, a `pid`)
+
+**The confirm is UNCONDITIONAL.** There is no `StopNow` counterpart for a pid,
+however finished the record looks. `StopNow` is safe on the job-id route because
+stopping a job that already ended is claude's own no-op (`claude stop
+<dead-job>` just exits non-zero). A signal has no such floor: a `state`/`status`
+bucket is a report ABOUT a session, and it cannot prove that the process now
+wearing this pid is the one claude reported. The confirm names the pid and the
+session label, says a SIGTERM will be sent, and warns that the transcript may end
+mid-line: a `claude -p` child ended mid-reply can leave a truncated final JSONL
+line, which FAIL-SOFT parsing skips, and the confirm says so up front rather than
+leaving it to be discovered. It asserts nothing about who owns the process.
+
+**The pid is re-verified at `Enter`, on this route alone.** The pid captured when
+the confirm opened is a CLAIM, never a target: the confirm can sit open
+indefinitely, and a process that exits meanwhile frees its number for anything.
+So `update::dispatch_signal` asks claude AGAIN (`App::live_agent_now`, one bare
+probe) and the pure `send::signal_plan` judges the fresh record, in this order:
+
+| Fresh record at `Enter` | Result |
+| --- | --- |
+| gone — claude no longer reports the session | refuse (`SIGNAL_RECORD_GONE`): nothing was signalled |
+| now carries a stoppable job id | refuse (`SIGNAL_NOW_HAS_JOB`): the delegated verb became available, so press `Ctrl-K` again to take the `claude stop` route |
+| a different `pid`, or none | refuse (`SIGNAL_PID_MOVED`): nothing was signalled |
+| the same `pid`, still no job id | `Outcome::Signal { pid }`: send it a SIGTERM |
+
+The job-id check sits before the pid comparison. That changes no safety property
+(with both stale, either check refuses), but it decides which refusal the user
+reads, and `SIGNAL_NOW_HAS_JOB` names a next move where `SIGNAL_PID_MOVED` is a
+dead end. The re-probe is deliberately ASYMMETRIC with the job-id route, which gets
+none: a stale job id fails safe (`claude stop` exits with "No job matching" and
+`status_for_stop` shows it), while a stale pid can land on an unrelated process
+and cannot be undone. Do not "unify" the two arms. The probe is a one-shot at a
+hand-off-shaped moment, the exception
+[PATTERNS.md §6](PATTERNS.md#6-off-ui-thread-for-anything-that-can-block) allows,
+and costs the same ~0.26s hitch as the other hand-offs. What it cannot close is
+recorded as an [accepted risk](#on-disk-layout).
+
+**The signal is SIGTERM, sent inline, and reported for exactly what happened.**
+The driver performs `Outcome::Signal { pid }` synchronously, with no detached
+thread, no `AppEvent` and no `App::interrupting`: `kill(2)` returns as soon as the
+signal is queued, so there is nothing to wait for and nothing to report back. That
+is not an exception to the off-UI-thread rule, which governs blocking work. The
+driver runs `update::show_signal_result(app, send::signal_term(pid))`: the helper
+takes the syscall's result as a parameter, maps it with `send::status_for_signal`
+and applies the class below, so that choice is tested with hand-built results and
+never by signalling. `signal_term` is the crate's one syscall and this route's only
+effect. It takes its target only from the pure `send::signal_target`, which
+narrows the `u32` to a STRICTLY POSITIVE `pid_t` or refuses, so `0`, `-1` or a
+negative (a process group or a broadcast) can never reach `kill(2)`. That check is
+`send::positive_pid_t`, the range half of `send::signallable_pid`. The gate already
+applied the whole rule before any confirm opened (`INTERRUPT_PID_UNUSABLE`), so the
+range half is defence in depth here; the board's-own-pid half is not re-asked (see
+the [accepted-risk list](#on-disk-layout) for why that is safe). No test calls
+`signal_term`. There is no SIGKILL and no escalation: a process that ignores
+SIGTERM keeps running, and its row keeps its badge. Off unix, a same-signature fallback signals nothing and reports that as a
+failure.
+
+| `kill(2)` result | Status (`send::status_for_signal`) | Class |
+| --- | --- | --- |
+| delivered | `SIGNAL_SENT`: "SIGTERM sent — not waiting for it to exit" | transient |
+| `ESRCH` (no process has that pid) | `SIGNAL_ALREADY_GONE`: "no process with that id — it is already gone" | transient |
+| anything else (`EPERM`; `signal_target`'s out-of-range refusal; the off-unix fallback) | `signal failed: <reason>` (sanitized, like claude's stderr), or `SIGNAL_FAILED_GENERIC` when nothing readable is left | sticky |
+
+The success status claims delivery, never that the process ended. The row's badge
+clearing on a later agents poll is what shows it worked.

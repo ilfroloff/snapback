@@ -35,7 +35,8 @@ use crate::store::preview::{self, LinkRegion};
 use crate::store::FailedTask;
 
 use super::app::{
-    resolve_list_width, App, Modal, ModalChoice, ModalLayout, NewSessionDraft, Row, Scope,
+    resolve_list_width, App, InterruptRoute, Modal, ModalChoice, ModalLayout, NewSessionDraft, Row,
+    Scope,
 };
 use super::compose::{ComposeState, ComposeTarget};
 
@@ -1194,6 +1195,11 @@ fn blink_visible(tick: u64) -> bool {
     (tick / BLINK_TICKS).is_multiple_of(2)
 }
 
+/// The separator between the banner's status phrase and its age (`live busy · 46m`):
+/// the same middot the draft card and the board header use between facts, so the
+/// age reads as a second fact about the session and not as part of the qualifier.
+const BANNER_AGE_SEPARATOR: &str = " \u{b7} ";
+
 /// The status banner line for the SELECTED session, or `None` when there is
 /// nothing to pin (the preview then renders unchanged).
 ///
@@ -1202,18 +1208,54 @@ fn blink_visible(tick: u64) -> bool {
 ///
 /// - claude REPORTED the session as an agent — the status in words, phrased by
 ///   [`agents::friendly_status`] (no second interpretation of the `state`/`status`
-///   value set);
+///   value set), followed by its age when the record carries one (see below);
 /// - the session carries a FAILED background task the user has not written into
 ///   it since ([`Session::failed_task`](crate::store::Session::failed_task)) —
 ///   claude's own summary, when the notice carries one, quoted by
 ///   [`failed_task_banner`].
 ///
 /// Read-only over state that already exists: the selected id (`App::selected`),
-/// the `App::reported_agent` accessor and the selected session's own parsed
-/// field — no new `App` state and no new I/O.
+/// the `App::reported_agent` accessor and the stamp its map arrived with, and the
+/// selected session's own parsed field — no new I/O.
 ///
 /// Keyed on REPORTED, not live, so a FINISHED agent still gets its banner (`bg
 /// done`) rather than silently losing it.
+///
+/// # The age (`live busy · 46m`)
+///
+/// When the record carries a `startedAt`, the phrase gains how long ago claude says
+/// the session started ([`agents::elapsed_phrase`]), so a wedged child is legible
+/// rather than indistinguishable from a healthy one. [`agents::friendly_status`]
+/// still owns the phrase before the separator, which is composed beside it and never
+/// re-derived here. Three rules hold it in place:
+///
+/// * **Its "now" is the POLL's, never a clock read here.** It subtracts the record's
+///   `startedAt` from `App::reported_at_ms`, the wall-clock instant the poller
+///   stamped this same map with. The age is therefore true "as of the last poll", and
+///   this render path reads no clock. A few seconds of staleness cannot move an `m`/`h`
+///   answer.
+/// * **It reads the POLLED `--all` map, deliberately.** An age is a DISPLAY fact, so
+///   the snapshot that draws badges is the right source. The `pid` a `Ctrl-K` signal
+///   targets comes from the one-shot probe (`App::live_agent_now`) and never from
+///   here. Two sources, two questions, and neither may borrow the other's.
+/// * **It lives in typed state and draws HERE, never on `App::status`** (STATUS-LINE
+///   OWNERSHIP). An age is true over an interval, and the status line carries only
+///   the outcome or refusal of a keypress.
+///
+/// It measures from the session's reported START (`startedAt`), not from when its
+/// current turn or qualifier began: it is the session's age as claude reports it,
+/// never a turn's. The two process shapes measured behind a `kind:"interactive"`
+/// record (`docs/agents/DOMAIN.md`, "What `kind: "interactive"` denotes") read it
+/// differently. At `claude 2.1.278` every record (11/11) was a `claude -p` child,
+/// busy from its first instant, so the session's start and its one turn's start
+/// coincide and a large age is a reply that has run that long. At `claude 2.1.280`
+/// both records (2/2) were pty-backed TUIs, one `busy` and one `idle`. A TUI can stay
+/// open across many turns, so there the two need not coincide: `46m` says the
+/// session was reported started 46 minutes before the poll, not that any turn has
+/// run that long. Under either shape the banner claims exactly the session's age and
+/// nothing more. No age is drawn when there is nothing honest to state (no
+/// `startedAt`, no stamp, or a start after the stamp), and the banner's status fact
+/// is then exactly the phrase alone.
 ///
 /// Exposed to `super::update` so the link hit-test can ask the SAME question the
 /// view does — "does this session have a banner?" — and derive the same
@@ -1225,6 +1267,20 @@ fn blink_visible(tick: u64) -> bool {
 /// the `cooking…` placeholder renders INLINE at the transcript's tail instead
 /// ([`sending_tail`]), so the exchange reads as ordinary turns. Returning `None`
 /// is also what keeps the render and the click hit-test agreeing on the geometry.
+///
+/// That precedence is also why the two surfaces divide the way they do, and the
+/// age depends on it. When the in-flight child is THIS board's, the tail already
+/// says so, and the banner (with its age) steps aside. The age is for the other
+/// case, where `App::sending` is `None` and the banner is all the user gets. At
+/// `claude 2.1.278` the samples of 2026-09-21 and 2026-09-23 found that case
+/// dominant as a `claude -p` child that some OTHER snapback instance dispatched, or
+/// that outlived the board that did, so nothing here knew about the send. At
+/// `claude 2.1.280` it was also a pty-backed TUI, which is never a quick reply and
+/// so never in `App::sending` (see
+/// `docs/agents/DOMAIN.md`, "What `kind: "interactive"` denotes"). So the `cooking…`
+/// indicator is never copied into the banner,
+/// and the age is never copied into the tail. Each fact is told once, on the
+/// surface that owns it.
 pub(crate) fn preview_banner(app: &App) -> Option<Line<'static>> {
     // A NEW-SESSION draft owns the pane: the card replaces the transcript, so the
     // SELECTED session's status line has nothing left to sit above and would only
@@ -1246,11 +1302,22 @@ pub(crate) fn preview_banner(app: &App) -> Option<Line<'static>> {
     }
     let mut spans: Vec<Span<'static>> = Vec::new();
     if let Some(agent) = app.reported_agent(selected) {
+        let status = agents::friendly_status(agent);
+        // The age, measured against the stamp this same map arrived with. No clock
+        // is read here, and anything with nothing honest to state leaves the phrase
+        // alone.
+        let age = app
+            .reported_at_ms
+            .and_then(|polled_at| agents::elapsed_phrase(agent.started_at_ms, polled_at));
+        let text = match age {
+            Some(age) => format!("{status}{BANNER_AGE_SEPARATOR}{age}"),
+            None => status,
+        };
         // Cyan + BOLD marks the line as the board speaking rather than transcript
         // content (the search prompt uses the same accent). NAMED so it adapts to
         // the terminal theme — no RGB (TERMINAL-SAFE STYLING).
         spans.push(Span::styled(
-            agents::friendly_status(agent),
+            text,
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -2598,6 +2665,14 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         // a separate one) rather than beside `^U/^D`: the scroll cluster already
         // begins past column 171, so wherever in it a new token lands is equally
         // off-screen at 80 columns — this placement is purely for readability.
+        //
+        // `^K stop` covers all of `Ctrl-K`'s routes with one word, deliberately:
+        // the job-id route runs `claude stop` and the pid route sends a SIGTERM,
+        // which is a REQUEST to stop, so "stop" is true of both without promising
+        // that a process ended. It also cannot grow. It ends at EXACTLY column 80,
+        // so any extra glyph (`^K stop/signal`, say) would cut its own tail on an
+        // 80-column terminal. The routes are spelled out where there is room:
+        // `KEYS` in `cli.rs`, the README key map and the table in `update.rs`.
         Line::from(vec![Span::styled(
             "↑↓ move · ←/→ fold/expand · Enter resume · ^F fork · ^N new · ^R reply · ^K stop · ^X hide/del · type to search · Tab name/content · S-↑↓ match · ^A scope · ^/ preview · PgUp/PgDn·^U/^D·^T/^E·Home/End·wheel scroll · Esc quit",
             Style::default().add_modifier(Modifier::DIM),
@@ -2707,14 +2782,38 @@ fn render_stop_confirm(frame: &mut Frame, app: &App) {
     );
 }
 
-/// The "stop this agent?" interrupt confirmation overlay, shown when `Ctrl-K`
-/// targets a live, not-yet-finished agent. Confirming runs `claude stop <job-id>`,
-/// ending the live job (its conversation is kept) — an interrupt, so the wording
-/// says nothing about a reply, unlike [`render_stop_confirm`].
+/// The interrupt confirmation overlay (`Ctrl-K`), in the shape its
+/// [`InterruptRoute`] calls for. Confirming runs `claude stop <job-id>` on the job
+/// route, or sends the reported pid a SIGTERM on the signal route — an interrupt
+/// either way, so the wording says nothing about a reply, unlike
+/// [`render_stop_confirm`].
+///
+/// The two shapes are drawn from ONE function because they are one confirmation with
+/// two handles; the route picks the copy, the title and the box height, and everything
+/// else (the [`Clear`], the centering, the label lookup, the footer's shape) is shared
+/// so the two cannot drift apart as chrome.
+///
+/// # The signal variant's copy, and what it may not say
+///
+/// It names the pid and the session, says a SIGTERM will be sent, and warns that the
+/// transcript may end mid-line (a killed `claude -p` can leave a truncated final JSONL
+/// line — FAIL-SOFT parsing skips it, which is worth saying HERE rather than leaving a
+/// user to discover it afterwards).
+///
+/// It asserts NOTHING about who owns the process, and that restraint is evidential
+/// rather than stylistic. A `kind:"interactive"` record has been measured as two
+/// different processes: at `claude 2.1.278` every one (11/11) was a `claude -p` child,
+/// and at `claude 2.1.280` both (2/2) were pty-backed TUIs, one `busy` and one
+/// `idle`. The evidence and its limits are in `docs/agents/DOMAIN.md`, "What
+/// `kind: "interactive"` denotes". Both readings point the same way for the
+/// mechanism, so the copy is written to survive EITHER: it describes only what was
+/// OBSERVED — claude reports no attachable job, and a process with this pid — and
+/// never who started it or which terminal it belongs to. A render test pins the
+/// absence of those phrasings.
 ///
 /// Drawn last (on top of the board) with a [`Clear`]. Pure presentation — the target
-/// session and the job id live on [`App::pending_interrupt`]; styled with named
-/// colors only (TERMINAL-SAFE STYLING).
+/// session and the route live on [`App::pending_interrupt`]; styled with named colors
+/// and modifiers only (TERMINAL-SAFE STYLING).
 fn render_interrupt_confirm(frame: &mut Frame, app: &App) {
     let Some(pending) = &app.pending_interrupt else {
         return;
@@ -2724,31 +2823,61 @@ fn render_interrupt_confirm(frame: &mut Frame, app: &App) {
         .map(|s| s.label.as_str())
         .filter(|l| !l.is_empty())
         .unwrap_or(pending.session_id.as_str());
-    let area = centered_rect(frame.area(), 64, 8);
 
-    let lines = vec![
-        Line::from(Span::styled(
-            "This session is running as an agent.",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(Span::raw(format!("Stop it?  —  {label}"))),
-        Line::from(Span::styled(
-            "(ends the live agent; its conversation is kept)",
-            Style::default().add_modifier(Modifier::DIM),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Enter  stop    \u{b7}    Esc  cancel",
-            Style::default().add_modifier(Modifier::DIM),
-        )),
-    ];
+    let warn = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().add_modifier(Modifier::DIM);
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" stop this agent? ");
+    let (title, height, lines) = match &pending.route {
+        InterruptRoute::Job { .. } => (
+            " stop this agent? ",
+            8,
+            vec![
+                Line::from(Span::styled("This session is running as an agent.", warn)),
+                Line::from(""),
+                Line::from(Span::raw(format!("Stop it?  \u{2014}  {label}"))),
+                Line::from(Span::styled(
+                    "(ends the live agent; its conversation is kept)",
+                    dim,
+                )),
+                Line::from(""),
+                Line::from(Span::styled("Enter  stop    \u{b7}    Esc  cancel", dim)),
+            ],
+        ),
+        InterruptRoute::Signal { pid } => (
+            " signal this process? ",
+            11,
+            vec![
+                Line::from(Span::styled(
+                    "claude reports no attachable job for this session.",
+                    warn,
+                )),
+                Line::from(""),
+                Line::from(Span::raw(format!(
+                    "Send SIGTERM to pid {pid}?  \u{2014}  {label}"
+                ))),
+                Line::from(Span::styled(
+                    "(the pid on the record is the only handle left)",
+                    dim,
+                )),
+                Line::from(""),
+                Line::from(Span::styled("The transcript may end mid-line.", dim)),
+                Line::from(Span::styled(
+                    "snapback reads it fail-soft, so the row stays readable.",
+                    dim,
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Enter  send SIGTERM    \u{b7}    Esc  cancel",
+                    dim,
+                )),
+            ],
+        ),
+    };
+
+    let area = centered_rect(frame.area(), 64, height);
+    let block = Block::default().borders(Borders::ALL).title(title);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines)
@@ -3177,6 +3306,7 @@ mod tests {
 
     use super::super::app::ModalAction;
     use super::*;
+    use crate::send::OWNERSHIP_CLAIMS;
     use crate::store::Session;
 
     #[test]
@@ -4551,6 +4681,151 @@ mod tests {
         assert_eq!((clamped.x, clamped.y), (0, 0));
     }
 
+    // --- the interrupt confirmation overlay -------------------------------
+    //
+    // The phrasings no drawn text may contain are `crate::send::OWNERSHIP_CLAIMS`:
+    // one list, shared with the refusal-copy test in `send`, whose doc comment
+    // carries the reason.
+
+    /// Every drawn row of a full board frame, borders included.
+    fn drawn_frame(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        let buffer = drawn_buffer(app, width, height);
+        (0..height)
+            .map(|y| full_row_text(&buffer, y, width))
+            .collect()
+    }
+
+    /// A full board frame's cells, drawn with whatever overlay `app` has open.
+    fn drawn_buffer(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height))
+            .expect("build an in-memory test terminal");
+        terminal
+            .draw(|frame| render(frame, app))
+            .expect("the board must draw with the confirm open");
+        terminal.backend().buffer().clone()
+    }
+
+    /// The text drawn INSIDE the bordered box whose top border carries `title`: one
+    /// string per content row, borders excluded. Panics if no such box is drawn.
+    ///
+    /// Found by CONTENT (the title, then the box's own corners) rather than by
+    /// recomputing the renderer's `centered_rect`. A copied size can drift from the
+    /// renderer's, and a drifted rect lands on BOARD cells, where the session's label
+    /// is drawn too, so an assertion over them would pass with the box saying nothing.
+    fn boxed_rows(buffer: &ratatui::buffer::Buffer, title: &str) -> Vec<String> {
+        let (width, height) = (buffer.area.width, buffer.area.height);
+        let symbol = |x: u16, y: u16| buffer.cell((x, y)).map_or("", |cell| cell.symbol());
+        let title_len = u16::try_from(title.chars().count()).expect("a short title");
+        let spells_title = |x: u16, y: u16| {
+            (x..x.saturating_add(title_len))
+                .map(|cx| symbol(cx, y))
+                .collect::<String>()
+                == title
+        };
+        let (left, top) = (0..height)
+            .flat_map(|y| (0..width).map(move |x| (x, y)))
+            .find(|&(x, y)| symbol(x, y) == "┌" && spells_title(x + 1, y))
+            .unwrap_or_else(|| panic!("no box titled {title:?} is drawn"));
+        let right = (left + 1..width)
+            .find(|&x| symbol(x, top) == "┐")
+            .expect("the box's top-right corner");
+        let bottom = (top + 1..height)
+            .find(|&y| symbol(left, y) == "└")
+            .expect("the box's bottom-left corner");
+        (top + 1..bottom)
+            .map(|y| (left + 1..right).map(|x| symbol(x, y)).collect())
+            .collect()
+    }
+
+    /// A board with the interrupt confirm open on `route`.
+    fn confirm_app(route: InterruptRoute) -> App {
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.open_interrupt_confirm("sess-normal-1".to_string(), route);
+        app
+    }
+
+    /// The pid variant must draw the pid, the session, the verb, and the truncated-
+    /// transcript warning — and must assert NOTHING about who owns the process.
+    ///
+    /// The presence half is read from INSIDE the confirm's own box. The board row
+    /// under it draws the session's label too, so a whole-frame search for it passes
+    /// with the confirm not naming the session at all (observed: it stayed green with
+    /// the label dropped from the confirm's text).
+    ///
+    /// The absence half is the point of the test, and it is checked against every row
+    /// of the frame rather than against the lines this function happens to build, so a
+    /// later edit cannot sneak an ownership claim in through the title, the footer, or
+    /// a helper.
+    #[test]
+    fn the_signal_confirm_names_the_pid_and_claims_no_owner() {
+        const PID: u32 = 29628;
+        let (width, height) = (100, 30);
+        let mut app = confirm_app(InterruptRoute::Signal { pid: PID });
+        let buffer = drawn_buffer(&mut app, width, height);
+        let screen = (0..height)
+            .map(|y| full_row_text(&buffer, y, width))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let confirm = boxed_rows(&buffer, " signal this process? ").join("\n");
+
+        for required in [
+            "29628",             // the pid, so the user can see WHAT is being signalled
+            "SIGTERM",           // the verb, named rather than implied
+            "sess-normal-1",     // which session it belongs to
+            "no attachable job", // the observation that put us on this route
+            "mid-line",          // the truncated final JSONL line, named up front
+            "fail-soft",         // ...and that it is survivable
+            "Esc",               // the way out
+        ] {
+            assert!(
+                confirm.contains(required),
+                "the signal confirm must draw {required:?} INSIDE its box:\n{confirm}"
+            );
+        }
+
+        for claim in OWNERSHIP_CLAIMS {
+            assert!(
+                !screen.to_lowercase().contains(claim),
+                "no drawn text may claim {claim:?}:\n{screen}"
+            );
+        }
+        // "kill" would overclaim in the other direction: SIGTERM is a request, and
+        // nothing here waits to see it honoured.
+        assert!(
+            !screen.contains("Kill") && !screen.contains("kill"),
+            "the copy must not promise a kill:\n{screen}"
+        );
+    }
+
+    /// The job-id variant keeps its own wording, unchanged: one function draws both
+    /// shapes, so the signal copy must not have leaked into the delegated route.
+    #[test]
+    fn the_job_confirm_still_draws_the_delegated_stop_wording() {
+        let mut app = confirm_app(InterruptRoute::Job {
+            job_id: "job-k".to_string(),
+        });
+        let rows = drawn_frame(&mut app, 100, 30);
+        let screen = rows.join("\n");
+
+        assert!(
+            screen.contains("running as an agent") && screen.contains("conversation is kept"),
+            "the job route keeps its own copy:\n{screen}"
+        );
+        for leaked in ["SIGTERM", "pid", "mid-line"] {
+            assert!(
+                !screen.contains(leaked),
+                "the signal copy must not reach the job route ({leaked:?}):\n{screen}"
+            );
+        }
+        for claim in OWNERSHIP_CLAIMS {
+            assert!(!screen.to_lowercase().contains(claim));
+        }
+    }
+
     // --- search-match highlight run splitting -----------------------------
 
     #[test]
@@ -5409,10 +5684,11 @@ mod tests {
                 id: Some("job-1".to_string()),
                 state: Some("running".to_string()),
                 status: None,
-                name: None,
+                pid: None,
+                started_at_ms: None,
             },
         );
-        app.set_reported_agents(reported);
+        app.set_reported_agents(reported, None);
         assert!(
             preview_banner(&app).is_some(),
             "a reported session banners while browsing, or this proves nothing"
@@ -5814,10 +6090,11 @@ mod tests {
                 id: None,
                 state: Some("working".to_string()),
                 status: None,
-                name: None,
+                pid: None,
+                started_at_ms: None,
             },
         );
-        app.set_reported_agents(reported);
+        app.set_reported_agents(reported, None);
         let tail = flatten_lines(&sending_tail(&app, 80).expect("still in flight"));
         assert!(
             tail.contains("cooking") && !tail.contains("sending"),
@@ -8088,10 +8365,11 @@ mod tests {
                     id: None,
                     state: Some(state.to_string()),
                     status: None,
-                    name: None,
+                    pid: None,
+                    started_at_ms: None,
                 },
             );
-            app.set_reported_agents(reported);
+            app.set_reported_agents(reported, None);
         }
         app
     }
@@ -8262,10 +8540,11 @@ mod tests {
                 id: None,
                 state: Some("blocked".to_string()),
                 status: None,
-                name: None,
+                pid: None,
+                started_at_ms: None,
             },
         );
-        app.set_reported_agents(reported);
+        app.set_reported_agents(reported, None);
 
         // The fixture must really render to nothing, or this test proves nothing
         // — it would just be re-testing the ordinary banner path.
@@ -8451,6 +8730,120 @@ mod tests {
         assert_eq!(failure_cell.fg, Color::Red, "and wears the failure color");
     }
 
+    // --- the banner's age (`startedAt`, as of the last poll) ---------------
+
+    /// The capture's real `startedAt` (`claude 2.1.278`), so the banner is measured at
+    /// the magnitude the wire actually sends.
+    const STARTED_AT: i64 = 1_790_152_789_592;
+
+    /// 46m59s after [`STARTED_AT`]: the stalled `claude -p` child the age exists for,
+    /// one second short of the next minute, so an age that rounded would read `47m`.
+    const POLLED_46M_LATER: i64 = STARTED_AT + (46 * 60 + 59) * 1_000;
+
+    /// The sample session reported as an INTERACTIVE record mid-turn (`live busy`,
+    /// the shape every interactive record had in the capture), carrying
+    /// `started_at_ms`, in a map the poller stamped at `reported_at_ms`.
+    fn aged_banner_app(started_at_ms: Option<i64>, reported_at_ms: Option<i64>) -> App {
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        let mut agent = ReportedAgent::fixture("interactive", None, Some("busy"));
+        agent.started_at_ms = started_at_ms;
+        let mut reported = HashMap::new();
+        reported.insert("sess-normal-1".to_string(), agent);
+        app.set_reported_agents(reported, reported_at_ms);
+        app
+    }
+
+    /// A reported record with a `startedAt` leads with its AGE, measured against the
+    /// poll's stamp, so a wedged child reads `live busy · 46m` instead of looking
+    /// exactly like a healthy one.
+    ///
+    /// Read off the DRAWN row, because the row is what the user sees. The render has
+    /// no clock and no probe to consult (this board's live probe panics under test),
+    /// so the age can only have come from the POLLED map and the stamp it arrived
+    /// with.
+    #[test]
+    fn the_status_banner_shows_the_reported_age_as_of_the_last_poll() {
+        let (width, height) = BANNER_PANE;
+        let mut app = aged_banner_app(Some(STARTED_AT), Some(POLLED_46M_LATER));
+
+        let rows = inner_rows(&mut app, width, height);
+        assert_eq!(
+            rows[0], "live busy \u{b7} 46m",
+            "the banner must state how long ago claude says the session started, \
+             as of the poll that reported it"
+        );
+    }
+
+    /// With no age to state, the banner is EXACTLY today's: every cell of the pane
+    /// (text and style, via `preview_buffer`) matches a board whose record never
+    /// carried a `startedAt`, so no dangling separator, no `0s`, no restyled span.
+    ///
+    /// Three ways to have nothing to state, each drawn on its own board: the record
+    /// has no `startedAt`; the map arrived with no stamp; the start lies after the
+    /// stamp (claude's clock and this board's disagree).
+    #[test]
+    fn a_banner_with_no_age_to_state_is_exactly_todays_banner() {
+        let (width, height) = BANNER_PANE;
+        let mut baseline = aged_banner_app(None, None);
+        assert_eq!(
+            inner_rows(&mut baseline, width, height)[0],
+            "live busy",
+            "the baseline must really draw today's banner, or matching it proves nothing"
+        );
+        let todays = preview_buffer(&mut baseline, width, height);
+
+        for (case, started_at_ms, reported_at_ms) in [
+            ("no startedAt on the record", None, Some(POLLED_46M_LATER)),
+            ("no stamp on the map", Some(STARTED_AT), None),
+            (
+                "a start 1 ms after the stamp",
+                Some(POLLED_46M_LATER + 1),
+                Some(POLLED_46M_LATER),
+            ),
+        ] {
+            let mut app = aged_banner_app(started_at_ms, reported_at_ms);
+            assert_eq!(
+                preview_buffer(&mut app, width, height),
+                todays,
+                "{case}: the pane must be exactly today's, banner included"
+            );
+        }
+    }
+
+    /// While THIS board's quick reply to the row is in flight, the age is drawn
+    /// NOWHERE: the pinned banner yields to the inline `cooking…` tail, and the tail
+    /// does not borrow the age either.
+    ///
+    /// The age is for the case the banner is all a user gets, which is a child this
+    /// board did not dispatch. This board's own in-flight reply already has its
+    /// indicator, and one fact is told once.
+    #[test]
+    fn an_in_flight_reply_draws_no_age_beside_its_cooking_tail() {
+        use super::super::app::Sending;
+
+        let (width, height) = BANNER_PANE;
+        let mut app = aged_banner_app(Some(STARTED_AT), Some(POLLED_46M_LATER));
+        app.sending = Some(Sending {
+            session_id: "sess-normal-1".to_string(),
+            message: "1a".to_string(),
+            baseline_msg_count: 0,
+        });
+
+        let rows = inner_rows(&mut app, width, height);
+        assert!(
+            rows.iter().any(|row| row.contains(REPLY_COOKING_LABEL)),
+            "the inline tail must be on screen, or this test proves nothing: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("46m")),
+            "an in-flight reply's pane must not repeat the age: {rows:?}"
+        );
+    }
+
     /// The bordered preview block, as `render_preview` builds it. Shared with the
     /// geometry tests below so they measure against the REAL block rather than a
     /// look-alike.
@@ -8613,7 +9006,8 @@ mod tests {
             id: None,
             state: state.map(str::to_owned),
             status: status.map(str::to_owned),
-            name: None,
+            pid: None,
+            started_at_ms: None,
         }
     }
 
@@ -8898,13 +9292,14 @@ mod tests {
                     id: None,
                     state: Some(state.to_string()),
                     status: status.map(str::to_owned),
-                    name: None,
+                    pid: None,
+                    started_at_ms: None,
                 },
             );
             sessions.push(session);
         }
         let mut app = App::new(sessions, Scope::All, PathBuf::from("/tmp/launch"));
-        app.set_reported_agents(reported);
+        app.set_reported_agents(reported, None);
         app
     }
 
@@ -10518,13 +10913,14 @@ mod tests {
                     id: None,
                     state: Some(state.to_string()),
                     status: None,
-                    name: None,
+                    pid: None,
+                    started_at_ms: None,
                 },
             );
             sessions.push(session);
         }
         let mut app = App::new(sessions, Scope::All, PathBuf::from("/tmp/launch"));
-        app.set_reported_agents(reported);
+        app.set_reported_agents(reported, None);
         // The URL row is the selected one, so its badge and its URL share a row
         // AND its preview pane is populated from the fixture on disk.
         app.selected = Some("sess-url".to_string());
@@ -11586,12 +11982,13 @@ mod tests {
                     id: None,
                     state: Some("blocked".to_string()),
                     status: None,
-                    name: None,
+                    pid: None,
+                    started_at_ms: None,
                 },
             );
         }
         let mut app = App::new(sessions, Scope::All, PathBuf::from("/tmp/launch"));
-        app.set_reported_agents(reported);
+        app.set_reported_agents(reported, None);
         app
     }
 

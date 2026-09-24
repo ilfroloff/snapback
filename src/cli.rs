@@ -60,13 +60,17 @@ KEYS:
                   without leaving the board. An agent whose run is over (done,
                   stopped, failed) is stopped first so the reply lands in place;
                   a waiting one (needs input) confirms first; a working, idle,
-                  interrupted or unrecognized agent is refused — Attach or Fork
-                  instead (Enter sends, Ctrl-J or Alt+Enter newline, Esc cancels)
-    Ctrl-K        stop / interrupt the selected session's live background agent
-                  (claude stop); an agent whose run is over (done, stopped,
-                  failed) stops at once, every other live agent confirms first;
-                  a session claude isn't holding, or one running interactively,
-                  has no job to stop (Enter stops, Esc cancels)
+                  interrupted or unrecognized agent, or a session claude reports
+                  with no job to stop, is refused — try Ctrl-K or Fork instead
+                  (Enter sends, Ctrl-J or Alt+Enter newline, Esc cancels)
+    Ctrl-K        stop / interrupt the selected session's live agent. With a job
+                  to stop it runs claude stop: an agent whose run is over (done,
+                  stopped, failed) stops at once, every other one confirms
+                  first. With no job but a process id on claude's record it
+                  confirms, re-checks that claude still reports that same pid,
+                  then sends it SIGTERM (never SIGKILL). A session claude isn't
+                  holding, or one with neither a job nor a usable pid, is
+                  refused (Enter stops or signals, Esc cancels)
     Tab           toggle name / name+content search. Widening to content also
                   opens the preview on the most recent match, as typing does
     PgUp/PgDn     preview page  Ctrl-U/Ctrl-D  preview quarter-page
