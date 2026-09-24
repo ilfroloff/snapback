@@ -442,8 +442,9 @@ pub fn handle_event(app: &mut App, event: AppEvent, store: &mut SessionStore) ->
         // `tui::run_inner` builds a fresh `EventLoop` per board session and drops
         // the old receiver, while `lib::run` re-enters the board on the SAME `App`.
         // A card left standing there would replace EVERY session's transcript with
-        // a placeholder and hold `overlay_active` true (killing link clicks and
-        // splitter drags) until another compose was opened and cancelled.
+        // a placeholder and hold `overlay_active` true (killing link clicks, fold
+        // toggles and splitter drags) until another compose was opened and
+        // cancelled.
         app.close_compose();
     }
     outcome
@@ -7228,7 +7229,8 @@ mod tests {
     /// reports back into a channel nobody is reading and the SAME `App` re-enters
     /// the board still holding the card. That strands the preview on a placeholder
     /// for every session, with `overlay_active` stuck true (dead link clicks, dead
-    /// splitter drags), recoverable only by opening and cancelling another compose.
+    /// fold toggles, dead splitter drags), recoverable only by opening and
+    /// cancelling another compose.
     /// Every hand-off therefore ends the card with the board session it belonged to.
     #[test]
     fn handing_off_while_a_launch_is_in_flight_leaves_no_stranded_card() {
