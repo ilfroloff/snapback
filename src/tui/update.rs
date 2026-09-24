@@ -5195,10 +5195,23 @@ mod tests {
     /// to the pane: the grab band reaches leftward from the seam only, which is what
     /// keeps a node's affordance clickable
     /// (`a_click_on_a_peer_nodes_marker_cell_expands_it`).
+    ///
+    /// The drag is ALL this asserts after the press. The converse — that the press
+    /// did not ALSO toggle the node under the pointer — is deliberately NOT claimed
+    /// here, because at the seam it is unfalsifiable: `view::content_hit` refuses
+    /// every cell outside the transcript's INNER rect, and the seam is a border
+    /// column, so it resolves to `None` whichever arm reaches it. Reorder the two
+    /// arms and the drag assertion above goes red while the node stays shut anyway
+    /// — an assertion that survives the exact defect it names certifies the bug
+    /// instead of catching it, which is how the symmetric grab band this test's
+    /// sibling fixed went unnoticed. That containment guard is pinned where it
+    /// lives, against flush-left regions at content column 0 (the only shape a
+    /// clamped column can be caught by):
+    /// `view::tests::link_at_is_none_left_or_right_of_the_inner_rect` and
+    /// `view::tests::fold_at_is_none_on_blank_rows_and_outside_the_pane`.
     #[test]
     fn a_click_on_the_seam_resizes_instead_of_toggling_a_peer_node() {
         let (mut app, buffer) = peer_app();
-        let width = preview_transcript_rect(&app).width;
         let (marker_col, header_row) = drawn_peer_marker_cell(&buffer, app.preview_rect);
         let col = app.list_rect.x + app.list_rect.width;
         assert_eq!(
@@ -5234,10 +5247,6 @@ mod tests {
         assert!(
             app.is_dragging_split(),
             "a click on the seam must begin a splitter drag"
-        );
-        assert!(
-            !preview_string(&mut app, width).contains(PEER_BODY_PHRASE),
-            "and it must NOT also toggle the node on the row it landed on"
         );
     }
 
