@@ -2692,19 +2692,22 @@ impl App {
 
     /// Whether an overlay currently owns the board. The SINGLE gate predicate
     /// callers use (never `self.modal.is_some()` inline) to keep mouse actions
-    /// (splitter drag / link open) from firing while an overlay is up — so a later
-    /// gate extension lives in exactly one place.
+    /// (splitter drag / fold toggle / link open) from firing while an overlay is
+    /// up — so a later gate extension lives in exactly one place.
     ///
     /// True while a [`Modal`] is open, the quick-reply compose zone, the
     /// stop-then-reply confirmation, or the interrupt confirmation owns the
     /// keyboard, OR a `Ctrl-X` leader chord is [pending](Self::pending_chord): each
     /// takes the keyboard, so each must equally gate the mouse (a stray click
-    /// mid-chord must not start a drag or open a link), per PATTERNS §10.
+    /// mid-chord must not start a drag, toggle a fold, or open a link), per
+    /// PATTERNS §10.
     ///
     /// A [`draft`](Self::draft) counts for a related reason: it owns the PANE
     /// rather than the keyboard. While its card is drawn the transcript is not, so
-    /// the cached link regions describe text that is no longer on screen — a click
-    /// resolved against them would open a link from a session the user cannot see.
+    /// the cached link AND fold regions — both handed out of the ONE
+    /// [`preview_hit_context`](Self::preview_hit_context) entry — describe text
+    /// that is no longer on screen, and a click resolved against them would open a
+    /// link or toggle a fold in a session the user cannot see.
     /// It outlives the editor by AT MOST one in-flight launch (whichever comes
     /// first: that launch's own result, or the end of the board session), which is
     /// the window this arm covers on its own.
@@ -7827,9 +7830,10 @@ mod tests {
     /// has already closed and no keyboard owner is left.
     ///
     /// It owns the PANE: while the card is drawn the transcript is not, so the
-    /// cached link regions describe text no longer on screen and a click resolved
-    /// against them would open a link from a session the user cannot see. That
-    /// window is exactly the one the editor no longer covers.
+    /// cached link AND fold regions describe text no longer on screen and a
+    /// click resolved against them would open a link or toggle a fold in a
+    /// session the user cannot see. That window is exactly the one the editor no
+    /// longer covers.
     #[test]
     fn an_in_flight_draft_card_still_gates_the_mouse() {
         let mut app = app_all(vec![session("s", "r", Some("main"), "/tmp/s")]);

@@ -284,9 +284,10 @@ inner rect when there is no banner (so a banner-less pane's geometry is exactly
   link or folds the wrong node. The compose split (`preview_compose_split`) is built ON `preview_split`,
   carving the docked compose zone off the bottom of that same transcript rect
   rather than re-deriving it; a docked compose zone shrinks the transcript, but
-  link hit-testing is gated off while composing (`overlay_active`), so the two
-  never disagree. Both rects trace back to `preview_inner`, the ONE place the
-  pane's border inset is applied — which matters most for the docked compose
+  click hit-testing — link AND fold alike — is gated off while composing
+  (`overlay_active`), so the two never disagree. Both rects trace back to
+  `preview_inner`, the ONE place the pane's border inset is applied — which
+  matters most for the docked compose
   zone, because it then draws a border of its OWN: measure it from the pane's
   OUTER rect and its editor is four columns narrower than whatever measured it,
   so a wrapping draft under-grows and the editor scrolls its own first row away.
@@ -824,11 +825,11 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    second piece of state. `handle_event` checks each in turn before the board.
    `App::overlay_active` (`modal.is_some() || compose.is_some() ||
    draft.is_some() || pending_stop.is_some() || pending_interrupt.is_some() ||
-   pending_chord`) gates mouse actions (splitter drag / link open) so none fires
-   while any is up. A mouse wheel is handled **before** and **independent of** that
-   gate: it never routes into an overlay handler, it only scrolls a pane. A new
-   keyboard owner must be added to `overlay_active` too, or the mouse will act
-   underneath it.
+   pending_chord`) gates mouse actions (splitter drag / fold toggle / link open)
+   so none fires while any is up. A mouse wheel is handled **before** and
+   **independent of** that gate: it never routes into an overlay handler, it only
+   scrolls a pane. A new keyboard owner must be added to `overlay_active` too, or
+   the mouse will act underneath it.
 
    The wheel takes exactly ONE condition, and `update::wheel_target` owns it as a
    parameter (`composing`) the way `key_to_action` owns its own. It hit-tests
@@ -870,9 +871,10 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
 
    `draft` is the one arm that is not a keyboard owner: it owns the **pane**. While
    the new-session draft card is drawn the transcript is not, so the cached link
-   regions describe text no longer on screen and a click would open a link from a
-   session the user cannot see. It outlives the compose editor by AT MOST one
-   in-flight launch, which is the window nothing else covers — so a pane owner
+   AND fold regions describe text no longer on screen, and a click would open a
+   link or toggle a fold in a session the user cannot see. It outlives the
+   compose editor by AT MOST one in-flight launch, which is the window nothing
+   else covers — so a pane owner
    earns an arm here for the same reason a keyboard owner does. "At most" is the
    operative bound: a pane owner that outlives its keyboard owner also outlives the
    gate that used to end it, so it needs its own end conditions — see
