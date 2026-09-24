@@ -593,8 +593,8 @@ mod tests {
                 .any(|p| p.components().any(|c| c.as_os_str() == "subagents")),
             "discovery must never descend into a subagents/ directory: {files:?}"
         );
-        // The fifteen depth-2 `.jsonl` files, none of the nested subagent file.
-        assert_eq!(files.len(), 15, "unexpected discovered set: {files:?}");
+        // The nineteen depth-2 `.jsonl` files, none of the nested subagent file.
+        assert_eq!(files.len(), 19, "unexpected discovered set: {files:?}");
     }
 
     #[test]
@@ -616,8 +616,8 @@ mod tests {
             !sessions.iter().any(|s| s.label.contains("Sidecar title")),
             "a sidecar file with no cwd was surfaced as a session"
         );
-        // Exactly fourteen resumable sessions survive (15 discovered - 1 sidecar).
-        assert_eq!(sessions.len(), 14, "unexpected session count");
+        // Exactly eighteen resumable sessions survive (19 discovered - 1 sidecar).
+        assert_eq!(sessions.len(), 18, "unexpected session count");
     }
 
     // --- failed background task: the fixture pairs ------------------------
@@ -913,7 +913,12 @@ mod tests {
         // flatten the text back to plain text (span contents joined) to assert the
         // structural markers survive. Width is the table shrink-to-fit budget; a
         // comfortable 80 columns here.
-        let rendered = preview::render(s, 80, &std::collections::HashSet::new());
+        let rendered = preview::render(
+            s,
+            80,
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+        );
         let plain: String = rendered
             .text
             .lines

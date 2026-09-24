@@ -274,11 +274,14 @@ inner rect when there is no banner (so a banner-less pane's geometry is exactly
 `Block::inner`, unchanged). The rules that follow from it:
 
 - `preview_split` is the ONE place the banner/transcript geometry is derived.
-  `render_preview` draws against its rects and `update::link_under_pointer`
-  hit-tests against the same transcript rect. A click resolves through
+  `render_preview` draws against its rects, and BOTH click hit-tests —
+  `update::link_under_pointer` and `update::fold_under_pointer` — take the same
+  transcript rect from the one `update::preview_transcript_rect` helper, which
+  also supplies the width the fold toggle re-renders at, so the hit-test and the
+  re-render cannot resolve through different widths. A click resolves through
   `App::preview_scroll` and the width-scoped hit cache, both measured from that
   rect's origin — derive it anywhere else and a click silently opens the wrong
-  link. The compose split (`preview_compose_split`) is built ON `preview_split`,
+  link or folds the wrong node. The compose split (`preview_compose_split`) is built ON `preview_split`,
   carving the docked compose zone off the bottom of that same transcript rect
   rather than re-deriving it; a docked compose zone shrinks the transcript, but
   link hit-testing is gated off while composing (`overlay_active`), so the two
@@ -334,9 +337,16 @@ inner rect when there is no banner (so a banner-less pane's geometry is exactly
   TRANSCRIPT, and the match map is keyed by transcript line, so a window adds its
   own start index back before looking one up.
 - **The CLICK reads that same map, and `view::line_at_row` is the one place a row
-  becomes a line.** `row_window` starts the window with it and `link_at` resolves a
-  click with it, so the paint and the hit-test cannot disagree about which line sits
-  where — the failure a second derivation guarantees. Which LINE a click lands on is
+  becomes a line.** `row_window` starts the window with it, and BOTH click
+  consumers resolve through it: `link_at` (a url to open) and `fold_at` (a peer
+  node's fold key to toggle) share the one private `content_hit`, which is that
+  map's lookup plus the pane guard, and each then does nothing but look its own
+  regions up. So the paint and the two hit-tests cannot disagree about which line
+  sits where — the failure a second derivation guarantees, and the one that nearly
+  landed: the first cut of `content_hit` kept only the ROW half of that guard and
+  clamped the column, which aliased every click LEFT of the pane's inner rect onto
+  content column 0 and made a peer header (whose region spans the whole line) eat
+  the pane border. Which LINE a click lands on is
   therefore EXACT at any length or scroll position. What stays approximate is the
   COLUMN inside that one line (`sub_row * inner_width`, character-packed because the
   wrapper will not say where inside a line it broke), so the error is bounded by ONE
@@ -712,7 +722,7 @@ CADENCES and LIMITS, so a retune knows what it is next to:
 | `store` | `MTIME_SETTLE_WINDOW` (2 s) |
 | `store::parse` | `CONTENT_INDEX_CAP` (1 MB) |
 | `store::label` | `LABEL_MAX` (180) |
-| `store::preview` | `TABLE_MIN_COL_WIDTH` (10) · `RECORD_RULE_WIDTH` (32) |
+| `store::preview` | `TABLE_MIN_COL_WIDTH` (10) · `RECORD_RULE_WIDTH` (32) · `PEER_STEM_LEN` (17 — the agent-stem length a peer sender must match before it renders as an `@handle`, so a socket path or an agent TYPE name falls back to the generic label) · `PEER_HEADER_BLOCK_ROW` (1 — not a knob but a SHAPE: the peer node's header index inside its own `[blank, header, body…]` block, named so the fold region and the body links rebase off one number) |
 | `send` | `SEND_ERROR_MAX` (200) |
 | `tui::app` | `PREVIEW_WHEEL_STEP` (2) · `LIST_WHEEL_STEP` (1) · `STATUS_DWELL_TICKS` (16) · `MIN_PANE_WIDTH` (15) · `DEFAULT_LIST_PERCENT` (48) |
 | `tui::update` | `PASTE_MAX_CHARS` (4096) · `SPLITTER_TOLERANCE` (1) |
@@ -1025,13 +1035,21 @@ Tests are **inline** `#[cfg(test)] mod tests` at the bottom of each source file
   normal session, a no-summary session, a malformed-line session, a worktree
   cwd, a sidecar (no `cwd`), a nested subagent, a **background-fork pair**
   (two files sharing one tree root, `cwd`, branch and label — the duplicate-row
-  shape), a **root-less** session (no `parentUuid: null` record), and four
+  shape), a **root-less** session (no `parentUuid: null` record), four
   **failed-background-task pairs** under `-Users-me-project-epsilon` (`failed` vs
   `completed`; a quick reply vs an `sdk`-marked notification after the failure; a
   `turnOrigin: "sdk"` slash command vs a bare one; a `failed` notice with vs
   without its `<summary>`, reusing the first pair's failed half) — each pair one
   transcript whose halves differ only in their last record, and root-less so the
-  seven never fold into a false lineage. Reach it
+  seven never fold into a false lineage — and four
+  record-level `origin` shapes, one session file each so a guard is asserted in
+  isolation: a PEER hand-back (stem-shaped `from`, the `The report follows:`
+  preamble, a uniformly indented report), a peer whose `from` is NOT a stem and
+  whose body has neither the preamble nor the indent (one record, three fail-soft
+  paths), the two BARE kinds (`human`, `task-notification` — no `from`, no
+  `body`), and a record with NO `origin` whose content quotes the
+  `<agent-message …>` frame inside a fenced block, which pins that the text frame
+  alone collapses nothing. Reach it
   via `env!("CARGO_MANIFEST_DIR")`. Add a fixture when you add a format edge
   case, and update the counts in `store::mod`'s discovery/session-count tests.
   A fixture pair must **differ in the field under test**, and the fork pair

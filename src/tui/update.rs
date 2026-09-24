@@ -415,10 +415,12 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool
 /// * `Input(Key)` (a press/repeat) -> decode + apply an [`Action`].
 /// * `Input(Mouse)` -> a wheel notch scrolls the pane under the pointer, a
 ///   left-button press/drag/release on the list/preview seam resizes the split,
-///   and a left-click on a rendered preview link opens its url in the default
-///   browser ([`handle_mouse`]); all are independent of the overlay gate (a click
-///   cannot start an orphaned drag or open a link while the overlay is open — see
-///   [`App::begin_split_drag`] and the `App::overlay_active` gate).
+///   a left-click on a peer-message node's header toggles that node open or
+///   closed, and a left-click on a rendered preview link opens its url in the
+///   default browser ([`handle_mouse`]); all are independent of the overlay gate
+///   (a click cannot start an orphaned drag, toggle a node, or open a link while
+///   the overlay is open — see [`App::begin_split_drag`] and the
+///   `App::overlay_active` gate).
 /// * `SessionsChanged` -> reload `store` and re-apply query+scope, preserving
 ///   selection-by-id and scroll (see [`reload_board`]).
 /// * `Tick` -> nothing costly: advance the board clock, age a transient status,
@@ -928,15 +930,33 @@ fn on_splitter(col: u16, row: u16, list: Rect, preview: Rect) -> bool {
 /// press on the list/preview seam begins
 /// dragging the splitter, a left-button drag while dragging resizes it, and a
 /// left-button release always ends the drag. A left-button press INSIDE the
-/// preview pane (but not on the seam) that lands on a rendered link opens its url
-/// in the default browser — fire-and-forget, off the render loop. Any other event
+/// preview pane (but not on the seam) does one of exactly two things: on a
+/// peer-message node's HEADER it toggles that node open or closed
+/// ([`App::toggle_peer_fold`]), and otherwise, if it lands on a rendered link, it
+/// opens the link's url in the default browser — fire-and-forget, off the render
+/// loop. A pane click that hits neither is a no-op. Any other event
 /// (other buttons, horizontal wheel, plain moves) is ignored. Never touches the
 /// query, and the overlay gate is enforced by [`App::begin_split_drag`] (drag) and
-/// the [`App::overlay_active`] gate (link open), so this never crashes or starts an
-/// orphaned drag / stray link-open in any mode.
+/// the [`App::overlay_active`] gate (fold toggle AND link open), so this never
+/// crashes or starts an orphaned drag / stray toggle / stray link-open in any mode.
 ///
-/// Arm order matters: the seam-drag arm is tried BEFORE the preview-link arm, so a
-/// click on the border still resizes rather than opening a link.
+/// Arm order matters: the seam-drag arm is tried BEFORE the pane arm, so a click on
+/// the border still resizes rather than toggling a node or opening a link. The pane
+/// arm is the LAST word on a left-press inside `preview_rect` — its guard matches
+/// every such press, so an arm added after it would be unreachable — which is why
+/// the rest of the precedence lives INSIDE it rather than as arms of its own. Read
+/// end to end: seam drag -> fold toggle -> link open.
+///
+/// Fold-before-link is FREE, not a tie-break. A node's header line is built from
+/// the marker, the sender, the timestamp and the affordance alone; every link
+/// region a node produces belongs to its BODY and is rebased strictly BELOW the
+/// header row (`store::preview::peer_node_lines`), so no content row is ever
+/// claimed by both a `FoldRegion` and a `LinkRegion` and neither order can swallow
+/// the other's click. The order is written down anyway because that is a property
+/// of today's render rather than a guarantee of it: it is what would decide the
+/// collision if a header ever did carry a link, and
+/// `a_peer_node_header_carries_no_link_regions_at_any_width` is the test that goes
+/// red the moment the premise stops holding.
 fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     match mouse.kind {
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
@@ -964,7 +984,12 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         // A left-click inside the preview pane (the seam-drag arm above already
         // claimed the border). Gated by any modal overlay like the drag, so a
         // click while the running-session choice or the agent picker owns input
-        // never opens a link.
+        // never toggles a node or opens a link.
+        //
+        // THE one owner of a pane click: this guard matches every left-press
+        // inside the pane, so the fold-then-link precedence is resolved in the
+        // body rather than by a second arm that could never be reached. The
+        // arm-order doc above owns why that order costs nothing.
         MouseEventKind::Down(MouseButton::Left)
             if !app.overlay_active()
                 && app.preview_rect.contains(Position {
@@ -972,7 +997,14 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                     y: mouse.row,
                 }) =>
         {
-            open_link_under_pointer(app, mouse.column, mouse.row);
+            // One derivation of the transcript rect for both halves, so the width
+            // the toggle re-renders at is the width the hit-test resolved through.
+            let transcript = preview_transcript_rect(app);
+            if let Some(key) = fold_under_pointer(app, mouse.column, mouse.row) {
+                app.toggle_peer_fold(&key, transcript.width);
+            } else {
+                open_link_under_pointer(app, mouse.column, mouse.row);
+            }
         }
         MouseEventKind::Drag(MouseButton::Left) if app.is_dragging_split() => {
             let body_width = app.list_rect.width + app.preview_rect.width;
@@ -983,14 +1015,14 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     }
 }
 
-/// The url of the rendered preview link under a pointer at screen `(col, row)`,
-/// or `None` when the pointer is over no link.
+/// The rect the preview's TRANSCRIPT was actually drawn into — the rect every
+/// hit-test over the pane must resolve a screen cell against.
 ///
 /// The transcript does NOT own the whole preview pane: a REPORTED session — or
 /// one carrying a failed background task — pins a status banner to the pane's
 /// first inner row (`view::preview_banner`), so its transcript starts one row
-/// lower. Deriving the rect from the SAME
-/// [`view::preview_split`] the view drew with is what keeps this honest — the
+/// lower. Deriving the rect from the SAME [`view::preview_split`] the view drew
+/// with is what keeps a hit-test honest — the
 /// scroll offset and the cached line widths are both measured from that rect's
 /// origin, so a click on screen row N resolves to the transcript line actually
 /// drawn there. A session with no banner splits off nothing and hit-tests
@@ -1002,16 +1034,33 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
 /// [`App::is_live_now`], and it would be the wrong question here twice over: it
 /// shells out to claude, and it would disagree with the drawn banner.
 ///
+/// ONE derivation serves BOTH pane hit-tests ([`link_under_pointer`] and
+/// [`fold_under_pointer`]) and the width the fold toggle re-renders at. A second
+/// copy is exactly how a fold and a link would come to disagree about which row
+/// the banner pushed them onto.
+fn preview_transcript_rect(app: &App) -> Rect {
+    let has_banner = view::preview_banner(app).is_some();
+    let (_, transcript) = view::preview_split(app.preview_rect, has_banner);
+    transcript
+}
+
+/// The url of the rendered preview link under a pointer at screen `(col, row)`,
+/// or `None` when the pointer is over no link.
+///
+/// The transcript rect comes from [`preview_transcript_rect`], which owns why it is
+/// not simply the pane's inner rect.
+///
 /// The wrapped-layout context (the per-line wrapped-row prefix map + the link
 /// regions) comes from the SAME width-scoped cache the view drew from — the very
 /// map the draw windowed itself by, so the click and the paint resolve a screen row
-/// to a logical line through one shared answer rather than two models. The url comes
-/// from the pure [`view::link_at`]. Terminal- and process-free, so the geometry is
-/// unit testable; [`open_link_under_pointer`] is the thin impure wrapper over it.
+/// to a logical line through one shared answer rather than two models. The fold
+/// regions ride in that same answer and are [`fold_under_pointer`]'s half of it.
+/// The url comes from the pure [`view::link_at`]. Terminal- and process-free, so
+/// the geometry is unit testable; [`open_link_under_pointer`] is the thin impure
+/// wrapper over it.
 fn link_under_pointer(app: &mut App, col: u16, row: u16) -> Option<String> {
-    let has_banner = view::preview_banner(app).is_some();
-    let (_, transcript) = view::preview_split(app.preview_rect, has_banner);
-    let (row_prefix, regions) = app.preview_hit_context(transcript.width);
+    let transcript = preview_transcript_rect(app);
+    let (row_prefix, regions, _folds) = app.preview_hit_context(transcript.width);
     view::link_at(
         col,
         row,
@@ -1019,6 +1068,34 @@ fn link_under_pointer(app: &mut App, col: u16, row: u16) -> Option<String> {
         app.preview_scroll,
         &row_prefix,
         &regions,
+    )
+    .map(str::to_string)
+}
+
+/// The fold key of the peer-message node whose HEADER sits under a pointer at
+/// screen `(col, row)`, or `None` when the pointer is over no node header.
+///
+/// A deliberate mirror of [`link_under_pointer`], sharing every step that decides
+/// WHERE a click landed: the same [`preview_transcript_rect`], the same
+/// width-scoped [`App::preview_hit_context`] entry, and — inside [`view::fold_at`]
+/// — the same `content_hit` resolver its link sibling runs through. Only the region
+/// list it matches against, and what a match yields, differ. A second geometry
+/// model here is the one way a click could toggle a node whose header the draw
+/// painted a row away.
+///
+/// Terminal- and process-free: it answers a key and changes nothing. Every side
+/// effect of acting on that key — the set mutation, the cache eviction, the
+/// re-render and the scroll anchor — belongs to [`App::toggle_peer_fold`].
+fn fold_under_pointer(app: &mut App, col: u16, row: u16) -> Option<String> {
+    let transcript = preview_transcript_rect(app);
+    let (row_prefix, _links, folds) = app.preview_hit_context(transcript.width);
+    view::fold_at(
+        col,
+        row,
+        transcript,
+        app.preview_scroll,
+        &row_prefix,
+        &folds,
     )
     .map(str::to_string)
 }
@@ -4707,6 +4784,382 @@ mod tests {
         assert_eq!(app.list_width, None, "no drag was in progress to apply");
         wheel(&mut app, MouseEventKind::Up(MouseButton::Left), 60, 10);
         assert!(!app.is_dragging_split());
+    }
+
+    // --- peer-message fold: the pane arm's fold-then-link precedence ---------
+
+    /// The checked-in peer-node fixture: one `origin.kind:"peer"` hand-back sitting
+    /// below a typed prompt, an assistant turn and an `Agent` tool use, so the node
+    /// header these tests click is a REAL drawn row rather than a synthetic region.
+    const PEER_FIXTURE: (&str, &str) = ("-Users-me-project-epsilon", "sess-peer-handback-1.jsonl");
+
+    /// That hand-back's fold key: `origin.from`, the sending agent's stem — NEVER
+    /// the record `uuid`.
+    const PEER_KEY: &str = "a03505fe4b1c2d3e0";
+
+    /// A phrase carried ONLY by the hand-back's `origin.body`. `App::expanded_peers`
+    /// is private to `app`, so the node's state is asserted the way a user reads it:
+    /// this phrase is on screen when the node is OPEN and absent when it is CLOSED.
+    ///
+    /// It is the report's closing line rather than its heading on purpose — the
+    /// fixture's SUMMARY says "webhook retry backoff" too, so a phrase from the
+    /// heading would be on screen with the node shut and prove nothing.
+    const PEER_BODY_PHRASE: &str = "No pending questions.";
+
+    /// The affordance a COLLAPSED node's header ends in. `store::preview` owns the
+    /// literal; it is restated here on purpose, because a test that asserted through
+    /// the private const could not tell a rename from a regression.
+    const COLLAPSED_AFFORDANCE: &str = "(click to expand)";
+    /// The affordance an EXPANDED node's header ends in; see the collapsed sibling.
+    const EXPANDED_AFFORDANCE: &str = "(click to collapse)";
+
+    /// A session backed by a checked-in fixture file, so the preview cache has a
+    /// real transcript to render (a synthetic [`session`] points at a `/tmp` path
+    /// that does not exist and renders to nothing).
+    fn fixture_session(id: &str, folder: &str, file: &str) -> Session {
+        let mut s = session(id);
+        s.file = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("store")
+            .join(folder)
+            .join(file);
+        s
+    }
+
+    /// An app over [`PEER_FIXTURE`], laid out by a REAL draw so `preview_rect`,
+    /// `list_rect` and the resolved `preview_scroll` are the geometry a user is
+    /// looking at. Returns the app beside the buffer that was drawn from it.
+    fn peer_app() -> (App, ratatui::buffer::Buffer) {
+        let (folder, file) = PEER_FIXTURE;
+        let mut app = App::new(
+            vec![fixture_session("s1", folder, file)],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
+        assert_eq!(app.selected.as_deref(), Some("s1"));
+        let buffer = render_board(&mut app);
+        (app, buffer)
+    }
+
+    /// Where a glyph was actually DRAWN inside the preview pane, as screen
+    /// `(col, row)`.
+    ///
+    /// Scanning the drawn buffer — never COMPUTING a row — is the same discipline
+    /// [`drawn_link_cell`] keeps: a computed row would restate the geometry under
+    /// test and pass however far it drifted.
+    fn drawn_cell(
+        buffer: &ratatui::buffer::Buffer,
+        preview: Rect,
+        glyph: &str,
+    ) -> Option<(u16, u16)> {
+        (preview.y..preview.bottom())
+            .flat_map(|y| (preview.x..preview.right()).map(move |x| (x, y)))
+            .find(|&(x, y)| buffer.cell((x, y)).is_some_and(|c| c.symbol() == glyph))
+    }
+
+    /// The node header's LEFTMOST drawn cell — the marker glyph `store::preview`
+    /// opens the line with, which lands on content column 0.
+    ///
+    /// That column is also one inside the pane border, hence within
+    /// [`SPLITTER_TOLERANCE`] of the seam, which is exactly what makes it the right
+    /// probe for the seam test and the WRONG one for the toggle tests.
+    fn drawn_peer_marker_cell(buffer: &ratatui::buffer::Buffer, preview: Rect) -> (u16, u16) {
+        drawn_cell(buffer, preview, "\u{25c6}").expect(
+            "the fixture's peer node must be drawn inside the preview pane, \
+             or these tests prove nothing",
+        )
+    }
+
+    /// A cell in the MIDDLE of the same header — the `@` opening the sender handle,
+    /// the one glyph no other turn marker draws.
+    ///
+    /// Clear of the seam's grab tolerance, so a click here reaches the pane arm and
+    /// tests the precedence rather than the splitter. A `FoldRegion` spans the
+    /// header's whole display width, so this cell and the marker cell address the
+    /// same node.
+    fn drawn_peer_handle_cell(buffer: &ratatui::buffer::Buffer, preview: Rect) -> (u16, u16) {
+        let cell = drawn_cell(buffer, preview, "@")
+            .expect("the node header must draw its sender handle, or this probes nothing");
+        assert_eq!(
+            cell.1,
+            drawn_peer_marker_cell(buffer, preview).1,
+            "the handle must sit on the header's own row"
+        );
+        cell
+    }
+
+    /// The preview transcript as plain text, joined the way a reader sees it.
+    fn preview_string(app: &mut App, width: u16) -> String {
+        app.preview_text(width)
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A click on a collapsed node's header OPENS it, and a second click on the
+    /// same header CLOSES it again (resolved decision 4).
+    ///
+    /// Driven END TO END through [`handle_mouse`]'s pane arm, not through
+    /// [`fold_under_pointer`] alone, because the arm is what this phase adds: a
+    /// resolver nothing routes to would pass every assertion below and still leave
+    /// the node inert under a real click.
+    #[test]
+    fn a_click_on_a_peer_node_header_expands_it_and_a_second_click_collapses_it() {
+        let (mut app, buffer) = peer_app();
+        let width = preview_transcript_rect(&app).width;
+        let (col, row) = drawn_peer_handle_cell(&buffer, app.preview_rect);
+        assert!(
+            !on_splitter(col, row, app.list_rect, app.preview_rect),
+            "the probe must reach the PANE arm, not the seam-drag arm above it"
+        );
+
+        let collapsed = preview_string(&mut app, width);
+        assert!(
+            collapsed.contains(COLLAPSED_AFFORDANCE) && !collapsed.contains(PEER_BODY_PHRASE),
+            "a peer node starts CLOSED, or the expand assertion below is vacuous"
+        );
+
+        wheel(&mut app, MouseEventKind::Down(MouseButton::Left), col, row);
+        let expanded = preview_string(&mut app, width);
+        assert!(
+            expanded.contains(PEER_BODY_PHRASE),
+            "the first click must open the node's body"
+        );
+        assert!(
+            expanded.contains(EXPANDED_AFFORDANCE),
+            "an open node's header must offer the click that closes it again"
+        );
+
+        wheel(&mut app, MouseEventKind::Down(MouseButton::Left), col, row);
+        let reclosed = preview_string(&mut app, width);
+        assert!(
+            !reclosed.contains(PEER_BODY_PHRASE),
+            "the second click must CLOSE the node, not re-open it"
+        );
+        assert!(
+            reclosed.contains(COLLAPSED_AFFORDANCE),
+            "and the header must go back to offering the expand"
+        );
+        assert!(
+            !app.is_dragging_split() && app.modal.is_none(),
+            "toggling a node must not start a drag or open an overlay"
+        );
+    }
+
+    /// A body with a markdown link, written as a REAL peer record: the checked-in
+    /// fixture's hand-back carries no link (real reports rarely do), and the
+    /// precedence test below needs a link that is reachable ONLY once the node is
+    /// open.
+    fn peer_link_session(dir: &Path) -> Session {
+        let file = dir.join("sess-peer-link.jsonl");
+        let body = format!(
+            "[Subagent hand-back] The report follows:\\n  Findings are in [docs]({LINK_URL}) \
+             for review."
+        );
+        let jsonl = format!(
+            concat!(
+                r#"{{"type":"user","sessionId":"sess-peer-link","cwd":"/tmp","#,
+                r#""timestamp":"2026-07-01T10:00:00.000Z","#,
+                r#""origin":{{"kind":"peer","from":"{key}","senderTaskId":"{key}","#,
+                r#""handback":true,"body":"{body}"}},"#,
+                r#""message":{{"role":"user","content":"ignored: the node renders from origin"}}}}"#,
+                "\n",
+            ),
+            key = PEER_KEY,
+            body = body,
+        );
+        std::fs::write(&file, jsonl).expect("write the peer-link fixture");
+        let mut s = session("sess-peer-link");
+        s.file = file;
+        s
+    }
+
+    /// Fold-before-link does NOT swallow a click on a link inside an OPEN node: the
+    /// header is the node's click target, the body is not.
+    ///
+    /// Asserted through the pure [`fold_under_pointer`] / [`link_under_pointer`]
+    /// seam rather than through the arm, because taking the arm's link branch would
+    /// reach `resume::open_url` and spawn a browser — the same reason the link
+    /// hit-tests above stop at this seam.
+    #[test]
+    fn a_click_on_a_link_inside_an_expanded_peer_node_still_opens_the_link() {
+        let dir = unique_temp_dir("peer-link");
+        let mut app = App::new(
+            vec![peer_link_session(&dir)],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
+        let buffer = render_board(&mut app);
+
+        // Open the node first: its body — and so its link — does not exist until a
+        // click puts it on screen, which is the whole point of the fold.
+        let (header_col, header_row) = drawn_peer_handle_cell(&buffer, app.preview_rect);
+        wheel(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            header_col,
+            header_row,
+        );
+        let buffer = render_board(&mut app);
+
+        let (col, row) = drawn_link_cell(&buffer, app.preview_rect);
+        assert_eq!(
+            fold_under_pointer(&mut app, col, row),
+            None,
+            "the node's BODY is not its click target — only the header is, or a \
+             fold-first arm would swallow every link a report contains"
+        );
+        assert_eq!(
+            link_under_pointer(&mut app, col, row).as_deref(),
+            Some(LINK_URL),
+            "so the arm falls through to the link, exactly as it does outside a node"
+        );
+
+        // And the header is still the node's own target, not the link's.
+        let (header_col, header_row) = drawn_peer_handle_cell(&buffer, app.preview_rect);
+        assert_eq!(
+            fold_under_pointer(&mut app, header_col, header_row).as_deref(),
+            Some(PEER_KEY),
+        );
+        assert_eq!(link_under_pointer(&mut app, header_col, header_row), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The premise the fold-then-link precedence rests on, measured against the
+    /// REAL render instead of assumed: a node's header row carries no link region,
+    /// in EITHER fold state and at every pane width the node is readable at.
+    ///
+    /// If this ever goes red the ordering inside the pane arm stops being free and
+    /// starts deciding a collision, which is why the arm's doc comment names this
+    /// test by name.
+    #[test]
+    fn a_peer_node_header_carries_no_link_regions_at_any_width() {
+        let dir = unique_temp_dir("peer-premise");
+        let mut app = App::new(
+            vec![peer_link_session(&dir)],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
+        // Widths from comfortable down to narrow enough that the header itself
+        // soft-wraps, so a wrapped header is covered too.
+        for width in [80u16, 40, 24, 16] {
+            for open in [false, true] {
+                if open {
+                    app.toggle_peer_fold(PEER_KEY, width);
+                }
+                let (_row_prefix, links, folds) = app.preview_hit_context(width);
+                assert!(
+                    !folds.is_empty(),
+                    "the node must render a fold region at width {width}, \
+                     or this width proves nothing"
+                );
+                for fold in &folds {
+                    assert!(
+                        !links.iter().any(|l| l.content_row == fold.content_row),
+                        "a header row must carry no link at width {width} \
+                         (open={open}), or fold-before-link stops being free"
+                    );
+                }
+                if open {
+                    assert!(
+                        !links.is_empty(),
+                        "the open node's body must contribute links at width \
+                         {width}, or the disjointness above is vacuous"
+                    );
+                    app.toggle_peer_fold(PEER_KEY, width);
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A click on the seam still RESIZES, even when the row it lands on is a peer
+    /// node's header.
+    ///
+    /// The column is one INSIDE the pane border — within [`SPLITTER_TOLERANCE`] of
+    /// the seam, and also content column 0 of the header, which a `FoldRegion`
+    /// spans. So the two arms genuinely compete here, and only the seam arm running
+    /// FIRST keeps the drag.
+    #[test]
+    fn a_click_on_the_seam_resizes_instead_of_toggling_a_peer_node() {
+        let (mut app, buffer) = peer_app();
+        let width = preview_transcript_rect(&app).width;
+        let (marker_col, header_row) = drawn_peer_marker_cell(&buffer, app.preview_rect);
+        let seam = app.list_rect.x + app.list_rect.width;
+        let col = seam + SPLITTER_TOLERANCE;
+        assert_eq!(
+            col, marker_col,
+            "the probe is the header's own leftmost drawn cell, so the seam arm and \
+             the pane arm are competing for one real cell rather than a contrived one"
+        );
+        assert!(
+            on_splitter(col, header_row, app.list_rect, app.preview_rect),
+            "the probe column must really be a seam grab, or this tests nothing"
+        );
+        assert_eq!(
+            fold_under_pointer(&mut app, col, header_row).as_deref(),
+            Some(PEER_KEY),
+            "and it must really be over the node's header too, or the two arms \
+             never compete"
+        );
+
+        wheel(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            col,
+            header_row,
+        );
+        assert!(
+            app.is_dragging_split(),
+            "a click on the seam must begin a splitter drag"
+        );
+        assert!(
+            !preview_string(&mut app, width).contains(PEER_BODY_PHRASE),
+            "and it must NOT also toggle the node under it"
+        );
+    }
+
+    /// A click on a node header while an overlay owns input does NEITHER: no
+    /// toggle, no link open, and the overlay is left exactly as it was.
+    ///
+    /// The same `!app.overlay_active()` gate the link arm always had, which the
+    /// fold must not quietly widen.
+    #[test]
+    fn a_click_on_a_peer_node_header_during_an_overlay_neither_toggles_nor_opens() {
+        let (mut app, buffer) = peer_app();
+        let width = preview_transcript_rect(&app).width;
+        let (col, row) = drawn_peer_handle_cell(&buffer, app.preview_rect);
+        assert_eq!(
+            fold_under_pointer(&mut app, col, row).as_deref(),
+            Some(PEER_KEY),
+            "the probe must be a cell that WOULD toggle, or the silence below is \
+             the geometry's and not the gate's"
+        );
+        app.open_live_choice("s1".to_string());
+        assert!(app.overlay_active(), "the overlay must really own input");
+
+        wheel(&mut app, MouseEventKind::Down(MouseButton::Left), col, row);
+        let after = preview_string(&mut app, width);
+        assert!(
+            !after.contains(PEER_BODY_PHRASE) && after.contains(COLLAPSED_AFFORDANCE),
+            "a click behind an overlay must leave the node closed"
+        );
+        assert!(
+            app.modal.is_some(),
+            "and must not disturb the overlay either"
+        );
+        assert!(
+            !app.is_dragging_split(),
+            "nor start an orphaned splitter drag"
+        );
     }
 
     /// Task VERIFY-4: Enter on a LIVE session enters the choice-overlay state

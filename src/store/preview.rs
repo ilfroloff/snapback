@@ -18,6 +18,14 @@
 //! per-message day rollover), so a turn shows the agent set *before* it, and a late
 //! record never retroactively labels earlier turns.
 //!
+//! A `type:"user"` record that another SESSION sent — a subagent's hand-back, or
+//! a forked sibling's note — is neither of those turns, and renders as its own
+//! one-line node instead (`◆ message from @a03505fe4b1c2d3e0 · 14:15`). Whether a
+//! record is one is decided STRUCTURALLY, from its record-level `origin` object,
+//! and NEVER by parsing the `<agent-message …>` text frame its body carries — that
+//! frame appears verbatim in quoted prose and tool payloads, so a text-level match
+//! would collapse legitimate content. See [`peer_origin`].
+//!
 //! Ahead of the markdown pass, each message BODY runs through an allowlist-driven
 //! control-wrapper collapse ([`collapse_control_wrappers`]). Claude Code injects a
 //! fixed set of PAIRED pseudo-tags (`<command-name>`, `<system-reminder>`,
@@ -43,6 +51,7 @@
 //! frame; the pane now draws a window of the rows its viewport can reach
 //! (`tui::view::row_window`), so the cap bought nothing but a truncated transcript.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -128,15 +137,68 @@ pub struct LinkRegion {
     pub url: String,
 }
 
+/// A clickable fold toggle inside the rendered preview — the header line of a
+/// peer-message node (see [`peer_node_lines`]) — in the SAME content coordinates
+/// and under the SAME width discipline as [`LinkRegion`].
+///
+/// `content_row` indexes into the returned [`Text`]'s lines and addresses the
+/// node's HEADER, never the blank separator above it; `col_start..col_end` spans
+/// the header's whole display width, so a click anywhere along the line toggles
+/// the node rather than only on the affordance text. Columns depend on the render
+/// `width` exactly as a link's do, which is why both ride in the same
+/// [`RenderedPreview`] and are cached together.
+///
+/// `key` is the node's fold key — `origin.from`, the sending agent's stem — NOT
+/// the record `uuid`, so a future delegation node resolves to the SAME key and
+/// the two anchors drive one node.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FoldRegion {
+    /// Line index into the rendered [`Text`] the node's header sits on.
+    pub content_row: usize,
+    /// Display column where the clickable header starts (inclusive).
+    pub col_start: usize,
+    /// Display column just past the clickable header (exclusive).
+    pub col_end: usize,
+    /// The fold key this node toggles.
+    pub key: String,
+}
+
+/// A block-relative region the running rebase in [`render_file_collect`] can
+/// shift onto the growing transcript.
+///
+/// Implemented by BOTH [`LinkRegion`] and [`FoldRegion`] so the two are rebased
+/// by the ONE [`rebased`] function and the ONE offset. A second rebase — even a
+/// faithful copy — is exactly how a node's click target and the links inside its
+/// body would come to disagree about which row they sit on.
+trait BlockRegion {
+    /// The region's row index, for [`rebased`] to advance.
+    fn content_row_mut(&mut self) -> &mut usize;
+}
+
+impl BlockRegion for LinkRegion {
+    fn content_row_mut(&mut self) -> &mut usize {
+        &mut self.content_row
+    }
+}
+
+impl BlockRegion for FoldRegion {
+    fn content_row_mut(&mut self) -> &mut usize {
+        &mut self.content_row
+    }
+}
+
 /// A rendered transcript preview: the styled [`Text`] plus the clickable
-/// [`LinkRegion`]s discovered while building it. Both are produced from one pass
-/// at a fixed `width`, so a region's columns always match the text as drawn.
+/// [`LinkRegion`]s and [`FoldRegion`]s discovered while building it. All three
+/// are produced from one pass at a fixed `width`, so a region's columns always
+/// match the text as drawn.
 #[derive(Debug, Default)]
 pub struct RenderedPreview {
     /// The styled, markdown-rendered transcript.
     pub text: Text<'static>,
     /// Clickable link regions, in content coordinates (see [`LinkRegion`]).
     pub links: Vec<LinkRegion>,
+    /// Clickable fold regions, in content coordinates (see [`FoldRegion`]).
+    pub folds: Vec<FoldRegion>,
 }
 
 /// Render a session's transcript for the preview pane, fitting GFM tables to
@@ -146,8 +208,18 @@ pub struct RenderedPreview {
 /// `known_agents` is the set of DEFINED agent names (`~/.claude/agents/*.md`); it
 /// gates the noisy `agent-name` fallback so a free-form background-job title never
 /// renders as a bogus handle (see [`render_record`]).
-pub fn render(session: &Session, width: usize, known_agents: &HashSet<&str>) -> RenderedPreview {
-    render_file_collect(&session.file, width, known_agents)
+///
+/// `expanded` is the set of peer-message fold keys (`origin.from`) currently open;
+/// a node whose key is absent renders COLLAPSED (see [`peer_node_lines`]). This
+/// function stays PURE: it TAKES the set, it never owns or mutates it — the fold
+/// state belongs to the app, and the renderer only reads it.
+pub fn render(
+    session: &Session,
+    width: usize,
+    known_agents: &HashSet<&str>,
+    expanded: &HashSet<&str>,
+) -> RenderedPreview {
+    render_file_collect(&session.file, width, known_agents, expanded)
 }
 
 /// The optimistic trailing turns shown in the preview while a quick-reply send is
@@ -207,13 +279,19 @@ pub fn pending_reply_turns(
 /// the rows its viewport can reach rather than re-wrapping the whole transcript per
 /// frame — so the transcript arrives whole and a region keeps the row it was
 /// rendered on.
-fn render_file_collect(path: &Path, width: usize, known_agents: &HashSet<&str>) -> RenderedPreview {
+fn render_file_collect(
+    path: &Path,
+    width: usize,
+    known_agents: &HashSet<&str>,
+    expanded: &HashSet<&str>,
+) -> RenderedPreview {
     let file = match File::open(path) {
         Ok(f) => f,
         Err(_) => {
             return RenderedPreview {
                 text: Text::from(format!("No such session file:\n{}", path.display())),
                 links: Vec::new(),
+                folds: Vec::new(),
             }
         }
     };
@@ -221,6 +299,7 @@ fn render_file_collect(path: &Path, width: usize, known_agents: &HashSet<&str>) 
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut links: Vec<LinkRegion> = Vec::new();
+    let mut folds: Vec<FoldRegion> = Vec::new();
     // Day of the previously ANNOTATED turn, threaded through the loop so a
     // per-message timestamp can switch to `MM-DD HH:MM` on a day rollover.
     let mut prev_day: Option<Date> = None;
@@ -245,11 +324,19 @@ fn render_file_collect(path: &Path, width: usize, known_agents: &HashSet<&str>) 
         if !record.is_object() {
             continue;
         }
-        if let Some((block, block_links)) =
-            render_record(&record, &mut agent, known_agents, &mut prev_day, width)
-        {
+        if let Some((block, block_links, block_folds)) = render_record(
+            &record,
+            &mut agent,
+            known_agents,
+            expanded,
+            &mut prev_day,
+            width,
+        ) {
+            // ONE offset, ONE rebase, both kinds of region: a node's fold target
+            // and the links inside its body must never disagree about a row.
             let offset = lines.len();
             links.extend(rebased(block_links, offset));
+            folds.extend(rebased(block_folds, offset));
             lines.extend(block);
         }
     }
@@ -257,16 +344,18 @@ fn render_file_collect(path: &Path, width: usize, known_agents: &HashSet<&str>) 
     RenderedPreview {
         text: Text::from(lines),
         links,
+        folds,
     }
 }
 
-/// Shift a batch of block-relative link regions down by `offset` rows so they
-/// address the growing transcript.
-fn rebased(links: Vec<LinkRegion>, offset: usize) -> Vec<LinkRegion> {
-    links
+/// Shift a batch of block-relative regions down by `offset` rows so they address
+/// the growing transcript. Generic over [`BlockRegion`] so links and folds share
+/// the one implementation — see that trait for why a second copy is a defect.
+fn rebased<R: BlockRegion>(regions: Vec<R>, offset: usize) -> Vec<R> {
+    regions
         .into_iter()
         .map(|mut r| {
-            r.content_row += offset;
+            *r.content_row_mut() += offset;
             r
         })
         .collect()
@@ -285,14 +374,22 @@ fn rebased(links: Vec<LinkRegion>, offset: usize) -> Vec<LinkRegion> {
 /// `known_agents` gates the `agent-name` fallback. State is threaded — never
 /// hoisted — so attribution is positional; see the module doc.
 ///
+/// `expanded` is the open peer-message fold keys; only the peer node reads it.
+///
+/// Returns the block's lines, its block-relative [`LinkRegion`]s and its
+/// block-relative [`FoldRegion`]s. The fold vec holds at most one entry today
+/// (a record renders at most one node), but it is a vec so the caller rebases it
+/// through the SAME [`rebased`] the links go through.
+///
 /// [`effective`]: AgentState::effective
 fn render_record(
     record: &Value,
     agent: &mut AgentState,
     known_agents: &HashSet<&str>,
+    expanded: &HashSet<&str>,
     prev_day: &mut Option<Date>,
     width: usize,
-) -> Option<(Vec<Line<'static>>, Vec<LinkRegion>)> {
+) -> Option<(Vec<Line<'static>>, Vec<LinkRegion>, Vec<FoldRegion>)> {
     match record.get("type").and_then(Value::as_str) {
         Some("summary") => {
             let s = record.get("summary").and_then(Value::as_str)?;
@@ -304,9 +401,27 @@ fn render_record(
                 record,
                 prev_day,
             )];
-            Some((lines, Vec::new()))
+            Some((lines, Vec::new(), Vec::new()))
         }
         Some("user") => {
+            // A message from ANOTHER session collapses to a one-line node, and is
+            // tried FIRST so it never reaches the `▶ you` rendering below — which
+            // would both dump its `<agent-message …>` frame and attribute a
+            // subagent's report to the person reading it. Membership is decided
+            // from the structural `origin` object alone, NEVER from the frame
+            // text; `peer_origin` owns the gate and the reason.
+            // FIRST is literal: the gate also runs ahead of the `isSidechain`
+            // drop below, so a peer-with-body record that ALSO carried
+            // `isSidechain:true` renders as a one-line node here instead of
+            // being dropped from the preview entirely. A collapsed node costs
+            // one row, while the drop would lose the hand-back silently. No
+            // record in the live store pairs the two today; the interaction is
+            // written down here rather than relied on.
+            if let Some(origin) = peer_origin(record) {
+                // `expanded` decides which shape this node renders in; it is READ
+                // here and owned by the app, never mutated by the renderer.
+                return Some(peer_node_lines(&origin, expanded, record, prev_day, width));
+            }
             if record
                 .get("isSidechain")
                 .and_then(Value::as_bool)
@@ -328,7 +443,7 @@ fn render_record(
             let offset = lines.len();
             let (body, body_links) = collapse_body_lines_collect(&text, width);
             lines.extend(body);
-            Some((lines, rebased(body_links, offset)))
+            Some((lines, rebased(body_links, offset), Vec::new()))
         }
         Some("assistant") => {
             let content = record.get("message").and_then(|m| m.get("content"))?;
@@ -348,7 +463,7 @@ fn render_record(
             ];
             let offset = lines.len();
             lines.extend(body);
-            Some((lines, rebased(body_links, offset)))
+            Some((lines, rebased(body_links, offset), Vec::new()))
         }
         Some("agent-setting") => {
             // Positional state, not a rendered line: record the interactive BIND in
@@ -490,6 +605,334 @@ fn timestamp_annotation(ts: OffsetDateTime, prev_day: Option<Date>) -> String {
     }
 }
 
+// --- peer message node --------------------------------------------------------
+//
+// Another Claude session's message — a subagent's hand-back, or a forked
+// sibling's note — arrives as an ordinary `type:"user"` record carrying a
+// record-level `origin` object, and its `message.content` is a
+// `<agent-message from="…">` text frame (~95 wrapped rows at the median).
+// Rendered as-is that is two defects at once: unreadable frame noise, and a
+// MISLABEL, since `▶ you` attributes a subagent's report to the person reading
+// it. This section collapses such a record to a ONE-LINE node instead.
+//
+// MEMBERSHIP IS DECIDED STRUCTURALLY, FROM `origin` ALONE. The frame text is
+// never parsed, and the reason is the whole safety argument for this feature:
+//
+//   NEVER parse the `<agent-message …>` text frame. It appears verbatim inside
+//   quoted prose and inside tool payloads, so a text-level match would collapse
+//   legitimate content. `origin` is structural and cannot be forged by content.
+//
+// A quoted transcript inside a fenced code block carries every cue a text
+// matcher would key on — the opener, the `from="…"` attribute, the harness
+// preamble — and collapsing it would DISCARD what the user is quoting. Only the
+// record-level `origin` object says who actually sent the record, and content
+// cannot write it. The `sess-frame-text-1` fixture is that case, and it must
+// keep rendering as an ordinary `▶ you` turn forever.
+
+/// The `origin.kind` value that marks a message from another session. One of
+/// THREE kinds observed in the live store — the other two (`human`, the user's
+/// own typed turns, and `task-notification`) are bare `{"kind":…}` objects
+/// carrying neither `from` nor `body`. Named because it is an undocumented wire
+/// token, exactly like `agents::KIND_*`.
+const ORIGIN_KIND_PEER: &str = "peer";
+
+/// A qualifying peer message, borrowed out of the record: the two structural
+/// facts the node renders from. Produced ONLY by [`peer_origin`], so the gate
+/// cannot be bypassed by constructing one elsewhere.
+struct PeerOrigin<'a> {
+    /// `origin.from` — the sending agent's stem (`a03505fe4b1c2d3e0`), or some
+    /// other sender identity entirely (an agent TYPE name, a unix socket path).
+    ///
+    /// OPTIONAL by design: the gate does not require it, so a body-bearing peer
+    /// record with no `from` still renders — under the generic label rather than
+    /// being dropped. See [`peer_label`].
+    from: Option<&'a str>,
+    /// `origin.body` — the message text, GUARANTEED non-empty by the gate.
+    body: &'a str,
+}
+
+/// The gate: does this record render as a peer-message node? `Some` only when ALL
+/// THREE of these hold, read FAIL-SOFT off `serde_json::Value` throughout (a
+/// malformed or absent `origin` is simply not a peer message — never a panic):
+///
+/// 1. `type == "user"`
+/// 2. `origin.kind == "peer"`
+/// 3. `origin.body` is a NON-EMPTY string
+///
+/// Requiring `body` is LOAD-BEARING, not defensive. Measured across the live
+/// store: 227 `peer`, 221 `human` and 278 `task-notification` origins exist, and
+/// only `peer` ever carries `from`/`body` (136 of them a non-empty one). So a
+/// looser gate of "has an `origin`" would collapse ~221 ordinary human turns and
+/// ~278 task notifications into peer nodes — hiding the user's OWN prompts. That
+/// is the same class of regression the never-parse-the-frame rule above exists to
+/// prevent, arriving through the structural path instead.
+///
+/// PURE — see the unit tests.
+fn peer_origin(record: &Value) -> Option<PeerOrigin<'_>> {
+    // The record type is spelled literally here, as in `render_record`'s match.
+    if record.get("type").and_then(Value::as_str) != Some("user") {
+        return None;
+    }
+    let origin = record.get("origin")?;
+    if origin.get("kind").and_then(Value::as_str) != Some(ORIGIN_KIND_PEER) {
+        return None;
+    }
+    let body = origin
+        .get("body")
+        .and_then(Value::as_str)
+        .filter(|b| !b.is_empty())?;
+    Some(PeerOrigin {
+        from: origin.get("from").and_then(Value::as_str),
+        body,
+    })
+}
+
+/// The fixed harness boilerplate that introduces a subagent hand-back ends with
+/// this sentence, so everything up to and including it is preamble rather than
+/// report. 134 of the 136 body-bearing peer records in the live store carry it
+/// verbatim; the 2 that do not are genuine cross-session peer messages with no
+/// preamble at all, which is why [`strip_handback_preamble`] fails soft.
+const HANDBACK_PREAMBLE_MARKER: &str = "The report follows:";
+
+/// Drop the harness preamble from a hand-back body: everything up to and
+/// INCLUDING [`HANDBACK_PREAMBLE_MARKER`], plus the newline(s) that separate it
+/// from the report (the live shape is exactly ONE `\n`), so the expanded node
+/// opens on the report's first line rather than on a blank one.
+///
+/// FAIL-SOFT: a body with no marker is returned UNCHANGED — that is the shape of
+/// a peer message that is not a hand-back at all. PURE — see the unit test.
+fn strip_handback_preamble(body: &str) -> &str {
+    match body.find(HANDBACK_PREAMBLE_MARKER) {
+        Some(at) => body[at + HANDBACK_PREAMBLE_MARKER.len()..].trim_start_matches('\n'),
+        None => body,
+    }
+}
+
+/// Remove the common leading-SPACE prefix from every line of `body`, but ONLY
+/// when one is shared; otherwise return the body untouched.
+///
+/// The harness indents every line of a hand-back report by two spaces, uniformly,
+/// in all 134 marker-bearing bodies. Two spaces sit below markdown's four-space
+/// code-block threshold so the report does not become a code block, but they DO
+/// perturb list parsing — which is why this dedents rather than leaving it.
+///
+/// A WHITESPACE-ONLY line does NOT vote on the prefix. That is a deliberate
+/// decision about real data: the harness writes a blank report line as two spaces
+/// (`"  "`), which happens to agree, but a single stray line indented one space —
+/// or trimmed to `""` by some writer — must not veto the dedent for the whole
+/// report. Such lines are emitted empty instead. Fail-soft by construction: with
+/// no shared prefix (a flush-left body, a tab-indented one) nothing is removed.
+/// PURE — see the unit test.
+fn dedent_uniformly(body: &str) -> Cow<'_, str> {
+    let prefix = body.lines().filter_map(line_indent).min().unwrap_or(0);
+    if prefix == 0 {
+        return Cow::Borrowed(body);
+    }
+    // Every counted char is a one-byte ASCII space, so slicing at `prefix` can
+    // never land inside a multi-byte char; a shorter whitespace-only line has no
+    // prefix to strip and collapses to empty.
+    let dedented: Vec<&str> = body
+        .lines()
+        .map(|line| line.get(prefix..).unwrap_or(""))
+        .collect();
+    Cow::Owned(dedented.join("\n"))
+}
+
+/// A line's leading-SPACE count, or `None` when the line has no non-whitespace
+/// content and therefore does not vote on the common prefix (see
+/// [`dedent_uniformly`]).
+fn line_indent(line: &str) -> Option<usize> {
+    if line.trim().is_empty() {
+        return None;
+    }
+    Some(line.len() - line.trim_start_matches(' ').len())
+}
+
+/// The generic sender label for a peer message whose `from` is NOT an agent stem.
+/// Says what is structurally known — another session sent this — without claiming
+/// a handle the value cannot back.
+const PEER_SESSION_LABEL: &str = "a peer session";
+
+/// Length of an agent stem (`a03505fe4b1c2d3e0`): 17 lowercase hex chars. The
+/// shape [`is_agent_stem`] admits, named because the number is the whole test.
+const PEER_STEM_LEN: usize = 17;
+
+/// The collapsed node's SENDER segment: `@{from}` when `from` is stem-shaped,
+/// else [`PEER_SESSION_LABEL`].
+///
+/// This mirrors [`agent_handle`]'s refusal precedent and exists for the same
+/// reason: a value that is not a handle must never be RENDERED as one. Measured,
+/// 134 of 136 `origin.from` values are agent stems and 2 are not — an agent TYPE
+/// name (`general-purpose`) and a unix socket path
+/// (`uds:/tmp/cc-socks/10523.sock`) — so `@uds:/tmp/cc-socks/10523.sock` is a
+/// real line this would otherwise draw, not a hypothetical one.
+///
+/// The branch is on the SENDER'S SHAPE, never on `origin.kind`: under the
+/// body-requiring gate in [`peer_origin`] no `kind:"human"` record can reach here
+/// at all (0 of ~221 carry `from` or `body`), so keying the label on the kind
+/// would put the decision on a discriminator that never varies.
+/// PURE — see the unit test.
+fn peer_label(from: &str) -> String {
+    if is_agent_stem(from) {
+        format!("@{from}")
+    } else {
+        PEER_SESSION_LABEL.to_string()
+    }
+}
+
+/// Is `from` shaped like an agent stem — exactly [`PEER_STEM_LEN`] LOWERCASE hex
+/// chars? Every stem observed in the store also begins with `a`, but that is not
+/// required here: `a` is itself a hex digit, so the length and the alphabet
+/// already refuse every non-stem sender the store holds, and pinning a leading
+/// letter would refuse a legitimate stem minted with another one.
+fn is_agent_stem(from: &str) -> bool {
+    from.len() == PEER_STEM_LEN && from.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Trailing affordance on a COLLAPSED node: the body is one click away.
+const PEER_EXPAND_AFFORDANCE: &str = "(click to expand)";
+/// Trailing affordance on an EXPANDED node — the same click closes it again, so
+/// the line says so rather than leaving the second click undiscoverable.
+const PEER_COLLAPSE_AFFORDANCE: &str = "(click to collapse)";
+
+/// How a peer node renders: whether its body shows, and whether a click can
+/// change that. Three states rather than a bool, because the third one is real —
+/// see [`PeerFold::Unfoldable`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerFold {
+    /// Foldable and closed: header only, offering to expand.
+    Collapsed,
+    /// Foldable and open: header plus body, offering to collapse.
+    Expanded,
+    /// NOT foldable: the record carries no `origin.from`, so the node has no fold
+    /// key and nothing can toggle it. It therefore renders OPEN, with no
+    /// affordance text and no [`FoldRegion`].
+    ///
+    /// The alternative — treat a keyless node as collapsed — would draw a closed
+    /// node with no clickable region, putting its body permanently out of reach.
+    /// That is a UI DATA-LOSS bug, and one cheap branch is the right price to
+    /// avoid it. The gate in [`peer_origin`] is exactly `type:"user"` +
+    /// `origin.kind:"peer"` + a non-empty `origin.body` and deliberately does NOT
+    /// require `from`; widening it to require `from` would drop such a record's
+    /// body instead of showing it, which is the same loss by another route.
+    /// No record in the store takes this branch today.
+    Unfoldable,
+}
+
+impl PeerFold {
+    /// Does the node's body render beneath the header?
+    fn shows_body(self) -> bool {
+        !matches!(self, PeerFold::Collapsed)
+    }
+
+    /// The trailing affordance text, or `None` when no click can change the
+    /// node's shape — promising a click that does nothing would be a lie.
+    fn affordance(self) -> Option<&'static str> {
+        match self {
+            PeerFold::Collapsed => Some(PEER_EXPAND_AFFORDANCE),
+            PeerFold::Expanded => Some(PEER_COLLAPSE_AFFORDANCE),
+            PeerFold::Unfoldable => None,
+        }
+    }
+}
+
+/// Which shape a peer node renders in, from its sender and the set of open fold
+/// keys. PURE — see the unit test.
+fn peer_fold(from: Option<&str>, expanded: &HashSet<&str>) -> PeerFold {
+    match from {
+        None => PeerFold::Unfoldable,
+        Some(key) if expanded.contains(key) => PeerFold::Expanded,
+        Some(_) => PeerFold::Collapsed,
+    }
+}
+
+/// Where the node's header sits INSIDE its own block: `[blank, header, body…]`,
+/// the same shape every other turn renders, so index 1 is the header and index 0
+/// is the blank separator above it. Named because the off-by-one is silent — a
+/// [`FoldRegion`] pointing at the blank would make every click miss by one row.
+const PEER_HEADER_BLOCK_ROW: usize = 1;
+
+/// Render a peer message as a fold node: a blank separator, the one-line header,
+/// and — unless the node is collapsed — the message body beneath it.
+///
+/// The body is the structural `origin.body`, preamble-stripped and dedented, run
+/// through the SAME [`collapse_body_lines_collect`] pass every other turn body
+/// takes, so a peer report styles and wraps exactly like a `▶ you` turn. Its link
+/// regions are block-relative and are rebased past the lines that lead the node.
+///
+/// Returns the node's [`FoldRegion`] alongside them — one per node that HAS a
+/// fold key, none for an [`Unfoldable`] one. PURE: `expanded` is read, never
+/// written.
+///
+/// [`Unfoldable`]: PeerFold::Unfoldable
+fn peer_node_lines(
+    origin: &PeerOrigin<'_>,
+    expanded: &HashSet<&str>,
+    record: &Value,
+    prev_day: &mut Option<Date>,
+    width: usize,
+) -> (Vec<Line<'static>>, Vec<LinkRegion>, Vec<FoldRegion>) {
+    let fold = peer_fold(origin.from, expanded);
+    let header = peer_header_line(origin.from.unwrap_or_default(), fold, record, prev_day);
+    // The whole header line is the click target, so a reader need not hit the
+    // affordance text exactly. `from` is `None` for precisely the `Unfoldable`
+    // case, so a keyless node gets NO region — see `PeerFold::Unfoldable`.
+    let folds: Vec<FoldRegion> = origin
+        .from
+        .map(|key| FoldRegion {
+            content_row: PEER_HEADER_BLOCK_ROW,
+            col_start: 0,
+            col_end: line_display_width(&header),
+            key: key.to_string(),
+        })
+        .into_iter()
+        .collect();
+
+    let mut lines = vec![Line::from(""), header];
+    if !fold.shows_body() {
+        return (lines, Vec::new(), folds);
+    }
+    // Body links are relative to the body; rebase them past the blank + header
+    // lines that lead the node, exactly as a `▶ you` turn rebases its own.
+    let offset = lines.len();
+    let body = dedent_uniformly(strip_handback_preamble(origin.body));
+    let (body_lines, body_links) = collapse_body_lines_collect(&body, width);
+    lines.extend(body_lines);
+    (lines, rebased(body_links, offset), folds)
+}
+
+/// The node's one-line header: `◆ message from @a03505fe4b1c2d3e0 · 14:15 ·
+/// (click to expand)`.
+///
+/// Built through [`marker_line_with_time`], so the node inherits the existing
+/// per-message timestamp and day-rollover behaviour untouched. The sender segment
+/// is fused into the MARKER text rather than passed as that builder's `agent`,
+/// because [`agent_handle`] prefixes its own ` · ` separator and suppresses the
+/// default handle — neither of which applies to a sender. The affordance then
+/// rides [`annotation_span`], the module's ONE ` · <text>` convention, so the
+/// three segments cannot drift apart in separator or style (DRY).
+///
+/// An [`Unfoldable`] node's header ends after the timestamp: it still reads
+/// `◆ message from a peer session · 14:15`, but claims no click.
+///
+/// Carries NO size segment — no byte count, turn count or line count. A collapsed
+/// node says WHO and WHEN, and what a click will do.
+///
+/// [`Unfoldable`]: PeerFold::Unfoldable
+fn peer_header_line(
+    from: &str,
+    fold: PeerFold,
+    record: &Value,
+    prev_day: &mut Option<Date>,
+) -> Line<'static> {
+    let marker = format!("{PEER_MARKER} {}", peer_label(from));
+    let mut line = marker_line_with_time(marker, peer_style(), None, record, prev_day);
+    if let Some(affordance) = fold.affordance() {
+        line.spans.push(annotation_span(affordance));
+    }
+    line
+}
+
 /// User `message.content` -> readable text (string, or text blocks joined with
 /// newlines). Bash `utxt` (preview variant).
 fn user_text(content: &Value) -> String {
@@ -560,6 +1003,14 @@ fn summary_style() -> Style {
 const YOU_MARKER: &str = "\u{25b6} you";
 /// The `● claude` assistant-turn marker (glyph + label); see [`YOU_MARKER`].
 const CLAUDE_MARKER: &str = "\u{25cf} claude";
+/// The `◆ message from` peer-message node marker (glyph + label), leading the
+/// collapsed line another session's message renders as (see [`peer_node_lines`]).
+///
+/// The glyph (`◆`, U+25C6) is deliberately DISTINCT from both turn markers — `▶`
+/// (U+25B6) `you` and `●` (U+25CF) `claude` — because the node is neither: nobody
+/// in this session typed it and claude did not answer it. It is a filled shape
+/// like the other two so the three read as one family of turn heads.
+const PEER_MARKER: &str = "\u{25c6} message from";
 
 /// `▶ you` turn separator.
 fn you_style() -> Style {
@@ -572,6 +1023,17 @@ fn you_style() -> Style {
 fn claude_style() -> Style {
     Style::default()
         .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// `◆ message from` peer-message node head.
+///
+/// Magenta + BOLD: a NAMED ANSI color, so it adapts to the terminal theme like
+/// its `you` (Green) and `claude` (Cyan) siblings, and distinct from both so the
+/// node cannot be misread as either end of this session's own conversation.
+fn peer_style() -> Style {
+    Style::default()
+        .fg(Color::Magenta)
         .add_modifier(Modifier::BOLD)
 }
 
@@ -2011,17 +2473,26 @@ mod tests {
 
     /// Text-only convenience over [`render_file_collect`] for the transcript-shape
     /// tests that assert markers/structure rather than link regions. No known
-    /// agents, so the `agent-name` fallback stays inert; see [`render_file_known`]
-    /// for tests that exercise it.
+    /// agents, so the `agent-name` fallback stays inert (see [`render_file_known`]
+    /// for tests that exercise it), and no open folds, so a peer node renders
+    /// COLLAPSED (see [`render_file_expanded`]).
     fn render_file(path: &Path, width: usize) -> Text<'static> {
-        render_file_collect(path, width, &HashSet::new()).text
+        render_file_collect(path, width, &HashSet::new(), &HashSet::new()).text
     }
 
     /// Like [`render_file`] but with an explicit set of known DEFINED agents, so a
     /// test can exercise the validated `agent-name` fallback.
     fn render_file_known(path: &Path, width: usize, known: &[&str]) -> Text<'static> {
         let known: HashSet<&str> = known.iter().copied().collect();
-        render_file_collect(path, width, &known).text
+        render_file_collect(path, width, &known, &HashSet::new()).text
+    }
+
+    /// Like [`render_file`] but with an explicit set of OPEN peer-message fold
+    /// keys, so a test can exercise the expanded shape end to end through the
+    /// JSONL path rather than by calling [`peer_node_lines`] directly.
+    fn render_file_expanded(path: &Path, width: usize, expanded: &[&str]) -> RenderedPreview {
+        let expanded: HashSet<&str> = expanded.iter().copied().collect();
+        render_file_collect(path, width, &HashSet::new(), &expanded)
     }
 
     /// Flatten a `Text` back to a plain string (span contents joined, lines by
@@ -2092,6 +2563,518 @@ mod tests {
         );
         // Styling is via ratatui Style, never embedded ANSI (TERMINAL-SAFE STYLING).
         assert!(!text.contains('\u{1b}'), "reply tail must not embed ANSI");
+    }
+
+    // --- peer message node ----------------------------------------------------
+
+    /// The encoded-cwd fixture folder holding the four peer-message sessions.
+    const PEER_FOLDER: &str = "-Users-me-project-epsilon";
+    /// `origin.from` of the hand-back fixture's peer record — a real agent stem.
+    const PEER_STEM: &str = "a03505fe4b1c2d3e0";
+
+    /// Build a minimal peer record so the pure helpers can be exercised without a
+    /// file. `origin` is spelled out per case rather than templated, because the
+    /// gate's whole job is to tell these shapes apart.
+    fn peer_record(origin: Value) -> Value {
+        serde_json::json!({
+            "type": "user",
+            "timestamp": "2026-08-20T14:15:00.000Z",
+            "origin": origin,
+            "message": {"content": "Another Claude session sent a message:\n<agent-message from=\"x\">\nbody\n</agent-message>"}
+        })
+    }
+
+    /// The gate is all THREE conditions — `type:"user"`, `origin.kind:"peer"`,
+    /// and a NON-EMPTY string `origin.body` — and every other shape falls
+    /// through to today's rendering. The body requirement is the load-bearing
+    /// one: the live store's `human` and `task-notification` origins are bare
+    /// `{"kind":…}` objects, so a gate of "has an origin" would swallow the
+    /// user's own prompts. Malformed origins fail soft to `None`, never a panic.
+    #[test]
+    fn peer_origin_gate_requires_type_kind_and_a_non_empty_body() {
+        let good = peer_record(serde_json::json!({
+            "kind": "peer", "from": PEER_STEM, "body": "hello"
+        }));
+        let origin = peer_origin(&good).expect("a peer record with a body qualifies");
+        assert_eq!(origin.from, Some(PEER_STEM));
+        assert_eq!(origin.body, "hello");
+
+        // The two bare kinds that dominate the store: no body, no node.
+        for kind in ["human", "task-notification"] {
+            let bare = peer_record(serde_json::json!({ "kind": kind }));
+            assert!(
+                peer_origin(&bare).is_none(),
+                "a bare `{kind}` origin must not collapse"
+            );
+        }
+        // Same kind, but the body is missing / empty / not a string.
+        for body in [
+            serde_json::json!(null),
+            serde_json::json!(""),
+            serde_json::json!(42),
+        ] {
+            let record = peer_record(serde_json::json!({
+                "kind": "peer", "from": PEER_STEM, "body": body
+            }));
+            assert!(
+                peer_origin(&record).is_none(),
+                "a peer origin with body {body} must not collapse"
+            );
+        }
+        // Wrong record type, wrong kind, absent / non-object origin: all fail soft.
+        let mut assistant = peer_record(serde_json::json!({
+            "kind": "peer", "from": PEER_STEM, "body": "hello"
+        }));
+        assistant["type"] = serde_json::json!("assistant");
+        assert!(
+            peer_origin(&assistant).is_none(),
+            "only user records collapse"
+        );
+        assert!(peer_origin(&peer_record(serde_json::json!("peer"))).is_none());
+        assert!(peer_origin(&serde_json::json!({"type": "user"})).is_none());
+    }
+
+    /// The harness preamble is dropped up to and including its closing sentence
+    /// — and so is the newline that separates it from the report, so the node
+    /// opens on the report rather than on a blank line. FAIL-SOFT: a body with
+    /// no marker (a genuine cross-session note) comes back untouched.
+    #[test]
+    fn strip_handback_preamble_drops_the_marker_and_keeps_an_unmarked_body() {
+        let body = format!("[Subagent hand-back] Boilerplate. {HANDBACK_PREAMBLE_MARKER}\n  ## Result\n  \n  Done.");
+        assert_eq!(strip_handback_preamble(&body), "  ## Result\n  \n  Done.");
+
+        let unmarked = "We are forked sibling sessions on the same worktree.";
+        assert_eq!(
+            strip_handback_preamble(unmarked),
+            unmarked,
+            "a body with no marker must be rendered whole"
+        );
+    }
+
+    /// The uniform two-space indent the harness writes is removed; a body with no
+    /// shared indent is returned untouched. A whitespace-only line (`"  "`, which
+    /// is how the harness writes a blank report line) does not vote on the
+    /// prefix and is emitted empty.
+    #[test]
+    fn dedent_uniformly_strips_a_shared_indent_and_refuses_a_ragged_one() {
+        assert_eq!(
+            dedent_uniformly("  ## Result\n  \n  - one\n    - nested"),
+            "## Result\n\n- one\n  - nested"
+        );
+
+        let flush = "We are forked sibling sessions.\n\nTake preview.rs.";
+        assert_eq!(
+            dedent_uniformly(flush),
+            flush,
+            "nothing shared, nothing cut"
+        );
+        let ragged = "  indented\nflush left";
+        assert_eq!(dedent_uniformly(ragged), ragged, "one flush line vetoes it");
+        // A whitespace-only line is not a veto, even indented less than the rest.
+        assert_eq!(dedent_uniformly("  a\n \n  b"), "a\n\nb");
+    }
+
+    /// Decision 3's binding intent: a sender that is not an agent stem must never
+    /// render as a bogus `@handle`. Both sides are reachable against real records
+    /// — 134 of 136 `origin.from` values are stems, and the other 2 are an agent
+    /// TYPE name and a unix socket path.
+    #[test]
+    fn peer_label_refuses_a_handle_for_a_non_stem_sender() {
+        assert_eq!(peer_label(PEER_STEM), format!("@{PEER_STEM}"));
+
+        for sender in [
+            "general-purpose",
+            "uds:/tmp/cc-socks/10523.sock",
+            "",
+            "a03505fe4b1c2d3e",   // one char short of a stem
+            "a03505fe4b1c2d3e00", // one char long
+            "A03505FE4B1C2D3E0",  // uppercase is not the observed shape
+            "z03505fe4b1c2d3e0",  // right length, not hex
+        ] {
+            assert_eq!(
+                peer_label(sender),
+                PEER_SESSION_LABEL,
+                "`{sender}` is not a stem and must not render as a handle"
+            );
+            assert!(
+                !peer_label(sender).contains('@'),
+                "`{sender}` must render no `@` at all"
+            );
+        }
+    }
+
+    /// The whole point: a peer record renders as ONE node line instead of the
+    /// `<agent-message …>` frame, and is no longer attributed to `▶ you`. The
+    /// session's own typed prompt above it still renders as an ordinary turn.
+    #[test]
+    fn peer_message_collapses_to_one_node_line_instead_of_the_agent_message_frame() {
+        let text = render_file(&fixture(PEER_FOLDER, "sess-peer-handback-1.jsonl"), WIDE);
+        let plain = flatten(&text);
+
+        assert!(
+            plain.contains(&format!("{PEER_MARKER} @{PEER_STEM}")),
+            "missing the peer node head:\n{plain}"
+        );
+        assert!(
+            plain.contains(PEER_EXPAND_AFFORDANCE),
+            "a collapsed node must say a click expands it:\n{plain}"
+        );
+        assert!(
+            !plain.contains("<agent-message"),
+            "the raw frame must not reach the pane:\n{plain}"
+        );
+        assert!(
+            !plain.contains("webhook retry backoff is fixed"),
+            "a collapsed node must not render its body:\n{plain}"
+        );
+        // The user's own typed turn is untouched.
+        assert!(
+            plain.contains("Delegate the retry backoff fix"),
+            "the human turn must still render:\n{plain}"
+        );
+        assert!(
+            plain.contains(YOU_MARKER),
+            "the human turn keeps its `you` marker:\n{plain}"
+        );
+    }
+
+    /// Expanded, the node renders the STRUCTURAL `origin.body` — preamble
+    /// stripped, indent removed — through the same body pass every other turn
+    /// takes, beneath a header that now offers to collapse it.
+    #[test]
+    fn expanding_a_peer_node_renders_the_body_without_the_harness_preamble() {
+        let record = peer_record(serde_json::json!({
+            "kind": "peer",
+            "from": PEER_STEM,
+            "body": format!(
+                "[Subagent hand-back] Boilerplate that is not the report. \
+                 {HANDBACK_PREAMBLE_MARKER}\n  ## Result\n  \n  - one backoff, applied per attempt"
+            ),
+        }));
+        let origin = peer_origin(&record).expect("gate admits the record");
+        let open: HashSet<&str> = [PEER_STEM].into_iter().collect();
+        let (lines, _, _) = peer_node_lines(&origin, &open, &record, &mut None, WIDE);
+        let plain = flatten(&Text::from(lines));
+
+        assert!(
+            plain.contains("Result"),
+            "an expanded node renders the report:\n{plain}"
+        );
+        assert!(
+            plain.contains("one backoff, applied per attempt"),
+            "an expanded node renders the whole report:\n{plain}"
+        );
+        assert!(
+            !plain.contains("Boilerplate") && !plain.contains(HANDBACK_PREAMBLE_MARKER),
+            "the harness preamble is dropped:\n{plain}"
+        );
+        assert!(
+            plain.contains(PEER_COLLAPSE_AFFORDANCE) && !plain.contains(PEER_EXPAND_AFFORDANCE),
+            "an expanded node offers to collapse:\n{plain}"
+        );
+        // The markdown pass PRESERVES a list item's own indent (it renders
+        // `  • item` for an indented one), so the rendered bullet's column is
+        // what says whether the harness indent was removed before the pass ran.
+        assert!(
+            plain.contains("\u{2022} one backoff"),
+            "the report renders as a list:\n{plain}"
+        );
+        assert!(
+            !plain.contains("  \u{2022} one backoff"),
+            "the uniform indent is removed before the markdown pass:\n{plain}"
+        );
+    }
+
+    /// A sender that is not an agent stem renders the generic label and NO `@`
+    /// anywhere on the line. The same fixture's body is flush-left and carries no
+    /// preamble, so it also pins that both body transforms fail soft.
+    #[test]
+    fn a_non_stem_peer_sender_renders_a_peer_session_and_never_an_at_handle() {
+        let path = fixture(PEER_FOLDER, "sess-peer-nonstem-1.jsonl");
+        let text = render_file(&path, WIDE);
+        let node = text
+            .lines
+            .iter()
+            .find(|l| {
+                l.spans
+                    .first()
+                    .is_some_and(|s| s.content.starts_with(PEER_MARKER))
+            })
+            .expect("the non-stem peer record still collapses to a node");
+        let head: String = node.spans.iter().map(|s| s.content.as_ref()).collect();
+
+        assert!(
+            head.contains(PEER_SESSION_LABEL),
+            "a socket path is not a handle: {head}"
+        );
+        assert!(
+            !head.contains('@'),
+            "no bogus `@handle` on the line: {head}"
+        );
+        assert!(
+            !head.contains("uds:"),
+            "the raw sender identity is not shown: {head}"
+        );
+
+        // Fail-soft, both transforms, on the body this record actually carries.
+        let body = "We are forked sibling sessions on the same worktree.\n\nI am holding \
+                    tests/fixtures/store while I add the peer records. Take \
+                    src/store/preview.rs and we will not collide.";
+        assert_eq!(strip_handback_preamble(body), body, "no preamble to strip");
+        assert_eq!(
+            dedent_uniformly(body),
+            body,
+            "flush left: nothing to dedent"
+        );
+    }
+
+    /// The bare origins that dominate the store — 221 `human` and 278
+    /// `task-notification` records carrying `{"kind":…}` and nothing else — still
+    /// render as ordinary `▶ you` turns. Collapsing them would hide the user's own
+    /// prompts. The `task-notification` turn keeps the existing control-wrapper
+    /// marker it has always rendered.
+    #[test]
+    fn bare_origin_kinds_still_render_ordinary_you_turns() {
+        let text = render_file(&fixture(PEER_FOLDER, "sess-origin-bare-1.jsonl"), WIDE);
+        let plain = flatten(&text);
+
+        assert!(
+            !plain.contains(PEER_MARKER),
+            "a bare origin must never collapse to a peer node:\n{plain}"
+        );
+        assert!(
+            plain.contains("Run the fixture sweep"),
+            "a `human` string turn still renders:\n{plain}"
+        );
+        assert!(
+            plain.contains("now add the missing regression guard"),
+            "a `human` typed-block turn still renders:\n{plain}"
+        );
+        assert!(
+            plain.contains(MARKER_TASK_NOTIFICATION),
+            "a `task-notification` turn keeps its existing marker:\n{plain}"
+        );
+        assert_eq!(
+            plain.matches(YOU_MARKER).count(),
+            3,
+            "all three bare-origin turns stay `you` turns:\n{plain}"
+        );
+    }
+
+    /// THE constraint: the `<agent-message …>` frame is never parsed. This record
+    /// quotes a whole hand-back — opener, `from="…"` attribute, harness preamble
+    /// and indented report — inside a fenced code block, and carries NO
+    /// record-level `origin`. Every cue a text matcher would key on is present,
+    /// and it must still render as an ordinary `▶ you` turn with its quote intact.
+    #[test]
+    fn an_agent_message_frame_in_text_alone_never_collapses_a_turn() {
+        let text = render_file(&fixture(PEER_FOLDER, "sess-frame-text-1.jsonl"), WIDE);
+        let plain = flatten(&text);
+
+        assert!(
+            !plain.contains(PEER_MARKER),
+            "text alone must never collapse a turn:\n{plain}"
+        );
+        assert!(
+            plain.contains(YOU_MARKER),
+            "the quoting turn stays a `you` turn:\n{plain}"
+        );
+        assert!(
+            plain.contains("<agent-message from=\"abc\">"),
+            "the quoted frame is content and must survive verbatim:\n{plain}"
+        );
+        assert!(
+            plain.contains("Line one of the quoted report."),
+            "the quoted report must survive:\n{plain}"
+        );
+        assert!(
+            plain.contains("Can the preview collapse that to a single line?"),
+            "the user's own question must survive:\n{plain}"
+        );
+    }
+
+    /// The collapsed line carries the sender, the timestamp and the affordance —
+    /// and NOTHING else. No byte count, turn count or line count (resolved
+    /// decision 5), which an exact match on the whole line is what pins.
+    #[test]
+    fn the_collapsed_peer_line_carries_no_size_segment() {
+        let text = render_file(&fixture(PEER_FOLDER, "sess-peer-handback-1.jsonl"), WIDE);
+        let head = text
+            .lines
+            .iter()
+            .find(|l| {
+                l.spans
+                    .first()
+                    .is_some_and(|s| s.content.starts_with(PEER_MARKER))
+            })
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .expect("the peer record collapses to a node");
+
+        // The turn above it shares the day, so the timestamp is the compact form.
+        assert_eq!(
+            head,
+            format!("{PEER_MARKER} @{PEER_STEM} \u{b7} 14:15 \u{b7} {PEER_EXPAND_AFFORDANCE}"),
+        );
+        // TERMINAL-SAFE STYLING: named-ANSI `Style`, never an embedded escape.
+        assert!(!head.contains('\u{1b}'), "the node must not embed ANSI");
+    }
+
+    /// The fold state decides the node's shape, and it is read END TO END through
+    /// the JSONL path — not just by the helper. With the node's key in the open
+    /// set the report renders and the header offers to collapse; with the set
+    /// empty it does not. A renderer that ignored its new argument would keep the
+    /// collapsed half of this passing and fail the expanded half.
+    #[test]
+    fn the_expanded_set_decides_whether_a_peer_node_renders_its_body() {
+        let path = fixture(PEER_FOLDER, "sess-peer-handback-1.jsonl");
+
+        let closed = flatten(&render_file_expanded(&path, WIDE, &[]).text);
+        assert!(
+            !closed.contains("webhook retry backoff is fixed"),
+            "a key outside the set stays collapsed:\n{closed}"
+        );
+
+        let open = flatten(&render_file_expanded(&path, WIDE, &[PEER_STEM]).text);
+        assert!(
+            open.contains("webhook retry backoff is fixed"),
+            "a key IN the set renders the report:\n{open}"
+        );
+        assert!(
+            open.contains(PEER_COLLAPSE_AFFORDANCE) && !open.contains(PEER_EXPAND_AFFORDANCE),
+            "an open node offers to collapse:\n{open}"
+        );
+        assert!(
+            !open.contains(HANDBACK_PREAMBLE_MARKER),
+            "the harness preamble is still dropped end to end:\n{open}"
+        );
+    }
+
+    /// The node's [`FoldRegion`] addresses its HEADER row, not the blank
+    /// separator above it and not some row the running rebase drifted to.
+    ///
+    /// The fixture puts a summary, a typed prompt and an assistant turn ABOVE the
+    /// node deliberately: a node at row 0 would let an off-by-N in the running
+    /// offset pass unnoticed, so the assertion is made against a node several
+    /// turns down and cross-checked against the text actually rendered.
+    #[test]
+    fn a_peer_nodes_fold_region_lands_on_its_header_row_below_several_turns() {
+        let rendered = render_file_expanded(
+            &fixture(PEER_FOLDER, "sess-peer-handback-1.jsonl"),
+            WIDE,
+            &[],
+        );
+        assert_eq!(
+            rendered.folds.len(),
+            1,
+            "the one peer record yields the one fold region"
+        );
+        let region = &rendered.folds[0];
+        assert_eq!(region.key, PEER_STEM, "keyed by `origin.from`, not `uuid`");
+
+        // Several turns render above the node, so this is a real offset test.
+        let header_row = region.content_row;
+        assert!(
+            header_row >= 4,
+            "the fixture must place turns above the node, or this proves nothing \
+             (header_row={header_row})"
+        );
+
+        // The recorded row IS the header: the blank separator is the row ABOVE.
+        let row_text = |row: usize| -> String {
+            rendered.text.lines[row]
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
+        let header = row_text(header_row);
+        assert!(
+            header.starts_with(PEER_MARKER),
+            "the fold region must address the header, not row {header_row}: {header:?}"
+        );
+        assert!(
+            row_text(header_row - 1).is_empty(),
+            "the row above the header is the node's blank separator, not the header"
+        );
+
+        // The whole header line is the click target.
+        assert_eq!(
+            (region.col_start, region.col_end),
+            (0, display_width(&header)),
+            "the region spans the header's full display width"
+        );
+    }
+
+    /// A peer record with a BODY but NO `origin.from` renders EXPANDED, carries NO
+    /// fold region and shows NO affordance text.
+    ///
+    /// The gate is exactly `type:"user"` + `origin.kind:"peer"` + a non-empty
+    /// `origin.body`, and does not require `from`. Rendering such a record
+    /// collapsed would draw a closed node with nothing to click, putting its body
+    /// permanently out of reach — a UI data-loss bug. No record in the live store
+    /// is shaped this way today; the branch exists so one never can hide content.
+    #[test]
+    fn a_peer_record_with_no_sender_renders_expanded_and_claims_no_click() {
+        let record = peer_record(serde_json::json!({
+            "kind": "peer",
+            "body": format!("Preamble. {HANDBACK_PREAMBLE_MARKER}\n  a body no click could reach"),
+        }));
+        let origin = peer_origin(&record).expect("the gate does not require `from`");
+        let (lines, _, folds) = peer_node_lines(&origin, &HashSet::new(), &record, &mut None, WIDE);
+        let plain = flatten(&Text::from(lines));
+
+        assert!(
+            folds.is_empty(),
+            "no fold key means no clickable region:\n{plain}"
+        );
+        assert!(
+            plain.contains("a body no click could reach"),
+            "a node nothing can open must render OPEN:\n{plain}"
+        );
+        assert!(
+            !plain.contains(PEER_EXPAND_AFFORDANCE) && !plain.contains(PEER_COLLAPSE_AFFORDANCE),
+            "an unclickable node must not promise a click:\n{plain}"
+        );
+        assert!(
+            plain.contains(&format!("{PEER_MARKER} {PEER_SESSION_LABEL}")),
+            "the header still says a peer session sent it:\n{plain}"
+        );
+    }
+
+    /// The three fold shapes, straight off the sender and the open-key set.
+    #[test]
+    fn peer_fold_reads_the_open_set_and_refuses_a_keyless_node() {
+        let open: HashSet<&str> = [PEER_STEM].into_iter().collect();
+        assert_eq!(peer_fold(Some(PEER_STEM), &open), PeerFold::Expanded);
+        assert_eq!(
+            peer_fold(Some(PEER_STEM), &HashSet::new()),
+            PeerFold::Collapsed
+        );
+        assert_eq!(
+            peer_fold(Some("another-sender"), &open),
+            PeerFold::Collapsed
+        );
+        assert_eq!(peer_fold(None, &open), PeerFold::Unfoldable);
+
+        // Only a COLLAPSED node hides its body, and only a foldable one claims a
+        // click.
+        assert!(!PeerFold::Collapsed.shows_body());
+        assert!(PeerFold::Expanded.shows_body());
+        assert!(PeerFold::Unfoldable.shows_body());
+        assert_eq!(PeerFold::Unfoldable.affordance(), None);
+        assert_eq!(
+            PeerFold::Collapsed.affordance(),
+            Some(PEER_EXPAND_AFFORDANCE)
+        );
+        assert_eq!(
+            PeerFold::Expanded.affordance(),
+            Some(PEER_COLLAPSE_AFFORDANCE)
+        );
     }
 
     #[test]
@@ -2841,7 +3824,7 @@ mod tests {
         );
         std::fs::write(&file, jsonl).expect("write temp jsonl");
 
-        let rendered = render_file_collect(&file, WIDE, &HashSet::new());
+        let rendered = render_file_collect(&file, WIDE, &HashSet::new(), &HashSet::new());
         assert_eq!(rendered.links.len(), 1, "one link region end to end");
         let region = &rendered.links[0];
         assert_eq!(region.url, "https://example.com/page");
@@ -2893,7 +3876,7 @@ mod tests {
         }
         std::fs::write(&file, jsonl).expect("write temp jsonl");
 
-        let rendered = render_file_collect(&file, WIDE, &HashSet::new());
+        let rendered = render_file_collect(&file, WIDE, &HashSet::new(), &HashSet::new());
         assert!(
             rendered.text.lines.len() > FORMER_TAIL_CAP,
             "the fixture must render past the old cap, or this proves nothing \

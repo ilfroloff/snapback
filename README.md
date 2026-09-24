@@ -123,6 +123,7 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | mouse wheel | Scroll the pane under the pointer — except while a compose or draft box is open, when the session list stops taking notches: a wheel over it does **nothing**, so the session you are writing to can never slide out from under you. Everywhere else it is unchanged, and a notch anywhere but the list still scrolls the transcript |
 | drag the pane border | Resize the list and preview panes |
 | click a preview link | Open its url in your browser |
+| click a peer message | Unfold a subagent's hand-back where it sits — the one-line `◆ message from @…` node — and click it again to fold it back. A hand-back otherwise arrives as ~95 rows of `<agent-message>` frame attributed to **you**; folded it costs one line, and the report is still one click away. Which nodes you left open is remembered for this run only — snapback writes nothing for it |
 | `Backspace` | Delete the last query character |
 | `Alt+Backspace` (`⌥⌫`) / `Ctrl-W` / `Alt+H` | Delete the last query **word** — one whole search term, so a path or a branch name goes in a single press instead of character by character (`Backspace` alone still takes one character). All three keys do the same thing, because which of them your terminal actually sends depends on how it treats **Option**; they are also the same three the reply and draft boxes word-delete on, so the gesture is bound wherever you type. What a press *cuts* differs on purpose: on the board it takes a whole search term, so `feature/fold-fork-lineages` goes in one press, while in a reply or draft box the cut stops at punctuation and takes only `lineages` |
 | any printable char | Type to search |
@@ -512,6 +513,9 @@ Code session store, which snapback otherwise only reads.
 session rendered as clean, scrollable markdown — the real conversation, whole,
 from its first turn to its last, however long it ran. So you
 can confirm it's the right session before jumping back in. Links are clickable.
+A message handed back by a subagent is folded to a single `◆ message from @…`
+line — it is that agent's report, not something you said, and it opens where it
+sits on a click.
 
 ---
 

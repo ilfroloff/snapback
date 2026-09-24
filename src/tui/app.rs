@@ -1527,6 +1527,24 @@ pub struct App {
     /// change invalidates the whole cache (see `preview_cache`). `None` until
     /// the first preview render.
     preview_width: Option<u16>,
+    /// The peer-message nodes the user has EXPANDED in the preview pane. EMPTY
+    /// IS THE DEFAULT, and it means every peer node renders collapsed to its
+    /// one clickable header line.
+    ///
+    /// Keyed by `origin.from` — the SENDING AGENT'S STEM, never the record
+    /// `uuid` — so a future delegation node resolves to the SAME key and the two
+    /// anchors drive one node (see [`preview::FoldRegion`]).
+    ///
+    /// IN MEMORY ONLY. It is NEVER written to disk: AGENTS.md SNAPBACK-OWNED
+    /// STATE permits exactly one persisted set, the hidden-session ids under
+    /// `$SNAPBACK_CONFIG_DIR/state/`, and this is not it. A fold is a transient
+    /// view of one pane, not a preference worth surviving the process — and the
+    /// store it describes is read-only, so nothing on disk could hold it anyway.
+    ///
+    /// Read by [`ensure_preview`](Self::ensure_preview) and mutated ONLY by
+    /// [`toggle_peer_fold`](Self::toggle_peer_fold), which evicts the cache
+    /// entry it invalidates in the same breath so the two cannot drift.
+    expanded_peers: HashSet<String>,
     /// The `(session_id, query)` the [`MATCH_OUTSIDE_PREVIEW`] nudge was last
     /// fired for, so one state of affairs is reported exactly once.
     ///
@@ -1673,6 +1691,7 @@ impl App {
             pending_chord: false,
             preview_cache: HashMap::new(),
             preview_width: None,
+            expanded_peers: HashSet::new(),
             preview_match_notice: None,
             preview_match_jump: false,
             preview_match_line: None,
@@ -3375,7 +3394,14 @@ impl App {
             // Defined-agent names gate the preview's `agent-name` fallback so a
             // free-form background-job title never renders as a bogus handle.
             let known_agents: HashSet<&str> = self.agent_names.iter().map(String::as_str).collect();
-            let rendered = preview::render(session, usize::from(inner_width), &known_agents);
+            // Open peer-message fold keys, borrowed out of the app's own set
+            // (`expanded_peers`). The renderer only ever READS it, which is what
+            // keeps `preview::render` pure; a key is added or removed by
+            // `toggle_peer_fold` alone, and that evicts this entry so the next
+            // miss re-renders under the new set.
+            let expanded: HashSet<&str> = self.expanded_peers.iter().map(String::as_str).collect();
+            let rendered =
+                preview::render(session, usize::from(inner_width), &known_agents, &expanded);
             // Measure ONCE, here, where the text and the width it was rendered for
             // are both in hand — the wrapper walks every line, so a per-frame
             // measurement would put a whole-transcript pass on the draw path.
@@ -3515,7 +3541,13 @@ impl App {
     /// row the user is looking at, so there is nothing unexplained to explain.
     /// What is left is the content hits — roughly one in eight, measured once —
     /// whose text lives in a turn the preview collapses or drops,
-    /// where an unmarked pane would otherwise read as a broken highlight. It takes
+    /// where an unmarked pane would otherwise read as a broken highlight. A
+    /// COLLAPSED peer-message node is exactly such a turn: it contributes its one
+    /// `◆ message from …` header line and NOTHING of the subagent's `origin.body`,
+    /// so a hit that matched only inside a hand-back has no marked line until a
+    /// click expands the node — and that click re-renders through
+    /// [`toggle_peer_fold`](Self::toggle_peer_fold), whose `ensure_preview` pass
+    /// recomputes the marks over the now-longer text. It takes
     /// NO rendered line holding any atom: a query whose words landed on different
     /// lines has marks on screen and explains itself.
     ///
@@ -3688,29 +3720,140 @@ impl App {
         self.ensure_preview(inner_width).map(|p| &p.matches)
     }
 
-    /// The wrapped-layout context needed to hit-test a mouse click into a preview
-    /// link: the per-line wrapped-row PREFIX MAP
-    /// ([`row_prefix`](CachedPreview::row_prefix)) and the clickable
-    /// [`LinkRegion`](preview::LinkRegion)s — both pulled from the SAME width-scoped
+    /// The wrapped-layout context needed to hit-test a mouse click into a preview:
+    /// the per-line wrapped-row PREFIX MAP
+    /// ([`row_prefix`](CachedPreview::row_prefix)) and BOTH kinds of clickable
+    /// region — the [`LinkRegion`](preview::LinkRegion)s and the peer-node
+    /// [`FoldRegion`](preview::FoldRegion)s — all pulled from the SAME width-scoped
     /// cache the view drew from, so a hit-test can never disagree with what is on
     /// screen. Empty when nothing is selected.
     ///
+    /// The two region kinds come back TOGETHER, out of ONE cache entry, for the same
+    /// reason the renderer emits them from one pass: a click is resolved to a row
+    /// once, and a fold whose row was read from a different render than the link
+    /// beside it would toggle a node the user did not click. Asking twice — once per
+    /// kind — is the shape that makes that possible, so do not split this in two.
+    ///
     /// It hands over the very map the DRAW windows by, and that shared identity is
-    /// the point: `view::link_at` resolves a clicked row to a logical line through
-    /// the same binary search `view::row_window` starts the window with, so the two
-    /// cannot disagree about which line was painted where. Answering that from a
-    /// per-line model instead — as a walk over each line's display WIDTH did — makes
-    /// the click's error grow with every wrapping line above it, without limit on a
-    /// long transcript.
+    /// the point: `view::link_at` and `view::fold_at` resolve a clicked row to a
+    /// logical line through the same binary search `view::row_window` starts the
+    /// window with, so the two cannot disagree about which line was painted where.
+    /// Answering that from a per-line model instead — as a walk over each line's
+    /// display WIDTH did — makes the click's error grow with every wrapping line
+    /// above it, without limit on a long transcript.
     pub fn preview_hit_context(
         &mut self,
         inner_width: u16,
-    ) -> (Vec<usize>, Vec<preview::LinkRegion>) {
+    ) -> (
+        Vec<usize>,
+        Vec<preview::LinkRegion>,
+        Vec<preview::FoldRegion>,
+    ) {
         match self.ensure_preview(inner_width) {
-            Some(p) => (p.row_prefix.clone(), p.rendered.links.clone()),
-            None => (Vec::new(), Vec::new()),
+            Some(p) => (
+                p.row_prefix.clone(),
+                p.rendered.links.clone(),
+                p.rendered.folds.clone(),
+            ),
+            None => (Vec::new(), Vec::new(), Vec::new()),
         }
     }
+
+    /// Open or close the peer-message node keyed by `key`, then keep it on the
+    /// screen row it was clicked on.
+    ///
+    /// The ONE place `expanded_peers` is mutated, and it evicts the selected
+    /// session's `preview_cache` entry in the same breath. That pairing is the whole
+    /// design: the fold set is deliberately NOT part of the cache key (a second key
+    /// component buys a retained collapsed render nobody asks for — YAGNI), so an
+    /// entry that outlived a toggle would serve the OLD shape forever, and the two
+    /// steps drifting apart is exactly the bug the single call site prevents.
+    ///
+    /// `preview_follow_bottom` is deliberately left alone. Expanding grows the
+    /// transcript BELOW the node, so a pane pinned to the bottom stays pinned by the
+    /// existing clamp, and a pane the user has anchored mid-transcript keeps its
+    /// anchor through [`fold_scroll_delta`] — neither wants the follow flag touched.
+    ///
+    /// Fail-soft throughout: nothing selected, or a key with no region in the
+    /// current render, toggles the set and re-renders but moves no scroll.
+    pub(crate) fn toggle_peer_fold(&mut self, key: &str, inner_width: u16) {
+        let Some(id) = self.selected.clone() else {
+            return;
+        };
+        // Read the BEFORE geometry off the entry that is on screen, so the row the
+        // anchor is measured against is the row the user actually clicked.
+        let Some(entry) = self.ensure_preview(inner_width) else {
+            return;
+        };
+        let row_prefix_before = entry.row_prefix.clone();
+        let content_row = entry
+            .rendered
+            .folds
+            .iter()
+            .find(|f| f.key == key)
+            .map(|f| f.content_row);
+
+        // Mutate AND evict together. `remove` answers whether the key was open, so
+        // one call covers both directions of the toggle (resolved decision 4).
+        if !self.expanded_peers.remove(key) {
+            self.expanded_peers.insert(key.to_string());
+        }
+        self.preview_cache.remove(&id);
+
+        let scroll = self.preview_scroll;
+        let next = self
+            .ensure_preview(inner_width)
+            .zip(content_row)
+            .map(|(entry, row)| {
+                fold_scroll_delta(&row_prefix_before, &entry.row_prefix, row, scroll)
+            });
+        if let Some(next) = next {
+            self.preview_scroll = next;
+        }
+    }
+}
+
+/// The preview scroll offset that holds a toggled node on the SCREEN ROW it was
+/// clicked on, given the wrapped-row prefix maps from BEFORE and AFTER the
+/// re-render and the node's header line index.
+///
+/// A node sits on screen row `row_prefix[content_row] - scroll`. Holding that
+/// constant across a re-render means moving `scroll` by exactly as much as the
+/// node's first wrapped row moved, which is the whole formula:
+/// `scroll + after[content_row] - before[content_row]`.
+///
+/// `content_row` is the node's own header and is STABLE across the toggle — the
+/// header line occupies the same content index either way, because expanding only
+/// appends body lines BELOW it and nothing above it moves. So in today's renderer
+/// the difference is zero and the pane holds still on its own. That is a property
+/// of the render, not a guarantee of it: this function is what keeps the anchor
+/// correct if a node ever grows a line above its header, and it is the reason the
+/// anchoring cannot fail SILENTLY — a wrong answer here shows up as a test failure
+/// rather than as a pane that jumps.
+///
+/// Saturating throughout and index FAIL-SOFT: a `content_row` past either map (a
+/// node that stopped existing between the two renders) returns `scroll` untouched
+/// rather than guessing, and no arithmetic can wrap past `0` or `u32::MAX`.
+fn fold_scroll_delta(
+    row_prefix_before: &[usize],
+    row_prefix_after: &[usize],
+    content_row: usize,
+    scroll: u32,
+) -> u32 {
+    let (Some(&before), Some(&after)) = (
+        row_prefix_before.get(content_row),
+        row_prefix_after.get(content_row),
+    ) else {
+        return scroll;
+    };
+    // Add before subtracting so a node that moved DOWN cannot underflow a
+    // small offset on the way, and clamp back into `u32` at the end: the maps
+    // are `usize` row counts and the offset every scroll path shares is a `u32`.
+    let next = usize::try_from(scroll)
+        .unwrap_or(usize::MAX)
+        .saturating_add(after)
+        .saturating_sub(before);
+    u32::try_from(next).unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]
@@ -4620,6 +4763,185 @@ mod tests {
             after > before,
             "a reloaded transcript must be re-measured, not answered from the \
              pre-reload cache (before={before}, after={after})"
+        );
+    }
+
+    // --- peer-message fold: the toggle, the eviction, and the anchor --------
+
+    /// The peer-node fixture: one `origin.kind:"peer"` hand-back with a prompt, an
+    /// assistant turn and a tool use above it, so the node's header sits well down
+    /// the transcript rather than at row 0.
+    const PEER_FIXTURE: (&str, &str) = ("-Users-me-project-epsilon", "sess-peer-handback-1.jsonl");
+    /// The agent stem that fixture's hand-back was sent FROM — the node's fold key
+    /// (`origin.from`, never the record `uuid`).
+    const PEER_KEY: &str = "a03505fe4b1c2d3e0";
+    /// A pane width wide enough that the fixture's header line does not wrap, so
+    /// the geometry under test is the fold's and not the wrapper's.
+    const PEER_WIDTH: u16 = 40;
+
+    /// A click TOGGLES: the first opens the node, the second closes it again
+    /// (resolved decision 4). Both directions go through the one mutation site, so
+    /// an insert-only toggle would leave a node the user cannot re-collapse.
+    #[test]
+    fn toggling_a_peer_fold_inserts_then_removes_the_same_key() {
+        let (folder, file) = PEER_FIXTURE;
+        let mut app = app_all(vec![fixture_session("s1", folder, file)]);
+        assert!(
+            app.expanded_peers.is_empty(),
+            "every peer node starts COLLAPSED — an empty set is the default"
+        );
+
+        app.toggle_peer_fold(PEER_KEY, PEER_WIDTH);
+        assert_eq!(
+            app.expanded_peers
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec![PEER_KEY],
+            "the first click must open exactly the clicked node"
+        );
+
+        app.toggle_peer_fold(PEER_KEY, PEER_WIDTH);
+        assert!(
+            app.expanded_peers.is_empty(),
+            "the second click must CLOSE the same node, not re-open it"
+        );
+    }
+
+    /// A toggle evicts the SELECTED session's preview entry and nothing else.
+    ///
+    /// Both halves matter and neither shows up as a failing build. Evicting
+    /// nothing serves the pre-toggle render forever — the node never opens. Evicting
+    /// everything throws away every other transcript the board has rendered, which
+    /// is the whole cost the reload's narrow `retain` exists to avoid.
+    #[test]
+    fn a_peer_fold_toggle_evicts_exactly_one_cached_preview() {
+        let (folder, file) = PEER_FIXTURE;
+        let (long_folder, long_file) = LONG_FIXTURE;
+        let mut app = app_all(vec![
+            fixture_session("s1", folder, file),
+            fixture_session("s2", long_folder, long_file),
+        ]);
+
+        app.selected = Some("s2".to_string());
+        app.preview_text(PEER_WIDTH);
+        app.selected = Some("s1".to_string());
+        let collapsed = app.preview_wrapped_rows(PEER_WIDTH);
+        assert_eq!(app.preview_cache_len(), 2, "both transcripts are cached");
+
+        app.toggle_peer_fold(PEER_KEY, PEER_WIDTH);
+        assert!(
+            app.preview_wrapped_rows(PEER_WIDTH) > collapsed,
+            "the selected session's entry must be evicted, so the re-render opens \
+             the node's body (collapsed={collapsed})"
+        );
+        assert_eq!(
+            app.preview_cache_len(),
+            2,
+            "and ONLY that entry: the unselected session's preview must survive"
+        );
+    }
+
+    /// The anchor arithmetic, in both directions and at both edges.
+    ///
+    /// Pure, so the maps are synthetic: this is where the formula is pinned,
+    /// because the renderer's own node never moves (see the real-render sibling
+    /// below) and could therefore not tell a correct delta from a dropped one.
+    #[test]
+    fn fold_scroll_delta_holds_a_nodes_screen_row_in_both_directions() {
+        // A four-line transcript whose node header is line 2, starting on wrapped
+        // row 10; the pane is scrolled to 6, so the node sits on screen row 4.
+        let before = [0usize, 3, 10, 12];
+        // The same transcript after a re-render that pushed the header down 4 rows.
+        let after = [0usize, 3, 14, 30];
+
+        assert_eq!(
+            fold_scroll_delta(&before, &after, 2, 6),
+            10,
+            "expanding: the offset must move with the header (14 - 10 == 4), so the \
+             node stays on screen row 4"
+        );
+        assert_eq!(
+            fold_scroll_delta(&after, &before, 2, 10),
+            6,
+            "collapsing: the same movement in reverse returns the original offset"
+        );
+        assert_eq!(
+            fold_scroll_delta(&after, &before, 2, 1),
+            0,
+            "a node moving UP past the top of a barely-scrolled pane saturates at 0 \
+             rather than underflowing"
+        );
+        assert_eq!(
+            fold_scroll_delta(&before, &after, 99, 6),
+            6,
+            "a row past either map is fail-soft: the offset is left exactly where \
+             it was, never guessed"
+        );
+    }
+
+    /// The real render agrees with the formula: expanding and re-collapsing a node
+    /// leaves it on the screen row it was clicked on, and the pane does not jump.
+    ///
+    /// This is the claim the brief demanded be VERIFIED rather than assumed, and
+    /// today's renderer verifies it the strong way — the header's own
+    /// `content_row` and its wrapped row are IDENTICAL across the toggle, because
+    /// expanding appends body lines BELOW the header and nothing above it moves.
+    /// The delta is therefore zero here by construction; the arithmetic that makes
+    /// it zero for the right reason is pinned by the pure sibling above. What this
+    /// test adds is the WIRING — that the toggle really consults
+    /// [`fold_scroll_delta`] against the pre-toggle map, which a mis-derived delta
+    /// (dropping the `before` term, say) would move the pane by the node's whole
+    /// depth into the transcript.
+    #[test]
+    fn a_peer_fold_toggle_keeps_the_node_on_its_screen_row() {
+        let (folder, file) = PEER_FIXTURE;
+        let mut app = app_all(vec![fixture_session("s1", folder, file)]);
+        // Anchored mid-transcript rather than at the top, so an offset the toggle
+        // moved cannot be mistaken for the one it left alone.
+        app.preview_scroll = 4;
+
+        let (before_map, _links, folds) = app.preview_hit_context(PEER_WIDTH);
+        let region = folds
+            .iter()
+            .find(|f| f.key == PEER_KEY)
+            .expect("the fixture's hand-back must render a fold region");
+        let start_before = before_map[region.content_row];
+        assert!(
+            start_before > 0,
+            "the node must sit BELOW the first row, or a dropped `before` term \
+             would be invisible here"
+        );
+        let screen_row = i64::try_from(start_before).unwrap() - i64::from(app.preview_scroll);
+
+        app.toggle_peer_fold(PEER_KEY, PEER_WIDTH);
+        let (open_map, _links, open_folds) = app.preview_hit_context(PEER_WIDTH);
+        assert!(
+            open_map.last() > before_map.last(),
+            "the node's body must really have opened below the header"
+        );
+        let open_region = open_folds
+            .iter()
+            .find(|f| f.key == PEER_KEY)
+            .expect("an expanded node stays clickable");
+        assert_eq!(
+            i64::try_from(open_map[open_region.content_row]).unwrap()
+                - i64::from(app.preview_scroll),
+            screen_row,
+            "expanding must leave the node on the screen row it was clicked on"
+        );
+
+        app.toggle_peer_fold(PEER_KEY, PEER_WIDTH);
+        let (closed_map, _links, closed_folds) = app.preview_hit_context(PEER_WIDTH);
+        let closed_region = closed_folds
+            .iter()
+            .find(|f| f.key == PEER_KEY)
+            .expect("a re-collapsed node is still clickable");
+        assert_eq!(
+            i64::try_from(closed_map[closed_region.content_row]).unwrap()
+                - i64::from(app.preview_scroll),
+            screen_row,
+            "and re-collapsing must put it back on that same row"
         );
     }
 

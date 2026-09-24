@@ -256,8 +256,9 @@ never fatal:
 | `agentName` | on `type:"agent-name"`, string (fail-soft) | the background job's name; a **fallback** bound-agent source for the preview handle, trusted ONLY when it names a known agent (the field also carries free-form titles) — see [bound agent](#bound-agent-storepreview) |
 | `sessionKind` | **top-level on ordinary records**, string (fail-soft); only observed value `"bg"` | marks the transcript a **background** job — one half of the [lost agent binding](#lost-agent-binding-storelineage) badge. See [`sessionKind`](#sessionkind) |
 | `message.content` | string **or** typed-block array | user prompt, preview body, content index |
-| `isSidechain` | bool (`label::is_sidechain`; non-bool ⇒ `false`) | skip sub-agent turns when picking a label/preview; a sub-agent turn neither raises nor clears the [failed-task flag](#failed-background-task-storeparse) |
+| `origin` | on `type:"user"`, object (fail-soft) | WHO the turn came from, when it was not the person at the keyboard. `kind` is `"peer"`, `"human"` or `"task-notification"`; only a `"peer"` record ever carries `from` (the sending agent) and `body` (its message). A peer record with a NON-EMPTY `body` renders as the preview's collapsible **peer node** and `from` is that node's fold key — see [Peer message node](#peer-message-node-storepreview) |
 | `origin.kind` | on `type:"user"`: `origin` is an object with a string `kind` (fail-soft — see the flag); observed `"human"`, `"task-notification"`, `"peer"`, and very often **absent** | who wrote the record. Ruled on **first** by the [failed-task flag](#failed-background-task-storeparse): `"task-notification"` is a notice, and only an absent `origin` or `"human"` can clear |
+| `isSidechain` | bool (`label::is_sidechain`; non-bool ⇒ `false`) | skip sub-agent turns when picking a label/preview — except that the preview checks the [peer node](#peer-message-node-storepreview) gate FIRST, so a peer record with a body still renders even on a sidechain turn; a sub-agent turn neither raises nor clears the [failed-task flag](#failed-background-task-storeparse) |
 | `promptSource` | on `type:"user"`, string (fail-soft); observed `typed`, `sdk`, `system`, `queued` | `typed` / `sdk` mark the USER writing — clears the flag, but is **never read before `origin`** (51 of 169 notices say `sdk` too) |
 | `turnOrigin` | on `type:"user"`, string (fail-soft); observed `human`, `sdk`, `peer`, `task_notification` | `human` / `sdk` mark the user writing — the ONLY marker a quick-reply slash command carries, [from Claude Code 2.1.278 on](#why-turnorigin-counts) |
 | `isMeta` | bool on `type:"user"`; anything but absent or `false` reads as meta | an injection nobody typed; never clears the flag |
@@ -1512,6 +1513,49 @@ This is the third and last of **three distinct agent concepts** — keep them ap
 | **Live** (reported) agent | `claude agents --json` (`src/agents.rs`) | a **running process** — drives the board badge and the resume gate (see [Reported agents](#reported-agents-srcagentsrs)) |
 | **Defined** agent | `~/.claude/agents/*.md` (`src/defined_agents.rs`) | an **on-disk definition** a new session can be launched under (`claude --agent <name>`, see [Hand-off invocations](#hand-off-invocations-srcresumers)) |
 | **Bound** agent | `agent-setting` / `agent-name` records (`store::preview`) | the **agent a recorded session actually ran under** — a preview-only label, this section; the **Defined** set above is what validates the noisy `agent-name` source |
+
+### Peer message node (`store::preview`)
+
+A message handed back by a subagent lands in the parent transcript as a
+`type:"user"` record carrying a record-level `origin` object AND an
+`<agent-message from="…">` text frame inside `message.content`. Drawn as an
+ordinary user turn it is two defects at once: noise (~95 wrapped rows at the
+median, so a session with seven hand-backs gains ~700) and a MISLABEL — a
+subagent is not the person reading the board. The preview renders it as a
+one-line node instead:
+
+```text
+collapsed:  ◆ message from @a03505fe4b1c2d3e0 · 14:15 · (click to expand)
+expanded:   ◆ message from @a03505fe4b1c2d3e0 · 14:15 · (click to collapse)
+            <origin.body, preamble stripped and dedented>
+```
+
+**NEVER match the `<agent-message …>` text frame.** It occurs verbatim inside
+quoted prose and inside tool payloads, so a text-level rule collapses legitimate
+content; `origin` is structural and cannot be forged by content. The fixture
+store pins the trap directly: a record with NO `origin` whose content quotes that
+frame inside a fenced block must still render `▶ you`.
+
+The gate, every field read fail-soft as `serde_json::Value`: `type == "user"`,
+`origin.kind == "peer"`, and `origin.body` a NON-EMPTY string. The body
+requirement is load-bearing rather than defensive — `kind:"human"` and
+`kind:"task-notification"` records are bare `{"kind":…}` objects with no `from`
+and no `body`, and together they outnumber the peer records, so a gate of "has an
+`origin`" would fold away the user's own prompts.
+
+| Field | Shape in the store | What the renderer does with it |
+| --- | --- | --- |
+| `origin.kind` | `"peer"`, `"human"` or `"task-notification"` | only `"peer"` is admitted |
+| `origin.body` | the message text; a hand-back opens with a fixed harness preamble ending `The report follows:`, and the report below it is uniformly two-space indented | preamble stripped and body dedented, BOTH fail-soft: an absent marker renders the body whole, and an indent that is not shared by every non-blank line is left alone |
+| `origin.from` | the sending agent's STEM for the great majority; real data also holds an agent TYPE name and a unix socket path | the node's FOLD KEY, and its label only when stem-shaped (`PEER_STEM_LEN` lowercase hex) — anything else renders `a peer session`, the same refusal the [bound agent](#bound-agent-storepreview) makes of a free-form `agent-name`, so a socket path never draws as an `@handle` |
+
+The fold key is the SENDER, never the record `uuid`: `(session, origin.from)`
+pairs are unique across the store, and keying it this way lets a later
+delegation node resolve to the SAME node. Which nodes are open lives in
+`tui::app`'s `expanded_peers`, IN MEMORY for the run — the hidden-id set above
+stays the only thing snapback persists. A record that passes the gate but
+carries no `from` has no key, so it claims no click region and renders EXPANDED:
+a collapsed node nobody can click would put its body permanently out of reach.
 
 ## User-facing modes (`tui::app`)
 
