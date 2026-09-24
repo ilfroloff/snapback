@@ -156,12 +156,13 @@ one place.
   single item with a reason. NEVER a crate/module-wide blanket. (`src/search.rs`,
   `src/watch.rs`, `src/worktrees.rs`)
 - **KEEP KEY DOCS IN SYNC.** A key/flag change must update the table in
-  `update.rs`, `USAGE`/`KEYS` in `cli.rs`, the help line in `view.rs`, the
-  README key map, and any prose enumeration of a key set in `docs/agents/*`
-  (for example, PATTERNS.md's follow-bottom re-arm passage) together. This is
-  the ONE list of those surfaces; the other docs point here. It binds ROUTING
-  too, not just bindings: when a key's gate gains a case (a new
-  `AgentActivity` bucket, a new refusal), every place that ENUMERATES that
+  `update.rs`, `USAGE`/`KEYS` in `cli.rs`, the help line in `view.rs` — BOTH
+  strings that render there, the board keymap AND `chord_hint`'s which-key list,
+  which is column-budgeted at 80 — the README key map, and any prose enumeration of
+  a key set in `docs/agents/*` (for example, PATTERNS.md's follow-bottom re-arm
+  passage) together. This is the ONE list of those surfaces; the other docs point
+  here. It binds ROUTING too, not just bindings: when a key's gate gains a case (a
+  new `AgentActivity` bucket, a new refusal), every place that ENUMERATES that
   routing is stale until updated — the five above plus the gate tables in
   [DOMAIN.md](docs/agents/DOMAIN.md). A partial enumeration is a wrong one.
 - **STATUS-LINE OWNERSHIP.** `App::status` is a keypress-scoped surface: it carries

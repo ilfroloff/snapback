@@ -34,7 +34,7 @@
 //! | `Ctrl-K` | stop / interrupt the selected session's live background agent (`claude stop`); an agent whose run is OVER (`done` / `stopped` / `failed`) stops at once, every other live agent confirms first, and a session claude is not holding — or one running interactively, which carries no job id — is refused (see [`send::interrupt_gate`]) |
 //! | `Tab` | toggle name-only vs. name+content search. Widening to content also opens the preview on the most recent match, exactly as typing does: it goes through the same query funnel, and the mode is the gate that key just opened |
 //! | `Ctrl-A` | flip the scope: current folder <-> project (the launch repo and all of its git worktrees). ONE key for both, because the second is a refinement of the same question the first answers, not a separate mode. Launched with `--all`/`-a` it becomes a three-stop cycle through all folders as well — the whole store is on this key only when the launch flag put it there |
-//! | `Ctrl-X` then `x`/`d`/`h`/`r` | leader chord: hide / hard-delete (this row, or its whole fork lineage) / toggle show-hidden / re-read every transcript from disk (any other key cancels) |
+//! | `Ctrl-X` then `x`/`d`/`h`/`m`/`r` | leader chord: hide / hard-delete (this row, or its whole fork lineage) / toggle show-hidden / pick the sticky `--model` override every later hand-off carries (also pre-armable at launch with `--model <value>` — see below) / re-read every transcript from disk (any other key cancels) |
 //! | `Ctrl-/` | toggle the preview pane |
 //! | `PgUp` / `PgDn` | scroll the preview a page (always) |
 //! | `Ctrl-U` / `Ctrl-D` | scroll the preview a quarter page (always) |
@@ -53,6 +53,17 @@
 //! disambiguated by whether there is anything marked to move between — and they
 //! fall through to the unshifted binding when there is not, so a terminal that
 //! drops the modifier still moves the selection.
+//!
+//! ## The one launch flag that lands on this table
+//!
+//! `--model <value>` belongs here rather than in [`crate::cli`] alone, because it
+//! writes state a KEY otherwise owns: it pre-arms the same sticky override
+//! `Ctrl-X m` sets, through the same `App::set_model_override`, so the flag and the
+//! picker are two doors onto ONE setting and the picker can still change or clear
+//! it mid-session. Nothing downstream can tell them apart. Every other flag
+//! (`-a`/`--all`, `-p`/`--project`, `--help`, the hidden `--print-list`) picks a
+//! starting scope or a run mode that no key writes, and is documented in
+//! [`crate::cli`] alone.
 //!
 //! ## Terminal paste
 //!
@@ -170,7 +181,7 @@ pub enum Action {
     BackspaceWord,
     /// Enter the `Ctrl-X` leader chord: arm [`App::pending_chord`] so the NEXT key
     /// routes through the pure [`chord_key`] machine (hide / hard-delete /
-    /// show-hidden / cancel) instead of the board.
+    /// show-hidden / model picker / forced rescan / cancel) instead of the board.
     Chord,
     /// A key with no binding in the current state.
     Ignore,
@@ -265,9 +276,11 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool
             KeyCode::Char('r') | KeyCode::Char('R') => Action::Reply,
             KeyCode::Char('k') | KeyCode::Char('K') => Action::Interrupt,
             KeyCode::Char('c') | KeyCode::Char('C') => Action::Quit,
-            // Ctrl-X (0x18 CAN) is the board-trimming leader chord (hide /
-            // hard-delete / show-hidden / forced rescan). Unbound and
-            // terminal-safe — unlike Ctrl-H/I/M, which alias Backspace/Tab/Enter.
+            // Ctrl-X (0x18 CAN) is the leader chord (hide / hard-delete /
+            // show-hidden / model picker / forced rescan). Unbound and
+            // terminal-safe — unlike Ctrl-H/I/M, which alias Backspace/Tab/Enter,
+            // the last of which is exactly why the model picker is on `m` here
+            // rather than on a `Ctrl-M` of its own.
             // It only ARMS the chord; the follow-up key decides (see `chord_key`).
             KeyCode::Char('x') | KeyCode::Char('X') => Action::Chord,
             // Quarter-page preview scroll (readline-style). Acts regardless of
@@ -356,6 +369,8 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool
 ///   [`App::begin_split_drag`] and the `App::overlay_active` gate).
 /// * `SessionsChanged` -> reload `store` and re-apply query+scope, preserving
 ///   selection-by-id and scroll (see [`reload_board`]).
+/// * `ModelAliases` -> swap in the alias set the off-thread probe read off the
+///   installed `claude`, so the next `Ctrl-X m` offers it instead of the seed.
 /// * `Tick` -> nothing costly (just a redraw upstream).
 ///
 /// Every return runs through ONE teardown seam: an outcome that
@@ -396,7 +411,7 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
             }
             // A pending `Ctrl-X` leader chord OWNS the next key too: route it through
             // the chord machine BEFORE normal handling so a printable follow-up
-            // (`x`/`d`/`h`/`r`) completes the chord instead of leaking into the query.
+            // (`x`/`d`/`h`/`m`/`r`) completes the chord instead of leaking into the query.
             if app.pending_chord {
                 return handle_chord_key(app, key, store);
             }
@@ -449,6 +464,20 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
         AppEvent::ReportedAgents(agents) => {
             // Delivered off-thread by the agents poller; just swap the map in.
             app.set_reported_agents(agents);
+            Outcome::Continue
+        }
+        AppEvent::ModelAliases(aliases) => {
+            // Delivered ONCE, off-thread, by the `--model` alias probe; just swap
+            // the list in. An empty list is the probe's "could not read it" answer
+            // and is stored as-is — the picker reads empty as "keep the seed", so a
+            // failed probe degrades rather than emptying the overlay.
+            //
+            // Deliberately silent: which aliases the picker offers is a fact true
+            // over an INTERVAL, rendered by the picker itself, so it never reaches
+            // the keypress-scoped status line (STATUS-LINE OWNERSHIP). It also does
+            // not touch the selection or trigger a reload — nothing about the board's
+            // rows depends on it.
+            app.set_model_aliases(aliases);
             Outcome::Continue
         }
         AppEvent::SendFinished {
@@ -874,18 +903,17 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
 /// The url of the rendered preview link under a pointer at screen `(col, row)`,
 /// or `None` when the pointer is over no link.
 ///
-/// The transcript does NOT own the whole preview pane: a REPORTED session pins a
-/// status banner to the pane's first inner row (`view::preview_banner`), so its
+/// The transcript does NOT own the whole preview pane: the selected session pins a
+/// banner to the pane's first inner row (`view::preview_banner`), so its
 /// transcript starts one row lower. Deriving the rect from the SAME
 /// [`view::preview_split`] the view drew with is what keeps this honest — the
 /// scroll offset and the cached line widths are both measured from that rect's
 /// origin, so a click on screen row N resolves to the transcript line actually
-/// drawn there. A session claude never reported splits off nothing and hit-tests
-/// against the full inner rect, exactly as it did before the banner existed.
+/// drawn there. A pane with no banner splits off nothing and hit-tests against the
+/// full inner rect, exactly as it did before the banner existed.
 ///
-/// REPORTED, not live: an agent that reported completion still has a banner, so
-/// asking the banner — never liveness — is what keeps this rect identical to the
-/// one the view drew against. Liveness is a hand-off question answered by
+/// The banner, never liveness: asking the banner is what keeps this rect identical
+/// to the one the view drew against. Liveness is a hand-off question answered by
 /// [`App::is_live_now`], and it would be the wrong question here twice over: it
 /// shells out to claude, and it would disagree with the drawn banner.
 ///
@@ -985,7 +1013,9 @@ fn apply_action(app: &mut App, action: Action) -> Outcome {
             // board status rather than a teardown/re-init flash. Only a confirmed
             // `Ready` plan escalates to `Outcome::Resume`. The `map` drops the
             // `&Session` borrow before we mutably touch `app` for `set_status`.
-            let checked = app.selected_session().map(|s| resume::check(s, fork));
+            let checked = app
+                .selected_session()
+                .map(|s| resume::check(s, fork, app.model_override.as_deref()));
             match checked {
                 Some(Ok(ready)) => Outcome::Resume(ready),
                 Some(Err(err)) => {
@@ -1064,9 +1094,10 @@ fn apply_action(app: &mut App, action: Action) -> Outcome {
     }
 }
 
-/// The four keys a pending `Ctrl-X` chord binds, plus cancel — the PURE decision
+/// The five keys a pending `Ctrl-X` chord binds, plus cancel — the PURE decision
 /// half of the leader chord (PATTERNS §10, keys -> actions -> outcomes). The impure
-/// completion (hide / open confirm / toggle / rescan) lives in [`handle_chord_key`].
+/// completion (hide / open confirm / toggle / open picker / rescan) lives in
+/// [`handle_chord_key`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChordOutcome {
     /// `x` — toggle the selected session's hidden state (soft delete / un-hide).
@@ -1075,6 +1106,8 @@ enum ChordOutcome {
     Delete,
     /// `h` — toggle whether user-hidden sessions are revealed inline.
     ShowHidden,
+    /// `m` — open the model picker for the sticky `--model` override.
+    Model,
     /// `r` — drop every cached parse and re-read the whole store.
     Rescan,
     /// `Esc` / `Ctrl-C` / any unbound key — abandon the chord with no side effect.
@@ -1089,6 +1122,11 @@ enum ChordOutcome {
 /// cancels too, so a mistyped follow-up abandons the chord rather than doing
 /// something surprising. Each binding accepts its shifted form so a held Shift on
 /// the follow-up still completes the chord.
+///
+/// The model picker is on the chord for the same Ctrl-cancel reason: `Ctrl-M`
+/// cannot be bound at all, because the terminal delivers it as Enter (see the
+/// `Ctrl-H`/`Ctrl-I`/`Ctrl-M` note on the board's key arm). The leader chord is
+/// what makes an `m` binding reachable.
 fn chord_key(key: KeyEvent) -> ChordOutcome {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return ChordOutcome::Cancel;
@@ -1097,6 +1135,7 @@ fn chord_key(key: KeyEvent) -> ChordOutcome {
         KeyCode::Char('x') | KeyCode::Char('X') => ChordOutcome::Hide,
         KeyCode::Char('d') | KeyCode::Char('D') => ChordOutcome::Delete,
         KeyCode::Char('h') | KeyCode::Char('H') => ChordOutcome::ShowHidden,
+        KeyCode::Char('m') | KeyCode::Char('M') => ChordOutcome::Model,
         KeyCode::Char('r') | KeyCode::Char('R') => ChordOutcome::Rescan,
         _ => ChordOutcome::Cancel,
     }
@@ -1107,11 +1146,12 @@ fn chord_key(key: KeyEvent) -> ChordOutcome {
 ///
 /// `x` hides / un-hides the selected session (persisting the change), `d` opens the
 /// hard-delete confirm (it does NOT delete here — the confirm handler does), `h`
-/// toggles the show-hidden view, `r` forces a full re-read of the store, and
-/// anything else (`Esc` / `Ctrl-C` / an unbound key) abandons the chord with no side
-/// effect. The pending state is cleared FIRST so an early return can never wedge the
-/// board in the chord. Routed BEFORE `key_to_action` in [`handle_event`], so a
-/// printable completion never leaks into the query.
+/// toggles the show-hidden view, `m` opens the model picker (it does NOT set the
+/// override here — the confirm handler does), `r` forces a full re-read of the
+/// store, and anything else (`Esc` / `Ctrl-C` / an unbound key) abandons the chord
+/// with no side effect. The pending state is cleared FIRST so an early return can
+/// never wedge the board in the chord. Routed BEFORE `key_to_action` in
+/// [`handle_event`], so a printable completion never leaks into the query.
 ///
 /// `r` is the store cache's ESCAPE HATCH, and it is a user-reachable key rather
 /// than an internal call for exactly that reason: reloads reuse the parse of every
@@ -1129,6 +1169,7 @@ fn handle_chord_key(app: &mut App, key: KeyEvent, store: &mut SessionStore) -> O
         ChordOutcome::Hide => app.toggle_hidden_selected(),
         ChordOutcome::ShowHidden => app.toggle_show_hidden(),
         ChordOutcome::Delete => app.open_delete_confirm(),
+        ChordOutcome::Model => app.open_model_picker(),
         ChordOutcome::Rescan => {
             store.invalidate();
             reload_board(app, store);
@@ -1243,9 +1284,11 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, store: &mut SessionStore) -> O
 ///
 /// The `ModalAction` match is the second of two gates: [`modal_key`] already
 /// restricts the key to the `List` layout, and this restricts it to a choice that
-/// actually names a new session. Any other action — Attach, Fork, Delete, Cancel,
-/// or an out-of-range highlight — is a NO-OP, so a future `List`-layout modal
-/// cannot inherit an interactive start it has no meaning for.
+/// actually names a new session. Any other action — Attach, Fork, Delete,
+/// DeleteLineage, SetModel, Cancel, or an out-of-range highlight — is a NO-OP, so a
+/// `List`-layout modal cannot inherit an interactive start it has no meaning for.
+/// The model picker is exactly such a modal, and it relies on this: `Ctrl-O` there
+/// must not launch anything.
 ///
 /// The pick is recorded as the last-chosen agent FIRST — BEFORE the gate, so the
 /// next `Ctrl-N` repeats it even across a refusal. This is one of the THREE points
@@ -1325,6 +1368,14 @@ fn confirm_modal(app: &mut App, store: &mut SessionStore) -> Outcome {
             // Nothing is launched and nothing is recorded yet; the draft's own
             // `Enter` (`--bg`) or `Ctrl-O` (interactive) decides both.
             compose::open_background(app, agent);
+            Outcome::Continue
+        }
+        // The only confirm that hands off NOTHING: it records a board preference
+        // the NEXT hand-off reads. No status is set — the override is true over an
+        // interval rather than at a keypress, so the header owns saying it
+        // (AGENTS.md STATUS-LINE OWNERSHIP).
+        Some(ModalAction::SetModel(model)) => {
+            app.set_model_override(model);
             Outcome::Continue
         }
     }
@@ -1458,9 +1509,11 @@ fn route_handoff(app: &mut App, session_id: &str, kind: Handoff) -> Outcome {
             app.session_by_id(session_id)
                 .map(|s| resume::check_attach(s, agent.id.as_deref()))
         }
+        // Fork carries the board's model override; Attach deliberately cannot —
+        // `check_attach` takes no model at all (see `HandoffCtx::model`).
         Handoff::Fork => app
             .session_by_id(session_id)
-            .map(|s| resume::check(s, true)),
+            .map(|s| resume::check(s, true, app.model_override.as_deref())),
     };
     match checked {
         Some(Ok(ready)) => Outcome::Resume(ready),
@@ -1639,12 +1692,21 @@ fn handle_interrupt_confirm_key(app: &mut App, key: KeyEvent) -> Outcome {
 /// snapback has always emitted for a new session, while the draft pane passes
 /// `Some(prompt)` whenever its buffer is non-empty. A `Some(prompt)` AUTO-SUBMITS
 /// as the session's first turn (see [`resume::build_new_argv`]).
+///
+/// The board's sticky model override is read HERE rather than passed in, for the
+/// same reason `launch_dir` is: it belongs to the board, not to either caller, so
+/// neither route can start a session under a model the header is not showing.
 pub(super) fn launch_new_session(
     app: &mut App,
     agent: Option<&str>,
     prompt: Option<&str>,
 ) -> Outcome {
-    match resume::check_new(&app.launch_dir, agent, prompt) {
+    match resume::check_new(
+        &app.launch_dir,
+        agent,
+        app.model_override.as_deref(),
+        prompt,
+    ) {
         Ok(ready) => Outcome::Resume(ready),
         Err(err) => {
             app.set_status(err.message().to_string());
@@ -3479,15 +3541,22 @@ mod tests {
     }
 
     #[test]
-    fn a_click_on_a_drawn_link_opens_it_for_a_banner_less_session() {
+    fn a_click_on_a_drawn_link_opens_it_for_a_banner_less_pane() {
         // No banner: the transcript owns the pane's whole inner rect, and the
-        // hit-test must NOT shift by a row that was never reserved.
+        // hit-test must NOT shift by a row that was never reserved. An in-flight
+        // quick reply is the one banner-less pane that still draws the transcript
+        // (its inline echo turns take the banner's place).
         let dir = unique_temp_dir("link-plain");
         let mut app = link_app(&dir, None);
+        app.sending = Some(crate::tui::app::Sending {
+            session_id: "sess-link".to_string(),
+            message: "thanks".to_string(),
+            baseline_msg_count: 0,
+        });
         let buffer = render_board(&mut app);
         assert!(
             view::preview_banner(&app).is_none(),
-            "a session with no joined agent reserves no banner row"
+            "an in-flight reply reserves no banner row"
         );
         assert!(
             app.preview_scroll > 0,
@@ -3499,6 +3568,44 @@ mod tests {
             link_under_pointer(&mut app, col, row).as_deref(),
             Some(LINK_URL),
             "a click on the cell the link was DRAWN on must resolve to its url"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_click_on_a_drawn_link_opens_it_beneath_an_unreported_sessions_pinned_row() {
+        // A session claude does NOT report pins the row too — it keys on the
+        // selection — so its transcript starts one row lower, and the hit-test
+        // must follow it there exactly as it does for a reported one.
+        let dir = unique_temp_dir("link-unreported");
+        let mut app = link_app(&dir, None);
+        let buffer = render_board(&mut app);
+        assert!(
+            app.reported_agent("sess-link").is_none(),
+            "the session must really be unreported, or this is the reported case"
+        );
+        assert!(
+            view::preview_banner(&app).is_some(),
+            "an unreported selected session must pin the row"
+        );
+        assert!(
+            app.preview_scroll > 0,
+            "the fixture must overflow the pane, or this never tests a scrolled hit"
+        );
+
+        let (col, row) = drawn_link_cell(&buffer, app.preview_rect);
+        assert_eq!(
+            link_under_pointer(&mut app, col, row).as_deref(),
+            Some(LINK_URL),
+            "a click on the cell the link was DRAWN on must resolve to its url \
+             even though the pinned row pushed the transcript down a row"
+        );
+        // Precision, not just presence: the row ABOVE the label is a different
+        // transcript line, so it must NOT resolve to the same link.
+        assert_ne!(
+            link_under_pointer(&mut app, col, row - 1).as_deref(),
+            Some(LINK_URL),
+            "the row above the label is another transcript line, not the link"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4131,6 +4238,82 @@ mod tests {
             app.reported_agent("s").map(ReportedAgent::kind_label),
             Some("bg"),
             "a ReportedAgents event must update the agent set"
+        );
+    }
+
+    /// A `ModelAliases` event is what carries the off-thread `--model` probe's
+    /// answer onto the board, and this is the only place that wiring is pinned.
+    ///
+    /// Asserted through the PICKER'S ROWS rather than through app state, because the
+    /// rows are what a user would see; a test reading a field could pass over a
+    /// picker that still built itself from the seed. The fixture's aliases differ
+    /// from the seed in order and length on purpose, so "the rows changed" cannot be
+    /// satisfied by the seed.
+    ///
+    /// The event is also asserted to be SILENT: which aliases are on offer is true
+    /// over an interval and belongs to the picker, so it must never squat on the
+    /// keypress-scoped status line (STATUS-LINE OWNERSHIP).
+    #[test]
+    fn model_aliases_event_replaces_the_pickers_seed_without_touching_the_status_line() {
+        let mut app = app_with("s", None);
+        let rows = |app: &mut App| -> Vec<String> {
+            app.open_model_picker();
+            let labels = app
+                .modal
+                .as_ref()
+                .expect("the model picker is open")
+                .choices
+                .iter()
+                .map(|c| c.label.clone())
+                .collect();
+            app.modal = None;
+            labels
+        };
+
+        let seeded = rows(&mut app);
+        assert!(
+            !seeded.iter().any(|l| l == "sonnet[1m]"),
+            "the seed must not already carry the fixture's marker alias: {seeded:?}"
+        );
+
+        app.set_status("a refusal the user has not acknowledged".to_string());
+        let out = handle_event(
+            &mut app,
+            AppEvent::ModelAliases(vec![
+                "sonnet[1m]".to_string(),
+                "opusplan".to_string(),
+                "zeta-9".to_string(),
+            ]),
+            &mut store_at(Path::new("/tmp")),
+        );
+        assert!(
+            matches!(out, Outcome::Continue),
+            "the probe's answer never ends the board session"
+        );
+
+        let probed = rows(&mut app);
+        assert_eq!(
+            probed.iter().skip(1).cloned().collect::<Vec<_>>(),
+            vec!["sonnet[1m]", "opusplan", "zeta-9"],
+            "the delivered set must replace the seed verbatim, unknown alias and all"
+        );
+        assert_eq!(
+            app.status.as_deref(),
+            Some("a refusal the user has not acknowledged"),
+            "a background delivery must not overwrite a sticky refusal"
+        );
+
+        // An EMPTY delivery is the probe's "could not read it" answer: it degrades
+        // to the seed rather than emptying the overlay.
+        handle_event(
+            &mut app,
+            AppEvent::ModelAliases(Vec::new()),
+            &mut store_at(Path::new("/tmp")),
+        );
+        assert_eq!(
+            rows(&mut app),
+            seeded,
+            "an empty probe result falls back to the seed, never to an empty picker"
         );
     }
 
@@ -5921,6 +6104,140 @@ mod tests {
 
         std::env::remove_var("SNAPBACK_CONFIG_DIR");
         let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// `Ctrl-X m` opens the model picker and LEAVES the chord, and confirming a row
+    /// sets the sticky override — the picker does not set it, exactly as `Ctrl-X d`
+    /// opens a confirm rather than deleting.
+    ///
+    /// The `m` also proves the leak guard still holds for the new key: a printable
+    /// chord completion must never reach the search query.
+    #[test]
+    fn ctrl_x_m_opens_the_model_picker_and_confirm_sets_the_override() {
+        let mut app = App::new(
+            vec![session("sbx-a")],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        let mut store = store_at(Path::new("/tmp"));
+
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        assert!(app.pending_chord, "Ctrl-X arms the leader chord");
+        feed(&mut app, key(KeyCode::Char('m')), &mut store);
+
+        assert!(!app.pending_chord, "the chord resolves on its one key");
+        assert!(app.query().is_empty(), "`m` must not leak into the query");
+        assert!(app.modal.is_some(), "Ctrl-X m opens the picker");
+        assert_eq!(
+            app.model_override, None,
+            "opening the picker must not set anything on its own"
+        );
+
+        // Move off the clear row onto the first alias, then confirm.
+        feed(&mut app, key(KeyCode::Down), &mut store);
+        feed(&mut app, key(KeyCode::Enter), &mut store);
+
+        assert!(app.modal.is_none(), "confirm closes the picker");
+        assert_eq!(
+            app.model_override.as_deref(),
+            Some("fable"),
+            "confirming an alias row sets the sticky override"
+        );
+
+        // Re-open and confirm the clear row: the override goes away again.
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('M')), &mut store);
+        assert!(
+            app.modal.is_some(),
+            "the shifted form completes the chord too"
+        );
+        // The picker opened ON the current override, so walk back to row 0.
+        while app.modal.as_ref().unwrap().selected != 0 {
+            feed(&mut app, key(KeyCode::Up), &mut store);
+        }
+        feed(&mut app, key(KeyCode::Enter), &mut store);
+        assert_eq!(
+            app.model_override, None,
+            "the default row clears the override"
+        );
+    }
+
+    /// `Ctrl-O` on the MODEL picker must launch nothing. It is a `List`-layout
+    /// modal, so [`modal_key`] binds the key — the second gate, in
+    /// [`launch_pick_interactively`], is what keeps a non-`New` choice inert.
+    #[test]
+    fn ctrl_o_on_the_model_picker_launches_nothing() {
+        let mut app = App::new(
+            vec![session("sbx-a")],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        let mut store = store_at(Path::new("/tmp"));
+
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('m')), &mut store);
+        let outcome = handle_event(
+            &mut app,
+            AppEvent::Input(Event::Key(ctrl(KeyCode::Char('o')))),
+            &mut store,
+        );
+
+        assert!(
+            matches!(outcome, Outcome::Continue),
+            "Ctrl-O on a model row must not hand off"
+        );
+        assert!(
+            app.modal.is_some(),
+            "and must not even close the picker: it is simply unbound here"
+        );
+        assert_eq!(app.model_override, None);
+    }
+
+    /// The override the board holds is what the hand-off actually spawns with —
+    /// the seam a picker that set state nothing reads would silently break.
+    #[test]
+    fn the_board_override_reaches_the_resume_argv() {
+        let dir = unique_temp_dir("model-handoff");
+        std::fs::create_dir_all(&dir).expect("create the temp cwd");
+        let file = dir.join("sbm-live.jsonl");
+        std::fs::write(
+            &file,
+            format!(
+                r#"{{"type":"user","sessionId":"sbm-live","cwd":"{}","message":{{"role":"user","content":"hi"}}}}"#,
+                dir.display()
+            ),
+        )
+        .expect("write the resumable fixture");
+
+        let mut session = session("sbm-live");
+        session.file = file;
+        session.cwd = dir.clone();
+        let mut app = App::new(vec![session], Scope::All, PathBuf::from("/tmp/launch"));
+        app.set_model_override(Some("sonnet".to_string()));
+        let mut store = store_at(Path::new("/tmp"));
+
+        // Ctrl-F forks without probing liveness, so it reaches the gate directly.
+        let outcome = handle_event(
+            &mut app,
+            AppEvent::Input(Event::Key(ctrl(KeyCode::Char('f')))),
+            &mut store,
+        );
+        match outcome {
+            Outcome::Resume(ready) => {
+                assert_eq!(
+                    ready.argv.join(" "),
+                    "claude -r sbm-live --fork-session --model sonnet"
+                );
+                assert_eq!(
+                    ready.nonzero_hint,
+                    crate::resume::MODEL_NONZERO_HINT,
+                    "a hand-off carrying an override gets the model-specific hint"
+                );
+            }
+            _ => panic!("Ctrl-F on a resumable session must hand off"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Task 4.3 / 4.4: `Ctrl-X d` opens a confirm defaulting to Cancel; confirming

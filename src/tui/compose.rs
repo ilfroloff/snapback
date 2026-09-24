@@ -412,6 +412,12 @@ fn submit_compose(app: &mut App) -> Outcome {
 /// no attempt is made to reconcile the short job id back to a `sessionId`. The new
 /// agent reaches the board through the existing watcher → reload path, and its own
 /// transcript already records which agent it is.
+///
+/// The board's sticky model override rides along into the argv beside the agent, and
+/// DELIBERATELY outranks any `model:` the agent definition declares — the same
+/// precedence [`crate::resume::build_new_argv`] argues for the interactive twin, so
+/// `Ctrl-N` means the same thing whichever key launches it. With no override the
+/// argv is unchanged.
 fn submit_bg_launch(app: &mut App, message: String, agent: Option<String>) -> Outcome {
     if message.trim().is_empty() {
         // Nothing to run: keep the draft pane open so the user can type.
@@ -421,7 +427,11 @@ fn submit_bg_launch(app: &mut App, message: String, agent: Option<String>) -> Ou
     app.set_last_new_agent(agent.clone());
     match send::plan_bg_launch(&app.launch_dir) {
         Ok(cwd) => {
-            let argv = send::build_bg_launch_argv(agent.as_deref(), &message);
+            let argv = send::build_bg_launch_argv(
+                agent.as_deref(),
+                app.model_override.as_deref(),
+                &message,
+            );
             // The editor closes but the CARD stays, marked in flight: there is
             // nothing left to type, yet still no session to preview, so the
             // placeholder reports the launch until THIS launch's `BgLaunchFinished`
@@ -494,6 +504,11 @@ fn open_interactive(app: &mut App) -> Outcome {
 /// marks the send in flight, clears the compose state, and hands a [`SendRequest`]
 /// to the driver as [`Outcome::Send`]. A refusal (deleted worktree / unreadable file)
 /// sets a board status and stays on the board.
+///
+/// The board's sticky model override rides along into the argv, and this path is the
+/// one where it is not merely a convenience: `claude -p` is non-interactive, so the
+/// in-session `/model` command cannot reach it and `--model` is the ONLY way to
+/// choose a model for a quick reply. With no override the argv is unchanged.
 fn submit_reply(
     app: &mut App,
     message: String,
@@ -520,7 +535,8 @@ fn submit_reply(
             cwd,
             session_id: authoritative_id,
         } => {
-            let argv = send::build_send_argv(&authoritative_id, &message);
+            let argv =
+                send::build_send_argv(&authoritative_id, app.model_override.as_deref(), &message);
             app.close_compose();
             // Mark the send in flight so the preview echoes the message under a
             // synthetic `▶ you` turn plus a live `cooking…` indicator until the
@@ -872,5 +888,162 @@ mod tests {
             "the next compose keystroke must clear the nudge"
         );
         assert!(app.status_ttl.is_none());
+    }
+
+    /// An isolated temp dir for the send fixtures (PATTERNS: never touch the real
+    /// `~/.claude/projects`).
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the unix epoch")
+            .as_nanos();
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "snapback-compose-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    /// One row for `app.sessions`, pointed at `file`/`cwd`.
+    fn session_at(id: &str, file: PathBuf, cwd: PathBuf) -> Session {
+        Session {
+            file,
+            session_id: id.to_string(),
+            cwd,
+            git_branch: None,
+            timestamp: None,
+            repo: "repo".to_string(),
+            label: format!("label {id}"),
+            root_uuid: None,
+            msg_count: 0,
+            content_index: String::new(),
+        }
+    }
+
+    /// The board's sticky override reaches the QUICK REPLY argv, end to end from
+    /// `App` through the submit. Not redundant with `send`'s builder tests: those
+    /// prove the formatter can carry a model, this proves the call site actually
+    /// hands it one — the seam a picker that set state nothing reads would silently
+    /// break. This path matters most, because `claude -p` is non-interactive and
+    /// `/model` cannot reach it.
+    #[test]
+    fn the_board_override_reaches_the_quick_reply_argv() {
+        let dir = unique_temp_dir("model-reply");
+        let file = dir.join("sbc-reply.jsonl");
+        std::fs::write(
+            &file,
+            format!(
+                r#"{{"type":"user","sessionId":"sbc-reply","cwd":"{}","message":{{"role":"user","content":"hi"}}}}"#,
+                dir.display()
+            ),
+        )
+        .expect("write the sendable fixture");
+
+        let mut app = App::new(
+            vec![session_at("sbc-reply", file, dir.clone())],
+            Scope::All,
+            dir.clone(),
+        );
+        app.set_model_override(Some("opus".to_string()));
+        app.open_compose(ComposeState::new_reply("sbc-reply".to_string(), None), None);
+        app.compose
+            .as_mut()
+            .expect("the reply editor is open")
+            .textarea
+            .insert_str("ship it");
+
+        match handle_compose_key(&mut app, key(KeyCode::Enter)) {
+            Outcome::Send(req) => assert_eq!(
+                req.argv.join(" "),
+                "claude -p -r sbc-reply --output-format json --model opus ship it"
+            ),
+            _ => panic!("Enter on a drafted reply must send"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same override reaches the BACKGROUND LAUNCH argv, beside the agent —
+    /// the `Ctrl-N` half of the send path.
+    #[test]
+    fn the_board_override_reaches_the_background_launch_argv() {
+        let dir = unique_temp_dir("model-launch");
+        let mut app = App::new(Vec::new(), Scope::All, dir.clone());
+        app.set_model_override(Some("sonnet".to_string()));
+        app.open_compose(
+            ComposeState::new_background(Some("planner".to_string())),
+            None,
+        );
+        app.compose
+            .as_mut()
+            .expect("the draft editor is open")
+            .textarea
+            .insert_str("ship it");
+
+        match handle_compose_key(&mut app, key(KeyCode::Enter)) {
+            Outcome::BgLaunch(req) => assert_eq!(
+                req.argv.join(" "),
+                "claude --agent planner --model sonnet --bg ship it"
+            ),
+            _ => panic!("Enter on a drafted launch must launch"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With NO override both send-path argvs are byte-identical to what they have
+    /// always been — no `--model` token anywhere. The counterpart of the two tests
+    /// above, and the one that pins "costs nothing when unused".
+    #[test]
+    fn an_unset_override_leaves_both_send_argvs_untouched() {
+        let dir = unique_temp_dir("model-none");
+        let file = dir.join("sbc-none.jsonl");
+        std::fs::write(
+            &file,
+            format!(
+                r#"{{"type":"user","sessionId":"sbc-none","cwd":"{}","message":{{"role":"user","content":"hi"}}}}"#,
+                dir.display()
+            ),
+        )
+        .expect("write the sendable fixture");
+
+        let mut app = App::new(
+            vec![session_at("sbc-none", file, dir.clone())],
+            Scope::All,
+            dir.clone(),
+        );
+        assert_eq!(
+            app.model_override, None,
+            "the board defaults to no override"
+        );
+
+        app.open_compose(ComposeState::new_reply("sbc-none".to_string(), None), None);
+        app.compose
+            .as_mut()
+            .expect("the reply editor is open")
+            .textarea
+            .insert_str("ship it");
+        match handle_compose_key(&mut app, key(KeyCode::Enter)) {
+            Outcome::Send(req) => assert_eq!(
+                req.argv.join(" "),
+                "claude -p -r sbc-none --output-format json ship it"
+            ),
+            _ => panic!("Enter on a drafted reply must send"),
+        }
+
+        app.open_compose(ComposeState::new_background(None), None);
+        app.compose
+            .as_mut()
+            .expect("the draft editor is open")
+            .textarea
+            .insert_str("ship it");
+        match handle_compose_key(&mut app, key(KeyCode::Enter)) {
+            Outcome::BgLaunch(req) => assert_eq!(req.argv.join(" "), "claude --bg ship it"),
+            _ => panic!("Enter on a drafted launch must launch"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

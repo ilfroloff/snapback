@@ -10,13 +10,25 @@
 //! GFM pipe tables.
 //!
 //! The `claude` separator also carries the BOUND agent handle in effect at that
-//! turn (`● claude · @lead · 12:55`), read from two record types: `agent-setting`
-//! (the interactive bind — a clean handle, authoritative) and `agent-name` (the
-//! background job's name, a fallback trusted only when it names a KNOWN defined
-//! agent, since that field also carries free-form job titles). Attribution is
-//! POSITIONAL — the agent is threaded as streaming state (exactly like the
-//! per-message day rollover), so a turn shows the agent set *before* it, and a late
-//! record never retroactively labels earlier turns.
+//! turn (`● claude · @lead · Opus 5.5 · xhigh · 12:55`), read from two record types:
+//! `agent-setting` (the interactive bind — a clean handle, authoritative) and
+//! `agent-name` (the background job's name, a fallback trusted only when it names a
+//! KNOWN defined agent, since that field also carries free-form job titles).
+//! Attribution is POSITIONAL — the agent is threaded as streaming state (exactly
+//! like the per-message day rollover), so a turn shows the agent set *before* it,
+//! and a late record never retroactively labels earlier turns.
+//!
+//! It carries the ANSWERING MODEL the same way, and positional for the same reason
+//! — but with no threading at all, because `message.model` sits on the very record
+//! being rendered ([`record_model`]). A session that switches model mid-file
+//! therefore labels each turn with its own, which real sessions do. `<synthetic>`,
+//! the pseudo-model Claude Code stamps on records it injects itself, is suppressed
+//! by [`model_label`], as is the total absence of a model (the common case).
+//!
+//! The EFFORT level the turn ran at follows the model, positional for the same
+//! reason: [`record_effort`] reads it from the rendered record's own top-level
+//! `perTurnEffort`, then `effort`, and it shows as the bare level (`xhigh`, never
+//! `xhigh effort`). A pseudo-model record shows none, since no model ran that turn.
 //!
 //! Ahead of the markdown pass, each message BODY runs through an allowlist-driven
 //! control-wrapper collapse ([`collapse_control_wrappers`]). Claude Code injects a
@@ -128,15 +140,42 @@ pub struct LinkRegion {
     pub url: String,
 }
 
+/// One turn's marker `Line`, addressed by content row in the SAME coordinate
+/// space as [`LinkRegion::content_row`] (an index into the rendered [`Text`]'s
+/// lines, rebased onto the whole transcript as each block is appended — there is
+/// no tail cap left to rebase it a second time, see [`render_file_collect`]).
+///
+/// Captured so the preview pane's PINNED row can show the marker of whichever turn
+/// is scrolled to the top of the viewport — in EVERY scroll state, including the
+/// default bottom-anchored one (see [`crate::tui::view::render_preview`]) — reusing
+/// a `Line` that is ALREADY rendered elsewhere in the transcript rather than
+/// deriving a second, divergent copy of the marker text (no first-line synopsis,
+/// no tool-only-turn fallback — the marker line verbatim, or nothing).
+#[derive(Debug, Clone)]
+pub struct MarkerLine {
+    /// Line index into the rendered [`Text`] this marker sits on.
+    pub content_row: usize,
+    /// The turn's marker line verbatim — richest form first, every annotation
+    /// being independently optional (see [`marker_line_with_time`]): e.g.
+    /// `● claude · @lead · Opus 5.5 · xhigh · 12:55` or `▶ you · 14:23`. The
+    /// effort therefore reaches the pinned row with the rest of the line, never as a
+    /// copy of its own.
+    pub line: Line<'static>,
+}
+
 /// A rendered transcript preview: the styled [`Text`] plus the clickable
-/// [`LinkRegion`]s discovered while building it. Both are produced from one pass
-/// at a fixed `width`, so a region's columns always match the text as drawn.
+/// [`LinkRegion`]s and turn [`MarkerLine`]s discovered while building it. All
+/// three are produced from one pass at a fixed `width`, so a region's columns —
+/// and a marker's content row — always match the text as drawn.
 #[derive(Debug, Default)]
 pub struct RenderedPreview {
     /// The styled, markdown-rendered transcript.
     pub text: Text<'static>,
     /// Clickable link regions, in content coordinates (see [`LinkRegion`]).
     pub links: Vec<LinkRegion>,
+    /// Every turn's marker line, in content-row (i.e. file) order (see
+    /// [`MarkerLine`]).
+    pub markers: Vec<MarkerLine>,
 }
 
 /// Render a session's transcript for the preview pane, fitting GFM tables to
@@ -195,18 +234,23 @@ pub fn pending_reply_turns(
 }
 
 /// Render `path` into a [`RenderedPreview`]: the styled transcript plus the
-/// clickable [`LinkRegion`]s, over the WHOLE file.
+/// clickable [`LinkRegion`]s and the turn [`MarkerLine`]s, over the WHOLE file.
 ///
-/// Each record's block contributes its lines and its (block-relative) link
-/// regions; both are rebased onto the growing transcript by the running line
-/// offset so a region's `content_row` addresses the FINAL text. That running
-/// rebase is now the ONLY one: a tail cap used to drop everything above the last
-/// 600 rendered lines and shift every surviving region up by the same amount, so a
-/// long conversation's early turns simply were not in the preview and a link above
-/// the cut was dropped. Nothing needs the cap any more — the pane draws a window of
-/// the rows its viewport can reach rather than re-wrapping the whole transcript per
-/// frame — so the transcript arrives whole and a region keeps the row it was
-/// rendered on.
+/// Each record's block contributes its lines, its (block-relative) link regions,
+/// and — for a "user"/"assistant"/"summary" record — its (block-relative)
+/// [`MarkerLine`]; all are rebased onto the growing transcript by the running line
+/// offset so a region's `content_row` (and a marker's) addresses the FINAL text.
+/// That running rebase is now the ONLY one: a tail cap used to drop everything
+/// above the last 600 rendered lines and shift every surviving region up by the
+/// same amount, so a long conversation's early turns simply were not in the preview
+/// and a link above the cut was dropped. Nothing needs the cap any more — the pane
+/// draws a window of the rows its viewport can reach rather than re-wrapping the
+/// whole transcript per frame — so the transcript arrives whole and a region, like a
+/// marker, keeps the row it was rendered on.
+///
+/// That the cap is gone is what makes the marker list TOTAL: every turn in the file
+/// has a marker at a live row, so the banner's lookup can never miss because the
+/// turn it wanted was cut off the top.
 fn render_file_collect(path: &Path, width: usize, known_agents: &HashSet<&str>) -> RenderedPreview {
     let file = match File::open(path) {
         Ok(f) => f,
@@ -214,6 +258,7 @@ fn render_file_collect(path: &Path, width: usize, known_agents: &HashSet<&str>) 
             return RenderedPreview {
                 text: Text::from(format!("No such session file:\n{}", path.display())),
                 links: Vec::new(),
+                markers: Vec::new(),
             }
         }
     };
@@ -221,6 +266,7 @@ fn render_file_collect(path: &Path, width: usize, known_agents: &HashSet<&str>) 
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut links: Vec<LinkRegion> = Vec::new();
+    let mut markers: Vec<MarkerLine> = Vec::new();
     // Day of the previously ANNOTATED turn, threaded through the loop so a
     // per-message timestamp can switch to `MM-DD HH:MM` on a day rollover.
     let mut prev_day: Option<Date> = None;
@@ -245,11 +291,15 @@ fn render_file_collect(path: &Path, width: usize, known_agents: &HashSet<&str>) 
         if !record.is_object() {
             continue;
         }
-        if let Some((block, block_links)) =
+        if let Some((block, block_links, block_marker)) =
             render_record(&record, &mut agent, known_agents, &mut prev_day, width)
         {
             let offset = lines.len();
             links.extend(rebased(block_links, offset));
+            if let Some(mut marker) = block_marker {
+                marker.content_row += offset;
+                markers.push(marker);
+            }
             lines.extend(block);
         }
     }
@@ -257,6 +307,7 @@ fn render_file_collect(path: &Path, width: usize, known_agents: &HashSet<&str>) 
     RenderedPreview {
         text: Text::from(lines),
         links,
+        markers,
     }
 }
 
@@ -285,6 +336,14 @@ fn rebased(links: Vec<LinkRegion>, offset: usize) -> Vec<LinkRegion> {
 /// `known_agents` gates the `agent-name` fallback. State is threaded — never
 /// hoisted — so attribution is positional; see the module doc.
 ///
+/// The third tuple element is the block's own [`MarkerLine`] (block-relative
+/// `content_row`, rebased by the caller like the links) for a "summary",
+/// "user", or "assistant" record — the ONE line the pinned preview banner can
+/// show when the user scrolls this turn to the top of the viewport
+/// ([`crate::tui::view::render_preview`]) — `None` for a record that
+/// contributes lines but is not itself a turn (there is none today, but the
+/// shape stays honest for one that might).
+///
 /// [`effective`]: AgentState::effective
 fn render_record(
     record: &Value,
@@ -292,19 +351,22 @@ fn render_record(
     known_agents: &HashSet<&str>,
     prev_day: &mut Option<Date>,
     width: usize,
-) -> Option<(Vec<Line<'static>>, Vec<LinkRegion>)> {
+) -> Option<(Vec<Line<'static>>, Vec<LinkRegion>, Option<MarkerLine>)> {
     match record.get("type").and_then(Value::as_str) {
         Some("summary") => {
             let s = record.get("summary").and_then(Value::as_str)?;
             // Keep the literal `# summary` head, now styled as a heading. No links.
-            let lines = vec![marker_line_with_time(
-                format!("# {s}"),
-                summary_style(),
-                None,
-                record,
-                prev_day,
-            )];
-            Some((lines, Vec::new()))
+            let marker =
+                marker_line_with_time(format!("# {s}"), summary_style(), None, record, prev_day);
+            let lines = vec![marker.clone()];
+            Some((
+                lines,
+                Vec::new(),
+                Some(MarkerLine {
+                    content_row: 0,
+                    line: marker,
+                }),
+            ))
         }
         Some("user") => {
             if record
@@ -319,16 +381,23 @@ fn render_record(
             if text.is_empty() {
                 return None;
             }
-            let mut lines = vec![
-                Line::from(""),
-                marker_line_with_time(YOU_MARKER.to_string(), you_style(), None, record, prev_day),
-            ];
+            let marker =
+                marker_line_with_time(YOU_MARKER.to_string(), you_style(), None, record, prev_day);
+            let mut lines = vec![Line::from(""), marker.clone()];
             // Body links are relative to the body; rebase them past the blank +
-            // marker lines that lead every turn.
+            // marker lines that lead every turn. The marker itself sits at row 1
+            // (the blank line at row 0 leads every turn).
             let offset = lines.len();
             let (body, body_links) = collapse_body_lines_collect(&text, width);
             lines.extend(body);
-            Some((lines, rebased(body_links, offset)))
+            Some((
+                lines,
+                rebased(body_links, offset),
+                Some(MarkerLine {
+                    content_row: 1,
+                    line: marker,
+                }),
+            ))
         }
         Some("assistant") => {
             let content = record.get("message").and_then(|m| m.get("content"))?;
@@ -336,19 +405,24 @@ fn render_record(
             if body.is_empty() {
                 return None;
             }
-            let mut lines = vec![
-                Line::from(""),
-                marker_line_with_time(
-                    CLAUDE_MARKER.to_string(),
-                    claude_style(),
-                    agent.effective(),
-                    record,
-                    prev_day,
-                ),
-            ];
+            let marker = marker_line_with_time(
+                CLAUDE_MARKER.to_string(),
+                claude_style(),
+                agent.effective(),
+                record,
+                prev_day,
+            );
+            let mut lines = vec![Line::from(""), marker.clone()];
             let offset = lines.len();
             lines.extend(body);
-            Some((lines, rebased(body_links, offset)))
+            Some((
+                lines,
+                rebased(body_links, offset),
+                Some(MarkerLine {
+                    content_row: 1,
+                    line: marker,
+                }),
+            ))
         }
         Some("agent-setting") => {
             // Positional state, not a rendered line: record the interactive BIND in
@@ -377,7 +451,8 @@ fn render_record(
 }
 
 /// A record's string `key`, trimmed, or `None` when it is absent / null /
-/// non-string / blank. The one FAIL-SOFT reader both agent records share.
+/// non-string / blank. The one FAIL-SOFT reader both agent records and
+/// [`record_effort`] share.
 fn trimmed_field(record: &Value, key: &str) -> Option<String> {
     record
         .get(key)
@@ -428,23 +503,169 @@ fn agent_handle(agent: Option<&str>) -> Option<String> {
     Some(format!("@{name}"))
 }
 
-/// One DIM ` · <text>` marker annotation. BOTH the bound-agent handle and the
-/// per-message timestamp render through this ONE builder, so they share a single
-/// ` · ` separator convention and DIM style and cannot drift apart (DRY).
+/// The vendor prefix every Claude Code model id carries (`claude-sonnet-5`). The
+/// whole board is Claude, so repeating the vendor on every turn is noise —
+/// [`model_label`] strips it FIRST, then reads the shape of what is left. (NO MAGIC
+/// VALUES: named here, like [`DEFAULT_AGENT`], never spelled inline.) Ids WITHOUT
+/// it (the bare `opus` / `sonnet` aliases that also appear on disk) skip the strip
+/// and go straight to that shape rule.
+const MODEL_VENDOR_PREFIX: &str = "claude-";
+
+/// The character that joins a model id's parts (`haiku-4-5-20251001` is family,
+/// major, minor and date). [`model_label`]'s shape rule reads an id part by part,
+/// so this is what decides where one part ends and the next begins.
+const MODEL_ID_SEPARATOR: char = '-';
+
+/// The most digits a MAJOR or MINOR version part may have, so a `4-10` release
+/// still reads `4.10`. It must stay BELOW [`MODEL_DATE_DIGITS`]: that gap is what
+/// keeps a date from ever being read as a version (`claude-haiku-20251001` has no
+/// version at all, so it keeps today's label rather than rendering
+/// `Haiku 20251001`), and what lets a lone third part be told apart as a minor or
+/// a date by its length alone.
+const MODEL_VERSION_MAX_DIGITS: usize = 2;
+
+/// The exact digit count of a release-DATE part (`YYYYMMDD`, as in
+/// `claude-haiku-4-5-20251001`). Exact rather than a range: a part of any other
+/// length is not a date, and an id carrying one keeps today's label.
+const MODEL_DATE_DIGITS: usize = 8;
+
+/// Whether `id` is a PSEUDO-model — any `<…>`-wrapped id — rather than a model
+/// that answered anything. `<synthetic>` is the one seen on disk; matching by
+/// SHAPE rather than listing it means a future sibling pseudo-model is suppressed
+/// the day it appears instead of leaking to the board. Padding is ignored. The ONE
+/// place this check lives: [`model_label`] suppresses the label with it and
+/// [`record_effort`] the effort. PURE — see both unit tests.
+fn is_pseudo_model(id: &str) -> bool {
+    let id = id.trim();
+    id.starts_with('<') && id.ends_with('>')
+}
+
+/// A model FAMILY part: one or more lowercase ASCII letters (`opus`, `haiku`).
+fn is_model_family(part: &str) -> bool {
+    !part.is_empty() && part.bytes().all(|b| b.is_ascii_lowercase())
+}
+
+/// A MAJOR or MINOR version part: 1 to [`MODEL_VERSION_MAX_DIGITS`] ASCII digits.
+fn is_model_version(part: &str) -> bool {
+    (1..=MODEL_VERSION_MAX_DIGITS).contains(&part.len()) && part.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// A release-DATE part: exactly [`MODEL_DATE_DIGITS`] ASCII digits.
+fn is_model_date(part: &str) -> bool {
+    part.len() == MODEL_DATE_DIGITS && part.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// A model id with the vendor prefix already stripped, written the way people
+/// say it (`opus-5-5` -> `Opus 5.5`, `haiku-4-5-20251001` -> `Haiku 4.5 20251001`),
+/// or `None` when it is not a VERSIONED id: a family, a major, an optional minor
+/// and an optional date, in that order and nothing else. [`model_label`] owns the
+/// rule and its rationale.
+fn versioned_model_label(id: &str) -> Option<String> {
+    let parts: Vec<&str> = id.split(MODEL_ID_SEPARATOR).collect();
+    let (family, major, minor, date) = match parts.as_slice() {
+        [family, major] => (*family, *major, None, None),
+        // A lone third part is a minor OR a date, told apart by its length (see
+        // `MODEL_VERSION_MAX_DIGITS`).
+        [family, major, date] if is_model_date(date) => (*family, *major, None, Some(*date)),
+        [family, major, minor] => (*family, *major, Some(*minor), None),
+        [family, major, minor, date] => (*family, *major, Some(*minor), Some(*date)),
+        _ => return None,
+    };
+    let versioned = is_model_family(family)
+        && is_model_version(major)
+        && minor.is_none_or(is_model_version)
+        && date.is_none_or(is_model_date);
+    if !versioned {
+        return None;
+    }
+    let mut family = family.to_string();
+    if let Some(initial) = family.get_mut(..1) {
+        initial.make_ascii_uppercase();
+    }
+    let minor = minor.map(|minor| format!(".{minor}")).unwrap_or_default();
+    let date = date.map(|date| format!(" {date}")).unwrap_or_default();
+    Some(format!("{family} {major}{minor}{date}"))
+}
+
+/// The model label to render for a turn — the model that actually ANSWERED it —
+/// or `None` when there is nothing worth showing. This is the SINGLE place that
+/// decision lives, mirroring [`agent_handle`]. PURE — see the unit test.
+///
+/// Suppressed: an absent / null / non-string `message.model` (all of which reach
+/// here as `None` — see [`record_model`]) and a blank one; plus any
+/// [`is_pseudo_model`]. `<synthetic>` is the one that matters: Claude Code stamps it
+/// on records it injects ITSELF (a session-limit or auth notice), so it names no
+/// model that answered anything, and it is the LAST assistant model in real
+/// sessions — exactly where a naive "latest model" label would render it.
+///
+/// # The shape rule
+///
+/// After the optional [`MODEL_VENDOR_PREFIX`] is stripped, a VERSIONED id — a
+/// lowercase family, a major version, an optional minor and an optional date,
+/// joined by [`MODEL_ID_SEPARATOR`] (see [`MODEL_VERSION_MAX_DIGITS`] and
+/// [`MODEL_DATE_DIGITS`] for the digit counts) — is written the way people say it:
+/// the family capitalised, the version dotted, and the date after a SPACE
+/// (`claude-opus-5-5` -> `Opus 5.5`, `claude-sonnet-5` -> `Sonnet 5`,
+/// `claude-haiku-4-5-20251001` -> `Haiku 4.5 20251001`).
+///
+/// The date is KEPT, never cut: a truncated id reads back as a plausible WRONG
+/// model. It follows a space rather than sitting in parentheses because the
+/// quick-reply status already wraps its labels in ` (…)`, where a parenthesised
+/// date would nest.
+///
+/// ANY OTHER shape keeps today's label — the id with only the prefix stripped —
+/// rather than a guessed reformatting: a bare alias (`opus`), a legacy id that leads
+/// with its version (`claude-3-5-sonnet-20241022` -> `3-5-sonnet-20241022`), and an
+/// id with any part the rule does not recognise (`claude-opus-5-5[1m]` ->
+/// `opus-5-5[1m]`). The rule reads what is left AFTER the optional strip, so an
+/// un-prefixed `sonnet-5` spells `Sonnet 5`, exactly as its prefixed twin does.
+///
+/// # Two surfaces, one rule
+///
+/// `pub(crate)` rather than private because it now answers for BOTH places a model
+/// id reaches the screen: the DIM preview marker here, and the quick-reply
+/// completion status built from `modelUsage`
+/// ([`crate::send::status_for_send`]). Those two channels exist to be COMPARED —
+/// what the transcript recorded against what the send reported — so they must
+/// spell and suppress identically or a difference in spelling would read as a
+/// difference in model. Hence one owner, exported, rather than a sibling copy.
+#[must_use]
+pub(crate) fn model_label(model: Option<&str>) -> Option<String> {
+    let id = model?.trim();
+    if id.is_empty() || is_pseudo_model(id) {
+        return None;
+    }
+    let id = id.strip_prefix(MODEL_VENDOR_PREFIX).unwrap_or(id);
+    // A bare prefix and nothing else is malformed; render no annotation rather
+    // than an empty ` · `.
+    if id.is_empty() {
+        return None;
+    }
+    Some(versioned_model_label(id).unwrap_or_else(|| id.to_string()))
+}
+
+/// One DIM ` · <text>` marker annotation. ALL FOUR annotations — the bound-agent
+/// handle, the answering-model label, the effort level and the per-message
+/// timestamp — render through this ONE builder, so they share a single ` · `
+/// separator convention and DIM style and cannot drift apart (DRY).
 fn annotation_span(text: &str) -> Span<'static> {
     Span::styled(format!(" \u{b7} {text}"), marker_style())
 }
 
 /// Build a turn-marker line, appending — in order — a DIM `@agent` handle (when a
-/// non-default `agent` is in effect) then a DIM per-message timestamp annotation
-/// (e.g. ` · 14:23`, when THIS record carries a parseable RFC 3339 `timestamp`), so
-/// a bound assistant turn reads `● claude · @lead · 12:55`.
+/// non-default `agent` is in effect), a DIM answering-model label (when THIS record
+/// carries a showable [`record_model`]), a DIM effort level (when THIS record carries
+/// a showable [`record_effort`]), then a DIM per-message timestamp annotation (e.g.
+/// ` · 14:23`, when THIS record carries a parseable RFC 3339 `timestamp`), so a bound
+/// assistant turn reads `● claude · @lead · Opus 5.5 · xhigh · 12:55`.
 ///
 /// The marker span keeps its own (bold) style unchanged; only the trailing
 /// annotations are DIM. FAIL-SOFT: a missing or unparseable timestamp renders the
 /// marker with no timestamp annotation and leaves `prev_day` untouched; a suppressed
-/// or absent agent renders no handle. On a timestamp success `prev_day` advances to
-/// this record's day so the next annotated turn can detect a rollover.
+/// or absent agent renders no handle; a suppressed or absent model renders no label;
+/// a missing or suppressed effort renders no effort span (never an empty ` · `).
+/// On a timestamp success `prev_day` advances to this record's day so the next
+/// annotated turn can detect a rollover.
 fn marker_line_with_time(
     marker: String,
     style: Style,
@@ -456,12 +677,61 @@ fn marker_line_with_time(
     if let Some(handle) = agent_handle(agent) {
         spans.push(annotation_span(&handle));
     }
+    if let Some(label) = model_label(record_model(record)) {
+        spans.push(annotation_span(&label));
+    }
+    if let Some(effort) = record_effort(record) {
+        spans.push(annotation_span(&effort));
+    }
     if let Some(ts) = record_timestamp(record) {
         let annotation = timestamp_annotation(ts, *prev_day);
         *prev_day = Some(ts.date());
         spans.push(annotation_span(&annotation));
     }
     Line::from(spans)
+}
+
+/// A record's own `message.model` — the model that ANSWERED this turn, and the ONLY
+/// on-disk evidence of it (no `model` RECORD type exists, so a session's model is
+/// never persisted as a file-level fact). Read from the record being rendered, which
+/// is what makes the label POSITIONAL for free: a session that changes model mid-file
+/// labels each turn with ITS OWN model, and no late turn can relabel an earlier one.
+/// In practice only `assistant` records carry the field.
+///
+/// FAIL-SOFT: absent / null / non-string all read as `None`, which is the NORMAL
+/// case — a fifth of real sessions carry no model at all — never an error state.
+fn record_model(record: &Value) -> Option<&str> {
+    record
+        .get("message")
+        .and_then(|m| m.get("model"))
+        .and_then(Value::as_str)
+}
+
+/// The EFFORT level a record's turn ran at (`xhigh`, `max`, …), or `None` when it
+/// names none worth showing. The marker renders it as the bare level, between the
+/// model label and the timestamp (see [`marker_line_with_time`]).
+///
+/// It comes from two TOP-LEVEL keys, siblings of `message` rather than inside it:
+/// `perTurnEffort` FIRST, then `effort`. That order follows how the Claude Code binary
+/// resolves a turn's effort, NOT observed data: no record in the measured store
+/// carries two different values, so the data could not have decided it. An UNUSABLE
+/// `perTurnEffort` falls through to `effort` rather than ending the search, because a
+/// `null` one beside a string `effort` is an ordinary on-disk shape.
+///
+/// A PSEUDO-model record ([`is_pseudo_model`], i.e. `<synthetic>`) shows no effort
+/// even when it records one: Claude Code injected that turn itself, so no model ran
+/// it at any effort. A record with NO model still shows its effort.
+///
+/// FAIL-SOFT: absent / null / non-string / blank read as `None`, through the same
+/// [`trimmed_field`] the agent records use. Otherwise the value is returned as
+/// WRITTEN, trimmed but never re-cased, mapped or suffixed. POSITIONAL like the
+/// model: it sits on the record being rendered, so no threading is needed. PURE —
+/// see the unit test.
+fn record_effort(record: &Value) -> Option<String> {
+    if record_model(record).is_some_and(is_pseudo_model) {
+        return None;
+    }
+    trimmed_field(record, "perTurnEffort").or_else(|| trimmed_field(record, "effort"))
 }
 
 /// Parse a record's own `timestamp` field as RFC 3339 (the same parser the store
@@ -2009,6 +2279,18 @@ mod tests {
             .join(file)
     }
 
+    /// A fixture under `tests/fixtures/preview/` — deliberately OUTSIDE the `store/`
+    /// discovery root, so a preview-only format edge case is handed straight to the
+    /// renderer and can never disturb the exact discovered/session counts `store`'s
+    /// own tests pin.
+    fn preview_fixture(file: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("preview")
+            .join(file)
+    }
+
     /// Text-only convenience over [`render_file_collect`] for the transcript-shape
     /// tests that assert markers/structure rather than link regions. No known
     /// agents, so the `agent-name` fallback stays inert; see [`render_file_known`]
@@ -2045,6 +2327,16 @@ mod tests {
         text.lines
             .iter()
             .find(|l| l.spans.first().map(|s| s.content.as_ref()) == Some(needle))
+    }
+
+    /// EVERY line led by `needle`, in transcript order — for the tests that assert a
+    /// PER-TURN annotation across a multi-turn session, where checking only the first
+    /// turn would pass against a hoisted (file-level) value.
+    fn lines_led_by<'a>(text: &'a Text, needle: &str) -> Vec<&'a Line<'a>> {
+        text.lines
+            .iter()
+            .filter(|l| l.spans.first().map(|s| s.content.as_ref()) == Some(needle))
+            .collect()
     }
 
     fn unique_temp_dir(tag: &str) -> PathBuf {
@@ -2130,6 +2422,95 @@ mod tests {
                 "{sep} separator must be bold"
             );
         }
+    }
+
+    /// Every marker [`render_file_collect`] collects addresses the row its OWN line
+    /// was rendered on — the `summary` head included, whose block is a SINGLE line
+    /// and so carries its marker at block row 0, where a `user` or `assistant`
+    /// turn's leading blank line puts theirs at row 1.
+    ///
+    /// [`RenderedPreview::markers`] has exactly one reader — the pinned preview
+    /// banner, through `App::preview_marker_at` — and a marker rebased onto the
+    /// wrong row still renders a perfectly ordinary transcript, so nothing in the
+    /// drawn text can catch it. That is why the row is pinned HERE, at the producer,
+    /// rather than left to a pane test: the banner's own suite resolves WHICH turn
+    /// owns a scroll offset, and takes these rows as given.
+    ///
+    /// INDEPENDENT on both sides. The summary's expected text is read back out of
+    /// the FIXTURE's own first record, so re-wording the fixture moves the
+    /// expectation with it instead of stranding a hardcoded string; and the rows are
+    /// re-derived by walking the rendered `Text` FORWARD for every marker-led line,
+    /// never by asking the list under test where its markers are.
+    #[test]
+    fn collected_markers_address_their_rendered_rows_summary_head_included() {
+        let path = fixture("-Users-me-project-alpha", "sess-normal-1.jsonl");
+        let raw = std::fs::read_to_string(&path).expect("read the fixture");
+        let record: Value = serde_json::from_str(raw.lines().next().expect("a first record"))
+            .expect("the first record is JSON");
+        assert_eq!(
+            record.get("type").and_then(Value::as_str),
+            Some("summary"),
+            "this fixture must LEAD with a summary record, or the arm under test is \
+             never reached"
+        );
+        // The head renders the fixture's own summary verbatim behind a `# `, so the
+        // expectation comes from the INPUT rather than from anything the renderer
+        // produced.
+        let expected_head = format!(
+            "# {}",
+            record
+                .get("summary")
+                .and_then(Value::as_str)
+                .expect("a summary record names its summary")
+        );
+
+        let rendered = render_file_collect(&path, WIDE, &HashSet::new());
+        let text_of =
+            |line: &Line<'_>| -> String { line.spans.iter().map(|s| s.content.as_ref()).collect() };
+
+        // Walk the rendered transcript forward for every marker-led line — the `# `
+        // head as well as the two turn glyphs. A markdown body header has its hashes
+        // STRIPPED by `markdown_body_lines`, so nothing inside a turn can pose as the
+        // summary head here.
+        let expected: Vec<(usize, String)> = rendered
+            .text
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| {
+                line.spans.first().is_some_and(|span| {
+                    let head = span.content.as_ref();
+                    head == YOU_MARKER || head == CLAUDE_MARKER || head == expected_head
+                })
+            })
+            .map(|(row, line)| (row, text_of(line)))
+            .collect();
+        let actual: Vec<(usize, String)> = rendered
+            .markers
+            .iter()
+            .map(|marker| (marker.content_row, text_of(&marker.line)))
+            .collect();
+
+        // The fixture must carry ordinary turns beside the summary, or the rebase
+        // past the head's one-line block is never exercised.
+        assert!(
+            expected.len() > 1,
+            "the oracle must find the summary AND real turns: {expected:?}"
+        );
+        assert_eq!(
+            actual, expected,
+            "every collected marker must address the row its line was rendered on, \
+             in transcript order"
+        );
+        // The arm this exists for: the head is the FIRST marker and sits at row 0 —
+        // its block contributes exactly one line, so there is no leading blank row to
+        // rebase past, and the banner has a turn to name at the very top of a
+        // summary-led transcript.
+        assert_eq!(
+            actual.first(),
+            Some(&(0, expected_head)),
+            "the summary head must be a pinnable marker at the transcript's first row"
+        );
     }
 
     #[test]
@@ -3407,6 +3788,491 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- answering model label --------------------------------------------
+
+    #[test]
+    fn model_label_writes_a_versioned_id_as_family_and_dotted_version() {
+        let cases: &[(Option<&str>, Option<&str>)] = &[
+            // A VERSIONED id — family, 1–2 digit major, optional 1–2 digit minor,
+            // optional 8-digit date — reads the way people say it.
+            (Some("claude-opus-5-5"), Some("Opus 5.5")),
+            (Some("claude-sonnet-5"), Some("Sonnet 5")),
+            (Some("claude-fable-5-1"), Some("Fable 5.1")),
+            // A DATED id keeps its date, after a space — collapsing it would render
+            // two different releases identically, which is worse than a long label.
+            (
+                Some("claude-haiku-4-5-20251001"),
+                Some("Haiku 4.5 20251001"),
+            ),
+            // A major and a date with no minor between them.
+            (Some("claude-sonnet-4-20250514"), Some("Sonnet 4 20250514")),
+            // A 2-digit minor is still a minor.
+            (Some("claude-opus-4-10"), Some("Opus 4.10")),
+            // The shape rule reads what is LEFT after the optional prefix, so an
+            // un-prefixed id spells the model exactly as its prefixed twin does.
+            (Some("sonnet-5"), Some("Sonnet 5")),
+            // A padded id is trimmed before anything else.
+            (Some("  claude-opus-5  "), Some("Opus 5")),
+            // ANY OTHER SHAPE keeps today's label: the id with only the vendor
+            // prefix stripped, never a guessed reformatting.
+            // A bare alias (also on disk) has no version to write.
+            (Some("opus"), Some("opus")),
+            // A legacy id leads with its version, not its family.
+            (
+                Some("claude-3-5-sonnet-20241022"),
+                Some("3-5-sonnet-20241022"),
+            ),
+            (Some("claude-opus"), Some("opus")),
+            // The 1M-context suffix is not a version part.
+            (Some("claude-opus-5-5[1m]"), Some("opus-5-5[1m]")),
+            // A 3-digit minor is neither a version nor a date.
+            (Some("claude-opus-5-123"), Some("opus-5-123")),
+            // A 7-digit date is not a date.
+            (Some("claude-haiku-4-5-2025100"), Some("haiku-4-5-2025100")),
+            // An 8-digit number where the major goes is never read as a version.
+            (Some("claude-haiku-20251001"), Some("haiku-20251001")),
+            // Nothing may trail the date.
+            (
+                Some("claude-opus-5-5-20251001-beta"),
+                Some("opus-5-5-20251001-beta"),
+            ),
+            // The family is lowercase ASCII letters only.
+            (Some("claude-Opus-5"), Some("Opus-5")),
+            // An empty trailing part is malformed, not an absent minor.
+            (Some("claude-opus-5-"), Some("opus-5-")),
+            // SUPPRESSED, as before. `<synthetic>` names no model that answered —
+            // it rides records Claude Code injects itself — and ANY `<…>`-wrapped
+            // pseudo-model goes with it, not just the one seen on disk.
+            (Some("<synthetic>"), None),
+            (Some("<unknown>"), None),
+            // Absent / empty / whitespace-only all suppress.
+            (None, None),
+            (Some(""), None),
+            (Some("   "), None),
+            // A bare prefix and nothing else renders no label, never an empty ` · `.
+            (Some("claude-"), None),
+        ];
+        // Every mislabelled case is reported, not just the first one.
+        let wrong: Vec<String> = cases
+            .iter()
+            .filter_map(|&(id, want)| {
+                let got = model_label(id);
+                (got.as_deref() != want).then(|| format!("{id:?}: got {got:?}, want {want:?}"))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "mislabelled ids:\n{}", wrong.join("\n"));
+    }
+
+    #[test]
+    fn record_model_is_fail_soft_over_absent_null_and_non_string() {
+        let present = serde_json::json!({"message": {"model": "claude-opus-5"}});
+        assert_eq!(record_model(&present), Some("claude-opus-5"));
+        // An absent `message`, an absent `model`, a null, a non-string, and a
+        // non-object `message` must ALL read as no model — never a panic.
+        for raw in [
+            serde_json::json!({}),
+            serde_json::json!({"message": {}}),
+            serde_json::json!({"message": {"model": null}}),
+            serde_json::json!({"message": {"model": 42}}),
+            serde_json::json!({"message": "not an object"}),
+        ] {
+            assert_eq!(record_model(&raw), None, "{raw} must read as no model");
+        }
+    }
+
+    #[test]
+    fn record_effort_prefers_the_per_turn_level_and_is_fail_soft() {
+        let cases: &[(Value, Option<&str>)] = &[
+            // `perTurnEffort` goes FIRST: when the two differ, it is the answer.
+            (
+                serde_json::json!({"perTurnEffort": "max", "effort": "xhigh"}),
+                Some("max"),
+            ),
+            // An UNUSABLE `perTurnEffort` — null, blank, non-string, absent — falls
+            // back to `effort` rather than ending the search.
+            (
+                serde_json::json!({"perTurnEffort": null, "effort": "xhigh"}),
+                Some("xhigh"),
+            ),
+            (
+                serde_json::json!({"perTurnEffort": "  ", "effort": "xhigh"}),
+                Some("xhigh"),
+            ),
+            (
+                serde_json::json!({"perTurnEffort": 42, "effort": "xhigh"}),
+                Some("xhigh"),
+            ),
+            (serde_json::json!({"effort": "xhigh"}), Some("xhigh")),
+            // Neither usable: no effort, never a panic.
+            (serde_json::json!({}), None),
+            (serde_json::json!({"effort": null}), None),
+            (serde_json::json!({"effort": 42}), None),
+            (serde_json::json!({"effort": ""}), None),
+            (
+                serde_json::json!({"perTurnEffort": null, "effort": null}),
+                None,
+            ),
+            (
+                serde_json::json!({"perTurnEffort": "  ", "effort": ""}),
+                None,
+            ),
+            // Shown as WRITTEN: the case is kept, and only surrounding whitespace
+            // goes.
+            (serde_json::json!({"perTurnEffort": "MAX"}), Some("MAX")),
+            (serde_json::json!({"effort": " xhigh "}), Some("xhigh")),
+            // The keys are TOP-LEVEL siblings of `message`; nested ones are not read.
+            (serde_json::json!({"message": {"effort": "xhigh"}}), None),
+            (
+                serde_json::json!({"message": {"perTurnEffort": "xhigh"}}),
+                None,
+            ),
+            // A record naming a real model keeps its effort ...
+            (
+                serde_json::json!({"message": {"model": "claude-opus-5-5"}, "perTurnEffort": "xhigh"}),
+                Some("xhigh"),
+            ),
+            // ... but a PSEUDO-model record shows none: no model ran that turn.
+            (
+                serde_json::json!({"message": {"model": "<synthetic>"}, "perTurnEffort": "xhigh"}),
+                None,
+            ),
+            (
+                serde_json::json!({"message": {"model": "<synthetic>"}, "effort": "xhigh"}),
+                None,
+            ),
+        ];
+        // Every misread record is reported, not just the first one.
+        let wrong: Vec<String> = cases
+            .iter()
+            .filter_map(|(record, want)| {
+                let got = record_effort(record);
+                (got.as_deref() != *want).then(|| format!("{record}: got {got:?}, want {want:?}"))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "misread efforts:\n{}", wrong.join("\n"));
+    }
+
+    #[test]
+    fn the_claude_marker_carries_the_answering_model_between_handle_and_time() {
+        let text = render_file(&preview_fixture("sess-model-synthetic-tail-1.jsonl"), WIDE);
+        let claude = lines_led_by(&text, "\u{25cf} claude");
+        let first = claude.first().expect("a claude marker line");
+        // Exact span ORDER: `● claude` (bold) · @lead · Opus 4.8 · timestamp (dim).
+        assert_eq!(
+            first.spans.len(),
+            4,
+            "marker + handle + model + timestamp: {:?}",
+            first.spans
+        );
+        assert_eq!(first.spans[0].content.as_ref(), "\u{25cf} claude");
+        assert_eq!(first.spans[1].content.as_ref(), " \u{b7} @lead");
+        assert_eq!(first.spans[2].content.as_ref(), " \u{b7} Opus 4.8");
+        assert!(
+            first.spans[2].style.add_modifier.contains(Modifier::DIM),
+            "the model label is dim"
+        );
+        assert_eq!(first.spans[3].content.as_ref(), " \u{b7} 10:00");
+        // Styled with ratatui only — never embedded ANSI.
+        assert!(
+            !flatten(&text).contains('\u{1b}'),
+            "the model label must not embed ANSI"
+        );
+    }
+
+    #[test]
+    fn a_synthetic_model_turn_renders_bare() {
+        // The `<synthetic>` pseudo-model is the LAST assistant model in this
+        // fixture — exactly where a naive "latest model" label would render it.
+        let text = render_file(&preview_fixture("sess-model-synthetic-tail-1.jsonl"), WIDE);
+        let claude = lines_led_by(&text, "\u{25cf} claude");
+        assert_eq!(claude.len(), 2, "both assistant turns render");
+        let last = claude[1];
+        // Marker + handle + timestamp only — NO model span between them.
+        assert_eq!(
+            last.spans.len(),
+            3,
+            "a pseudo-model adds no label span: {:?}",
+            last.spans
+        );
+        assert_eq!(last.spans[1].content.as_ref(), " \u{b7} @lead");
+        assert_eq!(last.spans[2].content.as_ref(), " \u{b7} 10:02");
+        assert!(
+            !flatten(&text).contains("synthetic"),
+            "the pseudo-model must never reach the screen"
+        );
+    }
+
+    #[test]
+    fn a_two_model_session_labels_each_turn_with_its_own_model() {
+        // THE anti-hoist test: this session genuinely changes model mid-file (real
+        // sessions do), so a file-level "the session's model" would be false for one
+        // of these two turns whichever value it picked.
+        let text = render_file(&preview_fixture("sess-model-switch-1.jsonl"), WIDE);
+        let claude = lines_led_by(&text, "\u{25cf} claude");
+        assert_eq!(claude.len(), 2, "both assistant turns render");
+        assert_eq!(claude[0].spans[1].content.as_ref(), " \u{b7} Opus 4.8");
+        assert_eq!(claude[1].spans[1].content.as_ref(), " \u{b7} Sonnet 5");
+        // The label rides the ASSISTANT record, so a user turn never carries one.
+        for you in lines_led_by(&text, "\u{25b6} you") {
+            assert_eq!(
+                you.spans.len(),
+                2,
+                "a user turn is marker + timestamp only: {:?}",
+                you.spans
+            );
+        }
+    }
+
+    #[test]
+    fn a_turn_with_no_model_renders_exactly_as_it_did_before() {
+        // 21% of real sessions carry no `message.model` at all — the NORMAL case,
+        // which must render byte-identically to the pre-label marker line.
+        let text = render_file(&preview_fixture("sess-model-absent-1.jsonl"), WIDE);
+        let claude = lines_led_by(&text, "\u{25cf} claude");
+        assert_eq!(claude.len(), 2, "both assistant turns render");
+        // Marker + timestamp, exactly as before this label existed.
+        assert_eq!(
+            claude[0]
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["\u{25cf} claude", " \u{b7} 10:00"],
+        );
+        assert_eq!(
+            claude[1]
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["\u{25cf} claude", " \u{b7} 10:00"],
+        );
+    }
+
+    #[test]
+    fn a_malformed_model_never_panics_and_renders_no_label() {
+        // A missing `message`, a null, a number, an empty string, and a `<…>`
+        // pseudo-model must all FAIL SOFT to no label. No timestamps here, so a
+        // bare marker line is exactly ONE span and a stray annotation is loud.
+        let dir = unique_temp_dir("bad-model");
+        let file = dir.join("sess.jsonl");
+        let jsonl = concat!(
+            r#"{"type":"assistant","sessionId":"s","cwd":"/x","message":{"role":"assistant","content":"a"}}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"s","cwd":"/x","message":{"role":"assistant","model":null,"content":"b"}}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"s","cwd":"/x","message":{"role":"assistant","model":42,"content":"c"}}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"s","cwd":"/x","message":{"role":"assistant","model":"","content":"d"}}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"s","cwd":"/x","message":{"role":"assistant","model":"<synthetic>","content":"e"}}"#,
+            "\n",
+        );
+        std::fs::write(&file, jsonl).expect("write temp jsonl");
+
+        let text = render_file(&file, WIDE);
+        let markers = lines_led_by(&text, "\u{25cf} claude");
+        assert_eq!(markers.len(), 5, "all five assistant turns render");
+        for m in markers {
+            assert_eq!(
+                m.spans.len(),
+                1,
+                "a malformed model renders no label: {:?}",
+                m.spans
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- effort annotation ------------------------------------------------
+
+    /// Every effort fixture, so a rule that must hold in ALL of them (the `▶ you`
+    /// line never carries an effort) is checked against each one.
+    const EFFORT_FIXTURES: &[&str] = &[
+        "sess-effort-present-1.jsonl",
+        "sess-effort-absent-haiku-1.jsonl",
+        "sess-effort-per-turn-wins-1.jsonl",
+        "sess-effort-per-turn-null-1.jsonl",
+        "sess-effort-synthetic-1.jsonl",
+    ];
+
+    /// One line's span contents in order, for the exact span-order checks.
+    fn span_texts<'a>(line: &'a Line<'_>) -> Vec<&'a str> {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn the_effort_rides_the_claude_marker_between_model_and_time() {
+        let text = render_file(&preview_fixture("sess-effort-present-1.jsonl"), WIDE);
+        let claude = line_led_by(&text, "\u{25cf} claude").expect("a claude marker line");
+        // Exact ORDER: marker, @agent, model, effort, time.
+        assert_eq!(
+            span_texts(claude),
+            vec![
+                "\u{25cf} claude",
+                " \u{b7} @lead",
+                " \u{b7} Opus 5.5",
+                " \u{b7} xhigh",
+                " \u{b7} 12:55"
+            ],
+        );
+        // DIM like every other annotation. Looked up by content, so a DIM neighbour
+        // cannot answer for it.
+        assert!(
+            claude
+                .spans
+                .iter()
+                .any(|s| s.content.as_ref() == " \u{b7} xhigh"
+                    && s.style.add_modifier.contains(Modifier::DIM)),
+            "the effort span is dim: {:?}",
+            claude.spans
+        );
+    }
+
+    #[test]
+    fn a_turn_with_no_recorded_effort_renders_no_effort_span() {
+        // The observed Haiku shape: `perTurnEffort: null` and NO `effort` key.
+        let text = render_file(&preview_fixture("sess-effort-absent-haiku-1.jsonl"), WIDE);
+        let claude = line_led_by(&text, "\u{25cf} claude").expect("a claude marker line");
+        assert_eq!(
+            span_texts(claude),
+            vec![
+                "\u{25cf} claude",
+                " \u{b7} Haiku 4.5 20251001",
+                " \u{b7} 12:55"
+            ],
+        );
+    }
+
+    #[test]
+    fn a_per_turn_effort_wins_over_the_session_effort() {
+        // `perTurnEffort: "max"` beside `effort: "xhigh"`: the line carries ` · max`
+        // and no `xhigh` at all.
+        let text = render_file(&preview_fixture("sess-effort-per-turn-wins-1.jsonl"), WIDE);
+        let claude = line_led_by(&text, "\u{25cf} claude").expect("a claude marker line");
+        assert_eq!(
+            span_texts(claude),
+            vec![
+                "\u{25cf} claude",
+                " \u{b7} Opus 5.5",
+                " \u{b7} max",
+                " \u{b7} 12:55"
+            ],
+        );
+    }
+
+    #[test]
+    fn a_null_per_turn_effort_falls_back_to_the_session_effort() {
+        // The observed `claude-opus-5` shape: `perTurnEffort: null` beside
+        // `effort: "xhigh"`.
+        let text = render_file(&preview_fixture("sess-effort-per-turn-null-1.jsonl"), WIDE);
+        let claude = line_led_by(&text, "\u{25cf} claude").expect("a claude marker line");
+        assert_eq!(
+            span_texts(claude),
+            vec![
+                "\u{25cf} claude",
+                " \u{b7} Opus 5",
+                " \u{b7} xhigh",
+                " \u{b7} 12:55"
+            ],
+        );
+    }
+
+    #[test]
+    fn a_pseudo_model_turn_shows_no_effort() {
+        let text = render_file(&preview_fixture("sess-effort-synthetic-1.jsonl"), WIDE);
+        let claude = lines_led_by(&text, "\u{25cf} claude");
+        assert_eq!(claude.len(), 2, "both assistant turns render");
+        // The injected `/login` notice records `perTurnEffort: "xhigh"`, but no model
+        // ran that turn: its marker is exactly what it was before effort existed.
+        assert_eq!(
+            span_texts(claude[1]),
+            vec!["\u{25cf} claude", " \u{b7} 12:56"],
+        );
+        // The control: the real turn before it DOES show its effort, so the bare
+        // marker above is the pseudo-model rule, not a fixture with nothing to show.
+        assert_eq!(
+            span_texts(claude[0]),
+            vec![
+                "\u{25cf} claude",
+                " \u{b7} Opus 5.5",
+                " \u{b7} xhigh",
+                " \u{b7} 12:55"
+            ],
+        );
+    }
+
+    #[test]
+    fn the_effort_reads_as_the_bare_level() {
+        // `· xhigh`, never `· xhigh effort`.
+        let text = render_file(&preview_fixture("sess-effort-present-1.jsonl"), WIDE);
+        let claude =
+            line_text(line_led_by(&text, "\u{25cf} claude").expect("a claude marker line"));
+        assert!(
+            claude.contains("\u{b7} xhigh \u{b7}"),
+            "the bare level sits between two separators: {claude}"
+        );
+        assert!(
+            !claude.contains("effort"),
+            "the marker never spells out `effort`: {claude}"
+        );
+    }
+
+    #[test]
+    fn the_pinned_row_carries_the_effort_verbatim() {
+        let rendered = render_file_collect(
+            &preview_fixture("sess-effort-present-1.jsonl"),
+            WIDE,
+            &HashSet::new(),
+        );
+        let row = rendered
+            .text
+            .lines
+            .iter()
+            .position(|l| l.spans.first().map(|s| s.content.as_ref()) == Some("\u{25cf} claude"))
+            .expect("a claude marker row");
+        let pinned = rendered
+            .markers
+            .iter()
+            .find(|m| m.content_row == row)
+            .expect("a collected marker at the claude row");
+        // The pinned row is the rendered marker line itself, styles included ...
+        assert_eq!(pinned.line, rendered.text.lines[row]);
+        // ... so it carries the effort with no code of its own.
+        assert_eq!(
+            span_texts(&pinned.line),
+            vec![
+                "\u{25cf} claude",
+                " \u{b7} @lead",
+                " \u{b7} Opus 5.5",
+                " \u{b7} xhigh",
+                " \u{b7} 12:55"
+            ],
+        );
+    }
+
+    #[test]
+    fn a_user_turn_never_carries_an_effort() {
+        // Only assistant records carry an effort, and the annotation is read from the
+        // record being rendered, so every `▶ you` line stays marker + timestamp.
+        let wrong: Vec<String> = EFFORT_FIXTURES
+            .iter()
+            .flat_map(|file| {
+                let text = render_file(&preview_fixture(file), WIDE);
+                let you: Vec<Vec<String>> = lines_led_by(&text, "\u{25b6} you")
+                    .into_iter()
+                    .map(|line| span_texts(line).into_iter().map(str::to_string).collect())
+                    .collect();
+                let want = vec![vec![
+                    "\u{25b6} you".to_string(),
+                    " \u{b7} 09-23 12:50".to_string(),
+                ]];
+                (you != want).then(|| format!("{file}: got {you:?}, want {want:?}"))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "user turns:\n{}", wrong.join("\n"));
     }
 
     // --- control-wrapper collapse -----------------------------------------

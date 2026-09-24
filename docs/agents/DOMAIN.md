@@ -178,6 +178,8 @@ never fatal:
 | `agentSetting` | on `type:"agent-setting"`, string (fail-soft) | the [bound agent](#bound-agent-storepreview) handle on preview turns (interactive bind — authoritative); read **positionally**, never hoisted |
 | `agentName` | on `type:"agent-name"`, string (fail-soft) | the background job's name; a **fallback** bound-agent source for the preview handle, trusted ONLY when it names a known agent (the field also carries free-form titles) — see [bound agent](#bound-agent-storepreview) |
 | `message.content` | string **or** typed-block array | user prompt, preview body, content index |
+| `message.model` | per `assistant` record, string (fail-soft) | the [answering model](#answering-model-storepreview) label on preview turns; read **positionally**, never hoisted |
+| `perTurnEffort`, then `effort` | TOP-LEVEL (siblings of `message`), per `assistant` record, string (fail-soft) | the [effort level](#effort-level-record_effort) on preview turns; read **positionally**, never hoisted |
 | `isSidechain` | bool | skip sub-agent turns when picking a label/preview |
 | `uuid` | per record | a record's identity in the transcript **tree** |
 | `parentUuid` | per record; **JSON `null` on the root** | the tree edge; the null-parent record's `uuid` is the fork-lineage identity (see [Fork lineage](#fork-lineage-storelineage)) |
@@ -847,7 +849,7 @@ exactly ONE place: `classify` buckets the resolved qualifier (`state`, else
 `status` — `ReportedAgent::qualifier`'s precedence) into an `AgentActivity`.
 Every qualifier-shaped output derives from that enum, so they cannot drift apart:
 
-| Bucket | Qualifier(s) | Badge color | Badge glyph | Dot pulses | Banner / row reads |
+| Bucket | Qualifier(s) | Badge color | Badge glyph | Dot pulses | Row reads |
 | --- | --- | --- | --- | --- | --- |
 | `NeedsInput` | `blocked`, `waiting` | `Yellow` (label/phrase) | `!` (`Red`) | no | `needs input` (translated — both tokens) |
 | `Idle` | `idle` | `Green` | `●` | no | `idle` (verbatim) |
@@ -872,13 +874,13 @@ Red is an ACCENT layered on the shape channel — one steady cell, NOT a row-wid
 pulsing alarm, which the design avoids because nearly every active agent is
 `blocked` and an alarm on all of them would cry wolf.
 
-The **Banner / row reads** column is one phrase with two consumers: `classify`
-feeds a single `agents::qualifier_copy`, so the preview banner
-(`friendly_status`, kind label fused in) and the board **list row** speak the
-SAME translated copy — the row no longer prints the raw token. Only the WEIGHT
-differs, and that is a `tui::view` rendering call, not a bucket property:
-`NeedsInput` draws its `needs input` at the badge's own color + `BOLD` (as loud
-as the dot and kind label), every other bucket stays `DIM`.
+The **Row reads** column is one phrase with two consumers: `classify` feeds a
+single `agents::qualifier_copy`, so the preview banner's fallback for a transcript
+with no marker at all (`friendly_status`, kind label fused in) and the board
+**list row** speak the SAME translated copy — the row no longer prints the raw
+token. Only the WEIGHT differs, and that is a `tui::view` rendering call, not a
+bucket property: `NeedsInput` draws its `needs input` at the badge's own color +
+`BOLD` (as loud as the dot and kind label), every other bucket stays `DIM`.
 
 **`WorkingButIdle` is the only bucket classified from the raw `state`/`status`
 PAIR rather than the collapsed qualifier, and the only translated one with no
@@ -1081,6 +1083,98 @@ This is the third and last of **three distinct agent concepts** — keep them ap
 | **Defined** agent | `~/.claude/agents/*.md` (`src/defined_agents.rs`) | an **on-disk definition** a new session can be launched under (`claude --agent <name>`, see [Hand-off invocations](#hand-off-invocations-srcresumers)) |
 | **Bound** agent | `agent-setting` / `agent-name` records (`store::preview`) | the **agent a recorded session actually ran under** — a preview-only label, this section; the **Defined** set above is what validates the noisy `agent-name` source |
 
+### Answering model (`store::preview`)
+
+Every `assistant` record carries `message.model` — the model that actually
+answered THAT turn. The preview renders it as a DIM label between the bound-agent
+handle and the [effort level](#effort-level-record_effort)
+(`● claude · @lead · Opus 5.5 · xhigh · 12:55`), through the same
+`annotation_span` builder all four annotations use. One pure function,
+`model_label`, owns the whole decision, mirroring `agent_handle`. It strips the
+`claude-` vendor prefix (`MODEL_VENDOR_PREFIX`) first — the whole board is Claude,
+so repeating the vendor every turn is noise — then reads the SHAPE of what is
+left. A VERSIONED id — a lowercase family, a 1–2 digit major, an optional 1–2
+digit minor and an optional 8-digit date, joined by `-` (`MODEL_ID_SEPARATOR`,
+`MODEL_VERSION_MAX_DIGITS`, `MODEL_DATE_DIGITS`) — is written the way people say
+it; any other shape keeps the prefix-stripped id:
+
+| Input | Label | Why |
+| --- | --- | --- |
+| `claude-opus-5-5`, `claude-sonnet-5` | `Opus 5.5`, `Sonnet 5` | The shape rule: the family capitalised, the version dotted. |
+| `claude-haiku-4-5-20251001` | `Haiku 4.5 20251001` | The date is KEPT. Collapsing a dated suffix was considered and rejected as lossy for the ~4/411 sessions that carry one; a truncated id reads back as a plausible WRONG model. It follows a SPACE rather than sitting in parentheses because the [quick reply's](#quick-reply--non-interactive-send-srcsendrs) status already wraps its labels in ` (…)`, where a parenthesised date would nest. |
+| `sonnet-5` (no prefix) | `Sonnet 5` | The rule reads what is left AFTER the optional strip, so an un-prefixed id spells exactly as its prefixed twin does. |
+| `opus`, `sonnet` (bare aliases, also on disk) | unchanged | No version, so not the versioned shape; nothing to strip. |
+| `claude-3-5-sonnet-20241022` (legacy, version first), and any other shape: `claude-opus-5-5[1m]`, a 3-digit minor, a 7-digit date, a date where the major goes (`claude-haiku-20251001`), a trailing extra part | the id with only the prefix stripped (`3-5-sonnet-20241022`) | Kept rather than a guessed reformatting. The major/minor digit cap sits BELOW the date's length, so a date is never read as a version. |
+| `<synthetic>`, and any other `<…>`-wrapped id | **suppressed** | See below. |
+| absent / `null` / non-string / blank / a bare `claude-` | **suppressed** | Fail-soft, and the majority case — see below. |
+
+**`<synthetic>` is matched by SHAPE, not by an equality check.** Claude Code
+stamps it on records it injects ITSELF (a session-limit or auth notice), so it
+names no model that answered anything — and it is the LAST assistant model in
+**10/411** sessions, exactly where a naive "latest model" label would render it.
+The guard, `is_pseudo_model`, is `starts_with('<') && ends_with('>')` over the
+trimmed id, so a future sibling pseudo-model is suppressed the day it appears
+rather than after it leaks to the board.
+
+**Absent is the NORMAL case, not an error state.** **86/411 (21%)** of the
+measured store carries no `message.model` at all, so a turn with no model renders
+exactly as it did before the label existed — bare, with no placeholder and no
+warning. There is nothing wrong with those sessions.
+
+**Attribution is positional, never hoisted** — the same rule the bound agent
+follows, but reached for a different reason. **11/411** sessions genuinely CHANGE
+model mid-file (one observed run went `claude-opus-4-8` ×86 → `claude-sonnet-5`
+×109), so any file-level answer would be false for those. It needs no streaming
+state at all: unlike the agent, the model sits ON the assistant record being
+rendered, which makes the per-turn property automatic. This is why the store has
+NO `Session::model` field and why neither `store::parse` nor `store::mod` was
+touched to add the label.
+
+There is no `model` record type in the store — the model is never persisted per
+session, only per turn — which is what makes `message.model` the only on-disk
+evidence of which model ran. `model_label` is therefore `pub(crate)` and shared:
+the [quick reply's](#quick-reply--non-interactive-send-srcsendrs) `modelUsage`
+readout spells and suppresses through the SAME function, so the two channels —
+what the transcript recorded, and what the send reported — can be compared without
+a difference in spelling reading as a difference in model.
+
+#### Effort level (`record_effort`)
+
+The effort level the turn ran at is the third of the four DIM annotations — after
+the model label, before the timestamp — shown as the BARE level exactly as recorded
+(`· xhigh`, never `· xhigh effort`). One pure function, `record_effort`, owns the
+decision:
+
+| Record | Effort shown | Why |
+| --- | --- | --- |
+| top-level `perTurnEffort` is a non-blank string | that value | Read FIRST. The order follows how the Claude Code binary resolves a turn's effort, NOT observed data: no measured record carries two different values (below), so the data could not have decided it. |
+| `perTurnEffort` absent / `null` / non-string / blank; `effort` a non-blank string | the `effort` value | An unusable `perTurnEffort` falls THROUGH rather than ending the search: a `null` one beside a string `effort` is an ordinary on-disk shape. |
+| neither key usable (absent / `null` / non-string / blank) | none — no span, never an empty ` · ` | Fail-soft; the observed Haiku shape. |
+| `message.model` is a pseudo-model (`<synthetic>`, any `<…>`) | none, even when a key is set | Claude Code injected that turn itself, so no model ran it at any effort, and its marker stays `● claude · 12:55`. The check is the SAME `is_pseudo_model` predicate that `model_label` suppresses with, never a second copy. A record with NO model still shows its effort. |
+| either key nested inside `message` | not read | Both keys are siblings of `message`: `{"type":"assistant","message":{"model":"claude-opus-5-5",…},"effort":"xhigh","perTurnEffort":null,…}`. |
+
+The value is trimmed of surrounding whitespace, as `model_label` and
+`agent_handle` treat padding, and otherwise shown as WRITTEN: never re-cased,
+mapped to a word, or suffixed. It is positional for the same reason the model is —
+it sits on the record being rendered, so it needs no streaming state — and the
+pinned row shows it because that row IS the marker line. Two surfaces never show
+an effort: a `▶ you` turn, because no `user` record carries either key (the marker
+builder is shared, so this is the data's absence, not a special case); and the
+quick-reply status, which names models only (`status_for_send`).
+
+Measured on the local store on 2026-09-23 (716 files; 53,703 `assistant` records
+carrying an effort key):
+
+| `message.model` | `effort` | `perTurnEffort` |
+| --- | --- | --- |
+| `claude-opus-5-5`, `claude-fable-5-1` | `"xhigh"` | `"xhigh"` |
+| `claude-opus-5`, `claude-sonnet-5` | `"xhigh"` | `null` or absent |
+| `claude-haiku-4-5-20251001` | absent | `null` |
+| `<synthetic>` (2 of 51 records) | absent | `"xhigh"` — both `isApiErrorMessage` "Please run /login · API Error: 403" turns |
+
+Only `assistant` records carry either key, and no record carries two string values
+that differ.
+
 ## User-facing modes (`tui::app`)
 
 | Concept | Values | Meaning |
@@ -1088,8 +1182,9 @@ This is the third and last of **three distinct agent concepts** — keep them ap
 | **Scope** | `CurrentFolder` (default) / `Project` / `All` | THREE concentric answers to "which sessions are mine right now", declared widest-last so the variant order is the cycle order. current-folder = sessions whose **canonical** `cwd` exactly equals the canonical launch dir; project = sessions whose `cwd` is EITHER a member of the launch project's live worktree set (`src/worktrees.rs`) OR under the same repo ROOT (see below — two arms, and the scope needs both); all = every session. `All` renders repo→branch group heads; `Project` renders branch groups under the ONE project label instead of per-folder repo labels (see below); `CurrentFolder` is the flat, head-less list, and it ALONE, because it is the only scope that cannot span more than one folder. Selected at launch by `--project`/`-p` or `--all`/`-a`, and flipped by `Ctrl-A` between the first two — `All` joins that key ONLY on a board launched with `-a`, which is the sole route to it (see below). |
 | **Search mode** | `NameOnly` (default) / `NameAndContent` | which haystack the substring matcher scores; toggled by `Tab`. |
 | **Show hidden** | off (default) / on | whether soft-hidden sessions appear (dimmed, marked `[hidden]`, live badge intact). Toggled by `Ctrl-X h`; a row is hidden/un-hidden by `Ctrl-X x`. The set persists — see [snapback-owned state](#snapback-owned-state-srchiddenrs). |
+| **Model override** | `None` (default) / any raw `--model` value — an alias the installed `claude` accepts, or a full model id | the `--model` value every later hand-off asks for. TWO doors onto ONE setting, both writing through `App::set_model_override`: `Ctrl-X m` opens the `List` modal below, and the `--model <value>` launch flag pre-arms it before the board is drawn (`src/cli.rs`). Choice 0 (`default (settings)`) CLEARS it, emitting no flag at all — the stricter statement of "let the settings decide" than any alias could make, and the one row NOT drawn from the alias list. **Where the picker's rows come from is a RUNTIME READ of the installed binary, not a list kept in this repo:** `model_aliases::installed_model_aliases` scans `claude` off the UI thread and its answer arrives as `AppEvent::ModelAliases`; from then on the picker offers exactly that — unfiltered, undeduplicated, in the binary's own array order — so a newly shipped or withdrawn alias reaches the picker with no snapback release. Until it lands the picker draws the `tui::app::MODEL_ALIASES` SEED, and an EMPTY answer (no `claude` on `PATH`, an unreadable binary, no match) degrades to that same seed, so a failed probe can never leave the picker empty. The aliases are deliberately NOT enumerated here: a prose list is one more hand-synced artifact of exactly the kind the probe exists to delete, and the point-in-time capture plus its refresh command live in [CLAUDE_CLI.md](CLAUDE_CLI.md#model-aliases---model). It rides `Resume` / `Fork` / `New` ([hand-off invocations](#hand-off-invocations-srcresumers)) and BOTH send paths (`Ctrl-R` quick reply, `Ctrl-N` background launch); it can NEVER reach `Attach`, structurally — `build_attach_argv` takes no model parameter to pass one to. Rendered persistently in the header (`model: <alias>`), because a sticky mode with no indicator silently redirects every later hand-off. Held as the raw string and NEVER validated — neither the probed set nor the seed is a whitelist (`--model` also takes a full id like `claude-sonnet-5`), and an invalid value is claude's to reject — a hard, non-zero failure the board then explains with `resume::MODEL_NONZERO_HINT` instead of the misleading Fork/Attach or agent-name wording. The ONE value that does not survive is a BLANK one: `set_model_override` normalizes an empty or whitespace-only `--model ""` to `None`, since no value asked for is no override — the same answer a trailing valueless `--model` already gets, and a rule about the ABSENCE of a value rather than a check on one, so `Some(_)` always names something that reaches claude and the header never draws an empty `model:` segment. **IN-MEMORY ONLY — the contrast with Show hidden above is the point:** that set is persisted, this is not — and neither is the probed alias list, which is derived state about ANOTHER program's binary, memoized in a process-lifetime `OnceLock` and written nowhere. It is forgotten on restart, because [SNAPBACK-OWNED STATE](../../AGENTS.md) limits the on-disk writes to the hidden-id set and because a model is a per-invocation REQUEST, not a property of a session (the store has no `model` record type — see [answering model](#answering-model-storepreview)). **Precedence:** an explicit override SUPERSEDES a defined agent's own `model:` frontmatter — deliberate, since the user picked it after that agent was written; `src/defined_agents.rs` does not read the field at all, so claude resolves it and the flag is the later word. |
 | **Forced rescan** | `Ctrl-X r` | not a mode: a one-shot that drops the store's parse cache and re-reads every transcript, reporting the count it landed on. The board autorefreshes and reuses unchanged files by itself, so this is the escape hatch for a row that looks stale — see [incremental reload](#incremental-reload-storesessionstore). |
-| **Modal** | `Row` \| `List` layout in one `Option<Modal>` | the SINGLE type for a TITLED, choice-bearing overlay. `Enter` on a running session builds the `Attach` / `Fork` / `Cancel` choice (a `Row`); `Ctrl-N` with defined agents builds the agent picker (a `List`); `Ctrl-X d` builds the hard-delete confirm (a `Row`: `Delete this` / `Delete lineage (N)` — offered only for a real multi-member lineage, carrying the member ids resolved at OPEN time — / `Cancel`, default-highlighted on Cancel by that choice's position). Each choice carries a `ModalAction` tag the one confirm handler (`confirm_modal`) routes on. The plain Enter/Esc stop confirmations (`Ctrl-R`, `Ctrl-K`), the compose zone and the `Ctrl-X` chord are separate keyboard owners, NOT `Modal`s — see [PATTERNS.md](PATTERNS.md#10-keys-actions-outcomes). |
+| **Modal** | `Row` \| `List` layout in one `Option<Modal>` | the SINGLE type for a TITLED, choice-bearing overlay. `Enter` on a running session builds the `Attach` / `Fork` / `Cancel` choice (a `Row`); `Ctrl-N` with defined agents builds the agent picker (a `List`); `Ctrl-X m` builds the model picker (a `List`, pre-highlighted on the active override by MATCHING the built choices rather than by index arithmetic, so an override that is no longer offered falls back to row 0); `Ctrl-X d` builds the hard-delete confirm (a `Row`: `Delete this` / `Delete lineage (N)` — offered only for a real multi-member lineage, carrying the member ids resolved at OPEN time — / `Cancel`, default-highlighted on Cancel by that choice's position). Each choice carries a `ModalAction` tag the one confirm handler (`confirm_modal`) routes on. The plain Enter/Esc stop confirmations (`Ctrl-R`, `Ctrl-K`), the compose zone and the `Ctrl-X` chord are separate keyboard owners, NOT `Modal`s — see [PATTERNS.md](PATTERNS.md#10-keys-actions-outcomes). |
 
 The current-folder scope is an **exact** canonical `cwd` match by design: a
 repo's *other* worktree folders do not appear there, no matter how the paths
@@ -1261,10 +1356,24 @@ different mechanism, same verb.
 
 | Action | argv |
 | --- | --- |
-| Resume | `claude -r <id>` (`<id>` = full `sessionId`) |
-| Fork | `claude -r <id> --fork-session` (`<id>` = full `sessionId`) |
+| Resume | `claude -r <id> [--model <alias>]` (`<id>` = full `sessionId`) |
+| Fork | `claude -r <id> --fork-session [--model <alias>]` (`<id>` = full `sessionId`) |
 | Attach | `claude attach <job-id>` (one-shot reattach; `<job-id>` = the **short agent-view id** from `claude agents --json`, **not** the `sessionId`) |
-| New session | `claude [--agent <name>] [<prompt>]` (interactive launch, no `-r` — mints its own id; started in `App::launch_dir` via `Ctrl-N`, optionally bound to a picked agent, and optionally opening on a drafted `<prompt>` — see [the background draft pane](#background-agent-draft-pane-ctrl-n)) |
+| New session | `claude [--agent <name>] [--model <alias>] [<prompt>]` (interactive launch, no `-r` — mints its own id; started in `App::launch_dir` via `Ctrl-N`, optionally bound to a picked agent, and optionally opening on a drafted `<prompt>` — see [the background draft pane](#background-agent-draft-pane-ctrl-n)) |
+
+`--model` is the board's sticky [model override](#user-facing-modes-tuiapp),
+threaded in through `HandoffCtx` and emitted only when one is armed — with no
+override the four argvs above are BYTE-IDENTICAL to what they have always been.
+`argv_for` does not append the flag itself: it hands `ctx.model` to the three
+builders that may carry one, because for **New** the flag must precede the
+trailing POSITIONAL prompt and only the builder that owns that positional knows
+where "before it" is. **Attach is excluded structurally**, not by a match arm —
+`build_attach_argv` takes no model parameter, so no `--model` token can reach a
+`claude attach` argv even by mistake. The trim/blank guard is literally SHARED
+with `--agent` (`resume::flag_value`), so a blank pick can never emit a valueless
+flag, and `nonzero_hint_for` selects `MODEL_NONZERO_HINT` from that SAME predicate
+— a blank override emits nothing and therefore keeps the action's own wording,
+rather than blaming a model that was never sent.
 
 `claude attach` matches the agent-view **job id** (the short id), not the full
 `sessionId` — a full UUID exits 1 ("No job matching"). Only **background** agents
@@ -1307,8 +1416,8 @@ launching, and from there:
 
 | Key | argv | Route |
 | --- | --- | --- |
-| `Enter` | `claude [--agent <name>] --bg <prompt>` | `Outcome::BgLaunch` → `send::spawn_bg_launch` → one `AppEvent::BgLaunchFinished`. **No teardown** — the board stays up. |
-| `Ctrl-O` | `claude [--agent <name>] [<prompt>]` | `Outcome::Resume` → the ordinary teardown round trip, via `resume::check_new`. |
+| `Enter` | `claude [--agent <name>] [--model <alias>] --bg <prompt>` | `Outcome::BgLaunch` → `send::spawn_bg_launch` → one `AppEvent::BgLaunchFinished`. **No teardown** — the board stays up. |
+| `Ctrl-O` | `claude [--agent <name>] [--model <alias>] [<prompt>]` | `Outcome::Resume` → the ordinary teardown round trip, via `resume::check_new`. |
 
 `Enter` therefore lives in the [`send`](#quick-reply--non-interactive-send-srcsendrs)
 family, not the hand-off one: `--bg` registers the agent and returns immediately
@@ -1410,7 +1519,8 @@ than as a clean start — see
 ## Quick reply — non-interactive send (`src/send.rs`)
 
 `Ctrl-R` sends a one-shot message to the selected session WITHOUT the teardown
-hand-off above. `claude -p -r <id> --output-format json "<msg>"` resumes the
+hand-off above. `claude -p -r <id> --output-format json [--model <alias>] "<msg>"`
+resumes the
 session non-interactively (its stdio is a pipe, no TTY), replays the full
 context, **appends the exchange in place** to the same `<id>.jsonl` — same
 `sessionId`, no new file — prints a JSON result (`is_error`, `total_cost_usd`,
@@ -1429,7 +1539,7 @@ and it FOLLOWS the bottom so both stay in view. The `▶ you` echo is
 dropped the instant the real turn lands on disk — detected by the reloaded
 `Session::msg_count` growing past `Sending::baseline_msg_count` — so the real turn
 (styled identically) takes its place with no doubling; the placeholder stays until
-`AppEvent::SendFinished` clears `App::sending`. The pinned status banner is SUPPRESSED
+`AppEvent::SendFinished` clears `App::sending`. The pinned banner is SUPPRESSED
 while a send is in flight (`view::preview_banner` returns `None`, keeping render and
 the click hit-test agreeing on the geometry), since the inline turns replace it.
 
@@ -1488,7 +1598,36 @@ The stop step (`build_stop_argv`, the SHORT agent-view job id from the probe's
 `ReportedAgent.id`) runs in `run_send` BEFORE the send, **best-effort**: if the job
 was already reaped between the gate and the send, the stop fails but the reply still
 lands; if the session really is still held, the reply's own error is what surfaces.
-No permission flags are passed: a send inherits the user's existing settings.
+
+**What a send inherits, and what it does not.** No permission flags are passed
+(`--permission-mode` / `--allowedTools`): a send inherits the user's PERMISSION
+POSTURE from their existing settings, matching an ordinary interactive resume.
+That claim is about permissions ALONE. The MODEL is a deliberate carve-out — an
+explicit, visible choice made on the board, and the ONLY way to choose one on this
+path at all, since the in-session `/model` command cannot reach a non-interactive
+`-p` run — so an armed [override](#user-facing-modes-tuiapp) is honored here
+exactly as it is on a resume, emitted through the SAME `resume::push_model_flag`
+rather than a second copy of its guard. The identical split holds for the
+background launch below. With no override the argv is byte-identical to before.
+
+**Which model ANSWERED.** A successful send's JSON payload carries `modelUsage`, a
+map keyed by the model that actually ran, so `status_for_send` appends it to the
+cost: `sent — $0.0136 (Sonnet 5)`. It sits next to the cost because on this path the
+two are one fact — a `-p -r` reply replays the whole conversation, so which model
+answered is what the number was spent on — and it is the only SYNCHRONOUS proof of
+the answer, since `--model` is a REQUEST a `--fallback-model` may silently
+substitute and the transcript's own `message.model` cannot be read until the turn
+is on disk. Keys are spelled and suppressed by the SAME
+[`preview::model_label`](#answering-model-storepreview) the transcript marker
+uses. **Every** key is listed (sorted for determinism, then deduped by LABEL), not
+one picked at random: a multi-key map IS the substitution, and reporting one of
+them would hide exactly the divergence this readout exists to expose. FAIL-SOFT
+throughout — an absent, empty, non-object or wholly-suppressed `modelUsage`
+appends nothing and leaves the status exactly as it read before; the suffix is
+never attached to a FAILURE, where naming a model would dress a refusal up as an
+answer. An invalid `--model` is a hard failure (exit 1, empty stderr, stdout
+`is_error:true`, `modelUsage:{}`) and needs no new seam: `status_for_failed_send`
+already renders it.
 
 **Report the send HONESTLY.** Because claude prints its refusal to **stderr** and
 exits non-zero with an EMPTY stdout, a driver that nulls stderr and ignores the exit

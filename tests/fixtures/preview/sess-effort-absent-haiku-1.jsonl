@@ -1,0 +1,3 @@
+{"type":"summary","summary":"A quick answer from Haiku"}
+{"type":"user","sessionId":"sess-effort-absent-haiku-1","cwd":"/Users/me/project-alpha","gitBranch":"main","timestamp":"2026-09-23T12:50:00.000Z","message":{"role":"user","content":"Name the config file"}}
+{"type":"assistant","sessionId":"sess-effort-absent-haiku-1","cwd":"/Users/me/project-alpha","gitBranch":"main","timestamp":"2026-09-23T12:55:00.000Z","message":{"role":"assistant","model":"claude-haiku-4-5-20251001","content":"It is the snapback config file."},"perTurnEffort":null}

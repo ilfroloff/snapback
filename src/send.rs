@@ -28,7 +28,8 @@
 //!   parser), plus the cwd-existence gate — the send counterpart of
 //!   [`crate::resume::plan`].
 //! * [`status_for_send`] — map the `--output-format json` payload to a board
-//!   status (cost on success, an error hint on `is_error`), FAIL-SOFT.
+//!   status (cost AND the answering model on success, read from `modelUsage`; an
+//!   error hint on `is_error`), FAIL-SOFT.
 //!
 //! [`spawn_send`] is the only impure piece: the detached-thread driver that
 //! spawns the child, reaps it, and delivers exactly one
@@ -51,7 +52,7 @@ use std::sync::mpsc::Sender;
 use serde_json::Value;
 
 use crate::agents::{self, AgentActivity, ReportedAgent};
-use crate::store::parse;
+use crate::store::{parse, preview};
 use crate::watch::AppEvent;
 
 /// Refusal shown when a Reply (Ctrl-R) targets a live agent that must NOT be
@@ -95,6 +96,11 @@ const SEND_FAILED_PREFIX: &str = "send failed: ";
 /// Max characters of a surfaced claude error kept on the (one-row) status line, so
 /// a verbose message cannot balloon the status past what is useful.
 const SEND_ERROR_MAX: usize = 200;
+
+/// What joins two answering models in the readout when a send used more than one
+/// (a `--fallback-model` substitution). Named rather than inlined so the multi-model
+/// case has ONE spelling. See [`answering_models`] for why every one is listed.
+const MODEL_READOUT_SEPARATOR: &str = ", ";
 
 /// A ready-to-run send, or a refusal with a user-facing message.
 ///
@@ -315,26 +321,45 @@ pub struct InterruptRequest {
 }
 
 /// Build the `claude` argv for a one-shot send:
-/// `claude -p -r <id> --output-format json <message>`.
+/// `claude -p -r <id> --output-format json [--model <alias>] <message>`.
 ///
 /// A DUMB pure formatter, like [`crate::resume::build_argv`] — no trimming or
 /// validation beyond formatting (the empty-message guard lives at the call site).
 /// `--output-format json` makes the reply machine-readable for [`status_for_send`];
-/// the prompt is the trailing positional argument.
+/// the prompt is the trailing positional argument, and `--model` is emitted BEFORE
+/// it for the reason [`crate::resume::build_new_argv`] documents (a flag trailing an
+/// operand is at the mercy of the parser).
+///
+/// `model` is the board's sticky override, formatted by
+/// [`crate::resume::push_model_flag`] — the SAME function the interactive hand-offs
+/// use, rather than a second copy of its trim/blank guard here, so a quick reply and
+/// a resume can never disagree about what the override means. `None` (an
+/// un-overridden board) and a blank pick both emit nothing, leaving this argv
+/// byte-identical to the one it has always produced.
+///
+/// # What a send inherits, and what it does not
 ///
 /// NO permission flags are passed (`--permission-mode` / `--allowedTools`): a send
-/// INHERITS the user's existing settings, matching an ordinary interactive resume.
+/// INHERITS the user's PERMISSION POSTURE from their existing settings, matching an
+/// ordinary interactive resume. That claim is now about permissions ALONE. The
+/// MODEL is a deliberate carve-out: it is an explicit, visible choice the user made
+/// on the board (and the only way to choose one at all on this path, since the
+/// in-session `/model` command cannot reach a non-interactive `-p` run), so an
+/// active override is honored here exactly as it is on a resume. The same split
+/// holds for [`build_bg_launch_argv`]; the two must be read together.
 #[must_use]
-pub fn build_send_argv(session_id: &str, message: &str) -> Vec<String> {
-    vec![
+pub fn build_send_argv(session_id: &str, model: Option<&str>, message: &str) -> Vec<String> {
+    let mut argv = vec![
         "claude".to_string(),
         "-p".to_string(),
         "-r".to_string(),
         session_id.to_string(),
         "--output-format".to_string(),
         "json".to_string(),
-        message.to_string(),
-    ]
+    ];
+    crate::resume::push_model_flag(&mut argv, model);
+    argv.push(message.to_string());
+    argv
 }
 
 /// Build the `claude stop <job-id>` argv that DEREGISTERS a background job so a
@@ -384,6 +409,58 @@ pub fn plan_send(file: &Path) -> SendPlan {
     }
 }
 
+/// The models a `--output-format json` payload says actually ANSWERED, as labels
+/// ready to render — empty when the payload names none worth showing.
+///
+/// `modelUsage` is a MAP keyed by model id (each value a per-model cost/token
+/// breakdown), and it is the send path's only synchronous evidence of which model
+/// ran — the counterpart of the transcript's `message.model`, which does not exist
+/// until claude has written the turn to disk.
+///
+/// EVERY key is listed, never just the first. More than one key means the request
+/// and the answer DIVERGED — a `--fallback-model` substitution answered part of the
+/// turn — and that divergence is the entire reason this readout exists; picking one
+/// would hide exactly the fact worth reporting. The order is SORTED rather than
+/// map order, so the status text is deterministic for a given payload no matter how
+/// the map iterates (the crate does not enable `serde_json/preserve_order`, but the
+/// readout must not silently depend on that). Identical LABELS collapse
+/// ([`Vec::dedup`]): two keys that shorten to the same text name the same model, and
+/// repeating it would read as a divergence that is not there.
+///
+/// FAIL-SOFT (AGENTS.md): read from a `serde_json::Value`, never a hard-typed
+/// struct. An absent `modelUsage`, an empty one, and a NON-object one (a string, a
+/// number, an array, `null`) all yield an empty list rather than an error — as does
+/// a key [`preview::model_label`] suppresses (`<synthetic>`, blank). Nothing here
+/// can panic on a shape it did not expect.
+fn answering_models(value: &Value) -> Vec<String> {
+    let Some(usage) = value.get("modelUsage").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut labels: Vec<String> = usage
+        .keys()
+        // The SAME shortening/suppression the preview marker applies, so the two
+        // channels can be read against each other (see `preview::model_label`).
+        .filter_map(|id| preview::model_label(Some(id)))
+        .collect();
+    labels.sort();
+    labels.dedup();
+    labels
+}
+
+/// The ` (Sonnet 5)` suffix a success status carries when the payload named the
+/// model(s) that answered, or `""` when it named none.
+///
+/// Split from [`status_for_send`] so the "no evidence ⇒ no claim" degradation is one
+/// expression: an empty list produces an empty string, which appends to today's
+/// status and leaves it byte-identical.
+fn model_readout(value: &Value) -> String {
+    let models = answering_models(value);
+    if models.is_empty() {
+        return String::new();
+    }
+    format!(" ({})", models.join(MODEL_READOUT_SEPARATOR))
+}
+
 /// Map the `--output-format json` stdout to a board status and its class.
 ///
 /// FAIL-SOFT by construction (AGENTS.md): the payload is parsed as
@@ -395,6 +472,23 @@ pub fn plan_send(file: &Path) -> SendPlan {
 /// neutral `"sent"` (the child ran, but printed nothing we can read — never a
 /// panic, never a false cost). Returns `(text, transient)` so the UI layer never
 /// has to infer the class from the text.
+///
+/// # The answering model
+///
+/// A success also carries WHICH MODEL ANSWERED, read from `modelUsage` and appended
+/// as `sent — $0.0136 (Sonnet 4.5 20250929)`. It sits next to the cost deliberately:
+/// on this path the two are one fact — a `-p -r` reply replays the whole
+/// conversation, so which model answered is what the number was spent on. It is
+/// also the only SYNCHRONOUS proof of the answer, since an override is a request
+/// (`--model`) that a `--fallback-model` may silently substitute, and the
+/// transcript's own `message.model` cannot be read until the turn is on disk.
+///
+/// The suffix is best-effort in the strict sense: no `modelUsage`, an empty one, a
+/// mistyped one, or one naming only suppressed ids appends NOTHING and leaves the
+/// status exactly as it read before ([`model_readout`]). It is never attached to a
+/// FAILURE — an invalid model exits non-zero with `modelUsage:{}`, and naming a
+/// model there would dress a refusal up as an answer; that path belongs to
+/// [`status_for_failed_send`].
 #[must_use]
 pub fn status_for_send(raw_stdout: &str) -> (String, bool) {
     let Ok(value) = serde_json::from_str::<Value>(raw_stdout) else {
@@ -404,9 +498,10 @@ pub fn status_for_send(raw_stdout: &str) -> (String, bool) {
     if value.get("is_error").and_then(Value::as_bool) == Some(true) {
         return (SEND_ERROR.to_string(), false);
     }
+    let models = model_readout(&value);
     match value.get("total_cost_usd").and_then(Value::as_f64) {
-        Some(cost) => (format!("sent — ${cost:.4}"), true),
-        None => (SEND_OK.to_string(), true),
+        Some(cost) => (format!("sent — ${cost:.4}{models}"), true),
+        None => (format!("{SEND_OK}{models}"), true),
     }
 }
 
@@ -703,24 +798,37 @@ pub struct BgLaunchRequest {
 }
 
 /// Build the `claude` argv that starts a BACKGROUND agent with a first prompt:
-/// `claude --agent <name> --bg <prompt>`, or `claude --bg <prompt>` when `agent`
-/// is `None`.
+/// `claude [--agent <name>] [--model <alias>] --bg <prompt>`.
 ///
 /// A DUMB pure formatter, the sibling of [`build_send_argv`] and
 /// [`crate::resume::build_new_argv`] — no trimming or validation beyond
 /// formatting (the empty-prompt guard lives at the call site). `--bg` makes
 /// claude start the session as a background agent and return immediately, which
 /// is what lets the board stay up; the prompt is the trailing positional argument
-/// and stays ONE argv element, so a multiline draft reaches claude intact.
+/// and stays ONE argv element, so a multiline draft reaches claude intact. Every
+/// flag precedes that positional, `--model` included.
 ///
 /// An empty / whitespace-only `agent` is treated exactly like `None` (never a
-/// valueless `--agent`), matching [`crate::resume::build_new_argv`]'s guard.
+/// valueless `--agent`), matching [`crate::resume::build_new_argv`]'s guard;
+/// `model` gets the SAME treatment for free, because it is formatted by the very
+/// function that guard belongs to ([`crate::resume::push_model_flag`]).
+///
+/// The two flags are independent, and the model deliberately WINS where they
+/// overlap — an agent definition's own `model:` frontmatter is a file the user is
+/// not looking at, while the override is a choice they just made. Both are emitted;
+/// claude resolves the pair. [`crate::resume::build_new_argv`] owns that argument
+/// in full, since it is the same one.
+///
+/// # What a launch inherits, and what it does not
 ///
 /// NO permission flags are passed (`--permission-mode` / `--allowedTools`): a
-/// launch INHERITS the user's existing settings, exactly like [`build_send_argv`]
-/// and an ordinary interactive start.
+/// launch INHERITS the user's PERMISSION POSTURE from their existing settings,
+/// exactly like [`build_send_argv`] and an ordinary interactive start. That claim
+/// is about permissions ALONE — the MODEL is a deliberate carve-out, an explicit
+/// user choice this argv is expected to carry. Read this note and
+/// [`build_send_argv`]'s together; they state one invariant between them.
 #[must_use]
-pub fn build_bg_launch_argv(agent: Option<&str>, prompt: &str) -> Vec<String> {
+pub fn build_bg_launch_argv(agent: Option<&str>, model: Option<&str>, prompt: &str) -> Vec<String> {
     let mut argv = vec!["claude".to_string()];
     if let Some(name) = agent {
         let name = name.trim();
@@ -729,6 +837,7 @@ pub fn build_bg_launch_argv(agent: Option<&str>, prompt: &str) -> Vec<String> {
             argv.push(name.to_string());
         }
     }
+    crate::resume::push_model_flag(&mut argv, model);
     argv.push("--bg".to_string());
     argv.push(prompt.to_string());
     argv
@@ -854,12 +963,14 @@ mod tests {
     /// permission flags, the prompt as the trailing positional argument.
     #[test]
     fn argv_is_claude_dash_p_resume_json_for_a_plain_send() {
-        let argv = build_send_argv("abc-123", "hello there");
+        let argv = build_send_argv("abc-123", None, "hello there");
         assert_eq!(
             argv.join(" "),
             "claude -p -r abc-123 --output-format json hello there"
         );
-        // The send INHERITS the user's settings: no permission posture is forced.
+        // The send inherits the user's PERMISSION posture: none is forced here.
+        // (The MODEL is the carve-out — an explicit choice, asserted separately in
+        // `argv_carries_the_model_override_before_the_positional_message`.)
         assert!(
             !argv
                 .iter()
@@ -882,9 +993,57 @@ mod tests {
     /// so a multiline reply reaches claude intact.
     #[test]
     fn argv_keeps_a_multiline_message_as_a_single_argument() {
-        let argv = build_send_argv("id", "line one\nline two");
+        let argv = build_send_argv("id", None, "line one\nline two");
         assert_eq!(argv.last().map(String::as_str), Some("line one\nline two"));
         assert_eq!(argv.len(), 7, "no extra args from the newline: {argv:?}");
+    }
+
+    /// The override reaches the quick reply as `--model <alias>`, and lands BEFORE
+    /// the trailing positional message so the flag can never be parsed as part of
+    /// the prompt (the ordering `resume::build_new_argv` argues for).
+    #[test]
+    fn argv_carries_the_model_override_before_the_positional_message() {
+        let argv = build_send_argv("abc-123", Some("opus"), "hello there");
+        assert_eq!(
+            argv.join(" "),
+            "claude -p -r abc-123 --output-format json --model opus hello there"
+        );
+        let flag = argv.iter().position(|a| a == "--model");
+        assert_eq!(
+            flag,
+            Some(6),
+            "the flag sits after the fixed head: {argv:?}"
+        );
+        assert_eq!(
+            argv.last().map(String::as_str),
+            Some("hello there"),
+            "the message stays the trailing positional: {argv:?}"
+        );
+    }
+
+    /// With no override the send argv is BYTE-IDENTICAL to the one this path has
+    /// always produced — no `--model` token anywhere — and a blank/whitespace pick
+    /// collapses to the same thing rather than emitting a valueless flag (the
+    /// `resume::flag_value` guard, shared through `push_model_flag`).
+    #[test]
+    fn a_blank_or_absent_model_leaves_the_send_argv_untouched() {
+        let bare = build_send_argv("abc-123", None, "hi");
+        assert_eq!(
+            bare.join(" "),
+            "claude -p -r abc-123 --output-format json hi"
+        );
+        for blank in ["", "   ", "\t\n"] {
+            assert_eq!(
+                build_send_argv("abc-123", Some(blank), "hi"),
+                bare,
+                "a blank model {blank:?} must emit nothing at all"
+            );
+        }
+        // And a value that survives is TRIMMED into the argv, never padded.
+        assert_eq!(
+            build_send_argv("abc-123", Some("  sonnet  "), "hi").join(" "),
+            "claude -p -r abc-123 --output-format json --model sonnet hi"
+        );
     }
 
     /// A successful payload surfaces `total_cost_usd` in the status (the whole
@@ -947,6 +1106,139 @@ mod tests {
                 "unreadable stdout must degrade to a neutral status, got {status:?} for {raw:?}"
             );
         }
+    }
+
+    /// A successful payload also names WHICH MODEL answered, read from `modelUsage`
+    /// and shortened by the SAME `store::preview::model_label` the transcript
+    /// marker uses — so the two evidence channels spell one model one way.
+    #[test]
+    fn status_names_the_answering_model_from_model_usage() {
+        let raw = r#"{"type":"result","is_error":false,"total_cost_usd":0.0136,
+                      "modelUsage":{"claude-sonnet-4-5-20250929":
+                        {"inputTokens":4,"outputTokens":100,"costUSD":0.0136}}}"#;
+        let (status, transient) = status_for_send(raw);
+        assert_eq!(status, "sent — $0.0136 (Sonnet 4.5 20250929)");
+        assert!(transient, "a priced success stays transient: {status}");
+
+        // With no cost to anchor it, the model still rides the neutral success.
+        let priceless = r#"{"modelUsage":{"claude-opus-5":{"costUSD":0.0}}}"#;
+        assert_eq!(status_for_send(priceless).0, "sent (Opus 5)");
+    }
+
+    /// The readout spells a model exactly as the preview's turn marker does
+    /// (`● claude · Sonnet 5 · 12:55`), so a reply's result line and the turn it
+    /// appends read as one model, not two.
+    #[test]
+    fn status_spells_the_answering_model_as_the_turn_marker_does() {
+        let raw = r#"{"type":"result","is_error":false,"total_cost_usd":0.0136,
+                      "modelUsage":{"claude-sonnet-5":
+                        {"inputTokens":4,"outputTokens":100,"costUSD":0.0136}}}"#;
+        assert_eq!(status_for_send(raw).0, "sent — $0.0136 (Sonnet 5)");
+    }
+
+    /// THE divergence case: `--fallback-model` can substitute a model mid-turn, and
+    /// then `modelUsage` holds MORE THAN ONE key. Every one is surfaced — silently
+    /// picking a single key would hide exactly the fact this readout exists to
+    /// expose — in a DETERMINISTIC (sorted) order, so the status text is stable for
+    /// a given payload however the map iterates.
+    #[test]
+    fn status_lists_every_model_when_a_fallback_answered_too() {
+        // Written opus-first so a pass cannot come from insertion order.
+        let raw = r#"{"total_cost_usd":0.5,"modelUsage":{
+                        "claude-opus-4-1":{"costUSD":0.4},
+                        "claude-haiku-4-5":{"costUSD":0.1}}}"#;
+        let (status, _) = status_for_send(raw);
+        assert_eq!(status, "sent — $0.5000 (Haiku 4.5, Opus 4.1)");
+        assert!(
+            status.contains("Opus 4.1") && status.contains("Haiku 4.5"),
+            "both models must be named, not one: {status}"
+        );
+    }
+
+    /// Two keys that SHORTEN to the same label name one model, and are reported
+    /// once — repeating it would read as a divergence that is not there.
+    ///
+    /// This is what makes the `sort` load-bearing rather than decorative: the
+    /// shortening is NOT order-preserving over the key order, so the duplicate
+    /// labels are not adjacent as they arrive (the keys sort
+    /// `claude-sonnet-5` < `haiku-4-5` < `sonnet-5`, whose labels interleave to
+    /// `Sonnet 5, Haiku 4.5, Sonnet 5`) and `dedup`, which only collapses
+    /// CONSECUTIVE equals, would miss them. Sorting the LABELS is the step that
+    /// makes both the collapse and the rendered order hold.
+    #[test]
+    fn two_keys_naming_one_model_are_reported_once_and_in_order() {
+        let raw = r#"{"total_cost_usd":0.5,"modelUsage":{
+                        "claude-sonnet-5":{"costUSD":0.3},
+                        "sonnet-5":{"costUSD":0.1},
+                        "haiku-4-5":{"costUSD":0.1}}}"#;
+        assert_eq!(
+            status_for_send(raw).0,
+            "sent — $0.5000 (Haiku 4.5, Sonnet 5)"
+        );
+    }
+
+    /// FAIL-SOFT over `modelUsage` (AGENTS.md): absent, empty, non-object, and
+    /// mistyped shapes ALL degrade to exactly today's status — no suffix, no
+    /// panic, no invented model — as does a map naming only ids the label rules
+    /// suppress (`<synthetic>`, blank).
+    #[test]
+    fn a_malformed_model_usage_degrades_to_the_plain_status() {
+        for raw in [
+            r#"{"total_cost_usd":0.0136}"#,                       // absent
+            r#"{"total_cost_usd":0.0136,"modelUsage":{}}"#,       // empty
+            r#"{"total_cost_usd":0.0136,"modelUsage":null}"#,     // null
+            r#"{"total_cost_usd":0.0136,"modelUsage":"sonnet"}"#, // a string
+            r#"{"total_cost_usd":0.0136,"modelUsage":42}"#,       // a number
+            r#"{"total_cost_usd":0.0136,"modelUsage":["claude-opus-5"]}"#, // an array
+            // Present, well-shaped, but naming nothing worth showing.
+            r#"{"total_cost_usd":0.0136,"modelUsage":{"<synthetic>":{}}}"#,
+            r#"{"total_cost_usd":0.0136,"modelUsage":{"   ":{}}}"#,
+            r#"{"total_cost_usd":0.0136,"modelUsage":{"claude-":{}}}"#,
+        ] {
+            assert_eq!(
+                status_for_send(raw).0,
+                "sent — $0.0136",
+                "a malformed modelUsage must add nothing: {raw}"
+            );
+        }
+        // The same over an unreadable payload entirely — still no model claimed.
+        assert_eq!(status_for_send("not json").0, SEND_OK);
+    }
+
+    /// An INVALID `--model` is rendered by the EXISTING failure seam with NO new
+    /// code: claude exits non-zero with an EMPTY stderr and an `is_error` payload
+    /// on stdout, so `status_for_failed_send`'s first preference (the payload's own
+    /// `result`) already names the bad model. Pins that this feature added no
+    /// warned-outcome seam of its own — the `--agent` silent-downgrade shape does
+    /// NOT apply here, because a bad model FAILS LOUDLY instead of degrading.
+    #[test]
+    fn an_invalid_model_is_reported_by_the_existing_failure_seam() {
+        // Verbatim shape observed from `claude -p -r <id> --model nope`.
+        let stdout = r#"{"type":"result","subtype":"error_during_execution",
+                        "is_error":true,"duration_ms":1,"num_turns":0,
+                        "result":"There's an issue with the selected model (nope). Please use /model to switch.",
+                        "total_cost_usd":0,"modelUsage":{}}"#;
+        let (status, transient) = status_for_output(false, stdout, "");
+
+        assert!(
+            status.starts_with(SEND_FAILED_PREFIX),
+            "a bad model must read as a failure: {status}"
+        );
+        assert!(
+            status.contains("(nope)"),
+            "and must name the model claude rejected: {status}"
+        );
+        assert!(!transient, "a failure is sticky: {status}");
+        // It never reads as a success, and never borrows the empty `modelUsage`
+        // to claim a model answered.
+        assert!(
+            !status.starts_with(SEND_OK),
+            "a rejected model is not a send: {status}"
+        );
+        // Routing proof: this is `status_for_failed_send` verbatim, not a new arm.
+        assert_eq!(status, status_for_failed_send(stdout, ""));
+        // And the empty stderr is not the reason it worked — the payload is.
+        assert_ne!(status, SEND_FAILED_GENERIC);
     }
 
     /// A background agent record in a given `state`, carrying a stoppable job id.
@@ -1313,18 +1605,20 @@ mod tests {
 
     /// A background launch builds `claude --agent <name> --bg <prompt>`, and
     /// `claude --bg <prompt>` with no agent — the prompt as the trailing
-    /// positional, no permission flags (the launch inherits the user's settings).
+    /// positional, no permission flags (the launch inherits the user's PERMISSION
+    /// posture; the MODEL is the carve-out, asserted separately in
+    /// `bg_launch_argv_carries_the_model_beside_the_agent`).
     #[test]
     fn bg_launch_argv_is_claude_bg_with_the_prompt_last() {
         assert_eq!(
-            build_bg_launch_argv(Some("planner"), "ship the thing").join(" "),
+            build_bg_launch_argv(Some("planner"), None, "ship the thing").join(" "),
             "claude --agent planner --bg ship the thing"
         );
         assert_eq!(
-            build_bg_launch_argv(None, "ship the thing").join(" "),
+            build_bg_launch_argv(None, None, "ship the thing").join(" "),
             "claude --bg ship the thing"
         );
-        let argv = build_bg_launch_argv(Some("planner"), "ship the thing");
+        let argv = build_bg_launch_argv(Some("planner"), None, "ship the thing");
         assert!(
             !argv
                 .iter()
@@ -1341,12 +1635,55 @@ mod tests {
     #[test]
     fn bg_launch_argv_treats_a_blank_agent_as_none() {
         assert_eq!(
-            build_bg_launch_argv(Some(""), "hi").join(" "),
+            build_bg_launch_argv(Some(""), None, "hi").join(" "),
             "claude --bg hi"
         );
         assert_eq!(
-            build_bg_launch_argv(Some("   "), "hi").join(" "),
+            build_bg_launch_argv(Some("   "), None, "hi").join(" "),
             "claude --bg hi"
+        );
+    }
+
+    /// The override reaches a background launch too, between `--agent` and `--bg`
+    /// so every flag still precedes the trailing positional prompt. Both flags are
+    /// emitted together: an agent definition's own `model:` is deliberately
+    /// outranked by the explicit pick (`resume::build_new_argv` owns that argument).
+    #[test]
+    fn bg_launch_argv_carries_the_model_beside_the_agent() {
+        assert_eq!(
+            build_bg_launch_argv(Some("planner"), Some("opusplan"), "ship it").join(" "),
+            "claude --agent planner --model opusplan --bg ship it"
+        );
+        assert_eq!(
+            build_bg_launch_argv(None, Some("haiku"), "ship it").join(" "),
+            "claude --model haiku --bg ship it"
+        );
+        let argv = build_bg_launch_argv(Some("planner"), Some("opusplan"), "ship it");
+        assert_eq!(
+            argv.last().map(String::as_str),
+            Some("ship it"),
+            "the prompt stays the trailing positional: {argv:?}"
+        );
+    }
+
+    /// With no override a launch argv is BYTE-IDENTICAL to the one it has always
+    /// produced, and a blank/whitespace pick never emits a valueless `--model` —
+    /// the SAME guard `--agent` gets, because both run through
+    /// `resume::flag_value` rather than a copy of it.
+    #[test]
+    fn a_blank_or_absent_model_leaves_the_bg_launch_argv_untouched() {
+        let bare = build_bg_launch_argv(Some("planner"), None, "hi");
+        assert_eq!(bare.join(" "), "claude --agent planner --bg hi");
+        for blank in ["", "   ", "\t\n"] {
+            assert_eq!(
+                build_bg_launch_argv(Some("planner"), Some(blank), "hi"),
+                bare,
+                "a blank model {blank:?} must emit nothing at all"
+            );
+        }
+        assert_eq!(
+            build_bg_launch_argv(None, Some("  sonnet  "), "hi").join(" "),
+            "claude --model sonnet --bg hi"
         );
     }
 
@@ -1355,10 +1692,10 @@ mod tests {
     /// `argv_keeps_a_multiline_message_as_a_single_argument`.
     #[test]
     fn bg_launch_argv_keeps_a_multiline_message_as_a_single_argument() {
-        let argv = build_bg_launch_argv(Some("planner"), "line one\nline two");
+        let argv = build_bg_launch_argv(Some("planner"), None, "line one\nline two");
         assert_eq!(argv.last().map(String::as_str), Some("line one\nline two"));
         assert_eq!(argv.len(), 5, "no extra args from the newline: {argv:?}");
-        let bare = build_bg_launch_argv(None, "line one\nline two");
+        let bare = build_bg_launch_argv(None, None, "line one\nline two");
         assert_eq!(bare.last().map(String::as_str), Some("line one\nline two"));
         assert_eq!(bare.len(), 3, "no extra args from the newline: {bare:?}");
     }

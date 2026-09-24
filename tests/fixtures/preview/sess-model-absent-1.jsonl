@@ -1,0 +1,4 @@
+{"type":"summary","summary":"A session that records no model at all"}
+{"type":"user","sessionId":"sess-model-absent-1","cwd":"/Users/me/project-alpha","gitBranch":"main","timestamp":"2026-07-04T10:00:00.000Z","message":{"role":"user","content":"Rename the helper"}}
+{"type":"assistant","sessionId":"sess-model-absent-1","cwd":"/Users/me/project-alpha","gitBranch":"main","timestamp":"2026-07-04T10:00:05.000Z","message":{"role":"assistant","content":"Renamed it."}}
+{"type":"assistant","sessionId":"sess-model-absent-1","cwd":"/Users/me/project-alpha","gitBranch":"main","timestamp":"2026-07-04T10:00:09.000Z","message":{"role":"assistant","content":"Also updated the call sites."}}

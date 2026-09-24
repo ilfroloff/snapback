@@ -75,8 +75,15 @@ snapback -p                 # or --project: the repo you launched in AND all of
                             # project head
 snapback -a                 # or --all: every folder, grouped repo → branch, AND
                             # the only way to put that scope on Ctrl-A
+snapback --model opus       # pre-arm the sticky model override Ctrl-X m sets
 snapback -h                 # help
 ```
+
+`--model` takes the NEXT argument verbatim and never checks it: it seeds
+`App::model_override` through the same setter the picker uses, so the flag and
+`Ctrl-X m` are two doors onto one in-memory setting, and an unknown value is
+claude's to reject (`resume::MODEL_NONZERO_HINT` is worded for it). A trailing
+`--model` with no value asks for no override rather than erroring.
 
 `-a` means TWO things — start in the all scope, and keep it as the third stop of
 the `Ctrl-A` cycle — and only the FIRST takes part in the precedence rule below.
@@ -236,12 +243,13 @@ confirm subagents/sidecars were excluded). It is intentionally omitted from
 
 - A real **TTY** — the interactive UI refuses to run when stdout is not a
   terminal (it prints a count and exits instead of panicking).
-- `claude` on `PATH` — the binary that resume/fork/attach spawn, and the source
-  of live-agent badges. If it is missing or fails to launch, the hand-off fails
-  soft to a board status message and live detection degrades to "nothing is
-  live", so the live-agent badges disappear. Its flags, commands, version pin,
-  and the exact argv `snapback` builds are in
-  [CLAUDE_CLI.md](CLAUDE_CLI.md).
+- `claude` on `PATH` — the binary that resume/fork/attach spawn, the source of
+  live-agent badges, and (read rather than run) the source of the `Ctrl-X m`
+  picker's `--model` alias list. If it is missing or fails to launch, the hand-off
+  fails soft to a board status message, live detection degrades to "nothing is
+  live" so the live-agent badges disappear, and the picker falls back to its
+  built-in seed. Its flags, commands, version pin, and the exact argv `snapback`
+  builds are in [CLAUDE_CLI.md](CLAUDE_CLI.md).
 
 ## Validation checklist before finishing a change
 

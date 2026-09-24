@@ -1,0 +1,4 @@
+{"type":"summary","summary":"Plan the migration under the lead agent"}
+{"type":"agent-setting","agentSetting":"lead","sessionId":"sess-effort-present-1"}
+{"type":"user","sessionId":"sess-effort-present-1","cwd":"/Users/me/project-alpha","gitBranch":"main","timestamp":"2026-09-23T12:50:00.000Z","message":{"role":"user","content":"Plan the migration"}}
+{"type":"assistant","sessionId":"sess-effort-present-1","cwd":"/Users/me/project-alpha","gitBranch":"main","timestamp":"2026-09-23T12:55:00.000Z","message":{"role":"assistant","model":"claude-opus-5-5","content":"Here is the migration plan."},"effort":"xhigh","perTurnEffort":"xhigh"}

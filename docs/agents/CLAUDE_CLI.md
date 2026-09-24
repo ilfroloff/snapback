@@ -14,12 +14,12 @@ scope only: the surface of the `claude` command itself.
 
 ## Version pin (self-healing)
 
-> **Captured against `claude 2.1.220` (Claude Code).**
+> **Captured against `claude 2.1.235` (Claude Code).**
 
 Before trusting a flag or command below, compare the installed version:
 
 ```sh
-claude --version   # e.g. "2.1.220 (Claude Code)"
+claude --version   # e.g. "2.1.235 (Claude Code)"
 ```
 
 - **Installed == pinned** → this doc matches the live CLI. Trust it.
@@ -29,7 +29,7 @@ claude --version   # e.g. "2.1.220 (Claude Code)"
   just because an older local `claude` rejects it.
 - **Installed > pinned** → **this doc is stale**, not the CLI. Re-capture and
   refresh it (see [Refreshing this doc](#refreshing-this-doc)) before relying on
-  the tables; flags may have been added, renamed, or removed since 2.1.220.
+  the tables; flags may have been added, renamed, or removed since 2.1.235.
 
 Keep the pinned version above in sync with the tables — bumping one without the
 other defeats the check.
@@ -42,13 +42,13 @@ an inline test asserting the exact string, so drift here is caught by
 
 | Purpose | Argv | Builder |
 | --- | --- | --- |
-| Resume a session in place | `claude -r <session-id>` | `resume::build_argv` (`src/resume.rs`) |
-| Fork a session (new id) | `claude -r <session-id> --fork-session` | `resume::build_argv` |
+| Resume a session in place | `claude -r <session-id> [--model <alias>]` | `resume::build_argv` (`src/resume.rs`) |
+| Fork a session (new id) | `claude -r <session-id> --fork-session [--model <alias>]` | `resume::build_argv` |
 | Dispatch a DEFINED agent | `claude --agent <name>` | `resume::build_new_argv` (`src/resume.rs`) |
-| Start a new session on a drafted prompt | `claude [--agent <name>] <prompt>` | `resume::build_new_argv` |
-| Start a BACKGROUND agent on a drafted prompt | `claude [--agent <name>] --bg <prompt>` | `send::build_bg_launch_argv` (`src/send.rs`) |
+| Start a new session on a drafted prompt | `claude [--agent <name>] [--model <alias>] <prompt>` | `resume::build_new_argv` |
+| Start a BACKGROUND agent on a drafted prompt | `claude [--agent <name>] [--model <alias>] --bg <prompt>` | `send::build_bg_launch_argv` (`src/send.rs`) |
 | Attach to a live background job | `claude attach <job-id>` | `resume::build_attach_argv` |
-| Quick-send a reply (non-interactive) | `claude -p -r <session-id> --output-format json <message>` | `send::build_send_argv` (`src/send.rs`) |
+| Quick-send a reply (non-interactive) | `claude -p -r <session-id> --output-format json [--model <alias>] <message>` | `send::build_send_argv` (`src/send.rs`) |
 | Release a held job before a reply, or interrupt a selected agent (`Ctrl-K`) | `claude stop <job-id>` | `send::build_stop_argv` |
 | Detect live agents (gate probe) | `claude agents --json` | `agents::live_agents_argv` (`src/agents.rs`) |
 | Detect live agents (incl. just-finished) | `claude agents --json --all` | `agents::agents_argv` |
@@ -57,6 +57,16 @@ Two of these — **`attach`** and **`stop`** — are hidden commands (see below)
 `attach`/`stop` take the **short agent-view job id** (e.g. `ca56b543`), NOT the
 full `sessionId`; passing a UUID returns exit 1 ("No job matching"). The `-r`
 resume/fork/send paths take the **full `sessionId`**.
+
+`[--model <alias>]` is the board's sticky override (`Ctrl-X m`). It is emitted
+ONLY while one is armed — with none, every argv above is byte-identical to what it
+was before the flag existed — and it is always placed BEFORE a trailing positional
+(the new-session prompt, the reply message), since a flag trailing an operand is at
+the mercy of the parser. **`attach` can never carry it**, and structurally rather
+than by convention: `build_attach_argv` takes no model parameter at all. That is
+deliberate — `claude attach` joins a process already running under a model, so a
+`--model` there would be meaningless. `--agent` and `--model` compose freely, and
+snapback emits both when both are set; the accepted alias set is below.
 
 ## Invocation form
 
@@ -110,11 +120,60 @@ with `-p/--print` (SDK/non-interactive mode).
 | `--from-pr [value]` | Resume a session linked to a PR (number/URL), or open the picker. |
 | `--session-id <uuid>` | Use a specific (valid UUID) session id. |
 | `-n, --name <name>` | Display name (prompt box, `/resume` picker, terminal title). |
-| `--model <model>` | Model for the session — alias (`fable`/`opus`/`sonnet`) or full id (`claude-fable-5`). |
+| `--model <model>` | Model for the session — alias or full id (`claude-fable-5`). **`--help` lists only `fable`/`opus`/`sonnet`; that list is INCOMPLETE — see [Model aliases](#model-aliases---model).** |
 | `--fallback-model <model>` | `[P]` Fallback model(s), comma-separated, tried in order when the primary is overloaded. |
 | `--agent <agent>` | Agent for the session; overrides the `agent` setting. |
 | `--agents <json>` | JSON object defining custom agents inline. |
 | `--effort <level>` | `low` \| `medium` \| `high` \| `xhigh` \| `max`. |
+| `--autocompact <value>` | Auto-compact window size: `auto`, or a token budget in 100k–1M. |
+
+#### Model aliases (`--model`)
+
+**`claude --help` is WRONG here, and it is the one place in this doc where the
+help text cannot be the source.** Its `--model` blurb names `fable`, `opus` and
+`sonnet` only — three of the nine the binary accepts — so a help-derived list is
+missing six, including the alias with the most leverage. The set below was read
+out of the shipped binary instead (capture command in
+[Refreshing this doc](#refreshing-this-doc)), in the binary's own array order:
+
+| Alias | Notes |
+| --- | --- |
+| `sonnet` | Listed by `--help`. |
+| `opus` | Listed by `--help`. |
+| `haiku` | **Absent from `--help`.** |
+| `fable` | Listed by `--help`. |
+| `best` | **Absent from `--help`.** Accepted by the array; the bundle carries no picker label or description for it. |
+| `sonnet[1m]` | **Absent from `--help`.** The 1M-context variant (`label:"Sonnet 5 (1M context)"` in the bundle). Its embedded `]` is why a `[^]]`-style capture regex truncates the array right here — see [Refreshing this doc](#refreshing-this-doc). |
+| `opus[1m]` | **Absent from `--help`.** The 1M-context variant (`label:"Opus (1M context)"`). |
+| `fable[1m]` | **Absent from `--help`.** Same `[1m]` naming; the bundle carries no label for this one. |
+| `opusplan` | **Absent from `--help`.** Runs Opus for **plan mode** and the resting model otherwise — "plan with Opus, implement with Sonnet" as one alias. Confirmed from binary strings, including an `opusplan-mode-reminder`. It is also the CONTENT ANCHOR the capture command selects on: no other array in the bundle carries it. |
+
+**This table is a POINT-IN-TIME RECORD FOR HUMANS, not a list `snapback` reads.**
+`snapback` reads the same array out of the installed binary itself, at runtime
+(`src/model_aliases.rs`), so a newly shipped or withdrawn alias reaches the
+`Ctrl-X m` picker with no snapback release and **no edit here**. What
+`tui::app::MODEL_ALIASES` holds is a five-entry COLD-START SEED — what the picker
+draws in the frames before the probe answers, and what it keeps if the probe finds
+nothing — and it is deliberately NOT hand-refreshed: a stale seed is cosmetic and
+self-corrects. Refresh this table when you want the doc to describe the version in
+the [pin](#version-pin-self-healing) above, never because a picker depends on it.
+
+Neither the table nor the seed is a validation whitelist. `--model` also accepts a
+**full model id** (`claude-sonnet-5`), so this is an alias set, not the accepted
+domain: nothing in `snapback` rejects a `--model` value, and an invalid one is
+claude's to refuse (a hard, non-zero failure — see below).
+
+**An invalid `--model` is a HARD failure, not the `--agent` silent downgrade.**
+It exits **1** with an **empty stderr** and prints `is_error:true` on stdout with
+`result:"There's an issue with the selected model (…)"`, `modelUsage:{}` and cost
+0. Contrast the `--bg` agent case below, which exits **0** and starts the session
+without the agent. Because the failure is loud, `send::status_for_failed_send`
+already renders it correctly and no warned-outcome seam exists for it.
+
+The `-p --output-format json` payload's **`modelUsage`** map is keyed by the model
+that actually ANSWERED, with per-model `costUSD` — the only synchronous way to see
+that a `--fallback-model` substituted something else for what `--model` asked for.
+`send::status_for_send` reads it.
 
 ### Print / SDK mode
 
@@ -168,6 +227,9 @@ with `-p/--print` (SDK/non-interactive mode).
 | `--tmux` | Create a tmux session for the worktree (requires `--worktree`; `--tmux=classic` for plain tmux). |
 | `--remote-control [name]` | Interactive session with Remote Control enabled. |
 | `--remote-control-session-name-prefix <prefix>` | Prefix for auto-named Remote Control sessions. |
+| `--cloud [value]` | Create a cloud session from a description, or attach to an existing one by session id or `claude.ai/code` URL. |
+| `--environment <environment_id>` | Create a cloud session on a given self-hosted environment (`ccpool_…`). |
+| `--teleport [session]` | Resume a teleport session, optionally by session ID. |
 | `--ide` | Auto-connect to an IDE on startup if exactly one is available. |
 | `--chrome` / `--no-chrome` | Enable / disable the Claude-in-Chrome integration. |
 | `--brief` | Enable the `SendUserMessage` agent-to-user tool. |
@@ -199,6 +261,7 @@ flags (a few are expanded below).
 | `auto-mode` | Inspect or reset the auto-mode classifier config. |
 | `doctor` | Health-check the installation (read-only; no trust prompt). |
 | `gateway` | Run the enterprise auth/telemetry gateway (`--config <path>`). |
+| `import [source]` | Import config from another AI coding agent (`codex`, `gemini`); `--dry-run`, `--yes[=<digest>]`. |
 | `install [target]` | Install a native build (`stable`/`latest`/version; `--force`). |
 | `mcp` | Configure and manage MCP servers. |
 | `plugin` \| `plugins` | Manage plugins and marketplaces. |
@@ -296,8 +359,11 @@ from user settings).
 
 ### `claude ultrareview`
 
-`--json` (raw `bugs.json`) \| `--timeout <minutes>` (default 30). User-triggered
-and billed; a session cannot launch it for you.
+`--json` (raw `bugs.json`) \| `--timeout <minutes>` (default 30) \| `--post` /
+`--no-post` (post the findings to the PR as you, PR targets only, one plain
+comment — `--no-post` is the default and exists for parity with the
+`/ultrareview` and `/code-review ultra` flags). User-triggered and billed; a
+session cannot launch it for you.
 
 ## Refreshing this doc
 
@@ -308,11 +374,58 @@ stage cannot regenerate these facts — they must be re-captured from the live C
 claude --version
 claude --help
 for c in agents auth mcp plugin project install update ultrareview \
-         doctor setup-token gateway auto-mode; do
+         doctor setup-token gateway auto-mode import; do
   echo "== $c =="; claude "$c" --help
 done
 claude stop --help; claude attach --help   # hidden — re-verify explicitly
+
+# --model aliases: NOT derivable from --help (it names 3 of the 9), so read the
+# array out of the shipped binary. Extract every FLAT array of quoted strings,
+# keep the ones carrying `opusplan`, print the longest. That is the same rule
+# `src/model_aliases.rs` applies at runtime — content-anchor first, longest-wins
+# only as a deterministic tie-break — and it exits 1 when it finds nothing, so a
+# withdrawn anchor fails loudly instead of printing an empty line.
+strings -a "$(command -v claude)" \
+  | grep -oE '\["[^"]*"(,"[^"]*")*\]' \
+  | grep -F '"opusplan"' \
+  | awk '{ if (length > n) { n = length; a = $0 } }
+         END { if (n) print a
+               else { print "no --model alias array found" > "/dev/stderr"; exit 1 } }'
 ```
+
+Three traps, each reproduced against the real binaries. Do not "simplify" past
+any of them:
+
+1. **Do not require `opusplan` to be LAST.** The earlier form of this command
+   (`'\[("[^"]+",)+"opusplan"\]'`) could only match while `opusplan` was the final
+   element. Fed an array with one alias appended after it, that form printed
+   NOTHING and the pipeline still exited **0** — a drift check that cannot detect
+   the drift it exists to catch, and that fails silently rather than loudly. The
+   pattern above accepts a flat string array of any length and finds the anchor
+   anywhere in it.
+2. **Do not use a `[^]]*`-style terminator.** `sonnet[1m]` carries a `]` inside a
+   quoted element, so a "run of non-`]`" stops dead there and yields
+   `["sonnet","opus","haiku","fable","best","sonnet[1m]` — the array truncated,
+   silently dropping the four aliases after it.
+3. **Do not anchor on the identifier, and do not take the longest array.** The
+   variable holding it is minified and regenerated every build — observed as
+   `h9e` → `bze` → `SWe` → `qWe` → `UKe` across five consecutive releases. And the
+   array immediately BEFORE the alias array is a 17-element full-model-id list
+   (`["claude-3-5-haiku",…,"claude-sonnet-5"]`), nearly twice as long, so
+   longest-wins on its own returns the wrong one. The content anchor is what
+   discriminates: in 2.1.235 exactly one array in the bundle carries `opusplan`.
+
+That command is the refresh owner for
+[Model aliases](#model-aliases---model) and for nothing else — update the table
+and the [version pin](#version-pin-self-healing) in one pass. Read its output as
+the ACCEPTED alias set (`--model` takes full model ids besides).
+
+It is **not** how `tui::app::MODEL_ALIASES` is maintained, and that const's doc
+comment no longer points here. It is a cold-start seed the picker outgrows within
+the first frames of a board session, because `src/model_aliases.rs` applies the
+selection rule above to the installed binary at runtime — so the picker never
+waits on this pass, and hand-syncing the const would rebuild the very artifact
+that module exists to delete.
 
 Update the tables **and** the [version pin](#version-pin-self-healing) together
 when the surface changes. When a flag/command that `snapback` invokes changes,

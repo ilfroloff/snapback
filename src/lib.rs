@@ -22,6 +22,7 @@ mod config;
 mod defined_agents;
 mod delete;
 mod hidden;
+mod model_aliases;
 mod resume;
 mod search;
 mod send;
@@ -83,6 +84,12 @@ pub fn run() {
     // the `Ctrl-A` cycle. It is board state rather than a constructor argument
     // because it filters nothing — see `App::all_scope_enabled`.
     app.all_scope_enabled = args.all_scope_enabled;
+    // `--model` pre-arms the sticky override through the SAME setter `Ctrl-X m`
+    // goes through, so a launch flag and a picked row cannot diverge — and the
+    // picker can still change or clear it from inside the board. No override was
+    // asked for when the flag is absent, and `set_model_override(None)` is exactly
+    // that state, so this needs no branch.
+    app.set_model_override(args.model);
     loop {
         match tui::run(&mut app, &mut store) {
             // User quit the board (or all event senders dropped).
@@ -256,7 +263,7 @@ mod tests {
     fn plain_resume_ready(session_id: &str) -> resume::Ready {
         resume::Ready {
             cwd: PathBuf::from("/tmp"),
-            argv: resume::build_argv(session_id, false),
+            argv: resume::build_argv(session_id, false, None),
             nonzero_hint: resume::RESUME_NONZERO_HINT,
             race_probe_id: Some(session_id.to_string()),
         }
@@ -329,7 +336,7 @@ mod tests {
         let mut app = app_with_live(&["sess-forked"]);
         let ready = resume::Ready {
             cwd: PathBuf::from("/tmp"),
-            argv: resume::build_argv("sess-forked", true),
+            argv: resume::build_argv("sess-forked", true, None),
             nonzero_hint: resume::RESUME_NONZERO_HINT,
             // A fork is structurally excluded from race recovery.
             race_probe_id: None,
@@ -352,7 +359,7 @@ mod tests {
         let mut app = app_with_live(&[]);
         let ready = resume::Ready {
             cwd: PathBuf::from("/tmp"),
-            argv: resume::build_new_argv(None, None),
+            argv: resume::build_new_argv(None, None, None),
             nonzero_hint: resume::NEW_SESSION_NONZERO_HINT,
             race_probe_id: None,
         };

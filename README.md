@@ -94,6 +94,10 @@ snapback -a        # browse EVERY folder's sessions, grouped repo → branch —
                    # and put that scope on Ctrl-A, which is the only way to
                    # reach it
 snapback --all     # (long form of -a)
+snapback --model opus
+                   # start with the model already picked — the same sticky
+                   # choice Ctrl-X m makes, so a shell alias can launch the
+                   # board already aimed at a model
 snapback -h        # help
 ```
 
@@ -112,7 +116,7 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | `Ctrl-O` (in that picker) | **Start the highlighted agent interactively at once**, skipping the draft — the same thing `Ctrl-O` means inside the draft box, so either route out of the picker is one keypress |
 | `Ctrl-R` | **Quick reply** — send a one-shot message to the selected session without leaving the board. A background agent whose run is over (`done`, `stopped`, `failed`) is stopped first so the reply lands in place; a waiting one (`needs input`) asks you to confirm that stop; one that is still live (`working`, `idle`, `interrupted`, or a state this version doesn't recognize) is left alone and refused. Opens a compose box (`Enter` sends, `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels) |
 | `Ctrl-K` | **Stop / interrupt** the selected session's live background agent (`claude stop`). An agent whose run is over (`done`, `stopped`, `failed`) stops immediately; every other live agent (`working`, `needs input`, `idle`, `interrupted`, unrecognized) confirms first, since stopping ends the live job (its conversation is kept). A session that isn't running as an agent has nothing to stop, and an interactive session running in another terminal can't be stopped from here |
-| `Ctrl-X` then `x` / `d` / `h` / `r` | **Leader chord** for trimming and refreshing the board — `x` **hides** the selected session (reversible, persisted), `d` **hard-deletes** it after a confirmation that can take just that row or its whole `(+N)` stack, `h` toggles **show hidden**, `r` **re-reads every transcript from disk**. Any other key cancels the chord |
+| `Ctrl-X` then `x` / `d` / `h` / `m` / `r` | **Leader chord** for trimming, refreshing and aiming the board — `x` **hides** the selected session (reversible, persisted), `d` **hard-deletes** it after a confirmation that can take just that row or its whole `(+N)` stack, `h` toggles **show hidden**, `m` **picks the model** for everything you start or send from here on (`--model <value>` at launch arms the same pick), `r` **re-reads every transcript from disk**. Any other key cancels the chord |
 | `Tab` | Toggle search: **name-only ↔ name+content**. Widening to content also opens the preview on the most recent match, the same way typing does |
 | `Ctrl-A` | Flip scope: **current folder ↔ project** — the project being the repo you launched in and all of its git worktrees. Started with `-a` it is a three-stop cycle instead (current folder → project → all folders), which is the only way to reach all folders |
 | `Ctrl-/` | Toggle the transcript **preview** pane |
@@ -131,9 +135,10 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 
 Mouse mode is on so the wheel can scroll and the pane border can be dragged; to
 select/copy text natively, hold **Shift** (or **Option/⌥** on iTerm2 and macOS
-Terminal). The header shows the active scope, the search mode, and a
-`shown / total` count, with a version on the right — a release build shows the
-version number, a local dev build is marked as such.
+Terminal). The header shows the active scope, the search mode, the model you've
+picked (`model: opus`) if you've picked one, and a `shown / total` count, with a
+version on the right — a release build shows the version number, a local dev
+build is marked as such.
 
 Both numbers count **conversations**, not files: a folded fork lineage is one
 row wearing a `(+2)`, and it counts once on each side — so opening or closing a
@@ -258,16 +263,31 @@ a dot is steady, the shade separates the two at rest — the working gray is the
 interrupted one, the dimmer gray is a run that has ended. Colors follow your
 terminal's theme.
 
-Open the preview on a badged session and it leads with the same status in words,
-pinned above the transcript so it stays in view while the transcript scrolls
-beneath it — you can see why a session is sitting there before deciding what to
-do about it. It reports what Claude Code reports, in Claude Code's own words, with
-two exceptions. The two states that both mean *the session is waiting on you*
+Open the preview on any session — badged or not — and a row stays pinned above
+the transcript, naming **the turn you are reading**: the marker of whichever turn
+owns the line at the top of the viewport —
+`● claude · @lead · Opus 5.5 · xhigh · 12:55` — so who
+spoke, under which agent, on which model at what effort and when stay readable
+long after that turn's own marker has scrolled off the top of a long answer. It
+is the transcript's own marker line reused verbatim, down to the highlight your
+search puts on it, never a second rendering that could drift from the line below.
+It tracks the turn as you scroll, in every position the pane can be in, including
+the bottom-anchored one it opens at; scroll to the very first turn and the pinned
+row names that one, there being nothing above it to name. The row steps aside only
+while a quick reply you sent to that session is still in flight, when the reply's
+own turns take its place at the bottom of the transcript.
+
+The session's *status* in words is on the list row instead, as the word beside the
+badge. It reports what Claude Code reports, in Claude Code's own words, with two
+exceptions. The two states that both mean *the session is waiting on you*
 (`blocked` and `waiting`) are spelled out as `needs input`. And a background agent
 Claude Code still calls `working` while its own status reads `idle` — the shape of
 one that was interrupted and never cleaned up — is labelled `interrupted` (Claude
 Code's own word) and held steady. Anything else is passed through as-is rather
-than guessed at.
+than guessed at. That status reaches the pinned row only when the transcript has
+no turn to name at all — an empty one, or a session file that can no longer be
+read — the one case the preview leads with words rather than with a turn (a
+session without a badge has no status to show, so its row stays blank then).
 
 Because a session that's still running can't be plain-resumed, pressing `Enter`
 on one offers **Attach** (reconnect to a running background agent), **Fork**, or
@@ -360,8 +380,10 @@ sits still: that badge is snapback's *inference* from Claude Code contradicting
 itself, not a report that the run ended, and it isn't worth stopping live work over
 a guess. Use `Ctrl-K` if you do want it stopped — it will ask first.
 
-**Hide & delete.** `Ctrl-X` is a leader chord for trimming the board: press it,
-and a hint shows the follow-ups — `x`, `d`, `h`, `r` — while any other key cancels.
+**Hide & delete.** `Ctrl-X` is a leader chord: press it, and a hint shows the
+follow-ups — `x`, `d`, `h`, `m`, `r` — while any other key cancels. The first
+three and `r` trim and refresh the board and are covered here; `m` picks the
+model, and has its own section below.
 
 - `Ctrl-X x` **hides** the selected session. This is the reversible default: the
   session stays on disk, it just drops off the board. A `(+N)` stack always hides
@@ -416,10 +438,54 @@ session ids lives in its own config directory —
 otherwise `~/.config/snapback/state/hidden_sessions` — never inside the Claude
 Code session store, which snapback otherwise only reads.
 
+**Pick the model.** `Ctrl-X m` opens a list of the models *your* Claude Code
+accepts, and the pick sticks. Everything you start or send from then on asks for
+that model: `Enter` resume, `Ctrl-F` fork, `Ctrl-N` new session, `Ctrl-R` quick
+reply, and a background launch alike. The header says which one is armed
+(`model: opus`) so a sticky choice is never invisible, and the first row of the
+picker — `default (settings)` — clears it, which sends no `--model` at all and
+lets your Claude Code settings decide again.
+
+The list isn't baked into snapback: it's read from the Claude Code binary you have
+installed, in the background at startup. So a model that arrives in a Claude Code
+update shows up in the picker too, without waiting for a snapback release — and
+one that goes away stops being offered. If snapback can't read it for any reason
+it falls back to a small built-in list rather than showing you nothing, and you
+can always type any model you like with `--model` at launch.
+
+You can arm the same pick before the board even opens, with `snapback --model
+opus` — handy in a shell alias. It's the same setting either way: the picker
+still changes or clears it mid-session, and the value goes to Claude Code as you
+typed it, so a full model id works as well as an alias and an unknown one comes
+back as Claude Code's own complaint.
+
+Two things worth knowing. The pick lives in memory only: snapback never writes
+it down, so it's gone the next time you start — unlike the sessions you hide,
+which are remembered (a `--model` in your alias looks like it persists, but the
+durable thing there is your alias file, not anything snapback saved). And it
+wins over an agent's own `model:` if you started that agent with `Ctrl-N`; an
+explicit choice you just made is treated as the later word.
+
+`opusplan` is the one to notice, because `claude --help` doesn't list it: it runs
+Opus while planning and the resting model the rest of the time, which is "plan
+with Opus, implement with Sonnet" as a single choice. Attach is the one hand-off
+that never carries a model — you're joining a process that already picked one.
+
 **Readable transcript preview.** `Ctrl-/` opens a preview of the selected
 session rendered as clean, scrollable markdown — the real conversation, whole,
 from its first turn to its last, however long it ran. So you
 can confirm it's the right session before jumping back in. Links are clickable.
+
+Each `claude` turn is marked with **which model actually answered it**, beside
+the agent and the time — `● claude · @lead · Opus 5.5 · xhigh · 12:55`. It's
+read from the turn itself rather than assumed for the session, because a long
+conversation really can change model partway through, and each turn is labelled
+with its own. Turns that don't record one are left plain: most sessions don't,
+and a blank there is normal, not a gap. The marker also shows the effort level
+the turn ran at (`xhigh` above), read from the turn the same way. When you
+`Ctrl-R` reply, the status line names the answering model next to the cost
+(`sent — $0.0136 (Sonnet 5)`) — so if the model that answered isn't the one you
+asked for, you can see it rather than assume.
 
 ---
 

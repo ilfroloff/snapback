@@ -89,7 +89,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // A modal (the running-session choice or the new-session agent picker) sits
     // ON TOP of the board when open. The two overlays are now one `Option<Modal>`,
     // so at most one ever draws — a fact made structural, not conventional.
-    if let Some(modal) = &app.modal {
+    // Borrowed MUTABLY for the same reason the list is: a `List` modal's scroll
+    // window is resolved against the clamped box and written back (`Modal::scroll`).
+    if let Some(modal) = app.modal.as_mut() {
         render_modal(frame, modal);
     }
     // The "stop the waiting agent?" confirmation overlays the board before compose
@@ -287,7 +289,7 @@ const SCROLLBAR_END_ARROW: &str = "↓";
 /// jittering each time an arrow pops in or out at an edge.
 const SCROLLBAR_ARROW_HIDDEN: &str = " ";
 
-/// Rows the PINNED status banner reserves at the top of the preview's
+/// Rows the PINNED banner (the sticky header) reserves at the top of the preview's
 /// inner area (see [`preview_split`]). Exactly one: [`preview_banner`] is a
 /// single, never-wrapped line, so a taller reservation would only add dead
 /// space above the transcript and a shorter one would hide the banner outright.
@@ -459,6 +461,16 @@ fn project_name(app: &App) -> String {
 /// rightmost text of this line first. No new width logic guards that — the row
 /// has always been two overlaid paragraphs — but the order means the first thing
 /// to go is the least load-bearing one, not the counter or the scope.
+///
+/// An active `Ctrl-X m` model override renders as a `model: <alias>` segment
+/// beside the search mode, and it sits THERE for the same width argument read the
+/// other way: it is the most load-bearing thing on the row, so it goes early
+/// rather than in the tail a narrow terminal drops. It is a sticky mode that
+/// silently re-prices every later hand-off, and the header is the only surface
+/// that can say so over the whole interval it is true (AGENTS.md STATUS-LINE
+/// OWNERSHIP — the status line carries outcomes, not standing facts). With no
+/// override the segment is absent entirely, so an un-overridden board's header is
+/// byte-identical to what it has always drawn.
 fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     let scope = match app.scope {
         Scope::CurrentFolder => format!("folder:{}", launch_dir_name(app)),
@@ -485,12 +497,20 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         Span::raw(HEADER_SEPARATOR),
         Span::raw("search: "),
         Span::styled(mode, Style::default().fg(Color::Yellow)),
-        Span::raw(HEADER_SEPARATOR),
-        Span::styled(
-            format!("{} / {} sessions", counts.visible, counts.total),
-            dim,
-        ),
     ];
+    if let Some(model) = &app.model_override {
+        header.push(Span::raw(HEADER_SEPARATOR));
+        header.push(Span::raw("model: "));
+        header.push(Span::styled(
+            model.clone(),
+            Style::default().fg(Color::Magenta),
+        ));
+    }
+    header.push(Span::raw(HEADER_SEPARATOR));
+    header.push(Span::styled(
+        format!("{} / {} sessions", counts.visible, counts.total),
+        dim,
+    ));
     if counts.hidden > 0 {
         header.push(Span::raw(HEADER_SEPARATOR));
         header.push(Span::styled(format!("{} hidden", counts.hidden), dim));
@@ -1024,21 +1044,33 @@ fn blink_visible(tick: u64) -> bool {
     (tick / BLINK_TICKS).is_multiple_of(2)
 }
 
-/// The status banner line for the SELECTED session, or `None` when claude never
-/// reported that session as an agent (the preview then renders unchanged).
+/// WHETHER the preview reserves its pinned banner row — and the FALLBACK line for
+/// it — or `None` when the pane has no session transcript to pin a row above: nothing
+/// is selected, a new-session draft card owns the pane, or a quick reply to the
+/// selected session is in flight.
 ///
-/// Read-only over state that already exists: the selected id (`App::selected`)
-/// joined through the existing `App::reported_agent` accessor, with the phrasing
-/// owned by [`agents::friendly_status`] — no new `App` state, no new I/O, and no
-/// second interpretation of the `state`/`status` value set.
+/// This answers the RESERVATION, which is the question both callers actually need.
+/// What the row finally SHOWS is resolved in [`render_preview`], after the scroll
+/// offset is known: the marker of the turn at the top of the viewport
+/// ([`marker_at_top`]). The line returned here reaches the screen only when that
+/// lookup misses — a transcript with no marker at all — so it is the session's
+/// reported status when claude reports one ([`agents::friendly_status`]) and an
+/// EMPTY row otherwise. The remap is `Option::map`, so `is_some()` — the only thing
+/// the geometry depends on — is preserved exactly.
 ///
-/// Keyed on REPORTED, not live, so a FINISHED agent still gets its banner (`bg
-/// done`) rather than silently losing it.
+/// Keyed on the SELECTION alone — never on the reported-agent set, on liveness, or
+/// on whether the cached render holds markers. Why each of those is wrong is owned
+/// by `docs/agents/PATTERNS.md` §5 (the `has_banner` rule); do not restate it here.
+///
+/// Read-only over state that already exists — the selected id (`App::selected`), the
+/// draft and in-flight send, and the existing `App::reported_agent` accessor for the
+/// fallback — so there is no new `App` state, no I/O, and no second interpretation of
+/// the `state`/`status` value set.
 ///
 /// Exposed to `super::update` so the link hit-test can ask the SAME question the
-/// view does — "does this session have a banner?" — and derive the same
-/// transcript rect via [`preview_split`]; the two must agree, or a click would
-/// resolve to the wrong transcript row.
+/// view does — "does this pane have a banner?" — and derive the same transcript
+/// rect via [`preview_split`]; the two must agree, or a click would resolve to the
+/// wrong transcript row.
 ///
 /// An IN-FLIGHT quick-reply send takes precedence: while `App::sending` names the
 /// selected session there is NO pinned banner at all — this returns `None`, and
@@ -1064,7 +1096,11 @@ pub(crate) fn preview_banner(app: &App) -> Option<Line<'static>> {
     if app.sending_to(selected).is_some() {
         return None;
     }
-    let agent = app.reported_agent(selected)?;
+    // The fallback only: a session claude does not report still reserves the row,
+    // and with no marker to pin it has nothing to say there, so the row stays blank.
+    let Some(agent) = app.reported_agent(selected) else {
+        return Some(Line::default());
+    };
     // Cyan + BOLD marks the line as the board speaking rather than transcript
     // content (the search prompt uses the same accent). NAMED so it adapts to
     // the terminal theme — no RGB (TERMINAL-SAFE STYLING).
@@ -1150,27 +1186,24 @@ fn preview_inner(area: Rect) -> Rect {
 ///
 /// The pane's inner area ([`preview_inner`]) is divided into a
 /// PINNED banner row and the scrolling transcript beneath it. `has_banner` is
-/// [`preview_banner`]`(..).is_some()`, i.e. "claude REPORTED the selected
-/// session as an agent" — NOT "the selected session is live". The two parted
-/// ways when the shell-out grew `--all`: an agent that reported completion is
-/// still reported, so it has a banner, while claude would not call it live.
-/// Passing liveness here would desync this geometry from [`super::update`]'s
-/// hit-test (which asks [`preview_banner`]) for every `done` session — banner
-/// drawn, clicks resolved one row off. It is also unaskable here: liveness now
-/// means a shell-out to claude ([`App::is_live_now`]), which a render must never
-/// do.
+/// [`preview_banner`]`(..).is_some()` — "a session transcript is on the pane" (see
+/// that fn for the cases that return `None`) — and never "the selected session is
+/// live". Passing liveness here would desync this geometry from
+/// [`super::update`]'s hit-test (which asks [`preview_banner`]) — banner drawn,
+/// clicks resolved one row off. It is also unaskable here: liveness means a
+/// shell-out to claude ([`App::is_live_now`]), which a render must never do.
 ///
 /// The banner is a dedicated LAYOUT row rather than a line prepended into the
 /// scrolled `Text` because the preview is bottom-anchored by DEFAULT
 /// (`App::preview_follow_bottom`, re-armed on every selection change): a
 /// prepended line is pinned off the top of the viewport for any transcript
-/// taller than the pane — which is every realistic reported session — leaving
-/// the banner reachable only via `Home`. As its own row it stays put while the
-/// transcript scrolls beneath it.
+/// taller than the pane — which is every realistic session — leaving the banner
+/// reachable only via `Home`. As its own row it stays put while the transcript
+/// scrolls beneath it.
 ///
 /// When `has_banner` is false the transcript IS the whole inner rect and the
-/// banner rect is empty, so a BANNER-LESS session's geometry is exactly what it
-/// was before the banner existed.
+/// banner rect is empty, so a BANNER-LESS pane's geometry is exactly what it was
+/// before the banner existed.
 ///
 /// Pure, and the ONE place this geometry is derived: `render_preview` draws
 /// against these rects and [`super::update`]'s link hit-test resolves clicks
@@ -1428,12 +1461,17 @@ fn render_compose_zone(frame: &mut Frame, app: &App, area: Rect) {
 fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default().borders(Borders::ALL).title(" preview ");
 
-    // A REPORTED session leads with a status banner so the user can see WHY it
-    // is stopped (or that it is working, or that it has finished) without
-    // decoding the row badge. It is PINNED as its own layout row (see
+    // The selected session leads with the marker of whichever turn owns the TOP
+    // row of the viewport, so who spoke — under which agent, on which model, when —
+    // stays readable long after that turn's own marker scrolled off the top of a
+    // long answer. This call answers only WHETHER that row is reserved, and
+    // carries its fallback line for a transcript with no marker at all
+    // (`preview_banner`); the row's CONTENT is resolved further down, once the
+    // scroll offset is known. It is PINNED as its own layout row (see
     // `preview_split`) — the transcript scrolls beneath it — so the default
-    // bottom-anchored viewport cannot scroll it away. A session claude never
-    // reported reserves no row and renders unchanged.
+    // bottom-anchored viewport cannot scroll it away. A pane with no session
+    // transcript on it (nothing selected, a draft card, an in-flight reply)
+    // reserves no row.
     let banner = preview_banner(app);
     // Dock the compose zone in the bottom of the pane when composing AND the pane
     // is tall enough; otherwise `render` gave compose a full-width bottom bar and
@@ -1529,10 +1567,10 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     let transcript_lines = app.preview_line_count(inner_width);
 
     // Nothing selected (no text AND no banner, since a banner implies a SELECTED
-    // session claude reported). A reported session whose transcript is still
-    // empty falls through instead: its banner is the one thing worth drawing, and
-    // keeping the banner unconditional is what lets the hit-test below derive the
-    // same geometry from `banner.is_some()` alone.
+    // session). A selected session whose transcript is still empty falls through
+    // instead: its banner is the one thing worth drawing (a reported agent's status),
+    // and keeping the banner unconditional is what lets the hit-test below derive
+    // the same geometry from `banner.is_some()` alone.
     let nothing_to_draw = !showing_card && reply_tail.is_none() && transcript_lines == 0;
     if nothing_to_draw && banner.is_none() && !dock_compose {
         // Keep the scroll bookkeeping sane and still record the viewport height
@@ -1550,16 +1588,15 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
 
     // The block is drawn as its OWN pass instead of via `Paragraph::block` so the
     // pinned banner and the scrolling transcript can occupy separate rects inside
-    // one border. For a banner-less session this paints exactly what
+    // one border. For a banner-less pane this paints exactly what
     // `Paragraph::new(text).block(block)` painted: `preview_split`'s inner rect is
     // `Block::inner` for `Borders::ALL`, and the paragraph's own style is default.
+    //
+    // The block goes down HERE, but the BANNER cannot: its content is the marker of
+    // whichever turn the viewport's top row lands on, so it has to wait for the
+    // resolved `offset` below. Only the draw moves — the block still precedes it, so
+    // the border can never paint over the pinned row.
     frame.render_widget(block, area);
-    if let Some(banner) = banner {
-        // Deliberately NOT wrapped: a pinned row cannot grow, so an over-long
-        // banner truncates at the pane edge rather than silently stealing a
-        // transcript row and desyncing the hit-test's geometry.
-        frame.render_widget(Paragraph::new(banner), banner_area);
-    }
 
     // The wrapped height of what this pane is ACTUALLY showing — the WHOLE of it,
     // window or no window, because this is what the scroll clamp, the bottom anchor
@@ -1700,6 +1737,40 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
         }
     }
     let widget_offset = u16::try_from(residual).unwrap_or(u16::MAX);
+
+    // The banner's CONTENT is resolved HERE — after `offset` — rather than where
+    // `banner` was first read above, because it needs that same resolved offset to
+    // know which turn is under the pinned row. It ALWAYS shows the marker `Line` of
+    // the turn now sitting at the TOP of the viewport ([`App::preview_marker_at`]),
+    // in every scroll state including the default bottom-anchored one (re-armed on
+    // every selection change) — `friendly_status` no longer renders as the
+    // pinned row's NORMAL content; it survives only as the `unwrap_or`
+    // fallback for a transcript with no marker to pin (an empty one, or a
+    // session file that can no longer be read), and only for a session claude
+    // reports — any other session's fallback is a blank row. Whether anything is
+    // shown AT ALL is still exactly `banner.is_some()` from above — a card or an
+    // in-flight send already forced it to `None`, and nothing here widens that:
+    // `preview_split`'s reservation and the click hit-test's
+    // `preview_banner(..).is_some()` contract are UNCHANGED by this remap.
+    //
+    // It is handed `offset_rows` — the SAME `usize` row the window above was taken
+    // at, not a second narrowing of `offset` — and reads the SAME cached
+    // `row_prefix` that `row_window` just windowed by. That shared identity is the
+    // whole correctness argument: the pane's first painted row and the row the
+    // banner names its turn from are resolved by one `line_at_row` over one map, so
+    // the banner cannot name a turn the pane did not paint there. A card is excluded
+    // structurally, since `preview_banner` already returned `None` for one.
+    let banner = banner.map(|status_line| {
+        app.preview_marker_at(inner_width, offset_rows)
+            .unwrap_or(status_line)
+    });
+    if let Some(banner) = banner {
+        // Deliberately NOT wrapped: a pinned row cannot grow, so an over-long
+        // banner truncates at the pane edge rather than silently stealing a
+        // transcript row and desyncing the hit-test's geometry.
+        frame.render_widget(Paragraph::new(banner), banner_area);
+    }
+
     frame.render_widget(
         Paragraph::new(Text::from(window))
             .wrap(Wrap { trim: false })
@@ -1938,6 +2009,123 @@ fn visual_to_content(row_prefix: &[usize], visual_row: usize) -> Option<(usize, 
     }
     let sub_row = visual_row.saturating_sub(row_prefix[content_row]);
     Some((content_row, sub_row))
+}
+
+/// The marker [`Line`] of the turn sitting at wrapped visual row `offset` — the TOP
+/// of the preview viewport, in EVERY scroll state including the default
+/// bottom-anchored one — or `None` when `markers` is empty or `offset` falls past the
+/// end of the content.
+///
+/// Reuses [`visual_to_content`] — the SAME binary search over the SAME
+/// [`wrapped_row_prefix`] map the windowed draw starts at ([`row_window`]) and the
+/// click hit-test resolves against ([`link_at`]) — to translate `offset` into the
+/// logical content row beneath it, then looks up the LAST marker at or before that
+/// row: `markers` is produced in FILE order (see [`preview::render`]), so
+/// `content_row`s are monotonically non-decreasing and the last one `<=` the target
+/// is the turn that OWNS that row — the marker line itself, or any body line beneath
+/// it, belongs to the turn whose marker precedes it. When the target row sits ABOVE
+/// every marker (e.g. `offset == 0`, on the blank line that leads the very first
+/// turn), the FIRST marker is used instead: the opening turn is still what is "under"
+/// the pinned row in that case, there being nothing rendered before it.
+///
+/// The row half of that lookup is EXACT, and that is load-bearing rather than
+/// incidental. An earlier form of this took a per-line display-WIDTH model and
+/// re-derived the wrap as `ceil(width / inner_width)`, which drifts by a row for
+/// every line the WRAPPER chose to break somewhere else — so a long transcript, or
+/// one holding a soft-wrapped GFM table row, could pin a NEIGHBOURING turn's marker
+/// while compiling and rendering perfectly. Reading the map `row_window` just
+/// windowed by removes that class outright: the pane's first painted row and this
+/// lookup's target row are one number resolved through one [`line_at_row`], so the
+/// banner cannot name a turn the pane did not paint on its top row.
+///
+/// Pure and terminal-free, so the mapping is unit-testable from a marker list and a
+/// prefix map alone. This answers WHICH turn and nothing else; the pinned row the
+/// pane actually paints goes through [`marker_at_top_marked`], which adds the active
+/// query's marks to THIS line, and [`App::preview_marker_at`] is the impure, cached
+/// wrapper [`render_preview`] calls for it.
+///
+/// [`App::preview_marker_at`]: super::app::App::preview_marker_at
+pub(crate) fn marker_at_top(
+    markers: &[preview::MarkerLine],
+    row_prefix: &[usize],
+    offset: usize,
+) -> Option<Line<'static>> {
+    marker_owning_row(markers, row_prefix, offset).map(|m| m.line.clone())
+}
+
+/// The turn marker that OWNS the content row under wrapped visual row `offset`.
+///
+/// The ONE place the ownership rule lives — the LAST marker at or before the target
+/// row, or the FIRST when the row sits above every one ([`marker_at_top`] owns why) —
+/// so the line the banner SHOWS and the content row its marks are looked up by are
+/// answered by the SAME rule over the SAME map. A second copy of that rule could name
+/// one turn's marker and style it with another turn's matches.
+///
+/// Note that ONE rule is not one CALL: [`marker_at_top_marked`] resolves through here
+/// TWICE per pinned row — once for the line (via [`marker_at_top`]) and once for that
+/// marker's own `content_row` — so it is two walks over the one map, not one walk
+/// serving both. They cannot disagree: this is pure, both calls are handed the SAME
+/// three arguments, and `markers`/`row_prefix` are borrowed IMMUTABLY across the whole
+/// of it, so the second walk re-derives the first's answer by construction. The cost
+/// is one extra reverse scan of a list holding at most one entry per turn, on a path
+/// that runs once per frame for a single row.
+fn marker_owning_row<'m>(
+    markers: &'m [preview::MarkerLine],
+    row_prefix: &[usize],
+    offset: usize,
+) -> Option<&'m preview::MarkerLine> {
+    let (content_row, _) = visual_to_content(row_prefix, offset)?;
+    markers
+        .iter()
+        .rev()
+        .find(|m| m.content_row <= content_row)
+        .or_else(|| markers.first())
+}
+
+/// [`marker_at_top`]'s line carrying the active query's marks — the SAME emphasis,
+/// through the SAME helper, the transcript's own rows are drawn with.
+///
+/// The banner reuses a `Line` the renderer already produced, and that is what keeps
+/// the pinned row inside TERMINAL-SAFE STYLING: no color and no attribute is invented
+/// here, and nothing is re-derived from the query. But the drawn WINDOW re-styles the
+/// lines it paints through [`highlight_matched_spans`] first, so reusing the UNMARKED
+/// line put one line on screen in two appearances whenever the query hit a marker —
+/// marked in the transcript, unmarked in the pinned row directly above it. Reusing
+/// the marks the window already produces is the whole fix.
+///
+/// `matches` is the width-scoped cache's match map ([`App::preview_matches`], the
+/// very map the window marks by), keyed ABSOLUTELY by rendered line index — the same
+/// coordinate space [`preview::MarkerLine::content_row`] addresses — so the lookup is
+/// the marker's OWN row and nothing has to be rebased. An unsearched pane simply
+/// misses and the line is reused verbatim, exactly as before.
+///
+/// WHICH turn stays [`marker_at_top`]'s answer alone: this adds styling to that
+/// line and can never move the banner onto another turn. That is why the resolution
+/// is done TWICE rather than threaded through as one value — the line comes back from
+/// [`marker_at_top`], the row from a second [`marker_owning_row`] call — and why the
+/// two are nonetheless the same turn: identical arguments into one pure rule, with
+/// both slices held immutably throughout ([`marker_owning_row`] states the argument).
+///
+/// [`App::preview_matches`]: super::app::App::preview_matches
+pub(crate) fn marker_at_top_marked(
+    markers: &[preview::MarkerLine],
+    row_prefix: &[usize],
+    matches: &HashMap<usize, HashSet<usize>>,
+    offset: usize,
+) -> Option<Line<'static>> {
+    let line = marker_at_top(markers, row_prefix, offset)?;
+    // The marks are keyed by the resolved marker's OWN content row, so that row is
+    // asked of the SAME shared ownership rule rather than re-derived here.
+    let Some(matched) = marker_owning_row(markers, row_prefix, offset)
+        .and_then(|marker| matches.get(&marker.content_row))
+    else {
+        return Some(line);
+    };
+    Some(highlight_matched_spans(
+        &line,
+        matched,
+        PREVIEW_MATCH_MODIFIER,
+    ))
 }
 
 /// The url of a preview link under a mouse click at screen `(col, row)`, or `None`.
@@ -2228,9 +2416,27 @@ fn render_search(frame: &mut Frame, app: &mut App, area: Rect) {
 /// the longest form is what has to fit — `expose` (the wider verb) lands it at
 /// exactly 80 columns. Anything added here costs the tail of an 80-column
 /// terminal, so weigh a new verb against `Esc cancel` rather than appending.
+///
+/// `m model` was PAID FOR rather than appended: `h`'s verb went from
+/// `show/hide hidden` to `hidden`, which is the same 10 columns back, so the
+/// widest form is still exactly 80 and `Esc cancel` still lands on screen. `h` was
+/// the one to shorten because it is the only verb here whose full wording carries
+/// no argument of its own — `x` flips to say what the next press does, and `d`
+/// names BOTH targets its confirm offers — and because a key that toggles is
+/// honestly described by its SUBJECT: `h hidden` says which rows it is about, and
+/// the direction is whichever one the board is not in.
+///
+/// The `--model` LAUNCH FLAG pre-arms the very override `m` picks, and is
+/// deliberately NOT named here: this string is a which-key list of the follow-up
+/// KEYS a pending chord binds, so a flag has no key to sit beside — and the budget
+/// above is already exactly spent, so naming it would cost `Esc cancel` its place
+/// on an 80-column terminal. It is documented where a flag belongs (`USAGE` in
+/// `cli.rs`, the key/flag table in [`update`](crate::tui::update), and the README),
+/// and it needs no mention here anyway: `m` re-picks whatever the flag armed, and
+/// the header shows the armed value the whole time.
 fn chord_hint(selected_hidden: bool) -> String {
     let x = if selected_hidden { "expose" } else { "hide" };
-    format!("^X  x {x} · d delete row/lineage · h show/hide hidden · r reload · Esc cancel")
+    format!("^X  x {x} · d delete row/lineage · h hidden · m model · r reload · Esc cancel")
 }
 
 /// The compose zone's key hints, per open draft. Pure so the wording is assertable
@@ -2313,14 +2519,15 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         // The board keymap — one of the five surfaces AGENTS.md's KEEP KEY DOCS IN
         // SYNC names. It does NOT mention the terminal's paste, on COLUMN BUDGET:
-        // this line is already 224 columns (measured with the `unicode-width` the
+        // this line is already 230 columns (measured with the `unicode-width` the
         // renderer counts in) against a help row that is ONE line and never wraps, so
         // on an 80-column terminal it is cut the instant `^K stop` ends and
-        // everything from `^X hide/del` (column 84) rightward is already unpainted.
-        // A 23-column "paste keeps newlines" clause would land at columns 225-247 —
-        // nowhere, on any realistic width. What a board paste DOES (append to the
-        // query with newlines flattened to spaces, and never resume) is documented
-        // where there is room to say it: `KEYS` in `cli.rs` and the README key map.
+        // everything from `^X hide/del/model` (column 84) rightward is already
+        // unpainted. A 23-column "paste keeps newlines" clause would land at columns
+        // 231-253 — nowhere, on any realistic width. What a board paste DOES (append
+        // to the query with newlines flattened to spaces, and never resume) is
+        // documented where there is room to say it: `KEYS` in `cli.rs` and the README
+        // key map.
         //
         // The QUERY WORD-DELETE keys are omitted for exactly the same reason, and
         // just as deliberately. Even the tersest honest clause (`· ⌥⌫ del word`,
@@ -2345,10 +2552,25 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         //
         // `^T/^E` sits beside `Home/End` in the scroll cluster (its twin action, not
         // a separate one) rather than beside `^U/^D`: the scroll cluster already
-        // begins past column 171, so wherever in it a new token lands is equally
+        // begins past column 177, so wherever in it a new token lands is equally
         // off-screen at 80 columns — this placement is purely for readability.
+        //
+        // The chord's third verb is folded INTO its existing token (`hide/del` ->
+        // `hide/del/model`) rather than added as a segment of its own: this line
+        // enumerates the KEYS, and `^X` is one key whose follow-ups the which-key
+        // hint spells out the moment it is armed ([`chord_hint`]). Six more columns
+        // past the 224 this line already ran to cost nothing that was ever painted,
+        // and a second `^X …` segment would read as a second binding.
+        //
+        // The `--model` LAUNCH FLAG that pre-arms the same override is absent for the
+        // same reason the paste is: this is a KEYMAP, and a flag is typed before the
+        // board exists rather than pressed on it — there is no key to name it beside,
+        // and every column here past 80 is unpainted anyway. It lives in `USAGE` in
+        // `cli.rs`, the key/flag table in `tui::update`, and the README key map. What
+        // the board DOES show of it is the header's `model: <alias>` segment, which
+        // is armed identically whichever door set it.
         Line::from(vec![Span::styled(
-            "↑↓ move · ←/→ fold/expand · Enter resume · ^F fork · ^N new · ^R reply · ^K stop · ^X hide/del · type to search · Tab name/content · S-↑↓ match · ^A scope · ^/ preview · PgUp/PgDn·^U/^D·^T/^E·Home/End·wheel scroll · Esc quit",
+            "↑↓ move · ←/→ fold/expand · Enter resume · ^F fork · ^N new · ^R reply · ^K stop · ^X hide/del/model · type to search · Tab name/content · S-↑↓ match · ^A scope · ^/ preview · PgUp/PgDn·^U/^D·^T/^E·Home/End·wheel scroll · Esc quit",
             Style::default().add_modifier(Modifier::DIM),
         )])
     };
@@ -2369,11 +2591,44 @@ const MODAL_WIDTH: u16 = 62;
 const MODAL_ROW_CHROME_ROWS: u16 = 4;
 
 /// Non-message, non-entry rows a `List`-layout modal draws around its selectable
-/// list: a blank spacer above the list, a blank spacer below it, and a footer help
+/// list: a spacer row above the list, a spacer row below it, and a footer help
 /// line. The box height is message rows + entries + this chrome + two borders, so a
 /// picker grows with its choice count (the picker's old `AGENT_PICK_CHROME_ROWS`
 /// reasoning, kept) and any modal grows with a wrapped message.
+///
+/// The two spacers are where the scrolled-list affordance is PAID FOR: when rows
+/// sit off the window they carry [`modal_more_line`]'s dim `N more` marker instead
+/// of being blank, so the overflow hint costs the box zero extra rows (see
+/// [`modal_list_window`]).
 const MODAL_LIST_CHROME_ROWS: u16 = 3;
+
+/// The most choice rows a `List`-layout modal ASKS for before it scrolls instead
+/// of growing.
+///
+/// Without a cap the box grows one row per choice without bound — the agent picker
+/// draws one row per user-defined agent, and the model picker one per alias — so on
+/// a tall terminal an overlay stops reading as an overlay and covers the board it
+/// is supposed to sit on. Twelve is measured against the classic 24-row terminal:
+/// a one-row message plus [`MODAL_LIST_CHROME_ROWS`] plus two borders is six rows
+/// of chrome, so a full 12-row window lands an 18-row box that still leaves six
+/// rows of board visible around it. Whatever the cap, the terminal's own height
+/// clamps the box further ([`centered_rect`]) and [`modal_list_window`] scrolls the
+/// remainder into reach either way — this only decides how much is offered at once.
+const MODAL_LIST_MAX_ROWS: u16 = 12;
+
+/// Rows a modal's `Borders::ALL` block costs its content: one top, one bottom.
+/// Named because BOTH the height a modal asks for and the viewport
+/// [`render_modal`] derives back out of the clamped box subtract it, and the two
+/// must be the same number or the list window disagrees with the box drawing it.
+const MODAL_BORDER_ROWS: u16 = 2;
+
+/// The marker on a scrolled `List` modal's UPPER spacer row: rows exist above the
+/// window. An arrow rather than an ellipsis so the direction to press is the thing
+/// the glyph says.
+const MODAL_MORE_ABOVE: &str = "\u{2191}";
+/// The [`MODAL_MORE_ABOVE`] counterpart on the LOWER spacer row: rows exist below
+/// the window.
+const MODAL_MORE_BELOW: &str = "\u{2193}";
 
 /// Word-wrap `text` into lines no wider than `width` columns, breaking on
 /// whitespace; a single word longer than `width` is kept whole (it clips rather
@@ -2517,7 +2772,17 @@ fn render_interrupt_confirm(frame: &mut Frame, app: &App) {
 /// derived from the layout, preserving each overlay's original chrome: a `Row`
 /// reads as a warning/confirm (`Yellow`, `←/→ … Enter confirm`, centered), a
 /// `List` as a picker (`Cyan`, `↑/↓ … Enter draft`, left-aligned).
-fn render_modal(frame: &mut Frame, modal: &Modal) {
+///
+/// A `List` also SCROLLS, which is why this takes `&mut`: the box asks for at most
+/// [`MODAL_LIST_MAX_ROWS`] of list, [`centered_rect`] clamps even that on a short
+/// terminal, and [`modal_list_window`] then resolves which slice of the choices the
+/// surviving rows show — writing the resolved offset back onto the modal the way
+/// [`render_list`] writes back `App::scroll`, because only a render knows the
+/// viewport. Without it the box drew every choice top-down and a clamped height
+/// simply lost the tail: a picker's later rows were unreachable rather than
+/// scrolled, and both pickers grow with data (one row per defined agent, one per
+/// model alias) rather than being fixed-size.
+fn render_modal(frame: &mut Frame, modal: &mut Modal) {
     let (accent, footer) = match modal.layout {
         ModalLayout::Row => (
             Color::Yellow,
@@ -2537,6 +2802,24 @@ fn render_modal(frame: &mut Frame, modal: &Modal) {
     // border; the box height below counts the wrapped rows so the two agree.
     let message = wrap_message(&modal.message, MODAL_WIDTH.saturating_sub(2));
     let message_rows = message.len() as u16;
+
+    // The height the box ASKS for (message rows + chrome + borders; a list also
+    // grows with its entry count, up to the cap). `centered_rect` clamps it, and for
+    // a `List` the surviving rows are what the window below is measured against —
+    // so the height is resolved BEFORE the rows are built, not alongside them.
+    let height = match modal.layout {
+        ModalLayout::Row => message_rows
+            .saturating_add(MODAL_ROW_CHROME_ROWS)
+            .saturating_add(MODAL_BORDER_ROWS),
+        ModalLayout::List => u16::try_from(modal.choices.len())
+            .unwrap_or(u16::MAX)
+            .min(MODAL_LIST_MAX_ROWS)
+            .saturating_add(message_rows)
+            .saturating_add(MODAL_LIST_CHROME_ROWS)
+            .saturating_add(MODAL_BORDER_ROWS),
+    };
+    let area = centered_rect(frame.area(), MODAL_WIDTH, height);
+
     let mut lines: Vec<Line> = message
         .into_iter()
         .map(|l| {
@@ -2546,39 +2829,53 @@ fn render_modal(frame: &mut Frame, modal: &Modal) {
             ))
         })
         .collect();
-    lines.push(Line::from(""));
 
-    // The choices, plus the box height (message rows + chrome + borders; a list also
-    // grows with its entry count).
-    let height = match modal.layout {
+    match modal.layout {
         ModalLayout::Row => {
+            lines.push(Line::from(""));
             lines.push(Line::from(modal_button_row(&modal.choices, modal.selected)));
-            message_rows
-                .saturating_add(MODAL_ROW_CHROME_ROWS)
-                .saturating_add(2)
+            lines.push(Line::from(""));
         }
         ModalLayout::List => {
-            for (i, choice) in modal.choices.iter().enumerate() {
+            // How many choice rows the CLAMPED box actually has room for — the same
+            // subtraction the height was built from, run backwards.
+            let viewport = usize::from(
+                area.height
+                    .saturating_sub(message_rows)
+                    .saturating_sub(MODAL_LIST_CHROME_ROWS)
+                    .saturating_sub(MODAL_BORDER_ROWS),
+            );
+            let total = modal.choices.len();
+            modal.scroll = modal_list_window(total, modal.selected, viewport, modal.scroll);
+            let shown = total.min(modal.scroll.saturating_add(viewport)) - modal.scroll;
+            // The two spacers carry the overflow hint instead of being blank, so the
+            // affordance costs the box nothing.
+            lines.push(modal_more_line(MODAL_MORE_ABOVE, modal.scroll));
+            for (i, choice) in modal
+                .choices
+                .iter()
+                .enumerate()
+                .skip(modal.scroll)
+                .take(viewport)
+            {
                 lines.push(modal_list_row(
                     &choice.label,
                     choice.description.as_deref(),
                     i == modal.selected,
                 ));
             }
-            (modal.choices.len() as u16)
-                .saturating_add(message_rows)
-                .saturating_add(MODAL_LIST_CHROME_ROWS)
-                .saturating_add(2)
+            lines.push(modal_more_line(
+                MODAL_MORE_BELOW,
+                total.saturating_sub(modal.scroll.saturating_add(shown)),
+            ));
         }
-    };
+    }
 
-    lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         footer,
         Style::default().add_modifier(Modifier::DIM),
     )));
 
-    let area = centered_rect(frame.area(), MODAL_WIDTH, height);
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" {} ", modal.title));
@@ -2638,6 +2935,64 @@ fn modal_list_row(label: &str, description: Option<&str>, selected: bool) -> Lin
         ));
     }
     Line::from(spans)
+}
+
+/// Resolve a `List`-layout modal's scroll window: given `len` choices, the
+/// `selected` index, a `viewport` of that many drawable rows and the offset the
+/// modal is CURRENTLY scrolled to, return the index of the first row to draw.
+///
+/// The rule is ratatui `ListState`'s, which is the board list's rule (PATTERNS §5,
+/// via `render_list`) rather than a second scrolling idiom: keep the current offset
+/// wherever the selection is still inside it, and otherwise move by the least
+/// amount that brings the selection back — to the top when it sits above the
+/// window, to the bottom when it sits below. That is what makes SELECTION FOLLOW
+/// SCROLL: whatever `App::cycle_modal` picked, including a `rem_euclid` wrap from
+/// one end of the list to the other, the returned window contains it.
+///
+/// Total and saturating over every degenerate input, because the viewport is
+/// derived from a terminal the user can size freely: a `viewport` of 0 (a box with
+/// no room for a single row) answers 0 and draws nothing rather than underflowing,
+/// a `viewport` of 1 pins the window to the selection, a list SHORTER than the
+/// viewport answers 0 (there is nothing to scroll), and a `selected` past the end
+/// is clamped by the final `max_scroll` bound rather than trusted.
+///
+/// Pure, so the window arithmetic is unit-tested without a terminal.
+#[must_use]
+fn modal_list_window(len: usize, selected: usize, viewport: usize, current: usize) -> usize {
+    if viewport == 0 {
+        return 0;
+    }
+    let max_scroll = len.saturating_sub(viewport);
+    let mut scroll = current.min(max_scroll);
+    if selected < scroll {
+        scroll = selected;
+    } else if selected >= scroll.saturating_add(viewport) {
+        // `selected >= scroll + viewport >= viewport >= 1`, so this cannot wrap;
+        // saturating anyway keeps the fn total for a caller that hands in a
+        // `selected` past the end.
+        scroll = selected.saturating_sub(viewport).saturating_add(1);
+    }
+    scroll.min(max_scroll)
+}
+
+/// The dim `↑ N more` / `↓ N more` marker a scrolled `List` modal draws on the
+/// spacer row [`MODAL_LIST_CHROME_ROWS`] already reserves, or a blank line when
+/// nothing is off-window in that direction.
+///
+/// It costs the box no height at all — the spacer was there and blank — which is
+/// why the affordance is here rather than as a row of its own: a picker that had to
+/// grow to admit it would be fighting the very clamp this viewport exists to
+/// survive. Named ANSI arrows + `Modifier::DIM` only, no RGB and no raw escapes
+/// (TERMINAL-SAFE STYLING); the leading two spaces line the marker up with
+/// [`modal_list_row`]'s unselected indent so it reads as part of the list.
+fn modal_more_line(arrow: &str, hidden: usize) -> Line<'static> {
+    if hidden == 0 {
+        return Line::from("");
+    }
+    Line::from(Span::styled(
+        format!("  {arrow} {hidden} more"),
+        Style::default().add_modifier(Modifier::DIM),
+    ))
 }
 
 /// A centered `width`x`height` (cells) rect within `area`, clamped so it never
@@ -3102,6 +3457,92 @@ mod tests {
             app.project_head().as_deref(),
             Some(project_name(&app).as_str()),
             "and the one group head still reads exactly as the header does"
+        );
+    }
+
+    /// The sticky `Ctrl-X m` override is a standing fact, so the HEADER carries it
+    /// for as long as it is true — the status line could only announce the keypress
+    /// that set it (AGENTS.md STATUS-LINE OWNERSHIP).
+    ///
+    /// The absent case is the load-bearing half: with no override the header must
+    /// read exactly as it always has, since that is the same "invisible until used"
+    /// property the argv seam pins on its side.
+    #[test]
+    fn the_header_shows_an_active_model_override_and_nothing_without_one() {
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::CurrentFolder,
+            PathBuf::from("/tmp/launch"),
+        );
+
+        let bare = drawn_header(&app);
+        assert!(
+            !bare.contains("model"),
+            "an un-overridden board must not mention a model at all: {bare}"
+        );
+
+        app.set_model_override(Some("opusplan".to_string()));
+        let overridden = drawn_header(&app);
+        assert!(
+            overridden.contains("model: opusplan"),
+            "the active override must be named on the header: {overridden}"
+        );
+        // Everything the header already said is still there, in order — the segment
+        // is an insertion, not a replacement.
+        assert!(
+            overridden.contains("folder:launch") && overridden.contains("search: name"),
+            "the scope and search-mode segments survive: {overridden}"
+        );
+        let model_at = overridden.find("model:").expect("the segment is drawn");
+        let counts_at = overridden.find("sessions").expect("the counter is drawn");
+        assert!(
+            model_at < counts_at,
+            "the override goes AHEAD of the counter, where a narrow terminal keeps \
+             it: {overridden}"
+        );
+
+        app.set_model_override(None);
+        assert_eq!(
+            drawn_header(&app),
+            bare,
+            "clearing the override restores the byte-identical original header"
+        );
+    }
+
+    /// The segment is drawn for a VALUE, so it must never be drawn empty. Only
+    /// `--model ""` can ask for that (the picker offers no blank row), and the argv
+    /// seam emits no flag for it — a rendered `model: ` would announce an override
+    /// that changes nothing about the next hand-off.
+    ///
+    /// The alias at the end is the control: it proves the segment is suppressed by
+    /// the value being blank, not suppressed outright.
+    #[test]
+    fn a_blank_model_override_draws_no_header_segment() {
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::CurrentFolder,
+            PathBuf::from("/tmp/launch"),
+        );
+        let bare = drawn_header(&app);
+
+        app.set_model_override(Some(String::new()));
+        assert_eq!(
+            drawn_header(&app),
+            bare,
+            "an empty --model value leaves the header exactly as an unset one"
+        );
+
+        app.set_model_override(Some("   ".to_string()));
+        assert_eq!(
+            drawn_header(&app),
+            bare,
+            "whitespace-only is blank as well, not a model named with spaces"
+        );
+
+        app.set_model_override(Some("sonnet".to_string()));
+        assert!(
+            drawn_header(&app).contains("model: sonnet"),
+            "control: a real alias still draws the segment"
         );
     }
 
@@ -4005,6 +4446,103 @@ mod tests {
         assert_eq!(visual_to_content(&[0], 0), None, "a map of zero lines");
     }
 
+    /// A `MarkerLine` test fixture: `content_row` plus a distinguishing label so
+    /// a test can name which marker won without depending on styling.
+    fn marker(content_row: usize, label: &str) -> preview::MarkerLine {
+        preview::MarkerLine {
+            content_row,
+            line: Line::from(label.to_string()),
+        }
+    }
+
+    /// An UNWRAPPED [`wrapped_row_prefix`]-shaped map over `lines` logical lines —
+    /// every line occupies exactly one screen row, so a visual row and a content row
+    /// coincide 1:1 and these tests read as the OWNERSHIP rule alone. The wrapped
+    /// case is covered separately, against the real wrapper, by
+    /// `the_banner_tracks_the_top_turn_across_a_wrapped_table_row`.
+    fn flat_prefix(lines: usize) -> Vec<usize> {
+        (0..=lines).collect()
+    }
+
+    #[test]
+    fn marker_at_top_owns_the_last_marker_at_or_before_the_target_row() {
+        let markers = [marker(0, "m0"), marker(4, "m4"), marker(9, "m9")];
+        let prefix = flat_prefix(12);
+
+        // Exactly on a marker's own row.
+        assert_eq!(
+            marker_at_top(&markers, &prefix, 4).map(|l| l.to_string()),
+            Some("m4".to_string())
+        );
+        // A body row under a turn belongs to the marker that PRECEDES it, not
+        // the next one — this is the "turn ownership" the pinned banner relies
+        // on: scrolling to any row of a turn, not only its exact marker row,
+        // must still show that turn's marker.
+        assert_eq!(
+            marker_at_top(&markers, &prefix, 6).map(|l| l.to_string()),
+            Some("m4".to_string()),
+            "a row under a turn must resolve to that turn's marker, not the next one"
+        );
+        // Past the last marker's row: the last marker still owns every row
+        // after it (its own body).
+        assert_eq!(
+            marker_at_top(&markers, &prefix, 11).map(|l| l.to_string()),
+            Some("m9".to_string())
+        );
+    }
+
+    /// The lookup follows the MAP, so a turn whose lines WRAP is still owned by its
+    /// own marker at every one of its wrapped rows.
+    ///
+    /// The map below is one no `ceil(width / inner_width)` packing walk produces for
+    /// these lines: line 1 takes three rows, so the second turn's marker (content row
+    /// 2) opens at visual row 4. A width model that called line 1 two rows would
+    /// resolve visual row 4 to content row 3 and pin the SECOND turn one row early —
+    /// and the drift compounds with every wrapping line above, which is exactly the
+    /// bug this signature change removes.
+    #[test]
+    fn marker_at_top_follows_the_map_where_a_width_model_would_pin_the_wrong_turn() {
+        let markers = [marker(0, "first"), marker(2, "second")];
+        // line 0: 1 row, line 1: 3 wrapped rows, line 2 (the marker): 1 row, line 3: 1 row.
+        let prefix = [0usize, 1, 4, 5, 6];
+        for row in 0..4 {
+            assert_eq!(
+                marker_at_top(&markers, &prefix, row).map(|l| l.to_string()),
+                Some("first".to_string()),
+                "visual row {row} is still inside the FIRST turn's wrapped body"
+            );
+        }
+        assert_eq!(
+            marker_at_top(&markers, &prefix, 4).map(|l| l.to_string()),
+            Some("second".to_string()),
+            "row 4 is where the wrapper actually starts the second turn's marker"
+        );
+    }
+
+    #[test]
+    fn marker_at_top_falls_back_to_the_first_marker_above_every_one() {
+        // A target row that sits ABOVE the very first marker (the blank line
+        // that leads the first turn, e.g.) still resolves to the OPENING turn's
+        // marker rather than to nothing — there being nothing rendered before it.
+        let markers = [marker(2, "m2")];
+        assert_eq!(
+            marker_at_top(&markers, &flat_prefix(5), 0).map(|l| l.to_string()),
+            Some("m2".to_string())
+        );
+    }
+
+    #[test]
+    fn marker_at_top_is_none_with_no_markers_or_past_the_content() {
+        let prefix = flat_prefix(5);
+        assert_eq!(marker_at_top(&[], &prefix, 0), None, "no markers at all");
+        let markers = [marker(0, "m0")];
+        assert_eq!(
+            marker_at_top(&markers, &prefix, 99),
+            None,
+            "an offset past the end of the content has no owning row"
+        );
+    }
+
     /// A 20-wide inner pane at origin (1,1); most link tests share it.
     fn inner_rect() -> Rect {
         Rect {
@@ -4294,6 +4832,103 @@ mod tests {
         let clamped = centered_rect(tiny, 62, 7);
         assert_eq!((clamped.width, clamped.height), (20, 3));
         assert_eq!((clamped.x, clamped.y), (0, 0));
+    }
+
+    // --- the List modal's scroll window -----------------------------------
+
+    /// The whole window rule, stated as arithmetic: the offset is KEPT while the
+    /// selection is inside it and moved by the least amount that brings it back
+    /// otherwise. Every case is one the modal can actually reach — `cycle_modal`
+    /// steps by one and WRAPS, so both ends are ordinary keystrokes, not edge cases.
+    #[test]
+    fn the_list_window_keeps_its_offset_until_the_selection_leaves_it() {
+        // A list that FITS never scrolls, whatever the caller asks for: there is
+        // nothing off-window, so an inherited offset must be discarded rather than
+        // blanking rows the box has room for.
+        assert_eq!(modal_list_window(3, 2, 10, 0), 0);
+        assert_eq!(modal_list_window(3, 0, 10, 7), 0);
+        assert_eq!(modal_list_window(10, 9, 10, 4), 0);
+
+        // Selection INSIDE the current window: the offset is untouched, which is
+        // what stops the list re-centring on every keypress.
+        assert_eq!(modal_list_window(20, 5, 5, 3), 3);
+        assert_eq!(modal_list_window(20, 7, 5, 3), 3);
+
+        // Selection ABOVE the window: scroll up exactly onto it.
+        assert_eq!(modal_list_window(20, 2, 5, 6), 2);
+
+        // Selection BELOW the window: scroll down the least that shows it, which
+        // puts it on the LAST visible row (`selected + 1 - viewport`).
+        assert_eq!(modal_list_window(20, 9, 5, 3), 5);
+
+        // Both ends, reached the way the wrap actually reaches them.
+        assert_eq!(modal_list_window(20, 0, 5, 12), 0, "top pins to zero");
+        assert_eq!(
+            modal_list_window(20, 19, 5, 0),
+            15,
+            "bottom pins to max_scroll = len - viewport"
+        );
+
+        // An offset past the end (a shrunken list) is clamped, never trusted.
+        assert_eq!(modal_list_window(20, 19, 5, 99), 15);
+    }
+
+    /// The degenerate viewports a freely-resized terminal produces. A short enough
+    /// box leaves ZERO rows for the list, and the arithmetic must answer rather than
+    /// underflow — `selected + 1 - viewport` is the subtraction that would.
+    #[test]
+    fn the_list_window_survives_a_viewport_of_zero_or_one() {
+        // Zero rows: nothing is drawable, so the answer is 0 and no subtraction
+        // happens at all.
+        assert_eq!(modal_list_window(20, 19, 0, 7), 0);
+        assert_eq!(modal_list_window(0, 0, 0, 0), 0);
+
+        // One row: the window IS the selection, from either direction.
+        assert_eq!(modal_list_window(20, 0, 1, 9), 0);
+        assert_eq!(modal_list_window(20, 9, 1, 0), 9);
+        assert_eq!(modal_list_window(20, 19, 1, 19), 19);
+
+        // An empty list cannot select anything; the window is still 0.
+        assert_eq!(modal_list_window(0, 0, 5, 3), 0);
+
+        // A `selected` past the end (defensive — `cycle_modal` keeps it in range)
+        // is bounded by `max_scroll` instead of running off it.
+        assert_eq!(modal_list_window(4, 99, 2, 0), 2);
+    }
+
+    /// The overflow marker is drawn ONLY when something is actually off-window, and
+    /// carries the count rather than a bare arrow — "there is more" is far less
+    /// useful than "there are seven more" when deciding whether to keep pressing.
+    #[test]
+    fn the_more_marker_appears_only_when_rows_are_off_window() {
+        let blank = modal_more_line(MODAL_MORE_ABOVE, 0);
+        assert_eq!(
+            blank
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>(),
+            "",
+            "nothing hidden means the spacer stays a spacer"
+        );
+
+        let more = modal_more_line(MODAL_MORE_BELOW, 7);
+        let text = more
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains('7'), "the marker names the count: {text:?}");
+        assert!(
+            text.contains(MODAL_MORE_BELOW),
+            "and the direction to press: {text:?}"
+        );
+        assert!(
+            more.spans
+                .iter()
+                .all(|s| s.style.add_modifier.contains(Modifier::DIM)),
+            "the marker is chrome, not a choice"
+        );
     }
 
     // --- search-match highlight run splitting -----------------------------
@@ -5494,7 +6129,10 @@ mod tests {
     /// `● claude` **cooking…** placeholder. The placeholder no longer depends on the
     /// agents poll; it reads `cooking…` before and after claude reports working.
     /// The `▶ you` echo drops the instant the real turn lands on disk; when the send
-    /// finishes the banner yields back to the agent status.
+    /// finishes the banner is no longer suppressed and the pinned row returns to
+    /// its normal content — the marker of the turn under the top of the viewport —
+    /// with the agent status reaching it only as the fallback for a transcript with
+    /// no marker at all.
     #[test]
     fn an_in_flight_send_renders_inline_and_suppresses_the_banner() {
         use super::super::app::Sending;
@@ -5519,8 +6157,13 @@ mod tests {
         );
         app.selected = Some("sess-normal-1".to_string());
 
-        // Nothing in flight and no reported agent -> no banner, no inline tail.
-        assert!(preview_banner(&app).is_none());
+        // Nothing in flight -> no inline tail, and the pinned row IS reserved even
+        // though claude reports no agent for this session: the reservation keys on
+        // the selection, so the suppression below is suppressing a real row.
+        assert!(
+            preview_banner(&app).is_some(),
+            "an unreported selected session still reserves its pinned row"
+        );
         assert!(sending_tail(&app, 80).is_none());
 
         // In flight, nothing on disk yet (msg_count still the baseline) -> the
@@ -5579,7 +6222,10 @@ mod tests {
             "the pending claude placeholder stays until the send finishes: {tail:?}"
         );
 
-        // Send done -> no inline tail; the banner yields back to the agent status.
+        // Send done -> no inline tail, and the banner is no longer suppressed. What
+        // `render_preview` finally draws in that row is the marker of the turn under
+        // the top of the viewport; the agent status returned here reaches the screen
+        // only as the fallback for a transcript with no marker at all.
         app.sending = None;
         assert!(sending_tail(&app, 80).is_none());
         let banner = preview_banner(&app).expect("the reported agent still has a banner");
@@ -5742,8 +6388,10 @@ mod tests {
         // Recompute the same wrapped-height math `render_preview` uses, from
         // the (now cached) preview text, to confirm this viewport genuinely
         // overflows and to know the exact bottom-pinned offset independent of
-        // this fixture's specific turn count.
-        let inner_height = height - 2;
+        // this fixture's specific turn count. The scrollbar spans the
+        // TRANSCRIPT's rows, beneath the pinned banner row.
+        let transcript = transcript_rect(&app, width, height);
+        let inner_height = transcript.height;
         let content_h = content_height(&mut app, width);
         assert!(
             content_h > usize::from(inner_height),
@@ -5757,11 +6405,11 @@ mod tests {
         );
 
         // The thumb's bottom-most cell sits one row above the down arrow
-        // (`↓`), which itself sits one row above the block's bottom border:
-        // height-1 (border) - 1 (down arrow) - 1 (last track row).
-        let begin_row = 1u16;
-        let end_row = height - 2;
-        let last_track_row = height - 3;
+        // (`↓`), which itself sits on the transcript's last row, just above the
+        // block's bottom border.
+        let begin_row = transcript.y;
+        let end_row = transcript.bottom() - 1;
+        let last_track_row = end_row - 1;
         let thumb_col = width - 1;
         let buffer = terminal.backend().buffer();
         let cell = buffer
@@ -5822,9 +6470,11 @@ mod tests {
             "Home must resolve to the very first offset"
         );
 
+        // The track spans the TRANSCRIPT's rows, beneath the pinned banner row.
+        let transcript = transcript_rect(&app, width, height);
         let thumb_col = width - 1;
-        let begin_row = 1u16;
-        let end_row = height - 2;
+        let begin_row = transcript.y;
+        let end_row = transcript.bottom() - 1;
         let buffer = terminal.backend().buffer();
         let begin_cell = buffer
             .cell((thumb_col, begin_row))
@@ -5858,11 +6508,12 @@ mod tests {
 
         // An extremely narrow pane (inner_width 1) inflates the fixture's
         // handful of short lines into hundreds of wrapped rows against a
-        // 6-row track (inner_height 8, minus the 2 reserved arrow rows) — the
-        // huge content_h/track_length ratio that exposed the old rounding bug
-        // (a tiny real scroll rounding straight back onto an edge track row).
+        // 6-row track (a transcript of 8 rows under the pinned banner row, minus
+        // the 2 reserved arrow rows) — the huge content_h/track_length ratio that
+        // exposed the old rounding bug (a tiny real scroll rounding straight back
+        // onto an edge track row).
         let width = 3u16;
-        let height = 10u16;
+        let height = 11u16;
         let mut terminal = Terminal::new(TestBackend::new(width, height))
             .expect("build an in-memory test terminal");
         terminal
@@ -5872,7 +6523,9 @@ mod tests {
             })
             .expect("render_preview must not panic on a narrow, tall viewport");
 
-        let inner_height = height - 2;
+        // The track spans the TRANSCRIPT's rows, beneath the pinned banner row.
+        let transcript = transcript_rect(&app, width, height);
+        let inner_height = transcript.height;
         let content_h = content_height(&mut app, width);
         let max_offset = (content_h - usize::from(inner_height)) as u32;
         assert!(
@@ -5883,10 +6536,10 @@ mod tests {
         );
 
         let thumb_col = width - 1;
-        let begin_row = 1u16;
-        let end_row = height - 2;
-        let first_track_row = 2u16;
-        let last_track_row = height - 3;
+        let begin_row = transcript.y;
+        let end_row = transcript.bottom() - 1;
+        let first_track_row = begin_row + 1;
+        let last_track_row = end_row - 1;
         let buffer = terminal.backend().buffer();
 
         for (row, label) in [(begin_row, "begin"), (end_row, "end")] {
@@ -6128,9 +6781,9 @@ mod tests {
     #[test]
     fn a_windowed_render_paints_what_the_whole_transcript_render_painted() {
         let (width, height) = WINDOW_PANE;
-        let inner = (width - 2, height - 2);
         let dir = unique_temp_dir("window-parity");
         let mut app = window_app(&dir);
+        let inner = (width - 2, transcript_rect(&app, width, height).height);
 
         let lines = app.preview_text(inner.0).lines;
         let prefix = wrapped_row_prefix(&lines, inner.0);
@@ -6150,7 +6803,7 @@ mod tests {
         // Past the end too: the clamp must still land the pane on the last page.
         for offset in 0..=(max_offset + 5) {
             app.preview_scroll = u32::try_from(offset).expect("a small test offset");
-            let drawn = inner_rows(&mut app, width, height);
+            let drawn = transcript_rows(&mut app, width, height);
             let expected = unwindowed_rows(
                 &lines,
                 u16::try_from(offset.min(max_offset)).expect("a small test offset"),
@@ -6177,9 +6830,9 @@ mod tests {
     #[test]
     fn an_offset_inside_a_wrapped_line_paints_that_line_from_the_right_row() {
         let (width, height) = WINDOW_PANE;
-        let inner = (width - 2, height - 2);
         let dir = unique_temp_dir("window-residual");
         let mut app = window_app(&dir);
+        let inner = (width - 2, transcript_rect(&app, width, height).height);
 
         let lines = app.preview_text(inner.0).lines;
         let prefix = wrapped_row_prefix(&lines, inner.0);
@@ -6194,7 +6847,7 @@ mod tests {
 
         app.preview_follow_bottom = false;
         app.preview_scroll = u32::try_from(offset).expect("a small test offset");
-        let drawn = inner_rows(&mut app, width, height);
+        let drawn = transcript_rows(&mut app, width, height);
 
         let at_line_start = unwindowed_rows(
             &lines,
@@ -6241,7 +6894,7 @@ mod tests {
         app.preview_follow_bottom = false;
         app.preview_scroll = u32::try_from(geometry.rows_above).expect("a small test offset");
 
-        let window = app.preview_window(inner_w, geometry.rows_above, height - 2);
+        let window = app.preview_window(inner_w, geometry.rows_above, geometry.inner_h);
         assert!(
             window.start > 0,
             "the drawn window must really start past line 0, or the absolute-index \
@@ -6279,9 +6932,12 @@ mod tests {
     #[test]
     fn the_scrollbar_describes_the_whole_transcript_not_the_window() {
         let (width, height) = WINDOW_PANE;
-        let inner_h = height - 2;
         let dir = unique_temp_dir("window-scrollbar");
         let mut app = window_app(&dir);
+        // The scrollbar spans the TRANSCRIPT's rows, beneath the pinned banner row.
+        let transcript = transcript_rect(&app, width, height);
+        let inner_h = transcript.height;
+        let end_row = transcript.bottom() - 1;
 
         let content_h = content_height(&mut app, width);
         let max_offset = content_h - usize::from(inner_h);
@@ -6292,7 +6948,7 @@ mod tests {
         );
 
         // Track rows, excluding the two reserved boundary-arrow slots.
-        let track = 2..height - 2;
+        let track = transcript.y + 1..end_row;
         let thumb_rows = |buffer: &ratatui::buffer::Buffer| -> Vec<u16> {
             track
                 .clone()
@@ -6314,7 +6970,7 @@ mod tests {
              window-sized scrollbar would fill it; thumb rows: {thumb:?}"
         );
         assert_eq!(
-            middle.cell((width - 1, height - 2)).map(|c| c.symbol()),
+            middle.cell((width - 1, end_row)).map(|c| c.symbol()),
             Some(SCROLLBAR_ARROW_HIDDEN),
             "the end arrow belongs to the transcript's bottom, not the window's"
         );
@@ -6324,7 +6980,7 @@ mod tests {
         app.preview_scroll = u32::try_from(max_offset).expect("a small test offset");
         let bottom = preview_buffer(&mut app, width, height);
         assert_eq!(
-            bottom.cell((width - 1, height - 2)).map(|c| c.symbol()),
+            bottom.cell((width - 1, end_row)).map(|c| c.symbol()),
             Some(SCROLLBAR_END_ARROW),
             "only the whole transcript's last page may show the end arrow"
         );
@@ -6406,19 +7062,16 @@ mod tests {
             app.preview_scroll > 0,
             "the fixture must overflow the pane, or nothing here is windowed"
         );
+        // The TRANSCRIPT's rect — beneath the pinned banner row — which is what the
+        // click hit-test resolves against.
+        let inner = transcript_rect(&app, width, height);
         let offset = usize::try_from(app.preview_scroll).expect("a small test offset");
         assert!(
-            app.preview_window(inner_w, offset, height - 2).start > 0,
+            app.preview_window(inner_w, offset, inner.height).start > 0,
             "the drawn window must really start past line 0, or an absolute offset \
              and a window-relative one are indistinguishable"
         );
 
-        let inner = Rect {
-            x: 1,
-            y: 1,
-            width: inner_w,
-            height: height - 2,
-        };
         let (col, row) = (inner.y..inner.bottom())
             .flat_map(|y| (inner.x..inner.right()).map(move |x| (x, y)))
             .find(|&(x, y)| {
@@ -6560,12 +7213,9 @@ mod tests {
             "the fixture must overflow the pane, or nothing here is scrolled"
         );
 
-        let inner = Rect {
-            x: 1,
-            y: 1,
-            width: inner_w,
-            height: height - 2,
-        };
+        // The TRANSCRIPT's rect — beneath the pinned banner row — which is what the
+        // click hit-test resolves against.
+        let inner = transcript_rect(&app, width, height);
         let (col, row) = (inner.y..inner.bottom())
             .flat_map(|y| (inner.x..inner.right()).map(move |x| (x, y)))
             .find(|&(x, y)| {
@@ -6735,7 +7385,11 @@ mod tests {
     /// inner geometry, the transcript, and where the target match sits in it.
     struct JumpGeometry {
         inner_w: u16,
+        /// The TRANSCRIPT's height — the viewport the jump is resolved against,
+        /// beneath any pinned banner row.
         inner_h: u16,
+        /// The screen row the transcript's first row is painted on.
+        top: u16,
         /// Rows the pane leaves ABOVE a jumped-to match.
         lead: usize,
         /// The whole transcript's wrapped height.
@@ -6751,10 +7405,13 @@ mod tests {
         lines: Vec<Line<'static>>,
     }
 
-    /// Measure the pane the jump is about to be asserted against.
+    /// Measure the pane the jump is about to be asserted against, in the state it
+    /// will be drawn in — so call it AFTER anything that moves the banner (an
+    /// in-flight reply gives the pinned row back to the transcript).
     fn jump_geometry(app: &mut App, (width, height): (u16, u16)) -> JumpGeometry {
         let inner_w = width - 2;
-        let inner_h = height - 2;
+        let transcript = transcript_rect(app, width, height);
+        let inner_h = transcript.height;
         let lines = app.preview_text(inner_w).lines;
         let target = app
             .preview_match_target()
@@ -6769,6 +7426,7 @@ mod tests {
         JumpGeometry {
             inner_w,
             inner_h,
+            top: transcript.y,
             lead: usize::from(inner_h / MATCH_JUMP_LEAD_DIVISOR),
             content_h: wrapped_text_rows(&lines, inner_w),
             target,
@@ -6853,7 +7511,7 @@ mod tests {
         );
 
         let drawn = preview_buffer(&mut app, width, height);
-        let row = row_text(&drawn, 1 + geo.lead as u16, width);
+        let row = row_text(&drawn, geo.top + geo.lead as u16, width);
         assert_eq!(
             row,
             first_wrapped_row(&geo.lines[geo.target], geo.inner_w),
@@ -7248,7 +7906,7 @@ mod tests {
         assert_eq!(
             row_text(
                 &preview_buffer(&mut app, width, height),
-                1 + geo.lead as u16,
+                geo.top + geo.lead as u16,
                 width
             ),
             first_wrapped_row(&geo.lines[earlier], geo.inner_w),
@@ -7308,8 +7966,10 @@ mod tests {
         let dir = unique_temp_dir("jump-sending");
         let (width, height) = JUMP_PANE;
         let mut app = jump_app(&dir);
+        // The send goes in FIRST: an in-flight reply gives the pinned row back to the
+        // transcript, and the geometry must describe the pane as it is drawn.
+        let tail_rows = send_in_flight(&mut app, "sess-jump-1", width - 2);
         let geo = jump_geometry(&mut app, JUMP_PANE);
-        let tail_rows = send_in_flight(&mut app, "sess-jump-1", geo.inner_w);
 
         // The tail must want a DIFFERENT offset than the jump, or nothing here can
         // tell the two apart.
@@ -7326,7 +7986,7 @@ mod tests {
         let first = preview_buffer(&mut app, width, height);
         assert_eq!(app.preview_scroll, parked, "frame N must honour the jump");
         assert_eq!(
-            row_text(&first, 1 + geo.lead as u16, width),
+            row_text(&first, geo.top + geo.lead as u16, width),
             matched_row,
             "frame N must park the matched line at the lead; drawn: {:?}",
             (0..height)
@@ -7343,7 +8003,7 @@ mod tests {
             "the next frame must not undo the jump the reader just asked for"
         );
         assert_eq!(
-            row_text(&second, 1 + geo.lead as u16, width),
+            row_text(&second, geo.top + geo.lead as u16, width),
             matched_row,
             "and must still be painting the matched line at the lead; drawn: {:?}",
             (0..height)
@@ -7387,8 +8047,10 @@ mod tests {
         let dir = unique_temp_dir("jump-scroll-back");
         let (width, height) = JUMP_PANE;
         let mut app = jump_app(&dir);
+        // The send goes in FIRST: an in-flight reply gives the pinned row back to the
+        // transcript, and the geometry must describe the pane as it is drawn.
+        let tail_rows = send_in_flight(&mut app, "sess-jump-1", width - 2);
         let geo = jump_geometry(&mut app, JUMP_PANE);
-        let tail_rows = send_in_flight(&mut app, "sess-jump-1", geo.inner_w);
         let bottom = bottom_offset(geo.content_h, tail_rows, geo.inner_h);
 
         // Spend the query's pending jump on a frame of its own, so what positions the
@@ -7437,7 +8099,7 @@ mod tests {
                 .map(|y| row_text(&landed, y, width))
                 .collect::<Vec<_>>()
         );
-        let top = row_text(&landed, 1, width);
+        let top = row_text(&landed, geo.top, width);
 
         // Claude writes the reply: the transcript GROWS under the pane. A pane that
         // had been handed back to the tail would ride down with it; this one was
@@ -7475,7 +8137,7 @@ mod tests {
             "scrolling to the end is not a subscription to whatever lands next"
         );
         assert_eq!(
-            row_text(&after, 1, width),
+            row_text(&after, geo.top, width),
             top,
             "so the reader keeps reading the row they were on; drawn: {:?}",
             (0..height)
@@ -7541,13 +8203,15 @@ mod tests {
              was never reached (was {chosen}, now {clamped})"
         );
         let held = preview_buffer(&mut app, wide, height);
-        let top = row_text(&held, 1, wide);
+        // The transcript's own top row, beneath the pinned banner row.
+        let transcript = transcript_rect(&app, wide, height);
+        let top = row_text(&held, transcript.y, wide);
 
         // The session gains turns — the only thing that can tell a pane parked on the
         // last row from one following the newest.
         const GROWN_TURNS: usize = JUMP_TURNS + 8;
         app.apply_sessions(vec![jump_session_of(&dir, "sess-jump-1", GROWN_TURNS)]);
-        let following = content_height(&mut app, wide) - usize::from(height - 2);
+        let following = content_height(&mut app, wide) - usize::from(transcript.height);
         assert!(
             following > clamped as usize,
             "the new turns must move the bottom, or a followed pane would sit still \
@@ -7559,7 +8223,7 @@ mod tests {
             "a resize is not a request to follow the newest turn"
         );
         assert_eq!(
-            row_text(&after, 1, wide),
+            row_text(&after, transcript.y, wide),
             top,
             "so the reader keeps reading the row they were on; drawn: {:?}",
             (0..height)
@@ -7598,11 +8262,13 @@ mod tests {
              was never reached (was {chosen}, now {clamped})"
         );
         let held = preview_buffer(&mut app, width, height);
-        let top = row_text(&held, 1, width);
+        // The transcript's own top row, beneath the pinned banner row.
+        let transcript = transcript_rect(&app, width, height);
+        let top = row_text(&held, transcript.y, width);
 
         // And the turns come back.
         app.apply_sessions(vec![jump_session_at(&dir, "sess-jump-1")]);
-        let following = content_height(&mut app, width) - usize::from(height - 2);
+        let following = content_height(&mut app, width) - usize::from(transcript.height);
         assert!(
             following > clamped as usize,
             "the restored turns must move the bottom, or a followed pane would sit \
@@ -7614,7 +8280,7 @@ mod tests {
             "a transcript changing height is not a request to follow the newest turn"
         );
         assert_eq!(
-            row_text(&after, 1, width),
+            row_text(&after, transcript.y, width),
             top,
             "so the reader keeps reading the row they were on; drawn: {:?}",
             (0..height)
@@ -7754,7 +8420,9 @@ mod tests {
     /// for.
     #[test]
     fn a_draft_card_carries_no_search_marks() {
-        let (width, height) = CARD_PANE;
+        // One row taller than `CARD_PANE`, so the bottom-anchored transcript window
+        // beneath the pinned banner row still reaches a line that says the query.
+        let (width, height) = (CARD_PANE.0, CARD_PANE.1 + PREVIEW_BANNER_ROWS);
         let mut app = App::new(
             vec![markable_session()],
             Scope::All,
@@ -7789,9 +8457,9 @@ mod tests {
 
     /// Preview pane size for the banner tests: narrow and SHORT enough that the
     /// `sample_session` fixture's transcript overflows it, which is the case the
-    /// banner has to survive (a reported session's transcript grows, and the
-    /// preview bottom-anchors by default). Each test re-asserts the overflow
-    /// rather than trusting this comment.
+    /// banner has to survive (a session's transcript grows, and the preview
+    /// bottom-anchors by default). Each test re-asserts the overflow rather than
+    /// trusting this comment.
     const BANNER_PANE: (u16, u16) = (80, 8);
 
     /// The sample session, optionally joined to a REPORTED agent carrying
@@ -7851,6 +8519,30 @@ mod tests {
             .collect()
     }
 
+    /// The transcript's rect inside a `(width, height)` preview pane drawn at the
+    /// origin, derived exactly as `render_preview` and `update`'s click hit-test
+    /// derive it — `preview_split` keyed on `preview_banner` — so a test states where
+    /// the transcript REALLY sits instead of assuming it owns the whole inner rect:
+    /// every selected session pins a banner row above it, and only a pane with no
+    /// session transcript on it (a draft card, an in-flight reply) gives that back.
+    fn transcript_rect(app: &App, width: u16, height: u16) -> Rect {
+        let pane = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        preview_split(pane, preview_banner(app).is_some()).1
+    }
+
+    /// Render the preview and return only the TRANSCRIPT's drawn rows, top to
+    /// bottom — [`inner_rows`] minus any pinned banner row above them.
+    fn transcript_rows(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        // Rows between the pane's top border and the transcript's first row.
+        let above = transcript_rect(app, width, height).y - 1;
+        inner_rows(app, width, height).split_off(usize::from(above))
+    }
+
     /// The wrapped height of `app`'s preview text at the pane's inner width — the
     /// very count `render_preview` scrolls against, read from the same cache — so a
     /// test can prove its fixture really overflows the viewport.
@@ -7880,8 +8572,9 @@ mod tests {
 
         let rows = inner_rows(&mut reported, width, height);
         assert_eq!(
-            rows[0], "bg needs input",
-            "a reported session must LEAD with its status banner in the default view"
+            rows[0], "\u{25cf} claude \u{b7} 10:00",
+            "a reported session must LEAD with its pinned banner row (the turn \
+             marker under the top of the viewport) in the default view"
         );
         assert!(
             reported.preview_scroll > 0,
@@ -7891,30 +8584,126 @@ mod tests {
 
         // The banner steals a row from the pane, not from the transcript's tail:
         // the newest line stays on the bottom row, so the transcript scrolls
-        // BENEATH the banner rather than being pushed down by it.
-        let mut plain = banner_app(None);
-        let plain_rows = inner_rows(&mut plain, width, height);
-        assert_eq!(
-            rows.last(),
-            plain_rows.last(),
-            "the newest transcript line must stay anchored to the pane's bottom row"
+        // BENEATH the banner rather than being pushed down by it. Read off the
+        // same cache the pane draws from rather than hardcoded.
+        let newest: String = reported
+            .preview_text(width - 2)
+            .lines
+            .last()
+            .expect("the fixture renders at least one line")
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            newest.chars().count() < usize::from(width - 2),
+            "the newest line must fit one row, or the bottom-row check proves nothing"
         );
-        assert_ne!(
-            plain_rows[0], "bg needs input",
-            "the baseline row must be real transcript, or this test proves nothing"
+        assert_eq!(
+            rows.last().map(String::as_str),
+            Some(newest.trim_end()),
+            "the newest transcript line must stay anchored to the pane's bottom row"
         );
         // The banner costs the transcript EXACTLY one row of viewport — no
         // silent gap under it, no second reserved row.
         assert_eq!(
             reported.preview_viewport_h,
-            plain.preview_viewport_h - 1,
+            inner_height - PREVIEW_BANNER_ROWS,
             "the pinned banner must cost the transcript exactly one row"
         );
     }
 
-    /// A FINISHED agent must keep its banner: the pane keys on REPORTED, not on
-    /// live, so a `done` session still leads with `bg done` rather than silently
-    /// losing the row the moment the agent wraps up.
+    /// A session claude does NOT report pins the SAME row a reported one does: the
+    /// row names the turn you are reading, which every transcript has, so the
+    /// reservation keys on the selection and never on claude's agent list. The two
+    /// panes must therefore be IDENTICAL, cell text for cell text — the same turn
+    /// marker pinned above the same bottom-anchored transcript window.
+    ///
+    /// Left in the DEFAULT bottom-anchored state (never `preview_top()`), which is
+    /// the state a user sees and the one a prepended line would scroll away in.
+    #[test]
+    fn an_unreported_session_pins_the_same_turn_marker_row_as_a_reported_one() {
+        let (width, height) = BANNER_PANE;
+        let mut unreported = banner_app(None);
+        assert!(
+            unreported.reported_agent("sess-normal-1").is_none(),
+            "the session must really be unreported, or this is the reported case"
+        );
+        assert!(
+            unreported.preview_follow_bottom,
+            "the preview must be bottom-anchored by default, or this test proves nothing"
+        );
+        let inner_height = height - 2;
+        let content_h = content_height(&mut unreported, width);
+        assert!(
+            content_h > usize::from(inner_height),
+            "the fixture must overflow the pane, or this test proves nothing \
+             (content_h={content_h}, inner_height={inner_height})"
+        );
+
+        let rows = inner_rows(&mut unreported, width, height);
+        assert_eq!(
+            rows[0], "\u{25cf} claude \u{b7} 10:00",
+            "an unreported session must LEAD with the pinned turn marker under the \
+             top of the viewport: {rows:?}"
+        );
+        assert!(
+            unreported.preview_scroll > 0,
+            "the transcript must really be scrolled to the newest turn, not parked \
+             at the top where the marker would be row 0 for free"
+        );
+        assert_eq!(
+            unreported.preview_viewport_h,
+            inner_height - PREVIEW_BANNER_ROWS,
+            "the pinned row must cost the unreported transcript exactly one row"
+        );
+
+        let mut reported = banner_app(Some("blocked"));
+        assert_eq!(
+            rows,
+            inner_rows(&mut reported, width, height),
+            "whether claude reports the session must not change the pane at all"
+        );
+    }
+
+    /// An UNREPORTED session whose transcript has no marker to pin still reserves
+    /// the row — the geometry the hit-test derives from `preview_banner` alone — and
+    /// leaves it BLANK: there is no reported status to fall back to, and the pane
+    /// must not claim that nothing is selected when something is.
+    #[test]
+    fn an_unreported_marker_less_transcript_reserves_a_blank_pinned_row() {
+        let (width, height) = BANNER_PANE;
+        let mut session = sample_session();
+        session.file = empty_transcript_fixture();
+        let mut app = App::new(vec![session], Scope::All, PathBuf::from("/tmp/launch"));
+        assert!(
+            app.preview_text(width - 2).lines.is_empty(),
+            "the fixture must render an EMPTY transcript for this test to reach \
+             the marker-less fallback"
+        );
+        assert!(app.reported_agent("sess-normal-1").is_none());
+
+        let rows = inner_rows(&mut app, width, height);
+        assert_eq!(
+            app.preview_viewport_h,
+            height - 2 - PREVIEW_BANNER_ROWS,
+            "the row is reserved even with nothing to show in it"
+        );
+        assert_eq!(rows[0], "", "no marker and no reported status: a blank row");
+        assert!(
+            !rows.iter().any(|row| row.contains("No session selected.")),
+            "a SELECTED session must never fall through to the nothing-selected \
+             placeholder: {rows:?}"
+        );
+    }
+
+    /// A FINISHED agent must keep its banner: the pane keys on the selection, never
+    /// on live, so a `done` session still leads with its pinned banner row (the
+    /// turn marker under the top of the viewport) rather than silently losing
+    /// the row the moment the agent wraps up. `done` vs `blocked` only picks
+    /// which bucket `ReportedAgent` falls in — neither the transcript nor the
+    /// resolved offset depends on it — so this renders the exact same marker
+    /// text as the bottom-anchored default proven above.
     ///
     /// Guards the seam that liveness's corrected semantics could plausibly have
     /// broken — gating the BANNER on liveness (instead of only Enter's routing)
@@ -7926,7 +8715,7 @@ mod tests {
 
         let rows = inner_rows(&mut app, width, height);
         assert_eq!(
-            rows[0], "bg done",
+            rows[0], "\u{25cf} claude \u{b7} 10:00",
             "a reported-but-finished session must still show its banner"
         );
     }
@@ -8026,6 +8815,649 @@ mod tests {
         assert_eq!(text, "bg compacting");
     }
 
+    // --- sticky banner: the turn marker in every scroll state, including
+    // bottom-anchored ----------------------------------------------------------
+
+    /// The pinned banner row always shows the marker `Line` of whichever turn
+    /// sits at the TOP of the viewport — in EVERY scroll state, including the
+    /// default bottom-anchored one (re-armed on every selection change), not
+    /// only once the user scrolls away. It live-updates as they keep
+    /// scrolling, and keeps tracking the (different) turn now at the top once
+    /// they return to the bottom (`End`, which re-arms `preview_follow_bottom`).
+    ///
+    /// Row positions are looked up directly off the SAME cache `render_preview`
+    /// draws from (`app.preview_text`), rather than hardcoded, so this cannot
+    /// silently start proving nothing if the fixture's wording ever changes.
+    /// The pane is 80 columns wide (none of this short fixture's lines
+    /// soft-wrap at that width, so a content row and its visual row coincide
+    /// exactly) and only 5 rows tall — short enough that `max_offset` reaches
+    /// the transcript's LAST turn, so the scroll journey below exercises real,
+    /// reachable offsets rather than ones the clamp would shorten first.
+    #[test]
+    fn scrolling_away_from_the_bottom_swaps_the_banner_to_the_turn_marker_under_it() {
+        let width = 80u16;
+        let height = 5u16;
+        let inner_width = width - 2;
+        let mut app = banner_app(Some("blocked"));
+
+        // Bottom-anchored (the default): the pinned row already shows the
+        // turn marker under the top of the viewport, exactly as it will once
+        // the user scrolls away — `friendly_status` no longer renders here in
+        // any state.
+        assert!(
+            app.preview_follow_bottom,
+            "a freshly selected session must start bottom-anchored"
+        );
+        let rows = inner_rows(&mut app, width, height);
+        assert_eq!(
+            rows[0], "\u{25b6} you \u{b7} 10:01",
+            "bottom-anchored must show the turn marker under the top of the viewport"
+        );
+
+        // Locate this fixture's two `you` turns and its one `claude` turn by
+        // their marker's own span (never a second span, which could be an
+        // annotation or a body line quoting the same words).
+        let rows_with_first_span = |app: &mut App, needle: &str| -> Vec<usize> {
+            app.preview_text(inner_width)
+                .lines
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| {
+                    l.spans
+                        .first()
+                        .is_some_and(|s| s.content.as_ref() == needle)
+                })
+                .map(|(i, _)| i)
+                .collect()
+        };
+        let you_rows = rows_with_first_span(&mut app, "\u{25b6} you");
+        let claude_rows = rows_with_first_span(&mut app, "\u{25cf} claude");
+        assert_eq!(you_rows.len(), 2, "the fixture has exactly two `you` turns");
+        assert_eq!(
+            claude_rows.len(),
+            1,
+            "the fixture has exactly one `claude` turn"
+        );
+        assert!(
+            you_rows[0] < claude_rows[0] && claude_rows[0] < you_rows[1],
+            "the turns must run you -> claude -> you, or the scroll journey below \
+             proves nothing about ownership: you={you_rows:?} claude={claude_rows:?}"
+        );
+
+        // Scroll away to the FIRST `you` turn's own row: the pinned row must
+        // swap to ITS marker.
+        app.preview_follow_bottom = false;
+        app.preview_scroll = u32::try_from(you_rows[0]).expect("a small test offset");
+        let rows = inner_rows(&mut app, width, height);
+        assert!(
+            rows[0].starts_with("\u{25b6} you"),
+            "scrolled to the first `you` turn, the pinned row must show its \
+             marker: {:?}",
+            rows[0]
+        );
+        assert!(!rows[0].contains("bg needs input"));
+
+        // Scroll further to the `claude` turn: the pinned row updates LIVE to
+        // the new turn under it.
+        app.preview_scroll = u32::try_from(claude_rows[0]).expect("a small test offset");
+        let rows = inner_rows(&mut app, width, height);
+        assert!(
+            rows[0].starts_with("\u{25cf} claude"),
+            "scrolled to the claude turn, the pinned row must follow: {:?}",
+            rows[0]
+        );
+
+        // Scroll to a BODY row of that same claude turn (one row past its own
+        // marker, still short of the next `you` marker): the pinned row must
+        // still read the claude turn's marker — ownership by the turn, not by
+        // the exact marker row.
+        app.preview_scroll = u32::try_from(claude_rows[0] + 1).expect("a small test offset");
+        assert!(
+            app.preview_scroll < u32::try_from(you_rows[1]).expect("a small test offset"),
+            "the probed body row must still belong to the claude turn"
+        );
+        let rows = inner_rows(&mut app, width, height);
+        assert!(
+            rows[0].starts_with("\u{25cf} claude"),
+            "a body row still belongs to the turn whose marker precedes it: {:?}",
+            rows[0]
+        );
+
+        // Scroll to the SECOND `you` turn.
+        app.preview_scroll = u32::try_from(you_rows[1]).expect("a small test offset");
+        let rows = inner_rows(&mut app, width, height);
+        assert!(
+            rows[0].starts_with("\u{25b6} you"),
+            "scrolled to the second `you` turn, the pinned row must follow: {:?}",
+            rows[0]
+        );
+
+        // Back to the bottom (`End`): follow-bottom re-arms and the banner
+        // reverts to the SAME marker the default bottom-anchored state opened
+        // with (the first `you` turn, unchanged by the scroll journey above).
+        app.preview_bottom();
+        assert!(app.preview_follow_bottom);
+        let rows = inner_rows(&mut app, width, height);
+        assert_eq!(
+            rows[0], "\u{25b6} you \u{b7} 10:01",
+            "returning to the bottom must revert the banner to the top-of-viewport marker"
+        );
+    }
+
+    /// A reported session whose transcript renders to EMPTY has no marker to
+    /// swap to, so even a (synthetic) non-bottom-anchored state must fall back
+    /// to `friendly_status` rather than blanking the pinned row.
+    #[test]
+    fn an_empty_transcript_has_no_marker_so_the_banner_stays_friendly_status() {
+        let (width, height) = BANNER_PANE;
+        let mut session = sample_session();
+        session.file = empty_transcript_fixture();
+        let mut app = App::new(vec![session], Scope::All, PathBuf::from("/tmp/launch"));
+        let mut reported = HashMap::new();
+        reported.insert(
+            "sess-normal-1".to_string(),
+            ReportedAgent {
+                kind: "background".to_string(),
+                id: None,
+                state: Some("blocked".to_string()),
+                status: None,
+                name: None,
+            },
+        );
+        app.set_reported_agents(reported);
+        assert!(
+            app.preview_text(width - 2).lines.is_empty(),
+            "the fixture must render an EMPTY transcript for this test to reach \
+             the seam it targets"
+        );
+
+        // Not a reachable state through real scroll keys (there is nothing to
+        // scroll), but forcing it proves the fallback rather than assuming it.
+        app.preview_follow_bottom = false;
+
+        let rows = inner_rows(&mut app, width, height);
+        assert_eq!(
+            rows[0], "bg needs input",
+            "no marker exists to pin to, so the banner must fall back to \
+             friendly_status: {rows:?}"
+        );
+    }
+
+    /// A reported `App` over a transcript WRITTEN BY THE TEST, so a banner case can
+    /// pick the transcript shape it needs (a wrap, a length) instead of taking
+    /// whatever `sample_session`'s fixture happens to have.
+    ///
+    /// The file is handed straight to a synthetic `Session` and lives outside the
+    /// discovery root, so it can never disturb `store`'s discovered/session counts
+    /// (the same discipline `empty_transcript_fixture` documents).
+    fn banner_app_over(jsonl: &str, tag: &str) -> App {
+        banner_app_over_labelled(jsonl, tag, &sample_session().label)
+    }
+
+    /// [`banner_app_over`] with the row's LABEL chosen as well, so a name-only query
+    /// for a word in the TRANSCRIPT can still keep the row on the board.
+    ///
+    /// The filter runs before any preview exists, and its haystack is built once at
+    /// construction — so a label miss deselects the session and leaves the pane with
+    /// nothing to draw at all, and a label set afterwards would never reach the index.
+    /// Same discipline as [`markable_session`].
+    fn banner_app_over_labelled(jsonl: &str, tag: &str, label: &str) -> App {
+        let dir = unique_temp_dir(tag);
+        let file = dir.join("sess-normal-1.jsonl");
+        std::fs::write(&file, jsonl).expect("write temp transcript");
+        let mut session = sample_session();
+        session.file = file;
+        session.label = label.to_string();
+        let mut app = App::new(vec![session], Scope::All, PathBuf::from("/tmp/launch"));
+        let mut reported = HashMap::new();
+        reported.insert(
+            "sess-normal-1".to_string(),
+            ReportedAgent {
+                kind: "background".to_string(),
+                id: None,
+                state: Some("blocked".to_string()),
+                status: None,
+                name: None,
+            },
+        );
+        app.set_reported_agents(reported);
+        app
+    }
+
+    /// The content rows whose line STARTS with `needle` as its own first span — a
+    /// turn's marker row, never a body line that merely quotes the same words.
+    fn marker_rows(app: &mut App, inner_width: u16, needle: &str) -> Vec<usize> {
+        app.preview_text(inner_width)
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| {
+                l.spans
+                    .first()
+                    .is_some_and(|s| s.content.as_ref() == needle)
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// What the pinned banner SHOULD read once the pane has resolved to wrapped row
+    /// `offset`, derived WITHOUT going through `marker_at_top`: the last turn marker
+    /// whose own FIRST SCREEN ROW — read off the cached prefix map via
+    /// `App::preview_rows_above` — is at or before `offset`, flattened to its drawn
+    /// text.
+    ///
+    /// An INDEPENDENT oracle on purpose. Asserting against a hardcoded string makes a
+    /// test that has to be re-guessed whenever a fixture's wording moves; asserting
+    /// against `marker_at_top` itself would let a bug in the lookup satisfy its own
+    /// expectation. This walks the map the other way — forward over every marker —
+    /// and so agrees with the binary search only when the search is right.
+    ///
+    /// The set it recognises is EXACTLY the two turn glyphs — a first span of
+    /// `▶ you` or `● claude`. A `# `-led summary head is deliberately OUTSIDE
+    /// it: `render_record`'s `Some("summary")` arm emits its whole `# {summary}` text
+    /// as that line's single first span, so equality against the two glyphs can never
+    /// reach it, and this oracle reads a summary-led transcript as beginning at its
+    /// first `▶ you` turn instead.
+    ///
+    /// Safe today only because nothing drives that shape: every caller of this oracle
+    /// builds its `App` through `banner_app_over`, and the JSONL those callers
+    /// generate holds `user` and `assistant` records only — never a `summary` one.
+    /// Offset 0 itself IS already probed, by
+    /// `the_banner_names_the_opening_turn_at_the_ctrl_t_jump_endpoint`; it is the
+    /// summary-LED transcript that no test pairs with it. (`sample_session`'s fixture
+    /// does lead with a summary, but the tests over it go through `banner_app`, which
+    /// never reaches this oracle.)
+    ///
+    /// So a failure that appears when probing offset 0 on a summary-led transcript is
+    /// THIS ORACLE's blind spot, not a production bug: the pane correctly pins the
+    /// summary head, which owns content row 0. Teach the filter that head — do NOT
+    /// "fix" `marker_owning_row` or the `Some("summary")` arm to agree with it.
+    ///
+    /// The path this shadows is covered where it is produced:
+    /// `RenderedPreview::markers` collects that head at `content_row: 0`, and
+    /// `collected_markers_address_their_rendered_rows_summary_head_included` in
+    /// `store::preview` holds it to the row it renders on.
+    fn banner_should_show(app: &mut App, inner_width: u16, offset: usize) -> String {
+        let lines = app.preview_text(inner_width).lines;
+        let markers: Vec<(usize, String)> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| {
+                l.spans.first().is_some_and(|s| {
+                    matches!(s.content.as_ref(), "\u{25b6} you" | "\u{25cf} claude")
+                })
+            })
+            .map(|(i, l)| (i, l.spans.iter().map(|s| s.content.as_ref()).collect()))
+            .collect();
+        let mut owning: Option<&(usize, String)> = None;
+        for candidate in &markers {
+            let first_row = app
+                .preview_rows_above(inner_width, candidate.0)
+                .expect("a marker row inside the transcript");
+            if first_row <= offset {
+                owning = Some(candidate);
+            }
+        }
+        // Above every marker, the opening turn still owns the pinned row.
+        owning
+            .or_else(|| markers.first())
+            .map(|(_, text)| text.clone())
+            .expect("the transcript must hold at least one turn marker")
+    }
+
+    /// Render at `(width, height)`, then assert the pinned row names the turn that
+    /// owns the offset the pane ACTUALLY resolved to.
+    ///
+    /// Reading the resolved offset back out of `App::preview_scroll` rather than
+    /// trusting the requested one is what makes this usable at the bottom of a
+    /// transcript: `clamp_preview_offset` caps a request past `content_h -
+    /// inner_height`, so a probe near the tail is drawn at a SMALLER offset than it
+    /// asked for — and the banner must agree with where the pane landed, not with
+    /// where the test pointed.
+    fn assert_banner_tracks(app: &mut App, width: u16, height: u16, requested: usize) {
+        app.preview_scroll = u32::try_from(requested).expect("a small test offset");
+        let rows = inner_rows(app, width, height);
+        let resolved = usize::try_from(app.preview_scroll).expect("a small resolved offset");
+        let expected = banner_should_show(app, width - 2, resolved);
+        assert_eq!(
+            rows[0], expected,
+            "asked for row {requested}, pane resolved to {resolved}; the banner must \
+             name the turn owning THAT row"
+        );
+        assert!(
+            !rows[0].contains("bg needs input"),
+            "the reported status must never render in the preview pane"
+        );
+    }
+
+    /// How many rendered lines the preview's tail cap used to keep before it was
+    /// deleted. Named here ONLY so the banner test below can prove its transcript
+    /// reaches past it — nothing in the renderer or the pane knows this number any
+    /// more (`store::preview`'s own suite names it separately, for the same reason).
+    const FORMER_TAIL_CAP: usize = 600;
+
+    /// How many turns the long-transcript case below writes. Sized so the rendered
+    /// transcript comfortably exceeds [`FORMER_TAIL_CAP`] (each turn costs a blank
+    /// line, a marker and a body line, so ~3 rows a turn).
+    const LONG_TRANSCRIPT_TURNS: usize = 400;
+
+    /// The pinned banner tracks the top-of-viewport turn on a transcript LONGER than
+    /// the tail cap that used to truncate the preview — including for turns that sat
+    /// ABOVE the old cut, whose markers the cap would have dropped outright.
+    ///
+    /// This is the regression the rebase onto the cap's removal is most likely to
+    /// introduce silently. The marker list is rebased by the running line offset
+    /// ALONE now; while the cap existed it was additionally shifted up by the cut and
+    /// filtered, and a resolution that kept that second rebase — or that kept pinning
+    /// markers to a capped `Text` — would still render a plausible banner for the
+    /// tail while naming the wrong turn (or nothing) for everything above it.
+    ///
+    /// Asserted at the TOP of the transcript on purpose: offset 0 is precisely the
+    /// region a 600-row cap removed.
+    #[test]
+    fn the_banner_tracks_the_top_turn_on_a_transcript_past_the_former_tail_cap() {
+        let (width, height) = BANNER_PANE;
+        let inner_width = width - 2;
+        let mut jsonl = String::new();
+        for turn in 0..LONG_TRANSCRIPT_TURNS {
+            jsonl.push_str(&format!(
+                r#"{{"type":"user","sessionId":"sess-normal-1","cwd":"/Users/me/project-alpha","timestamp":"2026-07-04T10:00:00.000Z","message":{{"role":"user","content":"ask number {turn}"}}}}"#
+            ));
+            jsonl.push('\n');
+            jsonl.push_str(&format!(
+                r#"{{"type":"assistant","sessionId":"sess-normal-1","cwd":"/Users/me/project-alpha","timestamp":"2026-07-04T10:00:05.000Z","message":{{"role":"assistant","content":"answer number {turn}"}}}}"#
+            ));
+            jsonl.push('\n');
+        }
+        let mut app = banner_app_over(&jsonl, "banner-long");
+
+        // The fixture must really outrun the former cap, or this proves nothing.
+        let content_lines = app.preview_line_count(inner_width);
+        assert!(
+            content_lines > FORMER_TAIL_CAP,
+            "the transcript must exceed the former {FORMER_TAIL_CAP}-line cap \
+             (got {content_lines} lines)"
+        );
+
+        let you_rows = marker_rows(&mut app, inner_width, "\u{25b6} you");
+        let claude_rows = marker_rows(&mut app, inner_width, "\u{25cf} claude");
+        assert_eq!(you_rows.len(), LONG_TRANSCRIPT_TURNS);
+        assert_eq!(claude_rows.len(), LONG_TRANSCRIPT_TURNS);
+        app.preview_follow_bottom = false;
+
+        // The turns a 600-row cap would have CUT: the opening ones, plus the last turn
+        // that still sat above the old cut. Each is probed at the screen row the
+        // wrapper starts its marker on, read off the same prefix map the pane draws by.
+        let above_the_cut: Vec<usize> = [you_rows[0], claude_rows[0], you_rows[1]]
+            .into_iter()
+            .map(|line| {
+                app.preview_rows_above(inner_width, line)
+                    .expect("a marker row inside the transcript")
+            })
+            .collect();
+        assert!(
+            above_the_cut.iter().all(|&row| row < FORMER_TAIL_CAP),
+            "the probed turns must sit ABOVE the former cut, or the cap's removal is \
+             not what is being tested: {above_the_cut:?}"
+        );
+        for row in above_the_cut {
+            assert_banner_tracks(&mut app, width, height, row);
+        }
+
+        // A turn in the MIDDLE, and the transcript's tail — so removing the cap did
+        // not simply move the breakage to the other end. The tail probe is past the
+        // scroll clamp on this short pane, which `assert_banner_tracks` handles by
+        // asserting against the offset the pane resolved to.
+        for line in [
+            claude_rows[LONG_TRANSCRIPT_TURNS / 2],
+            *claude_rows.last().expect("a claude turn"),
+        ] {
+            let row = app
+                .preview_rows_above(inner_width, line)
+                .expect("a marker row inside the transcript");
+            assert_banner_tracks(&mut app, width, height, row);
+        }
+    }
+
+    /// The banner resolves the top-of-viewport turn through the WRAPPER's own row map,
+    /// so a soft-wrapped GFM table row inside a turn cannot slide the banner onto a
+    /// neighbouring turn.
+    ///
+    /// The case that a per-line display-WIDTH model gets wrong: such a model derives a
+    /// line's height as `ceil(width / inner_width)`, which disagrees with
+    /// `WordWrapper` wherever the wrapper breaks on a word boundary instead — and a
+    /// wrapped table cell is exactly that. Every disagreement above the target row
+    /// shifts the resolved content row, so the banner names the turn before or after
+    /// the real one. Here the expected rows are read from the SAME cached prefix map
+    /// the pane draws by (`App::preview_rows_above`), so the assertion is "the banner
+    /// agrees with what was painted" rather than a hardcoded guess.
+    #[test]
+    fn the_banner_tracks_the_top_turn_across_a_wrapped_table_row() {
+        // A pane NARROWER than a floor-width grid for this table (3 * 10 + 2 * 3 = 36
+        // columns), so `render_table` takes the stacked-record fallback — where a
+        // table row is an ORDINARY logical line that the preview's own
+        // `Wrap { trim: false }` soft-wraps, and the fixed-width `─` rule between
+        // records overflows into several rows. That is the shape this test needs: a
+        // GRID fits every cell to the pane and so never soft-wraps, which is why the
+        // wide-pane version of this case cannot exercise the mapping at all.
+        let (width, height) = (26u16, 12u16);
+        let inner_width = width - 2;
+        let table = "| column one | column two | column three |\\n\
+             | --- | --- | --- |\\n\
+             | a deliberately long first cell that must soft wrap several times \
+             | a second cell that also runs well past the column width \
+             | a third cell of similar length to force more rows |";
+        let jsonl = format!(
+            "{}\n{}\n",
+            format_args!(
+                r#"{{"type":"assistant","sessionId":"sess-normal-1","cwd":"/Users/me/project-alpha","timestamp":"2026-07-04T10:00:00.000Z","message":{{"role":"assistant","content":"{table}"}}}}"#
+            ),
+            r#"{"type":"user","sessionId":"sess-normal-1","cwd":"/Users/me/project-alpha","timestamp":"2026-07-04T10:05:00.000Z","message":{"role":"user","content":"after the table"}}"#
+        );
+        let mut app = banner_app_over(&jsonl, "banner-table");
+
+        let claude_rows = marker_rows(&mut app, inner_width, "\u{25cf} claude");
+        let you_rows = marker_rows(&mut app, inner_width, "\u{25b6} you");
+        assert_eq!(claude_rows.len(), 1, "one claude turn carries the table");
+        assert_eq!(you_rows.len(), 1, "one user turn follows it");
+
+        let claude_first_row = app
+            .preview_rows_above(inner_width, claude_rows[0])
+            .expect("the claude marker is inside the transcript");
+        let you_first_row = app
+            .preview_rows_above(inner_width, you_rows[0])
+            .expect("the user marker is inside the transcript");
+
+        // The table must genuinely SOFT-WRAP, or this test degenerates into the
+        // unwrapped case the plain banner test already covers — and the width model it
+        // is here to rule out would agree with the wrapper. More screen rows than
+        // logical lines between the two markers is exactly that property.
+        let table_span = you_first_row - claude_first_row;
+        let table_lines = you_rows[0] - claude_rows[0];
+        assert!(
+            table_span > table_lines,
+            "the table must soft-wrap at this width, or the test proves nothing \
+             (span={table_span} rows over {table_lines} lines)"
+        );
+
+        app.preview_follow_bottom = false;
+
+        // EVERY wrapped row of the claude turn — its marker row through the last row
+        // of the wrapped table — still belongs to the claude turn, and the row the
+        // WRAPPER starts the user turn on (never one a `ceil(width / inner_width)`
+        // model would have guessed) is where the banner switches.
+        for row in claude_first_row..=you_first_row {
+            assert_banner_tracks(&mut app, width, height, row);
+        }
+    }
+
+    /// The cells of preview row `y` INSIDE the borders, as `(symbol, marked)` — the
+    /// drawn text paired with whether [`PREVIEW_MATCH_MODIFIER`] reached each cell.
+    ///
+    /// Reads the CELLS, not the model: a mark that never reached the terminal is not a
+    /// highlight (PATTERNS — assert drawn cells).
+    fn row_cells(buffer: &ratatui::buffer::Buffer, y: u16, width: u16) -> Vec<(String, bool)> {
+        (1..width - 1)
+            .filter_map(|x| buffer.cell((x, y)))
+            .map(|cell| {
+                (
+                    cell.symbol().to_string(),
+                    cell.modifier.contains(PREVIEW_MATCH_MODIFIER),
+                )
+            })
+            .collect()
+    }
+
+    /// The inner columns a `query` occurrence COVERS on a drawn row, derived from the
+    /// row's own symbols and the query string ALONE.
+    ///
+    /// An INDEPENDENT oracle, in the spirit of [`banner_should_show`]: it locates the
+    /// query in what was painted and reports the columns it spans, so neither
+    /// `highlight_matched_spans` nor the banner can satisfy its own expectation. Both
+    /// assumptions it rests on are ASSERTED rather than trusted — one cell per char
+    /// (a wide glyph would shift every column after it) and exactly one occurrence
+    /// (a second one would make the answer partial).
+    fn query_columns(cells: &[(String, bool)], query: &str) -> Vec<usize> {
+        let text: String = cells.iter().map(|(symbol, _)| symbol.as_str()).collect();
+        assert!(
+            cells.iter().all(|(symbol, _)| symbol.chars().count() == 1),
+            "this oracle maps one cell to one char: {text:?}"
+        );
+        assert_eq!(
+            text.matches(query).count(),
+            1,
+            "the query must occur exactly once on the probed row: {text:?}"
+        );
+        let at = text
+            .find(query)
+            .expect("an occurrence that was just counted");
+        let first = text[..at].chars().count();
+        (first..first + query.chars().count()).collect()
+    }
+
+    /// The columns of a drawn row the match emphasis actually reached.
+    fn marked_columns(cells: &[(String, bool)]) -> Vec<usize> {
+        cells
+            .iter()
+            .enumerate()
+            .filter_map(|(col, (_, marked))| marked.then_some(col))
+            .collect()
+    }
+
+    /// The drawn text of a row read by [`row_cells`], for assertion messages.
+    fn cells_text(cells: &[(String, bool)]) -> String {
+        cells
+            .iter()
+            .map(|(symbol, _)| symbol.as_str())
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    /// The word the marked-banner case searches for: it occurs in every `● claude`
+    /// turn marker — the very line the pinned banner reuses — and nowhere else on that
+    /// line (a bound handle of `@claude` is suppressed and a model id loses its
+    /// `claude-` vendor prefix, so neither can add a second occurrence).
+    const BANNER_MARKER_QUERY: &str = "claude";
+
+    /// How many turns the marked-banner case writes. Enough that the probed marker
+    /// sits well clear of the scroll clamp at the transcript's tail, so the pane
+    /// resolves to exactly the offset the probe asks for.
+    const MARKED_BANNER_TURNS: usize = 12;
+
+    /// A query that hits a TURN MARKER is marked in the PINNED BANNER exactly as it is
+    /// in the transcript row beneath it.
+    ///
+    /// The banner reuses an already-rendered marker `Line` while the drawn window
+    /// re-styles the lines it paints ([`highlight_matched_spans`]) — so reusing the
+    /// UNMARKED line put ONE line on screen in TWO appearances: marked in the
+    /// transcript, unmarked in the pinned row directly above it. Probed at the offset
+    /// that puts the marker on the viewport's TOP row, which is the state where both
+    /// copies are drawn at once and the disagreement is visible.
+    ///
+    /// Both rows are held to [`query_columns`] — an oracle derived from the drawn
+    /// symbols and the query alone — rather than to each other, so the agreement
+    /// cannot be satisfied by two surfaces being equally wrong. The transcript row is
+    /// asserted FIRST: without its marks there would be nothing for the banner to
+    /// agree with, and the test would pin nothing.
+    #[test]
+    fn the_banner_marks_a_marker_line_query_exactly_as_the_transcript_does() {
+        let (width, height) = BANNER_PANE;
+        let inner_width = width - 2;
+        let mut jsonl = String::new();
+        for turn in 0..MARKED_BANNER_TURNS {
+            jsonl.push_str(&format!(
+                r#"{{"type":"user","sessionId":"sess-normal-1","cwd":"/Users/me/project-alpha","timestamp":"2026-07-04T10:00:00.000Z","message":{{"role":"user","content":"ask number {turn}"}}}}"#
+            ));
+            jsonl.push('\n');
+            jsonl.push_str(&format!(
+                r#"{{"type":"assistant","sessionId":"sess-normal-1","cwd":"/Users/me/project-alpha","timestamp":"2026-07-04T10:00:05.000Z","message":{{"role":"assistant","content":"answer number {turn}"}}}}"#
+            ));
+            jsonl.push('\n');
+        }
+        // Through the real query funnel: it is what compiles the per-atom finders the
+        // marks are derived from, so a query assigned straight to the field would mark
+        // nothing. The label carries the word too, or the filter would drop the only
+        // row and leave the pane with nothing to draw.
+        let mut app = banner_app_over_labelled(
+            &jsonl,
+            "banner-marked",
+            &format!("{BANNER_MARKER_QUERY} answered every ask"),
+        );
+        app.push_query_str(BANNER_MARKER_QUERY);
+        assert!(
+            app.selected.is_some(),
+            "the query must keep the session on the board, or nothing is previewed"
+        );
+
+        // An EARLY claude turn, probed at the screen row the WRAPPER starts its marker
+        // on — read off the same cached prefix map the pane draws by.
+        let claude_rows = marker_rows(&mut app, inner_width, "\u{25cf} claude");
+        assert_eq!(claude_rows.len(), MARKED_BANNER_TURNS);
+        let probe = app
+            .preview_rows_above(inner_width, claude_rows[1])
+            .expect("a marker row inside the transcript");
+        // One frame FIRST, to consume the match jump the query change armed: it is a
+        // one-shot that would otherwise override the probe's offset on exactly the
+        // frame being measured.
+        let _ = preview_buffer(&mut app, width, height);
+        app.preview_follow_bottom = false;
+        app.preview_scroll = u32::try_from(probe).expect("a small test offset");
+
+        let drawn = preview_buffer(&mut app, width, height);
+        assert_eq!(
+            usize::try_from(app.preview_scroll).expect("a small resolved offset"),
+            probe,
+            "the pane must resolve to the probed row, or the marker is not its top row"
+        );
+        // Row 0 inside the borders is the pinned banner; row 1 is the transcript's
+        // first drawn row (see `preview_split`), which at this offset is the very
+        // marker line the banner reused.
+        let banner = row_cells(&drawn, 1, width);
+        let top = row_cells(&drawn, 2, width);
+        assert_eq!(
+            cells_text(&banner),
+            cells_text(&top),
+            "the pinned row and the transcript's first row must be the same line here"
+        );
+
+        let expected = query_columns(&top, BANNER_MARKER_QUERY);
+        assert_eq!(
+            marked_columns(&top),
+            expected,
+            "the transcript must mark the query on the marker line, or the banner has \
+             nothing to agree with: {:?}",
+            cells_text(&top)
+        );
+        assert_eq!(
+            marked_columns(&banner),
+            expected,
+            "and the pinned banner must mark the same columns — one line, ONE \
+             appearance: {:?}",
+            cells_text(&banner)
+        );
+    }
+
     /// The bordered preview block, as `render_preview` builds it. Shared with the
     /// geometry tests below so they measure against the REAL block rather than a
     /// look-alike.
@@ -8116,12 +9548,27 @@ mod tests {
     #[test]
     fn a_banner_less_preview_draws_byte_for_byte_what_one_blocked_paragraph_drew() {
         // The banner made `render_preview` draw the block and the transcript as
-        // two passes into two rects. For a session claude never reported that must
-        // still paint exactly the single `Paragraph::new(text).block(block)` it
-        // replaced — rebuilt here from ratatui's own widgets and compared cell by
-        // cell.
+        // two passes into two rects. A pane that reserves NO banner must still
+        // paint exactly the single `Paragraph::new(text).block(block)` it replaced
+        // — rebuilt here from ratatui's own widgets and compared cell by cell.
+        //
+        // Every selected session reserves the row now, so the one banner-less pane
+        // that still draws a transcript is an IN-FLIGHT quick reply: its inline
+        // echo turns take the banner's place, and the reference is the transcript
+        // with that same tail appended.
+        use super::super::app::Sending;
+
         let (width, height) = BANNER_PANE;
         let mut app = banner_app(None);
+        app.sending = Some(Sending {
+            session_id: "sess-normal-1".to_string(),
+            message: "please summarize this".to_string(),
+            baseline_msg_count: app.sessions[0].msg_count,
+        });
+        assert!(
+            preview_banner(&app).is_none(),
+            "an in-flight reply must reserve no banner, or this is the banner case"
+        );
         let mut actual = Terminal::new(TestBackend::new(width, height))
             .expect("build an in-memory test terminal");
         actual
@@ -8133,7 +9580,9 @@ mod tests {
 
         // The reference: one blocked, wrapped, scrolled paragraph over the WHOLE
         // pane, at the offset the render above resolved.
-        let text = app.preview_text(width - 2);
+        let mut text = app.preview_text(width - 2);
+        text.lines
+            .extend(sending_tail(&app, width - 2).expect("the reply is still in flight"));
         // Narrowed exactly as `render_preview` narrows it for `Paragraph::scroll`
         // (ratatui's `Position.y` is `u16`), so the reference paragraph is drawn
         // from the same value the pane under test handed the widget.
@@ -8158,8 +9607,8 @@ mod tests {
 
         // Every column but the rightmost, which is where the scrollbar draws its
         // own separate pass (the reference has none). That column is pinned
-        // cell-by-cell, for banner-less sessions, by the scrollbar-geometry tests
-        // above — so nothing here is left unasserted.
+        // cell-by-cell by the scrollbar-geometry tests above — so nothing here is
+        // left unasserted.
         let cells = |terminal: &Terminal<TestBackend>| -> Vec<(String, Style)> {
             let buffer = terminal.backend().buffer().clone();
             (0..height)
@@ -9555,7 +11004,8 @@ mod tests {
         for needle in [
             "x hide",
             "d delete row/lineage",
-            "h show/hide hidden",
+            "h hidden",
+            "m model",
             "r reload",
             "Esc cancel",
         ] {
@@ -9691,6 +11141,348 @@ mod tests {
             drawn.contains("Enter draft") && drawn.contains("^O interactive"),
             "the picker footer must name both Enter and Ctrl-O:\n{drawn}"
         );
+    }
+
+    /// Flatten a whole rendered board to one searchable string, rows joined by
+    /// newlines. The `List`-modal viewport tests below look for a SELECTED row's
+    /// `› label` — a two-token needle the highlight glyph makes specific to the
+    /// modal — so they need the screen, not one row.
+    fn drawn_screen(app: &mut App, width: u16, height: u16) -> String {
+        let buffer = drawn_board(app, width, height);
+        (0..height)
+            .map(|y| full_row_text(&buffer, y, width))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The `› ` needle that says a choice is BOTH drawn and highlighted — the same
+    /// marker [`modal_list_row`] gives a selected row.
+    fn selected_needle(app: &App) -> String {
+        let modal = app.modal.as_ref().expect("a modal is open");
+        format!("\u{203a} {}", modal.choices[modal.selected].label)
+    }
+
+    /// The viewport's whole point, swept over terminal height the way
+    /// `the_disclosing_delete_confirm_costs_one_row_and_keeps_cancel_default` sweeps
+    /// it: a `List` modal's SELECTED row is drawn at every height that has room for
+    /// a list row at all, not only on a terminal tall enough for the whole list.
+    ///
+    /// The picker's LAST row is selected, reached the way a user reaches it — one
+    /// `modal_prev` off the pre-highlight, which `cycle_modal` wraps to the end — so
+    /// the row under test is the one furthest from where a top-down draw starts. That
+    /// is exactly the row the old render lost: `centered_rect` clamps the box and
+    /// nothing scrolled, so on a short terminal the tail simply was not painted.
+    ///
+    /// The needle is derived from the modal rather than hard-coded, so the sweep
+    /// keeps testing the last row whatever the alias set is — which now varies at
+    /// RUNTIME, since the picker offers what the installed `claude` accepts and
+    /// falls back to the `app::MODEL_ALIASES` seed only until that probe lands. This
+    /// case is the SEED one (no probe delivered); the probed one is pinned below.
+    #[test]
+    fn a_short_terminal_still_draws_the_model_pickers_selected_row() {
+        /// Terminal heights the sweep covers. Seven is the shortest box that has a
+        /// single list row at all (one message row + `MODAL_LIST_CHROME_ROWS` +
+        /// `MODAL_BORDER_ROWS` = six rows of chrome), and twenty is comfortably
+        /// taller than the whole picker, so the sweep spans "scrolled to one row" to
+        /// "not scrolled at all".
+        const SWEEP: std::ops::RangeInclusive<u16> = 7..=20;
+
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.open_model_picker();
+        // Wrap onto the last alias — the row a top-down draw reaches last.
+        app.modal_prev();
+        let needle = selected_needle(&app);
+        let last = app.modal.as_ref().expect("the picker is open").selected;
+        assert_eq!(
+            last,
+            app.modal
+                .as_ref()
+                .expect("the picker is open")
+                .choices
+                .len()
+                - 1,
+            "the fixture must be on the LAST row"
+        );
+
+        for height in SWEEP {
+            let screen = drawn_screen(&mut app, 80, height);
+            assert!(
+                screen.contains(&needle),
+                "a {height}-row terminal must still draw the selected {needle:?}; \
+                 screen:\n{screen}"
+            );
+        }
+    }
+
+    /// The same sweep against the PROBED set, with `opusplan` pinned by name.
+    ///
+    /// Two things make this a different claim from the seed sweep above rather than
+    /// a copy of it. The probed list is TEN rows (nine aliases plus the synthetic
+    /// clear row) against the seed's six, so every terminal in the sweep below
+    /// sixteen rows genuinely scrolls. And `opusplan` — the alias this whole feature
+    /// exists to surface, since `claude --help` hides it — is LAST in the binary's
+    /// own array order, which the picker offers verbatim. It is therefore the FIRST
+    /// row a top-down draw with no viewport would lose, which is exactly why its
+    /// reachability is worth pinning by name and not only by "the selected row".
+    #[test]
+    fn the_probed_pickers_last_row_opusplan_is_reachable_on_a_short_terminal() {
+        /// Terminal heights the sweep covers — the seed sweep's range, so the two
+        /// cases are compared over the same terminals. Seven is the shortest box
+        /// with a single list row at all; twenty is taller than the whole picker.
+        const SWEEP: std::ops::RangeInclusive<u16> = 7..=20;
+        /// The alias array the installed `claude 2.1.233` accepts, in wire order —
+        /// stated here so this test needs no 290 MB binary. `opusplan` last is the
+        /// property under test, not an incidental detail of the fixture.
+        const PROBED: [&str; 9] = [
+            "sonnet",
+            "opus",
+            "haiku",
+            "fable",
+            "best",
+            "sonnet[1m]",
+            "opus[1m]",
+            "fable[1m]",
+            "opusplan",
+        ];
+
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.set_model_aliases(PROBED.iter().map(|a| (*a).to_string()).collect());
+        app.open_model_picker();
+        // Wrap onto the last alias — the row a top-down draw reaches last.
+        app.modal_prev();
+
+        let modal = app.modal.as_ref().expect("the picker is open");
+        assert_eq!(
+            modal.choices.len(),
+            PROBED.len() + 1,
+            "the probed picker is nine aliases plus the synthetic clear row"
+        );
+        assert_eq!(
+            modal.choices[modal.selected].label, "opusplan",
+            "opusplan must be the LAST row — that is what makes it the first one a \
+             viewport-less draw loses"
+        );
+        let needle = selected_needle(&app);
+
+        for height in SWEEP {
+            let screen = drawn_screen(&mut app, 80, height);
+            assert!(
+                screen.contains(&needle),
+                "a {height}-row terminal must still reach {needle:?}; screen:\n{screen}"
+            );
+        }
+    }
+
+    /// A probe that returns MORE aliases than the window holds must SCROLL, not clip.
+    ///
+    /// This stopped being hypothetical when the row count became upstream data:
+    /// nothing in snapback bounds how many aliases a future `claude` ships, and the
+    /// picker offers every one of them. Same shape as the agent-picker cap test, but
+    /// it has to be stated for the model picker too — that one is bounded by the
+    /// user's own agent files, this one by another program's release notes.
+    #[test]
+    fn a_probe_longer_than_the_cap_scrolls_the_model_picker_rather_than_clipping() {
+        /// Aliases the stated probe returns — comfortably past
+        /// `MODAL_LIST_MAX_ROWS`, so the CAP is what bounds the box.
+        const ALIASES: usize = 20;
+        /// A terminal tall enough to draw all of them, so nothing here is the
+        /// terminal clamp in disguise.
+        const TALL: u16 = 40;
+
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.set_model_aliases((0..ALIASES).map(|i| format!("model-{i:02}")).collect());
+        app.open_model_picker();
+        // +1 for the synthetic "default (settings)" row.
+        let total = ALIASES + 1;
+        let off_window = total - usize::from(MODAL_LIST_MAX_ROWS);
+        let last = format!("model-{:02}", ALIASES - 1);
+
+        // Opened at the top: the tail is off-window and the LOWER spacer says how
+        // much of it there is.
+        let screen = drawn_screen(&mut app, 80, TALL);
+        assert!(
+            !screen.contains(&last),
+            "the cap must stop the box growing with the probe's answer; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains(&format!("{MODAL_MORE_BELOW} {off_window} more")),
+            "and the spacer must disclose how many aliases are below; screen:\n{screen}"
+        );
+
+        // Wrap onto the last alias: it must be REACHABLE rather than clipped away.
+        app.modal_prev();
+        let needle = selected_needle(&app);
+        let screen = drawn_screen(&mut app, 80, TALL);
+        assert!(
+            screen.contains(&needle),
+            "the window must follow the selection onto {last}; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains(&format!("{MODAL_MORE_ABOVE} {off_window} more")),
+            "and disclose the aliases now above it; screen:\n{screen}"
+        );
+    }
+
+    /// The other half: a list LONGER than the cap is bounded on a tall terminal
+    /// too, and says so.
+    ///
+    /// The agent picker draws one row per user-defined agent, so it is unbounded by
+    /// data — twenty agents on a forty-row terminal used to draw a twenty-six-row box
+    /// over a board it is meant to overlay. `MODAL_LIST_MAX_ROWS` caps the window and
+    /// the spacer rows carry the count that is off-window, so the rows beyond it are
+    /// discoverable rather than merely absent.
+    #[test]
+    fn a_long_agent_picker_is_capped_and_says_how_many_rows_are_off_window() {
+        /// Agents in the fixture — comfortably past `MODAL_LIST_MAX_ROWS`, so the cap
+        /// is the thing under test rather than the terminal's height.
+        const AGENTS: usize = 20;
+        /// A terminal tall enough to draw all of them, so nothing here is the
+        /// terminal clamp in disguise.
+        const TALL: u16 = 40;
+
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.open_agent_picker(
+            (0..AGENTS)
+                .map(|i| DefinedAgent {
+                    name: format!("agent-{i:02}"),
+                    description: None,
+                })
+                .collect(),
+        );
+        // +1 for the synthetic "default (no agent)" row.
+        let total = AGENTS + 1;
+        let off_window = total - usize::from(MODAL_LIST_MAX_ROWS);
+
+        // A marker is `<arrow> <count> more`, so ask for it by SHAPE over every
+        // count it could carry. A bare `<arrow> ` needle would also match the
+        // picker's own `↑/↓ choose` footer and quietly never be able to go red.
+        let marker = |screen: &str, arrow: &str| {
+            (1..=total).any(|n| screen.contains(&format!("{arrow} {n} more")))
+        };
+
+        // Opened at the top: the tail is off-window and the LOWER spacer says how
+        // much of it there is.
+        let screen = drawn_screen(&mut app, 80, TALL);
+        assert!(
+            !screen.contains("agent-19"),
+            "the cap must stop the box growing with the agent count; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains(&format!("{MODAL_MORE_BELOW} {off_window} more")),
+            "and the spacer must disclose how many rows are below; screen:\n{screen}"
+        );
+        assert!(
+            !marker(&screen, MODAL_MORE_ABOVE),
+            "nothing is above the window at the top; screen:\n{screen}"
+        );
+
+        // Wrap onto the last agent: the window follows the selection, and now it is
+        // the HEAD of the list that is off-window.
+        app.modal_prev();
+        let needle = selected_needle(&app);
+        let screen = drawn_screen(&mut app, 80, TALL);
+        assert!(
+            screen.contains(&needle),
+            "the window must follow the selection to the last row; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains(&format!("{MODAL_MORE_ABOVE} {off_window} more")),
+            "and disclose the rows now above it; screen:\n{screen}"
+        );
+        assert!(
+            !marker(&screen, MODAL_MORE_BELOW),
+            "nothing is below the window at the bottom; screen:\n{screen}"
+        );
+    }
+
+    /// The offset is KEPT between frames rather than re-derived, which is what makes
+    /// the modal scroll like the board list instead of re-centring per keypress.
+    ///
+    /// Asserted through `Modal::scroll` after real renders, because that field is the
+    /// state the render writes back (`App::scroll`'s idiom) — a test that only read
+    /// the screen could not tell a kept offset from a recomputed one that happened to
+    /// agree.
+    #[test]
+    fn the_modal_scroll_offset_is_written_back_and_then_left_alone() {
+        /// Six rows of chrome plus four list rows, so the window is four of the
+        /// picker's rows and moving within it must not scroll.
+        const SHORT: u16 = 10;
+
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.open_model_picker();
+        let total = app
+            .modal
+            .as_ref()
+            .expect("the picker is open")
+            .choices
+            .len();
+        assert!(
+            total > 4,
+            "the fixture needs more rows than the 4-row window"
+        );
+
+        let scroll_now = |app: &App| app.modal.as_ref().expect("open").scroll;
+
+        // Row 0 selected: nothing above it, so the window sits at the top.
+        drawn_screen(&mut app, 80, SHORT);
+        assert_eq!(scroll_now(&app), 0, "a top selection needs no scroll");
+
+        // Step down INSIDE the window: the offset must not move.
+        app.modal_next();
+        drawn_screen(&mut app, 80, SHORT);
+        assert_eq!(
+            scroll_now(&app),
+            0,
+            "moving inside the window keeps it still"
+        );
+
+        // Step past the bottom: the offset moves by exactly one.
+        for _ in 1..4 {
+            app.modal_next();
+        }
+        drawn_screen(&mut app, 80, SHORT);
+        assert_eq!(
+            scroll_now(&app),
+            1,
+            "leaving the window scrolls the least that brings the row back"
+        );
+
+        // Down to the last row: the offset stops at `len - viewport`.
+        for _ in 4..total - 1 {
+            app.modal_next();
+        }
+        drawn_screen(&mut app, 80, SHORT);
+        assert_eq!(
+            scroll_now(&app),
+            total - 4,
+            "the bottom pins the window to max_scroll"
+        );
+
+        // One more press WRAPS to row 0 — a single keystroke crossing the whole
+        // list, which is the move a window that only ever nudged by one would lose.
+        app.modal_next();
+        drawn_screen(&mut app, 80, SHORT);
+        assert_eq!(scroll_now(&app), 0, "the wrap pins the window back to zero");
     }
 
     #[test]
@@ -9836,8 +11628,11 @@ mod tests {
     /// `app::delete_confirm_message` quotes.
     ///
     /// The added sentence costs exactly ONE wrapped row (4 → 5), so the `Row` box
-    /// grows 10 → 11. `centered_rect` CLAMPS that height and `render_modal` draws
-    /// top-down with no vertical scroll, so the extra row pushes the button strip
+    /// grows 10 → 11. `centered_rect` CLAMPS that height and `render_modal` draws a
+    /// `Row` top-down with no vertical scroll — only the `List` layout scrolls
+    /// ([`modal_list_window`]), and deliberately so: a button strip is fixed chrome
+    /// the user cannot page through, where a picker's rows are data — so the extra
+    /// row pushes the button strip
     /// and the `Esc cancel` footer off a short terminal one row sooner than the
     /// non-disclosing confirm did: the strip needs 9 rows where it needed 8, the
     /// footer 11 where it needed 10.
@@ -9942,7 +11737,7 @@ mod tests {
 
         let narrowest_whole_cancel = |lineage_label: &str| -> Option<u16> {
             (20u16..=70).find(|&w| {
-                let modal = Modal {
+                let mut modal = Modal {
                     title: "delete session".to_string(),
                     message: message.clone(),
                     layout: ModalLayout::Row,
@@ -9956,11 +11751,12 @@ mod tests {
                         .collect(),
                     selected: 2,
                     session_id: None,
+                    scroll: 0,
                 };
                 let mut terminal =
                     Terminal::new(TestBackend::new(w, 24)).expect("build a test terminal");
                 terminal
-                    .draw(|frame| render_modal(frame, &modal))
+                    .draw(|frame| render_modal(frame, &mut modal))
                     .expect("render must not panic at any width");
                 let buffer = terminal.backend().buffer().clone();
                 (0..24u16)
@@ -10821,6 +12617,153 @@ mod tests {
             !scell.modifier.contains(Modifier::DIM),
             "a non-hidden row's label must not be dimmed, got {:?}",
             scell.modifier
+        );
+    }
+
+    /// How many short turns lead the `Ctrl-T`/`Ctrl-E` endpoint transcript, before
+    /// the long final turn. Enough that the top and bottom viewports cannot overlap.
+    const ENDPOINT_LEAD_TURNS: usize = 6;
+
+    /// A transcript for the jump-endpoint cases: [`ENDPOINT_LEAD_TURNS`] short
+    /// user/assistant pairs, then ONE assistant turn whose body outruns the pane.
+    ///
+    /// That last turn is what makes the bottom endpoint's claim sharp. With a short
+    /// tail the final viewport opens some rows before the last marker and the banner
+    /// would name whichever turn happens to straddle that row — true, but it would
+    /// pass just as well if the lookup were off by a turn. A tail TALLER than the
+    /// viewport puts the clamped bottom offset strictly INSIDE the last turn, so
+    /// "the banner names the last turn" is the only correct answer.
+    fn endpoint_jsonl() -> String {
+        let mut jsonl = String::new();
+        for turn in 0..ENDPOINT_LEAD_TURNS {
+            jsonl.push_str(&format!(
+                r#"{{"type":"user","sessionId":"sess-normal-1","cwd":"/Users/me/project-alpha","timestamp":"2026-07-04T10:00:00.000Z","message":{{"role":"user","content":"ask number {turn}"}}}}"#
+            ));
+            jsonl.push('\n');
+            jsonl.push_str(&format!(
+                r#"{{"type":"assistant","sessionId":"sess-normal-1","cwd":"/Users/me/project-alpha","timestamp":"2026-07-04T10:00:05.000Z","message":{{"role":"assistant","content":"answer number {turn}"}}}}"#
+            ));
+            jsonl.push('\n');
+        }
+        // The tall final turn: many separate lines, so its height comes from the
+        // transcript's own line count rather than from a wrap this pane might undo.
+        let tall = (0..BANNER_PANE.1 * 2)
+            .map(|line| format!("tail line {line}"))
+            .collect::<Vec<_>>()
+            .join("\\n");
+        jsonl.push_str(&format!(
+            r#"{{"type":"assistant","sessionId":"sess-normal-1","cwd":"/Users/me/project-alpha","timestamp":"2026-07-04T10:10:00.000Z","message":{{"role":"assistant","content":"{tall}"}}}}"#
+        ));
+        jsonl.push('\n');
+        jsonl
+    }
+
+    /// `Ctrl-T` (and `Home`, its twin) parks the pinned banner on the OPENING turn.
+    ///
+    /// `Action::PreviewTop` drives `preview_scroll` straight to 0, which is the one
+    /// offset that lands ABOVE every marker — the blank row leading the first turn —
+    /// so the banner's turn comes from `marker_owning_row`'s `.or_else(markers.first())`
+    /// fall-through rather than from its reverse scan. This asserts the DRAWN row at
+    /// that endpoint, because the fall-through compiles and renders perfectly while
+    /// naming nothing (or the wrong turn) if it is ever dropped. The keypress half —
+    /// `Ctrl-T` reaching `Action::PreviewTop` at all — is
+    /// `update::tests::preview_scroll_keys_act_regardless_of_query`.
+    #[test]
+    fn the_banner_names_the_opening_turn_at_the_ctrl_t_jump_endpoint() {
+        let (width, height) = BANNER_PANE;
+        let inner_width = width - 2;
+        let mut app = banner_app_over(&endpoint_jsonl(), "banner-ctrl-t");
+
+        // The transcript must overflow the pane, or top and bottom are one place and
+        // neither endpoint is being tested.
+        let content_h = content_height(&mut app, width);
+        assert!(
+            content_h > usize::from(height),
+            "the transcript must outrun the pane (got {content_h} rows in {height})"
+        );
+
+        let you_rows = marker_rows(&mut app, inner_width, "\u{25b6} you");
+        let first_marker_row = app
+            .preview_rows_above(inner_width, you_rows[0])
+            .expect("the opening marker is inside the transcript");
+        // The fall-through only runs when row 0 sits ABOVE the first marker. If the
+        // transcript ever stops leading with a blank row, this test would silently
+        // start exercising the reverse scan instead.
+        assert!(
+            first_marker_row > 0,
+            "the transcript must open with a row above its first marker, or the \
+             fall-through this pins is not the path taken (marker at row \
+             {first_marker_row})"
+        );
+
+        app.preview_top();
+        let rows = inner_rows(&mut app, width, height);
+        let resolved = usize::try_from(app.preview_scroll).expect("a small resolved offset");
+        assert_eq!(resolved, 0, "Ctrl-T resolves to the very first row");
+        assert_eq!(
+            rows[0],
+            banner_should_show(&mut app, inner_width, resolved),
+            "at the top endpoint the banner must name the OPENING turn"
+        );
+    }
+
+    /// `Ctrl-E` (and `End`, its twin) parks the pinned banner on the turn owning the
+    /// FINAL viewport's top row — here the last turn, whose body fills that viewport.
+    ///
+    /// `Action::PreviewBottom` names no offset at all: it re-arms
+    /// `preview_follow_bottom`, and the row the pane lands on is whatever
+    /// `clamp_preview_offset` derives as `content_h - viewport_h`. So the banner has to
+    /// agree with a number no keypress ever stated, which is the half that can silently
+    /// name the wrong turn. The keypress half — `Ctrl-E` reaching
+    /// `Action::PreviewBottom` — is
+    /// `update::tests::preview_scroll_keys_act_regardless_of_query`.
+    #[test]
+    fn the_banner_names_the_tail_turn_at_the_ctrl_e_jump_endpoint() {
+        let (width, height) = BANNER_PANE;
+        let inner_width = width - 2;
+        let mut app = banner_app_over(&endpoint_jsonl(), "banner-ctrl-e");
+
+        let content_h = content_height(&mut app, width);
+        assert!(
+            content_h > usize::from(height),
+            "the transcript must outrun the pane (got {content_h} rows in {height})"
+        );
+
+        let claude_rows = marker_rows(&mut app, inner_width, "\u{25cf} claude");
+        let last_marker_row = app
+            .preview_rows_above(
+                inner_width,
+                *claude_rows.last().expect("a closing assistant turn"),
+            )
+            .expect("the closing marker is inside the transcript");
+
+        app.preview_bottom();
+        let rows = inner_rows(&mut app, width, height);
+        let resolved = usize::try_from(app.preview_scroll).expect("a small resolved offset");
+
+        // The clamp must produce a REAL bottom offset, and it must land inside the last
+        // turn — that is what makes "the banner names the last turn" the only right
+        // answer here rather than one turn among several plausible ones.
+        assert!(resolved > 0, "Ctrl-E must resolve past the top row");
+        assert!(
+            resolved >= last_marker_row,
+            "the final viewport must open INSIDE the last turn for this to pin the \
+             tail (resolved {resolved}, last marker opens at {last_marker_row})"
+        );
+        assert_eq!(
+            rows[0],
+            banner_should_show(&mut app, inner_width, resolved),
+            "at the bottom endpoint the banner must name the turn owning THAT row"
+        );
+
+        // And the two endpoints really are different turns, so neither assertion above
+        // could be passing by naming the same marker in both places.
+        let mut at_top = banner_app_over(&endpoint_jsonl(), "banner-ctrl-e-top");
+        at_top.preview_top();
+        let top_rows = inner_rows(&mut at_top, width, height);
+        assert_ne!(
+            rows[0], top_rows[0],
+            "the top and bottom endpoints must pin DIFFERENT turns"
         );
     }
 }
