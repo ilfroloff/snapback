@@ -352,14 +352,11 @@ mod tests {
 
     /// A synthetic reported record carrying only what the guard reads: the
     /// `kind` it is judged by and the `state`/`status` pair `classify` buckets.
+    ///
+    /// Built through the shared `#[cfg(test)]` fixture rather than a literal, so
+    /// this module never has to name a wire field the guard must not read.
     fn agent(kind: &str, state: Option<&str>, status: Option<&str>) -> ReportedAgent {
-        ReportedAgent {
-            kind: kind.to_string(),
-            id: None,
-            state: state.map(str::to_owned),
-            status: status.map(str::to_owned),
-            name: None,
-        }
+        ReportedAgent::fixture(kind, state, status)
     }
 
     /// Build a minimal `Session` pointing at `file`. `remove` only reads

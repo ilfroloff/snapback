@@ -110,8 +110,8 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | `Ctrl-F` | **Fork** the selected session into a copy — available for any session, running or not |
 | `Ctrl-N` | **Start a new session** in the launch directory; if you have Claude Code agents defined, pick one first (or `default (no agent)`). Then a **draft box** opens for the session's first message: `Enter` launches it with `claude --bg` and leaves you on the board, `Ctrl-O` runs it interactively instead, `Esc` cancels. Your message is sent as the session's first turn either way |
 | `Ctrl-O` (in that picker) | **Start the highlighted agent interactively at once**, skipping the draft — the same thing `Ctrl-O` means inside the draft box, so either route out of the picker is one keypress |
-| `Ctrl-R` | **Quick reply** — send a one-shot message to the selected session without leaving the board. A background agent whose run is over (`done`, `stopped`, `failed`) is stopped first so the reply lands in place; a waiting one (`needs input`) asks you to confirm that stop; one that is still live (`working`, `idle`, `interrupted`, or a state this version doesn't recognize) is left alone and refused. Opens a compose box (`Enter` sends, `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels) |
-| `Ctrl-K` | **Stop / interrupt** the selected session's live background agent (`claude stop`). An agent whose run is over (`done`, `stopped`, `failed`) stops immediately; every other live agent (`working`, `needs input`, `idle`, `interrupted`, unrecognized) confirms first, since stopping ends the live job (its conversation is kept). A session that isn't running as an agent has nothing to stop, and an interactive session running in another terminal can't be stopped from here |
+| `Ctrl-R` | **Quick reply** — send a one-shot message to the selected session without leaving the board. A background agent whose run is over (`done`, `stopped`, `failed`) is stopped first so the reply lands in place; a waiting one (`needs input`) asks you to confirm that stop; one that is still live (`working`, `idle`, `interrupted`, or a state this version doesn't recognize) is left alone and refused, and so is a session with no background job to stop first (a `live` one, for instance); the refusal suggests `Ctrl-K` or Fork instead. Opens a compose box (`Enter` sends, `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels) |
+| `Ctrl-K` | **Stop / interrupt** the selected session's live agent. On a background agent it runs `claude stop`: one whose run is over (`done`, `stopped`, `failed`) stops immediately; every other live agent (`working`, `needs input`, `idle`, `interrupted`, unrecognized) confirms first, since stopping ends the live job (its conversation is kept). A session with no background job (a `live` one, typically) has no job to stop, so if Claude Code reports a process id for it, `Ctrl-K` offers to send that process a **SIGTERM** instead: the confirmation shows the pid, and nothing is sent unless Claude Code still reports that same pid when you press `Enter`. A session that isn't running as an agent has nothing to stop, and neither does one Claude Code reports with no job and no process id that can be signalled |
 | `Ctrl-X` then `x` / `d` / `h` / `r` / `y` | **Leader chord** that acts on the selected row (`x`, `d`, `y`) or on the whole board (`h`, `r`) — `x` **hides** the selected session (reversible, persisted), `d` **hard-deletes** it after a confirmation that can take just that row or its whole `(+N)` stack, `h` toggles **show hidden**, `r` **re-reads every transcript from disk**, `y` is **copy session ID**: the selected session's full id goes to your clipboard and shows on the status line. Any other key cancels the chord |
 | `Tab` | Toggle search: **name-only ↔ name+content**. Widening to content also opens the preview on the most recent match, the same way typing does |
 | `Ctrl-A` | Flip scope: **current folder ↔ project** — the project being the repo you launched in and all of its git worktrees. Started with `-a` it is a three-stop cycle instead (current folder → project → all folders), which is the only way to reach all folders |
@@ -255,6 +255,15 @@ off the list.
 - **dim gray, steady** — the agent has ended: it was stopped or its run failed.
   The word beside the badge says which.
 
+The short tag names the kind of agent. `bg` is a background agent Claude Code
+runs as a job. `live` is a session Claude Code reports as running with **no
+background job** behind it. What sits behind a `live` tag varies: it has been a
+one-shot `claude -p` reply still in progress, and it has been an ordinary
+interactive Claude Code session. So snapback tells you only what Claude Code
+reports about it and never guesses where it is running. With no job, a `live`
+session can't be attached to or stopped with `claude stop`; `Ctrl-K` in the
+[key table](#keys) covers what the board can do instead.
+
 The pulse is the tell for activity, and it is the *first* thing to read — not the
 shade. Only a genuinely working badge pulses, once a second, and only its dot,
 which fades between the bright and the dim gray rather than blinking out, so no
@@ -278,9 +287,18 @@ one that was interrupted and never cleaned up — is labelled `interrupted` (Cla
 Code's own word) and held steady. Anything else is passed through as-is rather
 than guessed at.
 
+When Claude Code reports when the session started, the banner also says how long
+ago that was, as of the board's last check: `live busy · 46m`. A reply stuck for
+most of an hour then looks different from one that began a moment ago. The age
+counts from when the session started, not from when it last changed state, and it
+stays off the status line at the bottom, which is only for what your last
+keypress did.
+
 Because a session that's still running can't be plain-resumed, pressing `Enter`
 on one offers **Attach** (reconnect to a running background agent), **Fork**, or
-**Cancel** — so a live agent is never a dead end. A finished session resumes
+**Cancel** — so a live agent is never a dead end. On a `live` session there is no
+background job to attach to, so Attach says so and points you at Fork. `Ctrl-K`
+can still offer to send its process a SIGTERM. A finished session resumes
 normally; its badge tells you it's done without getting in the way.
 
 Which of those you get is decided by asking Claude Code at the moment you press
@@ -409,8 +427,10 @@ it's still holding as an agent. An agent whose run is **over** — `done`, or
 land in place. A **waiting** (`needs input`) agent asks you to confirm before it's
 stopped, since that abandons an agent that's still live. Anything still live is
 left alone and the reply is refused: `working`, `idle`, `interrupted`, or a state
-this version doesn't recognize — use Attach to answer it in its own channel, or
-Fork (`Ctrl-F`) to branch a copy. `interrupted` refuses on purpose even though it
+this version doesn't recognize. So is a session with no background job to stop
+first, such as a `live` one. The refusal suggests `Ctrl-K` to stop it or Fork
+(`Ctrl-F`) to branch a copy; on a background agent, `Enter`'s **Attach** still
+reconnects you to it. `interrupted` refuses on purpose even though it
 sits still: that badge is snapback's *inference* from Claude Code contradicting
 itself, not a report that the run ended, and it isn't worth stopping live work over
 a guess. Use `Ctrl-K` if you do want it stopped — it will ask first.
@@ -453,8 +473,10 @@ row or on the whole board: press it, and a hint shows the follow-ups — `x`, `d
   session's own `<id>.jsonl` and its sibling `<id>/` directory of subagent
   transcripts — nothing else.
 
-  What it refuses is a session something might be **writing**: one you have open
-  in a Claude Code window, a background agent Claude Code still has up — working
+  What it refuses is a session something might be **writing**: a `live` one
+  (whatever runs behind it, an interactive Claude Code session or a `claude -p`
+  reply still in progress, can append to the transcript), a background agent
+  Claude Code still has up — working
   a turn, sitting idle between turns, or reporting something snapback can't read
   (an unreadable signal never gets to authorize an irreversible delete) — or one
   snapback itself is still replying to. A quick reply (`Ctrl-R`) keeps writing

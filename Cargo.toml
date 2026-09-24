@@ -86,6 +86,20 @@ unicode-segmentation = "=1.13.3"
 # columns aligned. Already in the tree transitively via ratatui; pinned exact.
 unicode-width = "=0.2.2"
 
+# Unix-only, like the one syscall it exists for: off unix `send::signal_term`
+# is a same-signature fallback that REFUSES instead of signalling, and nothing
+# else in the crate names a `libc` item.
+[target.'cfg(unix)'.dependencies]
+# ONE syscall: `kill(2)` for `Ctrl-K`'s signal route (`send::signal_term`), the
+# only handle left on a reported session that carries no stoppable job `id`.
+# SIGTERM only — there is no SIGKILL constant anywhere in the tree. Preferred
+# over shelling out to `/bin/kill`, which would cost a PATH dependency, a child
+# process and a thread for a call that returns immediately. Already in the tree
+# transitively on unix (notify, mio, signal-hook, dirs-sys and parking_lot_core,
+# among others, pull it); pinned exact, so the direct dependency adds nothing to
+# the build graph.
+libc = "=0.2.186"
+
 # Test-only. `nucleo` is the membership ORACLE, and nothing else: the parity test
 # in src/search.rs compares this crate's match set against nucleo's own, so the
 # per-atom smart-case rule is proved rather than asserted from belief. It is a

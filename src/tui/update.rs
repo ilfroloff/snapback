@@ -19,9 +19,11 @@
 //! to an [`Action`], and [`handle_event`] applies an [`AppEvent`] to the [`App`]
 //! and returns an [`Outcome`] telling the driver (in [`crate::tui`]) whether to
 //! continue, quit, hand off a resume, fire one of the three no-teardown children
-//! (`Send` / `Interrupt` / `BgLaunch`), or start / finish a `Ctrl-X y` clipboard
-//! copy (`Copy` / `FinishCopy`). All of it is terminal-free and unit tested; the
-//! terminal-driving loop that calls it lives in [`crate::tui::run`].
+//! (`Send` / `Interrupt` / `BgLaunch`), deliver `Ctrl-K`'s child-free SIGTERM
+//! (`Signal`, a `kill(2)` the driver runs inline — see [`Outcome::Signal`]), or
+//! start / finish a `Ctrl-X y` clipboard copy (`Copy` / `FinishCopy`). All of it is
+//! terminal-free and unit tested; the terminal-driving loop that calls it lives in
+//! [`crate::tui::run`].
 //!
 //! ## Keybindings
 //!
@@ -33,8 +35,8 @@
 //! | `Ctrl-F` | fork-resume the selected session |
 //! | `Ctrl-N` | start a new session in the launch directory. When agents are defined a picker opens first and `Enter` on a pick opens a draft pane for the session's first message; with none defined that draft opens straight away. In the draft, `Enter` starts a BACKGROUND agent without leaving the board, `Ctrl-O` runs it interactively instead, `Esc` cancels |
 //! | `Ctrl-O` (in the agent picker) | start the highlighted agent INTERACTIVELY at once, skipping the draft — the same verb `Ctrl-O` names inside the draft, so BOTH routes out of the picker cost exactly one key. Bound on the picker alone — inert on every other modal |
-//! | `Ctrl-R` | quick-reply: send a one-shot message to the selected session without leaving the board. An agent whose run is OVER (`done` / `stopped` / `failed`) is stopped first so the reply lands in place; `needs input` confirms first; `working` / `idle` / `interrupted` / an unrecognized qualifier is refused (see [`send::reply_gate`]) |
-//! | `Ctrl-K` | stop / interrupt the selected session's live background agent (`claude stop`); an agent whose run is OVER (`done` / `stopped` / `failed`) stops at once, every other live agent confirms first, and a session claude is not holding — or one running interactively, which carries no job id — is refused (see [`send::interrupt_gate`]) |
+//! | `Ctrl-R` | quick-reply: send a one-shot message to the selected session without leaving the board. An agent whose run is OVER (`done` / `stopped` / `failed`) is stopped first so the reply lands in place; `needs input` confirms first; `working` / `idle` / `interrupted` / an unrecognized qualifier is refused, and so is a session claude reports with no stoppable job id — the refusal points at `Ctrl-K` or Fork (see [`send::reply_gate`]) |
+//! | `Ctrl-K` | stop / interrupt the selected session's live agent, by whichever handle claude's record carries (see [`send::interrupt_gate`]). A stoppable job id → `claude stop`: an agent whose run is OVER (`done` / `stopped` / `failed`) stops at once, every other live agent confirms first. NO job id but a `pid` → confirm, then re-ask claude at `Enter` and send that pid a SIGTERM (never SIGKILL) only if claude still reports the same pid with no job id; a record that is gone, now carries a job id, or reports another pid refuses instead (see [`send::signal_plan`]). A session claude is not holding, or one it reports with neither a job id nor a pid — or with no job id and a pid no signal could take (`0`, past `i32::MAX`, or the board's own process id) — is refused |
 //! | `Tab` | toggle name-only vs. name+content search. Widening to content also opens the preview on the most recent match, exactly as typing does: it goes through the same query funnel, and the mode is the gate that key just opened |
 //! | `Ctrl-A` | flip the scope: current folder <-> project (the launch repo and all of its git worktrees). ONE key for both, because the second is a refinement of the same question the first answers, not a separate mode. Launched with `--all`/`-a` it becomes a three-stop cycle through all folders as well — the whole store is on this key only when the launch flag put it there |
 //! | `Ctrl-X` then `x`/`d`/`h`/`r`/`y` | leader chord: hide / hard-delete (this row, or its whole fork lineage) / toggle show-hidden / re-read every transcript from disk / copy session ID (the selected session's full id, to the clipboard; the id also shows on the status line) (any other key cancels) |
@@ -81,11 +83,13 @@ use ratatui::layout::{Position, Rect};
 use crate::defined_agents;
 use crate::delete;
 use crate::resume::{self, Ready};
-use crate::send::{self, BgLaunchRequest, InterruptGate, InterruptRequest, ReplyGate, SendRequest};
+use crate::send::{
+    self, BgLaunchRequest, InterruptGate, InterruptRequest, ReplyGate, SendRequest, SignalPlan,
+};
 use crate::store::SessionStore;
 use crate::watch::AppEvent;
 
-use super::app::{App, Interrupting, ModalAction, ModalLayout};
+use super::app::{App, InterruptRoute, Interrupting, ModalAction, ModalLayout};
 use super::{clipboard, compose, view};
 
 /// A decoded intent from a single keypress.
@@ -121,11 +125,13 @@ pub enum Action {
     /// whose run is over is stopped first and compose opens, a `needs input` one
     /// confirms before that stop, and a still-live one is refused with a hint.
     Reply,
-    /// Stop / interrupt the selected session's live background agent (`Ctrl-K`).
-    /// [`apply_action`] runs the interrupt gate ([`send::interrupt_gate`]): an
-    /// agent whose run is over is stopped immediately, every other live agent
-    /// confirms first, and a non-live or interactive session is refused with a
-    /// hint.
+    /// Stop / interrupt the selected session's live agent (`Ctrl-K`).
+    /// [`apply_action`] runs the interrupt gate ([`send::interrupt_gate`]): on a
+    /// background job id, an agent whose run is over is stopped immediately and
+    /// every other live agent confirms first; a reported session with no job id
+    /// but a `pid` confirms, then has that pid re-verified and sent a SIGTERM; a
+    /// non-live session, one reported with neither handle, or one whose pid no
+    /// signal could take, is refused with a hint.
     Interrupt,
     /// Toggle name-only vs. name+content search.
     ToggleSearchMode,
@@ -224,6 +230,31 @@ pub enum Outcome {
     /// nothing. The interactive escape hatch (`Ctrl-O`) still takes
     /// [`Resume`](Self::Resume), because that one really does hand the terminal over.
     BgLaunch(BgLaunchRequest),
+    /// Send a re-verified pid a SIGTERM — `Ctrl-K`'s route for a reported session
+    /// with no stoppable job id, confirmed and re-probed
+    /// ([`send::signal_plan`](crate::send::signal_plan)). The board never tears down.
+    ///
+    /// **This one is performed SYNCHRONOUSLY by the driver, with no detached thread
+    /// and no `AppEvent` round trip — and that is a decision, not an omission.** The
+    /// three variants above exist because a `claude` CHILD blocks: it has to be
+    /// spawned, waited on, and its streams read, so the work cannot sit on the render
+    /// loop. `kill(2)` returns as soon as the signal is queued. There is no completion
+    /// to wait for and nothing to report back, so a thread plus a channel round trip
+    /// would add two moving parts and a new event source to deliver a result the
+    /// driver already holds.
+    ///
+    /// It is NOT an exception to AGENTS.md's OFF-UI-THREAD rule either. That rule
+    /// governs BLOCKING work, and one non-blocking syscall is not blocking work — the
+    /// rule is satisfied rather than waived. (The one-shot PROBE that re-verified this
+    /// pid does block, briefly, and IS argued as the documented hand-off exception —
+    /// at its call site, [`dispatch_signal`].)
+    ///
+    /// Carried as data for the same reason as the others: the DECISION stays in the
+    /// pure handler and unit-testable, while the effect lives in the driver.
+    Signal {
+        /// The pid to signal, as re-verified against a fresh probe at confirm time.
+        pid: u32,
+    },
     /// Copy this FULL `session_id` to the system clipboard and KEEP running — the
     /// `Ctrl-X y` request, like [`Send`](Self::Send) a no-teardown effect handled
     /// inline by [`crate::tui::run`]. The driver reads the environment, picks the
@@ -256,8 +287,9 @@ impl Outcome {
     /// down and the merged event channel with it.
     ///
     /// True for [`Quit`](Self::Quit) and every [`Resume`](Self::Resume); false for
-    /// the no-teardown effects (`Send`, `Interrupt`, `BgLaunch`, and the clipboard
-    /// copy's `Copy` / `FinishCopy`), which keep drawing on the SAME channel. Pure,
+    /// the no-teardown effects (`Send`, `Interrupt`, `BgLaunch`, the interrupt's
+    /// `Signal`, and the clipboard copy's `Copy` / `FinishCopy`), which keep
+    /// drawing on the SAME channel. Pure,
     /// so "does the board survive this?" is one greppable answer rather than a
     /// `matches!` repeated per call site.
     #[must_use]
@@ -479,9 +511,15 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
             reload_board(app, store);
             Outcome::Continue
         }
-        AppEvent::ReportedAgents(agents) => {
-            // Delivered off-thread by the agents poller; just swap the map in.
-            app.set_reported_agents(agents);
+        AppEvent::ReportedAgents {
+            agents,
+            reported_at_ms,
+        } => {
+            // Delivered off-thread by the agents poller; just swap the map in,
+            // with the wall-clock instant the poller stamped it at. The stamp is
+            // CARRIED, never read here, so this arm stays clock-free (see
+            // `AppEvent::ReportedAgents::reported_at_ms`).
+            app.set_reported_agents(agents, reported_at_ms);
             Outcome::Continue
         }
         AppEvent::SendFinished {
@@ -1713,12 +1751,18 @@ fn handle_stop_confirm_key(app: &mut App, key: KeyEvent) -> Outcome {
 /// a valid target here. `claude stop <job-id>` deregisters the job (keeping the
 /// conversation); it needs the SHORT agent-view id, which only a background job has:
 ///
-/// * not held / no job id → refuse ([`send::INTERRUPT_NOT_LIVE`] /
-///   [`send::INTERRUPT_NO_JOB_ID`]);
+/// * not held, or reported with neither a job id nor a pid → refuse
+///   ([`send::INTERRUPT_NOT_LIVE`] / [`send::INTERRUPT_NO_JOB_ID`]);
+/// * no stoppable job id and a `pid` no signal could ever take (`0`, past
+///   `i32::MAX`, or this board's own, [`App::own_pid`]) → refuse
+///   ([`send::INTERRUPT_PID_UNUSABLE`]), so no confirm opens;
 /// * `done`, or a TERMINAL `stopped`/`failed` → stop immediately (harmless;
 ///   nothing runs);
 /// * any other live state → CONFIRM first ([`App::open_interrupt_confirm`]) —
-///   stopping abandons live work — then stop on confirm.
+///   stopping abandons live work — then stop on confirm;
+/// * no stoppable job id but a reported `pid` a signal could take → CONFIRM, then
+///   re-probe and SIGTERM that pid ([`dispatch_signal`]). The pid captured here is
+///   a claim to re-verify, never a target — see [`send::signal_plan`].
 ///
 /// The probe is the SAME authoritative bare read the resume/reply gates use
 /// ([`App::live_agent_now`]) — never the polled `--all` map — a one-shot at a
@@ -1728,10 +1772,17 @@ fn interrupt(app: &mut App) -> Outcome {
     let Some(id) = app.selected_session().map(|s| s.session_id.clone()) else {
         return Outcome::Continue;
     };
-    match send::interrupt_gate(app.live_agent_now(&id).as_ref()) {
+    match send::interrupt_gate(app.live_agent_now(&id).as_ref(), app.own_pid) {
         InterruptGate::StopNow { job_id } => dispatch_interrupt(app, &id, &job_id),
         InterruptGate::Confirm { job_id } => {
-            app.open_interrupt_confirm(id, job_id);
+            app.open_interrupt_confirm(id, InterruptRoute::Job { job_id });
+            Outcome::Continue
+        }
+        // No stoppable job id, but claude reported a pid: confirm, then re-probe and
+        // signal it (see `dispatch_signal`). The pid is CAPTURED here and re-verified
+        // at `Enter` — it is never signalled on the strength of this read.
+        InterruptGate::ConfirmSignal { pid } => {
+            app.open_interrupt_confirm(id, InterruptRoute::Signal { pid });
             Outcome::Continue
         }
         InterruptGate::Refuse(message) => {
@@ -1758,17 +1809,101 @@ fn dispatch_interrupt(app: &mut App, session_id: &str, job_id: &str) -> Outcome 
     Outcome::Interrupt(req)
 }
 
-/// Apply a keypress while the "stop this agent?" interrupt confirmation is open.
+/// Signal the pid the confirm captured — but only after asking claude AGAIN, right
+/// now, whether that pid is still the one it reports for this session.
 ///
-/// `Enter` confirms — the agent is stopped — so it resolves into
-/// [`Outcome::Interrupt`]; `Esc`/`Ctrl-C` dismiss and return to the board. Any other
-/// key is ignored: this is a deliberate confirmation, not a fat-finger.
+/// The interrupt confirm's SECOND dispatcher, beside [`dispatch_interrupt`], and the
+/// re-probe is the only difference between them.
+///
+/// # Why the re-probe is on THIS route alone
+///
+/// A stale job id and a stale pid are not equally dangerous, and the asymmetry is the
+/// argument for the guard living here:
+///
+/// * A stale job id FAILS SAFE. `claude stop <dead-job>` exits non-zero with "No job
+///   matching" and [`send::status_for_stop`] surfaces that reason. Nothing else is
+///   touched, so the job-id arm has never needed a re-probe and does not get one.
+/// * A stale pid does NOT fail safe. A pid is a slot the kernel recycles: the confirm
+///   can sit open indefinitely (the same unbounded window [`route_handoff`] documents
+///   for the attach id), and a process that exits inside it frees its number for
+///   anything. A SIGTERM aimed at the captured number could land on an unrelated
+///   process, and there is no undo.
+///
+/// So the two arms are deliberately NOT symmetric. Do not "unify" them: making the job
+/// arm re-probe would be harmless but pointless, and making this one stop re-probing
+/// deletes the only thing standing between a recycled pid and a signal. The decision
+/// itself is pure and unit-tested in [`send::signal_plan`]; all this adds is the fresh
+/// record it judges.
+///
+/// # On PATTERNS.md §6 (off-UI-thread), argued per branch
+///
+/// [`App::live_agent_now`] here is a ONE-SHOT at a hand-off-shaped moment — the same
+/// exception the Enter gate, [`route_handoff`] and `confirm_delete` each argue at their
+/// own call sites, and the `Ctrl-K` keypress that opened this confirm already spent one.
+/// It adds no tick, no thread and no event source, and leaves the `--all` poller at one
+/// call per cycle. Its ~0.26s lands between the keypress and a board that redraws with
+/// either a signalled row or the refusal that says why not — the same deliberate hitch
+/// every other hand-off pays, accepted here because the alternative is signalling a pid
+/// nothing current vouches for.
+///
+/// The signal itself does NOT go on a thread: see [`Outcome::Signal`] for why a
+/// non-blocking syscall needs neither one nor an `AppEvent` round trip.
+fn dispatch_signal(app: &mut App, session_id: &str, captured_pid: u32) -> Outcome {
+    // The probe's record is OWNED, so it holds no borrow on `app` when `set_status`
+    // re-borrows it mutably below.
+    let fresh = app.live_agent_now(session_id);
+    match send::signal_plan(captured_pid, fresh.as_ref()) {
+        SignalPlan::Signal { pid } => Outcome::Signal { pid },
+        SignalPlan::Refuse(message) => {
+            app.set_status(message);
+            Outcome::Continue
+        }
+    }
+}
+
+/// Show what the driver's SIGTERM did on the board status line.
+///
+/// The driver performs [`Outcome::Signal`] and passes [`send::signal_term`]'s result
+/// straight in. Everything after that syscall is decided HERE, from the result
+/// as a PARAMETER, so it is unit-tested with hand-built results and no test ever
+/// signals anything. [`send::status_for_signal`] maps the result to its text and
+/// class, and this applies the class the way every other outcome is applied
+/// (STATUS-LINE OWNERSHIP): a neutral one (sent, or already gone) expires after
+/// `STATUS_DWELL_TICKS`, while a failure stays until the next actionable keypress,
+/// because the process may still be running.
+pub(super) fn show_signal_result(app: &mut App, result: Result<(), std::io::Error>) {
+    let (status, neutral) = send::status_for_signal(result);
+    if neutral {
+        app.set_status_transient(status);
+    } else {
+        app.set_status(status);
+    }
+}
+
+/// Apply a keypress while the interrupt confirmation is open.
+///
+/// `Enter` confirms, resolving into the effect its [`InterruptRoute`] names: a
+/// `claude stop` ([`Outcome::Interrupt`]) on the job-id route, or a re-probed SIGTERM
+/// ([`dispatch_signal`]) on the pid route. `Esc`/`Ctrl-C` dismiss and return to the
+/// board. Any other key is ignored: this is a deliberate confirmation, not a
+/// fat-finger.
+///
+/// The route was chosen by [`send::interrupt_gate`] when the confirm opened and travels
+/// as a sum type, so this arm dispatches the decision rather than re-deriving it —
+/// there is no state here in which both handles, or neither, are available.
 fn handle_interrupt_confirm_key(app: &mut App, key: KeyEvent) -> Outcome {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
         KeyCode::Enter => {
             if let Some(pending) = app.pending_interrupt.take() {
-                return dispatch_interrupt(app, &pending.session_id, &pending.job_id);
+                return match pending.route {
+                    InterruptRoute::Job { job_id } => {
+                        dispatch_interrupt(app, &pending.session_id, &job_id)
+                    }
+                    InterruptRoute::Signal { pid } => {
+                        dispatch_signal(app, &pending.session_id, pid)
+                    }
+                };
             }
             Outcome::Continue
         }
@@ -1888,6 +2023,9 @@ mod tests {
         }
     }
 
+    /// Pid-less and `startedAt`-less by default; a test that needs either appends
+    /// [`ReportedAgent::with_pid`] rather than this growing a parameter every
+    /// existing caller would have to pass `None` to.
     fn reported_agent(kind: &str) -> ReportedAgent {
         ReportedAgent {
             kind: kind.to_string(),
@@ -1896,7 +2034,8 @@ mod tests {
             id: None,
             state: None,
             status: None,
-            name: None,
+            pid: None,
+            started_at_ms: None,
         }
     }
 
@@ -1909,7 +2048,8 @@ mod tests {
             id: job_id.map(str::to_owned),
             state: None,
             status: None,
-            name: None,
+            pid: None,
+            started_at_ms: None,
         }
     }
 
@@ -1994,7 +2134,7 @@ mod tests {
             Some(kind) => {
                 let mut reported = HashMap::new();
                 reported.insert(id.to_string(), reported_agent(kind));
-                app.set_reported_agents(reported);
+                app.set_reported_agents(reported, None);
                 let job = (kind == "background").then_some("job-steady");
                 seed_live_agents(&mut app, &[(id, kind, job)]);
             }
@@ -2184,7 +2324,8 @@ mod tests {
                     id: Some("job-x".to_string()),
                     state: Some(state.to_string()),
                     status: None,
-                    name: None,
+                    pid: None,
+                    started_at_ms: None,
                 },
             );
             map
@@ -2260,7 +2401,8 @@ mod tests {
                     id: Some("job-y".to_string()),
                     state: Some("blocked".to_string()),
                     status: None,
-                    name: None,
+                    pid: None,
+                    started_at_ms: None,
                 },
             );
             map
@@ -2303,7 +2445,8 @@ mod tests {
                     id: job.map(str::to_owned),
                     state: Some(state.to_string()),
                     status: None,
-                    name: None,
+                    pid: None,
+                    started_at_ms: None,
                 },
             );
             map
@@ -2349,7 +2492,13 @@ mod tests {
                 panic!("{state:?} must open the interrupt confirmation");
             };
             assert_eq!(pending.session_id, "live-1");
-            assert_eq!(pending.job_id, "job-k");
+            assert_eq!(
+                pending.route,
+                InterruptRoute::Job {
+                    job_id: "job-k".to_string()
+                },
+                "a record with a job id confirms on the DELEGATED route, never the signal one"
+            );
         }
 
         // Not held at all -> nothing to stop.
@@ -2380,7 +2529,8 @@ mod tests {
                     id: Some("job-z".to_string()),
                     state: Some("working".to_string()),
                     status: None,
-                    name: None,
+                    pid: None,
+                    started_at_ms: None,
                 },
             );
             map
@@ -2421,6 +2571,335 @@ mod tests {
         assert!(app.pending_interrupt.is_none(), "Esc dismisses the prompt");
     }
 
+    /// A board holding one session claude reports WITHOUT a job id but WITH `pid`,
+    /// and whose probe can be re-seeded between the keypress and the confirm.
+    ///
+    /// The pid is a real one from the `claude 2.1.278` capture, and the record's
+    /// shape mirrors it: `kind: "interactive"`, a `status` rather than a `state`, no
+    /// `id`.
+    fn app_on_the_pid_route(id: &str, pid: u32) -> App {
+        let mut app = App::new(vec![session(id)], Scope::All, PathBuf::from("/tmp"));
+        seed_probe(&mut app, id, Some(reported_pid_record(pid)));
+        app
+    }
+
+    /// The observed interactive shape: no attachable job, a `status` rather than a
+    /// `state`, and a pid.
+    fn reported_pid_record(pid: u32) -> ReportedAgent {
+        ReportedAgent::fixture("interactive", None, Some("busy")).with_pid(pid)
+    }
+
+    /// Re-seed `app`'s one-shot probe: `Some(record)` for `id`, or an EMPTY active
+    /// list. Called a second time to state "the world moved while the confirm was
+    /// open", which is the whole subject of the pid route's re-verification.
+    fn seed_probe(app: &mut App, id: &str, record: Option<ReportedAgent>) {
+        let id = id.to_string();
+        app.set_live_probe(move || {
+            let mut map = HashMap::new();
+            if let Some(record) = record.clone() {
+                map.insert(id.clone(), record);
+            }
+            map
+        });
+    }
+
+    /// `Ctrl-K` on a reported session with NO stoppable job id but a `pid`: the
+    /// confirm opens on the SIGNAL route carrying that pid, and `Enter` escalates to
+    /// `Outcome::Signal` — the driver's syscall — rather than to a `claude stop`.
+    ///
+    /// Also pins that this route no longer refuses. The refusal it used to give
+    /// (`INTERRUPT_NO_JOB_ID`) is now reserved for a record with neither handle, so a
+    /// pid-carrying record reaching it again would mean the signal route had been
+    /// disconnected.
+    #[test]
+    fn a_reported_pid_with_no_job_id_confirms_then_signals() {
+        const PID: u32 = 29628;
+
+        let mut app = app_on_the_pid_route("live-pid", PID);
+        let outcome = press_ctrl(&mut app, KeyCode::Char('k'));
+        assert!(
+            matches!(outcome, Outcome::Continue),
+            "the pid route CONFIRMS first — it never signals straight off a keypress"
+        );
+        let Some(pending) = app.pending_interrupt.as_ref() else {
+            panic!("a reported pid with no job id must open the interrupt confirmation");
+        };
+        assert_eq!(pending.session_id, "live-pid");
+        assert_eq!(
+            pending.route,
+            InterruptRoute::Signal { pid: PID },
+            "the confirm must carry the pid, and only the pid"
+        );
+        assert_eq!(
+            app.status, None,
+            "the pid route must NOT refuse: INTERRUPT_NO_JOB_ID is now for a record \
+             carrying neither a job id nor a pid"
+        );
+
+        // Enter: the probe still reports the same record, so the captured pid is
+        // re-verified and the driver is handed the syscall.
+        let outcome = press(&mut app, KeyCode::Enter);
+        assert!(
+            matches!(outcome, Outcome::Signal { pid } if pid == PID),
+            "confirming an unchanged record must escalate Outcome::Signal for that pid"
+        );
+        assert!(
+            app.pending_interrupt.is_none(),
+            "confirming closes the prompt"
+        );
+        assert!(
+            app.interrupting_on("live-pid").is_none(),
+            "a signal has no in-flight child to track — `interrupting` is the \
+             `claude stop` guard, and nothing would ever clear it here"
+        );
+    }
+
+    /// The confirm-time re-probe, which is the guard against pid reuse: each of the
+    /// three ways the world can move while the confirm sits open must REFUSE, in its
+    /// own words, and none of them may reach `Outcome::Signal`.
+    ///
+    /// The confirm is opened against one probe answer and `Enter` pressed against
+    /// another — the unbounded window the route actually has.
+    #[test]
+    fn the_confirm_time_re_probe_refuses_every_stale_pid() {
+        const PID: u32 = 29628;
+
+        for (moved_to, expected) in [
+            // The session ended on its own: nothing reports it, so its pid is the
+            // likeliest of all to have been recycled.
+            (None, send::SIGNAL_RECORD_GONE),
+            // It now carries a stoppable job id — the delegated verb, which wins
+            // even though the pid is unchanged.
+            (
+                Some(live_agent("background", Some("job-now")).with_pid(PID)),
+                send::SIGNAL_NOW_HAS_JOB,
+            ),
+            // The record was replaced: same session, different process.
+            (Some(reported_pid_record(PID + 1)), send::SIGNAL_PID_MOVED),
+        ] {
+            let mut app = app_on_the_pid_route("live-pid", PID);
+            press_ctrl(&mut app, KeyCode::Char('k'));
+            assert!(
+                app.pending_interrupt.is_some(),
+                "the confirm must be open before the world moves under it"
+            );
+
+            seed_probe(&mut app, "live-pid", moved_to.clone());
+            let outcome = press(&mut app, KeyCode::Enter);
+            assert!(
+                matches!(outcome, Outcome::Continue),
+                "a stale pid must never reach the syscall (moved_to={moved_to:?})"
+            );
+            assert_eq!(
+                app.status.as_deref(),
+                Some(expected),
+                "each staleness must refuse in its OWN words (moved_to={moved_to:?})"
+            );
+            assert!(
+                app.pending_interrupt.is_none(),
+                "a refused confirm still closes"
+            );
+        }
+    }
+
+    /// The keyboard-owner precedence reaches the SIGNAL route unchanged: its confirm
+    /// swallows a typed key and a paste (neither leaks into the query nor resolves
+    /// it), and `Esc` and `Ctrl-C` each dismiss it without escalating a signal.
+    ///
+    /// Pinned on this route because it is the one whose `Enter` ends in `kill(2)`:
+    /// a key that slipped past the owner here decides whether a process is signalled,
+    /// not just what the hidden query says. Only the returned `Outcome` is asserted —
+    /// the syscall lives in the driver, which no test runs.
+    #[test]
+    fn the_signal_confirm_owns_the_keyboard_and_cancels_on_esc_or_ctrl_c() {
+        const PID: u32 = 29628;
+
+        for cancel in [key(KeyCode::Esc), ctrl(KeyCode::Char('c'))] {
+            let mut app = app_on_the_pid_route("live-pid", PID);
+            press_ctrl(&mut app, KeyCode::Char('k'));
+            assert_eq!(
+                app.pending_interrupt.as_ref().map(|p| &p.route),
+                Some(&InterruptRoute::Signal { pid: PID }),
+                "the fixture must really open the SIGNAL route's confirm"
+            );
+
+            // Owned: a typed key and a paste are swallowed, so the confirm stands and
+            // nothing reaches the board's query.
+            assert!(matches!(
+                press(&mut app, KeyCode::Char('y')),
+                Outcome::Continue
+            ));
+            assert!(matches!(paste(&mut app, "junk\ntext"), Outcome::Continue));
+            assert!(
+                app.pending_interrupt.is_some(),
+                "neither a typed key nor a paste may resolve the confirm"
+            );
+            assert!(
+                app.query().is_empty(),
+                "the confirm owns the keyboard: nothing may leak into the query"
+            );
+
+            // Dismissed: the cancel key closes it and escalates nothing.
+            let outcome = handle_event(
+                &mut app,
+                AppEvent::Input(Event::Key(cancel)),
+                &mut store_at(Path::new("/tmp")),
+            );
+            assert!(
+                matches!(outcome, Outcome::Continue),
+                "{cancel:?} must dismiss the confirm, never signal or quit"
+            );
+            assert!(
+                app.pending_interrupt.is_none(),
+                "{cancel:?} must dismiss the confirm"
+            );
+        }
+    }
+
+    /// `Ctrl-K` on a record whose pid NO signal could take — `0`, or past
+    /// `i32::MAX` — refuses at the keypress: no confirm opens, and the status says why
+    /// in its own words (never "no process id": the record carries one). It stays
+    /// until the next key, like every refusal.
+    ///
+    /// The probe is seeded, so this spawns nothing; and since no confirm opens,
+    /// nothing here could reach `Outcome::Signal` either.
+    #[test]
+    fn a_pid_no_signal_could_take_refuses_without_opening_a_confirm() {
+        for pid in [0, i32::MAX as u32 + 1, u32::MAX] {
+            let mut app = app_on_the_pid_route("live-pid", pid);
+            let outcome = press_ctrl(&mut app, KeyCode::Char('k'));
+            assert!(
+                matches!(outcome, Outcome::Continue),
+                "pid {pid}: a refusal escalates nothing"
+            );
+            assert!(
+                app.pending_interrupt.is_none(),
+                "pid {pid} can never be signalled, so no confirm may open for it"
+            );
+            assert_eq!(
+                app.status.as_deref(),
+                Some(send::INTERRUPT_PID_UNUSABLE),
+                "pid {pid}: the refusal must name what was observed"
+            );
+            for _ in 0..=STATUS_DWELL_TICKS {
+                handle_event(&mut app, AppEvent::Tick, &mut store_at(Path::new("/tmp")));
+            }
+            assert_eq!(
+                app.status.as_deref(),
+                Some(send::INTERRUPT_PID_UNUSABLE),
+                "pid {pid}: a refusal is sticky, so it must outlive the dwell"
+            );
+        }
+    }
+
+    /// `Ctrl-K` on a record naming the BOARD'S OWN pid refuses at the keypress, with
+    /// no confirm, because the board reaches the gate with [`App::own_pid`] — the
+    /// press, not the pure gate alone, is what this pins. A SIGTERM to that pid would
+    /// end the board without its terminal restore.
+    ///
+    /// The same board first opens the ordinary signal confirm for that record, so
+    /// the refusal is caused by the board's pid and nothing else about the fixture.
+    /// The probe is seeded and no confirm survives, so nothing here can reach
+    /// `Outcome::Signal`, let alone the driver's syscall.
+    #[test]
+    fn ctrl_k_on_the_boards_own_pid_refuses_without_opening_a_confirm() {
+        const PID: u32 = 29628;
+
+        let mut app = app_on_the_pid_route("live-pid", PID);
+        press_ctrl(&mut app, KeyCode::Char('k'));
+        assert_eq!(
+            app.pending_interrupt.as_ref().map(|p| &p.route),
+            Some(&InterruptRoute::Signal { pid: PID }),
+            "while the pid is not the board's own, the fixture must open the signal confirm"
+        );
+        press(&mut app, KeyCode::Esc);
+
+        app.own_pid = PID; // the record's pid is now this board's own
+        let outcome = press_ctrl(&mut app, KeyCode::Char('k'));
+        assert!(
+            matches!(outcome, Outcome::Continue),
+            "a refusal escalates nothing"
+        );
+        assert!(
+            app.pending_interrupt.is_none(),
+            "no confirm may open for the board's own pid"
+        );
+        assert_eq!(
+            app.status.as_deref(),
+            Some(send::INTERRUPT_PID_UNUSABLE),
+            "the board's own pid must refuse in the words for a pid no signal could take"
+        );
+    }
+
+    /// What the user sees after the driver's SIGTERM, for each kind of result: the
+    /// status text, and whether it goes away on its own.
+    ///
+    /// Every result is BUILT BY HAND — `Ok(())`, an errno via
+    /// `io::Error::from_raw_os_error`, and an `InvalidInput` like `signal_target`'s
+    /// refusal — and handed to `show_signal_result` exactly as the driver hands it the
+    /// syscall's result. No test calls `signal_term`, so nothing is signalled.
+    ///
+    /// Expiry is asserted by driving the SAME `AppEvent::Tick` dwell the board runs,
+    /// not by reading a flag: a delivered or already-gone signal is a confirmation and
+    /// must clear after `STATUS_DWELL_TICKS`, while a failure means the process may
+    /// still be running and must stay until the next key.
+    ///
+    /// Unix-only, like `send`'s own errno test: the `ESRCH`/`EPERM` rows name `libc`
+    /// constants, which exist on unix alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_signal_result_clears_when_neutral_and_stays_when_it_failed() {
+        use std::io::{Error, ErrorKind};
+
+        // The syscall's result is built ON DEMAND — once for the board, once for the
+        // expected text — because `io::Error` is not `Clone`.
+        type MakeResult = fn() -> Result<(), Error>;
+        let sent: MakeResult = || Ok(());
+        let already_gone: MakeResult = || Err(Error::from_raw_os_error(libc::ESRCH));
+        let not_permitted: MakeResult = || Err(Error::from_raw_os_error(libc::EPERM));
+        let out_of_range: MakeResult = || {
+            Err(Error::new(
+                ErrorKind::InvalidInput,
+                "reported process id is out of range",
+            ))
+        };
+
+        // (label, result, does the status clear on its own?)
+        for (label, result, clears) in [
+            ("sent", sent, true),
+            ("ESRCH", already_gone, true),
+            ("EPERM", not_permitted, false),
+            ("out of range", out_of_range, false),
+        ] {
+            let (expected, _) = send::status_for_signal(result());
+            let mut app = App::new(vec![session("s")], Scope::All, PathBuf::from("/tmp"));
+            show_signal_result(&mut app, result());
+            assert_eq!(
+                app.status.as_deref(),
+                Some(expected.as_str()),
+                "{label}: the board must show the mapped text"
+            );
+
+            for _ in 0..STATUS_DWELL_TICKS {
+                handle_event(&mut app, AppEvent::Tick, &mut store_at(Path::new("/tmp")));
+            }
+            if clears {
+                assert_eq!(
+                    app.status, None,
+                    "{label}: a neutral outcome is a confirmation and must clear after \
+                     the dwell"
+                );
+            } else {
+                assert_eq!(
+                    app.status.as_deref(),
+                    Some(expected.as_str()),
+                    "{label}: a failed signal must stay until the next key — the \
+                     process may still be running"
+                );
+            }
+        }
+    }
+
     /// A finished `InterruptFinished` carrying a STALE session id must not clear a
     /// newer `app.interrupting` guard. The interrupt twin of the launch-identity
     /// regression tests: the board may have moved on and dispatched another stop,
@@ -2441,7 +2920,8 @@ mod tests {
                     id: Some("job-a".to_string()),
                     state: Some("done".to_string()),
                     status: None,
-                    name: None,
+                    pid: None,
+                    started_at_ms: None,
                 },
             );
             map.insert(
@@ -2451,7 +2931,8 @@ mod tests {
                     id: Some("job-b".to_string()),
                     state: Some("done".to_string()),
                     status: None,
-                    name: None,
+                    pid: None,
+                    started_at_ms: None,
                 },
             );
             map
@@ -2710,7 +3191,8 @@ mod tests {
                 id: Some("job-w".to_string()),
                 state: Some("blocked".to_string()),
                 status: None,
-                name: None,
+                pid: None,
+                started_at_ms: None,
             },
         );
         app.set_live_probe(move || waiting.clone());
@@ -2731,7 +3213,8 @@ mod tests {
                 id: Some("job-z".to_string()),
                 state: Some("working".to_string()),
                 status: None,
-                name: None,
+                pid: None,
+                started_at_ms: None,
             },
         );
         app.set_live_probe(move || working.clone());
@@ -3032,7 +3515,8 @@ mod tests {
                 id: Some("job-e2e".to_string()),
                 state: Some("done".to_string()),
                 status: None,
-                name: None,
+                pid: None,
+                started_at_ms: None,
             },
         );
         app.set_live_probe(move || live.clone());
@@ -3605,10 +4089,11 @@ mod tests {
                     id: None,
                     state: Some(state.to_string()),
                     status: None,
-                    name: None,
+                    pid: None,
+                    started_at_ms: None,
                 },
             );
-            app.set_reported_agents(reported);
+            app.set_reported_agents(reported, None);
         }
         assert_eq!(app.selected.as_deref(), Some("sess-link"));
         app
@@ -3893,10 +4378,11 @@ mod tests {
                 id: Some("job-1".to_string()),
                 state: Some(state.to_string()),
                 status: None,
-                name: None,
+                pid: None,
+                started_at_ms: None,
             },
         );
-        app.set_reported_agents(reported);
+        app.set_reported_agents(reported, None);
         seed_live(&mut app, live);
         assert_eq!(app.selected.as_deref(), Some(id));
         app
@@ -4090,10 +4576,11 @@ mod tests {
                 id: Some(polled_job.to_string()),
                 state: Some("working".to_string()),
                 status: None,
-                name: None,
+                pid: None,
+                started_at_ms: None,
             },
         );
-        app.set_reported_agents(reported);
+        app.set_reported_agents(reported, None);
         assert_eq!(app.selected.as_deref(), Some(id));
         app
     }
@@ -4290,22 +4777,60 @@ mod tests {
         );
     }
 
-    /// A `ReportedAgents` event swaps the agent set in (off-thread delivery path).
+    /// A `ReportedAgents` event swaps the agent set in (off-thread delivery path),
+    /// together with the wall-clock instant the poller stamped it at.
+    ///
+    /// The stamp is the banner age's "now", so three things are pinned about it:
+    /// it lands on `App` exactly as carried (this arm reads no clock of its own);
+    /// a later map WITHOUT one clears it rather than keeping the older poll's
+    /// instant; and it never reaches `App::status`, because an age is true over an
+    /// interval and the status line carries only keypress-scoped outcomes
+    /// (STATUS-LINE OWNERSHIP).
     #[test]
     fn reported_agents_event_updates_the_agent_set() {
+        // The capture's real `startedAt` (1_790_152_789_592), polled 46 minutes on.
+        const POLLED_AT: i64 = 1_790_155_549_592;
         let mut app = app_with("s", None);
         assert!(app.reported_agent("s").is_none());
+        assert_eq!(app.reported_at_ms, None, "no poll yet, so no instant");
         let mut reported = HashMap::new();
-        reported.insert("s".to_string(), reported_agent("background"));
+        let mut agent = reported_agent("background");
+        agent.started_at_ms = Some(POLLED_AT - 46 * 60 * 1_000);
+        reported.insert("s".to_string(), agent);
         handle_event(
             &mut app,
-            AppEvent::ReportedAgents(reported),
+            AppEvent::ReportedAgents {
+                agents: reported.clone(),
+                reported_at_ms: Some(POLLED_AT),
+            },
             &mut store_at(Path::new("/tmp")),
         );
         assert_eq!(
             app.reported_agent("s").map(ReportedAgent::kind_label),
             Some("bg"),
             "a ReportedAgents event must update the agent set"
+        );
+        assert_eq!(
+            app.reported_at_ms,
+            Some(POLLED_AT),
+            "the map's own stamp must land with it, exactly as carried"
+        );
+        assert_eq!(
+            app.status, None,
+            "an age is an interval fact: it renders on the banner, never on the status line"
+        );
+
+        handle_event(
+            &mut app,
+            AppEvent::ReportedAgents {
+                agents: reported,
+                reported_at_ms: None,
+            },
+            &mut store_at(Path::new("/tmp")),
+        );
+        assert_eq!(
+            app.reported_at_ms, None,
+            "a map with no stamp must not inherit the previous poll's instant"
         );
     }
 
@@ -5562,10 +6087,11 @@ mod tests {
     /// teardown hangs on.
     ///
     /// Both directions are load-bearing, and the FALSE side is the sharper one: the
-    /// three no-teardown effects keep drawing on the same channel, so counting
+    /// no-teardown effects keep drawing on the same channel, so counting
     /// `BgLaunch` here would close the draft card at the moment of dispatch — which
     /// is precisely the snap-back-to-an-unrelated-transcript the card exists to
-    /// prevent.
+    /// prevent. `Signal` is one of them: the driver performs it inline and keeps the
+    /// board up, so it must not end the session either.
     #[test]
     fn ends_board_session_is_true_for_the_teardown_outcomes_only() {
         let ready = resume::Ready {
@@ -5605,6 +6131,8 @@ mod tests {
             copied: false,
         }
         .ends_board_session());
+        // A value only: nothing here signals — the syscall lives in the driver.
+        assert!(!Outcome::Signal { pid: 29628 }.ends_board_session());
     }
 
     /// An in-flight card must not outlive the board session that dispatched it.
@@ -5904,7 +6432,8 @@ mod tests {
                         id: None,
                         state: state.map(str::to_owned),
                         status: None,
-                        name: None,
+                        pid: None,
+                        started_at_ms: None,
                     },
                 )
             })

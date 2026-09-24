@@ -132,12 +132,22 @@ pub const NEW_SESSION_NONZERO_HINT: &str =
 /// job.
 ///
 /// `claude attach` matches the agent-view JOB id (the short `id` from
-/// `claude agents --json`), which only BACKGROUND agents expose. An INTERACTIVE
-/// live session has no such id, so there is nothing to attach to — refuse with
-/// this hint rather than spawning a broken `claude attach` (which would exit 1
-/// with "No job matching").
-pub const ATTACH_NO_JOB_ID: &str = "This interactive session has no attachable agent job; \
-     open it in its own terminal, or Fork instead.";
+/// `claude agents --json`), which only BACKGROUND agents expose. A record claude
+/// reports without one (every `kind:"interactive"` record measured so far, at
+/// `claude 2.1.278` and `2.1.280`) has nothing to attach to, so refuse with this
+/// hint rather than spawning a broken `claude attach` (which would exit 1 with
+/// "No job matching").
+///
+/// **Worded for what was OBSERVED** — the rule [`ATTACH_NOT_LIVE`] states. It used
+/// to call the session "interactive" and send the user to "open it in its own
+/// terminal". Both pick one reading of that `kind`, a real TUI, and the measured
+/// records do not support picking either: at `claude 2.1.278` every one (11/11) was
+/// a `claude -p` child with no terminal of its own, and at `claude 2.1.280` both
+/// (2/2) were pty-backed TUIs, one of them idle (see `docs/agents/DOMAIN.md`, "What
+/// `kind: "interactive"` denotes"). The copy now states only the absent job id, and
+/// names the one move that works on the same record either way: Fork.
+pub const ATTACH_NO_JOB_ID: &str = "claude reports no attachable job for this session, \
+     so there is nothing to attach to. Press Ctrl-F to fork it instead.";
 
 /// Refusal shown when Attach is chosen but claude's ACTIVE list no longer
 /// reports the session as a running agent.

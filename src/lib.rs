@@ -113,14 +113,16 @@ pub fn run() {
                 app.apply_reload(store.reload());
             }
             // `run` only breaks its own loop on Quit/Resume; Continue never
-            // escapes, and a quick-reply Send, an interrupt, a background-agent
-            // launch, and a clipboard copy (its request and its completion) are all
-            // handled INSIDE `run_inner` (the board stays up, so none of them
-            // propagates here) — treat them all as a clean exit for totality.
+            // escapes, and a quick-reply Send, an interrupt, the interrupt's SIGTERM
+            // route, a background-agent launch, and a clipboard copy (its request
+            // and its completion) are all handled INSIDE `run_inner` (the board
+            // stays up, so none of them propagates here) — treat them all as a
+            // clean exit for totality.
             Ok(
                 Outcome::Continue
                 | Outcome::Send(_)
                 | Outcome::Interrupt(_)
+                | Outcome::Signal { .. }
                 | Outcome::BgLaunch(_)
                 | Outcome::Copy(_)
                 | Outcome::FinishCopy { .. },
@@ -243,13 +245,7 @@ mod tests {
             .map(|id| {
                 (
                     (*id).to_string(),
-                    ReportedAgent {
-                        kind: "interactive".to_string(),
-                        id: None,
-                        state: None,
-                        status: None,
-                        name: None,
-                    },
+                    ReportedAgent::fixture("interactive", None, None),
                 )
             })
             .collect();

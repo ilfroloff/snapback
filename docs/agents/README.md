@@ -25,8 +25,10 @@ find the same rule in two places, that is a bug to fix.
    prerequisites, the hidden `--print-list` mode, the CI + release-plz
    automation, and the pre-finish validation checklist.
 6. [CLAUDE_CLI.md](CLAUDE_CLI.md) — **the external `claude` binary**: version
-   pin, the argv `snapback` spawns, top-level flags, commands, and the hidden
-   `stop`/`attach` commands it depends on.
+   pin, the argv `snapback` spawns (and the one effect that is not a `claude`
+   invocation: a `kill(2)` on a pid `claude agents --json` reported), top-level
+   flags, commands, and the background-session commands — `stop`/`attach`, which
+   it depends on, and the ones it deliberately does not use.
 
 ## Section ownership (avoid duplication)
 

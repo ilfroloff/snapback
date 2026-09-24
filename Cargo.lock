@@ -1469,6 +1469,7 @@ dependencies = [
  "anyhow",
  "crossterm",
  "dirs",
+ "libc",
  "memchr",
  "notify",
  "notify-debouncer-mini",

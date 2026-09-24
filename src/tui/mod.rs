@@ -550,6 +550,19 @@ fn run_inner(
                 Outcome::BgLaunch(req) => {
                     crate::send::spawn_bg_launch(req, events.sender());
                 }
+                // A confirmed, re-verified SIGTERM: performed RIGHT HERE, inline, and
+                // its result shown on the status line at once — with no detached
+                // thread and no `AppEvent` round trip on ANY path, because `kill(2)`
+                // returns as soon as the signal is queued and there is no completion
+                // to wait for. `Outcome::Signal` carries that reasoning where it is
+                // declared. The syscall's result goes straight into the pure
+                // `update::show_signal_result`, which owns the transient-vs-sticky
+                // choice so that choice is tested without signalling anything. The
+                // board keeps drawing either way; the row clearing is what shows it
+                // worked, since nothing here waits for the process to exit.
+                Outcome::Signal { pid } => {
+                    update::show_signal_result(app, crate::send::signal_term(pid));
+                }
                 // A `Ctrl-X y` copy request: read the environment HERE, at the edge,
                 // pick the route, then either start the clipboard-tool worker (it
                 // reports back via `AppEvent::CopyFinished` on this same channel) or,

@@ -65,8 +65,18 @@ it. Follow this split when adding behavior:
   `build_new_argv` / `status_for_exit`; every decision in `send` — `reply_gate` /
   `interrupt_gate` (the whole routing tree, asserted with no process spawned),
   `build_send_argv` / `build_stop_argv` / `build_bg_launch_argv`, `plan_send` /
-  `plan_bg_launch`, and the `status_for_output` / `status_for_failed_send` /
-  `status_for_stop` / `status_for_bg_launch` mapping;
+  `plan_bg_launch`, the `status_for_output` / `status_for_failed_send` /
+  `status_for_stop` / `status_for_bg_launch` / `status_for_signal` mapping, and
+  the signal route's two checks, `signal_plan` (re-verify a captured pid against
+  a fresh record) and `signal_target` (narrow it to a strictly positive `pid_t`,
+  or refuse, by `positive_pid_t` — the range half of `signallable_pid`, the one
+  rule `interrupt_gate` applies, whose other half refuses the board's own pid and
+  takes it as a parameter, `App::own_pid`, so no test reads a real process id)
+  — each split out so the guard in front of `kill(2)` is asserted without ever
+  calling it; `tui::update::show_signal_result`, which takes that syscall's result
+  as a parameter, so what the status line does after it is tested with no signal;
+  `agents::elapsed_phrase` and `watch::epoch_ms`, which take their instants as
+  parameters so no test reads a clock;
   `compose::compose_key_to_action`; `defined_agents::select_agents` /
   `parse_frontmatter`; `agents::classify` and the outputs derived from it
   (`qualifier_copy`, the shared banner/list-row phrase that `friendly_status`
@@ -126,8 +136,10 @@ it. Follow this split when adding behavior:
 - Thin, impure: `resume::launch` (chdir + spawn + wait), `defined_agents::discover_agents`
   (the FS walk over `select_agents` / `parse_frontmatter`), `worktrees::resolve`
   (spawn + capture, delegating every decision to `set_from_output`), the `watch`
-  threads, `tui::run` (draw loop). Keep these small and delegate to tested
-  helpers.
+  threads, `tui::run` (draw loop), and `send::signal_term` (the crate's one
+  syscall, `kill(2)` with SIGTERM, whose only caller is that loop and which NO
+  test may call — see "Watch every test fail" below). Keep these small and
+  delegate to tested helpers.
 
 The terminal-up **refusal gate** is an instance of this: `resume::check` (and its
 sibling `resume::check_new` for starting a fresh session in the launch dir) runs
@@ -466,7 +478,11 @@ the board keeps drawing while the child runs. The pure send DECISION is returned
 `Outcome::Send` and the spawn happens in the `run` driver, keeping the effect out of
 the pure event handler. `send::spawn_interrupt` and `send::spawn_bg_launch` are the
 same shape for `claude stop` and `claude --bg`; a new one-shot child belongs here
-rather than behind a teardown whenever it needs no TTY.
+rather than behind a teardown whenever it needs no TTY. A single NON-blocking
+syscall is not this shape and gets no thread: `Ctrl-K`'s SIGTERM
+(`Outcome::Signal`) runs inline in the driver, because this rule governs blocking
+work and `kill(2)` returns as soon as the signal is queued. That satisfies the
+rule rather than waiving it.
 
 The `Ctrl-X y` clipboard copy is that same THREADED shape, and it is NOT a third
 synchronous one-shot beside the two exceptions below. `handle_chord_key` returns
@@ -497,9 +513,10 @@ must be argued at the call site rather than assumed:
 - Be **accurate about what it costs**, per branch. Where nothing renders between
   the probe and the terminal teardown (plain resume; a confirmed Attach) it is
   invisible. Where the board draws again — the Enter gate's overlay, Attach's
-  two refusals, and EVERY branch of the delete confirm — it lands ~0.26s after the
-  keypress: a real, deliberate hitch. Do not paper over it with a zero-render
-  claim that only holds on one branch.
+  two refusals, EVERY branch of the delete confirm, and EVERY branch of the
+  `Ctrl-K` signal confirm's `Enter` — it lands ~0.26s after the keypress: a real,
+  deliberate hitch. Do not paper over it with a zero-render claim that only holds
+  on one branch.
 - **One shot means one, whatever the target count.** The hard-delete confirm
   (`confirm_delete`) judges a whole fork lineage, so it takes claude's active list
   ONCE for the entire set (`App::live_agents_now`) and evaluates every member
@@ -513,7 +530,12 @@ Attach hand-off asks AGAIN rather than reusing the gate's answer or the polled
 map, and the hard-delete confirm asks for itself. `route_handoff` is where that
 second ask lives; `confirm_delete` is the third site, and it counts as
 hand-off-shaped for the same reason — an irreversible unlink is exactly the kind
-of decision that must not be made from a stale snapshot. The reason is the same one
+of decision that must not be made from a stale snapshot. `update::dispatch_signal`
+is the fourth: `Ctrl-K`'s signal confirm asks AGAIN at `Enter`, because the pid it
+captured is worse than stale data once the confirm has sat open — it may name an
+unrelated process by then. The job-id arm of that same confirm deliberately does
+NOT re-ask (a stale job id makes `claude stop` fail safe), and that asymmetry is
+argued at the call site so a "symmetry" refactor cannot erase it. The reason is the same one
 that moved the gate here — an authoritative decision must not be made from a
 stale snapshot — and it is sharper at Attach, because the overlay can sit open
 indefinitely, so the gate's answer has no bounded freshness at all. **Nothing
@@ -749,11 +771,14 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    printable char types into the query; arrows, Enter, Tab, and `Ctrl-*` always
    act so search never blocks navigation).
 2. `apply_action` mutates the `App` and returns an `Outcome`
-   (`Continue`/`Quit`/`Resume`/`Send`/`Interrupt`/`BgLaunch`). `Send`, `Interrupt`
-   and `BgLaunch` carry a confirmed `SendRequest` / `InterruptRequest` /
+   (`Continue`/`Quit`/`Resume`/`Send`/`Interrupt`/`BgLaunch`/`Signal`/`Copy`/
+   `FinishCopy`). `Send`,
+   `Interrupt` and `BgLaunch` carry a confirmed `SendRequest` / `InterruptRequest` /
    `BgLaunchRequest` the driver spawns without a teardown (the board stays up), the
    way `Resume` carries a confirmed `Ready` — the decision is data, the effect is
-   the driver's. Add a new effect this way, not by spawning inside the handler.
+   the driver's. `Signal { pid }` carries a re-verified pid the same way; the driver
+   sends it a SIGTERM inline rather than on a thread (see §6). Add a new effect
+   this way, not by spawning or signalling inside the handler.
    The `Ctrl-X y` copy is the same shape in two steps: the chord's
    `handle_chord_key` returns `Outcome::Copy` (the full id) for the driver to
    start, and `handle_event` turns the worker's `AppEvent::CopyFinished` into
@@ -779,7 +804,9 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    waiting agent?" confirmation via `App.pending_stop` (a plain Enter/Esc gate
    before compose, for the `needs input` quick-reply path), its `Ctrl-K` sibling
    `App.pending_interrupt` (the same Enter/Esc gate, but resolving to a bare
-   `Outcome::Interrupt` rather than into compose), and the compose zone via
+   `Outcome::Interrupt` on the job-id route, or — after a re-probe — to
+   `Outcome::Signal` on the pid route, rather than into compose), and the compose
+   zone via
    `App.compose` + its `compose_key_to_action` machine — ONE keyboard owner for
    BOTH drafts, since which one is open is a `ComposeTarget` rather than a
    second piece of state. `handle_event` checks each in turn before the board.
@@ -943,7 +970,20 @@ state and renders on the surface that owns it:
 - an interrupt in flight lives in `App::interrupting` and deliberately has **no**
   visible label — `claude stop` is fast and the badge clears on the next agents
   poll — but the guard still prevents a stale completion from landing on a
-  surface that has moved on.
+  surface that has moved on;
+- how long a reported session has been running lives in typed state and renders
+  on the preview banner (`live busy · 46m`), not on the help line: the record's
+  `startedAt` (`ReportedAgent::started_at_ms`) against `App::reported_at_ms`, the
+  wall-clock instant the poller's map was answered. The poller stamps it
+  (`AppEvent::ReportedAgents { agents, reported_at_ms }`) and the event arm only
+  stores it, so the age is "as of the last poll", no clock is read in render, and
+  applying a map never writes `App::status`.
+
+`Ctrl-K`'s SIGTERM is the opposite case, an OUTCOME: the driver hands the
+syscall's result to `update::show_signal_result`, which sets `SIGNAL_SENT` /
+`SIGNAL_ALREADY_GONE` transient and any failure sticky, because a sent signal is a
+fact about one instant. Its effect, the row's `live` badge clearing, arrives
+through the agents poll like any other change.
 
 The help line renders `App::status` and nothing else. `set_status` is sticky
 (failures and refusals persist until the next actionable keypress);
@@ -1025,7 +1065,10 @@ Every new pure function gets a unit test in the same file.
 
 A test that has never been observed red is an unverified claim. Before reporting
 work green: temporarily break what the test pins, confirm it FAILS, restore. If
-it still passes, it was never testing what you thought.
+it still passes, it was never testing what you thought. NEVER break a guard in
+front of a real side effect (a syscall, a spawn, a file delete) while any test
+can still reach that effect — the break turns that test into the very accident
+the guard exists to prevent.
 
 This is not a hypothetical discipline — the live-status work shipped three tests
 that passed against broken code, each for a different reason:

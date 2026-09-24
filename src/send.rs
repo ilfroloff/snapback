@@ -47,6 +47,16 @@
 //! `--agent` on the launch, a background-task sweep that terminates the agent the
 //! reply was aimed at on the send. So each treats a zero exit with a non-empty
 //! stderr as *started/sent, but claude warned…* rather than as a clean success.
+//!
+//! `Ctrl-K`'s SIGNAL route lives here too, and it is the one piece that spawns no
+//! `claude` child at all. A reported session with no stoppable job id but a `pid` a
+//! signal could take ([`signallable_pid`]; [`interrupt_gate`] →
+//! [`InterruptGate::ConfirmSignal`]) is confirmed, the pid is
+//! re-verified against a fresh probe ([`signal_plan`]), and [`signal_term`] sends it
+//! a SIGTERM through `kill(2)`, the crate's one syscall, with no thread and no event
+//! because the call does not block. [`status_for_signal`] maps the result. Every
+//! decision on that route is pure; [`signal_term`] is its only effect, and no test
+//! calls it.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -66,13 +76,33 @@ use crate::watch::AppEvent;
 /// [`reply_gate`] for claude's verbatim error). A `done` or `needs input` agent can
 /// be deregistered first with `claude stop` and replied to in place, but stopping a
 /// `working` agent would interrupt live work and stopping an `idle` one abandons a
-/// live agent for no clear gain — so those refuse and point at the moves claude's
-/// own error names: Attach (interact with it directly) or Fork (`Ctrl-F`, to branch
-/// a copy). Mirrors [`crate::resume::ATTACH_NO_JOB_ID`]'s "refuse with a clear next
-/// move" shape.
+/// live agent for no clear gain — so those refuse, and point at the next moves.
+///
+/// **It names only moves that hold for EVERY record that reaches it.** Two kinds
+/// do: a job-id record in a live bucket, and a record with NO job id at all, which
+/// [`reply_gate`] refuses before it looks at a bucket. Every `kind:"interactive"`
+/// record measured so far is of that second kind, whichever process was behind it:
+/// at `claude 2.1.278` every one (11/11) was a `claude -p` child, and at
+/// `claude 2.1.280` both (2/2) were pty-backed TUIs, one busy and one idle (see
+/// `docs/agents/DOMAIN.md`, "What `kind: "interactive"` denotes"). None carried a
+/// job id. It used to say "Attach to answer it", but Attach
+/// refuses that second kind ([`crate::resume::ATTACH_NO_JOB_ID`]), so the hint led
+/// to a second refusal. It now names:
+///
+/// * Fork (`Ctrl-F`), which works on either kind;
+/// * `Ctrl-K`, which has a route for both: `claude stop` for a job id, a confirmed
+///   SIGTERM for a reported `pid` (see [`interrupt_gate`]). It is offered with
+///   "Try", never promised, because a record with neither handle is still refused
+///   ([`INTERRUPT_NO_JOB_ID`]), and so is one whose pid no signal could take
+///   ([`INTERRUPT_PID_UNUSABLE`]).
+///
+/// Attach stays one keypress away on a job-id record (Enter's running-session
+/// choice). It is just no longer named here. Mirrors
+/// [`crate::resume::ATTACH_NOT_LIVE`]'s "refuse with a next move that holds in
+/// every world" shape.
 pub const SEND_LIVE_REFUSED: &str =
-    "This session is running as an agent — claude won't resume it in place. \
-     Attach to answer it, or Fork (Ctrl-F) to branch a copy.";
+    "claude reports this session as a running agent, so it won't resume it in place. \
+     Try Ctrl-K to stop it, or Fork (Ctrl-F) to branch a copy.";
 
 /// Neutral success status when the JSON parsed but carried no `total_cost_usd`,
 /// or when stdout was unreadable/empty (the child ran, but said nothing we can
@@ -160,6 +190,20 @@ pub enum ReplyGate {
     Refuse(&'static str),
 }
 
+/// The record's job `id` IF `claude stop` has something to take — `None` for both
+/// an absent id and a BLANK one.
+///
+/// One spelling of that rule for every gate that asks it ([`reply_gate`],
+/// [`interrupt_gate`], [`signal_plan`]), because the three must agree: a blank id
+/// that read as stoppable would spawn `claude stop "   "`, and — since
+/// `interrupt_gate` reads a record's `pid` exactly where this answers `None` — a
+/// drift between two of them would move the boundary between the DELEGATED stop and
+/// an irreversible signal. Pure; trimmed for the test rather than stored trimmed, so
+/// the id handed to `claude` is byte-for-byte the one claude reported.
+fn stoppable_job_id(agent: &ReportedAgent) -> Option<&str> {
+    agent.id.as_deref().filter(|id| !id.trim().is_empty())
+}
+
 /// Decide [`ReplyGate`] from the session's current live-agent record (`None` when
 /// claude is not holding it).
 ///
@@ -170,7 +214,9 @@ pub enum ReplyGate {
 /// first (stopping abandons a waiting agent); `working`/`idle`/`interrupted`/unknown
 /// → refuse (stopping would interrupt live work, and the user should Attach/Fork). A
 /// held agent with no stoppable job id (`id == None`, e.g. an interactive session)
-/// can't be stopped, so it refuses too. Not held at all → reply in place directly.
+/// gives this path's `claude stop` step nothing to take, so it refuses too (a
+/// `pid` does not change that: signalling is `Ctrl-K`'s own confirmed verb, never a
+/// reply's preparatory step). Not held at all → reply in place directly.
 ///
 /// [`AgentActivity::WorkingButIdle`] rides with the LIVE states, NOT with
 /// [`AgentActivity::Ended`], even though both badge steady. The difference is
@@ -185,7 +231,7 @@ pub fn reply_gate(record: Option<&ReportedAgent>) -> ReplyGate {
     let Some(agent) = record else {
         return ReplyGate::Reply; // claude isn't holding it -> plain in-place reply
     };
-    let Some(job_id) = agent.id.as_deref().filter(|id| !id.trim().is_empty()) else {
+    let Some(job_id) = stoppable_job_id(agent) else {
         // Held but not stoppable by job id (e.g. an interactive session).
         return ReplyGate::Refuse(SEND_LIVE_REFUSED);
     };
@@ -209,13 +255,44 @@ pub fn reply_gate(record: Option<&ReportedAgent>) -> ReplyGate {
 pub const INTERRUPT_NOT_LIVE: &str =
     "This session isn't running as an agent — there's nothing to stop.";
 
-/// Refusal shown when `Ctrl-K` targets a LIVE session with no stoppable job id — an
-/// interactive session (running in another terminal) that `claude agents` lists
-/// without an `id`. `claude stop` only takes the short background job id, so an
-/// interactive one can't be stopped from here; point at the terminal that owns it.
+/// Refusal shown when `Ctrl-K` targets a session claude reports with NEITHER handle:
+/// no stoppable job `id` for `claude stop`, and no `pid` for the signal route
+/// ([`InterruptGate::ConfirmSignal`]). Since that route landed, this is the only
+/// case [`interrupt_gate`] refuses with it. A record that DOES carry a pid, but one
+/// no signal could ever take, refuses with [`INTERRUPT_PID_UNUSABLE`] instead:
+/// "no process id" would be false for it.
+///
+/// **Worded for what was OBSERVED, and nothing more** — the rule behind
+/// [`crate::resume::ATTACH_NOT_LIVE`]. It used to send the user to "the terminal
+/// that's running it", which named an owner the evidence does not support. The
+/// `kind:"interactive"` records measured so far took two shapes: at `claude 2.1.278`
+/// every one (11/11) was a `claude -p` child with no terminal of its own, and at
+/// `claude 2.1.280` both (2/2) were pty-backed TUIs, one busy and one idle (see
+/// `docs/agents/DOMAIN.md`, "What `kind: "interactive"` denotes"). So a terminal may
+/// or may not exist, and nothing snapback observes says whose it is. Both readings
+/// agree on the record, so the copy describes the record: two absent handles, hence
+/// nothing here to act with. It does not claim the session stopped, or will.
 pub const INTERRUPT_NO_JOB_ID: &str =
-    "This session is running interactively, not as a background agent — \
-     stop it from the terminal that's running it.";
+    "claude reports no attachable job and no process id for this session, \
+     so there is no handle here to stop or signal it.";
+
+/// Refusal shown when `Ctrl-K` targets a session claude reports with no stoppable job
+/// `id` and a `pid` this board can never signal: `0`, a number past `i32::MAX` that no
+/// `pid_t` can hold, or the board's OWN process id (the rule is [`signallable_pid`]).
+/// The gate refuses it at the keypress rather than opening a confirm whose only
+/// possible end is a failure — or, for the board's own pid, the board's exit without
+/// its terminal restore.
+///
+/// Worded for what was OBSERVED, exactly like [`INTERRUPT_NO_JOB_ID`]: a process id IS
+/// on the record, so this must never say there is none. It names no owner and picks no
+/// reading of `kind`, and it does not claim the session stopped, or will. "Cannot be
+/// signalled" is said from the board's side and holds for all three causes, which the
+/// copy does not tell apart: no `kill(2)` can take the first two, and the board must
+/// not send the third, because that signal would end the board itself. Each leaves
+/// nothing here to stop the session with.
+pub const INTERRUPT_PID_UNUSABLE: &str =
+    "claude reports no attachable job for this session and a process id that \
+     cannot be signalled, so there is nothing here to stop it.";
 
 /// What `Ctrl-K` should do for the selected session, decided from what claude is
 /// holding it as right now.
@@ -223,10 +300,12 @@ pub const INTERRUPT_NO_JOB_ID: &str =
 /// The interrupt counterpart of [`ReplyGate`], with the OPPOSITE intent: a reply
 /// must never interrupt live work, whereas an interrupt exists to stop it — so a
 /// `working` (mid-turn) agent is a valid target here, not a refusal. Only a
-/// background job carries the short id `claude stop` takes; an interactive live
-/// session (no id) can't be stopped from here, and a session claude isn't holding at
-/// all has nothing to stop. Stopping abandons live work, so every state EXCEPT a
-/// finished (`done`) or terminal (`stopped` / `failed`) one confirms first.
+/// background job carries the short id `claude stop` takes; a reported session
+/// WITHOUT one is reachable solely through the `pid` on its record, and a session
+/// claude isn't holding at all has nothing to stop. Stopping abandons live work, so
+/// on the job-id route every state EXCEPT a finished (`done`) or terminal
+/// (`stopped` / `failed`) one confirms first — and the pid route confirms in every
+/// state, for the reason [`InterruptGate::ConfirmSignal`] gives.
 #[derive(Debug, PartialEq, Eq)]
 pub enum InterruptGate {
     /// A FINISHED (`done`) or TERMINAL (`stopped` / `failed`) agent — the job is
@@ -241,8 +320,24 @@ pub enum InterruptGate {
         /// The short agent-view job id to `claude stop`.
         job_id: String,
     },
-    /// Nothing stoppable — refuse with a message (not a live agent, or interactive
-    /// with no job id).
+    /// A reported session with NO attachable job id but a `pid` on the wire that a
+    /// signal could take ([`signallable_pid`]) — the only handle left. CONFIRM first,
+    /// then send that pid a SIGTERM.
+    ///
+    /// The confirm is UNCONDITIONAL: there is deliberately no `StopNow` counterpart
+    /// here, however finished the record looks. `StopNow` is safe because stopping a
+    /// job that already ended is claude's own no-op (`claude stop <dead-job>` just
+    /// exits non-zero). A signal has no such floor — a `state`/`status` bucket is a
+    /// report ABOUT a session, and it cannot prove the process now wearing this pid
+    /// is still the one claude reported.
+    ConfirmSignal {
+        /// The OS process id to signal, straight off the record
+        /// ([`ReportedAgent::pid`]) — and nothing else, because the pid IS the whole
+        /// decision here: no argv, no job, no child to spawn.
+        pid: u32,
+    },
+    /// Nothing stoppable — refuse with a message (not a live agent; reported with
+    /// neither a job id nor a pid; or with no job id and a pid no signal could take).
     Refuse(&'static str),
 }
 
@@ -250,11 +345,43 @@ pub enum InterruptGate {
 /// when claude is not holding it).
 ///
 /// Pure so the whole decision tree is unit-tested without a probe, reusing the one
-/// classifier ([`agents::classify`]). Mirrors [`reply_gate`]'s shape but routes by
-/// the interrupt intent: not held → refuse (nothing to stop); held without a
-/// stoppable job id → refuse (interactive, can't stop from here); `done` — or a
-/// TERMINAL `stopped` / `failed` — → stop immediately (harmless; the job is already
-/// over); every other live state → confirm first (stopping abandons live work).
+/// classifier ([`agents::classify`]). Spawns nothing and signals nothing — it only
+/// says which route the keypress takes. Mirrors [`reply_gate`]'s shape but routes by
+/// the interrupt intent: not held → refuse (nothing to stop); `done` — or a TERMINAL
+/// `stopped` / `failed` — → stop immediately (harmless; the job is already over);
+/// every other live state → confirm first (stopping abandons live work); no
+/// stoppable job id but a reported `pid` that a signal could take → confirm, then
+/// signal that pid; no job id and a `pid` no signal could ever take → refuse
+/// ([`INTERRUPT_PID_UNUSABLE`]); neither → refuse (nothing on the record to act on).
+///
+/// # The boundary between the two stop mechanisms
+///
+/// Two now exist, and keeping them apart is this function's main job. `claude stop
+/// <job-id>` is the DELEGATED verb: claude ends its own job, by a handle it issued.
+/// A SIGTERM to a pid is the blunt one, aimed at a process this code cannot prove it
+/// owns. So `claude stop` wins WHENEVER a job id exists — the pid arm is reachable
+/// only through the `else` of the job-id read, which is why a record carrying BOTH
+/// routes by the id and its pid is never even looked at. Do not widen the pid arm to
+/// a bucket that has a job id.
+///
+/// "No job id" and "has a pid" stay two SEPARATE conditions, and neither may be
+/// inferred from the other or from `kind` — [`ReportedAgent::pid`] carries the
+/// measurement that forces this (pid on 3/3 interactive and 0/159 background records
+/// at `claude 2.1.278`, but on 2/150 background ones in an earlier sample).
+///
+/// The pid route confirms UNCONDITIONALLY: there is no `StopNow` equivalent for it,
+/// because a `state`/`status` bucket describes a SESSION claude reported and cannot
+/// prove that a foreign process is safe to signal. That asymmetry against the job-id
+/// route's `StopNow` is deliberate, not an oversight — see
+/// [`InterruptGate::ConfirmSignal`].
+///
+/// The confirm opens only for a pid a signal could take. `0`, any number past
+/// `i32::MAX`, and `own_pid` — this board's own process id, passed in rather than read
+/// here so the gate stays pure — refuse here instead, by [`signallable_pid`]. Its range
+/// half is the one [`signal_target`] applies again right before `kill(2)`, so no
+/// confirm is ever offered for a pid that step would refuse. Its board half is asked
+/// here alone, because a SIGTERM to the board's own process would end the board without
+/// its terminal restore.
 ///
 /// [`AgentActivity::WorkingButIdle`] CONFIRMS rather than stopping immediately, for
 /// the same evidence gap [`reply_gate`] documents: `Ended` is claude's own terminal
@@ -263,13 +390,25 @@ pub enum InterruptGate {
 /// live work on that false positive with no way back; the confirm costs one keypress
 /// and is exactly the safety net for a bucket that cannot prove its own cause.
 #[must_use]
-pub fn interrupt_gate(record: Option<&ReportedAgent>) -> InterruptGate {
+pub fn interrupt_gate(record: Option<&ReportedAgent>, own_pid: u32) -> InterruptGate {
     let Some(agent) = record else {
         return InterruptGate::Refuse(INTERRUPT_NOT_LIVE); // nothing running to stop
     };
-    let Some(job_id) = agent.id.as_deref().filter(|id| !id.trim().is_empty()) else {
-        // Live but not stoppable by job id (e.g. an interactive session).
-        return InterruptGate::Refuse(INTERRUPT_NO_JOB_ID);
+    let Some(job_id) = stoppable_job_id(agent) else {
+        // No attachable job, so `claude stop` has no id to take. The pid claude
+        // reported for this session is the only handle left — and it is read HERE
+        // and nowhere else, inside the `else` of the job-id read, so the delegated
+        // verb keeps every record that has an id (see this function's docs).
+        return match agent.pid {
+            Some(pid) if signallable_pid(pid, own_pid).is_some() => {
+                InterruptGate::ConfirmSignal { pid }
+            }
+            // A pid IS on the record, but no signal from this board may take it (out
+            // of range, or the board's own): refuse now rather than open a confirm
+            // whose only possible end is a failure or the board's own exit.
+            Some(_) => InterruptGate::Refuse(INTERRUPT_PID_UNUSABLE),
+            None => InterruptGate::Refuse(INTERRUPT_NO_JOB_ID),
+        };
     };
     let job_id = job_id.to_string();
     match agents::classify(agent) {
@@ -282,6 +421,87 @@ pub fn interrupt_gate(record: Option<&ReportedAgent>) -> InterruptGate {
         | AgentActivity::Idle
         | AgentActivity::Other => InterruptGate::Confirm { job_id },
     }
+}
+
+/// Refusal when the confirm-time re-probe no longer reports the session AT ALL: it
+/// ended while the confirm was open, so there is nothing left to signal — and the pid
+/// the confirm still carries is exactly the stale number a reuse would turn into an
+/// unrelated process.
+pub const SIGNAL_RECORD_GONE: &str =
+    "That session is no longer reported as running — nothing was signalled.";
+
+/// Refusal when the re-probe DOES report the session but it now carries a stoppable
+/// job id: the delegated verb became available while the confirm was open, and it
+/// always wins (see [`interrupt_gate`]'s boundary section). The keypress re-routes
+/// rather than signalling, so `Ctrl-K` again takes the `claude stop` path.
+pub const SIGNAL_NOW_HAS_JOB: &str =
+    "That session now reports a stoppable job — press Ctrl-K again to stop it.";
+
+/// Refusal when the re-probed record carries a DIFFERENT pid — or none at all. The
+/// number captured at confirm time is no longer what claude reports for this session,
+/// so nothing on the current record vouches for it.
+pub const SIGNAL_PID_MOVED: &str =
+    "The process id reported for that session changed — nothing was signalled.";
+
+/// What `Enter` on the interrupt confirm's SIGNAL route should do, judged against a
+/// freshly re-probed record.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SignalPlan {
+    /// Re-verified against the fresh record: send THIS pid a SIGTERM.
+    Signal {
+        /// The pid to signal — the captured one, which the fresh record still names.
+        pid: u32,
+    },
+    /// Do not signal; show this reason instead.
+    Refuse(&'static str),
+}
+
+/// Decide whether the pid captured when the interrupt confirm OPENED is still the pid
+/// to signal, given the record a FRESH probe returns at `Enter`.
+///
+/// Pure — it takes the re-probed record as an argument and spawns nothing, so all four
+/// answers are unit-tested without a `claude` child. The probe itself happens at the
+/// call site ([`crate::tui::update`]'s interrupt-confirm `Enter` arm), which is also
+/// where the one-shot is argued.
+///
+/// # Why a second probe at all: pid reuse
+///
+/// Every other confirm in this codebase re-asks claude at the hand-off because the
+/// overlay can sit open INDEFINITELY. Here that unbounded window is worse than stale
+/// data: a pid is not a name, it is a slot the kernel recycles. A process that exits
+/// while the confirm is open frees its pid, and a signal aimed at the number would
+/// land on whatever took it. So the captured pid is treated as a CLAIM to re-verify,
+/// never as a target — and the only answer that signals is the one where claude still
+/// reports this very pid for this very session.
+///
+/// # The three refusals, in the order they are checked
+///
+/// 1. **The record is gone** ([`SIGNAL_RECORD_GONE`]) — the session ended on its own.
+///    Refusing is not just caution: its pid is now the likeliest of all to have been
+///    reused.
+/// 2. **The record now carries a stoppable job id** ([`SIGNAL_NOW_HAS_JOB`]) — the
+///    delegated `claude stop` wins wherever a job id exists ([`interrupt_gate`]), so a
+///    record that gained one must re-route rather than be signalled. A matching pid is
+///    permission to signal only in the absence of a better verb. It is checked BEFORE
+///    the pid comparison, which changes no SAFETY property (with both stale, either
+///    check refuses) but does decide which refusal the user reads: this one names a
+///    next move, where [`SIGNAL_PID_MOVED`] is a dead end.
+/// 3. **The pid moved** ([`SIGNAL_PID_MOVED`]) — the record reports a different pid,
+///    or none. One comparison covers both, because the question is not "did it
+///    change?" but "does the fresh record still name THIS pid?", and an absent pid
+///    answers no just as loudly as a different one.
+#[must_use]
+pub fn signal_plan(captured_pid: u32, fresh: Option<&ReportedAgent>) -> SignalPlan {
+    let Some(agent) = fresh else {
+        return SignalPlan::Refuse(SIGNAL_RECORD_GONE);
+    };
+    if stoppable_job_id(agent).is_some() {
+        return SignalPlan::Refuse(SIGNAL_NOW_HAS_JOB);
+    }
+    if agent.pid != Some(captured_pid) {
+        return SignalPlan::Refuse(SIGNAL_PID_MOVED);
+    }
+    SignalPlan::Signal { pid: captured_pid }
 }
 
 /// A confirmed send request handed from the compose zone (pure decision) to the
@@ -731,6 +951,238 @@ pub fn status_for_stop(success: bool, stdout: &str, stderr: &str) -> (String, bo
     )
 }
 
+// --- the signal route (Ctrl-K on a record with no stoppable job id) ---------
+
+/// Neutral success for a DELIVERED SIGTERM, and worded for exactly that much.
+///
+/// It must never read as "the process died": `kill(2)` returns the moment the signal
+/// is queued, nothing here waits, and SIGTERM is a request a process may take time to
+/// honour. The row clearing is what tells the user it worked.
+const SIGNAL_SENT: &str = "SIGTERM sent — not waiting for it to exit";
+
+/// Neutral outcome for `ESRCH`: no process currently carries that pid, so the signal
+/// had nothing to reach. Not a failure — it is the state the user was asking for,
+/// reached without us — so it is transient rather than sticky. Unix-only, like the
+/// `ESRCH` arm that produces it: off unix no syscall runs, so no errno can arrive.
+#[cfg(unix)]
+const SIGNAL_ALREADY_GONE: &str = "no process with that id — it is already gone";
+
+/// Prefix a surfaced signal failure carries, so it never reads as success. Mirrors
+/// [`STOP_FAILED_PREFIX`]'s role for `claude stop`.
+const SIGNAL_FAILED_PREFIX: &str = "signal failed: ";
+
+/// Fallback when the OS rejected the signal but left nothing readable to quote.
+const SIGNAL_FAILED_GENERIC: &str = "signal failed — the OS rejected it";
+
+/// Reason [`signal_target`] refuses a reported pid with: it cannot be represented as
+/// a strictly positive `pid_t`. Reaches the user as [`SIGNAL_FAILED_PREFIX`] + this.
+#[cfg(unix)]
+const SIGNAL_PID_OUT_OF_RANGE: &str = "reported process id is out of range";
+
+/// Reason [`signal_term`] refuses with OFF unix, where there is no `kill(2)` to call.
+/// Reaches the user as [`SIGNAL_FAILED_PREFIX`] + this — a sticky failure, which is
+/// the truth: nothing was sent, so the process is still running.
+#[cfg(not(unix))]
+const SIGNAL_UNSUPPORTED: &str = "sending a signal is not supported on this platform";
+
+/// THE rule for which reported pids a signal may ever take, in two halves. The RANGE
+/// half ([`positive_pid_t`]): the pid fits in a `pid_t` (`i32` on every unix) AND is
+/// STRICTLY POSITIVE. The BOARD half: it is not `own_pid`, this board's own process id.
+/// `None` for anything else — `0`, which `kill(2)` reads as "every process in my
+/// group"; any number past `i32::MAX`, which no `pid_t` can hold; and `own_pid`.
+///
+/// **Why the board's own pid is refused.** snapback installs no SIGTERM handler, so a
+/// SIGTERM to its own process ends the board on the spot, with raw mode and the
+/// alternate screen still on: an exit that skips the terminal restore, which TERMINAL
+/// SAFETY forbids. snapback is not a `claude` process, so a record naming its pid is
+/// not describing it — the likeliest way to get one is a stale record whose number was
+/// recycled onto the board. Refusing that one number loses nothing. Pid `1` stays
+/// allowed: an unprivileged `kill(1, …)` fails with `EPERM`, a sticky failure the
+/// board survives.
+///
+/// `own_pid` is a PARAMETER and is never read in here, so the rule stays pure: the
+/// board captures its pid ONCE (`App::own_pid`) and every test states one. Both sides
+/// are compared as the raw `u32`, before any narrowing, so no conversion can make two
+/// different numbers equal. An `own_pid` past `i32::MAX` excludes nothing extra,
+/// because the range half already refuses every such pid.
+///
+/// This is the single statement of the rule, and [`interrupt_gate`] reads it at the
+/// keypress: a pid this refuses gets [`INTERRUPT_PID_UNUSABLE`], so no confirm opens
+/// for a pid whose signal could only fail or end the board. The syscall's last check,
+/// [`signal_target`], asks the RANGE half again, and asks it alone — its docs say why
+/// the board half cannot reach it and why that is safe.
+///
+/// Pure and compiled on EVERY platform, returning a plain `i32` rather than a `pid_t`:
+/// the gate must build everywhere, while `pid_t` and [`signal_target`] are unix-only.
+#[must_use]
+fn signallable_pid(pid: u32, own_pid: u32) -> Option<i32> {
+    positive_pid_t(pid).filter(|_| pid != own_pid)
+}
+
+/// The RANGE half of [`signallable_pid`]: `pid` as a `pid_t` value if it fits AND is
+/// STRICTLY POSITIVE, else `None`. Stated once here and read by both
+/// [`signallable_pid`] (at the gate) and [`signal_target`] (right before `kill(2)`),
+/// so the check that keeps a process group or a broadcast out of `kill(2)` still runs
+/// twice without being written twice.
+///
+/// The parser accepts the whole `u32` range, so the conversion is `try_from` and never
+/// `as`: `as` would WRAP `u32::MAX` to `-1` (a broadcast) and everything past
+/// `i32::MAX` into a negative process GROUP. A pid past `i32::MAX` is unreachable from
+/// a real kernel, so refusing it costs nothing and removes the only route by which a
+/// sign could flip.
+#[must_use]
+fn positive_pid_t(pid: u32) -> Option<i32> {
+    i32::try_from(pid).ok().filter(|target| *target > 0)
+}
+
+/// Narrow a reported `pid` to the `pid_t` [`signal_term`] may pass to `kill(2)` — or
+/// REFUSE it, with an [`InvalidInput`](std::io::ErrorKind::InvalidInput) error carrying
+/// [`SIGNAL_PID_OUT_OF_RANGE`], when [`positive_pid_t`] rejects it (it cannot be
+/// represented as a STRICTLY POSITIVE one). That error has no errno because no syscall
+/// ran, and [`signal_term`] returns it unchanged.
+///
+/// Split out as a pure function precisely BECAUSE the thing it protects cannot be
+/// tested through [`signal_term`]: `kill(2)` reads a NEGATIVE argument as a process
+/// GROUP, `0` as "every process in my group" and `-1` as a broadcast, so a test that
+/// exercised the widening through the real syscall would be the very accident it is
+/// meant to prevent. Here the rule is an assertion instead of a comment — and so is
+/// the refusal: it is BUILT here, so its kind and its missing errno are tested here,
+/// and no test ever has a reason to call [`signal_term`].
+///
+/// What it asks is the RANGE half of [`signallable_pid`] ([`positive_pid_t`]), which
+/// [`interrupt_gate`] already applied before any confirm opened. Asking it again here is
+/// DEFENCE IN DEPTH: the gate is not allowed to be the only thing between a record and
+/// a process group. The step from its `i32` to `pid_t` is no conversion at all, because
+/// `pid_t` IS `i32` on every unix; on a target where it were not, this would stop
+/// compiling rather than narrow silently.
+///
+/// The rule's BOARD half (the board's own pid) is NOT asked again here, deliberately.
+/// This step takes the pid alone because [`signal_term`] — the crate's one `unsafe`
+/// block, kept exactly as reviewed — hands it the pid alone, and reading the board's
+/// pid in here would make it impure. Nothing is lost: a process's id never changes
+/// while it runs, so the gate's verdict on the board's pid cannot go stale the way a
+/// reported pid's owner can, and the only pid that reaches this step is the one
+/// [`signal_plan`] matched against the pid that gate already accepted.
+///
+/// Unix-only: `pid_t` is a unix type, and off unix [`signal_term`] refuses before any
+/// pid would need narrowing.
+#[cfg(unix)]
+fn signal_target(pid: u32) -> Result<libc::pid_t, std::io::Error> {
+    positive_pid_t(pid).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, SIGNAL_PID_OUT_OF_RANGE)
+    })
+}
+
+/// Send `pid` a **SIGTERM**. The ONE impure step on the signal route, and the only
+/// syscall in this crate.
+///
+/// Thin on purpose: every decision that led here is pure and tested elsewhere
+/// ([`interrupt_gate`] chose the route, [`signal_plan`] re-verified the pid,
+/// [`signal_target`] narrowed it — or refused it), so this does the syscall and maps
+/// its errno — nothing else. It does not even build the out-of-range refusal: that
+/// error comes whole from [`signal_target`] and is only propagated here. It returns
+/// the [`std::io::Error`](std::io::Error) rather than a `String` because the ERRNO is
+/// load-bearing: [`status_for_signal`] has to tell `ESRCH` ("already gone") from every
+/// other failure, and a pre-formatted message could not answer that. That keeps the
+/// judgement in the pure function and only the effect in here.
+///
+/// No test calls this, and none may: past [`signal_target`] its only step is the real
+/// `kill(2)`, so a test driving it is one broken guard away from `kill(-1, SIGTERM)`,
+/// a broadcast to every process this uid may signal. The refusal is asserted on
+/// [`signal_target`] and the errno mapping on [`status_for_signal`], both pure.
+///
+/// Two rules the signature is built to make hard to break:
+///
+/// * **SIGTERM, never SIGKILL.** SIGTERM is catchable, so the process gets to run its
+///   own shutdown — which matters most in the case this route cannot rule out: a
+///   process snapback did not start. There is no `SIGKILL` constant anywhere in this
+///   crate and no escalation ladder; a process that ignores SIGTERM stays running and
+///   says so through the board's own status, which is the honest outcome.
+/// * **The pid ITSELF, never a negative pid.** `kill(2)` reads a negative argument as
+///   a PROCESS GROUP (and `0`/`-1` as broadcasts), so a sign slip here would signal
+///   far more than the one process claude reported. `pid` arrives as `u32` — the
+///   parser's own narrowing ([`crate::agents::ReportedAgent::pid`]) — and the only
+///   conversion is [`signal_target`], which is pure, REJECTS rather than wraps, and
+///   is unit-tested for strict positivity.
+///
+/// Unix-only. Off unix a same-signature fallback compiles in its place and REFUSES
+/// rather than signals, so the driver's one call site builds on every target. The
+/// split is two `#[cfg]` ITEMS rather than `#[cfg]` statements inside one body, so
+/// this function — the crate's one `unsafe` block — stays exactly as reviewed.
+#[cfg(unix)]
+pub fn signal_term(pid: u32) -> Result<(), std::io::Error> {
+    let target = signal_target(pid)?;
+    // SAFETY: `kill` takes two scalars and touches no memory this side owns, so there
+    // is no pointer, lifetime or aliasing obligation to uphold. `target` is a strictly
+    // positive `pid_t` — the only `Ok` `signal_target` can return — so the call cannot
+    // address a process group. Any failure is reported through `errno`, which is read
+    // immediately below before anything else can overwrite it.
+    let rc = unsafe { libc::kill(target, libc::SIGTERM) };
+    if rc == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The off-unix stand-in for the unix [`signal_term`]: same signature, and it signals
+/// NOTHING. There is no `kill(2)` (and no `pid_t`) to call here, so it refuses with an
+/// [`Unsupported`](std::io::ErrorKind::Unsupported) error carrying
+/// [`SIGNAL_UNSUPPORTED`], which [`status_for_signal`] shows as a sticky failure. No
+/// errno, because no syscall ran. Shipped targets are darwin and linux only; this
+/// exists so the crate still compiles elsewhere, the same compile-everywhere shape as
+/// `resume::opener_argv`'s unsupported-target arm.
+#[cfg(not(unix))]
+pub fn signal_term(pid: u32) -> Result<(), std::io::Error> {
+    let _ = pid; // unsupported target: nothing to signal
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        SIGNAL_UNSUPPORTED,
+    ))
+}
+
+/// Map the result of [`signal_term`] to a board status and its class.
+///
+/// The signal sibling of [`status_for_stop`], and deliberately NOT a reuse of it:
+/// that one takes `(success, stdout, stderr)` because a `claude` CHILD produces
+/// streams, while a syscall produces an errno. Synthesizing empty streams to fit the
+/// existing signature would fake a child that never ran; a sibling keeps one shape per
+/// source of truth. It reuses [`sanitize_status`] so the OS error text is stripped of
+/// ANSI/control characters and length-capped exactly like claude's (TERMINAL-SAFE
+/// STYLING — no raw escape can reach the ratatui buffer). Pure and unit-tested.
+///
+/// Three arms, two of them neutral:
+///
+/// * **`Ok`** → [`SIGNAL_SENT`], TRANSIENT. It claims delivery and nothing more —
+///   never that the process exited, which this code does not wait to observe.
+/// * **`ESRCH`** → [`SIGNAL_ALREADY_GONE`], TRANSIENT. Nothing carries that pid, so
+///   the signal had nothing to reach. That is the asked-for state, not an error.
+/// * **anything else** (`EPERM`, and [`signal_target`]'s errno-less out-of-range
+///   refusal) → STICKY, quoting the reason, because it means the process is still
+///   running and the user needs to know the attempt did not take.
+///
+/// The `ESRCH` arm is unix-only (`#[cfg(unix)]`, like the `libc` constant it names).
+/// Off unix [`signal_term`] never makes a syscall, so no errno can arrive, and its
+/// `Unsupported` refusal lands on the sticky arm.
+#[must_use]
+pub fn status_for_signal(result: Result<(), std::io::Error>) -> (String, bool) {
+    let Err(err) = result else {
+        return (SIGNAL_SENT.to_string(), true);
+    };
+    #[cfg(unix)]
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        return (SIGNAL_ALREADY_GONE.to_string(), true);
+    }
+    let reason = sanitize_status(&err.to_string());
+    (
+        if reason.is_empty() {
+            SIGNAL_FAILED_GENERIC.to_string()
+        } else {
+            format!("{SIGNAL_FAILED_PREFIX}{reason}")
+        },
+        false,
+    )
+}
+
 // --- background-agent launch (the new-session Ctrl-N draft pane) ------------
 
 /// Neutral success: `claude --bg` exited clean AND printed nothing on stderr, so
@@ -920,6 +1372,39 @@ pub fn spawn_bg_launch(req: BgLaunchRequest, tx: Sender<AppEvent>) {
     });
 }
 
+/// Phrasings NO user-facing string may contain, because each of them asserts
+/// something about who owns the signalled process that the evidence cannot
+/// support.
+///
+/// A `kind:"interactive"` record has been measured as TWO different processes, so
+/// no single reading of that kind holds:
+///
+/// * `claude 2.1.278`: every record (11/11) was a `claude -p` child with no
+///   terminal of its own, all `busy`, and two pty-backed TUIs did not register in
+///   short NEGATIVE probes.
+/// * `claude 2.1.280`: both records (2/2) were pty-backed TUIs, one `busy` and one
+///   `idle`, so there registration is not keyed to a turn in flight.
+///
+/// The evidence and its limits (`ps` parentage on one machine) are in
+/// `docs/agents/DOMAIN.md`, "What `kind: "interactive"` denotes". Nothing snapback
+/// can observe proves who owns such a pid, whichever shape it is. The copy has to
+/// be true under EITHER reading, so it may describe only what was observed.
+///
+/// ONE list for the whole crate, test-only: the confirm's render tests
+/// (`tui::view`) and the refusal-copy test below both read it, so a phrasing
+/// found to mislead is banned everywhere by one edit. `"own terminal"` is here
+/// because a refusal once sent the user to open the session "in its own
+/// terminal": the `claude -p` shape has no terminal, and in the TUI shape
+/// snapback cannot tell where that terminal is or whose it is.
+#[cfg(test)]
+pub(crate) const OWNERSHIP_CLAIMS: [&str; 5] = [
+    "your terminal",
+    "another terminal",
+    "the terminal that's running it",
+    "own terminal",
+    "snapback started",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1026,15 +1511,27 @@ mod tests {
     }
 
     /// A background agent record in a given `state`, carrying a stoppable job id.
+    ///
+    /// Pid-less by default, which is what the wire shows for a background record
+    /// (0/159 at claude 2.1.278). A test that needs one appends
+    /// [`ReportedAgent::with_pid`] — including the case that must prove the pid
+    /// is IGNORED whenever a job id is also present.
     fn bg(state: &str, job_id: Option<&str>) -> ReportedAgent {
         ReportedAgent {
             kind: "background".to_string(),
             id: job_id.map(str::to_owned),
             state: Some(state.to_string()),
             status: None,
-            name: None,
+            pid: None,
+            started_at_ms: None,
         }
     }
+
+    /// The board's own pid in every gate and rule case that is NOT about it: a
+    /// number no case record in this module reports, so those cases exercise the
+    /// rest of the rule exactly as they did before the board half existed. The cases
+    /// that ARE about it pass a record's own pid instead.
+    const BOARD_PID: u32 = 4_242;
 
     /// The reply gate: not held → reply; `done` → stop-then-reply; `needs input` →
     /// confirm-then-stop-then-reply; busy/idle → refuse; held-without-a-job-id →
@@ -1099,20 +1596,27 @@ mod tests {
 
     /// The interrupt gate has the OPPOSITE intent to the reply gate: it exists to
     /// stop live work, so `working` is a valid target (Confirm), not a refusal.
-    /// Not held → refuse (nothing to stop); no/blank job id → refuse (interactive);
-    /// `done` → stop immediately; every other live state → confirm. Stop paths carry
-    /// the SHORT job id.
+    /// Not held → refuse (nothing to stop); `done` → stop immediately; every other
+    /// live state → confirm. Stop paths carry the SHORT job id.
+    ///
+    /// With no stoppable job id the record's `pid` decides between the last rows: a
+    /// pid a signal could take → confirm-then-signal, a pid no signal could ever take
+    /// (`0`, or past `i32::MAX`) → refuse without a confirm, no pid → refuse. The case
+    /// tables at the end pin the BOUNDARY between the two stop mechanisms, which is
+    /// the part a later edit is most likely to erode: `claude stop <job-id>` wins
+    /// whenever a job id exists, and the pid is not even looked at there — not even a
+    /// pid the signal route would refuse.
     #[test]
     fn interrupt_gate_routes_by_agent_state() {
         // Not held at all -> nothing to stop.
         assert_eq!(
-            interrupt_gate(None),
+            interrupt_gate(None, BOARD_PID),
             InterruptGate::Refuse(INTERRUPT_NOT_LIVE)
         );
 
         // done -> stop immediately (harmless), carrying the job id.
         assert_eq!(
-            interrupt_gate(Some(&bg("done", Some("job-1")))),
+            interrupt_gate(Some(&bg("done", Some("job-1"))), BOARD_PID),
             InterruptGate::StopNow {
                 job_id: "job-1".to_string()
             }
@@ -1122,7 +1626,7 @@ mod tests {
         // immediately like `done` rather than confirming.
         for terminal in ["stopped", "failed"] {
             assert_eq!(
-                interrupt_gate(Some(&bg(terminal, Some("job-1")))),
+                interrupt_gate(Some(&bg(terminal, Some("job-1"))), BOARD_PID),
                 InterruptGate::StopNow {
                     job_id: "job-1".to_string()
                 },
@@ -1141,7 +1645,7 @@ mod tests {
             "waiting",
         ] {
             assert_eq!(
-                interrupt_gate(Some(&bg(live, Some("job-2")))),
+                interrupt_gate(Some(&bg(live, Some("job-2"))), BOARD_PID),
                 InterruptGate::Confirm {
                     job_id: "job-2".to_string()
                 },
@@ -1149,16 +1653,390 @@ mod tests {
             );
         }
 
-        // Live but no stoppable job id (interactive) -> refuse with the right hint.
+        // Live with NEITHER a stoppable job id NOR a pid -> refuse: there is
+        // nothing on the record left to act on. (`bg` is pid-less by default.)
         assert_eq!(
-            interrupt_gate(Some(&bg("working", None))),
+            interrupt_gate(Some(&bg("working", None)), BOARD_PID),
             InterruptGate::Refuse(INTERRUPT_NO_JOB_ID),
-            "an interactive live session has no job id -> refuse"
+            "no job id and no pid -> nothing here to stop"
         );
         assert_eq!(
-            interrupt_gate(Some(&bg("done", Some("   ")))),
+            interrupt_gate(Some(&bg("done", Some("   "))), BOARD_PID),
             InterruptGate::Refuse(INTERRUPT_NO_JOB_ID),
-            "a blank job id is not stoppable -> refuse"
+            "a blank job id is not stoppable, and there is no pid to fall back to"
+        );
+
+        // The pid route, and the boundary that keeps it narrow. A reported pid is
+        // the handle of LAST resort: read ONLY where no job id exists, IGNORED
+        // wherever one does, and never inferred from (or inferring) `kind`.
+        let pid = 29628; // a real pid from the 2.1.278 capture
+        for (job_id, state, expected) in [
+            // No job id -> the pid is the only handle, so confirm then signal.
+            (None, "working", InterruptGate::ConfirmSignal { pid }),
+            // ...and it confirms UNCONDITIONALLY: even a record that reports
+            // itself finished gets the guard, because a reported bucket cannot
+            // prove which process is wearing this pid now. No StopNow here.
+            (None, "done", InterruptGate::ConfirmSignal { pid }),
+            // A blank job id is no job id, so the pid still decides.
+            (Some("   "), "working", InterruptGate::ConfirmSignal { pid }),
+            // THE ANTI-WIDENING CASES: a job id is present, so the delegated verb
+            // wins on BOTH of its arms and the pid is never looked at.
+            (
+                Some("job-5"),
+                "working",
+                InterruptGate::Confirm {
+                    job_id: "job-5".to_string(),
+                },
+            ),
+            (
+                Some("job-5"),
+                "done",
+                InterruptGate::StopNow {
+                    job_id: "job-5".to_string(),
+                },
+            ),
+        ] {
+            assert_eq!(
+                interrupt_gate(Some(&bg(state, job_id).with_pid(pid)), BOARD_PID),
+                expected,
+                "a pid with job_id={job_id:?} in state {state:?} must route to {expected:?}"
+            );
+        }
+
+        // The pid route opens its confirm only for a pid a signal could take. The
+        // edges of that range still confirm...
+        for pid in [1, i32::MAX as u32] {
+            assert_eq!(
+                interrupt_gate(Some(&bg("working", None).with_pid(pid)), BOARD_PID),
+                InterruptGate::ConfirmSignal { pid },
+                "pid {pid} is a strictly positive pid_t, so it must still confirm"
+            );
+        }
+        // ...and just outside it, a pid IS on the record but no `kill(2)` could ever
+        // take it, so the gate refuses in its OWN words (never "no process id", which
+        // would be false) instead of opening a confirm that could only fail.
+        for pid in [0, i32::MAX as u32 + 1, u32::MAX] {
+            for (job_id, state) in [(None, "working"), (None, "done"), (Some("   "), "working")] {
+                assert_eq!(
+                    interrupt_gate(Some(&bg(state, job_id).with_pid(pid)), BOARD_PID),
+                    InterruptGate::Refuse(INTERRUPT_PID_UNUSABLE),
+                    "pid {pid} (job_id={job_id:?}, state {state:?}) can never be signalled, \
+                     so no confirm may open for it"
+                );
+            }
+            // ANTI-WIDENING, again: a job id still wins, whatever the pid, so the new
+            // refusal must never steal a record the delegated verb can stop.
+            for (state, expected) in [
+                (
+                    "working",
+                    InterruptGate::Confirm {
+                        job_id: "job-5".to_string(),
+                    },
+                ),
+                (
+                    "done",
+                    InterruptGate::StopNow {
+                        job_id: "job-5".to_string(),
+                    },
+                ),
+            ] {
+                assert_eq!(
+                    interrupt_gate(Some(&bg(state, Some("job-5")).with_pid(pid)), BOARD_PID),
+                    expected,
+                    "a job id must win over pid {pid} in state {state:?}"
+                );
+            }
+        }
+    }
+
+    /// The one rule for which pids a signal may take, asserted on EVERY platform
+    /// (the gate reads it everywhere; `signal_target`, unix-only, reads its range
+    /// half last): exactly the strictly positive values a `pid_t` can hold, returned
+    /// unchanged, MINUS the board's own pid — one number, never a range around it.
+    #[test]
+    fn signallable_pid_is_the_strictly_positive_pid_t_range_minus_the_boards_own() {
+        // Pid 1 stays in: an unprivileged `kill(1, …)` fails with EPERM, a sticky
+        // failure the board survives, which is accepted.
+        for pid in [1, 2, 29628, i32::MAX as u32 - 1, i32::MAX as u32] {
+            assert_eq!(
+                signallable_pid(pid, BOARD_PID).map(i64::from),
+                Some(i64::from(pid)),
+                "pid {pid} is a strictly positive pid_t and must pass through unchanged"
+            );
+        }
+        // `0` is "every process in my group" to `kill(2)`; past `i32::MAX` no `pid_t`
+        // exists, and `as` would have WRAPPED these into process groups or `-1`.
+        for pid in [0, i32::MAX as u32 + 1, u32::MAX - 1, u32::MAX] {
+            assert_eq!(
+                signallable_pid(pid, BOARD_PID),
+                None,
+                "pid {pid} can never be signalled and must be rejected"
+            );
+        }
+
+        // The BOARD half: the board's own pid is refused wherever it sits in the
+        // range, edges included, and its neighbours still pass.
+        for own in [1, 2, 29628, i32::MAX as u32 - 1, i32::MAX as u32] {
+            assert_eq!(
+                signallable_pid(own, own),
+                None,
+                "pid {own} is the board's own, and a SIGTERM to it would end the board \
+                 without its terminal restore, so it must be rejected"
+            );
+            for neighbour in [own - 1, own + 1] {
+                assert_eq!(
+                    signallable_pid(neighbour, own),
+                    positive_pid_t(neighbour),
+                    "pid {neighbour} is not the board's own {own}, so only the range \
+                     half may decide it"
+                );
+            }
+        }
+        // A board pid no `pid_t` could hold excludes nothing extra: the range half
+        // already refuses every such pid, and every in-range pid still passes.
+        assert_eq!(signallable_pid(29628, u32::MAX), Some(29628));
+        assert_eq!(signallable_pid(u32::MAX, u32::MAX), None);
+    }
+
+    /// `Ctrl-K` never offers to SIGTERM the board's OWN process. snapback installs no
+    /// SIGTERM handler, so that signal would end the board with raw mode and the
+    /// alternate screen still on. snapback is not a `claude` process, so a record
+    /// naming its pid is not describing it (most likely a stale record whose number
+    /// was recycled onto the board). The gate refuses it before any confirm opens, in
+    /// the words it already uses for a pid no signal could take.
+    ///
+    /// Asserted on the pure gate with the board's pid as a parameter, so nothing reads
+    /// the test runner's own pid and nothing is signalled. The same record with a
+    /// DIFFERENT pid still confirms, so the refusal is pinned to the one number and not
+    /// to the route; and a job id still wins over the board's pid, so the new refusal
+    /// cannot steal a record the delegated `claude stop` can take.
+    #[test]
+    fn interrupt_gate_refuses_the_boards_own_pid_and_still_confirms_any_other() {
+        let own = 29628; // a real pid from the 2.1.278 capture, standing in for the board's
+
+        // Every record shape the pid arm reads: no job id, or a blank one.
+        for (job_id, state) in [(None, "working"), (None, "done"), (Some("   "), "working")] {
+            assert_eq!(
+                interrupt_gate(Some(&bg(state, job_id).with_pid(own)), own),
+                InterruptGate::Refuse(INTERRUPT_PID_UNUSABLE),
+                "a record naming the board's own pid (job_id={job_id:?}, state {state:?}) \
+                 must refuse, so no confirm opens"
+            );
+        }
+
+        // Any other real pid on the same record still confirms — pid 1 included,
+        // whose EPERM is the accepted outcome.
+        for other in [own - 1, own + 1, 1] {
+            assert_eq!(
+                interrupt_gate(Some(&bg("working", None).with_pid(other)), own),
+                InterruptGate::ConfirmSignal { pid: other },
+                "pid {other} is not the board's own {own}, so it must still confirm"
+            );
+        }
+
+        // ANTI-WIDENING: a job id wins even when the record's pid is the board's own.
+        assert_eq!(
+            interrupt_gate(Some(&bg("working", Some("job-5")).with_pid(own)), own),
+            InterruptGate::Confirm {
+                job_id: "job-5".to_string()
+            },
+            "a job id must win over the board's own pid"
+        );
+        assert_eq!(
+            interrupt_gate(Some(&bg("done", Some("job-5")).with_pid(own)), own),
+            InterruptGate::StopNow {
+                job_id: "job-5".to_string()
+            },
+            "a job id must win over the board's own pid"
+        );
+    }
+
+    /// The refusals a reported record with NO job id can reach say only what was
+    /// observed, and point only at moves that do not refuse that same record.
+    ///
+    /// `INTERRUPT_NO_JOB_ID` (`Ctrl-K` with neither a job id nor a pid),
+    /// `INTERRUPT_PID_UNUSABLE` (`Ctrl-K` with no job id and a pid no signal could
+    /// take), `SEND_LIVE_REFUSED` (`Ctrl-R`, which refuses every no-job-id record
+    /// before it looks at a bucket) and `resume::ATTACH_NO_JOB_ID` (Attach) are the
+    /// words a `kind:"interactive"` row meets. Each must hold under BOTH shapes
+    /// that kind has been measured as: a `claude -p` child (every record, 11/11, at
+    /// `claude 2.1.278`) and a pty-backed TUI, busy or idle (both records, 2/2, at
+    /// `claude 2.1.280`; see `docs/agents/DOMAIN.md`, "What `kind: "interactive"`
+    /// denotes"). So:
+    ///
+    /// * none may claim an owner (`OWNERSHIP_CLAIMS`);
+    /// * none may call the session "interactive". That is claude's `kind` token, and
+    ///   saying the session IS interactive picks the TUI reading;
+    /// * none may send the user to a move that refuses the same record. Attach is
+    ///   the one that did: `SEND_LIVE_REFUSED` pointed a no-job-id row at Attach,
+    ///   which refuses it with `ATTACH_NO_JOB_ID`;
+    /// * `SEND_LIVE_REFUSED` may name `Ctrl-K`, but may not PROMISE it: `Ctrl-K`
+    ///   signals only a record that carries a pid, and refuses one that does not.
+    ///
+    /// Each must also still SAY something: the observation that put the user here,
+    /// and (where one exists) the move that works in every world, Fork.
+    ///
+    /// Violations are COLLECTED rather than asserted one by one, so a single run
+    /// names every string that still misleads, not only the first.
+    #[test]
+    fn the_no_job_id_refusals_claim_no_owner_and_name_no_move_that_refuses() {
+        let attach_no_job_id = crate::resume::ATTACH_NO_JOB_ID;
+        let mut violations = Vec::new();
+
+        for (name, copy) in [
+            ("INTERRUPT_NO_JOB_ID", INTERRUPT_NO_JOB_ID),
+            ("INTERRUPT_PID_UNUSABLE", INTERRUPT_PID_UNUSABLE),
+            ("SEND_LIVE_REFUSED", SEND_LIVE_REFUSED),
+            ("ATTACH_NO_JOB_ID", attach_no_job_id),
+        ] {
+            let lower = copy.to_lowercase();
+            for claim in OWNERSHIP_CLAIMS {
+                if lower.contains(claim) {
+                    violations.push(format!("{name} claims an owner ({claim:?}): {copy:?}"));
+                }
+            }
+            if lower.contains("interactive") {
+                violations.push(format!(
+                    "{name} picks a reading (\"interactive\"): {copy:?}"
+                ));
+            }
+        }
+
+        // Attach refuses every record with no job id, so no refusal a no-job-id
+        // record reaches may send the user there.
+        for (name, copy) in [
+            ("INTERRUPT_NO_JOB_ID", INTERRUPT_NO_JOB_ID),
+            ("INTERRUPT_PID_UNUSABLE", INTERRUPT_PID_UNUSABLE),
+            ("SEND_LIVE_REFUSED", SEND_LIVE_REFUSED),
+        ] {
+            if copy.contains("Attach") {
+                violations.push(format!("{name} names Attach, which refuses it: {copy:?}"));
+            }
+        }
+        // `Ctrl-K` is a next move to OFFER, never one to promise.
+        for promise in ["will", "end it", "ends it", "kill"] {
+            if SEND_LIVE_REFUSED.to_lowercase().contains(promise) {
+                violations.push(format!(
+                    "SEND_LIVE_REFUSED promises what Ctrl-K may refuse ({promise:?}): \
+                     {SEND_LIVE_REFUSED:?}"
+                ));
+            }
+        }
+
+        // What each one must still say.
+        for (name, copy, required) in [
+            (
+                "INTERRUPT_NO_JOB_ID",
+                INTERRUPT_NO_JOB_ID,
+                "no attachable job",
+            ),
+            ("INTERRUPT_NO_JOB_ID", INTERRUPT_NO_JOB_ID, "no process id"),
+            (
+                "INTERRUPT_PID_UNUSABLE",
+                INTERRUPT_PID_UNUSABLE,
+                "no attachable job",
+            ),
+            (
+                "INTERRUPT_PID_UNUSABLE",
+                INTERRUPT_PID_UNUSABLE,
+                "cannot be signalled",
+            ),
+            ("SEND_LIVE_REFUSED", SEND_LIVE_REFUSED, "Ctrl-K"),
+            ("SEND_LIVE_REFUSED", SEND_LIVE_REFUSED, "Ctrl-F"),
+            ("ATTACH_NO_JOB_ID", attach_no_job_id, "no attachable job"),
+            ("ATTACH_NO_JOB_ID", attach_no_job_id, "Ctrl-F"),
+        ] {
+            if !copy.contains(required) {
+                violations.push(format!("{name} must say {required:?}: {copy:?}"));
+            }
+        }
+        // A pid IS on the record `INTERRUPT_PID_UNUSABLE` answers, so it must never
+        // borrow `INTERRUPT_NO_JOB_ID`'s "no process id".
+        if INTERRUPT_PID_UNUSABLE.contains("no process id") {
+            violations.push(format!(
+                "INTERRUPT_PID_UNUSABLE denies the pid the record carries: \
+                 {INTERRUPT_PID_UNUSABLE:?}"
+            ));
+        }
+
+        assert!(
+            violations.is_empty(),
+            "refusal copy that misleads:\n{}",
+            violations.join("\n")
+        );
+    }
+
+    /// The confirm-time re-verification: all FOUR answers, and only one of them
+    /// signals.
+    ///
+    /// This is the guard against pid reuse, so each refusal is asserted on its own
+    /// reason rather than on "not Signal" — a refusal that fired for the wrong cause
+    /// would still look green under a weaker assertion, and the three causes have
+    /// three different next moves for the user.
+    #[test]
+    fn signal_plan_re_verifies_the_captured_pid_against_a_fresh_record() {
+        let captured = 29628; // a real pid from the 2.1.278 capture
+
+        // The ONE signalling answer: still reported, still no stoppable job, still
+        // this pid.
+        assert_eq!(
+            signal_plan(captured, Some(&bg("working", None).with_pid(captured))),
+            SignalPlan::Signal { pid: captured },
+            "an unchanged record is the only thing that may be signalled"
+        );
+
+        // Gone: it ended while the confirm sat open. Its pid is now the likeliest of
+        // all to have been recycled, so this must never fall through to a signal.
+        assert_eq!(
+            signal_plan(captured, None),
+            SignalPlan::Refuse(SIGNAL_RECORD_GONE)
+        );
+
+        // It gained a stoppable job id — the delegated verb, which always wins, so a
+        // matching pid does not buy a signal when a `claude stop` is available.
+        assert_eq!(
+            signal_plan(
+                captured,
+                Some(&bg("working", Some("job-9")).with_pid(captured))
+            ),
+            SignalPlan::Refuse(SIGNAL_NOW_HAS_JOB),
+            "a re-routable record must re-route, not signal"
+        );
+        // Both stale at once — a job id AND a moved pid. Either check alone would
+        // refuse, so this row is not about safety; it pins the ORDER, and the order is
+        // about which refusal the user reads. `SIGNAL_NOW_HAS_JOB` names a next move
+        // (`Ctrl-K` again, on the delegated verb) where `SIGNAL_PID_MOVED` is a dead
+        // end, so the re-routable answer must win whenever both apply.
+        assert_eq!(
+            signal_plan(
+                captured,
+                Some(&bg("working", Some("job-9")).with_pid(captured + 1))
+            ),
+            SignalPlan::Refuse(SIGNAL_NOW_HAS_JOB),
+            "with both stale, the refusal that names a next move must win"
+        );
+        // ...and a BLANK job id is still no job id, so it keeps signalling rather
+        // than refusing for the wrong reason (the same rule `interrupt_gate` used to
+        // put us on this route at all).
+        assert_eq!(
+            signal_plan(
+                captured,
+                Some(&bg("working", Some("   ")).with_pid(captured))
+            ),
+            SignalPlan::Signal { pid: captured }
+        );
+
+        // The pid moved — a different number, or none at all. Both are "the fresh
+        // record does not name this pid", which is the question being asked.
+        assert_eq!(
+            signal_plan(captured, Some(&bg("working", None).with_pid(captured + 1))),
+            SignalPlan::Refuse(SIGNAL_PID_MOVED),
+            "a replaced record must not be signalled on the old pid"
+        );
+        assert_eq!(
+            signal_plan(captured, Some(&bg("working", None))),
+            SignalPlan::Refuse(SIGNAL_PID_MOVED),
+            "a record that stopped reporting a pid names nothing to signal"
         );
     }
 
@@ -1180,7 +2058,8 @@ mod tests {
             id: Some("job-9".to_string()),
             state: Some("working".to_string()),
             status: Some("idle".to_string()),
-            name: None,
+            pid: None,
+            started_at_ms: None,
         };
         assert_eq!(
             agents::classify(&interrupted),
@@ -1196,7 +2075,7 @@ mod tests {
         );
         // ...and Ctrl-K keeps its confirmation guard rather than stopping outright.
         assert_eq!(
-            interrupt_gate(Some(&interrupted)),
+            interrupt_gate(Some(&interrupted), BOARD_PID),
             InterruptGate::Confirm {
                 job_id: "job-9".to_string()
             },
@@ -1214,7 +2093,7 @@ mod tests {
             }
         );
         assert_eq!(
-            interrupt_gate(Some(&ended)),
+            interrupt_gate(Some(&ended), BOARD_PID),
             InterruptGate::StopNow {
                 job_id: "job-9".to_string()
             }
@@ -1249,6 +2128,169 @@ mod tests {
         assert_eq!(
             status_for_stop(false, "   \n", "  \n"),
             (STOP_FAILED_GENERIC.to_string(), false)
+        );
+    }
+
+    /// The one rule `kill(2)` gives no second chance on: whatever `signal_target`
+    /// hands back is STRICTLY POSITIVE, so a signal can never reach a process GROUP —
+    /// and every other pid is REFUSED with the error `signal_term` returns unchanged.
+    ///
+    /// Asserted on the pure narrowing rather than through `signal_term`, because the
+    /// failure mode is exactly what a test must not perform: `u32::MAX as i32` is
+    /// `-1`, and `kill(-1, SIGTERM)` is a broadcast to every process this uid may
+    /// signal. Proving it here costs no syscall, and since `signal_target` BUILDS the
+    /// refusal, the refusal is proven here too — no test ever calls `signal_term`.
+    /// Unix-only, like `signal_target` itself.
+    #[cfg(unix)]
+    #[test]
+    fn signal_target_never_yields_a_group_or_broadcast() {
+        // A real reported pid passes through unchanged.
+        assert_eq!(signal_target(29628).ok(), Some(29628));
+        assert_eq!(signal_target(1).ok(), Some(1));
+
+        // A refusal is the range check's OWN error: `InvalidInput`, and no errno,
+        // because no syscall ran to produce one.
+        let assert_refused = |pid: u32| {
+            let Err(err) = signal_target(pid) else {
+                panic!("pid {pid} is not a strictly positive pid_t and must be refused");
+            };
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "pid {pid}: the refusal must be the range check, not an errno"
+            );
+            assert_eq!(
+                err.raw_os_error(),
+                None,
+                "pid {pid}: no syscall ran, so there is no errno to report"
+            );
+        };
+
+        // Zero is "every process in my group" to `kill`, so it is not a target. The
+        // parser can produce it: a `"pid": 0` on the wire reads as `Some(0)`.
+        assert_refused(0);
+
+        // Past `i32::MAX` there is no `pid_t` to use. `as` would WRAP these into
+        // negative numbers — process groups — which is the accident being excluded.
+        assert_refused(u32::MAX);
+        assert_refused(i32::MAX as u32 + 1);
+
+        // The property, over the whole boundary neighbourhood rather than the cases
+        // above alone: nothing non-positive ever comes out.
+        for pid in [
+            0,
+            1,
+            2,
+            29628,
+            i32::MAX as u32 - 1,
+            i32::MAX as u32,
+            i32::MAX as u32 + 1,
+            u32::MAX - 1,
+            u32::MAX,
+        ] {
+            if let Ok(target) = signal_target(pid) {
+                assert!(
+                    target > 0,
+                    "pid {pid} narrowed to {target}, which `kill` would read as a \
+                     process group or a broadcast"
+                );
+            }
+        }
+    }
+
+    /// The signal route's status seam: each of the three arms, and the honesty rule
+    /// that shapes them — a delivered SIGTERM is all that may be claimed, because
+    /// nothing waits to see the process exit.
+    ///
+    /// Driven by `io::Error::from_raw_os_error`, so the errno arms are exercised
+    /// WITHOUT signalling anything (the suite never touches a real process). The
+    /// out-of-range refusal is built by hand the same way, never obtained by calling
+    /// `signal_term`. Unix-only: its errno arms name `libc` constants.
+    #[cfg(unix)]
+    #[test]
+    fn status_for_signal_maps_the_three_errno_arms() {
+        use std::io::{Error, ErrorKind};
+
+        // Delivered: neutral and TRANSIENT, and it must not overclaim.
+        let (status, ok) = status_for_signal(Ok(()));
+        assert_eq!((status.as_str(), ok), (SIGNAL_SENT, true));
+        for overclaim in ["killed", "died", "exited", "ended", "stopped"] {
+            assert!(
+                !status.contains(overclaim),
+                "a sent SIGTERM must not claim the process {overclaim}: {status}"
+            );
+        }
+
+        // ESRCH: nothing carries that pid. The state the user wanted, so it is
+        // neutral + transient — NOT a failure to act on.
+        let (status, ok) = status_for_signal(Err(Error::from_raw_os_error(libc::ESRCH)));
+        assert_eq!((status.as_str(), ok), (SIGNAL_ALREADY_GONE, true));
+        assert!(
+            !status.starts_with(SIGNAL_FAILED_PREFIX),
+            "an already-gone process is not a failure: {status}"
+        );
+
+        // Any other errno: STICKY, quoting the OS's own reason, because the process
+        // is still running and the attempt did not take. EPERM is the real-world
+        // case — a pid claude reported that this uid may not signal.
+        let (status, ok) = status_for_signal(Err(Error::from_raw_os_error(libc::EPERM)));
+        assert!(!ok, "a rejected signal must be sticky: {status}");
+        assert!(
+            status.starts_with(SIGNAL_FAILED_PREFIX),
+            "a rejected signal must read as a failure: {status}"
+        );
+        assert!(
+            !status.contains("sent") && !status.contains("gone"),
+            "a rejected signal must never read as either neutral arm: {status}"
+        );
+        assert!(
+            status.len() > SIGNAL_FAILED_PREFIX.len(),
+            "it must quote the OS reason, not just the prefix: {status}"
+        );
+
+        // The out-of-range refusal: an `InvalidInput` with NO errno, built by hand
+        // exactly as `signal_target` builds it. Having no errno must not make it read
+        // as neutral — the process was never signalled, so it is still running.
+        let (status, ok) = status_for_signal(Err(Error::new(
+            ErrorKind::InvalidInput,
+            SIGNAL_PID_OUT_OF_RANGE,
+        )));
+        assert!(!ok, "a refused signal is sticky, not neutral: {status}");
+        assert!(
+            status.starts_with(SIGNAL_FAILED_PREFIX),
+            "a refused signal must read as a failure: {status}"
+        );
+        assert!(
+            status.ends_with(SIGNAL_PID_OUT_OF_RANGE),
+            "a refused signal must quote the range check's reason: {status}"
+        );
+
+        // The OS text goes through `sanitize_status`, so neither an escape sequence
+        // nor a second line in it can reach the ratatui buffer (TERMINAL-SAFE
+        // STYLING). The out-of-range refusal just above lands on this same arm.
+        let (status, ok) = status_for_signal(Err(Error::new(
+            ErrorKind::InvalidInput,
+            "bad \u{1b}[31mpid\u{1b}[0m and a\nsecond line",
+        )));
+        assert!(!ok);
+        assert!(status.starts_with(SIGNAL_FAILED_PREFIX));
+        assert!(
+            status.contains("bad pid"),
+            "the reason must survive sanitizing: {status}"
+        );
+        assert!(
+            !status.contains('\u{1b}') && !status.contains('['),
+            "no escape sequence may reach the buffer: {status:?}"
+        );
+        assert!(
+            !status.contains('\n'),
+            "the one-row status line stays one row: {status:?}"
+        );
+
+        // Nothing readable at all still reads as a failure rather than as success.
+        assert_eq!(
+            status_for_signal(Err(Error::other(""))),
+            (SIGNAL_FAILED_GENERIC.to_string(), false)
         );
     }
 

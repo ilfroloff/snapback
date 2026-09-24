@@ -6,21 +6,31 @@ Everything here is captured from the live CLI (`claude --help` and each
 actually expose" quick-review sheet the rest of the docs assume.
 
 `snapback` never links `claude`; it spawns it as a child (resume/fork/attach/send)
-and reads `claude agents --json`. The terminal-safety and authoritative-from-file
-rules around those spawns live in [PATTERNS.md](PATTERNS.md) and
+and reads `claude agents --json`. On ONE route it also sends a SIGTERM to a `pid`
+that `claude agents --json` reported. That is not a `claude` invocation, and it is
+listed [below](#how-snapback-drives-claude) so the boundary stays visible. The
+terminal-safety and authoritative-from-file rules around those spawns live in
+[PATTERNS.md](PATTERNS.md) and
 [ARCHITECTURE.md](ARCHITECTURE.md); the runtime "`claude` on `PATH`" prerequisite
 lives in [OPERATIONS.md](OPERATIONS.md#runtime-prerequisites). This file owns one
 scope only: the surface of the `claude` command itself.
 
 ## Version pin (self-healing)
 
-> **Captured against `claude 2.1.220` (Claude Code).**
+> **Captured against `claude 2.1.280` (Claude Code).** Previous capture:
+> `2.1.220`.
 
 Before trusting a flag or command below, compare the installed version:
 
 ```sh
-claude --version   # e.g. "2.1.220 (Claude Code)"
+claude --version   # e.g. "2.1.280 (Claude Code)"
 ```
+
+This pin covers the COMMAND surface: flags, commands and their help text. The
+`claude agents --json` WIRE shape that `snapback` parses (its keys, which records
+carry `id` and `pid`, and what `kind: "interactive"` turned out to denote) is
+measured separately in [DOMAIN.md](DOMAIN.md#reported-agents-srcagentsrs). It was
+captured at 2.1.278 and spot-checked at 2.1.280 with the same nine-key union.
 
 - **Installed == pinned** → this doc matches the live CLI. Trust it.
 - **Installed < pinned** → the local install is **behind this doc**. Newer flags
@@ -29,15 +39,16 @@ claude --version   # e.g. "2.1.220 (Claude Code)"
   just because an older local `claude` rejects it.
 - **Installed > pinned** → **this doc is stale**, not the CLI. Re-capture and
   refresh it (see [Refreshing this doc](#refreshing-this-doc)) before relying on
-  the tables; flags may have been added, renamed, or removed since 2.1.220.
+  the tables; flags may have been added, renamed, or removed since 2.1.280.
 
 Keep the pinned version above in sync with the tables — bumping one without the
 other defeats the check.
 
 ## How snapback drives `claude`
 
-The only invocations `snapback` depends on. Each is a **pure argv builder** with
-an inline test asserting the exact string, so drift here is caught by
+The only invocations `snapback` depends on, plus the one effect that is NOT an
+invocation (the last row). Each invocation is a **pure argv builder** with an
+inline test asserting the exact string, so drift here is caught by
 `cargo test`. Cross-references are to the builder that owns the shape.
 
 | Purpose | Argv | Builder |
@@ -52,11 +63,25 @@ an inline test asserting the exact string, so drift here is caught by
 | Release a held job before a reply, or interrupt a selected agent (`Ctrl-K`) | `claude stop <job-id>` | `send::build_stop_argv` |
 | Detect live agents (gate probe) | `claude agents --json` | `agents::live_agents_argv` (`src/agents.rs`) |
 | Detect live agents (incl. just-finished) | `claude agents --json --all` | `agents::agents_argv` |
+| `Ctrl-K` on a reported session with NO job id but a `pid` | **none: NOT a `claude` invocation.** A `kill(2)` sending `SIGTERM` (never `SIGKILL`) to the `pid` that `claude agents --json` (the bare probe above) reported, after a confirm and a re-probe at `Enter` | `send::signal_plan` (pure: re-verify the pid against the fresh record) → `send::signal_target` (pure: a strictly positive `pid_t`, or refuse) → `send::signal_term` (the syscall; no test calls it) |
 
-Two of these — **`attach`** and **`stop`** — are hidden commands (see below).
-`attach`/`stop` take the **short agent-view job id** (e.g. `ca56b543`), NOT the
-full `sessionId`; passing a UUID returns exit 1 ("No job matching"). The `-r`
-resume/fork/send paths take the **full `sessionId`**.
+The last row is the deliberate exception to "every row is an argv builder": it
+spawns nothing and has no argv, so there is no string to pin. Its tests pin the
+two pure checks in front of the syscall instead. It exists because `claude` offers
+no verb for a record without a job id (see
+[Background-session commands](#background-session-commands)), so the only handle
+left is the pid claude itself reported. Do not confuse it with **`claude kill
+<id>`**: at 2.1.280 that is an alias of `claude stop`, takes a background JOB id,
+and cannot address such a record either. What `kind: "interactive"` records are,
+and why no user-facing string says who owns the signalled process, is in
+[DOMAIN.md](DOMAIN.md#what-kind-interactive-denotes).
+
+Two of these, **`attach`** and **`stop`**, were hidden from `claude --help` in the
+2.1.220 capture and are listed there at 2.1.280 (see
+[below](#background-session-commands)). `attach`/`stop` take the **short
+agent-view job id** (e.g. `ca56b543`), NOT the full `sessionId`; passing a UUID
+returns exit 1 ("No job matching"). The `-r` resume/fork/send paths take the
+**full `sessionId`**.
 
 ## Invocation form
 
@@ -132,16 +157,20 @@ with `-p/--print` (SDK/non-interactive mode).
 | `--session-id <uuid>` | Use a specific (valid UUID) session id. |
 | `-n, --name <name>` | Display name (prompt box, `/resume` picker, terminal title). |
 | `--model <model>` | Model for the session — alias (`fable`/`opus`/`sonnet`) or full id (`claude-fable-5`). |
-| `--fallback-model <model>` | `[P]` Fallback model(s), comma-separated, tried in order when the primary is overloaded. |
+| `--fallback-model <model>` | `[P]` Fallback model(s), comma-separated, tried in order when the primary is overloaded; the primary is re-tried at the start of each user turn. |
 | `--agent <agent>` | Agent for the session; overrides the `agent` setting. |
 | `--agents <json>` | JSON object defining custom agents inline. |
 | `--effort <level>` | `low` \| `medium` \| `high` \| `xhigh` \| `max`. |
+| `--autocompact <auto\|tokens>` | Auto-compact window size (`auto`, or 100k–1M tokens). |
+| `--teleport [session]` | Resume a teleport session, optionally by session id. |
+| `--cloud [description\|session_id\|url]` | Create a cloud session with a description, or attach to an existing one by session id or claude.ai/code URL. |
+| `--environment <environment_id>` | Create a new cloud session on a given self-hosted environment (`ccpool_...`). |
 
 ### Print / SDK mode
 
 | Flag | Effect |
 | --- | --- |
-| `-p, --print` | Print the response and exit (pipes). Skips the trust dialog; only use in trusted dirs. |
+| `-p, --print` | Print the response and exit (pipes). Skips the trust dialog (as does any non-TTY stdout); only use in trusted dirs. Settings files that fail validation are silently ignored in this mode. |
 | `--output-format <fmt>` | `[P]` `text` (default) \| `json` \| `stream-json`. |
 | `--input-format <fmt>` | `[P]` `text` (default) \| `stream-json`. |
 | `--include-partial-messages` | `[P]` Emit partial chunks as they arrive (stream-json only). |
@@ -152,6 +181,7 @@ with `-p/--print` (SDK/non-interactive mode).
 | `--max-budget-usd <amount>` | `[P]` Hard cap on API spend. |
 | `--no-session-persistence` | `[P]` Do not save the session to disk (not resumable). |
 | `--prompt-suggestions [value]` | Emit a predicted next-prompt message each turn. |
+| `--permission-prompts <target>` | `[P]` Who answers permission prompts: `host` (default — the SDK host or `--permission-prompt-tool`) or `none` (anything that would prompt is denied). |
 
 ### Permissions & tools
 
@@ -164,6 +194,7 @@ with `-p/--print` (SDK/non-interactive mode).
 | `--disallowedTools, --disallowed-tools <tools...>` | Denylist. |
 | `--tools <tools...>` | Restrict the built-in tool set (`""` = none, `default` = all, or names). |
 | `--add-dir <dirs...>` | Extra directories tools may access. |
+| `--restricted` | Drop the command/code-running tools and WebFetch unless `--tools` names them, ignore user/project/local settings files, confine file tools to the working dirs, and refuse `bypassPermissions`. |
 
 ### Config, MCP, plugins
 
@@ -178,13 +209,14 @@ with `-p/--print` (SDK/non-interactive mode).
 | `--system-prompt <prompt>` | Replace the default system prompt. |
 | `--append-system-prompt <prompt>` | Append to the default system prompt. |
 | `--exclude-dynamic-system-prompt-sections` | Move per-machine sections to the first user message (better cache reuse). |
+| `--system-prompt-snapshot <on\|off>` | `on` (default): record the system prompt once per conversation and reuse it verbatim on every request and resume until compaction. `off`: render it fresh every request. |
 | `--betas <betas...>` | Beta headers (API-key users only). |
 
 ### Session lifecycle & environment
 
 | Flag | Effect |
 | --- | --- |
-| `--bg, --background` | Start as a background agent and return immediately (manage with `claude agents`). |
+| `--bg, --background` | Start in the background and return immediately, printing the id that `claude attach`, `logs`, `stop` and `rm` take (`claude agents` lists them). With `--resume <session-id>` it continues that session in the background under the same id, or starts a copy and says so when the session is already running. |
 | `-w, --worktree [name]` | Create a git worktree for this session. |
 | `--tmux` | Create a tmux session for the worktree (requires `--worktree`; `--tmux=classic` for plain tmux). |
 | `--remote-control [name]` | Interactive session with Remote Control enabled. |
@@ -198,7 +230,7 @@ with `-p/--print` (SDK/non-interactive mode).
 
 | Flag | Effect |
 | --- | --- |
-| `--bare` | Minimal mode: skip hooks/LSP/plugins/attribution/auto-memory/CLAUDE.md discovery. Sets `CLAUDE_CODE_SIMPLE=1`; auth is strictly `ANTHROPIC_API_KEY`/apiKeyHelper. |
+| `--bare` | Minimal mode: skip settings/plugin hooks, LSP, plugin sync, attribution, auto-memory, background prefetches, keychain reads and CLAUDE.md discovery. Sets `CLAUDE_CODE_SIMPLE=1`; Anthropic auth is strictly `ANTHROPIC_API_KEY`/apiKeyHelper (OAuth and keychain are never read). |
 | `--safe-mode` | Disable all customizations for troubleshooting. Policy settings still apply; sets `CLAUDE_CODE_SAFE_MODE=1`. |
 | `-d, --debug [filter]` | Debug mode with optional category filter (`"api,hooks"` or `"!1p,!file"`). |
 | `--debug-file <path>` | Write debug logs to a path (implies debug). |
@@ -216,34 +248,76 @@ flags (a few are expanded below).
 | Command | Purpose |
 | --- | --- |
 | `agents` | Manage background agents. Also `--json[ --all]` for scripting. |
+| `attach <id>` | Open a background session in this terminal (see [below](#background-session-commands)). |
 | `auth` | Manage authentication (`login`/`logout`/`status`). |
 | `auto-mode` | Inspect or reset the auto-mode classifier config. |
 | `doctor` | Health-check the installation (read-only; no trust prompt). |
 | `gateway` | Run the enterprise auth/telemetry gateway (`--config <path>`). |
+| `import [source]` | Import config from another AI coding agent (`codex` / `gemini` / `cursor`; `--dry-run`, `--yes`). |
 | `install [target]` | Install a native build (`stable`/`latest`/version; `--force`). |
+| `logs <id>` | Print a background session's recent terminal output. |
 | `mcp` | Configure and manage MCP servers. |
 | `plugin` \| `plugins` | Manage plugins and marketplaces. |
 | `project` | Manage project state (`purge` deletes all Claude state for a project). |
+| `respawn [id]` | Restart a background session, or all of them with `--all`, on the current Claude Code version. |
+| `rm <id>` | Delete a background session, and its worktree when that is safe; works on sessions that already exited. |
 | `setup-token` | Set up a long-lived auth token (requires a subscription). |
+| `stop` \| `kill <id>` | Stop a background session; its conversation is kept. |
 | `ultrareview [target]` | Cloud multi-agent review of the branch / a PR number / base branch. |
 | `update` \| `upgrade` | Check for updates and install if available. |
 
-## Hidden commands
+## Background-session commands
 
-Real, working subcommands that are **absent from `claude --help`**. Verified by
-their own dedicated usage output (a non-command argument instead just re-prints
-the top-level help). `snapback` **depends on both** — treat them as load-bearing,
-not incidental.
+The commands that act on a background session by its **short job id** — the `id`
+that `claude --bg` prints and `claude agents --json` reports on background records.
+In the 2.1.220 capture `attach` and `stop` were hidden from `claude --help`. At
+2.1.280 `attach`, `stop`, `logs`, `respawn` and `rm` are all listed there, and only
+`daemon` is still hidden (see [Hidden commands](#hidden-commands)). Each usage
+below is the command's own `--help` text at 2.1.280, except `daemon stop`'s, which
+was read from the binary (see [Refreshing this doc](#refreshing-this-doc) for why
+it is never run).
+
+**None of them can end a record that has no job id**, and every
+`kind: "interactive"` record measured so far has none (0/3 at 2.1.278, 0/2 at
+2.1.280, see [DOMAIN.md](DOMAIN.md#what-kind-interactive-denotes)). Those records
+are a `claude -p` print-mode child or an interactive TUI. The last column below
+records this per command, and it is why `Ctrl-K` has a SIGTERM route at all (see
+[How snapback drives `claude`](#how-snapback-drives-claude)).
+
+| Command | Usage (own help text) | Notes | Can it end a record with no job id? |
+| --- | --- | --- | --- |
+| `claude attach <id>` | Open the background session in this terminal. `←` returns to agent view, `Ctrl+Z` drops back to your shell. The session keeps running either way. | **`snapback` depends on it** (Attach). Takes the SHORT job id. | No: it needs a job id, and it attaches rather than ends. |
+| `claude stop <id>` (alias `kill`) | Stop a background session. Its conversation is kept; resume it later with `claude attach <id>`. | **`snapback` depends on it** (the reply unlock and `Ctrl-K`'s job-id route). Only the live job registration drops, which is what lets `claude -p -r` reclaim the session. Takes the SHORT job id. The `kill` alias takes a job id too; it is not a way to signal a pid. | No: it takes a job id. |
+| `claude rm <id> [--discard-unpushed <commit>@<worktree-id>] [--force-remove-worktree <worktree-id>]` | Delete a background session and its worktree. Unlike `stop`, works on already-exited sessions. | Not used by `snapback`. The two flags pass back a value a previous `claude rm <id>` reported, to discard unpushed work or force-remove a worktree git could not. | No: it takes a job id and deletes a background session. |
+| `claude respawn <id>\|--all` | Restart a background session (or all of them) so it picks up the current Claude binary. | Not used by `snapback`. | No: background sessions only, and it restarts rather than ends. |
+| `claude logs <id>` | Print the background session's recent terminal output. | Not used by `snapback`. Read-only. | No: it reads, it does not end anything. |
+| `claude daemon stop [--any] [--keep-workers]` | Shut down the supervisor and terminate background sessions (`--any` also stops a transient, non-service daemon; `--keep-workers` leaves detached sessions running). | **Do NOT build on it.** It is GLOBAL, with no per-session meaning: one call terminates background sessions across every project. | No: per its usage text it terminates BACKGROUND sessions (never exercised here). |
+
+**`claude rm`, noted for its own sake (future consideration only; NOT wired).**
+Background job registrations accumulate. In the 2.1.278 capture `--all` listed
+159 background records against 83 in the bare list (162 against 86 records in
+all), and the 2.1.280 spot-check read 164 against 82. An earlier 2.1.278 sample,
+on 2026-09-21, read 150 against 83. `Ctrl-X d` unlinks a session's transcript but
+leaves its job registration behind, so `claude agents --json --all` goes on listing
+a job whose transcript is gone. `claude rm <id>` is the verb that would drop it, and it
+works on sessions that already exited. Wiring it into `Ctrl-X d` is explicitly out
+of scope here. It would need its own design: it deletes a WORKTREE too, and its
+unpushed-work handling (`--discard-unpushed`) is not something a board keypress
+should decide.
+
+### Hidden commands
+
+Subcommands that are **absent from `claude --help`** but whose usage text ships
+in the binary. At 2.1.280 that is `daemon` alone.
 
 | Command | Usage | Notes |
 | --- | --- | --- |
-| `claude attach <id>` | Open a background session in this terminal. | `←` returns to agent view; `Ctrl+Z` drops to the shell; the session keeps running either way. Takes the SHORT job id. |
-| `claude stop <id>` | Stop a background session. | Conversation is KEPT (resume later with `attach`); only the live job registration drops — which is what lets `claude -p -r` reclaim the session. Takes the SHORT job id. |
+| `claude daemon [subcommand] [options]` | Service lifecycle for the background-session supervisor: `run [json-path]` (**the default when piped**), `status`, `logs`, `stop`, `install`, `start`, `restart`, `uninstall`; options `--json-path <p>` (default `~/.claude/daemon.json`), `--log-file <p>` (default `~/.claude/daemon.log`), `--help`/`-h`. | Not used by `snapback`. Read from the binary's embedded usage text, never by running it: a bare `claude daemon` with piped stdout RUNS the supervisor. `stop` is in the table above. |
 
-Because they are undocumented in `--help`, a version bump can change or remove
-them without a visible help diff. If `snapback`'s attach/send paths regress after
-a `claude` update, re-verify these two first with `claude stop --help` /
-`claude attach --help`.
+Because a hidden command is undocumented in `--help`, a version bump can change or
+remove it without a visible help diff. The same caution applies to the two
+`snapback` depends on: if its attach/send/stop paths regress after a `claude`
+update, re-verify `claude stop --help` / `claude attach --help` first.
 
 ## Returning to snapback from inside a session
 
@@ -273,10 +347,11 @@ rest, `claude <command> --help` is authoritative.
 
 | Flag | Effect |
 | --- | --- |
-| `--json` | Print active sessions (interactive + background) as a JSON array and exit — no TTY needed. This is the shape `snapback` parses fail-soft. |
-| `--all` | With `--json`, also include just-completed background sessions. |
-| `--cwd <path>` | Only sessions started under `<path>`. |
+| `--json` | Print active sessions (interactive + background) as a JSON array and exit — no TTY needed. This is the shape `snapback` parses fail-soft; its fields, and which records carry `id` / `pid`, are measured in [DOMAIN.md](DOMAIN.md#reported-agents-srcagentsrs). |
+| `--all` | With `--json`, also include completed background sessions. |
+| `--cwd <path>` | Only background sessions started under `<path>`. |
 | `--agent` / `--model` / `--effort` / `--permission-mode` | Defaults for sessions dispatched from agent view. |
+| `--restricted` | Start dispatched sessions in restricted mode. |
 | `--add-dir` / `--mcp-config` / `--plugin-dir` / `--settings` / `--setting-sources` / `--strict-mcp-config` | Config applied to dispatched sessions (repeatable where noted). |
 | `--dangerously-skip-permissions` | Alias for `--permission-mode bypassPermissions`. |
 | `--allow-dangerously-skip-permissions` | Make bypass available to dispatched sessions without defaulting to it. |
@@ -307,7 +382,9 @@ rest, `claude <command> --help` is authoritative.
 
 `purge [path]` — delete ALL Claude Code state for a project (transcripts, tasks,
 file history, config entry). Destructive; relevant because it removes the JSONL
-`snapback` reads.
+`snapback` reads. Flags: `--all` (every project; exclusive with `[path]`),
+`--dry-run`, `-i`/`--interactive` (prompt per item), `-y`/`--yes` (skip the
+confirmation).
 
 ### `claude auto-mode`
 
@@ -317,8 +394,9 @@ from user settings).
 
 ### `claude ultrareview`
 
-`--json` (raw `bugs.json`) \| `--timeout <minutes>` (default 30). User-triggered
-and billed; a session cannot launch it for you.
+`--json` (raw `bugs.json`) \| `--timeout <minutes>` (default 45) \| `--post`
+(post the findings to the PR as you; PR targets only) \| `--no-post` (the
+default). User-triggered and billed; a session cannot launch it for you.
 
 ## Refreshing this doc
 
@@ -327,13 +405,25 @@ stage cannot regenerate these facts — they must be re-captured from the live C
 
 ```sh
 claude --version
-claude --help
+claude --help </dev/null
 for c in agents auth mcp plugin project install update ultrareview \
-         doctor setup-token gateway auto-mode; do
-  echo "== $c =="; claude "$c" --help
+         doctor setup-token gateway auto-mode import \
+         attach stop rm respawn logs; do
+  echo "== $c =="; claude "$c" --help </dev/null
 done
-claude stop --help; claude attach --help   # hidden — re-verify explicitly
+# daemon: hidden, and NEVER run to read its help (see below)
+strings "$(readlink -f "$(command -v claude)")" | grep -A15 '^Usage: claude daemon'
 ```
+
+**Run nothing but `--version` and `--help` here.** Several commands in this list
+start, stop, delete, restart or attach to something when run without `--help`
+(`stop`, `rm`, `respawn`, `attach`, `install`, `update`), and so do `-p` and `-r`.
+Stdin comes from `/dev/null` so nothing can wait on a prompt. `daemon` is the one exception to even `--help`. With no
+subcommand it RUNS the supervisor when its stdout is piped, and `daemon stop`
+terminates background sessions across every project. Its usage is therefore read
+from the text embedded in the binary, never from running it. Pass multi-word
+subcommands as separate words (`claude auth login --help`, not a single quoted
+`"auth login"`, which just re-prints the top-level help).
 
 Update the tables **and** the [version pin](#version-pin-self-healing) together
 when the surface changes. When a flag/command that `snapback` invokes changes,

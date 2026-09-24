@@ -366,17 +366,49 @@ pub struct PendingStop {
     pub job_id: String,
 }
 
+/// WHICH of `Ctrl-K`'s two stop mechanisms the open confirmation will run on
+/// `Enter` — the handle [`crate::send::interrupt_gate`] already chose.
+///
+/// A sum type rather than two `Option`s on [`PendingInterrupt`], so the two
+/// IMPOSSIBLE states cannot be constructed at all: a pending interrupt carrying
+/// BOTH a job id and a pid (which would leave the confirm handler free to pick the
+/// blunter of the two) or NEITHER (a confirm with nothing behind it). The gate reads
+/// a record's `pid` only where its job id is absent, and this keeps that decision
+/// made once, at the gate, rather than re-derivable at the `Enter` keypress.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InterruptRoute {
+    /// Run `claude stop <job-id>`: claude ends its own job, by a handle it issued.
+    Job {
+        /// Short agent-view job id to `claude stop` on confirm.
+        job_id: String,
+    },
+    /// Send this pid a SIGTERM — the only handle a reported session with NO
+    /// attachable job leaves.
+    ///
+    /// The pid is the one CAPTURED when the confirm opened, kept so the `Enter` arm
+    /// can compare it against a FRESH probe rather than trust it: the confirm can
+    /// sit open indefinitely, and a pid can be reused inside that unbounded window.
+    /// It is a value to RE-VERIFY, not a target.
+    Signal {
+        /// The pid `claude agents --json` reported when the confirm opened.
+        pid: u32,
+    },
+}
+
 /// The open "stop this agent?" confirmation, shown when `Ctrl-K` (interrupt) targets
 /// a LIVE agent that is not already finished: stopping it abandons live work, so the
 /// user confirms first (`Enter`) or cancels (`Esc`). A simple yes/no gate (no
 /// navigation). Distinct from [`PendingStop`], which is the reply's stop-THEN-reply
-/// pre-step; this one resolves into an actual `claude stop` and nothing more.
+/// pre-step; this one resolves into an actual `claude stop` — or, on the pid
+/// [`route`](Self::route), a SIGTERM — and nothing more.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingInterrupt {
-    /// Stable `session_id` the interrupt targets — kept only to label the modal.
+    /// Stable `session_id` the interrupt targets — the modal's label, and the id the
+    /// pid route's confirm-time re-probe asks about.
     pub session_id: String,
-    /// Short agent-view job id to `claude stop` on confirm.
-    pub job_id: String,
+    /// The handle this confirm resolves into, and the only difference between its
+    /// two shapes.
+    pub route: InterruptRoute,
 }
 
 /// A quick-reply send that is IN FLIGHT (dispatched, not yet finished).
@@ -898,6 +930,32 @@ fn default_worktree_probe(_launch_dir: &Path) -> WorktreeSet {
     WorktreeSet::empty()
 }
 
+/// The board's own process id, read from the OS ONCE, here, for [`App::own_pid`]. The
+/// pure `Ctrl-K` gate is handed that value ([`crate::send::interrupt_gate`]) rather
+/// than reading ambient state itself.
+#[cfg(not(test))]
+fn own_process_id() -> u32 {
+    std::process::id()
+}
+
+/// The board's own process id UNDER TEST: [`TEST_OWN_PID`], never the test runner's.
+///
+/// The runner's pid is whatever the OS handed out, so reading it here would make any
+/// `Ctrl-K` test that seeds a real-looking pid fail on the one run where the two
+/// happen to match — the same reason no test reads a clock. A test about the board's
+/// own pid states it by setting [`App::own_pid`].
+#[cfg(test)]
+fn own_process_id() -> u32 {
+    TEST_OWN_PID
+}
+
+/// The stand-in for the board's pid under test: Linux's `PID_MAX_LIMIT` (2^22). Every
+/// Linux pid stays below `pid_max`, whose ceiling this is, and macOS pids stop far
+/// below it, so no real process and no fixture carries it. It is still a strictly
+/// positive `pid_t`, so the rule's board half is not masked by its range half.
+#[cfg(test)]
+const TEST_OWN_PID: u32 = 1 << 22;
+
 /// One session's preview as rendered at [`App::preview_width`] — the styled text
 /// and its link regions, plus everything else that is a function of that same
 /// (session, width) pair.
@@ -1199,6 +1257,20 @@ pub struct App {
     /// `AGENTS_IDLE_AFTER`) snapshot is the bug shape this seam exists to
     /// prevent. It renders badges and the banner, nothing more.
     pub reported_agents: HashMap<String, ReportedAgent>,
+    /// The wall-clock instant (epoch millis) [`reported_agents`](Self::reported_agents)
+    /// was answered at, or `None` before the first poll or when the poller's clock
+    /// had no reading. Set ONLY together with that map
+    /// ([`set_reported_agents`](Self::set_reported_agents)), so one poll's records
+    /// are never measured against another poll's instant.
+    ///
+    /// The preview banner's age is `reported_at_ms − startedAt`
+    /// ([`crate::agents::elapsed_phrase`]), which makes it honest "as of the last
+    /// poll". It also keeps the clock out of the render path: the stamp is taken
+    /// once per map by the poller, and the render only subtracts. A DISPLAY fact,
+    /// with this map's authority and no more. An interval fact too, so it lives
+    /// here and on the banner, never on [`status`](Self::status) (STATUS-LINE
+    /// OWNERSHIP).
+    pub reported_at_ms: Option<i64>,
     /// How [`live_agent_now`](Self::live_agent_now) and
     /// [`is_live_now`](Self::is_live_now) ask claude which sessions are live.
     /// Defaults to the real [`crate::agents::live_agents`] shell-out.
@@ -1261,6 +1333,17 @@ pub struct App {
     /// from [`pending_stop`](Self::pending_stop): this resolves into a bare
     /// `claude stop`, not a reply.
     pub pending_interrupt: Option<PendingInterrupt>,
+    /// This board's OWN process id, captured ONCE at construction (from
+    /// `std::process::id()`; a fixed stand-in under test, see `own_process_id`) and
+    /// handed to [`crate::send::interrupt_gate`] as a value, so that pure gate can
+    /// refuse a record naming it without reading ambient state.
+    ///
+    /// It is the one pid `Ctrl-K` must never signal: snapback installs no SIGTERM
+    /// handler, so a SIGTERM to itself would end the board with raw mode and the
+    /// alternate screen still on (TERMINAL SAFETY). A process's id never changes while
+    /// it runs, so a capture taken once is exact rather than a snapshot that goes
+    /// stale. Nothing writes it after construction except a test stating its case.
+    pub own_pid: u32,
     /// The quick-reply send that is IN FLIGHT (dispatched, not yet finished), or
     /// `None`. Drives the optimistic in-preview echo of the message plus the
     /// animated `cooking…` placeholder so the reply feels instant; set when the
@@ -1537,6 +1620,7 @@ impl App {
             status_ttl: None,
             tick: 0,
             reported_agents: HashMap::new(),
+            reported_at_ms: None,
             live_probe: Box::new(default_live_probe),
             // Seeded a few lines down, once the probe it is resolved by is in
             // place.
@@ -1544,6 +1628,7 @@ impl App {
             worktree_probe: Box::new(default_worktree_probe),
             modal: None,
             pending_interrupt: None,
+            own_pid: own_process_id(),
             compose: None,
             draft: None,
             pending_stop: None,
@@ -2277,10 +2362,20 @@ impl App {
     // --- reported agents + running-session choice overlay -----------------
 
     /// Replace the reported-agent set (delivered off-thread by the agents
-    /// poller). Keyed by full `session_id`; the poller refreshes the whole map
-    /// each cycle so stale entries self-heal without an explicit clear.
-    pub fn set_reported_agents(&mut self, agents: HashMap<String, ReportedAgent>) {
+    /// poller) together with the wall-clock instant it was answered at. Keyed by
+    /// full `session_id`; the poller refreshes the whole map each cycle so stale
+    /// entries self-heal without an explicit clear.
+    ///
+    /// The map and its instant are ONE fact and arrive together, so they are only
+    /// ever set together: a `None` instant CLEARS the previous poll's stamp rather
+    /// than leaving it behind to date records it never saw.
+    pub fn set_reported_agents(
+        &mut self,
+        agents: HashMap<String, ReportedAgent>,
+        reported_at_ms: Option<i64>,
+    ) {
         self.reported_agents = agents;
+        self.reported_at_ms = reported_at_ms;
     }
 
     /// The reported-agent record for `session_id`, if claude knows it as an agent
@@ -2593,10 +2688,15 @@ impl App {
         self.pending_stop = None;
     }
 
-    /// Open the "stop this agent?" interrupt confirmation for a live, not-yet-finished
-    /// agent (`Ctrl-K`).
-    pub fn open_interrupt_confirm(&mut self, session_id: String, job_id: String) {
-        self.pending_interrupt = Some(PendingInterrupt { session_id, job_id });
+    /// Open the interrupt confirmation (`Ctrl-K`) for `route`'s handle: a live,
+    /// not-yet-finished agent on the job-id route, or a reported session whose only
+    /// handle is a pid on the signal route.
+    ///
+    /// One opener for both, because WHICH handle applies was already decided by
+    /// [`crate::send::interrupt_gate`] — see [`InterruptRoute`] for why that decision
+    /// travels as a sum type rather than as two nullable fields.
+    pub fn open_interrupt_confirm(&mut self, session_id: String, route: InterruptRoute) {
+        self.pending_interrupt = Some(PendingInterrupt { session_id, route });
     }
 
     /// Dismiss the interrupt confirmation, returning to the board.
@@ -7038,13 +7138,7 @@ mod tests {
     // --- live-agent join + overlay state ----------------------------------
 
     fn reported_agent(kind: &str) -> ReportedAgent {
-        ReportedAgent {
-            kind: kind.to_string(),
-            id: None,
-            state: None,
-            status: None,
-            name: None,
-        }
+        ReportedAgent::fixture(kind, None, None)
     }
 
     /// The reported-agent join is a STRICT full-`session_id` match: a matching id
@@ -7063,7 +7157,7 @@ mod tests {
         ]);
         let mut reported = HashMap::new();
         reported.insert("live-id".to_string(), reported_agent("background"));
-        app.set_reported_agents(reported);
+        app.set_reported_agents(reported, None);
 
         assert_eq!(
             app.reported_agent("live-id").map(ReportedAgent::kind_label),

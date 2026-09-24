@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, LazyLock};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event as CrosstermEvent};
@@ -88,6 +88,30 @@ fn now_ms() -> u64 {
     EPOCH.elapsed().as_millis() as u64
 }
 
+/// `at` as WALL-CLOCK epoch milliseconds, the unit claude stamps `startedAt` in
+/// ([`ReportedAgent::started_at_ms`]), or `None` when it has no such reading.
+///
+/// NOT [`now_ms`]'s clock. That one counts MONOTONIC millis from this process's
+/// [`EPOCH`], which is right for an elapsed-time gate and meaningless next to an
+/// epoch instant: subtracting a `startedAt` from it would yield an "age" that is
+/// really a negative number near −1.79 × 10¹². The two live side by side here so
+/// the difference stays visible.
+///
+/// Pure (the instant is a parameter) and FAIL-SOFT toward "no age": a clock set
+/// before 1970, or one past `i64` milliseconds, yields `None`, and
+/// [`crate::agents::elapsed_phrase`] then draws nothing rather than a nonsense
+/// age.
+fn epoch_ms(at: SystemTime) -> Option<i64> {
+    let since_epoch = at.duration_since(UNIX_EPOCH).ok()?;
+    i64::try_from(since_epoch.as_millis()).ok()
+}
+
+/// The wall clock, now, as [`epoch_ms`]. Read in exactly ONE place: the agents
+/// poller stamps each map it delivers with it (see [`spawn_agents_thread`]).
+fn wall_clock_ms() -> Option<i64> {
+    epoch_ms(SystemTime::now())
+}
+
 /// Decide whether the `claude agents` poll is due given board activity.
 ///
 /// The poll runs while the board has been active within the last
@@ -130,7 +154,22 @@ pub enum AppEvent {
     /// it is a DISPLAY signal only — every hand-off (the resume gate, and Attach
     /// for its job id) probes claude directly rather than reading it (see
     /// [`crate::agents::live_agents`]).
-    ReportedAgents(HashMap<String, ReportedAgent>),
+    ReportedAgents {
+        /// The poll's answer, keyed by full `sessionId`.
+        agents: HashMap<String, ReportedAgent>,
+        /// The wall-clock instant this answer arrived, as epoch millis ([`epoch_ms`]),
+        /// or `None` when the clock had no such reading.
+        ///
+        /// The ONE wall-clock stamp per map, and it travels WITH the map, so the
+        /// board can never pair one poll's records with another poll's instant.
+        /// The preview banner measures each record's `startedAt` against it (its
+        /// age, "as of the last poll"). It is taken here, where the poller already
+        /// runs impure work, rather than when the event is applied: that keeps
+        /// `update::handle_event` free of an ambient clock, so a test states the
+        /// instant instead of racing one. The render path never reads a clock at
+        /// all.
+        reported_at_ms: Option<i64>,
+    },
     /// A one-shot quick-reply send finished (`claude -p -r <id>`), delivered OFF
     /// the UI thread by the detached send driver (see [`crate::send::spawn_send`]).
     ///
@@ -622,7 +661,9 @@ fn spawn_tick_thread(tx: Sender<AppEvent>, interval: Duration) {
 }
 
 /// Run `poll` OFF-THREAD, emitting an [`AppEvent::ReportedAgents`] immediately
-/// and then every `interval`, until the owning [`EventLoop`] goes away.
+/// and then every `interval`, until the owning [`EventLoop`] goes away. Each one
+/// carries the wall-clock instant its answer arrived ([`wall_clock_ms`], the
+/// crate's only wall-clock read outside tests and the store's settle window).
 ///
 /// The first poll fires BEFORE any sleep so badges appear on load; each
 /// subsequent poll refreshes them on the autorefresh cadence. In production
@@ -665,7 +706,15 @@ fn spawn_agents_thread<F>(
         let last = activity.load(Ordering::Relaxed);
         if agents_poll_due(last, now, idle_after) {
             let reported = poll();
-            if tx.send(AppEvent::ReportedAgents(reported)).is_err() {
+            // Stamped ONCE per map, the moment the answer is in hand, and sent
+            // with it (see `AppEvent::ReportedAgents::reported_at_ms`). The wall
+            // clock, never `now` above: that one is monotonic.
+            let reported_at_ms = wall_clock_ms();
+            let event = AppEvent::ReportedAgents {
+                agents: reported,
+                reported_at_ms,
+            };
+            if tx.send(event).is_err() {
                 break; // TUI receiver gone.
             }
         }
@@ -803,13 +852,7 @@ mod tests {
             calls.fetch_add(1, Ordering::Relaxed);
             HashMap::from([(
                 POLLED_ID.to_string(),
-                ReportedAgent {
-                    kind: "background".to_string(),
-                    id: None,
-                    state: None,
-                    status: None,
-                    name: None,
-                },
+                ReportedAgent::fixture("background", None, None),
             )])
         }
     }
@@ -1348,12 +1391,20 @@ mod tests {
     /// IMMEDIATELY — before the first sleep — and delivers what the poll
     /// returned. `interval` is far longer than the budget on purpose, so a
     /// poller that slept first would fail this rather than pass it slowly.
+    ///
+    /// The delivered map also carries its WALL-CLOCK stamp, and the stamp is
+    /// bracketed by two wall-clock reads taken around the poll. The bracket is what
+    /// pins the clock: the MONOTONIC `now_ms` the same loop already reads counts
+    /// from process start, so a stamp taken from it lands about 1.79 × 10¹² ms below
+    /// the bracket and fails here. On the banner it would fail silently, as an age
+    /// that never draws.
     #[test]
     fn agents_poller_polls_immediately_while_the_board_is_active() {
         let (tx, rx) = mpsc::channel::<AppEvent>();
         let calls = Arc::new(AtomicUsize::new(0));
         let activity = Arc::new(AtomicU64::new(now_ms()));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let before = epoch_ms(SystemTime::now()).expect("the test host's clock is past 1970");
 
         spawn_agents_thread(
             tx,
@@ -1365,10 +1416,22 @@ mod tests {
         );
 
         match rx.recv_timeout(Duration::from_secs(2)) {
-            Ok(AppEvent::ReportedAgents(reported)) => assert!(
-                reported.contains_key(POLLED_ID),
-                "the delivered set must be the one the poll returned, got {reported:?}"
-            ),
+            Ok(AppEvent::ReportedAgents {
+                agents,
+                reported_at_ms,
+            }) => {
+                let after =
+                    epoch_ms(SystemTime::now()).expect("the test host's clock is past 1970");
+                assert!(
+                    agents.contains_key(POLLED_ID),
+                    "the delivered set must be the one the poll returned, got {agents:?}"
+                );
+                assert!(
+                    reported_at_ms.is_some_and(|at| (before..=after).contains(&at)),
+                    "the map must carry the wall-clock instant it was answered at, \
+                     inside [{before}, {after}] epoch ms; got {reported_at_ms:?}"
+                );
+            }
             other => panic!("an active board must deliver ReportedAgents, got {other:?}"),
         }
         assert_eq!(
@@ -1687,6 +1750,40 @@ mod tests {
             WatchPathClass::Session,
             WatchPathClass::Ignorable,
         ]));
+    }
+
+    // --- epoch_ms (pure, no clock) ---
+
+    /// The wall-clock conversion the agents poller stamps each map with: epoch
+    /// MILLIS exactly (the unit `startedAt` arrives in), and `None` rather than a
+    /// wrapped or clamped number when the instant has no such reading.
+    #[test]
+    fn epoch_ms_reads_epoch_millis_and_fails_soft_before_1970_and_past_i64() {
+        // A real `startedAt` from the 2.1.278 capture: the conversion must land on
+        // the very number claude would have sent for the same instant.
+        let started_at = 1_790_152_789_592_u64;
+        assert_eq!(
+            epoch_ms(UNIX_EPOCH + Duration::from_millis(started_at)),
+            Some(1_790_152_789_592),
+        );
+        // Sub-millisecond precision truncates, as `startedAt` itself does.
+        assert_eq!(
+            epoch_ms(UNIX_EPOCH + Duration::from_micros(started_at * 1_000 + 999)),
+            Some(1_790_152_789_592),
+        );
+        assert_eq!(epoch_ms(UNIX_EPOCH), Some(0));
+        assert_eq!(
+            epoch_ms(UNIX_EPOCH - Duration::from_millis(1)),
+            None,
+            "a clock before 1970 has no epoch-millis reading: no age, not a negative one"
+        );
+        // One millisecond past what `i64` millis can hold. Built only if the
+        // platform's `SystemTime` reaches that far; where it cannot, no clock can
+        // reach this arm either.
+        let past_i64 = Duration::from_millis(i64::MAX.unsigned_abs() + 1);
+        if let Some(far) = UNIX_EPOCH.checked_add(past_i64) {
+            assert_eq!(epoch_ms(far), None, "past i64 millis must not wrap");
+        }
     }
 
     // --- agents_poll_due tests (pure, no filesystem) ---
