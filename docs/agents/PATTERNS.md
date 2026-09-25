@@ -773,8 +773,8 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    printable char types into the query; arrows, Enter, Tab, and `Ctrl-*` always
    act so search never blocks navigation).
 2. `apply_action` mutates the `App` and returns an `Outcome`
-   (`Continue`/`Quit`/`Resume`/`Send`/`Interrupt`/`BgLaunch`/`Signal`/`Copy`/
-   `FinishCopy`). `Send`,
+   (`Continue`/`Quit`/`Resume`/`Send`/`Interrupt`/`BgLaunch`/`Signal`; `Copy` comes
+   from `handle_chord_key` and `FinishCopy` from `handle_event`, below). `Send`,
    `Interrupt` and `BgLaunch` carry a confirmed `SendRequest` / `InterruptRequest` /
    `BgLaunchRequest` the driver spawns without a teardown (the board stays up), the
    way `Resume` carries a confirmed `Ready` — the decision is data, the effect is

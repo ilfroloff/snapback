@@ -291,9 +291,8 @@ impl Outcome {
     /// True for [`Quit`](Self::Quit) and every [`Resume`](Self::Resume); false for
     /// the no-teardown effects (`Send`, `Interrupt`, `BgLaunch`, the interrupt's
     /// `Signal`, and the clipboard copy's `Copy` / `FinishCopy`), which keep
-    /// drawing on the SAME channel. Pure,
-    /// so "does the board survive this?" is one greppable answer rather than a
-    /// `matches!` repeated per call site.
+    /// drawing on the SAME channel. Pure, so "does the board survive this?" is one
+    /// greppable answer rather than a `matches!` repeated per call site.
     #[must_use]
     pub fn ends_board_session(&self) -> bool {
         matches!(self, Outcome::Quit | Outcome::Resume(_))
@@ -642,9 +641,14 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
 /// Called on every `Tick` (after `tick_status`) and once at board entry, before
 /// the first draw ([`crate::tui::run`]). The queue is taken with ONE lock-and-take,
 /// and the lock is released before any event is handled, so the render loop never
-/// waits on a send thread. Every event in the queue is a completion, and a
-/// completion's arm always answers `Continue`: there is no outcome here that could
-/// end the board.
+/// waits on a send thread. Every event in the queue is a `SendFinished`, and its
+/// arm answers `Continue`, so discarding `dispatch`'s outcome loses nothing and
+/// nothing here can end the board. That holds only because nothing else is ever
+/// queued. Two paths fill the queue, and each admits `SendFinished` alone:
+/// [`crate::send::spawn_send`] is `deliver`'s only non-test caller, and the
+/// teardown drain ([`crate::send::UndeliveredEvents::drain_then_drop`]) discards
+/// every other event. Not every completion answers `Continue` (`CopyFinished`
+/// answers `FinishCopy`), so queueing another kind must revisit this.
 pub fn replay_undelivered(app: &mut App, store: &mut SessionStore) {
     for event in app.take_undelivered() {
         dispatch(app, event, store);
