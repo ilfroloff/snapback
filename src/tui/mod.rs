@@ -496,9 +496,15 @@ pub fn run(app: &mut App, store: &mut SessionStore) -> Result<Outcome> {
 /// Split out so [`run`] can guarantee [`restore_terminal`] runs on every exit:
 /// the `?`-propagated errors from [`EventLoop::new`] and `terminal.draw` leave
 /// through this function's return value rather than bypassing the caller's
-/// restore. Dropping the local `events` here also joins the input reader before
-/// [`run`] returns (see [`EventLoop`]'s `Drop`), so the reader has released
-/// stdin before `main` spawns `claude`.
+/// restore. Dropping the local `events` here (inside the teardown drain at the
+/// end) also joins the input reader before [`run`] returns (see [`EventLoop`]'s
+/// `Drop`), so the reader has released stdin before `main` spawns `claude`.
+///
+/// A quick reply's completion can outlive the board session that dispatched it,
+/// so this function brackets each session with the app's undelivered queue
+/// ([`crate::send::UndeliveredEvents`]): it replays what an earlier session could
+/// not read before the first draw, and on the way out it moves any completion
+/// this session's channel accepted but never read into that queue.
 fn run_inner(
     terminal: &mut DefaultTerminal,
     app: &mut App,
@@ -520,6 +526,15 @@ fn run_inner(
     // `claude agents --json --all` shell-out can never block rendering. Delivered
     // as `AppEvent::ReportedAgents` on the merged channel and applied in `update`.
     events.spawn_agents_poller(crate::watch::AGENTS_REFRESH);
+    // The app's queue of completions no board session has read. It outlives this
+    // session because `lib::run` re-enters the board on the SAME `App`, while the
+    // channel above dies with this function.
+    let undelivered = app.undelivered_handle();
+    // A reply that finished while no board was up (the hand-off's `claude` child
+    // was running) is already queued: settle it before the first draw, so this
+    // board never paints a `cooking…` tail for a reply that has already landed.
+    // Anything queued later is picked up by the next `Tick`.
+    update::replay_undelivered(app, store);
 
     let outcome = loop {
         terminal.draw(|frame| view::render(frame, app))?;
@@ -530,9 +545,11 @@ fn run_inner(
                 // KEEP drawing — the board never tears down (contrast
                 // `Outcome::Resume`). The child reports back via
                 // `AppEvent::SendFinished` on this same channel, so the completion
-                // status and the reloaded reply both land on the live board.
+                // status and the reloaded reply both land on the live board. If
+                // this board session has ended by then, the completion goes into
+                // `undelivered` instead, for the next one.
                 Outcome::Send(req) => {
-                    crate::send::spawn_send(req, events.sender());
+                    crate::send::spawn_send(req, events.sender(), undelivered.clone());
                 }
                 // A confirmed interrupt: fire `claude stop` on a detached thread and
                 // KEEP drawing, exactly like `Outcome::Send`. The stop reports back
@@ -585,6 +602,18 @@ fn run_inner(
             None => break Outcome::Quit,
         }
     };
+
+    // The board session is over, but its channel may still hold a quick reply's
+    // `SendFinished` that arrived after the key that ended it. Dropping `events`
+    // would throw that away, and `App::sending`, which only that event clears,
+    // would then stay set into every later board session. So the receiver is
+    // emptied into the queue and dropped under the queue's lock (the input-reader
+    // join included), and a reply finishing at the same moment either lands before
+    // the drain or finds the receiver gone. Either way it is queued for the next
+    // board's replay (the no-gap argument is `UndeliveredEvents`'). The `?` exits
+    // above skip this on purpose: an `Err` from here ends the process in
+    // `lib::run`, so no later board could read the queue.
+    undelivered.drain_then_drop(events, EventLoop::try_recv);
 
     Ok(outcome)
 }

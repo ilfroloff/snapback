@@ -537,6 +537,17 @@ impl EventLoop {
         self.rx.recv().ok()
     }
 
+    /// The next event ALREADY buffered on the merged channel, without waiting;
+    /// `None` once the buffer is empty (or every sender dropped).
+    ///
+    /// Used only by [`crate::tui::run`]'s teardown drain
+    /// ([`crate::send::UndeliveredEvents::drain_then_drop`]), which empties this
+    /// receiver before it drops so a quick reply's completion the board never read
+    /// is kept for the next board rather than lost with the buffer.
+    pub fn try_recv(&self) -> Option<AppEvent> {
+        self.rx.try_recv().ok()
+    }
+
     /// Block for the next event up to `timeout`; `None` on timeout/disconnect.
     ///
     /// Not on the binary's runtime path — the TUI loop blocks on

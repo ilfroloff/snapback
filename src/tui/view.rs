@@ -2673,6 +2673,13 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         // so any extra glyph (`^K stop/signal`, say) would cut its own tail on an
         // 80-column terminal. The routes are spelled out where there is room:
         // `KEYS` in `cli.rs`, the README key map and the table in `update.rs`.
+        //
+        // `^R reply` stays one word too. Its refusals (a live agent, a session with
+        // no job to stop first, and one reply at a time while another is still being
+        // sent) are refusals, not routes, and each explains itself on this line
+        // when it fires. The key sits at columns 63-70 of a line cut at 80, so it has
+        // no room to list them anyway. They are spelled out on the same three
+        // surfaces as `^K`'s routes.
         Line::from(vec![Span::styled(
             "↑↓ move · ←/→ fold/expand · Enter resume · ^F fork · ^N new · ^R reply · ^K stop · ^X hide/del · type to search · Tab name/content · S-↑↓ match · ^A scope · ^/ preview · PgUp/PgDn·^U/^D·^T/^E·Home/End·wheel scroll · Esc quit",
             Style::default().add_modifier(Modifier::DIM),

@@ -29,8 +29,10 @@ use crate::defined_agents::{self, DefinedAgent};
 use crate::{config, delete, hidden};
 
 use crate::search::{self, MarkScratch, SearchIndex, SearchMode};
+use crate::send::UndeliveredEvents;
 use crate::store::lineage::{self, LineageKey};
 use crate::store::{preview, Reload, Session};
+use crate::watch::AppEvent;
 // The scope predicate and the worktree resolver MUST canonicalize paths the same
 // way or membership compares apples to oranges, so both call the one
 // `resolve_dir` that lives beside the worktree set it has to match.
@@ -1347,9 +1349,27 @@ pub struct App {
     /// The quick-reply send that is IN FLIGHT (dispatched, not yet finished), or
     /// `None`. Drives the optimistic in-preview echo of the message plus the
     /// animated `cooking…` placeholder so the reply feels instant; set when the
-    /// send is handed off and cleared when its `AppEvent::SendFinished` lands.
+    /// send is handed off and cleared when its `AppEvent::SendFinished` lands. That
+    /// event lands on the board that dispatched the send or, when that board session
+    /// ended first, on the next one, through [`undelivered`](Self::undelivered).
+    /// Either way the slot is cleared only once the reply child has finished.
     /// See [`Sending`].
     pub sending: Option<Sending>,
+    /// Completions a board session ended before it could read, kept here for the
+    /// next board. Today that is only the quick reply's `AppEvent::SendFinished`.
+    ///
+    /// It lives on `App` because `tui::run_inner` drops the board's receiver at
+    /// every hand-off, while `lib::run` re-enters the board on the SAME `App`: the
+    /// model outlives every channel, so the model is where a completion can wait.
+    /// Without it, a reply still running across a hand-off reported into a channel
+    /// nobody read, and [`sending`](Self::sending) stayed set until restart. The
+    /// driver hands each send thread a handle
+    /// ([`undelivered_handle`](Self::undelivered_handle)), and the board empties it
+    /// on every `Tick` and once at entry
+    /// ([`take_undelivered`](Self::take_undelivered), via
+    /// `update::replay_undelivered`). The lock rules and the no-gap argument are
+    /// [`UndeliveredEvents`]'s.
+    undelivered: UndeliveredEvents,
     /// The `claude stop` interrupt that is IN FLIGHT (dispatched, not yet finished),
     /// or `None`. Set when the stop is handed off and cleared when its
     /// `AppEvent::InterruptFinished` lands for the same session id.
@@ -1633,6 +1653,7 @@ impl App {
             draft: None,
             pending_stop: None,
             sending: None,
+            undelivered: UndeliveredEvents::default(),
             interrupting: None,
             next_bg_launch_id: 0,
             last_new_agent: None,
@@ -2801,6 +2822,44 @@ impl App {
     #[must_use]
     pub fn sending_to(&self, session_id: &str) -> Option<&Sending> {
         self.sending.as_ref().filter(|s| s.session_id == session_id)
+    }
+
+    /// The board's name for the session the in-flight quick reply is going to: its
+    /// label, or its id when the label is empty or the row has left the board. `None`
+    /// exactly when no reply is in flight.
+    ///
+    /// `Ctrl-R`'s one-reply-at-a-time refusal names the session with this
+    /// ([`crate::send::reply_in_flight_refusal`]), so it must answer `Some` whenever
+    /// [`sending`](Self::sending) is set. A lookup that went `None` for a missing row
+    /// would switch that guard off the moment a reload dropped the row, while the
+    /// reply was still being sent.
+    #[must_use]
+    pub fn sending_label(&self) -> Option<&str> {
+        let sending = self.sending.as_ref()?;
+        Some(
+            self.session_by_id(&sending.session_id)
+                .map(|session| session.label.as_str())
+                .filter(|label| !label.is_empty())
+                .unwrap_or(sending.session_id.as_str()),
+        )
+    }
+
+    /// Another handle on this board's [`undelivered`](Self::undelivered) queue:
+    /// the driver gives one to each quick-reply send thread
+    /// ([`crate::send::spawn_send`]) and uses one for the teardown drain. A handle,
+    /// not a copy: whatever a thread queues through it, the board takes here.
+    #[must_use]
+    pub fn undelivered_handle(&self) -> UndeliveredEvents {
+        self.undelivered.clone()
+    }
+
+    /// Every completion a previous board session could not read, oldest first,
+    /// leaving the queue empty. ONE lock-and-take, released before this returns,
+    /// so the caller handles each event with the lock free (see
+    /// [`UndeliveredEvents::take`]).
+    #[must_use]
+    pub fn take_undelivered(&self) -> Vec<AppEvent> {
+        self.undelivered.take()
     }
 
     /// The in-flight `claude stop` interrupt targeting `session_id`, or `None`
@@ -7477,6 +7536,95 @@ mod tests {
         assert!(
             !app.overlay_active(),
             "the board is back once the card closes"
+        );
+    }
+
+    /// `sending_label` names the in-flight reply's session by its label, falls back
+    /// to the id when the label is empty or the row has left the board, and is
+    /// `None` only while nothing is in flight. The `Ctrl-R` guard it feeds therefore
+    /// cannot switch off because a row went missing.
+    #[test]
+    fn sending_label_names_the_in_flight_session_and_answers_while_any_is_set() {
+        let mut blank = session("blank", "r", Some("main"), "/tmp/blank");
+        blank.label = String::new();
+        let mut app = app_all(vec![session("s", "r", Some("main"), "/tmp/s"), blank]);
+        let in_flight_to = |id: &str| {
+            Some(Sending {
+                session_id: id.to_string(),
+                message: "hi".to_string(),
+                baseline_msg_count: 0,
+            })
+        };
+
+        assert_eq!(app.sending_label(), None, "nothing in flight");
+
+        app.sending = in_flight_to("s");
+        assert_eq!(
+            app.sending_label(),
+            Some("label for s"),
+            "named by its label"
+        );
+
+        app.sending = in_flight_to("blank");
+        assert_eq!(
+            app.sending_label(),
+            Some("blank"),
+            "an empty label falls back to the id"
+        );
+
+        app.sending = in_flight_to("gone");
+        assert_eq!(
+            app.sending_label(),
+            Some("gone"),
+            "a row that left the board is still named, by its id"
+        );
+    }
+
+    /// Task 10.2: `App::new` starts with nothing undelivered, and one take hands
+    /// back every completion queued through ANY handle, oldest first, leaving the
+    /// queue empty.
+    ///
+    /// The completions are queued the way a send thread queues them: through a
+    /// handle, over a real channel whose receiver was dropped. A handle that
+    /// copied the queue instead of sharing it would leave the board's take empty.
+    #[test]
+    fn take_undelivered_drains_every_handle_in_order_and_leaves_the_queue_empty() {
+        let app = app_all(vec![session("s", "r", Some("main"), "/tmp/s")]);
+        assert!(
+            app.take_undelivered().is_empty(),
+            "a new board has nothing undelivered"
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(rx); // the board that dispatched these has gone
+        let (one, other) = (app.undelivered_handle(), app.undelivered_handle());
+        for (handle, id) in [(&one, "first"), (&other, "second"), (&one, "third")] {
+            handle.deliver(
+                &tx,
+                AppEvent::SendFinished {
+                    session_id: id.to_string(),
+                    status: "sent".to_string(),
+                    success: true,
+                },
+            );
+        }
+
+        let ids: Vec<String> = app
+            .take_undelivered()
+            .into_iter()
+            .map(|event| match event {
+                AppEvent::SendFinished { session_id, .. } => session_id,
+                other => panic!("only completions were queued, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            ["first", "second", "third"],
+            "the take drains every handle's completions, oldest first"
+        );
+        assert!(
+            app.take_undelivered().is_empty(),
+            "the take leaves the queue empty"
         );
     }
 

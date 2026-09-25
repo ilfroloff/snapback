@@ -64,6 +64,8 @@ it. Follow this split when adding behavior:
 - Pure, tested: `resume::plan` / `plan_from_parts` / `build_argv` /
   `build_new_argv` / `status_for_exit`; every decision in `send` — `reply_gate` /
   `interrupt_gate` (the whole routing tree, asserted with no process spawned),
+  `reply_in_flight_refusal` (`Ctrl-R`'s one-reply-at-a-time rule, which takes the
+  in-flight session's name as a parameter rather than reading `App`),
   `build_send_argv` / `build_stop_argv` / `build_bg_launch_argv`, `plan_send` /
   `plan_bg_launch`, the `status_for_output` / `status_for_failed_send` /
   `status_for_stop` / `status_for_bg_launch` / `status_for_signal` mapping, and
