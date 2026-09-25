@@ -319,6 +319,35 @@ tells you why an agent-bound job may be behaving like a plain one, which is not
 otherwise visible anywhere. Expect it to stop appearing once the upstream bug is
 fixed.
 
+**When a job you sent off fails.** If a background agent (or a background
+command) that a session started fails — it stalled, or hit an API error — Claude
+Code drops a short notice into that session and moves on. Nothing on the board
+used to say so, so a failed job looked just like one still working.
+
+snapback marks that session's row `[task failed]`, and its preview leads with a
+line quoting Claude Code's own account, word for word, with the time it arrived:
+
+```text
+background task failed at 2026-09-21 15:30: Agent "Remediate review findings" failed: Agent stalled: no progress for 600s (stream watchdog did not recover)
+```
+
+If the notice doesn't include an account, the session is still marked and the
+line just says `background task failed at <time>`.
+
+The mark stays until you next **write** in that session — a prompt you type, or a
+`Ctrl-R` quick reply, skill commands such as `/cr-review` included (as a quick
+reply, from Claude Code 2.1.278 on; older versions leave no sign it was you).
+Other things don't count, because they aren't you: a later notice that some other
+job finished, a message from another agent, or a built-in command such as `/exit`
+typed on its own. That errs on the side of a mark you've already dealt with, never on
+the side of a failure you haven't seen. Two consequences worth knowing: it will
+also mark a failure Claude Code already explained in its own reply, and a
+background copy of the session (see above) carries the mark over until its own
+first prompt.
+
+It's a marker and nothing more — no key, and it changes nothing. A job that was
+stopped or killed isn't marked, only one that failed.
+
 **Hand an agent a job and stay put.** `Ctrl-N` starts a fresh session in the
 folder you launched from. If you keep Claude Code agents defined, it offers a
 quick picker so the new session can start bound to one, and it remembers the last

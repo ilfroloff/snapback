@@ -32,6 +32,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::agents::{self, AgentActivity, ReportedAgent};
 use crate::search::SearchMode;
 use crate::store::preview::{self, LinkRegion};
+use crate::store::FailedTask;
 
 use super::app::{
     resolve_list_width, App, Modal, ModalChoice, ModalLayout, NewSessionDraft, Row, Scope,
@@ -107,7 +108,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 /// What sits between two header segments: a middot with breathing room either
 /// side. Declared once so every segment — including the counter's optional
 /// `· N hidden` tail — is joined by the SAME string, rather than by a literal
-/// copied per call site that can drift a space.
+/// copied per call site that can drift a space. The preview banner joins its two
+/// facts with it too ([`preview_banner`]), so the board has one separator.
 const HEADER_SEPARATOR: &str = "  ·  ";
 
 /// Prefix for a release build's version indicator (`v0.1.0`); the leading `v`
@@ -271,6 +273,44 @@ const HIDDEN_ROW_MARKER: &str = "  [hidden]";
 /// Carries its own leading gap, exactly as [`HIDDEN_ROW_MARKER`] and
 /// [`LINEAGE_MARKER_GAP`] do, so the width reserved is the width drawn.
 const AGENT_UNBOUND_MARKER: &str = "  [unbound]";
+
+/// The marker a session row wears while a background task it launched stands
+/// FAILED and the user has not written into the session since (see
+/// [`Session::failed_task`](crate::store::Session::failed_task)).
+///
+/// # What it asserts
+///
+/// EXACTLY this: claude delivered a `failed` task notification into this
+/// transcript, and no later record in it is the user's own prompt, typed or a
+/// quick reply. The precise account is claude's own `<summary>`, which the
+/// preview banner quotes when the notice carries one ([`failed_task_banner`]);
+/// the row only says where to look.
+///
+/// "task", not "agent", because the notification is claude's `task-notification`
+/// and it reports background SHELL commands as well as agents — a real store
+/// holds a `Background command "…" failed with exit code 126` beside the agent
+/// stalls. A plain state rather than an imperative, like [`AGENT_UNBOUND_MARKER`],
+/// so it cannot drift into advice. It is a marker only: no key is bound to it and
+/// it gates nothing.
+///
+/// # Width
+///
+/// Two words, because one (`[failed]`) reads as a verdict on the SESSION, which
+/// did not fail. Like every trailing marker it is reserved BEFORE the label and
+/// dropped whole rather than clipped, so the extra columns cost label, never a
+/// half-drawn `[task fai`.
+///
+/// Carries its own leading gap, exactly as [`AGENT_UNBOUND_MARKER`] does, so the
+/// width reserved is the width drawn.
+const FAILED_TASK_MARKER: &str = "  [task failed]";
+
+/// What the preview banner says ahead of claude's own words when the selected
+/// session carries a failed background task (see [`failed_task_banner`]).
+///
+/// Lower-case board voice, matching the reported-agent status it can share the
+/// banner row with (`bg done`), and worded for the task rather than the agent for
+/// the reason [`FAILED_TASK_MARKER`] gives.
+const FAILED_TASK_BANNER_LEAD: &str = "background task failed";
 
 /// How many leading chars of a `session_id` a lineage CHILD row shows.
 ///
@@ -788,6 +828,19 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                             Style::default().add_modifier(Modifier::DIM),
                         ));
                     }
+                    // A failed background task is a fact about THIS file, so a
+                    // child row draws it too — and a child is exactly where an
+                    // inherited one shows: a background fork copies its parent's
+                    // transcript, flag included, until its own first prompt.
+                    // Dropped only if the row has no room, exactly as the turn
+                    // count above is, and decided FIRST because it is the marker
+                    // that wants the user.
+                    let used: usize = spans.iter().map(Span::width).sum();
+                    if session.failed_task.is_some()
+                        && used + FAILED_TASK_MARKER.chars().count() <= content_width
+                    {
+                        spans.push(failed_task_marker_span());
+                    }
                     // A downgraded member is not always the head: the fork is
                     // usually NEWER than its root and so heads the lineage, but a
                     // third member can push it into a child row. The badge is a
@@ -815,20 +868,33 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 // `hidden` is 0 for every row with nothing hidden, and such a row
                 // takes the untouched label it always has.
                 let marker = (*hidden > 0).then(|| lineage_marker(*hidden));
-                // The #80811 badge: a single lookup against the set derived once
-                // per reload, using the id this row already holds. Never a scan.
                 let fold_width = marker.as_ref().map_or(0, |m| m.chars().count());
                 let used: usize = spans.iter().map(Span::width).sum();
-                // DROPPED, never clipped, when the row cannot fit it even with no
-                // label at all: a half-drawn `[unboun` asserts nothing, and a
-                // marker that overruns pushes the row's content off the edge.
-                // Same discipline as `fit_child_msgs` on the child row.
+                // The failed-task marker: a field of the session this row already
+                // holds, so no lookup at all. DROPPED, never clipped, when the row
+                // cannot fit it even with no label: a half-drawn `[task fai`
+                // asserts nothing, and a marker that overruns pushes the row's
+                // content off the edge. Same discipline as `fit_child_msgs` on the
+                // child row. Decided BEFORE the #80811 badge because it is the one
+                // that wants the user, so a pane with room for only one keeps it.
+                let failed = session.failed_task.is_some()
+                    && used + fold_width + FAILED_TASK_MARKER.chars().count() <= content_width;
+                let failed_width = if failed {
+                    FAILED_TASK_MARKER.chars().count()
+                } else {
+                    0
+                };
+                // The #80811 badge: a single lookup against the set derived once
+                // per reload, using the id this row already holds. Never a scan.
+                // Dropped whole on the same terms, against what is left.
                 let unbound = app.lost_agent_bindings.contains(&session.session_id)
-                    && used + fold_width + AGENT_UNBOUND_MARKER.chars().count() <= content_width;
-                // BOTH trailing markers are reserved in ONE budget, so the label
-                // is what gives way and neither marker can be shoved off the edge
-                // — the same discipline `(+N)` alone already followed.
+                    && used + fold_width + failed_width + AGENT_UNBOUND_MARKER.chars().count()
+                        <= content_width;
+                // EVERY trailing marker is reserved in ONE budget, so the label
+                // is what gives way and no marker can be shoved off the edge —
+                // the same discipline `(+N)` alone already followed.
                 let reserved = fold_width
+                    + failed_width
                     + if unbound {
                         AGENT_UNBOUND_MARKER.chars().count()
                     } else {
@@ -866,6 +932,9 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                         marker,
                         Style::default().add_modifier(Modifier::DIM),
                     ));
+                }
+                if failed {
+                    spans.push(failed_task_marker_span());
                 }
                 if unbound {
                     spans.push(unbound_marker_span());
@@ -915,6 +984,26 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
 /// escape (AGENTS.md).
 fn unbound_marker_span() -> Span<'static> {
     Span::styled(AGENT_UNBOUND_MARKER, Style::default().fg(Color::Yellow))
+}
+
+/// The color that says "a background task failed" — the row marker and the
+/// banner sentence alike, so the two surfaces read as one fact.
+///
+/// `Red`: the board's one accent for "this wants you" (the `NeedsInput` glyph,
+/// [`BADGE_NEEDS_INPUT_COLOR`], already speaks it), and a failure nobody has
+/// looked at yet is exactly that. A NAMED ANSI color, never RGB (TERMINAL-SAFE
+/// STYLING).
+const FAILED_TASK_COLOR: Color = Color::Red;
+
+/// The styled [`FAILED_TASK_MARKER`] span, built in ONE place so the head row
+/// and a child row can never draw the same fact in two different styles.
+///
+/// Deliberately NOT `DIM` — dim is this row's footnote weight, and an unanswered
+/// failure is not a footnote — and deliberately not `BOLD`, so a trailing marker
+/// does not outrank the label it sits beside (the same weighing as
+/// [`unbound_marker_span`]).
+fn failed_task_marker_span() -> Span<'static> {
+    Span::styled(FAILED_TASK_MARKER, Style::default().fg(FAILED_TASK_COLOR))
 }
 
 /// Dim an ENTIRE list row when it is a soft-hidden session shown under the
@@ -1105,13 +1194,23 @@ fn blink_visible(tick: u64) -> bool {
     (tick / BLINK_TICKS).is_multiple_of(2)
 }
 
-/// The status banner line for the SELECTED session, or `None` when claude never
-/// reported that session as an agent (the preview then renders unchanged).
+/// The status banner line for the SELECTED session, or `None` when there is
+/// nothing to pin (the preview then renders unchanged).
 ///
-/// Read-only over state that already exists: the selected id (`App::selected`)
-/// joined through the existing `App::reported_agent` accessor, with the phrasing
-/// owned by [`agents::friendly_status`] — no new `App` state, no new I/O, and no
-/// second interpretation of the `state`/`status` value set.
+/// Two facts can put a banner up, and when both hold they share the ONE row,
+/// joined by [`HEADER_SEPARATOR`], the reported status first:
+///
+/// - claude REPORTED the session as an agent — the status in words, phrased by
+///   [`agents::friendly_status`] (no second interpretation of the `state`/`status`
+///   value set);
+/// - the session carries a FAILED background task the user has not written into
+///   it since ([`Session::failed_task`](crate::store::Session::failed_task)) —
+///   claude's own summary, when the notice carries one, quoted by
+///   [`failed_task_banner`].
+///
+/// Read-only over state that already exists: the selected id (`App::selected`),
+/// the `App::reported_agent` accessor and the selected session's own parsed
+/// field — no new `App` state and no new I/O.
 ///
 /// Keyed on REPORTED, not live, so a FINISHED agent still gets its banner (`bg
 /// done`) rather than silently losing it.
@@ -1145,16 +1244,78 @@ pub(crate) fn preview_banner(app: &App) -> Option<Line<'static>> {
     if app.sending_to(selected).is_some() {
         return None;
     }
-    let agent = app.reported_agent(selected)?;
-    // Cyan + BOLD marks the line as the board speaking rather than transcript
-    // content (the search prompt uses the same accent). NAMED so it adapts to
-    // the terminal theme — no RGB (TERMINAL-SAFE STYLING).
-    Some(Line::from(Span::styled(
-        agents::friendly_status(agent),
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )))
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if let Some(agent) = app.reported_agent(selected) {
+        // Cyan + BOLD marks the line as the board speaking rather than transcript
+        // content (the search prompt uses the same accent). NAMED so it adapts to
+        // the terminal theme — no RGB (TERMINAL-SAFE STYLING).
+        spans.push(Span::styled(
+            agents::friendly_status(agent),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if let Some(task) = app
+        .session_by_id(selected)
+        .and_then(|session| session.failed_task.as_ref())
+    {
+        if !spans.is_empty() {
+            spans.push(Span::raw(HEADER_SEPARATOR));
+        }
+        // The banner's own BOLD weight, in the failure color the row marker wears
+        // ([`FAILED_TASK_COLOR`]), so the row and the pane read as one fact.
+        spans.push(Span::styled(
+            failed_task_banner(task),
+            Style::default()
+                .fg(FAILED_TASK_COLOR)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    (!spans.is_empty()).then(|| Line::from(spans))
+}
+
+/// The banner sentence for a failed background task:
+/// `background task failed at <when>: <claude's summary>`, or without the
+/// `at <when>` when the notice carried no readable timestamp, and without the
+/// `: <claude's summary>` when there is nothing to quote ([`quotable_summary`]) —
+/// never a dangling colon.
+///
+/// The summary is QUOTED, never paraphrased: it goes in exactly as the parse kept
+/// it — the `<summary>` tag's inner text — so the user reads claude's own account
+/// (`Agent "…" failed: Agent stalled: no progress for 600s …`). The time is the
+/// NOTICE's, not the session's, and is drawn with the row's own [`short_time`]
+/// so the two read alike; it is what tells a failure from this morning apart from
+/// one left standing for days, since the flag clears only when the user writes.
+///
+/// TERMINAL-SAFE by construction rather than by rewriting: a summary is rendered
+/// through a ratatui `Span`, whose graphemes drop control characters before they
+/// reach the buffer, so a stray escape in claude's text can never be emitted raw.
+/// Pure, so the wording is tested without a terminal.
+fn failed_task_banner(task: &FailedTask) -> String {
+    let lead = match task.timestamp {
+        Some(when) => format!("{FAILED_TASK_BANNER_LEAD} at {}", short_time(Some(when))),
+        None => FAILED_TASK_BANNER_LEAD.to_string(),
+    };
+    match quotable_summary(&task.summary) {
+        Some(summary) => format!("{lead}: {summary}"),
+        None => lead,
+    }
+}
+
+/// The summary [`failed_task_banner`] quotes, or `None` when there is nothing
+/// to quote.
+///
+/// `None` for the EMPTY summary the parse keeps when a `failed` notice carried
+/// no readable `<summary>` (absent, never closed, or empty), and for one made
+/// only of whitespace and control characters: the banner's `Span` drops the
+/// control characters and draws the whitespace blank, so quoting it would leave
+/// the same dangling `: ` with nothing after it. Otherwise the summary itself,
+/// UNTOUCHED — blankness is decided on the text, but what is quoted is still
+/// claude's words verbatim, padding included. Pure.
+fn quotable_summary(summary: &str) -> Option<&str> {
+    let blank = summary.chars().all(|c| c.is_whitespace() || c.is_control());
+    (!blank).then_some(summary)
 }
 
 /// Braille spinner frames for the in-flight send indicator. Plain glyphs (no ANSI),
@@ -1232,7 +1393,8 @@ fn preview_inner(area: Rect) -> Rect {
 /// The pane's inner area ([`preview_inner`]) is divided into a
 /// PINNED banner row and the scrolling transcript beneath it. `has_banner` is
 /// [`preview_banner`]`(..).is_some()`, i.e. "claude REPORTED the selected
-/// session as an agent" — NOT "the selected session is live". The two parted
+/// session as an agent, or it carries a failed background task" — NOT "the
+/// selected session is live". The two parted
 /// ways when the shell-out grew `--all`: an agent that reported completion is
 /// still reported, so it has a banner, while claude would not call it live.
 /// Passing liveness here would desync this geometry from [`super::update`]'s
@@ -1511,10 +1673,11 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
 
     // A REPORTED session leads with a status banner so the user can see WHY it
     // is stopped (or that it is working, or that it has finished) without
-    // decoding the row badge. It is PINNED as its own layout row (see
-    // `preview_split`) — the transcript scrolls beneath it — so the default
-    // bottom-anchored viewport cannot scroll it away. A session claude never
-    // reported reserves no row and renders unchanged.
+    // decoding the row badge — and a session whose background task failed leads
+    // with claude's own account of the failure. It is PINNED as its own layout
+    // row (see `preview_split`) — the transcript scrolls beneath it — so the
+    // default bottom-anchored viewport cannot scroll it away. A session with
+    // neither reserves no row and renders unchanged.
     let banner = preview_banner(app);
     // Dock the compose zone in the bottom of the pane when composing AND the pane
     // is tall enough; otherwise `render` gave compose a full-width bottom bar and
@@ -1610,7 +1773,7 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     let transcript_lines = app.preview_line_count(inner_width);
 
     // Nothing selected (no text AND no banner, since a banner implies a SELECTED
-    // session claude reported). A reported session whose transcript is still
+    // session). A bannered session whose transcript is still
     // empty falls through instead: its banner is the one thing worth drawing, and
     // keeping the banner unconditional is what lets the hit-test below derive the
     // same geometry from `banner.is_some()` alone.
@@ -3312,6 +3475,7 @@ mod tests {
             background: false,
             has_agent_name: false,
             has_agent_setting: false,
+            failed_task: None,
         }
     }
 
@@ -4761,6 +4925,7 @@ mod tests {
             background: false,
             has_agent_name: false,
             has_agent_setting: false,
+            failed_task: None,
         }
     }
 
@@ -6467,6 +6632,7 @@ mod tests {
             background: false,
             has_agent_name: false,
             has_agent_setting: false,
+            failed_task: None,
         }
     }
 
@@ -6605,6 +6771,7 @@ mod tests {
             background: false,
             has_agent_name: false,
             has_agent_setting: false,
+            failed_task: None,
         }
     }
 
@@ -6781,6 +6948,7 @@ mod tests {
             background: false,
             has_agent_name: false,
             has_agent_setting: false,
+            failed_task: None,
         }
     }
 
@@ -8120,6 +8288,160 @@ mod tests {
         let banner = preview_banner(&app).expect("a reported session yields a banner");
         let text: String = banner.spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "bg compacting");
+    }
+
+    // --- failed background task: the banner ---------------------------------
+
+    /// A failed background task as the store derives it, stamped at `unix_secs`
+    /// (or undated).
+    fn failed_task(summary: &str, unix_secs: Option<i64>) -> FailedTask {
+        FailedTask {
+            summary: summary.to_string(),
+            timestamp: unix_secs
+                .map(|s| OffsetDateTime::from_unix_timestamp(s).expect("a valid test timestamp")),
+        }
+    }
+
+    /// 2023-11-14T22:13:20Z — the instant `short_time`'s own test pins, so the
+    /// expected banner time is a known string rather than a re-derivation.
+    const FAILED_AT: i64 = 1_700_000_000;
+
+    /// A summary short enough that the whole sentence fits [`BANNER_PANE`], so a
+    /// test can compare the drawn row whole instead of a prefix of it.
+    const SHORT_FAILURE: &str = "Agent \"Fix CI\" failed: exit 1";
+
+    /// The sentence QUOTES claude: the summary goes in exactly as the store kept
+    /// it — quotes, doubled spaces and padding included — after the board's
+    /// lead-in and the notice's own time.
+    #[test]
+    fn the_failed_task_banner_quotes_claudes_summary_verbatim() {
+        let summary = " Agent \"Remediate  findings\" failed: Agent stalled: no progress for 600s ";
+        assert_eq!(
+            failed_task_banner(&failed_task(summary, Some(FAILED_AT))),
+            format!("background task failed at 2023-11-14 22:13: {summary}")
+        );
+        // Undated: the sentence drops the time rather than inventing a `--`.
+        assert_eq!(
+            failed_task_banner(&failed_task(summary, None)),
+            format!("background task failed: {summary}")
+        );
+    }
+
+    /// A failure with NOTHING to quote reads as the bare sentence — never a
+    /// dangling `: ` with nothing after it. Covers the empty summary the parse
+    /// keeps for a notice with no readable `<summary>` (absent, unclosed or
+    /// empty), and a summary of only whitespace and control characters, which the
+    /// banner's `Span` would draw as blank; dated and undated alike.
+    #[test]
+    fn the_failed_task_banner_quotes_nothing_when_there_is_no_summary() {
+        for summary in ["", "   ", "\t\n", "\u{1b}"] {
+            assert_eq!(
+                failed_task_banner(&failed_task(summary, Some(FAILED_AT))),
+                "background task failed at 2023-11-14 22:13",
+                "nothing to quote in {summary:?}, so no colon and no quote"
+            );
+            assert_eq!(
+                failed_task_banner(&failed_task(summary, None)),
+                "background task failed",
+                "undated, and still nothing to quote in {summary:?}"
+            );
+        }
+    }
+
+    /// The failure banner, read off the DRAWN pane: a session claude never
+    /// reported still leads with it, in the failure color, and it costs the
+    /// transcript exactly the one row every banner costs — the same geometry the
+    /// click hit-test derives from `preview_banner(..).is_some()`.
+    #[test]
+    fn a_session_whose_background_task_failed_leads_with_a_banner_quoting_claude() {
+        let (width, height) = BANNER_PANE;
+        let mut session = sample_session();
+        session.failed_task = Some(failed_task(SHORT_FAILURE, Some(FAILED_AT)));
+        let mut app = App::new(vec![session], Scope::All, PathBuf::from("/tmp/launch"));
+        assert!(
+            app.reported_agent("sess-normal-1").is_none(),
+            "the session must be UNREPORTED, or the status banner could be what drew"
+        );
+
+        let rows = inner_rows(&mut app, width, height);
+        assert_eq!(
+            rows[0],
+            format!("background task failed at 2023-11-14 22:13: {SHORT_FAILURE}"),
+            "the pane must lead with claude's own account of the failure"
+        );
+        let mut plain = banner_app(None);
+        let _ = inner_rows(&mut plain, width, height);
+        assert_eq!(
+            app.preview_viewport_h,
+            plain.preview_viewport_h - 1,
+            "the failure banner must cost the transcript exactly one row"
+        );
+        assert!(
+            preview_banner(&app).is_some(),
+            "the hit-test asks this, so it must agree with what was drawn"
+        );
+
+        // Style read off the buffer: a NAMED failure color at the banner's weight.
+        let mut terminal = Terminal::new(TestBackend::new(width, height))
+            .expect("build an in-memory test terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_preview(frame, &mut app, area);
+            })
+            .expect("render_preview must not panic");
+        let cell = terminal
+            .backend()
+            .buffer()
+            .cell((1, 1))
+            .expect("the banner's first cell is inside the rendered buffer");
+        assert_eq!(cell.fg, Color::Red, "a NAMED ansi color, never RGB");
+        assert!(cell.modifier.contains(Modifier::BOLD));
+    }
+
+    /// A REPORTED session that also carries a failed task says BOTH on its one
+    /// banner row — the reported status first, in its own color, then the failure
+    /// — rather than letting either fact hide the other.
+    #[test]
+    fn a_reported_session_with_a_failed_task_shows_both_on_one_banner_row() {
+        let (width, height) = BANNER_PANE;
+        let mut app = banner_app(Some("done"));
+        app.sessions[0].failed_task = Some(failed_task(SHORT_FAILURE, None));
+
+        let rows = inner_rows(&mut app, width, height);
+        let status = "bg done";
+        assert_eq!(
+            rows[0],
+            format!("{status}{HEADER_SEPARATOR}background task failed: {SHORT_FAILURE}")
+        );
+        // Each fact keeps its own color on the drawn row.
+        let mut terminal = Terminal::new(TestBackend::new(width, height))
+            .expect("build an in-memory test terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_preview(frame, &mut app, area);
+            })
+            .expect("render_preview must not panic");
+        let buffer = terminal.backend().buffer();
+        let status_cell = buffer.cell((1, 1)).expect("the status's first cell");
+        assert_eq!(
+            status_cell.fg,
+            Color::Cyan,
+            "the reported status keeps its color"
+        );
+        let failure_x =
+            1 + u16::try_from(status.chars().count() + HEADER_SEPARATOR.chars().count())
+                .expect("a short banner prefix");
+        let failure_cell = buffer
+            .cell((failure_x, 1))
+            .expect("the failure's first cell");
+        assert_eq!(
+            failure_cell.symbol(),
+            "b",
+            "the failure sentence starts here"
+        );
+        assert_eq!(failure_cell.fg, Color::Red, "and wears the failure color");
     }
 
     /// The bordered preview block, as `render_preview` builds it. Shared with the
@@ -10440,6 +10762,7 @@ mod tests {
             background: false,
             has_agent_name: false,
             has_agent_setting: false,
+            failed_task: None,
         }
     }
 
@@ -10683,13 +11006,10 @@ mod tests {
         );
     }
 
-    /// The badge on a CHILD row. A downgraded member is not always its lineage's
-    /// head: give the lineage a THIRD, NEWER member and the #80811 fork is pushed
-    /// beneath it. The badge is a fact about the SESSION, not about where the fold
-    /// put it, so it must follow the fork down — read, as above, off the DRAWN
-    /// cells rather than off a span.
-    #[test]
-    fn render_list_badges_a_downgraded_fork_sitting_in_a_child_row() {
+    /// A lineage whose #80811 fork sits in a CHILD row, EXPANDED so that row is
+    /// drawn. A downgraded member is not always its lineage's head: give the
+    /// lineage a THIRD, NEWER member and the fork is pushed beneath it.
+    fn downgraded_fork_in_a_child_row_board() -> App {
         // A member NEWER than the downgraded fork, so IT takes the head (D1) and
         // the fork lands in a child row. Same shapes as the fixture's own members,
         // distinct so every row stays addressable.
@@ -10723,11 +11043,20 @@ mod tests {
         sessions[1].has_agent_name = true;
         sessions[1].has_agent_setting = false;
         // The newest member is left BARE on purpose: it heads the lineage carrying
-        // nothing of its own, so the badge found below cannot have come from the
-        // head row's block.
+        // nothing of its own, so a marker found on the fork's row cannot have come
+        // from the head row's block.
 
         let mut app = App::new(sessions, Scope::All, PathBuf::from("/tmp/launch"));
         app.expand_selected();
+        app
+    }
+
+    /// The badge on a CHILD row. The badge is a fact about the SESSION, not about
+    /// where the fold put it, so it must follow the fork down — read, as above,
+    /// off the DRAWN cells rather than off a span.
+    #[test]
+    fn render_list_badges_a_downgraded_fork_sitting_in_a_child_row() {
+        let mut app = downgraded_fork_in_a_child_row_board();
         let (width, height) = LINEAGE_BOARD_SIZE;
         let buffer = drawn_list(&mut app, width, height);
 
@@ -10771,6 +11100,274 @@ mod tests {
                 "a real defect is not a footnote"
             );
         }
+    }
+
+    // --- failed background task: the row marker -----------------------------
+
+    /// Assert that `needle` is drawn on row `y` in the failure color, never DIM —
+    /// read off the buffer's cells, not off the span that was built.
+    fn assert_failed_marker_cells(buffer: &ratatui::buffer::Buffer, y: u16, width: u16) {
+        let needle = FAILED_TASK_MARKER.trim();
+        let x = column_of(buffer, y, width, needle);
+        for (i, ch) in needle.chars().enumerate() {
+            let cell = buffer
+                .cell((
+                    x + u16::try_from(i).expect("a marker shorter than a row"),
+                    y,
+                ))
+                .expect("a drawn marker cell");
+            assert_eq!(cell.symbol(), ch.to_string());
+            assert_eq!(
+                cell.fg,
+                Color::Red,
+                "the marker is the NAMED-ANSI failure color, never RGB"
+            );
+            assert!(
+                !cell.modifier.contains(Modifier::DIM),
+                "an unanswered failure is not a footnote"
+            );
+        }
+    }
+
+    /// The marker lands on the row whose session carries a failed task, in the
+    /// failure color — and on NO other row, the guard against a marker that is
+    /// really just always on.
+    #[test]
+    fn render_list_marks_a_session_whose_background_task_failed() {
+        let mut app = lineage_board();
+        let lone = app
+            .sessions
+            .iter()
+            .position(|s| s.session_id == LONE_ID)
+            .expect("the lone session is on the board");
+        app.sessions[lone].failed_task = Some(failed_task(SHORT_FAILURE, Some(FAILED_AT)));
+        let (width, height) = LINEAGE_BOARD_SIZE;
+        let buffer = drawn_list(&mut app, width, height);
+
+        let row = row_of(&buffer, width, height, LONE_LABEL);
+        assert!(
+            row_text(&buffer, row, width).contains(FAILED_TASK_MARKER.trim()),
+            "the flagged session must wear the marker"
+        );
+        assert_failed_marker_cells(&buffer, row, width);
+        for other in (0..height).filter(|&y| y != row) {
+            assert!(
+                !row_text(&buffer, other, width).contains(FAILED_TASK_MARKER.trim()),
+                "only the flagged session may claim a failed task (row {other})"
+            );
+        }
+    }
+
+    /// A background fork copies its parent's transcript, so a CHILD row can
+    /// carry an inherited failure until its own first prompt. The marker is a
+    /// fact about that file, so it follows the session into the fold.
+    #[test]
+    fn render_list_marks_a_failed_task_on_a_child_row() {
+        let mut app = lineage_board();
+        let ancestor = app
+            .sessions
+            .iter()
+            .position(|s| s.session_id == ANCESTOR_ID)
+            .expect("the ancestor is on the board");
+        app.sessions[ancestor].failed_task = Some(failed_task(SHORT_FAILURE, None));
+        app.expand_selected();
+        let (width, height) = LINEAGE_BOARD_SIZE;
+        let buffer = drawn_list(&mut app, width, height);
+
+        let child = row_of(&buffer, width, height, &short_id(ANCESTOR_ID));
+        let text = row_text(&buffer, child, width);
+        assert!(
+            text.contains(CHILD_GUTTER.trim()) && !text.contains(LINEAGE_LABEL),
+            "the flagged ancestor must really be drawn as a CHILD, or this pins the \
+             head row all over again: {text:?}"
+        );
+        assert!(
+            text.contains(FAILED_TASK_MARKER.trim()),
+            "the marker follows the session into the fold: {text:?}"
+        );
+        assert_failed_marker_cells(&buffer, child, width);
+    }
+
+    /// Wide enough for `(+1)` and the failed-task marker beside the timestamp,
+    /// but NOT for the `[unbound]` badge as well: the one width at which the
+    /// markers' priority is observable.
+    const ONE_MARKER_WIDTH: u16 = 50;
+
+    /// When a row has room for only one of the two defect markers, the failed
+    /// task — the one that wants the user — is the one kept, and the other is
+    /// dropped WHOLE. Neither may overrun the row.
+    #[test]
+    fn render_list_keeps_the_failed_marker_when_only_one_marker_fits() {
+        let mut app = downgraded_lineage_board();
+        let fork = app
+            .sessions
+            .iter()
+            .position(|s| s.session_id == BG_ID)
+            .expect("the downgraded fork is on the board");
+        app.sessions[fork].failed_task = Some(failed_task(SHORT_FAILURE, None));
+        let (full_width, height) = LINEAGE_BOARD_SIZE;
+
+        // The premise: with room, the fork's head row wears BOTH.
+        let wide = drawn_list(&mut app, full_width, height);
+        let head = row_of(&wide, full_width, height, "(+1)");
+        let text = row_text(&wide, head, full_width);
+        assert!(
+            text.contains(FAILED_TASK_MARKER.trim()) && text.contains(AGENT_UNBOUND_MARKER.trim()),
+            "the wide board must draw both markers, or this pins nothing: {text:?}"
+        );
+
+        let width = ONE_MARKER_WIDTH;
+        let narrow = drawn_list(&mut app, width, height);
+        let head = row_of(&narrow, width, height, "(+1)");
+        let text = row_text(&narrow, head, width);
+        assert!(
+            text.contains(FAILED_TASK_MARKER.trim()),
+            "the failed-task marker outranks the #80811 badge: {text:?}"
+        );
+        // The kept marker must END the row. A badge pushed after it anyway runs
+        // off the pane's edge and is clipped to whatever fragment fits (`[un`,
+        // `[u`, ...), so no needle for the fragment can be trusted. And a
+        // character count of the row cannot catch it either: `row_text` reads at
+        // most `width - 2` cells, so it can never exceed `width`.
+        assert!(
+            text.ends_with(FAILED_TASK_MARKER.trim()),
+            "the badge that did not fit is dropped whole, never clipped at the \
+             edge, so nothing may follow the kept marker: {text:?}"
+        );
+    }
+
+    /// At a width that cannot fit the marker even with NO label, it is DROPPED
+    /// whole rather than clipped: a half-drawn `[task fai` asserts nothing.
+    #[test]
+    fn render_list_drops_the_failed_marker_rather_than_clipping_it() {
+        let mut app = lineage_board();
+        let fork = app
+            .sessions
+            .iter()
+            .position(|s| s.session_id == BG_ID)
+            .expect("the fork is on the board");
+        app.sessions[fork].failed_task = Some(failed_task(SHORT_FAILURE, None));
+        let (_, height) = LINEAGE_BOARD_SIZE;
+        let width = LINEAGE_NARROW_WIDTH;
+        let buffer = drawn_list(&mut app, width, height);
+
+        // Found by the `(+N)`, which still fits: the marker is what gave way.
+        // No width check on top: `row_text` reads at most `width - 2` cells, so a
+        // count of it can never exceed `width`. A marker pushed past the edge
+        // shows up as its clipped `[` fragment instead, which is what this pins.
+        let head = row_of(&buffer, width, height, "(+1)");
+        let text = row_text(&buffer, head, width);
+        assert!(
+            !text.contains('['),
+            "no fragment of the marker may survive the drop: {text:?}"
+        );
+    }
+
+    /// Wide enough for the flagged ANCESTOR's child row to draw its id and its
+    /// `  6 msgs`, but NOT the failed-task marker after them — and wide enough
+    /// that a marker pushed anyway would show at least its `[`.
+    ///
+    /// That child row spends 39 columns before the marker (gutter, the fixture's
+    /// sixteen-column epoch timestamp, the gap, the id, the turn count), so the
+    /// marker would take it to 54 and its `[` sits at column 42. This width gives
+    /// the row 46 drawable columns: between the two.
+    const CHILD_NO_MARKER_WIDTH: u16 = 50;
+
+    /// The child-row twin of
+    /// `render_list_drops_the_failed_marker_rather_than_clipping_it`: at a width
+    /// the marker does not fit, a CHILD row drops it whole while the fields
+    /// before it still draw — never a clipped `[task fai` at the edge.
+    #[test]
+    fn render_list_drops_the_failed_marker_on_a_child_row_rather_than_clipping_it() {
+        let mut app = lineage_board();
+        let ancestor = app
+            .sessions
+            .iter()
+            .position(|s| s.session_id == ANCESTOR_ID)
+            .expect("the ancestor is on the board");
+        app.sessions[ancestor].failed_task = Some(failed_task(SHORT_FAILURE, None));
+        app.expand_selected();
+        let (full_width, height) = LINEAGE_BOARD_SIZE;
+
+        // The premise: with room, the ancestor's CHILD row wears the marker.
+        let wide = drawn_list(&mut app, full_width, height);
+        let child = row_of(&wide, full_width, height, &short_id(ANCESTOR_ID));
+        let text = row_text(&wide, child, full_width);
+        assert!(
+            text.contains(CHILD_GUTTER.trim()) && text.contains(FAILED_TASK_MARKER.trim()),
+            "the wide board must draw the marker on a CHILD row, or this pins \
+             nothing: {text:?}"
+        );
+
+        let width = CHILD_NO_MARKER_WIDTH;
+        let narrow = drawn_list(&mut app, width, height);
+        let child = row_of(&narrow, width, height, &short_id(ANCESTOR_ID));
+        let text = row_text(&narrow, child, width);
+        assert!(
+            text.contains(child_msgs(ANCESTOR_MSGS).trim()),
+            "the turn count still fits, so the marker is what gave way: {text:?}"
+        );
+        assert!(
+            !text.contains('['),
+            "no fragment of the marker may survive the drop: {text:?}"
+        );
+    }
+
+    /// Wide enough for the #80811 fork's child row to fit ONE defect marker after
+    /// its id and `  171 msgs`, but not both.
+    ///
+    /// That child row spends 41 columns before its markers: the failed-task
+    /// marker takes it to 56, the `[unbound]` badge to 52, the pair to 67. This
+    /// width gives the row 60 drawable columns, so either marker fits alone and
+    /// whichever is decided first is the one drawn.
+    const CHILD_ONE_MARKER_WIDTH: u16 = 64;
+
+    /// The child-row twin of
+    /// `render_list_keeps_the_failed_marker_when_only_one_marker_fits`: a child
+    /// row with room for only one defect marker keeps the failed task, the one
+    /// that wants the user, and drops the badge WHOLE.
+    #[test]
+    fn render_list_keeps_the_failed_marker_on_a_child_row_when_only_one_marker_fits() {
+        let mut app = downgraded_fork_in_a_child_row_board();
+        let fork = app
+            .sessions
+            .iter()
+            .position(|s| s.session_id == BG_ID)
+            .expect("the downgraded fork is on the board");
+        app.sessions[fork].failed_task = Some(failed_task(SHORT_FAILURE, None));
+        let (full_width, height) = LINEAGE_BOARD_SIZE;
+
+        // The premise: with room, the fork's CHILD row wears BOTH.
+        let wide = drawn_list(&mut app, full_width, height);
+        let child = row_of(&wide, full_width, height, &short_id(BG_ID));
+        let text = row_text(&wide, child, full_width);
+        assert!(
+            text.contains(CHILD_GUTTER.trim()) && !text.contains(LINEAGE_LABEL),
+            "the fork must really be drawn as a CHILD here, or this pins the head \
+             row all over again: {text:?}"
+        );
+        assert!(
+            text.contains(FAILED_TASK_MARKER.trim()) && text.contains(AGENT_UNBOUND_MARKER.trim()),
+            "the wide board must draw both markers, or this pins nothing: {text:?}"
+        );
+
+        let width = CHILD_ONE_MARKER_WIDTH;
+        let narrow = drawn_list(&mut app, width, height);
+        let child = row_of(&narrow, width, height, &short_id(BG_ID));
+        let text = row_text(&narrow, child, width);
+        assert!(
+            text.contains(FAILED_TASK_MARKER.trim()),
+            "the failed-task marker outranks the #80811 badge on a child row too: \
+             {text:?}"
+        );
+        // Ends the row, for the reason the head-row twin gives: a badge pushed
+        // anyway is clipped to a fragment no fixed needle can predict — here
+        // only `[u` would survive the edge.
+        assert!(
+            text.ends_with(FAILED_TASK_MARKER.trim()),
+            "the badge that did not fit is dropped whole, never clipped at the \
+             edge, so nothing may follow the kept marker: {text:?}"
+        );
     }
 
     /// The default: three sessions, two rows, and the surviving head says so.

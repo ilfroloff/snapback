@@ -874,13 +874,14 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
 /// The url of the rendered preview link under a pointer at screen `(col, row)`,
 /// or `None` when the pointer is over no link.
 ///
-/// The transcript does NOT own the whole preview pane: a REPORTED session pins a
-/// status banner to the pane's first inner row (`view::preview_banner`), so its
-/// transcript starts one row lower. Deriving the rect from the SAME
+/// The transcript does NOT own the whole preview pane: a REPORTED session — or
+/// one carrying a failed background task — pins a status banner to the pane's
+/// first inner row (`view::preview_banner`), so its transcript starts one row
+/// lower. Deriving the rect from the SAME
 /// [`view::preview_split`] the view drew with is what keeps this honest — the
 /// scroll offset and the cached line widths are both measured from that rect's
 /// origin, so a click on screen row N resolves to the transcript line actually
-/// drawn there. A session claude never reported splits off nothing and hit-tests
+/// drawn there. A session with no banner splits off nothing and hit-tests
 /// against the full inner rect, exactly as it did before the banner existed.
 ///
 /// REPORTED, not live: an agent that reported completion still has a banner, so
@@ -1725,6 +1726,7 @@ mod tests {
             background: false,
             has_agent_name: false,
             has_agent_setting: false,
+            failed_task: None,
         }
     }
 
@@ -1954,6 +1956,7 @@ mod tests {
             background: false,
             has_agent_name: false,
             has_agent_setting: false,
+            failed_task: None,
         };
         (session, dir)
     }
@@ -3426,6 +3429,7 @@ mod tests {
             background: false,
             has_agent_name: false,
             has_agent_setting: false,
+            failed_task: None,
         }
     }
 
@@ -3703,6 +3707,7 @@ mod tests {
             background: false,
             has_agent_name: false,
             has_agent_setting: false,
+            failed_task: None,
         }
     }
 

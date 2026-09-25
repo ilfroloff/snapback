@@ -717,6 +717,7 @@ mod tests {
             background: false,
             has_agent_name: false,
             has_agent_setting: false,
+            failed_task: None,
         };
         (session, dir)
     }
@@ -814,6 +815,7 @@ mod tests {
             background: false,
             has_agent_name: false,
             has_agent_setting: false,
+            failed_task: None,
         };
         match plan(&session, false) {
             ResumePlan::Refuse { message } => {
@@ -842,6 +844,7 @@ mod tests {
             background: false,
             has_agent_name: false,
             has_agent_setting: false,
+            failed_task: None,
         };
         match check(&session, false) {
             Err(ResumeError::Refused(message)) => {
@@ -1237,6 +1240,7 @@ mod tests {
             background: false,
             has_agent_name: false,
             has_agent_setting: false,
+            failed_task: None,
         };
         match check_attach(&session, None) {
             Err(ResumeError::Refused(message)) => {

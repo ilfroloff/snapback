@@ -379,6 +379,7 @@ mod tests {
             background: false,
             has_agent_name: false,
             has_agent_setting: false,
+            failed_task: None,
         }
     }
 

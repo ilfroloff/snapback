@@ -930,7 +930,13 @@ Tests are **inline** `#[cfg(test)] mod tests` at the bottom of each source file
   normal session, a no-summary session, a malformed-line session, a worktree
   cwd, a sidecar (no `cwd`), a nested subagent, a **background-fork pair**
   (two files sharing one tree root, `cwd`, branch and label — the duplicate-row
-  shape), and a **root-less** session (no `parentUuid: null` record). Reach it
+  shape), a **root-less** session (no `parentUuid: null` record), and four
+  **failed-background-task pairs** under `-Users-me-project-epsilon` (`failed` vs
+  `completed`; a quick reply vs an `sdk`-marked notification after the failure; a
+  `turnOrigin: "sdk"` slash command vs a bare one; a `failed` notice with vs
+  without its `<summary>`, reusing the first pair's failed half) — each pair one
+  transcript whose halves differ only in their last record, and root-less so the
+  seven never fold into a false lineage. Reach it
   via `env!("CARGO_MANIFEST_DIR")`. Add a fixture when you add a format edge
   case, and update the counts in `store::mod`'s discovery/session-count tests.
   A fixture pair must **differ in the field under test**, and the fork pair
