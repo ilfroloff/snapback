@@ -52,6 +52,57 @@ pub const CONTENT_INDEX_CAP: usize = 1024 * 1024;
 /// file non-background rather than producing a verdict.
 pub const SESSION_KIND_BACKGROUND: &str = "bg";
 
+/// The `origin.kind` Claude Code stamps on the `user` record it SYNTHESIZES to
+/// deliver a background task's `<task-notification>` into the session that
+/// launched it.
+///
+/// `origin` is undocumented upstream. It is an object whose `kind` names who
+/// wrote the record; the other kinds observed in a real store are
+/// [`ORIGIN_KIND_HUMAN`] and `"peer"` (a message from another agent). The read is
+/// FAIL-SOFT: see [`OriginKind`].
+const ORIGIN_KIND_TASK_NOTIFICATION: &str = "task-notification";
+
+/// The `origin.kind` of a record a PERSON wrote into the session.
+///
+/// The only kind that may clear the failed-task flag besides an absent `origin`:
+/// every other kind is a machine speaking (see [`task_signal`]).
+const ORIGIN_KIND_HUMAN: &str = "human";
+
+/// The `<status>` a task notification carries when the background task FAILED —
+/// the one value that raises the flag.
+///
+/// Compared EXACTLY, like [`SESSION_KIND_BACKGROUND`]: `completed`, `stopped`,
+/// `killed`, a missing tag and any other spelling raise nothing. `stopped` and
+/// `killed` are deliberately out of scope, and a `completed` notice does not
+/// CLEAR the flag either — only the user writing does.
+const TASK_STATUS_FAILED: &str = "failed";
+
+/// The `promptSource` values that mean the USER wrote the record: `typed` at the
+/// prompt, `sdk` from a `claude -p` quick reply.
+///
+/// NEVER sufficient on its own: nearly a third of the task notifications in a real
+/// store (51 of 169) ALSO carry `sdk`, which is why [`task_signal`] rules on `origin`
+/// before it ever reads this.
+const USER_PROMPT_SOURCES: [&str; 2] = ["typed", "sdk"];
+
+/// The `turnOrigin` values that mean the USER wrote the record: `human` at the
+/// prompt, `sdk` from a quick reply.
+///
+/// Read because `promptSource` is not always there: a slash command sent as a
+/// quick reply (`/pr-squash`, `/handoff-to-lead`, `/cr-review` in a real store)
+/// carries ONLY `turnOrigin: "sdk"`, and it is still the user engaging. Claude Code
+/// writes that marker from 2.1.278 on; one sent by an older version carries none,
+/// so it does not clear — a leftover marker, the direction the flag accepts.
+const USER_TURN_ORIGINS: [&str; 2] = ["human", "sdk"];
+
+/// The `<status>` tag of a task notification's body, as its `(open, close)` pair.
+const STATUS_TAG: (&str, &str) = ("<status>", "</status>");
+
+/// The `<summary>` tag of a task notification's body — claude's own one-line
+/// account of what happened, which the board quotes WORD FOR WORD. Optional: a
+/// `failed` notice without one still raises the flag ([`failed_notice`]).
+const SUMMARY_TAG: (&str, &str) = ("<summary>", "</summary>");
+
 /// What one candidate file turned out to be — the three answers a fail-soft read
 /// can give, kept apart because only TWO of them are statements about the file.
 ///
@@ -175,6 +226,32 @@ pub struct ParsedFile {
     /// `"technical-brainstormer"` in a real store). This is the binding whose LOSS
     /// on a background fork is the anthropics/claude-code#80811 signature.
     pub has_agent_setting: bool,
+    /// The last `failed` background-task notice the user has NOT written into this
+    /// session since, or `None`.
+    ///
+    /// Decided record by record in file order by [`task_signal`]: a `failed`
+    /// notice raises it (a later one REPLACES an earlier one), the user's next
+    /// prompt — typed or a quick reply — clears it, and every other record leaves
+    /// it alone. A fact about the BYTES like every other field here, so the parse
+    /// cache carries it unchanged.
+    pub failed_task: Option<FailedTaskNotice>,
+}
+
+/// A background task's `failed` notice, as the pass found it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailedTaskNotice {
+    /// The notice's `<summary>`, VERBATIM: the tag's inner text, neither trimmed
+    /// nor rewritten, because the board quotes claude's words rather than
+    /// paraphrasing them.
+    ///
+    /// EMPTY when the notice carried no readable `<summary>` (absent, or never
+    /// closed) as well as when it carried an empty one: the two are the same fact
+    /// to the board — nothing to quote — so one representation serves both.
+    pub summary: String,
+    /// The notice record's own `timestamp`, unparsed RFC 3339 like
+    /// [`ParsedFile::timestamp_raw`] — parsing is derivation, and derivation
+    /// happens above this module. `None` when the record carries none.
+    pub timestamp_raw: Option<String>,
 }
 
 /// Stream one JSONL file fail-soft and say what it is.
@@ -202,6 +279,7 @@ pub fn parse_file(path: &Path) -> FileVerdict<ParsedFile> {
     let mut background = false;
     let mut has_agent_name = false;
     let mut has_agent_setting = false;
+    let mut failed_task: Option<FailedTaskNotice> = None;
 
     for line in reader.lines() {
         let line = match line {
@@ -322,6 +400,16 @@ pub fn parse_file(path: &Path) -> FileVerdict<ParsedFile> {
             }
             _ => {}
         }
+        // The failed-background-task flag, decided in THIS pass and in FILE ORDER,
+        // which is what "later" means for both halves of the rule: a later failed
+        // notice replaces an earlier one, and the user's next prompt clears
+        // whatever is standing. The whole decision is the pure `task_signal`; this
+        // arm only applies it.
+        match task_signal(&record) {
+            TaskSignal::Failed(notice) => failed_task = Some(notice),
+            TaskSignal::UserTurn => failed_task = None,
+            TaskSignal::Neither => {}
+        }
         // gitBranch + timestamp: last non-null (most-recent activity wins).
         if let Some(b) = record.get("gitBranch").and_then(Value::as_str) {
             git_branch = Some(b.to_string());
@@ -365,7 +453,191 @@ pub fn parse_file(path: &Path) -> FileVerdict<ParsedFile> {
         background,
         has_agent_name,
         has_agent_setting,
+        failed_task,
     })
+}
+
+/// What one record says about the failed-background-task flag
+/// ([`ParsedFile::failed_task`]).
+#[derive(Debug, PartialEq, Eq)]
+enum TaskSignal {
+    /// A background task's `failed` notice: raise the flag, REPLACING any earlier
+    /// notice.
+    Failed(FailedTaskNotice),
+    /// The user wrote into this session — typed at the prompt or sent as a quick
+    /// reply: clear the flag.
+    UserTurn,
+    /// Anything else leaves the flag exactly as it was.
+    Neither,
+}
+
+/// A `user` record's `origin.kind`, read FAIL-SOFT.
+#[derive(Debug)]
+enum OriginKind<'a> {
+    /// No `origin` key at all — the shape of a quick reply, and of the tool
+    /// results and slash-command wrappers claude writes for itself.
+    Absent,
+    /// `origin` is an object carrying a string `kind`.
+    Kind(&'a str),
+    /// `origin` is present but not in that shape: `null`, not an object, or an
+    /// object with no string `kind`. Neither raises nor clears anything.
+    Unrecognised,
+}
+
+/// Read `record.origin.kind` into an [`OriginKind`].
+fn origin_kind(record: &Value) -> OriginKind<'_> {
+    match record.get("origin") {
+        None => OriginKind::Absent,
+        Some(Value::Object(origin)) => match origin.get("kind").and_then(Value::as_str) {
+            Some(kind) => OriginKind::Kind(kind),
+            None => OriginKind::Unrecognised,
+        },
+        Some(_) => OriginKind::Unrecognised,
+    }
+}
+
+/// Classify one record for the failed-background-task flag. Pure.
+///
+/// Only a `user` record that is the session's OWN turn ([`label::is_sidechain`],
+/// the store's one "not from a subagent" rule) can say anything. Then `origin`
+/// is ruled on FIRST, before any other marker is read:
+///
+/// - [`ORIGIN_KIND_TASK_NOTIFICATION`] is a notice. It raises the flag when its
+///   `<status>` is exactly [`TASK_STATUS_FAILED`], whether or not it carries a
+///   `<summary>` ([`failed_notice`]); otherwise it is [`TaskSignal::Neither`]. A
+///   notice NEVER clears — not even a `completed` one.
+/// - An ABSENT `origin`, or [`ORIGIN_KIND_HUMAN`], MAY be the user writing. It is
+///   when the record is not an `isMeta` injection and not a tool result, and it
+///   carries at least one of the three markers: `origin.kind` [`ORIGIN_KIND_HUMAN`]
+///   itself, a `promptSource` in [`USER_PROMPT_SOURCES`], or a `turnOrigin` in
+///   [`USER_TURN_ORIGINS`].
+/// - Any other kind (`"peer"` — another agent's message) and any unrecognised
+///   `origin` shape are machine speech: [`TaskSignal::Neither`].
+///
+/// Why `origin` goes first: task notifications carry `promptSource: "sdk"` too —
+/// the very value a quick reply carries — so a `promptSource`-only rule would let a
+/// later notice count as the user's reply and silently clear the flag. Why
+/// `turnOrigin` counts: a slash command sent as a quick reply carries ONLY
+/// `turnOrigin: "sdk"` — from the Claude Code version [`USER_TURN_ORIGINS`] names
+/// on; one sent by an older version carries nothing. What else carries NONE of the
+/// markers, and so never clears, is exactly what claude writes on its own: a
+/// slash-command wrapper with no marker (`/exit`), its `<local-command-stdout>`
+/// output, and the `[Request interrupted…]` line.
+///
+/// FAIL-SOFT throughout: an unrecognised shape neither raises nor clears. So a
+/// degraded record can leave a stale marker behind but cannot hide a failure that
+/// is standing — the direction the feature's trade-off picked — with two
+/// exceptions, both erring the other way. `isSidechain` is read fail-OPEN: a
+/// non-bool value is the session's own turn ([`label::is_sidechain`]), so a record
+/// malformed there is judged on its other fields and, if it carries a user marker,
+/// DOES clear. The real store never writes one: sub-agent turns live in files
+/// discovery never reaches, and the depth-2 records it does reach carry a bool.
+/// And a notice whose body is not a string, or whose `<status>` cannot be read,
+/// raises nothing ([`failed_notice`]), so that failure goes unflagged. A missing
+/// `<summary>` is not such a case: the status alone raises the flag.
+fn task_signal(record: &Value) -> TaskSignal {
+    if record.get("type").and_then(Value::as_str) != Some("user") || label::is_sidechain(record) {
+        return TaskSignal::Neither;
+    }
+    match origin_kind(record) {
+        OriginKind::Kind(ORIGIN_KIND_TASK_NOTIFICATION) => {
+            failed_notice(record).map_or(TaskSignal::Neither, TaskSignal::Failed)
+        }
+        OriginKind::Absent => user_turn_signal(record, false),
+        OriginKind::Kind(ORIGIN_KIND_HUMAN) => user_turn_signal(record, true),
+        OriginKind::Kind(_) | OriginKind::Unrecognised => TaskSignal::Neither,
+    }
+}
+
+/// The clearing half of [`task_signal`], for a record whose `origin` is absent
+/// (`human == false`) or [`ORIGIN_KIND_HUMAN`] (`human == true`).
+fn user_turn_signal(record: &Value, human: bool) -> TaskSignal {
+    if is_meta(record) || is_tool_result(record) {
+        return TaskSignal::Neither;
+    }
+    let marked = human
+        || has_marker(record, "promptSource", &USER_PROMPT_SOURCES)
+        || has_marker(record, "turnOrigin", &USER_TURN_ORIGINS);
+    if marked {
+        TaskSignal::UserTurn
+    } else {
+        TaskSignal::Neither
+    }
+}
+
+/// Whether `record[key]` is a string naming one of `values`. FAIL-SOFT: an
+/// absent, null or non-string value is no marker.
+fn has_marker(record: &Value, key: &str, values: &[&str]) -> bool {
+    record
+        .get(key)
+        .and_then(Value::as_str)
+        .is_some_and(|value| values.contains(&value))
+}
+
+/// Whether `record` is an `isMeta` injection — context claude adds on the user's
+/// behalf (skill bodies, caveats), which nobody typed.
+///
+/// FAIL-SOFT toward "meta": only an ABSENT `isMeta` or a literal `false` reads
+/// as an ordinary record, so an unrecognised value can never clear the flag.
+fn is_meta(record: &Value) -> bool {
+    !matches!(record.get("isMeta"), None | Some(Value::Bool(false)))
+}
+
+/// Whether `record` is a TOOL RESULT: a `user` record whose `message.content` is
+/// a block array holding a `tool_result` block. Claude writes these for itself
+/// after every tool call, so one never counts as the user engaging.
+fn is_tool_result(record: &Value) -> bool {
+    record
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_array)
+        .is_some_and(|blocks| {
+            blocks
+                .iter()
+                .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+        })
+}
+
+/// The `failed` notice a task-notification record carries, or `None`.
+///
+/// `None` unless `message.content` is a STRING whose `<status>` is exactly
+/// [`TASK_STATUS_FAILED`] — a missing or unclosed `<status>` or a non-string body
+/// reads as an unrecognised shape and raises nothing, the flag's one SET-side miss
+/// (see [`task_signal`]).
+///
+/// The status ALONE decides; the `<summary>` is only the words the banner quotes.
+/// A notice with no readable summary — the tag absent, or opened and never closed
+/// — keeps the EMPTY summary, exactly what an empty `<summary></summary>` already
+/// gives, so it still raises the flag and the banner simply quotes nothing.
+/// Dropping a failure whose status was read, over a missing account of it, would
+/// err toward a hidden failure — the one direction the flag refuses.
+fn failed_notice(record: &Value) -> Option<FailedTaskNotice> {
+    let body = record
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)?;
+    if tag_inner(body, STATUS_TAG)? != TASK_STATUS_FAILED {
+        return None;
+    }
+    Some(FailedTaskNotice {
+        summary: tag_inner(body, SUMMARY_TAG).unwrap_or_default().to_string(),
+        timestamp_raw: record
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    })
+}
+
+/// The text between the FIRST `open` tag in `body` and the first `close` after
+/// it, exactly as written — or `None` when either is missing.
+///
+/// First wins because claude writes the envelope's own tags (`<status>`,
+/// `<summary>`) AHEAD of the free-form `<result>` it closes with, so a result
+/// that happens to quote a tag cannot take precedence.
+fn tag_inner<'a>(body: &'a str, (open, close): (&str, &str)) -> Option<&'a str> {
+    let start = body.find(open)? + open.len();
+    let rest = &body[start..];
+    Some(&rest[..rest.find(close)?])
 }
 
 /// Whether `record[key]` is a string with non-whitespace content.
@@ -619,6 +891,417 @@ mod tests {
         assert!(
             parsed.background,
             "one bg-stamped record anywhere makes the transcript a background job"
+        );
+    }
+
+    // --- the failed-background-task flag -------------------------------------
+
+    /// A task-notification BODY in claude's real envelope shape: the envelope's
+    /// own tags first, the free-form `<result>` last.
+    fn notification_body(status: &str, summary: &str) -> String {
+        format!(
+            "<task-notification>\n<task-id>af4404196ddbcd945</task-id>\n\
+             <status>{status}</status>\n<summary>{summary}</summary>\n\
+             <result>Now let me verify the internals the review cites.</result>\n\
+             </task-notification>"
+        )
+    }
+
+    /// A `user` record delivering a task notification, as claude writes it
+    /// (`promptSource: "system"` is the common case; 51 of 169 real ones say
+    /// `"sdk"`, which is the point of several tests below).
+    fn notification(status: &str, summary: &str, ts: &str) -> Value {
+        serde_json::json!({
+            "type": "user", "cwd": "/repo", "sessionId": "s", "timestamp": ts,
+            "isSidechain": false, "origin": {"kind": "task-notification"},
+            "promptSource": "system",
+            "message": {"role": "user", "content": notification_body(status, summary)}
+        })
+    }
+
+    /// A plain text `user` record carrying exactly the `extra` keys given — the
+    /// base every marker test below varies one key of.
+    fn user_record(extra: Value) -> Value {
+        let mut record = serde_json::json!({
+            "type": "user", "cwd": "/repo", "sessionId": "s",
+            "timestamp": "2026-09-21T16:00:00.000Z", "isSidechain": false,
+            "message": {"role": "user", "content": "keep going"}
+        });
+        let (Value::Object(base), Value::Object(extra)) = (&mut record, extra) else {
+            panic!("both sides of a test record are JSON objects");
+        };
+        base.extend(extra);
+        record
+    }
+
+    #[test]
+    fn a_failed_notice_raises_the_flag_with_its_summary_verbatim_and_its_time() {
+        // Padding, quotes and a doubled space: none of it may be trimmed or
+        // rewritten, because the board QUOTES claude rather than paraphrasing.
+        let summary = "  Agent \"Fix  the build\" failed: Agent stalled: no progress for 600s  ";
+        assert_eq!(
+            task_signal(&notification("failed", summary, "2026-09-21T15:30:32.799Z")),
+            TaskSignal::Failed(FailedTaskNotice {
+                summary: summary.to_string(),
+                timestamp_raw: Some("2026-09-21T15:30:32.799Z".to_string()),
+            })
+        );
+    }
+
+    /// Only the exact `failed` status raises the flag. `stopped` and `killed`
+    /// are out of scope, `completed` is success, and a near-miss spelling or a
+    /// missing tag is an unrecognised shape.
+    #[test]
+    fn every_status_but_failed_raises_nothing() {
+        for status in ["completed", "stopped", "killed", "FAILED", " failed", ""] {
+            assert_eq!(
+                task_signal(&notification(status, "Agent \"x\" did something", "t")),
+                TaskSignal::Neither,
+                "status {status:?} must not raise the flag"
+            );
+        }
+        let mut no_status = notification("failed", "Agent \"x\" failed", "t");
+        no_status["message"]["content"] = Value::String(
+            "<task-notification>\n<summary>Agent \"x\" failed</summary>\n</task-notification>"
+                .to_string(),
+        );
+        assert_eq!(
+            task_signal(&no_status),
+            TaskSignal::Neither,
+            "no <status> tag"
+        );
+    }
+
+    /// The `<status>` alone raises the flag: a `failed` notice whose `<summary>`
+    /// is ABSENT, or opened and never closed, raises it exactly as one carrying an
+    /// EMPTY `<summary></summary>` does — with the empty summary, so the banner has
+    /// nothing to quote, and with the notice's own time. Reading the status and
+    /// then dropping the failure over a missing account of it would err toward a
+    /// hidden failure, the one direction the flag's trade-off refuses.
+    #[test]
+    fn a_failed_notice_without_a_summary_still_raises_the_flag() {
+        let body = |summary_part: &str| {
+            format!(
+                "<task-notification>\n<task-id>af4404196ddbcd945</task-id>\n\
+                 <status>failed</status>\n{summary_part}</task-notification>"
+            )
+        };
+        let expected = TaskSignal::Failed(FailedTaskNotice {
+            summary: String::new(),
+            timestamp_raw: Some("2026-09-21T15:30:32.799Z".to_string()),
+        });
+        for summary_part in ["", "<summary>cut off\n", "<summary></summary>\n"] {
+            let mut record = notification("failed", "x", "2026-09-21T15:30:32.799Z");
+            record["message"]["content"] = Value::String(body(summary_part));
+            assert_eq!(
+                task_signal(&record),
+                expected,
+                "a failed status must raise the flag whatever {summary_part:?} leaves of \
+                 its summary"
+            );
+        }
+    }
+
+    /// FAIL-SOFT on the notice's own body: an unclosed `<status>`, a typed-block
+    /// body, a null body and a missing message are all unrecognised shapes — none
+    /// raises the flag, and none clears it. (A readable `failed` status with no
+    /// readable `<summary>` is NOT one of them: see the test above.)
+    #[test]
+    fn a_failed_notice_in_an_unrecognised_shape_raises_nothing() {
+        let bodies = [
+            Value::String("<task-notification>\n<status>failed".to_string()),
+            serde_json::json!([{"type": "text", "text": notification_body("failed", "x")}]),
+            Value::Null,
+        ];
+        for body in bodies {
+            let mut record = notification("failed", "x", "t");
+            record["message"]["content"] = body.clone();
+            assert_eq!(
+                task_signal(&record),
+                TaskSignal::Neither,
+                "body {body} must not raise the flag"
+            );
+        }
+        let mut no_message = notification("failed", "x", "t");
+        no_message
+            .as_object_mut()
+            .expect("an object record")
+            .remove("message");
+        assert_eq!(task_signal(&no_message), TaskSignal::Neither);
+    }
+
+    /// Each of the three markers, alone, makes a record the user writing: the
+    /// typed prompt (`origin.kind: human`, `promptSource: typed`,
+    /// `turnOrigin: human`) and the quick reply (`promptSource: sdk`,
+    /// `turnOrigin: sdk`).
+    #[test]
+    fn each_user_marker_alone_clears_the_flag() {
+        for marker in [
+            serde_json::json!({"origin": {"kind": "human"}}),
+            serde_json::json!({"promptSource": "typed"}),
+            serde_json::json!({"promptSource": "sdk"}),
+            serde_json::json!({"turnOrigin": "human"}),
+            serde_json::json!({"turnOrigin": "sdk"}),
+            // `human` with a promptSource that is not a user value is still human.
+            serde_json::json!({"origin": {"kind": "human"}, "promptSource": "queued"}),
+        ] {
+            assert_eq!(
+                task_signal(&user_record(marker.clone())),
+                TaskSignal::UserTurn,
+                "{marker} marks the user writing"
+            );
+        }
+    }
+
+    /// Measured detail 1, pinned at the record level: the SAME `promptSource:
+    /// "sdk"` record clears the flag with no `origin` and does NOT once `origin`
+    /// names a notification or another agent. A rule that read `promptSource`
+    /// first would clear on all three.
+    #[test]
+    fn origin_is_ruled_on_before_prompt_source() {
+        let quick_reply = user_record(serde_json::json!({"promptSource": "sdk"}));
+        assert_eq!(task_signal(&quick_reply), TaskSignal::UserTurn);
+
+        for kind in ["task-notification", "peer"] {
+            let mut machine = quick_reply.clone();
+            machine["origin"] = serde_json::json!({"kind": kind});
+            assert_eq!(
+                task_signal(&machine),
+                TaskSignal::Neither,
+                "origin {kind:?} is machine speech whatever promptSource says"
+            );
+        }
+    }
+
+    /// The Never-clears list. Everything claude writes into a session by itself
+    /// leaves the flag standing — including the records that carry a user-looking
+    /// marker beside the one that disqualifies them.
+    #[test]
+    fn nothing_claude_writes_on_its_own_clears_the_flag() {
+        let never = [
+            // A tool result, bare and with a quick-reply marker beside it.
+            user_record(serde_json::json!({
+                "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}
+                ]}
+            })),
+            user_record(serde_json::json!({
+                "promptSource": "sdk",
+                "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}
+                ]}
+            })),
+            // An `isMeta` injection, bare and marked.
+            user_record(serde_json::json!({"isMeta": true})),
+            user_record(serde_json::json!({"isMeta": true, "promptSource": "sdk"})),
+            // A later notification — completed, and carrying promptSource: sdk.
+            {
+                let mut n = notification("completed", "Agent \"y\" completed", "t");
+                n["promptSource"] = Value::String("sdk".to_string());
+                n
+            },
+            // Another agent's message, as a real store holds it.
+            user_record(serde_json::json!({
+                "origin": {"kind": "peer"}, "promptSource": "sdk", "isMeta": true
+            })),
+            user_record(serde_json::json!({
+                "origin": {"kind": "peer"}, "promptSource": "system", "turnOrigin": "peer"
+            })),
+            // A slash-command wrapper and its output, with no marker.
+            user_record(serde_json::json!({
+                "message": {"role": "user",
+                    "content": "<command-name>/exit</command-name>\n<command-message>exit</command-message>"}
+            })),
+            user_record(serde_json::json!({
+                "message": {"role": "user",
+                    "content": "<local-command-stdout>(no content)</local-command-stdout>"}
+            })),
+            // The interrupt line claude writes by itself.
+            user_record(serde_json::json!({
+                "message": {"role": "user", "content": [
+                    {"type": "text", "text": "[Request interrupted by user]"}
+                ]}
+            })),
+            // A subagent's turn, even one marked as a quick reply.
+            user_record(serde_json::json!({"isSidechain": true, "promptSource": "sdk"})),
+        ];
+        for record in never {
+            assert_eq!(
+                task_signal(&record),
+                TaskSignal::Neither,
+                "must neither raise nor clear: {record}"
+            );
+        }
+    }
+
+    /// FAIL-SOFT: every unrecognised shape of the four undocumented fields — and
+    /// of the record itself — neither raises nor clears, so a record degraded in
+    /// any of these ways can leave a stale marker but never hide a standing
+    /// failure. The one field that can, a non-bool `isSidechain`, is
+    /// [`task_signal`]'s documented exception.
+    #[test]
+    fn unrecognised_shapes_neither_raise_nor_clear() {
+        let sdk = serde_json::json!("sdk");
+        let shapes = [
+            // `origin` present but not an object carrying a string `kind`.
+            user_record(serde_json::json!({"origin": null, "promptSource": sdk})),
+            user_record(serde_json::json!({"origin": "human", "promptSource": sdk})),
+            user_record(serde_json::json!({"origin": {}, "promptSource": sdk})),
+            user_record(serde_json::json!({"origin": {"kind": 42}, "promptSource": sdk})),
+            user_record(serde_json::json!({"origin": {"kind": "HUMAN"}})),
+            // `isMeta` that is neither absent nor a literal false.
+            user_record(serde_json::json!({"isMeta": "yes", "promptSource": sdk})),
+            user_record(serde_json::json!({"isMeta": null, "promptSource": sdk})),
+            // Markers of the wrong type or value.
+            user_record(serde_json::json!({"promptSource": 42})),
+            user_record(serde_json::json!({"promptSource": "SDK"})),
+            user_record(serde_json::json!({"promptSource": "system"})),
+            user_record(serde_json::json!({"turnOrigin": ["sdk"]})),
+            user_record(serde_json::json!({"turnOrigin": "task_notification"})),
+            // No marker at all.
+            user_record(serde_json::json!({})),
+            // Not a `user` record: absent, null and non-string `type`, an
+            // assistant turn carrying a user marker, and the `queue-operation`
+            // copy claude writes of every notification's body.
+            user_record(serde_json::json!({"type": null, "promptSource": sdk})),
+            user_record(serde_json::json!({"type": 42, "promptSource": sdk})),
+            user_record(serde_json::json!({"type": "assistant", "promptSource": sdk})),
+            serde_json::json!({
+                "type": "queue-operation", "operation": "enqueue", "sessionId": "s",
+                "content": notification_body("failed", "Agent \"x\" failed")
+            }),
+            serde_json::json!({"cwd": "/repo", "promptSource": sdk}),
+        ];
+        for record in shapes {
+            assert_eq!(
+                task_signal(&record),
+                TaskSignal::Neither,
+                "an unrecognised shape must neither raise nor clear: {record}"
+            );
+        }
+    }
+
+    /// "First occurrence wins" ([`tag_inner`]): claude writes the envelope's own
+    /// `<status>` AHEAD of the free-form `<result>`, so a result that happens to
+    /// QUOTE a status tag must never take precedence — in either direction.
+    #[test]
+    fn the_first_status_tag_wins_over_one_quoted_later_in_the_result() {
+        let quoting = |status: &str, quoted: &str| {
+            format!(
+                "<task-notification>\n<status>{status}</status>\n<summary>s</summary>\n\
+                 <result>the log said <status>{quoted}</status></result>\n\
+                 </task-notification>"
+            )
+        };
+        assert_eq!(
+            tag_inner(&quoting("completed", "failed"), STATUS_TAG),
+            Some("completed")
+        );
+        assert_eq!(
+            tag_inner(&quoting("failed", "completed"), STATUS_TAG),
+            Some("failed")
+        );
+        // And through the classifier: a completed notice whose result quotes a
+        // failure raises nothing.
+        let mut record = notification("completed", "s", "t");
+        record["message"]["content"] = Value::String(quoting("completed", "failed"));
+        assert_eq!(task_signal(&record), TaskSignal::Neither);
+    }
+
+    /// Serialize test records as the lines of a transcript.
+    fn lines_of(records: &[Value]) -> Vec<String> {
+        records.iter().map(Value::to_string).collect()
+    }
+
+    /// Run the real streaming pass over `records` and return its flag.
+    fn failed_task_after(tag: &str, records: &[Value]) -> Option<FailedTaskNotice> {
+        let lines = lines_of(records);
+        let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
+        parse_lines(tag, &borrowed)
+            .expect("a file with a cwd is a session")
+            .failed_task
+    }
+
+    /// "A later failed notice replaces an earlier one" — both the summary AND the
+    /// timestamp come from the later notice.
+    #[test]
+    fn a_later_failed_notice_replaces_an_earlier_one() {
+        let flag = failed_task_after(
+            "failed-twice",
+            &[
+                notification(
+                    "failed",
+                    "Agent \"first\" failed: stalled",
+                    "2026-09-21T15:00:00Z",
+                ),
+                notification(
+                    "failed",
+                    "Agent \"second\" failed: 403",
+                    "2026-09-21T16:00:00Z",
+                ),
+            ],
+        );
+        assert_eq!(
+            flag,
+            Some(FailedTaskNotice {
+                summary: "Agent \"second\" failed: 403".to_string(),
+                timestamp_raw: Some("2026-09-21T16:00:00Z".to_string()),
+            })
+        );
+    }
+
+    /// A `completed` notice after a failure does not clear it: only the user
+    /// writing does (the rejected "clear on a later completion" rule).
+    #[test]
+    fn a_completed_notice_after_a_failure_leaves_it_standing() {
+        let flag = failed_task_after(
+            "failed-then-completed",
+            &[
+                notification(
+                    "failed",
+                    "Agent \"a\" failed: stalled",
+                    "2026-09-21T15:00:00Z",
+                ),
+                notification("completed", "Agent \"b\" completed", "2026-09-21T16:00:00Z"),
+            ],
+        );
+        assert_eq!(
+            flag.map(|notice| notice.summary),
+            Some("Agent \"a\" failed: stalled".to_string())
+        );
+    }
+
+    /// FILE ORDER decides: a prompt clears what stands BEFORE it, and a failure
+    /// that arrives after the prompt raises the flag again.
+    #[test]
+    fn the_users_prompt_clears_only_what_came_before_it() {
+        let typed = user_record(serde_json::json!({"promptSource": "typed"}));
+        let failed = |summary: &str| notification("failed", summary, "2026-09-21T15:00:00Z");
+
+        assert_eq!(
+            failed_task_after("fail-then-prompt", &[failed("a"), typed.clone()]),
+            None,
+            "the prompt clears the failure before it"
+        );
+        assert_eq!(
+            failed_task_after("prompt-then-fail", &[typed.clone(), failed("b")])
+                .map(|notice| notice.summary),
+            Some("b".to_string()),
+            "a failure after the prompt stands"
+        );
+        assert_eq!(
+            failed_task_after(
+                "fail-prompt-fail",
+                &[failed("a"), typed.clone(), failed("c")]
+            )
+            .map(|notice| notice.summary),
+            Some("c".to_string()),
+            "and a later failure raises the flag again"
+        );
+        assert_eq!(
+            failed_task_after("no-notice", &[typed]),
+            None,
+            "a transcript with no notice carries no flag"
         );
     }
 

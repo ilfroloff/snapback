@@ -32,6 +32,26 @@ pub fn summary_text(record: &Value) -> Option<String> {
     Some(s.to_string())
 }
 
+/// Whether this record is a SUB-AGENT's turn (`isSidechain: true`) rather than
+/// the session's own.
+///
+/// The store's one "not from a subagent" rule for a record, shared by the label
+/// pick below and by `parse`'s failed-background-task pass, so the two cannot
+/// disagree about whose turn a record is. It is the rule's SHARED home, not its
+/// ONLY one: `store::preview` still holds an inline copy of the same read for its
+/// user turns, and a change here must be mirrored there.
+///
+/// FAIL-SOFT: an absent, null, or non-bool `isSidechain` reads as `false` — the
+/// session's own turn, which is what every depth-2 `user` record observed in a
+/// real store carries (subagent turns live in their own files, which discovery
+/// never reaches).
+pub fn is_sidechain(record: &Value) -> bool {
+    record
+        .get("isSidechain")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 /// Extract the text of a "real" user prompt from this record, or `None`.
 ///
 /// A record qualifies when it is `type:"user"`, is not an `isSidechain` turn,
@@ -42,11 +62,7 @@ pub fn user_prompt_text(record: &Value) -> Option<String> {
     if record.get("type").and_then(Value::as_str) != Some("user") {
         return None;
     }
-    if record
-        .get("isSidechain")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
+    if is_sidechain(record) {
         return None;
     }
     let content = record.get("message").and_then(|m| m.get("content"))?;
@@ -128,6 +144,22 @@ mod tests {
             "message": {"content": "<command-name>/clear</command-name>"}
         });
         assert_eq!(user_prompt_text(&wrapped), None);
+    }
+
+    #[test]
+    fn is_sidechain_reads_only_a_true_bool_as_a_subagent_turn() {
+        assert!(is_sidechain(&json!({"type": "user", "isSidechain": true})));
+        // Everything else is the session's own turn: false, absent, and the
+        // fail-soft shapes a drifted schema could carry.
+        for own in [
+            json!({"type": "user", "isSidechain": false}),
+            json!({"type": "user"}),
+            json!({"type": "user", "isSidechain": null}),
+            json!({"type": "user", "isSidechain": "true"}),
+            json!({"type": "user", "isSidechain": 1}),
+        ] {
+            assert!(!is_sidechain(&own), "not a subagent turn: {own}");
+        }
     }
 
     #[test]

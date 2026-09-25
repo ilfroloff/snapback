@@ -172,14 +172,19 @@ never fatal:
 | `cwd` | first non-null | authoritative working dir; **absence ⇒ not a session** |
 | `sessionId` | first non-null (else file stem) | stable id, resume target, reported-agent join key |
 | `gitBranch` | last non-null (`None` ⇒ `(detached)`) | branch grouping level |
-| `timestamp` | last non-null, RFC 3339 | sort + display (per-message too, in preview) |
+| `timestamp` | last non-null, RFC 3339 | sort + display (per-message too, in preview; a [failed notice](#failed-background-task-storeparse)'s own, on the banner) |
 | `type` | `"summary"` / `"user"` / `"assistant"` / `"agent-setting"` / `"agent-name"` | label, preview, content index, [turn count](#turn-count-storeparse) |
 | `summary` | on `type:"summary"` | preferred label + searchable text |
 | `agentSetting` | on `type:"agent-setting"`, string (fail-soft) | the [bound agent](#bound-agent-storepreview) handle on preview turns (interactive bind — authoritative); read **positionally**, never hoisted |
 | `agentName` | on `type:"agent-name"`, string (fail-soft) | the background job's name; a **fallback** bound-agent source for the preview handle, trusted ONLY when it names a known agent (the field also carries free-form titles) — see [bound agent](#bound-agent-storepreview) |
 | `sessionKind` | **top-level on ordinary records**, string (fail-soft); only observed value `"bg"` | marks the transcript a **background** job — one half of the [lost agent binding](#lost-agent-binding-storelineage) badge. See [`sessionKind`](#sessionkind) |
 | `message.content` | string **or** typed-block array | user prompt, preview body, content index |
-| `isSidechain` | bool | skip sub-agent turns when picking a label/preview |
+| `isSidechain` | bool (`label::is_sidechain`; non-bool ⇒ `false`) | skip sub-agent turns when picking a label/preview; a sub-agent turn neither raises nor clears the [failed-task flag](#failed-background-task-storeparse) |
+| `origin.kind` | on `type:"user"`: `origin` is an object with a string `kind` (fail-soft — see the flag); observed `"human"`, `"task-notification"`, `"peer"`, and very often **absent** | who wrote the record. Ruled on **first** by the [failed-task flag](#failed-background-task-storeparse): `"task-notification"` is a notice, and only an absent `origin` or `"human"` can clear |
+| `promptSource` | on `type:"user"`, string (fail-soft); observed `typed`, `sdk`, `system`, `queued` | `typed` / `sdk` mark the USER writing — clears the flag, but is **never read before `origin`** (51 of 169 notices say `sdk` too) |
+| `turnOrigin` | on `type:"user"`, string (fail-soft); observed `human`, `sdk`, `peer`, `task_notification` | `human` / `sdk` mark the user writing — the ONLY marker a quick-reply slash command carries, [from Claude Code 2.1.278 on](#why-turnorigin-counts) |
+| `isMeta` | bool on `type:"user"`; anything but absent or `false` reads as meta | an injection nobody typed; never clears the flag |
+| `<status>` / `<summary>` | tags inside the **string** `message.content` of an `origin.kind: "task-notification"` record; first occurrence, inner text | `<status>failed</status>` raises the flag on its own; the `<summary>` is kept and quoted **verbatim** on the banner. Optional: absent or unclosed ⇒ kept empty, exactly like `<summary></summary>`, and the banner quotes nothing |
 | `uuid` | per record | a record's identity in the transcript **tree** |
 | `parentUuid` | per record; **JSON `null` on the root** | the tree edge; the null-parent record's `uuid` is the fork-lineage identity (see [Fork lineage](#fork-lineage-storelineage)) |
 
@@ -816,6 +821,128 @@ would rescan the store per row and make the board O(n²).
 
 The row draws it as `[unbound]` — see the row markers in
 [README.md](../../README.md).
+
+### Failed background task (`store::parse`)
+
+When a background task a session launched — an agent, or a background shell
+command — fails, claude delivers a `failed` **task notification** into that
+session's transcript and nothing on the board says so. `Session::failed_task`
+carries that failure from the moment it arrives until the user next WRITES into
+the session, typed or as a quick reply. Two surfaces show it: the row's
+`[task failed]` marker (`view::FAILED_TASK_MARKER`, outside the agent badge) and a
+banner sentence on the pinned preview row quoting claude's summary unchanged
+(`background task failed at <when>: <summary>`, `view::failed_task_banner`; it
+shares the row with the reported-agent status when both hold). With nothing to
+quote — no summary, or one of only whitespace and control characters
+(`view::quotable_summary`) — the sentence stops at `background task failed at
+<when>`, never at a dangling colon. It is a **marker
+only** — no key, no gate, and never the status line, since it is true over an
+interval ([PATTERNS.md](PATTERNS.md#11-status-line-ownership)).
+
+#### The rule
+
+Decided record by record, **in file order**, by the pure `parse::task_signal`
+inside `parse_file`'s single pass — no second read:
+
+| Record | Effect |
+| --- | --- |
+| `type:"user"`, not a sub-agent turn, `origin.kind: "task-notification"`, string body whose first `<status>` is exactly `failed` — with or without a `<summary>` | **Set**: keep the summary word for word (empty when there is none) and the record's `timestamp`. A later `failed` notice **replaces** an earlier one |
+| `type:"user"`, not a sub-agent turn, `origin` **absent** or `origin.kind: "human"`, not `isMeta`, not a tool result, and carrying at least one marker: `origin.kind: "human"`, `promptSource` `typed`/`sdk`, or `turnOrigin` `human`/`sdk` | **Clear** |
+| anything else | nothing |
+
+**Never clears**: tool results, `isMeta` records, notification records (a
+`completed` one included) and agent messages (`origin.kind: "peer"`),
+slash-command wrappers with no marker and their `<local-command-stdout>` output,
+and `[Request interrupted…]` lines. Each of those is either machine-marked
+(`origin`, `isMeta`, a tool-result block) or carries no marker at all. A slash
+command clears whenever it DOES carry one, like any other prompt: a skill command
+typed at the prompt (`/cr-review`, `/claude-api`) carries `origin.kind: "human"`,
+and one sent as a quick reply carries only `turnOrigin: "sdk"` — from Claude Code
+2.1.278 on; [older ones carry none](#why-turnorigin-counts). Built-ins such as
+`/exit` and `/model` carry none, so they never clear.
+
+#### Why `origin` is ruled on first
+
+**51 of 169 task notifications carry `promptSource: "sdk"`** — the same value a
+quick reply carries. A rule that read `promptSource` alone would count a later
+notification as the user's reply and silently clear a standing failure. So a
+record marked as a notification or another agent's message never counts, whatever
+`promptSource` says (pinned by the `sess-task-notified-1` fixture and
+`origin_is_ruled_on_before_prompt_source`).
+
+#### Why `turnOrigin` counts
+
+**8 slash commands sent as quick replies** (`/pr-squash`, `/handoff-to-lead`,
+`/cr-review`) carry ONLY `turnOrigin: "sdk"`, with no `promptSource`. To honour
+"typed or quick reply", `turnOrigin` has to count too (pinned by
+`sess-task-slash-sdk-1`). Claude Code writes that marker **from 2.1.278 on**: the
+11 quick-reply skill commands written by 2.1.237–2.1.276 carry no marker at all,
+so they do not clear — a leftover marker, the accepted direction. The records that
+carry **none** of the markers turned out to be slash commands, their output, and
+`[Request interrupted…]` lines — which claude also writes by itself, for example
+inside a running lead agent — so none of them clears.
+
+#### Accepted trade-offs
+
+- A slash command with no marker, such as `/exit` or a quick-reply skill command
+  from an [older Claude Code](#why-turnorigin-counts), does not clear the flag, so
+  the marker can outlive a visit in which the user only ran a command. It errs
+  toward a leftover marker, **never toward a hidden failure**, as does every
+  CLEAR-side fail-soft path below but one; that one (`isSidechain`) and the SET
+  side's narrow miss err the other way.
+- It still flags failures claude already explained in its own reply.
+- **A background fork inherits the flag.** A fork copies the earlier transcript
+  verbatim ([the mechanism](#the-mechanism-why-identical-rows-appear)), notice
+  included, so the new file carries the flag until its own first prompt. The row
+  marker therefore draws on lineage child rows too.
+
+#### Out of scope
+
+`stopped` and `killed` notices raise nothing, and a `completed` notice does not
+clear (only the user writing does). Failures of agents nested inside other agents
+are not tracked: a sub-agent turn (`isSidechain: true`) neither raises nor clears,
+and sub-agent transcripts are never discovered at all.
+
+#### Fail-soft
+
+Four undocumented fields decide this (`origin.kind`, `promptSource`,
+`turnOrigin`, the notification's `<status>`), all read as `serde_json::Value` with
+`Option` access, so no shape can panic or reject a file. Every unrecognised shape
+but one **neither sets nor clears**, and which way that errs depends on the side:
+
+- **Clear side — toward a leftover marker.** An `origin` that is `null`, not an
+  object, or has no string `kind`; a marker of the wrong type or spelling
+  (`"SDK"`); an `isMeta` that is neither absent nor `false` (read as meta). None of
+  these clears, so a failure already standing stays standing.
+- **The exception — `isSidechain`, read fail-OPEN, toward a hidden failure.**
+  `label::is_sidechain` reads a null or non-bool value (`"true"`) as the session's
+  own turn, so a record malformed there is judged on its other fields and, if it
+  carries a user marker, **does clear**. The real store never writes one:
+  sub-agent turns live in files discovery never reaches, and the depth-2 records
+  it does reach carry a bool.
+- **Set side — toward not flagging.** A notification whose body is not a string or
+  has no readable `<status>` raises nothing, so in that narrow case the failure
+  goes unflagged. A `failed` one with no readable `<summary>` (absent or never
+  closed) is **not** such a case: the status alone decides, so it raises the flag
+  with an empty summary, exactly as an empty `<summary></summary>` does — dropping
+  a failure whose status was read would err toward a hidden one.
+
+The `queue-operation` copy claude writes of every notification body is not a
+`user` record and is ignored.
+
+**Measured over a real store (119 sessions, 2026-09-25):** 169 task notifications,
+**10** of them `failed` across 8 sessions (9 agent failures, 1 background command's
+`exit code 126`). The rule flags **0** today — every one has since been answered —
+while cutting two of those transcripts back to before the user's reply flags both,
+each with claude's summary intact. A snapshot, not a contract.
+
+#### Where it is computed
+
+In the parse pass, into `ParsedFile::failed_task` and then `Session::failed_task`
+(the timestamp parsed on the way, like `Session::timestamp`). It is a fact about
+the BYTES, so the [parse cache](#incremental-reload-storesessionstore) carries it
+unchanged. No `App` state is derived from it: the row reads its own session's
+field, and the banner reads the selected session's.
 
 ### Turn count (`store::parse`)
 

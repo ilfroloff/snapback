@@ -254,6 +254,32 @@ pub struct Session {
     /// downgrade. They are facts about the BYTES, so the parse cache may carry
     /// them exactly as it carries every other parsed field.
     pub has_agent_setting: bool,
+    /// A background task this session launched that FAILED, and that the user
+    /// has not written into the session since (see
+    /// [`parse::ParsedFile::failed_task`]); `None` otherwise.
+    ///
+    /// Read by ONE surface pair — the list row's marker and the preview banner in
+    /// `tui::view` — and by nothing else: no key, no gate. A fact about the bytes,
+    /// carried through the parse cache like every other parsed field.
+    pub failed_task: Option<FailedTask>,
+}
+
+/// A background task's FAILED notice still standing on a [`Session`] — the
+/// derived form of [`parse::FailedTaskNotice`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailedTask {
+    /// claude's `<summary>` of the failure, VERBATIM — EMPTY when the notice
+    /// carried none, which still flags the session; the banner then quotes
+    /// nothing.
+    pub summary: String,
+    /// When the notice arrived, parsed from RFC 3339 exactly as
+    /// [`Session::timestamp`] is (`None` if absent or unparseable).
+    pub timestamp: Option<OffsetDateTime>,
+}
+
+/// Parse a raw RFC 3339 timestamp read out of a transcript, fail-soft.
+fn parse_timestamp(raw: Option<&str>) -> Option<OffsetDateTime> {
+    raw.and_then(|t| OffsetDateTime::parse(t, &Rfc3339).ok())
 }
 
 impl Session {
@@ -280,10 +306,11 @@ impl Session {
                 parsed.first_user.as_deref(),
                 &parsed.session_id,
             );
-            let timestamp = parsed
-                .timestamp_raw
-                .as_deref()
-                .and_then(|t| OffsetDateTime::parse(t, &Rfc3339).ok());
+            let timestamp = parse_timestamp(parsed.timestamp_raw.as_deref());
+            let failed_task = parsed.failed_task.map(|notice| FailedTask {
+                summary: notice.summary,
+                timestamp: parse_timestamp(notice.timestamp_raw.as_deref()),
+            });
 
             Session {
                 file: path.to_path_buf(),
@@ -299,6 +326,7 @@ impl Session {
                 background: parsed.background,
                 has_agent_name: parsed.has_agent_name,
                 has_agent_setting: parsed.has_agent_setting,
+                failed_task,
             }
         })
     }
@@ -565,8 +593,8 @@ mod tests {
                 .any(|p| p.components().any(|c| c.as_os_str() == "subagents")),
             "discovery must never descend into a subagents/ directory: {files:?}"
         );
-        // The eight depth-2 `.jsonl` files, none of the nested subagent file.
-        assert_eq!(files.len(), 8, "unexpected discovered set: {files:?}");
+        // The fifteen depth-2 `.jsonl` files, none of the nested subagent file.
+        assert_eq!(files.len(), 15, "unexpected discovered set: {files:?}");
     }
 
     #[test]
@@ -588,8 +616,163 @@ mod tests {
             !sessions.iter().any(|s| s.label.contains("Sidecar title")),
             "a sidecar file with no cwd was surfaced as a session"
         );
-        // Exactly seven resumable sessions survive (8 discovered - 1 sidecar).
-        assert_eq!(sessions.len(), 7, "unexpected session count");
+        // Exactly fourteen resumable sessions survive (15 discovered - 1 sidecar).
+        assert_eq!(sessions.len(), 14, "unexpected session count");
+    }
+
+    // --- failed background task: the fixture pairs ------------------------
+    //
+    // Four pairs under `-Users-me-project-epsilon`, each pair the SAME transcript
+    // except for its session id and its LAST record, so neither half can pass
+    // against a rule that reads something else. Pairs 1, 3 and 4 change one part of
+    // that record (`<status>`; `turnOrigin`; the `<summary>` line). Pair 2 changes
+    // who wrote it — its `origin` and its body both differ — while both halves keep
+    // the `promptSource: "sdk"` that is the point of the pair. Pair 4 reuses pair
+    // 1's failed half, so the pairs span seven files. All seven are root-less on
+    // purpose: sharing a tree root would make them one fork lineage, which is a
+    // second difference and a false story about how they were made.
+
+    /// The summary every fixture's `failed` notice carries, quoted VERBATIM.
+    const FIXTURE_FAILED_SUMMARY: &str = "Agent \"Remediate review findings\" failed: \
+         Agent stalled: no progress for 600s (stream watchdog did not recover)";
+
+    /// Pair 1: `failed` vs `completed`, differing ONLY in `<status>`. The status
+    /// alone decides — the summary, which says "failed" in both files, does not.
+    #[test]
+    fn a_failed_notice_flags_the_session_and_a_completed_one_does_not() {
+        let sessions = load();
+        let failed = find(&sessions, "sess-task-failed-1");
+        let completed = find(&sessions, "sess-task-completed-1");
+
+        let task = failed
+            .failed_task
+            .as_ref()
+            .expect("a failed notice with no later prompt flags the session");
+        assert_eq!(task.summary, FIXTURE_FAILED_SUMMARY, "quoted word for word");
+        assert_eq!(
+            completed.failed_task, None,
+            "a completed notice raises nothing, whatever its summary says"
+        );
+    }
+
+    /// The failed task's time is the NOTICE's own `timestamp`, never the session's
+    /// last activity. Read off `sess-task-notified-1` because a LATER record (the
+    /// completed notice at 16:00) moves that session's time past the failure's, so
+    /// the two values are genuinely apart; in `sess-task-failed-1` the notice is
+    /// the last record and the two would coincide.
+    #[test]
+    fn a_failed_task_keeps_the_notices_own_time_not_the_sessions_last_activity() {
+        let sessions = load();
+        let notified = find(&sessions, "sess-task-notified-1");
+        let fixture_time = |raw: &str| {
+            Some(OffsetDateTime::parse(raw, &Rfc3339).expect("a valid fixture timestamp"))
+        };
+
+        // The premise, and it has teeth: were the session's time the notice's
+        // own, the assertion below could not tell the two sources apart.
+        assert_eq!(
+            notified.timestamp,
+            fixture_time("2026-09-21T16:00:00.000Z"),
+            "a later record must move the session's time past the notice's"
+        );
+        assert_eq!(
+            notified
+                .failed_task
+                .as_ref()
+                .and_then(|task| task.timestamp),
+            fixture_time("2026-09-21T15:30:32.799Z"),
+            "the failed task carries the NOTICE's own time, parsed from RFC 3339, \
+             not the session's last activity"
+        );
+    }
+
+    /// Pair 2: after the same failed notice, a QUICK-REPLY prompt
+    /// (`promptSource: "sdk"`, no `origin`) clears the flag, while a later
+    /// NOTIFICATION carrying that very `promptSource: "sdk"` must not — `origin`
+    /// is ruled on before `promptSource` is ever read.
+    #[test]
+    fn a_quick_reply_clears_the_flag_and_an_sdk_marked_notification_does_not() {
+        let sessions = load();
+        let replied = find(&sessions, "sess-task-reply-1");
+        let notified = find(&sessions, "sess-task-notified-1");
+
+        assert_eq!(
+            replied.failed_task, None,
+            "the user's quick reply is the user engaging, so the flag clears"
+        );
+        let task = notified.failed_task.as_ref().expect(
+            "a later notification is claude speaking, not the user, even when it \
+             carries promptSource: sdk — and a completed notice clears nothing",
+        );
+        assert_eq!(
+            task.summary, FIXTURE_FAILED_SUMMARY,
+            "the ORIGINAL failure still stands; the completed notice replaced nothing"
+        );
+    }
+
+    /// Pair 3: after the same failed notice, a quick-reply SLASH COMMAND marked
+    /// ONLY with `turnOrigin: "sdk"` clears the flag, while the identical command
+    /// with no marker — the shape claude writes for a bare `/exit` — does not.
+    #[test]
+    fn a_turn_origin_sdk_slash_command_clears_the_flag_and_a_bare_one_does_not() {
+        let sessions = load();
+        let marked = find(&sessions, "sess-task-slash-sdk-1");
+        let bare = find(&sessions, "sess-task-slash-bare-1");
+
+        assert_eq!(
+            marked.failed_task, None,
+            "turnOrigin: sdk is a quick reply, so the flag clears"
+        );
+        assert_eq!(
+            bare.failed_task.as_ref().map(|task| task.summary.as_str()),
+            Some(FIXTURE_FAILED_SUMMARY),
+            "a slash command with no marker is not proof the user engaged"
+        );
+    }
+
+    /// Pair 4: the same failed notice with and without its `<summary>` line. Both
+    /// flag the session, at the notice's own time; only the words differ, and the
+    /// summary-less one keeps the EMPTY summary, so the banner quotes nothing
+    /// rather than the failure going unflagged.
+    #[test]
+    fn a_failed_notice_flags_the_session_with_or_without_a_summary() {
+        let sessions = load();
+        let with = find(&sessions, "sess-task-failed-1");
+        let without = find(&sessions, "sess-task-failed-nosummary-1");
+
+        let task = without
+            .failed_task
+            .as_ref()
+            .expect("the failed status alone raises the flag; a missing summary must not hide it");
+        assert_eq!(task.summary, "", "nothing to quote, so nothing is kept");
+        let with_time = with.failed_task.as_ref().and_then(|task| task.timestamp);
+        assert!(with_time.is_some(), "the premise: pair 1's notice is dated");
+        assert_eq!(
+            task.timestamp, with_time,
+            "the same notice time either way — the summary decides only the words"
+        );
+    }
+
+    /// Nothing ELSE in the fixture store is flagged — the guard against a flag
+    /// that is really just always on.
+    #[test]
+    fn no_session_without_a_failed_notice_is_flagged() {
+        let sessions = load();
+        let mut flagged: Vec<&str> = sessions
+            .iter()
+            .filter(|s| s.failed_task.is_some())
+            .map(|s| s.session_id.as_str())
+            .collect();
+        flagged.sort_unstable();
+        assert_eq!(
+            flagged,
+            vec![
+                "sess-task-failed-1",
+                "sess-task-failed-nosummary-1",
+                "sess-task-notified-1",
+                "sess-task-slash-bare-1"
+            ]
+        );
     }
 
     #[test]
