@@ -3531,10 +3531,10 @@ impl App {
 
     /// The wrapped-layout context needed to hit-test a mouse click into a preview
     /// link: the per-line wrapped-row PREFIX MAP
-    /// ([`row_prefix`](CachedPreview::row_prefix)) and the clickable
-    /// [`LinkRegion`](preview::LinkRegion)s — both pulled from the SAME width-scoped
-    /// cache the view drew from, so a hit-test can never disagree with what is on
-    /// screen. Empty when nothing is selected.
+    /// ([`row_prefix`](CachedPreview::row_prefix)), the rendered LINES, and the
+    /// clickable [`LinkRegion`](preview::LinkRegion)s — all three pulled from the
+    /// SAME width-scoped cache the view drew from, so a hit-test can never disagree
+    /// with what is on screen. `None` when nothing is selected.
     ///
     /// It hands over the very map the DRAW windows by, and that shared identity is
     /// the point: `view::link_at` resolves a clicked row to a logical line through
@@ -3543,14 +3543,22 @@ impl App {
     /// per-line model instead — as a walk over each line's display WIDTH did — makes
     /// the click's error grow with every wrapping line above it, without limit on a
     /// long transcript.
+    ///
+    /// The LINES come along because resolving which CELL of that line was clicked is
+    /// answered the same way — by re-rendering the line rather than by modelling the
+    /// wrap (see `view::region_paints_cell`). They are BORROWED, never cloned: a
+    /// click would otherwise copy a whole transcript to read one line of it.
     pub fn preview_hit_context(
         &mut self,
         inner_width: u16,
-    ) -> (Vec<usize>, Vec<preview::LinkRegion>) {
-        match self.ensure_preview(inner_width) {
-            Some(p) => (p.row_prefix.clone(), p.rendered.links.clone()),
-            None => (Vec::new(), Vec::new()),
-        }
+    ) -> Option<(&[usize], &[Line<'static>], &[preview::LinkRegion])> {
+        self.ensure_preview(inner_width).map(|p| {
+            (
+                &p.row_prefix[..],
+                &p.rendered.text.lines[..],
+                &p.rendered.links[..],
+            )
+        })
     }
 }
 
