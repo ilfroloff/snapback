@@ -260,7 +260,7 @@ inner rect when there is no banner (so a banner-less pane's geometry is exactly
 `Block::inner`, unchanged). The rules that follow from it:
 
 - `preview_split` is the ONE place the banner/transcript geometry is derived.
-  `render_preview` draws against its rects and `update::link_under_pointer`
+  `render_preview` draws against its rects and `update::resolve_link_click`
   hit-tests against the same transcript rect. A click resolves through
   `App::preview_scroll` and the width-scoped hit cache, both measured from that
   rect's origin — derive it anywhere else and a click silently opens the wrong
@@ -290,11 +290,15 @@ inner rect when there is no banner (so a banner-less pane's geometry is exactly
   agreeing with the wrapper.
 
   The one production path that PERFORMS a wrap is the exception that shows where
-  the line is: `store::preview::wrap_spans` word-wraps a GFM table cell down its
-  column, so a hand-rolled wrapper does sit beside ratatui's. It is safe for one
+  the line is: `store::preview::wrap_span_cells` word-wraps a GFM table cell down
+  its column, so a hand-rolled wrapper does sit beside ratatui's. It is safe for one
   structural reason, not by care — a grid line is clamped to the pane width, so it
   NEVER reaches ratatui's wrapper, and the two models therefore cannot disagree
-  about a table. The one height it does take — `table_data_lines` sizing a row by
+  about a table. That same fact is what lets a grid cell record a clickable
+  `LinkRegion` at all: its columns are the columns painted, with no wrap in between
+  to move them, so a grid region always resolves at `sub_row` 0. Record mode is the
+  other side of it and records nothing — its lines ARE handed to ratatui's wrapper.
+  The one height it does take — `table_data_lines` sizing a row by
   its tallest cell — is not a PREDICTION either: it counts lines it has ALREADY
   PRODUCED itself, never guessing what ratatui's wrapper would do to them. Those
   lines stay ordinary `Line`s that `wrapped_row_prefix` then measures through the
@@ -323,15 +327,77 @@ inner rect when there is no banner (so a banner-less pane's geometry is exactly
   becomes a line.** `row_window` starts the window with it and `link_at` resolves a
   click with it, so the paint and the hit-test cannot disagree about which line sits
   where — the failure a second derivation guarantees. Which LINE a click lands on is
-  therefore EXACT at any length or scroll position. What stays approximate is the
-  COLUMN inside that one line (`sub_row * inner_width`, character-packed because the
-  wrapper will not say where inside a line it broke), so the error is bounded by ONE
-  logical line's wrapped extent and can never reach another line whichever way that
-  column slips — and it slips BOTH ways. `link_at`'s doc comment owns the two
-  directions and what each one costs a click; do not restate them. Answering the line
-  from a per-line model instead — a packing walk down the whole transcript — grew the
-  error with every wrapping line above the click, bounded by nothing once the
-  preview's 600-line tail cap was deleted.
+  therefore EXACT at any length or scroll position. Answering the line from a
+  per-line model instead — a packing walk down the whole transcript — grew the error
+  with every wrapping line above the click, bounded by nothing once the preview's
+  600-line tail cap was deleted.
+- **Which CELL of that line was clicked is asked of the RENDERER too, by a PROBE.**
+  `view::region_paints_cell` re-styles one candidate `LinkRegion`'s graphemes with a
+  marker `Modifier`, pushes that single line through the same
+  `Paragraph::wrap(Wrap { trim: false })` into an in-memory `Buffer`, and reads the
+  clicked cell back — so a wrapped link is clickable on every cell it was painted
+  into, continuation rows included. This replaced the last packed step
+  (`sub_row * inner_width`), which put a sub-row's computed start on either side of
+  its true one and left a 92-column url's last 73 columns dead. THE PROBE IS NOT A
+  SECOND WRAP MODEL, and that is the whole reason it is allowed: re-styling leaves
+  the text byte-identical and splits only at grapheme-cluster edges, so the probe's
+  wrap IS the paint's wrap. The equality is checked, not assumed — a marked line that
+  does not measure to the rows the prefix map gave it resolves to NO link, because a
+  hit-test that guesses hands an unintended url to a browser while one that abstains
+  costs a click. THE SAME DIRECTION DECIDES THE UNWRITTEN CELL, which is the other
+  place that promise is easy to lose. `render_line` writes once per grapheme and
+  advances by its display width, so the right half of a double-width glyph is never
+  written — but `Paragraph` only `set_style`s its area and never blanks a row's
+  remainder, so the columns past a row's last glyph are unwritten too. The two are
+  identical by symbol and opposite in meaning, so an unwritten cell counts as a hit
+  ONLY when its left neighbour is marked AND measures two columns wide. Drop that
+  width test and the blank column beside a link that ENDS a painted row opens that
+  link — a click on empty space, which is exactly the wrong-hit this bullet forbids.
+  Cost is one small render per candidate region per click, over only
+  the rows up to the clicked one; a click is human-paced, so no frame pays it.
+- **The probe is BOUNDED, and the bound is a PRODUCT.** Each candidate clones and
+  re-wraps the WHOLE logical line, and a MISS pays for every region on it, so one
+  click costs `candidates * line_bytes` of reading — unbounded on a single logical
+  line holding a minified blob with several links in it, which is tens of
+  megabytes of cloning on the UI thread per click. `view::LINK_PROBE_BYTE_BUDGET`
+  caps that PRODUCT, because either factor capped alone admits the case the other
+  exists to stop: a line just under a size cap still carries thousands of links,
+  and one link still sits inside a megabyte-long blob. BYTES rather than the
+  wrapped ROWS that arrive free off the prefix map, because rows count what the
+  wrapper PAINTS while the probe pays for what it READS — a line of megabytes of
+  zero-width marks wraps to ONE row, so a row budget prices that click at 1 and
+  then admits thousands of candidates that each re-wrap all of it. Bytes SUBSUME
+  rows, and `view::line_probe_bytes` sums them in O(spans) off each span's `len`.
+  A candidate costs O(spans) as well as O(bytes) — `view::highlight_matched_spans`
+  keeps even the EMPTY spans — so what would defeat a byte price is not an empty
+  span but an UNBOUNDED NUMBER of them, a line of thousands measuring ZERO bytes.
+  The REPEATABLE empty forms, whose count grows with the input, are refused at the
+  parse in `store::preview::parse_inline_collect`: `flush_plain` skips an empty
+  run, `match_delim` rejects `****`, `match_link` rejects `[]()`, and the
+  inline-code arm rejects an empty backtick pair. Adding a delimiter form here
+  means owing it the same empty-case rejection, or that count stops being bounded.
+  `regions_from_inline` then drops ZERO-WIDTH regions so an unhittable candidate
+  cannot multiply what is left. The empty spans that DO survive are bounded per
+  line rather than absent, and what bounds them is a property rather than a roster:
+  a block construct emits O(1) empties per line, so they cannot grow with the
+  line's length. Several exist today — the `" ".repeat(indent)` prefix (empty on
+  any unindented list item, on a line that can carry a region), the blank
+  placeholder (emitted only when an inline run produced no spans, so it never
+  coincides with a region), an empty ATX header, a `Line::from("")` spacer — and
+  that list is ILLUSTRATIVE, not a census. A grid row adds no empty of its own: its
+  `COLUMN_RULE`s and its hold-open pads all carry bytes, since a grid column's width
+  never falls below 1. So spans are `O(bytes) + O(1)` per line and
+  the product stays `O(candidates * bytes)`. This is deliberately a BOUND and not a
+  list of which spans are non-empty: the bound still holds when a parser arm is
+  added, whereas such a list rots the moment one is. The obligation a new arm
+  inherits is therefore not "emit no empty span" — it is: do not emit them in a
+  count that grows with the input, and if you must, make it cost bytes.
+  PAST the budget the hit-test ABSTAINS — the same direction the
+  row-count check above takes, for the same reason — and SAYS SO, answering
+  `view::LinkProbe::Unresolvable` for `update::note_link_click` to map to a STICKY
+  message, because an underlined affordance that does nothing on purpose must
+  admit it. The failure mode stays "a click was missed, and the reader was told",
+  never "a url the reader never aimed at reached a browser".
 - **That map's soundness is one property, and it is PINNED.** Summing per-line
   counts equals the whole-text count only because `Wrap { trim: false }` wraps
   each logical line independently and never joins two onto one row — the same
@@ -671,11 +737,11 @@ CADENCES and LIMITS, so a retune knows what it is next to:
 | `store` | `MTIME_SETTLE_WINDOW` (2 s) |
 | `store::parse` | `CONTENT_INDEX_CAP` (1 MB) |
 | `store::label` | `LABEL_MAX` (180) |
-| `store::preview` | `TABLE_MIN_COL_WIDTH` (10) · `RECORD_RULE_WIDTH` (32) |
+| `store::preview` | `TABLE_MIN_COL_WIDTH` (10) · `RECORD_RULE_WIDTH` (32) · `COLUMN_RULE_WIDTH` (3) · `ELLIPSIS_WIDTH` (1) |
 | `send` | `SEND_ERROR_MAX` (200) |
 | `tui::app` | `PREVIEW_WHEEL_STEP` (2) · `LIST_WHEEL_STEP` (1) · `STATUS_DWELL_TICKS` (16) · `MIN_PANE_WIDTH` (15) · `DEFAULT_LIST_PERCENT` (48) |
 | `tui::update` | `PASTE_MAX_CHARS` (4096) · `SPLITTER_TOLERANCE` (1) |
-| `tui::view` | `BLINK_TICKS` (2) · `CHILD_ID_CHARS` (8) · the layout rows `PREVIEW_BANNER_ROWS` / `BOARD_CHROME_ROWS` / `COMPOSE_*` / `MODAL_WIDTH` / `MODAL_*_CHROME_ROWS` |
+| `tui::view` | `BLINK_TICKS` (2) · `CHILD_ID_CHARS` (8) · `MATCH_JUMP_LEAD_DIVISOR` (3 — a jumped-to match parks `h / 3` rows down) · `WIDE_GLYPH_COLUMNS` (2) · `LINK_PROBE_BYTE_BUDGET` (131_072) · the layout rows `PREVIEW_BANNER_ROWS` / `BOARD_CHROME_ROWS` / `COMPOSE_*` / `MODAL_WIDTH` / `MODAL_*_CHROME_ROWS` |
 
 Add a new tunable the same way. The rule is not only about numbers — a literal
 with a meaning gets a name whatever its type: the undocumented `claude agents`
@@ -920,6 +986,43 @@ The help line renders `App::status` and nothing else. `set_status` is sticky
 and nudges do not squat on the keymap row. This keeps each fact told exactly
 once and prevents interval-scoped facts from colonizing a keypress-scoped
 surface.
+
+**A MOUSE click is scoped like a keypress, and which kind it is depends on WHAT it
+resolved to.** `update::note_link_click` is the instance, and it is the ONE place a
+preview-link click's four outcomes are mapped to status treatment — a single site, so
+each is decided once and any of them can be re-decided without hunting:
+
+| `LinkClick` | Status | Why |
+| --- | --- | --- |
+| `Opening(url)` | TRANSIENT `opening <url>` | A confirmation: what the user aimed at is under way, so it dwells rather than squatting on the keymap row. |
+| `RefusedScheme(url)` | STICKY `not opening <url> - …` | A refusal the reader may act on: a `[label](url)` target is scheme-checked nowhere on the way in, so a label CAN render underlined over a url the opener will not take. |
+| `Unresolvable` | STICKY `cannot tell which link …` | The hit-test ABSTAINED — the clicked line is past `view`'s probe budget (`probe_within_budget`). Not the same claim as "no link": that budget bounds the line's SIZE times its candidate count, so a line with no regions has a product of zero and is always within it, and abstaining IMPLIES a rendered link there. A rendered, underlined affordance that does nothing must say so. |
+| `NoLink` | nothing | A NO-OP, which must not wipe a refusal the reader has not read yet (the `WheelTarget::Ignore` arm is the same principle for the wheel). |
+
+The first three are ACTIONABLE inputs — the user aimed at something and it either
+happens or is refused — so each may clear whatever the line held, exactly as an
+actionable keypress does. That asymmetry against the fourth is load-bearing beyond
+tidiness: `resume::open_url` nulls all child stdio and swallows every error, so the
+status line is the ONLY thing separating a resolved click from a dead opener — a
+message with no browser indicts the opener, and silence means the click resolved
+nothing. Let a pending sticky message SUPPRESS a resolved click's message and silence
+stops meaning that, so anything but `NoLink` must always be able to speak.
+
+Making the over-budget case silent again is deliberately a ONE-LINE change to that
+table's `Unresolvable` arm. Keep the mapping a single site so it stays that way.
+
+**What splits `Opening` from `RefusedScheme` is ONE predicate, asked once.** snapback
+opens `http`/`https` only — `store::preview::has_openable_scheme`, which both
+`store::preview::match_autolink` and `resume::opener_argv` read, so the renderer and
+the opener cannot disagree about what a link is. `update::resolve_link_click` asks
+that same predicate rather than a rule of its own, which is why the two variants can
+never describe a url differently from the opener that gets it.
+
+Across all four rows the governing rule is the same: saying nothing was never an
+option for a click that landed on something. An affordance that renders, records a
+region and then silently does nothing is the very indistinguishable silence this
+hit-test was built to remove, and leaving it at the far end of the path — whether by
+refusing the scheme or by refusing to probe — would only have moved it.
 
 ## Testing patterns
 

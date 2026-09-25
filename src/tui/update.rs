@@ -77,7 +77,7 @@ use crate::defined_agents;
 use crate::delete;
 use crate::resume::{self, Ready};
 use crate::send::{self, BgLaunchRequest, InterruptGate, InterruptRequest, ReplyGate, SendRequest};
-use crate::store::SessionStore;
+use crate::store::{preview, SessionStore};
 use crate::watch::AppEvent;
 
 use super::app::{App, Interrupting, ModalAction, ModalLayout};
@@ -350,10 +350,15 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool
 /// * `Input(Key)` (a press/repeat) -> decode + apply an [`Action`].
 /// * `Input(Mouse)` -> a wheel notch scrolls the pane under the pointer, a
 ///   left-button press/drag/release on the list/preview seam resizes the split,
-///   and a left-click on a rendered preview link opens its url in the default
-///   browser ([`handle_mouse`]); all are independent of the overlay gate (a click
-///   cannot start an orphaned drag or open a link while the overlay is open — see
-///   [`App::begin_split_drag`] and the `App::overlay_active` gate).
+///   and a left-click on a rendered preview link is resolved by [`handle_mouse`]:
+///   a hit on an `http`/`https` url opens it in the default browser and reports
+///   `opening <url>` transiently, a hit on any other scheme opens NOTHING and
+///   reports a sticky refusal naming the url, a line too big to hit-test reports
+///   a sticky [`LinkClick::Unresolvable`] message, and a miss writes nothing (the
+///   mapping lives in [`note_link_click`]); all are independent of the overlay
+///   gate (a click cannot start an orphaned drag or open a link while the
+///   overlay is open — see [`App::begin_split_drag`] and the
+///   `App::overlay_active` gate).
 /// * `SessionsChanged` -> reload `store` and re-apply query+scope, preserving
 ///   selection-by-id and scroll (see [`reload_board`]).
 /// * `Tick` -> nothing costly (just a redraw upstream).
@@ -816,8 +821,13 @@ fn on_splitter(col: u16, row: u16, list: Rect, preview: Rect) -> bool {
 /// press on the list/preview seam begins
 /// dragging the splitter, a left-button drag while dragging resizes it, and a
 /// left-button release always ends the drag. A left-button press INSIDE the
-/// preview pane (but not on the seam) that lands on a rendered link opens its url
-/// in the default browser — fire-and-forget, off the render loop. Any other event
+/// preview pane (but not on the seam) is resolved by [`open_link_under_pointer`]:
+/// a hit on an `http`/`https` link opens its url in the default browser —
+/// fire-and-forget, off the render loop — and reports `opening <url>` transiently;
+/// a hit on any OTHER scheme opens nothing and reports a STICKY refusal naming the
+/// url (the gate is [`preview::has_openable_scheme`]); a line too big to hit-test
+/// reports a sticky [`LinkClick::Unresolvable`] message; and a miss writes nothing.
+/// Any other event
 /// (other buttons, horizontal wheel, plain moves) is ignored. Never touches the
 /// query, and the overlay gate is enforced by [`App::begin_split_drag`] (drag) and
 /// the [`App::overlay_active`] gate (link open), so this never crashes or starts an
@@ -871,8 +881,52 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     }
 }
 
-/// The url of the rendered preview link under a pointer at screen `(col, row)`,
-/// or `None` when the pointer is over no link.
+/// What a left-click on the preview pane amounts to — the ONE outcome the whole click
+/// path speaks in, from the hit-test through the status line to the spawn.
+///
+/// It has four states because the click really has four, and the two that used to
+/// share an `Option::None` are the reason this type exists. [`NoLink`](Self::NoLink)
+/// says the pointer was over ordinary text; [`Unresolvable`](Self::Unresolvable) says
+/// the pointer was over a line too large to hit-test, so WHICH link it landed on — or
+/// whether it landed on one at all — is unknown. Folded together they came out as the
+/// same SILENCE, and the second one's silence is the exact failure this hit-test
+/// exists to remove: a label that IS rendered and IS underlined, clicked, and nothing
+/// happens and nothing is said. An abstention is never vacuous either — the probe
+/// budget bounds the clicked line's SIZE times its candidate count, so a line with no
+/// regions has a product of zero and is always within it
+/// and abstaining IMPLIES a rendered link on that line (see [`view::LinkProbe`]).
+///
+/// Splitting a hit into [`Opening`](Self::Opening) and
+/// [`RefusedScheme`](Self::RefusedScheme) is the same argument one step on: both hand
+/// the opener nothing visible, so only a distinct message separates "your browser is
+/// coming" from "snapback will not open this scheme".
+///
+/// The value is produced by the pure [`resolve_link_click`], turned into copy by
+/// [`note_link_click`] and consumed by exactly one impure statement in
+/// [`open_link_under_pointer`] — PATTERNS §3's split, with the type as the seam.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LinkClick {
+    /// The click resolved to a real cell carrying no link.
+    NoLink,
+    /// The click resolved to this url and snapback will hand it to the opener.
+    Opening(String),
+    /// The click resolved to this url and snapback will NOT open its scheme.
+    RefusedScheme(String),
+    /// The click's line exceeded the hit-test's probe budget, so which link it hit is
+    /// unknown — see the type doc for why that is not [`NoLink`](Self::NoLink).
+    Unresolvable,
+}
+
+/// Decide what a left-click on the preview pane at screen `(col, row)` amounts to,
+/// WITHOUT saying or opening anything.
+///
+/// The DECISION half of [`open_link_under_pointer`], split out for the reason
+/// PATTERNS §3 gives: everything here is terminal-, process- and status-free and can
+/// be asserted directly against all four outcomes, while the caller is left holding
+/// one spawn. That is what lets a test drive a real rendered transcript all the way to
+/// "this is the url that would be opened" without a browser appearing on the machine
+/// running it. It takes `&mut App` only because the width-scoped preview cache is
+/// filled on demand; it writes nothing a reader can see.
 ///
 /// The transcript does NOT own the whole preview pane: a REPORTED session — or
 /// one carrying a failed background task — pins a status banner to the pane's
@@ -890,35 +944,148 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
 /// [`App::is_live_now`], and it would be the wrong question here twice over: it
 /// shells out to claude, and it would disagree with the drawn banner.
 ///
-/// The wrapped-layout context (the per-line wrapped-row prefix map + the link
-/// regions) comes from the SAME width-scoped cache the view drew from — the very
-/// map the draw windowed itself by, so the click and the paint resolve a screen row
-/// to a logical line through one shared answer rather than two models. The url comes
-/// from the pure [`view::link_at`]. Terminal- and process-free, so the geometry is
-/// unit testable; [`open_link_under_pointer`] is the thin impure wrapper over it.
-fn link_under_pointer(app: &mut App, col: u16, row: u16) -> Option<String> {
+/// The wrapped-layout context (the per-line wrapped-row prefix map, the rendered
+/// lines and the link regions) comes from the SAME width-scoped cache the view drew
+/// from — the very map the draw windowed itself by, so the click and the paint
+/// resolve a screen row to a logical line through one shared answer rather than two
+/// models. The hit itself comes from the pure [`view::link_at`], whose three answers
+/// widen into four here by asking [`preview::has_openable_scheme`] of a hit — the same
+/// predicate the autolink parser applies and [`resume::opener_argv`] enforces, asked
+/// once, here, so the driver holds no gate of its own.
+///
+/// A pane with no previewed session at all is [`LinkClick::NoLink`]: there is no
+/// transcript to have hit, which is a genuine absence rather than an abstention.
+fn resolve_link_click(app: &mut App, col: u16, row: u16) -> LinkClick {
     let has_banner = view::preview_banner(app).is_some();
     let (_, transcript) = view::preview_split(app.preview_rect, has_banner);
-    let (row_prefix, regions) = app.preview_hit_context(transcript.width);
-    view::link_at(
-        col,
-        row,
-        transcript,
-        app.preview_scroll,
-        &row_prefix,
-        &regions,
-    )
-    .map(str::to_string)
+    // Read before the borrow below: the hit context borrows `app` for as long as its
+    // lines are in hand, and the offset is a plain `Copy` field.
+    let scroll = app.preview_scroll;
+    let Some((row_prefix, lines, regions)) = app.preview_hit_context(transcript.width) else {
+        return LinkClick::NoLink;
+    };
+    match view::link_at(col, row, transcript, scroll, row_prefix, lines, regions) {
+        view::LinkProbe::NoLink => LinkClick::NoLink,
+        view::LinkProbe::Unresolvable => LinkClick::Unresolvable,
+        view::LinkProbe::Hit(url) if preview::has_openable_scheme(url) => {
+            LinkClick::Opening(url.to_string())
+        }
+        view::LinkProbe::Hit(url) => LinkClick::RefusedScheme(url.to_string()),
+    }
+}
+
+/// Prefix of the status a link click reports itself with, so the message names the
+/// url that is being handed to the opener rather than only that something happened.
+///
+/// It is what makes a MISSED hit distinguishable from a FAILED opener.
+/// [`resume::open_url`] nulls every child stdio and swallows each error, so "nothing
+/// opened" carries no information on its own: it is equally a click that resolved no
+/// link and a browser that never launched. With this, the status line separates them —
+/// a message with no browser is the opener's fault, no message at all means the click
+/// never reached a link (or never reached the handler, the terminal having consumed
+/// the `Down(Left)` itself).
+const LINK_OPENING_PREFIX: &str = "opening ";
+
+/// The two halves of the status a link click reports when it hit a link it will NOT
+/// open, wrapped around the url so the reader sees which link and why.
+///
+/// snapback opens `http`/`https` only ([`preview::has_openable_scheme`] — the rule
+/// the autolink parser already applies, and the gate [`resume::opener_argv`] enforces).
+/// A `[label](url)` target, though, is authored by the transcript and is scheme-checked
+/// nowhere on the way in, so a label CAN render underlined over a url the opener will
+/// refuse. This message is what stops that from being SILENT. A rendered, clickable
+/// affordance that quietly does nothing is exactly the indistinguishable silence this
+/// hit-test exists to remove, and re-creating it here would trade one unreadable state
+/// for another.
+const LINK_REFUSED_PREFIX: &str = "not opening ";
+/// The other half of the refusal (see [`LINK_REFUSED_PREFIX`]): it names the rule, so
+/// the reader learns the link is unreachable from snapback rather than broken.
+const LINK_REFUSED_SUFFIX: &str = " - only http/https links open";
+
+/// The status a click reports when the hit-test ABSTAINED — the line it landed on was
+/// too large to probe within `view`'s budget, so WHICH link it hit is unknown.
+///
+/// Worded to claim only what is actually known, which rules out both easier sentences.
+/// It is NOT "no link here": abstaining implies at least one rendered link region on
+/// that line, since a line with none costs nothing and is always within budget. It is
+/// NOT "this link is broken" either: the url was never resolved, so nothing is known
+/// about it — not even that the pointer was on it rather than on the prose beside it.
+/// What IS known is that snapback could not tell, and why, and naming the line as the
+/// cause is what stops the reader from blaming the link, the browser, or their aim.
+///
+/// It carries no url for the same reason: printing one would require having chosen a
+/// region, which is precisely the work that was refused.
+///
+/// STICKY, like every refusal (PATTERNS §11) — and for the reason this whole branch
+/// exists: a rendered, underlined affordance that does nothing must say so, and a
+/// message that expired unread would leave the silence in place. Should a later reader
+/// decide the over-budget case is better off SILENT, that is a one-line change to the
+/// [`LinkClick::Unresolvable`] arm of [`note_link_click`] and nothing else — the
+/// mapping lives in exactly one place so the decision stays reversible.
+const LINK_UNRESOLVED: &str = "cannot tell which link that is - this line is too big to hit-test";
+
+/// Give a resolved [`LinkClick`] its status-line treatment. The ONE place that mapping
+/// lives, so each outcome's stickiness is decided once and is re-readable as a table.
+/// Terminal- and process-free, so it is unit-testable across all four.
+///
+/// A click that RESOLVED anything is an ACTIONABLE input, not a notification: the user
+/// aimed at something and either it is about to happen or it is refused, exactly as for
+/// an actionable keypress. So it may clear whatever the status line held and state its
+/// own outcome — which is also what keeps the diagnostic above SOUND. If a pending
+/// sticky refusal could suppress the message, "no status" would stop implying "no hit"
+/// and the status line would answer neither question.
+///
+/// [`LinkClick::NoLink`] writes NOTHING. It is a no-op — no scroll, no selection move,
+/// no url — and a no-op must not wipe a refusal the reader has not read yet. That
+/// asymmetry is the whole resolution of the tension between the two rules: the keypress
+/// protocol says a transient message must not evict a sticky one, and it is honoured
+/// here because a miss never sets one, while the other three are not mere transient
+/// notifications at all.
+///
+/// The other three split by what the reader must do about them, per the status-line
+/// ownership rule:
+///
+/// - [`Opening`](LinkClick::Opening) is a confirmation — something the user asked for
+///   is under way — so it is TRANSIENT and expires after `STATUS_DWELL_TICKS` rather
+///   than squatting on the keymap row. Whether the browser actually came up is
+///   something only the user can see; `open_url` is fire-and-forget and has no answer
+///   to report back.
+/// - [`RefusedScheme`](LinkClick::RefusedScheme) is an outcome the reader may have to
+///   act on (the link is unreachable from snapback, and only a message says so), so it
+///   is STICKY like every other refusal and waits for the next actionable keypress.
+/// - [`Unresolvable`](LinkClick::Unresolvable) is STICKY for the same reason and one
+///   more: it is the ONLY signal that an underlined label the reader clicked did
+///   nothing on purpose. See [`LINK_UNRESOLVED`] for the wording, and for why turning
+///   this arm back into silence is deliberately a one-line change.
+fn note_link_click(app: &mut App, click: &LinkClick) {
+    match click {
+        LinkClick::NoLink => {}
+        LinkClick::Opening(url) => app.set_status_transient(format!("{LINK_OPENING_PREFIX}{url}")),
+        LinkClick::RefusedScheme(url) => {
+            app.set_status(format!("{LINK_REFUSED_PREFIX}{url}{LINK_REFUSED_SUFFIX}"));
+        }
+        LinkClick::Unresolvable => app.set_status(LINK_UNRESOLVED),
+    }
 }
 
 /// Open the url of a rendered preview link under a left-click at screen
 /// `(col, row)`, if any.
 ///
-/// Thin driver over [`link_under_pointer`]: hands a hit to the fire-and-forget,
-/// off-thread [`resume::open_url`]. A click that misses every link is a no-op.
-/// Fails soft end to end — a bad url or missing opener never crashes the board.
+/// The IMPURE end of PATTERNS §3's split, and deliberately the thinnest thing that can
+/// still be called a driver: decide ([`resolve_link_click`]), say
+/// ([`note_link_click`]), then hand exactly one variant to the fire-and-forget,
+/// off-thread [`resume::open_url`]. Every decision above it is pinned directly; the
+/// spawn is the ONE statement in the path a test cannot assert, which is the point of
+/// keeping it alone here. A click that resolved no link, one snapback will not open, or
+/// one the hit-test abstained from spawns nothing.
+///
+/// The status is written BEFORE the spawn, so the board has the message whatever the
+/// opener does with it. Fails soft end to end — a bad url or missing opener never
+/// crashes the board.
 fn open_link_under_pointer(app: &mut App, col: u16, row: u16) {
-    if let Some(url) = link_under_pointer(app, col, row) {
+    let click = resolve_link_click(app, col, row);
+    note_link_click(app, &click);
+    if let LinkClick::Opening(url) = click {
         resume::open_url(&url);
     }
 }
@@ -3371,6 +3538,11 @@ mod tests {
     /// The url behind `link_session`'s one markdown link.
     const LINK_URL: &str = "https://example.com/page";
 
+    /// A url a transcript can author in a `[label](url)` link and snapback will NOT
+    /// open. A bracket target is scheme-checked nowhere on the way in, so this is the
+    /// shape that reaches the opener verbatim unless something refuses it.
+    const REFUSED_URL: &str = "file:///etc/passwd";
+
     /// Filler lines ahead of that link. Enough that the rendered transcript is
     /// TALLER than `BOARD`'s preview pane, so the default bottom anchor resolves
     /// to a NON-ZERO scroll offset — the hit-test has to survive a scrolled pane,
@@ -3393,18 +3565,16 @@ mod tests {
         dir
     }
 
-    /// A session whose transcript overflows the preview pane and ends in ONE
-    /// markdown link, written to a real file under `dir`.
+    /// A session carrying ONE user turn whose message body is `body`, written to a
+    /// real file under `dir`.
     ///
     /// A real file, not a synthetic `LinkRegion`: the hit-test resolves clicks
     /// through the SAME width-scoped preview cache the view draws from, so only a
-    /// real render can prove the two agree about where the link landed.
-    fn link_session(dir: &Path) -> Session {
+    /// real render can prove the two agree about where the link landed. Everything but
+    /// the body is fixed, so two fixtures built through here differ in exactly what
+    /// their bodies differ in.
+    fn link_fixture(dir: &Path, body: &str) -> Session {
         let file = dir.join("sess-link.jsonl");
-        let mut body: String = (1..=LINK_FILLER_LINES)
-            .map(|i| format!("filler line {i}\\n"))
-            .collect();
-        body.push_str(&format!("open [docs]({LINK_URL}) here"));
         let jsonl = format!(
             concat!(
                 r#"{{"type":"user","sessionId":"sess-link","cwd":"/tmp","#,
@@ -3433,11 +3603,78 @@ mod tests {
         }
     }
 
+    /// A session whose transcript overflows the preview pane and ends in ONE
+    /// markdown link.
+    ///
+    /// The link TARGET is a parameter so the same real render can be driven with a url
+    /// the opener accepts and with one it refuses. Only the url varies — the label, the
+    /// filler and the session id stay put — so a difference in outcome between two such
+    /// sessions can only have come from the scheme.
+    fn link_session(dir: &Path, url: &str) -> Session {
+        let mut body: String = (1..=LINK_FILLER_LINES)
+            .map(|i| format!("filler line {i}\\n"))
+            .collect();
+        body.push_str(&format!("open [docs]({url}) here"));
+        link_fixture(dir, &body)
+    }
+
+    /// How many markdown links the OVER-BUDGET fixture crowds onto ONE logical line.
+    ///
+    /// The hit-test's budget is a PRODUCT — the clicked line's SIZE times the candidate
+    /// regions on it — so a fixture has to move BOTH factors to cross it and neither
+    /// number means anything alone. That is also what makes a crossing fixture cheap
+    /// enough to render in a unit test: each link here draws as a one-character label
+    /// plus a space, so N of them both make the line about `2N` long AND put N
+    /// candidates on it. The cost therefore grows as N SQUARED, and a few hundred links
+    /// buy a product in the hundreds of thousands.
+    ///
+    /// Deliberately stated without the budget's UNIT (`view` owns whether that size is
+    /// counted in wrapped rows or in bytes) and without the pane's exact width, because
+    /// the crossing is never ASSUMED here: the test runs the same click against
+    /// [`CROWDED_CONTROL_LINKS`] first and requires an ordinary hit. Retune the budget,
+    /// its unit, the board or this number and that premise goes red, rather than the
+    /// case quietly becoming vacuous.
+    const CROWDED_LINE_LINKS: usize = 400;
+
+    /// The control count for [`CROWDED_LINE_LINKS`]: the same fixture shape, comfortably
+    /// WITHIN the budget, so the two runs differ in the crossing and nothing else.
+    const CROWDED_CONTROL_LINKS: usize = 4;
+
+    /// A session whose whole transcript is ONE logical line carrying `links` markdown
+    /// links — all the same url, so only their COUNT varies between runs.
+    ///
+    /// No filler: the crowded line must be the line a click lands on, and a transcript
+    /// that is nothing else cannot resolve the click to some other row by accident.
+    fn crowded_link_session(dir: &Path, links: usize) -> Session {
+        let body = vec![format!("[x]({LINK_URL})"); links].join(" ");
+        link_fixture(dir, &body)
+    }
+
+    /// An app over [`crowded_link_session`], in `App`'s DEFAULT scroll state.
+    fn crowded_link_app(dir: &Path, links: usize) -> App {
+        let app = App::new(
+            vec![crowded_link_session(dir, links)],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
+        assert_eq!(app.selected.as_deref(), Some("sess-link"));
+        app
+    }
+
     /// An app over [`link_session`], optionally joined to a REPORTED agent in
     /// `state`.
     /// Left in `App`'s DEFAULT scroll state — bottom-anchored, as a user sees it.
     fn link_app(dir: &Path, agent_state: Option<&str>) -> App {
-        let mut app = App::new(vec![link_session(dir)], Scope::All, PathBuf::from("/tmp"));
+        link_app_to(dir, agent_state, LINK_URL)
+    }
+
+    /// [`link_app`] over an arbitrary link target (see [`link_session`]).
+    fn link_app_to(dir: &Path, agent_state: Option<&str>, url: &str) -> App {
+        let mut app = App::new(
+            vec![link_session(dir, url)],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
         if let Some(state) = agent_state {
             let mut reported = HashMap::new();
             reported.insert(
@@ -3491,6 +3728,37 @@ mod tests {
         )
     }
 
+    /// [`drawn_link_cell`], restricted to a cell the SPLITTER does not claim.
+    ///
+    /// The crowded fixture opens its line with a link, so its first underlined cell is
+    /// at the transcript's column 0 — one column right of the seam, and therefore
+    /// inside `SPLITTER_TOLERANCE`. `handle_mouse` tries the seam-drag arm FIRST by
+    /// design (a click on the border resizes rather than opening a link), so a cell
+    /// there never reaches the link arm at all: an end-to-end click on one would
+    /// measure the splitter and report it as a silent hit-test.
+    ///
+    /// It asks the production [`on_splitter`] rather than restating the tolerance, so
+    /// a retune of the seam's width moves this with it instead of leaving a test that
+    /// aims at a column the splitter has since claimed.
+    fn drawn_link_cell_clear_of_the_seam(
+        buffer: &ratatui::buffer::Buffer,
+        list: Rect,
+        preview: Rect,
+    ) -> (u16, u16) {
+        let found = (preview.y..preview.bottom())
+            .flat_map(|y| (preview.x..preview.right()).map(move |x| (x, y)))
+            .find(|&(x, y)| {
+                !on_splitter(x, y, list, preview)
+                    && buffer
+                        .cell((x, y))
+                        .is_some_and(|c| c.modifier.contains(Modifier::UNDERLINED))
+            });
+        found.expect(
+            "the fixture must draw a link label clear of the splitter seam, \
+             or an end-to-end click measures the splitter instead of the hit-test",
+        )
+    }
+
     #[test]
     fn a_click_on_a_drawn_link_opens_it_for_a_banner_less_session() {
         // No banner: the transcript owns the pane's whole inner rect, and the
@@ -3509,8 +3777,8 @@ mod tests {
 
         let (col, row) = drawn_link_cell(&buffer, app.preview_rect);
         assert_eq!(
-            link_under_pointer(&mut app, col, row).as_deref(),
-            Some(LINK_URL),
+            resolve_link_click(&mut app, col, row),
+            LinkClick::Opening(LINK_URL.to_string()),
             "a click on the cell the link was DRAWN on must resolve to its url"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -3535,19 +3803,99 @@ mod tests {
 
         let (col, row) = drawn_link_cell(&buffer, app.preview_rect);
         assert_eq!(
-            link_under_pointer(&mut app, col, row).as_deref(),
-            Some(LINK_URL),
+            resolve_link_click(&mut app, col, row),
+            LinkClick::Opening(LINK_URL.to_string()),
             "a click on the cell the link was DRAWN on must resolve to its url \
              even though the pinned banner pushed the transcript down a row"
         );
         // Precision, not just presence: the row ABOVE the label is a different
-        // transcript line, so it must NOT resolve to the same link.
-        assert_ne!(
-            link_under_pointer(&mut app, col, row - 1).as_deref(),
-            Some(LINK_URL),
+        // transcript line. `NoLink` and not merely "not this url" — a real render of
+        // an ordinary prose line is the one place the NO-LINK outcome can be pinned
+        // against something actually drawn, and it must not come back as the
+        // abstention either.
+        assert_eq!(
+            resolve_link_click(&mut app, col, row - 1),
+            LinkClick::NoLink,
             "the row above the label is another transcript line, not the link"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every [`LinkClick`] but the no-op reports itself, each with the stickiness its
+    /// outcome earns. The ONE mapping, asserted as the table it is.
+    ///
+    /// The silent arm is what makes a MISSED HIT tellable from a FAILED OPENER.
+    /// `resume::open_url` nulls all child stdio and swallows every error, so with no
+    /// status a hit and a dead browser are the same observation — "no browser
+    /// appeared". With it, a message and no browser indicts the opener, and NO MESSAGE
+    /// means the click resolved no link (or never reached the handler at all). That
+    /// second reading is only sound while every OTHER outcome ALWAYS produces a
+    /// visible status, which is why each is allowed to overwrite a pending sticky
+    /// refusal: were they suppressible, silence would stop meaning "no link" and the
+    /// status line would answer neither question.
+    ///
+    /// The converse is the keypress protocol, kept intact: `NoLink` is a no-op — no
+    /// scroll, no selection move, no url — so it must not evict a refusal the reader
+    /// has not read yet.
+    ///
+    /// The three speaking arms run in sequence against the SAME app on purpose: each
+    /// starts from the message the one before it left, so what is pinned is that each
+    /// can displace the last, not merely that it can write to an empty line.
+    #[test]
+    fn note_link_click_speaks_for_every_outcome_but_the_no_op() {
+        const REFUSAL: &str = "a refusal the reader has not read yet";
+        let mut app = app_with("sess-link-status", None);
+        app.set_status(REFUSAL);
+
+        note_link_click(&mut app, &LinkClick::NoLink);
+        assert_eq!(
+            app.status.as_deref(),
+            Some(REFUSAL),
+            "a click that hit nothing is a no-op and must not wipe an unread refusal"
+        );
+        assert_eq!(
+            app.status_ttl, None,
+            "nor may a no-op start a dwell on someone else's sticky message"
+        );
+
+        note_link_click(&mut app, &LinkClick::Opening(LINK_URL.to_string()));
+        assert_eq!(
+            app.status.as_deref(),
+            Some(format!("{LINK_OPENING_PREFIX}{LINK_URL}").as_str()),
+            "a hit must ALWAYS show the url it hands to the opener, whatever the \
+             status line held before it"
+        );
+        assert_eq!(
+            app.status_ttl,
+            Some(STATUS_DWELL_TICKS),
+            "and it is a confirmation, so it dwells rather than squatting on the \
+             keymap row"
+        );
+
+        note_link_click(&mut app, &LinkClick::RefusedScheme(REFUSED_URL.to_string()));
+        assert_eq!(
+            app.status.as_deref(),
+            Some(format!("{LINK_REFUSED_PREFIX}{REFUSED_URL}{LINK_REFUSED_SUFFIX}").as_str()),
+            "a refused scheme must name the url and the rule, or an underlined label \
+             that does nothing is silent again"
+        );
+        assert_eq!(
+            app.status_ttl, None,
+            "and a refusal is sticky — it waits for the next actionable keypress"
+        );
+
+        note_link_click(&mut app, &LinkClick::Unresolvable);
+        assert_eq!(
+            app.status.as_deref(),
+            Some(LINK_UNRESOLVED),
+            "an abstention is the ONLY signal that an underlined label the reader \
+             clicked did nothing on purpose, so it must speak too"
+        );
+        assert_eq!(
+            app.status_ttl, None,
+            "and it is a refusal, not a confirmation: a message that expired unread \
+             would leave exactly the silence it exists to break"
+        );
     }
 
     #[test]
@@ -3556,10 +3904,12 @@ mod tests {
         // panic when the pointer is not over a link. The synthetic session's file
         // does not exist, so the preview has no link regions — the click resolves
         // to nothing.
+        const REFUSAL: &str = "a refusal the reader has not read yet";
         let mut app = app_with("s", None);
         let (list, preview) = split_panes();
         app.list_rect = list;
         app.preview_rect = preview;
+        app.set_status(REFUSAL);
 
         // Well inside the preview body (col 70 of the 50..90 preview), not the seam.
         wheel(&mut app, MouseEventKind::Down(MouseButton::Left), 70, 10);
@@ -3571,6 +3921,166 @@ mod tests {
             app.modal.is_none(),
             "a preview-body click must not open the overlay"
         );
+        // The miss half of the wiring, asserted from the same end the user sees:
+        // a real `Down(Left)` through `handle_event`, not a direct call to the
+        // decision fn. A no-op must leave an unread refusal exactly where it was.
+        assert_eq!(
+            app.status.as_deref(),
+            Some(REFUSAL),
+            "a click that hit nothing must not wipe an unread refusal"
+        );
+        assert_eq!(
+            app.status_ttl, None,
+            "nor start a dwell on someone else's sticky message"
+        );
+    }
+
+    /// The HIT half of the wiring, END TO END through a real `Down(Left)` event.
+    ///
+    /// `note_link_click_speaks_for_every_outcome_but_the_no_op` pins the MAPPING — it
+    /// calls `note_link_click` directly — which leaves the CALL SITE uncovered:
+    /// deleting `note_link_click(...)` out of the driver left that test, and the whole
+    /// suite, green. This drives the mouse event instead, so the chain from
+    /// `handle_event` through `resolve_link_click` to the status line is what is
+    /// asserted.
+    ///
+    /// It clicks a REFUSED scheme on purpose, and that is not a compromise: the route
+    /// through `handle_event` reaches `resume::open_url`, and an accepted url there
+    /// would launch a real browser on whoever ran the suite. A refused one exercises
+    /// exactly the same wiring — `link_at` resolves it, `note_link_click` speaks for
+    /// it — while the opener gets nothing. The ACCEPTED url is asserted one level
+    /// down, in the test below, where no spawn can happen.
+    #[test]
+    fn a_click_on_a_link_snapback_will_not_open_says_so_and_opens_nothing() {
+        let dir = unique_temp_dir("link-refused");
+        let mut app = link_app_to(&dir, None, REFUSED_URL);
+        let buffer = render_board(&mut app);
+        let (col, row) = drawn_link_cell(&buffer, app.preview_rect);
+        // The premise: the label IS drawn, underlined, and the click DOES resolve to
+        // the refused url. Without this the test could pass on a link that was never
+        // rendered at all, and prove nothing about the refusal.
+        assert_eq!(
+            resolve_link_click(&mut app, col, row),
+            LinkClick::RefusedScheme(REFUSED_URL.to_string()),
+            "a non-http target still renders and still records a clickable region"
+        );
+
+        wheel(&mut app, MouseEventKind::Down(MouseButton::Left), col, row);
+        assert_eq!(
+            app.status.as_deref(),
+            Some(format!("{LINK_REFUSED_PREFIX}{REFUSED_URL}{LINK_REFUSED_SUFFIX}").as_str()),
+            "an underlined label that does nothing is the silence this whole \
+             hit-test exists to remove, so a refusal must SAY which url and why"
+        );
+        assert_eq!(
+            app.status_ttl, None,
+            "and a refusal is sticky, not a confirmation that dwells"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same wiring for a url the opener DOES accept, run one level DOWN from
+    /// `handle_event` — `resolve_link_click` then `note_link_click`, which is the
+    /// driver minus its single spawn, so no browser is ever launched by the test suite
+    /// (PATTERNS: test the pure helper, not the impure driver). The url inside the
+    /// `Opening` it returns IS what `open_link_under_pointer` hands `resume::open_url`,
+    /// so this pins both what is said and what is opened.
+    #[test]
+    fn a_click_on_a_drawn_http_link_announces_the_url_it_hands_the_opener() {
+        let dir = unique_temp_dir("link-opening");
+        let mut app = link_app(&dir, None);
+        let buffer = render_board(&mut app);
+        let (col, row) = drawn_link_cell(&buffer, app.preview_rect);
+
+        let click = resolve_link_click(&mut app, col, row);
+        assert_eq!(
+            click,
+            LinkClick::Opening(LINK_URL.to_string()),
+            "an http(s) hit is the url handed to the opener"
+        );
+        note_link_click(&mut app, &click);
+        assert_eq!(
+            app.status.as_deref(),
+            Some(format!("{LINK_OPENING_PREFIX}{LINK_URL}").as_str()),
+            "and the click must name it, or a dead opener is indistinguishable \
+             from a missed hit"
+        );
+        assert_eq!(
+            app.status_ttl,
+            Some(STATUS_DWELL_TICKS),
+            "it is a confirmation, so it dwells rather than squatting on the keymap row"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The FOURTH outcome: a click on a line too large to hit-test resolves to
+    /// `Unresolvable` and SAYS so, rather than falling silent.
+    ///
+    /// The silence is the bug. An over-budget line still has its links RENDERED and
+    /// UNDERLINED, so the reader clicks an affordance that is plainly there and gets
+    /// nothing back — the very state the hit-test exists to remove, re-created one
+    /// level up. The abstention itself is right (a guessed hit hands a browser a url
+    /// nobody aimed at); only its muteness was wrong.
+    ///
+    /// The CONTROL run is the whole proof. Without it, `Unresolvable` here could just
+    /// as well mean the fixture failed to render, or that clicks on this shape never
+    /// resolve at all. The same click on the same shape with [`CROWDED_CONTROL_LINKS`]
+    /// links is an ordinary `Opening`, so the only difference between the two runs is
+    /// the budget crossing — and this cannot pass vacuously if the fixture stops
+    /// crossing it.
+    ///
+    /// The second half drives a REAL `Down(Left)` through `handle_event`, because the
+    /// decision being right proves nothing if the driver never asks for it. No browser
+    /// can be launched: `Unresolvable` is precisely the outcome that spawns nothing.
+    #[test]
+    fn a_click_on_a_line_too_large_to_hit_test_says_so_instead_of_falling_silent() {
+        let control_dir = unique_temp_dir("link-control");
+        let mut control = crowded_link_app(&control_dir, CROWDED_CONTROL_LINKS);
+        let control_buffer = render_board(&mut control);
+        let (control_col, control_row) = drawn_link_cell_clear_of_the_seam(
+            &control_buffer,
+            control.list_rect,
+            control.preview_rect,
+        );
+        assert_eq!(
+            resolve_link_click(&mut control, control_col, control_row),
+            LinkClick::Opening(LINK_URL.to_string()),
+            "the same fixture shape UNDER the budget must be an ordinary hit, or the \
+             run below says nothing about the budget"
+        );
+        let _ = std::fs::remove_dir_all(&control_dir);
+
+        let dir = unique_temp_dir("link-crowded");
+        let mut app = crowded_link_app(&dir, CROWDED_LINE_LINKS);
+        let buffer = render_board(&mut app);
+        let (col, row) =
+            drawn_link_cell_clear_of_the_seam(&buffer, app.list_rect, app.preview_rect);
+        assert_eq!(
+            resolve_link_click(&mut app, col, row),
+            LinkClick::Unresolvable,
+            "past the budget the click must resolve to the ABSTENTION and not to \
+             `NoLink` — the control run just hit a link on this very shape, so \
+             claiming there is none would be a false statement about the transcript"
+        );
+
+        // A sticky message the reader has not read yet, so the assertion below also
+        // shows the abstention is actionable enough to displace one.
+        const REFUSAL: &str = "a refusal the reader has not read yet";
+        app.set_status(REFUSAL);
+        wheel(&mut app, MouseEventKind::Down(MouseButton::Left), col, row);
+        assert_eq!(
+            app.status.as_deref(),
+            Some(LINK_UNRESOLVED),
+            "an underlined label that does nothing must SAY that snapback could not \
+             tell which link it was, or the click is indistinguishable from a dead \
+             opener and from a click that landed on nothing"
+        );
+        assert_eq!(
+            app.status_ttl, None,
+            "and it is a refusal, not a confirmation: a message that dwelled away \
+             unread would leave exactly the silence it exists to break"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

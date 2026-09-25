@@ -18,16 +18,18 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use ratatui::buffer::{Buffer, Cell};
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
-    ScrollbarState, Wrap,
+    ScrollbarState, Widget, Wrap,
 };
 use ratatui::Frame;
 use time::OffsetDateTime;
 use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::agents::{self, AgentActivity, ReportedAgent};
 use crate::search::SearchMode;
@@ -2184,22 +2186,315 @@ fn visual_to_content(row_prefix: &[usize], visual_row: usize) -> Option<(usize, 
     Some((content_row, sub_row))
 }
 
-/// The url of a preview link under a mouse click at screen `(col, row)`, or `None`.
+/// The modifier a link probe re-styles a candidate region with before rendering it,
+/// so the cells that region PAINTED can be told from every other cell on the line.
+///
+/// `CROSSED_OUT` because nothing in this crate styles with it — the preview's
+/// vocabulary is `DIM`/`BOLD`/`UNDERLINED`/`REVERSED`/`ITALIC` — so a probe cell
+/// carrying it can only have come from the region that was marked. It is composed
+/// ONTO each span's existing style, never replacing it, so the marked line differs
+/// from the plain one in this one bit and nothing else. The probe buffer is
+/// in-memory and dropped, so this attribute never reaches a terminal.
+const LINK_PROBE_MARKER: Modifier = Modifier::CROSSED_OUT;
+
+/// The symbol a probe buffer is pre-filled with, so a cell the renderer never wrote
+/// is distinguishable from one it wrote a blank into.
+///
+/// NUL is the choice because `Paragraph` SKIPS every zero-width grapheme, so it can
+/// never paint one — a NUL left in a probe buffer is therefore a cell nothing was
+/// drawn to. That is what identifies the RIGHT half of a double-width glyph, which
+/// ratatui paints by styling the LEFT cell alone: without it a click on the second
+/// column of a CJK or emoji label would read an untouched cell and miss a link that
+/// is plainly under the pointer.
+const LINK_PROBE_UNWRITTEN: &str = "\u{0}";
+
+/// The display width of a DOUBLE-WIDTH glyph, and the ONLY left-neighbour width under
+/// which an unwritten probe cell belongs to the glyph beside it.
+///
+/// An unwritten cell has two possible causes and they demand opposite answers: the
+/// right half of a wide glyph (part of what was painted) and a column the renderer
+/// never reached at all (painted by nothing). Only a left neighbour measuring this
+/// wide can account for the first, so it is what separates them.
+const WIDE_GLYPH_COLUMNS: usize = 2;
+
+/// The most TEXT one click may spend probing which link it landed on: the BYTES of
+/// the logical line it resolved to, multiplied by the candidate regions on that line.
+///
+/// [`link_at`] buys exactness by RE-RENDERING ([`region_paints_cell`]), and that
+/// render is not free. A candidate walks the line's graphemes to find the region's
+/// chars ([`region_char_positions`]), re-styles and COPIES the line end to end
+/// ([`highlight_matched_spans`]), then word-wraps that copy end to end again to check
+/// the row count — all of it over the WHOLE logical line, however small the clicked
+/// cell is. A MISS pays that for each region on the line, since nothing short-circuits
+/// an answer that never comes. So one click costs `candidates * line_bytes` of
+/// reading, and THAT PRODUCT is what this bounds.
+///
+/// The product, not either factor, because each cap alone admits the case the other
+/// exists to stop. A cap on LENGTH alone still lets a line sitting just under it carry
+/// thousands of links — a `[a](u)` needs only a few bytes — and a cap on the candidate
+/// COUNT alone still lets ONE link sit inside a megabyte-long minified blob.
+///
+/// BYTES, and not the wrapped ROWS [`link_at`] already holds free off the row-prefix
+/// map, which is the tempting measure and the wrong one. Rows count what the wrapper
+/// PAINTS; the probe pays for what it READS, and a grapheme of zero display width is
+/// read without ever being painted. A line of tens of MB of ZWSP or combining marks
+/// wraps to ONE row, so a row budget would price that click at 1 and then permit
+/// thousands of candidates against it — each still copying and re-wrapping every one
+/// of those megabytes (`a_zero_width_line_costs_bytes_the_wrapped_rows_cannot_see`
+/// pins the gap). Bytes SUBSUME rows, since a non-empty line never wraps to more rows
+/// than it has bytes.
+///
+/// What bytes do NOT subsume on their own is the SPAN count, and a candidate is paid
+/// for in BOTH: [`highlight_matched_spans`] emits at least one span per input span and
+/// deliberately KEEPS the empty ones, which carry no bytes to charge for. The byte
+/// price survives that. A NON-EMPTY span costs at least one byte, so those number at
+/// most `bytes`; the EMPTY ones are bounded per line, because a block construct emits
+/// O(1) of them per line and so cannot grow them with the line's length. What would
+/// actually defeat a byte price is an UNBOUNDED number of empty spans — a line of
+/// thousands measures ZERO bytes and buys unlimited candidates against it — and
+/// keeping that from arising through an inline form is
+/// `store::preview::parse_inline_collect`'s obligation, discharged there, not here.
+///
+/// A line's spans are therefore `O(bytes) + O(1)`, one candidate costs `O(bytes)`, and
+/// `candidates * (bytes + spans)` stays `O(candidates * bytes)` — the product measured
+/// here. Stated as a BOUND rather than as a list of which spans happen to be non-empty,
+/// deliberately: a bound still holds when someone adds a parser arm, whereas an
+/// enumeration silently rots the moment one is added and leaves the budget resting on a
+/// claim that stopped being true without anyone editing this comment. So the obligation
+/// a new arm inherits is not "emit no empty span" — it may add another O(1)-per-line
+/// empty freely. It is: do not emit empty spans in a count that grows with the input.
+/// Those span shapes are also not this hit-test's to change — it prices them; it does
+/// not own them. `markdown_body_lines_collect_bounds_a_lines_spans_against_its_bytes`
+/// pins the bound across them.
+///
+/// 131,072 (128 KiB) is chosen for HEADROOM, not tightness: a line of ordinary prose
+/// or source runs ORDERS OF MAGNITUDE under it. Measured multiples are deliberately
+/// not stated here — they drift with the corpus, and the longest line to hand sits in
+/// a file this very commit edits.
+///
+/// PAST the budget the hit-test ABSTAINS: it answers [`LinkProbe::Unresolvable`]
+/// rather than a guessed url, the same direction [`region_paints_cell`] takes when it
+/// cannot reproduce a row count, and for the same reason — a wrong hit gives a browser
+/// an unintended url, while a missed one costs a click. That direction is also what
+/// makes the bound safe by construction: it takes effect as an early abstention BEFORE
+/// any region is consulted, so it can turn a hit into an abstention but not a non-hit
+/// into a hit.
+const LINK_PROBE_BYTE_BUDGET: usize = 131_072;
+
+/// The text a probe of `line` must read end to end, in BYTES — the unit
+/// [`LINK_PROBE_BYTE_BUDGET`] is spent in.
+///
+/// Summed over the SPANS rather than over a joined string, because a `Line` never
+/// holds one: each `Cow<str>::len` is a field read, so measuring a line walks its
+/// spans (a handful) and never its text. Bytes rather than chars or graphemes is slack
+/// in the safe direction — it can only over-charge a probe, never under-charge one.
+/// Pure and terminal-free.
+fn line_probe_bytes(line: &Line<'_>) -> usize {
+    line.spans.iter().map(|s| s.content.len()).sum()
+}
+
+/// Can a click that resolved to a line of `line_bytes` carrying `candidates` regions
+/// be answered within [`LINK_PROBE_BYTE_BUDGET`]?
+///
+/// Saturating, so an absurd pair cannot wrap its product back under the budget and buy
+/// itself exactly the work the budget exists to refuse.
+/// Pure and terminal-free.
+fn probe_within_budget(line_bytes: usize, candidates: usize) -> bool {
+    line_bytes.saturating_mul(candidates) <= LINK_PROBE_BYTE_BUDGET
+}
+
+/// What a click inside the preview transcript resolved to — the whole answer
+/// [`link_at`] can give, in the three shapes it can honestly take.
+///
+/// It exists because `Option<&str>` could not say the third one. A `None` meant BOTH
+/// "the click landed on text carrying no link" and "the click landed on a line too
+/// large to hit-test, so which link — if any — is unknown", and those are different
+/// events that owe the reader different answers. Collapsed together, the second one
+/// came out as SILENCE: a label that IS rendered and IS underlined, clicked, and
+/// nothing said. That is the same indistinguishable silence the hit-test exists to
+/// remove, so the distinction has to survive as far as the status line.
+///
+/// [`Unresolvable`](Self::Unresolvable) is never vacuous, which is what makes it worth
+/// telling the reader about: the budget bounds `line_bytes * candidates`, and a line
+/// with NO candidates has a product of zero, so it is always within budget. Abstaining
+/// therefore IMPLIES at least one link region on that logical line. The click may not
+/// have been aimed at it — but there is a rendered link there, and "no link here" would
+/// be a claim this probe did not make.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinkProbe<'a> {
+    /// The click landed on a cell this url's region PAINTED.
+    Hit(&'a str),
+    /// The click resolved to a real cell carrying no link region.
+    NoLink,
+    /// The click's line exceeded [`LINK_PROBE_BYTE_BUDGET`], so the probe was never
+    /// spent and WHICH region was clicked is unknown — see the type doc for why that
+    /// is not the same as [`NoLink`](Self::NoLink).
+    Unresolvable,
+}
+
+/// The CHAR positions within `line`'s plain text whose grapheme clusters overlap the
+/// DISPLAY-column range `col_start..col_end` — a [`LinkRegion`]'s columns translated
+/// into the units [`highlight_matched_spans`] marks in.
+///
+/// Two accumulators, deliberately different, because they answer to two different
+/// authorities. The SPAN origin advances by each span's whole-string
+/// `unicode-width`, which is exactly how `store::preview` produced these columns in
+/// the first place (it sums one display width per rendered span). The offset WITHIN
+/// a span advances per grapheme cluster, because that is the finest unit a region
+/// boundary can honestly land on. Summing per-cluster widths is not the same
+/// function as measuring the unsplit span — `unicode-width` is a contextual fold —
+/// so using the per-cluster sum for the outer walk would drift from the coordinates
+/// the region was recorded in.
+///
+/// Whole clusters only: every char of an overlapping cluster is included, so a
+/// region boundary landing INSIDE a cluster widens outward instead of cutting it.
+/// That matters because a severed emoji measures differently from the same bytes
+/// unsplit, which would move where the wrapper breaks and make the probe describe a
+/// layout the pane never painted. It is the SECOND guard on that, not the only one —
+/// [`match_runs`] snaps a run out to cluster edges downstream regardless
+/// (`match_runs_snaps_a_partial_mark_out_to_the_whole_cluster` pins it) — but
+/// emitting whole clusters here keeps this fn's output meaningful on its own rather
+/// than only once something else has repaired it.
+/// Pure and terminal-free.
+fn region_char_positions(line: &Line<'_>, col_start: usize, col_end: usize) -> HashSet<usize> {
+    let mut chars: HashSet<usize> = HashSet::new();
+    let mut char_pos = 0usize;
+    let mut span_col = 0usize;
+    for span in &line.spans {
+        let mut col = span_col;
+        for cluster in span.content.graphemes(true) {
+            let cluster_chars = cluster.chars().count();
+            let cluster_cols = UnicodeWidthStr::width(cluster);
+            if col < col_end && col + cluster_cols > col_start {
+                chars.extend(char_pos..char_pos + cluster_chars);
+            }
+            char_pos += cluster_chars;
+            col += cluster_cols;
+        }
+        span_col += UnicodeWidthStr::width(span.content.as_ref());
+    }
+    chars
+}
+
+/// Did the [`LinkRegion`] at display columns `col_start..col_end` of `line` paint the
+/// cell at `(rel_col, sub_row)` when `line` was word-wrapped at `inner_width`?
+///
+/// This is the answer a character-packing formula could only approximate, and it is
+/// obtained by ASKING THE RENDERER rather than by modelling it. The region's
+/// graphemes are re-styled with [`LINK_PROBE_MARKER`], that one line is pushed
+/// through the SAME `Paragraph::wrap(Wrap { trim: false })` the pane paints with,
+/// into an in-memory [`Buffer`] `inner_width` wide, and the clicked cell is read
+/// back. A cell carrying the marker is a cell the region painted — wherever the
+/// wrapper chose to break, and whether or not the region straddles that break. No
+/// second wrapping model exists to drift from the first.
+///
+/// Re-styling is what makes the probe sound: [`highlight_matched_spans`] leaves the
+/// text BYTE-IDENTICAL and splits only at grapheme-cluster edges, so no glyph's
+/// width can move and the probe's wrap is the paint's wrap. `line_rows` — the height
+/// the map the pane WINDOWED BY gave this line — is the check on that claim: when
+/// the marked line does not measure to it, the probe describes some other layout, so
+/// this refuses instead of answering from it. That direction is chosen: a hit-test
+/// that guesses hands an unintended url to a browser, while one that abstains costs
+/// a click.
+///
+/// Only rows up to the clicked one are allocated. A wrap is a function of WIDTH
+/// alone, so a shorter buffer CLIPS the paint without moving a single break — the
+/// cost is the rows a click can actually reach, not the line's full extent.
+///
+/// The clicked cell is read back under TWO rules, and the second one is narrow on
+/// purpose. A cell carrying the marker is a hit outright. A cell the renderer left
+/// UNWRITTEN is a hit only when its LEFT neighbour is both marked AND
+/// [`WIDE_GLYPH_COLUMNS`] wide — because an unwritten cell is AMBIGUOUS, and the two
+/// things it can mean want opposite answers. `render_line` advances by each
+/// grapheme's display width and writes once per grapheme, so the second column of a
+/// double-width glyph is left untouched and IS part of the link. But `Paragraph` only
+/// `set_style`s its area — it never blanks a row's remainder — so every column right
+/// of a row's last painted glyph is untouched too, and is part of NOTHING. Without
+/// the width test those two are indistinguishable, and the blank column beside a link
+/// that ENDS a painted row resolves to that link's url: a click on empty space handing
+/// an unintended url to a browser. Measuring the neighbour admits the first case and
+/// refuses the second, so the probe abstains exactly where it cannot be sure.
+///
+/// Pure and terminal-free: the buffer never touches a backend.
+fn region_paints_cell(
+    line: &Line<'_>,
+    col_start: usize,
+    col_end: usize,
+    inner_width: u16,
+    line_rows: usize,
+    sub_row: usize,
+    rel_col: u16,
+) -> bool {
+    if inner_width == 0 || sub_row >= line_rows {
+        return false;
+    }
+    let marked = highlight_matched_spans(
+        line,
+        &region_char_positions(line, col_start, col_end),
+        LINK_PROBE_MARKER,
+    );
+    if wrapped_text_rows(std::slice::from_ref(&marked), inner_width) != line_rows {
+        return false;
+    }
+    let Ok(rows) = u16::try_from(sub_row + 1) else {
+        return false;
+    };
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: inner_width,
+        height: rows,
+    };
+    let mut buf = Buffer::filled(area, Cell::new(LINK_PROBE_UNWRITTEN));
+    Paragraph::new(Text::from(vec![marked]))
+        .wrap(Wrap { trim: false })
+        .render(area, &mut buf);
+    // The clicked row is the last one allocated; `Buffer::cell` answers `None` for a
+    // position outside the area, which is the "nothing was rendered here" case.
+    let y = rows - 1;
+    let marked_at = |x: u16| {
+        buf.cell((x, y))
+            .is_some_and(|c| c.modifier.contains(LINK_PROBE_MARKER))
+    };
+    if marked_at(rel_col) {
+        return true;
+    }
+    rel_col > 0
+        && buf
+            .cell((rel_col, y))
+            .is_some_and(|c| c.symbol() == LINK_PROBE_UNWRITTEN)
+        && buf.cell((rel_col - 1, y)).is_some_and(|c| {
+            c.modifier.contains(LINK_PROBE_MARKER)
+                && UnicodeWidthStr::width(c.symbol()) == WIDE_GLYPH_COLUMNS
+        })
+}
+
+/// What a mouse click at screen `(col, row)` resolved to inside the preview transcript
+/// — a url, no link, or an abstention (see [`LinkProbe`], which owns why the last two
+/// are not the same answer).
 ///
 /// `inner` is the preview pane's INNER rect (inside the borders), `scroll_offset`
 /// the resolved vertical offset in wrapped rows (`App::preview_scroll`), and
-/// `row_prefix` the whole transcript's per-line wrapped-row map — the SAME
-/// [`wrapped_row_prefix`] the pane windowed its draw by, read off the same
-/// width-scoped cache (`App::preview_hit_context`). The click is translated to
-/// content coordinates and matched against a [`LinkRegion`]: screen row -> wrapped
-/// visual row (via `scroll_offset`) -> `(content_row, sub_row)` -> content column. A
-/// region whose `col_start..col_end` on that row contains the content column yields
-/// its url.
+/// `row_prefix`, `lines` and `regions` the whole transcript's per-line wrapped-row
+/// map, its rendered lines and its clickable [`LinkRegion`]s — all three from the
+/// SAME width-scoped cache the pane drew from (`App::preview_hit_context`), so the
+/// hit-test and the paint can never describe different renders.
 ///
-/// Because a region spans the label's full content-column range, a link that
-/// SOFT-WRAPS across visual rows is hit on ANY of its wrapped segments for free
-/// (each segment's cells map back into the same content-column range) — no special
-/// case.
+/// The click resolves in two steps, and NEITHER is an approximation. Which LINE:
+/// screen row -> absolute wrapped row (via `scroll_offset`) -> `(content_row,
+/// sub_row)`, a binary search of the map the wrapper itself measured
+/// ([`visual_to_content`]) — the same map the draw windows by, so no error is
+/// accumulated over the lines above the click. Which REGION: each candidate region
+/// on that line is asked whether it PAINTED the clicked cell, by re-rendering that
+/// one line with the region marked and reading the cell back
+/// ([`region_paints_cell`]). A link that SOFT-WRAPS is therefore hit on every one of
+/// its drawn cells, continuation rows included, because the answer comes from where
+/// the wrapper actually put them.
+///
+/// The pane paints the search-MARKED lines while this probes the plain cached ones.
+/// That is the same invariant the row map already rests on:
+/// [`highlight_matched_spans`] only moves styles, leaving the text byte-identical
+/// and splitting at cluster edges alone, so the two wrap identically.
 ///
 /// `scroll_offset` stays ABSOLUTE — rows from the top of the whole transcript —
 /// even though the pane hands the widget only a WINDOW of logical lines and scrolls
@@ -2213,67 +2508,85 @@ fn visual_to_content(row_prefix: &[usize], visual_row: usize) -> Option<(usize, 
 /// pane to a line near the top of the file.
 ///
 /// WHICH LINE a click lands on is EXACT, however long the transcript and wherever it
-/// is scrolled: it is a binary search of the map the wrapper itself measured
-/// ([`visual_to_content`]), the same map the draw windows by, so no error is
-/// accumulated over the lines above the click. That replaced a per-line
-/// character-packing walk whose error GREW with every wrapping line above the click
-/// — unbounded once the preview's old 600-line tail cap was removed, since the cap
-/// was all that had ever bounded it.
+/// is scrolled, and so is WHICH CELL of that line. The line comes from the map
+/// ([`visual_to_content`]); the cell comes from a render of that one line, so the
+/// column step no longer has to predict where a row broke. It used to: `sub_row *
+/// inner.width` packed characters while the wrapper breaks at word boundaries, which
+/// put a sub-row's computed start on either side of its true one and left a wrapped
+/// link's continuation row entirely dead — measured at a 92-character url whose last
+/// 73 columns could not be clicked (`link_at_hits_a_wrapped_url_across_its_whole_drawn_extent`).
 ///
-/// What stays APPROXIMATE is the COLUMN within that one line: `sub_row *
-/// inner.width` packs characters while the wrapper breaks at word boundaries, so a
-/// sub-row's true start falls on EITHER side of that product. Break EARLY at a word
-/// boundary and the row spent FEWER source characters than the product assumes, so
-/// the computed column runs to the RIGHT of the true one; SWALLOW the whitespace
-/// broken on — consumed with no cell painted for it — and the row spent MORE, so the
-/// column runs to the LEFT
-/// (`character_packing_and_word_wrap_disagree_in_both_directions` pins both halves).
-/// Its error is bounded either way by ONE logical line's own wrapped extent, and it
-/// can never address a DIFFERENT line, because [`line_at_row`] gated the
-/// `content_row` exactly and that gate is DIRECTION-INDEPENDENT — which is why the
-/// second direction costs the bound nothing. So the worst case is a click on a
-/// wrapped line's CONTINUATION row missing the link painted there — or, on a line
-/// carrying several links, resolving to a LATER one where the column overshoots and
-/// an EARLIER one where it undershoots. The FIRST row of every line — and every row
-/// of every line that fits `inner.width`, which is the common case — is exact.
-///
-/// It stays an approximation because the real wrapper
-/// (`ratatui_widgets::reflow::WordWrapper`) is private and the one public accessor
-/// over it, `Paragraph::line_count`, answers how TALL a line is and never where
-/// inside it each row broke; closing that gap would mean reimplementing the wrapper,
-/// which would be a SECOND model to drift. Pure and terminal-free.
+/// The cost is one small in-memory render per CANDIDATE region — the regions on the
+/// resolved line, typically one — per click, over only the rows up to the clicked
+/// one. A click is a human-paced event, so that buys exactness at a price no frame
+/// pays. It is nonetheless BOUNDED rather than trusted to stay small: a click whose
+/// line and candidate count would read more than [`LINK_PROBE_BYTE_BUDGET`] bytes of
+/// text is answered [`LinkProbe::Unresolvable`] instead — see that const for why the
+/// bound is their product, why it is spent in bytes rather than in the wrapped rows
+/// already in hand, and why no real transcript reaches it, and [`LinkProbe`] for why
+/// that abstention is REPORTED rather than folded into "no link".
+/// Pure and terminal-free.
 pub(crate) fn link_at<'a>(
     col: u16,
     row: u16,
     inner: Rect,
     scroll_offset: u32,
     row_prefix: &[usize],
+    lines: &[Line<'_>],
     regions: &'a [LinkRegion],
-) -> Option<&'a str> {
+) -> LinkProbe<'a> {
     if !inner.contains(Position { x: col, y: row }) {
-        return None;
+        return LinkProbe::NoLink;
     }
-    let rel_col = usize::from(col - inner.x);
+    let rel_col = col - inner.x;
     let rel_row = usize::from(row - inner.y);
     // `scroll_offset` is `App::preview_scroll`, so it carries the pane's `u32`
     // offset domain into this `usize` row lookup. Saturating both steps: the worst a
     // saturated one can produce is a row past the end of the map, which
-    // `visual_to_content` already answers with the "no link here" `None`.
+    // `visual_to_content` already answers with the "no link here" case.
     let visual_row = usize::try_from(scroll_offset)
         .unwrap_or(usize::MAX)
         .saturating_add(rel_row);
-    let (content_row, sub_row) = visual_to_content(row_prefix, visual_row)?;
-    // The one packed step left. A word-wrapped sub-row starts on EITHER side of
-    // `sub_row * inner.width`, so this can overshoot OR undershoot the true column —
-    // never reaching another line either way, since the content row came from the map
-    // above rather than from this arithmetic.
-    let content_col = sub_row * usize::from(inner.width) + rel_col;
+    let Some((content_row, sub_row)) = visual_to_content(row_prefix, visual_row) else {
+        return LinkProbe::NoLink;
+    };
+    let Some(line) = lines.get(content_row) else {
+        return LinkProbe::NoLink;
+    };
+    // The rows the PAINT gave this line, read straight off the map it windowed by —
+    // the probe below has to reproduce exactly this or it is describing some other
+    // layout. A map and a line list that disagree resolve to no link, never a guess.
+    let Some(line_rows) = row_prefix
+        .get(content_row + 1)
+        .and_then(|next| next.checked_sub(row_prefix[content_row]))
+    else {
+        return LinkProbe::NoLink;
+    };
+    // The probe below is bounded BEFORE any of it is spent. Counting the candidates
+    // costs one pass over `regions`, which the search itself already costs, so the
+    // bound is paid for out of work that was happening anyway.
+    let candidates = regions
+        .iter()
+        .filter(|r| r.content_row == content_row)
+        .count();
+    if !probe_within_budget(line_probe_bytes(line), candidates) {
+        return LinkProbe::Unresolvable;
+    }
     regions
         .iter()
         .find(|r| {
-            r.content_row == content_row && r.col_start <= content_col && content_col < r.col_end
+            r.content_row == content_row
+                && region_paints_cell(
+                    line,
+                    r.col_start,
+                    r.col_end,
+                    inner.width,
+                    line_rows,
+                    sub_row,
+                    rel_col,
+                )
         })
-        .map(|r| r.url.as_str())
+        .map_or(LinkProbe::NoLink, |r| LinkProbe::Hit(r.url.as_str()))
 }
 
 /// Resolve the final vertical preview offset: pin to the bottom when following,
@@ -3922,13 +4235,12 @@ mod tests {
     /// `inner_width`: `ceil(width / inner_width)`, and at least one row (a blank line
     /// still takes a row).
     ///
-    /// A TEST FOIL, and only that — which is why it lives in `mod tests`. No
-    /// production path models a wrap any more: the transcript's height AND the
-    /// per-line map of where each line starts are both asked of the widget
-    /// (`wrapped_text_rows` / `wrapped_row_prefix`), and the click hit-test resolves a
-    /// clicked ROW through that same map. What survives of character packing in
-    /// production is the COLUMN step inside `link_at`, over the ONE line the map
-    /// already resolved exactly.
+    /// A TEST FOIL, and only that — which is why it lives in `mod tests`. NOTHING in
+    /// production models a wrap: the transcript's height and the per-line map of
+    /// where each line starts are both asked of the widget (`wrapped_text_rows` /
+    /// `wrapped_row_prefix`), the click hit-test resolves a clicked ROW through that
+    /// same map, and it resolves the CELL inside that row by re-rendering the line
+    /// ([`region_paints_cell`]) rather than by packing characters into it.
     ///
     /// It is kept because several fixtures below have to PROVE they are a case the
     /// two models disagree about: on a fixture where they happen to agree, a test
@@ -3970,6 +4282,15 @@ mod tests {
     ///
     /// Without this the agreement test above could pass while both models happened to
     /// agree, proving nothing about which one is in use.
+    ///
+    /// It outlived the packed COLUMN step in `link_at` on purpose. Both claims here
+    /// are about HEIGHT, measured against the rows actually PAINTED, and height is
+    /// still asked of the widget everywhere the pane computes an offset — so this
+    /// keeps pinning why `wrapped_text_rows` and `wrapped_row_prefix` may not be
+    /// swapped for arithmetic. It also keeps `wrapped_line_height` honest for the one
+    /// fixture that still needs a foil: `a_click_below_wrapping_lines_resolves_the_link_under_it`
+    /// measures the drift a packed walk would have accumulated, to prove its lines
+    /// really wrap before it asserts anything about a click.
     #[test]
     fn character_packing_and_word_wrap_disagree_in_both_directions() {
         let packed_rows = |lines: &[Line<'static>], width: u16| -> usize {
@@ -4272,87 +4593,786 @@ mod tests {
         }
     }
 
+    /// A content line carrying a link label at display columns `col_start..col_end`,
+    /// padded out to `cols` with dots so the columns around it are real drawn cells
+    /// rather than the blank tail of a short line.
+    ///
+    /// Dots, not spaces: the wrapper breaks on whitespace, so a padded line of spaces
+    /// would wrap somewhere a test has no reason to expect. A run of dots is one
+    /// unbreakable token, which puts the break exactly at the pane width.
+    fn link_line(cols: usize, col_start: usize, col_end: usize) -> Line<'static> {
+        Line::from(vec![
+            Span::raw(".".repeat(col_start)),
+            Span::styled(
+                ".".repeat(col_end - col_start),
+                Style::default().add_modifier(Modifier::UNDERLINED),
+            ),
+            Span::raw(".".repeat(cols.saturating_sub(col_end))),
+        ])
+    }
+
     #[test]
     fn link_at_returns_url_inside_a_link_and_none_just_outside() {
         let inner = inner_rect();
         // Three unwrapped content lines; a link on line 2 at columns 4..8.
-        let prefix = [0usize, 1, 2, 3];
+        let lines = vec![
+            Line::from(String::new()),
+            Line::from(String::new()),
+            link_line(12, 4, 8),
+        ];
+        let prefix = wrapped_row_prefix(&lines, inner.width);
+        assert_eq!(prefix, vec![0, 1, 2, 3], "each line must fit one row");
         let regions = [region(2, 4, 8, "u")];
         // Inside the label (content col 4..7) -> the url.
         assert_eq!(
-            link_at(inner.x + 4, inner.y + 2, inner, 0, &prefix, &regions),
-            Some("u")
+            link_at(
+                inner.x + 4,
+                inner.y + 2,
+                inner,
+                0,
+                &prefix,
+                &lines,
+                &regions
+            ),
+            LinkProbe::Hit("u")
         );
         assert_eq!(
-            link_at(inner.x + 7, inner.y + 2, inner, 0, &prefix, &regions),
-            Some("u")
+            link_at(
+                inner.x + 7,
+                inner.y + 2,
+                inner,
+                0,
+                &prefix,
+                &lines,
+                &regions
+            ),
+            LinkProbe::Hit("u")
         );
-        // One cell past the end (col_end is exclusive) -> None.
+        // One cell past the end (col_end is exclusive) -> no link. NOT `Unresolvable`:
+        // the probe was spent and came back empty, which is a different answer.
         assert_eq!(
-            link_at(inner.x + 8, inner.y + 2, inner, 0, &prefix, &regions),
-            None
+            link_at(
+                inner.x + 8,
+                inner.y + 2,
+                inner,
+                0,
+                &prefix,
+                &lines,
+                &regions
+            ),
+            LinkProbe::NoLink
         );
-        // One cell before the start -> None.
+        // One cell before the start -> no link.
         assert_eq!(
-            link_at(inner.x + 3, inner.y + 2, inner, 0, &prefix, &regions),
-            None
+            link_at(
+                inner.x + 3,
+                inner.y + 2,
+                inner,
+                0,
+                &prefix,
+                &lines,
+                &regions
+            ),
+            LinkProbe::NoLink
+        );
+    }
+
+    /// The budget bounds the PRODUCT, so neither factor alone decides.
+    ///
+    /// Both single-dimension caps that were rejected are pinned here as the cases
+    /// they would have let through: a short line carrying many links, and a long line
+    /// carrying one. Either would pass a cap on the other dimension.
+    #[test]
+    fn the_probe_budget_bounds_bytes_times_candidates_not_either_alone() {
+        // An ordinary click is nowhere near it: a wrapped paragraph, a link or two.
+        assert!(
+            probe_within_budget(400, 2),
+            "an ordinary prose line with links"
+        );
+        assert!(
+            probe_within_budget(800, 8),
+            "and a pane-clamped grid table row with one link per cell"
+        );
+
+        // The boundary, from each side and in each dimension.
+        assert!(
+            probe_within_budget(1, LINK_PROBE_BYTE_BUDGET),
+            "at the budget"
+        );
+        assert!(
+            !probe_within_budget(1, LINK_PROBE_BYTE_BUDGET + 1),
+            "one candidate past it"
+        );
+        assert!(
+            probe_within_budget(LINK_PROBE_BYTE_BUDGET, 1),
+            "and in bytes"
+        );
+        assert!(
+            !probe_within_budget(LINK_PROBE_BYTE_BUDGET + 1, 1),
+            "one byte past it"
+        );
+
+        // The product is the quantity spent: a line well under any plausible length
+        // cap, carrying a count well under any plausible candidate cap, still costs
+        // more than the budget between them.
+        assert!(
+            probe_within_budget(BUDGET_LINE_BYTES, BUDGET_AT_LIMIT_CANDIDATES),
+            "an ordinary-length line, 32 links deep, is the budget exactly"
+        );
+        assert!(
+            !probe_within_budget(BUDGET_LINE_BYTES, BUDGET_AT_LIMIT_CANDIDATES + 1),
+            "and one link deeper is past it"
+        );
+
+        // Saturating, so an absurd pair cannot wrap back under the budget and buy
+        // itself the work this exists to refuse.
+        assert!(!probe_within_budget(usize::MAX, 2));
+        assert!(!probe_within_budget(2, usize::MAX));
+    }
+
+    /// The gap a WRAPPED-ROW budget could not see, and the whole reason this one is
+    /// spent in bytes: a line whose graphemes occupy no column costs a full read per
+    /// candidate while measuring ONE row tall.
+    ///
+    /// Rows count what the wrapper PAINTS; the probe pays for what it READS. A run of
+    /// zero-width spaces is read and never painted, so a row budget prices this click
+    /// at `1 * candidates` and waves it through, while every candidate still walks,
+    /// re-styles, copies and re-wraps every byte the line holds. Transcript text is
+    /// whatever a model or a tool dumped into the session, so the shape is reachable
+    /// without anything exotic — which is why both prices are asserted here, not just
+    /// the right one.
+    #[test]
+    fn a_zero_width_line_costs_bytes_the_wrapped_rows_cannot_see() {
+        const ZERO_WIDTH: &str = "\u{200b}";
+        const GRAPHEMES: usize = 8192;
+        const CANDIDATES: usize = 8;
+        let inner = inner_rect();
+        let lines = vec![Line::from(ZERO_WIDTH.repeat(GRAPHEMES))];
+        let bytes = line_probe_bytes(&lines[0]);
+        assert_eq!(
+            bytes,
+            GRAPHEMES * ZERO_WIDTH.len(),
+            "the fixture must really hold the bytes it claims"
+        );
+        assert_eq!(
+            lines[0].width(),
+            0,
+            "and none of them may take a column, or the wrapped rows would see them"
+        );
+        assert_eq!(
+            wrapped_row_prefix(&lines, inner.width),
+            vec![0, 1],
+            "the wrapper paints this as ONE row however much text it holds — which is \
+             exactly why rows cannot price the probe"
+        );
+        assert!(
+            probe_within_budget(1, CANDIDATES),
+            "priced in ROWS this click is trivially affordable"
+        );
+        assert!(
+            !probe_within_budget(bytes, CANDIDATES),
+            "priced in the bytes it actually reads it is not, and that is the answer \
+             the budget has to give"
+        );
+    }
+
+    /// Bytes in the line the end-to-end boundary below is measured on: an ordinary
+    /// paragraph's worth of text, and an exact divisor of [`LINK_PROBE_BYTE_BUDGET`]
+    /// so a candidate count can straddle the boundary precisely rather than near it.
+    const BUDGET_LINE_BYTES: usize = 4096;
+
+    /// Candidates that spend [`BUDGET_LINE_BYTES`] EXACTLY up to the budget — the last
+    /// count still answered, so `+ 1` is the first one refused.
+    const BUDGET_AT_LIMIT_CANDIDATES: usize = LINK_PROBE_BYTE_BUDGET / BUDGET_LINE_BYTES;
+
+    /// Past the budget the hit-test ABSTAINS — even on a cell a region plainly
+    /// painted, which is the only version of this that proves anything.
+    ///
+    /// The two runs differ in ONE candidate and nothing else, so what is pinned is the
+    /// boundary itself rather than "a big number abstains". The hitting region is
+    /// FIRST in both, so the at-budget run short-circuits on it: the over-budget run
+    /// therefore refuses because of the BUDGET, not because it ran out of regions to
+    /// try, and abstaining costs a hit that was genuinely available.
+    ///
+    /// The abstention is asserted as [`LinkProbe::Unresolvable`] and NOT as
+    /// [`LinkProbe::NoLink`], which is the whole point of there being two: this fixture
+    /// has a link on the clicked cell, so "no link" would be a false statement about
+    /// the transcript rather than an honest refusal to answer.
+    #[test]
+    fn link_at_abstains_once_a_click_would_cost_more_than_the_probe_budget() {
+        let inner = inner_rect();
+        let lines = vec![link_line(BUDGET_LINE_BYTES, 4, 8)];
+        let prefix = wrapped_row_prefix(&lines, inner.width);
+        assert_eq!(
+            line_probe_bytes(&lines[0]),
+            BUDGET_LINE_BYTES,
+            "the dot fixture must be one byte per column, or the two runs below are \
+             not measured in the budget's own unit"
+        );
+        assert_eq!(
+            BUDGET_AT_LIMIT_CANDIDATES * BUDGET_LINE_BYTES,
+            LINK_PROBE_BYTE_BUDGET,
+            "the fixture must divide the budget EXACTLY, or the two runs straddle \
+             nothing and the boundary is not pinned"
+        );
+
+        // Decoys sit on the same content line at columns the click never touches, so
+        // they are CANDIDATES (same line) that can never answer.
+        let decoy = region(0, 0, 1, "decoy");
+        let mut at_budget = vec![region(0, 4, 8, "u")];
+        at_budget.resize(BUDGET_AT_LIMIT_CANDIDATES, decoy.clone());
+        assert_eq!(at_budget.len(), BUDGET_AT_LIMIT_CANDIDATES);
+        assert_eq!(
+            link_at(inner.x + 4, inner.y, inner, 0, &prefix, &lines, &at_budget),
+            LinkProbe::Hit("u"),
+            "AT the budget the click is answered exactly as it always was"
+        );
+
+        let mut past_budget = at_budget;
+        past_budget.push(decoy);
+        assert_eq!(past_budget.len(), BUDGET_AT_LIMIT_CANDIDATES + 1);
+        assert_eq!(
+            link_at(
+                inner.x + 4,
+                inner.y,
+                inner,
+                0,
+                &prefix,
+                &lines,
+                &past_budget
+            ),
+            LinkProbe::Unresolvable,
+            "ONE region past it the probe must abstain rather than answer from work \
+             it refuses to do — a missed hit costs a click, a guessed one hands a \
+             browser a url the reader never aimed at. And it must abstain IN ITS OWN \
+             WORDS: the very same click is a HIT one candidate earlier, so reporting \
+             `NoLink` would deny a link this fixture demonstrably has"
         );
     }
 
     #[test]
     fn link_at_is_none_on_blank_rows_and_outside_the_pane() {
         let inner = inner_rect();
-        let prefix = [0usize, 1, 2, 3];
+        // Line 0 carries TEXT at the very columns the link occupies on line 2; line 1
+        // is blank. The text line is the one that earns its place: against a BLANK
+        // line, a hit-test that forgot WHICH line a region belongs to would still
+        // answer None, because nothing is painted there to match — so the row gate
+        // would go untested. Here a forgotten gate resolves line 0's prose as a link.
+        let lines = vec![
+            Line::from(".".repeat(12)),
+            Line::from(String::new()),
+            link_line(12, 4, 8),
+        ];
+        let prefix = wrapped_row_prefix(&lines, inner.width);
         let regions = [region(2, 4, 8, "u")];
+        // A click on line 0's prose, at the link's own columns, hits no region.
+        assert_eq!(
+            link_at(inner.x + 4, inner.y, inner, 0, &prefix, &lines, &regions),
+            LinkProbe::NoLink,
+            "a region belongs to ONE content line, not to those columns on every line"
+        );
         // A click on the blank content line 1 hits no region.
         assert_eq!(
-            link_at(inner.x + 4, inner.y + 1, inner, 0, &prefix, &regions),
-            None
+            link_at(
+                inner.x + 4,
+                inner.y + 1,
+                inner,
+                0,
+                &prefix,
+                &lines,
+                &regions
+            ),
+            LinkProbe::NoLink
         );
         // A click left of the inner rect is rejected outright.
-        assert_eq!(link_at(0, inner.y + 2, inner, 0, &prefix, &regions), None);
-        // A click below the content (inside the pane, past the last line) -> None.
         assert_eq!(
-            link_at(inner.x + 4, inner.y + 5, inner, 0, &prefix, &regions),
-            None
+            link_at(0, inner.y + 2, inner, 0, &prefix, &lines, &regions),
+            LinkProbe::NoLink
+        );
+        // A click below the content (inside the pane, past the last line) is no link.
+        assert_eq!(
+            link_at(
+                inner.x + 4,
+                inner.y + 5,
+                inner,
+                0,
+                &prefix,
+                &lines,
+                &regions
+            ),
+            LinkProbe::NoLink
         );
     }
 
     #[test]
     fn link_at_hits_a_soft_wrapped_link_on_its_second_visual_row() {
         let inner = inner_rect();
-        // One content line occupying 3 visual rows (inner width 20). A link at
-        // content columns 25..30 lives on the SECOND wrapped row.
-        let prefix = [0usize, 3];
-        let regions = [region(0, 25, 30, "w")];
-        // Second visual row, column 7 => content col 20 + 7 = 27, inside 25..30.
+        // One unbreakable content line of 45 columns in a 20-wide pane, so the
+        // wrapper breaks at exactly 20 and 40. A link at content columns 25..30 is
+        // therefore painted on the SECOND wrapped row, at its columns 5..10.
+        let lines = vec![link_line(45, 25, 30)];
+        let prefix = wrapped_row_prefix(&lines, inner.width);
         assert_eq!(
-            link_at(inner.x + 7, inner.y + 1, inner, 0, &prefix, &regions),
-            Some("w"),
+            prefix,
+            vec![0, 3],
+            "the fixture must occupy three visual rows"
+        );
+        let regions = [region(0, 25, 30, "w")];
+        assert_eq!(
+            link_at(
+                inner.x + 7,
+                inner.y + 1,
+                inner,
+                0,
+                &prefix,
+                &lines,
+                &regions
+            ),
+            LinkProbe::Hit("w"),
             "a wrapped link is clickable on its second visual segment"
         );
         // The SAME column on the first visual row is content col 7 -> no link.
         assert_eq!(
-            link_at(inner.x + 7, inner.y, inner, 0, &prefix, &regions),
-            None
+            link_at(inner.x + 7, inner.y, inner, 0, &prefix, &lines, &regions),
+            LinkProbe::NoLink
         );
     }
 
     #[test]
     fn link_at_respects_the_scroll_offset() {
         let inner = inner_rect();
-        // Five unwrapped lines; a link on line 3 spanning columns 0..3.
-        let prefix = [0usize, 1, 2, 3, 4, 5];
+        // Five unwrapped lines; a link on line 3 spanning columns 0..3. The OTHER
+        // lines carry text at those same columns on purpose: the "without the scroll"
+        // assertion below lands on line 1, and only a line with something painted
+        // there can tell a working offset from one that resolved the wrong line.
+        let lines = vec![
+            Line::from(".".repeat(12)),
+            Line::from(".".repeat(12)),
+            Line::from(".".repeat(12)),
+            link_line(12, 0, 3),
+            Line::from(".".repeat(12)),
+        ];
+        let prefix = wrapped_row_prefix(&lines, inner.width);
+        assert_eq!(prefix, vec![0, 1, 2, 3, 4, 5], "each line must fit one row");
         let regions = [region(3, 0, 3, "s")];
         // Scrolled down 2 rows, screen row rel 1 => visual row 3 => content line 3.
         assert_eq!(
-            link_at(inner.x + 1, inner.y + 1, inner, 2, &prefix, &regions),
-            Some("s")
+            link_at(
+                inner.x + 1,
+                inner.y + 1,
+                inner,
+                2,
+                &prefix,
+                &lines,
+                &regions
+            ),
+            LinkProbe::Hit("s")
         );
         // Without the scroll, the same screen cell is content line 1 -> no link.
         assert_eq!(
-            link_at(inner.x + 1, inner.y + 1, inner, 0, &prefix, &regions),
-            None
+            link_at(
+                inner.x + 1,
+                inner.y + 1,
+                inner,
+                0,
+                &prefix,
+                &lines,
+                &regions
+            ),
+            LinkProbe::NoLink
+        );
+    }
+
+    // --- the measured wrapped-link shape ----------------------------------
+
+    /// The pane width the reported miss was measured at.
+    const HIT_PANE_WIDTH: u16 = 80;
+    /// Characters in the measured url. Longer than the pane, so it cannot help but
+    /// straddle a wrap.
+    const HIT_URL_LEN: usize = 92;
+    /// Display columns in the measured logical line, url and prose together.
+    const HIT_LINE_COLS: usize = 305;
+    /// The prose the measured line opens with, which is also the url's start column.
+    const HIT_HEAD: &str = "I have ";
+
+    /// The measured line as the preview renders it: plain prose, the url UNDERLINED
+    /// the way `store::preview` styles a link label, then plain prose out to
+    /// [`HIT_LINE_COLS`] columns. Returns the line and the url it carries.
+    fn hit_shape_line() -> (Line<'static>, String) {
+        let url = format!("https://example.com/{}", "a".repeat(HIT_URL_LEN - 20));
+        assert_eq!(
+            url.len(),
+            HIT_URL_LEN,
+            "the fixture url must be the measured length"
+        );
+        let mut tail = String::from(" ");
+        let tail_len = HIT_LINE_COLS - HIT_HEAD.len() - HIT_URL_LEN;
+        while tail.len() < tail_len {
+            tail.push_str("the quick brown fox jumps over the lazy dog ");
+        }
+        tail.truncate(tail_len);
+        let line = Line::from(vec![
+            Span::raw(HIT_HEAD),
+            Span::styled(
+                url.clone(),
+                Style::default().add_modifier(Modifier::UNDERLINED),
+            ),
+            Span::raw(tail),
+        ]);
+        assert_eq!(
+            line.width(),
+            HIT_LINE_COLS,
+            "the fixture must be the measured width"
+        );
+        (line, url)
+    }
+
+    /// Every `(x, y)` cell the renderer paints `modifier` into for `lines` at
+    /// `width` — the label's REAL drawn extent, read off a rendered buffer rather
+    /// than computed from the geometry under test.
+    fn cells_with(
+        lines: &[Line<'static>],
+        width: u16,
+        rows: u16,
+        modifier: Modifier,
+    ) -> Vec<(u16, u16)> {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height: rows,
+        };
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(
+            Paragraph::new(Text::from(lines.to_vec())).wrap(Wrap { trim: false }),
+            area,
+            &mut buffer,
+        );
+        (0..rows)
+            .flat_map(|y| (0..width).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                buffer
+                    .cell((x, y))
+                    .is_some_and(|c| c.modifier.contains(modifier))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn link_at_hits_a_wrapped_url_across_its_whole_drawn_extent() {
+        let (line, url) = hit_shape_line();
+        let lines = vec![line];
+        let prefix = wrapped_row_prefix(&lines, HIT_PANE_WIDTH);
+        let rows = u16::try_from(*prefix.last().expect("a non-empty map")).expect("a short line");
+        let regions = [region(
+            0,
+            HIT_HEAD.len(),
+            HIT_HEAD.len() + HIT_URL_LEN,
+            &url,
+        )];
+        let inner = Rect {
+            x: 1,
+            y: 1,
+            width: HIT_PANE_WIDTH,
+            height: rows,
+        };
+
+        // The url's REAL drawn extent: the preview underlines a link label, so the
+        // underlined cells are exactly the cells a user can see it in. Read off a
+        // rendered buffer, never computed from the arithmetic under test.
+        let drawn = cells_with(&lines, HIT_PANE_WIDTH, rows, Modifier::UNDERLINED);
+        assert_eq!(
+            drawn.len(),
+            HIT_URL_LEN,
+            "every one of the url's columns must reach a cell"
+        );
+        let drawn_rows: HashSet<u16> = drawn.iter().map(|&(_, y)| y).collect();
+        assert!(
+            drawn_rows.len() > 1,
+            "the url must span more than one visual row, or its CONTINUATION row — \
+             the row the packed column step killed outright — is not under test"
+        );
+        assert!(
+            !drawn_rows.contains(&0),
+            "the wrapper must have pushed the whole url off row 0, or the fixture is \
+             not the shape that was measured"
+        );
+
+        for &(x, y) in &drawn {
+            assert_eq!(
+                link_at(
+                    inner.x + x,
+                    inner.y + y,
+                    inner,
+                    0,
+                    &prefix,
+                    &lines,
+                    &regions
+                ),
+                LinkProbe::Hit(url.as_str()),
+                "a click on drawn cell ({x}, {y}) must open the url it was painted for"
+            );
+        }
+
+        // And the cells immediately outside that extent must stay dead: the prose
+        // before the url on row 0, and the first cell after its last drawn one.
+        let (last_x, last_y) = *drawn.last().expect("a drawn url");
+        assert_eq!(
+            link_at(
+                inner.x + last_x + 1,
+                inner.y + last_y,
+                inner,
+                0,
+                &prefix,
+                &lines,
+                &regions
+            ),
+            LinkProbe::NoLink,
+            "the cell just past the url's last drawn one is prose, not the link"
+        );
+        assert_eq!(
+            link_at(inner.x, inner.y, inner, 0, &prefix, &lines, &regions),
+            LinkProbe::NoLink,
+            "the prose the line opens with is not the link"
+        );
+    }
+
+    /// Widths the marking sweep below measures every case at. 40 because the widest
+    /// case is 40 columns of text, so the sweep runs from a one-column pane (where
+    /// every glyph breaks) right through to one that fits the whole line — covering
+    /// every break position a lost column could possibly move.
+    const MARK_SWEEP_WIDTH: u16 = 40;
+
+    /// The equality the probe's soundness rests on: re-styling a region cannot move
+    /// the wrap, so the marked line measures to exactly the rows the plain one does.
+    ///
+    /// The failure mode it guards is a WIDTH that moves when a line is re-split into
+    /// more spans, which only a contextual, multi-column glyph can expose — hence the
+    /// CJK and VS16 cases beside the measured ASCII one. Each is swept across every
+    /// width from 1 to [`MARK_SWEEP_WIDTH`] rather than asserted at one hand-picked
+    /// number: a width where a lost column happens not to move a break would let a
+    /// broken splitter through, and a sweep has no such gap.
+    #[test]
+    fn marking_a_link_region_does_not_move_the_wrap() {
+        let (hit_line, _) = hit_shape_line();
+        let cjk = Line::from(vec![
+            Span::raw("see "),
+            Span::styled(
+                "日本語のドキュメント".to_string(),
+                Style::default().add_modifier(Modifier::UNDERLINED),
+            ),
+            Span::raw(" for the rest of it"),
+        ]);
+        // A VS16 emoji is the hard case: the selector adds a column to the glyph it
+        // follows, so severing it from its base measures ONE column narrower than the
+        // same bytes unsplit. This region STOPS INSIDE that cluster — a boundary the
+        // renderer's own columns never produce, but exactly where a char-indexed
+        // marker would cut, so the snap-out has something to prove.
+        let emoji = Line::from(vec![
+            Span::raw("ok ☺\u{fe0f}"),
+            Span::styled(
+                "☺\u{fe0f}link".to_string(),
+                Style::default().add_modifier(Modifier::UNDERLINED),
+            ),
+            Span::raw(" go on then"),
+        ]);
+        for (name, line, col_start, col_end) in [
+            (
+                "the measured url",
+                hit_line,
+                HIT_HEAD.len(),
+                HIT_HEAD.len() + HIT_URL_LEN,
+            ),
+            ("a CJK label", cjk, 4, 24),
+            ("a VS16 emoji cut mid-cluster", emoji, 5, 6),
+        ] {
+            let marked = highlight_matched_spans(
+                &line,
+                &region_char_positions(&line, col_start, col_end),
+                LINK_PROBE_MARKER,
+            );
+            assert!(
+                marked
+                    .spans
+                    .iter()
+                    .any(|s| s.style.add_modifier.contains(LINK_PROBE_MARKER)),
+                "{name}: the region must really have been marked, or the equality \
+                 below is asserting nothing"
+            );
+            for width in 1..=MARK_SWEEP_WIDTH {
+                assert_eq!(
+                    wrapped_text_rows(std::slice::from_ref(&marked), width),
+                    wrapped_text_rows(std::slice::from_ref(&line), width),
+                    "{name}: marking a region must not change how tall the line \
+                     wraps, and it did at width {width}"
+                );
+            }
+        }
+    }
+
+    /// A double-width label is clickable across BOTH columns of every glyph.
+    ///
+    /// ratatui paints a wide glyph by styling its LEFT cell alone and leaving the
+    /// right one untouched, so a probe that only ever read the clicked cell would
+    /// answer "no link" on half of a CJK label's visible width.
+    #[test]
+    fn link_at_hits_both_halves_of_a_double_width_label() {
+        // "see " (4 cols) then a 5-glyph, 10-column label, then prose.
+        let label = "日本語文書";
+        let lines = vec![Line::from(vec![
+            Span::raw("see "),
+            Span::styled(
+                label.to_string(),
+                Style::default().add_modifier(Modifier::UNDERLINED),
+            ),
+            Span::raw(" ok"),
+        ])];
+        let inner = Rect {
+            x: 1,
+            y: 1,
+            width: 40,
+            height: 4,
+        };
+        let prefix = wrapped_row_prefix(&lines, inner.width);
+        let regions = [region(0, 4, 4 + 10, "cjk")];
+        for x in 4..14u16 {
+            assert_eq!(
+                link_at(inner.x + x, inner.y, inner, 0, &prefix, &lines, &regions),
+                LinkProbe::Hit("cjk"),
+                "column {x} is inside the label's drawn width and must open its url"
+            );
+        }
+        for x in [3u16, 14] {
+            assert_eq!(
+                link_at(inner.x + x, inner.y, inner, 0, &prefix, &lines, &regions),
+                LinkProbe::NoLink,
+                "column {x} is outside the label"
+            );
+        }
+    }
+
+    /// The blank column immediately RIGHT of a link that ENDS a painted row is NOT
+    /// part of that link.
+    ///
+    /// `Paragraph` only `set_style`s its area — it never blanks a row's remainder — so
+    /// every column past a row's last painted glyph is left UNWRITTEN, which by symbol
+    /// alone is indistinguishable from the right half of a double-width glyph. Admit
+    /// both and a click on empty space opens the link beside it: the one failure this
+    /// hit-test exists to prevent, since an abstention costs a click while a wrong hit
+    /// hands an unintended url to a browser.
+    ///
+    /// The fixture deliberately does NOT use [`link_line`], whose dot padding would put
+    /// a real, unmarked cell at that column and arrange the ambiguity away entirely.
+    /// That the column really is unwritten is therefore ASSERTED, off a render of the
+    /// same line, before anything is concluded from it.
+    #[test]
+    fn link_at_refuses_the_blank_column_right_of_a_link_that_ends_a_row() {
+        const HEAD: &str = "see ";
+        const LABEL: &str = "docs";
+        let start = HEAD.len();
+        let end = start + LABEL.len();
+        // The label ENDS the line: the row's last painted column is the link's last.
+        let lines = vec![Line::from(vec![
+            Span::raw(HEAD),
+            Span::styled(
+                LABEL.to_string(),
+                Style::default().add_modifier(Modifier::UNDERLINED),
+            ),
+        ])];
+        let inner = inner_rect();
+        let blank = u16::try_from(end).expect("a short fixture");
+        assert!(
+            blank < inner.width,
+            "the pane must be wider than the line, or there is no column to its right"
+        );
+
+        // The premise, read off a render rather than assumed: the column just past the
+        // label was never written, so it is exactly the ambiguous cell under test.
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: inner.width,
+            height: 1,
+        };
+        let mut painted = Buffer::filled(area, Cell::new(LINK_PROBE_UNWRITTEN));
+        Paragraph::new(Text::from(lines.clone()))
+            .wrap(Wrap { trim: false })
+            .render(area, &mut painted);
+        assert_eq!(
+            painted.cell((blank - 1, 0)).map(|c| c.symbol()),
+            Some("s"),
+            "the label's last column must really be the row's last painted one"
+        );
+        assert_eq!(
+            painted.cell((blank, 0)).map(|c| c.symbol()),
+            Some(LINK_PROBE_UNWRITTEN),
+            "the column right of the label must be UNWRITTEN, or this fixture cannot \
+             pose the ambiguity it exists to pose"
+        );
+
+        let prefix = wrapped_row_prefix(&lines, inner.width);
+        let regions = [region(0, start, end, "u")];
+        assert_eq!(
+            link_at(
+                inner.x + blank - 1,
+                inner.y,
+                inner,
+                0,
+                &prefix,
+                &lines,
+                &regions
+            ),
+            LinkProbe::Hit("u"),
+            "the label's own last cell still opens its url"
+        );
+        assert_eq!(
+            link_at(
+                inner.x + blank,
+                inner.y,
+                inner,
+                0,
+                &prefix,
+                &lines,
+                &regions
+            ),
+            LinkProbe::NoLink,
+            "an unwritten cell whose left neighbour is a NARROW glyph is blank space, \
+             not that glyph's second half — clicking it must open nothing"
+        );
+        assert_eq!(
+            link_at(
+                inner.x + blank + 1,
+                inner.y,
+                inner,
+                0,
+                &prefix,
+                &lines,
+                &regions
+            ),
+            LinkProbe::NoLink,
+            "and deeper into the unpainted tail stays dead too"
+        );
+    }
+
+    /// The probe REFUSES rather than guesses when the row count it is handed does not
+    /// match what the marked line measures to.
+    ///
+    /// That disagreement means the probe render is describing a layout the pane never
+    /// painted, and the safe direction is unambiguous here: a hit-test that guesses
+    /// hands an unintended url to a browser, while one that abstains costs a click.
+    #[test]
+    fn a_region_probe_refuses_a_row_count_it_cannot_reproduce() {
+        let (line, _) = hit_shape_line();
+        let real_rows = wrapped_text_rows(std::slice::from_ref(&line), HIT_PANE_WIDTH);
+        let (start, end) = (HIT_HEAD.len(), HIT_HEAD.len() + HIT_URL_LEN);
+        assert!(
+            region_paints_cell(&line, start, end, HIT_PANE_WIDTH, real_rows, 1, 0),
+            "the true row count must resolve the cell, or the refusal below proves \
+             nothing"
+        );
+        assert!(
+            !region_paints_cell(&line, start, end, HIT_PANE_WIDTH, real_rows + 1, 1, 0),
+            "a row count the marked line cannot reproduce must resolve to no link"
         );
     }
 
@@ -6684,22 +7704,18 @@ mod tests {
             })
             .expect("the fixture's link label must be drawn inside the pane");
 
-        let (row_prefix, regions) = app.preview_hit_context(inner_w);
+        let scroll = app.preview_scroll;
+        let (row_prefix, lines, regions) = app
+            .preview_hit_context(inner_w)
+            .expect("a selected preview");
         assert_eq!(
-            link_at(col, row, inner, app.preview_scroll, &row_prefix, &regions),
-            Some(WINDOW_LINK_URL),
+            link_at(col, row, inner, scroll, row_prefix, lines, regions),
+            LinkProbe::Hit(WINDOW_LINK_URL),
             "a click on the cell the label was DRAWN on must open its url"
         );
         assert_eq!(
-            link_at(
-                col,
-                row - 1,
-                inner,
-                app.preview_scroll,
-                &row_prefix,
-                &regions
-            ),
-            None,
+            link_at(col, row - 1, inner, scroll, row_prefix, lines, regions),
+            LinkProbe::NoLink,
             "and the row above it is another transcript line, not the link"
         );
 
@@ -6835,12 +7851,171 @@ mod tests {
             })
             .expect("the fixture's link label must be drawn inside the pane");
 
-        let (row_prefix, regions) = app.preview_hit_context(inner_w);
+        let scroll = app.preview_scroll;
+        let (row_prefix, hit_lines, regions) = app
+            .preview_hit_context(inner_w)
+            .expect("a selected preview");
         assert_eq!(
-            link_at(col, row, inner, app.preview_scroll, &row_prefix, &regions),
-            Some(WRAP_LINK_URL),
+            link_at(col, row, inner, scroll, row_prefix, hit_lines, regions),
+            LinkProbe::Hit(WRAP_LINK_URL),
             "a click on the cell the label was DRAWN on must open its url, however \
              many wrapped lines sit above it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The url behind the GFM TABLE fixture below, and the label it renders as.
+    const TABLE_LINK_URL: &str = "https://example.com/table-cell";
+    const TABLE_LINK_LABEL: &str = "spec";
+
+    /// The column rule a GRID-mode table draws between its columns.
+    ///
+    /// Its presence on the clicked row is what tells the grid layout from the stacked
+    /// RECORD fallback, which records no clickable region at all — so without it this
+    /// test could go green over a table that was never the shape under test.
+    const GRID_COLUMN_RULE: &str = "\u{2502}";
+
+    /// A transcript whose one turn is a GFM TABLE carrying a link in a body cell.
+    ///
+    /// Written as MARKDOWN SOURCE and rendered by the production pass, never as
+    /// hand-built [`LinkRegion`]s: the columns a grid cell's region is recorded in are
+    /// produced by `store::preview`'s own table layout, so regions stated by hand would
+    /// test the probe against the test's arithmetic instead of against the render — and
+    /// reproduce exactly the blindness this case exists to remove.
+    /// Headers wide enough that the table's NATURAL width overflows [`WINDOW_PANE`],
+    /// so the grid is clamped to fill the pane's inner width EXACTLY.
+    ///
+    /// That is what makes this fixture able to catch a probe measuring at a width the
+    /// grid was not laid out at. A short table fits any nearby width unchanged and
+    /// wraps at none of them, so it stays green against exactly the divergence this
+    /// case exists to detect — the shape of a fixture that arranges the failure away.
+    const TABLE_HEADERS: &str = "| Document reference | Notes about the document |";
+
+    fn table_link_session(dir: &Path) -> Session {
+        let file = dir.join("sess-table-link.jsonl");
+        let body = format!(
+            "{TABLE_HEADERS}\\n| --- | --- |\\n| [{TABLE_LINK_LABEL}]({TABLE_LINK_URL}) | ok |"
+        );
+        let jsonl = format!(
+            concat!(
+                r#"{{"type":"user","sessionId":"sess-table-link","cwd":"/tmp","#,
+                r#""timestamp":"2026-07-01T10:00:00.000Z","#,
+                r#""message":{{"role":"user","content":"{body}"}}}}"#,
+                "\n",
+            ),
+            body = body,
+        );
+        std::fs::write(&file, jsonl).expect("write the table link fixture");
+        Session {
+            file,
+            session_id: "sess-table-link".to_string(),
+            cwd: PathBuf::from("/tmp"),
+            git_branch: Some("main".to_string()),
+            timestamp: None,
+            repo: "repo".to_string(),
+            label: "table link session".to_string(),
+            root_uuid: None,
+            msg_count: 0,
+            content_index: String::new(),
+            background: false,
+            has_agent_name: false,
+            has_agent_setting: false,
+            failed_task: None,
+        }
+    }
+
+    /// A link inside a GFM GRID table is clickable through the REAL click path.
+    ///
+    /// Table links were verified at the `store::preview` layer alone, which proves the
+    /// regions are RECORDED but not that anything can ever HIT one. Nothing drove a
+    /// grid table through `link_at`, so the whole capability could have been inert —
+    /// the grid render width diverging from the pane's `inner.width` by a single column
+    /// makes every table region fail the probe's row-count check and abstain, silently,
+    /// with the suite still green. This closes that: markdown source in, production
+    /// render out, and the click aimed at the cells the label was actually PAINTED in
+    /// (found by the `UNDERLINED` modifier the preview marks a label with, never
+    /// computed from the geometry under test).
+    #[test]
+    fn a_click_opens_a_link_inside_a_gfm_grid_table() {
+        let (width, height) = WINDOW_PANE;
+        let inner_w = width - 2;
+        let dir = unique_temp_dir("table-link");
+        let mut app = App::new(
+            vec![table_link_session(&dir)],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+
+        let buffer = preview_buffer(&mut app, width, height);
+        let inner = Rect {
+            x: 1,
+            y: 1,
+            width: inner_w,
+            height: height - 2,
+        };
+
+        // The cells the label was drawn in, read off the render.
+        let drawn: Vec<(u16, u16)> = (inner.y..inner.bottom())
+            .flat_map(|y| (inner.x..inner.right()).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                buffer
+                    .cell((x, y))
+                    .is_some_and(|c| c.modifier.contains(Modifier::UNDERLINED))
+            })
+            .collect();
+        let drawn_text: String = drawn
+            .iter()
+            .filter_map(|&(x, y)| buffer.cell((x, y)).map(|c| c.symbol().to_string()))
+            .collect();
+        assert_eq!(
+            drawn_text, TABLE_LINK_LABEL,
+            "the table cell's link label must be what is painted underlined in the \
+             pane, or this is aiming at some other span"
+        );
+
+        // It must really be a GRID: the record fallback stacks the cells instead and
+        // records no region at all, so a green run there would mean nothing.
+        let row = drawn[0].1;
+        let rule_col = (inner.x..inner.right())
+            .find(|&x| {
+                buffer
+                    .cell((x, row))
+                    .is_some_and(|c| c.symbol() == GRID_COLUMN_RULE)
+            })
+            .expect("the label's row must draw a grid column rule at this pane width");
+
+        let scroll = app.preview_scroll;
+        let (row_prefix, lines, regions) = app
+            .preview_hit_context(inner_w)
+            .expect("a selected preview");
+        assert_eq!(
+            regions.len(),
+            1,
+            "the production render must have recorded the table cell's one region"
+        );
+        // The premise that makes the probe's width answerable at all: the clamped grid
+        // fills the pane's inner width EXACTLY, so the layout the region's columns were
+        // recorded in is the layout the probe re-renders. A grid laid out at some other
+        // width would put the label's columns somewhere the probe never paints, and
+        // every table region would abstain.
+        assert_eq!(
+            lines[regions[0].content_row].width(),
+            usize::from(inner_w),
+            "the grid must be clamped to fill the pane's inner width exactly, or the \
+             region's columns and the probe's render describe different layouts"
+        );
+        for &(x, y) in &drawn {
+            assert_eq!(
+                link_at(x, y, inner, scroll, row_prefix, lines, regions),
+                LinkProbe::Hit(TABLE_LINK_URL),
+                "a click on drawn cell ({x}, {y}) of a table-cell link must open its url"
+            );
+        }
+        assert_eq!(
+            link_at(rule_col, row, inner, scroll, row_prefix, lines, regions),
+            LinkProbe::NoLink,
+            "the column rule between the cells belongs to no link"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

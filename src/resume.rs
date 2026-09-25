@@ -27,7 +27,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::store::{parse, Session};
+use crate::store::{parse, preview, Session};
 
 /// A ready-to-run hand-off, or a refusal with a user-facing message.
 ///
@@ -611,7 +611,30 @@ pub fn launch(ready: &Ready) -> Result<Option<String>, ResumeError> {
 /// not mistaken for the title). `None` on any other target, where opening a link
 /// is simply a no-op rather than a broken spawn. Pure so the exact invocation is
 /// unit-testable without spawning anything.
+///
+/// `None` ALSO for a url whose scheme snapback does not open, and the SCHEME GATE
+/// lives here rather than one level up for two reasons: this is the single pure
+/// choke point — [`open_url`] structurally cannot spawn without an argv — and being
+/// pure it can be asserted directly, so the refusal is pinned by a test that never
+/// puts a browser on the machine running it. It is needed because only BARE
+/// autolinks are scheme-checked as they are parsed; a `[label](url)` target is
+/// authored by the transcript and arrives VERBATIM, so without this a transcript
+/// could name `file://` — or any other scheme — and have the desktop's default
+/// handler act on it. What is refused is an unintended CAPABILITY — and on ONE arm
+/// more than that, which is worth naming rather than glossing: `open` and `xdg-open`
+/// are exec'd directly with no shell anywhere in the path, but `cmd /C start` hands
+/// the url to `cmd.exe`, which DOES re-parse its command line. So on Windows the
+/// allowlist is also what keeps a shell metacharacter out of a shell. That argv is
+/// unchanged here and Windows ships no prebuilt binary; the point is only that a flat
+/// "no shell is involved" would not be true of it. The rule is not restated
+/// here: it is [`preview::has_openable_scheme`], the SAME predicate the autolink
+/// parser applies, so the renderer and the opener cannot disagree about what a link
+/// is. An empty or whitespace-led url falls to that test too, which is why nothing
+/// checks emptiness separately.
 fn opener_argv(url: &str) -> Option<Vec<String>> {
+    if !preview::has_openable_scheme(url) {
+        return None;
+    }
     #[cfg(target_os = "macos")]
     let argv = Some(vec!["open".to_string(), url.to_string()]);
     #[cfg(target_os = "linux")]
@@ -642,16 +665,14 @@ fn opener_argv(url: &str) -> Option<Vec<String>> {
 /// reaped (no zombie) without the UI thread ever blocking. The opener
 /// (`open`/`xdg-open`) hands the url to the browser and exits promptly.
 ///
-/// FAIL-SOFT throughout: an empty url, an unsupported target, a missing opener, or
-/// a spawn error are all swallowed, so a malformed link or a machine with no
-/// browser can never crash — or even disturb — the board. Child stdio is nulled so
-/// the opener can neither read the board's stdin nor paint over the alt screen.
+/// FAIL-SOFT throughout: an unopenable url (an empty one, or a scheme snapback does
+/// not open — [`opener_argv`] owns that gate), an unsupported target, a missing
+/// opener, or a spawn error are all swallowed, so a malformed link or a machine with
+/// no browser can never crash — or even disturb — the board. Child stdio is nulled
+/// so the opener can neither read the board's stdin nor paint over the alt screen.
 pub fn open_url(url: &str) {
-    if url.trim().is_empty() {
-        return;
-    }
     let Some(argv) = opener_argv(url) else {
-        return; // unsupported target: no-op rather than a broken spawn
+        return; // nothing to open, or an unsupported target: no broken spawn
     };
     std::thread::spawn(move || {
         let mut cmd = command(&argv);
@@ -1203,6 +1224,11 @@ mod tests {
     /// url through verbatim as the final argument, so click-to-open hands the
     /// browser exactly the link under the pointer. Guarded to the supported
     /// targets (the only ones this personal tool builds for).
+    ///
+    /// It is also where the ADMITTED half of the case-insensitive scheme rule is
+    /// pinned: an uppercase scheme is a real https link, so it must reach the
+    /// launcher. That assertion belongs here and not in the refusal test below,
+    /// which is deliberately un-`#[cfg]`-guarded and has no opener to admit to.
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     #[test]
     fn opener_argv_targets_the_platform_launcher_and_passes_the_url_last() {
@@ -1218,6 +1244,57 @@ mod tests {
             "argv[0] must be the OS default-app launcher, got {}",
             argv[0]
         );
+        // RFC 3986 makes a scheme case-insensitive, so this IS an https link: it
+        // passes the gate and still reaches the launcher byte-for-byte unchanged
+        // — nothing lowercases the url on the way through.
+        let upper = "HTTPS://example.com/page?x=1";
+        let upper_argv = opener_argv(upper).expect("an uppercase scheme is still https");
+        assert_eq!(
+            upper_argv.last().map(String::as_str),
+            Some(upper),
+            "an uppercase scheme opens, and is passed through verbatim"
+        );
+    }
+
+    /// The opener refuses every scheme but `http`/`https`, ON EVERY TARGET.
+    ///
+    /// A `[label](url)` target is authored by the transcript and never scheme-checked
+    /// on the way in, so this is the gate that stops one from reaching the desktop's
+    /// default handler. Asserted on `opener_argv` rather than on `open_url` because
+    /// that is the pure half: `open_url` cannot spawn without an argv, and a test of
+    /// the ADMITTED case there would launch a real browser on whoever ran it.
+    ///
+    /// Not `#[cfg]`-guarded to the supported targets, unlike the argv shape above: a
+    /// refusal must hold where there is no opener at all, and the gate sits ahead of
+    /// the per-target arms precisely so it does.
+    ///
+    /// The uppercase spellings are here to prove what matching case-insensitively did
+    /// NOT do. It folds `FILE://` onto `file://`; it does not widen the allowlist past
+    /// `http`/`https`, so shouting a refused scheme still buys a transcript nothing.
+    #[test]
+    fn opener_argv_refuses_a_url_whose_scheme_snapback_does_not_open() {
+        for refused in [
+            // The motivating case: the handler would act on it, and nothing in the
+            // rendered preview tells the reader that is what they are clicking.
+            "file:///etc/passwd",
+            "FILE:///etc/passwd",
+            "javascript:alert(1)",
+            "JavaScript:alert(1)",
+            "data:text/html,<script>",
+            "vscode://file/etc/passwd",
+            "mailto:someone@example.com",
+            "MAILTO:someone@example.com",
+            // Never a link to begin with, and now refused by the same one test
+            // rather than by a second emptiness check.
+            "",
+            "   ",
+            "/relative/path",
+        ] {
+            assert!(
+                opener_argv(refused).is_none(),
+                "{refused:?} must never reach the OS opener"
+            );
+        }
     }
 
     #[test]

@@ -62,7 +62,7 @@ use super::Session;
 /// grid that cannot seat every column at its floor is abandoned for the stacked
 /// record layout, the LAYOUT SWITCH between the two (see [`render_table`]).
 ///
-/// Now that an over-wide cell WRAPS instead of being cut ([`wrap_spans`]), a
+/// Now that an over-wide cell WRAPS instead of being cut ([`wrap_span_cells`]), a
 /// column narrower than this turns its text vertical — one or two chars per
 /// line — which reads worse than no grid at all. Pinned at 10: a typical
 /// transcript cell is a short phrase of ~20 columns, so 10 still seats one or
@@ -75,6 +75,16 @@ use super::Session;
 /// whose NATURAL width is already below the floor only ever costs its natural
 /// width, so a table of short cells is never dumped into records for want of
 /// room it would not have used.
+///
+/// Because GRID mode is the only table layout that records clickable
+/// [`LinkRegion`]s (see [`markdown_body_lines_collect`]), this switch also decides
+/// whether a table's links are CLICKABLE AT ALL: the same table answers clicks in a
+/// pane wide enough to seat its floors and goes inert the moment a splitter drag
+/// pushes it into records. That is a deliberate answer rather than an oversight —
+/// record mode cannot place a region correctly (its lines are re-wrapped by the
+/// pane), and a region that cannot be placed correctly is worse than none — but it
+/// does mean clickability is width-dependent, so the switch point is pinned by
+/// `the_record_fallback_switch_points_are_pinned_at_a_62_column_pane`.
 const TABLE_MIN_COL_WIDTH: usize = 10;
 
 /// Width of the DIM `─` rule that separates two stacked records in the
@@ -102,6 +112,27 @@ const TABLE_MIN_COL_WIDTH: usize = 10;
 /// wrap costs a few rows rather than a screenful (a 64-wide rule would cost eight
 /// rows at width 8 where this one costs four).
 const RECORD_RULE_WIDTH: usize = 32;
+
+/// The rule drawn between two adjacent GRID columns on a data row (see
+/// [`table_data_lines`]); [`table_separator_line`] draws the matching `─┼─` in the
+/// same columns so the junction lines up with the `│` above it.
+const COLUMN_RULE: &str = " \u{2502} ";
+
+/// Display width of [`COLUMN_RULE`] — what a grid spends on chrome between two
+/// adjacent columns. Pinned at 3 because the rule is one glyph with a column of
+/// air either side.
+///
+/// It is the ONE number the column budget, the separator row and the link-region
+/// column math all measure that chrome with, and the last of those makes it
+/// load-bearing rather than cosmetic: a cell's link regions are offset past every
+/// preceding rule, so a wrong value here would land a recorded region ON a rule and
+/// make a click on chrome open a url.
+const COLUMN_RULE_WIDTH: usize = 3;
+
+/// Display width of the `…` (U+2026) [`truncate_spans`] appends when it cuts a run
+/// short: the one column it reserves out of the budget, and the one column a
+/// clamped grid line spends on chrome instead of cell text.
+const ELLIPSIS_WIDTH: usize = 1;
 
 /// A clickable link inside the rendered preview, in CONTENT coordinates (before
 /// the preview's soft-wrap is applied at draw time).
@@ -889,6 +920,30 @@ fn markdown_body_lines(body: &str, width: usize) -> Vec<Line<'static>> {
 /// `content_row`, shifting their columns past the line's `prefix_width` (a list
 /// bullet, blockquote rule, or ordered-item number) so the recorded columns match
 /// where the label actually renders.
+///
+/// A ZERO-WIDTH region is DROPPED — the guard the GRID table path already applies
+/// at both of its ends ([`link_tagged_cells`], [`cell_link_fragments`]), owed here
+/// for the same reason. Such a region occupies no column, so there is nothing a
+/// reader could aim at: it costs budget without being a plausible target. It
+/// inflates the candidate COUNT that `view::probe_within_budget` multiplies while
+/// contributing no bytes for that count to be multiplied against, and it can push a
+/// line carrying a REAL link past the budget and downgrade a resolvable click to
+/// `LinkProbe::Unresolvable`.
+///
+/// Dropping it is safe in the direction this module always fails. `view::link_at`
+/// answers through `view::region_paints_cell`, which marks clusters via
+/// `view::region_char_positions`, and THAT test (`col < col_end && col +
+/// cluster_cols > col_start`) a cluster STRICTLY STRADDLING the two equal columns
+/// would still satisfy — per-span and per-cluster widths need not agree, because
+/// `unicode-width` is a contextual fold. So the claim here is not that such a
+/// region decides nothing; it is that were a straddling cluster ever reachable,
+/// dropping the region costs a MISSED CLICK and never a wrong url — the same
+/// direction the budget's own abstention takes.
+///
+/// Filtered HERE, on the finished region, rather than at the parse in
+/// [`match_link`], because the disqualifying property is zero DISPLAY WIDTH and not
+/// an empty source label: `[\u{200B}](https://x)` has a label that is non-empty in
+/// bytes and still renders to nothing, and only a width test catches both.
 fn regions_from_inline(
     content_row: usize,
     prefix_width: usize,
@@ -896,6 +951,7 @@ fn regions_from_inline(
 ) -> Vec<LinkRegion> {
     inline
         .into_iter()
+        .filter(|l| l.col_end > l.col_start)
         .map(|l| LinkRegion {
             content_row,
             col_start: prefix_width + l.col_start,
@@ -916,19 +972,19 @@ fn regions_from_inline(
 /// Deliberately minimal — it favors predictable, restrained styling over full
 /// CommonMark.
 ///
-/// Only the prose branches (paragraph, blockquote, unordered / ordered list item)
-/// inline-parse and can carry links; headers push raw text, fenced code is
-/// verbatim, and GFM table cells are inline-parsed but their link columns are
-/// still NOT recorded, so a table-cell link is never a wrong hit.
+/// The prose branches (paragraph, blockquote, unordered / ordered list item) and
+/// GFM tables in GRID mode carry links; headers push raw text and fenced code is
+/// verbatim, so neither can.
 ///
-/// The reason is the LAYOUT, not truncation — nothing in a table is cut any more
-/// (see [`render_table`]). A cell's label no longer sits at one known column:
-/// grid mode wraps a cell down its column, so the label may start on any of the
-/// row's visual lines at a per-line offset the padding shifts, and record mode
-/// drops the grid entirely and re-emits the cell behind a `Header: ` prefix on a
-/// line the pane then soft-wraps. Mapping either back to a `(content_row,
-/// col_start..col_end)` region is a second, layout-aware pass; until it exists,
-/// recording nothing keeps the promise that a click never opens the wrong url.
+/// A grid cell's label does not sit at one known column — the cell WRAPS down its
+/// column and the alignment padding shifts each visual line — so the table path
+/// maps every wrapped label FRAGMENT back to its own row and column span and emits
+/// one region per fragment (see [`table_data_lines`]). Record mode still records
+/// NOTHING: it drops the grid entirely and re-emits each cell behind a `Header: `
+/// prefix on an ordinary logical line that the pane's own `Wrap { trim: false }`
+/// then re-wraps, so columns measured here would not survive to the paint.
+/// Recording nothing there keeps the promise that a click never opens the wrong
+/// url — and a table in record mode is in a narrow pane by definition.
 fn markdown_body_lines_collect(body: &str, width: usize) -> (Vec<Line<'static>>, Vec<LinkRegion>) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut links: Vec<LinkRegion> = Vec::new();
@@ -961,10 +1017,11 @@ fn markdown_body_lines_collect(body: &str, width: usize) -> (Vec<Line<'static>>,
         // by a valid delimiter row (`:?-+:?` cells). The delimiter row is REQUIRED,
         // so a stray `|` in ordinary prose is never mistaken for a table. (`in_fence`
         // is already false here — the fenced-code branch above `continue`s.)
-        // v1: table cells may hold links but their columns are not mapped (see the
-        // doc comment), so no regions are recorded here.
+        // Grid mode maps each wrapped cell label back to its row and columns;
+        // record mode records nothing (see the doc comment for why).
         if trimmed.contains('|') && rows.get(i + 1).copied().is_some_and(is_table_delimiter) {
-            let (table_lines, consumed) = render_table(&rows[i..], width);
+            let (table_lines, table_links, consumed) = render_table(&rows[i..], width);
+            links.extend(rebased(table_links, lines.len()));
             lines.extend(table_lines);
             i += consumed;
             continue;
@@ -1087,7 +1144,7 @@ fn ordered_item(line: &str) -> Option<(u64, &str)> {
 // cost instead. There are two layouts and `render_table` chooses between them:
 //
 // * GRID (the default) shrinks the columns to fit, then WRAPS an over-wide cell
-//   down its own column (`wrap_spans`), so a row is as many visual lines as its
+//   down its own column (`wrap_span_cells`), so a row is as many visual lines as its
 //   tallest cell needs. Columns never shrink past `TABLE_MIN_COL_WIDTH`, because
 //   a narrower one would wrap its text into a vertical stack of single chars.
 //   Because a row is no longer one line, the SAME `─┼─` rule that sits under the
@@ -1220,7 +1277,7 @@ fn truncate_spans(spans: &[Span<'static>], width: usize, ellipsis: Style) -> Vec
     if width == 0 {
         return Vec::new();
     }
-    let budget = width - 1; // reserve one column for the ellipsis
+    let budget = width - ELLIPSIS_WIDTH; // reserve the ellipsis' own column
     let mut out: Vec<Span<'static>> = Vec::new();
     let mut used = 0usize;
     'outer: for span in spans {
@@ -1244,8 +1301,57 @@ fn truncate_spans(spans: &[Span<'static>], width: usize, ellipsis: Style) -> Vec
     out
 }
 
-/// Word-wrap parsed cell `spans` to at most `width` display columns, returning ONE
-/// span run per visual line. The sibling of [`truncate_spans`], and its opposite:
+/// One grapheme cluster on its way through [`wrap_span_cells`]: the text, the style
+/// it renders with, its display width, and the index of the [`InlineLink`] whose
+/// visible LABEL it belongs to (`None` for ordinary text).
+///
+/// The link index is THREADED through the wrap rather than recovered afterwards
+/// from `Modifier::UNDERLINED`. Styling is a rendering decision, not an identity:
+/// two adjacent labels wear the same modifier, so it could not tell one link from
+/// the next — and anything else the preview ever underlines would read as a link.
+#[derive(Clone, Copy)]
+struct WrapCell<'a> {
+    text: &'a str,
+    style: Style,
+    width: usize,
+    link: Option<usize>,
+}
+
+/// Explode parsed `spans` into one [`WrapCell`] per grapheme cluster, tagging every
+/// cluster of a link's visible label with that link's index in `links`.
+///
+/// A label is always exactly ONE span — [`parse_inline_collect`] pushes the visible
+/// text whole and parses no markdown inside it — so a link is matched to its span
+/// by the display columns BOTH sides already agree on. The running per-span width
+/// here reproduces that function's column cursor exactly, because both advance by
+/// the same whole-span [`display_width`] (never a per-cluster sum, which
+/// `unicode-width`'s contextual fold does not have to equal). Start AND end must
+/// match, so an empty span parked at a label's start column can never be mistaken
+/// for it.
+fn link_tagged_cells<'a>(spans: &'a [Span<'static>], links: &[InlineLink]) -> Vec<WrapCell<'a>> {
+    let mut cells: Vec<WrapCell<'a>> = Vec::new();
+    let mut col = 0usize;
+    for span in spans {
+        let text = span.content.as_ref();
+        let end = col + display_width(text);
+        let link = links
+            .iter()
+            .position(|l| l.col_start == col && l.col_end == end && l.col_end > l.col_start);
+        for g in text.graphemes(true) {
+            cells.push(WrapCell {
+                text: g,
+                style: span.style,
+                width: display_width(g),
+                link,
+            });
+        }
+        col = end;
+    }
+    cells
+}
+
+/// Word-wrap parsed cell `cells` to at most `width` display columns, returning ONE
+/// cluster run per visual line. The sibling of [`truncate_spans`], and its opposite:
 /// where that one CUTS at the column budget, this one spends vertical space, so a
 /// cell too wide for its column costs LINES rather than characters (see
 /// [`render_table_grid`]).
@@ -1271,21 +1377,18 @@ fn truncate_spans(spans: &[Span<'static>], width: usize, ellipsis: Style) -> Vec
 /// forever. Grid mode keeps that last case unreachable — a column holding a
 /// 2-column cluster has a natural width of at least 2, hence a floor of at least
 /// 2 — but the helper does not rely on its caller for totality.
-fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
+///
+/// Clusters come out in SOURCE ORDER and each line holds a contiguous run of them:
+/// only the whitespace a line actually broke on is dropped, and nothing is ever
+/// reordered. That is what lets a caller follow a link label across the break —
+/// [`cell_link_fragments`].
+fn wrap_span_cells<'a>(cells: &[WrapCell<'a>], width: usize) -> Vec<Vec<WrapCell<'a>>> {
     if width == 0 {
         return Vec::new();
     }
-    // One entry per grapheme cluster, carrying the style of the span it came from
-    // and its display width, so a break can only ever land BETWEEN two entries.
-    let mut cells: Vec<(&str, Style, usize)> = Vec::new();
-    for span in spans {
-        for g in span.content.as_ref().graphemes(true) {
-            cells.push((g, span.style, display_width(g)));
-        }
-    }
 
-    let mut lines: Vec<Vec<Span<'static>>> = Vec::new();
-    let mut cur: Vec<(&str, Style, usize)> = Vec::new();
+    let mut lines: Vec<Vec<WrapCell<'a>>> = Vec::new();
+    let mut cur: Vec<WrapCell<'a>> = Vec::new();
     let mut cur_w = 0usize;
 
     let mut i = 0usize;
@@ -1293,18 +1396,18 @@ fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> 
         // A run of whitespace is a break OPPORTUNITY: kept when the word after it
         // still fits this line, dropped when that word starts a new one.
         let gap_start = i;
-        while i < cells.len() && is_blank_cluster(cells[i].0) {
+        while i < cells.len() && is_blank_cluster(cells[i].text) {
             i += 1;
         }
         let gap = &cells[gap_start..i];
-        let gap_w: usize = gap.iter().map(|c| c.2).sum();
+        let gap_w: usize = gap.iter().map(|c| c.width).sum();
 
         let word_start = i;
-        while i < cells.len() && !is_blank_cluster(cells[i].0) {
+        while i < cells.len() && !is_blank_cluster(cells[i].text) {
             i += 1;
         }
         let word = &cells[word_start..i];
-        let word_w: usize = word.iter().map(|c| c.2).sum();
+        let word_w: usize = word.iter().map(|c| c.width).sum();
 
         if word.is_empty() {
             // Trailing whitespace, so this is the last turn: keep only what still
@@ -1318,8 +1421,7 @@ fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> 
 
         if !cur.is_empty() {
             if cur_w + gap_w + word_w > width {
-                lines.push(coalesce_cells(&cur));
-                cur.clear();
+                lines.push(std::mem::take(&mut cur));
                 cur_w = 0;
             } else {
                 cur.extend_from_slice(gap);
@@ -1331,7 +1433,7 @@ fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> 
         // of it cannot fit one.
         let mut rest = word;
         loop {
-            let rest_w: usize = rest.iter().map(|c| c.2).sum();
+            let rest_w: usize = rest.iter().map(|c| c.width).sum();
             if cur_w + rest_w <= width {
                 cur.extend_from_slice(rest);
                 cur_w += rest_w;
@@ -1339,8 +1441,8 @@ fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> 
             }
             let mut take = 0usize;
             let mut take_w = 0usize;
-            while take < rest.len() && cur_w + take_w + rest[take].2 <= width {
-                take_w += rest[take].2;
+            while take < rest.len() && cur_w + take_w + rest[take].width <= width {
+                take_w += rest[take].width;
                 take += 1;
             }
             if take == 0 && cur.is_empty() {
@@ -1349,8 +1451,7 @@ fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> 
                 take = 1;
             }
             cur.extend_from_slice(&rest[..take]);
-            lines.push(coalesce_cells(&cur));
-            cur.clear();
+            lines.push(std::mem::take(&mut cur));
             cur_w = 0;
             rest = &rest[take..];
             if rest.is_empty() {
@@ -1359,30 +1460,59 @@ fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> 
         }
     }
     if !cur.is_empty() {
-        lines.push(coalesce_cells(&cur));
+        lines.push(cur);
     }
     lines
 }
 
 /// Is this grapheme cluster whitespace — i.e. a break opportunity for
-/// [`wrap_spans`] rather than content?
+/// [`wrap_span_cells`] rather than content?
 fn is_blank_cluster(g: &str) -> bool {
     g.chars().all(char::is_whitespace)
 }
 
 /// Rebuild one wrapped line's grapheme cells back into spans, merging each run
-/// that shares a style. The output is span-for-span what [`wrap_spans`] was
-/// handed, minus the break points — so a cell's inline styling (DIM code, a bold
-/// run, an underlined link label) survives the wrap intact.
-fn coalesce_cells(cells: &[(&str, Style, usize)]) -> Vec<Span<'static>> {
+/// that shares a style AND a link tag. The output is span-for-span what
+/// [`link_tagged_cells`] was handed, minus the break points — so a cell's inline
+/// styling (DIM code, a bold run, an underlined link label) survives the wrap
+/// intact.
+///
+/// The link tag is part of the merge key so two ADJACENT labels stay two spans, as
+/// [`parse_inline_collect`] emitted them, instead of collapsing into one on the
+/// strength of sharing `UNDERLINED`. That costs nothing visually (the two spans
+/// carry identical styles) and buys the caller a guarantee it relies on: a link
+/// fragment's boundaries are always span boundaries, so measuring a prefix of the
+/// line measures exactly what is painted before that fragment.
+fn coalesce_cells(cells: &[WrapCell<'_>]) -> Vec<Span<'static>> {
     let mut out: Vec<Span<'static>> = Vec::new();
-    for (text, style, _) in cells {
+    let mut last_link: Option<usize> = None;
+    for cell in cells {
         match out.last_mut() {
-            Some(last) if last.style == *style => last.content.to_mut().push_str(text),
-            _ => out.push(Span::styled((*text).to_string(), *style)),
+            Some(last) if last.style == cell.style && last_link == cell.link => {
+                last.content.to_mut().push_str(cell.text);
+            }
+            _ => out.push(Span::styled(cell.text.to_string(), cell.style)),
         }
+        last_link = cell.link;
     }
     out
+}
+
+/// The LEFT padding [`pad_cell_spans`] inserts ahead of a fitted cell's text: none
+/// for a left-aligned cell, all of it for a right-aligned one, half (rounded down)
+/// for a centered one.
+///
+/// Split out so a cell's text START column has exactly ONE definition. The padder
+/// and the link-region math both ask it, so they cannot drift into disagreeing
+/// about where a cell's text begins — and a region that started at the wrong column
+/// would cover padding.
+fn cell_pad_left(fitted_w: usize, width: usize, align: Align) -> usize {
+    let pad = width.saturating_sub(fitted_w);
+    match align {
+        Align::Left => 0,
+        Align::Right => pad,
+        Align::Center => pad / 2,
+    }
 }
 
 /// Pad fitted cell `spans` (display width `fitted_w`, already `<= width`) out to
@@ -1399,11 +1529,8 @@ fn pad_cell_spans(
     if pad == 0 {
         return spans;
     }
-    let (left, right) = match align {
-        Align::Left => (0, pad),
-        Align::Right => (pad, 0),
-        Align::Center => (pad / 2, pad - pad / 2),
-    };
+    let left = cell_pad_left(fitted_w, width, align);
+    let right = pad - left;
     let mut out = Vec::with_capacity(spans.len() + 2);
     if left > 0 {
         out.push(Span::styled(" ".repeat(left), base));
@@ -1415,20 +1542,88 @@ fn pad_cell_spans(
     out
 }
 
+/// One visual line of a wrapped, padded table cell: the span run the grid draws,
+/// plus the link label fragments that landed on it in columns RELATIVE to the
+/// cell's own left edge (the alignment padding already accounted for).
+struct WrappedCellLine {
+    spans: Vec<Span<'static>>,
+    links: Vec<InlineLink>,
+}
+
 /// Wrap one table cell to `width` display columns: inline-parse `raw` over `base`
 /// (so `**bold**`/`` `code` ``/`[a](b)` style inside the cell), word-wrap the
 /// result, then pad EVERY visual line out to exactly `width` per `align`. Returns
-/// one span run per visual line — the cell's height in the grid. Width is
-/// measured on the stripped display text, so styled and plain cells stay
-/// column-aligned on every one of those lines.
-fn wrap_cell_spans(raw: &str, width: usize, align: Align, base: Style) -> Vec<Vec<Span<'static>>> {
-    wrap_spans(&parse_inline(raw, base), width)
+/// one entry per visual line — the cell's height in the grid. Width is measured on
+/// the stripped display text, so styled and plain cells stay column-aligned on
+/// every one of those lines.
+///
+/// It parses with [`parse_inline_collect`] rather than [`parse_inline`] so the link
+/// metadata survives the wrap instead of being thrown away: each returned line
+/// carries the label fragments that landed on it, which is what makes a table-cell
+/// link clickable at all.
+fn wrap_cell_spans(raw: &str, width: usize, align: Align, base: Style) -> Vec<WrappedCellLine> {
+    let (spans, links) = parse_inline_collect(raw, base);
+    let cells = link_tagged_cells(&spans, &links);
+    wrap_span_cells(&cells, width)
         .into_iter()
         .map(|line| {
-            let w = spans_display_width(&line);
-            pad_cell_spans(line, w, width, align, base)
+            let fitted = coalesce_cells(&line);
+            let w = spans_display_width(&fitted);
+            let left = cell_pad_left(w, width, align);
+            WrappedCellLine {
+                links: cell_link_fragments(&line, left, &links),
+                spans: pad_cell_spans(fitted, w, width, align, base),
+            }
         })
         .collect()
+}
+
+/// The link label fragments on ONE wrapped line of a cell, in columns relative to
+/// that cell's left edge: `left` (the alignment padding [`pad_cell_spans`] is about
+/// to insert) plus the width of the line's own text ahead of the fragment.
+///
+/// A fragment is a maximal run of clusters carrying the SAME link index, so a label
+/// broken across two visual lines yields one fragment per line — each on its own
+/// content row — and two adjacent labels never merge into one region.
+///
+/// Both ends are measured with [`spans_display_width`] over [`coalesce_cells`], the
+/// exact pair the fitted width and the padding are computed with, and a fragment's
+/// bounds are merge-key boundaries ([`coalesce_cells`] keeps two links apart), so
+/// the measured prefix is the painted prefix rather than an approximation of it.
+///
+/// The columns therefore cover the label's own clusters ONLY: never the alignment
+/// padding on either side of it, and never the [`COLUMN_RULE`] the caller draws
+/// outside the cell entirely.
+fn cell_link_fragments(
+    line: &[WrapCell<'_>],
+    left: usize,
+    links: &[InlineLink],
+) -> Vec<InlineLink> {
+    let mut out: Vec<InlineLink> = Vec::new();
+    let mut i = 0usize;
+    while i < line.len() {
+        let Some(idx) = line[i].link else {
+            i += 1;
+            continue;
+        };
+        let start = i;
+        while i < line.len() && line[i].link == Some(idx) {
+            i += 1;
+        }
+        // Fail soft: a tag with no link behind it records nothing rather than
+        // panicking on the index.
+        let Some(link) = links.get(idx) else { continue };
+        let col_start = left + spans_display_width(&coalesce_cells(&line[..start]));
+        let col_end = col_start + spans_display_width(&coalesce_cells(&line[start..i]));
+        if col_end > col_start {
+            out.push(InlineLink {
+                col_start,
+                col_end,
+                url: link.url.clone(),
+            });
+        }
+    }
+    out
 }
 
 /// Total display width of a `Line`'s spans (terminal columns).
@@ -1526,9 +1721,12 @@ fn column_floors(natural: &[usize]) -> Vec<usize> {
 ///   no grid left to scatter, so each row is stacked as `Header: value` lines and
 ///   left for the pane's own soft wrap.
 ///
-/// Neither layout records link regions for its cells; see
-/// [`markdown_body_lines_collect`] for why.
-fn render_table(rows: &[&str], width: usize) -> (Vec<Line<'static>>, usize) {
+/// Only the GRID layout records link regions: it returns one [`LinkRegion`] per
+/// wrapped cell-label fragment, in columns relative to its first line. Record mode
+/// returns none — see [`markdown_body_lines_collect`] for why, and
+/// [`TABLE_MIN_COL_WIDTH`] for what that means for a table that changes layout on a
+/// splitter drag.
+fn render_table(rows: &[&str], width: usize) -> (Vec<Line<'static>>, Vec<LinkRegion>, usize) {
     let headers = split_table_row(rows[0]);
     let ncols = headers.len().max(1);
 
@@ -1570,18 +1768,20 @@ fn render_table(rows: &[&str], width: usize) -> (Vec<Line<'static>>, usize) {
     // of it, so a wide one fills the pane edge to edge and follows a splitter
     // drag. No scrollbar column is subtracted: it overlays the block's right
     // border, not a content column.
-    let sep_total = 3 * ncols.saturating_sub(1);
+    let sep_total = COLUMN_RULE_WIDTH * ncols.saturating_sub(1);
 
     // ONE number governs both the choice and the layout, so a grid is only ever
     // chosen when its floors are actually affordable inside it.
     let floors = column_floors(&natural);
     let min_grid_width = floors.iter().sum::<usize>() + sep_total;
-    let lines = if min_grid_width <= width {
+    let (lines, links) = if min_grid_width <= width {
         render_table_grid(&header_cells, &body_rows, &aligns, natural, &floors, width)
     } else {
-        render_table_records(&header_cells, &body_rows)
+        // Record mode records no regions at all: its lines are handed to the pane's
+        // own soft wrap, which would move any column measured here.
+        (render_table_records(&header_cells, &body_rows), Vec::new())
     };
-    (lines, consumed)
+    (lines, links, consumed)
 }
 
 /// The GRID layout: header row, `─┼─` separator, then one block of visual lines
@@ -1604,6 +1804,12 @@ fn render_table(rows: &[&str], width: usize) -> (Vec<Line<'static>>, usize) {
 /// grid mode is only entered when the floors fit — and [`clamp_line_to_width`]
 /// stays as the backstop that keeps the guarantee true if the arithmetic above it
 /// ever drifts.
+///
+/// That no-wrap guarantee is also what makes this the layout that can record
+/// clickable [`LinkRegion`]s: a grid line reaches the pane already fitted, so its
+/// recorded columns are the columns painted, with no wrap between the two to shift
+/// them. The HEADER row is in scope exactly like a body row — both are built by
+/// [`table_data_lines`], so a link in a header cell is clickable too.
 fn render_table_grid(
     header_cells: &[String],
     body_rows: &[Vec<String>],
@@ -1611,18 +1817,22 @@ fn render_table_grid(
     natural: Vec<usize>,
     floors: &[usize],
     width: usize,
-) -> Vec<Line<'static>> {
-    let sep_total = 3 * floors.len().saturating_sub(1);
+) -> (Vec<Line<'static>>, Vec<LinkRegion>) {
+    let sep_total = COLUMN_RULE_WIDTH * floors.len().saturating_sub(1);
     let budget = width.saturating_sub(sep_total);
     let widths = fit_widths(natural, floors, budget);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
-    lines.extend(table_data_lines(
+    let mut links: Vec<LinkRegion> = Vec::new();
+
+    let (header_lines, header_links) = table_data_lines(
         header_cells,
         &widths,
         aligns,
         base_style().add_modifier(Modifier::BOLD),
-    ));
+    );
+    links.extend(rebased(header_links, lines.len()));
+    lines.extend(header_lines);
     lines.push(table_separator_line(&widths));
     for (i, row) in body_rows.iter().enumerate() {
         // A rule per row BOUNDARY — between adjacent body rows only. Since a
@@ -1633,13 +1843,55 @@ fn render_table_grid(
         if i > 0 {
             lines.push(table_separator_line(&widths));
         }
-        lines.extend(table_data_lines(row, &widths, aligns, base_style()));
+        let (row_lines, row_links) = table_data_lines(row, &widths, aligns, base_style());
+        links.extend(rebased(row_links, lines.len()));
+        lines.extend(row_lines);
     }
 
-    lines
+    clamped_grid(lines, links, width)
+}
+
+/// Apply the [`clamp_line_to_width`] backstop to a finished grid, and keep its link
+/// regions honest about what the clamp left behind: a region reaching past the cut
+/// is CLIPPED to the columns that survived, and one left with no columns at all is
+/// DROPPED.
+///
+/// The clamp should never fire — grid mode is only entered when every column's
+/// floor fits the pane — but if drift ever made it fire, a region must not keep
+/// pointing at columns the line no longer draws, nor at the `…` that replaced them.
+/// Chrome is never clickable, including chrome that only appears once something
+/// else has already gone wrong.
+fn clamped_grid(
+    lines: Vec<Line<'static>>,
+    links: Vec<LinkRegion>,
+    width: usize,
+) -> (Vec<Line<'static>>, Vec<LinkRegion>) {
+    // Per row, the columns that still hold CELL TEXT: the whole line when it fit,
+    // and everything but the trailing ellipsis when it did not.
+    let mut visible: Vec<usize> = Vec::with_capacity(lines.len());
+    let mut clamped: Vec<Line<'static>> = Vec::with_capacity(lines.len());
+    for line in lines {
+        let before = line_display_width(&line);
+        let line = clamp_line_to_width(line, width);
+        visible.push(if before <= width {
+            before
+        } else {
+            line_display_width(&line).saturating_sub(ELLIPSIS_WIDTH)
+        });
+        clamped.push(line);
+    }
+
+    let links = links
         .into_iter()
-        .map(|l| clamp_line_to_width(l, width))
-        .collect()
+        .filter_map(|r| {
+            let limit = visible.get(r.content_row).copied().unwrap_or(0);
+            (r.col_start < limit).then(|| LinkRegion {
+                col_end: r.col_end.min(limit),
+                ..r
+            })
+        })
+        .collect();
+    (clamped, links)
 }
 
 /// The narrow-pane FALLBACK layout: with no grid that can seat every column at
@@ -1707,35 +1959,60 @@ fn render_table_records(header_cells: &[String], body_rows: &[Vec<String>]) -> V
 /// so every visual line of the row shares one display width and one rule column,
 /// and the grid never scatters. A row always occupies at least one line, even
 /// when every cell in it is empty.
+///
+/// Alongside the lines it returns ONE [`LinkRegion`] per wrapped label fragment,
+/// with `content_row` relative to the FIRST line returned here (the caller rebases
+/// it onto the transcript). A cell's fragments arrive in columns relative to that
+/// cell, and are shifted onto the row by the cell's own left edge — the running
+/// `sum(widths[0..c]) + COLUMN_RULE_WIDTH * c` accumulated below. A fragment covers
+/// its label's clusters alone ([`cell_link_fragments`]) and the edge accounts for
+/// every rule ahead of it, so a recorded region can reach neither the alignment
+/// padding nor a [`COLUMN_RULE`]: clicking chrome never opens a url.
+///
+/// These lines are also the only table lines a region is recorded for, and they are
+/// CLAMPED to the pane rather than soft-wrapped by it (see [`render_table_grid`]),
+/// so a grid region always resolves at `sub_row` 0 and its columns are exact.
 fn table_data_lines(
     cells: &[String],
     widths: &[usize],
     aligns: &[Align],
     cell_style: Style,
-) -> Vec<Line<'static>> {
-    let wrapped: Vec<Vec<Vec<Span<'static>>>> = widths
+) -> (Vec<Line<'static>>, Vec<LinkRegion>) {
+    let wrapped: Vec<Vec<WrappedCellLine>> = widths
         .iter()
         .enumerate()
         .map(|(c, width)| wrap_cell_spans(&cells[c], *width, aligns[c], cell_style))
         .collect();
     let height = wrapped.iter().map(Vec::len).max().unwrap_or(0).max(1);
 
-    (0..height)
-        .map(|row| {
-            let mut spans: Vec<Span<'static>> = Vec::new();
-            for (c, width) in widths.iter().enumerate() {
-                if c > 0 {
-                    spans.push(Span::styled(" \u{2502} ".to_string(), table_border_style()));
-                }
-                match wrapped[c].get(row) {
-                    Some(line) => spans.extend(line.iter().cloned()),
-                    // This cell is shorter than the row: hold its column open.
-                    None => spans.push(Span::styled(" ".repeat(*width), cell_style)),
-                }
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(height);
+    let mut links: Vec<LinkRegion> = Vec::new();
+    for row in 0..height {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut edge = 0usize;
+        for (c, width) in widths.iter().enumerate() {
+            if c > 0 {
+                spans.push(Span::styled(COLUMN_RULE.to_string(), table_border_style()));
+                edge += COLUMN_RULE_WIDTH;
             }
-            Line::from(spans)
-        })
-        .collect()
+            match wrapped[c].get(row) {
+                Some(cell) => {
+                    spans.extend(cell.spans.iter().cloned());
+                    links.extend(cell.links.iter().map(|l| LinkRegion {
+                        content_row: row,
+                        col_start: edge + l.col_start,
+                        col_end: edge + l.col_end,
+                        url: l.url.clone(),
+                    }));
+                }
+                // This cell is shorter than the row: hold its column open.
+                None => spans.push(Span::styled(" ".repeat(*width), cell_style)),
+            }
+            edge += *width;
+        }
+        lines.push(Line::from(spans));
+    }
+    (lines, links)
 }
 
 /// Build a DIM box-drawing separator row: `─` fill per column, `─┼─` at the
@@ -1774,6 +2051,19 @@ fn match_delim<'a>(rest: &'a str, delim: &str) -> Option<(&'a str, usize)> {
 /// label nor url may contain its own closing bracket (no nesting). Any
 /// unclosed/malformed form (e.g. `[text](`) returns `None` so the `[` falls back
 /// to literal text, mirroring the unclosed-delimiter behavior.
+///
+/// `[]()` — empty on BOTH sides — is rejected too, which is [`match_delim`]'s
+/// empty-span rule applied to the other bracket form. There is nothing to show for
+/// it: the empty-LABEL fallback renders the url instead, and here the url is empty
+/// as well, so accepting it emits an EMPTY span and silently swallows four
+/// characters the transcript actually contains. Rejecting it renders them as the
+/// literal text they are, and — the part `view::LINK_PROBE_BYTE_BUDGET` rests on —
+/// keeps this empty form from being REPEATABLE: accepted, `[]()` emits one empty
+/// span per four bytes, so a line of them carries a span count no byte measure can
+/// price. Refusing it here is what bounds that count; it does not make every span
+/// non-empty, and the budget does not need it to (see that constant's doc for the
+/// bound, and [`regions_from_inline`] for the zero-width-region half).
+/// An empty label with a REAL url keeps working: that fallback is deliberate.
 fn match_link(rest: &str) -> Option<(&str, &str, usize)> {
     let after_open = rest.strip_prefix('[')?;
     let label_end = after_open.find(']')?;
@@ -1781,24 +2071,70 @@ fn match_link(rest: &str) -> Option<(&str, &str, usize)> {
     let after_paren = after_open[label_end + 1..].strip_prefix('(')?;
     let url_end = after_paren.find(')')?;
     let url = &after_paren[..url_end];
+    if label.is_empty() && url.is_empty() {
+        return None;
+    }
     // '[' + label + ']' + '(' + url + ')'
     let consumed = 1 + label_end + 1 + 1 + url_end + 1;
     Some((label, url, consumed))
 }
 
+/// The URL schemes snapback recognises and is willing to hand to the OS opener.
+///
+/// An ALLOWLIST, not a denylist, because the input is a hostile, undocumented
+/// transcript: the question asked is "is this one of the two things a preview link
+/// is allowed to be", never "is this one of the things we remembered to forbid".
+const OPENABLE_SCHEMES: &[&str] = &["http://", "https://"];
+
+/// Does `s` BEGIN with a scheme from [`OPENABLE_SCHEMES`]?
+///
+/// ONE rule with TWO readers, which is the whole reason it is a function rather
+/// than a pair of `starts_with` calls. [`match_autolink`] asks it of the REMAINING
+/// LINE, to decide whether a bare url starts here; `resume::opener_argv` — the gate
+/// every opened link passes through — asks it of a RESOLVED url, because a
+/// `[label](url)` target is authored by the transcript and reaches the opener
+/// verbatim, the bracket form being scheme-checked nowhere on the way in the way an
+/// autolink is. `tui::update::resolve_link_click` asks it a third time, to split a
+/// clicked hit into `LinkClick::Opening` or `LinkClick::RefusedScheme` before
+/// anything is said or spawned. Written out separately they would drift, and the
+/// drift shows up as the renderer underlining something the opener silently refuses.
+///
+/// The scheme match is ASCII CASE-INSENSITIVE, because RFC 3986 schemes are:
+/// `HTTPS://example.com` genuinely IS an https link, and refusing it under a status
+/// line reading "only http/https links open" tells the reader something untrue about
+/// the url in front of them. The comparison runs over BYTES rather than a `str`
+/// slice: `s[..scheme.len()]` PANICS when that byte index lands inside a multi-byte
+/// character, and a url led by one is reachable from a hostile transcript, whereas
+/// `as_bytes().get(..)` answers `None` for a too-short input and can never panic.
+/// Pure and allocation-free — nothing is lowercased, only compared.
+pub(crate) fn has_openable_scheme(s: &str) -> bool {
+    OPENABLE_SCHEMES.iter().any(|scheme| {
+        s.as_bytes()
+            .get(..scheme.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(scheme.as_bytes()))
+    })
+}
+
 /// If `rest` begins with a bare `http://` / `https://` autolink, return the URL
-/// slice and its byte length. The URL runs to the first ASCII whitespace or angle
-/// bracket; a trailing run of sentence punctuation (`.,;:!?`) is excluded so a URL
-/// ending a sentence renders cleanly. A bare scheme with no host is not a link.
+/// slice and its byte length. The scheme match is ASCII CASE-INSENSITIVE, the rule
+/// being [`has_openable_scheme`]'s alone. The URL runs to the first ASCII whitespace
+/// or angle bracket; a trailing run of sentence punctuation (`.,;:!?`) is excluded so
+/// a URL ending a sentence renders cleanly. A bare scheme with no host is not a link
+/// — and THAT test must ignore case for the same reason the first one does, or an
+/// uppercase `HTTP://` would clear the predicate, miss a case-sensitive guard, and
+/// render underlined over a url with no host to open.
 fn match_autolink(rest: &str) -> Option<(&str, usize)> {
-    if !(rest.starts_with("http://") || rest.starts_with("https://")) {
+    if !has_openable_scheme(rest) {
         return None;
     }
     let end = rest
         .find(|c: char| c.is_whitespace() || matches!(c, '<' | '>'))
         .unwrap_or(rest.len());
     let url = rest[..end].trim_end_matches(['.', ',', ';', ':', '!', '?']);
-    if url == "http://" || url == "https://" {
+    if OPENABLE_SCHEMES
+        .iter()
+        .any(|scheme| url.eq_ignore_ascii_case(scheme))
+    {
         return None;
     }
     Some((url, url.len()))
@@ -1826,8 +2162,10 @@ struct InlineLink {
 /// Thin wrapper over [`parse_inline_collect`] that discards the link-region
 /// metadata — the single scan implementation lives there, so the styled output
 /// and the recorded link columns can never diverge. Callers that need the link
-/// regions (the prose branches of [`markdown_body_lines_collect`]) call
-/// `parse_inline_collect` directly; table cells and every other caller use this.
+/// regions call `parse_inline_collect` directly: the prose branches of
+/// [`markdown_body_lines_collect`], and GRID table cells via [`wrap_cell_spans`].
+/// What is left on this wrapper measures or re-emits text that carries no
+/// clickable region — column widths, a record-mode cell, a stacked header label.
 fn parse_inline(text: &str, base: Style) -> Vec<Span<'static>> {
     parse_inline_collect(text, base).0
 }
@@ -1859,9 +2197,15 @@ fn parse_inline_collect(text: &str, base: Style) -> (Vec<Span<'static>>, Vec<Inl
     while i < text.len() {
         let rest = &text[i..];
 
-        // Inline code: `...`
+        // Inline code: `...`. An EMPTY one is rejected, which is `match_delim`'s
+        // empty-span rule owed to the third delimiter form: a bare pair renders
+        // nothing, so accepting it would swallow both backticks and push an EMPTY
+        // span. That span is not merely invisible — it is the span the probe budget
+        // cannot price, since `view::LINK_PROBE_BYTE_BUDGET` charges a candidate in
+        // BYTES while `view::highlight_matched_spans` copies per SPAN. Falls back to
+        // literal text, as every other unmatched delimiter here does.
         if let Some(after) = rest.strip_prefix('`') {
-            if let Some(close) = after.find('`') {
+            if let Some(close) = after.find('`').filter(|&c| c > 0) {
                 col += flush_plain(&mut plain, &mut spans, base);
                 let content = after[..close].to_string();
                 col += display_width(&content);
@@ -2760,6 +3104,115 @@ mod tests {
         );
     }
 
+    /// The ONE scheme rule both the parser and the opener read.
+    ///
+    /// It is pinned here rather than only through `match_autolink` because the
+    /// other reader — `resume::opener_argv` — asks it of a `[label](url)` target,
+    /// a url the parser never inspects. Both directions of the allowlist matter:
+    /// what it ADMITS is what a browser gets, and what it REFUSES is the whole
+    /// point of it being an allowlist.
+    #[test]
+    fn only_http_and_https_count_as_an_openable_scheme() {
+        assert!(has_openable_scheme("http://example.com"));
+        assert!(has_openable_scheme("https://example.com/a?b=c#d"));
+        // RFC 3986 makes a scheme case-insensitive, so these ARE http(s) links.
+        // Refusing one while the status line says "only http/https links open"
+        // would state something untrue about the url the reader just clicked.
+        assert!(has_openable_scheme("HTTPS://example.com"));
+        assert!(has_openable_scheme("HTTP://example.com"));
+        assert!(has_openable_scheme("HtTpS://example.com/a?b=c#d"));
+        // Every other scheme a transcript could author, whether or not it looks
+        // harmless. `file://` is the one that motivates the rule: the desktop
+        // handler would act on it, and nothing in the preview says so. Ignoring
+        // case folds `FILE://` onto `file://` — it does NOT widen the allowlist,
+        // so every uppercase spelling below is refused exactly as its twin is.
+        for refused in [
+            "file:///etc/passwd",
+            "FILE:///etc/passwd",
+            "javascript:alert(1)",
+            "JavaScript:alert(1)",
+            "data:text/html,<script>",
+            "vscode://file/etc/passwd",
+            "mailto:someone@example.com",
+            "MAILTO:someone@example.com",
+            "ftp://example.com",
+            "httpx://example.com",
+            "HTTPX://example.com",
+            "/relative/path",
+            "#anchor",
+            "",
+            " https://example.com",
+            " HTTPS://example.com",
+        ] {
+            assert!(
+                !has_openable_scheme(refused),
+                "{refused:?} must not be openable"
+            );
+        }
+    }
+
+    /// A url that is not ASCII where the scheme ends is REFUSED, never a panic.
+    ///
+    /// This pins the boundary panic so it can never be reintroduced. The predicate
+    /// compares BYTES (`s.as_bytes().get(..len)`) precisely so it cannot slice a
+    /// `str` at an index that is not a char boundary: `&s[..7]` on a string led by
+    /// three-byte characters panics outright, and a transcript is hostile input
+    /// that can author exactly that. Swap the byte compare back for a `str` slice
+    /// and these inputs abort the test binary rather than merely failing it.
+    #[test]
+    fn a_multi_byte_url_is_refused_without_panicking() {
+        for refused in [
+            // Byte 7 (`"http://".len()`) and byte 8 (`"https://".len()`) both land
+            // INSIDE the third character, whose bytes span 6..9.
+            "日本語http://example.com",
+            "日本語https://example.com",
+            // Shorter than either scheme AND multi-byte: `get(..)` answers `None`
+            // where a slice would panic on an out-of-bounds index instead.
+            "日",
+            "é",
+        ] {
+            assert!(
+                !has_openable_scheme(refused),
+                "{refused:?} must be refused, and must not panic"
+            );
+        }
+    }
+
+    #[test]
+    fn an_uppercase_bare_autolink_is_underlined() {
+        // The scheme predicate is SHARED with `match_autolink`, so ignoring case
+        // changes RENDERING as well as opening: `HTTP://` is a real http link by
+        // RFC 3986 and now underlines exactly as its lowercase twin does. Pinned
+        // through the parser, not only through the predicate, because that render
+        // change is the half a predicate test cannot see.
+        let spans = parse_inline("visit HTTP://example.com/path.", base_style());
+        let url = spans
+            .iter()
+            .find(|s| s.content.as_ref() == "HTTP://example.com/path")
+            .expect("the uppercase bare url span");
+        assert!(
+            url.style.add_modifier.contains(Modifier::UNDERLINED),
+            "an uppercase bare autolink is underlined"
+        );
+    }
+
+    #[test]
+    fn an_uppercase_bare_scheme_with_no_host_stays_literal() {
+        // `match_autolink`'s own rule: a bare scheme with no host is not a link.
+        // A case-SENSITIVE no-host guard would break that rule the moment the
+        // predicate started ignoring case — `HTTP://` would clear the predicate,
+        // miss the guard, and render underlined over a url with nothing to open.
+        let spans = parse_inline("bare HTTP:// and HTTPS:// only", base_style());
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, "bare HTTP:// and HTTPS:// only");
+        assert!(
+            spans
+                .iter()
+                .all(|s| !s.style.add_modifier.contains(Modifier::UNDERLINED)),
+            "a bare scheme with no host is not a link, in any case"
+        );
+    }
+
     #[test]
     fn malformed_link_stays_literal() {
         // An unclosed `[text](` (no closing paren) falls back to literal text,
@@ -2826,6 +3279,254 @@ mod tests {
         assert_eq!(links[0].content_row, 0);
         assert_eq!((links[0].col_start, links[0].col_end), (6, 7));
         assert_eq!(links[0].url, "https://x.io");
+    }
+
+    /// An EMPTY span sits on a line that also carries a clickable region, on every
+    /// block shape that pushes an indent prefix.
+    ///
+    /// Pinned because the probe budget was once justified by the opposite claim —
+    /// that every span a probe can be CHARGED for is worth at least a byte, the
+    /// blank placeholder being the sole empty one and alone on a region-less line.
+    /// Both halves are false: `" ".repeat(indent)` is empty on any UNINDENTED item,
+    /// and `regions_from_inline` runs on that same line. `view::LINK_PROBE_BYTE_BUDGET`
+    /// is sound via a BOUND on the empty-span count instead (pinned just below), so
+    /// this test exists to keep the retracted enumeration from being written back:
+    /// anyone re-asserting "no empty span here" goes red on these three bodies.
+    #[test]
+    fn markdown_body_lines_collect_keeps_empty_spans_on_lines_that_carry_links() {
+        for body in [
+            "- see [d](https://x.io)",
+            "1. see [d](https://x.io)",
+            "  - see [d](https://x.io)",
+        ] {
+            let (lines, links) = markdown_body_lines_collect(body, WIDE);
+            assert_eq!(lines.len(), 1, "{body:?} is one line");
+            assert_eq!(links.len(), 1, "{body:?} carries exactly one region");
+            assert_eq!(links[0].content_row, 0, "the region is on that same line");
+            let empties = lines[0]
+                .spans
+                .iter()
+                .filter(|s| s.content.is_empty())
+                .count();
+            // The indent span is empty exactly when the item is unindented, and the
+            // region shares the line either way — so a charged span CAN be empty.
+            let indented = body.starts_with(' ');
+            assert_eq!(
+                empties,
+                usize::from(!indented),
+                "an unindented item emits one empty prefix span beside its region; \
+                 an indented one emits none. {body:?} rendered {:?}",
+                lines[0]
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<Vec<&str>>()
+            );
+        }
+    }
+
+    /// The BOUND the byte-priced probe budget actually rests on: a line's SPAN count
+    /// is `O(bytes) + O(1)`, so pricing a candidate in bytes never under-charges the
+    /// `O(spans)` work `view::highlight_matched_spans` does per candidate.
+    ///
+    /// Derivation, which is what the constants below are: every NON-EMPTY span costs
+    /// at least one byte, so those number at most `bytes`. The EMPTY ones are bounded
+    /// because each block construct emits O(1) of them per line — a `" ".repeat(0)`
+    /// prefix, a blank placeholder, an empty ATX header, a `Line::from("")` spacer;
+    /// the `3` is headroom over that fixed set, not a census of it. A GRID row adds no
+    /// empty of its own: its `COLUMN_RULE`s and its hold-open pads all carry bytes —
+    /// a pad is `" ".repeat(width)`, and `fit_widths` never takes a column below its
+    /// `column_floors` entry, which is at least 1 — so the `bytes` term already pays
+    /// for them, and the `bytes / 5` is slack on top of it. Hence
+    /// `spans <= bytes + bytes / 5 + 3`.
+    ///
+    /// A bound rather than a list of which spans stay non-empty: it still holds when
+    /// a parser arm is added, where such a list would quietly stop being true.
+    #[test]
+    fn markdown_body_lines_collect_bounds_a_lines_spans_against_its_bytes() {
+        let grid = {
+            let head = ["wide header"; 4].join(" | ");
+            let delim = ["---"; 4].join(" | ");
+            // The newline in the first cell is NOT a cell newline: the body is split
+            // on '\n' before any table is parsed, so the table ends after the one body
+            // row `| a` and the rows below it render as ordinary paragraphs. That row
+            // is RAGGED — `fit_row` pads it out to four cells — and each padded-out
+            // EMPTY cell wraps to no lines at all, which is what makes
+            // `table_data_lines` push a hold-open pad.
+            let cells = ["a\nb\nc", "[wide link!](https://x.io/w)", "d", "e"].join(" | ");
+            format!("| {head} |\n| {delim} |\n| {cells} |")
+        };
+        let bodies = [
+            "",                        // blank placeholder, alone
+            "- ",                      // empty prefix AND placeholder on one line
+            "1. ",                     // same, ordered
+            "> ",                      // non-empty rule prefix + placeholder
+            "- see [d](https://x.io)", // empty prefix beside a region
+            "> see [d](https://x.io)", // blockquote carrying a region
+            "plain paragraph text",    // the shape the old pin covered
+            "#",                       // ATX header whose text is empty
+            "# ",                      // same, with the space consumed
+            "a\n\nb",                  // blank row between paragraphs
+            &"[]()".repeat(16),        // the refused repeatable empty form
+            &grid,                     // grid rules + hold-open pads
+        ];
+
+        let mut saw_empty = 0usize;
+        let mut saw_rule = false;
+        let mut saw_pad = false;
+        for body in bodies {
+            let (lines, _) = markdown_body_lines_collect(body, 62);
+            for (row, line) in lines.iter().enumerate() {
+                let bytes: usize = line.spans.iter().map(|s| s.content.len()).sum();
+                let spans = line.spans.len();
+                saw_empty += line.spans.iter().filter(|s| s.content.is_empty()).count();
+                saw_rule |= line.spans.iter().any(|s| s.content == COLUMN_RULE);
+                // A hold-open pad: all spaces, on a row that also carries a rule.
+                saw_pad |= line.spans.iter().any(|s| s.content == COLUMN_RULE)
+                    && line
+                        .spans
+                        .iter()
+                        .any(|s| !s.content.is_empty() && s.content.chars().all(|c| c == ' '));
+                assert!(
+                    spans <= bytes + bytes / 5 + 3,
+                    "span count must stay O(bytes) + O(1): row {row} of {body:?} has \
+                     {spans} spans for {bytes} bytes, over the bound of {}. Rendered \
+                     {:?}",
+                    bytes + bytes / 5 + 3,
+                    line.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<Vec<&str>>()
+                );
+            }
+        }
+
+        // The bound is only worth asserting if the corpus above actually reaches the
+        // shapes it bounds, so the test states what it covered rather than passing
+        // vacuously on lines that could never have violated it.
+        assert!(
+            saw_empty >= 6,
+            "corpus must exercise EMPTY spans, saw {saw_empty}"
+        );
+        assert!(saw_rule, "corpus must exercise a grid COLUMN_RULE span");
+        assert!(saw_pad, "corpus must exercise a grid hold-open pad span");
+    }
+
+    /// The blank placeholder never coincides with a link region — the one half of the
+    /// retracted claim that IS true, pinned here for its own sake. The bound above does
+    /// not rest on it: that is a span-count-against-bytes derivation, indifferent to
+    /// which spans happen to carry a region.
+    ///
+    /// It holds for a reason rather than by luck: `parse_inline_collect` pushes the
+    /// placeholder only when an inline run produced NO spans at all, and a run that
+    /// produced no spans parsed no link either, so it records nothing for
+    /// `regions_from_inline` to place. Note this says nothing about the span being
+    /// ALONE on its line — `"> "` renders `["\u{258f} ", ""]` and `"- "` renders
+    /// `["", "\u{2022} ", ""]`.
+    #[test]
+    fn markdown_body_lines_collect_never_pairs_a_blank_placeholder_with_a_region() {
+        for body in ["", "- ", "1. ", "> ", "  - "] {
+            let (lines, links) = markdown_body_lines_collect(body, WIDE);
+            assert!(
+                lines[0].spans.last().is_some_and(|s| s.content.is_empty()),
+                "premise: {body:?} ends in a blank placeholder, got {:?}",
+                lines[0]
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<Vec<&str>>()
+            );
+            assert!(
+                links.is_empty(),
+                "a line whose inline run produced no spans records no region, \
+                 got {links:?} for {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn markdown_body_lines_collect_records_no_region_for_a_run_of_empty_links() {
+        // `[]()` has neither a label nor a url to show, so it is not a link and
+        // stays literal text. Accepting it recorded a ZERO-WIDTH region over an
+        // EMPTY span, and that pair is what defeated the probe budget: N of them
+        // measure ZERO bytes, so `view::probe_within_budget` priced the click at
+        // `0 * N`, admitted it, and then let the search re-render the line once per
+        // candidate at O(spans) each — O(N^2) on the render thread, from 64 bytes.
+        let body = "[]()".repeat(16);
+        let (lines, links) = markdown_body_lines_collect(&body, WIDE);
+        assert!(
+            links.is_empty(),
+            "an empty link is not a clickable region, got {links:?}"
+        );
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert_eq!(
+            text, body,
+            "the characters render as the literal text they are"
+        );
+        assert!(
+            lines
+                .iter()
+                .flat_map(|l| l.spans.iter())
+                .all(|s| !s.content.is_empty()),
+            "this body renders no EMPTY span — the span the byte-priced probe budget \
+             cannot charge for (the other forms are pinned by their own tests)"
+        );
+    }
+
+    #[test]
+    fn markdown_body_lines_collect_renders_no_empty_span_for_a_bare_backtick_pair() {
+        // The THIRD empty-span form, and the one a `[]()` guard alone would miss.
+        // An empty inline-code pair rendered NOTHING and pushed an EMPTY span, and
+        // an empty span is precisely what the probe budget cannot charge for:
+        // `view::LINK_PROBE_BYTE_BUDGET` prices a candidate in BYTES while
+        // `view::highlight_matched_spans` copies per SPAN. So a line could carry a
+        // real link WITHIN the byte budget and still cost O(candidates * spans) to
+        // hit-test — the same stall the budget exists to refuse, reached without
+        // ever tripping it. Rejected now, so the backticks stay literal text.
+        let body = format!("[a](https://x.io) {}", "``".repeat(32));
+        let (lines, links) = markdown_body_lines_collect(&body, WIDE);
+        assert!(
+            lines
+                .iter()
+                .flat_map(|l| l.spans.iter())
+                .all(|s| !s.content.is_empty()),
+            "an empty backtick pair must not render an empty span"
+        );
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert_eq!(
+            text,
+            format!("a {}", "``".repeat(32)),
+            "backticks stay literal"
+        );
+        // The real link beside them is untouched: the guard rejects the EMPTY pair,
+        // not inline code, and not the link whose cost the budget is bounding.
+        assert_eq!(links.len(), 1, "the real link is still a clickable region");
+        assert_eq!(links[0].url, "https://x.io");
+    }
+
+    #[test]
+    fn markdown_body_lines_collect_records_no_region_for_a_zero_display_width_label() {
+        // The half a `match_link` guard could never catch: the label is non-empty in
+        // BYTES, so the link parses, but it renders to no columns at all. The region
+        // would span `col..col`, occupying nothing a reader could aim at while still
+        // costing budget. Dropping it fails in the safe direction — at worst a missed
+        // click, never a wrong url. Only a WIDTH test on the finished region catches it.
+        assert_eq!(
+            display_width("\u{200b}"),
+            0,
+            "premise: ZWSP occupies no column"
+        );
+        let (_, links) = markdown_body_lines_collect("a [\u{200b}](https://x.io) b", WIDE);
+        assert!(
+            links.is_empty(),
+            "a label of zero display width is not a clickable region, got {links:?}"
+        );
     }
 
     #[test]
@@ -2927,6 +3628,255 @@ mod tests {
         assert_eq!(&text[region.col_start..region.col_end], "origin");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- link regions inside a GFM table (grid mode) ----------------------
+
+    /// The text a line PAINTS at display columns `start..end` — the exact question
+    /// a recorded [`LinkRegion`] answers, asked of the rendered line rather than of
+    /// the arithmetic that produced it. Clusters are measured by display width, so
+    /// a padding run or a double-width glyph cannot fake a match.
+    fn cols_of(line: &Line, start: usize, end: usize) -> String {
+        let mut out = String::new();
+        let mut col = 0usize;
+        for span in &line.spans {
+            for g in span.content.as_ref().graphemes(true) {
+                let w = display_width(g);
+                if col >= start && col + w <= end {
+                    out.push_str(g);
+                }
+                col += w;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_grid_table_cell_link_is_clickable_over_its_label_columns() {
+        // A link in a body cell must record a region on the row the label renders
+        // on, covering the label and nothing else. The column is wider than the
+        // label, so a region that swallowed the padding would show up here.
+        let body = "| Document | Note |\n| --- | --- |\n| [spec](https://x.io/s) | ok |";
+        let (lines, links) = markdown_body_lines_collect(body, WIDE);
+        assert_eq!(links.len(), 1, "one region for the one cell link");
+        let r = &links[0];
+        assert_eq!(r.url, "https://x.io/s");
+        assert_eq!(r.content_row, 2, "header, separator, then the body row");
+        assert_eq!(
+            cols_of(&lines[r.content_row], r.col_start, r.col_end),
+            "spec",
+            "the region covers the label and only the label"
+        );
+    }
+
+    #[test]
+    fn a_grid_table_header_link_is_clickable_too() {
+        // GFM table HEADERS are in scope: they are built by the same
+        // `table_data_lines` path as a body row, so a header link is clickable on
+        // the row the header renders on. (ATX `#` headers are the unrelated
+        // construct that carries no links.)
+        let body = "| [Docs](https://x.io/d) | Note |\n| --- | --- |\n| a | b |";
+        let (lines, links) = markdown_body_lines_collect(body, WIDE);
+        assert_eq!(links.len(), 1);
+        let r = &links[0];
+        assert_eq!(r.content_row, 0, "the header is the table's first line");
+        assert_eq!(r.url, "https://x.io/d");
+        assert_eq!(
+            cols_of(&lines[r.content_row], r.col_start, r.col_end),
+            "Docs"
+        );
+    }
+
+    #[test]
+    fn a_grid_link_region_never_covers_padding_or_a_column_rule() {
+        // The load-bearing "never a wrong hit" promise. A RIGHT-aligned SECOND
+        // column makes the region clear three different things to land on its
+        // label: the first column, the 3-column " │ " rule, and 11 columns of
+        // alignment padding.
+        let body = "| Alpha | Longer header |\n| :--- | ---: |\n\
+                    | x | [go](https://x.io/g) |";
+        let (lines, links) = markdown_body_lines_collect(body, WIDE);
+        assert_eq!(links.len(), 1);
+        let r = &links[0];
+        let line = &lines[r.content_row];
+        // Column A is 5 wide ("Alpha"), the rule 3, column B 13 ("Longer header")
+        // with the 2-column label right-aligned inside it.
+        assert_eq!(
+            (r.col_start, r.col_end),
+            (5 + 3 + 11, 5 + 3 + 13),
+            "the region starts past the rule AND past the padding"
+        );
+        assert_eq!(cols_of(line, r.col_start, r.col_end), "go");
+        assert_eq!(
+            cols_of(line, 5, 8),
+            " \u{2502} ",
+            "the column rule sits outside every region"
+        );
+        assert_eq!(
+            cols_of(line, r.col_start - 1, r.col_start),
+            " ",
+            "the column just before the region is padding, and is not covered"
+        );
+    }
+
+    #[test]
+    fn a_wrapped_grid_cell_link_gets_one_region_per_visual_line() {
+        // A label too wide for its column wraps DOWN the column, so it yields one
+        // region per visual fragment, each on its own content row. A single region
+        // spanning the whole label would point at columns the label never painted.
+        let body = "| Ref |\n| --- |\n| [alpha beta gamma](https://x.io/abg) |";
+        let (lines, links) = markdown_body_lines_collect(body, 12);
+        assert_eq!(links.len(), 2, "one region per wrapped label fragment");
+        assert!(
+            links.iter().all(|r| r.url == "https://x.io/abg"),
+            "every fragment opens the same url"
+        );
+        assert_eq!(
+            (links[0].content_row, links[1].content_row),
+            (2, 3),
+            "consecutive content rows, one fragment each"
+        );
+        let painted: Vec<String> = links
+            .iter()
+            .map(|r| cols_of(&lines[r.content_row], r.col_start, r.col_end))
+            .collect();
+        assert_eq!(
+            painted,
+            vec!["alpha beta".to_string(), "gamma".to_string()],
+            "the fragments reassemble the label and cover no padding"
+        );
+    }
+
+    #[test]
+    fn two_adjacent_cell_links_keep_one_region_each() {
+        // Adjacent labels share `UNDERLINED`, so anything recovering links from
+        // STYLING would merge them into one region pointing at one url. The link
+        // index threaded through the wrap keeps them apart.
+        let body = "| Links |\n| --- |\n| [ab](https://x.io/1)[cd](https://x.io/2) |";
+        let (lines, links) = markdown_body_lines_collect(body, WIDE);
+        assert_eq!(links.len(), 2, "two labels, two regions");
+        let row = &lines[links[0].content_row];
+        assert_eq!(cols_of(row, links[0].col_start, links[0].col_end), "ab");
+        assert_eq!(links[0].url, "https://x.io/1");
+        assert_eq!(cols_of(row, links[1].col_start, links[1].col_end), "cd");
+        assert_eq!(links[1].url, "https://x.io/2");
+    }
+
+    #[test]
+    fn a_wide_glyph_cell_link_records_display_columns_not_chars() {
+        // A 2-column-per-char label must be recorded in DISPLAY columns, so a click
+        // lands on the glyph it looks like it lands on.
+        let body = "| Head |\n| --- |\n| x [\u{65e5}\u{672c}](https://x.io/j) |";
+        let (lines, links) = markdown_body_lines_collect(body, WIDE);
+        assert_eq!(links.len(), 1);
+        let r = &links[0];
+        assert_eq!(
+            (r.col_start, r.col_end),
+            (2, 6),
+            "'x ' is 2 columns and the label is 4, not 2 chars"
+        );
+        assert_eq!(
+            cols_of(&lines[r.content_row], r.col_start, r.col_end),
+            "\u{65e5}\u{672c}"
+        );
+    }
+
+    #[test]
+    fn a_table_link_is_clickable_as_a_grid_and_inert_once_it_tips_into_records() {
+        // `TABLE_MIN_COL_WIDTH` is a LAYOUT switch, so it is a CLICKABILITY switch
+        // too: only grid mode can place a region correctly, so the SAME table
+        // answers clicks at one pane width and not at another. That is deliberate
+        // (a region record mode cannot place is worse than none), and it is pinned
+        // here at the same 62-column switch point as
+        // `the_record_fallback_switch_points_are_pinned_at_a_62_column_pane`:
+        //   5 cols -> 5*10 + 4*3 = 62 <= 62  grid, links recorded
+        //   5 cols at a 61-column pane       record, nothing recorded
+        let head = ["wide header"; 5].join(" | ");
+        let delim = ["---"; 5].join(" | ");
+        let cells = [
+            "wide value!!",
+            "[wide link!](https://x.io/w)",
+            "wide value!!",
+            "wide value!!",
+            "wide value!!",
+        ]
+        .join(" | ");
+        let body = format!("| {head} |\n| {delim} |\n| {cells} |");
+
+        let (grid_lines, grid_links) = markdown_body_lines_collect(&body, 62);
+        assert!(
+            grid_lines.iter().any(|l| line_text(l).contains('\u{2502}')),
+            "5 columns fit 62 EXACTLY, so this is the grid"
+        );
+        assert!(
+            !grid_links.is_empty() && grid_links.iter().all(|r| r.url == "https://x.io/w"),
+            "the cell link is clickable while the table is a grid"
+        );
+
+        let (record_lines, record_links) = markdown_body_lines_collect(&body, 61);
+        assert!(
+            record_lines
+                .iter()
+                .all(|l| !line_text(l).contains('\u{2502}')),
+            "one column narrower tips the same table into records"
+        );
+        assert!(
+            record_links.is_empty(),
+            "record mode records nothing: the pane re-wraps its lines, so any \
+             column measured here would move before it is painted"
+        );
+    }
+
+    #[test]
+    fn the_clamp_backstop_clips_a_grid_region_off_the_cut_columns() {
+        // `clamp_line_to_width` should never fire inside a grid, so this asks the
+        // backstop DIRECTLY rather than trying to construct the drift that would
+        // reach it. If it ever did fire, a region must not keep pointing at columns
+        // the line no longer draws, nor at the `…` that replaced them.
+        let line = Line::from(Span::styled("abcdefghij".to_string(), base_style()));
+        let links = vec![
+            LinkRegion {
+                content_row: 0,
+                col_start: 1,
+                col_end: 9,
+                url: "clipped".to_string(),
+            },
+            LinkRegion {
+                content_row: 0,
+                col_start: 7,
+                col_end: 9,
+                url: "dropped".to_string(),
+            },
+        ];
+        let (clamped, out) = clamped_grid(vec![line], links, 6);
+        assert_eq!(
+            line_text(&clamped[0]),
+            "abcde\u{2026}",
+            "5 columns of text plus the ellipsis"
+        );
+        assert_eq!(out.len(), 1, "a region starting past the cut is DROPPED");
+        assert_eq!(out[0].url, "clipped");
+        assert_eq!(
+            (out[0].col_start, out[0].col_end),
+            (1, 5),
+            "clipped to the surviving columns, never onto the `…`"
+        );
+
+        // The ordinary case: a line that fit is not clipped at all.
+        let short = Line::from(Span::styled("abc".to_string(), base_style()));
+        let kept = clamped_grid(
+            vec![short],
+            vec![LinkRegion {
+                content_row: 0,
+                col_start: 0,
+                col_end: 3,
+                url: "kept".to_string(),
+            }],
+            6,
+        )
+        .1;
+        assert_eq!(kept.len(), 1);
+        assert_eq!((kept[0].col_start, kept[0].col_end), (0, 3));
     }
 
     #[test]
