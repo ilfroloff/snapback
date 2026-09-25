@@ -23,6 +23,10 @@
 //!   `needs input` → confirm then stop then reply; `working`/`idle`/unstoppable →
 //!   refuse ([`SEND_LIVE_REFUSED`]). [`build_stop_argv`] is the stop step;
 //!   [`run_send`] runs it (best-effort) before the send.
+//! * [`reply_in_flight_refusal`] — what `Ctrl-R` asks BEFORE that gate and its
+//!   probe. A board sends one quick reply at a time, so while one is in flight
+//!   `Ctrl-R` refuses on every row ([`SEND_IN_FLIGHT_REFUSED`]), naming that
+//!   reply's session.
 //! * [`plan_send`] — the AUTHORITATIVE re-read of `(cwd, session_id)` from INSIDE
 //!   the file at send time (via [`crate::store::parse::parse_file`], the one
 //!   parser), plus the cwd-existence gate — the send counterpart of
@@ -33,6 +37,8 @@
 //! [`spawn_send`] is the only impure piece: the detached-thread driver that
 //! spawns the child, reaps it, and delivers exactly one
 //! [`AppEvent::SendFinished`] on the merged channel — the UI thread never blocks.
+//! A board session can end before that event is read, so [`UndeliveredEvents`]
+//! keeps it for the next board on the same `App` rather than losing it.
 //!
 //! A THIRD family rides the same shape: the background-agent launch
 //! ([`build_bg_launch_argv`] / [`plan_bg_launch`] / [`status_for_bg_launch`] /
@@ -60,7 +66,8 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{SendError, Sender};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use serde_json::Value;
 
@@ -103,6 +110,23 @@ use crate::watch::AppEvent;
 pub const SEND_LIVE_REFUSED: &str =
     "claude reports this session as a running agent, so it won't resume it in place. \
      Try Ctrl-K to stop it, or Fork (Ctrl-F) to branch a copy.";
+
+/// Refusal shown when `Ctrl-R` is pressed on ANY row while snapback's own quick reply
+/// is still in flight. It is a PREFIX: [`reply_in_flight_refusal`] appends the name
+/// of the session that reply is going to.
+///
+/// A board sends ONE quick reply at a time, because `App::sending` tracks exactly
+/// one. That slot is more than the preview's echo. It is the board's only record of
+/// the `claude -p` child snapback spawned, the THIRD writer
+/// [`crate::delete::can_delete_target`] refuses a hard delete on, and claude's
+/// active list is not a witness snapback can rely on for that writer. A second
+/// reply that replaced the slot would leave `Ctrl-X d` on the first session judged
+/// by claude's probe alone. Sending several at once would need a per-session
+/// registry of sends instead of one slot.
+///
+/// The session is named LAST so a one-row status line cut at the terminal's width
+/// keeps the rule and loses only the tail of a long label.
+pub const SEND_IN_FLIGHT_REFUSED: &str = "One reply at a time — still sending to: ";
 
 /// Neutral success status when the JSON parsed but carried no `total_cost_usd`,
 /// or when stdout was unreadable/empty (the child ran, but said nothing we can
@@ -202,6 +226,22 @@ pub enum ReplyGate {
 /// the id handed to `claude` is byte-for-byte the one claude reported.
 fn stoppable_job_id(agent: &ReportedAgent) -> Option<&str> {
     agent.id.as_deref().filter(|id| !id.trim().is_empty())
+}
+
+/// `Ctrl-R`'s FIRST question, asked before [`reply_gate`] and before the probe that
+/// feeds it: is a quick reply already in flight? `in_flight` is the name of the
+/// session the board's in-flight reply (`App::sending`) is going to, or `None` when
+/// there is none.
+///
+/// `Some` refuses, naming that session ([`SEND_IN_FLIGHT_REFUSED`]), whatever row
+/// `Ctrl-R` was pressed on. The selected row is deliberately not an input: a second
+/// reply to the SAME session is refused too, because the first one's
+/// `SendFinished` would clear the slot while the second was still writing. The
+/// caller asks this before any compose box opens, so no typed message is thrown
+/// away. `None` lets [`reply_gate`] decide.
+#[must_use]
+pub fn reply_in_flight_refusal(in_flight: Option<&str>) -> Option<String> {
+    in_flight.map(|name| format!("{SEND_IN_FLIGHT_REFUSED}{name}"))
 }
 
 /// Decide [`ReplyGate`] from the session's current live-agent record (`None` when
@@ -813,6 +853,110 @@ fn sanitize_status(s: &str) -> String {
     out.trim_end().to_string()
 }
 
+/// Completions a board session ended before it could READ, kept for the next
+/// board on the same `App` (`crate::tui::App`, which owns one of these for its
+/// whole life).
+///
+/// It exists because the channel a completion reports on lasts ONE board session
+/// and the state it clears does not. `tui::run_inner` builds a new
+/// [`crate::watch::EventLoop`] per board session and drops the old receiver at
+/// every hand-off (Enter, `Ctrl-F`, Attach, `Ctrl-O`), while `lib::run` re-enters
+/// the board on the SAME `App`. A quick reply's `claude -p` child routinely
+/// outlives that seam, and its [`AppEvent::SendFinished`] is the ONLY thing that
+/// clears `App::sending`. A lost one left the slot full until restart: the
+/// `cooking…` tail stayed up, `Ctrl-X d` kept refusing that session, and `Ctrl-R`
+/// refused on every row ([`reply_in_flight_refusal`]). The slot is deliberately
+/// NOT cleared at the seam instead: the child may still be writing, and the slot
+/// is what keeps `Ctrl-X d` off that transcript until the child has finished
+/// (`delete::can_delete_target`).
+///
+/// ONE queue per `App`, and every clone is a handle on it (it is an `Arc`), so the
+/// board and each send thread share it. Three operations take its lock, each
+/// briefly:
+///
+/// * [`deliver`](Self::deliver), on the send thread: send on the board's channel,
+///   and queue the event ONLY when that send fails because the receiver is gone;
+/// * [`drain_then_drop`](Self::drain_then_drop), at the board's teardown: move
+///   every buffered `SendFinished` into the queue, then drop the receiver;
+/// * [`take`](Self::take), on the next board: one lock-and-take, released before
+///   any event is handled.
+///
+/// The first two each hold the lock across their WHOLE step, and that is what
+/// leaves no gap between them. A completion either reaches the channel's buffer
+/// before the drain (and the drain moves it) or finds the receiver already
+/// dropped (and its failed send queues it). It can never land in the buffer AFTER
+/// the drain emptied it, because the receiver is dropped before the drain releases
+/// the lock.
+///
+/// FAIL-SOFT: a poisoned lock is recovered, never propagated. The queue is a plain
+/// `Vec` that a panicking holder cannot leave half-written, so its contents are
+/// still kept and still taken.
+#[derive(Debug, Clone, Default)]
+pub struct UndeliveredEvents(Arc<Mutex<Vec<AppEvent>>>);
+
+impl UndeliveredEvents {
+    /// Deliver `event` on `tx`, or keep it when the board that owned `tx`'s
+    /// receiver has gone.
+    ///
+    /// The normal path is the plain send it always was: the event goes onto the
+    /// channel and the queue is left alone. ONLY a failed send, whose
+    /// [`SendError`] hands the event back, queues it. The lock is held across the
+    /// send, which never blocks on this unbounded channel, so this step cannot
+    /// interleave with [`drain_then_drop`](Self::drain_then_drop).
+    pub fn deliver(&self, tx: &Sender<AppEvent>, event: AppEvent) {
+        let mut queue = self.lock();
+        if let Err(SendError(event)) = tx.send(event) {
+            queue.push(event);
+        }
+    }
+
+    /// Tear a board session's `receiver` down without losing a completion it
+    /// ACCEPTED but never read.
+    ///
+    /// The board's own `recv` loop has stopped by the time this runs, yet a
+    /// `SendFinished` can still be sitting in the buffer: the hand-off key was read
+    /// first, and a completion can land after it and before the receiver goes. That
+    /// window includes the `EventLoop` drop itself, which joins the input reader
+    /// BEFORE its receiver field drops. So this empties the buffer through
+    /// `try_recv` (a non-blocking read), moves every `SendFinished` into the queue,
+    /// discards every other event as teardown always did, and then drops
+    /// `receiver`, join included, all under the lock (see the type's doc for why
+    /// that leaves no gap). `receiver` is generic so a test can hand in a plain
+    /// channel instead of a live `EventLoop`.
+    pub fn drain_then_drop<R>(
+        &self,
+        receiver: R,
+        mut try_recv: impl FnMut(&R) -> Option<AppEvent>,
+    ) {
+        let mut queue = self.lock();
+        while let Some(event) = try_recv(&receiver) {
+            if matches!(event, AppEvent::SendFinished { .. }) {
+                queue.push(event);
+            }
+        }
+        // Dropped HERE, while `queue` still holds the lock. Left to the end of the
+        // function, the parameter would drop AFTER the guard: the lock would be
+        // released first, and a `deliver` could then send successfully into a buffer
+        // that is about to be thrown away.
+        drop(receiver);
+    }
+
+    /// Every kept completion, oldest first, leaving the queue empty.
+    ///
+    /// ONE lock-and-take: the guard lives only for this one statement, so the lock
+    /// is released before the caller handles any of the events. A send thread
+    /// waiting to `deliver` is never held up behind a handler.
+    #[must_use]
+    pub fn take(&self) -> Vec<AppEvent> {
+        std::mem::take(&mut *self.lock())
+    }
+
+    /// The queue's lock, recovered if poisoned (see the type's FAIL-SOFT note).
+    fn lock(&self) -> MutexGuard<'_, Vec<AppEvent>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 /// Spawn the confirmed send on its OWN detached thread and deliver exactly one
 /// [`AppEvent::SendFinished`] when it completes — the UI thread never blocks.
 ///
@@ -825,21 +969,27 @@ fn sanitize_status(s: &str) -> String {
 /// `session_id`.
 ///
 /// FAIL-SOFT throughout: a spawn error yields a neutral error status rather than a
-/// panic, and a send failure on the channel (the board went away) is ignored.
+/// panic. A send failure on the channel (the board that dispatched this went away)
+/// is NOT ignored: the completion goes into `undelivered` instead, and the next
+/// board on the same `App` replays it (see [`UndeliveredEvents`]).
 ///
 /// When `req.stop_job` is set it FIRST runs `claude stop <job-id>` to deregister
 /// the held background job (so the following `-p -r` is accepted); if the stop
 /// itself fails the reply is NOT attempted (it would only be refused) and the stop
 /// error is surfaced.
-pub fn spawn_send(req: SendRequest, tx: Sender<AppEvent>) {
+pub fn spawn_send(req: SendRequest, tx: Sender<AppEvent>, undelivered: UndeliveredEvents) {
     std::thread::spawn(move || {
         let (status, success) = run_send(&req);
-        // A send failure means the receiver (TUI) has gone away; ignore it.
-        let _ = tx.send(AppEvent::SendFinished {
-            session_id: req.session_id,
-            status,
-            success,
-        });
+        // Onto the board's channel while that board is up; into the queue the next
+        // board empties once it is not.
+        undelivered.deliver(
+            &tx,
+            AppEvent::SendFinished {
+                session_id: req.session_id,
+                status,
+                success,
+            },
+        );
     });
 }
 
@@ -1532,6 +1682,38 @@ mod tests {
     /// rest of the rule exactly as they did before the board half existed. The cases
     /// that ARE about it pass a record's own pid instead.
     const BOARD_PID: u32 = 4_242;
+
+    /// `Ctrl-R`'s one-reply-at-a-time rule. With nothing in flight it stays out of
+    /// the way. With a reply in flight it refuses, and the refusal names the session
+    /// that reply is going to. The rule comes first and the name last, set off by a
+    /// space, so a narrow status line cuts the label and keeps the rule. Like every
+    /// refusal on this key it claims no owner for any process.
+    #[test]
+    fn a_reply_in_flight_refuses_the_next_one_and_names_its_session() {
+        assert_eq!(
+            reply_in_flight_refusal(None),
+            None,
+            "nothing in flight: the reply gate decides"
+        );
+
+        let name = "Fix the payment webhook retries";
+        let refusal =
+            reply_in_flight_refusal(Some(name)).expect("a reply in flight must refuse the next");
+        assert!(
+            refusal.starts_with(SEND_IN_FLIGHT_REFUSED),
+            "the rule leads: {refusal:?}"
+        );
+        assert!(
+            refusal.ends_with(&format!(" {name}")),
+            "the in-flight session is named, last and set apart: {refusal:?}"
+        );
+        for claim in OWNERSHIP_CLAIMS {
+            assert!(
+                !refusal.to_lowercase().contains(claim),
+                "{refusal:?} must not claim an owner ({claim:?})"
+            );
+        }
+    }
 
     /// The reply gate: not held → reply; `done` → stop-then-reply; `needs input` →
     /// confirm-then-stop-then-reply; busy/idle → refuse; held-without-a-job-id →
@@ -2742,5 +2924,177 @@ mod tests {
             SendPlan::Ready { .. } => panic!("a sidecar with no cwd must refuse"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- the undelivered-completion queue ------------------------------------
+    //
+    // Every test below drives `UndeliveredEvents` over a REAL `mpsc` channel and
+    // hands it a completion it built itself. None goes near `spawn_send`, so no
+    // thread runs a `claude` child.
+
+    /// A quick reply's completion for `session_id`, as `spawn_send` builds it.
+    fn finished(session_id: &str, success: bool) -> AppEvent {
+        AppEvent::SendFinished {
+            session_id: session_id.to_string(),
+            status: format!("status for {session_id}"),
+            success,
+        }
+    }
+
+    /// What each event IS, in order: a `SendFinished` by its session id, anything
+    /// else as `"<other>"`. `AppEvent` has no `PartialEq`, so this is how an order
+    /// and a filter are compared.
+    fn finished_ids(events: &[AppEvent]) -> Vec<String> {
+        events
+            .iter()
+            .map(|event| match event {
+                AppEvent::SendFinished { session_id, .. } => session_id.clone(),
+                _ => "<other>".to_string(),
+            })
+            .collect()
+    }
+
+    /// Task 10.3: a completion whose board has gone (the receiver was DROPPED at a
+    /// hand-off) is kept in the queue, whole, instead of being thrown away with the
+    /// failed send.
+    #[test]
+    fn a_completion_whose_board_is_gone_is_queued_instead_of_dropped() {
+        let queue = UndeliveredEvents::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(rx);
+
+        queue.deliver(&tx, finished("gone", false));
+
+        let kept = queue.take();
+        assert_eq!(
+            finished_ids(&kept),
+            ["gone"],
+            "a completion the channel refused must be queued, not dropped"
+        );
+        assert!(
+            matches!(
+                &kept[0],
+                AppEvent::SendFinished { status, success: false, .. } if status == "status for gone"
+            ),
+            "the queued completion keeps its status and its class: {kept:?}"
+        );
+    }
+
+    /// Task 10.3: while the board is up, the completion goes onto its channel
+    /// exactly as before, and nothing is queued, so a live board never sees it
+    /// twice.
+    #[test]
+    fn a_completion_whose_board_is_up_is_delivered_and_not_queued() {
+        let queue = UndeliveredEvents::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        queue.deliver(&tx, finished("live", true));
+
+        let delivered = rx.try_recv().expect("the completion is on the channel");
+        assert_eq!(finished_ids(&[delivered]), ["live"]);
+        assert!(
+            queue.take().is_empty(),
+            "a delivered completion must not also be queued"
+        );
+    }
+
+    /// Stands in for the board's `EventLoop`: a real receiver, plus a record of
+    /// whether the queue's lock was HELD at the instant it dropped.
+    struct WatchedReceiver {
+        rx: std::sync::mpsc::Receiver<AppEvent>,
+        queue: UndeliveredEvents,
+        locked_at_drop: std::rc::Rc<std::cell::Cell<Option<bool>>>,
+    }
+
+    impl Drop for WatchedReceiver {
+        fn drop(&mut self) {
+            let held = matches!(
+                self.queue.0.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            );
+            self.locked_at_drop.set(Some(held));
+        }
+    }
+
+    /// Task 10.3, the teardown window: a completion the dying board's channel
+    /// ACCEPTED but never read is moved into the queue, and every other buffered
+    /// event is discarded as teardown always did. That includes the other
+    /// completion kinds, which this queue does not carry yet.
+    ///
+    /// Then the no-gap half: the receiver is gone once the drain returns, and it
+    /// dropped while the queue's lock was still held. Only that ordering stops a
+    /// `deliver` from slipping a completion into the buffer between the drain and
+    /// the drop.
+    #[test]
+    fn the_teardown_drain_keeps_only_buffered_completions_and_drops_the_receiver_under_the_lock() {
+        let queue = UndeliveredEvents::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        for event in [
+            AppEvent::Tick,
+            finished("first", true),
+            AppEvent::SessionsChanged,
+            AppEvent::InterruptFinished {
+                session_id: "stopped".to_string(),
+                status: "stopped".to_string(),
+                success: true,
+            },
+            finished("second", false),
+        ] {
+            tx.send(event).expect("the receiver is still up");
+        }
+        let locked_at_drop = std::rc::Rc::new(std::cell::Cell::new(None));
+        let receiver = WatchedReceiver {
+            rx,
+            queue: queue.clone(),
+            locked_at_drop: std::rc::Rc::clone(&locked_at_drop),
+        };
+
+        queue.drain_then_drop(receiver, |receiver| receiver.rx.try_recv().ok());
+
+        assert_eq!(
+            finished_ids(&queue.take()),
+            ["first", "second"],
+            "only the buffered SendFinished events are kept, oldest first"
+        );
+        assert!(
+            tx.send(AppEvent::Tick).is_err(),
+            "the receiver is gone once the drain returns"
+        );
+        assert_eq!(
+            locked_at_drop.get(),
+            Some(true),
+            "the receiver must drop while the queue's lock is held, or a completion \
+             can land in its buffer after the drain"
+        );
+    }
+
+    /// Task 10.2's FAIL-SOFT rule: a holder that panicked with the lock poisons it,
+    /// and the queue still keeps a completion and hands every one back. Nothing
+    /// panics.
+    #[test]
+    fn a_poisoned_queue_still_keeps_and_hands_back_its_completions() {
+        let queue = UndeliveredEvents::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(rx);
+        queue.deliver(&tx, finished("before", true));
+
+        let holder = queue.clone();
+        let poisoner = std::thread::spawn(move || {
+            let _held = holder.0.lock().expect("not poisoned yet");
+            panic!("poison the undelivered queue on purpose");
+        });
+        assert!(
+            poisoner.join().is_err(),
+            "precondition: the holder panicked"
+        );
+        assert!(queue.0.is_poisoned(), "precondition: the lock is poisoned");
+
+        queue.deliver(&tx, finished("after", false));
+        assert_eq!(
+            finished_ids(&queue.take()),
+            ["before", "after"],
+            "a poisoned queue still keeps and hands back every completion"
+        );
+        assert!(queue.take().is_empty(), "the take emptied it");
     }
 }

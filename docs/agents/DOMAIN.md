@@ -133,6 +133,13 @@ user to close a claude window would point at the wrong process. It stays a
 COMPOSITION of two facts with two sources and two remedies, not a wider
 `can_delete`.
 
+That in-flight fact is only complete because a board sends ONE quick reply at a
+time. `App::sending` is a single slot, so `Ctrl-R` refuses on every row while it
+is full (`send::reply_in_flight_refusal`; see
+[the reply gate](#quick-reply--non-interactive-send-srcsendrs)). A second reply
+that overwrote the slot would leave the first one still writing with nothing on
+the board recording it, and this refusal would lapse for that session.
+
 The two FINISHED arms, `Done` and `Ended`, were once thought unreachable here: an
 earlier note argued the guard reads the BARE list and that both sampled bare lists
 held zero `done` records (across 37 entries and 74 — see the
@@ -1830,7 +1837,15 @@ and it FOLLOWS the bottom so both stay in view. The `▶ you` echo is
 dropped the instant the real turn lands on disk — detected by the reloaded
 `Session::msg_count` growing past `Sending::baseline_msg_count` — so the real turn
 (styled identically) takes its place with no doubling; the placeholder stays until
-`AppEvent::SendFinished` clears `App::sending`. The pinned status banner is SUPPRESSED
+`AppEvent::SendFinished` clears `App::sending`. That event survives a hand-off. If
+the board session that dispatched the send ends first (Enter, `Ctrl-F`, Attach,
+`Ctrl-O`), the event is kept in the app's `send::UndeliveredEvents` queue, and the
+next board replays it through the same arm: once at entry, before the first draw,
+and then on every `Tick` (see
+[the event sources](ARCHITECTURE.md#event-sources-watcheventloop)). So the slot
+clears only once the reply child has finished. It is never cleared early at the
+seam, which would reopen `Ctrl-X d` on a transcript the child may still be
+writing, and it no longer stays set until restart. The pinned status banner is SUPPRESSED
 while a send is in flight (`view::preview_banner` returns `None`, keeping render and
 the click hit-test agreeing on the geometry), since the inline turns replace it.
 
@@ -1861,6 +1876,7 @@ never the polled `--all` map — classified by the one `agents::classify`), and
 
 | Probe result | Bucket | `Ctrl-R` (`send::reply_gate`) |
 | --- | --- | --- |
+| not asked: a quick reply is already in flight (`App::sending` is set), whichever row is selected, that one included | — | refuse (`SEND_IN_FLIGHT_REFUSED`, naming the session the reply is going to) BEFORE the probe, via `send::reply_in_flight_refusal`: no compose opens |
 | claude is not holding the session | — | reply in place, no stop (compose opens) |
 | held, but the record carries no stoppable job id (every `kind: "interactive"` record measured so far), with or without a `pid` | — | refuse (`SEND_LIVE_REFUSED`) — try `Ctrl-K` or Fork (`Ctrl-F`) |
 | `done` | `Done` | stop the ended job, then reply — straight to compose |
@@ -1870,6 +1886,14 @@ never the polled `--all` map — classified by the one `agents::classify`), and
 | `state`=`working`/`busy` **AND** `status`=`idle` | `WorkingButIdle` (reads `interrupted`) | refuse (the same message) |
 | `idle` | `Idle` | refuse (the same message) |
 | anything else, or no qualifier at all | `Other` | refuse (the same message) |
+
+The **in-flight check runs first of all**, before the probe. One reply goes out
+at a time because `App::sending` is one slot, and the hard-delete guard reads it
+(see [the third writer](#on-disk-layout)). Refusing at `Ctrl-R`, rather than at
+`Enter`, means no compose box opens, so nothing typed is thrown away, and no
+probe is spent. The session is named by `App::sending_label` (its label, else its
+id), which answers whenever a reply is in flight, even after its row left the
+board.
 
 The **job-id check runs BEFORE the bucket** and wins in every state: an agent
 `claude stop` cannot address is unstoppable by this path whatever it is doing, so

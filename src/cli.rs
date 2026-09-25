@@ -61,7 +61,9 @@ KEYS:
                   stopped, failed) is stopped first so the reply lands in place;
                   a waiting one (needs input) confirms first; a working, idle,
                   interrupted or unrecognized agent, or a session claude reports
-                  with no job to stop, is refused — try Ctrl-K or Fork instead
+                  with no job to stop, is refused — try Ctrl-K or Fork instead.
+                  One reply at a time: while one is still being sent, Ctrl-R on
+                  any row is refused until it lands
                   (Enter sends, Ctrl-J or Alt+Enter newline, Esc cancels)
     Ctrl-K        stop / interrupt the selected session's live agent. With a job
                   to stop it runs claude stop: an agent whose run is over (done,
