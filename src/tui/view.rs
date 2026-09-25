@@ -8785,6 +8785,40 @@ mod tests {
         );
     }
 
+    /// An AGED record that also carries a failed task says both on its one banner
+    /// row: the status with its age first, then the failure after the separator
+    /// that joins banner facts. The age measures the status, so it must never land
+    /// after the failure sentence, and neither fact may crowd the other off the row.
+    ///
+    /// Read off the DRAWN row. The failure is undated so the whole row fits
+    /// [`BANNER_PANE`] and can be compared whole.
+    #[test]
+    fn an_aged_banner_with_a_failed_task_draws_the_age_before_the_failure() {
+        let (width, height) = BANNER_PANE;
+        let mut app = aged_banner_app(Some(STARTED_AT), Some(POLLED_46M_LATER));
+        app.sessions[0].failed_task = Some(failed_task(SHORT_FAILURE, None));
+
+        let rows = inner_rows(&mut app, width, height);
+        let row = &rows[0];
+        let aged_status = format!("live busy{BANNER_AGE_SEPARATOR}46m");
+        let failure = format!("background task failed: {SHORT_FAILURE}");
+        let age_at = row
+            .find(&aged_status)
+            .unwrap_or_else(|| panic!("the status's age must be drawn: {row:?}"));
+        let failure_at = row
+            .find(&failure)
+            .unwrap_or_else(|| panic!("the failed task must be drawn: {row:?}"));
+        assert!(
+            age_at < failure_at,
+            "the age must come before the failed task: {row:?}"
+        );
+        assert_eq!(
+            *row,
+            format!("{aged_status}{HEADER_SEPARATOR}{failure}"),
+            "one row: the aged status, the separator, then the failed task"
+        );
+    }
+
     /// With no age to state, the banner is EXACTLY today's: every cell of the pane
     /// (text and style, via `preview_buffer`) matches a board whose record never
     /// carried a `startedAt`, so no dangling separator, no `0s`, no restyled span.
