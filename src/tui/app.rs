@@ -1016,6 +1016,20 @@ impl CachedPreview {
     }
 }
 
+/// Everything ONE preview click resolves against, borrowed out of a single
+/// [`CachedPreview`] entry: the per-line wrapped-row prefix map, the rendered lines,
+/// and both clickable region lists.
+///
+/// Named because it travels as one value and is returned as one — see
+/// [`App::preview_hit_context`], which owns why the four are inseparable and why they
+/// are borrowed rather than cloned.
+type PreviewHitContext<'a> = (
+    &'a [usize],
+    &'a [Line<'static>],
+    &'a [preview::LinkRegion],
+    &'a [preview::FoldRegion],
+);
+
 /// The slice of a rendered preview a viewport can actually reach, cloned out of the
 /// width-scoped cache so the draw can style it without touching what is cached.
 ///
@@ -3739,11 +3753,11 @@ impl App {
 
     /// The wrapped-layout context needed to hit-test a mouse click into a preview:
     /// the per-line wrapped-row PREFIX MAP
-    /// ([`row_prefix`](CachedPreview::row_prefix)) and BOTH kinds of clickable
-    /// region — the [`LinkRegion`](preview::LinkRegion)s and the peer-node
+    /// ([`row_prefix`](CachedPreview::row_prefix)), the rendered LINES, and BOTH kinds
+    /// of clickable region — the [`LinkRegion`](preview::LinkRegion)s and the peer-node
     /// [`FoldRegion`](preview::FoldRegion)s — all pulled from the SAME width-scoped
     /// cache the view drew from, so a hit-test can never disagree with what is on
-    /// screen. Empty when nothing is selected.
+    /// screen. `None` when nothing is selected.
     ///
     /// The two region kinds come back TOGETHER, out of ONE cache entry, for the same
     /// reason the renderer emits them from one pass: a click is resolved to a row
@@ -3758,22 +3772,23 @@ impl App {
     /// Answering that from a per-line model instead — as a walk over each line's
     /// display WIDTH did — makes the click's error grow with every wrapping line
     /// above it, without limit on a long transcript.
-    pub fn preview_hit_context(
-        &mut self,
-        inner_width: u16,
-    ) -> (
-        Vec<usize>,
-        Vec<preview::LinkRegion>,
-        Vec<preview::FoldRegion>,
-    ) {
-        match self.ensure_preview(inner_width) {
-            Some(p) => (
-                p.row_prefix.clone(),
-                p.rendered.links.clone(),
-                p.rendered.folds.clone(),
-            ),
-            None => (Vec::new(), Vec::new(), Vec::new()),
-        }
+    ///
+    /// The LINES come along because resolving which CELL of that line was clicked is
+    /// answered that way on the LINK side — by re-rendering the line rather than by
+    /// modelling the wrap (see `view::region_paints_cell`); the fold side needs only
+    /// the map, and `view::content_hit` owns why the cheaper column answer is enough
+    /// for it. Everything here is BORROWED, never cloned: a click would otherwise
+    /// copy a whole transcript to read one line of it, and both region lists ride in
+    /// that same borrow rather than paying a clone of their own.
+    pub fn preview_hit_context(&mut self, inner_width: u16) -> Option<PreviewHitContext<'_>> {
+        self.ensure_preview(inner_width).map(|p| {
+            (
+                &p.row_prefix[..],
+                &p.rendered.text.lines[..],
+                &p.rendered.links[..],
+                &p.rendered.folds[..],
+            )
+        })
     }
 
     /// Open or close the peer-message node keyed by `key`, then keep it on the
@@ -4910,6 +4925,21 @@ mod tests {
     /// [`fold_scroll_delta`] against the pre-toggle map, which a mis-derived delta
     /// (dropping the `before` term, say) would move the pane by the node's whole
     /// depth into the transcript.
+    /// An OWNED snapshot of the peer-fold half of [`App::preview_hit_context`]: the
+    /// row map and the fold regions copied out of the borrowed cache entry.
+    ///
+    /// The borrow is what production wants — a click reads one line and must not copy
+    /// a transcript to do it — but this test compares a BEFORE against an AFTER across
+    /// a [`App::toggle_peer_fold`] that re-borrows `app` mutably, so the earlier answer
+    /// has to outlive the borrow it came from. Copying here keeps that need in the test
+    /// instead of paying for it on every click.
+    fn peer_hit_snapshot(app: &mut App) -> (Vec<usize>, Vec<preview::FoldRegion>) {
+        let (map, _lines, _links, folds) = app
+            .preview_hit_context(PEER_WIDTH)
+            .expect("the fixture session is selected, so it has a preview");
+        (map.to_vec(), folds.to_vec())
+    }
+
     #[test]
     fn a_peer_fold_toggle_keeps_the_node_on_its_screen_row() {
         let (folder, file) = PEER_FIXTURE;
@@ -4918,7 +4948,7 @@ mod tests {
         // moved cannot be mistaken for the one it left alone.
         app.preview_scroll = 4;
 
-        let (before_map, _links, folds) = app.preview_hit_context(PEER_WIDTH);
+        let (before_map, folds) = peer_hit_snapshot(&mut app);
         let region = folds
             .iter()
             .find(|f| f.key == PEER_KEY)
@@ -4932,7 +4962,7 @@ mod tests {
         let screen_row = i64::try_from(start_before).unwrap() - i64::from(app.preview_scroll);
 
         app.toggle_peer_fold(PEER_KEY, PEER_WIDTH);
-        let (open_map, _links, open_folds) = app.preview_hit_context(PEER_WIDTH);
+        let (open_map, open_folds) = peer_hit_snapshot(&mut app);
         assert!(
             open_map.last() > before_map.last(),
             "the node's body must really have opened below the header"
@@ -4949,7 +4979,7 @@ mod tests {
         );
 
         app.toggle_peer_fold(PEER_KEY, PEER_WIDTH);
-        let (closed_map, _links, closed_folds) = app.preview_hit_context(PEER_WIDTH);
+        let (closed_map, closed_folds) = peer_hit_snapshot(&mut app);
         let closed_region = closed_folds
             .iter()
             .find(|f| f.key == PEER_KEY)
