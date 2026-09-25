@@ -120,14 +120,20 @@ Those are `can_delete`'s two refusals, and they cover only TWO of the three
 writers. The third is snapback's OWN: a
 [quick reply](#quick-reply--non-interactive-send-srcsendrs) `claude stop`s the
 held job before it runs `claude -p -r <id>` — precisely so `-r` is accepted — so
-for the whole span of a send the target is ABSENT from the active list
-`can_delete` reads, while a `claude` child snapback spawned appends to that very
-transcript. The probe cannot see that writer by construction, and the board stays
-fully interactive during a send, so `Ctrl-X d` genuinely is reachable in the
-window. What the confirm therefore calls is `delete::can_delete_target`: the
-in-flight answer from `App::sending_to` FIRST, because it is the more specific
-fact (mid-send the claude-side verdict is `Ok` by construction, so asking it
-first would report nothing at all), then `can_delete`. Its refusal
+once that stop has run, the target is ABSENT from the active list `can_delete`
+reads until the `claude` child snapback spawned registers, and that child appends
+to that very transcript. The probe cannot be relied on to see that writer. At
+2.1.278 the child was absent until it registered and was reported as
+`kind: "interactive"` after (11 of 11 interactive records measured then were such
+children; see [what `kind: "interactive"` denotes](#what-kind-interactive-denotes)),
+and no `-p` child was sampled at 2.1.280, so whether one registers there is not
+known. The board stays fully interactive during a send, so `Ctrl-X d` genuinely
+is reachable in that window. What the confirm therefore calls is
+`delete::can_delete_target`: the in-flight answer from `App::sending_to` FIRST,
+because it is the more specific fact (until the child registers, the claude-side
+verdict is `Ok`, so asking it first would report nothing at all), then
+`can_delete`. Either fact refuses on its own, so the delete is refused for the
+whole send whether or not claude reports the child. Its refusal
 (`DELETE_SENDING_REFUSAL`) names snapback rather than claude, since telling the
 user to close a claude window would point at the wrong process. It stays a
 COMPOSITION of two facts with two sources and two remedies, not a wider
@@ -171,7 +177,10 @@ with the bare and `--all` probes taken within the same second (non-`null` counts
 An earlier sample at the same version, taken on 2026-09-21, read interactive `id`
 0/5 and `pid` 5/5, and background `id` 150/150 and `pid` **2/150**. A spot-check
 at `claude 2.1.280` on 2026-09-24 agreed with the first table: interactive `id` 0/2 and `pid` 2/2; background `id` 164/164 and
-`pid` 0/164 under `--all`, 82/82 and 0/82 bare. So the pid is now absent almost
+`pid` 0/164 under `--all`, 82/82 and 0/82 bare. A spot-check at `claude 2.1.282`
+on 2026-09-25 ([Sample E](#observed-value-distribution); the bare probe only, no
+`--all` taken) read interactive `id` 0/3 and `pid` 3/3, and background `id` 85/85
+and `pid` **1/85**. So the pid is now absent almost
 exactly where a job id already exists, but not exactly, and not by any contract
 claude states. That is why "no job id" and "has a pid" stay two
 SEPARATE conditions everywhere they are read, and neither is inferred from the
@@ -1150,14 +1159,21 @@ parentage on one machine where nearly every `claude` starts through snapback, so
 else, and nothing snapback can observe proves who owns a pid. Hence three rules
 the code follows:
 
-- **No user-facing string names an owner or picks a reading.** The no-job-id
-  refusals and the signal confirm describe only the record (no attachable job, a
-  process with this pid). The test-only `send::OWNERSHIP_CLAIMS` list pins the
-  phrasings they must never use ("your terminal", "another terminal", "the
-  terminal that's running it", "own terminal", "snapback started"). The
-  refusal-copy test also bars the four refusals such a record can meet
-  (`INTERRUPT_NO_JOB_ID`, `INTERRUPT_PID_UNUSABLE`, `ATTACH_NO_JOB_ID`,
-  `SEND_LIVE_REFUSED`) from calling the session "interactive".
+- **No user-facing string names an owner or picks a reading, with ONE known
+  exception.** The no-job-id refusals and the signal confirm describe only the
+  record (no attachable job, a process with this pid). The test-only
+  `send::OWNERSHIP_CLAIMS` list pins the phrasings they must never use ("your
+  terminal", "another terminal", "the terminal that's running it", "own
+  terminal", "snapback started"). The refusal-copy test also bars the four
+  refusals such a record can meet (`INTERRUPT_NO_JOB_ID`,
+  `INTERRUPT_PID_UNUSABLE`, `ATTACH_NO_JOB_ID`, `SEND_LIVE_REFUSED`) from calling
+  the session "interactive". The exception is the hard-delete refusal
+  `delete::DELETE_INTERACTIVE_REFUSAL`: "claude has this session open
+  interactively — close that window first, then hard-delete." It picks the TUI
+  reading, yet at 2.1.278 every record measured under this `kind` was a
+  `claude -p` child with no window to close. No test holds it to either rule. It
+  awaits a separate follow-up `fix`; until then it is the exception, not a
+  precedent.
 - **The signal route treats every such pid as possibly someone else's process:**
   SIGTERM only, behind an unconditional confirm and a confirm-time re-probe. See
   [the signal route](#the-signal-route-no-job-id-a-pid).
@@ -1410,15 +1426,29 @@ Sample D, dated 2026-09-24 at `claude 2.1.280`, a spot-check:
 | `claude agents --json` | 84 (82 background, 2 interactive) | `blocked`×82, background only | `busy`×1, `idle`×1, interactive only |
 | `claude agents --json --all` | 166 (164 background, 2 interactive) | `blocked`×82, `stopped`×67, `done`×14, `failed`×1 | `busy`×1, `idle`×1, interactive only |
 
+Sample E, dated 2026-09-25 at `claude 2.1.282`, a spot-check of ONE bare
+`claude agents --json` probe (no `--all` taken), reduced to key names and counts
+before anything was read. Each count is the number of records carrying that key,
+and no key held `null`. Only key presence was recorded, not the `state`/`status`
+value split, so it is not in the format of Samples A-D (its `id`/`pid` counts are
+also in [the one write into this tree](#on-disk-layout)):
+
+| `kind` | Records | Keys (records carrying each) |
+| --- | --- | --- |
+| `background` | 85 | `cwd` 85, `id` 85, `kind` 85, `name` 71, `pid` 1, `sessionId` 85, `startedAt` 85, `state` 85, `status` 1 |
+| `interactive` | 3 | `cwd` 3, `kind` 3, `name` 3, `pid` 3, `sessionId` 3, `startedAt` 3, `status` 3 (no `id`, no `state`) |
+
 In Samples C and D, `state` and `status` were **kind-exclusive**: every background
 record carried a `state` and no `status`, and every interactive record the
 reverse. Sample A had records carrying BOTH (35 with a `state` and 21 with a
-`status` among 37 entries), which is the pair `WorkingButIdle` reads. So the
-exclusivity is a sample, not a rule: the parser keeps reading both fields and
+`status` among 37 entries), which is the pair `WorkingButIdle` reads, and in
+Sample E one background record carried a `status` beside its `state` (whether it
+is the same record that carried a `pid` was not recorded). So the exclusivity is a
+sample, not a rule: the parser keeps reading both fields and
 `ReportedAgent::qualifier` keeps its `state`-first precedence. Neither bare list
-carried `done`, and the nine-key union (`cwd`, `id`, `kind`, `name`, `pid`,
-`sessionId`, `startedAt`, `state`, `status`) was identical in both samples and
-both probes.
+in C or D carried `done`, and the nine-key union (`cwd`, `id`, `kind`, `name`,
+`pid`, `sessionId`, `startedAt`, `state`, `status`) was identical in both samples
+and both probes, and the same again in Sample E.
 
 Notes across Samples A and B: `done` occurred **only** under `--all` — **zero**
 occurrences in either bare list (37 entries, then 74) — which is the direct

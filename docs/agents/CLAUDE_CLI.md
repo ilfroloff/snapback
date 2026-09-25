@@ -17,20 +17,21 @@ scope only: the surface of the `claude` command itself.
 
 ## Version pin (self-healing)
 
-> **Captured against `claude 2.1.280` (Claude Code).** Previous capture:
-> `2.1.220`.
+> **Captured against `claude 2.1.282` (Claude Code).** Previous capture:
+> `2.1.280`.
 
 Before trusting a flag or command below, compare the installed version:
 
 ```sh
-claude --version   # e.g. "2.1.280 (Claude Code)"
+claude --version </dev/null   # e.g. "2.1.282 (Claude Code)"
 ```
 
 This pin covers the COMMAND surface: flags, commands and their help text. The
 `claude agents --json` WIRE shape that `snapback` parses (its keys, which records
 carry `id` and `pid`, and what `kind: "interactive"` turned out to denote) is
 measured separately in [DOMAIN.md](DOMAIN.md#reported-agents-srcagentsrs). It was
-captured at 2.1.278 and spot-checked at 2.1.280 with the same nine-key union.
+captured at 2.1.278 and spot-checked at 2.1.280 with the same nine-key union, and
+again at 2.1.282 ([DOMAIN.md, Sample E](DOMAIN.md#observed-value-distribution)).
 
 - **Installed == pinned** → this doc matches the live CLI. Trust it.
 - **Installed < pinned** → the local install is **behind this doc**. Newer flags
@@ -39,7 +40,7 @@ captured at 2.1.278 and spot-checked at 2.1.280 with the same nine-key union.
   just because an older local `claude` rejects it.
 - **Installed > pinned** → **this doc is stale**, not the CLI. Re-capture and
   refresh it (see [Refreshing this doc](#refreshing-this-doc)) before relying on
-  the tables; flags may have been added, renamed, or removed since 2.1.280.
+  the tables; flags may have been added, renamed, or removed since 2.1.282.
 
 Keep the pinned version above in sync with the tables — bumping one without the
 other defeats the check.
@@ -71,13 +72,14 @@ two pure checks in front of the syscall instead. It exists because `claude` offe
 no verb for a record without a job id (see
 [Background-session commands](#background-session-commands)), so the only handle
 left is the pid claude itself reported. Do not confuse it with **`claude kill
-<id>`**: at 2.1.280 that is an alias of `claude stop`, takes a background JOB id,
-and cannot address such a record either. What `kind: "interactive"` records are,
-and why no user-facing string says who owns the signalled process, is in
+<id>`**: at 2.1.282, as at 2.1.280, that is an alias of `claude stop`, takes a
+background JOB id, and cannot address such a record either. What
+`kind: "interactive"` records are, and why no user-facing string says who owns
+the signalled process, is in
 [DOMAIN.md](DOMAIN.md#what-kind-interactive-denotes).
 
 Two of these, **`attach`** and **`stop`**, were hidden from `claude --help` in the
-2.1.220 capture and are listed there at 2.1.280 (see
+2.1.220 capture and have been listed there since 2.1.280 (see
 [below](#background-session-commands)). `attach`/`stop` take the **short
 agent-view job id** (e.g. `ca56b543`), NOT the full `sessionId`; passing a UUID
 returns exit 1 ("No job matching"). The `-r` resume/fork/send paths take the
@@ -159,7 +161,7 @@ with `-p/--print` (SDK/non-interactive mode).
 | `--model <model>` | Model for the session — alias (`fable`/`opus`/`sonnet`) or full id (`claude-fable-5`). |
 | `--fallback-model <model>` | `[P]` Fallback model(s), comma-separated, tried in order when the primary is overloaded; the primary is re-tried at the start of each user turn. |
 | `--agent <agent>` | Agent for the session; overrides the `agent` setting. |
-| `--agents <json>` | JSON object defining custom agents inline. |
+| `--agents <json-or-file>` | JSON object defining custom agents inline, or with `--print` the path to a file that holds one. |
 | `--effort <level>` | `low` \| `medium` \| `high` \| `xhigh` \| `max`. |
 | `--autocompact <auto\|tokens>` | Auto-compact window size (`auto`, or 100k–1M tokens). |
 | `--teleport [session]` | Resume a teleport session, optionally by session id. |
@@ -271,17 +273,21 @@ flags (a few are expanded below).
 The commands that act on a background session by its **short job id** — the `id`
 that `claude --bg` prints and `claude agents --json` reports on background records.
 In the 2.1.220 capture `attach` and `stop` were hidden from `claude --help`. At
-2.1.280 `attach`, `stop`, `logs`, `respawn` and `rm` are all listed there, and only
-`daemon` is still hidden (see [Hidden commands](#hidden-commands)). Each usage
-below is the command's own `--help` text at 2.1.280, except `daemon stop`'s, which
+2.1.282, as at 2.1.280, `attach`, `stop`, `logs`, `respawn` and `rm` are all
+listed there, and `daemon` is the one hidden command in this set (see
+[Hidden commands](#hidden-commands)). Each usage below is the command's own
+`--help` text at 2.1.282, identical at 2.1.280, except `daemon stop`'s, which
 was read from the binary (see [Refreshing this doc](#refreshing-this-doc) for why
 it is never run).
 
 **None of them can end a record that has no job id**, and every
 `kind: "interactive"` record measured so far has none (0/3 at 2.1.278, 0/2 at
-2.1.280, see [DOMAIN.md](DOMAIN.md#what-kind-interactive-denotes)). Those records
-are a `claude -p` print-mode child or an interactive TUI. The last column below
-records this per command, and it is why `Ctrl-K` has a SIGTERM route at all (see
+2.1.280, see [DOMAIN.md](DOMAIN.md#what-kind-interactive-denotes); 0/3 in the
+2.1.282 [spot-check](DOMAIN.md#observed-value-distribution)). Where their
+processes were inspected (2.1.278 and 2.1.280), those records were a `claude -p`
+print-mode child or an interactive TUI. The last column below records this per
+command, and it is why
+`Ctrl-K` has a SIGTERM route at all (see
 [How snapback drives `claude`](#how-snapback-drives-claude)).
 
 | Command | Usage (own help text) | Notes | Can it end a record with no job id? |
@@ -308,16 +314,20 @@ should decide.
 ### Hidden commands
 
 Subcommands that are **absent from `claude --help`** but whose usage text ships
-in the binary. At 2.1.280 that is `daemon` alone.
+in the binary. At 2.1.282 those are `daemon` and `self-hosted-runner`. Both were
+already in the 2.1.280 binary, but that capture recorded only `daemon`.
 
 | Command | Usage | Notes |
 | --- | --- | --- |
 | `claude daemon [subcommand] [options]` | Service lifecycle for the background-session supervisor: `run [json-path]` (**the default when piped**), `status`, `logs`, `stop`, `install`, `start`, `restart`, `uninstall`; options `--json-path <p>` (default `~/.claude/daemon.json`), `--log-file <p>` (default `~/.claude/daemon.log`), `--help`/`-h`. | Not used by `snapback`. Read from the binary's embedded usage text, never by running it: a bare `claude daemon` with piped stdout RUNS the supervisor. `stop` is in the table above. |
+| `claude self-hosted-runner [options]` | Runs a self-hosted runner that takes Claude Code CLOUD sessions on this machine. Its options cover the connection (API URL, environment secret, an egress proxy), capacity and checkout directory, lifecycle hooks, and per-session watchdogs. Subcommands: `orchestrator` (polls a spawn-hint queue and runs a `spawn-runner` hook per hint), `setup` and `doctor` (interactive wizards that start a Claude Code session), `decode-token [token]`. | Not used by `snapback`, and it takes no background job id. Read from the binary's embedded usage text, never by running it: without `--help` it starts a long-running runner, and `setup`/`doctor` start a session. Whether its `--help` returns before anything starts was not tested by running it. |
 
-Because a hidden command is undocumented in `--help`, a version bump can change or
-remove it without a visible help diff. The same caution applies to the two
-`snapback` depends on: if its attach/send/stop paths regress after a `claude`
-update, re-verify `claude stop --help` / `claude attach --help` first.
+Because a hidden command is undocumented in `--help`, a version bump can add,
+change or remove one without a visible help diff. The embedded-usage listing in
+[Refreshing this doc](#refreshing-this-doc) is how a new one shows up. The same
+caution applies to the two `snapback` depends on: if its attach/send/stop paths
+regress after a `claude` update, re-verify `claude stop --help` /
+`claude attach --help` first.
 
 ## Returning to snapback from inside a session
 
@@ -376,6 +386,7 @@ rest, `claude <command> --help` is authoritative.
 `details`, `disable`, `enable`, `eval [target]`, `init|new <name>`,
 `install|i <plugin>`, `list`, `marketplace`, `prune|autoremove`, `tag`,
 `uninstall|remove <plugin>`, `update <plugin>`, `validate <path>`.
+`update`'s `--scope` defaults to auto-detect.
 `marketplace` has `add <source>`, `list`, `remove|rm <name>`, `update [name]`.
 
 ### `claude project`
@@ -404,26 +415,57 @@ default). User-triggered and billed; a session cannot launch it for you.
 stage cannot regenerate these facts — they must be re-captured from the live CLI:
 
 ```sh
-claude --version
+claude --version </dev/null
 claude --help </dev/null
 for c in agents auth mcp plugin project install update ultrareview \
          doctor setup-token gateway auto-mode import \
          attach stop rm respawn logs; do
   echo "== $c =="; claude "$c" --help </dev/null
 done
-# daemon: hidden, and NEVER run to read its help (see below)
-strings "$(readlink -f "$(command -v claude)")" | grep -A15 '^Usage: claude daemon'
+# Second level. A subcommand a group lists that is missing here is NEW:
+# check it is an ordinary subcommand before adding it and calling its --help.
+for p in auth:login auth:logout auth:status \
+         mcp:add mcp:add-from-claude-desktop mcp:add-json mcp:get mcp:list \
+         mcp:login mcp:logout mcp:remove mcp:reset-project-choices mcp:serve \
+         plugin:details plugin:disable plugin:enable plugin:eval plugin:init \
+         plugin:install plugin:list plugin:marketplace plugin:prune plugin:tag \
+         plugin:uninstall plugin:update plugin:validate project:purge \
+         auto-mode:config auto-mode:critique auto-mode:defaults auto-mode:reset; do
+  echo "== ${p%%:*} ${p#*:} =="; claude "${p%%:*}" "${p#*:}" --help </dev/null
+done
+for s in add list remove update; do
+  echo "== plugin marketplace $s =="; claude plugin marketplace "$s" --help </dev/null
+done
+# Hidden commands: NEVER run, not even with --help (see below). List every usage
+# line embedded in the binary (a name missing from `claude --help` is hidden),
+# then read each hidden command's usage from the binary.
+BIN="$(readlink -f "$(command -v claude)")"
+strings "$BIN" | grep -oE 'Usage: claude [a-z][a-z-]*' | sort -u
+strings "$BIN" | grep -A15 '^Usage: claude daemon'
+strings "$BIN" | grep -A30 '^Usage: claude self-hosted-runner'
 ```
 
 **Run nothing but `--version` and `--help` here.** Several commands in this list
 start, stop, delete, restart or attach to something when run without `--help`
 (`stop`, `rm`, `respawn`, `attach`, `install`, `update`), and so do `-p` and `-r`.
-Stdin comes from `/dev/null` so nothing can wait on a prompt. `daemon` is the one exception to even `--help`. With no
-subcommand it RUNS the supervisor when its stdout is piped, and `daemon stop`
-terminates background sessions across every project. Its usage is therefore read
-from the text embedded in the binary, never from running it. Pass multi-word
-subcommands as separate words (`claude auth login --help`, not a single quoted
-`"auth login"`, which just re-prints the top-level help).
+Stdin comes from `/dev/null` so nothing can wait on a prompt. The two hidden
+commands are the exception to even `--help`. With no subcommand, `daemon` RUNS the
+supervisor when its stdout is piped, and `daemon stop` terminates background
+sessions across every project. `self-hosted-runner` starts a long-running runner,
+and its `setup`/`doctor` start a Claude Code session. Their usage is therefore
+read from the text embedded in the binary, never from running them, and a NEW
+hidden command gets the same treatment. Pass multi-word subcommands as separate
+words (`claude auth login --help`, not a single quoted `"auth login"`, which just
+re-prints the top-level help).
+
+**Diff against the previous build.** On a native install,
+`readlink -f "$(command -v claude)"` resolves to a file named after its version,
+and older builds may still sit beside it. When the previous one does, run the
+block above against both and `diff` the output. That diff is the capture-time
+check: it catches a changed default or wording that no table records. What it
+finds is folded into the tables and the version pin, and the before/after is left
+to the commit message, because git history is the
+[refresh log](README.md#maintenance).
 
 Update the tables **and** the [version pin](#version-pin-self-healing) together
 when the surface changes. When a flag/command that `snapback` invokes changes,

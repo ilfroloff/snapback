@@ -72,7 +72,7 @@ one place.
   bucket the send gates treat as live without re-deriving the writer question.
   The gate the confirm calls is `can_delete_target` — `can_delete` COMPOSED with
   `App::sending_to`, refusing snapback's OWN in-flight quick reply (the THIRD
-  writer, which claude's probe structurally CANNOT see) in its own words
+  writer, which claude's probe cannot be relied on to see) in its own words
   (`DELETE_SENDING_REFUSAL`) because the writer to name there is snapback, not
   claude; keep it a composition of two facts, never a wider `can_delete`.
   A confirm may target the selected id ALONE or its whole fork lineage
