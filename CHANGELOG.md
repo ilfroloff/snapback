@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/ilfroloff/snapback/compare/v0.9.0...v0.10.0) - 2026-09-26
+
+### Added
+
+- fold a subagent's hand-back into one line a click opens
+- let Ctrl-K end a live session with a SIGTERM to its process
+- *(tui)* copy the selected session's full ID with Ctrl-X y
+
+### Fixed
+
+- let Ctrl-R reply to other sessions while a reply is in flight
+- *(tui/update)* keep the preview's first content column clickable
+- keep a quick reply tracked until it actually finishes
+- mark a session whose background task failed until you write in it
+- stop the board from hiding two silent agent downgrades
+
+### Other
+
+- *(tui/update)* drop a seam assertion that could no longer fail
+- complete the overlay_active gated-action enumeration
+- cover a banner row carrying both the age and a failed task
+- align the delete-guard rationale and CLI reference with evidence
+
 ## [0.9.0](https://github.com/ilfroloff/snapback/compare/v0.8.2...v0.9.0) - 2026-09-23
 
 ### Added
