@@ -525,8 +525,9 @@ fn submit_reply(
             // Mark the send in flight so the preview echoes the message under a
             // synthetic `▶ you` turn plus a live `cooking…` indicator until the
             // completion event lands. `baseline_msg_count` lets the echo step aside
-            // the instant claude writes the real turn to disk.
-            app.sending = Some(super::app::Sending {
+            // the instant claude writes the real turn to disk. The entry is this
+            // session's alone: a reply still in flight to another row keeps its own.
+            app.mark_sending(super::app::Sending {
                 session_id: authoritative_id.clone(),
                 message,
                 baseline_msg_count,

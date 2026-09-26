@@ -605,11 +605,11 @@ fn run_inner(
 
     // The board session is over, but its channel may still hold a quick reply's
     // `SendFinished` that arrived after the key that ended it. Dropping `events`
-    // would throw that away, and `App::sending`, which only that event clears,
-    // would then stay set into every later board session. So the receiver is
-    // emptied into the queue and dropped under the queue's lock (the input-reader
-    // join included), and a reply finishing at the same moment either lands before
-    // the drain or finds the receiver gone. Either way it is queued for the next
+    // would throw that away, and the reply's `App::sending` entry, which only that
+    // event clears, would then stay set into every later board session. So the
+    // receiver is emptied into the queue and dropped under the queue's lock (the
+    // input-reader join included), and a reply finishing at the same moment either
+    // lands before the drain or finds the receiver gone. Either way it is queued for the next
     // board's replay (the no-gap argument is `UndeliveredEvents`'). The `?` exits
     // above skip this on purpose: an `Err` from here ends the process in
     // `lib::run`, so no later board could read the queue.

@@ -35,7 +35,7 @@
 //! | `Ctrl-F` | fork-resume the selected session |
 //! | `Ctrl-N` | start a new session in the launch directory. When agents are defined a picker opens first and `Enter` on a pick opens a draft pane for the session's first message; with none defined that draft opens straight away. In the draft, `Enter` starts a BACKGROUND agent without leaving the board, `Ctrl-O` runs it interactively instead, `Esc` cancels |
 //! | `Ctrl-O` (in the agent picker) | start the highlighted agent INTERACTIVELY at once, skipping the draft — the same verb `Ctrl-O` names inside the draft, so BOTH routes out of the picker cost exactly one key. Bound on the picker alone — inert on every other modal |
-//! | `Ctrl-R` | quick-reply: send a one-shot message to the selected session without leaving the board. An agent whose run is OVER (`done` / `stopped` / `failed`) is stopped first so the reply lands in place; `needs input` confirms first; `working` / `idle` / `interrupted` / an unrecognized qualifier is refused, and so is a session claude reports with no stoppable job id — the refusal points at `Ctrl-K` or Fork (see [`send::reply_gate`]). ONE reply at a time: while one is still in flight, `Ctrl-R` on any row, that one included, is refused before any of the above, naming the session it is going to (see [`send::reply_in_flight_refusal`]) |
+//! | `Ctrl-R` | quick-reply: send a one-shot message to the selected session without leaving the board. An agent whose run is OVER (`done` / `stopped` / `failed`) is stopped first so the reply lands in place; `needs input` confirms first; `working` / `idle` / `interrupted` / an unrecognized qualifier is refused, and so is a session claude reports with no stoppable job id — the refusal points at `Ctrl-K` or Fork (see [`send::reply_gate`]). While this session's OWN reply is still in flight, `Ctrl-R` on it is refused before any of the above (see [`send::reply_in_flight_refusal`]); a reply still in flight to another row refuses nothing here |
 //! | `Ctrl-K` | stop / interrupt the selected session's live agent, by whichever handle claude's record carries (see [`send::interrupt_gate`]). A stoppable job id → `claude stop`: an agent whose run is OVER (`done` / `stopped` / `failed`) stops at once, every other live agent confirms first. NO job id but a `pid` → confirm, then re-ask claude at `Enter` and send that pid a SIGTERM (never SIGKILL) only if claude still reports the same pid with no job id; a record that is gone, now carries a job id, or reports another pid refuses instead (see [`send::signal_plan`]). A session claude is not holding, or one it reports with neither a job id nor a pid — or with no job id and a pid no signal could take (`0`, past `i32::MAX`, or the board's own process id) — is refused |
 //! | `Tab` | toggle name-only vs. name+content search. Widening to content also opens the preview on the most recent match, exactly as typing does: it goes through the same query funnel, and the mode is the gate that key just opened |
 //! | `Ctrl-A` | flip the scope: current folder <-> project (the launch repo and all of its git worktrees). ONE key for both, because the second is a refinement of the same question the first answers, not a separate mode. Launched with `--all`/`-a` it becomes a three-stop cycle through all folders as well — the whole store is on this key only when the launch flag put it there |
@@ -124,8 +124,9 @@ pub enum Action {
     /// `claude -p -r` REFUSES a session claude is holding as an agent: an agent
     /// whose run is over is stopped first and compose opens, a `needs input` one
     /// confirms before that stop, and a still-live one is refused with a hint.
-    /// Before that gate, a reply already in flight refuses on any row
-    /// ([`send::reply_in_flight_refusal`]): a board sends one at a time.
+    /// Before that gate, a reply of the selected session's own still in flight
+    /// refuses ([`send::reply_in_flight_refusal`]); a reply in flight to another
+    /// row does not.
     Reply,
     /// Stop / interrupt the selected session's live agent (`Ctrl-K`).
     /// [`apply_action`] runs the interrupt gate ([`send::interrupt_gate`]): on a
@@ -533,13 +534,12 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
             status,
             success,
         } => {
-            // A one-shot quick-reply send completed off-thread. Clear the in-flight
-            // indicator (if this is the send it was tracking) and surface the mapped
-            // result (cost / error) on the status line. Successes are transient
-            // confirmations; failures and refusals stay sticky.
-            if app.sending_to(&session_id).is_some() {
-                app.sending = None;
-            }
+            // A one-shot quick-reply send completed off-thread. Clear THIS session's
+            // in-flight entry — only it: a reply still running to another session
+            // keeps its own — and surface the mapped result (cost / error) on the
+            // status line. Successes are transient confirmations; failures and
+            // refusals stay sticky.
+            app.clear_sending(&session_id);
             if success {
                 app.set_status_transient(status);
             } else {
@@ -568,7 +568,7 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
             //
             // Clear the in-flight guard only when the ids match, so a stale result
             // cannot land on a surface that has moved on — the interrupt twin of the
-            // `sending_to` guard above.
+            // session-keyed `clear_sending` above.
             if app.interrupting_on(&session_id).is_some() {
                 app.interrupting = None;
             }
@@ -591,11 +591,12 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
             // knows yet, and it arrives on the list through the ordinary watcher →
             // reload path like any other session.
             //
-            // The identity check is the `sending_to` guard above, and it is
-            // load-bearing for the same reason: the card outlives its editor, so a
-            // result can land on a surface that is no longer this launch's — a
-            // quick reply, or a second draft — and closing blindly would throw away
-            // a buffer the user is still typing into.
+            // The identity check is the launch's twin of the session key
+            // `clear_sending` clears by above, and it is load-bearing for the same
+            // reason: the card outlives its editor, so a result can land on a
+            // surface that is no longer this launch's — a quick reply, or a second
+            // draft — and closing blindly would throw away a buffer the user is
+            // still typing into.
             if success {
                 app.set_status_transient(status);
             } else {
@@ -636,9 +637,9 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
 ///
 /// Such a completion is kept in [`App::take_undelivered`]'s queue by the send
 /// thread, or by the teardown drain (see [`crate::send::UndeliveredEvents`]). The
-/// `SendFinished` arm clears `App::sending` only when `sending_to(session_id)`
-/// matches, so a stale completion cannot clear a reply that is not its own. Its
-/// status keeps the live split, transient on success and sticky on failure, and a
+/// `SendFinished` arm clears only the `App::sending` entry keyed by its own
+/// `session_id`, so a stale completion cannot clear a reply that is not its own.
+/// Its status keeps the live split, transient on success and sticky on failure, and a
 /// finished send on the selected row re-anchors the preview as usual.
 ///
 /// Called on every `Tick` (after `tick_status`) and once at board entry, before
@@ -1827,14 +1828,16 @@ fn new_session(app: &mut App) -> Outcome {
 /// Handle `Ctrl-R` (quick reply). Ask claude what it is holding the SELECTED
 /// session as, one-shot, then route via [`send::reply_gate`].
 ///
-/// One question comes BEFORE that probe: is a quick reply already in flight? A
-/// board sends one at a time, so while [`App::sending`] is set `Ctrl-R` on ANY row
-/// is refused, naming the session that reply is going to
-/// ([`send::reply_in_flight_refusal`]). A second reply would overwrite the one slot
-/// that tracks the first, and [`delete::can_delete_target`] reads that slot to
-/// refuse deleting a transcript snapback's own child is still writing. Refusing
-/// here, rather than at submit, means no compose box opens for a reply that could
-/// not be sent, so nothing typed is thrown away, and no probe is spent.
+/// One question comes BEFORE that probe: does THIS session already have a quick
+/// reply of its own in flight ([`App::sending_to`])? If so `Ctrl-R` is refused
+/// ([`send::reply_in_flight_refusal`]). A reply in flight to ANOTHER session is not
+/// asked about: [`App::sending`] keeps one entry per session, so a reply here is
+/// tracked beside it, and [`delete::can_delete_target`] keeps refusing to delete
+/// either transcript while its own child writes. The same session stays refused
+/// because two `claude -p -r` runs would both append to one transcript, and the
+/// first to finish would clear the entry the second still needed. Refusing here,
+/// rather than at submit, means no compose box opens for a reply that could not be
+/// sent, so nothing typed is thrown away, and no probe is spent.
 ///
 /// `claude -p -r <id>` refuses to resume a session registered as a live agent, but
 /// `claude stop <job-id>` deregisters the job (keeping the conversation) so the
@@ -1856,8 +1859,8 @@ fn reply(app: &mut App) -> Outcome {
     let Some(id) = app.selected_session().map(|s| s.session_id.clone()) else {
         return Outcome::Continue;
     };
-    // ONE in-flight reply per board, refused before the probe (see above).
-    if let Some(refusal) = send::reply_in_flight_refusal(app.sending_label()) {
+    // ONE in-flight reply per SESSION, refused before the probe (see above).
+    if let Some(refusal) = send::reply_in_flight_refusal(app.sending_to(&id).is_some()) {
         app.set_status(refusal);
         return Outcome::Continue;
     }
@@ -3717,17 +3720,18 @@ mod tests {
         assert!(app.is_composing(), "compose stays open on an empty send");
     }
 
-    /// Tasks 8.2 / 8.3: while a quick reply is in flight, `Ctrl-R` is refused AT THE
-    /// KEYPRESS on every row, the in-flight one included. It is refused before the
-    /// probe `send::reply_gate` reads, so no compose box opens (nothing typed can be
-    /// thrown away) and no probe is spent. The refusal names the session the reply
-    /// is going to, never the row `Ctrl-R` was pressed on, and it is sticky like
-    /// every refusal.
+    /// While a quick reply is in flight, `Ctrl-R` is refused AT THE KEYPRESS on that
+    /// reply's OWN row, and only there. Another row opens its compose box exactly as
+    /// if nothing were in flight: its reply gate spends its probe and refuses
+    /// nothing. On the in-flight row the refusal comes before the probe
+    /// `send::reply_gate` reads, so no compose box opens (nothing typed can be
+    /// thrown away) and no probe is spent. That refusal speaks about this session
+    /// and is sticky like every refusal.
     ///
-    /// Nothing here can dispatch: the reply in flight is stated, not sent, and the
-    /// probe is seeded, so a board that let a compose box open would stop there.
+    /// Nothing here can dispatch: the reply in flight is stated, not sent, the probe
+    /// is seeded, and the compose box the other row opens is cancelled unsent.
     #[test]
-    fn ctrl_r_while_a_reply_is_in_flight_refuses_before_the_probe_on_every_row() {
+    fn ctrl_r_refuses_only_the_session_whose_reply_is_in_flight() {
         let mut app = App::new(
             vec![session("first"), session("second")],
             Scope::All,
@@ -3739,48 +3743,65 @@ mod tests {
             counter.set(counter.get() + 1);
             HashMap::new() // claude holds nothing: only the in-flight reply refuses
         });
-        app.sending = Some(crate::tui::app::Sending {
-            session_id: "first".to_string(),
-            message: "still landing".to_string(),
-            baseline_msg_count: 0,
-        });
+        app.sending = vec![replying_to("first")];
 
-        for (step, row) in [(KeyCode::Down, "second"), (KeyCode::Up, "first")] {
-            press(&mut app, step);
-            assert_eq!(app.selected.as_deref(), Some(row));
-            app.status = None; // each press must set its own refusal
+        // Another row: `first`'s reply in flight is none of its business.
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.selected.as_deref(), Some("second"));
+        app.status = None;
+        let outcome = press_ctrl(&mut app, KeyCode::Char('r'));
+        assert!(
+            matches!(outcome, Outcome::Continue),
+            "second: opening compose escalates nothing"
+        );
+        assert!(
+            app.is_composing(),
+            "second: another session's reply in flight must not refuse this one"
+        );
+        assert_eq!(
+            probes.get(),
+            1,
+            "second: its reply gate asked claude as usual"
+        );
+        assert_eq!(app.status, None, "second: nothing was refused");
+        press(&mut app, KeyCode::Esc); // cancel the draft unsent
+        assert!(!app.is_composing(), "precondition: back on the board");
 
-            let outcome = press_ctrl(&mut app, KeyCode::Char('r'));
-            assert!(
-                matches!(outcome, Outcome::Continue),
-                "{row}: a refusal escalates nothing"
-            );
-            assert!(
-                !app.is_composing() && app.pending_stop.is_none(),
-                "{row}: nothing may open for a reply that cannot be sent"
-            );
-            assert_eq!(
-                probes.get(),
-                0,
-                "{row}: the refusal comes before the probe, so none is spent"
-            );
-            let status = app
-                .status
-                .clone()
-                .expect("the refusal is on the status line");
-            assert!(
-                status.contains("label first") && !status.contains("label second"),
-                "{row}: the refusal names the session being replied to: {status:?}"
-            );
-            for _ in 0..=STATUS_DWELL_TICKS {
-                handle_event(&mut app, AppEvent::Tick, &mut store_at(Path::new("/tmp")));
-            }
-            assert_eq!(
-                app.status.as_deref(),
-                Some(status.as_str()),
-                "{row}: a refusal is sticky, so it must outlive the dwell"
-            );
+        // The in-flight row itself: refused before the probe.
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.selected.as_deref(), Some("first"));
+        app.status = None; // the press must set its own refusal
+        let outcome = press_ctrl(&mut app, KeyCode::Char('r'));
+        assert!(
+            matches!(outcome, Outcome::Continue),
+            "first: a refusal escalates nothing"
+        );
+        assert!(
+            !app.is_composing() && app.pending_stop.is_none(),
+            "first: nothing may open for a reply that cannot be sent"
+        );
+        assert_eq!(
+            probes.get(),
+            1,
+            "first: the refusal comes before the probe, so none is spent"
+        );
+        let status = app
+            .status
+            .clone()
+            .expect("the refusal is on the status line");
+        assert_eq!(
+            status,
+            send::SEND_IN_FLIGHT_REFUSED,
+            "first: refused in words about this session"
+        );
+        for _ in 0..=STATUS_DWELL_TICKS {
+            handle_event(&mut app, AppEvent::Tick, &mut store_at(Path::new("/tmp")));
         }
+        assert_eq!(
+            app.status.as_deref(),
+            Some(status.as_str()),
+            "first: a refusal is sticky, so it must outlive the dwell"
+        );
     }
 
     /// The first row of [`a_reply_in_flight_then_a_second_attempt`]'s board: the
@@ -3797,11 +3818,13 @@ mod tests {
     ///
     /// The second attempt is made the way a user makes it: `Ctrl-R`, then — only if
     /// a compose box opened — type and `Enter`. The `if` is what lets one driver
-    /// serve both boards. One that refuses at `Ctrl-R` has no draft to type into
+    /// serve every board. One that refuses at `Ctrl-R` has no draft to type into
     /// (the keys would land in the search query), and one that does not dispatches
-    /// the second reply, which reproduces the overwrite end to end. Neither
-    /// `Outcome::Send` is executed: the test holds the value and the driver never
-    /// sees it, so no `claude` is spawned.
+    /// the second reply. On a board that tracked ONE send that dispatch reproduced
+    /// the overwrite end to end; on this one, which keys its sends by session, it
+    /// puts the second reply's entry beside the first. Neither `Outcome::Send` is
+    /// executed: the test holds the value and the driver never sees it, so no
+    /// `claude` is spawned.
     ///
     /// Both files live in a temp dir this helper creates. Returns the board and
     /// that dir, for the caller to remove.
@@ -3835,25 +3858,32 @@ mod tests {
         (app, dir)
     }
 
-    /// Task 8.4, the regression: a quick reply still IN FLIGHT stays the tracked send
-    /// when a second reply is attempted on another row.
+    /// Task 8.4, the regression: a quick reply still IN FLIGHT stays tracked when a
+    /// second reply is sent to another row, and the second is tracked beside it.
     ///
-    /// `App::sending` holds ONE send. Before the one-in-flight guard, `Ctrl-R` on
-    /// another row opened a compose box and its `Enter` overwrote that slot. The
-    /// first reply's `claude -p` child was still running and still appending to
-    /// its transcript, but the board no longer tracked it anywhere.
+    /// When `App::sending` held ONE send, `Ctrl-R` on another row opened a compose
+    /// box and its `Enter` overwrote that slot. The first reply's `claude -p` child
+    /// was still running and still appending to its transcript, but the board no
+    /// longer tracked it anywhere. Refusing `Ctrl-R` on every row closed that hole
+    /// by sending one reply at a time; keying the entries by session closes it
+    /// while both replies run.
     #[test]
-    fn a_second_reply_cannot_overwrite_the_one_still_in_flight() {
+    fn a_second_reply_to_another_session_is_tracked_beside_the_first() {
         let (app, dir) = a_reply_in_flight_then_a_second_attempt();
-        let tracked = app
-            .sending_to(IN_FLIGHT_FIRST)
-            .map(|sending| sending.message.clone());
+        let message_to = |id: &str| app.sending_to(id).map(|sending| sending.message.clone());
+        let (first, second) = (message_to(IN_FLIGHT_FIRST), message_to(IN_FLIGHT_SECOND));
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(
-            tracked.as_deref(),
+            first.as_deref(),
             Some("first"),
-            "the reply still in flight must stay the tracked send"
+            "the reply still in flight must stay tracked"
         );
+        assert_eq!(
+            second.as_deref(),
+            Some("second"),
+            "the reply to the other row went out and is tracked too"
+        );
+        assert_eq!(app.sending.len(), 2, "one entry per session, no more");
     }
 
     /// Task 8.5, the consequence and the reason this is a fix: the hard-delete
@@ -3960,6 +3990,45 @@ mod tests {
         assert_eq!(app.status.as_deref(), Some("sent"));
     }
 
+    /// A finished reply clears ONLY its own session's entry. With replies in flight
+    /// to `a` and `b`, `a`'s `SendFinished` ends `a`'s tracking and leaves `b`'s
+    /// standing, because `b`'s `claude -p` child is still writing: its echo stays up
+    /// and the hard-delete guard stays armed on its transcript, asked exactly what
+    /// `confirm_delete` asks it with claude reporting nothing.
+    #[test]
+    fn a_finished_reply_leaves_another_sessions_reply_tracked() {
+        let mut app = App::new(
+            vec![session("a"), session("b")],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
+        app.sending = vec![replying_to("a"), replying_to("b")];
+
+        handle_event(
+            &mut app,
+            AppEvent::SendFinished {
+                session_id: "a".to_string(),
+                status: "sent".to_string(),
+                success: true,
+            },
+            &mut store_at(Path::new("/tmp")),
+        );
+        assert!(
+            app.sending_to("a").is_none(),
+            "a's reply finished, so its entry clears"
+        );
+        assert_eq!(
+            app.sending_to("b").map(|sending| sending.message.as_str()),
+            Some("still landing"),
+            "b's reply is still running, so a's completion must leave it tracked"
+        );
+        assert_eq!(
+            delete::can_delete_target(None, app.sending_to("b").is_some()),
+            Err(delete::DELETE_SENDING_REFUSAL.to_string()),
+            "b's transcript must stay undeletable while its reply lands"
+        );
+    }
+
     // --- a completion that outlived its board session ------------------------
     //
     // Each test below queues a completion the way a send thread does once its
@@ -3982,12 +4051,12 @@ mod tests {
     }
 
     /// A quick reply in flight to `session_id`, stated rather than dispatched.
-    fn replying_to(session_id: &str) -> Option<crate::tui::app::Sending> {
-        Some(crate::tui::app::Sending {
+    fn replying_to(session_id: &str) -> crate::tui::app::Sending {
+        crate::tui::app::Sending {
             session_id: session_id.to_string(),
             message: "still landing".to_string(),
             baseline_msg_count: 0,
-        })
+        }
     }
 
     fn tick(app: &mut App) -> Outcome {
@@ -4002,7 +4071,7 @@ mod tests {
     #[test]
     fn a_queued_completion_is_replayed_on_the_next_tick_and_clears_its_reply() {
         let mut app = app_with("s", None);
-        app.sending = replying_to("s");
+        app.sending = vec![replying_to("s")];
         app.preview_top(); // the reader scrolled up while the reply was in flight
         queue_undelivered(&app, "s", "sent — $0.0136", true);
         assert!(
@@ -4016,7 +4085,7 @@ mod tests {
             "a tick never ends the board"
         );
         assert!(
-            app.sending.is_none(),
+            app.sending.is_empty(),
             "the replayed completion clears the reply it belongs to"
         );
         assert!(
@@ -4046,13 +4115,13 @@ mod tests {
     #[test]
     fn a_queued_failed_completion_is_replayed_sticky() {
         let mut app = app_with("s", None);
-        app.sending = replying_to("s");
+        app.sending = vec![replying_to("s")];
         queue_undelivered(&app, "s", "send failed: boom", false);
 
         tick(&mut app);
         assert!(
-            app.sending.is_none(),
-            "a failed reply has finished too, so its slot clears"
+            app.sending.is_empty(),
+            "a failed reply has finished too, so its entry clears"
         );
         for i in 0..=STATUS_DWELL_TICKS {
             assert_eq!(
@@ -4066,7 +4135,8 @@ mod tests {
 
     /// Task 10.4: a queued completion for ANOTHER session is still replayed (its
     /// status shows, and the queue empties), but it leaves the reply in flight
-    /// alone. The replay reaches the same `sending_to` check as a live event.
+    /// alone. Like a live event, the replay reaches `App::clear_sending`, which
+    /// removes only the entry for the completion's own session.
     #[test]
     fn a_queued_completion_for_another_session_leaves_the_reply_in_flight_alone() {
         let mut app = App::new(
@@ -4074,7 +4144,7 @@ mod tests {
             Scope::All,
             PathBuf::from("/tmp"),
         );
-        app.sending = replying_to("a");
+        app.sending = vec![replying_to("a")];
         queue_undelivered(&app, "b", "sent", true);
 
         tick(&mut app);
@@ -4096,13 +4166,13 @@ mod tests {
     #[test]
     fn the_board_entry_replay_settles_a_queued_completion_before_any_tick() {
         let mut app = app_with("s", None);
-        app.sending = replying_to("s");
+        app.sending = vec![replying_to("s")];
         queue_undelivered(&app, "s", "sent", true);
 
         replay_undelivered(&mut app, &mut store_at(Path::new("/tmp")));
         assert_eq!(app.tick, 0, "no tick was spent");
         assert!(
-            app.sending.is_none(),
+            app.sending.is_empty(),
             "the entry replay clears the reply it belongs to"
         );
         assert_eq!(app.status.as_deref(), Some("sent"));
@@ -4116,11 +4186,11 @@ mod tests {
     /// dispatched, then a hand-off (`Enter`) ends that board session while the
     /// reply is still running, and the reply finishes with no board up to read it.
     ///
-    /// Until the next board's tick the slot must still stand, and with it the
+    /// Until the next board's tick its entry must still stand, and with it the
     /// hard-delete guard, because nothing has been delivered yet. Clearing it early
     /// would reopen `Ctrl-X d` on a transcript the child may still be writing. After
-    /// that tick the slot is clear, and `Ctrl-R` opens a compose box again instead
-    /// of refusing "one reply at a time" until restart.
+    /// that tick the entry is gone, and `Ctrl-R` on that session opens a compose
+    /// box again instead of refusing it until restart.
     ///
     /// Nothing is executed: both outcomes are held, never handed to a driver, the
     /// probe is seeded, and the delete guard is asked exactly what `confirm_delete`
@@ -4156,7 +4226,7 @@ mod tests {
 
         // 5. The next board's tick, then `Ctrl-R` on the same row.
         tick(&mut app);
-        let in_flight_after = app.sending.is_some();
+        let in_flight_after = !app.sending.is_empty();
         let reopened = press_ctrl(&mut app, KeyCode::Char('r'));
         let composing = app.is_composing();
         let status = app.status.clone();
@@ -4177,7 +4247,7 @@ mod tests {
         );
         assert!(
             in_flight_before,
-            "the slot stands until a completion is delivered"
+            "the entry stands until a completion is delivered"
         );
         assert_eq!(
             verdict_before,
@@ -6857,7 +6927,7 @@ mod tests {
             "the draft card is marked launching in the preview pane"
         );
         assert!(
-            app.sending.is_none(),
+            app.sending.is_empty(),
             "a launch is not a reply: nothing to echo into a transcript"
         );
     }
@@ -7288,9 +7358,9 @@ mod tests {
     /// whatever surface happens to be open when it arrives. Closing blindly there
     /// destroys a quick reply mid-sentence: the typed buffer is gone with no
     /// warning, and the only thing the user did was not sit still for the second
-    /// or two the launch took. The guard is the `App::sending_to` shape — the
-    /// request carries an identity, the completion event carries it back, and the
-    /// handler acts only on a match.
+    /// or two the launch took. The guard is the shape a quick reply is cleared by
+    /// (`App::clear_sending`) — the request carries an identity, the completion
+    /// event carries it back, and the handler acts only on a match.
     #[test]
     fn a_finished_launch_never_closes_a_compose_opened_after_it() {
         let mut app = app_with("idle", None);
@@ -7444,7 +7514,7 @@ mod tests {
         );
         assert!(matches!(out, Outcome::Continue));
         assert_eq!(app.status.as_deref(), Some("background agent started"));
-        assert!(app.sending.is_none());
+        assert!(app.sending.is_empty());
         assert!(!app.is_composing());
     }
 
@@ -8072,11 +8142,11 @@ mod tests {
         // Claude reports NOTHING: the send already deregistered the job.
         seed_live(&mut app, &[]);
         // ...but snapback still has the reply in flight to this very id.
-        app.sending = Some(crate::tui::app::Sending {
+        app.sending = vec![crate::tui::app::Sending {
             session_id: "sbsend-1".to_string(),
             message: "still landing".to_string(),
             baseline_msg_count: 0,
-        });
+        }];
         assert_eq!(app.selected.as_deref(), Some("sbsend-1"));
         let file = proj.join("sbsend-1.jsonl");
 

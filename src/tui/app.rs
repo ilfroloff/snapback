@@ -1346,15 +1346,18 @@ pub struct App {
     /// it runs, so a capture taken once is exact rather than a snapshot that goes
     /// stale. Nothing writes it after construction except a test stating its case.
     pub own_pid: u32,
-    /// The quick-reply send that is IN FLIGHT (dispatched, not yet finished), or
-    /// `None`. Drives the optimistic in-preview echo of the message plus the
-    /// animated `cooking…` placeholder so the reply feels instant; set when the
-    /// send is handed off and cleared when its `AppEvent::SendFinished` lands. That
-    /// event lands on the board that dispatched the send or, when that board session
-    /// ended first, on the next one, through [`undelivered`](Self::undelivered).
-    /// Either way the slot is cleared only once the reply child has finished.
-    /// See [`Sending`].
-    pub sending: Option<Sending>,
+    /// Every quick-reply send that is IN FLIGHT (dispatched, not yet finished), at
+    /// most ONE per session, keyed by each entry's own
+    /// [`Sending::session_id`] (so the id is not stored twice). Each entry drives
+    /// the optimistic in-preview echo of its message plus the animated `cooking…`
+    /// placeholder so the reply feels instant; it is added when the send is handed
+    /// off ([`mark_sending`](Self::mark_sending)) and removed when THAT session's
+    /// `AppEvent::SendFinished` lands ([`clear_sending`](Self::clear_sending)),
+    /// leaving every other session's entry standing. That event lands on the board
+    /// that dispatched the send or, when that board session ended first, on the
+    /// next one, through [`undelivered`](Self::undelivered). Either way an entry is
+    /// removed only once its reply child has finished. See [`Sending`].
+    pub sending: Vec<Sending>,
     /// Completions a board session ended before it could read, kept here for the
     /// next board. Today that is only the quick reply's `AppEvent::SendFinished`.
     ///
@@ -1362,8 +1365,8 @@ pub struct App {
     /// every hand-off, while `lib::run` re-enters the board on the SAME `App`: the
     /// model outlives every channel, so the model is where a completion can wait.
     /// Without it, a reply still running across a hand-off reported into a channel
-    /// nobody read, and [`sending`](Self::sending) stayed set until restart. The
-    /// driver hands each send thread a handle
+    /// nobody read, and its [`sending`](Self::sending) entry stayed set until
+    /// restart. The driver hands each send thread a handle
     /// ([`undelivered_handle`](Self::undelivered_handle)), and the board empties it
     /// on every `Tick` and once at entry
     /// ([`take_undelivered`](Self::take_undelivered), via
@@ -1670,7 +1673,7 @@ impl App {
             compose: None,
             draft: None,
             pending_stop: None,
-            sending: None,
+            sending: Vec::new(),
             undelivered: UndeliveredEvents::default(),
             interrupting: None,
             next_bg_launch_id: 0,
@@ -2825,7 +2828,7 @@ impl App {
     /// The in-flight draft card reporting `launch_id`, or `None` when the pane has
     /// moved on to something else.
     ///
-    /// The launch twin of [`sending_to`](Self::sending_to), and load-bearing for
+    /// The launch twin of [`clear_sending`](Self::clear_sending), and load-bearing for
     /// the same reason: a completion event says only that ONE dispatch finished,
     /// never that whatever is on screen now belongs to it. The card outlives its
     /// editor, so the surface underneath when the result lands may be a quick reply
@@ -2840,30 +2843,40 @@ impl App {
 
     /// The in-flight quick-reply send targeting `session_id`, or `None` when no
     /// send is in flight for that session. The preview's optimistic echo and its
-    /// banner-suppression both key off this so render and the click hit-test agree.
+    /// banner-suppression both key off this so render and the click hit-test agree,
+    /// the hard-delete guard reads it for snapback's own writer
+    /// ([`crate::delete::can_delete_target`]), and `Ctrl-R` refuses a second reply
+    /// to a session it answers `Some` for ([`crate::send::reply_in_flight_refusal`]).
+    /// Every one of them asks about ONE session, so a reply in flight elsewhere
+    /// never answers for this one.
     #[must_use]
     pub fn sending_to(&self, session_id: &str) -> Option<&Sending> {
-        self.sending.as_ref().filter(|s| s.session_id == session_id)
+        self.sending.iter().find(|s| s.session_id == session_id)
     }
 
-    /// The board's name for the session the in-flight quick reply is going to: its
-    /// label, or its id when the label is empty or the row has left the board. `None`
-    /// exactly when no reply is in flight.
+    /// Record a dispatched quick reply as IN FLIGHT, beside any reply already in
+    /// flight to another session.
     ///
-    /// `Ctrl-R`'s one-reply-at-a-time refusal names the session with this
-    /// ([`crate::send::reply_in_flight_refusal`]), so it must answer `Some` whenever
-    /// [`sending`](Self::sending) is set. A lookup that went `None` for a missing row
-    /// would switch that guard off the moment a reload dropped the row, while the
-    /// reply was still being sent.
-    #[must_use]
-    pub fn sending_label(&self) -> Option<&str> {
-        let sending = self.sending.as_ref()?;
-        Some(
-            self.session_by_id(&sending.session_id)
-                .map(|session| session.label.as_str())
-                .filter(|label| !label.is_empty())
-                .unwrap_or(sending.session_id.as_str()),
-        )
+    /// One entry per session: a send to a session that already has one REPLACES
+    /// its entry instead of adding a twin, so [`sending_to`](Self::sending_to) and
+    /// [`clear_sending`](Self::clear_sending) always agree on which entry is that
+    /// session's. `Ctrl-R` refuses a second reply to a session still in flight
+    /// before any compose box opens, so this is the invariant's backstop rather
+    /// than a route a keypress takes.
+    pub fn mark_sending(&mut self, sending: Sending) {
+        self.clear_sending(&sending.session_id);
+        self.sending.push(sending);
+    }
+
+    /// Forget the in-flight quick reply to `session_id`, because its
+    /// `AppEvent::SendFinished` landed: that reply child has finished.
+    ///
+    /// Only THAT session's entry goes. A reply still running to any other session
+    /// keeps its entry, and with it that session's echo and the hard-delete guard
+    /// its transcript needs while the child writes. A `session_id` with no entry
+    /// (a stale or foreign completion) changes nothing.
+    pub fn clear_sending(&mut self, session_id: &str) {
+        self.sending.retain(|s| s.session_id != session_id);
     }
 
     /// Another handle on this board's [`undelivered`](Self::undelivered) queue:
@@ -2886,8 +2899,9 @@ impl App {
 
     /// The in-flight `claude stop` interrupt targeting `session_id`, or `None`
     /// when no interrupt is in flight for that session. The interrupt's twin of
-    /// [`sending_to`](Self::sending_to): a completion event must only clear the state
-    /// it belongs to, so a stale result cannot land on a surface that has moved on.
+    /// [`clear_sending`](Self::clear_sending): a completion event must only clear
+    /// the state it belongs to, so a stale result cannot land on a surface that has
+    /// moved on.
     #[must_use]
     pub fn interrupting_on(&self, session_id: &str) -> Option<&Interrupting> {
         self.interrupting
@@ -7865,44 +7879,56 @@ mod tests {
         );
     }
 
-    /// `sending_label` names the in-flight reply's session by its label, falls back
-    /// to the id when the label is empty or the row has left the board, and is
-    /// `None` only while nothing is in flight. The `Ctrl-R` guard it feeds therefore
-    /// cannot switch off because a row went missing.
+    /// The in-flight replies are keyed by session. `mark_sending` adds one BESIDE a
+    /// reply already in flight elsewhere and replaces, never twins, a session's own;
+    /// `clear_sending` removes that session's entry alone; `sending_to` answers for
+    /// exactly the session asked about.
     #[test]
-    fn sending_label_names_the_in_flight_session_and_answers_while_any_is_set() {
-        let mut blank = session("blank", "r", Some("main"), "/tmp/blank");
-        blank.label = String::new();
-        let mut app = app_all(vec![session("s", "r", Some("main"), "/tmp/s"), blank]);
-        let in_flight_to = |id: &str| {
-            Some(Sending {
-                session_id: id.to_string(),
-                message: "hi".to_string(),
-                baseline_msg_count: 0,
-            })
+    fn in_flight_replies_are_tracked_one_per_session() {
+        let mut app = app_all(vec![
+            session("a", "r", Some("main"), "/tmp/a"),
+            session("b", "r", Some("main"), "/tmp/b"),
+        ]);
+        let reply = |id: &str, message: &str| Sending {
+            session_id: id.to_string(),
+            message: message.to_string(),
+            baseline_msg_count: 0,
         };
+        let message_to =
+            |app: &App, id: &str| app.sending_to(id).map(|sending| sending.message.clone());
 
-        assert_eq!(app.sending_label(), None, "nothing in flight");
+        assert_eq!(message_to(&app, "a"), None, "nothing in flight");
 
-        app.sending = in_flight_to("s");
+        app.mark_sending(reply("a", "to a"));
+        app.mark_sending(reply("b", "to b"));
+        assert_eq!(message_to(&app, "a").as_deref(), Some("to a"));
         assert_eq!(
-            app.sending_label(),
-            Some("label for s"),
-            "named by its label"
+            message_to(&app, "b").as_deref(),
+            Some("to b"),
+            "a second session's reply is tracked beside the first"
         );
 
-        app.sending = in_flight_to("blank");
+        app.mark_sending(reply("a", "to a, again"));
         assert_eq!(
-            app.sending_label(),
-            Some("blank"),
-            "an empty label falls back to the id"
+            app.sending.len(),
+            2,
+            "a session's own second entry replaces its first, never twins it"
+        );
+        assert_eq!(message_to(&app, "a").as_deref(), Some("to a, again"));
+
+        app.clear_sending("a");
+        assert_eq!(message_to(&app, "a"), None, "a's reply finished");
+        assert_eq!(
+            message_to(&app, "b").as_deref(),
+            Some("to b"),
+            "clearing one session leaves every other reply in flight"
         );
 
-        app.sending = in_flight_to("gone");
+        app.clear_sending("gone");
         assert_eq!(
-            app.sending_label(),
-            Some("gone"),
-            "a row that left the board is still named, by its id"
+            app.sending.len(),
+            1,
+            "a completion with no entry of its own changes nothing"
         );
     }
 
