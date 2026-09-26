@@ -1271,9 +1271,10 @@ const BANNER_AGE_SEPARATOR: &str = " \u{b7} ";
 /// That precedence is also why the two surfaces divide the way they do, and the
 /// age depends on it. When the in-flight child is THIS board's, the tail already
 /// says so, and the banner (with its age) steps aside. The age is for the other
-/// case, where `App::sending` is `None` and the banner is all the user gets. At
-/// `claude 2.1.278` the samples of 2026-09-21 and 2026-09-23 found that case
-/// dominant as a `claude -p` child that some OTHER snapback instance dispatched, or
+/// case, where `App::sending` holds nothing for this session and the banner is all
+/// the user gets. At `claude 2.1.278` the samples of 2026-09-21 and 2026-09-23
+/// found that case dominant as a `claude -p` child that some OTHER snapback
+/// instance dispatched, or
 /// that outlived the board that did, so nothing here knew about the send. At
 /// `claude 2.1.280` it was also a pty-backed TUI, which is never a quick reply and
 /// so never in `App::sending` (see
@@ -2746,9 +2747,9 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         // `KEYS` in `cli.rs`, the README key map and the table in `update.rs`.
         //
         // `^R reply` stays one word too. Its refusals (a live agent, a session with
-        // no job to stop first, and one reply at a time while another is still being
-        // sent) are refusals, not routes, and each explains itself on this line
-        // when it fires. The key sits at columns 63-70 of a line cut at 80, so it has
+        // no job to stop first, and a session whose own reply is still being sent)
+        // are refusals, not routes, and each explains itself on this line when it
+        // fires. The key sits at columns 63-70 of a line cut at 80, so it has
         // no room to list them anyway. They are spelled out on the same three
         // surfaces as `^K`'s routes.
         Line::from(vec![Span::styled(
@@ -6306,11 +6307,11 @@ mod tests {
 
         // In flight, nothing on disk yet (msg_count still the baseline) -> the
         // pinned banner is suppressed and the tail echoes the message + "cooking…".
-        app.sending = Some(Sending {
+        app.sending = vec![Sending {
             session_id: "sess-normal-1".to_string(),
             message: "please summarize this".to_string(),
             baseline_msg_count: 0,
-        });
+        }];
         assert!(
             preview_banner(&app).is_none(),
             "an in-flight send suppresses the pinned banner"
@@ -6362,7 +6363,7 @@ mod tests {
         );
 
         // Send done -> no inline tail; the banner yields back to the agent status.
-        app.sending = None;
+        app.sending.clear();
         assert!(sending_tail(&app, 80).is_none());
         let banner = preview_banner(&app).expect("the reported agent still has a banner");
         let banner_text = banner
@@ -6389,11 +6390,11 @@ mod tests {
             PathBuf::from("/tmp/launch"),
         );
         app.selected = Some("sess-normal-1".to_string());
-        app.sending = Some(Sending {
+        app.sending = vec![Sending {
             session_id: "sess-normal-1".to_string(),
             message: "please summarize this".to_string(),
             baseline_msg_count: 0,
-        });
+        }];
 
         let width = 80u16;
         let height = 20u16;
@@ -6774,11 +6775,11 @@ mod tests {
         app.selected = Some("sess-normal-1".to_string());
         let transcript_only = content_height(&mut app, width);
 
-        app.sending = Some(Sending {
+        app.sending = vec![Sending {
             session_id: "sess-normal-1".to_string(),
             message: "ping".to_string(),
             baseline_msg_count: 0,
-        });
+        }];
         let tail = sending_tail(&app, inner_width).expect("a send is in flight");
         let tail_rows = wrapped_text_rows(&tail, inner_width);
         assert!(tail_rows > 0, "the tail must have rows to be missed");
@@ -8072,11 +8073,11 @@ mod tests {
     /// been overtaken by a real turn on disk yet: the tail is at its tallest, which is
     /// the state a send spends its first seconds in.
     fn send_in_flight(app: &mut App, id: &str, inner_w: u16) -> usize {
-        app.sending = Some(super::super::app::Sending {
+        app.sending = vec![super::super::app::Sending {
             session_id: id.to_string(),
             message: "any update on the rollout?".to_string(),
             baseline_msg_count: JUMP_TURNS,
-        });
+        }];
         let tail =
             sending_tail(app, inner_w).expect("the send must be in flight for the previewed row");
         wrapped_text_rows(&tail, inner_w)
@@ -9107,11 +9108,11 @@ mod tests {
 
         let (width, height) = BANNER_PANE;
         let mut app = aged_banner_app(Some(STARTED_AT), Some(POLLED_46M_LATER));
-        app.sending = Some(Sending {
+        app.sending = vec![Sending {
             session_id: "sess-normal-1".to_string(),
             message: "1a".to_string(),
             baseline_msg_count: 0,
-        });
+        }];
 
         let rows = inner_rows(&mut app, width, height);
         assert!(

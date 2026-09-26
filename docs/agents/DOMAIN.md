@@ -139,12 +139,22 @@ user to close a claude window would point at the wrong process. It stays a
 COMPOSITION of two facts with two sources and two remedies, not a wider
 `can_delete`.
 
-That in-flight fact is only complete because a board sends ONE quick reply at a
-time. `App::sending` is a single slot, so `Ctrl-R` refuses on every row while it
-is full (`send::reply_in_flight_refusal`; see
-[the reply gate](#quick-reply--non-interactive-send-srcsendrs)). A second reply
-that overwrote the slot would leave the first one still writing with nothing on
-the board recording it, and this refusal would lapse for that session.
+That in-flight fact is only complete because the board records EVERY quick reply
+it has in flight, one entry per session. `App::sending` is keyed by session: a
+reply to another row is added beside an entry still standing, and a
+`SendFinished` removes only its own session's entry, so replies to several
+sessions can run at once and each keeps its transcript's delete refused. What
+stays refused is a second reply to the SAME session
+(`send::reply_in_flight_refusal`; see
+[the reply gate](#quick-reply--non-interactive-send-srcsendrs)): two
+`claude -p -r` runs would both append to one transcript, the first to finish
+would clear the entry the second still needed, and this refusal would lapse while
+that second child was writing.
+
+An earlier revision kept ONE slot and refused `Ctrl-R` on every row while it was
+full, because a second reply that overwrote the slot left the first one still
+writing with nothing on the board recording it. Keying the entries by session
+closes that hole without serializing replies to unrelated sessions.
 
 The two FINISHED arms, `Done` and `Ended`, were once thought unreachable here: an
 earlier note argued the guard reads the BARE list and that both sampled bare lists
@@ -1833,9 +1843,10 @@ long enough to care:
 - **Which dispatch.** The card is still up when the result lands, but the SURFACE
   underneath may have moved on — the user can open a quick reply (`Ctrl-R`) or a
   second draft while `--bg` runs. So the event carries the `launch_id` back and
-  `App::launching_draft` checks it, exactly as `App::sending_to` checks a session
-  id before clearing an in-flight send. Without that check a completing launch
-  closes whatever compose is open and discards a half-typed message.
+  `App::launching_draft` checks it, the way a quick reply's completion carries its
+  session id back and `App::clear_sending` removes only that session's entry.
+  Without that check a completing launch closes whatever compose is open and
+  discards a half-typed message.
 - **Whether it arrives.** Delivery is bounded by the board session: `tui::run_inner`
   builds a new `EventLoop` per board and drops the old receiver, so a launch still
   running when the user hands off (`Enter`/`Ctrl-F` on a row stay routable — the
@@ -1903,20 +1914,21 @@ the board stays up, and the reply renders through the ordinary `SessionWatcher` 
 
 **Optimistic in-flight echo.** Because `claude -p` writes the user turn only after a
 network round trip, the reload path alone would leave the preview showing stale
-content for the first seconds after Send. So while the send is in flight (`App::sending`,
-which carries the message and the session's turn count AT SEND TIME), the preview
+content for the first seconds after Send. So while the send is in flight (its
+`App::sending` entry, one per session, which carries the message and the session's
+turn count AT SEND TIME), the preview
 appends two synthetic turns via `store::preview::pending_reply_turns`: the sent
 message under a `▶ you` turn plus a live `● claude` **cooking…** placeholder,
 and it FOLLOWS the bottom so both stay in view. The `▶ you` echo is
 dropped the instant the real turn lands on disk — detected by the reloaded
 `Session::msg_count` growing past `Sending::baseline_msg_count` — so the real turn
 (styled identically) takes its place with no doubling; the placeholder stays until
-`AppEvent::SendFinished` clears `App::sending`. That event survives a hand-off. If
+`AppEvent::SendFinished` clears that session's entry (and only it). That event survives a hand-off. If
 the board session that dispatched the send ends first (Enter, `Ctrl-F`, Attach,
 `Ctrl-O`), the event is kept in the app's `send::UndeliveredEvents` queue, and the
 next board replays it through the same arm: once at entry, before the first draw,
 and then on every `Tick` (see
-[the event sources](ARCHITECTURE.md#event-sources-watcheventloop)). So the slot
+[the event sources](ARCHITECTURE.md#event-sources-watcheventloop)). So the entry
 clears only once the reply child has finished. It is never cleared early at the
 seam, which would reopen `Ctrl-X d` on a transcript the child may still be
 writing, and it no longer stays set until restart. The pinned status banner is SUPPRESSED
@@ -1950,7 +1962,7 @@ never the polled `--all` map — classified by the one `agents::classify`), and
 
 | Probe result | Bucket | `Ctrl-R` (`send::reply_gate`) |
 | --- | --- | --- |
-| not asked: a quick reply is already in flight (`App::sending` is set), whichever row is selected, that one included | — | refuse (`SEND_IN_FLIGHT_REFUSED`, naming the session the reply is going to) BEFORE the probe, via `send::reply_in_flight_refusal`: no compose opens |
+| not asked: the SELECTED session's own quick reply is still in flight (`App::sending_to` answers for it); a reply in flight to another row is not this row's and never lands here | — | refuse (`SEND_IN_FLIGHT_REFUSED`, about this session) BEFORE the probe, via `send::reply_in_flight_refusal`: no compose opens |
 | claude is not holding the session | — | reply in place, no stop (compose opens) |
 | held, but the record carries no stoppable job id (every `kind: "interactive"` record measured so far), with or without a `pid` | — | refuse (`SEND_LIVE_REFUSED`) — try `Ctrl-K` or Fork (`Ctrl-F`) |
 | `done` | `Done` | stop the ended job, then reply — straight to compose |
@@ -1961,13 +1973,14 @@ never the polled `--all` map — classified by the one `agents::classify`), and
 | `idle` | `Idle` | refuse (the same message) |
 | anything else, or no qualifier at all | `Other` | refuse (the same message) |
 
-The **in-flight check runs first of all**, before the probe. One reply goes out
-at a time because `App::sending` is one slot, and the hard-delete guard reads it
-(see [the third writer](#on-disk-layout)). Refusing at `Ctrl-R`, rather than at
-`Enter`, means no compose box opens, so nothing typed is thrown away, and no
-probe is spent. The session is named by `App::sending_label` (its label, else its
-id), which answers whenever a reply is in flight, even after its row left the
-board.
+The **in-flight check runs first of all**, before the probe, and it asks about
+the selected session ALONE. `App::sending` keeps one entry per session, so a
+reply to another row goes out beside one still in flight; why the SAME session
+stays refused, and why the hard-delete guard needs each entry, is
+[the third writer](#on-disk-layout)'s argument. Refusing at `Ctrl-R`, rather than
+at `Enter`, means no compose box opens, so nothing typed is thrown away, and no
+probe is spent. The refusal says "this session" rather than naming one, because
+it is only ever shown for the row `Ctrl-R` was pressed on.
 
 The **job-id check runs BEFORE the bucket** and wins in every state: an agent
 `claude stop` cannot address is unstoppable by this path whatever it is doing, so
@@ -2089,8 +2102,9 @@ failed stop never reads as a successful one.
 **The interrupt carries a dispatch identity.** `AppEvent::InterruptFinished` rides
 back with the `session_id` of the row that dispatched it, and `App::interrupting`
 stores that same id while the stop is in flight. The completion clears the guard
-only when the ids match, exactly as `App::sending_to` guards a quick reply and
-`App::launching_draft` guards a background launch. `claude stop` is a fast registry
+only when the ids match, exactly as `App::launching_draft` guards a background
+launch (a quick reply's completion needs no such check: `App::clear_sending`
+removes only its own session's entry). `claude stop` is a fast registry
 operation and the row badge clears on the next agents poll, so there is no
 dedicated `"stopping…"` label; the guard exists solely so a stale completion cannot
 land on a surface that has moved on. The signal route sets no such guard, because

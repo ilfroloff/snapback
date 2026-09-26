@@ -110,7 +110,7 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | `Ctrl-F` | **Fork** the selected session into a copy — available for any session, running or not |
 | `Ctrl-N` | **Start a new session** in the launch directory; if you have Claude Code agents defined, pick one first (or `default (no agent)`). Then a **draft box** opens for the session's first message: `Enter` launches it with `claude --bg` and leaves you on the board, `Ctrl-O` runs it interactively instead, `Esc` cancels. Your message is sent as the session's first turn either way |
 | `Ctrl-O` (in that picker) | **Start the highlighted agent interactively at once**, skipping the draft — the same thing `Ctrl-O` means inside the draft box, so either route out of the picker is one keypress |
-| `Ctrl-R` | **Quick reply** — send a one-shot message to the selected session without leaving the board. A background agent whose run is over (`done`, `stopped`, `failed`) is stopped first so the reply lands in place; a waiting one (`needs input`) asks you to confirm that stop; one that is still live (`working`, `idle`, `interrupted`, or a state this version doesn't recognize) is left alone and refused, and so is a session with no background job to stop first (a `live` one, for instance); the refusal suggests `Ctrl-K` or Fork instead. One reply goes out at a time: while one is still being sent, `Ctrl-R` on any row is refused until it lands, and the status line names the session it's going to. Opens a compose box (`Enter` sends, `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels) |
+| `Ctrl-R` | **Quick reply** — send a one-shot message to the selected session without leaving the board. A background agent whose run is over (`done`, `stopped`, `failed`) is stopped first so the reply lands in place; a waiting one (`needs input`) asks you to confirm that stop; one that is still live (`working`, `idle`, `interrupted`, or a state this version doesn't recognize) is left alone and refused, and so is a session with no background job to stop first (a `live` one, for instance); the refusal suggests `Ctrl-K` or Fork instead. While a session's own reply is still being sent, `Ctrl-R` on that session is refused until it lands; replies to other sessions can go out at the same time. Opens a compose box (`Enter` sends, `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels) |
 | `Ctrl-K` | **Stop / interrupt** the selected session's live agent. On a background agent it runs `claude stop`: one whose run is over (`done`, `stopped`, `failed`) stops immediately; every other live agent (`working`, `needs input`, `idle`, `interrupted`, unrecognized) confirms first, since stopping ends the live job (its conversation is kept). A session with no background job (a `live` one, typically) has no job to stop, so if Claude Code reports a process id for it, `Ctrl-K` offers to send that process a **SIGTERM** instead: the confirmation shows the pid, and nothing is sent unless Claude Code still reports that same pid when you press `Enter`. A session that isn't running as an agent has nothing to stop, and neither does one Claude Code reports with no job and no process id that can be signalled |
 | `Ctrl-X` then `x` / `d` / `h` / `r` / `y` | **Leader chord** that acts on the selected row (`x`, `d`, `y`) or on the whole board (`h`, `r`) — `x` **hides** the selected session (reversible, persisted), `d` **hard-deletes** it after a confirmation that can take just that row or its whole `(+N)` stack, `h` toggles **show hidden**, `r` **re-reads every transcript from disk**, `y` is **copy session ID**: the selected session's full id goes to your clipboard and shows on the status line. Any other key cancels the chord |
 | `Tab` | Toggle search: **name-only ↔ name+content**. Widening to content also opens the preview on the most recent match, the same way typing does |
@@ -420,12 +420,12 @@ cooking…** placeholder — so the exchange reads normally while the reply is s
 in flight. The placeholder is replaced in place as `claude` writes the
 real turns, and the status line reports what the reply cost (or the reason if it
 fails). Confirmations and nudges fade after a few seconds; failures and refusals
-stay until you press a key, so nothing is silently downgraded. One reply goes out
-at a time: until it lands, `Ctrl-R` on any row, the same session included, is
-refused before a compose box opens (so nothing you type is lost), and the status
-line names the session the reply is still going to. That rule is also what lets
-the hard delete below keep refusing a session while its reply is still being
-written.
+stay until you press a key, so nothing is silently downgraded. You can reply to
+several sessions at once, each tracked on its own, but not twice to the same one:
+until a session's reply lands, `Ctrl-R` on that session is refused before a
+compose box opens (so nothing you type is lost), while every other row can still
+reply. That per-session record is also what lets the hard delete below keep
+refusing a session while its reply is still being written.
 
 Background agents get special handling, because `claude` won't resume a session
 it's still holding as an agent. An agent whose run is **over** — `done`, or

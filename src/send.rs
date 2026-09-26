@@ -24,9 +24,9 @@
 //!   refuse ([`SEND_LIVE_REFUSED`]). [`build_stop_argv`] is the stop step;
 //!   [`run_send`] runs it (best-effort) before the send.
 //! * [`reply_in_flight_refusal`] — what `Ctrl-R` asks BEFORE that gate and its
-//!   probe. A board sends one quick reply at a time, so while one is in flight
-//!   `Ctrl-R` refuses on every row ([`SEND_IN_FLIGHT_REFUSED`]), naming that
-//!   reply's session.
+//!   probe. While the selected session's OWN quick reply is still in flight,
+//!   `Ctrl-R` on that session refuses ([`SEND_IN_FLIGHT_REFUSED`]); a reply in
+//!   flight to any other session refuses nothing.
 //! * [`plan_send`] — the AUTHORITATIVE re-read of `(cwd, session_id)` from INSIDE
 //!   the file at send time (via [`crate::store::parse::parse_file`], the one
 //!   parser), plus the cwd-existence gate — the send counterpart of
@@ -111,22 +111,25 @@ pub const SEND_LIVE_REFUSED: &str =
     "claude reports this session as a running agent, so it won't resume it in place. \
      Try Ctrl-K to stop it, or Fork (Ctrl-F) to branch a copy.";
 
-/// Refusal shown when `Ctrl-R` is pressed on ANY row while snapback's own quick reply
-/// is still in flight. It is a PREFIX: [`reply_in_flight_refusal`] appends the name
-/// of the session that reply is going to.
+/// Refusal shown when `Ctrl-R` is pressed on a session snapback is STILL sending a
+/// quick reply to.
 ///
-/// A board sends ONE quick reply at a time, because `App::sending` tracks exactly
-/// one. That slot is more than the preview's echo. It is the board's only record of
-/// the `claude -p` child snapback spawned, the THIRD writer
+/// Only that session refuses. `App::sending` keeps one in-flight entry PER
+/// SESSION, so a reply to any other row goes out beside it. Each entry is more
+/// than the preview's echo: it is the board's only record of the `claude -p` child
+/// snapback spawned for that session, the THIRD writer
 /// [`crate::delete::can_delete_target`] refuses a hard delete on, and claude's
 /// active list is not a witness snapback can rely on for that writer. A second
-/// reply that replaced the slot would leave `Ctrl-X d` on the first session judged
-/// by claude's probe alone. Sending several at once would need a per-session
-/// registry of sends instead of one slot.
+/// reply to the SAME session is what stays refused: two `claude -p -r` runs would
+/// both append to one transcript, and the first to finish would clear the entry
+/// the second still needed, leaving `Ctrl-X d` on it judged by claude's probe
+/// alone.
 ///
-/// The session is named LAST so a one-row status line cut at the terminal's width
-/// keeps the rule and loses only the tail of a long label.
-pub const SEND_IN_FLIGHT_REFUSED: &str = "One reply at a time — still sending to: ";
+/// It is only ever shown for the row `Ctrl-R` was pressed on, so it says "this
+/// session" rather than naming one, and it names no other move: waiting is the one
+/// that holds in every world.
+pub const SEND_IN_FLIGHT_REFUSED: &str = "snapback is still sending a reply to this session — \
+     wait for it to land, then reply again.";
 
 /// Neutral success status when the JSON parsed but carried no `total_cost_usd`,
 /// or when stdout was unreadable/empty (the child ran, but said nothing we can
@@ -229,19 +232,18 @@ fn stoppable_job_id(agent: &ReportedAgent) -> Option<&str> {
 }
 
 /// `Ctrl-R`'s FIRST question, asked before [`reply_gate`] and before the probe that
-/// feeds it: is a quick reply already in flight? `in_flight` is the name of the
-/// session the board's in-flight reply (`App::sending`) is going to, or `None` when
-/// there is none.
+/// feeds it: does the SELECTED session already have a quick reply of its own in
+/// flight? `reply_in_flight` is the board's answer for that one session
+/// (`App::sending_to`), never whether a reply is in flight anywhere on the board.
 ///
-/// `Some` refuses, naming that session ([`SEND_IN_FLIGHT_REFUSED`]), whatever row
-/// `Ctrl-R` was pressed on. The selected row is deliberately not an input: a second
-/// reply to the SAME session is refused too, because the first one's
-/// `SendFinished` would clear the slot while the second was still writing. The
+/// `true` refuses ([`SEND_IN_FLIGHT_REFUSED`]): the first reply's `SendFinished`
+/// would clear that session's entry while a second was still writing. A reply in
+/// flight to ANOTHER session is not an input, so it can never refuse this one. The
 /// caller asks this before any compose box opens, so no typed message is thrown
 /// away. `None` lets [`reply_gate`] decide.
 #[must_use]
-pub fn reply_in_flight_refusal(in_flight: Option<&str>) -> Option<String> {
-    in_flight.map(|name| format!("{SEND_IN_FLIGHT_REFUSED}{name}"))
+pub fn reply_in_flight_refusal(reply_in_flight: bool) -> Option<&'static str> {
+    reply_in_flight.then_some(SEND_IN_FLIGHT_REFUSED)
 }
 
 /// Decide [`ReplyGate`] from the session's current live-agent record (`None` when
@@ -863,12 +865,12 @@ fn sanitize_status(s: &str) -> String {
 /// every hand-off (Enter, `Ctrl-F`, Attach, `Ctrl-O`), while `lib::run` re-enters
 /// the board on the SAME `App`. A quick reply's `claude -p` child routinely
 /// outlives that seam, and its [`AppEvent::SendFinished`] is the ONLY thing that
-/// clears `App::sending`. A lost one left the slot full until restart: the
-/// `cooking…` tail stayed up, `Ctrl-X d` kept refusing that session, and `Ctrl-R`
-/// refused on every row ([`reply_in_flight_refusal`]). The slot is deliberately
-/// NOT cleared at the seam instead: the child may still be writing, and the slot
-/// is what keeps `Ctrl-X d` off that transcript until the child has finished
-/// (`delete::can_delete_target`).
+/// clears that session's `App::sending` entry. A lost one left the entry standing
+/// until restart: the `cooking…` tail stayed up, and `Ctrl-X d` and `Ctrl-R`
+/// ([`reply_in_flight_refusal`]) kept refusing that session. The entry is
+/// deliberately NOT cleared at the seam instead: the child may still be writing,
+/// and the entry is what keeps `Ctrl-X d` off that transcript until the child has
+/// finished (`delete::can_delete_target`).
 ///
 /// ONE queue per `App`, and every clone is a handle on it (it is an `Arc`), so the
 /// board and each send thread share it. Three operations take its lock, each
@@ -1683,29 +1685,29 @@ mod tests {
     /// that ARE about it pass a record's own pid instead.
     const BOARD_PID: u32 = 4_242;
 
-    /// `Ctrl-R`'s one-reply-at-a-time rule. With nothing in flight it stays out of
-    /// the way. With a reply in flight it refuses, and the refusal names the session
-    /// that reply is going to. The rule comes first and the name last, set off by a
-    /// space, so a narrow status line cuts the label and keeps the rule. Like every
+    /// `Ctrl-R`'s per-session in-flight rule. With no reply of the selected
+    /// session's own in flight it stays out of the way, whatever is in flight
+    /// elsewhere. With one, it refuses in words about THIS session: no board-wide
+    /// "one at a time" rule, since a reply to any other row goes ahead. Like every
     /// refusal on this key it claims no owner for any process.
     #[test]
-    fn a_reply_in_flight_refuses_the_next_one_and_names_its_session() {
+    fn a_reply_in_flight_refuses_a_second_to_the_same_session() {
         assert_eq!(
-            reply_in_flight_refusal(None),
+            reply_in_flight_refusal(false),
             None,
-            "nothing in flight: the reply gate decides"
+            "nothing in flight to this session: the reply gate decides"
         );
 
-        let name = "Fix the payment webhook retries";
-        let refusal =
-            reply_in_flight_refusal(Some(name)).expect("a reply in flight must refuse the next");
+        let refusal = reply_in_flight_refusal(true)
+            .expect("a reply in flight to this session must refuse a second one");
+        assert_eq!(refusal, SEND_IN_FLIGHT_REFUSED);
         assert!(
-            refusal.starts_with(SEND_IN_FLIGHT_REFUSED),
-            "the rule leads: {refusal:?}"
+            refusal.contains("this session"),
+            "the refusal is about the selected session: {refusal:?}"
         );
         assert!(
-            refusal.ends_with(&format!(" {name}")),
-            "the in-flight session is named, last and set apart: {refusal:?}"
+            !refusal.to_lowercase().contains("at a time"),
+            "no board-wide rule is claimed: {refusal:?}"
         );
         for claim in OWNERSHIP_CLAIMS {
             assert!(

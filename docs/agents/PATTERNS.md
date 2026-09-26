@@ -64,8 +64,9 @@ it. Follow this split when adding behavior:
 - Pure, tested: `resume::plan` / `plan_from_parts` / `build_argv` /
   `build_new_argv` / `status_for_exit`; every decision in `send` — `reply_gate` /
   `interrupt_gate` (the whole routing tree, asserted with no process spawned),
-  `reply_in_flight_refusal` (`Ctrl-R`'s one-reply-at-a-time rule, which takes the
-  in-flight session's name as a parameter rather than reading `App`),
+  `reply_in_flight_refusal` (`Ctrl-R`'s per-session in-flight rule, which takes
+  whether the SELECTED session has a reply of its own in flight as a parameter
+  rather than reading `App`),
   `build_send_argv` / `build_stop_argv` / `build_bg_launch_argv`, `plan_send` /
   `plan_bg_launch`, the `status_for_output` / `status_for_failed_send` /
   `status_for_stop` / `status_for_bg_launch` / `status_for_signal` mapping, and
@@ -977,8 +978,9 @@ point in time: a send result, a resume refusal, a paste-too-long warning, an
 empty-buffer nudge. A fact that is true over an **interval** lives in typed
 state and renders on the surface that owns it:
 
-- the quick reply's in-flight echo lives in `App::sending` and renders **inline**
-  in the preview pane (`view::sending_tail`), not on the help line;
+- the quick reply's in-flight echo lives in `App::sending` (one entry per
+  session) and renders **inline** in that session's preview pane
+  (`view::sending_tail`), not on the help line;
 - a background-agent launch lives in `App::draft.launch_id` and renders on the
   draft card (`view::draft_card`), not on the help line;
 - an interrupt in flight lives in `App::interrupting` and deliberately has **no**
