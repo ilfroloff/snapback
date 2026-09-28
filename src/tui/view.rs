@@ -41,7 +41,7 @@ use crate::store::FailedTask;
 
 use super::app::{
     resolve_list_width, App, ComposeDefault, InterruptRoute, Modal, ModalAction, ModalChoice,
-    ModalLayout, NewSessionDraft, PaneLayout, Row, Scope, MODEL_DEFAULT_LABEL,
+    ModalLayout, NewSessionDraft, PaneLayout, PreviewSelection, Row, Scope, MODEL_DEFAULT_LABEL,
     MODEL_NEW_SESSION_SCOPE,
 };
 use super::compose::{ComposeState, ComposeTarget};
@@ -89,6 +89,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     render_header(frame, app, header_area);
     render_body(frame, app, body_area);
+    // Reverse-video the active mouse text selection directly over the rendered
+    // preview cells — after `render_body` has drawn them, before any modal
+    // overlays this frame — and record the text under it, which is what a
+    // finished drag hands to the copy path on button-up.
+    let selected_text = overlay_preview_selection(frame, app);
+    app.set_preview_selection_text(selected_text);
     if let Some(compose_bar) = compose_bar {
         render_compose_zone(frame, app, compose_bar);
     }
@@ -1394,10 +1400,10 @@ const BANNER_AGE_SEPARATOR: &str = " \u{b7} ";
 /// age alone marks nothing live: a finished or parked record carries a `startedAt`
 /// too. The fallback asks no such thing and states the age whenever it is known.
 ///
-/// Exposed to `super::update` so the link hit-test can ask the SAME question the
-/// view does — "does this pane have a banner?" — and derive the same transcript
-/// rect via [`preview_split`]; the two must agree, or a click would resolve to the
-/// wrong transcript row.
+/// Exposed to `super::update` so the pointer hit-tests can ask the SAME question
+/// the view does — "does this pane have a banner?" — and derive the same
+/// transcript rect ([`preview_transcript_rect`], built on [`preview_split`]); the
+/// two must agree, or a click would resolve to the wrong transcript row.
 ///
 /// An IN-FLIGHT quick-reply send takes precedence: while `App::sending` names the
 /// selected session there is NO pinned banner at all — this returns `None`, and
@@ -1808,6 +1814,55 @@ fn preview_compose_split(area: Rect, has_banner: bool, compose_height: u16) -> (
     (banner, shrunk, compose)
 }
 
+/// Whether the compose zone docks INSIDE a preview pane drawn at `area` — only
+/// while composing AND when the pane is tall enough ([`COMPOSE_MIN_DOCK_HEIGHT`]);
+/// otherwise `render` gave compose a full-width bottom bar and the transcript
+/// keeps the whole pane. Mirrors [`compose_uses_bottom_bar`], evaluated against
+/// THIS pane's height (already the shorter body in the bottom-bar layout, so the
+/// two agree).
+fn docks_compose(app: &App, area: Rect) -> bool {
+    app.is_composing() && preview_inner(area).height >= COMPOSE_MIN_DOCK_HEIGHT
+}
+
+/// The preview pane's `(banner, transcript, compose)` rects for a pane drawn at
+/// `area` — THE one derivation of that geometry. [`render_preview`] draws against
+/// it, and [`preview_transcript_rect`] hands the same answer to every pointer
+/// hit-test, so the rows a click or a drag resolves against are the rows the text
+/// was drawn in: never the pinned banner row, never the docked compose zone.
+///
+/// `has_banner` is [`preview_banner`]`(..).is_some()` (see [`preview_split`] for
+/// why it is never liveness). The docked zone's height is read off the editor
+/// itself ([`compose_zone_height`]), which knows the width it was last drawn at.
+fn preview_areas(app: &App, area: Rect, has_banner: bool) -> (Rect, Rect, Rect) {
+    let compose_h = if docks_compose(app, area) {
+        compose_zone_height(app)
+    } else {
+        0
+    };
+    preview_compose_split(area, has_banner, compose_h)
+}
+
+/// The TRANSCRIPT rect of the preview pane as the last frame laid it out — what
+/// every pointer action over the preview is hit-tested against: a fold-node
+/// toggle (`update::fold_under_pointer`, plus the width the toggle re-renders
+/// at), a link click (`update::resolve_link_click`) and a drag-selection (its
+/// press gate, its clamp, and the highlight/copy overlay) alike. ONE source, so
+/// they can never disagree about where the transcript is — nor about which row
+/// the pinned row above it pushed a line onto.
+///
+/// The pinned row ([`preview_banner`], reserved for every selected session whose
+/// transcript is on the pane) and a docked compose zone both sit OUTSIDE it by
+/// construction, so neither is ever clickable transcript or selectable text.
+///
+/// Derived on demand from [`App::preview_rect`] (written by `render_body` each
+/// frame) through [`preview_areas`], rather than stored: a stored copy is a second
+/// answer that can drift from the draw. EMPTY-sized when the preview is not drawn
+/// (`PaneLayout::ListOnly` leaves `preview_rect` empty), so nothing hit-tests there.
+pub(crate) fn preview_transcript_rect(app: &App) -> Rect {
+    let (_, transcript, _) = preview_areas(app, app.preview_rect, preview_banner(app).is_some());
+    transcript
+}
+
 /// The draft pane's title when the picked agent is the "default (no agent)" row —
 /// named rather than inlined so the one place that phrase appears is greppable
 /// against the picker row it mirrors.
@@ -2056,22 +2111,15 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     // reserves no row.
     let banner = preview_banner(app);
     // Dock the compose zone in the bottom of the pane when composing AND the pane
-    // is tall enough; otherwise `render` gave compose a full-width bottom bar and
-    // the transcript keeps the whole pane. Mirrors `compose_uses_bottom_bar`,
-    // evaluated against THIS pane's height (which is already the shorter body in the
-    // bottom-bar layout, so the two agree).
-    let dock_compose = app.is_composing() && preview_inner(area).height >= COMPOSE_MIN_DOCK_HEIGHT;
-    // The docked zone grows with the draft (0 = not docking). Its WIDTH is not a
-    // parameter here: `preview_compose_split` carves it out of `preview_inner`, and
-    // the box's height is read off the editor itself, which knows the width it was
-    // last drawn at — so there is no second width to get wrong.
-    let compose_h = if dock_compose {
-        compose_zone_height(app)
-    } else {
-        0
-    };
-    let (banner_area, transcript_area, compose_area) =
-        preview_compose_split(area, banner.is_some(), compose_h);
+    // is tall enough (`docks_compose`); otherwise `render` gave compose a
+    // full-width bottom bar and the transcript keeps the whole pane.
+    let dock_compose = docks_compose(app, area);
+    // The docked zone grows with the draft. Its WIDTH is not a parameter here:
+    // `preview_compose_split` carves it out of `preview_inner`, and the box's height
+    // is read off the editor itself, which knows the width it was last drawn at —
+    // so there is no second width to get wrong. `preview_areas` is the SAME
+    // derivation every pointer hit-test reads (`preview_transcript_rect`).
+    let (banner_area, transcript_area, compose_area) = preview_areas(app, area, banner.is_some());
     // The transcript's width is also the table shrink-to-fit budget, so it must
     // be resolved BEFORE rendering the preview text (which fits GFM tables to
     // it). The banner split is vertical only, so this width — and therefore the
@@ -3259,6 +3307,185 @@ pub(crate) fn fold_at<'a>(
         .map(|r| r.key.as_str())
 }
 
+/// Order a selection's two endpoints into reading order: `(start, end)` where
+/// `start` is never after `end` — top-to-bottom, and left-to-right within one
+/// row. Pure so the selection geometry is unit-testable without a terminal.
+fn ordered(anchor: Position, cursor: Position) -> (Position, Position) {
+    if (anchor.y, anchor.x) <= (cursor.y, cursor.x) {
+        (anchor, cursor)
+    } else {
+        (cursor, anchor)
+    }
+}
+
+/// The half-open column range `[x0, x1)` selected on screen row `y` for a
+/// FLOWING (reading-order) selection between the ordered endpoints `start` and
+/// `end`, confined to transcript rect `rect`.
+///
+/// Rows strictly between the endpoints reach edge to edge; the first row starts
+/// at `start.x`, the last row stops after `end.x` (INCLUSIVE of the cell under
+/// the cursor, hence `end.x + 1`). `None` for a row outside the selection's
+/// vertical span or an empty range.
+///
+/// This is the selection's GEOMETRY — how far the drag reaches on the row, blank
+/// cells included — not what it selects. What is selected is this span cut at its
+/// last drawn cell ([`cut_at_last_text_cell`]), and that cut span, gathered once by
+/// [`selected_runs`], is the one thing the highlight and the copy both walk. Pure
+/// and terminal-free.
+fn flow_span_on_row(start: Position, end: Position, rect: Rect, y: u16) -> Option<(u16, u16)> {
+    if y < start.y || y > end.y {
+        return None;
+    }
+    let left = rect.x;
+    let right = rect.x.saturating_add(rect.width); // exclusive edge
+    let x0 = if y == start.y { start.x } else { left };
+    let x1 = if y == end.y {
+        end.x.saturating_add(1)
+    } else {
+        right
+    };
+    let x0 = x0.max(left);
+    let x1 = x1.min(right);
+    (x0 < x1).then_some((x0, x1))
+}
+
+/// Whether a drawn cell's `symbol` is BLANK: it shows no text, only the space
+/// ratatui leaves where nothing was drawn (or whitespace that was).
+///
+/// "Blank" means exactly "erased whole by [`str::trim_end`]" — the rule the copy
+/// always stripped a row's end by. Stating it per CELL is what lets the highlight
+/// stop where the copied text does. The ONE blank rule of the selection: the
+/// per-row cut ([`cut_at_last_text_cell`]) reads it, and the edge-row trim
+/// ([`trim_blank_edge_rows`]) drops only the rows that cut found blank.
+fn is_blank_symbol(symbol: &str) -> bool {
+    symbol.trim_end().is_empty()
+}
+
+/// Cut row `y`'s selected span `[x0, x1)` at its LAST non-blank cell
+/// ([`is_blank_symbol`]): `[x0, last + 1)`, or `None` when every cell in the span
+/// is blank.
+///
+/// Only the row's END moves. A blank cell BEFORE the last drawn one stays — the gap
+/// between two words, the indent snapback draws on a code line — because it sits
+/// inside drawn text; the empty space right of a line's last character does not.
+/// Pure over a `Buffer`, so it is tested without a terminal.
+fn cut_at_last_text_cell(buf: &Buffer, y: u16, (x0, x1): (u16, u16)) -> Option<(u16, u16)> {
+    (x0..x1)
+        .rev()
+        .find(|&x| {
+            buf.cell((x, y))
+                .is_some_and(|cell| !is_blank_symbol(cell.symbol()))
+        })
+        .map(|last| (x0, last + 1))
+}
+
+/// Drop the wholly blank rows (`None`) at the START and the END of a selection's
+/// rows, and keep the ones BETWEEN two drawn rows. Empty when no row holds text.
+///
+/// A blank row inside the selection is a paragraph break, which the copy must keep;
+/// one at either edge is only the empty space the drag began or ended over. Pure
+/// and generic, so it is tested as a list transformation.
+fn trim_blank_edge_rows<T>(rows: &[Option<T>]) -> &[Option<T>] {
+    let Some(first) = rows.iter().position(Option::is_some) else {
+        return &[];
+    };
+    let last = rows.iter().rposition(Option::is_some).unwrap_or(first);
+    &rows[first..=last]
+}
+
+/// One selected screen row's TEXT-BEARING cells: row `y`, columns `[x0, x1)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelectedRun {
+    y: u16,
+    x0: u16,
+    x1: u16,
+}
+
+/// What a selection between the ordered endpoints `start` and `end`, confined to
+/// transcript rect `rect`, actually selects in `buf`, top to bottom: each row's
+/// [`flow_span_on_row`] span cut at its last drawn cell
+/// ([`cut_at_last_text_cell`]), `None` for a blank row between two drawn ones, and
+/// the blank rows at either edge dropped ([`trim_blank_edge_rows`]). Empty when the
+/// selection covers blank cells alone.
+///
+/// The ONE answer the highlight and the copy both walk, which is what keeps the
+/// reverse-videoed cells and the copied text the same cells. Pure over a `Buffer`.
+fn selected_runs(
+    buf: &Buffer,
+    start: Position,
+    end: Position,
+    rect: Rect,
+) -> Vec<Option<SelectedRun>> {
+    let rows: Vec<Option<SelectedRun>> = (start.y..=end.y)
+        .filter_map(|y| flow_span_on_row(start, end, rect, y).map(|span| (y, span)))
+        .map(|(y, span)| {
+            cut_at_last_text_cell(buf, y, span).map(|(x0, x1)| SelectedRun { y, x0, x1 })
+        })
+        .collect();
+    trim_blank_edge_rows(&rows).to_vec()
+}
+
+/// The text `runs` cover in `buf`: each run's cell symbols in order, a blank row
+/// between two drawn ones as `""`, the rows joined with `\n`. `None` for no runs —
+/// a selection over blank cells alone has nothing to copy. Nothing is trimmed here:
+/// every run already ends on a drawn cell, so the text holds exactly the cells the
+/// highlight covers. Pure over a `Buffer`.
+fn selection_text(buf: &Buffer, runs: &[Option<SelectedRun>]) -> Option<String> {
+    if runs.is_empty() {
+        return None;
+    }
+    let rows: Vec<String> = runs
+        .iter()
+        .map(|run| match run {
+            Some(run) => (run.x0..run.x1)
+                .filter_map(|x| buf.cell((x, run.y)))
+                .map(|cell| cell.symbol())
+                .collect(),
+            None => String::new(),
+        })
+        .collect();
+    Some(rows.join("\n"))
+}
+
+/// Reverse-video the active preview text selection over the rendered cells and
+/// return the text under it — what a finished drag copies, recorded by [`render`]
+/// into [`App::set_preview_selection_text`]. `None` with no selection, AND when the
+/// selection covers blank cells alone: `update::mouse_effect`'s release arm turns
+/// that `None` into no copy and no link-open, so a drag over empty space leaves the
+/// clipboard alone.
+///
+/// Reads the RENDERED buffer as the single source of truth for what is on screen,
+/// so the highlight and the copy are the post-wrap, post-scroll characters the user
+/// sees, with no re-derivation of the wrapped layout. Both walk the ONE
+/// [`selected_runs`] answer — each row cut at its last drawn cell, the blank rows at
+/// either edge dropped — so a cell is reverse-videoed if and only if it is copied:
+/// the highlight reads like an editor's selection, never a full-width band of empty
+/// cells. A blank row between two drawn rows gets no highlight at all and copies as
+/// an empty line. It sets no status: the copy's status comes from its RESULT, in
+/// `update::finish_copy`, once the clipboard path has run.
+fn overlay_preview_selection(frame: &mut Frame, app: &App) -> Option<String> {
+    let PreviewSelection { anchor, cursor } = app.preview_selection()?;
+    // The same transcript rect the press was gated on and the drag clamped to.
+    let rect = preview_transcript_rect(app);
+    if rect.width == 0 || rect.height == 0 {
+        return None;
+    }
+    let (start, end) = ordered(anchor, cursor);
+    let buf = frame.buffer_mut();
+    let runs = selected_runs(buf, start, end, rect);
+    let text = selection_text(buf, &runs)?;
+    for run in runs.iter().flatten() {
+        for x in run.x0..run.x1 {
+            if let Some(cell) = buf.cell_mut(Position { x, y: run.y }) {
+                // Merge REVERSED in (a `Modifier`, not a color, so this honors
+                // TERMINAL-SAFE STYLING) — keeps the cell's own fg/bg.
+                cell.set_style(Style::new().add_modifier(Modifier::REVERSED));
+            }
+        }
+    }
+    Some(text)
+}
+
 /// Resolve the final vertical preview offset: pin to the bottom when following,
 /// else clamp the requested offset into `[0, max_offset]` where
 /// `max_offset = content_h - viewport_h`. Saturating throughout, so a short
@@ -3553,18 +3780,18 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         // The board keymap — one of the five surfaces AGENTS.md's KEEP KEY DOCS IN
         // SYNC names. It does NOT mention the terminal's paste, on COLUMN BUDGET:
-        // this line is already 225 columns (measured with the `unicode-width` the
+        // this line is already 237 columns (measured with the `unicode-width` the
         // renderer counts in) against a help row that is ONE line and never wraps, so
         // on an 80-column terminal it is cut the instant `^K stop` ends and
         // everything from `^X hide/del` (column 84) rightward is already unpainted.
-        // A 23-column "paste keeps newlines" clause would land at columns 226-248 —
+        // A 23-column "paste keeps newlines" clause would land at columns 238-260 —
         // nowhere, on any realistic width. What a board paste DOES (append to the
         // query with newlines flattened to spaces, and never resume) is documented
         // where there is room to say it: `KEYS` in `cli.rs` and the README key map.
         //
         // The QUERY WORD-DELETE keys are omitted for exactly the same reason, and
         // just as deliberately. Even the tersest honest clause (`· ⌥⌫ del word`,
-        // 14 columns) would be painted at columns 225-238 — off the end of any
+        // 14 columns) would be painted at columns 237-250 — off the end of any
         // realistic width — and terse is the one thing this binding cannot be:
         // `Alt-Backspace`, `Ctrl-W` and `Alt-H` ALL do it, on purpose, so that the
         // board answers the same set the compose box does whatever the terminal
@@ -3613,8 +3840,16 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         // line while a box is open names it ([`compose_hint`]), and the model picker
         // it opens names its own `←/→` effort keys in its prompt and footer — so the
         // `←/→` below means fold/expand ON THE BOARD only.
+        //
+        // `drag copy` names the preview drag-selection beside the board's other
+        // mouse gesture, `wheel scroll`, in two words: the drag selects and its
+        // release copies. Like everything past `^X` it is off-screen at 80 columns.
+        // The rest — a click on its release still opens a link or unfolds a node,
+        // the copy goes the way `Ctrl-X y`'s does, Shift/Option for the terminal's
+        // own selection — is spelled out in `KEYS` and the README, where there is
+        // room.
         Line::from(vec![Span::styled(
-            "↑↓ move · ←/→ fold/expand · Enter resume · ^F fork · ^N new · ^R reply · ^K stop · ^X hide/del · type to search · Tab name/content · S-↑↓ match · ^A scope · S-←→ layout · PgUp/PgDn·^U/^D·^T/^E·Home/End·wheel scroll · Esc quit",
+            "↑↓ move · ←/→ fold/expand · Enter resume · ^F fork · ^N new · ^R reply · ^K stop · ^X hide/del · type to search · Tab name/content · S-↑↓ match · ^A scope · S-←→ layout · PgUp/PgDn·^U/^D·^T/^E·Home/End·wheel scroll · drag copy · Esc quit",
             Style::default().add_modifier(Modifier::DIM),
         )])
     };
@@ -6156,6 +6391,183 @@ mod tests {
             None,
             "an offset past the end of the content has no owning row"
         );
+    }
+
+    #[test]
+    fn ordered_puts_the_earlier_reading_order_endpoint_first() {
+        let a = Position { x: 5, y: 2 };
+        let b = Position { x: 1, y: 4 };
+        assert_eq!(ordered(a, b), (a, b), "already in order");
+        assert_eq!(ordered(b, a), (a, b), "swapped back into order");
+        // Same row: the smaller column comes first.
+        let l = Position { x: 3, y: 7 };
+        let r = Position { x: 9, y: 7 };
+        assert_eq!(ordered(r, l), (l, r));
+    }
+
+    #[test]
+    fn flow_span_selects_flowing_rows_within_the_transcript() {
+        // Transcript rect: x in [4, 24), y in [2, 8).
+        let rect = Rect {
+            x: 4,
+            y: 2,
+            width: 20,
+            height: 6,
+        };
+        let start = Position { x: 10, y: 3 };
+        let end = Position { x: 15, y: 5 };
+
+        // A row above/below the vertical span selects nothing.
+        assert_eq!(flow_span_on_row(start, end, rect, 2), None);
+        assert_eq!(flow_span_on_row(start, end, rect, 6), None);
+        // First row starts at the anchor column, runs to the right edge (exclusive 24).
+        assert_eq!(flow_span_on_row(start, end, rect, 3), Some((10, 24)));
+        // A middle row selects edge to edge.
+        assert_eq!(flow_span_on_row(start, end, rect, 4), Some((4, 24)));
+        // The last row runs from the left edge to end.x INCLUSIVE (15 → exclusive 16).
+        assert_eq!(flow_span_on_row(start, end, rect, 5), Some((4, 16)));
+    }
+
+    #[test]
+    fn flow_span_on_a_single_row_covers_the_cursor_cell_inclusively() {
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 5,
+        };
+        let start = Position { x: 6, y: 2 };
+        let end = Position { x: 9, y: 2 };
+        // Columns 6,7,8,9 selected → half-open [6, 10).
+        assert_eq!(flow_span_on_row(start, end, rect, 2), Some((6, 10)));
+        // An end column ON the right edge clamps to the rect rather than overrunning.
+        let edge = Position { x: 39, y: 2 };
+        assert_eq!(flow_span_on_row(start, edge, rect, 2), Some((6, 40)));
+    }
+
+    /// "Blank" is exactly what `str::trim_end` erases whole — the untouched space
+    /// ratatui fills a buffer with, any other whitespace, and an empty symbol —
+    /// while anything that draws a glyph (snapback's own role marker and rules
+    /// included) is text.
+    #[test]
+    fn a_blank_symbol_is_exactly_what_trim_end_erases_whole() {
+        for blank in [" ", "", "\t", "\u{a0}", "\u{3000}"] {
+            assert!(is_blank_symbol(blank), "{blank:?} draws nothing");
+            assert!(blank.trim_end().is_empty(), "and trim_end agrees");
+        }
+        for text in ["a", "中", "●", "│", "-"] {
+            assert!(!is_blank_symbol(text), "{text:?} is drawn text");
+        }
+    }
+
+    /// The per-row cut moves only the span's END, back to its last drawn cell:
+    /// the indent and the gap between words stay (they sit inside drawn text),
+    /// the space right of the line goes, and a span over blank cells alone is
+    /// `None`.
+    #[test]
+    fn the_row_cut_ends_each_span_on_its_last_drawn_cell() {
+        let buf = Buffer::with_lines(["  ab cd     "]);
+        assert_eq!(
+            cut_at_last_text_cell(&buf, 0, (0, 12)),
+            Some((0, 7)),
+            "indent and word gap kept, trailing blanks cut"
+        );
+        assert_eq!(
+            cut_at_last_text_cell(&buf, 0, (3, 12)),
+            Some((3, 7)),
+            "the start column is never moved"
+        );
+        assert_eq!(
+            cut_at_last_text_cell(&buf, 0, (0, 5)),
+            Some((0, 4)),
+            "a span ending on the gap between words ends on the word before it"
+        );
+        assert_eq!(
+            cut_at_last_text_cell(&buf, 0, (0, 2)),
+            None,
+            "the indent alone is blank"
+        );
+        assert_eq!(
+            cut_at_last_text_cell(&buf, 0, (7, 12)),
+            None,
+            "the space right of the line is blank"
+        );
+    }
+
+    /// Blank rows at either EDGE of a selection are the empty space the drag began
+    /// or ended over, and go; a blank row BETWEEN drawn rows is a paragraph break,
+    /// and stays. Nothing drawn at all leaves nothing.
+    #[test]
+    fn the_edge_row_trim_drops_blank_edge_rows_and_keeps_interior_ones() {
+        assert_eq!(
+            trim_blank_edge_rows(&[None, Some(1), None, Some(2), None, None]),
+            &[Some(1), None, Some(2)],
+        );
+        assert_eq!(
+            trim_blank_edge_rows(&[Some(1), Some(2)]),
+            &[Some(1), Some(2)],
+            "a selection with no blank edge is untouched"
+        );
+        assert_eq!(trim_blank_edge_rows::<u8>(&[None, None]), &[]);
+        assert_eq!(trim_blank_edge_rows::<u8>(&[]), &[]);
+    }
+
+    /// A buffer with a drawn line, an empty line, another drawn line and an empty
+    /// last line — the shapes a transcript's rows come in.
+    fn paragraph_buffer() -> Buffer {
+        Buffer::with_lines(["hello     ", "", "world     ", ""])
+    }
+
+    /// A selection over blank cells alone — one row or several — has no runs and
+    /// no text, which is the `None` that makes its release copy nothing.
+    #[test]
+    fn a_selection_over_blank_cells_alone_selects_no_text() {
+        let buf = paragraph_buffer();
+        let rect = buf.area;
+        for (start, end) in [
+            // Right of "hello", on its own row.
+            (Position { x: 6, y: 0 }, Position { x: 9, y: 0 }),
+            // The empty row between the two drawn ones, edge to edge.
+            (Position { x: 0, y: 1 }, Position { x: 9, y: 1 }),
+            // Right of "world", down through the empty last row.
+            (Position { x: 6, y: 2 }, Position { x: 9, y: 3 }),
+        ] {
+            let runs = selected_runs(&buf, start, end, rect);
+            assert_eq!(runs, Vec::new(), "{start:?}..{end:?} covers no drawn text");
+            assert_eq!(selection_text(&buf, &runs), None);
+        }
+    }
+
+    /// Every drawn row is cut at its last drawn cell, the blank row BETWEEN drawn
+    /// rows is kept as an empty line with no highlighted cell of its own, and the
+    /// blank rows at either edge are dropped — so neither the text nor the runs
+    /// open or close on a blank.
+    #[test]
+    fn a_selection_keeps_interior_blank_rows_as_empty_lines_and_drops_blank_edges() {
+        let buf = paragraph_buffer();
+        let rect = buf.area;
+
+        let whole = selected_runs(&buf, Position { x: 0, y: 0 }, Position { x: 9, y: 3 }, rect);
+        assert_eq!(
+            whole,
+            vec![
+                Some(SelectedRun { y: 0, x0: 0, x1: 5 }),
+                None,
+                Some(SelectedRun { y: 2, x0: 0, x1: 5 }),
+            ],
+            "cut at each last drawn cell, blank last row dropped"
+        );
+        assert_eq!(
+            selection_text(&buf, &whole).as_deref(),
+            Some("hello\n\nworld")
+        );
+
+        // A drag that starts right of "hello" drops that row AND the empty one
+        // under it: both are blank edge rows, so no leading newline survives.
+        let from_blank =
+            selected_runs(&buf, Position { x: 7, y: 0 }, Position { x: 2, y: 2 }, rect);
+        assert_eq!(from_blank, vec![Some(SelectedRun { y: 2, x0: 0, x1: 3 })]);
+        assert_eq!(selection_text(&buf, &from_blank).as_deref(), Some("wor"));
     }
 
     /// A 20-wide inner pane at origin (1,1); most link tests share it.
@@ -11940,8 +12352,9 @@ mod tests {
     }
 
     /// The transcript's rect inside a `(width, height)` preview pane drawn at the
-    /// origin, derived exactly as `render_preview` and `update`'s click hit-test
-    /// derive it — `preview_split` keyed on `preview_banner` — so a test states where
+    /// origin, derived exactly as `render_preview` and every pointer hit-test
+    /// (`preview_transcript_rect`) derive it with no compose docked —
+    /// `preview_split` keyed on `preview_banner` — so a test states where
     /// the transcript REALLY sits instead of assuming it owns the whole inner rect:
     /// every selected session pins a banner row above it, and only a pane with no
     /// session transcript on it (a draft card, an in-flight reply) gives that back.

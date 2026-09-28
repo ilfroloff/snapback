@@ -15,7 +15,7 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::text::Line;
 // `Text` reaches only the test-only whole-transcript accessor now that the draw
 // takes a window of `Line`s instead (see `App::preview_text`).
@@ -545,6 +545,40 @@ impl NewSessionDraft {
     pub fn is_launching(&self) -> bool {
         self.launch_id.is_some()
     }
+}
+
+/// An in-progress (or just-completed) mouse text selection over the preview
+/// TRANSCRIPT, in absolute screen/buffer coordinates.
+///
+/// `anchor` is the cell the left button was pressed on; `cursor` is the latest
+/// dragged-to cell (clamped into the preview's TRANSCRIPT rect —
+/// `view::preview_transcript_rect`, the one rect every pointer hit-test over the
+/// preview reads, so the banner row and a docked compose zone are never in it).
+///
+/// The selection is FLOWING (reading order): the first row runs from the anchor
+/// column, the last row stops at the cursor column, and the rows between reach
+/// across the pane. What it SELECTS is only the drawn text in that reach, the way
+/// an editor highlights a selection: each row ends at its last drawn cell rather
+/// than at the pane's edge, blank rows at either end drop out, and a blank row
+/// between two drawn ones copies as an empty line with nothing highlighted. A drag
+/// over blank cells alone selects nothing, so its release copies nothing. The press
+/// may still land on a blank cell (below a short transcript, inside a line's
+/// indent): only what ends up selected is limited, never where a drag may start.
+///
+/// The view reads the RENDERED buffer within this region to both reverse-video the
+/// selected cells and extract the copied text, so the highlight and the copy are
+/// the same post-wrap, post-scroll cells on screen
+/// (`view::overlay_preview_selection`). Absolute-cell — not content-anchored — so
+/// any change to what sits under those cells (a scroll, a new selection, a reload
+/// that re-read the previewed transcript or moved the selection, any keypress)
+/// clears it (see [`App::clear_preview_selection`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreviewSelection {
+    /// Cell the drag began on (the button-down position, always inside the
+    /// transcript rect since the press arm gates on it).
+    pub anchor: Position,
+    /// Latest dragged-to cell, clamped into the transcript rect.
+    pub cursor: Position,
 }
 
 /// A titled, centered prompt with N labelled choices and a wrapping-cycle
@@ -1331,6 +1365,22 @@ pub fn resolve_list_width(layout: PaneLayout, body_width: u16) -> u16 {
     }
 }
 
+/// Clamp `pos` to the last selectable cell inside `rect`, so a mouse drag past
+/// the transcript edge extends the selection to the boundary rather than off it.
+/// An empty `rect` (zero width or height) collapses to its origin — harmless,
+/// since a press is only ever started over a non-empty transcript. Pure so the
+/// selection geometry is unit-testable without a terminal.
+fn clamp_to_rect(pos: Position, rect: Rect) -> Position {
+    // `right`/`bottom` are the last valid cell indices (exclusive edge minus one),
+    // saturating so a zero-width/height rect clamps to its own origin.
+    let right = rect.x + rect.width.saturating_sub(1);
+    let bottom = rect.y + rect.height.saturating_sub(1);
+    Position {
+        x: pos.x.clamp(rect.x, right),
+        y: pos.y.clamp(rect.y, bottom),
+    }
+}
+
 /// How the board asks claude which sessions are LIVE right now.
 ///
 /// Boxed so it is injectable at the one seam that matters — see
@@ -1706,6 +1756,24 @@ pub struct App {
     /// matches a hit-test — as [`list_rect`](Self::list_rect) is under
     /// [`PaneLayout::PreviewOnly`].
     pub preview_rect: Rect,
+    /// The active preview text selection, if the user is (or just finished)
+    /// dragging inside the transcript. Drives the reverse-video highlight and the
+    /// copy. `None` whenever nothing is selected. See [`PreviewSelection`].
+    preview_selection: Option<PreviewSelection>,
+    /// The left-button-down cell inside the transcript while the button is held,
+    /// or `None`. Distinguishes a plain CLICK (press + release, no drag → open a
+    /// link) from a DRAG (press + move → select): the selection materializes only
+    /// once the pointer moves off this cell (see [`extend_preview_selection`]).
+    ///
+    /// [`extend_preview_selection`]: Self::extend_preview_selection
+    preview_press: Option<Position>,
+    /// The text under [`preview_selection`](Self::preview_selection) exactly as the
+    /// LAST frame drew it, or `None` with no selection or one over blank cells
+    /// alone (a `None` the release turns into no copy). Written by the view every
+    /// frame (it owns the buffer the text is read from) and read on button-up,
+    /// where a finished drag hands it to the ONE copy path as an
+    /// `Outcome::Copy` — so what is copied is what was highlighted on screen.
+    preview_selection_text: Option<String>,
     /// Transient board status (e.g. a resume refusal for a deleted worktree).
     /// Rendered on the help line and cleared on the next actionable keypress, OR
     /// when its sibling `status_ttl` counts down to zero.
@@ -2230,6 +2298,9 @@ impl App {
             preview_viewport_h: 0,
             list_rect: Rect::default(),
             preview_rect: Rect::default(),
+            preview_selection: None,
+            preview_press: None,
+            preview_selection_text: None,
             status: None,
             status_ttl: None,
             tick: 0,
@@ -2989,6 +3060,90 @@ impl App {
         self.preview_scroll_by(step);
     }
 
+    // --- preview text selection (mouse drag → clipboard) --------------------
+
+    /// Begin a left-button press inside the preview transcript at `pos` (the
+    /// caller has already gated `pos` on the transcript rect —
+    /// `update::press_starts_selection`). Clears any prior selection so a fresh
+    /// click deselects like a terminal; the selection only MATERIALIZES once the
+    /// pointer drags off this cell (see
+    /// [`extend_preview_selection`](Self::extend_preview_selection)).
+    pub fn begin_preview_press(&mut self, pos: Position) {
+        self.preview_selection = None;
+        self.preview_selection_text = None;
+        self.preview_press = Some(pos);
+    }
+
+    /// Extend the in-progress selection to `cursor` while the button is held.
+    /// A no-op unless a press is active, so a drag that began anywhere but the
+    /// transcript (the list, the banner, a docked compose zone, nowhere) never
+    /// selects. `cursor` is clamped into `transcript` — the SAME rect the press was
+    /// gated on (`view::preview_transcript_rect`), passed in rather than stored so
+    /// there is no second copy of it to drift — so dragging past the pane edge, or
+    /// down over the compose zone, selects to the boundary. A drag back onto the
+    /// anchor cell de-materializes the selection (nothing is selected yet), so a
+    /// jittery click still resolves as a link-open on release.
+    pub fn extend_preview_selection(&mut self, cursor: Position, transcript: Rect) {
+        let Some(anchor) = self.preview_press else {
+            return;
+        };
+        let cursor = clamp_to_rect(cursor, transcript);
+        self.preview_selection = if cursor == anchor {
+            None
+        } else {
+            Some(PreviewSelection { anchor, cursor })
+        };
+    }
+
+    /// Take the active press on button-up. `Some(pos)` is the original press
+    /// cell, letting the caller resolve a no-drag click (open a link at `pos`)
+    /// versus a completed drag (copy the selection). Leaves the selection itself
+    /// intact so a finished drag stays highlighted.
+    pub fn take_preview_press(&mut self) -> Option<Position> {
+        self.preview_press.take()
+    }
+
+    /// Whether a materialized (dragged) selection is currently held.
+    #[must_use]
+    pub fn has_preview_selection(&self) -> bool {
+        self.preview_selection.is_some()
+    }
+
+    /// The active selection, if any — read by the view to highlight the cells and
+    /// extract their text.
+    #[must_use]
+    pub fn preview_selection(&self) -> Option<PreviewSelection> {
+        self.preview_selection
+    }
+
+    /// Record the text the view just drew under the selection (`None` with no
+    /// selection). The view's ONE write here, once per frame: it owns the buffer
+    /// the text is read from, and there is no buffer at event time.
+    pub fn set_preview_selection_text(&mut self, text: Option<String>) {
+        self.preview_selection_text = text;
+    }
+
+    /// The text under the selection as the last frame drew it — what a finished
+    /// drag copies. `None` with no selection, before a frame has drawn one, or when
+    /// the selection covers blank cells alone.
+    #[must_use]
+    pub fn preview_selection_text(&self) -> Option<&str> {
+        self.preview_selection_text.as_deref()
+    }
+
+    /// Clear any preview selection and in-progress press. Called whenever the
+    /// preview's content or scroll could change under an ABSOLUTE-cell selection
+    /// and leave a stale highlight — any keypress, a wheel scroll, a new press, a
+    /// fold node toggled open or closed
+    /// ([`toggle_peer_fold`](Self::toggle_peer_fold)), or a store reload that
+    /// re-read the previewed transcript or moved the selection
+    /// ([`apply_reload`](Self::apply_reload) decides which).
+    pub fn clear_preview_selection(&mut self) {
+        self.preview_selection = None;
+        self.preview_press = None;
+        self.preview_selection_text = None;
+    }
+
     // --- transient status --------------------------------------------------
 
     /// Set a **sticky** board status (e.g. a resume refusal or a failure).
@@ -3339,22 +3494,29 @@ impl App {
     // --- new-session agent picker -----------------------------------------
 
     /// Whether an overlay currently owns the board. The SINGLE gate predicate
-    /// callers use (never `self.modal.is_some()` inline) to keep the mouse's two
-    /// actions — toggling a fold node and opening a preview link — from firing
-    /// while an overlay is up, so a later gate extension lives in exactly one place.
+    /// callers use (never `self.modal.is_some()` inline) to keep the mouse's three
+    /// actions over the preview — toggling a fold node, opening a link, and
+    /// starting a drag-selection — from firing while an overlay is up, so a later
+    /// gate extension lives in exactly one place. All three begin from a press
+    /// `update::press_starts_selection` admits: the PRESS only records where it
+    /// landed, and the RELEASE resolves it (a drag selects and copies; a plain
+    /// click toggles the fold under it, else opens the link) — so a press this gate
+    /// refuses leaves its release nothing to act on.
     ///
     /// True while a [`Modal`] is open, the quick-reply compose zone, the
     /// stop-then-reply confirmation, or the interrupt confirmation owns the
     /// keyboard, OR a `Ctrl-X` leader chord is [pending](Self::pending_chord): each
     /// takes the keyboard, so each must equally gate the mouse (a stray click
-    /// mid-chord must not toggle a fold or open a link), per PATTERNS §10.
+    /// mid-chord must not toggle a fold, open a link, or start a selection), per
+    /// PATTERNS §10.
     ///
     /// A [`draft`](Self::draft) counts for a related reason: it owns the PANE
     /// rather than the keyboard. While its card is drawn the transcript is not, so
     /// the cached link AND fold regions — both handed out of the ONE
     /// [`preview_hit_context`](Self::preview_hit_context) entry — describe text
     /// that is no longer on screen, and a click resolved against them would open a
-    /// link or toggle a fold in a session the user cannot see.
+    /// link or toggle a fold in a session the user cannot see, while a drag would
+    /// select the placeholder card rather than any transcript.
     /// It outlives the editor by AT MOST one in-flight launch (whichever comes
     /// first: that launch's own result, or the end of the board session), which is
     /// the window this arm covers on its own.
@@ -3930,11 +4092,26 @@ impl App {
         // expression `App::new` seeds with, on purpose: launch and reload must not
         // be able to disagree about what a project is.
         self.worktrees = (self.worktree_probe)(&self.launch_dir);
+        // Whether the transcript under the preview was re-read — asked of the
+        // SAME `changed` set the cache eviction above reads.
+        let preview_reread = prev_id
+            .as_ref()
+            .is_some_and(|id| reload.changed.contains(id));
         self.recompute_scope();
         self.recompute_filtered();
 
-        self.restore_selection(prev_id, prev_pos);
+        self.restore_selection(prev_id.clone(), prev_pos);
         self.clamp_scroll();
+        // A mouse selection is ABSOLUTE cells over the preview, so it goes when
+        // the text under those cells may have moved — the previewed transcript
+        // was re-read, or the selection landed on another row — and ONLY then,
+        // exactly as the preview cache is evicted only for what was re-read. The
+        // watcher reloads whenever ANY transcript in the store is written, so
+        // clearing on every reload cancelled a drag mid-gesture whenever some
+        // other agent wrote a line.
+        if preview_reread || self.selected != prev_id {
+            self.clear_preview_selection();
+        }
     }
 
     // --- internals --------------------------------------------------------
@@ -4716,6 +4893,12 @@ impl App {
     /// entry that outlived a toggle would serve the OLD shape forever, and the two
     /// steps drifting apart is exactly the bug the single call site prevents.
     ///
+    /// It also drops any mouse text selection
+    /// ([`clear_preview_selection`](Self::clear_preview_selection)): the re-render
+    /// moves the text under the selection's absolute cells, so the highlight — and
+    /// the text a release would copy — would name other lines. Here rather than at
+    /// a caller, so no toggle route can skip it.
+    ///
     /// `preview_follow_bottom` is deliberately left alone. Expanding grows the
     /// transcript BELOW the node, so a pane pinned to the bottom stays pinned by the
     /// existing clamp, and a pane the user has anchored mid-transcript keeps its
@@ -4746,6 +4929,12 @@ impl App {
             self.expanded_peers.insert(key.to_string());
         }
         self.preview_cache.remove(&id);
+        // The toggle re-renders the transcript — its lines, its row map and the
+        // scroll below all move — so a mouse selection's ABSOLUTE cells would now
+        // name other text. Drop it here, beside the mutation, so no route into a
+        // toggle can leave a stale highlight (or copy the wrong text on release):
+        // the same rule a wheel notch and a re-reading reload follow.
+        self.clear_preview_selection();
 
         let scroll = self.preview_scroll;
         let next = self
@@ -6277,6 +6466,209 @@ mod tests {
             after_first + 1,
             "reading the same query again must not recompute"
         );
+    }
+
+    #[test]
+    fn clamp_to_rect_holds_a_drag_inside_the_transcript_bounds() {
+        let rect = Rect {
+            x: 5,
+            y: 3,
+            width: 10,
+            height: 4,
+        };
+        // Last valid cell is (x + width - 1, y + height - 1) = (14, 6).
+        assert_eq!(
+            clamp_to_rect(Position { x: 100, y: 100 }, rect),
+            Position { x: 14, y: 6 }
+        );
+        // Below/left of the origin clamps up to the origin.
+        assert_eq!(
+            clamp_to_rect(Position { x: 0, y: 0 }, rect),
+            Position { x: 5, y: 3 }
+        );
+        // A point already inside passes through untouched.
+        assert_eq!(
+            clamp_to_rect(Position { x: 8, y: 5 }, rect),
+            Position { x: 8, y: 5 }
+        );
+        // A zero-sized rect collapses to its origin rather than underflowing.
+        let empty = Rect {
+            x: 2,
+            y: 2,
+            width: 0,
+            height: 0,
+        };
+        assert_eq!(
+            clamp_to_rect(Position { x: 9, y: 9 }, empty),
+            Position { x: 2, y: 2 }
+        );
+    }
+
+    #[test]
+    fn a_press_then_drag_materializes_a_selection_clamped_to_the_transcript() {
+        let mut app = app_all(vec![session("a", "r1", Some("main"), "/tmp/a")]);
+        let transcript = Rect {
+            x: 4,
+            y: 2,
+            width: 20,
+            height: 6,
+        };
+        // Down alone is not yet a selection — it is a pending press (a possible click).
+        app.begin_preview_press(Position { x: 6, y: 3 });
+        assert!(!app.has_preview_selection());
+        // The first drag off the anchor materializes it; a far drag clamps to the edge.
+        app.extend_preview_selection(Position { x: 999, y: 999 }, transcript);
+        let sel = app
+            .preview_selection()
+            .expect("a drag materializes a selection");
+        assert_eq!(sel.anchor, Position { x: 6, y: 3 });
+        assert_eq!(sel.cursor, Position { x: 23, y: 7 }); // clamped to (x+w-1, y+h-1)
+    }
+
+    #[test]
+    fn a_press_with_no_drag_is_a_click_not_a_selection() {
+        let mut app = app_all(vec![session("a", "r1", Some("main"), "/tmp/a")]);
+        let transcript = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        };
+        app.begin_preview_press(Position { x: 3, y: 4 });
+        // A "drag" that never leaves the anchor cell does not materialize a selection,
+        // so button-up resolves as a link-open click, not a copy.
+        app.extend_preview_selection(Position { x: 3, y: 4 }, transcript);
+        assert!(!app.has_preview_selection());
+        assert_eq!(app.take_preview_press(), Some(Position { x: 3, y: 4 }));
+        assert_eq!(app.take_preview_press(), None, "the press is consumed once");
+    }
+
+    #[test]
+    fn begin_preview_press_clears_a_prior_selection_like_a_terminal_click() {
+        let mut app = app_all(vec![session("a", "r1", Some("main"), "/tmp/a")]);
+        let transcript = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        };
+        app.begin_preview_press(Position { x: 1, y: 1 });
+        app.extend_preview_selection(Position { x: 5, y: 1 }, transcript);
+        assert!(app.has_preview_selection());
+        // A fresh press deselects.
+        app.begin_preview_press(Position { x: 2, y: 2 });
+        assert!(!app.has_preview_selection());
+    }
+
+    /// The drawn text rides WITH the selection: it survives being read (a finished
+    /// drag stays highlighted, and its text stays copyable), and every way the
+    /// selection ends drops it too — so a later release can never copy text from
+    /// a selection that is gone.
+    #[test]
+    fn the_drawn_selection_text_is_readable_until_the_selection_clears() {
+        let mut app = app_all(vec![session("a", "r1", Some("main"), "/tmp/a")]);
+        let transcript = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        };
+        app.begin_preview_press(Position { x: 1, y: 1 });
+        app.extend_preview_selection(Position { x: 8, y: 1 }, transcript);
+        // The view records what it drew under the selection; reading it is not
+        // consuming it.
+        app.set_preview_selection_text(Some("hello".to_string()));
+        assert_eq!(app.preview_selection_text(), Some("hello"));
+        assert_eq!(app.preview_selection_text(), Some("hello"));
+        // A scroll / keypress clears the highlight AND the text under it.
+        app.clear_preview_selection();
+        assert!(!app.has_preview_selection());
+        assert_eq!(app.preview_selection_text(), None);
+        // So does a fresh press, which starts a new selection from nothing.
+        app.set_preview_selection_text(Some("stale".to_string()));
+        app.begin_preview_press(Position { x: 2, y: 2 });
+        assert_eq!(app.preview_selection_text(), None);
+    }
+
+    /// A reload drops a mouse selection only when the text under it may have
+    /// moved. Another session's transcript being written — which the watcher turns
+    /// into a reload every time — keeps it, press included, so a drag survives a
+    /// busy store; the previewed transcript being re-read, or the selection
+    /// landing on another row, clears it.
+    #[test]
+    fn a_reload_clears_the_preview_selection_only_when_the_previewed_text_may_move() {
+        let transcript = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        };
+        let sessions = vec![
+            session("a", "r1", Some("main"), "/tmp/a"),
+            session("b", "r1", Some("main"), "/tmp/b"),
+        ];
+        let mut app = app_all(sessions.clone());
+        let previewed = app.selected.clone().expect("a row is selected");
+        let other = if previewed == "a" { "b" } else { "a" };
+        let drag = |app: &mut App| {
+            app.begin_preview_press(Position { x: 1, y: 1 });
+            app.extend_preview_selection(Position { x: 8, y: 2 }, transcript);
+            assert!(app.has_preview_selection(), "premise: a selection is held");
+        };
+
+        drag(&mut app);
+        app.apply_reload(Reload {
+            sessions: sessions.clone(),
+            changed: HashSet::from([other.to_string()]),
+        });
+        assert!(
+            app.has_preview_selection(),
+            "another transcript's write must not cancel the selection"
+        );
+        assert_eq!(
+            app.take_preview_press(),
+            Some(Position { x: 1, y: 1 }),
+            "nor the press of a drag still in progress"
+        );
+
+        drag(&mut app);
+        app.apply_reload(Reload {
+            sessions: sessions.clone(),
+            changed: HashSet::from([previewed.clone()]),
+        });
+        assert!(
+            !app.has_preview_selection(),
+            "a re-read of the previewed transcript clears the selection"
+        );
+
+        drag(&mut app);
+        let without_previewed: Vec<Session> = sessions
+            .into_iter()
+            .filter(|s| s.session_id != previewed)
+            .collect();
+        app.apply_reload(Reload {
+            sessions: without_previewed,
+            changed: HashSet::new(),
+        });
+        assert_ne!(app.selected.as_deref(), Some(previewed.as_str()));
+        assert!(
+            !app.has_preview_selection(),
+            "the selection moving to another row clears it"
+        );
+    }
+
+    #[test]
+    fn extend_preview_selection_without_a_press_is_a_no_op() {
+        let mut app = app_all(vec![session("a", "r1", Some("main"), "/tmp/a")]);
+        let transcript = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        };
+        // A drag that began outside the transcript (no press) never selects.
+        app.extend_preview_selection(Position { x: 5, y: 5 }, transcript);
+        assert!(!app.has_preview_selection());
     }
 
     /// A CONTENT hit whose text did not survive into the rendered preview says so
@@ -9771,8 +10163,8 @@ mod tests {
     /// It owns the PANE: while the card is drawn the transcript is not, so the
     /// cached link AND fold regions describe text no longer on screen and a
     /// click resolved against them would open a link or toggle a fold in a
-    /// session the user cannot see. That window is exactly the one the editor no
-    /// longer covers.
+    /// session the user cannot see, while a drag would select the placeholder
+    /// card. That window is exactly the one the editor no longer covers.
     #[test]
     fn an_in_flight_draft_card_still_gates_the_mouse() {
         let mut app = app_all(vec![session("s", "r", Some("main"), "/tmp/s")]);

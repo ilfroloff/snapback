@@ -8,9 +8,10 @@
 //! poller's badge/banner map, while `SendFinished`, `InterruptFinished` and
 //! `BgLaunchFinished` each land ONE one-shot child's result — the last of which
 //! also closes the in-flight new-session draft card it names (and only that one).
-//! `CopyFinished` lands a `Ctrl-X y` clipboard tool's result too, but hands it
-//! back to the driver ([`Outcome::FinishCopy`]) because only the driver holds the
-//! writer its OSC 52 fallback needs.
+//! `CopyFinished` lands a clipboard tool's result too (a `Ctrl-X y` id or a
+//! preview drag-selection), but hands it back to the driver
+//! ([`Outcome::FinishCopy`]) because only the driver holds the writer its OSC 52
+//! fallback needs.
 //! Because such a result can arrive after the board it belongs to is gone,
 //! [`handle_event`] closes the compose surface on any [`Outcome`] that
 //! [ends the board session](Outcome::ends_board_session) as well.
@@ -21,7 +22,8 @@
 //! continue, quit, hand off a resume, fire one of the three no-teardown children
 //! (`Send` / `Interrupt` / `BgLaunch`), deliver `Ctrl-K`'s child-free SIGTERM
 //! (`Signal`, a `kill(2)` the driver runs inline — see [`Outcome::Signal`]), or
-//! start / finish a `Ctrl-X y` clipboard copy (`Copy` / `FinishCopy`). All of it is
+//! start / finish a clipboard copy — `Ctrl-X y`'s id or a preview drag-selection —
+//! (`Copy` / `FinishCopy`). All of it is
 //! terminal-free and unit tested; the terminal-driving loop that calls it lives in
 //! [`crate::tui::run`].
 //!
@@ -51,6 +53,9 @@
 //! | `Alt-Backspace` / `Ctrl-W` / `Alt-H` | delete the last query ATOM — one whole search word, not one character, so a path or a branch name goes in a single press. THREE keys because `TextArea::input` word-deletes on all three in the compose box: binding the same SET here is what makes the gesture reach the board at all, whatever the user's option-as-meta setting turns `Alt-Backspace` into. The set matches; the EXTENT deliberately does not — the board cuts at the search atom and the compose box at `CharKind`'s punctuation boundary, so `feature/fold-fork-lineages` goes whole here and loses only `lineages` there |
 //! | printable char | type-to-search (append to the query) |
 //! | terminal paste | inserted as TEXT — never as keystrokes (see below) |
+//! | mouse: click a folded node's header | unfold the node — a subagent's hand-back (`◆`) or context claude injected (`◇`) — where it sits, and a second click folds it back; a click on a header toggles its node and never opens a link. On the RELEASE, like a link, and ahead of one (see [`click_effect`]) |
+//! | mouse: click a preview link | open its url in the browser — `http`/`https` only: any other scheme opens nothing and says so on a sticky status line. On the RELEASE, since only then is it known that the press was a click and not the start of a drag (see [`mouse_effect`]) |
+//! | mouse: drag in the preview | select transcript text in reading order, reverse-videoed — DRAWN text only: each row ends at its last drawn character, never at the pane's edge, and a drag over blank space alone selects nothing, so its release copies nothing; the release copies a selection the way `Ctrl-X y` copies — [`Outcome::Copy`], the clipboard tool first, OSC 52 as the fallback — with a transient status. A drag that starts on a node header or a link selects, and toggles or opens nothing. Off under any overlay (the draft card included) and never started on the pinned row or a docked compose zone (see [`press_starts_selection`]) |
 //! | `Esc` / `Ctrl-C` | quit (always) |
 //!
 //! No bare printable character is a command: every one of them types into the
@@ -94,7 +99,7 @@ use crate::send::{
     self, BgLaunchRequest, InterruptGate, InterruptRequest, ReplyGate, SendRequest, SignalPlan,
 };
 use crate::store::{preview, SessionStore};
-use crate::watch::AppEvent;
+use crate::watch::{AppEvent, CopyPayload};
 
 use super::app::{App, InterruptRoute, Interrupting, ModalAction, ModalLayout};
 use super::{clipboard, compose, view};
@@ -267,19 +272,21 @@ pub enum Outcome {
         /// The pid to signal, as re-verified against a fresh probe at confirm time.
         pid: u32,
     },
-    /// Copy this FULL `session_id` to the system clipboard and KEEP running — the
-    /// `Ctrl-X y` request, like [`Send`](Self::Send) a no-teardown effect handled
-    /// inline by [`crate::tui::run`]. The driver reads the environment, picks the
-    /// route ([`clipboard::clipboard_route`]), and either starts the clipboard-tool
-    /// worker ([`clipboard::spawn_tool_copy`], which reports back via
+    /// Copy this payload's text to the system clipboard and KEEP running — the
+    /// `Ctrl-X y` request (the selected session's FULL id) or a finished preview
+    /// drag (the selected transcript text). Like [`Send`](Self::Send) a no-teardown
+    /// effect handled inline by [`crate::tui::run`], and ONE path for both kinds:
+    /// the driver reads the environment, picks the route
+    /// ([`clipboard::clipboard_route`]), and either starts the clipboard-tool worker
+    /// ([`clipboard::spawn_tool_copy`], which reports back via
     /// [`AppEvent::CopyFinished`]) or — over SSH, or with no tool for this
     /// OS/display — writes the OSC 52 fallback at once through [`finish_copy`].
     /// Carried as data (rather than copied in the handler) so the copy DECISION
     /// stays pure and unit-testable, the way [`Send`](Self::Send) carries a request.
-    Copy(String),
-    /// Complete a finished `Ctrl-X y` copy: set its honest, sticky status and, when
-    /// no tool copied the id, write the OSC 52 fallback — [`finish_copy`], which the
-    /// driver runs with the terminal's own writer on the UI thread, between draws.
+    Copy(CopyPayload),
+    /// Complete a finished copy: set its honest status and, when no tool copied
+    /// the text, write the OSC 52 fallback — [`finish_copy`], which the driver runs
+    /// with the terminal's own writer on the UI thread, between draws.
     ///
     /// [`handle_event`] returns this for [`AppEvent::CopyFinished`] instead of
     /// completing the copy itself because the fallback is a terminal WRITE and only
@@ -287,9 +294,9 @@ pub enum Outcome {
     /// (rather than intercepting it in the driver) keeps that function the ONE place
     /// every [`AppEvent`] is routed, with an exhaustive match and no dead arm.
     FinishCopy {
-        /// The authoritative full `sessionId` the copy targeted.
-        session_id: String,
-        /// Whether a clipboard tool copied it (exited 0 with the id on its stdin).
+        /// What the copy carried (a session id or a preview selection).
+        payload: CopyPayload,
+        /// Whether a clipboard tool copied it (exited 0 with the text on its stdin).
         copied: bool,
     },
 }
@@ -436,17 +443,22 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool
 ///
 /// * `Input(Key)` (a press/repeat) -> decode + apply an [`Action`].
 /// * `Input(Mouse)` -> a wheel notch scrolls the pane under the pointer, a
-///   left-click on a fold node's header — a peer message or injected
-///   context — toggles that node open or closed, and a left-click on a
-///   rendered preview link is resolved by
-///   [`handle_mouse`]: a hit on an `http`/`https` url opens it in the default
-///   browser and reports `opening <url>` transiently, a hit on any other scheme
-///   opens NOTHING and reports a sticky refusal naming the url, a line too big to
-///   hit-test reports a sticky [`LinkClick::Unresolvable`] message, and a miss
-///   writes nothing (the mapping lives in [`note_link_click`]); all are routed
-///   independently of the overlay gate, and a click cannot toggle a node or open a
-///   link while an overlay is open (the `App::overlay_active` gate). Nothing else:
-///   the pane widths belong to the keyboard (`Shift-Left` / `Shift-Right`).
+///   left-button PRESS over the preview transcript only records where it landed,
+///   and its RELEASE decides what it was ([`handle_mouse`] over the pure
+///   [`mouse_effect`]). A press that DRAGGED selects transcript text and its
+///   release copies it through [`Outcome::Copy`], toggling and opening nothing. A
+///   plain CLICK (no drag) on a fold node's header — a peer message or injected
+///   context — toggles that node open or closed, and otherwise is resolved
+///   against the rendered preview links: a hit on an `http`/`https` url opens it
+///   in the default browser and reports `opening <url>` transiently, a hit on any
+///   other scheme opens NOTHING and reports a sticky refusal naming the url, a
+///   line too big to hit-test reports a sticky [`LinkClick::Unresolvable`]
+///   message, and a miss writes nothing (the mapping lives in
+///   [`note_link_click`]). All are routed independently of the modal key gate, and
+///   a press cannot start a selection, toggle a node or open a link while an
+///   overlay is open (the `App::overlay_active` gate, behind
+///   [`press_starts_selection`]). Nothing else: the pane widths belong to the
+///   keyboard (`Shift-Left` / `Shift-Right`).
 /// * `SessionsChanged` -> reload `store` and re-apply query+scope, preserving
 ///   selection-by-id and scroll (see [`reload_board`]).
 /// * `ModelAliases` -> swap in the alias set the off-thread probe read off the
@@ -475,8 +487,9 @@ pub fn handle_event(app: &mut App, event: AppEvent, store: &mut SessionStore) ->
         // `tui::run_inner` builds a fresh `EventLoop` per board session and drops
         // the old receiver, while `lib::run` re-enters the board on the SAME `App`.
         // A card left standing there would replace EVERY session's transcript with
-        // a placeholder and hold `overlay_active` true (killing link clicks and fold
-        // toggles) until another compose was opened and cancelled.
+        // a placeholder and hold `overlay_active` true (killing link clicks, fold
+        // toggles and drag-selections) until another compose was opened and
+        // cancelled.
         app.close_compose();
     }
     outcome
@@ -490,6 +503,12 @@ pub fn handle_event(app: &mut App, event: AppEvent, store: &mut SessionStore) ->
 fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome {
     match event {
         AppEvent::Input(Event::Key(key)) if is_actionable(key) => {
+            // Any keypress ends a mouse text selection: its absolute cells would
+            // otherwise keep highlighting whatever the board now draws there. Done
+            // first so it fires whoever owns the keyboard next (board, modal,
+            // compose). Ticks (which redraw constantly) deliberately do NOT clear,
+            // so a finished selection stays highlighted until the user acts.
+            app.clear_preview_selection();
             // While a modal overlay (the running-session choice, the new-session
             // agent picker, or the hard-delete confirm) is open it OWNS the
             // keyboard: keys navigate/confirm/cancel the modal, never the board.
@@ -526,15 +545,15 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
             let action = key_to_action(key, app.query_input.is_empty(), app.has_preview_matches());
             apply_action(app, action)
         }
-        // Mouse wheel scroll and preview link clicks. A dedicated arm BEFORE the
-        // input catch-all and INDEPENDENT of the modal overlay gate above:
-        // neither routes into the modal handler — a wheel just scrolls a pane and
-        // never crashes in any mode (query active, modal open, ...), and a click
-        // opens no link while an overlay is up (`App::overlay_active` gates it).
-        AppEvent::Input(Event::Mouse(mouse)) => {
-            handle_mouse(app, mouse);
-            Outcome::Continue
-        }
+        // Mouse wheel scroll, preview fold-node toggles, preview link clicks and
+        // preview drag-selection. A dedicated arm BEFORE the input catch-all and
+        // INDEPENDENT of the modal overlay gate above: none routes into the modal
+        // handler — a wheel just scrolls a pane and never crashes in any mode
+        // (query active, modal open, ...), and a press neither toggles a node, opens
+        // a link nor starts a selection while an overlay is up
+        // (`App::overlay_active` gates it). A finished drag answers `Outcome::Copy`,
+        // the same copy request `Ctrl-X y` makes.
+        AppEvent::Input(Event::Mouse(mouse)) => handle_mouse(app, mouse),
         // A terminal PASTE (bracketed paste, enabled in `tui::init_terminal`). A
         // dedicated arm BEFORE the input catch-all that used to swallow it, and
         // routed by [`handle_paste`] through the SAME precedence the key arm above
@@ -666,12 +685,12 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
             }
             Outcome::Continue
         }
-        // A `Ctrl-X y` clipboard-tool copy finished off-thread. Completing it is the
-        // DRIVER's job, not this handler's: when no tool copied the id, the OSC 52
-        // fallback has to be written to the terminal, and only the driver holds the
+        // A clipboard-tool copy finished off-thread. Completing it is the DRIVER's
+        // job, not this handler's: when no tool copied the text, the OSC 52 fallback
+        // has to be written to the terminal, and only the driver holds the
         // terminal's writer. So the result is handed straight back to it (see
         // `Outcome::FinishCopy`), and the status is set there, from this result.
-        AppEvent::CopyFinished { session_id, copied } => Outcome::FinishCopy { session_id, copied },
+        AppEvent::CopyFinished { payload, copied } => Outcome::FinishCopy { payload, copied },
         AppEvent::Tick => {
             // The tick already drove a redraw; counting it turns that existing
             // cadence into the board's clock, which `view::blink_visible` phases
@@ -962,48 +981,79 @@ fn wheel_target(col: u16, row: u16, preview: Rect, list: Rect, composing: bool) 
     }
 }
 
-/// Apply a mouse event: a vertical wheel notch scrolls whichever pane the
-/// pointer is over — unless a draft is open, which takes the LIST out of the
-/// wheel's reach so a notch there is swallowed ([`wheel_target`] owns that rule
-/// and the reason for it). A left-button press INSIDE the preview pane does one of
-/// exactly two things: on a fold node's HEADER — a peer message or injected
-/// context — it toggles that node open or closed ([`App::toggle_peer_fold`]), and
-/// otherwise it is resolved by [`open_link_under_pointer`]: a hit on an
-/// `http`/`https` link opens its url in the default browser — fire-and-forget, off
-/// the render loop — and reports `opening <url>` transiently; a hit on any OTHER
-/// scheme opens nothing and reports a STICKY refusal naming the url (the gate is
-/// [`preview::has_openable_scheme`]); a line too big to hit-test reports a sticky
-/// [`LinkClick::Unresolvable`] message; and a miss writes nothing. Any other event
-/// (other buttons, drags, releases, horizontal wheel, plain moves) is ignored: the
+/// What one mouse event asks of the world beyond the [`App`] — decided by
+/// [`mouse_effect`] with no process spawned and no terminal touched, so a test can
+/// press, drag and release over a drawn link without a browser ever opening.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MouseEffect {
+    /// Nothing beyond the state change already applied — which may be a fold node
+    /// toggled open or closed, or a link click's status line.
+    None,
+    /// A plain CLICK — press and release with no drag — over a drawn link whose
+    /// scheme snapback opens ([`LinkClick::Opening`]): open this url.
+    OpenLink(String),
+    /// A finished DRAG: copy this selected text.
+    Copy(String),
+}
+
+/// Apply a mouse event and carry out what it decided: [`mouse_effect`] owns the
+/// decision, this owns the two effects. A click's link goes to the
+/// fire-and-forget, off-thread [`resume::open_url`] — the ONE statement in the
+/// link path a test cannot assert, which is the point of keeping it alone here
+/// (PATTERNS §3); its status was already written by [`note_link_click`], BEFORE
+/// this spawn, so the board has the message whatever the opener does with it. A
+/// finished drag answers [`Outcome::Copy`] with the selected text — the SAME
+/// request `Ctrl-X y` makes, so the copy takes the one clipboard path (tool first,
+/// OSC 52 fallback) and [`finish_copy`] reports what really happened. Every other
+/// event answers [`Outcome::Continue`]. Fails soft end to end: a bad url or a
+/// missing opener never crashes the board.
+fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Outcome {
+    match mouse_effect(app, mouse) {
+        MouseEffect::None => Outcome::Continue,
+        MouseEffect::OpenLink(url) => {
+            resume::open_url(&url);
+            Outcome::Continue
+        }
+        MouseEffect::Copy(text) => Outcome::Copy(CopyPayload::Selection(text)),
+    }
+}
+
+/// Decide a mouse event — the state change it makes, and the effect it asks for.
+///
+/// A vertical wheel notch scrolls whichever pane the pointer is over — unless a
+/// draft is open, which takes the LIST out of the wheel's reach so a notch there
+/// is swallowed ([`wheel_target`] owns that rule and the reason for it) — and
+/// drops any selection first.
+///
+/// The left button over the preview transcript is a CLICK or a DRAG, and which one
+/// is only known when it comes back UP — so nothing acts on the press:
+///
+/// - the PRESS records where it landed ([`App::begin_preview_press`]), if
+///   [`press_starts_selection`] admits it, and toggles or opens nothing;
+/// - a DRAG extends a selection from that press ([`App::extend_preview_selection`]);
+/// - the RELEASE resolves it: a drag copies the text the last frame drew under the
+///   selection ([`MouseEffect::Copy`]) — or does nothing when that selection held
+///   no drawn text (the view records `None` for it) — while a plain click is
+///   resolved at the press cell by [`click_effect`]: the fold node whose header
+///   is under it toggles, else the link under it opens. So a drag that happens to
+///   start on a node header or a link selects, and toggles or opens nothing.
+///
+/// Any other event (other buttons, horizontal wheel, plain moves) is ignored: the
 /// pane widths belong to the keyboard (`Shift-Left` / `Shift-Right`), so the mouse
-/// has no border to drag. Never touches the query, and the [`App::overlay_active`]
-/// gate keeps a click from toggling a node or opening a link under an overlay, so
-/// this never crashes or makes a stray toggle / stray link-open in any mode.
-///
-/// The pane arm is the LAST word on a left-press inside `preview_rect` — its guard
-/// matches every such press, so an arm added after it would be unreachable — which
-/// is why the precedence lives INSIDE it rather than as arms of its own. Read end
-/// to end: fold toggle -> link open. That guard is the OUTER `preview_rect`, so a
-/// press on the pane's own BORDER reaches the arm too, and it is the hit-tests that
-/// refuse it: `view::content_hit` checks containment in the transcript's INNER rect
-/// on both axes, so a border click aliases onto no content column and does nothing.
-///
-/// Fold-before-link is FREE, not a tie-break. A node's header line is built from
-/// the marker, the sender, the timestamp and the affordance alone; every link
-/// region a node produces belongs to its BODY and is rebased strictly BELOW the
-/// header row (`store::preview::peer_node_lines`, `injected_node_lines`), so no
-/// content row is ever claimed by both a `FoldRegion` and a `LinkRegion` and
-/// neither order can swallow the other's click. The order is written down anyway
-/// because that is a property
-/// of today's render rather than a guarantee of it: it is what would decide the
-/// collision if a header ever did carry a link, and
-/// `a_peer_node_header_carries_no_link_regions_at_any_width` and
-/// `an_injected_node_header_carries_no_link_regions_at_any_width` — one per node
-/// kind, since each builds its header on its own path — are the tests that go red
-/// the moment the premise stops holding.
-fn handle_mouse(app: &mut App, mouse: MouseEvent) {
+/// has no border to drag. Never touches the query, and the press gate keeps a
+/// click from toggling a node or opening a link — or a drag from selecting —
+/// under an overlay: a press it refuses records nothing, so its release has
+/// nothing to resolve.
+fn mouse_effect(app: &mut App, mouse: MouseEvent) -> MouseEffect {
+    let pos = Position {
+        x: mouse.column,
+        y: mouse.row,
+    };
     match mouse.kind {
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            // A wheel notch changes what text sits under an absolute-cell
+            // selection, so drop any highlight before scrolling.
+            app.clear_preview_selection();
             let up = mouse.kind == MouseEventKind::ScrollUp;
             match wheel_target(
                 mouse.column,
@@ -1020,59 +1070,120 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                 WheelTarget::Ignore => {}
             }
         }
-        // A left-click inside the preview pane. Gated by any overlay, so a click
-        // while the running-session choice or the agent picker owns input never
-        // toggles a node or opens a link.
-        //
-        // THE one owner of a pane click: this guard matches every left-press
-        // inside the pane, so the fold-then-link precedence is resolved in the
-        // body rather than by a second arm that could never be reached. The
-        // arm-order doc above owns why that order costs nothing.
-        MouseEventKind::Down(MouseButton::Left)
-            if !app.overlay_active()
-                && app.preview_rect.contains(Position {
-                    x: mouse.column,
-                    y: mouse.row,
-                }) =>
-        {
-            // One derivation of the transcript rect for both halves, so the width
-            // the toggle re-renders at is the width the hit-test resolved through.
-            let transcript = preview_transcript_rect(app);
-            if let Some(key) = fold_under_pointer(app, mouse.column, mouse.row) {
-                app.toggle_peer_fold(&key, transcript.width);
-            } else {
-                open_link_under_pointer(app, mouse.column, mouse.row);
+        // A left press inside the transcript starts a POTENTIAL drag-select and
+        // toggles or opens NOTHING yet: the selection only materializes once the
+        // pointer moves, and a press that never moves is a plain click, resolved
+        // on release (`click_effect`: fold toggle, else link open). So a single
+        // click both toggles a node or opens a link as before and de-highlights
+        // any prior selection. `press_starts_selection` owns where a press may
+        // land and when — gated by any overlay, so a press while the
+        // running-session choice or the agent picker owns input records nothing.
+        MouseEventKind::Down(MouseButton::Left) if press_starts_selection(app, pos) => {
+            app.begin_preview_press(pos);
+        }
+        // A held-button drag inside the preview extends the text selection. A
+        // no-op unless a press is active (`begin_preview_press` set it), so a drag
+        // that began on the list, the pinned row or a docked compose zone never
+        // selects; the cursor is clamped into the SAME transcript rect the press
+        // was gated on.
+        MouseEventKind::Drag(MouseButton::Left) => {
+            app.extend_preview_selection(pos, view::preview_transcript_rect(app));
+        }
+        // The release resolves the press, and only a press the gate admitted:
+        // a completed drag copies the selection — the text the last frame drew
+        // under it, which is exactly what is highlighted on screen — and never
+        // toggles a node or opens a link, even one it started on; a plain click
+        // with no drag is THE one pane click, resolved at the press cell.
+        MouseEventKind::Up(MouseButton::Left) => {
+            let Some(press) = app.take_preview_press() else {
+                return MouseEffect::None;
+            };
+            if app.has_preview_selection() {
+                return app
+                    .preview_selection_text()
+                    .map_or(MouseEffect::None, |text| MouseEffect::Copy(text.to_owned()));
             }
+            return click_effect(app, press);
         }
         _ => {}
     }
+    MouseEffect::None
 }
 
-/// The rect the preview's TRANSCRIPT was actually drawn into — the rect every
-/// hit-test over the pane must resolve a screen cell against.
+/// Whether a left press at `pos` may begin a preview press — the ONE gate in
+/// front of all three mouse actions over the preview, since a node toggles, a link
+/// opens and a selection starts only from a press this admits.
 ///
-/// The transcript does NOT own the whole preview pane: the selected session pins a
-/// banner to the pane's first inner row (`view::preview_banner`), so its
-/// transcript starts one row lower. Deriving the rect from the SAME
-/// [`view::preview_split`] the view drew with is what keeps a hit-test honest — the
-/// scroll offset and the cached line widths are both measured from that rect's
-/// origin, so a click on screen row N resolves to the transcript line actually
-/// drawn there. A pane with no banner splits off nothing and hit-tests against the
-/// full inner rect, exactly as it did before the banner existed.
+/// Three conditions, all required:
 ///
-/// The banner, never liveness: asking the banner is what keeps this rect identical
-/// to the one the view drew against. Liveness is a hand-off question answered by
-/// [`App::is_live_now`], and it would be the wrong question here twice over: it
-/// shells out to claude, and it would disagree with the drawn banner.
+/// - no overlay owns the board ([`App::overlay_active`]) — which includes the
+///   quick-reply / draft EDITOR and the new-session draft CARD, so no selection
+///   starts under a draft card and no node toggles or link opens from a
+///   transcript the card hides;
+/// - a session is selected, so the "No session selected." placeholder is never
+///   selectable text;
+/// - `pos` is inside the preview's TRANSCRIPT rect,
+///   [`view::preview_transcript_rect`] — the same rect [`fold_under_pointer`] and
+///   [`resolve_link_click`] resolve a click against, and the one the view drew the
+///   text in. The pinned row above it, the pane's own border and a docked compose
+///   zone are outside it by construction.
+fn press_starts_selection(app: &App, pos: Position) -> bool {
+    !app.overlay_active()
+        && app.selected_session().is_some()
+        && view::preview_transcript_rect(app).contains(pos)
+}
+
+/// Resolve a plain CLICK — a press released with no drag — at its PRESS cell:
+/// THE one owner of a pane click, and the one place its precedence lives. Read
+/// end to end: fold toggle -> link open.
 ///
-/// ONE derivation serves BOTH pane hit-tests ([`resolve_link_click`] and
-/// [`fold_under_pointer`]) and the width the fold toggle re-renders at. A second
-/// copy is exactly how a fold and a link would come to disagree about which row
-/// the banner pushed them onto.
-fn preview_transcript_rect(app: &App) -> Rect {
-    let has_banner = view::preview_banner(app).is_some();
-    let (_, transcript) = view::preview_split(app.preview_rect, has_banner);
-    transcript
+/// - On a fold node's HEADER — a peer message or injected context — it toggles
+///   that node open or closed ([`App::toggle_peer_fold`], which also drops any
+///   mouse selection) and asks for nothing more.
+/// - Otherwise it is resolved by [`resolve_link_click`] and given its status by
+///   [`note_link_click`]: a hit on an `http`/`https` link asks [`handle_mouse`]
+///   to open its url ([`MouseEffect::OpenLink`]) and reports `opening <url>`
+///   transiently; a hit on any OTHER scheme opens nothing and reports a STICKY
+///   refusal naming the url (the gate is [`preview::has_openable_scheme`]); a line
+///   too big to hit-test reports a sticky [`LinkClick::Unresolvable`] message; and
+///   a miss writes nothing.
+///
+/// Resolved at the PRESS cell because that is the cell the gate vetted: a press
+/// is admitted only inside the transcript rect ([`press_starts_selection`]), so a
+/// press on the pane's own BORDER or on its pinned row never records at all. The
+/// hit-tests keep their own containment behind that gate — `view::content_hit`
+/// checks the transcript's INNER rect on both axes — so a border cell could not
+/// alias onto content column 0 even if it got this far.
+///
+/// Fold-before-link is FREE, not a tie-break. A node's header line is built from
+/// the marker, the sender, the timestamp and the affordance alone; every link
+/// region a node produces belongs to its BODY and is rebased strictly BELOW the
+/// header row (`store::preview::peer_node_lines`, `injected_node_lines`), so no
+/// content row is ever claimed by both a `FoldRegion` and a `LinkRegion` and
+/// neither order can swallow the other's click. The order is written down anyway
+/// because that is a property
+/// of today's render rather than a guarantee of it: it is what would decide the
+/// collision if a header ever did carry a link, and
+/// `a_peer_node_header_carries_no_link_regions_at_any_width` and
+/// `an_injected_node_header_carries_no_link_regions_at_any_width` — one per node
+/// kind, since each builds its header on its own path — are the tests that go red
+/// the moment the premise stops holding.
+fn click_effect(app: &mut App, press: Position) -> MouseEffect {
+    // One derivation of the transcript rect for both halves, so the width the
+    // toggle re-renders at is the width the hit-test resolved through.
+    let transcript = view::preview_transcript_rect(app);
+    if let Some(key) = fold_under_pointer(app, press.x, press.y) {
+        app.toggle_peer_fold(&key, transcript.width);
+        return MouseEffect::None;
+    }
+    let click = resolve_link_click(app, press.x, press.y);
+    note_link_click(app, &click);
+    match click {
+        LinkClick::Opening(url) => MouseEffect::OpenLink(url),
+        LinkClick::NoLink | LinkClick::RefusedScheme(_) | LinkClick::Unresolvable => {
+            MouseEffect::None
+        }
+    }
 }
 
 /// What a left-click on the preview pane amounts to — the ONE outcome the whole click
@@ -1096,8 +1207,9 @@ fn preview_transcript_rect(app: &App) -> Rect {
 /// coming" from "snapback will not open this scheme".
 ///
 /// The value is produced by the pure [`resolve_link_click`], turned into copy by
-/// [`note_link_click`] and consumed by exactly one impure statement in
-/// [`open_link_under_pointer`] — PATTERNS §3's split, with the type as the seam.
+/// [`note_link_click`] and into an effect by [`click_effect`], and consumed by
+/// exactly one impure statement in [`handle_mouse`] — PATTERNS §3's split, with the
+/// type as the seam.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LinkClick {
     /// The click resolved to a real cell carrying no link.
@@ -1114,7 +1226,8 @@ enum LinkClick {
 /// Decide what a left-click on the preview pane at screen `(col, row)` amounts to,
 /// WITHOUT saying or opening anything.
 ///
-/// The DECISION half of [`open_link_under_pointer`], split out for the reason
+/// The DECISION half of a link click ([`click_effect`] asks it on a click's
+/// release; [`handle_mouse`] holds the one spawn), split out for the reason
 /// PATTERNS §3 gives: everything here is terminal-, process- and status-free and can
 /// be asserted directly against all four outcomes, while the caller is left holding
 /// one spawn. That is what lets a test drive a real rendered transcript all the way to
@@ -1122,8 +1235,8 @@ enum LinkClick {
 /// running it. It takes `&mut App` only because the width-scoped preview cache is
 /// filled on demand; it writes nothing a reader can see.
 ///
-/// The transcript rect comes from [`preview_transcript_rect`], which owns why it is
-/// not simply the pane's inner rect.
+/// The transcript rect comes from [`view::preview_transcript_rect`], which owns why
+/// it is not simply the pane's inner rect.
 ///
 /// The wrapped-layout context (the per-line wrapped-row prefix map, the rendered
 /// lines and the link regions) comes from the SAME width-scoped cache the view drew
@@ -1137,7 +1250,7 @@ enum LinkClick {
 /// A pane with no previewed session at all is [`LinkClick::NoLink`]: there is no
 /// transcript to have hit, which is a genuine absence rather than an abstention.
 fn resolve_link_click(app: &mut App, col: u16, row: u16) -> LinkClick {
-    let transcript = preview_transcript_rect(app);
+    let transcript = view::preview_transcript_rect(app);
     // Read before the borrow below: the hit context borrows `app` for as long as its
     // lines are in hand, and the offset is a plain `Copy` field.
     let scroll = app.preview_scroll;
@@ -1164,7 +1277,7 @@ fn resolve_link_click(app: &mut App, col: u16, row: u16) -> LinkClick {
 /// link and a browser that never launched. With this, the status line separates them —
 /// a message with no browser is the opener's fault, no message at all means the click
 /// never reached a link (or never reached the handler, the terminal having consumed
-/// the `Down(Left)` itself).
+/// the press or its release itself).
 const LINK_OPENING_PREFIX: &str = "opening ";
 
 /// The two halves of the status a link click reports when it hit a link it will NOT
@@ -1254,47 +1367,26 @@ fn note_link_click(app: &mut App, click: &LinkClick) {
 /// is over no node header.
 ///
 /// A deliberate mirror of [`resolve_link_click`], sharing every step that decides
-/// WHICH LINE a click landed on: the same [`preview_transcript_rect`], the same
-/// width-scoped [`App::preview_hit_context`] entry, and — inside [`view::fold_at`]
-/// — the same `visual_to_content` row lookup its link sibling runs through, so the
-/// two can never disagree about which line a cell belongs to. They part on the
-/// COLUMN, which `view::content_hit` packs for this path and its sibling resolves by
-/// re-rendering; `view::content_hit` owns why the cheaper answer is sufficient for a
-/// region spanning its header's whole width. Only the region list it matches
-/// against, and what a match yields, differ.
+/// WHICH LINE a click landed on: the same [`view::preview_transcript_rect`], the
+/// same width-scoped [`App::preview_hit_context`] entry, and — inside
+/// [`view::fold_at`] — the same `visual_to_content` row lookup its link sibling
+/// runs through, so the two can never disagree about which line a cell belongs to.
+/// They part on the COLUMN, which `view::content_hit` packs for this path and its
+/// sibling resolves by re-rendering; `view::content_hit` owns why the cheaper answer
+/// is sufficient for a region spanning its header's whole width. Only the region
+/// list it matches against, and what a match yields, differ.
 ///
 /// Terminal- and process-free: it answers a key and changes nothing. Every side
 /// effect of acting on that key — the set mutation, the cache eviction, the
-/// re-render and the scroll anchor — belongs to [`App::toggle_peer_fold`].
+/// re-render, the scroll anchor and dropping any mouse selection — belongs to
+/// [`App::toggle_peer_fold`], which [`click_effect`] calls on a click's release.
 fn fold_under_pointer(app: &mut App, col: u16, row: u16) -> Option<String> {
-    let transcript = preview_transcript_rect(app);
+    let transcript = view::preview_transcript_rect(app);
     // Read before the borrow below, which holds `app` for as long as the regions are
     // in hand; the offset is a plain `Copy` field.
     let scroll = app.preview_scroll;
     let (row_prefix, _lines, _links, folds) = app.preview_hit_context(transcript.width)?;
     view::fold_at(col, row, transcript, scroll, row_prefix, folds).map(str::to_string)
-}
-
-/// Open the url of a rendered preview link under a left-click at screen
-/// `(col, row)`, if any.
-///
-/// The IMPURE end of PATTERNS §3's split, and deliberately the thinnest thing that can
-/// still be called a driver: decide ([`resolve_link_click`]), say
-/// ([`note_link_click`]), then hand exactly one variant to the fire-and-forget,
-/// off-thread [`resume::open_url`]. Every decision above it is pinned directly; the
-/// spawn is the ONE statement in the path a test cannot assert, which is the point of
-/// keeping it alone here. A click that resolved no link, one snapback will not open, or
-/// one the hit-test abstained from spawns nothing.
-///
-/// The status is written BEFORE the spawn, so the board has the message whatever the
-/// opener does with it. Fails soft end to end — a bad url or missing opener never
-/// crashes the board.
-fn open_link_under_pointer(app: &mut App, col: u16, row: u16) {
-    let click = resolve_link_click(app, col, row);
-    note_link_click(app, &click);
-    if let LinkClick::Opening(url) = click {
-        resume::open_url(&url);
-    }
 }
 
 /// Apply a decoded [`Action`] to the app.
@@ -1489,6 +1581,72 @@ pub(super) fn osc52_sent_status(id: &str) -> String {
     format!("{OSC52_SENT_STATUS_PREFIX}{id}{OSC52_SENT_STATUS_CAVEAT}")
 }
 
+/// Status-line opener for a preview drag-SELECTION a clipboard TOOL confirmed (it
+/// exited 0 with the text on its stdin). Names a selection, never a session id, so
+/// the two copies the board makes never read alike; and like
+/// [`COPY_STATUS_PREFIX`], only a tool's exit code earns "Copied".
+const SELECTION_COPY_STATUS_PREFIX: &str = "Copied selection ";
+
+/// Status-line opener for a drag-selection that went out as an OSC 52 escape. It
+/// says "Sent", NEVER "Copied", for the reason [`OSC52_SENT_STATUS_PREFIX`] does,
+/// and it carries the same [`OSC52_SENT_STATUS_CAVEAT`] after the size.
+const SELECTION_SENT_STATUS_PREFIX: &str = "Sent selection ";
+
+/// How big a selection was, as the status line states it: `(1 line)` or
+/// `(N lines)`, counting the screen rows the drag covered. The selected TEXT itself
+/// is never echoed — a multi-row selection cannot fit the one help row, and the
+/// highlight in the pane already shows what it was. Pure.
+fn selection_size(text: &str) -> String {
+    let rows = text.split('\n').count();
+    let noun = if rows == 1 { "line" } else { "lines" };
+    format!("({rows} {noun})")
+}
+
+/// The HONEST status for a finished copy of `payload`: `copied` is whether a
+/// clipboard tool took the text (exit 0). Four lines, one per kind and route:
+///
+/// - a session id a tool copied → [`copy_status`] (`Copied session ID <uuid>`);
+/// - a session id sent as OSC 52 → [`osc52_sent_status`] (`Sent session ID …`);
+/// - a selection a tool copied → `Copied selection (N lines)`;
+/// - a selection sent as OSC 52 → `Sent selection (N lines) to the terminal via
+///   OSC 52 (some terminals ignore it)`.
+///
+/// "Copied" appears ONLY when a tool exited 0; the kind is always named. Pure, so
+/// every row is assertable without a terminal or a tool.
+pub(super) fn copy_result_status(payload: &CopyPayload, copied: bool) -> String {
+    match (payload, copied) {
+        (CopyPayload::SessionId(id), true) => copy_status(id),
+        (CopyPayload::SessionId(id), false) => osc52_sent_status(id),
+        (CopyPayload::Selection(text), true) => {
+            format!("{SELECTION_COPY_STATUS_PREFIX}{}", selection_size(text))
+        }
+        (CopyPayload::Selection(text), false) => format!(
+            "{SELECTION_SENT_STATUS_PREFIX}{}{OSC52_SENT_STATUS_CAVEAT}",
+            selection_size(text)
+        ),
+    }
+}
+
+/// Whether a finished copy's status line is STICKY (until the next key) or a
+/// transient confirmation — the decision PATTERNS §11 (status-line ownership)
+/// records, made pure here so it is pinned by a test rather than by a comment.
+///
+/// A `Ctrl-X y` session id: STICKY, on both routes. The line reports which route
+/// ran, and on the OSC 52 path the full id on it is what the user selects by hand
+/// (Shift/Option-drag past mouse capture) when the terminal ignores the escape — a
+/// `STATUS_DWELL_TICKS` x `watch::TICK` = 4 s dwell is too short for that.
+///
+/// A drag SELECTION: TRANSIENT, on both routes. The hand-selection reason does not
+/// carry over: the line holds only a row count, never the text, and the text the
+/// user would re-select natively is still on screen, still highlighted, in the
+/// pane. Nor does the line carry a failure or a refusal. The route it names is read
+/// the moment the button comes up, while the user is looking, so the dwell is
+/// enough — and a sticky line would park on the keymap row after EVERY drag until a
+/// key was pressed, which a mouse-only reader may never do.
+fn copy_status_is_sticky(payload: &CopyPayload) -> bool {
+    matches!(payload, CopyPayload::SessionId(_))
+}
+
 /// Decide the `Ctrl-X y` completion for the current selection — the copy's PURE
 /// decision half, reached from [`handle_chord_key`]. It performs NO I/O at all.
 ///
@@ -1504,7 +1662,7 @@ fn copy_selected_id(app: &mut App) -> Outcome {
     // Own the id so the `&Session` borrow ends before `app` is mutably re-borrowed
     // below (the clone-then-mutate discipline the resume path uses).
     match app.selected_session().map(|s| s.session_id.clone()) {
-        Some(id) => Outcome::Copy(id),
+        Some(id) => Outcome::Copy(CopyPayload::SessionId(id)),
         None => {
             app.set_status(NO_SELECTION_STATUS);
             Outcome::Continue
@@ -1512,17 +1670,19 @@ fn copy_selected_id(app: &mut App) -> Outcome {
     }
 }
 
-/// Complete a `Ctrl-X y` copy with its HONEST, sticky status. This is the one
-/// function that performs the OSC 52 write, and the writer is INJECTED (`w`), so a
-/// test hands it a `Vec<u8>` and no escape ever reaches the test run's terminal.
+/// Complete a copy — a `Ctrl-X y` session id or a preview drag-selection — with
+/// its HONEST status. This is the one function that performs the OSC 52 write, and
+/// the writer is INJECTED (`w`), so a test hands it a `Vec<u8>` and no escape ever
+/// reaches the test run's terminal.
 ///
 /// `copied` is a RESULT, never a hope: `true` only when a clipboard tool exited 0
-/// with the id on its stdin (see [`AppEvent::CopyFinished`]). Then the status is
-/// [`copy_status`] and NO escape is written, because the id is already on the
-/// clipboard. Otherwise — SSH, no tool for this OS/display, or every tool missing
-/// or failing — the id goes out as a write-only OSC 52 escape
-/// ([`clipboard::copy_to_clipboard`]) and the status says it was SENT
-/// ([`osc52_sent_status`]).
+/// with the text on its stdin (see [`AppEvent::CopyFinished`]). Then NO escape is
+/// written, because the text is already on the clipboard, and the status says
+/// "Copied". Otherwise — SSH, no tool for this OS/display, or every tool missing
+/// or failing — the text goes out as a write-only OSC 52 escape
+/// ([`clipboard::copy_to_clipboard`]) and the status says it was SENT. The wording
+/// is [`copy_result_status`]'s, and whether it sticks is
+/// [`copy_status_is_sticky`]'s.
 ///
 /// The driver (`tui::run_inner`) calls this on the UI thread with the terminal's own
 /// writer, never from the tool worker. Frame-safety: that is the EVENT-HANDLING
@@ -1531,25 +1691,23 @@ fn copy_selected_id(app: &mut App) -> Outcome {
 /// diffs against an unchanged screen (same reasoning as `tui::mod`'s `hard_reset`).
 /// A write from the worker thread could instead interleave with a frame the UI
 /// thread is flushing.
-pub fn finish_copy<W: Write>(app: &mut App, w: &mut W, session_id: &str, copied: bool) {
-    let status = if copied {
-        copy_status(session_id)
-    } else {
-        // Best-effort: the status below carries the full id whatever happens, and a
+pub fn finish_copy<W: Write>(app: &mut App, w: &mut W, payload: &CopyPayload, copied: bool) {
+    if !copied {
+        // Best-effort: the status below reports the route whatever happens, and a
         // stdout that cannot take a few bytes cannot draw the board either, so the
         // `io::Result` is deliberately discarded (like `resume::open_url`'s spawn).
-        let _ = clipboard::copy_to_clipboard(w, session_id);
-        osc52_sent_status(session_id)
-    };
-    // STICKY (`set_status`, NOT `set_status_transient`) on purpose — a deliberate
-    // exception to PATTERNS §11's "confirmations expire". The line confirms what
-    // ACTUALLY happened (a tool copied the id, or it was only sent as OSC 52), and on
-    // the OSC 52 path it is also the fallback: the FULL id is what the user selects
-    // by hand (Shift/Option-drag past mouse capture) when the terminal ignores the
-    // escape, and a `STATUS_DWELL_TICKS` x `watch::TICK` = 4 s dwell is too short
-    // for that. It still clears on the next actionable keypress, like any sticky
-    // status.
-    app.set_status(status);
+        let _ = clipboard::copy_to_clipboard(w, payload.text());
+    }
+    let status = copy_result_status(payload, copied);
+    // A `Ctrl-X y` id's line is STICKY (`set_status`) on purpose — a deliberate
+    // exception to PATTERNS §11's "confirmations expire"; a selection's is not.
+    // `copy_status_is_sticky` owns both reasons. A sticky line still clears on the
+    // next actionable keypress, like any sticky status.
+    if copy_status_is_sticky(payload) {
+        app.set_status(status);
+    } else {
+        app.set_status_transient(status);
+    }
 }
 
 /// The five keys a pending `Ctrl-X` chord binds, plus cancel — the PURE decision
@@ -2672,6 +2830,16 @@ mod tests {
             AppEvent::Input(Event::Mouse(mouse_ev(kind, col, row))),
             &mut store_at(Path::new("/tmp")),
         )
+    }
+
+    /// A whole left CLICK at `(col, row)` — press, then release, no drag — through
+    /// the real `handle_event`, the way a user's click arrives. The press only
+    /// records where it landed; the RELEASE is what toggles a node or opens a link
+    /// (`click_effect`), so a press alone proves nothing about either. Returns the
+    /// release's outcome.
+    fn left_click(app: &mut App, col: u16, row: u16) -> Outcome {
+        wheel(app, MouseEventKind::Down(MouseButton::Left), col, row);
+        wheel(app, MouseEventKind::Up(MouseButton::Left), col, row)
     }
 
     // --- quick reply (Ctrl-R): gate, compose routing, send, completion ----
@@ -4982,6 +5150,21 @@ mod tests {
         )
     }
 
+    /// Press, then release, the left button at `(col, row)` — a plain CLICK — and
+    /// return what the RELEASE decided. Driven through the pure [`mouse_effect`], so
+    /// a url it resolves is returned, never handed to a browser.
+    fn click(app: &mut App, col: u16, row: u16) -> MouseEffect {
+        let pressed = mouse_effect(
+            app,
+            mouse_ev(MouseEventKind::Down(MouseButton::Left), col, row),
+        );
+        assert_eq!(pressed, MouseEffect::None, "a press alone must never act");
+        mouse_effect(
+            app,
+            mouse_ev(MouseEventKind::Up(MouseButton::Left), col, row),
+        )
+    }
+
     #[test]
     fn a_click_on_a_drawn_link_opens_it_for_a_banner_less_pane() {
         // No banner: the transcript owns the pane's whole inner rect, and the
@@ -5010,6 +5193,12 @@ mod tests {
             resolve_link_click(&mut app, col, row),
             LinkClick::Opening(LINK_URL.to_string()),
             "a click on the cell the link was DRAWN on must resolve to its url"
+        );
+        assert_eq!(
+            click(&mut app, col, row),
+            MouseEffect::OpenLink(LINK_URL.to_string()),
+            "a click (press + release) on the cell the link was DRAWN on must open \
+             its url"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5076,6 +5265,11 @@ mod tests {
             "a click on the cell the link was DRAWN on must resolve to its url \
              even though the pinned banner pushed the transcript down a row"
         );
+        assert_eq!(
+            click(&mut app, col, row),
+            MouseEffect::OpenLink(LINK_URL.to_string()),
+            "and a click (press + release) there must open it"
+        );
         // Precision, not just presence: the row ABOVE the label is a different
         // transcript line. `NoLink` and not merely "not this url" — a real render of
         // an ordinary prose line is the one place the NO-LINK outcome can be pinned
@@ -5084,6 +5278,12 @@ mod tests {
         assert_eq!(
             resolve_link_click(&mut app, col, row - 1),
             LinkClick::NoLink,
+            "the row above the label is another transcript line, not the link"
+        );
+        // So a click there must NOT open the same link.
+        assert_ne!(
+            click(&mut app, col, row - 1),
+            MouseEffect::OpenLink(LINK_URL.to_string()),
             "the row above the label is another transcript line, not the link"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -5098,10 +5298,12 @@ mod tests {
     /// arm runs ahead of the pane arm; this pins that the column stays the
     /// transcript's.
     ///
-    /// Stops at the pure [`resolve_link_click`] seam like its sibling link tests:
-    /// taking the arm's link branch would reach `resume::open_url` and spawn a
-    /// browser. What the arm would do with the press is pinned by its guard instead:
-    /// the cell must lie inside `preview_rect`, the one rect that arm asks about.
+    /// Pinned at the pure [`resolve_link_click`] seam like its sibling link tests,
+    /// and then through a whole click at the pure [`mouse_effect`] — press, then
+    /// release — which returns the url instead of handing it to `resume::open_url`,
+    /// so no browser is spawned. The press gate is asked first: the cell must lie
+    /// inside the transcript rect [`press_starts_selection`] admits presses in, the
+    /// one rect every pane click is resolved against.
     #[test]
     fn a_click_on_a_link_starting_at_content_column_zero_opens_it() {
         let dir = unique_temp_dir("link-col0");
@@ -5120,14 +5322,49 @@ mod tests {
              column, or this probes an ordinary interior link"
         );
         assert!(
-            app.preview_rect.contains(Position { x: col, y: row }),
-            "the pane arm guards on `preview_rect`, so a cell outside it would make \
-             the link unreachable however precisely the user clicked it"
+            view::preview_transcript_rect(&app).contains(Position { x: col, y: row }),
+            "the press gate admits presses in the transcript rect alone, so a cell \
+             outside it would make the link unreachable however precisely the user \
+             clicked it"
         );
         assert_eq!(
             resolve_link_click(&mut app, col, row),
             LinkClick::Opening(LINK_URL.to_string()),
-            "and the pane arm then resolves the cell the label was DRAWN on to its url"
+            "and the pane click then resolves the cell the label was DRAWN on to its url"
+        );
+        assert_eq!(
+            click(&mut app, col, row),
+            MouseEffect::OpenLink(LINK_URL.to_string()),
+            "so a whole click there — press, then release — opens it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The PRESS opens nothing: whether it was a click or the start of a drag is
+    /// only known when the button comes back up, so the link waits for the
+    /// release. The release of that same press then opens it.
+    #[test]
+    fn a_press_alone_on_a_drawn_link_opens_nothing_until_the_release() {
+        let dir = unique_temp_dir("link-press");
+        let mut app = link_app(&dir, None);
+        let buffer = render_board(&mut app);
+        let (col, row) = drawn_link_cell(&buffer, app.preview_rect);
+
+        assert_eq!(
+            mouse_effect(
+                &mut app,
+                mouse_ev(MouseEventKind::Down(MouseButton::Left), col, row)
+            ),
+            MouseEffect::None,
+            "a press on a link must not open it"
+        );
+        assert_eq!(
+            mouse_effect(
+                &mut app,
+                mouse_ev(MouseEventKind::Up(MouseButton::Left), col, row)
+            ),
+            MouseEffect::OpenLink(LINK_URL.to_string()),
+            "the release of that press is what opens it"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5209,6 +5446,38 @@ mod tests {
         );
     }
 
+    /// A drag that STARTS on a link is a selection, not a click: its release copies
+    /// the selected text and opens nothing.
+    #[test]
+    fn a_drag_that_starts_on_a_link_copies_instead_of_opening_it() {
+        let dir = unique_temp_dir("link-drag");
+        let mut app = link_app(&dir, None);
+        let buffer = render_board(&mut app);
+        let (col, row) = drawn_link_cell(&buffer, app.preview_rect);
+
+        let pressed = mouse_effect(
+            &mut app,
+            mouse_ev(MouseEventKind::Down(MouseButton::Left), col, row),
+        );
+        assert_eq!(pressed, MouseEffect::None);
+        render_board(&mut app);
+        mouse_effect(
+            &mut app,
+            mouse_ev(MouseEventKind::Drag(MouseButton::Left), col + 3, row),
+        );
+        render_board(&mut app);
+        let released = mouse_effect(
+            &mut app,
+            mouse_ev(MouseEventKind::Up(MouseButton::Left), col + 3, row),
+        );
+
+        let MouseEffect::Copy(text) = released else {
+            panic!("a drag's release must copy, not open: got {released:?}");
+        };
+        assert_eq!(text, "docs", "the four drawn cells of the link label");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_left_click_in_the_preview_body_without_a_link_is_a_harmless_no_op() {
         // The preview-link arm must never open the overlay or panic when the
@@ -5232,15 +5501,22 @@ mod tests {
         };
         app.set_status(REFUSAL);
 
-        // Well inside the preview body (col 70 of the 50..90 preview).
+        // Well inside the preview body (col 70 of the 50..90 preview): a whole
+        // click — press, then release — through the real handler.
         wheel(&mut app, MouseEventKind::Down(MouseButton::Left), 70, 10);
+        let released = wheel(&mut app, MouseEventKind::Up(MouseButton::Left), 70, 10);
+        assert!(
+            matches!(released, Outcome::Continue),
+            "a click with no link and no drag asks nothing of the driver"
+        );
         assert!(
             app.modal.is_none(),
             "a preview-body click must not open the overlay"
         );
         // The miss half of the wiring, asserted from the same end the user sees:
-        // a real `Down(Left)` through `handle_event`, not a direct call to the
-        // decision fn. A no-op must leave an unread refusal exactly where it was.
+        // a real click — `Down(Left)` then `Up(Left)` — through `handle_event`, not
+        // a direct call to the decision fn. A no-op must leave an unread refusal
+        // exactly where it was.
         assert_eq!(
             app.status.as_deref(),
             Some(REFUSAL),
@@ -5252,14 +5528,16 @@ mod tests {
         );
     }
 
-    /// The HIT half of the wiring, END TO END through a real `Down(Left)` event.
+    /// The HIT half of the wiring, END TO END through a real click — a `Down(Left)`
+    /// and its `Up(Left)`, since the RELEASE is what resolves a click.
     ///
     /// `note_link_click_speaks_for_every_outcome_but_the_no_op` pins the MAPPING — it
     /// calls `note_link_click` directly — which leaves the CALL SITE uncovered:
     /// deleting `note_link_click(...)` out of the driver left that test, and the whole
-    /// suite, green. This drives the mouse event instead, so the chain from
+    /// suite, green. This drives the mouse events instead, so the chain from
     /// `handle_event` through `resolve_link_click` to the status line is what is
-    /// asserted.
+    /// asserted. The PRESS alone is asserted to say nothing first: a click is only
+    /// known to be one when the button comes back up.
     ///
     /// It clicks a REFUSED scheme on purpose, and that is not a compromise: the route
     /// through `handle_event` reaches `resume::open_url`, and an accepted url there
@@ -5283,6 +5561,8 @@ mod tests {
         );
 
         wheel(&mut app, MouseEventKind::Down(MouseButton::Left), col, row);
+        assert_eq!(app.status, None, "the press alone resolves nothing yet");
+        wheel(&mut app, MouseEventKind::Up(MouseButton::Left), col, row);
         assert_eq!(
             app.status.as_deref(),
             Some(format!("{LINK_REFUSED_PREFIX}{REFUSED_URL}{LINK_REFUSED_SUFFIX}").as_str()),
@@ -5300,8 +5580,9 @@ mod tests {
     /// `handle_event` — `resolve_link_click` then `note_link_click`, which is the
     /// driver minus its single spawn, so no browser is ever launched by the test suite
     /// (PATTERNS: test the pure helper, not the impure driver). The url inside the
-    /// `Opening` it returns IS what `open_link_under_pointer` hands `resume::open_url`,
-    /// so this pins both what is said and what is opened.
+    /// `Opening` it returns IS what `click_effect` hands `handle_mouse` as
+    /// `MouseEffect::OpenLink` for `resume::open_url`, so this pins both what is said
+    /// and what is opened.
     #[test]
     fn a_click_on_a_drawn_http_link_announces_the_url_it_hands_the_opener() {
         let dir = unique_temp_dir("link-opening");
@@ -5346,9 +5627,10 @@ mod tests {
     /// the budget crossing — and this cannot pass vacuously if the fixture stops
     /// crossing it.
     ///
-    /// The second half drives a REAL `Down(Left)` through `handle_event`, because the
-    /// decision being right proves nothing if the driver never asks for it. No browser
-    /// can be launched: `Unresolvable` is precisely the outcome that spawns nothing.
+    /// The second half drives a REAL click — `Down(Left)` then `Up(Left)`, since the
+    /// release is what resolves it — through `handle_event`, because the decision
+    /// being right proves nothing if the driver never asks for it. No browser can be
+    /// launched: `Unresolvable` is precisely the outcome that spawns nothing.
     #[test]
     fn a_click_on_a_line_too_large_to_hit_test_says_so_instead_of_falling_silent() {
         let control_dir = unique_temp_dir("link-control");
@@ -5379,7 +5661,7 @@ mod tests {
         // shows the abstention is actionable enough to displace one.
         const REFUSAL: &str = "a refusal the reader has not read yet";
         app.set_status(REFUSAL);
-        wheel(&mut app, MouseEventKind::Down(MouseButton::Left), col, row);
+        left_click(&mut app, col, row);
         assert_eq!(
             app.status.as_deref(),
             Some(LINK_UNRESOLVED),
@@ -5392,6 +5674,220 @@ mod tests {
             "and it is a refusal, not a confirmation: a message that dwelled away \
              unread would leave exactly the silence it exists to break"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- drag-selection: ONE transcript rect, shared with the link hit-test ---
+
+    /// Row `y` of `pane` exactly as drawn, border columns included.
+    fn drawn_row(buffer: &ratatui::buffer::Buffer, pane: Rect, y: u16) -> String {
+        (pane.x..pane.right())
+            .filter_map(|x| buffer.cell((x, y)).map(|c| c.symbol().to_string()))
+            .collect()
+    }
+
+    /// A press on the PINNED BANNER row never starts a selection — the banner is
+    /// not transcript, and the selection's rect is the link hit-test's rect, which
+    /// already starts one row lower. The control half proves the fixture CAN
+    /// select: the same gesture from the first transcript row copies.
+    #[test]
+    fn a_press_on_the_pinned_banner_row_never_starts_a_selection() {
+        let dir = unique_temp_dir("select-banner");
+        let mut app = link_app(&dir, Some("blocked"));
+        let buffer = render_board(&mut app);
+        let pane = app.preview_rect;
+        // The pinned row as DRAWN: the pane's first inner row carries text — the
+        // marker of the turn at the top of the viewport, which is what this row
+        // shows whenever the transcript has one, else the reported status — and
+        // the transcript starts on the row below it.
+        assert!(
+            view::preview_banner(&app).is_some(),
+            "premise: a joined reported agent pins a row"
+        );
+        let banner_row = pane.y + 1;
+        assert!(
+            drawn_row(&buffer, pane, banner_row)
+                .trim_matches(|c: char| c == '│' || c.is_whitespace())
+                .chars()
+                .count()
+                > 0,
+            "premise: the pinned row is drawn on the pane's first inner row"
+        );
+        assert_eq!(
+            view::preview_transcript_rect(&app).y,
+            banner_row + 1,
+            "premise: and the transcript starts right under it"
+        );
+
+        let col = pane.x + 3;
+        let released = drag_and_release(&mut app, (col, banner_row), (col + 8, banner_row + 2));
+        assert!(
+            !app.has_preview_selection(),
+            "a press on the banner row must not start a selection"
+        );
+        assert!(
+            !matches!(released, Outcome::Copy(_)),
+            "and its release must copy nothing"
+        );
+
+        // Control: one row lower is transcript, and the same drag selects.
+        let released = drag_and_release(&mut app, (col, banner_row + 1), (col + 8, banner_row + 3));
+        assert!(
+            matches!(released, Outcome::Copy(CopyPayload::Selection(_))),
+            "the first transcript row under the banner is selectable"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The row EVERY selected session pins above its transcript — here an
+    /// UNREPORTED one, whose pinned row names the turn at the top of the viewport —
+    /// is never selectable and never clickable: a drag from it selects and copies
+    /// nothing, and a click on it resolves nothing. It is chrome that restates a
+    /// turn marker, not transcript, and the one transcript rect every pointer
+    /// action reads starts below it. The control drag proves the fixture CAN
+    /// select one row lower.
+    #[test]
+    fn the_pinned_row_of_an_unreported_session_never_starts_a_selection_or_a_click() {
+        let dir = unique_temp_dir("select-pinned");
+        let mut app = link_app(&dir, None);
+        let buffer = render_board(&mut app);
+        let pane = app.preview_rect;
+        assert!(
+            app.reported_agent("sess-link").is_none() && view::preview_banner(&app).is_some(),
+            "premise: an unreported session still pins the row"
+        );
+        let pinned_row = pane.y + 1;
+        let drawn_pinned = drawn_row(&buffer, pane, pinned_row);
+        assert!(
+            drawn_pinned.contains("you \u{b7} "),
+            "premise: the pinned row names the top turn — the fixture's one user \
+             turn: {drawn_pinned:?}"
+        );
+        assert_eq!(
+            view::preview_transcript_rect(&app).y,
+            pinned_row + 1,
+            "premise: and the transcript starts right under it"
+        );
+
+        let col = pane.x + 3;
+        let released = drag_and_release(&mut app, (col, pinned_row), (col + 8, pinned_row + 2));
+        assert!(
+            !app.has_preview_selection() && !matches!(released, Outcome::Copy(_)),
+            "a drag from the pinned row must select and copy nothing"
+        );
+        assert_eq!(
+            click(&mut app, col, pinned_row),
+            MouseEffect::None,
+            "and a click on it resolves nothing"
+        );
+        assert_eq!(app.status, None, "not even a status line");
+
+        let released = drag_and_release(&mut app, (col, pinned_row + 1), (col + 8, pinned_row + 3));
+        assert!(
+            matches!(released, Outcome::Copy(CopyPayload::Selection(_))),
+            "control: the first transcript row under the pinned row is selectable"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No selection starts while the new-session DRAFT CARD is shown — the card
+    /// replaces the transcript, so there is nothing of the session's to select, the
+    /// same reason a link click is off there. Pinned on a DISPATCHED card, whose
+    /// editor is already closed, so the card alone is what gates the press.
+    #[test]
+    fn no_selection_starts_under_the_new_session_draft_card() {
+        let dir = unique_temp_dir("select-draft");
+        let mut app = link_app(&dir, None);
+        seed_live(&mut app, &[]);
+        app.open_agent_picker(vec![def_agent("planner")]);
+        press(&mut app, KeyCode::Enter);
+        type_into_draft(&mut app, "ship the thing");
+        assert!(
+            matches!(press(&mut app, KeyCode::Enter), Outcome::BgLaunch(_)),
+            "the draft must dispatch for its card to outlive the editor"
+        );
+        assert!(app.draft.is_some(), "premise: the card is up");
+        assert!(!app.is_composing(), "premise: and the editor is closed");
+
+        let buffer = render_board(&mut app);
+        let (col, row) = drawn_text_cell(&buffer, app.preview_rect, "new session");
+        let released = drag_and_release(&mut app, (col, row), (col + 6, row + 1));
+
+        assert!(
+            !app.has_preview_selection(),
+            "a press over the draft card must not start a selection"
+        );
+        assert!(
+            !matches!(released, Outcome::Copy(_)),
+            "and its release must copy nothing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With no session selected the pane shows a placeholder sentence, not a
+    /// transcript, so a drag over it selects nothing and copies nothing.
+    #[test]
+    fn the_no_session_placeholder_is_not_selectable() {
+        let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp"));
+        let buffer = render_board(&mut app);
+        let (col, row) = drawn_text_cell(&buffer, app.preview_rect, "No session selected.");
+        let released = drag_and_release(&mut app, (col, row), (col + 8, row));
+        assert!(
+            !app.has_preview_selection(),
+            "the placeholder is not transcript"
+        );
+        assert!(!matches!(released, Outcome::Copy(_)));
+    }
+
+    /// While a reply is DOCKED in the preview pane, the transcript rect every
+    /// pointer action reads stops above the compose box: the rows the editor is
+    /// drawn in are never transcript. Read off the drawn box (its top-left corner
+    /// inside the pane), never computed from the geometry under test. A press in
+    /// the box selects nothing either.
+    #[test]
+    fn the_shared_transcript_rect_stops_above_a_docked_compose_zone() {
+        let dir = unique_temp_dir("select-compose");
+        let mut app = link_app(&dir, None);
+        seed_live(&mut app, &[]);
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        assert!(
+            app.is_composing(),
+            "premise: Ctrl-R on an idle session composes"
+        );
+        let buffer = render_board(&mut app);
+        let pane = app.preview_rect;
+
+        // The docked box draws its own border INSIDE the pane: its top-left corner
+        // sits one column in from the pane's left border.
+        let compose_top = (pane.y + 1..pane.bottom())
+            .find(|&y| {
+                buffer
+                    .cell((pane.x + 1, y))
+                    .is_some_and(|c| c.symbol() == "┌")
+            })
+            .expect("premise: the compose box is docked inside the preview pane");
+
+        let transcript = view::preview_transcript_rect(&app);
+        assert!(
+            transcript.height > 0,
+            "premise: some transcript is still shown"
+        );
+        assert!(
+            transcript.bottom() <= compose_top,
+            "the transcript rect ({transcript:?}) must end above the docked compose box \
+             (top row {compose_top})"
+        );
+
+        let released = drag_and_release(
+            &mut app,
+            (pane.x + 3, compose_top + 1),
+            (pane.x + 9, compose_top + 1),
+        );
+        assert!(
+            !app.has_preview_selection(),
+            "a press in the box selects nothing"
+        );
+        assert!(!matches!(released, Outcome::Copy(_)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5500,7 +5996,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // --- peer-message fold: the pane arm's fold-then-link precedence ---------
+    // --- peer-message fold: the pane click's fold-then-link precedence -------
 
     /// The checked-in peer-node fixture: one `origin.kind:"peer"` hand-back sitting
     /// below a typed prompt, an assistant turn and an `Agent` tool use, so the node
@@ -5623,18 +6119,18 @@ mod tests {
     /// A click on a collapsed node's header OPENS it, and a second click on the
     /// same header CLOSES it again (resolved decision 4).
     ///
-    /// Driven END TO END through [`handle_mouse`]'s pane arm, not through
-    /// [`fold_under_pointer`] alone, because the arm is what this phase adds: a
-    /// resolver nothing routes to would pass every assertion below and still leave
-    /// the node inert under a real click.
+    /// Driven END TO END through [`handle_mouse`] — a press, then its release, which
+    /// [`click_effect`] resolves — not through [`fold_under_pointer`] alone, because
+    /// the routing is what this phase adds: a resolver nothing routes to would pass
+    /// every assertion below and still leave the node inert under a real click.
     #[test]
     fn a_click_on_a_peer_node_header_expands_it_and_a_second_click_collapses_it() {
         let (mut app, buffer) = peer_app();
-        let width = preview_transcript_rect(&app).width;
+        let width = view::preview_transcript_rect(&app).width;
         let (col, row) = drawn_peer_handle_cell(&buffer, app.preview_rect);
         assert!(
-            app.preview_rect.contains(Position { x: col, y: row }),
-            "the probe must be inside the rect the PANE arm guards on"
+            view::preview_transcript_rect(&app).contains(Position { x: col, y: row }),
+            "the probe must be inside the transcript rect the press gate admits"
         );
 
         let collapsed = preview_string(&mut app, width);
@@ -5643,7 +6139,7 @@ mod tests {
             "a peer node starts CLOSED, or the expand assertion below is vacuous"
         );
 
-        wheel(&mut app, MouseEventKind::Down(MouseButton::Left), col, row);
+        left_click(&mut app, col, row);
         let expanded = preview_string(&mut app, width);
         assert!(
             expanded.contains(PEER_BODY_PHRASE),
@@ -5654,7 +6150,7 @@ mod tests {
             "an open node's header must offer the click that closes it again"
         );
 
-        wheel(&mut app, MouseEventKind::Down(MouseButton::Left), col, row);
+        left_click(&mut app, col, row);
         let reclosed = preview_string(&mut app, width);
         assert!(
             !reclosed.contains(PEER_BODY_PHRASE),
@@ -5701,10 +6197,10 @@ mod tests {
     /// Fold-before-link does NOT swallow a click on a link inside an OPEN node: the
     /// header is the node's click target, the body is not.
     ///
-    /// Asserted through the pure [`fold_under_pointer`] / [`link_under_pointer`]
-    /// seam rather than through the arm, because taking the arm's link branch would
-    /// reach `resume::open_url` and spawn a browser — the same reason the link
-    /// hit-tests above stop at this seam.
+    /// Asserted through the pure [`fold_under_pointer`] / [`resolve_link_click`]
+    /// seam rather than through `handle_event`, because taking the click's link
+    /// branch there would reach `resume::open_url` and spawn a browser — the same
+    /// reason the link hit-tests above stop at this seam.
     #[test]
     fn a_click_on_a_link_inside_an_expanded_peer_node_still_opens_the_link() {
         let dir = unique_temp_dir("peer-link");
@@ -5718,12 +6214,7 @@ mod tests {
         // Open the node first: its body — and so its link — does not exist until a
         // click puts it on screen, which is the whole point of the fold.
         let (header_col, header_row) = drawn_peer_handle_cell(&buffer, app.preview_rect);
-        wheel(
-            &mut app,
-            MouseEventKind::Down(MouseButton::Left),
-            header_col,
-            header_row,
-        );
+        left_click(&mut app, header_col, header_row);
         let buffer = render_board(&mut app);
 
         let (col, row) = drawn_link_cell(&buffer, app.preview_rect);
@@ -5756,8 +6247,8 @@ mod tests {
     /// REAL render instead of assumed: a node's header row carries no link region,
     /// in EITHER fold state and at every pane width the node is readable at.
     ///
-    /// If this ever goes red the ordering inside the pane arm stops being free and
-    /// starts deciding a collision, which is why the arm's doc comment names this
+    /// If this ever goes red the ordering inside `click_effect` stops being free
+    /// and starts deciding a collision, which is why its doc comment names this
     /// test by name.
     #[test]
     fn a_peer_node_header_carries_no_link_regions_at_any_width() {
@@ -5806,14 +6297,18 @@ mod tests {
     /// it lands on is a peer node's header.
     ///
     /// The probe is the preview block's left border column — chrome the pane's
-    /// `Block` draws and the transcript never reaches. The pane arm guards on
-    /// `preview_rect`, the OUTER rect, so a press on that border DOES reach the arm,
-    /// and nothing runs ahead of it to claim the cell: the pane widths belong to the
-    /// keyboard, so the mouse has no border to drag. What keeps the press inert is
-    /// the hit-test's containment — `view::content_hit` refuses every cell outside
-    /// the transcript's INNER rect, so the border resolves to no content column at
-    /// all. Clamp that column instead and the border aliases onto content column 0,
-    /// the header's marker one cell to its RIGHT, and this press opens the node.
+    /// `Block` draws and the transcript never reaches. It is inside `preview_rect`,
+    /// the pane's OUTER rect, so it IS a click on the pane, and nothing runs ahead
+    /// of the pane click to claim the cell: the pane widths belong to the keyboard,
+    /// so the mouse has no border to drag. What keeps the click inert is
+    /// containment, twice over. The press gate (`press_starts_selection`) admits
+    /// presses in the TRANSCRIPT rect alone, so a border press records nothing and
+    /// its release has nothing to resolve; and behind it the hit-test's own
+    /// containment — `view::content_hit` refuses every cell outside the
+    /// transcript's INNER rect — would still resolve the border to no content
+    /// column at all. Clamp that column instead and the border aliases onto content
+    /// column 0, the header's marker one cell to its RIGHT, and this click opens the
+    /// node.
     ///
     /// The marker itself is the node's own click target
     /// (`a_click_on_a_peer_nodes_marker_cell_expands_it`). The containment guard is
@@ -5824,7 +6319,7 @@ mod tests {
     #[test]
     fn a_click_on_the_preview_border_beside_a_peer_node_toggles_nothing() {
         let (mut app, buffer) = peer_app();
-        let width = preview_transcript_rect(&app).width;
+        let width = view::preview_transcript_rect(&app).width;
         let (marker_col, header_row) = drawn_peer_marker_cell(&buffer, app.preview_rect);
         let col = app.preview_rect.x;
         assert_eq!(
@@ -5838,8 +6333,15 @@ mod tests {
                 x: col,
                 y: header_row,
             }),
-            "the probe must be inside the rect the PANE arm guards on, or the press \
-             never reaches the hit-test and the silence below proves nothing"
+            "the probe must be inside the pane, or this is a click somewhere else \
+             and the silence below proves nothing about the border"
+        );
+        assert!(
+            !view::preview_transcript_rect(&app).contains(Position {
+                x: col,
+                y: header_row,
+            }),
+            "and it must be outside the transcript rect, or it is not the border"
         );
         let collapsed = preview_string(&mut app, width);
         assert!(
@@ -5847,12 +6349,7 @@ mod tests {
             "a peer node starts CLOSED, or the assertion below is vacuous"
         );
 
-        wheel(
-            &mut app,
-            MouseEventKind::Down(MouseButton::Left),
-            col,
-            header_row,
-        );
+        left_click(&mut app, col, header_row);
         let after = preview_string(&mut app, width);
         assert!(
             after.contains(COLLAPSED_AFFORDANCE) && !after.contains(PEER_BODY_PHRASE),
@@ -5873,13 +6370,13 @@ mod tests {
     /// at every terminal size and every split ratio. The pane widths now belong to
     /// the keyboard, and this keeps any future arm from taking the cell back.
     ///
-    /// Driven END TO END through [`handle_mouse`], not through
-    /// [`fold_under_pointer`]: the defect was never in the resolver — it is which
-    /// arm claims the press.
+    /// Driven END TO END through [`handle_mouse`] — press, then release — not
+    /// through [`fold_under_pointer`]: the defect was never in the resolver — it is
+    /// which arm claims the click.
     #[test]
     fn a_click_on_a_peer_nodes_marker_cell_expands_it() {
         let (mut app, buffer) = peer_app();
-        let width = preview_transcript_rect(&app).width;
+        let width = view::preview_transcript_rect(&app).width;
         let (col, row) = drawn_peer_marker_cell(&buffer, app.preview_rect);
         assert_eq!(
             col,
@@ -5894,7 +6391,7 @@ mod tests {
             "a peer node starts CLOSED, or the expand assertion below is vacuous"
         );
 
-        wheel(&mut app, MouseEventKind::Down(MouseButton::Left), col, row);
+        left_click(&mut app, col, row);
         let expanded = preview_string(&mut app, width);
         assert!(
             expanded.contains(PEER_BODY_PHRASE),
@@ -5907,15 +6404,115 @@ mod tests {
         );
     }
 
+    /// The PRESS on a node header toggles nothing: whether it is a click or the
+    /// start of a drag is only known when the button comes back up, so the fold
+    /// waits for the release — exactly as a link does. The release of that same
+    /// press then opens the node, and asks the driver for nothing more.
+    #[test]
+    fn a_press_alone_on_a_peer_node_header_toggles_nothing_until_the_release() {
+        let (mut app, buffer) = peer_app();
+        let width = view::preview_transcript_rect(&app).width;
+        let (col, row) = drawn_peer_handle_cell(&buffer, app.preview_rect);
+
+        let pressed = mouse_effect(
+            &mut app,
+            mouse_ev(MouseEventKind::Down(MouseButton::Left), col, row),
+        );
+        assert_eq!(pressed, MouseEffect::None, "a press asks for nothing");
+        let after_press = preview_string(&mut app, width);
+        assert!(
+            after_press.contains(COLLAPSED_AFFORDANCE) && !after_press.contains(PEER_BODY_PHRASE),
+            "a press alone must leave the node CLOSED"
+        );
+
+        let released = mouse_effect(
+            &mut app,
+            mouse_ev(MouseEventKind::Up(MouseButton::Left), col, row),
+        );
+        assert_eq!(released, MouseEffect::None, "a toggle opens no link");
+        let after_release = preview_string(&mut app, width);
+        assert!(
+            after_release.contains(PEER_BODY_PHRASE) && after_release.contains(EXPANDED_AFFORDANCE),
+            "the release of that press is what opens the node"
+        );
+    }
+
+    /// A drag that STARTS on a node header is a selection, not a click: its release
+    /// copies the header text it covered and toggles NOTHING — the fold's twin of
+    /// `a_drag_that_starts_on_a_link_copies_instead_of_opening_it`.
+    #[test]
+    fn a_drag_that_starts_on_a_peer_node_header_selects_and_toggles_nothing() {
+        let (mut app, buffer) = peer_app();
+        let width = view::preview_transcript_rect(&app).width;
+        let (col, row) = drawn_peer_handle_cell(&buffer, app.preview_rect);
+
+        let released = drag_and_release(&mut app, (col, row), (col + 3, row));
+
+        let Outcome::Copy(CopyPayload::Selection(text)) = released else {
+            panic!("a drag's release must copy a selection, not toggle the node");
+        };
+        assert!(
+            text.starts_with('@'),
+            "the copy is the header text the drag covered, from the handle on: {text:?}"
+        );
+        let after = preview_string(&mut app, width);
+        assert!(
+            after.contains(COLLAPSED_AFFORDANCE) && !after.contains(PEER_BODY_PHRASE),
+            "a drag that started on the header must leave the node CLOSED"
+        );
+    }
+
+    /// A fold toggle drops a standing drag-selection. The toggle re-renders the
+    /// transcript — lines, row map and scroll all move — so the selection's
+    /// ABSOLUTE cells would now highlight, and a later release would copy, other
+    /// text. Toggled through `App::toggle_peer_fold` DIRECTLY, not through a click,
+    /// on purpose: a click's own press already starts a fresh selection, so only a
+    /// direct call can show the clear lives in the toggle itself, where no route
+    /// into it can skip it. Asserted on the next frame too, so no stale highlight
+    /// survives the redraw.
+    #[test]
+    fn a_fold_toggle_clears_a_standing_preview_selection() {
+        let (mut app, buffer) = peer_app();
+        let width = view::preview_transcript_rect(&app).width;
+        let (col, row) = drawn_peer_handle_cell(&buffer, app.preview_rect);
+        drag_and_release(&mut app, (col, row), (col + 3, row));
+        let drawn = render_board(&mut app);
+        assert!(
+            app.has_preview_selection()
+                && !highlighted_cells(&drawn, view::preview_transcript_rect(&app)).is_empty(),
+            "premise: a finished drag stays selected and highlighted"
+        );
+
+        app.toggle_peer_fold(PEER_KEY, width);
+
+        assert!(
+            !app.has_preview_selection(),
+            "a fold toggle must drop the selection"
+        );
+        assert_eq!(
+            app.preview_selection_text(),
+            None,
+            "and the text a release would have copied"
+        );
+        let redrawn = render_board(&mut app);
+        assert_eq!(
+            highlighted_cells(&redrawn, view::preview_transcript_rect(&app)),
+            Vec::<(u16, u16)>::new(),
+            "and no highlight may survive into the next frame"
+        );
+    }
+
     /// A click on a node header while an overlay owns input does NEITHER: no
     /// toggle, no link open, and the overlay is left exactly as it was.
     ///
     /// The same `!app.overlay_active()` gate the link arm always had, which the
-    /// fold must not quietly widen.
+    /// fold must not quietly widen — asked of the PRESS (`press_starts_selection`),
+    /// so the whole click, release included, is inert, and no selection starts
+    /// either.
     #[test]
     fn a_click_on_a_peer_node_header_during_an_overlay_neither_toggles_nor_opens() {
         let (mut app, buffer) = peer_app();
-        let width = preview_transcript_rect(&app).width;
+        let width = view::preview_transcript_rect(&app).width;
         let (col, row) = drawn_peer_handle_cell(&buffer, app.preview_rect);
         assert_eq!(
             fold_under_pointer(&mut app, col, row).as_deref(),
@@ -5926,11 +6523,15 @@ mod tests {
         app.open_live_choice("s1".to_string());
         assert!(app.overlay_active(), "the overlay must really own input");
 
-        wheel(&mut app, MouseEventKind::Down(MouseButton::Left), col, row);
+        let released = left_click(&mut app, col, row);
         let after = preview_string(&mut app, width);
         assert!(
             !after.contains(PEER_BODY_PHRASE) && after.contains(COLLAPSED_AFFORDANCE),
             "a click behind an overlay must leave the node closed"
+        );
+        assert!(
+            matches!(released, Outcome::Continue) && !app.has_preview_selection(),
+            "and must neither ask the driver for anything nor start a selection"
         );
         assert!(
             app.modal.is_some(),
@@ -5938,7 +6539,7 @@ mod tests {
         );
     }
 
-    // --- injected-context fold: the same pane arm, the same premise ----------
+    // --- injected-context fold: the same pane click, the same premise --------
 
     /// The injected record's `uuid` in [`injected_link_session`].
     const INJECTED_UUID: &str = "inj-link-1";
@@ -6035,10 +6636,10 @@ mod tests {
     /// closed again — and is never taken for a link, while a link inside the open
     /// body still is one.
     ///
-    /// Driven END TO END through [`handle_mouse`]'s pane arm, like the peer
-    /// node's click tests: a resolver nothing routes to would pass every pure
+    /// Driven END TO END through [`handle_mouse`] — press, then release — like the
+    /// peer node's click tests: a resolver nothing routes to would pass every pure
     /// assertion and still leave the node inert. Each click is preceded by the
-    /// pure seam's verdict for that cell — a fold key and NO url — so the arm can
+    /// pure seam's verdict for that cell — a fold key and NO url — so the click can
     /// only ever take its fold branch here and never reaches `resume::open_url`.
     #[test]
     fn a_click_on_an_injected_node_header_toggles_it_and_never_opens_a_link() {
@@ -6049,11 +6650,11 @@ mod tests {
             PathBuf::from("/tmp"),
         );
         let buffer = render_board(&mut app);
-        let width = preview_transcript_rect(&app).width;
+        let width = view::preview_transcript_rect(&app).width;
         let (col, row) = drawn_injected_marker_cell(&buffer, app.preview_rect);
         assert!(
-            app.preview_rect.contains(Position { x: col, y: row }),
-            "the probe must be inside the rect the PANE arm guards on"
+            view::preview_transcript_rect(&app).contains(Position { x: col, y: row }),
+            "the probe must be inside the transcript rect the press gate admits"
         );
 
         let collapsed = preview_string(&mut app, width);
@@ -6072,7 +6673,7 @@ mod tests {
             "the header must be the injected node's own click target"
         );
 
-        wheel(&mut app, MouseEventKind::Down(MouseButton::Left), col, row);
+        left_click(&mut app, col, row);
         let expanded = preview_string(&mut app, width);
         assert!(
             expanded.contains(INJECTED_BODY_PHRASE) && expanded.contains(EXPANDED_AFFORDANCE),
@@ -6109,7 +6710,7 @@ mod tests {
             "so a click on the body's link falls through to the link"
         );
 
-        wheel(&mut app, MouseEventKind::Down(MouseButton::Left), col, row);
+        left_click(&mut app, col, row);
         let reclosed = preview_string(&mut app, width);
         assert!(
             !reclosed.contains(INJECTED_BODY_PHRASE) && reclosed.contains(COLLAPSED_AFFORDANCE),
@@ -6125,15 +6726,15 @@ mod tests {
     ///
     /// Every selected session reserves that row (`view::preview_banner`), so the
     /// node's header is drawn one row lower than the pane's first inner row, and
-    /// the pane arm must resolve the press against that SAME lower rect
-    /// ([`preview_transcript_rect`]). Asserted on the precondition first, so a
+    /// the pane click must resolve against that SAME lower rect
+    /// ([`view::preview_transcript_rect`]). Asserted on the precondition first, so a
     /// board that stopped pinning the row could not pass this as the banner-less
     /// case in disguise.
     ///
     /// The probe is the header's MARKER cell, the pane's first CONTENT column, so
-    /// the one press also pins that column as the transcript's on the rows beneath
+    /// the one click also pins that column as the transcript's on the rows beneath
     /// the pinned one. And the row directly ABOVE the header,
-    /// the node's blank separator, is pressed first and must stay inert: a
+    /// the node's blank separator, is clicked first and must stay inert: a
     /// hit-test that forgot the reserved row resolves that row to the header.
     #[test]
     fn a_click_on_a_folded_peer_node_opens_it_beneath_the_pinned_row() {
@@ -6142,7 +6743,7 @@ mod tests {
             view::preview_banner(&app).is_some(),
             "every selected session pins the row, or this is the banner-less case"
         );
-        let transcript = preview_transcript_rect(&app);
+        let transcript = view::preview_transcript_rect(&app);
         assert_eq!(
             transcript.y,
             app.preview_rect.y + 2,
@@ -6161,12 +6762,7 @@ mod tests {
              above it is transcript rather than the pinned row"
         );
 
-        wheel(
-            &mut app,
-            MouseEventKind::Down(MouseButton::Left),
-            col,
-            row - 1,
-        );
+        left_click(&mut app, col, row - 1);
         let untouched = preview_string(&mut app, width);
         assert!(
             untouched.contains(COLLAPSED_AFFORDANCE) && !untouched.contains(PEER_BODY_PHRASE),
@@ -6174,7 +6770,7 @@ mod tests {
              toggle it"
         );
 
-        wheel(&mut app, MouseEventKind::Down(MouseButton::Left), col, row);
+        left_click(&mut app, col, row);
         let expanded = preview_string(&mut app, width);
         assert!(
             expanded.contains(PEER_BODY_PHRASE) && expanded.contains(EXPANDED_AFFORDANCE),
@@ -6189,7 +6785,7 @@ mod tests {
     /// reserved.
     ///
     /// The blank BELOW the collapsed header, the one that leads the next turn, is
-    /// pressed first and must stay inert: a hit-test that reserved a row anyway
+    /// clicked first and must stay inert: a hit-test that reserved a row anyway
     /// resolves that row to the header's last drawn row.
     #[test]
     fn a_click_on_a_folded_peer_node_opens_it_in_a_banner_less_pane() {
@@ -6209,7 +6805,7 @@ mod tests {
             view::preview_banner(&app).is_none(),
             "an in-flight reply reserves no pinned row"
         );
-        let transcript = preview_transcript_rect(&app);
+        let transcript = view::preview_transcript_rect(&app);
         assert_eq!(
             transcript.y,
             app.preview_rect.y + 1,
@@ -6232,12 +6828,7 @@ mod tests {
                     .is_some_and(|c| c.symbol() == "\u{25cf}")
             })
             .expect("the fixture draws a claude turn below the node");
-        wheel(
-            &mut app,
-            MouseEventKind::Down(MouseButton::Left),
-            col,
-            next_turn - 1,
-        );
+        left_click(&mut app, col, next_turn - 1);
         let untouched = preview_string(&mut app, width);
         assert!(
             untouched.contains(COLLAPSED_AFFORDANCE) && !untouched.contains(PEER_BODY_PHRASE),
@@ -6245,7 +6836,7 @@ mod tests {
              toggle the node"
         );
 
-        wheel(&mut app, MouseEventKind::Down(MouseButton::Left), col, row);
+        left_click(&mut app, col, row);
         let expanded = preview_string(&mut app, width);
         assert!(
             expanded.contains(PEER_BODY_PHRASE) && expanded.contains(EXPANDED_AFFORDANCE),
@@ -6254,12 +6845,12 @@ mod tests {
     }
 
     /// A link label that starts its line, on the pane's FIRST content column,
-    /// stays clickable beneath the pinned row: the pane arm owns that column there
-    /// too, and resolves the cell against the transcript rect the pinned row pushed
-    /// down.
+    /// stays clickable beneath the pinned row: the pane click owns that column
+    /// there too, and resolves the cell against the transcript rect the pinned row
+    /// pushed down.
     ///
     /// Stops at the pure [`resolve_link_click`] seam, like its siblings, because
-    /// the arm's link branch would spawn a browser.
+    /// the click's link branch through `handle_event` would spawn a browser.
     #[test]
     fn a_link_on_the_first_content_column_opens_beneath_the_pinned_row() {
         let dir = unique_temp_dir("link-col0-pinned");
@@ -6273,7 +6864,7 @@ mod tests {
             view::preview_banner(&app).is_some(),
             "every selected session pins the row, or this is the banner-less case"
         );
-        let transcript = preview_transcript_rect(&app);
+        let transcript = view::preview_transcript_rect(&app);
         assert_eq!(
             transcript.y,
             app.preview_rect.y + 2,
@@ -6287,8 +6878,9 @@ mod tests {
             "the label must sit on the pane's first CONTENT column"
         );
         assert!(
-            app.preview_rect.contains(Position { x: col, y: row }),
-            "the first content column is inside the rect the PANE arm guards on"
+            transcript.contains(Position { x: col, y: row }),
+            "the first content column is inside the transcript rect the press gate \
+             admits"
         );
         assert_eq!(
             resolve_link_click(&mut app, col, row),
@@ -7318,7 +7910,11 @@ mod tests {
         let Outcome::Copy(requested) = copy_selected_id(&mut app) else {
             panic!("a selection must request the copy");
         };
-        assert_eq!(requested, id, "the request carries the FULL session id");
+        assert_eq!(
+            requested,
+            CopyPayload::SessionId(id.to_string()),
+            "the request carries the FULL session id"
+        );
         assert_eq!(app.status, None, "nothing is claimed before the copy ran");
     }
 
@@ -8486,14 +9082,19 @@ mod tests {
             session_id: "s".to_string(),
         })
         .ends_board_session());
-        // The clipboard copy's request and its completion both keep the board up:
-        // the worker reports back on the SAME channel.
-        assert!(!Outcome::Copy("s".to_string()).ends_board_session());
-        assert!(!Outcome::FinishCopy {
-            session_id: "s".to_string(),
-            copied: false,
+        // The clipboard copy's request and its completion both keep the board up,
+        // whichever kind they carry: the worker reports back on the SAME channel.
+        for payload in [
+            CopyPayload::SessionId("s".to_string()),
+            CopyPayload::Selection("row".to_string()),
+        ] {
+            assert!(!Outcome::Copy(payload.clone()).ends_board_session());
+            assert!(!Outcome::FinishCopy {
+                payload,
+                copied: false,
+            }
+            .ends_board_session());
         }
-        .ends_board_session());
         // A value only: nothing here signals — the syscall lives in the driver.
         assert!(!Outcome::Signal { pid: 29628 }.ends_board_session());
     }
@@ -8507,7 +9108,8 @@ mod tests {
     /// reports back into a channel nobody is reading and the SAME `App` re-enters
     /// the board still holding the card. That strands the preview on a placeholder
     /// for every session, with `overlay_active` stuck true (dead link clicks, dead
-    /// fold toggles), recoverable only by opening and cancelling another compose.
+    /// fold toggles, dead drag-selections), recoverable only by opening and
+    /// cancelling another compose.
     /// Every hand-off therefore ends the card with the board session it belonged to.
     #[test]
     fn handing_off_while_a_launch_is_in_flight_leaves_no_stranded_card() {
@@ -9038,7 +9640,11 @@ mod tests {
         let Outcome::Copy(requested) = feed(&mut app, key(KeyCode::Char('y')), &mut store) else {
             panic!("Ctrl-X y on a selection must hand the driver a copy request");
         };
-        assert_eq!(requested, id, "the request carries the FULL session id");
+        assert_eq!(
+            requested,
+            CopyPayload::SessionId(id.to_string()),
+            "the request carries the FULL session id"
+        );
         assert_eq!(
             app.status, None,
             "the keypress claims nothing: the status comes from the copy's RESULT"
@@ -9049,16 +9655,15 @@ mod tests {
         );
 
         let finished = AppEvent::CopyFinished {
-            session_id: requested,
+            payload: requested,
             copied,
         };
-        let Outcome::FinishCopy { session_id, copied } =
-            handle_event(&mut app, finished, &mut store)
+        let Outcome::FinishCopy { payload, copied } = handle_event(&mut app, finished, &mut store)
         else {
             panic!("a CopyFinished must go back to the driver to be completed");
         };
-        assert_eq!(session_id, id);
-        finish_copy(&mut app, term, &session_id, copied);
+        assert_eq!(payload, CopyPayload::SessionId(id.to_string()));
+        finish_copy(&mut app, term, &payload, copied);
         app
     }
 
@@ -9124,6 +9729,250 @@ mod tests {
             Some(sent.as_str()),
             "the Sent line must survive more than STATUS_DWELL_TICKS ticks"
         );
+    }
+
+    // --- the preview drag-selection copy: the SAME path, its own wording ------
+
+    /// A selection's status names a SELECTION and its size, never a session id,
+    /// and says "Copied" only when a tool exited 0 — the OSC 52 route says "Sent"
+    /// and carries the same caveat the id's line does. The session-id rows of the
+    /// same function are the `Ctrl-X y` wording, untouched.
+    #[test]
+    fn a_selection_copy_status_names_a_selection_and_says_copied_only_for_a_tool() {
+        let three = CopyPayload::Selection("first\n\nthird".to_string());
+        let one = CopyPayload::Selection("only row".to_string());
+
+        assert_eq!(
+            copy_result_status(&three, true),
+            "Copied selection (3 lines)"
+        );
+        assert_eq!(copy_result_status(&one, true), "Copied selection (1 line)");
+
+        let sent = copy_result_status(&three, false);
+        assert_eq!(
+            sent,
+            format!("Sent selection (3 lines){OSC52_SENT_STATUS_CAVEAT}")
+        );
+        assert!(
+            !sent.to_lowercase().contains("copied"),
+            "the OSC 52 route must never claim a copy: {sent:?}"
+        );
+        for status in [copy_result_status(&three, true), sent] {
+            assert!(
+                !status.contains("session ID"),
+                "a selection is not a session id: {status:?}"
+            );
+        }
+
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        let session = CopyPayload::SessionId(id.to_string());
+        assert_eq!(copy_result_status(&session, true), copy_status(id));
+        assert_eq!(copy_result_status(&session, false), osc52_sent_status(id));
+    }
+
+    /// The §11 decision, pinned: a `Ctrl-X y` id's line sticks (the user may have
+    /// to select the id off it by hand), a selection's does not.
+    #[test]
+    fn a_copy_status_sticks_for_a_session_id_and_expires_for_a_selection() {
+        assert!(copy_status_is_sticky(&CopyPayload::SessionId(
+            "id".to_string()
+        )));
+        assert!(!copy_status_is_sticky(&CopyPayload::Selection(
+            "row".to_string()
+        )));
+    }
+
+    /// `finish_copy` completes a SELECTION on both routes: a tool copy writes no
+    /// escape; the fallback writes EXACTLY the OSC 52 escape for the selected text
+    /// (not an id). Either way the line is transient and gone after the dwell.
+    #[test]
+    fn finish_copy_of_a_selection_reports_the_route_and_expires() {
+        let text = "first row\nsecond row";
+        let payload = CopyPayload::Selection(text.to_string());
+        for copied in [true, false] {
+            let mut app = app_with("s", None);
+            let mut term: Vec<u8> = Vec::new();
+
+            finish_copy(&mut app, &mut term, &payload, copied);
+
+            if copied {
+                assert!(term.is_empty(), "a tool copied it: no escape");
+            } else {
+                assert_eq!(term, clipboard::osc52_clipboard_sequence(text));
+            }
+            let expected = copy_result_status(&payload, copied);
+            assert_eq!(app.status.as_deref(), Some(expected.as_str()));
+            assert!(app.status_ttl.is_some(), "set transient, not sticky");
+            tick_past_the_dwell(&mut app);
+            assert_eq!(
+                app.status, None,
+                "a selection's line expires after the dwell (copied: {copied})"
+            );
+        }
+    }
+
+    /// The first transcript row drawn with `needle` in it, and the column `needle`
+    /// starts at — read off the BUFFER, never computed, so a drag in a test lands
+    /// where the text really is.
+    fn drawn_text_cell(buffer: &ratatui::buffer::Buffer, pane: Rect, needle: &str) -> (u16, u16) {
+        for y in pane.y..pane.bottom() {
+            let row: String = (pane.x..pane.right())
+                .filter_map(|x| buffer.cell((x, y)).map(|c| c.symbol().to_string()))
+                .collect();
+            if let Some(byte) = row.find(needle) {
+                let col = u16::try_from(row[..byte].chars().count()).expect("fits a row");
+                return (pane.x + col, y);
+            }
+        }
+        panic!("{needle:?} must be drawn inside the pane, or this test proves nothing");
+    }
+
+    /// A press, a drag, and the release, each followed by a frame the way the real
+    /// loop draws between events. Returns the RELEASE's outcome.
+    fn drag_and_release(app: &mut App, from: (u16, u16), to: (u16, u16)) -> Outcome {
+        wheel(app, MouseEventKind::Down(MouseButton::Left), from.0, from.1);
+        render_board(app);
+        wheel(app, MouseEventKind::Drag(MouseButton::Left), to.0, to.1);
+        render_board(app);
+        wheel(app, MouseEventKind::Up(MouseButton::Left), to.0, to.1)
+    }
+
+    /// End to end: a drag over drawn transcript text, released, hands the driver
+    /// `Outcome::Copy` with THAT text as a `Selection` — the same request `Ctrl-X y`
+    /// makes, so the copy goes through the clipboard tool / OSC 52 path rather
+    /// than a writer of its own. The release claims nothing on the status line:
+    /// the status comes from the copy's result.
+    #[test]
+    fn a_finished_drag_hands_the_drawn_text_to_the_one_copy_path() {
+        let dir = unique_temp_dir("drag-copy");
+        let mut app = link_app(&dir, None);
+        let buffer = render_board(&mut app);
+        let needle = "filler line";
+        let (col, row) = drawn_text_cell(&buffer, app.preview_rect, needle);
+        let last = col + u16::try_from(needle.len()).expect("short") - 1;
+
+        let released = drag_and_release(&mut app, (col, row), (last, row));
+
+        let Outcome::Copy(payload) = released else {
+            panic!("a finished drag must request a copy");
+        };
+        assert_eq!(payload, CopyPayload::Selection(needle.to_string()));
+        assert_eq!(app.status, None, "nothing is claimed before the copy ran");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every transcript cell the frame drew reverse-videoed, as screen `(col, row)`
+    /// — read off the BUFFER, so a test asserts the highlight the user sees. Scoped
+    /// to the transcript rect: the list's own selection highlight is `REVERSED` too.
+    fn highlighted_cells(buffer: &ratatui::buffer::Buffer, transcript: Rect) -> Vec<(u16, u16)> {
+        (transcript.y..transcript.bottom())
+            .flat_map(|y| (transcript.x..transcript.right()).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                buffer
+                    .cell((x, y))
+                    .is_some_and(|c| c.modifier.contains(Modifier::REVERSED))
+            })
+            .collect()
+    }
+
+    /// The column one past `needle`'s last drawn cell on the row it was drawn on.
+    fn drawn_text_end(buffer: &ratatui::buffer::Buffer, pane: Rect, needle: &str) -> (u16, u16) {
+        let (col, row) = drawn_text_cell(buffer, pane, needle);
+        let width = u16::try_from(needle.chars().count()).expect("short needle");
+        (col + width, row)
+    }
+
+    /// A drag over nothing but BLANK cells — the empty space right of a drawn line
+    /// — selects nothing: no cell is reverse-videoed and the release requests no
+    /// copy, so the clipboard is never overwritten with an empty string.
+    #[test]
+    fn a_drag_over_blank_cells_alone_highlights_and_copies_nothing() {
+        let dir = unique_temp_dir("drag-blank");
+        let mut app = link_app(&dir, None);
+        let buffer = render_board(&mut app);
+        let (text_end, row) = drawn_text_end(&buffer, app.preview_rect, "filler line 18");
+        let from = (text_end + 2, row);
+        let to = (text_end + 6, row);
+        let transcript = view::preview_transcript_rect(&app);
+        assert!(
+            transcript.contains(Position { x: to.0, y: to.1 }),
+            "the drag must stay inside the transcript, or it proves nothing"
+        );
+        assert!(
+            (from.0..=to.0).all(|x| buffer
+                .cell((x, row))
+                .is_some_and(|c| c.symbol().trim().is_empty())),
+            "the dragged-over cells must be blank, or this is not the case under test"
+        );
+
+        let released = drag_and_release(&mut app, from, to);
+        let after = render_board(&mut app);
+
+        if let Outcome::Copy(payload) = released {
+            panic!("a blank-only drag must request no copy, got {payload:?}");
+        }
+        assert_eq!(
+            highlighted_cells(&after, view::preview_transcript_rect(&app)),
+            Vec::<(u16, u16)>::new(),
+            "a blank-only drag highlights nothing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A drag across several rows highlights each row only up to its last DRAWN
+    /// cell — the space right of a line is not text, so no row may end in a
+    /// reverse-videoed blank. Checked on every row the drag touched, and the rows
+    /// are counted so the check cannot pass over an empty highlight.
+    #[test]
+    fn a_multi_row_drag_never_ends_a_row_in_a_highlighted_blank_cell() {
+        let dir = unique_temp_dir("drag-rows");
+        let mut app = link_app(&dir, None);
+        let buffer = render_board(&mut app);
+        let from = drawn_text_cell(&buffer, app.preview_rect, "filler line 18");
+        let (end_col, end_row) = drawn_text_end(&buffer, app.preview_rect, "filler line 21");
+
+        drag_and_release(&mut app, from, (end_col - 1, end_row));
+        let after = render_board(&mut app);
+
+        let transcript = view::preview_transcript_rect(&app);
+        let highlighted = highlighted_cells(&after, transcript);
+        let mut rows = 0;
+        for y in transcript.y..transcript.bottom() {
+            let Some(&(last, _)) = highlighted.iter().rfind(|&&(_, row)| row == y) else {
+                continue;
+            };
+            rows += 1;
+            let symbol = after.cell((last, y)).expect("in the buffer").symbol();
+            assert!(
+                !symbol.trim().is_empty(),
+                "row {y} ends in a highlighted BLANK cell at column {last}"
+            );
+        }
+        assert_eq!(rows, 4, "the drag spans the four drawn rows 18..=21");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A drag that STARTS in the blank space right of a line copies from the next
+    /// drawn text on: the blank first row contributes nothing, so the copy does not
+    /// open with a stray newline.
+    #[test]
+    fn a_drag_starting_right_of_the_text_copies_no_leading_newline() {
+        let dir = unique_temp_dir("drag-leading");
+        let mut app = link_app(&dir, None);
+        let buffer = render_board(&mut app);
+        let (text_end, row) = drawn_text_end(&buffer, app.preview_rect, "filler line 20");
+        let (end_col, end_row) = drawn_text_end(&buffer, app.preview_rect, "filler line 22");
+
+        let released = drag_and_release(&mut app, (text_end + 2, row), (end_col - 1, end_row));
+
+        let Outcome::Copy(payload) = released else {
+            panic!("a drag over drawn text must request a copy");
+        };
+        assert_eq!(
+            payload,
+            CopyPayload::Selection("filler line 21\nfiller line 22".to_string())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Task 4.4: `Ctrl-X x` on a non-hidden selected session hides it, PERSISTS the

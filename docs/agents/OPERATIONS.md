@@ -225,7 +225,7 @@ switch. That `NPM_TOKEN` secret can be deleted once one OIDC release succeeds.)
 | --- | --- | --- |
 | `CLAUDE_PROJECTS_DIR` | `~/.claude/projects` | Overrides the session store root (used by both the TUI and `--print-list`). |
 | `SNAPBACK_CONFIG_DIR` | `~/.config/snapback` | Overrides snapback's OWN config dir (the single env-resolved root for snapback-owned paths; state lives in its `state/` subdir). Resolved only by the `config` module. |
-| `SSH_CONNECTION` / `SSH_TTY` / `WAYLAND_DISPLAY` / `DISPLAY` | set by `sshd` / the desktop session | Session FACTS, not overrides. Read only by `tui::clipboard::ClipboardEnv::from_env` (present and non-empty counts as set) to pick the `Ctrl-X y` copy's clipboard tool, or none, in which case the copy falls back to OSC 52. The route table is the `tui::clipboard` row of the [module map](ARCHITECTURE.md#module-map). |
+| `SSH_CONNECTION` / `SSH_TTY` / `WAYLAND_DISPLAY` / `DISPLAY` | set by `sshd` / the desktop session | Session FACTS, not overrides. Read only by `tui::clipboard::ClipboardEnv::from_env` (present and non-empty counts as set) to pick the clipboard copy's tool (`Ctrl-X y` and a preview drag-selection alike), or none, in which case the copy falls back to OSC 52. The route table is the `tui::clipboard` row of the [module map](ARCHITECTURE.md#module-map). |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | `claude`'s own variable, READ (never set) by `claude_settings` to find the user `settings.json` — the lowest settings layer, so every higher layer outranks it. Its `model` feeds only a `Ctrl-N` draft's `model:` label. Its `env` block counts only through the variables in the two rows below: `ANTHROPIC_MODEL` for the draft's value, and all five restore-override names for a `Ctrl-R` reply's label. Empty counts as unset. |
 | `ANTHROPIC_MODEL` | unset | `claude`'s own variable, READ by `claude_settings`: when non-empty (in the highest settings layer's `env` block, else in the environment) it beats every settings file's `model` for a draft's new-session value, AND it stops `claude` restoring a session's own model on `-r`, so a reply box says `model: default` instead of `model: session (…)`. snapback passes its environment to the `claude` it spawns unchanged. |
 | `ANTHROPIC_DEFAULT_{FABLE,OPUS,SONNET,HAIKU}_MODEL` | unset | `claude`'s own variables, READ by `claude_settings` for one question only: any of them non-empty (in the highest settings layer's `env` block, else in the environment) stops the `-r` model restore, so a reply box says `model: default`. |
@@ -252,9 +252,10 @@ confirm subagents/sidecars were excluded). It is intentionally omitted from
   built-in seed. Its flags, commands, version pin, and the exact argv `snapback`
   builds are in [CLAUDE_CLI.md](CLAUDE_CLI.md).
 - A clipboard tool, OPTIONAL — `pbcopy` (built into macOS), or `wl-copy` /
-  `xclip` / `xsel` on a Linux desktop — for `Ctrl-X y`. Without a working one,
-  and always over SSH, the copy falls back to a write-only OSC 52 escape, and
-  the status line says `Sent session ID …`, never `Copied`.
+  `xclip` / `xsel` on a Linux desktop — for `Ctrl-X y` and a preview
+  drag-selection. Without a working one, and always over SSH, the copy falls
+  back to a write-only OSC 52 escape, and the status line says `Sent session ID
+  …` / `Sent selection …`, never `Copied`.
 
 ## Validation checklist before finishing a change
 

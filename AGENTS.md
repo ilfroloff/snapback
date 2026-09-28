@@ -153,9 +153,11 @@ one place.
   construction/reload. Both are argued at the call site, and NEITHER may move
   onto a keystroke or the render path. Work that runs on its OWN thread and
   reports back with one `AppEvent` is the rule's ordinary case, never a third
-  exception: the `Ctrl-X y` clipboard copy (`CopyFinished`), the `--model` alias
-  probe (`ModelAliases`) and the settings-model read (`SettingsModel`) are all
-  that shape. (`src/watch.rs`, `src/worktrees.rs`, `src/tui/clipboard.rs`)
+  exception: the clipboard copy (`CopyFinished` — `Ctrl-X y`'s id and a preview
+  drag-selection alike, ONE path, its tool a THREADED child the driver starts, so
+  no keystroke or mouse release waits on it), the `--model` alias probe
+  (`ModelAliases`) and the settings-model read (`SettingsModel`) are all that
+  shape. (`src/watch.rs`, `src/worktrees.rs`, `src/tui/clipboard.rs`)
 - **PURE, GIT-FREE STORE CORE.** `src/store/*` decides everything from the bytes
   it was given: `repo_of`'s worktree collapse is a pure string heuristic, and NO
   module under `src/store/` may shell out (to `git` or anything else) or read

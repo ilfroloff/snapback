@@ -31,7 +31,7 @@ use crossterm::terminal::{
 use ratatui::DefaultTerminal;
 
 use crate::store::SessionStore;
-use crate::watch::{AppEvent, EventLoop};
+use crate::watch::{AppEvent, CopyPayload, EventLoop};
 
 pub use app::{App, Scope};
 pub use update::Outcome;
@@ -603,21 +603,22 @@ fn run_inner(
                 Outcome::Signal { pid } => {
                     update::show_signal_result(app, crate::send::signal_term(pid));
                 }
-                // A `Ctrl-X y` copy request: read the environment HERE, at the edge,
-                // pick the route, then either start the clipboard-tool worker (it
-                // reports back via `AppEvent::CopyFinished` on this same channel) or,
-                // with no tool to try, write the OSC 52 fallback now — on this UI
+                // A copy request — `Ctrl-X y`'s session id or a preview drag's
+                // selection, one path for both: read the environment HERE, at the
+                // edge, pick the route, then either start the clipboard-tool worker
+                // (it reports back via `AppEvent::CopyFinished` on this same channel)
+                // or, with no tool to try, write the OSC 52 fallback now — on this UI
                 // thread, between draws. See `start_copy`.
-                Outcome::Copy(session_id) => {
+                Outcome::Copy(payload) => {
                     let tools = clipboard::clipboard_route(clipboard::ClipboardEnv::from_env());
-                    start_copy(app, &mut io::stdout(), session_id, tools, events.sender());
+                    start_copy(app, &mut io::stdout(), payload, tools, events.sender());
                 }
                 // The worker's result, handed back by `handle_event`: set the honest
-                // status and, when no tool copied the id, write the OSC 52 fallback —
-                // here on the UI thread, never on the worker, so the escape can never
-                // interleave with a frame.
-                Outcome::FinishCopy { session_id, copied } => {
-                    update::finish_copy(app, &mut io::stdout(), &session_id, copied);
+                // status and, when no tool copied the text, write the OSC 52 fallback
+                // — here on the UI thread, never on the worker, so the escape can
+                // never interleave with a frame.
+                Outcome::FinishCopy { payload, copied } => {
+                    update::finish_copy(app, &mut io::stdout(), &payload, copied);
                 }
                 done => break done,
             },
@@ -641,8 +642,9 @@ fn run_inner(
     Ok(outcome)
 }
 
-/// Start a `Ctrl-X y` copy of `session_id` along `tools`, the route
-/// [`clipboard::clipboard_route`] picked — the driver half of [`Outcome::Copy`].
+/// Start a copy of `payload` (a `Ctrl-X y` session id or a preview selection)
+/// along `tools`, the route [`clipboard::clipboard_route`] picked — the driver half
+/// of [`Outcome::Copy`].
 ///
 /// With a tool to try, the copy runs on its OWN thread
 /// ([`clipboard::spawn_tool_copy`], the shape of `send::spawn_send`) and reports
@@ -657,14 +659,14 @@ fn run_inner(
 fn start_copy<W: Write>(
     app: &mut App,
     w: &mut W,
-    session_id: String,
+    payload: CopyPayload,
     tools: &'static [clipboard::ClipboardTool],
     tx: Sender<AppEvent>,
 ) {
     if tools.is_empty() {
-        update::finish_copy(app, w, &session_id, false);
+        update::finish_copy(app, w, &payload, false);
     } else {
-        clipboard::spawn_tool_copy(tools, session_id, tx);
+        clipboard::spawn_tool_copy(tools, payload, tx);
     }
 }
 
@@ -967,13 +969,52 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut term: Vec<u8> = Vec::new();
 
-        start_copy(&mut app, &mut term, COPY_ID.to_string(), &[], tx);
+        start_copy(
+            &mut app,
+            &mut term,
+            CopyPayload::SessionId(COPY_ID.to_string()),
+            &[],
+            tx,
+        );
 
         assert_eq!(term, clipboard::osc52_clipboard_sequence(COPY_ID));
         assert_eq!(
             app.status.as_deref(),
             Some(update::osc52_sent_status(COPY_ID).as_str())
         );
+        assert!(
+            rx.recv_timeout(Duration::from_secs(1)).is_err(),
+            "no worker was started, so no CopyFinished may arrive"
+        );
+    }
+
+    /// A preview SELECTION with no tool on the route takes the very same fallback:
+    /// the driver writes the OSC 52 escape for the selected TEXT — through
+    /// `clipboard`'s one encoder, byte for byte — and the status names a selection
+    /// that was SENT, never a session id and never "Copied".
+    #[test]
+    fn start_copy_of_a_selection_with_no_tool_sends_its_text_through_the_one_osc52_path() {
+        let mut app = empty_board();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut term: Vec<u8> = Vec::new();
+        let selected = "first row\nsecond row";
+
+        start_copy(
+            &mut app,
+            &mut term,
+            CopyPayload::Selection(selected.to_string()),
+            &[],
+            tx,
+        );
+
+        assert_eq!(term, clipboard::osc52_clipboard_sequence(selected));
+        let status = app.status.clone().expect("the fallback reports itself");
+        assert_eq!(
+            status,
+            update::copy_result_status(&CopyPayload::Selection(selected.to_string()), false)
+        );
+        assert!(status.starts_with("Sent selection"), "{status:?}");
+        assert!(!status.contains("session ID"), "{status:?}");
         assert!(
             rx.recv_timeout(Duration::from_secs(1)).is_err(),
             "no worker was started, so no CopyFinished may arrive"
@@ -994,13 +1035,19 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut term: Vec<u8> = Vec::new();
 
-        start_copy(&mut app, &mut term, COPY_ID.to_string(), STAND_IN, tx);
+        start_copy(
+            &mut app,
+            &mut term,
+            CopyPayload::SessionId(COPY_ID.to_string()),
+            STAND_IN,
+            tx,
+        );
 
         assert!(term.is_empty(), "the tool path writes no escape");
         assert_eq!(app.status, None, "the status waits for the worker's result");
         match rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(AppEvent::CopyFinished { session_id, copied }) => {
-                assert_eq!(session_id, COPY_ID);
+            Ok(AppEvent::CopyFinished { payload, copied }) => {
+                assert_eq!(payload, CopyPayload::SessionId(COPY_ID.to_string()));
                 assert!(copied, "the stand-in exited 0 with the id on its stdin");
             }
             other => panic!("expected one CopyFinished, got {other:?}"),

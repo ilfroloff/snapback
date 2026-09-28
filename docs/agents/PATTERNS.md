@@ -367,6 +367,17 @@ not lines. The box asks for the tallest run of that many choices, so a wrapped
 row adds its extra lines to the box instead of pushing a choice out of the
 window.
 
+The mouse's TEXT selection over the preview is ABSOLUTE screen cells, so it cannot
+be restored by id — but it is dropped by the same rule the preview cache is
+evicted by: `App::apply_reload` clears it only when the reload re-read the
+previewed transcript (`Reload::changed`) or moved the row selection, never because
+some OTHER transcript was written. The watcher reloads on every write anywhere in
+the store, so clearing on every reload cancelled a drag mid-gesture whenever any
+agent was working. A fold toggle clears it too, for the same reason a re-read
+does: `App::toggle_peer_fold` evicts and re-renders the previewed transcript, so
+the text under the selection's cells moves — and the clear sits beside that
+eviction, inside the one mutator, so no route into a toggle can skip it.
+
 The preview's own scroll is **bottom-anchored by default**
 (`App::preview_follow_bottom` starts true, is re-armed on every selection change
 and preview show, and `clamp_preview_offset` then pins to `max_offset`). So
@@ -381,20 +392,25 @@ into a pinned banner row and the transcript beneath it, and returns the WHOLE
 inner rect when there is no banner (so a banner-less pane's geometry is exactly
 `Block::inner`, unchanged). The rules that follow from it:
 
-- `preview_split` is the ONE place the banner/transcript geometry is derived.
-  `render_preview` draws against its rects, and BOTH click hit-tests —
-  `update::resolve_link_click` and `update::fold_under_pointer` — take the same
-  transcript rect from the one `update::preview_transcript_rect` helper, which
-  also supplies the width the fold toggle re-renders at, so the hit-test and the
-  re-render cannot resolve through different widths. A click resolves through
-  `App::preview_scroll` and the width-scoped hit cache, both measured from that
-  rect's origin — derive it anywhere else and a click silently opens the wrong
-  link or folds the wrong node. The compose split (`preview_compose_split`) is built ON `preview_split`,
-  carving the docked compose zone off the bottom of that same transcript rect
-  rather than re-deriving it; a docked compose zone shrinks the transcript, but
-  click hit-testing — link AND fold alike — is gated off while composing
-  (`overlay_active`), so the two never disagree. Both rects trace back to
-  `preview_inner`, the ONE place the pane's border inset is applied — which
+- `preview_split` is the ONE place the banner/transcript geometry is derived,
+  and `view::preview_areas` the one place the docked compose zone is carved off
+  it (`preview_compose_split`, sized by `docks_compose` + the editor's own
+  height). `render_preview` draws against `preview_areas`' rects, and
+  `view::preview_transcript_rect` hands the SAME transcript rect — re-derived on
+  demand from `App::preview_rect`, never stored — to EVERY pointer action over
+  the preview: BOTH click hit-tests (`update::fold_under_pointer` and
+  `update::resolve_link_click`) resolve a click against it, it supplies the width
+  the fold toggle re-renders at (so the hit-test and the re-render cannot resolve
+  through different widths), and the drag-selection's press gate
+  (`update::press_starts_selection`), its drag clamp and its highlight/copy
+  overlay all read it. There is no second copy of it in `update`. A click
+  resolves through `App::preview_scroll` and the width-scoped hit cache, both
+  measured from that rect's origin — derive it anywhere else and a click
+  silently opens the wrong link or folds the wrong node, or a drag starts on the
+  pinned row. All three mouse actions are also gated off while any overlay is up
+  (`overlay_active`, which counts the editor AND the draft card), so none fires
+  over a docked compose zone or a draft card either way. Both rects trace back
+  to `preview_inner`, the ONE place the pane's border inset is applied — which
   matters most for the docked compose
   zone, because it then draws a border of its OWN: measure it from the pane's
   OUTER rect and its editor is four columns narrower than whatever measured it,
@@ -720,17 +736,19 @@ syscall is not this shape and gets no thread: `Ctrl-K`'s SIGTERM
 work and `kill(2)` returns as soon as the signal is queued. That satisfies the
 rule rather than waiving it.
 
-The `Ctrl-X y` clipboard copy is that same THREADED shape, and it is NOT a third
+The clipboard copy is that same THREADED shape, and it is NOT a third
 synchronous one-shot beside the two exceptions below. `handle_chord_key` returns
-`Outcome::Copy(id)`, and the driver (`run_inner` → `start_copy`) reads the
+`Outcome::Copy(CopyPayload::SessionId(id))` for `Ctrl-X y`, a finished preview
+drag returns `Outcome::Copy(CopyPayload::Selection(text))` from the mouse arm,
+and the driver (`run_inner` → `start_copy`) reads the
 environment at that edge, picks the route (`tui::clipboard::clipboard_route`),
 and, when the route has a tool, starts `clipboard::spawn_tool_copy`: a detached
-worker thread per copy, like `Send`/`Interrupt`/`BgLaunch`. The worker pipes the id into each candidate tool's
+worker thread per copy, like `Send`/`Interrupt`/`BgLaunch`. The worker pipes the payload's text into each candidate tool's
 STDIN, with stdout and stderr `Stdio::null()` as `resume::open_url` nulls its
 opener's, so a tool can neither paint over the board nor hold open a pipe
 anything waits on. Exit 0 means copied and ends the walk; a missing tool, a
 failed stdin write or a non-zero exit moves on to the next candidate. It then
-delivers exactly ONE `AppEvent::CopyFinished { session_id, copied }`, and a tool
+delivers exactly ONE `AppEvent::CopyFinished { payload, copied }`, and a tool
 that hangs blocks only its own worker. The worker NEVER writes to the terminal.
 The OSC 52 fallback is written by `update::finish_copy` on the UI thread,
 between draws: at once from `start_copy` when the route has no tool, or when the
@@ -1077,9 +1095,9 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    the driver's. `Signal { pid }` carries a re-verified pid the same way; the driver
    sends it a SIGTERM inline rather than on a thread (see §6). Add a new effect
    this way, not by spawning or signalling inside the handler.
-   The `Ctrl-X y` copy is the same shape in two steps: the chord's
-   `handle_chord_key` returns `Outcome::Copy` (the full id) for the driver to
-   start, and `handle_event` turns the worker's `AppEvent::CopyFinished` into
+   The clipboard copy is the same shape in two steps: the chord's
+   `handle_chord_key` returns `Outcome::Copy` (the full id) — and a finished
+   preview drag returns it with the selected text — for the driver to start, and `handle_event` turns the worker's `AppEvent::CopyFinished` into
    `Outcome::FinishCopy` rather than finishing it itself, because its OSC 52
    fallback is a terminal write only the driver may make (§6).
    Which of the two shapes a new action takes is decided by the CHILD, not by what
@@ -1126,11 +1144,19 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    straight back to the untouched draft, with no state saved or restored.
    `App::overlay_active` (`modal.is_some() || compose.is_some() ||
    draft.is_some() || pending_stop.is_some() || pending_interrupt.is_some() ||
-   pending_chord`) gates the mouse's two actions — toggling a fold node and
-   opening a preview link — so neither fires while any is up. A mouse wheel is
-   handled **before** and **independent of** that gate: it never routes into an
-   overlay handler, it only scrolls a pane. A new keyboard owner must be added to
-   `overlay_active` too, or the mouse will act underneath it.
+   pending_chord`) gates the mouse's three actions over the preview — toggling a
+   fold node, opening a preview link, and starting a preview drag-select — so
+   none fires while any is up. All three begin from a left PRESS the one gate
+   (`update::press_starts_selection`) admits; the press only RECORDS where it
+   landed, and the RELEASE resolves it — a drag selects and copies, a plain click
+   toggles the fold under the press, else opens the link there — so a press the
+   gate refuses leaves its release nothing to act on. A mouse
+   wheel is handled **before** and **independent of** that gate: it never routes
+   into an overlay handler, it only scrolls a pane, and it (like any keypress)
+   clears an active preview text selection first, since scrolling changes what
+   the selection's absolute cells sit over. A new
+   keyboard owner must be added to `overlay_active` too, or the mouse will act
+   underneath it.
 
    The wheel takes exactly ONE condition, and `update::wheel_target` owns it as a
    parameter (`composing`) the way `key_to_action` owns its own. It hit-tests
@@ -1174,7 +1200,8 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    `draft` is the one arm that is not a keyboard owner: it owns the **pane**. While
    the new-session draft card is drawn the transcript is not, so the cached link
    AND fold regions describe text no longer on screen, and a click would open a
-   link or toggle a fold in a session the user cannot see. It outlives the
+   link or toggle a fold in a session the user cannot see, while a drag would
+   select the placeholder card rather than any transcript. It outlives the
    compose editor by AT MOST one in-flight launch, which is the window nothing
    else covers — so a pane owner
    earns an arm here for the same reason a keyboard owner does. "At most" is the
@@ -1343,8 +1370,9 @@ surface.
 
 Some confirmations are deliberately sticky (`set_status`) all the same:
 
-- **The `Ctrl-X y` copy's line, on BOTH routes.** `update::finish_copy` makes
-  one `set_status` call for whichever route ran, and says why above it:
+- **The `Ctrl-X y` copy's line, on BOTH routes.** `update::finish_copy` sets it
+  with `set_status` for whichever route ran (`copy_status_is_sticky` answers true
+  for a `CopyPayload::SessionId`, and its doc comment says why):
   `Copied session ID <uuid>` when a clipboard tool exited 0, and the OSC 52
   path's `osc52_sent_status` line (`Sent session ID <uuid> …`), which never says
   "Copied". The line reports which route ACTUALLY ran, which the user cannot see
@@ -1359,14 +1387,40 @@ Some confirmations are deliberately sticky (`set_status`) all the same:
   SINGLE delete says nothing at all: the row leaving the board is the message.
 
 Both still clear on the next actionable keypress like any sticky status. Do not
-"fix" either to `set_status_transient`. A new confirmation earns stickiness only
-by the same kind of argument: the user has to act on the text itself, or the line
-carries a failure or refusal beside the success.
+"fix" either to `set_status_transient`.
+
+The preview **drag-selection copy** is decided the other way, on purpose, although
+it goes through the very same `finish_copy` and clipboard path: its line —
+`Copied selection (N lines)` from a tool, `Sent selection (N lines) …` from the
+OSC 52 fallback — is TRANSIENT on both routes (`copy_status_is_sticky` answers
+false for a `CopyPayload::Selection`, and a test pins it). The `Ctrl-X y` reasons
+do not carry over. The id line sticks because the user may have to act on its
+TEXT — select the full id by hand when the terminal drops the escape — and a
+selection's line carries no text to act on: it names only a row count, since a
+multi-row selection cannot fit the one help row. The fallback's fallback is a
+native Shift/Option selection of the transcript itself, which is still on screen
+and still highlighted in the pane. Nor does the line carry a failure or a refusal.
+The route it names is read the moment the button comes up, while the user is
+looking at the board, so the dwell is enough; and a sticky line would park on the
+keymap row after EVERY drag until a key was pressed, which a reader working with
+the mouse alone may never do.
+
+A drag over blank cells alone gets NO line at all, and that is not a missing
+nudge. It selects no drawn text, so the view records `None`, the release requests
+no copy, and there is no outcome to report — the clipboard is untouched and
+nothing is highlighted, which the user can already see. Do not add a status for it.
+
+A new confirmation earns stickiness only by the same kind of argument: the user
+has to act on the text itself, or the line carries a failure or refusal beside the
+success.
 
 **A MOUSE click is scoped like a keypress, and which kind it is depends on WHAT it
 resolved to.** `update::note_link_click` is the instance, and it is the ONE place a
 preview-link click's four outcomes are mapped to status treatment — a single site, so
-each is decided once and any of them can be re-decided without hunting:
+each is decided once and any of them can be re-decided without hunting. It runs on
+the click's RELEASE (`update::click_effect`), never on the press: a press only
+records where it landed, and a press that became a drag resolves no link at all,
+so it says nothing here.
 
 | `LinkClick` | Status | Why |
 | --- | --- | --- |
@@ -1453,7 +1507,11 @@ Tests are **inline** `#[cfg(test)] mod tests` at the bottom of each source file
   `tui::start_copy` take the tool list as a parameter, so a test hands in a
   harmless stand-in (`sh`, `cat`, `false`), and the OSC 52 fallback reaches a
   `Vec<u8>` through the `Write`-generic `update::finish_copy`, never the test
-  run's terminal.
+  run's terminal. No browser opens either: a link click is decided by the pure
+  `update::mouse_effect`, which RETURNS the url a release would open
+  (`MouseEffect::OpenLink`) instead of handing it to `resume::open_url` — only
+  the thin `handle_mouse` does that — so a test presses and releases over a real
+  drawn link and asserts the url.
 - **Assert structure, not styling**: preview tests flatten `Text` to plain
   strings to check markers, and separately assert `Style`/`Modifier` on specific
   spans.

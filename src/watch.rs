@@ -239,22 +239,24 @@ pub enum AppEvent {
         /// downgrade is never auto-dismissed.
         success: bool,
     },
-    /// A one-shot `Ctrl-X y` clipboard-tool copy finished (`pbcopy`, `wl-copy`,
-    /// `xclip` or `xsel`, with the id on its stdin), delivered OFF the UI thread by
-    /// the detached copy worker (see [`crate::tui::clipboard::spawn_tool_copy`]).
+    /// A one-shot clipboard-tool copy finished (`pbcopy`, `wl-copy`, `xclip` or
+    /// `xsel`, with the payload's text on its stdin) — a `Ctrl-X y` session id or a
+    /// preview drag-selection — delivered OFF the UI thread by the detached copy
+    /// worker (see [`crate::tui::clipboard::spawn_tool_copy`]).
     ///
     /// Like [`SendFinished`](Self::SendFinished) it fires EXACTLY ONCE per copy,
     /// from a thread spawned for that one copy. It carries a RESULT rather than a
     /// status, because completing it is not the update loop's alone: when no tool
-    /// copied the id, the OSC 52 fallback still has to be WRITTEN, and only the
+    /// copied the text, the OSC 52 fallback still has to be WRITTEN, and only the
     /// driver holds the terminal's writer. The update loop therefore hands it back
     /// to the driver as [`crate::tui::update::Outcome::FinishCopy`].
     CopyFinished {
-        /// The authoritative full `sessionId` the copy targeted — what the status
-        /// echoes, and what the OSC 52 fallback carries.
-        session_id: String,
-        /// Whether a clipboard tool exited 0 with the whole id on its stdin.
-        /// `false` when every candidate was missing, failed to take the id, or
+        /// What the copy carried — the text, and whether it was a session id or a
+        /// preview selection. The status names which, and the OSC 52 fallback
+        /// carries the text.
+        payload: CopyPayload,
+        /// Whether a clipboard tool exited 0 with the whole text on its stdin.
+        /// `false` when every candidate was missing, failed to take the text, or
         /// exited non-zero.
         copied: bool,
     },
@@ -295,6 +297,33 @@ pub enum AppEvent {
     SettingsModel(claude_settings::ModelDefaults),
     /// A periodic wake-up. The update loop does nothing costly on this.
     Tick,
+}
+
+/// What one clipboard copy carries: the TEXT to place on the clipboard, and what
+/// that text IS — which the board's status line names, since "Copied session ID
+/// <uuid>" and "Copied selection (3 lines)" report different things.
+///
+/// Both kinds travel the ONE copy path: `tui::update::Outcome::Copy` → the
+/// clipboard tool worker or the OSC 52 fallback (`tui::clipboard`) →
+/// [`AppEvent::CopyFinished`] → `tui::update::finish_copy`. Declared here, beside
+/// the event that carries it, so this module never imports the TUI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopyPayload {
+    /// `Ctrl-X y`: the selected session's FULL `sessionId`.
+    SessionId(String),
+    /// A mouse drag over the preview transcript: the selected cells' text, one
+    /// screen row per line, joined by `\n`.
+    Selection(String),
+}
+
+impl CopyPayload {
+    /// The text to place on the clipboard, whichever kind this is.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        match self {
+            Self::SessionId(text) | Self::Selection(text) => text,
+        }
+    }
 }
 
 /// Classification of a single watcher path relative to the store root.
@@ -2109,6 +2138,21 @@ mod tests {
         if let Some(far) = UNIX_EPOCH.checked_add(past_i64) {
             assert_eq!(epoch_ms(far), None, "past i64 millis must not wrap");
         }
+    }
+
+    // --- CopyPayload (pure) ---
+
+    /// Either kind hands the clipboard its OWN text, verbatim — a selection's
+    /// newlines included — and never the other kind's.
+    #[test]
+    fn a_copy_payload_hands_over_its_own_text_verbatim() {
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        assert_eq!(CopyPayload::SessionId(id.to_string()).text(), id);
+        let selected = "first row\n\nthird row";
+        assert_eq!(
+            CopyPayload::Selection(selected.to_string()).text(),
+            selected
+        );
     }
 
     // --- agents_poll_due tests (pure, no filesystem) ---
