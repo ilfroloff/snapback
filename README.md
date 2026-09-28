@@ -123,8 +123,9 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | `Ctrl-T` / `Ctrl-E`, `Home` / `End` | Jump the preview to the top / bottom (on a MacBook keyboard without dedicated `Home`/`End` keys, `fn+←` / `fn+→` reach the same two) |
 | `Shift-↑` / `Shift-↓` | Walk the preview through the lines your query marks — previous / next. Only bound while something IS marked in the previewed transcript; with nothing marked they stay plain **move the selection**, so they never take a key away from you (and a terminal that swallows the modifier still moves). One stop per marked **line**, not per occurrence: a line saying your query twice is marked twice and stopped at once |
 | mouse wheel | Scroll the pane under the pointer — except while a compose or draft box is open, when the session list stops taking notches: a wheel over it does **nothing**, so the session you are writing to can never slide out from under you. Everywhere else it is unchanged, and a notch anywhere but the list still scrolls the transcript |
-| click a preview link | Open its url in your browser — `http`/`https` only. A link of any other scheme opens **nothing** and instead reports a refusal on the status line that names the link (`not opening <url> - only http/https links open`), so an underlined label that quietly does nothing never leaves you guessing which of the two happened. That refusal is **sticky** — it stays up until your next actionable keypress |
-| click a folded node | Unfold it where it sits, and click it again to fold it back. Two kinds of turn arrive folded to one line: a subagent's hand-back — the `◆ message from @…` node, otherwise ~95 rows of `<agent-message>` frame attributed to **you** — and context Claude Code added on your behalf, such as the instructions a skill or slash command expands into — the `◇ added by claude code` node, otherwise often thousands of rows, also attributed to **you**. Folded each costs one line, and its text is still one click away. Which nodes you left open is remembered for this run only — snapback writes nothing for it |
+| drag inside the preview | Select transcript text (in reading order, like your terminal's own selection, but only the transcript's drawn text — never the empty space right of a line, and never the session list beside it) and copy it to the clipboard when you let go. A drag over empty space alone copies nothing. A drag that starts on a link or a folded node selects it rather than opening or unfolding it. Not while a reply or draft box is open, and never from the pinned row at the top of the pane |
+| click a preview link | Open its url in your browser — when you let go, so a drag that starts on a link selects it instead. `http`/`https` only: a link of any other scheme opens **nothing** and instead reports a refusal on the status line that names the link (`not opening <url> - only http/https links open`), so an underlined label that quietly does nothing never leaves you guessing which of the two happened. That refusal is **sticky** — it stays up until your next actionable keypress |
+| click a folded node | Unfold it where it sits — when you let go, like a link — and click it again to fold it back. Two kinds of turn arrive folded to one line: a subagent's hand-back — the `◆ message from @…` node, otherwise ~95 rows of `<agent-message>` frame attributed to **you** — and context Claude Code added on your behalf, such as the instructions a skill or slash command expands into — the `◇ added by claude code` node, otherwise often thousands of rows, also attributed to **you**. Folded each costs one line, and its text is still one click away. Which nodes you left open is remembered for this run only — snapback writes nothing for it |
 | `Backspace` | Delete the last query character |
 | `Alt+Backspace` (`⌥⌫`) / `Ctrl-W` / `Alt+H` | Delete the last query **word** — one whole search term, so a path or a branch name goes in a single press instead of character by character (`Backspace` alone still takes one character). All three keys do the same thing, because which of them your terminal actually sends depends on how it treats **Option**; they are also the same three the reply and draft boxes word-delete on, so the gesture is bound wherever you type. What a press *cuts* differs on purpose: on the board it takes a whole search term, so `feature/fold-fork-lineages` goes in one press, while in a reply or draft box the cut stops at punctuation and takes only `lineages` |
 | any printable char | Type to search |
@@ -140,9 +141,20 @@ escape, which reaches your clipboard only if the terminal — and tmux, via
 `Sent session ID …`, never `Copied`. Either way the full id stays on the status
 line until your next key, so you can select it by hand.
 
-Mouse mode is on so the wheel can scroll and a preview link can be clicked; to
-select/copy text natively, hold **Shift** (or **Option/⌥** on iTerm2 and macOS
-Terminal). The header shows the active scope, the search mode, and a
+Mouse mode is on so the wheel can scroll, a preview link can be clicked open and
+a folded node clicked to unfold — each click acting when you let go, since only
+then is it a click rather than the start of a drag.
+**Drag inside the preview** to select transcript text — the selection is
+reverse-videoed and copied to your clipboard on release, the same way `Ctrl-X y`
+copies: through your OS clipboard tool, or over SSH as an OSC 52 escape. Only
+drawn text is selected, the way an editor highlights: each line stops at its last
+character rather than running to the pane's edge, and a drag over empty space
+alone selects nothing and leaves your clipboard as it was. The
+status line briefly says `Copied selection (N lines)`, or `Sent selection …`
+when it went out as OSC 52. To select across both panes, or if your terminal
+ignores OSC 52, hold **Shift** (or **Option/⌥** on iTerm2 and macOS Terminal)
+for a native selection instead. The
+header shows the active scope, the search mode, and a
 `shown / total` count, with a version on the right — a release build shows the
 version number, a local dev build is marked as such.
 
@@ -674,6 +686,7 @@ line — it is that agent's report, not something you said — and context Claud
 Code added on your behalf (the instructions a skill or slash command expands
 into, a command's caveat) to a single `◇ added by claude code` line; either opens
 where it sits on a click.
+Dragging over the transcript selects and copies just the transcript text.
 `Shift-←` / `Shift-→` step through five fixed layouts, from the preview filling
 the screen to the list filling it, so a long transcript can take the whole width
 and a long list of sessions can too.

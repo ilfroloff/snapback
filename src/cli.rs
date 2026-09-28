@@ -106,11 +106,20 @@ KEYS:
                   Only while something is marked there — with nothing marked they
                   stay plain move, so they never take a key away from you. One
                   stop per marked line, not per repeated word
-    wheel         scroll preview / list (mouse mode on; hold Shift/Option to
-                  select). While a compose or draft box is open the list stops
-                  taking notches — a wheel over it does nothing, so the session
-                  you are writing to cannot slide away under the pointer.
-                  Anywhere else the wheel still scrolls the transcript
+    wheel         scroll preview / list (mouse mode on). While a compose or draft
+                  box is open the list stops taking notches — a wheel over it
+                  does nothing, so the session you are writing to cannot slide
+                  away under the pointer. Anywhere else the wheel still scrolls
+                  the transcript
+    click         in the preview, on release: a folded node (a subagent's
+                  hand-back, or context claude added) unfolds, and a second click
+                  folds it back; otherwise a link opens (http/https only)
+    drag          in the preview: select transcript text; on release it is
+                  copied the way Ctrl-X y copies (your clipboard tool, or OSC 52
+                  over SSH). A drag that starts on a node or a link selects it
+                  rather than unfolding or opening it. Off while a compose or
+                  draft box is open. Hold Shift/Option for your terminal's own
+                  selection instead
     Backspace     delete the last query character
     Alt+Backspace delete the last query WORD — one whole search atom, so a
                   path or a branch name goes in one press. Ctrl-W and Alt+H do

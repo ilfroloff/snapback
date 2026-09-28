@@ -1,7 +1,12 @@
-//! System-clipboard copy for `Ctrl-X y`: the OS clipboard TOOL first, a write-only
-//! OSC 52 escape as the fallback.
+//! System-clipboard copy for `Ctrl-X y` and for a preview drag-selection: the OS
+//! clipboard TOOL first, a write-only OSC 52 escape as the fallback.
 //!
-//! Why two routes. OSC 52 hands the id to the TERMINAL and hopes: some terminals
+//! Both copies are ONE path. What is copied arrives as a
+//! [`CopyPayload`](crate::watch::CopyPayload) — a session id or the selected
+//! transcript text — and every part below is indifferent to which: it moves the
+//! payload's text, and only the status line (`update::finish_copy`) names the kind.
+//!
+//! Why two routes. OSC 52 hands the text to the TERMINAL and hopes: some terminals
 //! drop it silently (RustRover's JediTerm has no OSC 52 handler at all), and the
 //! write-only discipline forbids asking whether it landed. A local clipboard tool
 //! reports an exit code instead, so the board's status can say what actually
@@ -19,15 +24,16 @@
 //! - ONE thin environment edge ([`ClipboardEnv::from_env`]), the only place the
 //!   route reads the environment;
 //! - a THREADED tool copy ([`spawn_tool_copy`]): the `tui::run_inner` driver starts
-//!   it for `update::Outcome::Copy`, it pipes the id into each candidate on its OWN
-//!   thread, and reports exactly one `AppEvent::CopyFinished`. It never touches the
-//!   terminal;
+//!   it for `update::Outcome::Copy`, it pipes the text into each candidate on its
+//!   OWN thread, and reports exactly one `AppEvent::CopyFinished`. It never touches
+//!   the terminal;
 //! - the OSC 52 fallback: a PURE, unit-tested encoder core ([`base64_encode`] →
 //!   [`osc52_clipboard_sequence`]) and a THIN `Write`-generic writer
-//!   ([`copy_to_clipboard`]). Its one runtime caller is `update::finish_copy`,
-//!   which the driver runs on the UI thread, between draws, with `io::stdout()` —
-//!   at once when the route has no tool, or when a `CopyFinished` reports that no
-//!   tool copied the id. The escape is never queried back.
+//!   ([`copy_to_clipboard`]) — the crate's ONLY OSC 52 encoder and its only
+//!   writer. Its one runtime caller is `update::finish_copy`, which the driver runs
+//!   on the UI thread, between draws, with `io::stdout()` — at once when the route
+//!   has no tool, or when a `CopyFinished` reports that no tool copied the text.
+//!   The escape is never queried back.
 //!
 //! No new dependency: base64 is hand-inlined here (see [`base64_encode`]) rather
 //! than pulling `base64` into `[dependencies]`, and the tools are plain
@@ -36,15 +42,15 @@
 //! hand-rolled markdown pass in `store::preview` and the hand-parsed agent
 //! frontmatter make the same call).
 //!
-//! Every item here is reachable from the driver's `Ctrl-X y` path, so none of them
-//! needs a `#[allow(dead_code)]`.
+//! Every item here is reachable from the driver's copy path, so none of them needs
+//! a `#[allow(dead_code)]`.
 
 use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
 
-use crate::watch::AppEvent;
+use crate::watch::{AppEvent, CopyPayload};
 
 /// Set by OpenSSH's `sshd` in every session it serves. Its presence means snapback
 /// runs on the REMOTE end of an SSH login, where a local clipboard tool would fill
@@ -66,8 +72,9 @@ const WAYLAND_DISPLAY_VAR: &str = "WAYLAND_DISPLAY";
 /// then `xsel`) when no Wayland display is present.
 const DISPLAY_VAR: &str = "DISPLAY";
 
-/// One clipboard-tool invocation: the program and its fixed argv. The id always
-/// travels on the child's STDIN, never as an argument, so no id ever needs quoting.
+/// One clipboard-tool invocation: the program and its fixed argv. The text always
+/// travels on the child's STDIN, never as an argument, so no text ever needs
+/// quoting — a multi-line selection included.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClipboardTool {
     /// Program name, resolved on `PATH` by [`Command::new`].
@@ -86,7 +93,7 @@ const PBCOPY: ClipboardTool = ClipboardTool {
 
 /// wl-clipboard's writer for Wayland sessions. With no argument it copies stdin to
 /// the regular CLIPBOARD (the primary selection would need `--primary`) and leaves
-/// a small server behind, so the id stays pasteable after snapback exits.
+/// a small server behind, so the text stays pasteable after snapback exits.
 const WL_COPY: ClipboardTool = ClipboardTool {
     program: "wl-copy",
     args: &[],
@@ -94,7 +101,7 @@ const WL_COPY: ClipboardTool = ClipboardTool {
 
 /// `xclip` for X11 sessions. `-selection clipboard` targets the CLIPBOARD: xclip's
 /// default is PRIMARY (middle-click), which `Ctrl-V` never reads. It reads stdin by
-/// default and leaves a server behind that keeps serving the id after it exits.
+/// default and leaves a server behind that keeps serving the text after it exits.
 const XCLIP: ClipboardTool = ClipboardTool {
     program: "xclip",
     args: &["-selection", "clipboard"],
@@ -213,9 +220,10 @@ pub fn clipboard_route(env: ClipboardEnv) -> &'static [ClipboardTool] {
     }
 }
 
-/// Copy `session_id` with the first of `tools` that succeeds, on its OWN detached
-/// thread, and deliver exactly one [`AppEvent::CopyFinished`] when it is done — the
-/// UI thread never waits on a clipboard tool, even one that hangs.
+/// Copy `payload`'s text with the first of `tools` that succeeds, on its OWN
+/// detached thread, and deliver exactly one [`AppEvent::CopyFinished`] — carrying
+/// the payload back — when it is done. The UI thread never waits on a clipboard
+/// tool, even one that hangs.
 ///
 /// The one-shot shape of `send::spawn_send` (a thread per request, one completion
 /// event, a failed send ignored because the board went away), started from the
@@ -226,11 +234,15 @@ pub fn clipboard_route(env: ClipboardEnv) -> &'static [ClipboardTool] {
 ///
 /// `tools` is a parameter (the route [`clipboard_route`] picked) so a test can hand
 /// in a harmless stand-in instead of a real clipboard tool.
-pub fn spawn_tool_copy(tools: &'static [ClipboardTool], session_id: String, tx: Sender<AppEvent>) {
+pub fn spawn_tool_copy(
+    tools: &'static [ClipboardTool],
+    payload: CopyPayload,
+    tx: Sender<AppEvent>,
+) {
     std::thread::spawn(move || {
-        let copied = copy_with_tools(tools, &session_id);
+        let copied = copy_with_tools(tools, payload.text());
         // A send failure means the receiver (the board) has gone away; ignore it.
-        let _ = tx.send(AppEvent::CopyFinished { session_id, copied });
+        let _ = tx.send(AppEvent::CopyFinished { payload, copied });
     });
 }
 
@@ -240,8 +252,8 @@ fn copy_with_tools(tools: &[ClipboardTool], payload: &str) -> bool {
     tools.iter().any(|tool| run_tool(*tool, payload))
 }
 
-/// Run ONE clipboard tool with `payload` on its stdin; `true` only if the whole id
-/// reached its stdin AND it exited 0.
+/// Run ONE clipboard tool with `payload` on its stdin; `true` only if the whole
+/// text reached its stdin AND it exited 0.
 ///
 /// stdout and stderr are nulled, the way `resume::open_url` nulls its opener's: a
 /// tool can then never paint over the board, and a tool that leaves a server
@@ -286,8 +298,9 @@ const SIX_BIT_MASK: u32 = 0b11_1111;
 
 /// Encode `bytes` as standard-alphabet base64 with `=` padding.
 ///
-/// Inlined on purpose: `base64` is only a TRANSITIVE dependency, and a session
-/// id is a 36-byte UUID — promoting a crate to `[dependencies]` for ~20 lines of
+/// Inlined on purpose: `base64` is only a TRANSITIVE dependency, and the payloads
+/// are small — a 36-byte session UUID, or a selection no bigger than one screen of
+/// transcript — so promoting a crate to `[dependencies]` for ~20 lines of
 /// well-specified, fully-tested arithmetic fails YAGNI and the self-contained
 /// binary principle. So this is hand-rolled and pinned by RFC 4648 test vectors,
 /// exactly like the crate's other hand-rolled parsers.
@@ -342,8 +355,10 @@ const OSC_PARAM_SEPARATOR: u8 = b';';
 /// virtually every emulator accept for OSC 52, and some simpler terminals and
 /// multiplexers handle it more reliably than the two-byte `ST`. That trade-off
 /// matters because OSC 52 support is already uneven and this write is
-/// best-effort (the sticky status line carries the full id as the visible
-/// fallback), so we favor the terminator most likely to land over matching the
+/// best-effort (for `Ctrl-X y` the sticky status line carries the full id as the
+/// visible fallback; a selection stays highlighted in the pane, where a native
+/// Shift/Option selection can take it again), so we favor the terminator most
+/// likely to land over matching the
 /// module's `ST` idiom.
 const OSC_STRING_TERMINATOR: u8 = 0x07;
 
@@ -573,13 +588,13 @@ mod tests {
         const NOTHING_COPIES: &[ClipboardTool] = &[MISSING, FAILS];
         for (tools, copied) in [(COPIES, true), (NOTHING_COPIES, false)] {
             let (tx, rx) = mpsc::channel();
-            spawn_tool_copy(tools, ID.to_string(), tx);
+            spawn_tool_copy(tools, CopyPayload::SessionId(ID.to_string()), tx);
             match rx.recv_timeout(WORKER_TIMEOUT) {
                 Ok(AppEvent::CopyFinished {
-                    session_id,
+                    payload,
                     copied: got,
                 }) => {
-                    assert_eq!(session_id, ID);
+                    assert_eq!(payload, CopyPayload::SessionId(ID.to_string()));
                     assert_eq!(got, copied, "the result for {tools:?}");
                 }
                 other => panic!("expected one CopyFinished, got {other:?}"),
@@ -589,6 +604,53 @@ mod tests {
                 "exactly one event: the worker drops its sender once it reports"
             );
         }
+    }
+
+    /// A drag-SELECTION rides the same worker: its text — several rows and a
+    /// non-ASCII character — reaches the tool's stdin byte for byte, and the event
+    /// hands the SAME payload back, still a `Selection`, so the status can say what
+    /// was copied. The stand-in exits 0 only on the exact bytes, so a pass proves
+    /// the whole multi-line text travelled and nothing was trimmed or re-encoded.
+    #[test]
+    fn a_selection_travels_the_worker_whole_and_comes_back_as_a_selection() {
+        const ACCEPTS_SELECTION: ClipboardTool = ClipboardTool {
+            program: "sh",
+            args: &[
+                "-c",
+                "[ \"$(cat)\" = \"$(printf 'caf\\303\\251 row\\n\\nlast')\" ]",
+            ],
+        };
+        let text = "café row\n\nlast";
+        assert!(
+            run_tool(ACCEPTS_SELECTION, text),
+            "the stand-in must accept the exact selection bytes"
+        );
+        assert!(
+            !run_tool(ACCEPTS_SELECTION, "cafe row\n\nlast"),
+            "and must actually check them"
+        );
+
+        let (tx, rx) = mpsc::channel();
+        spawn_tool_copy(
+            &[ACCEPTS_SELECTION],
+            CopyPayload::Selection(text.to_string()),
+            tx,
+        );
+        match rx.recv_timeout(WORKER_TIMEOUT) {
+            Ok(AppEvent::CopyFinished { payload, copied }) => {
+                assert_eq!(payload, CopyPayload::Selection(text.to_string()));
+                assert!(copied, "the selection's text reached the tool whole");
+            }
+            other => panic!("expected one CopyFinished, got {other:?}"),
+        }
+    }
+
+    /// A selection is arbitrary UTF-8, not an ASCII UUID: the encoder takes its RAW
+    /// bytes (`é` is `0xC3 0xA9`), which is what a terminal decodes back.
+    #[test]
+    fn base64_encode_takes_the_raw_bytes_of_non_ascii_text() {
+        assert_eq!(base64_encode("é".as_bytes()), "w6k=");
+        assert_eq!(base64_encode("a\nb".as_bytes()), "YQpi");
     }
 
     /// RFC 4648 §10 test vectors — the canonical base64 conformance set, so this
