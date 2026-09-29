@@ -33,6 +33,11 @@
 //! way and keyed by its record `uuid`. It is tried AFTER the peer gate, because
 //! every hand-back also carries `isMeta`. See [`injected_node_lines`].
 //!
+//! An OPEN node of either kind draws its body DIM ([`FOLD_NODE_MODIFIER`]), so
+//! text nobody in this session typed recedes from — and reads as set apart from —
+//! the session's own `▶ you` / `● claude` turns. The node's header — its title —
+//! is NOT dimmed: it keeps its full-intensity Magenta, open or collapsed.
+//!
 //! Ahead of the markdown pass, each message BODY runs through an allowlist-driven
 //! control-wrapper collapse (`store::command::collapse_control_wrappers`, the
 //! parse shared with the content index and the label). Claude Code injects a
@@ -930,8 +935,10 @@ const PEER_HEADER_BLOCK_ROW: usize = 1;
 ///
 /// The body is the structural `origin.body`, preamble-stripped and dedented, run
 /// through the SAME [`collapse_body_lines_collect`] pass every other turn body
-/// takes, so a peer report styles and wraps exactly like a `▶ you` turn. Its link
-/// regions are block-relative and are rebased past the lines that lead the node.
+/// takes, so a peer report wraps exactly like a `▶ you` turn and keeps every style
+/// that pass gives it — then [`recede_fold_body`] dims it as a whole, so the open
+/// report reads as set apart from the turns around it. Its link regions are
+/// block-relative and are rebased past the lines that lead the node.
 ///
 /// Returns the node's [`FoldRegion`] alongside them — one per node that HAS a
 /// fold key, none for an [`Unfoldable`] one. PURE: `expanded` is read, never
@@ -969,7 +976,8 @@ fn peer_node_lines(
     // lines that lead the node, exactly as a `▶ you` turn rebases its own.
     let offset = lines.len();
     let body = dedent_uniformly(strip_handback_preamble(origin.body()));
-    let (body_lines, body_links) = collapse_body_lines_collect(&body, width);
+    let (mut body_lines, body_links) = collapse_body_lines_collect(&body, width);
+    recede_fold_body(&mut body_lines);
     lines.extend(body_lines);
     (lines, rebased(body_links, offset), folds)
 }
@@ -1015,7 +1023,8 @@ fn peer_header_line(
 // a `▶ you` turn that is a MISLABEL — nobody typed it — and, for a skill body, a
 // wall of instructions between the command the user did type and claude's reply.
 // This section folds such a record to a ONE-LINE node, reusing the peer node's
-// fold machinery (`PeerFold`, the header row, the affordances, one open set).
+// fold machinery (`PeerFold`, the header row, the affordances, one open set) and
+// its receded open body (`recede_fold_body`).
 //
 // Membership is `label::is_injected` — the SAME check the content index and the
 // label pick use, so the three cannot disagree about which records are
@@ -1063,7 +1072,9 @@ fn injected_style() -> Style {
 ///
 /// The shape is the peer node's exactly: header on [`PEER_HEADER_BLOCK_ROW`], the
 /// whole header line one [`FoldRegion`], none for an [`Unfoldable`] node, and the
-/// three [`PeerFold`] states with their affordances.
+/// three [`PeerFold`] states with their affordances. So is an open body's look: it
+/// recedes through the same [`recede_fold_body`], while the header keeps
+/// [`injected_style`].
 ///
 /// An open node's body is ALSO returned as one [`UnindexedRows`] run: the content
 /// index leaves injected records out, so the pane's search marks must too.
@@ -1105,7 +1116,8 @@ fn injected_node_lines(
         return (lines, Vec::new(), folds, Vec::new());
     }
     let offset = lines.len();
-    let (body_lines, body_links) = collapse_body_lines_collect(text, width);
+    let (mut body_lines, body_links) = collapse_body_lines_collect(text, width);
+    recede_fold_body(&mut body_lines);
     let unindexed = vec![UnindexedRows {
         content_row: offset,
         len: body_lines.len(),
@@ -1216,6 +1228,38 @@ fn peer_style() -> Style {
     Style::default()
         .fg(Color::Magenta)
         .add_modifier(Modifier::BOLD)
+}
+
+/// The modifier an OPEN fold node's BODY — a peer message ([`peer_node_lines`]) or
+/// injected context ([`injected_node_lines`]) — is drawn in, on every span.
+///
+/// Neither body is this session's own conversation — nobody at this keyboard typed
+/// it and claude did not answer with it — so it RECEDES, and the `▶ you` /
+/// `● claude` turns around it keep the reader's eye: an open hand-back report or
+/// skill body reads as set apart from the text flow rather than as more of it. DIM
+/// rather than a color because it has to COMPOSE onto the body: every style the
+/// markdown pass gave it (bold, italic, code, a link's underline, a list bullet, a
+/// table rule) survives and only the intensity drops — the restraint the preview's
+/// code, quotes and markers already use, and nothing a light terminal theme can
+/// erase.
+///
+/// The body ONLY. The node's header — its title — keeps its own full-intensity
+/// style ([`peer_style`], [`injected_style`]), so the line a reader scans for and
+/// clicks to fold never fades along with the content it opens. ONE constant for
+/// both kinds, so their bodies cannot drift apart.
+const FOLD_NODE_MODIFIER: Modifier = Modifier::DIM;
+
+/// Recede an OPEN fold node's body: compose [`FOLD_NODE_MODIFIER`] onto every
+/// span's existing style — never replacing it — so the markdown pass's styling
+/// survives and only the intensity drops.
+///
+/// Style only: no span's text changes, so no line's display width or wrap can
+/// move, and the body's link regions, the node's fold region and an injected
+/// body's unindexed run keep the rows and columns they were computed at.
+fn recede_fold_body(lines: &mut [Line<'static>]) {
+    for span in lines.iter_mut().flat_map(|line| line.spans.iter_mut()) {
+        span.style = span.style.add_modifier(FOLD_NODE_MODIFIER);
+    }
 }
 
 /// Secondary markers (`[tool_use: ...]` / `[tool_result]` / `[thinking]`).
@@ -3576,6 +3620,176 @@ mod tests {
         let indexed: Vec<bool> = (0..7).map(|i| rendered.is_indexed_line(i)).collect();
         assert_eq!(indexed, [true, true, true, false, false, true, true]);
         assert!(RenderedPreview::default().is_indexed_line(0));
+    }
+
+    // --- fold node styling ------------------------------------------------------
+
+    /// The first line of `text` whose leading span STARTS with `marker` — a fold
+    /// node's header, whose marker the peer node fuses with its sender.
+    fn node_header<'a>(text: &'a Text, marker: &str) -> &'a Line<'a> {
+        text.lines
+            .iter()
+            .find(|l| {
+                l.spans
+                    .first()
+                    .is_some_and(|s| s.content.starts_with(marker))
+            })
+            .unwrap_or_else(|| panic!("no `{marker}` node header"))
+    }
+
+    /// A fold node's TITLE is never dimmed — only an open body recedes. For both
+    /// kinds, the header's marker span keeps its full intensity and its Magenta
+    /// family cue; the peer title is BOLD and the injected one is not, so the
+    /// harness's own context still reads quieter than another agent's message.
+    #[test]
+    fn fold_node_titles_are_undimmed_magenta_and_only_the_peer_title_is_bold() {
+        let peer = render_file(&fixture(PEER_FOLDER, "sess-peer-handback-1.jsonl"), WIDE);
+        let injected = render_file(&command_fixture(), WIDE);
+
+        for (text, marker, bold) in [
+            (&peer, PEER_MARKER, true),
+            (&injected, INJECTED_MARKER, false),
+        ] {
+            let header = node_header(text, marker);
+            let plain: String = header.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(
+                plain.ends_with(PEER_EXPAND_AFFORDANCE),
+                "the node must be collapsed, or this pins the wrong shape: {plain}"
+            );
+            let title = header.spans[0].style;
+            assert!(
+                !title.add_modifier.contains(Modifier::DIM),
+                "the `{marker}` title is not dimmed: {title:?}"
+            );
+            assert_eq!(
+                title.fg,
+                Some(Color::Magenta),
+                "`{marker}` keeps its family color"
+            );
+            assert_eq!(
+                title.add_modifier.contains(Modifier::BOLD),
+                bold,
+                "`{marker}` title bold should be {bold}: {title:?}"
+            );
+        }
+    }
+
+    /// An OPEN node's body recedes — every span DIM — while its title above it
+    /// does not, and the markdown pass's own styling survives beneath the dim: a
+    /// `**bold**` word stays BOLD and a link keeps its UNDERLINE. Style only: the
+    /// body's text is byte-identical to the plain body pass, so no wrap, column or
+    /// region can move. Pinned for BOTH kinds, since each renders its own body.
+    #[test]
+    fn an_open_fold_nodes_body_is_dim_and_keeps_its_markdown_styling() {
+        const BODY: &str = "The **retry** backoff now applies per attempt; see [the PR](https://example.com/pr/1).";
+        const INJECTED_UUID_KEY: &str = "injected:dim-body-1";
+
+        let peer = peer_record(serde_json::json!({
+            "kind": "peer",
+            "from": PEER_STEM,
+            "body": BODY,
+        }));
+        let injected = serde_json::json!({
+            "type": "user", "isMeta": true, "uuid": "dim-body-1",
+            "timestamp": "2026-08-20T14:15:00.000Z",
+            "message": {"content": BODY}
+        });
+        let open: HashSet<&str> = [PEER_STEM, INJECTED_UUID_KEY].into_iter().collect();
+        let origin = peer_origin(&peer).expect("gate admits the record");
+        let (peer_lines, _, _) = peer_node_lines(&origin, &open, &peer, &mut None, WIDE);
+        let (injected_lines, _, _, _) =
+            injected_node_lines(BODY, &open, &injected, &mut None, WIDE);
+
+        let plain_body = flatten(&Text::from(collapse_body_lines(BODY, WIDE)));
+        for (kind, lines) in [("peer", peer_lines), ("injected", injected_lines)] {
+            let header = &lines[PEER_HEADER_BLOCK_ROW];
+            assert!(
+                header
+                    .spans
+                    .last()
+                    .is_some_and(|s| s.content.ends_with(PEER_COLLAPSE_AFFORDANCE)),
+                "{kind}: the node must be open, or this pins nothing: {header:?}"
+            );
+            assert!(
+                !header.spans[0].style.add_modifier.contains(Modifier::DIM),
+                "{kind}: an open node's title is not dimmed with its body: {:?}",
+                header.spans[0].style
+            );
+
+            let body = &lines[PEER_HEADER_BLOCK_ROW + 1..];
+            assert_eq!(
+                flatten(&Text::from(body.to_vec())),
+                plain_body,
+                "{kind}: dimming is style only — the body's text must not change"
+            );
+            let spans: Vec<&Span> = body.iter().flat_map(|l| l.spans.iter()).collect();
+            assert!(!spans.is_empty(), "{kind}: an open node renders its body");
+            assert!(
+                spans
+                    .iter()
+                    .all(|s| s.style.add_modifier.contains(Modifier::DIM)),
+                "{kind}: every body span is dim: {spans:?}"
+            );
+            let style_of = |needle: &str| {
+                spans
+                    .iter()
+                    .find(|s| s.content.as_ref() == needle)
+                    .unwrap_or_else(|| panic!("{kind}: no `{needle}` span in {spans:?}"))
+                    .style
+            };
+            assert!(
+                style_of("retry").add_modifier.contains(Modifier::BOLD),
+                "{kind}: a bold word keeps BOLD beneath the dim"
+            );
+            assert!(
+                style_of("the PR")
+                    .add_modifier
+                    .contains(Modifier::UNDERLINED),
+                "{kind}: a link keeps its underline beneath the dim"
+            );
+        }
+    }
+
+    /// The recede belongs to the NODE alone: beside an OPEN peer node, the
+    /// session's own `▶ you` prompt above it and claude's reply below it render
+    /// at full intensity, and the `▶ you` head keeps its BOLD.
+    #[test]
+    fn turns_around_an_open_fold_node_are_not_dimmed() {
+        let rendered = render_file_expanded(
+            &fixture(PEER_FOLDER, "sess-peer-handback-1.jsonl"),
+            WIDE,
+            &[PEER_STEM],
+        );
+        assert!(
+            flatten(&rendered.text).contains("webhook retry backoff is fixed"),
+            "the node must be open, or this proves nothing"
+        );
+
+        for said in [
+            "Delegate the retry backoff fix",
+            "The backoff fix landed; both callers share it.",
+        ] {
+            let line = rendered
+                .text
+                .lines
+                .iter()
+                .find(|l| l.spans.iter().any(|s| s.content.contains(said)))
+                .unwrap_or_else(|| panic!("no line saying `{said}`"));
+            assert!(
+                line.spans
+                    .iter()
+                    .all(|s| !s.style.add_modifier.contains(Modifier::DIM)),
+                "an ordinary turn body is never dimmed: {:?}",
+                line.spans
+            );
+        }
+        let you = line_led_by(&rendered.text, YOU_MARKER).expect("the typed prompt renders");
+        assert!(
+            you.spans[0].style.add_modifier.contains(Modifier::BOLD)
+                && !you.spans[0].style.add_modifier.contains(Modifier::DIM),
+            "the `▶ you` head stays bold and undimmed: {:?}",
+            you.spans[0].style
+        );
     }
 
     #[test]
