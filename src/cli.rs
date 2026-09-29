@@ -120,6 +120,11 @@ KEYS:
                   rather than unfolding or opening it. Off while a compose or
                   draft box is open. Hold Shift/Option for your terminal's own
                   selection instead
+    double-click  in the preview: select the word under the pointer and copy it
+                  on release, the same way a drag copies (two clicks on one
+                  cell within half a second). The first click still unfolds a
+                  node or opens a link; the second only selects, so a node
+                  double-clicked stays open
     Backspace     delete the last query character
     Alt+Backspace delete the last query WORD — one whole search atom, so a
                   path or a branch name goes in one press. Ctrl-W and Alt+H do

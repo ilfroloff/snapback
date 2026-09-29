@@ -14,6 +14,7 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use ratatui::layout::{Position, Rect};
 use ratatui::text::Line;
@@ -572,6 +573,11 @@ impl NewSessionDraft {
 /// any change to what sits under those cells (a scroll, a new selection, a reload
 /// that re-read the previewed transcript or moved the selection, any keypress)
 /// clears it (see [`App::clear_preview_selection`]).
+///
+/// A DOUBLE-CLICK records a [`SelectionUnit::Word`] selection instead: `anchor` and
+/// `cursor` are both the clicked cell, and the view expands it to the UAX #29 word
+/// under that cell on the drawn row (one run, blank words select nothing).
+/// Highlight and copy walk that run exactly as they walk a drag's runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PreviewSelection {
     /// Cell the drag began on (the button-down position, always inside the
@@ -579,6 +585,29 @@ pub struct PreviewSelection {
     pub anchor: Position,
     /// Latest dragged-to cell, clamped into the transcript rect.
     pub cursor: Position,
+    /// How `anchor`/`cursor` are read: a flowing character range (a drag) or the
+    /// one word under `anchor` (a double-click).
+    pub unit: SelectionUnit,
+}
+
+/// The granularity a [`PreviewSelection`] is read at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionUnit {
+    /// The flowing character range between `anchor` and `cursor` — a drag.
+    Chars,
+    /// The UAX #29 word under `anchor` — a double-click.
+    Word,
+}
+
+/// The last left press the selection gate admitted: where and when, so the next
+/// press can be told apart as a double-click (`update::is_double_click`). Cleared
+/// by [`App::clear_preview_selection`] and by any press that became a drag — but
+/// NOT by a fold toggle, which is the first click's own effect
+/// (see [`App::drop_preview_selection`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClickRecord {
+    pub pos: Position,
+    pub at: Instant,
 }
 
 /// A titled, centered prompt with N labelled choices and a wrapping-cycle
@@ -1767,6 +1796,9 @@ pub struct App {
     ///
     /// [`extend_preview_selection`]: Self::extend_preview_selection
     preview_press: Option<Position>,
+    /// The previous admitted left press, for double-click timing. See
+    /// [`ClickRecord`]; `None` at rest.
+    last_click: Option<ClickRecord>,
     /// The text under [`preview_selection`](Self::preview_selection) exactly as the
     /// LAST frame drew it, or `None` with no selection or one over blank cells
     /// alone (a `None` the release turns into no copy). Written by the view every
@@ -2300,6 +2332,7 @@ impl App {
             preview_rect: Rect::default(),
             preview_selection: None,
             preview_press: None,
+            last_click: None,
             preview_selection_text: None,
             status: None,
             status_ttl: None,
@@ -3088,11 +3121,47 @@ impl App {
             return;
         };
         let cursor = clamp_to_rect(cursor, transcript);
-        self.preview_selection = if cursor == anchor {
-            None
-        } else {
-            Some(PreviewSelection { anchor, cursor })
-        };
+        if cursor != anchor {
+            // A real drag: a character selection from the press cell, and the
+            // press no longer counts as a first click.
+            self.last_click = None;
+            self.preview_selection = Some(PreviewSelection {
+                anchor,
+                cursor,
+                unit: SelectionUnit::Chars,
+            });
+        } else if !self
+            .preview_selection
+            .is_some_and(|s| s.unit == SelectionUnit::Word)
+        {
+            // Back on the anchor: nothing selected — except a double-click's word,
+            // which a zero-length drag must not erase.
+            self.preview_selection = None;
+        }
+    }
+
+    /// The previous admitted press, for the pure double-click decision.
+    #[must_use]
+    pub fn last_click(&self) -> Option<ClickRecord> {
+        self.last_click
+    }
+
+    /// Record an admitted press at `pos` at time `now` as the chain's latest click.
+    pub fn note_click(&mut self, pos: Position, now: Instant) {
+        self.last_click = Some(ClickRecord { pos, at: now });
+    }
+
+    /// A double-click at `pos`: select the word under that cell. Holds the press
+    /// too, so the release reads the selection through the same path a drag's does
+    /// (`take_preview_press` -> `has_preview_selection` -> the drawn text).
+    pub fn begin_word_selection(&mut self, pos: Position) {
+        self.preview_selection = Some(PreviewSelection {
+            anchor: pos,
+            cursor: pos,
+            unit: SelectionUnit::Word,
+        });
+        self.preview_selection_text = None;
+        self.preview_press = Some(pos);
     }
 
     /// Take the active press on button-up. `Some(pos)` is the original press
@@ -3131,14 +3200,32 @@ impl App {
         self.preview_selection_text.as_deref()
     }
 
-    /// Clear any preview selection and in-progress press. Called whenever the
-    /// preview's content or scroll could change under an ABSOLUTE-cell selection
-    /// and leave a stale highlight — any keypress, a wheel scroll, a new press, a
-    /// fold node toggled open or closed
-    /// ([`toggle_peer_fold`](Self::toggle_peer_fold)), or a store reload that
-    /// re-read the previewed transcript or moved the selection
-    /// ([`apply_reload`](Self::apply_reload) decides which).
+    /// Clear any preview selection and in-progress press, AND reset the
+    /// double-click chain ([`ClickRecord`]). Called whenever the preview's content
+    /// or scroll could change under an ABSOLUTE-cell selection and leave a stale
+    /// highlight — any keypress, a wheel scroll, or a store reload that re-read the
+    /// previewed transcript or moved the selection
+    /// ([`apply_reload`](Self::apply_reload) decides which). A fold node toggled
+    /// open or closed drops the selection WITHOUT the chain reset
+    /// ([`drop_preview_selection`](Self::drop_preview_selection) owns why).
     pub fn clear_preview_selection(&mut self) {
+        self.drop_preview_selection();
+        self.last_click = None;
+    }
+
+    /// Drop the preview selection, the in-progress press and the text the last
+    /// frame drew under the selection — everything
+    /// [`clear_preview_selection`](Self::clear_preview_selection) clears EXCEPT the
+    /// double-click chain ([`ClickRecord`]).
+    ///
+    /// Its one other caller is [`toggle_peer_fold`](Self::toggle_peer_fold). A
+    /// toggle IS a click's own effect — the release of a plain click on a node
+    /// header — and it keeps that header on the row it was clicked on, so the
+    /// second press of a double-click lands on the same header and must still find
+    /// the chain: that press selects the word under it and toggles nothing. A chain
+    /// reset here would read it as a fresh click instead, and a double-click on a
+    /// header would open the node and shut it again.
+    fn drop_preview_selection(&mut self) {
         self.preview_selection = None;
         self.preview_press = None;
         self.preview_selection_text = None;
@@ -3496,12 +3583,15 @@ impl App {
     /// Whether an overlay currently owns the board. The SINGLE gate predicate
     /// callers use (never `self.modal.is_some()` inline) to keep the mouse's three
     /// actions over the preview — toggling a fold node, opening a link, and
-    /// starting a drag-selection — from firing while an overlay is up, so a later
-    /// gate extension lives in exactly one place. All three begin from a press
-    /// `update::press_starts_selection` admits: the PRESS only records where it
-    /// landed, and the RELEASE resolves it (a drag selects and copies; a plain
-    /// click toggles the fold under it, else opens the link) — so a press this gate
-    /// refuses leaves its release nothing to act on.
+    /// starting a selection (a drag-selection, or a double-click's word) — from
+    /// firing while an overlay is up, so a later gate extension lives in exactly
+    /// one place. All three begin from a press `update::press_starts_selection`
+    /// admits: the PRESS only records where it landed (a second admitted press on
+    /// the same cell within `update::DOUBLE_CLICK_INTERVAL` records the word under
+    /// it instead), and the RELEASE resolves it (a drag or a double-clicked word
+    /// selects and copies; a plain click toggles the fold under it, else opens the
+    /// link) — so a press this gate refuses leaves its release nothing to act on,
+    /// and is no first half of a double-click either.
     ///
     /// True while a [`Modal`] is open, the quick-reply compose zone, the
     /// stop-then-reply confirmation, or the interrupt confirmation owns the
@@ -4894,10 +4984,12 @@ impl App {
     /// steps drifting apart is exactly the bug the single call site prevents.
     ///
     /// It also drops any mouse text selection
-    /// ([`clear_preview_selection`](Self::clear_preview_selection)): the re-render
+    /// ([`drop_preview_selection`](Self::drop_preview_selection)): the re-render
     /// moves the text under the selection's absolute cells, so the highlight — and
     /// the text a release would copy — would name other lines. Here rather than at
-    /// a caller, so no toggle route can skip it.
+    /// a caller, so no toggle route can skip it. The double-click chain survives
+    /// it, so a quick second press on the header selects a word instead of
+    /// toggling the node back.
     ///
     /// `preview_follow_bottom` is deliberately left alone. Expanding grows the
     /// transcript BELOW the node, so a pane pinned to the bottom stays pinned by the
@@ -4933,8 +5025,10 @@ impl App {
         // scroll below all move — so a mouse selection's ABSOLUTE cells would now
         // name other text. Drop it here, beside the mutation, so no route into a
         // toggle can leave a stale highlight (or copy the wrong text on release):
-        // the same rule a wheel notch and a re-reading reload follow.
-        self.clear_preview_selection();
+        // the same rule a wheel notch and a re-reading reload follow. The click
+        // chain is NOT reset: this toggle is the first click of a possible
+        // double-click, whose second press must select a word, not toggle again.
+        self.drop_preview_selection();
 
         let scroll = self.preview_scroll;
         let next = self

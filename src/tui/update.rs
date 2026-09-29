@@ -56,6 +56,7 @@
 //! | mouse: click a folded node's header | unfold the node — a subagent's hand-back (`◆`) or context claude injected (`◇`) — where it sits, and a second click folds it back; a click on a header toggles its node and never opens a link. On the RELEASE, like a link, and ahead of one (see [`click_effect`]) |
 //! | mouse: click a preview link | open its url in the browser — `http`/`https` only: any other scheme opens nothing and says so on a sticky status line. On the RELEASE, since only then is it known that the press was a click and not the start of a drag (see [`mouse_effect`]) |
 //! | mouse: drag in the preview | select transcript text in reading order, reverse-videoed — DRAWN text only: each row ends at its last drawn character, never at the pane's edge, and a drag over blank space alone selects nothing, so its release copies nothing; the release copies a selection the way `Ctrl-X y` copies — [`Outcome::Copy`], the clipboard tool first, OSC 52 as the fallback — with a transient status. A drag that starts on a node header or a link selects, and toggles or opens nothing. Off under any overlay (the draft card included) and never started on the pinned row or a docked compose zone (see [`press_starts_selection`]) |
+//! | mouse: double-click in the preview | select the WORD under the pointer (Unicode word boundaries, on the drawn row) and copy it on release, exactly as a drag copies. Two presses on the SAME cell within [`DOUBLE_CLICK_INTERVAL`] (see [`is_double_click`]); a blank word selects nothing; a quick third click keeps the word. The FIRST release is a plain click — it toggles a node header or opens a link, as above — and the SECOND copies the word and toggles or opens nothing, so a node header double-clicked is opened once and stays open. Any key, wheel notch or reload resets the count (a fold toggle does not: it is the first click's own effect), and a press that turned into a drag is not a first click. Same gate as a drag ([`press_starts_selection`]) |
 //! | `Esc` / `Ctrl-C` | quit (always) |
 //!
 //! No bare printable character is a command: every one of them types into the
@@ -86,6 +87,7 @@
 //! to spaces. A paste can never submit, resume, or quit.
 
 use std::io::Write;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -101,7 +103,7 @@ use crate::send::{
 use crate::store::{preview, SessionStore};
 use crate::watch::{AppEvent, CopyPayload};
 
-use super::app::{App, InterruptRoute, Interrupting, ModalAction, ModalLayout};
+use super::app::{App, ClickRecord, InterruptRoute, Interrupting, ModalAction, ModalLayout};
 use super::{clipboard, compose, view};
 
 /// A decoded intent from a single keypress.
@@ -1008,7 +1010,7 @@ enum MouseEffect {
 /// event answers [`Outcome::Continue`]. Fails soft end to end: a bad url or a
 /// missing opener never crashes the board.
 fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Outcome {
-    match mouse_effect(app, mouse) {
+    match mouse_effect(app, mouse, Instant::now()) {
         MouseEffect::None => Outcome::Continue,
         MouseEffect::OpenLink(url) => {
             resume::open_url(&url);
@@ -1041,10 +1043,21 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Outcome {
 /// Any other event (other buttons, horizontal wheel, plain moves) is ignored: the
 /// pane widths belong to the keyboard (`Shift-Left` / `Shift-Right`), so the mouse
 /// has no border to drag. Never touches the query, and the press gate keeps a
-/// click from toggling a node or opening a link — or a drag from selecting —
-/// under an overlay: a press it refuses records nothing, so its release has
-/// nothing to resolve.
-fn mouse_effect(app: &mut App, mouse: MouseEvent) -> MouseEffect {
+/// click from toggling a node or opening a link — or a drag or a double-click
+/// from selecting — under an overlay: a press it refuses records nothing, so its
+/// release has nothing to resolve.
+///
+/// A SECOND admitted press on the SAME cell as the previous one, within
+/// [`DOUBLE_CLICK_INTERVAL`], is a DOUBLE-CLICK ([`is_double_click`]): it records a
+/// WORD selection
+/// ([`App::begin_word_selection`]), so its release takes the copy arm above and
+/// never reaches [`click_effect`] — the first release already toggled or opened
+/// whatever sat under the cell, and the second must not do it again.
+///
+/// `now` is the instant the press is handled at, passed in so the double-click
+/// decision ([`is_double_click`]) is a pure function a test can drive with
+/// synthetic times; [`handle_mouse`] is the one place that reads the clock.
+fn mouse_effect(app: &mut App, mouse: MouseEvent, now: Instant) -> MouseEffect {
     let pos = Position {
         x: mouse.column,
         y: mouse.row,
@@ -1078,8 +1091,19 @@ fn mouse_effect(app: &mut App, mouse: MouseEvent) -> MouseEffect {
         // any prior selection. `press_starts_selection` owns where a press may
         // land and when — gated by any overlay, so a press while the
         // running-session choice or the agent picker owns input records nothing.
+        //
+        // A SECOND admitted press on the same cell within `DOUBLE_CLICK_INTERVAL`
+        // records a WORD selection instead (`is_double_click`); the view expands it
+        // and the release copies it through the same path a drag's does — and,
+        // holding a selection, never reaches `click_effect`, so the second click
+        // toggles or opens nothing the first one already did.
         MouseEventKind::Down(MouseButton::Left) if press_starts_selection(app, pos) => {
-            app.begin_preview_press(pos);
+            if is_double_click(app.last_click(), pos, now) {
+                app.begin_word_selection(pos);
+            } else {
+                app.begin_preview_press(pos);
+            }
+            app.note_click(pos, now);
         }
         // A held-button drag inside the preview extends the text selection. A
         // no-op unless a press is active (`begin_preview_press` set it), so a drag
@@ -1090,9 +1114,10 @@ fn mouse_effect(app: &mut App, mouse: MouseEvent) -> MouseEffect {
             app.extend_preview_selection(pos, view::preview_transcript_rect(app));
         }
         // The release resolves the press, and only a press the gate admitted:
-        // a completed drag copies the selection — the text the last frame drew
-        // under it, which is exactly what is highlighted on screen — and never
-        // toggles a node or opens a link, even one it started on; a plain click
+        // a completed drag (or a double-click's word) copies the selection — the
+        // text the last frame drew under it, which is exactly what is highlighted
+        // on screen — and never toggles a node or opens a link, even one it
+        // started on; a plain click
         // with no drag is THE one pane click, resolved at the press cell.
         MouseEventKind::Up(MouseButton::Left) => {
             let Some(press) = app.take_preview_press() else {
@@ -1110,9 +1135,33 @@ fn mouse_effect(app: &mut App, mouse: MouseEvent) -> MouseEffect {
     MouseEffect::None
 }
 
+/// The longest gap between two presses on the same cell that still makes the
+/// second a double-click. crossterm reports no double-click event, so the two
+/// presses are timed here. 500 ms is the platform default the user's other
+/// programs already use: macOS `NSEvent.doubleClickInterval` is 0.5 s and
+/// Windows' default double-click time is 500 ms. The OS setting is deliberately
+/// not read.
+const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Whether a press at `pos` at `now` is a double-click: the previous admitted
+/// press landed on the SAME cell no more than [`DOUBLE_CLICK_INTERVAL`] ago. Pure
+/// over its three inputs. A chain keeps going — each press is compared to the one
+/// before it — so a quick third click is a double-click too and keeps the word.
+/// A `now` earlier than the previous press (a clock that stepped back) is not one.
+fn is_double_click(previous: Option<ClickRecord>, pos: Position, now: Instant) -> bool {
+    previous.is_some_and(|prev| {
+        prev.pos == pos
+            && now
+                .checked_duration_since(prev.at)
+                .is_some_and(|gap| gap <= DOUBLE_CLICK_INTERVAL)
+    })
+}
+
 /// Whether a left press at `pos` may begin a preview press — the ONE gate in
 /// front of all three mouse actions over the preview, since a node toggles, a link
-/// opens and a selection starts only from a press this admits.
+/// opens and a selection starts — a drag's, or a double-click's word — only from a
+/// press this admits. A press it refuses is not a click either: it records
+/// nothing, so it cannot become the first half of a double-click.
 ///
 /// Three conditions, all required:
 ///
@@ -1139,7 +1188,9 @@ fn press_starts_selection(app: &App, pos: Position) -> bool {
 ///
 /// - On a fold node's HEADER — a peer message or injected context — it toggles
 ///   that node open or closed ([`App::toggle_peer_fold`], which also drops any
-///   mouse selection) and asks for nothing more.
+///   mouse selection but KEEPS the click chain, so a quick second press on the
+///   header is a double-click that selects a word rather than a second toggle)
+///   and asks for nothing more.
 /// - Otherwise it is resolved by [`resolve_link_click`] and given its status by
 ///   [`note_link_click`]: a hit on an `http`/`https` link asks [`handle_mouse`]
 ///   to open its url ([`MouseEffect::OpenLink`]) and reports `opening <url>`
@@ -2824,6 +2875,11 @@ mod tests {
         }
     }
 
+    /// [`mouse_effect`] at the real clock — for tests that do not time clicks.
+    fn mouse_at(app: &mut App, mouse: MouseEvent) -> MouseEffect {
+        mouse_effect(app, mouse, Instant::now())
+    }
+
     fn wheel(app: &mut App, kind: MouseEventKind, col: u16, row: u16) -> Outcome {
         handle_event(
             app,
@@ -2840,6 +2896,31 @@ mod tests {
     fn left_click(app: &mut App, col: u16, row: u16) -> Outcome {
         wheel(app, MouseEventKind::Down(MouseButton::Left), col, row);
         wheel(app, MouseEventKind::Up(MouseButton::Left), col, row)
+    }
+
+    /// A whole left click at `(col, row)` that lands MORE than
+    /// [`DOUBLE_CLICK_INTERVAL`] after the last click the board recorded — a
+    /// SEPARATE click, never the second half of a double-click. A test's clicks
+    /// arrive microseconds apart, and [`handle_event`] reads the real clock, so a
+    /// second [`left_click`] on the same cell IS a double-click (it selects a word
+    /// and toggles nothing); this one is driven through the pure [`mouse_effect`]
+    /// at an instant past the interval instead. Measured from the recorded click
+    /// itself, not from now, so a run of these can never chain into a double-click
+    /// either. Returns the release's effect.
+    fn separate_left_click(app: &mut App, col: u16, row: u16) -> MouseEffect {
+        let now = Instant::now();
+        let after = app.last_click().map_or(now, |click| click.at.max(now));
+        let at = after + DOUBLE_CLICK_INTERVAL + Duration::from_millis(1);
+        mouse_effect(
+            app,
+            mouse_ev(MouseEventKind::Down(MouseButton::Left), col, row),
+            at,
+        );
+        mouse_effect(
+            app,
+            mouse_ev(MouseEventKind::Up(MouseButton::Left), col, row),
+            at,
+        )
     }
 
     // --- quick reply (Ctrl-R): gate, compose routing, send, completion ----
@@ -5154,12 +5235,12 @@ mod tests {
     /// return what the RELEASE decided. Driven through the pure [`mouse_effect`], so
     /// a url it resolves is returned, never handed to a browser.
     fn click(app: &mut App, col: u16, row: u16) -> MouseEffect {
-        let pressed = mouse_effect(
+        let pressed = mouse_at(
             app,
             mouse_ev(MouseEventKind::Down(MouseButton::Left), col, row),
         );
         assert_eq!(pressed, MouseEffect::None, "a press alone must never act");
-        mouse_effect(
+        mouse_at(
             app,
             mouse_ev(MouseEventKind::Up(MouseButton::Left), col, row),
         )
@@ -5351,7 +5432,7 @@ mod tests {
         let (col, row) = drawn_link_cell(&buffer, app.preview_rect);
 
         assert_eq!(
-            mouse_effect(
+            mouse_at(
                 &mut app,
                 mouse_ev(MouseEventKind::Down(MouseButton::Left), col, row)
             ),
@@ -5359,7 +5440,7 @@ mod tests {
             "a press on a link must not open it"
         );
         assert_eq!(
-            mouse_effect(
+            mouse_at(
                 &mut app,
                 mouse_ev(MouseEventKind::Up(MouseButton::Left), col, row)
             ),
@@ -5455,18 +5536,18 @@ mod tests {
         let buffer = render_board(&mut app);
         let (col, row) = drawn_link_cell(&buffer, app.preview_rect);
 
-        let pressed = mouse_effect(
+        let pressed = mouse_at(
             &mut app,
             mouse_ev(MouseEventKind::Down(MouseButton::Left), col, row),
         );
         assert_eq!(pressed, MouseEffect::None);
         render_board(&mut app);
-        mouse_effect(
+        mouse_at(
             &mut app,
             mouse_ev(MouseEventKind::Drag(MouseButton::Left), col + 3, row),
         );
         render_board(&mut app);
-        let released = mouse_effect(
+        let released = mouse_at(
             &mut app,
             mouse_ev(MouseEventKind::Up(MouseButton::Left), col + 3, row),
         );
@@ -6116,13 +6197,16 @@ mod tests {
             .join("\n")
     }
 
-    /// A click on a collapsed node's header OPENS it, and a second click on the
-    /// same header CLOSES it again (resolved decision 4).
+    /// A click on a collapsed node's header OPENS it, and a second, SEPARATE click
+    /// on the same header CLOSES it again (resolved decision 4).
     ///
     /// Driven END TO END through [`handle_mouse`] — a press, then its release, which
     /// [`click_effect`] resolves — not through [`fold_under_pointer`] alone, because
     /// the routing is what this phase adds: a resolver nothing routes to would pass
-    /// every assertion below and still leave the node inert under a real click.
+    /// every assertion below and still leave the node inert under a real click. The
+    /// second click goes through [`mouse_effect`] at an instant past
+    /// [`DOUBLE_CLICK_INTERVAL`] ([`separate_left_click`]), since a quick one on the
+    /// same cell is a double-click.
     #[test]
     fn a_click_on_a_peer_node_header_expands_it_and_a_second_click_collapses_it() {
         let (mut app, buffer) = peer_app();
@@ -6150,7 +6234,10 @@ mod tests {
             "an open node's header must offer the click that closes it again"
         );
 
-        left_click(&mut app, col, row);
+        // A SEPARATE second click: one inside the double-click interval selects a
+        // word instead and leaves the node open
+        // (`a_double_click_on_a_folded_peer_header_opens_it_once_and_copies_the_word`).
+        separate_left_click(&mut app, col, row);
         let reclosed = preview_string(&mut app, width);
         assert!(
             !reclosed.contains(PEER_BODY_PHRASE),
@@ -6414,7 +6501,7 @@ mod tests {
         let width = view::preview_transcript_rect(&app).width;
         let (col, row) = drawn_peer_handle_cell(&buffer, app.preview_rect);
 
-        let pressed = mouse_effect(
+        let pressed = mouse_at(
             &mut app,
             mouse_ev(MouseEventKind::Down(MouseButton::Left), col, row),
         );
@@ -6425,7 +6512,7 @@ mod tests {
             "a press alone must leave the node CLOSED"
         );
 
-        let released = mouse_effect(
+        let released = mouse_at(
             &mut app,
             mouse_ev(MouseEventKind::Up(MouseButton::Left), col, row),
         );
@@ -6499,6 +6586,106 @@ mod tests {
             highlighted_cells(&redrawn, view::preview_transcript_rect(&app)),
             Vec::<(u16, u16)>::new(),
             "and no highlight may survive into the next frame"
+        );
+    }
+
+    /// [`peer_app`] with the pane UNPINNED from the newest turn — one wheel notch
+    /// up, the way a reader who scrolled up to the node left it. Pinned to the
+    /// bottom, an expansion re-pins the pane and scrolls the node's header off the
+    /// row it was clicked on; unpinned, the toggle keeps it there
+    /// (`fold_scroll_delta`), which is the premise a click on the SAME cell right
+    /// after the toggle needs. Returns the app beside the buffer drawn after the
+    /// notch.
+    fn unpinned_peer_app() -> (App, ratatui::buffer::Buffer) {
+        let (mut app, _) = peer_app();
+        let rect = view::preview_transcript_rect(&app);
+        wheel(&mut app, MouseEventKind::ScrollUp, rect.x, rect.y);
+        assert!(
+            !app.preview_follow_bottom,
+            "premise: a notch up unpins the pane from the newest turn"
+        );
+        let buffer = render_board(&mut app);
+        (app, buffer)
+    }
+
+    /// A DOUBLE-click on a FOLDED node's header opens the node ONCE and copies the
+    /// header word under the pointer. The first release is a plain click, so it
+    /// toggles the node open; the toggle drops the selection but KEEPS the click
+    /// chain (`App::drop_preview_selection`), and it keeps the header on the row it
+    /// was clicked on, so the second press is a double-click on the same header.
+    /// Its release copies the word and toggles nothing — the node stays open. A
+    /// toggle that reset the chain would read the second press as a fresh click and
+    /// shut the node again, copying nothing.
+    #[test]
+    fn a_double_click_on_a_folded_peer_header_opens_it_once_and_copies_the_word() {
+        let (mut app, buffer) = unpinned_peer_app();
+        let width = view::preview_transcript_rect(&app).width;
+        let (_, header_row) = drawn_peer_marker_cell(&buffer, app.preview_rect);
+        let cell = inside_word(&mut app, "message from @");
+        assert_eq!(
+            cell.1, header_row,
+            "the probe must sit on the node's header"
+        );
+        let collapsed = preview_string(&mut app, width);
+        assert!(
+            collapsed.contains(COLLAPSED_AFFORDANCE) && !collapsed.contains(PEER_BODY_PHRASE),
+            "a peer node starts CLOSED, or the open-once assertion is vacuous"
+        );
+        let t0 = Instant::now();
+
+        let first = click_at(&mut app, cell, t0);
+        assert_eq!(first, MouseEffect::None, "a toggle asks for nothing more");
+        assert!(
+            preview_string(&mut app, width).contains(PEER_BODY_PHRASE),
+            "the FIRST release is a plain click: it opens the node"
+        );
+        let opened = render_board(&mut app);
+        assert_eq!(
+            drawn_peer_marker_cell(&opened, app.preview_rect).1,
+            header_row,
+            "premise: the toggle kept the header on the row it was clicked on"
+        );
+
+        let second = click_at(&mut app, cell, t0 + Duration::from_millis(100));
+        assert_eq!(
+            second,
+            MouseEffect::Copy("message".to_string()),
+            "the SECOND press is a double-click: its release copies the header word"
+        );
+        let after = preview_string(&mut app, width);
+        assert!(
+            after.contains(PEER_BODY_PHRASE) && after.contains(EXPANDED_AFFORDANCE),
+            "and toggles nothing: the node was opened once and stays open"
+        );
+    }
+
+    /// The chain a fold toggle keeps is still reset by a KEY, as the double-click
+    /// rule says: after a click that opened a node, any keypress makes the next
+    /// press on the same cell a plain click again — which toggles the node shut.
+    #[test]
+    fn a_key_after_a_fold_toggle_resets_the_click_chain() {
+        let (mut app, buffer) = unpinned_peer_app();
+        let width = view::preview_transcript_rect(&app).width;
+        let cell = drawn_peer_handle_cell(&buffer, app.preview_rect);
+        let t0 = Instant::now();
+
+        click_at(&mut app, cell, t0);
+        assert!(
+            preview_string(&mut app, width).contains(PEER_BODY_PHRASE),
+            "premise: the first click opened the node"
+        );
+        // `Backspace` on the empty query changes nothing on the board — only the
+        // any-key chain reset in `dispatch` acts.
+        assert_eq!(app.query(), "");
+        press(&mut app, KeyCode::Backspace);
+
+        let second = click_at(&mut app, cell, t0 + Duration::from_millis(100));
+        assert_eq!(second, MouseEffect::None, "a plain click copies nothing");
+        let reclosed = preview_string(&mut app, width);
+        assert!(
+            !reclosed.contains(PEER_BODY_PHRASE) && reclosed.contains(COLLAPSED_AFFORDANCE),
+            "with the chain reset, the quick second press is a plain click that \
+             toggles the node shut"
         );
     }
 
@@ -6710,7 +6897,9 @@ mod tests {
             "so a click on the body's link falls through to the link"
         );
 
-        left_click(&mut app, col, row);
+        // A SEPARATE second click, as in the peer twin above: a quick one on the
+        // same cell is a double-click, which selects a word and toggles nothing.
+        separate_left_click(&mut app, col, row);
         let reclosed = preview_string(&mut app, width);
         assert!(
             !reclosed.contains(INJECTED_BODY_PHRASE) && reclosed.contains(COLLAPSED_AFFORDANCE),
@@ -9973,6 +10162,285 @@ mod tests {
             CopyPayload::Selection("filler line 21\nfiller line 22".to_string())
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- double-click word selection: timed presses, one word, the same copy ----
+
+    /// One left-button event at `cell` at instant `at`, then a frame — the loop
+    /// draws between events.
+    fn button(app: &mut App, kind: MouseEventKind, cell: (u16, u16), at: Instant) -> MouseEffect {
+        let effect = mouse_effect(app, mouse_ev(kind, cell.0, cell.1), at);
+        render_board(app);
+        effect
+    }
+
+    /// A press and release at `cell` at `at`; returns the release's effect.
+    fn click_at(app: &mut App, cell: (u16, u16), at: Instant) -> MouseEffect {
+        button(app, MouseEventKind::Down(MouseButton::Left), cell, at);
+        button(app, MouseEventKind::Up(MouseButton::Left), cell, at)
+    }
+
+    /// The cell one column into `needle`'s first drawn occurrence, and its row.
+    fn inside_word(app: &mut App, needle: &str) -> (u16, u16) {
+        let buffer = render_board(app);
+        let (col, row) = drawn_text_cell(&buffer, app.preview_rect, needle);
+        (col + 1, row)
+    }
+
+    /// End to end: two presses on the same cell within the interval copy exactly
+    /// the word under it — and the cells reverse-videoed are those same cells.
+    #[test]
+    fn a_double_click_copies_exactly_the_word_and_highlights_its_cells() {
+        let dir = unique_temp_dir("dbl-word");
+        let mut app = link_app(&dir, None);
+        let cell = inside_word(&mut app, "filler line 18");
+        let t0 = Instant::now();
+
+        click_at(&mut app, cell, t0);
+        button(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            cell,
+            t0 + Duration::from_millis(100),
+        );
+        let after = render_board(&mut app);
+        let released = button(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            cell,
+            t0 + Duration::from_millis(150),
+        );
+
+        assert_eq!(released, MouseEffect::Copy("filler".to_string()));
+        let lit = highlighted_cells(&after, view::preview_transcript_rect(&app));
+        let shown: String = lit
+            .iter()
+            .map(|&(x, y)| after.cell((x, y)).expect("in buffer").symbol())
+            .collect();
+        assert_eq!(shown, "filler", "the highlight is the copied text");
+        assert!(lit.iter().all(|&(_, y)| y == cell.1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A double-click on a blank cell selects nothing: no highlight, and the
+    /// release copies nothing — the same blank rule a drag has.
+    #[test]
+    fn a_double_click_on_a_blank_cell_copies_nothing() {
+        let dir = unique_temp_dir("dbl-blank");
+        let mut app = link_app(&dir, None);
+        let buffer = render_board(&mut app);
+        let (end, row) = drawn_text_end(&buffer, app.preview_rect, "filler line 18");
+        let cell = (end + 3, row);
+        let t0 = Instant::now();
+
+        click_at(&mut app, cell, t0);
+        button(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            cell,
+            t0 + Duration::from_millis(100),
+        );
+        let after = render_board(&mut app);
+        let released = button(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            cell,
+            t0 + Duration::from_millis(150),
+        );
+
+        assert_eq!(released, MouseEffect::None);
+        assert_eq!(
+            highlighted_cells(&after, view::preview_transcript_rect(&app)),
+            Vec::<(u16, u16)>::new()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A second press after the interval, or on another cell, is a fresh first
+    /// click — two clicks, never a word.
+    #[test]
+    fn a_slow_or_moved_second_click_stays_two_clicks() {
+        let dir = unique_temp_dir("dbl-slow");
+        let mut app = link_app(&dir, None);
+        let cell = inside_word(&mut app, "filler line 18");
+        let next = (cell.0 + 1, cell.1);
+        let t0 = Instant::now();
+
+        click_at(&mut app, cell, t0);
+        button(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            cell,
+            t0 + DOUBLE_CLICK_INTERVAL + Duration::from_millis(1),
+        );
+        assert!(!app.has_preview_selection(), "too slow for a double-click");
+        button(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            cell,
+            t0 + DOUBLE_CLICK_INTERVAL + Duration::from_millis(1),
+        );
+
+        let t1 = t0 + Duration::from_secs(5);
+        click_at(&mut app, cell, t1);
+        button(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            next,
+            t1 + Duration::from_millis(100),
+        );
+        assert!(!app.has_preview_selection(), "another cell is a new click");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The second press's release with a zero-length drag in between (the pointer
+    /// jitters off and back onto the cell) must not erase the word.
+    #[test]
+    fn a_zero_length_drag_keeps_the_double_clicked_word() {
+        let dir = unique_temp_dir("dbl-zero");
+        let mut app = link_app(&dir, None);
+        let cell = inside_word(&mut app, "filler line 18");
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(100);
+
+        click_at(&mut app, cell, t0);
+        button(&mut app, MouseEventKind::Down(MouseButton::Left), cell, t1);
+        button(&mut app, MouseEventKind::Drag(MouseButton::Left), cell, t1);
+        let released = button(&mut app, MouseEventKind::Up(MouseButton::Left), cell, t1);
+
+        assert_eq!(released, MouseEffect::Copy("filler".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A real drag after the second press is a character selection from the press
+    /// cell, as any drag is.
+    #[test]
+    fn a_real_drag_after_the_second_press_is_a_character_selection() {
+        let dir = unique_temp_dir("dbl-drag");
+        let mut app = link_app(&dir, None);
+        let buffer = render_board(&mut app);
+        let (col, row) = drawn_text_cell(&buffer, app.preview_rect, "filler line 18");
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(100);
+
+        click_at(&mut app, (col, row), t0);
+        button(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            (col, row),
+            t1,
+        );
+        button(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            (col + 10, row),
+            t1,
+        );
+        let released = button(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            (col + 10, row),
+            t1,
+        );
+
+        assert_eq!(released, MouseEffect::Copy("filler line".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A press that turned into a drag is not a first click: pressing the same
+    /// cell again inside the interval is an ordinary press.
+    #[test]
+    fn a_press_that_became_a_drag_does_not_count_as_a_first_click() {
+        let dir = unique_temp_dir("dbl-dragfirst");
+        let mut app = link_app(&dir, None);
+        let buffer = render_board(&mut app);
+        let (col, row) = drawn_text_cell(&buffer, app.preview_rect, "filler line 18");
+        let t0 = Instant::now();
+
+        button(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            (col, row),
+            t0,
+        );
+        button(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            (col + 5, row),
+            t0,
+        );
+        button(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            (col + 5, row),
+            t0,
+        );
+        button(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            (col, row),
+            t0 + Duration::from_millis(100),
+        );
+
+        assert!(!app.has_preview_selection(), "an ordinary press deselects");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A quick third click keeps the word selected (and copies it again) rather
+    /// than deselecting it; a keypress resets the chain.
+    #[test]
+    fn a_third_quick_click_keeps_the_word_and_a_key_resets_the_chain() {
+        let dir = unique_temp_dir("dbl-third");
+        let mut app = link_app(&dir, None);
+        let cell = inside_word(&mut app, "filler line 18");
+        let t0 = Instant::now();
+
+        click_at(&mut app, cell, t0);
+        click_at(&mut app, cell, t0 + Duration::from_millis(100));
+        button(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            cell,
+            t0 + Duration::from_millis(200),
+        );
+        assert!(
+            app.has_preview_selection(),
+            "the third click keeps the word"
+        );
+        let released = button(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            cell,
+            t0 + Duration::from_millis(250),
+        );
+        assert_eq!(released, MouseEffect::Copy("filler".to_string()));
+
+        app.clear_preview_selection();
+        button(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            cell,
+            t0 + Duration::from_millis(300),
+        );
+        assert!(!app.has_preview_selection(), "the chain was reset");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The pure decision: same cell, within the interval (boundary inclusive),
+    /// a prior click — and nothing else.
+    #[test]
+    fn is_double_click_is_a_pure_function_of_cell_and_time() {
+        let t0 = Instant::now();
+        let here = Position { x: 4, y: 2 };
+        let prev = Some(ClickRecord { pos: here, at: t0 });
+        assert!(is_double_click(prev, here, t0 + DOUBLE_CLICK_INTERVAL));
+        assert!(!is_double_click(
+            prev,
+            here,
+            t0 + DOUBLE_CLICK_INTERVAL + Duration::from_millis(1)
+        ));
+        assert!(!is_double_click(prev, Position { x: 5, y: 2 }, t0));
+        assert!(!is_double_click(None, here, t0));
     }
 
     /// Task 4.4: `Ctrl-X x` on a non-hidden selected session hides it, PERSISTS the
