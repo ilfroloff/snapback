@@ -401,11 +401,12 @@ inner rect when there is no banner (so a banner-less pane's geometry is exactly
   the preview: BOTH click hit-tests (`update::fold_under_pointer` and
   `update::resolve_link_click`) resolve a click against it, it supplies the width
   the fold toggle re-renders at (so the hit-test and the re-render cannot resolve
-  through different widths), and the drag-selection's press gate
-  (`update::press_starts_selection`), its drag clamp and its highlight/copy
-  overlay all read it. There is no second copy of it in `update`. A click
-  resolves through `App::preview_scroll` and the width-scoped hit cache, both
-  measured from that rect's origin — derive it anywhere else and a click
+  through different widths), and the selection's press gate
+  (`update::press_starts_selection`, a drag's and a double-click's word alike),
+  its drag clamp and its highlight/copy overlay all read it. There is no second
+  copy of it in `update`. A click resolves through `App::preview_scroll` and the
+  width-scoped hit cache, both measured from that rect's origin — derive it
+  anywhere else and a click
   silently opens the wrong link or folds the wrong node, or a drag starts on the
   pinned row. All three mouse actions are also gated off while any overlay is up
   (`overlay_active`, which counts the editor AND the draft card), so none fires
@@ -739,7 +740,7 @@ rule rather than waiving it.
 The clipboard copy is that same THREADED shape, and it is NOT a third
 synchronous one-shot beside the two exceptions below. `handle_chord_key` returns
 `Outcome::Copy(CopyPayload::SessionId(id))` for `Ctrl-X y`, a finished preview
-drag returns `Outcome::Copy(CopyPayload::Selection(text))` from the mouse arm,
+drag (or a double-click's word) returns `Outcome::Copy(CopyPayload::Selection(text))` from the mouse arm,
 and the driver (`run_inner` → `start_copy`) reads the
 environment at that edge, picks the route (`tui::clipboard::clipboard_route`),
 and, when the route has a tool, starts `clipboard::spawn_tool_copy`: a detached
@@ -1145,12 +1146,16 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    `App::overlay_active` (`modal.is_some() || compose.is_some() ||
    draft.is_some() || pending_stop.is_some() || pending_interrupt.is_some() ||
    pending_chord`) gates the mouse's three actions over the preview — toggling a
-   fold node, opening a preview link, and starting a preview drag-select — so
-   none fires while any is up. All three begin from a left PRESS the one gate
+   fold node, opening a preview link, and starting a preview selection (a
+   drag-select, or a double-click's word-select) — so none fires while any is
+   up. All three begin from a left PRESS the one gate
    (`update::press_starts_selection`) admits; the press only RECORDS where it
-   landed, and the RELEASE resolves it — a drag selects and copies, a plain click
-   toggles the fold under the press, else opens the link there — so a press the
-   gate refuses leaves its release nothing to act on. A mouse
+   landed — a second admitted press on the same cell within
+   `DOUBLE_CLICK_INTERVAL` records the word under it instead — and the RELEASE
+   resolves it: a drag or a double-clicked word selects and copies, a plain click
+   toggles the fold under the press, else opens the link there. So a press the
+   gate refuses leaves its release nothing to act on, and is no first half of a
+   double-click either. A mouse
    wheel is handled **before** and **independent of** that gate: it never routes
    into an overlay handler, it only scrolls a pane, and it (like any keypress)
    clears an active preview text selection first, since scrolling changes what

@@ -41,8 +41,8 @@ use crate::store::FailedTask;
 
 use super::app::{
     resolve_list_width, App, ComposeDefault, InterruptRoute, Modal, ModalAction, ModalChoice,
-    ModalLayout, NewSessionDraft, PaneLayout, PreviewSelection, Row, Scope, MODEL_DEFAULT_LABEL,
-    MODEL_NEW_SESSION_SCOPE,
+    ModalLayout, NewSessionDraft, PaneLayout, PreviewSelection, Row, Scope, SelectionUnit,
+    MODEL_DEFAULT_LABEL, MODEL_NEW_SESSION_SCOPE,
 };
 use super::compose::{ComposeState, ComposeTarget};
 
@@ -1845,8 +1845,9 @@ fn preview_areas(app: &App, area: Rect, has_banner: bool) -> (Rect, Rect, Rect) 
 /// The TRANSCRIPT rect of the preview pane as the last frame laid it out — what
 /// every pointer action over the preview is hit-tested against: a fold-node
 /// toggle (`update::fold_under_pointer`, plus the width the toggle re-renders
-/// at), a link click (`update::resolve_link_click`) and a drag-selection (its
-/// press gate, its clamp, and the highlight/copy overlay) alike. ONE source, so
+/// at), a link click (`update::resolve_link_click`) and a selection — a drag's or
+/// a double-click's word (its press gate, a drag's clamp, and the highlight/copy
+/// overlay, which resolves the word in it through [`word_runs`]) — alike. ONE source, so
 /// they can never disagree about where the transcript is — nor about which row
 /// the pinned row above it pushed a line onto.
 ///
@@ -3425,6 +3426,56 @@ fn selected_runs(
     trim_blank_edge_rows(&rows).to_vec()
 }
 
+/// The runs a double-click at `at` selects: the ONE word under that cell on its
+/// drawn row, as the single [`SelectedRun`] of the UAX #29 segment holding it —
+/// the same shape [`selected_runs`] answers, so the highlight and the copy walk it
+/// unchanged. Empty when `at` is outside `rect`, or the segment under it is blank
+/// ([`is_blank_symbol`]): a blank word selects nothing, exactly as a blank drag.
+///
+/// Word boundaries come ONLY from `unicode-segmentation`; the row is the cells'
+/// symbols inside `rect`, so a word never reaches past the pane and never wraps to
+/// another row. A wide character's continuation cell is not specially handled.
+/// Pure over a `Buffer`.
+fn word_runs(buf: &Buffer, at: Position, rect: Rect) -> Vec<Option<SelectedRun>> {
+    if !rect.contains(at) {
+        return Vec::new();
+    }
+    // The row as one string, with the byte offset each cell starts at.
+    let mut row = String::new();
+    let mut starts = Vec::with_capacity(usize::from(rect.width));
+    for x in rect.x..rect.right() {
+        starts.push(row.len());
+        row.push_str(buf.cell((x, at.y)).map_or(" ", |cell| cell.symbol()));
+    }
+    let at_byte = starts[usize::from(at.x - rect.x)];
+    let Some((seg_start, seg)) = row
+        .split_word_bound_indices()
+        .find(|&(start, seg)| start <= at_byte && at_byte < start + seg.len())
+    else {
+        return Vec::new();
+    };
+    if is_blank_symbol(seg) {
+        return Vec::new();
+    }
+    let seg_end = seg_start + seg.len();
+    let first = starts.iter().position(|&s| s >= seg_start);
+    let past = starts
+        .iter()
+        .position(|&s| s >= seg_end)
+        .unwrap_or(starts.len());
+    let (Some(first), Ok(past)) = (first, u16::try_from(past)) else {
+        return Vec::new();
+    };
+    let Ok(first) = u16::try_from(first) else {
+        return Vec::new();
+    };
+    vec![Some(SelectedRun {
+        y: at.y,
+        x0: rect.x + first,
+        x1: rect.x + past,
+    })]
+}
+
 /// The text `runs` cover in `buf`: each run's cell symbols in order, a blank row
 /// between two drawn ones as `""`, the rows joined with `\n`. `None` for no runs —
 /// a selection over blank cells alone has nothing to copy. Nothing is trimmed here:
@@ -3456,15 +3507,20 @@ fn selection_text(buf: &Buffer, runs: &[Option<SelectedRun>]) -> Option<String> 
 ///
 /// Reads the RENDERED buffer as the single source of truth for what is on screen,
 /// so the highlight and the copy are the post-wrap, post-scroll characters the user
-/// sees, with no re-derivation of the wrapped layout. Both walk the ONE
-/// [`selected_runs`] answer — each row cut at its last drawn cell, the blank rows at
-/// either edge dropped — so a cell is reverse-videoed if and only if it is copied:
+/// sees, with no re-derivation of the wrapped layout. Both walk the ONE runs answer
+/// — [`selected_runs`] for a drag, each row cut at its last drawn cell and the blank
+/// rows at either edge dropped, or [`word_runs`] for a double-click's word — so a
+/// cell is reverse-videoed if and only if it is copied:
 /// the highlight reads like an editor's selection, never a full-width band of empty
 /// cells. A blank row between two drawn rows gets no highlight at all and copies as
 /// an empty line. It sets no status: the copy's status comes from its RESULT, in
 /// `update::finish_copy`, once the clipboard path has run.
 fn overlay_preview_selection(frame: &mut Frame, app: &App) -> Option<String> {
-    let PreviewSelection { anchor, cursor } = app.preview_selection()?;
+    let PreviewSelection {
+        anchor,
+        cursor,
+        unit,
+    } = app.preview_selection()?;
     // The same transcript rect the press was gated on and the drag clamped to.
     let rect = preview_transcript_rect(app);
     if rect.width == 0 || rect.height == 0 {
@@ -3472,7 +3528,10 @@ fn overlay_preview_selection(frame: &mut Frame, app: &App) -> Option<String> {
     }
     let (start, end) = ordered(anchor, cursor);
     let buf = frame.buffer_mut();
-    let runs = selected_runs(buf, start, end, rect);
+    let runs = match unit {
+        SelectionUnit::Chars => selected_runs(buf, start, end, rect),
+        SelectionUnit::Word => word_runs(buf, anchor, rect),
+    };
     let text = selection_text(buf, &runs)?;
     for run in runs.iter().flatten() {
         for x in run.x0..run.x1 {
@@ -3843,7 +3902,9 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         //
         // `drag copy` names the preview drag-selection beside the board's other
         // mouse gesture, `wheel scroll`, in two words: the drag selects and its
-        // release copies. Like everything past `^X` it is off-screen at 80 columns.
+        // release copies. A double-click selects and copies a word the same way and
+        // is spelled out in `KEYS` and the README, not here. Like everything past
+        // `^X` it is off-screen at 80 columns.
         // The rest — a click on its release still opens a link or unfolds a node,
         // the copy goes the way `Ctrl-X y`'s does, Shift/Option for the terminal's
         // own selection — is spelled out in `KEYS` and the README, where there is
@@ -6516,6 +6577,43 @@ mod tests {
     /// last line — the shapes a transcript's rows come in.
     fn paragraph_buffer() -> Buffer {
         Buffer::with_lines(["hello     ", "", "world     ", ""])
+    }
+
+    /// The word a double-click at column `x` of a one-row buffer selects, as text.
+    fn word_at(line: &str, x: u16) -> Option<String> {
+        let buf = Buffer::with_lines([line]);
+        let runs = word_runs(&buf, Position { x, y: 0 }, buf.area);
+        selection_text(&buf, &runs)
+    }
+
+    /// The UAX #29 word under the cell, and only it: an apostrophe or a dot between
+    /// alphanumerics, and an underscore, keep a word whole; a hyphen splits it; a
+    /// run of spaces or trailing blank cells is no word.
+    #[test]
+    fn a_double_click_selects_the_uax29_word_under_the_cell() {
+        let line = "view.rs don't snake_case sess-link  ";
+        assert_eq!(word_at(line, 2).as_deref(), Some("view.rs"));
+        assert_eq!(word_at(line, 9).as_deref(), Some("don't"));
+        assert_eq!(word_at(line, 15).as_deref(), Some("snake_case"));
+        assert_eq!(word_at(line, 27).as_deref(), Some("sess"));
+        assert_eq!(word_at(line, 31).as_deref(), Some("link"));
+        assert_eq!(word_at(line, 7), None, "the space between words is blank");
+        assert_eq!(word_at(line, 35), None, "trailing empty cells are blank");
+    }
+
+    /// The word's run is exactly its cells — the highlight range — and stays
+    /// inside the rect it was resolved in.
+    #[test]
+    fn a_word_run_covers_exactly_the_word_cells_inside_the_rect() {
+        let buf = Buffer::with_lines(["ab cd ef"]);
+        let rect = Rect::new(3, 0, 5, 1);
+        let runs = word_runs(&buf, Position { x: 4, y: 0 }, rect);
+        assert_eq!(runs, vec![Some(SelectedRun { y: 0, x0: 3, x1: 5 })]);
+        assert_eq!(
+            word_runs(&buf, Position { x: 1, y: 0 }, rect),
+            Vec::new(),
+            "a cell outside the rect selects nothing"
+        );
     }
 
     /// A selection over blank cells alone — one row or several — has no runs and
