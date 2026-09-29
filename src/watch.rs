@@ -21,7 +21,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, LazyLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -648,9 +648,16 @@ impl EventLoop {
         self.tx.clone()
     }
 
-    /// Block until the next merged event, or `None` once all senders drop.
-    pub fn recv(&self) -> Option<AppEvent> {
-        self.rx.recv().ok()
+    /// Wait for the next merged event: with `timeout` `None`, block until one
+    /// arrives; with `Some`, give up once it has passed. [`Waited`] tells an event,
+    /// a timeout and a closed channel apart.
+    ///
+    /// The TUI run loop's one wait. It blocks with no timeout on an idle board —
+    /// a board that waits on nothing costs nothing — and passes one only while a
+    /// preview drag is held past the transcript's edge
+    /// (`App::autoscroll_due_in`), so the autoscroll can step between events.
+    pub fn wait(&self, timeout: Option<Duration>) -> Waited {
+        wait_on(&self.rx, timeout)
     }
 
     /// The next event ALREADY buffered on the merged channel, without waiting;
@@ -663,16 +670,35 @@ impl EventLoop {
     pub fn try_recv(&self) -> Option<AppEvent> {
         self.rx.try_recv().ok()
     }
+}
 
-    /// Block for the next event up to `timeout`; `None` on timeout/disconnect.
-    ///
-    /// Not on the binary's runtime path — the TUI loop blocks on
-    /// [`recv`](Self::recv) — but exercised by this module's watcher tests, which
-    /// poll with a timeout so they never block forever. Retained + `dead_code`
-    /// allowed narrowly here (rather than crate-wide) for that reason.
-    #[allow(dead_code)]
-    pub fn recv_timeout(&self, timeout: Duration) -> Option<AppEvent> {
-        self.rx.recv_timeout(timeout).ok()
+/// What one [`EventLoop::wait`] produced.
+///
+/// Three answers, because the run loop must treat them three ways: an event is
+/// handled, a timeout only lets a due autoscroll step run, and a closed channel
+/// ends the board. An `Option` would fold the last two together and end the board
+/// on every timeout.
+#[derive(Debug)]
+pub enum Waited {
+    /// The next merged event.
+    Event(AppEvent),
+    /// The timeout passed with no event.
+    TimedOut,
+    /// Every sender dropped: no event can ever arrive.
+    Closed,
+}
+
+/// [`EventLoop::wait`] over a bare receiver, so the three answers are tested on a
+/// channel a test can close — an `EventLoop` holds a sender of its own, so its
+/// channel never does.
+fn wait_on(rx: &Receiver<AppEvent>, timeout: Option<Duration>) -> Waited {
+    let Some(timeout) = timeout else {
+        return rx.recv().map_or(Waited::Closed, Waited::Event);
+    };
+    match rx.recv_timeout(timeout) {
+        Ok(event) => Waited::Event(event),
+        Err(RecvTimeoutError::Timeout) => Waited::TimedOut,
+        Err(RecvTimeoutError::Disconnected) => Waited::Closed,
     }
 }
 
@@ -947,7 +973,7 @@ mod tests {
     fn wait_for(events: &EventLoop, budget: Duration, pred: impl Fn(&AppEvent) -> bool) -> bool {
         let deadline = Instant::now() + budget;
         while Instant::now() < deadline {
-            if let Some(ev) = events.recv_timeout(Duration::from_millis(100)) {
+            if let Waited::Event(ev) = events.wait(Some(Duration::from_millis(100))) {
                 if pred(&ev) {
                     return true;
                 }
@@ -1340,6 +1366,49 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The run loop's wait tells its three outcomes apart, with a timeout and
+    /// without one: an event is delivered, a timeout with nothing buffered is
+    /// `TimedOut` (never mistaken for the end), and a channel whose senders are all
+    /// gone is `Closed` — which ends the board — even with no timeout, rather than
+    /// blocking forever.
+    #[test]
+    fn a_wait_tells_an_event_a_timeout_and_a_closed_channel_apart() {
+        let (tx, rx) = mpsc::channel::<AppEvent>();
+        let short = Some(Duration::from_millis(10));
+
+        tx.send(AppEvent::Tick).expect("the receiver is alive");
+        assert!(matches!(wait_on(&rx, short), Waited::Event(AppEvent::Tick)));
+        tx.send(AppEvent::SessionsChanged)
+            .expect("the receiver is alive");
+        assert!(matches!(
+            wait_on(&rx, None),
+            Waited::Event(AppEvent::SessionsChanged)
+        ));
+        assert!(
+            matches!(wait_on(&rx, short), Waited::TimedOut),
+            "an empty channel with a live sender times out"
+        );
+        assert!(
+            matches!(wait_on(&rx, Some(Duration::ZERO)), Waited::TimedOut),
+            "an overdue deadline returns at once"
+        );
+
+        tx.send(AppEvent::Tick).expect("the receiver is alive");
+        drop(tx);
+        assert!(
+            matches!(wait_on(&rx, short), Waited::Event(AppEvent::Tick)),
+            "an event buffered before the close is still delivered"
+        );
+        assert!(
+            matches!(wait_on(&rx, short), Waited::Closed),
+            "closed, timed"
+        );
+        assert!(
+            matches!(wait_on(&rx, None), Waited::Closed),
+            "closed, untimed"
+        );
     }
 
     /// Task 3.2: the merged loop delivers BOTH the periodic tick and the

@@ -15,7 +15,7 @@ pub mod view;
 
 use std::io::{self, Write};
 use std::sync::mpsc::Sender;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::cursor::{SetCursorStyle, Show};
@@ -31,7 +31,7 @@ use crossterm::terminal::{
 use ratatui::DefaultTerminal;
 
 use crate::store::SessionStore;
-use crate::watch::{AppEvent, CopyPayload, EventLoop};
+use crate::watch::{AppEvent, CopyPayload, EventLoop, Waited};
 
 pub use app::{App, Scope};
 pub use update::Outcome;
@@ -561,8 +561,13 @@ fn run_inner(
 
     let outcome = loop {
         terminal.draw(|frame| view::render(frame, app))?;
-        match events.recv() {
-            Some(event) => match update::handle_event(app, event, store) {
+        // Block for the next event — unless a preview drag is held past the
+        // transcript's edge, when the wait gets a deadline (`app::AUTOSCROLL_FRAME`
+        // after the last autoscroll step) so the pane keeps gliding with no event
+        // to wake it. `None` for any other board, which blocks exactly as it did.
+        let timeout = app.autoscroll_due_in(view::preview_transcript_rect(app), Instant::now());
+        match events.wait(timeout) {
+            Waited::Event(event) => match update::handle_event(app, event, store) {
                 Outcome::Continue => {}
                 // A confirmed quick-reply send: fire it on a detached thread and
                 // KEEP drawing — the board never tears down (contrast
@@ -622,9 +627,19 @@ fn run_inner(
                 }
                 done => break done,
             },
+            // The deadline passed with no event: only the autoscroll step below
+            // was due.
+            Waited::TimedOut => {}
             // All senders dropped (input + watcher + tick gone): exit cleanly.
-            None => break Outcome::Quit,
+            Waited::Closed => break Outcome::Quit,
         }
+        // Pay out the autoscroll a held drag owes by now, before the next draw.
+        // After EVERY wake-up, an event as well as the deadline: moving the mouse
+        // past the edge wakes the loop before the deadline, so a step taken only
+        // on a timeout would stall the pane for as long as the mouse kept moving.
+        // A no-op unless a drag is held past the edge; the step pays out the time
+        // that really passed, so waking more often never scrolls faster.
+        app.autoscroll_preview_selection(view::preview_transcript_rect(app), Instant::now());
     };
 
     // The board session is over, but its channel may still hold a quick reply's

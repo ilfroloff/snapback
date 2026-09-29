@@ -367,16 +367,39 @@ not lines. The box asks for the tallest run of that many choices, so a wrapped
 row adds its extra lines to the box instead of pushing a choice out of the
 window.
 
-The mouse's TEXT selection over the preview is ABSOLUTE screen cells, so it cannot
-be restored by id — but it is dropped by the same rule the preview cache is
-evicted by: `App::apply_reload` clears it only when the reload re-read the
-previewed transcript (`Reload::changed`) or moved the row selection, never because
-some OTHER transcript was written. The watcher reloads on every write anywhere in
-the store, so clearing on every reload cancelled a drag mid-gesture whenever any
-agent was working. A fold toggle clears it too, for the same reason a re-read
-does: `App::toggle_peer_fold` evicts and re-renders the previewed transcript, so
-the text under the selection's cells moves — and the clear sits beside that
-eviction, inside the one mutator, so no route into a toggle can skip it.
+The mouse's TEXT selection over the preview is anchored in CONTENT coordinates
+(`app::ContentPos`: a wrapped row counted from the top of the whole transcript,
+the row domain `App::preview_scroll` and the cached prefix map share, plus a
+column from the transcript rect's left edge), converted from the screen through
+the scroll the pane last RESOLVED — never a raw request past the end. So it
+survives the pane moving under it: a drag held past the transcript's top or bottom
+edge autoscrolls (§7) and the selection grows into rows that were
+never on screen, and the frame highlights only the part that is visible
+(`view::visible_selection_runs`). What it cannot survive is its rows naming other
+text, so it is dropped by the same rule the preview cache is evicted by:
+`App::apply_reload` clears it only when the reload re-read the previewed
+transcript (`Reload::changed`) or moved the row selection, never because some
+OTHER transcript was written. The watcher reloads on every write anywhere in the
+store, so clearing on every reload cancelled a drag mid-gesture whenever any agent
+was working. A RESIZE clears it too (`update::dispatch`'s `Event::Resize` arm): a
+new width re-wraps the transcript, and the same row number then names other text.
+A fold toggle clears it too, for the same reason: `App::toggle_peer_fold` evicts
+and re-renders the previewed transcript, so the rows below the node are
+re-numbered and the selection's anchors would name other text — and the clear
+sits beside that eviction, inside the one mutator, so no route into a toggle can
+skip it.
+
+A released selection is copied from an OFF-SCREEN REDRAW, not from the frame: the
+selected rows are drawn again, `view::SELECTION_COPY_CHUNK_ROWS` at a time, with the
+pane's own widget, wrap and `row_window` windowing over the cached lines
+(`view::selection_copy_text`), and walked by the SAME blank rule, per-row cut and
+edge-row trim the highlight uses — the trim applied once to the whole selection,
+never per chunk. A per-frame record of drawn text is the rejected shape: rows the
+pane never drew would be missing from it. The selection is clamped to the cached
+TRANSCRIPT rows for both highlight and copy, because an in-flight reply's tail is
+drawn below them but is not in that cache — the one place the frame and the
+redraw would disagree. The parity test pins that an on-screen selection copies
+exactly what the drawn frame shows.
 
 The preview's own scroll is **bottom-anchored by default**
 (`App::preview_follow_bottom` starts true, is re-armed on every selection change
@@ -403,10 +426,10 @@ inner rect when there is no banner (so a banner-less pane's geometry is exactly
   the fold toggle re-renders at (so the hit-test and the re-render cannot resolve
   through different widths), and the selection's press gate
   (`update::press_starts_selection`, a drag's and a double-click's word alike),
-  its drag clamp and its highlight/copy overlay all read it. There is no second
-  copy of it in `update`. A click resolves through `App::preview_scroll` and the
-  width-scoped hit cache, both measured from that rect's origin — derive it
-  anywhere else and a click
+  its drag clamp, its autoscroll edges, its highlight overlay and its release
+  copy's width all read it. There is no second copy of it in `update`. A click
+  resolves through `App::preview_scroll` and the width-scoped hit cache, both
+  measured from that rect's origin — derive it anywhere else and a click
   silently opens the wrong link or folds the wrong node, or a drag starts on the
   pinned row. All three mouse actions are also gated off while any overlay is up
   (`overlay_active`, which counts the editor AND the draft card), so none fires
@@ -624,8 +647,9 @@ inner rect when there is no banner (so a banner-less pane's geometry is exactly
   frame later — whatever the reader or the match jump had just done. A one-shot
   cannot win against a per-frame recompute; give the decision state that outlasts
   the frame instead. Every transition is a USER ACT: ANY scroll releases the
-  anchor (in either direction — a scroll states a position, not a subscription),
-  and only `End` (or its `Ctrl-E` twin), another row, or a layout change that
+  anchor (in either direction — a scroll states a position, not a subscription —
+  and a drag held past the pane's edge included, on a step whose autoscroll
+  actually moves the pane), and only `End` (or its `Ctrl-E` twin), another row, or a layout change that
   brings the pane back from 1:0 (`App::set_pane_layout`, which `Shift-←` and an
   opening compose both go through) re-arms it. A step between two layouts that
   both show the pane neither arms nor releases it. The render writes the flag for
@@ -973,6 +997,28 @@ existing tick and redraw loop, so confirmations fade within ≤250 ms of the
 countdown reaching zero without ever drifting from the pulse or needing its own
 event source.
 
+**The one exception is a held drag's AUTOSCROLL**, and it is deliberately narrow:
+it is a MOTION that phases no animation, and it runs only while the gesture
+lasts. The rule exists to keep phased animations from drifting apart and to keep
+the idle board cheap, and the autoscroll threatens neither — nothing reads a
+phase off it, so nothing can drift against `blink_visible`, and with no drag held
+past the edge the loop blocks with no deadline, exactly as before. So it runs on a
+short frame deadline of its own rather than the tick: while
+`App::autoscroll_due_in` reports a drag held above or below the transcript rect,
+`tui::run_inner` waits for the next event with an `app::AUTOSCROLL_FRAME` (33 ms)
+timeout instead of blocking (`watch::EventLoop::wait`, whose `Waited` tells an
+event, a timeout and a closed channel apart), and after EVERY wake-up — an event
+or the deadline — calls `App::autoscroll_preview_selection`, which pays out the
+time that really elapsed through the pure `app::autoscroll_rows`: a page per
+`AUTOSCROLL_PAGE_PERIOD` for each row past the edge, up to
+`AUTOSCROLL_MAX_DISTANCE`, carrying the part of a row between frames. The speed
+therefore cannot depend on how often the loop wakes or the mouse reports a move,
+and the tick no longer steps it at all — riding the 250 ms tick made it jump a
+quarter page at a time. The exception covers exactly that: a new animation that
+PHASES anything, or a deadline armed outside a held gesture, is not it. A lost
+release would otherwise scroll forever, so a plain move while the press is held
+resolves as the release (`update::mouse_effect`).
+
 `blink_visible` is THE phase source, not one of two: the dot and the cursor both
 read it and therefore one `BLINK_TICKS`, so they pulse together. Anything
 animated later phases off it too — a second counter or cadence would drift
@@ -1029,7 +1075,7 @@ CADENCES and LIMITS, so a retune knows what it is next to:
 | `model_aliases` | `MAX_ALIAS_ARRAY_BYTES` (4096) · `SCAN_CHUNK_BYTES` (1 MiB) · `SCAN_OVERLAP_BYTES` (= `MAX_ALIAS_ARRAY_BYTES` by definition — that equality is what proves no match straddles a chunk unseen, so neither is retuned alone) |
 | `store::preview` | `MODEL_VERSION_MAX_DIGITS` (2) · `MODEL_DATE_DIGITS` (8 — kept above the version cap so a date never reads as a version) · `TABLE_MIN_COL_WIDTH` (10) · `RECORD_RULE_WIDTH` (32) · `COLUMN_RULE_WIDTH` (3) · `ELLIPSIS_WIDTH` (1) · `PEER_STEM_LEN` (17 — the agent-stem length a peer sender must match before it renders as an `@handle`, so a socket path or an agent TYPE name falls back to the generic label) · `PEER_HEADER_BLOCK_ROW` (1 — not a knob but a SHAPE: every fold node's header index — peer and injected alike — inside its own `[blank, header, body…]` block, named so the fold region and the body links rebase off one number) |
 | `send` | `SEND_ERROR_MAX` (200) |
-| `tui::app` | `PREVIEW_WHEEL_STEP` (2) · `LIST_WHEEL_STEP` (1) · `STATUS_DWELL_TICKS` (16) · `MIN_PANE_WIDTH` (15) · the list's share of the body per split `PaneLayout` stop: `PREVIEW_WIDE_LIST_PERCENT` (25) / `DEFAULT_LIST_PERCENT` (48) / `LIST_WIDE_LIST_PERCENT` (75) |
+| `tui::app` | `PREVIEW_WHEEL_STEP` (2) · `LIST_WHEEL_STEP` (1) · `STATUS_DWELL_TICKS` (16) · `MIN_PANE_WIDTH` (15) · the list's share of the body per split `PaneLayout` stop: `PREVIEW_WIDE_LIST_PERCENT` (25) / `DEFAULT_LIST_PERCENT` (48) / `LIST_WIDE_LIST_PERCENT` (75) · a held drag's autoscroll: `AUTOSCROLL_FRAME` (33 ms, the run loop's wait deadline while one is held past the edge — §7's one exception to animating from the tick) / `AUTOSCROLL_PAGE_PERIOD` (1 s, a page per row past the edge) / `AUTOSCROLL_MAX_DISTANCE` (4) |
 | `tui::update` | `PASTE_MAX_CHARS` (4096) |
 | `tui::view` | `BLINK_TICKS` (2) · `CHILD_ID_CHARS` (8) · `MATCH_JUMP_LEAD_DIVISOR` (3 — a jumped-to match parks `h / 3` rows down) · `WIDE_GLYPH_COLUMNS` (2) · `LINK_PROBE_BYTE_BUDGET` (131_072) · the layout rows `PREVIEW_BANNER_ROWS` / `BOARD_CHROME_ROWS` / `COMPOSE_*` / `MODAL_WIDTH` / `MODAL_*_CHROME_ROWS` / `MODAL_BORDER_ROWS` / `MODAL_BORDER_COLS` / `MODAL_LIST_MAX_ROWS` (12 — the most CHOICES a `List` picker offers before it scrolls, so an overlay stays an overlay on a tall terminal; a wrapped row's extra lines are paid on top, see [§5](#5-selection-and-scroll-survive-reloads)) |
 
@@ -1158,8 +1204,11 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    double-click either. A mouse
    wheel is handled **before** and **independent of** that gate: it never routes
    into an overlay handler, it only scrolls a pane, and it (like any keypress)
-   clears an active preview text selection first, since scrolling changes what
-   the selection's absolute cells sit over. A new
+   clears an active preview text selection first. The selection is
+   content-anchored, so the scroll alone would not strand it; the notch ends it
+   because a notch during a HELD drag would otherwise have to extend that drag
+   too, and it does not — a drag moves the pane only through its own autoscroll.
+   A new
    keyboard owner must be added to `overlay_active` too, or the mouse will act
    underneath it.
 
@@ -1411,8 +1460,9 @@ keymap row after EVERY drag until a key was pressed, which a reader working with
 the mouse alone may never do.
 
 A drag over blank cells alone gets NO line at all, and that is not a missing
-nudge. It selects no drawn text, so the view records `None`, the release requests
-no copy, and there is no outcome to report — the clipboard is untouched and
+nudge. It selects no drawn text, so its release copy (`view::preview_selection_copy`)
+is `None`, the release requests no copy, and there is no outcome to report — the
+clipboard is untouched and
 nothing is highlighted, which the user can already see. Do not add a status for it.
 
 A new confirmation earns stickiness only by the same kind of argument: the user

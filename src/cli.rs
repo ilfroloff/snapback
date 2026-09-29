@@ -117,9 +117,11 @@ KEYS:
     drag          in the preview: select transcript text; on release it is
                   copied the way Ctrl-X y copies (your clipboard tool, or OSC 52
                   over SSH). A drag that starts on a node or a link selects it
-                  rather than unfolding or opening it. Off while a compose or
-                  draft box is open. Hold Shift/Option for your terminal's own
-                  selection instead
+                  rather than unfolding or opening it. Hold the drag past the
+                  pane's top or bottom edge and it scrolls that way, faster the
+                  further out, so the selection keeps growing until you let go.
+                  Off while a compose or draft box is open. Hold Shift/Option
+                  for your terminal's own selection instead
     double-click  in the preview: select the word under the pointer and copy it
                   on release, the same way a drag copies (two clicks on one
                   cell within half a second). The first click still unfolds a

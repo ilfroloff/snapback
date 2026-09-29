@@ -40,9 +40,9 @@ use crate::store::preview::{self, FoldRegion, LinkRegion};
 use crate::store::FailedTask;
 
 use super::app::{
-    resolve_list_width, App, ComposeDefault, InterruptRoute, Modal, ModalAction, ModalChoice,
-    ModalLayout, NewSessionDraft, PaneLayout, PreviewSelection, Row, Scope, SelectionUnit,
-    MODEL_DEFAULT_LABEL, MODEL_NEW_SESSION_SCOPE,
+    resolve_list_width, App, ComposeDefault, ContentPos, InterruptRoute, Modal, ModalAction,
+    ModalChoice, ModalLayout, NewSessionDraft, PaneLayout, PreviewSelection, Row, Scope,
+    SelectionUnit, MODEL_DEFAULT_LABEL, MODEL_NEW_SESSION_SCOPE,
 };
 use super::compose::{ComposeState, ComposeTarget};
 
@@ -89,12 +89,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     render_header(frame, app, header_area);
     render_body(frame, app, body_area);
-    // Reverse-video the active mouse text selection directly over the rendered
-    // preview cells — after `render_body` has drawn them, before any modal
-    // overlays this frame — and record the text under it, which is what a
-    // finished drag hands to the copy path on button-up.
-    let selected_text = overlay_preview_selection(frame, app);
-    app.set_preview_selection_text(selected_text);
+    // Reverse-video the VISIBLE part of the active mouse text selection directly
+    // over the rendered preview cells — after `render_body` has drawn them (and
+    // resolved this frame's scroll), before any modal overlays this frame. Nothing
+    // is recorded: the release copies the whole selection off screen instead
+    // (`preview_selection_copy`), rows the pane never drew included.
+    overlay_preview_selection(frame, app);
     if let Some(compose_bar) = compose_bar {
         render_compose_zone(frame, app, compose_bar);
     }
@@ -2211,6 +2211,7 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
         // so a later selection can size a page.
         app.preview_viewport_h = inner_height;
         app.preview_scroll = 0;
+        app.preview_content_h = 0;
         frame.render_widget(
             Paragraph::new("No session selected.")
                 .style(Style::default().add_modifier(Modifier::DIM))
@@ -2311,8 +2312,13 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     // from `offset` — measured against the CARD (see `content_h` above), so it is 0
     // unless the card itself overflows a very narrow pane — only the write-back is
     // skipped, so `preview_scroll` keeps describing the transcript throughout.
+    // The content height it was clamped against goes back WITH it, for the same
+    // reason and under the same condition: a held drag's autoscroll clamps its
+    // next step against it (`App::autoscroll_preview_selection`), exactly as the
+    // next frame will.
     if !showing_card {
         app.preview_scroll = offset;
+        app.preview_content_h = content_h;
     }
     app.preview_viewport_h = inner_height;
 
@@ -3402,28 +3408,42 @@ struct SelectedRun {
     x1: u16,
 }
 
-/// What a selection between the ordered endpoints `start` and `end`, confined to
-/// transcript rect `rect`, actually selects in `buf`, top to bottom: each row's
-/// [`flow_span_on_row`] span cut at its last drawn cell
-/// ([`cut_at_last_text_cell`]), `None` for a blank row between two drawn ones, and
-/// the blank rows at either edge dropped ([`trim_blank_edge_rows`]). Empty when the
-/// selection covers blank cells alone.
+/// Every row a selection between the ordered endpoints `start` and `end`,
+/// confined to transcript rect `rect`, reaches in `buf`, top to bottom: each row's
+/// [`flow_span_on_row`] span cut at its last drawn cell ([`cut_at_last_text_cell`]),
+/// `None` for a row that cut found blank — the edge rows NOT yet trimmed.
 ///
-/// The ONE answer the highlight and the copy both walk, which is what keeps the
-/// reverse-videoed cells and the copied text the same cells. Pure over a `Buffer`.
+/// Untrimmed because the release copy ([`selection_copy_text`]) draws a long
+/// selection in chunks and must trim the edges of the WHOLE selection, never of
+/// each chunk: a blank row at a chunk's edge may be a paragraph break inside it.
+/// Pure over a `Buffer`.
+fn flow_runs(buf: &Buffer, start: Position, end: Position, rect: Rect) -> Vec<Option<SelectedRun>> {
+    (start.y..=end.y)
+        .filter_map(|y| flow_span_on_row(start, end, rect, y).map(|span| (y, span)))
+        .map(|(y, span)| {
+            cut_at_last_text_cell(buf, y, span).map(|(x0, x1)| SelectedRun { y, x0, x1 })
+        })
+        .collect()
+}
+
+/// What a selection between the ordered endpoints `start` and `end`, confined to
+/// transcript rect `rect`, actually selects in `buf`, top to bottom: its
+/// [`flow_runs`] with the blank rows at either edge dropped
+/// ([`trim_blank_edge_rows`]). Empty when the selection covers blank cells alone.
+///
+/// The ONE rule both the highlight and the copy apply, which is what keeps the
+/// reverse-videoed cells and the copied text the same cells: the highlight calls it
+/// over the frame's visible slice ([`visible_selection_runs`]); the copy applies
+/// its two halves across an off-screen redraw ([`selection_copy_text`]) —
+/// [`flow_runs`] per chunk, the edge-row trim once over the whole selection. Pure
+/// over a `Buffer`.
 fn selected_runs(
     buf: &Buffer,
     start: Position,
     end: Position,
     rect: Rect,
 ) -> Vec<Option<SelectedRun>> {
-    let rows: Vec<Option<SelectedRun>> = (start.y..=end.y)
-        .filter_map(|y| flow_span_on_row(start, end, rect, y).map(|span| (y, span)))
-        .map(|(y, span)| {
-            cut_at_last_text_cell(buf, y, span).map(|(x0, x1)| SelectedRun { y, x0, x1 })
-        })
-        .collect();
-    trim_blank_edge_rows(&rows).to_vec()
+    trim_blank_edge_rows(&flow_runs(buf, start, end, rect)).to_vec()
 }
 
 /// The runs a double-click at `at` selects: the ONE word under that cell on its
@@ -3476,6 +3496,14 @@ fn word_runs(buf: &Buffer, at: Position, rect: Rect) -> Vec<Option<SelectedRun>>
     })]
 }
 
+/// The symbols of `run`'s cells in `buf`, in order — one selected row's text.
+fn run_text(buf: &Buffer, run: SelectedRun) -> String {
+    (run.x0..run.x1)
+        .filter_map(|x| buf.cell((x, run.y)))
+        .map(|cell| cell.symbol())
+        .collect()
+}
+
 /// The text `runs` cover in `buf`: each run's cell symbols in order, a blank row
 /// between two drawn ones as `""`, the rows joined with `\n`. `None` for no runs —
 /// a selection over blank cells alone has nothing to copy. Nothing is trimmed here:
@@ -3487,53 +3515,136 @@ fn selection_text(buf: &Buffer, runs: &[Option<SelectedRun>]) -> Option<String> 
     }
     let rows: Vec<String> = runs
         .iter()
-        .map(|run| match run {
-            Some(run) => (run.x0..run.x1)
-                .filter_map(|x| buf.cell((x, run.y)))
-                .map(|cell| cell.symbol())
-                .collect(),
-            None => String::new(),
-        })
+        .map(|run| run.map(|run| run_text(buf, run)).unwrap_or_default())
         .collect();
     Some(rows.join("\n"))
 }
 
-/// Reverse-video the active preview text selection over the rendered cells and
-/// return the text under it — what a finished drag copies, recorded by [`render`]
-/// into [`App::set_preview_selection_text`]. `None` with no selection, AND when the
-/// selection covers blank cells alone: `update::mouse_effect`'s release arm turns
-/// that `None` into no copy and no link-open, so a drag over empty space leaves the
-/// clipboard alone.
+/// A window of content rows `top..bottom` drawn from the top of `rect`: the
+/// frame's visible slice of the transcript, or one chunk of a release copy's
+/// off-screen redraw. Row `top` is drawn on `rect.y`, and the window is never
+/// taller than `rect` (nor empty: `top < bottom`).
+#[derive(Debug, Clone, Copy)]
+struct RowWindow {
+    rect: Rect,
+    top: usize,
+    bottom: usize,
+}
+
+impl RowWindow {
+    /// Where content cell `at` falls in this window, PINNED to it: a row inside
+    /// maps to its own cell, a row above to the window's first cell, a row below
+    /// to its last — exactly where a flowing selection that reaches past the window
+    /// crosses its edge. Monotonic in reading order, so [`ordered`] of two pinned
+    /// ends is the two ends' order.
+    fn pin(self, at: ContentPos) -> Position {
+        let rect = self.rect;
+        let (row, col) = if at.row < self.top {
+            (self.top, 0)
+        } else if at.row >= self.bottom {
+            (self.bottom - 1, rect.width.saturating_sub(1))
+        } else {
+            (at.row, at.col)
+        };
+        // `row - top` is below the window's height, which fits the rect's `u16`.
+        Position {
+            x: rect.x.saturating_add(col),
+            y: rect
+                .y
+                .saturating_add(u16::try_from(row - self.top).unwrap_or(u16::MAX)),
+        }
+    }
+
+    /// The flowing selection between `a` and `b` as it crosses this window: both
+    /// ends [pinned](Self::pin) into it and put in reading order ([`ordered`]),
+    /// ready for [`flow_span_on_row`]'s geometry — or `None` when no row of it
+    /// falls inside, i.e. BOTH ends lie on the same side of the window.
+    fn flow_ends(self, a: ContentPos, b: ContentPos) -> Option<(Position, Position)> {
+        let above = |at: ContentPos| at.row < self.top;
+        let below = |at: ContentPos| at.row >= self.bottom;
+        if (above(a) && above(b)) || (below(a) && below(b)) {
+            return None;
+        }
+        Some(ordered(self.pin(a), self.pin(b)))
+    }
+
+    /// The cell a double-click's word anchor `at` is drawn on, when its row is in
+    /// this window.
+    fn word_cell(self, at: ContentPos) -> Option<Position> {
+        (self.top..self.bottom)
+            .contains(&at.row)
+            .then(|| self.pin(at))
+    }
+}
+
+/// The runs to reverse-video in a frame `buf` whose transcript rect `rect` is
+/// scrolled to `scroll`: the part of the content-anchored `selection` that is ON
+/// SCREEN, mapped into `rect`, over the first `transcript_rows` rows only.
 ///
-/// Reads the RENDERED buffer as the single source of truth for what is on screen,
-/// so the highlight and the copy are the post-wrap, post-scroll characters the user
-/// sees, with no re-derivation of the wrapped layout. Both walk the ONE runs answer
-/// — [`selected_runs`] for a drag, each row cut at its last drawn cell and the blank
-/// rows at either edge dropped, or [`word_runs`] for a double-click's word — so a
-/// cell is reverse-videoed if and only if it is copied:
-/// the highlight reads like an editor's selection, never a full-width band of empty
-/// cells. A blank row between two drawn rows gets no highlight at all and copies as
-/// an empty line. It sets no status: the copy's status comes from its RESULT, in
+/// The visible content rows are `scroll .. scroll + rect.height`, cut short at
+/// `transcript_rows` — the cached transcript's own height — so the rows an
+/// in-flight reply's tail is drawn on below the transcript are never highlighted:
+/// the release copies transcript rows only ([`selection_copy_text`]), and a
+/// highlight over the tail would show text the copy leaves out. An end above that
+/// window is pinned to its first row's left edge and an end below it to its last
+/// row's right edge ([`RowWindow::pin`]), and the result goes through the one
+/// [`selected_runs`] rule — [`flow_runs`], then the edge-row trim — or
+/// [`word_runs`] for a double-click's word. No row outside `rect` can come out of
+/// it, whatever rect the selection was made in. Pure over a `Buffer`.
+fn visible_selection_runs(
+    buf: &Buffer,
+    selection: PreviewSelection,
+    rect: Rect,
+    scroll: u32,
+    transcript_rows: usize,
+) -> Vec<Option<SelectedRun>> {
+    let top = usize::try_from(scroll).unwrap_or(usize::MAX);
+    let bottom = top
+        .saturating_add(usize::from(rect.height))
+        .min(transcript_rows);
+    if top >= bottom || rect.width == 0 {
+        return Vec::new();
+    }
+    let window = RowWindow { rect, top, bottom };
+    match selection.unit {
+        SelectionUnit::Chars => window
+            .flow_ends(selection.anchor, selection.cursor)
+            .map_or_else(Vec::new, |(from, to)| selected_runs(buf, from, to, rect)),
+        SelectionUnit::Word => window
+            .word_cell(selection.anchor)
+            .map_or_else(Vec::new, |at| word_runs(buf, at, rect)),
+    }
+}
+
+/// Reverse-video the VISIBLE part of the active preview text selection over the
+/// rendered cells ([`visible_selection_runs`]).
+///
+/// Reads the RENDERED buffer, so the highlight is the post-wrap, post-scroll
+/// characters the user sees. It walks the one [`selected_runs`] rule — each row cut
+/// at its last drawn cell, the blank rows at either edge dropped — so the highlight
+/// reads like an editor's selection, never a full-width band of empty cells, and a
+/// blank row between two drawn rows gets no highlight at all. The release copies
+/// the WHOLE selection by the same rule over an off-screen redraw
+/// ([`preview_selection_copy`]), so a cell on screen is reverse-videoed if and only
+/// if it is copied. It sets no status: the copy's status comes from its RESULT, in
 /// `update::finish_copy`, once the clipboard path has run.
-fn overlay_preview_selection(frame: &mut Frame, app: &App) -> Option<String> {
-    let PreviewSelection {
-        anchor,
-        cursor,
-        unit,
-    } = app.preview_selection()?;
-    // The same transcript rect the press was gated on and the drag clamped to.
+fn overlay_preview_selection(frame: &mut Frame, app: &mut App) {
+    let Some(selection) = app.preview_selection() else {
+        return;
+    };
+    // The same transcript rect the press was gated on and the drag clamped to, as
+    // THIS frame laid it out.
     let rect = preview_transcript_rect(app);
     if rect.width == 0 || rect.height == 0 {
-        return None;
+        return;
     }
-    let (start, end) = ordered(anchor, cursor);
+    let transcript_rows = app.preview_wrapped_rows(rect.width);
+    let scroll = app.preview_scroll;
     let buf = frame.buffer_mut();
-    let runs = match unit {
-        SelectionUnit::Chars => selected_runs(buf, start, end, rect),
-        SelectionUnit::Word => word_runs(buf, anchor, rect),
-    };
-    let text = selection_text(buf, &runs)?;
-    for run in runs.iter().flatten() {
+    for run in visible_selection_runs(buf, selection, rect, scroll, transcript_rows)
+        .iter()
+        .flatten()
+    {
         for x in run.x0..run.x1 {
             if let Some(cell) = buf.cell_mut(Position { x, y: run.y }) {
                 // Merge REVERSED in (a `Modifier`, not a color, so this honors
@@ -3542,7 +3653,163 @@ fn overlay_preview_selection(frame: &mut Frame, app: &App) -> Option<String> {
             }
         }
     }
-    Some(text)
+}
+
+/// Rows of the transcript a released selection's copy redraws per off-screen
+/// buffer ([`selection_copy_text`]).
+///
+/// It BOUNDS the work, rather than tuning it: a buffer holds `rows × width` cells,
+/// and one `Paragraph` re-wraps every line it is handed, so drawing a
+/// 10,000-row selection in one buffer would allocate it whole and hand the widget
+/// every selected line at once — and a buffer's height is a `u16`, which a long
+/// selection in a narrow pane can outgrow. 256 rows keeps each buffer a small,
+/// fixed size (a 100-column pane: about 25,600 cells) while leaving the per-chunk
+/// overhead negligible: 10,000 rows × 100 columns was measured at ~34 ms in a
+/// release build (~486 ms debug) in chunks of this size, spent once, on release,
+/// never per frame.
+const SELECTION_COPY_CHUNK_ROWS: u16 = 256;
+
+/// Draw `height` wrapped rows of the transcript `lines`, starting at content row
+/// `top`, into a fresh `width`-wide off-screen buffer — with the SAME widget, wrap
+/// and windowing the pane draws with ([`render_preview`]): the lines
+/// [`row_window`] says those rows reach, in a `Paragraph` with
+/// `Wrap { trim: false }`, scrolled by the residual inside the first of them. So
+/// row `y` of the buffer holds exactly what the pane shows at content row
+/// `top + y`, style marks aside (a search mark or the highlight never changes a
+/// symbol). Pure.
+fn draw_transcript_rows(
+    lines: &[Line<'_>],
+    row_prefix: &[usize],
+    top: usize,
+    height: u16,
+    width: u16,
+) -> Buffer {
+    let area = Rect::new(0, 0, width, height);
+    let mut buf = Buffer::empty(area);
+    let (range, residual) = row_window(row_prefix, top, height);
+    Widget::render(
+        Paragraph::new(Text::from(lines[range].to_vec()))
+            .wrap(Wrap { trim: false })
+            .scroll((u16::try_from(residual).unwrap_or(u16::MAX), 0)),
+        area,
+        &mut buf,
+    );
+    buf
+}
+
+/// The text a released `selection` copies from the transcript `lines` (with their
+/// [`wrapped_row_prefix`] map `row_prefix`) wrapped at `width` — ALL of it, rows
+/// the pane never drew included, by the same rules the highlight draws with.
+///
+/// Redraws the selected rows off screen, [`SELECTION_COPY_CHUNK_ROWS`] at a time
+/// ([`draw_transcript_rows`]), and walks each chunk with [`flow_runs`]: the one
+/// blank rule, the one per-row cut at the last drawn cell. The rows of every chunk
+/// are gathered first and only then is the WHOLE selection's edge trimmed
+/// ([`trim_blank_edge_rows`]) — per chunk, it would turn a paragraph break that
+/// happens to sit on a chunk's edge into a lost line. A double-click's word is its
+/// one row's [`word_runs`]. The selection is clamped to the transcript's own rows,
+/// so the in-flight reply tail the pane draws below them — never in this cache —
+/// is never copied, which is also why the highlight never covers it. `None` when
+/// the selection holds no drawn text: its release copies nothing. Pure.
+fn selection_copy_text(
+    lines: &[Line<'_>],
+    row_prefix: &[usize],
+    selection: PreviewSelection,
+    width: u16,
+) -> Option<String> {
+    selection_copy_text_in_chunks(
+        lines,
+        row_prefix,
+        selection,
+        width,
+        SELECTION_COPY_CHUNK_ROWS,
+    )
+}
+
+/// [`selection_copy_text`] with the chunk height as a parameter, so a test can
+/// cross many chunk edges with a small selection. Pure.
+fn selection_copy_text_in_chunks(
+    lines: &[Line<'_>],
+    row_prefix: &[usize],
+    selection: PreviewSelection,
+    width: u16,
+    chunk_rows: u16,
+) -> Option<String> {
+    let transcript_rows = row_prefix.last().copied().unwrap_or(0);
+    if width == 0 || chunk_rows == 0 || transcript_rows == 0 {
+        return None;
+    }
+    if selection.unit == SelectionUnit::Word {
+        // A word never leaves its one drawn row, so one row is the whole redraw.
+        let row = selection.anchor.row;
+        if row >= transcript_rows {
+            return None;
+        }
+        let buf = draw_transcript_rows(lines, row_prefix, row, 1, width);
+        let window = RowWindow {
+            rect: buf.area,
+            top: row,
+            bottom: row + 1,
+        };
+        let runs = window
+            .word_cell(selection.anchor)
+            .map_or_else(Vec::new, |at| word_runs(&buf, at, buf.area));
+        return selection_text(&buf, &runs);
+    }
+    // The selection's rows, clamped to the transcript's own: the reply tail below
+    // them is not in this cache, and the highlight never covers it either.
+    let first = selection.anchor.min(selection.cursor).row;
+    let last = selection
+        .anchor
+        .max(selection.cursor)
+        .row
+        .min(transcript_rows - 1);
+    if first > last {
+        return None;
+    }
+    let mut rows: Vec<Option<String>> = Vec::with_capacity(last - first + 1);
+    let mut top = first;
+    while top <= last {
+        let height =
+            u16::try_from((last - top + 1).min(usize::from(chunk_rows))).unwrap_or(chunk_rows);
+        let buf = draw_transcript_rows(lines, row_prefix, top, height, width);
+        let window = RowWindow {
+            rect: buf.area,
+            top,
+            bottom: top + usize::from(height),
+        };
+        if let Some((from, to)) = window.flow_ends(selection.anchor, selection.cursor) {
+            rows.extend(
+                flow_runs(&buf, from, to, buf.area)
+                    .into_iter()
+                    .map(|run| run.map(|run| run_text(&buf, run))),
+            );
+        }
+        top = window.bottom;
+    }
+    // The edge-row trim of the WHOLE selection, only now that every chunk is in.
+    let rows = trim_blank_edge_rows(&rows);
+    if rows.is_empty() {
+        return None;
+    }
+    Some(
+        rows.iter()
+            .map(|row| row.as_deref().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+/// What a released preview selection copies: [`selection_copy_text`] over the
+/// selected session's cached transcript at the transcript rect's width — the
+/// width the selection was made at, since a resize clears it. `None` with no
+/// selection, no transcript, or a selection over blank cells alone. The thin
+/// wrapper the release arm (`update::mouse_effect`) calls.
+pub(crate) fn preview_selection_copy(app: &mut App) -> Option<String> {
+    let selection = app.preview_selection()?;
+    let width = preview_transcript_rect(app).width;
+    let (lines, row_prefix) = app.preview_transcript(width)?;
+    selection_copy_text(lines, row_prefix, selection, width)
 }
 
 /// Resolve the final vertical preview offset: pin to the bottom when following,
@@ -3556,7 +3823,12 @@ fn overlay_preview_selection(frame: &mut Frame, app: &App) -> Option<String> {
 /// actually sits on instead of pinning at `u16::MAX` — where "follow the bottom"
 /// would stop short of the newest turn and every deeper offset would collapse
 /// onto one indistinguishable position.
-fn clamp_preview_offset(
+///
+/// The ONE clamp of the pane's offset: the draw resolves every frame's scroll
+/// through it, and a held drag's autoscroll clamps its step through it too
+/// (`App::autoscroll_preview_selection`), so the cursor that step derives sits on
+/// the row the next frame shows.
+pub(crate) fn clamp_preview_offset(
     follow_bottom: bool,
     requested: u32,
     content_h: usize,
@@ -3906,9 +4178,10 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         // is spelled out in `KEYS` and the README, not here. Like everything past
         // `^X` it is off-screen at 80 columns.
         // The rest — a click on its release still opens a link or unfolds a node,
-        // the copy goes the way `Ctrl-X y`'s does, Shift/Option for the terminal's
-        // own selection — is spelled out in `KEYS` and the README, where there is
-        // room.
+        // a drag held past the pane's top or bottom edge scrolls it and keeps
+        // selecting, the copy goes the way `Ctrl-X y`'s does, Shift/Option for the
+        // terminal's own selection — is spelled out in `KEYS` and the README, where
+        // there is room.
         Line::from(vec![Span::styled(
             "↑↓ move · ←/→ fold/expand · Enter resume · ^F fork · ^N new · ^R reply · ^K stop · ^X hide/del · type to search · Tab name/content · S-↑↓ match · ^A scope · S-←→ layout · PgUp/PgDn·^U/^D·^T/^E·Home/End·wheel scroll · drag copy · Esc quit",
             Style::default().add_modifier(Modifier::DIM),
@@ -6666,6 +6939,300 @@ mod tests {
             selected_runs(&buf, Position { x: 7, y: 0 }, Position { x: 2, y: 2 }, rect);
         assert_eq!(from_blank, vec![Some(SelectedRun { y: 2, x0: 0, x1: 3 })]);
         assert_eq!(selection_text(&buf, &from_blank).as_deref(), Some("wor"));
+    }
+
+    // --- a content-anchored selection: the visible slice, and the release copy ---
+
+    /// A flowing selection over content rows `anchor..cursor`, as the drag records it.
+    fn chars(anchor: (usize, u16), cursor: (usize, u16)) -> PreviewSelection {
+        PreviewSelection {
+            anchor: ContentPos {
+                row: anchor.0,
+                col: anchor.1,
+            },
+            cursor: ContentPos {
+                row: cursor.0,
+                col: cursor.1,
+            },
+            unit: SelectionUnit::Chars,
+        }
+    }
+
+    /// The frame's visible slice: rows `scroll ..` of the selection, mapped onto the
+    /// rect's rows; an end above the window pinned to its first cell and one below
+    /// to its last; nothing past the transcript's own rows (the reply tail's) and
+    /// nothing at all when the whole selection is off to one side.
+    #[test]
+    fn the_visible_slice_maps_a_content_selection_into_the_rect_and_pins_off_screen_ends() {
+        // The transcript rect sits INSIDE the frame, as it does under a banner row:
+        // content rows 10..13 are drawn on screen rows 2..=4, columns 1..=4, and
+        // every `z` is something else's cell (a banner, a border, the list).
+        let buf = Buffer::with_lines(["zzzzzz", "zzzzzz", "zaaaaz", "zbbbbz", "zccccz", "zzzzzz"]);
+        let rect = Rect::new(1, 2, 4, 3);
+        let run = |y: u16, x0: u16, x1: u16| Some(SelectedRun { y, x0, x1 });
+        let visible = |selection: PreviewSelection, transcript_rows: usize| {
+            visible_selection_runs(&buf, selection, rect, 10, transcript_rows)
+        };
+
+        assert_eq!(
+            visible(chars((11, 1), (12, 2)), 100),
+            vec![run(3, 2, 5), run(4, 1, 4)],
+            "rows 11..=12 are screen rows 3..=4"
+        );
+        assert_eq!(
+            visible(chars((20, 3), (5, 2)), 100),
+            vec![run(2, 1, 5), run(3, 1, 5), run(4, 1, 5)],
+            "both ends off screen, either order: every visible row, edge to edge"
+        );
+        assert_eq!(
+            visible(chars((11, 2), (50, 0)), 100),
+            vec![run(3, 3, 5), run(4, 1, 5)],
+            "an end below runs the last visible row to its edge"
+        );
+        assert_eq!(visible(chars((2, 0), (9, 3)), 100), Vec::new(), "all above");
+        assert_eq!(
+            visible(chars((13, 0), (40, 3)), 100),
+            Vec::new(),
+            "all below"
+        );
+        assert_eq!(
+            visible(chars((5, 0), (50, 0)), 12),
+            vec![run(2, 1, 5), run(3, 1, 5)],
+            "rows past the transcript's own (a reply tail's) are never lit"
+        );
+        let word = |row: usize| PreviewSelection {
+            anchor: ContentPos { row, col: 1 },
+            cursor: ContentPos { row, col: 1 },
+            unit: SelectionUnit::Word,
+        };
+        assert_eq!(visible(word(11), 100), vec![run(3, 1, 5)]);
+        assert_eq!(visible(word(9), 100), Vec::new(), "a word scrolled off");
+        assert_eq!(visible(word(12), 12), Vec::new(), "a word in the tail");
+
+        // Whatever the two ends, no run ever leaves the rect: the `z` cells around
+        // it are never lit.
+        for a in 0..30 {
+            for b in 0..30 {
+                for (ca, cb) in [(0, 3), (2, 0), (3, 3)] {
+                    for run in visible(chars((a, ca), (b, cb)), 100).iter().flatten() {
+                        assert!(
+                            rect.contains(Position {
+                                x: run.x0,
+                                y: run.y
+                            }) && run.x1 <= rect.right(),
+                            "{a}:{ca} -> {b}:{cb} lit {run:?} outside {rect:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Lines shaped to exercise every rule the copy shares with the highlight:
+    /// lines that WORD-wrap (rows that end early, and a scroll residual that lands
+    /// inside a line), blank lines (interior blank rows and blank chunk edges), and
+    /// short lines (blank space right of the text).
+    fn copy_fixture_lines(count: usize) -> Vec<Line<'static>> {
+        (0..count)
+            .map(|i| match i % 7 {
+                2 | 5 => Line::from(""),
+                4 => Line::from(format!(
+                    "{i} a long line that has to wrap across several rows of a narrow pane"
+                )),
+                _ => Line::from(format!("line {i}")),
+            })
+            .collect()
+    }
+
+    /// `lines` drawn WHOLE into one buffer — no window, no residual, nothing of the
+    /// copy's own machinery — as the ground truth a chunked copy must reproduce.
+    fn draw_whole(lines: &[Line<'static>], width: u16, rows: u16) -> Buffer {
+        let area = Rect::new(0, 0, width, rows);
+        let mut buf = Buffer::empty(area);
+        Widget::render(
+            Paragraph::new(Text::from(lines.to_vec())).wrap(Wrap { trim: false }),
+            area,
+            &mut buf,
+        );
+        buf
+    }
+
+    /// The copy is the same whatever the chunk height: every chunk edge — a blank
+    /// row on it, a wrapped line split by it — is invisible in the result, and the
+    /// edge-row trim applies to the WHOLE selection, never per chunk. Checked
+    /// against the selection drawn in ONE buffer by the committed on-screen rule,
+    /// and past the transcript's last row the copy stops at that row.
+    #[test]
+    fn a_long_selection_copies_the_same_across_any_chunk_size() {
+        let width = 24;
+        let lines = copy_fixture_lines(300);
+        let prefix = wrapped_row_prefix(&lines, width);
+        let rows = *prefix.last().expect("a prefix map");
+        let whole = draw_whole(&lines, width, u16::try_from(rows).expect("fits a buffer"));
+        let last_row = u16::try_from(rows - 1).expect("fits");
+        let cases = [
+            ((5, 2), (rows - 4, 3)),
+            ((2, 0), (rows - 1, width - 1)), // starts on a blank row
+            ((rows - 3, 5), (1, 1)),         // dragged upward
+            ((40, 0), (rows + 25, 0)),       // runs past the transcript's end
+            ((9, 0), (9, 0)),                // one cell
+        ];
+        for (anchor, cursor) in cases {
+            let pin = |(row, col): (usize, u16)| {
+                if row >= rows {
+                    Position {
+                        x: width - 1,
+                        y: last_row,
+                    }
+                } else {
+                    Position {
+                        x: col,
+                        y: u16::try_from(row).expect("fits"),
+                    }
+                }
+            };
+            let (start, end) = ordered(pin(anchor), pin(cursor));
+            let expected = selection_text(&whole, &selected_runs(&whole, start, end, whole.area));
+            assert!(
+                expected.is_some(),
+                "premise: {anchor:?}..{cursor:?} holds text"
+            );
+            for chunk in [1, 2, 3, 7, 64, SELECTION_COPY_CHUNK_ROWS, u16::MAX] {
+                assert_eq!(
+                    selection_copy_text_in_chunks(
+                        &lines,
+                        &prefix,
+                        chars(anchor, cursor),
+                        width,
+                        chunk
+                    ),
+                    expected,
+                    "{anchor:?}..{cursor:?} in chunks of {chunk}"
+                );
+            }
+        }
+        assert_eq!(
+            selection_copy_text(&lines, &prefix, chars((rows, 0), (rows + 9, 5)), width),
+            None,
+            "a selection wholly past the transcript copies nothing"
+        );
+    }
+
+    /// The transcript for the parity test: several turns whose lines word-wrap in
+    /// [`PARITY_PANE`], with blank lines between paragraphs and bullet indents.
+    fn parity_session(dir: &Path) -> Session {
+        let file = dir.join("sess-parity.jsonl");
+        let mut out = String::new();
+        for turn in 0..6 {
+            let role = if turn % 2 == 0 { "user" } else { "assistant" };
+            out.push_str(&format!(
+                concat!(
+                    r#"{{"type":"{role}","sessionId":"sess-parity","cwd":"/tmp","#,
+                    r#""timestamp":"2026-07-01T10:00:00.000Z","#,
+                    r#""message":{{"role":"{role}","content":"turn {turn} opens with a "#,
+                    r#"paragraph long enough to wrap in a narrow pane\n\n- a bullet "#,
+                    r#"item\n- another bullet that also runs long enough to wrap\n\n"#,
+                    r#"short\n\nand a closing line for turn {turn}"}}}}"#,
+                    "\n",
+                ),
+                role = role,
+                turn = turn,
+            ));
+        }
+        std::fs::write(&file, out).expect("write the parity fixture");
+        Session {
+            file,
+            session_id: "sess-parity".to_string(),
+            cwd: PathBuf::from("/tmp"),
+            git_branch: Some("main".to_string()),
+            timestamp: None,
+            repo: "repo".to_string(),
+            label: "parity session".to_string(),
+            root_uuid: None,
+            msg_count: 0,
+            content_index: String::new(),
+            background: false,
+            has_agent_name: false,
+            has_agent_setting: false,
+            failed_task: None,
+        }
+    }
+
+    /// The pane the parity test draws: narrow, so the fixture's lines wrap, and
+    /// short, so the transcript overflows it several times.
+    const PARITY_PANE: (u16, u16) = (32, 12);
+
+    /// PARITY: a selection fully on screen copies EXACTLY what the drawn frame
+    /// shows under it — the text the committed on-screen rule reads off the frame
+    /// the pane drew ([`selected_runs`] / [`word_runs`] -> [`selection_text`]), for
+    /// every pair of a grid of cells, at several scroll positions including ones
+    /// that start inside a wrapped line, and for a double-click's word on every
+    /// cell. The release redraws those rows off screen instead of reading the
+    /// frame, so this is what proves the redraw IS the frame.
+    #[test]
+    fn a_selection_on_screen_copies_exactly_what_the_drawn_frame_shows() {
+        let (width, height) = PARITY_PANE;
+        let dir = unique_temp_dir("copy-parity");
+        let mut app = App::new(
+            vec![parity_session(&dir)],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        // `preview_buffer` draws the pane over the whole frame; say so, so the
+        // shared transcript rect is the one it drew into.
+        app.preview_rect = Rect::new(0, 0, width, height);
+        let rect = preview_transcript_rect(&app);
+        let cols = [0, 3, rect.width / 2, rect.width - 1];
+        let cells: Vec<Position> = (rect.y..rect.bottom())
+            .flat_map(|y| cols.iter().map(move |&c| Position { x: rect.x + c, y }))
+            .collect();
+        let mut compared = 0;
+        let mut scrolls = Vec::new();
+        for requested in [None, Some(0), Some(1), Some(4), Some(9)] {
+            if let Some(scroll) = requested {
+                app.preview_follow_bottom = false;
+                app.preview_scroll = scroll;
+            }
+            let drawn = preview_buffer(&mut app, width, height);
+            scrolls.push(app.preview_scroll);
+            for &a in &cells {
+                for &b in &cells {
+                    app.begin_preview_press(a, rect);
+                    app.extend_preview_selection(b, rect);
+                    if !app.has_preview_selection() {
+                        continue; // a zero-length drag is a click, not a selection
+                    }
+                    let (start, end) = ordered(a, b);
+                    let shown = selection_text(&drawn, &selected_runs(&drawn, start, end, rect));
+                    assert_eq!(
+                        preview_selection_copy(&mut app),
+                        shown,
+                        "scroll {}: {a:?} -> {b:?}",
+                        app.preview_scroll
+                    );
+                    compared += 1;
+                }
+            }
+            for y in rect.y..rect.bottom() {
+                for x in rect.x..rect.right() {
+                    let at = Position { x, y };
+                    app.begin_word_selection(at, rect);
+                    let shown = selection_text(&drawn, &word_runs(&drawn, at, rect));
+                    assert_eq!(
+                        preview_selection_copy(&mut app),
+                        shown,
+                        "scroll {}: word at {at:?}",
+                        app.preview_scroll
+                    );
+                }
+            }
+        }
+        assert!(
+            scrolls.windows(2).all(|w| w[0] != w[1]),
+            "premise: every pass drew a different scroll ({scrolls:?})"
+        );
+        assert!(compared > 1000, "premise: the sweep compared {compared}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A 20-wide inner pane at origin (1,1); most link tests share it.
