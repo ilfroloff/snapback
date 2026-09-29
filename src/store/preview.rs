@@ -51,6 +51,9 @@
 //! NAMED ANSI colors, which adapt to the user's terminal theme (unlike hardcoded
 //! RGB, which can vanish on a light background). Code — inline and fenced — is
 //! DIM (and fenced code is indented), never syntax-highlighted with fixed colors.
+//! A clickable link's visible label is light blue, italic and underlined
+//! ([`link_style`]); one that cannot be clicked keeps its text but not that look
+//! ([`LinkRender`]).
 //!
 //! The WHOLE transcript is rendered — there is no tail cap — and the caller caches
 //! the result per session id, so markdown parsing never stalls the UI on a large
@@ -104,6 +107,12 @@ use super::Session;
 /// pane), and a region that cannot be placed correctly is worse than none — but it
 /// does mean clickability is width-dependent, so the switch point is pinned by
 /// `the_record_fallback_switch_points_are_pinned_at_a_62_column_pane`.
+///
+/// The link LOOK tracks the same switch, so a table never shows an affordance it
+/// cannot honor: a grid draws its links in [`link_style`], and record mode draws
+/// them [`LinkRender::Inert`] — same text, in the cell's own style. A click on a
+/// record-mode label resolves to no link and says nothing, so a label that looked
+/// clickable there would fail silently.
 const TABLE_MIN_COL_WIDTH: usize = 10;
 
 /// Width of the DIM `─` rule that separates two stacked records in the
@@ -156,14 +165,14 @@ const ELLIPSIS_WIDTH: usize = 1;
 /// A clickable link inside the rendered preview, in CONTENT coordinates (before
 /// the preview's soft-wrap is applied at draw time).
 ///
-/// The preview renders a link's label UNDERLINED and DISCARDS its url from the
-/// visible text (no OSC 8, no raw url — see [`parse_inline_collect`]). This
-/// records where that label lives so the app's own mouse handling can recover the
-/// url on a click: `content_row` indexes into the returned [`Text`]'s lines, and
-/// `col_start..col_end` is the label's DISPLAY-column span on that line. Columns
-/// depend on the render `width` (GFM tables shrink, wrap, and may change layout
-/// entirely), so regions are cached TOGETHER with the `Text` under the same width
-/// discipline (see [`App`]).
+/// The preview renders a link's label light blue, italic and UNDERLINED
+/// ([`link_style`]) and DISCARDS its url from the visible text (no OSC 8, no raw
+/// url — see [`parse_inline_collect`]). This records where that label lives so the
+/// app's own mouse handling can recover the url on a click: `content_row` indexes
+/// into the returned [`Text`]'s lines, and `col_start..col_end` is the label's
+/// DISPLAY-column span on that line. Columns depend on the render `width` (GFM
+/// tables shrink, wrap, and may change layout entirely), so regions are cached
+/// TOGETHER with the `Text` under the same width discipline (see [`App`]).
 ///
 /// [`App`]: crate::tui::app::App
 #[derive(Debug, Clone, PartialEq)]
@@ -1245,6 +1254,77 @@ fn header_style(level: usize) -> Style {
     }
 }
 
+/// A CLICKABLE link's visible label — a `[label](url)` or a bare `http(s)://`
+/// autolink ([`parse_inline_collect`]): `LightBlue` + ITALIC + UNDERLINED.
+///
+/// The color is blue because blue is the conventional link hue, and it is the
+/// NAMED ANSI bright blue so the user's theme picks the exact shade — hardcoded RGB
+/// would be wrong on every other theme and is forbidden (TERMINAL-SAFE STYLING).
+/// Bright rather than ANSI 4 `Blue`, which many dark palettes draw too dark to read
+/// against their background; the bright variant stays readable there and still
+/// holds up on a light theme.
+///
+/// The ITALIC and the UNDERLINE echo how terminals such as JetBrains' mark a url
+/// they auto-detect, so a label reads as the kind of thing a user already clicks in
+/// their terminal. The UNDERLINE also stays because the preview's hit-test tests
+/// locate a drawn link label by it.
+///
+/// No other style in this pane wears `LightBlue` — Yellow is a heading, Green
+/// `you`, Cyan `claude`, Magenta a peer or injected node — so a link is still told
+/// apart from an H1, which is underlined too. (The session LIST's search-match
+/// highlight shares the hue, but it sits in the other pane and is BOLD, never italic
+/// or underlined.) A link INSIDE a DIM run (a blockquote) keeps that DIM on top of
+/// the blue, so a terminal that honors DIM draws it a fainter blue than a link in
+/// prose — still blue, italic and underlined, and quiet in step with the quote
+/// around it; that is the price of letting the enclosing run's modifiers survive on
+/// the label.
+///
+/// PATCHED onto the enclosing run's style (`base.patch(link_style())`), so a link
+/// inside `**bold**` or a blockquote keeps that run's modifiers and adds only the
+/// link's color, italic and underline. Worn only where a click can land:
+/// [`LinkRender`] is the one place that decides, and a link whose region is never
+/// recorded (a table in its RECORD layout) is drawn [`LinkRender::Inert`] instead.
+/// It is a rendering decision, never an identity: a click resolves through the
+/// recorded [`LinkRegion`], not through this style (see [`WrapCell`]).
+pub(crate) fn link_style() -> Style {
+    Style::default()
+        .fg(Color::LightBlue)
+        .add_modifier(Modifier::ITALIC | Modifier::UNDERLINED)
+}
+
+/// Whether [`parse_inline_collect`] draws a link LOOKING like one — the ONE switch
+/// between a label in [`link_style`] and the same label in its enclosing run's own
+/// style.
+///
+/// It changes STYLE alone. The visible text (a label with its url hidden, the url
+/// for an empty label, a bare autolink's url) and the [`InlineLink`] columns are
+/// identical under both variants, so a caller's choice can never move a width, a
+/// wrap, or a region. What it keeps is the promise that NOTHING LOOKS CLICKABLE
+/// THAT IS NOT: a click on a label with no recorded region resolves to no link and
+/// writes nothing to the status line, so a label styled as a link there would
+/// promise a click that lands silently. The caller picks by whether its regions
+/// reach the pane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LinkRender {
+    /// Patch [`link_style`] over the run. The prose branches and GRID table cells,
+    /// whose regions are recorded and answer a click.
+    Clickable,
+    /// Leave the label in the run's own style — its bold/italic/quote kept, no link
+    /// color, italic or underline added. The RECORD table layout, which records no
+    /// regions (see [`TABLE_MIN_COL_WIDTH`]).
+    Inert,
+}
+
+impl LinkRender {
+    /// The style a link's visible label is drawn in, over the enclosing run `base`.
+    fn label_style(self, base: Style) -> Style {
+        match self {
+            Self::Clickable => base.patch(link_style()),
+            Self::Inert => base,
+        }
+    }
+}
+
 /// GFM table borders/separators (the `│` column rules and the `─┼─` separator
 /// row): DIM box-drawing, so they frame the table without a fixed RGB color —
 /// dark-terminal-safe, matching `code_style`/`marker_style`.
@@ -1403,7 +1483,9 @@ fn regions_from_inline(
 /// prefix on an ordinary logical line that the pane's own `Wrap { trim: false }`
 /// then re-wraps, so columns measured here would not survive to the paint.
 /// Recording nothing there keeps the promise that a click never opens the wrong
-/// url — and a table in record mode is in a narrow pane by definition.
+/// url — and a table in record mode is in a narrow pane by definition. Its links
+/// are drawn [`LinkRender::Inert`] to match, so nothing there LOOKS clickable
+/// either.
 fn markdown_body_lines_collect(body: &str, width: usize) -> (Vec<Line<'static>>, Vec<LinkRegion>) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut links: Vec<LinkRegion> = Vec::new();
@@ -1459,7 +1541,8 @@ fn markdown_body_lines_collect(body: &str, width: usize) -> (Vec<Line<'static>>,
             let content = rest.strip_prefix(' ').unwrap_or(rest);
             let mut spans = vec![Span::styled("\u{258f} ".to_string(), quote_style())];
             let prefix_width = spans_display_width(&spans);
-            let (inline_spans, inline_links) = parse_inline_collect(content, quote_style());
+            let (inline_spans, inline_links) =
+                parse_inline_collect(content, quote_style(), LinkRender::Clickable);
             links.extend(regions_from_inline(lines.len(), prefix_width, inline_links));
             spans.extend(inline_spans);
             lines.push(Line::from(spans));
@@ -1474,7 +1557,8 @@ fn markdown_body_lines_collect(body: &str, width: usize) -> (Vec<Line<'static>>,
                 Span::styled("\u{2022} ".to_string(), base_style()),
             ];
             let prefix_width = spans_display_width(&spans);
-            let (inline_spans, inline_links) = parse_inline_collect(rest, base_style());
+            let (inline_spans, inline_links) =
+                parse_inline_collect(rest, base_style(), LinkRender::Clickable);
             links.extend(regions_from_inline(lines.len(), prefix_width, inline_links));
             spans.extend(inline_spans);
             lines.push(Line::from(spans));
@@ -1487,7 +1571,8 @@ fn markdown_body_lines_collect(body: &str, width: usize) -> (Vec<Line<'static>>,
                 Span::styled(format!("{num}. "), base_style()),
             ];
             let prefix_width = spans_display_width(&spans);
-            let (inline_spans, inline_links) = parse_inline_collect(rest, base_style());
+            let (inline_spans, inline_links) =
+                parse_inline_collect(rest, base_style(), LinkRender::Clickable);
             links.extend(regions_from_inline(lines.len(), prefix_width, inline_links));
             spans.extend(inline_spans);
             lines.push(Line::from(spans));
@@ -1495,7 +1580,8 @@ fn markdown_body_lines_collect(body: &str, width: usize) -> (Vec<Line<'static>>,
             continue;
         }
 
-        let (inline_spans, inline_links) = parse_inline_collect(raw, base_style());
+        let (inline_spans, inline_links) =
+            parse_inline_collect(raw, base_style(), LinkRender::Clickable);
         links.extend(regions_from_inline(lines.len(), 0, inline_links));
         lines.push(Line::from(inline_spans));
         i += 1;
@@ -1684,8 +1770,12 @@ fn spans_display_text(spans: &[Span<'static>]) -> String {
 /// Display width of a table cell's VISIBLE text: parse inline markers, then
 /// measure the stripped result. This is the width columns are aligned to, so a
 /// styled cell (`**x**`, `` `x` ``, `[x](y)`) lines up with a plain one.
+///
+/// Only text is measured here, and [`LinkRender`] never changes text, so the width
+/// is the same whichever layout the cell ends up in; `Inert` because no style
+/// produced here is ever drawn.
 fn cell_display_width(raw: &str) -> usize {
-    spans_display_width(&parse_inline(raw, Style::default()))
+    spans_display_width(&parse_inline(raw, Style::default(), LinkRender::Inert))
 }
 
 /// Truncate parsed cell `spans` to at most `width` display columns, appending a
@@ -1725,9 +1815,10 @@ fn truncate_spans(spans: &[Span<'static>], width: usize, ellipsis: Style) -> Vec
 /// visible LABEL it belongs to (`None` for ordinary text).
 ///
 /// The link index is THREADED through the wrap rather than recovered afterwards
-/// from `Modifier::UNDERLINED`. Styling is a rendering decision, not an identity:
-/// two adjacent labels wear the same modifier, so it could not tell one link from
-/// the next — and anything else the preview ever underlines would read as a link.
+/// from [`link_style`]. Styling is a rendering decision, not an identity: two
+/// adjacent labels wear the same style, so it could not tell one link from the
+/// next — and anything else the preview ever styled alike (an H1 is underlined
+/// too) would read as a link.
 #[derive(Clone, Copy)]
 struct WrapCell<'a> {
     text: &'a str,
@@ -1893,12 +1984,12 @@ fn is_blank_cluster(g: &str) -> bool {
 /// Rebuild one wrapped line's grapheme cells back into spans, merging each run
 /// that shares a style AND a link tag. The output is span-for-span what
 /// [`link_tagged_cells`] was handed, minus the break points — so a cell's inline
-/// styling (DIM code, a bold run, an underlined link label) survives the wrap
+/// styling (DIM code, a bold run, a link label's [`link_style`]) survives the wrap
 /// intact.
 ///
 /// The link tag is part of the merge key so two ADJACENT labels stay two spans, as
 /// [`parse_inline_collect`] emitted them, instead of collapsing into one on the
-/// strength of sharing `UNDERLINED`. That costs nothing visually (the two spans
+/// strength of sharing [`link_style`]. That costs nothing visually (the two spans
 /// carry identical styles) and buys the caller a guarantee it relies on: a link
 /// fragment's boundaries are always span boundaries, so measuring a prefix of the
 /// line measures exactly what is painted before that fragment.
@@ -1979,9 +2070,10 @@ struct WrappedCellLine {
 /// It parses with [`parse_inline_collect`] rather than [`parse_inline`] so the link
 /// metadata survives the wrap instead of being thrown away: each returned line
 /// carries the label fragments that landed on it, which is what makes a table-cell
-/// link clickable at all.
+/// link clickable at all — and, being clickable, it is drawn
+/// [`LinkRender::Clickable`].
 fn wrap_cell_spans(raw: &str, width: usize, align: Align, base: Style) -> Vec<WrappedCellLine> {
-    let (spans, links) = parse_inline_collect(raw, base);
+    let (spans, links) = parse_inline_collect(raw, base, LinkRender::Clickable);
     let cells = link_tagged_cells(&spans, &links);
     wrap_span_cells(&cells, width)
         .into_iter()
@@ -2142,9 +2234,9 @@ fn column_floors(natural: &[usize]) -> Vec<usize> {
 ///
 /// Only the GRID layout records link regions: it returns one [`LinkRegion`] per
 /// wrapped cell-label fragment, in columns relative to its first line. Record mode
-/// returns none — see [`markdown_body_lines_collect`] for why, and
-/// [`TABLE_MIN_COL_WIDTH`] for what that means for a table that changes layout on a
-/// splitter drag.
+/// returns none and draws its links [`LinkRender::Inert`] to match — see
+/// [`markdown_body_lines_collect`] for why, and [`TABLE_MIN_COL_WIDTH`] for what
+/// that means for a table that changes layout on a splitter drag.
 fn render_table(rows: &[&str], width: usize) -> (Vec<Line<'static>>, Vec<LinkRegion>, usize) {
     let headers = split_table_row(rows[0]);
     let ncols = headers.len().max(1);
@@ -2197,7 +2289,8 @@ fn render_table(rows: &[&str], width: usize) -> (Vec<Line<'static>>, Vec<LinkReg
         render_table_grid(&header_cells, &body_rows, &aligns, natural, &floors, width)
     } else {
         // Record mode records no regions at all: its lines are handed to the pane's
-        // own soft wrap, which would move any column measured here.
+        // own soft wrap, which would move any column measured here. Its links are
+        // drawn inert for the same reason (see `render_table_records`).
         (render_table_records(&header_cells, &body_rows), Vec::new())
     };
     (lines, links, consumed)
@@ -2327,12 +2420,24 @@ fn clamped_grid(
 /// An EMPTY cell contributes no line at all, so a sparse row does not become a
 /// column of bare labels. A table with no body rows has nothing to stack, so its
 /// headers are emitted on their own rather than the table vanishing.
+///
+/// Every cell — a body value and a lone header alike — is parsed
+/// [`LinkRender::Inert`]: this layout records no link regions (see
+/// [`TABLE_MIN_COL_WIDTH`]), so a link here keeps its visible text but is drawn in
+/// the cell's own style, never in [`link_style`]. A label styled as a link would
+/// invite a click that resolves to nothing and says nothing.
 fn render_table_records(header_cells: &[String], body_rows: &[Vec<String>]) -> Vec<Line<'static>> {
     if body_rows.is_empty() {
         return header_cells
             .iter()
             .filter(|h| !h.is_empty())
-            .map(|h| Line::from(parse_inline(h, base_style().add_modifier(Modifier::BOLD))))
+            .map(|h| {
+                Line::from(parse_inline(
+                    h,
+                    base_style().add_modifier(Modifier::BOLD),
+                    LinkRender::Inert,
+                ))
+            })
             .collect();
     }
 
@@ -2348,13 +2453,13 @@ fn render_table_records(header_cells: &[String], body_rows: &[Vec<String>]) -> V
             // rather than `**Beta**` — the same stripping the grid aligns on.
             let label = header_cells
                 .get(c)
-                .map(|h| spans_display_text(&parse_inline(h, Style::default())))
+                .map(|h| spans_display_text(&parse_inline(h, Style::default(), LinkRender::Inert)))
                 .unwrap_or_default();
             let mut spans: Vec<Span<'static>> = Vec::new();
             if !label.is_empty() {
                 spans.push(Span::styled(format!("{label}: "), record_label_style()));
             }
-            spans.extend(parse_inline(cell, base_style()));
+            spans.extend(parse_inline(cell, base_style(), LinkRender::Inert));
             record.push(Line::from(spans));
         }
         if record.is_empty() {
@@ -2576,7 +2681,7 @@ struct InlineLink {
 
 /// Parse inline markdown (`` `code` ``, `**bold**`/`__bold__`,
 /// `*italic*`/`_italic_`, `[text](url)` links, and bare `http(s)://` autolinks)
-/// into styled spans over `base`.
+/// into styled spans over `base`, drawing links per `render`.
 ///
 /// Thin wrapper over [`parse_inline_collect`] that discards the link-region
 /// metadata — the single scan implementation lives there, so the styled output
@@ -2584,9 +2689,11 @@ struct InlineLink {
 /// regions call `parse_inline_collect` directly: the prose branches of
 /// [`markdown_body_lines_collect`], and GRID table cells via [`wrap_cell_spans`].
 /// What is left on this wrapper measures or re-emits text that carries no
-/// clickable region — column widths, a record-mode cell, a stacked header label.
-fn parse_inline(text: &str, base: Style) -> Vec<Span<'static>> {
-    parse_inline_collect(text, base).0
+/// clickable region — column widths, a record-mode cell, a stacked header label —
+/// so those callers pass [`LinkRender::Inert`]: a label with no region must not
+/// look like a link.
+fn parse_inline(text: &str, base: Style, render: LinkRender) -> Vec<Span<'static>> {
+    parse_inline_collect(text, base, render).0
 }
 
 /// Parse inline markdown into styled spans AND the display-column span of every
@@ -2594,18 +2701,27 @@ fn parse_inline(text: &str, base: Style) -> Vec<Span<'static>> {
 ///
 /// Inline code wins first (no emphasis inside it), then links/autolinks, then
 /// bold, then italic (recursing so `**a `b`**` styles the code inside the bold).
-/// A link renders its VISIBLE label UNDERLINED (the url is not shown, keeping the
-/// line at the label's display width — no OSC 8 or embedded escapes); an empty
-/// label falls back to showing the url. An unclosed delimiter or malformed link is
-/// emitted as literal text. Always returns at least one span so a blank line still
-/// occupies a row.
+/// A link renders its VISIBLE label in the style `render` picks
+/// ([`LinkRender::label_style`]): under [`LinkRender::Clickable`] that is
+/// [`link_style`] — `LightBlue`, ITALIC and UNDERLINED — patched over `base` so an
+/// enclosing bold/italic/quote run keeps its modifiers; under [`LinkRender::Inert`]
+/// it is `base` itself, so the label reads as the run's own text. Either way the url
+/// is not shown, keeping the line at the label's display width (no OSC 8 or embedded
+/// escapes), and an empty label falls back to showing the url. An unclosed
+/// delimiter or malformed link is emitted as literal text. Always returns at least
+/// one span so a blank line still occupies a row.
 ///
 /// Alongside the spans it records an [`InlineLink`] for each link/autolink at the
 /// DISPLAY column it occupies (measured with `unicode-width`, so multi-byte / wide
-/// labels map to the right cells). A bold/italic run recurses and its nested links
-/// are shifted by the run's own starting column, so `**[a](u)**` still yields a
-/// correctly-placed region.
-fn parse_inline_collect(text: &str, base: Style) -> (Vec<Span<'static>>, Vec<InlineLink>) {
+/// labels map to the right cells) — under BOTH renders, since `render` changes a
+/// label's style and nothing else. A bold/italic run recurses with the same
+/// `render` and its nested links are shifted by the run's own starting column, so
+/// `**[a](u)**` still yields a correctly-placed region.
+fn parse_inline_collect(
+    text: &str,
+    base: Style,
+    render: LinkRender,
+) -> (Vec<Span<'static>>, Vec<InlineLink>) {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut links: Vec<InlineLink> = Vec::new();
     let mut plain = String::new();
@@ -2633,7 +2749,8 @@ fn parse_inline_collect(text: &str, base: Style) -> (Vec<Span<'static>>, Vec<Inl
                 continue;
             }
         }
-        // Inline link: [label](url) -> UNDERLINED label (url not shown), region recorded.
+        // Inline link: [label](url) -> link-styled label (url not shown), region
+        // recorded.
         if let Some((label, url, consumed)) = match_link(rest) {
             col += flush_plain(&mut plain, &mut spans, base);
             let shown = if label.is_empty() { url } else { label };
@@ -2643,15 +2760,12 @@ fn parse_inline_collect(text: &str, base: Style) -> (Vec<Span<'static>>, Vec<Inl
                 col_end: col + width,
                 url: url.to_string(),
             });
-            spans.push(Span::styled(
-                shown.to_string(),
-                base.add_modifier(Modifier::UNDERLINED),
-            ));
+            spans.push(Span::styled(shown.to_string(), render.label_style(base)));
             col += width;
             i += consumed;
             continue;
         }
-        // Bare autolink: http(s)://... -> UNDERLINED, region recorded.
+        // Bare autolink: http(s)://... -> link-styled url, region recorded.
         if let Some((url, consumed)) = match_autolink(rest) {
             col += flush_plain(&mut plain, &mut spans, base);
             let width = display_width(url);
@@ -2660,10 +2774,7 @@ fn parse_inline_collect(text: &str, base: Style) -> (Vec<Span<'static>>, Vec<Inl
                 col_end: col + width,
                 url: url.to_string(),
             });
-            spans.push(Span::styled(
-                url.to_string(),
-                base.add_modifier(Modifier::UNDERLINED),
-            ));
+            spans.push(Span::styled(url.to_string(), render.label_style(base)));
             col += width;
             i += consumed;
             continue;
@@ -2679,6 +2790,7 @@ fn parse_inline_collect(text: &str, base: Style) -> (Vec<Span<'static>>, Vec<Inl
                 col,
                 content,
                 base.add_modifier(Modifier::BOLD),
+                render,
             );
             i += consumed;
             continue;
@@ -2693,6 +2805,7 @@ fn parse_inline_collect(text: &str, base: Style) -> (Vec<Span<'static>>, Vec<Inl
                 col,
                 content,
                 base.add_modifier(Modifier::ITALIC),
+                render,
             );
             i += consumed;
             continue;
@@ -2723,8 +2836,9 @@ fn extend_with_nested(
     base_col: usize,
     content: &str,
     style: Style,
+    render: LinkRender,
 ) -> usize {
-    let (sub_spans, sub_links) = parse_inline_collect(content, style);
+    let (sub_spans, sub_links) = parse_inline_collect(content, style, render);
     for mut link in sub_links {
         link.col_start += base_col;
         link.col_end += base_col;
@@ -3678,7 +3792,7 @@ mod tests {
     #[test]
     fn inline_parser_leaves_unclosed_delimiters_literal() {
         // No closing `**` / `` ` `` => emitted verbatim, never panics.
-        let spans = parse_inline("a **b and `c", base_style());
+        let spans = parse_inline("a **b and `c", base_style(), LinkRender::Clickable);
         let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(joined, "a **b and `c");
     }
@@ -4210,19 +4324,48 @@ mod tests {
 
     // --- inline links + autolinks -----------------------------------------
 
+    /// Assert `style` wears the clickable link LOOK — `LightBlue` + ITALIC +
+    /// UNDERLINED — and still carries the enclosing `run`'s modifiers.
+    ///
+    /// The look is spelled out LITERALLY rather than read back from [`link_style`],
+    /// so a change to that palette entry fails every caller here instead of being
+    /// echoed by it. One assertion per part, so a failure names the part that went.
+    #[track_caller]
+    fn assert_link_look(style: Style, run: Modifier, what: &str) {
+        assert_eq!(
+            style.fg,
+            Some(Color::LightBlue),
+            "{what} must wear the link color, LightBlue: {style:?}"
+        );
+        assert!(
+            style.add_modifier.contains(Modifier::ITALIC),
+            "{what} must be italic: {style:?}"
+        );
+        assert!(
+            style.add_modifier.contains(Modifier::UNDERLINED),
+            "{what} must be underlined: {style:?}"
+        );
+        assert!(
+            style.add_modifier.contains(run),
+            "{what} must keep its enclosing run's {run:?}: {style:?}"
+        );
+    }
+
     #[test]
-    fn inline_link_renders_an_underlined_label_and_hides_the_url() {
-        // [text](url): the visible label is UNDERLINED and the url is not shown,
-        // so the span's display text is exactly the label (no OSC 8, no raw url).
-        let spans = parse_inline("see [docs](https://example.com) now", base_style());
+    fn inline_link_renders_a_light_blue_italic_underlined_label_and_hides_the_url() {
+        // [text](url): the visible label is LightBlue + ITALIC + UNDERLINED and the
+        // url is not shown, so the span's display text is exactly the label (no
+        // OSC 8, no raw url).
+        let spans = parse_inline(
+            "see [docs](https://example.com) now",
+            base_style(),
+            LinkRender::Clickable,
+        );
         let label = spans
             .iter()
             .find(|s| s.content.as_ref() == "docs")
-            .expect("an underlined label span");
-        assert!(
-            label.style.add_modifier.contains(Modifier::UNDERLINED),
-            "the link label is underlined"
-        );
+            .expect("a link label span");
+        assert_link_look(label.style, Modifier::empty(), "the link label");
         // No raw markdown link syntax or url leaks into the visible text.
         let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(joined, "see docs now");
@@ -4230,18 +4373,157 @@ mod tests {
     }
 
     #[test]
-    fn bare_autolink_is_underlined() {
-        // A bare https:// url in prose is underlined; trailing sentence
+    fn bare_autolink_is_light_blue_italic_and_underlined() {
+        // A bare https:// url in prose is styled as a link; trailing sentence
         // punctuation is left outside the link.
-        let spans = parse_inline("visit https://example.com/path.", base_style());
+        let spans = parse_inline(
+            "visit https://example.com/path.",
+            base_style(),
+            LinkRender::Clickable,
+        );
         let url = spans
             .iter()
             .find(|s| s.content.as_ref() == "https://example.com/path")
             .expect("the bare url span");
-        assert!(
-            url.style.add_modifier.contains(Modifier::UNDERLINED),
-            "a bare autolink is underlined"
+        assert_link_look(url.style, Modifier::empty(), "a bare autolink");
+    }
+
+    /// A link PATCHES the link style over the run it sits in: it takes the link
+    /// color, italic and underline, and keeps every modifier the enclosing run
+    /// carries.
+    ///
+    /// Both halves are pinned because each has a plausible wrong implementation of
+    /// its own: adding the link modifiers to `base` alone leaves the label the
+    /// prose's color, and REPLACING `base` with the link style drops the run's
+    /// bold/dim — a link inside `**bold**` would suddenly render thin.
+    #[test]
+    fn a_link_keeps_its_enclosing_runs_modifiers_and_takes_the_link_color() {
+        let spans = parse_inline(
+            "**see [docs](https://x.io) and** *https://y.io/z*",
+            base_style(),
+            LinkRender::Clickable,
         );
+        let style_of = |needle: &str| {
+            spans
+                .iter()
+                .find(|s| s.content.as_ref() == needle)
+                .unwrap_or_else(|| panic!("no span {needle:?} in {spans:?}"))
+                .style
+        };
+        for (needle, run) in [
+            ("docs", Modifier::BOLD),
+            ("https://y.io/z", Modifier::ITALIC),
+        ] {
+            assert_link_look(style_of(needle), run, &format!("{needle:?}"));
+        }
+        // The run's own text is untouched by the link inside it.
+        let prose = style_of("see ");
+        assert_eq!(prose.fg, None, "the bold prose keeps the terminal's color");
+        assert!(!prose.add_modifier.contains(Modifier::UNDERLINED));
+        assert!(!prose.add_modifier.contains(Modifier::ITALIC));
+
+        // A blockquote's DIM | ITALIC carries onto a link inside it the same way —
+        // DIM over the blue draws a fainter blue, which `link_style` accepts as the
+        // price.
+        let lines = markdown_body_lines("> read [docs](https://x.io)", WIDE);
+        let quoted = lines[0]
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "docs")
+            .expect("the quoted link label")
+            .style;
+        assert_link_look(quoted, Modifier::DIM | Modifier::ITALIC, "a quoted link");
+    }
+
+    /// A link is told apart from an H1 heading, which is UNDERLINED too.
+    ///
+    /// An underline alone therefore cannot say "this is a link" — the heading wears
+    /// one as well — so the link's own color and italic are what separate the two. A
+    /// heading renders its text raw (no inline parsing, so no link can sit INSIDE
+    /// one); the pair here is a heading and a link on the line below it.
+    #[test]
+    fn a_link_is_told_apart_from_an_underlined_h1_heading() {
+        let lines = markdown_body_lines("# Title\n\nsee [docs](https://x.io)", WIDE);
+        let style_of = |needle: &str| {
+            lines
+                .iter()
+                .flat_map(|l| l.spans.iter())
+                .find(|s| s.content.as_ref() == needle)
+                .unwrap_or_else(|| panic!("no span {needle:?}"))
+                .style
+        };
+        let (heading, link) = (style_of("Title"), style_of("docs"));
+        assert!(
+            heading.add_modifier.contains(Modifier::UNDERLINED)
+                && link.add_modifier.contains(Modifier::UNDERLINED),
+            "the premise: both the H1 and the link are underlined"
+        );
+        assert_eq!(
+            heading.fg,
+            Some(Color::Yellow),
+            "the H1 keeps its heading color"
+        );
+        assert!(
+            !heading.add_modifier.contains(Modifier::ITALIC),
+            "the H1 is not italic: {heading:?}"
+        );
+        assert_link_look(link, Modifier::empty(), "the link below the H1");
+    }
+
+    /// [`LinkRender`] changes a link label's STYLE and nothing else.
+    ///
+    /// The same line is parsed under both renders. The visible text and the recorded
+    /// link columns must match exactly — the switch may never move a width, a wrap or
+    /// a region — and, span for span, the ONLY difference is that a `Clickable` label
+    /// wears `link_style` patched over the very style its `Inert` twin carries: the
+    /// enclosing run's own. The empty-label link pins the url fallback under both,
+    /// and the bold run pins that the switch reaches the bold/italic recursion rather
+    /// than stopping at the top-level scan.
+    #[test]
+    fn link_render_changes_a_labels_style_and_nothing_else() {
+        let text = "a [docs](https://x.io/d), [](https://e.io/x) and **b https://y.io/z**";
+        let (clickable, clickable_links) =
+            parse_inline_collect(text, base_style(), LinkRender::Clickable);
+        let (inert, inert_links) = parse_inline_collect(text, base_style(), LinkRender::Inert);
+
+        let joined = |spans: &[Span<'static>]| -> String {
+            spans.iter().map(|s| s.content.as_ref()).collect()
+        };
+        assert_eq!(
+            joined(&inert),
+            "a docs, https://e.io/x and b https://y.io/z",
+            "an inert link still shows its label, the url of an empty label, and a bare url"
+        );
+        assert_eq!(joined(&clickable), joined(&inert), "the text never changes");
+        assert_eq!(
+            clickable_links, inert_links,
+            "nor do the recorded link columns"
+        );
+
+        // Each label and the enclosing run it sits in, which an INERT label wears as is.
+        let labels = [
+            ("docs", base_style()),
+            ("https://e.io/x", base_style()),
+            ("https://y.io/z", base_style().add_modifier(Modifier::BOLD)),
+        ];
+        assert_eq!(clickable.len(), inert.len(), "the same spans, one for one");
+        for (c, i) in clickable.iter().zip(&inert) {
+            assert_eq!(c.content, i.content);
+            match labels
+                .iter()
+                .find(|(label, _)| *label == i.content.as_ref())
+            {
+                Some(&(label, run)) => {
+                    assert_eq!(i.style, run, "inert {label:?} wears its run's style alone");
+                    assert_eq!(
+                        c.style,
+                        run.patch(link_style()),
+                        "clickable {label:?} wears the link style over that same run"
+                    );
+                }
+                None => assert_eq!(c.style, i.style, "non-link {:?} is styled alike", i.content),
+            }
+        }
     }
 
     /// The ONE scheme rule both the parser and the opener read.
@@ -4319,21 +4601,22 @@ mod tests {
     }
 
     #[test]
-    fn an_uppercase_bare_autolink_is_underlined() {
+    fn an_uppercase_bare_autolink_is_styled_as_a_link() {
         // The scheme predicate is SHARED with `match_autolink`, so ignoring case
         // changes RENDERING as well as opening: `HTTP://` is a real http link by
-        // RFC 3986 and now underlines exactly as its lowercase twin does. Pinned
+        // RFC 3986 and now renders exactly as its lowercase twin does. Pinned
         // through the parser, not only through the predicate, because that render
         // change is the half a predicate test cannot see.
-        let spans = parse_inline("visit HTTP://example.com/path.", base_style());
+        let spans = parse_inline(
+            "visit HTTP://example.com/path.",
+            base_style(),
+            LinkRender::Clickable,
+        );
         let url = spans
             .iter()
             .find(|s| s.content.as_ref() == "HTTP://example.com/path")
             .expect("the uppercase bare url span");
-        assert!(
-            url.style.add_modifier.contains(Modifier::UNDERLINED),
-            "an uppercase bare autolink is underlined"
-        );
+        assert_link_look(url.style, Modifier::empty(), "an uppercase bare autolink");
     }
 
     #[test]
@@ -4342,7 +4625,11 @@ mod tests {
         // A case-SENSITIVE no-host guard would break that rule the moment the
         // predicate started ignoring case — `HTTP://` would clear the predicate,
         // miss the guard, and render underlined over a url with nothing to open.
-        let spans = parse_inline("bare HTTP:// and HTTPS:// only", base_style());
+        let spans = parse_inline(
+            "bare HTTP:// and HTTPS:// only",
+            base_style(),
+            LinkRender::Clickable,
+        );
         let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(joined, "bare HTTP:// and HTTPS:// only");
         assert!(
@@ -4357,7 +4644,7 @@ mod tests {
     fn malformed_link_stays_literal() {
         // An unclosed `[text](` (no closing paren) falls back to literal text,
         // mirroring the unclosed-delimiter behavior; never panics.
-        let spans = parse_inline("a [text]( trailing", base_style());
+        let spans = parse_inline("a [text]( trailing", base_style(), LinkRender::Clickable);
         let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(joined, "a [text]( trailing");
         assert!(
@@ -4375,8 +4662,11 @@ mod tests {
         // "see [docs](https://example.com) now": the label "docs" renders at
         // display columns 4..8 (after "see "), and the url is retained for click-
         // to-open even though it is never shown.
-        let (spans, links) =
-            parse_inline_collect("see [docs](https://example.com) now", base_style());
+        let (spans, links) = parse_inline_collect(
+            "see [docs](https://example.com) now",
+            base_style(),
+            LinkRender::Clickable,
+        );
         let visible: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(visible, "see docs now", "url is not shown, only the label");
         assert_eq!(links.len(), 1, "exactly one link region");
@@ -4394,7 +4684,11 @@ mod tests {
     fn parse_inline_collect_records_a_bare_autolink_over_its_display_columns() {
         // A bare url is its own label; the region spans the whole visible url
         // (trailing sentence punctuation excluded, matching the render).
-        let (_, links) = parse_inline_collect("visit https://example.com/path.", base_style());
+        let (_, links) = parse_inline_collect(
+            "visit https://example.com/path.",
+            base_style(),
+            LinkRender::Clickable,
+        );
         assert_eq!(links.len(), 1);
         let url = "https://example.com/path";
         assert_eq!(
@@ -4889,7 +5183,7 @@ mod tests {
 
     #[test]
     fn two_adjacent_cell_links_keep_one_region_each() {
-        // Adjacent labels share `UNDERLINED`, so anything recovering links from
+        // Adjacent labels share one `link_style`, so anything recovering links from
         // STYLING would merge them into one region pointing at one url. The link
         // index threaded through the wrap keeps them apart.
         let body = "| Links |\n| --- |\n| [ab](https://x.io/1)[cd](https://x.io/2) |";
@@ -4964,6 +5258,147 @@ mod tests {
             record_links.is_empty(),
             "record mode records nothing: the pane re-wraps its lines, so any \
              column measured here would move before it is painted"
+        );
+    }
+
+    /// The table both sides of the link-LOOK switch below render: a labelled link, a
+    /// bare autolink, and a link inside `**bold**`. Its floors — 8 + 10 + 8 columns
+    /// plus two 3-column rules, 32 in all — seat it as a grid at [`WIDE`] and tip it
+    /// into records at [`LINK_LOOK_RECORD_PANE`].
+    const LINK_LOOK_TABLE: &str = "| Document | Homepage | Remark |\n\
+                                   | --- | --- | --- |\n\
+                                   | [spec](https://x.io/s) | https://y.io/z | \
+                                   **see [docs](https://x.io/d)** |";
+
+    /// A pane narrower than [`LINK_LOOK_TABLE`]'s 32-column floor grid.
+    const LINK_LOOK_RECORD_PANE: usize = 30;
+
+    /// The style of the span spelling `needle` exactly, anywhere in `lines`.
+    fn span_style_in(lines: &[Line<'static>], needle: &str) -> Style {
+        lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.as_ref() == needle)
+            .unwrap_or_else(|| panic!("no span {needle:?} in {lines:?}"))
+            .style
+    }
+
+    /// Assert an INERT link label (a record-mode table's) wears none of the link
+    /// LOOK — not `LightBlue`, not ITALIC, not UNDERLINED — and is EXACTLY its
+    /// enclosing `run`'s style.
+    ///
+    /// The mirror of [`assert_link_look`], spelled out literally for the same
+    /// reason; the last check alone would imply the first three, but a failure that
+    /// names the part of the look that leaked says more than a whole-style diff.
+    /// `run` must carry none of the look itself, or "not italic" would be a claim
+    /// about the run rather than about the render.
+    #[track_caller]
+    fn assert_inert_look(style: Style, run: Style, what: &str) {
+        assert!(
+            run.fg != Some(Color::LightBlue)
+                && !run
+                    .add_modifier
+                    .intersects(Modifier::ITALIC | Modifier::UNDERLINED),
+            "the premise: {what}'s run {run:?} carries none of the link look"
+        );
+        assert_ne!(
+            style.fg,
+            Some(Color::LightBlue),
+            "{what} must not wear the link color, LightBlue: {style:?}"
+        );
+        assert!(
+            !style.add_modifier.contains(Modifier::ITALIC),
+            "{what} must not be italic: {style:?}"
+        );
+        assert!(
+            !style.add_modifier.contains(Modifier::UNDERLINED),
+            "{what} must not be underlined: {style:?}"
+        );
+        assert_eq!(
+            style, run,
+            "{what} must wear exactly its enclosing run's style"
+        );
+    }
+
+    /// The link LOOK tracks the table layout exactly as clickability does
+    /// (`a_table_link_is_clickable_as_a_grid_and_inert_once_it_tips_into_records`):
+    /// the SAME table draws its links in the link look (light blue, italic,
+    /// underlined) as a grid, and as plain text once it tips into records — where a
+    /// click resolves to no link and writes nothing, so a label that looked clickable
+    /// would fail silently.
+    ///
+    /// Record mode changes the STYLE alone. Its text is pinned line for line (a label
+    /// shows with its url hidden, a bare url shows as itself), and each label wears
+    /// EXACTLY its enclosing run's style — the bold run's BOLD survives on the link
+    /// inside it, so "plain" means the cell's own style, not no style at all.
+    #[test]
+    fn a_table_link_looks_clickable_as_a_grid_and_plain_once_it_tips_into_records() {
+        let grid = markdown_body_lines(LINK_LOOK_TABLE, WIDE);
+        assert!(
+            grid.iter().any(|l| line_text(l).contains('\u{2502}')),
+            "the premise: a wide pane seats this table as a grid"
+        );
+        for (needle, run) in [
+            ("spec", Modifier::empty()),
+            ("https://y.io/z", Modifier::empty()),
+            // The grid's bold link keeps its run's BOLD beside the link look.
+            ("docs", Modifier::BOLD),
+        ] {
+            assert_link_look(
+                span_style_in(&grid, needle),
+                run,
+                &format!("grid {needle:?}"),
+            );
+        }
+
+        let records = markdown_body_lines(LINK_LOOK_TABLE, LINK_LOOK_RECORD_PANE);
+        let texts: Vec<String> = records.iter().map(line_text).collect();
+        assert_eq!(
+            texts,
+            [
+                "Document: spec",
+                "Homepage: https://y.io/z",
+                "Remark: see docs"
+            ],
+            "record text is unchanged: a label with its url hidden, a bare url as itself"
+        );
+        for (needle, run) in [
+            ("spec", base_style()),
+            ("https://y.io/z", base_style()),
+            ("docs", base_style().add_modifier(Modifier::BOLD)),
+        ] {
+            assert_inert_look(
+                span_style_in(&records, needle),
+                run,
+                &format!("record {needle:?}"),
+            );
+        }
+    }
+
+    /// The record layout's HEADER-ONLY branch draws its links inert too. With no
+    /// body rows to stack, the headers render on lines of their own in BOLD, and a
+    /// link among them keeps its label and that BOLD — never the link look.
+    #[test]
+    fn a_header_only_record_table_draws_its_header_link_as_plain_bold_text() {
+        // 6 columns of 4-to-7 natural width: 29 + 5 * 3 = 44 > 40, so this routes to
+        // record mode rather than proving the grid's behaviour by accident.
+        let body = "| [Docs](https://x.io/d) | Beta | Gamma | Delta | Epsilon | Zeta |\n\
+                    | --- | --- | --- | --- | --- | --- |";
+        let lines = markdown_body_lines(body, 40);
+        assert!(
+            lines.iter().all(|l| !line_text(l).contains('\u{2502}')),
+            "the premise: 6 columns at 40 route to record mode"
+        );
+        assert_eq!(
+            line_text(&lines[0]),
+            "Docs",
+            "the header link shows its label, url hidden"
+        );
+        // The header's BOLD alone: no link color, italic or underline.
+        assert_inert_look(
+            span_style_in(&lines, "Docs"),
+            base_style().add_modifier(Modifier::BOLD),
+            "the header link",
         );
     }
 
