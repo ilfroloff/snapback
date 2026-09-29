@@ -55,7 +55,7 @@
 //! | terminal paste | inserted as TEXT — never as keystrokes (see below) |
 //! | mouse: click a folded node's header | unfold the node — a subagent's hand-back (`◆`) or context claude injected (`◇`) — where it sits, and a second click folds it back; a click on a header toggles its node and never opens a link. On the RELEASE, like a link, and ahead of one (see [`click_effect`]) |
 //! | mouse: click a preview link | open its url in the browser — `http`/`https` only: any other scheme opens nothing and says so on a sticky status line. On the RELEASE, since only then is it known that the press was a click and not the start of a drag (see [`mouse_effect`]) |
-//! | mouse: drag in the preview | select transcript text in reading order, reverse-videoed — DRAWN text only: each row ends at its last drawn character, never at the pane's edge, and a drag over blank space alone selects nothing, so its release copies nothing; the release copies a selection the way `Ctrl-X y` copies — [`Outcome::Copy`], the clipboard tool first, OSC 52 as the fallback — with a transient status. A drag that starts on a node header or a link selects, and toggles or opens nothing. Off under any overlay (the draft card included) and never started on the pinned row or a docked compose zone (see [`press_starts_selection`]) |
+//! | mouse: drag in the preview | select transcript text in reading order, reverse-videoed — DRAWN text only: each row ends at its last drawn character, never at the pane's edge, and a drag over blank space alone selects nothing, so its release copies nothing. HOLD the drag past the transcript's top or bottom edge and the pane glides that way, a small step every `AUTOSCROLL_FRAME` — faster the further past the edge — so the selection keeps growing into rows that were never on screen until the button comes up (see [`App::autoscroll_preview_selection`]); a plain move while the button is held counts as the release the terminal lost. The release copies the WHOLE selection the way `Ctrl-X y` copies — [`Outcome::Copy`], the clipboard tool first, OSC 52 as the fallback — with a transient status. Never the in-flight reply's tail. A wheel notch, any key or a resize ends it. A drag that starts on a node header or a link selects, and toggles or opens nothing. Off under any overlay (the draft card included) and never started on the pinned row or a docked compose zone (see [`press_starts_selection`]) |
 //! | mouse: double-click in the preview | select the WORD under the pointer (Unicode word boundaries, on the drawn row) and copy it on release, exactly as a drag copies. Two presses on the SAME cell within [`DOUBLE_CLICK_INTERVAL`] (see [`is_double_click`]); a blank word selects nothing; a quick third click keeps the word. The FIRST release is a plain click — it toggles a node header or opens a link, as above — and the SECOND copies the word and toggles or opens nothing, so a node header double-clicked is opened once and stays open. Any key, wheel notch or reload resets the count (a fold toggle does not: it is the first click's own effect), and a press that turned into a drag is not a first click. Same gate as a drag ([`press_starts_selection`]) |
 //! | `Esc` / `Ctrl-C` | quit (always) |
 //!
@@ -103,7 +103,9 @@ use crate::send::{
 use crate::store::{preview, SessionStore};
 use crate::watch::{AppEvent, CopyPayload};
 
-use super::app::{App, ClickRecord, InterruptRoute, Interrupting, ModalAction, ModalLayout};
+use super::app::{
+    screen_at, App, ClickRecord, InterruptRoute, Interrupting, ModalAction, ModalLayout,
+};
 use super::{clipboard, compose, view};
 
 /// A decoded intent from a single keypress.
@@ -461,6 +463,8 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool
 ///   overlay is open (the `App::overlay_active` gate, behind
 ///   [`press_starts_selection`]). Nothing else: the pane widths belong to the
 ///   keyboard (`Shift-Left` / `Shift-Right`).
+/// * `Input(Resize)` -> clear the preview's mouse selection (a new width re-wraps
+///   the transcript its anchors name); the next frame re-lays the board out.
 /// * `SessionsChanged` -> reload `store` and re-apply query+scope, preserving
 ///   selection-by-id and scroll (see [`reload_board`]).
 /// * `ModelAliases` -> swap in the alias set the off-thread probe read off the
@@ -472,7 +476,9 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool
 ///   row then show.
 /// * `Tick` -> nothing costly: advance the board clock, age a transient status,
 ///   then replay any completion an earlier board session could not read
-///   ([`replay_undelivered`]).
+///   ([`replay_undelivered`]). It never steps a held drag's autoscroll: the run
+///   loop does that after every event and at a frame deadline of its own
+///   ([`App::autoscroll_preview_selection`]).
 ///
 /// Every return runs through ONE teardown seam: an outcome that
 /// [ends the board session](Outcome::ends_board_session) also tears the compose
@@ -505,11 +511,15 @@ pub fn handle_event(app: &mut App, event: AppEvent, store: &mut SessionStore) ->
 fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome {
     match event {
         AppEvent::Input(Event::Key(key)) if is_actionable(key) => {
-            // Any keypress ends a mouse text selection: its absolute cells would
-            // otherwise keep highlighting whatever the board now draws there. Done
-            // first so it fires whoever owns the keyboard next (board, modal,
-            // compose). Ticks (which redraw constantly) deliberately do NOT clear,
-            // so a finished selection stays highlighted until the user acts.
+            // Any keypress ends a mouse text selection, the way a terminal's own
+            // selection ends when you type. The selection is anchored to the
+            // transcript's content, so a scroll alone would not strand it — but a
+            // key can move the row selection to another transcript, re-lay the
+            // panes out, or open an overlay over the pane, and it is the user
+            // acting on the board rather than on the selection. Done first so it
+            // fires whoever owns the keyboard next (board, modal, compose). Ticks
+            // (which redraw constantly) deliberately do NOT clear, so a finished
+            // selection stays highlighted until the user acts.
             app.clear_preview_selection();
             // While a modal overlay (the running-session choice, the new-session
             // agent picker, or the hard-delete confirm) is open it OWNS the
@@ -562,6 +572,15 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
         // uses — see that fn for what each keyboard owner does with one.
         AppEvent::Input(Event::Paste(text)) => {
             handle_paste(app, &text);
+            Outcome::Continue
+        }
+        // A RESIZE clears the preview's mouse selection — a finished one and a
+        // held one alike. The selection is anchored to rows of the transcript as
+        // wrapped at the pane's width, and a new width re-wraps it, so the same row
+        // number would name other text. Nothing else here reacts: the next frame
+        // re-lays the board out at the new size on its own.
+        AppEvent::Input(Event::Resize(..)) => {
+            app.clear_preview_selection();
             Outcome::Continue
         }
         AppEvent::Input(_) => Outcome::Continue,
@@ -1030,22 +1049,32 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Outcome {
 /// The left button over the preview transcript is a CLICK or a DRAG, and which one
 /// is only known when it comes back UP — so nothing acts on the press:
 ///
-/// - the PRESS records where it landed ([`App::begin_preview_press`]), if
-///   [`press_starts_selection`] admits it, and toggles or opens nothing;
-/// - a DRAG extends a selection from that press ([`App::extend_preview_selection`]);
-/// - the RELEASE resolves it: a drag copies the text the last frame drew under the
-///   selection ([`MouseEffect::Copy`]) — or does nothing when that selection held
-///   no drawn text (the view records `None` for it) — while a plain click is
-///   resolved at the press cell by [`click_effect`]: the fold node whose header
-///   is under it toggles, else the link under it opens. So a drag that happens to
-///   start on a node header or a link selects, and toggles or opens nothing.
+/// - the PRESS records the CONTENT cell it landed on ([`App::begin_preview_press`]),
+///   if [`press_starts_selection`] admits it, and toggles or opens nothing;
+/// - a DRAG moves the held pointer and extends a selection from that press to the
+///   content under it ([`App::extend_preview_selection`]); a pointer held past the
+///   transcript's top or bottom edge is then scrolled toward by the run loop's
+///   autoscroll step, a small one every `app::AUTOSCROLL_FRAME`
+///   ([`App::autoscroll_preview_selection`]), never by the drag events themselves;
+/// - the RELEASE resolves it ([`release_preview_press`]): a drag copies the WHOLE
+///   selection, redrawn off screen ([`view::preview_selection_copy`],
+///   [`MouseEffect::Copy`]) — or does nothing when it holds no drawn text — while a
+///   plain click is resolved by [`click_effect`] at the press's content cell, where
+///   the pane shows it now: the fold node whose header is under it toggles, else
+///   the link under it opens. So a drag that happens to start on a node header or a
+///   link selects, and toggles or opens nothing.
 ///
-/// Any other event (other buttons, horizontal wheel, plain moves) is ignored: the
-/// pane widths belong to the keyboard (`Shift-Left` / `Shift-Right`), so the mouse
-/// has no border to drag. Never touches the query, and the press gate keeps a
-/// click from toggling a node or opening a link — or a drag or a double-click
-/// from selecting — under an overlay: a press it refuses records nothing, so its
-/// release has nothing to resolve.
+/// A plain MOVE while the press is still held is also the release. With the
+/// button really down the terminal reports a DRAG, never a move, so a move means
+/// the release was lost; resolving it here is what keeps a lost release from
+/// autoscrolling for as long as the board runs.
+///
+/// Any other event (other buttons, horizontal wheel, a move with no press held) is
+/// ignored: the pane widths belong to the keyboard (`Shift-Left` / `Shift-Right`),
+/// so the mouse has no border to drag. Never touches the query, and the press gate
+/// keeps a click from toggling a node or opening a link — or a drag or a
+/// double-click from selecting — under an overlay: a press it refuses records
+/// nothing, so its release has nothing to resolve.
 ///
 /// A SECOND admitted press on the SAME cell as the previous one, within
 /// [`DOUBLE_CLICK_INTERVAL`], is a DOUBLE-CLICK ([`is_double_click`]): it records a
@@ -1064,8 +1093,11 @@ fn mouse_effect(app: &mut App, mouse: MouseEvent, now: Instant) -> MouseEffect {
     };
     match mouse.kind {
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-            // A wheel notch changes what text sits under an absolute-cell
-            // selection, so drop any highlight before scrolling.
+            // A wheel notch ends any selection before it scrolls, held or
+            // finished. The selection is content-anchored, so it would survive the
+            // scroll itself — but a notch during a held drag would then have to
+            // extend the drag as well, and it does not: the drag's own autoscroll
+            // is how a selection moves the pane.
             app.clear_preview_selection();
             let up = mouse.kind == MouseEventKind::ScrollUp;
             match wheel_target(
@@ -1098,41 +1130,60 @@ fn mouse_effect(app: &mut App, mouse: MouseEvent, now: Instant) -> MouseEffect {
         // holding a selection, never reaches `click_effect`, so the second click
         // toggles or opens nothing the first one already did.
         MouseEventKind::Down(MouseButton::Left) if press_starts_selection(app, pos) => {
+            let transcript = view::preview_transcript_rect(app);
             if is_double_click(app.last_click(), pos, now) {
-                app.begin_word_selection(pos);
+                app.begin_word_selection(pos, transcript);
             } else {
-                app.begin_preview_press(pos);
+                app.begin_preview_press(pos, transcript);
             }
             app.note_click(pos, now);
         }
-        // A held-button drag inside the preview extends the text selection. A
-        // no-op unless a press is active (`begin_preview_press` set it), so a drag
-        // that began on the list, the pinned row or a docked compose zone never
-        // selects; the cursor is clamped into the SAME transcript rect the press
-        // was gated on.
+        // A held-button drag moves the pointer and extends the text selection to
+        // the content under it. A no-op unless a press is active
+        // (`begin_preview_press` set it), so a drag that began on the list, the
+        // pinned row or a docked compose zone never selects; the cursor is clamped
+        // into the SAME transcript rect the press was gated on, while the raw
+        // pointer is kept for the autoscroll.
         MouseEventKind::Drag(MouseButton::Left) => {
             app.extend_preview_selection(pos, view::preview_transcript_rect(app));
         }
-        // The release resolves the press, and only a press the gate admitted:
-        // a completed drag (or a double-click's word) copies the selection — the
-        // text the last frame drew under it, which is exactly what is highlighted
-        // on screen — and never toggles a node or opens a link, even one it
-        // started on; a plain click
-        // with no drag is THE one pane click, resolved at the press cell.
-        MouseEventKind::Up(MouseButton::Left) => {
-            let Some(press) = app.take_preview_press() else {
-                return MouseEffect::None;
-            };
-            if app.has_preview_selection() {
-                return app
-                    .preview_selection_text()
-                    .map_or(MouseEffect::None, |text| MouseEffect::Copy(text.to_owned()));
-            }
-            return click_effect(app, press);
+        // The release resolves the press, and only a press the gate admitted: a
+        // completed drag (or a double-click's word) copies the selection and never
+        // toggles a node or opens a link, even one it started on; a plain click
+        // with no drag is THE one pane click, resolved at the press's content cell
+        // (`release_preview_press`). A MOVE while the press is held stands in for a
+        // release the terminal lost (see the doc above); with no press held it
+        // finds nothing to take.
+        MouseEventKind::Up(MouseButton::Left) | MouseEventKind::Moved => {
+            return release_preview_press(app);
         }
         _ => {}
     }
     MouseEffect::None
+}
+
+/// Resolve the held preview press as its release, ending the gesture and with it
+/// any autoscroll. A completed drag (or a double-click's word) copies the WHOLE
+/// selection — redrawn off screen by the rules its highlight is drawn with
+/// ([`view::preview_selection_copy`]), so rows scrolled past during the drag are
+/// copied too — and never toggles a node or opens a link, even one it started on;
+/// a selection over blank cells alone copies nothing. A plain click with no drag
+/// is handed to [`click_effect`] at the press's CONTENT cell, found on screen where
+/// the pane shows it now ([`screen_at`]) — nothing when that cell has left the
+/// transcript rect. [`MouseEffect::None`] when no press was held.
+fn release_preview_press(app: &mut App) -> MouseEffect {
+    let Some(press) = app.take_preview_press() else {
+        return MouseEffect::None;
+    };
+    if app.has_preview_selection() {
+        return view::preview_selection_copy(app).map_or(MouseEffect::None, MouseEffect::Copy);
+    }
+    screen_at(
+        press,
+        view::preview_transcript_rect(app),
+        app.preview_scroll,
+    )
+    .map_or(MouseEffect::None, |cell| click_effect(app, cell))
 }
 
 /// The longest gap between two presses on the same cell that still makes the
@@ -2546,7 +2597,9 @@ mod tests {
     use crate::resume::ModelPick;
     use crate::search::{filter, SearchMode};
     use crate::store::Session;
-    use crate::tui::app::{NewSessionDraft, PaneLayout, Scope, STATUS_DWELL_TICKS};
+    use crate::tui::app::{
+        NewSessionDraft, PaneLayout, Scope, AUTOSCROLL_FRAME, STATUS_DWELL_TICKS,
+    };
     use crate::tui::compose::ComposeTarget;
 
     /// A store over `root` for a test that drives [`handle_event`]. Most routing
@@ -6551,7 +6604,7 @@ mod tests {
 
     /// A fold toggle drops a standing drag-selection. The toggle re-renders the
     /// transcript — lines, row map and scroll all move — so the selection's
-    /// ABSOLUTE cells would now highlight, and a later release would copy, other
+    /// content anchors would now highlight, and a later release would copy, other
     /// text. Toggled through `App::toggle_peer_fold` DIRECTLY, not through a click,
     /// on purpose: a click's own press already starts a fresh selection, so only a
     /// direct call can show the clear lives in the toggle itself, where no route
@@ -6577,7 +6630,7 @@ mod tests {
             "a fold toggle must drop the selection"
         );
         assert_eq!(
-            app.preview_selection_text(),
+            view::preview_selection_copy(&mut app),
             None,
             "and the text a release would have copied"
         );
@@ -10160,6 +10213,543 @@ mod tests {
         assert_eq!(
             payload,
             CopyPayload::Selection("filler line 21\nfiller line 22".to_string())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- autoscroll: a drag held past the transcript's top or bottom edge -------
+
+    /// Numbered one-row lines in [`scroll_session`]: several viewports of
+    /// [`BOARD`]'s preview pane, so a held drag has rows to scroll through in both
+    /// directions without reaching either end in a handful of ticks.
+    const SCROLL_FILLER_LINES: usize = 60;
+
+    /// A session of [`SCROLL_FILLER_LINES`] numbered lines (`filler line 1` ..),
+    /// written to a real file under `dir`. A real render, not a synthetic cache:
+    /// the release copies from the same width-scoped cache the pane draws from, so
+    /// only a real one proves the two agree.
+    fn scroll_session(dir: &Path) -> Session {
+        let file = dir.join("sess-scroll.jsonl");
+        let body = (1..=SCROLL_FILLER_LINES)
+            .map(|i| format!("filler line {i}"))
+            .collect::<Vec<_>>()
+            .join("\\n");
+        let jsonl = format!(
+            concat!(
+                r#"{{"type":"user","sessionId":"sess-scroll","cwd":"/tmp","#,
+                r#""timestamp":"2026-07-01T10:00:00.000Z","#,
+                r#""message":{{"role":"user","content":"{body}"}}}}"#,
+                "\n",
+            ),
+            body = body,
+        );
+        std::fs::write(&file, jsonl).expect("write the scroll fixture");
+        Session {
+            file,
+            session_id: "sess-scroll".to_string(),
+            cwd: PathBuf::from("/tmp"),
+            git_branch: Some("main".to_string()),
+            timestamp: None,
+            repo: "repo".to_string(),
+            label: "scroll session".to_string(),
+            root_uuid: None,
+            msg_count: 0,
+            content_index: String::new(),
+            background: false,
+            has_agent_name: false,
+            has_agent_setting: false,
+            failed_task: None,
+        }
+    }
+
+    /// An app over [`scroll_session`], in `App`'s default (bottom-anchored) scroll.
+    fn scroll_app(dir: &Path) -> App {
+        let app = App::new(vec![scroll_session(dir)], Scope::All, PathBuf::from("/tmp"));
+        assert_eq!(app.selected.as_deref(), Some("sess-scroll"));
+        app
+    }
+
+    /// The `N` of every `filler line N` drawn inside `transcript`, top to bottom —
+    /// read off the BUFFER, so a test knows which rows the user could see.
+    fn drawn_fillers(buffer: &ratatui::buffer::Buffer, transcript: Rect) -> Vec<usize> {
+        (transcript.y..transcript.bottom())
+            .filter_map(|y| {
+                let row = drawn_row(buffer, transcript, y);
+                row.trim().strip_prefix("filler line ")?.parse().ok()
+            })
+            .collect()
+    }
+
+    /// The `N` of every line of a copied selection, which must read
+    /// `filler line N` and nothing else.
+    fn copied_fillers(text: &str) -> Vec<usize> {
+        text.lines()
+            .map(|line| {
+                line.strip_prefix("filler line ")
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or_else(|| panic!("copied an unexpected line: {line:?}"))
+            })
+            .collect()
+    }
+
+    /// Press at `from`, then drag the held button to `to` — anywhere on the board,
+    /// past the transcript's edge included — with a frame after each, as the loop
+    /// draws between events. The button stays DOWN.
+    fn hold_drag(app: &mut App, from: (u16, u16), to: (u16, u16)) {
+        wheel(app, MouseEventKind::Down(MouseButton::Left), from.0, from.1);
+        render_board(app);
+        wheel(app, MouseEventKind::Drag(MouseButton::Left), to.0, to.1);
+        render_board(app);
+    }
+
+    /// The autoscroll step the run loop takes at instant `at` — it takes one after
+    /// every event and at every frame deadline — then the frame it draws next;
+    /// returns the scroll that frame resolved.
+    fn step_and_draw(app: &mut App, at: Instant) -> u32 {
+        app.autoscroll_preview_selection(view::preview_transcript_rect(app), at);
+        render_board(app);
+        app.preview_scroll
+    }
+
+    /// The step the run loop takes right after the drag event that put the pointer
+    /// past the edge: it only starts the autoscroll's clock. Returns that instant.
+    fn start_hold(app: &mut App) -> Instant {
+        let started = Instant::now();
+        step_and_draw(app, started);
+        started
+    }
+
+    /// Frames in one checked stretch of a hold: about a quarter second of
+    /// [`AUTOSCROLL_FRAME`]s, enough that a pointer one row past [`BOARD`]'s
+    /// transcript edge owes a few rows by the end of it, while a single frame owes
+    /// less than one.
+    const HOLD_FRAMES: u32 = 8;
+
+    /// Keep the pointer still for [`HOLD_FRAMES`] frames after `*clock`, stepping
+    /// and drawing at each deadline as the run loop does, and advance `*clock` to
+    /// the last one; returns the scroll the last frame resolved.
+    fn hold_still(app: &mut App, clock: &mut Instant) -> u32 {
+        for _ in 0..HOLD_FRAMES {
+            *clock += AUTOSCROLL_FRAME;
+            step_and_draw(app, *clock);
+        }
+        app.preview_scroll
+    }
+
+    /// The copied text of a release that must have requested a selection copy.
+    fn selection_of(released: Outcome) -> String {
+        let Outcome::Copy(CopyPayload::Selection(text)) = released else {
+            panic!("the release must request a selection copy");
+        };
+        text
+    }
+
+    /// Held one row BELOW the transcript, the pane keeps scrolling down, stretch
+    /// after stretch — the pointer only moved once — and the release copies the
+    /// whole run from the press down to the row the pointer's clamped cursor
+    /// reached, INCLUDING rows that were below the pane when the button went down.
+    #[test]
+    fn a_drag_held_below_the_edge_keeps_scrolling_down_and_copies_rows_that_started_off_screen() {
+        let dir = unique_temp_dir("autoscroll-down");
+        let mut app = scroll_app(&dir);
+        press(&mut app, KeyCode::Home);
+        let buffer = render_board(&mut app);
+        assert_eq!(app.preview_scroll, 0, "premise: the pane starts at the top");
+        let transcript = view::preview_transcript_rect(&app);
+        let last_at_press = *drawn_fillers(&buffer, transcript)
+            .iter()
+            .max()
+            .expect("premise: filler lines are drawn");
+        let from = drawn_text_cell(&buffer, app.preview_rect, "filler line 2");
+        let below = (transcript.right() - 1, transcript.bottom());
+
+        hold_drag(&mut app, from, below);
+        let mut clock = start_hold(&mut app);
+        let mut scroll = app.preview_scroll;
+        for stretch in 1..=3 {
+            let next = hold_still(&mut app, &mut clock);
+            assert!(
+                next > scroll,
+                "stretch {stretch}: a drag held below the edge scrolls down ({scroll} -> {next})"
+            );
+            scroll = next;
+        }
+        let after = render_board(&mut app);
+        let last_on_screen = *drawn_fillers(&after, transcript)
+            .iter()
+            .max()
+            .expect("filler lines are drawn");
+        let released = wheel(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            below.0,
+            below.1,
+        );
+
+        let copied = copied_fillers(&selection_of(released));
+        assert_eq!(
+            copied,
+            (2..=last_on_screen).collect::<Vec<_>>(),
+            "the copy runs from the pressed line to the last row the cursor reached"
+        );
+        assert!(
+            last_on_screen > last_at_press,
+            "rows that were below the pane at the press ({last_at_press}) are copied too"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Held one row ABOVE the transcript, the pane keeps scrolling up, stretch after
+    /// stretch, and the release copies from the top row it reached down to the
+    /// pressed line.
+    #[test]
+    fn a_drag_held_above_the_edge_keeps_scrolling_up() {
+        let dir = unique_temp_dir("autoscroll-up");
+        let mut app = scroll_app(&dir);
+        let buffer = render_board(&mut app);
+        assert!(
+            app.preview_scroll > 0,
+            "premise: bottom-anchored, not at the top"
+        );
+        let transcript = view::preview_transcript_rect(&app);
+        let first_at_press = *drawn_fillers(&buffer, transcript)
+            .iter()
+            .min()
+            .expect("premise: filler lines are drawn");
+        let pressed = SCROLL_FILLER_LINES - 2;
+        let (end_col, row) =
+            drawn_text_end(&buffer, app.preview_rect, &format!("filler line {pressed}"));
+        let above = (transcript.x, transcript.y - 1);
+
+        hold_drag(&mut app, (end_col - 1, row), above);
+        let mut clock = start_hold(&mut app);
+        let mut scroll = app.preview_scroll;
+        for stretch in 1..=3 {
+            let next = hold_still(&mut app, &mut clock);
+            assert!(
+                next < scroll,
+                "stretch {stretch}: a drag held above the edge scrolls up ({scroll} -> {next})"
+            );
+            scroll = next;
+        }
+        let after = render_board(&mut app);
+        let first_on_screen = *drawn_fillers(&after, transcript)
+            .iter()
+            .min()
+            .expect("filler lines are drawn");
+        let released = wheel(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            above.0,
+            above.1,
+        );
+
+        let copied = copied_fillers(&selection_of(released));
+        assert_eq!(copied, (first_on_screen..=pressed).collect::<Vec<_>>());
+        assert!(
+            first_on_screen < first_at_press,
+            "rows that were above the pane at the press ({first_at_press}) are copied too"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Letting go ends the autoscroll: later steps leave the pane where the release
+    /// found it — and the loop stops waiting on a deadline for them — with the
+    /// finished selection still held.
+    #[test]
+    fn releasing_a_held_drag_stops_the_autoscroll() {
+        let dir = unique_temp_dir("autoscroll-release");
+        let mut app = scroll_app(&dir);
+        press(&mut app, KeyCode::Home);
+        let buffer = render_board(&mut app);
+        let transcript = view::preview_transcript_rect(&app);
+        let from = drawn_text_cell(&buffer, app.preview_rect, "filler line 2");
+        let below = (transcript.right() - 1, transcript.bottom());
+
+        hold_drag(&mut app, from, below);
+        let mut clock = start_hold(&mut app);
+        assert!(
+            hold_still(&mut app, &mut clock) > 0,
+            "premise: the held drag autoscrolls"
+        );
+        selection_of(wheel(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            below.0,
+            below.1,
+        ));
+        assert_eq!(
+            app.autoscroll_due_in(transcript, clock),
+            None,
+            "a released drag sets no deadline"
+        );
+        let parked = app.preview_scroll;
+        for _ in 0..3 {
+            assert_eq!(
+                hold_still(&mut app, &mut clock),
+                parked,
+                "a released drag never scrolls again"
+            );
+        }
+        assert!(
+            app.has_preview_selection(),
+            "the finished selection stays highlighted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A terminal that loses the button's release reports the next pointer move as
+    /// a plain `Moved`, which cannot happen while the button is really held. That
+    /// move resolves the press exactly as the release would have — it copies — and
+    /// the autoscroll stops, instead of scrolling for as long as the board runs.
+    #[test]
+    fn a_lost_release_stops_the_autoscroll_at_the_next_pointer_move() {
+        let dir = unique_temp_dir("autoscroll-lost");
+        let mut app = scroll_app(&dir);
+        press(&mut app, KeyCode::Home);
+        let buffer = render_board(&mut app);
+        let transcript = view::preview_transcript_rect(&app);
+        let from = drawn_text_cell(&buffer, app.preview_rect, "filler line 2");
+        let below = (transcript.right() - 1, transcript.bottom());
+
+        hold_drag(&mut app, from, below);
+        let mut clock = start_hold(&mut app);
+        assert!(
+            hold_still(&mut app, &mut clock) > 0,
+            "premise: the held drag autoscrolls"
+        );
+        let moved = wheel(&mut app, MouseEventKind::Moved, below.0, below.1 + 1);
+        let copied = copied_fillers(&selection_of(moved));
+        assert_eq!(copied.first(), Some(&2), "the move copied the selection");
+        render_board(&mut app);
+        let parked = app.preview_scroll;
+        for _ in 0..3 {
+            assert_eq!(
+                hold_still(&mut app, &mut clock),
+                parked,
+                "no step scrolls after the lost release"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The board TICK never scrolls a held drag: the run loop's autoscroll step is
+    /// the one driver. Ticks arriving a second after the drag's clock started — a
+    /// second the step would pay out as most of a page — leave the pane where it
+    /// was, and the step then pays it.
+    #[test]
+    fn a_tick_alone_never_scrolls_a_held_drag() {
+        let dir = unique_temp_dir("autoscroll-tick");
+        let mut app = scroll_app(&dir);
+        press(&mut app, KeyCode::Home);
+        let buffer = render_board(&mut app);
+        let transcript = view::preview_transcript_rect(&app);
+        let from = drawn_text_cell(&buffer, app.preview_rect, "filler line 2");
+        let below = (transcript.right() - 1, transcript.bottom());
+
+        hold_drag(&mut app, from, below);
+        let a_second_ago = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("the monotonic clock has run for a second");
+        let parked = step_and_draw(&mut app, a_second_ago);
+        for _ in 0..3 {
+            tick(&mut app);
+            render_board(&mut app);
+            assert_eq!(app.preview_scroll, parked, "a tick scrolled the held drag");
+        }
+        assert!(
+            step_and_draw(&mut app, Instant::now()) > parked,
+            "premise: the step owes the second that passed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A resize clears the selection — a finished one and a held one alike. The
+    /// selection is anchored to wrapped transcript rows, and a new width re-wraps
+    /// the transcript, so the same row number would name other text.
+    #[test]
+    fn a_resize_clears_the_preview_selection() {
+        let dir = unique_temp_dir("select-resize");
+        let mut app = link_app(&dir, None);
+        let buffer = render_board(&mut app);
+        let from = drawn_text_cell(&buffer, app.preview_rect, "filler line 18");
+        let (end_col, end_row) = drawn_text_end(&buffer, app.preview_rect, "filler line 19");
+        drag_and_release(&mut app, from, (end_col - 1, end_row));
+        assert!(app.has_preview_selection(), "premise: a selection is held");
+
+        let resized = handle_event(
+            &mut app,
+            AppEvent::Input(Event::Resize(BOARD.0 - 10, BOARD.1)),
+            &mut store_at(Path::new("/tmp")),
+        );
+        assert!(matches!(resized, Outcome::Continue));
+        assert!(
+            !app.has_preview_selection(),
+            "a resize clears a finished selection"
+        );
+        let after = render_board(&mut app);
+        assert_eq!(
+            highlighted_cells(&after, view::preview_transcript_rect(&app)),
+            Vec::<(u16, u16)>::new(),
+            "and the next frame highlights nothing"
+        );
+
+        // A HELD drag goes too: its release afterwards copies nothing.
+        hold_drag(&mut app, from, (end_col - 1, end_row));
+        assert!(app.has_preview_selection(), "premise: a drag is held");
+        handle_event(
+            &mut app,
+            AppEvent::Input(Event::Resize(BOARD.0, BOARD.1)),
+            &mut store_at(Path::new("/tmp")),
+        );
+        assert!(!app.has_preview_selection());
+        let released = wheel(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            end_col - 1,
+            end_row,
+        );
+        assert!(
+            !matches!(released, Outcome::Copy(_)),
+            "the release of a press a resize ended copies nothing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The highlight is drawn only inside the transcript rect of the frame being
+    /// drawn — never on the pinned row, a border, or any other row — even when the
+    /// transcript moved under a finished selection (the pinned row took the pane's
+    /// first row back) or the selection is taller than the pane (autoscroll).
+    #[test]
+    fn the_highlight_never_covers_a_row_outside_the_current_transcript_area() {
+        // The pinned row returns under a finished selection that began on the
+        // transcript's first row: a reply in flight to the selected session stands
+        // the pinned row down (`view::preview_banner`), and its end brings it back.
+        // Read from the top (`Home`), so the reply's tail leaving does not move the
+        // scroll and the selection's first row sits right under the pinned row.
+        let dir = unique_temp_dir("select-inside");
+        let mut app = link_app(&dir, None);
+        let mut reported = HashMap::new();
+        reported.insert(
+            "sess-link".to_string(),
+            ReportedAgent {
+                kind: "background".to_string(),
+                id: None,
+                state: Some("blocked".to_string()),
+                status: None,
+                pid: None,
+                started_at_ms: None,
+            },
+        );
+        app.set_reported_agents(reported, None);
+        app.sending = vec![replying_to("sess-link")];
+        press(&mut app, KeyCode::Home);
+        render_board(&mut app);
+        let before = view::preview_transcript_rect(&app);
+        drag_and_release(&mut app, (before.x, before.y), (before.x + 5, before.y + 2));
+        assert!(app.has_preview_selection(), "premise: a selection is held");
+        app.sending.clear();
+        let after = render_board(&mut app);
+        let now = view::preview_transcript_rect(&app);
+        assert_eq!(
+            now.y,
+            before.y + 1,
+            "premise: the pinned row took the first row"
+        );
+        let pinned: String = (now.x..now.right())
+            .filter_map(|x| after.cell((x, before.y)))
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            !pinned.trim().is_empty(),
+            "premise: the pinned row has drawn text a stray highlight would cover"
+        );
+        let lit = highlighted_cells(&after, app.preview_rect);
+        assert!(!lit.is_empty(), "premise: the selection is still drawn");
+        for (x, y) in lit {
+            assert!(
+                now.contains(Position { x, y }),
+                "({x}, {y}) is highlighted outside the transcript rect {now:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A selection taller than the pane: every row of the pane is inside it,
+        // and nothing outside the pane's transcript rect is.
+        let dir = unique_temp_dir("select-tall");
+        let mut app = scroll_app(&dir);
+        press(&mut app, KeyCode::Home);
+        let buffer = render_board(&mut app);
+        let transcript = view::preview_transcript_rect(&app);
+        let from = drawn_text_cell(&buffer, app.preview_rect, "filler line 2");
+        hold_drag(
+            &mut app,
+            from,
+            (transcript.right() - 1, transcript.bottom()),
+        );
+        let mut clock = start_hold(&mut app);
+        for _ in 0..4 {
+            hold_still(&mut app, &mut clock);
+        }
+        let after = render_board(&mut app);
+        let lit = highlighted_cells(&after, app.preview_rect);
+        for &(x, y) in &lit {
+            assert!(
+                transcript.contains(Position { x, y }),
+                "({x}, {y}) is highlighted outside the transcript rect {transcript:?}"
+            );
+        }
+        let rows: std::collections::BTreeSet<u16> = lit.iter().map(|&(_, y)| y).collect();
+        assert_eq!(
+            rows.len(),
+            usize::from(transcript.height),
+            "the selection spans the whole pane, so every transcript row is lit"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The in-flight reply's optimistic tail is drawn below the transcript but is
+    /// not transcript: a drag through it neither highlights it nor copies it — the
+    /// one place the drawn frame and the transcript cache would otherwise disagree.
+    #[test]
+    fn a_selection_never_highlights_or_copies_the_in_flight_reply_tail() {
+        let dir = unique_temp_dir("select-tail");
+        let mut app = link_app(&dir, None);
+        app.sending = vec![replying_to("sess-link")];
+        let buffer = render_board(&mut app);
+        let transcript = view::preview_transcript_rect(&app);
+        let transcript_rows = app.preview_wrapped_rows(transcript.width);
+        let scroll = usize::try_from(app.preview_scroll).expect("fits");
+        let tail_top = transcript.y
+            + u16::try_from(transcript_rows - scroll).expect("the tail starts inside the pane");
+        let (_, echo_row) = drawn_text_cell(&buffer, app.preview_rect, "still landing");
+        assert!(
+            echo_row >= tail_top && echo_row < transcript.bottom(),
+            "premise: the reply tail is drawn inside the transcript rect"
+        );
+        let from = drawn_text_cell(&buffer, app.preview_rect, "filler line 23");
+
+        let released = drag_and_release(
+            &mut app,
+            from,
+            (transcript.right() - 1, transcript.bottom() - 1),
+        );
+        let text = selection_of(released);
+        assert!(
+            !text.contains("still landing") && !text.contains("cooking"),
+            "the tail is not copied: {text:?}"
+        );
+        assert!(text.starts_with("filler line 23\n"), "{text:?}");
+        assert!(
+            text.lines().last().is_some_and(|l| l.contains("docs")),
+            "the copy ends on the transcript's own last line: {text:?}"
+        );
+        let after = render_board(&mut app);
+        let lit = highlighted_cells(&after, transcript);
+        assert!(!lit.is_empty(), "premise: the transcript part is lit");
+        assert!(
+            lit.iter().all(|&(_, y)| y < tail_top),
+            "no tail row is highlighted"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

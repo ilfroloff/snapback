@@ -123,7 +123,7 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | `Ctrl-T` / `Ctrl-E`, `Home` / `End` | Jump the preview to the top / bottom (on a MacBook keyboard without dedicated `Home`/`End` keys, `fn+←` / `fn+→` reach the same two) |
 | `Shift-↑` / `Shift-↓` | Walk the preview through the lines your query marks — previous / next. Only bound while something IS marked in the previewed transcript; with nothing marked they stay plain **move the selection**, so they never take a key away from you (and a terminal that swallows the modifier still moves). One stop per marked **line**, not per occurrence: a line saying your query twice is marked twice and stopped at once |
 | mouse wheel | Scroll the pane under the pointer — except while a compose or draft box is open, when the session list stops taking notches: a wheel over it does **nothing**, so the session you are writing to can never slide out from under you. Everywhere else it is unchanged, and a notch anywhere but the list still scrolls the transcript |
-| drag inside the preview | Select transcript text (in reading order, like your terminal's own selection, but only the transcript's drawn text — never the empty space right of a line, and never the session list beside it) and copy it to the clipboard when you let go. A drag over empty space alone copies nothing. A drag that starts on a link or a folded node selects it rather than opening or unfolding it. Not while a reply or draft box is open, and never from the pinned row at the top of the pane |
+| drag inside the preview | Select transcript text (in reading order, like your terminal's own selection, but only the transcript's drawn text — never the empty space right of a line, and never the session list beside it) and copy it to the clipboard when you let go. Hold the drag past the preview's top or bottom edge and it keeps scrolling that way — faster the further past the edge you hold it — with the selection growing until you let go, so it can copy far more than one screen. A drag over empty space alone copies nothing. A drag that starts on a link or a folded node selects it rather than opening or unfolding it. Not while a reply or draft box is open, and never from the pinned row at the top of the pane |
 | double-click in the preview | Select the **word** under the pointer and copy it when you let go, exactly as a drag copies. Two clicks on the same cell within half a second; words follow Unicode word boundaries, so `view.rs`, `don't` and `snake_case` are one word but `sess-link` is two, and paths and URLs split at their punctuation. The first click still does what a click does — opens a link, or unfolds a folded node — and the second only selects, so a node you double-click is unfolded once and stays open. Double-clicking blank space copies nothing; a quick third click keeps the word |
 | click a preview link | Open its url in your browser — when you let go, so a drag that starts on a link selects it instead. `http`/`https` only: a link of any other scheme opens **nothing** and instead reports a refusal on the status line that names the link (`not opening <url> - only http/https links open`), so an underlined label that quietly does nothing never leaves you guessing which of the two happened. That refusal is **sticky** — it stays up until your next actionable keypress |
 | click a folded node | Unfold it where it sits — when you let go, like a link — and click it again to fold it back. Two kinds of turn arrive folded to one line: a subagent's hand-back — the `◆ message from @…` node, otherwise ~95 rows of `<agent-message>` frame attributed to **you** — and context Claude Code added on your behalf, such as the instructions a skill or slash command expands into — the `◇ added by claude code` node, otherwise often thousands of rows, also attributed to **you**. Folded each costs one line, and its text is still one click away. Which nodes you left open is remembered for this run only — snapback writes nothing for it |
@@ -150,8 +150,14 @@ reverse-videoed and copied to your clipboard on release, the same way `Ctrl-X y`
 copies: through your OS clipboard tool, or over SSH as an OSC 52 escape. Only
 drawn text is selected, the way an editor highlights: each line stops at its last
 character rather than running to the pane's edge, and a drag over empty space
-alone selects nothing and leaves your clipboard as it was. The
-status line briefly says `Copied selection (N lines)`, or `Sent selection …`
+alone selects nothing and leaves your clipboard as it was. To select more than
+fits on screen, hold the drag just past the preview's top or bottom edge: the
+transcript glides that way in small steps (about a screen a second, faster the
+further past the edge you hold it) and the selection grows with it until you let
+go — then all of it is copied, not just the part still on screen. The selection stays
+on the same text while the pane moves; scrolling the wheel, pressing any key or
+resizing the terminal ends it. A reply you are still sending is not selectable.
+The status line briefly says `Copied selection (N lines)`, or `Sent selection …`
 when it went out as OSC 52. To select across both panes, or if your terminal
 ignores OSC 52, hold **Shift** (or **Option/⌥** on iTerm2 and macOS Terminal)
 for a native selection instead. The
@@ -687,8 +693,9 @@ line — it is that agent's report, not something you said — and context Claud
 Code added on your behalf (the instructions a skill or slash command expands
 into, a command's caveat) to a single `◇ added by claude code` line; either opens
 where it sits on a click.
-Dragging over the transcript selects and copies just the transcript text;
-double-clicking a word copies that word.
+Dragging over the transcript selects and copies just the transcript text — hold
+the drag past the pane's edge and it scrolls on, so the copy can span many
+screens; double-clicking a word copies that word.
 `Shift-←` / `Shift-→` step through five fixed layouts, from the preview filling
 the screen to the list filling it, so a long transcript can take the whole width
 and a long list of sessions can too.

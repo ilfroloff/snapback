@@ -14,7 +14,7 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ratatui::layout::{Position, Rect};
 use ratatui::text::Line;
@@ -48,6 +48,34 @@ use super::view;
 /// Lines the preview scrolls per mouse-wheel notch. Small (the terminal reports
 /// discrete notches, not pixel deltas) so a trackpad flick stays controllable.
 const PREVIEW_WHEEL_STEP: i32 = 2;
+
+/// How long a drag held ONE row past the transcript's edge takes to scroll the
+/// pane a whole page; each further row past it scrolls another page in the same
+/// time, up to [`AUTOSCROLL_MAX_DISTANCE`] ([`autoscroll_rows`]). A page a second
+/// is the quarter page `Ctrl-U` / `Ctrl-D` scroll by, four times a second — slow
+/// enough to stop where the reader means to, fast enough that ten screens take
+/// seconds.
+const AUTOSCROLL_PAGE_PERIOD: Duration = Duration::from_secs(1);
+
+/// How many rows past the edge the autoscroll stops speeding up at: four pages an
+/// [`AUTOSCROLL_PAGE_PERIOD`] at most, which at [`AUTOSCROLL_FRAME`] is about an
+/// eighth of a page a frame, so every row still passes through the viewport on
+/// its way, never jumped over unseen. The board's own chrome keeps the pointer
+/// within about three rows of the transcript's edge (a border, the search line
+/// and the help line below it; a border and the header above), so the whole range
+/// of speeds is reachable without leaving the terminal.
+const AUTOSCROLL_MAX_DISTANCE: u16 = 4;
+
+/// How often a drag held past the transcript's edge scrolls. While one is held
+/// there ([`App::autoscroll_due_in`]) the run loop waits for its next event with
+/// this as the deadline instead of blocking, and every wake-up pays out the time
+/// that REALLY passed ([`App::autoscroll_preview_selection`]), so this sets how
+/// smooth the motion is, never how fast: the speed is [`AUTOSCROLL_PAGE_PERIOD`]'s.
+/// About 30 frames a second — small steps that read as a glide rather than the
+/// quarter-page jump a 250 ms `watch::TICK` step makes — and no more often than
+/// the loop already draws while the mouse moves, since crossterm reports a drag
+/// for every cell crossed and every event draws a frame.
+pub(crate) const AUTOSCROLL_FRAME: Duration = Duration::from_millis(33);
 
 /// Rows the list selection moves per mouse-wheel notch.
 const LIST_WHEEL_STEP: isize = 1;
@@ -548,13 +576,46 @@ impl NewSessionDraft {
     }
 }
 
-/// An in-progress (or just-completed) mouse text selection over the preview
-/// TRANSCRIPT, in absolute screen/buffer coordinates.
+/// A cell of the preview TRANSCRIPT in CONTENT coordinates — what a mouse
+/// selection's two ends are anchored to, so the selection stays on the same text
+/// while the pane scrolls under it.
 ///
-/// `anchor` is the cell the left button was pressed on; `cursor` is the latest
-/// dragged-to cell (clamped into the preview's TRANSCRIPT rect —
-/// `view::preview_transcript_rect`, the one rect every pointer hit-test over the
-/// preview reads, so the banner row and a docked compose zone are never in it).
+/// `row` counts wrapped rows from the top of the WHOLE wrapped transcript, the row
+/// domain [`App::preview_scroll`] and [`CachedPreview::row_prefix`] already share,
+/// so screen row `y` of the transcript rect is content row `preview_scroll + (y -
+/// rect.y)` — exactly ([`content_at`] / [`screen_at`]). `col` counts cells from
+/// the transcript rect's left edge. Both describe the transcript as wrapped at ONE
+/// width, which is why a resize clears the selection (a new width re-wraps
+/// everything, and the same row number then names other text).
+///
+/// The field order is the reading order, so the derived `Ord` orders two ends
+/// top-to-bottom, then left-to-right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ContentPos {
+    /// Wrapped row from the top of the whole transcript.
+    pub row: usize,
+    /// Cell from the transcript rect's left edge.
+    pub col: u16,
+}
+
+/// An in-progress (or just-completed) mouse text selection over the preview
+/// TRANSCRIPT, anchored in CONTENT coordinates ([`ContentPos`]).
+///
+/// `anchor` is the content cell the left button was pressed on; `cursor` is the
+/// content cell under the latest pointer position, clamped into the preview's
+/// TRANSCRIPT rect (`view::preview_transcript_rect`, the one rect every pointer
+/// hit-test over the preview reads, so the banner row and a docked compose zone are
+/// never in it) and converted through the scroll the pane last RESOLVED, never a
+/// raw requested one.
+///
+/// Content-anchored rather than screen cells, so it survives the pane moving under
+/// it: a held drag past the transcript's top or bottom edge AUTOSCROLLS, a small
+/// step every [`AUTOSCROLL_FRAME`] ([`App::autoscroll_preview_selection`]), and the
+/// selection keeps growing with it, to rows that were never on screen at the
+/// press. What ends it is the user acting elsewhere or its rows coming to name
+/// other text: a new press, any keypress, a wheel notch, a resize (a new width
+/// re-wraps every row), or a reload that re-read the previewed transcript or moved
+/// the row selection ([`App::clear_preview_selection`]).
 ///
 /// The selection is FLOWING (reading order): the first row runs from the anchor
 /// column, the last row stops at the cursor column, and the rows between reach
@@ -564,27 +625,28 @@ impl NewSessionDraft {
 /// between two drawn ones copies as an empty line with nothing highlighted. A drag
 /// over blank cells alone selects nothing, so its release copies nothing. The press
 /// may still land on a blank cell (below a short transcript, inside a line's
-/// indent): only what ends up selected is limited, never where a drag may start.
+/// indent): only what ends up selected is limited, never where a drag may start. It
+/// selects TRANSCRIPT rows only: an in-flight reply's tail drawn below them is never
+/// highlighted or copied.
 ///
-/// The view reads the RENDERED buffer within this region to both reverse-video the
-/// selected cells and extract the copied text, so the highlight and the copy are
-/// the same post-wrap, post-scroll cells on screen
-/// (`view::overlay_preview_selection`). Absolute-cell — not content-anchored — so
-/// any change to what sits under those cells (a scroll, a new selection, a reload
-/// that re-read the previewed transcript or moved the selection, any keypress)
-/// clears it (see [`App::clear_preview_selection`]).
+/// Each frame, the view highlights the part of it that is VISIBLE, mapped into the
+/// current transcript rect (`view::overlay_preview_selection`); the release copies
+/// all of it by redrawing the selected rows off screen with the pane's own widget
+/// and width (`view::preview_selection_copy`). Both apply the same blank rule, the
+/// same per-row cut and the same edge-row trim, so a selection that is fully on
+/// screen copies exactly what it highlights.
 ///
 /// A DOUBLE-CLICK records a [`SelectionUnit::Word`] selection instead: `anchor` and
 /// `cursor` are both the clicked cell, and the view expands it to the UAX #29 word
-/// under that cell on the drawn row (one run, blank words select nothing).
+/// under that cell on its drawn row (one run, blank words select nothing).
 /// Highlight and copy walk that run exactly as they walk a drag's runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PreviewSelection {
-    /// Cell the drag began on (the button-down position, always inside the
-    /// transcript rect since the press arm gates on it).
-    pub anchor: Position,
-    /// Latest dragged-to cell, clamped into the transcript rect.
-    pub cursor: Position,
+    /// Content cell the drag began on (the button-down position, always inside
+    /// the transcript rect since the press arm gates on it).
+    pub anchor: ContentPos,
+    /// Content cell under the latest pointer, clamped into the transcript rect.
+    pub cursor: ContentPos,
     /// How `anchor`/`cursor` are read: a flowing character range (a drag) or the
     /// one word under `anchor` (a double-click).
     pub unit: SelectionUnit,
@@ -608,6 +670,40 @@ pub enum SelectionUnit {
 pub struct ClickRecord {
     pub pos: Position,
     pub at: Instant,
+}
+
+/// The pointer of a held left press over the preview: its RAW screen position and
+/// the autoscroll clock of a drag held past the transcript's edge.
+///
+/// The clock lives HERE, inside the held press, so nothing can end the drag and
+/// leave it behind: every path that lets go of the pointer — a release, a lost
+/// one, a key, a wheel notch, a resize, a reload that re-read the transcript —
+/// drops the clock with it, carry included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HeldPointer {
+    /// Where the pointer is, NOT clamped into the transcript rect.
+    pos: Position,
+    /// `Some` while the pointer sits past the transcript's edge and a step has
+    /// timed it; `None` inside the rect, so leaving it again starts afresh.
+    autoscroll: Option<AutoscrollClock>,
+}
+
+impl HeldPointer {
+    /// A pointer at `pos` with no autoscroll timed yet.
+    fn at(pos: Position) -> Self {
+        Self {
+            pos,
+            autoscroll: None,
+        }
+    }
+}
+
+/// How much of a held drag's autoscroll is paid: the instant elapsed time was last
+/// turned into rows, and the part of a row owed beyond them ([`autoscroll_rows`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AutoscrollClock {
+    paid_at: Instant,
+    carry: u64,
 }
 
 /// A titled, centered prompt with N labelled choices and a wrapping-cycle
@@ -1410,6 +1506,84 @@ fn clamp_to_rect(pos: Position, rect: Rect) -> Position {
     }
 }
 
+/// The CONTENT cell ([`ContentPos`]) drawn at screen cell `pos` of a transcript
+/// rect scrolled to `scroll` — the pane's resolved offset, so screen row `rect.y`
+/// is content row `scroll`. `pos` is expected inside `rect` (the callers clamp it
+/// first); saturating, so one outside cannot underflow. Pure.
+pub(crate) fn content_at(pos: Position, rect: Rect, scroll: u32) -> ContentPos {
+    let top = usize::try_from(scroll).unwrap_or(usize::MAX);
+    ContentPos {
+        row: top.saturating_add(usize::from(pos.y.saturating_sub(rect.y))),
+        col: pos.x.saturating_sub(rect.x),
+    }
+}
+
+/// The screen cell content cell `at` is drawn on in a transcript rect scrolled to
+/// `scroll` — the inverse of [`content_at`] — or `None` when it is not on screen
+/// (a row above or below the viewport, or a column past the rect). Pure.
+pub(crate) fn screen_at(at: ContentPos, rect: Rect, scroll: u32) -> Option<Position> {
+    let top = usize::try_from(scroll).unwrap_or(usize::MAX);
+    let dy = u16::try_from(at.row.checked_sub(top)?).ok()?;
+    (dy < rect.height && at.col < rect.width).then(|| Position {
+        x: rect.x + at.col,
+        y: rect.y + dy,
+    })
+}
+
+/// Which way a held drag's autoscroll moves the pane, and how fast: `(direction,
+/// distance)`, where `direction` is `-1` (up, toward older turns) for a pointer
+/// row `pointer_y` above `transcript` and `1` below it, and `distance` is how many
+/// rows past that edge it sits. `None` inside the rect's rows — the only place a
+/// drag never scrolls — and for an EMPTY rect (no pane drawn), which has no rows
+/// to scroll through. Pure.
+pub(crate) fn autoscroll_edge(pointer_y: u16, transcript: Rect) -> Option<(i32, u16)> {
+    if transcript.height == 0 {
+        None
+    } else if pointer_y < transcript.y {
+        Some((-1, transcript.y - pointer_y))
+    } else if pointer_y >= transcript.bottom() {
+        Some((1, pointer_y - transcript.bottom() + 1))
+    } else {
+        None
+    }
+}
+
+/// The whole rows a held drag's autoscroll owes after `elapsed` with the pointer
+/// `distance` rows past the transcript's edge, and the part of a row still owed
+/// after them. Pure.
+///
+/// The speed is `page × min(distance, AUTOSCROLL_MAX_DISTANCE)` rows per
+/// [`AUTOSCROLL_PAGE_PERIOD`] — a page a second per row past the edge — so the
+/// rows are that rate times `elapsed`, however the time was sliced: the speed is
+/// set by WHERE the pointer is and how long it stayed, never by how often the
+/// loop woke up or the mouse reported a move. `carry` is the part of a row the
+/// previous payout left, in units of `1 / AUTOSCROLL_PAGE_PERIOD.as_nanos()` of a
+/// row, and the second value returned is the new one — kept so a slow speed
+/// accumulates into a row over several frames instead of rounding to nothing on
+/// every one of them.
+///
+/// One payout never exceeds a `page`, and one that would (a loop stalled far
+/// longer than a frame) pays exactly a page and drops the carry: every row still
+/// passes through the viewport on its way, never jumped over unseen. At
+/// [`AUTOSCROLL_FRAME`] that cap is never reached.
+pub(crate) fn autoscroll_rows(
+    elapsed: Duration,
+    distance: u16,
+    page: u16,
+    carry: u64,
+) -> (u16, u64) {
+    let period = AUTOSCROLL_PAGE_PERIOD.as_nanos();
+    let per_period = u128::from(page) * u128::from(distance.min(AUTOSCROLL_MAX_DISTANCE));
+    let owed = per_period
+        .saturating_mul(elapsed.as_nanos())
+        .saturating_add(u128::from(carry));
+    match u16::try_from(owed / period) {
+        // `owed % period < period`, one AUTOSCROLL_PAGE_PERIOD in nanoseconds: it fits.
+        Ok(rows) if rows <= page => (rows, u64::try_from(owed % period).unwrap_or(0)),
+        _ => (page, 0),
+    }
+}
+
 /// How the board asks claude which sessions are LIVE right now.
 ///
 /// Boxed so it is injectable at the one seam that matters — see
@@ -1758,8 +1932,10 @@ pub struct App {
     ///   previewed row FINISHES (so the reply lands in view) — which `End` is how it
     ///   is said, so that is one site, not two.
     /// * CLEARED by ANY explicit scroll ([`preview_scroll_by`](Self::preview_scroll_by),
-    ///   [`preview_top`](Self::preview_top)), in either direction, and by a resolved
-    ///   match jump, which is a position the reader asked for exactly as a scroll is.
+    ///   [`preview_top`](Self::preview_top)), in either direction — a held drag's
+    ///   autoscroll included, through that same funnel, on a step that actually
+    ///   moves the pane — and by a resolved match jump, which is a position the
+    ///   reader asked for exactly as a scroll is.
     ///
     /// A scroll states a POSITION, never a subscription: even one that lands on the
     /// last row leaves the pane to the reader, because the alternative cannot be
@@ -1785,27 +1961,38 @@ pub struct App {
     /// matches a hit-test — as [`list_rect`](Self::list_rect) is under
     /// [`PaneLayout::PreviewOnly`].
     pub preview_rect: Rect,
+    /// Last wrapped height of everything the preview pane scrolls over — the
+    /// transcript plus an in-flight reply's tail — written back by the view with
+    /// [`preview_scroll`](Self::preview_scroll), so a held drag's autoscroll clamps
+    /// its step through `view::clamp_preview_offset` exactly as the next frame will
+    /// and derives its cursor from THAT scroll, never from one past the end. Left
+    /// alone under a draft card, like the scroll itself.
+    pub preview_content_h: usize,
     /// The active preview text selection, if the user is (or just finished)
     /// dragging inside the transcript. Drives the reverse-video highlight and the
     /// copy. `None` whenever nothing is selected. See [`PreviewSelection`].
     preview_selection: Option<PreviewSelection>,
-    /// The left-button-down cell inside the transcript while the button is held,
-    /// or `None`. Distinguishes a plain CLICK (press + release, no drag → open a
-    /// link) from a DRAG (press + move → select): the selection materializes only
-    /// once the pointer moves off this cell (see [`extend_preview_selection`]).
+    /// The CONTENT cell the left button went down on inside the transcript, while
+    /// the button is held, or `None`. Distinguishes a plain CLICK (press + release,
+    /// no drag → open a link) from a DRAG (press + move → select): the selection
+    /// materializes only once the pointer moves off this cell (see
+    /// [`extend_preview_selection`]).
     ///
     /// [`extend_preview_selection`]: Self::extend_preview_selection
-    preview_press: Option<Position>,
+    preview_press: Option<ContentPos>,
+    /// The pointer while the button is held — at the press cell, then the latest
+    /// drag, its RAW screen position NOT clamped into the transcript rect — or
+    /// `None` with no press held. How far it is past the transcript's edge is what
+    /// sets the autoscroll's direction and speed, and every autoscroll step
+    /// re-derives the cursor from it (see [`autoscroll_preview_selection`]). It
+    /// carries that autoscroll's clock too, so the two end together
+    /// ([`HeldPointer`]).
+    ///
+    /// [`autoscroll_preview_selection`]: Self::autoscroll_preview_selection
+    preview_pointer: Option<HeldPointer>,
     /// The previous admitted left press, for double-click timing. See
     /// [`ClickRecord`]; `None` at rest.
     last_click: Option<ClickRecord>,
-    /// The text under [`preview_selection`](Self::preview_selection) exactly as the
-    /// LAST frame drew it, or `None` with no selection or one over blank cells
-    /// alone (a `None` the release turns into no copy). Written by the view every
-    /// frame (it owns the buffer the text is read from) and read on button-up,
-    /// where a finished drag hands it to the ONE copy path as an
-    /// `Outcome::Copy` — so what is copied is what was highlighted on screen.
-    preview_selection_text: Option<String>,
     /// Transient board status (e.g. a resume refusal for a deleted worktree).
     /// Rendered on the help line and cleared on the next actionable keypress, OR
     /// when its sibling `status_ttl` counts down to zero.
@@ -1824,8 +2011,9 @@ pub struct App {
     /// Count of `AppEvent::Tick`s since launch, advanced at the `watch::TICK`
     /// cadence and wrapping rather than overflowing.
     ///
-    /// The board's only clock, and it exists for exactly one reason: it phases
-    /// the live-badge pulse via [`super::view::blink_visible`]. The pulse is
+    /// The board's only PHASE clock (a held drag's autoscroll times its motion by
+    /// elapsed time and phases nothing), and it exists for exactly one reason: it
+    /// phases the live-badge pulse via [`super::view::blink_visible`]. The pulse is
     /// APP-driven because the terminal-driven alternative does not work — most
     /// modern terminals ignore the ANSI blink attribute, so a `SLOW_BLINK` dot
     /// renders steady. This reuses the redraw cadence that already exists; it
@@ -2330,10 +2518,11 @@ impl App {
             preview_viewport_h: 0,
             list_rect: Rect::default(),
             preview_rect: Rect::default(),
+            preview_content_h: 0,
             preview_selection: None,
             preview_press: None,
+            preview_pointer: None,
             last_click: None,
-            preview_selection_text: None,
             status: None,
             status_ttl: None,
             tick: 0,
@@ -2922,7 +3111,10 @@ impl App {
     /// wrap one line down rather than removing it.
     ///
     /// The ONE funnel for every scroll that moves by a delta — `PgUp`/`PgDn`,
-    /// `Ctrl-U`/`Ctrl-D` and the mouse wheel — so the release is stated once, for
+    /// `Ctrl-U`/`Ctrl-D`, the mouse wheel and a held drag's autoscroll
+    /// ([`autoscroll_preview_selection`](Self::autoscroll_preview_selection), which
+    /// clamps its delta first and skips the call when that leaves nothing to move)
+    /// — so the release is stated once, for
     /// every one of them, and in ONE direction: down is a position like any other,
     /// not a request to keep following whatever lands next. `End` is how a reader
     /// asks for that, and it costs one key
@@ -3095,32 +3287,69 @@ impl App {
 
     // --- preview text selection (mouse drag → clipboard) --------------------
 
-    /// Begin a left-button press inside the preview transcript at `pos` (the
-    /// caller has already gated `pos` on the transcript rect —
-    /// `update::press_starts_selection`). Clears any prior selection so a fresh
-    /// click deselects like a terminal; the selection only MATERIALIZES once the
-    /// pointer drags off this cell (see
-    /// [`extend_preview_selection`](Self::extend_preview_selection)).
-    pub fn begin_preview_press(&mut self, pos: Position) {
-        self.preview_selection = None;
-        self.preview_selection_text = None;
-        self.preview_press = Some(pos);
+    /// The content cell drawn at screen cell `pos` of `transcript` right now —
+    /// `pos` clamped into the rect, then converted through
+    /// [`preview_scroll`](Self::preview_scroll), which is the offset the last frame
+    /// RESOLVED (the render writes it back) or the one the autoscroll just clamped,
+    /// never a raw request past the end.
+    fn content_under(&self, pos: Position, transcript: Rect) -> ContentPos {
+        content_at(
+            clamp_to_rect(pos, transcript),
+            transcript,
+            self.preview_scroll,
+        )
     }
 
-    /// Extend the in-progress selection to `cursor` while the button is held.
+    /// Begin a left-button press inside the preview transcript at screen cell
+    /// `pos` (the caller has already gated `pos` on `transcript` —
+    /// `update::press_starts_selection`, over `view::preview_transcript_rect`),
+    /// anchoring it to the CONTENT cell drawn there. Clears any prior selection so
+    /// a fresh click deselects like a terminal; the selection only MATERIALIZES once
+    /// the pointer drags off this cell (see
+    /// [`extend_preview_selection`](Self::extend_preview_selection)).
+    pub fn begin_preview_press(&mut self, pos: Position, transcript: Rect) {
+        self.preview_selection = None;
+        self.preview_press = Some(self.content_under(pos, transcript));
+        self.preview_pointer = Some(HeldPointer::at(pos));
+    }
+
+    /// Move the held pointer to `pointer` — its RAW screen position, past the
+    /// transcript's edge included — and re-derive the selection's cursor from it.
+    ///
     /// A no-op unless a press is active, so a drag that began anywhere but the
     /// transcript (the list, the banner, a docked compose zone, nowhere) never
-    /// selects. `cursor` is clamped into `transcript` — the SAME rect the press was
-    /// gated on (`view::preview_transcript_rect`), passed in rather than stored so
-    /// there is no second copy of it to drift — so dragging past the pane edge, or
-    /// down over the compose zone, selects to the boundary. A drag back onto the
-    /// anchor cell de-materializes the selection (nothing is selected yet), so a
-    /// jittery click still resolves as a link-open on release.
-    pub fn extend_preview_selection(&mut self, cursor: Position, transcript: Rect) {
-        let Some(anchor) = self.preview_press else {
+    /// selects. `transcript` is the SAME rect the press was gated on
+    /// (`view::preview_transcript_rect`), passed in rather than stored so there is
+    /// no second copy of it to drift. The pointer is kept unclamped (it is what the
+    /// autoscroll reads), while the cursor is the content cell under it CLAMPED into
+    /// that rect, so dragging past the pane's edge, or down over the compose zone,
+    /// selects to the boundary row on screen — and the autoscroll carries that
+    /// boundary on through the transcript. This only moves the pointer: it never
+    /// scrolls, so how often the mouse reports a move cannot change the speed. It
+    /// keeps the autoscroll's clock while the pointer stays past the edge and drops
+    /// it, carry included, the moment the pointer is back inside the rect.
+    pub fn extend_preview_selection(&mut self, pointer: Position, transcript: Rect) {
+        let (Some(_), Some(held)) = (self.preview_press, self.preview_pointer) else {
             return;
         };
-        let cursor = clamp_to_rect(cursor, transcript);
+        let autoscroll = held
+            .autoscroll
+            .filter(|_| autoscroll_edge(pointer.y, transcript).is_some());
+        self.preview_pointer = Some(HeldPointer {
+            pos: pointer,
+            autoscroll,
+        });
+        self.retarget_preview_cursor(transcript);
+    }
+
+    /// Put the selection's cursor on the content cell under the held pointer. A drag
+    /// back onto the anchor cell de-materializes the selection (nothing is selected
+    /// yet), so a jittery click still resolves as a link-open on release.
+    fn retarget_preview_cursor(&mut self, transcript: Rect) {
+        let (Some(anchor), Some(held)) = (self.preview_press, self.preview_pointer) else {
+            return;
+        };
+        let cursor = self.content_under(held.pos, transcript);
         if cursor != anchor {
             // A real drag: a character selection from the press cell, and the
             // press no longer counts as a first click.
@@ -3140,6 +3369,94 @@ impl App {
         }
     }
 
+    /// One step of a held drag's AUTOSCROLL at instant `now`: while the button is
+    /// held and the raw pointer sits above or below `transcript`, scroll the pane
+    /// toward it by the rows the time since the last step owes ([`autoscroll_rows`])
+    /// and re-derive the cursor from the pointer, so the selection keeps growing
+    /// into rows that were never on screen.
+    ///
+    /// The run loop calls this after EVERY wake-up — each event, and each
+    /// [`AUTOSCROLL_FRAME`] deadline [`autoscroll_due_in`](Self::autoscroll_due_in)
+    /// sets while a drag is held past the edge — and it is the ONLY thing that
+    /// scrolls a held drag:
+    /// [`extend_preview_selection`](Self::extend_preview_selection) only moves the
+    /// pointer, and the board tick does not step it. Each step pays out the time
+    /// that really passed, so the speed is set by where the pointer IS and how long
+    /// it stays there, never by how often the loop wakes or the mouse moves.
+    ///
+    /// The step that first finds the pointer past the edge only starts the clock;
+    /// one that finds it inside the rect stops it and drops the carried part of a
+    /// row, so leaving the rect again starts from nothing. That covers the RECT
+    /// moving under a still pointer (a banner or a compose zone coming or going);
+    /// the pointer moving back inside is dropped at once by
+    /// [`extend_preview_selection`](Self::extend_preview_selection).
+    ///
+    /// The step is clamped here through `view::clamp_preview_offset` against the
+    /// last frame's content height ([`preview_content_h`](Self::preview_content_h))
+    /// — the SAME clamp the next frame applies — so the cursor is derived from the
+    /// scroll that frame will actually show, never from one past the end. Nothing
+    /// is written when the clamp leaves the pane where it was, so a drag held below
+    /// a pane already at the bottom does not let go of the newest turn.
+    pub fn autoscroll_preview_selection(&mut self, transcript: Rect, now: Instant) {
+        let Some(held) = self.preview_pointer else {
+            return;
+        };
+        let Some((direction, distance)) = autoscroll_edge(held.pos.y, transcript) else {
+            self.preview_pointer = Some(HeldPointer::at(held.pos));
+            return;
+        };
+        // Untimed (the pointer only just went past the edge): start the clock, owe nothing.
+        let (rows, carry) = held.autoscroll.map_or((0, 0), |clock| {
+            autoscroll_rows(
+                now.saturating_duration_since(clock.paid_at),
+                distance,
+                self.preview_page(),
+                clock.carry,
+            )
+        });
+        self.preview_pointer = Some(HeldPointer {
+            autoscroll: Some(AutoscrollClock {
+                paid_at: now,
+                carry,
+            }),
+            ..held
+        });
+        let requested = i64::from(self.preview_scroll) + i64::from(direction) * i64::from(rows);
+        let next = view::clamp_preview_offset(
+            false,
+            u32::try_from(requested.max(0)).unwrap_or(u32::MAX),
+            self.preview_content_h,
+            transcript.height,
+        );
+        if next != self.preview_scroll {
+            // Through the ONE funnel for a scroll by a delta: a scroll the reader
+            // asked for by holding the drag there, so it lets go of the bottom anchor
+            // like any other. Already clamped, so the funnel lands exactly on `next`;
+            // the delta is at most a page, so it always fits.
+            let delta = i64::from(next) - i64::from(self.preview_scroll);
+            self.preview_scroll_by(i32::try_from(delta).unwrap_or(0));
+        }
+        self.retarget_preview_cursor(transcript);
+    }
+
+    /// How long from `now` until a held drag's next autoscroll step is due —
+    /// [`AUTOSCROLL_FRAME`] after the last one, `ZERO` when that has passed or no
+    /// step has timed the drag yet — or `None` when no drag is held past
+    /// `transcript`'s edge. `None` is the idle answer, and the run loop then blocks
+    /// for its next event with no deadline at all, exactly as it always has.
+    ///
+    /// Derived afresh on every call from the held pointer and the clock it carries
+    /// ([`HeldPointer`]), never kept as a timer of its own, so no deadline can
+    /// outlive the drag that set it. Pure: `now` is passed in.
+    #[must_use]
+    pub fn autoscroll_due_in(&self, transcript: Rect, now: Instant) -> Option<Duration> {
+        let held = self.preview_pointer?;
+        autoscroll_edge(held.pos.y, transcript)?;
+        Some(held.autoscroll.map_or(Duration::ZERO, |clock| {
+            AUTOSCROLL_FRAME.saturating_sub(now.saturating_duration_since(clock.paid_at))
+        }))
+    }
+
     /// The previous admitted press, for the pure double-click decision.
     #[must_use]
     pub fn last_click(&self) -> Option<ClickRecord> {
@@ -3151,24 +3468,30 @@ impl App {
         self.last_click = Some(ClickRecord { pos, at: now });
     }
 
-    /// A double-click at `pos`: select the word under that cell. Holds the press
-    /// too, so the release reads the selection through the same path a drag's does
-    /// (`take_preview_press` -> `has_preview_selection` -> the drawn text).
-    pub fn begin_word_selection(&mut self, pos: Position) {
+    /// A double-click at screen cell `pos` of `transcript`: select the word under
+    /// that cell, anchored to the CONTENT cell drawn there like a press is. Holds
+    /// the press too, so the release reads the selection through the same path a
+    /// drag's does (`take_preview_press` -> `has_preview_selection` ->
+    /// `view::preview_selection_copy`).
+    pub fn begin_word_selection(&mut self, pos: Position, transcript: Rect) {
+        let at = self.content_under(pos, transcript);
         self.preview_selection = Some(PreviewSelection {
-            anchor: pos,
-            cursor: pos,
+            anchor: at,
+            cursor: at,
             unit: SelectionUnit::Word,
         });
-        self.preview_selection_text = None;
-        self.preview_press = Some(pos);
+        self.preview_press = Some(at);
+        self.preview_pointer = Some(HeldPointer::at(pos));
     }
 
-    /// Take the active press on button-up. `Some(pos)` is the original press
-    /// cell, letting the caller resolve a no-drag click (open a link at `pos`)
+    /// Take the active press on button-up (or on the move that stands in for a
+    /// lost one), ending the held gesture — and with it the autoscroll, its clock
+    /// and carry included. `Some(at)` is the CONTENT cell the button went down on,
+    /// letting the caller resolve a no-drag click (open the link drawn there)
     /// versus a completed drag (copy the selection). Leaves the selection itself
     /// intact so a finished drag stays highlighted.
-    pub fn take_preview_press(&mut self) -> Option<Position> {
+    pub fn take_preview_press(&mut self) -> Option<ContentPos> {
+        self.preview_pointer = None;
         self.preview_press.take()
     }
 
@@ -3178,43 +3501,30 @@ impl App {
         self.preview_selection.is_some()
     }
 
-    /// The active selection, if any — read by the view to highlight the cells and
-    /// extract their text.
+    /// The active selection, if any — read by the view to highlight its visible
+    /// part and, on release, to copy all of it.
     #[must_use]
     pub fn preview_selection(&self) -> Option<PreviewSelection> {
         self.preview_selection
     }
 
-    /// Record the text the view just drew under the selection (`None` with no
-    /// selection). The view's ONE write here, once per frame: it owns the buffer
-    /// the text is read from, and there is no buffer at event time.
-    pub fn set_preview_selection_text(&mut self, text: Option<String>) {
-        self.preview_selection_text = text;
-    }
-
-    /// The text under the selection as the last frame drew it — what a finished
-    /// drag copies. `None` with no selection, before a frame has drawn one, or when
-    /// the selection covers blank cells alone.
-    #[must_use]
-    pub fn preview_selection_text(&self) -> Option<&str> {
-        self.preview_selection_text.as_deref()
-    }
-
-    /// Clear any preview selection and in-progress press, AND reset the
-    /// double-click chain ([`ClickRecord`]). Called whenever the preview's content
-    /// or scroll could change under an ABSOLUTE-cell selection and leave a stale
-    /// highlight — any keypress, a wheel scroll, or a store reload that re-read the
-    /// previewed transcript or moved the selection
-    /// ([`apply_reload`](Self::apply_reload) decides which). A fold node toggled
-    /// open or closed drops the selection WITHOUT the chain reset
+    /// Clear any preview selection and the held press with it (so no autoscroll
+    /// outlives it either), AND reset the double-click chain ([`ClickRecord`]).
+    /// The selection is anchored to CONTENT, so a scroll alone never needs this; it
+    /// is called when the user acts on the board or what the anchors name may
+    /// change — any keypress, a wheel notch, a resize (a new width re-wraps the
+    /// transcript, so a row number names other text), or a store reload that
+    /// re-read the previewed transcript or moved the selection
+    /// ([`apply_reload`](Self::apply_reload) decides which). A new press drops a
+    /// prior selection on its own ([`begin_preview_press`](Self::begin_preview_press)),
+    /// and a fold node toggled open or closed drops it WITHOUT the chain reset
     /// ([`drop_preview_selection`](Self::drop_preview_selection) owns why).
     pub fn clear_preview_selection(&mut self) {
         self.drop_preview_selection();
         self.last_click = None;
     }
 
-    /// Drop the preview selection, the in-progress press and the text the last
-    /// frame drew under the selection — everything
+    /// Drop the preview selection and the held press and pointer — everything
     /// [`clear_preview_selection`](Self::clear_preview_selection) clears EXCEPT the
     /// double-click chain ([`ClickRecord`]).
     ///
@@ -3228,7 +3538,7 @@ impl App {
     fn drop_preview_selection(&mut self) {
         self.preview_selection = None;
         self.preview_press = None;
-        self.preview_selection_text = None;
+        self.preview_pointer = None;
     }
 
     // --- transient status --------------------------------------------------
@@ -4192,13 +4502,13 @@ impl App {
 
         self.restore_selection(prev_id.clone(), prev_pos);
         self.clamp_scroll();
-        // A mouse selection is ABSOLUTE cells over the preview, so it goes when
-        // the text under those cells may have moved — the previewed transcript
-        // was re-read, or the selection landed on another row — and ONLY then,
-        // exactly as the preview cache is evicted only for what was re-read. The
-        // watcher reloads whenever ANY transcript in the store is written, so
-        // clearing on every reload cancelled a drag mid-gesture whenever some
-        // other agent wrote a line.
+        // A mouse selection is anchored to rows of the previewed transcript as
+        // it was RENDERED, so it goes when those rows may name other text — the
+        // previewed transcript was re-read (and will be re-rendered), or the
+        // selection landed on another row — and ONLY then, exactly as the preview
+        // cache is evicted only for what was re-read. The watcher reloads whenever
+        // ANY transcript in the store is written, so clearing on every reload
+        // cancelled a drag mid-gesture whenever some other agent wrote a line.
         if preview_reread || self.selected != prev_id {
             self.clear_preview_selection();
         }
@@ -4584,6 +4894,8 @@ impl App {
     /// all), [`preview_rows_above`](Self::preview_rows_above) (the match jump and
     /// the layout step's reading-position anchor),
     /// [`preview_hit_context`](Self::preview_hit_context) (the click hit-test),
+    /// [`preview_transcript`](Self::preview_transcript) (a released selection's
+    /// off-screen redraw),
     /// [`note_match_outside_preview`](Self::note_match_outside_preview) (whether the
     /// query occurs in the pane), and the test-only
     /// [`preview_text`](Self::preview_text).
@@ -4985,11 +5297,11 @@ impl App {
     ///
     /// It also drops any mouse text selection
     /// ([`drop_preview_selection`](Self::drop_preview_selection)): the re-render
-    /// moves the text under the selection's absolute cells, so the highlight — and
-    /// the text a release would copy — would name other lines. Here rather than at
-    /// a caller, so no toggle route can skip it. The double-click chain survives
-    /// it, so a quick second press on the header selects a word instead of
-    /// toggling the node back.
+    /// re-numbers the wrapped rows below the node, so the selection's content
+    /// anchors — and the text a release would copy — would name other lines.
+    /// Here rather than at a caller, so no toggle route can skip it. The
+    /// double-click chain survives it, so a quick second press on the header
+    /// selects a word instead of toggling the node back.
     ///
     /// `preview_follow_bottom` is deliberately left alone. Expanding grows the
     /// transcript BELOW the node, so a pane pinned to the bottom stays pinned by the
@@ -5022,10 +5334,10 @@ impl App {
         }
         self.preview_cache.remove(&id);
         // The toggle re-renders the transcript — its lines, its row map and the
-        // scroll below all move — so a mouse selection's ABSOLUTE cells would now
+        // scroll below all move — so a mouse selection's content anchors would now
         // name other text. Drop it here, beside the mutation, so no route into a
         // toggle can leave a stale highlight (or copy the wrong text on release):
-        // the same rule a wheel notch and a re-reading reload follow. The click
+        // the same rule a resize and a re-reading reload follow. The click
         // chain is NOT reset: this toggle is the first click of a possible
         // double-click, whose second press must select a word, not toggle again.
         self.drop_preview_selection();
@@ -5076,6 +5388,23 @@ impl App {
             &cached.matches,
             offset,
         )
+    }
+
+    /// The selected session's WHOLE rendered transcript at `inner_width` — its
+    /// logical lines and their wrapped-row prefix map — BORROWED from the SAME
+    /// width-scoped cache the pane draws from, or `None` when nothing is selected.
+    ///
+    /// What a released selection is copied from: `view::preview_selection_copy`
+    /// redraws the selected rows off screen, a bounded chunk at a time, with the
+    /// pane's own widget over these very lines — so rows the pane never drew copy
+    /// exactly as it would have drawn them. Borrowed, not cloned: the redraw clones
+    /// only the lines each chunk can reach (`view::row_window`), never the whole.
+    pub(crate) fn preview_transcript(
+        &mut self,
+        inner_width: u16,
+    ) -> Option<(&[Line<'static>], &[usize])> {
+        self.ensure_preview(inner_width)
+            .map(|p| (p.rendered.text.lines.as_slice(), p.row_prefix.as_slice()))
     }
 }
 
@@ -6608,15 +6937,26 @@ mod tests {
             height: 6,
         };
         // Down alone is not yet a selection — it is a pending press (a possible click).
-        app.begin_preview_press(Position { x: 6, y: 3 });
+        app.begin_preview_press(Position { x: 6, y: 3 }, transcript);
         assert!(!app.has_preview_selection());
         // The first drag off the anchor materializes it; a far drag clamps to the edge.
         app.extend_preview_selection(Position { x: 999, y: 999 }, transcript);
         let sel = app
             .preview_selection()
             .expect("a drag materializes a selection");
-        assert_eq!(sel.anchor, Position { x: 6, y: 3 });
-        assert_eq!(sel.cursor, Position { x: 23, y: 7 }); // clamped to (x+w-1, y+h-1)
+        // Anchored in CONTENT cells: rows from the transcript's top (the pane is
+        // unscrolled here), columns from the rect's left edge.
+        assert_eq!(sel.anchor, ContentPos { row: 1, col: 2 });
+        // Clamped to the rect's last cell (x+w-1, y+h-1) = (23, 7) first.
+        assert_eq!(sel.cursor, ContentPos { row: 5, col: 19 });
+
+        // On a SCROLLED pane the same screen cells name rows further down.
+        app.preview_scroll = 40;
+        app.begin_preview_press(Position { x: 6, y: 3 }, transcript);
+        app.extend_preview_selection(Position { x: 999, y: 999 }, transcript);
+        let sel = app.preview_selection().expect("a drag");
+        assert_eq!(sel.anchor, ContentPos { row: 41, col: 2 });
+        assert_eq!(sel.cursor, ContentPos { row: 45, col: 19 });
     }
 
     #[test]
@@ -6628,12 +6968,15 @@ mod tests {
             width: 40,
             height: 10,
         };
-        app.begin_preview_press(Position { x: 3, y: 4 });
+        app.begin_preview_press(Position { x: 3, y: 4 }, transcript);
         // A "drag" that never leaves the anchor cell does not materialize a selection,
         // so button-up resolves as a link-open click, not a copy.
         app.extend_preview_selection(Position { x: 3, y: 4 }, transcript);
         assert!(!app.has_preview_selection());
-        assert_eq!(app.take_preview_press(), Some(Position { x: 3, y: 4 }));
+        assert_eq!(
+            app.take_preview_press(),
+            Some(ContentPos { row: 4, col: 3 })
+        );
         assert_eq!(app.take_preview_press(), None, "the press is consumed once");
     }
 
@@ -6646,20 +6989,21 @@ mod tests {
             width: 40,
             height: 10,
         };
-        app.begin_preview_press(Position { x: 1, y: 1 });
+        app.begin_preview_press(Position { x: 1, y: 1 }, transcript);
         app.extend_preview_selection(Position { x: 5, y: 1 }, transcript);
         assert!(app.has_preview_selection());
         // A fresh press deselects.
-        app.begin_preview_press(Position { x: 2, y: 2 });
+        app.begin_preview_press(Position { x: 2, y: 2 }, transcript);
         assert!(!app.has_preview_selection());
     }
 
-    /// The drawn text rides WITH the selection: it survives being read (a finished
-    /// drag stays highlighted, and its text stays copyable), and every way the
-    /// selection ends drops it too — so a later release can never copy text from
-    /// a selection that is gone.
+    /// A finished selection rides on until it is cleared: reading it is not
+    /// consuming it (a finished drag stays highlighted, and its release could copy
+    /// it), and clearing it ends the whole gesture with it — the press AND the held
+    /// pointer — so neither a later release nor a later tick can act on a
+    /// selection that is gone.
     #[test]
-    fn the_drawn_selection_text_is_readable_until_the_selection_clears() {
+    fn a_held_selection_survives_reads_and_clearing_ends_the_drag_with_it() {
         let mut app = app_all(vec![session("a", "r1", Some("main"), "/tmp/a")]);
         let transcript = Rect {
             x: 0,
@@ -6667,21 +7011,387 @@ mod tests {
             width: 40,
             height: 10,
         };
-        app.begin_preview_press(Position { x: 1, y: 1 });
+        app.preview_content_h = 100;
+        app.begin_preview_press(Position { x: 1, y: 1 }, transcript);
         app.extend_preview_selection(Position { x: 8, y: 1 }, transcript);
-        // The view records what it drew under the selection; reading it is not
-        // consuming it.
-        app.set_preview_selection_text(Some("hello".to_string()));
-        assert_eq!(app.preview_selection_text(), Some("hello"));
-        assert_eq!(app.preview_selection_text(), Some("hello"));
-        // A scroll / keypress clears the highlight AND the text under it.
+        let held = app.preview_selection().expect("a drag materializes");
+        assert_eq!(
+            app.preview_selection(),
+            Some(held),
+            "reading is not consuming"
+        );
+        assert_eq!(app.preview_selection(), Some(held));
+
+        // Drag below the rect, then clear (a keypress, a wheel notch, a resize).
+        app.extend_preview_selection(Position { x: 8, y: 12 }, transcript);
         app.clear_preview_selection();
         assert!(!app.has_preview_selection());
-        assert_eq!(app.preview_selection_text(), None);
-        // So does a fresh press, which starts a new selection from nothing.
-        app.set_preview_selection_text(Some("stale".to_string()));
-        app.begin_preview_press(Position { x: 2, y: 2 });
-        assert_eq!(app.preview_selection_text(), None);
+        // The steps first: taking the press below would drop the pointer itself.
+        let t0 = Instant::now();
+        app.autoscroll_preview_selection(transcript, t0);
+        app.autoscroll_preview_selection(transcript, t0 + AUTOSCROLL_PAGE_PERIOD);
+        assert_eq!(
+            app.preview_scroll, 0,
+            "the held pointer went with it: no step scrolls after a clear"
+        );
+        assert_eq!(app.take_preview_press(), None, "and so did the press");
+    }
+
+    /// Screen <-> content: screen row `y` of the rect is content row `scroll + (y -
+    /// rect.y)`, column `x` is `x - rect.x`, and the inverse answers `None` for a
+    /// cell the pane is not showing.
+    #[test]
+    fn content_at_and_screen_at_convert_through_the_resolved_scroll() {
+        let rect = Rect::new(5, 3, 10, 4);
+        assert_eq!(
+            content_at(Position { x: 7, y: 5 }, rect, 100),
+            ContentPos { row: 102, col: 2 }
+        );
+        assert_eq!(
+            screen_at(ContentPos { row: 102, col: 2 }, rect, 100),
+            Some(Position { x: 7, y: 5 })
+        );
+        for scroll in [0, 1, 37] {
+            for y in rect.y..rect.bottom() {
+                for x in rect.x..rect.right() {
+                    let pos = Position { x, y };
+                    assert_eq!(
+                        screen_at(content_at(pos, rect, scroll), rect, scroll),
+                        Some(pos)
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            screen_at(ContentPos { row: 99, col: 0 }, rect, 100),
+            None,
+            "above"
+        );
+        assert_eq!(
+            screen_at(ContentPos { row: 104, col: 0 }, rect, 100),
+            None,
+            "below"
+        );
+        assert_eq!(
+            screen_at(ContentPos { row: 101, col: 10 }, rect, 100),
+            None,
+            "right"
+        );
+    }
+
+    /// The autoscroll's direction and speed: none inside the rect's rows (or with no
+    /// rows at all); up above it, down below it; and over a quarter second — one
+    /// board tick, which is what the step used to ride — a quarter page per row
+    /// past the edge, growing to a whole page and no further: the speeds the
+    /// tick-driven step had.
+    #[test]
+    fn autoscroll_scrolls_toward_the_pointer_faster_the_further_past_the_edge() {
+        let rect = Rect::new(0, 5, 40, 20); // rows 5..25
+        for y in rect.y..rect.bottom() {
+            assert_eq!(autoscroll_edge(y, rect), None, "row {y} is inside");
+        }
+        assert_eq!(autoscroll_edge(4, rect), Some((-1, 1)), "one row above");
+        assert_eq!(autoscroll_edge(25, rect), Some((1, 1)), "one row below");
+        assert_eq!(autoscroll_edge(3, rect), Some((-1, 2)), "two rows above");
+        assert_eq!(autoscroll_edge(27, rect), Some((1, 3)), "three rows below");
+        assert_eq!(autoscroll_edge(0, rect), Some((-1, 5)), "five rows above");
+        assert_eq!(
+            autoscroll_edge(7, Rect::new(0, 7, 40, 0)),
+            None,
+            "no pane drawn: no rows to scroll"
+        );
+
+        let page = 20;
+        let tick = Duration::from_millis(250);
+        let rows = |distance| autoscroll_rows(tick, distance, page, 0).0;
+        assert_eq!(rows(1), 5, "one row out: a quarter page");
+        assert_eq!(rows(2), 10, "two rows out");
+        assert_eq!(rows(3), 15, "three rows out");
+        assert_eq!(rows(4), 20, "four rows out: a page");
+        let tenth = Duration::from_millis(100);
+        for distance in [5, 200] {
+            assert_eq!(
+                autoscroll_rows(tenth, distance, page, 0),
+                autoscroll_rows(tenth, AUTOSCROLL_MAX_DISTANCE, page, 0),
+                "{distance} rows out is no faster than {AUTOSCROLL_MAX_DISTANCE}"
+            );
+        }
+        let (first, carry) = autoscroll_rows(tick, 1, 2, 0);
+        assert_eq!(first, 0, "a two-row page owes half a row a quarter second");
+        assert_eq!(
+            autoscroll_rows(tick, 1, 2, carry).0,
+            1,
+            "and a pane that short still makes progress: the halves add up"
+        );
+    }
+
+    /// The autoscroll pays out ELAPSED TIME: twice the time or twice the distance
+    /// past the edge owes twice the rows, and the same time sliced into
+    /// `AUTOSCROLL_FRAME` frames pays the same rows the rate promises — the part of
+    /// a row each frame carries forward loses nothing to rounding.
+    #[test]
+    fn autoscroll_rows_are_proportional_to_the_elapsed_time_and_the_distance_past_the_edge() {
+        let page = 20;
+        let ms = Duration::from_millis;
+        assert_eq!(
+            autoscroll_rows(ms(100), 1, page, 0),
+            (2, 0),
+            "a tenth of a page-second"
+        );
+        assert_eq!(
+            autoscroll_rows(ms(200), 1, page, 0),
+            (4, 0),
+            "twice the time"
+        );
+        assert_eq!(
+            autoscroll_rows(ms(100), 2, page, 0),
+            (4, 0),
+            "twice the distance"
+        );
+        assert_eq!(
+            autoscroll_rows(ms(100), 3, page, 0),
+            (6, 0),
+            "three times it"
+        );
+        assert_eq!(
+            autoscroll_rows(Duration::ZERO, 4, page, 0),
+            (0, 0),
+            "no time"
+        );
+        assert_eq!(
+            autoscroll_rows(AUTOSCROLL_PAGE_PERIOD, 1, page, 0),
+            (page, 0),
+            "one row out scrolls a page an AUTOSCROLL_PAGE_PERIOD"
+        );
+
+        // 30 frames of 33 ms = 0.99 s: `page × distance × 0.99` rows, rounded down
+        // ONCE for the whole stretch rather than once per frame.
+        const FRAMES: u32 = 30;
+        for (distance, owed) in [(1, 19), (2, 39), (3, 59), (4, 79)] {
+            let (mut paid, mut carry) = (0_u32, 0);
+            for _ in 0..FRAMES {
+                let (rows, left) = autoscroll_rows(AUTOSCROLL_FRAME, distance, page, carry);
+                paid += u32::from(rows);
+                carry = left;
+            }
+            assert_eq!(paid, owed, "{distance} rows out over {FRAMES} frames");
+        }
+    }
+
+    /// Stepped every `AUTOSCROLL_FRAME`, no step moves more than the rows one frame
+    /// is worth, rounded up, whatever the page and the distance: small steps many
+    /// times a second instead of the tick's quarter-page jump. Even a loop that
+    /// stalled far longer than a frame never moves more than a page in one step.
+    #[test]
+    fn smooth_frames_never_jump_more_than_one_frames_worth_of_rows() {
+        for page in [1, 14, 20, 50, 200] {
+            for distance in 1..=AUTOSCROLL_MAX_DISTANCE + 1 {
+                let rate = u128::from(page) * u128::from(distance.min(AUTOSCROLL_MAX_DISTANCE));
+                let one_frame = (rate * AUTOSCROLL_FRAME.as_nanos())
+                    .div_ceil(AUTOSCROLL_PAGE_PERIOD.as_nanos());
+                let mut carry = 0;
+                for frame in 0..60 {
+                    let (rows, left) = autoscroll_rows(AUTOSCROLL_FRAME, distance, page, carry);
+                    assert!(
+                        u128::from(rows) <= one_frame,
+                        "page {page}, {distance} rows out, frame {frame}: {rows} rows > \
+                         one frame's {one_frame}"
+                    );
+                    carry = left;
+                }
+            }
+        }
+        assert_eq!(
+            autoscroll_rows(Duration::from_secs(10), AUTOSCROLL_MAX_DISTANCE, 20, 0),
+            (20, 0),
+            "a stalled loop's step moves one page and carries nothing past it"
+        );
+    }
+
+    /// The run loop waits with a deadline ONLY while a drag is held past the
+    /// transcript's edge. Every other state answers `None` — the idle loop blocks
+    /// exactly as it did — and while one is held the deadline counts down from the
+    /// last step to one `AUTOSCROLL_FRAME`, due at once before any step timed it.
+    #[test]
+    fn no_autoscroll_deadline_is_set_unless_a_drag_is_held_past_the_edge() {
+        let mut app = app_all(vec![session("a", "r1", Some("main"), "/tmp/a")]);
+        let transcript = Rect::new(0, 5, 40, 10); // rows 5..15
+        app.preview_viewport_h = transcript.height;
+        app.preview_content_h = 100;
+        app.preview_follow_bottom = false;
+        let t0 = Instant::now();
+        let due = |app: &App, at| app.autoscroll_due_in(transcript, at);
+        assert_eq!(due(&app, t0), None, "no press");
+
+        app.begin_preview_press(Position { x: 2, y: 8 }, transcript);
+        assert_eq!(due(&app, t0), None, "a press held inside");
+        app.extend_preview_selection(Position { x: 30, y: 14 }, transcript);
+        assert_eq!(due(&app, t0), None, "a drag held on the last row");
+
+        app.extend_preview_selection(Position { x: 30, y: 15 }, transcript);
+        assert_eq!(
+            due(&app, t0),
+            Some(Duration::ZERO),
+            "past the edge, untimed"
+        );
+        app.autoscroll_preview_selection(transcript, t0);
+        assert_eq!(
+            due(&app, t0),
+            Some(AUTOSCROLL_FRAME),
+            "a frame after the step"
+        );
+        let ten_ms = Duration::from_millis(10);
+        assert_eq!(due(&app, t0 + ten_ms), Some(AUTOSCROLL_FRAME - ten_ms));
+        assert_eq!(
+            due(&app, t0 + AUTOSCROLL_FRAME * 2),
+            Some(Duration::ZERO),
+            "overdue"
+        );
+        assert_eq!(
+            app.autoscroll_due_in(Rect::new(0, 5, 40, 0), t0),
+            None,
+            "no pane drawn"
+        );
+
+        app.extend_preview_selection(Position { x: 30, y: 9 }, transcript);
+        assert_eq!(due(&app, t0), None, "back inside");
+        app.extend_preview_selection(Position { x: 30, y: 4 }, transcript);
+        assert_eq!(due(&app, t0), Some(Duration::ZERO), "past the top edge");
+
+        app.take_preview_press();
+        assert!(
+            app.has_preview_selection(),
+            "premise: the finished drag stays"
+        );
+        assert_eq!(
+            due(&app, t0),
+            None,
+            "released: a finished selection waits on nothing"
+        );
+
+        app.begin_preview_press(Position { x: 2, y: 8 }, transcript);
+        app.extend_preview_selection(Position { x: 30, y: 15 }, transcript);
+        app.autoscroll_preview_selection(transcript, t0);
+        app.clear_preview_selection();
+        assert_eq!(
+            due(&app, t0),
+            None,
+            "cleared by a key, a wheel notch or a resize"
+        );
+    }
+
+    /// The part of a row the autoscroll carries between frames belongs to ONE stay
+    /// past the edge. The pointer moving back inside the rect drops it; so does the
+    /// rect growing back over a still pointer (a compose zone closing); so does the
+    /// drag ending. Each next stay starts owing nothing.
+    #[test]
+    fn the_autoscroll_carry_never_outlives_a_stay_past_the_edge() {
+        let mut app = app_all(vec![session("a", "r1", Some("main"), "/tmp/a")]);
+        let transcript = Rect::new(0, 0, 40, 10);
+        let taller = Rect::new(0, 0, 40, 12);
+        app.preview_viewport_h = transcript.height; // one row out: 10 rows a second
+        app.preview_content_h = 100;
+        app.preview_follow_bottom = false;
+        let half_row = Duration::from_millis(50);
+        let (press_at, below) = (Position { x: 2, y: 3 }, Position { x: 30, y: 10 });
+        let t0 = Instant::now();
+        let stay = |n: u64| t0 + Duration::from_secs(5 * n);
+
+        // Half a row owed, and the pointer moves back inside.
+        app.begin_preview_press(press_at, transcript);
+        app.extend_preview_selection(below, transcript);
+        app.autoscroll_preview_selection(transcript, stay(0));
+        app.autoscroll_preview_selection(transcript, stay(0) + half_row);
+        assert_eq!(
+            app.preview_scroll, 0,
+            "premise: half a row owed, none scrolled"
+        );
+        app.extend_preview_selection(Position { x: 30, y: 5 }, transcript);
+        app.extend_preview_selection(below, transcript);
+        app.autoscroll_preview_selection(transcript, stay(1));
+        app.autoscroll_preview_selection(transcript, stay(1) + half_row);
+        assert_eq!(
+            app.preview_scroll, 0,
+            "moving back inside dropped the half row, or this half would complete it"
+        );
+        app.autoscroll_preview_selection(transcript, stay(1) + half_row * 2);
+        assert_eq!(
+            app.preview_scroll, 1,
+            "premise: within one stay the halves add up"
+        );
+
+        // Half a row owed again, and the rect grows back over the still pointer.
+        app.autoscroll_preview_selection(transcript, stay(1) + half_row * 3);
+        app.autoscroll_preview_selection(taller, stay(1) + half_row * 3);
+        app.autoscroll_preview_selection(transcript, stay(2));
+        app.autoscroll_preview_selection(transcript, stay(2) + half_row);
+        assert_eq!(
+            app.preview_scroll, 1,
+            "the pointer inside the grown rect dropped the half row"
+        );
+
+        // Half a row owed again, and the drag ends.
+        app.autoscroll_preview_selection(transcript, stay(2) + half_row * 2);
+        assert_eq!(app.preview_scroll, 2, "premise: the halves add up again");
+        app.autoscroll_preview_selection(transcript, stay(2) + half_row * 3);
+        app.take_preview_press();
+        app.begin_preview_press(press_at, transcript);
+        app.extend_preview_selection(below, transcript);
+        app.autoscroll_preview_selection(transcript, stay(3));
+        app.autoscroll_preview_selection(transcript, stay(3) + half_row);
+        assert_eq!(
+            app.preview_scroll, 2,
+            "the release dropped the half row, so the new drag starts owing nothing"
+        );
+    }
+
+    /// An autoscroll step clamps like the next frame will: it stops at the last
+    /// offset the content allows, and the cursor it re-derives sits on the rect's
+    /// last row at THAT offset — never on a row past the end. A step the clamp
+    /// swallows writes nothing, so a pane held at the bottom keeps following it.
+    #[test]
+    fn the_autoscroll_clamps_at_the_end_and_rederives_the_cursor_from_the_clamped_scroll() {
+        let mut app = app_all(vec![session("a", "r1", Some("main"), "/tmp/a")]);
+        let transcript = Rect::new(0, 0, 40, 10);
+        app.preview_viewport_h = transcript.height;
+        app.preview_content_h = 23; // max offset 13
+        app.preview_follow_bottom = false;
+        app.begin_preview_press(Position { x: 2, y: 3 }, transcript);
+        app.extend_preview_selection(Position { x: 30, y: 10 }, transcript);
+
+        let t0 = Instant::now();
+        app.autoscroll_preview_selection(transcript, t0);
+        assert_eq!(
+            app.preview_scroll, 0,
+            "the first step only starts the clock"
+        );
+        let mut at = t0 + Duration::from_millis(200);
+        app.autoscroll_preview_selection(transcript, at);
+        assert_eq!(
+            app.preview_scroll, 2,
+            "a fifth of a second at a page (10 rows) a second"
+        );
+        let sel = app.preview_selection().expect("a drag");
+        assert_eq!(sel.cursor, ContentPos { row: 11, col: 30 });
+
+        for _ in 0..20 {
+            at += AUTOSCROLL_PAGE_PERIOD;
+            app.autoscroll_preview_selection(transcript, at);
+        }
+        assert_eq!(app.preview_scroll, 13, "clamped at the last offset");
+        let sel = app.preview_selection().expect("a drag");
+        assert_eq!(
+            sel.cursor,
+            ContentPos { row: 22, col: 30 },
+            "the cursor is the last content row, not one past it"
+        );
+
+        app.preview_follow_bottom = true;
+        app.autoscroll_preview_selection(transcript, at + AUTOSCROLL_PAGE_PERIOD);
+        assert!(
+            app.preview_follow_bottom,
+            "a step the clamp swallowed moves nothing and lets go of nothing"
+        );
     }
 
     /// A reload drops a mouse selection only when the text under it may have
@@ -6705,7 +7415,7 @@ mod tests {
         let previewed = app.selected.clone().expect("a row is selected");
         let other = if previewed == "a" { "b" } else { "a" };
         let drag = |app: &mut App| {
-            app.begin_preview_press(Position { x: 1, y: 1 });
+            app.begin_preview_press(Position { x: 1, y: 1 }, transcript);
             app.extend_preview_selection(Position { x: 8, y: 2 }, transcript);
             assert!(app.has_preview_selection(), "premise: a selection is held");
         };
@@ -6721,7 +7431,7 @@ mod tests {
         );
         assert_eq!(
             app.take_preview_press(),
-            Some(Position { x: 1, y: 1 }),
+            Some(ContentPos { row: 1, col: 1 }),
             "nor the press of a drag still in progress"
         );
 
