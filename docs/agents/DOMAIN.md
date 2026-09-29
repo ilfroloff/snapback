@@ -32,9 +32,10 @@ environment for any snapback-owned path:
 
 The set is a single file, `<config>/state/hidden_sessions` (default
 `~/.config/snapback/state/hidden_sessions`): newline-delimited session ids,
-serialized in SORTED order for stable diffs. Reads are fail-soft (a missing file or
-an unparseable line ⇒ that entry skipped, an empty set, never a panic); writes are
-atomic (temp file + rename), matching the JSONL fail-soft discipline.
+serialized in SORTED order for stable diffs. Reads are fail-soft: each line is
+trimmed and a blank one skipped, and a missing or unreadable file (non-UTF-8 bytes
+included) is an empty set, never a panic. Writes are atomic (temp file + rename),
+matching the JSONL fail-soft discipline.
 
 Hiding is a **visibility preference, not a status flag**. A hidden session is
 still discovered, parsed, and indexed at load — its bytes stay on disk — and is
@@ -156,16 +157,10 @@ full, because a second reply that overwrote the slot left the first one still
 writing with nothing on the board recording it. Keying the entries by session
 closes that hole without serializing replies to unrelated sessions.
 
-The two FINISHED arms, `Done` and `Ended`, were once thought unreachable here: an
-earlier note argued the guard reads the BARE list and that both sampled bare lists
-held zero `done` records (across 37 entries and 74 — see the
-[sampled distribution](#observed-value-distribution)), so a finished session would
-arrive unreported and be allowed by the not-reported arm instead. That inference
-from an ABSENCE was wrong. `claude` keeps a `done` background job in its ACTIVE
-list for a while before reaping it, so the arm is LIVE rather than contingent —
-and the old note's warning against deleting it as dead code stands vindicated.
-`delete::can_delete`'s doc comment owns that correction and is the only place the
-reasoning is written down.
+The two FINISHED arms, `Done` and `Ended`, are LIVE arms, not dead code to clean
+up: `delete::can_delete`'s doc comment owns why (and the correction of the earlier
+belief that they were unreachable), and is the only place that reasoning is
+written down.
 
 What is left for a parked agent is **resurrection, not corruption** — attaching
 and replying later re-creates the file with only the new lines — and the confirm
@@ -220,7 +215,8 @@ guards the pid with an unconditional confirm and a confirm-time re-probe
   check passes and the SIGTERM reaches the newcomer. A short window also remains
   between the re-probe and `kill(2)`.
 - **pid `1` is accepted.** `send::signallable_pid` refuses only what is not a
-  strictly positive `pid_t` (`0`, a negative, anything past `i32::MAX`), so that
+  strictly positive `pid_t` (`0`, or anything past `i32::MAX` — the pid arrives
+  as a `u32`, so nothing negative reaches it), so that
   no value can reach a process group or a broadcast, plus the board's own pid
   (below); `send::signal_target` re-checks the range half. A record naming pid
   `1` would be confirmed and signalled like any other. For an unprivileged user
@@ -269,12 +265,14 @@ never fatal:
 | `agentName` | on `type:"agent-name"`, string (fail-soft) | the background job's name; a **fallback** bound-agent source for the preview handle, trusted ONLY when it names a known agent (the field also carries free-form titles) — see [bound agent](#bound-agent-storepreview) |
 | `sessionKind` | **top-level on ordinary records**, string (fail-soft); only observed value `"bg"` | marks the transcript a **background** job — one half of the [lost agent binding](#lost-agent-binding-storelineage) badge. See [`sessionKind`](#sessionkind) |
 | `message.content` | string **or** typed-block array | user prompt, preview body, content index |
+| `message.model` | per `assistant` record, string (fail-soft) | the [answering model](#answering-model-storepreview) label on preview turns; read **positionally**, never hoisted — save ONE file-level reading, the newest non-`isMeta` answer, which is [the model a `-r` launch restores](#the-model-a--r-launch-restores-last_model) and a quick reply's default |
+| `perTurnEffort`, then `effort` | TOP-LEVEL (siblings of `message`), per `assistant` record, string (fail-soft) | the [effort level](#effort-level-record_effort) on preview turns; read **positionally**, never hoisted |
 | `origin` | on `type:"user"`, object (fail-soft) | WHO the turn came from, when it was not the person at the keyboard. `kind` is `"peer"`, `"human"` or `"task-notification"`; only a `"peer"` record ever carries `from` (the sending agent) and `body` (its message). A peer record with a NON-EMPTY `body` renders as the preview's collapsible **peer node** and `from` is that node's fold key — see [Peer message node](#peer-message-node-storepreview) |
 | `origin.kind` | on `type:"user"`: `origin` is an object with a string `kind` (fail-soft — see the flag); observed `"human"`, `"task-notification"`, `"peer"`, and very often **absent** | who wrote the record. Ruled on **first** by the [failed-task flag](#failed-background-task-storeparse): `"task-notification"` is a notice, and only an absent `origin` or `"human"` can clear |
 | `isSidechain` | bool (`label::is_sidechain`; non-bool ⇒ `false`) | skip sub-agent turns when picking a label/preview — except that the preview checks the [peer node](#peer-message-node-storepreview) gate FIRST, so a peer record with a body still renders even on a sidechain turn; a sub-agent turn neither raises nor clears the [failed-task flag](#failed-background-task-storeparse) |
 | `promptSource` | on `type:"user"`, string (fail-soft); observed `typed`, `sdk`, `system`, `queued` | `typed` / `sdk` mark the USER writing — clears the flag, but is **never read before `origin`** (51 of 169 notices say `sdk` too) |
 | `turnOrigin` | on `type:"user"`, string (fail-soft); observed `human`, `sdk`, `peer`, `task_notification` | `human` / `sdk` mark the user writing — the ONLY marker a quick-reply slash command carries, [from Claude Code 2.1.278 on](#why-turnorigin-counts) |
-| `isMeta` | bool on `type:"user"`; anything but absent or `false` reads as meta (`label::is_meta`) | an injection nobody typed; never clears the flag. Every subagent hand-back carries it too, so "Claude Code injected this" is `isMeta` AND not a [peer message](#peer-message-node-storepreview) (`label::is_injected`) — the ONE check the preview's [injected node](#injected-context-node-storepreview), the [content index](#content-index-storeparse) and the [label](#label-storelabel) all read |
+| `isMeta` | bool on `type:"user"` and `type:"assistant"`; anything but absent or `false` reads as meta (`label::is_meta`, the ONE reading of it) | an injection nobody typed: on a user record it never clears the flag; on an assistant record it is skipped when finding [the model a `-r` launch restores](#the-model-a--r-launch-restores-last_model). Every subagent hand-back carries it too, so "Claude Code injected this" is `isMeta` AND not a [peer message](#peer-message-node-storepreview) (`label::is_injected`) — the ONE check the preview's [injected node](#injected-context-node-storepreview), the [content index](#content-index-storeparse) and the [label](#label-storelabel) all read |
 | `<status>` / `<summary>` | tags inside the **string** `message.content` of an `origin.kind: "task-notification"` record; first occurrence, inner text | `<status>failed</status>` raises the flag on its own; the `<summary>` is kept and quoted **verbatim** on the banner. Optional: absent or unclosed ⇒ kept empty, exactly like `<summary></summary>`, and the banner quotes nothing |
 | `uuid` | per record | a record's identity in the transcript **tree**; an [injected node](#injected-context-node-storepreview)'s fold key |
 | `parentUuid` | per record; **JSON `null` on the root** | the tree edge; the null-parent record's `uuid` is the fork-lineage identity (see [Fork lineage](#fork-lineage-storelineage)); an injected record pointing at the slash-command wrapper just before it confirms a [prompt command label](#label-storelabel) |
@@ -381,8 +379,12 @@ whose worktrees match no marker here still aggregates correctly through the git
 arm, for exactly as long as those worktrees exist.
 
 The branch level comes from the authoritative `gitBranch` (missing ⇒
-`(detached)`). Sessions sort repo↑ / branch↑ / timestamp↓; the list renders one
-group head per repo→branch group, git-log style.
+`(detached)`). The store returns sessions repo↑ / branch↑ / timestamp↓ (the order
+`--print-list` prints); the board re-orders them in `App::order_filtered`. The
+current-folder scope is a flat timestamp↓ list with no heads; the project and
+all-folders scopes render one group head per repo→branch group (the project scope
+heads every group with its one project label), git-log style, ranking each group
+by its newest session and listing its sessions timestamp↓.
 
 ### Content index (`store::parse`)
 
@@ -443,8 +445,10 @@ runtime path at all**: it is a dev-dependency, and the same memmem finders answe
 the row LABEL's highlight and the preview's marks.
 
 The reason is that `App::order_filtered` imposes the timestamp/group order and
-**discards any rank**, over a key (`(Reverse(timestamp), session_id)`) that is a
-**total order with zero ties** (measured: 66 entries → 66 distinct keys). A rank
+**discards any rank**, over a key ending in `session_id` —
+`(Reverse(timestamp), session_id)` in the current-folder scope, group-first in the
+other two — that is a **total order with zero ties** (measured: 66 entries → 66
+distinct keys). A rank
 therefore provably could not reach the screen, yet producing one dominated the
 keystroke: nucleo's `Utf32Str` conversion allocates a full `Vec<char>` for any
 non-ASCII haystack at ~8.6 ns/byte, and **86% of entries are non-ASCII** once
@@ -601,8 +605,8 @@ and occur nowhere in the rendered preview — the same one-off probe put it near
 **one content hit in eight**, again an upper bound, and dated: that measurement
 was taken while a 600-line tail cap also truncated the preview, and the cap is
 gone, so read the figure as evidence the gap exists rather than as its size. What
-remains of it is text inside collapsed wrappers and dropped sidechain turns. That
-is reported, not
+remains of it is text inside collapsed wrappers, the body of a collapsed
+peer-message node, and dropped sidechain turns. That is reported, not
 hidden — the board says the match lies outside the previewed transcript, once per
 (session, query), on the transient status line. It says so from the KEYPRESS that
 changed the query or the selection, and only when NO rendered line holds ANY atom
@@ -619,7 +623,8 @@ keeps — not bounding it differently.
 ### Incremental reload (`store::SessionStore`)
 
 The store re-reads only what moved. `SessionStore` holds an in-memory
-`path -> (FileStamp, Session)` cache and, per reload, reuses the parse of every
+`path -> (FileStamp, Option<Session>)` cache (`None` records a sidecar: read end
+to end, no `cwd`) and, per reload, reuses the parse of every
 discovered file whose `FileStamp` — `(mtime, len)`, compared as a PAIR — is
 unchanged. Measured on a 403-file / 182 MB store (2026-08-03): a full parse costs
 ~0.43 s of CPU, a reload that reuses everything ~9 ms, and one appended
@@ -660,10 +665,9 @@ cache lives.
   every reload would re-read it). A read that FAILED is a third thing and is no
   answer about the file at all: `EMFILE`, a permissions blip, a network home
   directory that blinked. `parse::FileVerdict` keeps the three apart precisely so
-  the failure cannot be stored. Stored, it would be re-served for as long as the
-  file sits still — and a finished transcript's stamp never moves again, so one
-  blip would cost that session for the LIFE OF THE PROCESS. Unstored, it costs
-  this reload only and the next one reads the file again.
+  the failure cannot be stored (why a stored one would be fatal is the AGENTS.md
+  rule's). Unstored, it costs this reload only and the next one reads the file
+  again.
 
   A read that dies MID-FILE is the same distinction one level down, drawn the
   same way: non-UTF-8 bytes (`InvalidData`) are a fact about the content, so that
@@ -836,11 +840,12 @@ rows between — so an un-gathered member surfaces as an indented, label-less ro
 far from the head that explains it, which moves the "I can't tell these apart"
 complaint rather than solving it.
 
-A gathered member draws as an indented **child row** carrying only what actually
-DIFFERS from its head: its own timestamp, its badge, the first 8 chars of its
-`session_id`, and its [turn count](#turn-count-storeparse). The count is the one
-field there carrying real information. A lineage's members share a label BY
-CONSTRUCTION — that identity *is* the reported bug — so `6 msgs` beside
+A gathered member draws as an indented **child row** carrying only what can
+DIFFER from its head: its own timestamp, its badge, the first 8 chars of its
+`session_id`, its [turn count](#turn-count-storeparse), and any marker that is a
+fact about that one session (`[task failed]`, `[unbound]`, `[hidden]`). The count
+is the field that tells the members' WORK apart. A lineage's members share a
+label BY CONSTRUCTION — that identity *is* the reported bug — so `6 msgs` beside
 `171 msgs` is what says which member is a stalled stub and which holds the work;
 a timestamp and an id only ever say WHICH member. The row **reports** and
 predicts nothing about whether a member will plain-resume: that is the hand-off
@@ -1057,8 +1062,9 @@ and sub-agent transcripts are never discovered at all.
 #### Fail-soft
 
 Four undocumented fields decide this (`origin.kind`, `promptSource`,
-`turnOrigin`, the notification's `<status>`), all read as `serde_json::Value` with
-`Option` access, so no shape can panic or reject a file. Every unrecognised shape
+`turnOrigin`, the notification's `<status>`), gated by `isSidechain`, `isMeta` and
+the tool-result check, all read as `serde_json::Value` with `Option` access, so no
+shape can panic or reject a file. Every unrecognised shape
 but one **neither sets nor clears**, and which way that errs depends on the side:
 
 - **Clear side — toward a leftover marker.** An `origin` that is `null`, not an
@@ -1136,12 +1142,14 @@ machine-readable window onto that, and `snapback` reads it **twice, differently*
 | **Board signal** (`reported_agents`) | `--json --all` | polled off-thread every `watch::AGENTS_REFRESH` (5s), skipped once the board has been idle past `watch::AGENTS_IDLE_AFTER` (60s) | "what should each row's badge say?" |
 | **Hand-off signal** (`live_agents`) | `--json` (**no `--all`**) | one-shot at EVERY hand-off | "will `claude -r` refuse *right now*?" **and** "what job id does `claude attach`/`claude stop` take?" **and**, for a record with no job id, "which `pid` does `Ctrl-K`'s signal route take?" |
 
-The hand-off reading serves FOUR gates, not just Enter: resume, Attach, the
-`Ctrl-R` [reply gate](#quick-reply--non-interactive-send-srcsendrs) and the
-`Ctrl-K` [interrupt gate](#interrupt--stopping-a-live-agent-ctrl-k-srcsendrs).
-The last two also CLASSIFY the record (via `agents::classify`) rather than reading
-membership alone — the only place a bucket informs an action rather than a pixel,
-and it is still claude's own fresh answer, never the polled `--all` map.
+The hand-off reading serves FIVE gates, not just Enter: resume, Attach, the
+`Ctrl-R` [reply gate](#quick-reply--non-interactive-send-srcsendrs), the
+`Ctrl-K` [interrupt gate](#interrupt--stopping-a-live-agent-ctrl-k-srcsendrs) and
+the `Ctrl-X d` [hard-delete confirm](#on-disk-layout). The last three also
+CLASSIFY the record (via `agents::classify`) rather than reading membership alone —
+the only places a bucket informs an action rather than a pixel (see
+[the bucket's non-display consumers](#activity-buckets-agentactivity)) — and it is
+still claude's own fresh answer, never the polled `--all` map.
 `Ctrl-K`'s [signal route](#the-signal-route-no-job-id-a-pid) asks it TWICE: once
 at the keypress, to choose the route, and again at the confirm's `Enter`, to
 re-verify the pid before anything is signalled.
@@ -1405,9 +1413,10 @@ it doing right now":
 * the hard-delete writer guard (`delete::can_delete`, see
   [the one write into this tree](#on-disk-layout)), which asks "is a WRITER
   present?" and allows `NeedsInput` / `WorkingButIdle` / `Done` / `Ended` while
-  refusing `Working` / `Idle` / `Other` — two of the gate's THREE refusals, the
-  third (snapback's own in-flight quick reply, added by
-  `delete::can_delete_target`) reading no bucket at all. That gate is
+  refusing `Working` / `Idle` / `Other` (`DELETE_RUNNING_REFUSAL`) — the one of
+  the gate's THREE refusals a bucket decides: the interactive refusal reads `kind`,
+  and the third (snapback's own in-flight quick reply, added by
+  `delete::can_delete_target`) reads no agent record at all. That gate is
   IRREVERSIBLE, so a change to `classify` is now weighed against it as well as
   against the badge it draws;
 * the `Ctrl-R`/`Ctrl-K` stop routing (`send::reply_gate` /
@@ -1449,10 +1458,11 @@ for half of every ~1s cycle, so a snapshot of the dot cannot tell a churning age
 from a dead job. What separates them is that one MOVES and the other holds. Two
 things keep the row readable anyway, and neither is the dot's instantaneous color:
 
-- **Only the dot pulses.** The kind label and the qualifier phrase always carry
-  `badge_color`'s base (`render_list` styles them off `base`, never
-  `pulse_color`), so a `Working` row's label stays `Gray` while an `Ended` row's
-  reads `DarkGray` in every phase — a stable channel through the dot's off phase.
+- **Only the dot pulses.** The kind label always carries `badge_color`'s base
+  (`render_list` styles it off `base`, never `pulse_color`), so a `Working` row's
+  label stays `Gray` while an `Ended` row's reads `DarkGray` in every phase — a
+  stable channel through the dot's off phase. (The qualifier phrase beside it is
+  DIM, except `NeedsInput`'s, which takes that base + BOLD — see above.)
 - **Among the STEADY dots, shade then separates the two resting gray buckets**:
   `WorkingButIdle` holds the working `Gray`, `Ended` holds the dim `DarkGray`.
 
@@ -1584,7 +1594,8 @@ launches persist it differently:
 long-running background sessions (which carry no `agent-setting` at all), so
 ignoring it would leave exactly those sessions bare — but the field is shared with
 free-form job titles, so it is trusted ONLY when the value matches a **defined
-agent** (`App::agent_names`, discovered once from `~/.claude/agents/*.md`, passed
+agent** (`App::agent_names`, discovered once from `~/.claude/agents/*.md` and
+`<launch_dir>/.claude/agents/*.md`, passed
 into `render`). A title therefore renders bare rather than as a bogus
 `@handle`. Both fields are read fail-soft (`.and_then(Value::as_str)`); the catch-all
 default `"claude"` and any blank name suppress the handle (the `● claude` marker
@@ -1605,7 +1616,7 @@ This is the third and last of **three distinct agent concepts** — keep them ap
 | Concept | Source | What it is |
 | --- | --- | --- |
 | **Live** (reported) agent | `claude agents --json` (`src/agents.rs`) | a **running process** — drives the board badge and the resume gate (see [Reported agents](#reported-agents-srcagentsrs)) |
-| **Defined** agent | `~/.claude/agents/*.md` (`src/defined_agents.rs`) | an **on-disk definition** a new session can be launched under (`claude --agent <name>`, see [Hand-off invocations](#hand-off-invocations-srcresumers)) |
+| **Defined** agent | `~/.claude/agents/*.md` and `<launch_dir>/.claude/agents/*.md` (`src/defined_agents.rs`) | an **on-disk definition** a new session can be launched under (`claude --agent <name>`, see [Hand-off invocations](#hand-off-invocations-srcresumers)) |
 | **Bound** agent | `agent-setting` / `agent-name` records (`store::preview`) | the **agent a recorded session actually ran under** — a preview-only label, this section; the **Defined** set above is what validates the noisy `agent-name` source |
 
 ### Peer message node (`store::preview`)
@@ -1720,6 +1731,127 @@ the latest of them, and a peer message that follows a `▶ you` turn names
 node's own `◆ message from …` header is what names that sender, and it scrolls
 with the transcript.
 
+### Answering model (`store::preview`)
+
+Every `assistant` record carries `message.model` — the model that actually
+answered THAT turn. The preview renders it as a DIM label between the bound-agent
+handle and the [effort level](#effort-level-record_effort)
+(`● claude · @lead · Opus 5.5 · xhigh · 12:55`), through the same
+`annotation_span` builder all four annotations use. One pure function,
+`model_label`, owns the whole decision, mirroring `agent_handle`. It strips the
+`claude-` vendor prefix (`MODEL_VENDOR_PREFIX`) first — the whole board is Claude,
+so repeating the vendor every turn is noise — then reads the SHAPE of what is
+left. A VERSIONED id — a lowercase family, a 1–2 digit major, an optional 1–2
+digit minor and an optional 8-digit date, joined by `-` (`MODEL_ID_SEPARATOR`,
+`MODEL_VERSION_MAX_DIGITS`, `MODEL_DATE_DIGITS`) — is written the way people say
+it; any other shape keeps the prefix-stripped id:
+
+| Input | Label | Why |
+| --- | --- | --- |
+| `claude-opus-5-5`, `claude-sonnet-5` | `Opus 5.5`, `Sonnet 5` | The shape rule: the family capitalised, the version dotted. |
+| `claude-haiku-4-5-20251001` | `Haiku 4.5 20251001` | The date is KEPT. Collapsing a dated suffix was considered and rejected as lossy for the ~4/411 sessions that carry one; a truncated id reads back as a plausible WRONG model. It follows a SPACE rather than sitting in parentheses because the [quick reply's](#quick-reply--non-interactive-send-srcsendrs) status already wraps its labels in ` (…)`, where a parenthesised date would nest. |
+| `sonnet-5` (no prefix) | `Sonnet 5` | The rule reads what is left AFTER the optional strip, so an un-prefixed id spells exactly as its prefixed twin does. |
+| `opus`, `sonnet` (bare aliases, also on disk) | unchanged | No version, so not the versioned shape; nothing to strip. |
+| `claude-3-5-sonnet-20241022` (legacy, version first), and any other shape: `claude-opus-5-5[1m]`, a 3-digit minor, a 7-digit date, a date where the major goes (`claude-haiku-20251001`), a trailing extra part | the id with only the prefix stripped (`3-5-sonnet-20241022`) | Kept rather than a guessed reformatting. The major/minor digit cap sits BELOW the date's length, so a date is never read as a version. |
+| `<synthetic>`, and any other `<…>`-wrapped id | **suppressed** | See below. |
+| absent / `null` / non-string / blank / a bare `claude-` | **suppressed** | Fail-soft, and a common case (about a fifth of sessions) — see below. |
+
+**`<synthetic>` is matched by SHAPE, not by an equality check.** Claude Code
+stamps it on records it injects ITSELF (a session-limit or auth notice), so it
+names no model that answered anything — and it is the LAST assistant model in
+**10/411** sessions, exactly where a naive "latest model" label would render it.
+The guard, `is_pseudo_model`, is `starts_with('<') && ends_with('>')` over the
+trimmed id, so a future sibling pseudo-model is suppressed the day it appears
+rather than after it leaks to the board.
+
+**Absent is an ORDINARY case, not an error state.** **86/411 (21%)** of the
+measured store carries no `message.model` at all, so a turn with no model renders
+exactly as it did before the label existed — bare, with no placeholder and no
+warning. There is nothing wrong with those sessions.
+
+**Attribution is positional, never hoisted** — the same rule the bound agent
+follows, but reached for a different reason. **11/411** sessions genuinely CHANGE
+model mid-file (one observed run went `claude-opus-4-8` ×86 → `claude-sonnet-5`
+×109), so any file-level answer would be false for those. It needs no streaming
+state at all: unlike the agent, the model sits ON the assistant record being
+rendered, which makes the per-turn property automatic. This is why the store has
+NO `Session::model` field and why neither `store::parse` nor `store::mod` was
+touched to add the label.
+
+There is no `model` record type in the store — the model is never persisted per
+session, only per turn — which is what makes `message.model` the only on-disk
+evidence of which model ran. `model_label` is therefore `pub(crate)` and shared:
+the [quick reply's](#quick-reply--non-interactive-send-srcsendrs) `modelUsage`
+readout spells and suppresses through the SAME function, so the two channels —
+what the transcript recorded, and what the send reported — can be compared without
+a difference in spelling reading as a difference in model.
+
+#### The model a `-r` launch restores (`last_model`)
+
+The per-turn rule above has ONE deliberate file-level exception, and it answers a
+different question: not "which model answered this turn" but "which model would
+`claude` resume this session on". `claude` normally restores that on a `-r` launch
+without `--model` (`restoreModelFromSession`) — the exceptions, such as an
+environment override, a non-first-party provider or a model it declines at resume
+time, are in
+[CLAUDE_CLI.md](CLAUDE_CLI.md#which-model-a-launch-runs-on-without---model) — and a
+quick reply with no pick is exactly such a launch, so its compose box names it.
+The pure `restorable_model` mirrors claude's choice for one record: an `assistant`
+record that is not `isMeta` — asked through the shared `label::is_meta`, so the
+readings of the flag cannot drift — and whose `message.model` survives
+`model_label`, so `<synthetic>` and every other pseudo-model, a blank and a
+non-string id all name nothing. The render pass keeps the LAST such record's label
+as `RenderedPreview::last_model`. Hoisting is correct here, where it would be false
+for a turn label, because the newest answer is by definition the one claude
+restores. It is collected by the SAME pass that renders the turns, so the reply box
+reads it off the width-scoped cache and no file is read or parsed a second time, on
+a keystroke or in a draw; opening a compose force-shows the preview, so that
+session's render exists before the box is first drawn. `the_last_model_is_the_newest_one_claude_would_restore`
+pins it against fixtures whose tails are the traps: a mid-file switch
+(`sess-model-switch-1`, the NEWER model), a `<synthetic>` tail and an `isMeta` tail
+(`sess-model-synthetic-tail-1`, `sess-model-meta-tail-1` — both answer the real
+model before them), and no model at all (`sess-model-absent-1`, `None`). The store
+still has no `Session::model`: this is a fact of the cached render, not of the
+parsed session.
+
+#### Effort level (`record_effort`)
+
+The effort level the turn ran at is the third of the four DIM annotations — after
+the model label, before the timestamp — shown as the BARE level exactly as recorded
+(`· xhigh`, never `· xhigh effort`). One pure function, `record_effort`, owns the
+decision:
+
+| Record | Effort shown | Why |
+| --- | --- | --- |
+| top-level `perTurnEffort` is a non-blank string | that value | Read FIRST. The order follows how the Claude Code binary resolves a turn's effort, NOT observed data: no measured record carries two different values (below), so the data could not have decided it. |
+| `perTurnEffort` absent / `null` / non-string / blank; `effort` a non-blank string | the `effort` value | An unusable `perTurnEffort` falls THROUGH rather than ending the search: a `null` one beside a string `effort` is an ordinary on-disk shape. |
+| neither key usable (absent / `null` / non-string / blank) | none — no span, never an empty ` · ` | Fail-soft; the observed Haiku shape. |
+| `message.model` is a pseudo-model (`<synthetic>`, any `<…>`) | none, even when a key is set | Claude Code injected that turn itself, so no model ran it at any effort, and its marker stays `● claude · 12:55`. The check is the SAME `is_pseudo_model` predicate that `model_label` suppresses with, never a second copy. A record with NO model still shows its effort. |
+| either key nested inside `message` | not read | Both keys are siblings of `message`: `{"type":"assistant","message":{"model":"claude-opus-5-5",…},"effort":"xhigh","perTurnEffort":null,…}`. |
+
+The value is trimmed of surrounding whitespace, as `model_label` and
+`agent_handle` treat padding, and otherwise shown as WRITTEN: never re-cased,
+mapped to a word, or suffixed. It is positional for the same reason the model is —
+it sits on the record being rendered, so it needs no streaming state — and the
+pinned row shows it because that row IS the marker line (whenever no
+[failed task](#failed-background-task-storeparse) outranks it). Two surfaces never show
+an effort: a `▶ you` turn, because no `user` record carries either key (the marker
+builder is shared, so this is the data's absence, not a special case); and the
+quick-reply status, which names models only (`status_for_send`).
+
+Measured on the local store on 2026-09-23 (716 files; 53,703 `assistant` records
+carrying an effort key):
+
+| `message.model` | `effort` | `perTurnEffort` |
+| --- | --- | --- |
+| `claude-opus-5-5`, `claude-fable-5-1` | `"xhigh"` | `"xhigh"` |
+| `claude-opus-5`, `claude-sonnet-5` | `"xhigh"` | `null` or absent |
+| `claude-haiku-4-5-20251001` | absent | `null` |
+| `<synthetic>` (2 of 51 records) | absent | `"xhigh"` — both `isApiErrorMessage` "Please run /login · API Error: 403" turns |
+
+Only `assistant` records carry either key, and no record carries two string values
+that differ.
+
 ## User-facing modes (`tui::app`)
 
 | Concept | Values | Meaning |
@@ -1727,8 +1859,9 @@ with the transcript.
 | **Scope** | `CurrentFolder` (default) / `Project` / `All` | THREE concentric answers to "which sessions are mine right now", declared widest-last so the variant order is the cycle order. current-folder = sessions whose **canonical** `cwd` exactly equals the canonical launch dir; project = sessions whose `cwd` is EITHER a member of the launch project's live worktree set (`src/worktrees.rs`) OR under the same repo ROOT (see below — two arms, and the scope needs both); all = every session. `All` renders repo→branch group heads; `Project` renders branch groups under the ONE project label instead of per-folder repo labels (see below); `CurrentFolder` is the flat, head-less list, and it ALONE, because it is the only scope that cannot span more than one folder. Selected at launch by `--project`/`-p` or `--all`/`-a`, and flipped by `Ctrl-A` between the first two — `All` joins that key ONLY on a board launched with `-a`, which is the sole route to it (see below). |
 | **Search mode** | `NameOnly` (default) / `NameAndContent` | which haystack the substring matcher scores; toggled by `Tab`. |
 | **Show hidden** | off (default) / on | whether soft-hidden sessions appear (dimmed, marked `[hidden]`, live badge intact). Toggled by `Ctrl-X h`; a row is hidden/un-hidden by `Ctrl-X x`. The set persists — see [snapback-owned state](#snapback-owned-state-srchiddenrs). |
+| **Compose model pick** | `None` (the default, in every new compose) / a `resume::ModelPick`: an offered alias plus an optional `--effort` level | the `--model` (and effort) a compose's own launch asks for, picked with `Ctrl-L` inside that compose and held on it (`ComposeState::model`); which launches it may reach is the A MODEL IS PICKED PER COMPOSE, NEVER PER BOARD rule in [AGENTS.md](../../AGENTS.md#critical-rules). With no pick the compose's `model:` label names what `claude` will choose instead. See [Compose model pick](#compose-model-pick-ctrl-l). |
 | **Forced rescan** | `Ctrl-X r` | not a mode: a one-shot that drops the store's parse cache and re-reads every transcript, reporting the count it landed on. The board autorefreshes and reuses unchanged files by itself, so this is the escape hatch for a row that looks stale — see [incremental reload](#incremental-reload-storesessionstore). |
-| **Modal** | `Row` \| `List` layout in one `Option<Modal>` | the SINGLE type for a TITLED, choice-bearing overlay. `Enter` on a running session builds the `Attach` / `Fork` / `Cancel` choice (a `Row`); `Ctrl-N` with defined agents builds the agent picker (a `List`); `Ctrl-X d` builds the hard-delete confirm (a `Row`: `Delete this` / `Delete lineage (N)` — offered only for a real multi-member lineage, carrying the member ids resolved at OPEN time — / `Cancel`, default-highlighted on Cancel by that choice's position). Each choice carries a `ModalAction` tag the one confirm handler (`confirm_modal`) routes on. The plain Enter/Esc stop confirmations (`Ctrl-R`, `Ctrl-K`), the compose zone and the `Ctrl-X` chord are separate keyboard owners, NOT `Modal`s — see [PATTERNS.md](PATTERNS.md#10-keys-actions-outcomes). |
+| **Modal** | `Row` \| `List` layout in one `Option<Modal>` | the SINGLE type for a TITLED, choice-bearing overlay. `Enter` on a running session builds the `Attach` / `Fork` / `Cancel` choice (a `Row`); `Ctrl-N` with defined agents builds the agent picker (a `List`); `Ctrl-L` inside a compose builds the model picker (a `List` opened OVER that compose, which stays open beneath it; row 0 is the compose's default, and the compose's current pick — effort included — is pre-highlighted by MATCHING the built choices rather than by index arithmetic, so a pick that is no longer offered falls back to row 0; its `←`/`→` step the highlighted model row's effort, which the row draws inline as ` · <level>`, or a dim ` · default effort` while unset and highlighted — see [Compose model pick](#compose-model-pick-ctrl-l)); `Ctrl-X d` builds the hard-delete confirm (a `Row`: `Delete this` / `Delete lineage (N)` — offered only for a real multi-member lineage, carrying the member ids resolved at OPEN time — / `Cancel`, default-highlighted on Cancel by that choice's position). Each choice carries a `ModalAction` tag the one confirm handler (`confirm_modal`) routes on. The plain Enter/Esc stop confirmations (`Ctrl-R`, `Ctrl-K`), the compose zone and the `Ctrl-X` chord are separate keyboard owners, NOT `Modal`s — see [PATTERNS.md](PATTERNS.md#10-keys-actions-outcomes). |
 
 The current-folder scope is an **exact** canonical `cwd` match by design: a
 repo's *other* worktree folders do not appear there, no matter how the paths
@@ -1829,7 +1962,7 @@ other two in four ways worth keeping straight:
   scan in `store::group`: `repo_root_of` slices the path, `repo_of` labels what
   it sliced.
 - **Autoreloaded, not a launch-time snapshot.** The git set is resolved once in
-  `App::new` and RE-RESOLVED on every reload, inside `App::apply_sessions` — so a
+  `App::new` and RE-RESOLVED on every reload, inside `App::apply_reload` — so a
   worktree created while the board is running joins the scope on the next
   refresh, with no restart, no polling, and no extra event source (a new worktree
   can only matter once its first session writes a JSONL, which the existing
@@ -1863,7 +1996,146 @@ other two in four ways worth keeping straight:
   `App::order_filtered` and `build_rows` share the one `group_key`, or the
   ordering would scatter a group the row builder then re-heads.
 
-Selection is tracked by stable `session_id` so it survives an autorefresh reload.
+### Compose model pick (`Ctrl-L`)
+
+The rule is [AGENTS.md](../../AGENTS.md#critical-rules)'s (A MODEL IS PICKED PER
+COMPOSE, NEVER PER BOARD); this is its mechanism and its reasons. The pick,
+`ComposeState::model: Option<ModelPick>`, is written only by
+`App::set_compose_model` from the picker's confirm (a blank model normalizes to
+`None`, and its effort with it). Nothing needs persisting: what a session last ran
+on is already on disk, per turn (`message.model`, see
+[answering model](#answering-model-storepreview)). Where a pick can go:
+
+| Launch | Carries the compose's pick? | Built by |
+| --- | --- | --- |
+| `Enter` in a `Ctrl-R` reply box | yes, when one is set | `send::build_send_argv` |
+| `Enter` in a `Ctrl-N` draft (`--bg`) | yes, when one is set | `send::build_bg_launch_argv` |
+| `Ctrl-O` in a `Ctrl-N` draft | yes, when one is set | `resume::build_new_argv`, via `check_new` |
+| `Ctrl-O` on the agent picker | never: it skips the draft, the only place a pick is made | `resume::build_new_argv` with `None` |
+| Resume (`Enter` on a row), Fork (`Ctrl-F`), Attach | never: their builders take no pick | `resume::build_argv` / `build_attach_argv` |
+
+`--model` goes out only for a `Some`, and `--effort` only right behind it, both
+through the ONE `resume::push_model_flag`; with no pick every argv is
+byte-identical to its modelless form and `claude` decides. That is the whole reason
+Resume and Fork carry none: a `-r` launch without `--model` normally restores the
+session's own last model (the exceptions, such as an environment override, a
+non-first-party provider or a model it declines at resume time, are in
+[CLAUDE_CLI.md](CLAUDE_CLI.md#which-model-a-launch-runs-on-without---model)),
+and a reply that picked a model leaves the session on it, because that model
+answered last. Attach carries none for a plainer reason: `claude attach` joins a
+process already running under one. `claude` does NOT restore an effort, so a
+picked effort applies to that one launch, and a later resume runs at the settings
+level for the model it restores.
+
+**The picker.** `Ctrl-L` (`compose::ComposeAction::PickModel`, on both targets)
+opens a `List` [modal](#user-facing-modes-tuiapp) OVER the compose, which keeps its
+text and pick untouched beneath it: `Enter` writes the highlighted row into that
+compose and hands the keyboard back to it, `Esc` returns to it with the previous
+pick intact. Its prompt names the scope (`Model for this reply only (←/→ effort):`
+or `Model for this new session (←/→ effort):`) and its footer the keys
+(`MODEL_PICKER_FOOTER`, `↑/↓ choose · ←/→ effort · Enter set · Esc cancel` — no
+`^O`, which is inert here). Row 0 is the compose's DEFAULT
+(`ModalAction::SetModel(None)`, no `--model`): the one row NOT drawn from the alias
+list, and the one whose description wraps whole (see
+[PATTERNS.md §5](PATTERNS.md#5-selection-and-scroll-survive-reloads)). **Where the
+other rows come from is a RUNTIME READ of the installed binary, not a list kept in
+this repo:** `model_aliases::installed_model_aliases` scans `claude` off the UI
+thread and its answer arrives as `AppEvent::ModelAliases`; from then on the picker
+offers exactly that — unfiltered, undeduplicated, in the binary's own array order —
+so a newly shipped or withdrawn alias reaches the picker with no snapback release.
+Until it lands the picker draws the `tui::app::MODEL_ALIASES` SEED, and an EMPTY
+answer (no `claude` on `PATH`, an unreadable binary, no match) degrades to that
+same seed, so a failed probe can never leave the picker empty. The aliases are
+deliberately NOT enumerated here: a prose list is one more hand-synced artifact of
+exactly the kind the probe exists to delete, and the point-in-time capture plus its
+refresh command live in [CLAUDE_CLI.md](CLAUDE_CLI.md#model-aliases---model).
+
+**The effort lives INSIDE the pick,** so no state can hold an effort without a
+model. On a highlighted MODEL row `←`/`→` step it through unset → `low` → `medium`
+→ `high` → `xhigh` → `max`, wrapping both ways (`resume::EFFORT_LEVELS`, the one
+list of levels; `tui::app::cycle_effort`, the cycle), and one `Enter` sets the
+model and the effort together. Each model row carries its OWN effort while the
+picker is open — the compose's picked model's row starts at the picked effort,
+every other row unset; moving the highlight neither carries a level along nor
+resets the row left behind; `Esc` discards them all. Row 0 holds no pick, so the
+arrows do nothing there. Unset means the model's own settings level applies, which
+the board does not read; what `claude` does with a set level — and why it can never
+fail a launch — is [CLAUDE_CLI.md](CLAUDE_CLI.md#effort-levels---effort)'s.
+
+**What a compose runs on with no pick** is ONE pure decision,
+`tui::app::resolve_compose_default(target, session_model, restore_overridden, settings_model) -> ComposeDefault`,
+asked through `App::compose_default` from state already in hand, so both surfaces
+that show it — the compose's bottom-border `model:` label and the picker's row 0 —
+read the same answer:
+
+| `ComposeDefault` | When | Label (`view::compose_model_label`) | Picker row 0 |
+| --- | --- | --- | --- |
+| `SessionModel(label)` | a reply, no override in effect, and the session has an answering model on record | `model: session (<label>)` | `session's model (<label>)` |
+| `RestoreOverridden` | a reply while `ANTHROPIC_MODEL` or an `ANTHROPIC_DEFAULT_{FABLE,OPUS,SONNET,HAIKU}_MODEL` is non-empty — in the highest settings layer's `env` block, else in the process environment — so `claude` skips the restore | `model: default` | `default` |
+| `NoSessionModel` | a reply whose transcript records no answering model: nothing to restore | `model: default` | `default` |
+| `Settings(value)` | a draft whose `claude` settings name a model | `model: default (<value>) (new sessions only)` | `default (<value>) (settings)` |
+| `BuiltIn` | a draft whose settings name none | `model: default` | `default` |
+
+A reply's `<label>` is [the model a `-r` launch restores](#the-model-a--r-launch-restores-last_model),
+read off the cached preview and spelled as the turn markers spell it. The override
+flag and a draft's value come from ONE off-thread read,
+`claude_settings::model_defaults`, delivered once per board session as
+`AppEvent::SettingsModel(ModelDefaults { new_session, restore_overridden })`; the
+precedence it mirrors is CLAUDE_CLI.md's. An override outranks the transcript,
+because `claude` skips the restore whatever the session last ran on. The
+`(new sessions only)` part (`MODEL_NEW_SESSION_SCOPE`) is the honest one: the
+settings value decides a NEW session's model, while a `-r` launch normally restores
+its session's own. A pick reads
+`model: <alias>` or `model: <alias> · <effort>` (`view::model_pick_label`). Every
+value — `default` included — is drawn in `MODEL_LABEL_STYLE` magenta, and the
+`model: ` prefix and the scope are unstyled, so a pick and a default differ by
+their words rather than by colour. The label is the compose's state for its whole
+lifetime, so it renders on the box and never on `App::status`.
+
+**Known limits — the label is display-only.** With no pick snapback sends no
+`--model`, so a wrong label never changes the argv or what runs; it only
+misnames it. The cases it is known to misname, each a `claude` rule
+([CLAUDE_CLI.md](CLAUDE_CLI.md#which-model-a-launch-runs-on-without---model)) that
+snapback does not model, include:
+
+- A reply reads `session (<label>)` while `claude` DECLINES the restore for a model
+  it rejects at resume time (retired, of an unknown family, not allowed for the
+  account) — only `claude` knows that, at that moment.
+- A reply reads `session (<label>)` on a non-first-party provider, which skips the
+  restore; CLAUDE_CLI.md records no variables that select a provider.
+- A reply reads `session (<label>)` when the session is bound to an agent whose
+  frontmatter names its own `model:`: the restored agent's model overrides the
+  session's, and `defined_agents` does not read the field.
+- A reply reads `session (<label>)` when the settings' model is `opusplan` or
+  `haiku` and the session's model is compatible with it: `claude` skips the restore
+  and keeps the alias, and a reply's default ignores the settings value.
+- A reply runs in its session's own `cwd`, while `claude_settings` reads the LAUNCH
+  dir's project layer, so an `env` override set in one of those projects and not
+  the other is misread.
+- A `Ctrl-N` draft for a defined agent whose frontmatter names a `model:` (not
+  `inherit`) starts on that model, which outranks `ANTHROPIC_MODEL` and the
+  settings, while the label names the settings value or `default`.
+- A draft's settings value misses the sources `claude_settings` does not read (the
+  MDM/server-managed tiers, the global config's `env`, the git-root
+  `settings.local.json` relocation; see [ARCHITECTURE.md](ARCHITECTURE.md)'s
+  `claude_settings` row).
+
+The list is not exhaustive: CLAUDE_CLI.md also records a skip the bundle does not
+make legible. The label also omits the `[1m]` suffix `claude` may append to a
+restored id; that is the same model's long-context variant, not a different model.
+
+**Held as the raw string and NEVER validated** — neither the probed set nor the
+seed is a whitelist, and an unknown value is `claude`'s to reject: a hard,
+non-zero failure, which the draft's `Ctrl-O` run explains with
+`resume::MODEL_NONZERO_HINT` (naming the draft's `Ctrl-L` pick instead of the
+agent-name wording) and the reply and the `--bg` launch report through their own
+honest status maps. **Precedence:** a draft's pick SUPERSEDES a defined agent's own
+`model:` frontmatter — deliberate, since the user picked it after that agent was
+written; `src/defined_agents.rs` does not read the field at all, so `claude`
+resolves it and the flag is the later word. The probed alias list and the settings
+answers are derived, in-memory state about ANOTHER program — memoized for the
+process and re-read per board session respectively — and are written nowhere
+either.
 
 ### Terminal paste routing (`Event::Paste`)
 
@@ -1874,7 +2146,7 @@ a partial enumeration here is a wrong one, so all six keyboard owners are stated
 
 | Owner (in precedence order) | What a paste does | Why |
 | --- | --- | --- |
-| **Modal** (`handle_modal_key`) | ignored | A fixed choice with no text field. Acting would pick an option the user did not choose; falling through would type into a query the overlay is covering. |
+| **Modal** (`handle_modal_key`) | ignored | A fixed choice with no text field. Acting would pick an option the user did not choose; falling through would type into whatever the overlay is covering — the query, or, under a compose's `Ctrl-L` model picker, that compose's draft. |
 | **`Ctrl-X` chord** (`handle_chord_key`) | ignored, chord stays ARMED | The chord resolves on exactly one KEY, hit or miss. A paste carries no completion, and cancelling on one would silently disarm a chord whose hint is still on screen. |
 | **Stop confirm** (`handle_stop_confirm_key`) | ignored | A plain Enter/Esc gate; a paste is neither, and must never stop an agent. |
 | **Interrupt confirm** (`handle_interrupt_confirm_key`) | ignored | Same. |
@@ -1903,7 +2175,24 @@ different mechanism, same verb.
 | Resume | `claude -r <id>` (`<id>` = full `sessionId`) |
 | Fork | `claude -r <id> --fork-session` (`<id>` = full `sessionId`) |
 | Attach | `claude attach <job-id>` (one-shot reattach; `<job-id>` = the **short agent-view id** from `claude agents --json`, **not** the `sessionId`) |
-| New session | `claude [--agent <name>] [<prompt>]` (interactive launch, no `-r` — mints its own id; started in `App::launch_dir` via `Ctrl-N`, optionally bound to a picked agent, and optionally opening on a drafted `<prompt>` — see [the background draft pane](#background-agent-draft-pane-ctrl-n)) |
+| New session | `claude [--agent <name>] [--model <alias> [--effort <level>]] [<prompt>]` (interactive launch, no `-r` — mints its own id; started in `App::launch_dir` via `Ctrl-N`, optionally bound to a picked agent, and optionally opening on a drafted `<prompt>` — see [the background draft pane](#background-agent-draft-pane-ctrl-n)) |
+
+**Which hand-off may carry a model** is the
+[compose model pick](#compose-model-pick-ctrl-l)'s table. On this side the
+exclusion is a SIGNATURE, not a match arm: `build_argv(session_id, fork)`,
+`build_attach_argv(job_id)` and their gates (`check(session, fork)`,
+`check_attach`) take no model parameter, so no `--model` or `--effort` token can
+reach a Resume, Fork or Attach argv even by mistake.
+`argv_for` hands `ctx.model` to `build_new_argv` alone rather than appending the
+flag itself, because it must precede the trailing POSITIONAL prompt and only the
+builder that owns that positional knows where "before it" is. `--effort` rides
+inside the same `push_model_flag` guard, directly after `--model`, so it never
+appears without the model; with no pick the argv is byte-identical to its
+modelless form. The trim/blank guard is literally SHARED with `--agent`
+(`resume::flag_value`), so a blank pick can never emit a valueless flag, and
+`nonzero_hint_for` selects `MODEL_NONZERO_HINT` from that SAME predicate — a blank
+pick emits nothing and therefore keeps the new-session wording, rather than blaming
+a model that was never sent.
 
 `claude attach` matches the agent-view **job id** (the short id), not the full
 `sessionId` — a full UUID exits 1 ("No job matching"). Only **background** agents
@@ -1951,14 +2240,17 @@ launching, and from there:
 
 | Key | argv | Route |
 | --- | --- | --- |
-| `Enter` | `claude [--agent <name>] --bg <prompt>` | `Outcome::BgLaunch` → `send::spawn_bg_launch` → one `AppEvent::BgLaunchFinished`. **No teardown** — the board stays up. |
-| `Ctrl-O` | `claude [--agent <name>] [<prompt>]` | `Outcome::Resume` → the ordinary teardown round trip, via `resume::check_new`. |
+| `Enter` | `claude [--agent <name>] [--model <alias> [--effort <level>]] --bg <prompt>` | `Outcome::BgLaunch` → `send::spawn_bg_launch` → one `AppEvent::BgLaunchFinished`. **No teardown** — the board stays up. |
+| `Ctrl-O` | `claude [--agent <name>] [--model <alias> [--effort <level>]] [<prompt>]` | `Outcome::Resume` → the ordinary teardown round trip, via `resume::check_new`. |
 
 `Enter` therefore lives in the [`send`](#quick-reply--non-interactive-send-srcsendrs)
 family, not the hand-off one: `--bg` registers the agent and returns immediately
 with no TTY, so tearing the board down for it would buy nothing. An empty draft
 refuses `Enter` (a background agent with no prompt does nothing) but is fine for
-`Ctrl-O`, which then launches bare — exactly what the picker's own `Ctrl-O` emits.
+`Ctrl-O`, which then launches with no positional — with no pick, exactly what the
+picker's own `Ctrl-O` emits. Both routes carry the draft's own `Ctrl-L` pick when
+it has one, and only then ([compose model pick](#compose-model-pick-ctrl-l)): the
+draft chose its model, and which key starts it does not change that.
 
 **The pane shows a PLACEHOLDER, not a transcript.** A draft opens
 `App::draft: Option<NewSessionDraft>` alongside the compose editor, and while it
@@ -2038,7 +2330,7 @@ Two constraints shape the rest:
   is `last_new_agent` above, which is picker state, not a board row.
 
   The draft card is NOT a counter-example: it is a PANE, and it is the reason a
-  row was never an option. `apply_sessions` replaces `sessions` wholesale, so a
+  row was never an option. `apply_reload` replaces `sessions` wholesale, so a
   synthetic row dies on the next autorefresh; its empty `content_index` would
   drop it under any active query; `Ctrl-X x` on it would persist a fabricated id
   into the one file snapback owns; and `resume.rs` forbids deriving the short id
@@ -2056,7 +2348,8 @@ carries the same row for its own zero-exit downgrade (below).
 ## Quick reply — non-interactive send (`src/send.rs`)
 
 `Ctrl-R` sends a one-shot message to the selected session WITHOUT the teardown
-hand-off above. `claude -p -r <id> --output-format json "<msg>"` resumes the
+hand-off above. `claude -p -r <id> --output-format json [--model <alias> [--effort <level>]] "<msg>"`
+resumes the
 session non-interactively (its stdio is a pipe, no TTY), replays the full
 context, **appends the exchange in place** to the same `<id>.jsonl` — same
 `sessionId`, no new file — prints a JSON result (`is_error`, `total_cost_usd`,
@@ -2163,7 +2456,39 @@ The stop step (`build_stop_argv`, the SHORT agent-view job id from the probe's
 `ReportedAgent.id`) runs in `run_send` BEFORE the send, **best-effort**: if the job
 was already reaped between the gate and the send, the stop fails but the reply still
 lands; if the session really is still held, the reply's own error is what surfaces.
-No permission flags are passed: a send inherits the user's existing settings.
+
+**What a send inherits, and what it does not.** No permission flags are passed
+(`--permission-mode` / `--allowedTools`): a send inherits the user's PERMISSION
+POSTURE from their existing settings, matching an ordinary interactive resume.
+That claim is about permissions ALONE. The MODEL is a deliberate carve-out — an
+explicit, visible `Ctrl-L` pick made in THIS reply's box, and the ONLY way to
+choose one on this path at all, since the in-session `/model` command cannot reach
+a non-interactive `-p` run — so a [compose pick](#compose-model-pick-ctrl-l) is
+honored for this one reply, its effort included, emitted through the SAME
+`resume::push_model_flag` rather than a second copy of its guard. The identical
+split holds for the draft's background launch. With no pick the argv carries no
+`--model`, and `claude` normally restores the model the session last answered with
+— the `model: session (<label>)` the box showed, unless an environment override
+made it say `default`.
+
+**Which model ANSWERED.** A successful send's JSON payload carries `modelUsage`, a
+map keyed by the model that actually ran, so `status_for_send` appends it to the
+cost: `sent — $0.0136 (Sonnet 5)`. It sits next to the cost because on this path the
+two are one fact — a `-p -r` reply replays the whole conversation, so which model
+answered is what the number was spent on — and it is the only SYNCHRONOUS proof of
+the answer, since `--model` is a REQUEST a `--fallback-model` may silently
+substitute and the transcript's own `message.model` cannot be read until the turn
+is on disk. Keys are spelled and suppressed by the SAME
+[`preview::model_label`](#answering-model-storepreview) the transcript marker
+uses. **Every** key is listed (sorted for determinism, then deduped by LABEL), not
+one picked at random: a multi-key map IS the substitution, and reporting one of
+them would hide exactly the divergence this readout exists to expose. FAIL-SOFT
+throughout — an absent, empty, non-object or wholly-suppressed `modelUsage`
+appends nothing and leaves the status exactly as it read before; the suffix is
+never attached to a FAILURE, where naming a model would dress a refusal up as an
+answer. An invalid `--model` is a hard failure (exit 1, empty stderr, stdout
+`is_error:true`, `modelUsage:{}`) and needs no new seam: `status_for_failed_send`
+already renders it.
 
 **Report the send HONESTLY.** Because claude prints its refusal to **stderr** and
 exits non-zero with an EMPTY stdout, a driver that nulls stderr and ignores the exit

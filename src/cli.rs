@@ -46,8 +46,9 @@ KEYS:
     Ctrl-N        new session in the launch dir: pick an agent when any are
                   defined, then draft the session's first message — Enter starts
                   it as a BACKGROUND agent without leaving the board, Ctrl-O runs
-                  it interactively instead, Ctrl-J or Alt+Enter newline, Esc
-                  cancels. The message is sent as the first turn either way
+                  it interactively instead, Ctrl-L picks its model, Ctrl-J or
+                  Alt+Enter newline, Esc cancels. The message is sent as the
+                  first turn either way
     Ctrl-O        in the agent picker: start that agent interactively at once,
                   skipping the draft — the same verb Ctrl-O has inside the draft
     Ctrl-X        leader chord: x hide · d delete (this row or its lineage)
@@ -64,7 +65,26 @@ KEYS:
                   with no job to stop, is refused — try Ctrl-K or Fork instead.
                   While a session's own reply is still being sent, Ctrl-R on
                   that session is refused until it lands; other rows can still
-                  reply (Enter sends, Ctrl-J or Alt+Enter newline, Esc cancels)
+                  reply (Enter sends, Ctrl-L picks the model, Ctrl-J or Alt+Enter
+                  newline, Esc cancels)
+    Ctrl-L        in a reply or draft box: pick the model, and optionally the
+                  effort, for THIS message only. The box names what it will run
+                  on — a reply 'model: session (<model>)', the model its session
+                  last answered with, which claude keeps by itself; a draft
+                  'model: default (<value>) (new sessions only)', from your
+                  claude settings — and --model/--effort are sent only when you
+                  pick something else. With ANTHROPIC_MODEL or an
+                  ANTHROPIC_DEFAULT_*_MODEL set, claude does not restore the
+                  session's model, so a reply says 'model: default'. The first
+                  row goes back to the default; every new box starts there and
+                  nothing is remembered. Enter, Ctrl-F and Attach never send a
+                  model, and claude does not keep an effort for a later resume
+    ←/→           in the model picker: step the highlighted model's effort
+                  through default → low → medium → high → xhigh → max, wrapping,
+                  sent as --effort beside --model; Enter sets both into the box,
+                  which then reads 'model: <alias> · <effort>'. Nothing on the
+                  default row. claude lowers a level the model can't use, and
+                  ignores it for a model with no effort support
     Ctrl-K        stop / interrupt the selected session's live agent. With a job
                   to stop it runs claude stop: an agent whose run is over (done,
                   stopped, failed) stops at once, every other one confirms

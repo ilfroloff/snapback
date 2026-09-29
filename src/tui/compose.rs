@@ -16,7 +16,9 @@
 //!
 //! The compose zone is a modal — while it is open it owns the keyboard, exactly
 //! like the running-session and agent-pick overlays — and leaves by submitting
-//! (`Enter`), running interactively (`Ctrl-O`), or cancelling (`Esc`).
+//! (`Enter`), running interactively (`Ctrl-O`), or cancelling (`Esc`). `Ctrl-L`
+//! opens the model picker OVER it, for this one compose only (see
+//! [`ComposeState::model`]); the picker returns to the same draft either way.
 //!
 //! It is also the only installer of the PANE-level twin,
 //! [`App::draft`](super::app::App::draft): [`open_background`] opens the editor and
@@ -51,6 +53,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 
+use crate::resume::ModelPick;
 use crate::send::{self, BgLaunchRequest, SendPlan, SendRequest};
 
 use super::app::{App, NewSessionDraft};
@@ -120,12 +123,27 @@ pub struct ComposeState {
     /// separate buffer with its own configuration and is never routed through
     /// this one (see the module doc).
     pub textarea: TextArea<'static>,
+    /// The model (and optional effort) picked for THIS compose with `Ctrl-L`, or
+    /// `None` for its default — no `--model` at all, so a reply normally keeps the
+    /// model the session last answered with and a draft starts on the settings' model.
+    ///
+    /// SCOPED TO ONE COMPOSE, by construction: it lives on the compose state, so it
+    /// is born `None` with every [`ComposeState::new`] and dies with the compose
+    /// (`App::close_compose`). Nothing global holds it and nothing on disk ever
+    /// learns it — a pick is a request for one message, and claude itself keeps a
+    /// session on the model a reply ran with (it normally restores that model on the
+    /// next `-r`). Written only by `App::set_compose_model`, from the picker's confirm;
+    /// read by the submit paths below, which emit `--model`/`--effort` ONLY when it
+    /// is `Some`, and by the compose box's `model:` label.
+    pub model: Option<ModelPick>,
 }
 
 impl ComposeState {
     /// Open a fresh compose buffer for `target`, configured for plain multiline
     /// input. The single constructor, so both drafts get an identically-configured
-    /// editor and the widget setup lives in exactly one place.
+    /// editor and the widget setup lives in exactly one place — and so every
+    /// compose starts on its default model ([`model`](Self::model) `None`), however
+    /// the last one ended.
     #[must_use]
     pub fn new(target: ComposeTarget) -> Self {
         let mut textarea = TextArea::default();
@@ -136,7 +154,11 @@ impl ComposeState {
         // wider than the box) so a long sentence stays visible instead of scrolling
         // off to the right.
         textarea.set_wrap_mode(WrapMode::WordOrGlyph);
-        Self { target, textarea }
+        Self {
+            target,
+            textarea,
+            model: None,
+        }
     }
 
     /// Open a fresh REPLY buffer for `session_id`. `stop_job` carries the job id to
@@ -226,6 +248,29 @@ pub enum ComposeAction {
     /// actionable. `Ctrl-O` is unbound in `ratatui_textarea`, so claiming it costs
     /// the reply editor nothing it previously did.
     OpenInteractive,
+    /// Open the model picker for THIS compose (`Ctrl-L`) — both targets act on it,
+    /// since a reply and a draft each carry their own pick
+    /// ([`ComposeState::model`]).
+    ///
+    /// `Ctrl-L` because it is the one control letter left that nothing on the path
+    /// to this router claims:
+    ///
+    /// * `ratatui_textarea` `=0.9.2` does not bind it. `TextArea::input`'s map
+    ///   (`textarea.rs`, the `match` in `input`) binds `Ctrl-` + `m h d k j w n p f b
+    ///   a e u r y x c v` and nothing else, and falls through to `_ => false`, so
+    ///   the key edits nothing today and claiming it costs the editor nothing —
+    ///   exactly the `Ctrl-O` argument above.
+    /// * No terminal aliases it. crossterm 0.29 decodes its byte, `0x0C`, through
+    ///   the plain `0x01..=0x1A` control arm as `Char('l')` + `CONTROL`, where
+    ///   `Ctrl-M`/`Ctrl-I`/`Ctrl-H` arrive as Enter/Tab/Backspace and `Ctrl-[` as
+    ///   Esc. It is not flow control (`Ctrl-S`/`Ctrl-Q`), a job-control signal
+    ///   (`Ctrl-Z`, `Ctrl-C`), or a key this router already owns (`Enter`, `Esc`,
+    ///   `Ctrl-J`, `Ctrl-O`).
+    /// * Of the control letters that survive both of those — `g`, `l`, `t` — the
+    ///   Zellij multiplexer's default keymap takes `Ctrl-G` (lock) and `Ctrl-T`
+    ///   (tabs) before the program ever sees them; `Ctrl-L` is the one it leaves
+    ///   alone. The board binds no `Ctrl-L` either, so the key means one thing.
+    PickModel,
 }
 
 /// Map a keypress to a [`ComposeAction`]. PURE and free of any `TextArea`
@@ -252,6 +297,8 @@ pub enum ComposeAction {
 ///   `Alt+Enter` remains the guaranteed newline.
 /// * `Ctrl-O` → **OpenInteractive** (the background draft's escape hatch; inert on
 ///   a reply — see [`ComposeAction::OpenInteractive`]).
+/// * `Ctrl-L` → **PickModel** (this compose's model picker, on both targets — see
+///   [`ComposeAction::PickModel`] for why the key is free).
 /// * `Esc` → **Cancel** (dismiss compose, not the app).
 /// * everything else → **Forward** to the editor.
 #[must_use]
@@ -262,6 +309,10 @@ pub fn compose_key_to_action(key: KeyEvent) -> ComposeAction {
     match key.code {
         KeyCode::Char('j' | 'J') if ctrl => ComposeAction::Newline,
         KeyCode::Char('o' | 'O') if ctrl => ComposeAction::OpenInteractive,
+        // Unbound in `ratatui_textarea` =0.9.2 and aliased by no terminal: the
+        // full argument is on `ComposeAction::PickModel`. Both cases, for the kitty
+        // path's sake, like the arms above.
+        KeyCode::Char('l' | 'L') if ctrl => ComposeAction::PickModel,
         KeyCode::Enter if alt || shift => ComposeAction::Newline,
         KeyCode::Enter => ComposeAction::Send,
         KeyCode::Esc => ComposeAction::Cancel,
@@ -306,8 +357,10 @@ pub fn open_background(app: &mut App, agent: Option<String>) {
 /// Newline inserts into the editor; Forward hands the keystroke to the editor's
 /// FULL key handler ([`TextArea::input`]); Cancel clears the compose state; Send
 /// resolves the buffer through [`submit_compose`] (a reply send, or a background
-/// launch) and OpenInteractive escalates a background draft to the interactive
-/// hand-off.
+/// launch); OpenInteractive escalates a background draft to the interactive
+/// hand-off; and PickModel opens the model picker over this compose
+/// (`App::open_model_picker`), which leaves the draft — text and pick alike —
+/// exactly as it was until the picker's `Enter` writes a new pick into it.
 ///
 /// Forward uses `input` (not `input_without_shortcuts`) so arrows/Home/End actually
 /// MOVE the caret and word-delete works — `input_without_shortcuts` handles only
@@ -341,6 +394,12 @@ pub fn handle_compose_key(app: &mut App, key: KeyEvent) -> Outcome {
         }
         ComposeAction::Send => submit_compose(app),
         ComposeAction::OpenInteractive => open_interactive(app),
+        ComposeAction::PickModel => {
+            // A modal over the compose: it takes the keyboard until `Enter`/`Esc`,
+            // and the compose underneath is untouched either way.
+            app.open_model_picker();
+            Outcome::Continue
+        }
     }
 }
 
@@ -366,29 +425,49 @@ pub fn insert_paste(app: &mut App, text: &str) {
     }
 }
 
-/// Read the open draft's `(text, target)` out of the app, ending the borrow before
-/// anything mutates it — the clone-then-mutate discipline every other handler here
-/// follows.
-fn draft(app: &App) -> Option<(String, ComposeTarget)> {
+/// The open draft as its submit paths need it: the text, what it is addressed to,
+/// and the model picked for it (`None` = its default, no `--model`). Cloned out so
+/// the borrow of the app ends before anything mutates it — the clone-then-mutate
+/// discipline every other handler here follows.
+struct Draft {
+    /// The editor buffer, lines joined with `\n`.
+    message: String,
+    /// What the draft is addressed to.
+    target: ComposeTarget,
+    /// The compose's own model pick ([`ComposeState::model`]).
+    model: Option<ModelPick>,
+}
+
+/// Read the open draft out of the app (see [`Draft`]).
+fn draft(app: &App) -> Option<Draft> {
     let compose = app.compose.as_ref()?;
-    Some((compose.textarea.lines().join("\n"), compose.target.clone()))
+    Some(Draft {
+        message: compose.textarea.lines().join("\n"),
+        target: compose.target.clone(),
+        model: compose.model.clone(),
+    })
 }
 
 /// Resolve the compose buffer into a driver [`Outcome`], routing on the open
-/// [`ComposeTarget`]: a reply sends, a background draft launches.
+/// [`ComposeTarget`]: a reply sends, a background draft launches — each with the
+/// model picked in THIS compose, if any.
 fn submit_compose(app: &mut App) -> Outcome {
-    match draft(app) {
-        Some((
-            message,
-            ComposeTarget::Reply {
-                session_id,
-                stop_job,
-            },
-        )) => submit_reply(app, message, session_id, stop_job),
-        Some((message, ComposeTarget::NewBackgroundAgent { agent })) => {
-            submit_bg_launch(app, message, agent)
+    let Some(Draft {
+        message,
+        target,
+        model,
+    }) = draft(app)
+    else {
+        return Outcome::Continue;
+    };
+    match target {
+        ComposeTarget::Reply {
+            session_id,
+            stop_job,
+        } => submit_reply(app, message, session_id, stop_job, model.as_ref()),
+        ComposeTarget::NewBackgroundAgent { agent } => {
+            submit_bg_launch(app, message, agent, model.as_ref())
         }
-        None => Outcome::Continue,
     }
 }
 
@@ -412,7 +491,19 @@ fn submit_compose(app: &mut App) -> Outcome {
 /// no attempt is made to reconcile the short job id back to a `sessionId`. The new
 /// agent reaches the board through the existing watcher → reload path, and its own
 /// transcript already records which agent it is.
-fn submit_bg_launch(app: &mut App, message: String, agent: Option<String>) -> Outcome {
+///
+/// The model picked in THIS draft (`model`, from `Ctrl-L`) rides along into the argv
+/// beside the agent, and DELIBERATELY outranks any `model:` the agent definition
+/// declares — the same precedence [`crate::resume::build_new_argv`] argues for the
+/// interactive twin, so the draft means the same thing whichever key launches it.
+/// With no pick (`None`) no `--model` is sent and the argv is unchanged: the new
+/// session starts on the model the user's `claude` settings name.
+fn submit_bg_launch(
+    app: &mut App,
+    message: String,
+    agent: Option<String>,
+    model: Option<&ModelPick>,
+) -> Outcome {
     if message.trim().is_empty() {
         // Nothing to run: keep the draft pane open so the user can type.
         app.set_status_transient(COMPOSE_EMPTY_BG_HINT);
@@ -421,7 +512,7 @@ fn submit_bg_launch(app: &mut App, message: String, agent: Option<String>) -> Ou
     app.set_last_new_agent(agent.clone());
     match send::plan_bg_launch(&app.launch_dir) {
         Ok(cwd) => {
-            let argv = send::build_bg_launch_argv(agent.as_deref(), &message);
+            let argv = send::build_bg_launch_argv(agent.as_deref(), model, &message);
             // The editor closes but the CARD stays, marked in flight: there is
             // nothing left to type, yet still no session to preview, so the
             // placeholder reports the launch until THIS launch's `BgLaunchFinished`
@@ -451,10 +542,10 @@ fn submit_bg_launch(app: &mut App, message: String, agent: Option<String>) -> Ou
 /// it delegates to [`super::update::launch_new_session`] — the same seam the
 /// picker's OWN `Ctrl-O` uses — which runs [`crate::resume::check_new`] over the
 /// existing `SessionAction::New` / `HandoffCtx` / `argv_for` machinery. The draft
-/// becomes `claude [--agent <name>] <prompt>` through the IDENTICAL teardown →
-/// spawn → wait → return round trip as every other `Outcome::Resume`. An EMPTY
-/// draft launches bare (no positional), i.e. exactly what the picker's `Ctrl-O`
-/// emits.
+/// becomes `claude [--agent <name>] [--model <alias> [--effort <level>]] <prompt>`
+/// through the IDENTICAL teardown → spawn → wait → return round trip as every other
+/// `Outcome::Resume`. An EMPTY draft with no pick launches bare (no positional), i.e.
+/// exactly what the picker's `Ctrl-O` emits.
 ///
 /// That shared seam is the point of the shared key: `Ctrl-O` means "open
 /// interactive claude" on the picker and in the draft alike, so a user who wants
@@ -470,10 +561,21 @@ fn submit_bg_launch(app: &mut App, message: String, agent: Option<String>) -> Ou
 /// is why every user-facing string for this key says "run interactively" and never
 /// promises a chance to review or edit it inside claude.
 ///
+/// The model picked in THIS draft (`Ctrl-L`) rides along too, as `--model` [and
+/// `--effort`] ahead of the prompt, exactly as it would on the background launch:
+/// the draft chose its model, and which key starts it does not change that. With no
+/// pick the argv carries no model, like the picker's own `Ctrl-O` — which skips the
+/// draft and so never has a pick to pass.
+///
 /// INERT on a [`ComposeTarget::Reply`]: a reply addresses a session that already
 /// exists, so there is no new-session launch to escape to.
 fn open_interactive(app: &mut App) -> Outcome {
-    let Some((message, ComposeTarget::NewBackgroundAgent { agent })) = draft(app) else {
+    let Some(Draft {
+        message,
+        target: ComposeTarget::NewBackgroundAgent { agent },
+        model,
+    }) = draft(app)
+    else {
         return Outcome::Continue; // no interactive launch on the reply target
     };
     // An empty / whitespace draft launches BARE — no positional at all — which is
@@ -483,7 +585,7 @@ fn open_interactive(app: &mut App) -> Outcome {
     // nothing left to report: close the whole surface.
     app.close_compose();
     app.set_last_new_agent(agent.clone());
-    super::update::launch_new_session(app, agent.as_deref(), prompt.as_deref())
+    super::update::launch_new_session(app, agent.as_deref(), prompt.as_deref(), model.as_ref())
 }
 
 /// Send the drafted quick reply — the `Enter` half of the reply target.
@@ -494,11 +596,21 @@ fn open_interactive(app: &mut App) -> Outcome {
 /// marks the send in flight, clears the compose state, and hands a [`SendRequest`]
 /// to the driver as [`Outcome::Send`]. A refusal (deleted worktree / unreadable file)
 /// sets a board status and stays on the board.
+///
+/// The model picked in THIS reply box (`model`, from `Ctrl-L`) rides along into the
+/// argv, and this path is the one where it is not merely a convenience:
+/// `claude -p` is non-interactive, so the in-session `/model` command cannot reach
+/// it and `--model` is the ONLY way to choose a model for a quick reply. With no
+/// pick (`None`) the argv is unchanged and carries no `--model`, so claude normally
+/// restores the model the session last answered with — the `model: session (…)`
+/// the box showed. After a picked reply claude keeps the session on that model by
+/// itself (the next `-r` normally restores it); its effort is not kept.
 fn submit_reply(
     app: &mut App,
     message: String,
     session_id: String,
     stop_job: Option<String>,
+    model: Option<&ModelPick>,
 ) -> Outcome {
     if message.trim().is_empty() {
         // Nothing to send: keep the compose zone open so the user can type.
@@ -520,7 +632,7 @@ fn submit_reply(
             cwd,
             session_id: authoritative_id,
         } => {
-            let argv = send::build_send_argv(&authoritative_id, &message);
+            let argv = send::build_send_argv(&authoritative_id, model, &message);
             app.close_compose();
             // Mark the send in flight so the preview echoes the message under a
             // synthetic `▶ you` turn plus a live `cooking…` indicator until the
@@ -695,6 +807,63 @@ mod tests {
             compose_key_to_action(key(KeyCode::Char('o'))),
             ComposeAction::Forward,
             "a bare `o` types an `o`; only Ctrl-O is the interactive chord"
+        );
+    }
+
+    /// `Ctrl-L` decodes to this compose's model picker, in both cases for the kitty
+    /// path's sake, and ONLY with Ctrl: a bare `l` (and a shifted `L`) still types,
+    /// since a compose box is a text field first.
+    #[test]
+    fn ctrl_l_picks_the_model_and_a_bare_l_still_types() {
+        assert_eq!(
+            compose_key_to_action(with_mods(KeyCode::Char('l'), KeyModifiers::CONTROL)),
+            ComposeAction::PickModel,
+        );
+        assert_eq!(
+            compose_key_to_action(with_mods(KeyCode::Char('L'), KeyModifiers::CONTROL)),
+            ComposeAction::PickModel,
+        );
+        assert_eq!(
+            compose_key_to_action(key(KeyCode::Char('l'))),
+            ComposeAction::Forward,
+            "a bare `l` types an `l`; only Ctrl-L opens the picker"
+        );
+        assert_eq!(
+            compose_key_to_action(with_mods(KeyCode::Char('L'), KeyModifiers::SHIFT)),
+            ComposeAction::Forward,
+            "a shifted `L` types an `L`"
+        );
+    }
+
+    /// The key is free for a REASON, and the reason is checked rather than recited:
+    /// the pinned `ratatui_textarea` really does nothing with `Ctrl-L`, so routing it
+    /// away from the editor takes no editing gesture from the user. Fed to the
+    /// widget's own full key map, the key leaves the text and the caret exactly as
+    /// they were — while `Ctrl-K` (a key the widget DOES bind) is the control that
+    /// proves this probe can see an edit at all.
+    #[test]
+    fn the_editor_itself_binds_nothing_on_ctrl_l() {
+        let mut state = ComposeState::new_background(None);
+        state.textarea.insert_str("keep this");
+        state.textarea.move_cursor(CursorMove::Head);
+        let before = (state.textarea.lines().to_vec(), state.textarea.cursor());
+
+        let modified = state
+            .textarea
+            .input(with_mods(KeyCode::Char('l'), KeyModifiers::CONTROL));
+        assert!(!modified, "Ctrl-L edits nothing in ratatui_textarea");
+        assert_eq!(
+            (state.textarea.lines().to_vec(), state.textarea.cursor()),
+            before,
+            "Ctrl-L neither edits the text nor moves the caret"
+        );
+
+        let control = state
+            .textarea
+            .input(with_mods(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert!(
+            control && state.textarea.lines() != before.0.as_slice(),
+            "control: a key the editor binds (Ctrl-K, delete to line end) does edit"
         );
     }
 
@@ -877,5 +1046,270 @@ mod tests {
             "the next compose keystroke must clear the nudge"
         );
         assert!(app.status_ttl.is_none());
+    }
+
+    /// An isolated temp dir for the send fixtures (PATTERNS: never touch the real
+    /// `~/.claude/projects`).
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the unix epoch")
+            .as_nanos();
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "snapback-compose-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    /// One row for `app.sessions`, pointed at `file`/`cwd`.
+    fn session_at(id: &str, file: PathBuf, cwd: PathBuf) -> Session {
+        Session {
+            file,
+            session_id: id.to_string(),
+            cwd,
+            git_branch: None,
+            timestamp: None,
+            repo: "repo".to_string(),
+            label: format!("label {id}"),
+            root_uuid: None,
+            msg_count: 0,
+            content_index: String::new(),
+            background: false,
+            has_agent_name: false,
+            has_agent_setting: false,
+            failed_task: None,
+        }
+    }
+
+    /// Every compose is BORN on its default model, whichever constructor opened it:
+    /// the pick is per-compose state, so there is nothing a new box could inherit.
+    #[test]
+    fn every_compose_starts_on_its_default_model() {
+        for state in [
+            ComposeState::new_reply("sess-1".to_string(), None),
+            ComposeState::new_reply("sess-1".to_string(), Some("job-1".to_string())),
+            ComposeState::new_background(Some("planner".to_string())),
+            ComposeState::new_background(None),
+        ] {
+            assert_eq!(
+                state.model, None,
+                "{:?} must open with no pick, so it sends no --model",
+                state.target
+            );
+        }
+    }
+
+    /// A reply session file under `dir` that `send::plan_send` accepts (its in-file
+    /// `cwd` is `dir`, which exists), plus the matching board row.
+    fn sendable_session(dir: &std::path::Path, id: &str) -> Session {
+        let file = dir.join(format!("{id}.jsonl"));
+        std::fs::write(
+            &file,
+            format!(
+                r#"{{"type":"user","sessionId":"{id}","cwd":"{}","message":{{"role":"user","content":"hi"}}}}"#,
+                dir.display()
+            ),
+        )
+        .expect("write the sendable fixture");
+        session_at(id, file, dir.to_path_buf())
+    }
+
+    /// Type `text` into the open compose's editor.
+    fn type_into(app: &mut App, text: &str) {
+        app.compose
+            .as_mut()
+            .expect("a compose is open")
+            .textarea
+            .insert_str(text);
+    }
+
+    /// A pick made in THIS reply box reaches the QUICK REPLY argv, end to end from
+    /// the compose state through the submit: `--model` then `--effort`, ahead of the
+    /// positional message. Not redundant with `send`'s builder tests: those prove the
+    /// formatter can carry a model, this proves the submit hands it the compose's
+    /// own pick — the seam a picker that set state nothing reads would silently
+    /// break. This path matters most, because `claude -p` is non-interactive and
+    /// `/model` cannot reach it.
+    #[test]
+    fn a_compose_pick_reaches_the_quick_reply_argv() {
+        let dir = unique_temp_dir("model-reply");
+        let mut app = App::new(
+            vec![sendable_session(&dir, "sbc-reply")],
+            Scope::All,
+            dir.clone(),
+        );
+        app.open_compose(ComposeState::new_reply("sbc-reply".to_string(), None), None);
+        app.set_compose_model(Some(ModelPick {
+            model: "opus".to_string(),
+            effort: Some("xhigh"),
+        }));
+        type_into(&mut app, "ship it");
+
+        match handle_compose_key(&mut app, key(KeyCode::Enter)) {
+            Outcome::Send(req) => assert_eq!(
+                req.argv.join(" "),
+                "claude -p -r sbc-reply --output-format json --model opus --effort xhigh ship it"
+            ),
+            _ => panic!("Enter on a drafted reply must send"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The draft's pick reaches the BACKGROUND LAUNCH argv, beside the agent — the
+    /// `Enter` half of the `Ctrl-N` draft.
+    #[test]
+    fn a_compose_pick_reaches_the_background_launch_argv() {
+        let dir = unique_temp_dir("model-launch");
+        let mut app = App::new(Vec::new(), Scope::All, dir.clone());
+        app.open_compose(
+            ComposeState::new_background(Some("planner".to_string())),
+            None,
+        );
+        app.set_compose_model(Some(ModelPick {
+            model: "sonnet".to_string(),
+            effort: Some("low"),
+        }));
+        type_into(&mut app, "ship it");
+
+        match handle_compose_key(&mut app, key(KeyCode::Enter)) {
+            Outcome::BgLaunch(req) => assert_eq!(
+                req.argv.join(" "),
+                "claude --agent planner --model sonnet --effort low --bg ship it"
+            ),
+            _ => panic!("Enter on a drafted launch must launch"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The draft's pick reaches its `Ctrl-O` INTERACTIVE run too — a new session, so
+    /// the flags sit ahead of the prompt — because which key starts the draft does
+    /// not change the model it chose.
+    #[test]
+    fn a_compose_pick_reaches_the_drafts_interactive_run() {
+        let dir = unique_temp_dir("model-interactive");
+        let mut app = App::new(Vec::new(), Scope::All, dir.clone());
+        app.open_compose(
+            ComposeState::new_background(Some("planner".to_string())),
+            None,
+        );
+        app.set_compose_model(Some(ModelPick {
+            model: "haiku".to_string(),
+            effort: Some("medium"),
+        }));
+        type_into(&mut app, "ship it");
+
+        match handle_compose_key(
+            &mut app,
+            with_mods(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        ) {
+            Outcome::Resume(ready) => {
+                assert_eq!(
+                    ready.argv.join(" "),
+                    "claude --agent planner --model haiku --effort medium ship it"
+                );
+                assert_eq!(
+                    ready.nonzero_hint,
+                    crate::resume::MODEL_NONZERO_HINT,
+                    "a launch that carried a model gets the model-worded hint"
+                );
+            }
+            _ => panic!("Ctrl-O on a draft must hand off interactively"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With NO pick every compose path is byte-identical to what it has always been
+    /// — no `--model`, no `--effort` anywhere — on the reply, the draft's background
+    /// launch AND the draft's interactive run. The counterpart of the three tests
+    /// above, and the one that pins "costs nothing when unused".
+    #[test]
+    fn an_unpicked_compose_sends_no_model_on_any_path() {
+        let dir = unique_temp_dir("model-none");
+        let mut app = App::new(
+            vec![sendable_session(&dir, "sbc-none")],
+            Scope::All,
+            dir.clone(),
+        );
+        let no_model_flags =
+            |argv: &[String]| !argv.iter().any(|arg| arg == "--model" || arg == "--effort");
+
+        app.open_compose(ComposeState::new_reply("sbc-none".to_string(), None), None);
+        type_into(&mut app, "ship it");
+        match handle_compose_key(&mut app, key(KeyCode::Enter)) {
+            Outcome::Send(req) => {
+                assert_eq!(
+                    req.argv.join(" "),
+                    "claude -p -r sbc-none --output-format json ship it"
+                );
+                assert!(no_model_flags(&req.argv));
+            }
+            _ => panic!("Enter on a drafted reply must send"),
+        }
+
+        app.open_compose(ComposeState::new_background(None), None);
+        type_into(&mut app, "ship it");
+        match handle_compose_key(&mut app, key(KeyCode::Enter)) {
+            Outcome::BgLaunch(req) => {
+                assert_eq!(req.argv.join(" "), "claude --bg ship it");
+                assert!(no_model_flags(&req.argv));
+            }
+            _ => panic!("Enter on a drafted launch must launch"),
+        }
+
+        app.open_compose(ComposeState::new_background(None), None);
+        type_into(&mut app, "ship it");
+        match handle_compose_key(
+            &mut app,
+            with_mods(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        ) {
+            Outcome::Resume(ready) => {
+                assert_eq!(ready.argv.join(" "), "claude ship it");
+                assert!(no_model_flags(&ready.argv));
+                assert_eq!(
+                    ready.nonzero_hint,
+                    crate::resume::NEW_SESSION_NONZERO_HINT,
+                    "no model sent, so the hint is the ordinary new-session one"
+                );
+            }
+            _ => panic!("Ctrl-O on a draft must hand off interactively"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `Ctrl-L` opens the model picker OVER the compose and changes nothing else:
+    /// the draft's text, its target and its (absent) pick are exactly as they were,
+    /// and nothing is sent or launched.
+    #[test]
+    fn ctrl_l_opens_the_picker_over_the_compose_and_touches_nothing_else() {
+        let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp"));
+        app.open_compose(ComposeState::new_background(None), None);
+        type_into(&mut app, "half a thought");
+
+        let out = handle_compose_key(
+            &mut app,
+            with_mods(KeyCode::Char('l'), KeyModifiers::CONTROL),
+        );
+        assert!(
+            matches!(out, Outcome::Continue),
+            "opening a picker sends nothing"
+        );
+        assert!(app.modal.is_some(), "Ctrl-L opens the model picker");
+        let compose = app
+            .compose
+            .as_ref()
+            .expect("the compose stays open under it");
+        assert_eq!(
+            compose.textarea.lines(),
+            ["half a thought"],
+            "the draft is untouched, and the key typed no `l` into it"
+        );
+        assert_eq!(compose.model, None, "opening the picker picks nothing");
     }
 }

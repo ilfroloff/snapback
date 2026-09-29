@@ -108,11 +108,13 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | `←` / `→` | **Fold** / **expand** a stack of look-alike rows that are really one conversation — a row marked `(+N)` stands for `N` more |
 | `Enter` | **Resume** the selected session, returning to the board when it exits. On a **running** session it opens an **Attach / Fork / Cancel** choice instead |
 | `Ctrl-F` | **Fork** the selected session into a copy — available for any session, running or not |
-| `Ctrl-N` | **Start a new session** in the launch directory; if you have Claude Code agents defined, pick one first (or `default (no agent)`). Then a **draft box** opens for the session's first message: `Enter` launches it with `claude --bg` and leaves you on the board, `Ctrl-O` runs it interactively instead, `Esc` cancels. Your message is sent as the session's first turn either way |
+| `Ctrl-N` | **Start a new session** in the launch directory; if you have Claude Code agents defined, pick one first (or `default (no agent)`). Then a **draft box** opens for the session's first message: `Enter` launches it with `claude --bg` and leaves you on the board, `Ctrl-O` runs it interactively instead, `Ctrl-L` picks its model, `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels. Your message is sent as the session's first turn either way |
 | `Ctrl-O` (in that picker) | **Start the highlighted agent interactively at once**, skipping the draft — the same thing `Ctrl-O` means inside the draft box, so either route out of the picker is one keypress |
-| `Ctrl-R` | **Quick reply** — send a one-shot message to the selected session without leaving the board. A background agent whose run is over (`done`, `stopped`, `failed`) is stopped first so the reply lands in place; a waiting one (`needs input`) asks you to confirm that stop; one that is still live (`working`, `idle`, `interrupted`, or a state this version doesn't recognize) is left alone and refused, and so is a session with no background job to stop first (a `live` one, for instance); the refusal suggests `Ctrl-K` or Fork instead. While a session's own reply is still being sent, `Ctrl-R` on that session is refused until it lands; replies to other sessions can go out at the same time. Opens a compose box (`Enter` sends, `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels) |
+| `Ctrl-R` | **Quick reply** — send a one-shot message to the selected session without leaving the board. A background agent whose run is over (`done`, `stopped`, `failed`) is stopped first so the reply lands in place; a waiting one (`needs input`) asks you to confirm that stop; one that is still live (`working`, `idle`, `interrupted`, or a state this version doesn't recognize) is left alone and refused, and so is a session with no background job to stop first (a `live` one, for instance); the refusal suggests `Ctrl-K` or Fork instead. While a session's own reply is still being sent, `Ctrl-R` on that session is refused until it lands; replies to other sessions can go out at the same time. Opens a compose box (`Enter` sends, `Ctrl-L` picks the model, `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels) |
+| `Ctrl-L` (in a reply or draft box) | **Pick the model** — and, with `←` / `→`, its **effort** — for **this message only**. The box's bottom border names what it will run on: a reply says `model: session (Opus 5.5)`, the model that session last answered with, which Claude Code normally keeps on its own; a draft says `model: default (opus[1m]) (new sessions only)` when your Claude Code settings name a model. Either says plain `model: default` when there is nothing to name. `--model` / `--effort` are sent only when you pick something; the picker's first row goes back to the default. Every new box starts at the default, and nothing is remembered. `Enter` resume, `Ctrl-F` fork and Attach never send a model |
 | `Ctrl-K` | **Stop / interrupt** the selected session's live agent. On a background agent it runs `claude stop`: one whose run is over (`done`, `stopped`, `failed`) stops immediately; every other live agent (`working`, `needs input`, `idle`, `interrupted`, unrecognized) confirms first, since stopping ends the live job (its conversation is kept). A session with no background job (a `live` one, typically) has no job to stop, so if Claude Code reports a process id for it, `Ctrl-K` offers to send that process a **SIGTERM** instead: the confirmation shows the pid, and nothing is sent unless Claude Code still reports that same pid when you press `Enter`. A session that isn't running as an agent has nothing to stop, and neither does one Claude Code reports with no job and no process id that can be signalled |
 | `Ctrl-X` then `x` / `d` / `h` / `r` / `y` | **Leader chord** that acts on the selected row (`x`, `d`, `y`) or on the whole board (`h`, `r`) — `x` **hides** the selected session (reversible, persisted), `d` **hard-deletes** it after a confirmation that can take just that row or its whole `(+N)` stack, `h` toggles **show hidden**, `r` **re-reads every transcript from disk**, `y` is **copy session ID**: the selected session's full id goes to your clipboard and shows on the status line. Any other key cancels the chord |
+| `←` / `→` (in the model picker) | **Step the highlighted model's effort** down / up: `default effort` (no `--effort`, your settings decide) → `low` → `medium` → `high` → `xhigh` → `max`, wrapping round both ways. `Enter` sets the model and the effort together into the box; `Esc` goes back to the box with your text and its previous choice untouched. They do nothing on the picker's first (default) row, and nothing in the agent picker — and inside either picker they never fold or expand the board underneath |
 | `Tab` | Toggle search: **name-only ↔ name+content**. Widening to content also opens the preview on the most recent match, the same way typing does |
 | `Ctrl-A` | Flip scope: **current folder ↔ project** — the project being the repo you launched in and all of its git worktrees. Started with `-a` it is a three-stop cycle instead (current folder → project → all folders), which is the only way to reach all folders |
 | `Ctrl-/` | Toggle the transcript **preview** pane |
@@ -249,12 +251,15 @@ want one.
 **Agent sessions at a glance.** Every session Claude Code is running — or has
 recently finished running — as an agent carries a colored badge: a dot and a
 short tag that share one color, so you can read the state of your agents straight
-off the list.
+off the list. The one exception is a session waiting on you, whose dot becomes a
+red `!` beside its yellow tag.
 
-- **yellow** — it **needs input**: stopped, waiting on you to answer.
+- **yellow, with a red `!`** — it **needs input**: stopped, waiting on you to
+  answer.
 - **green** — nothing is wanted from you: the session is either idle or finished.
   The word beside the badge says which.
-- **gray, pulsing** — working right now.
+- **gray, pulsing** — working right now, or reporting a state this version doesn't
+  recognize (shown as busy rather than hidden behind a steady dot).
 - **gray, steady** — **interrupted**: a background agent Claude Code still lists
   as working while its own status for it reads idle, so the badge holds still
   instead of pulsing as if a turn were in flight.
@@ -271,37 +276,38 @@ session can't be attached to or stopped with `claude stop`; `Ctrl-K` in the
 [key table](#keys) covers what the board can do instead.
 
 The pulse is the tell for activity, and it is the *first* thing to read — not the
-shade. Only a genuinely working badge pulses, once a second, and only its dot,
+shade. Only a working (or unrecognized) badge pulses, once a second, and only its dot,
 which fades between the bright and the dim gray rather than blinking out, so no
 text on the row ever moves or redraws and a busy board doesn't flicker. That fade
 passes through exactly the dim gray an ended agent wears, so a glance at the dot
 alone can't tell a working agent from a finished one — but a working dot *moves*
-and the other two hold still. Two things keep it unambiguous: the word beside the
-badge never pulses, so it always shows the badge's real color; and once you can see
+and the other two hold still. Two things keep it unambiguous: the badge's short
+tag never pulses, so it always shows the badge's real color; and once you can see
 a dot is steady, the shade separates the two at rest — the working gray is the
 interrupted one, the dimmer gray is a run that has ended. Colors follow your
 terminal's theme.
 
 Open the preview on any session — badged or not — and a row stays pinned above
 the transcript, naming **the turn you are reading**: the marker of whichever turn
-owns the line at the top of the viewport — `● claude · @lead · 12:55` — so who
-spoke, under which agent and when stay readable long after that turn's own
-marker has scrolled off the top of a long answer. It is the transcript's own
-marker line reused verbatim, down to the highlight your search puts on it, never
-a second rendering that could drift from the line below. It tracks the turn as
-you scroll, in every position the pane can be in, including the bottom-anchored
-one it opens at; scroll to the very first turn and the pinned row names that
-one, there being nothing above it to name. One exception to *who spoke*: a
-message a subagent hands back is not a turn of its own and has no marker, so
-while you read inside an expanded one the pinned row names the last turn above
-it, not the subagent. That is usually the `● claude` turn that delegated the
-work, but it is whichever turn precedes the message — a hand-back that lands
-after later turns names the latest of them, and a peer message that follows a
-`▶ you` turn names that turn. The `◆ message from …` line that opens the message
-is what names its sender. The same goes for context Claude Code added on your
-behalf, the `◇ added by claude code` line: it is not a turn either and has no
-marker, so inside an opened one the pinned row names the turn above it. The row
-steps aside only while something else holds the pane: a quick reply you sent
+owns the line at the top of the viewport —
+`● claude · @lead · Opus 5.5 · xhigh · 12:55` — so who
+spoke, under which agent, on which model at what effort and when stay readable
+long after that turn's own marker has scrolled off the top of a long answer. It
+is the transcript's own marker line reused verbatim, down to the highlight your
+search puts on it, never a second rendering that could drift from the line below.
+It tracks the turn as you scroll, in every position the pane can be in, including
+the bottom-anchored one it opens at; scroll to the very first turn and the pinned
+row names that one, there being nothing above it to name. One exception to *who
+spoke*: a message a subagent hands back is not a turn of its own and has no
+marker, so while you read inside an expanded one the pinned row names the last
+turn above it, not the subagent. That is usually the `● claude` turn that
+delegated the work, but it is whichever turn precedes the message — a hand-back
+that lands after later turns names the latest of them, and a peer message that
+follows a `▶ you` turn names that turn. The `◆ message from …` line that opens
+the message is what names its sender. The same goes for context Claude Code added
+on your behalf, the `◇ added by claude code` line: it is not a turn either and has
+no marker, so inside an opened one the pinned row names the turn above it. The
+row steps aside only while something else holds the pane: a quick reply you sent
 to that session is still in flight, when the reply's own turns take its place at
 the bottom of the transcript, or a `Ctrl-N` draft has replaced the transcript
 altogether. And it gives way to one
@@ -424,7 +430,8 @@ stopped or killed isn't marked, only one that failed.
 **Hand an agent a job and stay put.** `Ctrl-N` starts a fresh session in the
 folder you launched from. If you keep Claude Code agents defined, it offers a
 quick picker so the new session can start bound to one, and it remembers the last
-agent you actually started so a repeat is just `Ctrl-N`, `Enter`, `Enter`.
+agent you actually started so a repeat is just `Ctrl-N`, `Enter`, your message,
+`Enter`.
 
 `Enter` on a pick — or `Ctrl-N` on its own, if you have no agents defined — opens
 a draft box rather than starting anything. The preview pane clears to a
@@ -443,6 +450,9 @@ you the terminal as usual. It works from the draft box (if you change your mind
 mid-sentence, your draft comes along as the first turn) *and* straight from the
 picker, where it skips the draft entirely. So both ways out are a single
 keypress — the background one just happens to be the one `Enter` falls on now.
+Before either, `Ctrl-L` in the draft box picks the model the new session starts
+on; whichever key then starts it, that choice goes with it (see *Pick the model
+for one message* below).
 
 One thing to know either way: your draft is sent as the session's **first turn**,
 immediately. Claude Code's CLI has no way to put text in the input box for you to
@@ -459,8 +469,9 @@ session and sends your message with a one-shot `claude -p` — it replays the fu
 context, appends the exchange in place, and the reply shows up in the preview, all
 while the board stays up. The box is a real multiline editor — arrows move the
 caret, long lines soft-wrap, and it grows from one line as you type (`Ctrl-J` or
-`Alt+Enter` for a newline, `Enter` to send). The moment you send, your message
-appears in the preview under a **you** turn, followed by a live **claude
+`Alt+Enter` for a newline, `Enter` to send, `Ctrl-L` to pick the model this one
+message runs on — see *Pick the model for one message* below). The moment you
+send, your message appears in the preview under a **you** turn, followed by a live **claude
 cooking…** placeholder — so the exchange reads normally while the reply is still
 in flight. The placeholder is replaced in place as `claude` writes the
 real turns, and the status line reports what the reply cost (or the reason if it
@@ -554,7 +565,103 @@ session ids lives in its own config directory —
 otherwise `~/.config/snapback/state/hidden_sessions` — never inside the Claude
 Code session store, which snapback otherwise only reads.
 
-**Readable transcript preview.** `Ctrl-/` opens a preview of the selected
+**Pick the model for one message.** In a reply box (`Ctrl-R`) or a new-session
+draft (`Ctrl-N`), `Ctrl-L` opens a list of the models *your* Claude Code accepts.
+`Enter` sets the highlighted one for that box alone; `Esc` goes back to your text
+with the box's previous choice untouched. The pick goes out with that one message
+— the reply, or the session the draft starts, whether `Enter` runs it in the
+background or `Ctrl-O` interactively — and is gone when the box closes: every new
+box starts back at its default, and snapback never writes a pick down.
+
+Nothing else ever asks for a model. `Enter` resume and `Ctrl-F` fork send no
+`--model` at all, because a session already has one: when Claude Code resumes a
+session it normally restores the model that session last answered with (the
+exceptions are listed below). So a session carries on with its own model — and
+after a reply you picked a model for, it carries on with that one, because that
+is the model that answered last. Attach sends none either: it joins a process
+that is already running under a model. The agent picker's own `Ctrl-O` skips the
+box, so there is no pick to send, and Claude Code chooses the new session's model.
+
+The box's bottom border always says what snapback expects the message to run on:
+
+- A reply with nothing picked says `model: session (Opus 5.5)` — the model the
+  session last answered with, spelled the way the preview's turn markers spell
+  it. It says plain `model: default` instead when Claude Code would not restore
+  that model — `ANTHROPIC_MODEL` or an `ANTHROPIC_DEFAULT_*_MODEL` (`FABLE`,
+  `OPUS`, `SONNET` or `HAIKU`) is set, in your environment or in a settings
+  file's `env` block — or when the session has no answering model on record.
+- A draft with nothing picked says `model: default (opus[1m]) (new sessions only)`
+  when your Claude Code settings name a model, and plain `model: default` when
+  they don't. The *new sessions only* part is there because that settings value
+  decides what a new session starts on; a resumed one normally keeps its own.
+- A pick says `model: opus`, or `model: opus · high` with an effort.
+
+The picker's first row is that same default, spelled out — `session's model
+(Opus 5.5)` in a reply box, `default (opus[1m]) (settings)` or `default` in a
+draft — with a line or two on why. The settings value is read the way Claude Code
+reads it — managed settings, then the launch folder's
+`.claude/settings.local.json` and `.claude/settings.json`, then your own
+`~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`), with
+`ANTHROPIC_MODEL` beating them all — and read again every time you come back from
+a Claude session, so a `/model` pick Claude Code saved as your default shows up in
+the next draft.
+
+The label is snapback's best reading, and it is display only: with nothing picked
+snapback sends no `--model` and Claude Code decides, so a wrong label never
+changes what runs. The cases it is known to get wrong include:
+
+- A session model Claude Code refuses to restore (a retired one, say) still reads
+  `session (…)` while Claude Code warns and uses another.
+- A provider that doesn't use Anthropic's own model ids (Bedrock, Vertex, Foundry)
+  is not modelled.
+- A reply to a session bound to an agent whose definition names its own `model:`
+  still reads `session (…)`, but Claude Code runs the agent's model instead.
+- With `opusplan` or `haiku` as your settings' model, Claude Code keeps that
+  instead of restoring a session model that suits it (Opus or Sonnet for
+  `opusplan`, Haiku or Sonnet for `haiku`), while the reply still reads
+  `session (…)`.
+- Project settings are read from the folder you launched snapback in, so a reply
+  to a session in another project misses that project's `env` block, and is
+  judged by the launch folder's instead.
+- A `Ctrl-N` draft for an agent whose definition names its own `model:` starts on
+  that model, while the box names your settings' default.
+- Settings that don't come from the files above aren't read, so a draft's default
+  can miss them: managed settings pushed by MDM or a server, the `env` block in
+  `~/.claude.json`, and the repository root's `.claude/settings.local.json` that
+  Claude Code also reads when the launch folder isn't that root.
+
+The picker's list of models isn't baked into snapback: it's read from the Claude
+Code binary you have installed, in the background at startup. So a model that
+arrives in a Claude Code update shows up in the picker too, without waiting for a
+snapback release — and
+one that goes away stops being offered. If snapback can't read it for any reason
+it falls back to a small built-in list rather than showing you nothing. A draft's
+pick wins over an agent's own `model:` if you started that agent with `Ctrl-N`; an
+explicit choice you just made is treated as the later word.
+
+`opusplan` is the one to notice, because `claude --help` doesn't list it: it runs
+Opus while planning and the resting model the rest of the time, which is "plan
+with Opus, implement with Sonnet" as a single choice.
+
+**Pick the effort too.** In the picker, `←` / `→` step the highlighted model's
+effort through `low`, `medium`, `high`, `xhigh` and `max`, wrapping round to
+`default effort` — no `--effort` at all, so the level your Claude Code settings
+keep for that model applies. The highlighted row shows where you are
+(`fable · high`), and `Enter` sets the model and the effort together; the box
+then reads `model: opus · high`, the same way each turn marker in the preview
+shows the effort that turn ran at. It goes out right after the model
+(`--model opus --effort high`) and never on its own: the first row has no model,
+so the arrows do nothing there, and going back to the default clears the effort
+with it. Each row keeps its own effort while the picker is open — move away and
+back and it's as you left it — and `Esc` throws those changes away. The effort
+counts for that one message only: Claude Code keeps a session's model but not its
+effort, so a later resume runs at your settings' level for whatever model it
+restores. A level the model can't use is quietly lowered by Claude Code (`max` or
+`xhigh` become `high`), a model without effort support ignores it, and a
+`CLAUDE_CODE_EFFORT_LEVEL` in your environment beats it.
+
+**Readable transcript preview.** The preview pane — open by default, toggled by
+`Ctrl-/` — shows the selected
 session rendered as clean, scrollable markdown — the real conversation, whole,
 from its first turn to its last, however long it ran. So you
 can confirm it's the right session before jumping back in. Links are clickable.
@@ -563,6 +670,17 @@ line — it is that agent's report, not something you said — and context Claud
 Code added on your behalf (the instructions a skill or slash command expands
 into, a command's caveat) to a single `◇ added by claude code` line; either opens
 where it sits on a click.
+
+Each `claude` turn is marked with **which model actually answered it**, beside
+the agent and the time — `● claude · @lead · Opus 5.5 · xhigh · 12:55`. It's
+read from the turn itself rather than assumed for the session, because a long
+conversation really can change model partway through, and each turn is labelled
+with its own. Turns that don't record one are left plain: about a fifth of
+sessions record none, and a blank there is normal, not a gap. The marker also shows the effort level
+the turn ran at (`xhigh` above), read from the turn the same way. When you
+`Ctrl-R` reply, the status line names the answering model next to the cost
+(`sent — $0.0136 (Sonnet 5)`) — so if the model that answered isn't the one you
+asked for, you can see it rather than assume.
 
 ---
 

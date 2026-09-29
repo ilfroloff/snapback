@@ -26,6 +26,7 @@ use time::OffsetDateTime;
 
 use crate::agents::ReportedAgent;
 use crate::defined_agents::{self, DefinedAgent};
+use crate::resume::{ModelPick, EFFORT_LEVELS};
 use crate::{config, delete, hidden};
 
 use crate::search::{self, MarkScratch, SearchIndex, SearchMode};
@@ -140,8 +141,10 @@ const DELETE_CONFIRM_PROMPT: &str = "Permanently delete this transcript from dis
 ///
 /// **The shipped option is not free either, and its cost is on the HEIGHT axis.**
 /// The sentence adds ONE wrapped row (4 → 5 at the 60-column inner width).
-/// `view::centered_rect` clamps the box and `render_modal` draws top-down with no
-/// vertical scroll, so the button strip now needs a terminal 9 rows tall instead of
+/// `view::centered_rect` clamps the box and `render_modal` draws a `Row` layout
+/// top-down with no vertical scroll — the scrolling viewport it grew is the `List`
+/// layout's, where the rows are a picker's DATA rather than a fixed button strip —
+/// so the button strip now needs a terminal 9 rows tall instead of
 /// 8 and the `Esc cancel` footer 11 instead of 10 — a terminal exactly 8 rows tall
 /// loses a strip it used to draw. One row is what THIS sentence costs, NOT a floor
 /// under any disclosure (a short enough prefix reflows nothing); the first draft
@@ -284,26 +287,30 @@ pub enum Row {
 }
 
 /// The layout a [`Modal`] renders in — the ONLY structural fork the generic modal
-/// supports, and the thing its key map is derived from: a `Row` binds the
-/// horizontal `←`/`→`/`h`/`l` keys (a button strip); a `List` deliberately does
-/// NOT (a vertical picker navigated with `↑`/`↓`/`k`/`j`/`Tab` alone). Namespaced
-/// under `ModalLayout` so the `Row` variant does not collide with the list-row
-/// [`Row`] enum above.
+/// supports, and the thing its key map is derived from. Both move the highlight
+/// with the vertical `↑`/`↓`/`k`/`j`/`Tab`. A `Row` (a button strip) ALSO moves it
+/// with the horizontal `←`/`→`/`h`/`l`. A `List` (a vertical picker) gives `←`/`→`
+/// a different meaning instead — ADJUST the highlighted row's value, which only the
+/// model picker's model rows act on ([`App::adjust_modal_effort`]) — and leaves
+/// `h`/`l` unbound. Namespaced under `ModalLayout` so the `Row` variant does not
+/// collide with the list-row [`Row`] enum above.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModalLayout {
     /// A horizontal strip of buttons (the running-session Attach/Fork/Cancel
-    /// choice; a delete confirm). Binds the horizontal keys on top of the shared
-    /// vertical ones.
+    /// choice; a delete confirm). Binds the horizontal keys to move the highlight,
+    /// on top of the shared vertical ones.
     Row,
-    /// A vertical list of rows (the new-session agent picker). Vertical keys only.
+    /// A vertical list of rows (the new-session agent picker; a compose's `Ctrl-L`
+    /// model picker). The vertical keys move the highlight; `←`/`→` adjust the
+    /// highlighted row, which is a no-op on every row but a model pick.
     List,
 }
 
 /// What confirming a [`ModalChoice`] does — a plain tag the ONE generic confirm
 /// handler matches on, so a single handler serves every modal: the running-session
-/// overlay (`Attach`/`Fork`/`Cancel`), the new-session picker (`New`), and the
-/// hard-delete confirm (`Delete`). Carries no borrowed data so it can ride on a
-/// choice.
+/// overlay (`Attach`/`Fork`/`Cancel`), the new-session picker (`New`), the
+/// hard-delete confirm (`Delete`/`DeleteLineage`), and the model picker
+/// (`SetModel`). Carries no borrowed data so it can ride on a choice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModalAction {
     /// Attach to the running session's background agent (`claude attach <job-id>`),
@@ -338,6 +345,27 @@ pub enum ModalAction {
     /// The confirm handler guards each member individually and deletes the ones
     /// that pass; one busy fork must not block the rest of the family.
     DeleteLineage(Vec<String>),
+    /// Set the OPEN compose's model pick ([`super::compose::ComposeState::model`]) to
+    /// the carried pick — an alias and its optional `--effort` — or return it to its
+    /// default with `None` (the picker's first row, which sends no `--model` at
+    /// all). Never a board-wide setting: the picker is opened FROM a compose
+    /// (`Ctrl-L`) and writes into that compose alone.
+    ///
+    /// The pick rides the choice for the same reason [`ModalAction::New`]'s agent
+    /// name does — confirm needs no index-to-alias lookup — and the `Option` means
+    /// the default and a model are ONE action rather than two, so the picker's first
+    /// row is an ordinary row and no handler can implement "back to default"
+    /// differently from "set to nothing".
+    ///
+    /// It is also where the picker's `←`/`→` write: they step the effort INSIDE the
+    /// highlighted choice's pick ([`App::adjust_modal_effort`]), so one `Enter`
+    /// confirms the model and the effort together, and the `None` row has no pick
+    /// for them to change.
+    ///
+    /// A [`ModalAction`] that hands off NOTHING: it spawns no child and ends no
+    /// board session, since the pick applies when that compose is SENT rather than
+    /// performing anything itself.
+    SetModel(Option<ModelPick>),
     /// Dismiss the modal, returning to the board.
     Cancel,
 }
@@ -351,6 +379,18 @@ pub struct ModalChoice {
     pub label: String,
     /// An optional dim description trailing the label (List layout only).
     pub description: Option<String>,
+    /// Whether [`description`](Self::description) WRAPS onto indented, dim
+    /// continuation lines instead of trailing the label on one line and clipping
+    /// at the border (List layout only).
+    ///
+    /// Opt-in per choice, and exactly one choice sets it: the model picker's first
+    /// (default) row. Its description ([`ComposeDefault::picker_description`]) says
+    /// what sending no `--model` means for THIS compose, and it is only honest when
+    /// read in full. Every other choice stays one line. That includes the
+    /// other model rows and the agent picker's user-written blurbs, where a long
+    /// description loses only its clipped tail. The view takes the row's height
+    /// from the same wrap that draws it (`view::modal_list_row_lines`).
+    pub wrap_description: bool,
     /// What confirming this choice does.
     pub action: ModalAction,
 }
@@ -496,13 +536,15 @@ impl NewSessionDraft {
 
 /// A titled, centered prompt with N labelled choices and a wrapping-cycle
 /// highlight — the ONE overlay model behind the running-session choice, the
-/// new-session agent picker, and (later) a delete confirm.
+/// new-session agent picker, the hard-delete confirm, and a compose's `Ctrl-L`
+/// model picker.
 ///
 /// Modeled as explicit state so the whole overlay is a small, unit-testable state
 /// machine that owns the keyboard while open. `selected` is a `rem_euclid` index
 /// over `choices` (wraps both directions, both layouts). `session_id` is the
 /// target a session-addressed action routes to (`Some` for Attach/Fork/delete);
-/// the picker leaves it `None` because a new session has no source.
+/// both pickers leave it `None` — a new session has no source, and a model pick
+/// addresses the open compose rather than any row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Modal {
     /// The bordered box title (rendered padded with a space either side).
@@ -511,13 +553,40 @@ pub struct Modal {
     pub message: String,
     /// The layout — and, with it, the key map — this modal renders in.
     pub layout: ModalLayout,
+    /// The dim key-hint line drawn at the foot of the box.
+    ///
+    /// Named by each constructor, one const per overlay kind
+    /// ([`MODAL_ROW_FOOTER`], [`AGENT_PICKER_FOOTER`], [`MODEL_PICKER_FOOTER`]),
+    /// rather than derived from [`layout`](Self::layout): the layout fixes which
+    /// keys are BOUND, not what they DO. The two `List` pickers bind the same keys to
+    /// different verbs — `Enter` drafts a new session in one and sets the compose's
+    /// model in the other, `←`/`→` step an effort only in the model picker, and
+    /// `Ctrl-O` acts only in the agent picker — so a footer read off the layout can
+    /// be true of at most one of them. It rides the modal the way its title and
+    /// message do, and `view::render_modal` only draws it.
+    pub footer: &'static str,
     /// The selectable choices in display order.
     pub choices: Vec<ModalChoice>,
     /// The highlighted choice, an index into `choices` (wraps via `rem_euclid`).
     pub selected: usize,
     /// The session a session-addressed action (Attach/Fork/delete) targets;
-    /// `None` for the picker, which starts a fresh session with no target.
+    /// `None` for the two pickers, which target no existing row.
     pub session_id: Option<String>,
+    /// First VISIBLE choice — the `List` layout's scroll offset, so a picker with
+    /// more rows than the terminal can hold still reaches all of them.
+    ///
+    /// Seeded at 0 and owned end to end by the view, exactly as `App::scroll` is
+    /// owned by `view::render_list` and `App::preview_scroll` by
+    /// `view::render_preview`: only the render knows the viewport height, so
+    /// [`view::render_modal`](crate::tui::view) resolves this against the CLAMPED
+    /// box and writes the resolved value back (PATTERNS §5). Inert for the `Row`
+    /// layout, which has no list to scroll.
+    ///
+    /// It is an offset rather than a derived function of `selected` for the same
+    /// reason the board list keeps one: a memoryless window would have to re-centre
+    /// on every keypress, where an offset only moves when the selection actually
+    /// leaves it.
+    pub scroll: usize,
 }
 
 impl Modal {
@@ -549,6 +618,313 @@ pub fn pick_default_index(last: Option<&str>, agents: &[DefinedAgent]) -> usize 
             .map_or(0, |i| i + 1),
         None => 0,
     }
+}
+
+/// The `--model` aliases the picker offers at COLD START — a SEED, not the source
+/// of truth.
+///
+/// [`crate::model_aliases::installed_model_aliases`] reads the accepted set out of
+/// the INSTALLED `claude` binary, off the UI thread, and delivers it as
+/// [`AppEvent::ModelAliases`](crate::watch::AppEvent::ModelAliases). From that
+/// moment the probe's answer is what the picker offers, verbatim. This list is only
+/// what the board can show in the frames before that lands — and what it falls back
+/// to when the probe finds nothing (see [`offered_model_aliases`]).
+///
+/// **A stale seed is now COSMETIC rather than a bug, and it must NOT be
+/// hand-refreshed.** It used to be the picker's entire vocabulary, so a missing
+/// alias was simply unreachable and re-syncing this list against each `claude`
+/// release was the fix; that hand-synced artifact is exactly what the probe exists
+/// to delete, and re-adopting the habit would quietly restore it. As it stands the
+/// seed is wrong on four of the installed binary's nine entries (`best` and the
+/// three `[1m]` long-context variants are missing) and that costs nothing: the
+/// probe corrects it within the first frames of a board session.
+///
+/// It carries no `default` entry, and that is a SHAPE agreement rather than a
+/// trim: the probe never emits one — the accepted set the binary carries has no
+/// `default`, which is snapback's own synthetic word for "no pick" — so the seed
+/// and the live answer are the same kind of list and the row builder has one case,
+/// not two. The picker's DEFAULT row is [`ComposeDefault`]'s, which states it more
+/// strictly by emitting no flag at all.
+/// (NO MAGIC VALUES: the set is named here, never spelled inline.)
+pub const MODEL_ALIASES: [&str; 5] = ["fable", "haiku", "opus", "opusplan", "sonnet"];
+
+/// The word for "no pick": the model picker's first row whenever it names no
+/// particular model, and a compose box's `model:` value in that case.
+///
+/// It is NOT an alias and has no counterpart in the probe's output: the accepted
+/// set read off the binary carries no `default`, so this row asks for no model at
+/// all, by emitting no `--model` flag ([`ModalAction::SetModel`]`(None)`). Mirrors
+/// the agent picker's "default (no agent)" row. Shared by the picker row
+/// ([`ComposeDefault::picker_label`]) and the compose label (`view`), so the two
+/// surfaces call the one state by one name.
+pub const MODEL_DEFAULT_LABEL: &str = "default";
+
+/// The picker's first-row label for a REPLY claude will restore the session's own
+/// model for: `session's model (<label>)`. It names the model rather than saying
+/// `default`, because with no `--model` that model is exactly what the reply runs
+/// on — the one the session last answered with.
+pub const MODEL_SESSION_ROW_LABEL: &str = "session's model";
+
+/// The tag the picker's first row puts after a DRAFT's settings value —
+/// `default (opus[1m]) (settings)` — saying where the value came from.
+pub const MODEL_SETTINGS_TAG: &str = "(settings)";
+
+/// The model picker's prompt line when opened from a REPLY box. It says the pick
+/// is for this reply ALONE — nothing is remembered, and claude normally keeps the
+/// session on whatever model answers — and names `←`/`→` beside the question they
+/// answer. [`MODEL_PICKER_FOOTER`] lists them too, among the picker's other keys. Kept
+/// within one line of the modal's 60-column inner width, so naming the keys costs
+/// the box no height.
+pub const MODEL_PICKER_REPLY_MESSAGE: &str = "Model for this reply only (←/→ effort):";
+
+/// The model picker's prompt line when opened from a `Ctrl-N` DRAFT: the pick is
+/// for the session this draft starts, whichever key starts it. Same one-line budget
+/// as [`MODEL_PICKER_REPLY_MESSAGE`].
+pub const MODEL_PICKER_DRAFT_MESSAGE: &str = "Model for this new session (←/→ effort):";
+
+/// The footer of every `Row`-layout [`Modal`] — the running-session
+/// Attach/Fork/Cancel choice and the hard-delete confirm. Both are button strips
+/// whose choices sit side by side, so `←`/`→` move the highlight and `Enter` runs
+/// whichever button it is on; neither has a second verb to name.
+pub const MODAL_ROW_FOOTER: &str = "←/→ choose · Enter confirm · Esc cancel";
+
+/// The new-session agent picker's footer. The picker has TWO verbs, so its footer
+/// names both: `Enter` drafts the session's first message (staying on the board),
+/// `Ctrl-O` starts the agent interactively at once (leaving it). One key each —
+/// neither is buried.
+pub const AGENT_PICKER_FOOTER: &str = "↑/↓ choose · Enter draft · ^O interactive · Esc cancel";
+
+/// The compose model picker's (`Ctrl-L`) footer. The picker shares the agent
+/// picker's `List` layout but none of its verbs: `Enter` SETS the highlighted row
+/// as the open compose's pick — model and effort together — sending and drafting
+/// nothing, and `←`/`→` step the highlighted model row's effort
+/// ([`App::adjust_modal_effort`]). `Esc` returns to the compose unchanged.
+///
+/// `^O` is absent because it is INERT here. `update::modal_key` binds `Ctrl-O` on
+/// every `List` modal, but `update::launch_pick_interactively` acts only on a
+/// [`ModalAction::New`] choice, and every row of this picker is a
+/// [`ModalAction::SetModel`]; the key returns to the board loop having launched
+/// nothing and left the picker open (pinned by `update`'s
+/// `ctrl_o_on_the_model_picker_launches_nothing`). Naming it would advertise a verb
+/// the picker does not have.
+pub const MODEL_PICKER_FOOTER: &str = "↑/↓ choose · ←/→ effort · Enter set · Esc cancel";
+
+/// The scope a DRAFT's settings-default model carries on its compose label:
+/// `model: default (opus[1m]) (new sessions only)`. It is its own parenthesized
+/// part, drawn AFTER the value's rather than folded into it, and it only ever
+/// follows a value — with no value known there is nothing to scope.
+///
+/// It is the honest part of the label: the value comes from the user's `claude`
+/// settings, which decide a NEW session's model, while a `-r` launch normally
+/// restores the session's own model instead — so the settings value, unscoped,
+/// would read as a model the board's other launches run on, which it is not.
+pub const MODEL_NEW_SESSION_SCOPE: &str = "(new sessions only)";
+
+/// What a compose runs on when NO model is picked in it — the ONE decision behind
+/// both its `model:` label (`view`) and the model picker's first row
+/// ([`ComposeDefault::picker_label`] / [`ComposeDefault::picker_description`]).
+/// Produced by [`resolve_compose_default`].
+///
+/// Five cases rather than a string, because the two surfaces word each one
+/// differently (the label is terse, the picker row explains itself) and because
+/// the three reasons a reply says `default` are three different facts to explain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComposeDefault {
+    /// A REPLY that claude restores the session's own model for: carries that
+    /// model's label (`Opus 5.5`), as the preview's turn markers spell it.
+    SessionModel(String),
+    /// A REPLY where an environment override (`ANTHROPIC_MODEL` or an
+    /// `ANTHROPIC_DEFAULT_*_MODEL`) makes claude skip the restore and use its
+    /// startup model.
+    RestoreOverridden,
+    /// A REPLY whose session has no answering model on record, so claude has
+    /// nothing to restore and uses its startup model.
+    NoSessionModel,
+    /// A `Ctrl-N` DRAFT whose `claude` settings name a model for a new session:
+    /// carries the value spelled exactly as the settings spell it (`opus[1m]`).
+    Settings(String),
+    /// A `Ctrl-N` DRAFT whose settings name no model: claude's own default.
+    BuiltIn,
+}
+
+impl ComposeDefault {
+    /// The picker's first-row LABEL: `session's model (<label>)` for a reply claude
+    /// restores, `default (<value>) (settings)` for a draft with a settings model,
+    /// and plain [`MODEL_DEFAULT_LABEL`] otherwise. Pure.
+    #[must_use]
+    pub fn picker_label(&self) -> String {
+        match self {
+            Self::SessionModel(label) => format!("{MODEL_SESSION_ROW_LABEL} ({label})"),
+            Self::Settings(value) => {
+                format!("{MODEL_DEFAULT_LABEL} ({value}) {MODEL_SETTINGS_TAG}")
+            }
+            Self::RestoreOverridden | Self::NoSessionModel | Self::BuiltIn => {
+                MODEL_DEFAULT_LABEL.to_string()
+            }
+        }
+    }
+
+    /// The picker's first-row DESCRIPTION: what sending no `--model` means for
+    /// this compose, and — for the three `default` cases — why. Drawn WHOLE,
+    /// wrapped under the label ([`ModalChoice::wrap_description`]), so it may be
+    /// honest rather than short. A reply's names the effort caveat too: claude
+    /// restores a session's model but not its effort. Pure.
+    #[must_use]
+    pub fn picker_description(&self) -> &'static str {
+        /// A reply claude restores: the session's model, not its effort.
+        const SESSION_MODEL: &str = "no --model · claude restores the model this session \
+             last answered with; the effort comes from your settings";
+        /// A reply an environment override takes the restore away from.
+        const RESTORE_OVERRIDDEN: &str = "no --model · ANTHROPIC_MODEL or an \
+             ANTHROPIC_DEFAULT_*_MODEL is set, so claude uses its startup model, not \
+             the session's";
+        /// A reply with nothing on record to restore.
+        const NO_SESSION_MODEL: &str = "no --model · this session has no answering \
+             model on record, so claude uses its startup model";
+        /// A draft whose settings name its model.
+        const SETTINGS: &str = "no --model · a new session starts on the model your \
+             claude settings name";
+        /// A draft whose settings name none.
+        const BUILT_IN: &str = "no --model · your claude settings name no model, so \
+             claude uses its own default";
+        match self {
+            Self::SessionModel(_) => SESSION_MODEL,
+            Self::RestoreOverridden => RESTORE_OVERRIDDEN,
+            Self::NoSessionModel => NO_SESSION_MODEL,
+            Self::Settings(_) => SETTINGS,
+            Self::BuiltIn => BUILT_IN,
+        }
+    }
+}
+
+/// What a compose runs on when no model is picked in it: the PURE decision over
+/// the four facts it depends on, each already in hand.
+///
+/// * `target` — a quick reply restores; a `Ctrl-N` draft starts fresh.
+/// * `session_model` — for a reply, the label of the model its session last
+///   answered with, read off the preview the board already parsed
+///   (`store::preview`'s `last_model`), or `None` when the transcript records no
+///   answering model. Ignored for a draft.
+/// * `restore_overridden` — whether an environment override makes claude skip the
+///   restore (`claude_settings::resolve_restore_overridden`). Ignored for a draft.
+/// * `settings_model` — the model the user's `claude` settings name for a new
+///   session (`claude_settings::resolve_new_session_model`). Ignored for a reply.
+///
+/// A reply names the session's model ONLY when claude would restore it: an
+/// override outranks the transcript, and a transcript with no answering model has
+/// nothing to restore — both say `default` (claude's startup model) instead.
+///
+/// KNOWN LIMITS. The label is display-only: with no pick snapback sends no
+/// `--model`, so a wrong answer here misnames what runs and never changes it. For a
+/// reply this models only the environment override and a transcript with nothing to
+/// restore, so a reply still reads as the session's model when claude runs another,
+/// for example for a model it declines at resume time (retired, of an unknown
+/// family, or not allowed for the account — only claude knows, at that moment), a
+/// non-first-party provider, a session bound to an agent whose frontmatter names its
+/// own `model:`, or an `opusplan`/`haiku` settings model compatible with the
+/// session's (claude keeps the alias). `restore_overridden` is read from the LAUNCH
+/// dir's project settings, not the reply's `cwd`. A draft names the settings value
+/// (or `default`) even when a defined agent's `model:` frontmatter outranks it, and
+/// misses the settings sources `claude_settings` does not read.
+/// `docs/agents/DOMAIN.md`, "Known limits — the label is display-only", lists the
+/// known cases with the `claude` rule behind each.
+#[must_use]
+pub fn resolve_compose_default(
+    target: &super::compose::ComposeTarget,
+    session_model: Option<&str>,
+    restore_overridden: bool,
+    settings_model: Option<&str>,
+) -> ComposeDefault {
+    use super::compose::ComposeTarget;
+    match target {
+        ComposeTarget::Reply { .. } if restore_overridden => ComposeDefault::RestoreOverridden,
+        ComposeTarget::Reply { .. } => session_model
+            .map_or(ComposeDefault::NoSessionModel, |label| {
+                ComposeDefault::SessionModel(label.to_string())
+            }),
+        ComposeTarget::NewBackgroundAgent { .. } => settings_model
+            .map_or(ComposeDefault::BuiltIn, |value| {
+                ComposeDefault::Settings(value.to_string())
+            }),
+    }
+}
+
+/// The aliases the picker offers: the runtime `probed` set when there is one, the
+/// [`MODEL_ALIASES`] seed when there is not.
+///
+/// Pure, so the one decision this feature turns on is unit-tested rather than only
+/// observed through a rendered modal. `probed` is
+/// [`crate::model_aliases::installed_model_aliases`]' answer as delivered by
+/// [`App::set_model_aliases`], and it is EMPTY in two situations — the probe has
+/// not answered yet, and the probe answered with nothing (no `claude` on `PATH`, an
+/// unreadable binary, no match). Collapsing them is deliberate: both say "there is
+/// no live answer", the board's move is the same either way, and folding them makes
+/// seed-until-delivered and degrade-on-failure the SAME line of code rather than
+/// two that could drift apart.
+///
+/// The probe's answer is passed through **UNFILTERED and in UPSTREAM ARRAY
+/// ORDER** — not sorted, not deduplicated, not screened against the seed, and not
+/// stripped of entries snapback does not recognise. That restraint is the whole
+/// point of the change. Any curated filter here would re-create the hand-synced
+/// artifact this replaced (a list snapback must be re-released to widen) and would
+/// do it INVISIBLY, since a newly-shipped alias would simply never appear. An alias
+/// snapback has never heard of is precisely the case the probe exists to serve: it
+/// renders bare (see [`model_alias_hint`]) and reaches `--model` raw, which is
+/// claude's to accept or reject.
+#[must_use]
+fn offered_model_aliases(probed: &[String]) -> Vec<&str> {
+    if probed.is_empty() {
+        return MODEL_ALIASES.to_vec();
+    }
+    probed.iter().map(String::as_str).collect()
+}
+
+/// The dim one-line blurb the picker trails a KNOWN alias with, or `None`.
+///
+/// BEST-EFFORT COSMETIC, and deliberately partial. The rows come from the runtime
+/// probe ([`offered_model_aliases`]), so the picker routinely offers aliases this
+/// match has never heard of; those render BARE, and that is correct behaviour
+/// rather than a gap to fill. It must NEVER gate which rows appear: a hint table
+/// that decided the vocabulary would be the hand-synced list all over again, and it
+/// would fail CLOSED — hiding exactly the newly-shipped alias the probe went to the
+/// trouble of finding.
+///
+/// Only `opusplan` earns one today, and it is the reason the picker exists at all:
+/// it runs Opus for PLAN mode and the resting model otherwise — "plan with Opus,
+/// implement with Sonnet" as one alias — and it is absent from `claude --help`, so
+/// a user cannot discover that from the CLI. Pure so the wording is assertable.
+#[must_use]
+fn model_alias_hint(alias: &str) -> Option<&'static str> {
+    match alias {
+        "opusplan" => Some("Opus while planning, the resting model otherwise"),
+        _ => None,
+    }
+}
+
+/// The effort the model picker's `→` (`forward`) or `←` steps a pick to from
+/// `current`.
+///
+/// The cycle is UNSET (`None`: no `--effort`, so the model's own level from the
+/// user's settings applies) followed by every [`EFFORT_LEVELS`] entry in its
+/// ascending order, and it WRAPS both ways: `→` from `max` lands on unset, `←`
+/// from unset lands on `max`. Unset comes first because it is where a pick with
+/// no effort starts, so the first `→` is the lowest level and the first `←` the
+/// highest. A `current` that is not in the list (nothing in the board can produce
+/// one) is read as unset rather than rejected. Pure, so the whole cycle is
+/// asserted without a modal.
+#[must_use]
+fn cycle_effort(current: Option<&'static str>, forward: bool) -> Option<&'static str> {
+    // Position 0 is unset; position `i + 1` is `EFFORT_LEVELS[i]`.
+    let positions = EFFORT_LEVELS.len() + 1;
+    let at = current
+        .and_then(|level| EFFORT_LEVELS.iter().position(|known| *known == level))
+        .map_or(0, |index| index + 1);
+    let next = if forward {
+        (at + 1) % positions
+    } else {
+        (at + positions - 1) % positions
+    };
+    next.checked_sub(1).map(|index| EFFORT_LEVELS[index])
 }
 
 /// The folder-scoping predicate: is `session` in `scope`?
@@ -1418,6 +1794,60 @@ pub struct App {
     /// agent). In-memory ONLY — never persisted to disk — so the NEXT `Ctrl-N`
     /// pre-highlights it for a one-keystroke repeat.
     last_new_agent: Option<String>,
+    /// The `--model` aliases the INSTALLED `claude` accepts, read off that binary at
+    /// runtime — EMPTY until the one-shot probe delivers, and empty again if it
+    /// found nothing.
+    ///
+    /// DERIVED, IN-MEMORY state: it describes another program's binary, snapback
+    /// owns none of it, and nothing here ever reaches disk. AGENTS.md settles that
+    /// category twice over — THE PARSE CACHE keeps derived state in memory, and
+    /// SNAPBACK-OWNED STATE keeps the hidden-session id set the only thing snapback
+    /// persists. Written only by [`set_model_aliases`](Self::set_model_aliases),
+    /// from [`AppEvent::ModelAliases`](crate::watch::AppEvent::ModelAliases); read
+    /// only by [`offered_model_aliases`], which decides what the picker offers.
+    ///
+    /// Starting EMPTY is what makes "the picker draws the seed until the probe
+    /// delivers" STRUCTURAL rather than incidental. There is no pending flag to
+    /// consult and nothing a render could wait on: the field just holds a list, the
+    /// picker builds its rows from whatever it holds at the instant `Ctrl-L` opens
+    /// it, and an empty list means the seed. That is also why the scan (~125 ms
+    /// release, ~2.2 s debug) is allowed to be deliberately unoptimized — nothing
+    /// is blocked on it.
+    model_aliases: Vec<String>,
+    /// The model a NEW session in the launch dir would run on with no `--model`,
+    /// as the user's `claude` settings files and `ANTHROPIC_MODEL` name it — `None`
+    /// until the off-thread read delivers, and when they name none.
+    ///
+    /// DERIVED, IN-MEMORY state about ANOTHER program's configuration, exactly like
+    /// [`model_aliases`](Self::model_aliases): nothing here reaches disk. Written
+    /// only by [`set_settings_model`](Self::set_settings_model), from
+    /// [`AppEvent::SettingsModel`](crate::watch::AppEvent::SettingsModel), which is
+    /// re-read once per board session so a `/model` pick `claude` saved as the
+    /// default inside a resumed session shows up on return. Read by
+    /// [`compose_default`](Self::compose_default) alone, for a `Ctrl-N` DRAFT —
+    /// its `model:` label and its picker's first row.
+    ///
+    /// It describes NEW sessions only, and the draft's label says so by following
+    /// it with [`MODEL_NEW_SESSION_SCOPE`]: a `-r` launch normally restores the
+    /// session's own last model instead, so a reply never reads it. Starting at
+    /// `None` is what makes "a draft says `model: default` until the read lands"
+    /// structural rather than a pending state anything waits on.
+    settings_model: Option<String>,
+    /// Whether an environment override (`ANTHROPIC_MODEL` or an
+    /// `ANTHROPIC_DEFAULT_*_MODEL`, from the process environment or a settings
+    /// file's `env` block) is in effect, so that `claude` SKIPS restoring a
+    /// session's own model on a `-r` launch and uses its startup model instead.
+    ///
+    /// The second half of the same off-thread read as
+    /// [`settings_model`](Self::settings_model), and the same kind of state:
+    /// DERIVED, IN-MEMORY, re-read once per board session, never on a keystroke or
+    /// in render, and never written to disk. Written only by
+    /// [`set_restore_overridden`](Self::set_restore_overridden); read by
+    /// [`compose_default`](Self::compose_default) alone, where it turns a reply's
+    /// `model: session (<model>)` into `model: default`. Starting `false` (no
+    /// override seen) keeps a reply naming its session's model until the read
+    /// lands, which is what claude normally does when no override is set.
+    restore_overridden: bool,
     /// Whether the list/preview splitter is currently being dragged (mouse
     /// button down on the seam). Private: only the drag methods below need
     /// it, mirroring `scoped`/`preview_cache`/`index`.
@@ -1518,10 +1948,11 @@ pub struct App {
     pub show_hidden: bool,
     /// Whether a `Ctrl-X` leader chord is pending — the moment between the leader
     /// keypress and its follow-up (`x` hide, `d` hard-delete, `h` show-hidden,
-    /// `r` forced rescan, `y` copy session ID, anything else cancels). While `true` the
-    /// view draws the which-key hint and [`handle_event`](crate::tui::update)
-    /// routes the NEXT key through the pure `chord_key` machine BEFORE normal key
-    /// handling, so a printable follow-up never leaks into the search query.
+    /// `r` forced rescan, `y` copy session ID, anything else cancels). While `true`
+    /// the view draws the which-key hint and
+    /// [`handle_event`](crate::tui::update) routes the NEXT key through the pure
+    /// `chord_key` machine BEFORE normal key handling, so a printable follow-up
+    /// never leaks into the search query.
     ///
     /// A plain marker rather than a data-carrying enum because there is exactly ONE
     /// leader (`Ctrl-X`) with no per-chord state; folded into
@@ -1706,6 +2137,16 @@ impl App {
             interrupting: None,
             next_bg_launch_id: 0,
             last_new_agent: None,
+            // No live answer yet, so the picker offers the `MODEL_ALIASES` seed. The
+            // probe delivers onto the event channel some frames from now; nothing
+            // waits for it here (see the field docs).
+            model_aliases: Vec::new(),
+            // Nothing read yet, so a draft says `model: default` and a reply names
+            // its session's model; the off-thread settings read delivers both facts
+            // onto the event channel, and nothing waits for it. Nothing on disk can
+            // seed either: a model pick lives on each compose, never on the board.
+            settings_model: None,
+            restore_overridden: false,
             dragging_split: false,
             scoped: Vec::new(),
             population: Vec::new(),
@@ -2587,25 +3028,32 @@ impl App {
             title: "session is running".to_string(),
             message: "This session is running — it can't be plain-resumed.".to_string(),
             layout: ModalLayout::Row,
+            footer: MODAL_ROW_FOOTER,
             choices: vec![
                 ModalChoice {
                     label: "Attach".to_string(),
                     description: None,
+                    wrap_description: false,
                     action: ModalAction::Attach,
                 },
                 ModalChoice {
                     label: "Fork".to_string(),
                     description: None,
+                    wrap_description: false,
                     action: ModalAction::Fork,
                 },
                 ModalChoice {
                     label: "Cancel".to_string(),
                     description: None,
+                    wrap_description: false,
                     action: ModalAction::Cancel,
                 },
             ],
             selected: 0,
             session_id: Some(session_id),
+            // The view resolves and writes back the list window; every modal opens
+            // at the top.
+            scroll: 0,
         });
     }
 
@@ -2656,6 +3104,7 @@ impl App {
         let mut choices = vec![ModalChoice {
             label: "Delete this".to_string(),
             description: None,
+            wrap_description: false,
             action: ModalAction::Delete,
         }];
         // Only offer the lineage when there IS one: a lone session would otherwise
@@ -2664,12 +3113,14 @@ impl App {
             choices.push(ModalChoice {
                 label: format!("Delete lineage ({})", members.len()),
                 description: None,
+                wrap_description: false,
                 action: ModalAction::DeleteLineage(members),
             });
         }
         choices.push(ModalChoice {
             label: "Cancel".to_string(),
             description: None,
+            wrap_description: false,
             action: ModalAction::Cancel,
         });
         // Derive the default highlight from the Cancel choice's position rather
@@ -2683,9 +3134,13 @@ impl App {
             title: "delete session".to_string(),
             message,
             layout: ModalLayout::Row,
+            footer: MODAL_ROW_FOOTER,
             choices,
             selected,
             session_id: Some(id),
+            // The view resolves and writes back the list window; every modal opens
+            // at the top.
+            scroll: 0,
         });
     }
 
@@ -2955,12 +3410,14 @@ impl App {
         let mut choices = vec![ModalChoice {
             label: "default (no agent)".to_string(),
             description: None,
+            wrap_description: false,
             action: ModalAction::New(None),
         }];
         for agent in agents {
             choices.push(ModalChoice {
                 label: agent.name.clone(),
                 description: agent.description,
+                wrap_description: false,
                 action: ModalAction::New(Some(agent.name)),
             });
         }
@@ -2968,9 +3425,13 @@ impl App {
             title: "new session".to_string(),
             message: "Start a new session — pick an agent:".to_string(),
             layout: ModalLayout::List,
+            footer: AGENT_PICKER_FOOTER,
             choices,
             selected,
             session_id: None,
+            // The view resolves and writes back the list window; every modal opens
+            // at the top.
+            scroll: 0,
         });
     }
 
@@ -2978,6 +3439,270 @@ impl App {
     /// agent), so the next `Ctrl-N` pre-highlights it. In-memory only.
     pub fn set_last_new_agent(&mut self, agent: Option<String>) {
         self.last_new_agent = agent;
+    }
+
+    /// Open the model picker over the OPEN compose (`Ctrl-L`) as a `List`-layout
+    /// [`Modal`]: its default row first, then one row per alias
+    /// [`offered_model_aliases`] hands back, pre-highlighting whatever THIS compose
+    /// has picked. A no-op with no compose open — the picker has nowhere to write.
+    ///
+    /// The picker is SCOPED TO THE COMPOSE it was opened from, never to the board:
+    /// `Enter` writes the highlighted row into that compose's
+    /// [`ComposeState::model`](super::compose::ComposeState::model) (through
+    /// [`set_compose_model`](Self::set_compose_model), from `update`'s confirm), and
+    /// `Esc` returns to it with the text AND the previous pick intact, since the
+    /// modal holds its own copy of every row and the compose underneath is never
+    /// touched until a confirm.
+    ///
+    /// The rows are built HERE, at open time, from whatever
+    /// [`model_aliases`](Self::model_aliases) holds at that instant — the runtime
+    /// probe's answer once it has landed, the [`MODEL_ALIASES`] seed before then.
+    /// That is the whole of the seed-until-delivered behaviour: no waiting, no
+    /// pending state, and a picker opened in the first frames of a session simply
+    /// shows the seed. Nothing rebuilds an ALREADY-OPEN picker either — a modal is a
+    /// snapshot of the choice it was opened on, and re-writing its rows underneath
+    /// the user would move the selection they are looking at.
+    ///
+    /// Choice 0 is the compose's DEFAULT ([`ModalAction::SetModel`]`(None)`), which
+    /// sends no `--model` at all. Its label and its description come from
+    /// [`compose_default`](Self::compose_default): for a reply, the session's own
+    /// model (`session's model (Opus 5.5)`) — or `default` when claude would not
+    /// restore it — and for a draft, the settings' model
+    /// (`default (opus[1m]) (settings)`) or plain `default`. It is the only row not
+    /// drawn from the alias list, because "no pick" is not something `--model` can
+    /// express, and the only row that sets [`ModalChoice::wrap_description`], so the
+    /// whole explanation is drawn over as many lines as it needs.
+    ///
+    /// The pre-highlight is found by matching the built choices against the
+    /// compose's current pick rather than by index arithmetic, so it cannot drift
+    /// from the rows (a pick that is no longer offered falls back to row 0, never
+    /// panics) — which covers a real case: the offered set can CHANGE mid-session,
+    /// the moment the probe replaces the seed. Mirrors
+    /// [`open_agent_picker`](Self::open_agent_picker) throughout — same layout, same
+    /// "synthetic default first" shape, same one-key confirm.
+    ///
+    /// **Each model row carries its OWN effort while the picker is open.** A row
+    /// starts with no effort, except the row naming the compose's picked model,
+    /// which starts at the picked effort — so the pre-highlighted row shows the pick
+    /// exactly (and it is what makes the equality match above land on it). `←`/`→`
+    /// change the highlighted row's effort only
+    /// ([`adjust_modal_effort`](Self::adjust_modal_effort)). Moving the highlight
+    /// neither carries an effort to the next row nor resets the one left behind:
+    /// each row keeps whatever it was set to until the picker closes, so coming back
+    /// to a row finds it as it was left. `Enter` applies the highlighted row's model
+    /// and effort together; `Esc` discards every row's changes.
+    pub fn open_model_picker(&mut self) {
+        let Some(default) = self.compose_default() else {
+            return;
+        };
+        let Some(compose) = self.compose.as_ref() else {
+            return;
+        };
+        let message = match compose.target {
+            super::compose::ComposeTarget::Reply { .. } => MODEL_PICKER_REPLY_MESSAGE,
+            super::compose::ComposeTarget::NewBackgroundAgent { .. } => MODEL_PICKER_DRAFT_MESSAGE,
+        };
+        let current = compose.model.clone();
+        let mut choices = vec![ModalChoice {
+            label: default.picker_label(),
+            description: Some(default.picker_description().to_string()),
+            // The one row whose description wraps instead of clipping: it explains
+            // what sending no `--model` means here, and a clipped version leaves out
+            // the part that says why.
+            wrap_description: true,
+            action: ModalAction::SetModel(None),
+        }];
+        for alias in offered_model_aliases(&self.model_aliases) {
+            // Only the picked model's row starts at the picked effort; every other
+            // row starts unset.
+            let effort = current
+                .as_ref()
+                .filter(|pick| pick.model == alias)
+                .and_then(|pick| pick.effort);
+            choices.push(ModalChoice {
+                label: alias.to_string(),
+                description: model_alias_hint(alias).map(ToOwned::to_owned),
+                wrap_description: false,
+                action: ModalAction::SetModel(Some(ModelPick {
+                    model: alias.to_string(),
+                    effort,
+                })),
+            });
+        }
+        let current = ModalAction::SetModel(current);
+        let selected = choices
+            .iter()
+            .position(|choice| choice.action == current)
+            .unwrap_or(0);
+        self.open_modal(Modal {
+            title: "model".to_string(),
+            message: message.to_string(),
+            layout: ModalLayout::List,
+            footer: MODEL_PICKER_FOOTER,
+            choices,
+            selected,
+            session_id: None,
+            // The view resolves and writes back the list window; every modal opens
+            // at the top.
+            scroll: 0,
+        });
+    }
+
+    /// Step the highlighted model row's effort one level up (`→`, `forward`) or
+    /// down (`←`) through [`cycle_effort`]'s wrapping cycle — the model picker's
+    /// `←`/`→`.
+    ///
+    /// The layout owns the KEY (`update::modal_key` gives `←`/`→` this meaning on
+    /// every `List` modal); this owns what it DOES, and narrows it to a
+    /// [`ModalAction::SetModel`]`(Some(_))` choice — a model row. Everywhere else it
+    /// is a no-op that leaves the modal exactly as it was: the model picker's
+    /// default row (which carries no pick, so it has no effort to change), every
+    /// agent-picker row, and no modal at all. The `Ctrl-O` precedent, the other way
+    /// round: that key acts only on a `New` row.
+    ///
+    /// It edits the highlighted CHOICE, not the compose: nothing reaches the
+    /// compose's pick until `Enter` confirms that choice, so `Esc` still leaves the
+    /// compose's pick untouched. Each row keeps its own effort while the picker is
+    /// open (see [`open_model_picker`](Self::open_model_picker)).
+    pub fn adjust_modal_effort(&mut self, forward: bool) {
+        let Some(modal) = self.modal.as_mut() else {
+            return;
+        };
+        let Some(choice) = modal.choices.get_mut(modal.selected) else {
+            return;
+        };
+        if let ModalAction::SetModel(Some(pick)) = &mut choice.action {
+            pick.effort = cycle_effort(pick.effort, forward);
+        }
+    }
+
+    /// Set (or, with `None`, return to its default) the OPEN compose's model pick,
+    /// together with the `--effort` it carries. A no-op with no compose open.
+    ///
+    /// The single writer of
+    /// [`ComposeState::model`](super::compose::ComposeState::model), reached from
+    /// the model picker's [`ModalAction::SetModel`] confirm. It writes the compose
+    /// and nothing else: no board-wide model exists, nothing here touches disk
+    /// (AGENTS.md SNAPBACK-OWNED STATE), and the pick dies with the compose — the
+    /// next compose starts on its default again.
+    ///
+    /// **A pick whose model is BLANK or whitespace-only normalizes to `None` — no
+    /// value asked for is no pick,** and its effort goes with it, since an effort
+    /// means nothing without the model it was picked for. The picker offers no blank
+    /// row, and the argv seam ([`crate::resume::push_model_flag`]'s shared trim/blank
+    /// guard) would emit nothing for one anyway; this keeps the compose's `model:`
+    /// label from naming a pick that changes nothing.
+    ///
+    /// **It is NOT validation and must not become one.** Nothing about the model is
+    /// inspected beyond it being blank: an unknown-but-non-blank value is stored
+    /// verbatim and stays claude's to reject, because snapback holds no list it
+    /// could check one against without going stale on the next claude release.
+    pub fn set_compose_model(&mut self, pick: Option<ModelPick>) {
+        if let Some(compose) = self.compose.as_mut() {
+            compose.model = pick.filter(|pick| !pick.model.trim().is_empty());
+        }
+    }
+
+    /// What the OPEN compose runs on when no model is picked in it —
+    /// [`resolve_compose_default`] over this board's state — or `None` with no
+    /// compose open.
+    ///
+    /// Reads only state already in hand: the compose's target, the model the
+    /// reply's session last answered with ([`session_model_label`](Self::session_model_label),
+    /// off the CACHED preview), and the two answers of the off-thread settings read
+    /// ([`settings_model`](Self::settings_model),
+    /// [`restore_overridden`](Self::restore_overridden)). So it may be asked on a
+    /// keystroke (the picker's first row) and in render (the compose's `model:`
+    /// label) alike: it reads no file and no environment.
+    #[must_use]
+    pub fn compose_default(&self) -> Option<ComposeDefault> {
+        let compose = self.compose.as_ref()?;
+        let session_model = match &compose.target {
+            super::compose::ComposeTarget::Reply { session_id, .. } => {
+                self.session_model_label(session_id)
+            }
+            super::compose::ComposeTarget::NewBackgroundAgent { .. } => None,
+        };
+        Some(resolve_compose_default(
+            &compose.target,
+            session_model,
+            self.restore_overridden,
+            self.settings_model.as_deref(),
+        ))
+    }
+
+    /// The label of the model `session_id` last ANSWERED with — the model a `-r`
+    /// launch without `--model` normally restores — as the preview already parsed it
+    /// (`preview::RenderedPreview::last_model`), or `None` when its transcript
+    /// records none or it has not been previewed at the current width.
+    ///
+    /// Read off the width-scoped preview CACHE and never through
+    /// [`ensure_preview`](Self::ensure_preview): it must not read or parse a file,
+    /// because it is asked on a keystroke and in render. A reply is always about the
+    /// session its compose was opened on, and opening a compose force-shows the
+    /// preview, so that session's entry is the one the pane renders — in the same
+    /// frame, before the compose box is drawn. Keyed by the compose's own
+    /// `session_id` rather than the current selection (STABLE-ID STATE), so a reload
+    /// that moves the selection cannot relabel the reply.
+    #[must_use]
+    fn session_model_label(&self, session_id: &str) -> Option<&str> {
+        self.preview_cache
+            .get(session_id)
+            .and_then(|entry| entry.rendered.last_model.as_deref())
+    }
+
+    /// Adopt the `--model` alias set read off the installed `claude` binary.
+    ///
+    /// The single writer of [`model_aliases`](Self::model_aliases), and a plain swap
+    /// — the blocking scan ran on its own thread and its answer arrived as
+    /// [`AppEvent::ModelAliases`](crate::watch::AppEvent::ModelAliases), so there is
+    /// no I/O here. Mirrors
+    /// [`set_reported_agents`](Self::set_reported_agents): an off-thread reading
+    /// lands in one field and the surfaces that care read it later.
+    ///
+    /// An EMPTY `aliases` is accepted as-is rather than rejected. It is the probe's
+    /// documented "could not read it" answer, and storing it changes nothing —
+    /// [`offered_model_aliases`] reads empty as "keep the seed", so a failed probe
+    /// can never produce an empty picker.
+    ///
+    /// It deliberately touches NO other state. In particular it sets no status:
+    /// which aliases are on offer is a fact true over an INTERVAL, so it renders on
+    /// the surface that owns it — the picker — never on the keypress-scoped help
+    /// line (AGENTS.md: STATUS-LINE OWNERSHIP). Nothing on disk learns it either.
+    pub fn set_model_aliases(&mut self, aliases: Vec<String>) {
+        self.model_aliases = aliases;
+    }
+
+    /// Adopt the model the user's `claude` settings name for a NEW session, read
+    /// off the UI thread (`None` = they name none).
+    ///
+    /// The single writer of [`settings_model`](Self::settings_model), fed by
+    /// [`AppEvent::SettingsModel`](crate::watch::AppEvent::SettingsModel) and
+    /// mirroring [`set_model_aliases`](Self::set_model_aliases): the blocking reads
+    /// ran on their own thread, so this is a plain store. A BLANK value is stored
+    /// as `None`, the same "no value is no value" rule
+    /// [`set_compose_model`](Self::set_compose_model) applies, so no reader can
+    /// ever draw an empty value (a label `default ()`, a picker row's bare
+    /// `(settings)`) with a scope after it — the resolver already never produces
+    /// one, and this keeps that true for any future caller.
+    ///
+    /// It deliberately touches NO other state and sets no status: the settings
+    /// default is a fact true over an INTERVAL, rendered by the draft's compose box
+    /// and its picker, never by the keypress-scoped help line (AGENTS.md:
+    /// STATUS-LINE OWNERSHIP).
+    pub fn set_settings_model(&mut self, model: Option<String>) {
+        self.settings_model = model.filter(|value| !value.trim().is_empty());
+    }
+
+    /// Adopt whether an environment override makes `claude` skip restoring a
+    /// session's own model on `-r` — the second answer of the same off-thread read
+    /// as [`set_settings_model`](Self::set_settings_model), and its sibling in every
+    /// respect: the single writer of
+    /// [`restore_overridden`](Self::restore_overridden), a plain store, NO other
+    /// state touched and no status set (a fact true over an interval, rendered by
+    /// the reply's compose box and its picker).
+    pub fn set_restore_overridden(&mut self, overridden: bool) {
+        self.restore_overridden = overridden;
     }
 
     // --- autorefresh reload -----------------------------------------------
@@ -8024,6 +8749,727 @@ mod tests {
             app.modal.as_ref().unwrap().selected_action(),
             Some(&ModalAction::New(Some("beta".to_string()))),
             "the picker opens on the last-picked agent"
+        );
+    }
+
+    // --- compose model picker (Ctrl-L) ---------------------------------------
+
+    /// The alias array the installed `claude 2.1.233` accepts, in wire order — the
+    /// answer `model_aliases::installed_model_aliases` delivers on this machine, and
+    /// byte-identical across the four versions `src/model_aliases.rs` pins.
+    ///
+    /// Spelled out here rather than reached for so these tests state a PROBE RESULT
+    /// without reading a 290 MB binary. It deliberately differs from
+    /// [`MODEL_ALIASES`] in both LENGTH and ORDER (nine against five, `sonnet` first
+    /// rather than last) — a fixture that agreed with the seed could not tell the
+    /// probe's answer from the seed's and would pass against a picker that ignored
+    /// the probe entirely.
+    const PROBED: [&str; 9] = [
+        "sonnet",
+        "opus",
+        "haiku",
+        "fable",
+        "best",
+        "sonnet[1m]",
+        "opus[1m]",
+        "fable[1m]",
+        "opusplan",
+    ];
+
+    /// `PROBED` as the setter takes it.
+    fn probed() -> Vec<String> {
+        PROBED.iter().map(|a| (*a).to_string()).collect()
+    }
+
+    /// Open a `Ctrl-N` draft compose on `app` — the picker is a compose's, so every
+    /// picker case here opens one first.
+    fn open_draft(app: &mut App) {
+        app.open_compose(
+            super::super::compose::ComposeState::new_background(None),
+            Some(NewSessionDraft::default()),
+        );
+    }
+
+    /// Open a `Ctrl-R` reply compose on `app` for `session_id`.
+    fn open_reply(app: &mut App, session_id: &str) {
+        app.open_compose(
+            super::super::compose::ComposeState::new_reply(session_id.to_string(), None),
+            None,
+        );
+    }
+
+    /// A board row backed by a committed PREVIEW fixture, so warming its preview
+    /// really parses a transcript — the one way a session's model is on record.
+    fn preview_fixture_session(id: &str, file: &str) -> Session {
+        let mut row = session(id, "r", Some("main"), "/tmp/s");
+        row.file = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("preview")
+            .join(file);
+        row
+    }
+
+    /// The picker opens only OVER a compose — it writes into one, and there is no
+    /// board-wide model for it to set — so with no compose open it opens nothing.
+    #[test]
+    fn the_model_picker_opens_only_over_a_compose() {
+        let mut app = app_all(vec![session("s", "r", Some("main"), "/tmp/s")]);
+        app.open_model_picker();
+        assert!(
+            app.modal.is_none(),
+            "no compose, nowhere to write, no picker"
+        );
+
+        open_draft(&mut app);
+        app.open_model_picker();
+        assert!(app.modal.is_some(), "over a compose it opens");
+    }
+
+    /// The picker's cold-start rows: the compose's default row first, then the
+    /// [`MODEL_ALIASES`] SEED — which is what a board draws in the frames before the
+    /// runtime probe delivers, and forever if it never does.
+    ///
+    /// The seed carries no `default` of its own: the probe never emits one, so
+    /// dropping it keeps the two lists the same SHAPE, and row 0 already asks for
+    /// no model more strictly (no flag at all, rather than `--model default`).
+    #[test]
+    fn the_model_picker_opens_on_the_seed_before_the_probe_answers() {
+        let mut app = app_all(vec![session("s", "r", Some("main"), "/tmp/s")]);
+        open_draft(&mut app);
+        app.open_model_picker();
+        let modal = app.modal.clone().expect("the model picker is open");
+
+        assert_eq!(modal.layout, ModalLayout::List, "a vertical picker");
+        assert_eq!(
+            modal.session_id, None,
+            "a pick targets the compose, not a row"
+        );
+        assert_eq!(modal.message, MODEL_PICKER_DRAFT_MESSAGE);
+        assert_eq!(
+            modal.choices.len(),
+            MODEL_ALIASES.len() + 1,
+            "one row per seeded alias, plus the synthetic default row"
+        );
+        assert_eq!(modal.choices[0].label, MODEL_DEFAULT_LABEL);
+        assert_eq!(modal.choices[0].action, ModalAction::SetModel(None));
+        assert!(
+            modal.choices[0].wrap_description,
+            "the default row is the one that wraps its explanation"
+        );
+
+        // Asserted BEFORE the rows, so it is the seed's own shape that is pinned and
+        // not merely a consequence of the row list below happening to omit it.
+        assert!(
+            !MODEL_ALIASES.contains(&"default"),
+            "the seed must not carry a `default` the probe can never emit: \
+             {MODEL_ALIASES:?}"
+        );
+        let labels: Vec<&str> = modal.choices.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                MODEL_DEFAULT_LABEL,
+                "fable",
+                "haiku",
+                "opus",
+                "opusplan",
+                "sonnet"
+            ]
+        );
+        for (row, alias) in modal.choices.iter().skip(1).zip(labels.iter().skip(1)) {
+            assert_eq!(
+                row.action,
+                ModalAction::SetModel(Some(ModelPick::new(*alias))),
+                "each alias row carries its own name, so confirm needs no lookup"
+            );
+        }
+    }
+
+    /// The point of the runtime read: once the probe delivers, the picker offers
+    /// THAT set — verbatim, complete, and in the binary's own order.
+    ///
+    /// Asserted against a fixture that differs from the seed in length AND order, so
+    /// a picker still reading the seed fails, and one that sorted or deduplicated
+    /// the probe's answer fails too. `best` and the three `[1m]` variants are named
+    /// individually because they are exactly the four the seed is missing.
+    #[test]
+    fn a_delivered_probe_replaces_the_seed_verbatim_and_in_upstream_order() {
+        let mut app = app_all(vec![session("s", "r", Some("main"), "/tmp/s")]);
+        app.set_model_aliases(probed());
+        open_draft(&mut app);
+        app.open_model_picker();
+        let modal = app.modal.clone().expect("the model picker is open");
+
+        let labels: Vec<&str> = modal.choices.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(
+            labels[0], MODEL_DEFAULT_LABEL,
+            "the default row still leads; it is not an alias and the probe never sends one"
+        );
+        assert_eq!(
+            &labels[1..],
+            PROBED.as_slice(),
+            "the probe's answer must arrive unfiltered, unsorted and in wire order"
+        );
+        for missing in ["best", "sonnet[1m]", "opus[1m]", "fable[1m]"] {
+            assert!(
+                !MODEL_ALIASES.contains(&missing) && labels.contains(&missing),
+                "{missing} is absent from the seed and must reach the picker through \
+                 the probe: {labels:?}"
+            );
+        }
+        for (row, alias) in modal.choices.iter().skip(1).zip(PROBED) {
+            assert_eq!(
+                row.action,
+                ModalAction::SetModel(Some(ModelPick::new(alias))),
+                "each probed row carries its own name, so confirm needs no lookup"
+            );
+        }
+    }
+
+    /// [`offered_model_aliases`] is the ONE decision, stated directly.
+    ///
+    /// EMPTY collapses two premises — the probe has not answered yet, and the probe
+    /// answered with nothing — onto the same seed, so a failed probe degrades rather
+    /// than emptying the picker. A non-empty answer is passed through untouched: no
+    /// sort, no dedupe, no screening against the seed, and no dropping of entries
+    /// snapback does not recognise. A curated filter there would rebuild the
+    /// hand-synced list this replaced, and would hide exactly the new alias the
+    /// probe went looking for.
+    #[test]
+    fn the_offered_aliases_are_the_probe_verbatim_or_the_seed_when_it_is_empty() {
+        assert_eq!(
+            offered_model_aliases(&[]),
+            MODEL_ALIASES.to_vec(),
+            "no live answer — not yet delivered, or delivered empty — keeps the seed"
+        );
+
+        assert_eq!(
+            offered_model_aliases(&probed()),
+            PROBED.to_vec(),
+            "a live answer is offered whole and in its own order"
+        );
+
+        // Shapes a curated filter would have quietly removed: an alias snapback has
+        // never heard of, a duplicate, and an order that is not sorted.
+        let odd = ["zeta-9".to_string(), "opus".to_string(), "opus".to_string()];
+        assert_eq!(
+            offered_model_aliases(&odd),
+            vec!["zeta-9", "opus", "opus"],
+            "an unknown alias, a duplicate and an unsorted order all pass through — \
+             what `--model` accepts is claude's to decide, never snapback's"
+        );
+    }
+
+    /// A probed alias with no blurb renders BARE, and that is the correct outcome.
+    ///
+    /// [`model_alias_hint`] is cosmetic and knows one alias; the rows come from the
+    /// probe. Pinned because the tempting "fix" — only offering aliases the hint
+    /// table recognises — fails CLOSED and would hide every newly-shipped alias.
+    #[test]
+    fn an_alias_the_hint_table_never_heard_of_is_still_offered_bare() {
+        let mut app = app_all(vec![session("s", "r", Some("main"), "/tmp/s")]);
+        app.set_model_aliases(vec!["zeta-9".to_string(), "opusplan".to_string()]);
+        open_draft(&mut app);
+        app.open_model_picker();
+        let modal = app.modal.clone().expect("the model picker is open");
+
+        assert_eq!(model_alias_hint("zeta-9"), None, "nothing to say about it");
+        let unknown = modal
+            .choices
+            .iter()
+            .find(|c| c.label == "zeta-9")
+            .expect("an unrecognised alias is still a row");
+        assert_eq!(
+            unknown.description, None,
+            "it renders bare rather than being dropped"
+        );
+        assert_eq!(
+            unknown.action,
+            ModalAction::SetModel(Some(ModelPick::new("zeta-9"))),
+            "and it is pickable — the value reaches --model raw"
+        );
+    }
+
+    /// `opusplan` is the alias the picker exists to surface — it is absent from
+    /// `claude --help`, so its behaviour is undiscoverable from the CLI — and it is
+    /// the ONLY alias row that needs a blurb.
+    #[test]
+    fn only_opusplan_carries_a_hint_and_it_names_plan_mode() {
+        let mut app = app_all(vec![session("s", "r", Some("main"), "/tmp/s")]);
+        open_draft(&mut app);
+        app.open_model_picker();
+        let modal = app.modal.clone().expect("the model picker is open");
+
+        let opusplan = modal
+            .choices
+            .iter()
+            .find(|c| c.label == "opusplan")
+            .expect("opusplan is offered");
+        let hint = opusplan.description.as_deref().expect("opusplan explains");
+        assert!(
+            hint.contains("Opus") && hint.contains("plan"),
+            "the hint must say Opus runs while planning: {hint:?}"
+        );
+        // Row 0 keeps its own blurb (what sending no --model means); no other alias
+        // has one.
+        for row in modal
+            .choices
+            .iter()
+            .skip(1)
+            .filter(|c| c.label != "opusplan")
+        {
+            assert_eq!(
+                row.description, None,
+                "{:?} needs no blurb; only opusplan is non-obvious",
+                row.label
+            );
+        }
+        assert_eq!(model_alias_hint("sonnet"), None);
+    }
+
+    /// The picker opens ON the compose's current pick, so `Ctrl-L` then `Enter` is
+    /// a no-op rather than a silent reset — and a value that is no longer offered
+    /// falls back to row 0 instead of panicking on an out-of-range index.
+    #[test]
+    fn the_model_picker_pre_highlights_the_composes_current_pick() {
+        let mut app = app_all(vec![session("s", "r", Some("main"), "/tmp/s")]);
+        open_draft(&mut app);
+
+        // No pick -> the default row.
+        app.open_model_picker();
+        assert_eq!(
+            app.modal.take().unwrap().selected_action(),
+            Some(&ModalAction::SetModel(None))
+        );
+
+        app.set_compose_model(Some(ModelPick::new("opus")));
+        app.open_model_picker();
+        assert_eq!(
+            app.modal.take().unwrap().selected_action(),
+            Some(&ModalAction::SetModel(Some(ModelPick::new("opus")))),
+            "the picker opens on the model this compose already picked"
+        );
+
+        // A full model id (valid for `--model`, not an offered alias) is not a row.
+        app.set_compose_model(Some(ModelPick::new("claude-sonnet-5")));
+        app.open_model_picker();
+        assert_eq!(
+            app.modal.take().unwrap().selected,
+            0,
+            "a pick with no row of its own falls back to the default row"
+        );
+    }
+
+    /// The picker opens on the compose's pick WITH its effort: the pre-highlighted
+    /// row carries the picked effort, so `Ctrl-L` then `Enter` re-confirms the same
+    /// model AND effort rather than silently dropping the level. Every other row
+    /// starts unset — an effort belongs to the model it was picked for.
+    #[test]
+    fn the_model_picker_opens_on_the_current_pick_and_its_effort() {
+        let mut app = app_all(vec![session("s", "r", Some("main"), "/tmp/s")]);
+        open_draft(&mut app);
+        let opus_high = ModelPick {
+            model: "opus".to_string(),
+            effort: Some("high"),
+        };
+        app.set_compose_model(Some(opus_high.clone()));
+        app.open_model_picker();
+        let modal = app.modal.clone().expect("the model picker is open");
+
+        assert_eq!(
+            modal.selected_action(),
+            Some(&ModalAction::SetModel(Some(opus_high.clone()))),
+            "the highlighted row is the picked model at the picked effort"
+        );
+        for choice in &modal.choices {
+            if let ModalAction::SetModel(Some(pick)) = &choice.action {
+                if pick.model != "opus" {
+                    assert_eq!(
+                        pick.effort, None,
+                        "{:?} starts unset; the picked effort is opus's alone",
+                        pick.model
+                    );
+                }
+            }
+        }
+    }
+
+    /// [`cycle_effort`] is the whole `←`/`→` cycle, stated directly: UNSET, then
+    /// every [`EFFORT_LEVELS`] entry in ascending order, wrapping both ways.
+    #[test]
+    fn the_effort_cycle_walks_unset_then_every_level_and_wraps_both_ways() {
+        // Forward from unset visits every level in order and wraps back to unset.
+        let mut walked = Vec::new();
+        let mut at = None;
+        for _ in 0..=EFFORT_LEVELS.len() {
+            at = cycle_effort(at, true);
+            walked.push(at);
+        }
+        assert_eq!(
+            walked,
+            vec![
+                Some("low"),
+                Some("medium"),
+                Some("high"),
+                Some("xhigh"),
+                Some("max"),
+                None,
+            ],
+            "→ steps up through every level, then wraps to unset"
+        );
+
+        // Backward is the exact mirror: unset wraps to the TOP level first.
+        assert_eq!(
+            cycle_effort(None, false),
+            Some("max"),
+            "← from unset is max"
+        );
+        assert_eq!(
+            cycle_effort(Some("low"), false),
+            None,
+            "← from low is unset"
+        );
+        assert_eq!(cycle_effort(Some("xhigh"), false), Some("high"));
+        for level in EFFORT_LEVELS {
+            assert_eq!(
+                cycle_effort(cycle_effort(Some(level), true), false),
+                Some(level),
+                "→ then ← must return to {level}"
+            );
+        }
+
+        // A level the list does not know reads as unset rather than panicking.
+        assert_eq!(cycle_effort(Some("ultra"), true), Some("low"));
+    }
+
+    /// `←`/`→` change the HIGHLIGHTED model row's effort and nothing else: the
+    /// default row has no pick to change, other rows keep their own effort, and the
+    /// compose's pick is untouched until `Enter` confirms the row.
+    #[test]
+    fn adjusting_the_effort_touches_only_the_highlighted_model_row() {
+        let mut app = app_all(vec![session("s", "r", Some("main"), "/tmp/s")]);
+        open_draft(&mut app);
+        app.open_model_picker();
+        let before = app.modal.clone().expect("the model picker is open");
+        assert_eq!(before.selected, 0, "no pick: the default row");
+
+        // On the default row both keys are no-ops: the modal is unchanged after
+        // EACH press (a pair could cancel out and hide a press that acted).
+        for forward in [true, false] {
+            app.adjust_modal_effort(forward);
+            assert_eq!(
+                app.modal.as_ref(),
+                Some(&before),
+                "the default row carries no pick, so there is no effort to change"
+            );
+        }
+
+        // On a model row `→` steps its effort up, `←` back down, wrapping.
+        app.modal_next();
+        let row = app.modal.as_ref().unwrap().selected;
+        let effort_of =
+            |app: &App, index: usize| match &app.modal.as_ref().unwrap().choices[index].action {
+                ModalAction::SetModel(Some(pick)) => pick.effort,
+                other => panic!("row {index} is not a model row: {other:?}"),
+            };
+        app.adjust_modal_effort(true);
+        assert_eq!(effort_of(&app, row), Some("low"));
+        app.adjust_modal_effort(true);
+        assert_eq!(effort_of(&app, row), Some("medium"));
+        app.adjust_modal_effort(false);
+        app.adjust_modal_effort(false);
+        assert_eq!(effort_of(&app, row), None, "back to unset");
+        app.adjust_modal_effort(false);
+        assert_eq!(
+            effort_of(&app, row),
+            Some("max"),
+            "← from unset wraps to max"
+        );
+
+        // Moving on neither carries the effort nor resets the row left behind.
+        app.modal_next();
+        let next = app.modal.as_ref().unwrap().selected;
+        assert_eq!(
+            effort_of(&app, next),
+            None,
+            "the next row keeps its own (unset)"
+        );
+        assert_eq!(effort_of(&app, row), Some("max"), "the row left keeps max");
+        app.modal_prev();
+        assert_eq!(
+            app.modal.as_ref().unwrap().selected_action(),
+            Some(&ModalAction::SetModel(Some(ModelPick {
+                model: "fable".to_string(),
+                effort: Some("max"),
+            }))),
+            "coming back finds the row as it was left"
+        );
+
+        assert_eq!(
+            app.compose.as_ref().and_then(|c| c.model.clone()),
+            None,
+            "nothing reaches the compose until Enter confirms the row"
+        );
+    }
+
+    /// The narrowing half of the `←`/`→` key: on every agent-picker row (the other
+    /// `List` modal) adjusting is a no-op that leaves the modal byte-for-byte as it
+    /// was, checked after EACH call so a pair cannot cancel out; with no modal open
+    /// it opens nothing.
+    #[test]
+    fn adjusting_the_effort_is_inert_on_every_modal_but_the_model_picker() {
+        let mut app = app_all(vec![session("s", "r", Some("main"), "/tmp/s")]);
+        app.open_agent_picker(vec![
+            DefinedAgent {
+                name: "planner".to_string(),
+                description: None,
+            },
+            DefinedAgent {
+                name: "reviewer".to_string(),
+                description: None,
+            },
+        ]);
+        for _ in 0..3 {
+            let before = app.modal.clone();
+            for forward in [true, false] {
+                app.adjust_modal_effort(forward);
+                assert_eq!(app.modal, before, "an agent row has no effort to change");
+            }
+            app.modal_next();
+        }
+
+        app.close_modal();
+        app.adjust_modal_effort(true);
+        assert_eq!(
+            app.modal, None,
+            "no modal: nothing to adjust, nothing opened"
+        );
+    }
+
+    /// [`resolve_compose_default`] is the whole "what does this compose run on with
+    /// no pick" decision, stated directly — every case the reply and the draft can
+    /// be in.
+    #[test]
+    fn the_compose_default_is_decided_by_target_session_model_override_and_settings() {
+        use super::super::compose::ComposeTarget;
+        let reply = ComposeTarget::Reply {
+            session_id: "s".to_string(),
+            stop_job: None,
+        };
+        let draft = ComposeTarget::NewBackgroundAgent { agent: None };
+
+        // A reply: the session's own model, which claude restores...
+        assert_eq!(
+            resolve_compose_default(&reply, Some("Opus 5.5"), false, Some("opus[1m]")),
+            ComposeDefault::SessionModel("Opus 5.5".to_string()),
+            "a reply restores the session's model; the settings model is not its answer"
+        );
+        // ...unless an environment override means claude will not restore it...
+        assert_eq!(
+            resolve_compose_default(&reply, Some("Opus 5.5"), true, Some("opus[1m]")),
+            ComposeDefault::RestoreOverridden,
+            "an ANTHROPIC_MODEL / ANTHROPIC_DEFAULT_*_MODEL override outranks the \
+             transcript"
+        );
+        // ...or the transcript records no answering model to restore.
+        assert_eq!(
+            resolve_compose_default(&reply, None, false, Some("opus[1m]")),
+            ComposeDefault::NoSessionModel,
+            "no answering model on record: nothing for claude to restore"
+        );
+        assert_eq!(
+            resolve_compose_default(&reply, None, true, None),
+            ComposeDefault::RestoreOverridden,
+            "the override is the stated reason whenever it is in effect"
+        );
+
+        // A draft: the settings' model for a new session, or none.
+        assert_eq!(
+            resolve_compose_default(&draft, Some("Opus 5.5"), true, Some("opus[1m]")),
+            ComposeDefault::Settings("opus[1m]".to_string()),
+            "a draft starts fresh: the session model and the restore play no part"
+        );
+        assert_eq!(
+            resolve_compose_default(&draft, None, false, None),
+            ComposeDefault::BuiltIn,
+            "no settings value: claude's own default"
+        );
+    }
+
+    /// The default row's LABEL per case, stated directly: it names the model a
+    /// reply keeps or a draft's settings value, and is plain `default` otherwise.
+    #[test]
+    fn the_default_rows_label_names_the_model_or_says_default() {
+        assert_eq!(
+            ComposeDefault::SessionModel("Opus 5.5".to_string()).picker_label(),
+            "session's model (Opus 5.5)"
+        );
+        assert_eq!(
+            ComposeDefault::Settings("opus[1m]".to_string()).picker_label(),
+            "default (opus[1m]) (settings)"
+        );
+        for plain in [
+            ComposeDefault::RestoreOverridden,
+            ComposeDefault::NoSessionModel,
+            ComposeDefault::BuiltIn,
+        ] {
+            assert_eq!(plain.picker_label(), "default", "{plain:?}");
+        }
+        // Every description says no flag is sent, and the reply's names the effort
+        // caveat: claude restores a session's model, never its effort.
+        for default in [
+            ComposeDefault::SessionModel("Opus 5.5".to_string()),
+            ComposeDefault::RestoreOverridden,
+            ComposeDefault::NoSessionModel,
+            ComposeDefault::Settings("opus[1m]".to_string()),
+            ComposeDefault::BuiltIn,
+        ] {
+            assert!(
+                default.picker_description().starts_with("no --model"),
+                "{default:?}: {}",
+                default.picker_description()
+            );
+        }
+        assert!(ComposeDefault::SessionModel(String::new())
+            .picker_description()
+            .contains("effort"));
+    }
+
+    /// The picker's first row, through `App`, for each state the board can be in —
+    /// the wiring from the compose target, the cached preview and the settings read
+    /// to the row a user sees. The reply's session model comes off the preview the
+    /// board already rendered, so before any render it is not on record.
+    #[test]
+    fn the_pickers_first_row_follows_the_compose_the_preview_and_the_settings() {
+        let mut app = app_all(vec![preview_fixture_session(
+            "sbp-switch",
+            "sess-model-switch-1.jsonl",
+        )]);
+        let row_zero = |app: &mut App| -> ModalChoice {
+            app.open_model_picker();
+            let row = app.modal.take().expect("the model picker is open").choices[0].clone();
+            assert_eq!(
+                row.action,
+                ModalAction::SetModel(None),
+                "row 0 sends no model"
+            );
+            row
+        };
+
+        // A reply before any render: nothing on record yet, so `default`.
+        open_reply(&mut app, "sbp-switch");
+        assert_eq!(row_zero(&mut app).label, "default");
+        // Once the preview is rendered (as the frame that shows the compose does),
+        // the NEWEST answering model is the reply's default.
+        let _ = app.preview_text(80);
+        assert_eq!(row_zero(&mut app).label, "session's model (Sonnet 5)");
+        // An override means claude will not restore it.
+        app.set_restore_overridden(true);
+        assert_eq!(row_zero(&mut app).label, "default");
+        app.set_restore_overridden(false);
+
+        // A draft: the settings model, scoped by its tag, or plain `default`.
+        app.close_compose();
+        open_draft(&mut app);
+        assert_eq!(row_zero(&mut app).label, "default");
+        app.set_settings_model(Some("opus[1m]".to_string()));
+        assert_eq!(row_zero(&mut app).label, "default (opus[1m]) (settings)");
+        app.set_settings_model(Some("  ".to_string()));
+        assert_eq!(
+            row_zero(&mut app).label,
+            "default",
+            "a blank settings value is no value: never a bare `default () (settings)`"
+        );
+    }
+
+    /// The picker's prompt says whose model it picks: THIS reply only, or the new
+    /// session this draft starts.
+    #[test]
+    fn the_pickers_prompt_names_the_compose_it_picks_for() {
+        let mut app = app_all(vec![session("s", "r", Some("main"), "/tmp/s")]);
+        open_reply(&mut app, "s");
+        app.open_model_picker();
+        assert_eq!(
+            app.modal.take().expect("open").message,
+            MODEL_PICKER_REPLY_MESSAGE
+        );
+        app.close_compose();
+        open_draft(&mut app);
+        app.open_model_picker();
+        assert_eq!(
+            app.modal.take().expect("open").message,
+            MODEL_PICKER_DRAFT_MESSAGE
+        );
+        for message in [MODEL_PICKER_REPLY_MESSAGE, MODEL_PICKER_DRAFT_MESSAGE] {
+            assert!(
+                message.chars().count() <= 60,
+                "{message:?} must fit the modal's 60-column inner width on one line"
+            );
+        }
+    }
+
+    /// The pick is written into the OPEN compose alone, through its one setter —
+    /// never into board state — and `None` genuinely returns it to the default.
+    /// With no compose open the setter has nowhere to write, and writes nowhere.
+    #[test]
+    fn the_compose_pick_is_set_and_cleared_through_its_setter() {
+        let mut app = app_all(vec![session("s", "r", Some("main"), "/tmp/s")]);
+        app.set_compose_model(Some(ModelPick::new("haiku")));
+        assert!(
+            app.compose.is_none(),
+            "no compose: the setter opens nothing"
+        );
+
+        open_draft(&mut app);
+        let pick = |app: &App| app.compose.as_ref().and_then(|c| c.model.clone());
+        assert_eq!(pick(&app), None, "a fresh compose sends no --model at all");
+
+        let haiku_low = ModelPick {
+            model: "haiku".to_string(),
+            effort: Some("low"),
+        };
+        app.set_compose_model(Some(haiku_low.clone()));
+        assert_eq!(
+            pick(&app),
+            Some(haiku_low),
+            "the effort is stored WITH its model"
+        );
+
+        app.set_compose_model(None);
+        assert_eq!(
+            pick(&app),
+            None,
+            "None returns the compose to its default, effort and all"
+        );
+    }
+
+    /// A BLANK pick is no pick at all — it would emit no flag, so the compose must
+    /// not hold one its label would then name. The last case is the line this must
+    /// not cross: an unknown value is NOT blank, so it is stored verbatim and stays
+    /// claude's to reject.
+    #[test]
+    fn a_blank_compose_pick_is_no_pick_at_all() {
+        let mut app = app_all(vec![session("s", "r", Some("main"), "/tmp/s")]);
+        open_draft(&mut app);
+        let pick = |app: &App| app.compose.as_ref().and_then(|c| c.model.clone());
+
+        for blank in ["", "  \t "] {
+            app.set_compose_model(Some(ModelPick::new(blank)));
+            assert_eq!(pick(&app), None, "{blank:?} asks for no value");
+        }
+        // An effort cannot keep a blank model alive.
+        app.set_compose_model(Some(ModelPick {
+            model: " ".to_string(),
+            effort: Some("max"),
+        }));
+        assert_eq!(pick(&app), None, "a blank model drops its effort with it");
+
+        app.set_compose_model(Some(ModelPick::new("no-such-model")));
+        assert_eq!(
+            pick(&app),
+            Some(ModelPick::new("no-such-model")),
+            "this is not validation: an unknown value passes through untouched"
         );
     }
 

@@ -67,12 +67,19 @@ pub struct Ready {
     /// The full argv to spawn; `argv[0]` is the program (always `claude`).
     pub argv: Vec<String>,
     /// The neutral board hint shown if THIS child exits non-zero. Carried on the
-    /// plan (rather than fixed in [`launch`]) because a resume and a new session
-    /// fail for different reasons: a resume points at Fork/Attach
+    /// plan (rather than fixed in [`launch`]) because different hand-offs fail for
+    /// different reasons: a resume points at Fork/Attach
     /// ([`RESUME_NONZERO_HINT`]), whereas a new session — which has no live
     /// session and no fork target — points at the agent name instead
     /// ([`NEW_SESSION_NONZERO_HINT`]). Reusing the resume wording on a new-session
     /// failure would be actively misleading.
+    ///
+    /// A hand-off that actually EMITS `--model` overrides the new-session one with
+    /// [`MODEL_NONZERO_HINT`], since an invalid model is a hard failure and the agent
+    /// wording does not name it. Only a NEW session can carry one — the `Ctrl-N`
+    /// draft's `Ctrl-O` run, with a model picked in that draft — because a resume, a
+    /// fork and an attach take no model at all. [`nonzero_hint_for`] makes that
+    /// selection, from the same predicate the argv is built with.
     pub nonzero_hint: &'static str,
     /// The session id to re-probe if this child exits non-zero — `Some` ONLY on
     /// the PLAIN-resume path.
@@ -127,6 +134,21 @@ pub const RESUME_RACE_STATUS: &str =
 /// discovery list is incomplete and a hand-typed or stale pick can be rejected).
 pub const NEW_SESSION_NONZERO_HINT: &str =
     "claude exited with an error — if you picked an agent, check that its name is valid.";
+
+/// Neutral hint shown when a NEW session that CARRIED a `--model` exits NON-ZERO —
+/// it replaces [`NEW_SESSION_NONZERO_HINT`] for exactly those invocations.
+///
+/// The one interactive hand-off that can carry a model is the `Ctrl-N` draft run
+/// with `Ctrl-O` after a model was picked in that draft (`Ctrl-L`); a resume, a fork
+/// and an attach take none. An invalid model is a HARD failure (claude exits
+/// non-zero rather than silently downgrading, the way an unknown `--agent` can), so
+/// on a launch that emitted one the pick is the first thing to check — and the
+/// agent-worded hint becomes actively misleading there. Like its siblings it does
+/// NOT assert a cause (a user Ctrl-C'ing a healthy session exits non-zero too); it
+/// names the one input this launch carried that a plain one does not, and the key
+/// that picked it.
+pub const MODEL_NONZERO_HINT: &str = "claude exited with an error — check that the model you \
+     picked in the draft (Ctrl-L) names a model claude accepts.";
 
 /// Refusal shown when Attach is chosen for a session with no attachable agent
 /// job.
@@ -196,6 +218,67 @@ impl ResumeError {
     }
 }
 
+/// Every level `claude --effort <level>` accepts, lowest to highest — the ONE list
+/// of them in snapback (NO MAGIC VALUES).
+///
+/// Read off the installed `claude --help` (`--effort <level>  Effort level for the
+/// current session (low, medium, high, xhigh, max)`, claude 2.1.282); see
+/// `docs/agents/CLAUDE_CLI.md`. The ORDER is load-bearing: the compose model
+/// picker's (`Ctrl-L`) `←`/`→` steps through this list after one unset position and
+/// wraps (`tui::app::cycle_effort`), so `→` reads as "more effort".
+///
+/// Unlike the `--model` aliases this is a compile-time list rather than a runtime
+/// read of the binary, and a stale copy cannot break a hand-off: `claude` never
+/// fails a launch over `--effort`. An unknown level is warned about and replaced by
+/// the default, a level the chosen model cannot use is quietly lowered (`max` and
+/// `xhigh` become `high`), and a model with no effort support runs with none. So the
+/// worst a drifted list can do is offer a level claude then ignores or lowers.
+pub const EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+/// A compose's model pick as a launch carries it: the model to ask for and,
+/// optionally, the effort to run it at.
+///
+/// Picked per compose with `Ctrl-L` — for ONE quick reply, or for one `Ctrl-N`
+/// draft's launch — and held on that compose alone
+/// (`tui::compose::ComposeState::model`), never on the board and never on disk.
+///
+/// ONE value rather than two parallel options, so no code path can hold an effort
+/// without a model. The effort lives INSIDE the pick, and a compose with no pick has
+/// nowhere to keep one. That mirrors the argv, where [`push_model_flag`] emits
+/// `--effort` only right after the `--model` it qualifies, and the picker, whose
+/// default row (no `--model`) carries no pick for `←`/`→` to change.
+///
+/// `effort: None` sends no `--effort`, and claude then uses the model's own level
+/// from the user's settings (`modelSettings`) or its built-in default. The picker
+/// only ever sets a `Some` drawn from [`EFFORT_LEVELS`]. Claude does NOT restore an
+/// effort on a later `-r` the way it restores a model, so an effort picked for one
+/// reply applies to that reply alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelPick {
+    /// The raw `--model` value: an alias or a full model id, never validated here
+    /// (an unknown one is claude's to reject).
+    pub model: String,
+    /// The `--effort` level to send with it, or `None` to send none.
+    pub effort: Option<&'static str>,
+}
+
+impl ModelPick {
+    /// A pick of `model` with no effort — what an un-adjusted picker row carries.
+    ///
+    /// Test-only: the picker builds its rows as struct literals, because each row
+    /// also carries whatever effort `←`/`→` left on it, and the `--model` launch
+    /// flag that was this constructor's one runtime caller is gone. The suite still
+    /// states "a pick with no effort" in one word, so the constructor stays there.
+    #[cfg(test)]
+    #[must_use]
+    pub fn new(model: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+            effort: None,
+        }
+    }
+}
+
 /// Which `claude` hand-off to build an argv for.
 ///
 /// A plain tag carrying NO borrowed data, so it can ride on a modal choice and be
@@ -217,12 +300,12 @@ pub enum SessionAction {
 
 /// The per-action inputs [`argv_for`] reads to build a hand-off's argv.
 ///
-/// Each [`SessionAction`] reads ONLY the field its invocation needs — a
+/// Each [`SessionAction`] reads ONLY the fields its invocation needs — a
 /// Resume/Fork the `session_id`, an Attach the `job_id`, a New session the
-/// optional `agent` and `prompt` — so the `check_*` gate that owns the data fills
-/// just those fields (`..Default::default()`) and the rest stay inert (never
-/// emitted for the non-matching actions). Bundling the inputs here keeps the seam
-/// a single `(action, ctx)` call rather than widening it into a positional grab
+/// optional `agent`, `prompt` and `model` — so the `check_*` gate that owns the
+/// data fills just those fields (`..Default::default()`) and the rest stay inert
+/// (never emitted for the non-matching actions). Bundling the inputs here keeps the
+/// seam a single `(action, ctx)` call rather than widening it into a positional grab
 /// bag.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HandoffCtx<'a> {
@@ -239,6 +322,27 @@ pub struct HandoffCtx<'a> {
     /// launches with no positional — byte-identical to a bare interactive start.
     /// See [`build_new_argv`] for what the positional does and does NOT do.
     pub prompt: Option<&'a str>,
+    /// The model picked in the `Ctrl-N` draft (`Ctrl-L`), emitted as
+    /// `--model <alias>` (followed by `--effort <level>` when the pick carries one)
+    /// for a `New` session ONLY — the draft's `Ctrl-O` run.
+    ///
+    /// INERT for `Resume`, `Fork` and `Attach`, and not merely unused there: their
+    /// builders ([`build_argv`], [`build_attach_argv`]) take no pick at all, so the
+    /// exclusion is structural rather than a match arm that could be re-added by
+    /// accident. A `-r` launch without `--model` normally restores the model the
+    /// session last answered with (the exceptions, such as an environment override,
+    /// a non-first-party provider or a model claude declines at resume time, are in
+    /// `docs/agents/CLAUDE_CLI.md`), which is exactly what `Enter` and `^F` mean to
+    /// keep, and `claude attach <job-id>` joins a process ALREADY RUNNING under a
+    /// model, so a `--model` or `--effort` on it would claim to change something it
+    /// cannot.
+    ///
+    /// `None` (the default, and the only value a launch with no compose — the agent
+    /// picker's own `Ctrl-O` — can pass) emits nothing, so its argv stays
+    /// byte-identical to what it has always been; a pick whose model is
+    /// blank/whitespace is treated as `None` by [`flag_value`], exactly like `agent`
+    /// — and takes its effort down with it.
+    pub model: Option<&'a ModelPick>,
 }
 
 /// Build the `claude` argv for `action`, reading the one input it needs from
@@ -250,13 +354,101 @@ pub struct HandoffCtx<'a> {
 /// their invocation in one tested place. It stays argv-ONLY — `cwd`,
 /// `nonzero_hint`, and `race_probe_id` are the gates' responsibility, never this
 /// one's. Pure so the exact invocation per action is directly assertable.
+///
+/// This is also the ONE place that says WHICH actions a picked model reaches:
+/// `ctx.model` is handed to the New builder alone. [`build_argv`] and
+/// [`build_attach_argv`] cannot take one, so a resume, a fork and an attach are
+/// modelless (and effortless) by construction rather than by this match remembering
+/// to skip them. The flags are placed by the builder and not appended here, because
+/// for a New session they must precede the trailing POSITIONAL prompt — and the
+/// builder that owns that positional is the only thing that can know where "before
+/// it" is.
 #[must_use]
 pub fn argv_for(action: SessionAction, ctx: &HandoffCtx) -> Vec<String> {
     match action {
         SessionAction::Resume => build_argv(ctx.session_id, false),
         SessionAction::Fork => build_argv(ctx.session_id, true),
         SessionAction::Attach => build_attach_argv(ctx.job_id),
-        SessionAction::New => build_new_argv(ctx.agent, ctx.prompt),
+        SessionAction::New => build_new_argv(ctx.agent, ctx.model, ctx.prompt),
+    }
+}
+
+/// The value a value-taking flag would actually be emitted with, or `None` when
+/// there is nothing to emit.
+///
+/// The ONE trim/blank guard behind both `--agent` and `--model`, so the two can
+/// never drift: `None`, `Some("")` and `Some("   ")` are all the same non-input,
+/// and a blank pick can therefore never emit a valueless flag. It TRIMS rather
+/// than merely rejecting blanks, so a value that survives carries no surrounding
+/// whitespace into the argv.
+#[must_use]
+fn flag_value(raw: Option<&str>) -> Option<&str> {
+    let value = raw?.trim();
+    (!value.is_empty()).then_some(value)
+}
+
+/// The `--model` value a pick would actually be emitted with, or `None` when there
+/// is no pick or its model is blank — [`flag_value`] applied to the pick's model.
+///
+/// The ONE predicate behind both [`push_model_flag`] (what the argv carries) and
+/// [`nonzero_hint_for`] (what the board blames on a failure), so the two can never
+/// disagree about whether a hand-off carried a model.
+#[must_use]
+fn model_value(pick: Option<&ModelPick>) -> Option<&str> {
+    flag_value(pick.map(|pick| pick.model.as_str()))
+}
+
+/// Append `--model <alias>` to `argv` when the compose's pick names one, followed
+/// directly by `--effort <level>` when the pick carries an effort too.
+///
+/// The single place a pick becomes argv, shared by [`build_new_argv`] AND the two
+/// non-interactive builders in [`crate::send`] ([`crate::send::build_send_argv`] /
+/// [`crate::send::build_bg_launch_argv`]), so no invocation can spell either flag —
+/// or guard its value — differently. That is
+/// why it is `pub(crate)` rather than private: the alternative was a second copy
+/// of [`flag_value`]'s trim/blank guard living in `send.rs`, which is exactly the
+/// drift this function exists to prevent. DUMB, like every builder here: it
+/// validates nothing beyond that guard, because an unknown alias is claude's to
+/// reject (it exits non-zero, and [`MODEL_NONZERO_HINT`] is what the board then
+/// says).
+///
+/// `--effort` sits INSIDE the `--model` guard, never beside it: a pick whose model
+/// is blank emits neither flag, so no argv can carry an effort without the model it
+/// was picked for. It follows `--model` immediately, which keeps the pair together
+/// and ahead of any positional. With no effort the output is byte-identical to the
+/// `--model`-only argv this function produced before efforts existed.
+///
+/// Every caller appends it BEFORE its own trailing positional (the new-session
+/// prompt, the reply message, the background draft) — see [`build_new_argv`]'s
+/// flag-order note for why a flag never trails an operand.
+pub(crate) fn push_model_flag(argv: &mut Vec<String>, pick: Option<&ModelPick>) {
+    let Some(alias) = model_value(pick) else {
+        return;
+    };
+    argv.push("--model".to_string());
+    argv.push(alias.to_string());
+    if let Some(level) = flag_value(pick.and_then(|pick| pick.effort)) {
+        argv.push("--effort".to_string());
+        argv.push(level.to_string());
+    }
+}
+
+/// Pick a new session's non-zero hint: [`MODEL_NONZERO_HINT`] when this invocation
+/// actually EMITS `--model`, else the action's own `fallback`
+/// ([`NEW_SESSION_NONZERO_HINT`]).
+///
+/// Decided by the SAME [`model_value`] predicate the argv is built from, so the
+/// hint can never name a pick the invocation did not carry — a blank pick
+/// emits no flag and keeps the action's own wording. The effort plays no part:
+/// claude never fails a launch over `--effort` (see [`EFFORT_LEVELS`]), so it can
+/// never be the thing a non-zero exit points at. Pure so that pairing is assertable
+/// without spawning anything.
+#[must_use]
+fn nonzero_hint_for(model: Option<&ModelPick>, fallback: &'static str) -> &'static str {
+    if model_value(model).is_some() {
+        MODEL_NONZERO_HINT
+    } else {
+        fallback
     }
 }
 
@@ -264,6 +456,14 @@ pub fn argv_for(action: SessionAction, ctx: &HandoffCtx) -> Vec<String> {
 /// (`claude -r <id> --fork-session`). Reached through [`argv_for`]
 /// (`Resume`/`Fork`); kept a standalone pure fn so the exact invocation stays
 /// directly assertable. `argv[0]` is the program to spawn.
+///
+/// It takes NO model, and that is the whole guarantee: `Enter` and `^F` hand the
+/// session over with no `--model`, leaving the model to claude, which normally
+/// restores the session's OWN from the transcript (`restoreModelFromSession`); the
+/// exceptions, such as an environment override, a non-first-party provider or a
+/// model claude declines at resume time, are in `docs/agents/CLAUDE_CLI.md`. With
+/// no parameter to pass one through, no state anywhere can put `--model` or
+/// `--effort` on a resume or a fork.
 #[must_use]
 pub fn build_argv(session_id: &str, fork: bool) -> Vec<String> {
     let mut argv = vec![
@@ -307,7 +507,23 @@ pub fn build_attach_argv(job_id: &str) -> Vec<String> {
 /// itself. When `agent` is `Some(non-empty)`, `--agent <name>` is appended so the
 /// fresh session starts bound to that agent; when it is `None` — or `Some` of an
 /// empty/whitespace string, treated identically so a blank pick can never emit a
-/// bare `--agent` with no value — no agent flag is emitted.
+/// bare `--agent` with no value — no agent flag is emitted. `model` — the pick made
+/// in the `Ctrl-N` draft with `Ctrl-L`, `None` from every other route — follows the
+/// SAME guard, via the [`flag_value`] both share, and brings its optional
+/// `--effort` with it ([`push_model_flag`]).
+///
+/// The two flags are independent, and the model DELIBERATELY wins where they
+/// overlap: an agent definition may declare its own `model:` in frontmatter, and
+/// an explicit pick is a later, louder statement of intent than a file the user
+/// is not looking at. Both flags are emitted; claude resolves the pair.
+///
+/// # Flag order
+///
+/// `--model` (and the `--effort` right behind it) is emitted BEFORE the trailing
+/// positional prompt, not after it — which is the whole reason this builder takes
+/// the model rather than having it appended by [`argv_for`]. A flag trailing an
+/// operand is at the mercy of the CLI's parser; keeping every flag ahead of the
+/// positional needs no assumption about it at all.
 ///
 /// # The prompt is a trailing POSITIONAL, and it AUTO-SUBMITS
 ///
@@ -338,15 +554,17 @@ pub fn build_attach_argv(job_id: &str) -> Vec<String> {
 /// (`New`); pure so the exact invocation is directly assertable, and it funnels
 /// through the SAME [`launch`] round trip as every other hand-off.
 #[must_use]
-pub fn build_new_argv(agent: Option<&str>, prompt: Option<&str>) -> Vec<String> {
+pub fn build_new_argv(
+    agent: Option<&str>,
+    model: Option<&ModelPick>,
+    prompt: Option<&str>,
+) -> Vec<String> {
     let mut argv = vec!["claude".to_string()];
-    if let Some(name) = agent {
-        let name = name.trim();
-        if !name.is_empty() {
-            argv.push("--agent".to_string());
-            argv.push(name.to_string());
-        }
+    if let Some(name) = flag_value(agent) {
+        argv.push("--agent".to_string());
+        argv.push(name.to_string());
     }
+    push_model_flag(&mut argv, model);
     if let Some(prompt) = prompt {
         argv.push(prompt.to_string());
     }
@@ -448,6 +666,9 @@ pub fn plan(session: &Session, fork: bool) -> ResumePlan {
 /// child; `Err(ResumeError::Refused)` means stay on the board and surface the
 /// message. Doing this BEFORE teardown avoids a needless teardown/re-init flash
 /// on a session that cannot be resumed anyway.
+///
+/// It takes NO model: a resume and a fork keep the session's own model, which
+/// claude normally restores when no `--model` is passed (see [`build_argv`]).
 pub fn check(session: &Session, fork: bool) -> Result<Ready, ResumeError> {
     match plan(session, fork) {
         ResumePlan::Ready {
@@ -494,6 +715,12 @@ pub fn check(session: &Session, fork: bool) -> Result<Ready, ResumeError> {
 /// UUID. The `cwd` is still carried so `launch` `chdir`s into it, keeping parity
 /// with resume/fork. A deleted worktree / unreadable file refuses with a board
 /// status, exactly like a plain resume.
+///
+/// It takes NO model, and that is deliberate: attaching joins a process already
+/// running under one, so there is nothing for a `--model` or `--effort` to change
+/// here. No pick is threaded in at all, which is what makes the exclusion
+/// structural rather than a rule this function has to remember (see
+/// [`HandoffCtx::model`]).
 pub fn check_attach(session: &Session, agent_id: Option<&str>) -> Result<Ready, ResumeError> {
     let job_id = attach_job_id(agent_id).map_err(ResumeError::Refused)?;
     match plan(session, false) {
@@ -533,9 +760,16 @@ pub fn check_attach(session: &Session, agent_id: Option<&str>) -> Result<Ready, 
 ///
 /// A `Some(prompt)` AUTO-SUBMITS as the session's first turn — see
 /// [`build_new_argv`] for why no pre-fill alternative exists.
+///
+/// `model` is the pick made in the `Ctrl-N` draft with `Ctrl-L` (with its optional
+/// effort), threaded through exactly as `agent` is — `None` from the agent picker's
+/// own `Ctrl-O`, which skips the draft and so has no compose to pick in. When it is
+/// actually emitted the plan carries [`MODEL_NONZERO_HINT`] instead of the
+/// agent-worded one, since a bad model and a bad agent name are different failures.
 pub fn check_new(
     launch_dir: &Path,
     agent: Option<&str>,
+    model: Option<&ModelPick>,
     prompt: Option<&str>,
 ) -> Result<Ready, ResumeError> {
     if launch_dir.is_dir() {
@@ -545,6 +779,7 @@ pub fn check_new(
                 SessionAction::New,
                 &HandoffCtx {
                     agent,
+                    model,
                     prompt,
                     ..Default::default()
                 },
@@ -552,7 +787,7 @@ pub fn check_new(
             // A brand-new session has no session id yet (claude mints one), so
             // there is nothing to probe and nothing to recover.
             race_probe_id: None,
-            nonzero_hint: NEW_SESSION_NONZERO_HINT,
+            nonzero_hint: nonzero_hint_for(model, NEW_SESSION_NONZERO_HINT),
         })
     } else {
         Err(ResumeError::Refused(format!(
@@ -953,14 +1188,14 @@ mod tests {
     fn new_argv_is_bare_claude_when_no_agent() {
         // A brand-new session with no agent mints its own id, so the invocation is
         // just the program — no `-r`, no id, no `--agent`, no positional.
-        assert_eq!(build_new_argv(None, None).join(" "), "claude");
+        assert_eq!(build_new_argv(None, None, None).join(" "), "claude");
     }
 
     #[test]
     fn new_argv_appends_agent_flag_when_an_agent_is_selected() {
         // A selected agent binds the fresh session via `--agent <name>`.
         assert_eq!(
-            build_new_argv(Some("code-reviewer"), None).join(" "),
+            build_new_argv(Some("code-reviewer"), None, None).join(" "),
             "claude --agent code-reviewer"
         );
     }
@@ -969,8 +1204,8 @@ mod tests {
     fn new_argv_treats_empty_or_whitespace_agent_as_none() {
         // A blank / whitespace pick must never emit a valueless `--agent`; it
         // collapses to a bare `claude`, identical to the `None` case.
-        assert_eq!(build_new_argv(Some(""), None).join(" "), "claude");
-        assert_eq!(build_new_argv(Some("   "), None).join(" "), "claude");
+        assert_eq!(build_new_argv(Some(""), None, None).join(" "), "claude");
+        assert_eq!(build_new_argv(Some("   "), None, None).join(" "), "claude");
     }
 
     /// A first prompt rides as the TRAILING POSITIONAL — the only mechanism the
@@ -980,19 +1215,19 @@ mod tests {
     #[test]
     fn new_argv_appends_the_prompt_as_a_trailing_positional() {
         assert_eq!(
-            build_new_argv(Some("planner"), Some("ship the thing")).join(" "),
+            build_new_argv(Some("planner"), None, Some("ship the thing")).join(" "),
             "claude --agent planner ship the thing"
         );
         assert_eq!(
-            build_new_argv(None, Some("ship the thing")).join(" "),
+            build_new_argv(None, None, Some("ship the thing")).join(" "),
             "claude ship the thing"
         );
         // The positional is LAST, after any `--agent <name>` pair.
-        let argv = build_new_argv(Some("planner"), Some("line one\nline two"));
+        let argv = build_new_argv(Some("planner"), None, Some("line one\nline two"));
         assert_eq!(argv.last().map(String::as_str), Some("line one\nline two"));
         assert_eq!(argv.len(), 4, "a newline must not re-split the prompt");
         // No prompt -> no positional (today's behaviour, unchanged).
-        assert_eq!(build_new_argv(Some("planner"), None).len(), 3);
+        assert_eq!(build_new_argv(Some("planner"), None, None).len(), 3);
     }
 
     #[test]
@@ -1100,6 +1335,7 @@ mod tests {
                     job_id: "ca56b543",
                     agent: Some("planner"),
                     prompt: Some("ship the thing"),
+                    model: None,
                 },
             );
             assert_eq!(
@@ -1110,6 +1346,359 @@ mod tests {
         }
     }
 
+    /// A picked model reaches ONE action, `New`, and is INERT for every `-r` launch
+    /// and for `Attach`.
+    ///
+    /// Both halves are hard invariants. `Enter` and `^F` hand a session over with
+    /// its OWN model — claude normally restores it on a `-r` launch that carries no
+    /// `--model` — so a model on a resume or a fork would override the very thing
+    /// they keep. And `claude attach` joins a process already running under a model,
+    /// so a `--model` there would claim to change something it cannot. The sibling
+    /// of [`a_prompt_in_the_ctx_is_inert_for_every_action_but_new`]: the prompt and
+    /// the model are both read by `New` alone.
+    #[test]
+    fn a_model_in_the_ctx_reaches_only_a_new_session() {
+        let sonnet_high = ModelPick {
+            model: "sonnet".to_string(),
+            effort: Some("high"),
+        };
+        for (action, expected) in [
+            (SessionAction::Resume, "claude -r abc-123"),
+            (SessionAction::Fork, "claude -r abc-123 --fork-session"),
+            (SessionAction::Attach, "claude attach ca56b543"),
+            (
+                SessionAction::New,
+                "claude --agent planner --model sonnet --effort high ship the thing",
+            ),
+        ] {
+            let argv = argv_for(
+                action,
+                &HandoffCtx {
+                    session_id: "abc-123",
+                    job_id: "ca56b543",
+                    agent: Some("planner"),
+                    prompt: Some("ship the thing"),
+                    model: Some(&sonnet_high),
+                },
+            );
+            assert_eq!(argv.join(" "), expected, "{action:?} argv");
+        }
+        // Stated once more as a membership claim rather than a string match, so a
+        // future edit that starts threading a model into a resume, a fork or an
+        // attach cannot pass by changing the expected argv above alongside it.
+        for action in [
+            SessionAction::Resume,
+            SessionAction::Fork,
+            SessionAction::Attach,
+        ] {
+            let argv = argv_for(
+                action,
+                &HandoffCtx {
+                    session_id: "abc-123",
+                    job_id: "ca56b543",
+                    model: Some(&sonnet_high),
+                    ..Default::default()
+                },
+            );
+            assert!(
+                !argv.iter().any(|arg| arg == "--model" || arg == "--effort"),
+                "{action:?} must NEVER carry a model or an effort: {argv:?}"
+            );
+        }
+    }
+
+    /// A blank / whitespace pick is the same non-input as no pick at all, through
+    /// the seam, for the one action that reads one — so a picker that ever hands
+    /// over an empty string cannot emit a valueless `--model` (the guard `--agent`
+    /// has always had, literally the same code).
+    #[test]
+    fn a_blank_model_never_emits_a_valueless_flag() {
+        for blank in ["", "   "] {
+            let model = ModelPick::new(blank);
+            let argv = argv_for(
+                SessionAction::New,
+                &HandoffCtx {
+                    model: Some(&model),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                argv.join(" "),
+                "claude",
+                "a blank model must emit nothing for a new session"
+            );
+        }
+        // A value that merely CARRIES whitespace is trimmed, not rejected.
+        let padded = ModelPick::new("  opus  ");
+        assert_eq!(
+            argv_for(
+                SessionAction::New,
+                &HandoffCtx {
+                    model: Some(&padded),
+                    ..Default::default()
+                }
+            )
+            .join(" "),
+            "claude --model opus"
+        );
+    }
+
+    /// The effort rides the pick as `--effort <level>` placed IMMEDIATELY after
+    /// `--model <alias>` and ahead of a new session's trailing positional prompt.
+    #[test]
+    fn an_effort_follows_its_model_on_a_new_session() {
+        let pick = ModelPick {
+            model: "sonnet".to_string(),
+            effort: Some("xhigh"),
+        };
+        let argv = argv_for(
+            SessionAction::New,
+            &HandoffCtx {
+                agent: Some("planner"),
+                prompt: Some("ship the thing"),
+                model: Some(&pick),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            argv.join(" "),
+            "claude --agent planner --model sonnet --effort xhigh ship the thing"
+        );
+        // Adjacency, stated as positions rather than only a string: the effort is
+        // the very next pair after the model it qualifies.
+        let at = argv
+            .iter()
+            .position(|arg| arg == "--model")
+            .expect("the pick emits --model");
+        assert_eq!(
+            argv.get(at + 2).map(String::as_str),
+            Some("--effort"),
+            "--effort must follow --model <alias> directly: {argv:?}"
+        );
+    }
+
+    /// An effort can never reach an argv WITHOUT the model it was picked for: a
+    /// pick whose model is blank emits neither flag, effort or not. The structural
+    /// half of "no effort without a model" is the pick type itself; this is the
+    /// argv half.
+    #[test]
+    fn an_effort_never_reaches_the_argv_without_its_model() {
+        for blank in ["", "   "] {
+            let pick = ModelPick {
+                model: blank.to_string(),
+                effort: Some("max"),
+            };
+            let argv = argv_for(
+                SessionAction::New,
+                &HandoffCtx {
+                    model: Some(&pick),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                argv.join(" "),
+                "claude",
+                "a blank model must take its effort down with it"
+            );
+        }
+    }
+
+    /// A pick with NO effort emits `--model` alone: no `--effort` token anywhere,
+    /// nothing reordered. Paired with `no_pick_leaves_every_argv_byte_identical`,
+    /// which pins the no-pick-at-all case.
+    #[test]
+    fn a_pick_without_an_effort_emits_no_effort_flag() {
+        let pick = ModelPick::new("opus");
+        let argv = argv_for(
+            SessionAction::New,
+            &HandoffCtx {
+                agent: Some("planner"),
+                prompt: Some("ship the thing"),
+                model: Some(&pick),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            argv.join(" "),
+            "claude --agent planner --model opus ship the thing"
+        );
+        assert!(
+            !argv.iter().any(|arg| arg == "--effort"),
+            "no effort must emit no --effort token: {argv:?}"
+        );
+    }
+
+    /// The levels are exactly what `claude --help` lists for `--effort` (2.1.282:
+    /// "low, medium, high, xhigh, max"), in that ascending order — the order the
+    /// picker's `←`/`→` cycle walks.
+    #[test]
+    fn the_effort_levels_are_claudes_in_ascending_order() {
+        assert_eq!(EFFORT_LEVELS, ["low", "medium", "high", "xhigh", "max"]);
+    }
+
+    /// With NO pick every hand-off argv is byte-identical to what snapback emitted
+    /// before model picks existed. Asserted as an exact string per action AND as the
+    /// absence of the token anywhere, so neither a stray flag nor a reordering can
+    /// pass.
+    #[test]
+    fn no_pick_leaves_every_argv_byte_identical() {
+        for (action, expected) in [
+            (SessionAction::Resume, "claude -r abc-123"),
+            (SessionAction::Fork, "claude -r abc-123 --fork-session"),
+            (SessionAction::Attach, "claude attach ca56b543"),
+            (SessionAction::New, "claude --agent planner ship the thing"),
+        ] {
+            let argv = argv_for(
+                action,
+                &HandoffCtx {
+                    session_id: "abc-123",
+                    job_id: "ca56b543",
+                    agent: Some("planner"),
+                    prompt: Some("ship the thing"),
+                    model: None,
+                },
+            );
+            assert_eq!(argv.join(" "), expected, "{action:?} argv");
+            assert!(
+                !argv.iter().any(|arg| arg == "--model" || arg == "--effort"),
+                "no pick must emit no --model or --effort token for {action:?}: {argv:?}"
+            );
+        }
+    }
+
+    /// The `--model` flag lands in FLAG position, ahead of the new session's
+    /// trailing positional prompt — and so does the `--effort` riding behind it.
+    ///
+    /// Load-bearing rather than cosmetic: the prompt is an operand, and a flag
+    /// written after one is at the mercy of the CLI's parser. Keeping every flag
+    /// ahead of it needs no assumption about that parser at all — which is why the
+    /// builder that owns the positional is the thing that places the flag.
+    #[test]
+    fn the_model_flag_precedes_a_new_sessions_positional_prompt() {
+        let opus = ModelPick::new("opus");
+        let argv = build_new_argv(Some("planner"), Some(&opus), Some("ship the thing"));
+        assert_eq!(
+            argv,
+            vec![
+                "claude".to_string(),
+                "--agent".to_string(),
+                "planner".to_string(),
+                "--model".to_string(),
+                "opus".to_string(),
+                "ship the thing".to_string(),
+            ]
+        );
+        let opus_low = ModelPick {
+            model: "opus".to_string(),
+            effort: Some("low"),
+        };
+        assert_eq!(
+            build_new_argv(None, Some(&opus_low), Some("ship the thing")),
+            vec![
+                "claude".to_string(),
+                "--model".to_string(),
+                "opus".to_string(),
+                "--effort".to_string(),
+                "low".to_string(),
+                "ship the thing".to_string(),
+            ],
+            "the effort pair must sit between --model and the positional"
+        );
+        assert_eq!(
+            argv.last().map(String::as_str),
+            Some("ship the thing"),
+            "the prompt must stay the LAST element"
+        );
+    }
+
+    /// A new session that emits `--model` carries the model-specific non-zero hint;
+    /// one that does not keeps the agent-worded one. A resume, a fork and an attach
+    /// can carry no model, so theirs is always the resume hint.
+    ///
+    /// An invalid model exits non-zero, and there the new-session hint ("check the
+    /// agent name") points away from the cause. The selection is tied to what was
+    /// actually EMITTED, not to what was passed — a blank pick emits nothing and must
+    /// keep the ordinary hint, or the board would blame a model it never sent.
+    #[test]
+    fn a_new_session_carrying_a_model_gets_the_model_nonzero_hint() {
+        let (session, dir) = resumable_session("model-hint", "sess-model");
+
+        let plain = check(&session, false).expect("an existing cwd must proceed");
+        assert_eq!(plain.nonzero_hint, RESUME_NONZERO_HINT);
+        let forked = check(&session, true).expect("an existing cwd must proceed");
+        assert_eq!(forked.nonzero_hint, RESUME_NONZERO_HINT);
+        let attached = check_attach(&session, Some("ca56b543")).expect("an attachable job");
+        assert_eq!(attached.nonzero_hint, RESUME_NONZERO_HINT);
+
+        let existing = std::env::temp_dir();
+        let opus = ModelPick::new("opus");
+        let new_with = check_new(&existing, Some("planner"), Some(&opus), None)
+            .expect("an existing launch dir must proceed");
+        assert_eq!(new_with.nonzero_hint, MODEL_NONZERO_HINT);
+        let new_without = check_new(&existing, Some("planner"), None, None)
+            .expect("an existing launch dir must proceed");
+        assert_eq!(new_without.nonzero_hint, NEW_SESSION_NONZERO_HINT);
+        // A blank pick emits no flag, so it must not claim one either — and an
+        // effort riding a blank model changes nothing, since it is not emitted.
+        let blank = ModelPick {
+            model: "  ".to_string(),
+            effort: Some("high"),
+        };
+        let new_blank = check_new(&existing, Some("planner"), Some(&blank), None)
+            .expect("an existing launch dir must proceed");
+        assert_eq!(
+            new_blank.nonzero_hint, NEW_SESSION_NONZERO_HINT,
+            "a hint may only name a pick the argv actually carried"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Through the GATES the board actually calls: resume and fork (`check`) and
+    /// attach (`check_attach`) spawn byte-identical, model-free argvs, while the
+    /// new-session gate (`check_new`) threads a pick into the argv — the half a
+    /// caller actually feels.
+    #[test]
+    fn only_the_new_session_gate_carries_a_pick_into_the_spawned_argv() {
+        let (session, dir) = resumable_session("model-argv", "sess-argv");
+
+        assert_eq!(
+            check(&session, false)
+                .expect("an existing cwd must proceed")
+                .argv
+                .join(" "),
+            "claude -r sess-argv"
+        );
+        assert_eq!(
+            check(&session, true)
+                .expect("an existing cwd must proceed")
+                .argv
+                .join(" "),
+            "claude -r sess-argv --fork-session"
+        );
+        assert_eq!(
+            check_attach(&session, Some("ca56b543"))
+                .expect("an attachable job")
+                .argv
+                .join(" "),
+            "claude attach ca56b543",
+            "the attach gate takes no model, so its argv cannot grow one"
+        );
+        let haiku_max = ModelPick {
+            model: "haiku".to_string(),
+            effort: Some("max"),
+        };
+        assert_eq!(
+            check_new(&std::env::temp_dir(), None, Some(&haiku_max), None)
+                .expect("an existing launch dir must proceed")
+                .argv
+                .join(" "),
+            "claude --model haiku --effort max"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn check_new_proceeds_for_an_existing_launch_dir() {
         // The new-session gate is pure existence: an existing dir yields a Ready
@@ -1118,7 +1707,7 @@ mod tests {
         // new-session non-zero hint, NOT the resume-worded one.
         let existing = std::env::temp_dir();
         assert!(existing.is_dir(), "temp_dir should exist");
-        match check_new(&existing, None, None) {
+        match check_new(&existing, None, None, None) {
             Ok(Ready {
                 cwd,
                 argv,
@@ -1142,7 +1731,7 @@ mod tests {
     fn check_new_carries_the_selected_agent_into_the_argv() {
         // A selected agent threads through the gate into `claude --agent <name>`.
         let existing = std::env::temp_dir();
-        match check_new(&existing, Some("planner"), None) {
+        match check_new(&existing, Some("planner"), None, None) {
             Ok(ready) => {
                 assert_eq!(ready.argv.join(" "), "claude --agent planner");
                 assert_eq!(ready.nonzero_hint, NEW_SESSION_NONZERO_HINT);
@@ -1158,7 +1747,7 @@ mod tests {
     #[test]
     fn check_new_carries_a_drafted_prompt_into_the_argv() {
         let existing = std::env::temp_dir();
-        match check_new(&existing, Some("planner"), Some("ship the thing")) {
+        match check_new(&existing, Some("planner"), None, Some("ship the thing")) {
             Ok(ready) => {
                 assert_eq!(
                     ready.argv.join(" "),
@@ -1170,7 +1759,7 @@ mod tests {
             Err(e) => panic!("an existing launch dir must proceed: {e:?}"),
         }
         // No agent, just a prompt.
-        match check_new(&existing, None, Some("ship the thing")) {
+        match check_new(&existing, None, None, Some("ship the thing")) {
             Ok(ready) => assert_eq!(ready.argv.join(" "), "claude ship the thing"),
             Err(e) => panic!("an existing launch dir must proceed: {e:?}"),
         }
@@ -1182,7 +1771,7 @@ mod tests {
         // status, never a crash.
         let missing = PathBuf::from("/no/such/snapback/launch/dir/anywhere");
         assert!(!missing.exists(), "test path must not exist");
-        match check_new(&missing, None, None) {
+        match check_new(&missing, None, None, None) {
             Err(ResumeError::Refused(message)) => {
                 assert!(message.contains("no longer exists"), "{message}");
             }

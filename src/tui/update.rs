@@ -40,6 +40,8 @@
 //! | `Tab` | toggle name-only vs. name+content search. Widening to content also opens the preview on the most recent match, exactly as typing does: it goes through the same query funnel, and the mode is the gate that key just opened |
 //! | `Ctrl-A` | flip the scope: current folder <-> project (the launch repo and all of its git worktrees). ONE key for both, because the second is a refinement of the same question the first answers, not a separate mode. Launched with `--all`/`-a` it becomes a three-stop cycle through all folders as well — the whole store is on this key only when the launch flag put it there |
 //! | `Ctrl-X` then `x`/`d`/`h`/`r`/`y` | leader chord: hide / hard-delete (this row, or its whole fork lineage) / toggle show-hidden / re-read every transcript from disk / copy session ID (the selected session's full id, to the clipboard; the id also shows on the status line) (any other key cancels) |
+//! | `Ctrl-L` (in a compose box) | pick the model — and optionally the effort — for THIS compose only: the `Ctrl-R` reply or the `Ctrl-N` draft it is pressed in (see [`compose::compose_key_to_action`]). The box's `model:` label names what it runs on: a reply's default is `session (<model>)`, the model its session last answered with, which claude normally restores by itself (`default` when an `ANTHROPIC_MODEL` / `ANTHROPIC_DEFAULT_*_MODEL` override, or a transcript with no answering model, means it would not); a draft's is `default (<value>) (new sessions only)` from the user's `claude` settings. `--model` / `--effort` are sent ONLY for a pick other than that default — on the reply, the draft's background launch and the draft's `Ctrl-O` run. The picker's first row returns to the default, `Enter` sets the highlighted row into the compose, `Esc` returns with the text and the previous pick intact. Every new compose starts at its default; nothing is remembered. `Enter`, `Ctrl-F` and Attach never send a model |
+//! | `Left` / `Right` (in the model picker) | step the highlighted MODEL row's `--effort` down / up through unset → `low` → `medium` → `high` → `xhigh` → `max`, wrapping both ways; `Enter` then sets the model and the effort together into the compose. Inert on the picker's default row (no model, so no effort) and on every other list modal, so the agent picker keeps ignoring them; they never reach the board's fold / expand underneath |
 //! | `Ctrl-/` | toggle the preview pane |
 //! | `PgUp` / `PgDn` | scroll the preview a page (always) |
 //! | `Ctrl-U` / `Ctrl-D` | scroll the preview a quarter page (always) |
@@ -429,6 +431,13 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool
 ///   `App::overlay_active` gate).
 /// * `SessionsChanged` -> reload `store` and re-apply query+scope, preserving
 ///   selection-by-id and scroll (see [`reload_board`]).
+/// * `ModelAliases` -> swap in the alias set the off-thread probe read off the
+///   installed `claude`, so the next compose's `Ctrl-L` offers it instead of the
+///   seed.
+/// * `SettingsModel` -> store the model the user's `claude` settings name for a
+///   new session and whether an environment override stops claude restoring a
+///   session's model — what a compose box's `model:` label and its picker's first
+///   row then show.
 /// * `Tick` -> nothing costly: advance the board clock, age a transient status,
 ///   then replay any completion an earlier board session could not read
 ///   ([`replay_undelivered`]).
@@ -532,6 +541,35 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
             // CARRIED, never read here, so this arm stays clock-free (see
             // `AppEvent::ReportedAgents::reported_at_ms`).
             app.set_reported_agents(agents, reported_at_ms);
+            Outcome::Continue
+        }
+        AppEvent::ModelAliases(aliases) => {
+            // Delivered ONCE, off-thread, by the `--model` alias probe; just swap
+            // the list in. An empty list is the probe's "could not read it" answer
+            // and is stored as-is — the picker reads empty as "keep the seed", so a
+            // failed probe degrades rather than emptying the overlay.
+            //
+            // Deliberately silent: which aliases the picker offers is a fact true
+            // over an INTERVAL, rendered by the picker itself, so it never reaches
+            // the keypress-scoped status line (STATUS-LINE OWNERSHIP). It also does
+            // not touch the selection or trigger a reload — nothing about the board's
+            // rows depends on it.
+            app.set_model_aliases(aliases);
+            Outcome::Continue
+        }
+        AppEvent::SettingsModel(defaults) => {
+            // Delivered ONCE per board session, off-thread, by the settings read;
+            // just store both answers. A `None` new-session model is "the settings
+            // name no model" and a draft reads it as plain `model: default`; a set
+            // restore override turns a reply's `model: session (…)` into
+            // `model: default`.
+            //
+            // Deliberately silent, for the same reason as `ModelAliases`: both facts
+            // are true over an INTERVAL and rendered by the compose boxes and their
+            // picker, never by the keypress-scoped status line (STATUS-LINE
+            // OWNERSHIP).
+            app.set_settings_model(defaults.new_session);
+            app.set_restore_overridden(defaults.restore_overridden);
             Outcome::Continue
         }
         AppEvent::SendFinished {
@@ -1362,6 +1400,8 @@ fn apply_action(app: &mut App, action: Action) -> Outcome {
             // board status rather than a teardown/re-init flash. Only a confirmed
             // `Ready` plan escalates to `Outcome::Resume`. The `map` drops the
             // `&Session` borrow before we mutably touch `app` for `set_status`.
+            // No model is threaded in: `resume::check` takes none, so a resume and
+            // a fork keep the session's own model, which claude normally restores.
             let checked = app.selected_session().map(|s| resume::check(s, fork));
             match checked {
                 Some(Ok(ready)) => Outcome::Resume(ready),
@@ -1642,11 +1682,21 @@ fn rescan_status(sessions: usize) -> String {
 
 /// A decoded intent while a modal overlay owns the keyboard. Collapses the old
 /// `LiveNav` + `AgentNav`, which were variant-identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModalNav {
     /// Move the highlight forward (`→`/`↓`/`Tab`/`l`/`j`; horizontal keys Row-only).
     Next,
     /// Move the highlight backward (`←`/`↑`/`h`/`k`; horizontal keys Row-only).
     Prev,
+    /// Adjust the highlighted row's value one step up (`→`, `forward`) or down
+    /// (`←`) — the `List` layout's meaning for the horizontal arrows. Bound on
+    /// every `List` modal (see [`modal_key`]) and narrowed by
+    /// [`App::adjust_modal_effort`] to a model-picker model row, where it steps
+    /// that row's `--effort`; on every other row it changes nothing.
+    Adjust {
+        /// `true` for `→` (up), `false` for `←` (down).
+        forward: bool,
+    },
     /// Act on the highlighted choice (`Enter`).
     Confirm,
     /// Start the highlighted choice INTERACTIVELY, skipping the draft (`Ctrl-O`) —
@@ -1662,18 +1712,31 @@ enum ModalNav {
 
 /// Map a keypress to a [`ModalNav`] while a modal is open.
 ///
-/// The vertical keys (`↑`/`↓`, plus `k`/`j` and `Tab` forward) serve BOTH layouts.
-/// The horizontal keys (`←`/`→`/`h`/`l`) are DERIVED from `layout`: a `Row` (button
-/// strip) binds them, a `List` (vertical picker) deliberately does NOT — the two
-/// overlays' key maps must not be unioned by accident. `Left`/`Right` are ALSO
-/// bound on the BOARD (`CollapseLineage`/`ExpandLineage`); `handle_event`'s modal
-/// gate keeps those dispatch contexts apart, so they never see the same keypress.
+/// The vertical keys (`↑`/`↓`, plus `k`/`j` and `Tab` forward) move the highlight in
+/// BOTH layouts. The horizontal keys are DERIVED from `layout`, and mean a
+/// different thing in each — the two overlays' key maps must not be unioned by
+/// accident:
+///
+/// * a `Row` (button strip) binds `←`/`→`/`h`/`l` to MOVE the highlight, since its
+///   choices sit side by side;
+/// * a `List` (vertical picker) never moves its highlight sideways. It binds `←`/`→`
+///   to [`ModalNav::Adjust`] — step the highlighted row's value — which only the
+///   model picker's model rows act on (their `--effort`). `h`/`l` stay UNBOUND
+///   there: a list moves on its vertical keys alone, and a letter adjusting a value
+///   would be a second, undiscoverable spelling of a key pair the picker already
+///   names in its prompt and footer.
+///
+/// `Left`/`Right` are ALSO bound on the BOARD (`CollapseLineage`/`ExpandLineage`);
+/// `handle_event`'s modal gate keeps those dispatch contexts apart, so the picker's
+/// arrows can never fold or expand a lineage underneath it.
 ///
 /// `Ctrl-O` is derived from `layout` for the same reason: only the `List` picker
 /// has an interactive start to offer, so it must stay INERT on the running-session
 /// Attach/Fork strip and the delete confirm rather than becoming a modal-wide key.
 /// The action-level narrowing lives in [`launch_pick_interactively`] — the layout is
-/// the key map's business, the choice's meaning is the handler's.
+/// the key map's business, the choice's meaning is the handler's. `Adjust` follows
+/// the same split: the layout binds the arrows, [`App::adjust_modal_effort`] decides
+/// which rows they do anything on, so the agent picker keeps ignoring them.
 fn modal_key(key: KeyEvent, layout: ModalLayout) -> ModalNav {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
@@ -1690,6 +1753,8 @@ fn modal_key(key: KeyEvent, layout: ModalLayout) -> ModalNav {
         KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => ModalNav::Next,
         KeyCode::Left | KeyCode::Char('h') if horizontal => ModalNav::Prev,
         KeyCode::Right | KeyCode::Char('l') if horizontal => ModalNav::Next,
+        KeyCode::Left if !horizontal => ModalNav::Adjust { forward: false },
+        KeyCode::Right if !horizontal => ModalNav::Adjust { forward: true },
         KeyCode::Enter => ModalNav::Confirm,
         KeyCode::Esc => ModalNav::Cancel,
         _ => ModalNav::Ignore,
@@ -1710,6 +1775,10 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, store: &mut SessionStore) -> O
         }
         ModalNav::Prev => {
             app.modal_prev();
+            Outcome::Continue
+        }
+        ModalNav::Adjust { forward } => {
+            app.adjust_modal_effort(forward);
             Outcome::Continue
         }
         ModalNav::Cancel => {
@@ -1739,15 +1808,21 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, store: &mut SessionStore) -> O
 ///
 /// The `ModalAction` match is the second of two gates: [`modal_key`] already
 /// restricts the key to the `List` layout, and this restricts it to a choice that
-/// actually names a new session. Any other action — Attach, Fork, Delete, Cancel,
-/// or an out-of-range highlight — is a NO-OP, so a future `List`-layout modal
-/// cannot inherit an interactive start it has no meaning for.
+/// actually names a new session. Any other action — Attach, Fork, Delete,
+/// DeleteLineage, SetModel, Cancel, or an out-of-range highlight — is a NO-OP, so a
+/// `List`-layout modal cannot inherit an interactive start it has no meaning for.
+/// The model picker is exactly such a modal, and it relies on this: `Ctrl-O` there
+/// must not launch anything.
 ///
 /// The pick is recorded as the last-chosen agent FIRST — BEFORE the gate, so the
 /// next `Ctrl-N` repeats it even across a refusal. This is one of the THREE points
 /// a new session is actually started (the others are the draft pane's `Enter` and
 /// its own `Ctrl-O`), and only those record: merely OPENING a draft must not
 /// rewrite that memory, or a cancelled draft would.
+///
+/// It sends NO model: skipping the draft skips the compose, and a model is only
+/// ever picked inside a compose (`Ctrl-L`), so there is no pick to carry — the new
+/// session starts on the model the user's `claude` settings name.
 fn launch_pick_interactively(app: &mut App) -> Outcome {
     let Some(ModalAction::New(agent)) = app
         .modal
@@ -1759,7 +1834,7 @@ fn launch_pick_interactively(app: &mut App) -> Outcome {
     };
     app.close_modal();
     app.set_last_new_agent(agent.clone());
-    launch_new_session(app, agent.as_deref(), None)
+    launch_new_session(app, agent.as_deref(), None, None)
 }
 
 /// Which teardown-safe hand-off a confirmed overlay choice runs.
@@ -1821,6 +1896,16 @@ fn confirm_modal(app: &mut App, store: &mut SessionStore) -> Outcome {
             // Nothing is launched and nothing is recorded yet; the draft's own
             // `Enter` (`--bg`) or `Ctrl-O` (interactive) decides both.
             compose::open_background(app, agent);
+            Outcome::Continue
+        }
+        // The confirm that hands off NOTHING: it writes the row's model and
+        // whatever effort `←`/`→` left on it into the compose the picker was opened
+        // over (`Ctrl-L`), in one write, and the modal's close returns the keyboard
+        // to that compose — text untouched. No status is set: the pick is true over
+        // the compose's lifetime rather than at a keypress, so the compose box's
+        // `model:` label owns saying it (AGENTS.md STATUS-LINE OWNERSHIP).
+        Some(ModalAction::SetModel(pick)) => {
+            app.set_compose_model(pick);
             Outcome::Continue
         }
     }
@@ -1954,6 +2039,9 @@ fn route_handoff(app: &mut App, session_id: &str, kind: Handoff) -> Outcome {
             app.session_by_id(session_id)
                 .map(|s| resume::check_attach(s, agent.id.as_deref()))
         }
+        // Neither carries a model: `check` and `check_attach` take none (see
+        // `HandoffCtx::model`), so a fork normally keeps the session's own model
+        // and an attach joins a process already running under one.
         Handoff::Fork => app
             .session_by_id(session_id)
             .map(|s| resume::check(s, true)),
@@ -2243,17 +2331,24 @@ fn handle_interrupt_confirm_key(app: &mut App, key: KeyEvent) -> Outcome {
 /// the `&launch_dir` borrow is released before we mutably touch `app` for
 /// `set_status`.
 ///
-/// Those two callers differ only in whether a draft was typed, so `prompt` is what
-/// separates them: the picker's `Ctrl-O` passes `None` and emits the bare argv
-/// snapback has always emitted for a new session, while the draft pane passes
-/// `Some(prompt)` whenever its buffer is non-empty. A `Some(prompt)` AUTO-SUBMITS
-/// as the session's first turn (see [`resume::build_new_argv`]).
+/// Those two callers differ in whether a draft was opened, so `prompt` and `model`
+/// are what separate them: the picker's `Ctrl-O` passes `None` for both and emits
+/// the bare argv snapback has always emitted for a new session, while the draft
+/// pane passes `Some(prompt)` whenever its buffer is non-empty and the model picked
+/// in THAT draft (`Ctrl-L`), if any. A `Some(prompt)` AUTO-SUBMITS as the session's
+/// first turn (see [`resume::build_new_argv`]).
+///
+/// The model is a PARAMETER rather than read from the board, because there is no
+/// board-wide model: a pick belongs to one compose, so only the caller that owns a
+/// compose can have one to pass, and the picker's route — which skips the draft —
+/// structurally cannot.
 pub(super) fn launch_new_session(
     app: &mut App,
     agent: Option<&str>,
     prompt: Option<&str>,
+    model: Option<&resume::ModelPick>,
 ) -> Outcome {
-    match resume::check_new(&app.launch_dir, agent, prompt) {
+    match resume::check_new(&app.launch_dir, agent, model, prompt) {
         Ok(ready) => Outcome::Resume(ready),
         Err(err) => {
             app.set_status(err.message().to_string());
@@ -2275,6 +2370,7 @@ mod tests {
     use ratatui::Terminal;
 
     use crate::agents::ReportedAgent;
+    use crate::resume::ModelPick;
     use crate::search::{filter, SearchMode};
     use crate::store::Session;
     use crate::tui::app::{NewSessionDraft, Scope, MIN_PANE_WIDTH, STATUS_DWELL_TICKS};
@@ -6929,6 +7025,204 @@ mod tests {
         );
     }
 
+    /// A `ModelAliases` event is what carries the off-thread `--model` probe's
+    /// answer onto the board, and this is the only place that wiring is pinned.
+    ///
+    /// Asserted through the PICKER'S ROWS rather than through app state, because the
+    /// rows are what a user would see; a test reading a field could pass over a
+    /// picker that still built itself from the seed. The fixture's aliases differ
+    /// from the seed in order and length on purpose, so "the rows changed" cannot be
+    /// satisfied by the seed. The picker is a compose's, so a draft is open throughout.
+    ///
+    /// The event is also asserted to be SILENT: which aliases are on offer is true
+    /// over an interval and belongs to the picker, so it must never squat on the
+    /// keypress-scoped status line (STATUS-LINE OWNERSHIP).
+    #[test]
+    fn model_aliases_event_replaces_the_pickers_seed_without_touching_the_status_line() {
+        let mut app = app_with("s", None);
+        compose::open_background(&mut app, None);
+        let rows = |app: &mut App| -> Vec<String> {
+            app.open_model_picker();
+            let labels = app
+                .modal
+                .as_ref()
+                .expect("the model picker is open")
+                .choices
+                .iter()
+                .map(|c| c.label.clone())
+                .collect();
+            app.modal = None;
+            labels
+        };
+
+        let seeded = rows(&mut app);
+        assert!(
+            !seeded.iter().any(|l| l == "sonnet[1m]"),
+            "the seed must not already carry the fixture's marker alias: {seeded:?}"
+        );
+
+        app.set_status("a refusal the user has not acknowledged".to_string());
+        let out = handle_event(
+            &mut app,
+            AppEvent::ModelAliases(vec![
+                "sonnet[1m]".to_string(),
+                "opusplan".to_string(),
+                "zeta-9".to_string(),
+            ]),
+            &mut store_at(Path::new("/tmp")),
+        );
+        assert!(
+            matches!(out, Outcome::Continue),
+            "the probe's answer never ends the board session"
+        );
+
+        let probed = rows(&mut app);
+        assert_eq!(
+            probed.iter().skip(1).cloned().collect::<Vec<_>>(),
+            vec!["sonnet[1m]", "opusplan", "zeta-9"],
+            "the delivered set must replace the seed verbatim, unknown alias and all"
+        );
+        assert_eq!(
+            app.status.as_deref(),
+            Some("a refusal the user has not acknowledged"),
+            "a background delivery must not overwrite a sticky refusal"
+        );
+
+        // An EMPTY delivery is the probe's "could not read it" answer: it degrades
+        // to the seed rather than emptying the overlay.
+        handle_event(
+            &mut app,
+            AppEvent::ModelAliases(Vec::new()),
+            &mut store_at(Path::new("/tmp")),
+        );
+        assert_eq!(
+            rows(&mut app),
+            seeded,
+            "an empty probe result falls back to the seed, never to an empty picker"
+        );
+    }
+
+    /// A board row backed by a committed PREVIEW fixture, so a render really parses
+    /// a transcript — the one way a reply's session model can be on record.
+    fn preview_fixture_session(id: &str, file: &str) -> Session {
+        let mut row = session(id);
+        row.file = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("preview")
+            .join(file);
+        row
+    }
+
+    /// The first row of the picker the OPEN compose would show, as (label,
+    /// description) — opened and closed again, so the compose stays as it was.
+    fn picker_row_zero(app: &mut App) -> (String, String) {
+        app.open_model_picker();
+        let row = app.modal.take().expect("the model picker is open").choices[0].clone();
+        (row.label, row.description.unwrap_or_default())
+    }
+
+    /// A `SettingsModel` event is what carries the off-thread settings read onto the
+    /// board, and this is the only place that wiring is pinned — BOTH halves of it:
+    /// the new-session model reaches a draft's picker, and the restore override
+    /// reaches a reply's.
+    ///
+    /// Asserted through the picker's first ROW — what a user sees — rather than the
+    /// stored fields, and asserted SILENT: both facts are true over an interval, so
+    /// they must never overwrite the keypress-scoped status line (STATUS-LINE
+    /// OWNERSHIP). A later empty answer (a return from a session whose saved
+    /// `/model` pick cleared the setting) takes each away again.
+    #[test]
+    fn settings_model_event_reaches_both_pickers_without_touching_the_status_line() {
+        let mut app = App::new(
+            vec![preview_fixture_session(
+                "sbe-switch",
+                "sess-model-switch-1.jsonl",
+            )],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        let store = &mut store_at(Path::new("/tmp"));
+
+        // The DRAFT half: the settings model.
+        compose::open_background(&mut app, None);
+        assert_eq!(
+            picker_row_zero(&mut app).0,
+            "default",
+            "nothing read yet names no new-session model"
+        );
+        app.set_status("a refusal the user has not acknowledged".to_string());
+        let out = handle_event(
+            &mut app,
+            AppEvent::SettingsModel(crate::claude_settings::ModelDefaults {
+                new_session: Some("opus[1m]".to_string()),
+                restore_overridden: false,
+            }),
+            store,
+        );
+        assert!(
+            matches!(out, Outcome::Continue),
+            "the settings read never ends the board session"
+        );
+        assert_eq!(
+            picker_row_zero(&mut app).0,
+            "default (opus[1m]) (settings)",
+            "the delivered model reaches the draft picker's first row"
+        );
+        assert_eq!(
+            app.status.as_deref(),
+            Some("a refusal the user has not acknowledged"),
+            "a background delivery must not overwrite a sticky refusal"
+        );
+        app.close_compose();
+
+        // The REPLY half: the restore override. The preview is rendered first, as a
+        // frame would, so the session's own model is on record.
+        let _ = app.preview_text(80);
+        compose::open(&mut app, "sbe-switch".to_string(), None);
+        assert_eq!(
+            picker_row_zero(&mut app).0,
+            "session's model (Sonnet 5)",
+            "with no override, a reply's default is the model its session last answered with"
+        );
+        handle_event(
+            &mut app,
+            AppEvent::SettingsModel(crate::claude_settings::ModelDefaults {
+                new_session: Some("opus[1m]".to_string()),
+                restore_overridden: true,
+            }),
+            store,
+        );
+        let (label, why) = picker_row_zero(&mut app);
+        assert_eq!(
+            label, "default",
+            "an override means claude will not restore the session's model"
+        );
+        assert!(
+            why.contains("ANTHROPIC_MODEL"),
+            "and the row says why: {why}"
+        );
+
+        // A later empty answer takes both away again.
+        handle_event(
+            &mut app,
+            AppEvent::SettingsModel(crate::claude_settings::ModelDefaults::default()),
+            store,
+        );
+        assert_eq!(
+            picker_row_zero(&mut app).0,
+            "session's model (Sonnet 5)",
+            "the override is gone, so the reply names its session's model again"
+        );
+        app.close_compose();
+        compose::open_background(&mut app, None);
+        assert_eq!(
+            picker_row_zero(&mut app).0,
+            "default",
+            "and the draft names no settings model again"
+        );
+    }
+
     /// The tick is the board's clock: `view::blink_visible` phases the live-badge
     /// pulse off it, so a `Tick` that does not ADVANCE it leaves the dot frozen —
     /// exactly the "dot never pulses" bug this counter exists to fix. The view
@@ -7512,27 +7806,23 @@ mod tests {
             ModalNav::Cancel
         ));
 
-        // The List deliberately does NOT bind the horizontal keys — they must not
-        // be unioned into a vertical picker's key map.
-        assert!(matches!(
+        // A List never MOVES its highlight sideways — the Row's horizontal
+        // navigation must not be unioned into a vertical picker's key map. Its
+        // arrows ADJUST the highlighted row instead (only a model row acts on that;
+        // see the behavioural tests below), and `h`/`l` stay unbound.
+        assert_eq!(
             modal_key(key(KeyCode::Left), list),
-            ModalNav::Ignore
-        ));
-        assert!(matches!(
+            ModalNav::Adjust { forward: false }
+        );
+        assert_eq!(
             modal_key(key(KeyCode::Right), list),
-            ModalNav::Ignore
-        ));
-        assert!(matches!(
-            modal_key(key(KeyCode::Char('h')), list),
-            ModalNav::Ignore
-        ));
-        assert!(matches!(
-            modal_key(key(KeyCode::Char('l')), list),
-            ModalNav::Ignore
-        ));
+            ModalNav::Adjust { forward: true }
+        );
+        assert_eq!(modal_key(key(KeyCode::Char('h')), list), ModalNav::Ignore);
+        assert_eq!(modal_key(key(KeyCode::Char('l')), list), ModalNav::Ignore);
 
-        // A Row (button strip) DOES bind the horizontal keys on top of the shared
-        // vertical ones — the only divergence between the two key maps.
+        // A Row (button strip) binds the horizontal keys to MOVE its highlight, on
+        // top of the shared vertical ones — `h`/`l` included, unlike the List.
         let row = ModalLayout::Row;
         assert!(matches!(modal_key(key(KeyCode::Left), row), ModalNav::Prev));
         assert!(matches!(
@@ -7557,6 +7847,38 @@ mod tests {
             modal_key(key(KeyCode::Esc), row),
             ModalNav::Cancel
         ));
+    }
+
+    /// The AGENT picker keeps ignoring `←`/`→`, behaviourally: the arrows reach it
+    /// as [`ModalNav::Adjust`] (the `List` key map binds them for the model
+    /// picker's sake), and on an agent row that must change NOTHING — not the
+    /// highlight, not the rows, not the open state — and launch nothing.
+    ///
+    /// Compared after EVERY single press, never only after a sequence: a sequence
+    /// can wrap a moved highlight back to where it started (three moves over three
+    /// rows) and pass while every press was acting.
+    #[test]
+    fn the_agent_picker_ignores_left_and_right() {
+        let mut app = app_with("s", None);
+        app.open_agent_picker(vec![def_agent("planner"), def_agent("reviewer")]);
+        for downs in 0..3 {
+            if downs > 0 {
+                press(&mut app, KeyCode::Down);
+            }
+            let before = app.modal.clone();
+            for code in [KeyCode::Left, KeyCode::Right] {
+                let out = press(&mut app, code);
+                assert!(
+                    matches!(out, Outcome::Continue),
+                    "an arrow launches nothing"
+                );
+                assert_eq!(
+                    app.modal, before,
+                    "row {downs}: {code:?} must leave the agent picker exactly as it was"
+                );
+                assert!(!app.is_composing(), "and must not open the draft pane");
+            }
+        }
     }
 
     #[test]
@@ -8553,6 +8875,12 @@ mod tests {
         assert_eq!(chord_key(key(KeyCode::Char('r'))), ChordOutcome::Rescan);
         assert_eq!(chord_key(key(KeyCode::Char('y'))), ChordOutcome::Copy);
         assert_eq!(
+            chord_key(key(KeyCode::Char('m'))),
+            ChordOutcome::Cancel,
+            "`m` is not a chord verb: a model is picked per compose (Ctrl-L), never \
+             for the whole board"
+        );
+        assert_eq!(
             chord_key(key(KeyCode::Char('Y'))),
             ChordOutcome::Copy,
             "a held Shift on the follow-up still copies"
@@ -8966,6 +9294,343 @@ mod tests {
 
         std::env::remove_var("SNAPBACK_CONFIG_DIR");
         let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// `Ctrl-X m` is NOT a chord verb any more: there is no board-wide model to
+    /// pick. `m` after the leader is an unbound follow-up, so it abandons the chord
+    /// like any other — opening nothing, and (the leak guard) never reaching the
+    /// search query.
+    #[test]
+    fn ctrl_x_m_opens_nothing_and_leaks_nothing() {
+        let mut app = App::new(
+            vec![session("sbx-a")],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        let mut store = store_at(Path::new("/tmp"));
+
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        assert!(app.pending_chord, "Ctrl-X arms the leader chord");
+        feed(&mut app, key(KeyCode::Char('m')), &mut store);
+
+        assert!(!app.pending_chord, "the chord resolves on its one key");
+        assert!(app.modal.is_none(), "no model picker opens from the board");
+        assert!(app.query().is_empty(), "`m` must not leak into the query");
+    }
+
+    /// The whole per-compose pick, end to end through `handle_event`: `Ctrl-L` in a
+    /// REPLY opens the picker over it, `Enter` on a model row writes that model into
+    /// THIS compose — text untouched — and the next compose starts on its default
+    /// again, even though a pick was confirmed in the previous one. The pick is
+    /// compose state, never board state.
+    #[test]
+    fn a_pick_is_scoped_to_one_compose_and_the_next_starts_at_default() {
+        let mut app = app_with("sbc-scope", None);
+
+        // Ctrl-R on a session claude is not holding opens the reply compose.
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        assert!(app.is_composing(), "Ctrl-R opens the reply compose");
+        type_into_draft(&mut app, "hello");
+        assert_eq!(
+            app.compose.as_ref().and_then(|c| c.model.clone()),
+            None,
+            "a fresh compose starts at its default"
+        );
+
+        press_ctrl(&mut app, KeyCode::Char('l'));
+        assert!(app.modal.is_some(), "Ctrl-L opens the model picker");
+        assert!(app.is_composing(), "over the compose, which stays open");
+        // Move off the default row onto the first alias (the seed's `fable`), step
+        // its effort once, and confirm.
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Enter);
+
+        assert!(app.modal.is_none(), "Enter closes the picker");
+        let compose = app.compose.as_ref().expect("and returns to the compose");
+        assert_eq!(
+            compose.model,
+            Some(ModelPick {
+                model: "fable".to_string(),
+                effort: Some("low"),
+            }),
+            "Enter sets the row's model and effort into THIS compose"
+        );
+        assert_eq!(compose.textarea.lines(), ["hello"], "the text is untouched");
+
+        // Leave the compose and open another: it starts at its default again.
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.is_composing(), "Esc closes the compose");
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        assert!(app.is_composing(), "a second reply compose opens");
+        assert_eq!(
+            app.compose.as_ref().and_then(|c| c.model.clone()),
+            None,
+            "a pick confirmed in the previous compose must not carry over"
+        );
+        compose::open_background(&mut app, None);
+        assert_eq!(
+            app.compose.as_ref().and_then(|c| c.model.clone()),
+            None,
+            "nor into a new-session draft"
+        );
+    }
+
+    /// `Esc` from the picker returns to the compose with BOTH the text and the
+    /// PREVIOUS pick intact — the picker's rows are its own copies, so nothing a
+    /// highlight move or an effort step did while it was open reaches the compose.
+    #[test]
+    fn esc_from_the_model_picker_keeps_the_text_and_the_previous_pick() {
+        let mut app = App::new(
+            vec![session("sbx-a")],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        compose::open_background(&mut app, None);
+        type_into_draft(&mut app, "draft text");
+        let fable = ModelPick::new("fable");
+        app.set_compose_model(Some(fable.clone()));
+
+        press_ctrl(&mut app, KeyCode::Char('l'));
+        assert_eq!(
+            app.modal.as_ref().and_then(|m| m.selected_action()),
+            Some(&ModalAction::SetModel(Some(fable.clone()))),
+            "the picker opens ON the compose's current pick"
+        );
+        // Move to another row and give it an effort, then walk away.
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Esc);
+
+        assert!(app.modal.is_none(), "Esc closes the picker");
+        let compose = app.compose.as_ref().expect("the compose is still open");
+        assert_eq!(
+            compose.textarea.lines(),
+            ["draft text"],
+            "the text is intact"
+        );
+        assert_eq!(
+            compose.model,
+            Some(fable),
+            "the previous pick is intact — nothing the picker did reached it"
+        );
+    }
+
+    /// `Ctrl-O` on the MODEL picker must launch nothing. It is a `List`-layout
+    /// modal, so [`modal_key`] binds the key — the second gate, in
+    /// [`launch_pick_interactively`], is what keeps a non-`New` choice inert.
+    #[test]
+    fn ctrl_o_on_the_model_picker_launches_nothing() {
+        let mut app = App::new(
+            vec![session("sbx-a")],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        let mut store = store_at(Path::new("/tmp"));
+        compose::open_background(&mut app, None);
+
+        feed(&mut app, ctrl(KeyCode::Char('l')), &mut store);
+        let outcome = handle_event(
+            &mut app,
+            AppEvent::Input(Event::Key(ctrl(KeyCode::Char('o')))),
+            &mut store,
+        );
+
+        assert!(
+            matches!(outcome, Outcome::Continue),
+            "Ctrl-O on a model row must not hand off"
+        );
+        assert!(
+            app.modal.is_some(),
+            "and must not even close the picker: it is simply unbound here"
+        );
+        assert_eq!(app.compose.as_ref().and_then(|c| c.model.clone()), None);
+    }
+
+    /// In the MODEL picker `→`/`←` step the highlighted model row's effort, and ONE
+    /// `Enter` sets the model and the effort together into the compose. On the
+    /// default row the arrows do nothing — there is no model for an effort to
+    /// belong to — and the picker re-opens on the compose's pick at its effort.
+    #[test]
+    fn the_model_pickers_arrows_set_an_effort_that_enter_confirms_with_the_model() {
+        let mut app = App::new(
+            vec![session("sbx-a")],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        let mut store = store_at(Path::new("/tmp"));
+        compose::open_background(&mut app, None);
+        let pick = |app: &App| app.compose.as_ref().and_then(|c| c.model.clone());
+
+        feed(&mut app, ctrl(KeyCode::Char('l')), &mut store);
+        // The default row: each arrow is a no-op that leaves the picker as it was
+        // (checked per press, so a Right and a Left cannot cancel each other out).
+        let before = app.modal.clone();
+        for code in [KeyCode::Right, KeyCode::Left] {
+            feed(&mut app, key(code), &mut store);
+            assert_eq!(
+                app.modal, before,
+                "{code:?} does nothing on the default row"
+            );
+        }
+
+        // First alias (fable): → three times walks unset -> low -> medium -> high.
+        feed(&mut app, key(KeyCode::Down), &mut store);
+        for _ in 0..3 {
+            feed(&mut app, key(KeyCode::Right), &mut store);
+        }
+        assert_eq!(pick(&app), None, "adjusting sets nothing until Enter");
+        feed(&mut app, key(KeyCode::Enter), &mut store);
+        let fable_high = ModelPick {
+            model: "fable".to_string(),
+            effort: Some("high"),
+        };
+        assert_eq!(
+            pick(&app),
+            Some(fable_high.clone()),
+            "one Enter confirms the model and its effort together"
+        );
+
+        // Re-open: the picked row is highlighted at the picked effort, and Enter
+        // re-confirms it unchanged.
+        feed(&mut app, ctrl(KeyCode::Char('l')), &mut store);
+        assert_eq!(
+            app.modal.as_ref().and_then(|m| m.selected_action()),
+            Some(&ModalAction::SetModel(Some(fable_high.clone())))
+        );
+        feed(&mut app, key(KeyCode::Enter), &mut store);
+        assert_eq!(pick(&app), Some(fable_high.clone()));
+
+        // ← from unset wraps to the top level on another row.
+        feed(&mut app, ctrl(KeyCode::Char('l')), &mut store);
+        feed(&mut app, key(KeyCode::Down), &mut store); // haiku, unset
+        feed(&mut app, key(KeyCode::Left), &mut store);
+        assert_eq!(
+            app.modal.as_ref().and_then(|m| m.selected_action()),
+            Some(&ModalAction::SetModel(Some(ModelPick {
+                model: "haiku".to_string(),
+                effort: Some("max"),
+            })))
+        );
+        // And the default row takes the pick away again.
+        while app.modal.as_ref().expect("the picker is open").selected != 0 {
+            feed(&mut app, key(KeyCode::Up), &mut store);
+        }
+        feed(&mut app, key(KeyCode::Enter), &mut store);
+        assert_eq!(
+            pick(&app),
+            None,
+            "the default row returns the compose to no pick"
+        );
+    }
+
+    /// `←`/`→` inside the open model picker must NEVER reach the board, where the
+    /// same keys fold and expand a fork lineage. The fixture is a real two-member
+    /// lineage folded to one row, and the CONTROL at the end proves `→` does expand
+    /// it once the picker AND its compose are gone — so this cannot pass on a board
+    /// with nothing to fold.
+    #[test]
+    fn arrows_in_the_model_picker_never_fold_or_expand_the_board() {
+        let mut head = session("sbl-head");
+        head.root_uuid = Some("root-shared".to_string());
+        let mut fork = session("sbl-fork");
+        fork.root_uuid = Some("root-shared".to_string());
+        let mut app = App::new(vec![head, fork], Scope::All, PathBuf::from("/tmp/launch"));
+        let mut store = store_at(Path::new("/tmp"));
+        assert_eq!(
+            app.filtered.len(),
+            1,
+            "the lineage starts folded to one row"
+        );
+
+        compose::open_background(&mut app, None);
+        feed(&mut app, ctrl(KeyCode::Char('l')), &mut store);
+        feed(&mut app, key(KeyCode::Down), &mut store);
+        for code in [KeyCode::Right, KeyCode::Right, KeyCode::Left] {
+            feed(&mut app, key(code), &mut store);
+            assert_eq!(
+                app.filtered.len(),
+                1,
+                "{code:?} in the picker must not expand the lineage underneath it"
+            );
+        }
+        assert!(app.modal.is_some(), "the picker still owns the keyboard");
+
+        // Control: with the picker AND the compose closed the very same key DOES
+        // expand it.
+        feed(&mut app, key(KeyCode::Esc), &mut store);
+        feed(&mut app, key(KeyCode::Esc), &mut store);
+        assert!(!app.is_composing(), "both overlays are gone");
+        feed(&mut app, key(KeyCode::Right), &mut store);
+        assert_eq!(
+            app.filtered.len(),
+            2,
+            "the fixture is foldable: → on the board expands it"
+        );
+    }
+
+    /// `Enter`, `Ctrl-F` and Attach NEVER carry `--model` or `--effort`, through the
+    /// real key routing — even straight after a pick was confirmed in a compose. A
+    /// resume and a fork keep the session's own model (claude normally restores it),
+    /// and an attach joins a running process: the argvs are byte-identical to what they
+    /// were before model picks existed.
+    #[test]
+    fn enter_fork_and_attach_never_carry_a_model_even_after_a_compose_pick() {
+        let dir = unique_temp_dir("no-model-handoffs");
+        let mut app = App::new(
+            vec![resumable_session(&dir, "sbm-plain")],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
+        seed_live(&mut app, &[]);
+        let carries_a_model =
+            |argv: &[String]| argv.iter().any(|arg| arg == "--model" || arg == "--effort");
+
+        // A reply compose with a CONFIRMED pick, then abandoned.
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        press_ctrl(&mut app, KeyCode::Char('l'));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            app.compose.as_ref().is_some_and(|c| c.model.is_some()),
+            "fixture: the compose holds a pick"
+        );
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.is_composing());
+
+        let Outcome::Resume(resumed) = press(&mut app, KeyCode::Enter) else {
+            panic!(
+                "Enter on a resumable session must hand off: {:?}",
+                app.status
+            );
+        };
+        assert_eq!(resumed.argv.join(" "), "claude -r sbm-plain");
+        assert!(!carries_a_model(&resumed.argv));
+        assert_eq!(resumed.nonzero_hint, crate::resume::RESUME_NONZERO_HINT);
+
+        let Outcome::Resume(forked) = press_ctrl(&mut app, KeyCode::Char('f')) else {
+            panic!(
+                "Ctrl-F on a resumable session must hand off: {:?}",
+                app.status
+            );
+        };
+        assert_eq!(forked.argv.join(" "), "claude -r sbm-plain --fork-session");
+        assert!(!carries_a_model(&forked.argv));
+
+        // Attach: claude reports the session running as a background job.
+        seed_live_agents(&mut app, &[("sbm-plain", "background", Some("job-1"))]);
+        app.open_live_choice("sbm-plain".to_string());
+        let Outcome::Resume(attached) = press(&mut app, KeyCode::Enter) else {
+            panic!(
+                "Attach on a live background job must hand off: {:?}",
+                app.status
+            );
+        };
+        assert_eq!(attached.argv.join(" "), "claude attach job-1");
+        assert!(!carries_a_model(&attached.argv));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Task 4.3 / 4.4: `Ctrl-X d` opens a confirm defaulting to Cancel; confirming

@@ -28,8 +28,11 @@ use std::path::{Path, PathBuf};
 const AGENTS_SUBDIR: &str = "agents";
 
 /// The `.claude` config directory name, shared by the user- and project-level
-/// agent locations (`~/.claude/agents`, `<launch_dir>/.claude/agents`).
-const CLAUDE_DIR: &str = ".claude";
+/// agent locations (`~/.claude/agents`, `<launch_dir>/.claude/agents`) and by
+/// [`crate::claude_settings`]' settings-file locations (`~/.claude/settings.json`,
+/// `<launch_dir>/.claude/settings{,.local}.json`), so the name claude gives its
+/// config directory is written once.
+pub(crate) const CLAUDE_DIR: &str = ".claude";
 
 /// File extension of an agent-definition file. Only `*.md` files are considered;
 /// anything else in the directory is ignored.
