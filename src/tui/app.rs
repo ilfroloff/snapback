@@ -991,7 +991,9 @@ struct CachedPreview {
     /// offset function into these lines (see
     /// [DOMAIN.md](../../docs/agents/DOMAIN.md#a-content-index-position-never-projects-into-preview-coordinates)). Only
     /// lines with at least one match are present, so an unmatched transcript costs
-    /// an empty map.
+    /// an empty map. The rows of an open injected-context node's body are never
+    /// searched ([`preview::RenderedPreview::is_indexed_line`]): the index does not
+    /// hold them, so a mark there would be a hit the filter never counted.
     ///
     /// That seam marks PER ATOM, with the FILTER's own memmem finders, so the marks
     /// reproduce the rule the row was admitted by: a multi-atom query marks each
@@ -1544,13 +1546,16 @@ pub struct App {
     /// change invalidates the whole cache (see `preview_cache`). `None` until
     /// the first preview render.
     preview_width: Option<u16>,
-    /// The peer-message nodes the user has EXPANDED in the preview pane. EMPTY
-    /// IS THE DEFAULT, and it means every peer node renders collapsed to its
-    /// one clickable header line.
+    /// The fold nodes the user has EXPANDED in the preview pane — peer messages
+    /// and injected-context nodes alike. EMPTY IS THE DEFAULT, and it means every
+    /// node renders collapsed to its one clickable header line.
     ///
-    /// Keyed by `origin.from` — the SENDING AGENT'S STEM, never the record
-    /// `uuid` — so a future delegation node resolves to the SAME key and the two
-    /// anchors drive one node (see [`preview::FoldRegion`]).
+    /// Holds TWO kinds of key, one per node kind (see [`preview::FoldRegion`]): a
+    /// peer node's `origin.from` — the SENDING AGENT'S STEM, never the record
+    /// `uuid`, so a future delegation node resolves to the SAME key and the two
+    /// anchors drive one node — and an injected node's record `uuid` behind a
+    /// fixed prefix, which keeps the two kinds from ever colliding. The set does
+    /// not care which is which: a key is simply open or not.
     ///
     /// IN MEMORY ONLY. It is NEVER written to disk: AGENTS.md SNAPBACK-OWNED
     /// STATE permits exactly one persisted set, the hidden-session ids under
@@ -3425,8 +3430,9 @@ impl App {
             // Defined-agent names gate the preview's `agent-name` fallback so a
             // free-form background-job title never renders as a bogus handle.
             let known_agents: HashSet<&str> = self.agent_names.iter().map(String::as_str).collect();
-            // Open peer-message fold keys, borrowed out of the app's own set
-            // (`expanded_peers`). The renderer only ever READS it, which is what
+            // Open fold keys of BOTH node kinds — peer messages and injected
+            // context — borrowed out of the app's own set (`expanded_peers`).
+            // The renderer only ever READS it, which is what
             // keeps `preview::render` pure; a key is added or removed by
             // `toggle_peer_fold` alone, and that evicts this entry so the next
             // miss re-renders under the new set.
@@ -3516,6 +3522,12 @@ impl App {
         let mut scratch = MarkScratch::new();
         // An empty query marks nothing, so the walk is skipped outright rather than
         // asked line by line.
+        //
+        // The body of an OPEN injected-context node is never asked at all: the
+        // content index left that record out, so a hit there is one the filter did
+        // not count. This one walk feeds the pane's highlights, the `Shift`-arrow
+        // stops, the match jump and the "outside the preview" verdict alike, so
+        // skipping here keeps all four honest together.
         let matches: HashMap<usize, HashSet<usize>> = if query.is_empty() {
             HashMap::new()
         } else {
@@ -3526,6 +3538,7 @@ impl App {
                     .lines
                     .iter()
                     .enumerate()
+                    .filter(|(i, _)| entry.rendered.is_indexed_line(*i))
                     .filter_map(|(i, line)| {
                         let matched =
                             index.atom_match_positions_with(&line_text(line), &mut scratch);
@@ -3754,8 +3767,9 @@ impl App {
     /// The wrapped-layout context needed to hit-test a mouse click into a preview:
     /// the per-line wrapped-row PREFIX MAP
     /// ([`row_prefix`](CachedPreview::row_prefix)), the rendered LINES, and BOTH kinds
-    /// of clickable region — the [`LinkRegion`](preview::LinkRegion)s and the peer-node
-    /// [`FoldRegion`](preview::FoldRegion)s — all pulled from the SAME width-scoped
+    /// of clickable region — the [`LinkRegion`](preview::LinkRegion)s and the fold-node
+    /// [`FoldRegion`](preview::FoldRegion)s, peer messages and injected context
+    /// alike — all pulled from the SAME width-scoped
     /// cache the view drew from, so a hit-test can never disagree with what is on
     /// screen. `None` when nothing is selected.
     ///
@@ -3791,8 +3805,8 @@ impl App {
         })
     }
 
-    /// Open or close the peer-message node keyed by `key`, then keep it on the
-    /// screen row it was clicked on.
+    /// Open or close the fold node — a peer message or an injected-context node —
+    /// keyed by `key`, then keep it on the screen row it was clicked on.
     ///
     /// The ONE place `expanded_peers` is mutated, and it evicts the selected
     /// session's `preview_cache` entry in the same breath. That pairing is the whole
@@ -4989,6 +5003,101 @@ mod tests {
                 - i64::from(app.preview_scroll),
             screen_row,
             "and re-collapsing must put it back on that same row"
+        );
+    }
+
+    // --- injected-context node: the same fold, and search skips its body ----
+
+    /// The command-started fixture: its `/review-branch` skill body is an
+    /// `isMeta` record the preview folds to one node.
+    const COMMAND_FIXTURE: (&str, &str) = ("-Users-me-project-zeta", "sess-command-prompt-1.jsonl");
+    /// That body's fold key — its record `uuid` behind the injected prefix, in
+    /// the SAME open set the peer keys live in.
+    const SKILL_BODY_KEY: &str = "injected:zeta-5";
+    /// A pane wide enough that no line of the fixture wraps.
+    const COMMAND_WIDTH: u16 = 80;
+
+    /// The fixture session, labelled with `query` so a name-only filter keeps the
+    /// row on the board while the query is typed.
+    fn command_app(query: &str) -> App {
+        let (folder, file) = COMMAND_FIXTURE;
+        let mut s = fixture_session("s1", folder, file);
+        s.label = format!("started with {query}");
+        app_all(vec![s])
+    }
+
+    /// Opening an injected node through the one toggle holds its header on the
+    /// screen row it was clicked on, exactly as a peer node's does — the node
+    /// keeps its header on row 1 of its block, so `fold_scroll_delta` holds.
+    #[test]
+    fn an_injected_fold_toggle_keeps_the_node_on_its_screen_row() {
+        let mut app = command_app("x");
+        app.preview_scroll = 2;
+        let (before_map, folds) = app
+            .preview_hit_context(COMMAND_WIDTH)
+            .map(|(map, _lines, _links, folds)| (map.to_vec(), folds.to_vec()))
+            .expect("the fixture session is selected, so it has a preview");
+        let region = folds
+            .iter()
+            .find(|f| f.key == SKILL_BODY_KEY)
+            .expect("the skill body renders a fold region keyed by its uuid");
+        let screen_row =
+            i64::try_from(before_map[region.content_row]).unwrap() - i64::from(app.preview_scroll);
+
+        app.toggle_peer_fold(SKILL_BODY_KEY, COMMAND_WIDTH);
+        let (open_map, open_folds) = app
+            .preview_hit_context(COMMAND_WIDTH)
+            .map(|(map, _lines, _links, folds)| (map.to_vec(), folds.to_vec()))
+            .expect("the fixture session is selected, so it has a preview");
+        assert!(
+            open_map.last() > before_map.last(),
+            "the node's body must really have opened below the header"
+        );
+        let open_region = open_folds
+            .iter()
+            .find(|f| f.key == SKILL_BODY_KEY)
+            .expect("an open node stays clickable");
+        assert_eq!(
+            i64::try_from(open_map[open_region.content_row]).unwrap()
+                - i64::from(app.preview_scroll),
+            screen_row,
+            "opening must leave the node on the screen row it was clicked on"
+        );
+    }
+
+    /// The mark walk skips the body of an OPEN injected node: the content index
+    /// never held that text, so a mark there would be a hit the filter did not
+    /// count — and this one walk drives the highlights, the `Shift`-arrow stops,
+    /// the jump and the "outside the preview" note alike. A line the index DOES
+    /// hold, saying the same word, is still marked.
+    #[test]
+    fn an_open_injected_nodes_body_is_never_marked_by_search() {
+        const QUERY: &str = "review";
+        let mut app = command_app(QUERY);
+        app.push_query_str(QUERY);
+        app.toggle_peer_fold(SKILL_BODY_KEY, COMMAND_WIDTH);
+        let text = app.preview_text(COMMAND_WIDTH);
+        let matches = app
+            .preview_matches(COMMAND_WIDTH)
+            .expect("a selected session has a match map")
+            .clone();
+
+        let line_saying = |needle: &str| {
+            text.lines
+                .iter()
+                .position(|l| line_text(l).contains(needle))
+                .unwrap_or_else(|| panic!("the preview must draw a line saying {needle:?}"))
+        };
+        // The premise: the open body really draws the query on screen.
+        let body_line = line_saying("Your task is to review");
+        assert!(
+            !matches.contains_key(&body_line),
+            "the open body's line {body_line} must never be marked: {matches:?}"
+        );
+        let command_line = line_saying("/review-branch");
+        assert!(
+            matches.contains_key(&command_line),
+            "the typed command's line is indexed and must still be marked: {matches:?}"
         );
     }
 

@@ -271,10 +271,10 @@ never fatal:
 | `isSidechain` | bool (`label::is_sidechain`; non-bool ⇒ `false`) | skip sub-agent turns when picking a label/preview — except that the preview checks the [peer node](#peer-message-node-storepreview) gate FIRST, so a peer record with a body still renders even on a sidechain turn; a sub-agent turn neither raises nor clears the [failed-task flag](#failed-background-task-storeparse) |
 | `promptSource` | on `type:"user"`, string (fail-soft); observed `typed`, `sdk`, `system`, `queued` | `typed` / `sdk` mark the USER writing — clears the flag, but is **never read before `origin`** (51 of 169 notices say `sdk` too) |
 | `turnOrigin` | on `type:"user"`, string (fail-soft); observed `human`, `sdk`, `peer`, `task_notification` | `human` / `sdk` mark the user writing — the ONLY marker a quick-reply slash command carries, [from Claude Code 2.1.278 on](#why-turnorigin-counts) |
-| `isMeta` | bool on `type:"user"`; anything but absent or `false` reads as meta | an injection nobody typed; never clears the flag |
+| `isMeta` | bool on `type:"user"`; anything but absent or `false` reads as meta (`label::is_meta`) | an injection nobody typed; never clears the flag. Every subagent hand-back carries it too, so "Claude Code injected this" is `isMeta` AND not a [peer message](#peer-message-node-storepreview) (`label::is_injected`) — the ONE check the preview's [injected node](#injected-context-node-storepreview), the [content index](#content-index-storeparse) and the [label](#label-storelabel) all read |
 | `<status>` / `<summary>` | tags inside the **string** `message.content` of an `origin.kind: "task-notification"` record; first occurrence, inner text | `<status>failed</status>` raises the flag on its own; the `<summary>` is kept and quoted **verbatim** on the banner. Optional: absent or unclosed ⇒ kept empty, exactly like `<summary></summary>`, and the banner quotes nothing |
-| `uuid` | per record | a record's identity in the transcript **tree** |
-| `parentUuid` | per record; **JSON `null` on the root** | the tree edge; the null-parent record's `uuid` is the fork-lineage identity (see [Fork lineage](#fork-lineage-storelineage)) |
+| `uuid` | per record | a record's identity in the transcript **tree**; an [injected node](#injected-context-node-storepreview)'s fold key |
+| `parentUuid` | per record; **JSON `null` on the root** | the tree edge; the null-parent record's `uuid` is the fork-lineage identity (see [Fork lineage](#fork-lineage-storelineage)); an injected record pointing at the slash-command wrapper just before it confirms a [prompt command label](#label-storelabel) |
 
 "First non-null" vs "last non-null" is deliberate: identity fields take the
 earliest value, activity fields (branch, timestamp) take the most recent.
@@ -290,12 +290,33 @@ Preference order, then sanitized (tabs/newlines → spaces) and truncated to
 `LABEL_MAX` (180) chars:
 
 1. latest `type:"summary"` title (empty/whitespace summaries ignored), else
-2. the first **real** user prompt — skipping `isSidechain` turns and
-   `<...>`-wrapped command/system prompts; handles both string and typed-block
-   `message.content`, else
+2. the first prompt the **user wrote** (`label::FirstPrompt`) — whichever comes
+   first of:
+   - a **real** typed prompt — skipping `isSidechain` turns,
+     [injected context](#injected-context-node-storepreview) and
+     `<...>`-wrapped command/system prompts; handles both string and
+     typed-block `message.content`;
+   - a **prompt command**, labelled as the `/name args` the user typed (e.g.
+     `/cr-review github PR #157. Use a separate worktree…`), else
 3. the `session_id`.
 
 An `ai-title`/`aiTitle` tier is deliberately **not** considered.
+
+A slash command's record is a `<command-name>` wrapper either way; the record
+AFTER it says which kind it was. A prompt command's expanded body follows it as an
+injected record whose `parentUuid` is the wrapper's `uuid` — that confirms it. A
+LOCAL command (`/model`, `/clear`) is followed by its `<local-command-stdout>`
+instead and stays skipped, as it always was. So the pick holds the last command
+line for exactly ONE record and confirms or drops it there: one streaming pass, no
+look-back. Every body in a real store is the very next record (measured
+2026-09-28: 61 of 61). The `/name args` text is `store::command`'s, the same the
+preview's `▷` line and the content index hold.
+
+Without the second arm, a command-started session was labelled with the first line
+of the SKILL BODY — the first unwrapped user text — so every `/cr-review` read
+"Your task is to run an independent, unbiased review…". Measured on a real store
+(132 sessions, 2026-09-28) the rule changes exactly those 26 labels and sends none
+to a bare session id.
 
 ### Repo / branch grouping (`store::group`)
 
@@ -364,7 +385,28 @@ group head per repo→branch group, git-log style.
 
 An in-memory string of readable transcript text (user/assistant text blocks +
 summaries; tool params/thinking omitted), extracted **once at load**; the
-name+content search mode searches it without re-reading disk. It is bounded by
+name+content search mode searches it without re-reading disk.
+
+It holds what was SAID — what the user typed and what claude and its agents
+answered — and not what Claude Code wrote around it:
+
+- an [injected](#injected-context-node-storepreview) record (`label::is_injected`
+  — a skill or command body, a caveat) is left out whole. A session that ran a
+  skill otherwise matched every query sharing that skill's wording (~2.8 MB of
+  skill-body text in a real store). A subagent hand-back is NOT injected — the
+  same check says so — and stays searchable like any reply, as do background task
+  notices;
+- a slash command is kept as the `/name args` the user typed
+  (`store::command::typed_text`), never as its `<command-name>` / `<command-args>`
+  tags — the literal tag name alone made `args` match 59 of 127 sessions. Every
+  OTHER wrapper (`<local-command-stdout>`, `<system-reminder>`,
+  `<task-notification>`, …) is kept exactly as written, tags included, because
+  the README promises that text is found.
+
+A session Claude loaded a skill in by itself is therefore no longer findable by
+that skill's name: nobody typed it.
+
+It is bounded by
 `CONTENT_INDEX_CAP` — a **safety ceiling** of 1 MB against a pathological file,
 truncated on a UTF-8 char boundary — and not by a working budget.
 
@@ -497,9 +539,11 @@ nothing either; an **FTS5** table over transcript text is the step past that.
 The content index and the rendered preview (`store::preview`) are two
 INDEPENDENT, lossy extractions of the same transcript, and no offset function
 maps one onto the other. They disagree in both directions: the index keeps
-sidechain turns and the FULL body of every control wrapper, and drops markers,
-timestamps and blank lines; the preview collapses each wrapper to a one-line
-marker, drops sidechain user turns, discards a link's url, and RE-LAYS-OUT a
+sidechain turns and the FULL body of every control wrapper but a slash command
+(kept as `/name args`), and drops markers, timestamps, blank lines and every
+injected record; the preview collapses each wrapper to a one-line marker, folds an
+injected record to a node whose body it draws only when opened, drops sidechain
+user turns, discards a link's url, and RE-LAYS-OUT a
 table — wrapping one cell across several lines, interleaving a rule between every
 pair of body rows (a wrapped row spans several lines, so without one two rows run
 together), and — on a pane too narrow to seat every column at its floor —
@@ -542,6 +586,12 @@ The pane's search NAVIGATION is per LINE regardless: `Shift-Up`/`Shift-Down` ste
 between marked LINES, not between occurrences, because a stop is a place to look
 and a line is what the jump can scroll to. A line saying the query twice, or
 carrying two different atoms, is marked twice and stopped at once.
+
+The re-search SKIPS the body rows of an OPEN [injected node](#injected-context-node-storepreview)
+(`RenderedPreview::unindexed`, asked through `is_indexed_line`): the index never
+held that text, so a mark there would be a hit the filter did not count. That one
+walk feeds the highlights, the `Shift`-arrow stops, the match jump and the
+outside-the-preview note, so the skip keeps all four consistent with the filter.
 
 The two pipelines also disagree about what EXISTS: a query can match the index
 and occur nowhere in the rendered preview — the same one-off probe put it near
@@ -1566,6 +1616,59 @@ delegation node resolve to the SAME node. Which nodes are open lives in
 stays the only thing snapback persists. A record that passes the gate but
 carries no `from` has no key, so it claims no click region and renders EXPANDED:
 a collapsed node nobody can click would put its body permanently out of reach.
+The same set also holds the [injected nodes'](#injected-context-node-storepreview)
+keys; the two kinds never collide.
+
+The gate itself (`label::peer_origin`) lives in `store::label`, beside the
+`isMeta` read: every hand-back carries `isMeta` too, and the
+[injected-context](#injected-context-node-storepreview) check refuses a peer
+record by asking this very gate.
+
+### Injected context node (`store::preview`)
+
+Claude Code writes context into a session on the user's behalf as ordinary
+`type:"user"` records marked `isMeta`: the expanded body of a skill or prompt
+command, a local command's caveat, a "continue from where you left off" notice.
+Drawn as a `▶ you` turn that is a MISLABEL — nobody typed it — and, for a skill
+body, a wall of instructions between the command the user did type and claude's
+reply. The preview folds such a record to a one-line node instead, reusing the
+peer node's fold machinery:
+
+```text
+▶ you · 08:05
+▷ /handoff-to-lead in a separate worktree
+
+◇ added by claude code · 08:05 · (click to expand)
+```
+
+Membership is `label::is_injected`: `type:"user"`, `isMeta` set, and NOT a
+[peer message](#peer-message-node-storepreview). It is decided from the
+record-level `isMeta` alone, never from the text, and it is the SAME check the
+[content index](#content-index-storeparse) skips by and the
+[label](#label-storelabel) confirms a prompt command by, so the three surfaces
+cannot disagree about which records are instructions.
+
+- **Order is load-bearing.** The branch runs AFTER the peer gate and after the
+  `isSidechain` drop. Every hand-back also carries `isMeta`; one reaching this
+  branch would lose its sender label and its `origin.from` fold key. The shared
+  check refuses a peer record too, so the order and the check guard it twice.
+- **Fold key: the record `uuid`,** behind the fixed prefix `injected:` so it can
+  share `expanded_peers` with the peer nodes' `origin.from` keys without the two
+  shapes ever colliding (a sender is a stem, an agent type name or a socket path).
+  The undocumented `turnCompanion` / `sourceToolUseID` fields are NOT keyed on —
+  older skill bodies lack `turnCompanion`. A fork copies its records
+  uuid-for-uuid, so opening a node in one fork opens it in the others; harmless.
+- **No `uuid`** ⇒ no key ⇒ the peer node's `Unfoldable` state: the body renders
+  OPEN, with no affordance and no click region.
+- **Header on row 1** of the node's block, exactly like the peer node, so opening
+  it only appends lines below the header and `fold_scroll_delta` holds the node
+  on the row it was clicked on.
+- **An open node's body is not searchable text.** It rides out of the renderer as
+  an `UnindexedRows` run, and the pane's search marks skip it (see
+  [the mark walk](#a-content-index-position-never-projects-into-preview-coordinates)).
+- **Out of scope:** naming the skill in the fold line (when claude runs a skill
+  itself, the turn above only says `[tool_use: Skill]`), and auto-opening a fold
+  whose body is the only place a query occurs.
 
 ## User-facing modes (`tui::app`)
 

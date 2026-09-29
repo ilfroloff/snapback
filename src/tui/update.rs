@@ -416,8 +416,9 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool
 /// * `Input(Key)` (a press/repeat) -> decode + apply an [`Action`].
 /// * `Input(Mouse)` -> a wheel notch scrolls the pane under the pointer, a
 ///   left-button press/drag/release on the list/preview seam resizes the split,
-///   a left-click on a peer-message node's header toggles that node open or
-///   closed, and a left-click on a rendered preview link is resolved by
+///   a left-click on a fold node's header — a peer message or injected
+///   context — toggles that node open or closed, and a left-click on a
+///   rendered preview link is resolved by
 ///   [`handle_mouse`]: a hit on an `http`/`https` url opens it in the default
 ///   browser and reports `opening <url>` transiently, a hit on any other scheme
 ///   opens NOTHING and reports a sticky refusal naming the url, a line too big to
@@ -931,9 +932,10 @@ const SPLITTER_TOLERANCE: u16 = 1;
 /// `seam + 1` is the preview's FIRST CONTENT COLUMN: the border is always
 /// exactly one column, at every terminal size and split ratio, so claiming
 /// `seam + 1` claims live transcript. Content column 0 is where a peer node's
-/// `\u{25c6}` marker sits, and where a markdown link that starts its line sits;
-/// a symmetric band made both of them unclickable — the marker that reads
-/// "(click to expand)" being the one cell that could not be clicked. Two
+/// `\u{25c6}` marker sits, where an injected-context node's `\u{25c7}` marker
+/// sits, and where a markdown link that starts its line sits; a symmetric band
+/// made all three unclickable — each fold marker being the one cell of its
+/// "(click to expand)" header that could not be clicked. Two
 /// columns is still a comfortable target. Do NOT re-symmetrise this, and do NOT
 /// fix a variant of it by reordering the arms: the pane arm guards on the OUTER
 /// `preview_rect`, so running it first would hit-test border clicks into content
@@ -956,9 +958,9 @@ fn on_splitter(col: u16, row: u16, list: Rect, preview: Rect) -> bool {
 /// press on the list/preview seam begins
 /// dragging the splitter, a left-button drag while dragging resizes it, and a
 /// left-button release always ends the drag. A left-button press INSIDE the
-/// preview pane (but not on the seam) does one of exactly two things: on a
-/// peer-message node's HEADER it toggles that node open or closed
-/// ([`App::toggle_peer_fold`]), and otherwise it is resolved by
+/// preview pane (but not on the seam) does one of exactly two things: on a fold
+/// node's HEADER — a peer message or injected context — it toggles that node open
+/// or closed ([`App::toggle_peer_fold`]), and otherwise it is resolved by
 /// [`open_link_under_pointer`]: a hit on an `http`/`https` link opens its url in the
 /// default browser — fire-and-forget, off the render loop — and reports
 /// `opening <url>` transiently; a hit on any OTHER scheme opens nothing and reports a
@@ -980,13 +982,16 @@ fn on_splitter(col: u16, row: u16, list: Rect, preview: Rect) -> bool {
 /// Fold-before-link is FREE, not a tie-break. A node's header line is built from
 /// the marker, the sender, the timestamp and the affordance alone; every link
 /// region a node produces belongs to its BODY and is rebased strictly BELOW the
-/// header row (`store::preview::peer_node_lines`), so no content row is ever
-/// claimed by both a `FoldRegion` and a `LinkRegion` and neither order can swallow
-/// the other's click. The order is written down anyway because that is a property
+/// header row (`store::preview::peer_node_lines`, `injected_node_lines`), so no
+/// content row is ever claimed by both a `FoldRegion` and a `LinkRegion` and
+/// neither order can swallow the other's click. The order is written down anyway
+/// because that is a property
 /// of today's render rather than a guarantee of it: it is what would decide the
 /// collision if a header ever did carry a link, and
-/// `a_peer_node_header_carries_no_link_regions_at_any_width` is the test that goes
-/// red the moment the premise stops holding.
+/// `a_peer_node_header_carries_no_link_regions_at_any_width` and
+/// `an_injected_node_header_carries_no_link_regions_at_any_width` — one per node
+/// kind, since each builds its header on its own path — are the tests that go red
+/// the moment the premise stops holding.
 fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     match mouse.kind {
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
@@ -1248,8 +1253,9 @@ fn note_link_click(app: &mut App, click: &LinkClick) {
     }
 }
 
-/// The fold key of the peer-message node whose HEADER sits under a pointer at
-/// screen `(col, row)`, or `None` when the pointer is over no node header.
+/// The fold key of the fold node — a peer message or injected context — whose
+/// HEADER sits under a pointer at screen `(col, row)`, or `None` when the pointer
+/// is over no node header.
 ///
 /// A deliberate mirror of [`resolve_link_click`], sharing every step that decides
 /// WHICH LINE a click landed on: the same [`preview_transcript_rect`], the same
@@ -5909,6 +5915,186 @@ mod tests {
             !app.is_dragging_split(),
             "nor start an orphaned splitter drag"
         );
+    }
+
+    // --- injected-context fold: the same pane arm, the same premise ----------
+
+    /// The injected record's `uuid` in [`injected_link_session`].
+    const INJECTED_UUID: &str = "inj-link-1";
+    /// That record's fold key: its `uuid` behind the injected prefix.
+    /// `store::preview` owns the prefix; it is restated here on purpose, for the
+    /// same reason [`COLLAPSED_AFFORDANCE`] is.
+    const INJECTED_KEY: &str = "injected:inj-link-1";
+    /// A phrase carried ONLY by the injected body, so the node's state is read the
+    /// way a user reads it: on screen when OPEN, absent when CLOSED.
+    const INJECTED_BODY_PHRASE: &str = "follow every review step";
+
+    /// A session holding ONE injected (`isMeta`, non-peer) record whose body OPENS
+    /// with a markdown link, written as a real file under `dir`.
+    ///
+    /// The link sits at the body's content column 0 on purpose: that is the
+    /// column the header's marker is drawn on, so if the body's links were ever
+    /// rebased onto the header row, the header's own leftmost cell would carry a
+    /// link and a click there would stop being the node's alone.
+    fn injected_link_session(dir: &Path) -> Session {
+        let file = dir.join("sess-injected-link.jsonl");
+        let body = format!("[guide]({LINK_URL}) explains the task.\\n\\n{INJECTED_BODY_PHRASE}.");
+        let jsonl = format!(
+            concat!(
+                r#"{{"type":"user","sessionId":"sess-injected-link","cwd":"/tmp","#,
+                r#""timestamp":"2026-07-01T10:00:00.000Z","uuid":"{uuid}","isMeta":true,"#,
+                r#""message":{{"role":"user","content":"{body}"}}}}"#,
+                "\n",
+            ),
+            uuid = INJECTED_UUID,
+            body = body,
+        );
+        std::fs::write(&file, jsonl).expect("write the injected-link fixture");
+        let mut s = session("sess-injected-link");
+        s.file = file;
+        s
+    }
+
+    /// The injected node header's LEFTMOST drawn cell — its `◇` marker, on the
+    /// pane's first CONTENT column. Scanned from the drawn buffer, never computed.
+    fn drawn_injected_marker_cell(buffer: &ratatui::buffer::Buffer, preview: Rect) -> (u16, u16) {
+        drawn_cell(buffer, preview, "\u{25c7}").expect(
+            "the fixture's injected node must be drawn inside the preview pane, \
+             or these tests prove nothing",
+        )
+    }
+
+    /// The premise fold-before-link rests on, for the INJECTED node kind: its
+    /// header row carries no link region, in EITHER fold state and at every pane
+    /// width the node is readable at. The peer kind's twin is
+    /// `a_peer_node_header_carries_no_link_regions_at_any_width`; the arm's doc
+    /// comment names both, because each kind builds its header on its own path.
+    #[test]
+    fn an_injected_node_header_carries_no_link_regions_at_any_width() {
+        let dir = unique_temp_dir("injected-premise");
+        let mut app = App::new(
+            vec![injected_link_session(&dir)],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
+        for width in [80u16, 40, 24, 16] {
+            for open in [false, true] {
+                if open {
+                    app.toggle_peer_fold(INJECTED_KEY, width);
+                }
+                let (_row_prefix, _lines, links, folds) = app
+                    .preview_hit_context(width)
+                    .expect("the fixture session is selected, so it has a preview");
+                assert!(
+                    folds.iter().any(|f| f.key == INJECTED_KEY),
+                    "the injected node must render its fold region at width {width}, \
+                     or this width proves nothing"
+                );
+                for fold in folds {
+                    assert!(
+                        !links.iter().any(|l| l.content_row == fold.content_row),
+                        "an injected header row must carry no link at width {width} \
+                         (open={open}), or fold-before-link stops being free"
+                    );
+                }
+                if open {
+                    assert!(
+                        !links.is_empty(),
+                        "the open node's body must contribute links at width \
+                         {width}, or the disjointness above is vacuous"
+                    );
+                    app.toggle_peer_fold(INJECTED_KEY, width);
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A real click on an INJECTED node's header toggles THAT node — open, then
+    /// closed again — and is never taken for a link, while a link inside the open
+    /// body still is one.
+    ///
+    /// Driven END TO END through [`handle_mouse`]'s pane arm, like the peer
+    /// node's click tests: a resolver nothing routes to would pass every pure
+    /// assertion and still leave the node inert. Each click is preceded by the
+    /// pure seam's verdict for that cell — a fold key and NO url — so the arm can
+    /// only ever take its fold branch here and never reaches `resume::open_url`.
+    #[test]
+    fn a_click_on_an_injected_node_header_toggles_it_and_never_opens_a_link() {
+        let dir = unique_temp_dir("injected-click");
+        let mut app = App::new(
+            vec![injected_link_session(&dir)],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
+        let buffer = render_board(&mut app);
+        let width = preview_transcript_rect(&app).width;
+        let (col, row) = drawn_injected_marker_cell(&buffer, app.preview_rect);
+        assert!(
+            !on_splitter(col, row, app.list_rect, app.preview_rect),
+            "the probe must reach the PANE arm, not the seam-drag arm above it"
+        );
+
+        let collapsed = preview_string(&mut app, width);
+        assert!(
+            collapsed.contains(COLLAPSED_AFFORDANCE) && !collapsed.contains(INJECTED_BODY_PHRASE),
+            "an injected node starts CLOSED, or the expand assertion below is vacuous"
+        );
+        assert_eq!(
+            resolve_link_click(&mut app, col, row),
+            LinkClick::NoLink,
+            "a closed injected header must carry no link"
+        );
+        assert_eq!(
+            fold_under_pointer(&mut app, col, row).as_deref(),
+            Some(INJECTED_KEY),
+            "the header must be the injected node's own click target"
+        );
+
+        wheel(&mut app, MouseEventKind::Down(MouseButton::Left), col, row);
+        let expanded = preview_string(&mut app, width);
+        assert!(
+            expanded.contains(INJECTED_BODY_PHRASE) && expanded.contains(EXPANDED_AFFORDANCE),
+            "the click must open the injected node's body under a header offering \
+             to close it"
+        );
+
+        // Open, the header is still the node's alone — its body's link is not on it.
+        let buffer = render_board(&mut app);
+        assert_eq!(
+            drawn_injected_marker_cell(&buffer, app.preview_rect),
+            (col, row),
+            "opening a node must leave its header where it was clicked"
+        );
+        assert_eq!(
+            resolve_link_click(&mut app, col, row),
+            LinkClick::NoLink,
+            "an open injected header must carry no link either"
+        );
+        assert_eq!(
+            fold_under_pointer(&mut app, col, row).as_deref(),
+            Some(INJECTED_KEY),
+        );
+        let (link_col, link_row) = drawn_link_cell(&buffer, app.preview_rect);
+        assert_ne!(link_row, row, "the body's link is drawn below the header");
+        assert_eq!(
+            fold_under_pointer(&mut app, link_col, link_row),
+            None,
+            "the node's BODY is not its click target"
+        );
+        assert_eq!(
+            resolve_link_click(&mut app, link_col, link_row),
+            LinkClick::Opening(LINK_URL.to_string()),
+            "so a click on the body's link falls through to the link"
+        );
+
+        wheel(&mut app, MouseEventKind::Down(MouseButton::Left), col, row);
+        let reclosed = preview_string(&mut app, width);
+        assert!(
+            !reclosed.contains(INJECTED_BODY_PHRASE) && reclosed.contains(COLLAPSED_AFFORDANCE),
+            "the second click must CLOSE the node again"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Task VERIFY-4: Enter on a LIVE session enters the choice-overlay state

@@ -123,7 +123,7 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | mouse wheel | Scroll the pane under the pointer — except while a compose or draft box is open, when the session list stops taking notches: a wheel over it does **nothing**, so the session you are writing to can never slide out from under you. Everywhere else it is unchanged, and a notch anywhere but the list still scrolls the transcript |
 | drag the pane border | Resize the list and preview panes |
 | click a preview link | Open its url in your browser — `http`/`https` only. A link of any other scheme opens **nothing** and instead reports a refusal on the status line that names the link (`not opening <url> - only http/https links open`), so an underlined label that quietly does nothing never leaves you guessing which of the two happened. That refusal is **sticky** — it stays up until your next actionable keypress |
-| click a peer message | Unfold a subagent's hand-back where it sits — the one-line `◆ message from @…` node — and click it again to fold it back. A hand-back otherwise arrives as ~95 rows of `<agent-message>` frame attributed to **you**; folded it costs one line, and the report is still one click away. Which nodes you left open is remembered for this run only — snapback writes nothing for it |
+| click a folded node | Unfold it where it sits, and click it again to fold it back. Two kinds of turn arrive folded to one line: a subagent's hand-back — the `◆ message from @…` node, otherwise ~95 rows of `<agent-message>` frame attributed to **you** — and context Claude Code added on your behalf, such as the instructions a skill or slash command expands into — the `◇ added by claude code` node, otherwise often thousands of rows, also attributed to **you**. Folded each costs one line, and its text is still one click away. Which nodes you left open is remembered for this run only — snapback writes nothing for it |
 | `Backspace` | Delete the last query character |
 | `Alt+Backspace` (`⌥⌫`) / `Ctrl-W` / `Alt+H` | Delete the last query **word** — one whole search term, so a path or a branch name goes in a single press instead of character by character (`Backspace` alone still takes one character). All three keys do the same thing, because which of them your terminal actually sends depends on how it treats **Option**; they are also the same three the reply and draft boxes word-delete on, so the gesture is bound wherever you type. What a press *cuts* differs on purpose: on the board it takes a whole search term, so `feature/fold-fork-lineages` goes in one press, while in a reply or draft box the cut stops at punctuation and takes only `lineages` |
 | any printable char | Type to search |
@@ -221,10 +221,15 @@ you where it was said instead of leaving you to scroll for it. In content mode
 the preview also **scrolls itself onto the most recent match** as you type, as
 you move between rows, and the moment `Tab` widens the search, and `Shift-↑` /
 `Shift-↓` walk back and forth through the rest — so finding a hit costs no
-scrolling at all. Content search also reads the parts
-the preview folds away — an injected reminder, a slash command's output — so a hit
-occasionally lands somewhere the pane cannot show it; the board says so rather
-than leaving you looking at an unmarked pane.
+scrolling at all. Content search reads what was **said** in a session — what you
+typed and what came back — and not the instructions Claude Code added around it:
+a slash command is found by its name and the arguments you gave it (`/cr-review
+PR #157`), never by the skill text it expanded into, so a query that happens to
+share a skill's wording no longer matches every session that ran that skill. It
+does read some parts the preview folds away — an injected reminder, a slash
+command's output, a subagent's report — so a hit occasionally lands somewhere the
+pane cannot show it; the board says so rather than leaving you looking at an
+unmarked pane.
 
 The preview follows the newest turn of a session that is still being written —
 until you position the pane yourself. Scroll it, jump to a match, or press `Home`
@@ -514,8 +519,10 @@ session rendered as clean, scrollable markdown — the real conversation, whole,
 from its first turn to its last, however long it ran. So you
 can confirm it's the right session before jumping back in. Links are clickable.
 A message handed back by a subagent is folded to a single `◆ message from @…`
-line — it is that agent's report, not something you said, and it opens where it
-sits on a click.
+line — it is that agent's report, not something you said — and context Claude
+Code added on your behalf (the instructions a skill or slash command expands
+into, a command's caveat) to a single `◇ added by claude code` line; either opens
+where it sits on a click.
 
 ---
 

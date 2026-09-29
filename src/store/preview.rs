@@ -24,10 +24,18 @@
 //! record is one is decided STRUCTURALLY, from its record-level `origin` object,
 //! and NEVER by parsing the `<agent-message …>` text frame its body carries — that
 //! frame appears verbatim in quoted prose and tool payloads, so a text-level match
-//! would collapse legitimate content. See [`peer_origin`].
+//! would collapse legitimate content. See [`label::peer_origin`].
+//!
+//! A `type:"user"` record Claude Code INJECTED — a skill or command body, a
+//! caveat, anything it marks `isMeta` that is not a peer message
+//! ([`label::is_injected`]) — is not the user's turn either, and renders as a
+//! one-line node of its own (`◇ added by claude code · 08:05`), folded the same
+//! way and keyed by its record `uuid`. It is tried AFTER the peer gate, because
+//! every hand-back also carries `isMeta`. See [`injected_node_lines`].
 //!
 //! Ahead of the markdown pass, each message BODY runs through an allowlist-driven
-//! control-wrapper collapse ([`collapse_control_wrappers`]). Claude Code injects a
+//! control-wrapper collapse (`store::command::collapse_control_wrappers`, the
+//! parse shared with the content index and the label). Claude Code injects a
 //! fixed set of PAIRED pseudo-tags (`<command-name>`, `<system-reminder>`,
 //! `<local-command-stdout>`, `<local-command-caveat>`, `<task-notification>`,
 //! `<persisted-output>`, …) that
@@ -65,6 +73,8 @@ use time::{Date, OffsetDateTime};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use super::command::{self, collapse_control_wrappers, Segment};
+use super::label::{self, PeerOrigin};
 use super::Session;
 
 /// Floor on a GFM table column's rendered width in GRID mode — and, because a
@@ -169,8 +179,9 @@ pub struct LinkRegion {
 }
 
 /// A clickable fold toggle inside the rendered preview — the header line of a
-/// peer-message node (see [`peer_node_lines`]) — in the SAME content coordinates
-/// and under the SAME width discipline as [`LinkRegion`].
+/// peer-message node ([`peer_node_lines`]) or of an injected-context node
+/// ([`injected_node_lines`]) — in the SAME content coordinates and under the SAME
+/// width discipline as [`LinkRegion`].
 ///
 /// `content_row` indexes into the returned [`Text`]'s lines and addresses the
 /// node's HEADER, never the blank separator above it; `col_start..col_end` spans
@@ -179,9 +190,16 @@ pub struct LinkRegion {
 /// `width` exactly as a link's do, which is why both ride in the same
 /// [`RenderedPreview`] and are cached together.
 ///
-/// `key` is the node's fold key — `origin.from`, the sending agent's stem — NOT
-/// the record `uuid`, so a future delegation node resolves to the SAME key and
-/// the two anchors drive one node.
+/// `key` is the node's fold key, and each KIND of node draws it from its own
+/// source — the two share one open set, so their shapes must never collide:
+///
+/// - a PEER node's key is `origin.from`, the sending agent's stem — NOT the record
+///   `uuid`, so a future delegation node resolves to the SAME key and the two
+///   anchors drive one node;
+/// - an INJECTED node's key is its record `uuid` behind
+///   [`INJECTED_FOLD_KEY_PREFIX`] ([`injected_fold_key`]). The prefix is what
+///   keeps the kinds apart: a sender is a stem, an agent type name or a socket
+///   path, and none of those begins with it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FoldRegion {
     /// Line index into the rendered [`Text`] the node's header sits on.
@@ -197,10 +215,11 @@ pub struct FoldRegion {
 /// A block-relative region the running rebase in [`render_file_collect`] can
 /// shift onto the growing transcript.
 ///
-/// Implemented by BOTH [`LinkRegion`] and [`FoldRegion`] so the two are rebased
-/// by the ONE [`rebased`] function and the ONE offset. A second rebase — even a
-/// faithful copy — is exactly how a node's click target and the links inside its
-/// body would come to disagree about which row they sit on.
+/// Implemented by [`LinkRegion`], [`FoldRegion`] and [`UnindexedRows`] so all
+/// three are rebased by the ONE [`rebased`] function and the ONE offset. A second
+/// rebase — even a faithful copy — is exactly how a node's click target, the links
+/// inside its body and the rows search skips would come to disagree about which
+/// row they sit on.
 trait BlockRegion {
     /// The region's row index, for [`rebased`] to advance.
     fn content_row_mut(&mut self) -> &mut usize;
@@ -218,10 +237,34 @@ impl BlockRegion for FoldRegion {
     }
 }
 
+/// A run of rendered lines holding text the CONTENT INDEX never saw: the body of
+/// an OPEN injected-context node ([`injected_node_lines`]), in the same content
+/// coordinates as the other regions.
+///
+/// The index leaves injected records out (`store::parse`), so a query can never
+/// admit a session because of what one says. The preview still draws the body on
+/// a click, and marking a hit inside it would show the reader matches the filter
+/// did not count — so the pane's search marks skip these rows
+/// ([`RenderedPreview::is_indexed_line`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnindexedRows {
+    /// The run's first line.
+    pub content_row: usize,
+    /// How many lines the run spans.
+    pub len: usize,
+}
+
+impl BlockRegion for UnindexedRows {
+    fn content_row_mut(&mut self) -> &mut usize {
+        &mut self.content_row
+    }
+}
+
 /// A rendered transcript preview: the styled [`Text`] plus the clickable
-/// [`LinkRegion`]s and [`FoldRegion`]s discovered while building it. All three
-/// are produced from one pass at a fixed `width`, so a region's columns always
-/// match the text as drawn.
+/// [`LinkRegion`]s and [`FoldRegion`]s discovered while building it, and the
+/// [`UnindexedRows`] search must not mark. All of them are produced from one pass
+/// at a fixed `width`, so a region's rows and columns always match the text as
+/// drawn.
 #[derive(Debug, Default)]
 pub struct RenderedPreview {
     /// The styled, markdown-rendered transcript.
@@ -230,6 +273,21 @@ pub struct RenderedPreview {
     pub links: Vec<LinkRegion>,
     /// Clickable fold regions, in content coordinates (see [`FoldRegion`]).
     pub folds: Vec<FoldRegion>,
+    /// Runs of lines the content index never held (see [`UnindexedRows`]).
+    pub unindexed: Vec<UnindexedRows>,
+}
+
+impl RenderedPreview {
+    /// Whether rendered line `line` holds text the content index holds too — i.e.
+    /// whether a search mark may land on it. `false` only inside an
+    /// [`UnindexedRows`] run; every other line, chrome included, is fair game as
+    /// it always was.
+    pub fn is_indexed_line(&self, line: usize) -> bool {
+        !self
+            .unindexed
+            .iter()
+            .any(|run| (run.content_row..run.content_row + run.len).contains(&line))
+    }
 }
 
 /// Render a session's transcript for the preview pane, fitting GFM tables to
@@ -240,10 +298,11 @@ pub struct RenderedPreview {
 /// gates the noisy `agent-name` fallback so a free-form background-job title never
 /// renders as a bogus handle (see [`render_record`]).
 ///
-/// `expanded` is the set of peer-message fold keys (`origin.from`) currently open;
-/// a node whose key is absent renders COLLAPSED (see [`peer_node_lines`]). This
-/// function stays PURE: it TAKES the set, it never owns or mutates it — the fold
-/// state belongs to the app, and the renderer only reads it.
+/// `expanded` is the set of fold keys currently open — both kinds, see
+/// [`FoldRegion`]; a node whose key is absent renders COLLAPSED (see
+/// [`peer_node_lines`] and [`injected_node_lines`]). This function stays PURE: it
+/// TAKES the set, it never owns or mutates it — the fold state belongs to the
+/// app, and the renderer only reads it.
 pub fn render(
     session: &Session,
     width: usize,
@@ -321,8 +380,7 @@ fn render_file_collect(
         Err(_) => {
             return RenderedPreview {
                 text: Text::from(format!("No such session file:\n{}", path.display())),
-                links: Vec::new(),
-                folds: Vec::new(),
+                ..RenderedPreview::default()
             }
         }
     };
@@ -331,6 +389,7 @@ fn render_file_collect(
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut links: Vec<LinkRegion> = Vec::new();
     let mut folds: Vec<FoldRegion> = Vec::new();
+    let mut unindexed: Vec<UnindexedRows> = Vec::new();
     // Day of the previously ANNOTATED turn, threaded through the loop so a
     // per-message timestamp can switch to `MM-DD HH:MM` on a day rollover.
     let mut prev_day: Option<Date> = None;
@@ -355,7 +414,7 @@ fn render_file_collect(
         if !record.is_object() {
             continue;
         }
-        if let Some((block, block_links, block_folds)) = render_record(
+        if let Some((block, block_links, block_folds, block_unindexed)) = render_record(
             &record,
             &mut agent,
             known_agents,
@@ -363,11 +422,13 @@ fn render_file_collect(
             &mut prev_day,
             width,
         ) {
-            // ONE offset, ONE rebase, both kinds of region: a node's fold target
-            // and the links inside its body must never disagree about a row.
+            // ONE offset, ONE rebase, every kind of region: a node's fold target,
+            // the links inside its body and the rows search must skip must never
+            // disagree about a row.
             let offset = lines.len();
             links.extend(rebased(block_links, offset));
             folds.extend(rebased(block_folds, offset));
+            unindexed.extend(rebased(block_unindexed, offset));
             lines.extend(block);
         }
     }
@@ -376,6 +437,7 @@ fn render_file_collect(
         text: Text::from(lines),
         links,
         folds,
+        unindexed,
     }
 }
 
@@ -392,6 +454,16 @@ fn rebased<R: BlockRegion>(regions: Vec<R>, offset: usize) -> Vec<R> {
         .collect()
 }
 
+/// One record's rendered block: its lines plus its block-relative link, fold and
+/// unindexed regions, in that order — all four rebased together by
+/// [`render_file_collect`].
+type Block = (
+    Vec<Line<'static>>,
+    Vec<LinkRegion>,
+    Vec<FoldRegion>,
+    Vec<UnindexedRows>,
+);
+
 /// Render a single record into a transcript block, or `None` to omit it.
 ///
 /// `prev_day` carries the day of the previously ANNOTATED turn so the compact
@@ -405,12 +477,12 @@ fn rebased<R: BlockRegion>(regions: Vec<R>, offset: usize) -> Vec<R> {
 /// `known_agents` gates the `agent-name` fallback. State is threaded — never
 /// hoisted — so attribution is positional; see the module doc.
 ///
-/// `expanded` is the open peer-message fold keys; only the peer node reads it.
+/// `expanded` is the open fold keys; only the two fold nodes read it.
 ///
-/// Returns the block's lines, its block-relative [`LinkRegion`]s and its
-/// block-relative [`FoldRegion`]s. The fold vec holds at most one entry today
-/// (a record renders at most one node), but it is a vec so the caller rebases it
-/// through the SAME [`rebased`] the links go through.
+/// Returns the record's [`Block`]: its lines plus its block-relative
+/// [`LinkRegion`]s, [`FoldRegion`]s and [`UnindexedRows`]. The last two hold at
+/// most one entry today (a record renders at most one node), but they are vecs
+/// so the caller rebases them through the SAME [`rebased`] the links go through.
 ///
 /// [`effective`]: AgentState::effective
 fn render_record(
@@ -420,7 +492,7 @@ fn render_record(
     expanded: &HashSet<&str>,
     prev_day: &mut Option<Date>,
     width: usize,
-) -> Option<(Vec<Line<'static>>, Vec<LinkRegion>, Vec<FoldRegion>)> {
+) -> Option<Block> {
     match record.get("type").and_then(Value::as_str) {
         Some("summary") => {
             let s = record.get("summary").and_then(Value::as_str)?;
@@ -432,7 +504,7 @@ fn render_record(
                 record,
                 prev_day,
             )];
-            Some((lines, Vec::new(), Vec::new()))
+            Some((lines, Vec::new(), Vec::new(), Vec::new()))
         }
         Some("user") => {
             // A message from ANOTHER session collapses to a one-line node, and is
@@ -448,10 +520,12 @@ fn render_record(
             // one row, while the drop would lose the hand-back silently. No
             // record in the live store pairs the two today; the interaction is
             // written down here rather than relied on.
-            if let Some(origin) = peer_origin(record) {
+            if let Some(origin) = label::peer_origin(record) {
                 // `expanded` decides which shape this node renders in; it is READ
                 // here and owned by the app, never mutated by the renderer.
-                return Some(peer_node_lines(&origin, expanded, record, prev_day, width));
+                let (lines, links, folds) =
+                    peer_node_lines(&origin, expanded, record, prev_day, width);
+                return Some((lines, links, folds, Vec::new()));
             }
             if record
                 .get("isSidechain")
@@ -465,6 +539,19 @@ fn render_record(
             if text.is_empty() {
                 return None;
             }
+            // Context Claude Code injected — a skill body, a caveat — is not the
+            // user's turn, and folds to a one-line node instead of `▶ you`. ORDER
+            // IS LOAD-BEARING: this runs AFTER the peer gate above, because every
+            // hand-back carries `isMeta` too, and a hand-back reaching this branch
+            // would lose its sender label and its `origin.from` fold key. The
+            // shared check says the same thing (`label::is_injected` refuses a
+            // peer record); running it second keeps the preview from depending on
+            // that alone.
+            if label::is_injected(record) {
+                return Some(injected_node_lines(
+                    &text, expanded, record, prev_day, width,
+                ));
+            }
             let mut lines = vec![
                 Line::from(""),
                 marker_line_with_time(YOU_MARKER.to_string(), you_style(), None, record, prev_day),
@@ -474,7 +561,7 @@ fn render_record(
             let offset = lines.len();
             let (body, body_links) = collapse_body_lines_collect(&text, width);
             lines.extend(body);
-            Some((lines, rebased(body_links, offset), Vec::new()))
+            Some((lines, rebased(body_links, offset), Vec::new(), Vec::new()))
         }
         Some("assistant") => {
             let content = record.get("message").and_then(|m| m.get("content"))?;
@@ -494,7 +581,7 @@ fn render_record(
             ];
             let offset = lines.len();
             lines.extend(body);
-            Some((lines, rebased(body_links, offset), Vec::new()))
+            Some((lines, rebased(body_links, offset), Vec::new(), Vec::new()))
         }
         Some("agent-setting") => {
             // Positional state, not a rendered line: record the interactive BIND in
@@ -659,64 +746,11 @@ fn timestamp_annotation(ts: OffsetDateTime, prev_day: Option<Date>) -> String {
 // record-level `origin` object says who actually sent the record, and content
 // cannot write it. The `sess-frame-text-1` fixture is that case, and it must
 // keep rendering as an ordinary `▶ you` turn forever.
-
-/// The `origin.kind` value that marks a message from another session. One of
-/// THREE kinds observed in the live store — the other two (`human`, the user's
-/// own typed turns, and `task-notification`) are bare `{"kind":…}` objects
-/// carrying neither `from` nor `body`. Named because it is an undocumented wire
-/// token, exactly like `agents::KIND_*`.
-const ORIGIN_KIND_PEER: &str = "peer";
-
-/// A qualifying peer message, borrowed out of the record: the two structural
-/// facts the node renders from. Produced ONLY by [`peer_origin`], so the gate
-/// cannot be bypassed by constructing one elsewhere.
-struct PeerOrigin<'a> {
-    /// `origin.from` — the sending agent's stem (`a03505fe4b1c2d3e0`), or some
-    /// other sender identity entirely (an agent TYPE name, a unix socket path).
-    ///
-    /// OPTIONAL by design: the gate does not require it, so a body-bearing peer
-    /// record with no `from` still renders — under the generic label rather than
-    /// being dropped. See [`peer_label`].
-    from: Option<&'a str>,
-    /// `origin.body` — the message text, GUARANTEED non-empty by the gate.
-    body: &'a str,
-}
-
-/// The gate: does this record render as a peer-message node? `Some` only when ALL
-/// THREE of these hold, read FAIL-SOFT off `serde_json::Value` throughout (a
-/// malformed or absent `origin` is simply not a peer message — never a panic):
-///
-/// 1. `type == "user"`
-/// 2. `origin.kind == "peer"`
-/// 3. `origin.body` is a NON-EMPTY string
-///
-/// Requiring `body` is LOAD-BEARING, not defensive. Measured across the live
-/// store: 227 `peer`, 221 `human` and 278 `task-notification` origins exist, and
-/// only `peer` ever carries `from`/`body` (136 of them a non-empty one). So a
-/// looser gate of "has an `origin`" would collapse ~221 ordinary human turns and
-/// ~278 task notifications into peer nodes — hiding the user's OWN prompts. That
-/// is the same class of regression the never-parse-the-frame rule above exists to
-/// prevent, arriving through the structural path instead.
-///
-/// PURE — see the unit tests.
-fn peer_origin(record: &Value) -> Option<PeerOrigin<'_>> {
-    // The record type is spelled literally here, as in `render_record`'s match.
-    if record.get("type").and_then(Value::as_str) != Some("user") {
-        return None;
-    }
-    let origin = record.get("origin")?;
-    if origin.get("kind").and_then(Value::as_str) != Some(ORIGIN_KIND_PEER) {
-        return None;
-    }
-    let body = origin
-        .get("body")
-        .and_then(Value::as_str)
-        .filter(|b| !b.is_empty())?;
-    Some(PeerOrigin {
-        from: origin.get("from").and_then(Value::as_str),
-        body,
-    })
-}
+//
+// The gate itself — `label::peer_origin` — lives in `store::label`, beside the
+// `isMeta` read it has to agree with: every hand-back carries `isMeta` too, and
+// the injected-context check (`label::is_injected`) refuses a peer record by
+// asking this very gate.
 
 /// The fixed harness boilerplate that introduces a subagent hand-back ends with
 /// this sentence, so everything up to and including it is preamble rather than
@@ -799,9 +833,9 @@ const PEER_STEM_LEN: usize = 17;
 /// real line this would otherwise draw, not a hypothetical one.
 ///
 /// The branch is on the SENDER'S SHAPE, never on `origin.kind`: under the
-/// body-requiring gate in [`peer_origin`] no `kind:"human"` record can reach here
-/// at all (0 of ~221 carry `from` or `body`), so keying the label on the kind
-/// would put the decision on a discriminator that never varies.
+/// body-requiring gate in [`label::peer_origin`] no `kind:"human"` record can
+/// reach here at all (0 of ~221 carry `from` or `body`), so keying the label on
+/// the kind would put the decision on a discriminator that never varies.
 /// PURE — see the unit test.
 fn peer_label(from: &str) -> String {
     if is_agent_stem(from) {
@@ -826,27 +860,30 @@ const PEER_EXPAND_AFFORDANCE: &str = "(click to expand)";
 /// the line says so rather than leaving the second click undiscoverable.
 const PEER_COLLAPSE_AFFORDANCE: &str = "(click to collapse)";
 
-/// How a peer node renders: whether its body shows, and whether a click can
-/// change that. Three states rather than a bool, because the third one is real —
-/// see [`PeerFold::Unfoldable`].
+/// How a fold node — a peer message or an injected-context node — renders:
+/// whether its body shows, and whether a click can change that. Three states
+/// rather than a bool, because the third one is real — see
+/// [`PeerFold::Unfoldable`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PeerFold {
     /// Foldable and closed: header only, offering to expand.
     Collapsed,
     /// Foldable and open: header plus body, offering to collapse.
     Expanded,
-    /// NOT foldable: the record carries no `origin.from`, so the node has no fold
-    /// key and nothing can toggle it. It therefore renders OPEN, with no
-    /// affordance text and no [`FoldRegion`].
+    /// NOT foldable: the node has no fold key — a peer record with no
+    /// `origin.from`, an injected record with no `uuid` — so nothing can toggle
+    /// it. It therefore renders OPEN, with no affordance text and no
+    /// [`FoldRegion`].
     ///
     /// The alternative — treat a keyless node as collapsed — would draw a closed
     /// node with no clickable region, putting its body permanently out of reach.
     /// That is a UI DATA-LOSS bug, and one cheap branch is the right price to
-    /// avoid it. The gate in [`peer_origin`] is exactly `type:"user"` +
+    /// avoid it. The gate in [`label::peer_origin`] is exactly `type:"user"` +
     /// `origin.kind:"peer"` + a non-empty `origin.body` and deliberately does NOT
     /// require `from`; widening it to require `from` would drop such a record's
-    /// body instead of showing it, which is the same loss by another route.
-    /// No record in the store takes this branch today.
+    /// body instead of showing it, which is the same loss by another route. The
+    /// injected node takes the same branch rather than requiring a `uuid`, for the
+    /// same reason. No record in the store takes this branch today.
     Unfoldable,
 }
 
@@ -867,8 +904,8 @@ impl PeerFold {
     }
 }
 
-/// Which shape a peer node renders in, from its sender and the set of open fold
-/// keys. PURE — see the unit test.
+/// Which shape a fold node renders in, from its fold key (`None` when it has
+/// none) and the set of open fold keys. PURE — see the unit test.
 fn peer_fold(from: Option<&str>, expanded: &HashSet<&str>) -> PeerFold {
     match from {
         None => PeerFold::Unfoldable,
@@ -877,10 +914,15 @@ fn peer_fold(from: Option<&str>, expanded: &HashSet<&str>) -> PeerFold {
     }
 }
 
-/// Where the node's header sits INSIDE its own block: `[blank, header, body…]`,
-/// the same shape every other turn renders, so index 1 is the header and index 0
-/// is the blank separator above it. Named because the off-by-one is silent — a
-/// [`FoldRegion`] pointing at the blank would make every click miss by one row.
+/// Where a fold node's header sits INSIDE its own block: `[blank, header,
+/// body…]`, the same shape every other turn renders, so index 1 is the header and
+/// index 0 is the blank separator above it. Named because the off-by-one is
+/// silent — a [`FoldRegion`] pointing at the blank would make every click miss by
+/// one row.
+///
+/// BOTH node kinds put their header here, and nothing ever renders ABOVE it:
+/// opening a node only appends body lines BELOW the header, which is what lets
+/// `tui::app`'s `fold_scroll_delta` hold a clicked node on its screen row.
 const PEER_HEADER_BLOCK_ROW: usize = 1;
 
 /// Render a peer message as a fold node: a blank separator, the one-line header,
@@ -903,13 +945,13 @@ fn peer_node_lines(
     prev_day: &mut Option<Date>,
     width: usize,
 ) -> (Vec<Line<'static>>, Vec<LinkRegion>, Vec<FoldRegion>) {
-    let fold = peer_fold(origin.from, expanded);
-    let header = peer_header_line(origin.from.unwrap_or_default(), fold, record, prev_day);
+    let fold = peer_fold(origin.from(), expanded);
+    let header = peer_header_line(origin.from().unwrap_or_default(), fold, record, prev_day);
     // The whole header line is the click target, so a reader need not hit the
     // affordance text exactly. `from` is `None` for precisely the `Unfoldable`
     // case, so a keyless node gets NO region — see `PeerFold::Unfoldable`.
     let folds: Vec<FoldRegion> = origin
-        .from
+        .from()
         .map(|key| FoldRegion {
             content_row: PEER_HEADER_BLOCK_ROW,
             col_start: 0,
@@ -926,7 +968,7 @@ fn peer_node_lines(
     // Body links are relative to the body; rebase them past the blank + header
     // lines that lead the node, exactly as a `▶ you` turn rebases its own.
     let offset = lines.len();
-    let body = dedent_uniformly(strip_handback_preamble(origin.body));
+    let body = dedent_uniformly(strip_handback_preamble(origin.body()));
     let (body_lines, body_links) = collapse_body_lines_collect(&body, width);
     lines.extend(body_lines);
     (lines, rebased(body_links, offset), folds)
@@ -962,6 +1004,114 @@ fn peer_header_line(
         line.spans.push(annotation_span(affordance));
     }
     line
+}
+
+// --- injected-context node ------------------------------------------------------
+//
+// Claude Code writes context into the session on the user's behalf as ordinary
+// `type:"user"` records marked `isMeta`: the expanded body of a skill or prompt
+// command (thousands of rows each, and every `/cr-review` carries the same one),
+// a local command's caveat, a "continue from where you left off" notice. Drawn as
+// a `▶ you` turn that is a MISLABEL — nobody typed it — and, for a skill body, a
+// wall of instructions between the command the user did type and claude's reply.
+// This section folds such a record to a ONE-LINE node, reusing the peer node's
+// fold machinery (`PeerFold`, the header row, the affordances, one open set).
+//
+// Membership is `label::is_injected` — the SAME check the content index and the
+// label pick use, so the three cannot disagree about which records are
+// instructions — and it is decided from the record-level `isMeta` alone, never
+// from the text (a skill body opens with whatever its author wrote).
+
+/// The injected node's marker (glyph + label). The glyph (`◇`, U+25C7) is the
+/// HOLLOW sibling of the peer node's `◆`: both are records nobody in this session
+/// typed, and the outline says this one is not even a message — it is context
+/// Claude Code added.
+const INJECTED_MARKER: &str = "\u{25c7} added by claude code";
+
+/// The prefix an injected node's record `uuid` carries as a fold key, so the one
+/// open set can hold both kinds of key without either ever standing for the
+/// other (see [`FoldRegion`]).
+const INJECTED_FOLD_KEY_PREFIX: &str = "injected:";
+
+/// The fold key of an injected record: its `uuid` behind
+/// [`INJECTED_FOLD_KEY_PREFIX`], or `None` when it carries no string `uuid` —
+/// which renders the node [`PeerFold::Unfoldable`], i.e. OPEN.
+///
+/// Keyed on the `uuid` and on nothing else. The undocumented fields beside it
+/// (`turnCompanion`, `sourceToolUseID`) are not on every body. A fork copies its
+/// records uuid-for-uuid, so opening a node in one fork opens it in the others —
+/// harmless, since the copies are the same text. PURE.
+fn injected_fold_key(record: &Value) -> Option<String> {
+    record
+        .get("uuid")
+        .and_then(Value::as_str)
+        .map(|uuid| format!("{INJECTED_FOLD_KEY_PREFIX}{uuid}"))
+}
+
+/// `◇ added by claude code` node head: Magenta like the peer node's — the family
+/// of "not this session's own turn" — but NOT bold, so the harness's own context
+/// reads quieter than a message another agent sent. A NAMED ANSI color, so it
+/// adapts to the terminal theme.
+fn injected_style() -> Style {
+    Style::default().fg(Color::Magenta)
+}
+
+/// Render an injected record as a fold node: a blank separator, the one-line
+/// header (`◇ added by claude code · 08:05 · (click to expand)`), and — unless the
+/// node is collapsed — its `text` beneath it, through the SAME
+/// [`collapse_body_lines_collect`] pass every other body takes.
+///
+/// The shape is the peer node's exactly: header on [`PEER_HEADER_BLOCK_ROW`], the
+/// whole header line one [`FoldRegion`], none for an [`Unfoldable`] node, and the
+/// three [`PeerFold`] states with their affordances.
+///
+/// An open node's body is ALSO returned as one [`UnindexedRows`] run: the content
+/// index leaves injected records out, so the pane's search marks must too.
+///
+/// PURE: `expanded` is read, never written.
+///
+/// [`Unfoldable`]: PeerFold::Unfoldable
+fn injected_node_lines(
+    text: &str,
+    expanded: &HashSet<&str>,
+    record: &Value,
+    prev_day: &mut Option<Date>,
+    width: usize,
+) -> Block {
+    let key = injected_fold_key(record);
+    let fold = peer_fold(key.as_deref(), expanded);
+    let mut header = marker_line_with_time(
+        INJECTED_MARKER.to_string(),
+        injected_style(),
+        None,
+        record,
+        prev_day,
+    );
+    if let Some(affordance) = fold.affordance() {
+        header.spans.push(annotation_span(affordance));
+    }
+    let folds: Vec<FoldRegion> = key
+        .map(|key| FoldRegion {
+            content_row: PEER_HEADER_BLOCK_ROW,
+            col_start: 0,
+            col_end: line_display_width(&header),
+            key,
+        })
+        .into_iter()
+        .collect();
+
+    let mut lines = vec![Line::from(""), header];
+    if !fold.shows_body() {
+        return (lines, Vec::new(), folds, Vec::new());
+    }
+    let offset = lines.len();
+    let (body_lines, body_links) = collapse_body_lines_collect(text, width);
+    let unindexed = vec![UnindexedRows {
+        content_row: offset,
+        len: body_lines.len(),
+    }];
+    lines.extend(body_lines);
+    (lines, rebased(body_links, offset), folds, unindexed)
 }
 
 /// User `message.content` -> readable text (string, or text blocks joined with
@@ -1125,198 +1275,13 @@ fn marker_line(text: String) -> Line<'static> {
 // KNOWN wrappers to the existing dim-marker convention; everything else is left
 // literal.
 //
-// SAFETY — allowlist only. Two classes of angle-bracket tokens live in real data
-// and only PAIRED control wrappers may be touched. Open-only template placeholders
-// (`<session-id>`, `<skill-dir>`), generics/JSX (`<String>`, `<br>`, `<T>`), and
-// comparisons (`x < y > z`) are legitimate content — collapsing them would be a
-// data-loss bug. So a token is acted on ONLY when its name is in
-// `CONTROL_WRAPPERS` AND it has a matching close tag; a known opener with no close
-// FAILS SOFT to literal (never eats trailing content, never panics). Wrappers can
-// span lines and nest different-named tags as payload (e.g. `<task-notification>`
-// holds `<task-id>`/`<output-file>`), so the pass walks the WHOLE body string.
-
-/// The ONLY paired pseudo-tag names the collapse acts on. One exact allowlist so
-/// the pass can never touch a legitimate angle-bracket token (an open-only
-/// placeholder, a generic, or a `<`/`>` comparison in prose).
-const CONTROL_WRAPPERS: &[&str] = &[
-    "command-name",
-    "command-message",
-    "command-args",
-    "local-command-stdout",
-    "local-command-stderr",
-    "local-command-caveat",
-    "system-reminder",
-    "task-notification",
-    "persisted-output",
-];
+// The PARSE lives in `store::command` (allowlist, segments, the `/name args`
+// normalisation), shared with the content index and the row label so the three
+// read a command identically; this section only DRAWS its segments.
 
 /// Glyph for a collapsed slash-command turn (`▷`, U+25B7) — deliberately DISTINCT
 /// from the `▶` (U+25B6) `you` turn marker so a command reads as its own thing.
 const COMMAND_GLYPH: &str = "\u{25b7}";
-
-/// Marker for a collapsed `local-command-stdout` / `local-command-stderr` wrapper.
-/// The payload can be huge, so only its presence is surfaced (never inlined).
-const MARKER_COMMAND_OUTPUT: &str = "[command output]";
-/// Marker for a collapsed `local-command-caveat` wrapper. The caveat Claude Code
-/// injects alongside `local-command-stdout` is semantically DISTINCT from the
-/// command's output, so it gets its own label rather than folding into it.
-const MARKER_COMMAND_CAVEAT: &str = "[command caveat]";
-/// Marker for a collapsed `system-reminder` wrapper — stubbed, so an injected
-/// reminder stays discoverable rather than hidden or dumped raw.
-const MARKER_SYSTEM_REMINDER: &str = "[system-reminder]";
-/// Marker for a collapsed `task-notification` wrapper (nested `task-id` /
-/// `output-file` are consumed as payload, never shown).
-const MARKER_TASK_NOTIFICATION: &str = "[task-notification]";
-/// Marker for a collapsed `persisted-output` wrapper.
-const MARKER_PERSISTED_OUTPUT: &str = "[persisted-output]";
-
-/// A collapsed message body as an ordered sequence of literal prose and collapsed
-/// control wrappers. Literal segments are routed through the markdown pass;
-/// collapsed segments become a single marker/command line.
-#[derive(Debug, PartialEq)]
-enum Segment {
-    /// Prose to render through [`markdown_body_lines`] unchanged.
-    Literal(String),
-    /// A collapsed slash-command turn -> `▷ /name args` (args omitted when empty).
-    Command { name: Option<String>, args: String },
-    /// A collapsed wrapper rendered as a fixed dim marker label.
-    Marker(&'static str),
-}
-
-/// How an allowlisted wrapper renders. Command-turn tags carry their payload so
-/// the trio (`command-name` + optional `command-args`; `command-message` is a mere
-/// echo) can merge into one command line; every other wrapper maps to a fixed
-/// marker label.
-enum WrapperKind {
-    CommandName,
-    CommandArgs,
-    CommandMessage,
-    Marker(&'static str),
-}
-
-/// Map an allowlisted wrapper name to its render kind — the single source that
-/// ties [`CONTROL_WRAPPERS`] to behavior. `None` means "not a control wrapper".
-fn wrapper_kind(name: &str) -> Option<WrapperKind> {
-    Some(match name {
-        "command-name" => WrapperKind::CommandName,
-        "command-args" => WrapperKind::CommandArgs,
-        "command-message" => WrapperKind::CommandMessage,
-        "local-command-stdout" | "local-command-stderr" => {
-            WrapperKind::Marker(MARKER_COMMAND_OUTPUT)
-        }
-        "local-command-caveat" => WrapperKind::Marker(MARKER_COMMAND_CAVEAT),
-        "system-reminder" => WrapperKind::Marker(MARKER_SYSTEM_REMINDER),
-        "task-notification" => WrapperKind::Marker(MARKER_TASK_NOTIFICATION),
-        "persisted-output" => WrapperKind::Marker(MARKER_PERSISTED_OUTPUT),
-        _ => return None,
-    })
-}
-
-/// If `rest` opens with a known control-wrapper tag `<name>` (name in
-/// [`CONTROL_WRAPPERS`], immediately closed by `>` with no attributes), return the
-/// allowlist `name` and the opener's byte length. A closing tag, an unlisted name,
-/// or an attribute-bearing tag is not a control opener. Tag names are ASCII, so
-/// the returned length always lands on a UTF-8 char boundary.
-fn match_control_opener(rest: &str) -> Option<(&'static str, usize)> {
-    let after_lt = rest.strip_prefix('<')?;
-    CONTROL_WRAPPERS.iter().find_map(|&name| {
-        after_lt
-            .strip_prefix(name)
-            .and_then(|tail| tail.strip_prefix('>'))
-            .map(|_| (name, '<'.len_utf8() + name.len() + '>'.len_utf8()))
-    })
-}
-
-/// Pure pre-pass: split `body` into literal and collapsed [`Segment`]s over the
-/// [`CONTROL_WRAPPERS`] allowlist. Operates on the WHOLE body (wrappers span lines
-/// and nest different-named tags as payload). FAIL-SOFT: a known opener with no
-/// matching close is left literal (trailing content preserved, never panics); an
-/// unlisted `<…>` token is left literal byte-for-byte. A body with no wrapper
-/// yields exactly `[Literal(body)]`, so ordinary prose is untouched.
-fn collapse_control_wrappers(body: &str) -> Vec<Segment> {
-    let mut segments: Vec<Segment> = Vec::new();
-    let mut literal = String::new();
-    let mut i = 0;
-    while i < body.len() {
-        let rest = &body[i..];
-        if let Some(consumed) = try_collapse_at(rest, &mut segments, &mut literal) {
-            i += consumed;
-            continue;
-        }
-        // Ordinary character (includes an unmatched `<` or an unlisted tag's `<`).
-        let ch = rest.chars().next().expect("non-empty remainder has a char");
-        literal.push(ch);
-        i += ch.len_utf8();
-    }
-    flush_literal_segment(&mut literal, &mut segments);
-    segments
-}
-
-/// Try to collapse a control wrapper at the START of `rest`. On a full match
-/// (known opener + matching close) mutate `segments`/`literal` and return the byte
-/// length consumed; return `None` otherwise (the caller then takes one literal
-/// char), which also covers the FAIL-SOFT unclosed-opener case.
-fn try_collapse_at(rest: &str, segments: &mut Vec<Segment>, literal: &mut String) -> Option<usize> {
-    let (name, open_len) = match_control_opener(rest)?;
-    let kind = wrapper_kind(name)?;
-    let close = format!("</{name}>");
-    let rel = rest[open_len..].find(&close)?;
-    let payload = &rest[open_len..open_len + rel];
-    match kind {
-        WrapperKind::Marker(label) => {
-            flush_literal_segment(literal, segments);
-            segments.push(Segment::Marker(label));
-        }
-        WrapperKind::CommandName => add_command_field(segments, literal, Some(payload), None),
-        WrapperKind::CommandArgs => add_command_field(segments, literal, None, Some(payload)),
-        // A `command-message` is a mere echo: drop its payload but keep the command
-        // group open so an adjacent name/args tag still merges into one line.
-        WrapperKind::CommandMessage => add_command_field(segments, literal, None, None),
-    }
-    Some(open_len + rel + close.len())
-}
-
-/// Flush accumulated literal text as a `Segment::Literal` (an empty run is dropped).
-fn flush_literal_segment(literal: &mut String, segments: &mut Vec<Segment>) {
-    if !literal.is_empty() {
-        segments.push(Segment::Literal(std::mem::take(literal)));
-    }
-}
-
-/// Merge one slash-command tag into the current command group. The trio is
-/// contiguous in real data but separated only by whitespace, so a blank pending
-/// literal is absorbed and the field extends the trailing `Segment::Command`; any
-/// non-blank literal (real prose) finalizes the run and starts a fresh group.
-fn add_command_field(
-    segments: &mut Vec<Segment>,
-    literal: &mut String,
-    name: Option<&str>,
-    args: Option<&str>,
-) {
-    if literal.trim().is_empty() {
-        literal.clear(); // absorb inter-tag / leading whitespace
-    } else {
-        flush_literal_segment(literal, segments);
-    }
-    if !matches!(segments.last(), Some(Segment::Command { .. })) {
-        segments.push(Segment::Command {
-            name: None,
-            args: String::new(),
-        });
-    }
-    if let Some(Segment::Command {
-        name: cur_name,
-        args: cur_args,
-    }) = segments.last_mut()
-    {
-        if let Some(n) = name {
-            *cur_name = Some(n.to_string());
-        }
-        if let Some(a) = args {
-            *cur_args = a.to_string();
-        }
-    }
-}
 
 /// Text-only view over [`collapse_body_lines_collect`] (link regions discarded),
 /// used by the transcript-shape tests. Runtime code calls the `_collect` variant
@@ -1339,7 +1304,7 @@ fn collapse_body_lines_collect(body: &str, width: usize) -> (Vec<Line<'static>>,
                 links.extend(rebased(seg_links, lines.len()));
                 lines.extend(seg_lines);
             }
-            Segment::Marker(label) => lines.push(marker_line(label.to_string())),
+            Segment::Marker { label, .. } => lines.push(marker_line(label.to_string())),
             Segment::Command { name, args } => {
                 if let Some(line) = command_line(name.as_deref(), &args) {
                     lines.push(line);
@@ -1350,22 +1315,14 @@ fn collapse_body_lines_collect(body: &str, width: usize) -> (Vec<Line<'static>>,
     (lines, links)
 }
 
-/// Render a collapsed slash-command turn as a single `▷ /name args` DIM marker.
-/// The name is normalized (any leading slashes stripped, then exactly one
-/// rendered) and the args are omitted when empty. A group with no usable name (a
-/// bare `command-message` echo) renders nothing.
+/// Render a collapsed slash-command turn as a single `▷ /name args` DIM marker —
+/// the shared [`command::command_text`] behind [`COMMAND_GLYPH`], so the line
+/// reads exactly what the content index and the row label hold for the same
+/// command. A group with no usable name (a bare `command-message` echo) renders
+/// nothing.
 fn command_line(name: Option<&str>, args: &str) -> Option<Line<'static>> {
-    let name = name?.trim().trim_start_matches('/');
-    if name.is_empty() {
-        return None;
-    }
-    let args = args.trim();
-    let text = if args.is_empty() {
-        format!("{COMMAND_GLYPH} /{name}")
-    } else {
-        format!("{COMMAND_GLYPH} /{name} {args}")
-    };
-    Some(marker_line(text))
+    let text = command::command_text(name, args)?;
+    Some(marker_line(format!("{COMMAND_GLYPH} {text}")))
 }
 
 // --- minimal markdown pass ----------------------------------------------------
@@ -2792,6 +2749,11 @@ fn flush_plain(plain: &mut String, spans: &mut Vec<Span<'static>>, base: Style) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::command::{
+        MARKER_COMMAND_CAVEAT, MARKER_COMMAND_OUTPUT, MARKER_SYSTEM_REMINDER,
+        MARKER_TASK_NOTIFICATION,
+    };
+    use crate::store::label::peer_origin;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2926,56 +2888,6 @@ mod tests {
             "origin": origin,
             "message": {"content": "Another Claude session sent a message:\n<agent-message from=\"x\">\nbody\n</agent-message>"}
         })
-    }
-
-    /// The gate is all THREE conditions — `type:"user"`, `origin.kind:"peer"`,
-    /// and a NON-EMPTY string `origin.body` — and every other shape falls
-    /// through to today's rendering. The body requirement is the load-bearing
-    /// one: the live store's `human` and `task-notification` origins are bare
-    /// `{"kind":…}` objects, so a gate of "has an origin" would swallow the
-    /// user's own prompts. Malformed origins fail soft to `None`, never a panic.
-    #[test]
-    fn peer_origin_gate_requires_type_kind_and_a_non_empty_body() {
-        let good = peer_record(serde_json::json!({
-            "kind": "peer", "from": PEER_STEM, "body": "hello"
-        }));
-        let origin = peer_origin(&good).expect("a peer record with a body qualifies");
-        assert_eq!(origin.from, Some(PEER_STEM));
-        assert_eq!(origin.body, "hello");
-
-        // The two bare kinds that dominate the store: no body, no node.
-        for kind in ["human", "task-notification"] {
-            let bare = peer_record(serde_json::json!({ "kind": kind }));
-            assert!(
-                peer_origin(&bare).is_none(),
-                "a bare `{kind}` origin must not collapse"
-            );
-        }
-        // Same kind, but the body is missing / empty / not a string.
-        for body in [
-            serde_json::json!(null),
-            serde_json::json!(""),
-            serde_json::json!(42),
-        ] {
-            let record = peer_record(serde_json::json!({
-                "kind": "peer", "from": PEER_STEM, "body": body
-            }));
-            assert!(
-                peer_origin(&record).is_none(),
-                "a peer origin with body {body} must not collapse"
-            );
-        }
-        // Wrong record type, wrong kind, absent / non-object origin: all fail soft.
-        let mut assistant = peer_record(serde_json::json!({
-            "kind": "peer", "from": PEER_STEM, "body": "hello"
-        }));
-        assistant["type"] = serde_json::json!("assistant");
-        assert!(
-            peer_origin(&assistant).is_none(),
-            "only user records collapse"
-        );
-        assert!(peer_origin(&peer_record(serde_json::json!("peer"))).is_none());
-        assert!(peer_origin(&serde_json::json!({"type": "user"})).is_none());
     }
 
     /// The harness preamble is dropped up to and including its closing sentence
@@ -3419,6 +3331,251 @@ mod tests {
             PeerFold::Expanded.affordance(),
             Some(PEER_COLLAPSE_AFFORDANCE)
         );
+    }
+
+    // --- injected-context node ------------------------------------------------
+
+    /// The command-started fixture: an `isMeta` caveat, a local `/model` with its
+    /// output, then `/review-branch` and its `isMeta` skill body.
+    const COMMAND_FIXTURE: (&str, &str) = ("-Users-me-project-zeta", "sess-command-prompt-1.jsonl");
+    /// The skill body's fold key: its record `uuid` behind the injected prefix.
+    const SKILL_BODY_KEY: &str = "injected:zeta-5";
+    /// A word ONLY the skill body says, so its presence on a line proves the
+    /// body rendered there.
+    const SKILL_BODY_WORD: &str = "zetaskillonly";
+
+    fn command_fixture() -> PathBuf {
+        let (folder, file) = COMMAND_FIXTURE;
+        fixture(folder, file)
+    }
+
+    /// Every line led by the injected marker, flattened.
+    fn injected_headers(text: &Text) -> Vec<String> {
+        text.lines
+            .iter()
+            .filter(|l| {
+                l.spans
+                    .first()
+                    .is_some_and(|s| s.content.starts_with(INJECTED_MARKER))
+            })
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    /// The whole point: a skill body — and a caveat — renders as ONE node line
+    /// that says Claude Code added it, instead of a `▶ you` turn dumping the
+    /// instructions. The command the user DID type still reads `▷ /name args`.
+    #[test]
+    fn injected_context_folds_to_one_node_line_instead_of_a_you_turn() {
+        let text = render_file(&command_fixture(), WIDE);
+        let plain = flatten(&text);
+
+        assert_eq!(
+            injected_headers(&text),
+            vec![
+                // The caveat opens the file, so its time carries the date.
+                format!("{INJECTED_MARKER} \u{b7} 09-25 08:00 \u{b7} {PEER_EXPAND_AFFORDANCE}"),
+                format!("{INJECTED_MARKER} \u{b7} 08:05 \u{b7} {PEER_EXPAND_AFFORDANCE}"),
+            ],
+            "one collapsed node per injected record, carrying WHEN and the click:\n{plain}"
+        );
+        assert!(
+            !plain.contains(SKILL_BODY_WORD) && !plain.contains("Your task is"),
+            "a collapsed node must not render its body:\n{plain}"
+        );
+        assert!(
+            plain.contains("\u{25b7} /review-branch PR #42 in a separate worktree"),
+            "the command the user typed still renders as a command line:\n{plain}"
+        );
+        assert_eq!(
+            plain.matches(YOU_MARKER).count(),
+            3,
+            "only the three records the user's commands wrote stay `you` turns — the \
+             caveat and the skill body are not the user's:\n{plain}"
+        );
+        assert!(!plain.contains('\u{1b}'), "the node must not embed ANSI");
+    }
+
+    /// The fold key is the record `uuid` behind the prefix, and it decides the
+    /// shape END TO END: with the key open the body renders — and is reported as
+    /// the one run search must not mark — beneath a header offering to collapse.
+    #[test]
+    fn opening_an_injected_node_renders_its_body_as_an_unindexed_run() {
+        let closed = render_file_expanded(&command_fixture(), WIDE, &[]);
+        assert!(
+            closed.unindexed.is_empty(),
+            "a collapsed node draws no body, so there is nothing to skip"
+        );
+
+        let open = render_file_expanded(&command_fixture(), WIDE, &[SKILL_BODY_KEY]);
+        let plain = flatten(&open.text);
+        assert!(
+            plain.contains(SKILL_BODY_WORD),
+            "an open node renders its body:\n{plain}"
+        );
+        assert!(
+            injected_headers(&open.text)
+                .iter()
+                .any(|h| h.ends_with(PEER_COLLAPSE_AFFORDANCE)),
+            "an open node offers to collapse:\n{plain}"
+        );
+        assert_eq!(open.unindexed.len(), 1, "one open node, one unindexed run");
+
+        // The run covers EXACTLY the body: every line saying the skill's words is
+        // inside it, and the header above it is not.
+        let region = open
+            .folds
+            .iter()
+            .find(|f| f.key == SKILL_BODY_KEY)
+            .expect("the open node is still clickable");
+        let run = &open.unindexed[0];
+        assert_eq!(
+            run.content_row,
+            region.content_row + 1,
+            "the run starts right under the header"
+        );
+        assert!(
+            open.is_indexed_line(region.content_row),
+            "the header is not skipped"
+        );
+        for (i, line) in open.text.lines.iter().enumerate() {
+            let said = line
+                .spans
+                .iter()
+                .any(|s| s.content.contains(SKILL_BODY_WORD));
+            if said {
+                assert!(!open.is_indexed_line(i), "body line {i} must be unindexed");
+            }
+        }
+        assert!(
+            open.is_indexed_line(run.content_row + run.len),
+            "the claude turn after the body is searchable again"
+        );
+    }
+
+    /// The node's [`FoldRegion`] addresses its HEADER on row 1 of its block —
+    /// the row `fold_scroll_delta` anchors on — not the blank above it.
+    #[test]
+    fn an_injected_nodes_fold_region_lands_on_its_header_row() {
+        let rendered = render_file_expanded(&command_fixture(), WIDE, &[]);
+        let region = rendered
+            .folds
+            .iter()
+            .find(|f| f.key == SKILL_BODY_KEY)
+            .expect("the skill body yields a fold region keyed by its uuid");
+        let row_text = |row: usize| -> String {
+            rendered.text.lines[row]
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
+        let header = row_text(region.content_row);
+        assert!(
+            header.starts_with(INJECTED_MARKER),
+            "the region must address the header: {header:?}"
+        );
+        assert!(
+            row_text(region.content_row - 1).is_empty(),
+            "the row above the header is the node's blank separator"
+        );
+        assert_eq!(
+            (region.col_start, region.col_end),
+            (0, display_width(&header)),
+            "the region spans the header's full display width"
+        );
+    }
+
+    /// An injected record with NO `uuid` has no fold key: it renders OPEN, claims
+    /// no click and promises none — a collapsed node nobody can open would put its
+    /// body out of reach. Its body is still unindexed text.
+    #[test]
+    fn an_injected_record_with_no_uuid_renders_open_and_claims_no_click() {
+        let record = serde_json::json!({
+            "type": "user", "isMeta": true, "timestamp": "2026-09-25T08:05:00.000Z",
+            "message": {"content": "Continue from where you left off."}
+        });
+        let (lines, _, folds, unindexed) = injected_node_lines(
+            "Continue from where you left off.",
+            &HashSet::new(),
+            &record,
+            &mut None,
+            WIDE,
+        );
+        let plain = flatten(&Text::from(lines));
+
+        assert!(
+            folds.is_empty(),
+            "no uuid means no clickable region:\n{plain}"
+        );
+        assert!(
+            plain.contains("Continue from where you left off."),
+            "a node nothing can open must render OPEN:\n{plain}"
+        );
+        assert!(
+            !plain.contains(PEER_EXPAND_AFFORDANCE) && !plain.contains(PEER_COLLAPSE_AFFORDANCE),
+            "an unclickable node must not promise a click:\n{plain}"
+        );
+        assert_eq!(
+            unindexed,
+            vec![UnindexedRows {
+                content_row: PEER_HEADER_BLOCK_ROW + 1,
+                len: 1
+            }],
+            "the open body is still text the index never held"
+        );
+    }
+
+    /// ORDER: a hand-back carries `isMeta` too, and it must stay a PEER node —
+    /// its sender on the header, `origin.from` as its fold key — never fold under
+    /// "added by claude code".
+    #[test]
+    fn a_peer_handback_with_is_meta_stays_a_peer_node() {
+        let record = serde_json::json!({
+            "type": "user", "isMeta": true, "uuid": "peer-record-uuid",
+            "timestamp": "2026-08-20T14:15:00.000Z",
+            "origin": {"kind": "peer", "from": PEER_STEM, "body": "the report"},
+            "message": {"content": "Another Claude session sent a message: the report"}
+        });
+        let (lines, _, folds, unindexed) = render_record(
+            &record,
+            &mut AgentState::default(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &mut None,
+            WIDE,
+        )
+        .expect("a hand-back renders");
+        let plain = flatten(&Text::from(lines));
+
+        assert!(
+            plain.contains(&format!("{PEER_MARKER} @{PEER_STEM}")),
+            "the hand-back keeps its sender label:\n{plain}"
+        );
+        assert!(
+            !plain.contains(INJECTED_MARKER),
+            "a hand-back is not injected context:\n{plain}"
+        );
+        assert_eq!(
+            folds.iter().map(|f| f.key.as_str()).collect::<Vec<_>>(),
+            vec![PEER_STEM],
+            "and keeps `origin.from` as its fold key, not its uuid"
+        );
+        assert!(unindexed.is_empty(), "a hand-back's text is indexed");
+    }
+
+    #[test]
+    fn is_indexed_line_is_false_only_inside_a_run() {
+        let rendered = RenderedPreview {
+            unindexed: vec![UnindexedRows {
+                content_row: 3,
+                len: 2,
+            }],
+            ..RenderedPreview::default()
+        };
+        let indexed: Vec<bool> = (0..7).map(|i| rendered.is_indexed_line(i)).collect();
+        assert_eq!(indexed, [true, true, true, false, false, true, true]);
+        assert!(RenderedPreview::default().is_indexed_line(0));
     }
 
     #[test]
@@ -5343,18 +5500,9 @@ mod tests {
     }
 
     // --- control-wrapper collapse -----------------------------------------
-
-    #[test]
-    fn every_allowlisted_wrapper_has_a_render_kind() {
-        // Drift guard: the allowlist and the render mapping stay in lockstep, so
-        // matching a listed opener can never fall through to an unhandled kind.
-        for &name in CONTROL_WRAPPERS {
-            assert!(
-                wrapper_kind(name).is_some(),
-                "allowlist name {name} has no render kind"
-            );
-        }
-    }
+    //
+    // The pure pre-pass is `store::command`'s and is tested there; these pin
+    // what the preview DRAWS from its segments.
 
     #[test]
     fn slash_command_turn_collapses_to_a_single_command_line() {
@@ -5458,28 +5606,11 @@ mod tests {
     }
 
     #[test]
-    fn legitimate_angle_bracket_tokens_are_left_literal() {
-        // Regression / data-loss guard: open-only placeholders, generics, and
-        // comparisons are real content — the pre-pass returns them byte-for-byte
-        // as one literal segment (nothing stripped or restyled).
-        let body = "Use <session-id> and Vec<String>; also x < y > z here.";
-        assert_eq!(
-            collapse_control_wrappers(body),
-            vec![Segment::Literal(body.to_string())],
-            "no legitimate angle-bracket token may be collapsed"
-        );
-    }
-
-    #[test]
     fn unclosed_known_opener_is_left_literal_and_keeps_trailing_content() {
-        // A known opener with no closing tag must FAIL SOFT: treated as literal,
-        // with everything after it preserved (never eaten, never a panic).
+        // A known opener with no closing tag must FAIL SOFT: drawn as literal,
+        // with everything after it preserved (never eaten, never a panic). The
+        // segment-level half of this is pinned in `store::command`.
         let body = "before <system-reminder> tail content after";
-        assert_eq!(
-            collapse_control_wrappers(body),
-            vec![Segment::Literal(body.to_string())],
-            "an unclosed opener stays literal"
-        );
         let joined = collapse_body_lines(body, WIDE)
             .iter()
             .map(line_text)
