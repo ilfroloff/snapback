@@ -344,8 +344,9 @@ inner rect when there is no banner (so a banner-less pane's geometry is exactly
   own start index back before looking one up.
 - **The CLICK reads that same map, and `view::line_at_row` is the one place a row
   becomes a line.** `row_window` starts the window with it, and BOTH click consumers
-  resolve their ROW with it — `link_at` (a url to open) and `fold_at` (a peer node's
-  fold key to toggle) — so the paint and the two hit-tests cannot disagree about
+  resolve their ROW with it — `link_at` (a url to open) and `fold_at` (the fold key
+  of a node to toggle — a peer message or injected context) — so the paint and the
+  two hit-tests cannot disagree about
   which line sits where. That is the failure a second derivation guarantees, and the
   one that nearly landed: the first cut of `content_hit` kept only the ROW half of
   its pane guard and clamped the column, which aliased every click LEFT of the pane's
@@ -771,7 +772,8 @@ visibly against the first. Two testing rules follow for any future animation:
   noticed nothing would call the bug fixed.
 
 Ahead of the markdown pass, each message body runs through an **allowlist-driven
-control-wrapper collapse** (`store::preview::collapse_control_wrappers`). Claude
+control-wrapper collapse** (`store::command::collapse_control_wrappers`, the
+one parse the preview, the content index and the label share). Claude
 Code injects a fixed set of paired pseudo-tags (`<command-name>`,
 `<system-reminder>`, `<local-command-stdout>`, `<local-command-caveat>`,
 `<task-notification>`, `<persisted-output>`, …); each collapses to a single dim
@@ -798,7 +800,7 @@ CADENCES and LIMITS, so a retune knows what it is next to:
 | `store` | `MTIME_SETTLE_WINDOW` (2 s) |
 | `store::parse` | `CONTENT_INDEX_CAP` (1 MB) |
 | `store::label` | `LABEL_MAX` (180) |
-| `store::preview` | `TABLE_MIN_COL_WIDTH` (10) · `RECORD_RULE_WIDTH` (32) · `COLUMN_RULE_WIDTH` (3) · `ELLIPSIS_WIDTH` (1) · `PEER_STEM_LEN` (17 — the agent-stem length a peer sender must match before it renders as an `@handle`, so a socket path or an agent TYPE name falls back to the generic label) · `PEER_HEADER_BLOCK_ROW` (1 — not a knob but a SHAPE: the peer node's header index inside its own `[blank, header, body…]` block, named so the fold region and the body links rebase off one number) |
+| `store::preview` | `TABLE_MIN_COL_WIDTH` (10) · `RECORD_RULE_WIDTH` (32) · `COLUMN_RULE_WIDTH` (3) · `ELLIPSIS_WIDTH` (1) · `PEER_STEM_LEN` (17 — the agent-stem length a peer sender must match before it renders as an `@handle`, so a socket path or an agent TYPE name falls back to the generic label) · `PEER_HEADER_BLOCK_ROW` (1 — not a knob but a SHAPE: every fold node's header index — peer and injected alike — inside its own `[blank, header, body…]` block, named so the fold region and the body links rebase off one number) |
 | `send` | `SEND_ERROR_MAX` (200) |
 | `tui::app` | `PREVIEW_WHEEL_STEP` (2) · `LIST_WHEEL_STEP` (1) · `STATUS_DWELL_TICKS` (16) · `MIN_PANE_WIDTH` (15) · `DEFAULT_LIST_PERCENT` (48) |
 | `tui::update` | `PASTE_MAX_CHARS` (4096) · `SPLITTER_TOLERANCE` (1) |
@@ -1164,7 +1166,12 @@ Tests are **inline** `#[cfg(test)] mod tests` at the bottom of each source file
   paths), the two BARE kinds (`human`, `task-notification` — no `from`, no
   `body`), and a record with NO `origin` whose content quotes the
   `<agent-message …>` frame inside a fenced block, which pins that the text frame
-  alone collapses nothing. Reach it
+  alone collapses nothing. Under `-Users-me-project-zeta`, one COMMAND-STARTED
+  session in the real record order: an `isMeta` caveat, a LOCAL `/model` with its
+  `<local-command-stdout>`, then a PROMPT command whose `isMeta` skill body
+  follows it with `parentUuid` pointing back — it pins the `/name args` label,
+  the content index dropping injected text and command tags, and the preview's
+  injected node. Reach it
   via `env!("CARGO_MANIFEST_DIR")`. Add a fixture when you add a format edge
   case, and update the counts in `store::mod`'s discovery/session-count tests.
   A fixture pair must **differ in the field under test**, and the fork pair

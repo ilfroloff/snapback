@@ -2287,7 +2287,8 @@ fn visual_to_content(row_prefix: &[usize], visual_row: usize) -> Option<(usize, 
 /// the mouse arm gates on `App::preview_rect`, the OUTER rect, so the pane's
 /// BORDER columns reach this function already. Answering them by clamping the
 /// column instead would alias every click on the left border onto content column
-/// 0 — a hit on any region that starts there, which is every peer-node header.
+/// 0 — a hit on any region that starts there, which is every fold-node header,
+/// peer and injected alike.
 fn content_hit(
     col: u16,
     row: u16,
@@ -2720,8 +2721,8 @@ pub(crate) fn link_at<'a>(
         .map_or(LinkProbe::NoLink, |r| LinkProbe::Hit(r.url.as_str()))
 }
 
-/// The fold key of a peer-message node whose HEADER sits under a mouse click at
-/// screen `(col, row)`, or `None`.
+/// The fold key of a fold node — a peer message or injected context — whose
+/// HEADER sits under a mouse click at screen `(col, row)`, or `None`.
 ///
 /// A sibling of [`link_at`] over the same width-scoped cache entry
 /// (`App::preview_hit_context`) and the same transcript rect from [`preview_split`],

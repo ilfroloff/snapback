@@ -15,7 +15,8 @@ find the same rule in two places, that is a bug to fix.
 3. [DOMAIN.md](DOMAIN.md) — **the session format**: store layout, the
    session/subagent/sidecar distinction, the JSONL fields relied on, the derived
    concepts (label, grouping, content index, fork lineage, turn count, live
-   agents, scopes), and the per-state routing tables — the hand-offs, the
+   agents, the preview's peer and injected-context nodes, scopes), and the
+   per-state routing tables — the hand-offs, the
    `Ctrl-R` / `Ctrl-K` gates, and the terminal-paste owner table.
 4. [PATTERNS.md](PATTERNS.md) — **how to build new things**: the repeated
    implementation rules and the testing conventions to match.

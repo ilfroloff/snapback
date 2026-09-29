@@ -12,6 +12,7 @@
 //! rather than to the whole store. Discovery is NEVER cached, and neither is
 //! anything but a COMPLETED read — see [`SessionStore::reload`].
 
+pub mod command;
 pub mod discover;
 pub mod group;
 pub mod label;
@@ -593,8 +594,8 @@ mod tests {
                 .any(|p| p.components().any(|c| c.as_os_str() == "subagents")),
             "discovery must never descend into a subagents/ directory: {files:?}"
         );
-        // The nineteen depth-2 `.jsonl` files, none of the nested subagent file.
-        assert_eq!(files.len(), 19, "unexpected discovered set: {files:?}");
+        // The twenty depth-2 `.jsonl` files, none of the nested subagent file.
+        assert_eq!(files.len(), 20, "unexpected discovered set: {files:?}");
     }
 
     #[test]
@@ -616,8 +617,74 @@ mod tests {
             !sessions.iter().any(|s| s.label.contains("Sidecar title")),
             "a sidecar file with no cwd was surfaced as a session"
         );
-        // Exactly eighteen resumable sessions survive (19 discovered - 1 sidecar).
-        assert_eq!(sessions.len(), 18, "unexpected session count");
+        // Exactly nineteen resumable sessions survive (20 discovered - 1 sidecar).
+        assert_eq!(sessions.len(), 19, "unexpected session count");
+    }
+
+    // --- injected context and the typed command: end to end ----------------
+    //
+    // `sess-command-prompt-1` is the real shape of a command-started session: an
+    // `isMeta` caveat, a LOCAL command (`/model`) with its output, then a PROMPT
+    // command (`/review-branch`) whose expanded body follows it as an `isMeta`
+    // record pointing back at it. No summary, so the label is the first prompt.
+
+    /// The label is the prompt command the user typed, as `/name args` — not the
+    /// local command before it, and not the first line of the skill body, which
+    /// is what the first unwrapped user text used to be.
+    #[test]
+    fn a_command_started_session_is_labelled_with_the_command_it_was_started_with() {
+        let sessions = load();
+        let session = find(&sessions, "sess-command-prompt-1");
+        assert_eq!(
+            session.label,
+            "/review-branch PR #42 in a separate worktree"
+        );
+    }
+
+    /// The content index holds what the user typed and what was said, and not
+    /// what Claude Code injected around it.
+    #[test]
+    fn the_content_index_keeps_typed_commands_and_drops_injected_context() {
+        let sessions = load();
+        let index = &find(&sessions, "sess-command-prompt-1").content_index;
+
+        for kept in [
+            "/review-branch PR #42 in a separate worktree",
+            "/model",
+            // A local command's OUTPUT stays searchable, tags and all, as before.
+            "<local-command-stdout>Set model to zetastdoutword</local-command-stdout>",
+            "Reviewing PR #42",
+        ] {
+            assert!(index.contains(kept), "{kept:?} must be indexed: {index:?}");
+        }
+        for dropped in [
+            // The skill body and the caveat are injected: nobody typed them.
+            "zetaskillonly",
+            "Your task is to review",
+            "zetacaveatonly",
+            // A command's own tag names are harness syntax, never searchable.
+            "command-name",
+            "command-args",
+            "command-message",
+        ] {
+            assert!(
+                !index.contains(dropped),
+                "{dropped:?} must not be indexed: {index:?}"
+            );
+        }
+    }
+
+    /// Every subagent hand-back carries `isMeta` too, and it is an agent's
+    /// report, not instructions: it must stay searchable. The epsilon fixture's
+    /// hand-back is exactly that pairing.
+    #[test]
+    fn a_peer_handback_with_is_meta_stays_in_the_content_index() {
+        let sessions = load();
+        let index = &find(&sessions, "sess-peer-handback-1").content_index;
+        assert!(
+            index.contains("webhook retry backoff is fixed"),
+            "the hand-back's report must stay searchable: {index:?}"
+        );
     }
 
     // --- failed background task: the fixture pairs ------------------------

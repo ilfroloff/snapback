@@ -20,7 +20,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use super::label;
+use super::{command, label};
 
 /// SAFETY CEILING on the per-session searchable transcript text — a bound
 /// against one pathological file, NOT a working memory budget. 1 MB is ~4x the
@@ -173,7 +173,8 @@ pub struct ParsedFile {
     pub timestamp_raw: Option<String>,
     /// Latest `type:"summary"` title, if any.
     pub summary: Option<String>,
-    /// First "real" user prompt, if any (see [`label::user_prompt_text`]).
+    /// First prompt the user wrote, if any — a typed prompt or a confirmed prompt
+    /// command as `/name args` (see [`label::FirstPrompt`]).
     pub first_user: Option<String>,
     /// `uuid` of the record whose `parentUuid` is JSON `null` — the transcript
     /// TREE's root, which identifies a fork lineage (a background hand-off copies
@@ -272,7 +273,7 @@ pub fn parse_file(path: &Path) -> FileVerdict<ParsedFile> {
     let mut git_branch: Option<String> = None;
     let mut timestamp_raw: Option<String> = None;
     let mut summary: Option<String> = None;
-    let mut first_user: Option<String> = None;
+    let mut first_user = label::FirstPrompt::default();
     let mut root_uuid: Option<String> = None;
     let mut msg_count: usize = 0;
     let mut content_index = String::new();
@@ -417,15 +418,12 @@ pub fn parse_file(path: &Path) -> FileVerdict<ParsedFile> {
         if let Some(t) = record.get("timestamp").and_then(Value::as_str) {
             timestamp_raw = Some(t.to_string());
         }
-        // Label sources: latest summary, first real user prompt.
+        // Label sources: latest summary, first prompt the user wrote. The pick
+        // sees EVERY record: a prompt command is confirmed by the record after it.
         if let Some(s) = label::summary_text(&record) {
             summary = Some(s);
         }
-        if first_user.is_none() {
-            if let Some(u) = label::user_prompt_text(&record) {
-                first_user = Some(u);
-            }
-        }
+        first_user.observe(&record);
         // Searchable transcript text, accumulated up to the cap.
         if content_index.len() < CONTENT_INDEX_CAP {
             append_readable(&record, &mut content_index);
@@ -446,7 +444,7 @@ pub fn parse_file(path: &Path) -> FileVerdict<ParsedFile> {
         git_branch,
         timestamp_raw,
         summary,
-        first_user,
+        first_user: first_user.into_first(),
         root_uuid,
         msg_count,
         content_index,
@@ -552,7 +550,9 @@ fn task_signal(record: &Value) -> TaskSignal {
 /// The clearing half of [`task_signal`], for a record whose `origin` is absent
 /// (`human == false`) or [`ORIGIN_KIND_HUMAN`] (`human == true`).
 fn user_turn_signal(record: &Value, human: bool) -> TaskSignal {
-    if is_meta(record) || is_tool_result(record) {
+    // `label::is_meta`, FAIL-SOFT toward "meta": an unrecognised `isMeta` value
+    // can never clear the flag.
+    if label::is_meta(record) || is_tool_result(record) {
         return TaskSignal::Neither;
     }
     let marked = human
@@ -572,15 +572,6 @@ fn has_marker(record: &Value, key: &str, values: &[&str]) -> bool {
         .get(key)
         .and_then(Value::as_str)
         .is_some_and(|value| values.contains(&value))
-}
-
-/// Whether `record` is an `isMeta` injection — context claude adds on the user's
-/// behalf (skill bodies, caveats), which nobody typed.
-///
-/// FAIL-SOFT toward "meta": only an ABSENT `isMeta` or a literal `false` reads
-/// as an ordinary record, so an unrecognised value can never clear the flag.
-fn is_meta(record: &Value) -> bool {
-    !matches!(record.get("isMeta"), None | Some(Value::Bool(false)))
 }
 
 /// Whether `record` is a TOOL RESULT: a `user` record whose `message.content` is
@@ -667,12 +658,28 @@ fn file_stem(path: &Path) -> String {
 /// index. Text blocks only (tool params/thinking are omitted to keep the index
 /// readable — and that omission, not the ceiling, is what keeps it a small
 /// fraction of the raw bytes); breadth is bounded by [`CONTENT_INDEX_CAP`].
+///
+/// The index holds what was SAID in the session, so two things Claude Code wrote
+/// around the user's words stay out of it:
+///
+/// - an [`label::is_injected`] record — a skill or command body, a caveat —
+///   is skipped whole. Nobody typed it, and a session that ran a skill would
+///   otherwise match every query that happens to share that skill's wording.
+///   A subagent hand-back is NOT injected (the same shared check says so), so
+///   its report stays searchable like any other reply.
+/// - a slash command is kept as the `/name args` the user typed
+///   ([`command::typed_text`]), never as its `<command-name>`/`<command-args>`
+///   tags, whose names would match ordinary words. Every OTHER wrapper's text —
+///   a reminder, a command's output, a task notice — is kept exactly as written.
 fn append_readable(record: &Value, buf: &mut String) {
+    if label::is_injected(record) {
+        return;
+    }
     let text = match record.get("type").and_then(Value::as_str) {
         Some("user") | Some("assistant") => record
             .get("message")
             .and_then(|m| m.get("content"))
-            .map(readable_text)
+            .map(|content| command::typed_text(readable_text(content)))
             .unwrap_or_default(),
         Some("summary") => record
             .get("summary")
