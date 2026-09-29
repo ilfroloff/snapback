@@ -4455,9 +4455,10 @@ fn highlight_runs(label: &str, matched: &HashSet<usize>) -> Vec<(String, bool)> 
 /// The styled sibling of [`highlight_runs`], and the difference is the whole
 /// point: a row label is unstyled text this view owns, whereas a preview line
 /// arrives ALREADY styled by `store::preview` (markers, headings, DIM code, the
-/// underlined link labels). So this splits the line's own spans at the matched
-/// positions and ADDS the modifier to the matched runs, rather than replacing
-/// their style — a marked word inside a DIM code span stays DIM.
+/// light-blue italic underlined link labels). So this splits the line's own spans
+/// at the matched positions and ADDS the modifier to the matched runs, rather than
+/// replacing their style — a marked word inside a DIM code span stays DIM, and a
+/// marked link keeps its color, italic and underline.
 ///
 /// Three invariants hold, and the rest of the pane depends on all three:
 ///
@@ -6577,9 +6578,10 @@ mod tests {
     /// The prose the measured line opens with, which is also the url's start column.
     const HIT_HEAD: &str = "I have ";
 
-    /// The measured line as the preview renders it: plain prose, the url UNDERLINED
-    /// the way `store::preview` styles a link label, then plain prose out to
-    /// [`HIT_LINE_COLS`] columns. Returns the line and the url it carries.
+    /// The measured line as the preview renders it: plain prose, the url in
+    /// [`preview::link_style`] (the style `store::preview` gives a link label), then
+    /// plain prose out to [`HIT_LINE_COLS`] columns. Returns the line and the url it
+    /// carries.
     fn hit_shape_line() -> (Line<'static>, String) {
         let url = format!("https://example.com/{}", "a".repeat(HIT_URL_LEN - 20));
         assert_eq!(
@@ -6595,10 +6597,7 @@ mod tests {
         tail.truncate(tail_len);
         let line = Line::from(vec![
             Span::raw(HIT_HEAD),
-            Span::styled(
-                url.clone(),
-                Style::default().add_modifier(Modifier::UNDERLINED),
-            ),
+            Span::styled(url.clone(), preview::link_style()),
             Span::raw(tail),
         ]);
         assert_eq!(
@@ -9915,6 +9914,52 @@ mod tests {
             link_at(col, row - 1, inner, scroll, row_prefix, lines, regions),
             LinkProbe::NoLink,
             "and the row above it is another transcript line, not the link"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A preview link is DRAWN light blue, italic and underlined — its label's cells
+    /// and no others.
+    ///
+    /// Read off the rendered pane rather than off the parser's spans (PATTERNS —
+    /// assert drawn cells): a style the parser set but the render lost is not a link
+    /// anyone can see. Both directions are pinned. Every `LightBlue` cell spells the
+    /// label, so the color reaches neither the prose around it nor the pane's chrome
+    /// (nothing else the preview pane draws is `LightBlue` — the list's search-match
+    /// highlight is, but it is not in this pane — which is what makes the color a
+    /// sound locator); and every one of them is italic and underlined, the half of the
+    /// look that does not depend on how the terminal's theme draws the blue.
+    #[test]
+    fn a_preview_link_is_drawn_light_blue_italic_and_underlined() {
+        let (width, height) = WINDOW_PANE;
+        let dir = unique_temp_dir("link-color");
+        let mut app = App::new(
+            vec![window_link_session(&dir)],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+
+        // The default bottom anchor scrolls the pane to the tail, where the link is.
+        let buffer = preview_buffer(&mut app, width, height);
+        let blue: Vec<&Cell> = (0..height)
+            .flat_map(|y| (0..width).map(move |x| (x, y)))
+            .filter_map(|(x, y)| buffer.cell((x, y)))
+            .filter(|c| c.fg == Color::LightBlue)
+            .collect();
+        let blue_text: String = blue.iter().map(|c| c.symbol()).collect();
+        assert_eq!(
+            blue_text, WINDOW_LINK_LABEL,
+            "exactly the link's label must be drawn LightBlue"
+        );
+        assert!(
+            blue.iter().all(|c| c.modifier.contains(Modifier::ITALIC)),
+            "every LightBlue label cell must also be italic"
+        );
+        assert!(
+            blue.iter()
+                .all(|c| c.modifier.contains(Modifier::UNDERLINED)),
+            "every LightBlue label cell must also be underlined"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

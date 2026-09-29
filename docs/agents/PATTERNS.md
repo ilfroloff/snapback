@@ -866,6 +866,28 @@ text with it. `REVERSED` in particular is the one attribute this board already
 relies on being honored (the list's selection highlight), unlike the blink
 attribute below.
 
+A preview LINK is not such a mark. Its `LightBlue` + ITALIC + UNDERLINED
+(`store::preview::link_style`) is the element's OWN style, chosen by the parser
+that knows it is a link, so it may carry a color; it is PATCHED onto the
+enclosing run (`base.patch(link_style())`) so a bold, italic, or quoted run's
+modifiers survive on the label. The color is the NAMED bright blue — the
+conventional link hue, readable on a dark theme where ANSI `Blue` often is not —
+never an RGB value; the italic underline echoes how terminals such as JetBrains'
+mark a url they auto-detect. Nothing else in the preview pane is `LightBlue`
+(the list's search-match highlight shares the hue, but in the other pane and
+BOLD), and its color and italic are what tell a link from an H1, which is
+underlined too. A link inside a DIM run (a blockquote) keeps that DIM and draws
+a fainter blue — an accepted trade.
+
+That look is an AFFORDANCE, so it is worn only where a click can land. The one
+inline parser takes a `store::preview::LinkRender` switch — `Clickable` patches
+`link_style`, `Inert` leaves the label in its run's own style with the SAME text
+and the same recorded columns — and a caller picks by whether its link regions
+reach the pane. A GFM table in its narrow-pane RECORD layout records none, and a
+click there resolves to `LinkClick::NoLink`, which writes nothing (§11), so it
+parses `Inert`: a label that looked clickable there would fail silently. Pick the
+variant; never restyle a link at a call site.
+
 This is why the live badge honors "Claude's palette" as the named `Yellow` /
 `Green` / `Gray` rather than brand hex: named colors stay legible on a light
 terminal, and the semantics survive. Three further rules hold there.

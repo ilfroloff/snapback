@@ -664,7 +664,11 @@ restores. A level the model can't use is quietly lowered by Claude Code (`max` o
 `Ctrl-/` — shows the selected
 session rendered as clean, scrollable markdown — the real conversation, whole,
 from its first turn to its last, however long it ran. So you
-can confirm it's the right session before jumping back in. Links are clickable.
+can confirm it's the right session before jumping back in. Links show in light
+blue, italic and underlined — the italic underline echoing how many terminals
+mark a url they detect — and are clickable, except in a table too wide for a
+narrow pane, which is stacked into `Header: value` lines where a link shows as
+plain text, since it can't be clicked there.
 A message handed back by a subagent is folded to a single `◆ message from @…`
 line — it is that agent's report, not something you said — and context Claude
 Code added on your behalf (the instructions a skill or slash command expands
