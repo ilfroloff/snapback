@@ -57,10 +57,10 @@ inline test asserting the exact string, so drift here is caught by
 | Resume a session in place | `claude -r <session-id>` | `resume::build_argv` (`src/resume.rs`) |
 | Fork a session (new id) | `claude -r <session-id> --fork-session` | `resume::build_argv` |
 | Dispatch a DEFINED agent | `claude --agent <name>` | `resume::build_new_argv` (`src/resume.rs`) |
-| Start a new session on a drafted prompt | `claude [--agent <name>] <prompt>` | `resume::build_new_argv` |
-| Start a BACKGROUND agent on a drafted prompt | `claude [--agent <name>] --bg <prompt>` | `send::build_bg_launch_argv` (`src/send.rs`) |
+| Start a new session on a drafted prompt | `claude [--agent <name>] [--model <alias> [--effort <level>]] <prompt>` | `resume::build_new_argv` |
+| Start a BACKGROUND agent on a drafted prompt | `claude [--agent <name>] [--model <alias> [--effort <level>]] --bg <prompt>` | `send::build_bg_launch_argv` (`src/send.rs`) |
 | Attach to a live background job | `claude attach <job-id>` | `resume::build_attach_argv` |
-| Quick-send a reply (non-interactive) | `claude -p -r <session-id> --output-format json <message>` | `send::build_send_argv` (`src/send.rs`) |
+| Quick-send a reply (non-interactive) | `claude -p -r <session-id> --output-format json [--model <alias> [--effort <level>]] <message>` | `send::build_send_argv` (`src/send.rs`) |
 | Release a held job before a reply, or interrupt a selected agent (`Ctrl-K`) | `claude stop <job-id>` | `send::build_stop_argv` |
 | Detect live agents (gate probe) | `claude agents --json` | `agents::live_agents_argv` (`src/agents.rs`) |
 | Detect live agents (incl. just-finished) | `claude agents --json --all` | `agents::agents_argv` |
@@ -84,6 +84,31 @@ Two of these, **`attach`** and **`stop`**, were hidden from `claude --help` in t
 agent-view job id** (e.g. `ca56b543`), NOT the full `sessionId`; passing a UUID
 returns exit 1 ("No job matching"). The `-r` resume/fork/send paths take the
 **full `sessionId`**.
+
+`[--model <alias>]` is a compose box's `Ctrl-L` pick. Which launches may carry it
+is the A MODEL IS PICKED PER COMPOSE, NEVER PER BOARD rule in
+[AGENTS.md](../../AGENTS.md#critical-rules), and which builder emits it for each
+launch is [DOMAIN.md](DOMAIN.md#compose-model-pick-ctrl-l)'s table. It is emitted
+ONLY for an explicit pick — with none, every argv that can carry it is
+byte-identical to its modelless form, so a reply normally keeps the session's last
+model and a new session runs on whatever `claude` gives one (see
+[Which model a launch runs on](#which-model-a-launch-runs-on-without---model)) —
+and it is always placed BEFORE a trailing positional (the new-session prompt, the
+reply message), since a flag trailing an operand is at the mercy of the parser.
+The `claude` behaviour that rule rests on: a `-r` launch without `--model`
+normally restores the session's own model (the exceptions are
+[below](#which-model-a-launch-runs-on-without---model)), and `claude attach` joins
+a process already running under a model. `--agent` and `--model` compose freely,
+and snapback emits both when both are set; the accepted alias set is below.
+
+`[--effort <level>]` is the same pick's optional effort (`←`/`→` inside that
+compose's model picker). It lives INSIDE the model pick (`resume::ModelPick`), so
+it is emitted only together with `--model`: immediately after it, before any
+trailing positional, through the one `resume::push_model_flag` guard — a pick
+whose model is blank emits neither flag. With no effort each of those argvs is
+byte-identical to its `--model`-only form, and no row that cannot carry a model
+can carry an effort. What claude does with the value is
+[below](#effort-levels---effort).
 
 ## Invocation form
 
@@ -158,15 +183,211 @@ with `-p/--print` (SDK/non-interactive mode).
 | `--from-pr [value]` | Resume a session linked to a PR (number/URL), or open the picker. |
 | `--session-id <uuid>` | Use a specific (valid UUID) session id. |
 | `-n, --name <name>` | Display name (prompt box, `/resume` picker, terminal title). |
-| `--model <model>` | Model for the session — alias (`fable`/`opus`/`sonnet`) or full id (`claude-fable-5`). |
+| `--model <model>` | Model for the session — alias or full id (`claude-fable-5`). **`--help` lists only `fable`/`opus`/`sonnet`; that list is INCOMPLETE — see [Model aliases](#model-aliases---model).** |
 | `--fallback-model <model>` | `[P]` Fallback model(s), comma-separated, tried in order when the primary is overloaded; the primary is re-tried at the start of each user turn. |
 | `--agent <agent>` | Agent for the session; overrides the `agent` setting. |
 | `--agents <json-or-file>` | JSON object defining custom agents inline, or with `--print` the path to a file that holds one. |
-| `--effort <level>` | `low` \| `medium` \| `high` \| `xhigh` \| `max`. |
+| `--effort <level>` | `low` \| `medium` \| `high` \| `xhigh` \| `max`. Never fails a launch — see [Effort levels](#effort-levels---effort). |
 | `--autocompact <auto\|tokens>` | Auto-compact window size (`auto`, or 100k–1M tokens). |
 | `--teleport [session]` | Resume a teleport session, optionally by session id. |
 | `--cloud [description\|session_id\|url]` | Create a cloud session with a description, or attach to an existing one by session id or claude.ai/code URL. |
 | `--environment <environment_id>` | Create a new cloud session on a given self-hosted environment (`ccpool_...`). |
+
+#### Model aliases (`--model`)
+
+**`claude --help` is WRONG here, and it is the one place in this doc where the
+help text cannot be the source.** Its `--model` blurb names `fable`, `opus` and
+`sonnet` only — three of the nine the binary accepts — so a help-derived list is
+missing six, including the alias with the most leverage. The set below was read
+out of the shipped binary instead (capture command in
+[Refreshing this doc](#refreshing-this-doc)), in the binary's own array order:
+
+| Alias | Notes |
+| --- | --- |
+| `sonnet` | Listed by `--help`. |
+| `opus` | Listed by `--help`. |
+| `haiku` | **Absent from `--help`.** |
+| `fable` | Listed by `--help`. |
+| `best` | **Absent from `--help`.** Accepted by the array; the bundle carries no picker label or description for it. |
+| `sonnet[1m]` | **Absent from `--help`.** The 1M-context variant; the bundle builds its picker label from the current `sonnet` model's display name (`` `${displayName} (1M context)` ``) rather than carrying a literal. Its embedded `]` is why a `[^]]`-style capture regex truncates the array right here — see [Refreshing this doc](#refreshing-this-doc). |
+| `opus[1m]` | **Absent from `--help`.** The 1M-context variant (`label:"Opus (1M context)"`). |
+| `fable[1m]` | **Absent from `--help`.** Same `[1m]` naming; the bundle carries no label for this one. |
+| `opusplan` | **Absent from `--help`.** Runs Opus for **plan mode** and the resting model otherwise — "plan with Opus, implement with Sonnet" as one alias. Confirmed from binary strings, including an `opusplan-mode-reminder`. It is also the CONTENT ANCHOR the capture command selects on: no other array in the bundle carries it. |
+
+**This table is a POINT-IN-TIME RECORD FOR HUMANS, not a list `snapback` reads.**
+`snapback` reads the same array out of the installed binary itself, at runtime
+(`src/model_aliases.rs`), so a newly shipped or withdrawn alias reaches the
+compose model picker (`Ctrl-L`) with no snapback release and **no edit here**. What
+`tui::app::MODEL_ALIASES` holds is a five-entry COLD-START SEED — what the picker
+draws in the frames before the probe answers, and what it keeps if the probe finds
+nothing — and it is deliberately NOT hand-refreshed: a stale seed is cosmetic and
+self-corrects. Refresh this table when you want the doc to describe the version in
+the [pin](#version-pin-self-healing) above, never because a picker depends on it.
+
+Neither the table nor the seed is a validation whitelist. `--model` also accepts a
+**full model id** (`claude-sonnet-5`), so this is an alias set, not the accepted
+domain: nothing in `snapback` validates the value it sends (the picker offers the
+probed aliases verbatim), and an invalid one is claude's to refuse (a hard,
+non-zero failure — see below).
+
+**An invalid `--model` is a HARD failure, not the `--agent` silent downgrade.**
+It exits **1** with an **empty stderr** and prints `is_error:true` on stdout with
+`result:"There's an issue with the selected model (…)"`, `modelUsage:{}` and cost
+0. Contrast the `--bg` agent case below, which exits **0** and starts the session
+without the agent. Because the failure is loud, `send::status_for_failed_send`
+already renders it correctly and no warned-outcome seam exists for it.
+
+The `-p --output-format json` payload's **`modelUsage`** map is keyed by the model
+that actually ANSWERED, with per-model `costUSD` — the only synchronous way to see
+that a `--fallback-model` substituted something else for what `--model` asked for.
+`send::status_for_send` reads it.
+
+#### Effort levels (`--effort`)
+
+**Read out of `claude 2.1.282`, and not tested live.** `claude --help` lists the
+accepted levels (`--effort <level>  Effort level for the current session (low,
+medium, high, xhigh, max)`); the behaviour below is from the bundle's strings and
+code. Unlike `--model`, the flag can never make a hand-off FAIL:
+
+- **The levels** are `low`, `medium`, `high`, `xhigh`, `max`, lowest to highest.
+  snapback keeps them in ONE const, `resume::EFFORT_LEVELS`, in that order —
+  the order the picker's `←`/`→` cycle walks (after an unset stop, wrapping). It
+  is a compile-time list rather than a runtime read like the aliases, and that is
+  safe precisely because of the next two points.
+- **An unknown value does not fail the launch.** claude prints a warning
+  (`Unknown --effort value '…'`) and runs at the default instead.
+- **A level the model cannot use is quietly lowered**: `max` or `xhigh` become
+  `high` ("after any silent downgrade for the selected model"), and a model with
+  no effort support runs with no effort at all. snapback does not model any of
+  this per model — it offers every level on every row, and claude resolves it.
+- **`CLAUDE_CODE_EFFORT_LEVEL` beats `--effort`** (`CLAUDE_CODE_EFFORT_LEVEL
+  overrides effort for this session`). A maximum effort level, when the settings
+  configure one, also clamps whatever is asked for (`--effort` included).
+- **Without `--effort`** the user's settings keep a default level per model
+  (`modelSettings`), so a model picked with no effort runs at that model's
+  settings level, or claude's built-in default. That is what the picker's unset
+  stop (`default effort`) means; the board does not read which level it is.
+
+snapback's effort pick lives inside its model pick, so the A MODEL IS PICKED PER
+COMPOSE, NEVER PER BOARD rule in [AGENTS.md](../../AGENTS.md#critical-rules)
+governs it as well. Unlike the model, **claude does not restore an effort** on a
+later `-r` (`restoreModelFromSession`, below, restores the model alone), so a
+picked effort applies to that one reply or launch; a later resume runs at the
+settings level for whatever model it restores. Each preview turn marker already
+shows the effort that turn actually ran at (`record_effort`,
+[DOMAIN.md](DOMAIN.md#effort-level-record_effort)), so a lowered or overridden
+level is visible after the fact. Because an effort can never cause a non-zero exit,
+`resume::MODEL_NONZERO_HINT` is chosen on whether `--model` was emitted, never on
+the effort, and never names it.
+
+To re-verify after a `claude` update: `claude --help | grep -A1 -- --effort` for
+the level list, and search the bundle (`strings -a`) for `Unknown --effort value`,
+`CLAUDE_CODE_EFFORT_LEVEL overrides effort` and `silent downgrade`.
+
+#### Which model a launch runs on without `--model`
+
+**Read out of the `claude 2.1.282` bundle** — `--help` says nothing about any of
+this. Only what the bundle's code showed is written here; the minified names it
+was found under change every build, so re-verify against the stable strings named
+at the end rather than against identifiers.
+
+A launch picks its model in this order: `--model` (`--model default` means the
+built-in default); else a bound agent's `model:` frontmatter (unless `inherit`);
+else `ANTHROPIC_MODEL`; else the merged settings `model`; else the built-in
+default. A settings or `ANTHROPIC_MODEL` value of `default` (trimmed, any case)
+resolves to the built-in default too. Two JavaScript details matter: the check is
+`ANTHROPIC_MODEL || model`, so an EMPTY `ANTHROPIC_MODEL` falls through to the
+settings model; and the settings merge ASSIGNS a higher source's `model` even when
+it is blank or `default`, so such a value masks the sources below it.
+
+**Settings merge order**, lowest to highest (a later source wins): user
+(`$CLAUDE_CONFIG_DIR/settings.json`, else `~/.claude/settings.json`) → project
+(`<cwd>/.claude/settings.json`) → local (`<cwd>/.claude/settings.local.json`) →
+flag (`--settings`) → managed. Managed settings are `managed-settings.json` in
+`/Library/Application Support/ClaudeCode` (macOS), `C:\Program Files\ClaudeCode`
+(Windows) or `/etc/claude-code` (everything else), overridden by every
+`managed-settings.d/*.json` drop-in (dotfiles skipped) in file-name order; MDM
+(plist/registry) and server-delivered tiers compose into the same managed layer.
+One local-file caveat: when `<cwd>` is not its repository's canonical root,
+`claude` reads that root's `.claude/settings.local.json` (after an ownership check)
+and layers `<cwd>`'s own file beneath it.
+
+**`env` blocks beat the shell.** At startup `claude` copies the global config's
+(`~/.claude.json`) `env`, then each settings source's `env` in the merge order
+above, ONTO its own process environment. So a settings file's
+`env.ANTHROPIC_MODEL` overrides one inherited from the shell, the highest source
+that sets it wins, and — because `ANTHROPIC_MODEL` precedes the settings `model` —
+it beats every file's `model`.
+Project and local files may set it; it is not on their blocked-key list.
+
+`claude_settings::model_defaults` mirrors the settings layers, the drop-ins and
+both `ANTHROPIC_MODEL` sources for a NEW session in the launch dir — the value a
+`Ctrl-N` draft's `model:` label names. It does not mirror the MDM and server tiers,
+the global config's `env`, or the local-file git-root relocation, and snapback
+reads no agent's `model:` frontmatter, which outranks all of them for an agent
+draft; a miss there mislabels the draft and never changes what `claude` runs,
+since with no pick snapback sends no `--model`.
+
+**A `-r` launch normally restores the session's own model**
+(`restoreModelFromSession`). Every startup resume path calls it — interactive
+`-r`, `-r --fork-session`, and `-p -r` — so Resume, Fork and the quick reply all
+keep the model the session last ran on, NOT the settings default, unless it is
+skipped or declined as below. (The in-session `/resume` picker skips it for a
+fork; snapback never drives that path.) It:
+
+- walks the transcript BACKWARDS and takes the last `assistant` record that is not
+  `isMeta` and whose `message.model` is a string other than `<synthetic>`;
+- is SKIPPED when a main-loop model override is set (`--model`, or a restored
+  agent's frontmatter model), when `ANTHROPIC_MODEL` or any
+  `ANTHROPIC_DEFAULT_{FABLE,OPUS,SONNET,HAIKU}_MODEL` is set, when the provider
+  does not use first-party model ids (only first-party, Anthropic-on-AWS,
+  Anthropic-on-Google-Cloud and the gateway do — Bedrock, Vertex and Foundry do
+  not), and in one further env-attribution case the bundle does not make legible;
+- is SKIPPED when the resolved model setting is the mode-dependent `opusplan` or
+  `haiku` alias and the transcript model is compatible with it (`opusplan` with an
+  opus or sonnet model, `haiku` with a haiku or sonnet model) and not an `-eap`
+  model;
+- is DECLINED — warning `Session model <m> could not be restored (<reason>) —
+  using <model> instead.` and falling back to the model the launch would otherwise
+  use — when the model's family is unknown to this `claude`, it is not allowed by
+  the account's model settings (after an entitlement re-probe), or it is retired;
+- may append `[1m]` to the restored id when the startup model or the transcript's
+  own context calls for the long-context variant (the exact condition was not
+  traced).
+
+The consequences snapback is built on. **A launch without `--model` leaves the
+model to `claude`, which keeps the session's own on every `-r` path unless a skip
+or decline above applies** — an environment override, a non-first-party provider
+or a model it declines at resume time among them — and the A MODEL IS PICKED PER
+COMPOSE, NEVER PER BOARD rule in [AGENTS.md](../../AGENTS.md#critical-rules) rests
+on that. **`--model` always wins over the restore**, so a compose
+pick is honored as asked — and, because that model then answers last, the NEXT
+`-r` normally restores it too. **No pick means two different things**: the
+session's last model
+for a quick reply, the settings default for a new session — so the two compose
+boxes label their defaults differently. A reply's `model: session (<label>)` names
+the same record the restore takes (`store::preview::restorable_model`: the last
+non-`isMeta` `assistant` record whose `message.model` is a real model), and
+`claude_settings::resolve_restore_overridden` mirrors the env-var skip for all five
+names above — `ANTHROPIC_MODEL` or any `ANTHROPIC_DEFAULT_*_MODEL`, non-empty in the
+highest settings layer's `env` block, else in the process environment — to make
+that label say `default` instead. A draft's settings value carries
+`(new sessions only)`. What snapback does NOT mirror includes the restored agent's
+frontmatter-model skip (snapback reads no frontmatter `model:`), the provider skip
+(this doc records no variables that select a provider), the `opusplan` / `haiku`
+compatibility skip, the env-attribution skip the bundle does not make legible, and
+the decline cases (only `claude` knows, at resume time, that a model is retired or
+not allowed); in each of those the reply still reads `session (<label>)`, and none
+of them changes what runs. The label also omits the `[1m]` suffix `claude` may
+append to a restored id; that is the same model's long-context variant, not a
+different model.
+
+To re-verify after a `claude` update, search the bundle (`strings -a` on the
+canonicalized binary) for these stable strings rather than for minified names:
+`"userSettings","projectSettings","localSettings","flagSettings","policySettings"`
+(the merge order), `managed-settings.d` and `/etc/claude-code` (the managed paths),
+`applyConfigEnvironmentVariables` (the `env` copy), `startupModelWinsOverSessionRestore`
+and `tengu_resume_model_restore` (the restore and its skip conditions).
 
 ### Print / SDK mode
 
@@ -443,6 +664,19 @@ BIN="$(readlink -f "$(command -v claude)")"
 strings "$BIN" | grep -oE 'Usage: claude [a-z][a-z-]*' | sort -u
 strings "$BIN" | grep -A15 '^Usage: claude daemon'
 strings "$BIN" | grep -A30 '^Usage: claude self-hosted-runner'
+
+# --model aliases: NOT derivable from --help (it names 3 of the 9), so read the
+# array out of the shipped binary. Extract every FLAT array of quoted strings,
+# keep the ones carrying `opusplan`, print the longest. That is the same rule
+# `src/model_aliases.rs` applies at runtime — content-anchor first, longest-wins
+# only as a deterministic tie-break — and it exits 1 when it finds nothing, so a
+# withdrawn anchor fails loudly instead of printing an empty line.
+strings -a "$(command -v claude)" \
+  | grep -oE '\["[^"]*"(,"[^"]*")*\]' \
+  | grep -F '"opusplan"' \
+  | awk '{ if (length > n) { n = length; a = $0 } }
+         END { if (n) print a
+               else { print "no --model alias array found" > "/dev/stderr"; exit 1 } }'
 ```
 
 **Run nothing but `--version` and `--help` here.** Several commands in this list
@@ -467,8 +701,45 @@ finds is folded into the tables and the version pin, and the before/after is lef
 to the commit message, because git history is the
 [refresh log](README.md#maintenance).
 
+Three traps in the `--model` alias capture, each reproduced against the real
+binaries. Do not "simplify" past any of them:
+
+1. **Do not require `opusplan` to be LAST.** The earlier form of this command
+   (`'\[("[^"]+",)+"opusplan"\]'`) could only match while `opusplan` was the final
+   element. Fed an array with one alias appended after it, that form printed
+   NOTHING and the pipeline still exited **0** — a drift check that cannot detect
+   the drift it exists to catch, and that fails silently rather than loudly. The
+   pattern above accepts a flat string array of any length and finds the anchor
+   anywhere in it.
+2. **Do not use a `[^]]*`-style terminator.** `sonnet[1m]` carries a `]` inside a
+   quoted element, so a "run of non-`]`" stops dead there and yields
+   `["sonnet","opus","haiku","fable","best","sonnet[1m]` — the array truncated,
+   silently dropping the four aliases after it.
+3. **Do not anchor on the identifier, and do not take the longest array.** The
+   variable holding it is minified and regenerated every build — observed as
+   `h9e` → `bze` → `SWe` → `qWe` → `UKe` across five consecutive releases up to
+   2.1.235, and as `xU` in 2.1.282. And the array immediately BEFORE the alias
+   array is a full-model-id list (`["claude-3-5-haiku",…,"claude-sonnet-5"]`) —
+   17 elements in 2.1.235 and 20 in 2.1.282, against the alias array's nine — so
+   longest-wins on its own returns the wrong one. The content anchor is what
+   discriminates: in 2.1.282 exactly one array in the bundle carries `opusplan`.
+
+That command is the refresh owner for
+[Model aliases](#model-aliases---model) and for nothing else — update the table
+and the [version pin](#version-pin-self-healing) in one pass. Read its output as
+the ACCEPTED alias set (`--model` takes full model ids besides).
+
+It is **not** how `tui::app::MODEL_ALIASES` is maintained, and that const's doc
+comment no longer points here. It is a cold-start seed the picker outgrows within
+the first frames of a board session, because `src/model_aliases.rs` applies the
+selection rule above to the installed binary at runtime — so the picker never
+waits on this pass, and hand-syncing the const would rebuild the very artifact
+that module exists to delete.
+
 Update the tables **and** the [version pin](#version-pin-self-healing) together
 when the surface changes. When a flag/command that `snapback` invokes changes,
 also fix the matching argv builder and its inline test in `src/resume.rs`,
 `src/send.rs`, or `src/agents.rs` — the code and this doc are the two halves of
-one contract.
+one contract. The `--effort` level list is the one hand-kept list in that
+contract: when `claude --help` changes it, update `resume::EFFORT_LEVELS` and its
+pinning test (`the_effort_levels_are_claudes_in_ascending_order`) with it.

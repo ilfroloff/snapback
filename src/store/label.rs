@@ -70,7 +70,10 @@ pub fn is_sidechain(record: &Value) -> bool {
 /// FAIL-SOFT toward "meta": only an ABSENT `isMeta` or a literal `false` reads
 /// as an ordinary record, so an unrecognised value can never pass an injection
 /// off as the user writing. Shared by `parse`'s failed-task flag (an injection
-/// never clears it) and by [`is_injected`].
+/// never clears it), by [`is_injected`], and by the preview's
+/// `restorable_model`, which asks it of an ASSISTANT record when it finds the
+/// model a `-r` launch restores: claude skips an `isMeta` assistant turn there,
+/// and one predicate serves every caller.
 pub fn is_meta(record: &Value) -> bool {
     !matches!(record.get("isMeta"), None | Some(Value::Bool(false)))
 }

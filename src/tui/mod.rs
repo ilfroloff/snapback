@@ -526,6 +526,29 @@ fn run_inner(
     // `claude agents --json --all` shell-out can never block rendering. Delivered
     // as `AppEvent::ReportedAgents` on the merged channel and applied in `update`.
     events.spawn_agents_poller(crate::watch::AGENTS_REFRESH);
+    // Read the installed `claude`'s `--model` alias set OFF the UI thread too, so
+    // the compose model picker (`Ctrl-L`) offers what THIS install accepts rather
+    // than a list frozen at snapback's last release. A ONE-SHOT, not a poll: it delivers a
+    // single `AppEvent::ModelAliases` and its thread ends. Nothing below waits on
+    // it — the picker draws its compile-time seed until (and unless) it lands, which
+    // is what lets a multi-second scan sit on the same channel as the render loop.
+    //
+    // This LINE is untested for the same accepted reason `spawn_agents_poller`'s is
+    // (PATTERNS §6): `run_inner` needs a real terminal, so there is nothing to assert
+    // it from. Everything on either side of it IS pinned — the thread's shape through
+    // `watch`'s probe seam, the event's effect through `update::dispatch` — so the
+    // gap is one call, not a behaviour. Do not close it with a proxy assertion.
+    events.spawn_model_alias_probe();
+    // Resolve, from the user's `claude` settings and environment, the model a NEW
+    // session would get and whether an override (`ANTHROPIC_MODEL`,
+    // `ANTHROPIC_DEFAULT_*_MODEL`) stops claude restoring a session's own model —
+    // OFF the UI thread as well, for the compose boxes' `model:` labels and the
+    // picker's first row. Another ONE-SHOT, delivering a single
+    // `AppEvent::SettingsModel`. Being here — once per board session — is what
+    // re-reads it after EVERY return from a `claude` child, so a `/model` pick saved
+    // as the default inside the session that just ended reaches the next draft.
+    // Untested for the same accepted reason as the line above.
+    events.spawn_settings_model_probe(app.launch_dir.clone());
     // The app's queue of completions no board session has read. It outlives this
     // session because `lib::run` re-enters the board on the SAME `App`, while the
     // channel above dies with this function.

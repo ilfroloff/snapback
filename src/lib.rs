@@ -17,11 +17,13 @@
 //! binaries are thin shims that both call [`run`].
 
 mod agents;
+mod claude_settings;
 mod cli;
 mod config;
 mod defined_agents;
 mod delete;
 mod hidden;
+mod model_aliases;
 mod resume;
 mod search;
 mod send;
@@ -354,7 +356,7 @@ mod tests {
         let mut app = app_with_live(&[]);
         let ready = resume::Ready {
             cwd: PathBuf::from("/tmp"),
-            argv: resume::build_new_argv(None, None),
+            argv: resume::build_new_argv(None, None, None),
             nonzero_hint: resume::NEW_SESSION_NONZERO_HINT,
             race_probe_id: None,
         };

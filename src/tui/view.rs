@@ -32,13 +32,14 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::agents::{self, AgentActivity, ReportedAgent};
+use crate::resume::ModelPick;
 use crate::search::SearchMode;
 use crate::store::preview::{self, FoldRegion, LinkRegion};
 use crate::store::FailedTask;
 
 use super::app::{
-    resolve_list_width, App, InterruptRoute, Modal, ModalChoice, ModalLayout, NewSessionDraft, Row,
-    Scope,
+    resolve_list_width, App, ComposeDefault, InterruptRoute, Modal, ModalAction, ModalChoice,
+    ModalLayout, NewSessionDraft, Row, Scope, MODEL_DEFAULT_LABEL, MODEL_NEW_SESSION_SCOPE,
 };
 use super::compose::{ComposeState, ComposeTarget};
 
@@ -93,7 +94,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // A modal (the running-session choice or the new-session agent picker) sits
     // ON TOP of the board when open. The two overlays are now one `Option<Modal>`,
     // so at most one ever draws — a fact made structural, not conventional.
-    if let Some(modal) = &app.modal {
+    // Borrowed MUTABLY for the same reason the list is: a `List` modal's scroll
+    // window is resolved against the clamped box and written back (`Modal::scroll`).
+    if let Some(modal) = app.modal.as_mut() {
         render_modal(frame, modal);
     }
     // The "stop the waiting agent?" confirmation overlays the board before compose
@@ -113,6 +116,40 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 /// `· N hidden` tail — is joined by the SAME string, rather than by a literal
 /// copied per call site that can drift a space.
 const HEADER_SEPARATOR: &str = "  ·  ";
+
+/// How a compose box's `model:` label draws the model its launch will run on: a
+/// `Ctrl-L` pick (with its effort), and the default shown while none is picked —
+/// `session (<model>)`, `default (<value>)` or `default` — alike. One constant for
+/// all of them, so they cannot drift to different colours; a pick and the default
+/// are told apart by their words, not by colour. The `(new sessions only)` scope
+/// after a draft's settings value is NOT in it (see [`compose_model_label`]). The
+/// model picker draws a row's set effort in it too ([`modal_effort_span`]), so a
+/// level reads the same in the picker as in the label it lands in. A named ANSI
+/// colour only (TERMINAL-SAFE STYLING).
+const MODEL_LABEL_STYLE: Style = Style::new().fg(Color::Magenta);
+
+/// What joins a model and its effort — `opus · high` — in a compose's `model:`
+/// label and on a model-picker row. The middot with ONE space either side is the
+/// preview's turn marker separator (`● claude · Opus 5.5 · xhigh`), so a picked
+/// effort reads exactly like the effort a turn records; it is deliberately tighter
+/// than [`HEADER_SEPARATOR`], which parts whole header SEGMENTS rather than the two
+/// halves of one value.
+const MODEL_EFFORT_SEPARATOR: &str = " · ";
+
+/// What a compose's `model:` label calls a REPLY's default — the model its session
+/// last answered with, which claude normally restores with no `--model`:
+/// `model: session (Opus 5.5)`. Terse, because the label shares a border with the
+/// box it sits on; the picker's first row spells the same state out in full
+/// (`session's model (Opus 5.5)`, [`super::app::MODEL_SESSION_ROW_LABEL`]).
+const MODEL_SESSION_LABEL: &str = "session";
+
+/// What a HIGHLIGHTED model-picker row shows while its effort is UNSET: no
+/// `--effort` is sent, so claude applies the model's own level (the user's
+/// settings, else its built-in default). Shown only on the highlighted row, so the
+/// cycle's unset stop is visible where `←`/`→` act without cluttering every other
+/// row. It names no level on purpose — which one the settings would apply is not
+/// something the board reads.
+const EFFORT_UNSET_LABEL: &str = "default effort";
 
 /// Prefix for a release build's version indicator (`v0.1.0`); the leading `v`
 /// is the conventional marker readers expect before a semver string.
@@ -573,6 +610,68 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         Style::default().add_modifier(Modifier::DIM),
     ));
     frame.render_widget(Paragraph::new(version).alignment(Alignment::Right), area);
+}
+
+/// A `Ctrl-L` pick as a compose label names it: the model alone, or
+/// `<model> · <effort>` when the pick carries an effort — the effort as the bare
+/// level, the way a turn marker shows the effort a turn ran at. Pure, so the
+/// wording is asserted without a terminal.
+#[must_use]
+fn model_pick_label(pick: &ModelPick) -> String {
+    match pick.effort {
+        Some(level) => format!("{}{MODEL_EFFORT_SEPARATOR}{level}", pick.model),
+        None => pick.model.clone(),
+    }
+}
+
+/// The `model: …` label a compose box carries on its bottom border: what THIS
+/// reply or draft will run on, as a line of spans. `pick` is the compose's own
+/// `Ctrl-L` pick and `default` what it runs on without one
+/// ([`App::compose_default`]).
+///
+/// * A pick reads `model: <alias>` or `model: <alias> · <effort>`
+///   ([`model_pick_label`]).
+/// * A reply's default reads `model: session (<model>)` — the model its session
+///   last answered with, which claude normally restores — or `model: default` when
+///   claude would not restore it (an environment override, or no answering model
+///   on record).
+/// * A draft's default reads `model: default (<value>) (new sessions only)` with the
+///   settings' model, or bare `model: default` with none.
+///
+/// The value — the part that NAMES a model, `default` included — is drawn in
+/// [`MODEL_LABEL_STYLE`]; the `model: ` prefix and the `(new sessions only)` scope
+/// ([`MODEL_NEW_SESSION_SCOPE`]) are separate UNSTYLED spans, leading space
+/// included, so they take the box's own border colour and only the value carries the
+/// model's. Padded with a space either side, the way the box's top title is.
+///
+/// It is STATE for the compose's whole lifetime, so it renders on the compose box
+/// that owns it and never on `App::status` (AGENTS.md STATUS-LINE OWNERSHIP). Pure,
+/// so the wording AND the styling are asserted without a terminal.
+#[must_use]
+fn compose_model_label(pick: Option<&ModelPick>, default: &ComposeDefault) -> Line<'static> {
+    let mut spans = vec![Span::raw(" model: ")];
+    match (pick, default) {
+        (Some(pick), _) => spans.push(Span::styled(model_pick_label(pick), MODEL_LABEL_STYLE)),
+        (None, ComposeDefault::SessionModel(label)) => spans.push(Span::styled(
+            format!("{MODEL_SESSION_LABEL} ({label})"),
+            MODEL_LABEL_STYLE,
+        )),
+        (None, ComposeDefault::Settings(value)) => {
+            spans.push(Span::styled(
+                format!("{MODEL_DEFAULT_LABEL} ({value})"),
+                MODEL_LABEL_STYLE,
+            ));
+            spans.push(Span::raw(format!(" {MODEL_NEW_SESSION_SCOPE}")));
+        }
+        (
+            None,
+            ComposeDefault::RestoreOverridden
+            | ComposeDefault::NoSessionModel
+            | ComposeDefault::BuiltIn,
+        ) => spans.push(Span::styled(MODEL_DEFAULT_LABEL, MODEL_LABEL_STYLE)),
+    }
+    spans.push(Span::raw(" "));
+    Line::from(spans)
 }
 
 /// The two-pane body: grouped list on the left, preview on the right. The
@@ -1719,13 +1818,20 @@ const REPLY_COOKING_LABEL: &str = "cooking\u{2026}";
 ///
 /// It deliberately does NOT carry the reply arm's "paste keeps newlines" clause,
 /// on COLUMN BUDGET alone — a pasted newline was every bit as destructive here (see
-/// [`compose_hint`] for the measurement). This string is already 97 columns, so on
-/// the one-line help row the clause would be painted past the end of an 80-column
+/// [`compose_hint`] for the measurement). This string is 112 columns, so on the
+/// one-line help row the clause would be painted past the end of an 80-column
 /// terminal, and on the draft card — which wraps rather than clipping — it would
 /// cost a further wrapped row of a placeholder whose whole point is to stay
 /// near-empty.
+///
+/// `Ctrl-L model` (this draft's model picker) is the one key that DID earn a place,
+/// and it sits right after `Ctrl-O run interactively` — ending at column 67 — so it
+/// is inside the 80 columns the help row draws, where the newline clause and
+/// `Esc cancel` behind it already were not. On the card its 15 columns (97 before
+/// it, 112 with it) can cost one more wrapped row on a narrow pane: the price of
+/// naming the key on the one surface a draft shows before anything is typed.
 const BG_DRAFT_HINT: &str = "Enter start in background · Ctrl-O run interactively · \
-                             Ctrl-J newline (or Alt+Enter) · Esc cancel";
+                             Ctrl-L model · Ctrl-J newline (or Alt+Enter) · Esc cancel";
 
 /// The draft card's agent segment: `@handle` for a picked agent, or the picker's
 /// own [`BG_DRAFT_DEFAULT_AGENT`] wording for its default row (a bare `@` would be
@@ -1833,15 +1939,26 @@ fn compose_title(app: &App, compose: &ComposeState) -> String {
 /// query. The two differ in what they let the widget own: this one takes the
 /// widget's cursor as it comes, while the search line overrides the cursor STYLE
 /// per frame to drive the blink (see [`super::compose`] and [`render_search`]).
+///
+/// The box's BOTTOM border carries its `model: …` label ([`compose_model_label`]):
+/// what this reply or draft will run on. On the border rather than inside the box,
+/// so it costs the editor no row — the box is the same height with or without it,
+/// down to the one-row minimum on a short terminal — and it rides whichever place
+/// the box is drawn (docked in the preview, or the full-width bottom bar).
 fn render_compose_zone(frame: &mut Frame, app: &App, area: Rect) {
     let Some(compose) = &app.compose else {
         return;
     };
     let title = compose_title(app, compose);
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
         .title(title);
+    // Resolved from state already in hand (the cached preview and the settings
+    // read), never by reading a file or the environment here in render.
+    if let Some(default) = app.compose_default() {
+        block = block.title_bottom(compose_model_label(compose.model.as_ref(), &default));
+    }
     let inner = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(&compose.textarea, inner);
@@ -1872,7 +1989,7 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default().borders(Borders::ALL).title(" preview ");
 
     // The selected session leads with the marker of whichever turn owns the TOP
-    // row of the viewport, so who spoke — under which agent, when —
+    // row of the viewport, so who spoke — under which agent, on which model, when —
     // stays readable long after that turn's own marker scrolled off the top of a
     // long answer. A LIVE agent's status and age ride after that marker on the same
     // row (`marker_with_live_status`) — unless a background task it launched FAILED
@@ -3295,16 +3412,22 @@ fn chord_hint(selected_hidden: bool) -> String {
 /// by both targets and maps a bare `Enter` to Send, so the same paste that sent a
 /// truncated reply launched a background agent on the draft's first line. The split
 /// is COLUMN BUDGET alone, measured with the `unicode-width` the renderer counts in:
-/// the help row is ONE line that never wraps, the reply hint is 55 columns and the
-/// clause 23, so it lands at 78 and still fits an 80-column terminal, while
-/// [`BG_DRAFT_HINT`] is already 97 there (`Esc cancel` starts at column 88, off
-/// screen) and the clause would be painted at columns 98-120 — nowhere. What a paste
-/// does is documented in full where there is room for it: `KEYS` in `cli.rs` and the
-/// README key map.
+/// the help row is ONE line that never wraps, and the reply hint must fit an
+/// 80-column terminal whole, while [`BG_DRAFT_HINT`] is already past 80 there and
+/// the clause would be painted nowhere. What a paste does is documented in full
+/// where there is room for it: `KEYS` in `cli.rs` and the README key map.
+///
+/// The model key (`Ctrl-L`, both targets) was PAID FOR on the reply hint, which sat
+/// at 78 columns: its `^L model` segment costs 11, so the newline clause went from
+/// `Ctrl-J newline (or Alt+Enter)` to `^J/Alt+Enter newline` — both keys still
+/// named, in the board keymap's caret notation — which lands the hint at EXACTLY
+/// 80 (pinned by `the_reply_hint_fits_an_eighty_column_terminal`). The background
+/// hint keeps its spelled-out keys: it was already cut at 80, and `Ctrl-L model`
+/// sits right after `Ctrl-O run interactively`, inside the columns that ARE drawn.
 fn compose_hint(target: &ComposeTarget) -> &'static str {
     match target {
         ComposeTarget::Reply { .. } => {
-            "Enter send · Ctrl-J newline (or Alt+Enter) · paste keeps newlines · Esc cancel"
+            "Enter send · ^L model · ^J/Alt+Enter newline · paste keeps newlines · Esc cancel"
         }
         // The SAME const the draft card shows, so the two surfaces cannot describe
         // the same keys differently.
@@ -3404,6 +3527,13 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         // fires. The key sits at columns 63-70 of a line cut at 80, so it has
         // no room to list them anyway. They are spelled out on the same three
         // surfaces as `^K`'s routes.
+        //
+        // The compose box's `^L` (pick THIS reply's or draft's model) is absent for
+        // the reason `^J` is: it is a key of the COMPOSE box, not of the board, and
+        // this line lists the board's keys alone. The compose hint that replaces this
+        // line while a box is open names it ([`compose_hint`]), and the model picker
+        // it opens names its own `←/→` effort keys in its prompt and footer — so the
+        // `←/→` below means fold/expand ON THE BOARD only.
         Line::from(vec![Span::styled(
             "↑↓ move · ←/→ fold/expand · Enter resume · ^F fork · ^N new · ^R reply · ^K stop · ^X hide/del · type to search · Tab name/content · S-↑↓ match · ^A scope · ^/ preview · PgUp/PgDn·^U/^D·^T/^E·Home/End·wheel scroll · Esc quit",
             Style::default().add_modifier(Modifier::DIM),
@@ -3419,6 +3549,29 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
 /// fit on a tiny terminal.
 const MODAL_WIDTH: u16 = 62;
 
+/// Columns a modal's `Borders::ALL` block takes from its content: one on the
+/// left, one on the right. The width counterpart of [`MODAL_BORDER_ROWS`].
+const MODAL_BORDER_COLS: u16 = 2;
+
+/// Columns a modal's content has inside its borders. The message and a wrapped
+/// `List` description ([`modal_list_row_lines`]) both wrap to this one width, so
+/// neither can put the border somewhere other than where the box draws it.
+const MODAL_INNER_WIDTH: u16 = MODAL_WIDTH - MODAL_BORDER_COLS;
+
+/// What a SELECTED `List`-modal row starts with: the session list's own highlight
+/// glyph, so a picker's selection looks like the board's.
+const MODAL_LIST_SELECTED_MARKER: &str = "› ";
+
+/// What an UNSELECTED `List`-modal row starts with: blanks, exactly as wide as
+/// [`MODAL_LIST_SELECTED_MARKER`]. The label, and a wrapped description's hanging
+/// indent ([`modal_list_description_column`]), then sit in the same column
+/// whichever row is highlighted. If the widths differed, moving the selection
+/// would re-wrap a description and change its row's height mid-keypress.
+const MODAL_LIST_UNSELECTED_MARKER: &str = "  ";
+
+/// The gap between a `List`-modal row's label and its description.
+const MODAL_LIST_DESCRIPTION_GAP: &str = "  ";
+
 /// Non-message rows a `Row`-layout modal draws, borders excluded: a blank spacer,
 /// the button strip, a blank spacer, and the footer help line. The message (one or
 /// more wrapped rows) is added on top, so the box grows to fit a long prompt rather
@@ -3426,18 +3579,61 @@ const MODAL_WIDTH: u16 = 62;
 const MODAL_ROW_CHROME_ROWS: u16 = 4;
 
 /// Non-message, non-entry rows a `List`-layout modal draws around its selectable
-/// list: a blank spacer above the list, a blank spacer below it, and a footer help
-/// line. The box height is message rows + entries + this chrome + two borders, so a
-/// picker grows with its choice count (the picker's old `AGENT_PICK_CHROME_ROWS`
-/// reasoning, kept) and any modal grows with a wrapped message.
+/// list: a spacer row above the list, a spacer row below it, and a footer help
+/// line. The box height is message rows + the lines its choices draw + this
+/// chrome + two borders, so a picker grows with its choice count (the picker's old
+/// `AGENT_PICK_CHROME_ROWS` reasoning, kept) and any modal grows with a wrapped
+/// message.
+///
+/// The two spacers are where the scrolled-list affordance is PAID FOR: when rows
+/// sit off the window they carry [`modal_more_line`]'s dim `N more` marker instead
+/// of being blank, so the overflow hint costs the box zero extra rows (see
+/// [`modal_list_window`]).
 const MODAL_LIST_CHROME_ROWS: u16 = 3;
+
+/// The most choice rows a `List`-layout modal ASKS for before it scrolls instead
+/// of growing.
+///
+/// Without a cap the box grows one row per choice without bound — the agent picker
+/// draws one row per user-defined agent, and the model picker one per alias — so on
+/// a tall terminal an overlay stops reading as an overlay and covers the board it
+/// is supposed to sit on. Twelve is measured against the classic 24-row terminal:
+/// a one-row message plus [`MODAL_LIST_CHROME_ROWS`] plus two borders is six rows
+/// of chrome, so a full 12-row window lands an 18-row box that still leaves six
+/// rows of board visible around it. Whatever the cap, the terminal's own height
+/// clamps the box further ([`centered_rect`]) and [`modal_list_window`] scrolls the
+/// remainder into reach either way — this only decides how much is offered at once.
+///
+/// It counts CHOICES, not screen lines. A choice with a wrapped description
+/// ([`modal_list_row_lines`]) takes more than one line. The box pays for those
+/// extra lines on top of the cap ([`modal_list_lines_asked`]), so a wrapped row
+/// never pushes a choice out of the window. A cap in lines would instead offer
+/// fewer choices whenever the wrapped row was in view, so the same picker would
+/// report a different `N more` count at its two ends.
+const MODAL_LIST_MAX_ROWS: u16 = 12;
+
+/// Rows a modal's `Borders::ALL` block costs its content: one top, one bottom.
+/// Named because BOTH the height a modal asks for and the viewport
+/// [`render_modal`] derives back out of the clamped box subtract it, and the two
+/// must be the same number or the list window disagrees with the box drawing it.
+const MODAL_BORDER_ROWS: u16 = 2;
+
+/// The marker on a scrolled `List` modal's UPPER spacer row: rows exist above the
+/// window. An arrow rather than an ellipsis so the direction to press is the thing
+/// the glyph says.
+const MODAL_MORE_ABOVE: &str = "\u{2191}";
+/// The [`MODAL_MORE_ABOVE`] counterpart on the LOWER spacer row: rows exist below
+/// the window.
+const MODAL_MORE_BELOW: &str = "\u{2193}";
 
 /// Word-wrap `text` into lines no wider than `width` columns, breaking on
 /// whitespace; a single word longer than `width` is kept whole (it clips rather
 /// than splitting mid-word — fine for the short, controlled prompts a modal
 /// carries). Always returns at least one line so an empty message still reserves a
 /// row. Pure, so the wrapped line count that sizes the modal box is unit-testable.
-/// Counts by `char` — exact for the ASCII prompts these modals use.
+/// Counts by `char`, which is exact for the ASCII prompts these modals use. It is
+/// the ONE wrapping rule for a modal: the message and a wrapped `List`
+/// description ([`modal_list_row_lines`]) both go through it.
 fn wrap_message(text: &str, width: u16) -> Vec<String> {
     let width = usize::from(width.max(1));
     let mut lines: Vec<String> = Vec::new();
@@ -3624,30 +3820,70 @@ fn render_interrupt_confirm(frame: &mut Frame, app: &App) {
 /// Drawn last (on top of the board) with a [`Clear`] so the board shows through
 /// only outside the box. The choices, the highlight, and the routing all live on
 /// the [`Modal`] in [`App`], so this is pure presentation. Styled with named
-/// colors + modifiers only (terminal-safe). The message accent and footer are
+/// colors + modifiers only (terminal-safe). The message accent and alignment are
 /// derived from the layout, preserving each overlay's original chrome: a `Row`
-/// reads as a warning/confirm (`Yellow`, `←/→ … Enter confirm`, centered), a
-/// `List` as a picker (`Cyan`, `↑/↓ … Enter draft`, left-aligned).
-fn render_modal(frame: &mut Frame, modal: &Modal) {
-    let (accent, footer) = match modal.layout {
-        ModalLayout::Row => (
-            Color::Yellow,
-            "\u{2190}/\u{2192} choose \u{b7} Enter confirm \u{b7} Esc cancel",
-        ),
-        // The picker has TWO verbs, so its footer names both: Enter drafts the
-        // session's first message (staying on the board), Ctrl-O starts the agent
-        // interactively at once (leaving it). One key each — neither is buried.
-        ModalLayout::List => (
-            Color::Cyan,
-            "↑/↓ choose · Enter draft · ^O interactive · Esc cancel",
-        ),
+/// reads as a warning/confirm (`Yellow`, centered), a `List` as a picker (`Cyan`,
+/// left-aligned). The footer is NOT derived from it: the two `List` pickers share a
+/// layout but not their verbs, so each modal carries its own ([`Modal::footer`])
+/// and this draws it as given.
+///
+/// A `List` also SCROLLS, which is why this takes `&mut`: the box asks for at most
+/// [`MODAL_LIST_MAX_ROWS`] choices' worth of lines, [`centered_rect`] clamps even
+/// that on a short terminal, and [`modal_list_window`] then resolves which slice of
+/// the choices the surviving lines show — writing the resolved offset back onto the
+/// modal the way [`render_list`] writes back `App::scroll`, because only a render
+/// knows the viewport. Without it the box drew every choice top-down and a clamped
+/// height simply lost the tail: a picker's later rows were unreachable rather than
+/// scrolled, and both pickers grow with data (one row per defined agent, one per
+/// model alias) rather than being fixed-size.
+///
+/// A choice is not always one line. Its height is the number of lines
+/// [`modal_list_row_lines`] draws for it, and the asked height, the window and the
+/// drawn slice all take that height from the SAME built lines.
+fn render_modal(frame: &mut Frame, modal: &mut Modal) {
+    let accent = match modal.layout {
+        ModalLayout::Row => Color::Yellow,
+        ModalLayout::List => Color::Cyan,
     };
 
     // Wrap the message to the box's inner width (borders excluded) so a long prompt
     // — e.g. the delete confirmation — shows in full instead of clipping at the
     // border; the box height below counts the wrapped rows so the two agree.
-    let message = wrap_message(&modal.message, MODAL_WIDTH.saturating_sub(2));
+    let message = wrap_message(&modal.message, MODAL_INNER_WIDTH);
     let message_rows = message.len() as u16;
+
+    // A `List`'s choices as the lines they DRAW, built once. Each row's height is
+    // its `len()`, and the box height, the window and the lines drawn below all
+    // read that one count. A wrapped description can then never be drawn taller
+    // than the arithmetic made room for. Empty for a `Row`, which has no list.
+    let list_rows: Vec<Vec<Line<'static>>> = match modal.layout {
+        ModalLayout::Row => Vec::new(),
+        ModalLayout::List => modal
+            .choices
+            .iter()
+            .enumerate()
+            .map(|(i, choice)| modal_list_row_lines(choice, i == modal.selected))
+            .collect(),
+    };
+    let row_heights: Vec<usize> = list_rows.iter().map(Vec::len).collect();
+    let max_rows = usize::from(MODAL_LIST_MAX_ROWS);
+
+    // The height the box ASKS for (message rows + chrome + borders; a list also
+    // grows with the lines its choices draw, up to the cap). `centered_rect` clamps
+    // it, and for a `List` the surviving rows are what the window below is measured
+    // against — so the height is resolved BEFORE the window, not alongside it.
+    let height = match modal.layout {
+        ModalLayout::Row => message_rows
+            .saturating_add(MODAL_ROW_CHROME_ROWS)
+            .saturating_add(MODAL_BORDER_ROWS),
+        ModalLayout::List => u16::try_from(modal_list_lines_asked(&row_heights, max_rows))
+            .unwrap_or(u16::MAX)
+            .saturating_add(message_rows)
+            .saturating_add(MODAL_LIST_CHROME_ROWS)
+            .saturating_add(MODAL_BORDER_ROWS),
+    };
+    let area = centered_rect(frame.area(), MODAL_WIDTH, height);
+
     let mut lines: Vec<Line> = message
         .into_iter()
         .map(|l| {
@@ -3657,39 +3893,61 @@ fn render_modal(frame: &mut Frame, modal: &Modal) {
             ))
         })
         .collect();
-    lines.push(Line::from(""));
 
-    // The choices, plus the box height (message rows + chrome + borders; a list also
-    // grows with its entry count).
-    let height = match modal.layout {
+    match modal.layout {
         ModalLayout::Row => {
+            lines.push(Line::from(""));
             lines.push(Line::from(modal_button_row(&modal.choices, modal.selected)));
-            message_rows
-                .saturating_add(MODAL_ROW_CHROME_ROWS)
-                .saturating_add(2)
+            lines.push(Line::from(""));
         }
         ModalLayout::List => {
-            for (i, choice) in modal.choices.iter().enumerate() {
-                lines.push(modal_list_row(
-                    &choice.label,
-                    choice.description.as_deref(),
-                    i == modal.selected,
-                ));
-            }
-            (modal.choices.len() as u16)
-                .saturating_add(message_rows)
-                .saturating_add(MODAL_LIST_CHROME_ROWS)
-                .saturating_add(2)
+            // How many list LINES the CLAMPED box actually has room for — the same
+            // subtraction the height was built from, run backwards.
+            let viewport = usize::from(
+                area.height
+                    .saturating_sub(message_rows)
+                    .saturating_sub(MODAL_LIST_CHROME_ROWS)
+                    .saturating_sub(MODAL_BORDER_ROWS),
+            );
+            let total = list_rows.len();
+            modal.scroll = modal_list_window(
+                &row_heights,
+                modal.selected,
+                viewport,
+                max_rows,
+                modal.scroll,
+            );
+            let shown = modal_list_shown(&row_heights, modal.scroll, viewport, max_rows);
+            // The two spacers carry the overflow hint instead of being blank, so the
+            // affordance costs the box nothing.
+            lines.push(modal_more_line(MODAL_MORE_ABOVE, modal.scroll));
+            // A row taller than the room left is cut at the viewport: its first line
+            // (the marker and label) is drawn and the rest is clipped.
+            let drawn: Vec<Line<'static>> = list_rows
+                .into_iter()
+                .skip(modal.scroll)
+                .take(shown)
+                .flatten()
+                .take(viewport)
+                .collect();
+            // Pad to the viewport, so the lower spacer and the footer stay on the
+            // box's last rows when the window holds fewer lines than the tallest
+            // window the box was sized for.
+            let padding = viewport.saturating_sub(drawn.len());
+            lines.extend(drawn);
+            lines.extend(std::iter::repeat_n(Line::from(""), padding));
+            lines.push(modal_more_line(
+                MODAL_MORE_BELOW,
+                total.saturating_sub(modal.scroll.saturating_add(shown)),
+            ));
         }
-    };
+    }
 
-    lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        footer,
+        modal.footer,
         Style::default().add_modifier(Modifier::DIM),
     )));
 
-    let area = centered_rect(frame.area(), MODAL_WIDTH, height);
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" {} ", modal.title));
@@ -3721,34 +3979,287 @@ fn modal_button_row(choices: &[ModalChoice], selected: usize) -> Vec<Span<'stati
     spans
 }
 
-/// One row of a `List`-layout modal: a `› ` marker + reversed, bold label when
-/// selected (the same highlight glyph the session list uses), else a padded label,
-/// with an optional dim description trailing. Owns its text (`'static`) so it
-/// composes into the modal `Paragraph`. (The picker's old `agent_entry_line`,
-/// generalized to any list modal.)
-fn modal_list_row(label: &str, description: Option<&str>, selected: bool) -> Line<'static> {
+/// The FIRST line of a `List`-layout modal row: a [`MODAL_LIST_SELECTED_MARKER`]
+/// and a reversed, bold label when selected (the same highlight glyph the session
+/// list uses), else a padded label, then the model picker's inline `effort` when
+/// there is one ([`modal_effort_span`]), with an optional dim description trailing
+/// after [`MODAL_LIST_DESCRIPTION_GAP`]. For most rows this is the whole row. A
+/// wrapping choice gets its extra lines from [`modal_list_row_lines`], which owns
+/// the rule for how tall a row is. Owns its text (`'static`) so it composes into
+/// the modal `Paragraph`. (The picker's old `agent_entry_line`, generalized to any
+/// list modal.)
+fn modal_list_row(
+    label: &str,
+    effort: Option<Span<'static>>,
+    description: Option<&str>,
+    selected: bool,
+) -> Line<'static> {
     let (marker, label_style) = if selected {
         (
-            "› ",
+            MODAL_LIST_SELECTED_MARKER,
             Style::default()
                 .add_modifier(Modifier::REVERSED)
                 .add_modifier(Modifier::BOLD),
         )
     } else {
-        ("  ", Style::default())
+        (MODAL_LIST_UNSELECTED_MARKER, Style::default())
     };
     let mut spans = vec![
         Span::raw(marker),
         Span::styled(label.to_string(), label_style),
     ];
+    spans.extend(effort);
     if let Some(desc) = description {
-        spans.push(Span::raw("  "));
+        spans.push(Span::raw(MODAL_LIST_DESCRIPTION_GAP));
         spans.push(Span::styled(
             desc.to_string(),
             Style::default().add_modifier(Modifier::DIM),
         ));
     }
     Line::from(spans)
+}
+
+/// The inline effort a model-picker row draws right after its label, or `None`.
+///
+/// Only a model row has one — a [`ModalAction::SetModel`]`(Some(_))` choice, the
+/// rows `←`/`→` act on. Every other row, the picker's default row and every
+/// agent-picker row included, draws exactly as it always has. On a model row:
+///
+/// * a SET effort draws as ` · <level>` in [`MODEL_LABEL_STYLE`] whether or not
+///   the row is highlighted — each row keeps its own effort while the picker is
+///   open, so a level left on a row the highlight moved away from stays visible
+///   rather than becoming hidden state;
+/// * an UNSET effort draws as a dim ` · default effort` ([`EFFORT_UNSET_LABEL`]) on
+///   the HIGHLIGHTED row only, marking the cycle's unset stop where the keys act,
+///   and as nothing on any other row.
+///
+/// The ` · ` is [`MODEL_EFFORT_SEPARATOR`], the compose label's, so a confirmed row
+/// reads exactly like the `model:` label it becomes. Pure, so what each row shows is
+/// asserted without a terminal.
+#[must_use]
+fn modal_effort_span(action: &ModalAction, selected: bool) -> Option<Span<'static>> {
+    let ModalAction::SetModel(Some(pick)) = action else {
+        return None;
+    };
+    match pick.effort {
+        Some(level) => Some(Span::styled(
+            format!("{MODEL_EFFORT_SEPARATOR}{level}"),
+            MODEL_LABEL_STYLE,
+        )),
+        None if selected => Some(Span::styled(
+            format!("{MODEL_EFFORT_SEPARATOR}{EFFORT_UNSET_LABEL}"),
+            Style::default().add_modifier(Modifier::DIM),
+        )),
+        None => None,
+    }
+}
+
+/// The column inside the box where a `List`-modal row's description starts:
+/// marker, label, then the gap.
+///
+/// A WRAPPED description indents its continuation lines to exactly this column (a
+/// hanging indent). That is also why one wrap width serves every line: the room
+/// beside the label on the first line and the room under it on each later line
+/// are both `MODAL_INNER_WIDTH - column`. So [`wrap_message`] wraps the whole
+/// description in one call, and no second rule with two widths is needed. Counted
+/// by `char`, the way `wrap_message` counts.
+fn modal_list_description_column(label: &str) -> u16 {
+    let column = MODAL_LIST_SELECTED_MARKER.chars().count()
+        + label.chars().count()
+        + MODAL_LIST_DESCRIPTION_GAP.chars().count();
+    u16::try_from(column).unwrap_or(u16::MAX)
+}
+
+/// One `List`-modal choice as the lines it DRAWS, which also makes it the row's
+/// height. Everything that counts a choice's lines reads the `len()` of this: the
+/// box height ([`modal_list_lines_asked`]), the scroll window
+/// ([`modal_list_window`]) and the drawn slice ([`modal_list_shown`]). One wrap
+/// produces the lines and the count, so the drawing and the arithmetic cannot
+/// disagree.
+///
+/// A choice is ONE line ([`modal_list_row`]), its description trailing the label
+/// and clipped at the border, unless it opts into
+/// [`ModalChoice::wrap_description`]. For such a choice, [`wrap_message`] wraps
+/// the description to the room right of the label. The first chunk trails the
+/// label as usual. Each further chunk gets its own DIM line, indented to the
+/// description's column ([`modal_list_description_column`]), so the whole text is
+/// drawn and reads as part of the row. The line count is whatever the wrap
+/// produced, never a fixed number: it moves with the label's width (a reply's
+/// `session's model (Opus 5.5)` leaves less room beside it than a bare `default`)
+/// and with the description it explains. Named modifiers only (TERMINAL-SAFE
+/// STYLING).
+fn modal_list_row_lines(choice: &ModalChoice, selected: bool) -> Vec<Line<'static>> {
+    let description = choice.description.as_deref();
+    let effort = modal_effort_span(&choice.action, selected);
+    let Some(text) = description.filter(|_| choice.wrap_description) else {
+        return vec![modal_list_row(&choice.label, effort, description, selected)];
+    };
+    // A wrapping row's hanging indent is measured from the LABEL alone, so it must
+    // never also carry an effort. It cannot today: only the model picker's
+    // default row wraps, and that row holds no pick (so no effort).
+    debug_assert!(effort.is_none(), "a wrapping row never carries an effort");
+    let column = modal_list_description_column(&choice.label);
+    let mut chunks = wrap_message(text, MODAL_INNER_WIDTH.saturating_sub(column)).into_iter();
+    // `wrap_message` always yields at least one line; the default is unreachable.
+    let first = chunks.next().unwrap_or_default();
+    let indent = " ".repeat(usize::from(column));
+    let mut lines = vec![modal_list_row(&choice.label, None, Some(&first), selected)];
+    lines.extend(chunks.map(|chunk| {
+        Line::from(vec![
+            Span::raw(indent.clone()),
+            Span::styled(chunk, Style::default().add_modifier(Modifier::DIM)),
+        ])
+    }));
+    lines
+}
+
+/// The least first row `start <= end` from which rows `start..=end` are all drawn
+/// WHOLE: at most `max_rows` of them, in at most `viewport` lines, given each
+/// row's line count in `heights`.
+///
+/// When `end` ALONE is taller than the viewport, the answer is `end` itself. Its
+/// top lines, which carry the marker and the label, are drawn and the rest is
+/// clipped. That keeps a row taller than the whole box selectable instead of
+/// unreachable. `end` past the last row is treated as the last row, and an empty
+/// list answers 0. Pure.
+#[must_use]
+fn modal_list_first_fitting(
+    heights: &[usize],
+    end: usize,
+    viewport: usize,
+    max_rows: usize,
+) -> usize {
+    let Some(last) = heights.len().checked_sub(1) else {
+        return 0;
+    };
+    let end = end.min(last);
+    // `start` is exclusive of what is taken so far: `start..=end` fits.
+    let mut start = end + 1;
+    let mut used = 0usize;
+    while start > 0 && end + 1 - start < max_rows {
+        let next = used.saturating_add(heights[start - 1]);
+        if next > viewport {
+            break;
+        }
+        used = next;
+        start -= 1;
+    }
+    start.min(end)
+}
+
+/// Resolve a `List`-layout modal's scroll window: given each choice's line count
+/// in `heights` (from [`modal_list_row_lines`]), the `selected` index, a
+/// `viewport` of that many drawable LINES holding at most `max_rows` choices, and
+/// the offset the modal is CURRENTLY scrolled to, return the index of the first
+/// choice to draw.
+///
+/// The rule is ratatui `ListState`'s, which is the board list's rule (PATTERNS §5,
+/// via `render_list`) rather than a second scrolling idiom: keep the current offset
+/// wherever the selection is still inside it, and otherwise move by the least
+/// amount that brings the selection back — to the top when it sits above the
+/// window, to the bottom when it sits below. That is what makes SELECTION FOLLOW
+/// SCROLL: whatever `App::cycle_modal` picked, including a `rem_euclid` wrap from
+/// one end of the list to the other, the returned window contains it. "Inside"
+/// means drawn WHOLE: every line of a wrapped selected row, not only its first
+/// ([`modal_list_first_fitting`]). The exception is a selected row taller than the
+/// whole viewport, which is shown from its top.
+///
+/// Total and saturating over every degenerate input, because the viewport is
+/// derived from a terminal the user can size freely: a `viewport` of 0 (a box with
+/// no room for a single line) answers 0 and draws nothing rather than underflowing,
+/// a `viewport` of 1 pins the window to the selection, a list SHORTER than the
+/// viewport answers 0 (there is nothing to scroll), and a `selected` past the end
+/// is treated as the last row rather than trusted.
+///
+/// Pure, so the window arithmetic is unit-tested without a terminal.
+#[must_use]
+fn modal_list_window(
+    heights: &[usize],
+    selected: usize,
+    viewport: usize,
+    max_rows: usize,
+    current: usize,
+) -> usize {
+    let Some(last) = heights.len().checked_sub(1) else {
+        return 0;
+    };
+    if viewport == 0 || max_rows == 0 {
+        return 0;
+    }
+    let selected = selected.min(last);
+    // Past this offset the window would end before the list does, leaving blank
+    // lines below the last row. So an offset a longer list or a shorter terminal
+    // left behind is pulled back here first.
+    let max_scroll = modal_list_first_fitting(heights, last, viewport, max_rows);
+    // Every offset from `lowest` to `selected` draws the selection whole, so
+    // clamping into that range is exactly the least move that brings it back. The
+    // clamp cannot push past `max_scroll`: `lowest <= max_scroll` because
+    // `selected <= last`, and a later row never fits from an earlier start.
+    let lowest = modal_list_first_fitting(heights, selected, viewport, max_rows);
+    current.min(max_scroll).clamp(lowest, selected)
+}
+
+/// How many choices, starting at `scroll`, get at least their FIRST line drawn in
+/// a `viewport` of that many lines holding at most `max_rows` choices. A row cut
+/// off at the viewport's end counts as shown: its label is on screen, so the
+/// `N more` count below it leaves it out. Pure.
+#[must_use]
+fn modal_list_shown(heights: &[usize], scroll: usize, viewport: usize, max_rows: usize) -> usize {
+    let mut used = 0usize;
+    let mut shown = 0usize;
+    for &height in heights.iter().skip(scroll) {
+        if shown == max_rows || used >= viewport {
+            break;
+        }
+        used = used.saturating_add(height);
+        shown += 1;
+    }
+    shown
+}
+
+/// The list lines a `List` modal ASKS for: what the tallest run of `max_rows`
+/// consecutive choices takes, or the whole list's lines when it has no more
+/// choices than that.
+///
+/// Using the TALLEST run makes the box one fixed height for the whole modal. The
+/// window can then scroll anywhere, including onto a wrapped row, without pushing
+/// a choice out of the [`MODAL_LIST_MAX_ROWS`] it offers. A box sized to the
+/// current window would change height under the user's keypress. A window with no
+/// wrapped row in it leaves the extra lines blank at the bottom of the list.
+/// Pure.
+#[must_use]
+fn modal_list_lines_asked(heights: &[usize], max_rows: usize) -> usize {
+    if max_rows == 0 {
+        return 0;
+    }
+    if heights.len() <= max_rows {
+        return heights.iter().sum();
+    }
+    heights
+        .windows(max_rows)
+        .map(|run| run.iter().sum::<usize>())
+        .max()
+        .unwrap_or(0)
+}
+
+/// The dim `↑ N more` / `↓ N more` marker a scrolled `List` modal draws on the
+/// spacer row [`MODAL_LIST_CHROME_ROWS`] already reserves, or a blank line when
+/// nothing is off-window in that direction.
+///
+/// It costs the box no height at all — the spacer was there and blank — which is
+/// why the affordance is here rather than as a row of its own: a picker that had to
+/// grow to admit it would be fighting the very clamp this viewport exists to
+/// survive. Named ANSI arrows + `Modifier::DIM` only, no RGB and no raw escapes
+/// (TERMINAL-SAFE STYLING); the leading two spaces line the marker up with
+/// [`modal_list_row`]'s unselected indent so it reads as part of the list.
+fn modal_more_line(arrow: &str, hidden: usize) -> Line<'static> {
+    if hidden == 0 {
+        return Line::from("");
+    }
+    Line::from(Span::styled(
+        format!("  {arrow} {hidden} more"),
+        Style::default().add_modifier(Modifier::DIM),
+    ))
 }
 
 /// A centered `width`x`height` (cells) rect within `area`, clamped so it never
@@ -4214,6 +4725,347 @@ mod tests {
             app.project_head().as_deref(),
             Some(project_name(&app).as_str()),
             "and the one group head still reads exactly as the header does"
+        );
+    }
+
+    /// The header is scope, search and counts ONLY: no `model:` segment. A model is
+    /// picked per compose now, so the board has no model of its own to name — and
+    /// a pick made in a compose must not leak onto the header either.
+    #[test]
+    fn the_header_names_no_model() {
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::CurrentFolder,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.set_settings_model(Some("opus[1m]".to_string()));
+        let header = drawn_header(&app);
+        assert!(
+            header.contains("folder:launch") && header.contains("search: name"),
+            "the scope and search segments are drawn: {header}"
+        );
+        crate::tui::compose::open_background(&mut app, None);
+        app.set_compose_model(Some(ModelPick::new("haiku")));
+        let composing = drawn_header(&app);
+        for leaked in ["model:", "opus[1m]", "haiku", MODEL_NEW_SESSION_SCOPE] {
+            assert!(
+                !header.contains(leaked) && !composing.contains(leaked),
+                "the header must not name a model ({leaked:?}): {header} / {composing}"
+            );
+        }
+        let counts = app.session_counts();
+        assert!(
+            header.contains(&format!("{} / {} sessions", counts.visible, counts.total)),
+            "the counter is whole at the harness width: {header}"
+        );
+    }
+
+    /// [`model_pick_label`] is a pick's wording, stated directly.
+    #[test]
+    fn the_model_pick_label_is_the_model_then_its_effort() {
+        assert_eq!(model_pick_label(&ModelPick::new("sonnet")), "sonnet");
+        assert_eq!(
+            model_pick_label(&ModelPick {
+                model: "sonnet".to_string(),
+                effort: Some("xhigh"),
+            }),
+            "sonnet · xhigh"
+        );
+    }
+
+    /// [`compose_model_label`]'s wording AND styling per case, stated directly: the
+    /// value that names a model (`default` included) in magenta, the `model: `
+    /// prefix, the draft's `(new sessions only)` scope and the padding unstyled.
+    #[test]
+    fn the_compose_model_label_names_each_case_and_styles_only_the_value() {
+        let magenta = Style::default().fg(Color::Magenta);
+        let label = |pick: Option<ModelPick>, default: ComposeDefault| {
+            compose_model_label(pick.as_ref(), &default).spans
+        };
+
+        // A reply's default: the session's own model, or `default` when claude
+        // would not restore it.
+        assert_eq!(
+            label(None, ComposeDefault::SessionModel("Opus 5.5".to_string())),
+            vec![
+                Span::raw(" model: "),
+                Span::styled("session (Opus 5.5)", magenta),
+                Span::raw(" "),
+            ]
+        );
+        for plain in [
+            ComposeDefault::RestoreOverridden,
+            ComposeDefault::NoSessionModel,
+            ComposeDefault::BuiltIn,
+        ] {
+            assert_eq!(
+                label(None, plain.clone()),
+                vec![
+                    Span::raw(" model: "),
+                    Span::styled("default", magenta),
+                    Span::raw(" "),
+                ],
+                "{plain:?} reads a bare `model: default`"
+            );
+        }
+        // A draft's default with a settings value: scoped to new sessions, the
+        // scope unstyled.
+        assert_eq!(
+            label(None, ComposeDefault::Settings("opus[1m]".to_string())),
+            vec![
+                Span::raw(" model: "),
+                Span::styled("default (opus[1m])", magenta),
+                Span::raw(" (new sessions only)"),
+                Span::raw(" "),
+            ]
+        );
+        // A pick replaces whichever default, with its effort after it.
+        for default in [
+            ComposeDefault::SessionModel("Opus 5.5".to_string()),
+            ComposeDefault::Settings("opus[1m]".to_string()),
+        ] {
+            assert_eq!(
+                label(Some(ModelPick::new("sonnet")), default.clone()),
+                vec![
+                    Span::raw(" model: "),
+                    Span::styled("sonnet", magenta),
+                    Span::raw(" "),
+                ],
+                "a pick replaces the {default:?} default"
+            );
+        }
+        assert_eq!(
+            label(
+                Some(ModelPick {
+                    model: "opus".to_string(),
+                    effort: Some("high"),
+                }),
+                ComposeDefault::BuiltIn,
+            ),
+            vec![
+                Span::raw(" model: "),
+                Span::styled("opus · high", magenta),
+                Span::raw(" "),
+            ]
+        );
+    }
+
+    /// A board row backed by a committed PREVIEW fixture, so drawing its preview
+    /// really parses a transcript — the one way a session's model is on record.
+    fn preview_fixture_row(id: &str, file: &str) -> Session {
+        let mut row = sample_session();
+        row.session_id = id.to_string();
+        row.label = id.to_string();
+        row.file = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("preview")
+            .join(file);
+        row
+    }
+
+    /// A board wide and tall enough that the compose box DOCKS in the preview pane
+    /// and its bottom border is wide enough for the longest label these cases draw
+    /// (`model: default (opus[1m]) (new sessions only)`) with room to spare.
+    const LABEL_BOARD: (u16, u16) = (140, 30);
+
+    /// The compose box's bottom border row — the row its `model:` label rides on —
+    /// as drawn, with its index: the first `└` row BELOW the row whose top border
+    /// carries `title`. Read off the buffer, never off the geometry under test.
+    fn drawn_compose_bottom(
+        buffer: &ratatui::buffer::Buffer,
+        (width, height): (u16, u16),
+        title: &str,
+    ) -> (u16, String) {
+        let rows: Vec<String> = (0..height)
+            .map(|y| full_row_text(buffer, y, width))
+            .collect();
+        let top = rows
+            .iter()
+            .position(|row| row.contains(title))
+            .unwrap_or_else(|| panic!("the compose box titled {title:?} is drawn"));
+        let bottom = (top + 1..rows.len())
+            .find(|&y| rows[y].contains(BOX_BOTTOM_LEFT))
+            .expect("the compose box is closed by a bottom border");
+        (
+            u16::try_from(bottom).expect("a terminal row"),
+            rows[bottom].clone(),
+        )
+    }
+
+    /// The foreground colour of every cell `needle` covers on row `y`, as drawn.
+    fn row_fgs(buffer: &ratatui::buffer::Buffer, y: u16, width: u16, needle: &str) -> Vec<Color> {
+        let text = full_row_text(buffer, y, width);
+        let byte = text
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} is not drawn on row {y}: {text}"));
+        let start = u16::try_from(text[..byte].chars().count()).expect("a column");
+        let len = u16::try_from(needle.chars().count()).expect("a short needle");
+        (start..start + len)
+            .map(|x| buffer.cell((x, y)).expect("on screen").fg)
+            .collect()
+    }
+
+    /// A REPLY box names what the reply runs on, on its bottom border, drawn — and
+    /// the label follows the state: the session's own model by default (the newest
+    /// one the transcript recorded), `default` once an environment override means
+    /// claude would not restore it, and the compose's own pick once one is made.
+    /// The value is magenta (spelled out here rather than read back from
+    /// [`MODEL_LABEL_STYLE`], so a change to that constant turns this red) and none
+    /// of it ever reaches the status line.
+    #[test]
+    fn a_reply_box_names_the_model_the_reply_runs_on() {
+        let mut app = App::new(
+            vec![preview_fixture_row(
+                "sbv-switch",
+                "sess-model-switch-1.jsonl",
+            )],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        crate::tui::compose::open(&mut app, "sbv-switch".to_string(), None);
+
+        let buffer = drawn_board(&mut app, LABEL_BOARD.0, LABEL_BOARD.1);
+        let (y, bottom) = drawn_compose_bottom(&buffer, LABEL_BOARD, COMPOSE_TITLE_MARKER);
+        assert!(
+            bottom.contains("model: session (Sonnet 5)"),
+            "the reply's default is its session's newest answering model: {bottom}"
+        );
+        assert!(
+            row_fgs(&buffer, y, LABEL_BOARD.0, "session (Sonnet 5)")
+                .iter()
+                .all(|fg| *fg == Color::Magenta),
+            "the value is drawn magenta"
+        );
+        assert!(
+            row_fgs(&buffer, y, LABEL_BOARD.0, "model: ")
+                .iter()
+                .all(|fg| *fg != Color::Magenta),
+            "the prefix is not"
+        );
+
+        app.set_restore_overridden(true);
+        let buffer = drawn_board(&mut app, LABEL_BOARD.0, LABEL_BOARD.1);
+        let (_, bottom) = drawn_compose_bottom(&buffer, LABEL_BOARD, COMPOSE_TITLE_MARKER);
+        assert!(
+            bottom.contains("model: default ") && !bottom.contains("session ("),
+            "an override means claude will not restore it, so the box says default: \
+             {bottom}"
+        );
+
+        app.set_compose_model(Some(ModelPick {
+            model: "opus".to_string(),
+            effort: Some("high"),
+        }));
+        let buffer = drawn_board(&mut app, LABEL_BOARD.0, LABEL_BOARD.1);
+        let (y, bottom) = drawn_compose_bottom(&buffer, LABEL_BOARD, COMPOSE_TITLE_MARKER);
+        assert!(
+            bottom.contains("model: opus · high"),
+            "a pick names the alias and its effort: {bottom}"
+        );
+        assert!(
+            row_fgs(&buffer, y, LABEL_BOARD.0, "opus · high")
+                .iter()
+                .all(|fg| *fg == Color::Magenta),
+            "the whole pick, effort included, is magenta"
+        );
+        assert_eq!(
+            app.status, None,
+            "the label is compose STATE, never a status-line message"
+        );
+    }
+
+    /// A reply whose transcript records NO answering model says `model: default`:
+    /// claude has nothing to restore, so naming a session model would be a guess.
+    #[test]
+    fn a_reply_with_no_answering_model_on_record_says_default() {
+        let mut app = App::new(
+            vec![preview_fixture_row(
+                "sbv-absent",
+                "sess-model-absent-1.jsonl",
+            )],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        crate::tui::compose::open(&mut app, "sbv-absent".to_string(), None);
+        let buffer = drawn_board(&mut app, LABEL_BOARD.0, LABEL_BOARD.1);
+        let (_, bottom) = drawn_compose_bottom(&buffer, LABEL_BOARD, COMPOSE_TITLE_MARKER);
+        assert!(
+            bottom.contains("model: default ") && !bottom.contains("session ("),
+            "no model on record: {bottom}"
+        );
+    }
+
+    /// A DRAFT box names what the new session starts on: bare `model: default`
+    /// while the settings name nothing, and `model: default (<value>) (new sessions
+    /// only)` once they do — the value magenta, the scope not.
+    #[test]
+    fn a_draft_box_names_the_settings_model_scoped_to_new_sessions() {
+        /// The draft box's top-border title, used to find it on the board.
+        const DRAFT_TITLE: &str = "new background agent";
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        crate::tui::compose::open_background(&mut app, None);
+
+        let buffer = drawn_board(&mut app, LABEL_BOARD.0, LABEL_BOARD.1);
+        let (_, bottom) = drawn_compose_bottom(&buffer, LABEL_BOARD, DRAFT_TITLE);
+        assert!(
+            bottom.contains("model: default ") && !bottom.contains(MODEL_NEW_SESSION_SCOPE),
+            "no settings value: a bare default, with nothing to scope: {bottom}"
+        );
+
+        app.set_settings_model(Some("opus[1m]".to_string()));
+        let buffer = drawn_board(&mut app, LABEL_BOARD.0, LABEL_BOARD.1);
+        let (y, bottom) = drawn_compose_bottom(&buffer, LABEL_BOARD, DRAFT_TITLE);
+        assert!(
+            bottom.contains("model: default (opus[1m]) (new sessions only)"),
+            "the settings value is named and scoped: {bottom}"
+        );
+        assert!(
+            row_fgs(&buffer, y, LABEL_BOARD.0, "default (opus[1m])")
+                .iter()
+                .all(|fg| *fg == Color::Magenta),
+            "`default` and its value are magenta"
+        );
+        assert!(
+            row_fgs(&buffer, y, LABEL_BOARD.0, " (new sessions only)")
+                .iter()
+                .all(|fg| *fg != Color::Magenta),
+            "the scope, leading space included, is not"
+        );
+    }
+
+    /// The label rides the box's BORDER, so it costs the editor NO row: on the
+    /// short board — the full-width bottom bar, where rows are scarcest — an empty
+    /// draft's box is still exactly one text row tall, and the label sits on the
+    /// border row that closes it.
+    #[test]
+    fn the_model_label_costs_the_editor_no_row_even_in_the_bottom_bar() {
+        let (width, height) = BAR_BOARD;
+        assert!(
+            compose_uses_bottom_bar(true, height),
+            "the fixture must be the bottom-bar layout"
+        );
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        crate::tui::compose::open(&mut app, "sess-normal-1".to_string(), None);
+        let buffer = drawn_board(&mut app, width, height);
+
+        assert_eq!(
+            drawn_compose_text_rows(&buffer, width, height).len(),
+            1,
+            "an empty draft keeps its one text row"
+        );
+        let (_, bottom) = drawn_compose_bottom(&buffer, (width, height), COMPOSE_TITLE_MARKER);
+        assert!(
+            bottom.contains("model: "),
+            "the label is on the closing border row: {bottom}"
         );
     }
 
@@ -6560,6 +7412,303 @@ mod tests {
         }
     }
 
+    // --- the List modal's scroll window -----------------------------------
+
+    /// `len` one-line choices: the shape every `List` modal had before a
+    /// description could wrap, so the window cases written for it still ask the
+    /// questions they always asked.
+    fn one_line_rows(len: usize) -> Vec<usize> {
+        vec![1; len]
+    }
+
+    /// No cap on the choice count, so a case is about the line viewport alone.
+    const UNCAPPED: usize = usize::MAX;
+
+    /// The whole window rule, stated as arithmetic: the offset is KEPT while the
+    /// selection is inside it and moved by the least amount that brings it back
+    /// otherwise. Every case is one the modal can actually reach — `cycle_modal`
+    /// steps by one and WRAPS, so both ends are ordinary keystrokes, not edge cases.
+    #[test]
+    fn the_list_window_keeps_its_offset_until_the_selection_leaves_it() {
+        // A list that FITS never scrolls, whatever the caller asks for: there is
+        // nothing off-window, so an inherited offset must be discarded rather than
+        // blanking rows the box has room for.
+        assert_eq!(modal_list_window(&one_line_rows(3), 2, 10, UNCAPPED, 0), 0);
+        assert_eq!(modal_list_window(&one_line_rows(3), 0, 10, UNCAPPED, 7), 0);
+        assert_eq!(modal_list_window(&one_line_rows(10), 9, 10, UNCAPPED, 4), 0);
+
+        // Selection INSIDE the current window: the offset is untouched, which is
+        // what stops the list re-centring on every keypress.
+        assert_eq!(modal_list_window(&one_line_rows(20), 5, 5, UNCAPPED, 3), 3);
+        assert_eq!(modal_list_window(&one_line_rows(20), 7, 5, UNCAPPED, 3), 3);
+
+        // Selection ABOVE the window: scroll up exactly onto it.
+        assert_eq!(modal_list_window(&one_line_rows(20), 2, 5, UNCAPPED, 6), 2);
+
+        // Selection BELOW the window: scroll down the least that shows it, which
+        // puts it on the LAST visible row (`selected + 1 - viewport`).
+        assert_eq!(modal_list_window(&one_line_rows(20), 9, 5, UNCAPPED, 3), 5);
+
+        // Both ends, reached the way the wrap actually reaches them.
+        assert_eq!(
+            modal_list_window(&one_line_rows(20), 0, 5, UNCAPPED, 12),
+            0,
+            "top pins to zero"
+        );
+        assert_eq!(
+            modal_list_window(&one_line_rows(20), 19, 5, UNCAPPED, 0),
+            15,
+            "bottom pins to max_scroll = len - viewport"
+        );
+
+        // An offset past the end (a shrunken list) is clamped, never trusted.
+        assert_eq!(
+            modal_list_window(&one_line_rows(20), 19, 5, UNCAPPED, 99),
+            15
+        );
+    }
+
+    /// The degenerate viewports a freely-resized terminal produces. A short enough
+    /// box leaves ZERO rows for the list, and the arithmetic must answer rather than
+    /// underflow — `selected + 1 - viewport` is the subtraction that would.
+    #[test]
+    fn the_list_window_survives_a_viewport_of_zero_or_one() {
+        // Zero rows: nothing is drawable, so the answer is 0 and no subtraction
+        // happens at all.
+        assert_eq!(modal_list_window(&one_line_rows(20), 19, 0, UNCAPPED, 7), 0);
+        assert_eq!(modal_list_window(&one_line_rows(0), 0, 0, UNCAPPED, 0), 0);
+
+        // One row: the window IS the selection, from either direction.
+        assert_eq!(modal_list_window(&one_line_rows(20), 0, 1, UNCAPPED, 9), 0);
+        assert_eq!(modal_list_window(&one_line_rows(20), 9, 1, UNCAPPED, 0), 9);
+        assert_eq!(
+            modal_list_window(&one_line_rows(20), 19, 1, UNCAPPED, 19),
+            19
+        );
+
+        // An empty list cannot select anything; the window is still 0.
+        assert_eq!(modal_list_window(&one_line_rows(0), 0, 5, UNCAPPED, 3), 0);
+
+        // A `selected` past the end (defensive — `cycle_modal` keeps it in range)
+        // is bounded by `max_scroll` instead of running off it.
+        assert_eq!(modal_list_window(&one_line_rows(4), 99, 2, UNCAPPED, 0), 2);
+    }
+
+    /// A wrapped row counts EVERY line it draws. The selection is inside the
+    /// window only when it is drawn whole. Each case here has a different answer
+    /// if the two-line row is counted as one line.
+    #[test]
+    fn the_list_window_counts_every_line_a_wrapped_row_draws() {
+        /// The model picker's shape: a two-line `default` row, then one-line
+        /// aliases.
+        const HEIGHTS: [usize; 6] = [2, 1, 1, 1, 1, 1];
+        /// Four lines of list: the wrapped row plus two aliases fill it.
+        const VIEWPORT: usize = 4;
+
+        let window =
+            |selected, current| modal_list_window(&HEIGHTS, selected, VIEWPORT, UNCAPPED, current);
+        // Rows 0..=2 take exactly four lines, so the top window holds them.
+        assert_eq!(window(0, 0), 0);
+        assert_eq!(window(2, 0), 0);
+        // Row 3 is the fifth line. The least move drops the whole two-line row, so
+        // the window starts one ROW down. Counting row 0 as one line keeps it at 0.
+        assert_eq!(window(3, 0), 1);
+        // The bottom pins where the last four one-line rows fill the window.
+        assert_eq!(window(5, 0), 2);
+        // Wrapping back to the top scrolls onto the whole wrapped row.
+        assert_eq!(window(0, 2), 0);
+
+        // A THREE-line row: it and one alias fill the window, and the next alias
+        // scrolls it away as a unit.
+        let tall = [3, 1, 1, 1];
+        assert_eq!(modal_list_window(&tall, 1, VIEWPORT, UNCAPPED, 0), 0);
+        assert_eq!(modal_list_window(&tall, 2, VIEWPORT, UNCAPPED, 0), 1);
+    }
+
+    /// A selected row TALLER than the whole viewport, which a short terminal
+    /// produces, is shown from its top: marker and label. It is never scrolled
+    /// past, so it stays reachable.
+    #[test]
+    fn a_row_taller_than_the_viewport_is_shown_from_its_top() {
+        let heights = [3, 1, 1];
+        assert_eq!(modal_list_window(&heights, 0, 2, UNCAPPED, 0), 0);
+        assert_eq!(modal_list_window(&heights, 0, 2, UNCAPPED, 1), 0);
+        assert_eq!(modal_list_window(&heights, 1, 2, UNCAPPED, 0), 1);
+        // Its first line lands in the viewport, so it counts as shown. The one line
+        // of room goes to it and the rows below are the `N more`.
+        assert_eq!(modal_list_shown(&heights, 0, 1, UNCAPPED), 1);
+        assert_eq!(modal_list_shown(&heights, 0, 2, UNCAPPED), 1);
+    }
+
+    /// The choice cap bounds the window as well as the lines. That is what gives
+    /// a picker longer than [`MODAL_LIST_MAX_ROWS`] the same `N more` count at both
+    /// ends, even though one end has a wrapped row and the other does not.
+    #[test]
+    fn the_choice_cap_bounds_the_window_at_both_ends_of_a_wrapped_list() {
+        /// A cap-sized window, as `render_modal` passes it.
+        const CAP: usize = 12;
+        // A wrapped `default` row plus twenty one-line aliases.
+        let mut heights = vec![2];
+        heights.extend(one_line_rows(20));
+        let asked = modal_list_lines_asked(&heights, CAP);
+        assert_eq!(
+            asked, 13,
+            "the tallest twelve-choice run: the wrapped row + 11"
+        );
+
+        // At the top: twelve choices in thirteen lines, nine below.
+        assert_eq!(modal_list_window(&heights, 0, asked, CAP, 0), 0);
+        assert_eq!(modal_list_shown(&heights, 0, asked, CAP), 12);
+        // At the bottom: twelve one-line choices. Without the cap, thirteen would
+        // fit the thirteen lines and only eight would be above.
+        let bottom = modal_list_window(&heights, 20, asked, CAP, 0);
+        assert_eq!(bottom, 9);
+        assert_eq!(modal_list_shown(&heights, bottom, asked, CAP), 12);
+    }
+
+    /// Which choices get their first line drawn, counting each one's height.
+    #[test]
+    fn the_shown_count_follows_row_heights_and_the_cap() {
+        let heights = [2, 1, 1];
+        assert_eq!(
+            modal_list_shown(&heights, 0, 0, UNCAPPED),
+            0,
+            "no room, no rows"
+        );
+        assert_eq!(modal_list_shown(&heights, 0, 3, UNCAPPED), 2);
+        assert_eq!(modal_list_shown(&heights, 0, 4, UNCAPPED), 3);
+        assert_eq!(modal_list_shown(&heights, 0, 10, UNCAPPED), 3);
+        assert_eq!(modal_list_shown(&heights, 0, 10, 2), 2, "the cap stops it");
+        assert_eq!(modal_list_shown(&heights, 1, 10, UNCAPPED), 2);
+        assert_eq!(
+            modal_list_shown(&heights, 9, 10, UNCAPPED),
+            0,
+            "past the end"
+        );
+        // One-line rows: the old `min(len - scroll, viewport)`, unchanged.
+        assert_eq!(modal_list_shown(&one_line_rows(20), 15, 5, UNCAPPED), 5);
+        assert_eq!(modal_list_shown(&one_line_rows(20), 17, 5, UNCAPPED), 3);
+    }
+
+    /// What the box asks for: every line when the list is within the cap, the
+    /// tallest cap-sized run otherwise.
+    #[test]
+    fn the_asked_lines_are_the_tallest_cap_sized_run() {
+        assert_eq!(modal_list_lines_asked(&[2, 1, 1, 1], 12), 5);
+        assert_eq!(modal_list_lines_asked(&[3, 1, 1, 1, 1, 1], 12), 8);
+        assert_eq!(modal_list_lines_asked(&one_line_rows(20), 12), 12);
+        // The tallest run is found wherever it sits, not only at the top.
+        assert_eq!(modal_list_lines_asked(&[1, 1, 3, 1], 2), 4);
+        assert_eq!(modal_list_lines_asked(&[], 12), 0);
+        assert_eq!(modal_list_lines_asked(&[2, 1], 0), 0);
+    }
+
+    /// A wrapping choice's continuation lines are DIM and sit at the hanging
+    /// indent. The selection does not change the row's height. A choice that does
+    /// not opt in stays one line, however long its description.
+    #[test]
+    fn modal_list_row_lines_wraps_only_an_opted_in_description() {
+        // A real default-row explanation: a reply claude will not restore for.
+        let choice = |wrap| ModalChoice {
+            label: "default".to_string(),
+            description: Some(
+                ComposeDefault::RestoreOverridden
+                    .picker_description()
+                    .to_string(),
+            ),
+            wrap_description: wrap,
+            action: ModalAction::Cancel,
+        };
+        let text =
+            |line: &Line| -> String { line.spans.iter().map(|s| s.content.as_ref()).collect() };
+
+        // The room right of `› default  ` is 49 columns, and `wrap_message` fills
+        // each line greedily by whole words: 34 columns (the next word, 25 wide,
+        // does not fit beside it), then 48, then the rest.
+        let wrapped = modal_list_row_lines(&choice(true), true);
+        assert_eq!(
+            wrapped.len(),
+            3,
+            "the explanation wraps onto two more lines"
+        );
+        assert_eq!(
+            text(&wrapped[0]),
+            "\u{203a} default  no --model \u{b7} ANTHROPIC_MODEL or an"
+        );
+        let indent = " ".repeat(usize::from(modal_list_description_column("default")));
+        assert_eq!(
+            text(&wrapped[1]),
+            format!("{indent}ANTHROPIC_DEFAULT_*_MODEL is set, so claude uses")
+        );
+        assert_eq!(
+            text(&wrapped[2]),
+            format!("{indent}its startup model, not the session's")
+        );
+        assert!(
+            wrapped
+                .iter()
+                .all(|line| text(line).chars().count() <= usize::from(MODAL_INNER_WIDTH)),
+            "every line fits inside the borders"
+        );
+        for line in &wrapped[1..] {
+            let continuation = line
+                .spans
+                .iter()
+                .find(|s| !s.content.trim().is_empty())
+                .expect("the continuation has text");
+            assert!(
+                continuation.style.add_modifier.contains(Modifier::DIM),
+                "every continuation is dim, like the description it continues"
+            );
+        }
+        assert_eq!(
+            modal_list_row_lines(&choice(true), false).len(),
+            wrapped.len(),
+            "moving the selection off the row does not change its height"
+        );
+
+        assert_eq!(
+            modal_list_row_lines(&choice(false), true).len(),
+            1,
+            "a choice that does not opt in stays one line"
+        );
+    }
+
+    /// The overflow marker is drawn ONLY when something is actually off-window, and
+    /// carries the count rather than a bare arrow — "there is more" is far less
+    /// useful than "there are seven more" when deciding whether to keep pressing.
+    #[test]
+    fn the_more_marker_appears_only_when_rows_are_off_window() {
+        let blank = modal_more_line(MODAL_MORE_ABOVE, 0);
+        assert_eq!(
+            blank
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>(),
+            "",
+            "nothing hidden means the spacer stays a spacer"
+        );
+
+        let more = modal_more_line(MODAL_MORE_BELOW, 7);
+        let text = more
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains('7'), "the marker names the count: {text:?}");
+        assert!(
+            text.contains(MODAL_MORE_BELOW),
+            "and the direction to press: {text:?}"
+        );
+        assert!(
+            more.spans
+                .iter()
+                .all(|s| s.style.add_modifier.contains(Modifier::DIM)),
+            "the marker is chrome, not a choice"
+        );
+    }
+
     // --- search-match highlight run splitting -----------------------------
 
     #[test]
@@ -7738,23 +8887,56 @@ mod tests {
         let reply_hint = compose_hint(&plain.target);
         assert_eq!(
             reply_hint,
-            "Enter send · Ctrl-J newline (or Alt+Enter) · paste keeps newlines · Esc cancel",
+            "Enter send · ^L model · ^J/Alt+Enter newline · paste keeps newlines · Esc cancel",
         );
         assert!(
             !reply_hint.contains("Ctrl-O"),
             "the reply hints must not grow a key the reply target ignores: {reply_hint}"
         );
 
-        // The background hint names both verbs, honestly.
+        // The background hint names both verbs, honestly — and its model key.
         let bg_hint = compose_hint(&ComposeState::new_background(None).target);
         assert!(bg_hint.contains("Enter start in background"), "{bg_hint}");
         assert!(bg_hint.contains("Ctrl-O run interactively"), "{bg_hint}");
+        assert!(bg_hint.contains("Ctrl-L model"), "{bg_hint}");
         for dishonest in ["review", "edit", "before sending", "prefill", "pre-fill"] {
             assert!(
                 !bg_hint.to_lowercase().contains(dishonest),
                 "the prompt AUTO-SUBMITS, so the hint must not imply {dishonest:?}: {bg_hint}"
             );
         }
+    }
+
+    /// The reply hint's column budget: it is ONE help-row line that is truncated,
+    /// never wrapped, so it must fit an 80-column terminal WHOLE — `Esc cancel` last
+    /// — measured with the `unicode-width` the renderer counts in. The model key was
+    /// paid for inside that budget (see [`compose_hint`]), and it is inside the
+    /// drawn columns of the BACKGROUND hint too, which runs past 80 on purpose.
+    #[test]
+    fn the_reply_hint_fits_an_eighty_column_terminal() {
+        use unicode_width::UnicodeWidthStr;
+
+        /// The narrowest terminal the help row is budgeted for.
+        const HELP_ROW_BUDGET: usize = 80;
+
+        let reply = compose_hint(&ComposeTarget::Reply {
+            session_id: "s".to_string(),
+            stop_job: None,
+        });
+        assert!(
+            reply.width() <= HELP_ROW_BUDGET,
+            "the reply hint must fit {HELP_ROW_BUDGET} columns: {} in {reply:?}",
+            reply.width()
+        );
+        let model_key_end = BG_DRAFT_HINT
+            .find("Ctrl-L model")
+            .map(|at| BG_DRAFT_HINT[..at + "Ctrl-L model".len()].width())
+            .expect("the background hint names its model key");
+        assert!(
+            model_key_end <= HELP_ROW_BUDGET,
+            "the background hint's model key must sit inside the drawn columns: ends \
+             at {model_key_end}"
+        );
     }
 
     /// While a send is in flight for the selected session the pinned banner is
@@ -11845,8 +13027,8 @@ mod tests {
 
     /// The word the marked-banner case searches for: it occurs in every `● claude`
     /// turn marker — the very line the pinned banner reuses — and nowhere else on that
-    /// line (a bound handle of `@claude` is suppressed, so it cannot add a second
-    /// occurrence).
+    /// line (a bound handle of `@claude` is suppressed and a model id loses its
+    /// `claude-` vendor prefix, so neither can add a second occurrence).
     const BANNER_MARKER_QUERY: &str = "claude";
 
     /// How many turns the marked-banner case writes. Enough that the probed marker
@@ -13558,7 +14740,7 @@ mod tests {
     #[test]
     fn modal_list_row_marks_the_selected_row_and_trails_the_description() {
         // A selected row leads with the highlight marker and reverses the label.
-        let sel = modal_list_row("planner", Some("plans work"), true);
+        let sel = modal_list_row("planner", None, Some("plans work"), true);
         let text: String = sel.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
             text.starts_with("› "),
@@ -13576,7 +14758,7 @@ mod tests {
         );
 
         // An unselected, description-less row is padded and not reversed.
-        let unsel = modal_list_row("planner", None, false);
+        let unsel = modal_list_row("planner", None, None, false);
         let text: String = unsel.spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(
             text, "  planner",
@@ -13590,6 +14772,92 @@ mod tests {
         assert!(
             !name.style.add_modifier.contains(Modifier::REVERSED),
             "an unselected label is not reversed"
+        );
+    }
+
+    /// What each model-picker row draws after its label, stated directly: a SET
+    /// effort on any model row (highlighted or not) in the pick's magenta, the dim
+    /// unset stop on the HIGHLIGHTED model row only, and nothing at all on the
+    /// `default` row or an agent row, highlighted or not.
+    #[test]
+    fn modal_effort_span_shows_a_set_effort_and_marks_the_highlighted_unset_stop() {
+        let text = |span: Option<Span<'static>>| span.map(|s| s.content.into_owned());
+        let high = ModalAction::SetModel(Some(ModelPick {
+            model: "opus".to_string(),
+            effort: Some("high"),
+        }));
+        let unset = ModalAction::SetModel(Some(ModelPick::new("opus")));
+
+        for selected in [true, false] {
+            let span = modal_effort_span(&high, selected).expect("a set effort always shows");
+            assert_eq!(span.content, " · high");
+            assert_eq!(
+                span.style.fg,
+                Some(Color::Magenta),
+                "drawn like the header pick"
+            );
+        }
+        let marker = modal_effort_span(&unset, true).expect("the highlighted unset stop shows");
+        assert_eq!(marker.content, " · default effort");
+        assert!(marker.style.add_modifier.contains(Modifier::DIM));
+        assert_eq!(
+            text(modal_effort_span(&unset, false)),
+            None,
+            "unset, not highlighted"
+        );
+
+        for (action, what) in [
+            (ModalAction::SetModel(None), "the default row"),
+            (
+                ModalAction::New(Some("planner".to_string())),
+                "an agent row",
+            ),
+            (ModalAction::New(None), "the no-agent row"),
+        ] {
+            for selected in [true, false] {
+                assert_eq!(
+                    text(modal_effort_span(&action, selected)),
+                    None,
+                    "{what} never draws an effort (selected: {selected})"
+                );
+            }
+        }
+    }
+
+    /// The model picker as DRAWN: its prompt names `←`/`→`, the highlighted model
+    /// row shows its effort inline, and the `default` row stays as it was.
+    #[test]
+    fn the_model_picker_draws_the_highlighted_rows_effort_and_names_the_arrows() {
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        crate::tui::compose::open_background(&mut app, None);
+        app.open_model_picker();
+        let on_default = drawn_screen(&mut app, 80, 24);
+        assert!(
+            on_default.contains("(←/→ effort)"),
+            "the prompt names the keys that set the effort:\n{on_default}"
+        );
+        assert!(
+            !on_default.contains("default effort") && !on_default.contains(" · high"),
+            "the default row carries no effort, and no other row has one set:\n{on_default}"
+        );
+
+        app.modal_next(); // fable, unset
+        let unset = drawn_screen(&mut app, 80, 24);
+        assert!(
+            unset.contains("› fable · default effort"),
+            "the highlighted row marks the unset stop:\n{unset}"
+        );
+        app.adjust_modal_effort(true);
+        app.adjust_modal_effort(true);
+        app.adjust_modal_effort(true);
+        let high = drawn_screen(&mut app, 80, 24);
+        assert!(
+            high.contains("› fable · high"),
+            "the highlighted row shows its effort inline:\n{high}"
         );
     }
 
@@ -13630,6 +14898,711 @@ mod tests {
         assert!(
             drawn.contains("Enter draft") && drawn.contains("^O interactive"),
             "the picker footer must name both Enter and Ctrl-O:\n{drawn}"
+        );
+    }
+
+    /// The two pickers share the `List` layout but not their verbs, so each draws
+    /// its OWN footer. The model picker's names the effort arrows and `Enter set`,
+    /// and must not borrow the agent picker's `Enter draft` / `^O`: `Enter` drafts
+    /// nothing there, and `Ctrl-O` is inert.
+    #[test]
+    fn the_model_picker_draws_its_own_footer_not_the_agent_pickers() {
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        crate::tui::compose::open_background(&mut app, None);
+        app.open_model_picker();
+        let drawn = drawn_screen(&mut app, 80, 24);
+        assert!(
+            drawn.contains("↑/↓ choose · ←/→ effort · Enter set · Esc cancel"),
+            "the model picker's footer names its own keys:\n{drawn}"
+        );
+        assert!(
+            !drawn.contains("Enter draft") && !drawn.contains("^O"),
+            "the model picker must not advertise the agent picker's verbs:\n{drawn}"
+        );
+    }
+
+    /// The agent picker's footer, pinned whole: giving the model picker a footer of
+    /// its own must leave this one exactly as it was.
+    #[test]
+    fn the_agent_picker_keeps_its_draft_and_interactive_footer() {
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.open_agent_picker(vec![DefinedAgent {
+            name: "planner".to_string(),
+            description: None,
+        }]);
+        let drawn = drawn_screen(&mut app, 80, 24);
+        assert!(
+            drawn.contains("↑/↓ choose · Enter draft · ^O interactive · Esc cancel"),
+            "the agent picker's footer names both of its verbs:\n{drawn}"
+        );
+        assert!(
+            !drawn.contains("Enter set"),
+            "the agent picker must not advertise the model picker's verb:\n{drawn}"
+        );
+    }
+
+    /// Both `Row` modals keep the button-strip footer they drew before the footer
+    /// moved onto the modal.
+    #[test]
+    fn the_row_modals_keep_the_confirm_footer() {
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        let footer = "←/→ choose · Enter confirm · Esc cancel";
+
+        app.open_live_choice("sb-running".to_string());
+        let live = drawn_screen(&mut app, 80, 24);
+        assert!(
+            live.contains(footer),
+            "the running-session choice keeps its footer:\n{live}"
+        );
+
+        app.close_modal();
+        app.open_delete_confirm();
+        assert!(app.modal.is_some(), "the delete confirm opens");
+        let delete = drawn_screen(&mut app, 80, 24);
+        assert!(
+            delete.contains(footer),
+            "the delete confirm keeps its footer:\n{delete}"
+        );
+    }
+
+    /// Flatten a whole rendered board to one searchable string, rows joined by
+    /// newlines. The `List`-modal viewport tests below look for a SELECTED row's
+    /// `› label` — a two-token needle the highlight glyph makes specific to the
+    /// modal — so they need the screen, not one row.
+    fn drawn_screen(app: &mut App, width: u16, height: u16) -> String {
+        let buffer = drawn_board(app, width, height);
+        (0..height)
+            .map(|y| full_row_text(&buffer, y, width))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The `› ` needle that says a choice is BOTH drawn and highlighted — the same
+    /// marker [`modal_list_row`] gives a selected row.
+    fn selected_needle(app: &App) -> String {
+        let modal = app.modal.as_ref().expect("a modal is open");
+        format!("\u{203a} {}", modal.choices[modal.selected].label)
+    }
+
+    /// The viewport's whole point, swept over terminal height the way
+    /// `the_disclosing_delete_confirm_costs_one_row_and_keeps_cancel_default` sweeps
+    /// it: a `List` modal's SELECTED row is drawn at every height that has room for
+    /// a list row at all, not only on a terminal tall enough for the whole list.
+    ///
+    /// The picker's LAST row is selected, reached the way a user reaches it — one
+    /// `modal_prev` off the pre-highlight, which `cycle_modal` wraps to the end — so
+    /// the row under test is the one furthest from where a top-down draw starts. That
+    /// is exactly the row the old render lost: `centered_rect` clamps the box and
+    /// nothing scrolled, so on a short terminal the tail simply was not painted.
+    ///
+    /// The needle is derived from the modal rather than hard-coded, so the sweep
+    /// keeps testing the last row whatever the alias set is — which now varies at
+    /// RUNTIME, since the picker offers what the installed `claude` accepts and
+    /// falls back to the `app::MODEL_ALIASES` seed only until that probe lands. This
+    /// case is the SEED one (no probe delivered); the probed one is pinned below.
+    #[test]
+    fn a_short_terminal_still_draws_the_model_pickers_selected_row() {
+        /// Terminal heights the sweep covers. Seven is the shortest box that has a
+        /// single list row at all (one message row + `MODAL_LIST_CHROME_ROWS` +
+        /// `MODAL_BORDER_ROWS` = six rows of chrome), and twenty is comfortably
+        /// taller than the whole picker, so the sweep spans "scrolled to one row" to
+        /// "not scrolled at all".
+        const SWEEP: std::ops::RangeInclusive<u16> = 7..=20;
+
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        crate::tui::compose::open_background(&mut app, None);
+        app.open_model_picker();
+        // Wrap onto the last alias — the row a top-down draw reaches last.
+        app.modal_prev();
+        let needle = selected_needle(&app);
+        let last = app.modal.as_ref().expect("the picker is open").selected;
+        assert_eq!(
+            last,
+            app.modal
+                .as_ref()
+                .expect("the picker is open")
+                .choices
+                .len()
+                - 1,
+            "the fixture must be on the LAST row"
+        );
+
+        for height in SWEEP {
+            let screen = drawn_screen(&mut app, 80, height);
+            assert!(
+                screen.contains(&needle),
+                "a {height}-row terminal must still draw the selected {needle:?}; \
+                 screen:\n{screen}"
+            );
+        }
+    }
+
+    /// The same sweep against the PROBED set, with `opusplan` pinned by name.
+    ///
+    /// Two things make this a different claim from the seed sweep above rather than
+    /// a copy of it. The probed list is TEN rows (nine aliases plus the synthetic
+    /// clear row) against the seed's six, so every terminal in the sweep below
+    /// sixteen rows genuinely scrolls. And `opusplan` — the alias this whole feature
+    /// exists to surface, since `claude --help` hides it — is LAST in the binary's
+    /// own array order, which the picker offers verbatim. It is therefore the FIRST
+    /// row a top-down draw with no viewport would lose, which is exactly why its
+    /// reachability is worth pinning by name and not only by "the selected row".
+    #[test]
+    fn the_probed_pickers_last_row_opusplan_is_reachable_on_a_short_terminal() {
+        /// Terminal heights the sweep covers — the seed sweep's range, so the two
+        /// cases are compared over the same terminals. Seven is the shortest box
+        /// with a single list row at all; twenty is taller than the whole picker.
+        const SWEEP: std::ops::RangeInclusive<u16> = 7..=20;
+        /// The alias array the installed `claude 2.1.233` accepts, in wire order —
+        /// stated here so this test needs no 290 MB binary. `opusplan` last is the
+        /// property under test, not an incidental detail of the fixture.
+        const PROBED: [&str; 9] = [
+            "sonnet",
+            "opus",
+            "haiku",
+            "fable",
+            "best",
+            "sonnet[1m]",
+            "opus[1m]",
+            "fable[1m]",
+            "opusplan",
+        ];
+
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.set_model_aliases(PROBED.iter().map(|a| (*a).to_string()).collect());
+        crate::tui::compose::open_background(&mut app, None);
+        app.open_model_picker();
+        // Wrap onto the last alias — the row a top-down draw reaches last.
+        app.modal_prev();
+
+        let modal = app.modal.as_ref().expect("the picker is open");
+        assert_eq!(
+            modal.choices.len(),
+            PROBED.len() + 1,
+            "the probed picker is nine aliases plus the synthetic clear row"
+        );
+        assert_eq!(
+            modal.choices[modal.selected].label, "opusplan",
+            "opusplan must be the LAST row — that is what makes it the first one a \
+             viewport-less draw loses"
+        );
+        let needle = selected_needle(&app);
+
+        for height in SWEEP {
+            let screen = drawn_screen(&mut app, 80, height);
+            assert!(
+                screen.contains(&needle),
+                "a {height}-row terminal must still reach {needle:?}; screen:\n{screen}"
+            );
+        }
+    }
+
+    /// A probe that returns MORE aliases than the window holds must SCROLL, not clip.
+    ///
+    /// This stopped being hypothetical when the row count became upstream data:
+    /// nothing in snapback bounds how many aliases a future `claude` ships, and the
+    /// picker offers every one of them. Same shape as the agent-picker cap test, but
+    /// it has to be stated for the model picker too — that one is bounded by the
+    /// user's own agent files, this one by another program's release notes.
+    #[test]
+    fn a_probe_longer_than_the_cap_scrolls_the_model_picker_rather_than_clipping() {
+        /// Aliases the stated probe returns — comfortably past
+        /// `MODAL_LIST_MAX_ROWS`, so the CAP is what bounds the box.
+        const ALIASES: usize = 20;
+        /// A terminal tall enough to draw all of them, so nothing here is the
+        /// terminal clamp in disguise.
+        const TALL: u16 = 40;
+
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.set_model_aliases((0..ALIASES).map(|i| format!("model-{i:02}")).collect());
+        crate::tui::compose::open_background(&mut app, None);
+        app.open_model_picker();
+        // +1 for the synthetic default row, which sends no model.
+        let total = ALIASES + 1;
+        let off_window = total - usize::from(MODAL_LIST_MAX_ROWS);
+        let last = format!("model-{:02}", ALIASES - 1);
+
+        // Opened at the top: the tail is off-window and the LOWER spacer says how
+        // much of it there is.
+        let screen = drawn_screen(&mut app, 80, TALL);
+        assert!(
+            !screen.contains(&last),
+            "the cap must stop the box growing with the probe's answer; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains(&format!("{MODAL_MORE_BELOW} {off_window} more")),
+            "and the spacer must disclose how many aliases are below; screen:\n{screen}"
+        );
+
+        // Wrap onto the last alias: it must be REACHABLE rather than clipped away.
+        app.modal_prev();
+        let needle = selected_needle(&app);
+        let screen = drawn_screen(&mut app, 80, TALL);
+        assert!(
+            screen.contains(&needle),
+            "the window must follow the selection onto {last}; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains(&format!("{MODAL_MORE_ABOVE} {off_window} more")),
+            "and disclose the aliases now above it; screen:\n{screen}"
+        );
+    }
+
+    /// The other half: a list LONGER than the cap is bounded on a tall terminal
+    /// too, and says so.
+    ///
+    /// The agent picker draws one row per user-defined agent, so it is unbounded by
+    /// data — twenty agents on a forty-row terminal used to draw a twenty-six-row box
+    /// over a board it is meant to overlay. `MODAL_LIST_MAX_ROWS` caps the window and
+    /// the spacer rows carry the count that is off-window, so the rows beyond it are
+    /// discoverable rather than merely absent.
+    #[test]
+    fn a_long_agent_picker_is_capped_and_says_how_many_rows_are_off_window() {
+        /// Agents in the fixture — comfortably past `MODAL_LIST_MAX_ROWS`, so the cap
+        /// is the thing under test rather than the terminal's height.
+        const AGENTS: usize = 20;
+        /// A terminal tall enough to draw all of them, so nothing here is the
+        /// terminal clamp in disguise.
+        const TALL: u16 = 40;
+
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.open_agent_picker(
+            (0..AGENTS)
+                .map(|i| DefinedAgent {
+                    name: format!("agent-{i:02}"),
+                    description: None,
+                })
+                .collect(),
+        );
+        // +1 for the synthetic "default (no agent)" row.
+        let total = AGENTS + 1;
+        let off_window = total - usize::from(MODAL_LIST_MAX_ROWS);
+
+        // A marker is `<arrow> <count> more`, so ask for it by SHAPE over every
+        // count it could carry. A bare `<arrow> ` needle would also match the
+        // picker's own `↑/↓ choose` footer and quietly never be able to go red.
+        let marker = |screen: &str, arrow: &str| {
+            (1..=total).any(|n| screen.contains(&format!("{arrow} {n} more")))
+        };
+
+        // Opened at the top: the tail is off-window and the LOWER spacer says how
+        // much of it there is.
+        let screen = drawn_screen(&mut app, 80, TALL);
+        assert!(
+            !screen.contains("agent-19"),
+            "the cap must stop the box growing with the agent count; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains(&format!("{MODAL_MORE_BELOW} {off_window} more")),
+            "and the spacer must disclose how many rows are below; screen:\n{screen}"
+        );
+        assert!(
+            !marker(&screen, MODAL_MORE_ABOVE),
+            "nothing is above the window at the top; screen:\n{screen}"
+        );
+
+        // Wrap onto the last agent: the window follows the selection, and now it is
+        // the HEAD of the list that is off-window.
+        app.modal_prev();
+        let needle = selected_needle(&app);
+        let screen = drawn_screen(&mut app, 80, TALL);
+        assert!(
+            screen.contains(&needle),
+            "the window must follow the selection to the last row; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains(&format!("{MODAL_MORE_ABOVE} {off_window} more")),
+            "and disclose the rows now above it; screen:\n{screen}"
+        );
+        assert!(
+            !marker(&screen, MODAL_MORE_BELOW),
+            "nothing is below the window at the bottom; screen:\n{screen}"
+        );
+    }
+
+    /// The offset is KEPT between frames rather than re-derived, which is what makes
+    /// the modal scroll like the board list instead of re-centring per keypress.
+    ///
+    /// Asserted through `Modal::scroll` after real renders, because that field is the
+    /// state the render writes back (`App::scroll`'s idiom) — a test that only read
+    /// the screen could not tell a kept offset from a recomputed one that happened to
+    /// agree.
+    #[test]
+    fn the_modal_scroll_offset_is_written_back_and_then_left_alone() {
+        /// Six rows of chrome plus four list rows, so the window is four of the
+        /// picker's rows and moving within it must not scroll.
+        const SHORT: u16 = 10;
+
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        crate::tui::compose::open_background(&mut app, None);
+        app.open_model_picker();
+        let total = app
+            .modal
+            .as_ref()
+            .expect("the picker is open")
+            .choices
+            .len();
+        assert!(
+            total > 4,
+            "the fixture needs more rows than the 4-row window"
+        );
+
+        let scroll_now = |app: &App| app.modal.as_ref().expect("open").scroll;
+
+        // Row 0 selected: nothing above it, so the window sits at the top.
+        drawn_screen(&mut app, 80, SHORT);
+        assert_eq!(scroll_now(&app), 0, "a top selection needs no scroll");
+
+        // Step down INSIDE the window: the offset must not move.
+        app.modal_next();
+        drawn_screen(&mut app, 80, SHORT);
+        assert_eq!(
+            scroll_now(&app),
+            0,
+            "moving inside the window keeps it still"
+        );
+
+        // Step past the bottom: the offset moves by exactly one.
+        for _ in 1..4 {
+            app.modal_next();
+        }
+        drawn_screen(&mut app, 80, SHORT);
+        assert_eq!(
+            scroll_now(&app),
+            1,
+            "leaving the window scrolls the least that brings the row back"
+        );
+
+        // Down to the last row: the offset stops at `len - viewport`.
+        for _ in 4..total - 1 {
+            app.modal_next();
+        }
+        drawn_screen(&mut app, 80, SHORT);
+        assert_eq!(
+            scroll_now(&app),
+            total - 4,
+            "the bottom pins the window to max_scroll"
+        );
+
+        // One more press WRAPS to row 0 — a single keystroke crossing the whole
+        // list, which is the move a window that only ever nudged by one would lose.
+        app.modal_next();
+        drawn_screen(&mut app, 80, SHORT);
+        assert_eq!(scroll_now(&app), 0, "the wrap pins the window back to zero");
+    }
+
+    // --- the model picker's wrapped `default` row -------------------------
+
+    /// Every terminal row's slice of a modal's INNER columns (the span
+    /// `centered_rect` places the box in, minus its borders), trailing blanks
+    /// trimmed. Reading only the box's own columns keeps the board's panes out of
+    /// the text, so a line that runs INTO the border reads as clipped instead of
+    /// running on into whatever the preview drew beside it.
+    fn modal_inner_rows(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        let buffer = drawn_board(app, width, height);
+        let inner_x = usize::from((width - MODAL_WIDTH) / 2 + 1);
+        let inner_w = usize::from(MODAL_INNER_WIDTH);
+        (0..height)
+            .map(|y| {
+                full_row_text(&buffer, y, width)
+                    .chars()
+                    .skip(inner_x)
+                    .take(inner_w)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Whether any `↑ N more` / `↓ N more` marker is on `rows`, asked by SHAPE over
+    /// every count it could carry. A bare arrow would also match the picker's own
+    /// `↑/↓ choose` footer and could never go red.
+    fn any_more_marker(rows: &[String], choices: usize) -> bool {
+        let screen = rows.join("\n");
+        [MODAL_MORE_ABOVE, MODAL_MORE_BELOW]
+            .iter()
+            .any(|arrow| (1..=choices).any(|n| screen.contains(&format!("{arrow} {n} more"))))
+    }
+
+    /// The claim the wrapped-default-row cases below share, checked on the drawn
+    /// screen, for the picker `app` has a compose open for.
+    ///
+    /// Row 0 draws EXACTLY `expected`: its first line beside `› <label>`, each
+    /// further line at the hanging indent under the description's first column,
+    /// and the next choice directly beneath the last one. So the whole description
+    /// is on screen, and the row is `expected.len()` lines tall.
+    ///
+    /// Then the box has to COUNT those lines, checked where a user would notice.
+    /// At the terminal height the box needs for every choice plus row 0's extra
+    /// lines, nothing is off-window. One row shorter, the lower spacer reads
+    /// `↓ 1 more`. A box that counted row 0 as a single line would fit one row
+    /// sooner, so that marker would never appear.
+    fn assert_default_row_wraps_whole(mut app: App, expected: &[&str]) {
+        /// Wide enough for the whole 62-column modal, so nothing here is the
+        /// terminal's own width clamp.
+        const WIDTH: u16 = 80;
+        /// Tall enough to draw the whole picker with room to spare.
+        const TALL: u16 = 24;
+
+        app.open_model_picker();
+        let modal = app.modal.clone().expect("the picker is open");
+        assert_eq!(modal.selected, 0, "no pick highlights the default row");
+        assert_eq!(
+            Some(expected.join(" ")),
+            modal.choices[0].description,
+            "the fixture must spell row 0's WHOLE description, split where it wraps"
+        );
+
+        let rows = modal_inner_rows(&mut app, WIDTH, TALL);
+        let screen = rows.join("\n");
+        let head = format!("\u{203a} {}  ", modal.choices[0].label);
+        let top = rows
+            .iter()
+            .position(|row| row.starts_with(&head))
+            .unwrap_or_else(|| panic!("the selected default row is drawn; screen:\n{screen}"));
+        assert_eq!(
+            rows[top],
+            format!("{head}{}", expected[0]),
+            "the first chunk trails the label; screen:\n{screen}"
+        );
+        let indent = " ".repeat(head.chars().count());
+        for (k, line) in expected.iter().enumerate().skip(1) {
+            assert_eq!(
+                rows[top + k],
+                format!("{indent}{line}"),
+                "continuation {k} sits at the description's column; screen:\n{screen}"
+            );
+        }
+        assert!(
+            rows[top + expected.len()].starts_with(&format!("  {}", modal.choices[1].label)),
+            "the next choice follows row 0's last line directly, so the row is {} \
+             lines tall; screen:\n{screen}",
+            expected.len()
+        );
+
+        // The arithmetic: every choice is one line except row 0, which is as many
+        // as its wrap produced.
+        let list_lines = modal.choices.len() + expected.len() - 1;
+        let message_rows = wrap_message(&modal.message, MODAL_INNER_WIDTH).len();
+        let fits = u16::try_from(list_lines + message_rows).expect("a small modal")
+            + MODAL_LIST_CHROME_ROWS
+            + MODAL_BORDER_ROWS;
+        let last = format!("  {}", modal.choices[modal.choices.len() - 1].label);
+
+        let rows = modal_inner_rows(&mut app, WIDTH, fits);
+        let screen = rows.join("\n");
+        assert!(
+            rows.iter().any(|row| row.starts_with(&last))
+                && !any_more_marker(&rows, modal.choices.len()),
+            "a {fits}-row terminal fits the whole picker, row 0's {} lines included; \
+             screen:\n{screen}",
+            expected.len()
+        );
+        let rows = modal_inner_rows(&mut app, WIDTH, fits - 1);
+        let screen = rows.join("\n");
+        assert!(
+            screen.contains(&format!("{MODAL_MORE_BELOW} 1 more")),
+            "one row shorter, the last choice is off-window and the spacer says so; \
+             screen:\n{screen}"
+        );
+    }
+
+    /// A board with a `Ctrl-N` DRAFT compose open and `settings_model` read from the
+    /// user's settings — the picker the draft cases below open.
+    fn draft_board(settings_model: Option<&str>) -> App {
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.set_settings_model(settings_model.map(ToOwned::to_owned));
+        crate::tui::compose::open_background(&mut app, None);
+        app
+    }
+
+    /// A draft whose settings name `opus[1m]`: the row NAMES the value in its label
+    /// (`default (opus[1m]) (settings)`), which leaves 27 columns beside it, and the
+    /// explanation wraps onto three lines under it — `wrap_message`'s greedy
+    /// whole-word fill of those 27 columns.
+    #[test]
+    fn the_model_pickers_default_row_wraps_a_settings_model_onto_three_lines() {
+        assert_default_row_wraps_whole(
+            draft_board(Some("opus[1m]")),
+            &[
+                "no --model \u{b7} a new session",
+                "starts on the model your",
+                "claude settings name",
+            ],
+        );
+    }
+
+    /// With no settings value the label is a bare `default`, which leaves 49
+    /// columns, and the explanation still needs a second line — being SHORTER than
+    /// the valued rows is what makes a hard-coded row height fail one case or
+    /// another.
+    #[test]
+    fn the_model_pickers_default_row_wraps_even_with_no_settings_model() {
+        assert_default_row_wraps_whole(
+            draft_board(None),
+            &[
+                "no --model \u{b7} your claude settings name no model,",
+                "so claude uses its own default",
+            ],
+        );
+    }
+
+    /// A full dated model id MOVES the wrap points: the label grows with the value,
+    /// leaving 11 columns beside it, so the explanation falls one or two words to a
+    /// line. The row's height is whatever the wrap produced — eight lines here — and
+    /// the box counts all of them.
+    #[test]
+    fn a_long_settings_model_moves_the_default_rows_wrap_points() {
+        assert_default_row_wraps_whole(
+            draft_board(Some("claude-opus-4-1-20250805")),
+            &[
+                "no --model",
+                "\u{b7} a new",
+                "session",
+                "starts on",
+                "the model",
+                "your claude",
+                "settings",
+                "name",
+            ],
+        );
+    }
+
+    /// A REPLY's default row names the session's own model — read off the preview
+    /// the board drew, the newest answering model in the transcript — and wraps its
+    /// explanation, effort caveat included, under that longer label.
+    #[test]
+    fn a_replys_default_row_names_the_session_model_and_wraps_under_it() {
+        let mut app = App::new(
+            vec![preview_fixture_row(
+                "sbv-switch",
+                "sess-model-switch-1.jsonl",
+            )],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        crate::tui::compose::open(&mut app, "sbv-switch".to_string(), None);
+        // The frame that shows the compose renders the preview first; the picker
+        // reads the session's model off that render.
+        let _ = drawn_board(&mut app, 80, 24);
+        app.open_model_picker();
+        assert_eq!(
+            app.modal.take().expect("the picker is open").choices[0].label,
+            "session's model (Sonnet 5)"
+        );
+        assert_default_row_wraps_whole(
+            app,
+            &[
+                "no --model \u{b7} claude restores",
+                "the model this session last",
+                "answered with; the effort",
+                "comes from your settings",
+            ],
+        );
+    }
+
+    /// Only the model picker's `default` row wraps. An agent picker row keeps its
+    /// user-written blurb on ONE line, clipped at the border, however long it is.
+    /// The box also counts each agent choice as one line.
+    #[test]
+    fn the_agent_pickers_rows_stay_one_line_however_long_the_description() {
+        /// Far wider than the room beside the label, and its tail is a word that
+        /// appears nowhere else on the board. Drawing it anywhere would mean the
+        /// description wrapped instead of clipping.
+        const LONG: &str = "Plans the work in careful detail before anyone writes a \
+                            line of code and then hands off a checklist";
+        /// Wide enough for the whole modal.
+        const WIDTH: u16 = 80;
+        /// Tall enough to draw the whole picker.
+        const TALL: u16 = 24;
+
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.open_agent_picker(vec![
+            DefinedAgent {
+                name: "planner".to_string(),
+                description: Some(LONG.to_string()),
+            },
+            DefinedAgent {
+                name: "reviewer".to_string(),
+                description: None,
+            },
+        ]);
+        let modal = app.modal.clone().expect("the picker is open");
+
+        let rows = modal_inner_rows(&mut app, WIDTH, TALL);
+        let screen = rows.join("\n");
+        let planner = rows
+            .iter()
+            .position(|row| row.starts_with("  planner  Plans the work"))
+            .unwrap_or_else(|| panic!("the planner row is drawn; screen:\n{screen}"));
+        assert!(
+            rows[planner + 1].starts_with("  reviewer"),
+            "the next agent follows directly: the long blurb stayed on its row; \
+             screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("checklist"),
+            "the blurb's tail is clipped at the border, not wrapped; screen:\n{screen}"
+        );
+
+        // The arithmetic: one line per choice, so the box fits exactly that many.
+        let message_rows = wrap_message(&modal.message, MODAL_INNER_WIDTH).len();
+        let fits = u16::try_from(modal.choices.len() + message_rows).expect("a small modal")
+            + MODAL_LIST_CHROME_ROWS
+            + MODAL_BORDER_ROWS;
+        let rows = modal_inner_rows(&mut app, WIDTH, fits);
+        let screen = rows.join("\n");
+        assert!(
+            rows.iter().any(|row| row.starts_with("  reviewer"))
+                && !any_more_marker(&rows, modal.choices.len()),
+            "a {fits}-row terminal fits every one-line agent row; screen:\n{screen}"
+        );
+        let rows = modal_inner_rows(&mut app, WIDTH, fits - 1);
+        let screen = rows.join("\n");
+        assert!(
+            screen.contains(&format!("{MODAL_MORE_BELOW} 1 more")),
+            "one row shorter, exactly one agent row is off-window; screen:\n{screen}"
         );
     }
 
@@ -13776,8 +15749,11 @@ mod tests {
     /// `app::delete_confirm_message` quotes.
     ///
     /// The added sentence costs exactly ONE wrapped row (4 → 5), so the `Row` box
-    /// grows 10 → 11. `centered_rect` CLAMPS that height and `render_modal` draws
-    /// top-down with no vertical scroll, so the extra row pushes the button strip
+    /// grows 10 → 11. `centered_rect` CLAMPS that height and `render_modal` draws a
+    /// `Row` top-down with no vertical scroll — only the `List` layout scrolls
+    /// ([`modal_list_window`]), and deliberately so: a button strip is fixed chrome
+    /// the user cannot page through, where a picker's rows are data — so the extra
+    /// row pushes the button strip
     /// and the `Esc cancel` footer off a short terminal one row sooner than the
     /// non-disclosing confirm did: the strip needs 9 rows where it needed 8, the
     /// footer 11 where it needed 10.
@@ -13882,25 +15858,28 @@ mod tests {
 
         let narrowest_whole_cancel = |lineage_label: &str| -> Option<u16> {
             (20u16..=70).find(|&w| {
-                let modal = Modal {
+                let mut modal = Modal {
                     title: "delete session".to_string(),
                     message: message.clone(),
                     layout: ModalLayout::Row,
+                    footer: super::super::app::MODAL_ROW_FOOTER,
                     choices: ["Delete this", lineage_label, "Cancel"]
                         .into_iter()
                         .map(|label| ModalChoice {
                             label: label.to_string(),
                             description: None,
+                            wrap_description: false,
                             action: ModalAction::Cancel,
                         })
                         .collect(),
                     selected: 2,
                     session_id: None,
+                    scroll: 0,
                 };
                 let mut terminal =
                     Terminal::new(TestBackend::new(w, 24)).expect("build a test terminal");
                 terminal
-                    .draw(|frame| render_modal(frame, &modal))
+                    .draw(|frame| render_modal(frame, &mut modal))
                     .expect("render must not panic at any width");
                 let buffer = terminal.backend().buffer().clone();
                 (0..24u16)

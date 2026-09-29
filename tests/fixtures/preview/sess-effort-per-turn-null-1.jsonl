@@ -1,0 +1,3 @@
+{"type":"summary","summary":"Opus 5 at the session level"}
+{"type":"user","sessionId":"sess-effort-per-turn-null-1","cwd":"/Users/me/project-alpha","gitBranch":"main","timestamp":"2026-09-23T12:50:00.000Z","message":{"role":"user","content":"Review the diff"}}
+{"type":"assistant","sessionId":"sess-effort-per-turn-null-1","cwd":"/Users/me/project-alpha","gitBranch":"main","timestamp":"2026-09-23T12:55:00.000Z","message":{"role":"assistant","model":"claude-opus-5","content":"The diff looks correct."},"effort":"xhigh","perTurnEffort":null}

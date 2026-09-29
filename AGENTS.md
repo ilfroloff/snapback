@@ -20,8 +20,13 @@ one place.
 
 - **FAIL-SOFT parsing.** Parse JSONL as `serde_json::Value`, NEVER hard-typed
   deserialize structs. Skip bad lines/files; never panic on malformed input.
-  Same for `claude agents --json` and for DEFINED-agent frontmatter (hand-parsed,
-  no YAML crate). (`src/store/*`, `src/agents.rs`, `src/defined_agents.rs`)
+  Same for `claude agents --json`, for DEFINED-agent frontmatter (hand-parsed,
+  no YAML crate), and for every `claude` settings file `claude_settings` reads
+  (which ones, and in which precedence, is
+  [CLAUDE_CLI.md](docs/agents/CLAUDE_CLI.md#which-model-a-launch-runs-on-without---model)'s),
+  where a bad file is "no value from this file", never an error.
+  (`src/store/*`, `src/agents.rs`, `src/defined_agents.rs`,
+  `src/claude_settings.rs`)
 - **AUTHORITATIVE-FROM-FILE.** Read `cwd`/`sessionId` from INSIDE the file,
   never decode the `<encoded-cwd>` folder name (the `/`→`-` encoding is lossy).
   Re-read them at hand-off time. (`src/store/parse.rs`, `src/resume.rs`)
@@ -52,10 +57,23 @@ one place.
   `~/.config/snapback`), specifically the `state/` subdir — resolved by the
   `config` module, the SINGLE place that reads the environment for any
   snapback-owned path — NEVER inside the read-only `~/.claude/projects` store.
-  Read + write are FAIL-SOFT (a missing or garbage file ⇒ an empty set, never a
-  panic) and the write is ATOMIC (temp file + rename). Hiding is a VISIBILITY
+  Read + write are FAIL-SOFT (a missing or unreadable file ⇒ an empty set, never
+  a panic) and the write is ATOMIC (temp file + rename). Hiding is a VISIBILITY
   preference, not a status flag. (`src/config.rs`; `src/hidden.rs`; the persist
   path in `src/tui/app.rs`)
+- **A MODEL IS PICKED PER COMPOSE, NEVER PER BOARD.** `--model`/`--effort` reach
+  `claude` ONLY from an explicit `Ctrl-L` pick inside a compose box, and only on
+  that compose's own launch: the `Ctrl-R` quick reply, or the `Ctrl-N` draft's
+  `--bg` launch / `Ctrl-O` run. Resume (`Enter`), Fork (`Ctrl-F`) and Attach NEVER
+  carry one, structurally: `build_argv` and `build_attach_argv` take no pick. The
+  agent picker's `Ctrl-O` skips the compose, so `launch_pick_interactively` has no
+  pick and hands `None` on to `build_new_argv`, the one hand-off builder that takes
+  one. An effort rides only INSIDE a pick (`ModelPick`), never alone. The pick is
+  `ComposeState::model`, `None` in every new compose, and dies with it: no
+  board-wide pick, no launch flag, nothing persisted. Why, and where each launch
+  gets its model: [DOMAIN.md](docs/agents/DOMAIN.md#compose-model-pick-ctrl-l).
+  (`src/resume.rs`; `src/send.rs`; `src/tui/compose.rs`;
+  `launch_pick_interactively` in `src/tui/update.rs`)
 - **STORE WRITES ARE GATED, AND ALL BUT ONE ARE DELEGATED.** The only mutation
   `snapback` itself performs on `~/.claude/projects` is hard delete (`Ctrl-X d`),
   behind BOTH a confirmation modal AND the pure `can_delete_target` WRITER guard.
@@ -103,30 +121,24 @@ one place.
   a **dev-dependency** and survives ONLY as the test-only parity ORACLE inside that
   same module — NO runtime path may reach it, and nothing outside `mod tests` may
   `use` it. Matching is SUBSTRING, not fuzzy, by the mechanism rather than by a
-  setting: memmem searches substrings by nature. ONE matcher answers everything,
-  under TWO rules. The FILTER answers MEMBERSHIP with `memchr::memmem`; smart case
-  is decided **PER ATOM**, never per query, and each atom searches the cased or
-  lowercased haystack accordingly — BOTH are load-bearing. In `NameAndContent` the
-  MULTI-atom AND is BOUNDED, never unbounded co-occurrence: every atom in the
-  LABEL, or every atom within ONE proximity window of the content haystack. A
-  single-atom query and `NameOnly` keep the plain AND. That window arm runs over
-  the COMBINED label+content string, so a pair straddling that seam co-occurs, and
-  its occurrence cap is asked of the ANCHOR (RAREST) atom ALONE — a cap on a common
-  atom is a cap on English, and it hands the query back the unbounded AND. That cap
-  is a SCAN-COST bound, not only a bad-file guard: an all-common-word query trips it
-  over an ORDINARY file too, harmlessly, since atoms that frequent co-occur inside
-  the window anyway. The window measures byte distances ACROSS the cased/lowercased
-  pair, so EVERY lowercased string in the module — the filter's haystacks and BOTH
-  marking seams' — is folded by the ONE per-char fold that KEEPS any char whose
-  lowercase would change its UTF-8 width. One fold everywhere or the surfaces
-  disagree: same finders, different fold, and an admitted row draws with nothing
-  marked. The ROW-LABEL highlight (`match_indices`) applies the WHOLE-STRING rule
-  over those same finders — EVERY atom in the one string, because a label IS one
-  string, and every occurrence of each is marked. The PREVIEW marks apply the
-  PER-ATOM rule (`atom_match_positions`), so a marked pane reproduces the rule the
-  row was admitted by (the atoms occur ANYWHERE in the transcript, not all on one
-  line). Never rank the filter's results: display order is `App::order_filtered`'s
-  alone.
+  setting. ONE matcher answers everything, under TWO rules. The FILTER answers
+  MEMBERSHIP with `memchr::memmem`; smart case is decided **PER ATOM**, never per
+  query, and each atom searches the cased or lowercased haystack accordingly —
+  BOTH haystacks are load-bearing. In `NameAndContent` a MULTI-atom AND is
+  BOUNDED, never unbounded co-occurrence: every atom in the LABEL, OR every atom
+  within ONE proximity window — BOTH arms are load-bearing. That window arm runs
+  over the COMBINED label+content string, so a pair straddling that seam
+  co-occurs, and its occurrence cap is asked of the ANCHOR (RAREST) atom ALONE. A
+  single-atom query and `NameOnly` keep the plain AND. EVERY lowercased string in
+  the module — the filter's haystacks and BOTH marking seams' — is folded by the
+  ONE per-char, byte-length-preserving fold. The ROW-LABEL highlight
+  (`match_indices`) applies the WHOLE-STRING rule over the same finders — EVERY
+  atom in the one string, every occurrence of each marked; the PREVIEW marks apply
+  the PER-ATOM rule (`atom_match_positions`). Never rank the filter's results:
+  display order is `App::order_filtered`'s alone. The window, the cap and the fold
+  are argued in
+  [DOMAIN.md](docs/agents/DOMAIN.md#content-index-storeparse), the two rules in
+  [PATTERNS.md](docs/agents/PATTERNS.md#4-isolate-volatile-dependencies).
   (`src/search.rs`)
 - **STABLE-ID STATE.** Track selection by `session_id`, never list index, so it
   survives autorefresh reloads. (`src/tui/app.rs`)
@@ -139,10 +151,11 @@ one place.
   TWO bounded one-shots are deliberate, documented exceptions (`PATTERNS.md` §6):
   the liveness probe at hand-off, and the worktree resolve at
   construction/reload. Both are argued at the call site, and NEITHER may move
-  onto a keystroke or the render path. The `Ctrl-X y` clipboard copy is NOT a
-  third: its tool runs as a THREADED child, started by the driver on its own
-  thread and reporting back as one `AppEvent::CopyFinished`, so no keystroke
-  waits on it. (`src/watch.rs`, `src/worktrees.rs`, `src/tui/clipboard.rs`)
+  onto a keystroke or the render path. Work that runs on its OWN thread and
+  reports back with one `AppEvent` is the rule's ordinary case, never a third
+  exception: the `Ctrl-X y` clipboard copy (`CopyFinished`), the `--model` alias
+  probe (`ModelAliases`) and the settings-model read (`SettingsModel`) are all
+  that shape. (`src/watch.rs`, `src/worktrees.rs`, `src/tui/clipboard.rs`)
 - **PURE, GIT-FREE STORE CORE.** `src/store/*` decides everything from the bytes
   it was given: `repo_of`'s worktree collapse is a pure string heuristic, and NO
   module under `src/store/` may shell out (to `git` or anything else) or read
@@ -158,15 +171,21 @@ one place.
 - **NARROW `#[allow(dead_code)]`.** Binary-crate lint quirk: attach it to the
   single item with a reason. NEVER a crate/module-wide blanket. (`src/search.rs`,
   `src/watch.rs`, `src/worktrees.rs`)
-- **KEEP KEY DOCS IN SYNC.** A key/flag change must update the table in
-  `update.rs`, `USAGE`/`KEYS` in `cli.rs`, the help line in `view.rs`, the
-  README key map, and any prose enumeration of a key set in `docs/agents/*`
-  (for example, PATTERNS.md's follow-bottom re-arm passage) together. This is
-  the ONE list of those surfaces; the other docs point here. It binds ROUTING
-  too, not just bindings: when a key's gate gains a case (a new
-  `AgentActivity` bucket, a new refusal), every place that ENUMERATES that
-  routing is stale until updated — the five above plus the gate tables in
-  [DOMAIN.md](docs/agents/DOMAIN.md). A partial enumeration is a wrong one.
+- **KEEP KEY DOCS IN SYNC.** A key/flag change must update, together: the
+  keybinding table in `update.rs`'s module doc; `USAGE`/`KEYS` in `cli.rs`; the
+  help line in `view.rs` (EVERY key string that renders there: the board keymap,
+  `chord_hint`'s which-key list, and `compose_hint`'s reply hint and
+  `BG_DRAFT_HINT`); the README key map; and any prose enumeration of a key set in
+  `docs/agents/*` (for example, PATTERNS.md's follow-bottom re-arm passage). This
+  is the ONE list of those surfaces; the other docs point here. The help line is
+  ONE row, cut rather than wrapped: `chord_hint` and the reply hint are
+  column-budgeted to fit 80 whole (each pinned by a test), while the board keymap
+  and `BG_DRAFT_HINT` run past 80 and are cut there, so an 80-column terminal
+  draws only their leading keys. It binds ROUTING too, not just bindings: when a
+  key's gate gains a case (a new `AgentActivity` bucket, a new refusal), every
+  place that ENUMERATES that routing is stale until updated — the five above plus
+  the gate tables in [DOMAIN.md](docs/agents/DOMAIN.md). A partial enumeration is
+  a wrong one.
 - **STATUS-LINE OWNERSHIP.** `App::status` is a keypress-scoped surface: it carries
   only **outcomes and refusals**. A fact that is true over an interval lives in
   typed state and renders on the surface that owns it. Failures and refusals stay
@@ -186,14 +205,22 @@ one place.
 - **NO MAGIC VALUES** — every tunable is a named `const` with a rationale.
 - **PURE + TESTED** — new decision logic is a pure function with an inline unit
   test; keep side effects in thin wrappers.
+- **TESTS ARE THE SPECIFICATION** — change an existing test's behavioral
+  assertion only for a stated trigger (a requirement change, or a test proven
+  wrong), and report every changed test in a short Test Change Report (test,
+  what changed, why).
+- **COMMENTS STATE WHAT THE CODE CANNOT** — an added or edited comment states a
+  constraint the code cannot show, or points to the doc that owns the rationale
+  instead of restating it. Provenance is the exception: an undocumented,
+  version-pinned or reverse-engineered finding keeps its source and version
+  (`claude 2.1.282`, a dated measurement).
 
 ## Git commits
 
 - **ALWAYS** read [`GIT_COMMIT_INSTRUCTIONS.md`](GIT_COMMIT_INSTRUCTIONS.md)
-  before composing a commit message — follow every rule and example it contains
-  (Conventional Commits, `src/`-derived scopes, WHY-focused body, plain text).
-- **NEVER** write a commit message without consulting
-  `GIT_COMMIT_INSTRUCTIONS.md` first.
+  before composing a commit message — NEVER write one without it — and follow
+  every rule and example it contains (Conventional Commits, `src/`-derived
+  scopes, WHY-focused body, plain text).
 - **NEVER** commit gitignored files, and NEVER use `git add -f` or similar force
   commands to bypass `.gitignore` (notably `/target`).
 - **Commit TYPE now drives the released version** — the accurate type per
@@ -237,7 +264,7 @@ Full command reference and the validation checklist:
 | Session format, JSONL fields, domain concepts | [docs/agents/DOMAIN.md](docs/agents/DOMAIN.md) |
 | Implementation + testing conventions | [docs/agents/PATTERNS.md](docs/agents/PATTERNS.md) |
 | Commands, env, `--print-list`, CI + release automation, checklist | [docs/agents/OPERATIONS.md](docs/agents/OPERATIONS.md) |
-| External `claude` CLI flags/commands + version pin + spawned argv | [docs/agents/CLAUDE_CLI.md](docs/agents/CLAUDE_CLI.md) |
+| External `claude` CLI flags/commands + version pin + spawned argv, the `--model` alias capture, the model a launch without `--model` runs on | [docs/agents/CLAUDE_CLI.md](docs/agents/CLAUDE_CLI.md) |
 | Commit message rules + examples | [GIT_COMMIT_INSTRUCTIONS.md](GIT_COMMIT_INSTRUCTIONS.md) |
 | Reading order / doc ownership | [docs/agents/README.md](docs/agents/README.md) |
 | End-user features + full key map | [README.md](README.md) |
@@ -251,4 +278,4 @@ Full command reference and the validation checklist:
       Un-failed tests are unverified claims, not coverage.
 - [ ] New pure logic has an inline unit test; new format edge case has a fixture.
 - [ ] Key/flag docs kept in sync across the five locations.
-- [ ] Agent docs refreshed via the self-healing stage.
+- [ ] Agent docs refreshed by the `project-agent-docs` skill (self-healing).

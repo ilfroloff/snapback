@@ -15,32 +15,42 @@ find the same rule in two places, that is a bug to fix.
 3. [DOMAIN.md](DOMAIN.md) — **the session format**: store layout, the
    session/subagent/sidecar distinction, the JSONL fields relied on, the derived
    concepts (label, grouping, content index, fork lineage, turn count, live
-   agents, the preview's peer and injected-context nodes, scopes), and the
-   per-state routing tables — the hand-offs, the
+   agents, the preview's peer and injected-context nodes, the answering model
+   and the one a `-r` launch restores, scopes, the per-compose model pick and
+   its defaults), and the per-state routing tables — the hand-offs, the
    `Ctrl-R` / `Ctrl-K` gates, and the terminal-paste owner table.
 4. [PATTERNS.md](PATTERNS.md) — **how to build new things**: the repeated
    implementation rules and the testing conventions to match.
 5. [OPERATIONS.md](OPERATIONS.md) — build/test/lint/run commands, the
    environment it reads (the `CLAUDE_PROJECTS_DIR` / `SNAPBACK_CONFIG_DIR`
-   overrides and the session facts the `Ctrl-X y` copy routes by), the runtime
+   overrides, the session facts the `Ctrl-X y` copy routes by, and `claude`'s own
+   model variables the compose boxes' `model:` labels read), the runtime
    prerequisites, the hidden `--print-list` mode, the CI + release-plz
    automation, and the pre-finish validation checklist.
 6. [CLAUDE_CLI.md](CLAUDE_CLI.md) — **the external `claude` binary**: version
-   pin, the argv `snapback` spawns (and the one effect that is not a `claude`
-   invocation: a `kill(2)` on a pid `claude agents --json` reported), top-level
-   flags, commands, and the background-session commands — `stop`/`attach`, which
-   it depends on, and the ones it deliberately does not use.
+   pin, the argv `snapback` spawns (including where a compose's `Ctrl-L` pick
+   places `--model` / `--effort`), the one effect that is not a `claude`
+   invocation (a `kill(2)` on a pid `claude agents --json` reported), top-level
+   flags, commands, the `--model` alias set (which `claude --help` reports
+   incompletely, so it is captured from the binary instead — a point-in-time
+   record for humans, since `snapback` reads the same array off the installed
+   binary at runtime), what `--effort` accepts and why it can never fail a launch,
+   which model a launch runs on without `--model` (the settings precedence and the
+   `-r` model restore, read out of the bundle), and the background-session
+   commands — `stop`/`attach`, which it depends on, and the ones it deliberately
+   does not use.
 
 ## Section ownership (avoid duplication)
 
 | Topic | Lives in |
 | --- | --- |
 | Module responsibilities, stack, runtime wiring | ARCHITECTURE |
-| Store layout, JSONL fields, label/grouping/fork-lineage/turn-count/live-agent semantics, and the routing tables (hand-off, `Ctrl-R`, `Ctrl-K`, `Event::Paste`) | DOMAIN |
-| Fail-soft / authoritative-from-file / isolation / styling rules, testing conventions | PATTERNS |
+| Store layout, JSONL fields, label/grouping/fork-lineage/turn-count/live-agent/answering-model semantics, the per-compose model pick and its `ComposeDefault` cases, and the routing tables (hand-off, `Ctrl-R`, `Ctrl-K`, `Event::Paste`) | DOMAIN |
+| How the critical rules are carried out in code (fail-soft direction, authoritative re-read, matcher isolation, styling, off-thread shapes, status ownership), the tunables table, testing conventions | PATTERNS |
 | Commands, env vars, CI + release automation, validation checklist | OPERATIONS |
-| External `claude` CLI surface (flags, commands, version pin, spawned argv) | CLAUDE_CLI |
-| Critical rules + engineering principles | AGENTS.md |
+| External `claude` CLI surface (flags, commands, version pin, spawned argv, the captured `--model` alias set + its refresh command, the `--effort` levels and how claude treats them, the settings precedence and `-r` model restore a launch without `--model` follows) | CLAUDE_CLI |
+| The runtime readers of that alias set (`model_aliases`) and of the settings default and restore override (`claude_settings`), and how their answers reach the compose boxes | ARCHITECTURE |
+| The critical rules themselves + engineering principles (the authoritative wording: the files above own each rule's mechanism, and where one still repeats a rule, AGENTS.md's statement wins) | AGENTS.md |
 
 ## Maintenance
 
