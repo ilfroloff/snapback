@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/ilfroloff/snapback/compare/v0.10.0...v0.11.0) - 2026-09-30
+
+### Added
+
+- keep selecting while a held drag scrolls past the preview edge
+- select a word in the preview with a double-click
+- select and copy preview text with a mouse drag
+- step the pane layout with Shift-arrows instead of a preview toggle
+- make preview links stand out from the text around them
+- pick the model for each reply or draft and see who answered
+- pin the turn you are reading above the preview transcript
+- *(store/preview)* dim an opened fold node's body so it recedes
+
+### Fixed
+
+- stop treating injected context as something you typed
+- open only the web link a preview click actually lands on
+
 ## [0.10.0](https://github.com/ilfroloff/snapback/compare/v0.9.0...v0.10.0) - 2026-09-26
 
 ### Added
