@@ -143,7 +143,8 @@ KEYS:
                   as TEXT: into a compose draft at the cursor, newlines and all, or
                   into the search query at its cursor with newlines flattened to
                   spaces. It never sends, resumes, or answers a confirmation
-    Esc           quit          (type to search)
+    Esc           clear the search query; with none typed, quit
+    Ctrl-C        quit          (always)
 
 BACK TO THE BOARD (typed inside a resumed Claude session, not a snapback key):
     /bg           detach the session — it keeps running as a bg agent — and snap

@@ -1366,7 +1366,7 @@ movement and folding never share a key. Prefer
 keyboard protocol and clears it on every board (re)entry
 (`tui::reset_terminal_state`), so on default macOS terminals `Alt` arrives as a
 composed character that types junk into the query, and a split `ESC` read
-surfaces as a bare `Esc` — which quits the board. `Shift` rides the ordinary
+surfaces as a bare `Esc` — which quits an empty-query board. `Shift` rides the ordinary
 `CSI 1;2<final>` encoding crossterm already decodes into a `KeyModifiers::SHIFT`.
 
 `Alt` is bindable in ONE narrow case: the binding MIRRORS a gesture the compose
@@ -1386,7 +1386,7 @@ for Option.
 
 The exception does not WAIVE the hazard above, it ACCEPTS it: a split `ESC` read
 on a slow or multiplexed link can surface an `ESC`-prefixed key (`Alt-Backspace`,
-`Alt-b`) as a bare `Esc`, and a bare `Esc` quits the board — so the keys this
+`Alt-b`) as a bare `Esc`, and a bare `Esc` quits an empty-query board — so the keys this
 case blesses can drop the user off the board instead of deleting or hopping a
 word. It is taken anyway on two grounds. `⌥⌫` and `⌥←`/`⌥→` are the gestures
 users actually press, and were the originating requests for the two features;

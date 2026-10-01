@@ -2953,6 +2953,18 @@ impl App {
         self.apply_query_change();
     }
 
+    /// Empty the query and re-filter ONCE (`Esc` on the board while a query is
+    /// typed). Already-empty returns without re-filtering, so a no-op keypress
+    /// cannot move the preview or the selection. Selection follows the session id
+    /// through the shared funnel, like every other query edit.
+    pub fn clear_query(&mut self) {
+        if self.query_input.is_empty() {
+            return;
+        }
+        self.query_input.clear();
+        self.apply_query_change();
+    }
+
     /// Toggle name-only vs. name+content search and re-filter.
     ///
     /// Goes through the query funnel rather than straight to the re-filter: the

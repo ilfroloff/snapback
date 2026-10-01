@@ -132,7 +132,8 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | `Alt+Backspace` (`⌥⌫`) / `Ctrl-W` / `Alt+H` | Delete the query **word** before the cursor — one whole search term, so a path or a branch name goes in a single press instead of character by character (`Backspace` alone still takes one character); whatever follows the cursor stays. All three keys do the same thing, because which of them your terminal actually sends depends on how it treats **Option**; they are also the same three the reply and draft boxes word-delete on, so the gesture is bound wherever you type. What a press *cuts* differs on purpose: on the board it takes a whole search term, so `feature/fold-fork-lineages` goes in one press, while in a reply or draft box the cut stops at punctuation and takes only `lineages` |
 | any printable char | Type to search, at the cursor |
 | paste (`Cmd`/`Ctrl-V`, middle-click) | Your terminal's own paste, taken as **text**: into a compose or draft box at the cursor, **newlines intact** (no more sending just the first line); on the board, into the query at its cursor with newlines as spaces. It never sends, resumes, or confirms |
-| `Esc` / `Ctrl-C` | Quit |
+| `Esc` | Clear the search query; with nothing typed, quit |
+| `Ctrl-C` | Quit (always) |
 
 The `Ctrl-X y` copy goes through your OS clipboard tool — `pbcopy` on macOS;
 `wl-copy`, `xclip` or `xsel` on Linux — and the status line says

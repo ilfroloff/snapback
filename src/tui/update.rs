@@ -58,7 +58,8 @@
 //! | mouse: click a preview link | open its url in the browser — `http`/`https` only: any other scheme opens nothing and says so on a sticky status line. On the RELEASE, since only then is it known that the press was a click and not the start of a drag (see [`mouse_effect`]) |
 //! | mouse: drag in the preview | select transcript text in reading order, reverse-videoed — DRAWN text only: each row ends at its last drawn character, never at the pane's edge, and a drag over blank space alone selects nothing, so its release copies nothing. HOLD the drag past the transcript's top or bottom edge and the pane glides that way, a small step every `AUTOSCROLL_FRAME` — faster the further past the edge — so the selection keeps growing into rows that were never on screen until the button comes up (see [`App::autoscroll_preview_selection`]); a plain move while the button is held counts as the release the terminal lost. The release copies the WHOLE selection the way `Ctrl-X y` copies — [`Outcome::Copy`], the clipboard tool first, OSC 52 as the fallback — with a transient status. Never the in-flight reply's tail. A wheel notch, any key or a resize ends it. A drag that starts on a node header or a link selects, and toggles or opens nothing. Off under any overlay (the draft card included) and never started on the pinned row or a docked compose zone (see [`press_starts_selection`]) |
 //! | mouse: double-click in the preview | select the WORD under the pointer (Unicode word boundaries, on the drawn row) and copy it on release, exactly as a drag copies. Two presses on the SAME cell within [`DOUBLE_CLICK_INTERVAL`] (see [`is_double_click`]); a blank word selects nothing; a quick third click keeps the word. The FIRST release is a plain click — it toggles a node header or opens a link, as above — and the SECOND copies the word and toggles or opens nothing, so a node header double-clicked is opened once and stays open. Any key, wheel notch or reload resets the count (a fold toggle does not: it is the first click's own effect), and a press that turned into a drag is not a first click. Same gate as a drag ([`press_starts_selection`]) |
-//! | `Esc` / `Ctrl-C` | quit (always) |
+//! | `Esc` | clear the search query when one is typed; quit when it is already empty |
+//! | `Ctrl-C` | quit (always) |
 //!
 //! No bare printable character is a command: every one of them types into the
 //! query, so no search term can navigate or quit on its way in. Arrows, `Enter`,
@@ -213,6 +214,10 @@ pub enum Action {
     /// `feature/fold-fork-lineages` goes whole on the board where a compose box
     /// would leave all but `lineages`.
     BackspaceWord,
+    /// Empty the search query (`Esc` while one is typed). With an empty query
+    /// `Esc` is [`Action::Quit`] instead, so a first press never quits a board the
+    /// user was still searching.
+    ClearQuery,
     /// Enter the `Ctrl-X` leader chord: arm [`App::pending_chord`] so the NEXT key
     /// routes through the pure [`chord_key`] machine (hide / hard-delete /
     /// show-hidden / forced rescan / copy session ID / fold toggle / cancel)
@@ -445,6 +450,9 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool
         KeyCode::Home => Action::PreviewTop,
         KeyCode::End => Action::PreviewBottom,
         KeyCode::Enter => Action::Resume { fork: false },
+        // `Esc` unwinds one level: a typed query first, the board second.
+        // `Ctrl-C` is bound above and always quits.
+        KeyCode::Esc if !query_empty => Action::ClearQuery,
         KeyCode::Esc => Action::Quit,
         KeyCode::Tab => Action::ToggleSearchMode,
         // Word-delete on the macOS gesture. This arm MUST sit above the plain
@@ -1673,6 +1681,10 @@ fn apply_action(app: &mut App, action: Action) -> Outcome {
         }
         Action::BackspaceWord => {
             app.pop_query_word();
+            Outcome::Continue
+        }
+        Action::ClearQuery => {
+            app.clear_query();
             Outcome::Continue
         }
         Action::Chord => {
@@ -8358,9 +8370,39 @@ mod tests {
     }
 
     #[test]
-    fn esc_and_ctrl_c_always_quit() {
+    fn esc_clears_a_typed_query_and_quits_on_an_empty_one() {
         assert_eq!(key_to_action(key(KeyCode::Esc), true, false), Action::Quit);
-        assert_eq!(key_to_action(key(KeyCode::Esc), false, false), Action::Quit);
+        assert_eq!(
+            key_to_action(key(KeyCode::Esc), false, false),
+            Action::ClearQuery
+        );
+    }
+
+    #[test]
+    fn esc_clears_the_query_first_and_a_second_esc_quits() {
+        let mut app = App::new(
+            vec![session("alpha"), session("beta")],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
+        let all = app.filtered.len();
+        press(&mut app, KeyCode::Char('z'));
+        press(&mut app, KeyCode::Char('z'));
+        assert_eq!(app.query(), "zz");
+        assert!(app.filtered.len() < all, "the query narrowed the list");
+
+        let out = press(&mut app, KeyCode::Esc);
+        assert!(matches!(out, Outcome::Continue), "first Esc keeps running");
+        assert_eq!(app.query(), "", "first Esc clears the query");
+        assert_eq!(app.filtered.len(), all, "the filter re-applied");
+        assert!(app.selected_session().is_some(), "selection survives");
+
+        let out = press(&mut app, KeyCode::Esc);
+        assert!(matches!(out, Outcome::Quit), "second Esc quits");
+    }
+
+    #[test]
+    fn ctrl_c_always_quits() {
         assert_eq!(
             key_to_action(ctrl(KeyCode::Char('c')), false, false),
             Action::Quit
