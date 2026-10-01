@@ -742,7 +742,7 @@ The twins are also **not redundant**, so they must never be hidden outright: the
 bg copy is what makes `claude -r` refuse (the reason `src/agents.rs` exists), so
 the **stalled ancestor is the only plain-resumable copy** of that conversation.
 Hiding it irrecoverably would remove a real capability; hence a reversible fold
-(`←`/`→`) rather than a filter.
+(`Ctrl-X f`) rather than a filter.
 
 #### `sessionKind`
 
@@ -832,7 +832,9 @@ timestamp-desc and ranks groups by their MAX timestamp: a head chosen any other
 way could carry a timestamp below its own lineage's max, and the folded row would
 sort incoherently against the very rows it represents.
 
-Expanding (`→`) **gathers** the other members immediately beneath their head
+Expanding (`Ctrl-X f` on a folded head; the same keys on any row of an open
+lineage fold it back — `App::toggle_selected_lineage`, decided by the pure
+`lineage_toggle`) **gathers** the other members immediately beneath their head
 rather than leaving them at their own timestamp slots. That is deliberate, and it
 is not what plain filtering does: time scatters a lineage — the bg head keeps
 working while its stalled ancestor strands hours or days back, with unrelated
@@ -2152,7 +2154,7 @@ a partial enumeration here is a wrong one, so all six keyboard owners are stated
 | **Stop confirm** (`handle_stop_confirm_key`) | ignored | A plain Enter/Esc gate; a paste is neither, and must never stop an agent. |
 | **Interrupt confirm** (`handle_interrupt_confirm_key`) | ignored | Same. |
 | **Compose** (`App::is_composing`) | inserted at the caret, newlines intact (`compose::insert_paste` → `TextArea::insert_str`) | The fix: as keystrokes, the first embedded newline was a bare `Enter` = `ComposeAction::Send`. |
-| **Board** | appended to the query, newlines flattened to spaces | The query is one line and `search::gate_atoms` splits it on spaces into substring atoms, so `foo\nbar` becomes exactly the `foo bar` the user could have typed. First-line-only would silently discard input. |
+| **Board** | inserted at the query's caret, newlines flattened to spaces | The query is one line and `search::gate_atoms` splits it on spaces into substring atoms, so `foo\nbar` becomes exactly the `foo bar` the user could have typed. First-line-only would silently discard input. |
 
 Two rules hold on every path, both in `update::accept_paste`: line endings
 normalize to `\n` (`\r\n` collapses to one, a lone `\r` becomes one), and the text

@@ -32,7 +32,8 @@
 //! | Key | Action |
 //! | --- | ------ |
 //! | `Up` / `Down` | move selection (always) |
-//! | `Left` / `Right` | fold / expand the selected row's fork lineage (always) |
+//! | `Left` / `Right` | move the search query's caret one character back / forward (always). Not a query change: the list, the selection and the preview stay exactly where they were |
+//! | `Alt-Left` / `Alt-Right`, `Alt-b` / `Alt-f`, `Ctrl-Left` / `Ctrl-Right` | move the search query's caret one WORD back / forward (always) — the widget's own word hop (see [`App::move_query_caret_by_word`]), so forward lands on the START of the next word, as in the reply box. Not a query change either. Three pairs because `⌥←` / `⌥→` reaches the board as `CSI 1;3D` / `C` or as `ESC b` / `ESC f` depending on the terminal, and `Ctrl-Left` / `Ctrl-Right` is the non-`Alt` twin; `Alt-b` / `Alt-f` and `Ctrl-Left` / `Ctrl-Right` are also the pairs the compose box hops words on |
 //! | `Enter` | resume the selected session |
 //! | `Ctrl-F` | fork-resume the selected session |
 //! | `Ctrl-N` | start a new session in the launch directory. When agents are defined a picker opens first and `Enter` on a pick opens a draft pane for the session's first message; with none defined that draft opens straight away. In the draft, `Enter` starts a BACKGROUND agent without leaving the board, `Ctrl-O` runs it interactively instead, `Esc` cancels |
@@ -41,17 +42,17 @@
 //! | `Ctrl-K` | stop / interrupt the selected session's live agent, by whichever handle claude's record carries (see [`send::interrupt_gate`]). A stoppable job id → `claude stop`: an agent whose run is OVER (`done` / `stopped` / `failed`) stops at once, every other live agent confirms first. NO job id but a `pid` → confirm, then re-ask claude at `Enter` and send that pid a SIGTERM (never SIGKILL) only if claude still reports the same pid with no job id; a record that is gone, now carries a job id, or reports another pid refuses instead (see [`send::signal_plan`]). A session claude is not holding, or one it reports with neither a job id nor a pid — or with no job id and a pid no signal could take (`0`, past `i32::MAX`, or the board's own process id) — is refused |
 //! | `Tab` | toggle name-only vs. name+content search. Widening to content also opens the preview on the most recent match, exactly as typing does: it goes through the same query funnel, and the mode is the gate that key just opened |
 //! | `Ctrl-A` | flip the scope: current folder <-> project (the launch repo and all of its git worktrees). ONE key for both, because the second is a refinement of the same question the first answers, not a separate mode. Launched with `--all`/`-a` it becomes a three-stop cycle through all folders as well — the whole store is on this key only when the launch flag put it there |
-//! | `Ctrl-X` then `x`/`d`/`h`/`r`/`y` | leader chord: hide / hard-delete (this row, or its whole fork lineage) / toggle show-hidden / re-read every transcript from disk / copy session ID (the selected session's full id, to the clipboard; the id also shows on the status line) (any other key cancels) |
+//! | `Ctrl-X` then `x`/`d`/`h`/`r`/`y`/`f` | leader chord: hide / hard-delete (this row, or its whole fork lineage) / toggle show-hidden / re-read every transcript from disk / copy session ID (the selected session's full id, to the clipboard; the id also shows on the status line) / fold or expand the selected row's fork lineage (fold an open one, open a folded `(+N)` head, nothing otherwise — see [`App::toggle_selected_lineage`]) (any other key cancels) |
 //! | `Ctrl-L` (in a compose box) | pick the model — and optionally the effort — for THIS compose only: the `Ctrl-R` reply or the `Ctrl-N` draft it is pressed in (see [`compose::compose_key_to_action`]). The box's `model:` label names what it runs on: a reply's default is `session (<model>)`, the model its session last answered with, which claude normally restores by itself (`default` when an `ANTHROPIC_MODEL` / `ANTHROPIC_DEFAULT_*_MODEL` override, or a transcript with no answering model, means it would not); a draft's is `default (<value>) (new sessions only)` from the user's `claude` settings. `--model` / `--effort` are sent ONLY for a pick other than that default — on the reply, the draft's background launch and the draft's `Ctrl-O` run. The picker's first row returns to the default, `Enter` sets the highlighted row into the compose, `Esc` returns with the text and the previous pick intact. Every new compose starts at its default; nothing is remembered. `Enter`, `Ctrl-F` and Attach never send a model |
-//! | `Left` / `Right` (in the model picker) | step the highlighted MODEL row's `--effort` down / up through unset → `low` → `medium` → `high` → `xhigh` → `max`, wrapping both ways; `Enter` then sets the model and the effort together into the compose. Inert on the picker's default row (no model, so no effort) and on every other list modal, so the agent picker keeps ignoring them; they never reach the board's fold / expand underneath |
+//! | `Left` / `Right` (in the model picker) | step the highlighted MODEL row's `--effort` down / up through unset → `low` → `medium` → `high` → `xhigh` → `max`, wrapping both ways; `Enter` then sets the model and the effort together into the compose. Inert on the picker's default row (no model, so no effort) and on every other list modal, so the agent picker keeps ignoring them; they never reach the board's search caret underneath |
 //! | `Shift-Left` / `Shift-Right` | step the pane layout one stop toward a full-width preview / a full-width list, along `0:1 · 1:3 · 1:1 · 3:1 · 1:0` (list:preview; the board starts at `1:1`). A press at either end does nothing. Always — with or without a query, and whatever is marked. The step keeps the reader's place in the preview; leaving `1:0` opens it on the newest turn (see [`App::set_pane_layout`]) |
 //! | `PgUp` / `PgDn` | scroll the preview a page (always) |
 //! | `Ctrl-U` / `Ctrl-D` | scroll the preview a quarter page (always) |
 //! | `Ctrl-T` / `Ctrl-E`, `Home` / `End` | jump the preview to top / bottom (always) |
 //! | `Shift-Up` / `Shift-Down` | scroll the preview onto the previous / next MARKED line, but only while the query marks something in the previewed transcript; with nothing marked they fall through to plain selection movement. One stop per marked LINE, not per occurrence — a line saying the query twice is marked, and stopped at, once |
-//! | `Backspace` | delete the last query character |
-//! | `Alt-Backspace` / `Ctrl-W` / `Alt-H` | delete the last query ATOM — one whole search word, not one character, so a path or a branch name goes in a single press. THREE keys because `TextArea::input` word-deletes on all three in the compose box: binding the same SET here is what makes the gesture reach the board at all, whatever the user's option-as-meta setting turns `Alt-Backspace` into. The set matches; the EXTENT deliberately does not — the board cuts at the search atom and the compose box at `CharKind`'s punctuation boundary, so `feature/fold-fork-lineages` goes whole here and loses only `lineages` there |
-//! | printable char | type-to-search (append to the query) |
+//! | `Backspace` | delete the query character before the caret |
+//! | `Alt-Backspace` / `Ctrl-W` / `Alt-H` | delete the query ATOM before the caret — one whole search word, not one character, so a path or a branch name goes in a single press; what follows the caret stays. THREE keys because `TextArea::input` word-deletes on all three in the compose box: binding the same SET here is what makes the gesture reach the board at all, whatever the user's option-as-meta setting turns `Alt-Backspace` into. The set matches; the EXTENT deliberately does not — the board cuts at the search atom and the compose box at `CharKind`'s punctuation boundary, so `feature/fold-fork-lineages` goes whole here and loses only `lineages` there |
+//! | printable char | type-to-search (insert at the query's caret) |
 //! | terminal paste | inserted as TEXT — never as keystrokes (see below) |
 //! | mouse: click a folded node's header | unfold the node — a subagent's hand-back (`◆`) or context claude injected (`◇`) — where it sits, and a second click folds it back; a click on a header toggles its node and never opens a link. On the RELEASE, like a link, and ahead of one (see [`click_effect`]) |
 //! | mouse: click a preview link | open its url in the browser — `http`/`https` only: any other scheme opens nothing and says so on a sticky status line. On the RELEASE, since only then is it known that the press was a click and not the start of a drag (see [`mouse_effect`]) |
@@ -69,8 +70,13 @@
 //! NOT conditional: they step the layout whatever the query or the marks, and their
 //! arms sit above the plain `Left` / `Right` ones because the first matching arm
 //! wins. A terminal that drops THAT modifier delivers a plain `Left` / `Right`,
-//! which folds or expands a lineage instead — a working key, just not the one
-//! pressed.
+//! which moves the search caret instead — a working key, just not the one
+//! pressed. Caret movement and the lineage fold never share a key: the fold is
+//! `Ctrl-X f`. The `Alt` arrows' word-hop arms sit BETWEEN the two: below the
+//! shifted ones, so `Shift-Alt` still steps the layout, and above the plain ones,
+//! which match an `Alt` arrow too and would step it one character. `Ctrl-Left` /
+//! `Ctrl-Right` hop from inside the `Ctrl` block, which returns before any of them
+//! is tried.
 //!
 //! ## Terminal paste
 //!
@@ -83,8 +89,8 @@
 //! [`handle_paste`] routes it through the SAME six-owner precedence the key arm
 //! uses, and the row above is deliberately terse because the interesting part is
 //! that routing — the four overlay owners swallow a paste, the compose zone inserts
-//! it at the caret, and the board appends it to the query with newlines flattened
-//! to spaces. A paste can never submit, resume, or quit.
+//! it at the caret, and the board inserts it at the query's caret with newlines
+//! flattened to spaces. A paste can never submit, resume, or quit.
 
 use std::io::Write;
 use std::time::{Duration, Instant};
@@ -117,11 +123,18 @@ pub enum Action {
     MoveUp,
     /// Move the selection down one row.
     MoveDown,
-    /// Collapse the selected row's fork lineage back to its single head (`←`).
-    CollapseLineage,
-    /// Expand the selected row's fork lineage, showing the members its head
-    /// stands for (`→`).
-    ExpandLineage,
+    /// Move the search query's caret one character toward the head of the line
+    /// (`←`).
+    CaretBack,
+    /// Move the search query's caret one character toward the tail of the line
+    /// (`→`).
+    CaretForward,
+    /// Move the search query's caret one WORD toward the head of the line
+    /// (`Alt-←` / `Alt-b` / `Ctrl-←`).
+    CaretWordBack,
+    /// Move the search query's caret one WORD toward the tail of the line, onto
+    /// the start of the next word (`Alt-→` / `Alt-f` / `Ctrl-→`).
+    CaretWordForward,
     /// Resume (or fork-resume) the selected session. The refusal gate and the
     /// `claude` hand-off are decided in [`apply_action`]; a confirmed plan
     /// surfaces as [`Outcome::Resume`].
@@ -180,11 +193,11 @@ pub enum Action {
     PreviewMatchNext,
     /// Scroll the preview onto the PREVIOUS marked line (`Shift-Up`).
     PreviewMatchPrev,
-    /// Append a character to the query (type-to-search).
+    /// Insert a character at the query's caret (type-to-search).
     Insert(char),
-    /// Delete the last query character.
+    /// Delete the query character before the caret.
     Backspace,
-    /// Delete the last search ATOM from the query — one whole word, not one
+    /// Delete the search ATOM before the query's caret — one whole word, not one
     /// character (`Alt-Backspace` / `Ctrl-W` / `Alt-H`).
     ///
     /// Three keys because the compose box answers all three: `TextArea::input`
@@ -202,7 +215,8 @@ pub enum Action {
     BackspaceWord,
     /// Enter the `Ctrl-X` leader chord: arm [`App::pending_chord`] so the NEXT key
     /// routes through the pure [`chord_key`] machine (hide / hard-delete /
-    /// show-hidden / forced rescan / copy session ID / cancel) instead of the board.
+    /// show-hidden / forced rescan / copy session ID / fold toggle / cancel)
+    /// instead of the board.
     Chord,
     /// A key with no binding in the current state.
     Ignore,
@@ -351,9 +365,9 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool
             KeyCode::Char('k') | KeyCode::Char('K') => Action::Interrupt,
             KeyCode::Char('c') | KeyCode::Char('C') => Action::Quit,
             // Ctrl-X (0x18 CAN) is the board's leader chord: act on the selected
-            // row (hide / hard-delete / copy session ID) or on the board (show-hidden /
-            // forced rescan). Unbound and terminal-safe — unlike Ctrl-H/I/M,
-            // which alias Backspace/Tab/Enter.
+            // row (hide / hard-delete / copy session ID / fold toggle) or on the
+            // board (show-hidden / forced rescan). Unbound and terminal-safe —
+            // unlike Ctrl-H/I/M, which alias Backspace/Tab/Enter.
             // It only ARMS the chord; the follow-up key decides (see `chord_key`).
             KeyCode::Char('x') | KeyCode::Char('X') => Action::Chord,
             // Quarter-page preview scroll (readline-style). Acts regardless of
@@ -371,6 +385,11 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool
             // Alt at all, so it works on a terminal configured to send Option as
             // a composed character rather than as Meta.
             KeyCode::Char('w') | KeyCode::Char('W') => Action::BackspaceWord,
+            // Word hop (`CSI 1;5D`/`C`), INSIDE this block for the same
+            // early-return reason. It is the non-Alt twin of the `Alt` word hops
+            // below, and the pair `TextArea::input` hops words on in the reply box.
+            KeyCode::Left => Action::CaretWordBack,
+            KeyCode::Right => Action::CaretWordForward,
             _ => Action::Ignore,
         };
     }
@@ -380,12 +399,15 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool
         // something marked to move between. It steps between marked LINES, not
         // between every occurrence: a line can carry several marked runs and is
         // still one stop, because a stop is a place to look and a line is what the
-        // jump can scroll to. Deliberately NOT on Alt: snapback never pushes the kitty
-        // keyboard protocol and actively clears it on every board (re)entry
-        // (`tui::reset_terminal_state`), so Alt+arrow arrives on default macOS
-        // terminals as a composed character that types junk into the query, and a
-        // split ESC read surfaces as a bare `Esc` — which quits the board. `Shift`
-        // needs none of that: it rides the ordinary `CSI 1;2A`/`B` encoding.
+        // jump can scroll to. On `Shift` rather than `Alt-↑`/`↓`: snapback never
+        // pushes the kitty keyboard protocol and actively clears it on every board
+        // (re)entry (`tui::reset_terminal_state`), so on default macOS terminals
+        // `Alt` arrives as a composed character that types junk into the query, and
+        // a split ESC read surfaces as a bare `Esc` — which quits the board. `Shift`
+        // needs none of that: it rides the ordinary `CSI 1;2A`/`B` encoding. The
+        // `Alt` word hops on `←`/`→` below are the narrow exception PATTERNS.md §10
+        // allows — a gesture the reply box answers, with a non-Alt twin — and no
+        // such case exists for the vertical arrows.
         KeyCode::Up if shift && !query_empty && has_preview_matches => Action::PreviewMatchPrev,
         KeyCode::Down if shift && !query_empty && has_preview_matches => Action::PreviewMatchNext,
         KeyCode::Up => Action::MoveUp,
@@ -396,19 +418,26 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool
         // layout means the same thing with or without a query — and on `Shift` for
         // the same reason the match step is: it rides the ordinary `CSI 1;2D`/`C`
         // encoding, where `Alt` would reach a default macOS terminal as a composed
-        // character or a split `Esc`. These arms MUST sit above the plain `Left` /
-        // `Right` ones below: match arms are tried in order and the unguarded arm
-        // matches the shifted key too, so the other order would fold a lineage and
-        // never step the layout.
+        // character or a split `Esc`. These arms MUST sit above every other `Left`
+        // / `Right` arm below, the `Alt` word hops included: match arms are tried in
+        // order and the unguarded arm matches the shifted key too, so the other
+        // order would move the search caret and never step the layout.
         KeyCode::Left if shift => Action::LayoutTowardPreview,
         KeyCode::Right if shift => Action::LayoutTowardList,
-        // Fork-lineage fold toggle, on the canonical tree idiom. Bound OUTSIDE
-        // the `ctrl` block above on purpose: that namespace is already crowded,
-        // and these keys are not printable, so — like the arrows and the preview
-        // scroll keys — they act regardless of the query and can never be
-        // swallowed by type-to-search the way a plain letter would.
-        KeyCode::Left => Action::CollapseLineage,
-        KeyCode::Right => Action::ExpandLineage,
+        // Word hop on `⌥←`/`⌥→` sent as `CSI 1;3D`/`C`; `ESC b`/`ESC f`, the other
+        // byte form of the same gesture, is the `Char('b' | 'f') if alt` arm
+        // below. Below the `shift` arms, so `Shift-Alt-←` still steps the layout,
+        // and ABOVE the plain arms, which match an `Alt` arrow too and would move
+        // the caret one character instead.
+        KeyCode::Left if alt => Action::CaretWordBack,
+        KeyCode::Right if alt => Action::CaretWordForward,
+        // The search caret, unconditionally: editing the query is what the board
+        // does on every search, so it gets the plain arrows. Not gated on the query
+        // either — an empty query has nowhere to move, and the widget treats a move
+        // past either end as a no-op. The lineage fold is `Ctrl-X f` (`chord_key`),
+        // so the two never share a key.
+        KeyCode::Left => Action::CaretBack,
+        KeyCode::Right => Action::CaretForward,
         // Preview scroll: page + jump. Bound regardless of query state (they are
         // not printable, so they never collide with type-to-search).
         KeyCode::PageUp => Action::PreviewPageUp,
@@ -432,6 +461,12 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool
         // Guarded on `alt` and therefore above the catch-all below, which would
         // otherwise swallow it.
         KeyCode::Char('h' | 'H') if alt => Action::BackspaceWord,
+        // readline's word hops (`ESC b` / `ESC f`) — the bytes some terminals
+        // send for `⌥←`/`⌥→` (RustRover's does), and the pair `TextArea::input`
+        // hops words on in the reply box. Above the catch-all for the same reason
+        // as `Alt-H`.
+        KeyCode::Char('b' | 'B') if alt => Action::CaretWordBack,
+        KeyCode::Char('f' | 'F') if alt => Action::CaretWordForward,
         // Every OTHER alt-modified printable is swallowed rather than typed. An
         // `Alt`-modified key is a GESTURE the user aimed at some binding, not
         // text — inserting the bare letter would answer `Alt-J` by typing `j`
@@ -529,8 +564,8 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
             }
             // A pending `Ctrl-X` leader chord OWNS the next key too: route it through
             // the chord machine BEFORE normal handling so a printable follow-up
-            // (`x`/`d`/`h`/`r`/`y`) completes the chord instead of leaking into the
-            // query.
+            // (`x`/`d`/`h`/`r`/`y`/`f`) completes the chord instead of leaking into
+            // the query.
             if app.pending_chord {
                 return handle_chord_key(app, key, store);
             }
@@ -911,8 +946,8 @@ fn flatten_for_query(text: &str) -> String {
 /// 5. **Compose** — INSERTED at the caret as text, via [`compose::insert_paste`].
 ///    This is the fix: the newline inside a paste becomes a newline in the draft
 ///    instead of the `Enter` that used to submit it.
-/// 6. **Board** — APPENDED to the search query, newlines flattened to spaces
-///    ([`flatten_for_query`]), exactly as if typed.
+/// 6. **Board** — INSERTED at the search query's caret, newlines flattened to
+///    spaces ([`flatten_for_query`]), exactly as if typed.
 ///
 /// Returns nothing on purpose. A paste can never produce [`Outcome::Send`],
 /// [`Outcome::Resume`] or any other board-ending outcome, and that is structural
@@ -1503,12 +1538,23 @@ fn apply_action(app: &mut App, action: Action) -> Outcome {
             app.move_selection(1);
             Outcome::Continue
         }
-        Action::CollapseLineage => {
-            app.collapse_selected();
+        // A caret move — a character or a word — is not a query change, so it never
+        // reaches the query funnel (`App::apply_query_change`): no re-filter, and
+        // the preview stays put.
+        Action::CaretBack => {
+            app.move_query_caret(false);
             Outcome::Continue
         }
-        Action::ExpandLineage => {
-            app.expand_selected();
+        Action::CaretForward => {
+            app.move_query_caret(true);
+            Outcome::Continue
+        }
+        Action::CaretWordBack => {
+            app.move_query_caret_by_word(false);
+            Outcome::Continue
+        }
+        Action::CaretWordForward => {
+            app.move_query_caret_by_word(true);
             Outcome::Continue
         }
         Action::Resume { fork } => {
@@ -1812,10 +1858,10 @@ pub fn finish_copy<W: Write>(app: &mut App, w: &mut W, payload: &CopyPayload, co
     }
 }
 
-/// The five keys a pending `Ctrl-X` chord binds, plus cancel — the PURE decision
+/// The six keys a pending `Ctrl-X` chord binds, plus cancel — the PURE decision
 /// half of the leader chord (PATTERNS §10, keys -> actions -> outcomes). The impure
-/// completion (hide / open confirm / toggle / rescan / copy session ID) lives in
-/// [`handle_chord_key`].
+/// completion (hide / open confirm / toggle / rescan / copy session ID / fold
+/// toggle) lives in [`handle_chord_key`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChordOutcome {
     /// `x` — toggle the selected session's hidden state (soft delete / un-hide).
@@ -1830,6 +1876,10 @@ enum ChordOutcome {
     /// `session_id` to copy ([`Outcome::Copy`] — an OS clipboard tool first, OSC 52
     /// only as the fallback), and the status line then says what actually happened.
     Copy,
+    /// `f` — fold the selected row's fork lineage if it is open, open it if the
+    /// row is a folded `(+N)` head, otherwise nothing
+    /// ([`App::toggle_selected_lineage`]).
+    Fold,
     /// `Esc` / `Ctrl-C` / any unbound key — abandon the chord with no side effect.
     Cancel,
 }
@@ -1852,6 +1902,7 @@ fn chord_key(key: KeyEvent) -> ChordOutcome {
         KeyCode::Char('h') | KeyCode::Char('H') => ChordOutcome::ShowHidden,
         KeyCode::Char('r') | KeyCode::Char('R') => ChordOutcome::Rescan,
         KeyCode::Char('y') | KeyCode::Char('Y') => ChordOutcome::Copy,
+        KeyCode::Char('f') | KeyCode::Char('F') => ChordOutcome::Fold,
         _ => ChordOutcome::Cancel,
     }
 }
@@ -1863,11 +1914,11 @@ fn chord_key(key: KeyEvent) -> ChordOutcome {
 /// hard-delete confirm (it does NOT delete here — the confirm handler does), `h`
 /// toggles the show-hidden view, `r` forces a full re-read of the store, `y` requests
 /// a clipboard copy of the selected session's full id ([`copy_selected_id`], which
-/// hands the driver an [`Outcome::Copy`]), and anything else (`Esc` / `Ctrl-C` / an
-/// unbound key) abandons the chord with no side effect. The pending state is cleared
-/// FIRST so an early return can never wedge the board in the chord. Routed BEFORE
-/// `key_to_action` in [`handle_event`], so a printable completion never leaks into
-/// the query.
+/// hands the driver an [`Outcome::Copy`]), `f` folds or expands the selected row's
+/// fork lineage, and anything else (`Esc` / `Ctrl-C` / an unbound key) abandons the
+/// chord with no side effect. The pending state is cleared FIRST so an early return
+/// can never wedge the board in the chord. Routed BEFORE `key_to_action` in
+/// [`handle_event`], so a printable completion never leaks into the query.
 ///
 /// `r` is the store cache's ESCAPE HATCH, and it is a user-reachable key rather
 /// than an internal call for exactly that reason: reloads reuse the parse of every
@@ -1894,6 +1945,7 @@ fn handle_chord_key(app: &mut App, key: KeyEvent, store: &mut SessionStore) -> O
         // runs a tool on its own thread or writes an OSC 52 escape, so the request
         // leaves here as data (`Outcome::Copy`) rather than as `Continue`.
         ChordOutcome::Copy => return copy_selected_id(app),
+        ChordOutcome::Fold => app.toggle_selected_lineage(),
         ChordOutcome::Cancel => {}
     }
     Outcome::Continue
@@ -1950,9 +2002,10 @@ enum ModalNav {
 ///   would be a second, undiscoverable spelling of a key pair the picker already
 ///   names in its prompt and footer.
 ///
-/// `Left`/`Right` are ALSO bound on the BOARD (`CollapseLineage`/`ExpandLineage`);
+/// `Left`/`Right` are ALSO bound on the BOARD (`CaretBack`/`CaretForward`, and
+/// with `Alt`/`Ctrl` the word hops `CaretWordBack`/`CaretWordForward`);
 /// `handle_event`'s modal gate keeps those dispatch contexts apart, so the picker's
-/// arrows can never fold or expand a lineage underneath it.
+/// arrows can never move the search caret underneath it.
 ///
 /// `Ctrl-O` is derived from `layout` for the same reason: only the `List` picker
 /// has an interactive start to offer, so it must stay INERT on the running-session
@@ -2630,6 +2683,13 @@ mod tests {
     /// `Alt-Backspace`, `ESC h` for `Alt-H`).
     fn alt(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::ALT)
+    }
+
+    /// `Alt` with `SHIFT` alongside: what crossterm decodes `ESC B` into (a
+    /// capital letter after the ESC prefix carries `SHIFT`), and `CSI 1;4D` /
+    /// `C` (`Shift-Alt-←` / `→`).
+    fn alt_shift(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::ALT | KeyModifiers::SHIFT)
     }
 
     /// `Ctrl-Shift-<key>`: the modifier set a terminal reports when the shifted
@@ -8107,25 +8167,93 @@ mod tests {
         }
     }
 
+    /// Plain `←` / `→` move the search caret, ALWAYS: with or without a query and
+    /// with or without marks. The `query_empty = true` rows are the ones with teeth
+    /// for the rejected "fold while the query is empty" split — a gate on the query
+    /// would hand the empty-query arrows back to the fold, and this fails there.
     #[test]
-    fn left_right_fold_and_expand_regardless_of_query() {
-        // `←` folds a fork lineage back to its head, `→` expands it. Neither key
-        // is printable, so — unlike the letters, which type — they can never be
-        // swallowed by type-to-search, and that is precisely why they must NOT be
-        // gated on the query either: a `(+N)` head found BY searching is exactly
-        // the row a user most wants to open, and gating would make it unopenable
-        // without first clearing the query. The `query_empty = false` half is the
-        // one with teeth; it is what fails if these are ever gated on the query.
-        for empty in [true, false] {
+    fn left_right_move_the_search_caret_regardless_of_query() {
+        for (query_empty, marked) in [(true, false), (false, false), (true, true), (false, true)] {
             assert_eq!(
-                key_to_action(key(KeyCode::Left), empty, false),
-                Action::CollapseLineage
+                key_to_action(key(KeyCode::Left), query_empty, marked),
+                Action::CaretBack,
+                "Left (query_empty={query_empty}, marked={marked})"
             );
             assert_eq!(
-                key_to_action(key(KeyCode::Right), empty, false),
-                Action::ExpandLineage
+                key_to_action(key(KeyCode::Right), query_empty, marked),
+                Action::CaretForward,
+                "Right (query_empty={query_empty}, marked={marked})"
             );
         }
+    }
+
+    /// `Alt-b` / `Alt-f` — readline's word hops, the `ESC b` / `ESC f` some
+    /// terminals send for `⌥←` / `⌥→` — hop the caret one WORD, with or without a
+    /// query and with or without marks. The uppercase rows are what crossterm
+    /// decodes `ESC B` / `ESC F` into: the capital letter plus `SHIFT`.
+    ///
+    /// This is the bound half of the `Alt` catch-all rule for these two letters:
+    /// hoisting `Char(_) if alt => Ignore` above the hop arms decodes them as
+    /// [`Action::Ignore`] and fails HERE.
+    #[test]
+    fn alt_b_and_alt_f_hop_the_caret_by_word() {
+        for (query_empty, marked) in [(true, false), (false, false), (true, true), (false, true)] {
+            for (event, want) in [
+                (alt(KeyCode::Char('b')), Action::CaretWordBack),
+                (alt(KeyCode::Char('f')), Action::CaretWordForward),
+                (alt_shift(KeyCode::Char('B')), Action::CaretWordBack),
+                (alt_shift(KeyCode::Char('F')), Action::CaretWordForward),
+            ] {
+                assert_eq!(
+                    key_to_action(event, query_empty, marked),
+                    want,
+                    "{event:?} (query_empty={query_empty}, marked={marked})"
+                );
+            }
+        }
+    }
+
+    /// `Alt-←` / `Alt-→` (`CSI 1;3D` / `C`) and `Ctrl-←` / `Ctrl-→` (`CSI 1;5D` /
+    /// `C`) hop the caret one WORD, always — the arrow halves of the word-hop set.
+    ///
+    /// Each pair has an arm placement this pins. The `Alt` arms must sit ABOVE the
+    /// unguarded plain arms, which match an `Alt` arrow too: the other order decodes
+    /// `Alt-←` as [`Action::CaretBack`], a one-character step that looks like a
+    /// sluggish hop. The `Ctrl` arms must sit INSIDE the `ctrl` early-return block:
+    /// written in the lower match they are never reached, and `Ctrl-←` decodes as
+    /// the block's [`Action::Ignore`].
+    #[test]
+    fn alt_and_ctrl_arrows_hop_the_caret_by_word() {
+        for (query_empty, marked) in [(true, false), (false, false), (true, true), (false, true)] {
+            for (event, want) in [
+                (alt(KeyCode::Left), Action::CaretWordBack),
+                (alt(KeyCode::Right), Action::CaretWordForward),
+                (ctrl(KeyCode::Left), Action::CaretWordBack),
+                (ctrl(KeyCode::Right), Action::CaretWordForward),
+            ] {
+                assert_eq!(
+                    key_to_action(event, query_empty, marked),
+                    want,
+                    "{event:?} (query_empty={query_empty}, marked={marked})"
+                );
+            }
+        }
+    }
+
+    /// The `Alt` arrow arms sit BETWEEN the layout arms and the plain caret arms,
+    /// and a held `Shift` still wins: `Shift-Alt-←` (`CSI 1;4D`) steps the layout,
+    /// so hoisting the `Alt` arms above the `Shift` ones fails here — the one
+    /// ordering the word-hop decode test above cannot see.
+    #[test]
+    fn a_held_shift_wins_over_the_alt_word_hop_arms() {
+        assert_eq!(
+            key_to_action(alt_shift(KeyCode::Left), false, false),
+            Action::LayoutTowardPreview
+        );
+        assert_eq!(
+            key_to_action(alt_shift(KeyCode::Right), false, false),
+            Action::LayoutTowardList
+        );
     }
 
     #[test]
@@ -8201,7 +8329,8 @@ mod tests {
     }
 
     /// Both copy status lines name the thing the way the `Ctrl-X y` verb is labelled
-    /// on every key-doc surface (`y copy session ID`): a tool-confirmed copy reads
+    /// on the key-doc surfaces with room for it (`copy session ID`; the which-key
+    /// hint's column budget shortens it to `y copy ID`): a tool-confirmed copy reads
     /// EXACTLY `Copied session ID <uuid>`, and the OSC 52 line says `session ID
     /// <uuid>` too, so a relabel cannot leave one route naming it differently.
     #[test]
@@ -8329,19 +8458,19 @@ mod tests {
     }
 
     /// The layout arms sit ABOVE the plain `Left`/`Right` ones, and this is the
-    /// test that makes the order observable: the unguarded fold arm matches a
+    /// test that makes the order observable: the unguarded caret arm matches a
     /// shifted arrow too, so swapping the two would leave every decode above
-    /// compiling while `Shift-←` folded a lineage. Both directions are asserted —
-    /// the shifted keys step, the unshifted ones still fold and expand.
+    /// compiling while `Shift-←` moved the search caret. Both directions are
+    /// asserted — the shifted keys step, the unshifted ones still move the caret.
     #[test]
-    fn the_layout_arms_win_over_the_plain_fold_arms() {
+    fn the_layout_arms_win_over_the_plain_caret_arms() {
         assert_eq!(
             key_to_action(shift(KeyCode::Left), false, false),
             Action::LayoutTowardPreview
         );
         assert_eq!(
             key_to_action(key(KeyCode::Left), false, false),
-            Action::CollapseLineage
+            Action::CaretBack
         );
         assert_eq!(
             key_to_action(shift(KeyCode::Right), false, false),
@@ -8349,7 +8478,7 @@ mod tests {
         );
         assert_eq!(
             key_to_action(key(KeyCode::Right), false, false),
-            Action::ExpandLineage
+            Action::CaretForward
         );
     }
 
@@ -8525,6 +8654,176 @@ mod tests {
                 "the keypress must reach `pop_query_word`, not `pop_query_char` \
                  (which would leave `alpha bet`)"
             );
+        }
+    }
+
+    /// `←` / `→` pressed END TO END move the caret one character — and do NOTHING
+    /// else. A caret move is not a query change, so the press must not go through
+    /// the query funnel: in name+content mode that funnel re-arms the preview's
+    /// jump onto a match, which would yank the reader's pane on a key that edited
+    /// nothing, so the drained jump staying drained is the assertion with teeth.
+    /// Both ends are walked past, so a move off either end is pinned as a no-op.
+    #[test]
+    fn left_and_right_keypresses_move_the_caret_and_leave_the_board_alone() {
+        let mut app = app_with("s", None);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(
+            app.search_mode,
+            SearchMode::NameAndContent,
+            "premise: the mode in which a query change arms the preview's jump"
+        );
+        type_into_board(&mut app, "lab");
+        assert_eq!(
+            app.query_caret(),
+            3,
+            "premise: typing leaves the caret last"
+        );
+        assert!(
+            app.take_preview_match_jump(),
+            "premise: a real query change DOES arm the jump (drained here)"
+        );
+        app.preview_follow_bottom = false;
+        app.preview_scroll = 7;
+        let filtered = app.filtered.clone();
+
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.query_caret(), 2, "← steps the caret one character back");
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Left);
+        }
+        assert_eq!(app.query_caret(), 0, "and stops at the head of the line");
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.query_caret(), 1, "→ steps it one character forward");
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Right);
+        }
+        assert_eq!(app.query_caret(), 3, "and stops at the tail");
+
+        assert_eq!(app.query(), "lab", "a caret move edits nothing");
+        assert!(
+            !app.take_preview_match_jump(),
+            "a caret move is not a query change: it must not re-arm the preview's jump"
+        );
+        assert_eq!(app.filtered, filtered, "the list is untouched");
+        assert_eq!(app.selected.as_deref(), Some("s"), "so is the selection");
+        assert_eq!(
+            (app.preview_scroll, app.preview_follow_bottom),
+            (7, false),
+            "and the reader's place in the preview"
+        );
+    }
+
+    /// Every word-hop pair pressed END TO END — both byte forms of `⌥←` / `⌥→`
+    /// (`CSI 1;3D` and `ESC b`, plus the `ESC B` capital), and `Ctrl-←` / `Ctrl-→`
+    /// — moves the caret one WORD and does NOTHING else.
+    ///
+    /// The query `lab el` makes a hop distinguishable from every near miss: from
+    /// the tail a one-character step lands at 5 where the hop lands at 4, and from
+    /// the head the hop forward lands on the START of `el` (4) — not on `lab`'s
+    /// last character (2), and not just past it (3). The drained preview jump
+    /// staying drained is what catches a hop routed through the query funnel, as in
+    /// the one-character sibling above.
+    #[test]
+    fn word_hop_keypresses_move_the_caret_by_word_and_leave_the_board_alone() {
+        for (back, forward) in [
+            (alt(KeyCode::Left), alt(KeyCode::Right)),
+            (alt(KeyCode::Char('b')), alt(KeyCode::Char('f'))),
+            (alt_shift(KeyCode::Char('B')), alt_shift(KeyCode::Char('F'))),
+            (ctrl(KeyCode::Left), ctrl(KeyCode::Right)),
+        ] {
+            let mut app = app_with("s", None);
+            let mut store = store_at(Path::new("/tmp"));
+            press(&mut app, KeyCode::Tab);
+            type_into_board(&mut app, "lab el");
+            assert_eq!(
+                app.query_caret(),
+                6,
+                "premise: typing leaves the caret last"
+            );
+            assert!(
+                app.take_preview_match_jump(),
+                "premise: a real query change DOES arm the jump (drained here)"
+            );
+            app.preview_follow_bottom = false;
+            app.preview_scroll = 7;
+            let filtered = app.filtered.clone();
+            assert!(!filtered.is_empty(), "premise: the query keeps the row");
+
+            let mut hop = |event, want: usize, why: &str| {
+                feed(&mut app, event, &mut store);
+                assert_eq!(app.query_caret(), want, "{event:?}: {why}");
+            };
+            hop(back, 4, "back to the start of `el`, not one character (5)");
+            hop(back, 0, "then to the start of `lab`");
+            hop(back, 0, "and no further");
+            hop(
+                forward,
+                4,
+                "forward onto the START of `el`, not onto `lab`'s last character (2) or \
+                 just past it (3)",
+            );
+            hop(forward, 6, "then to the tail");
+            hop(forward, 6, "and no further");
+
+            assert_eq!(app.query(), "lab el", "{back:?}: a word hop edits nothing");
+            assert!(
+                !app.take_preview_match_jump(),
+                "{back:?}: a word hop is not a query change: it must not re-arm the jump"
+            );
+            assert_eq!(app.filtered, filtered, "{back:?}: the list is untouched");
+            assert_eq!(
+                app.selected.as_deref(),
+                Some("s"),
+                "{back:?}: so is the selection"
+            );
+            assert_eq!(
+                (app.preview_scroll, app.preview_follow_bottom),
+                (7, false),
+                "{back:?}: and the reader's place in the preview"
+            );
+        }
+    }
+
+    /// Once `←` has moved the caret, every editing key acts AT it: a typed
+    /// character goes in there, `Backspace` takes the character before it, and a
+    /// word delete cuts the atom before it — never the query's last atom, which is
+    /// what a word delete still pinned to the end of the line would take (it would
+    /// leave `alpha beta ` here). The text after the caret survives each edit and
+    /// the caret stays where the edit left it.
+    #[test]
+    fn editing_keys_act_at_the_caret_after_it_moves() {
+        for press_word_delete in [
+            (|app: &mut App| press_alt(app, KeyCode::Backspace)) as fn(&mut App) -> Outcome,
+            |app: &mut App| press_ctrl(app, KeyCode::Char('w')),
+        ] {
+            let mut app = app_with("idle", None);
+            app.push_query_str("alpha beta gamma");
+            for _ in 0.." gamma".len() {
+                press(&mut app, KeyCode::Left);
+            }
+            assert_eq!(
+                app.query_caret(),
+                10,
+                "premise: the caret sits after `beta`"
+            );
+
+            press_word_delete(&mut app);
+            assert_eq!(
+                app.query(),
+                "alpha  gamma",
+                "the atom BEFORE the caret goes and the tail after it stays"
+            );
+            assert_eq!(app.query_caret(), 6, "the caret stays at the cut");
+
+            type_into_board(&mut app, "xy");
+            assert_eq!(app.query(), "alpha xy gamma", "typing resumes at the cut");
+            press(&mut app, KeyCode::Backspace);
+            assert_eq!(
+                app.query(),
+                "alpha x gamma",
+                "Backspace takes the character before the caret, not the last one"
+            );
+            assert_eq!(app.query_caret(), 7);
         }
     }
 
@@ -9663,6 +9962,12 @@ mod tests {
         assert_eq!(chord_key(key(KeyCode::Char('h'))), ChordOutcome::ShowHidden);
         assert_eq!(chord_key(key(KeyCode::Char('r'))), ChordOutcome::Rescan);
         assert_eq!(chord_key(key(KeyCode::Char('y'))), ChordOutcome::Copy);
+        assert_eq!(chord_key(key(KeyCode::Char('f'))), ChordOutcome::Fold);
+        assert_eq!(
+            chord_key(key(KeyCode::Char('F'))),
+            ChordOutcome::Fold,
+            "a held Shift on the follow-up still folds"
+        );
         assert_eq!(
             chord_key(key(KeyCode::Char('m'))),
             ChordOutcome::Cancel,
@@ -11148,6 +11453,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(&state);
     }
 
+    /// `Ctrl-X f` toggles the selected row's fork lineage BOTH ways, pressed
+    /// through `handle_event`: a folded `(+N)` head opens, an open lineage folds —
+    /// from the head or from a child, which the fold retargets to its head — and the
+    /// `f` is consumed by the chord every time rather than typed into the query.
+    /// The query is live on purpose: a `(+N)` head found BY searching is the row a
+    /// user most wants to open, so the toggle must not depend on the query being
+    /// empty.
+    #[test]
+    fn ctrl_x_f_folds_and_expands_the_selected_rows_lineage() {
+        let mut head = session("sbf-head");
+        head.root_uuid = Some("root-shared".to_string());
+        let mut fork = session("sbf-fork");
+        fork.root_uuid = Some("root-shared".to_string());
+        let mut app = App::new(vec![head, fork], Scope::All, PathBuf::from("/tmp/launch"));
+        let mut store = store_at(Path::new("/tmp"));
+        type_into_board(&mut app, "label");
+        assert_eq!(app.filtered.len(), 1, "premise: the lineage starts folded");
+        let head_id = app.selected.clone().expect("the folded head is selected");
+        let mut ctrl_x_f = |app: &mut App| {
+            feed(app, ctrl(KeyCode::Char('x')), &mut store);
+            feed(app, key(KeyCode::Char('f')), &mut store);
+            assert!(!app.pending_chord, "the chord resolves on its one key");
+            assert_eq!(app.query(), "label", "the `f` must not leak into the query");
+        };
+
+        ctrl_x_f(&mut app);
+        assert_eq!(app.filtered.len(), 2, "a folded head opens");
+        assert_eq!(app.selected.as_deref(), Some(head_id.as_str()));
+
+        ctrl_x_f(&mut app);
+        assert_eq!(app.filtered.len(), 1, "an open lineage folds from its head");
+
+        ctrl_x_f(&mut app);
+        press(&mut app, KeyCode::Down);
+        assert_ne!(
+            app.selected.as_deref(),
+            Some(head_id.as_str()),
+            "premise: the selection stands on the child"
+        );
+        ctrl_x_f(&mut app);
+        assert_eq!(app.filtered.len(), 1, "and from a child");
+        assert_eq!(
+            app.selected.as_deref(),
+            Some(head_id.as_str()),
+            "which hands the selection to the head the fold keeps"
+        );
+    }
+
+    /// `Ctrl-X f` on a row with no lineage to toggle — a session that is its own
+    /// lineage — changes nothing: the list, the selection and the query all stay.
+    #[test]
+    fn ctrl_x_f_on_a_row_with_nothing_to_fold_changes_nothing() {
+        let mut app = app_with("sbf-lone", None);
+        let mut store = store_at(Path::new("/tmp"));
+        let filtered = app.filtered.clone();
+
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('f')), &mut store);
+
+        assert!(!app.pending_chord, "the chord resolves on its one key");
+        assert_eq!(app.filtered, filtered, "nothing to fold or open");
+        assert_eq!(app.selected.as_deref(), Some("sbf-lone"));
+        assert!(app.query().is_empty(), "`f` must not leak into the query");
+    }
+
     /// `Ctrl-X m` is NOT a chord verb any more: there is no board-wide model to
     /// pick. `m` after the leader is an unbound follow-up, so it abandons the chord
     /// like any other — opening nothing, and (the leak guard) never reaching the
@@ -11377,23 +11747,21 @@ mod tests {
     }
 
     /// `←`/`→` inside the open model picker must NEVER reach the board, where the
-    /// same keys fold and expand a fork lineage. The fixture is a real two-member
-    /// lineage folded to one row, and the CONTROL at the end proves `→` does expand
-    /// it once the picker AND its compose are gone — so this cannot pass on a board
-    /// with nothing to fold.
+    /// same keys move the search caret. The board's caret starts MID-query, so a
+    /// leaked arrow in EITHER direction would move it, and the CONTROL at the end
+    /// proves `→` does move it once the picker AND its compose are gone — so this
+    /// cannot pass on a caret with nowhere to go.
     #[test]
-    fn arrows_in_the_model_picker_never_fold_or_expand_the_board() {
-        let mut head = session("sbl-head");
-        head.root_uuid = Some("root-shared".to_string());
-        let mut fork = session("sbl-fork");
-        fork.root_uuid = Some("root-shared".to_string());
-        let mut app = App::new(vec![head, fork], Scope::All, PathBuf::from("/tmp/launch"));
-        let mut store = store_at(Path::new("/tmp"));
-        assert_eq!(
-            app.filtered.len(),
-            1,
-            "the lineage starts folded to one row"
+    fn arrows_in_the_model_picker_never_move_the_boards_search_caret() {
+        let mut app = App::new(
+            vec![session("sbl-row")],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
         );
+        let mut store = store_at(Path::new("/tmp"));
+        type_into_board(&mut app, "lab");
+        feed(&mut app, key(KeyCode::Left), &mut store);
+        assert_eq!(app.query_caret(), 2, "premise: the caret sits mid-query");
 
         compose::open_background(&mut app, None);
         feed(&mut app, ctrl(KeyCode::Char('l')), &mut store);
@@ -11401,23 +11769,28 @@ mod tests {
         for code in [KeyCode::Right, KeyCode::Right, KeyCode::Left] {
             feed(&mut app, key(code), &mut store);
             assert_eq!(
-                app.filtered.len(),
-                1,
-                "{code:?} in the picker must not expand the lineage underneath it"
+                app.query_caret(),
+                2,
+                "{code:?} in the picker must not move the board's caret underneath it"
             );
         }
         assert!(app.modal.is_some(), "the picker still owns the keyboard");
 
         // Control: with the picker AND the compose closed the very same key DOES
-        // expand it.
+        // move it.
         feed(&mut app, key(KeyCode::Esc), &mut store);
         feed(&mut app, key(KeyCode::Esc), &mut store);
         assert!(!app.is_composing(), "both overlays are gone");
         feed(&mut app, key(KeyCode::Right), &mut store);
         assert_eq!(
-            app.filtered.len(),
-            2,
-            "the fixture is foldable: → on the board expands it"
+            app.query_caret(),
+            3,
+            "the fixture can move: → on the board steps the caret"
+        );
+        assert_eq!(
+            app.query(),
+            "lab",
+            "and nothing in the round trip edited it"
         );
     }
 
