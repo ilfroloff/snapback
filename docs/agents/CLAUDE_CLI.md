@@ -110,6 +110,113 @@ byte-identical to its `--model`-only form, and no row that cannot carry a model
 can carry an effort. What claude does with the value is
 [below](#effort-levels---effort).
 
+**Every** invocation in the table above is spawned through
+`claude_cmd::claude_command(argv, profile_override)` (`src/claude_cmd.rs`), the
+ONE seam that turns a pure argv into an actual `Command`. It is handed the
+override `config::claude_profile_override()` read, and stamps
+`CLAUDE_CONFIG_DIR` onto the child via `Command::env` ONLY when the user set
+one and it is absolute. With no override the child's environment is left
+untouched, so `claude` resolves its own default `~/.claude`, which is also the
+store's default. Spelling that default out would NOT be the same: an
+explicitly set `CLAUDE_CONFIG_DIR` changes which login and which global config
+file `claude` uses, even when it names `~/.claude`
+([evidence](#an-explicitly-stamped-default-is-not-unset)). The one exception is
+`resume::open_url`, which opens a link in the platform's default-app launcher
+(`open`/`xdg-open`/`cmd /C start`) — that is not `claude`, so it builds its own
+plain `Command` (`opener_command`) and never carries the profile. See
+[`CLAUDE_CONFIG_DIR`](#claude_config_dir--the-profile-variable-claude_command-stamps)
+below for the variable itself.
+
+### `CLAUDE_CONFIG_DIR` — the profile variable `claude_command` stamps
+
+`snapback` did not invent this name — the external `claude` binary already
+honors it. Confirmed empirically against `claude 2.1.220`, **not from docs**:
+the published settings reference at <https://code.claude.com/docs/en/settings>
+(checked 2026-07-30) still describes `~/.claude` as fixed and does not list it.
+The feature has outrun its docs, which is why this fact lives here rather than
+being assumed permanent.
+
+```sh
+strings -a ~/.local/share/claude/versions/2.1.220 | grep -c CLAUDE_CONFIG_DIR
+# → dozens of hits (measured 28 on 2026-07-30; the exact count drifts by
+# release — only "non-zero" is load-bearing)
+```
+
+It relocates the transcript store to `$CLAUDE_CONFIG_DIR/projects`, with the
+IDENTICAL `<encoded-cwd>/<id>.jsonl` layout, and the agent-job registry too —
+an A/B/C probe against the real binary:
+
+- **(A)** `claude -r <real-id> < /dev/null` under the normal config → the
+  session was FOUND (it then errored later on an unrelated deferred-tool
+  marker).
+- **(B)** the SAME id with `CLAUDE_CONFIG_DIR=/tmp/probe` → `No conversation
+  found with session ID: …`.
+- **(C)** after copying that one `.jsonl` into
+  `/tmp/probe/projects/<encoded-cwd>/` → FOUND again, failing with the
+  identical error as (A) — proving the on-disk layout under a relocated
+  profile is byte-for-byte what `store::discover` already walks.
+- `CLAUDE_CONFIG_DIR=/tmp/probe claude agents --json` → `[]`, even when the
+  un-overridden command returns a real, non-empty list — the agent-job
+  registry is profile-scoped too, which is what makes `agents::live_agents`
+  (the hard-delete WRITER guard's sole authority) profile-scoped.
+
+Re-checked on 2026-09-30 against the installed `claude 2.1.284`
+(`~/.local/share/claude/versions/2.1.284`). This is evidence for this variable
+only; it does not move the command-surface
+[version pin](#version-pin-self-healing):
+
+- `strings -a <binary> | grep -c CLAUDE_CONFIG_DIR` → 49 hits;
+  `strings -a <binary> | grep -c CLAUDE_PROJECTS_DIR` → 0.
+- `CLAUDE_CONFIG_DIR=<fresh mktemp -d> claude agents --json </dev/null` →
+  `[]`, exit 0. The job registry is still profile-scoped.
+- `CLAUDE_CONFIG_DIR=<tmp> claude auth status --json` →
+  `"configDirectory": "<tmp>"` and `"projectsDirectory": "<tmp>/projects"`. The
+  binary itself reports the relocated profile and the `<dir>/projects` store
+  under it, the shape `store::discover` derives.
+
+#### An explicitly stamped default is not "unset"
+
+Measured on 2026-09-30 against the installed `claude 2.1.284`, invoked by its
+full path (`~/.local/share/claude/versions/2.1.284`), and re-run on 2026-10-01
+with the same result. This is why `claude_cmd` stamps only an override the user
+set and never the default spelled out. A stamped default once launched every
+spawned child logged out.
+
+- `env -u CLAUDE_CONFIG_DIR <binary> auth status --json </dev/null` →
+  `"loggedIn": true`, `"authMethod": "claude.ai"`, `"configDirectory"` =
+  `~/.claude` (printed as an absolute path).
+- `CLAUDE_CONFIG_DIR="$HOME/.claude" <binary> auth status --json </dev/null` →
+  `"loggedIn": false`, `"authMethod": "none"`, and the SAME
+  `"configDirectory"`. Same directory, different login.
+- The two read different global-config files. `~/.claude.json` (about 94 KB)
+  is read when the variable is unset; `~/.claude/.claude.json` (772 bytes) is
+  read when it is set. The sizes drift, and only the fact that these are two
+  different files is load-bearing.
+- The bundle shows why (minified names are per build). The keychain service
+  name (`wN`) has no suffix only while `!process.env.CLAUDE_CONFIG_DIR`. Once
+  the variable is set, to any value, it gains a `-<first 8 hex of
+  sha256(dir)>` suffix. The global config path (`M7n`) is
+  `$CLAUDE_CONFIG_DIR/.claude.json` when the variable is set, else
+  `~/.claude.json`. Read from the bundle but NOT exercised: `nr()` returns
+  false, skipping a background-daemon path, whenever the variable is set.
+- The profile directory itself (`be`) is
+  `process.env.CLAUDE_CONFIG_DIR ?? ~/.claude`. The `??` keeps an EMPTY value
+  as `""`, so `claude` does not treat empty as unset, while `config` does.
+  `claude_cmd` is handed no override for it and stamps nothing, so an empty
+  value reaches the child as is, as it did before `snapback` honored the
+  variable.
+
+`auth status --json` also prints account identifiers. Record only the keys
+above.
+
+Because the feature has outrun its docs, `config::claude_config_dir()` always
+falls back to `~/.claude` when the variable is unset or empty — if a future
+`claude` release drops support for it, `snapback` degrades to today's behavior
+rather than breaking. `CLAUDE_PROJECTS_DIR` (`snapback`'s own invention, zero
+hits in the same `strings` scan) is a separate, fixtures/demo-only override of
+the store view; see [OPERATIONS.md](OPERATIONS.md#environment) for how the two
+differ.
+
 ## Invocation form
 
 ```
@@ -677,6 +784,13 @@ strings -a "$(command -v claude)" \
   | awk '{ if (length > n) { n = length; a = $0 } }
          END { if (n) print a
                else { print "no --model alias array found" > "/dev/stderr"; exit 1 } }'
+
+# CLAUDE_CONFIG_DIR is undocumented upstream, so THIS doc is its only record —
+# re-run the strings count against the real installed binary ($BIN above, not
+# a PATH shim), the A/B/C + `agents --json` probe and the unset-vs-stamped-
+# default `auth status` pair above against the live binary rather than
+# trusting a prior capture:
+strings -a "$BIN" | grep -c CLAUDE_CONFIG_DIR
 ```
 
 **Run nothing but `--version` and `--help` here.** Several commands in this list
