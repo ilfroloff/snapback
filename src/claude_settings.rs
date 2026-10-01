@@ -104,6 +104,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use crate::config;
 use crate::defined_agents::CLAUDE_DIR;
 
 /// The environment variable `claude` reads for a model that overrides every
@@ -146,13 +147,6 @@ pub struct ModelDefaults {
     /// session last answered with.
     pub restore_overridden: bool,
 }
-
-/// The environment variable that relocates `claude`'s user config directory
-/// (default `~/.claude`). Set and non-empty wins; an empty value is treated as
-/// unset, matching snapback's own `$CLAUDE_PROJECTS_DIR` / `$SNAPBACK_CONFIG_DIR`
-/// convention rather than resolving settings relative to whatever directory the
-/// board happens to run in.
-const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 
 /// The settings file name in the user config dir and in a project's `.claude/`.
 const SETTINGS_FILE: &str = "settings.json";
@@ -394,13 +388,10 @@ fn read_layers(paths: &[PathBuf]) -> Vec<String> {
         .collect()
 }
 
-/// `claude`'s user config directory: `$CLAUDE_CONFIG_DIR` when set and non-empty,
-/// else `~/.claude`, or `None` when there is no home directory to resolve.
+/// `claude`'s user config directory — the profile `config` resolves — or `None`
+/// when it cannot be named, so the user layer is absent rather than guessed.
 fn user_config_dir() -> Option<PathBuf> {
-    match std::env::var_os(CLAUDE_CONFIG_DIR_ENV) {
-        Some(dir) if !dir.is_empty() => Some(PathBuf::from(dir)),
-        _ => dirs::home_dir().map(|home| home.join(CLAUDE_DIR)),
-    }
+    config::claude_config_dir_if_known()
 }
 
 /// The settings-file half of [`model_defaults`], with every location — and the
@@ -431,9 +422,10 @@ fn defaults_from_disk(
 /// What the user's `claude` settings and environment decide about the model for a
 /// launch from `launch_dir` that carries no `--model` — see [`ModelDefaults`].
 ///
-/// The thin impure driver: it reads the process environment (`ANTHROPIC_MODEL`,
-/// the `ANTHROPIC_DEFAULT_*_MODEL` overrides and `$CLAUDE_CONFIG_DIR`), lists and
-/// reads the settings files, and delegates every decision to
+/// The thin impure driver: it reads the process environment (`ANTHROPIC_MODEL`
+/// and the `ANTHROPIC_DEFAULT_*_MODEL` overrides), takes the user config dir from
+/// `config` (the one reader of `$CLAUDE_CONFIG_DIR`), lists and reads the
+/// settings files, and delegates every decision to
 /// [`resolve_new_session_model`] and [`resolve_restore_overridden`]. Blocking file
 /// I/O — call it off the UI thread, and never on a keystroke or the render path.
 #[must_use]

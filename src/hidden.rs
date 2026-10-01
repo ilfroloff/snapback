@@ -1,8 +1,9 @@
 //! Snapback-owned persistent state: the hidden-session id set.
 //!
 //! This is the FIRST persistent state snapback writes, and it lives in a
-//! SEPARATE, snapback-owned directory — NEVER inside the read-only Claude store
-//! under `~/.claude/projects/`. A session id in this set is a VISIBILITY
+//! SEPARATE, snapback-owned directory — NEVER inside the read-only Claude
+//! profile's store, `<claude-profile>/projects/` (default
+//! `~/.claude/projects/`). A session id in this set is a VISIBILITY
 //! preference (hide the row from the board), not a status claim about the agent:
 //! a hidden live session still reports live in the show-hidden view.
 //!

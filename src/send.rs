@@ -66,7 +66,7 @@
 //! calls it.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::mpsc::{SendError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -1122,15 +1122,24 @@ fn run_send(req: &SendRequest) -> (String, bool) {
 /// stdout, stderr)` — or `Err(())` if the child could not be spawned. Stdin is
 /// nulled so a child can never read the board's keystrokes; the process cwd is
 /// never mutated. Shared by the stop step and the send step.
+///
+/// The `Command` comes from [`crate::claude_cmd::claude_command`], handed the
+/// override [`crate::config::claude_profile_override`] read — the one the
+/// board's store was loaded from — so every reply/stop/bg-launch this module
+/// spawns runs under the store's profile. With no override the child's
+/// environment is left untouched and `claude` uses its own default, which is
+/// the store's default too.
 fn run_child(argv: &[String], cwd: &Path) -> Result<(bool, String, String), ()> {
-    let output = Command::new(&argv[0])
-        .args(&argv[1..])
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|_| ())?;
+    let output = crate::claude_cmd::claude_command(
+        argv,
+        crate::config::claude_profile_override().as_deref(),
+    )
+    .current_dir(cwd)
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .output()
+    .map_err(|_| ())?;
     Ok((
         output.status.success(),
         String::from_utf8_lossy(&output.stdout).into_owned(),

@@ -23,10 +23,19 @@
 //! [`build_argv`] and its siblings), [`read_authoritative`], and the existence
 //! check in [`plan_from_parts`] — are unit tested. The impure driver ([`launch`])
 //! performs `chdir` + spawn + wait and is kept thin over those tested helpers.
+//!
+//! [`launch`]'s `claude` child is built by
+//! [`crate::claude_cmd::claude_command`], which stamps the profile
+//! (`CLAUDE_CONFIG_DIR`) onto it only when the user set an override, and
+//! otherwise leaves its environment untouched. [`open_url`] is the one spawn
+//! in this file that is DELIBERATELY separate: it launches the OS "open in
+//! default app" opener, not `claude`, via its own [`opener_command`] — never
+//! `claude_command`.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::claude_cmd;
 use crate::store::{parse, preview, Session};
 
 /// A ready-to-run hand-off, or a refusal with a user-facing message.
@@ -798,8 +807,20 @@ pub fn check_new(
     }
 }
 
-/// Build a `Command` from an argv whose first element is the program.
-fn command(argv: &[String]) -> Command {
+/// Build a plain `Command` from an argv whose first element is the program —
+/// for the OS "open" launcher ONLY, used by [`open_url`].
+///
+/// This is deliberately NOT [`claude_cmd::claude_command`], and it must NEVER
+/// become it: `open_url` spawns the platform's default-app opener
+/// (`open`/`xdg-open`/`cmd /C start`), never `claude`, so it must never carry
+/// the `CLAUDE_CONFIG_DIR` profile override — an opener that inherited a
+/// profile override would be a meaningless side effect on a process that
+/// never reads it, and routing it through `claude_command` would be the first
+/// step toward accidentally doing so if that wrapper's contract ever widens.
+/// `opener_command_never_carries_the_claude_config_dir_override` (below) pins
+/// this and goes RED the moment someone "simplifies" by merging the two spawn
+/// helpers.
+fn opener_command(argv: &[String]) -> Command {
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]);
     cmd
@@ -820,6 +841,13 @@ fn command(argv: &[String]) -> Command {
 /// when the hand-off could not even start (the `chdir` failed or the program
 /// could not be spawned). The process cwd is restored afterwards so a subsequent
 /// store reload / relative path is unaffected.
+///
+/// The `Command` is built by [`claude_cmd::claude_command`], handed the
+/// override [`crate::config::claude_profile_override`] read, AFTER the `chdir`
+/// above. That ordering is why `claude_cmd::profile_env_value` never stamps a
+/// RELATIVE override: on a child spawned post-`chdir` it would resolve against
+/// the SESSION's directory rather than snapback's own, naming a different
+/// profile per session.
 pub fn launch(ready: &Ready) -> Result<Option<String>, ResumeError> {
     let restore_to = std::env::current_dir().ok();
 
@@ -830,7 +858,12 @@ pub fn launch(ready: &Ready) -> Result<Option<String>, ResumeError> {
         )));
     }
 
-    let result = match command(&ready.argv).status() {
+    let result = match claude_cmd::claude_command(
+        &ready.argv,
+        crate::config::claude_profile_override().as_deref(),
+    )
+    .status()
+    {
         // A clean exit shows nothing; a non-zero / signalled exit surfaces the
         // plan's own neutral hint (resume vs. new-session). Either way we return
         // straight to the board.
@@ -920,7 +953,7 @@ pub fn open_url(url: &str) {
         return; // nothing to open, or an unsupported target: no broken spawn
     };
     std::thread::spawn(move || {
-        let mut cmd = command(&argv);
+        let mut cmd = opener_command(&argv);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -1894,6 +1927,25 @@ mod tests {
                 "{refused:?} must never reach the OS opener"
             );
         }
+    }
+
+    /// `opener_command` must NEVER carry the `CLAUDE_CONFIG_DIR` profile
+    /// override — the OS opener is not `claude`, and stamping a profile onto it
+    /// would be a meaningless side effect on a process that never reads it.
+    /// This test goes RED the moment someone "unifies" `opener_command` and
+    /// `claude_cmd::claude_command` into one spawn helper.
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn opener_command_never_carries_the_claude_config_dir_override() {
+        let argv = opener_argv("https://example.com").expect("a supported target has an opener");
+        let cmd = opener_command(&argv);
+        let envs: Vec<(&std::ffi::OsStr, Option<&std::ffi::OsStr>)> = cmd.get_envs().collect();
+        assert!(
+            !envs
+                .iter()
+                .any(|(k, _)| *k == std::ffi::OsStr::new("CLAUDE_CONFIG_DIR")),
+            "the OS opener must never carry the claude profile override: {envs:?}"
+        );
     }
 
     #[test]

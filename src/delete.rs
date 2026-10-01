@@ -1,7 +1,8 @@
 //! Session deletion: pure guards plus the thin FS remove driver.
 //!
 //! This is snapback's FIRST store MUTATION path. Everywhere else the Claude
-//! store under `~/.claude/projects/` is treated as read-only, hostile input;
+//! profile's store — `<claude-profile>/projects/`, default
+//! `~/.claude/projects/` — is treated as read-only, hostile input;
 //! HARD delete is the one gated exception (behind a confirm modal and the WRITER
 //! guard below). The gate follows the pure-core / thin-driver split
 //! (PATTERNS §3): [`can_delete`], [`status_for_delete`] and [`toggle_hidden`] are
@@ -75,6 +76,23 @@ pub const DELETE_SENDING_REFUSAL: &str = "snapback is still sending a reply to t
 /// (`App::live_agents_now`), read at the moment of the confirm — the same
 /// re-ask-at-hand-off posture the resume gate uses, never a stale poll. `None`
 /// means claude did not report the session at all.
+///
+/// **This authority is PROFILE-SCOPED.** `reported` traces back to
+/// [`agents::live_agents`], which shells out to `claude agents --json` — and that
+/// command answers only for the profile it runs under: `CLAUDE_CONFIG_DIR=<other>
+/// claude agents --json` returns `[]` even when the real profile has active
+/// agents. So this guard is authoritative ONLY for the profile the store was
+/// loaded from. A MISMATCHED profile used to be the one input it could not
+/// defend against — not an unreadable qualifier (which fails toward refusing),
+/// but an authoritative-LOOKING and EMPTY answer: every row would read "no
+/// writer" and an open interactive session would be permitted through. That
+/// mismatch is now prevented at its source rather than merely documented: the
+/// store (`store::discover::store_root`) and this probe
+/// (`crate::claude_cmd::claude_command`) follow the ONE override `config`
+/// reads, so they agree whenever `CLAUDE_CONFIG_DIR` is unset or names an
+/// absolute path. An empty or non-UTF-8 value, which `config` reads as unset,
+/// still reaches the probe as is (`claude_cmd` stamps only an override it was
+/// handed).
 ///
 /// The question is **"is anything writing this file?"**, NOT "does claude know
 /// this session?". Bare MEMBERSHIP was the old rule and it was far too wide:

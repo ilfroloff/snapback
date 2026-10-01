@@ -3,9 +3,11 @@
 //! DISTINCT from [`crate::agents`], which detects RUNNING/live agents via
 //! `claude agents --json` for the Attach/Fork overlay. Here we enumerate the
 //! agents a user can BIND a brand-new session to (`claude --agent <name>`):
-//! Markdown files with YAML frontmatter under `~/.claude/agents/*.md`
-//! (user-level) and `<launch_dir>/.claude/agents/*.md` (project-level). Keep the
-//! two concepts apart — this module never touches the live-agent wire shape and
+//! Markdown files with YAML frontmatter under `<claude-profile>/agents/*.md`
+//! (user-level, default `~/.claude/agents`, PROFILE-scoped via
+//! `config::claude_config_dir_if_known`) and `<launch_dir>/.claude/agents/*.md`
+//! (project-level, repo-local — unaffected by the profile). Keep the two
+//! concepts apart — this module never touches the live-agent wire shape and
 //! `agents.rs` never touches these definition files.
 //!
 //! This list is a CONVENIENCE only: built-in and plugin agents are not files on
@@ -22,16 +24,24 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// The subdirectory (under `~/.claude` and `<launch_dir>/.claude`) that holds
-/// selectable agent-definition Markdown files. Named per Claude Code's on-disk
-/// layout (`.claude/agents/*.md`); a `const` so the two call sites cannot drift.
+use crate::config;
+
+/// The subdirectory (under the Claude profile and `<launch_dir>/.claude`) that
+/// holds selectable agent-definition Markdown files. Named per Claude Code's
+/// on-disk layout (`.claude/agents/*.md`); a `const` so the two call sites cannot
+/// drift.
 const AGENTS_SUBDIR: &str = "agents";
 
-/// The `.claude` config directory name, shared by the user- and project-level
-/// agent locations (`~/.claude/agents`, `<launch_dir>/.claude/agents`) and by
-/// [`crate::claude_settings`]' settings-file locations (`~/.claude/settings.json`,
-/// `<launch_dir>/.claude/settings{,.local}.json`), so the name claude gives its
-/// config directory is written once.
+/// The `.claude` config directory name for the PROJECT-level locations: the
+/// agents dir (`<launch_dir>/.claude/agents`) and [`crate::claude_settings`]'
+/// project settings files (`<launch_dir>/.claude/settings{,.local}.json`), so the
+/// name claude gives its config directory is written once. The user-level agents
+/// location is NOT this literal joined onto the home dir any more — it is
+/// profile-scoped via [`config::claude_config_dir_if_known`], which already
+/// resolves to `<home>/.claude` by default (or `$CLAUDE_CONFIG_DIR` when set).
+/// Kept here because the project-level paths are deliberately NOT
+/// profile-scoped (they are repo-local), so they still need the literal named
+/// per NO MAGIC VALUES.
 pub(crate) const CLAUDE_DIR: &str = ".claude";
 
 /// File extension of an agent-definition file. Only `*.md` files are considered;
@@ -146,11 +156,26 @@ fn unquote(s: &str) -> String {
     s.to_string()
 }
 
-/// The user-level agents directory (`~/.claude/agents`), or `None` when the home
-/// directory cannot be resolved. Mirrors `store::discover::store_root`'s home
-/// resolution via `dirs::home_dir`.
+/// The user-level agents directory: `<claude-profile>/agents` (default
+/// `~/.claude/agents`, or `$CLAUDE_CONFIG_DIR/agents` when that override is set).
+///
+/// PROFILE-scoped, unlike the project-level path below: this list is exactly
+/// what `claude --agent <name>` can resolve for the profile the board is
+/// running against, so a mismatched profile is what makes a perfectly valid
+/// agent name surface `NEW_SESSION_NONZERO_HINT` ("check that its name is
+/// valid") — the name is valid, just in a different profile.
+///
+/// `None` when no profile can be named (no override and no home): the guessed
+/// relative `.claude` would resolve against the launch dir and list that
+/// project's own agents a second time as user-level ones.
 fn user_agents_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(CLAUDE_DIR).join(AGENTS_SUBDIR))
+    user_agents_dir_from(config::claude_config_dir_if_known())
+}
+
+/// The pure half of [`user_agents_dir`]: `profile`'s agents subdirectory, and no
+/// directory at all without a profile.
+fn user_agents_dir_from(profile: Option<PathBuf>) -> Option<PathBuf> {
+    profile.map(|profile| profile.join(AGENTS_SUBDIR))
 }
 
 /// The project-level agents directory for a launch dir (`<launch_dir>/.claude/agents`).
@@ -189,11 +214,13 @@ fn agents_in_dir(dir: &Path) -> Vec<DefinedAgent> {
 
 /// Discover the agents selectable for a new session in `launch_dir`, FAIL-SOFT.
 ///
-/// Scans `~/.claude/agents/*.md` (user) and `<launch_dir>/.claude/agents/*.md`
+/// Scans `<claude-profile>/agents/*.md` (user, default `~/.claude/agents`;
+/// skipped when no profile can be named) and `<launch_dir>/.claude/agents/*.md`
 /// (project), parses each fail-soft, and merges via [`select_agents`] (project
-/// overrides user). The return is always a (possibly empty) list, never an error:
-/// every missing dir / unreadable file / malformed frontmatter is skipped. The
-/// thin impure driver over the pure [`select_agents`] / [`parse_frontmatter`].
+/// overrides user). The return is always a (possibly empty) list, never an
+/// error: every missing dir / unreadable file / malformed frontmatter is
+/// skipped. The thin impure driver over the pure [`select_agents`] /
+/// [`parse_frontmatter`].
 #[must_use]
 pub fn discover_agents(launch_dir: &Path) -> Vec<DefinedAgent> {
     let user = user_agents_dir()
@@ -337,5 +364,66 @@ mod tests {
         assert_eq!(agents.len(), 1, "only the valid *.md agent is discovered");
         assert_eq!(agents[0].name, "reviewer");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn user_agents_dir_follows_claude_config_dir() {
+        // The user-level agents dir must be PROFILE-scoped: it is derived from
+        // `config::claude_config_dir_if_known`, not a hardcoded `~/.claude`. Set
+        // the env var by its LITERAL name (never via a const under test) and
+        // assert the LITERAL `agents` segment, per the repo's env-test convention.
+        let _guard = config::env_lock();
+        let previous = std::env::var_os("CLAUDE_CONFIG_DIR");
+
+        let dir = std::env::temp_dir().join(format!(
+            "snapback-user-agents-dir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::env::set_var("CLAUDE_CONFIG_DIR", &dir);
+        let overridden = user_agents_dir();
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        let default = user_agents_dir();
+
+        match previous {
+            Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+
+        assert_eq!(
+            overridden,
+            Some(dir.join("agents")),
+            "a set CLAUDE_CONFIG_DIR must relocate the user-level agents dir"
+        );
+        assert_eq!(
+            default,
+            dirs::home_dir().map(|home| home.join(".claude").join("agents")),
+            "with CLAUDE_CONFIG_DIR unset the default is <home>/.claude/agents, and no dir without a home"
+        );
+    }
+
+    /// The no-home, no-override case is `None`, as it was before the list became
+    /// profile-scoped — never a relative `.claude/agents`, which would re-list the
+    /// launch project's agents as user-level ones.
+    #[test]
+    fn user_agents_dir_from_names_no_dir_without_a_profile() {
+        assert_eq!(
+            user_agents_dir_from(None),
+            None,
+            "no profile names no user-level agents dir — never a guessed relative one"
+        );
+        assert_eq!(
+            user_agents_dir_from(Some(PathBuf::from("/profiles/work"))),
+            Some(PathBuf::from("/profiles/work/agents")),
+            "a named profile's user-level agents live in its `agents` subdir"
+        );
+        assert_eq!(
+            user_agents_dir_from(Some(PathBuf::from(".claude-work"))),
+            Some(PathBuf::from(".claude-work/agents")),
+            "a user-set relative profile is honoured as given — no absolute-path filter here"
+        );
     }
 }

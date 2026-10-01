@@ -1,7 +1,9 @@
 //! `snapback` — Claude session launcher (short alias `sb`).
 //!
 //! A ratatui TUI that browses, searches, and resumes Claude Code sessions
-//! stored as JSONL under `~/.claude/projects/`.
+//! stored as JSONL under `<claude-profile>/projects/` (default
+//! `~/.claude/projects/`; the profile follows `$CLAUDE_CONFIG_DIR`, see
+//! [`config::claude_config_dir`]).
 //!
 //! Architecture (data-core-first): the framework-independent data layer
 //! (`store`) is unit-tested before any TUI code lands. The `tui` module is the
@@ -17,6 +19,7 @@
 //! binaries are thin shims that both call [`run`].
 
 mod agents;
+mod claude_cmd;
 mod claude_settings;
 mod cli;
 mod config;
