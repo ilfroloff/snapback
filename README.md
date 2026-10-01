@@ -105,7 +105,8 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | Key | Action |
 | --- | ------ |
 | `↑` / `↓` | Move the selection |
-| `←` / `→` | **Fold** / **expand** a stack of look-alike rows that are really one conversation — a row marked `(+N)` stands for `N` more |
+| `←` / `→` | Move the **cursor in your search** one character, to fix a typo without retyping the rest. The list and the preview stay where they are |
+| `Alt+←` / `Alt+→` (`⌥←` / `⌥→`) / `Alt+B` / `Alt+F` / `Ctrl-←` / `Ctrl-→` | Move the **cursor in your search** one **word**, landing where a word jump in the reply box does: forward goes to the start of the next word. Depending on the terminal, `⌥←` / `⌥→` arrives as `Alt+←` / `Alt+→` or as `Alt+B` / `Alt+F`, so both are bound; `Ctrl-←` / `Ctrl-→` does the same without Option. The list and the preview stay where they are |
 | `Enter` | **Resume** the selected session, returning to the board when it exits. On a **running** session it opens an **Attach / Fork / Cancel** choice instead |
 | `Ctrl-F` | **Fork** the selected session into a copy — available for any session, running or not |
 | `Ctrl-N` | **Start a new session** in the launch directory; if you have Claude Code agents defined, pick one first (or `default (no agent)`). Then a **draft box** opens for the session's first message: `Enter` launches it with `claude --bg` and leaves you on the board, `Ctrl-O` runs it interactively instead, `Ctrl-L` picks its model, `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels. Your message is sent as the session's first turn either way |
@@ -113,8 +114,8 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | `Ctrl-R` | **Quick reply** — send a one-shot message to the selected session without leaving the board. A background agent whose run is over (`done`, `stopped`, `failed`) is stopped first so the reply lands in place; a waiting one (`needs input`) asks you to confirm that stop; one that is still live (`working`, `idle`, `interrupted`, or a state this version doesn't recognize) is left alone and refused, and so is a session with no background job to stop first (a `live` one, for instance); the refusal suggests `Ctrl-K` or Fork instead. While a session's own reply is still being sent, `Ctrl-R` on that session is refused until it lands; replies to other sessions can go out at the same time. Opens a compose box (`Enter` sends, `Ctrl-L` picks the model, `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels) |
 | `Ctrl-L` (in a reply or draft box) | **Pick the model** — and, with `←` / `→`, its **effort** — for **this message only**. The box's bottom border names what it will run on: a reply says `model: session (Opus 5.5)`, the model that session last answered with, which Claude Code normally keeps on its own; a draft says `model: default (opus[1m]) (new sessions only)` when your Claude Code settings name a model. Either says plain `model: default` when there is nothing to name. `--model` / `--effort` are sent only when you pick something; the picker's first row goes back to the default. Every new box starts at the default, and nothing is remembered. `Enter` resume, `Ctrl-F` fork and Attach never send a model |
 | `Ctrl-K` | **Stop / interrupt** the selected session's live agent. On a background agent it runs `claude stop`: one whose run is over (`done`, `stopped`, `failed`) stops immediately; every other live agent (`working`, `needs input`, `idle`, `interrupted`, unrecognized) confirms first, since stopping ends the live job (its conversation is kept). A session with no background job (a `live` one, typically) has no job to stop, so if Claude Code reports a process id for it, `Ctrl-K` offers to send that process a **SIGTERM** instead: the confirmation shows the pid, and nothing is sent unless Claude Code still reports that same pid when you press `Enter`. A session that isn't running as an agent has nothing to stop, and neither does one Claude Code reports with no job and no process id that can be signalled |
-| `Ctrl-X` then `x` / `d` / `h` / `r` / `y` | **Leader chord** that acts on the selected row (`x`, `d`, `y`) or on the whole board (`h`, `r`) — `x` **hides** the selected session (reversible, persisted), `d` **hard-deletes** it after a confirmation that can take just that row or its whole `(+N)` stack, `h` toggles **show hidden**, `r` **re-reads every transcript from disk**, `y` is **copy session ID**: the selected session's full id goes to your clipboard and shows on the status line. Any other key cancels the chord |
-| `←` / `→` (in the model picker) | **Step the highlighted model's effort** down / up: `default effort` (no `--effort`, your settings decide) → `low` → `medium` → `high` → `xhigh` → `max`, wrapping round both ways. `Enter` sets the model and the effort together into the box; `Esc` goes back to the box with your text and its previous choice untouched. They do nothing on the picker's first (default) row, and nothing in the agent picker — and inside either picker they never fold or expand the board underneath |
+| `Ctrl-X` then `x` / `d` / `h` / `r` / `y` / `f` | **Leader chord** that acts on the selected row (`x`, `d`, `y`, `f`) or on the whole board (`h`, `r`) — `x` **hides** the selected session (reversible, persisted), `d` **hard-deletes** it after a confirmation that can take just that row or its whole `(+N)` stack, `h` toggles **show hidden**, `r` **re-reads every transcript from disk**, `y` is **copy session ID**: the selected session's full id goes to your clipboard and shows on the status line, `f` **folds** / **expands** a stack of look-alike rows that are really one conversation — a row marked `(+N)` stands for `N` more; `f` opens it, and folds it back from any of its rows. Any other key cancels the chord |
+| `←` / `→` (in the model picker) | **Step the highlighted model's effort** down / up: `default effort` (no `--effort`, your settings decide) → `low` → `medium` → `high` → `xhigh` → `max`, wrapping round both ways. `Enter` sets the model and the effort together into the box; `Esc` goes back to the box with your text and its previous choice untouched. They do nothing on the picker's first (default) row, and nothing in the agent picker — and inside either picker they never move the search cursor on the board underneath |
 | `Tab` | Toggle search: **name-only ↔ name+content**. Widening to content also opens the preview on the most recent match, the same way typing does |
 | `Ctrl-A` | Flip scope: **current folder ↔ project** — the project being the repo you launched in and all of its git worktrees. Started with `-a` it is a three-stop cycle instead (current folder → project → all folders), which is the only way to reach all folders |
 | `Shift-←` / `Shift-→` | Change the **layout** one step — how the screen is split between the session list and the transcript preview, list:preview: `0:1` (preview only) · `1:3` · `1:1` · `3:1` · `1:0` (list only). You start at `1:1`; `Shift-←` gives the preview more room, `Shift-→` gives the list more, and a press at either end does nothing. Works with or without a search typed. The preview keeps your place as it resizes; coming back from `1:0` it opens on the newest turn. At `0:1` the preview's title names the selected session, and `↑` / `↓` still move between sessions |
@@ -127,10 +128,10 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | double-click in the preview | Select the **word** under the pointer and copy it when you let go, exactly as a drag copies. Two clicks on the same cell within half a second; words follow Unicode word boundaries, so `view.rs`, `don't` and `snake_case` are one word but `sess-link` is two, and paths and URLs split at their punctuation. The first click still does what a click does — opens a link, or unfolds a folded node — and the second only selects, so a node you double-click is unfolded once and stays open. Double-clicking blank space copies nothing; a quick third click keeps the word |
 | click a preview link | Open its url in your browser — when you let go, so a drag that starts on a link selects it instead. `http`/`https` only: a link of any other scheme opens **nothing** and instead reports a refusal on the status line that names the link (`not opening <url> - only http/https links open`), so an underlined label that quietly does nothing never leaves you guessing which of the two happened. That refusal is **sticky** — it stays up until your next actionable keypress |
 | click a folded node | Unfold it where it sits — when you let go, like a link — and click it again to fold it back. Two kinds of turn arrive folded to one line: a subagent's hand-back — the `◆ message from @…` node, otherwise ~95 rows of `<agent-message>` frame attributed to **you** — and context Claude Code added on your behalf, such as the instructions a skill or slash command expands into — the `◇ added by claude code` node, otherwise often thousands of rows, also attributed to **you**. Folded each costs one line, and its text is still one click away. Which nodes you left open is remembered for this run only — snapback writes nothing for it |
-| `Backspace` | Delete the last query character |
-| `Alt+Backspace` (`⌥⌫`) / `Ctrl-W` / `Alt+H` | Delete the last query **word** — one whole search term, so a path or a branch name goes in a single press instead of character by character (`Backspace` alone still takes one character). All three keys do the same thing, because which of them your terminal actually sends depends on how it treats **Option**; they are also the same three the reply and draft boxes word-delete on, so the gesture is bound wherever you type. What a press *cuts* differs on purpose: on the board it takes a whole search term, so `feature/fold-fork-lineages` goes in one press, while in a reply or draft box the cut stops at punctuation and takes only `lineages` |
-| any printable char | Type to search |
-| paste (`Cmd`/`Ctrl-V`, middle-click) | Your terminal's own paste, taken as **text**: into a compose or draft box at the cursor, **newlines intact** (no more sending just the first line); on the board, appended to the query with newlines as spaces. It never sends, resumes, or confirms |
+| `Backspace` | Delete the query character before the cursor |
+| `Alt+Backspace` (`⌥⌫`) / `Ctrl-W` / `Alt+H` | Delete the query **word** before the cursor — one whole search term, so a path or a branch name goes in a single press instead of character by character (`Backspace` alone still takes one character); whatever follows the cursor stays. All three keys do the same thing, because which of them your terminal actually sends depends on how it treats **Option**; they are also the same three the reply and draft boxes word-delete on, so the gesture is bound wherever you type. What a press *cuts* differs on purpose: on the board it takes a whole search term, so `feature/fold-fork-lineages` goes in one press, while in a reply or draft box the cut stops at punctuation and takes only `lineages` |
+| any printable char | Type to search, at the cursor |
+| paste (`Cmd`/`Ctrl-V`, middle-click) | Your terminal's own paste, taken as **text**: into a compose or draft box at the cursor, **newlines intact** (no more sending just the first line); on the board, into the query at its cursor with newlines as spaces. It never sends, resumes, or confirms |
 | `Esc` / `Ctrl-C` | Quit |
 
 The `Ctrl-X y` copy goes through your OS clipboard tool — `pbcopy` on macOS;
@@ -388,8 +389,9 @@ further apart in the list as the day goes on.
 
 snapback spots that they're the same conversation (by what's inside the files,
 not by their names) and shows you **one row**, marked `(+N)` for the `N` copies
-behind it. Press `→` and they fan out underneath it, oldest work included, no
-matter how far apart in time they landed; `←` tidies them away again. Each copy
+behind it. Press `Ctrl-X` then `f` and they fan out underneath it, oldest work
+included, no matter how far apart in time they landed; the same keys tidy them
+away again. Each copy
 says how many messages it holds — `6 msgs` next to `171 msgs` — so you can see
 which one is a stub the hand-off left behind and which one holds the real work.
 The names can't tell you that; they're identical.
@@ -517,9 +519,9 @@ sits still: that badge is snapback's *inference* from Claude Code contradicting
 itself, not a report that the run ended, and it isn't worth stopping live work over
 a guess. Use `Ctrl-K` if you do want it stopped — it will ask first.
 
-**Hide, delete & copy.** `Ctrl-X` is a leader chord that acts on the selected
-row or on the whole board: press it, and a hint shows the follow-ups — `x`, `d`,
-`h`, `r`, `y` — while any other key cancels.
+**Hide, delete, copy & fold.** `Ctrl-X` is a leader chord that acts on the
+selected row or on the whole board: press it, and a hint shows the follow-ups —
+`x`, `d`, `h`, `r`, `y`, `f` — while any other key cancels.
 
 - `Ctrl-X x` **hides** the selected session. This is the reversible default: the
   session stays on disk, it just drops off the board. A `(+N)` stack always hides
@@ -545,6 +547,9 @@ row or on the whole board: press it, and a hint shows the follow-ups — `x`, `d
   escape instead, and the line says `Sent`, not `Copied`: some terminals (and
   tmux without `set -g set-clipboard on`) ignore that escape, and the id on the
   status line is still there to select by hand.
+- `Ctrl-X f` **folds or expands** a `(+N)` stack: on the folded row it fans the
+  look-alike copies out underneath, and on any row of an open stack it folds them
+  back into one. On a row with no copies it does nothing.
 - `Ctrl-X d` **hard-deletes** the selected session — physically removing its
   transcript from disk. Because that is irreversible, it asks first with a
   confirmation prompt (defaulted to Cancel). On a row that stands for a `(+N)`

@@ -1166,8 +1166,8 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    `ModalAction::SetModel(Some(_))` row in `App::adjust_modal_effort` (the agent
    picker and the `default` row stay inert), so neither a new `Row` modal nor a
    future `List` one can inherit a verb it has no meaning for. Because the modal
-   owns the keyboard, those arrows can never also reach the board's fold/expand
-   (a test pins it against a real folded lineage). The FOOTER follows the verbs,
+   owns the keyboard, those arrows can never also reach the board's search caret
+   (a test pins it against a caret parked mid-query). The FOOTER follows the verbs,
    not the layout: each constructor names its own (`Modal::footer`, one const per
    overlay kind), because the two `List` pickers share a key map but not what the
    keys do — a layout-derived footer advertised the agent picker's
@@ -1175,7 +1175,8 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    more keyboard owners sit alongside it: the `Ctrl-X` leader chord (while
    `App.pending_chord` is set, `chord_key` routes the next key — `x` hide, `d`
    delete-confirm, `h` show-hidden, `r` forced full store re-read, `y` copy
-   session ID, anything else cancels), the "stop the
+   session ID, `f` fold / expand the selected row's lineage, anything else
+   cancels), the "stop the
    waiting agent?" confirmation via `App.pending_stop` (a plain Enter/Esc gate
    before compose, for the `needs input` quick-reply path), its `Ctrl-K` sibling
    `App.pending_interrupt` (the same Enter/Esc gate, but resolving to a bare
@@ -1285,13 +1286,24 @@ the board QUITS, `Ctrl-K` is delete-to-line-end where the board stops the agent,
 where the board toggles the search mode. Forwarding raw keys would hijack all
 four, and each theft reads as the key doing nothing. The board binds its keys in
 `key_to_action` like any other and drives the widget with EXPLICIT method calls
-(`insert_char`, `insert_str`, `delete_char`, and `clear` + `insert_str` for the
-word delete — `App::pop_query_word`'s doc comment says why), each
+(`insert_char`, `insert_str`, `delete_char`, and a `clear` + `insert_str` rebuild
+for the word delete that also puts the caret back at the cut without the widget's
+`u16` column jump — `App::pop_query_word`'s doc comment says why), each
 routed through `App::apply_query_change` exactly ONCE so a keypress still costs
-one re-filter. `tui::compose` is the opposite case and stays that way: it IS a
-keyboard owner, so forwarding to `TextArea::input` is correct there — and that is
-precisely why the same crate can answer `Alt-Backspace` in the reply box without
-the board ever inheriting the rest of the map.
+one re-filter. The caret itself moves a character on `←`/`→`
+(`App::move_query_caret`, `CursorMove::Back`/`Forward`) and a word on the word
+hops — `Alt-←`/`Alt-→`, `Alt-b`/`Alt-f`, `Ctrl-←`/`Ctrl-→`
+(`App::move_query_caret_by_word`, the widget's own
+`CursorMove::WordBack`/`WordForward`, so a hop lands where the reply box's does).
+Those are the widget calls that must NOT go through the funnel: the text did not
+change, and the funnel would re-arm the preview's match jump on a key that edited
+nothing. Every edit acts AT the caret —
+a typed character, a paste, `Backspace` and the word delete alike — so no mutator
+may assume it sits at the end of the line. `tui::compose` is the opposite case and
+stays that way: it IS a keyboard owner, so forwarding to `TextArea::input` is
+correct there — and that is precisely why the same crate can answer
+`Alt-Backspace` in the reply box without the board ever inheriting the rest of the
+map.
 
 Add a keybinding by extending the `Action` enum + `key_to_action` + `apply_action`.
 Cover it with a `key_to_action` unit test AND one test that presses the key through
@@ -1341,10 +1353,15 @@ bit-for-bit the `MoveUp`/`MoveDown` they have always been, so a user who never
 searches loses nothing AND a terminal that drops the modifier degrades to a
 working key. The shifted HORIZONTAL arrows are the contrast: `Shift-←`/`Shift-→`
 step the `PaneLayout` UNCONDITIONALLY, taking neither parameter — but their arms
-still sit above the plain `Left`/`Right` fold arms, because the unguarded arm
+still sit above the plain `Left`/`Right` caret arms, because the unguarded arm
 matches the shifted key too and the first matching arm wins
-(`the_layout_arms_win_over_the_plain_fold_arms` pins the order). A dropped
-modifier degrades them to a fold/expand, a working key if not the one pressed. Prefer
+(`the_layout_arms_win_over_the_plain_caret_arms` pins the order) — and above the
+`Alt` word-hop arms as well, so `Shift-Alt-←` still steps the layout
+(`a_held_shift_wins_over_the_alt_word_hop_arms`). A dropped
+modifier degrades them to a search-caret step, a working key if not the one
+pressed. The plain arrows are unconditional too: they move the caret with or
+without a query, and the lineage fold is the `Ctrl-X f` chord verb, so caret
+movement and folding never share a key. Prefer
 `Shift`+key over `Alt`+key for anything new here: snapback never pushes the kitty
 keyboard protocol and clears it on every board (re)entry
 (`tui::reset_terminal_state`), so on default macOS terminals `Alt` arrives as a
@@ -1355,28 +1372,40 @@ surfaces as a bare `Esc` — which quits the board. `Shift` rides the ordinary
 `Alt` is bindable in ONE narrow case: the binding MIRRORS a gesture the compose
 editor already answers, and it ships alongside a non-`Alt` key for the same
 action, so a terminal that composes Option still leaves the user a working key.
-The word-delete set is the instance — `Alt-Backspace` and `Alt-H` are two of the
-three keys `TextArea::input` maps to `delete_word`, and `Ctrl-W` is the third,
-needing no `Alt` at all. Binding all three is what makes the board and the reply
-box answer the identical set whatever the terminal sends for Option.
+Two sets are the instances. The WORD DELETE — `Alt-Backspace` and `Alt-H` are two
+of the three keys `TextArea::input` maps to `delete_word`, and `Ctrl-W` is the
+third, needing no `Alt` at all. The WORD HOP — `Alt-b`/`Alt-f` and
+`Ctrl-←`/`Ctrl-→` are the keys `TextArea::input` maps to
+`WordBack`/`WordForward`, the `Ctrl` pair being the non-`Alt` twin, and
+`Alt-←`/`Alt-→` (`CSI 1;3D`/`C`) joins them as the OTHER bytes a terminal may
+send for the same `⌥←`/`⌥→` gesture (RustRover's sends `ESC b`/`ESC f`). The
+reply box answers that gesture only in its `ESC b` form — the widget ignores
+`CSI 1;3D` — so on the word hop the board's set is the wider one. Binding each
+set whole is what makes the board answer the gesture whatever the terminal sends
+for Option.
 
 The exception does not WAIVE the hazard above, it ACCEPTS it: a split `ESC` read
-on a slow or multiplexed link can surface `Alt-Backspace` as a bare `Esc`, and a
-bare `Esc` quits the board — so the two keys this case blesses can drop the user
-off the board instead of deleting a word. It is taken anyway on two grounds.
-`⌥⌫` is the gesture users actually press, and was the originating request for
-the feature; and `Ctrl-W` is the non-`Alt` sibling that always works when the
-`Alt` form does not, so the worst case is a key that is unreliable rather than an
+on a slow or multiplexed link can surface an `ESC`-prefixed key (`Alt-Backspace`,
+`Alt-b`) as a bare `Esc`, and a bare `Esc` quits the board — so the keys this
+case blesses can drop the user off the board instead of deleting or hopping a
+word. It is taken anyway on two grounds. `⌥⌫` and `⌥←`/`⌥→` are the gestures
+users actually press, and were the originating requests for the two features;
+and `Ctrl-W` and `Ctrl-←`/`Ctrl-→` are the non-`Alt` siblings, which no Option
+setting can break, so the worst case is a key that is unreliable rather than an
 action that is unreachable. That sibling is the exception's precondition, not a
 nicety — an `Alt` binding with no non-`Alt` twin would be paying this hazard for
 a gesture the user has no other way to make, and is still forbidden.
 
-Two ordering constraints come with it, both pinned by tests in `update.rs`: an
-`alt`-guarded arm must sit ABOVE the unguarded arm for the same `KeyCode` (a guarded
-`Backspace` placed below the plain one never fires, and the miss is invisible —
-it just deletes one character), and the `KeyCode::Char(_) if alt => Ignore`
-catch-all must sit BELOW every bound `Alt` printable while still existing, since
-it is what stops an unbound `Alt-J` from typing `j` into the query.
+The ordering constraints that come with it are all pinned by tests in
+`update.rs`: an `alt`-guarded arm must sit ABOVE the unguarded arm for the same
+`KeyCode` (a guarded `Backspace` placed below the plain one never fires, and the
+miss is invisible — it just deletes one character; an `Alt-←` below the plain
+`Left` steps one character instead of a word), and the
+`KeyCode::Char(_) if alt => Ignore` catch-all must sit BELOW every bound `Alt`
+printable while still existing, since it is what stops an unbound `Alt-J` from
+typing `j` into the query. A `Ctrl` binding of a NON-letter key — `Ctrl-←`/`Ctrl-→`
+— still belongs INSIDE `key_to_action`'s `ctrl` early-return block, exactly as
+`Ctrl-W` does: written in the lower match it is never reached.
 
 ## 11. Status-line ownership
 

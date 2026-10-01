@@ -3973,21 +3973,21 @@ fn render_search(frame: &mut Frame, app: &mut App, area: Rect) {
         Style::default()
     };
     app.query_input.set_cursor_style(cursor_style);
-    // KNOWN CEILING at 65_535 query characters, deliberately left UNFIXED — the
+    // KNOWN CEILING at caret column 65_535, deliberately left UNFIXED — the
     // horizontal scroll this row leans on is computed in `u16` inside the pinned
     // `ratatui-textarea-0.9.2`. `TextArea::scroll_top_col` casts the caret column
     // DOWN into that width with `self.screen_cursor().col as u16`
     // (`src/widget.rs:112-113`), and `next_scroll_top` then computes
     // `cursor + 1 - len` in the same `u16` (`src/widget.rs:85-89`).
     //
-    // At EXACTLY 65_535 characters the caret sits at column 65_535 and `cursor + 1`
-    // overflows: a panic inside the render loop in any debug/dev build, and a wrap
-    // to a garbage scroll column in release. At 65_536 or more the cast itself
-    // wraps the column small, `top_col` collapses to 0, and this row draws the
-    // query's HEAD with the caret off screen — the precise "keep the tail and the
-    // caret on screen" guarantee the row's split above exists to provide.
+    // With the caret at EXACTLY column 65_535 `cursor + 1` overflows: a panic
+    // inside the render loop in any debug/dev build, and a wrap to a garbage scroll
+    // column in release. At 65_536 or more the cast itself wraps the column small,
+    // `top_col` collapses to 0, and this row draws the query's HEAD with the caret
+    // off screen — the precise "keep the tail and the caret on screen" guarantee
+    // the row's split above exists to provide.
     //
-    // REACHABLE, not theoretical: a paste APPENDS to the query against
+    // REACHABLE, not theoretical: every paste adds to the query against
     // `update`'s 4096-character cap, so roughly 16 maximal pastes cross the
     // ceiling. That is the SAME reachability argument that justified fixing the
     // matching ceiling on the DELETE side — see the `CursorMove::Jump` clamp
@@ -4011,7 +4011,7 @@ fn render_search(frame: &mut Frame, app: &mut App, area: Rect) {
 ///
 /// COLUMN BUDGET: the help row is ONE line and is truncated, never wrapped, so
 /// the longest form is what has to fit — `expose` (the wider verb) lands it at
-/// 77 columns. Anything added here costs the tail of an 80-column terminal, so a
+/// 78 columns. Anything added here costs the tail of an 80-column terminal, so a
 /// new verb is paid for by shrinking existing wording, never by appending. The
 /// `y` verb paid twice. Appended to the old `h show/hide hidden` wording, `y copy`
 /// made 89 columns, so `h` shrank to `h hidden` (the toggle is still the one `h`
@@ -4019,10 +4019,13 @@ fn render_search(frame: &mut Frame, app: &mut App, area: Rect) {
 /// it copies, it made 90 columns with `· Esc cancel`, so `Esc cancel` went — the
 /// trade this note had set aside for the next verb: it was the one entry naming
 /// no action, and any key the chord does not bind still cancels it, `Esc`
-/// included. `d delete row/lineage` keeps naming both of its targets.
+/// included. The `f fold` verb (the lineage toggle `←`/`→` gave up to the search
+/// caret) made 86, and `y` paid again: `y copy ID` still says WHAT is copied —
+/// the reason it grew — and the status line still prints `Copied session ID …`
+/// in full. `d delete row/lineage` keeps naming both of its targets.
 fn chord_hint(selected_hidden: bool) -> String {
     let x = if selected_hidden { "expose" } else { "hide" };
-    format!("^X  x {x} · d delete row/lineage · h hidden · r reload · y copy session ID")
+    format!("^X  x {x} · d delete row/lineage · h hidden · r reload · y copy ID · f fold")
 }
 
 /// The compose zone's key hints, per open draft. Pure so the wording is assertable
@@ -4111,18 +4114,19 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         // The board keymap — one of the five surfaces AGENTS.md's KEEP KEY DOCS IN
         // SYNC names. It does NOT mention the terminal's paste, on COLUMN BUDGET:
-        // this line is already 237 columns (measured with the `unicode-width` the
+        // this line is already 253 columns (measured with the `unicode-width` the
         // renderer counts in) against a help row that is ONE line and never wraps, so
         // on an 80-column terminal it is cut the instant `^K stop` ends and
         // everything from `^X hide/del` (column 84) rightward is already unpainted.
-        // A 23-column "paste keeps newlines" clause would land at columns 238-260 —
-        // nowhere, on any realistic width. What a board paste DOES (append to the
-        // query with newlines flattened to spaces, and never resume) is documented
-        // where there is room to say it: `KEYS` in `cli.rs` and the README key map.
+        // A 23-column "paste keeps newlines" clause would land at columns 254-276 —
+        // nowhere, on any realistic width. What a board paste DOES (insert at the
+        // query's cursor with newlines flattened to spaces, and never resume) is
+        // documented where there is room to say it: `KEYS` in `cli.rs` and the
+        // README key map.
         //
         // The QUERY WORD-DELETE keys are omitted for exactly the same reason, and
         // just as deliberately. Even the tersest honest clause (`· ⌥⌫ del word`,
-        // 14 columns) would be painted at columns 237-250 — off the end of any
+        // 14 columns) would be painted at columns 253-266 — off the end of any
         // realistic width — and terse is the one thing this binding cannot be:
         // `Alt-Backspace`, `Ctrl-W` and `Alt-H` ALL do it, on purpose, so that the
         // board answers the same set the compose box does whatever the terminal
@@ -4145,9 +4149,18 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         // pair rather than the five stops they walk — those take a sentence, and
         // `KEYS` and the README have room for it.
         //
+        // `A-←→·^←→ word` is the query's word hop, beside `type to search` in the
+        // search cluster (columns 115-127, off-screen at 80 like everything past
+        // `^X`): it cannot sit next to `←→ query cursor` without pushing `^K stop`
+        // past column 80. `A-` is `Alt` spelled like `S-`, for the same no-glyph
+        // reason. `Alt-b` / `Alt-f` go unnamed because they are not a third gesture
+        // but the other bytes a terminal may send for `A-←→` itself, so the clause
+        // names every gesture that works; the byte forms are spelled out in `KEYS`,
+        // the README and `update.rs`'s table.
+        //
         // `^T/^E` sits beside `Home/End` in the scroll cluster (its twin action, not
         // a separate one) rather than beside `^U/^D`: the scroll cluster already
-        // begins past column 171, so wherever in it a new token lands is equally
+        // begins past column 187, so wherever in it a new token lands is equally
         // off-screen at 80 columns — this placement is purely for readability.
         //
         // `^K stop` covers all of `Ctrl-K`'s routes with one word, deliberately:
@@ -4170,7 +4183,10 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         // this line lists the board's keys alone. The compose hint that replaces this
         // line while a box is open names it ([`compose_hint`]), and the model picker
         // it opens names its own `←/→` effort keys in its prompt and footer — so the
-        // `←/→` below means fold/expand ON THE BOARD only.
+        // `←→` below means the search query's cursor ON THE BOARD only.
+        //
+        // The lineage fold is `Ctrl-X f`, named where the chord is armed
+        // ([`chord_hint`]); `^X hide/del` here was never the chord's full verb list.
         //
         // `drag copy` names the preview drag-selection beside the board's other
         // mouse gesture, `wheel scroll`, in two words: the drag selects and its
@@ -4183,7 +4199,7 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         // terminal's own selection — is spelled out in `KEYS` and the README, where
         // there is room.
         Line::from(vec![Span::styled(
-            "↑↓ move · ←/→ fold/expand · Enter resume · ^F fork · ^N new · ^R reply · ^K stop · ^X hide/del · type to search · Tab name/content · S-↑↓ match · ^A scope · S-←→ layout · PgUp/PgDn·^U/^D·^T/^E·Home/End·wheel scroll · drag copy · Esc quit",
+            "↑↓ move · ←→ query cursor · Enter resume · ^F fork · ^N new · ^R reply · ^K stop · ^X hide/del · type to search · A-←→·^←→ word · Tab name/content · S-↑↓ match · ^A scope · S-←→ layout · PgUp/PgDn·^U/^D·^T/^E·Home/End·wheel scroll · drag copy · Esc quit",
             Style::default().add_modifier(Modifier::DIM),
         )])
     };
@@ -16021,6 +16037,44 @@ mod tests {
         );
     }
 
+    /// The caret `←` moves is the caret the row draws: walked back to the head of
+    /// a query wider than the row, it scrolls the row BACK to the head and lights
+    /// the query's first character.
+    ///
+    /// Drawn twice on purpose — once with the caret at the tail, so the widget's
+    /// viewport has scrolled right, then again after the walk — because the
+    /// viewport keeps its offset between frames: a single draw starts at the head
+    /// anyway, and could not tell a row that follows the caret from one that never
+    /// moved.
+    #[test]
+    fn walking_the_caret_to_the_head_scrolls_a_wide_query_back_to_its_head() {
+        const LONG_QUERY: &str = "HEAD-abcdefghijklmnopqrstuvwxyz-0123456789-TAIL";
+        const NARROW: u16 = 20;
+
+        let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp/launch"));
+        app.push_query_str(LONG_QUERY);
+        let row = full_row_text(&drawn_search_at(&mut app, NARROW, 1), 0, NARROW);
+        assert!(
+            row.ends_with("TAIL"),
+            "premise: a caret at the tail scrolled the row right: {row:?}"
+        );
+
+        for _ in 0..LONG_QUERY.chars().count() {
+            app.move_query_caret(false);
+        }
+        let buffer = drawn_search_at(&mut app, NARROW, 1);
+        let row = full_row_text(&buffer, 0, NARROW);
+
+        assert!(
+            row.contains("HEAD") && !row.contains("TAIL"),
+            "the row must follow the caret back to the query's head: {row:?}"
+        );
+        assert!(
+            cell_is_reversed(&buffer, column_of(&buffer, 0, NARROW, "HEAD")),
+            "and draw the lit caret ON the first character, where it now sits: {row:?}"
+        );
+    }
+
     /// A long query stays ONE visual row: it scrolls, it does not WRAP.
     ///
     /// The sibling above pins that the row shows the query's TAIL, and it passes
@@ -16195,7 +16249,8 @@ mod tests {
             "d delete row/lineage",
             "h hidden",
             "r reload",
-            "y copy session ID",
+            "y copy ID",
+            "f fold",
         ] {
             assert!(
                 text.contains(needle),
@@ -16206,7 +16261,7 @@ mod tests {
 
     /// The hint's own column budget: its LONGEST form must still fit an
     /// 80-column terminal, since the help row is truncated rather than wrapped
-    /// and the tail carries the `y copy session ID` verb.
+    /// and the tail carries the `f fold` verb.
     #[test]
     fn the_chord_hint_fits_an_eighty_column_terminal() {
         let widest = chord_hint(true);

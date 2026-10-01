@@ -37,7 +37,12 @@ OPTIONS:
 
 KEYS:
     ↑/↓           move          Enter        resume (returns to the board on exit)
-    ←/→           fold / expand a fork lineage (a row marked (+N) stands for more)
+    ←/→           move the search query's cursor one character (the list and
+                  the preview stay put)
+    Alt+←/→       move the search query's cursor one WORD, as the reply box does
+                  (→ lands on the start of the next word). Alt+B/Alt+F and
+                  Ctrl+←/→ do the same, so it works whatever your terminal sends
+                  for Option+arrow
     Shift+←/→     step the list:preview layout one stop — 0:1 · 1:3 · 1:1 · 3:1 ·
                   1:0 (starts at 1:1; Shift+← toward a full-width preview, Shift+→
                   toward a full-width list; a press at either end does nothing).
@@ -61,6 +66,8 @@ KEYS:
                   r is the force, for a row that looks stale)
                   · y copy session ID (the selected session's full id; it also
                   shows on the status line)
+                  · f fold / expand the selected row's fork lineage (a row marked
+                  (+N) stands for more)
     Ctrl-R        quick reply — send a one-shot message to the selected session
                   without leaving the board. An agent whose run is over (done,
                   stopped, failed) is stopped first so the reply lands in place;
@@ -127,15 +134,15 @@ KEYS:
                   cell within half a second). The first click still unfolds a
                   node or opens a link; the second only selects, so a node
                   double-clicked stays open
-    Backspace     delete the last query character
-    Alt+Backspace delete the last query WORD — one whole search atom, so a
-                  path or a branch name goes in one press. Ctrl-W and Alt+H do
+    Backspace     delete the query character before the cursor
+    Alt+Backspace delete the WORD before the cursor — one whole search atom, so
+                  a path or a branch name goes in one press. Ctrl-W and Alt+H do
                   the same, so it works whatever your terminal sends for
                   Option, and it is the same set the reply box word-deletes on
     paste         your terminal's own paste (Cmd/Ctrl-V, middle-click) is inserted
                   as TEXT: into a compose draft at the cursor, newlines and all, or
-                  appended to the search query with newlines flattened to spaces.
-                  It never sends, resumes, or answers a confirmation
+                  into the search query at its cursor with newlines flattened to
+                  spaces. It never sends, resumes, or answers a confirmation
     Esc           quit          (type to search)
 
 BACK TO THE BOARD (typed inside a resumed Claude session, not a snapback key):

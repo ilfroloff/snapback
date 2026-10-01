@@ -22,7 +22,7 @@ use ratatui::text::Line;
 // takes a window of `Line`s instead (see `App::preview_text`).
 #[cfg(test)]
 use ratatui::text::Text;
-use ratatui_textarea::TextArea;
+use ratatui_textarea::{CursorMove, TextArea};
 use time::OffsetDateTime;
 
 use crate::agents::ReportedAgent;
@@ -1277,6 +1277,38 @@ fn child_indices(sessions: &[Session], filtered: &[usize]) -> HashSet<usize> {
         .collect()
 }
 
+/// What `Ctrl-X f` does to the selected row's fork lineage — the decision
+/// [`App::toggle_selected_lineage`] carries out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineageToggle {
+    /// The lineage is open on screen: fold it back to its head.
+    Collapse,
+    /// The row is a folded `(+N)` head: bring its members back.
+    Expand,
+    /// There is nothing to toggle.
+    Nothing,
+}
+
+/// Decide the `Ctrl-X f` toggle from the two facts the list holds about the
+/// selected row: whether it is a head currently standing in for folded members
+/// (`folded_head`, an entry in the fold's `hidden` map), and how many members of
+/// its lineage are on screen (`visible_members`, `0` with no lineage at all).
+///
+/// A folded head always shows exactly one member — itself — so the two facts
+/// never both call for a change and the order of the checks is not a precedence
+/// rule. A lineage of one, a rootless row and an empty list all land on
+/// [`LineageToggle::Nothing`]: the cases [`App::collapse_selected`] and
+/// [`App::expand_selected`] each refuse on their own anyway. Pure.
+fn lineage_toggle(folded_head: bool, visible_members: usize) -> LineageToggle {
+    if folded_head {
+        LineageToggle::Expand
+    } else if visible_members > 1 {
+        LineageToggle::Collapse
+    } else {
+        LineageToggle::Nothing
+    }
+}
+
 /// The `(repo, branch)` group a session renders under.
 ///
 /// The branch half is always the session's own. The repo half is normally
@@ -2326,7 +2358,8 @@ pub struct App {
     pub show_hidden: bool,
     /// Whether a `Ctrl-X` leader chord is pending — the moment between the leader
     /// keypress and its follow-up (`x` hide, `d` hard-delete, `h` show-hidden,
-    /// `r` forced rescan, `y` copy session ID, anything else cancels). While `true`
+    /// `r` forced rescan, `y` copy session ID, `f` fold / expand the selected
+    /// row's lineage, anything else cancels). While `true`
     /// the view draws the which-key hint and
     /// [`handle_event`](crate::tui::update) routes the NEXT key through the pure
     /// `chord_key` machine BEFORE normal key handling, so a printable follow-up
@@ -2753,6 +2786,47 @@ impl App {
         &self.query_input.lines()[0]
     }
 
+    /// Where the caret sits in [`query`](Self::query), counted in CHARACTERS from
+    /// the head of the line — the widget's own unit, never a byte offset.
+    #[must_use]
+    pub fn query_caret(&self) -> usize {
+        self.query_input.cursor().1
+    }
+
+    /// Move the query's caret one character toward the tail (`forward`, `→`) or
+    /// the head (`←`); a move past either end of the line does nothing.
+    ///
+    /// Deliberately NOT routed through
+    /// [`apply_query_change`](Self::apply_query_change): the text the filter reads
+    /// has not changed, and that funnel would still re-arm the preview's match jump
+    /// and forget the parked match line — moving the reader's pane on a key that
+    /// edits nothing.
+    pub fn move_query_caret(&mut self, forward: bool) {
+        let step = if forward {
+            CursorMove::Forward
+        } else {
+            CursorMove::Back
+        };
+        self.query_input.move_cursor(step);
+    }
+
+    /// Move the query's caret one WORD toward the tail (`forward`) or the head —
+    /// the board's word hop (`Alt-←/→`, `Alt-b/f`, `Ctrl-←/→`).
+    ///
+    /// The widget's own [`CursorMove::WordForward`] / [`CursorMove::WordBack`], so
+    /// a hop lands where the reply box's does: on the START of the next word going
+    /// forward, at punctuation as well as at spaces. A hop past either end does
+    /// nothing, and it skips the query funnel for the reason
+    /// [`move_query_caret`](Self::move_query_caret) gives.
+    pub fn move_query_caret_by_word(&mut self, forward: bool) {
+        let step = if forward {
+            CursorMove::WordForward
+        } else {
+            CursorMove::WordBack
+        };
+        self.query_input.move_cursor(step);
+    }
+
     /// Re-apply everything that depends on the query TEXT: the matcher's pattern,
     /// the pending preview match jump, the filtered list, and the report of a hit
     /// with nothing to mark.
@@ -2773,18 +2847,14 @@ impl App {
         self.note_match_outside_preview();
     }
 
-    /// Append a character to the query and re-filter (type-to-search).
-    ///
-    /// The caret only ever sits at the end of the line (no key moves it — caret
-    /// movement inside the query is deliberately unbound), so inserting AT the
-    /// caret is appending.
+    /// Insert a character at the query's caret and re-filter (type-to-search).
     pub fn push_query_char(&mut self, c: char) {
         self.query_input.insert_char(c);
         self.apply_query_change();
     }
 
-    /// Append a whole STRING to the query and re-filter ONCE — the terminal-paste
-    /// sibling of [`push_query_char`](Self::push_query_char).
+    /// Insert a whole STRING at the query's caret and re-filter ONCE — the
+    /// terminal-paste sibling of [`push_query_char`](Self::push_query_char).
     ///
     /// A paste arrives as one `Event::Paste`, so it re-filters once for the whole
     /// text rather than once per character; `set_query` rebuilds the pattern and the
@@ -2809,67 +2879,76 @@ impl App {
         }
     }
 
-    /// Delete the last query character and re-filter.
+    /// Delete the query character before the caret and re-filter.
     ///
-    /// [`TextArea::delete_char`] deletes BACKWARD from the caret, which sits at
-    /// the end of the line, and reports whether anything went — so an empty query
-    /// re-filters not at all, exactly as popping an empty `String` did.
+    /// [`TextArea::delete_char`] deletes BACKWARD from the caret and reports
+    /// whether anything went — so a caret at the head of the line, an empty query
+    /// included, re-filters not at all.
     pub fn pop_query_char(&mut self) {
         if self.query_input.delete_char() {
             self.apply_query_change();
         }
     }
 
-    /// Delete the last search ATOM from the query and re-filter ONCE — the
+    /// Delete the search ATOM before the caret and re-filter ONCE — the
     /// word-delete sibling of [`pop_query_char`](Self::pop_query_char).
     ///
-    /// The boundary is [`search::last_atom_start`], which mirrors the splitter the
-    /// filter itself uses, so one press removes exactly what the user sees as one
-    /// word of the query. Truncating in ONE step rather than looping
-    /// `pop_query_char` is the same economy [`push_query_str`](Self::push_query_str)
-    /// documents: `set_query` rebuilds the pattern and the per-atom finders on
-    /// every call, and this is ONE user action, so it pays that rebuild once
-    /// instead of once per deleted character.
+    /// The boundary is [`search::last_atom_start`] of the text BEFORE the caret,
+    /// which mirrors the splitter the filter itself uses, so one press removes
+    /// exactly what the user sees as one word of the query. Everything after the
+    /// caret survives, and the caret stays where the cut closed. Cutting in ONE
+    /// step rather than looping `pop_query_char` is the same economy
+    /// [`push_query_str`](Self::push_query_str) documents: `set_query` rebuilds the
+    /// pattern and the per-atom finders on every call, and this is ONE user
+    /// action, so it pays that rebuild once instead of once per deleted character.
     ///
-    /// Nothing to remove (an already-empty query) returns without re-filtering at
-    /// all — a no-op keypress must not move the preview or the selection.
+    /// Nothing to remove (a caret at the head of the line, an empty query
+    /// included) returns without re-filtering at all — a no-op keypress must not
+    /// move the preview or the selection.
     ///
-    /// The line is REBUILT — cleared, then handed back the head that survives —
-    /// rather than edited in place from a caret parked on the boundary. The
-    /// obvious shape (jump to the boundary, delete forward to the end of the
-    /// line) cannot be made correct at every length:
-    /// [`ratatui_textarea::CursorMove::Jump`] addresses a column as a `u16` and
-    /// CLAMPS to it, so every boundary past 65_535 characters is UNREACHABLE and
-    /// the caret parks SHORT of it — from there a forward delete runs over the
-    /// atoms in between and takes many of them in one press. That length is
-    /// reachable in practice rather than theoretical: a paste APPENDS to the
-    /// query and `update`'s paste cap is 4096 characters, so a run of maximal
-    /// pastes crosses the ceiling. [`TextArea::clear`] counts in `usize`, so the
-    /// rebuild is exact at EVERY length — one press is one atom however long the
-    /// query grew, which is the whole point of the feature.
+    /// The line is REBUILT rather than edited in place from a caret parked on the
+    /// boundary, and the rebuild itself is what puts the caret back: clear, insert
+    /// the TAIL, move to the line's head, insert the surviving HEAD — the widget
+    /// leaves the caret right after what it inserted, which is the boundary. The
+    /// obvious shape (jump to the boundary, delete forward to the caret) cannot be
+    /// made correct at every length: [`ratatui_textarea::CursorMove::Jump`]
+    /// addresses a column as a `u16` and CLAMPS to it, so every boundary past
+    /// 65_535 characters is UNREACHABLE and the caret parks SHORT of it — from
+    /// there a forward delete runs over the atoms in between and takes many of them
+    /// in one press, and a caret restored by a jump lands short of the cut. That
+    /// length is reachable in practice rather than theoretical: every paste adds
+    /// to the query and `update`'s paste cap is 4096 characters, so a run of
+    /// maximal pastes crosses the ceiling. [`TextArea::clear`], `insert_str` and
+    /// `CursorMove::Head` (column 0) all count in `usize`, so the rebuild — caret
+    /// included — is exact at EVERY length.
     ///
-    /// What that exactness costs is TWO undo-history entries per press (the clear
-    /// and the re-insert) and one pass over the surviving head. Both are
-    /// per-PRESS constants, which is the economy that matters here; looping
-    /// [`pop_query_char`](Self::pop_query_char) would cost one history entry AND
-    /// one pattern rebuild per CHARACTER.
+    /// What that exactness costs is up to THREE undo-history entries per press
+    /// (the clear and the two re-inserts; an empty tail or head records none) and
+    /// one pass over the surviving text. Both are per-PRESS constants, which is the
+    /// economy that matters here; looping [`pop_query_char`](Self::pop_query_char)
+    /// would cost one history entry AND one pattern rebuild per CHARACTER, and
+    /// stepping the caret back with `CursorMove::Back` one widget pass per
+    /// character stepped over.
     pub fn pop_query_word(&mut self) {
-        // The surviving head is taken by VALUE: the widget calls below need
+        // Both halves are taken by VALUE: the widget calls below need
         // `&mut self.query_input`, so the borrow of its line has to END first.
-        let head = {
+        let (head, tail) = {
             let query = &self.query_input.lines()[0];
-            let boundary = search::last_atom_start(query);
-            if boundary == query.len() {
+            let caret = query
+                .char_indices()
+                .nth(self.query_caret())
+                .map_or(query.len(), |(byte, _)| byte);
+            let boundary = search::last_atom_start(&query[..caret]);
+            if boundary == caret {
                 return;
             }
-            query[..boundary].to_string()
+            (query[..boundary].to_string(), query[caret..].to_string())
         };
 
-        // `clear` empties the one line and leaves the caret at its head;
-        // `insert_str` puts the head back and leaves the caret at the END of it,
-        // which is the only place the caret is ever allowed to rest. An emptied
-        // query re-inserts nothing and `insert_str` reports that as a no-op.
+        // An empty half inserts nothing, and `insert_str` reports that as a no-op.
         self.query_input.clear();
+        self.query_input.insert_str(&tail);
+        self.query_input.move_cursor(CursorMove::Head);
         self.query_input.insert_str(&head);
         self.apply_query_change();
     }
@@ -2948,6 +3027,22 @@ impl App {
         self.set_selected(Some(self.sessions[head].session_id.clone()));
         self.expanded.remove(&key);
         self.reapply_preserving_selection();
+    }
+
+    /// Fold the selected row's lineage if it is open, open it if the row is a
+    /// folded `(+N)` head, and otherwise do nothing — the `Ctrl-X f` chord verb.
+    pub fn toggle_selected_lineage(&mut self) {
+        let folded_head = self
+            .selected_index()
+            .is_some_and(|index| self.hidden.contains_key(&index));
+        let visible_members = self
+            .selected_lineage()
+            .map_or(0, |key| self.visible_lineage_members(&key).len());
+        match lineage_toggle(folded_head, visible_members) {
+            LineageToggle::Collapse => self.collapse_selected(),
+            LineageToggle::Expand => self.expand_selected(),
+            LineageToggle::Nothing => {}
+        }
     }
 
     // --- hide (soft delete) ------------------------------------------------
@@ -9140,10 +9235,10 @@ mod tests {
     /// Parking the caret
     /// there and deleting forward to the end of the line would take MANY atoms in
     /// a single press — precisely the defect this feature exists to prevent — and
-    /// nothing else in this file can see it, because every other query here is a
-    /// handful of characters long.
+    /// nothing else in this file can see it but its caret-restore sibling below,
+    /// because every other query here is a handful of characters long.
     ///
-    /// That length is reachable, not a synthetic limit: a paste APPENDS to the
+    /// That length is reachable, not a synthetic limit: every paste adds to the
     /// query and `update::PASTE_MAX_CHARS` is 4096, so about sixteen maximal
     /// pastes in a row cross the ceiling.
     ///
@@ -9222,6 +9317,218 @@ mod tests {
             visible_ids(&app),
             vec!["alpha-beta", "alpha-solo", "gamma"],
             "the board is unchanged"
+        );
+    }
+
+    // --- the query's caret -------------------------------------------------
+
+    /// A caret move is NOT a query change, so it never reaches the query funnel.
+    ///
+    /// The funnel clears the parked match line and, in name+content mode, re-arms
+    /// the pane's jump onto a match — both would move the reader's preview on a
+    /// key that edited nothing, and neither shows in the text or the list, which a
+    /// re-filter over unchanged text leaves exactly as they were. A move past
+    /// either end of the line does nothing, so the walk overshoots both.
+    #[test]
+    fn moving_the_query_caret_is_not_a_query_change() {
+        let mut app = word_delete_board();
+        app.toggle_search_mode();
+        assert_eq!(app.search_mode, SearchMode::NameAndContent);
+        app.push_query_str("alpha");
+        let _ = app.take_preview_match_jump();
+        app.preview_match_line = Some(7);
+
+        for _ in 0..7 {
+            app.move_query_caret(false);
+        }
+        assert_eq!(app.query_caret(), 0, "the caret stops at the head");
+        app.move_query_caret(true);
+        assert_eq!(app.query_caret(), 1, "one character per step");
+        for _ in 0..7 {
+            app.move_query_caret(true);
+        }
+        assert_eq!(app.query_caret(), 5, "and stops at the tail");
+
+        assert_eq!(app.query(), "alpha", "the text never moved");
+        assert_eq!(
+            app.preview_match_line,
+            Some(7),
+            "the pane stays parked where it was"
+        );
+        assert!(
+            !app.take_preview_match_jump(),
+            "and no jump onto a match is armed"
+        );
+        assert_eq!(visible_ids(&app), vec!["alpha-beta", "alpha-solo"]);
+    }
+
+    /// A word hop lands where the reply box's does — on the START of the next
+    /// word going forward, never just past the end of the current one — and, like
+    /// a character step, is not a query change: the parked match line stays and no
+    /// jump is armed. A hop past either end does nothing, so the walk overshoots
+    /// both.
+    #[test]
+    fn hopping_the_query_caret_by_word_lands_on_word_starts_and_is_not_a_query_change() {
+        let mut app = word_delete_board();
+        app.toggle_search_mode();
+        assert_eq!(app.search_mode, SearchMode::NameAndContent);
+        app.push_query_str("alpha beta");
+        let _ = app.take_preview_match_jump();
+        app.preview_match_line = Some(7);
+        let filtered = app.filtered.clone();
+        assert_eq!(
+            app.query_caret(),
+            10,
+            "premise: typing leaves the caret last"
+        );
+
+        app.move_query_caret_by_word(false);
+        assert_eq!(app.query_caret(), 6, "back to the start of `beta`");
+        app.move_query_caret_by_word(false);
+        assert_eq!(app.query_caret(), 0, "then to the start of `alpha`");
+        app.move_query_caret_by_word(false);
+        assert_eq!(app.query_caret(), 0, "and no further");
+        app.move_query_caret_by_word(true);
+        assert_eq!(
+            app.query_caret(),
+            6,
+            "forward lands on the START of `beta`, not on `alpha`'s last character (4) \
+             or just past it (5)"
+        );
+        app.move_query_caret_by_word(true);
+        assert_eq!(app.query_caret(), 10, "the last hop reaches the tail");
+        app.move_query_caret_by_word(true);
+        assert_eq!(app.query_caret(), 10, "and stops there");
+
+        assert_eq!(app.query(), "alpha beta", "the text never moved");
+        assert_eq!(
+            app.preview_match_line,
+            Some(7),
+            "the pane stays parked where it was"
+        );
+        assert!(
+            !app.take_preview_match_jump(),
+            "and no jump onto a match is armed"
+        );
+        assert_eq!(app.filtered, filtered, "the list is untouched");
+    }
+
+    /// A word delete cuts the atom BEFORE the caret, keeps everything after it,
+    /// leaves the caret at the cut — and re-filters, since the text did change.
+    ///
+    /// `beta` sits FIRST here and the caret right after it, so the query's last
+    /// atom (`alpha`) is the one a word delete pinned to the end of the line would
+    /// take instead — leaving `beta ` and a list narrowed to `alpha-beta`.
+    #[test]
+    fn a_word_delete_cuts_the_atom_before_the_caret_and_keeps_the_tail() {
+        let mut app = word_delete_board();
+        app.push_query_str("beta alpha");
+        for _ in 0.." alpha".len() {
+            app.move_query_caret(false);
+        }
+        assert_eq!(app.query_caret(), 4, "premise: the caret sits after `beta`");
+        assert_eq!(
+            visible_ids(&app),
+            vec!["alpha-beta"],
+            "premise: both atoms gate the list"
+        );
+
+        app.pop_query_word();
+
+        assert_eq!(app.query(), " alpha", "`beta` goes, the tail stays");
+        assert_eq!(app.query_caret(), 0, "the caret stays where the cut closed");
+        assert_eq!(
+            visible_ids(&app),
+            vec!["alpha-beta", "alpha-solo"],
+            "dropping `beta` must widen the list, not just the string"
+        );
+    }
+
+    /// With the caret at the head of the line there is nothing before it to cut,
+    /// so a word delete is a no-op keypress — the same early return an empty query
+    /// takes, and for the same reason: the funnel would still yank the preview.
+    #[test]
+    fn a_word_delete_with_the_caret_at_the_head_changes_nothing() {
+        let mut app = word_delete_board();
+        app.toggle_search_mode();
+        app.push_query_str("alpha");
+        for _ in 0.."alpha".len() {
+            app.move_query_caret(false);
+        }
+        let _ = app.take_preview_match_jump();
+        app.preview_match_line = Some(7);
+
+        app.pop_query_word();
+
+        assert_eq!(
+            app.query(),
+            "alpha",
+            "the text after the caret is not a target"
+        );
+        assert_eq!(app.query_caret(), 0);
+        assert_eq!(app.preview_match_line, Some(7), "the pane stays parked");
+        assert!(!app.take_preview_match_jump(), "and no jump is armed");
+    }
+
+    /// The caret a word delete leaves behind is EXACT past `u16::MAX` characters,
+    /// and so is the cut.
+    ///
+    /// [`ratatui_textarea::CursorMove::Jump`] addresses a column as a `u16` and
+    /// CLAMPS to it, so a caret put back by a jump would land at 65_535 — deep in
+    /// the pad — and the next keystroke would go in there. The typed `z` is what
+    /// makes the caret observable: it must land exactly at the cut, between the
+    /// surviving `alpha` and the untouched tail. Lengths and suffixes are asserted
+    /// rather than whole strings so a failure prints numbers instead of 70_000
+    /// characters.
+    #[test]
+    fn a_word_delete_puts_the_caret_back_exactly_past_the_u16_ceiling() {
+        let pad = "x".repeat(70_000);
+        let mut app = word_delete_board();
+        app.push_query_str(&format!("{pad} alpha beta gamma"));
+        for _ in 0.." gamma".len() {
+            app.move_query_caret(false);
+        }
+        assert_eq!(
+            app.query_caret(),
+            70_011,
+            "premise: the caret sits after `beta`, past `u16::MAX`"
+        );
+
+        app.pop_query_word();
+
+        assert_eq!(
+            app.query().chars().count(),
+            70_013,
+            "one press takes `beta` ALONE"
+        );
+        assert_eq!(app.query_caret(), 70_007, "and leaves the caret at the cut");
+
+        app.push_query_char('z');
+        assert!(
+            app.query().ends_with("x alpha z gamma"),
+            "the next keystroke lands at the cut, not where a clamped jump parks"
+        );
+    }
+
+    // --- the `Ctrl-X f` lineage toggle -------------------------------------
+
+    /// The toggle's decision, over every shape of the two facts it reads: a folded
+    /// head opens, a lineage with more than one member on screen folds, and a lone
+    /// member or no lineage at all is left alone.
+    #[test]
+    fn lineage_toggle_opens_a_folded_head_folds_an_open_lineage_and_otherwise_does_nothing() {
+        assert_eq!(lineage_toggle(true, 1), LineageToggle::Expand);
+        assert_eq!(lineage_toggle(false, 2), LineageToggle::Collapse);
+        assert_eq!(lineage_toggle(false, 3), LineageToggle::Collapse);
+        assert_eq!(
+            lineage_toggle(false, 1),
+            LineageToggle::Nothing,
+            "a lineage of one has nothing to fold"
+        );
+        assert_eq!(
+            lineage_toggle(false, 0),
+            LineageToggle::Nothing,
+            "a rootless row, or no selection, has no lineage at all"
         );
     }
 
