@@ -4199,7 +4199,7 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         // terminal's own selection — is spelled out in `KEYS` and the README, where
         // there is room.
         Line::from(vec![Span::styled(
-            "↑↓ move · ←→ query cursor · Enter resume · ^F fork · ^N new · ^R reply · ^K stop · ^X hide/del · type to search · A-←→·^←→ word · Tab name/content · S-↑↓ match · ^A scope · S-←→ layout · PgUp/PgDn·^U/^D·^T/^E·Home/End·wheel scroll · drag copy · Esc quit",
+            "↑↓ move · ←→ query cursor · Enter resume · ^F fork · ^N new · ^R reply · ^K stop · ^X hide/del · type to search · A-←→·^←→ word · Tab name/content · S-↑↓ match · ^A scope · S-←→ layout · PgUp/PgDn·^U/^D·^T/^E·Home/End·wheel scroll · drag copy · Esc clear/quit",
             Style::default().add_modifier(Modifier::DIM),
         )])
     };
