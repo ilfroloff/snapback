@@ -36,6 +36,7 @@ mod watch;
 mod worktrees;
 
 use std::io::IsTerminal;
+use std::path::Path;
 
 use store::SessionStore;
 use tui::{App, Outcome};
@@ -88,6 +89,17 @@ pub fn run() {
     // the `Ctrl-A` cycle. It is board state rather than a constructor argument
     // because it filters nothing — see `App::all_scope_enabled`.
     app.all_scope_enabled = args.all_scope_enabled;
+
+    // Fires ONCE, here, before the board loop starts: putting it inside the loop
+    // would resurrect it on every resume round trip, which is not what
+    // `App::status` carries (an OUTCOME/REFUSAL of the keypress just handled,
+    // not a startup fact restated forever).
+    show_store_override_note(
+        &mut app,
+        config::claude_projects_override().as_deref(),
+        &config::claude_config_dir(),
+    );
+
     loop {
         match tui::run(&mut app, &mut store) {
             // User quit the board (or all event senders dropped).
@@ -143,6 +155,21 @@ pub fn run() {
     }
 }
 
+/// D2: the one remaining way the store view and the child `claude`'s profile can
+/// disagree — `CLAUDE_PROJECTS_DIR` set to something other than
+/// `<claude_config_dir>/projects` — made VISIBLE as the board's status rather
+/// than silent. Whether the two disagree is
+/// [`store::discover::store_override_note`]'s decision; this is only its wiring.
+///
+/// Split out of [`run`] so the tests exercise the wiring `run` executes instead
+/// of a copy of it. Takes both inputs as VALUES — `run` reads them through
+/// `config`, the one env reader — so no test touches the environment.
+fn show_store_override_note(app: &mut App, projects_override: Option<&str>, config_dir: &Path) {
+    if let Some(note) = store::discover::store_override_note(projects_override, config_dir) {
+        app.set_status(note);
+    }
+}
+
 /// Handle a child that exited NON-ZERO, recovering the TOCTOU resume race when
 /// that is provably what happened.
 ///
@@ -194,6 +221,11 @@ fn print_session_list() {
     let sessions = SessionStore::load();
     let root = store::discover::store_root();
 
+    // This line now follows the profile (`$CLAUDE_CONFIG_DIR`, else `~/.claude`)
+    // joined with `projects`, unless `$CLAUDE_PROJECTS_DIR` overrides it — see
+    // `store::discover::store_root`. Left as the sole store-identifying line by
+    // design (D2): the release workflow `diff`s this exact output, so no
+    // override-mismatch line is added here.
     println!("# store: {}", root.display());
     println!("# columns: session_id\trepo\tbranch\tcwd");
     for s in &sessions {
@@ -375,6 +407,52 @@ mod tests {
             app.status.as_deref(),
             Some(resume::NEW_SESSION_NONZERO_HINT),
             "a new session has no session to probe and its own hint must stand"
+        );
+    }
+
+    // --- D2: store_override_note wired into App::status (Task 5.1) ---------
+    //
+    // The mismatch DECISION itself — precedence, the trailing-slash tolerance,
+    // what counts as a genuine divergence — is already fully covered by
+    // `store::discover::store_override_note`'s own inline tests (Task 2.5).
+    // These two pin `show_store_override_note`, the wiring `run` calls once
+    // before the board loop: `Some(note)` becomes `App::status`, `None` leaves it
+    // untouched. It takes its inputs as values, so neither test mutates
+    // `CLAUDE_PROJECTS_DIR`/`CLAUDE_CONFIG_DIR` or needs `config::env_lock()`.
+    // No test reaches `run`'s CALL to it (its arguments, its placement before the
+    // loop): `run` is the thin driver and needs a real TTY.
+
+    /// A genuinely divergent `CLAUDE_PROJECTS_DIR` override must surface as a
+    /// board status, naming the override actually in effect.
+    #[test]
+    fn store_override_note_sets_app_status_on_a_genuine_mismatch() {
+        let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp"));
+        let config_dir = PathBuf::from("/p/.claude-work");
+
+        show_store_override_note(&mut app, Some("/tmp/fixtures"), &config_dir);
+
+        let status = app
+            .status
+            .clone()
+            .expect("a genuinely divergent override must set a status");
+        assert!(
+            status.contains("/tmp/fixtures"),
+            "the status must name the override in effect: {status}"
+        );
+    }
+
+    /// An override that already names `<claude_config_dir>/projects` is not a
+    /// mismatch, so no status is set — the default board stays silent.
+    #[test]
+    fn store_override_note_leaves_app_status_untouched_when_override_matches_profile() {
+        let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp"));
+        let config_dir = PathBuf::from("/p/.claude-work");
+
+        show_store_override_note(&mut app, Some("/p/.claude-work/projects"), &config_dir);
+
+        assert_eq!(
+            app.status, None,
+            "an override matching the profile's own store must not set a status"
         );
     }
 }
