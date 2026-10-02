@@ -1893,9 +1893,8 @@ const REPLY_COOKING_LABEL: &str = "cooking\u{2026}";
 /// The compose hints of a BACKGROUND draft. One const, two surfaces: the help line
 /// ([`compose_hint`]) and the draft card, which must not restate them differently.
 ///
-/// It deliberately does NOT carry the reply arm's "paste keeps newlines" clause,
-/// on COLUMN BUDGET alone — a pasted newline was every bit as destructive here (see
-/// [`compose_hint`] for the measurement). This string is 112 columns, so on the
+/// It deliberately does NOT carry the reply arm's scroll clause (`PgUp/PgDn
+/// scroll`): a draft shows no transcript, so those keys stay the editor's there. This string is 112 columns, so on the
 /// one-line help row the clause would be painted past the end of an 80-column
 /// terminal, and on the draft card — which wraps rather than clipping — it would
 /// cost a further wrapped row of a placeholder whose whole point is to stay
@@ -4037,21 +4036,13 @@ fn chord_hint(selected_hidden: bool) -> String {
 /// [`crate::resume::build_new_argv`]) — so any wording that hinted at reviewing or
 /// editing the draft inside claude would promise something the CLI cannot do.
 ///
-/// "paste keeps newlines" names no key on purpose: the terminal's own paste is not
-/// a snapback binding (there is no `Ctrl-V`), so caret notation here would advertise
-/// one that does not exist. The line states what a paste DOES rather than reassuring
-/// that it is allowed.
-///
-/// It rides the REPLY arm ONLY, and NOT because the reply box is the only one a
-/// pasted newline used to break — it is not.
-/// [`compose_key_to_action`](crate::tui::compose::compose_key_to_action) is SHARED
-/// by both targets and maps a bare `Enter` to Send, so the same paste that sent a
-/// truncated reply launched a background agent on the draft's first line. The split
-/// is COLUMN BUDGET alone, measured with the `unicode-width` the renderer counts in:
-/// the help row is ONE line that never wraps, and the reply hint must fit an
-/// 80-column terminal whole, while [`BG_DRAFT_HINT`] is already past 80 there and
-/// the clause would be painted nowhere. What a paste does is documented in full
-/// where there is room for it: `KEYS` in `cli.rs` and the README key map.
+/// The reply arm names `PgUp/PgDn scroll` as the representative of the whole
+/// transcript-scroll set (`^T`/`^E`, `Ctrl-U`/`Ctrl-D`, `Home`/`End` work too; the
+/// README and `KEYS` list them), because a reply previews a real transcript. It
+/// replaced the old "paste keeps newlines" clause, which is now documented only in
+/// `KEYS` in `cli.rs` and the README (a pasted newline never sends: paste is
+/// delivered as text, not keystrokes). It rides the REPLY arm ONLY: a draft keeps
+/// those keys for its editor, and [`BG_DRAFT_HINT`] is already past 80 columns.
 ///
 /// The model key (`Ctrl-L`, both targets) was PAID FOR on the reply hint, which sat
 /// at 78 columns: its `^L model` segment costs 11, so the newline clause went from
@@ -4063,7 +4054,7 @@ fn chord_hint(selected_hidden: bool) -> String {
 fn compose_hint(target: &ComposeTarget) -> &'static str {
     match target {
         ComposeTarget::Reply { .. } => {
-            "Enter send · ^L model · ^J/Alt+Enter newline · paste keeps newlines · Esc cancel"
+            "Enter send · ^L model · ^J/Alt+Enter newline · PgUp/PgDn scroll · Esc cancel"
         }
         // The SAME const the draft card shows, so the two surfaces cannot describe
         // the same keys differently.
@@ -10053,12 +10044,12 @@ mod tests {
             );
         }
 
-        // The reply hint offers NO interactive escape hatch, and says what a pasted
-        // newline does (it used to submit the draft's first line).
+        // The reply hint offers NO interactive escape hatch, and names the scroll keys
+        // a reply answers.
         let reply_hint = compose_hint(&plain.target);
         assert_eq!(
             reply_hint,
-            "Enter send · ^L model · ^J/Alt+Enter newline · paste keeps newlines · Esc cancel",
+            "Enter send · ^L model · ^J/Alt+Enter newline · PgUp/PgDn scroll · Esc cancel",
         );
         assert!(
             !reply_hint.contains("Ctrl-O"),

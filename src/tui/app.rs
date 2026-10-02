@@ -2367,7 +2367,7 @@ pub struct App {
     ///
     /// A plain marker rather than a data-carrying enum because there is exactly ONE
     /// leader (`Ctrl-X`) with no per-chord state; folded into
-    /// [`overlay_active`](Self::overlay_active) so mouse actions stay gated while
+    /// [`preview_pointer_blocked`](Self::preview_pointer_blocked) so mouse actions stay gated while
     /// it is pending (PATTERNS §10).
     pub pending_chord: bool,
     /// Readable, markdown-styled transcript preview, keyed by `session_id`.
@@ -3997,27 +3997,26 @@ impl App {
 
     // --- new-session agent picker -----------------------------------------
 
-    /// Whether an overlay currently owns the board. The SINGLE gate predicate
-    /// callers use (never `self.modal.is_some()` inline) to keep the mouse's three
-    /// actions over the preview — toggling a fold node, opening a link, and
-    /// starting a selection (a drag-selection, or a double-click's word) — from
-    /// firing while an overlay is up, so a later gate extension lives in exactly
-    /// one place. All three begin from a press `update::press_starts_selection`
-    /// admits: the PRESS only records where it landed (a second admitted press on
-    /// the same cell within `update::DOUBLE_CLICK_INTERVAL` records the word under
-    /// it instead), and the RELEASE resolves it (a drag or a double-clicked word
-    /// selects and copies; a plain click toggles the fold under it, else opens the
-    /// link) — so a press this gate refuses leaves its release nothing to act on,
-    /// and is no first half of a double-click either.
+    /// Whether the mouse's three actions over the preview — toggling a fold node,
+    /// opening a link, and starting a selection (a drag-selection, or a
+    /// double-click's word) — are shut off. The SINGLE gate predicate callers use
+    /// (never `self.modal.is_some()` inline), so a later gate extension lives in
+    /// exactly one place. All three begin from a press
+    /// `update::press_starts_selection` admits: the PRESS only records where it
+    /// landed (a second admitted press on the same cell within
+    /// `update::DOUBLE_CLICK_INTERVAL` records the word under it instead), and the
+    /// RELEASE resolves it (a drag or a double-clicked word selects and copies; a
+    /// plain click toggles the fold under it, else opens the link) — so a press
+    /// this gate refuses leaves its release nothing to act on, and is no first half
+    /// of a double-click either.
     ///
-    /// True while a [`Modal`] is open, the quick-reply compose zone, the
-    /// stop-then-reply confirmation, or the interrupt confirmation owns the
-    /// keyboard, OR a `Ctrl-X` leader chord is [pending](Self::pending_chord): each
-    /// takes the keyboard, so each must equally gate the mouse (a stray click
-    /// mid-chord must not toggle a fold, open a link, or start a selection), per
-    /// PATTERNS §10.
+    /// True while a [`Modal`] is open, the stop-then-reply confirmation or the
+    /// interrupt confirmation owns the keyboard, OR a `Ctrl-X` leader chord is
+    /// [pending](Self::pending_chord): each takes the keyboard for a decision, so
+    /// each must equally gate the mouse (a stray click mid-chord must not toggle a
+    /// fold, open a link, or start a selection), per PATTERNS §10.
     ///
-    /// A [`draft`](Self::draft) counts for a related reason: it owns the PANE
+    /// A [`draft`](Self::draft) counts for a different reason: it owns the PANE
     /// rather than the keyboard. While its card is drawn the transcript is not, so
     /// the cached link AND fold regions — both handed out of the ONE
     /// [`preview_hit_context`](Self::preview_hit_context) entry — describe text
@@ -4025,12 +4024,21 @@ impl App {
     /// link or toggle a fold in a session the user cannot see, while a drag would
     /// select the placeholder card rather than any transcript.
     /// It outlives the editor by AT MOST one in-flight launch (whichever comes
-    /// first: that launch's own result, or the end of the board session), which is
-    /// the window this arm covers on its own.
+    /// first: that launch's own result, or the end of the board session). While the
+    /// editor is up it is also what gates a new-session draft's pointer, because
+    /// [`open_compose`](Self::open_compose) installs the two together.
+    ///
+    /// An open QUICK-REPLY editor ([`compose`](Self::compose) with no draft card) is
+    /// deliberately NOT here, though it owns the keyboard. It previews the REAL
+    /// transcript, docked in its own rect that the transcript rect already stops
+    /// above, and none of the three actions reads or writes anything the reply
+    /// holds: not its text or caret, not its target session, not the row selection
+    /// that target is addressed by. A selection is mouse state ended by any key, a
+    /// fold toggle re-renders the same session's transcript, and a link opens in
+    /// the browser. Gating them only made a reply a reason to lose the mouse.
     #[must_use]
-    pub fn overlay_active(&self) -> bool {
+    pub fn preview_pointer_blocked(&self) -> bool {
         self.modal.is_some()
-            || self.compose.is_some()
             || self.draft.is_some()
             || self.pending_stop.is_some()
             || self.pending_interrupt.is_some()
@@ -11303,13 +11311,13 @@ mod tests {
              completion has nothing to match"
         );
         assert!(
-            app.overlay_active(),
+            app.preview_pointer_blocked(),
             "the card still owns the pane, so the mouse must stay gated"
         );
 
         app.close_compose();
         assert!(
-            !app.overlay_active(),
+            !app.preview_pointer_blocked(),
             "the board is back once the card closes"
         );
     }
@@ -11419,7 +11427,61 @@ mod tests {
     fn agent_picker_counts_as_an_active_overlay() {
         let mut app = app_all(vec![session("s", "r", Some("main"), "/tmp/s")]);
         app.open_agent_picker(vec![def_agent("alpha")]);
-        assert!(app.overlay_active(), "an open picker is an active overlay");
+        assert!(
+            app.preview_pointer_blocked(),
+            "an open picker is an active overlay"
+        );
+    }
+
+    /// The gate's decision table, one row per surface that can be up over the
+    /// preview. An open QUICK REPLY is the one keyboard owner that does NOT block the
+    /// pointer — it previews the real transcript and nothing the mouse does there
+    /// touches the reply — while every surface that hides the transcript (the draft
+    /// card, editor or in-flight) or takes the keyboard for a decision still does.
+    #[test]
+    fn only_a_surface_that_hides_or_decides_blocks_the_preview_pointer() {
+        let board = || app_all(vec![session("s", "r", Some("main"), "/tmp/s")]);
+        assert!(!board().preview_pointer_blocked(), "the bare board is open");
+
+        let mut reply = board();
+        reply.open_compose(
+            super::super::compose::ComposeState::new_reply("s".to_string(), None),
+            None,
+        );
+        assert!(reply.is_composing(), "premise: the reply editor is up");
+        assert!(
+            !reply.preview_pointer_blocked(),
+            "a quick reply must leave the transcript's pointer actions alone"
+        );
+
+        let mut over_reply = board();
+        over_reply.open_compose(
+            super::super::compose::ComposeState::new_reply("s".to_string(), None),
+            None,
+        );
+        over_reply.open_agent_picker(vec![def_agent("alpha")]);
+        assert!(
+            over_reply.preview_pointer_blocked(),
+            "a modal over the reply takes the pointer back"
+        );
+
+        let mut draft = board();
+        draft.open_compose(
+            super::super::compose::ComposeState::new_background(None),
+            Some(NewSessionDraft::default()),
+        );
+        assert!(
+            draft.preview_pointer_blocked(),
+            "a new-session draft's card hides the transcript"
+        );
+
+        let mut stop = board();
+        stop.open_stop_confirm("s".to_string(), "job".to_string());
+        assert!(stop.preview_pointer_blocked(), "the stop confirm decides");
+
+        let mut chord = board();
+        chord.pending_chord = true;
+        assert!(chord.preview_pointer_blocked(), "a pending chord decides");
     }
 
     // --- status dwell --------------------------------------------------------

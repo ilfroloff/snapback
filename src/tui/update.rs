@@ -48,16 +48,16 @@
 //! | `Shift-Left` / `Shift-Right` | step the pane layout one stop toward a full-width preview / a full-width list, along `0:1 · 1:3 · 1:1 · 3:1 · 1:0` (list:preview; the board starts at `1:1`). A press at either end does nothing. Always — with or without a query, and whatever is marked. The step keeps the reader's place in the preview; leaving `1:0` opens it on the newest turn (see [`App::set_pane_layout`]) |
 //! | `PgUp` / `PgDn` | scroll the preview a page (always) |
 //! | `Ctrl-U` / `Ctrl-D` | scroll the preview a quarter page (always) |
-//! | `Ctrl-T` / `Ctrl-E`, `Home` / `End` | jump the preview to top / bottom (always) |
+//! | `Ctrl-T` / `Ctrl-E`, `Home` / `End` | jump the preview to top / bottom (always). Every preview scroll key (these, `PgUp` / `PgDn`, `Ctrl-U` / `Ctrl-D`) also works while a quick reply is open, through the same `App` methods (see [`compose::ComposeAction::PreviewTop`]); there they take the editor's meaning (`Ctrl-U`/`Ctrl-D`/`Ctrl-E`, `Home`/`End`/`PgUp`/`PgDn`) away. A new-session draft keeps them all for its editor |
 //! | `Shift-Up` / `Shift-Down` | scroll the preview onto the previous / next MARKED line, but only while the query marks something in the previewed transcript; with nothing marked they fall through to plain selection movement. One stop per marked LINE, not per occurrence — a line saying the query twice is marked, and stopped at, once |
 //! | `Backspace` | delete the query character before the caret |
 //! | `Alt-Backspace` / `Ctrl-W` / `Alt-H` | delete the query ATOM before the caret — one whole search word, not one character, so a path or a branch name goes in a single press; what follows the caret stays. THREE keys because `TextArea::input` word-deletes on all three in the compose box: binding the same SET here is what makes the gesture reach the board at all, whatever the user's option-as-meta setting turns `Alt-Backspace` into. The set matches; the EXTENT deliberately does not — the board cuts at the search atom and the compose box at `CharKind`'s punctuation boundary, so `feature/fold-fork-lineages` goes whole here and loses only `lineages` there |
 //! | printable char | type-to-search (insert at the query's caret) |
 //! | terminal paste | inserted as TEXT — never as keystrokes (see below) |
-//! | mouse: click a folded node's header | unfold the node — a subagent's hand-back (`◆`) or context claude injected (`◇`) — where it sits, and a second click folds it back; a click on a header toggles its node and never opens a link. On the RELEASE, like a link, and ahead of one (see [`click_effect`]) |
-//! | mouse: click a preview link | open its url in the browser — `http`/`https` only: any other scheme opens nothing and says so on a sticky status line. On the RELEASE, since only then is it known that the press was a click and not the start of a drag (see [`mouse_effect`]) |
-//! | mouse: drag in the preview | select transcript text in reading order, reverse-videoed — DRAWN text only: each row ends at its last drawn character, never at the pane's edge, and a drag over blank space alone selects nothing, so its release copies nothing. HOLD the drag past the transcript's top or bottom edge and the pane glides that way, a small step every `AUTOSCROLL_FRAME` — faster the further past the edge — so the selection keeps growing into rows that were never on screen until the button comes up (see [`App::autoscroll_preview_selection`]); a plain move while the button is held counts as the release the terminal lost. The release copies the WHOLE selection the way `Ctrl-X y` copies — [`Outcome::Copy`], the clipboard tool first, OSC 52 as the fallback — with a transient status. Never the in-flight reply's tail. A wheel notch, any key or a resize ends it. A drag that starts on a node header or a link selects, and toggles or opens nothing. Off under any overlay (the draft card included) and never started on the pinned row or a docked compose zone (see [`press_starts_selection`]) |
-//! | mouse: double-click in the preview | select the WORD under the pointer (Unicode word boundaries, on the drawn row) and copy it on release, exactly as a drag copies. Two presses on the SAME cell within [`DOUBLE_CLICK_INTERVAL`] (see [`is_double_click`]); a blank word selects nothing; a quick third click keeps the word. The FIRST release is a plain click — it toggles a node header or opens a link, as above — and the SECOND copies the word and toggles or opens nothing, so a node header double-clicked is opened once and stays open. Any key, wheel notch or reload resets the count (a fold toggle does not: it is the first click's own effect), and a press that turned into a drag is not a first click. Same gate as a drag ([`press_starts_selection`]) |
+//! | mouse: click a folded node's header | unfold the node — a subagent's hand-back (`◆`) or context claude injected (`◇`) — where it sits, and a second click folds it back; a click on a header toggles its node and never opens a link. On the RELEASE, like a link, and ahead of one (see [`click_effect`]). Works while a quick reply is open, like every pointer action over the transcript |
+//! | mouse: click a preview link | open its url in the browser — `http`/`https` only: any other scheme opens nothing and says so on a sticky status line. On the RELEASE, since only then is it known that the press was a click and not the start of a drag (see [`mouse_effect`]). Works while a quick reply is open |
+//! | mouse: drag in the preview | select transcript text in reading order, reverse-videoed — DRAWN text only: each row ends at its last drawn character, never at the pane's edge, and a drag over blank space alone selects nothing, so its release copies nothing. HOLD the drag past the transcript's top or bottom edge and the pane glides that way, a small step every `AUTOSCROLL_FRAME` — faster the further past the edge — so the selection keeps growing into rows that were never on screen until the button comes up (see [`App::autoscroll_preview_selection`]); a plain move while the button is held counts as the release the terminal lost. The release copies the WHOLE selection the way `Ctrl-X y` copies — [`Outcome::Copy`], the clipboard tool first, OSC 52 as the fallback — with a transient status. Never the in-flight reply's tail. A wheel notch, any key or a resize ends it. A drag that starts on a node header or a link selects, and toggles or opens nothing. Off under any overlay and a new-session draft's card, but ON while a quick reply is open (it previews the real transcript; the drag neither moves its caret nor touches its text), and never started on the pinned row or a docked compose zone (see [`press_starts_selection`]) |
+//! | mouse: double-click in the preview | select the WORD under the pointer (Unicode word boundaries, on the drawn row) and copy it on release, exactly as a drag copies. Two presses on the SAME cell within [`DOUBLE_CLICK_INTERVAL`] (see [`is_double_click`]); a blank word selects nothing; a quick third click keeps the word. The FIRST release is a plain click — it toggles a node header or opens a link, as above — and the SECOND copies the word and toggles or opens nothing, so a node header double-clicked is opened once and stays open. Any key, wheel notch or reload resets the count (a fold toggle does not: it is the first click's own effect), and a press that turned into a drag is not a first click. Same gate as a drag ([`press_starts_selection`]), so it too works while a quick reply is open |
 //! | `Esc` | clear the search query when one is typed; quit when it is already empty |
 //! | `Ctrl-C` | quit (always) |
 //!
@@ -503,9 +503,11 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool
 ///   message, and a miss writes nothing (the mapping lives in
 ///   [`note_link_click`]). All are routed independently of the modal key gate, and
 ///   a press cannot start a selection, toggle a node or open a link while an
-///   overlay is open (the `App::overlay_active` gate, behind
-///   [`press_starts_selection`]). Nothing else: the pane widths belong to the
-///   keyboard (`Shift-Left` / `Shift-Right`).
+///   overlay is open or a new-session draft's card replaces the transcript (the
+///   `App::preview_pointer_blocked` gate, behind [`press_starts_selection`]) — but
+///   it can while a QUICK REPLY is open, which previews the real transcript.
+///   Nothing else: the pane widths belong to the keyboard (`Shift-Left` /
+///   `Shift-Right`).
 /// * `Input(Resize)` -> clear the preview's mouse selection (a new width re-wraps
 ///   the transcript its anchors name); the next frame re-lays the board out.
 /// * `SessionsChanged` -> reload `store` and re-apply query+scope, preserving
@@ -538,7 +540,7 @@ pub fn handle_event(app: &mut App, event: AppEvent, store: &mut SessionStore) ->
         // `tui::run_inner` builds a fresh `EventLoop` per board session and drops
         // the old receiver, while `lib::run` re-enters the board on the SAME `App`.
         // A card left standing there would replace EVERY session's transcript with
-        // a placeholder and hold `overlay_active` true (killing link clicks, fold
+        // a placeholder and hold `preview_pointer_blocked` true (killing link clicks, fold
         // toggles and drag-selections) until another compose was opened and
         // cancelled.
         app.close_compose();
@@ -606,8 +608,9 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
         // handler — a wheel just scrolls a pane and never crashes in any mode
         // (query active, modal open, ...), and a press neither toggles a node, opens
         // a link nor starts a selection while an overlay is up
-        // (`App::overlay_active` gates it). A finished drag answers `Outcome::Copy`,
-        // the same copy request `Ctrl-X y` makes.
+        // (`App::preview_pointer_blocked` gates it; an open QUICK REPLY does not, since
+        // none of the three touches what the reply holds). A finished drag answers
+        // `Outcome::Copy`, the same copy request `Ctrl-X y` makes.
         AppEvent::Input(Event::Mouse(mouse)) => handle_mouse(app, mouse),
         // A terminal PASTE (bracketed paste, enabled in `tui::init_terminal`). A
         // dedicated arm BEFORE the input catch-all that used to swallow it, and
@@ -1259,10 +1262,11 @@ fn is_double_click(previous: Option<ClickRecord>, pos: Position, now: Instant) -
 ///
 /// Three conditions, all required:
 ///
-/// - no overlay owns the board ([`App::overlay_active`]) — which includes the
-///   quick-reply / draft EDITOR and the new-session draft CARD, so no selection
-///   starts under a draft card and no node toggles or link opens from a
-///   transcript the card hides;
+/// - nothing blocks the pointer ([`App::preview_pointer_blocked`]) — an overlay, a
+///   pending confirmation or chord, or the new-session draft CARD (editor or in
+///   flight), so no selection starts under a draft card and no node toggles or
+///   link opens from a transcript the card hides. An open QUICK-REPLY editor is
+///   not one: it previews the real transcript above its own docked box;
 /// - a session is selected, so the "No session selected." placeholder is never
 ///   selectable text;
 /// - `pos` is inside the preview's TRANSCRIPT rect,
@@ -1271,7 +1275,7 @@ fn is_double_click(previous: Option<ClickRecord>, pos: Position, now: Instant) -
 ///   text in. The pinned row above it, the pane's own border and a docked compose
 ///   zone are outside it by construction.
 fn press_starts_selection(app: &App, pos: Position) -> bool {
-    !app.overlay_active()
+    !app.preview_pointer_blocked()
         && app.selected_session().is_some()
         && view::preview_transcript_rect(app).contains(pos)
 }
@@ -6097,6 +6101,257 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // --- an open QUICK REPLY leaves the transcript's pointer actions alone ------
+
+    /// Open a quick reply on `link_app`'s session, type `typed` into it, and draw a
+    /// frame — the board a user is looking at while they compose. The reply
+    /// previews the REAL transcript (no draft card), so everything the pointer does
+    /// over it is the same gesture as on the bare board.
+    fn composing_reply_over_link_app(dir: &Path, typed: &str) -> App {
+        let mut app = link_app(dir, None);
+        seed_live(&mut app, &[]);
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        assert!(
+            app.is_composing() && app.draft.is_none(),
+            "premise: a quick reply is open and no draft card replaced the transcript"
+        );
+        type_into_draft(&mut app, typed);
+        render_board(&mut app);
+        app
+    }
+
+    /// What an open reply must be left holding after a pointer gesture: still open,
+    /// still addressed to the SAME session, its text untouched, and the row
+    /// selection where it was. A gesture over the transcript is not the reply's
+    /// business, and none of these may move.
+    fn assert_reply_untouched(app: &App, typed: &str) {
+        assert!(app.is_composing(), "the gesture must not close the reply");
+        assert_eq!(
+            app.compose.as_ref().map(|c| &c.target),
+            Some(&ComposeTarget::Reply {
+                session_id: "sess-link".to_string(),
+                stop_job: None,
+            }),
+            "the reply must still address the session it was opened on"
+        );
+        assert_eq!(draft_text(app), typed, "the typed text must be untouched");
+        assert_eq!(
+            app.selected.as_deref(),
+            Some("sess-link"),
+            "the selected row must not move"
+        );
+    }
+
+    /// A drag over the transcript while a quick reply is open selects the drawn
+    /// text and copies it on release, and leaves the reply alone. The selection is
+    /// MOUSE state, so it neither takes the keyboard from the reply nor moves its
+    /// caret: the next keystroke still lands in the draft, and — like any key —
+    /// ends the selection.
+    #[test]
+    fn a_drag_selects_and_copies_while_a_reply_is_open() {
+        let dir = unique_temp_dir("compose-drag");
+        let mut app = composing_reply_over_link_app(&dir, "hello");
+        let transcript = view::preview_transcript_rect(&app);
+        let buffer = render_board(&mut app);
+        let needle = "filler line";
+        let (col, row) = drawn_text_cell(&buffer, transcript, needle);
+        let last = col + u16::try_from(needle.len()).expect("short") - 1;
+
+        let released = drag_and_release(&mut app, (col, row), (last, row));
+
+        let Outcome::Copy(payload) = released else {
+            panic!("a finished drag must request a copy even with a reply open");
+        };
+        assert_eq!(payload, CopyPayload::Selection(needle.to_string()));
+        assert_reply_untouched(&app, "hello");
+
+        press(&mut app, KeyCode::Char('!'));
+        assert_eq!(
+            draft_text(&app),
+            "hello!",
+            "the keyboard is still the reply's: the selection did not take it"
+        );
+        assert!(
+            !app.has_preview_selection(),
+            "and a key ends the selection, as it does on the board"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A double-click on a transcript word while a quick reply is open copies that
+    /// word, exactly as on the bare board.
+    #[test]
+    fn a_double_click_copies_a_word_while_a_reply_is_open() {
+        let dir = unique_temp_dir("compose-dbl");
+        let mut app = composing_reply_over_link_app(&dir, "hello");
+        let transcript = view::preview_transcript_rect(&app);
+        let buffer = render_board(&mut app);
+        let (col, row) = drawn_text_cell(&buffer, transcript, "filler line");
+        let cell = (col + 1, row);
+        let t0 = Instant::now();
+
+        click_at(&mut app, cell, t0);
+        button(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            cell,
+            t0 + Duration::from_millis(100),
+        );
+        let released = button(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            cell,
+            t0 + Duration::from_millis(150),
+        );
+
+        assert_eq!(released, MouseEffect::Copy("filler".to_string()));
+        assert_reply_untouched(&app, "hello");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A click on a drawn transcript link while a quick reply is open resolves to
+    /// opening it, and leaves the reply alone.
+    #[test]
+    fn a_link_click_opens_the_url_while_a_reply_is_open() {
+        let dir = unique_temp_dir("compose-link");
+        let mut app = composing_reply_over_link_app(&dir, "hello");
+        let buffer = render_board(&mut app);
+        let (col, row) = drawn_link_cell(&buffer, app.preview_rect);
+        assert!(
+            view::preview_transcript_rect(&app).contains(Position { x: col, y: row }),
+            "premise: the link is drawn in the transcript, above the docked reply box"
+        );
+
+        assert_eq!(
+            click(&mut app, col, row),
+            MouseEffect::OpenLink(LINK_URL.to_string())
+        );
+        assert_reply_untouched(&app, "hello");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A click on a peer message's header (the `@agent` hand-back marker) while a
+    /// quick reply is open unfolds it, and a second click folds it back — the
+    /// reply is left alone throughout.
+    #[test]
+    fn a_peer_node_header_toggles_while_a_reply_is_open() {
+        let (folder, file) = PEER_FIXTURE;
+        let mut app = App::new(
+            vec![fixture_session("s1", folder, file)],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
+        seed_live(&mut app, &[]);
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        assert!(
+            app.is_composing() && app.draft.is_none(),
+            "premise: a quick reply is open over the real transcript"
+        );
+        type_into_draft(&mut app, "hello");
+        let buffer = render_board(&mut app);
+        let width = view::preview_transcript_rect(&app).width;
+        let (col, row) = drawn_peer_handle_cell(&buffer, app.preview_rect);
+        assert!(
+            view::preview_transcript_rect(&app).contains(Position { x: col, y: row }),
+            "premise: the header is drawn in the transcript, above the docked reply box"
+        );
+
+        left_click(&mut app, col, row);
+        assert!(
+            preview_string(&mut app, width).contains(PEER_BODY_PHRASE),
+            "a click on the header must open the node under an open reply"
+        );
+        // No frame between the clicks, like the bare-board twin: the open node
+        // moves the header, and the second press is aimed at where the first was.
+        let reclosed = separate_left_click(&mut app, col, row);
+        assert_eq!(reclosed, MouseEffect::None, "a toggle opens no link");
+        assert!(
+            !preview_string(&mut app, width).contains(PEER_BODY_PHRASE),
+            "and a second click folds it back"
+        );
+        assert!(app.is_composing(), "the reply is still open");
+        assert_eq!(draft_text(&app), "hello", "and its text is untouched");
+        assert_eq!(app.selected.as_deref(), Some("s1"));
+    }
+
+    /// The reply's own surface is still out of the pointer's reach: a press in the
+    /// docked box never starts a selection (pinned beside the unlock, which must not
+    /// have widened the transcript rect into the box).
+    #[test]
+    fn a_press_in_the_docked_reply_box_still_selects_nothing() {
+        let dir = unique_temp_dir("compose-box");
+        let mut app = composing_reply_over_link_app(&dir, "hello");
+        let buffer = render_board(&mut app);
+        let pane = app.preview_rect;
+        let compose_top = (pane.y + 1..pane.bottom())
+            .find(|&y| {
+                buffer
+                    .cell((pane.x + 1, y))
+                    .is_some_and(|c| c.symbol() == "┌")
+            })
+            .expect("premise: the compose box is docked inside the preview pane");
+
+        let released = drag_and_release(
+            &mut app,
+            (pane.x + 3, compose_top + 1),
+            (pane.x + 9, compose_top + 1),
+        );
+
+        assert!(!app.has_preview_selection());
+        assert!(!matches!(released, Outcome::Copy(_)));
+        assert_reply_untouched(&app, "hello");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// While a new-session draft is being TYPED (editor and card both up), the
+    /// transcript is not on screen, so no press starts a selection. The other half
+    /// of the quick-reply unlock: the card, not the editor, is what gates the
+    /// pointer, and a draft always has one.
+    #[test]
+    fn no_selection_starts_while_a_new_session_draft_is_open() {
+        let dir = unique_temp_dir("select-draft-open");
+        let mut app = link_app(&dir, None);
+        seed_live(&mut app, &[]);
+        app.open_agent_picker(vec![def_agent("planner")]);
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            app.is_composing() && app.draft.is_some(),
+            "premise: the draft editor and its card are both up"
+        );
+        let buffer = render_board(&mut app);
+        let (col, row) = drawn_text_cell(&buffer, app.preview_rect, "new session");
+
+        let released = drag_and_release(&mut app, (col, row), (col + 6, row));
+
+        assert!(!app.has_preview_selection());
+        assert!(!matches!(released, Outcome::Copy(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The model picker opens OVER a reply (`Ctrl-L`) and owns the keyboard, so the
+    /// transcript behind it takes no press until it closes: the modal gate is not
+    /// loosened by the reply unlock.
+    #[test]
+    fn no_selection_starts_while_the_model_picker_is_over_a_reply() {
+        let dir = unique_temp_dir("compose-picker");
+        let mut app = composing_reply_over_link_app(&dir, "hello");
+        // Read the cell off the board BEFORE the picker covers the transcript: the
+        // press must be aimed at text that really is behind it.
+        let buffer = render_board(&mut app);
+        let (col, row) =
+            drawn_text_cell(&buffer, view::preview_transcript_rect(&app), "filler line");
+        press_ctrl(&mut app, KeyCode::Char('l'));
+        assert!(app.modal.is_some(), "premise: the picker is open");
+        render_board(&mut app);
+
+        let released = drag_and_release(&mut app, (col, row), (col + 6, row));
+
+        assert!(!app.has_preview_selection());
+        assert!(!matches!(released, Outcome::Copy(_)));
+        assert!(app.modal.is_some(), "and the picker is undisturbed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // --- pane layout: Shift-Left / Shift-Right through the whole handler ------
 
     /// The user's walk, pressed through `handle_event`: three `Shift-←` from the
@@ -6817,8 +7072,10 @@ mod tests {
     /// A click on a node header while an overlay owns input does NEITHER: no
     /// toggle, no link open, and the overlay is left exactly as it was.
     ///
-    /// The same `!app.overlay_active()` gate the link arm always had, which the
-    /// fold must not quietly widen — asked of the PRESS (`press_starts_selection`),
+    /// The same `!app.preview_pointer_blocked()` gate the link arm always had, which the
+    /// fold must not quietly widen. The overlay here is a modal (the running-session
+    /// choice); an open quick reply is NOT one, and
+    /// `a_peer_node_header_toggles_while_a_reply_is_open` pins that half — asked of the PRESS (`press_starts_selection`),
     /// so the whole click, release included, is inert, and no selection starts
     /// either.
     #[test]
@@ -6833,7 +7090,10 @@ mod tests {
              the geometry's and not the gate's"
         );
         app.open_live_choice("s1".to_string());
-        assert!(app.overlay_active(), "the overlay must really own input");
+        assert!(
+            app.preview_pointer_blocked(),
+            "the overlay must really own input"
+        );
 
         let released = left_click(&mut app, col, row);
         let after = preview_string(&mut app, width);
@@ -9589,7 +9849,7 @@ mod tests {
              BgLaunchFinished will ever arrive to close it"
         );
         assert!(
-            !app.overlay_active(),
+            !app.preview_pointer_blocked(),
             "a surface stranded by a refusal leaves the mouse gated on the board"
         );
     }
@@ -9690,7 +9950,7 @@ mod tests {
     /// `EventLoop` per board session and drops the old receiver, so the launch
     /// reports back into a channel nobody is reading and the SAME `App` re-enters
     /// the board still holding the card. That strands the preview on a placeholder
-    /// for every session, with `overlay_active` stuck true (dead link clicks, dead
+    /// for every session, with `preview_pointer_blocked` stuck true (dead link clicks, dead
     /// fold toggles, dead drag-selections), recoverable only by opening and
     /// cancelling another compose.
     /// Every hand-off therefore ends the card with the board session it belonged to.
@@ -9727,7 +9987,7 @@ mod tests {
                 "the in-flight card must not survive the hand-off (fork={fork})"
             );
             assert!(
-                !app.overlay_active(),
+                !app.preview_pointer_blocked(),
                 "a stranded card leaves the mouse gated forever (fork={fork})"
             );
         }

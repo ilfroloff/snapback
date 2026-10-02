@@ -2270,7 +2270,7 @@ would be a fiction.
 Replacing the transcript drags in two rules PATTERNS owns: the card suppresses the
 pinned banner inside `view::preview_banner` (see
 [PATTERNS.md §5](PATTERNS.md#5-selection-and-scroll-survive-reloads)) and a draft
-counts in `App::overlay_active` (see
+counts in `App::preview_pointer_blocked` (see
 [PATTERNS.md §10](PATTERNS.md#10-keys-actions-outcomes)).
 
 `App::open_compose` / `close_compose` / `dispatch_draft` are the ONLY writers of

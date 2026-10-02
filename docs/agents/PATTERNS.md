@@ -431,9 +431,12 @@ inner rect when there is no banner (so a banner-less pane's geometry is exactly
   resolves through `App::preview_scroll` and the width-scoped hit cache, both
   measured from that rect's origin — derive it anywhere else and a click
   silently opens the wrong link or folds the wrong node, or a drag starts on the
-  pinned row. All three mouse actions are also gated off while any overlay is up
-  (`overlay_active`, which counts the editor AND the draft card), so none fires
-  over a docked compose zone or a draft card either way. Both rects trace back
+  pinned row. All three mouse actions are also gated off while a surface that hides the
+  transcript or takes the keyboard for a decision is up (`preview_pointer_blocked`:
+  a modal, a confirmation, a pending chord, or the draft card), so none fires over
+  a draft card. An open QUICK REPLY is not in that list: its docked box is outside
+  the transcript rect by construction, so a press in the box selects nothing while
+  one over the transcript acts as on the bare board. Both rects trace back
   to `preview_inner`, the ONE place the pane's border inset is applied — which
   matters most for the docked compose
   zone, because it then draws a border of its OWN: measure it from the pane's
@@ -649,7 +652,7 @@ inner rect when there is no banner (so a banner-less pane's geometry is exactly
   the frame instead. Every transition is a USER ACT: ANY scroll releases the
   anchor (in either direction — a scroll states a position, not a subscription —
   and a drag held past the pane's edge included, on a step whose autoscroll
-  actually moves the pane), and only `End` (or its `Ctrl-E` twin), another row, or a layout change that
+  actually moves the pane), and only `End` (or its `Ctrl-E` twin; an open quick reply answers every scroll key through the same methods), another row, or a layout change that
   brings the pane back from 1:0 (`App::set_pane_layout`, which `Shift-←` and an
   opening compose both go through) re-arms it. A step between two layouts that
   both show the pane neither arms nor releases it. The render writes the flag for
@@ -1190,12 +1193,19 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    model picker OVER the still-open compose: while the picker is up it owns every
    key, and its close (`Enter` after writing the pick, or `Esc`) hands the keyboard
    straight back to the untouched draft, with no state saved or restored.
-   `App::overlay_active` (`modal.is_some() || compose.is_some() ||
-   draft.is_some() || pending_stop.is_some() || pending_interrupt.is_some() ||
-   pending_chord`) gates the mouse's three actions over the preview — toggling a
-   fold node, opening a preview link, and starting a preview selection (a
-   drag-select, or a double-click's word-select) — so none fires while any is
-   up. All three begin from a left PRESS the one gate
+   `App::preview_pointer_blocked` (`modal.is_some() || draft.is_some() ||
+   pending_stop.is_some() || pending_interrupt.is_some() || pending_chord`) gates
+   the mouse's three actions over the preview — toggling a fold node, opening a
+   preview link, and starting a preview selection (a drag-select, or a
+   double-click's word-select) — so none fires while any is up. An open QUICK
+   REPLY (`compose` with no `draft`) is deliberately absent: it owns the keyboard
+   but previews the REAL transcript above its own docked box, and none of the
+   three actions touches what it holds — its text and caret, its target session
+   id, or the row selection that id is addressed by. A selection is mouse state
+   that any key ends (so typing never fights it), a fold toggle re-renders the
+   same session, and a link opens in the browser. A new-session draft is still
+   gated, by its `draft` card (`App::open_compose` installs editor and card
+   together). All three begin from a left PRESS the one gate
    (`update::press_starts_selection`) admits; the press only RECORDS where it
    landed — a second admitted press on the same cell within
    `DOUBLE_CLICK_INTERVAL` records the word under it instead — and the RELEASE
@@ -1210,8 +1220,15 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    because a notch during a HELD drag would otherwise have to extend that drag
    too, and it does not — a drag moves the pane only through its own autoscroll.
    A new
-   keyboard owner must be added to `overlay_active` too, or the mouse will act
-   underneath it.
+   keyboard owner or pane owner must be asked the same question before it is
+   added to `preview_pointer_blocked` or left out: does a click, a fold toggle or
+   a selection over the transcript act on a decision it is waiting for, or on
+   text it has hidden? If so it belongs there, or the mouse will act underneath
+   it; if the owner leaves the transcript on screen and the three actions leave
+   its state alone (the quick reply), blocking them only costs the user the mouse.
+   What stays blocked while a reply is open is everything that would change which
+   row is selected, which is the target's identity: the wheel over the LIST (below)
+   and every key, since all of them are the reply's.
 
    The wheel takes exactly ONE condition, and `update::wheel_target` owns it as a
    parameter (`composing`) the way `key_to_action` owns its own. It hit-tests
@@ -1243,8 +1260,8 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    walks it in the identical order — the per-owner table is
    [DOMAIN.md](DOMAIN.md#terminal-paste-routing-eventpaste). Two rules follow for
    anyone editing this area. A new keyboard owner must be added to `handle_paste`
-   as well, not only to `handle_event` and `overlay_active`, or pasted text lands
-   on the surface underneath it. And `handle_paste` returns no `Outcome` on
+   as well, not only to `handle_event` (and `preview_pointer_blocked`, when the
+   above says it belongs there), or pasted text lands on the surface underneath it. And `handle_paste` returns no `Outcome` on
    purpose: a paste is DATA, so it structurally cannot send, resume, or answer a
    confirmation. That is the shape of the fix for the bug where a pasted newline
    arrived as a bare `Enter` — `ComposeAction::Send` — and submitted a draft's
@@ -1342,6 +1359,20 @@ and `Ctrl-S`/`Ctrl-Q`/`Ctrl-Z`/`Ctrl-C` are flow or job control); and a common
 multiplexer must not take it first (Zellij's default keymap swallows `Ctrl-G` and
 `Ctrl-T`). `Ctrl-L` passed all three, and `ComposeAction::PickModel` keeps the
 argument next to the arm.
+
+The deliberate exception to "free on the whole path" is the board's transcript
+scroll set (`ComposeAction::PreviewTop` / `PreviewBottom` / `PreviewPageUp` /
+`PreviewPageDown` / `PreviewHalfUp` / `PreviewHalfDown`: `Ctrl-T`/`Ctrl-E`/`Home`/
+`End`, `PgUp`/`PgDn`, `Ctrl-U`/`Ctrl-D`), shared with an open quick REPLY because
+it previews the real transcript. The router mirrors `update::key_to_action`'s
+modifier rule (the `Ctrl` letters whatever else is held, the named keys only
+without `Ctrl`). Several are editor keys (`Ctrl-U` delete-to-head, `Ctrl-D`
+delete-char, `Ctrl-E`/`Home`/`End`/`PgUp`/`PgDn` caret moves), taken from the reply
+editor on purpose; all fall through to the editor on a new-session draft, whose
+pane shows a placeholder card. The handler only calls the board's `App::preview_*`
+methods, so the follow-bottom rules above apply unchanged and neither selection
+nor draft text/caret move. This is a conscious loss of those editing keys on a
+reply, not an oversight: do not add alternative chords for them.
 
 A binding that is only meaningful sometimes is **CONDITIONAL, and falls through**
 rather than going inert. `key_to_action` takes the conditions as parameters
