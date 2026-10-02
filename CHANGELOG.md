@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/ilfroloff/snapback/compare/v0.11.0...v0.12.0) - 2026-10-02
+
+### Added
+
+- match the compose pick list anywhere in a name or description
+- pick / commands and @ mentions from a list in both compose boxes
+- keep transcript mouse actions and scroll keys live during a quick reply
+- let the arrow keys move the cursor in the search query
+
+### Fixed
+
+- clear the search query on Esc before quitting the board
+
+### Other
+
+- *(search)* expose the filter's membership question for any string
+
 ## [0.11.0](https://github.com/ilfroloff/snapback/compare/v0.10.0...v0.11.0) - 2026-09-30
 
 ### Added
