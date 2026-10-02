@@ -34,6 +34,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::agents::{self, AgentActivity, ReportedAgent};
+use crate::config;
 use crate::resume::ModelPick;
 use crate::search::SearchMode;
 use crate::store::preview::{self, FoldRegion, LinkRegion};
@@ -553,6 +554,28 @@ fn project_name(app: &App) -> String {
         .unwrap_or_else(|| crate::worktrees::project_root_name(&app.launch_dir))
 }
 
+/// The header's profile status label (D3): `Some("profile:<final-component>")`
+/// when a Claude profile override is in effect, `None` when it is absent.
+///
+/// `None` propagates all the way to [`render_header`] drawing NO extra span at
+/// all — the pinned invariant is that the default board (no `CLAUDE_CONFIG_DIR`)
+/// stays byte-identical to today's header. When a path IS given, its final
+/// component, VERBATIM, is the profile name (`/Users/x/.claude-work` ->
+/// `profile:.claude-work`): the leading dot is kept so the label names the
+/// directory exactly as it was typed into `CLAUDE_CONFIG_DIR`, and two profiles
+/// differing only by it (`~/.work`, `~/work`) never draw the same label. A path
+/// whose final component cannot be read (e.g. `/`) falls back to the whole path
+/// string rather than dropping the label, since a mismatched-but-blank indicator
+/// would be worse than a slightly verbose one.
+fn profile_label(profile_override: Option<&Path>) -> Option<String> {
+    let dir = profile_override?;
+    let name = dir
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dir.to_string_lossy().into_owned());
+    Some(format!("profile:{name}"))
+}
+
 /// The top status line: title, active scope, search mode, and counts on the
 /// left, with the crate version indicator right-aligned on the same row.
 ///
@@ -608,6 +631,21 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
             dim,
         ),
     ];
+    // D3: only when `CLAUDE_CONFIG_DIR` is set does this append anything — the
+    // default board (unset) draws the exact same spans as before this feature,
+    // which is the pinned byte-identical invariant. It sits BEFORE the hidden
+    // tail: which profile the board reads is more load-bearing than how many
+    // lineages are hidden, so the hidden count stays the first thing a narrow
+    // terminal loses.
+    if let Some(label) = profile_label(config::claude_profile_override().as_deref()) {
+        header.push(Span::raw(HEADER_SEPARATOR));
+        header.push(Span::styled(
+            label,
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::DIM),
+        ));
+    }
     if counts.hidden > 0 {
         header.push(Span::raw(HEADER_SEPARATOR));
         header.push(Span::styled(format!("{} hidden", counts.hidden), dim));
@@ -6190,6 +6228,66 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    // --- profile indicator (D3) --------------------------------------------
+
+    #[test]
+    fn profile_label_is_none_when_override_absent() {
+        assert_eq!(profile_label(None), None);
+    }
+
+    /// Equality on the WHOLE label: a substring check passes whether or not the
+    /// leading dot survives, so it could not catch the label drifting from what
+    /// the README documents.
+    #[test]
+    fn profile_label_is_the_final_path_component_verbatim() {
+        assert_eq!(
+            profile_label(Some(Path::new("/Users/x/.claude-work"))),
+            Some("profile:.claude-work".to_string()),
+            "the label is `profile:` + the profile dir's final component, leading dot kept"
+        );
+    }
+
+    /// D3's pinned invariant, asserted on DRAWN CELLS rather than by calling
+    /// `profile_label` directly (`docs/agents/PATTERNS.md` "assert what the user
+    /// would see"): with `CLAUDE_CONFIG_DIR` unset the header draws NO `profile:`
+    /// text at all — the byte-identical-default pin — and with it set it DOES.
+    /// A cell-level assertion is what would catch `render_header` computing the
+    /// label but forgetting to push its spans, which a call to `profile_label`
+    /// alone could never catch.
+    #[test]
+    fn render_header_shows_profile_only_when_claude_config_dir_is_set() {
+        let _guard = crate::config::env_lock();
+        let previous = std::env::var_os("CLAUDE_CONFIG_DIR");
+
+        let app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp/launch"));
+
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        let unset_text = drawn_header(&app);
+
+        std::env::set_var("CLAUDE_CONFIG_DIR", "/tmp/.claude-work");
+        let set_text = drawn_header(&app);
+
+        match previous {
+            Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+
+        assert!(
+            !unset_text.contains("profile:"),
+            "the default header (CLAUDE_CONFIG_DIR unset) must draw no `profile:` text; \
+             drawn line: {unset_text:?}"
+        );
+        let drawn_label = set_text
+            .split_whitespace()
+            .find(|word| word.starts_with("profile:"));
+        assert_eq!(
+            drawn_label,
+            Some("profile:.claude-work"),
+            "the header must draw the exact profile label when CLAUDE_CONFIG_DIR is set; \
+             drawn line: {set_text:?}"
+        );
     }
 
     #[test]

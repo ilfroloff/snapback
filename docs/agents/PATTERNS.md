@@ -208,10 +208,11 @@ it. Follow this split when adding behavior:
   `model_aliases::installed_model_aliases` (locate on `$PATH`, canonicalize,
   chunk-read — it decides only WHERE to look and delegates what the bytes mean to
   `parse_model_aliases`), `claude_settings::model_defaults` (reads
-  `ANTHROPIC_MODEL`, the `ANTHROPIC_DEFAULT_*_MODEL` overrides, `$CLAUDE_CONFIG_DIR`
-  and the settings files — through `defaults_from_disk`, `managed_drop_ins` and
-  `read_layers`, reading the files ONCE for both answers — and delegates every
-  decision to `resolve_new_session_model` and `resolve_restore_overridden`), the `watch` threads, `tui::run` (draw loop), and
+  `ANTHROPIC_MODEL`, the `ANTHROPIC_DEFAULT_*_MODEL` overrides and the settings
+  files, taking the user config dir from `config` — through `defaults_from_disk`,
+  `managed_drop_ins` and `read_layers`, reading the files ONCE for both answers —
+  and delegates every decision to `resolve_new_session_model` and
+  `resolve_restore_overridden`), the `watch` threads, `tui::run` (draw loop), and
   `send::signal_term` (the crate's one syscall, `kill(2)` with SIGTERM, whose only
   caller is that loop and which NO test may call — see "Watch every test fail"
   below). Keep these small and delegate to tested helpers.

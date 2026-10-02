@@ -1,7 +1,22 @@
 //! Session file discovery.
 //!
-//! Resolves the store root from `$CLAUDE_PROJECTS_DIR` or `~/.claude/projects`
-//! and enumerates ONLY `<encoded-cwd>/<session-id>.jsonl` files at exactly one
+//! Resolves the store root from the Claude PROFILE
+//! (`config::claude_config_dir()` — i.e. `$CLAUDE_CONFIG_DIR`, else `~/.claude`)
+//! joined with `projects`, unless `config::claude_projects_override()` (i.e.
+//! `$CLAUDE_PROJECTS_DIR`) is set and non-empty, in which case IT wins — a
+//! FIXTURES/DEMO-only override of the store view that does NOT change the
+//! profile any spawned `claude` child uses (see `store_root_from`'s doc comment
+//! for why it stays highest-precedence). A relocated profile uses the IDENTICAL
+//! `<encoded-cwd>/<id>.jsonl` on-disk layout, so a moved root changes only WHERE
+//! this module looks, never HOW it looks — the two-level-deep scan below is
+//! unaffected either way.
+//!
+//! This module reads NO environment variables itself: both `config_dir` and
+//! `projects_override` are composed from `config`, the single env reader (see
+//! its module doc), so the store view and the child `claude`'s profile can
+//! never independently disagree from this side.
+//!
+//! Enumerates ONLY `<encoded-cwd>/<session-id>.jsonl` files at exactly one
 //! directory below the root. Never descends into `<session-id>/subagents/` —
 //! subagent transcripts (~62% of files) masquerade as sessions and must be
 //! excluded (see the Risks table). Returns candidate file paths.
@@ -9,19 +24,81 @@
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
-/// Resolve the store root: `$CLAUDE_PROJECTS_DIR` if set and non-empty, else
-/// `~/.claude/projects`.
-pub fn store_root() -> PathBuf {
-    if let Ok(dir) = std::env::var("CLAUDE_PROJECTS_DIR") {
+use crate::config;
+
+/// Subdirectory of the Claude profile holding transcripts. Kept as a literal
+/// here — the module that joins it — rather than in `config`, per the "one
+/// literal, one home" convention recorded at `config::CLAUDE_DIR_NAME`'s doc
+/// comment; do not duplicate it.
+const PROJECTS_SUBDIR: &str = "projects";
+
+/// Pure precedence decision behind [`store_root`]: a set, non-empty
+/// `projects_override` (i.e. `$CLAUDE_PROJECTS_DIR`) wins over
+/// `config_dir.join("projects")`; an empty override is treated as unset,
+/// matching `config`'s existing rule for every other override in this crate.
+///
+/// The override stays HIGHEST precedence — outranking the profile itself —
+/// because it is load-bearing for three consumers that must stay deterministic
+/// regardless of the ambient Claude profile: the board tests in
+/// `src/tui/update.rs` that set `CLAUDE_PROJECTS_DIR`, the release workflow's
+/// `sb`/`snapback` parity check (`.github/workflows/npm-release.yml`), and the
+/// demo-GIF recording procedure (the variable's documented contract, those
+/// consumers included, is `docs/agents/OPERATIONS.md#environment`). Each wants
+/// "point the board at THIS directory of fixtures and nothing else"; a
+/// profile-derived root that could override it would make all three depend on
+/// the runner's or developer's ambient profile.
+pub fn store_root_from(projects_override: Option<&str>, config_dir: &Path) -> PathBuf {
+    if let Some(dir) = projects_override {
         if !dir.is_empty() {
             return PathBuf::from(dir);
         }
     }
-    if let Some(home) = dirs::home_dir() {
-        return home.join(".claude").join("projects");
+    config_dir.join(PROJECTS_SUBDIR)
+}
+
+/// Resolve the store root: the thin, impure composition of `config`'s two
+/// readers over the pure [`store_root_from`]. See that function's doc comment
+/// for the precedence rule and why the override outranks the profile.
+pub fn store_root() -> PathBuf {
+    store_root_from(
+        config::claude_projects_override().as_deref(),
+        &config::claude_config_dir(),
+    )
+}
+
+/// D2: make the one remaining way the store view and the child `claude`'s
+/// profile can disagree VISIBLE rather than silent.
+///
+/// `None` unless `projects_override` (`$CLAUDE_PROJECTS_DIR`) is set, non-empty,
+/// AND its path components differ from `config_dir.join("projects")`'s —
+/// compared via [`Path::components`] equality so a trailing slash or a `./`
+/// segment is never falsely reported as a mismatch. Does **no filesystem
+/// access** (no `canonicalize`: it fails on a path that does not exist yet, and
+/// would have to fail soft regardless), so the check costs one component
+/// compare and never blocks startup.
+///
+/// The returned message names BOTH paths — the override actually in effect and
+/// the profile's own store root — so a one-time board status can say plainly
+/// that the board is showing the override, not the profile it would otherwise
+/// agree with.
+///
+/// `lib::run` calls this once, before the board loop starts, and turns `Some`
+/// into a one-time board status via `App::set_status`.
+pub fn store_override_note(projects_override: Option<&str>, config_dir: &Path) -> Option<String> {
+    let dir = projects_override?;
+    if dir.is_empty() {
+        return None;
     }
-    // Last resort if the home directory cannot be resolved.
-    PathBuf::from(".claude").join("projects")
+    let override_path = Path::new(dir);
+    let profile_root = config_dir.join(PROJECTS_SUBDIR);
+    if override_path.components().eq(profile_root.components()) {
+        return None;
+    }
+    Some(format!(
+        "showing CLAUDE_PROJECTS_DIR override {} instead of the profile's store at {}",
+        override_path.display(),
+        profile_root.display()
+    ))
 }
 
 /// Where a path sits in the store's ONE consumable shape,
@@ -345,6 +422,97 @@ mod tests {
         assert_eq!(
             store_depth(root, Path::new("/other/cwd/sess.jsonl")),
             StoreDepth::Outside
+        );
+    }
+
+    // `store_root_from` and `store_override_note` are pure functions of their
+    // arguments — no env mutation anywhere below, matching AGENTS.md PURE +
+    // TESTED. Both are tested with constructed paths, never `std::env::set_var`.
+    // The `projects` segment is asserted as a LITERAL string throughout (never
+    // via `PROJECTS_SUBDIR`), matching the repo's convention at
+    // `config.rs:118-123` of never asserting through the const under test.
+
+    // --- store_root_from -----------------------------------------------------
+
+    #[test]
+    fn store_root_from_prefers_a_set_non_empty_override() {
+        let config_dir = Path::new("/p/.claude-work");
+        assert_eq!(
+            store_root_from(Some("/tmp/fix"), config_dir),
+            PathBuf::from("/tmp/fix"),
+            "a set, non-empty CLAUDE_PROJECTS_DIR override must win over the \
+             profile-derived root"
+        );
+    }
+
+    #[test]
+    fn store_root_from_joins_the_literal_projects_segment_onto_the_profile_when_unset() {
+        let config_dir = Path::new("/p/.claude-work");
+        let root = store_root_from(None, config_dir);
+        assert_eq!(root, PathBuf::from("/p/.claude-work/projects"));
+        assert_eq!(
+            root.file_name().and_then(|n| n.to_str()),
+            Some("projects"),
+            "the store root's final component must be the literal `projects` segment"
+        );
+    }
+
+    #[test]
+    fn store_root_from_treats_an_empty_override_as_unset() {
+        let config_dir = Path::new("/p/.claude-work");
+        assert_eq!(
+            store_root_from(Some(""), config_dir),
+            store_root_from(None, config_dir),
+            "an empty CLAUDE_PROJECTS_DIR must fall through to the profile-derived \
+             root, matching config's rule for every other override"
+        );
+    }
+
+    // --- store_override_note --------------------------------------------------
+
+    #[test]
+    fn store_override_note_is_none_when_the_override_is_absent() {
+        let config_dir = Path::new("/p/.claude-work");
+        assert_eq!(
+            store_override_note(None, config_dir),
+            None,
+            "no override set means nothing to disagree about"
+        );
+    }
+
+    #[test]
+    fn store_override_note_is_none_when_the_override_matches_the_profile_root() {
+        let config_dir = Path::new("/p/.claude-work");
+        assert_eq!(
+            store_override_note(Some("/p/.claude-work/projects"), config_dir),
+            None,
+            "an override naming the SAME directory as the profile's store is not a \
+             mismatch"
+        );
+    }
+
+    #[test]
+    fn store_override_note_ignores_a_trailing_slash() {
+        let config_dir = Path::new("/p/.claude-work");
+        assert_eq!(
+            store_override_note(Some("/p/.claude-work/projects/"), config_dir),
+            None,
+            "Path::components() equality must not be fooled by a trailing slash"
+        );
+    }
+
+    #[test]
+    fn store_override_note_reports_a_genuinely_different_directory() {
+        let config_dir = Path::new("/p/.claude-work");
+        let note = store_override_note(Some("/tmp/fixtures"), config_dir)
+            .expect("a genuinely different override must produce a note");
+        assert!(
+            note.contains("/tmp/fixtures"),
+            "the note must name the override path actually in effect: {note}"
+        );
+        assert!(
+            note.contains("/p/.claude-work/projects"),
+            "the note must also name the profile's own store path: {note}"
         );
     }
 }

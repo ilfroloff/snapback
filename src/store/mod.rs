@@ -534,8 +534,9 @@ impl SessionStore {
         self.last_discovered
     }
 
-    /// One-shot load from the default store root (`$CLAUDE_PROJECTS_DIR` or
-    /// `~/.claude/projects`), keeping no cache. Used by `--print-list`, which
+    /// One-shot load from the default store root (`$CLAUDE_PROJECTS_DIR` if
+    /// set, else `<claude-profile>/projects`, default `~/.claude/projects` — see
+    /// [`discover::store_root`]), keeping no cache. Used by `--print-list`, which
     /// loads once and exits.
     pub fn load() -> Vec<Session> {
         Self::load_from(&discover::store_root())

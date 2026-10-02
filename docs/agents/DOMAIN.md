@@ -7,11 +7,21 @@ format as hostile input — see the fail-soft rule in [PATTERNS.md](PATTERNS.md)
 
 ## Store root
 
-Resolved by `store::discover::store_root()`:
+Resolved by `store::discover::store_root()`, a thin composition of `config`'s
+two env readers over the pure `store_root_from(projects_override, config_dir)`:
 
-1. `$CLAUDE_PROJECTS_DIR` if set and non-empty, else
-2. `~/.claude/projects`, else
+1. `$CLAUDE_PROJECTS_DIR` if set and non-empty — a FIXTURES/DEMO override of the
+   STORE VIEW only; it does NOT change the profile any spawned `claude` child
+   uses (see [OPERATIONS.md](OPERATIONS.md#environment)), else
+2. `<claude-profile>/projects`, where the Claude profile is
+   `config::claude_config_dir()` (`$CLAUDE_CONFIG_DIR` if set and non-empty,
+   else `~/.claude`), else
 3. `.claude/projects` (last resort if the home dir cannot be resolved).
+
+A relocated profile (e.g. `CLAUDE_CONFIG_DIR=~/.claude-work`) uses the
+IDENTICAL `<encoded-cwd>/<id>.jsonl` on-disk layout as the default — a moved
+root changes only WHERE this module looks, never HOW it looks, so discovery
+itself is unaffected by which profile is active.
 
 ## snapback-owned state (`src/hidden.rs`)
 
@@ -19,10 +29,12 @@ The store above is READ-ONLY to `snapback` with one exception (hard delete, belo
 `snapback`'s one persistent write of its own is the **soft-hidden session id set**,
 kept in a SEPARATE directory it owns — never inside the Claude store. Its path is
 resolved by the `config` module (`src/config.rs`), the SINGLE place that reads the
-environment for any snapback-owned path:
+environment for any snapback-owned path (and, per [Store root](#store-root)
+above, for the external Claude profile too):
 
 1. `config::config_dir()` = `$SNAPBACK_CONFIG_DIR` if set and non-empty (the
-   test/override seam, mirroring `$CLAUDE_PROJECTS_DIR`), else `~/.config/snapback`.
+   test/override seam — one of three variables `config` resolves, alongside
+   `$CLAUDE_CONFIG_DIR` and `$CLAUDE_PROJECTS_DIR`), else `~/.config/snapback`.
    The default is `~/.config/snapback` on EVERY platform — deliberately NOT
    `dirs::config_dir()` (which is `~/Library/Application Support` on macOS) — so the
    state keeps one predictable, greppable home regardless of OS. Built from
@@ -1596,12 +1608,12 @@ launches persist it differently:
 long-running background sessions (which carry no `agent-setting` at all), so
 ignoring it would leave exactly those sessions bare — but the field is shared with
 free-form job titles, so it is trusted ONLY when the value matches a **defined
-agent** (`App::agent_names`, discovered once from `~/.claude/agents/*.md` and
-`<launch_dir>/.claude/agents/*.md`, passed
-into `render`). A title therefore renders bare rather than as a bogus
-`@handle`. Both fields are read fail-soft (`.and_then(Value::as_str)`); the catch-all
-default `"claude"` and any blank name suppress the handle (the `● claude` marker
-already says `claude`).
+agent** (`App::agent_names`, discovered once from
+`<claude-profile>/agents/*.md` — default `~/.claude/agents` — and
+`<launch_dir>/.claude/agents/*.md`, passed into `render`). A title therefore
+renders bare rather than as a bogus `@handle`. Both fields are read fail-soft
+(`.and_then(Value::as_str)`); the catch-all default `"claude"` and any blank
+name suppress the handle (the `● claude` marker already says `claude`).
 
 Attribution is **positional**, not hoisted: the agent (both records) is threaded
 through the render loop as streaming state (exactly like the per-message day
@@ -1618,7 +1630,7 @@ This is the third and last of **three distinct agent concepts** — keep them ap
 | Concept | Source | What it is |
 | --- | --- | --- |
 | **Live** (reported) agent | `claude agents --json` (`src/agents.rs`) | a **running process** — drives the board badge and the resume gate (see [Reported agents](#reported-agents-srcagentsrs)) |
-| **Defined** agent | `~/.claude/agents/*.md` and `<launch_dir>/.claude/agents/*.md` (`src/defined_agents.rs`) | an **on-disk definition** a new session can be launched under (`claude --agent <name>`, see [Hand-off invocations](#hand-off-invocations-srcresumers)) |
+| **Defined** agent | `<claude-profile>/agents/*.md` (default `~/.claude/agents`) and `<launch_dir>/.claude/agents/*.md` (`src/defined_agents.rs`) | an **on-disk definition** a new session can be launched under (`claude --agent <name>`, see [Hand-off invocations](#hand-off-invocations-srcresumers)) |
 | **Bound** agent | `agent-setting` / `agent-name` records (`store::preview`) | the **agent a recorded session actually ran under** — a preview-only label, this section; the **Defined** set above is what validates the noisy `agent-name` source |
 
 ### Peer message node (`store::preview`)
@@ -2225,7 +2237,9 @@ existence of `App::launch_dir` itself and uses that dir as the authoritative
 A new session can also be **bound to a DEFINED agent** (`claude --agent <name>`).
 These are DISTINCT from the live/running agents above: they are on-disk
 definitions discovered fail-soft (`src/defined_agents.rs`) from Markdown files
-with YAML frontmatter under `~/.claude/agents/*.md` (user) and
+with YAML frontmatter under `<claude-profile>/agents/*.md` (user —
+profile-scoped, see [Store root](#store-root); default `~/.claude/agents`, and
+no user list at all when no profile can be named) and
 `<launch_dir>/.claude/agents/*.md` (project overrides user by `name`). The list
 is a convenience — built-in/plugin agents are not files, so it is inherently
 incomplete; the picker always offers a `default (no agent)` bare launch and never

@@ -7,10 +7,11 @@ system prompt: keep it loaded, follow it exactly.
 
 `snapback` (alias `sb`) is a single self-contained Rust **ratatui TUI** that
 browses, searches, and resumes **Claude Code** sessions stored as JSONL under
-`~/.claude/projects/`, and — without leaving the board — replies to, stops, and
-starts the agents claude runs. Ship changes that keep the data core correct
-against a hostile, undocumented on-disk format and keep the terminal safe across
-the resume round trip.
+the Claude profile's `projects/` store (default `~/.claude/projects/`), and —
+without leaving the board — replies to, stops, and starts the agents claude
+runs. Ship changes that keep the data core correct against a hostile,
+undocumented on-disk format and keep the terminal safe across the resume round
+trip.
 
 ## Critical rules
 
@@ -55,12 +56,18 @@ one place.
 - **SNAPBACK-OWNED STATE.** The ONLY persistent state `snapback` writes is the
   hidden-session id set. It lives under `$SNAPBACK_CONFIG_DIR` (default
   `~/.config/snapback`), specifically the `state/` subdir — resolved by the
-  `config` module, the SINGLE place that reads the environment for any
-  snapback-owned path — NEVER inside the read-only `~/.claude/projects` store.
-  Read + write are FAIL-SOFT (a missing or unreadable file ⇒ an empty set, never
-  a panic) and the write is ATOMIC (temp file + rename). Hiding is a VISIBILITY
-  preference, not a status flag. (`src/config.rs`; `src/hidden.rs`; the persist
-  path in `src/tui/app.rs`)
+  `config` module, the SINGLE place that reads the environment for ANY path
+  snapback resolves: its own (`SNAPBACK_CONFIG_DIR`) AND the external Claude
+  PROFILE it operates against (`CLAUDE_CONFIG_DIR`, `CLAUDE_PROJECTS_DIR`) —
+  NEVER inside the read-only Claude profile's `projects` store (default
+  `~/.claude/projects`). One env reader is what keeps the store view, every
+  spawned `claude` child (`src/claude_cmd.rs`, the one seam that stamps a SET
+  profile override via `Command::env`), and the `Ctrl-N` agent list from ever
+  resolving a second, disagreeing profile. Read + write of snapback's own hidden
+  set are FAIL-SOFT (a missing or unreadable file ⇒ an empty set, never a
+  panic) and the write is ATOMIC (temp file + rename). Hiding is a VISIBILITY
+  preference, not a status flag. (`src/config.rs`; `src/claude_cmd.rs`;
+  `src/hidden.rs`; the persist path in `src/tui/app.rs`)
 - **A MODEL IS PICKED PER COMPOSE, NEVER PER BOARD.** `--model`/`--effort` reach
   `claude` ONLY from an explicit `Ctrl-L` pick inside a compose box, and only on
   that compose's own launch: the `Ctrl-R` quick reply, or the `Ctrl-N` draft's
@@ -75,8 +82,9 @@ one place.
   (`src/resume.rs`; `src/send.rs`; `src/tui/compose.rs`;
   `launch_pick_interactively` in `src/tui/update.rs`)
 - **STORE WRITES ARE GATED, AND ALL BUT ONE ARE DELEGATED.** The only mutation
-  `snapback` itself performs on `~/.claude/projects` is hard delete (`Ctrl-X d`),
-  behind BOTH a confirmation modal AND the pure `can_delete_target` WRITER guard.
+  `snapback` itself performs on the profile's `projects` store is hard delete
+  (`Ctrl-X d`), behind BOTH a confirmation modal AND the pure
+  `can_delete_target` WRITER guard.
   Every OTHER change to a transcript is made by a `claude` CHILD and must stay
   that way — a quick reply appends in place because `claude -p -r` writes it,
   NEVER because snapback edits a session file. Do not add a direct writer.

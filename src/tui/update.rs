@@ -9394,16 +9394,25 @@ mod tests {
     /// `Ctrl-N` with ZERO defined agents skips the pointless one-row picker and
     /// opens the draft pane directly, bound to no agent — it must NOT resume.
     ///
-    /// `HOME` is redirected so `defined_agents::discover_agents` finds neither a
-    /// user- nor a project-level `.claude/agents`; without that the developer's own
-    /// agents would decide which branch this test exercises.
+    /// BOTH `HOME` and `CLAUDE_CONFIG_DIR` are redirected so
+    /// `defined_agents::discover_agents` finds neither a user- nor a
+    /// project-level `.claude/agents`. `HOME` alone used to be enough because
+    /// `user_agents_dir` hardcoded `~/.claude/agents`, but it is now PROFILE-scoped
+    /// via `config::claude_config_dir_if_known`, which prefers `$CLAUDE_CONFIG_DIR`
+    /// over `$HOME` — so a developer with `CLAUDE_CONFIG_DIR` exported in their own
+    /// shell would have it win over this test's redirected `HOME`, defeating the
+    /// isolation and letting their REAL agents decide which branch this test
+    /// exercises. Redirecting `CLAUDE_CONFIG_DIR` to the same isolated temp home's
+    /// `.claude` closes that gap.
     #[test]
     fn ctrl_n_with_no_defined_agents_opens_the_draft_pane_with_no_agent() {
         let _guard = crate::config::env_lock();
         let home = unique_temp_dir("no-agents-home");
         let launch = unique_temp_dir("no-agents-launch");
         let previous_home = std::env::var_os("HOME");
+        let previous_claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
         std::env::set_var("HOME", &home);
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.join(".claude"));
 
         let mut app = App::new(vec![session("s")], Scope::All, launch.clone());
         app.set_pane_layout(PaneLayout::ListOnly); // prove the draft pane brings the preview back
@@ -9412,6 +9421,10 @@ mod tests {
         match previous_home {
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
+        }
+        match previous_claude_config_dir {
+            Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
         }
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&launch);

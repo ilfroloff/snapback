@@ -22,11 +22,11 @@ find the same rule in two places, that is a bug to fix.
 4. [PATTERNS.md](PATTERNS.md) — **how to build new things**: the repeated
    implementation rules and the testing conventions to match.
 5. [OPERATIONS.md](OPERATIONS.md) — build/test/lint/run commands, the
-   environment it reads (the `CLAUDE_PROJECTS_DIR` / `SNAPBACK_CONFIG_DIR`
-   overrides, the session facts the clipboard copy routes by, and `claude`'s own
-   model variables the compose boxes' `model:` labels read), the runtime
-   prerequisites, the hidden `--print-list` mode, the CI + release-plz
-   automation, and the pre-finish validation checklist.
+   environment it reads (the `CLAUDE_CONFIG_DIR` / `CLAUDE_PROJECTS_DIR` /
+   `SNAPBACK_CONFIG_DIR` overrides, the session facts the clipboard copy routes
+   by, and `claude`'s own model variables the compose boxes' `model:` labels
+   read), the runtime prerequisites, the hidden `--print-list` mode, the CI +
+   release-plz automation, and the pre-finish validation checklist.
 6. [CLAUDE_CLI.md](CLAUDE_CLI.md) — **the external `claude` binary**: version
    pin, the argv `snapback` spawns (including where a compose's `Ctrl-L` pick
    places `--model` / `--effort`), the one effect that is not a `claude`

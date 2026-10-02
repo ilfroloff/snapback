@@ -59,7 +59,6 @@
 //! spawning anything.
 
 use std::collections::HashMap;
-use std::process::Command;
 
 use serde_json::Value;
 
@@ -769,8 +768,21 @@ fn agents_from_output(success: bool, stdout: &str) -> HashMap<String, ReportedAg
 /// the result means is [`agents_from_output`]'s pure decision. Output is CAPTURED
 /// (no TTY inherited), so it never contends with an interactive `claude` on the
 /// terminal. Never panics; every error path returns an empty map.
+///
+/// The `Command` itself comes from [`crate::claude_cmd::claude_command`], handed
+/// the override [`crate::config::claude_profile_override`] read — the SAME one
+/// `store::discover::store_root` resolves the store from; with none, `claude`
+/// uses its own default, which is the store's default too. That agreement is what
+/// makes [`live_agents`]' answer trustworthy for the hard-delete writer guard: a
+/// probe run under a DIFFERENT profile than the store's would report every row as
+/// "no writer" and silently widen an irreversible delete.
 fn run_agents(argv: &[String]) -> HashMap<String, ReportedAgent> {
-    let output = match Command::new(&argv[0]).args(&argv[1..]).output() {
+    let output = match crate::claude_cmd::claude_command(
+        argv,
+        crate::config::claude_profile_override().as_deref(),
+    )
+    .output()
+    {
         Ok(output) => output,
         Err(_) => return HashMap::new(), // `claude` not on PATH, spawn failed, etc.
     };
@@ -828,6 +840,16 @@ pub fn reported_agents() -> HashMap<String, ReportedAgent> {
 /// "not live" ⇒ a plain resume ⇒ **claude's own check still backstops it**, and
 /// the user sees claude's real message instead of our guess. Degrading toward
 /// "let claude decide" is correct, because claude is the authority.
+///
+/// **One more failure shape belongs on this list, because it does not look like a
+/// failure: a PROFILE mismatch.** This answer is PROFILE-SCOPED —
+/// `CLAUDE_CONFIG_DIR=<other> claude agents --json` returns `[]` — so an empty map
+/// from the WRONG profile means something different from an empty map from the
+/// right one: the former is silent disagreement with whichever store the caller
+/// actually loaded, not "nothing is running". [`crate::delete::can_delete`] is the
+/// consumer this bites hardest, since it treats an empty answer as "no writer" for
+/// an irreversible unlink. See [`run_agents`]'s doc comment for why that
+/// mismatch is now structurally prevented rather than merely a risk to remember.
 ///
 /// That direction also decides the ATTACH path, where it collapses two premises
 /// into one: an empty map means "the agent finished" and "we could not ask" ALIKE.

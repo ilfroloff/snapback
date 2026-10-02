@@ -77,9 +77,24 @@ Releases are tagged `vX.Y.Z` — pick one from the repo's Releases page. Every f
 above installs the same program under two names, `snapback` and the short alias
 `sb`; use whichever you prefer.
 
-Optional override:
+Optional environment overrides:
 
-- `CLAUDE_PROJECTS_DIR` — where sessions are stored (default `~/.claude/projects`).
+- `CLAUDE_CONFIG_DIR` — the Claude **profile** `snapback` operates against:
+  which sessions it lists, which profile every launched `claude` uses, and
+  which `agents/*.md` the `Ctrl-N` picker offers (default `~/.claude`). Useful
+  for a multi-account setup: if you already alias
+  `claude-work='CLAUDE_CONFIG_DIR=~/.claude-work claude'`, add
+  `alias sb-work='CLAUDE_CONFIG_DIR=~/.claude-work sb'` and the board and the
+  `claude` it launches agree on the same account. Unset by default, `snapback`
+  leaves it unset for every `claude` it launches too, so the board and those
+  launches (and their login) behave exactly as before this variable existed;
+  set, the header shows a `profile:<dir-name>` indicator so it's visible which
+  account is active — the directory's name verbatim, dot included
+  (`profile:.claude-work` for the alias above).
+- `CLAUDE_PROJECTS_DIR` — a fixtures/demo override of the session **store view
+  only** (default `<CLAUDE_CONFIG_DIR>/projects`, i.e. `~/.claude/projects`).
+  It does **not** change which profile a launched `claude` uses — for that,
+  set `CLAUDE_CONFIG_DIR` above instead.
 
 ## Usage
 
