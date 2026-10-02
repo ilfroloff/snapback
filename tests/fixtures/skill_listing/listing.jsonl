@@ -1,0 +1,5 @@
+{"type":"user","cwd":"/tmp/x","message":{"role":"user","content":"what does an agent_listing_delta record hold?"}}
+{"type":"attachment","attachment":{"type":"agent_listing_delta","addedTypes":["Explore","lead","sby-agent"],"addedLines":["- Explore: Fast read-only search agent for locating code. (Tools: Read, Glob)","- lead: Orchestrates task requests and `PLAN.md` implementation by delegating to domain sub-agents. (Tools: Read, Edit, Write, Bash)","- sby-agent: Probe agent Y for snapback (Tools: All tools)"],"removedTypes":[],"isInitial":true,"showConcurrencyNote":true}}
+{this is not json but mentions agent_listing_delta and skill_listing
+{"type":"attachment","attachment":{"type":"skill_listing","names":["brag-slim","cr-review","plugin-x:deploy","sbx-skill"],"content":"- brag-slim\n- cr-review: Independently review the current branch's changes (user)\n- plugin-x:deploy: Deploy through the plugin (plugin)\n- sbx-skill: Probe skill X for snapback","skillCount":4,"isInitial":true}}
+{"type":"attachment","attachment":{"type":"agent_listing_delta","addedTypes":[],"addedLines":[],"removedTypes":["lead"],"isInitial":false,"showConcurrencyNote":true}}

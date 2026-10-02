@@ -17,7 +17,9 @@
 //! binaries are thin shims that both call [`run`].
 
 mod agents;
+mod claude_catalog;
 mod claude_settings;
+mod claude_trust;
 mod cli;
 mod config;
 mod defined_agents;

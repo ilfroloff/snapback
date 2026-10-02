@@ -1,0 +1,62 @@
+{
+  "type": "control_response",
+  "response": {
+    "subtype": "success",
+    "request_id": "sb-v",
+    "response": {
+      "commands": [
+        {
+          "name": "sbnomodel",
+          "description": "Probe skill the model may not invoke (project)",
+          "argumentHint": ""
+        },
+        {
+          "name": "sbx-skill",
+          "description": "Probe skill X for snapback (project)",
+          "argumentHint": ""
+        },
+        {
+          "name": "cr-review",
+          "description": "Independently review the current branch's changes — or a named GitHub pull request, checked out in a throwaway detached worktree — for requirements, agent-rule, security, scope-creep, and test-gaming issues using the Independent Change Reviewer agent. Use after implementing a task or plan, before opening a PR, or to review an existing PR (`#123`, `org/repo#123`, or a `github.com` pull-request URL), to get an unbiased PASS/FAIL verdict. (user)",
+          "argumentHint": ""
+        },
+        {
+          "name": "sbz",
+          "description": "Probe command Z for snapback (project)",
+          "argumentHint": "word"
+        },
+        {
+          "name": "code-review",
+          "description": "Review the current diff, or a PR number/branch/path target, for correctness bugs (plus reuse/simplification/efficiency cleanups where the model's review recipe covers them) at the given effort level (low/medium: fewer, high-confidence findings; high→max: broader coverage, may include uncertain findings); with no level given, it reuses the level you typed last. Pass --comment to post findings as inline PR comments, or --fix to apply the findings to the working tree after the review.",
+          "argumentHint": "[low|medium|high|xhigh|max] [--fix] [--comment] [<pr#>|<branch>|<path>]",
+          "aliases": [
+            "review"
+          ],
+          "builtin": true
+        },
+        {
+          "name": "compact",
+          "description": "Free up context by summarizing the conversation so far",
+          "argumentHint": "<optional custom summarization instructions>",
+          "builtin": true
+        }
+      ],
+      "agents": [
+        {
+          "name": "Explore",
+          "description": "Fast read-only search agent for locating code. Use it to find files by pattern (eg. \"src/components/**/*.tsx\"), grep for symbols or keywords (eg. \"API endpoints\"), or answer \"where is X defined / which files reference Y.\" Do NOT use it for code review, design-doc auditing, cross-file consistency checks, or open-ended analysis — it reads excerpts rather than whole files and will miss content past its read window. When calling, specify search breadth: \"quick\" for a single targeted lookup, \"medium\" for moderate exploration, or \"very thorough\" to search across multiple locations and naming conventions.",
+          "model": "inherit"
+        },
+        {
+          "name": "lead",
+          "description": "Orchestrates task requests and `PLAN.md` implementation by delegating to domain sub-agents to prevent context compaction."
+        },
+        {
+          "name": "sby-agent",
+          "description": "Probe agent Y for snapback",
+          "model": "haiku"
+        }
+      ]
+    }
+  }
+}

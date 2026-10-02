@@ -9,6 +9,7 @@
 
 pub mod app;
 pub mod clipboard;
+pub mod complete;
 pub mod compose;
 pub mod update;
 pub mod view;
@@ -632,6 +633,18 @@ fn run_inner(
             Waited::TimedOut => {}
             // All senders dropped (input + watcher + tick gone): exit cleanly.
             Waited::Closed => break Outcome::Quit,
+        }
+        // A compose open on a folder whose command and agent list is neither
+        // cached nor being fetched gets claude's own, asked OFF the UI thread: a
+        // ONE-SHOT delivering a single `AppEvent::CatalogFetched` on this same
+        // channel. Asked after every wake-up, so every path that opens a compose
+        // (`Ctrl-R`, the stop-then-reply confirm, `Ctrl-N` with or without its
+        // picker) is covered without touching any of them. The DECISION is
+        // `compose::take_catalog_fetch`'s, pure and tested; this spawn LINE is
+        // untested for the same accepted reason as `spawn_model_alias_probe`'s
+        // above (PATTERNS §6: `run_inner` needs a real terminal).
+        if let Some(cwd) = compose::take_catalog_fetch(app) {
+            crate::claude_catalog::spawn_fetch(cwd, events.sender());
         }
         // Pay out the autoscroll a held drag owes by now, before the next draw.
         // After EVERY wake-up, an event as well as the deadline: moving the mouse

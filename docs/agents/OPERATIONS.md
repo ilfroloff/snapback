@@ -226,9 +226,10 @@ switch. That `NPM_TOKEN` secret can be deleted once one OIDC release succeeds.)
 | `CLAUDE_PROJECTS_DIR` | `~/.claude/projects` | Overrides the session store root (used by both the TUI and `--print-list`). |
 | `SNAPBACK_CONFIG_DIR` | `~/.config/snapback` | Overrides snapback's OWN config dir (the single env-resolved root for snapback-owned paths; state lives in its `state/` subdir). Resolved only by the `config` module. |
 | `SSH_CONNECTION` / `SSH_TTY` / `WAYLAND_DISPLAY` / `DISPLAY` | set by `sshd` / the desktop session | Session FACTS, not overrides. Read only by `tui::clipboard::ClipboardEnv::from_env` (present and non-empty counts as set) to pick the clipboard copy's tool (`Ctrl-X y` and a preview drag-selection alike), or none, in which case the copy falls back to OSC 52. The route table is the `tui::clipboard` row of the [module map](ARCHITECTURE.md#module-map). |
-| `CLAUDE_CONFIG_DIR` | `~/.claude` | `claude`'s own variable, READ (never set) by `claude_settings` to find the user `settings.json` — the lowest settings layer, so every higher layer outranks it. Its `model` feeds only a `Ctrl-N` draft's `model:` label. Its `env` block counts only through the variables in the two rows below: `ANTHROPIC_MODEL` for the draft's value, and all five restore-override names for a `Ctrl-R` reply's label. Empty counts as unset. |
-| `ANTHROPIC_MODEL` | unset | `claude`'s own variable, READ by `claude_settings`: when non-empty (in the highest settings layer's `env` block, else in the environment) it beats every settings file's `model` for a draft's new-session value, AND it stops `claude` restoring a session's own model on `-r`, so a reply box says `model: default` instead of `model: session (…)`. snapback passes its environment to the `claude` it spawns unchanged. |
+| `CLAUDE_CONFIG_DIR` | `~/.claude` | `claude`'s own variable, READ (never set) through `claude_settings`' one reader. (1) `claude_settings` finds the user `settings.json` there — the lowest settings layer, so every higher layer outranks it. Its `model` feeds only a `Ctrl-N` draft's `model:` label. Its `env` block counts only through the variables in the two rows below: `ANTHROPIC_MODEL` for the draft's value, and all five restore-override names for a `Ctrl-R` reply's label. (2) `claude_trust` finds claude's global config there, the workspace-trust record that picks the catalog fetch's form (argv and child environment): `$CLAUDE_CONFIG_DIR/.claude.json`, and with the variable unset `~/.claude.json` (in the home directory, not in `~/.claude`). The full file rule is [CLAUDE_CLI.md](CLAUDE_CLI.md#workspace-trust-what-an-untrusted-folder-can-run-and-the-two-argv-forms)'s. Empty counts as unset. |
+| `ANTHROPIC_MODEL` | unset | `claude`'s own variable, READ by `claude_settings`: when non-empty (in the highest settings layer's `env` block, else in the environment) it beats every settings file's `model` for a draft's new-session value, AND it stops `claude` restoring a session's own model on `-r`, so a reply box says `model: default` instead of `model: session (…)`. snapback passes it on, unchanged, to every `claude` it spawns. |
 | `ANTHROPIC_DEFAULT_{FABLE,OPUS,SONNET,HAIKU}_MODEL` | unset | `claude`'s own variables, READ by `claude_settings` for one question only: any of them non-empty (in the highest settings layer's `env` block, else in the environment) stops the `-r` model restore, so a reply box says `model: default`. |
+| `CLAUDE_CODE_CUSTOM_OAUTH_URL` | unset | `claude`'s own variable, READ by `claude_trust` for one question only: when non-empty, claude's global config, and with it the trust record, is `.claude-custom-oauth.json` instead of `.claude.json`. |
 
 ## Hidden debug mode
 
@@ -245,11 +246,16 @@ confirm subagents/sidecars were excluded). It is intentionally omitted from
 - A real **TTY** — the interactive UI refuses to run when stdout is not a
   terminal (it prints a count and exits instead of panicking).
 - `claude` on `PATH` — the binary that resume/fork/attach spawn, the source of
-  live-agent badges, and (read rather than run) the source of the compose model
-  picker's (`Ctrl-L`) `--model` alias list. If it is missing or fails to launch,
-  the hand-off fails soft to a board status message, live detection degrades to "nothing is
-  live" so the live-agent badges disappear, and the picker falls back to its
-  built-in seed. Its flags, commands, version pin, and the exact argv `snapback`
+  live-agent badges, the source of the compose pick list's skills, commands and
+  agents (its `initialize` handshake, once per folder, with the repository's own
+  items only where claude's workspace-trust record trusts the folder), and (read
+  rather than run) the source of the compose model picker's (`Ctrl-L`) `--model`
+  alias list.
+  If it is missing or fails to launch, the hand-off fails soft to a board status
+  message, live detection degrades to "nothing is live" so the live-agent badges
+  disappear, the compose pick list lists no `/` skills or commands (files and
+  folders still, and a reply's `@` agents from its transcript), and the model
+  picker falls back to its built-in seed. Its flags, commands, version pin, and the exact argv `snapback`
   builds are in [CLAUDE_CLI.md](CLAUDE_CLI.md).
 - A clipboard tool, OPTIONAL — `pbcopy` (built into macOS), or `wl-copy` /
   `xclip` / `xsel` on a Linux desktop — for `Ctrl-X y` and a preview

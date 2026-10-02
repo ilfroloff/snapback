@@ -394,13 +394,23 @@ fn read_layers(paths: &[PathBuf]) -> Vec<String> {
         .collect()
 }
 
-/// `claude`'s user config directory: `$CLAUDE_CONFIG_DIR` when set and non-empty,
-/// else `~/.claude`, or `None` when there is no home directory to resolve.
-fn user_config_dir() -> Option<PathBuf> {
+/// `$CLAUDE_CONFIG_DIR` when set and non-empty, else `None`.
+///
+/// The ONE reader of that variable for `claude`'s own files, shared by
+/// [`user_config_dir`] and `crate::claude_trust` (which locates claude's global
+/// config through it), so the two can never disagree on what an empty value means.
+pub(crate) fn claude_config_dir_override() -> Option<PathBuf> {
     match std::env::var_os(CLAUDE_CONFIG_DIR_ENV) {
         Some(dir) if !dir.is_empty() => Some(PathBuf::from(dir)),
-        _ => dirs::home_dir().map(|home| home.join(CLAUDE_DIR)),
+        _ => None,
     }
+}
+
+/// `claude`'s user config directory: [`claude_config_dir_override`], else
+/// `~/.claude`, or `None` when there is no home directory to resolve. Its
+/// `$CLAUDE_CONFIG_DIR` read is that function's, shared with `crate::claude_trust`.
+pub(crate) fn user_config_dir() -> Option<PathBuf> {
+    claude_config_dir_override().or_else(|| dirs::home_dir().map(|home| home.join(CLAUDE_DIR)))
 }
 
 /// The settings-file half of [`model_defaults`], with every location — and the

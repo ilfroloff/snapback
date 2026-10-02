@@ -25,8 +25,9 @@ use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
-    ScrollbarState, Widget, Wrap,
+    Block, Borders, Cell as TableCell, Clear, List, ListItem, ListState, Paragraph,
+    Row as TableRow, Scrollbar, ScrollbarOrientation, ScrollbarState, Table, TableState, Widget,
+    Wrap,
 };
 use ratatui::Frame;
 use time::OffsetDateTime;
@@ -44,6 +45,7 @@ use super::app::{
     ModalChoice, ModalLayout, NewSessionDraft, PaneLayout, PreviewSelection, Row, Scope,
     SelectionUnit, MODEL_DEFAULT_LABEL, MODEL_NEW_SESSION_SCOPE,
 };
+use super::complete::{Candidate, COMPLETION_VISIBLE_ROWS};
 use super::compose::{ComposeState, ComposeTarget};
 
 /// Render the whole UI for one frame.
@@ -1890,8 +1892,10 @@ const DRAFT_CARD_LAUNCHING: &str = "starting in the background\u{2026}";
 /// `▶ you` echo directly above. The word is therefore "cooking" and nothing else.
 const REPLY_COOKING_LABEL: &str = "cooking\u{2026}";
 
-/// The compose hints of a BACKGROUND draft. One const, two surfaces: the help line
-/// ([`compose_hint`]) and the draft card, which must not restate them differently.
+/// The compose hints of a BACKGROUND draft while its pick list is closed. One const,
+/// two surfaces: the help line ([`compose_hint`]) and the draft card, which must not
+/// restate them differently. With the list open both show [`COMPLETION_HINT`]
+/// instead ([`draft_hint`]).
 ///
 /// It deliberately does NOT carry the reply arm's scroll clause (`PgUp/PgDn
 /// scroll`): a draft shows no transcript, so those keys stay the editor's there. This string is 112 columns, so on the
@@ -1904,10 +1908,24 @@ const REPLY_COOKING_LABEL: &str = "cooking\u{2026}";
 /// and it sits right after `Ctrl-O run interactively` — ending at column 67 — so it
 /// is inside the 80 columns the help row draws, where the newline clause and
 /// `Esc cancel` behind it already were not. On the card its 15 columns (97 before
-/// it, 112 with it) can cost one more wrapped row on a narrow pane: the price of
-/// naming the key on the one surface a draft shows before anything is typed.
+/// it, 112 with it) can cost one more wrapped row on a narrow pane: the card wraps
+/// where the help row is cut, and that row is the price of the card sharing this
+/// const, which is what keeps the two surfaces from naming different keys.
 const BG_DRAFT_HINT: &str = "Enter start in background · Ctrl-O run interactively · \
                              Ctrl-L model · Ctrl-J newline (or Alt+Enter) · Esc cancel";
+
+/// The draft card's key hint: the pick list's keys while the list is open, else the
+/// draft's own. The help row ([`compose_hint`]) and the card name the SAME keys for
+/// the draft at every moment: while the list is up `Enter` picks and `Esc` closes
+/// only the list, so a card still offering `Enter start in background` would name a
+/// key that does not do that. Pure, so the agreement is assertable.
+fn draft_hint(list_open: bool) -> &'static str {
+    if list_open {
+        COMPLETION_HINT
+    } else {
+        BG_DRAFT_HINT
+    }
+}
 
 /// The draft card's agent segment: `@handle` for a picked agent, or the picker's
 /// own [`BG_DRAFT_DEFAULT_AGENT`] wording for its default row (a bare `@` would be
@@ -1927,13 +1945,20 @@ fn draft_agent_label(agent: Option<&str>) -> String {
 /// session that does not exist yet, so anything resembling a conversation would be
 /// a lie. Three facts and nothing else — what is being started, WHERE it will run
 /// (the launch dir is the one thing a new session commits to that the user cannot
-/// otherwise see), and the keys that act on it. Once dispatched, the key hints give
-/// way to the in-flight line, since none of those keys still apply.
+/// otherwise see), and the keys that act on it: the draft's own, or the pick list's
+/// while `list_open` ([`draft_hint`]). Once dispatched, the key hints give way to the
+/// in-flight line, since none of those keys still apply — and a dispatched draft has
+/// no editor, so no list either.
 ///
-/// Pure (`(&NewSessionDraft, &Path, tick) -> Vec<Line>`), so the card's content is
-/// assertable without a terminal. Styled with NAMED colors + modifiers only
-/// (TERMINAL-SAFE STYLING).
-fn draft_card(draft: &NewSessionDraft, launch_dir: &Path, tick: u64) -> Vec<Line<'static>> {
+/// Pure (`(&NewSessionDraft, &Path, tick, list_open) -> Vec<Line>`), so the card's
+/// content is assertable without a terminal. Styled with NAMED colors + modifiers
+/// only (TERMINAL-SAFE STYLING).
+fn draft_card(
+    draft: &NewSessionDraft,
+    launch_dir: &Path,
+    tick: u64,
+    list_open: bool,
+) -> Vec<Line<'static>> {
     let headline = Line::from(vec![
         Span::styled(
             DRAFT_CARD_HEADLINE,
@@ -1958,7 +1983,7 @@ fn draft_card(draft: &NewSessionDraft, launch_dir: &Path, tick: u64) -> Vec<Line
         ))
     } else {
         Line::from(Span::styled(
-            BG_DRAFT_HINT,
+            draft_hint(list_open),
             Style::default().add_modifier(Modifier::DIM),
         ))
     };
@@ -2038,6 +2063,103 @@ fn render_compose_zone(frame: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(&compose.textarea, inner);
+    render_completion_list(frame, compose, area);
+}
+
+/// The list block's top and bottom border rows.
+const COMPLETION_BORDER_ROWS: u16 = 2;
+/// Blank columns between a pick-list row's name and its description. The table's
+/// ONLY separator — no header, no column border — so two blanks rather than one:
+/// a single space would read as part of a name or of its description.
+const COMPLETION_COLUMN_GAP: u16 = 2;
+/// The most of the list's inner width the name column takes, in percent, once any
+/// row has a description: descriptions keep the other half, so one long file name
+/// cannot push every description off the box.
+const COMPLETION_NAME_MAX_PERCENT: u16 = 50;
+
+/// Where the pick list is drawn: directly ABOVE `compose_area` (same x and
+/// width), `min(rows, COMPLETION_VISIBLE_ROWS)` rows tall plus its two borders,
+/// clipped to `bounds` -- fewer rows when the room above is short, `None` when
+/// there is no room for even one row. Pure, so the placement is assertable
+/// without a terminal.
+fn completion_rect(compose_area: Rect, rows: usize, bounds: Rect) -> Option<Rect> {
+    let wanted = u16::try_from(rows.min(COMPLETION_VISIBLE_ROWS)).unwrap_or(u16::MAX);
+    let room = compose_area.y.saturating_sub(bounds.y);
+    let height = wanted.saturating_add(COMPLETION_BORDER_ROWS).min(room);
+    if wanted == 0 || height <= COMPLETION_BORDER_ROWS || compose_area.width == 0 {
+        return None;
+    }
+    Some(Rect {
+        x: compose_area.x,
+        y: compose_area.y - height,
+        width: compose_area.width,
+        height,
+    })
+}
+
+/// The pick list's name-column width: the widest `label` over ALL `candidates`,
+/// not only the rows in view, so the columns stay put while the list scrolls —
+/// counted in terminal columns (`unicode-width`, as the renderer counts). Capped at
+/// [`COMPLETION_NAME_MAX_PERCENT`] of `inner_width` once any candidate has a
+/// description, otherwise at `inner_width`. Pure, so the widths are assertable
+/// without a terminal.
+fn completion_name_width(candidates: &[Candidate], inner_width: u16) -> u16 {
+    let widest = candidates
+        .iter()
+        .map(|c| UnicodeWidthStr::width(c.label.as_str()))
+        .max()
+        .unwrap_or(0);
+    let cap = if candidates.iter().any(|c| c.description.is_some()) {
+        let share = u32::from(inner_width) * u32::from(COMPLETION_NAME_MAX_PERCENT) / 100;
+        u16::try_from(share).unwrap_or(inner_width)
+    } else {
+        inner_width
+    };
+    u16::try_from(widest).unwrap_or(u16::MAX).min(cap)
+}
+
+/// Draw the compose box's pick list, when one is showing, above `compose_area`:
+/// an untitled table (the list mixes kinds — files with agents, skills with
+/// commands — so no one title is true), the name on the left and its description
+/// `DIM` on the right, cut at the box's inner edge.
+///
+/// Reads only the cached `completion.visible` — the render path performs no I/O.
+/// The highlighted row is `Modifier::REVERSED` (named modifiers, no colors), and
+/// the `TableState` scrolls the window with the highlight. A list with no
+/// description at all is ONE column: a second, always-empty column would still
+/// cost its [`COMPLETION_COLUMN_GAP`], cutting the longest names short of the box
+/// edge for nothing (the gap outranks a `Length` in the layout solver of
+/// ratatui 0.30.2).
+fn render_completion_list(frame: &mut Frame, compose: &ComposeState, compose_area: Rect) {
+    let Some(visible) = &compose.completion.visible else {
+        return;
+    };
+    let Some(rect) = completion_rect(compose_area, visible.len(), frame.area()) else {
+        return;
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let name_width = completion_name_width(visible, block.inner(rect).width);
+    let widths: &[Constraint] = if visible.iter().any(|c| c.description.is_some()) {
+        &[Constraint::Length(name_width), Constraint::Fill(1)]
+    } else {
+        &[Constraint::Length(name_width)]
+    };
+    let rows = visible.iter().map(|candidate| {
+        TableRow::new([
+            TableCell::from(candidate.label.as_str()),
+            TableCell::from(candidate.description.as_deref().unwrap_or_default())
+                .style(Style::default().add_modifier(Modifier::DIM)),
+        ])
+    });
+    let table = Table::new(rows, widths.iter().copied())
+        .block(block)
+        .column_spacing(COMPLETION_COLUMN_GAP)
+        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    let mut state = TableState::default().with_selected(Some(compose.completion.highlight));
+    frame.render_widget(Clear, rect);
+    frame.render_stateful_widget(table, rect, &mut state);
 }
 
 /// The preview block's title whenever the pane is NOT standing in for a hidden
@@ -2132,11 +2254,17 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     // show and never inspects the compose target, so a docked compose box is never
     // drawn over an unrelated conversation (which reads as a reply to it). It also
     // outlives the editor for one in-flight launch, which is why the card — not
-    // `is_composing` — is what this branches on.
+    // `is_composing` — is what this branches on. The one compose fact the card reads
+    // is whether the pick list is up — the SAME condition `render_help` hands
+    // `compose_hint` — so the card and the help row name the same keys.
+    let list_open = app
+        .compose
+        .as_ref()
+        .is_some_and(|compose| compose.completion.visible.is_some());
     let card = app
         .draft
         .as_ref()
-        .map(|draft| draft_card(draft, &app.launch_dir, app.tick));
+        .map(|draft| draft_card(draft, &app.launch_dir, app.tick, list_open));
     let showing_card = card.is_some();
 
     // Optimistic reply turns for an in-flight send, resolved BEFORE the mutable
@@ -4051,16 +4179,28 @@ fn chord_hint(selected_hidden: bool) -> String {
 /// 80 (pinned by `the_reply_hint_fits_an_eighty_column_terminal`). The background
 /// hint keeps its spelled-out keys: it was already cut at 80, and `Ctrl-L model`
 /// sits right after `Ctrl-O run interactively`, inside the columns that ARE drawn.
-fn compose_hint(target: &ComposeTarget) -> &'static str {
+///
+/// With the pick list OPEN — on either draft — the row shows [`COMPLETION_HINT`]
+/// instead: while the list is up `Enter` picks and `Esc` closes only the list, so
+/// either closed-list hint would name keys that do not do that. The draft CARD
+/// switches with it, through [`draft_hint`], so the card and this row never name
+/// different keys for the same draft.
+fn compose_hint(target: &ComposeTarget, list_open: bool) -> &'static str {
     match target {
+        _ if list_open => COMPLETION_HINT,
         ComposeTarget::Reply { .. } => {
             "Enter send · ^L model · ^J/Alt+Enter newline · PgUp/PgDn scroll · Esc cancel"
         }
-        // The SAME const the draft card shows, so the two surfaces cannot describe
-        // the same keys differently.
+        // The SAME const the draft card shows with the list closed ([`draft_hint`]),
+        // so the two surfaces cannot describe the same keys differently.
         ComposeTarget::NewBackgroundAgent { .. } => BG_DRAFT_HINT,
     }
 }
+
+/// Either draft's hint while the pick list is open — on the help row, and on a
+/// background draft's card too ([`draft_hint`]). Budgeted to the 80-column help
+/// row (pinned by `every_compose_hint_form_fits_an_eighty_column_terminal`).
+const COMPLETION_HINT: &str = "↑/↓ choose · Enter/Tab pick · Esc close list";
 
 /// The bottom help line: the keybinding cheat sheet, a transient board status
 /// (e.g. a resume refusal) when one is set, or the [`chord_hint`] while a `Ctrl-X`
@@ -4099,7 +4239,7 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         // The compose zone owns the keyboard: show its chords instead of the board
         // keymap. Ctrl-J is the primary newline; Alt+Enter the guaranteed fallback.
         Line::from(vec![Span::styled(
-            compose_hint(&compose.target),
+            compose_hint(&compose.target, compose.completion.visible.is_some()),
             Style::default().add_modifier(Modifier::DIM),
         )])
     } else {
@@ -9767,6 +9907,7 @@ mod tests {
             },
             &dir,
             0,
+            false,
         );
         let rows = flat(&card);
         assert_eq!(
@@ -9798,6 +9939,7 @@ mod tests {
                 },
                 &dir,
                 0,
+                false,
             ));
             assert_eq!(
                 rows[0],
@@ -9818,6 +9960,7 @@ mod tests {
                 },
                 &dir,
                 tick,
+                false,
             ))
         };
         let at_zero = launching(0);
@@ -9835,6 +9978,55 @@ mod tests {
             launching(1)[3],
             "the in-flight line must animate off App::tick"
         );
+    }
+
+    /// The draft CARD names the keys the help row names, at every moment: the pick
+    /// list's while it is open, the draft's own while it is closed. A dispatched card
+    /// has no editor and so no list, so its in-flight line wins whatever `list_open`
+    /// says.
+    #[test]
+    fn the_draft_cards_hint_follows_the_pick_list() {
+        let dir = PathBuf::from("/tmp/launch");
+        let tail = |launch_id: Option<u64>, list_open: bool| -> String {
+            let card = draft_card(
+                &NewSessionDraft {
+                    agent: Some("planner".to_string()),
+                    launch_id,
+                },
+                &dir,
+                0,
+                list_open,
+            );
+            assert_eq!(card.len(), 4, "the list grows the card no rows");
+            card[3].to_string()
+        };
+
+        assert_eq!(
+            tail(None, true),
+            COMPLETION_HINT,
+            "with the list open, the card names the list's keys"
+        );
+        assert_eq!(
+            tail(None, false),
+            BG_DRAFT_HINT,
+            "with the list closed, the card names the draft's own keys"
+        );
+        let launching = tail(Some(1), true);
+        assert!(
+            launching.contains(DRAFT_CARD_LAUNCHING),
+            "an in-flight card reports the launch even if a list is said to be open: \
+             {launching:?}"
+        );
+
+        // The two surfaces agree for the BACKGROUND target, the only one with a card.
+        let bg = ComposeState::new_background(None).target;
+        for open in [false, true] {
+            assert_eq!(
+                draft_hint(open),
+                compose_hint(&bg, open),
+                "the card and the help row must name the same keys (list_open={open})"
+            );
+        }
     }
 
     /// The BACKGROUND draft REPLACES the previewed transcript with a placeholder
@@ -10046,7 +10238,7 @@ mod tests {
 
         // The reply hint offers NO interactive escape hatch, and names the scroll keys
         // a reply answers.
-        let reply_hint = compose_hint(&plain.target);
+        let reply_hint = compose_hint(&plain.target, false);
         assert_eq!(
             reply_hint,
             "Enter send · ^L model · ^J/Alt+Enter newline · PgUp/PgDn scroll · Esc cancel",
@@ -10057,7 +10249,7 @@ mod tests {
         );
 
         // The background hint names both verbs, honestly — and its model key.
-        let bg_hint = compose_hint(&ComposeState::new_background(None).target);
+        let bg_hint = compose_hint(&ComposeState::new_background(None).target, false);
         assert!(bg_hint.contains("Enter start in background"), "{bg_hint}");
         assert!(bg_hint.contains("Ctrl-O run interactively"), "{bg_hint}");
         assert!(bg_hint.contains("Ctrl-L model"), "{bg_hint}");
@@ -10081,10 +10273,13 @@ mod tests {
         /// The narrowest terminal the help row is budgeted for.
         const HELP_ROW_BUDGET: usize = 80;
 
-        let reply = compose_hint(&ComposeTarget::Reply {
-            session_id: "s".to_string(),
-            stop_job: None,
-        });
+        let reply = compose_hint(
+            &ComposeTarget::Reply {
+                session_id: "s".to_string(),
+                stop_job: None,
+            },
+            false,
+        );
         assert!(
             reply.width() <= HELP_ROW_BUDGET,
             "the reply hint must fit {HELP_ROW_BUDGET} columns: {} in {reply:?}",
@@ -10098,6 +10293,416 @@ mod tests {
             model_key_end <= HELP_ROW_BUDGET,
             "the background hint's model key must sit inside the drawn columns: ends \
              at {model_key_end}"
+        );
+    }
+
+    /// Every `compose_hint` form (reply/background x list open/closed) is pinned;
+    /// the reply forms fit the 80-column help row WHOLE. The closed background hint
+    /// runs past 80 on purpose (see [`compose_hint`]); with the list open a draft
+    /// shows the reply's list-open hint, since the same keys drive the same list.
+    #[test]
+    fn every_compose_hint_form_fits_an_eighty_column_terminal() {
+        const HELP_ROW_BUDGET: usize = 80;
+        let reply = ComposeTarget::Reply {
+            session_id: "s".to_string(),
+            stop_job: None,
+        };
+        for open in [false, true] {
+            let hint = compose_hint(&reply, open);
+            assert!(
+                hint.width() <= HELP_ROW_BUDGET,
+                "reply hint (list_open={open}) is {} columns: {hint:?}",
+                hint.width()
+            );
+        }
+        assert_eq!(
+            compose_hint(&reply, true),
+            "↑/↓ choose · Enter/Tab pick · Esc close list"
+        );
+        let bg = ComposeState::new_background(None).target;
+        assert_eq!(compose_hint(&bg, true), COMPLETION_HINT);
+        assert_eq!(compose_hint(&bg, false), BG_DRAFT_HINT);
+    }
+
+    #[test]
+    fn completion_rect_sits_above_the_box_and_clips() {
+        let bounds = Rect::new(0, 0, 60, 30);
+        let compose = Rect::new(5, 20, 40, 3);
+        // Normal: 3 rows + 2 borders directly above, same x and width.
+        assert_eq!(
+            completion_rect(compose, 3, bounds),
+            Some(Rect::new(5, 15, 40, 5))
+        );
+        // Capped at the visible-rows constant.
+        let capped = completion_rect(compose, 100, bounds).unwrap();
+        assert_eq!(capped.height as usize, COMPLETION_VISIBLE_ROWS + 2);
+        assert_eq!(capped.y + capped.height, compose.y);
+        // Clipped: only 4 rows of room above.
+        assert_eq!(
+            completion_rect(Rect::new(5, 4, 40, 3), 6, bounds),
+            Some(Rect::new(5, 0, 40, 4))
+        );
+        // No room: a box at the top, or only the borders would fit.
+        assert_eq!(completion_rect(Rect::new(5, 0, 40, 3), 3, bounds), None);
+        assert_eq!(completion_rect(Rect::new(5, 2, 40, 3), 3, bounds), None);
+        assert_eq!(completion_rect(compose, 0, bounds), None);
+    }
+
+    /// A pick-list [`Candidate`] as the tests below build one; the insert text is
+    /// never drawn, so it is just the label without a leading `/`.
+    fn pick(label: &str, description: Option<&str>) -> Candidate {
+        Candidate {
+            label: label.to_string(),
+            insert: label.trim_start_matches('/').to_string(),
+            description: description.map(str::to_string),
+        }
+    }
+
+    /// The name column is the widest label, capped at half the box once any row
+    /// has a description and at the whole box otherwise.
+    #[test]
+    fn the_name_column_fits_the_widest_label_within_its_cap() {
+        const INNER: u16 = 40;
+        let plain = [pick("/a", None), pick("/longer-name", None)];
+        assert_eq!(
+            completion_name_width(&plain, INNER),
+            12,
+            "the widest label, not the first"
+        );
+        let wide = [pick(&"n".repeat(50), None)];
+        assert_eq!(
+            completion_name_width(&wide, INNER),
+            INNER,
+            "with no description the cap is the whole box"
+        );
+        let described = [pick(&"n".repeat(30), None), pick("/x", Some("does x"))];
+        assert_eq!(
+            completion_name_width(&described, INNER),
+            INNER * COMPLETION_NAME_MAX_PERCENT / 100,
+            "one description anywhere keeps half the box for descriptions"
+        );
+        assert_eq!(
+            completion_name_width(&described, INNER + 1),
+            INNER * COMPLETION_NAME_MAX_PERCENT / 100,
+            "the share rounds down, never into the description column"
+        );
+        let short_described = [pick("/longer-name", Some("d"))];
+        assert_eq!(
+            completion_name_width(&short_described, INNER),
+            12,
+            "under the cap a name column is only as wide as its widest label"
+        );
+    }
+
+    /// Widths are TERMINAL COLUMNS: `/日本語` is 4 chars and 10 bytes but 7 columns.
+    #[test]
+    fn the_name_column_counts_terminal_columns() {
+        assert_eq!(completion_name_width(&[pick("/日本語", None)], 40), 7);
+    }
+
+    #[test]
+    fn an_empty_pick_list_has_no_name_column() {
+        assert_eq!(completion_name_width(&[], 40), 0);
+    }
+
+    /// The pick list's box as DRAWN, read off the buffer from the row showing
+    /// `first_label` (the box's first row): its `(left, right)` border columns.
+    /// Asserts the top border above that row is bare `─` corner to corner — the
+    /// list carries no title, whatever its rows hold.
+    fn drawn_pick_list_columns(
+        buffer: &ratatui::buffer::Buffer,
+        first_row: u16,
+        first_label: &str,
+        width: u16,
+    ) -> (u16, u16) {
+        let symbol = |x: u16, y: u16| buffer.cell((x, y)).map_or(" ", |c| c.symbol());
+        let left = column_of(buffer, first_row, width, first_label) - 1;
+        let top = first_row - 1;
+        assert_eq!(symbol(left, top), "┌", "the list's top-left corner");
+        let right = (left + 1..width)
+            .find(|&x| symbol(x, top) == "┐")
+            .expect("the list's top-right corner");
+        let border: String = (left + 1..right).map(|x| symbol(x, top)).collect();
+        assert!(
+            border.chars().all(|c| c == '─'),
+            "the list's top border carries no title: {border:?}"
+        );
+        (left, right)
+    }
+
+    /// Whether any cell of row `y` strictly between the list's borders is
+    /// `REVERSED` — scoped to the list, so the board's own highlight elsewhere on
+    /// the row cannot answer for it.
+    fn reversed_in_pick_list(
+        buffer: &ratatui::buffer::Buffer,
+        y: u16,
+        (left, right): (u16, u16),
+    ) -> bool {
+        (left + 1..right).any(|x| {
+            buffer
+                .cell((x, y))
+                .is_some_and(|c| c.modifier.contains(Modifier::REVERSED))
+        })
+    }
+
+    /// The pick list draws as an UNTITLED table directly above the compose box:
+    /// each name on the left and its description `DIM` on the right, every
+    /// description in ONE column a gap away, a description too long for the box
+    /// cut inside its right border, a row with no description drawn as its label
+    /// alone, and only the highlighted row `REVERSED`. Every column is read off the
+    /// buffer rather than from the geometry under test.
+    #[test]
+    fn an_open_pick_list_draws_above_the_compose_box_with_a_reversed_highlight() {
+        /// Fits the docked list's description column.
+        const SHORT_DESCRIPTION: &str = "runs alpha";
+        /// Wider than the whole box, and blank-free, so wherever the cell cuts it
+        /// the last drawn column is a glyph.
+        const LONG_DESCRIPTION: &str = "beta-carries-a-description-far-wider-than-the-list-box";
+        /// Enough of [`LONG_DESCRIPTION`] to find its (cut) start by.
+        const LONG_DESCRIPTION_HEAD: &str = "beta-carries";
+
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.set_pane_layout(DOCK_LAYOUT);
+        let mut compose = ComposeState::new_reply("sess-normal-1".to_string(), None);
+        compose.completion.visible = Some(vec![
+            pick("/alpha-skill", Some(SHORT_DESCRIPTION)),
+            pick("/beta-skill", Some(LONG_DESCRIPTION)),
+            pick("/gamma-cmd", None),
+        ]);
+        compose.completion.highlight = 1;
+        app.compose = Some(compose);
+        let (w, h) = DOCK_BOARD;
+        let buffer = drawn_board(&mut app, w, h);
+        let symbol = |x: u16, y: u16| buffer.cell((x, y)).map_or(" ", |c| c.symbol());
+        let find = |needle: &str| (0..h).find(|&y| full_row_text(&buffer, y, w).contains(needle));
+        let width_of = |s: &str| u16::try_from(s.width()).expect("a label narrower than a row");
+
+        for y in 0..h {
+            let row = full_row_text(&buffer, y, w);
+            assert!(
+                !row.contains(" skills ") && !row.contains(" files "),
+                "no kind title is drawn (row {y}): {row:?}"
+            );
+        }
+        let alpha = find("/alpha-skill").expect("the first pick is drawn");
+        let beta = find("/beta-skill").expect("the second pick is drawn");
+        let gamma = find("/gamma-cmd").expect("the third pick is drawn");
+        let reply_title = (0..h)
+            .filter(|&y| full_row_text(&buffer, y, w).contains("reply to"))
+            .max()
+            .expect("the compose box title is drawn");
+        assert_eq!(
+            (beta, gamma),
+            (alpha + 1, alpha + 2),
+            "rows are consecutive"
+        );
+        assert!(gamma < reply_title, "the list is ABOVE the compose box");
+        let (left, right) = drawn_pick_list_columns(&buffer, alpha, "/alpha-skill", w);
+        let name_x = left + 1;
+
+        // A name and its description share ONE row, only blanks between them.
+        let alpha_end = name_x + width_of("/alpha-skill");
+        let description_x = column_of(&buffer, alpha, w, SHORT_DESCRIPTION);
+        assert!(
+            description_x >= alpha_end + COMPLETION_COLUMN_GAP,
+            "a description sits at least the gap past its name: {alpha_end} -> {description_x}"
+        );
+        assert!(
+            (alpha_end..description_x).all(|x| symbol(x, alpha) == " "),
+            "only blanks between a name and its description"
+        );
+        assert_eq!(
+            column_of(&buffer, beta, w, LONG_DESCRIPTION_HEAD),
+            description_x,
+            "every description starts in the same column"
+        );
+        let dim = |x: u16, y: u16| {
+            buffer
+                .cell((x, y))
+                .is_some_and(|c| c.modifier.contains(Modifier::DIM))
+        };
+        assert!(dim(description_x, alpha), "a description is DIM");
+        assert!(!dim(name_x, alpha), "a name is not");
+
+        // A description longer than the box runs to its inner edge and stops.
+        assert!(
+            !full_row_text(&buffer, beta, w).contains(LONG_DESCRIPTION),
+            "a too-long description is cut, not drawn whole"
+        );
+        assert_ne!(
+            symbol(right - 1, beta),
+            " ",
+            "it fills its column to the edge"
+        );
+        assert_eq!(symbol(right, beta), "│", "and the right border survives it");
+
+        // A row with no description is its label alone.
+        assert_eq!(column_of(&buffer, gamma, w, "/gamma-cmd"), name_x);
+        assert!(
+            (name_x + width_of("/gamma-cmd")..right).all(|x| symbol(x, gamma) == " "),
+            "nothing is drawn after a description-less label"
+        );
+
+        assert!(
+            reversed_in_pick_list(&buffer, beta, (left, right)),
+            "the highlighted row is REVERSED"
+        );
+        for other in [alpha, gamma] {
+            assert!(
+                !reversed_in_pick_list(&buffer, other, (left, right)),
+                "row {other} is not highlighted"
+            );
+        }
+    }
+
+    /// A `Ctrl-N` background draft draws the same list, in the same place, and
+    /// its help row names the list's keys while the list is up.
+    #[test]
+    fn an_open_pick_list_draws_above_a_background_draft_too() {
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.set_pane_layout(DOCK_LAYOUT);
+        let mut compose = ComposeState::new_background(None);
+        compose.completion.visible = Some(vec![
+            pick("notes.txt", None),
+            pick("sby (agent)", Some("pings back")),
+        ]);
+        compose.completion.highlight = 1;
+        app.open_compose(compose, Some(NewSessionDraft::default()));
+        let (w, h) = DOCK_BOARD;
+        let buffer = drawn_board(&mut app, w, h);
+        let find = |needle: &str| (0..h).find(|&y| full_row_text(&buffer, y, w).contains(needle));
+
+        let notes = find("notes.txt").expect("the file is drawn");
+        let agent = find("sby (agent)").expect("the agent is drawn");
+        let draft_title = (0..h)
+            .filter(|&y| full_row_text(&buffer, y, w).contains("new background agent"))
+            .max()
+            .expect("the draft's compose box title is drawn");
+        assert_eq!(agent, notes + 1, "rows are consecutive");
+        assert!(
+            agent < draft_title,
+            "the list is ABOVE the draft's compose box"
+        );
+        let columns = drawn_pick_list_columns(&buffer, notes, "notes.txt", w);
+        assert_eq!(
+            column_of(&buffer, agent, w, "pings back"),
+            columns.0
+                + 1
+                + u16::try_from("sby (agent)".width()).expect("a short label")
+                + COMPLETION_COLUMN_GAP,
+            "the description sits the gap past the name column"
+        );
+        assert!(
+            reversed_in_pick_list(&buffer, agent, columns),
+            "the highlighted row is REVERSED"
+        );
+        assert!(
+            !reversed_in_pick_list(&buffer, notes, columns),
+            "the other row is not"
+        );
+        assert!(
+            find(COMPLETION_HINT).is_some(),
+            "the help row names the open list's keys on a draft too"
+        );
+    }
+
+    /// A board wide enough that the preview pane holds [`COMPLETION_HINT`] on ONE
+    /// card row, so the card's hint row can be read whole.
+    const WIDE_DRAFT_BOARD: (u16, u16) = (120, 30);
+
+    /// The draft CARD swaps its hint with the help row: while a `Ctrl-N` draft's
+    /// pick list is open, the card's hint row names the list's keys, and no surface
+    /// on the board still offers `Enter start in background`.
+    ///
+    /// Read off the card's OWN row, not the board at large: the help row shows
+    /// [`COMPLETION_HINT`] too, so a board-wide search for it would pass with the
+    /// card unchanged.
+    #[test]
+    fn an_open_pick_list_swaps_the_draft_cards_hint_too() {
+        const BG_ENTER: &str = "Enter start in background";
+        let (w, h) = WIDE_DRAFT_BOARD;
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.set_pane_layout(DOCK_LAYOUT);
+        crate::tui::compose::open_background(&mut app, Some("planner".to_string()));
+        let rows = |app: &mut App| -> Vec<String> {
+            let buffer = drawn_board(app, w, h);
+            (0..h).map(|y| full_row_text(&buffer, y, w)).collect()
+        };
+        // The hint is the card's fourth row: headline, launch dir, blank, keys.
+        let hint_row = |rows: &[String]| -> usize {
+            rows.iter()
+                .position(|row| row.contains(DRAFT_CARD_HEADLINE))
+                .expect("the draft card is drawn")
+                + 3
+        };
+
+        // Control: with the list closed that row names the draft's own keys, so the
+        // row arithmetic points at the card's hint and the swap below can be seen.
+        let closed = rows(&mut app);
+        let at = hint_row(&closed);
+        assert!(
+            closed[at].contains(BG_ENTER),
+            "premise: row {at} is the card's hint row: {closed:#?}"
+        );
+
+        app.compose
+            .as_mut()
+            .expect("the draft's editor is open")
+            .completion
+            .visible = Some(vec![pick("notes.txt", None)]);
+        let open = rows(&mut app);
+        assert_eq!(
+            hint_row(&open),
+            at,
+            "opening the list does not move the card"
+        );
+        assert!(
+            open[at].contains(COMPLETION_HINT),
+            "the card names the open list's keys: {open:#?}"
+        );
+        assert!(
+            !open.iter().any(|row| row.contains(BG_ENTER)),
+            "no surface may offer the closed-list Enter while the list is open: {open:#?}"
+        );
+    }
+
+    /// With no description anywhere the list is ONE column, so a name exactly as
+    /// wide as the box is drawn whole: a second, always-empty column would still
+    /// cost its gap and cut the name short.
+    #[test]
+    fn a_list_without_descriptions_gives_its_names_the_whole_box() {
+        let label = "n".repeat(usize::from(DOCK_EDITOR_WIDTH));
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.set_pane_layout(DOCK_LAYOUT);
+        let mut compose = ComposeState::new_reply("sess-normal-1".to_string(), None);
+        compose.completion.visible = Some(vec![pick(&label, None)]);
+        app.compose = Some(compose);
+        let (w, h) = DOCK_BOARD;
+        let buffer = drawn_board(&mut app, w, h);
+        let row = (0..h)
+            .find(|&y| full_row_text(&buffer, y, w).contains(&label))
+            .expect("a name as wide as the box is drawn whole");
+        let (left, right) = drawn_pick_list_columns(&buffer, row, &label, w);
+        assert_eq!(
+            right - left - 1,
+            DOCK_EDITOR_WIDTH,
+            "the premise: the name fills the list's inner width exactly"
         );
     }
 
@@ -10677,6 +11282,7 @@ mod tests {
             app.draft.as_ref().expect("the draft card is open"),
             &app.launch_dir,
             app.tick,
+            false,
         );
         assert!(
             wrapped_text_rows(&card, width - 2) <= inner_height,

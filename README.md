@@ -109,10 +109,11 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | `Alt+←` / `Alt+→` (`⌥←` / `⌥→`) / `Alt+B` / `Alt+F` / `Ctrl-←` / `Ctrl-→` | Move the **cursor in your search** one **word**, landing where a word jump in the reply box does: forward goes to the start of the next word. Depending on the terminal, `⌥←` / `⌥→` arrives as `Alt+←` / `Alt+→` or as `Alt+B` / `Alt+F`, so both are bound; `Ctrl-←` / `Ctrl-→` does the same without Option. The list and the preview stay where they are |
 | `Enter` | **Resume** the selected session, returning to the board when it exits. On a **running** session it opens an **Attach / Fork / Cancel** choice instead |
 | `Ctrl-F` | **Fork** the selected session into a copy — available for any session, running or not |
-| `Ctrl-N` | **Start a new session** in the launch directory; if you have Claude Code agents defined, pick one first (or `default (no agent)`). Then a **draft box** opens for the session's first message: `Enter` launches it with `claude --bg` and leaves you on the board, `Ctrl-O` runs it interactively instead, `Ctrl-L` picks its model, `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels. Your message is sent as the session's first turn either way |
+| `Ctrl-N` | **Start a new session** in the launch directory; if you have Claude Code agents defined, pick one first (or `default (no agent)`). Then a **draft box** opens for the session's first message: `Enter` launches it with `claude --bg` and leaves you on the board, `Ctrl-O` runs it interactively instead, `Ctrl-L` picks its model, `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels, and a `/` or `@` opens the pick list (the `/` or `@` row below). Your message is sent as the session's first turn either way |
 | `Ctrl-O` (in that picker) | **Start the highlighted agent interactively at once**, skipping the draft — the same thing `Ctrl-O` means inside the draft box, so either route out of the picker is one keypress |
-| `Ctrl-R` | **Quick reply** — send a one-shot message to the selected session without leaving the board. A background agent whose run is over (`done`, `stopped`, `failed`) is stopped first so the reply lands in place; a waiting one (`needs input`) asks you to confirm that stop; one that is still live (`working`, `idle`, `interrupted`, or a state this version doesn't recognize) is left alone and refused, and so is a session with no background job to stop first (a `live` one, for instance); the refusal suggests `Ctrl-K` or Fork instead. While a session's own reply is still being sent, `Ctrl-R` on that session is refused until it lands; replies to other sessions can go out at the same time. Opens a compose box (`Enter` sends, `Ctrl-L` picks the model, `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels) |
+| `Ctrl-R` | **Quick reply** — send a one-shot message to the selected session without leaving the board. A background agent whose run is over (`done`, `stopped`, `failed`) is stopped first so the reply lands in place; a waiting one (`needs input`) asks you to confirm that stop; one that is still live (`working`, `idle`, `interrupted`, or a state this version doesn't recognize) is left alone and refused, and so is a session with no background job to stop first (a `live` one, for instance); the refusal suggests `Ctrl-K` or Fork instead. While a session's own reply is still being sent, `Ctrl-R` on that session is refused until it lands; replies to other sessions can go out at the same time. Opens a compose box (`Enter` sends, `Ctrl-L` picks the model, `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels, and a `/` or `@` opens the pick list — the `/` or `@` row below) |
 | `Ctrl-L` (in a reply or draft box) | **Pick the model** — and, with `←` / `→`, its **effort** — for **this message only**. The box's bottom border names what it will run on: a reply says `model: session (Opus 5.5)`, the model that session last answered with, which Claude Code normally keeps on its own; a draft says `model: default (opus[1m]) (new sessions only)` when your Claude Code settings name a model. Either says plain `model: default` when there is nothing to name. `--model` / `--effort` are sent only when you pick something; the picker's first row goes back to the default. Every new box starts at the default, and nothing is remembered. `Enter` resume, `Ctrl-F` fork and Attach never send a model |
+| `/` or `@` (in a reply or draft box) | **Pick a skill, command, file or agent** — the same list in a `Ctrl-R` reply and a `Ctrl-N` draft. `/` as the very first character lists the skills and commands Claude Code offers in that folder, built-in ones included; `@` at the start of a word lists files and folders (`@src/tu` narrows inside `src/`) and, for a top-level `@`, the folder's agents, inserted as `@agent-<name>`. A skill, command or agent shows its description on the right. The letters you type narrow the list by the start of the name. While it is open `↑` / `↓` choose, `Enter` or `Tab` picks (a folder reopens the list one level down), and `Esc` closes only the list — never the draft; with no list open `Enter` and `Esc` do what the box's own row says. Where the list comes from is under *Quick reply without leaving the board* |
 | `Ctrl-K` | **Stop / interrupt** the selected session's live agent. On a background agent it runs `claude stop`: one whose run is over (`done`, `stopped`, `failed`) stops immediately; every other live agent (`working`, `needs input`, `idle`, `interrupted`, unrecognized) confirms first, since stopping ends the live job (its conversation is kept). A session with no background job (a `live` one, typically) has no job to stop, so if Claude Code reports a process id for it, `Ctrl-K` offers to send that process a **SIGTERM** instead: the confirmation shows the pid, and nothing is sent unless Claude Code still reports that same pid when you press `Enter`. A session that isn't running as an agent has nothing to stop, and neither does one Claude Code reports with no job and no process id that can be signalled |
 | `Ctrl-X` then `x` / `d` / `h` / `r` / `y` / `f` | **Leader chord** that acts on the selected row (`x`, `d`, `y`, `f`) or on the whole board (`h`, `r`) — `x` **hides** the selected session (reversible, persisted), `d` **hard-deletes** it after a confirmation that can take just that row or its whole `(+N)` stack, `h` toggles **show hidden**, `r` **re-reads every transcript from disk**, `y` is **copy session ID**: the selected session's full id goes to your clipboard and shows on the status line, `f` **folds** / **expands** a stack of look-alike rows that are really one conversation — a row marked `(+N)` stands for `N` more; `f` opens it, and folds it back from any of its rows. Any other key cancels the chord |
 | `←` / `→` (in the model picker) | **Step the highlighted model's effort** down / up: `default effort` (no `--effort`, your settings decide) → `low` → `medium` → `high` → `xhigh` → `max`, wrapping round both ways. `Enter` sets the model and the effort together into the box; `Esc` goes back to the box with your text and its previous choice untouched. They do nothing on the picker's first (default) row, and nothing in the agent picker — and inside either picker they never move the search cursor on the board underneath |
@@ -468,6 +469,14 @@ starts working in the background, and you never leave the board — it shows up 
 the list a moment later with a live badge, ready to `Ctrl-K` stop or `Ctrl-R`
 reply to like any other.
 
+The draft box has the same `/` and `@` pick list as a quick reply (see *Quick
+reply without leaving the board* below), for the folder you launched from. Its
+files and folders show at once; its skills, commands and agents appear once
+Claude Code's list for that folder arrives. A reply can offer the agents its
+transcript recorded in the meantime, but a session that does not exist yet has no
+transcript. If Claude Code doesn't trust that folder, the list leaves out the
+repository's own skills, commands and agents (why is below).
+
 **Or take the terminal instead.** `Ctrl-O` runs the agent interactively, handing
 you the terminal as usual. It works from the draft box (if you change your mind
 mid-sentence, your draft comes along as the first turn) *and* straight from the
@@ -493,7 +502,18 @@ context, appends the exchange in place, and the reply shows up in the preview, a
 while the board stays up. The box is a real multiline editor — arrows move the
 caret, long lines soft-wrap, and it grows from one line as you type (`Ctrl-J` or
 `Alt+Enter` for a newline, `Enter` to send, `Ctrl-L` to pick the model this one
-message runs on — see *Pick the model for one message* below). The moment you
+message runs on — see *Pick the model for one message* below). Type `/` at the
+very start to list the skills and commands Claude Code offers in the session's
+folder — built-in ones such as `/compact` included, but not the ones Claude Code
+hides from its own `/` menu — or `@` (at the start of a word) to list files and
+folders under the session's working directory and, for a top-level `@`, the
+folder's agents; picking one inserts `@agent-<name>`, the form Claude Code
+documents for naming an agent in a message. Skills, commands and agents show
+their description on the right, cut at the box's edge; the letters you type
+narrow the list by the start of the name. While a list is open `↑`/`↓` choose,
+`Enter` or `Tab` picks (a folder reopens the list one level down), and `Esc`
+closes only the list — it never discards the draft; with no list open `Enter`
+sends and `Esc` cancels as usual. The moment you
 send, your message appears in the preview under a **you** turn, followed by a live **claude
 cooking…** placeholder — so the exchange reads normally while the reply is still
 in flight. The placeholder is replaced in place as `claude` writes the
@@ -505,6 +525,25 @@ until a session's reply lands, `Ctrl-R` on that session is refused before a
 compose box opens (so nothing you type is lost), while every other row can still
 reply. That per-session record is also what lets the hard delete below keep
 refusing a session while its reply is still being written.
+
+The `/` and `@` list is Claude Code's own for that folder: the first time you open
+a box there, snapback asks `claude` for it in the background — no message is sent
+and nothing is written to your sessions — and keeps the answer until you quit.
+Until it arrives (normally well under a second) `/` shows nothing yet, and a
+reply's `@` offers the agents its own transcript recorded; files and folders
+show at once. If `claude` could not answer, it stays that way and the next box
+you open in that folder asks again. A command typed in full works without the
+list, so a skill you create after a folder's list arrived still works when typed,
+and is listed once you restart snapback.
+
+In a folder Claude Code hasn't been told to trust (you never accepted its trust
+prompt there, or in a folder whose trust covers it), the list shows your own,
+bundled and built-in skills, commands and agents, but not the repository's own
+`.claude/` ones. Listing those would mean starting Claude Code with that
+repository's settings, which can run commands and set environment variables, just
+because a box opened, so there snapback asks with your own settings only. Typed
+in full, the repository's own skills still work. To see them listed, run `claude`
+in the repository once and accept its trust prompt, then restart snapback.
 
 Background agents get special handling, because `claude` won't resume a session
 it's still holding as an agent. An agent whose run is **over** — `done`, or

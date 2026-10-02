@@ -5,10 +5,12 @@ Everything here is captured from the live CLI (`claude --help` and each
 `claude <cmd> --help`), not from this repo — it is the "what does Claude Code
 actually expose" quick-review sheet the rest of the docs assume.
 
-`snapback` never links `claude`; it spawns it as a child (resume/fork/attach/send)
-and reads `claude agents --json`. On ONE route it also sends a SIGTERM to a `pid`
-that `claude agents --json` reported. That is not a `claude` invocation, and it is
-listed [below](#how-snapback-drives-claude) so the boundary stays visible. The
+`snapback` never links `claude`; it spawns it as a child (resume/fork/attach/send,
+and the compose pick list's catalog fetch) and reads `claude agents --json`. On
+ONE route it also sends a SIGTERM to a `pid` that `claude agents --json` reported. That is not a `claude` invocation, and it is
+listed [below](#how-snapback-drives-claude) so the boundary stays visible. For the
+catalog fetch alone it also READS, never writes, claude's own workspace-trust
+record ([Workspace trust](#workspace-trust-what-an-untrusted-folder-can-run-and-the-two-argv-forms)). The
 terminal-safety and authoritative-from-file rules around those spawns live in
 [PATTERNS.md](PATTERNS.md) and
 [ARCHITECTURE.md](ARCHITECTURE.md); the runtime "`claude` on `PATH`" prerequisite
@@ -32,6 +34,10 @@ carry `id` and `pid`, and what `kind: "interactive"` turned out to denote) is
 measured separately in [DOMAIN.md](DOMAIN.md#reported-agents-srcagentsrs). It was
 captured at 2.1.278 and spot-checked at 2.1.280 with the same nine-key union, and
 again at 2.1.282 ([DOMAIN.md, Sample E](DOMAIN.md#observed-value-distribution)).
+The `initialize` control handshake is pinned separately too, at 2.1.284, in
+[its own section](#the-initialize-control-handshake-compose-pick-list), with the
+workspace-trust rule the fetch's form depends on: both are probed or read out of
+the bundle, not `--help` captures, and the refresh below does not re-verify them.
 
 - **Installed == pinned** → this doc matches the live CLI. Trust it.
 - **Installed < pinned** → the local install is **behind this doc**. Newer flags
@@ -64,6 +70,7 @@ inline test asserting the exact string, so drift here is caught by
 | Release a held job before a reply, or interrupt a selected agent (`Ctrl-K`) | `claude stop <job-id>` | `send::build_stop_argv` |
 | Detect live agents (gate probe) | `claude agents --json` | `agents::live_agents_argv` (`src/agents.rs`) |
 | Detect live agents (incl. just-finished) | `claude agents --json --all` | `agents::agents_argv` |
+| List a folder's slash commands and agents (compose pick list) | In a folder claude TRUSTS: `claude -p --input-format stream-json --output-format stream-json --verbose --no-session-persistence --strict-mcp-config --settings {"disableAllHooks":true}`. In ANY OTHER folder: the same, followed by `--setting-sources user`, and with `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1` added to the CHILD's environment (never snapback's own). Either runs IN that folder, with ONE stdin line holding the object `{"type":"control_request","request_id":"snapback-catalog","request":{"subtype":"initialize"}}` and then EOF (see [the handshake](#the-initialize-control-handshake-compose-pick-list) and [the two forms](#workspace-trust-what-an-untrusted-folder-can-run-and-the-two-argv-forms)) | `claude_catalog::build_catalog_argv(FolderTrust)` and, for the child's environment, `build_catalog_env(FolderTrust)` (+ `initialize_request_line`) (`src/claude_catalog.rs`); the verdict from `claude_trust::folder_trust` (`src/claude_trust.rs`), read on the fetch's worker thread |
 | `Ctrl-K` on a reported session with NO job id but a `pid` | **none: NOT a `claude` invocation.** A `kill(2)` sending `SIGTERM` (never `SIGKILL`) to the `pid` that `claude agents --json` (the bare probe above) reported, after a confirm and a re-probe at `Enter` | `send::signal_plan` (pure: re-verify the pid against the fresh record) → `send::signal_target` (pure: a strictly positive `pid_t`, or refuse) → `send::signal_term` (the syscall; no test calls it) |
 
 The last row is the deliberate exception to "every row is an argv builder": it
@@ -167,6 +174,864 @@ ordinary success rather than to a fabricated failure.
 snapback neither sets nor overrides claude's background-wait ceiling: the ceiling
 is claude's to own, and snapback's job is only to REPORT what it did. Do not add
 an env override to paper over it.
+
+## The `initialize` control handshake (compose pick list)
+
+> **Captured against `claude 2.1.284`, 2026-09-30.** Pinned separately from the
+> [command surface](#version-pin-self-healing) (still 2.1.282): this is a probe of
+> one undocumented wire exchange, not a `--help` capture.
+> **Added 2026-10-02, same `claude 2.1.284`:** the built-ins claude hides from its
+> own `/` menu, the two skill visibility flags against a transcript's
+> `skill_listing`, and the two agent-mention forms, by probe, by reading the same
+> bundle and from claude's docs.
+> **Also read 2026-10-02, from the 2.1.284 bundle and the 2.1.280 / 2.1.282
+> bundles:** claude's print-mode command gate, and the hidden commands whose name
+> is a variable or a factory argument.
+
+The compose pick list's PRIMARY source, asked for by `src/claude_catalog.rs`. What
+the list does with the answer is
+[DOMAIN.md](DOMAIN.md#compose-pick-list)'s; this section records only what
+`claude` did. Every probe ran with cwd = a fresh `mktemp -d` directory, with
+`~/.claude/projects` listed before and after, and every directory a probe created
+was removed afterwards.
+
+**Wire shape.** The argv is the [table row above](#how-snapback-drives-claude).
+`--verbose` is REQUIRED: without it claude exits 1 with
+`Error: When using --print, --output-format=stream-json requires --verbose`. Stdin
+carries one line, `{"type":"control_request","request_id":"<id>","request":{"subtype":"initialize"}}`,
+and the answer is one stdout line:
+
+```json
+{"type":"control_response","response":{"subtype":"success","request_id":"<id>","response":{"commands":[…],"agents":[…],…}}}
+```
+
+- `commands` is an array of `{name, description, argumentHint[, aliases][, builtin]}`
+  and `agents` an array of `{name, description[, model]}`.
+- The body carries 17 more keys snapback ignores (`models`, `output_style`, `pid`,
+  `session_state`, …). One of them, `account`, carries the user's account
+  identity: `claude_catalog` never reads it, and a captured reply must never be
+  logged, pasted or committed with it.
+- Every command and agent observed carried a non-empty `description`. User and
+  project command descriptions end in a source tag (` (user)` / ` (project)`);
+  bundled and built-in ones carry none.
+- An unknown subtype answers
+  `{"type":"control_response","response":{"subtype":"error","request_id":"<id>","error":"Unsupported control request subtype: …"}}`.
+- Size: ~34 KB for 74 commands and 15 agents.
+
+A trimmed sample (descriptions shortened, every other body key removed; the
+parser's fixture, `tests/fixtures/claude_catalog/initialize_response.json`, is a
+six-command, three-agent cut of the same reply with its descriptions whole):
+
+```json
+{"type":"control_response","response":{"subtype":"success","request_id":"sb-v","response":{
+  "commands":[
+    {"name":"sbz","description":"Probe command Z for snapback (project)","argumentHint":"word"},
+    {"name":"cr-review","description":"Independently review the current branch's changes … (user)","argumentHint":""},
+    {"name":"code-review","description":"Review the current diff, …","argumentHint":"[low|medium|high|xhigh|max] …","aliases":["review"],"builtin":true},
+    {"name":"compact","description":"Free up context by summarizing the conversation so far","argumentHint":"<optional custom summarization instructions>","builtin":true}],
+  "agents":[
+    {"name":"Explore","description":"Fast read-only search agent for locating code. …","model":"inherit"},
+    {"name":"sby-agent","description":"Probe agent Y for snapback","model":"haiku"}]}}}
+```
+
+**No model call.** No `result` message, no cost and no `assistant` message in any
+run: no user message is ever sent.
+
+**Latency** (wall clock, request written then stdin closed): default flags 0.69 s
+cold, then 0.50–0.53 s and 0.39 s; `--strict-mcp-config` alone 0.29 s; snapback's
+flags 0.21–0.22 s, the reply line at ~0.19 s.
+
+**Hooks and MCP.** By default the user's `SessionStart` hooks FIRE (their
+`{"type":"system","subtype":"hook_started","hook_name":"SessionStart:startup",…}`
+lines come first) and MCP servers START. Neither delays the reply much, but a slow
+hook delayed the EXIT ~2 s after EOF. MCP prompts are NOT in the reply: they
+arrive later as `{"type":"system","subtype":"commands_changed","commands":[…]}`
+lines (74 → 79 → 81 names, each `<server>:<prompt> (MCP)`). With
+`--settings '{"disableAllHooks":true}'` no hook event is emitted and the command
+and agent lists are identical (74/15), which is why the fetch passes it beside
+`--strict-mcp-config`, in BOTH argv forms: the fetch is not a session the user
+started. Hooks and MCP servers are not all a folder's settings can run, though:
+its `env` block and helper commands such as `apiKeyHelper` apply too, and neither
+flag stops them. Where claude does not trust the folder, `--setting-sources user`
+is what keeps the repository's settings out
+([Workspace trust](#workspace-trust-what-an-untrusted-folder-can-run-and-the-two-argv-forms)).
+Nor is everything that runs a setting: claude's own git prefetch is not, so
+neither `disableAllHooks`, `--strict-mcp-config` nor `--setting-sources user`
+stops it (the same section). `--bare` (43/5) and `--setting-sources ''` (46/5)
+DROP the user's skills and agents, so neither is usable; `--setting-sources user`
+keeps them.
+
+**EOF, SIGTERM and SIGKILL.** With stdin a real pipe (what `Stdio::piped()`
+gives), closing it after the request makes claude answer and exit 0, 25–50 ms
+after EOF with snapback's flags (~2 s with the defaults, the slow hook above). A
+harness that fed stdin through a named FIFO saw the child ignore EOF for more
+than 20 s — a macOS FIFO artifact, reproduced also when an unrelated child
+inherited the FIFO's write end, and never seen with a pipe; it is why the fetch
+carries a timeout and a kill all the same. SIGTERM exits 143 and claude removes
+its registry files; SIGKILL exits 137 and leaves `~/.claude/sessions/<pid>.json`,
+`<pid>.<hash>.key` and `/tmp/cc-socks/<pid>.sock` behind (the `.json` is pruned by
+claude's next `claude agents --json --all`). The fetch's kill is that SIGKILL,
+sent to the child's process group AND to the child itself: the child is spawned as
+the leader of a group of its own, and a timed-out fetch ends that group with
+`killpg(2)` (`claude_catalog::kill_group`) and the child with `Child::kill`
+([PATTERNS.md §6](PATTERNS.md#6-off-ui-thread-for-anything-that-can-block) owns
+the worker's contract and why it needs both). A timeout is the only path that
+kills: stdout closed by 0.24 s in every form probed, so a normal fetch is never
+signalled.
+
+**No transcript.** Across 20+ handshake runs — every flag variant, immediate and
+held-open stdin, SIGTERM and SIGKILL — no `<encoded-cwd>` folder and no `.jsonl`
+appeared in `~/.claude/projects`, so the fetch cannot put a stub row on the board;
+`--no-session-persistence` is passed anyway. What EVERY run leaves inside claude's
+own state, as any `claude -p` snapback spawns does: an empty
+`~/.claude/session-env/<session-id>/` directory, a transient
+`~/.claude/sessions/<pid>.json` (above) and a
+`~/.claude/backups/.claude.json.backup.<ts>`; no `~/.claude.json` project entry for
+the folder. While alive (~0.2 s) the child is listed by `claude agents --json --all`
+as `kind: "interactive"`, `status: "idle"`, with a `sessionId` that has no
+transcript. The MODEL-CALL probes below did create
+`~/.claude/projects/<encoded>/memory/` and `<id>/subagents/*.meta.json`, even under
+`--no-session-persistence`; the handshake makes no model call and never did.
+
+**`cwd` scopes the answer.** A folder holding `.claude/skills/sbx-skill/SKILL.md`,
+`.claude/commands/sbz.md` and `.claude/agents/sby-agent.md` listed `sbx-skill`
+(`… (project)`), `sbz` (`argumentHint: "word"`) and the agent `sby-agent`
+(`model: "haiku"`); a second fresh folder listed none of them (77/16 against
+74/15). That was the trusted form's argv in a folder claude never trusted. Print
+mode skips the workspace-trust dialog, so that argv LOADS such a folder's project
+settings, its `env` block and helper commands with them, not only its items (only
+its hooks stay off, through `disableAllHooks`). A folder claude does not trust is
+therefore fetched in the untrusted form, which lists none of its own items
+([Workspace trust](#workspace-trust-what-an-untrusted-folder-can-run-and-the-two-argv-forms)).
+
+**Built-ins, hidden built-ins and two visibility flags.** Built-in commands carry
+`builtin: true`: `clear` (aliases `reset`, `new`), `compact`, `model`, `context`,
+`init`, `usage`, `code-review` (alias `review`), …. `/exit` is absent. Found on
+2026-10-02, by reading the 2.1.284 bundle (and, for the gate and the drift, the
+2.1.280 and 2.1.282 bundles) and by probe:
+
+- **claude hides some built-ins from its own `/` menu, and the reply cannot say
+  which.** A command object may declare `isHidden`. claude's interactive `/`
+  typeahead skips every hidden command, with one exception: a hidden command whose
+  name EXACTLY equals the typed query is offered first. There is no `__` naming
+  rule and no feature flag on that path. The `initialize` reply never carries the
+  flag: its `commands` pass claude's print-mode gate (next bullet), then one
+  filter (`REr`, below), then one mapper (`Znn` in the bundle) that emits exactly
+  `{name, description, argumentHint, aliases?, builtin?}`. `reload_plugins` and
+  `reload_skills` answer through the same mapper, and `get_skills_dialog` lists
+  skills only. A menu-facing variant that
+  does skip hidden commands exists, but only the remote-control bridge uses it,
+  behind a server flag (`tengu_bridge_initialize_commands`, default off). So no
+  control request snapback could send says which built-in is hidden, and a hidden
+  one has the same shape as a visible one:
+
+  ```json
+  {"name":"__remote-workflow","description":"Run the workflow script …","argumentHint":"","builtin":true}
+  {"name":"compact","description":"Free up context …","argumentHint":"<optional custom summarization instructions>","builtin":true}
+  ```
+
+- **Only a command claude's print-mode gate passes can reach the reply.** The
+  gate is one predicate, `function lxe(e){return e.type==="prompt"&&!e.disableNonInteractive||e.type==="local"&&e.supportsNonInteractive}`:
+  it keeps a `local` command whose `supportsNonInteractive` is truthy and a
+  `prompt` command without `disableNonInteractive`, and a `local-jsx` command
+  never passes. Its wrapper (`yae`) returns an empty list when slash commands are
+  disabled (`disableSlashCommands()`). The stdin `initialize` handler answers
+  `{commands: jK(e), …}` over `Yn()`, whose merge (`zyt`) joins the gated list
+  (`Ts`, every assignment of which is the wrapper's result) with the MCP commands
+  (prompts, never built-ins) and dedups against synced skills. Those minified
+  names are 2.1.284's; 2.1.282 (`KTe`) and 2.1.280 (`_Te`) carry the same gate
+  body under other names. So a hidden command the gate refuses can never be in the reply,
+  and only a hidden built-in that passes it needs the pinned list.
+- **Five built-ins in the reply are hidden in claude's own menu.** The reply held
+  76 commands (46 `builtin: true`) and 17 agents. Five of the built-ins declare a
+  LITERAL `isHidden: !0`: `__remote-workflow`, `workflow-launch-exec`, `heapdump`
+  ("Dump the JS heap to the Desktop…"), `agents` ("(removed) Ask Claude to
+  create/manage subagents…") and `extra-usage` ("Renamed to /usage-credits").
+  Every other one has no `isHidden`, or an `isHidden` GETTER that is false
+  whenever the command is enabled in print mode (`model`, `config` and `usage`
+  also have a visible interactive twin of the same name). 21 gate-passing
+  commands carry such a getter at 2.1.284 and 2.1.282 (20 at 2.1.280). Most read
+  `return!Ce()`, where `Ce()` is `!isInteractive()`; `import`
+  (`!uge()||!Ce()` against `isEnabled:()=>uge()&&Ce()`) and `advisor`
+  (`!Ce()||!xw()` against `isEnabled:()=>Ce()&&xw()`) are true in print mode only
+  while the command is disabled there. A getter that turns true only in an
+  interactive session (`fast` without fast mode) is not mirrored: the reply
+  carries neither its condition nor its result.
+- **The bundle's literal-hidden commands, through the gate.** The 2.1.284 bundle
+  carries 34 literal `isHidden: !0`. 18 are typeless
+  `{isEnabled:()=>!1,isHidden:!0,name:"stub"}` placeholders and one is the
+  `{...g,isHidden:!0}` copy `zyt` makes of an MCP duplicate, so neither kind
+  declares a command. The other 15 objects declare 21 commands under 20
+  names: two factory objects build eight of them, and `extra-usage` is declared
+  twice.
+
+  | Name | Name declared as | Type | Gate |
+  | --- | --- | --- | --- |
+  | `__remote-workflow`, `agents`, `design-consent`, `design-revoke`, `heapdump`, `workflow-launch-exec` | literal | `local`, `supportsNonInteractive: !0` | PASS |
+  | `extra-usage` | literal, twice | a `local` twin with `supportsNonInteractive: !0`, and a `local-jsx` twin | PASS (the `local` twin) |
+  | `update` | literal | `local`, `supportsNonInteractive: !1`, `isEnabled: () => !1` | FAIL |
+  | `pro-trial-expired` | literal | `local-jsx` | FAIL |
+  | `claim-credit`, `low-priority` | a variable (`KOt`, `ble`) | `local`, `supportsNonInteractive: !1` | FAIL |
+  | `limit-reset` | a variable (`BK`) | `local-jsx` | FAIL |
+  | `vim`, `output-style` | factory `S1t(e,n,r)`'s first argument | `local-jsx` | FAIL |
+  | `ultraplan`, `ultrareview`, `teleport`, `remote-control`, `schedule`, `autofix-pr` | upsell factory `rB(e)`'s `e.name` | `local`, `supportsNonInteractive: !1` | FAIL |
+
+  The seven that pass are `claude_catalog::CLAUDE_HIDDEN_BUILTINS`: the hidden
+  built-ins that can reach the reply. `design-consent` and `design-revoke` pass
+  the gate, but the print-mode reply probed on 2026-10-02 did not list them. The
+  const drops a reply entry only when its `builtin` is the JSON boolean `true`
+  and its name is listed, so a user or project skill of the same name is still
+  offered. Both sets drift between releases, so the re-verify steps below
+  re-derive them:
+
+  | claude | Gate-passing hidden built-ins | Literal-hidden, gate-failing |
+  | --- | --- | --- |
+  | 2.1.280 | `__remote-workflow`, `design-consent`, `design-revoke`, `extra-usage`, `heapdump`, `workflow-launch-exec` (6) | `pro-trial-expired`, `rate-limit-options` (`local-jsx`), `update`, `claim-credit`, `low-priority`, `limit-reset`, `vim`, `output-style`, the six upsells |
+  | 2.1.282 | adds `agents` (7) | unchanged |
+  | 2.1.284 | unchanged (7) | drops `rate-limit-options` |
+
+  A pinned list fails OPEN: a built-in a later claude hides is listed until the
+  const catches up, and one it removes is never listed.
+- **`/__remote-workflow` in `claude -p`**, which is what a quick reply runs, ran
+  locally with no model call (`total_cost_usd` 0, `num_turns` 0,
+  `is_error: false`) and answered `remote-workflow: error[not-remote-session]:
+  this command only runs inside a remote (CCR) session (CLAUDE_CODE_REMOTE is not
+  set). Use the Workflow tool locally.` It is not rejected, only useless outside a
+  server-launched session, and a real reply would write it into the session's
+  transcript.
+- **The two skill flags.** A skill or legacy command with
+  `user-invocable: false` is EXCLUDED from the reply, and a skill with
+  `disable-model-invocation: true` is INCLUDED (first seen 2026-09-30; re-verified
+  2026-10-02 with one of each beside a control skill). The reply's filter is
+  `userInvocable !== false` (`REr` in the bundle), and a bundled, file or plugin
+  skill's `isHidden` derives from that same flag, so every hidden SKILL is already
+  out of the reply and only hidden BUILT-INS need the pinned list. claude's docs
+  (code.claude.com/docs/en/skills, read 2026-10-02) agree: `user-invocable: false`
+  means "Claude Code hides it from the `/` menu and doesn't run it when you type
+  `/name`". Typing one in `claude -p` is refused locally, with no model call:
+  both a `user-invocable: false` project skill and the bundled
+  `/keybindings-help` (`userInvocable: !1` in the bundle) wrote the user record
+  `This skill can only be invoked by Claude, not directly by users. Ask Claude to
+  use the "<name>" skill for you.`
+- **A transcript's `skill_listing` is the MODEL's list, not the menu's.** claude
+  builds it from the bundled skills without `disable-model-invocation`, plus the
+  user, project and plugin skills, so it is the exact opposite of the reply on
+  both flags: it INCLUDES `user-invocable: false` skills and OMITS
+  `disable-model-invocation: true` ones. Its record,
+  `{"type":"skill_listing","names":[…],"content":"- <name>: <description>\n…","skillCount":…,"isInitial":…}`,
+  carries no per-skill flag, so nothing reading it can tell which names claude
+  refuses when typed. A read-only scan of one local store found the bundled
+  `keybindings-help` in 179 of its 184 session files. This is why a reply's `/`
+  lists claude's catalog alone and `store::skills` never reads these records
+  ([DOMAIN.md](DOMAIN.md#compose-pick-list)).
+
+**`@agent-<name>` works in `claude -p`, and is the form to insert.**
+`claude -p --model haiku
+--disallowed-tools "Read,Bash,Glob,Grep,Edit,Write,WebFetch,WebSearch,NotebookEdit"
+-- '@agent-sby-agent Say the single word hello.'` (≈ $0.01–0.03 a run) made the
+main thread call `Agent` with `subagent_type: "sby-agent"`, which answered, and
+the persisted transcript carried
+`{"type":"attachment","attachment":{"type":"agent_mention","agentType":"sby-agent"}}`
+— a structured mention, not model inference. The 2.1.284 binary's mention
+extractor accepts two forms, `@"<name> (agent)"` and `@agent-<name>`, with
+`<name>` in `[\w:.@-]+` (`\w` is ASCII). claude's own typeahead labels an agent
+`<name> (agent)` and inserts `@"<name> (agent)"` (read from the binary, not
+observed in a UI). `@agent-<name>` is the verified form, the one claude's own
+telemetry compares against, and a single whitespace-free token. The `--bg` path
+could not be probed in isolation (`claude --bg` in an untrusted temp dir refuses:
+"Workspace not trusted"); the store is the evidence instead: of 142 transcripts
+born background (`sessionKind: "bg"` on the first user record), 33 open with an
+expanded slash command and 3 carry an `agent_mention` attachment. An interactive
+run's trailing prompt is believed to go through the same input processing (it
+auto-submits as an ordinary first turn, [above](#the-trailing-positional-auto-submits-and-there-is-no-pre-fill));
+that was not probed, since it needs a TTY.
+
+claude's docs give `@agent-<name>` as the form to type by hand
+([sub-agents](https://code.claude.com/docs/en/sub-agents), "Invoke subagents
+explicitly", read 2026-10-02): "You can also type the mention manually without
+using the picker: `@agent-<name>` for local subagents, or `@agent-` followed by
+the scoped name for plugin subagents, for example
+`@agent-my-plugin:code-reviewer`. While you type this form the typeahead shows
+file matches rather than agents. The agent mention still resolves when you
+submit." It is also the more robust form. Re-probed on 2026-10-02 in `claude -p`
+(`--model haiku --tools ""` and a one-line system prompt, ≈ $0.001–0.002 a run),
+a run's transcript carrying an `agent_mention` attachment only when the mention
+resolved:
+
+| Prompt | `agent_mention` |
+| --- | --- |
+| `@agent-sbq-agent …` | `sbq-agent` |
+| `@"sbq-agent (agent)" …` | `sbq-agent` |
+| `@agent-my-agent-x …` | `my-agent-x` |
+| `@"my-agent-x (agent)" …` | none |
+
+The quoted form loses every agent whose name CONTAINS `agent-`: claude resolves
+an extracted name with `replace("agent-","")` (`g9o` in the bundle), which cuts
+the first `agent-` out of a quoted bare name, while the `@agent-` form loses only
+its own prefix and so resolves every name in the class. A plugin agent's `:` is
+in the class, as the docs' example shows. A name with a space or a non-ASCII
+character cannot be mentioned in either form, which is what
+`complete::is_mention_safe` skips. One side path: the unquoted token also passes
+claude's FILE-mention extractor (`@([^\s]+)\b`), so claude looks for a file named
+`agent-<name>` in the folder; with none it is skipped silently, and every run
+above answered normally. The quoted form stays off that path, its one advantage.
+So `complete::AGENT_MENTION_PREFIX` keeps `@agent-`. An interactive session still
+was not driven: for it the form rests on the docs ("still resolves when you
+submit") and on the extractor it shares with `-p`.
+
+To re-verify after a `claude` update, re-run the handshake — never the model-call
+probe — in a throwaway folder, and print only the counts, so the `account` key
+never reaches the terminal:
+
+```sh
+d="$(mktemp -d)" && cd "$d" \
+  && printf '%s\n' '{"type":"control_request","request_id":"probe","request":{"subtype":"initialize"}}' \
+   | claude -p --input-format stream-json --output-format stream-json --verbose \
+       --no-session-persistence --strict-mcp-config --settings '{"disableAllHooks":true}' \
+   | grep '"control_response"' \
+   | jq '.response | {subtype, commands: (.response.commands | length), agents: (.response.agents | length)}'
+cd - >/dev/null && rm -rf "$d"
+```
+
+**Re-derive the hidden built-ins.** Run it from the repository root. It reads the
+installed binary and `src/claude_catalog.rs` and runs nothing; it needs `python3`
+(macOS ships it with the Command Line Tools) and took about 25 s per bundle. It
+finds the print-mode gate by its whole body, takes every command object declared
+with a literal `isHidden: !0`, and resolves its name: a literal as is, a variable
+to the nearest string literal assigned to it (printing how many candidates there
+were), a factory parameter to every call site's literal. It applies the gate,
+lists the typeless objects it skipped and the getter-hidden commands that pass
+the gate, and compares the gate-passing names with `CLAUDE_HIDDEN_BUILTINS`:
+
+```sh
+B="$(readlink -f "$(command -v claude)")"
+python3 - "$B" src/claude_catalog.rs <<'PY'
+import re, sys
+
+data = open(sys.argv[1], "rb").read()
+const_file = sys.argv[2] if len(sys.argv) > 2 else "src/claude_catalog.rs"
+WINDOW = 6000  # bytes searched around a match for its enclosing object
+
+# The print-mode gate, found by CONTENT: its minified name changes every build.
+GATE = re.compile(rb'function ([\w$]+)\(([\w$]+)\)\{return \2\.type==="prompt"&&'
+                  rb'!\2\.disableNonInteractive\|\|\2\.type==="local"&&\2\.supportsNonInteractive\}')
+gates = GATE.findall(data)
+if len(gates) != 1:
+    print("!! print-mode gate found %d times, want 1: re-read it" % len(gates))
+    sys.exit(2)
+print("gate: %s(...)" % gates[0][0].decode())
+
+
+def enclosing(pos):
+    depth, i = 0, pos - 1
+    while i >= max(0, pos - WINDOW):
+        if data[i] == 0x7D:
+            depth += 1
+        elif data[i] == 0x7B:
+            if depth == 0:
+                break
+            depth -= 1
+        i -= 1
+    else:
+        return None
+    depth = 0
+    for j in range(i, min(len(data), i + 2 * WINDOW)):
+        depth += {0x7B: 1, 0x7D: -1}.get(data[j], 0)
+        if depth == 0:
+            return i, j + 1
+    return None
+
+
+def top_level(obj):  # the object's own keys: nested {...} collapsed to {}
+    out, depth = bytearray(), 0
+    for c in obj:
+        depth += c == 0x7B
+        if depth == 1 or (c in (0x7B, 0x7D) and depth == 2):
+            out.append(c)
+        depth -= c == 0x7D
+    return bytes(out)
+
+
+def key(top, k):
+    m = re.search(rb"[{,]" + k + rb":([^,}]*)", top)
+    return m.group(1) if m else None
+
+
+def gate(top):
+    kind, sni, dni = key(top, rb"type"), key(top, rb"supportsNonInteractive"), key(top, rb"disableNonInteractive")
+    if re.search(rb"get (supportsNonInteractive|disableNonInteractive|type)\(\)", top):
+        return "UNKNOWN(getter)"
+    if kind == b'"local-jsx"':
+        return "FAIL"
+    if kind == b'"local"':
+        return "PASS" if sni in (b"!0", b"true") else "FAIL" if sni in (None, b"!1", b"false") else "UNKNOWN"
+    if kind == b'"prompt"':
+        return "PASS" if dni in (None, b"!1", b"false") else "FAIL" if dni in (b"!0", b"true") else "UNKNOWN"
+    return "UNKNOWN"
+
+
+def names(start, top):
+    raw = key(top, rb"name") or b"?"
+    if raw.startswith(b'"'):
+        return [(raw.strip(b'"').decode(), "literal")]
+    m = re.fullmatch(rb"([\w$]+)(?:\.([\w$]+))?", raw)
+    if not m:
+        return [("?" + raw.decode("latin-1"), "unresolved")]
+    ident, field = m.groups()
+    fac = re.search(rb"function ([\w$]+)\(([^)]*)\)\{[^{}]{0,200}return$", data[max(0, start - 400):start])
+    if fac and ident in fac.group(2).split(b","):  # a factory: resolve its call sites
+        fn = re.escape(fac.group(1))
+        arg = rb'\("([^"]+)"' if field is None else rb'\(\{(?:(?:[^{}]|\{[^{}]*\})*?,)?' + field + rb':"([^"]+)"'
+        found = sorted(set(re.findall(rb"(?:^|[^\w$.])" + fn + arg, data)))
+        how = "factory %s(%s)" % (fac.group(1).decode(), fac.group(2).decode())
+        return [(n.decode(), how) for n in found] or [("?" + raw.decode(), how)]
+    if field is not None:
+        return [("?" + raw.decode(), "unresolved")]
+    # A minified name is reused across scopes: take the literal assigned nearest.
+    hits = sorted((abs(m.start() - start), m.group(1)) for m in
+                  re.finditer(rb"(?:^|[^\w$.])" + re.escape(ident) + rb'="([^"]*)"', data))
+    if not hits:
+        return [("?" + raw.decode(), "unresolved")]
+    return [(hits[0][1].decode(), "variable %s (nearest of %d)" % (ident.decode(), len(hits)))]
+
+
+rows, skipped, seen = set(), {}, set()
+for m in re.finditer(rb"isHidden:(?:!0|true)(?![\w$])", data):
+    span = enclosing(m.start())
+    if span is None or span in seen:
+        continue
+    seen.add(span)
+    top = top_level(data[span[0]:span[1]])
+    if not re.search(rb"isHidden:(?:!0|true)(?![\w$])", top):
+        continue
+    if key(top, rb"type") is None:  # a stub or a spread copy, not a declaration
+        shape = data[span[0]:span[1]][:60].decode("latin-1")
+        skipped[shape] = skipped.get(shape, 0) + 1
+        continue
+    for name, how in names(span[0], top):
+        rows.add((name, key(top, rb"type").decode("latin-1"), gate(top), how))
+
+print("\nliteral isHidden command objects:")
+for row in sorted(rows):
+    print("  %-22s %-12s %-16s %s" % row)
+print("skipped typeless objects:")
+for shape, n in sorted(skipped.items()):
+    print("  x%-3d %s" % (n, shape))
+
+print("\ngetter-hidden commands that pass the gate (not mirrored; read each getter):")
+for m in re.finditer(rb"get isHidden\(\)\{([^{}]*)\}", data):
+    span = enclosing(m.start())
+    if span is None:
+        continue
+    top = top_level(data[span[0]:span[1]])
+    if key(top, rb"type") is not None and gate(top) != "FAIL":
+        for name, _ in names(span[0], top):
+            print("  %-22s %-16s %s" % (name, gate(top), m.group(1).decode("latin-1")))
+
+reach = {n for n, _, g, _ in rows if g != "FAIL"}
+text = open(const_file, encoding="utf-8").read()
+const = re.search(r"CLAUDE_HIDDEN_BUILTINS[^=]*=\s*\[(.*?)\];", text, re.S)
+have = set(re.findall(r'"([^"]+)"', const.group(1))) if const else set()
+print("\ngate-passing hidden built-ins: %s" % ", ".join(sorted(reach)))
+print("CLAUDE_HIDDEN_BUILTINS:        %s" % ", ".join(sorted(have)))
+problems = [
+    ("UNRESOLVED NAME", sorted(n for n in reach if n.startswith("?"))),
+    ("MISSING FROM CLAUDE_HIDDEN_BUILTINS", sorted(n for n in reach - have if not n.startswith("?"))),
+    ("IN CLAUDE_HIDDEN_BUILTINS BUT CANNOT REACH -p", sorted(have - reach)),
+]
+for label, found in problems:
+    if found:
+        print("!! %s: %s" % (label, ", ".join(found)))
+if not const:
+    print("!! CLAUDE_HIDDEN_BUILTINS not found in %s" % const_file)
+if not const or any(found for _, found in problems):
+    sys.exit(1)
+print("OK: CLAUDE_HIDDEN_BUILTINS equals the gate-passing hidden built-ins")
+PY
+```
+
+- **Exit 0** prints `OK: CLAUDE_HIDDEN_BUILTINS equals the gate-passing hidden
+  built-ins`.
+- **Exit 1** follows a `!!` line naming a mismatch: `UNRESOLVED NAME` (a
+  gate-passing command whose name it could not resolve),
+  `MISSING FROM CLAUDE_HIDDEN_BUILTINS`,
+  `IN CLAUDE_HIDDEN_BUILTINS BUT CANNOT REACH -p`, or the const not found.
+- **Exit 2** follows `!! print-mode gate found N times, want 1`: the gate's body
+  changed. Re-read the gate before trusting the predicate the recipe carries.
+
+At 2.1.284 (2026-10-02) it printed `gate: lxe(...)`, the rows of the first table
+above and `OK`, exit 0. At 2.1.282 it printed `gate: KTe(...)`, the same rows
+plus `rate-limit-options`, and `OK`, exit 0. Against 2.1.280 it exits 1 with
+`IN CLAUDE_HIDDEN_BUILTINS BUT CANNOT REACH -p: agents`, as expected: the const
+is pinned to 2.1.284. A `!!` line is a reason to update the const, its
+provenance and both tables above together. If a later reply ever carries
+`isHidden`, or a field like it, for a command, filter on that field instead and
+delete the const.
+
+**What it cannot see.**
+
+- `isHidden` GETTERS: the gate-passing ones are printed for reading, never
+  evaluated.
+- An `isHidden` that is not a literal on the object itself (a variable, a spread
+  base, a later assignment): it is never matched.
+- The `command.describe` extension point, which can override a command's
+  `isHidden` at run time.
+- Spread copies such as `zyt`'s `{...g,isHidden:!0}`: listed among the skipped
+  typeless objects, never resolved.
+- A factory whose name is not its first argument (or that argument's `.name`),
+  or that is not a `function` declaration: its name resolves to the wrong
+  literal or to `?`.
+- Its heuristics: an object is found by brace counting within 6,000 bytes, so a
+  brace inside a string literal can miscount and an object whose `isHidden` sits
+  farther from its opening brace is skipped; a variable resolves to the NEAREST
+  literal assigned to that identifier.
+
+An unresolved name on a gate-PASSING command ends in a `!!` line, and so does a
+wrong one unless it happens to be a name the const already holds; on a
+gate-failing command either is only a printed row. The getters' values, the
+`describe` override, a non-literal `isHidden` and an object the brace counting
+skips are silent. On the three bundles read on 2026-10-02 the brace counting skipped none:
+the skipped and declaring objects add up to every literal `isHidden: !0`.
+
+Then run the trust, git-prefetch and `rootOnly` checks at the end of
+[Workspace trust](#workspace-trust-what-an-untrusted-folder-can-run-and-the-two-argv-forms).
+
+### Workspace trust: what an untrusted folder can run, and the two argv forms
+
+> **Captured against `claude 2.1.284`, 2026-09-30**, by probe and by reading the
+> 2.1.284 bundle. Pinned with the handshake above, not with the
+> [command surface](#version-pin-self-healing) (still 2.1.282). The docs quoted
+> are code.claude.com/docs/en/permissions ("Project allow rules and workspace
+> trust", "What runs before you trust a folder") and /docs/en/env-vars.
+> **Added 2026-10-01, same `claude 2.1.284`:** claude's own git prefetch and the
+> switch that turns it off, and the rule's dead `rootOnly` branch, by probe and
+> by reading the same bundle.
+
+`src/claude_trust.rs` mirrors the rule below, and `src/claude_catalog.rs` picks
+the form, argv and child environment, from its verdict. What the pick list then
+shows is [DOMAIN.md](DOMAIN.md#compose-pick-list)'s.
+
+**What a never-trusted folder can run under `-p`.** `-p` never shows the
+workspace-trust dialog. claude's docs table "What runs before you trust a folder"
+marks these repository-supplied items "Used" for a `claude -p` run in a folder
+never trusted:
+
+- hooks in its settings files;
+- its `env` block;
+- helper commands such as `apiKeyHelper`;
+- a project skill's hooks and `allowed-tools`.
+
+Its `.mcp.json` servers are "Connected without asking". Only `permissions.allow`
+and `additionalDirectories`, a few frontmatter items and an MCP `headersHelper`
+are held back. The table leaves one thing out, found by probe: claude's OWN git
+prefetch, through which the repository's `.git/config` runs ("Observed: claude's
+own git prefetch", below). The trusted form's flags turn off hooks
+(`disableAllHooks`) and MCP (`--strict-mcp-config`) and nothing else, so in such
+a folder that form would
+run the repository's helper commands and apply its `env` block the moment a
+compose box opened, with nothing typed. For running `claude -p` in a repository you did not write, the docs name
+`--setting-sources user` ("reads neither the project's settings files nor its
+`.mcp.json`") and `--bare`. `--bare` still applies the project's `env` block and
+helpers such as `awsAuthRefresh`, and it drops the user's own skills and agents
+([above](#the-initialize-control-handshake-compose-pick-list)), so the fetch
+never uses it.
+
+**Observed: the trusted form in a never-trusted folder.** The probe folder's
+`.claude/settings.json` declared:
+
+- an `apiKeyHelper` that writes a marker file and echoes `x`;
+- an `awsAuthRefresh` and an `awsCredentialExport`;
+- `env: {"SB_PROBE_ENV":"1"}`;
+- one `permissions.allow` rule.
+
+The folder also held a project skill, a command and an agent. The run gave:
+
+- **The `apiKeyHelper` RAN** (the marker was written) and became claude's auth
+  source. The reply's `account.tokenSource` and `account.apiKeySource` read
+  `"apiKeyHelper"` (only key names were recorded), and the OAuth identity fields
+  vanished. stderr printed `⚠ claude.ai connectors are disabled because
+  ANTHROPIC_API_KEY or another auth source is set …`. The list held 73 commands,
+  the 2 project ones included. That is 3 fewer of the others than a plain folder's
+  74, presumably built-ins that need the claude.ai login. It held 16 agents.
+- **The `env` block was APPLIED.** A second folder whose settings held only
+  `env: {"ANTHROPIC_DEFAULT_SONNET_MODEL":"sb-probe-env-model"}` changed the
+  reply's `models[value=sonnet].resolvedModel` to `sb-probe-env-model`.
+- **`awsAuthRefresh` and `awsCredentialExport` did NOT run.** No Bedrock provider
+  was configured, so this is no evidence that they never run.
+- **stderr warned about the allow rule:** `Ignoring 1 permissions.allow entry from
+  .claude/settings.json: this workspace has not been trusted. … set
+  projects["/private/tmp/snapback-probe-…"].hasTrustDialogAccepted: true in
+  ~/.claude.json.`
+- **`.claude/settings.local.json` behaved the same.** The helper ran and became
+  the auth source. There was no allow-rule warning, because an untracked local
+  file counts under `-p`.
+- **The network is NOT verified.** A `--debug-file` run logged no request line,
+  but the probing machine had nonessential traffic disabled, so that absence is
+  not general. Whether a helper-supplied key or a project `ANTHROPIC_BASE_URL` is
+  used for a request during the handshake is unknown.
+- **Latency was unchanged:** 0.21–0.24 s.
+
+**Observed: the same folders with `--setting-sources user` added.**
+
+- **No helper ran.** No helper wrote its marker, the `env` block was not applied
+  (sonnet resolved to its default), and the OAuth `account` fields came back.
+  These folders were no git repositories. In one that is, claude's own git
+  prefetch still runs ("Observed: claude's own git prefetch", below).
+- **The lists kept the user's items and lost the repository's.** No project
+  skill, command or agent was listed. The name lists equalled a plain folder's:
+  74 commands (46 `builtin`, 28 tagged ` (user)`) and 15 agents.
+- **`--settings` is still honoured.** A flag-settings
+  `env.ANTHROPIC_DEFAULT_SONNET_MODEL` changed sonnet's `resolvedModel`, so the
+  flag's `disableAllHooks` still applies. No `hook_started` line was emitted, and
+  with `--strict-mcp-config` no `commands_changed` line either.
+- **Latency was unchanged:** 0.22–0.23 s over 5 runs. stdout reached EOF at
+  0.21–0.24 s in plain, `user` and trusted folders alike.
+
+**Observed: a trusted folder.** This probe was read-only, in an already-trusted
+repository holding one project skill, with no settings files and no `.mcp.json`.
+The trusted form listed 75 commands, the skill among them tagged ` (project)`.
+With `--setting-sources user` it listed 74 and the skill was gone. Nothing was
+written to the repository.
+
+**Observed: claude's own git prefetch** (2026-10-01). A `-p` run starts claude's
+git-status prefetch with NO trust check: the headless startup path logs
+`prefetch_system_context_non_interactive` and runs it, where an interactive
+session skips it until the folder is trusted
+(`prefetch_system_context_skipped_no_trust`). It is not a setting, so no setting
+source stops it. The probe folder was a git repository whose own `.git/config` set
+`filter.sbprobe.clean = "touch <marker>; cat"`, with `.gitattributes`
+`* filter=sbprobe` and one tracked file rewritten at the SAME size with another
+mtime, which `git status` can only settle by re-hashing that file through the
+filter. A clone never carries a `.git/config` of the sender's making, but an
+unpacked archive or a copied folder can. The run used the untrusted form's argv,
+`--setting-sources user` included, with the `initialize` handshake:
+
+- **The filter RAN** (its marker was written). A logging `git` shim first on the
+  CHILD's `PATH` recorded six calls: `status --short --ignore-submodules=dirty`,
+  `log --oneline -n 5`, `config user.name`, `remote get-url origin`, `remote`, and
+  `ls-files --error-unmatch` on `.claude/settings.local.json`. The first five
+  carried claude's forced `-c` set (`core.fsmonitor=`, `core.hooksPath=/dev/null`,
+  `core.askPass=`, `protocol.ext.allow=never`, `submodule.recurse=false`,
+  `log.showSignature=false`, `gc.auto=0`, `maintenance.auto=false`), the
+  `ls-files` call only its first two. Nothing in that set closes a
+  `filter.<x>.clean` or `filter.<x>.process` driver. claude's diagnostics file
+  logged `git_status_started`, `git_commands_completed` and
+  `git_status_completed`.
+- **The switch.** `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS` gates the prefetch
+  (bundle `lxt`). claude reads it as a tri-state boolean BEFORE the
+  `includeGitInstructions` setting: `1`, `true`, `yes` or `on` turn the prefetch
+  off; `0`, `false`, `no` or `off` turn it on; anything else falls back to the
+  setting, whose default is `true`. The same gate also decides the system
+  prompt's git instructions and one remote-session change, and none of its
+  readers builds the command or agent list. With the variable `1` in the
+  CHILD's environment, the marker did not appear, the `status`, `log` and
+  `config user.name` calls and their two diagnostics events were gone, and the
+  `commands` and `agents` objects were byte-identical to the run without it (74
+  and 15, the same SHA-256). One warm run each took 0.24 s without it and
+  0.23 s with it.
+- **Three git calls remain:** the `ls-files` call (claude's check for a tracked
+  local settings file), `remote get-url origin` and `remote`. They read the index
+  and the config and never hash working-tree content, so no filter, textconv,
+  hook, fsmonitor or signature program runs through them: no known vector.
+- **Nothing else found.** The bundle's other `-p` startup work under
+  `--setting-sources user` is a ripgrep file count (`rg --files --hidden`,
+  aborted after 3 s, reading ignore files only) and the CLAUDE.md read. Both only
+  read files.
+- **A trusted folder** (read-only, an already-trusted repository whose `git
+  status` was clean) ran the same prefetch, since `-p` has no trust check, and
+  the switch removed it there too, leaving the lists byte-identical. snapback sets
+  it in the untrusted form alone: claude's own interactive session runs that
+  prefetch in a trusted folder anyway, the user has accepted that folder's far
+  larger settings surface, and the trusted form stays the argv and environment it
+  always was, byte for byte.
+- **The residual: a settings `env` block outranks the child's environment.** With
+  the child's variable `1` AND
+  `--settings '{"disableAllHooks":true,"env":{"CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS":"0"}}'`,
+  the prefetch ran and the filter fired. Under `--setting-sources user` the `env`
+  sources still loaded are the user's own settings, managed policy and the flag
+  settings, and the flag settings are snapback's own. So only the user's own user
+  settings or a managed policy holding a false value can turn the prefetch back
+  on in an untrusted folder; a repository cannot. snapback sets the switch through
+  the child's environment alone, by decision: it does not also write it into the
+  flag settings' `env`, which would change the untrusted argv.
+
+**The two forms**: the argv from `claude_catalog::build_catalog_argv(FolderTrust)`,
+and what the child's environment gains over snapback's from
+`build_catalog_env(FolderTrust)`. snapback's own environment is never written.
+
+| claude's verdict for the folder | argv | child environment | lists |
+| --- | --- | --- | --- |
+| trusted | the [table row's](#how-snapback-drives-claude) argv, byte for byte | snapback's, untouched | the user's own, bundled and built-in items, AND the repository's own `.claude/` skills, commands and agents |
+| anything else, including every case snapback cannot settle | the same, followed by `--setting-sources user` | snapback's, plus `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1` | the user's own, bundled and built-in items only |
+
+`disableAllHooks` and `--strict-mcp-config` are in both forms. The verdict comes
+from `claude_trust::folder_trust`, read on the fetch's worker thread when the
+fetch runs, and ONE verdict picks both halves of a fetch's form.
+
+**Where claude records trust.** The record is claude's GLOBAL config:
+`$CLAUDE_CONFIG_DIR/.claude.json` when that variable is set and non-empty, else
+`~/.claude.json`. The env-vars docs say "`.claude.json` (the global config)
+lives directly in the specified directory"; the bundle's functions are `Lo`,
+`M7n` and `tq`. Two exceptions pick another file:
+
+- A legacy `<config home>/.config.json`, when it exists, is read instead. The
+  config home is `$CLAUDE_CONFIG_DIR`, else `~/.claude`.
+- When `CLAUDE_CODE_CUSTOM_OAUTH_URL` is set, the file is
+  `.claude-custom-oauth.json`.
+
+Trust is `projects["<key>"].hasTrustDialogAccepted`, a boolean. A key is the
+folder's REALPATH: absolute, NFC-normalised, with no trailing slash. On macOS a
+temp folder is keyed `/private/tmp/…`, never `/tmp/…`. Trust in the home
+directory is session-only and never written.
+
+**The rule** (the `claude --bg` trust gate, `$e` → `VI` → `_9n` in the bundle).
+Take F = realpath(folder). F is TRUSTED when either holds:
+
+1. **The exact key.** `projects[K].hasTrustDialogAccepted === true`, where K is
+   the CANONICAL root of F's git repository. For a linked worktree that is the
+   MAIN checkout, resolved by reading files: the `.git` file's `gitdir:`, then
+   that directory's `commondir`, with its `gitdir` back-pointer checked. Outside
+   any repository, K is F itself.
+2. **The walk.** Some directory from F upward carries a truthy flag. The walk
+   stops AT F's git root, the nearest ancestor-or-self holding a `.git` directory
+   or file. Outside any repository it stops at `/`.
+
+**A dead branch: `rootOnly`.** claude's code holds a third path that these two
+clauses leave out, because in 2.1.284 it never runs. `hS` first asks `y9n(F)`,
+and `y9n` first asks a ROOT FINDER, `T8n(F, {uncached})`. When that finds a root
+and a second check on it (`Fmt`) does not answer `true`, `y9n` returns
+`{root, rootOnly: true}`, and `hS` then trusts F ONLY when
+`projects[root].hasTrustDialogAccepted === true`: that root's exact key, with no
+walk and no git-root bound. Otherwise `y9n` returns the git root with
+`rootOnly: false`, which leads to the two clauses above. The `--bg` gate `_9n`
+reads `rootOnly` too. It is dead because `T8n` loops over a per-directory helper,
+`KD`, whose whole body is `return null` (its sibling `Lr` returns `false`), so the
+finder always answers `null`. If a later claude makes that helper answer, claude
+would trust a folder under such a root through the root's exact key alone, while
+the mirror's walk (clause 2) could still trust it from a flagged ancestor: an
+OVER-trust, the direction the mirror must never err in. The mirror then needs a
+re-probe of this rule before anything else. The re-verify step at the end of this
+section detects the branch going live.
+
+Two further cases also count as trusted: `CLAUDE_CODE_SANDBOXED` set, and a
+symlinked spelling of F whose own entry is flagged. In practice:
+
+- A trusted folder outside any repository covers every subfolder, but not the
+  inside of a nested repository.
+- A trusted repository root covers its subfolders.
+- A worktree inherits its main checkout's trust.
+- A trusted folder ABOVE a repository does not reach into it.
+
+The docs' "Project allow rules and workspace trust" says the same. The rule was
+read from the bundle's `sF`, `hS`, `y9n`, `yS`, `VI`, `_9n`, `Mde`/`nk`,
+`Oe`/`Qt`, `Zt`/`Te` and the `--bg` gate `$e` (its "bg: workspace trust check
+threw"), and the worktree pointer checks from `Hi`.
+
+**Not observed end to end.** No side-effect-free probe exposes the walk's
+verdict. `permissions.allow`, `additionalDirectories` and an MCP `headersHelper`
+are gated on the EXACT key only (the docs: "trusting a parent folder doesn't
+count for these rules"), and a `claude --bg` would start a session. The mirror
+rests on the bundle and the docs agreeing.
+
+**Where snapback's mirror fails toward UNTRUSTED** (why that direction is
+[PATTERNS.md §1](PATTERNS.md#1-fail-soft-over-external-input)'s). Every point
+where `claude_trust` cannot match claude exactly answers untrusted:
+
+- a missing, unreadable or malformed record, or one with a leading byte-order mark
+  (not stripped);
+- a folder that cannot be canonicalised, or that the record does not cover;
+- any flag value but the JSON boolean `true` (claude's walk accepts any truthy
+  value);
+- a key compared as the raw UTF-8 of the canonical path, with no NFC
+  normalisation, so a non-NFC or non-UTF-8 path matches nothing;
+- the three cases that only ever ADD trust, not mirrored: `CLAUDE_CODE_SANDBOXED`,
+  the home directory's session trust, and the symlinked-spelling fallback;
+- any `.git` entry, of whatever kind, or one that cannot be stat'ed, bounds the
+  walk, so it is never longer than claude's;
+- the worktree → main checkout step accepts only regular, non-symlink pointer
+  files within `GIT_POINTER_MAX_BYTES`, symlink-free targets, a matching
+  back-pointer and a non-bare main repository, with the worktree, its git
+  directory and the main repository all on one mount. It refuses every pointer
+  claude's `Hi` refuses, and more: UNC, backslash and `??` spellings; the `/net`
+  and `/Network` automounts, whatever the host (claude allows a `/net/<host>`
+  pointer on the worktree's own host); macOS `/.vol`, `/.file`, `/.nofollow` and
+  `/.resolve`; a crossing between `/home/<user>` automounts; and the zero-width and
+  bidirectional format characters claude deletes before it compares a mount name.
+  Any failure keys the folder on the worktree's own root, which claude's walk
+  checks too;
+- claude's internal `-local-oauth` and `-staging-oauth` record files are not
+  mirrored, because public builds never select them.
+
+**Re-verify the trust split and the git prefetch** after a `claude` update, in a
+throwaway folder that claude has never trusted. Its `apiKeyHelper` is the folder's
+own `touch`, and the first run lets it fire on purpose. The folder is also a git
+repository whose own `.git/config` defines a clean filter that `touch`es a second
+marker, and its one tracked file is rewritten at the same size with an older
+mtime, so a `git status` must re-hash it through that filter. Only the counts
+print, so the `account` key never reaches the terminal:
+
+```sh
+d="$(cd "$(mktemp -d)" && pwd -P)" && mkdir "$d/.claude" && cd "$d" \
+  && printf '{"apiKeyHelper": "touch %s/ran; echo x"}\n' "$d" > .claude/settings.json \
+  && git init -q && printf 'aaaa\n' > a.txt && git add a.txt \
+  && git -c user.name=probe -c user.email=probe@example.invalid -c commit.gpgsign=false \
+       commit -q --no-verify -m init \
+  && git config filter.sbprobe.clean "touch $d/filtered; cat" \
+  && printf '* filter=sbprobe\n' > .gitattributes \
+  && printf 'bbbb\n' > a.txt && touch -t 202001010000 a.txt
+probe() {
+  rm -f ran filtered
+  printf '%s\n' '{"type":"control_request","request_id":"probe","request":{"subtype":"initialize"}}' \
+    | claude -p --input-format stream-json --output-format stream-json --verbose \
+        --no-session-persistence --strict-mcp-config --settings '{"disableAllHooks":true}' "$@" \
+    | grep '"control_response"' \
+    | jq -c '.response | {subtype, commands: (.response.commands | length), agents: (.response.agents | length)}'
+  sleep 1   # give a straggling git a moment before the markers are read
+  if [ -e ran ]; then echo "helper RAN"; else echo "no helper"; fi
+  if [ -e filtered ]; then echo "filter RAN"; else echo "no filter"; fi
+}
+probe                          # the trusted form, in a folder claude never trusted
+probe --setting-sources user   # the untrusted form's argv, without its environment
+( export CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1; probe --setting-sources user )   # the untrusted form
+cd - >/dev/null && rm -rf "$d"
+```
+
+Expect `helper RAN` and `filter RAN`, then `no helper` and `filter RAN`, then
+`no helper` and `no filter`, with the last two runs' counts equal to a plain
+folder's. On 2026-10-01 (2.1.284) it printed 71/15, then 74/15 twice: the
+trusted form lists 3 fewer commands once the helper is claude's auth source, as
+observed above. Any result changing is a reason to re-probe this section, not to
+drop a form or the switch. In particular, `filter RAN` on the third run means the
+switch no longer stops claude's prefetch, so the untrusted form no longer keeps
+the repository's git configuration from running.
+
+**Re-verify that `rootOnly` is still dead.** This reads the installed binary and
+runs nothing. It anchors on property names and code shapes that survive
+minification, never on the minified names, which change every build: the one
+function that returns `{root:r.root,rootOnly:!0}` names the ROOT FINDER, the
+finder's loop names its PER-DIRECTORY helper, and the branch stays dead while
+that helper's whole body is `return null`. A minified name may hold a `$`, which
+the second and third steps escape:
+
+```sh
+BIN="$(readlink -f "$(command -v claude)")"
+finder="$(grep -aoE 'r=[A-Za-z0-9_$]+\(n,\{uncached:!0\}\);if\(r!==null&&[A-Za-z0-9_$]+\(r\.root,\{uncached:!0\}\)!==!0\)return\{root:r\.root,rootOnly:!0\}' "$BIN" \
+  | sed -E 's/^r=([^(]*)\(.*/\1/' | sort -u)"
+echo "root finder: [$finder]"
+f="$(printf '%s' "$finder" | sed 's/[$]/\\$/g')"
+helper="$(grep -aoE 'function '"$f"'\(e,\{uncached:n=!1\}=\{\}\)\{let r=e;for\(;;\)\{let s=[A-Za-z0-9_$]+\(r,' "$BIN" \
+  | sed -E 's/.*let s=([^(]*)\(r,$/\1/' | sort -u)"
+echo "per-directory helper: [$helper]"
+h="$(printf '%s' "$helper" | sed 's/[$]/\\$/g')"
+grep -aoE 'function '"$h"'\(e,\{uncached:n=!1\}=\{\}\)\{[^}]*\}' "$BIN" | sort -u
+```
+
+At 2.1.284 it printed `root finder: [T8n]`, `per-directory helper: [KD]` and
+`function KD(e,{uncached:n=!1}={}){return null}`. Expect exactly one finder, one
+helper and that `return null` body. Anything else (no match, several names, or a
+body that does work) is a reason to re-probe [the rule](#workspace-trust-what-an-untrusted-folder-can-run-and-the-two-argv-forms)
+before trusting the mirror, and possibly to make `claude_trust` fail toward
+untrusted wherever such a root exists.
 
 ## Top-level options
 

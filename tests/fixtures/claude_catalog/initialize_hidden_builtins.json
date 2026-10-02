@@ -1,0 +1,64 @@
+{
+  "type": "control_response",
+  "response": {
+    "subtype": "success",
+    "request_id": "probe",
+    "response": {
+      "commands": [
+        {
+          "name": "sbq-manual",
+          "description": "Probe skill only users can invoke for snapback (project)",
+          "argumentHint": ""
+        },
+        {
+          "name": "sbq-visible",
+          "description": "Probe skill visible to users for snapback (project)",
+          "argumentHint": ""
+        },
+        {
+          "name": "agents",
+          "description": "(removed) Ask Claude to create/manage subagents, or edit .claude/agents/",
+          "argumentHint": "",
+          "builtin": true
+        },
+        {
+          "name": "compact",
+          "description": "Free up context by summarizing the conversation so far",
+          "argumentHint": "<optional custom summarization instructions>",
+          "builtin": true
+        },
+        {
+          "name": "heapdump",
+          "description": "Dump the JS heap to the Desktop; on Linux with no Desktop folder, the home directory",
+          "argumentHint": "",
+          "builtin": true
+        },
+        {
+          "name": "__remote-workflow",
+          "description": "Run the workflow script delivered in this session environment (server-launched sessions only)",
+          "argumentHint": "",
+          "builtin": true
+        },
+        {
+          "name": "workflow-launch-exec",
+          "description": "Execute a server-launched workflow handoff (workflow_launch event sessions only)",
+          "argumentHint": "",
+          "builtin": true
+        },
+        {
+          "name": "extra-usage",
+          "description": "Renamed to /usage-credits",
+          "argumentHint": "",
+          "builtin": true
+        }
+      ],
+      "agents": [
+        {
+          "name": "sbq-agent",
+          "description": "Probe agent for snapback",
+          "model": "haiku"
+        }
+      ]
+    }
+  }
+}

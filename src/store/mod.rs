@@ -19,6 +19,7 @@ pub mod label;
 pub mod lineage;
 pub mod parse;
 pub mod preview;
+pub mod skills;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};

@@ -60,7 +60,7 @@
 //! signal could take ([`signallable_pid`]; [`interrupt_gate`] →
 //! [`InterruptGate::ConfirmSignal`]) is confirmed, the pid is
 //! re-verified against a fresh probe ([`signal_plan`]), and [`signal_term`] sends it
-//! a SIGTERM through `kill(2)`, the crate's one syscall, with no thread and no event
+//! a SIGTERM through `kill(2)`, `Ctrl-K`'s one syscall, with no thread and no event
 //! because the call does not block. [`status_for_signal`] maps the result. Every
 //! decision on that route is pure; [`signal_term`] is its only effect, and no test
 //! calls it.
@@ -1264,10 +1264,15 @@ const SIGNAL_UNSUPPORTED: &str = "sending a signal is not supported on this plat
 /// [`signal_target`], asks the RANGE half again, and asks it alone — its docs say why
 /// the board half cannot reach it and why that is safe.
 ///
+/// Its second caller is the catalog fetch's `claude_catalog::kill_group`, which
+/// narrows the pid of a child it spawned as a group leader before passing it to
+/// `killpg(2)` as a GROUP id: the range half keeps `0` (the caller's own group) out,
+/// and the board half keeps the board's own group out.
+///
 /// Pure and compiled on EVERY platform, returning a plain `i32` rather than a `pid_t`:
 /// the gate must build everywhere, while `pid_t` and [`signal_target`] are unix-only.
 #[must_use]
-fn signallable_pid(pid: u32, own_pid: u32) -> Option<i32> {
+pub(crate) fn signallable_pid(pid: u32, own_pid: u32) -> Option<i32> {
     positive_pid_t(pid).filter(|_| pid != own_pid)
 }
 
@@ -1309,12 +1314,12 @@ fn positive_pid_t(pid: u32) -> Option<i32> {
 /// compiling rather than narrow silently.
 ///
 /// The rule's BOARD half (the board's own pid) is NOT asked again here, deliberately.
-/// This step takes the pid alone because [`signal_term`] — the crate's one `unsafe`
-/// block, kept exactly as reviewed — hands it the pid alone, and reading the board's
-/// pid in here would make it impure. Nothing is lost: a process's id never changes
-/// while it runs, so the gate's verdict on the board's pid cannot go stale the way a
-/// reported pid's owner can, and the only pid that reaches this step is the one
-/// [`signal_plan`] matched against the pid that gate already accepted.
+/// This step takes the pid alone because [`signal_term`] — one of the crate's two
+/// `unsafe` blocks, kept exactly as reviewed — hands it the pid alone, and reading
+/// the board's pid in here would make it impure. Nothing is lost: a process's id
+/// never changes while it runs, so the gate's verdict on the board's pid cannot go
+/// stale the way a reported pid's owner can, and the only pid that reaches this step
+/// is the one [`signal_plan`] matched against the pid that gate already accepted.
 ///
 /// Unix-only: `pid_t` is a unix type, and off unix [`signal_term`] refuses before any
 /// pid would need narrowing.
@@ -1325,8 +1330,9 @@ fn signal_target(pid: u32) -> Result<libc::pid_t, std::io::Error> {
     })
 }
 
-/// Send `pid` a **SIGTERM**. The ONE impure step on the signal route, and the only
-/// syscall in this crate.
+/// Send `pid` a **SIGTERM**. The ONE impure step on the signal route, and `Ctrl-K`'s
+/// one syscall; the crate's only other one is the catalog fetch's `killpg(2)`, aimed
+/// at a process group that fetch spawned itself.
 ///
 /// Thin on purpose: every decision that led here is pure and tested elsewhere
 /// ([`interrupt_gate`] chose the route, [`signal_plan`] re-verified the pid,
@@ -1347,9 +1353,11 @@ fn signal_target(pid: u32) -> Result<libc::pid_t, std::io::Error> {
 ///
 /// * **SIGTERM, never SIGKILL.** SIGTERM is catchable, so the process gets to run its
 ///   own shutdown — which matters most in the case this route cannot rule out: a
-///   process snapback did not start. There is no `SIGKILL` constant anywhere in this
-///   crate and no escalation ladder; a process that ignores SIGTERM stays running and
-///   says so through the board's own status, which is the honest outcome.
+///   process snapback did not start. There is no `SIGKILL` on this route and no
+///   escalation ladder (the crate's one `SIGKILL` is the catalog fetch's, and only
+///   ever reaches a child group snapback started); a process that ignores SIGTERM
+///   stays running and says so through the board's own status, which is the honest
+///   outcome.
 /// * **The pid ITSELF, never a negative pid.** `kill(2)` reads a negative argument as
 ///   a PROCESS GROUP (and `0`/`-1` as broadcasts), so a sign slip here would signal
 ///   far more than the one process claude reported. `pid` arrives as `u32` — the
@@ -1360,7 +1368,7 @@ fn signal_target(pid: u32) -> Result<libc::pid_t, std::io::Error> {
 /// Unix-only. Off unix a same-signature fallback compiles in its place and REFUSES
 /// rather than signals, so the driver's one call site builds on every target. The
 /// split is two `#[cfg]` ITEMS rather than `#[cfg]` statements inside one body, so
-/// this function — the crate's one `unsafe` block — stays exactly as reviewed.
+/// this function — one of the crate's two `unsafe` blocks — stays exactly as reviewed.
 #[cfg(unix)]
 pub fn signal_term(pid: u32) -> Result<(), std::io::Error> {
     let target = signal_target(pid)?;

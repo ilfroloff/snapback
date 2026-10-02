@@ -28,9 +28,10 @@ use std::path::{Path, PathBuf};
 const AGENTS_SUBDIR: &str = "agents";
 
 /// The `.claude` config directory name, shared by the user- and project-level
-/// agent locations (`~/.claude/agents`, `<launch_dir>/.claude/agents`) and by
+/// agent locations (`~/.claude/agents`, `<launch_dir>/.claude/agents`), by
 /// [`crate::claude_settings`]' settings-file locations (`~/.claude/settings.json`,
-/// `<launch_dir>/.claude/settings{,.local}.json`), so the name claude gives its
+/// `<launch_dir>/.claude/settings{,.local}.json`) and by `crate::claude_trust`'s
+/// legacy global config (`~/.claude/.config.json`), so the name claude gives its
 /// config directory is written once.
 pub(crate) const CLAUDE_DIR: &str = ".claude";
 
