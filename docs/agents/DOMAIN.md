@@ -260,6 +260,8 @@ never fatal:
 | `gitBranch` | last non-null (`None` ⇒ `(detached)`) | branch grouping level |
 | `timestamp` | last non-null, RFC 3339 | sort + display (per-message too, in preview; a [failed notice](#failed-background-task-storeparse)'s own, on the banner) |
 | `type` | `"summary"` / `"user"` / `"assistant"` / `"agent-setting"` / `"agent-name"` | label, preview, content index, [turn count](#turn-count-storeparse) |
+| `attachment.type` = `skill_listing` | deliberately NOT read | nothing: it is the MODEL's skill list, which names skills claude's own `/` menu hides and refuses when typed, omits ones it offers, and carries no flag to tell them apart ([CLAUDE_CLI.md](CLAUDE_CLI.md#the-initialize-control-handshake-compose-pick-list)), so the [pick list](#compose-pick-list)'s `/` lists claude's catalog alone |
+| `attachment.type` = `agent_listing_delta` → `addedTypes`, `addedLines`, `removedTypes`, `isInitial` | on `type:"attachment"`: `addedTypes` / `removedTypes` arrays of names, `addedLines` an array of `- <name>: <description> (Tools: …)` strings (one `\n`-joined string tolerated), `isInitial` a bool (fail-soft) | a reply's `@` agent fallback in the [pick list](#compose-pick-list), folded in FILE ORDER: an `isInitial: true` record restarts the set (a file can carry more than one), then adds, then removes; the ` (Tools: …)` tail is cut. 414 records in 174 local transcripts, claude 2.1.235–2.1.284: `addedLines` an array in all 414, every entry in that shape. Read ONLY by `store::skills` |
 | `summary` | on `type:"summary"` | preferred label + searchable text |
 | `agentSetting` | on `type:"agent-setting"`, string (fail-soft) | the [bound agent](#bound-agent-storepreview) handle on preview turns (interactive bind — authoritative); read **positionally**, never hoisted |
 | `agentName` | on `type:"agent-name"`, string (fail-soft) | the background job's name; a **fallback** bound-agent source for the preview handle, trusted ONLY when it names a known agent (the field also carries free-form titles) — see [bound agent](#bound-agent-storepreview) |
@@ -1253,7 +1255,12 @@ busy or idle (every record at 2.1.280). The reading once held open as the
 alternative — that a real TUI registers too, perhaps only while a turn is in
 flight — is therefore OBSERVED at 2.1.280, and the idle TUI shows registration is
 not keyed to a turn in flight there. Whether the 2.1.278 negative probes reflect
-a version change or only their short windows is not known.
+a version change or only their short windows is not known. A third shape was seen
+at 2.1.284 (2026-09-30): the compose pick list's own catalog child, listed for the
+~0.2 s it lives under a `sessionId` with no transcript
+([the `initialize` handshake](CLAUDE_CLI.md#the-initialize-control-handshake-compose-pick-list)
+records it) — so it never matches a board row, which every lookup keys by the
+row's own id.
 
 The limits are the reason this is written down rather than built on. It is `ps`
 parentage on one machine where nearly every `claude` starts through snapback, so
@@ -2140,6 +2147,151 @@ answers are derived, in-memory state about ANOTHER program — memoized for the
 process and re-read per board session respectively — and are written nowhere
 either.
 
+### Compose pick list
+
+Code: `src/tui/complete.rs` (the pure core), `src/tui/compose.rs` (the source, the
+refresh, the fetch request), `src/claude_catalog.rs` (claude's list),
+`src/claude_trust.rs` (which form of claude's list a folder gets),
+`src/store/skills.rs` (a reply's `@` agents until claude's list lands).
+
+BOTH compose boxes — the `Ctrl-R` reply and the `Ctrl-N` draft — offer the same
+`/` and `@` list, through the same editor, key router, driver and renderer. It is
+a start-of-name filter over a small candidate list — NOT the session matcher:
+
+- `/` as the very first character of the draft lists claude's own skills and
+  commands for the folder, built-in ones included, minus the built-ins claude
+  hides from its own `/` menu (`claude_catalog::CLAUDE_HIDDEN_BUILTINS`), and
+  nothing until that list is in.
+- `@` at the start of a word lists files and folders under the folder
+  (`@src/tu` narrows inside `src/`); dot-names show only when the leaf starts with
+  `.`, folders come first, and a folder pick reopens the list one level down. For
+  a TOP-LEVEL `@` token only (no folder part), the folder's agents follow, labelled
+  `<name> (agent)` — claude's own typeahead label — and inserted as
+  `@agent-<name> `, the form claude turns into a structured `agent_mention` and
+  documents for typing by hand — never claude's own picker form
+  `@"<name> (agent)"`, which misses a name containing `agent-`
+  ([CLAUDE_CLI.md](CLAUDE_CLI.md#the-initialize-control-handshake-compose-pick-list)).
+  Agents match by the start of their NAME — a query that starts `agent-` matches
+  what follows it — so `@a` lists the agents named `a…`, not every agent through
+  the inserted prefix. An agent whose name claude's mention parser could not read
+  whole (`complete::is_mention_safe`: claude 2.1.284's `[\w:.@-]+`)
+  is never offered, since it would be inserted and silently ignored.
+- A skill, command or agent row carries its description, verbatim as its source
+  gives it (source tags such as ` (user)` included) once
+  `store::skills::normalize_description` has dropped every control character and
+  folded whitespace; files and folders carry none. The list draws as an UNTITLED
+  table, name left and `DIM` description right, cut at the box edge: a title such
+  as "skills" or "files" would be false for a list that mixes kinds.
+- The list opens only with the caret at the END of the token. While open,
+  `Up`/`Down` choose (wrapping), `Enter`/`Tab` pick, `Esc` closes only the list. A
+  closed token stays closed while the caret stays at its end (typing more of it
+  included); it reopens once the caret leaves the end of the token or a different
+  token is under it (`CompletionState::dismissed` is cleared then). With no
+  candidate the keys are the ordinary compose keys.
+- Fail-soft: a missing, unreadable or malformed transcript or folder is an empty
+  list, and a missing `claude` or a bad handshake answer only leaves the list as
+  it is without claude's (the `none` and transcript rows below) — never an
+  error. A missing, unreadable or malformed trust record is
+  UNTRUSTED, so the folder gets the user-sources list
+  ([below](#which-settings-the-fetch-loads)).
+
+**Where it reads from.** The one per-target difference is
+`compose::completion_source`: a reply reads its session's `cwd` and transcript
+file, both from the `Session` the store parsed out of the file itself, and gets no
+list once that session has left the store; a draft reads `App::launch_dir`, the
+folder its `--bg` / `Ctrl-O` child runs in, and has no transcript. For that folder
+the list reads, in order of precedence (a `/` reads the first row alone):
+
+| Source | Used when | What it holds |
+| --- | --- | --- |
+| claude's catalog (`App::catalogs`) | it has landed for the folder | claude's own `initialize` handshake answer: commands (skills and built-ins, minus the built-ins claude hides from its own menu) and agents, with descriptions. It includes the repository's own `.claude/` skills, commands and agents only where claude TRUSTS the folder; anywhere else the fetch passes `--setting-sources user`, so the list is the user's own, bundled and built-in items alone ([below](#which-settings-the-fetch-loads)) |
+| the reply's transcript | a REPLY's top-level `@`, until the catalog lands or when its fetch failed | AGENTS only: `store::skills::read_listing` of the reply's own session file (its [`agent_listing_delta` records](#jsonl-record-model)), read at most once per draft, and only for a top-level `@`. A `/` never reads it, and an `@` with a folder part lists no agents |
+| none | otherwise, until the catalog lands or when its fetch failed | `/` lists nothing in either box, and a draft's `@` lists no agents; files and folders show at once in both, a local read |
+
+**`/` is the catalog alone; for agents the catalog REPLACES the transcript.** A
+transcript's `skill_listing` records are the MODEL's skill list: they name the
+`user-invocable: false` skills claude keeps off its own `/` menu and refuses when
+typed (the bundled `keybindings-help` is in almost every transcript), omit the
+`disable-model-invocation: true` ones the menu offers, and carry no flag to tell
+them apart
+([CLAUDE_CLI.md](CLAUDE_CLI.md#the-initialize-control-handshake-compose-pick-list),
+"Built-ins, hidden built-ins and two visibility flags"). So `store::skills` does
+not read them, and a `/` lists nothing until claude's own list lands: typing a
+command still works, and a reply whose folder is gone, so that its fetch can never
+run, cannot be sent anyway (`send::plan_send`). Agents carry no such flag, so a
+reply's `@` takes them from its transcript until the catalog lands, and from then
+on the catalog is that folder's whole agent list, never merged with the
+transcript's. The transcript is a SNAPSHOT: an agent added after its last record
+is missing but still works when typed. A slash command in `claude -p` was
+verified at 2.1.282, an `@agent-<name>` mention at 2.1.284. In a folder claude
+does not trust, a reply's `@` can therefore show its TRANSCRIPT's project agents
+first and lose them when the user-sources catalog lands and replaces them: the
+repository's own items are what that folder's list
+[leaves out](#which-settings-the-fetch-loads), and its skills are never listed
+there at all. Typing one still works.
+
+**When the catalog is fetched, and retried.** No key handler spawns. After every
+wake-up the run loop asks the pure `compose::take_catalog_fetch`, which
+names a folder only when a compose is open, that compose has not asked yet
+(`CompletionState::catalog_requested`), and its folder is neither cached nor in
+flight (`App::catalogs_in_flight`); the driver then starts
+`claude_catalog::spawn_fetch`, whose thread delivers exactly ONE
+`AppEvent::CatalogFetched`. Deriving the request from state covers every
+compose-opening path — `Ctrl-R`, the stop-then-reply confirm, `Ctrl-N` with or
+without its picker — without touching any of them. EACH COMPOSE ASKS ONCE,
+whatever the answer, and a compose that finds its folder's fetch already running
+waits on that one. `App::finish_catalog_fetch` always releases the in-flight mark
+and caches only an ANSWER: no `claude`, a timeout or a bad reply is not a verdict
+about the folder and is never stored, so the NEXT compose on that folder asks
+again while one compose never retries — at most one spawn per compose opening,
+never a storm on a missing `claude` (a fetch still running when the board session
+ends is [ARCHITECTURE.md](ARCHITECTURE.md#event-sources-watcheventloop)'s seam
+rule). The `CatalogFetched` arm re-derives an open compose's list, so a catalog
+that lands mid-draft shows at once; a token `Esc` closed stays closed. At ~0.2 s
+the list is normally in before a trigger is typed.
+
+The cache lives for the BOARD'S lifetime (`App` survives every resume round trip),
+is never evicted — one ~34 KB entry per distinct folder composed in — and never
+reaches disk. It is keyed by the path as given (`Session.cwd` from the file, the
+canonical launch dir), so two spellings of one folder cost one extra fetch, never
+a wrong list, and a skill created mid-run is listed after a restart.
+
+#### Which settings the fetch loads
+
+`claude -p` never shows claude's workspace-trust dialog, so in a folder nobody
+trusted it would load the repository's own settings: their hooks, their `env`
+block and helper commands such as `apiKeyHelper`. A probe saw a repository's
+`apiKeyHelper` run and become claude's auth source, and its `env` block applied,
+before anything was typed ([CLAUDE_CLI.md](CLAUDE_CLI.md#workspace-trust-what-an-untrusted-folder-can-run-and-the-two-argv-forms)
+owns the exposure, the rule and the two forms). So the fetch loads a folder's
+project settings ONLY where claude itself trusts the folder. Anywhere else it
+passes `--setting-sources user`: the list keeps the user's own, bundled and
+built-in skills, commands and agents and drops the repository's `.claude/` ones.
+Accepting claude's trust prompt for the folder once, then restarting snapback,
+lists them. The untrusted form also sets `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1`
+in its child's environment, because no setting source stops claude's own git
+prefetch: with it, that prefetch never runs the repository's git configuration (a
+`.git/config` filter driver, say), and the list is the same as without it
+([CLAUDE_CLI.md](CLAUDE_CLI.md#workspace-trust-what-an-untrusted-folder-can-run-and-the-two-argv-forms),
+"Observed: claude's own git prefetch").
+
+- **When trust is read.** `claude_trust::folder_trust` reads claude's verdict on
+  the fetch's own worker thread, at fetch time, for that fetch. No key handler, no
+  render and not `compose::take_catalog_fetch` reads it.
+- **Its direction.** Fail-soft toward UNTRUSTED
+  ([PATTERNS.md §1](PATTERNS.md#1-fail-soft-over-external-input) owns why): a
+  missing, unreadable or malformed trust record, an unknown folder, and anything
+  the mirror cannot settle all fetch the user-sources form.
+- **Why the cache key stays the folder, not `(folder, trust)`.** Keying by trust
+  would need the verdict before the fetch is asked for, which is a file read in
+  `take_catalog_fetch` on the UI thread. The consequences are all bounded:
+  - A folder trusted mid-session keeps its user-sources list until a restart:
+    stale toward FEWER items, never toward running the repository's code, like a
+    skill added mid-run.
+  - A folder whose trust is revoked mid-session keeps the names fetched while it
+    was trusted. They are display only, and nothing runs.
+  - A failed fetch is never cached, so its retry reads trust again.
+
 ### Terminal paste routing (`Event::Paste`)
 
 `tui::init_terminal` enables **bracketed paste**, so the terminal delivers a
@@ -2153,7 +2305,7 @@ a partial enumeration here is a wrong one, so all six keyboard owners are stated
 | **`Ctrl-X` chord** (`handle_chord_key`) | ignored, chord stays ARMED | The chord resolves on exactly one KEY, hit or miss. A paste carries no completion, and cancelling on one would silently disarm a chord whose hint is still on screen. |
 | **Stop confirm** (`handle_stop_confirm_key`) | ignored | A plain Enter/Esc gate; a paste is neither, and must never stop an agent. |
 | **Interrupt confirm** (`handle_interrupt_confirm_key`) | ignored | Same. |
-| **Compose** (`App::is_composing`) | inserted at the caret, newlines intact (`compose::insert_paste` → `TextArea::insert_str`) | The fix: as keystrokes, the first embedded newline was a bare `Enter` = `ComposeAction::Send`. |
+| **Compose** (`App::is_composing`) | inserted at the caret, newlines intact (`compose::insert_paste` → `TextArea::insert_str`), then the [pick list](#compose-pick-list) re-derived, so a pasted `/` or `@` opens it like a typed one | The fix: as keystrokes, the first embedded newline was a bare `Enter` = `ComposeAction::Send`. |
 | **Board** | inserted at the query's caret, newlines flattened to spaces | The query is one line and `search::gate_atoms` splits it on spaces into substring atoms, so `foo\nbar` becomes exactly the `foo bar` the user could have typed. First-line-only would silently discard input. |
 
 Two rules hold on every path, both in `update::accept_paste`: line endings
@@ -2243,8 +2395,12 @@ launching, and from there:
 
 | Key | argv | Route |
 | --- | --- | --- |
-| `Enter` | `claude [--agent <name>] [--model <alias> [--effort <level>]] --bg <prompt>` | `Outcome::BgLaunch` → `send::spawn_bg_launch` → one `AppEvent::BgLaunchFinished`. **No teardown** — the board stays up. |
+| `Enter` (pick list closed) | `claude [--agent <name>] [--model <alias> [--effort <level>]] --bg <prompt>` | `Outcome::BgLaunch` → `send::spawn_bg_launch` → one `AppEvent::BgLaunchFinished`. **No teardown** — the board stays up. |
+| `Enter` / `Tab` (pick list OPEN) | none | `ComposeAction::AcceptCompletion`: picks the highlighted row into the draft → `Outcome::Continue`. Launches nothing ([compose pick list](#compose-pick-list)). |
 | `Ctrl-O` | `claude [--agent <name>] [--model <alias> [--effort <level>]] [<prompt>]` | `Outcome::Resume` → the ordinary teardown round trip, via `resume::check_new`. |
+
+`Esc` with the pick list open closes only the list (`ComposeAction::CloseCompletion`);
+with it closed, `Esc` cancels the draft and its card together.
 
 `Enter` therefore lives in the [`send`](#quick-reply--non-interactive-send-srcsendrs)
 family, not the hand-off one: `--bg` registers the agent and returns immediately
@@ -2258,7 +2414,9 @@ draft chose its model, and which key starts it does not change that.
 **The pane shows a PLACEHOLDER, not a transcript.** A draft opens
 `App::draft: Option<NewSessionDraft>` alongside the compose editor, and while it
 is set `view::draft_card` replaces the previewed transcript with a near-empty card
-naming the agent, the launch dir, and the draft's keys. The two fields are
+naming the agent, the launch dir, and the draft's keys: the pick list's keys while
+the list is open, else the draft's own (`view::draft_hint`), so the card and the
+help row name the same keys at every moment. The two fields are
 separate on purpose: the editor answers *what the keyboard does*, the draft
 answers *what the pane shows*, and the view never reads `ComposeTarget` to decide
 the second. Without it the compose box docked over whichever row was selected, so
@@ -2637,8 +2795,10 @@ is not an exception to the off-UI-thread rule, which governs blocking work. The
 driver runs `update::show_signal_result(app, send::signal_term(pid))`: the helper
 takes the syscall's result as a parameter, maps it with `send::status_for_signal`
 and applies the class below, so that choice is tested with hand-built results and
-never by signalling. `signal_term` is the crate's one syscall and this route's only
-effect. It takes its target only from the pure `send::signal_target`, which
+never by signalling. `signal_term` is `Ctrl-K`'s one syscall and this route's only
+effect; the crate's only other signals are the catalog fetch's SIGKILLs of its own
+child's process group (`killpg(2)`) and of that child (`Child::kill`)
+([CLAUDE_CLI.md](CLAUDE_CLI.md#the-initialize-control-handshake-compose-pick-list)). It takes its target only from the pure `send::signal_target`, which
 narrows the `u32` to a STRICTLY POSITIVE `pid_t` or refuses, so `0`, `-1` or a
 negative (a process group or a broadcast) can never reach `kill(2)`. That check is
 `send::positive_pid_t`, the range half of `send::signallable_pid`. The gate already

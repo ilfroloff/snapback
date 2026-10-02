@@ -13,8 +13,9 @@
 //! ([`Outcome::FinishCopy`]) because only the driver holds the writer its OSC 52
 //! fallback needs.
 //! Because such a result can arrive after the board it belongs to is gone,
-//! [`handle_event`] closes the compose surface on any [`Outcome`] that
-//! [ends the board session](Outcome::ends_board_session) as well.
+//! [`handle_event`] closes the compose surface, and forgets every compose
+//! pick-list catalog fetch still in flight (`CatalogFetched`), on any [`Outcome`]
+//! that [ends the board session](Outcome::ends_board_session) as well.
 //!
 //! This module is the *decision* half of the loop: [`key_to_action`] maps a key
 //! to an [`Action`], and [`handle_event`] applies an [`AppEvent`] to the [`App`]
@@ -36,15 +37,16 @@
 //! | `Alt-Left` / `Alt-Right`, `Alt-b` / `Alt-f`, `Ctrl-Left` / `Ctrl-Right` | move the search query's caret one WORD back / forward (always) — the widget's own word hop (see [`App::move_query_caret_by_word`]), so forward lands on the START of the next word, as in the reply box. Not a query change either. Three pairs because `⌥←` / `⌥→` reaches the board as `CSI 1;3D` / `C` or as `ESC b` / `ESC f` depending on the terminal, and `Ctrl-Left` / `Ctrl-Right` is the non-`Alt` twin; `Alt-b` / `Alt-f` and `Ctrl-Left` / `Ctrl-Right` are also the pairs the compose box hops words on |
 //! | `Enter` | resume the selected session |
 //! | `Ctrl-F` | fork-resume the selected session |
-//! | `Ctrl-N` | start a new session in the launch directory. When agents are defined a picker opens first and `Enter` on a pick opens a draft pane for the session's first message; with none defined that draft opens straight away. In the draft, `Enter` starts a BACKGROUND agent without leaving the board, `Ctrl-O` runs it interactively instead, `Esc` cancels |
+//! | `Ctrl-N` | start a new session in the launch directory. When agents are defined a picker opens first and `Enter` on a pick opens a draft pane for the session's first message; with none defined that draft opens straight away. In the draft, `Enter` starts a BACKGROUND agent without leaving the board, `Ctrl-O` runs it interactively instead, `Esc` cancels; `/` and `@` open the pick list (the `/` or `@` row below), which claims `Enter` and `Esc` while it is open |
 //! | `Ctrl-O` (in the agent picker) | start the highlighted agent INTERACTIVELY at once, skipping the draft — the same verb `Ctrl-O` names inside the draft, so BOTH routes out of the picker cost exactly one key. Bound on the picker alone — inert on every other modal |
-//! | `Ctrl-R` | quick-reply: send a one-shot message to the selected session without leaving the board. An agent whose run is OVER (`done` / `stopped` / `failed`) is stopped first so the reply lands in place; `needs input` confirms first; `working` / `idle` / `interrupted` / an unrecognized qualifier is refused, and so is a session claude reports with no stoppable job id — the refusal points at `Ctrl-K` or Fork (see [`send::reply_gate`]). While this session's OWN reply is still in flight, `Ctrl-R` on it is refused before any of the above (see [`send::reply_in_flight_refusal`]); a reply still in flight to another row refuses nothing here |
+//! | `Ctrl-R` | quick-reply: send a one-shot message to the selected session without leaving the board. An agent whose run is OVER (`done` / `stopped` / `failed`) is stopped first so the reply lands in place; `needs input` confirms first; `working` / `idle` / `interrupted` / an unrecognized qualifier is refused, and so is a session claude reports with no stoppable job id — the refusal points at `Ctrl-K` or Fork (see [`send::reply_gate`]). While this session's OWN reply is still in flight, `Ctrl-R` on it is refused before any of the above (see [`send::reply_in_flight_refusal`]); a reply still in flight to another row refuses nothing here. In the box `/` and `@` open the pick list (the `/` or `@` row below), which claims `Enter` and `Esc` while it is open |
 //! | `Ctrl-K` | stop / interrupt the selected session's live agent, by whichever handle claude's record carries (see [`send::interrupt_gate`]). A stoppable job id → `claude stop`: an agent whose run is OVER (`done` / `stopped` / `failed`) stops at once, every other live agent confirms first. NO job id but a `pid` → confirm, then re-ask claude at `Enter` and send that pid a SIGTERM (never SIGKILL) only if claude still reports the same pid with no job id; a record that is gone, now carries a job id, or reports another pid refuses instead (see [`send::signal_plan`]). A session claude is not holding, or one it reports with neither a job id nor a pid — or with no job id and a pid no signal could take (`0`, past `i32::MAX`, or the board's own process id) — is refused |
 //! | `Tab` | toggle name-only vs. name+content search. Widening to content also opens the preview on the most recent match, exactly as typing does: it goes through the same query funnel, and the mode is the gate that key just opened |
 //! | `Ctrl-A` | flip the scope: current folder <-> project (the launch repo and all of its git worktrees). ONE key for both, because the second is a refinement of the same question the first answers, not a separate mode. Launched with `--all`/`-a` it becomes a three-stop cycle through all folders as well — the whole store is on this key only when the launch flag put it there |
 //! | `Ctrl-X` then `x`/`d`/`h`/`r`/`y`/`f` | leader chord: hide / hard-delete (this row, or its whole fork lineage) / toggle show-hidden / re-read every transcript from disk / copy session ID (the selected session's full id, to the clipboard; the id also shows on the status line) / fold or expand the selected row's fork lineage (fold an open one, open a folded `(+N)` head, nothing otherwise — see [`App::toggle_selected_lineage`]) (any other key cancels) |
 //! | `Ctrl-L` (in a compose box) | pick the model — and optionally the effort — for THIS compose only: the `Ctrl-R` reply or the `Ctrl-N` draft it is pressed in (see [`compose::compose_key_to_action`]). The box's `model:` label names what it runs on: a reply's default is `session (<model>)`, the model its session last answered with, which claude normally restores by itself (`default` when an `ANTHROPIC_MODEL` / `ANTHROPIC_DEFAULT_*_MODEL` override, or a transcript with no answering model, means it would not); a draft's is `default (<value>) (new sessions only)` from the user's `claude` settings. `--model` / `--effort` are sent ONLY for a pick other than that default — on the reply, the draft's background launch and the draft's `Ctrl-O` run. The picker's first row returns to the default, `Enter` sets the highlighted row into the compose, `Esc` returns with the text and the previous pick intact. Every new compose starts at its default; nothing is remembered. `Enter`, `Ctrl-F` and Attach never send a model |
 //! | `Left` / `Right` (in the model picker) | step the highlighted MODEL row's `--effort` down / up through unset → `low` → `medium` → `high` → `xhigh` → `max`, wrapping both ways; `Enter` then sets the model and the effort together into the compose. Inert on the picker's default row (no model, so no effort) and on every other list modal, so the agent picker keeps ignoring them; they never reach the board's search caret underneath |
+//! | `/` or `@` (in a compose box) | open the pick list — the SAME list in the `Ctrl-R` reply and the `Ctrl-N` draft, which differ only in where it reads from (`compose::completion_source`). `/` as the draft's first character lists claude's skills and commands for the target's folder; `@` at the start of a word lists files and folders and, for a top-level `@` token only, agents, picked as `@agent-<name>`; a skill, command or agent carries its description. The list is claude's own, fetched once per folder per board off the UI thread (`compose::take_catalog_fetch`); until it lands `/` lists nothing in either box, while `@` lists files and folders at once, a reply's agents come from its transcript and a draft's wait for the catalog. While the list is open `Up` / `Down` choose, `Enter` / `Tab` pick (a folder reopens the list one level down) and `Esc` closes only the list, never the draft (see [`compose::compose_key_to_action`]) |
 //! | `Shift-Left` / `Shift-Right` | step the pane layout one stop toward a full-width preview / a full-width list, along `0:1 · 1:3 · 1:1 · 3:1 · 1:0` (list:preview; the board starts at `1:1`). A press at either end does nothing. Always — with or without a query, and whatever is marked. The step keeps the reader's place in the preview; leaving `1:0` opens it on the newest turn (see [`App::set_pane_layout`]) |
 //! | `PgUp` / `PgDn` | scroll the preview a page (always) |
 //! | `Ctrl-U` / `Ctrl-D` | scroll the preview a quarter page (always) |
@@ -519,6 +521,9 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool
 ///   new session and whether an environment override stops claude restoring a
 ///   session's model — what a compose box's `model:` label and its picker's first
 ///   row then show.
+/// * `CatalogFetched` -> settle a folder's off-thread catalog fetch (an answer is
+///   cached for the board's lifetime, no answer only releases the folder), then
+///   re-derive an open compose's pick list from it. Silent.
 /// * `Tick` -> nothing costly: advance the board clock, age a transient status,
 ///   then replay any completion an earlier board session could not read
 ///   ([`replay_undelivered`]). It never steps a held drag's autoscroll: the run
@@ -527,8 +532,8 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool
 ///
 /// Every return runs through ONE teardown seam: an outcome that
 /// [ends the board session](Outcome::ends_board_session) also tears the compose
-/// surface down, because neither half of it can outlive the channel it reports on
-/// (see [`dispatch`]).
+/// surface down and forgets every catalog fetch in flight, because none of them
+/// can outlive the channel it reports on (see [`dispatch`]).
 pub fn handle_event(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome {
     let outcome = dispatch(app, event, store);
     if outcome.ends_board_session() {
@@ -544,6 +549,11 @@ pub fn handle_event(app: &mut App, event: AppEvent, store: &mut SessionStore) ->
         // toggles and drag-selections) until another compose was opened and
         // cancelled.
         app.close_compose();
+        // A catalog fetch in flight reports on this session's channel, which dies
+        // with it (`tui::run_inner` builds a fresh `EventLoop`, and its teardown
+        // drain keeps only `SendFinished`), so its `CatalogFetched` can never land.
+        // A mark left standing would block every later fetch for that folder.
+        app.forget_catalog_fetches_in_flight();
     }
     outcome
 }
@@ -589,10 +599,14 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
             if app.pending_interrupt.is_some() {
                 return handle_interrupt_confirm_key(app, key);
             }
-            // The quick-reply compose zone owns the keyboard while open: every key
-            // routes to the compose handler (Enter sends, Ctrl-J/Alt+Enter add a
-            // newline, Esc cancels, the rest edit the buffer), bypassing
-            // `key_to_action` entirely — mirroring the two overlays above.
+            // The compose zone — a quick reply or a `Ctrl-N` draft — owns the
+            // keyboard while open: every key routes to the compose handler,
+            // bypassing `key_to_action` entirely — mirroring the two overlays
+            // above. While either draft's `/` / `@` pick list is showing, Enter/Tab
+            // pick, Up/Down move the highlight and Esc closes only the list; with
+            // no list, Enter submits (a reply sends, a draft launches),
+            // Ctrl-J/Alt+Enter add a newline, Esc cancels and the rest edit the
+            // buffer (`compose_key_to_action`).
             if app.is_composing() {
                 return compose::handle_compose_key(app, key);
             }
@@ -758,6 +772,20 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
         // terminal's writer. So the result is handed straight back to it (see
         // `Outcome::FinishCopy`), and the status is set there, from this result.
         AppEvent::CopyFinished { payload, copied } => Outcome::FinishCopy { payload, copied },
+        AppEvent::CatalogFetched { cwd, listing } => {
+            // Delivered ONCE per requested fetch, off-thread, by the catalog worker.
+            // Settle it (a `None` is released but never cached), then re-derive an
+            // open compose's list so a catalog that lands mid-draft shows at once.
+            // That refresh reads nothing new in practice: the transcript and folder
+            // reads are keyed to a token the key handler already resolved.
+            //
+            // Deliberately silent: a folder's list is a fact true over an INTERVAL,
+            // rendered by the pick list, never by the keypress-scoped status line
+            // (STATUS-LINE OWNERSHIP).
+            app.finish_catalog_fetch(cwd, listing);
+            compose::refresh_completion(app);
+            Outcome::Continue
+        }
         AppEvent::Tick => {
             // The tick already drove a redraw; counting it turns that existing
             // cadence into the board's clock, which `view::blink_visible` phases
@@ -2665,6 +2693,7 @@ mod tests {
     use crate::agents::ReportedAgent;
     use crate::resume::ModelPick;
     use crate::search::{filter, SearchMode};
+    use crate::store::skills::{Listing, ListingEntry};
     use crate::store::Session;
     use crate::tui::app::{
         NewSessionDraft, PaneLayout, Scope, AUTOSCROLL_FRAME, STATUS_DWELL_TICKS,
@@ -4270,6 +4299,476 @@ mod tests {
             "the send is marked in flight at its real home (the preview pane)"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- the compose `/` and `@` pick list (both drafts) ---------------------
+
+    /// A reply box open on a real session ([`completion_app_with`] with no extra
+    /// record) once claude's catalog for its folder has landed, listing `skills` as
+    /// commands with no description and no agents.
+    fn completion_app(skills: &[&str]) -> (App, PathBuf) {
+        let (mut app, dir) = completion_app_with(&[]);
+        let commands = skills
+            .iter()
+            .map(|name| ListingEntry {
+                name: (*name).to_owned(),
+                description: None,
+            })
+            .collect();
+        deliver_catalog(
+            &mut app,
+            &dir,
+            Some(Listing {
+                commands,
+                agents: Vec::new(),
+            }),
+        );
+        (app, dir)
+    }
+
+    /// A reply box open on a real session whose transcript carries `records`, one
+    /// JSONL line each, after its user turn, and whose cwd holds `notes.txt`,
+    /// `src/main.rs` and the session file itself. No catalog has landed.
+    fn completion_app_with(records: &[String]) -> (App, PathBuf) {
+        let (session, dir) = resumable_session_for_send();
+        let mut text = std::fs::read_to_string(&session.file).expect("read the fixture");
+        for record in records {
+            text.push('\n');
+            text.push_str(record);
+        }
+        text.push('\n');
+        std::fs::write(&session.file, text).expect("append the listing");
+        std::fs::write(dir.join("notes.txt"), "n").expect("write notes");
+        std::fs::create_dir_all(dir.join("src")).expect("create src");
+        std::fs::write(dir.join("src").join("main.rs"), "m").expect("write main");
+        let mut app = App::new(vec![session], Scope::All, dir.clone());
+        seed_live(&mut app, &[]);
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        assert!(app.is_composing());
+        (app, dir)
+    }
+
+    fn list_open(app: &App) -> bool {
+        app.compose
+            .as_ref()
+            .is_some_and(|c| c.completion.visible.is_some())
+    }
+
+    /// The open list's rows as `(label, description)`; empty when no list shows.
+    fn list_rows(app: &App) -> Vec<(String, Option<String>)> {
+        app.compose
+            .as_ref()
+            .and_then(|c| c.completion.visible.as_ref())
+            .map(|rows| {
+                rows.iter()
+                    .map(|c| (c.label.clone(), c.description.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// `(label, description)` rows for a [`list_rows`] comparison.
+    fn rows(expected: &[(&str, Option<&str>)]) -> Vec<(String, Option<String>)> {
+        expected
+            .iter()
+            .map(|(label, description)| ((*label).to_owned(), description.map(str::to_owned)))
+            .collect()
+    }
+
+    /// A folder's catalog as `claude_catalog` delivers it, from `(name,
+    /// description)` pairs.
+    fn catalog(commands: &[(&str, &str)], agents: &[(&str, &str)]) -> Listing {
+        let entries = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(name, description)| ListingEntry {
+                    name: (*name).to_owned(),
+                    description: Some((*description).to_owned()),
+                })
+                .collect()
+        };
+        Listing {
+            commands: entries(commands),
+            agents: entries(agents),
+        }
+    }
+
+    /// Hand-deliver a catalog fetch's ONE event for `cwd`, as the worker thread
+    /// would — no test spawns `claude`.
+    fn deliver_catalog(app: &mut App, cwd: &Path, listing: Option<Listing>) -> Outcome {
+        handle_event(
+            app,
+            AppEvent::CatalogFetched {
+                cwd: cwd.to_path_buf(),
+                listing,
+            },
+            &mut store_at(Path::new("/tmp")),
+        )
+    }
+
+    /// 3.8(a): `Esc` with the list open closes the LIST — the draft survives.
+    #[test]
+    fn esc_with_the_list_open_keeps_the_draft() {
+        let (mut app, dir) = completion_app(&["sbping", "sbpong", "other"]);
+        type_into_draft(&mut app, "/sb");
+        assert!(list_open(&app));
+        let outcome = press(&mut app, KeyCode::Esc);
+        assert!(matches!(outcome, Outcome::Continue));
+        assert!(app.is_composing(), "Esc must not cancel the draft");
+        assert_eq!(draft_text(&app), "/sb");
+        assert!(!list_open(&app));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.8(b): `Enter` with the list open inserts the pick and sends NOTHING.
+    #[test]
+    fn enter_with_the_list_open_inserts_the_pick_and_does_not_send() {
+        let (mut app, dir) = completion_app(&["sbping", "sbpong", "other"]);
+        type_into_draft(&mut app, "/sb");
+        let outcome = press(&mut app, KeyCode::Enter);
+        assert!(matches!(outcome, Outcome::Continue));
+        assert_eq!(draft_text(&app), "/sbping ");
+        assert!(app.sending_to("sess-send-e2e").is_none());
+        assert!(app.is_composing());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.8(c): with nothing matching there is no list, so `Enter` sends as ever.
+    #[test]
+    fn enter_with_no_match_still_sends() {
+        let (mut app, dir) = completion_app(&["sbping"]);
+        type_into_draft(&mut app, "/zzz-no-such-skill");
+        assert!(!list_open(&app), "an empty candidate set shows no list");
+        assert!(matches!(press(&mut app, KeyCode::Enter), Outcome::Send(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.8(d): `Tab` inserts `/name ` and a following `Enter` sends it; `Down`
+    /// moves the highlight first and wraps.
+    #[test]
+    fn tab_inserts_the_pick_and_the_next_enter_sends_it() {
+        let (mut app, dir) = completion_app(&["sbping", "sbpong"]);
+        type_into_draft(&mut app, "/sb");
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(draft_text(&app), "/sbpong ");
+        let Outcome::Send(req) = press(&mut app, KeyCode::Enter) else {
+            panic!("Enter with the list closed must send");
+        };
+        assert_eq!(req.argv.last().map(String::as_str), Some("/sbpong "));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.8(e): an `@` folder pick reopens the list one level down; `Esc` then
+    /// `Enter` sends the folder mention.
+    #[test]
+    fn an_at_folder_pick_reopens_one_level_down() {
+        let (mut app, dir) = completion_app(&[]);
+        type_into_draft(&mut app, "hé @s");
+        assert!(list_open(&app));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(draft_text(&app), "hé @src/", "a folder gets no space");
+        let rows = app.compose.as_ref().unwrap().completion.visible.clone();
+        assert_eq!(rows.expect("list reopens")[0].label, "main.rs");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.is_composing() && !list_open(&app));
+        let Outcome::Send(req) = press(&mut app, KeyCode::Enter) else {
+            panic!("Enter with the list closed must send");
+        };
+        assert_eq!(req.argv.last().map(String::as_str), Some("hé @src/"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.8(f): after `Esc` the same token stays closed; deleting the trigger and
+    /// retyping it reopens.
+    #[test]
+    fn a_dismissed_token_stays_closed_until_the_trigger_is_retyped() {
+        let (mut app, dir) = completion_app(&[]);
+        type_into_draft(&mut app, "@no");
+        assert!(list_open(&app));
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('t'));
+        assert!(!list_open(&app), "more of the same token stays closed");
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Backspace);
+        }
+        assert_eq!(draft_text(&app), "");
+        type_into_draft(&mut app, "@n");
+        assert!(list_open(&app));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `Ctrl-N` background draft has the SAME pick list as a reply. Its `@` files
+    /// are a local read of the launch dir, so they show at once; its `/` list is
+    /// claude's catalog for that dir alone, exactly as a reply's is, so `/` shows
+    /// nothing until the catalog lands — and then opens on the token already
+    /// typed. With the list closed, `Enter` still launches.
+    #[test]
+    fn a_background_draft_lists_files_at_once_and_skills_once_the_catalog_lands() {
+        let dir = unique_temp_dir("bg-complete");
+        std::fs::write(dir.join("notes.txt"), "n").expect("write notes");
+        let mut app = App::new(Vec::new(), Scope::All, dir.clone());
+        compose::open_background(&mut app, None);
+        type_into_draft(&mut app, "@n");
+        assert_eq!(
+            list_rows(&app),
+            rows(&[("notes.txt", None)]),
+            "a draft's `@` lists its launch dir at once"
+        );
+        press(&mut app, KeyCode::Esc);
+        assert!(
+            app.is_composing() && !list_open(&app),
+            "Esc closes the list, never the draft"
+        );
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.is_composing());
+
+        compose::open_background(&mut app, None);
+        type_into_draft(&mut app, "/sb");
+        assert!(
+            !list_open(&app),
+            "no catalog yet, and a `/` lists claude's catalog alone"
+        );
+
+        let launch_dir = app.launch_dir.clone();
+        let out = deliver_catalog(
+            &mut app,
+            &launch_dir,
+            Some(catalog(&[("sbping", "answers pong")], &[])),
+        );
+        assert!(matches!(out, Outcome::Continue));
+        assert_eq!(
+            list_rows(&app),
+            rows(&[("/sbping", Some("answers pong"))]),
+            "the landed catalog opens the list on the token already typed"
+        );
+
+        assert!(matches!(press(&mut app, KeyCode::Enter), Outcome::Continue));
+        assert_eq!(
+            draft_text(&app),
+            "/sbping ",
+            "Enter picks while the list is open"
+        );
+        assert!(!list_open(&app));
+        assert!(matches!(
+            press(&mut app, KeyCode::Enter),
+            Outcome::BgLaunch(_)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A reply's `/` lists claude's catalog for its folder alone. Its transcript's
+    /// `skill_listing` is the MODEL's list, which names skills claude's own `/`
+    /// menu hides (`keybindings-help`), so nothing shows until the catalog lands —
+    /// and the landed catalog then opens the list on the `/` already typed.
+    #[test]
+    fn a_replys_slash_waits_for_the_catalog_never_its_transcripts_skills() {
+        let skills = r#"{"type":"attachment","attachment":{"type":"skill_listing","names":["sbping","keybindings-help"],"content":"- sbping: Answers pong\n- keybindings-help: Customize keyboard shortcuts","isInitial":true}}"#;
+        let (mut app, dir) = completion_app_with(&[skills.to_owned()]);
+        type_into_draft(&mut app, "/");
+        assert!(
+            !list_open(&app),
+            "the transcript's skills are never offered"
+        );
+        deliver_catalog(
+            &mut app,
+            &dir,
+            Some(catalog(&[("sbother", "the catalog's own")], &[])),
+        );
+        assert_eq!(
+            list_rows(&app),
+            rows(&[("/sbother", Some("the catalog's own"))]),
+            "the landed catalog opens the list on the `/` already typed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A top-level `@` lists folders, then files, then the catalog's agents; picking
+    /// an agent inserts the mention claude reads, `@agent-<name>`, and an `@` under a
+    /// folder lists no agent, since an agent is not a path.
+    #[test]
+    fn a_top_level_at_lists_folders_then_files_then_the_catalogs_agents() {
+        let (mut app, dir) = completion_app(&[]);
+        deliver_catalog(
+            &mut app,
+            &dir,
+            Some(catalog(&[], &[("sby-agent", "Pings back")])),
+        );
+        type_into_draft(&mut app, "@");
+        assert_eq!(
+            list_rows(&app),
+            rows(&[
+                ("src/", None),
+                ("notes.txt", None),
+                ("sess-send-e2e.jsonl", None),
+                ("sby-agent (agent)", Some("Pings back")),
+            ])
+        );
+        press(&mut app, KeyCode::Up); // wraps to the last row: the agent
+        assert!(matches!(press(&mut app, KeyCode::Enter), Outcome::Continue));
+        assert_eq!(draft_text(&app), "@agent-sby-agent ");
+
+        type_into_draft(&mut app, "@src/");
+        assert_eq!(
+            list_rows(&app),
+            rows(&[("main.rs", None)]),
+            "no agent under a folder part"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With no catalog landed, a reply's `@` agents come from its transcript's
+    /// `agent_listing_delta` records, described and stripped of the tool list.
+    #[test]
+    fn a_reply_with_no_catalog_lists_agents_from_its_transcript() {
+        let delta = r#"{"type":"attachment","attachment":{"type":"agent_listing_delta","addedTypes":["sby-agent"],"addedLines":["- sby-agent: Pings back (Tools: Read)"],"removedTypes":[],"isInitial":true}}"#;
+        let (mut app, dir) = completion_app_with(&[delta.to_owned()]);
+        type_into_draft(&mut app, "@sb");
+        assert_eq!(
+            list_rows(&app),
+            rows(&[("sby-agent (agent)", Some("Pings back"))])
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Close the open reply and open a fresh one on the selected row.
+    fn reopen_reply(app: &mut App) {
+        press(app, KeyCode::Esc);
+        assert!(!app.is_composing());
+        assert!(
+            matches!(press_ctrl(app, KeyCode::Char('r')), Outcome::Continue),
+            "opening a compose still just continues"
+        );
+        assert!(app.is_composing());
+    }
+
+    /// The driver's fetch decision: each compose asks ONCE, for its own source's
+    /// folder, and gets that folder only when it is neither cached nor in flight.
+    /// A failed fetch is not cached, so the NEXT compose retries, while the compose
+    /// that waited on it does not.
+    #[test]
+    fn each_compose_asks_once_for_its_folders_catalog() {
+        let (session, cwd) = resumable_session_for_send();
+        let launch = unique_temp_dir("catalog-launch");
+        let mut app = App::new(vec![session], Scope::All, launch.clone());
+        seed_live(&mut app, &[]);
+        assert!(matches!(
+            press_ctrl(&mut app, KeyCode::Char('r')),
+            Outcome::Continue
+        ));
+
+        assert_eq!(
+            compose::take_catalog_fetch(&mut app),
+            Some(cwd.clone()),
+            "a reply asks for its session's folder"
+        );
+        assert!(app.catalogs_in_flight.contains(&cwd));
+        assert_eq!(
+            compose::take_catalog_fetch(&mut app),
+            None,
+            "one compose asks once"
+        );
+
+        reopen_reply(&mut app);
+        assert_eq!(
+            compose::take_catalog_fetch(&mut app),
+            None,
+            "that folder's fetch is already in flight"
+        );
+
+        deliver_catalog(&mut app, &cwd, None);
+        assert!(!app.catalogs_in_flight.contains(&cwd));
+        assert_eq!(
+            compose::take_catalog_fetch(&mut app),
+            None,
+            "the compose that waited on the failed fetch does not ask again"
+        );
+
+        reopen_reply(&mut app);
+        assert_eq!(
+            compose::take_catalog_fetch(&mut app),
+            Some(cwd.clone()),
+            "no answer was cached, so the next compose retries"
+        );
+
+        deliver_catalog(
+            &mut app,
+            &cwd,
+            Some(catalog(&[("sbping", "answers pong")], &[])),
+        );
+        reopen_reply(&mut app);
+        assert_eq!(
+            compose::take_catalog_fetch(&mut app),
+            None,
+            "a cached catalog is never fetched again"
+        );
+
+        press(&mut app, KeyCode::Esc);
+        compose::open_background(&mut app, None);
+        assert_eq!(
+            compose::take_catalog_fetch(&mut app),
+            Some(launch.clone()),
+            "a background draft asks for its launch dir"
+        );
+        let _ = std::fs::remove_dir_all(&cwd);
+        let _ = std::fs::remove_dir_all(&launch);
+    }
+
+    /// A token the user closed with `Esc` stays closed when a catalog lands for its
+    /// folder, even one that matches it.
+    #[test]
+    fn a_token_closed_with_esc_stays_closed_when_the_catalog_lands() {
+        let (mut app, dir) = completion_app_with(&[]);
+        type_into_draft(&mut app, "@s");
+        assert_eq!(
+            list_rows(&app).first().map(|(label, _)| label.as_str()),
+            Some("src/"),
+            "the list is open on the folder"
+        );
+        press(&mut app, KeyCode::Esc);
+        assert!(app.is_composing() && !list_open(&app));
+        deliver_catalog(
+            &mut app,
+            &dir,
+            Some(catalog(&[], &[("sby-agent", "Pings back")])),
+        );
+        assert!(
+            !list_open(&app),
+            "a landed catalog must not reopen a list the user closed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.8(h): a pasted `/` opens the list and a paste never yields an `Outcome`
+    /// that submits.
+    #[test]
+    fn pasting_a_slash_opens_the_list() {
+        let (mut app, dir) = completion_app(&["sbping"]);
+        let outcome = paste(&mut app, "/");
+        assert!(matches!(outcome, Outcome::Continue));
+        assert!(list_open(&app));
+        assert!(app.sending_to("sess-send-e2e").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `Ctrl-N` twin of [`pasting_a_slash_opens_the_list`]: a pasted `@` in an
+    /// empty background draft opens the list on its launch dir's files, and the
+    /// paste launches nothing.
+    #[test]
+    fn pasting_an_at_into_a_background_draft_opens_the_list() {
+        let dir = unique_temp_dir("bg-paste-at");
+        std::fs::write(dir.join("notes.txt"), "n").expect("write notes");
+        let mut app = App::new(Vec::new(), Scope::All, dir.clone());
+        compose::open_background(&mut app, None);
+        let outcome = paste(&mut app, "@");
+        assert!(matches!(outcome, Outcome::Continue));
+        assert_eq!(draft_text(&app), "@");
+        assert_eq!(list_rows(&app), rows(&[("notes.txt", None)]));
+        assert!(
+            app.draft.as_ref().is_some_and(|d| !d.is_launching()),
+            "a paste must never launch the draft"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -9992,6 +10491,115 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A catalog fetch in flight when the board session ends can never report back
+    /// — its channel dies with the session — so the teardown seam forgets its mark,
+    /// or that folder could not be fetched again this run. An outcome that keeps
+    /// the board up keeps the mark, because that answer is still coming; the lists
+    /// already cached outlive the session either way.
+    #[test]
+    fn ending_the_board_session_forgets_catalog_fetches_in_flight() {
+        let mut app = app_with("idle", None);
+        let in_flight = PathBuf::from("/tmp/catalog-in-flight");
+        let cached = PathBuf::from("/tmp/catalog-cached");
+        app.finish_catalog_fetch(cached.clone(), Some(Default::default()));
+        app.catalogs_in_flight.insert(in_flight.clone());
+
+        let out = handle_event(&mut app, AppEvent::Tick, &mut store_at(Path::new("/tmp")));
+        assert!(matches!(out, Outcome::Continue));
+        assert!(
+            app.catalogs_in_flight.contains(&in_flight),
+            "an event that keeps the board up must keep the mark: its answer can still land"
+        );
+
+        let out = press_ctrl(&mut app, KeyCode::Char('c'));
+        assert!(
+            matches!(out, Outcome::Quit) && out.ends_board_session(),
+            "the quit key must really end the board session, or this proves nothing"
+        );
+        assert!(
+            app.catalogs_in_flight.is_empty(),
+            "a mark outliving its channel blocks that folder's every later fetch: {:?}",
+            app.catalogs_in_flight
+        );
+        assert!(
+            app.catalogs.contains_key(&cached),
+            "a cached list is an answer, and the App outlives the session"
+        );
+
+        // The same through the path that really marks a fetch: a compose's ask.
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        let asked = compose::take_catalog_fetch(&mut app).expect("the reply asks for its folder");
+        assert!(app.catalogs_in_flight.contains(&asked));
+        press(&mut app, KeyCode::Esc);
+        assert!(
+            !app.is_composing(),
+            "Esc closes the reply, so the quit key reaches the board"
+        );
+        let out = press_ctrl(&mut app, KeyCode::Char('c'));
+        assert!(matches!(out, Outcome::Quit));
+        assert!(
+            app.catalogs_in_flight.is_empty(),
+            "the asked fetch's mark dies with its board session: {:?}",
+            app.catalogs_in_flight
+        );
+    }
+
+    /// `CatalogFetched` settles its fetch through the event loop — an answer is
+    /// cached under its folder, no answer only releases the folder — and says
+    /// nothing: a status the user set before it lands is left exactly as it was.
+    #[test]
+    fn a_catalog_fetched_event_settles_its_fetch_without_touching_the_status() {
+        let mut app = app_with("idle", None);
+        let failed = PathBuf::from("/tmp/catalog-failed");
+        let answered = PathBuf::from("/tmp/catalog-answered");
+        app.catalogs_in_flight.insert(failed.clone());
+        app.catalogs_in_flight.insert(answered.clone());
+        app.set_status("an earlier refusal");
+        let listing = crate::store::skills::Listing {
+            commands: vec![crate::store::skills::ListingEntry {
+                name: "sbping".to_string(),
+                description: Some("answers pong".to_string()),
+            }],
+            agents: Vec::new(),
+        };
+        assert!(!app.is_composing(), "premise: no compose is open");
+
+        for (cwd, delivered) in [
+            (failed.clone(), None),
+            (answered.clone(), Some(listing.clone())),
+        ] {
+            let out = handle_event(
+                &mut app,
+                AppEvent::CatalogFetched {
+                    cwd,
+                    listing: delivered,
+                },
+                &mut store_at(Path::new("/tmp")),
+            );
+            assert!(matches!(out, Outcome::Continue));
+        }
+
+        assert!(
+            app.catalogs_in_flight.is_empty(),
+            "both folders are released, the failed one included: {:?}",
+            app.catalogs_in_flight
+        );
+        assert_eq!(app.catalogs.get(&answered), Some(&listing));
+        assert!(
+            !app.catalogs.contains_key(&failed),
+            "no answer is never cached"
+        );
+        assert_eq!(
+            app.status.as_deref(),
+            Some("an earlier refusal"),
+            "a landed catalog is an interval fact, never a status line"
+        );
+        assert!(
+            !app.is_composing(),
+            "re-deriving the pick list after a landed catalog opens nothing"
+        );
     }
 
     /// A finished launch may only close the card IT dispatched — NEVER a compose

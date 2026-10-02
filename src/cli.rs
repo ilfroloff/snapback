@@ -56,8 +56,8 @@ KEYS:
                   defined, then draft the session's first message — Enter starts
                   it as a BACKGROUND agent without leaving the board, Ctrl-O runs
                   it interactively instead, Ctrl-L picks its model, Ctrl-J or
-                  Alt+Enter newline, Esc cancels. The message is sent as the
-                  first turn either way
+                  Alt+Enter newline, Esc cancels, and / or @ opens the pick
+                  list (below). The message is sent as the first turn either way
     Ctrl-O        in the agent picker: start that agent interactively at once,
                   skipping the draft — the same verb Ctrl-O has inside the draft
     Ctrl-X        leader chord: x hide · d delete (this row or its lineage)
@@ -77,7 +77,7 @@ KEYS:
                   While a session's own reply is still being sent, Ctrl-R on
                   that session is refused until it lands; other rows can still
                   reply (Enter sends, Ctrl-L picks the model, Ctrl-J or Alt+Enter
-                  newline, Esc cancels)
+                  newline, Esc cancels, and / or @ opens the pick list below)
     Ctrl-L        in a reply or draft box: pick the model, and optionally the
                   effort, for THIS message only. The box names what it will run
                   on — a reply 'model: session (<model>)', the model its session
@@ -96,6 +96,18 @@ KEYS:
                   which then reads 'model: <alias> · <effort>'. Nothing on the
                   default row. claude lowers a level the model can't use, and
                   ignores it for a model with no effort support
+    / or @        in a reply or draft box: a / as the first character lists
+                  claude's skills and commands for that folder, an @ at the
+                  start of a word lists files and folders (and, at the top
+                  level, agents, inserted as @agent-<name>); a skill, command or
+                  agent shows its description beside it. The letters after it
+                  narrow the list by the start of the name. While the list is
+                  open ↑/↓ choose, Enter or Tab pick (a folder reopens the list
+                  one level down), and Esc closes only the list (the draft
+                  stays). The list is claude's own, fetched once per folder in
+                  the background: until it lands / lists nothing in either box,
+                  while @ shows files and folders at once, a reply's agents come
+                  from its transcript and a draft's wait for the list
     Ctrl-K        stop / interrupt the selected session's live agent. With a job
                   to stop it runs claude stop: an agent whose run is over (done,
                   stopped, failed) stops at once, every other one confirms

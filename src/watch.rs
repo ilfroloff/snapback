@@ -35,6 +35,7 @@ use crate::agents::{self, ReportedAgent};
 use crate::claude_settings;
 use crate::model_aliases;
 use crate::store::discover::{is_session_path, store_depth, StoreDepth};
+use crate::store::skills::Listing;
 
 /// Debounce window for coalescing filesystem event storms into one reload.
 ///
@@ -295,6 +296,23 @@ pub enum AppEvent {
     /// lands — a draft `model: default`, a reply the session's own model — and keep
     /// reading that if it never does.
     SettingsModel(claude_settings::ModelDefaults),
+    /// A folder's slash commands and agents as claude's own `initialize`
+    /// handshake lists them, fetched OFF the UI thread for the compose pick list
+    /// (see [`crate::claude_catalog::spawn_fetch`]).
+    ///
+    /// Like [`SettingsModel`](Self::SettingsModel) it fires EXACTLY ONCE, here per
+    /// requested fetch, from a thread spawned for that one fetch. `None` is "no
+    /// answer" — the child could not be spawned, timed out, or gave no or a bad
+    /// reply — and is NOT a verdict about the folder, so it is never cached and a
+    /// later compose on that folder asks again. Nothing waits on it: until it
+    /// lands, a `/` lists nothing and a reply's `@` agents come from its transcript
+    /// (`docs/agents/DOMAIN.md`, "Compose pick list").
+    CatalogFetched {
+        /// The folder the fetch ran in, the key its answer is cached under.
+        cwd: PathBuf,
+        /// claude's listing for that folder, or `None` for no answer.
+        listing: Option<Listing>,
+    },
     /// A periodic wake-up. The update loop does nothing costly on this.
     Tick,
 }

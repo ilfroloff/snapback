@@ -45,18 +45,37 @@
 //! hand-offs live in [`handle_compose_key`], a thin driver over that decision and
 //! over the pure cores in [`crate::send`] / [`crate::resume`].
 //!
+//! BOTH drafts carry the same pick list ([`CompletionState`]), through the same
+//! editor, router and driver: `/` first in the draft lists the folder's skills and
+//! commands, `@` at the start of a word lists files and folders and, at the top
+//! level, agents. The one per-target difference is WHERE the list reads from, and
+//! [`completion_source`] alone decides it. While the list is showing the router
+//! claims `Enter`/`Tab` (pick), `Up`/`Down` (highlight) and `Esc` (close the list,
+//! never the draft); otherwise every key decodes as before. Its bounded reads run
+//! from the key/paste handler and the `CatalogFetched` arm only
+//! ([`refresh_completion`]), never the render path; claude's own list for the
+//! folder is fetched off the UI thread, requested by [`take_catalog_fetch`].
+//!
 //! [`insert_paste`] is the ONE entry point that is not a keypress: a terminal paste
 //! arrives as whole TEXT (`super::update::handle_paste`) and goes straight into the
 //! editor, bypassing the key router entirely. That bypass is the point — routed as
 //! keystrokes, a pasted newline reached the `Enter` = Send arm above.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 
 use crate::resume::ModelPick;
 use crate::send::{self, BgLaunchRequest, SendPlan, SendRequest};
+use crate::store::skills::{read_listing, Listing};
 
 use super::app::{App, NewSessionDraft};
+use super::complete::{
+    at_candidates, completion_context, filter_commands, list_dir, move_highlight, replacement,
+    settle_highlight, split_path_query, Candidate, Context, DirEntryInfo, Trigger,
+};
 use super::update::Outcome;
 
 /// Status shown when Send is pressed on an empty / whitespace-only reply buffer:
@@ -136,6 +155,188 @@ pub struct ComposeState {
     /// read by the submit paths below, which emit `--model`/`--effort` ONLY when it
     /// is `Some`, and by the compose box's `model:` label.
     pub model: Option<ModelPick>,
+    /// The `/` and `@` pick list of this draft, reply and background draft alike
+    /// (see [`CompletionState`]).
+    pub completion: CompletionState,
+}
+
+/// The compose pick list of either draft: what is showing, plus the per-draft
+/// caches that keep its filesystem reads bounded. Born empty with every
+/// [`ComposeState::new`] and dead with the compose — nothing global, nothing
+/// persisted. Claude's own list for a folder is NOT kept here: it outlives the
+/// draft, in `App::catalogs`.
+#[derive(Debug, Default)]
+pub struct CompletionState {
+    /// The rows on offer. DERIVED by [`refresh_completion`] and `Some` ONLY when
+    /// non-empty: an empty list would still claim `Enter` and `Esc` (see
+    /// [`compose_key_to_action`]), so "no match" must mean "no list", never an
+    /// empty one.
+    pub visible: Option<Vec<Candidate>>,
+    /// The highlighted row of `visible`.
+    pub highlight: usize,
+    /// The token the caret ends, whether or not its list is showing.
+    pub context: Option<Context>,
+    /// The token `Esc` closed the list for: `(trigger, row, start column)`. The
+    /// list stays closed while the caret is still in that same token.
+    dismissed: Option<(Trigger, usize, usize)>,
+    /// A REPLY's `@` agents until a catalog lands, read from its session transcript
+    /// by [`read_listing`]: `None` = not read yet, an empty listing = read and
+    /// nothing found. Read at most once per draft, only while no catalog has landed
+    /// for the folder, only for a top-level `@` (an `@` with a folder part lists no
+    /// agent, and `/` lists the catalog alone), and never for a background draft
+    /// (it has no transcript).
+    transcript: Option<Listing>,
+    /// Whether this compose has had its ONE ask for a catalog fetch
+    /// ([`take_catalog_fetch`]). Born `false` with every compose, so the next
+    /// compose on a folder whose fetch failed asks again, while this one never does.
+    catalog_requested: bool,
+    /// Folder listings keyed by the resolved folder. Read at most once per folder.
+    dirs: HashMap<PathBuf, Vec<DirEntryInfo>>,
+}
+
+/// What one refresh of the list reads from, borrowed for that refresh alone: the
+/// target's folder, its transcript (a reply's only) and the folder's cached
+/// catalog, if one has landed. Borrowed, so a catalog is never cloned per
+/// keystroke.
+struct SourceView<'a> {
+    cwd: &'a Path,
+    transcript: Option<&'a Path>,
+    catalog: Option<&'a Listing>,
+}
+
+impl CompletionState {
+    /// Recompute the list for the caret at `cursor` in `lines`. `source` is what
+    /// this draft's list reads from ([`completion_source`]), or `None` for a reply
+    /// whose session left the store, which shows no list.
+    ///
+    /// `/` lists the folder's `catalog` alone, and nothing until it lands: only
+    /// claude's own list knows which skills and commands its `/` menu hides, while
+    /// a transcript's `skill_listing` is the MODEL's list and carries no flag to
+    /// tell them apart (`docs/agents/CLAUDE_CLI.md`, "The `initialize` control
+    /// handshake"). A top-level `@` takes its agents from the catalog once it has
+    /// landed — it REPLACES the reply's transcript, never merges with it — else
+    /// from that transcript, else none.
+    ///
+    /// The ONLY reads the pick list makes happen here: the transcript listing (once
+    /// per reply draft, and only for a top-level `@`) and one folder listing
+    /// (once per folder, capped by `COMPLETION_MAX_DIR_ENTRIES`). Bounded
+    /// synchronous reads on the key/paste path are the same shape as
+    /// `defined_agents::discover_agents` on `Ctrl-N` and `send::plan_send` on
+    /// `Enter` (PATTERNS.md section 6); the render path only ever reads the cached
+    /// `visible` and performs no I/O.
+    fn refresh(
+        &mut self,
+        lines: &[String],
+        cursor: (usize, usize),
+        source: Option<SourceView<'_>>,
+    ) {
+        let Some(source) = source else {
+            // The ask is per compose, not per source: a session that leaves the
+            // store and comes back must not buy this compose a second fetch.
+            *self = Self {
+                catalog_requested: self.catalog_requested,
+                ..Self::default()
+            };
+            return;
+        };
+        let Some(ctx) = completion_context(lines, cursor) else {
+            self.context = None;
+            self.dismissed = None;
+            self.visible = None;
+            return;
+        };
+        let key = (ctx.trigger, ctx.row, ctx.start);
+        let start_changed = self.context.as_ref().map(|c| (c.trigger, c.row, c.start)) != Some(key);
+        self.context = Some(ctx.clone());
+        if self.dismissed != Some(key) {
+            self.dismissed = None;
+        } else {
+            self.visible = None;
+            return;
+        }
+        let candidates = match ctx.trigger {
+            Trigger::Slash => source.catalog.map_or_else(Vec::new, |listing| {
+                filter_commands(&listing.commands, &ctx.query)
+            }),
+            Trigger::At => {
+                let (dir_part, _) = split_path_query(&ctx.query);
+                let dir = source.cwd.join(dir_part);
+                let entries = self
+                    .dirs
+                    .entry(dir.clone())
+                    .or_insert_with(|| list_dir(&dir));
+                // Only a top-level `@` lists agents (`complete::at_candidates`), so
+                // only then may the transcript be read.
+                let agents = if dir_part.is_empty() {
+                    active_listing(&mut self.transcript, &source)
+                        .map_or(&[][..], |listing| listing.agents.as_slice())
+                } else {
+                    &[]
+                };
+                at_candidates(entries, agents, &ctx.query)
+            }
+        };
+        if candidates.is_empty() {
+            self.visible = None;
+            return;
+        }
+        self.highlight = settle_highlight(self.highlight, candidates.len(), start_changed);
+        self.visible = Some(candidates);
+    }
+}
+
+/// The listing a top-level `@` takes its agents from: `source`'s catalog when one
+/// has landed, else the reply's transcript — read into `cache` on first use, and
+/// only when `source` has a transcript — else none. `/` never asks it: it lists
+/// the catalog alone. Takes the cache field alone, so the caller keeps its other
+/// fields borrowable.
+fn active_listing<'a>(
+    cache: &'a mut Option<Listing>,
+    source: &SourceView<'a>,
+) -> Option<&'a Listing> {
+    if let Some(catalog) = source.catalog {
+        return Some(catalog);
+    }
+    let file = source.transcript?;
+    Some(cache.get_or_insert_with(|| read_listing(file)))
+}
+
+/// Where a compose's pick list reads from: the folder whose files, folders and
+/// catalog it offers, and the transcript its `@` agents come from until that
+/// catalog lands — a reply's alone, since a background draft has none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompletionSource {
+    /// The folder the target's `claude` child runs in: the key of its catalog, and
+    /// the root an `@` path resolves against.
+    pub cwd: PathBuf,
+    /// A reply's session file, read for its `@` agents only; `None` for a
+    /// background draft, which has none.
+    pub transcript: Option<PathBuf>,
+}
+
+/// THE one place a compose target's pick-list source is decided; both
+/// [`refresh_completion`] and [`take_catalog_fetch`] ask it, so the two drafts
+/// share every other line of the list.
+///
+/// * A reply reads its session's `cwd` and file, taken from the `Session` the
+///   store parsed out of the file itself (AGENTS.md AUTHORITATIVE-FROM-FILE), or
+///   nothing once the session has left the store.
+/// * A background draft reads [`App::launch_dir`], the directory
+///   `send::plan_bg_launch` and `resume::check_new` run its child in, and has no
+///   transcript.
+pub(crate) fn completion_source(app: &App, target: &ComposeTarget) -> Option<CompletionSource> {
+    match target {
+        ComposeTarget::Reply { session_id, .. } => {
+            app.session_by_id(session_id).map(|s| CompletionSource {
+                cwd: s.cwd.clone(),
+                transcript: Some(s.file.clone()),
+            })
+        }
+        ComposeTarget::NewBackgroundAgent { .. } => Some(CompletionSource {
+            cwd: app.launch_dir.clone(),
+            transcript: None,
+        }),
+    }
 }
 
 impl ComposeState {
@@ -158,6 +359,7 @@ impl ComposeState {
             target,
             textarea,
             model: None,
+            completion: CompletionState::default(),
         }
     }
 
@@ -294,6 +496,14 @@ pub enum ComposeAction {
     /// A quarter page down (`Ctrl-D`). On a reply it is taken from the editor's
     /// delete-char on purpose; a draft keeps it.
     PreviewHalfDown,
+    /// Insert the highlighted pick-list row (`Enter` or `Tab`, list open only).
+    AcceptCompletion,
+    /// Move the pick-list highlight up (`Up`, list open only).
+    CompletionPrev,
+    /// Move the pick-list highlight down (`Down`, list open only).
+    CompletionNext,
+    /// Close the pick list, keeping the draft (`Esc`, list open only).
+    CloseCompletion,
 }
 
 /// Map a keypress to a [`ComposeAction`]. PURE and free of any `TextArea`
@@ -330,8 +540,14 @@ pub enum ComposeAction {
 ///   forwards them to the editor.
 /// * `Esc` → **Cancel** (dismiss compose, not the app).
 /// * everything else → **Forward** to the editor.
+///
+/// While the `/` / `@` pick list is showing (`list_open`), and only then, the keys
+/// it needs are claimed AFTER the chords above (which keep their meaning): bare
+/// `Enter` and `Tab` → **AcceptCompletion**, `Up`/`Down` → **CompletionPrev** /
+/// **CompletionNext**, `Esc` → **CloseCompletion** (the list, never the draft).
+/// With `list_open == false` every key decodes exactly as listed above.
 #[must_use]
-pub fn compose_key_to_action(key: KeyEvent) -> ComposeAction {
+pub fn compose_key_to_action(key: KeyEvent, list_open: bool) -> ComposeAction {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -353,6 +569,10 @@ pub fn compose_key_to_action(key: KeyEvent) -> ComposeAction {
         KeyCode::PageUp if !ctrl => ComposeAction::PreviewPageUp,
         KeyCode::PageDown if !ctrl => ComposeAction::PreviewPageDown,
         KeyCode::Enter if alt || shift => ComposeAction::Newline,
+        KeyCode::Enter | KeyCode::Tab if list_open => ComposeAction::AcceptCompletion,
+        KeyCode::Up if list_open => ComposeAction::CompletionPrev,
+        KeyCode::Down if list_open => ComposeAction::CompletionNext,
+        KeyCode::Esc if list_open => ComposeAction::CloseCompletion,
         KeyCode::Enter => ComposeAction::Send,
         KeyCode::Esc => ComposeAction::Cancel,
         _ => ComposeAction::Forward,
@@ -413,17 +633,49 @@ pub fn handle_compose_key(app: &mut App, key: KeyEvent) -> Outcome {
     // same way `update::dispatch` clears before a board action. The Enter that sets
     // a nudge still leaves it visible, and the next keystroke clears it.
     app.clear_status();
-    match compose_key_to_action(key) {
+    let list_open = app
+        .compose
+        .as_ref()
+        .is_some_and(|c| c.completion.visible.is_some());
+    match compose_key_to_action(key, list_open) {
         ComposeAction::Newline => {
             if let Some(compose) = app.compose.as_mut() {
                 compose.textarea.insert_newline();
             }
+            refresh_completion(app);
             Outcome::Continue
         }
         ComposeAction::Forward => {
             if let Some(compose) = app.compose.as_mut() {
                 compose.textarea.input(key);
             }
+            refresh_completion(app);
+            Outcome::Continue
+        }
+        ComposeAction::AcceptCompletion => {
+            if let Some(compose) = app.compose.as_mut() {
+                accept_completion(compose);
+            }
+            refresh_completion(app);
+            Outcome::Continue
+        }
+        ComposeAction::CompletionPrev => {
+            step_highlight(app, false);
+            refresh_completion(app);
+            Outcome::Continue
+        }
+        ComposeAction::CompletionNext => {
+            step_highlight(app, true);
+            refresh_completion(app);
+            Outcome::Continue
+        }
+        ComposeAction::CloseCompletion => {
+            if let Some(compose) = app.compose.as_mut() {
+                let state = &mut compose.completion;
+                state.dismissed = state.context.as_ref().map(|c| (c.trigger, c.row, c.start));
+                state.visible = None;
+            }
+            refresh_completion(app);
             Outcome::Continue
         }
         ComposeAction::Cancel => {
@@ -494,6 +746,117 @@ pub fn insert_paste(app: &mut App, text: &str) {
     if let Some(compose) = app.compose.as_mut() {
         compose.textarea.insert_str(text);
     }
+    // A pasted `/` or `@` opens the list like a typed one; still no `Outcome`.
+    refresh_completion(app);
+}
+
+/// Recompute the open draft's pick list from its editor, reply and background
+/// draft alike, from the source [`completion_source`] names and the folder's
+/// cached catalog; a reply whose session left the store gets no list.
+///
+/// Its bounded reads ([`CompletionState::refresh`]: the transcript listing, once
+/// per reply draft and only for a top-level `@`, and folder listings, once
+/// per folder on both targets) run from the key and paste handlers and from
+/// `update::dispatch`'s `CatalogFetched` arm — which calls this so a catalog that
+/// lands mid-draft reaches an open list — and never from the render path.
+///
+/// Only the source's two paths are cloned out (clone-then-mutate); the catalog is
+/// BORROWED, `app.catalogs` beside `app.compose` as disjoint fields, so no list is
+/// copied per keystroke.
+pub(crate) fn refresh_completion(app: &mut App) {
+    let Some(compose) = app.compose.as_ref() else {
+        return;
+    };
+    let source = completion_source(app, &compose.target);
+    let catalog = source.as_ref().and_then(|s| app.catalogs.get(&s.cwd));
+    let Some(compose) = app.compose.as_mut() else {
+        return;
+    };
+    let view = source.as_ref().map(|s| SourceView {
+        cwd: &s.cwd,
+        transcript: s.transcript.as_deref(),
+        catalog,
+    });
+    compose.completion.refresh(
+        compose.textarea.lines(),
+        cursor_pos(&compose.textarea),
+        view,
+    );
+}
+
+/// The folder whose catalog the driver should fetch now, if any: `tui::run_inner`
+/// asks after every handled event and spawns `claude_catalog::spawn_fetch` on an
+/// answer, so the decision stays here, pure and tested, and no key handler ever
+/// spawns.
+///
+/// Each compose ASKS ONCE, the first time it is asked with a source: it is marked
+/// `catalog_requested` whatever the answer, and the answer is the source's `cwd`
+/// only when that folder is neither cached in `app.catalogs` nor already in
+/// `app.catalogs_in_flight` — which it then joins. A compose that finds the fetch
+/// already running waits on it rather than asking again when it fails.
+///
+/// Retry policy: a failed fetch is never cached (`App::finish_catalog_fetch`), so
+/// the NEXT compose on that folder asks again, while one compose never asks twice —
+/// at most one spawn per compose opening, never a storm on a missing `claude`.
+pub(crate) fn take_catalog_fetch(app: &mut App) -> Option<PathBuf> {
+    let compose = app.compose.as_ref()?;
+    if compose.completion.catalog_requested {
+        return None;
+    }
+    let cwd = completion_source(app, &compose.target)?.cwd;
+    if let Some(compose) = app.compose.as_mut() {
+        compose.completion.catalog_requested = true;
+    }
+    if app.catalogs.contains_key(&cwd) || !app.catalogs_in_flight.insert(cwd.clone()) {
+        return None;
+    }
+    Some(cwd)
+}
+
+/// The caret as a plain `(row, col)` in CHARACTERS (the widget wraps it in `DataCursor`).
+fn cursor_pos(textarea: &TextArea<'static>) -> (usize, usize) {
+    let c = textarea.cursor();
+    (c.0, c.1)
+}
+
+/// Move the pick-list highlight one row, wrapping.
+fn step_highlight(app: &mut App, forward: bool) {
+    if let Some(compose) = app.compose.as_mut() {
+        let len = compose.completion.visible.as_ref().map_or(0, Vec::len);
+        compose.completion.highlight = move_highlight(compose.completion.highlight, len, forward);
+    }
+}
+
+/// Replace the typed query with the highlighted pick: move the caret back over the
+/// query, delete it, insert the [`replacement`]. Caret columns are CHARACTERS, so
+/// this counts characters, never bytes. The token ends at the caret by
+/// construction (`completion_context`), so whatever follows is whitespace or
+/// nothing.
+fn accept_completion(compose: &mut ComposeState) {
+    let state = &compose.completion;
+    let (Some(ctx), Some(visible)) = (state.context.as_ref(), state.visible.as_ref()) else {
+        return;
+    };
+    let Some(candidate) = visible.get(state.highlight) else {
+        return;
+    };
+    let dir_part = match ctx.trigger {
+        Trigger::Slash => "",
+        Trigger::At => split_path_query(&ctx.query).0,
+    };
+    let (row, col) = cursor_pos(&compose.textarea);
+    let next_is_whitespace = compose
+        .textarea
+        .lines()
+        .get(row)
+        .is_some_and(|l| l.chars().nth(col).is_some());
+    let text = replacement(ctx.trigger, dir_part, candidate, next_is_whitespace);
+    let query_chars = ctx.query.chars().count();
+    for _ in 0..query_chars {
+        compose.textarea.move_cursor(CursorMove::Back);
+    }
+    compose.textarea.delete_str(query_chars);
+    compose.textarea.insert_str(text);
 }
 
 /// The open draft as its submit paths need it: the text, what it is addressed to,
@@ -774,7 +1137,7 @@ mod tests {
     #[test]
     fn bare_enter_sends() {
         assert_eq!(
-            compose_key_to_action(key(KeyCode::Enter)),
+            compose_key_to_action(key(KeyCode::Enter), false),
             ComposeAction::Send
         );
     }
@@ -784,12 +1147,12 @@ mod tests {
     #[test]
     fn ctrl_j_inserts_a_newline() {
         assert_eq!(
-            compose_key_to_action(with_mods(KeyCode::Char('j'), KeyModifiers::CONTROL)),
+            compose_key_to_action(with_mods(KeyCode::Char('j'), KeyModifiers::CONTROL), false),
             ComposeAction::Newline,
         );
         // Uppercase 'J' too, for the kitty path's sake.
         assert_eq!(
-            compose_key_to_action(with_mods(KeyCode::Char('J'), KeyModifiers::CONTROL)),
+            compose_key_to_action(with_mods(KeyCode::Char('J'), KeyModifiers::CONTROL), false),
             ComposeAction::Newline,
         );
     }
@@ -798,7 +1161,7 @@ mod tests {
     #[test]
     fn alt_enter_inserts_a_newline() {
         assert_eq!(
-            compose_key_to_action(with_mods(KeyCode::Enter, KeyModifiers::ALT)),
+            compose_key_to_action(with_mods(KeyCode::Enter, KeyModifiers::ALT), false),
             ComposeAction::Newline,
         );
     }
@@ -810,7 +1173,7 @@ mod tests {
     #[test]
     fn shift_enter_inserts_a_newline_when_delivered_distinctly() {
         assert_eq!(
-            compose_key_to_action(with_mods(KeyCode::Enter, KeyModifiers::SHIFT)),
+            compose_key_to_action(with_mods(KeyCode::Enter, KeyModifiers::SHIFT), false),
             ComposeAction::Newline,
         );
     }
@@ -820,7 +1183,7 @@ mod tests {
     #[test]
     fn esc_cancels() {
         assert_eq!(
-            compose_key_to_action(key(KeyCode::Esc)),
+            compose_key_to_action(key(KeyCode::Esc), false),
             ComposeAction::Cancel
         );
     }
@@ -830,11 +1193,11 @@ mod tests {
     #[test]
     fn a_plain_char_is_forwarded() {
         assert_eq!(
-            compose_key_to_action(key(KeyCode::Char('a'))),
+            compose_key_to_action(key(KeyCode::Char('a')), false),
             ComposeAction::Forward
         );
         assert_eq!(
-            compose_key_to_action(key(KeyCode::Char('j'))),
+            compose_key_to_action(key(KeyCode::Char('j')), false),
             ComposeAction::Forward,
             "a bare `j` types a `j`; only Ctrl-J is the newline chord"
         );
@@ -852,9 +1215,55 @@ mod tests {
             KeyCode::Down,
         ] {
             assert_eq!(
-                compose_key_to_action(key(code)),
+                compose_key_to_action(key(code), false),
                 ComposeAction::Forward,
                 "{code:?} must forward to the editor"
+            );
+        }
+    }
+
+    /// With the pick list showing, `Enter`/`Tab` pick, `Up`/`Down` move the
+    /// highlight and `Esc` closes the list only.
+    #[test]
+    fn an_open_list_claims_enter_tab_arrows_and_esc() {
+        let open = |code| compose_key_to_action(key(code), true);
+        assert_eq!(open(KeyCode::Enter), ComposeAction::AcceptCompletion);
+        assert_eq!(open(KeyCode::Tab), ComposeAction::AcceptCompletion);
+        assert_eq!(open(KeyCode::Up), ComposeAction::CompletionPrev);
+        assert_eq!(open(KeyCode::Down), ComposeAction::CompletionNext);
+        assert_eq!(open(KeyCode::Esc), ComposeAction::CloseCompletion);
+        assert_eq!(open(KeyCode::Char('a')), ComposeAction::Forward);
+    }
+
+    /// The chords keep their meaning while the list is open, and a closed list
+    /// leaves `Tab`/`Up`/`Down` to the editor.
+    #[test]
+    fn chords_are_unchanged_by_an_open_list_and_a_closed_list_claims_nothing() {
+        for (k, want) in [
+            (
+                with_mods(KeyCode::Char('j'), KeyModifiers::CONTROL),
+                ComposeAction::Newline,
+            ),
+            (
+                with_mods(KeyCode::Enter, KeyModifiers::ALT),
+                ComposeAction::Newline,
+            ),
+            (
+                with_mods(KeyCode::Enter, KeyModifiers::SHIFT),
+                ComposeAction::Newline,
+            ),
+            (
+                with_mods(KeyCode::Char('o'), KeyModifiers::CONTROL),
+                ComposeAction::OpenInteractive,
+            ),
+        ] {
+            assert_eq!(compose_key_to_action(k, true), want);
+            assert_eq!(compose_key_to_action(k, false), want);
+        }
+        for code in [KeyCode::Tab, KeyCode::Up, KeyCode::Down] {
+            assert_eq!(
+                compose_key_to_action(key(code), false),
+                ComposeAction::Forward
             );
         }
     }
@@ -864,16 +1273,16 @@ mod tests {
     #[test]
     fn ctrl_o_runs_interactively() {
         assert_eq!(
-            compose_key_to_action(with_mods(KeyCode::Char('o'), KeyModifiers::CONTROL)),
+            compose_key_to_action(with_mods(KeyCode::Char('o'), KeyModifiers::CONTROL), false),
             ComposeAction::OpenInteractive,
         );
         // Uppercase 'O' too, for the kitty path's sake (like the Ctrl-J arm).
         assert_eq!(
-            compose_key_to_action(with_mods(KeyCode::Char('O'), KeyModifiers::CONTROL)),
+            compose_key_to_action(with_mods(KeyCode::Char('O'), KeyModifiers::CONTROL), false),
             ComposeAction::OpenInteractive,
         );
         assert_eq!(
-            compose_key_to_action(key(KeyCode::Char('o'))),
+            compose_key_to_action(key(KeyCode::Char('o')), false),
             ComposeAction::Forward,
             "a bare `o` types an `o`; only Ctrl-O is the interactive chord"
         );
@@ -885,20 +1294,20 @@ mod tests {
     #[test]
     fn ctrl_l_picks_the_model_and_a_bare_l_still_types() {
         assert_eq!(
-            compose_key_to_action(with_mods(KeyCode::Char('l'), KeyModifiers::CONTROL)),
+            compose_key_to_action(with_mods(KeyCode::Char('l'), KeyModifiers::CONTROL), false),
             ComposeAction::PickModel,
         );
         assert_eq!(
-            compose_key_to_action(with_mods(KeyCode::Char('L'), KeyModifiers::CONTROL)),
+            compose_key_to_action(with_mods(KeyCode::Char('L'), KeyModifiers::CONTROL), false),
             ComposeAction::PickModel,
         );
         assert_eq!(
-            compose_key_to_action(key(KeyCode::Char('l'))),
+            compose_key_to_action(key(KeyCode::Char('l')), false),
             ComposeAction::Forward,
             "a bare `l` types an `l`; only Ctrl-L opens the picker"
         );
         assert_eq!(
-            compose_key_to_action(with_mods(KeyCode::Char('L'), KeyModifiers::SHIFT)),
+            compose_key_to_action(with_mods(KeyCode::Char('L'), KeyModifiers::SHIFT), false),
             ComposeAction::Forward,
             "a shifted `L` types an `L`"
         );
@@ -1153,6 +1562,228 @@ mod tests {
         }
     }
 
+    /// The ONE source resolver: a reply reads its session's folder and transcript, a
+    /// reply whose session left the store reads nothing, and a background draft
+    /// reads the launch dir with no transcript.
+    #[test]
+    fn completion_source_is_the_sessions_folder_for_a_reply_and_the_launch_dir_for_a_draft() {
+        let launch = PathBuf::from("/tmp/sbc-launch");
+        let app = App::new(
+            vec![session_at(
+                "sbc-src",
+                PathBuf::from("/tmp/sbc-src/s.jsonl"),
+                PathBuf::from("/tmp/sbc-src"),
+            )],
+            Scope::All,
+            launch.clone(),
+        );
+        let reply = |id: &str| ComposeTarget::Reply {
+            session_id: id.to_string(),
+            stop_job: None,
+        };
+        assert_eq!(
+            completion_source(&app, &reply("sbc-src")),
+            Some(CompletionSource {
+                cwd: PathBuf::from("/tmp/sbc-src"),
+                transcript: Some(PathBuf::from("/tmp/sbc-src/s.jsonl")),
+            })
+        );
+        assert_eq!(completion_source(&app, &reply("sbc-gone")), None);
+        for agent in [None, Some("planner".to_string())] {
+            assert_eq!(
+                completion_source(&app, &ComposeTarget::NewBackgroundAgent { agent }),
+                Some(CompletionSource {
+                    cwd: launch.clone(),
+                    transcript: None,
+                })
+            );
+        }
+    }
+
+    /// A refresh with no source (the reply's session left the store) clears the
+    /// list but keeps the compose's one catalog ask spent.
+    #[test]
+    fn a_sourceless_refresh_clears_the_list_but_keeps_the_ask_spent() {
+        let mut state = CompletionState {
+            visible: Some(vec![Candidate {
+                label: "/sbping".to_string(),
+                insert: "sbping".to_string(),
+                description: None,
+            }]),
+            catalog_requested: true,
+            ..CompletionState::default()
+        };
+        state.refresh(&["/sb".to_string()], (0, 3), None);
+        assert!(state.visible.is_none());
+        assert!(state.catalog_requested);
+    }
+
+    /// The transcript fixture whose listing names the commands `brag-slim`,
+    /// `cr-review`, `plugin-x:deploy`, `sbx-skill` and the agents `Explore`,
+    /// `sby-agent`.
+    fn listing_fixture() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/skill_listing/listing.jsonl")
+    }
+
+    /// Refresh `state` for a draft holding `token` alone with the caret at its end,
+    /// reading from `cwd` and `transcript` with no catalog landed.
+    fn refresh_token(
+        state: &mut CompletionState,
+        token: &str,
+        cwd: &std::path::Path,
+        transcript: &std::path::Path,
+    ) {
+        let source = SourceView {
+            cwd,
+            transcript: Some(transcript),
+            catalog: None,
+        };
+        state.refresh(
+            &[token.to_string()],
+            (0, token.chars().count()),
+            Some(source),
+        );
+    }
+
+    /// What `state`'s list would insert, row by row; empty when no list shows.
+    fn shown(state: &CompletionState) -> Vec<String> {
+        state
+            .visible
+            .iter()
+            .flatten()
+            .map(|c| c.insert.clone())
+            .collect()
+    }
+
+    /// An `@` with a folder part lists that folder and never an agent
+    /// (`complete::at_candidates`), so it never reads the reply's transcript the
+    /// agents come from. A top-level `@` still reads it, in a fresh draft and in one
+    /// whose earlier `@src/` skipped the read; a `/` never does, since it lists the
+    /// catalog alone.
+    #[test]
+    fn a_folder_part_at_never_reads_the_transcript() {
+        let cwd = unique_temp_dir("at-folder-part");
+        std::fs::create_dir_all(cwd.join("src")).expect("create src/");
+        std::fs::write(cwd.join("src").join("main.rs"), "").expect("write src/main.rs");
+        let transcript = listing_fixture();
+
+        let mut state = CompletionState::default();
+        refresh_token(&mut state, "@src/", &cwd, &transcript);
+        assert_eq!(
+            shown(&state),
+            ["main.rs"],
+            "the folder part lists its folder"
+        );
+        assert!(
+            state.transcript.is_none(),
+            "`@src/` must not read the transcript"
+        );
+
+        refresh_token(&mut state, "@", &cwd, &transcript);
+        assert!(state.transcript.is_some(), "a later top-level `@` reads it");
+        assert_eq!(
+            shown(&state),
+            ["src/", "agent-Explore", "agent-sby-agent"],
+            "and lists the transcript's agents"
+        );
+
+        let mut slash_after = CompletionState::default();
+        refresh_token(&mut slash_after, "@src/", &cwd, &transcript);
+        refresh_token(&mut slash_after, "/", &cwd, &transcript);
+        assert!(
+            slash_after.transcript.is_none(),
+            "a later `/` must not read it"
+        );
+        assert!(
+            shown(&slash_after).is_empty(),
+            "and lists nothing while no catalog has landed"
+        );
+
+        let mut fresh_at = CompletionState::default();
+        refresh_token(&mut fresh_at, "@", &cwd, &transcript);
+        assert!(
+            fresh_at.transcript.is_some(),
+            "a fresh draft's `@` reads the transcript"
+        );
+        let mut fresh_slash = CompletionState::default();
+        refresh_token(&mut fresh_slash, "/", &cwd, &transcript);
+        assert!(
+            fresh_slash.transcript.is_none(),
+            "a fresh draft's `/` must not read the transcript"
+        );
+        assert!(shown(&fresh_slash).is_empty(), "and shows no list");
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// A skipped read never costs a second one: the top-level `@` that reads the
+    /// transcript after an `@src/` reads it for the whole draft, so a later
+    /// top-level `@` lists from that read even once the file is gone.
+    #[test]
+    fn a_draft_reads_its_transcript_once_after_a_skipped_read() {
+        let cwd = unique_temp_dir("at-read-once");
+        std::fs::create_dir_all(cwd.join("src")).expect("create src/");
+        let transcript = cwd.join("listing.jsonl");
+        std::fs::copy(listing_fixture(), &transcript).expect("copy the listing fixture");
+
+        let mut state = CompletionState::default();
+        refresh_token(&mut state, "@src/", &cwd, &transcript);
+        refresh_token(&mut state, "@sb", &cwd, &transcript);
+        assert_eq!(shown(&state), ["agent-sby-agent"]);
+
+        std::fs::remove_file(&transcript).expect("remove the transcript");
+        refresh_token(&mut state, "@Ex", &cwd, &transcript);
+        assert_eq!(
+            shown(&state),
+            ["agent-Explore"],
+            "listed from the draft's one read, not from the file again"
+        );
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// `/` lists the folder's landed catalog alone: with none landed it shows
+    /// nothing and never reads the reply's transcript, whose `skill_listing` is the
+    /// model's list rather than claude's `/` menu.
+    #[test]
+    fn a_slash_lists_only_the_landed_catalog() {
+        let transcript = listing_fixture();
+        let cwd = transcript.parent().expect("the fixture has a folder");
+        let refresh = |state: &mut CompletionState, token: &str, catalog: Option<&Listing>| {
+            let source = SourceView {
+                cwd,
+                transcript: Some(&transcript),
+                catalog,
+            };
+            state.refresh(
+                &[token.to_string()],
+                (0, token.chars().count()),
+                Some(source),
+            );
+        };
+
+        let mut state = CompletionState::default();
+        for token in ["/", "/c"] {
+            refresh(&mut state, token, None);
+            assert!(
+                shown(&state).is_empty(),
+                "`{token}` shows nothing before the catalog lands"
+            );
+            assert!(
+                state.transcript.is_none(),
+                "`{token}` must not read the transcript"
+            );
+        }
+
+        let catalog = Listing {
+            commands: vec![crate::store::skills::ListingEntry {
+                name: "sbping".to_string(),
+                description: None,
+            }],
+            agents: Vec::new(),
+        };
+        refresh(&mut state, "/", Some(&catalog));
+        assert_eq!(shown(&state), ["sbping"], "the landed catalog alone");
+    }
+
     /// Every compose is BORN on its default model, whichever constructor opened it:
     /// the pick is per-compose state, so there is nothing a new box could inherit.
     #[test]
@@ -1393,13 +2024,13 @@ mod tests {
             ('E', ComposeAction::PreviewBottom),
         ] {
             assert_eq!(
-                compose_key_to_action(with_mods(KeyCode::Char(c), KeyModifiers::CONTROL)),
+                compose_key_to_action(with_mods(KeyCode::Char(c), KeyModifiers::CONTROL), false),
                 want
             );
         }
         for c in ['t', 'e'] {
             assert_eq!(
-                compose_key_to_action(key(KeyCode::Char(c))),
+                compose_key_to_action(key(KeyCode::Char(c)), false),
                 ComposeAction::Forward,
                 "a bare `{c}` types"
             );
@@ -1506,7 +2137,7 @@ mod tests {
             (KeyCode::Home, KeyModifiers::ALT, ComposeAction::PreviewTop),
         ] {
             assert_eq!(
-                compose_key_to_action(with_mods(code, mods)),
+                compose_key_to_action(with_mods(code, mods), false),
                 want,
                 "{code:?}"
             );
@@ -1514,7 +2145,10 @@ mod tests {
         // Bare letters type; Ctrl+named keys are the board's `Ignore`, so they stay
         // the editor's (word/paragraph jumps).
         for code in [KeyCode::Char('u'), KeyCode::Char('d')] {
-            assert_eq!(compose_key_to_action(key(code)), ComposeAction::Forward);
+            assert_eq!(
+                compose_key_to_action(key(code), false),
+                ComposeAction::Forward
+            );
         }
         for code in [
             KeyCode::Home,
@@ -1523,7 +2157,7 @@ mod tests {
             KeyCode::PageDown,
         ] {
             assert_eq!(
-                compose_key_to_action(with_mods(code, ctrl)),
+                compose_key_to_action(with_mods(code, ctrl), false),
                 ComposeAction::Forward,
                 "{code:?}"
             );

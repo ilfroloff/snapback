@@ -20,13 +20,17 @@ one place.
 
 - **FAIL-SOFT parsing.** Parse JSONL as `serde_json::Value`, NEVER hard-typed
   deserialize structs. Skip bad lines/files; never panic on malformed input.
-  Same for `claude agents --json`, for DEFINED-agent frontmatter (hand-parsed,
-  no YAML crate), and for every `claude` settings file `claude_settings` reads
+  Same for `claude agents --json`, for claude's `initialize` handshake reply,
+  for DEFINED-agent frontmatter (hand-parsed, no YAML crate), and for every
+  `claude` settings file `claude_settings` reads
   (which ones, and in which precedence, is
   [CLAUDE_CLI.md](docs/agents/CLAUDE_CLI.md#which-model-a-launch-runs-on-without---model)'s),
-  where a bad file is "no value from this file", never an error.
-  (`src/store/*`, `src/agents.rs`, `src/defined_agents.rs`,
-  `src/claude_settings.rs`)
+  where a bad file is "no value from this file", never an error. Same for
+  claude's workspace-trust record (`~/.claude.json` `projects`), whose direction
+  is UNTRUSTED: a missing, unreadable or malformed record, or an unknown folder,
+  is untrusted, never trusted.
+  (`src/store/*`, `src/agents.rs`, `src/claude_catalog.rs`,
+  `src/defined_agents.rs`, `src/claude_settings.rs`, `src/claude_trust.rs`)
 - **AUTHORITATIVE-FROM-FILE.** Read `cwd`/`sessionId` from INSIDE the file,
   never decode the `<encoded-cwd>` folder name (the `/`→`-` encoding is lossy).
   Re-read them at hand-off time. (`src/store/parse.rs`, `src/resume.rs`)
@@ -138,7 +142,9 @@ one place.
   display order is `App::order_filtered`'s alone. The window, the cap and the fold
   are argued in
   [DOMAIN.md](docs/agents/DOMAIN.md#content-index-storeparse), the two rules in
-  [PATTERNS.md](docs/agents/PATTERNS.md#4-isolate-volatile-dependencies).
+  [PATTERNS.md](docs/agents/PATTERNS.md#4-isolate-volatile-dependencies). The
+  compose pick list's start-of-name filter (`src/tui/complete.rs`) is NOT this
+  matcher and must never call it.
   (`src/search.rs`)
 - **STABLE-ID STATE.** Track selection by `session_id`, never list index, so it
   survives autorefresh reloads. (`src/tui/app.rs`)
@@ -151,13 +157,20 @@ one place.
   TWO bounded one-shots are deliberate, documented exceptions (`PATTERNS.md` §6):
   the liveness probe at hand-off, and the worktree resolve at
   construction/reload. Both are argued at the call site, and NEITHER may move
-  onto a keystroke or the render path. Work that runs on its OWN thread and
+  onto a keystroke or the render path. The compose pick list's transcript
+  listing and folder reads, in both drafts, are a different, keystroke-time
+  class (bounded, once per reply draft / per folder, never render):
+  `PATTERNS.md` §6 owns them. Work that runs on its OWN thread and
   reports back with one `AppEvent` is the rule's ordinary case, never a third
   exception: the clipboard copy (`CopyFinished` — `Ctrl-X y`'s id and a preview
   drag-selection alike, ONE path, its tool a THREADED child the driver starts, so
   no keystroke or mouse release waits on it), the `--model` alias probe
-  (`ModelAliases`) and the settings-model read (`SettingsModel`) are all that
-  shape. (`src/watch.rs`, `src/worktrees.rs`, `src/tui/clipboard.rs`)
+  (`ModelAliases`), the settings-model read (`SettingsModel`) and the compose
+  pick list's catalog fetch (`CatalogFetched` — a `claude` child the DRIVER
+  starts when the pure `take_catalog_fetch` says so, never a key handler; its
+  workspace-trust read runs on that same worker thread, never on a key or the
+  render path) are all that shape. (`src/watch.rs`, `src/worktrees.rs`,
+  `src/tui/clipboard.rs`, `src/claude_catalog.rs`, `src/claude_trust.rs`)
 - **PURE, GIT-FREE STORE CORE.** `src/store/*` decides everything from the bytes
   it was given: `repo_of`'s worktree collapse is a pure string heuristic, and NO
   module under `src/store/` may shell out (to `git` or anything else) or read
@@ -175,12 +188,18 @@ one place.
   `src/watch.rs`, `src/worktrees.rs`)
 - **KEEP KEY DOCS IN SYNC.** A key/flag change must update, together: the
   keybinding table in `update.rs`'s module doc; `USAGE`/`KEYS` in `cli.rs`; the
-  help line in `view.rs` (EVERY key string that renders there: the board keymap,
-  `chord_hint`'s which-key list, and `compose_hint`'s reply hint and
-  `BG_DRAFT_HINT`); the README key map; and any prose enumeration of a key set in
+  help line and the draft card in `view.rs` (EVERY key string that renders there:
+  the board keymap, `chord_hint`'s which-key list, and `compose_hint`'s reply
+  hint, the `COMPLETION_HINT` BOTH compose boxes show while the pick list is open,
+  and `BG_DRAFT_HINT`; the card's `draft_hint` names the same two, the list's
+  while it is open); the README key map; and any prose enumeration of a key set in
   `docs/agents/*` (for example, PATTERNS.md's follow-bottom re-arm passage). This
-  is the ONE list of those surfaces; the other docs point here. The help line is
-  ONE row, cut rather than wrapped: `chord_hint` and the reply hint are
+  is the ONE list of those surfaces; the other docs point here. A key both compose
+  boxes share (`Ctrl-L`, `/` or `@`) is ONE shared "in a compose box" entry in
+  each key map — the `update.rs` table, `KEYS`, the README — that the `Ctrl-R`
+  and `Ctrl-N` entries point to, never two copies.
+  The help line is ONE row, cut rather than wrapped: `chord_hint`, the reply hint
+  and `COMPLETION_HINT` are
   column-budgeted to fit 80 whole (each pinned by a test), while the board keymap
   and `BG_DRAFT_HINT` run past 80 and are cut there, so an 80-column terminal
   draws only their leading keys. It binds ROUTING too, not just bindings: when a
@@ -266,7 +285,7 @@ Full command reference and the validation checklist:
 | Session format, JSONL fields, domain concepts | [docs/agents/DOMAIN.md](docs/agents/DOMAIN.md) |
 | Implementation + testing conventions | [docs/agents/PATTERNS.md](docs/agents/PATTERNS.md) |
 | Commands, env, `--print-list`, CI + release automation, checklist | [docs/agents/OPERATIONS.md](docs/agents/OPERATIONS.md) |
-| External `claude` CLI flags/commands + version pin + spawned argv, the `--model` alias capture, the model a launch without `--model` runs on | [docs/agents/CLAUDE_CLI.md](docs/agents/CLAUDE_CLI.md) |
+| External `claude` CLI flags/commands + version pin + spawned argv, the `--model` alias capture, the model a launch without `--model` runs on, the `initialize` handshake the pick list asks, the workspace-trust rule that picks its argv and environment | [docs/agents/CLAUDE_CLI.md](docs/agents/CLAUDE_CLI.md) |
 | Commit message rules + examples | [GIT_COMMIT_INSTRUCTIONS.md](GIT_COMMIT_INSTRUCTIONS.md) |
 | Reading order / doc ownership | [docs/agents/README.md](docs/agents/README.md) |
 | End-user features + full key map | [README.md](README.md) |

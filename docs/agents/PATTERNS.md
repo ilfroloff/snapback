@@ -46,6 +46,25 @@ The JSONL format is external and undocumented, so treat every read as hostile:
   new-session answer collapses to `None`, which a `Ctrl-N` draft labels as plain
   `model: default`, and the restore-override answer to `false`, which leaves a
   reply naming its session's own model — each true, if less specific.
+- The compose pick list's two sources are the same again. claude's `initialize`
+  handshake reply (`claude_catalog::parse_initialize_response`) and a transcript's
+  `agent_listing_delta` records (`store::skills`, a reply's `@` agents only) are
+  read as `Value`, a malformed entry or record contributes nothing, and a failed
+  fetch — no `claude`, a timeout, an `error` subtype, another `request_id` — is
+  `None`. The direction is toward the list a box shows before claude's lands (no
+  `/` list; a reply's `@` agents from its transcript), never toward a verdict: a
+  `None` catalog is not a fact about the folder and is never cached (the retry is
+  [DOMAIN.md](DOMAIN.md#compose-pick-list)'s), and an unreadable transcript is an
+  empty list. Descriptions from both pass `store::skills::normalize_description`,
+  so no control character or raw escape reaches a cell.
+- claude's workspace-trust record (`claude_trust`, which file and which rule is
+  [CLAUDE_CLI.md](CLAUDE_CLI.md#workspace-trust-what-an-untrusted-folder-can-run-and-the-two-argv-forms)'s)
+  is read as a `Value` too, and its direction is UNTRUSTED: every input it cannot
+  settle (CLAUDE_CLI.md lists them) answers untrusted, which only costs the
+  folder's list the repository's own items. The other direction would load a
+  repository's settings, and with them its helper commands and `env` block, and
+  leave claude's own git prefetch running its git configuration, just because a
+  compose box opened.
 - **Reading is the default, but not the whole story.** `snapback` is
   overwhelmingly a reader of a hostile external store, and the Claude store stays
   read-only save for the one gated hard delete. It does, though, have exactly one
@@ -98,7 +117,8 @@ it. Follow this split when adding behavior:
   `status_for_signal` mapping, and the signal route's two checks, `signal_plan`
   (re-verify a captured pid against a fresh record) and `signal_target` (narrow it to a strictly positive `pid_t`,
   or refuse, by `positive_pid_t` — the range half of `signallable_pid`, the one
-  rule `interrupt_gate` applies, whose other half refuses the board's own pid and
+  rule `interrupt_gate` applies (and `claude_catalog::kill_group` reuses to narrow
+  its group id), whose other half refuses the board's own pid and
   takes it as a parameter, `App::own_pid`, so no test reads a real process id)
   — each split out so the guard in front of `kill(2)` is asserted without ever
   calling it; `tui::update::show_signal_result`, which takes that syscall's result
@@ -212,9 +232,16 @@ it. Follow this split when adding behavior:
   and the settings files — through `defaults_from_disk`, `managed_drop_ins` and
   `read_layers`, reading the files ONCE for both answers — and delegates every
   decision to `resolve_new_session_model` and `resolve_restore_overridden`), the `watch` threads, `tui::run` (draw loop), and
-  `send::signal_term` (the crate's one syscall, `kill(2)` with SIGTERM, whose only
+  `send::signal_term` (`Ctrl-K`'s one syscall, `kill(2)` with SIGTERM, whose only
   caller is that loop and which NO test may call — see "Watch every test fail"
-  below). Keep these small and delegate to tested helpers.
+  below), `claude_trust::folder_trust` (the real environment, home and record,
+  delegating to the pure `global_config_path`, `trust_keys` and `is_trusted`
+  through `folder_trust_in`, which tests drive with a temp record) and
+  `claude_catalog::kill_group` (the crate's other syscall, `killpg(2)` with
+  SIGKILL on a timed-out fetch's own child group, reached in tests only through
+  stand-in children, `sh` and one `perl` leader: see
+  [Testing patterns](#testing-patterns)). Keep these small and delegate to tested
+  helpers.
 
 The terminal-up **refusal gate** is an instance of this: `resume::check` (and its
 sibling `resume::check_new` for starting a fresh session in the launch dir) runs
@@ -809,6 +836,38 @@ either: a compose's `model:` label and the picker's first row are answered by
 `App::compose_default` from what this event stored and from the CACHED preview,
 which is what lets the label be asked in render and the row on a keystroke.
 
+`claude_catalog::spawn_fetch` is the seventh, and the one that runs a `claude`
+child from an event rather than from a confirmed key: claude's `initialize`
+handshake for a compose's folder, delivered as a single `AppEvent::CatalogFetched`.
+It keeps the shape by splitting the DECISION from the spawn exactly as `Send`
+does: the pure `compose::take_catalog_fetch` derives "fetch this folder now" from
+state (when that is true is [DOMAIN.md](DOMAIN.md#compose-pick-list)'s), the run
+loop asks it after every wake-up, and only the driver spawns — so no key handler,
+and no route that opens a compose, ever starts a child. The worker's FIRST step
+is a blocking file read too: claude's workspace-trust verdict for the folder
+(`claude_trust::folder_trust`), which picks the form, argv and child environment.
+It stays inside the
+worker, where `spawn_fetch_in` hands it in as `trust_of`; hoisting it onto the
+spawning thread is the regression
+`children::the_trust_read_runs_on_the_fetch_worker` pins. The child
+is the first one-shot here whose run is BOUNDED by snapback rather than by the
+child. It is spawned as the leader of a process group of its own, and
+`CATALOG_FETCH_TIMEOUT` covers the reply, the close of stdout and the exit. Past
+it the worker SIGKILLs the whole group (`claude_catalog::kill_group`, `killpg(2)`)
+AND the child itself (`Child::kill`, in `reap`), both before the child is reaped,
+so neither id can have been recycled. The group kill takes everything still in
+the group; the direct kill takes a LEADER that moved itself into another group
+(its own `setpgid`), which the group kill misses and the reap's `wait` would
+otherwise block on for as long as it runs. The worker then reaps the child and
+joins its stdout reader once every writer of the pipe is gone, within
+`CATALOG_READER_GRACE`. A hung `claude` therefore costs the worker at most
+`CATALOG_FETCH_TIMEOUT` plus `CATALOG_READER_GRACE`. The one residual is a
+DESCENDANT that LEFT the group (its own `setpgid`/`setsid`) while holding stdout:
+neither kill reaches it, so only its reader thread outlives the fetch, ending with
+that writer, and the worker still delivers its event. Nothing waits on
+the event, and it carries no shutdown flag for the alias probe's reason: it sends
+once and returns.
+
 The rule is about the **poll cadence**, not about the word "shell-out". A
 ONE-SHOT at hand-off is a different thing and is allowed — `agents::live_agents`
 is the instance, directly analogous to `resume`'s authoritative re-read of
@@ -886,8 +945,16 @@ loops on; `spawn_model_alias_thread` and `spawn_settings_model_thread` each take
 the `probe` they run once. All four are named exactly once, in `EventLoop`, where
 production passes `agents::reported_agents`, the real crossterm `poll`+`read` pair,
 `model_aliases::installed_model_aliases`, and `claude_settings::model_defaults`
-for the launch dir. Nothing else may pass anything else: the
-seam exists so a test can state a poll's answer without spawning `claude`, state
+for the launch dir. `claude_catalog::spawn_fetch_with` takes its `fetch` the same
+way, and `spawn_fetch_in` builds that `fetch` from a `trust_of`, a program and a
+timeout, all three named exactly once, in `spawn_fetch`
+(`claude_trust::folder_trust`, `claude`, `CATALOG_FETCH_TIMEOUT`). One level further
+down `fetch_in` takes the same three and `fetch_with` the argv, the child's
+environment, the request and the timeout, so the suite states a trust record, and
+drives the pipe, the child's environment, the group kill, the direct kill, the
+reap and the reader join with stand-in children (`sh`, and one `perl` leader:
+[Testing patterns](#testing-patterns)), and never spawns `claude`. Nothing else
+may pass anything else: the seam exists so a test can state a poll's answer without spawning `claude`, state
 an input event without a TTY, state an alias set without walking a 290 MB
 binary, and state the settings' answers without reading the machine's real
 settings or environment — which is what makes each thread's own behavior assertable at all (the
@@ -902,12 +969,26 @@ assert the error path and call that coverage. It carries no decision of its own
 (a `poll` + `read` pair where either half's `Err` propagates unchanged), and
 everything downstream of it is pinned through the seam. The `run_inner` lines that
 START these threads (`spawn_agents_poller`, `spawn_model_alias_probe`,
-`spawn_settings_model_probe`) are
+`spawn_settings_model_probe`, and the `claude_catalog::spawn_fetch` call behind
+`compose::take_catalog_fetch`) are
 accepted the same way and for the same reason: `run_inner` needs a real terminal,
 so there is nothing to assert them from, while the thread's shape is pinned
 through the seam and the event's effect through `update::dispatch` — the gap is
 one call, not a behaviour. Leave all of these untested rather than "fixing" them
 with a proxy assertion — see the false-clean modes below.
+
+The compose pick list adds two more BOUNDED synchronous reads, in the same class as
+`defined_agents::discover_agents` and `send::plan_send`: a reply's transcript
+listing (`store::skills::read_listing`, once per reply draft and only for a
+top-level `@`, never for `/` or a background draft, and not at all once the
+folder's catalog has landed) and a
+folder listing (`complete::list_dir`, once per resolved folder, capped by
+`COMPLETION_MAX_DIR_ENTRIES`, on both drafts). They run from
+`compose::refresh_completion`, called by the key and paste handlers and by
+`update::dispatch`'s `CatalogFetched` arm — which reads nothing new in practice,
+since every read is keyed to a token a key handler already resolved — and NEVER
+from the render path, which only reads the cached `visible` list. claude's own
+list is not one of them: it is the event-delivering fetch above.
 
 ## 7. Restrained, terminal-safe styling
 
@@ -1078,13 +1159,30 @@ CADENCES and LIMITS, so a retune knows what it is next to:
 | `model_aliases` | `MAX_ALIAS_ARRAY_BYTES` (4096) · `SCAN_CHUNK_BYTES` (1 MiB) · `SCAN_OVERLAP_BYTES` (= `MAX_ALIAS_ARRAY_BYTES` by definition — that equality is what proves no match straddles a chunk unseen, so neither is retuned alone) |
 | `store::preview` | `MODEL_VERSION_MAX_DIGITS` (2) · `MODEL_DATE_DIGITS` (8 — kept above the version cap so a date never reads as a version) · `TABLE_MIN_COL_WIDTH` (10) · `RECORD_RULE_WIDTH` (32) · `COLUMN_RULE_WIDTH` (3) · `ELLIPSIS_WIDTH` (1) · `PEER_STEM_LEN` (17 — the agent-stem length a peer sender must match before it renders as an `@handle`, so a socket path or an agent TYPE name falls back to the generic label) · `PEER_HEADER_BLOCK_ROW` (1 — not a knob but a SHAPE: every fold node's header index — peer and injected alike — inside its own `[blank, header, body…]` block, named so the fold region and the body links rebase off one number) |
 | `send` | `SEND_ERROR_MAX` (200) |
+| `claude_catalog` | `CATALOG_FETCH_TIMEOUT` (10 s — bounds the reply, the close of stdout AND the exit; the reply measured 0.21–0.22 s) · `CATALOG_READER_GRACE` (500 ms — how long a timed-out fetch waits, after the group and child kills, for its stdout reader to see EOF; the worker's worst case is the timeout plus this) · `CATALOG_EXIT_POLL` (20 ms — claude exits 25–50 ms after its stdin's EOF) |
+| `claude_trust` | `GIT_POINTER_MAX_BYTES` (8192 — a git pointer file holds one path line, and a path is at most `PATH_MAX`, so a longer file is not a pointer and gets the untrusted-direction fallback rather than a whole read) |
+| `tui::complete` | `COMPLETION_MAX_DIR_ENTRIES` (2000 — one keystroke's worst read of a huge folder) · `COMPLETION_VISIBLE_ROWS` (8) |
 | `tui::app` | `PREVIEW_WHEEL_STEP` (2) · `LIST_WHEEL_STEP` (1) · `STATUS_DWELL_TICKS` (16) · `MIN_PANE_WIDTH` (15) · the list's share of the body per split `PaneLayout` stop: `PREVIEW_WIDE_LIST_PERCENT` (25) / `DEFAULT_LIST_PERCENT` (48) / `LIST_WIDE_LIST_PERCENT` (75) · a held drag's autoscroll: `AUTOSCROLL_FRAME` (33 ms, the run loop's wait deadline while one is held past the edge — §7's one exception to animating from the tick) / `AUTOSCROLL_PAGE_PERIOD` (1 s, a page per row past the edge) / `AUTOSCROLL_MAX_DISTANCE` (4) |
 | `tui::update` | `PASTE_MAX_CHARS` (4096) |
-| `tui::view` | `BLINK_TICKS` (2) · `CHILD_ID_CHARS` (8) · `MATCH_JUMP_LEAD_DIVISOR` (3 — a jumped-to match parks `h / 3` rows down) · `WIDE_GLYPH_COLUMNS` (2) · `LINK_PROBE_BYTE_BUDGET` (131_072) · the layout rows `PREVIEW_BANNER_ROWS` / `BOARD_CHROME_ROWS` / `COMPOSE_*` / `MODAL_WIDTH` / `MODAL_*_CHROME_ROWS` / `MODAL_BORDER_ROWS` / `MODAL_BORDER_COLS` / `MODAL_LIST_MAX_ROWS` (12 — the most CHOICES a `List` picker offers before it scrolls, so an overlay stays an overlay on a tall terminal; a wrapped row's extra lines are paid on top, see [§5](#5-selection-and-scroll-survive-reloads)) |
+| `tui::view` | `BLINK_TICKS` (2) · `CHILD_ID_CHARS` (8) · `MATCH_JUMP_LEAD_DIVISOR` (3 — a jumped-to match parks `h / 3` rows down) · `WIDE_GLYPH_COLUMNS` (2) · `LINK_PROBE_BYTE_BUDGET` (131_072) · the layout rows `PREVIEW_BANNER_ROWS` / `BOARD_CHROME_ROWS` / `COMPOSE_*` / `MODAL_WIDTH` / `MODAL_*_CHROME_ROWS` / `MODAL_BORDER_ROWS` / `MODAL_BORDER_COLS` / `MODAL_LIST_MAX_ROWS` (12 — the most CHOICES a `List` picker offers before it scrolls, so an overlay stays an overlay on a tall terminal; a wrapped row's extra lines are paid on top, see [§5](#5-selection-and-scroll-survive-reloads)) · the compose pick list's `COMPLETION_BORDER_ROWS` / `COMPLETION_COLUMN_GAP` (2 — the table's only separator) / `COMPLETION_NAME_MAX_PERCENT` (50 — descriptions keep the other half of the box) |
 
 Add a new tunable the same way. The rule is not only about numbers — a literal
-with a meaning gets a name whatever its type: the undocumented `claude agents`
-wire tokens (`agents::KIND_*` / `QUALIFIER_*`), the raw control bytes the
+with a meaning gets a name whatever its type: the undocumented `claude` wire
+tokens (`agents::KIND_*` / `QUALIFIER_*`; `claude_catalog`'s `CATALOG_REQUEST_ID`,
+`CATALOG_SETTINGS`, `USER_SETTING_SOURCES`, the git-prefetch switch
+`DISABLE_GIT_INSTRUCTIONS_ENV` / `DISABLE_GIT_INSTRUCTIONS_ON`, `CLAUDE_PROGRAM`,
+`CONTROL_RESPONSE_MARKER`, the `process_group` argument `NEW_PROCESS_GROUP` and
+the pinned built-in names `CLAUDE_HIDDEN_BUILTINS`;
+`claude_trust`'s record and pointer names — `GLOBAL_CONFIG_FILE`,
+`CUSTOM_OAUTH_GLOBAL_CONFIG_FILE`, `LEGACY_GLOBAL_CONFIG_FILE`,
+`CUSTOM_OAUTH_URL_ENV`, `PROJECTS_KEY`, `TRUST_ACCEPTED_KEY`, `GIT_ENTRY`,
+`GITDIR_PREFIX`, `COMMONDIR_FILE`, `GITDIR_FILE`, `WORKTREES_DIR` — and the
+spellings and locations it refuses a worktree pointer into, `UNC_PREFIX`,
+`BACKSLASH`, `NT_OBJECT_MARKER`, `REFUSED_MOUNT_ROOTS`, `HOME_MOUNT_ROOT`,
+`FIRMLINK_PREFIX` and `MOUNT_NAME_FORMAT_CHARS`; `store::skills`'
+`AGENT_LISTING_MARKER` and the line shapes `LISTING_LINE_PREFIX`,
+`NAME_DESCRIPTION_SEPARATOR` and `AGENT_TOOLS_SUFFIX`;
+`tui::complete`'s `AGENT_MENTION_PREFIX` / `AGENT_LABEL_SUFFIX`), the raw control bytes the
 terminal seams write because crossterm publishes no typed command for them
 (`tui`'s `CAN` / `ST` / `KITTY_DISABLE_KEYBOARD` / `DECSTR` / `DECCKM_OFF`, and
 `tui::clipboard`'s OSC 52 wire bytes `OSC_INTRODUCER` / `OSC52_COMMAND` /
@@ -1268,6 +1366,10 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    first line before resuming on its second. `compose_key_to_action` is SHARED by
    both compose targets, so that hit BOTH boxes: a quick reply sent one line, and a
    `Ctrl-N` background draft launched an agent on one.
+   `compose_key_to_action` also takes `list_open`: with the pick list open (in
+   either draft — the router never sees the target) bare `Enter`/`Tab` pick, `Up`/`Down` choose and `Esc` closes the list;
+   `Ctrl-J`, `Alt`/`Shift+Enter` and `Ctrl-O` decode as ever, and `false` decodes
+   exactly as before. Each key needs its decode test AND a `handle_event` test.
 
    `draft` is the one arm that is not a keyboard owner: it owns the **pane**. While
    the new-session draft card is drawn the transcript is not, so the cached link
@@ -1346,8 +1448,9 @@ A COMPOSE key (`Ctrl-J`, `Ctrl-O`, `Ctrl-L`) is added a third way: a
 `ComposeAction` variant + its `compose_key_to_action` arm (both letter cases, for
 the kitty path) + its `handle_compose_key` arm. It belongs to the compose box and
 not to the board, so it is named in `view::compose_hint` (the reply hint fits 80
-columns exactly, so a new segment is paid for by shrinking another) and NOT in the
-board keymap or `chord_hint`. A NEW key must be FREE on the whole path to that
+columns exactly, so a new segment is paid for by shrinking another; a draft's key
+lands in `BG_DRAFT_HINT`, which the draft card shows too through `draft_hint`) and
+NOT in the board keymap or `chord_hint`. A NEW key must be FREE on the whole path to that
 router, and each claim needs evidence rather than a guess, because a key stolen
 anywhere upstream reads as the key doing nothing: the pinned `ratatui-textarea`
 must not bind it (`TextArea::input` at `=0.9.2` binds `Ctrl-` + `m h d k j w n p
@@ -1607,11 +1710,27 @@ Tests are **inline** `#[cfg(test)] mod tests` at the bottom of each source file
   `attachment` records each) so the child row's count column has something to
   tell apart — a pair that agreed there could not test the one field that exists
   to separate the stub from the member holding the work.
+- **Per-reader fixtures** sit beside the store, one directory per reader, each
+  read by that module's own tests and never discovered as a store:
+  `tests/fixtures/preview/` (single session files for the answering-model and
+  effort readings), `tests/fixtures/skill_listing/` (`listing.jsonl`: real
+  record shapes with shortened descriptions — the `agent_listing_delta` records
+  `store::skills` reads, beside a `skill_listing` record and a non-JSON line it
+  must skip) and `tests/fixtures/claude_catalog/` (two trimmed claude 2.1.284
+  `initialize` replies, every body key but `commands` and `agents` removed —
+  `account` among them — whose `request_id` the test restamps:
+  `initialize_response.json`, and `initialize_hidden_builtins.json`, which keeps
+  the five hidden built-ins the reply listed beside `compact`, two project skills
+  and one agent). A captured `claude` reply is committed only after that trim.
 - **Synthetic models**: build `Session`/`ReportedAgent` values directly in tests
   (see the `session(...)` helpers) rather than round-tripping through disk.
 - **Isolated temp dirs**: watcher/app tests create a unique
   `snapback-<tag>-<pid>-<nanos>` dir under `std::env::temp_dir()` and never
-  touch the real `~/.claude/projects`. Clean up with `remove_dir_all`.
+  touch the real `~/.claude/projects`. Clean up with `remove_dir_all`. The trust
+  reader's tests do the same with claude's record: `claude_trust::folder_trust_in`
+  takes the record's path, so each test writes its own under a canonicalised temp
+  dir (on macOS `/var` is `/private/var`) and never reads the real
+  `~/.claude.json`.
 - **Test the pure helper, not the impure driver**: exit handling is tested via
   `status_for_exit`, teardown via the `Write`-generic `disable_mouse`, argv via
   `build_argv` — no real `claude` process is ever spawned, and no real `git`
@@ -1627,6 +1746,13 @@ Tests are **inline** `#[cfg(test)] mod tests` at the bottom of each source file
   (`MouseEffect::OpenLink`) instead of handing it to `resume::open_url` — only
   the thin `handle_mouse` does that — so a test presses and releases over a real
   drawn link and asserts the url.
+- **Stand-in children need `perl` once**: the catalog fetch's child tests
+  (`claude_catalog`'s unix-only `children` module) run `sh`, `true` and `sleep`
+  in `claude`'s place. One of them,
+  `a_timed_out_leader_that_left_its_group_is_still_killed`, needs `perl` on
+  `PATH` (macOS and the `ubuntu-latest` CI runner ship it), because `sh` cannot
+  `setpgid` itself. Without `perl` it FAILS on its marker assertion, never passes
+  vacuously.
 - **Assert structure, not styling**: preview tests flatten `Text` to plain
   strings to check markers, and separately assert `Style`/`Modifier` on specific
   spans.

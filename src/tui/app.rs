@@ -33,6 +33,7 @@ use crate::{config, delete, hidden};
 use crate::search::{self, MarkScratch, SearchIndex, SearchMode};
 use crate::send::UndeliveredEvents;
 use crate::store::lineage::{self, LineageKey};
+use crate::store::skills::Listing;
 use crate::store::{preview, Reload, Session};
 use crate::watch::AppEvent;
 // The scope predicate and the worktree resolver MUST canonicalize paths the same
@@ -2262,6 +2263,33 @@ pub struct App {
     /// override seen) keeps a reply naming its session's model until the read
     /// lands, which is what claude normally does when no override is set.
     restore_overridden: bool,
+    /// Each folder's slash commands and agents as claude's own `initialize`
+    /// handshake lists them (`crate::claude_catalog`), keyed by the `cwd` the fetch
+    /// ran in: the compose pick list's PRIMARY source.
+    ///
+    /// DERIVED, IN-MEMORY state about ANOTHER program, like
+    /// [`model_aliases`](Self::model_aliases): nothing here reaches disk
+    /// (SNAPBACK-OWNED STATE). Kept for the BOARD'S lifetime, never evicted — `App`
+    /// survives every resume round trip, so a folder is asked once per run. It
+    /// holds only ANSWERS: a fetch that got none is never stored, so a later
+    /// compose on that folder can ask again. Written only by
+    /// [`finish_catalog_fetch`](Self::finish_catalog_fetch).
+    ///
+    /// `pub(crate)` so `compose::refresh_completion` can borrow this and
+    /// [`compose`](Self::compose) as DISJOINT fields, never cloning a list (~34 KB
+    /// measured) per keystroke.
+    pub(crate) catalogs: HashMap<PathBuf, Listing>,
+    /// The folders whose catalog fetch is IN FLIGHT — spawned, its
+    /// `AppEvent::CatalogFetched` not yet handled — so a folder never has two
+    /// fetches running at once.
+    ///
+    /// The same kind of state as [`catalogs`](Self::catalogs): derived, in memory,
+    /// never on disk. Marked by `compose::take_catalog_fetch` when it asks the
+    /// driver for a fetch (hence `pub(crate)`); cleared for one folder by
+    /// [`finish_catalog_fetch`](Self::finish_catalog_fetch) and for all of them by
+    /// [`forget_catalog_fetches_in_flight`](Self::forget_catalog_fetches_in_flight)
+    /// when the board session ends.
+    pub(crate) catalogs_in_flight: HashSet<PathBuf>,
     /// Indices (into `sessions`) that pass the scope predicate, cached so a
     /// per-keystroke query re-filter never re-canonicalizes paths.
     scoped: Vec<usize>,
@@ -2587,6 +2615,10 @@ impl App {
             // seed either: a model pick lives on each compose, never on the board.
             settings_model: None,
             restore_overridden: false,
+            // Nothing fetched yet: until a folder's catalog lands, no `/` list shows,
+            // a reply's `@` agents come from its transcript and a draft's has none.
+            catalogs: HashMap::new(),
+            catalogs_in_flight: HashSet::new(),
             scoped: Vec::new(),
             population: Vec::new(),
             expanded: HashSet::new(),
@@ -4543,6 +4575,32 @@ impl App {
     /// the reply's compose box and its picker).
     pub fn set_restore_overridden(&mut self, overridden: bool) {
         self.restore_overridden = overridden;
+    }
+
+    /// Settle one catalog fetch for `cwd`, delivered off the UI thread as
+    /// [`AppEvent::CatalogFetched`](crate::watch::AppEvent::CatalogFetched): the
+    /// folder is no longer in flight, and a `Some` becomes its list for the rest of
+    /// the board's life.
+    ///
+    /// A `None` is "no answer" (no `claude`, a timeout, a bad reply), NOT a verdict
+    /// about the folder, so it is never stored: a stored failure would stand in for
+    /// the list until restart. The in-flight mark is cleared EITHER way — kept on a
+    /// `None`, it would block the very retry that dropping the failure allows.
+    ///
+    /// Sets no status (STATUS-LINE OWNERSHIP): what a folder's list holds is a fact
+    /// true over an interval, and the pick list is the surface that shows it.
+    pub fn finish_catalog_fetch(&mut self, cwd: PathBuf, listing: Option<Listing>) {
+        self.catalogs_in_flight.remove(&cwd);
+        if let Some(listing) = listing {
+            self.catalogs.insert(cwd, listing);
+        }
+    }
+
+    /// Drop every in-flight catalog mark, because the board session that spawned
+    /// those fetches is ending and their answers can no longer arrive. Cached lists
+    /// stay: they are answers, and `App` outlives the session. Sets no status.
+    pub fn forget_catalog_fetches_in_flight(&mut self) {
+        self.catalogs_in_flight.clear();
     }
 
     // --- autorefresh reload -----------------------------------------------
@@ -11550,5 +11608,88 @@ mod tests {
                 "restored sticky status must survive tick {i}"
             );
         }
+    }
+
+    // --- the compose pick list's catalog cache --------------------------------
+
+    /// A one-command catalog, the shape `claude_catalog` delivers.
+    fn catalog(command: &str) -> Listing {
+        Listing {
+            commands: vec![crate::store::skills::ListingEntry {
+                name: command.to_string(),
+                description: Some(format!("{command} does a thing")),
+            }],
+            agents: Vec::new(),
+        }
+    }
+
+    /// A fetch that got NO answer releases its folder and stores nothing, so the
+    /// next compose on that folder can ask again. Kept, the mark would block that
+    /// retry for the rest of the run; stored, the failure would stand in for the
+    /// list until restart.
+    #[test]
+    fn a_catalog_fetch_with_no_answer_clears_its_mark_and_caches_nothing() {
+        let mut app = app_all(vec![]);
+        let failed = PathBuf::from("/tmp/catalog-failed");
+        let other = PathBuf::from("/tmp/catalog-other");
+        app.catalogs_in_flight.insert(failed.clone());
+        app.catalogs_in_flight.insert(other.clone());
+
+        app.finish_catalog_fetch(failed.clone(), None);
+
+        assert!(
+            !app.catalogs_in_flight.contains(&failed),
+            "a failed fetch must release its folder, or no compose there asks again"
+        );
+        assert!(
+            app.catalogs_in_flight.contains(&other),
+            "only the folder the answer is for is released"
+        );
+        assert!(
+            app.catalogs.is_empty(),
+            "no answer is not a verdict and is never cached: {:?}",
+            app.catalogs
+        );
+        assert_eq!(
+            app.status, None,
+            "a fetch's outcome never reaches the status line"
+        );
+    }
+
+    /// A fetch WITH an answer releases its folder and becomes that folder's list,
+    /// under the `cwd` it ran in and no other.
+    #[test]
+    fn a_catalog_fetch_with_an_answer_is_cached_for_its_folder() {
+        let mut app = app_all(vec![]);
+        let cwd = PathBuf::from("/tmp/catalog-answered");
+        app.catalogs_in_flight.insert(cwd.clone());
+
+        app.finish_catalog_fetch(cwd.clone(), Some(catalog("sbping")));
+
+        assert!(!app.catalogs_in_flight.contains(&cwd));
+        assert_eq!(app.catalogs.get(&cwd), Some(&catalog("sbping")));
+        assert_eq!(app.catalogs.len(), 1, "cached under its own folder alone");
+        assert_eq!(
+            app.status, None,
+            "a fetch's outcome never reaches the status line"
+        );
+    }
+
+    /// Ending a board session forgets every fetch in flight but KEEPS the answers
+    /// already cached: those are verdicts, and `App` outlives the session.
+    #[test]
+    fn forgetting_fetches_in_flight_keeps_the_cached_lists() {
+        let mut app = app_all(vec![]);
+        let cached = PathBuf::from("/tmp/catalog-cached");
+        app.finish_catalog_fetch(cached.clone(), Some(catalog("sbping")));
+        app.catalogs_in_flight
+            .insert(PathBuf::from("/tmp/catalog-a"));
+        app.catalogs_in_flight
+            .insert(PathBuf::from("/tmp/catalog-b"));
+
+        app.forget_catalog_fetches_in_flight();
+
+        assert!(app.catalogs_in_flight.is_empty());
+        assert_eq!(app.catalogs.get(&cached), Some(&catalog("sbping")));
     }
 }
