@@ -271,6 +271,29 @@ pub enum ComposeAction {
     ///   (tabs) before the program ever sees them; `Ctrl-L` is the one it leaves
     ///   alone. The board binds no `Ctrl-L` either, so the key means one thing.
     PickModel,
+    /// Jump the transcript to its top (`Ctrl-T`, the board's key).
+    ///
+    /// Acts only on a [`ComposeTarget::Reply`], whose compose previews the real
+    /// transcript; a draft shows a placeholder card, so there the key falls back to
+    /// the editor ([`handle_compose_key`]). `Ctrl-T` is unbound in the widget.
+    PreviewTop,
+    /// Jump the transcript to its bottom and re-follow the newest turn (`Ctrl-E`).
+    ///
+    /// Same target rule as [`ComposeAction::PreviewTop`]. `Ctrl-E` IS the widget's
+    /// end-of-line, so on a reply it is taken from the editor on purpose (the caret
+    /// still reaches line end with `End`/`Ctrl-F`); a draft keeps it.
+    PreviewBottom,
+    /// Scroll the transcript a page up (`PgUp`, the board's key). Reply-only, like
+    /// [`ComposeAction::PreviewTop`]; the editor loses its caret page-up there.
+    PreviewPageUp,
+    /// A page down (`PgDn`). Same rule as [`ComposeAction::PreviewPageUp`].
+    PreviewPageDown,
+    /// A quarter page up (`Ctrl-U`). On a reply it is taken from the editor's
+    /// delete-to-line-head on purpose; a draft keeps it.
+    PreviewHalfUp,
+    /// A quarter page down (`Ctrl-D`). On a reply it is taken from the editor's
+    /// delete-char on purpose; a draft keeps it.
+    PreviewHalfDown,
 }
 
 /// Map a keypress to a [`ComposeAction`]. PURE and free of any `TextArea`
@@ -299,6 +322,12 @@ pub enum ComposeAction {
 ///   a reply — see [`ComposeAction::OpenInteractive`]).
 /// * `Ctrl-L` → **PickModel** (this compose's model picker, on both targets — see
 ///   [`ComposeAction::PickModel`] for why the key is free).
+/// * `Ctrl-T` / `Ctrl-E` / `Home` / `End` → **PreviewTop** / **PreviewBottom**,
+///   `PgUp` / `PgDn` → **PreviewPageUp** / **PreviewPageDown**, `Ctrl-U` / `Ctrl-D`
+///   → **PreviewHalfUp** / **PreviewHalfDown**: exactly the board's transcript
+///   scroll keys (`update::key_to_action` — the `Ctrl` letters whatever else is
+///   held, the named keys only WITHOUT `Ctrl`). A reply acts on them, a draft
+///   forwards them to the editor.
 /// * `Esc` → **Cancel** (dismiss compose, not the app).
 /// * everything else → **Forward** to the editor.
 #[must_use]
@@ -313,6 +342,16 @@ pub fn compose_key_to_action(key: KeyEvent) -> ComposeAction {
         // full argument is on `ComposeAction::PickModel`. Both cases, for the kitty
         // path's sake, like the arms above.
         KeyCode::Char('l' | 'L') if ctrl => ComposeAction::PickModel,
+        KeyCode::Char('t' | 'T') if ctrl => ComposeAction::PreviewTop,
+        KeyCode::Char('e' | 'E') if ctrl => ComposeAction::PreviewBottom,
+        KeyCode::Char('u' | 'U') if ctrl => ComposeAction::PreviewHalfUp,
+        KeyCode::Char('d' | 'D') if ctrl => ComposeAction::PreviewHalfDown,
+        // The board binds these named keys only outside its `ctrl` block (where
+        // `Ctrl-Home` etc. are ignored), so `Ctrl-Home` stays the editor's here.
+        KeyCode::Home if !ctrl => ComposeAction::PreviewTop,
+        KeyCode::End if !ctrl => ComposeAction::PreviewBottom,
+        KeyCode::PageUp if !ctrl => ComposeAction::PreviewPageUp,
+        KeyCode::PageDown if !ctrl => ComposeAction::PreviewPageDown,
         KeyCode::Enter if alt || shift => ComposeAction::Newline,
         KeyCode::Enter => ComposeAction::Send,
         KeyCode::Esc => ComposeAction::Cancel,
@@ -395,6 +434,37 @@ pub fn handle_compose_key(app: &mut App, key: KeyEvent) -> Outcome {
         }
         ComposeAction::Send => submit_compose(app),
         ComposeAction::OpenInteractive => open_interactive(app),
+        // The transcript the reply previews is the SELECTED row's, which is the reply's
+        // target (STABLE-ID STATE: nothing here moves the selection), so the board's
+        // own jump applies; the caret and text are not touched. A draft has no
+        // transcript on screen, so the key reaches the editor as it always did.
+        scroll @ (ComposeAction::PreviewTop
+        | ComposeAction::PreviewBottom
+        | ComposeAction::PreviewPageUp
+        | ComposeAction::PreviewPageDown
+        | ComposeAction::PreviewHalfUp
+        | ComposeAction::PreviewHalfDown) => {
+            let replying = matches!(
+                app.compose.as_ref().map(|c| &c.target),
+                Some(ComposeTarget::Reply { .. })
+            );
+            if !replying {
+                if let Some(compose) = app.compose.as_mut() {
+                    compose.textarea.input(key);
+                }
+            } else {
+                // The board's own methods, so follow-bottom behaves identically.
+                match scroll {
+                    ComposeAction::PreviewTop => app.preview_top(),
+                    ComposeAction::PreviewBottom => app.preview_bottom(),
+                    ComposeAction::PreviewPageUp => app.preview_page_up(),
+                    ComposeAction::PreviewPageDown => app.preview_page_down(),
+                    ComposeAction::PreviewHalfUp => app.preview_half_up(),
+                    _ => app.preview_half_down(),
+                }
+            }
+            Outcome::Continue
+        }
         ComposeAction::PickModel => {
             // A modal over the compose: it takes the keyboard until `Enter`/`Esc`,
             // and the compose underneath is untouched either way.
@@ -780,8 +850,6 @@ mod tests {
             KeyCode::Right,
             KeyCode::Up,
             KeyCode::Down,
-            KeyCode::Home,
-            KeyCode::End,
         ] {
             assert_eq!(
                 compose_key_to_action(key(code)),
@@ -1312,5 +1380,237 @@ mod tests {
             "the draft is untouched, and the key typed no `l` into it"
         );
         assert_eq!(compose.model, None, "opening the picker picks nothing");
+    }
+
+    /// `Ctrl-T` / `Ctrl-E` decode to the transcript jumps (both cases, for the kitty
+    /// path's sake), and only with Ctrl: bare `t` / `e` still type.
+    #[test]
+    fn ctrl_t_and_ctrl_e_decode_to_the_preview_jumps() {
+        for (c, want) in [
+            ('t', ComposeAction::PreviewTop),
+            ('T', ComposeAction::PreviewTop),
+            ('e', ComposeAction::PreviewBottom),
+            ('E', ComposeAction::PreviewBottom),
+        ] {
+            assert_eq!(
+                compose_key_to_action(with_mods(KeyCode::Char(c), KeyModifiers::CONTROL)),
+                want
+            );
+        }
+        for c in ['t', 'e'] {
+            assert_eq!(
+                compose_key_to_action(key(KeyCode::Char(c))),
+                ComposeAction::Forward,
+                "a bare `{c}` types"
+            );
+        }
+    }
+
+    /// On a reply the jumps scroll the transcript of the compose's own row and touch
+    /// nothing else: not the draft's text, not its caret, not the row selection.
+    #[test]
+    fn a_reply_scrolls_the_transcript_and_leaves_the_draft_alone() {
+        let mut app = App::new(
+            vec![session_at(
+                "s",
+                PathBuf::from("/tmp/s.jsonl"),
+                PathBuf::from("/tmp"),
+            )],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
+        app.open_compose(ComposeState::new_reply("s".to_string(), None), None);
+        type_into(&mut app, "abc");
+        let caret = app.compose.as_ref().unwrap().textarea.cursor();
+        let selected = app.selected_session().map(|s| s.session_id.clone());
+        app.preview_scroll = 9;
+        app.preview_follow_bottom = true;
+
+        let ctrl = |c| with_mods(KeyCode::Char(c), KeyModifiers::CONTROL);
+        assert!(matches!(
+            handle_compose_key(&mut app, ctrl('t')),
+            Outcome::Continue
+        ));
+        assert_eq!(app.preview_scroll, 0, "Ctrl-T jumps to the top");
+        assert!(!app.preview_follow_bottom, "and drops follow-bottom");
+
+        handle_compose_key(&mut app, ctrl('e'));
+        assert!(
+            app.preview_follow_bottom,
+            "Ctrl-E re-follows the newest turn"
+        );
+
+        let compose = app.compose.as_ref().expect("still composing");
+        assert_eq!(compose.textarea.lines(), ["abc"]);
+        assert_eq!(compose.textarea.cursor(), caret, "the caret did not move");
+        assert_eq!(
+            app.selected_session().map(|s| s.session_id.clone()),
+            selected
+        );
+    }
+
+    /// A draft has no transcript on screen, so Ctrl-E keeps the editor's end-of-line
+    /// and the preview is not scrolled.
+    #[test]
+    fn a_draft_keeps_ctrl_e_as_end_of_line() {
+        let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp"));
+        app.open_compose(ComposeState::new_background(None), None);
+        type_into(&mut app, "abc");
+        app.compose
+            .as_mut()
+            .unwrap()
+            .textarea
+            .move_cursor(CursorMove::Head);
+        app.preview_follow_bottom = false;
+
+        handle_compose_key(
+            &mut app,
+            with_mods(KeyCode::Char('e'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.compose.as_ref().unwrap().textarea.cursor(), (0, 3));
+        assert!(!app.preview_follow_bottom, "the preview was not touched");
+    }
+
+    /// Every board transcript-scroll key decodes to its scroll action, with the
+    /// board's own modifier rule, and nothing else is claimed.
+    #[test]
+    fn the_board_scroll_keys_decode_to_scroll_actions() {
+        let ctrl = KeyModifiers::CONTROL;
+        for (code, mods, want) in [
+            (KeyCode::Char('u'), ctrl, ComposeAction::PreviewHalfUp),
+            (KeyCode::Char('U'), ctrl, ComposeAction::PreviewHalfUp),
+            (KeyCode::Char('d'), ctrl, ComposeAction::PreviewHalfDown),
+            (KeyCode::Char('D'), ctrl, ComposeAction::PreviewHalfDown),
+            (KeyCode::Home, KeyModifiers::NONE, ComposeAction::PreviewTop),
+            (
+                KeyCode::End,
+                KeyModifiers::NONE,
+                ComposeAction::PreviewBottom,
+            ),
+            (
+                KeyCode::PageUp,
+                KeyModifiers::NONE,
+                ComposeAction::PreviewPageUp,
+            ),
+            (
+                KeyCode::PageDown,
+                KeyModifiers::NONE,
+                ComposeAction::PreviewPageDown,
+            ),
+            // The board matches the named keys under Shift/Alt too.
+            (
+                KeyCode::PageUp,
+                KeyModifiers::SHIFT,
+                ComposeAction::PreviewPageUp,
+            ),
+            (KeyCode::Home, KeyModifiers::ALT, ComposeAction::PreviewTop),
+        ] {
+            assert_eq!(
+                compose_key_to_action(with_mods(code, mods)),
+                want,
+                "{code:?}"
+            );
+        }
+        // Bare letters type; Ctrl+named keys are the board's `Ignore`, so they stay
+        // the editor's (word/paragraph jumps).
+        for code in [KeyCode::Char('u'), KeyCode::Char('d')] {
+            assert_eq!(compose_key_to_action(key(code)), ComposeAction::Forward);
+        }
+        for code in [
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+        ] {
+            assert_eq!(
+                compose_key_to_action(with_mods(code, ctrl)),
+                ComposeAction::Forward,
+                "{code:?}"
+            );
+        }
+    }
+
+    /// On a reply each scroll key moves the transcript through the board's method and
+    /// leaves text, caret and selection alone.
+    #[test]
+    fn a_reply_scrolls_with_every_board_scroll_key() {
+        let mut app = App::new(
+            vec![session_at(
+                "s",
+                PathBuf::from("/tmp/s.jsonl"),
+                PathBuf::from("/tmp"),
+            )],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
+        app.open_compose(ComposeState::new_reply("s".to_string(), None), None);
+        type_into(&mut app, "abc");
+        let caret = app.compose.as_ref().unwrap().textarea.cursor();
+        let selected = app.selected_session().map(|s| s.session_id.clone());
+        let ctrl = |c| with_mods(KeyCode::Char(c), KeyModifiers::CONTROL);
+        type Board = fn(&mut App);
+        let cases: [(KeyEvent, Board); 6] = [
+            (ctrl('u'), App::preview_half_up),
+            (ctrl('d'), App::preview_half_down),
+            (key(KeyCode::PageUp), App::preview_page_up),
+            (key(KeyCode::PageDown), App::preview_page_down),
+            (key(KeyCode::Home), App::preview_top),
+            (key(KeyCode::End), App::preview_bottom),
+        ];
+        for (k, board) in cases {
+            for follow in [false, true] {
+                let mut want = app_with_preview(follow);
+                board(&mut want);
+                app.preview_scroll = 40;
+                app.preview_follow_bottom = follow;
+                handle_compose_key(&mut app, k);
+                assert_eq!(
+                    (app.preview_scroll, app.preview_follow_bottom),
+                    (want.preview_scroll, want.preview_follow_bottom),
+                    "{k:?} follow={follow}"
+                );
+            }
+        }
+        let compose = app.compose.as_ref().expect("still composing");
+        assert_eq!(compose.textarea.lines(), ["abc"]);
+        assert_eq!(compose.textarea.cursor(), caret);
+        assert_eq!(
+            app.selected_session().map(|s| s.session_id.clone()),
+            selected
+        );
+    }
+
+    fn app_with_preview(follow: bool) -> App {
+        let mut a = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp"));
+        a.preview_scroll = 40;
+        a.preview_follow_bottom = follow;
+        a
+    }
+
+    /// A draft keeps all of them as editor keys: Ctrl-D deletes a char, Home moves
+    /// the caret, and the preview is not touched.
+    #[test]
+    fn a_draft_keeps_every_scroll_key_as_an_editor_key() {
+        let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp"));
+        app.open_compose(ComposeState::new_background(None), None);
+        type_into(&mut app, "abc");
+        app.preview_scroll = 7;
+        app.preview_follow_bottom = false;
+        handle_compose_key(&mut app, key(KeyCode::Home));
+        assert_eq!(app.compose.as_ref().unwrap().textarea.cursor(), (0, 0));
+        handle_compose_key(
+            &mut app,
+            with_mods(KeyCode::Char('d'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.compose.as_ref().unwrap().textarea.lines(), ["bc"]);
+        handle_compose_key(&mut app, key(KeyCode::End));
+        assert_eq!(app.compose.as_ref().unwrap().textarea.cursor(), (0, 2));
+        handle_compose_key(
+            &mut app,
+            with_mods(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        );
+        // The widget's Ctrl-U is undo: it undid the Ctrl-D delete.
+        assert_eq!(app.compose.as_ref().unwrap().textarea.lines(), ["abc"]);
+        assert_eq!((app.preview_scroll, app.preview_follow_bottom), (7, false));
     }
 }

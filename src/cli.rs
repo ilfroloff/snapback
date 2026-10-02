@@ -107,8 +107,9 @@ KEYS:
     Tab           toggle name / name+content search. Widening to content also
                   opens the preview on the most recent match, as typing does
     PgUp/PgDn     preview page  Ctrl-U/Ctrl-D  preview quarter-page
-    Home/End      preview top / bottom (also Ctrl-T/Ctrl-E; fn+←/→ on a MacBook
-                  keyboard, where Home/End are not their own keys)
+    Home/End      preview top / bottom (also Ctrl-T/Ctrl-E; every preview scroll key
+                  also works while a quick reply is open, not on a draft; fn+←/→ on a MacBook keyboard, where
+                  Home/End are not their own keys)
     Shift+↑/↓     jump the preview to the previous / next line the query marks.
                   Only while something is marked there — with nothing marked they
                   stay plain move, so they never take a key away from you. One
@@ -120,15 +121,19 @@ KEYS:
                   the transcript
     click         in the preview, on release: a folded node (a subagent's
                   hand-back, or context claude added) unfolds, and a second click
-                  folds it back; otherwise a link opens (http/https only)
+                  folds it back; otherwise a link opens (http/https only).
+                  Like the drag and double-click below, it works while a reply
+                  box is open
     drag          in the preview: select transcript text; on release it is
                   copied the way Ctrl-X y copies (your clipboard tool, or OSC 52
                   over SSH). A drag that starts on a node or a link selects it
                   rather than unfolding or opening it. Hold the drag past the
                   pane's top or bottom edge and it scrolls that way, faster the
                   further out, so the selection keeps growing until you let go.
-                  Off while a compose or draft box is open. Hold Shift/Option
-                  for your terminal's own selection instead
+                  Works while a reply box is open (it never touches what you
+                  are typing); off while a new-session draft is, since its
+                  placeholder replaces the transcript. Hold Shift/Option for
+                  your terminal's own selection instead
     double-click  in the preview: select the word under the pointer and copy it
                   on release, the same way a drag copies (two clicks on one
                   cell within half a second). The first click still unfolds a
