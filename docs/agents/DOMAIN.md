@@ -477,7 +477,8 @@ measures distances ACROSS the pair. The narrow cost is that a char whose
 lowercase is two chars (`İ`) no longer folds at all.
 
 That fold is the module's **one** fold and every seam takes it — the filter's
-haystacks, the row-label highlight and the preview marks alike. The surfaces share
+haystacks (the pair `admits` builds from a caller's string included), the
+row-label highlight and the preview marks alike. The surfaces share
 the per-atom finders, and a finder only answers the same question twice if each
 haystack was lowercased by the same rule; fold one seam with `str::to_lowercase`
 instead and the two part company on exactly the chars above, plus the
@@ -585,8 +586,10 @@ them in one rendered LINE marks nothing whenever the words sit on different line
 — and the pane then reads as broken while the board's own nudge claims the match
 is elsewhere. The row LABEL's HIGHLIGHT is the other shape (one string, matched as
 a whole) and `match_indices` applies the WHOLE-STRING rule over those same
-finders — but that is a DRAWING seam, and any question about what a label
-CONTAINS goes to the per-atom rule instead (see the nudge below). Two
+finders — but that is a DRAWING seam. MEMBERSHIP — does a string pass the
+filter's own every-atom test — is `admits`, the predicate that seam's gate calls
+and the [compose pick list](#how-the-letters-narrow-the-list) asks; whether a
+label holds ANY atom goes to the per-atom rule instead (see the nudge below). Two
 consequences are normal and correct:
 SEVERAL marked runs on one line, and marks as a UNION — overlapping or abutting
 runs from different atoms merge into one span.
@@ -2155,8 +2158,8 @@ refresh, the fetch request), `src/claude_catalog.rs` (claude's list),
 `src/store/skills.rs` (a reply's `@` agents until claude's list lands).
 
 BOTH compose boxes — the `Ctrl-R` reply and the `Ctrl-N` draft — offer the same
-`/` and `@` list, through the same editor, key router, driver and renderer. It is
-a start-of-name filter over a small candidate list — NOT the session matcher:
+`/` and `@` list, through the same editor, key router, driver and renderer, and
+narrow it by the [rule below](#how-the-letters-narrow-the-list):
 
 - `/` as the very first character of the draft lists claude's own skills and
   commands for the folder, built-in ones included, minus the built-ins claude
@@ -2164,16 +2167,23 @@ a start-of-name filter over a small candidate list — NOT the session matcher:
   nothing until that list is in.
 - `@` at the start of a word lists files and folders under the folder
   (`@src/tu` narrows inside `src/`); dot-names show only when the leaf starts with
-  `.`, folders come first, and a folder pick reopens the list one level down. For
-  a TOP-LEVEL `@` token only (no folder part), the folder's agents follow, labelled
-  `<name> (agent)` — claude's own typeahead label — and inserted as
+  `.` — a visibility gate applied before any match, so `@env` never lists
+  `.env` — folders come first within a tier, and a folder pick reopens the list
+  one level down. For a TOP-LEVEL `@` token only (no folder part), the folder's
+  agents follow, labelled `<name> (agent)` — claude's own typeahead label — and
+  inserted as
   `@agent-<name> `, the form claude turns into a structured `agent_mention` and
   documents for typing by hand — never claude's own picker form
   `@"<name> (agent)"`, which misses a name containing `agent-`
   ([CLAUDE_CLI.md](CLAUDE_CLI.md#the-initialize-control-handshake-compose-pick-list)).
-  Agents match by the start of their NAME — a query that starts `agent-` matches
-  what follows it — so `@a` lists the agents named `a…`, not every agent through
-  the inserted prefix. An agent whose name claude's mention parser could not read
+  An agent is matched against its name and description, never that label: an
+  `agent-` typed in any case at the start of the query is stripped and the rest
+  keeps its case, so a re-typed mention (`@agent-Ex`) lists by what follows it,
+  while a partial `a`, `ag`… is an ordinary query — `@a` lists only the agents
+  whose name or description holds an `a`. claude 2.1.284's own `@` also matches
+  the `<name> (agent)` label, so there `@a`, `@ag` and `@agent` list practically
+  every agent, and it never matches an agent's description (read from the binary,
+  2026-10-02). An agent whose name claude's mention parser could not read
   whole (`complete::is_mention_safe`: claude 2.1.284's `[\w:.@-]+`)
   is never offered, since it would be inserted and silently ignored.
 - A skill, command or agent row carries its description, verbatim as its source
@@ -2255,6 +2265,30 @@ is never evicted — one ~34 KB entry per distinct folder composed in — and ne
 reaches disk. It is keyed by the path as given (`Session.cwd` from the file, the
 canonical launch dir), so two spellings of one folder cost one extra fetch, never
 a wrong list, and a skill created mid-run is listed after a restart.
+
+#### How the letters narrow the list
+
+The letters after the trigger go to the board's own matcher:
+`complete::placement` asks `SearchIndex::admits` — the
+[filter's](#content-index-storeparse) own membership question — of a candidate's
+NAME, and only then of its description. So a query matches ANYWHERE in the name
+or, for a skill, command or agent, anywhere in its description; a file or folder
+has only its name. It is a substring match under the board's per-atom smart case
+and its one fold: an all-lowercase query matches in any case and a typed
+uppercase letter matches exactly, so `@exp` lists both `Explore` and `explain`
+while `@Ex` lists only `Explore`. The token holds no whitespace, so it is always
+ONE atom.
+
+What matches is ordered in three tiers (`complete::Placement`): a name that
+STARTS with the query, then a name that holds it elsewhere, then a
+description-only hit. Within a tier the list keeps the order it has with no
+query — the source's order for commands and agents (claude's catalog, or a
+reply's transcript); folders before files, then by name, for `@` entries — and
+an `@` list keeps every entry above every agent, whatever their tiers. An empty
+query admits every candidate into that one order. claude 2.1.284 orders its own
+`/` menu the same way — name start, then the rest of the name, then the
+description (read from the binary, 2026-10-02) — but it matches fuzzily, and
+ranks aliases and usage too.
 
 #### Which settings the fetch loads
 

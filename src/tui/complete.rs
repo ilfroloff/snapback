@@ -4,19 +4,20 @@
 //! commands; `@` offers files and folders and, for a top-level token, agents.
 //! Each candidate carries its source's description, if any.
 //!
-//! This is a START-OF-NAME filter over a small candidate list (one folder's
-//! command or agent listing, or one folder's entries), NOT the session search
-//! matcher (AGENTS.md MATCHER ISOLATION): it reaches for neither search crate,
-//! and never ranks — the order is the sort the functions below state. A pure
-//! core plus one thin impure `read_dir` wrapper ([`list_dir`]); the caller
-//! decides WHEN to read (once per folder, from the key handler, never the render
-//! path).
+//! Candidates are matched by the board's ONE matcher
+//! ([`SearchIndex::admits`]), asked of a candidate's name and then its
+//! description, and what matches is ordered by [`Placement`] — the pick list's
+//! own order, never the board's. `memchr` and `nucleo` stay in `search.rs`
+//! (AGENTS.md MATCHER ISOLATION). A pure core plus one thin impure `read_dir`
+//! wrapper ([`list_dir`]); the caller decides WHEN to read (once per folder,
+//! from the key handler, never the render path).
 //!
 //! Every column is a CHARACTER column (what `TextArea::cursor` reports), never
 //! a byte offset, so multi-byte text before the caret cannot mis-cut a token.
 
 use std::path::Path;
 
+use crate::search::SearchIndex;
 use crate::store::skills::ListingEntry;
 
 /// Cap on entries read from one folder. Bounds a single keystroke's cost on a
@@ -120,14 +121,70 @@ pub fn completion_context(lines: &[String], cursor: (usize, usize)) -> Option<Co
     })
 }
 
-/// Commands (skills included) whose name starts with `query` (case-insensitive),
-/// in the given order. `label` is `/name`; `insert` is the bare name (the space
-/// is [`replacement`]'s); `description` is the entry's.
+/// Where the query landed in a candidate, declared best first so the derived
+/// order IS the pick list's order. claude 2.1.284 orders its own `/` list the
+/// same way: a name that starts with the query, then a name that holds it
+/// elsewhere, then a description-only hit (read from the binary, 2026-10-02).
+/// See DOMAIN.md "Compose pick list".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Placement {
+    NameStart,
+    InName,
+    InDescription,
+}
+
+/// The board's own matcher, compiled for one pick-list token. The token holds no
+/// whitespace ([`completion_context`] ends it there), so it is exactly ONE atom,
+/// under the board's per-atom smart case.
+fn matcher(query: &str) -> SearchIndex {
+    let mut matcher = SearchIndex::new();
+    matcher.set_query(query);
+    matcher
+}
+
+/// Where `matcher`'s query lands in a candidate: its `name`, else its
+/// `description`, else `None`. Asked of the NAME, never the row's label (`/name`,
+/// `<name> (agent)`), so the decoration can never match. An empty query admits
+/// every name and marks nothing, so every candidate lands in ONE tier and keeps
+/// its source order.
+fn placement(matcher: &SearchIndex, name: &str, description: Option<&str>) -> Option<Placement> {
+    if matcher.admits(name) {
+        Some(if matcher.atom_match_positions(name).first() == Some(&0) {
+            Placement::NameStart
+        } else {
+            Placement::InName
+        })
+    } else if description.is_some_and(|d| matcher.admits(d)) {
+        Some(Placement::InDescription)
+    } else {
+        None
+    }
+}
+
+/// The listing entries `query` matches, ordered by [`Placement`]. The sort is
+/// stable, which is what keeps the caller's order within a tier.
+fn select_listed<'a>(
+    entries: impl IntoIterator<Item = &'a ListingEntry>,
+    query: &str,
+) -> Vec<&'a ListingEntry> {
+    let matcher = matcher(query);
+    let mut picked: Vec<(Placement, &ListingEntry)> = entries
+        .into_iter()
+        .filter_map(|e| placement(&matcher, &e.name, e.description.as_deref()).map(|p| (p, e)))
+        .collect();
+    picked.sort_by_key(|(placement, _)| *placement);
+    picked.into_iter().map(|(_, e)| e).collect()
+}
+
+/// Commands (skills included) whose name holds `query` anywhere, or else whose
+/// description does, matched like the board's search box (an uppercase letter
+/// matches exactly). A name that starts with it lists first, then a name that
+/// holds it elsewhere, then a description hit, each tier in the given order.
+/// `label` is `/name`; `insert` is the bare name (the space is
+/// [`replacement`]'s); `description` is the entry's.
 pub fn filter_commands(entries: &[ListingEntry], query: &str) -> Vec<Candidate> {
-    let query = query.to_lowercase();
-    entries
-        .iter()
-        .filter(|e| e.name.to_lowercase().starts_with(&query))
+    select_listed(entries, query)
+        .into_iter()
         .map(|e| Candidate {
             label: format!("/{}", e.name),
             insert: e.name.clone(),
@@ -147,31 +204,45 @@ pub fn is_mention_safe(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || MENTION_NAME_PUNCTUATION.contains(&c))
 }
 
-/// Agents whose name starts with `query` (case-insensitive), in the given order,
-/// skipping every name that is not [`is_mention_safe`]. A query that already
-/// starts with [`AGENT_MENTION_PREFIX`] (typed in any case) is matched by what
-/// follows it; any other query by itself — so `@a` lists the agents named `a…`,
-/// never every agent through the prefix. `label` is the name plus
-/// [`AGENT_LABEL_SUFFIX`]; `insert` is [`AGENT_MENTION_PREFIX`] plus the name.
+/// Agents matched and ordered as [`filter_commands`] matches commands — by name
+/// anywhere, then by description — skipping every name that is not
+/// [`is_mention_safe`]. A query that already starts with [`AGENT_MENTION_PREFIX`]
+/// (typed in any case) is matched by what follows it; any other query by itself,
+/// against the name and description and never the label — so `@a` lists only
+/// the agents that hold an `a` there, never every agent through the prefix or
+/// [`AGENT_LABEL_SUFFIX`]. `label` is the name plus [`AGENT_LABEL_SUFFIX`];
+/// `insert` is [`AGENT_MENTION_PREFIX`] plus the name.
 pub fn select_agents(entries: &[ListingEntry], query: &str) -> Vec<Candidate> {
-    let query = query.to_lowercase();
-    let want = query.strip_prefix(AGENT_MENTION_PREFIX).unwrap_or(&query);
-    entries
-        .iter()
-        .filter(|e| is_mention_safe(&e.name) && e.name.to_lowercase().starts_with(want))
-        .map(|e| Candidate {
-            label: format!("{}{AGENT_LABEL_SUFFIX}", e.name),
-            insert: format!("{AGENT_MENTION_PREFIX}{}", e.name),
-            description: e.description.clone(),
-        })
-        .collect()
+    select_listed(
+        entries.iter().filter(|e| is_mention_safe(&e.name)),
+        strip_mention_prefix(query),
+    )
+    .into_iter()
+    .map(|e| Candidate {
+        label: format!("{}{AGENT_LABEL_SUFFIX}", e.name),
+        insert: format!("{AGENT_MENTION_PREFIX}{}", e.name),
+        description: e.description.clone(),
+    })
+    .collect()
+}
+
+/// `query` without a leading [`AGENT_MENTION_PREFIX`] typed in any case. The
+/// rest keeps ITS case, or smart case could never see an uppercase letter typed
+/// after the prefix.
+fn strip_mention_prefix(query: &str) -> &str {
+    match query.get(..AGENT_MENTION_PREFIX.len()) {
+        Some(head) if head.eq_ignore_ascii_case(AGENT_MENTION_PREFIX) => {
+            &query[AGENT_MENTION_PREFIX.len()..]
+        }
+        _ => query,
+    }
 }
 
 /// Every `@` candidate for `query`: the entries of the folder its `dir_part`
-/// names (`dir_entries`, read by the caller) whose name starts with its leaf —
-/// folders, then files — followed, ONLY for a top-level token (no `dir_part`),
-/// by the matching [`select_agents`]. An agent is not a path, so `@src/…` never
-/// lists one.
+/// names (`dir_entries`, read by the caller) that its leaf matches, in
+/// [`select_entries`]' order, followed, ONLY for a top-level token (no
+/// `dir_part`), by the matching [`select_agents`] — entries above agents
+/// whatever their tiers. An agent is not a path, so `@src/…` never lists one.
 pub fn at_candidates(
     dir_entries: &[DirEntryInfo],
     agents: &[ListingEntry],
@@ -194,22 +265,28 @@ pub fn split_path_query(query: &str) -> (&str, &str) {
     }
 }
 
-/// Entries whose name starts with `leaf` (case-insensitive): dot-names only
-/// when `leaf` itself starts with `.`; folders first, then files, each sorted
-/// by name. Names are inserted VERBATIM; folders carry a trailing `/`.
+/// Entries whose name holds `leaf` anywhere, matched like the board's search box
+/// (an uppercase letter matches exactly). Dot-names show only when `leaf` itself
+/// starts with `.`, a visibility gate applied before matching. Ordered by
+/// [`Placement`] (a name that starts with `leaf` first), then folders before
+/// files, then by name. Names are inserted VERBATIM; folders carry a trailing
+/// `/`.
 pub fn select_entries(entries: &[DirEntryInfo], leaf: &str) -> Vec<Candidate> {
-    let want = leaf.to_lowercase();
+    let matcher = matcher(leaf);
     let show_hidden = leaf.starts_with('.');
-    let mut picked: Vec<&DirEntryInfo> = entries
+    let mut picked: Vec<(Placement, &DirEntryInfo)> = entries
         .iter()
-        .filter(|e| {
-            (show_hidden || !e.name.starts_with('.')) && e.name.to_lowercase().starts_with(&want)
-        })
+        .filter(|e| show_hidden || !e.name.starts_with('.'))
+        .filter_map(|e| placement(&matcher, &e.name, None).map(|p| (p, e)))
         .collect();
-    picked.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
+    picked.sort_by(|(pa, a), (pb, b)| {
+        pa.cmp(pb)
+            .then_with(|| b.is_dir.cmp(&a.is_dir))
+            .then_with(|| a.name.cmp(&b.name))
+    });
     picked
         .into_iter()
-        .map(|e| {
+        .map(|(_, e)| {
             let text = if e.is_dir {
                 format!("{}/", e.name)
             } else {
@@ -385,25 +462,27 @@ mod tests {
     }
 
     #[test]
-    fn skill_filter_is_a_case_insensitive_prefix_match() {
+    fn the_command_filter_matches_anywhere_in_the_name() {
         let names = vec![
             listed("cr-review", None),
             listed("Handoff", None),
             listed("pr-squash", None),
         ];
         let got = filter_commands(&names, "h");
+        assert_eq!(inserts(&got), vec!["Handoff", "pr-squash"]);
         assert_eq!(
-            got,
-            vec![Candidate {
+            got[0],
+            Candidate {
                 label: "/Handoff".into(),
                 insert: "Handoff".into(),
                 description: None,
-            }]
+            }
         );
         assert_eq!(filter_commands(&names, "").len(), 3);
-        assert!(
-            filter_commands(&names, "review").is_empty(),
-            "prefix, not substring"
+        assert_eq!(
+            inserts(&filter_commands(&names, "review")),
+            vec!["cr-review"],
+            "anywhere, not only at the start"
         );
     }
 
@@ -446,7 +525,7 @@ mod tests {
     }
 
     #[test]
-    fn agents_match_by_name_prefix_in_input_order() {
+    fn agents_match_anywhere_in_the_name_in_input_order() {
         let agents = vec![
             listed("zeta", None),
             listed("Explore", None),
@@ -454,7 +533,11 @@ mod tests {
             listed("explain", None),
         ];
         assert_eq!(
-            inserts(&select_agents(&agents, "EXP")),
+            inserts(&select_agents(&agents, "exp")),
+            vec!["agent-Explore", "agent-explain"]
+        );
+        assert_eq!(
+            inserts(&select_agents(&agents, "xpl")),
             vec!["agent-Explore", "agent-explain"]
         );
         assert_eq!(
@@ -466,9 +549,9 @@ mod tests {
                 "agent-explain"
             ]
         );
-        assert!(
-            select_agents(&agents, "agent").is_empty(),
-            "no agent is named agent…"
+        assert_eq!(
+            inserts(&select_agents(&agents, "agent")),
+            vec!["agent-sby-agent"]
         );
     }
 
@@ -487,6 +570,8 @@ mod tests {
         assert_eq!(select_agents(&agents, "agent-").len(), 2);
     }
 
+    /// `Explore`'s LABEL, `Explore (agent)`, holds an `a` and its name does not,
+    /// so only matching the label could list it.
     #[test]
     fn a_short_query_never_lists_every_agent_through_the_mention_prefix() {
         let agents = vec![
@@ -494,8 +579,108 @@ mod tests {
             listed("alpha", None),
             listed("sby-agent", None),
         ];
-        assert_eq!(inserts(&select_agents(&agents, "a")), vec!["agent-alpha"]);
-        assert_eq!(inserts(&select_agents(&agents, "ag")), Vec::<&str>::new());
+        assert_eq!(
+            inserts(&select_agents(&agents, "a")),
+            vec!["agent-alpha", "agent-sby-agent"]
+        );
+        assert_eq!(
+            inserts(&select_agents(&agents, "ag")),
+            vec!["agent-sby-agent"]
+        );
+        assert_eq!(
+            inserts(&select_agents(&agents, "agent")),
+            vec!["agent-sby-agent"]
+        );
+    }
+
+    /// `zeta` before `alpha`: a tier keeps the catalog's order, never the
+    /// alphabet's.
+    #[test]
+    fn a_name_start_hit_lists_first_then_a_name_hit_then_a_description_hit() {
+        let entries = vec![
+            listed("zeta", Some("Review a change")),
+            listed("cr-review", None),
+            listed("alpha", Some("the review loop")),
+            listed("review-pr", None),
+            listed("reviewer", Some("Checks style")),
+            listed("other", Some("unrelated")),
+        ];
+        let got = filter_commands(&entries, "review");
+        assert_eq!(
+            inserts(&got),
+            vec!["review-pr", "reviewer", "cr-review", "zeta", "alpha"]
+        );
+        assert_eq!(
+            got.iter()
+                .map(|c| c.description.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                None,
+                Some("Checks style"),
+                None,
+                Some("Review a change"),
+                Some("the review loop")
+            ]
+        );
+    }
+
+    #[test]
+    fn an_agent_matches_its_description_after_every_name_hit() {
+        let agents = vec![
+            listed("planner", Some("Reviews plans before work")),
+            listed("sby-agent", Some("Pings back")),
+            listed("reviewer", None),
+        ];
+        assert_eq!(
+            inserts(&select_agents(&agents, "review")),
+            vec!["agent-reviewer", "agent-planner"]
+        );
+        assert_eq!(
+            inserts(&select_agents(&agents, "pings")),
+            vec!["agent-sby-agent"]
+        );
+    }
+
+    #[test]
+    fn an_uppercase_letter_matches_exactly_as_the_board_search_does() {
+        let agents = vec![listed("explain", None), listed("Explore", None)];
+        assert_eq!(
+            inserts(&select_agents(&agents, "ex")),
+            vec!["agent-explain", "agent-Explore"]
+        );
+        assert_eq!(
+            inserts(&select_agents(&agents, "Ex")),
+            vec!["agent-Explore"]
+        );
+        let commands = vec![listed("Handoff", None), listed("pr-squash", None)];
+        assert_eq!(inserts(&filter_commands(&commands, "H")), vec!["Handoff"]);
+        assert_eq!(
+            inserts(&filter_commands(&commands, "h")),
+            vec!["Handoff", "pr-squash"]
+        );
+        let e = vec![entry("README.md", false), entry("Readme", true)];
+        assert_eq!(inserts(&select_entries(&e, "READ")), vec!["README.md"]);
+        assert_eq!(
+            inserts(&select_entries(&e, "read")),
+            vec!["Readme/", "README.md"]
+        );
+    }
+
+    #[test]
+    fn a_mention_prefix_keeps_the_case_of_what_follows_it() {
+        let agents = vec![listed("explain", None), listed("Explore", None)];
+        assert_eq!(
+            inserts(&select_agents(&agents, "agent-Ex")),
+            vec!["agent-Explore"]
+        );
+        assert_eq!(
+            inserts(&select_agents(&agents, "AGENT-ex")),
+            vec!["agent-explain", "agent-Explore"]
+        );
+        assert_eq!(
+            inserts(&select_agents(&agents, "agent-")),
+            vec!["agent-explain", "agent-Explore"]
+        );
     }
 
     #[test]
@@ -518,7 +703,7 @@ mod tests {
         );
         assert_eq!(
             inserts(&at_candidates(&dir, &agents, "s")),
-            vec!["src/", "agent-sby-agent"]
+            vec!["src/", "notes.txt", "agent-sby-agent"]
         );
     }
 
@@ -587,6 +772,39 @@ mod tests {
             .map(|c| c.insert)
             .collect();
         assert_eq!(got, vec!["Readme/", "README.md"]);
+    }
+
+    #[test]
+    fn entries_match_anywhere_and_a_name_start_hit_outranks_folders_first() {
+        let e = vec![
+            entry("notes.md", false),
+            entry("assets", true),
+            entry("sample.txt", false),
+            entry("zz", true),
+        ];
+        let labels = |leaf: &str| -> Vec<String> {
+            select_entries(&e, leaf)
+                .into_iter()
+                .map(|c| c.label)
+                .collect()
+        };
+        assert_eq!(labels("s"), vec!["sample.txt", "assets/", "notes.md"]);
+        assert_eq!(labels(""), vec!["assets/", "zz/", "notes.md", "sample.txt"]);
+    }
+
+    #[test]
+    fn a_dot_name_stays_hidden_until_the_leaf_starts_with_a_dot() {
+        let e = vec![
+            entry(".env", false),
+            entry("venv", true),
+            entry("env.example", false),
+        ];
+        assert_eq!(
+            inserts(&select_entries(&e, "env")),
+            vec!["env.example", "venv/"],
+            ".env holds `env` but stays hidden"
+        );
+        assert_eq!(inserts(&select_entries(&e, ".env")), vec![".env"]);
     }
 
     #[test]

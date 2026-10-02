@@ -266,7 +266,10 @@ whose fingerprint changed.
 returns candidates in the order given. Do not re-introduce ranking:
 `App::order_filtered` re-sorts every result by a **tie-free total order**, so a
 rank cannot reach the screen, and computing one cost 76–81% of each keystroke
-through nucleo's `Utf32Str` UTF-32 conversion.
+through nucleo's `Utf32Str` UTF-32 conversion. The compose pick list's tiered
+order does not bend this: it is a pure decision in `tui::complete`
+(`Placement`), read off answers `search.rs` already gives, never a rank computed
+inside the matcher.
 
 Membership is "every atom present as a byte substring" in name-only mode and for
 a single atom. A **multi-atom name+content** query is narrower: the AND is
@@ -289,9 +292,18 @@ pane cannot explain why the row is there. Consequences to keep: several runs on
 one line are normal, and marks are a **union** (overlapping or abutting runs merge
 into one span, never two).
 
+The compose pick list is a further CONSUMER of those seams, not a third rule.
+`tui::complete` compiles its token with `SearchIndex::new` + `set_query` and asks
+`admits` — the filter's own membership predicate, the very gate `match_indices`
+runs — of a candidate's name and then its description. Its tier comes from the
+per-atom seam, because "does the name START with it" is a positional question: a
+name-start hit is an `atom_match_positions` run at char 0. The token is
+whitespace-free, so it is ONE atom, and on one atom the two rules coincide.
+
 Sharing the finders is only half of asking the same question. The other half is
 the **fold**: every lowercased string the module searches — the filter's
-haystacks and both marking seams' — goes through the one per-char,
+haystacks (the pair `admits` builds from a caller's string included) and both
+marking seams' — goes through the one per-char,
 byte-length-preserving fold. Reach for `str::to_lowercase` on any one of them and
 the surfaces diverge on the chars that fold differently, which shows up as a row
 the filter admitted drawing with nothing marked.
@@ -325,9 +337,9 @@ Two invariants are easy to break and expensive to get wrong:
   lowercased one the case-insensitive branch. Neither is dead; deleting the cased
   one breaks every uppercase query.
 
-`gate_atoms` is the ONE splitter: the filter, the row-label highlight and the
-preview marks all take the same atoms from it — never re-split a query somewhere
-else.
+`gate_atoms` is the ONE splitter: the filter, `admits` (and through it the
+compose pick list), the row-label highlight and the preview marks all take the
+same atoms from it — never re-split a query somewhere else.
 
 `last_atom_start` is the ONE exception, and it proves the rule rather than
 bending it. The word-delete keys need a BOUNDARY (the byte index one press
@@ -351,7 +363,10 @@ corpus is built to avoid the places this module deliberately differs (unicode
 normalization, per-string vs per-char lowercasing, the upstream non-ASCII tail
 off-by-one, the case predicate on non-ASCII atoms); the module docs enumerate
 them. Keep the import inside `mod tests`: a runtime `use nucleo` puts the matcher
-back in the shipped binary.
+back in the shipped binary. `admits` is chained to that proof rather than given
+its own: `admits_is_the_filters_own_question_asked_of_any_string` asserts it
+agrees with the name-only `filter` on every label, so the pick list inherits
+whatever the oracle proves of the filter.
 
 ## 5. Selection and scroll survive reloads
 
