@@ -101,13 +101,19 @@ KEYS:
                   start of a word lists files and folders (and, at the top
                   level, agents, inserted as @agent-<name>); a skill, command or
                   agent shows its description beside it. The letters after it
-                  narrow the list by the start of the name. While the list is
-                  open ↑/↓ choose, Enter or Tab pick (a folder reopens the list
-                  one level down), and Esc closes only the list (the draft
-                  stays). The list is claude's own, fetched once per folder in
-                  the background: until it lands / lists nothing in either box,
-                  while @ shows files and folders at once, a reply's agents come
-                  from its transcript and a draft's wait for the list
+                  narrow the list to what holds them anywhere in its name or,
+                  for a skill, command or agent, its description, matched like
+                  the search box (an uppercase letter matches exactly); names
+                  that start with them come first, then other name hits, then
+                  description hits — files and folders above agents. A file or
+                  folder named with a leading dot shows only once you type that
+                  dot. While the list is open ↑/↓ choose, Enter or Tab pick (a
+                  folder reopens the list one level down), and Esc closes only
+                  the list (the draft stays). The list is claude's own, fetched
+                  once per folder in the background: until it lands / lists
+                  nothing in either box, while @ shows files and folders at
+                  once, a reply's agents come from its transcript and a draft's
+                  wait for the list
     Ctrl-K        stop / interrupt the selected session's live agent. With a job
                   to stop it runs claude stop: an agent whose run is over (done,
                   stopped, failed) stops at once, every other one confirms

@@ -138,14 +138,18 @@ one place.
   ONE per-char, byte-length-preserving fold. The ROW-LABEL highlight
   (`match_indices`) applies the WHOLE-STRING rule over the same finders — EVERY
   atom in the one string, every occurrence of each marked; the PREVIEW marks apply
-  the PER-ATOM rule (`atom_match_positions`). Never rank the filter's results:
-  display order is `App::order_filtered`'s alone. The window, the cap and the fold
-  are argued in
+  the PER-ATOM rule (`atom_match_positions`). Never rank the BOARD filter's
+  results: display order is `App::order_filtered`'s alone. The window, the cap and
+  the fold are argued in
   [DOMAIN.md](docs/agents/DOMAIN.md#content-index-storeparse), the two rules in
   [PATTERNS.md](docs/agents/PATTERNS.md#4-isolate-volatile-dependencies). The
-  compose pick list's start-of-name filter (`src/tui/complete.rs`) is NOT this
-  matcher and must never call it.
-  (`src/search.rs`)
+  compose pick list (`src/tui/complete.rs`) is a consumer of this SAME matcher
+  and never matches by itself: it asks `SearchIndex::admits`, the filter's own
+  question, of a candidate's NAME and then its DESCRIPTION — never its label —
+  its whitespace-free token is ONE atom, and it orders what matches by where it
+  landed (name start, elsewhere in the name, description only), an order that is
+  the pick list's alone.
+  (`src/search.rs`, `src/tui/complete.rs`)
 - **STABLE-ID STATE.** Track selection by `session_id`, never list index, so it
   survives autorefresh reloads. (`src/tui/app.rs`)
 - **OFF-UI-THREAD blocking work.** RECURRING shell-outs / FS watch / input run on

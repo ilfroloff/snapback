@@ -17,8 +17,8 @@ find the same rule in two places, that is a bug to fix.
    concepts (label, grouping, content index, fork lineage, turn count, live
    agents, the preview's peer and injected-context nodes, the answering model
    and the one a `-r` launch restores, scopes, the per-compose model pick and
-   its defaults, the compose pick list and where it reads from), and the
-   per-state routing tables — the hand-offs, the
+   its defaults, the compose pick list, how it matches and where it reads
+   from), and the per-state routing tables — the hand-offs, the
    `Ctrl-R` / `Ctrl-K` gates, and the terminal-paste owner table.
 4. [PATTERNS.md](PATTERNS.md) — **how to build new things**: the repeated
    implementation rules and the testing conventions to match.
@@ -52,7 +52,7 @@ find the same rule in two places, that is a bug to fix.
 | Topic | Lives in |
 | --- | --- |
 | Module responsibilities, stack, runtime wiring | ARCHITECTURE |
-| Store layout, JSONL fields, label/grouping/fork-lineage/turn-count/live-agent/answering-model semantics, the per-compose model pick and its `ComposeDefault` cases, the compose pick list's sources, precedence and fetch/retry behaviour, and the routing tables (hand-off, `Ctrl-R`, `Ctrl-K`, `Event::Paste`) | DOMAIN |
+| Store layout, JSONL fields, label/grouping/fork-lineage/turn-count/live-agent/answering-model semantics, the per-compose model pick and its `ComposeDefault` cases, the compose pick list's sources, precedence, fetch/retry behaviour and how it matches and orders, and the routing tables (hand-off, `Ctrl-R`, `Ctrl-K`, `Event::Paste`) | DOMAIN |
 | How the critical rules are carried out in code (fail-soft direction, authoritative re-read, matcher isolation, styling, off-thread shapes, status ownership), the tunables table, testing conventions | PATTERNS |
 | Commands, env vars, CI + release automation, validation checklist | OPERATIONS |
 | External `claude` CLI surface (flags, commands, version pin, spawned argv, the captured `--model` alias set + its refresh command, the `--effort` levels and how claude treats them, the settings precedence and `-r` model restore a launch without `--model` follows, the `initialize` handshake's probed wire shape and side effects, the built-ins and skills claude hides from its `/` menu, the agent-mention forms, claude's workspace-trust record and rule, what an untrusted folder can run (claude's own git prefetch included), and the fetch's two forms, argv and child environment) | CLAUDE_CLI |
