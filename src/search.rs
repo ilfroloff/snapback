@@ -748,6 +748,27 @@ impl SearchIndex {
             .collect()
     }
 
+    /// Whether the active query admits `text` — the FILTER's own membership
+    /// question ([`atoms_match`] over the ONE fold), asked of a caller's string
+    /// rather than an indexed session.
+    ///
+    /// Vacuously true for an empty or whitespace-only query, because the filter
+    /// admits every candidate then. The compose pick list (`tui::complete`) asks
+    /// it of a candidate's name and description.
+    ///
+    /// Membership only: it marks nothing. Which chars matched is
+    /// [`match_indices`](Self::match_indices)' or
+    /// [`atom_match_positions`](Self::atom_match_positions)' question.
+    #[must_use]
+    pub fn admits(&self, text: &str) -> bool {
+        self.atom_finders.is_empty()
+            || atoms_match(
+                text,
+                &lowercase_preserving_byte_len(text),
+                &self.atom_finders,
+            )
+    }
+
     /// The CHAR indices within `display` that the active query matches — the
     /// ROW-LABEL highlight seam, under the WHOLE-STRING rule.
     ///
@@ -759,12 +780,12 @@ impl SearchIndex {
     /// label), and the row shows no highlight, which is the intended behaviour.
     ///
     /// WHOLE-STRING: it answers only when EVERY atom occurs in `display`, and
-    /// that predicate is the FILTER's own [`atoms_match`] — the same question,
-    /// over the same [`AtomFinder`]s, that admitted the row. That rule is what a
-    /// LABEL wants (one string, on the board because that string matched) and
-    /// what a transcript LINE must not be asked — see
-    /// [`atom_match_positions`](Self::atom_match_positions), which is the other
-    /// RULE over this one mechanism.
+    /// that predicate is [`admits`](Self::admits), the FILTER's own
+    /// [`atoms_match`] — the same question, over the same [`AtomFinder`]s, that
+    /// admitted the row. That rule is what a LABEL wants (one string, on the
+    /// board because that string matched) and what a transcript LINE must not be
+    /// asked — see [`atom_match_positions`](Self::atom_match_positions), which is
+    /// the other RULE over this one mechanism.
     ///
     /// Positions come from the per-atom marking that seam already owns, so the
     /// label marks EVERY occurrence of every atom rather than one "best" run: a
@@ -780,18 +801,10 @@ impl SearchIndex {
         if self.atom_finders.is_empty() {
             return Vec::new();
         }
-        // The WHOLE-STRING gate, asked of the filter's own predicate over the
-        // pair of haystacks each atom's smart-case decision selects. One atom
-        // missing from `display` means no highlight at all, even where the
-        // others land.
-        // Lowercased the way the FILTER lowercases its haystacks, not by
-        // `to_lowercase`: the gate is only "the same question" if it folds the
-        // same way the label arm that admitted the row does.
-        if !atoms_match(
-            display,
-            &lowercase_preserving_byte_len(display),
-            &self.atom_finders,
-        ) {
+        // The WHOLE-STRING gate is the filter's own predicate, so it folds the
+        // way the label arm that admitted the row does. One atom missing from
+        // `display` means no highlight at all, even where the others land.
+        if !self.admits(display) {
             return Vec::new();
         }
         // Past the gate, WHICH chars is the per-atom question, and the preview's
@@ -1995,6 +2008,77 @@ mod tests {
                  match-outside-preview nudge reads this one directly"
             );
         }
+    }
+
+    /// The compose pick list's membership IS the board filter's: `admits` agrees
+    /// with the name-only `filter` on every label, for every query shape.
+    #[test]
+    fn admits_is_the_filters_own_question_asked_of_any_string() {
+        let labels = [
+            "build notes",
+            "Npx wrapper",
+            "Foo dashboard",
+            "Foo BAR dashboard",
+            "deploy pipeline notes",
+            "pipeline for deploy",
+            "café notes",
+            "ΟΔΟΣ notes",
+            "\u{212A}elvin scale",
+            "unrelated",
+        ];
+        let queries = [
+            "",
+            "npx",
+            "NPX",
+            "Npx",
+            "foo",
+            "foo BAR",
+            "deploy pipeline",
+            r"deploy\ pipeline",
+            "café",
+            "οδοσ",
+            "οδος",
+            "kelvin",
+            "zzzqqq",
+        ];
+        let sessions: Vec<Session> = labels
+            .iter()
+            .enumerate()
+            .map(|(i, label)| session(&format!("s{i}"), label, ""))
+            .collect();
+        let index_for = |query: &str| {
+            let mut index = SearchIndex::new();
+            index.set_query(query);
+            index
+        };
+
+        for query in queries {
+            let admitted = as_set(&filter(query, &sessions, SearchMode::NameOnly));
+            let index = index_for(query);
+            for (i, label) in labels.iter().enumerate() {
+                assert_eq!(
+                    index.admits(label),
+                    admitted.contains(&i),
+                    "admits must answer the filter's question for {query:?} over {label:?}"
+                );
+            }
+        }
+
+        // Premises, so the agreement above cannot hold vacuously.
+        let mixed = index_for("foo BAR");
+        assert!(
+            mixed.admits("Foo BAR dashboard") && !mixed.admits("Foo dashboard"),
+            "a multi-atom query needs EVERY atom, each under its own case rule"
+        );
+        let empty = index_for("");
+        assert!(
+            labels.iter().all(|label| empty.admits(label)),
+            "an empty query admits every string, as the filter admits every row"
+        );
+        assert!(
+            index_for("οδοσ").admits("ΟΔΟΣ notes"),
+            "the per-char fold turns a word-final `Σ` into `σ`"
+        );
     }
 
     /// Accent folding is not part of the highlight: the label seam matches the
