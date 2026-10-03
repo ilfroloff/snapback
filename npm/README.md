@@ -52,8 +52,9 @@ between your terminal and a program that owns raw mode and hands the terminal to
 
 ## Docs
 
-Full feature list, key map, and configuration:
-**[github.com/ilfroloff/snapback](https://github.com/ilfroloff/snapback)**
+**[Full feature list, key map, and configuration](https://github.com/ilfroloff/snapback/blob/main/docs/GUIDE.md)**
+
+Project home: **[github.com/ilfroloff/snapback](https://github.com/ilfroloff/snapback)**
 
 ## License
 
