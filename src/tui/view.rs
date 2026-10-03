@@ -4166,10 +4166,11 @@ fn chord_hint(selected_hidden: bool) -> String {
 ///
 /// The reply arm names `PgUp/PgDn scroll` as the representative of the whole
 /// transcript-scroll set (`^T`/`^E`, `Ctrl-U`/`Ctrl-D`, `Home`/`End` work too; the
-/// key map in `docs/GUIDE.md` and `KEYS` list them), because a reply previews a real transcript. It
-/// replaced the old "paste keeps newlines" clause, which is now documented only in
-/// `KEYS` in `cli.rs` and the key map in `docs/GUIDE.md` (a pasted newline never sends: paste is
-/// delivered as text, not keystrokes). It rides the REPLY arm ONLY: a draft keeps
+/// key map in `docs/GUIDE.md` and `KEYS` list them), because a reply previews a
+/// real transcript. It replaced the old "paste keeps newlines" clause, which is
+/// now documented only in `KEYS` in `cli.rs` and the key map in `docs/GUIDE.md`
+/// (a pasted newline never sends: paste is delivered as text, not keystrokes). It
+/// rides the REPLY arm ONLY: a draft keeps
 /// those keys for its editor, and [`BG_DRAFT_HINT`] is already past 80 columns.
 ///
 /// The model key (`Ctrl-L`, both targets) was PAID FOR on the reply hint, which sat

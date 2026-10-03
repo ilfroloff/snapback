@@ -51,6 +51,22 @@ the bundle, not `--help` captures, and the refresh below does not re-verify them
 Keep the pinned version above in sync with the tables — bumping one without the
 other defeats the check.
 
+## Website gap claims
+
+The ONE home of the website copy rule: a row in `website/src/pages/index.astro`
+says what snapback DOES, never what Claude Code lacks. Each row answers a
+Claude Code behaviour recorded here, so a closed gap is found by re-reading its
+source ([Refreshing this doc](#refreshing-this-doc)).
+
+| Website row | Claude Code behaviour it answers | Source | Verified at |
+| --- | --- | --- | --- |
+| `--one-board` | `/resume` is a picker inside a session, and agent view lists background sessions only. | https://code.claude.com/docs/en/sessions; https://code.claude.com/docs/en/agent-view | docs read 2026-10-02; installed claude 2.1.284 |
+| `--search` | `/resume` filters by name, title, branch or PR URL, and agent view by name, first prompt or result. Neither documents transcript-text search. A live `claude --resume <term>` probe matched a title word but not an early message token. | the sessions and agent-view docs; the live probe | docs read 2026-10-02; installed claude 2.1.284 |
+| `--everything` | `/resume` leaves out `claude -p`, Agent SDK and `/loop`-first sessions. | the sessions doc | docs read 2026-10-02; installed claude 2.1.284 |
+| `--tidy` | There is no per-session transcript delete; `claude rm` keeps the transcript, and `claude project purge` wipes a whole project. | the sessions and agent-view docs | docs read 2026-10-02; installed claude 2.1.284 |
+| `--fold` | The picker groups entries that share a session ID, while background hand-off copies carry new IDs. The docs say nothing about folding by content. Confidence: medium. | the sessions doc | docs read 2026-10-02; installed claude 2.1.284 |
+| `--model` | The model is set per session (`--model`, `/model`, the dispatch default); the docs say nothing about a per-reply pick. Confidence: medium. | the sessions and agent-view docs | docs read 2026-10-02; installed claude 2.1.284 |
+
 ## How snapback drives `claude`
 
 The only invocations `snapback` depends on, plus the one effect that is NOT an
@@ -1600,6 +1616,11 @@ the first frames of a board session, because `src/model_aliases.rs` applies the
 selection rule above to the installed binary at runtime — so the picker never
 waits on this pass, and hand-syncing the const would rebuild the very artifact
 that module exists to delete.
+
+Re-read each source in the [website gap table](#website-gap-claims) and Claude
+Code's "What's new" entries since its "Verified at". If a gap has closed, update
+or drop that website row in the same change and update the table. The
+command-surface pin above is a separate refresh.
 
 Update the tables **and** the [version pin](#version-pin-self-healing) together
 when the surface changes. When a flag/command that `snapback` invokes changes,

@@ -198,14 +198,15 @@ one place.
   and `BG_DRAFT_HINT`; the card's `draft_hint` names the same two, the list's
   while it is open); the key map in `docs/GUIDE.md`; and any prose enumeration
   of a key set in `docs/agents/*` (for example, PATTERNS.md's follow-bottom
-  re-arm passage). This
-  is the ONE list of those surfaces; the other docs point here.
-  The README lists only a few core keys and NEVER enumerates routing: touch it
-  only when a key change renames or removes one of those core keys, or one of the
-  flags its quick start shows (`-p`, `-a`). A key both compose
-  boxes share (`Ctrl-L`, `/` or `@`) is ONE shared "in a compose box" entry in
-  each key map — the `update.rs` table, `KEYS`, `docs/GUIDE.md` — that the `Ctrl-R`
-  and `Ctrl-N` entries point to, never two copies.
+  re-arm passage). This is the ONE list of those surfaces; the other docs point
+  here.
+  The README AND the website's feature rows name only a few core keys and flags
+  and NEVER enumerate routing: touch them only when a key change renames or
+  removes one of those core keys, or changes what one of them does, or renames
+  or removes one of the flags the README's quick start shows (`-p`, `-a`). A key
+  both compose boxes share (`Ctrl-L`, `/` or `@`) is ONE shared "in a compose
+  box" entry in each key map — the `update.rs` table, `KEYS`, `docs/GUIDE.md` —
+  that the `Ctrl-R` and `Ctrl-N` entries point to, never two copies.
   The help line is ONE row, cut rather than wrapped: `chord_hint`, the reply hint
   and `COMPLETION_HINT` are
   column-budgeted to fit 80 whole (each pinned by a test), while the board keymap
@@ -264,9 +265,13 @@ format handling, RE-RUN the `project-agent-docs` skill to refresh `docs/GUIDE.md
 them. Keep `README.md` pitch-only (pitch, install, quick start); end-user feature
 prose goes to `docs/GUIDE.md`. A change to install or to a quick-start flag also
 updates `README.md`. If a change alters what a demo scene shows, re-run
-`website/demo/record.sh` and commit the new `website/public/demo.gif`. Remove or
-rewrite stale references — do not leave them. Deduplicate: if a rule appears in
-both `AGENTS.md` and a `docs/agents/*` file, keep it in one place.
+`website/demo/record.sh` and commit the new `website/public/demo.gif`. A change
+that adds, removes or renames a capability a website feature row describes
+(`website/src/pages/index.astro`), or a key or flag a row names, updates that row
+in the same change; a new capability that answers a gap in Claude Code's own
+tools is proposed as a row in the change's summary. Remove or rewrite stale
+references — do not leave them. Deduplicate: if a rule appears in both
+`AGENTS.md` and a `docs/agents/*` file, keep it in one place.
 
 Do NOT name the model or harness behind a doc update anywhere in these files —
 describe the change, not who or what made it. Do NOT reintroduce a `## Changelog`
@@ -297,7 +302,7 @@ Full command reference and the validation checklist:
 | Session format, JSONL fields, domain concepts | [docs/agents/DOMAIN.md](docs/agents/DOMAIN.md) |
 | Implementation + testing conventions | [docs/agents/PATTERNS.md](docs/agents/PATTERNS.md) |
 | Commands, env, `--print-list`, CI + release automation, checklist | [docs/agents/OPERATIONS.md](docs/agents/OPERATIONS.md) |
-| External `claude` CLI flags/commands + version pin + spawned argv, the `--model` alias capture, the model a launch without `--model` runs on, the `initialize` handshake the pick list asks, the workspace-trust rule that picks its argv and environment | [docs/agents/CLAUDE_CLI.md](docs/agents/CLAUDE_CLI.md) |
+| External `claude` CLI flags/commands + version pin + spawned argv, the `--model` alias capture, the model a launch without `--model` runs on, the `initialize` handshake the pick list asks, the workspace-trust rule that picks its argv and environment, the website gap claims (the evidence behind each website feature row) | [docs/agents/CLAUDE_CLI.md](docs/agents/CLAUDE_CLI.md) |
 | Commit message rules + examples | [GIT_COMMIT_INSTRUCTIONS.md](GIT_COMMIT_INSTRUCTIONS.md) |
 | Reading order / doc ownership | [docs/agents/README.md](docs/agents/README.md) |
 | End-user features + full key map | [docs/GUIDE.md](docs/GUIDE.md) |
