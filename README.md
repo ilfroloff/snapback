@@ -4,7 +4,7 @@
 
 # snapback
 
-A live board for all your Claude Code sessions and agents
+Every Claude Code session and agent — one live board
 
 ![snapback demo](website/public/demo.gif)
 
