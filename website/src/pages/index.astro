@@ -41,12 +41,12 @@ const features = [
     <section class="hero">
       <div class="hero-copy">
         <p class="eyebrow">terminal board for claude code</p>
-        <h1>A live board for all your Claude Code sessions and agents</h1>
+        <h1>Every Claude Code session and agent — one live board</h1>
         <p class="sub">
-          Every Claude Code session you've had and every agent still running,
-          on one live board. Search inside full transcripts, see
-          <code>claude -p</code> and SDK runs too, and clean up old sessions one
-          at a time.
+          Claude Code's picker skips -p, Agent SDK and /loop sessions, and
+          running agents scatter across your repos and worktrees. snapback puts
+          all of it on one live board — search inside full transcripts, then
+          reply, stop, or start an agent without leaving.
         </p>
 
         <div class="prompt">
@@ -75,6 +75,39 @@ const features = [
       </div>
     </section>
 
+    <section class="callout">
+      <p class="label"># what claude code hides</p>
+      <p class="callout-card">
+        -p, Agent SDK and /loop sessions never appear in Claude Code's own picker
+        — its
+        <a href="https://code.claude.com/docs/en/sessions">docs</a> confirm the
+        picker skips them. snapback reads every transcript on disk, including the
+        runs the picker hides, and shows them beside your running agents.
+      </p>
+    </section>
+
+    <section class="features">
+      <p class="label"># why snapback</p>
+      <dl class="flags">
+        <div class="flag-row">
+          <dt>See everything, live</dt>
+          <dd>Every session and running background agent — this folder, the repo's worktrees (-p), or every repo (-a) — updating as agents write.</dd>
+        </div>
+        <div class="flag-row">
+          <dt>Act without leaving</dt>
+          <dd>Reply (Ctrl-R), stop (Ctrl-K), or start a background agent (Ctrl-N), then get straight back to the board.</dd>
+        </div>
+        <div class="flag-row">
+          <dt>Find it by what was said</dt>
+          <dd>Search inside full transcripts, not just names; the preview jumps to the hit.</dd>
+        </div>
+        <div class="flag-row">
+          <dt>Keep it tidy</dt>
+          <dd>Hide or delete old sessions and folded hand-off copies, with anything still being written refused.</dd>
+        </div>
+      </dl>
+    </section>
+
     <section class="features">
       <p class="label"># features</p>
       <dl class="flags">
@@ -84,6 +117,32 @@ const features = [
             <dd>{f.desc}</dd>
           </div>
         ))}
+      </dl>
+    </section>
+
+    <section class="features">
+      <p class="label"># snapback vs the session picker</p>
+      <dl class="compare">
+        <div class="compare-head">
+          <span>native picker</span>
+          <span>snapback</span>
+        </div>
+        <div class="compare-row">
+          <dt>Sessions hidden by the picker</dt>
+          <dd>shown — --everything surfaces -p, SDK and /loop runs</dd>
+        </div>
+        <div class="compare-row">
+          <dt>One session at a time</dt>
+          <dd>every session and agent at once, live</dd>
+        </div>
+        <div class="compare-row">
+          <dt>Resume only</dt>
+          <dd>reply, stop and start without leaving</dd>
+        </div>
+        <div class="compare-row">
+          <dt>One project</dt>
+          <dd>every repo and worktree (-a)</dd>
+        </div>
       </dl>
     </section>
   </main>
@@ -344,6 +403,57 @@ const features = [
   .flag-row dd {
     margin: 0;
     color: var(--text-dim);
+    font-size: 0.92rem;
+  }
+
+  .callout {
+    border-top: 1px solid var(--border);
+    padding: 56px 0 72px;
+  }
+
+  .callout-card {
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 22px 24px;
+    margin: 0;
+    color: var(--text-dim);
+    font-size: 0.92rem;
+    max-width: 72ch;
+  }
+  .callout-card a {
+    color: var(--text);
+    text-decoration: underline;
+    text-underline-offset: 3px;
+  }
+
+  .compare {
+    margin: 0;
+  }
+  .compare-head,
+  .compare-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 18px;
+    border-bottom: 1px solid var(--border);
+    padding: 12px 0;
+  }
+  .compare-head {
+    color: var(--dim);
+    font-size: 0.82rem;
+    padding-top: 0;
+  }
+  .compare-row:last-child {
+    border-bottom: none;
+  }
+  .compare-row dt {
+    margin: 0;
+    color: var(--text-dim);
+    font-size: 0.92rem;
+  }
+  .compare-row dd {
+    margin: 0;
+    color: var(--text);
     font-size: 0.92rem;
   }
 
