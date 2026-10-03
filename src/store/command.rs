@@ -257,8 +257,8 @@ pub fn command_text(name: Option<&str>, args: &str) -> Option<String> {
 /// `command-name`) are harness syntax the user never typed, and indexing them
 /// made a search for an ordinary word like `args` match most sessions that ever
 /// ran a command; the command's name and arguments ARE what the user typed. The
-/// other wrappers' contents stay searchable as they always were (`README.md`
-/// promises a reminder or a command's output is found).
+/// other wrappers' contents stay searchable as they always were (the user guide,
+/// `docs/GUIDE.md`, promises a reminder or a command's output is found).
 ///
 /// A command is kept on a line of its own: where it would otherwise abut the text
 /// beside it (`…</local-command-stdout><command-name>…`), a newline separates the
@@ -390,7 +390,7 @@ mod tests {
         }
     }
 
-    /// Every OTHER wrapper stays exactly as written — the README promises a
+    /// Every OTHER wrapper stays exactly as written — the user guide promises a
     /// reminder or a command's output is searchable — and so does all prose,
     /// whether the fast path or the walk answers it. The last two bodies carry a
     /// `<command-name>` opener, so they go through the walk.

@@ -408,7 +408,7 @@ answered — and not what Claude Code wrote around it:
   tags — the literal tag name alone made `args` match 59 of 127 sessions. Every
   OTHER wrapper (`<local-command-stdout>`, `<system-reminder>`,
   `<task-notification>`, …) is kept exactly as written, tags included, because
-  the README promises that text is found.
+  the user guide ([GUIDE.md](../GUIDE.md)) promises that text is found.
 
 A session Claude loaded a skill in by itself is therefore no longer findable by
 that skill's name: nobody typed it.
@@ -973,7 +973,7 @@ per row: the question is about a lineage, so asking it while drawing row `i`
 would rescan the store per row and make the board O(n²).
 
 The row draws it as `[unbound]` — see the row markers in
-[README.md](../../README.md).
+[GUIDE.md](../GUIDE.md).
 
 ### Failed background task (`store::parse`)
 

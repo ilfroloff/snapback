@@ -107,7 +107,7 @@ cargo install --path .   # installs both snapback and sb
 There is no separate search mode: you start in browse and typing filters live.
 `Tab` widens name-only → name+content; `Ctrl-A` flips the scope (current folder →
 project → current folder), or cycles all three states when the board was launched
-with `-a`. See the README for the full key map.
+with `-a`. See [docs/GUIDE.md](../GUIDE.md#keys) for the full key map.
 
 ## Continuous integration & releases
 
@@ -149,6 +149,17 @@ publish must not be folded into `release-plz.toml`.
 
 Users install from npm (`npx snapback-tui install`) or from the tagged git ref —
 see the README [Install](../../README.md#install) section.
+
+### Demo GIF
+
+`website/public/demo.gif` (embedded by the README and the website) is produced
+from SYNTHETIC data by `website/demo/record.sh`: it builds a release binary, copies
+`website/demo/home` to a temporary `$HOME`, shadows `claude` with the stub in
+`website/demo/bin`, and records `website/demo/snapback.tape` with `vhs`. It needs
+`vhs`, `ttyd` and `ffmpeg` on `PATH` and never touches the real `~/.claude`,
+`~/.config/snapback` or `claude`. Re-run it when a change alters what a scene shows;
+`npm run demo` from `website/` is the same command. It is deliberately not part of
+`npm run build`: the Pages deploy runner has no `vhs`, `cargo` or stub.
 
 ### The npm package
 

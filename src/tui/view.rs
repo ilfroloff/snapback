@@ -4166,9 +4166,9 @@ fn chord_hint(selected_hidden: bool) -> String {
 ///
 /// The reply arm names `PgUp/PgDn scroll` as the representative of the whole
 /// transcript-scroll set (`^T`/`^E`, `Ctrl-U`/`Ctrl-D`, `Home`/`End` work too; the
-/// README and `KEYS` list them), because a reply previews a real transcript. It
+/// key map in `docs/GUIDE.md` and `KEYS` list them), because a reply previews a real transcript. It
 /// replaced the old "paste keeps newlines" clause, which is now documented only in
-/// `KEYS` in `cli.rs` and the README (a pasted newline never sends: paste is
+/// `KEYS` in `cli.rs` and the key map in `docs/GUIDE.md` (a pasted newline never sends: paste is
 /// delivered as text, not keystrokes). It rides the REPLY arm ONLY: a draft keeps
 /// those keys for its editor, and [`BG_DRAFT_HINT`] is already past 80 columns.
 ///
@@ -4252,8 +4252,8 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         // A 23-column "paste keeps newlines" clause would land at columns 254-276 —
         // nowhere, on any realistic width. What a board paste DOES (insert at the
         // query's cursor with newlines flattened to spaces, and never resume) is
-        // documented where there is room to say it: `KEYS` in `cli.rs` and the
-        // README key map.
+        // documented where there is room to say it: `KEYS` in `cli.rs` and the key
+        // map in `docs/GUIDE.md`.
         //
         // The QUERY WORD-DELETE keys are omitted for exactly the same reason, and
         // just as deliberately. Even the tersest honest clause (`· ⌥⌫ del word`,
@@ -4265,7 +4265,7 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         // narrower than the one that works. All three are documented on every
         // OTHER surface KEEP KEY DOCS IN SYNC names — the ones with room for that
         // sentence: the keybinding table in `update.rs`'s module doc, `KEYS` in
-        // `cli.rs`, the README key map, and the `Alt`-binding rule in
+        // `cli.rs`, the key map in `docs/GUIDE.md`, and the `Alt`-binding rule in
         // PATTERNS.md's "Keys, actions, outcomes". Plain `Backspace` (one
         // character) is unmentioned here on the same budget.
         //
@@ -4274,11 +4274,11 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         // it is spelled `S-` rather than `⇧` so it needs no glyph the terminal may
         // not have. It is off-screen at 80 columns like everything past `^X`, and
         // that is the same budget every clause here is judged against; the key is
-        // documented in full in `KEYS` and the README.
+        // documented in full in `KEYS` and `docs/GUIDE.md`.
         //
         // `S-←→ layout` is spelled the same way for the same reason, and names the
         // pair rather than the five stops they walk — those take a sentence, and
-        // `KEYS` and the README have room for it.
+        // `KEYS` and `docs/GUIDE.md` have room for it.
         //
         // `A-←→·^←→ word` is the query's word hop, beside `type to search` in the
         // search cluster (columns 115-127, off-screen at 80 like everything past
@@ -4287,7 +4287,7 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         // reason. `Alt-b` / `Alt-f` go unnamed because they are not a third gesture
         // but the other bytes a terminal may send for `A-←→` itself, so the clause
         // names every gesture that works; the byte forms are spelled out in `KEYS`,
-        // the README and `update.rs`'s table.
+        // the key map in `docs/GUIDE.md` and `update.rs`'s table.
         //
         // `^T/^E` sits beside `Home/End` in the scroll cluster (its twin action, not
         // a separate one) rather than beside `^U/^D`: the scroll cluster already
@@ -4300,7 +4300,8 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         // that a process ended. It also cannot grow. It ends at EXACTLY column 80,
         // so any extra glyph (`^K stop/signal`, say) would cut its own tail on an
         // 80-column terminal. The routes are spelled out where there is room:
-        // `KEYS` in `cli.rs`, the README key map and the table in `update.rs`.
+        // `KEYS` in `cli.rs`, the key map in `docs/GUIDE.md` and the table in
+        // `update.rs`.
         //
         // `^R reply` stays one word too. Its refusals (a live agent, a session with
         // no job to stop first, and a session whose own reply is still being sent)
@@ -4322,13 +4323,13 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         // `drag copy` names the preview drag-selection beside the board's other
         // mouse gesture, `wheel scroll`, in two words: the drag selects and its
         // release copies. A double-click selects and copies a word the same way and
-        // is spelled out in `KEYS` and the README, not here. Like everything past
+        // is spelled out in `KEYS` and `docs/GUIDE.md`, not here. Like everything past
         // `^X` it is off-screen at 80 columns.
         // The rest — a click on its release still opens a link or unfolds a node,
         // a drag held past the pane's top or bottom edge scrolls it and keeps
         // selecting, the copy goes the way `Ctrl-X y`'s does, Shift/Option for the
-        // terminal's own selection — is spelled out in `KEYS` and the README, where
-        // there is room.
+        // terminal's own selection — is spelled out in `KEYS` and `docs/GUIDE.md`,
+        // where there is room.
         Line::from(vec![Span::styled(
             "↑↓ move · ←→ query cursor · Enter resume · ^F fork · ^N new · ^R reply · ^K stop · ^X hide/del · type to search · A-←→·^←→ word · Tab name/content · S-↑↓ match · ^A scope · S-←→ layout · PgUp/PgDn·^U/^D·^T/^E·Home/End·wheel scroll · drag copy · Esc clear/quit",
             Style::default().add_modifier(Modifier::DIM),
