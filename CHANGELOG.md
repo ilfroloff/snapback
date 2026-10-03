@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0](https://github.com/ilfroloff/snapback/compare/v0.12.0...v0.13.0) - 2026-10-03
+
+### Added
+
+- *(website)* add Astro landing page and GitHub Pages deploy workflow
+
+### Other
+
+- keep the website and key docs current as features change
+- split the README into a quick-look page and a user guide
+- describe snapback as a live board for sessions and agents
+- add a re-recordable synthetic demo GIF
+- *(readme)* add centered project logo
+
 ## [0.12.0](https://github.com/ilfroloff/snapback/compare/v0.11.0...v0.12.0) - 2026-10-02
 
 ### Added
