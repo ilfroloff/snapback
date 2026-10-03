@@ -1,14 +1,18 @@
 {
   "name": "snapback-tui",
   "version": "0.0.0",
-  "description": "Browse, search, and resume Claude Code sessions from a ratatui TUI.",
+  "description": "Terminal board for Claude Code: every session and background agent across your repos and worktrees, live. See which agent needs you, reply or stop it without leaving, and find any session by what was said.",
   "keywords": [
     "claude",
     "claude-code",
     "tui",
     "sessions",
     "resume",
-    "cli"
+    "cli",
+    "agents",
+    "background-agents",
+    "worktree",
+    "session-manager"
   ],
   "homepage": "https://github.com/ilfroloff/snapback#readme",
   "bugs": {
