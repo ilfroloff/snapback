@@ -47,6 +47,10 @@ find the same rule in two places, that is a bug to fix.
    background-session commands — `stop`/`attach`, which it depends on, and the
    ones it deliberately does not use.
 
+End-user docs live outside this folder: [`docs/GUIDE.md`](../GUIDE.md) owns the
+feature prose and the full key map, and the top-level `README.md` is the pitch,
+install and quick start only.
+
 ## Section ownership (avoid duplication)
 
 | Topic | Lives in |

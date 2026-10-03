@@ -1420,8 +1420,8 @@ regress after a `claude` update, re-verify `claude stop --help` /
 `snapback` regains control only when the spawned `claude` child hands the terminal
 back (the dashboard loop in [ARCHITECTURE.md](ARCHITECTURE.md#the-persistent-dashboard-loop-librun)
 blocks in `resume::launch` until then). From inside a resumed session there are
-three ways to trigger that, and they are NOT equivalent — the README steers users
-to the first two:
+three ways to trigger that, and they are NOT equivalent — the user guide
+([GUIDE.md](../GUIDE.md)) steers users to the first two:
 
 | Action | What it does | Hand-back |
 | --- | --- | --- |

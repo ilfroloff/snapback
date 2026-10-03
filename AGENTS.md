@@ -196,11 +196,15 @@ one place.
   the board keymap, `chord_hint`'s which-key list, and `compose_hint`'s reply
   hint, the `COMPLETION_HINT` BOTH compose boxes show while the pick list is open,
   and `BG_DRAFT_HINT`; the card's `draft_hint` names the same two, the list's
-  while it is open); the README key map; and any prose enumeration of a key set in
-  `docs/agents/*` (for example, PATTERNS.md's follow-bottom re-arm passage). This
-  is the ONE list of those surfaces; the other docs point here. A key both compose
+  while it is open); the key map in `docs/GUIDE.md`; and any prose enumeration
+  of a key set in `docs/agents/*` (for example, PATTERNS.md's follow-bottom
+  re-arm passage). This
+  is the ONE list of those surfaces; the other docs point here.
+  The README lists only a few core keys and NEVER enumerates routing: touch it
+  only when a key change renames or removes one of those core keys, or one of the
+  flags its quick start shows (`-p`, `-a`). A key both compose
   boxes share (`Ctrl-L`, `/` or `@`) is ONE shared "in a compose box" entry in
-  each key map — the `update.rs` table, `KEYS`, the README — that the `Ctrl-R`
+  each key map — the `update.rs` table, `KEYS`, `docs/GUIDE.md` — that the `Ctrl-R`
   and `Ctrl-N` entries point to, never two copies.
   The help line is ONE row, cut rather than wrapped: `chord_hint`, the reply hint
   and `COMPLETION_HINT` are
@@ -255,10 +259,14 @@ one place.
 ## Self-healing stage (do before finishing)
 
 When your change adds/renames/removes files, modules, commands, keys, flags, or
-format handling, RE-RUN the `project-agent-docs` skill to refresh `README.md`,
+format handling, RE-RUN the `project-agent-docs` skill to refresh `docs/GUIDE.md`,
 `AGENTS.md`, and `docs/agents/*` against the new reality rather than hand-editing
-them. Remove or rewrite stale references — do not leave them. Deduplicate: if a
-rule appears in both `AGENTS.md` and a `docs/agents/*` file, keep it in one place.
+them. Keep `README.md` pitch-only (pitch, install, quick start); end-user feature
+prose goes to `docs/GUIDE.md`. A change to install or to a quick-start flag also
+updates `README.md`. If a change alters what a demo scene shows, re-run
+`website/demo/record.sh` and commit the new `website/public/demo.gif`. Remove or
+rewrite stale references — do not leave them. Deduplicate: if a rule appears in
+both `AGENTS.md` and a `docs/agents/*` file, keep it in one place.
 
 Do NOT name the model or harness behind a doc update anywhere in these files —
 describe the change, not who or what made it. Do NOT reintroduce a `## Changelog`
@@ -292,7 +300,8 @@ Full command reference and the validation checklist:
 | External `claude` CLI flags/commands + version pin + spawned argv, the `--model` alias capture, the model a launch without `--model` runs on, the `initialize` handshake the pick list asks, the workspace-trust rule that picks its argv and environment | [docs/agents/CLAUDE_CLI.md](docs/agents/CLAUDE_CLI.md) |
 | Commit message rules + examples | [GIT_COMMIT_INSTRUCTIONS.md](GIT_COMMIT_INSTRUCTIONS.md) |
 | Reading order / doc ownership | [docs/agents/README.md](docs/agents/README.md) |
-| End-user features + full key map | [README.md](README.md) |
+| End-user features + full key map | [docs/GUIDE.md](docs/GUIDE.md) |
+| Pitch, install, quick start | [README.md](README.md) |
 
 ## Ready checklist
 
