@@ -1,0 +1,33 @@
+#!/bin/sh
+# Stub `claude` for the synthetic demo (see website/demo/record.sh). It answers
+# only what the board asks; its state lives in the throwaway $HOME, never in git.
+here=$(cd "$(dirname "$0")" && pwd)
+agents="$HOME/agents.json"
+case "$1" in
+agents)
+  cat "$agents"
+  ;;
+stop)
+  tmp="$agents.tmp"
+  sed "s/\"state\":\"[a-z]*\"\(,\"id\":\"$2\"\)/\"state\":\"stopped\"\1/" "$agents" >"$tmp" && mv "$tmp" "$agents"
+  ;;
+-p)
+  # claude -p -r <session-id> --output-format json [--model ..] <message>
+  session=""
+  while [ $# -gt 0 ]; do
+    if [ "$1" = "-r" ]; then
+      session="$2"
+      break
+    fi
+    shift
+  done
+  sleep 1.5
+  file=$(ls "$HOME"/.claude/projects/*/"$session".jsonl 2>/dev/null | head -n 1)
+  if [ -n "$file" ]; then
+    now=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+    sed -e "s/SESSION/$session/g" -e "s/\"TS\"/\"$now\"/g" "$here/../reply.jsonl" >>"$file"
+  fi
+  printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s","num_turns":2,"total_cost_usd":0.0412,"modelUsage":{"claude-sonnet-5":{"inputTokens":18234,"outputTokens":412,"costUSD":0.0412}}}\n' "$session"
+  ;;
+esac
+exit 0

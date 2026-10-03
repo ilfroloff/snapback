@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "astro dev",
     "build": "astro build",
-    "preview": "astro preview"
+    "preview": "astro preview",
+    "demo": "bash demo/record.sh"
   },
   "dependencies": {
     "astro": "^7.0.0"

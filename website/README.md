@@ -26,11 +26,12 @@ path instead of nesting under it.
 
 ## Before your first deploy
 
-1. **Add the demo GIF.** Generate it with the `vhs` tape from the main
-   project's README, then drop the output at `website/public/demo.gif`.
-   Until it's there, the demo panel shows a placeholder instead of a
-   broken image.
-2. **Enable Pages.** In the repo's Settings → Pages, set Source to
+The demo GIF is already committed at `public/demo.gif`. To regenerate it
+after a feature changes what a scene shows, run `npm run demo` from
+`website/` (or `website/demo/record.sh`); it needs `vhs`, `ttyd`, `ffmpeg`
+and a Rust toolchain, and is never part of `npm run build`.
+
+1. **Enable Pages.** In the repo's Settings → Pages, set Source to
    "GitHub Actions." The workflow at `.github/workflows/deploy.yml`
    (repo root, not inside `website/`) handles the rest — it only
    triggers when something under `website/` changes.
@@ -39,4 +40,4 @@ path instead of nesting under it.
 
 Everything lives in `src/pages/index.astro` — one file, scoped styles, no
 component sprawl. `public/` holds the favicon set (already included) and
-the demo GIF once you've added it.
+the committed demo GIF.
