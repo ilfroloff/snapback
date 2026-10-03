@@ -1,6 +1,6 @@
 # snapback
 
-Browse, search, and resume **Claude Code** sessions from a terminal UI.
+A live board for all your Claude Code sessions and agents
 
 This is the npm distribution of [`snapback`](https://github.com/ilfroloff/snapback),
 a single self-contained Rust [ratatui](https://ratatui.rs) TUI. It ships prebuilt
