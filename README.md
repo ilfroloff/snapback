@@ -4,7 +4,7 @@
 
 # snapback
 
-A live board for all your Claude Code sessions and agents
+Every Claude Code session and agent — one live board
 
 ![snapback demo](website/public/demo.gif)
 
@@ -17,6 +17,22 @@ For developers who run Claude Code in many repos and worktrees at once.
 - **Act without leaving** — `Ctrl-R` reply, `Ctrl-K` stop, `Ctrl-N` start a background agent (optionally one of your agents, model per message), `Enter` resume or attach and return to the board.
 - **Find a session by what was said** — `Tab` searches transcripts and the preview jumps to the hit.
 - **Background hand-off copies folded** into one `(+N)` row.
+
+## Why snapback over Claude Code alone
+
+Claude Code is built for one session at a time. Run it across repos and
+worktrees — or spawn a few background agents — and the picture scatters.
+snapback puts it back together.
+
+| | Claude Code alone | snapback |
+| --- | --- | --- |
+| `-p`, SDK and `/loop` sessions | hidden from the picker | shown (`--everything`) |
+| Background agents | one at a time | all at once, live |
+| Search | session names | inside full transcripts |
+| Act on an agent | switch between picker and CLI | reply, stop, start from one board |
+| Scope | one project | every repo and worktree (`-a`) |
+
+One board, everything live — no more grepping `~/.claude` to find which agent needs you.
 
 ## Install
 
