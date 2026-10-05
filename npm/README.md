@@ -1,6 +1,6 @@
 # snapback
 
-A live board for all your Claude Code sessions and agents
+Every Claude Code session and agent — one live board
 
 This is the npm distribution of [`snapback`](https://github.com/ilfroloff/snapback),
 a single self-contained Rust [ratatui](https://ratatui.rs) TUI. It ships prebuilt
