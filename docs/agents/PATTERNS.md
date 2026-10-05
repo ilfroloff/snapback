@@ -997,8 +997,9 @@ The compose pick list adds two more BOUNDED synchronous reads, in the same class
 listing (`store::skills::read_listing`, once per reply draft and only for a
 top-level `@`, never for `/` or a background draft, and not at all once the
 folder's catalog has landed) and a
-folder listing (`complete::list_dir`, once per resolved folder, capped by
-`COMPLETION_MAX_DIR_ENTRIES`, on both drafts). They run from
+folder walk (`complete::list_tree`, once per resolved folder, capped by
+`COMPLETION_MAX_DIR_ENTRIES` per folder and
+`COMPLETION_MAX_TREE_ENTRIES` in all, at any depth, on both drafts). They run from
 `compose::refresh_completion`, called by the key and paste handlers and by
 `update::dispatch`'s `CatalogFetched` arm — which reads nothing new in practice,
 since every read is keyed to a token a key handler already resolved — and NEVER
@@ -1176,7 +1177,7 @@ CADENCES and LIMITS, so a retune knows what it is next to:
 | `send` | `SEND_ERROR_MAX` (200) |
 | `claude_catalog` | `CATALOG_FETCH_TIMEOUT` (10 s — bounds the reply, the close of stdout AND the exit; the reply measured 0.21–0.22 s) · `CATALOG_READER_GRACE` (500 ms — how long a timed-out fetch waits, after the group and child kills, for its stdout reader to see EOF; the worker's worst case is the timeout plus this) · `CATALOG_EXIT_POLL` (20 ms — claude exits 25–50 ms after its stdin's EOF) |
 | `claude_trust` | `GIT_POINTER_MAX_BYTES` (8192 — a git pointer file holds one path line, and a path is at most `PATH_MAX`, so a longer file is not a pointer and gets the untrusted-direction fallback rather than a whole read) |
-| `tui::complete` | `COMPLETION_MAX_DIR_ENTRIES` (2000 — one keystroke's worst read of a huge folder) · `COMPLETION_VISIBLE_ROWS` (8) |
+| `tui::complete` | `COMPLETION_MAX_DIR_ENTRIES` (2000 — one keystroke's worst read of a huge folder) · `COMPLETION_MAX_TREE_ENTRIES` (25000 — the whole `@` walk, breadth first, no depth cap: a depth cap hid a 9-level monorepo path) · `COMPLETION_VISIBLE_ROWS` (8) |
 | `tui::app` | `PREVIEW_WHEEL_STEP` (2) · `LIST_WHEEL_STEP` (1) · `STATUS_DWELL_TICKS` (16) · `MIN_PANE_WIDTH` (15) · the list's share of the body per split `PaneLayout` stop: `PREVIEW_WIDE_LIST_PERCENT` (25) / `DEFAULT_LIST_PERCENT` (48) / `LIST_WIDE_LIST_PERCENT` (75) · a held drag's autoscroll: `AUTOSCROLL_FRAME` (33 ms, the run loop's wait deadline while one is held past the edge — §7's one exception to animating from the tick) / `AUTOSCROLL_PAGE_PERIOD` (1 s, a page per row past the edge) / `AUTOSCROLL_MAX_DISTANCE` (4) |
 | `tui::update` | `PASTE_MAX_CHARS` (4096) |
 | `tui::view` | `BLINK_TICKS` (2) · `CHILD_ID_CHARS` (8) · `MATCH_JUMP_LEAD_DIVISOR` (3 — a jumped-to match parks `h / 3` rows down) · `WIDE_GLYPH_COLUMNS` (2) · `LINK_PROBE_BYTE_BUDGET` (131_072) · the layout rows `PREVIEW_BANNER_ROWS` / `BOARD_CHROME_ROWS` / `COMPOSE_*` / `MODAL_WIDTH` / `MODAL_*_CHROME_ROWS` / `MODAL_BORDER_ROWS` / `MODAL_BORDER_COLS` / `MODAL_LIST_MAX_ROWS` (12 — the most CHOICES a `List` picker offers before it scrolls, so an overlay stays an overlay on a tall terminal; a wrapped row's extra lines are paid on top, see [§5](#5-selection-and-scroll-survive-reloads)) · the compose pick list's `COMPLETION_BORDER_ROWS` / `COMPLETION_COLUMN_GAP` (2 — the table's only separator) / `COMPLETION_NAME_MAX_PERCENT` (50 — descriptions keep the other half of the box) |

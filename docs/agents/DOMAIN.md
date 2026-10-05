@@ -2166,7 +2166,14 @@ narrow it by the [rule below](#how-the-letters-narrow-the-list):
   hides from its own `/` menu (`claude_catalog::CLAUDE_HIDDEN_BUILTINS`), and
   nothing until that list is in.
 - `@` at the start of a word lists files and folders under the folder
-  (`@src/tu` narrows inside `src/`); dot-names show only when the leaf starts with
+  (`@src/tu` narrows inside `src/`). The leaf is matched against each entry's
+  FULL path relative to that folder, so `@disc` lists `src/store/discover.rs`
+  (the walk is `complete::list_tree`: breadth first, bounded by
+  `COMPLETION_MAX_TREE_ENTRIES` at any depth, never descending a
+  symlink, a dot-folder or a `TREE_SKIPPED_DIRS` name: generated output / installed
+  dependencies only, never `bin`, `out`, `vendor`, `lib`, `public` or `tmp`, which some repos fill with source); an EMPTY leaf lists only
+  the direct children, so a bare `@` stays a folder-by-folder walk. Dot-names (any
+  path component starting with `.`) show only when the leaf starts with
   `.` — a visibility gate applied before any match, so `@env` never lists
   `.env` — folders come first within a tier, and a folder pick reopens the list
   one level down. For a TOP-LEVEL `@` token only (no folder part), the folder's
@@ -2279,9 +2286,10 @@ uppercase letter matches exactly, so `@exp` lists both `Explore` and `explain`
 while `@Ex` lists only `Explore`. The token holds no whitespace, so it is always
 ONE atom.
 
-What matches is ordered in three tiers (`complete::Placement`): a name that
-STARTS with the query, then a name that holds it elsewhere, then a
-description-only hit. Within a tier the list keeps the order it has with no
+What matches is ordered in four tiers (`complete::Placement`): a name that
+STARTS with the query, then a name that holds it elsewhere, then (`@` paths only,
+`complete::path_placement`) a hit only in a FOLDER component of the path, then a
+description-only hit. An `@` path entry's name is its last component. Within a tier the list keeps the order it has with no
 query — the source's order for commands and agents (claude's catalog, or a
 reply's transcript); folders before files, then by name, for `@` entries — and
 an `@` list keeps every entry above every agent, whatever their tiers. An empty

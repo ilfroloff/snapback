@@ -9,7 +9,7 @@
 //! description, and what matches is ordered by [`Placement`] — the pick list's
 //! own order, never the board's. `memchr` and `nucleo` stay in `search.rs`
 //! (AGENTS.md MATCHER ISOLATION). A pure core plus one thin impure `read_dir`
-//! wrapper ([`list_dir`]); the caller decides WHEN to read (once per folder,
+//! walker ([`list_tree`]); the caller decides WHEN to read (once per folder,
 //! from the key handler, never the render path).
 //!
 //! Every column is a CHARACTER column (what `TextArea::cursor` reports), never
@@ -23,6 +23,41 @@ use crate::store::skills::ListingEntry;
 /// Cap on entries read from one folder. Bounds a single keystroke's cost on a
 /// huge or slow-mounted folder; a folder past it lists its first entries only.
 pub const COMPLETION_MAX_DIR_ENTRIES: usize = 2000;
+
+/// Cap on entries one `@` walk collects across ALL levels. There is no depth
+/// cap: a monorepo path sits 9+ levels down (measured 2026-10-05 on a 7k-file
+/// pnpm repo: 11.8k entries to depth 18, ~40 ms), and a depth cap silently hid
+/// it. The walk is breadth first, so a walk that hits this drops the deepest
+/// entries, never the shallow ones; the cap is sized at about twice that repo.
+pub const COMPLETION_MAX_TREE_ENTRIES: usize = 25_000;
+
+/// Folders an `@` walk lists but never descends into: build output and vendored
+/// trees that would spend [`COMPLETION_MAX_TREE_ENTRIES`] on files nobody
+/// mentions. Dot-folders (`.git`, `.next`, `.venv`, `.gradle`, ...) are never
+/// descended into either, so none is listed here. A name is listed only when it
+/// is generated output or an installed dependency in every repo that has it:
+/// `bin`, `out`, `vendor`, `lib`, `public` and `tmp` stay OUT because some repos
+/// keep hand-written scripts or committed source there. Names are matched
+/// whole, per path component.
+const TREE_SKIPPED_DIRS: [&str; 13] = [
+    // JS/TS, Rust, Java/Kotlin (Maven `target`, Gradle `build`)
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "coverage",
+    "storybook-static",
+    "bower_components",
+    // Python
+    "__pycache__",
+    "venv",
+    "site-packages",
+    // .NET
+    "obj",
+    // iOS/macOS
+    "Pods",
+    "DerivedData",
+];
 
 /// Rows of the pick list shown at once; more scroll with the highlight. Keeps
 /// the list from covering the transcript preview above the compose box.
@@ -84,7 +119,8 @@ pub struct Candidate {
     pub description: Option<String>,
 }
 
-/// One folder entry, as read by [`list_dir`].
+/// One folder entry, as read by [`list_tree`]. `name` is a path relative to the
+/// listed folder, `/`-separated: `name` or `sub/dir/name`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirEntryInfo {
     pub name: String,
@@ -130,6 +166,10 @@ pub fn completion_context(lines: &[String], cursor: (usize, usize)) -> Option<Co
 enum Placement {
     NameStart,
     InName,
+    /// A path entry whose folder components hold the query but whose own name
+    /// does not (`src/store/discover.rs` for `store`). Only [`select_entries`]
+    /// produces it.
+    InPath,
     InDescription,
 }
 
@@ -159,6 +199,14 @@ fn placement(matcher: &SearchIndex, name: &str, description: Option<&str>) -> Op
     } else {
         None
     }
+}
+
+/// [`placement`] of a path entry: judged on its own name (the last component)
+/// first, so a name that starts with the query outranks one that merely holds it,
+/// and a hit only in a folder component ranks last.
+fn path_placement(matcher: &SearchIndex, rel: &str) -> Option<Placement> {
+    let base = rel.rsplit('/').next().unwrap_or(rel);
+    placement(matcher, base, None).or_else(|| matcher.admits(rel).then_some(Placement::InPath))
 }
 
 /// The listing entries `query` matches, ordered by [`Placement`]. The sort is
@@ -265,19 +313,23 @@ pub fn split_path_query(query: &str) -> (&str, &str) {
     }
 }
 
-/// Entries whose name holds `leaf` anywhere, matched like the board's search box
-/// (an uppercase letter matches exactly). Dot-names show only when `leaf` itself
-/// starts with `.`, a visibility gate applied before matching. Ordered by
-/// [`Placement`] (a name that starts with `leaf` first), then folders before
-/// files, then by name. Names are inserted VERBATIM; folders carry a trailing
-/// `/`.
+/// Entries whose path holds `leaf` anywhere (an uppercase letter matches
+/// exactly, as in the board's search box): its own name or any folder above it, so
+/// `disc` finds `store/discover.rs`. An empty `leaf` lists only the folder's direct
+/// children, keeping the list a folder-by-folder walk. A dot-name (any component
+/// starting with `.`) shows only when `leaf` itself starts with `.`, a visibility
+/// gate applied before matching. Ordered by [`path_placement`] (own name starts
+/// with `leaf`, then holds it, then folder components hold it), then folders
+/// before files, then by path. Paths are inserted VERBATIM; folders carry a
+/// trailing `/`.
 pub fn select_entries(entries: &[DirEntryInfo], leaf: &str) -> Vec<Candidate> {
     let matcher = matcher(leaf);
     let show_hidden = leaf.starts_with('.');
     let mut picked: Vec<(Placement, &DirEntryInfo)> = entries
         .iter()
-        .filter(|e| show_hidden || !e.name.starts_with('.'))
-        .filter_map(|e| placement(&matcher, &e.name, None).map(|p| (p, e)))
+        .filter(|e| !leaf.is_empty() || !e.name.contains('/'))
+        .filter(|e| show_hidden || !e.name.split('/').any(|c| c.starts_with('.')))
+        .filter_map(|e| path_placement(&matcher, &e.name).map(|p| (p, e)))
         .collect();
     picked.sort_by(|(pa, a), (pb, b)| {
         pa.cmp(pb)
@@ -344,25 +396,41 @@ pub fn settle_highlight(current: usize, len: usize, token_start_changed: bool) -
     }
 }
 
-/// Entries of `dir`, at most [`COMPLETION_MAX_DIR_ENTRIES`]. `is_dir` follows
-/// symlinks. FAIL-SOFT: a missing or unreadable folder is empty and a failing
-/// entry is skipped.
-pub fn list_dir(dir: &Path) -> Vec<DirEntryInfo> {
-    list_dir_capped(dir, COMPLETION_MAX_DIR_ENTRIES)
+/// Entries of `dir` and the folders below it, as `/`-relative paths, breadth
+/// first, bounded by [`COMPLETION_MAX_TREE_ENTRIES`]. Never descends a symlink (no cycles), a
+/// dot-folder or a [`TREE_SKIPPED_DIRS`] folder. FAIL-SOFT: a missing or
+/// unreadable folder is empty and a failing entry is skipped.
+pub fn list_tree(dir: &Path) -> Vec<DirEntryInfo> {
+    list_tree_capped(dir, COMPLETION_MAX_TREE_ENTRIES)
 }
 
-fn list_dir_capped(dir: &Path, cap: usize) -> Vec<DirEntryInfo> {
-    let Ok(read) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    read.take(cap)
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let name = entry.file_name().into_string().ok()?;
-            let is_dir = entry.path().is_dir();
-            Some(DirEntryInfo { name, is_dir })
-        })
-        .collect()
+fn list_tree_capped(root: &Path, cap: usize) -> Vec<DirEntryInfo> {
+    let mut out = Vec::new();
+    let mut queue = std::collections::VecDeque::from([String::new()]);
+    while let Some(prefix) = queue.pop_front() {
+        let Ok(read) = std::fs::read_dir(root.join(&prefix)) else {
+            continue;
+        };
+        for entry in read.take(COMPLETION_MAX_DIR_ENTRIES).filter_map(Result::ok) {
+            if out.len() >= cap {
+                return out;
+            }
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            let file_type = entry.file_type();
+            let real_dir = file_type.as_ref().is_ok_and(|t| t.is_dir());
+            // Only a symlink needs the extra stat to learn it points at a folder.
+            let is_dir =
+                real_dir || file_type.is_ok_and(|t| t.is_symlink()) && entry.path().is_dir();
+            let rel = format!("{prefix}{name}");
+            if real_dir && !name.starts_with('.') && !TREE_SKIPPED_DIRS.contains(&name.as_str()) {
+                queue.push_back(format!("{rel}/"));
+            }
+            out.push(DirEntryInfo { name: rel, is_dir });
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -869,37 +937,146 @@ mod tests {
     }
 
     #[test]
-    fn list_dir_reports_folders_files_and_dot_files() {
-        let dir = temp_dir("complete-list");
-        std::fs::create_dir(dir.join("sub")).unwrap();
-        std::fs::write(dir.join("a.txt"), "x").unwrap();
-        std::fs::write(dir.join(".hidden"), "x").unwrap();
-        let mut got = list_dir(&dir);
-        got.sort_by(|a, b| a.name.cmp(&b.name));
+    fn list_tree_of_a_missing_folder_is_empty() {
+        assert!(list_tree(Path::new("/no/such/snapback-dir")).is_empty());
+    }
+
+    #[test]
+    fn a_query_matches_the_full_path_not_only_the_name() {
+        let e = vec![
+            entry("src", true),
+            entry("src/store", true),
+            entry("src/store/discover.rs", false),
+            entry("src/store/mod.rs", false),
+        ];
+        assert_eq!(
+            inserts(&select_entries(&e, "disc")),
+            vec!["src/store/discover.rs"]
+        );
+        // A folder component matches too, folders first within the tier.
+        assert_eq!(
+            inserts(&select_entries(&e, "store")),
+            vec!["src/store/", "src/store/discover.rs", "src/store/mod.rs"]
+        );
+    }
+
+    #[test]
+    fn a_name_start_outranks_a_name_hit_outranks_a_path_only_hit() {
+        let e = vec![
+            entry("lib/store", true),
+            entry("lib/store/zz.rs", false),
+            entry("lib/mystore.rs", false),
+            entry("store.rs", false),
+        ];
+        assert_eq!(
+            inserts(&select_entries(&e, "store")),
+            vec![
+                "lib/store/",
+                "store.rs",
+                "lib/mystore.rs",
+                "lib/store/zz.rs"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_empty_leaf_lists_direct_children_only_and_dot_components_stay_hidden() {
+        let e = vec![
+            entry("src", true),
+            entry("src/a.rs", false),
+            entry(".git", true),
+            entry(".git/config", false),
+        ];
+        assert_eq!(inserts(&select_entries(&e, "")), vec!["src/"]);
+        assert_eq!(inserts(&select_entries(&e, "conf")), Vec::<&str>::new());
+        assert_eq!(
+            inserts(&select_entries(&e, ".git")),
+            vec![".git/", ".git/config"]
+        );
+    }
+
+    #[test]
+    fn list_tree_walks_every_depth_and_skips_vendored_folders() {
+        let dir = temp_dir("complete-tree");
+        std::fs::create_dir_all(dir.join("src/store")).unwrap();
+        std::fs::create_dir_all(dir.join("target/debug")).unwrap();
+        std::fs::create_dir_all(dir.join(".git/objects")).unwrap();
+        // Ambiguous names stay walked; every other skipped name is pinned here.
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(dir.join("bin/run.sh"), "x").unwrap();
+        for skipped in [
+            "node_modules",
+            "dist",
+            "build",
+            "coverage",
+            "storybook-static",
+            "bower_components",
+            "__pycache__",
+            "venv",
+            "site-packages",
+            "obj",
+            "Pods",
+            "DerivedData",
+        ] {
+            std::fs::create_dir_all(dir.join(skipped).join("x")).unwrap();
+            std::fs::write(dir.join(skipped).join("x/junk"), "x").unwrap();
+        }
+        std::fs::write(dir.join("src/store/discover.rs"), "x").unwrap();
+        std::fs::write(dir.join("target/debug/junk"), "x").unwrap();
+        std::fs::write(dir.join(".git/objects/o"), "x").unwrap();
+        let mut got: Vec<String> = list_tree(&dir).into_iter().map(|e| e.name).collect();
+        got.sort();
+        // Skipped folders are listed themselves, never descended into.
         assert_eq!(
             got,
             vec![
-                entry(".hidden", false),
-                entry("a.txt", false),
-                entry("sub", true)
+                ".git",
+                "DerivedData",
+                "Pods",
+                "__pycache__",
+                "bin",
+                "bin/run.sh",
+                "bower_components",
+                "build",
+                "coverage",
+                "dist",
+                "node_modules",
+                "obj",
+                "site-packages",
+                "src",
+                "src/store",
+                "src/store/discover.rs",
+                "storybook-static",
+                "target",
+                "venv"
+            ]
+        );
+        assert_eq!(list_tree_capped(&dir, 2).len(), 2, "the entry cap holds");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_deep_path_survives_a_big_sibling() {
+        // The reported shape: a monorepo whose target sits 9 levels down beside a
+        // sibling bigger than the old 5000-entry cap, which BFS spends first.
+        let dir = temp_dir("complete-deep");
+        let deep = dir.join("apps/mono/src/modules/Layout/Page/ui/PageHeading");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("PageHeading.tsx"), "x").unwrap();
+        let big = dir.join("packages/gen");
+        std::fs::create_dir_all(&big).unwrap();
+        for i in 0..5500 {
+            std::fs::write(big.join(format!("f{i}.ts")), "x").unwrap();
+        }
+        let picked = select_entries(&list_tree(&dir), "PageHead");
+        let got = inserts(&picked);
+        assert_eq!(
+            got,
+            vec![
+                "apps/mono/src/modules/Layout/Page/ui/PageHeading/",
+                "apps/mono/src/modules/Layout/Page/ui/PageHeading/PageHeading.tsx",
             ]
         );
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn list_dir_respects_the_cap() {
-        let dir = temp_dir("complete-cap");
-        for i in 0..5 {
-            std::fs::write(dir.join(format!("f{i}")), "x").unwrap();
-        }
-        assert_eq!(list_dir_capped(&dir, 3).len(), 3);
-        assert_eq!(list_dir_capped(&dir, 100).len(), 5);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn list_dir_of_a_missing_folder_is_empty() {
-        assert!(list_dir(Path::new("/no/such/snapback-dir")).is_empty());
     }
 }
