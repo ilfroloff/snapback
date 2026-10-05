@@ -7,7 +7,7 @@ name = "snapback"
 # release tags v0.1.0.
 version = "0.12.0"
 edition = "2021"
-description = "A live board for all your Claude Code sessions and agents"
+description = "Every Claude Code session and agent — one live board"
 
 # DO NOT add a `publish` key here - not even `publish = false`. It silently
 # disables releasing: cargo-metadata then reports this package's `publish` as
