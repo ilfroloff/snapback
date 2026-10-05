@@ -73,7 +73,7 @@ use crate::store::skills::{read_listing, Listing};
 
 use super::app::{App, NewSessionDraft};
 use super::complete::{
-    at_candidates, completion_context, filter_commands, list_dir, move_highlight, replacement,
+    at_candidates, completion_context, filter_commands, list_tree, move_highlight, replacement,
     settle_highlight, split_path_query, Candidate, Context, DirEntryInfo, Trigger,
 };
 use super::update::Outcome;
@@ -264,7 +264,7 @@ impl CompletionState {
                 let entries = self
                     .dirs
                     .entry(dir.clone())
-                    .or_insert_with(|| list_dir(&dir));
+                    .or_insert_with(|| list_tree(&dir));
                 // Only a top-level `@` lists agents (`complete::at_candidates`), so
                 // only then may the transcript be read.
                 let agents = if dir_part.is_empty() {
