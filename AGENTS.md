@@ -21,6 +21,8 @@ one place.
 - **FAIL-SOFT parsing.** Parse JSONL as `serde_json::Value`, NEVER hard-typed
   deserialize structs. Skip bad lines/files; never panic on malformed input.
   Same for `claude agents --json`, for claude's `initialize` handshake reply,
+  for claude's `set_cwd` reply (the `Ctrl-X w` move's, where only `ok` with
+  `changed: true` is a move),
   for DEFINED-agent frontmatter (hand-parsed, no YAML crate), and for every
   `claude` settings file `claude_settings` reads
   (which ones, and in which precedence, is
@@ -28,12 +30,17 @@ one place.
   where a bad file is "no value from this file", never an error. Same for
   claude's workspace-trust record (`~/.claude.json` `projects`), whose direction
   is UNTRUSTED: a missing, unreadable or malformed record, or an unknown folder,
-  is untrusted, never trusted.
+  is untrusted, never trusted. A `claude agents --json` probe that cannot answer
+  reads as "not live" everywhere but the `Ctrl-X w` move, which REFUSES
+  ([PATTERNS.md §1](docs/agents/PATTERNS.md#1-fail-soft-over-external-input)).
   (`src/store/*`, `src/agents.rs`, `src/claude_catalog.rs`,
-  `src/defined_agents.rs`, `src/claude_settings.rs`, `src/claude_trust.rs`)
+  `src/claude_move.rs`, `src/defined_agents.rs`, `src/claude_settings.rs`,
+  `src/claude_trust.rs`)
 - **AUTHORITATIVE-FROM-FILE.** Read `cwd`/`sessionId` from INSIDE the file,
   never decode the `<encoded-cwd>` folder name (the `/`→`-` encoding is lossy).
-  Re-read them at hand-off time. (`src/store/parse.rs`, `src/resume.rs`)
+  Re-read them at hand-off time. A `relocated` record (written by claude's `/cd`
+  and by the `Ctrl-X w` move's `set_cwd`) is read from inside the file too, and
+  overrides the first `cwd`. (`src/store/parse.rs`, `src/resume.rs`)
 - **SUBAGENT EXCLUSION BY DEPTH.** The only consumable session shape is
   `<root>/<cwd>/<id>.jsonl` at depth 2. The shared predicate
   `store::discover::is_session_path` decides this by name-shape alone and is
@@ -68,22 +75,26 @@ one place.
 - **A MODEL IS PICKED PER COMPOSE, NEVER PER BOARD.** `--model`/`--effort` reach
   `claude` ONLY from an explicit `Ctrl-L` pick inside a compose box, and only on
   that compose's own launch: the `Ctrl-R` quick reply, or the `Ctrl-N` draft's
-  `--bg` launch / `Ctrl-O` run. Resume (`Enter`), Fork (`Ctrl-F`) and Attach NEVER
-  carry one, structurally: `build_argv` and `build_attach_argv` take no pick. The
-  agent picker's `Ctrl-O` skips the compose, so `launch_pick_interactively` has no
-  pick and hands `None` on to `build_new_argv`, the one hand-off builder that takes
-  one. An effort rides only INSIDE a pick (`ModelPick`), never alone. The pick is
-  `ComposeState::model`, `None` in every new compose, and dies with it: no
-  board-wide pick, no launch flag, nothing persisted. Why, and where each launch
+  `--bg` launch / `Ctrl-O` run. Resume (`Enter`), Fork (`Ctrl-F`), Attach and Move
+  (`Ctrl-X w`, a headless `set_cwd` control request, no model turn) NEVER carry
+  one, structurally: `build_argv`, `build_attach_argv` and `build_set_cwd_argv`
+  take no pick. The agent picker's `Ctrl-O` skips the compose, so
+  `launch_pick_interactively` has no pick and hands `None` on to `build_new_argv`,
+  the one hand-off builder that takes one. An effort rides only INSIDE a pick
+  (`ModelPick`), never alone. The pick is `ComposeState::model`, `None` in every
+  new compose, and dies with it: no board-wide pick, no launch flag, nothing
+  persisted. Why, and where each launch
   gets its model: [DOMAIN.md](docs/agents/DOMAIN.md#compose-model-pick-ctrl-l).
-  (`src/resume.rs`; `src/send.rs`; `src/tui/compose.rs`;
+  (`src/resume.rs`; `src/send.rs`; `src/claude_move.rs`; `src/tui/compose.rs`;
   `launch_pick_interactively` in `src/tui/update.rs`)
 - **STORE WRITES ARE GATED, AND ALL BUT ONE ARE DELEGATED.** The only mutation
   `snapback` itself performs on `~/.claude/projects` is hard delete (`Ctrl-X d`),
   behind BOTH a confirmation modal AND the pure `can_delete_target` WRITER guard.
   Every OTHER change to a transcript is made by a `claude` CHILD and must stay
   that way — a quick reply appends in place because `claude -p -r` writes it,
-  NEVER because snapback edits a session file. Do not add a direct writer.
+  NEVER because snapback edits a session file; likewise `Ctrl-X w` MOVES a
+  transcript only through a headless `claude` child's `set_cwd`. Do not add a
+  direct writer.
   That guard asks "is anything WRITING this file?", NEVER "does claude know this
   session?". Refuse an OPEN INTERACTIVE session and a still-RUNNING background
   agent; ALLOW the parked ones, INCLUDING the reported-finished and terminal
@@ -93,10 +104,11 @@ one place.
   decision that must never widen an irreversible gate, and never widen it to a
   bucket the send gates treat as live without re-deriving the writer question.
   The gate the confirm calls is `can_delete_target` — `can_delete` COMPOSED with
-  `App::sending_to`, refusing snapback's OWN in-flight quick reply (the THIRD
-  writer, which claude's probe cannot be relied on to see) in its own words
-  (`DELETE_SENDING_REFUSAL`) because the writer to name there is snapback, not
-  claude; keep it a composition of two facts, never a wider `can_delete`.
+  snapback's OWN two in-flight writers, which claude's probe cannot be relied on
+  to see: its quick reply (`App::sending_to`, `DELETE_SENDING_REFUSAL`) and its
+  `Ctrl-X w` move (`App::moving_on`, `DELETE_MOVING_REFUSAL`), each refused in its
+  own words because the writer to name there is snapback, not claude; keep it a
+  composition of three facts, never a wider `can_delete`.
   A confirm may target the selected id ALONE or its whole fork lineage
   (`lineage_member_ids`, the SAME grouping hide uses — never a second rule):
   guard each member individually, let one refusal skip only itself, and spend
@@ -105,7 +117,8 @@ one place.
   DISCLOSING how many of them are hidden. It removes ONLY each target id's own
   `<id>.jsonl` + sibling `<id>/` dir; everything else stays read-only.
   Mechanism: [DOMAIN.md](docs/agents/DOMAIN.md#on-disk-layout).
-  (`src/delete.rs`; `confirm_delete` in `src/tui/update.rs`; `src/send.rs`)
+  (`src/delete.rs`; `confirm_delete` in `src/tui/update.rs`; `src/send.rs`;
+  `src/claude_move.rs`)
 - **TERMINAL SAFETY.** Resume/fork/attach SPAWN `claude` as a child and RETURN
   to the board — never replace the process image. Restore the terminal (raw
   mode + alt screen + every mode snapback ENABLES — mouse capture and bracketed
@@ -121,6 +134,24 @@ one place.
   ONE complete return-to-known-state, not one mode per bug, and stays WRITE-ONLY:
   never emit a cursor-position (DSR `CSI 6n`) query on the return path — it
   deadlocks on a dirty child's stdin. (`src/tui/mod.rs`, `src/resume.rs`)
+- **DRIVE `claude` HEADLESSLY; HAND OVER THE TERMINAL ONLY TO PUT THE USER IN
+  IT.** When snapback needs `claude` to PERFORM an operation on a session or
+  folder — the `Ctrl-X w` move (`set_cwd`), the `Ctrl-R` reply (`claude -p -r`),
+  the `Ctrl-K` stop (`claude stop`), the compose pick list's catalog
+  (`initialize`), the `Ctrl-N` draft's background launch (`claude --bg`) — drive
+  it HEADLESSLY: a `-p`, control-request, subcommand or `--bg` child with no TTY,
+  on a thread of its own, reporting ONE `AppEvent` while the board stays up.
+  NEVER open an interactive `claude` to run an operation. An interactive hand-off
+  (`Outcome::Resume`, the terminal handed over) is reserved for actions whose
+  purpose IS to put the user into claude — `Enter` resume, `Ctrl-F` fork, Attach,
+  and the `Ctrl-O` runs (the `Ctrl-N` draft's and the agent picker's) — and for a
+  prompt only claude may show, such as its workspace-trust dialog. snapback NEVER
+  fakes such a prompt's answer: it never sends `set_cwd`'s `trust_accepted`, and a
+  `needs_trust` move points the user at `Enter` and `/cd` instead. Argv and wire
+  shapes: [CLAUDE_CLI.md](docs/agents/CLAUDE_CLI.md#how-snapback-drives-claude);
+  the thread shape and why:
+  [PATTERNS.md §6](docs/agents/PATTERNS.md#6-off-ui-thread-for-anything-that-can-block).
+  (`src/send.rs`, `src/claude_catalog.rs`, `src/claude_move.rs`, `src/resume.rs`)
 - **MATCHER ISOLATION.** Every `memchr` call stays in `src/search.rs`. `nucleo` is
   a **dev-dependency** and survives ONLY as the test-only parity ORACLE inside that
   same module — NO runtime path may reach it, and nothing outside `mod tests` may
@@ -162,19 +193,22 @@ one place.
   the liveness probe at hand-off, and the worktree resolve at
   construction/reload. Both are argued at the call site, and NEITHER may move
   onto a keystroke or the render path. The compose pick list's transcript
-  listing and folder reads, in both drafts, are a different, keystroke-time
-  class (bounded, once per reply draft / per folder, never render):
-  `PATTERNS.md` §6 owns them. Work that runs on its OWN thread and
-  reports back with one `AppEvent` is the rule's ordinary case, never a third
-  exception: the clipboard copy (`CopyFinished` — `Ctrl-X y`'s id and a preview
+  listing and folder reads (in both drafts, once per reply draft / per folder)
+  and the `Ctrl-X w` picker's resolve of the ONE selected session's folder are a
+  different, keystroke-time class (bounded, never render): `PATTERNS.md` §6 owns
+  them. Work that runs on its OWN thread and reports back with one `AppEvent` is
+  the rule's ordinary case, never a third exception: the clipboard copy (`CopyFinished` — `Ctrl-X y`'s id and a preview
   drag-selection alike, ONE path, its tool a THREADED child the driver starts, so
   no keystroke or mouse release waits on it), the `--model` alias probe
-  (`ModelAliases`), the settings-model read (`SettingsModel`) and the compose
+  (`ModelAliases`), the settings-model read (`SettingsModel`), the compose
   pick list's catalog fetch (`CatalogFetched` — a `claude` child the DRIVER
   starts when the pure `take_catalog_fetch` says so, never a key handler; its
   workspace-trust read runs on that same worker thread, never on a key or the
-  render path) are all that shape. (`src/watch.rs`, `src/worktrees.rs`,
-  `src/tui/clipboard.rs`, `src/claude_catalog.rs`, `src/claude_trust.rs`)
+  render path) and the `Ctrl-X w` move (`MoveFinished` — its re-read, liveness
+  probe, trust read and `claude` child all run on the move's own worker, so that
+  probe is not the hand-off exception above) are all that shape.
+  (`src/watch.rs`, `src/worktrees.rs`, `src/tui/clipboard.rs`,
+  `src/claude_catalog.rs`, `src/claude_trust.rs`, `src/claude_move.rs`)
 - **PURE, GIT-FREE STORE CORE.** `src/store/*` decides everything from the bytes
   it was given: `repo_of`'s worktree collapse is a pure string heuristic, and NO
   module under `src/store/` may shell out (to `git` or anything else) or read
@@ -302,7 +336,7 @@ Full command reference and the validation checklist:
 | Session format, JSONL fields, domain concepts | [docs/agents/DOMAIN.md](docs/agents/DOMAIN.md) |
 | Implementation + testing conventions | [docs/agents/PATTERNS.md](docs/agents/PATTERNS.md) |
 | Commands, env, `--print-list`, CI + release automation, checklist | [docs/agents/OPERATIONS.md](docs/agents/OPERATIONS.md) |
-| External `claude` CLI flags/commands + version pin + spawned argv, the `--model` alias capture, the model a launch without `--model` runs on, the `initialize` handshake the pick list asks, the workspace-trust rule that picks its argv and environment, the website gap claims (the evidence behind each website feature row) | [docs/agents/CLAUDE_CLI.md](docs/agents/CLAUDE_CLI.md) |
+| External `claude` CLI flags/commands + version pin + spawned argv, the `--model` alias capture, the model a launch without `--model` runs on, the `initialize` handshake the pick list asks, the `set_cwd` request the `Ctrl-X w` move sends, the workspace-trust rule that picks their argv and environment, the website gap claims (the evidence behind each website feature row) | [docs/agents/CLAUDE_CLI.md](docs/agents/CLAUDE_CLI.md) |
 | Commit message rules + examples | [GIT_COMMIT_INSTRUCTIONS.md](GIT_COMMIT_INSTRUCTIONS.md) |
 | Reading order / doc ownership | [docs/agents/README.md](docs/agents/README.md) |
 | End-user features + full key map | [docs/GUIDE.md](docs/GUIDE.md) |

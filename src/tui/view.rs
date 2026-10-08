@@ -102,9 +102,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
     render_search(frame, app, search_area);
     render_help(frame, app, help_area);
-    // A modal (the running-session choice or the new-session agent picker) sits
-    // ON TOP of the board when open. The two overlays are now one `Option<Modal>`,
-    // so at most one ever draws — a fact made structural, not conventional.
+    // A modal (the running-session choice, the hard-delete confirm, or the
+    // agent, model or move picker) sits ON TOP of the board when open. Every one
+    // of them is the same `Option<Modal>`, so at most one ever draws — a fact made
+    // structural, not conventional.
     // Borrowed MUTABLY for the same reason the list is: a `List` modal's scroll
     // window is resolved against the clamped box and written back (`Modal::scroll`).
     if let Some(modal) = app.modal.as_mut() {
@@ -353,6 +354,14 @@ const AGENT_UNBOUND_MARKER: &str = "  [unbound]";
 /// Carries its own leading gap, exactly as [`AGENT_UNBOUND_MARKER`] does, so the
 /// width reserved is the width drawn.
 const FAILED_TASK_MARKER: &str = "  [task failed]";
+
+/// The badge a row wears while snapback's own `Ctrl-X w` move of it is in flight
+/// (`App::moving_on`), drawn right after the timestamp. It names what snapback is
+/// doing to the row, never a claim about claude, and it is gone once the move's
+/// `MoveFinished` lands (~0.7 s at claude 2.1.291). Static text, so the row never
+/// changes under the terminal's link detection. Carries its own trailing gap, the
+/// way the trailing markers carry their leading one.
+const MOVING_ROW_BADGE: &str = "moving\u{2026}  ";
 
 /// What the preview banner says ahead of claude's own words when the selected
 /// session carries a failed background task (see [`failed_task_banner`]).
@@ -850,6 +859,13 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                     ),
                     Span::raw("  "),
                 ];
+                // snapback's own `Ctrl-X w` move of this row is in flight: the
+                // interval fact lives on the row it is about, never on the
+                // keypress-scoped status line (STATUS-LINE OWNERSHIP). Pushed
+                // before every width budget below, so the label gives way to it.
+                if app.moving_on(&session.session_id) {
+                    spans.push(moving_badge_span());
+                }
                 // Compact agent badge in its own column: `● bg` / `● live`, plus
                 // the translated qualifier phrase — LOUD for `NeedsInput` (`needs
                 // input` at badge weight) and DIM for every other bucket. Rows
@@ -1134,6 +1150,19 @@ const FAILED_TASK_COLOR: Color = Color::Red;
 /// [`unbound_marker_span`]).
 fn failed_task_marker_span() -> Span<'static> {
     Span::styled(FAILED_TASK_MARKER, Style::default().fg(FAILED_TASK_COLOR))
+}
+
+/// The styled [`MOVING_ROW_BADGE`] span, one place for the head and child rows.
+/// `Cyan`: the board's in-progress color (the draft card's headline and the list
+/// modals' border speak it), BOLD so a sub-second state still registers. A NAMED
+/// ANSI color, never RGB (TERMINAL-SAFE STYLING).
+fn moving_badge_span() -> Span<'static> {
+    Span::styled(
+        MOVING_ROW_BADGE,
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )
 }
 
 /// Dim an ENTIRE list row when it is a soft-hidden session shown under the
@@ -4130,16 +4159,17 @@ fn render_search(frame: &mut Frame, app: &mut App, area: Rect) {
 
 /// The which-key hint that takes over the help line while a `Ctrl-X` leader chord
 /// is pending: the follow-up keys and what each does. The `x` verb tracks the
-/// selected row — `hide` for a visible session, `expose` for one already hidden
+/// selected row — `hide` for a visible session, `show` for one already hidden
 /// (there `x` un-hides it) — so the hint names what the next keypress actually does.
 /// One place for the wording (NO MAGIC VALUES); keep it in step with
 /// [`update::chord_key`](crate::tui::update). Rendered with a NAMED color +
 /// modifier only, no RGB or ANSI (PATTERNS §7, TERMINAL-SAFE STYLING).
 ///
 /// COLUMN BUDGET: the help row is ONE line and is truncated, never wrapped, so
-/// the longest form is what has to fit — `expose` (the wider verb) lands it at
-/// 78 columns. Anything added here costs the tail of an 80-column terminal, so a
-/// new verb is paid for by shrinking existing wording, never by appending. The
+/// the longest form is what has to fit — `show` and `hide` are the same width,
+/// so either form lands it at 79 columns. Anything added here costs the tail of
+/// an 80-column terminal, so a new verb is paid for by shrinking existing
+/// wording, never by appending. The
 /// `y` verb paid twice. Appended to the old `h show/hide hidden` wording, `y copy`
 /// made 89 columns, so `h` shrank to `h hidden` (the toggle is still the one `h`
 /// does). Relabelled `y copy session ID`, because a bare "copy" did not say what
@@ -4149,10 +4179,15 @@ fn render_search(frame: &mut Frame, app: &mut App, area: Rect) {
 /// included. The `f fold` verb (the lineage toggle `←`/`→` gave up to the search
 /// caret) made 86, and `y` paid again: `y copy ID` still says WHAT is copied —
 /// the reason it grew — and the status line still prints `Copied session ID …`
-/// in full. `d delete row/lineage` keeps naming both of its targets.
+/// in full. The `w move` verb (move the session to another worktree) made 87, and
+/// three existing entries paid: `x expose` became `x show` (still the un-hide,
+/// beside `h hidden`), `d delete row/lineage` became `d del row/stack` (still both
+/// targets the confirm offers, though not in the modal's own `Delete this` /
+/// `Delete lineage (N)` words; "stack" is the `(+N)` row's name in the key map),
+/// and the `^X` lead lost its second space.
 fn chord_hint(selected_hidden: bool) -> String {
-    let x = if selected_hidden { "expose" } else { "hide" };
-    format!("^X  x {x} · d delete row/lineage · h hidden · r reload · y copy ID · f fold")
+    let x = if selected_hidden { "show" } else { "hide" };
+    format!("^X x {x} · d del row/stack · h hidden · r reload · y copy ID · f fold · w move")
 }
 
 /// The compose zone's key hints, per open draft. Pure so the wording is assertable
@@ -4211,7 +4246,7 @@ const COMPLETION_HINT: &str = "↑/↓ choose · Enter/Tab pick · Esc close lis
 fn render_help(frame: &mut Frame, app: &App, area: Rect) {
     if app.pending_chord {
         // The leader chord took the keyboard: show its follow-up keys so the chord
-        // is discoverable the moment `Ctrl-X` is hit. The `x` verb flips to "expose"
+        // is discoverable the moment `Ctrl-X` is hit. The `x` verb flips to "show"
         // when the selected row is already hidden, since there `x` un-hides it.
         let selected_hidden = app
             .selected
@@ -4392,7 +4427,8 @@ const MODAL_LIST_CHROME_ROWS: u16 = 3;
 /// of growing.
 ///
 /// Without a cap the box grows one row per choice without bound — the agent picker
-/// draws one row per user-defined agent, and the model picker one per alias — so on
+/// draws one row per user-defined agent, the model picker one per alias, and the
+/// move picker one per worktree — so on
 /// a tall terminal an overlay stops reading as an overlay and covers the board it
 /// is supposed to sit on. Twelve is measured against the classic 24-row terminal:
 /// a one-row message plus [`MODAL_LIST_CHROME_ROWS`] plus two borders is six rows
@@ -4620,8 +4656,8 @@ fn render_interrupt_confirm(frame: &mut Frame, app: &App) {
 /// colors + modifiers only (terminal-safe). The message accent and alignment are
 /// derived from the layout, preserving each overlay's original chrome: a `Row`
 /// reads as a warning/confirm (`Yellow`, centered), a `List` as a picker (`Cyan`,
-/// left-aligned). The footer is NOT derived from it: the two `List` pickers share a
-/// layout but not their verbs, so each modal carries its own ([`Modal::footer`])
+/// left-aligned). The footer is NOT derived from it: the three `List` pickers share
+/// a layout but not their verbs, so each modal carries its own ([`Modal::footer`])
 /// and this draws it as given.
 ///
 /// A `List` also SCROLLS, which is why this takes `&mut`: the box asks for at most
@@ -4631,8 +4667,8 @@ fn render_interrupt_confirm(frame: &mut Frame, app: &App) {
 /// modal the way [`render_list`] writes back `App::scroll`, because only a render
 /// knows the viewport. Without it the box drew every choice top-down and a clamped
 /// height simply lost the tail: a picker's later rows were unreachable rather than
-/// scrolled, and both pickers grow with data (one row per defined agent, one per
-/// model alias) rather than being fixed-size.
+/// scrolled, and all three pickers grow with data (one row per defined agent, one
+/// per model alias, one per worktree) rather than being fixed-size.
 ///
 /// A choice is not always one line. Its height is the number of lines
 /// [`modal_list_row_lines`] draws for it, and the asked height, the window and the
@@ -16841,15 +16877,17 @@ mod tests {
             text.contains(&chord_hint(false)),
             "a pending chord must draw the which-key hint on the help line; drawn: {text:?}"
         );
-        // `d` names BOTH targets the confirm offers, so the chord hint stays in
-        // step with the delete modal's own choices (AGENTS.md KEEP KEY DOCS IN SYNC).
+        // `d` names both targets the confirm offers, in the board's vocabulary
+        // (`row`, `stack`) — NOT the modal's button wording (`Delete this`,
+        // `Delete lineage (N)`), so this needle pins the hint's own words only.
         for needle in [
             "x hide",
-            "d delete row/lineage",
+            "d del row/stack",
             "h hidden",
             "r reload",
             "y copy ID",
             "f fold",
+            "w move",
         ] {
             assert!(
                 text.contains(needle),
@@ -16860,7 +16898,7 @@ mod tests {
 
     /// The hint's own column budget: its LONGEST form must still fit an
     /// 80-column terminal, since the help row is truncated rather than wrapped
-    /// and the tail carries the `f fold` verb.
+    /// and the tail carries the `w move` verb.
     #[test]
     fn the_chord_hint_fits_an_eighty_column_terminal() {
         let widest = chord_hint(true);
@@ -16873,10 +16911,10 @@ mod tests {
 
     #[test]
     fn chord_hint_flips_the_x_verb_with_the_selected_rows_hidden_state() {
-        // A visible row hides; a hidden row exposes (there `x` un-hides it).
+        // A visible row hides; a hidden row shows (there `x` un-hides it).
         assert!(chord_hint(false).contains("x hide"));
-        assert!(!chord_hint(false).contains("expose"));
-        assert!(chord_hint(true).contains("x expose"));
+        assert!(!chord_hint(false).contains("show"));
+        assert!(chord_hint(true).contains("x show"));
         assert!(!chord_hint(true).contains("x hide"));
     }
 
@@ -17071,7 +17109,7 @@ mod tests {
         );
     }
 
-    /// The two pickers share the `List` layout but not their verbs, so each draws
+    /// The pickers share the `List` layout but not their verbs, so each draws
     /// its OWN footer. The model picker's names the effort arrows and `Enter set`,
     /// and must not borrow the agent picker's `Enter draft` / `^O`: `Enter` drafts
     /// nothing there, and `Ctrl-O` is inert.
@@ -18771,6 +18809,42 @@ mod tests {
                 !cell.modifier.contains(Modifier::DIM),
                 "a real defect is not a footnote"
             );
+        }
+    }
+
+    // --- an in-flight `Ctrl-X w` move: the row badge ---------------------------
+
+    /// The row whose move is in flight wears the `moving…` badge in the named
+    /// in-progress color, and NO other row does; the badge is gone once the move
+    /// clears. The fact lives on the row, never on the status line.
+    #[test]
+    fn render_list_badges_a_row_whose_move_is_in_flight() {
+        let mut app = lineage_board();
+        app.mark_moving(LONE_ID);
+        let (width, height) = LINEAGE_BOARD_SIZE;
+        let buffer = drawn_list(&mut app, width, height);
+        let needle = MOVING_ROW_BADGE.trim();
+
+        let row = row_of(&buffer, width, height, LONE_LABEL);
+        assert!(
+            row_text(&buffer, row, width).contains(needle),
+            "the moving row wears the badge"
+        );
+        let x = column_of(&buffer, row, width, needle);
+        let cell = buffer.cell((x, row)).expect("a drawn badge cell");
+        assert_eq!(cell.fg, Color::Cyan, "a NAMED-ANSI color, never RGB");
+        for other in (0..height).filter(|&y| y != row) {
+            assert!(
+                !row_text(&buffer, other, width).contains(needle),
+                "only the moving row is badged (row {other})"
+            );
+        }
+        assert_eq!(app.status, None, "the in-flight move is not a status");
+
+        app.clear_moving(LONE_ID);
+        let buffer = drawn_list(&mut app, width, height);
+        for y in 0..height {
+            assert!(!row_text(&buffer, y, width).contains(needle), "row {y}");
         }
     }
 

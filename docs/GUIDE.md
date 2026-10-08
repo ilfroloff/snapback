@@ -29,16 +29,16 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | `↑` / `↓` | Move the selection |
 | `←` / `→` | Move the **cursor in your search** one character, to fix a typo without retyping the rest. The list and the preview stay where they are |
 | `Alt+←` / `Alt+→` (`⌥←` / `⌥→`) / `Alt+B` / `Alt+F` / `Ctrl-←` / `Ctrl-→` | Move the **cursor in your search** one **word**, landing where a word jump in the reply box does: forward goes to the start of the next word. Depending on the terminal, `⌥←` / `⌥→` arrives as `Alt+←` / `Alt+→` or as `Alt+B` / `Alt+F`, so both are bound; `Ctrl-←` / `Ctrl-→` does the same without Option. The list and the preview stay where they are |
-| `Enter` | **Resume** the selected session, returning to the board when it exits. On a **running** session it opens an **Attach / Fork / Cancel** choice instead |
-| `Ctrl-F` | **Fork** the selected session into a copy — available for any session, running or not |
+| `Enter` | **Resume** the selected session, returning to the board when it exits. On a **running** session it opens an **Attach / Fork / Cancel** choice instead. A session snapback is still moving (`Ctrl-X w`, the row reads `moving…`) is refused until the move finishes |
+| `Ctrl-F` | **Fork** the selected session into a copy — available for any session, running or not, except one snapback is still moving (`Ctrl-X w`) |
 | `Ctrl-N` | **Start a new session** in the launch directory; if you have Claude Code agents defined, pick one first (or `default (no agent)`). Then a **draft box** opens for the session's first message: `Enter` launches it with `claude --bg` and leaves you on the board, `Ctrl-O` runs it interactively instead, `Ctrl-L` picks its model, `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels, and a `/` or `@` opens the pick list (the `/` or `@` row below). Your message is sent as the session's first turn either way |
 | `Ctrl-O` (in that picker) | **Start the highlighted agent interactively at once**, skipping the draft — the same thing `Ctrl-O` means inside the draft box, so either route out of the picker is one keypress |
-| `Ctrl-R` | **Quick reply** — send a one-shot message to the selected session without leaving the board. A background agent whose run is over (`done`, `stopped`, `failed`) is stopped first so the reply lands in place; a waiting one (`needs input`) asks you to confirm that stop; one that is still live (`working`, `idle`, `interrupted`, or a state this version doesn't recognize) is left alone and refused, and so is a session with no background job to stop first (a `live` one, for instance); the refusal suggests `Ctrl-K` or Fork instead. While a session's own reply is still being sent, `Ctrl-R` on that session is refused until it lands; replies to other sessions can go out at the same time. Opens a compose box (`Enter` sends, `Ctrl-L` picks the model, `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels, and a `/` or `@` opens the pick list — the `/` or `@` row below) |
-| `Ctrl-L` (in a reply or draft box) | **Pick the model** — and, with `←` / `→`, its **effort** — for **this message only**. The box's bottom border names what it will run on: a reply says `model: session (Opus 5.5)`, the model that session last answered with, which Claude Code normally keeps on its own; a draft says `model: default (opus[1m]) (new sessions only)` when your Claude Code settings name a model. Either says plain `model: default` when there is nothing to name. `--model` / `--effort` are sent only when you pick something; the picker's first row goes back to the default. Every new box starts at the default, and nothing is remembered. `Enter` resume, `Ctrl-F` fork and Attach never send a model |
+| `Ctrl-R` | **Quick reply** — send a one-shot message to the selected session without leaving the board. A background agent whose run is over (`done`, `stopped`, `failed`) is stopped first so the reply lands in place; a waiting one (`needs input`) asks you to confirm that stop; one that is still live (`working`, `idle`, `interrupted`, or a state this version doesn't recognize) is left alone and refused, and so is a session with no background job to stop first (a `live` one, for instance); the refusal suggests `Ctrl-K` or Fork instead. While a session's own reply is still being sent, or snapback is moving the session (`Ctrl-X w`), `Ctrl-R` on that session is refused until that finishes; replies to other sessions can go out at the same time. Opens a compose box (`Enter` sends, `Ctrl-L` picks the model, `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels, and a `/` or `@` opens the pick list — the `/` or `@` row below) |
+| `Ctrl-L` (in a reply or draft box) | **Pick the model** — and, with `←` / `→`, its **effort** — for **this message only**. The box's bottom border names what it will run on: a reply says `model: session (Opus 5.5)`, the model that session last answered with, which Claude Code normally keeps on its own; a draft says `model: default (opus[1m]) (new sessions only)` when your Claude Code settings name a model. Either says plain `model: default` when there is nothing to name. `--model` / `--effort` are sent only when you pick something; the picker's first row goes back to the default. Every new box starts at the default, and nothing is remembered. `Enter` resume, `Ctrl-F` fork, Attach and the `Ctrl-X w` move never send a model |
 | `/` or `@` (in a reply or draft box) | **Pick a skill, command, file or agent** — the same list in a `Ctrl-R` reply and a `Ctrl-N` draft. `/` as the very first character lists the skills and commands Claude Code offers in that folder, built-in ones included; `@` at the start of a word lists files and folders (`@src/tu` narrows inside `src/`; once you type a letter the list also reaches files in deeper folders, so `@disc` finds `src/store/discover.rs`) and, for a top-level `@`, the folder's agents, inserted as `@agent-<name>`. A skill, command or agent shows its description on the right. The letters you type narrow the list to what holds them anywhere in its name or, for a skill, command or agent, its description, matched like the search box (an uppercase letter matches exactly): names that start with them come first, then other name matches, then description matches, with files and folders above agents; a file or folder whose name starts with `.` shows only once you type its leading `.`. While it is open `↑` / `↓` choose, `Enter` or `Tab` picks (a folder reopens the list one level down), and `Esc` closes only the list — never the draft; with no list open `Enter` and `Esc` do what the box's own row says. Where the list comes from is under *Quick reply without leaving the board* |
 | `Ctrl-K` | **Stop / interrupt** the selected session's live agent. On a background agent it runs `claude stop`: one whose run is over (`done`, `stopped`, `failed`) stops immediately; every other live agent (`working`, `needs input`, `idle`, `interrupted`, unrecognized) confirms first, since stopping ends the live job (its conversation is kept). A session with no background job (a `live` one, typically) has no job to stop, so if Claude Code reports a process id for it, `Ctrl-K` offers to send that process a **SIGTERM** instead: the confirmation shows the pid, and nothing is sent unless Claude Code still reports that same pid when you press `Enter`. A session that isn't running as an agent has nothing to stop, and neither does one Claude Code reports with no job and no process id that can be signalled |
-| `Ctrl-X` then `x` / `d` / `h` / `r` / `y` / `f` | **Leader chord** that acts on the selected row (`x`, `d`, `y`, `f`) or on the whole board (`h`, `r`) — `x` **hides** the selected session (reversible, persisted), `d` **hard-deletes** it after a confirmation that can take just that row or its whole `(+N)` stack, `h` toggles **show hidden**, `r` **re-reads every transcript from disk**, `y` is **copy session ID**: the selected session's full id goes to your clipboard and shows on the status line, `f` **folds** / **expands** a stack of look-alike rows that are really one conversation — a row marked `(+N)` stands for `N` more; `f` opens it, and folds it back from any of its rows. Any other key cancels the chord |
-| `←` / `→` (in the model picker) | **Step the highlighted model's effort** down / up: `default effort` (no `--effort`, your settings decide) → `low` → `medium` → `high` → `xhigh` → `max`, wrapping round both ways. `Enter` sets the model and the effort together into the box; `Esc` goes back to the box with your text and its previous choice untouched. They do nothing on the picker's first (default) row, and nothing in the agent picker — and inside either picker they never move the search cursor on the board underneath |
+| `Ctrl-X` then `x` / `d` / `h` / `r` / `y` / `f` / `w` | **Leader chord** that acts on the selected row (`x`, `d`, `y`, `f`, `w`) or on the whole board (`h`, `r`) — `x` **hides** the selected session (reversible, persisted), `d` **hard-deletes** it after a confirmation that can take just that row or its whole `(+N)` stack, `h` toggles **show hidden**, `r` **re-reads every transcript from disk**, `y` is **copy session ID**: the selected session's full id goes to your clipboard and shows on the status line, `f` **folds** / **expands** a stack of look-alike rows that are really one conversation — a row marked `(+N)` stands for `N` more; `f` opens it, and folds it back from any of its rows, `w` **moves** the session to another worktree of this project (the main folder included, the session's own folder left out) without leaving the board. Any other key cancels the chord |
+| `←` / `→` (in the model picker) | **Step the highlighted model's effort** down / up: `default effort` (no `--effort`, your settings decide) → `low` → `medium` → `high` → `xhigh` → `max`, wrapping round both ways. `Enter` sets the model and the effort together into the box; `Esc` goes back to the box with your text and its previous choice untouched. They do nothing on the picker's first (default) row, and nothing in the agent picker or the move picker — and inside any picker they never move the search cursor on the board underneath |
 | `Tab` | Toggle search: **name-only ↔ name+content**. Widening to content also opens the preview on the most recent match, the same way typing does |
 | `Ctrl-A` | Flip scope: **current folder ↔ project** — the project being the repo you launched in and all of its git worktrees. Started with `-a` it is a three-stop cycle instead (current folder → project → all folders), which is the only way to reach all folders |
 | `Shift-←` / `Shift-→` | Change the **layout** one step — how the screen is split between the session list and the transcript preview, list:preview: `0:1` (preview only) · `1:3` · `1:1` · `3:1` · `1:0` (list only). You start at `1:1`; `Shift-←` gives the preview more room, `Shift-→` gives the list more, and a press at either end does nothing. Works with or without a search typed. The preview keeps your place as it resizes; coming back from `1:0` it opens on the newest turn. At `0:1` the preview's title names the selected session, and `↑` / `↓` still move between sessions |
@@ -451,7 +451,8 @@ several sessions at once, each tracked on its own, but not twice to the same one
 until a session's reply lands, `Ctrl-R` on that session is refused before a
 compose box opens (so nothing you type is lost), while every other row can still
 reply. That per-session record is also what lets the hard delete below keep
-refusing a session while its reply is still being written.
+refusing a session while its reply is still being written. `Ctrl-R` is refused the
+same way while snapback is moving the session to another worktree (`Ctrl-X w`).
 
 The `/` and `@` list is Claude Code's own for that folder: the first time you open
 a box there, snapback asks `claude` for it in the background — no message is sent
@@ -486,9 +487,9 @@ sits still: that badge is snapback's *inference* from Claude Code contradicting
 itself, not a report that the run ended, and it isn't worth stopping live work over
 a guess. Use `Ctrl-K` if you do want it stopped — it will ask first.
 
-**Hide, delete, copy & fold.** `Ctrl-X` is a leader chord that acts on the
+**Hide, delete, copy, fold & move.** `Ctrl-X` is a leader chord that acts on the
 selected row or on the whole board: press it, and a hint shows the follow-ups —
-`x`, `d`, `h`, `r`, `y`, `f` — while any other key cancels.
+`x`, `d`, `h`, `r`, `y`, `f`, `w` — while any other key cancels.
 
 - `Ctrl-X x` **hides** the selected session. This is the reversible default: the
   session stays on disk, it just drops off the board. A `(+N)` stack always hides
@@ -517,6 +518,24 @@ selected row or on the whole board: press it, and a hint shows the follow-ups �
 - `Ctrl-X f` **folds or expands** a `(+N)` stack: on the folded row it fans the
   look-alike copies out underneath, and on any row of an open stack it folds them
   back into one. On a row with no copies it does nothing.
+- `Ctrl-X w` **moves** the selected session to another worktree of the launch
+  project without leaving the board. A picker lists the project's worktrees — the
+  main folder first, the session's own folder left out — and `Enter` has Claude
+  Code move the transcript into the chosen folder in the background. You stay on
+  the board, and usually within a second the status line says `moved to <folder>`,
+  or why not. While the move runs the row reads `moving…`, and `Enter`, `Ctrl-F`,
+  `Ctrl-R`, `Ctrl-X d` and another `Ctrl-X w` on it are refused until it
+  finishes. A session Claude Code lists as active is refused (close it first, or
+  `Ctrl-K`), and so is one snapback is still replying to. If snapback can't ask
+  Claude Code whether the session is active (`claude agents --json` fails), the
+  move is refused too, rather than risk moving a transcript something is still
+  writing. If Claude Code hasn't been told to trust the target folder, nothing
+  moves and the status line says so: press `Enter` to open the session, then run
+  `/cd <folder>` there once, so Claude Code can ask you itself. Moved sessions —
+  by this key or by typing `/cd` in Claude
+  Code — show under their new folder. In the current-folder scope a session moved
+  out of the folder you launched in leaves the list; `Ctrl-A` shows it under the
+  target.
 - `Ctrl-X d` **hard-deletes** the selected session — physically removing its
   transcript from disk. Because that is irreversible, it asks first with a
   confirmation prompt (defaulted to Cancel). On a row that stands for a `(+N)`
@@ -533,10 +552,12 @@ selected row or on the whole board: press it, and a hint shows the follow-ups �
   Claude Code still has up — working
   a turn, sitting idle between turns, or reporting something snapback can't read
   (an unreadable signal never gets to authorize an irreversible delete) — or one
-  snapback itself is still replying to. A quick reply (`Ctrl-R`) keeps writing
-  after the board comes back, so a delete aimed at that session waits until the
-  reply has landed. Fair game is a background agent that isn't churning: one
-  *waiting on you*, one Claude Code still reports as working while its own status
+  snapback itself is still replying to or moving. A quick reply (`Ctrl-R`) keeps
+  writing after the board comes back, so a delete aimed at that session is
+  refused until the reply has landed, and one aimed at a session `Ctrl-X w` is
+  moving is refused until the move finishes. Fair game is a background agent
+  that isn't churning: one *waiting on you*, one Claude Code still reports as
+  working while its own status
   reads idle (**interrupted**), or one that has reported it finished. Claude Code
   keeps listing agents long after they go quiet, and refusing all of them made
   delete useless for almost every row on the board. Two things worth knowing before you
@@ -573,6 +594,8 @@ after a reply you picked a model for, it carries on with that one, because that
 is the model that answered last. Attach sends none either: it joins a process
 that is already running under a model. The agent picker's own `Ctrl-O` skips the
 box, so there is no pick to send, and Claude Code chooses the new session's model.
+The `Ctrl-X w` move sends none either: it only moves the session's transcript to
+another folder, and no model answers anything.
 
 The box's bottom border always says what snapback expects the message to run on:
 

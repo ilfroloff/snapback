@@ -67,6 +67,13 @@ removes its sibling `<id>/` directory (subagents included) when present — neve
 other path, and only behind a confirmation modal plus the `can_delete_target`
 WRITER guard.
 
+A transcript can also MOVE under snapback without snapback writing it: `Ctrl-X w`
+sends a headless `claude` child one `set_cwd` request
+([Move](#move-to-another-worktree-ctrl-x-w-srcclaude_movers)), and claude relocates
+`<id>.jsonl` (and the sibling `<id>/` dir) into the target's `<encoded-cwd>` dir,
+appending a `relocated` record, as its own interactive `/cd` does. Authorship stays
+claude's; snapback never renames or copies a session file.
+
 A transcript can still GROW under snapback without snapback writing it: the quick
 reply ([`Ctrl-R`](#quick-reply--non-interactive-send-srcsendrs)) appends an
 exchange to the same `<id>.jsonl` because the `claude -p -r` CHILD appends it. The
@@ -117,9 +124,9 @@ background agent is judged by its
 and `Other` are refused, the last of those because an unreadable qualifier must
 not authorize an irreversible unlink.
 
-Those are `can_delete`'s two refusals, and they cover only TWO of the three
-writers. The third is snapback's OWN: a
-[quick reply](#quick-reply--non-interactive-send-srcsendrs) `claude stop`s the
+Those are `can_delete`'s two refusals, and they cover only TWO of the four
+writers. The other two are snapback's OWN. The third is a
+[quick reply](#quick-reply--non-interactive-send-srcsendrs), which `claude stop`s the
 held job before it runs `claude -p -r <id>` — precisely so `-r` is accepted — so
 once that stop has run, the target is ABSENT from the active list `can_delete`
 reads until the `claude` child snapback spawned registers, and that child appends
@@ -136,9 +143,18 @@ verdict is `Ok`, so asking it first would report nothing at all), then
 `can_delete`. Either fact refuses on its own, so the delete is refused for the
 whole send whether or not claude reports the child. Its refusal
 (`DELETE_SENDING_REFUSAL`) names snapback rather than claude, since telling the
-user to close a claude window would point at the wrong process. It stays a
-COMPOSITION of two facts with two sources and two remedies, not a wider
-`can_delete`.
+user to close a claude window would point at the wrong process.
+
+The fourth writer is a [`Ctrl-X w` move](#move-to-another-worktree-ctrl-x-w-srcclaude_movers)
+still in flight: its `claude` child renames the transcript into another project
+folder and appends to it, and that child is snapback's, not a job claude was asked
+to run, so the probe cannot be relied on to name it either. `can_delete_target`
+asks `App::moving_on` before the probe for the same reason and refuses with
+`DELETE_MOVING_REFUSAL`, whose remedy is to let the move finish. A reply and a move
+never run on one session together (each refuses while the other is in flight), so
+the order between the two snapback facts only picks which message names the one in
+flight. The gate stays a COMPOSITION of three facts with three sources and three
+remedies, not a wider `can_delete`.
 
 That in-flight fact is only complete because the board records EVERY quick reply
 it has in flight, one entry per session. `App::sending` is keyed by session: a
@@ -155,7 +171,10 @@ that second child was writing.
 An earlier revision kept ONE slot and refused `Ctrl-R` on every row while it was
 full, because a second reply that overwrote the slot left the first one still
 writing with nothing on the board recording it. Keying the entries by session
-closes that hole without serializing replies to unrelated sessions.
+closes that hole without serializing replies to unrelated sessions. `App::moving`
+is keyed the same way, for the same reason: a `MoveFinished` clears only its own
+session's entry, and a second move of the SAME session is refused
+(`MOVE_IN_FLIGHT_REFUSAL`) because two children would race for one file.
 
 The two FINISHED arms, `Done` and `Ended`, are LIVE arms, not dead code to clean
 up: `delete::can_delete`'s doc comment owns why (and the correction of the earlier
@@ -255,7 +274,8 @@ never fatal:
 
 | Field | Read as | Used for |
 | --- | --- | --- |
-| `cwd` | first non-null | authoritative working dir; **absence ⇒ not a session** |
+| `cwd` | the LAST non-empty `relocatedCwd` of a `relocated` record, else first non-null | authoritative working dir; **absence of a plain `cwd` ⇒ not a session** (a `relocated` record alone never makes one) |
+| `relocated` → `relocatedCwd` | on `type:"relocated"`, string (fail-soft: missing, blank, non-string, or on any other record type ⇒ ignored; a blank one never displaces an earlier valid one) | the move marker claude writes for its own `/cd` ([CLAUDE_CLI.md](CLAUDE_CLI.md#cd-moving-a-session-to-another-folder)) and for the `Ctrl-X w` move's `set_cwd` ([CLAUDE_CLI.md](CLAUDE_CLI.md#set_cwd-moving-a-session-without-leaving-the-board)): it overrides the head `cwd`, so the row is homed, scoped, grouped, resumed and quick-replied in the folder the session moved to |
 | `sessionId` | first non-null (else file stem) | stable id, resume target, reported-agent join key |
 | `gitBranch` | last non-null (`None` ⇒ `(detached)`) | branch grouping level |
 | `timestamp` | last non-null, RFC 3339 | sort + display (per-message too, in preview; a [failed notice](#failed-background-task-storeparse)'s own, on the banner) |
@@ -280,7 +300,13 @@ never fatal:
 | `parentUuid` | per record; **JSON `null` on the root** | the tree edge; the null-parent record's `uuid` is the fork-lineage identity (see [Fork lineage](#fork-lineage-storelineage)); an injected record pointing at the slash-command wrapper just before it confirms a [prompt command label](#label-storelabel) |
 
 "First non-null" vs "last non-null" is deliberate: identity fields take the
-earliest value, activity fields (branch, timestamp) take the most recent.
+earliest value, activity fields (branch, timestamp) take the most recent. `cwd` is
+the one identity field with an explicit override: a `relocated` record is claude's
+own statement that the session now belongs elsewhere (it derives a session's folder
+as `relocatedCwd ?? headCwdStrict` and merges the record `last-wins`, observed at
+2.1.284), so the LAST `relocatedCwd` wins over the first plain `cwd`, wherever in
+the file either sits. Without it a moved session would list under its old folder
+beside a branch read from its new one, and Enter would resume it in the old folder.
 
 `parentUuid` is the one field where **absent and `null` are different answers**,
 and conflating them breaks the lineage — see [Fork lineage](#fork-lineage-storelineage).
@@ -821,8 +847,9 @@ session.
 
 #### The lineage key is `(repo, branch, root)`
 
-Not the root uuid alone. Some lineages span more than one `gitBranch` (none span
-more than one `cwd`), and folding across branches would gather members across
+Not the root uuid alone. Some lineages span more than one `gitBranch`, and, once
+`Ctrl-X w` has moved one member (the move writes a `relocated` record), more than one
+`cwd`; folding across branches would gather members across
 branch group heads, breaking `build_rows`' invariant that same-group rows are
 contiguous with exactly one head per group. Branch-scoping is also the right
 semantic: **a fork onto another branch is different work**, and it keeps its own
@@ -850,8 +877,10 @@ complaint rather than solving it.
 A gathered member draws as an indented **child row** carrying only what can
 DIFFER from its head: its own timestamp, its badge, the first 8 chars of its
 `session_id`, its [turn count](#turn-count-storeparse), and any marker that is a
-fact about that one session (`[task failed]`, `[unbound]`, `[hidden]`). The count
-is the field that tells the members' WORK apart. A lineage's members share a
+fact about that one session (`[task failed]`, `[unbound]`, `[hidden]`, and the
+`moving…` badge while that member's
+[`Ctrl-X w` move](#move-to-another-worktree-ctrl-x-w-srcclaude_movers) is in
+flight). The count is the field that tells the members' WORK apart. A lineage's members share a
 label BY CONSTRUCTION — that identity *is* the reported bug — so `6 msgs` beside
 `171 msgs` is what says which member is a stalled stub and which holds the work;
 a timestamp and an id only ever say WHICH member. The row **reports** and
@@ -1147,13 +1176,17 @@ machine-readable window onto that, and `snapback` reads it **twice, differently*
 | Reading | Command | Asked | Question |
 | --- | --- | --- | --- |
 | **Board signal** (`reported_agents`) | `--json --all` | polled off-thread every `watch::AGENTS_REFRESH` (5s), skipped once the board has been idle past `watch::AGENTS_IDLE_AFTER` (60s) | "what should each row's badge say?" |
-| **Hand-off signal** (`live_agents`) | `--json` (**no `--all`**) | one-shot at EVERY hand-off | "will `claude -r` refuse *right now*?" **and** "what job id does `claude attach`/`claude stop` take?" **and**, for a record with no job id, "which `pid` does `Ctrl-K`'s signal route take?" |
+| **Hand-off signal** (`live_agents`; the move's `try_live_agents`) | `--json` (**no `--all`**) | one-shot at EVERY hand-off, and once per `Ctrl-X w` move on its worker | "will `claude -r` refuse *right now*?" **and** "what job id does `claude attach`/`claude stop` take?" **and**, for a record with no job id, "which `pid` does `Ctrl-K`'s signal route take?" |
 
-The hand-off reading serves FIVE gates, not just Enter: resume, Attach, the
+The hand-off reading serves SIX gates, not just Enter: resume, Attach, the
 `Ctrl-R` [reply gate](#quick-reply--non-interactive-send-srcsendrs), the
-`Ctrl-K` [interrupt gate](#interrupt--stopping-a-live-agent-ctrl-k-srcsendrs) and
-the `Ctrl-X d` [hard-delete confirm](#on-disk-layout). The last three also
-CLASSIFY the record (via `agents::classify`) rather than reading membership alone —
+`Ctrl-K` [interrupt gate](#interrupt--stopping-a-live-agent-ctrl-k-srcsendrs),
+the `Ctrl-X d` [hard-delete confirm](#on-disk-layout) and the
+[`Ctrl-X w` move](#move-to-another-worktree-ctrl-x-w-srcclaude_movers), which asks
+it on the move's worker rather than on the UI thread, reads membership alone, and
+is the one gate that REFUSES when the probe cannot answer
+([why](#why-the-gate-does-not-read-the---all-map)).
+The reply, interrupt and delete gates also CLASSIFY the record (via `agents::classify`) rather than reading membership alone —
 the only places a bucket informs an action rather than a pixel (see
 [the bucket's non-display consumers](#activity-buckets-agentactivity)) — and it is
 still claude's own fresh answer, never the polled `--all` map.
@@ -1207,7 +1240,10 @@ step that branches on it:
 `name` is still on the wire (69/83 background and 3/3 interactive records in the
 2.1.278 bare probe) but is no longer parsed: `ReportedAgent` dropped it because
 nothing read it, not because claude stopped sending it. Parsing is fail-soft: any
-failure ⇒ empty map, and one bad field never discards its record.
+failure ⇒ empty map, and one bad field never discards its record. The move's
+reading alone (`try_live_agents`) gets `None` there instead, so it can tell "could
+not ask" from "nothing is live"
+([below](#why-the-gate-does-not-read-the---all-map)).
 
 **Two fields, two sources, two questions.** The signal route's `pid` comes ONLY
 from the bare one-shot probe (`App::live_agent_now`), never from the polled
@@ -1326,6 +1362,20 @@ posture. That is deliberate: a classifier facing an unknown bucket should assume
 error left is "we could not ask", and claude's own check backstops that one step
 later. Degrading toward *let claude decide* is correct.
 
+**The `Ctrl-X w` move is the one exception: it fails toward REFUSING.** Its worker
+asks the same bare probe through `agents::try_live_agents`, which keeps "could not
+ask" (no child could start, a non-zero exit, or output that is not the documented
+array) apart from an empty list: `None` versus `Some(empty)`. The pure
+`claude_move::liveness_refusal` turns `None` into `MOVE_PROBE_FAILED_REFUSAL`,
+worded apart from `MOVE_LIVE_REFUSAL` because it reports a different observation.
+The backstop argument above does not reach the move: its child renames the
+transcript through `set_cwd`, and no claude-side check of a live writer was
+verified for that child ([CLAUDE_CLI.md](CLAUDE_CLI.md#set_cwd-moving-a-session-without-leaving-the-board)
+lists what was probed), so a "not live" guess has nothing one step later to catch
+it, and a file something is still writing would be split. A refused move costs a
+retry. Every other caller keeps `live_agents` and the "not live" direction,
+unchanged.
+
 At the **Attach** hand-off that same direction collapses two premises: an empty
 answer means "the agent finished" and "we could not ask" alike. Both must refuse
 (`resume::ATTACH_NOT_LIVE`) — without an authoritative id, `claude attach` would
@@ -1426,9 +1476,9 @@ it doing right now":
   [the one write into this tree](#on-disk-layout)), which asks "is a WRITER
   present?" and allows `NeedsInput` / `WorkingButIdle` / `Done` / `Ended` while
   refusing `Working` / `Idle` / `Other` (`DELETE_RUNNING_REFUSAL`) — the one of
-  the gate's THREE refusals a bucket decides: the interactive refusal reads `kind`,
-  and the third (snapback's own in-flight quick reply, added by
-  `delete::can_delete_target`) reads no agent record at all. That gate is
+  the gate's FOUR refusals a bucket decides: the interactive refusal reads `kind`,
+  and the other two (snapback's own in-flight quick reply and `Ctrl-X w` move,
+  added by `delete::can_delete_target`) read no agent record at all. That gate is
   IRREVERSIBLE, so a change to `classify` is now weighed against it as well as
   against the badge it draws;
 * the `Ctrl-R`/`Ctrl-K` stop routing (`send::reply_gate` /
@@ -1874,7 +1924,7 @@ that differ.
 | **Show hidden** | off (default) / on | whether soft-hidden sessions appear (dimmed, marked `[hidden]`, live badge intact). Toggled by `Ctrl-X h`; a row is hidden/un-hidden by `Ctrl-X x`. The set persists — see [snapback-owned state](#snapback-owned-state-srchiddenrs). |
 | **Compose model pick** | `None` (the default, in every new compose) / a `resume::ModelPick`: an offered alias plus an optional `--effort` level | the `--model` (and effort) a compose's own launch asks for, picked with `Ctrl-L` inside that compose and held on it (`ComposeState::model`); which launches it may reach is the A MODEL IS PICKED PER COMPOSE, NEVER PER BOARD rule in [AGENTS.md](../../AGENTS.md#critical-rules). With no pick the compose's `model:` label names what `claude` will choose instead. See [Compose model pick](#compose-model-pick-ctrl-l). |
 | **Forced rescan** | `Ctrl-X r` | not a mode: a one-shot that drops the store's parse cache and re-reads every transcript, reporting the count it landed on. The board autorefreshes and reuses unchanged files by itself, so this is the escape hatch for a row that looks stale — see [incremental reload](#incremental-reload-storesessionstore). |
-| **Modal** | `Row` \| `List` layout in one `Option<Modal>` | the SINGLE type for a TITLED, choice-bearing overlay. `Enter` on a running session builds the `Attach` / `Fork` / `Cancel` choice (a `Row`); `Ctrl-N` with defined agents builds the agent picker (a `List`); `Ctrl-L` inside a compose builds the model picker (a `List` opened OVER that compose, which stays open beneath it; row 0 is the compose's default, and the compose's current pick — effort included — is pre-highlighted by MATCHING the built choices rather than by index arithmetic, so a pick that is no longer offered falls back to row 0; its `←`/`→` step the highlighted model row's effort, which the row draws inline as ` · <level>`, or a dim ` · default effort` while unset and highlighted — see [Compose model pick](#compose-model-pick-ctrl-l)); `Ctrl-X d` builds the hard-delete confirm (a `Row`: `Delete this` / `Delete lineage (N)` — offered only for a real multi-member lineage, carrying the member ids resolved at OPEN time — / `Cancel`, default-highlighted on Cancel by that choice's position). Each choice carries a `ModalAction` tag the one confirm handler (`confirm_modal`) routes on. The plain Enter/Esc stop confirmations (`Ctrl-R`, `Ctrl-K`), the compose zone and the `Ctrl-X` chord are separate keyboard owners, NOT `Modal`s — see [PATTERNS.md](PATTERNS.md#10-keys-actions-outcomes). |
+| **Modal** | `Row` \| `List` layout in one `Option<Modal>` | the SINGLE type for a TITLED, choice-bearing overlay. `Enter` on a running session builds the `Attach` / `Fork` / `Cancel` choice (a `Row`); `Ctrl-N` with defined agents builds the agent picker (a `List`); `Ctrl-L` inside a compose builds the model picker (a `List` opened OVER that compose, which stays open beneath it; row 0 is the compose's default, and the compose's current pick — effort included — is pre-highlighted by MATCHING the built choices rather than by index arithmetic, so a pick that is no longer offered falls back to row 0; its `←`/`→` step the highlighted model row's effort, which the row draws inline as ` · <level>`, or a dim ` · default effort` while unset and highlighted — see [Compose model pick](#compose-model-pick-ctrl-l)); `Ctrl-X d` builds the hard-delete confirm (a `Row`: `Delete this` / `Delete lineage (N)` — offered only for a real multi-member lineage, carrying the member ids resolved at OPEN time — / `Cancel`, default-highlighted on Cancel by that choice's position); `Ctrl-X w` builds the move picker (a `List` of the launch project's worktrees, main first, the session's current folder omitted; each choice carries `ModalAction::MoveTo(path)`, and `Enter` starts the headless move, see [Move](#move-to-another-worktree-ctrl-x-w-srcclaude_movers)). Each choice carries a `ModalAction` tag the one confirm handler (`confirm_modal`) routes on. The plain Enter/Esc stop confirmations (`Ctrl-R`, `Ctrl-K`), the compose zone and the `Ctrl-X` chord are separate keyboard owners, NOT `Modal`s — see [PATTERNS.md](PATTERNS.md#10-keys-actions-outcomes). |
 
 The current-folder scope is an **exact** canonical `cwd` match by design: a
 repo's *other* worktree folders do not appear there, no matter how the paths
@@ -2026,6 +2076,7 @@ on is already on disk, per turn (`message.model`, see
 | `Ctrl-O` in a `Ctrl-N` draft | yes, when one is set | `resume::build_new_argv`, via `check_new` |
 | `Ctrl-O` on the agent picker | never: it skips the draft, the only place a pick is made | `resume::build_new_argv` with `None` |
 | Resume (`Enter` on a row), Fork (`Ctrl-F`), Attach | never: their builders take no pick | `resume::build_argv` / `build_attach_argv` |
+| Move (`Ctrl-X w`, a headless `set_cwd` request) | never: it takes no model turn, and its builder takes no pick | `claude_move::build_set_cwd_argv` |
 
 `--model` goes out only for a `Some`, and `--effort` only right behind it, both
 through the ONE `resume::push_model_flag`; with no pick every argv is
@@ -2406,7 +2457,9 @@ by splitting the UUID.
 Before any hand-off, `cwd` and `sessionId` are **re-read from inside the file**
 (authoritative at hand-off time) and the `cwd` must still exist on disk;
 otherwise the board surfaces a refusal (deleted worktrees are common) and stays
-up. That gate covers resume AND fork, and it is what bounds the
+up. That gate covers resume AND fork (and the `Ctrl-X w` move's worker asks it
+too, through `resume::plan_at`, for the folder the move starts from), and it is
+what bounds the
 [project scope's root arm](#user-facing-modes-tuiapp): a removed worktree's
 sessions are back on the board, and are browsable, searchable, hideable and
 deletable — but not resumable, because the directory they ran in is gone.
@@ -2612,6 +2665,7 @@ never the polled `--all` map — classified by the one `agents::classify`), and
 | Probe result | Bucket | `Ctrl-R` (`send::reply_gate`) |
 | --- | --- | --- |
 | not asked: the SELECTED session's own quick reply is still in flight (`App::sending_to` answers for it); a reply in flight to another row is not this row's and never lands here | — | refuse (`SEND_IN_FLIGHT_REFUSED`, about this session) BEFORE the probe, via `send::reply_in_flight_refusal`: no compose opens |
+| not asked: the SELECTED session's own [`Ctrl-X w` move](#move-to-another-worktree-ctrl-x-w-srcclaude_movers) is still in flight (`App::moving_on`); a move on another row never lands here | — | refuse (`MOVING_REPLY_REFUSAL`) BEFORE the probe, after the reply check above: no compose opens |
 | claude is not holding the session | — | reply in place, no stop (compose opens) |
 | held, but the record carries no stoppable job id (every `kind: "interactive"` record measured so far), with or without a `pid` | — | refuse (`SEND_LIVE_REFUSED`) — try `Ctrl-K` or Fork (`Ctrl-F`) |
 | `done` | `Done` | stop the ended job, then reply — straight to compose |
@@ -2629,7 +2683,9 @@ stays refused, and why the hard-delete guard needs each entry, is
 [the third writer](#on-disk-layout)'s argument. Refusing at `Ctrl-R`, rather than
 at `Enter`, means no compose box opens, so nothing typed is thrown away, and no
 probe is spent. The refusal says "this session" rather than naming one, because
-it is only ever shown for the row `Ctrl-R` was pressed on.
+it is only ever shown for the row `Ctrl-R` was pressed on. The move check follows
+it for the same reasons: a `claude -p -r` would append to the file the move's
+child is relocating.
 
 The **job-id check runs BEFORE the bucket** and wins in every state: an agent
 `claude stop` cannot address is unstoppable by this path whatever it is doing, so
@@ -2838,8 +2894,9 @@ driver runs `update::show_signal_result(app, send::signal_term(pid))`: the helpe
 takes the syscall's result as a parameter, maps it with `send::status_for_signal`
 and applies the class below, so that choice is tested with hand-built results and
 never by signalling. `signal_term` is `Ctrl-K`'s one syscall and this route's only
-effect; the crate's only other signals are the catalog fetch's SIGKILLs of its own
-child's process group (`killpg(2)`) and of that child (`Child::kill`)
+effect; the crate's only other signals are the SIGKILLs `claude_catalog::exchange_reaped`
+sends a timed-out child's process group (`killpg(2)`) and that child (`Child::kill`)
+— the catalog fetch's child or the `Ctrl-X w` move's
 ([CLAUDE_CLI.md](CLAUDE_CLI.md#the-initialize-control-handshake-compose-pick-list)). It takes its target only from the pure `send::signal_target`, which
 narrows the `u32` to a STRICTLY POSITIVE `pid_t` or refuses, so `0`, `-1` or a
 negative (a process group or a broadcast) can never reach `kill(2)`. That check is
@@ -2859,3 +2916,103 @@ failure.
 
 The success status claims delivery, never that the process ended. The row's badge
 clearing on a later agents poll is what shows it worked.
+
+## Move to another worktree (`Ctrl-X w`, `src/claude_move.rs`)
+
+A session started in the main checkout often ends up working in a worktree, and
+Enter keeps resuming it in main. `Ctrl-X w` opens a `List` modal over the launch
+project's worktrees, and `Enter` on one moves the session there WITHOUT a
+hand-off: the board stays up while a headless `claude` child answers one
+`set_cwd` control request and moves the transcript itself. The argv, the wire
+shape and the observed answers are
+[CLAUDE_CLI.md](CLAUDE_CLI.md#set_cwd-moving-a-session-without-leaving-the-board)'s.
+The picker lists every root of the cached `WorktreeSet` in git order (the main
+worktree first, which `parse_porcelain` already relies on) minus the session's
+current folder (`worktrees::move_targets`). The chosen folder rides the modal
+choice (`ModalAction::MoveTo`), so a reload while it is open cannot change what is
+moved.
+
+**Route.** The confirm (`update::start_move`) marks the row moving
+(`App::mark_moving`) and hands the driver `Outcome::Move(MoveRequest)`, carrying
+the row's id, its transcript and the chosen folder; nothing blocking runs on the
+key. The driver starts `claude_move::spawn_move`, whose worker runs, in order: the
+authoritative re-read and the "current folder exists" gate (`resume::plan_at`),
+the target pre-checks (`check_target`), the bare liveness probe for the
+AUTHORITATIVE id (`agents::try_live_agents`, never the polled map; a probe that
+cannot answer refuses, see the table below), claude's
+workspace-trust verdict for the CURRENT folder (`claude_trust::folder_trust`,
+which picks the catalog's trusted or untrusted form), then the child, spawned in
+the current folder (never the target) through the catalog fetch's
+`claude_catalog::exchange_reaped`. It reports exactly ONE `AppEvent::MoveFinished`,
+through `send::UndeliveredEvents` so a hand-off on another row cannot lose it: that
+event is the only thing that clears `App::moving`. Its arm clears that session's
+entry alone, reloads the board at once (the moved row shows under its new folder
+without waiting on the watcher's debounce) and sets the status.
+
+**Outcome.** A move counts only on `status == "ok"` AND `changed == true`
+(`parse_set_cwd_response`; CLAUDE_CLI.md has the two false-success shapes that
+rules out). `status_for_move` maps every outcome, passing each string from claude's
+answer, and the folder git reported, through `send::sanitize_status`:
+
+| Outcome | Status | Class |
+| --- | --- | --- |
+| `ok`, `changed: true` | `moved to <folder>` (claude's `cwd`, else the target) | transient |
+| `ok`, `changed` anything but `true` | `MOVE_UNCHANGED`: nothing moved | sticky |
+| `needs_trust` | `claude has not trusted <folder> yet, so nothing moved — press Enter, then run /cd <target> once so claude can ask.` | sticky |
+| `rejected` | `claude refused the move (<reason>): <message>`, the one part claude gave, or `MOVE_REJECTED_GENERIC` | sticky |
+| claude's `error`, or an answer with no known `status` | `claude could not run the move: <error>`, or `MOVE_PROTOCOL_GENERIC` | sticky |
+| stdout closed with no answer | `MOVE_NO_ANSWER` | sticky |
+| `MOVE_TIMEOUT` passed and the child was killed | `MOVE_TIMED_OUT` | sticky |
+| no child could start | `MOVE_SPAWN_FAILED` | sticky |
+| a refusal from the table below | the refusal | sticky |
+
+`needs_trust` is the one claude prompt the move meets, and snapback never answers
+it for the user (AGENTS.md DRIVE `claude` HEADLESSLY): the status sends the user
+into the session, where claude's own `/cd` dialog can ask.
+
+**Refusals**, each a status line:
+
+| Case | Where decided | Refusal |
+| --- | --- | --- |
+| this session's own move is still in flight (a second child would race the first for the file) | `App::open_move_picker`, before any picker opens | `MOVE_IN_FLIGHT_REFUSAL` |
+| snapback's own quick reply is in flight to the session (`App::sending_to`, a writer the probe cannot be relied on to see) | `App::open_move_picker`, before any picker opens | `MOVE_SENDING_REFUSAL`, naming snapback |
+| the session's folder is outside the launch project (its worktrees are not in the cached set; resolving them would put `git` on a keypress) | `App::open_move_picker` | `MOVE_OUTSIDE_PROJECT` |
+| the cached worktree list names no folder but the session's own | `App::open_move_picker` | `MOVE_NO_TARGET` |
+| no worktree list was resolved (git unavailable) | `App::open_move_picker` | `MOVE_WORKTREES_UNKNOWN` |
+| the transcript is gone, unreadable or yields no `cwd`, or its current folder is gone | the worker (`resume::plan_at`) | `MOVE_SOURCE_GONE`, one line naming no path, never `plan_at`'s own multi-line resume wording |
+| the target is unusable (relative or not UTF-8), gone, or resolves to the current folder | the worker (`claude_move::check_target`) | `MOVE_TARGET_UNUSABLE`, `MOVE_TARGET_GONE`, `MOVE_ALREADY_THERE` |
+| claude lists the session as active: moving a file something is writing would split its transcript | the worker (`claude_move::liveness_refusal`) | `MOVE_LIVE_REFUSAL` |
+| claude could not be asked: `claude agents --json` did not start, exited non-zero, or printed no readable list (`agents::try_live_agents` is `None`) | the worker (`claude_move::liveness_refusal`) | `MOVE_PROBE_FAILED_REFUSAL`, worded apart from `MOVE_LIVE_REFUSAL`. The move alone fails toward refusing here; every other gate reads a failed probe as "not live" ([why](#why-the-gate-does-not-read-the---all-map)) |
+
+The two in-flight refusals are asked when the picker OPENS, not at its confirm, so
+no picker opens for a move that could not start; the picker is modal, so neither
+fact can turn true while it is open.
+
+**While the move is in flight** the row wears a `moving…` badge
+(`view::MOVING_ROW_BADGE`), the interval fact on the row it is about and never on
+the status line ([PATTERNS.md §11](PATTERNS.md#11-status-line-ownership)). Every
+key that would read or write that transcript refuses THAT row, each in its own
+words; a move on another row refuses nothing here:
+
+| Key on the moving row | Refusal |
+| --- | --- |
+| `Enter`, `Ctrl-F` | `MOVING_RESUME_REFUSAL`, before any probe |
+| `Ctrl-R` | `MOVING_REPLY_REFUSAL`, before the probe ([the reply gate](#quick-reply--non-interactive-send-srcsendrs)) |
+| `Ctrl-X d`'s confirm | `DELETE_MOVING_REFUSAL` ([the fourth writer](#on-disk-layout)) |
+| `Ctrl-X w` | `MOVE_IN_FLIGHT_REFUSAL` |
+
+`Ctrl-K` and `Ctrl-X x` (hide) are deliberately not gated: `Ctrl-K` addresses
+claude's own job or pid, not the transcript, and hiding writes snapback's own
+state, never transcript bytes.
+
+**After the move.** The move is delegated: snapback writes nothing, claude moves
+the file ([on-disk layout](#on-disk-layout)). The reload finds it under the
+target's `<encoded-cwd>`, and the `relocated` record
+([JSONL record model](#jsonl-record-model)) homes the row there. In the
+current-folder scope a row moved out of the launch folder therefore leaves the
+list; `Ctrl-A` shows it under the target. A fork made BEFORE the move keeps the
+old head `cwd` and stays in the old folder. The
+[lineage](#fork-lineage-storelineage) key is `(repo, branch, root)`, not the root
+alone, so once the moved file's repo or branch differs from its pre-move fork's
+the two no longer fold together and show as separate rows. Only the moved file
+relocates.

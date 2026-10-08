@@ -919,7 +919,7 @@ fn strip_error_prefix(line: &str) -> &str {
 /// sequences and other control characters (never embed a raw escape — AGENTS.md
 /// TERMINAL-SAFE STYLING), collapse whitespace runs, and cap the length at
 /// [`SEND_ERROR_MAX`] characters. Pure.
-fn sanitize_status(s: &str) -> String {
+pub(crate) fn sanitize_status(s: &str) -> String {
     let mut out = String::with_capacity(s.len().min(SEND_ERROR_MAX));
     let mut chars = s.chars().peekable();
     let mut last_was_space = false;
@@ -970,16 +970,20 @@ fn sanitize_status(s: &str) -> String {
 /// ([`reply_in_flight_refusal`]) kept refusing that session. The entry is
 /// deliberately NOT cleared at the seam instead: the child may still be writing,
 /// and the entry is what keeps `Ctrl-X d` off that transcript until the child has
-/// finished (`delete::can_delete_target`).
+/// finished (`delete::can_delete_target`). A `Ctrl-X w` move's
+/// [`AppEvent::MoveFinished`] is the same case for `App::moving` (its worker is
+/// `crate::claude_move::spawn_move`), so it rides this queue too.
 ///
 /// ONE queue per `App`, and every clone is a handle on it (it is an `Arc`), so the
-/// board and each send thread share it. Three operations take its lock, each
-/// briefly:
+/// board and each send or move thread share it. Three operations take its lock,
+/// each briefly:
 ///
-/// * [`deliver`](Self::deliver), on the send thread: send on the board's channel,
-///   and queue the event ONLY when that send fails because the receiver is gone;
+/// * [`deliver`](Self::deliver), on the send or move thread: send on the board's
+///   channel, and queue the event ONLY when that send fails because the receiver
+///   is gone;
 /// * [`drain_then_drop`](Self::drain_then_drop), at the board's teardown: move
-///   every buffered `SendFinished` into the queue, then drop the receiver;
+///   every buffered `SendFinished` and `MoveFinished` into the queue, then drop
+///   the receiver;
 /// * [`take`](Self::take), on the next board: one lock-and-take, released before
 ///   any event is handled.
 ///
@@ -1016,15 +1020,15 @@ impl UndeliveredEvents {
     /// ACCEPTED but never read.
     ///
     /// The board's own `recv` loop has stopped by the time this runs, yet a
-    /// `SendFinished` can still be sitting in the buffer: the hand-off key was read
-    /// first, and a completion can land after it and before the receiver goes. That
-    /// window includes the `EventLoop` drop itself, which joins the input reader
-    /// BEFORE its receiver field drops. So this empties the buffer through
-    /// `try_recv` (a non-blocking read), moves every `SendFinished` into the queue,
-    /// discards every other event as teardown always did, and then drops
-    /// `receiver`, join included, all under the lock (see the type's doc for why
-    /// that leaves no gap). `receiver` is generic so a test can hand in a plain
-    /// channel instead of a live `EventLoop`.
+    /// `SendFinished` or `MoveFinished` can still be sitting in the buffer: the
+    /// hand-off key was read first, and a completion can land after it and before
+    /// the receiver goes. That window includes the `EventLoop` drop itself, which
+    /// joins the input reader BEFORE its receiver field drops. So this empties the
+    /// buffer through `try_recv` (a non-blocking read), moves every `SendFinished`
+    /// and `MoveFinished` into the queue, discards every other event as teardown
+    /// always did, and then drops `receiver`, join included, all under the lock
+    /// (see the type's doc for why that leaves no gap). `receiver` is generic so a
+    /// test can hand in a plain channel instead of a live `EventLoop`.
     pub fn drain_then_drop<R>(
         &self,
         receiver: R,
@@ -1032,7 +1036,10 @@ impl UndeliveredEvents {
     ) {
         let mut queue = self.lock();
         while let Some(event) = try_recv(&receiver) {
-            if matches!(event, AppEvent::SendFinished { .. }) {
+            if matches!(
+                event,
+                AppEvent::SendFinished { .. } | AppEvent::MoveFinished { .. }
+            ) {
                 queue.push(event);
             }
         }
@@ -3483,6 +3490,34 @@ mod tests {
             Some(true),
             "the receiver must drop while the queue's lock is held, or a completion \
              can land in its buffer after the drain"
+        );
+    }
+
+    /// A `Ctrl-X w` move's completion is the other kind the queue carries: the
+    /// teardown drain keeps a buffered `MoveFinished` beside the replies, in
+    /// order, because it is the only thing that clears `App::moving`.
+    #[test]
+    fn the_teardown_drain_keeps_a_buffered_move_finished_too() {
+        let queue = UndeliveredEvents::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        for event in [
+            finished("reply", true),
+            AppEvent::Tick,
+            AppEvent::MoveFinished {
+                session_id: "moved".to_string(),
+                status: "moved to /x".to_string(),
+                success: true,
+            },
+        ] {
+            tx.send(event).expect("the receiver is still up");
+        }
+        queue.drain_then_drop(rx, |rx| rx.try_recv().ok());
+
+        let kept = queue.take();
+        assert_eq!(finished_ids(&kept), ["reply", "<other>"]);
+        assert!(
+            matches!(&kept[1], AppEvent::MoveFinished { session_id, .. } if session_id == "moved"),
+            "the move's completion is kept, not discarded: {kept:?}"
         );
     }
 

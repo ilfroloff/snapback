@@ -9,7 +9,9 @@
 //! The compose pick list's catalog fetch (`crate::claude_catalog`). A folder
 //! claude trusts is fetched with its project settings; any other with
 //! `--setting-sources user`, so opening a compose box never runs a repository's
-//! own helper commands or applies its `env` block where claude would not.
+//! own helper commands or applies its `env` block where claude would not. The
+//! `Ctrl-X w` move (`crate::claude_move`) asks the same question of the session's
+//! current folder, and takes the same form from the answer.
 //!
 //! # Fail-soft, toward UNTRUSTED
 //!
@@ -21,9 +23,9 @@
 //!
 //! # Where it runs
 //!
-//! [`folder_trust`] makes blocking FS reads, so only the catalog fetch's worker
-//! thread calls it (AGENTS.md OFF-UI-THREAD), never a key handler or the render
-//! path.
+//! [`folder_trust`] makes blocking FS reads, so only the catalog fetch's and the
+//! move's worker threads call it (AGENTS.md OFF-UI-THREAD), never a key handler
+//! or the render path.
 //!
 //! # Where it lives
 //!
@@ -522,7 +524,7 @@ pub(crate) fn folder_trust_in(config_file: &Path, folder: &Path) -> FolderTrust 
 /// The ONE site naming the real environment and home: `$CLAUDE_CONFIG_DIR`
 /// through `claude_settings`, [`CUSTOM_OAUTH_URL_ENV`] and the home directory.
 /// No locatable record answers `Untrusted`. Blocking FS reads: the catalog
-/// fetch's worker thread only.
+/// fetch's and the `Ctrl-X w` move's worker threads only.
 #[must_use]
 pub fn folder_trust(folder: &Path) -> FolderTrust {
     let custom_oauth = std::env::var_os(CUSTOM_OAUTH_URL_ENV).is_some_and(|url| !url.is_empty());

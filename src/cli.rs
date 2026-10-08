@@ -68,15 +68,24 @@ KEYS:
                   shows on the status line)
                   · f fold / expand the selected row's fork lineage (a row marked
                   (+N) stands for more)
+                  · w move the session to another worktree of this project (or
+                  back to the main folder); the board stays up and the status
+                  line says where it went. A session claude lists as active, or
+                  one snapback is still replying to or moving, is refused, and
+                  so is any move while claude cannot be asked whether it is
+                  active (claude agents --json fails). While the move runs
+                  (under a second) the row reads moving… and refuses Enter,
+                  Ctrl-F, Ctrl-R, Ctrl-X d and another Ctrl-X w
     Ctrl-R        quick reply — send a one-shot message to the selected session
                   without leaving the board. An agent whose run is over (done,
                   stopped, failed) is stopped first so the reply lands in place;
                   a waiting one (needs input) confirms first; a working, idle,
                   interrupted or unrecognized agent, or a session claude reports
                   with no job to stop, is refused — try Ctrl-K or Fork instead.
-                  While a session's own reply is still being sent, Ctrl-R on
-                  that session is refused until it lands; other rows can still
-                  reply (Enter sends, Ctrl-L picks the model, Ctrl-J or Alt+Enter
+                  While a session's own reply is still being sent, or the
+                  session is being moved (Ctrl-X w), Ctrl-R on that session is
+                  refused until it lands; other rows can still reply
+                  (Enter sends, Ctrl-L picks the model, Ctrl-J or Alt+Enter
                   newline, Esc cancels, and / or @ opens the pick list below)
     Ctrl-L        in a reply or draft box: pick the model, and optionally the
                   effort, for THIS message only. The box names what it will run
@@ -88,8 +97,9 @@ KEYS:
                   ANTHROPIC_DEFAULT_*_MODEL set, claude does not restore the
                   session's model, so a reply says 'model: default'. The first
                   row goes back to the default; every new box starts there and
-                  nothing is remembered. Enter, Ctrl-F and Attach never send a
-                  model, and claude does not keep an effort for a later resume
+                  nothing is remembered. Enter, Ctrl-F, Attach and the
+                  Ctrl-X w move never send a model, and claude does not keep
+                  an effort for a later resume
     ←/→           in the model picker: step the highlighted model's effort
                   through default → low → medium → high → xhigh → max, wrapping,
                   sent as --effort beside --model; Enter sets both into the box,

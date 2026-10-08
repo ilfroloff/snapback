@@ -5,9 +5,11 @@
 //! `Tick` does nothing costly. Restores selection by locating the selected
 //! `session_id` in the new filtered list (clamps to nearest if it vanished).
 //! The remaining variants are off-thread deliveries: `ReportedAgents` swaps in the
-//! poller's badge/banner map, while `SendFinished`, `InterruptFinished` and
-//! `BgLaunchFinished` each land ONE one-shot child's result — the last of which
-//! also closes the in-flight new-session draft card it names (and only that one).
+//! poller's badge/banner map, while `SendFinished`, `MoveFinished`,
+//! `InterruptFinished` and `BgLaunchFinished` each land ONE one-shot child's
+//! result — `MoveFinished` also reloads the board, so the moved row shows its new
+//! folder, and the last closes the in-flight new-session draft card it names (and
+//! only that one).
 //! `CopyFinished` lands a clipboard tool's result too (a `Ctrl-X y` id or a
 //! preview drag-selection), but hands it back to the driver
 //! ([`Outcome::FinishCopy`]) because only the driver holds the writer its OSC 52
@@ -20,8 +22,8 @@
 //! This module is the *decision* half of the loop: [`key_to_action`] maps a key
 //! to an [`Action`], and [`handle_event`] applies an [`AppEvent`] to the [`App`]
 //! and returns an [`Outcome`] telling the driver (in [`crate::tui`]) whether to
-//! continue, quit, hand off a resume, fire one of the three no-teardown children
-//! (`Send` / `Interrupt` / `BgLaunch`), deliver `Ctrl-K`'s child-free SIGTERM
+//! continue, quit, hand off a resume, fire one of the four no-teardown children
+//! (`Send` / `Move` / `Interrupt` / `BgLaunch`), deliver `Ctrl-K`'s child-free SIGTERM
 //! (`Signal`, a `kill(2)` the driver runs inline — see [`Outcome::Signal`]), or
 //! start / finish a clipboard copy — `Ctrl-X y`'s id or a preview drag-selection —
 //! (`Copy` / `FinishCopy`). All of it is
@@ -35,16 +37,17 @@
 //! | `Up` / `Down` | move selection (always) |
 //! | `Left` / `Right` | move the search query's caret one character back / forward (always). Not a query change: the list, the selection and the preview stay exactly where they were |
 //! | `Alt-Left` / `Alt-Right`, `Alt-b` / `Alt-f`, `Ctrl-Left` / `Ctrl-Right` | move the search query's caret one WORD back / forward (always) — the widget's own word hop (see [`App::move_query_caret_by_word`]), so forward lands on the START of the next word, as in the reply box. Not a query change either. Three pairs because `⌥←` / `⌥→` reaches the board as `CSI 1;3D` / `C` or as `ESC b` / `ESC f` depending on the terminal, and `Ctrl-Left` / `Ctrl-Right` is the non-`Alt` twin; `Alt-b` / `Alt-f` and `Ctrl-Left` / `Ctrl-Right` are also the pairs the compose box hops words on |
-//! | `Enter` | resume the selected session |
-//! | `Ctrl-F` | fork-resume the selected session |
+//! | `Enter` | resume the selected session. Refused while snapback's own `Ctrl-X w` move of that session is still in flight (see [`App::moving_on`]) |
+//! | `Ctrl-F` | fork-resume the selected session. Refused, like `Enter`, while that session's move is in flight |
 //! | `Ctrl-N` | start a new session in the launch directory. When agents are defined a picker opens first and `Enter` on a pick opens a draft pane for the session's first message; with none defined that draft opens straight away. In the draft, `Enter` starts a BACKGROUND agent without leaving the board, `Ctrl-O` runs it interactively instead, `Esc` cancels; `/` and `@` open the pick list (the `/` or `@` row below), which claims `Enter` and `Esc` while it is open |
 //! | `Ctrl-O` (in the agent picker) | start the highlighted agent INTERACTIVELY at once, skipping the draft — the same verb `Ctrl-O` names inside the draft, so BOTH routes out of the picker cost exactly one key. Bound on the picker alone — inert on every other modal |
-//! | `Ctrl-R` | quick-reply: send a one-shot message to the selected session without leaving the board. An agent whose run is OVER (`done` / `stopped` / `failed`) is stopped first so the reply lands in place; `needs input` confirms first; `working` / `idle` / `interrupted` / an unrecognized qualifier is refused, and so is a session claude reports with no stoppable job id — the refusal points at `Ctrl-K` or Fork (see [`send::reply_gate`]). While this session's OWN reply is still in flight, `Ctrl-R` on it is refused before any of the above (see [`send::reply_in_flight_refusal`]); a reply still in flight to another row refuses nothing here. In the box `/` and `@` open the pick list (the `/` or `@` row below), which claims `Enter` and `Esc` while it is open |
+//! | `Ctrl-R` | quick-reply: send a one-shot message to the selected session without leaving the board. An agent whose run is OVER (`done` / `stopped` / `failed`) is stopped first so the reply lands in place; `needs input` confirms first; `working` / `idle` / `interrupted` / an unrecognized qualifier is refused, and so is a session claude reports with no stoppable job id — the refusal points at `Ctrl-K` or Fork (see [`send::reply_gate`]). While this session's OWN reply is still in flight, `Ctrl-R` on it is refused before any of the above (see [`send::reply_in_flight_refusal`]), and so it is while its `Ctrl-X w` move is; a reply or a move still in flight on another row refuses nothing here. In the box `/` and `@` open the pick list (the `/` or `@` row below), which claims `Enter` and `Esc` while it is open |
 //! | `Ctrl-K` | stop / interrupt the selected session's live agent, by whichever handle claude's record carries (see [`send::interrupt_gate`]). A stoppable job id → `claude stop`: an agent whose run is OVER (`done` / `stopped` / `failed`) stops at once, every other live agent confirms first. NO job id but a `pid` → confirm, then re-ask claude at `Enter` and send that pid a SIGTERM (never SIGKILL) only if claude still reports the same pid with no job id; a record that is gone, now carries a job id, or reports another pid refuses instead (see [`send::signal_plan`]). A session claude is not holding, or one it reports with neither a job id nor a pid — or with no job id and a pid no signal could take (`0`, past `i32::MAX`, or the board's own process id) — is refused |
 //! | `Tab` | toggle name-only vs. name+content search. Widening to content also opens the preview on the most recent match, exactly as typing does: it goes through the same query funnel, and the mode is the gate that key just opened |
 //! | `Ctrl-A` | flip the scope: current folder <-> project (the launch repo and all of its git worktrees). ONE key for both, because the second is a refinement of the same question the first answers, not a separate mode. Launched with `--all`/`-a` it becomes a three-stop cycle through all folders as well — the whole store is on this key only when the launch flag put it there |
-//! | `Ctrl-X` then `x`/`d`/`h`/`r`/`y`/`f` | leader chord: hide / hard-delete (this row, or its whole fork lineage) / toggle show-hidden / re-read every transcript from disk / copy session ID (the selected session's full id, to the clipboard; the id also shows on the status line) / fold or expand the selected row's fork lineage (fold an open one, open a folded `(+N)` head, nothing otherwise — see [`App::toggle_selected_lineage`]) (any other key cancels) |
-//! | `Ctrl-L` (in a compose box) | pick the model — and optionally the effort — for THIS compose only: the `Ctrl-R` reply or the `Ctrl-N` draft it is pressed in (see [`compose::compose_key_to_action`]). The box's `model:` label names what it runs on: a reply's default is `session (<model>)`, the model its session last answered with, which claude normally restores by itself (`default` when an `ANTHROPIC_MODEL` / `ANTHROPIC_DEFAULT_*_MODEL` override, or a transcript with no answering model, means it would not); a draft's is `default (<value>) (new sessions only)` from the user's `claude` settings. `--model` / `--effort` are sent ONLY for a pick other than that default — on the reply, the draft's background launch and the draft's `Ctrl-O` run. The picker's first row returns to the default, `Enter` sets the highlighted row into the compose, `Esc` returns with the text and the previous pick intact. Every new compose starts at its default; nothing is remembered. `Enter`, `Ctrl-F` and Attach never send a model |
+//! | `Ctrl-X` then `x`/`d`/`h`/`r`/`y`/`f`/`w` | leader chord: hide / hard-delete (this row, or its whole fork lineage; a member whose quick reply or move snapback still has in flight is refused, see [`delete::can_delete_target`]) / toggle show-hidden / re-read every transcript from disk / copy session ID (the selected session's full id, to the clipboard; the id also shows on the status line) / fold or expand the selected row's fork lineage (fold an open one, open a folded `(+N)` head, nothing otherwise — see [`App::toggle_selected_lineage`]) / move the selected session to another worktree of the launch project (the parent folder included, its own folder omitted): opens a picker, see the next row; refused, with no picker, while that session's own move or quick reply is still in flight (any other key cancels) |
+//! | `Enter` in the move picker | move the session to the chosen worktree; the board stays up. A worker thread re-reads the transcript, refuses a session claude lists as active — and, unlike every other gate, refuses too when claude cannot be asked (`claude agents --json` fails; see `crate::claude_move::liveness_refusal`) — then runs one headless `claude -p … -r <id>` in the session's current folder and sends it one `set_cwd` request (see `crate::claude_move`); the status line says `moved to <folder>`, or why not. While it runs the row wears `moving…` and refuses `Enter`, `Ctrl-F`, `Ctrl-R`, `Ctrl-X d` and another `Ctrl-X w` |
+//! | `Ctrl-L` (in a compose box) | pick the model — and optionally the effort — for THIS compose only: the `Ctrl-R` reply or the `Ctrl-N` draft it is pressed in (see [`compose::compose_key_to_action`]). The box's `model:` label names what it runs on: a reply's default is `session (<model>)`, the model its session last answered with, which claude normally restores by itself (`default` when an `ANTHROPIC_MODEL` / `ANTHROPIC_DEFAULT_*_MODEL` override, or a transcript with no answering model, means it would not); a draft's is `default (<value>) (new sessions only)` from the user's `claude` settings. `--model` / `--effort` are sent ONLY for a pick other than that default — on the reply, the draft's background launch and the draft's `Ctrl-O` run. The picker's first row returns to the default, `Enter` sets the highlighted row into the compose, `Esc` returns with the text and the previous pick intact. Every new compose starts at its default; nothing is remembered. `Enter`, `Ctrl-F`, Attach and the `Ctrl-X w` move never send a model |
 //! | `Left` / `Right` (in the model picker) | step the highlighted MODEL row's `--effort` down / up through unset → `low` → `medium` → `high` → `xhigh` → `max`, wrapping both ways; `Enter` then sets the model and the effort together into the compose. Inert on the picker's default row (no model, so no effort) and on every other list modal, so the agent picker keeps ignoring them; they never reach the board's search caret underneath |
 //! | `/` or `@` (in a compose box) | open the pick list — the SAME list in the `Ctrl-R` reply and the `Ctrl-N` draft, which differ only in where it reads from (`compose::completion_source`). `/` as the draft's first character lists claude's skills and commands for the target's folder; `@` at the start of a word lists files and folders and, for a top-level `@` token only, agents, picked as `@agent-<name>`; a skill, command or agent carries its description. The list is claude's own, fetched once per folder per board off the UI thread (`compose::take_catalog_fetch`); until it lands `/` lists nothing in either box, while `@` lists files and folders at once, a reply's agents come from its transcript and a draft's wait for the catalog. While the list is open `Up` / `Down` choose, `Enter` / `Tab` pick (a folder reopens the list one level down) and `Esc` closes only the list, never the draft (see [`compose::compose_key_to_action`]) |
 //! | `Shift-Left` / `Shift-Right` | step the pane layout one stop toward a full-width preview / a full-width list, along `0:1 · 1:3 · 1:1 · 3:1 · 1:0` (list:preview; the board starts at `1:1`). A press at either end does nothing. Always — with or without a query, and whatever is marked. The step keeps the reader's place in the preview; leaving `1:0` opens it on the newest turn (see [`App::set_pane_layout`]) |
@@ -96,6 +99,7 @@
 //! flattened to spaces. A paste can never submit, resume, or quit.
 
 use std::io::Write;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
@@ -103,6 +107,7 @@ use crossterm::event::{
 };
 use ratatui::layout::{Position, Rect};
 
+use crate::claude_move::{self, MoveRequest};
 use crate::defined_agents;
 use crate::delete;
 use crate::resume::{self, Ready};
@@ -222,8 +227,8 @@ pub enum Action {
     ClearQuery,
     /// Enter the `Ctrl-X` leader chord: arm [`App::pending_chord`] so the NEXT key
     /// routes through the pure [`chord_key`] machine (hide / hard-delete /
-    /// show-hidden / forced rescan / copy session ID / fold toggle / cancel)
-    /// instead of the board.
+    /// show-hidden / forced rescan / copy session ID / fold toggle / move picker /
+    /// cancel) instead of the board.
     Chord,
     /// A key with no binding in the current state.
     Ignore,
@@ -253,6 +258,14 @@ pub enum Outcome {
     /// stays pure and unit-testable, the way [`Resume`](Self::Resume) carries a
     /// confirmed [`Ready`].
     Send(SendRequest),
+    /// Fire a confirmed `Ctrl-X w` move on its own worker thread and KEEP running —
+    /// like [`Send`](Self::Send), the board never tears down. Handled inline by
+    /// [`crate::tui::run`] ([`crate::claude_move::spawn_move`]); the move reports
+    /// back via [`AppEvent::MoveFinished`](crate::watch::AppEvent::MoveFinished).
+    /// Carried as data so the key handler stays free of every blocking step: the
+    /// re-read, the liveness probe, the trust read and the child are all the
+    /// worker's.
+    Move(MoveRequest),
     /// Fire a one-shot interrupt (`claude stop <job-id>`) on a detached thread and
     /// KEEP running — like [`Send`](Self::Send), the board never tears down. Handled
     /// inline by [`crate::tui::run`]; the stop reports back via
@@ -278,7 +291,7 @@ pub enum Outcome {
     ///
     /// **This one is performed SYNCHRONOUSLY by the driver, with no detached thread
     /// and no `AppEvent` round trip — and that is a decision, not an omission.** The
-    /// three variants above exist because a `claude` CHILD blocks: it has to be
+    /// four variants above exist because a `claude` CHILD blocks: it has to be
     /// spawned, waited on, and its streams read, so the work cannot sit on the render
     /// loop. `kill(2)` returns as soon as the signal is queued. There is no completion
     /// to wait for and nothing to report back, so a thread plus a channel round trip
@@ -331,7 +344,7 @@ impl Outcome {
     /// down and the merged event channel with it.
     ///
     /// True for [`Quit`](Self::Quit) and every [`Resume`](Self::Resume); false for
-    /// the no-teardown effects (`Send`, `Interrupt`, `BgLaunch`, the interrupt's
+    /// the no-teardown effects (`Send`, `Move`, `Interrupt`, `BgLaunch`, the interrupt's
     /// `Signal`, and the clipboard copy's `Copy` / `FinishCopy`), which keep
     /// drawing on the SAME channel. Pure, so "does the board survive this?" is one
     /// greppable answer rather than a `matches!` repeated per call site.
@@ -372,9 +385,10 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool
             KeyCode::Char('k') | KeyCode::Char('K') => Action::Interrupt,
             KeyCode::Char('c') | KeyCode::Char('C') => Action::Quit,
             // Ctrl-X (0x18 CAN) is the board's leader chord: act on the selected
-            // row (hide / hard-delete / copy session ID / fold toggle) or on the
-            // board (show-hidden / forced rescan). Unbound and terminal-safe —
-            // unlike Ctrl-H/I/M, which alias Backspace/Tab/Enter.
+            // row (hide / hard-delete / copy session ID / fold toggle / move to
+            // another worktree) or on the board (show-hidden / forced rescan).
+            // Unbound and terminal-safe — unlike Ctrl-H/I/M, which alias
+            // Backspace/Tab/Enter.
             // It only ARMS the chord; the follow-up key decides (see `chord_key`).
             KeyCode::Char('x') | KeyCode::Char('X') => Action::Chord,
             // Quarter-page preview scroll (readline-style). Acts regardless of
@@ -551,7 +565,8 @@ pub fn handle_event(app: &mut App, event: AppEvent, store: &mut SessionStore) ->
         app.close_compose();
         // A catalog fetch in flight reports on this session's channel, which dies
         // with it (`tui::run_inner` builds a fresh `EventLoop`, and its teardown
-        // drain keeps only `SendFinished`), so its `CatalogFetched` can never land.
+        // drain keeps only `SendFinished` and `MoveFinished`), so its
+        // `CatalogFetched` can never land.
         // A mark left standing would block every later fetch for that folder.
         app.forget_catalog_fetches_in_flight();
     }
@@ -577,14 +592,15 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
             // selection stays highlighted until the user acts.
             app.clear_preview_selection();
             // While a modal overlay (the running-session choice, the new-session
-            // agent picker, or the hard-delete confirm) is open it OWNS the
-            // keyboard: keys navigate/confirm/cancel the modal, never the board.
+            // agent picker, a compose's model picker, the move picker, or the
+            // hard-delete confirm) is open it OWNS the keyboard: keys
+            // navigate/confirm/cancel the modal, never the board.
             if app.modal.is_some() {
                 return handle_modal_key(app, key, store);
             }
             // A pending `Ctrl-X` leader chord OWNS the next key too: route it through
             // the chord machine BEFORE normal handling so a printable follow-up
-            // (`x`/`d`/`h`/`r`/`y`/`f`) completes the chord instead of leaking into
+            // (`x`/`d`/`h`/`r`/`y`/`f`/`w`) completes the chord instead of leaking into
             // the query.
             if app.pending_chord {
                 return handle_chord_key(app, key, store);
@@ -713,6 +729,25 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
             }
             Outcome::Continue
         }
+        AppEvent::MoveFinished {
+            session_id,
+            status,
+            success,
+        } => {
+            // A `Ctrl-X w` move finished off-thread. Clear THIS session's in-flight
+            // move — only it — and reload at once, so the row shows its new folder
+            // (or leaves a current-folder board) without waiting on the watcher's
+            // debounce. The outcome is a keypress-scoped fact: a move is a
+            // transient confirmation, every failure or refusal stays sticky.
+            app.clear_moving(&session_id);
+            reload_board(app, store);
+            if success {
+                app.set_status_transient(status);
+            } else {
+                app.set_status(status);
+            }
+            Outcome::Continue
+        }
         AppEvent::InterruptFinished {
             session_id,
             status,
@@ -808,24 +843,27 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
 /// a live one reaches, so it is handled exactly as if it had arrived on this
 /// board's channel.
 ///
-/// Such a completion is kept in [`App::take_undelivered`]'s queue by the send
-/// thread, or by the teardown drain (see [`crate::send::UndeliveredEvents`]). The
-/// `SendFinished` arm clears only the `App::sending` entry keyed by its own
-/// `session_id`, so a stale completion cannot clear a reply that is not its own.
-/// Its status keeps the live split, transient on success and sticky on failure, and a
-/// finished send on the selected row re-anchors the preview as usual.
+/// Such a completion is kept in [`App::take_undelivered`]'s queue by the send or
+/// move thread, or by the teardown drain (see [`crate::send::UndeliveredEvents`]).
+/// The `SendFinished` arm clears only the `App::sending` entry keyed by its own
+/// `session_id`, and the `MoveFinished` arm only its own `App::moving` entry, so a
+/// stale completion cannot clear one that is not its own. Its status keeps the
+/// live split, transient on success and sticky on failure, and a finished send on
+/// the selected row re-anchors the preview as usual.
 ///
 /// Called on every `Tick` (after `tick_status`) and once at board entry, before
 /// the first draw ([`crate::tui::run`]). The queue is taken with ONE lock-and-take,
 /// and the lock is released before any event is handled, so the render loop never
-/// waits on a send thread. Every event in the queue is a `SendFinished`, and its
-/// arm answers `Continue`, so discarding `dispatch`'s outcome loses nothing and
-/// nothing here can end the board. That holds only because nothing else is ever
-/// queued. Two paths fill the queue, and each admits `SendFinished` alone:
-/// [`crate::send::spawn_send`] is `deliver`'s only non-test caller, and the
-/// teardown drain ([`crate::send::UndeliveredEvents::drain_then_drop`]) discards
-/// every other event. Not every completion answers `Continue` (`CopyFinished`
-/// answers `FinishCopy`), so queueing another kind must revisit this.
+/// waits on a send thread. Every event in the queue is a `SendFinished` or a
+/// `MoveFinished`, and both arms answer `Continue`, so discarding `dispatch`'s
+/// outcome loses nothing and nothing here can end the board. That holds only
+/// because nothing else is ever queued. Two paths fill the queue, and each admits
+/// those two alone: [`crate::send::spawn_send`] and
+/// [`crate::claude_move::spawn_move`] are `deliver`'s only non-test callers, and
+/// the teardown drain ([`crate::send::UndeliveredEvents::drain_then_drop`])
+/// discards every other event. Not every completion answers `Continue`
+/// (`CopyFinished` answers `FinishCopy`), so queueing another kind must revisit
+/// this.
 pub fn replay_undelivered(app: &mut App, store: &mut SessionStore) {
     for event in app.take_undelivered() {
         dispatch(app, event, store);
@@ -833,9 +871,9 @@ pub fn replay_undelivered(app: &mut App, store: &mut SessionStore) {
 }
 
 /// Reload the board from `store` — the ONE seam every reload path funnels
-/// through (the `SessionsChanged` watcher event, the post-delete reload, and the
-/// `Ctrl-X r` forced rescan), the way [`App::apply_reload`] is the one funnel on
-/// the model side.
+/// through (the `SessionsChanged` watcher event, the post-delete reload, the
+/// post-move reload in the `MoveFinished` arm, and the `Ctrl-X r` forced rescan),
+/// the way [`App::apply_reload`] is the one funnel on the model side.
 ///
 /// The reload is INCREMENTAL: the store re-parses only the transcripts whose
 /// `(mtime, len)` moved and hands back which ones those were, so the derived
@@ -970,7 +1008,8 @@ fn flatten_for_query(text: &str) -> String {
 /// not have text land on the surface behind it. All six owners, in order:
 ///
 /// 1. **Modal** ([`handle_modal_key`]) — IGNORED. A modal is a fixed choice
-///    (Attach/Fork/Cancel, the agent picker, the delete confirm); it has no text
+///    (Attach/Fork/Cancel, the agent, model or move picker, the delete confirm);
+///    it has no text
 ///    field, so the only things a paste could do are pick an option the user did not
 ///    choose or leak into the board's query underneath an overlay that hides it.
 /// 2. **`Ctrl-X` leader chord** ([`handle_chord_key`]) — IGNORED, and it does NOT
@@ -1195,8 +1234,8 @@ fn mouse_effect(app: &mut App, mouse: MouseEvent, now: Instant) -> MouseEffect {
         // on release (`click_effect`: fold toggle, else link open). So a single
         // click both toggles a node or opens a link as before and de-highlights
         // any prior selection. `press_starts_selection` owns where a press may
-        // land and when — gated by any overlay, so a press while the
-        // running-session choice or the agent picker owns input records nothing.
+        // land and when — gated by any overlay (`App::preview_pointer_blocked`),
+        // so a press while one owns input records nothing.
         //
         // A SECOND admitted press on the same cell within `DOUBLE_CLICK_INTERVAL`
         // records a WORD selection instead (`is_double_click`); the view expands it
@@ -1625,6 +1664,16 @@ fn apply_action(app: &mut App, action: Action) -> Outcome {
             // * Overlay: the overlay itself draws ~0.26s after Enter — a small,
             //   deliberate hitch, accepted because the alternative is handing the
             //   user claude's refusal instead of the Attach/Fork choice.
+            //
+            // FIRST, before that probe: snapback's own `Ctrl-X w` move of this
+            // row may still be renaming its transcript into another folder, so
+            // neither a resume nor a fork may read it yet (asked of THIS row only).
+            if let Some(id) = app.selected_session().map(|s| s.session_id.clone()) {
+                if app.moving_on(&id) {
+                    app.set_status(claude_move::MOVING_RESUME_REFUSAL.to_string());
+                    return Outcome::Continue;
+                }
+            }
             if !fork {
                 // Clone the id so the `&Session` borrow ends before the probe and
                 // `open_live_choice` touch `app`.
@@ -1902,10 +1951,10 @@ pub fn finish_copy<W: Write>(app: &mut App, w: &mut W, payload: &CopyPayload, co
     }
 }
 
-/// The six keys a pending `Ctrl-X` chord binds, plus cancel — the PURE decision
+/// The seven keys a pending `Ctrl-X` chord binds, plus cancel — the PURE decision
 /// half of the leader chord (PATTERNS §10, keys -> actions -> outcomes). The impure
 /// completion (hide / open confirm / toggle / rescan / copy session ID / fold
-/// toggle) lives in [`handle_chord_key`].
+/// toggle / open the move picker) lives in [`handle_chord_key`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChordOutcome {
     /// `x` — toggle the selected session's hidden state (soft delete / un-hide).
@@ -1924,6 +1973,9 @@ enum ChordOutcome {
     /// row is a folded `(+N)` head, otherwise nothing
     /// ([`App::toggle_selected_lineage`]).
     Fold,
+    /// `w` — open the move-to-worktree picker for the selected session
+    /// ([`App::open_move_picker`]).
+    Move,
     /// `Esc` / `Ctrl-C` / any unbound key — abandon the chord with no side effect.
     Cancel,
 }
@@ -1947,6 +1999,7 @@ fn chord_key(key: KeyEvent) -> ChordOutcome {
         KeyCode::Char('r') | KeyCode::Char('R') => ChordOutcome::Rescan,
         KeyCode::Char('y') | KeyCode::Char('Y') => ChordOutcome::Copy,
         KeyCode::Char('f') | KeyCode::Char('F') => ChordOutcome::Fold,
+        KeyCode::Char('w') | KeyCode::Char('W') => ChordOutcome::Move,
         _ => ChordOutcome::Cancel,
     }
 }
@@ -1959,9 +2012,11 @@ fn chord_key(key: KeyEvent) -> ChordOutcome {
 /// toggles the show-hidden view, `r` forces a full re-read of the store, `y` requests
 /// a clipboard copy of the selected session's full id ([`copy_selected_id`], which
 /// hands the driver an [`Outcome::Copy`]), `f` folds or expands the selected row's
-/// fork lineage, and anything else (`Esc` / `Ctrl-C` / an unbound key) abandons the
-/// chord with no side effect. The pending state is cleared FIRST so an early return
-/// can never wedge the board in the chord. Routed BEFORE `key_to_action` in
+/// fork lineage, `w` opens the move-to-worktree picker ([`App::open_move_picker`];
+/// the move itself runs at its confirm), and anything else (`Esc` / `Ctrl-C` / an
+/// unbound key) abandons the chord with no side effect. The pending state is
+/// cleared FIRST so an early return can never wedge the board in the chord.
+/// Routed BEFORE `key_to_action` in
 /// [`handle_event`], so a printable completion never leaks into the query.
 ///
 /// `r` is the store cache's ESCAPE HATCH, and it is a user-reachable key rather
@@ -1990,6 +2045,7 @@ fn handle_chord_key(app: &mut App, key: KeyEvent, store: &mut SessionStore) -> O
         // leaves here as data (`Outcome::Copy`) rather than as `Continue`.
         ChordOutcome::Copy => return copy_selected_id(app),
         ChordOutcome::Fold => app.toggle_selected_lineage(),
+        ChordOutcome::Move => app.open_move_picker(),
         ChordOutcome::Cancel => {}
     }
     Outcome::Continue
@@ -2057,7 +2113,8 @@ enum ModalNav {
 /// The action-level narrowing lives in [`launch_pick_interactively`] — the layout is
 /// the key map's business, the choice's meaning is the handler's. `Adjust` follows
 /// the same split: the layout binds the arrows, [`App::adjust_modal_effort`] decides
-/// which rows they do anything on, so the agent picker keeps ignoring them.
+/// which rows they do anything on, so the agent and move pickers keep ignoring
+/// them.
 fn modal_key(key: KeyEvent, layout: ModalLayout) -> ModalNav {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
@@ -2130,10 +2187,10 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, store: &mut SessionStore) -> O
 /// The `ModalAction` match is the second of two gates: [`modal_key`] already
 /// restricts the key to the `List` layout, and this restricts it to a choice that
 /// actually names a new session. Any other action — Attach, Fork, Delete,
-/// DeleteLineage, SetModel, Cancel, or an out-of-range highlight — is a NO-OP, so a
-/// `List`-layout modal cannot inherit an interactive start it has no meaning for.
-/// The model picker is exactly such a modal, and it relies on this: `Ctrl-O` there
-/// must not launch anything.
+/// DeleteLineage, SetModel, MoveTo, Cancel, or an out-of-range highlight — is a
+/// NO-OP, so a `List`-layout modal cannot inherit an interactive start it has no
+/// meaning for. The model and move pickers are exactly such modals, and they rely
+/// on this: `Ctrl-O` there must not launch anything.
 ///
 /// The pick is recorded as the last-chosen agent FIRST — BEFORE the gate, so the
 /// next `Ctrl-N` repeats it even across a refusal. This is one of the THREE points
@@ -2180,6 +2237,9 @@ enum Handoff {
 /// zone for the new session's first message, which then chooses `--bg` (`Enter`)
 /// or interactive ([`compose`]'s `Ctrl-O`). The picker's own `Ctrl-O`
 /// ([`launch_pick_interactively`]) is the one-key bypass to an interactive start.
+/// The rest stay on the board: `Delete` / `DeleteLineage` run the hard delete
+/// ([`confirm_delete`]), `SetModel` writes the open compose's pick, and `MoveTo`
+/// starts the headless move ([`start_move`]).
 ///
 /// `New` records NOTHING here. The memory behind `Ctrl-N`'s pre-highlight is "the
 /// agent of the last new session actually STARTED", and a draft can still be
@@ -2229,7 +2289,35 @@ fn confirm_modal(app: &mut App, store: &mut SessionStore) -> Outcome {
             app.set_compose_model(pick);
             Outcome::Continue
         }
+        // The move is NOT a hand-off: nothing blocking runs here (see
+        // `start_move`), and the board stays up.
+        Some(ModalAction::MoveTo(target)) => match modal.session_id.as_deref() {
+            Some(id) => start_move(app, id, target),
+            None => Outcome::Continue,
+        },
     }
+}
+
+/// Start a confirmed `Ctrl-X w` move of `session_id` to `target`: mark the row as
+/// moving ([`App::mark_moving`]) and hand the driver an [`Outcome::Move`].
+///
+/// Nothing blocking runs here. The authoritative re-read, the folder pre-checks,
+/// the liveness probe (claude's bare active list, never the polled map), the
+/// trust read and the `claude` child are all the worker's
+/// ([`crate::claude_move::spawn_move`]), so the board never waits on them
+/// (AGENTS.md OFF-UI-THREAD). snapback's own in-flight writers were refused when
+/// the picker opened ([`App::open_move_picker`]). A row a reload dropped while
+/// the picker sat open moves nothing.
+fn start_move(app: &mut App, session_id: &str, target: PathBuf) -> Outcome {
+    let Some(file) = app.session_by_id(session_id).map(|s| s.file.clone()) else {
+        return Outcome::Continue;
+    };
+    app.mark_moving(session_id);
+    Outcome::Move(MoveRequest {
+        session_id: session_id.to_owned(),
+        file,
+        target,
+    })
 }
 
 /// Execute a confirmed HARD delete of `ids` — one selected session, or every
@@ -2281,11 +2369,14 @@ fn confirm_delete(app: &mut App, ids: &[String], store: &mut SessionStore) -> Ou
     let mut errors: Vec<String> = Vec::new();
 
     for id in ids {
-        // BOTH writers, not just claude's: a quick reply snapback still has in
+        // EVERY writer, not just claude's: a quick reply snapback still has in
         // flight deregisters the job from claude's active list on its way in, so
-        // the probe above cannot see it (see `delete::can_delete_target`).
+        // the probe above cannot see it, and a move in flight is snapback's own
+        // child too (see `delete::can_delete_target`).
         let reply_in_flight = app.sending_to(id).is_some();
-        if let Err(refusal) = delete::can_delete_target(live.get(id), reply_in_flight) {
+        if let Err(refusal) =
+            delete::can_delete_target(live.get(id), reply_in_flight, app.moving_on(id))
+        {
             refusals.push(refusal);
             continue;
         }
@@ -2436,6 +2527,12 @@ fn reply(app: &mut App) -> Outcome {
     // ONE in-flight reply per SESSION, refused before the probe (see above).
     if let Some(refusal) = send::reply_in_flight_refusal(app.sending_to(&id).is_some()) {
         app.set_status(refusal);
+        return Outcome::Continue;
+    }
+    // Nor while snapback's own `Ctrl-X w` move of THIS session is in flight: a
+    // `claude -p -r` would append to the file the move's child is relocating.
+    if app.moving_on(&id) {
+        app.set_status(claude_move::MOVING_REPLY_REFUSAL.to_string());
         return Outcome::Continue;
     }
     match send::reply_gate(app.live_agent_now(&id).as_ref()) {
@@ -2699,6 +2796,7 @@ mod tests {
         NewSessionDraft, PaneLayout, Scope, AUTOSCROLL_FRAME, STATUS_DWELL_TICKS,
     };
     use crate::tui::compose::ComposeTarget;
+    use crate::worktrees::{resolve_dir, WorktreeSet};
 
     /// A store over `root` for a test that drives [`handle_event`]. Most routing
     /// tests never reload at all, so the root is usually a placeholder — where a
@@ -5034,6 +5132,7 @@ mod tests {
         let verdict = delete::can_delete_target(
             live.get(IN_FLIGHT_FIRST),
             app.sending_to(IN_FLIGHT_FIRST).is_some(),
+            app.moving_on(IN_FLIGHT_FIRST),
         );
         let _ = std::fs::remove_dir_all(&dir);
         assert!(
@@ -5147,7 +5246,7 @@ mod tests {
             "b's reply is still running, so a's completion must leave it tracked"
         );
         assert_eq!(
-            delete::can_delete_target(None, app.sending_to("b").is_some()),
+            delete::can_delete_target(None, app.sending_to("b").is_some(), app.moving_on("b")),
             Err(delete::DELETE_SENDING_REFUSAL.to_string()),
             "b's transcript must stay undeletable while its reply lands"
         );
@@ -5346,6 +5445,7 @@ mod tests {
         let verdict_before = delete::can_delete_target(
             live.get(IN_FLIGHT_FIRST),
             app.sending_to(IN_FLIGHT_FIRST).is_some(),
+            app.moving_on(IN_FLIGHT_FIRST),
         );
 
         // 5. The next board's tick, then `Ctrl-R` on the same row.
@@ -10392,7 +10492,8 @@ mod tests {
     /// `BgLaunch` here would close the draft card at the moment of dispatch — which
     /// is precisely the snap-back-to-an-unrelated-transcript the card exists to
     /// prevent. `Signal` is one of them: the driver performs it inline and keeps the
-    /// board up, so it must not end the session either.
+    /// board up, so it must not end the session either. Every no-teardown variant
+    /// is asserted below, `Move` included.
     #[test]
     fn ends_board_session_is_true_for_the_teardown_outcomes_only() {
         let ready = resume::Ready {
@@ -10422,6 +10523,14 @@ mod tests {
             argv: vec!["claude".to_string()],
             cwd: PathBuf::from("/tmp"),
             session_id: "s".to_string(),
+        })
+        .ends_board_session());
+        // The `Ctrl-X w` move runs on its own worker and reports back on the SAME
+        // channel, so it must not end the session either.
+        assert!(!Outcome::Move(MoveRequest {
+            session_id: "s".to_string(),
+            file: PathBuf::from("/tmp/s.jsonl"),
+            target: PathBuf::from("/tmp/wt"),
         })
         .ends_board_session());
         // The clipboard copy's request and its completion both keep the board up,
@@ -10873,6 +10982,7 @@ mod tests {
         assert_eq!(chord_key(key(KeyCode::Char('r'))), ChordOutcome::Rescan);
         assert_eq!(chord_key(key(KeyCode::Char('y'))), ChordOutcome::Copy);
         assert_eq!(chord_key(key(KeyCode::Char('f'))), ChordOutcome::Fold);
+        assert_eq!(chord_key(key(KeyCode::Char('w'))), ChordOutcome::Move);
         assert_eq!(
             chord_key(key(KeyCode::Char('F'))),
             ChordOutcome::Fold,
@@ -12450,6 +12560,286 @@ mod tests {
         assert!(app.query().is_empty(), "`m` must not leak into the query");
     }
 
+    /// A board whose one session lives in `main`, over a seeded project of `main`
+    /// plus `wt`. Returns the app and the two canonical folders (main, wt); the one session is
+    /// `sb-move-1`.
+    fn move_board(tag: &str, in_worktree: bool) -> (App, PathBuf, PathBuf) {
+        let main = resolve_dir(&unique_temp_dir(&format!("{tag}-main")));
+        let wt = resolve_dir(&unique_temp_dir(&format!("{tag}-wt")));
+        let home = if in_worktree { &wt } else { &main };
+        let sess = resumable_session(home, "sb-move-1");
+        let mut app = App::new(vec![sess.clone()], Scope::Project, main.clone());
+        let set = WorktreeSet::from_resolved([main.clone(), wt.clone()], None);
+        app.set_worktree_probe(move |_| set.clone());
+        app.apply_sessions(vec![sess]);
+        seed_live(&mut app, &[]);
+        assert_eq!(app.selected.as_deref(), Some("sb-move-1"));
+        (app, main, wt)
+    }
+
+    fn move_choices(app: &App) -> Vec<PathBuf> {
+        app.modal
+            .as_ref()
+            .expect("the move picker is open")
+            .choices
+            .iter()
+            .map(|c| match &c.action {
+                ModalAction::MoveTo(p) => p.clone(),
+                other => panic!("unexpected action {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ctrl_x_w_opens_the_move_picker_without_the_current_folder() {
+        let mut store = store_at(Path::new("/tmp"));
+        let (mut app, main, wt) = move_board("mv-open-main", false);
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('w')), &mut store);
+        assert_eq!(move_choices(&app), vec![wt.clone()]);
+        assert!(app.query().is_empty(), "`w` must not leak into the query");
+
+        let (mut app, main2, _wt2) = move_board("mv-open-wt", true);
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('w')), &mut store);
+        assert_eq!(move_choices(&app), vec![main2], "main is offered first");
+        let _ = (main, wt);
+    }
+
+    #[test]
+    fn ctrl_x_w_refuses_a_session_outside_the_project_and_a_project_with_no_target() {
+        let mut store = store_at(Path::new("/tmp"));
+        let (mut app, main, _wt) = move_board("mv-outside", false);
+        app.worktrees = WorktreeSet::empty();
+        app.launch_dir = resolve_dir(&unique_temp_dir("mv-outside-launch"));
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('w')), &mut store);
+        assert!(app.modal.is_none());
+        assert_eq!(
+            app.status.as_deref(),
+            Some(crate::tui::app::MOVE_OUTSIDE_PROJECT)
+        );
+
+        let (mut app, main2, _) = move_board("mv-none", false);
+        app.worktrees = WorktreeSet::from_resolved([main2], None);
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('w')), &mut store);
+        assert!(app.modal.is_none());
+        assert_eq!(app.status.as_deref(), Some(crate::tui::app::MOVE_NO_TARGET));
+
+        // An UNRESOLVED worktree list is not "no other worktree": its own wording.
+        let (mut app, _, _) = move_board("mv-unknown", false);
+        app.worktrees = WorktreeSet::empty();
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('w')), &mut store);
+        assert!(app.modal.is_none());
+        assert_eq!(
+            app.status.as_deref(),
+            Some(crate::tui::app::MOVE_WORKTREES_UNKNOWN)
+        );
+        let _ = main;
+    }
+
+    /// Confirming the picker starts the move WITHOUT a hand-off and without a
+    /// single blocking step on the key path: the probe is armed to panic, so any
+    /// liveness question asked here fails the test. The request carries the row's
+    /// id, its transcript (for the worker's authoritative re-read) and the chosen
+    /// folder; the row is marked moving; the board stays up; the status line is
+    /// left alone (the in-flight fact is the row's badge, not a status).
+    #[test]
+    fn confirming_a_move_starts_the_worker_and_marks_the_row_moving() {
+        let mut store = store_at(Path::new("/tmp"));
+        let (mut app, main, wt) = move_board("mv-go", false);
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('w')), &mut store);
+        app.set_live_probe(|| panic!("the key path must not probe: the worker does"));
+        let out = feed(&mut app, key(KeyCode::Enter), &mut store);
+        assert!(!out.ends_board_session(), "the board stays up");
+        match out {
+            Outcome::Move(req) => {
+                assert_eq!(
+                    req,
+                    MoveRequest {
+                        session_id: "sb-move-1".to_string(),
+                        file: main.join("sb-move-1.jsonl"),
+                        target: wt,
+                    }
+                );
+            }
+            _ => panic!("expected the move worker's request"),
+        }
+        assert!(app.moving_on("sb-move-1"));
+        assert!(app.modal.is_none(), "the picker closed");
+        assert_eq!(app.status, None, "an in-flight move is not a status");
+    }
+
+    /// `Ctrl-X w` refuses, with no picker, a row whose quick reply or whose own
+    /// move snapback still has in flight — each in its own words.
+    #[test]
+    fn ctrl_x_w_refuses_a_row_whose_reply_or_move_is_in_flight() {
+        let mut store = store_at(Path::new("/tmp"));
+        let (mut app, _main, _wt) = move_board("mv-sending", false);
+        app.sending = vec![crate::tui::app::Sending {
+            session_id: "sb-move-1".to_string(),
+            message: "still landing".to_string(),
+            baseline_msg_count: 0,
+        }];
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('w')), &mut store);
+        assert!(
+            app.modal.is_none(),
+            "no picker opens for a move that could not start"
+        );
+        assert_eq!(
+            app.status.as_deref(),
+            Some(claude_move::MOVE_SENDING_REFUSAL)
+        );
+
+        let (mut app, _main, _wt) = move_board("mv-again", false);
+        app.mark_moving("sb-move-1");
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('w')), &mut store);
+        assert!(app.modal.is_none());
+        assert_eq!(
+            app.status.as_deref(),
+            Some(claude_move::MOVE_IN_FLIGHT_REFUSAL)
+        );
+        assert!(app.query().is_empty(), "`w` must not leak into the query");
+    }
+
+    /// While a row's move is in flight, `Enter`, `Ctrl-F` and `Ctrl-R` on THAT row
+    /// refuse in their own words, before any probe (it is armed to panic), and
+    /// hand off or open nothing.
+    #[test]
+    fn a_moving_row_refuses_resume_fork_and_reply() {
+        let mut store = store_at(Path::new("/tmp"));
+        let (mut app, _main, _wt) = move_board("mv-busy", false);
+        app.mark_moving("sb-move-1");
+        app.set_live_probe(|| panic!("a moving row is refused before any probe"));
+
+        for (press, refusal) in [
+            (key(KeyCode::Enter), claude_move::MOVING_RESUME_REFUSAL),
+            (ctrl(KeyCode::Char('f')), claude_move::MOVING_RESUME_REFUSAL),
+            (ctrl(KeyCode::Char('r')), claude_move::MOVING_REPLY_REFUSAL),
+        ] {
+            let out = feed(&mut app, press, &mut store);
+            assert!(matches!(out, Outcome::Continue), "{press:?}");
+            assert_eq!(app.status.as_deref(), Some(refusal), "{press:?}");
+            assert!(app.modal.is_none(), "{press:?}");
+            assert!(!app.is_composing(), "{press:?} opened no compose");
+        }
+        assert_ne!(
+            claude_move::MOVING_RESUME_REFUSAL,
+            claude_move::MOVING_REPLY_REFUSAL
+        );
+    }
+
+    /// The refusal is about THIS row only: a move in flight elsewhere leaves
+    /// `Enter` on this row to resume as usual.
+    #[test]
+    fn a_move_in_flight_elsewhere_refuses_nothing_here() {
+        let mut store = store_at(Path::new("/tmp"));
+        let (mut app, main, _wt) = move_board("mv-elsewhere", false);
+        app.mark_moving("some-other-row");
+        match feed(&mut app, key(KeyCode::Enter), &mut store) {
+            Outcome::Resume(ready) => assert_eq!(ready.cwd, main),
+            _ => panic!("a move on another row must not refuse this one"),
+        }
+    }
+
+    /// The move's completion clears ITS row's in-flight entry alone, reloads the
+    /// board at once (the moved transcript under its new folder shows up without
+    /// the watcher), and reports: a move is a transient confirmation, anything
+    /// else sticks until the next key.
+    #[test]
+    fn move_finished_clears_its_row_reloads_the_board_and_reports() {
+        let root = unique_temp_dir("move-finished-store");
+        let proj = root.join("-tmp-proj");
+        std::fs::create_dir_all(&proj).expect("create the encoded-cwd dir");
+        write_store_session(&proj, "mv-a", "2026-07-14T10:00:00.000Z");
+        let mut store = store_at(&root);
+        let mut app = App::new(
+            store.reload().sessions,
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.mark_moving("mv-a");
+        app.mark_moving("mv-b");
+        // A transcript the board has not loaded yet, as a move leaves one.
+        let landed = root.join("-tmp-proj--wt");
+        std::fs::create_dir_all(&landed).expect("create the target's dir");
+        write_store_session(&landed, "mv-landed", "2026-07-14T11:00:00.000Z");
+        assert!(app.session_by_id("mv-landed").is_none());
+
+        handle_event(
+            &mut app,
+            AppEvent::MoveFinished {
+                session_id: "mv-a".to_string(),
+                status: "moved to /tmp/proj/wt".to_string(),
+                success: true,
+            },
+            &mut store,
+        );
+        assert!(!app.moving_on("mv-a"), "its own entry clears");
+        assert!(app.moving_on("mv-b"), "another row's move keeps its entry");
+        assert!(
+            app.session_by_id("mv-landed").is_some(),
+            "the completion reloads the board"
+        );
+        assert_eq!(app.status.as_deref(), Some("moved to /tmp/proj/wt"));
+        assert_eq!(app.status_ttl, Some(STATUS_DWELL_TICKS), "transient");
+
+        handle_event(
+            &mut app,
+            AppEvent::MoveFinished {
+                session_id: "mv-b".to_string(),
+                status: claude_move::MOVE_LIVE_REFUSAL.to_string(),
+                success: false,
+            },
+            &mut store,
+        );
+        assert!(!app.moving_on("mv-b"));
+        assert_eq!(app.status.as_deref(), Some(claude_move::MOVE_LIVE_REFUSAL));
+        assert_eq!(app.status_ttl, None, "a refusal is sticky");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A move that finished while no board was reading (a hand-off on another
+    /// row) is replayed on the next `Tick`, so its row does not stay `moving…`
+    /// and refused for the rest of the run.
+    #[test]
+    fn a_queued_move_finished_is_replayed_on_the_next_tick() {
+        let mut store = store_at(Path::new("/tmp"));
+        let (mut app, _main, _wt) = move_board("mv-replay", false);
+        app.mark_moving("sb-move-1");
+        let (dead_tx, dead_rx) = std::sync::mpsc::channel();
+        drop(dead_rx);
+        app.undelivered_handle().deliver(
+            &dead_tx,
+            AppEvent::MoveFinished {
+                session_id: "sb-move-1".to_string(),
+                status: "moved to /x".to_string(),
+                success: true,
+            },
+        );
+        handle_event(&mut app, AppEvent::Tick, &mut store);
+        assert!(!app.moving_on("sb-move-1"));
+        assert_eq!(app.status.as_deref(), Some("moved to /x"));
+    }
+
+    #[test]
+    fn ctrl_o_and_arrows_are_inert_on_the_move_picker() {
+        let mut store = store_at(Path::new("/tmp"));
+        let (mut app, _main, wt) = move_board("mv-inert", false);
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('w')), &mut store);
+        let out = feed(&mut app, ctrl(KeyCode::Char('o')), &mut store);
+        assert!(matches!(out, Outcome::Continue));
+        feed(&mut app, key(KeyCode::Right), &mut store);
+        feed(&mut app, key(KeyCode::Left), &mut store);
+        assert_eq!(move_choices(&app), vec![wt], "picker unchanged and open");
+    }
+
     /// The whole per-compose pick, end to end through `handle_event`: `Ctrl-L` in a
     /// REPLY opens the picker over it, `Enter` on a model row writes that model into
     /// THIS compose — text untouched — and the next compose starts on its default
@@ -12899,6 +13289,47 @@ mod tests {
             app.status.as_deref(),
             Some(crate::delete::DELETE_SENDING_REFUSAL),
             "the send refusal names snapback's own writer, not a claude window"
+        );
+
+        std::env::remove_var("CLAUDE_PROJECTS_DIR");
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+    }
+
+    /// A `Ctrl-X w` move STILL IN FLIGHT blocks the hard delete too, in its own
+    /// words, with claude reporting nothing: the move's `claude` child is
+    /// snapback's own writer, renaming the very file the delete would unlink.
+    #[test]
+    fn ctrl_x_d_confirm_while_a_move_is_in_flight_is_refused_and_removes_nothing() {
+        let _guard = crate::config::env_lock();
+        let root = unique_temp_dir("delete-moving-store");
+        let state = unique_temp_dir("delete-moving-state");
+        std::env::set_var("CLAUDE_PROJECTS_DIR", &root);
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &state);
+
+        let proj = root.join("-tmp-proj");
+        std::fs::create_dir_all(&proj).expect("create the encoded-cwd dir");
+        write_store_session(&proj, "sbmove-1", "2026-07-14T10:00:00.000Z");
+        let mut store = store_at(&root);
+        let mut app = App::new(
+            store.reload().sessions,
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        seed_live(&mut app, &[]);
+        app.mark_moving("sbmove-1");
+        let file = proj.join("sbmove-1.jsonl");
+
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('d')), &mut store);
+        feed(&mut app, key(KeyCode::Left), &mut store); // -> Delete this
+        let out = feed(&mut app, key(KeyCode::Enter), &mut store);
+        assert!(matches!(out, Outcome::Continue));
+
+        assert!(file.is_file(), "a transcript being moved is NOT unlinked");
+        assert!(app.session_by_id("sbmove-1").is_some());
+        assert_eq!(
+            app.status.as_deref(),
+            Some(crate::delete::DELETE_MOVING_REFUSAL)
         );
 
         std::env::remove_var("CLAUDE_PROJECTS_DIR");

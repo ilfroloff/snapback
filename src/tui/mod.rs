@@ -501,8 +501,8 @@ pub fn run(app: &mut App, store: &mut SessionStore) -> Result<Outcome> {
 /// end) also joins the input reader before [`run`] returns (see [`EventLoop`]'s
 /// `Drop`), so the reader has released stdin before `main` spawns `claude`.
 ///
-/// A quick reply's completion can outlive the board session that dispatched it,
-/// so this function brackets each session with the app's undelivered queue
+/// A quick reply's or a move's completion can outlive the board session that
+/// dispatched it, so this function brackets each session with the app's undelivered queue
 /// ([`crate::send::UndeliveredEvents`]): it replays what an earlier session could
 /// not read before the first draw, and on the way out it moves any completion
 /// this session's channel accepted but never read into that queue.
@@ -554,9 +554,10 @@ fn run_inner(
     // session because `lib::run` re-enters the board on the SAME `App`, while the
     // channel above dies with this function.
     let undelivered = app.undelivered_handle();
-    // A reply that finished while no board was up (the hand-off's `claude` child
-    // was running) is already queued: settle it before the first draw, so this
-    // board never paints a `cooking…` tail for a reply that has already landed.
+    // A reply or move that finished while no board was up (the hand-off's
+    // `claude` child was running) is already queued: settle it before the first
+    // draw, so this board never paints a `cooking…` tail or a `moving…` badge for
+    // one that has already landed.
     // Anything queued later is picked up by the next `Tick`.
     update::replay_undelivered(app, store);
 
@@ -579,6 +580,15 @@ fn run_inner(
                 // `undelivered` instead, for the next one.
                 Outcome::Send(req) => {
                     crate::send::spawn_send(req, events.sender(), undelivered.clone());
+                }
+                // A confirmed `Ctrl-X w` move: its worker re-reads the transcript,
+                // probes liveness, reads claude's trust and runs the headless
+                // `claude` child, all on its own thread, and KEEPS drawing here,
+                // exactly like `Outcome::Send`. It reports back via
+                // `AppEvent::MoveFinished` on this channel, or through
+                // `undelivered` once this board session has ended.
+                Outcome::Move(req) => {
+                    crate::claude_move::spawn_move(req, events.sender(), undelivered.clone());
                 }
                 // A confirmed interrupt: fire `claude stop` on a detached thread and
                 // KEEP drawing, exactly like `Outcome::Send`. The stop reports back
@@ -656,9 +666,10 @@ fn run_inner(
     };
 
     // The board session is over, but its channel may still hold a quick reply's
-    // `SendFinished` that arrived after the key that ended it. Dropping `events`
-    // would throw that away, and the reply's `App::sending` entry, which only that
-    // event clears, would then stay set into every later board session. So the
+    // `SendFinished` (or a move's `MoveFinished`) that arrived after the key that
+    // ended it. Dropping `events` would throw that away, and the reply's
+    // `App::sending` entry (the move's `App::moving` one), which only that event
+    // clears, would then stay set into every later board session. So the
     // receiver is emptied into the queue and dropped under the queue's lock (the
     // input-reader join included), and a reply finishing at the same moment either
     // lands before the drain or finds the receiver gone. Either way it is queued for the next

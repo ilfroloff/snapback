@@ -16,14 +16,23 @@ The JSONL format is external and undocumented, so treat every read as hostile:
   (`agents::parse_agents_json`, shared by the `--all` board poll and the bare
   liveness probe): a missing binary, non-zero exit, non-JSON, or a non-array top
   level all collapse to an **empty set**, never a panic. There is exactly one
-  place the wire shape is interpreted per source.
+  place the wire shape is interpreted per source. The `Ctrl-X w` move's reading
+  of the bare probe, `agents::try_live_agents`, sees those same four as `None`
+  instead, through the same parser, so it can tell them from an empty list.
 - **Fail-soft has a DIRECTION, and it is chosen per consumer.** The display
   classifier fails toward *active* (drift must not hide a busy session);
   `agents::live_agents` fails toward *not live* (empty ⇒ plain resume ⇒
   claude's own check backstops it). Opposite, and both correct — a classifier
   facing an unknown bucket should assume the worst, whereas a membership test has
-  no bucket to be unsure about and an authority one step downstream. State the
-  direction and its reason whenever you add a fail-soft path.
+  no bucket to be unsure about and an authority one step downstream. The
+  `Ctrl-X w` move alone fails toward *refusing* (`None` ⇒
+  `claude_move::MOVE_PROBE_FAILED_REFUSAL`, decided by the pure
+  `claude_move::liveness_refusal`): it renames a transcript, and no claude check
+  one step downstream of its `set_cwd` is verified to stop that under a live
+  writer ([DOMAIN.md](DOMAIN.md#why-the-gate-does-not-read-the---all-map)). A
+  consumer without that downstream authority does not inherit the "not live"
+  direction just because it asks the same probe. State the direction and its
+  reason whenever you add a fail-soft path.
 - **A fail-soft answer may COLLAPSE premises — then say only what you observed.**
   `live_agents`' empty map means "finished" and "could not ask" alike, so the
   Attach refusal (`resume::ATTACH_NOT_LIVE`) is worded for the report ("claude no
@@ -57,6 +66,15 @@ The JSONL format is external and undocumented, so treat every read as hostile:
   [DOMAIN.md](DOMAIN.md#compose-pick-list)'s), and an unreadable transcript is an
   empty list. Descriptions from both pass `store::skills::normalize_description`,
   so no control character or raw escape reaches a cell.
+- claude's `set_cwd` reply, the `Ctrl-X w` move's one answer
+  (`claude_move::parse_set_cwd_response`), is the same again: each stdout line is
+  read as a `Value`, and noise, a malformed line or a reply to another
+  `request_id` is skipped, never a verdict. The direction is toward NOT MOVED: a
+  move counts only on `status == "ok"` AND `changed` being the JSON boolean
+  `true`, an `ok` without it is `MoveOutcome::Unchanged`, an unknown body a
+  protocol error, and a child that closes its output without answering
+  `MoveOutcome::NoAnswer` — each a sticky failure, never a success. Every string
+  from the answer passes `send::sanitize_status` before the status line.
 - claude's workspace-trust record (`claude_trust`, which file and which rule is
   [CLAUDE_CLI.md](CLAUDE_CLI.md#workspace-trust-what-an-untrusted-folder-can-run-and-the-two-argv-forms)'s)
   is read as a `Value` too, and its direction is UNTRUSTED: every input it cannot
@@ -102,7 +120,8 @@ it. Follow this split when adding behavior:
   pick is passed IN as a parameter by the reply, the draft's `--bg` launch and its
   `Ctrl-O` run, and the builders the A MODEL IS PICKED PER COMPOSE, NEVER PER
   BOARD rule in [AGENTS.md](../../AGENTS.md#critical-rules) keeps it from —
-  `build_argv` (Resume, Fork) and `build_attach_argv` — simply take no pick, so
+  `build_argv` (Resume, Fork), `build_attach_argv` and the move's
+  `claude_move::build_set_cwd_argv` — simply take no pick, so
   that guarantee is a signature rather than a branch a test has to catch; every
   decision in `send` — `reply_gate` /
   `interrupt_gate` (the whole routing tree, asserted with no process spawned),
@@ -123,6 +142,12 @@ it. Follow this split when adding behavior:
   — each split out so the guard in front of `kill(2)` is asserted without ever
   calling it; `tui::update::show_signal_result`, which takes that syscall's result
   as a parameter, so what the status line does after it is tested with no signal;
+  `claude_move`'s `build_set_cwd_argv` / `set_cwd_request_line` /
+  `parse_set_cwd_response` (fail-soft over `Value`, a move only on `ok` AND
+  `changed: true`) / `status_for_move` / `liveness_refusal` (the probe verdict,
+  a probe that could not answer refusing), so the `Ctrl-X w` move's argv,
+  request, answer, liveness verdict and status are asserted with no `claude`
+  spawned;
   `agents::elapsed_phrase` and `watch::epoch_ms`, which take their instants as
   parameters so no test reads a clock;
   `compose::compose_key_to_action`; `defined_agents::select_agents` /
@@ -134,7 +159,8 @@ it. Follow this split when adding behavior:
   builders (`agents_argv` /
   `live_agents_argv`) and `agents_from_output` (the shell-out's
   non-zero-exit-means-no-signal decision, split from the spawn so it is testable
-  without one); `model_aliases::parse_model_aliases`, split from its read for the
+  without one) with its strict sibling `agents_reading` (the same decision with
+  "no signal" kept as `None`, which `try_live_agents` hands the move); `model_aliases::parse_model_aliases`, split from its read for the
   same reason and to sharper effect — it is the SINGLE interpreter of the `--model`
   alias array's byte format, so it is pinned against byte windows captured from
   two real `claude` binaries — the oldest and the current capture, a cap its test
@@ -192,7 +218,7 @@ it. Follow this split when adding behavior:
   `preview_split` /
   `centered_rect` / `modal_list_window` (a `List` modal's scroll window — the same
   keep-the-offset-until-the-selection-leaves-it rule ratatui's `ListState` gives the
-  board list, so the two pickers scroll rather than losing their tail off a short
+  board list, so the pickers scroll rather than losing their tail off a short
   terminal, and total over a viewport of 0 or 1) / `highlight_runs` and its STYLED sibling
   `highlight_matched_spans` (the same char-safe run split, but over a line that
   arrives ALREADY styled — it splits the line's own spans at the matched
@@ -238,10 +264,11 @@ it. Follow this split when adding behavior:
   delegating to the pure `global_config_path`, `trust_keys` and `is_trusted`
   through `folder_trust_in`, which tests drive with a temp record) and
   `claude_catalog::kill_group` (the crate's other syscall, `killpg(2)` with
-  SIGKILL on a timed-out fetch's own child group, reached in tests only through
-  stand-in children, `sh` and one `perl` leader: see
-  [Testing patterns](#testing-patterns)). Keep these small and delegate to tested
-  helpers.
+  SIGKILL on a timed-out catalog fetch's or `Ctrl-X w` move's own child group,
+  reached in tests only through stand-in children, `sh` and one `perl` leader: see
+  [Testing patterns](#testing-patterns)) and `claude_move::check_target` (the
+  move's folder pre-checks, an `is_dir` and one `resolve_dir`, so only its worker
+  calls it). Keep these small and delegate to tested helpers.
 
 The terminal-up **refusal gate** is an instance of this: `resume::check` (and its
 sibling `resume::check_new` for starting a fresh session in the launch dir) runs
@@ -375,7 +402,9 @@ TUI state that must persist across an autorefresh reload is keyed by **stable
 preserved and only clamped). On reload, restore the selection by locating the id
 in the new filtered list; if it vanished, clamp the previous position to the
 nearest surviving row. Path canonicalization (the scope predicate) runs only on
-reload / scope-toggle (`recompute_scope`), never per keystroke.
+reload / scope-toggle (`recompute_scope`), never per keystroke over the board; the
+one keystroke that asks it, `App::open_move_picker`, asks it of the ONE selected
+session (see [§6](#6-off-ui-thread-for-anything-that-can-block)).
 
 **The offset lives on the model; only the RENDER knows the viewport, so the render
 resolves it and writes it back.** One rule, three instances — a fourth copies it
@@ -385,8 +414,9 @@ from `App::scroll` and stores `state.offset()` back; `render_preview` clamps
 `render_modal` resolves `Modal::scroll` through the pure `modal_list_window`
 against the box `centered_rect` actually granted. The modal's window follows the
 SELECTION for the same reason the list's does — a `List` modal grows with data (one
-row per defined agent, one per model alias) while `centered_rect` clamps its
-height, so without a window the tail was simply not drawn: later rows were
+row per defined agent, one per model alias, one per worktree) while
+`centered_rect` clamps its height, so without a window the tail was simply not
+drawn: later rows were
 UNREACHABLE rather than scrolled. Its two spacer rows carry the `↑ N more` /
 `↓ N more` affordance, so disclosing the off-window rows costs the box no height.
 
@@ -800,8 +830,17 @@ the board keeps drawing while the child runs. The pure send DECISION is returned
 `Outcome::Send` and the spawn happens in the `run` driver, keeping the effect out of
 the pure event handler. `send::spawn_interrupt` and `send::spawn_bg_launch` are the
 same shape for `claude stop` and `claude --bg`; a new one-shot child belongs here
-rather than behind a teardown whenever it needs no TTY. A single NON-blocking
-syscall is not this shape and gets no thread: `Ctrl-K`'s SIGTERM
+rather than behind a teardown whenever it needs no TTY. That is the DRIVE `claude`
+HEADLESSLY rule in [AGENTS.md](../../AGENTS.md#critical-rules) seen from the
+thread side, and this is why it holds: a teardown hands the terminal to `claude`
+and leaves the user inside it until they exit. That is the point when entering the
+session IS the action, and a cost with no return when the user only wants an
+operation DONE: they must leave a claude they never meant to open, every such exit
+is one more child return the terminal reset has to absorb, and the board goes dark
+for work that needs none of it. A headless child reports into the surfaces the
+board already reads: the transcript on disk, one `AppEvent`, one status.
+
+A single NON-blocking syscall is not this shape and gets no thread: `Ctrl-K`'s SIGTERM
 (`Outcome::Signal`) runs inline in the driver, because this rule governs blocking
 work and `kill(2)` returns as soon as the signal is queued. That satisfies the
 rule rather than waiving it.
@@ -813,7 +852,7 @@ drag (or a double-click's word) returns `Outcome::Copy(CopyPayload::Selection(te
 and the driver (`run_inner` → `start_copy`) reads the
 environment at that edge, picks the route (`tui::clipboard::clipboard_route`),
 and, when the route has a tool, starts `clipboard::spawn_tool_copy`: a detached
-worker thread per copy, like `Send`/`Interrupt`/`BgLaunch`. The worker pipes the payload's text into each candidate tool's
+worker thread per copy, like `Send`/`Move`/`Interrupt`/`BgLaunch`. The worker pipes the payload's text into each candidate tool's
 STDIN, with stdout and stderr `Stdio::null()` as `resume::open_url` nulls its
 opener's, so a tool can neither paint over the board nor hold open a pipe
 anything waits on. Exit 0 means copied and ends the walk; a missing tool, a
@@ -882,6 +921,25 @@ neither kill reaches it, so only its reader thread outlives the fetch, ending wi
 that writer, and the worker still delivers its event. Nothing waits on
 the event, and it carries no shutdown flag for the alias probe's reason: it sends
 once and returns.
+
+`claude_move::spawn_move` is the eighth, and the first to run the bare LIVENESS
+PROBE on a worker. A confirmed `Ctrl-X w` returns `Outcome::Move(MoveRequest)`,
+carrying only what the board already held (the row's id, its transcript, the
+chosen folder), and the driver starts the worker the way it starts `Send`.
+Everything that blocks is the worker's: the authoritative re-read
+(`resume::plan_at`), the folder pre-checks (`check_target`),
+`agents::try_live_agents`, the trust read and the child. The child runs through the
+catalog's own `claude_catalog::exchange_reaped` (the same pipes, group kill,
+direct kill, reap and reader join, under `MOVE_TIMEOUT`) with the move's request
+and reply parser. So the move's probe is this ORDINARY case, not the hand-off
+exception below: the key handler never probes
+(`confirming_a_move_starts_the_worker_and_marks_the_row_moving` arms the probe to
+panic), and hoisting the probe or the trust read onto the spawning thread is what
+`children::the_probe_and_the_trust_read_run_on_the_move_worker` pins. It delivers
+its one `AppEvent::MoveFinished` through `send::UndeliveredEvents::deliver`, as
+`spawn_send` does and for the same reason: that event alone clears the session's
+`App::moving` entry, which keeps the row's own keys off a transcript the child may
+still be renaming, so a hand-off on another row must not lose it.
 
 The rule is about the **poll cadence**, not about the word "shell-out". A
 ONE-SHOT at hand-off is a different thing and is allowed — `agents::live_agents`
@@ -968,7 +1026,14 @@ down `fetch_in` takes the same three and `fetch_with` the argv, the child's
 environment, the request and the timeout, so the suite states a trust record, and
 drives the pipe, the child's environment, the group kill, the direct kill, the
 reap and the reader join with stand-in children (`sh`, and one `perl` leader:
-[Testing patterns](#testing-patterns)), and never spawns `claude`. Nothing else
+[Testing patterns](#testing-patterns)), and never spawns `claude`.
+`claude_move::spawn_move_with` takes its `run` the same way, and `spawn_move_in`
+builds that `run` from an `is_live`, a `trust_of`, a program and a timeout, all
+four named exactly once, in `spawn_move` (`agents::try_live_agents`,
+`claude_trust::folder_trust`, `claude`, `MOVE_TIMEOUT`), so the suite drives a
+move with a stated liveness answer (a probe that could not answer included), a
+stated trust record and a stand-in child.
+Nothing else
 may pass anything else: the seam exists so a test can state a poll's answer without spawning `claude`, state
 an input event without a TTY, state an alias set without walking a 290 MB
 binary, and state the settings' answers without reading the machine's real
@@ -984,8 +1049,9 @@ assert the error path and call that coverage. It carries no decision of its own
 (a `poll` + `read` pair where either half's `Err` propagates unchanged), and
 everything downstream of it is pinned through the seam. The `run_inner` lines that
 START these threads (`spawn_agents_poller`, `spawn_model_alias_probe`,
-`spawn_settings_model_probe`, and the `claude_catalog::spawn_fetch` call behind
-`compose::take_catalog_fetch`) are
+`spawn_settings_model_probe`, the `claude_catalog::spawn_fetch` call behind
+`compose::take_catalog_fetch`, and the `claude_move::spawn_move` call behind
+`Outcome::Move`) are
 accepted the same way and for the same reason: `run_inner` needs a real terminal,
 so there is nothing to assert them from, while the thread's shape is pinned
 through the seam and the event's effect through `update::dispatch` — the gap is
@@ -1005,6 +1071,12 @@ folder walk (`complete::list_tree`, once per resolved folder, capped by
 since every read is keyed to a token a key handler already resolved — and NEVER
 from the render path, which only reads the cached `visible` list. claude's own
 list is not one of them: it is the event-delivering fetch above.
+
+`Ctrl-X w`'s picker adds one more, smaller still: `App::open_move_picker`
+canonicalizes the ONE selected session's folder (`in_scope` and one
+`resolve_dir`), a bounded one-shot on that keypress like `resume::check`'s
+existence check, against the CACHED worktree set, never a fresh `git` call. The
+move itself is the worker above, never this keypress.
 
 ## 7. Restrained, terminal-safe styling
 
@@ -1176,6 +1248,7 @@ CADENCES and LIMITS, so a retune knows what it is next to:
 | `store::preview` | `MODEL_VERSION_MAX_DIGITS` (2) · `MODEL_DATE_DIGITS` (8 — kept above the version cap so a date never reads as a version) · `TABLE_MIN_COL_WIDTH` (10) · `RECORD_RULE_WIDTH` (32) · `COLUMN_RULE_WIDTH` (3) · `ELLIPSIS_WIDTH` (1) · `PEER_STEM_LEN` (17 — the agent-stem length a peer sender must match before it renders as an `@handle`, so a socket path or an agent TYPE name falls back to the generic label) · `PEER_HEADER_BLOCK_ROW` (1 — not a knob but a SHAPE: every fold node's header index — peer and injected alike — inside its own `[blank, header, body…]` block, named so the fold region and the body links rebase off one number) |
 | `send` | `SEND_ERROR_MAX` (200) |
 | `claude_catalog` | `CATALOG_FETCH_TIMEOUT` (10 s — bounds the reply, the close of stdout AND the exit; the reply measured 0.21–0.22 s) · `CATALOG_READER_GRACE` (500 ms — how long a timed-out fetch waits, after the group and child kills, for its stdout reader to see EOF; the worker's worst case is the timeout plus this) · `CATALOG_EXIT_POLL` (20 ms — claude exits 25–50 ms after its stdin's EOF) |
+| `claude_move` | `MOVE_TIMEOUT` (30 s — the answer, the close of stdout AND the exit together; a move measured ~0.7 s end to end on a small transcript at claude 2.1.291, and `-r` loads the whole transcript first, so the cap only ever cuts off a stuck child) |
 | `claude_trust` | `GIT_POINTER_MAX_BYTES` (8192 — a git pointer file holds one path line, and a path is at most `PATH_MAX`, so a longer file is not a pointer and gets the untrusted-direction fallback rather than a whole read) |
 | `tui::complete` | `COMPLETION_MAX_DIR_ENTRIES` (2000 — one keystroke's worst read of a huge folder) · `COMPLETION_MAX_TREE_ENTRIES` (25000 — the whole `@` walk, breadth first, no depth cap: a depth cap hid a 9-level monorepo path) · `COMPLETION_VISIBLE_ROWS` (8) |
 | `tui::app` | `PREVIEW_WHEEL_STEP` (2) · `LIST_WHEEL_STEP` (1) · `STATUS_DWELL_TICKS` (16) · `MIN_PANE_WIDTH` (15) · the list's share of the body per split `PaneLayout` stop: `PREVIEW_WIDE_LIST_PERCENT` (25) / `DEFAULT_LIST_PERCENT` (48) / `LIST_WIDE_LIST_PERCENT` (75) · a held drag's autoscroll: `AUTOSCROLL_FRAME` (33 ms, the run loop's wait deadline while one is held past the edge — §7's one exception to animating from the tick) / `AUTOSCROLL_PAGE_PERIOD` (1 s, a page per row past the edge) / `AUTOSCROLL_MAX_DISTANCE` (4) |
@@ -1188,7 +1261,9 @@ tokens (`agents::KIND_*` / `QUALIFIER_*`; `claude_catalog`'s `CATALOG_REQUEST_ID
 `CATALOG_SETTINGS`, `USER_SETTING_SOURCES`, the git-prefetch switch
 `DISABLE_GIT_INSTRUCTIONS_ENV` / `DISABLE_GIT_INSTRUCTIONS_ON`, `CLAUDE_PROGRAM`,
 `CONTROL_RESPONSE_MARKER`, the `process_group` argument `NEW_PROCESS_GROUP` and
-the pinned built-in names `CLAUDE_HIDDEN_BUILTINS`;
+the pinned built-in names `CLAUDE_HIDDEN_BUILTINS`; `claude_move`'s
+`MOVE_REQUEST_ID`, `SET_CWD_SUBTYPE`, `MOVE_SETTINGS` and the answer tokens
+`SUBTYPE_SUCCESS` / `STATUS_OK` / `STATUS_NEEDS_TRUST` / `STATUS_REJECTED`;
 `claude_trust`'s record and pointer names — `GLOBAL_CONFIG_FILE`,
 `CUSTOM_OAUTH_GLOBAL_CONFIG_FILE`, `LEGACY_GLOBAL_CONFIG_FILE`,
 `CUSTOM_OAUTH_URL_ENV`, `PROJECTS_KEY`, `TRUST_ACCEPTED_KEY`, `GIT_ENTRY`,
@@ -1251,10 +1326,11 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    printable char types into the query; arrows, Enter, Tab, and `Ctrl-*` always
    act so search never blocks navigation).
 2. `apply_action` mutates the `App` and returns an `Outcome`
-   (`Continue`/`Quit`/`Resume`/`Send`/`Interrupt`/`BgLaunch`/`Signal`; `Copy` comes
+   (`Continue`/`Quit`/`Resume`/`Send`/`Move`/`Interrupt`/`BgLaunch`/`Signal`; `Copy` comes
    from `handle_chord_key` and `FinishCopy` from `handle_event`, below). `Send`,
-   `Interrupt` and `BgLaunch` carry a confirmed `SendRequest` / `InterruptRequest` /
-   `BgLaunchRequest` the driver spawns without a teardown (the board stays up), the
+   `Move`, `Interrupt` and `BgLaunch` carry a confirmed `SendRequest` / `MoveRequest` /
+   `InterruptRequest` / `BgLaunchRequest` the driver spawns without a teardown (the
+   board stays up; `Move` comes from the move picker's confirm), the
    way `Resume` carries a confirmed `Ready` — the decision is data, the effect is
    the driver's. `Signal { pid }` carries a re-verified pid the same way; the driver
    sends it a SIGTERM inline rather than on a thread (see §6). Add a new effect
@@ -1267,10 +1343,12 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    Which of the two shapes a new action takes is decided by the CHILD, not by what
    it is called: a background-agent launch is `--bg` (returns at once, needs no
    TTY) so it stays on the no-teardown side, while its `Ctrl-O` twin hands the
-   terminal over and is therefore an ordinary `Resume`.
+   terminal over and is therefore an ordinary `Resume`. An action that only
+   OPERATES on a session picks the headless child (AGENTS.md DRIVE `claude`
+   HEADLESSLY): the `Ctrl-X w` move is a `set_cwd` child, not an interactive `/cd`.
 3. Modal state owns the keyboard: ONE `App.modal: Option<Modal>` serves every
    titled overlay — the running-session choice, the new-session agent picker, a
-   compose's `Ctrl-L` model picker, and
+   compose's `Ctrl-L` model picker, the `Ctrl-X w` move picker, and
    the hard-delete confirm — through the generic `modal_key` → `confirm_modal`
    machine, dispatching each choice's `ModalAction` tag (a `Row` layout binds the
    horizontal `←`/`→`/`h`/`l` to MOVE its highlight; a `List` never moves sideways,
@@ -1281,19 +1359,19 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    `ModalAction::New` choice in `launch_pick_interactively`, and the model picker's
    `←`/`→` are bound on the `List` layout the same way and acted on only for a
    `ModalAction::SetModel(Some(_))` row in `App::adjust_modal_effort` (the agent
-   picker and the `default` row stay inert), so neither a new `Row` modal nor a
+   and move pickers and the `default` row stay inert), so neither a new `Row` modal nor a
    future `List` one can inherit a verb it has no meaning for. Because the modal
    owns the keyboard, those arrows can never also reach the board's search caret
    (a test pins it against a caret parked mid-query). The FOOTER follows the verbs,
    not the layout: each constructor names its own (`Modal::footer`, one const per
-   overlay kind), because the two `List` pickers share a key map but not what the
+   overlay kind), because the `List` pickers (agent, model, move) share a key map but not what the
    keys do — a layout-derived footer advertised the agent picker's
    `Enter draft · ^O interactive` on the model picker, where `Ctrl-O` is inert. Four
    more keyboard owners sit alongside it: the `Ctrl-X` leader chord (while
    `App.pending_chord` is set, `chord_key` routes the next key — `x` hide, `d`
    delete-confirm, `h` show-hidden, `r` forced full store re-read, `y` copy
-   session ID, `f` fold / expand the selected row's lineage, anything else
-   cancels), the "stop the
+   session ID, `f` fold / expand the selected row's lineage, `w` open the
+   move-to-worktree picker, anything else cancels), the "stop the
    waiting agent?" confirmation via `App.pending_stop` (a plain Enter/Esc gate
    before compose, for the `needs input` quick-reply path), its `Ctrl-K` sibling
    `App.pending_interrupt` (the same Enter/Esc gate, but resolving to a bare
@@ -1569,6 +1647,12 @@ state and renders on the surface that owns it:
   (`view::sending_tail`), not on the help line;
 - a background-agent launch lives in `App::draft.launch_id` and renders on the
   draft card (`view::draft_card`), not on the help line;
+- a `Ctrl-X w` move in flight lives in `App::moving` (one entry per session) and
+  renders as that row's `moving…` badge (`view::MOVING_ROW_BADGE`), not on the
+  help line: the picker's confirm sets no status. Its `AppEvent::MoveFinished` is
+  the OUTCOME, `moved to <folder>` transient and every failure or refusal sticky,
+  `needs_trust`'s "press Enter, then run /cd" hint included, since the user has to
+  act on it;
 - an interrupt in flight lives in `App::interrupting` and deliberately has **no**
   visible label — `claude stop` is fast and the badge clears on the next agents
   poll — but the guard still prevents a stale completion from landing on a
@@ -1768,7 +1852,8 @@ Tests are **inline** `#[cfg(test)] mod tests` at the bottom of each source file
   `a_timed_out_leader_that_left_its_group_is_still_killed`, needs `perl` on
   `PATH` (macOS and the `ubuntu-latest` CI runner ship it), because `sh` cannot
   `setpgid` itself. Without `perl` it FAILS on its marker assertion, never passes
-  vacuously.
+  vacuously. The `Ctrl-X w` move's child tests (`claude_move`'s unix-only
+  `children` module) run `sh` alone, over the same `exchange_reaped`.
 - **Assert structure, not styling**: preview tests flatten `Text` to plain
   strings to check markers, and separately assert `Style`/`Modifier` on specific
   spans.

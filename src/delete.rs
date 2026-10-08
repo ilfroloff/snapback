@@ -61,12 +61,25 @@ pub const DELETE_RUNNING_REFUSAL: &str = "claude still reports this session as a
 /// User-facing refusal returned by [`can_delete_target`] when SNAPBACK ITSELF has a
 /// quick reply in flight to the target.
 ///
-/// The THIRD writer, and the only one [`can_delete`] structurally cannot see. It
-/// says "snapback" rather than "claude" because that is what was observed: the
-/// child doing the writing is one snapback spawned, and telling the user to close a
-/// claude window would point at the wrong thing entirely.
+/// The THIRD writer, and the first of the two snapback runs itself that
+/// [`can_delete`] cannot be relied on to see (the other is the `Ctrl-X w` move,
+/// [`DELETE_MOVING_REFUSAL`]). It says "snapback" rather than "claude" because
+/// that is what was observed: the child doing the writing is one snapback spawned,
+/// and telling the user to close a claude window would point at the wrong thing
+/// entirely.
 pub const DELETE_SENDING_REFUSAL: &str = "snapback is still sending a reply to this session — \
      wait for it to land, then hard-delete.";
+
+/// User-facing refusal returned by [`can_delete_target`] when SNAPBACK ITSELF has a
+/// `Ctrl-X w` move in flight on the target (`App::moving`).
+///
+/// The FOURTH writer, snapback's own like [`DELETE_SENDING_REFUSAL`]'s: the move's
+/// `claude` child is renaming the transcript into another project folder and
+/// appending to it, and claude's probe cannot be relied on to name it (the child
+/// is snapback's, not a job claude was asked to run). Its own wording, because the
+/// remedy is to let the move finish, not a reply.
+pub const DELETE_MOVING_REFUSAL: &str = "snapback is still moving this session to another \
+     folder — wait for it to finish, then hard-delete.";
 
 /// Pure WRITER guard for a HARD delete: refuse while claude holds a writer on the
 /// transcript, allow it otherwise.
@@ -158,8 +171,8 @@ pub fn can_delete(reported: Option<&ReportedAgent>) -> Result<(), String> {
 }
 
 /// The FULL writer guard a hard delete must pass: [`can_delete`]'s claude-side
-/// verdict, plus the one writer that verdict structurally cannot see — snapback's
-/// OWN in-flight quick reply.
+/// verdict, plus the two writers that verdict cannot be relied on to see —
+/// snapback's OWN in-flight quick reply and its own `Ctrl-X w` move.
 ///
 /// **Why a second fact is needed at all.** [`can_delete`] answers "is CLAUDE
 /// holding a writer?" off a freshly probed active list, and that list is
@@ -181,17 +194,27 @@ pub fn can_delete(reported: Option<&ReportedAgent>) -> Result<(), String> {
 /// it is the more specific fact: when snapback is mid-send the claude-side verdict
 /// is `Ok` by construction, so consulting it first would report nothing at all.
 ///
+/// `move_in_flight` is the same question for snapback's OTHER own writer, a
+/// `Ctrl-X w` move still running on THIS id (`App::moving_on`), and it is checked
+/// before the probe for the same reason. A reply and a move never run on one
+/// session together (each refuses while the other is in flight), so the order
+/// between the two only picks which message names the one that is.
+///
 /// Kept as a COMPOSITION rather than a wider [`can_delete`] on purpose, for the
-/// reason that function's own docs give for not reusing [`agents::is_active`]: two
+/// reason that function's own docs give for not reusing [`agents::is_active`]:
 /// small predicates over separate facts, each written where its consequence lives.
 /// The questions have different sources (claude's probe vs. snapback's own state)
 /// and different remedies, so they keep different messages.
 pub fn can_delete_target(
     reported: Option<&ReportedAgent>,
     reply_in_flight: bool,
+    move_in_flight: bool,
 ) -> Result<(), String> {
     if reply_in_flight {
         return Err(DELETE_SENDING_REFUSAL.to_string());
+    }
+    if move_in_flight {
+        return Err(DELETE_MOVING_REFUSAL.to_string());
     }
     can_delete(reported)
 }
@@ -565,7 +588,7 @@ mod tests {
         );
     }
 
-    /// SNAPBACK'S OWN in-flight quick reply is a writer too, and it is the one
+    /// SNAPBACK'S OWN in-flight quick reply is a writer too, and one
     /// `can_delete` structurally CANNOT see.
     ///
     /// The regression this pins is a race between two features, not a bad arm:
@@ -585,7 +608,7 @@ mod tests {
         // The exact shape of the hazard: claude reports NOTHING (the send
         // deregistered the job on its way in), yet a reply is still landing.
         assert_eq!(
-            can_delete_target(None, true).err().as_deref(),
+            can_delete_target(None, true, false).err().as_deref(),
             Some(DELETE_SENDING_REFUSAL),
             "an in-flight reply must refuse even though claude's list is empty"
         );
@@ -599,25 +622,33 @@ mod tests {
 
         // With nothing in flight the composed guard is exactly `can_delete`,
         // adding no refusals of its own.
-        assert_eq!(can_delete_target(None, false), Ok(()));
+        assert_eq!(can_delete_target(None, false, false), Ok(()));
         assert_eq!(
-            can_delete_target(Some(&agent("background", Some("blocked"), None)), false),
+            can_delete_target(
+                Some(&agent("background", Some("blocked"), None)),
+                false,
+                false
+            ),
             Ok(())
         );
 
         // The in-flight fact is checked FIRST: it must not be masked by, nor mask
         // the wording of, a claude-side refusal that also applies.
         assert_eq!(
-            can_delete_target(Some(&agent("interactive", None, None)), true)
+            can_delete_target(Some(&agent("interactive", None, None)), true, false)
                 .err()
                 .as_deref(),
             Some(DELETE_SENDING_REFUSAL),
             "the more specific writer owns the message"
         );
         assert_eq!(
-            can_delete_target(Some(&agent("background", Some("working"), None)), false)
-                .err()
-                .as_deref(),
+            can_delete_target(
+                Some(&agent("background", Some("working"), None)),
+                false,
+                false
+            )
+            .err()
+            .as_deref(),
             Some(DELETE_RUNNING_REFUSAL),
             "without a send in flight the claude-side verdict still stands"
         );
@@ -630,6 +661,38 @@ mod tests {
             !DELETE_SENDING_REFUSAL.contains("claude has"),
             "the writer is snapback's own child; do not point at a claude window"
         );
+    }
+
+    /// snapback's OTHER own writer: a `Ctrl-X w` move whose `claude` child is
+    /// renaming and appending to the transcript. The composed guard refuses on
+    /// that fact alone, with claude's verdict at its most permissive, in words of
+    /// its own, and ahead of a claude-side refusal that also applies.
+    #[test]
+    fn can_delete_target_refuses_snapbacks_own_in_flight_move() {
+        assert_eq!(
+            can_delete_target(None, false, true).err().as_deref(),
+            Some(DELETE_MOVING_REFUSAL),
+            "an in-flight move must refuse even though claude's list is empty"
+        );
+        assert_eq!(
+            can_delete_target(
+                Some(&agent("background", Some("working"), None)),
+                false,
+                true
+            )
+            .err()
+            .as_deref(),
+            Some(DELETE_MOVING_REFUSAL),
+            "snapback's own writer owns the message over claude's"
+        );
+        for other in [
+            DELETE_SENDING_REFUSAL,
+            DELETE_INTERACTIVE_REFUSAL,
+            DELETE_RUNNING_REFUSAL,
+        ] {
+            assert_ne!(DELETE_MOVING_REFUSAL, other);
+        }
+        assert!(DELETE_MOVING_REFUSAL.starts_with("snapback is still moving"));
     }
 
     // --- status_for_delete -------------------------------------------------

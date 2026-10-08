@@ -649,12 +649,19 @@ fn plan_from_parts(cwd: PathBuf, session_id: String, fork: bool) -> ResumePlan {
 /// Refuses (rather than guessing) when the file yields no `cwd`, and refuses
 /// when that `cwd` no longer exists on disk.
 pub fn plan(session: &Session, fork: bool) -> ResumePlan {
-    match read_authoritative(&session.file) {
+    plan_at(&session.file, fork)
+}
+
+/// [`plan`] over the transcript at `file` alone: the authoritative re-read and
+/// the existence gate, for a caller holding a path rather than a [`Session`]
+/// (the `Ctrl-X w` move's worker, `crate::claude_move`).
+pub fn plan_at(file: &Path, fork: bool) -> ResumePlan {
+    match read_authoritative(file) {
         Some((cwd, session_id)) => plan_from_parts(cwd, session_id, fork),
         None => ResumePlan::Refuse {
             message: format!(
                 "Could not read a cwd from the session file; refusing to guess:\n    {}",
-                session.file.display()
+                file.display()
             ),
         },
     }
@@ -1118,6 +1125,28 @@ mod tests {
             }
             other => panic!("a missing cwd must refuse via check: {other:?}"),
         }
+    }
+
+    #[test]
+    fn check_follows_a_relocated_record_into_the_relocated_folder() {
+        // The hand-off reads the parser, so a session moved by claude's `/cd`
+        // resumes in the folder it moved to (and the quick reply follows).
+        let (mut session, dir) = resumable_session("relocated", "sess-moved");
+        let moved = dir.join("moved");
+        std::fs::create_dir_all(&moved).expect("create the relocated dir");
+        let record = format!(
+            r#"{{"type":"relocated","relocatedCwd":"{}","sessionId":"sess-moved"}}"#,
+            moved.display()
+        );
+        let lines = format!(
+            "{}\n{record}\n",
+            std::fs::read_to_string(&session.file).expect("read"),
+        );
+        std::fs::write(&session.file, lines).expect("append the relocated record");
+        session.cwd = dir.clone();
+        let ready = check(&session, false).expect("relocated folder exists");
+        assert_eq!(ready.cwd, moved);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
