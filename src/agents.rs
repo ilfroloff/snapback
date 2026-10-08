@@ -44,7 +44,10 @@
 //! Both readings parse FAIL-SOFT: a missing binary, a non-zero exit, non-JSON
 //! output, or schema drift all collapse to an EMPTY set — never a panic — so the
 //! board degrades to plain behavior when the signal is unavailable. Note the two
-//! DEGRADE IN OPPOSITE DIRECTIONS, deliberately; see [`live_agents`].
+//! DEGRADE IN OPPOSITE DIRECTIONS, deliberately; see [`live_agents`]. The
+//! hand-off reading has one more form, [`try_live_agents`], for the one consumer
+//! that must tell "could not ask" from "nothing is live": the `Ctrl-X w` move,
+//! which refuses on the first.
 //!
 //! The split is drawn at the QUESTION, not at the caller: **every hand-off
 //! re-asks claude, and nothing hands off on polled data.** The `--all` map is a
@@ -634,7 +637,8 @@ pub fn is_active(agent: &ReportedAgent) -> bool {
 /// FAIL-SOFT by construction: non-JSON or a non-array top level yields an empty
 /// map; an element without a string `sessionId` is skipped; every other field is
 /// read with a default/optional so an unexpected shape never discards the record
-/// or panics. This is the ONLY place the wire shape is interpreted.
+/// or panics. This is the ONLY place the wire shape is interpreted: its body is
+/// [`try_parse_agents_json`], with "no signal" collapsed to that empty map.
 ///
 /// Last-one-wins per `sessionId`: two records sharing a session id collapse to
 /// whichever came last in the array. Observed not to happen (`--all` reported no
@@ -642,17 +646,24 @@ pub fn is_active(agent: &ReportedAgent) -> bool {
 /// the accepted risk if that ever changes.
 #[must_use]
 pub fn parse_agents_json(raw: &str) -> HashMap<String, ReportedAgent> {
+    try_parse_agents_json(raw).unwrap_or_default()
+}
+
+/// [`parse_agents_json`] with "no signal" kept apart from "an empty list":
+/// `None` when `raw` is not JSON or its top level is not the documented array,
+/// else the records. Per-element drift is still skipped, never `None`: the
+/// array itself was claude's answer.
+#[must_use]
+fn try_parse_agents_json(raw: &str) -> Option<HashMap<String, ReportedAgent>> {
+    // Not JSON at all, or a top level that is not the documented array: no
+    // signal.
+    let value = serde_json::from_str::<Value>(raw).ok()?;
+    let array = value.as_array()?;
     // Named for what it holds, not for what a caller wants it to mean: under
     // `--all` this accumulates agents that reported completion too. Calling it
     // `live` would re-plant the exact assumption that made the resume gate a
     // TOCTOU race — only `live_agents`' reading may claim liveness.
     let mut reported = HashMap::new();
-    let Ok(value) = serde_json::from_str::<Value>(raw) else {
-        return reported; // Not JSON at all -> no signal.
-    };
-    let Some(array) = value.as_array() else {
-        return reported; // Top level is not the documented array -> no signal.
-    };
     for element in array {
         let Some(session_id) = element.get("sessionId").and_then(Value::as_str) else {
             continue; // No join key -> unusable record, skip (never fatal).
@@ -679,7 +690,7 @@ pub fn parse_agents_json(raw: &str) -> HashMap<String, ReportedAgent> {
             },
         );
     }
-    reported
+    Some(reported)
 }
 
 /// The argv shared by BOTH readings: the program, the subcommand, and `--json`.
@@ -762,22 +773,48 @@ fn agents_from_output(success: bool, stdout: &str) -> HashMap<String, ReportedAg
     parse_agents_json(stdout)
 }
 
+/// [`agents_from_output`] with "no signal" kept apart from "an empty list":
+/// `None` for a non-zero exit, or for stdout that is not the documented array
+/// ([`try_parse_agents_json`]), else the records. The same order contract: the
+/// status is checked BEFORE the parse.
+#[must_use]
+fn agents_reading(success: bool, stdout: &str) -> Option<HashMap<String, ReportedAgent>> {
+    if !success {
+        return None; // Non-zero exit -> "no signal".
+    }
+    try_parse_agents_json(stdout)
+}
+
 /// Run an agents shell-out and parse it, or yield EMPTY on any failure (missing
 /// binary, non-zero exit, unreadable / non-JSON output).
 ///
-/// The one impure step both readings share, and it owns the SPAWN alone — what
-/// the result means is [`agents_from_output`]'s pure decision. Output is CAPTURED
-/// (no TTY inherited), so it never contends with an interactive `claude` on the
-/// terminal. Never panics; every error path returns an empty map.
+/// The impure step both readings share: the spawn is [`spawn_agents`]'s, and
+/// what the result means is [`agents_from_output`]'s pure decision. Never
+/// panics; every error path returns an empty map.
 fn run_agents(argv: &[String]) -> HashMap<String, ReportedAgent> {
-    let output = match Command::new(&argv[0]).args(&argv[1..]).output() {
-        Ok(output) => output,
-        Err(_) => return HashMap::new(), // `claude` not on PATH, spawn failed, etc.
-    };
-    agents_from_output(
+    spawn_agents(argv).map_or_else(HashMap::new, |(success, stdout)| {
+        agents_from_output(success, &stdout)
+    })
+}
+
+/// [`run_agents`] with "no signal" kept apart from "an empty list": `None` when
+/// no child could be spawned or [`agents_reading`] finds no signal in what it
+/// printed. Never panics.
+fn try_run_agents(argv: &[String]) -> Option<HashMap<String, ReportedAgent>> {
+    let (success, stdout) = spawn_agents(argv)?;
+    agents_reading(success, &stdout)
+}
+
+/// The SPAWN both runners share: run `argv` and return whether it exited zero
+/// and its stdout, or `None` when no child could be spawned (`claude` not on
+/// PATH, …). Output is CAPTURED (no TTY inherited), so it never contends with an
+/// interactive `claude` on the terminal.
+fn spawn_agents(argv: &[String]) -> Option<(bool, String)> {
+    let output = Command::new(&argv[0]).args(&argv[1..]).output().ok()?;
+    Some((
         output.status.success(),
-        &String::from_utf8_lossy(&output.stdout),
-    )
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+    ))
 }
 
 /// Shell out to [`agents_argv`] (`claude agents --json --all`) and return the
@@ -827,7 +864,9 @@ pub fn reported_agents() -> HashMap<String, ReportedAgent> {
 /// (missing binary, non-zero exit, bad JSON, schema drift) yields an EMPTY map ⇒
 /// "not live" ⇒ a plain resume ⇒ **claude's own check still backstops it**, and
 /// the user sees claude's real message instead of our guess. Degrading toward
-/// "let claude decide" is correct, because claude is the authority.
+/// "let claude decide" is correct, because claude is the authority. The
+/// `Ctrl-X w` move is the one consumer that must NOT degrade this way, so it
+/// asks [`try_live_agents`] instead and refuses when the probe cannot answer.
 ///
 /// That direction also decides the ATTACH path, where it collapses two premises
 /// into one: an empty map means "the agent finished" and "we could not ask" ALIKE.
@@ -857,6 +896,22 @@ pub fn reported_agents() -> HashMap<String, ReportedAgent> {
 #[must_use]
 pub fn live_agents() -> HashMap<String, ReportedAgent> {
     run_agents(&live_agents_argv())
+}
+
+/// [`live_agents`] with "could not ask" kept apart from "nothing is live":
+/// `None` when the probe could not answer — no child could be spawned, it
+/// exited non-zero, or it printed something other than the documented array —
+/// else the same records [`live_agents`] returns, an empty map included.
+///
+/// For the `Ctrl-X w` move alone (`crate::claude_move::spawn_move`, on the
+/// move's worker thread), which REFUSES on `None` rather than taking
+/// [`live_agents`]' "not live" guess: the move renames the transcript, and no
+/// claude check downstream of its `set_cwd` is known to stop it under a live
+/// writer. Every other caller keeps [`live_agents`] and its direction; why the
+/// move differs is DOMAIN.md's ("Reported agents").
+#[must_use]
+pub fn try_live_agents() -> Option<HashMap<String, ReportedAgent>> {
+    try_run_agents(&live_agents_argv())
 }
 
 #[cfg(test)]
@@ -1567,6 +1622,44 @@ mod tests {
         assert!(
             agents_from_output(true, "claude: unexpected error").is_empty(),
             "unparseable stdout on a clean exit is still no signal"
+        );
+    }
+
+    /// The reading behind `try_live_agents` (the `Ctrl-X w` move's) keeps "could
+    /// not ask" apart from "nothing is live": every no-signal case is `None`,
+    /// claude's own empty list is `Some(empty)`. The fail-soft reading over the
+    /// SAME inputs is still the empty map, so its direction did not move.
+    #[test]
+    fn the_strict_reading_tells_no_signal_from_an_empty_list() {
+        for (success, stdout) in [
+            (false, ONE_AGENT_JSON),
+            (true, "claude: unexpected error"),
+            (true, r#"{"sessionId":"sess-1","kind":"background"}"#),
+        ] {
+            assert_eq!(
+                agents_reading(success, stdout),
+                None,
+                "no signal: success={success} stdout={stdout}"
+            );
+            assert!(
+                agents_from_output(success, stdout).is_empty(),
+                "the fail-soft reading stays empty: success={success} stdout={stdout}"
+            );
+        }
+        assert_eq!(
+            agents_reading(true, "[]"),
+            Some(HashMap::new()),
+            "claude's empty list is an answer, not a failure"
+        );
+        assert_eq!(
+            agents_reading(true, r#"[{"kind":"background"}]"#),
+            Some(HashMap::new()),
+            "per-element drift is skipped; the array itself was the answer"
+        );
+        assert_eq!(
+            agents_reading(true, ONE_AGENT_JSON),
+            Some(agents_from_output(true, ONE_AGENT_JSON)),
+            "a clean run reads the same records either way"
         );
     }
 

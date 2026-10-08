@@ -259,15 +259,18 @@ confirm subagents/sidecars were excluded). It is intentionally omitted from
 - `claude` on `PATH` — the binary that resume/fork/attach spawn, the source of
   live-agent badges, the source of the compose pick list's skills, commands and
   agents (its `initialize` handshake, once per folder, with the repository's own
-  items only where claude's workspace-trust record trusts the folder), and (read
-  rather than run) the source of the compose model picker's (`Ctrl-L`) `--model`
-  alias list.
+  items only where claude's workspace-trust record trusts the folder), the
+  headless child that performs every `Ctrl-X w` move (a `set_cwd` request), and
+  (read rather than run) the source of the compose model picker's (`Ctrl-L`)
+  `--model` alias list.
   If it is missing or fails to launch, the hand-off fails soft to a board status
   message, live detection degrades to "nothing is live" so the live-agent badges
   disappear, the compose pick list lists no `/` skills or commands (files and
-  folders still, and a reply's `@` agents from its transcript), and the model
-  picker falls back to its built-in seed. Its flags, commands, version pin, and the exact argv `snapback`
-  builds are in [CLAUDE_CLI.md](CLAUDE_CLI.md).
+  folders still, and a reply's `@` agents from its transcript), a move refuses
+  (snapback could not ask claude whether the session is active) and moves
+  nothing, and the model picker falls back to its built-in seed. Its flags,
+  commands, version pin, and the exact argv `snapback` builds are in
+  [CLAUDE_CLI.md](CLAUDE_CLI.md).
 - A clipboard tool, OPTIONAL — `pbcopy` (built into macOS), or `wl-copy` /
   `xclip` / `xsel` on a Linux desktop — for `Ctrl-X y` and a preview
   drag-selection. Without a working one, and always over SSH, the copy falls

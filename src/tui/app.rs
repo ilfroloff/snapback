@@ -26,6 +26,7 @@ use ratatui_textarea::{CursorMove, TextArea};
 use time::OffsetDateTime;
 
 use crate::agents::ReportedAgent;
+use crate::claude_move;
 use crate::defined_agents::{self, DefinedAgent};
 use crate::resume::{ModelPick, EFFORT_LEVELS};
 use crate::{config, delete, hidden};
@@ -39,7 +40,7 @@ use crate::watch::AppEvent;
 // The scope predicate and the worktree resolver MUST canonicalize paths the same
 // way or membership compares apples to oranges, so both call the one
 // `resolve_dir` that lives beside the worktree set it has to match.
-use crate::worktrees::{project_root, project_root_name, resolve_dir, WorktreeSet};
+use crate::worktrees::{move_targets, project_root, project_root_name, resolve_dir, WorktreeSet};
 
 // The transcript's wrap model is the VIEW's (it is a fact about the widget that
 // paints the pane, not about this state), so the cache here stores what that module
@@ -344,16 +345,18 @@ pub enum ModalLayout {
     /// on top of the shared vertical ones.
     Row,
     /// A vertical list of rows (the new-session agent picker; a compose's `Ctrl-L`
-    /// model picker). The vertical keys move the highlight; `←`/`→` adjust the
-    /// highlighted row, which is a no-op on every row but a model pick.
+    /// model picker; the `Ctrl-X w` move picker). The vertical keys move the
+    /// highlight; `←`/`→` adjust the highlighted row, which is a no-op on every row
+    /// but a model pick.
     List,
 }
 
 /// What confirming a [`ModalChoice`] does — a plain tag the ONE generic confirm
 /// handler matches on, so a single handler serves every modal: the running-session
 /// overlay (`Attach`/`Fork`/`Cancel`), the new-session picker (`New`), the
-/// hard-delete confirm (`Delete`/`DeleteLineage`), and the model picker
-/// (`SetModel`). Carries no borrowed data so it can ride on a choice.
+/// hard-delete confirm (`Delete`/`DeleteLineage`), the model picker
+/// (`SetModel`), and the move picker (`MoveTo`). Carries no borrowed data so it
+/// can ride on a choice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModalAction {
     /// Attach to the running session's background agent (`claude attach <job-id>`),
@@ -409,6 +412,12 @@ pub enum ModalAction {
     /// board session, since the pick applies when that compose is SENT rather than
     /// performing anything itself.
     SetModel(Option<ModelPick>),
+    /// Move the target session to the carried worktree folder (`Ctrl-X w`; a
+    /// headless `claude` child's `set_cwd` does the move, `crate::claude_move`,
+    /// and the board stays up). The folder rides the choice, like
+    /// [`ModalAction::New`]'s agent, so a reload while the picker is open cannot
+    /// change what is moved.
+    MoveTo(PathBuf),
     /// Dismiss the modal, returning to the board.
     Cancel,
 }
@@ -709,15 +718,15 @@ struct AutoscrollClock {
 
 /// A titled, centered prompt with N labelled choices and a wrapping-cycle
 /// highlight — the ONE overlay model behind the running-session choice, the
-/// new-session agent picker, the hard-delete confirm, and a compose's `Ctrl-L`
-/// model picker.
+/// new-session agent picker, the hard-delete confirm, a compose's `Ctrl-L`
+/// model picker, and the `Ctrl-X w` move picker.
 ///
 /// Modeled as explicit state so the whole overlay is a small, unit-testable state
 /// machine that owns the keyboard while open. `selected` is a `rem_euclid` index
 /// over `choices` (wraps both directions, both layouts). `session_id` is the
-/// target a session-addressed action routes to (`Some` for Attach/Fork/delete);
-/// both pickers leave it `None` — a new session has no source, and a model pick
-/// addresses the open compose rather than any row.
+/// target a session-addressed action routes to (`Some` for Attach/Fork/delete and
+/// the move picker); the agent and model pickers leave it `None` — a new session
+/// has no source, and a model pick addresses the open compose rather than any row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Modal {
     /// The bordered box title (rendered padded with a space either side).
@@ -729,11 +738,12 @@ pub struct Modal {
     /// The dim key-hint line drawn at the foot of the box.
     ///
     /// Named by each constructor, one const per overlay kind
-    /// ([`MODAL_ROW_FOOTER`], [`AGENT_PICKER_FOOTER`], [`MODEL_PICKER_FOOTER`]),
+    /// ([`MODAL_ROW_FOOTER`], [`AGENT_PICKER_FOOTER`], [`MODEL_PICKER_FOOTER`],
+    /// [`MOVE_PICKER_FOOTER`]),
     /// rather than derived from [`layout`](Self::layout): the layout fixes which
-    /// keys are BOUND, not what they DO. The two `List` pickers bind the same keys to
-    /// different verbs — `Enter` drafts a new session in one and sets the compose's
-    /// model in the other, `←`/`→` step an effort only in the model picker, and
+    /// keys are BOUND, not what they DO. The three `List` pickers bind the same keys to
+    /// different verbs — `Enter` drafts a new session, sets the compose's model, or
+    /// moves a session, `←`/`→` step an effort only in the model picker, and
     /// `Ctrl-O` acts only in the agent picker — so a footer read off the layout can
     /// be true of at most one of them. It rides the modal the way its title and
     /// message do, and `view::render_modal` only draws it.
@@ -742,8 +752,8 @@ pub struct Modal {
     pub choices: Vec<ModalChoice>,
     /// The highlighted choice, an index into `choices` (wraps via `rem_euclid`).
     pub selected: usize,
-    /// The session a session-addressed action (Attach/Fork/delete) targets;
-    /// `None` for the two pickers, which target no existing row.
+    /// The session a session-addressed action (Attach/Fork/delete/move) targets;
+    /// `None` for the agent and model pickers, which target no existing row.
     pub session_id: Option<String>,
     /// First VISIBLE choice — the `List` layout's scroll offset, so a picker with
     /// more rows than the terminal can hold still reaches all of them.
@@ -866,6 +876,38 @@ pub const MODAL_ROW_FOOTER: &str = "←/→ choose · Enter confirm · Esc cance
 /// `Ctrl-O` starts the agent interactively at once (leaving it). One key each —
 /// neither is buried.
 pub const AGENT_PICKER_FOOTER: &str = "↑/↓ choose · Enter draft · ^O interactive · Esc cancel";
+
+/// Footer of the `Ctrl-X w` move picker: `Enter` moves the session; the board
+/// stays up and says where it went.
+pub const MOVE_PICKER_FOOTER: &str = "↑/↓ choose · Enter move · Esc cancel";
+
+/// Refusal: `Ctrl-X w` on a session outside the launch project, whose worktrees
+/// are not in the cached set (resolving them would put `git` on a keypress).
+pub const MOVE_OUTSIDE_PROJECT: &str =
+    "This session is outside the launch project, so it cannot be moved to one of its worktrees.";
+
+/// Refusal: the cached worktree set names no folder other than the session's own.
+pub const MOVE_NO_TARGET: &str = "The project's worktree list names no other folder to move the \
+     session to.";
+
+/// Refusal: no worktree list was resolved (git unavailable, or not a repository),
+/// so there is nothing to offer — distinct from a list that has only this folder.
+pub const MOVE_WORKTREES_UNKNOWN: &str =
+    "The project's worktrees could not be listed, so there is nowhere to move the session to.";
+
+/// The move picker's row label for `target`: the main checkout reads
+/// `<project label> (main)`, a worktree under the main root its path relative to it,
+/// and any other folder its absolute path. Pure so the three cases are testable
+/// without a board.
+fn move_choice_label(target: &Path, main: Option<&Path>, project_label: &str) -> String {
+    if main == Some(target) {
+        return format!("{project_label} (main)");
+    }
+    main.and_then(|m| target.strip_prefix(m).ok())
+        .unwrap_or(target)
+        .display()
+        .to_string()
+}
 
 /// The compose model picker's (`Ctrl-L`) footer. The picker shares the agent
 /// picker's `List` layout but none of its verbs: `Enter` SETS the highlighted row
@@ -1138,8 +1180,9 @@ fn cycle_effort(current: Option<&'static str>, forward: bool) -> Option<&'static
 ///
 /// PURE: the worktree set is a parameter rather than something this reaches for,
 /// so the predicate never resolves git and stays testable from a seeded set. It
-/// does canonicalize, which is why it runs on reload / scope-toggle only and
-/// never per keystroke (`App::recompute_scope`).
+/// does canonicalize, which is why the board runs it on reload / scope-toggle only
+/// (`App::recompute_scope`); the one keypress caller is `App::open_move_picker`, a
+/// bounded one-shot for the single selected session (PATTERNS.md §6).
 #[must_use]
 pub fn in_scope(scope: Scope, session: &Session, launch: &Path, worktrees: &WorktreeSet) -> bool {
     match scope {
@@ -2117,10 +2160,11 @@ pub struct App {
     /// does). Production swaps it exactly never.
     worktree_probe: WorktreeProbe,
     /// The open modal overlay, if any. `Some` while a titled prompt owns the
-    /// keyboard — the running-session Attach/Fork/Cancel choice, or the
-    /// new-session agent picker (`Ctrl-N` when defined agents exist). The two are
-    /// now one `Option<Modal>`, so their mutual exclusion is structural rather
-    /// than conventional.
+    /// keyboard — the running-session Attach/Fork/Cancel choice, the new-session
+    /// agent picker (`Ctrl-N` when defined agents exist), a compose's `Ctrl-L`
+    /// model picker, the `Ctrl-X w` move picker, or the `Ctrl-X d` hard-delete
+    /// confirm. They are all one `Option<Modal>`, so their mutual exclusion is
+    /// structural rather than conventional.
     pub modal: Option<Modal>,
     /// The open compose editor, if any. `Some` while the compose modal owns the
     /// keyboard — for EITHER draft: a quick reply (`Ctrl-R` on an idle session) or
@@ -2174,8 +2218,21 @@ pub struct App {
     /// next one, through [`undelivered`](Self::undelivered). Either way an entry is
     /// removed only once its reply child has finished. See [`Sending`].
     pub sending: Vec<Sending>,
+    /// The session ids whose `Ctrl-X w` move is IN FLIGHT (dispatched, its
+    /// `AppEvent::MoveFinished` not yet landed), at most one entry per session.
+    /// Added at the picker's confirm ([`mark_moving`](Self::mark_moving)) and
+    /// removed when THAT session's completion lands
+    /// ([`clear_moving`](Self::clear_moving)), on this board or, through
+    /// [`undelivered`](Self::undelivered), the next one. While an id is here
+    /// snapback's own `claude` child may be moving and appending to its
+    /// transcript, so `Enter`, `Ctrl-F`, `Ctrl-R`, `Ctrl-X d` and a second
+    /// `Ctrl-X w` refuse that row ([`moving_on`](Self::moving_on)), and the row
+    /// wears a `moving…` badge (`view`). A fact true over an interval, so typed
+    /// state, never the status line.
+    moving: Vec<String>,
     /// Completions a board session ended before it could read, kept here for the
-    /// next board. Today that is only the quick reply's `AppEvent::SendFinished`.
+    /// next board: the quick reply's `AppEvent::SendFinished` and the `Ctrl-X w`
+    /// move's `AppEvent::MoveFinished` (which alone clears [`moving`](Self::moving)).
     ///
     /// It lives on `App` because `tui::run_inner` drops the board's receiver at
     /// every hand-off, while `lib::run` re-enters the board on the SAME `App`: the
@@ -2387,7 +2444,7 @@ pub struct App {
     /// Whether a `Ctrl-X` leader chord is pending — the moment between the leader
     /// keypress and its follow-up (`x` hide, `d` hard-delete, `h` show-hidden,
     /// `r` forced rescan, `y` copy session ID, `f` fold / expand the selected
-    /// row's lineage, anything else cancels). While `true`
+    /// row's lineage, `w` open the move picker, anything else cancels). While `true`
     /// the view draws the which-key hint and
     /// [`handle_event`](crate::tui::update) routes the NEXT key through the pure
     /// `chord_key` machine BEFORE normal key handling, so a printable follow-up
@@ -2601,6 +2658,7 @@ impl App {
             draft: None,
             pending_stop: None,
             sending: Vec::new(),
+            moving: Vec::new(),
             undelivered: UndeliveredEvents::default(),
             interrupting: None,
             next_bg_launch_id: 0,
@@ -4203,8 +4261,11 @@ impl App {
     /// send is in flight for that session. The preview's optimistic echo and its
     /// banner-suppression both key off this so render and the click hit-test agree,
     /// the hard-delete guard reads it for snapback's own writer
-    /// ([`crate::delete::can_delete_target`]), and `Ctrl-R` refuses a second reply
-    /// to a session it answers `Some` for ([`crate::send::reply_in_flight_refusal`]).
+    /// ([`crate::delete::can_delete_target`]), `Ctrl-R` refuses a second reply
+    /// to a session it answers `Some` for ([`crate::send::reply_in_flight_refusal`]),
+    /// and `Ctrl-X w` opens no move picker for it
+    /// ([`claude_move::MOVE_SENDING_REFUSAL`], in
+    /// [`open_move_picker`](Self::open_move_picker)).
     /// Every one of them asks about ONE session, so a reply in flight elsewhere
     /// never answers for this one.
     #[must_use]
@@ -4237,9 +4298,35 @@ impl App {
         self.sending.retain(|s| s.session_id != session_id);
     }
 
+    /// Whether `session_id`'s own `Ctrl-X w` move is still in flight. Every gate
+    /// that refuses a row while snapback's move child writes it asks this, about
+    /// that ONE session: a move in flight elsewhere never answers for it.
+    #[must_use]
+    pub fn moving_on(&self, session_id: &str) -> bool {
+        self.moving.iter().any(|id| id == session_id)
+    }
+
+    /// Record `session_id`'s move as IN FLIGHT. Idempotent: a second mark keeps
+    /// the one entry, so [`clear_moving`](Self::clear_moving) always clears it.
+    /// `Ctrl-X w` refuses a row already moving before any picker opens, so this
+    /// is the invariant's backstop rather than a route a keypress takes.
+    pub fn mark_moving(&mut self, session_id: &str) {
+        if !self.moving_on(session_id) {
+            self.moving.push(session_id.to_owned());
+        }
+    }
+
+    /// Forget `session_id`'s in-flight move, because its `AppEvent::MoveFinished`
+    /// landed: that move's child has finished. Only that session's entry goes; an
+    /// id with no entry (a stale completion) changes nothing.
+    pub fn clear_moving(&mut self, session_id: &str) {
+        self.moving.retain(|id| id != session_id);
+    }
+
     /// Another handle on this board's [`undelivered`](Self::undelivered) queue:
     /// the driver gives one to each quick-reply send thread
-    /// ([`crate::send::spawn_send`]) and uses one for the teardown drain. A handle,
+    /// ([`crate::send::spawn_send`]) and each move worker
+    /// ([`crate::claude_move::spawn_move`]), and uses one for the teardown drain. A handle,
     /// not a copy: whatever a thread queues through it, the board takes here.
     #[must_use]
     pub fn undelivered_handle(&self) -> UndeliveredEvents {
@@ -4303,6 +4390,77 @@ impl App {
             session_id: None,
             // The view resolves and writes back the list window; every modal opens
             // at the top.
+            scroll: 0,
+        });
+    }
+
+    /// Open the `Ctrl-X w` move picker for the selected session: a `List` modal of
+    /// the project's worktrees (main first), the session's current folder omitted.
+    ///
+    /// Refusals are status lines, and the two about snapback's OWN writers come
+    /// first: this row's move still in flight
+    /// ([`claude_move::MOVE_IN_FLIGHT_REFUSAL`]) and its quick reply still in
+    /// flight ([`claude_move::MOVE_SENDING_REFUSAL`]). Refusing here, rather than
+    /// at the confirm, means no picker opens for a move that could not start
+    /// (the picker is modal, so neither fact can turn true while it is open).
+    /// The session's folder is resolved ONCE here, a bounded one-shot on this
+    /// keypress like `resume::check`'s existence check; the worktree set is the
+    /// cached one, never a fresh `git` call.
+    pub fn open_move_picker(&mut self) {
+        let Some(id) = self.selected_session().map(|s| s.session_id.clone()) else {
+            return;
+        };
+        let own_writer = if self.moving_on(&id) {
+            Some(claude_move::MOVE_IN_FLIGHT_REFUSAL)
+        } else if self.sending_to(&id).is_some() {
+            Some(claude_move::MOVE_SENDING_REFUSAL)
+        } else {
+            None
+        };
+        if let Some(refusal) = own_writer {
+            self.set_status(refusal.to_string());
+            return;
+        }
+        let Some(session) = self.session_by_id(&id) else {
+            return;
+        };
+        if !in_scope(Scope::Project, session, &self.launch_dir, &self.worktrees) {
+            self.set_status(MOVE_OUTSIDE_PROJECT.to_string());
+            return;
+        }
+        let current = resolve_dir(&session.cwd);
+        let targets = move_targets(&self.worktrees, &current);
+        if targets.is_empty() {
+            let message = if self.worktrees.is_empty() {
+                MOVE_WORKTREES_UNKNOWN
+            } else {
+                MOVE_NO_TARGET
+            };
+            self.set_status(message.to_string());
+            return;
+        }
+        let main = self.worktrees.main().map(Path::to_path_buf);
+        let project_label = self.project_label();
+        let choices = targets
+            .into_iter()
+            .map(|target| {
+                let label = move_choice_label(&target, main.as_deref(), &project_label);
+                ModalChoice {
+                    label,
+                    description: None,
+                    wrap_description: false,
+                    action: ModalAction::MoveTo(target),
+                }
+            })
+            .collect();
+        self.open_modal(Modal {
+            title: "move session".to_string(),
+            message: "Move this session to:".to_string(),
+            layout: ModalLayout::List,
+            footer: MOVE_PICKER_FOOTER,
+            choices,
+            selected: 0,
+            session_id: Some(id),
             scroll: 0,
         });
     }
@@ -4625,7 +4783,8 @@ impl App {
     /// it needs no wiring at any caller: every reload path already funnels
     /// through here — the `SessionsChanged` watcher event and the post-resume
     /// reload in `lib::run` (the two the autoreload exists for), plus the
-    /// post-delete reload and the `Ctrl-X r` rescan — so all of them pick a
+    /// post-delete reload, the post-move reload (`MoveFinished`) and the
+    /// `Ctrl-X r` rescan — so all of them pick a
     /// worktree created mid-run up by construction, and a future reload path gets
     /// the same behavior for free. Off-UI-thread: a reload is a bounded one-shot,
     /// unlike `recompute_scope` / `toggle_scope`, which run on a keystroke and
@@ -4691,8 +4850,10 @@ impl App {
 
     /// Recompute the scope membership set (`scoped`) and the header's counted
     /// [`population`](Self::population). This is the only path that
-    /// canonicalizes `cwd`s, so it runs on reload / scope-toggle, never on a
-    /// per-keystroke query change.
+    /// canonicalizes EVERY session's `cwd`, so it runs on reload / scope-toggle,
+    /// never on a per-keystroke query change. The one other canonicalization is
+    /// bounded to ONE session: [`open_move_picker`](Self::open_move_picker)
+    /// resolves the selected session's `cwd` on its `Ctrl-X w` keypress.
     fn recompute_scope(&mut self) {
         let scope = self.scope;
         let launch = self.launch_dir.as_path();
@@ -11430,6 +11591,49 @@ mod tests {
             app.sending.len(),
             1,
             "a completion with no entry of its own changes nothing"
+        );
+    }
+
+    /// The in-flight moves are keyed by session, like the replies: one entry per
+    /// session (a second mark never twins it, so one clear always clears it), a
+    /// clear removes only its own, and a stale clear changes nothing.
+    #[test]
+    fn in_flight_moves_are_tracked_and_cleared_per_session() {
+        let mut app = App::new(
+            vec![session("a", "r", Some("main"), "/tmp/a")],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
+        assert!(!app.moving_on("a"), "nothing in flight");
+        app.mark_moving("a");
+        app.mark_moving("b");
+        app.mark_moving("a");
+        assert!(app.moving_on("a") && app.moving_on("b"));
+        assert_eq!(app.moving.len(), 2, "never a twin entry");
+        app.clear_moving("a");
+        assert!(!app.moving_on("a"), "a single clear clears it");
+        assert!(app.moving_on("b"), "another session's move stays in flight");
+        app.clear_moving("gone");
+        assert_eq!(app.moving.len(), 1, "a stale completion changes nothing");
+    }
+
+    #[test]
+    fn move_choice_label_names_main_relative_and_absolute_targets() {
+        let main = Path::new("/r/proj");
+        let rel = Path::new("/r/proj/.agents/worktrees/a");
+        let elsewhere = Path::new("/elsewhere/b");
+        assert_eq!(move_choice_label(main, Some(main), "proj"), "proj (main)");
+        assert_eq!(
+            move_choice_label(rel, Some(main), "proj"),
+            ".agents/worktrees/a"
+        );
+        assert_eq!(
+            move_choice_label(elsewhere, Some(main), "proj"),
+            "/elsewhere/b"
+        );
+        assert_eq!(
+            move_choice_label(rel, None, "proj"),
+            rel.display().to_string()
         );
     }
 

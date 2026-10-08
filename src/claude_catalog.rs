@@ -30,6 +30,11 @@
 //!
 //! The answer is a [`Listing`], the shape `store::skills::read_listing` gives a
 //! reply's `@` agents too, so the pick list turns either into rows the same way.
+//!
+//! The child machinery ([`exchange_reaped`]: spawn, one request, timeout, group
+//! kill, reap) and the untrusted form ([`trust_flags`], [`build_catalog_env`])
+//! are shared with `crate::claude_move`, whose one `set_cwd` request rides the
+//! same exchange with a reply parser of its own.
 
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -50,9 +55,10 @@ use crate::watch::AppEvent;
 const CATALOG_REQUEST_ID: &str = "snapback-catalog";
 
 /// The program the real fetch runs, and the first word of
-/// [`build_catalog_argv`]. [`spawn_fetch`] is the one site that runs it; the
+/// [`build_catalog_argv`] (and of `claude_move::build_set_cwd_argv`).
+/// [`spawn_fetch`] and `claude_move::spawn_move` are the sites that run it; the
 /// suite runs a stand-in in its place.
-const CLAUDE_PROGRAM: &str = "claude";
+pub(crate) const CLAUDE_PROGRAM: &str = "claude";
 
 /// The `--settings` JSON the fetch runs under, in BOTH argv forms: the fetch is
 /// not a session the user started, so no hook runs just because a compose box
@@ -117,8 +123,9 @@ const CATALOG_EXIT_POLL: Duration = Duration::from_millis(20);
 
 /// Cheap prefilter: a stdout line without it cannot be the reply, so it is never
 /// JSON-parsed (hook and system lines are skipped unparsed). Plain
-/// `str::contains`: `memchr` stays in `search.rs`.
-const CONTROL_RESPONSE_MARKER: &str = "control_response";
+/// `str::contains`: `memchr` stays in `search.rs`. Also the reply's `type`, and
+/// `claude_move`'s parser reads it the same way.
+pub(crate) const CONTROL_RESPONSE_MARKER: &str = "control_response";
 
 /// claude's hidden built-ins that can reach the `initialize` reply: the commands
 /// claude 2.1.284 declares with a literal `isHidden: true` AND that pass its
@@ -160,10 +167,6 @@ const CLAUDE_HIDDEN_BUILTINS: [&str; 7] = [
 ///   CLAUDE_CLI.md's. The form's environment half is [`build_catalog_env`]'s.
 #[must_use]
 pub fn build_catalog_argv(trust: FolderTrust) -> Vec<String> {
-    let untrusted: &[&str] = match trust {
-        FolderTrust::Trusted => &[],
-        FolderTrust::Untrusted => &["--setting-sources", USER_SETTING_SOURCES],
-    };
     [
         CLAUDE_PROGRAM,
         "-p",
@@ -178,14 +181,28 @@ pub fn build_catalog_argv(trust: FolderTrust) -> Vec<String> {
         CATALOG_SETTINGS,
     ]
     .iter()
-    .chain(untrusted)
+    .chain(trust_flags(trust))
     .map(|word| (*word).to_owned())
     .collect()
 }
 
+/// The argv words the UNTRUSTED form appends for a folder `trust` describes:
+/// none for [`FolderTrust::Trusted`], `--setting-sources`
+/// [`USER_SETTING_SOURCES`] otherwise. The ONE copy of that choice: both
+/// [`build_catalog_argv`] and `claude_move::build_set_cwd_argv` end with it, and
+/// [`build_catalog_env`] is its environment half for both.
+#[must_use]
+pub fn trust_flags(trust: FolderTrust) -> &'static [&'static str] {
+    match trust {
+        FolderTrust::Trusted => &[],
+        FolderTrust::Untrusted => &["--setting-sources", USER_SETTING_SOURCES],
+    }
+}
+
 /// The environment half of [`build_catalog_argv`]'s form for a folder `trust`
 /// describes: the variables set on the fetch's CHILD alone, on top of what it
-/// inherits. Never snapback's own environment.
+/// inherits. Never snapback's own environment. The move's child
+/// (`claude_move`) takes the same environment for the same verdict.
 ///
 /// - [`FolderTrust::Trusted`]: none, so the child inherits snapback's
 ///   environment untouched.
@@ -348,12 +365,54 @@ struct Fetched {
     reader_joined: bool,
 }
 
-/// [`fetch_with`], reporting whether its stdout reader was joined.
+/// [`fetch_with`], reporting whether its stdout reader was joined: the catalog's
+/// [`exchange_reaped`], with [`parse_initialize_response`] as its reply parser.
+fn fetch_reaped(
+    argv: &[String],
+    env: &[(&str, &str)],
+    cwd: &Path,
+    request: &str,
+    timeout: Duration,
+) -> Fetched {
+    let exchanged = exchange_reaped(argv, env, cwd, request, timeout, parse_initialize_response);
+    Fetched {
+        listing: exchanged.answer.ok(),
+        reader_joined: exchanged.reader_joined,
+    }
+}
+
+/// Why one [`exchange_reaped`] has no answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoAnswer {
+    /// No child ran: the argv was empty, or the spawn failed (a missing program
+    /// or `cwd`).
+    Spawn,
+    /// The child's stdout closed (every writer gone) with no line the parser
+    /// accepted.
+    Closed,
+    /// The deadline passed before an answer; the child's group was killed.
+    TimedOut,
+}
+
+/// What one [`exchange_reaped`] left behind.
+pub struct Exchanged<T> {
+    /// The first stdout line the parser accepted, or why there was none.
+    pub answer: Result<T, NoAnswer>,
+    /// Whether the stdout reader thread was JOINED before the call returned.
+    /// `false` when it was left past [`CATALOG_READER_GRACE`], or when no child
+    /// (or no stdout) ever started one.
+    reader_joined: bool,
+}
+
+/// Run `argv` in `cwd` with `env` added to the child's environment, write
+/// `request` to its stdin and close it, and answer the first stdout line `parse`
+/// accepts — the ONE child exchange behind the catalog fetch and the move
+/// (`crate::claude_move`); only the request and the reply parser differ.
 ///
 /// `env` reaches the CHILD's environment alone, over whatever it inherits; this
 /// process's own environment is never written.
 ///
-/// The listing is `None` when the child cannot be spawned (a missing program or
+/// The answer is an `Err` when the child cannot be spawned (a missing program or
 /// `cwd`), its stdout ends with no answer, or `timeout` passes first. Never
 /// panics and never touches the terminal: stdin and stdout are pipes, stderr is
 /// discarded, and the child leads a process group of its own (on unix), outside
@@ -368,15 +427,16 @@ struct Fetched {
 ///    within [`CATALOG_READER_GRACE`].
 ///
 /// Every kill comes BEFORE the reap, the order [`kill_group`]'s contract needs.
-fn fetch_reaped(
+pub fn exchange_reaped<T>(
     argv: &[String],
     env: &[(&str, &str)],
     cwd: &Path,
     request: &str,
     timeout: Duration,
-) -> Fetched {
-    let unanswered = Fetched {
-        listing: None,
+    parse: impl Fn(&str) -> Option<T>,
+) -> Exchanged<T> {
+    let unanswered = Exchanged {
+        answer: Err(NoAnswer::Spawn),
         reader_joined: false,
     };
     let deadline = Instant::now() + timeout;
@@ -413,9 +473,9 @@ fn fetch_reaped(
     // reader keeps draining stdout and a child still writing never blocks on a
     // full pipe.
     let reader = child.stdout.take().map(forward_lines);
-    let listing = reader
+    let answer = reader
         .as_ref()
-        .and_then(|(lines, _)| await_answer(lines, deadline));
+        .and_then(|(lines, _)| await_answer(lines, deadline, &parse));
     let closed = reader
         .as_ref()
         .is_none_or(|(lines, _)| await_closed(lines, deadline));
@@ -427,8 +487,16 @@ fn fetch_reaped(
         (closed || await_closed(&lines, Instant::now() + CATALOG_READER_GRACE))
             && handle.join().is_ok()
     });
-    Fetched {
-        listing,
+    // With no answer, the close decides why: `await_answer` gave up either at
+    // EOF (and `await_closed` then saw the hang-up at once) or at the deadline
+    // (and `await_closed` had no time left).
+    let answer = answer.ok_or(if closed {
+        NoAnswer::Closed
+    } else {
+        NoAnswer::TimedOut
+    });
+    Exchanged {
+        answer,
         reader_joined,
     }
 }
@@ -473,14 +541,18 @@ fn await_closed(lines: &Receiver<String>, deadline: Instant) -> bool {
     }
 }
 
-/// The first line among `lines` that is the catalog reply, or `None` once the
-/// lines end (the child closed stdout) or `deadline` passes.
-fn await_answer(lines: &Receiver<String>, deadline: Instant) -> Option<Listing> {
+/// The first line among `lines` that `parse` accepts, or `None` once the lines
+/// end (the child closed stdout) or `deadline` passes.
+fn await_answer<T>(
+    lines: &Receiver<String>,
+    deadline: Instant,
+    parse: &impl Fn(&str) -> Option<T>,
+) -> Option<T> {
     loop {
         let left = deadline.checked_duration_since(Instant::now())?;
         let line = lines.recv_timeout(left).ok()?;
-        if let Some(listing) = parse_initialize_response(&line) {
-            return Some(listing);
+        if let Some(answer) = parse(&line) {
+            return Some(answer);
         }
     }
 }
@@ -508,10 +580,12 @@ fn reap(child: &mut Child, deadline: Instant) {
     let _ = child.wait();
 }
 
-/// SIGKILL `child`'s whole process group: the child [`fetch_reaped`] spawned as
+/// SIGKILL `child`'s whole process group: the child [`exchange_reaped`] spawned as
 /// a group leader and everything it started that stayed in the group. SIGKILL,
 /// never SIGTERM first: a fetch is no session the user started, and nothing in
-/// the group has work to save. It reaches only members still IN the group, so
+/// the group has work to save. A move's child (`crate::claude_move`) is killed
+/// only past `claude_move::MOVE_TIMEOUT`, many times its measured run, so it is
+/// stuck rather than mid-move. It reaches only members still IN the group, so
 /// [`reap`] also kills the child directly.
 ///
 /// **Contract: call it ONLY before the child has been reaped.** Until then the

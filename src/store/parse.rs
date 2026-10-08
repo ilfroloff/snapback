@@ -6,7 +6,9 @@
 //! aborting the scan. Extracts `cwd` and `sessionId` from INSIDE the file
 //! (never decoded from the folder name); falls back `session_id` to the file
 //! stem. Any file with no `cwd` is dropped (sidecar agent-name/ai-title files
-//! are not resumable).
+//! are not resumable). A `relocated` record (claude 2.1.284's `/cd`:
+//! `relocatedCwd ?? headCwdStrict`, merged last-wins) overrides the first `cwd`;
+//! see `docs/agents/DOMAIN.md`.
 //!
 //! Skipping is never SILENT about its reason: [`parse_file`] answers a
 //! three-way [`FileVerdict`], because "read it, and it is not a session" and
@@ -162,8 +164,10 @@ impl<T> FileVerdict<T> {
 /// `SessionStore`; this struct only carries what a single fail-soft scan can
 /// read straight out of the file.
 pub struct ParsedFile {
-    /// `cwd` read from inside the file (first non-null). Guaranteed present:
-    /// files with no `cwd` answer [`FileVerdict::NotASession`] instead.
+    /// The session's folder, read from inside the file: the last non-empty
+    /// `relocatedCwd` of a `relocated` record, else the first non-null `cwd`
+    /// (rule and provenance: `docs/agents/DOMAIN.md`). Guaranteed present: files
+    /// with no plain `cwd` answer [`FileVerdict::NotASession`] instead.
     pub cwd: String,
     /// `sessionId` from inside the file (first non-null), else the file stem.
     pub session_id: String,
@@ -269,6 +273,7 @@ pub fn parse_file(path: &Path) -> FileVerdict<ParsedFile> {
     let reader = BufReader::new(file);
 
     let mut cwd: Option<String> = None;
+    let mut relocated_cwd: Option<String> = None;
     let mut session_id: Option<String> = None;
     let mut git_branch: Option<String> = None;
     let mut timestamp_raw: Option<String> = None;
@@ -322,6 +327,16 @@ pub fn parse_file(path: &Path) -> FileVerdict<ParsedFile> {
         if cwd.is_none() {
             if let Some(c) = record.get("cwd").and_then(Value::as_str) {
                 cwd = Some(c.to_string());
+            }
+        }
+        // claude's `/cd` marker: the LAST non-empty `relocatedCwd` wins.
+        if record.get("type").and_then(Value::as_str) == Some("relocated") {
+            if let Some(c) = record
+                .get("relocatedCwd")
+                .and_then(Value::as_str)
+                .filter(|c| !c.trim().is_empty())
+            {
+                relocated_cwd = Some(c.to_string());
             }
         }
         if session_id.is_none() {
@@ -435,6 +450,7 @@ pub fn parse_file(path: &Path) -> FileVerdict<ParsedFile> {
     let Some(cwd) = cwd else {
         return FileVerdict::NotASession;
     };
+    let cwd = relocated_cwd.unwrap_or(cwd);
     let session_id = session_id.unwrap_or_else(|| file_stem(path));
     truncate_on_char_boundary(&mut content_index, CONTENT_INDEX_CAP);
 
@@ -757,6 +773,47 @@ mod tests {
         let parsed = parse_file(&file).session();
         std::fs::remove_dir_all(&dir).ok();
         parsed
+    }
+
+    #[test]
+    fn a_relocated_record_overrides_the_head_cwd_and_the_last_one_wins() {
+        let head = r#"{"type":"user","cwd":"/repo","sessionId":"s"}"#;
+        let one = r#"{"type":"relocated","relocatedCwd":"/repo/wt1","sessionId":"s"}"#;
+        let two = r#"{"type":"relocated","relocatedCwd":"/repo/wt2","sessionId":"s"}"#;
+        let p = parse_lines("reloc-one", &[head, one]).expect("session");
+        assert_eq!(p.cwd, "/repo/wt1");
+        let p = parse_lines("reloc-two", &[head, one, two]).expect("session");
+        assert_eq!(p.cwd, "/repo/wt2");
+        // Before any cwd record it still wins over the later plain cwd.
+        let p = parse_lines("reloc-early", &[one, head]).expect("session");
+        assert_eq!(p.cwd, "/repo/wt1");
+    }
+
+    #[test]
+    fn a_malformed_relocatedcwd_is_ignored() {
+        let head = r#"{"type":"user","cwd":"/repo","sessionId":"s"}"#;
+        for bad in [
+            r#"{"type":"relocated","relocatedCwd":""}"#,
+            r#"{"type":"relocated","relocatedCwd":"   "}"#,
+            r#"{"type":"relocated","relocatedCwd":null}"#,
+            r#"{"type":"relocated","relocatedCwd":42}"#,
+            r#"{"type":"relocated"}"#,
+            r#"{"type":"user","relocatedCwd":"/elsewhere"}"#,
+        ] {
+            let p = parse_lines("reloc-bad", &[head, bad]).expect("session");
+            assert_eq!(p.cwd, "/repo", "{bad}");
+        }
+        // A blank record never displaces an earlier valid one.
+        let good = r#"{"type":"relocated","relocatedCwd":"/repo/wt"}"#;
+        let blank = r#"{"type":"relocated","relocatedCwd":""}"#;
+        let p = parse_lines("reloc-keep", &[head, good, blank]).expect("session");
+        assert_eq!(p.cwd, "/repo/wt");
+    }
+
+    #[test]
+    fn a_relocated_record_alone_is_not_a_session() {
+        let only = r#"{"type":"relocated","relocatedCwd":"/repo/wt","sessionId":"s"}"#;
+        assert!(parse_lines("reloc-only", &[only]).is_none());
     }
 
     #[test]

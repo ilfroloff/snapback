@@ -595,8 +595,8 @@ mod tests {
                 .any(|p| p.components().any(|c| c.as_os_str() == "subagents")),
             "discovery must never descend into a subagents/ directory: {files:?}"
         );
-        // The twenty depth-2 `.jsonl` files, none of the nested subagent file.
-        assert_eq!(files.len(), 20, "unexpected discovered set: {files:?}");
+        // The twenty-one depth-2 `.jsonl` files, none of the nested subagent file.
+        assert_eq!(files.len(), 21, "unexpected discovered set: {files:?}");
     }
 
     #[test]
@@ -618,8 +618,25 @@ mod tests {
             !sessions.iter().any(|s| s.label.contains("Sidecar title")),
             "a sidecar file with no cwd was surfaced as a session"
         );
-        // Exactly nineteen resumable sessions survive (20 discovered - 1 sidecar).
-        assert_eq!(sessions.len(), 19, "unexpected session count");
+        // Exactly twenty resumable sessions survive (21 discovered - 1 sidecar).
+        assert_eq!(sessions.len(), 20, "unexpected session count");
+    }
+
+    /// `sess-relocated-1` carries claude's `/cd` `relocated` record: the row is
+    /// homed in the relocated folder and its repo/branch derive from it.
+    #[test]
+    fn a_relocated_session_is_homed_in_its_relocated_folder() {
+        let sessions = load();
+        let session = find(&sessions, "sess-relocated-1");
+        assert_eq!(
+            session.cwd,
+            std::path::PathBuf::from("/Users/me/project-eta/.agents/worktrees/moved")
+        );
+        assert_eq!(session.git_branch.as_deref(), Some("moved"));
+        // The worktree collapses onto its main checkout, path-qualified: the head
+        // `cwd` (`/Users/me/project-eta`) would label `project-eta`, so this exact
+        // value can only come from the relocated folder.
+        assert_eq!(session.repo, "me/project-eta");
     }
 
     // --- injected context and the typed command: end to end ----------------

@@ -29,7 +29,6 @@
 //! its stdin is null, so nothing git prints (notably a "not a git repository"
 //! error) can ever reach the terminal the TUI is drawing on.
 
-use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -77,8 +76,10 @@ const WORKTREE_LINE_PREFIX: &str = "worktree ";
 /// signal" and fall back, not as "nothing matches".
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorktreeSet {
-    /// Canonicalized worktree roots; empty means the set could not be resolved.
-    roots: HashSet<PathBuf>,
+    /// Canonicalized worktree roots in `git worktree list` order (main worktree
+    /// first), deduplicated keeping each path's first position; empty means the
+    /// set could not be resolved.
+    roots: Vec<PathBuf>,
     /// The project label for the header, `None` when nothing was resolved.
     label: Option<String>,
 }
@@ -97,8 +98,14 @@ impl WorktreeSet {
     /// resolves differently. Run each path through [`resolve_dir`] first.
     #[must_use]
     pub fn from_resolved(roots: impl IntoIterator<Item = PathBuf>, label: Option<String>) -> Self {
+        let mut ordered: Vec<PathBuf> = Vec::new();
+        for root in roots {
+            if !ordered.contains(&root) {
+                ordered.push(root); // First position wins; n is a handful.
+            }
+        }
         Self {
-            roots: roots.into_iter().collect(),
+            roots: ordered,
             label,
         }
     }
@@ -109,7 +116,22 @@ impl WorktreeSet {
     /// byte-equality on the resolved form, exactly like the exact-cwd scope.
     #[must_use]
     pub fn contains(&self, dir: &Path) -> bool {
-        self.roots.contains(dir)
+        self.roots.iter().any(|r| r == dir)
+    }
+
+    /// The roots in git's porcelain order: the main (parent) worktree first.
+    ///
+    /// "First = main" is git's contract (`worktree list` lists the main
+    /// worktree first), which [`parse_porcelain`] already relies on for the label.
+    pub fn roots(&self) -> impl Iterator<Item = &Path> {
+        self.roots.iter().map(PathBuf::as_path)
+    }
+
+    /// The main (parent) worktree: the first root, `None` when the set could not
+    /// be resolved. Same git-order contract as [`WorktreeSet::roots`].
+    #[must_use]
+    pub fn main(&self) -> Option<&Path> {
+        self.roots.first().map(PathBuf::as_path)
     }
 
     /// Whether the set carries no signal — see the type's docs: this is "could
@@ -132,6 +154,20 @@ impl WorktreeSet {
     pub fn label(&self) -> Option<&str> {
         self.label.as_deref()
     }
+}
+
+/// The folders a session in `current` may be moved to: every root of the project
+/// in git order (main first), minus `current` itself.
+///
+/// `current` MUST already be resolved with [`resolve_dir`], like
+/// [`WorktreeSet::contains`]. Pure: the set is cached, so this is keypress-safe.
+#[must_use]
+pub fn move_targets(worktrees: &WorktreeSet, current: &Path) -> Vec<PathBuf> {
+    worktrees
+        .roots()
+        .filter(|r| *r != current)
+        .map(Path::to_path_buf)
+        .collect()
 }
 
 /// Canonicalize `p`, falling back to the raw path when it cannot be resolved
@@ -276,7 +312,7 @@ pub fn resolve(launch_dir: &Path) -> WorktreeSet {
 /// main worktree first, and the main worktree is what names the project.
 #[must_use]
 pub fn parse_porcelain(text: &str, canonicalize: impl Fn(&Path) -> PathBuf) -> WorktreeSet {
-    let mut roots = HashSet::new();
+    let mut roots = Vec::new();
     let mut label = None;
 
     for line in text.lines() {
@@ -296,7 +332,7 @@ pub fn parse_porcelain(text: &str, canonicalize: impl Fn(&Path) -> PathBuf) -> W
         if label.is_none() {
             label = Some(group::repo_of(&root));
         }
-        roots.insert(root);
+        roots.push(root); // `from_resolved` drops a repeat, keeping the first.
     }
 
     WorktreeSet::from_resolved(roots, label)
@@ -305,6 +341,21 @@ pub fn parse_porcelain(text: &str, canonicalize: impl Fn(&Path) -> PathBuf) -> W
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn move_targets_lists_main_first_and_omits_the_current_folder() {
+        let main = PathBuf::from("/r/main");
+        let a = PathBuf::from("/r/main/.agents/worktrees/a");
+        let b = PathBuf::from("/r/main/.agents/worktrees/b");
+        let set = WorktreeSet::from_resolved([main.clone(), a.clone(), b.clone()], None);
+        assert_eq!(move_targets(&set, &main), vec![a.clone(), b.clone()]);
+        assert_eq!(move_targets(&set, &a), vec![main.clone(), b.clone()]);
+        assert_eq!(
+            move_targets(&set, Path::new("/elsewhere")),
+            vec![main, a, b]
+        );
+        assert!(move_targets(&WorktreeSet::empty(), &PathBuf::from("/r")).is_empty());
+    }
 
     /// Real `git worktree list --porcelain` output, captured from this repo (a
     /// main worktree plus siblings under `.agents/worktrees/`), so the parser is
@@ -374,6 +425,26 @@ branch refs/heads/feature/quick-send-reply-to-session
             "the label names the project, i.e. the main worktree's repo label"
         );
         assert!(!set.is_empty(), "a parsed set carries signal");
+    }
+
+    /// Order is the contract the move picker reads: git's order, main first, a
+    /// repeated path keeping its first position.
+    #[test]
+    fn roots_keep_git_order_with_main_first_and_dedupe_to_the_first_position() {
+        let set = parse_porcelain(SAMPLE, as_is);
+        let roots: Vec<&Path> = set.roots().collect();
+        assert_eq!(
+            roots,
+            [Path::new(MAIN), Path::new(WT_SCOPE), Path::new(WT_REPLY)]
+        );
+        assert_eq!(set.main(), Some(Path::new(MAIN)));
+
+        let dup = format!("worktree {MAIN}\n\nworktree {WT_SCOPE}\n\nworktree {MAIN}\n");
+        let set = parse_porcelain(&dup, as_is);
+        let roots: Vec<&Path> = set.roots().collect();
+        assert_eq!(roots, [Path::new(MAIN), Path::new(WT_SCOPE)]);
+
+        assert_eq!(WorktreeSet::empty().main(), None);
     }
 
     /// A record with no `worktree` line contributes nothing and does not derail

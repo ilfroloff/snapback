@@ -52,8 +52,10 @@ pub const TICK: Duration = Duration::from_millis(250);
 /// Measured: each `claude agents --json --all` spawn costs ~0.64 CPU-s. On a
 /// 1 s period that is a ~36 % duty cycle; on a 5 s period it is ~7 %. The poll
 /// is only a display signal (`set_reported_agents`) — every real decision
-/// (resume gate, attach, delete confirm) re-probes via [`crate::agents::live_agents`],
-/// so a slightly staler badge is cheap compared with the CPU it saves.
+/// (resume gate, attach, quick reply, stop, delete confirm) re-probes via
+/// [`crate::agents::live_agents`], and the `Ctrl-X w` move via
+/// [`crate::agents::try_live_agents`], so a slightly staler badge is cheap
+/// compared with the CPU it saves.
 ///
 /// See also [`AGENTS_IDLE_AFTER`], which skips the shell-out entirely while the
 /// board is idle.
@@ -155,8 +157,8 @@ pub enum AppEvent {
     ///
     /// Reported, not live: the set includes agents that reported completion, and
     /// it is a DISPLAY signal only — every hand-off (the resume gate, and Attach
-    /// for its job id) probes claude directly rather than reading it (see
-    /// [`crate::agents::live_agents`]).
+    /// for its job id), every other liveness gate and the `Ctrl-X w` move probe
+    /// claude directly rather than reading it (see [`crate::agents::live_agents`]).
     ReportedAgents {
         /// The poll's answer, keyed by full `sessionId`.
         agents: HashMap<String, ReportedAgent>,
@@ -191,6 +193,26 @@ pub enum AppEvent {
         /// Whether the status is a transient confirmation (`true`) or a sticky
         /// failure/refusal (`false`). Classified by the send mapper so the UI never
         /// infers it from the text.
+        success: bool,
+    },
+    /// A one-shot `Ctrl-X w` move finished (one headless `claude` child answering
+    /// a `set_cwd` request), delivered OFF the UI thread by the detached move
+    /// worker (see [`crate::claude_move::spawn_move`]).
+    ///
+    /// Like [`SendFinished`](Self::SendFinished) it fires EXACTLY ONCE per move,
+    /// refusals included, and it survives a hand-off the same way (through
+    /// [`crate::send::UndeliveredEvents`]), because it is the only thing that
+    /// clears that session's in-flight move (`App::moving`). `status` is the
+    /// mapped result ([`crate::claude_move::status_for_move`]): `moved to …` on
+    /// success, the refusal or claude's answer otherwise.
+    MoveFinished {
+        /// The board's id for the moved row, the key its in-flight entry is held
+        /// under.
+        session_id: String,
+        /// Mapped board status for the finished move.
+        status: String,
+        /// Whether the status is a transient confirmation (`true`, the
+        /// transcript moved) or a sticky failure/refusal (`false`).
         success: bool,
     },
     /// A one-shot interrupt (`claude stop <job-id>`) finished, delivered OFF the UI
