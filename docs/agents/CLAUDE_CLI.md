@@ -71,7 +71,7 @@ source ([Refreshing this doc](#refreshing-this-doc)).
 | `--everything` | `/resume` leaves out `claude -p`, Agent SDK and `/loop`-first sessions. | the sessions doc | docs read 2026-10-02; installed claude 2.1.284 |
 | `--tidy` | There is no per-session transcript delete; `claude rm` keeps the transcript, and `claude project purge` wipes a whole project. | the sessions and agent-view docs | docs read 2026-10-02; installed claude 2.1.284 |
 | `--fold` | The picker groups entries that share a session ID, while background hand-off copies carry new IDs. The docs say nothing about folding by content. Confidence: medium. | the sessions doc | docs read 2026-10-02; installed claude 2.1.284 |
-| `--move` | The only user command that moves a session is `/cd`, an interactive command with no headless twin: the one registry entry named `cd` is `type: "local-jsx"`, which claude's [print-mode gate](#the-initialize-control-handshake-compose-pick-list) never passes. The Agent SDK docs say "Neither SDK has a setter for `cwd`". The [`set_cwd`](#set_cwd-moving-a-session-without-leaving-the-board) request the move sends is undocumented. Confidence: medium. | the 2.1.291 bundle's `/cd` registry entry; https://code.claude.com/docs/en/commands; https://code.claude.com/docs/en/agent-sdk/configuration | bundle and docs read 2026-10-08; installed claude 2.1.291 |
+| `--move` | The only user command that moves a session is `/cd`, an interactive command with no headless twin: the one registry entry named `cd` is `type: "local-jsx"`, which claude's [print-mode gate](#the-initialize-control-handshake-compose-pick-list) never passes. `/cd` moves only the session it runs in (the commands doc: "Move this session to a new working directory"), and each copy a background hand-off leaves has its own session ID ([observed on disk](DOMAIN.md#the-mechanism-why-identical-rows-appear)), so moving a set of copies takes one interactive `/cd` per copy. The Agent SDK docs say "Neither SDK has a setter for `cwd`". The [`set_cwd`](#set_cwd-moving-a-session-without-leaving-the-board) request the move sends is undocumented. Confidence: medium. | the 2.1.291 bundle's `/cd` registry entry; https://code.claude.com/docs/en/commands; https://code.claude.com/docs/en/agent-sdk/configuration | bundle and docs read 2026-10-08, the commands doc again 2026-10-09; installed claude 2.1.291 |
 | `--model` | The model is set per session (`--model`, `/model`, the dispatch default); the docs say nothing about a per-reply pick. Confidence: medium. | the sessions and agent-view docs | docs read 2026-10-02; installed claude 2.1.284 |
 
 ## How snapback drives `claude`
@@ -91,7 +91,7 @@ inline test asserting the exact string, so drift here is caught by
 | Attach to a live background job | `claude attach <job-id>` | `resume::build_attach_argv` |
 | Quick-send a reply (non-interactive) | `claude -p -r <session-id> --output-format json [--model <alias> [--effort <level>]] <message>` | `send::build_send_argv` (`src/send.rs`) |
 | Release a held job before a reply, or interrupt a selected agent (`Ctrl-K`) | `claude stop <job-id>` | `send::build_stop_argv` |
-| Move a session to another folder (`Ctrl-X w`), the board staying up | In a folder claude TRUSTS: `claude -p --input-format stream-json --output-format stream-json --verbose --strict-mcp-config --settings {"disableAllHooks":true} -r <session-id>`, never with `--no-session-persistence`. In ANY OTHER folder: the same, followed by `--setting-sources user`, with `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1` added to the CHILD's environment. Either runs in the session's CURRENT folder (never the target), with ONE stdin line holding `{"type":"control_request","request_id":"snapback-move","request":{"subtype":"set_cwd","path":"<abs target>"}}` and then EOF (see [`set_cwd`](#set_cwd-moving-a-session-without-leaving-the-board)) | `claude_move::build_set_cwd_argv(session_id, FolderTrust)`, the catalog's `build_catalog_env(FolderTrust)` for the child's environment, and `set_cwd_request_line` (`src/claude_move.rs`); the verdict from `claude_trust::folder_trust`, read on the move's worker thread |
+| Move a session to another folder (`Ctrl-X w`), the board staying up | In a folder claude TRUSTS: `claude -p --input-format stream-json --output-format stream-json --verbose --strict-mcp-config --settings {"disableAllHooks":true} -r <session-id>`, never with `--no-session-persistence`. In ANY OTHER folder: the same, followed by `--setting-sources user`, with `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1` added to the CHILD's environment. Either runs in the session's CURRENT folder (never the target), with ONE stdin line holding `{"type":"control_request","request_id":"snapback-move","request":{"subtype":"set_cwd","path":"<abs target>"}}` and then EOF; a lineage move runs one such child per member, in sequence (see [`set_cwd`](#set_cwd-moving-a-session-without-leaving-the-board)) | `claude_move::build_set_cwd_argv(session_id, FolderTrust)`, the catalog's `build_catalog_env(FolderTrust)` for the child's environment, and `set_cwd_request_line` (`src/claude_move.rs`); the verdict from `claude_trust::folder_trust`, read on the move's worker thread |
 | Detect live agents (gate probe) | `claude agents --json` | `agents::live_agents_argv` (`src/agents.rs`) |
 | Detect live agents (incl. just-finished) | `claude agents --json --all` | `agents::agents_argv` |
 | List a folder's slash commands and agents (compose pick list) | In a folder claude TRUSTS: `claude -p --input-format stream-json --output-format stream-json --verbose --no-session-persistence --strict-mcp-config --settings {"disableAllHooks":true}`. In ANY OTHER folder: the same, followed by `--setting-sources user`, and with `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1` added to the CHILD's environment (never snapback's own). Either runs IN that folder, with ONE stdin line holding the object `{"type":"control_request","request_id":"snapback-catalog","request":{"subtype":"initialize"}}` and then EOF (see [the handshake](#the-initialize-control-handshake-compose-pick-list) and [the two forms](#workspace-trust-what-an-untrusted-folder-can-run-and-the-two-argv-forms)) | `claude_catalog::build_catalog_argv(FolderTrust)` and, for the child's environment, `build_catalog_env(FolderTrust)` (+ `initialize_request_line`) (`src/claude_catalog.rs`); the verdict from `claude_trust::folder_trust` (`src/claude_trust.rs`), read on the fetch's worker thread |
@@ -247,6 +247,48 @@ and one answer among claude's stream-json output lines:
   trust on the user's behalf: the status line points at `Enter`, then
   `/cd <target>` once, so claude's own dialog asks
   ([`/cd`](#cd-moving-a-session-to-another-folder)).
+- **A lineage is one child per member, one at a time.** `Move lineage (N)`
+  (`claude_move::MoveJob::Lineage`) gives each member its own child and its own
+  `set_cwd`, through the same path, strictly in sequence on the move's one
+  worker: `rejected` can carry `busy`, and concurrent children on sibling
+  transcripts were never probed, so the sequence avoids that question rather
+  than answering it. `needs_trust` is a verdict on the TARGET, which every member
+  shares, and a refused move still writes (above), so the job stops at the first
+  one (`claude_move::stops_the_lineage`) instead of spawning a child and writing
+  a transcript per remaining member for a certain refusal.
+
+**Observed: snapback gone mid-move.** Measured on installed `claude 2.1.291`,
+2026-10-09, with the Re-verify recipe below, plus `HOME` under the throwaway dir
+and an emptied environment. Each child was spawned the way `exchange_reaped`
+spawns it: stdin and stdout pipes, stderr to `/dev/null`, a process group of its
+own, the request written and stdin closed at once. Then the read end of its stdout
+was closed the way snapback's exit closes it, in three shapes:
+
+- at once, with the parent exiting without waiting, which orphans the child as
+  quitting does (3 runs);
+- at once, with the parent waiting so it could read the exit status (2 runs);
+- after the first stdout line (2 runs).
+
+What happened:
+
+- All 7 moves finished WHOLE. The transcript and its sibling `<id>/` dir ended
+  up under the target's `<encoded-cwd>`, holding the same 12 records,
+  `relocated` included, as runs whose stdout was read to EOF. Every line parsed,
+  and no transcript was left in the old project dir.
+- Each child exited on its own 2.68–2.79 s after the spawn, against 0.68–0.77 s
+  with stdout read (3 runs). Where the parent could read the status (4 runs), it
+  was 0.
+- The first stdout line (`system`, `ui_invalidate`) arrives at ~0.21 s, before
+  the answer. So claude writes into the closed pipe before it answers, and goes
+  on.
+- Not measured:
+  - a child that is slow or stuck when snapback quits (nothing kills it then);
+  - a quit between the spawn and the request write (the child then reads EOF
+    with no request);
+  - a `needs_trust` target, and an untrusted current folder.
+
+What snapback leaves running when it quits mid-move is
+[DOMAIN.md](DOMAIN.md#lineage-move-move-lineage-n)'s ("Quitting mid-move").
 
 **Unverified: a session whose CURRENT folder claude does not trust.** Every probe
 above started in a trusted folder. A move out of a folder claude does not trust

@@ -60,7 +60,10 @@ KEYS:
                   list (below). The message is sent as the first turn either way
     Ctrl-O        in the agent picker: start that agent interactively at once,
                   skipping the draft — the same verb Ctrl-O has inside the draft
-    Ctrl-X        leader chord: x hide · d delete (this row or its lineage)
+    Ctrl-X        leader chord: x hide (from a row showing (+N) or ↳ rows
+                  under it, that row and the copies it shows; else that
+                  session alone) · d delete (this row, or from a stack's top
+                  row its lineage)
                   · h show/hide hidden · r re-read every transcript from disk
                   (the board already autorefreshes and reuses unchanged files;
                   r is the force, for a row that looks stale)
@@ -75,7 +78,11 @@ KEYS:
                   so is any move while claude cannot be asked whether it is
                   active (claude agents --json fails). While the move runs
                   (under a second) the row reads moving… and refuses Enter,
-                  Ctrl-F, Ctrl-R, Ctrl-X d and another Ctrl-X w
+                  Ctrl-F, Ctrl-R, Ctrl-X d and another Ctrl-X w. On a stack's
+                  top row you then pick this session or its whole lineage: a
+                  lineage moves one session at a time, skips one snapback is
+                  still replying to or moving, stops at a folder claude does
+                  not trust yet, and one line tallies what moved
     Ctrl-R        quick reply — send a one-shot message to the selected session
                   without leaving the board. An agent whose run is over (done,
                   stopped, failed) is stopped first so the reply lands in place;

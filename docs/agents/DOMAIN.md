@@ -82,22 +82,29 @@ writing, so the format's authorship stays entirely with Claude Code and no
 half-written record can be snapback's doing. Everything else in this tree stays
 read-only.
 
-The confirm targets the selected session ALONE or its whole
-[fork lineage](#fork-lineage-storelineage) — the same grouping the hide flips as
-one unit, and for the same reason: deleting only a folded HEAD leaves its members
-on disk and the fold simply re-heads to a surviving fork, so the row never leaves
-the board. `delete::remove` is still strictly per-session; a lineage is a loop
-over it, each member guarded on its own, with refused members skipped rather than
-aborting the rest.
+The confirm targets the selected session ALONE or, on a lineage's HEAD row only,
+its whole [fork lineage](#fork-lineage-storelineage), for the reason a hide from
+a head that visibly stands for others takes that head's members too: deleting
+only a folded HEAD leaves its members on disk and the fold simply re-heads to a
+surviving fork, so the row never leaves the board. Unlike the hide, which flips
+only the members that row stands for on screen, the delete takes the lineage
+from the full store, and it is offered on a head standing alone too, because the
+confirm counts and discloses first. Which row offers it is the
+[row role](#row-role-head-row-or--row) below. `delete::remove` is still strictly
+per-session; a lineage is a loop over it, each member guarded on its own, with
+refused members skipped rather than aborting the rest.
 
 That grouping sweeps the FULL store, so a soft-HIDDEN member is counted in the
 button's `(N)` and deleted with the rest — hiding is a visibility preference, not
 a tombstone. The confirm therefore DISCLOSES the gap instead of narrowing the set:
-the pure `tui::app::delete_confirm_message` leads the prompt with `N in this
-lineage, M of them hidden` when `N > 1` **and** `M > 0`, so the count is
-predictable BEFORE the confirm rather than only explicable after it. Both
-conditions matter: a LONE session — hidden or not — has no lineage button, so
-there is no `(N)` to be surprised by and the prompt stays exactly as it was.
+the pure `tui::app::delete_confirm_message` (a wrapper over
+`lineage_confirm_message`, the ONE disclosure the move's scope confirm shares)
+leads the prompt with `N in this lineage, M of them hidden` when `N > 1` **and**
+`M > 0`, so the count is predictable BEFORE the confirm rather than only
+explicable after it. Both conditions matter: a LONE session — hidden or not — has
+no lineage button, so there is no `(N)` to be surprised by and the prompt stays
+exactly as it was. Nor has a `↳` row, whose confirm is the plain prompt even when
+its lineage has hidden members.
 
 The counts lead the sentence and the sentence leads the message because the modal
 wraps to a constant width and clips each row's TAIL on a narrow terminal (the
@@ -172,8 +179,9 @@ An earlier revision kept ONE slot and refused `Ctrl-R` on every row while it was
 full, because a second reply that overwrote the slot left the first one still
 writing with nothing on the board recording it. Keying the entries by session
 closes that hole without serializing replies to unrelated sessions. `App::moving`
-is keyed the same way, for the same reason: a `MoveFinished` clears only its own
-session's entry, and a second move of the SAME session is refused
+is keyed the same way, for the same reason: a `MoveFinished` clears only the
+entries of the ids it names (`session_ids`: one for a plain move, every dispatched
+member for a lineage job), and a second move of the SAME session is refused
 (`MOVE_IN_FLIGHT_REFUSAL`) because two children would race for one file.
 
 The two FINISHED arms, `Done` and `Ended`, are LIVE arms, not dead code to clean
@@ -897,6 +905,66 @@ cursor.
 `--print-list` prints **every** session, unfolded — it is a discovery/parse dump,
 and folding it would hide exactly what it exists to verify.
 
+#### Row role: head row or `↳` row
+
+The three row verbs that can reach beyond the selected session — `Ctrl-X x`
+hide, `Ctrl-X d` delete, `Ctrl-X w` move — let the BOARD POSITION decide their
+reach, never ancestry (`lineage::root_of` is not consulted): only a HEAD row (the
+row not drawn `↳`; a folded lineage shows only its head) may act on its lineage
+(delete and move on all of it, hide on what the row shows), a `↳` child row acts
+on itself alone. The pure `tui::app::is_lineage_child` IS membership in
+`child_indices(sessions, filtered)`, the set `build_rows` indents with, so the
+role cannot drift from the indent on screen. `filtered` is the post-hide-filter,
+post-fold visible list, so show-hidden mode and a live query count by
+construction: a hidden newest member heads its lineage only while show-hidden is
+on, and a query that drops the newer members makes an older one the visible
+head. `App::lineage_choice` is where delete and move ask: `None`
+with no selection, on a `↳` row, or for a one-member lineage; otherwise
+`lineage_member_ids` — the full store, hidden and out-of-scope members included,
+the ONE grouping.
+
+Hide does not ask `lineage_choice`. `App::hide_choice` is the pure
+`tui::app::on_screen_lineage`, which keeps WHEN and WHICH apart. WHEN is the
+pure `tui::app::stands_for_others`: the row VISIBLY stands for others — a folded
+head the fold map (`App::hidden`) draws as `(+N)`, or the `lineage::head_of` head
+of a multi-member `lineage::group_members` group of `filtered`, which is the
+expanded head `child_indices` draws `↳` rows under. WHICH is the same
+`lineage::group_members` partition over `App::unfolded`, the pre-fold list
+`recompute_filtered` hands `lineage::fold`: the group holding the row, which is
+the row plus the members folded into its `(+N)`, or plus its `↳` rows.
+`recompute_filtered` builds all three over the scoped rows after the query and
+the hide filter (skipped while show-hidden is on), so the scope, a live query and
+soft-hidden members count by construction; with show-hidden on, hidden members
+take part in the fold, so a wholly hidden lineage draws its `(+N)` (or its `↳`
+rows) again and un-hides from its head. So hide narrows its SET as well as its
+reach, to the members the row stands for on screen, by the one lineage key and
+never a second grouping rule.
+
+| Row | `Ctrl-X x` hide | `Ctrl-X d` delete | `Ctrl-X w` move |
+| --- | --- | --- | --- |
+| HEAD row that stands for others: a folded `(+N)` head, or an expanded head with `↳` rows beneath it | flips the row and the members it stands for on screen (its `(+N)` members or its `↳` rows), pivoting on the selected id (`delete::toggle_hidden`); members off the board stay as they are | `Delete this` / `Delete lineage (N)` / `Cancel` over the full-store lineage, any hidden members disclosed ([On-disk layout](#on-disk-layout)) | the picker's `Enter` opens `Move this` / `Move lineage (N)` / `Cancel` over the full-store lineage, any hidden members disclosed ([Move](#move-to-another-worktree-ctrl-x-w-srcclaude_movers)) |
+| HEAD row standing alone: its other members are off the board (filtered out by the query, hidden with show-hidden off, out of scope) | flips that id alone | `Delete this` / `Delete lineage (N)` / `Cancel` over the full-store lineage, any hidden members disclosed | the picker's `Enter` opens `Move this` / `Move lineage (N)` / `Cancel` over the full-store lineage, any hidden members disclosed |
+| `↳` row, or a lone / rootless session | flips that id alone | `Delete this` / `Cancel`, the plain prompt | the picker's `Enter` moves at once |
+
+Both HEAD rows are a deliberate asymmetry: hide flips what the row shows, delete
+and move take the full store. Whole-lineage hide exists only so the fold cannot
+re-head to a VISIBLE surviving member — hiding the head alone would promote the
+next copy into its place — and only a member on the board can be promoted. Hide
+is also SILENT, with no confirm to say how far it reached, so in no row role may
+it reach a row the user cannot see, which bounds its set to what the row shows:
+searching for old copies and hiding them leaves the newest session where it was,
+whether the query leaves one old copy standing alone or folds two or more into a
+`(+N)` head. Delete and move ASK first: the button's `(N)` counts the lineage
+and the prompt discloses hidden members (`lineage_confirm_message`), and
+AGENTS.md STORE WRITES requires the delete lineage to sweep the full store,
+hidden members included. So both keep `lineage_choice` unnarrowed.
+
+Hide's pivot has one ACCEPTED side effect: un-hiding from a head that stands for
+others exposes every member it stands for on screen. Un-hiding needs show-hidden
+on, where hidden members are on the board and take part in the fold, so a `↳`
+member hidden on its own is included. A test pins it, so it is a stated
+behaviour rather than an accident to fix.
+
 #### Observed store shape
 
 A **sampled observation dated 2026-07-15 on one machine — NOT a contract**, in the
@@ -1176,7 +1244,7 @@ machine-readable window onto that, and `snapback` reads it **twice, differently*
 | Reading | Command | Asked | Question |
 | --- | --- | --- | --- |
 | **Board signal** (`reported_agents`) | `--json --all` | polled off-thread every `watch::AGENTS_REFRESH` (5s), skipped once the board has been idle past `watch::AGENTS_IDLE_AFTER` (60s) | "what should each row's badge say?" |
-| **Hand-off signal** (`live_agents`; the move's `try_live_agents`) | `--json` (**no `--all`**) | one-shot at EVERY hand-off, and once per `Ctrl-X w` move on its worker | "will `claude -r` refuse *right now*?" **and** "what job id does `claude attach`/`claude stop` take?" **and**, for a record with no job id, "which `pid` does `Ctrl-K`'s signal route take?" |
+| **Hand-off signal** (`live_agents`; the move's `try_live_agents`) | `--json` (**no `--all`**) | one-shot at EVERY hand-off, and once per `Ctrl-X w` move on its worker (once per attempted member of a lineage move) | "will `claude -r` refuse *right now*?" **and** "what job id does `claude attach`/`claude stop` take?" **and**, for a record with no job id, "which `pid` does `Ctrl-K`'s signal route take?" |
 
 The hand-off reading serves SIX gates, not just Enter: resume, Attach, the
 `Ctrl-R` [reply gate](#quick-reply--non-interactive-send-srcsendrs), the
@@ -1921,10 +1989,10 @@ that differ.
 | **Scope** | `CurrentFolder` (default) / `Project` / `All` | THREE concentric answers to "which sessions are mine right now", declared widest-last so the variant order is the cycle order. current-folder = sessions whose **canonical** `cwd` exactly equals the canonical launch dir; project = sessions whose `cwd` is EITHER a member of the launch project's live worktree set (`src/worktrees.rs`) OR under the same repo ROOT (see below — two arms, and the scope needs both); all = every session. `All` renders repo→branch group heads; `Project` renders branch groups under the ONE project label instead of per-folder repo labels (see below); `CurrentFolder` is the flat, head-less list, and it ALONE, because it is the only scope that cannot span more than one folder. Selected at launch by `--project`/`-p` or `--all`/`-a`, and flipped by `Ctrl-A` between the first two — `All` joins that key ONLY on a board launched with `-a`, which is the sole route to it (see below). |
 | **Search mode** | `NameOnly` (default) / `NameAndContent` | which haystack the substring matcher scores; toggled by `Tab`. |
 | **Pane layout** | `PreviewOnly` (0:1) / `PreviewWide` (1:3) / `Even` (1:1, default) / `ListWide` (3:1) / `ListOnly` (1:0) | how the body divides between the list and the preview, read list:preview. Stepped one stop by `Shift-←` (toward the preview) / `Shift-→` (toward the list), saturating at both ends, with or without a query. Not persisted: every launch starts at `Even`. `ListOnly` is the only stop that hides the preview, and a compose opened there lands on `Even`; what a step does to the preview's scroll position is [PATTERNS.md §5](PATTERNS.md#5-selection-and-scroll-survive-reloads)'s. There is no mouse resize. |
-| **Show hidden** | off (default) / on | whether soft-hidden sessions appear (dimmed, marked `[hidden]`, live badge intact). Toggled by `Ctrl-X h`; a row is hidden/un-hidden by `Ctrl-X x`. The set persists — see [snapback-owned state](#snapback-owned-state-srchiddenrs). |
+| **Show hidden** | off (default) / on | whether soft-hidden sessions appear (dimmed, marked `[hidden]`, live badge intact). Toggled by `Ctrl-X h`; a row is hidden/un-hidden by `Ctrl-X x` — a row that visibly stands for others (a folded `(+N)` head, or an expanded head with `↳` rows beneath it) flips the members it stands for on screen, any other row itself alone. While on, hidden members take part in the fold, so a hidden newest member heads its lineage and moves the [row role](#row-role-head-row-or--row) with it, and a wholly hidden lineage stands for others again, so its head un-hides the members on the board. The set persists — see [snapback-owned state](#snapback-owned-state-srchiddenrs). |
 | **Compose model pick** | `None` (the default, in every new compose) / a `resume::ModelPick`: an offered alias plus an optional `--effort` level | the `--model` (and effort) a compose's own launch asks for, picked with `Ctrl-L` inside that compose and held on it (`ComposeState::model`); which launches it may reach is the A MODEL IS PICKED PER COMPOSE, NEVER PER BOARD rule in [AGENTS.md](../../AGENTS.md#critical-rules). With no pick the compose's `model:` label names what `claude` will choose instead. See [Compose model pick](#compose-model-pick-ctrl-l). |
 | **Forced rescan** | `Ctrl-X r` | not a mode: a one-shot that drops the store's parse cache and re-reads every transcript, reporting the count it landed on. The board autorefreshes and reuses unchanged files by itself, so this is the escape hatch for a row that looks stale — see [incremental reload](#incremental-reload-storesessionstore). |
-| **Modal** | `Row` \| `List` layout in one `Option<Modal>` | the SINGLE type for a TITLED, choice-bearing overlay. `Enter` on a running session builds the `Attach` / `Fork` / `Cancel` choice (a `Row`); `Ctrl-N` with defined agents builds the agent picker (a `List`); `Ctrl-L` inside a compose builds the model picker (a `List` opened OVER that compose, which stays open beneath it; row 0 is the compose's default, and the compose's current pick — effort included — is pre-highlighted by MATCHING the built choices rather than by index arithmetic, so a pick that is no longer offered falls back to row 0; its `←`/`→` step the highlighted model row's effort, which the row draws inline as ` · <level>`, or a dim ` · default effort` while unset and highlighted — see [Compose model pick](#compose-model-pick-ctrl-l)); `Ctrl-X d` builds the hard-delete confirm (a `Row`: `Delete this` / `Delete lineage (N)` — offered only for a real multi-member lineage, carrying the member ids resolved at OPEN time — / `Cancel`, default-highlighted on Cancel by that choice's position); `Ctrl-X w` builds the move picker (a `List` of the launch project's worktrees, main first, the session's current folder omitted; each choice carries `ModalAction::MoveTo(path)`, and `Enter` starts the headless move, see [Move](#move-to-another-worktree-ctrl-x-w-srcclaude_movers)). Each choice carries a `ModalAction` tag the one confirm handler (`confirm_modal`) routes on. The plain Enter/Esc stop confirmations (`Ctrl-R`, `Ctrl-K`), the compose zone and the `Ctrl-X` chord are separate keyboard owners, NOT `Modal`s — see [PATTERNS.md](PATTERNS.md#10-keys-actions-outcomes). |
+| **Modal** | `Row` \| `List` layout in one `Option<Modal>` | the SINGLE type for a TITLED, choice-bearing overlay. `Enter` on a running session builds the `Attach` / `Fork` / `Cancel` choice (a `Row`); `Ctrl-N` with defined agents builds the agent picker (a `List`); `Ctrl-L` inside a compose builds the model picker (a `List` opened OVER that compose, which stays open beneath it; row 0 is the compose's default, and the compose's current pick — effort included — is pre-highlighted by MATCHING the built choices rather than by index arithmetic, so a pick that is no longer offered falls back to row 0; its `←`/`→` step the highlighted model row's effort, which the row draws inline as ` · <level>`, or a dim ` · default effort` while unset and highlighted — see [Compose model pick](#compose-model-pick-ctrl-l)); `Ctrl-X d` builds the hard-delete confirm (a `Row`: `Delete this` / `Delete lineage (N)` — offered only on the HEAD row of a real multi-member lineage (`App::lineage_choice`, see [Row role](#row-role-head-row-or--row)), carrying the member ids resolved at OPEN time — / `Cancel`, default-highlighted on Cancel by that choice's position); `Ctrl-X w` builds the move picker (a `List` of the launch project's worktrees, main first, the session's current folder omitted; each choice carries `ModalAction::MoveTo(path)`, and `Enter` starts the headless move — or, on a lineage HEAD row, `ModalAction::ChooseMoveScope { target, members }`, whose `Enter` opens the move's SCOPE confirm (`App::open_move_scope_confirm`, a `Row` under the same title: `Move this` → `MoveTo` / `Move lineage (N)` → `ModalAction::MoveLineage { target, ids }` / `Cancel`, default-highlighted on Cancel by position, its prompt disclosing hidden members through `lineage_confirm_message`); the member ids ride both actions from the picker's open, see [Move](#move-to-another-worktree-ctrl-x-w-srcclaude_movers)). Each choice carries a `ModalAction` tag the one confirm handler (`confirm_modal`) routes on. The plain Enter/Esc stop confirmations (`Ctrl-R`, `Ctrl-K`), the compose zone and the `Ctrl-X` chord are separate keyboard owners, NOT `Modal`s — see [PATTERNS.md](PATTERNS.md#10-keys-actions-outcomes). |
 
 The current-folder scope is an **exact** canonical `cwd` match by design: a
 repo's *other* worktree folders do not appear there, no matter how the paths
@@ -2934,24 +3002,30 @@ The picker lists every root of the cached `WorktreeSet` in git order (the main
 worktree first, which `parse_porcelain` already relies on) minus the session's
 current folder (`worktrees::move_targets`). The chosen folder rides the modal
 choice (`ModalAction::MoveTo`), so a reload while it is open cannot change what is
-moved.
+moved. On a lineage's HEAD row ([row role](#row-role-head-row-or--row)) each
+choice is `ModalAction::ChooseMoveScope { target, members }` instead, and its
+`Enter` moves nothing yet: it opens the scope confirm (`Move this` /
+`Move lineage (N)` / `Cancel`), whose `Move this` is the plain move below and
+whose `Move lineage (N)` is the [lineage move](#lineage-move-move-lineage-n).
 
 **Route.** The confirm (`update::start_move`) marks the row moving
-(`App::mark_moving`) and hands the driver `Outcome::Move(MoveRequest)`, carrying
-the row's id, its transcript and the chosen folder; nothing blocking runs on the
-key. The driver starts `claude_move::spawn_move`, whose worker runs, in order: the
-authoritative re-read and the "current folder exists" gate (`resume::plan_at`),
-the target pre-checks (`check_target`), the bare liveness probe for the
-AUTHORITATIVE id (`agents::try_live_agents`, never the polled map; a probe that
-cannot answer refuses, see the table below), claude's
-workspace-trust verdict for the CURRENT folder (`claude_trust::folder_trust`,
-which picks the catalog's trusted or untrusted form), then the child, spawned in
-the current folder (never the target) through the catalog fetch's
-`claude_catalog::exchange_reaped`. It reports exactly ONE `AppEvent::MoveFinished`,
-through `send::UndeliveredEvents` so a hand-off on another row cannot lose it: that
-event is the only thing that clears `App::moving`. Its arm clears that session's
-entry alone, reloads the board at once (the moved row shows under its new folder
-without waiting on the watcher's debounce) and sets the status.
+(`App::mark_moving`) and hands the driver
+`Outcome::Move(MoveJob::One(MoveRequest))`, carrying the row's id, its
+transcript and the chosen folder; nothing blocking runs on the key. The driver
+starts `claude_move::spawn_move`, whose worker runs, in order: the authoritative
+re-read and the "current folder exists" gate (`resume::plan_at`), the target
+pre-checks (`check_target`), the bare liveness probe for the AUTHORITATIVE id
+(`agents::try_live_agents`, never the polled map; a probe that cannot answer
+refuses, see the table below), claude's workspace-trust verdict for the CURRENT
+folder (`claude_trust::folder_trust`, which picks the catalog's trusted or
+untrusted form), then the child, spawned in the current folder (never the
+target) through the catalog fetch's `claude_catalog::exchange_reaped`. It
+reports exactly ONE `AppEvent::MoveFinished`, through `send::UndeliveredEvents`
+so a hand-off on another row cannot lose it: that event is the only thing that
+clears `App::moving`. Its arm clears the entry of every id the event names
+(`session_ids`: this session alone, here) and no other, reloads the board ONCE,
+at once (the moved row shows under its new folder without waiting on the
+watcher's debounce) and sets the status by the event's `success` class.
 
 **Outcome.** A move counts only on `status == "ok"` AND `changed == true`
 (`parse_set_cwd_response`; CLAUDE_CLI.md has the two false-success shapes that
@@ -2969,12 +3043,17 @@ answer, and the folder git reported, through `send::sanitize_status`:
 | `MOVE_TIMEOUT` passed and the child was killed | `MOVE_TIMED_OUT` | sticky |
 | no child could start | `MOVE_SPAWN_FAILED` | sticky |
 | a refusal from the table below | the refusal | sticky |
+| a [lineage job](#lineage-move-move-lineage-n) finished | `status_for_lineage_move`'s ONE tally, counts leading: `<k> moved to <target>`, then `, K skipped (running)` (board-side own-writer skips plus `MOVE_LIVE_REFUSAL`), `, K already there`, `, K failed` (every other outcome — a probe that could not answer included, never counted as running), `, K already gone` (left the board before the dispatch), and last `, K not moved — <the needs-trust wording>` (the member that met it plus every member never attempted) | sticky, ALWAYS — even `3 moved to <folder>` ([PATTERNS.md §11](PATTERNS.md#11-status-line-ownership)) |
 
 `needs_trust` is the one claude prompt the move meets, and snapback never answers
 it for the user (AGENTS.md DRIVE `claude` HEADLESSLY): the status sends the user
-into the session, where claude's own `/cd` dialog can ask.
+into the session, where claude's own `/cd` dialog can ask. The single move and the
+lineage tally share that wording (`needs_trust_wording`); only the single line
+says `so nothing moved`.
 
-**Refusals**, each a status line:
+**Refusals**, each a status line for a single move; for a
+[lineage](#lineage-move-move-lineage-n) member, the tally bucket the last column
+names:
 
 | Case | Where decided | Refusal |
 | --- | --- | --- |
@@ -2987,16 +3066,23 @@ into the session, where claude's own `/cd` dialog can ask.
 | the target is unusable (relative or not UTF-8), gone, or resolves to the current folder | the worker (`claude_move::check_target`) | `MOVE_TARGET_UNUSABLE`, `MOVE_TARGET_GONE`, `MOVE_ALREADY_THERE` |
 | claude lists the session as active: moving a file something is writing would split its transcript | the worker (`claude_move::liveness_refusal`) | `MOVE_LIVE_REFUSAL` |
 | claude could not be asked: `claude agents --json` did not start, exited non-zero, or printed no readable list (`agents::try_live_agents` is `None`) | the worker (`claude_move::liveness_refusal`) | `MOVE_PROBE_FAILED_REFUSAL`, worded apart from `MOVE_LIVE_REFUSAL`. The move alone fails toward refusing here; every other gate reads a failed probe as "not live" ([why](#why-the-gate-does-not-read-the---all-map)) |
+| a lineage member snapback itself is still moving or replying to | `update::start_lineage_move`, per member (`claude_move::own_writer_refusal`, the rule the picker's open asks of the head) | skipped on the key, counted `skipped (running)` |
+| a lineage member a reload dropped from the board | `update::start_lineage_move` | skipped on the key, counted `already gone` |
+| an earlier member of the same lineage job met `needs_trust` | the worker (`claude_move::stops_the_lineage`) | never attempted, counted `not moved` with the trust remedy |
 
 The two in-flight refusals are asked when the picker OPENS, not at its confirm, so
 no picker opens for a move that could not start; the picker is modal, so neither
-fact can turn true while it is open.
+fact can turn true while it is open. A lineage's OTHER members are asked at the
+dispatch instead, one by one, since nothing about the head's facts speaks for
+them.
 
 **While the move is in flight** the row wears a `moving…` badge
 (`view::MOVING_ROW_BADGE`), the interval fact on the row it is about and never on
 the status line ([PATTERNS.md §11](PATTERNS.md#11-status-line-ownership)). Every
 key that would read or write that transcript refuses THAT row, each in its own
-words; a move on another row refuses nothing here:
+words; a move on another row refuses nothing here. A lineage job marks every
+member it dispatched, and each stays refused, per id, until the job's one event
+lands after its LAST member:
 
 | Key on the moving row | Refusal |
 | --- | --- |
@@ -3020,3 +3106,94 @@ old head `cwd` and stays in the old folder. The
 alone, so once the moved file's repo or branch differs from its pre-move fork's
 the two no longer fold together and show as separate rows. Only the moved file
 relocates.
+
+### Lineage move (`Move lineage (N)`)
+
+BEST EFFORT, like a lineage delete: move what can be moved and report one tally.
+The member ids ride `ModalAction::MoveLineage { target, ids }` from the picker's
+open (`lineage_member_ids`, so hidden and out-of-scope members are in it), so a
+reload while either modal is open cannot change membership.
+
+- **On the key** (`update::start_lineage_move`): for each id in the carried order,
+  `claude_move::own_writer_refusal(App::moving_on, App::sending_to)` — the SAME
+  rule the picker's open asks of the head — skips a member snapback itself is
+  still moving or replying to (counted `refused`); a member a reload dropped from
+  the board is skipped and reconciled as gone; every other member is marked
+  moving and packed into ONE `MoveJob::Lineage(LineageMove { target, moves,
+  asked, refused })`. Only snapback's own writers are asked here, and no member's
+  project scope is re-checked (the head's was, at the picker's open): every
+  claude-side fact is the worker's. With nothing left to dispatch the tally is set
+  at once, sticky, and nothing is spawned.
+- **On the worker** (`spawn_move_with`, the job's ONE thread): `run_in_order`
+  runs every member through the unchanged `run_move`, strictly one after another,
+  never concurrently — `set_cwd` can answer `busy`, and parallel children on
+  sibling transcripts were never probed. Each member keeps its own re-read,
+  `check_target` (so `MOVE_ALREADY_THERE`), liveness probe right before its own
+  child, trust read and child: the probe is NOT hoisted to one per set, because
+  the move keeps the probe-to-child window short and the probe is already off the
+  UI thread. That is the difference from the delete, whose one-probe rule exists
+  because its probe runs ON the UI thread.
+- **The trust stop** (`claude_move::stops_the_lineage`, `true` for `NeedsTrust`
+  alone): after the first `needs_trust` no further member is attempted. The
+  verdict is about the shared TARGET, so every later member would hear the same,
+  and a refused move still writes to the transcript it was asked about
+  ([CLAUDE_CLI.md](CLAUDE_CLI.md#set_cwd-moving-a-session-without-leaving-the-board)),
+  so going on would spawn a child and write a transcript per member for a certain
+  refusal. Every other outcome is about one member, and the job goes on. Once the
+  user has granted the trust in claude's own `/cd` dialog, a later move to that
+  target is no longer refused for it, and members already there say so.
+- **The report**: ONE `AppEvent::MoveFinished` naming EVERY dispatched id,
+  attempted or not, with `success: false`, so the arm's one loop clears each
+  member's entry, one reload follows and the tally is sticky.
+
+The cost of one event is that every dispatched member keeps `moving…` until the
+LAST member finishes: normally N × ~0.7 s, at worst N × (the probe +
+`MOVE_TIMEOUT`). The board stays up throughout, and every gate on those rows
+refuses per id.
+
+**Quitting mid-move** works the same way for a single move and a lineage job.
+Quit waits on nothing. `Ctrl-C`, or `Esc` on an empty query, is `Outcome::Quit`
+whatever `App::moving` holds. `run_inner` tears the board down: its drain moves a
+`MoveFinished` that has already arrived into the `App`'s own queue. Then the
+terminal is restored and `lib::run` returns. Nothing joins the move's worker
+(`spawn_move_with` drops its handle), so the process exit stops it wherever it
+is:
+
+- **Between members, in the re-read (`resume::plan_at`) or in the trust read.**
+  Nothing more happens, since those steps only read.
+- **In the liveness probe.** The `claude agents --json` child runs on, unread, to
+  its own exit, as the agents poller's shell-out does at every teardown. No
+  `set_cwd` child starts.
+- **After the `set_cwd` child has spawned.** `exchange_reaped` writes the whole
+  request and closes stdin in one statement right after the spawn, so the child
+  normally already holds the request and EOF. An exit between the spawn and that
+  write leaves it EOF alone, and it moves nothing. Either way it runs on with
+  nobody watching it:
+  - the read end of its stdout closes with snapback, and its stderr is
+    `/dev/null`;
+  - it leads its own process group, so it holds no terminal descriptor and gets
+    no terminal signal;
+  - nobody enforces `MOVE_TIMEOUT` any more, because only the worker did.
+
+  Measured, it still finishes the move whole and exits on its own
+  ([CLAUDE_CLI.md](CLAUDE_CLI.md#set_cwd-moving-a-session-without-leaving-the-board),
+  "Observed: snapback gone mid-move"). A slow or stuck one was not measured, and
+  nothing kills it.
+
+Every member the job had not reached gets no re-read, no probe, no child and no
+write. No `MoveFinished` is sent, and `App::moving` and the undelivered queue die
+with the process. snapback persists nothing about a move (the hidden-id set is
+its only file), so nothing reports the outcome, then or at the next launch.
+
+That launch reads each transcript where the disk has it: a moved one through its
+`relocated` record, an unmoved one in its old folder. A lineage's members can
+therefore come back in two folders, as any partial lineage move leaves them.
+
+A quit can land in that state for as long as the job runs: about 0.7 s per
+member, at worst the probe plus `MOVE_TIMEOUT` for each.
+
+One gap is left. While an orphaned child still runs, a relaunched board does not
+mark its row moving, because `App::moving` starts empty. Only claude's probe
+guards that row then, and the probe cannot be relied on to see a `claude -p`
+child ([the third and fourth writers](#on-disk-layout)). The orphan normally
+exits within about 3 s, before a relaunch reaches that row.

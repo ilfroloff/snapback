@@ -37,7 +37,7 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | `Ctrl-L` (in a reply or draft box) | **Pick the model** — and, with `←` / `→`, its **effort** — for **this message only**. The box's bottom border names what it will run on: a reply says `model: session (Opus 5.5)`, the model that session last answered with, which Claude Code normally keeps on its own; a draft says `model: default (opus[1m]) (new sessions only)` when your Claude Code settings name a model. Either says plain `model: default` when there is nothing to name. `--model` / `--effort` are sent only when you pick something; the picker's first row goes back to the default. Every new box starts at the default, and nothing is remembered. `Enter` resume, `Ctrl-F` fork, Attach and the `Ctrl-X w` move never send a model |
 | `/` or `@` (in a reply or draft box) | **Pick a skill, command, file or agent** — the same list in a `Ctrl-R` reply and a `Ctrl-N` draft. `/` as the very first character lists the skills and commands Claude Code offers in that folder, built-in ones included; `@` at the start of a word lists files and folders (`@src/tu` narrows inside `src/`; once you type a letter the list also reaches files in deeper folders, so `@disc` finds `src/store/discover.rs`) and, for a top-level `@`, the folder's agents, inserted as `@agent-<name>`. A skill, command or agent shows its description on the right. The letters you type narrow the list to what holds them anywhere in its name or, for a skill, command or agent, its description, matched like the search box (an uppercase letter matches exactly): names that start with them come first, then other name matches, then description matches, with files and folders above agents; a file or folder whose name starts with `.` shows only once you type its leading `.`. While it is open `↑` / `↓` choose, `Enter` or `Tab` picks (a folder reopens the list one level down), and `Esc` closes only the list — never the draft; with no list open `Enter` and `Esc` do what the box's own row says. Where the list comes from is under *Quick reply without leaving the board* |
 | `Ctrl-K` | **Stop / interrupt** the selected session's live agent. On a background agent it runs `claude stop`: one whose run is over (`done`, `stopped`, `failed`) stops immediately; every other live agent (`working`, `needs input`, `idle`, `interrupted`, unrecognized) confirms first, since stopping ends the live job (its conversation is kept). A session with no background job (a `live` one, typically) has no job to stop, so if Claude Code reports a process id for it, `Ctrl-K` offers to send that process a **SIGTERM** instead: the confirmation shows the pid, and nothing is sent unless Claude Code still reports that same pid when you press `Enter`. A session that isn't running as an agent has nothing to stop, and neither does one Claude Code reports with no job and no process id that can be signalled |
-| `Ctrl-X` then `x` / `d` / `h` / `r` / `y` / `f` / `w` | **Leader chord** that acts on the selected row (`x`, `d`, `y`, `f`, `w`) or on the whole board (`h`, `r`) — `x` **hides** the selected session (reversible, persisted), `d` **hard-deletes** it after a confirmation that can take just that row or its whole `(+N)` stack, `h` toggles **show hidden**, `r` **re-reads every transcript from disk**, `y` is **copy session ID**: the selected session's full id goes to your clipboard and shows on the status line, `f` **folds** / **expands** a stack of look-alike rows that are really one conversation — a row marked `(+N)` stands for `N` more; `f` opens it, and folds it back from any of its rows, `w` **moves** the session to another worktree of this project (the main folder included, the session's own folder left out) without leaving the board. Any other key cancels the chord |
+| `Ctrl-X` then `x` / `d` / `h` / `r` / `y` / `f` / `w` | **Leader chord** that acts on the selected row (`x`, `d`, `y`, `f`, `w`) or on the whole board (`h`, `r`) — `x` **hides** the selected session (reversible, persisted) — from a row that shows a stack (a `(+N)` row, or an open stack's top row with `↳` copies under it), that row and the copies it shows; from any other row, just that session — `d` **hard-deletes** it after a confirmation that, on a stack's top row, can also take the whole stack, `h` toggles **show hidden**, `r` **re-reads every transcript from disk**, `y` is **copy session ID**: the selected session's full id goes to your clipboard and shows on the status line, `f` **folds** / **expands** a stack of look-alike rows that are really one conversation — a row marked `(+N)` stands for `N` more; `f` opens it, and folds it back from any of its rows, `w` **moves** the session to another worktree of this project (the main folder included, the session's own folder left out) without leaving the board — from a stack's top row, that session or the whole stack. Any other key cancels the chord |
 | `←` / `→` (in the model picker) | **Step the highlighted model's effort** down / up: `default effort` (no `--effort`, your settings decide) → `low` → `medium` → `high` → `xhigh` → `max`, wrapping round both ways. `Enter` sets the model and the effort together into the box; `Esc` goes back to the box with your text and its previous choice untouched. They do nothing on the picker's first (default) row, and nothing in the agent picker or the move picker — and inside any picker they never move the search cursor on the board underneath |
 | `Tab` | Toggle search: **name-only ↔ name+content**. Widening to content also opens the preview on the most recent match, the same way typing does |
 | `Ctrl-A` | Flip scope: **current folder ↔ project** — the project being the repo you launched in and all of its git worktrees. Started with `-a` it is a three-stop cycle instead (current folder → project → all folders), which is the only way to reach all folders |
@@ -492,11 +492,22 @@ selected row or on the whole board: press it, and a hint shows the follow-ups �
 `x`, `d`, `h`, `r`, `y`, `f`, `w` — while any other key cancels.
 
 - `Ctrl-X x` **hides** the selected session. This is the reversible default: the
-  session stays on disk, it just drops off the board. A `(+N)` stack always hides
-  and returns whole, so the row genuinely leaves rather than being replaced by
-  the next copy behind it. The hidden set is remembered across restarts, so a
-  session you hide stays hidden next time. Press `Ctrl-X x` again on a revealed
-  row to un-hide it.
+  session stays on disk, it just drops off the board. On a row that shows a stack
+  — a `(+N)` row, or an open stack's top row with its copies drawn `↳` beneath
+  it — that row and the copies it shows hide and return together, so the row
+  genuinely leaves rather than being replaced by the next copy behind it. Copies
+  that aren't on the board stay as they are, whether search filtered them out,
+  they are outside the current scope, or they are already hidden. Any other row
+  hides just itself: one of those `↳` rows (the top row stays, so nothing takes
+  its place), or a row standing alone. So hiding an old copy you searched for
+  never takes the newest one with it, even when your search folds two or more
+  old copies into a `(+N)` row. The hidden set is remembered across restarts, so
+  a session you hide stays hidden next time. Press `Ctrl-X x` again on a revealed
+  row to un-hide it, by the same rule: on a row that shows the stack — while
+  hidden sessions are showing, a hidden stack is a `(+N)` row again — it brings
+  back the copies that row shows, a copy you had hidden on its own included.
+  Which row is on top follows the board: while hidden sessions are showing, a
+  hidden newer copy heads the stack.
 - `Ctrl-X h` **toggles showing hidden sessions**. Hidden rows come back dimmed and
   marked `[hidden]`, still carrying their live badge if their agent is running —
   hiding is a visibility choice, not a claim that a session is finished.
@@ -536,13 +547,42 @@ selected row or on the whole board: press it, and a hint shows the follow-ups �
   Code — show under their new folder. In the current-folder scope a session moved
   out of the folder you launched in leaves the list; `Ctrl-A` shows it under the
   target.
+
+  On a stack's top row, picking a folder asks one more question —
+  **Move this**, **Move lineage (N)** or **Cancel**, defaulted to Cancel and, like
+  the delete prompt, led by how many of them are hidden when some are. As with
+  delete, and unlike hiding, it takes the whole stack, copies off screen
+  included, and asks even when that row stands alone on the board, since the
+  question says how many it would take.
+  **Move lineage** moves
+  every copy, hidden ones included, one at a time, and does what it can: a copy
+  snapback is still replying to or moving is skipped, and so is one Claude Code
+  lists as active. If Claude Code hasn't been told to trust the folder, the run
+  stops at the first copy that hears so — every other copy would get the same
+  answer — and the status line points at the same `Enter`, then `/cd <folder>`
+  fix; once Claude Code trusts the folder, moving the rest works. Every copy
+  reads `moving…` until the last one finishes (about a second each), and one line
+  then tallies how many moved and why the others didn't (`2 moved to <folder>, 1
+  skipped (running)`); it stays until your next key. On a `↳` row, or a session
+  with no copies, `Enter` moves just that session at once.
+
+  Quitting snapback mid-move neither waits for the move nor stops it. A session
+  Claude Code has already started moving still moves, usually within a few
+  seconds. One it hasn't reached yet stays where it is, and so does every copy a
+  **Move lineage** run hadn't got to. Nothing reports how it went: the next time
+  you open snapback, each session shows in the folder it is really in, and you
+  can move the rest again.
 - `Ctrl-X d` **hard-deletes** the selected session — physically removing its
   transcript from disk. Because that is irreversible, it asks first with a
-  confirmation prompt (defaulted to Cancel). On a row that stands for a `(+N)`
-  stack the prompt also offers **Delete lineage** — the whole family of look-alike
-  copies at once, which is what hiding already does. Without it, deleting the top
-  row would leave the copies behind and the next one would simply take its place,
-  so the row never actually left the board. Deletion removes exactly each target
+  confirmation prompt (defaulted to Cancel). On a stack's top row the prompt
+  also offers **Delete lineage** — the whole family of look-alike copies at once.
+  Without it, deleting the top row would leave the copies behind and the next one
+  would simply take its place, so the row never actually left the board. Unlike
+  hiding, it takes the whole stack, copies off screen included (filtered out by
+  search, hidden, or outside the scope), and is offered even when that row
+  stands alone on the board: the prompt asks first, and the button's `(N)` and
+  the hidden count say how many it takes. On one of an open stack's `↳` rows
+  the prompt offers just that copy. Deletion removes exactly each target
   session's own `<id>.jsonl` and its sibling `<id>/` directory of subagent
   transcripts — nothing else.
 

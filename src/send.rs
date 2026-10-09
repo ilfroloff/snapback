@@ -970,8 +970,9 @@ pub(crate) fn sanitize_status(s: &str) -> String {
 /// ([`reply_in_flight_refusal`]) kept refusing that session. The entry is
 /// deliberately NOT cleared at the seam instead: the child may still be writing,
 /// and the entry is what keeps `Ctrl-X d` off that transcript until the child has
-/// finished (`delete::can_delete_target`). A `Ctrl-X w` move's
-/// [`AppEvent::MoveFinished`] is the same case for `App::moving` (its worker is
+/// finished (`delete::can_delete_target`). A `Ctrl-X w` move job's
+/// [`AppEvent::MoveFinished`] is the same case for `App::moving`, whose entries
+/// for every id the job dispatched only it clears (its worker is
 /// `crate::claude_move::spawn_move`), so it rides this queue too.
 ///
 /// ONE queue per `App`, and every clone is a handle on it (it is an `Arc`), so the
@@ -3504,7 +3505,7 @@ mod tests {
             finished("reply", true),
             AppEvent::Tick,
             AppEvent::MoveFinished {
-                session_id: "moved".to_string(),
+                session_ids: vec!["moved".to_string()],
                 status: "moved to /x".to_string(),
                 success: true,
             },
@@ -3516,7 +3517,7 @@ mod tests {
         let kept = queue.take();
         assert_eq!(finished_ids(&kept), ["reply", "<other>"]);
         assert!(
-            matches!(&kept[1], AppEvent::MoveFinished { session_id, .. } if session_id == "moved"),
+            matches!(&kept[1], AppEvent::MoveFinished { session_ids, .. } if session_ids == &["moved"]),
             "the move's completion is kept, not discarded: {kept:?}"
         );
     }

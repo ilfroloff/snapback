@@ -195,24 +195,30 @@ pub enum AppEvent {
         /// infers it from the text.
         success: bool,
     },
-    /// A one-shot `Ctrl-X w` move finished (one headless `claude` child answering
-    /// a `set_cwd` request), delivered OFF the UI thread by the detached move
-    /// worker (see [`crate::claude_move::spawn_move`]).
+    /// A one-shot `Ctrl-X w` move job finished (headless `claude` children
+    /// answering a `set_cwd` request), delivered OFF the UI thread by the detached
+    /// move worker (see [`crate::claude_move::spawn_move`]).
     ///
-    /// Like [`SendFinished`](Self::SendFinished) it fires EXACTLY ONCE per move,
-    /// refusals included, and it survives a hand-off the same way (through
-    /// [`crate::send::UndeliveredEvents`]), because it is the only thing that
-    /// clears that session's in-flight move (`App::moving`). `status` is the
-    /// mapped result ([`crate::claude_move::status_for_move`]): `moved to …` on
-    /// success, the refusal or claude's answer otherwise.
+    /// Like [`SendFinished`](Self::SendFinished) it fires EXACTLY ONCE per
+    /// dispatched job, refusals included, and it survives a hand-off the same way
+    /// (through [`crate::send::UndeliveredEvents`]), because it is the only thing
+    /// that clears the job's in-flight moves (`App::moving`). It is ONE variant for
+    /// every job rather than one per job kind, so the undelivered queue keeps
+    /// admitting exactly `SendFinished` and `MoveFinished`
+    /// (`send::UndeliveredEvents::drain_then_drop`, `update::replay_undelivered`).
+    /// `status` is the mapped result: [`crate::claude_move::status_for_move`]'s
+    /// for a plain move (`moved to …` on success, the refusal or claude's answer
+    /// otherwise), and [`crate::claude_move::status_for_lineage_move`]'s tally for
+    /// a lineage job, which fires once its LAST member finishes and is always
+    /// sticky.
     MoveFinished {
-        /// The board's id for the moved row, the key its in-flight entry is held
-        /// under.
-        session_id: String,
-        /// Mapped board status for the finished move.
+        /// Every board id the job dispatched (exactly one for a plain move): the
+        /// keys its in-flight entries are held under.
+        session_ids: Vec<String>,
+        /// Mapped board status for the finished job.
         status: String,
-        /// Whether the status is a transient confirmation (`true`, the
-        /// transcript moved) or a sticky failure/refusal (`false`).
+        /// The status's CLASS: a transient confirmation (`true`) or a sticky
+        /// failure/refusal (`false`).
         success: bool,
     },
     /// A one-shot interrupt (`claude stop <job-id>`) finished, delivered OFF the UI
