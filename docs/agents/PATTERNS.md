@@ -742,11 +742,14 @@ inner rect when there is no banner (so a banner-less pane's geometry is exactly
   in `FAILED_TASK_COLOR`) > the turn marker at the top of the viewport, followed —
   for a LIVE agent only — by `HEADER_SEPARATOR` and `<status> · <age>` in the
   status's Cyan + BOLD (`view::marker_with_live_status`) > the reported status,
-  with its age when known > a blank row. LIVE is the polled record's `pid`
+  with its age when known > a blank row (and while a reply of this board's is in
+  flight the fallback is the blank row, for the same reason). LIVE is the polled record's `pid`
   (`view::reports_live_process` — a DISPLAY reading of the `--all` map, never the
   probe's `App::is_live_now`, never `agents::is_active`, never a `classify`
   bucket), and the suffix also needs `agents::elapsed_phrase` to answer against
-  the poll's stamp; any other session's marker row is EXACTLY the marker, a
+  the poll's stamp, and no reply of THIS board's may be in flight to the session
+  (`App::sending_to`: the inline `cooking…` tail already says it, so the status
+  and age are told once); any other session's marker row is EXACTLY the marker, a
   finished record with a known age included. The marker leads, and the row is
   never wrapped, so a narrow pane cuts the age, then the status, before any of
   the marker. So the failure takes the sticky header's place — and
@@ -764,10 +767,14 @@ inner rect when there is no banner (so a banner-less pane's geometry is exactly
   which `preview_banner`'s `&App` read cannot build, so the hit-test could ask
   before the frame that fills it and disagree with the draw. Name it for the
   banner. Anything that REPLACES the transcript must therefore suppress the banner
-  inside that one fn rather than skipping it at the draw site: the in-flight quick
-  reply does (its echo turns take the banner's place inline) and so does the
-  new-session draft card (there is no session to describe). Skip it at the draw
-  site instead and the hit-test still reserves a row that was never painted.
+  inside that one fn rather than skipping it at the draw site: the new-session
+  draft card does (there is no session to describe). Skip it at the draw site
+  instead and the hit-test still reserves a row that was never painted. The
+  in-flight quick reply does NOT replace the transcript, it appends to it: the
+  row stays, and pins the marker of the last REAL turn once the viewport's top
+  sits in the synthetic tail (`render_preview` clamps the marker row to the
+  transcript's last row, since `sending_tail`'s pending turns carry no model or
+  effort and own no marker).
 - **A replacement pane must not write its own offset back.** `render_preview`
   persists the clamped offset into `App::preview_scroll` so the scroll keys stay in
   bounds, and that is right only while the transcript is what was measured. The

@@ -2633,9 +2633,13 @@ and then on every `Tick` (see
 [the event sources](ARCHITECTURE.md#event-sources-watcheventloop)). So the entry
 clears only once the reply child has finished. It is never cleared early at the
 seam, which would reopen `Ctrl-X d` on a transcript the child may still be
-writing, and it no longer stays set until restart. The pinned banner is SUPPRESSED
-while a send is in flight (`view::preview_banner` returns `None`, keeping render and
-the click hit-test agreeing on the geometry), since the inline turns replace it.
+writing, and it no longer stays set until restart. The pinned row STAYS
+while a send is in flight (`view::preview_banner` is unchanged by it, so render and
+the click hit-test keep agreeing on the geometry) and names the last real turn;
+the inline turns append below the transcript and carry no marker of their own. Only
+what the row says beside the marker changes: the live status and age, and the
+status fallback, step aside for the `cooking…` tail
+([PATTERNS.md §5](PATTERNS.md#5-selection-and-scroll-survive-reloads)).
 
 That echo is also why `App::status` never carries a transient `"sending…"`: an
 in-flight send is true over an INTERVAL, so it renders on the pane that owns it

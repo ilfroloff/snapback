@@ -5975,11 +5975,10 @@ mod tests {
     }
 
     #[test]
-    fn a_click_on_a_drawn_link_opens_it_for_a_banner_less_pane() {
-        // No banner: the transcript owns the pane's whole inner rect, and the
-        // hit-test must NOT shift by a row that was never reserved. An in-flight
-        // quick reply is the one banner-less pane that still draws the transcript
-        // (its inline echo turns take the banner's place).
+    fn a_click_on_a_drawn_link_opens_it_beneath_an_in_flight_replys_pinned_row() {
+        // An in-flight quick reply keeps the pinned row (its inline echo turns sit
+        // at the transcript's tail), so the hit-test must shift by that row exactly
+        // as it does when nothing is in flight.
         let dir = unique_temp_dir("link-plain");
         let mut app = link_app(&dir, None);
         app.sending = vec![crate::tui::app::Sending {
@@ -5989,8 +5988,8 @@ mod tests {
         }];
         let buffer = render_board(&mut app);
         assert!(
-            view::preview_banner(&app).is_none(),
-            "an in-flight reply reserves no banner row"
+            view::preview_banner(&app).is_some(),
+            "an in-flight reply keeps its pinned row"
         );
         assert!(
             app.preview_scroll > 0,
@@ -7951,17 +7950,16 @@ mod tests {
         );
     }
 
-    /// The banner-less half of the same seam: while a quick reply to the selected
-    /// session is in flight, its inline echo turns take the pinned row's place
-    /// (`view::preview_banner` is `None`), so the transcript owns the pane's whole
-    /// inner rect and a fold click must NOT shift by a row that was never
-    /// reserved.
+    /// The in-flight half of the same seam: while a quick reply to the selected
+    /// session is in flight, its inline echo turns sit at the transcript's tail and
+    /// the pinned row stays (`view::preview_banner` is `Some`), so a fold click must
+    /// shift by that row exactly as it does with nothing in flight.
     ///
     /// The blank BELOW the collapsed header, the one that leads the next turn, is
     /// clicked first and must stay inert: a hit-test that reserved a row anyway
     /// resolves that row to the header's last drawn row.
     #[test]
-    fn a_click_on_a_folded_peer_node_opens_it_in_a_banner_less_pane() {
+    fn a_click_on_a_folded_peer_node_opens_it_beneath_an_in_flight_replys_pinned_row() {
         let (folder, file) = PEER_FIXTURE;
         let mut app = App::new(
             vec![fixture_session("s1", folder, file)],
@@ -7975,14 +7973,14 @@ mod tests {
         }];
         let buffer = render_board(&mut app);
         assert!(
-            view::preview_banner(&app).is_none(),
-            "an in-flight reply reserves no pinned row"
+            view::preview_banner(&app).is_some(),
+            "an in-flight reply keeps its pinned row"
         );
         let transcript = view::preview_transcript_rect(&app);
         assert_eq!(
             transcript.y,
-            app.preview_rect.y + 1,
-            "with no pinned row the transcript owns the pane's first inner row"
+            app.preview_rect.y + 2,
+            "the pinned row takes the pane's first inner row"
         );
         let width = transcript.width;
         let (col, row) = drawn_peer_marker_cell(&buffer, app.preview_rect);
@@ -8013,7 +8011,7 @@ mod tests {
         let expanded = preview_string(&mut app, width);
         assert!(
             expanded.contains(PEER_BODY_PHRASE) && expanded.contains(EXPANDED_AFFORDANCE),
-            "a click on the header of a banner-less pane must open the node"
+            "a click on the header beneath an in-flight reply's pinned row must open the node"
         );
     }
 
@@ -11943,15 +11941,14 @@ mod tests {
 
     /// The highlight is drawn only inside the transcript rect of the frame being
     /// drawn — never on the pinned row, a border, or any other row — even when the
-    /// transcript moved under a finished selection (the pinned row took the pane's
-    /// first row back) or the selection is taller than the pane (autoscroll).
+    /// reply's tail left under a finished selection or the selection is taller than the pane (autoscroll).
     #[test]
     fn the_highlight_never_covers_a_row_outside_the_current_transcript_area() {
-        // The pinned row returns under a finished selection that began on the
-        // transcript's first row: a reply in flight to the selected session stands
-        // the pinned row down (`view::preview_banner`), and its end brings it back.
-        // Read from the top (`Home`), so the reply's tail leaving does not move the
-        // scroll and the selection's first row sits right under the pinned row.
+        // A finished selection that began on the transcript's first row survives
+        // the end of a reply in flight to the selected session: the pinned row is
+        // there throughout (`view::preview_banner`), and the highlight must stay off
+        // it. Read from the top (`Home`), so the reply's tail leaving does not move
+        // the scroll and the selection's first row sits right under the pinned row.
         let dir = unique_temp_dir("select-inside");
         let mut app = link_app(&dir, None);
         let mut reported = HashMap::new();
@@ -11977,12 +11974,11 @@ mod tests {
         let after = render_board(&mut app);
         let now = view::preview_transcript_rect(&app);
         assert_eq!(
-            now.y,
-            before.y + 1,
-            "premise: the pinned row took the first row"
+            now.y, before.y,
+            "premise: the pinned row is reserved before and after the reply"
         );
         let pinned: String = (now.x..now.right())
-            .filter_map(|x| after.cell((x, before.y)))
+            .filter_map(|x| after.cell((x, now.y - 1)))
             .map(ratatui::buffer::Cell::symbol)
             .collect();
         assert!(
