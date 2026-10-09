@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0](https://github.com/ilfroloff/snapback/compare/v0.12.0...v0.13.0) - 2026-10-09
+
+### Added
+
+- fork a session from a compose box without leaving the board
+- make hide, delete and move lineage-aware by board position
+- move a session to another worktree without leaving the board
+- *(tui)* match the @ pick list against the full file path
+- *(website)* add Astro landing page and GitHub Pages deploy workflow
+
+### Fixed
+
+- *(tui)* keep the pinned turn marker in the preview during a quick reply
+
+### Other
+
+- add a Coveralls coverage badge to the README
+- report line coverage to Coveralls on every push to main
+- align the crate and npm taglines with the repositioned pitch
+- add SEO metadata and social sharing cards
+- align the README with the repositioned pitch
+- reposition the landing page around the hidden-session pitch
+- keep the website and key docs current as features change
+- split the README into a quick-look page and a user guide
+- describe snapback as a live board for sessions and agents
+- add a re-recordable synthetic demo GIF
+- *(readme)* add centered project logo
+
 ## [0.12.0](https://github.com/ilfroloff/snapback/compare/v0.11.0...v0.12.0) - 2026-10-02
 
 ### Added
