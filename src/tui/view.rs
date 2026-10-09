@@ -358,9 +358,11 @@ const FAILED_TASK_MARKER: &str = "  [task failed]";
 /// The badge a row wears while snapback's own `Ctrl-X w` move of it is in flight
 /// (`App::moving_on`), drawn right after the timestamp. It names what snapback is
 /// doing to the row, never a claim about claude, and it is gone once the move's
-/// `MoveFinished` lands (~0.7 s at claude 2.1.291). Static text, so the row never
-/// changes under the terminal's link detection. Carries its own trailing gap, the
-/// way the trailing markers carry their leading one.
+/// `MoveFinished` lands (~0.7 s at claude 2.1.291). A lineage job's one
+/// `MoveFinished` lands after its LAST member, so every member's badge clears
+/// together then. Static text, so the row never changes under the terminal's link
+/// detection. Carries its own trailing gap, the way the trailing markers carry
+/// their leading one.
 const MOVING_ROW_BADGE: &str = "moving\u{2026}  ";
 
 /// What the preview banner says ahead of claude's own words when the selected
@@ -4179,7 +4181,8 @@ fn render_search(frame: &mut Frame, app: &mut App, area: Rect) {
 /// in full. The `w move` verb (move the session to another worktree) made 87, and
 /// three existing entries paid: `x expose` became `x show` (still the un-hide,
 /// beside `h hidden`), `d delete row/lineage` became `d del row/stack` (still both
-/// targets the confirm offers, though not in the modal's own `Delete this` /
+/// targets the confirm offers — the stack only on its top row, never on a `↳`
+/// row — though not in the modal's own `Delete this` /
 /// `Delete lineage (N)` words; "stack" is the `(+N)` row's name in the key map),
 /// and the `^X` lead lost its second space.
 fn chord_hint(selected_hidden: bool) -> String {
@@ -17934,14 +17937,15 @@ mod tests {
     /// modal under test is the one `open_delete_confirm` actually builds. The
     /// selected id is the NEWEST member, which is the lineage head.
     ///
-    /// The PARTIAL shape — older members hidden, the head not — is NOT reachable by
-    /// hiding: `App::toggle_hidden_selected` flips a whole lineage as ONE unit. It is
-    /// reachable the way a user meets it, a set PERSISTED while the lineage was
-    /// smaller plus a later fork joining as the new head, so the set is seeded and the
-    /// board is then rebuilt through `apply_sessions` — the PUBLIC reload path that
-    /// such a fork actually arrives on. The rebuild is the point: a board left as
-    /// `App::new` filtered it would still count the hidden members into the head's
-    /// `(+N)` marker, a board the running app cannot draw.
+    /// The PARTIAL shape — older members hidden, the head not — is reachable by
+    /// hiding (`App::toggle_hidden_selected` flips one session alone from a `↳` row
+    /// or a row standing alone) and by a set PERSISTED while the lineage was smaller
+    /// plus a later fork joining as the new head. This helper builds it the second
+    /// way: the set is seeded and the board is then rebuilt through `apply_sessions`
+    /// — the PUBLIC reload path that such a fork actually arrives on. The rebuild is
+    /// the point: a board left as `App::new` filtered it would still count the
+    /// hidden members into the head's `(+N)` marker, a board the running app cannot
+    /// draw.
     fn hidden_lineage_board(members: usize, hidden: usize) -> App {
         let ids: Vec<String> = (0..members).map(|i| format!("disc-{i:02}")).collect();
         let sessions: Vec<Session> = ids
@@ -18187,6 +18191,50 @@ mod tests {
             first_message_row(&mut app, 23),
             "12 in this lineage, 1",
             "at 23 columns the multi-digit hidden count clips into a shorter one"
+        );
+    }
+
+    /// The move's lineage scope confirm, in its DISCLOSING form, draws whole on an
+    /// 80×24 board: the leading counts, all three buttons, and its footer.
+    #[test]
+    fn the_move_scope_confirm_draws_whole_on_an_eighty_column_board() {
+        let mut app = hidden_lineage_board(3, 1);
+        let members: Vec<String> = (0..3).map(|i| format!("disc-{i:02}")).collect();
+        app.open_move_scope_confirm(
+            "disc-00".to_string(),
+            PathBuf::from("/r/main/.agents/worktrees/wt"),
+            members,
+            ".agents/worktrees/wt".to_string(),
+        );
+        let modal = app.modal.clone().expect("the scope confirm is open");
+        assert!(
+            modal
+                .message
+                .starts_with("3 in this lineage, 1 of them hidden."),
+            "the fixture must be on the DISCLOSING path: {:?}",
+            modal.message
+        );
+
+        let buffer = drawn_board(&mut app, 80, 24);
+        let screen: String = (0..24u16)
+            .map(|y| full_row_text(&buffer, y, 80))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for needle in [
+            "3 in this lineage, 1 of them hidden.",
+            "Move this",
+            "Move lineage (3)",
+            "Cancel",
+            "Esc cancel",
+        ] {
+            assert!(
+                screen.contains(needle),
+                "{needle:?} is not on screen:\n{screen}"
+            );
+        }
+        assert_eq!(
+            modal.choices[modal.selected].label, "Cancel",
+            "the safe default is preselected"
         );
     }
 

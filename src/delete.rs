@@ -8,9 +8,12 @@
 //! pure, fully unit-tested decisions; [`remove`] is the thin, impure FS driver
 //! that performs the unlink and spawns no process.
 //!
-//! A confirm may target the selected session ALONE or its whole fork lineage, but
-//! that is the caller's fan-out: every function here still decides about, or acts
-//! on, exactly ONE session, and a lineage is just the loop the caller runs.
+//! A confirm may target the selected session ALONE or, from a lineage's head row,
+//! its whole fork lineage, and a hide may flip one id or, from a row that visibly
+//! stands for others, that row's on-screen lineage members — but that is the
+//! caller's fan-out: every function here still decides about, or acts on,
+//! exactly ONE session (or flips the ids it is handed), and a lineage is just the
+//! loop the caller runs.
 //!
 //! [`remove`] is SUBAGENT-EXCLUSION-safe BY CONSTRUCTION (AGENTS.md SUBAGENT
 //! EXCLUSION): it only ever targets the session it is HANDED — that session's own
@@ -301,13 +304,19 @@ pub(crate) fn status_for_delete(
 /// in `members`; when it is already hidden, EXPOSE them all. Returns the NEW hidden
 /// state (`true` = now hidden).
 ///
-/// A background-fork lineage must hide and expose as ONE unit — otherwise hiding a
-/// folded head would just drop it and let the fold re-head to a surviving fork, so
-/// the lineage never leaves the board. A rootless singleton passes `members` of
-/// length one (itself). Pivoting on one id (rather than each member's own state)
-/// resolves a partially-hidden group cleanly to the pivot's opposite. The caller
-/// owns the side effects — persist via `hidden::save_hidden` and re-filter —
-/// keeping this decision pure and trivially testable.
+/// The caller picks the group by what the board shows: from a row that visibly
+/// stands for others (a folded `(+N)` head, or an expanded head with `↳` rows) it
+/// passes that row's on-screen lineage members, never the members a query, the
+/// scope or an earlier hide keeps off the board — hiding only the head would
+/// just drop it and let the fold re-head to a visible surviving fork, so the row
+/// would never leave the board — and otherwise (a `↳` row, a head whose other
+/// members are off the board, a lone or rootless session) it passes the one id.
+/// Pivoting on one id (rather than each member's own state) resolves a
+/// partially-hidden group cleanly to the pivot's opposite, which is also why
+/// un-hiding from such a head (show-hidden on) exposes every member it stands
+/// for, one hidden on its own included. The caller owns the side effects —
+/// persist via `hidden::save_hidden` and re-filter — keeping this decision pure
+/// and trivially testable.
 pub fn toggle_hidden(set: &mut HashSet<String>, members: &[String], pivot: &str) -> bool {
     let hide = !set.contains(pivot);
     for id in members {

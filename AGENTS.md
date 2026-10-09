@@ -93,8 +93,8 @@ one place.
   Every OTHER change to a transcript is made by a `claude` CHILD and must stay
   that way — a quick reply appends in place because `claude -p -r` writes it,
   NEVER because snapback edits a session file; likewise `Ctrl-X w` MOVES a
-  transcript only through a headless `claude` child's `set_cwd`. Do not add a
-  direct writer.
+  transcript only through a headless `claude` child's `set_cwd` — a lineage move
+  is one such child per member. Do not add a direct writer.
   That guard asks "is anything WRITING this file?", NEVER "does claude know this
   session?". Refuse an OPEN INTERACTIVE session and a still-RUNNING background
   agent; ALLOW the parked ones, INCLUDING the reported-finished and terminal
@@ -109,16 +109,28 @@ one place.
   `Ctrl-X w` move (`App::moving_on`, `DELETE_MOVING_REFUSAL`), each refused in its
   own words because the writer to name there is snapback, not claude; keep it a
   composition of three facts, never a wider `can_delete`.
-  A confirm may target the selected id ALONE or its whole fork lineage
-  (`lineage_member_ids`, the SAME grouping hide uses — never a second rule):
-  guard each member individually, let one refusal skip only itself, and spend
-  exactly ONE liveness probe for the whole set. That lineage sweeps the FULL
-  store, so it takes soft-HIDDEN members too — keep that, and keep the confirm
-  DISCLOSING how many of them are hidden. It removes ONLY each target id's own
-  `<id>.jsonl` + sibling `<id>/` dir; everything else stays read-only.
+  A confirm may target the selected id ALONE or — on a lineage's HEAD row only,
+  never a `↳` row — its whole fork lineage. The board position decides:
+  `App::lineage_choice` over `tui::app::is_lineage_child`, the facts `build_rows`
+  indents by; `lineage_member_ids` stays the ONE full-store grouping delete and
+  the `Ctrl-X w` lineage move both use — never a second rule. Hide, which has no
+  confirm, narrows both WHEN and WHAT: from a row that VISIBLY stands for others
+  (`tui::app::stands_for_others`, read off the rendered `(+N)` and `↳` facts) it
+  flips only the members that row stands for ON SCREEN
+  (`tui::app::on_screen_lineage`: the same `lineage::group_members` partition,
+  by the same lineage key, over the pre-fold list the board folds), else that id
+  alone; members off the board stay as they are, and delete and move keep
+  `lineage_choice` unnarrowed
+  ([DOMAIN.md](docs/agents/DOMAIN.md#row-role-head-row-or--row) owns why).
+  For a delete, guard each member individually, let one refusal skip only
+  itself, and spend exactly ONE liveness probe for the whole set. That lineage
+  sweeps the FULL store, so it takes soft-HIDDEN members too — keep that, and
+  keep the confirm DISCLOSING how many of them are hidden. It removes ONLY each
+  target id's own `<id>.jsonl` + sibling `<id>/` dir; everything else stays
+  read-only.
   Mechanism: [DOMAIN.md](docs/agents/DOMAIN.md#on-disk-layout).
-  (`src/delete.rs`; `confirm_delete` in `src/tui/update.rs`; `src/send.rs`;
-  `src/claude_move.rs`)
+  (`src/delete.rs`; `confirm_delete` in `src/tui/update.rs`; `lineage_choice` and
+  `hide_choice` in `src/tui/app.rs`; `src/send.rs`; `src/claude_move.rs`)
 - **TERMINAL SAFETY.** Resume/fork/attach SPAWN `claude` as a child and RETURN
   to the board — never replace the process image. Restore the terminal (raw
   mode + alt screen + every mode snapback ENABLES — mouse capture and bracketed
@@ -147,7 +159,8 @@ one place.
   and the `Ctrl-O` runs (the `Ctrl-N` draft's and the agent picker's) — and for a
   prompt only claude may show, such as its workspace-trust dialog. snapback NEVER
   fakes such a prompt's answer: it never sends `set_cwd`'s `trust_accepted`, and a
-  `needs_trust` move points the user at `Enter` and `/cd` instead. Argv and wire
+  `needs_trust` move points the user at `Enter` and `/cd` instead — and STOPS a
+  lineage move there (`claude_move::stops_the_lineage`). Argv and wire
   shapes: [CLAUDE_CLI.md](docs/agents/CLAUDE_CLI.md#how-snapback-drives-claude);
   the thread shape and why:
   [PATTERNS.md §6](docs/agents/PATTERNS.md#6-off-ui-thread-for-anything-that-can-block).
@@ -206,7 +219,9 @@ one place.
   workspace-trust read runs on that same worker thread, never on a key or the
   render path) and the `Ctrl-X w` move (`MoveFinished` — its re-read, liveness
   probe, trust read and `claude` child all run on the move's own worker, so that
-  probe is not the hand-off exception above) are all that shape.
+  probe is not the hand-off exception above; a lineage job runs every member's,
+  strictly one after another on that ONE worker, each probe right before its own
+  child, never hoisted to one per set) are all that shape.
   (`src/watch.rs`, `src/worktrees.rs`, `src/tui/clipboard.rs`,
   `src/claude_catalog.rs`, `src/claude_trust.rs`, `src/claude_move.rs`)
 - **PURE, GIT-FREE STORE CORE.** `src/store/*` decides everything from the bytes
@@ -255,7 +270,7 @@ one place.
   typed state and renders on the surface that owns it. Failures and refusals stay
   sticky until the next actionable keypress; confirmations and nudges expire after
   `STATUS_DWELL_TICKS`. Some confirmations are deliberately sticky too — the
-  `Ctrl-X y` copy's line, and a lineage delete's tally — and
+  `Ctrl-X y` copy's line, and a lineage delete's or lineage move's tally — and
   [PATTERNS.md](docs/agents/PATTERNS.md#11-status-line-ownership) owns which and
   why.
 

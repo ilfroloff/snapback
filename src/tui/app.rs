@@ -214,14 +214,35 @@ const DELETE_CONFIRM_PROMPT: &str = "Permanently delete this transcript from dis
 /// (PATTERNS §3).
 #[must_use]
 fn delete_confirm_message(members: usize, hidden: usize) -> String {
+    lineage_confirm_message(members, hidden, DELETE_CONFIRM_PROMPT)
+}
+
+/// The message of a confirm that offers a whole fork lineage — the delete
+/// confirm ([`delete_confirm_message`]) and the move's scope confirm
+/// ([`App::open_move_scope_confirm`]): `prompt`, led by a DISCLOSURE sentence when
+/// `hidden` of the lineage's `members` are soft-hidden. It says nothing extra when
+/// `hidden` is 0, and nothing when `members <= 1` (no lineage button to disclose
+/// for). Why the counts lead and what the sentence costs:
+/// [`delete_confirm_message`].
+#[must_use]
+pub(super) fn lineage_confirm_message(members: usize, hidden: usize, prompt: &str) -> String {
     if members <= 1 || hidden == 0 {
-        return DELETE_CONFIRM_PROMPT.to_string();
+        return prompt.to_string();
     }
     // Deliberately terse: every word costs wrapped rows, and a wrapped row costs
     // the button strip a whole terminal size (see above). The button beside it
-    // already reads `Delete lineage (N)`, so the sentence states the SPLIT rather
-    // than re-explaining what the button does.
-    format!("{members} in this lineage, {hidden} of them hidden. {DELETE_CONFIRM_PROMPT}")
+    // already reads `… lineage (N)`, so the sentence states the SPLIT rather than
+    // re-explaining what the button does.
+    format!("{members} in this lineage, {hidden} of them hidden. {prompt}")
+}
+
+/// The move scope confirm's prompt for the picked folder `label`
+/// ([`App::open_move_scope_confirm`]). Terse for the same reason as
+/// [`lineage_confirm_message`]'s disclosure: every wrapped row costs the button
+/// strip a terminal row.
+#[must_use]
+pub(super) fn move_scope_prompt(label: &str) -> String {
+    format!("Move to {label}: this session, or its whole lineage?")
 }
 
 /// Which set of sessions the list shows.
@@ -341,8 +362,8 @@ pub enum Row {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModalLayout {
     /// A horizontal strip of buttons (the running-session Attach/Fork/Cancel
-    /// choice; a delete confirm). Binds the horizontal keys to move the highlight,
-    /// on top of the shared vertical ones.
+    /// choice; a delete confirm; the move's lineage scope confirm). Binds the
+    /// horizontal keys to move the highlight, on top of the shared vertical ones.
     Row,
     /// A vertical list of rows (the new-session agent picker; a compose's `Ctrl-L`
     /// model picker; the `Ctrl-X w` move picker). The vertical keys move the
@@ -355,8 +376,9 @@ pub enum ModalLayout {
 /// handler matches on, so a single handler serves every modal: the running-session
 /// overlay (`Attach`/`Fork`/`Cancel`), the new-session picker (`New`), the
 /// hard-delete confirm (`Delete`/`DeleteLineage`), the model picker
-/// (`SetModel`), and the move picker (`MoveTo`). Carries no borrowed data so it
-/// can ride on a choice.
+/// (`SetModel`), the move picker (`MoveTo`, or `ChooseMoveScope` on a lineage
+/// head) and its scope confirm (`MoveTo`/`MoveLineage`). Carries no borrowed data
+/// so it can ride on a choice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModalAction {
     /// Attach to the running session's background agent (`claude attach <job-id>`),
@@ -375,9 +397,13 @@ pub enum ModalAction {
     /// writer guard first, then the FS removal; the modal only OPENS the prompt, it
     /// never deletes on its own. Default-highlighted on Cancel for safety.
     Delete,
-    /// HARD-delete EVERY session in the target's fork lineage — the same grouping
-    /// `Ctrl-X x` hides as one unit — carrying the member ids the choice was BUILT
-    /// with.
+    /// HARD-delete EVERY session in the target's fork lineage — the full-store
+    /// lineage, soft-hidden and out-of-scope members included, where `Ctrl-X x`
+    /// flips only what a row stands for on screen — carrying the member ids the
+    /// choice was BUILT with. Offered only on the HEAD row (the row not drawn
+    /// `↳`) of a multi-member lineage ([`App::lineage_choice`]), even one standing
+    /// alone on the board, since the confirm counts and discloses; a `↳` row's
+    /// confirm is single-id.
     ///
     /// The ids ride the action rather than being re-derived at confirm time, and
     /// that is a correctness property, not a convenience (the precedent is
@@ -416,8 +442,31 @@ pub enum ModalAction {
     /// headless `claude` child's `set_cwd` does the move, `crate::claude_move`,
     /// and the board stays up). The folder rides the choice, like
     /// [`ModalAction::New`]'s agent, so a reload while the picker is open cannot
-    /// change what is moved.
+    /// change what is moved. The move picker's row on a `↳` row or a lone
+    /// session, and the scope confirm's `Move this`.
     MoveTo(PathBuf),
+    /// A move-picker row on a lineage HEAD row ([`App::lineage_choice`]):
+    /// confirming it moves nothing and opens the scope confirm
+    /// ([`App::open_move_scope_confirm`]) for the carried folder instead. The
+    /// lineage's member ids ride it, resolved when the picker opened, for the
+    /// reason [`ModalAction::DeleteLineage`] gives.
+    ChooseMoveScope {
+        /// The picked folder.
+        target: PathBuf,
+        /// Every member of the head row's lineage (`App::lineage_member_ids`).
+        members: Vec<String>,
+    },
+    /// The scope confirm's `Move lineage (N)`: move every carried id to `target`,
+    /// best effort, one member after another on one worker
+    /// (`crate::claude_move::MoveJob::Lineage`). The ids ride the action, like
+    /// [`ModalAction::DeleteLineage`]'s, so a reload while either modal is open
+    /// cannot change membership, and the `(N)` shown is the set moved.
+    MoveLineage {
+        /// The picked folder.
+        target: PathBuf,
+        /// Every member of the head row's lineage, hidden ones included.
+        ids: Vec<String>,
+    },
     /// Dismiss the modal, returning to the board.
     Cancel,
 }
@@ -719,7 +768,7 @@ struct AutoscrollClock {
 /// A titled, centered prompt with N labelled choices and a wrapping-cycle
 /// highlight — the ONE overlay model behind the running-session choice, the
 /// new-session agent picker, the hard-delete confirm, a compose's `Ctrl-L`
-/// model picker, and the `Ctrl-X w` move picker.
+/// model picker, and the `Ctrl-X w` move picker with its lineage scope confirm.
 ///
 /// Modeled as explicit state so the whole overlay is a small, unit-testable state
 /// machine that owns the keyboard while open. `selected` is a `rem_euclid` index
@@ -866,9 +915,10 @@ pub const MODEL_PICKER_REPLY_MESSAGE: &str = "Model for this reply only (←/→
 pub const MODEL_PICKER_DRAFT_MESSAGE: &str = "Model for this new session (←/→ effort):";
 
 /// The footer of every `Row`-layout [`Modal`] — the running-session
-/// Attach/Fork/Cancel choice and the hard-delete confirm. Both are button strips
-/// whose choices sit side by side, so `←`/`→` move the highlight and `Enter` runs
-/// whichever button it is on; neither has a second verb to name.
+/// Attach/Fork/Cancel choice, the hard-delete confirm and the move's lineage
+/// scope confirm. All are button strips whose choices sit side by side, so
+/// `←`/`→` move the highlight and `Enter` runs whichever button it is on; none
+/// has a second verb to name.
 pub const MODAL_ROW_FOOTER: &str = "←/→ choose · Enter confirm · Esc cancel";
 
 /// The new-session agent picker's footer. The picker has TWO verbs, so its footer
@@ -878,8 +928,14 @@ pub const MODAL_ROW_FOOTER: &str = "←/→ choose · Enter confirm · Esc cance
 pub const AGENT_PICKER_FOOTER: &str = "↑/↓ choose · Enter draft · ^O interactive · Esc cancel";
 
 /// Footer of the `Ctrl-X w` move picker: `Enter` moves the session; the board
-/// stays up and says where it went.
+/// stays up and says where it went. On a lineage head row `Enter` reaches the
+/// move through one more confirm ([`App::open_move_scope_confirm`]), whose every
+/// button but `Cancel` moves, so one footer stays true for every row.
 pub const MOVE_PICKER_FOOTER: &str = "↑/↓ choose · Enter move · Esc cancel";
+
+/// The title of both `Ctrl-X w` modals — the move picker and, on a lineage head,
+/// the scope confirm that follows it — so the second reads as a step of the first.
+const MOVE_MODAL_TITLE: &str = "move session";
 
 /// Refusal: `Ctrl-X w` on a session outside the launch project, whose worktrees
 /// are not in the cached set (resolving them would put `git` on a keypress).
@@ -1246,11 +1302,13 @@ pub struct SessionCounts {
 /// is one entry and an expanded one is its head plus its children — which is why
 /// the numerator re-groups it instead of taking its length.
 ///
-/// A lineage is HIDDEN only when EVERY member is in `hidden_ids`. Hiding flips a
-/// whole family at once in practice (`App::toggle_hidden_selected` ->
-/// `lineage_member_ids`), but the strict test is what keeps a partially hidden
-/// lineage — one member hidden, another still drawing — counted as the visible
-/// row it is. `all` over an empty group would answer `true`; it cannot arise,
+/// A lineage is HIDDEN only when EVERY member is in `hidden_ids`. A hide flips at
+/// most what one row stands for on screen (`App::hide_choice` ->
+/// `on_screen_lineage`), never the members a query, the scope or an earlier hide
+/// keeps off the board, and a `↳` row or a row standing alone hides itself
+/// alone; so a partly hidden lineage is common, and the strict test is what keeps
+/// one — a member hidden, another still drawing — counted as the visible row it
+/// is. `all` over an empty group would answer `true`; it cannot arise,
 /// because [`lineage::group_members`] only ever emits non-empty groups.
 ///
 /// Pure so the arithmetic is assertable without an [`App`], a store or a
@@ -1319,6 +1377,91 @@ fn child_indices(sessions: &[Session], filtered: &[usize]) -> HashSet<usize> {
             group.into_iter().filter(move |&i| i != head)
         })
         .collect()
+}
+
+/// Whether the row for `sessions[index]` is drawn as a `↳` lineage CHILD — the
+/// row role [`App::lineage_choice`] reads to decide whether an action on it may
+/// cover its whole fork lineage (a child row acts on itself alone). Delete and
+/// move read it there. Hide reads [`stands_for_others`] instead, which is `false`
+/// on every `↳` row by the same partition.
+///
+/// The board position decides, never ancestry: this IS membership in
+/// [`child_indices`], the set [`build_rows`] marks `Row::Session { child }`
+/// with, so it cannot drift from the indent on screen. `filtered` is the
+/// post-hide-filter, post-fold visible list, which is what makes show-hidden mode
+/// and a live query count by construction. A folded lineage shows only its head,
+/// so a folded row is never a child; an index absent from `filtered` is not a
+/// child either. Pure.
+fn is_lineage_child(sessions: &[Session], filtered: &[usize], index: usize) -> bool {
+    child_indices(sessions, filtered).contains(&index)
+}
+
+/// Whether the row for `sessions[index]` VISIBLY stands for other members of its
+/// fork lineage: a folded head showing `(+N)`, or an expanded head with `↳` rows
+/// drawn beneath it. The WHEN of `Ctrl-X x` ([`App::hide_choice`]):
+/// [`on_screen_lineage`] is the WHICH, the members such a row stands for.
+///
+/// Reads only the two facts the board renders, and adds no grouping of its own:
+/// `folded` is the fold's head -> folded-count map ([`App::hidden`]), which
+/// [`build_rows`] draws as `Row::Session { hidden }`, the `(+N)` marker; and the
+/// expanded case is the [`lineage::group_members`] partition of `filtered` with
+/// its [`lineage::head_of`] head — exactly what [`child_indices`] indents by.
+/// [`App::recompute_filtered`] builds both in order: the query, then the hide
+/// filter (skipped while show-hidden is on), then the fold. So a live query,
+/// soft-hidden members and the scope all count by construction, and while
+/// show-hidden is on hidden members take part in the fold.
+///
+/// `false` for a `↳` row, a lone or rootless session, a head whose other members
+/// are all off the board, and an index absent from `filtered`. `true` implies
+/// `!is_lineage_child` and a `Some` [`App::lineage_choice`]. Pure.
+fn stands_for_others(
+    sessions: &[Session],
+    filtered: &[usize],
+    folded: &HashMap<usize, usize>,
+    index: usize,
+) -> bool {
+    if folded.get(&index).is_some_and(|&count| count > 0) {
+        return true;
+    }
+    lineage::group_members(sessions, filtered)
+        .into_iter()
+        .any(|group| group.len() > 1 && lineage::head_of(sessions, &group) == index)
+}
+
+/// The members `Ctrl-X x` flips from the row for `sessions[index]`: the row
+/// itself plus every member it stands for ON SCREEN, or `None` when the session
+/// flips alone. [`stands_for_others`] is the WHEN, unchanged; this adds only the
+/// WHICH.
+///
+/// The set is the [`lineage::group_members`] group of `unfolded` that holds
+/// `index` ([`App::unfolded`], the very list [`lineage::fold`] received), kept
+/// only with more than one member. That is the same partition [`child_indices`]
+/// and [`stands_for_others`] read, over the same lineage key, so this adds no
+/// grouping of its own. For a folded head the group is exactly the head plus the
+/// `hidden[head]` members the fold counted into its `(+N)`; for an expanded head
+/// it is exactly the head plus its `↳` rows.
+///
+/// `unfolded` never holds a member that is off the board — one the query filtered
+/// out, one outside the scope, or, with show-hidden off, one already hidden — so
+/// none of them is ever in the set. With show-hidden on, hidden members are in
+/// `unfolded` and take part. Whether the list is kept before or after the hide
+/// filter makes no difference to a hide or an un-hide: re-inserting an
+/// already-hidden id is a no-op, and un-hiding needs show-hidden on, where the
+/// filter is skipped. Pure.
+fn on_screen_lineage(
+    sessions: &[Session],
+    unfolded: &[usize],
+    filtered: &[usize],
+    folded: &HashMap<usize, usize>,
+    index: usize,
+) -> Option<Vec<usize>> {
+    if !stands_for_others(sessions, filtered, folded, index) {
+        return None;
+    }
+    lineage::group_members(sessions, unfolded)
+        .into_iter()
+        .find(|group| group.contains(&index))
+        .filter(|group| group.len() > 1)
 }
 
 /// What `Ctrl-X f` does to the selected row's fork lineage — the decision
@@ -2218,10 +2361,10 @@ pub struct App {
     /// next one, through [`undelivered`](Self::undelivered). Either way an entry is
     /// removed only once its reply child has finished. See [`Sending`].
     pub sending: Vec<Sending>,
-    /// The session ids whose `Ctrl-X w` move is IN FLIGHT (dispatched, its
+    /// The session ids whose `Ctrl-X w` move is IN FLIGHT (dispatched, its job's
     /// `AppEvent::MoveFinished` not yet landed), at most one entry per session.
     /// Added at the picker's confirm ([`mark_moving`](Self::mark_moving)) and
-    /// removed when THAT session's completion lands
+    /// removed when the completion of the job that dispatched it lands, naming it
     /// ([`clear_moving`](Self::clear_moving)), on this board or, through
     /// [`undelivered`](Self::undelivered), the next one. While an id is here
     /// snapback's own `claude` child may be moving and appending to its
@@ -2232,7 +2375,8 @@ pub struct App {
     moving: Vec<String>,
     /// Completions a board session ended before it could read, kept here for the
     /// next board: the quick reply's `AppEvent::SendFinished` and the `Ctrl-X w`
-    /// move's `AppEvent::MoveFinished` (which alone clears [`moving`](Self::moving)).
+    /// move job's `AppEvent::MoveFinished` (which alone clears its ids'
+    /// [`moving`](Self::moving) entries).
     ///
     /// It lives on `App` because `tui::run_inner` drops the board's receiver at
     /// every hand-off, while `lib::run` re-enters the board on the SAME `App`: the
@@ -2404,6 +2548,18 @@ pub struct App {
     /// Contrast `expanded` above, which must cross reloads and therefore may not
     /// be.
     hidden: HashMap<usize, usize>,
+    /// The list [`lineage::fold`] folded in the last
+    /// [`recompute_filtered`](Self::recompute_filtered): the scoped rows, after
+    /// the query and the hide filter (skipped while show-hidden is on), in display
+    /// order. So it holds every member the board stands for, each folded head's
+    /// `(+N)` members included, which `filtered` (post-fold) and `hidden` (a count
+    /// per head) cannot name.
+    ///
+    /// Derived, and rebuilt together with `filtered` and `hidden`, so index-keyed
+    /// is safe for the reason `hidden`'s doc gives; never persisted (AGENTS.md
+    /// SNAPBACK-OWNED STATE). Nothing navigates by it: only the hide's reach
+    /// ([`on_screen_lineage`]) reads it.
+    unfolded: Vec<usize>,
     /// Session ids showing the anthropics/claude-code#80811 downgrade: a
     /// background fork carrying an agent NAME that lost the agent BINDING its own
     /// lineage root still carries (see [`lineage::lost_agent_bindings`]).
@@ -2681,6 +2837,7 @@ impl App {
             population: Vec::new(),
             expanded: HashSet::new(),
             hidden: HashMap::new(),
+            unfolded: Vec::new(),
             lost_agent_bindings,
             // Load the persisted hidden set ONCE at startup. Resolve the dir here
             // (and again at save time) rather than caching a path, so a
@@ -2762,12 +2919,13 @@ impl App {
             .collect()
     }
 
-    /// Every session id that hides or exposes TOGETHER with the selection: all
-    /// members of its fork lineage, so a folded lineage (its `(+N)` nested forks
-    /// included) flips as one unit rather than shedding only its head. Gathered
-    /// from the FULL store — not the visible `filtered` — so already-folded or
-    /// already-hidden forks are swept in too. A selection with no derivable lineage
-    /// (a rootless session) is its own singleton.
+    /// Every member of the selected row's fork lineage — the ONE full-store
+    /// grouping the lineage-wide actions take: delete and move from a HEAD row
+    /// (see [`lineage_choice`](Self::lineage_choice)), so a folded lineage (its
+    /// `(+N)` nested forks included) goes as one unit rather than shedding only
+    /// its head. Gathered from the FULL store — not the visible `filtered` — so
+    /// already-folded or already-hidden forks are swept in too. A selection with
+    /// no derivable lineage (a rootless session) is its own singleton.
     fn lineage_member_ids(&self, selected_id: &str) -> Vec<String> {
         match self.selected_lineage() {
             Some(key) => {
@@ -2785,6 +2943,56 @@ impl App {
             }
             None => vec![selected_id.to_string()],
         }
+    }
+
+    /// The whole fork lineage a lineage-wide action on the SELECTED row would
+    /// cover, or `None` when that row offers no lineage choice: nothing is
+    /// selected, the row is a `↳` child ([`is_lineage_child`] — the board position
+    /// decides), or the lineage has one member (a lone or rootless session).
+    ///
+    /// `Some` carries [`lineage_member_ids`](Self::lineage_member_ids) unchanged —
+    /// the full store, hidden and out-of-scope members included — so this adds no
+    /// grouping of its own. Delete and move ask it; hide does not, and flips only
+    /// what a row stands for on screen ([`hide_choice`](Self::hide_choice)).
+    fn lineage_choice(&self) -> Option<Vec<String>> {
+        let id = self.selected.as_deref()?;
+        let index = self.selected_index()?;
+        if is_lineage_child(&self.sessions, &self.filtered, index) {
+            return None;
+        }
+        let members = self.lineage_member_ids(id);
+        (members.len() > 1).then_some(members)
+    }
+
+    /// The ids `Ctrl-X x` flips from the SELECTED row, or `None` when it flips
+    /// that session alone. From a row that VISIBLY stands for others
+    /// ([`stands_for_others`] — a folded `(+N)` head, or an expanded head with `↳`
+    /// rows beneath it) it is that row's on-screen members ([`on_screen_lineage`]):
+    /// the row plus its `(+N)` members or its `↳` rows. It never returns the full
+    /// store.
+    ///
+    /// Hide is silent, with no confirm, so in no row role may it reach a row the
+    /// user cannot see. A re-head can only promote a member that is on screen, so
+    /// flipping the on-screen members is all the whole-lineage hide ever needed.
+    /// Delete and move keep [`lineage_choice`](Self::lineage_choice) over the full
+    /// store, because they confirm first with a count and a hidden-member
+    /// disclosure, and AGENTS.md STORE WRITES requires it. The asymmetry is argued
+    /// in `docs/agents/DOMAIN.md` "Row role".
+    fn hide_choice(&self) -> Option<Vec<String>> {
+        let index = self.selected_index()?;
+        let members = on_screen_lineage(
+            &self.sessions,
+            &self.unfolded,
+            &self.filtered,
+            &self.hidden,
+            index,
+        )?;
+        Some(
+            members
+                .into_iter()
+                .map(|i| self.sessions[i].session_id.clone())
+                .collect(),
+        )
     }
 
     /// The single selection setter: assign the selected id and, when it actually
@@ -3161,17 +3369,30 @@ impl App {
     /// a soft-hidden row is meant to stay off the board. Un-hiding (toggling an
     /// already-hidden id) puts it back on the next re-filter.
     ///
-    /// A background-fork LINEAGE hides and exposes as ONE unit: the whole `(+N)`
-    /// family flips together (see [`lineage_member_ids`](Self::lineage_member_ids)),
-    /// so a folded head can never shed only itself and let the fold re-head to a
-    /// surviving fork — the lineage leaves and returns to the board whole.
+    /// What the board SHOWS decides the reach ([`hide_choice`](Self::hide_choice)):
+    ///
+    /// - From a row that visibly stands for others — a folded `(+N)` head, or an
+    ///   expanded head with `↳` rows beneath it — the row and the members it
+    ///   stands for on screen flip together. The row leaves whole, and nothing on
+    ///   the board re-heads into its place. Members off the board stay exactly as
+    ///   they are: those the query filtered out, those outside the scope, and,
+    ///   with show-hidden off, those an earlier hide removed.
+    /// - Any other row flips that session alone: a `↳` row, or a head whose other
+    ///   members are off the board (filtered out by the query, already hidden with
+    ///   show-hidden off, out of scope). Nothing visible could re-head, so this
+    ///   silent verb, with no confirm, reaches no row the user cannot see.
+    ///
+    /// Both pivot on the selected id through [`delete::toggle_hidden`], so
+    /// un-hiding from such a head (show-hidden on, where hidden members take part
+    /// in the fold) exposes every member it stands for, one hidden on its own
+    /// included — an accepted side effect.
     ///
     /// A no-op when nothing is selected. Wired to the `Ctrl-X x` soft-hide chord.
     pub fn toggle_hidden_selected(&mut self) {
         let Some(id) = self.selected.clone() else {
             return;
         };
-        let members = self.lineage_member_ids(&id);
+        let members = self.hide_choice().unwrap_or_else(|| vec![id.clone()]);
         delete::toggle_hidden(&mut self.hidden_ids, &members, &id);
         self.persist_hidden();
         self.reapply_preserving_selection();
@@ -3971,27 +4192,32 @@ impl App {
     /// irreversible delete. This method only OPENS the prompt — it never deletes.
     /// A no-op when nothing is selected.
     ///
-    /// The LINEAGE choice appears only when the selection's fork lineage actually
-    /// has more than one member, and its `(N)` is that real count. It exists
-    /// because hide is already a GROUP operation
-    /// ([`toggle_hidden_selected`](Self::toggle_hidden_selected)) while delete was
-    /// single-id, and the asymmetry showed: hard-deleting a folded HEAD left its
-    /// members behind and the fold simply re-headed to a surviving fork, so the
-    /// row never left the board and the delete read as broken. The member ids are
-    /// resolved HERE, from [`lineage_member_ids`](Self::lineage_member_ids) — the
-    /// same grouping the hide uses, never a second rule — and ride the
+    /// The LINEAGE choice appears only on the HEAD row (the row not drawn `↳`) of
+    /// a fork lineage with more than one member, decided by
+    /// [`lineage_choice`](Self::lineage_choice) — a head standing alone on the
+    /// board included, where [`toggle_hidden_selected`](Self::toggle_hidden_selected)
+    /// would hide that row alone, because this confirm counts and discloses
+    /// before anything goes — and its `(N)` is that real count. A `↳` row's
+    /// confirm is single-id
+    /// (`[Delete this] [Cancel]`, the plain prompt, no lineage disclosure). It
+    /// exists because hard-deleting a folded HEAD alone left its members behind
+    /// and the fold simply re-headed to a surviving fork, so the row never left
+    /// the board and the delete read as broken. The member ids are resolved HERE,
+    /// from [`lineage_member_ids`](Self::lineage_member_ids) — the ONE full-store
+    /// grouping delete and move share, never a second rule — and ride the
     /// [`ModalAction::DeleteLineage`] choice, so the count shown and the set
     /// deleted cannot disagree even if a reload moves the selection while the
-    /// modal is open.
+    /// modal is open. Hide, which is silent, flips only what a row stands for on
+    /// screen, through the same lineage key.
     ///
     /// That grouping sweeps the FULL store, so `(N)` can exceed what is on
-    /// screen: a soft-HIDDEN member counts and is deleted. Deliberate — it is
-    /// hide's own rule reused rather than a second one, and hiding a copy is a
-    /// visibility preference, not a claim the copy is gone. `(N)` therefore
-    /// states the real size of the family the button takes, which is exactly the
-    /// number that must not surprise anyone afterwards — and when some of that
-    /// family is off screen, [`delete_confirm_message`] SAYS SO, so the number is
-    /// predictable before the confirm rather than only explicable after it.
+    /// screen: a soft-HIDDEN member counts and is deleted. Deliberate — hiding a
+    /// copy is a visibility preference, not a claim the copy is gone. `(N)`
+    /// therefore states the real size of the family the button takes, which is
+    /// exactly the number that must not surprise anyone afterwards — and when
+    /// some of that family is off screen, [`delete_confirm_message`] SAYS SO, so
+    /// the number is predictable before the confirm rather than only explicable
+    /// after it.
     ///
     /// The message states the BLAST RADIUS honestly, because the writer guard now
     /// admits parked background agents: what goes is the transcript on disk, the
@@ -4001,23 +4227,23 @@ impl App {
         let Some(id) = self.selected.clone() else {
             return;
         };
-        let members = self.lineage_member_ids(&id);
-        // Counted from the SAME member list the button carries, so the disclosure
-        // and the set deleted can never describe different families.
-        let hidden = members
-            .iter()
-            .filter(|id| self.hidden_ids.contains(*id))
-            .count();
-        let message = delete_confirm_message(members.len(), hidden);
+        // `None` on a `↳` row and on a lone session: neither offers a lineage, so
+        // neither discloses one.
+        let lineage = self.lineage_choice();
+        let message = match &lineage {
+            // Counted from the SAME member list the button carries, so the
+            // disclosure and the set deleted can never describe different
+            // families.
+            Some(members) => delete_confirm_message(members.len(), self.hidden_count(members)),
+            None => DELETE_CONFIRM_PROMPT.to_string(),
+        };
         let mut choices = vec![ModalChoice {
             label: "Delete this".to_string(),
             description: None,
             wrap_description: false,
             action: ModalAction::Delete,
         }];
-        // Only offer the lineage when there IS one: a lone session would otherwise
-        // get a second button that does exactly what the first does.
-        if members.len() > 1 {
+        if let Some(members) = lineage {
             choices.push(ModalChoice {
                 label: format!("Delete lineage ({})", members.len()),
                 description: None,
@@ -4050,6 +4276,16 @@ impl App {
             // at the top.
             scroll: 0,
         });
+    }
+
+    /// How many of `members` are soft-hidden ([`hidden_ids`](Self::hidden_ids)):
+    /// the count a lineage confirm discloses ([`lineage_confirm_message`]), taken
+    /// from the same list its button carries.
+    fn hidden_count(&self, members: &[String]) -> usize {
+        members
+            .iter()
+            .filter(|id| self.hidden_ids.contains(*id))
+            .count()
     }
 
     /// Open `modal` as the active overlay, taking the keyboard until it closes.
@@ -4316,9 +4552,10 @@ impl App {
         }
     }
 
-    /// Forget `session_id`'s in-flight move, because its `AppEvent::MoveFinished`
-    /// landed: that move's child has finished. Only that session's entry goes; an
-    /// id with no entry (a stale completion) changes nothing.
+    /// Forget `session_id`'s in-flight move, because the `AppEvent::MoveFinished`
+    /// of the job that dispatched it landed, naming it: that job's children have
+    /// finished. Only that session's entry goes (the event's arm calls this once
+    /// per id it names); an id with no entry (a stale completion) changes nothing.
     pub fn clear_moving(&mut self, session_id: &str) {
         self.moving.retain(|id| id != session_id);
     }
@@ -4406,17 +4643,20 @@ impl App {
     /// The session's folder is resolved ONCE here, a bounded one-shot on this
     /// keypress like `resume::check`'s existence check; the worktree set is the
     /// cached one, never a fresh `git` call.
+    ///
+    /// On a lineage HEAD row ([`lineage_choice`](Self::lineage_choice)) every row
+    /// carries [`ModalAction::ChooseMoveScope`] with the lineage's members, so
+    /// `Enter` asks this session or the whole lineage
+    /// ([`open_move_scope_confirm`](Self::open_move_scope_confirm)); on a `↳` row
+    /// or a lone session it carries [`ModalAction::MoveTo`] and moves at once.
+    /// Only the selected row's own-writer and scope checks run here; each member's
+    /// are the lineage job's.
     pub fn open_move_picker(&mut self) {
         let Some(id) = self.selected_session().map(|s| s.session_id.clone()) else {
             return;
         };
-        let own_writer = if self.moving_on(&id) {
-            Some(claude_move::MOVE_IN_FLIGHT_REFUSAL)
-        } else if self.sending_to(&id).is_some() {
-            Some(claude_move::MOVE_SENDING_REFUSAL)
-        } else {
-            None
-        };
+        let own_writer =
+            claude_move::own_writer_refusal(self.moving_on(&id), self.sending_to(&id).is_some());
         if let Some(refusal) = own_writer {
             self.set_status(refusal.to_string());
             return;
@@ -4441,26 +4681,99 @@ impl App {
         }
         let main = self.worktrees.main().map(Path::to_path_buf);
         let project_label = self.project_label();
+        let lineage = self.lineage_choice();
         let choices = targets
             .into_iter()
             .map(|target| {
                 let label = move_choice_label(&target, main.as_deref(), &project_label);
+                let action = match &lineage {
+                    Some(members) => ModalAction::ChooseMoveScope {
+                        target,
+                        members: members.clone(),
+                    },
+                    None => ModalAction::MoveTo(target),
+                };
                 ModalChoice {
                     label,
                     description: None,
                     wrap_description: false,
-                    action: ModalAction::MoveTo(target),
+                    action,
                 }
             })
             .collect();
         self.open_modal(Modal {
-            title: "move session".to_string(),
+            title: MOVE_MODAL_TITLE.to_string(),
             message: "Move this session to:".to_string(),
             layout: ModalLayout::List,
             footer: MOVE_PICKER_FOOTER,
             choices,
             selected: 0,
             session_id: Some(id),
+            scroll: 0,
+        });
+    }
+
+    /// Open the move's lineage SCOPE confirm, after the picker's `Enter` on a
+    /// lineage HEAD row ([`ModalAction::ChooseMoveScope`]): a `Row` modal reading
+    /// `[Move this] [Move lineage (N)] [Cancel]`, DEFAULT-HIGHLIGHTED ON CANCEL like
+    /// the delete confirm, targeting `session_id` (the head). `label` is the picked
+    /// folder's picker label, named in the prompt.
+    ///
+    /// `Move this` is the plain single move ([`ModalAction::MoveTo`]); `Move
+    /// lineage (N)` carries `members` ([`ModalAction::MoveLineage`]), resolved when
+    /// the picker opened. That set sweeps the full store, so the message
+    /// discloses its soft-hidden members in delete's shape
+    /// ([`lineage_confirm_message`]). This only opens the prompt; nothing is
+    /// marked moving or dispatched until a button is confirmed.
+    pub fn open_move_scope_confirm(
+        &mut self,
+        session_id: String,
+        target: PathBuf,
+        members: Vec<String>,
+        label: String,
+    ) {
+        let message = lineage_confirm_message(
+            members.len(),
+            self.hidden_count(&members),
+            &move_scope_prompt(&label),
+        );
+        let choices = vec![
+            ModalChoice {
+                label: "Move this".to_string(),
+                description: None,
+                wrap_description: false,
+                action: ModalAction::MoveTo(target.clone()),
+            },
+            ModalChoice {
+                label: format!("Move lineage ({})", members.len()),
+                description: None,
+                wrap_description: false,
+                action: ModalAction::MoveLineage {
+                    target,
+                    ids: members,
+                },
+            },
+            ModalChoice {
+                label: "Cancel".to_string(),
+                description: None,
+                wrap_description: false,
+                action: ModalAction::Cancel,
+            },
+        ];
+        // The safe default by the Cancel choice's position, as the delete confirm
+        // derives it, so a reorder cannot move it onto a button that moves.
+        let selected = choices
+            .iter()
+            .position(|c| c.action == ModalAction::Cancel)
+            .unwrap_or(0);
+        self.open_modal(Modal {
+            title: MOVE_MODAL_TITLE.to_string(),
+            message,
+            layout: ModalLayout::Row,
+            footer: MODAL_ROW_FOOTER,
+            choices,
+            selected,
+            session_id: Some(session_id),
             scroll: 0,
         });
     }
@@ -4914,6 +5227,8 @@ impl App {
     /// wheel keep working untouched and know nothing about lineages — every one
     /// of them would otherwise have to skip hidden rows by hand. Folding earlier
     /// would also hand `order_filtered` a list it no longer decides the shape of.
+    /// The list the fold received is kept as [`unfolded`](Self::unfolded) for the
+    /// hide's reach.
     fn recompute_filtered(&mut self) {
         if self.query_input.is_empty() {
             self.filtered = self.scoped.clone();
@@ -4932,9 +5247,11 @@ impl App {
                 .retain(|&i| !self.hidden_ids.contains(&self.sessions[i].session_id));
         }
         self.order_filtered();
-        let folded = lineage::fold(&self.sessions, &self.filtered, &self.expanded);
+        let unfolded = std::mem::take(&mut self.filtered);
+        let folded = lineage::fold(&self.sessions, &unfolded, &self.expanded);
         self.filtered = folded.visible;
         self.hidden = folded.hidden;
+        self.unfolded = unfolded;
     }
 
     /// Sort [`filtered`](Self::filtered) into scope-aware DISPLAY order.
@@ -6331,6 +6648,947 @@ mod tests {
                 .iter()
                 .all(|m| !app.hidden_ids.contains(*m)),
             "exposing the lineage clears every member from the hidden set"
+        );
+
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Index into `app.sessions` of the session `id`.
+    fn index_of(app: &App, id: &str) -> usize {
+        app.sessions
+            .iter()
+            .position(|s| s.session_id == id)
+            .expect("the session is in the store")
+    }
+
+    /// The row role [`is_lineage_child`] gives the session `id` on `app`'s board.
+    fn is_child_row(app: &App, id: &str) -> bool {
+        is_lineage_child(&app.sessions, &app.filtered, index_of(app, id))
+    }
+
+    /// The ids among `ids` that are in the hidden set `set`, in `ids`' order.
+    fn hidden_among<'a>(set: &HashSet<String>, ids: &[&'a str]) -> Vec<&'a str> {
+        ids.iter().copied().filter(|id| set.contains(*id)).collect()
+    }
+
+    /// The `↳` indent the board draws and the row role delete and move read
+    /// are ONE fact: for every session row `build_rows` emits, `child` equals
+    /// `is_lineage_child`, on a folded board and an expanded one.
+    #[test]
+    fn is_lineage_child_agrees_with_the_rendered_indent() {
+        let mut app = app_all(vec![
+            session_fork("sbrole-new", "/tmp/p", "role-root", 300),
+            session_fork("sbrole-mid", "/tmp/p", "role-root", 200),
+            session_fork("sbrole-old", "/tmp/p", "role-root", 100),
+            session_fork("sbrole-lone", "/tmp/p", "lone-root", 250),
+            session_ts("sbrole-rootless", "repo", Some("main"), "/tmp/p", 50),
+        ]);
+        // How many child rows the board draws, asserting on the way that each
+        // session row's indent agrees with the helper.
+        let drawn_children = |app: &App| -> usize {
+            let mut children = 0;
+            for row in app.rows() {
+                if let Row::Session { index, child, .. } = row {
+                    assert_eq!(
+                        child,
+                        is_lineage_child(&app.sessions, &app.filtered, index),
+                        "the indent and the row role disagree for {}",
+                        app.sessions[index].session_id
+                    );
+                    children += usize::from(child);
+                }
+            }
+            children
+        };
+
+        assert_eq!(drawn_children(&app), 0, "a folded board draws no `↳` row");
+        assert!(!is_child_row(&app, "sbrole-new"), "a folded head");
+        assert!(
+            !is_child_row(&app, "sbrole-mid"),
+            "a member folded away is absent from `filtered`, so it is no child"
+        );
+        assert!(!is_child_row(&app, "sbrole-lone"), "a lineage of one");
+        assert!(!is_child_row(&app, "sbrole-rootless"), "a rootless session");
+
+        app.set_selected(Some("sbrole-new".to_string()));
+        app.toggle_selected_lineage();
+        assert_eq!(visible_ids(&app).len(), 5, "premise: the lineage is open");
+        assert_eq!(drawn_children(&app), 2, "an open lineage draws its members");
+        assert!(!is_child_row(&app, "sbrole-new"), "an expanded head");
+        assert!(is_child_row(&app, "sbrole-mid"), "an expanded member");
+        assert!(is_child_row(&app, "sbrole-old"), "an expanded member");
+        assert!(!is_child_row(&app, "sbrole-lone"), "a lineage of one");
+        assert!(!is_child_row(&app, "sbrole-rootless"), "a rootless session");
+    }
+
+    /// Show-hidden mode decides which member heads a lineage, and the row role
+    /// follows it: a hidden newest member is off the board (the next one heads)
+    /// until show-hidden is on, when it heads and the old head becomes a `↳` row.
+    #[test]
+    fn is_lineage_child_follows_show_hidden() {
+        let mut app = app_all(vec![
+            session_fork("sbshow-new", "/tmp/p", "show-root", 300),
+            session_fork("sbshow-mid", "/tmp/p", "show-root", 200),
+            session_fork("sbshow-old", "/tmp/p", "show-root", 100),
+        ]);
+        app.hidden_ids.insert("sbshow-new".to_string());
+        app.recompute_filtered();
+        app.set_selected(Some("sbshow-mid".to_string()));
+        app.toggle_selected_lineage();
+        assert_eq!(
+            visible_ids(&app),
+            vec!["sbshow-mid", "sbshow-old"],
+            "premise: the lineage is open without its hidden member"
+        );
+        assert!(
+            !is_child_row(&app, "sbshow-mid"),
+            "mid heads while new is hidden"
+        );
+        assert!(is_child_row(&app, "sbshow-old"));
+
+        app.toggle_show_hidden();
+        assert_eq!(
+            visible_ids(&app),
+            vec!["sbshow-new", "sbshow-mid", "sbshow-old"],
+            "premise: show-hidden brings the hidden member back into the fold"
+        );
+        assert!(
+            !is_child_row(&app, "sbshow-new"),
+            "the hidden member now heads"
+        );
+        assert!(
+            is_child_row(&app, "sbshow-mid"),
+            "and the old head is a `↳` row"
+        );
+        assert!(is_child_row(&app, "sbshow-old"));
+    }
+
+    /// `Ctrl-X x` on a `↳` row hides, and un-hides, that session ALONE: the head
+    /// stays, so nothing re-heads and the rest of the lineage stays on the board.
+    #[test]
+    fn ctrl_x_x_on_a_child_row_hides_only_that_member() {
+        let _guard = crate::config::env_lock();
+        let dir = unique_temp_dir("hide-child");
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &dir);
+
+        let members = ["sbchild-new", "sbchild-mid", "sbchild-old"];
+        let mut app = app_all(vec![
+            session_fork("sbchild-new", "/tmp/p", "child-root", 300),
+            session_fork("sbchild-mid", "/tmp/p", "child-root", 200),
+            session_fork("sbchild-old", "/tmp/p", "child-root", 100),
+        ]);
+        app.set_selected(Some("sbchild-new".to_string()));
+        app.toggle_selected_lineage();
+        app.set_selected(Some("sbchild-mid".to_string()));
+        assert!(is_child_row(&app, "sbchild-mid"), "premise: a `↳` row");
+
+        app.toggle_hidden_selected();
+        assert_eq!(
+            hidden_among(&app.hidden_ids, &members),
+            vec!["sbchild-mid"],
+            "only the `↳` row is hidden"
+        );
+        assert_eq!(
+            hidden_among(
+                &crate::hidden::load_hidden(&crate::config::state_dir()),
+                &members
+            ),
+            vec!["sbchild-mid"],
+            "and only it is persisted"
+        );
+        assert_eq!(
+            visible_ids(&app),
+            vec!["sbchild-new", "sbchild-old"],
+            "the head and the other member stay on the board"
+        );
+
+        app.toggle_show_hidden();
+        app.set_selected(Some("sbchild-mid".to_string()));
+        assert!(
+            is_child_row(&app, "sbchild-mid"),
+            "premise: still a `↳` row"
+        );
+        app.toggle_hidden_selected();
+        assert!(
+            hidden_among(&app.hidden_ids, &members).is_empty(),
+            "un-hiding from the `↳` row exposes it alone (nothing else was hidden)"
+        );
+        assert!(
+            hidden_among(
+                &crate::hidden::load_hidden(&crate::config::state_dir()),
+                &members
+            )
+            .is_empty(),
+            "the un-hide is persisted"
+        );
+
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The accepted side effect of pivoting on the head: un-hiding a lineage from
+    /// its head row exposes EVERY member, including a `↳` member hidden on its
+    /// own before the lineage was hidden.
+    #[test]
+    fn unhiding_from_the_head_also_exposes_a_child_hidden_alone() {
+        let _guard = crate::config::env_lock();
+        let dir = unique_temp_dir("unhide-head");
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &dir);
+
+        let members = ["sbside-new", "sbside-mid", "sbside-old"];
+        let mut app = app_all(vec![
+            session_fork("sbside-new", "/tmp/p", "side-root", 300),
+            session_fork("sbside-mid", "/tmp/p", "side-root", 200),
+            session_fork("sbside-old", "/tmp/p", "side-root", 100),
+        ]);
+        app.set_selected(Some("sbside-new".to_string()));
+        app.toggle_selected_lineage();
+        app.set_selected(Some("sbside-mid".to_string()));
+        app.toggle_hidden_selected();
+        assert_eq!(
+            hidden_among(&app.hidden_ids, &members),
+            vec!["sbside-mid"],
+            "premise: the `↳` member is hidden on its own"
+        );
+
+        app.set_selected(Some("sbside-new".to_string()));
+        assert!(!is_child_row(&app, "sbside-new"), "premise: the head row");
+        app.toggle_hidden_selected();
+        assert_eq!(
+            hidden_among(&app.hidden_ids, &members),
+            members.to_vec(),
+            "hiding from the head hides the whole lineage"
+        );
+
+        app.toggle_show_hidden();
+        app.set_selected(Some("sbside-new".to_string()));
+        assert!(
+            !is_child_row(&app, "sbside-new"),
+            "premise: still the head row"
+        );
+        app.toggle_hidden_selected();
+        assert!(
+            hidden_among(&app.hidden_ids, &members).is_empty(),
+            "un-hiding from the head exposes every member, the one hidden alone too"
+        );
+
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reach rule [`stands_for_others`] gives the session `id` on `app`'s board.
+    fn stands_row(app: &App, id: &str) -> bool {
+        stands_for_others(&app.sessions, &app.filtered, &app.hidden, index_of(app, id))
+    }
+
+    /// The `(+N)` and `↳` rows the board draws and the reach `Ctrl-X x` reads are
+    /// ONE fact: for every session row `build_rows` emits, `stands_for_others`
+    /// holds exactly when the row is not a `↳` row and either shows `(+N)` or has
+    /// a `↳` row of its own lineage drawn on the same board — folded, expanded,
+    /// with members hidden (show-hidden off and on), and under a query.
+    #[test]
+    fn stands_for_others_agrees_with_the_rendered_rows() {
+        let mut app = app_all(vec![
+            session_fork("sbstand-new", "/tmp/p", "stand-root", 300),
+            session_fork("sbstand-mid", "/tmp/p", "stand-root", 200),
+            session_fork("sbstand-old", "/tmp/p", "stand-root", 100),
+            session_fork("sbstand-lone", "/tmp/p", "lone-root", 250),
+            session_ts("sbstand-rootless", "repo", Some("main"), "/tmp/p", 50),
+        ]);
+        // The oracle reads the RENDERED rows alone, never the helper's inputs.
+        // Asserts every session row and returns how many stand for others.
+        let standing_rows = |app: &App| -> usize {
+            let rows = app.rows();
+            let child_keys: Vec<LineageKey> = rows
+                .iter()
+                .filter_map(|row| match *row {
+                    Row::Session {
+                        index, child: true, ..
+                    } => lineage::lineage_key(&app.sessions[index]),
+                    _ => None,
+                })
+                .collect();
+            let mut standing = 0;
+            for row in &rows {
+                if let Row::Session {
+                    index,
+                    hidden,
+                    child,
+                } = *row
+                {
+                    let has_child_rows = lineage::lineage_key(&app.sessions[index])
+                        .is_some_and(|key| child_keys.contains(&key));
+                    let drawn = !child && (hidden > 0 || has_child_rows);
+                    assert_eq!(
+                        stands_for_others(&app.sessions, &app.filtered, &app.hidden, index),
+                        drawn,
+                        "the rendered rows and the reach rule disagree for {}",
+                        app.sessions[index].session_id
+                    );
+                    standing += usize::from(drawn);
+                }
+            }
+            standing
+        };
+
+        // (i) Folded.
+        assert_eq!(standing_rows(&app), 1);
+        assert!(stands_row(&app, "sbstand-new"), "a folded `(+N)` head");
+        assert!(
+            !stands_row(&app, "sbstand-mid"),
+            "an index absent from `filtered`"
+        );
+        assert!(!stands_row(&app, "sbstand-lone"), "a lone session");
+        assert!(!stands_row(&app, "sbstand-rootless"), "a rootless session");
+
+        // (ii) The lineage expanded.
+        app.set_selected(Some("sbstand-new".to_string()));
+        app.toggle_selected_lineage();
+        assert_eq!(visible_ids(&app).len(), 5, "premise: the lineage is open");
+        assert_eq!(standing_rows(&app), 1);
+        assert!(stands_row(&app, "sbstand-new"), "an expanded head");
+        assert!(!stands_row(&app, "sbstand-mid"), "a `↳` row");
+        assert!(!stands_row(&app, "sbstand-old"), "a `↳` row");
+        app.toggle_selected_lineage();
+        assert_eq!(visible_ids(&app).len(), 3, "premise: folded again");
+
+        // (iii) The newest member hidden: show-hidden off, then on.
+        app.hidden_ids.insert("sbstand-new".to_string());
+        app.recompute_filtered();
+        assert_eq!(hidden_for(&app, "sbstand-mid"), Some(1), "premise");
+        assert_eq!(standing_rows(&app), 1);
+        assert!(
+            stands_row(&app, "sbstand-mid"),
+            "the next member heads `(+1)`"
+        );
+        assert!(!stands_row(&app, "sbstand-new"), "a hidden member is off");
+        app.toggle_show_hidden();
+        assert_eq!(hidden_for(&app, "sbstand-new"), Some(2), "premise");
+        assert_eq!(standing_rows(&app), 1);
+        assert!(
+            stands_row(&app, "sbstand-new"),
+            "hidden members take part in the fold under show-hidden"
+        );
+        assert!(!stands_row(&app, "sbstand-mid"), "folded away again");
+
+        // Every other member hidden, show-hidden off: the head stands alone.
+        app.toggle_show_hidden();
+        app.hidden_ids.clear();
+        app.hidden_ids.insert("sbstand-mid".to_string());
+        app.hidden_ids.insert("sbstand-old".to_string());
+        app.recompute_filtered();
+        assert_eq!(hidden_for(&app, "sbstand-new"), None, "premise: no `(+N)`");
+        assert_eq!(standing_rows(&app), 0);
+        assert!(
+            !stands_row(&app, "sbstand-new"),
+            "a head whose copies are all hidden"
+        );
+
+        // (iv) A live query matching only the OLDEST member's label.
+        app.hidden_ids.clear();
+        app.recompute_filtered();
+        app.push_query_str("sbstand-old");
+        assert_eq!(
+            visible_ids(&app),
+            vec!["sbstand-old"],
+            "premise: only the oldest member matches"
+        );
+        assert_eq!(standing_rows(&app), 0);
+        assert!(
+            !stands_row(&app, "sbstand-old"),
+            "the lone-looking match under a query"
+        );
+        assert!(
+            !stands_row(&app, "sbstand-new"),
+            "a head the query filtered out is absent from `filtered`"
+        );
+    }
+
+    /// The reported bug: searching for an old copy and pressing `Ctrl-X x` must
+    /// hide THAT row alone. Nothing else of its lineage is on the board, so the
+    /// newest session must not vanish with it.
+    #[test]
+    fn ctrl_x_x_under_a_query_hides_only_the_lone_looking_row() {
+        let _guard = crate::config::env_lock();
+        let dir = unique_temp_dir("hide-query");
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &dir);
+
+        let members = ["sbquery-new", "sbquery-mid", "sbquery-old"];
+        let mut app = app_all(vec![
+            session_fork("sbquery-new", "/tmp/p", "query-root", 300),
+            session_fork("sbquery-mid", "/tmp/p", "query-root", 200),
+            session_fork("sbquery-old", "/tmp/p", "query-root", 100),
+        ]);
+        app.push_query_str("sbquery-old");
+        app.set_selected(Some("sbquery-old".to_string()));
+        assert_eq!(
+            visible_ids(&app),
+            vec!["sbquery-old"],
+            "premise: the only member on the board"
+        );
+        assert_eq!(hidden_for(&app, "sbquery-old"), None, "premise: no `(+N)`");
+
+        app.toggle_hidden_selected();
+        assert_eq!(
+            hidden_among(&app.hidden_ids, &members),
+            vec!["sbquery-old"],
+            "only the lone-looking row is hidden"
+        );
+        assert_eq!(
+            hidden_among(
+                &crate::hidden::load_hidden(&crate::config::state_dir()),
+                &members
+            ),
+            vec!["sbquery-old"],
+            "and only it is persisted"
+        );
+
+        app.clear_query();
+        assert_eq!(
+            visible_ids(&app),
+            vec!["sbquery-new"],
+            "the newest session is back on the board"
+        );
+        assert_eq!(
+            hidden_for(&app, "sbquery-new"),
+            Some(1),
+            "heading the one member still visible"
+        );
+
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A head whose copies are all already hidden (show-hidden off) stands alone,
+    /// so `Ctrl-X x` reaches that row alone.
+    ///
+    /// For this shape the resulting set equals what the whole-lineage rule
+    /// produces, because the siblings were already in it. So the REACH assertion
+    /// before the toggle is the one that can fail; a set assertion alone could not.
+    #[test]
+    fn ctrl_x_x_on_a_head_whose_copies_are_all_hidden_hides_only_itself() {
+        let _guard = crate::config::env_lock();
+        let dir = unique_temp_dir("hide-lone-head");
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &dir);
+
+        let members = ["sbalone-new", "sbalone-mid", "sbalone-old"];
+        let mut app = app_all(vec![
+            session_fork("sbalone-new", "/tmp/p", "alone-root", 300),
+            session_fork("sbalone-mid", "/tmp/p", "alone-root", 200),
+            session_fork("sbalone-old", "/tmp/p", "alone-root", 100),
+        ]);
+        app.hidden_ids.insert("sbalone-mid".to_string());
+        app.hidden_ids.insert("sbalone-old".to_string());
+        app.recompute_filtered();
+        app.set_selected(Some("sbalone-new".to_string()));
+        assert_eq!(
+            visible_ids(&app),
+            vec!["sbalone-new"],
+            "premise: the head alone on the board"
+        );
+        assert_eq!(hidden_for(&app, "sbalone-new"), None, "premise: no `(+N)`");
+        assert!(
+            app.lineage_choice().is_some(),
+            "premise: delete and move would still offer the lineage"
+        );
+
+        assert_eq!(
+            app.hide_choice(),
+            None,
+            "the reach is the row alone: nothing on the board stands with it"
+        );
+        app.toggle_hidden_selected();
+        assert!(app.hidden_ids.contains("sbalone-new"), "the head is hidden");
+        assert_eq!(
+            hidden_among(
+                &crate::hidden::load_hidden(&crate::config::state_dir()),
+                &members
+            ),
+            members.to_vec(),
+            "persisted beside the copies hidden before"
+        );
+
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With show-hidden on, hidden members take part in the fold, so a fully
+    /// hidden lineage draws a `(+N)` head, and un-hiding from it brings the WHOLE
+    /// lineage back.
+    #[test]
+    fn ctrl_x_x_unhides_a_whole_lineage_from_its_plus_n_head_under_show_hidden() {
+        let _guard = crate::config::env_lock();
+        let dir = unique_temp_dir("unhide-plus-n");
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &dir);
+
+        let members = ["sbplus-new", "sbplus-mid", "sbplus-old"];
+        let mut app = app_all(vec![
+            session_fork("sbplus-new", "/tmp/p", "plus-root", 300),
+            session_fork("sbplus-mid", "/tmp/p", "plus-root", 200),
+            session_fork("sbplus-old", "/tmp/p", "plus-root", 100),
+        ]);
+        for id in members {
+            app.hidden_ids.insert(id.to_string());
+        }
+        app.toggle_show_hidden();
+        app.set_selected(Some("sbplus-new".to_string()));
+        assert_eq!(
+            hidden_for(&app, "sbplus-new"),
+            Some(2),
+            "premise: the hidden members fold under a `(+N)` head"
+        );
+
+        app.toggle_hidden_selected();
+        assert!(
+            hidden_among(&app.hidden_ids, &members).is_empty(),
+            "every member is un-hidden"
+        );
+        assert!(
+            hidden_among(
+                &crate::hidden::load_hidden(&crate::config::state_dir()),
+                &members
+            )
+            .is_empty(),
+            "the un-hide is persisted"
+        );
+
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The session rows the board draws, as `(id, (+N) count, drawn ↳)`, in
+    /// display order; group rows are skipped.
+    fn drawn_rows(app: &App) -> Vec<(&str, usize, bool)> {
+        app.rows()
+            .into_iter()
+            .filter_map(|row| match row {
+                Row::Session {
+                    index,
+                    hidden,
+                    child,
+                } => Some((app.sessions[index].session_id.as_str(), hidden, child)),
+                Row::Group { .. } => None,
+            })
+            .collect()
+    }
+
+    /// The ids [`on_screen_lineage`] gives the session `id` on `app`'s board, in
+    /// the order it returns them.
+    fn on_screen_ids<'a>(app: &'a App, id: &str) -> Option<Vec<&'a str>> {
+        on_screen_lineage(
+            &app.sessions,
+            &app.unfolded,
+            &app.filtered,
+            &app.hidden,
+            index_of(app, id),
+        )
+        .map(|members| {
+            members
+                .into_iter()
+                .map(|i| app.sessions[i].session_id.as_str())
+                .collect()
+        })
+    }
+
+    /// The oracle of [`on_screen_lineage_agrees_with_the_rendered_rows`]: it reads
+    /// the RENDERED rows alone, never the helper's inputs. Every session row's
+    /// on-screen set must be `None` exactly when the row stands for no other, and
+    /// otherwise hold the row plus as many members of its own lineage as its
+    /// `(+N)` counts or its `↳` rows show. Each folded head is then OPENED, and the
+    /// ids drawn (the head and its `↳` rows) must be the ids its call named; it is
+    /// folded back after, and the selection restored, so a later show-hidden flip
+    /// cannot auto-reveal a lineage from where this left it. Returns how many rows
+    /// stand for others.
+    fn assert_on_screen_matches_the_rows(app: &mut App) -> usize {
+        let selected = app.selected.clone();
+        let rows = app.rows();
+        let child_keys: Vec<LineageKey> = rows
+            .iter()
+            .filter_map(|row| match *row {
+                Row::Session {
+                    index, child: true, ..
+                } => lineage::lineage_key(&app.sessions[index]),
+                _ => None,
+            })
+            .collect();
+        let mut standing = 0;
+        let mut folded_heads: Vec<(String, Vec<String>)> = Vec::new();
+        for row in &rows {
+            let Row::Session {
+                index,
+                hidden,
+                child,
+            } = *row
+            else {
+                continue;
+            };
+            let id = app.sessions[index].session_id.clone();
+            let key = lineage::lineage_key(&app.sessions[index]);
+            let child_rows = key
+                .as_ref()
+                .map_or(0, |key| child_keys.iter().filter(|k| *k == key).count());
+            let stands = !child && (hidden > 0 || child_rows > 0);
+            let got = on_screen_lineage(
+                &app.sessions,
+                &app.unfolded,
+                &app.filtered,
+                &app.hidden,
+                index,
+            );
+            assert_eq!(
+                got.is_some(),
+                stands,
+                "the rendered rows and the on-screen set disagree for {id}"
+            );
+            let Some(members) = got else {
+                continue;
+            };
+            standing += 1;
+            assert!(members.contains(&index), "{id} stands for itself too");
+            assert!(
+                members
+                    .iter()
+                    .all(|&m| lineage::lineage_key(&app.sessions[m]) == key),
+                "every member shares {id}'s lineage"
+            );
+            assert_eq!(
+                members.len(),
+                1 + if hidden > 0 { hidden } else { child_rows },
+                "{id} stands for exactly what its `(+N)` or `↳` rows show"
+            );
+            if hidden > 0 {
+                let mut ids: Vec<String> = members
+                    .iter()
+                    .map(|&m| app.sessions[m].session_id.clone())
+                    .collect();
+                ids.sort();
+                folded_heads.push((id, ids));
+            }
+        }
+        for (head, stood_for) in folded_heads {
+            app.set_selected(Some(head.clone()));
+            app.toggle_selected_lineage();
+            let key = lineage::lineage_key(&app.sessions[index_of(app, &head)]);
+            let mut drawn: Vec<String> = app
+                .rows()
+                .into_iter()
+                .filter_map(|row| match row {
+                    Row::Session { index, child, .. }
+                        if app.sessions[index].session_id == head
+                            || (child && lineage::lineage_key(&app.sessions[index]) == key) =>
+                    {
+                        Some(app.sessions[index].session_id.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            drawn.sort();
+            assert_eq!(
+                drawn, stood_for,
+                "opening {head}'s `(+N)` draws exactly what it stood for"
+            );
+            app.toggle_selected_lineage();
+            assert_eq!(
+                hidden_for(app, &head),
+                Some(stood_for.len() - 1),
+                "{head} is folded back"
+            );
+        }
+        app.set_selected(selected);
+        standing
+    }
+
+    /// What a row stands for ON SCREEN and what the board draws are ONE fact:
+    /// folded, expanded, with the newest member hidden (show-hidden off and on),
+    /// and under a query that leaves only the two OLDER members, folded into a
+    /// `(+N)`. Opening a folded head draws exactly what it stood for.
+    #[test]
+    fn on_screen_lineage_agrees_with_the_rendered_rows() {
+        let mut app = app_all(vec![
+            session_fork("sbon-new", "/tmp/p", "on-root", 400),
+            session_fork("sbon-mid", "/tmp/p", "on-root", 300),
+            session_fork("sbon-old-a", "/tmp/p", "on-root", 200),
+            session_fork("sbon-old-b", "/tmp/p", "on-root", 100),
+            session_fork("sbon-lone", "/tmp/p", "lone-root", 250),
+            session_ts("sbon-rootless", "repo", Some("main"), "/tmp/p", 50),
+        ]);
+
+        // (i) Folded.
+        assert_eq!(hidden_for(&app, "sbon-new"), Some(3), "premise: `(+3)`");
+        assert_eq!(assert_on_screen_matches_the_rows(&mut app), 1);
+        assert_eq!(
+            on_screen_ids(&app, "sbon-new"),
+            Some(vec!["sbon-new", "sbon-mid", "sbon-old-a", "sbon-old-b"])
+        );
+        assert_eq!(on_screen_ids(&app, "sbon-lone"), None, "a lone session");
+        assert_eq!(
+            on_screen_ids(&app, "sbon-rootless"),
+            None,
+            "a rootless session"
+        );
+
+        // (ii) The lineage expanded.
+        app.set_selected(Some("sbon-new".to_string()));
+        app.toggle_selected_lineage();
+        assert_eq!(visible_ids(&app).len(), 6, "premise: the lineage is open");
+        assert_eq!(assert_on_screen_matches_the_rows(&mut app), 1);
+        assert_eq!(
+            on_screen_ids(&app, "sbon-new").map(|ids| ids.len()),
+            Some(4),
+            "an expanded head stands for its `↳` rows"
+        );
+        assert_eq!(on_screen_ids(&app, "sbon-mid"), None, "a `↳` row");
+        app.set_selected(Some("sbon-new".to_string()));
+        app.toggle_selected_lineage();
+        assert_eq!(visible_ids(&app).len(), 3, "premise: folded again");
+
+        // (iii) The newest member hidden: show-hidden off, then on.
+        app.hidden_ids.insert("sbon-new".to_string());
+        app.recompute_filtered();
+        assert_eq!(hidden_for(&app, "sbon-mid"), Some(2), "premise");
+        assert_eq!(assert_on_screen_matches_the_rows(&mut app), 1);
+        assert_eq!(
+            on_screen_ids(&app, "sbon-mid"),
+            Some(vec!["sbon-mid", "sbon-old-a", "sbon-old-b"]),
+            "the hidden newest member is off the board, so not stood for"
+        );
+        app.toggle_show_hidden();
+        assert_eq!(hidden_for(&app, "sbon-new"), Some(3), "premise");
+        assert_eq!(assert_on_screen_matches_the_rows(&mut app), 1);
+        assert_eq!(
+            on_screen_ids(&app, "sbon-new").map(|ids| ids.len()),
+            Some(4),
+            "hidden members take part under show-hidden"
+        );
+        app.toggle_show_hidden();
+        app.hidden_ids.clear();
+        app.recompute_filtered();
+
+        // (iv) The residual: a query that leaves only the two older members.
+        app.push_query_str("sbon-old");
+        assert_eq!(
+            drawn_rows(&app),
+            vec![("sbon-old-a", 1, false)],
+            "premise: the two older members fold into `(+1)`"
+        );
+        assert_eq!(assert_on_screen_matches_the_rows(&mut app), 1);
+        assert_eq!(
+            on_screen_ids(&app, "sbon-old-a"),
+            Some(vec!["sbon-old-a", "sbon-old-b"]),
+            "only the members the query left on the board"
+        );
+    }
+
+    /// The reported residual: a query leaves two OLDER copies on the board, folded
+    /// into a `(+N)` row. `Ctrl-X x` there hides those two and nothing else — the
+    /// copies the query filtered out, the newest among them, stay on the board.
+    #[test]
+    fn ctrl_x_x_on_a_plus_n_head_under_a_query_hides_only_the_copies_it_stands_for() {
+        let _guard = crate::config::env_lock();
+        let dir = unique_temp_dir("hide-residual");
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &dir);
+
+        let members = ["sbres-new", "sbres-mid", "sbres-old-a", "sbres-old-b"];
+        let mut app = app_all(vec![
+            session_fork("sbres-new", "/tmp/p", "res-root", 400),
+            session_fork("sbres-mid", "/tmp/p", "res-root", 300),
+            session_fork("sbres-old-a", "/tmp/p", "res-root", 200),
+            session_fork("sbres-old-b", "/tmp/p", "res-root", 100),
+        ]);
+        app.push_query_str("sbres-old");
+        app.set_selected(Some("sbres-old-a".to_string()));
+        assert_eq!(
+            drawn_rows(&app),
+            vec![("sbres-old-a", 1, false)],
+            "premise: the two older copies fold into `(+1)`"
+        );
+        assert_eq!(
+            app.hide_choice(),
+            Some(vec!["sbres-old-a".to_string(), "sbres-old-b".to_string()]),
+            "premise: the hide names exactly the copies on screen"
+        );
+
+        app.toggle_hidden_selected();
+        assert_eq!(
+            hidden_among(&app.hidden_ids, &members),
+            vec!["sbres-old-a", "sbres-old-b"],
+            "only the copies the row stands for are hidden"
+        );
+        assert_eq!(
+            hidden_among(
+                &crate::hidden::load_hidden(&crate::config::state_dir()),
+                &members
+            ),
+            vec!["sbres-old-a", "sbres-old-b"],
+            "and only they are persisted"
+        );
+
+        app.clear_query();
+        assert_eq!(
+            visible_ids(&app),
+            vec!["sbres-new"],
+            "the newest copy is back on the board"
+        );
+        assert_eq!(
+            hidden_for(&app, "sbres-new"),
+            Some(1),
+            "heading the lineage visibly, `sbres-mid` folded under it"
+        );
+
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The folder scope bounds the hide too: from a `(+N)` head in a narrower
+    /// scope, `Ctrl-X x` leaves a copy outside that scope as it is, and widening
+    /// the scope shows it still on the board.
+    #[test]
+    fn ctrl_x_x_from_a_plus_n_head_leaves_an_out_of_scope_copy_alone() {
+        let _guard = crate::config::env_lock();
+        let dir = unique_temp_dir("hide-scope-state");
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &dir);
+        let here = unique_temp_dir("hide-scope-here");
+        let cwd = here.to_str().expect("a UTF-8 temp dir");
+
+        let members = ["sbscope-new", "sbscope-mid", "sbscope-old"];
+        let mut app = App::new(
+            vec![
+                session_fork("sbscope-new", "/tmp/sbscope-elsewhere", "scope-root", 300),
+                session_fork("sbscope-mid", cwd, "scope-root", 200),
+                session_fork("sbscope-old", cwd, "scope-root", 100),
+            ],
+            Scope::CurrentFolder,
+            resolve_dir(&here),
+        );
+        assert_eq!(
+            drawn_rows(&app),
+            vec![("sbscope-mid", 1, false)],
+            "premise: the newest copy is out of scope, the other two fold"
+        );
+        assert_eq!(app.selected.as_deref(), Some("sbscope-mid"), "premise");
+
+        app.toggle_hidden_selected();
+        assert_eq!(
+            hidden_among(&app.hidden_ids, &members),
+            vec!["sbscope-mid", "sbscope-old"],
+            "only the copies in scope are hidden"
+        );
+        assert_eq!(
+            hidden_among(
+                &crate::hidden::load_hidden(&crate::config::state_dir()),
+                &members
+            ),
+            vec!["sbscope-mid", "sbscope-old"],
+            "and only they are persisted"
+        );
+
+        app.all_scope_enabled = true;
+        app.toggle_scope();
+        app.toggle_scope();
+        assert_eq!(app.scope, Scope::All, "premise: the widest scope");
+        assert_eq!(
+            visible_ids(&app),
+            vec!["sbscope-new"],
+            "the out-of-scope copy is on the board, not hidden"
+        );
+        assert!(!app.hidden_ids.contains("sbscope-new"));
+
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        for path in [&dir, &here] {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+
+    /// From an EXPANDED head, `Ctrl-X x` hides the head and its `↳` rows only: a
+    /// member the query keeps off the board is not among them.
+    #[test]
+    fn ctrl_x_x_on_an_expanded_head_hides_itself_and_its_child_rows_only() {
+        let _guard = crate::config::env_lock();
+        let dir = unique_temp_dir("hide-expanded");
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &dir);
+
+        let members = ["sbexp-keep-new", "sbexp-keep-mid", "sbexp-old"];
+        let mut app = app_all(vec![
+            session_fork("sbexp-keep-new", "/tmp/p", "exp-root", 300),
+            session_fork("sbexp-keep-mid", "/tmp/p", "exp-root", 200),
+            session_fork("sbexp-old", "/tmp/p", "exp-root", 100),
+        ]);
+        app.push_query_str("sbexp-keep");
+        app.set_selected(Some("sbexp-keep-new".to_string()));
+        app.toggle_selected_lineage();
+        assert_eq!(
+            drawn_rows(&app),
+            vec![("sbexp-keep-new", 0, false), ("sbexp-keep-mid", 0, true)],
+            "premise: an expanded head with one `↳` row"
+        );
+
+        app.toggle_hidden_selected();
+        assert_eq!(
+            hidden_among(&app.hidden_ids, &members),
+            vec!["sbexp-keep-new", "sbexp-keep-mid"],
+            "the head and its `↳` row are hidden, nothing else"
+        );
+        assert_eq!(
+            hidden_among(
+                &crate::hidden::load_hidden(&crate::config::state_dir()),
+                &members
+            ),
+            vec!["sbexp-keep-new", "sbexp-keep-mid"],
+            "and only they are persisted"
+        );
+
+        app.clear_query();
+        assert_eq!(
+            visible_ids(&app),
+            vec!["sbexp-old"],
+            "the member the query filtered out is on the board"
+        );
+
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Un-hiding follows the same rule: with show-hidden on, a query that leaves
+    /// two hidden OLDER copies folded into `(+1)` un-hides those two, and the
+    /// hidden copy the query filtered out stays hidden.
+    #[test]
+    fn ctrl_x_x_unhides_from_a_plus_n_head_only_the_copies_it_stands_for() {
+        let _guard = crate::config::env_lock();
+        let dir = unique_temp_dir("unhide-residual");
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &dir);
+
+        let members = ["sbun-new", "sbun-old-a", "sbun-old-b"];
+        let mut app = app_all(vec![
+            session_fork("sbun-new", "/tmp/p", "un-root", 300),
+            session_fork("sbun-old-a", "/tmp/p", "un-root", 200),
+            session_fork("sbun-old-b", "/tmp/p", "un-root", 100),
+        ]);
+        for id in members {
+            app.hidden_ids.insert(id.to_string());
+        }
+        app.toggle_show_hidden();
+        app.push_query_str("sbun-old");
+        app.set_selected(Some("sbun-old-a".to_string()));
+        assert_eq!(
+            drawn_rows(&app),
+            vec![("sbun-old-a", 1, false)],
+            "premise: the two hidden older copies fold into `(+1)`"
+        );
+
+        app.toggle_hidden_selected();
+        assert_eq!(
+            hidden_among(&app.hidden_ids, &members),
+            vec!["sbun-new"],
+            "the two copies on screen are un-hidden, the newest stays hidden"
+        );
+        assert_eq!(
+            hidden_among(
+                &crate::hidden::load_hidden(&crate::config::state_dir()),
+                &members
+            ),
+            vec!["sbun-new"],
+            "and the persisted set says the same"
         );
 
         std::env::remove_var("SNAPBACK_CONFIG_DIR");
@@ -9096,9 +10354,9 @@ mod tests {
     }
 
     /// A PARTIALLY hidden lineage still draws a row, so it stays counted on both
-    /// sides and discloses nothing. Hiding normally flips a whole family at once
-    /// (`toggle_hidden_selected` -> `lineage_member_ids`), but the counter must
-    /// not assume it.
+    /// sides and discloses nothing. A hide flips at most what one row stands for
+    /// on screen (`hide_choice` -> `on_screen_lineage`), so a partly hidden
+    /// family is common, and the counter must not assume otherwise.
     #[test]
     fn a_partially_hidden_lineage_still_counts_as_visible() {
         let mut app = App::new(
@@ -10705,6 +11963,138 @@ mod tests {
         assert_eq!(
             revealed.message, DELETE_CONFIRM_PROMPT,
             "a hidden session outside the lineage is not a member `(N)` takes"
+        );
+    }
+
+    /// Open the delete confirm on `id`'s row and hand back the modal it built,
+    /// closed again so the next call starts from the board.
+    fn delete_confirm_on(app: &mut App, id: &str) -> Modal {
+        app.set_selected(Some(id.to_string()));
+        app.open_delete_confirm();
+        let modal = app.modal.clone().expect("the confirm is open");
+        app.close_modal();
+        modal
+    }
+
+    /// The actions a modal offers, in strip order.
+    fn actions_of(modal: &Modal) -> Vec<ModalAction> {
+        modal.choices.iter().map(|c| c.action.clone()).collect()
+    }
+
+    /// On a `↳` row the confirm is single-id — `[Delete this] [Cancel]`, the plain
+    /// prompt, Cancel highlighted — even when its lineage has a hidden member; the
+    /// head row of the SAME board still offers and discloses the whole lineage.
+    #[test]
+    fn open_delete_confirm_on_a_child_row_offers_only_this_row() {
+        let ids = ["sbdelc-new", "sbdelc-mid", "sbdelc-old"];
+        let mut app = app_all(vec![
+            session_fork("sbdelc-new", "/tmp/p", "delc-root", 300),
+            session_fork("sbdelc-mid", "/tmp/p", "delc-root", 200),
+            session_fork("sbdelc-old", "/tmp/p", "delc-root", 100),
+        ]);
+        app.hidden_ids.insert("sbdelc-old".to_string());
+        app.toggle_show_hidden();
+        app.set_selected(Some("sbdelc-new".to_string()));
+        app.toggle_selected_lineage();
+        assert_eq!(
+            visible_ids(&app),
+            ids.to_vec(),
+            "premise: the lineage is open, its hidden member shown"
+        );
+
+        for child in ["sbdelc-mid", "sbdelc-old"] {
+            assert!(is_child_row(&app, child), "premise: {child} is a `↳` row");
+            let modal = delete_confirm_on(&mut app, child);
+            assert_eq!(
+                actions_of(&modal),
+                vec![ModalAction::Delete, ModalAction::Cancel],
+                "{child}: a `↳` row offers no lineage"
+            );
+            assert_eq!(
+                modal.selected_action(),
+                Some(&ModalAction::Cancel),
+                "{child}: still defaulted to Cancel"
+            );
+            assert_eq!(
+                modal.message, DELETE_CONFIRM_PROMPT,
+                "{child}: no lineage to disclose"
+            );
+            assert_eq!(modal.session_id.as_deref(), Some(child));
+        }
+
+        assert!(!is_child_row(&app, "sbdelc-new"), "premise: the head row");
+        let head = delete_confirm_on(&mut app, "sbdelc-new");
+        assert_eq!(
+            actions_of(&head),
+            vec![
+                ModalAction::Delete,
+                ModalAction::DeleteLineage(ids.iter().map(|id| (*id).to_string()).collect()),
+                ModalAction::Cancel,
+            ],
+            "the head row of the same board offers the whole lineage"
+        );
+        assert_eq!(head.selected_action(), Some(&ModalAction::Cancel));
+        assert!(
+            head.message
+                .starts_with("3 in this lineage, 1 of them hidden."),
+            "the head row discloses the hidden member: {:?}",
+            head.message
+        );
+    }
+
+    /// Show-hidden mode decides which row heads the lineage, and so which row
+    /// offers it: a hidden newest member heads (and offers) only while show-hidden
+    /// is on, when the previous head becomes a `↳` row that does not.
+    #[test]
+    fn the_head_under_show_hidden_is_the_row_that_offers_the_lineage() {
+        let lineage = ModalAction::DeleteLineage(
+            ["sbdelh-new", "sbdelh-mid", "sbdelh-old"]
+                .iter()
+                .map(|id| (*id).to_string())
+                .collect(),
+        );
+        let single = vec![ModalAction::Delete, ModalAction::Cancel];
+        let mut app = app_all(vec![
+            session_fork("sbdelh-new", "/tmp/p", "delh-root", 300),
+            session_fork("sbdelh-mid", "/tmp/p", "delh-root", 200),
+            session_fork("sbdelh-old", "/tmp/p", "delh-root", 100),
+        ]);
+        app.hidden_ids.insert("sbdelh-new".to_string());
+        app.recompute_filtered();
+        app.set_selected(Some("sbdelh-mid".to_string()));
+        app.toggle_selected_lineage();
+        assert_eq!(
+            visible_ids(&app),
+            vec!["sbdelh-mid", "sbdelh-old"],
+            "premise: open, without its hidden member"
+        );
+
+        assert_eq!(
+            actions_of(&delete_confirm_on(&mut app, "sbdelh-mid")),
+            vec![ModalAction::Delete, lineage.clone(), ModalAction::Cancel],
+            "mid heads while new is hidden, so it offers the whole lineage"
+        );
+        assert_eq!(
+            actions_of(&delete_confirm_on(&mut app, "sbdelh-old")),
+            single,
+            "old is a `↳` row"
+        );
+
+        app.toggle_show_hidden();
+        assert_eq!(
+            visible_ids(&app),
+            vec!["sbdelh-new", "sbdelh-mid", "sbdelh-old"],
+            "premise: show-hidden brings the hidden member back as the head"
+        );
+        assert_eq!(
+            actions_of(&delete_confirm_on(&mut app, "sbdelh-new")),
+            vec![ModalAction::Delete, lineage, ModalAction::Cancel],
+            "the hidden member now heads, so its row offers the lineage"
+        );
+        assert_eq!(
+            actions_of(&delete_confirm_on(&mut app, "sbdelh-mid")),
+            single,
+            "and the previous head is a `↳` row that does not"
         );
     }
 

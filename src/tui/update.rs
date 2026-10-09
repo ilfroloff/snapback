@@ -6,10 +6,11 @@
 //! `session_id` in the new filtered list (clamps to nearest if it vanished).
 //! The remaining variants are off-thread deliveries: `ReportedAgents` swaps in the
 //! poller's badge/banner map, while `SendFinished`, `MoveFinished`,
-//! `InterruptFinished` and `BgLaunchFinished` each land ONE one-shot child's
-//! result — `MoveFinished` also reloads the board, so the moved row shows its new
-//! folder, and the last closes the in-flight new-session draft card it names (and
-//! only that one).
+//! `InterruptFinished` and `BgLaunchFinished` each land ONE one-shot result —
+//! `MoveFinished` (one per move job) also clears only its own `App::moving`
+//! entries, the ids the job dispatched, and reloads the board once, so each moved
+//! row shows its new folder; the last closes the in-flight new-session draft card
+//! it names (and only that one).
 //! `CopyFinished` lands a clipboard tool's result too (a `Ctrl-X y` id or a
 //! preview drag-selection), but hands it back to the driver
 //! ([`Outcome::FinishCopy`]) because only the driver holds the writer its OSC 52
@@ -45,8 +46,8 @@
 //! | `Ctrl-K` | stop / interrupt the selected session's live agent, by whichever handle claude's record carries (see [`send::interrupt_gate`]). A stoppable job id → `claude stop`: an agent whose run is OVER (`done` / `stopped` / `failed`) stops at once, every other live agent confirms first. NO job id but a `pid` → confirm, then re-ask claude at `Enter` and send that pid a SIGTERM (never SIGKILL) only if claude still reports the same pid with no job id; a record that is gone, now carries a job id, or reports another pid refuses instead (see [`send::signal_plan`]). A session claude is not holding, or one it reports with neither a job id nor a pid — or with no job id and a pid no signal could take (`0`, past `i32::MAX`, or the board's own process id) — is refused |
 //! | `Tab` | toggle name-only vs. name+content search. Widening to content also opens the preview on the most recent match, exactly as typing does: it goes through the same query funnel, and the mode is the gate that key just opened |
 //! | `Ctrl-A` | flip the scope: current folder <-> project (the launch repo and all of its git worktrees). ONE key for both, because the second is a refinement of the same question the first answers, not a separate mode. Launched with `--all`/`-a` it becomes a three-stop cycle through all folders as well — the whole store is on this key only when the launch flag put it there |
-//! | `Ctrl-X` then `x`/`d`/`h`/`r`/`y`/`f`/`w` | leader chord: hide / hard-delete (this row, or its whole fork lineage; a member whose quick reply or move snapback still has in flight is refused, see [`delete::can_delete_target`]) / toggle show-hidden / re-read every transcript from disk / copy session ID (the selected session's full id, to the clipboard; the id also shows on the status line) / fold or expand the selected row's fork lineage (fold an open one, open a folded `(+N)` head, nothing otherwise — see [`App::toggle_selected_lineage`]) / move the selected session to another worktree of the launch project (the parent folder included, its own folder omitted): opens a picker, see the next row; refused, with no picker, while that session's own move or quick reply is still in flight (any other key cancels) |
-//! | `Enter` in the move picker | move the session to the chosen worktree; the board stays up. A worker thread re-reads the transcript, refuses a session claude lists as active — and, unlike every other gate, refuses too when claude cannot be asked (`claude agents --json` fails; see `crate::claude_move::liveness_refusal`) — then runs one headless `claude -p … -r <id>` in the session's current folder and sends it one `set_cwd` request (see `crate::claude_move`); the status line says `moved to <folder>`, or why not. While it runs the row wears `moving…` and refuses `Enter`, `Ctrl-F`, `Ctrl-R`, `Ctrl-X d` and another `Ctrl-X w` |
+//! | `Ctrl-X` then `x`/`d`/`h`/`r`/`y`/`f`/`w` | leader chord: hide (from a row that visibly stands for others — a folded `(+N)` head, or an expanded head with `↳` rows beneath it — that row and the members it stands for on screen, so the fold cannot re-head, while members off the board (filtered out by the query, out of scope, already hidden) stay as they are; any other row that session alone: a `↳` row, or a head whose other members are all off the board; un-hiding from such a head exposes every member it stands for, one hidden on its own included — see [`App::toggle_hidden_selected`]) / hard-delete (this row; on a multi-member lineage's HEAD row — the row not drawn `↳` — the confirm also offers its whole fork lineage, never on a `↳` row, and still on a head standing alone, since the confirm counts the lineage and discloses its hidden members; a member whose quick reply or move snapback still has in flight is refused, see [`delete::can_delete_target`]) / toggle show-hidden / re-read every transcript from disk / copy session ID (the selected session's full id, to the clipboard; the id also shows on the status line) / fold or expand the selected row's fork lineage (fold an open one, open a folded `(+N)` head, nothing otherwise — see [`App::toggle_selected_lineage`]) / move the selected session to another worktree of the launch project (the parent folder included, its own folder omitted): opens a picker, see the next row; refused, with no picker, while that session's own move or quick reply is still in flight (any other key cancels) |
+//! | `Enter` in the move picker | move the session to the chosen worktree; the board stays up. A worker thread re-reads the transcript, refuses a session claude lists as active — and, unlike every other gate, refuses too when claude cannot be asked (`claude agents --json` fails; see `crate::claude_move::liveness_refusal`) — then runs one headless `claude -p … -r <id>` in the session's current folder and sends it one `set_cwd` request (see `crate::claude_move`); the status line says `moved to <folder>`, or why not. While it runs the row wears `moving…` and refuses `Enter`, `Ctrl-F`, `Ctrl-R`, `Ctrl-X d` and another `Ctrl-X w`. On a multi-member lineage's HEAD row `Enter` first opens a `Move this` / `Move lineage (N)` / `Cancel` confirm, highlighted on `Cancel`, disclosing hidden members as the delete confirm does ([`App::open_move_scope_confirm`]); `Move this` is the move above. `Move lineage (N)` is BEST EFFORT: a member snapback is still replying to or moving is skipped, the rest move one at a time on ONE worker, each through the same steps, the run stops at the first `needs_trust` (the target's verdict, shared by every member), every member wears `moving…` until the last finishes, and ONE sticky tally says how many moved and why the rest did not (see `crate::claude_move::status_for_lineage_move`). On a `↳` row or a lone session `Enter` moves at once |
 //! | `Ctrl-L` (in a compose box) | pick the model — and optionally the effort — for THIS compose only: the `Ctrl-R` reply or the `Ctrl-N` draft it is pressed in (see [`compose::compose_key_to_action`]). The box's `model:` label names what it runs on: a reply's default is `session (<model>)`, the model its session last answered with, which claude normally restores by itself (`default` when an `ANTHROPIC_MODEL` / `ANTHROPIC_DEFAULT_*_MODEL` override, or a transcript with no answering model, means it would not); a draft's is `default (<value>) (new sessions only)` from the user's `claude` settings. `--model` / `--effort` are sent ONLY for a pick other than that default — on the reply, the draft's background launch and the draft's `Ctrl-O` run. The picker's first row returns to the default, `Enter` sets the highlighted row into the compose, `Esc` returns with the text and the previous pick intact. Every new compose starts at its default; nothing is remembered. `Enter`, `Ctrl-F`, Attach and the `Ctrl-X w` move never send a model |
 //! | `Left` / `Right` (in the model picker) | step the highlighted MODEL row's `--effort` down / up through unset → `low` → `medium` → `high` → `xhigh` → `max`, wrapping both ways; `Enter` then sets the model and the effort together into the compose. Inert on the picker's default row (no model, so no effort) and on every other list modal, so the agent picker keeps ignoring them; they never reach the board's search caret underneath |
 //! | `/` or `@` (in a compose box) | open the pick list — the SAME list in the `Ctrl-R` reply and the `Ctrl-N` draft, which differ only in where it reads from (`compose::completion_source`). `/` as the draft's first character lists claude's skills and commands for the target's folder; `@` at the start of a word lists files and folders and, for a top-level `@` token only, agents, picked as `@agent-<name>`; a skill, command or agent carries its description. The list is claude's own, fetched once per folder per board off the UI thread (`compose::take_catalog_fetch`); until it lands `/` lists nothing in either box, while `@` lists files and folders at once, a reply's agents come from its transcript and a draft's wait for the catalog. While the list is open `Up` / `Down` choose, `Enter` / `Tab` pick (a folder reopens the list one level down) and `Esc` closes only the list, never the draft (see [`compose::compose_key_to_action`]) |
@@ -107,7 +108,7 @@ use crossterm::event::{
 };
 use ratatui::layout::{Position, Rect};
 
-use crate::claude_move::{self, MoveRequest};
+use crate::claude_move::{self, LineageMove, MoveJob, MoveRequest};
 use crate::defined_agents;
 use crate::delete;
 use crate::resume::{self, Ready};
@@ -258,14 +259,15 @@ pub enum Outcome {
     /// stays pure and unit-testable, the way [`Resume`](Self::Resume) carries a
     /// confirmed [`Ready`].
     Send(SendRequest),
-    /// Fire a confirmed `Ctrl-X w` move on its own worker thread and KEEP running —
-    /// like [`Send`](Self::Send), the board never tears down. Handled inline by
-    /// [`crate::tui::run`] ([`crate::claude_move::spawn_move`]); the move reports
-    /// back via [`AppEvent::MoveFinished`](crate::watch::AppEvent::MoveFinished).
-    /// Carried as data so the key handler stays free of every blocking step: the
-    /// re-read, the liveness probe, the trust read and the child are all the
-    /// worker's.
-    Move(MoveRequest),
+    /// Fire a confirmed `Ctrl-X w` move job on its own worker thread and KEEP
+    /// running — like [`Send`](Self::Send), the board never tears down. Handled
+    /// inline by [`crate::tui::run`] ([`crate::claude_move::spawn_move`]); the job
+    /// reports back with ONE
+    /// [`AppEvent::MoveFinished`](crate::watch::AppEvent::MoveFinished) naming
+    /// every id it dispatched. Carried as data so the key handler stays free of
+    /// every blocking step: the re-read, the liveness probe, the trust read and the
+    /// child are all the worker's.
+    Move(MoveJob),
     /// Fire a one-shot interrupt (`claude stop <job-id>`) on a detached thread and
     /// KEEP running — like [`Send`](Self::Send), the board never tears down. Handled
     /// inline by [`crate::tui::run`]; the stop reports back via
@@ -730,16 +732,19 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
             Outcome::Continue
         }
         AppEvent::MoveFinished {
-            session_id,
+            session_ids,
             status,
             success,
         } => {
-            // A `Ctrl-X w` move finished off-thread. Clear THIS session's in-flight
-            // move — only it — and reload at once, so the row shows its new folder
-            // (or leaves a current-folder board) without waiting on the watcher's
-            // debounce. The outcome is a keypress-scoped fact: a move is a
-            // transient confirmation, every failure or refusal stays sticky.
-            app.clear_moving(&session_id);
+            // A `Ctrl-X w` move job finished off-thread. Clear the in-flight move of
+            // every session it dispatched — only those — and reload ONCE, at once,
+            // so each row shows its new folder (or leaves a current-folder board)
+            // without waiting on the watcher's debounce. The outcome is a
+            // keypress-scoped fact: `success` is the status's class, transient
+            // confirmation or sticky failure/refusal.
+            for session_id in &session_ids {
+                app.clear_moving(session_id);
+            }
             reload_board(app, store);
             if success {
                 app.set_status_transient(status);
@@ -846,8 +851,9 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
 /// Such a completion is kept in [`App::take_undelivered`]'s queue by the send or
 /// move thread, or by the teardown drain (see [`crate::send::UndeliveredEvents`]).
 /// The `SendFinished` arm clears only the `App::sending` entry keyed by its own
-/// `session_id`, and the `MoveFinished` arm only its own `App::moving` entry, so a
-/// stale completion cannot clear one that is not its own. Its status keeps the
+/// `session_id`, and the `MoveFinished` arm only its own `App::moving` entries
+/// (the ids its job dispatched), so a stale completion cannot clear one that is
+/// not its own. Its status keeps the
 /// live split, transient on success and sticky on failure, and a finished send on
 /// the selected row re-anchors the preview as usual.
 ///
@@ -2109,7 +2115,8 @@ enum ModalNav {
 ///
 /// `Ctrl-O` is derived from `layout` for the same reason: only the `List` picker
 /// has an interactive start to offer, so it must stay INERT on the running-session
-/// Attach/Fork strip and the delete confirm rather than becoming a modal-wide key.
+/// Attach/Fork strip and the delete and move-scope confirms rather than becoming a
+/// modal-wide key.
 /// The action-level narrowing lives in [`launch_pick_interactively`] — the layout is
 /// the key map's business, the choice's meaning is the handler's. `Adjust` follows
 /// the same split: the layout binds the arrows, [`App::adjust_modal_effort`] decides
@@ -2187,10 +2194,10 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, store: &mut SessionStore) -> O
 /// The `ModalAction` match is the second of two gates: [`modal_key`] already
 /// restricts the key to the `List` layout, and this restricts it to a choice that
 /// actually names a new session. Any other action — Attach, Fork, Delete,
-/// DeleteLineage, SetModel, MoveTo, Cancel, or an out-of-range highlight — is a
-/// NO-OP, so a `List`-layout modal cannot inherit an interactive start it has no
-/// meaning for. The model and move pickers are exactly such modals, and they rely
-/// on this: `Ctrl-O` there must not launch anything.
+/// DeleteLineage, SetModel, MoveTo, ChooseMoveScope, MoveLineage, Cancel, or an
+/// out-of-range highlight — is a NO-OP, so a `List`-layout modal cannot inherit an
+/// interactive start it has no meaning for. The model and move pickers are exactly
+/// such modals, and they rely on this: `Ctrl-O` there must not launch anything.
 ///
 /// The pick is recorded as the last-chosen agent FIRST — BEFORE the gate, so the
 /// next `Ctrl-N` repeats it even across a refusal. This is one of the THREE points
@@ -2238,8 +2245,10 @@ enum Handoff {
 /// or interactive ([`compose`]'s `Ctrl-O`). The picker's own `Ctrl-O`
 /// ([`launch_pick_interactively`]) is the one-key bypass to an interactive start.
 /// The rest stay on the board: `Delete` / `DeleteLineage` run the hard delete
-/// ([`confirm_delete`]), `SetModel` writes the open compose's pick, and `MoveTo`
-/// starts the headless move ([`start_move`]).
+/// ([`confirm_delete`]), `SetModel` writes the open compose's pick, `MoveTo`
+/// starts the headless move ([`start_move`]), `ChooseMoveScope` opens the move's
+/// lineage scope confirm ([`App::open_move_scope_confirm`]) and `MoveLineage`
+/// starts the lineage job ([`start_lineage_move`]).
 ///
 /// `New` records NOTHING here. The memory behind `Ctrl-N`'s pre-highlight is "the
 /// agent of the last new session actually STARTED", and a draft can still be
@@ -2290,11 +2299,24 @@ fn confirm_modal(app: &mut App, store: &mut SessionStore) -> Outcome {
             Outcome::Continue
         }
         // The move is NOT a hand-off: nothing blocking runs here (see
-        // `start_move`), and the board stays up.
+        // `start_move`), and the board stays up. The picker's row on a `↳` row or
+        // a lone session, and the scope confirm's `Move this`.
         Some(ModalAction::MoveTo(target)) => match modal.session_id.as_deref() {
             Some(id) => start_move(app, id, target),
             None => Outcome::Continue,
         },
+        // A picker row on a lineage head: ask this session or the lineage first.
+        // Nothing is marked or dispatched until that confirm's own button.
+        Some(ModalAction::ChooseMoveScope { target, members }) => {
+            let label = modal.choices.get(modal.selected).map(|c| c.label.clone());
+            if let (Some(id), Some(label)) = (modal.session_id, label) {
+                app.open_move_scope_confirm(id, target, members, label);
+            }
+            Outcome::Continue
+        }
+        // The ids were resolved when the picker opened (see
+        // `ModalAction::MoveLineage`), never re-derived from the selection.
+        Some(ModalAction::MoveLineage { target, ids }) => start_lineage_move(app, &ids, target),
     }
 }
 
@@ -2313,11 +2335,61 @@ fn start_move(app: &mut App, session_id: &str, target: PathBuf) -> Outcome {
         return Outcome::Continue;
     };
     app.mark_moving(session_id);
-    Outcome::Move(MoveRequest {
+    Outcome::Move(MoveJob::One(MoveRequest {
         session_id: session_id.to_owned(),
         file,
         target,
-    })
+    }))
+}
+
+/// Start a confirmed `Move lineage (N)` of `ids` to `target`, BEST EFFORT: each
+/// member snapback itself is still writing — its own move or quick reply in
+/// flight ([`claude_move::own_writer_refusal`]) — is skipped and counted refused,
+/// a member a reload dropped from the board is skipped (the tally reconciles it as
+/// gone), and every other member is marked moving and packed, in the carried
+/// order, into ONE [`MoveJob::Lineage`] for the driver.
+///
+/// Nothing blocking runs here, exactly as in [`start_move`]: every claude-side
+/// fact (liveness, trust, folders) is the worker's, per member, right before that
+/// member's child (AGENTS.md OFF-UI-THREAD). With nothing left to dispatch, the
+/// tally is set at once, sticky like the worker's
+/// ([`claude_move::status_for_lineage_move`]), and nothing is spawned.
+fn start_lineage_move(app: &mut App, ids: &[String], target: PathBuf) -> Outcome {
+    let mut moves = Vec::with_capacity(ids.len());
+    let mut refused = 0usize;
+    for id in ids {
+        if claude_move::own_writer_refusal(app.moving_on(id), app.sending_to(id).is_some())
+            .is_some()
+        {
+            refused += 1;
+            continue;
+        }
+        let Some(file) = app.session_by_id(id).map(|s| s.file.clone()) else {
+            continue;
+        };
+        app.mark_moving(id);
+        moves.push(MoveRequest {
+            session_id: id.clone(),
+            file,
+            target: target.clone(),
+        });
+    }
+    if moves.is_empty() {
+        app.set_status(claude_move::status_for_lineage_move(
+            ids.len(),
+            refused,
+            0,
+            &[],
+            &target,
+        ));
+        return Outcome::Continue;
+    }
+    Outcome::Move(MoveJob::Lineage(LineageMove {
+        target,
+        moves,
+        asked: ids.len(),
+        refused,
+    }))
 }
 
 /// Execute a confirmed HARD delete of `ids` — one selected session, or every
@@ -10525,11 +10597,11 @@ mod tests {
         .ends_board_session());
         // The `Ctrl-X w` move runs on its own worker and reports back on the SAME
         // channel, so it must not end the session either.
-        assert!(!Outcome::Move(MoveRequest {
+        assert!(!Outcome::Move(MoveJob::One(MoveRequest {
             session_id: "s".to_string(),
             file: PathBuf::from("/tmp/s.jsonl"),
             target: PathBuf::from("/tmp/wt"),
-        })
+        }))
         .ends_board_session());
         // The clipboard copy's request and its completion both keep the board up,
         // whichever kind they carry: the worker reports back on the SAME channel.
@@ -12517,6 +12589,78 @@ mod tests {
         );
     }
 
+    /// `Ctrl-X x` pressed on an expanded lineage's `↳` row hides that row ALONE:
+    /// the head and the other member stay on the board, and only the one id is
+    /// persisted.
+    #[test]
+    fn ctrl_x_x_on_an_expanded_child_row_hides_only_that_row() {
+        let _guard = crate::config::env_lock();
+        let state = unique_temp_dir("hide-child-row");
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &state);
+
+        let fork = |id: &str, unix_secs: i64| {
+            let mut s = session(id);
+            s.root_uuid = Some("sbxc-root".to_string());
+            s.timestamp = Some(
+                time::OffsetDateTime::from_unix_timestamp(unix_secs).expect("a valid timestamp"),
+            );
+            s
+        };
+        let members = ["sbxc-new", "sbxc-mid", "sbxc-old"];
+        let mut app = App::new(
+            vec![
+                fork("sbxc-new", 300),
+                fork("sbxc-mid", 200),
+                fork("sbxc-old", 100),
+            ],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        let mut store = store_at(Path::new("/tmp"));
+        assert_eq!(app.filtered.len(), 1, "premise: the lineage starts folded");
+        assert_eq!(app.selected.as_deref(), Some("sbxc-new"));
+
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('f')), &mut store);
+        assert_eq!(app.filtered.len(), 3, "premise: the lineage is open");
+        feed(&mut app, key(KeyCode::Down), &mut store);
+        assert_eq!(
+            app.selected.as_deref(),
+            Some("sbxc-mid"),
+            "premise: standing on the first `↳` row"
+        );
+
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('x')), &mut store);
+
+        let hidden: Vec<&str> = members
+            .iter()
+            .copied()
+            .filter(|id| app.hidden_ids.contains(*id))
+            .collect();
+        assert_eq!(hidden, vec!["sbxc-mid"], "only the `↳` row is hidden");
+        let persisted = crate::hidden::load_hidden(&crate::config::state_dir());
+        assert!(
+            persisted.contains("sbxc-mid")
+                && !persisted.contains("sbxc-new")
+                && !persisted.contains("sbxc-old"),
+            "only the `↳` row's hide is persisted: {persisted:?}"
+        );
+        let visible: Vec<&str> = app
+            .filtered
+            .iter()
+            .map(|&i| app.sessions[i].session_id.as_str())
+            .collect();
+        assert_eq!(
+            visible,
+            vec!["sbxc-new", "sbxc-old"],
+            "the head and the other member stay on the board"
+        );
+
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
     /// `Ctrl-X f` on a row with no lineage to toggle — a session that is its own
     /// lineage — changes nothing: the list, the selection and the query all stay.
     #[test]
@@ -12652,14 +12796,14 @@ mod tests {
         let out = feed(&mut app, key(KeyCode::Enter), &mut store);
         assert!(!out.ends_board_session(), "the board stays up");
         match out {
-            Outcome::Move(req) => {
+            Outcome::Move(job) => {
                 assert_eq!(
-                    req,
-                    MoveRequest {
+                    job,
+                    MoveJob::One(MoveRequest {
                         session_id: "sb-move-1".to_string(),
                         file: main.join("sb-move-1.jsonl"),
                         target: wt,
-                    }
+                    })
                 );
             }
             _ => panic!("expected the move worker's request"),
@@ -12770,7 +12914,7 @@ mod tests {
         handle_event(
             &mut app,
             AppEvent::MoveFinished {
-                session_id: "mv-a".to_string(),
+                session_ids: vec!["mv-a".to_string()],
                 status: "moved to /tmp/proj/wt".to_string(),
                 success: true,
             },
@@ -12788,7 +12932,7 @@ mod tests {
         handle_event(
             &mut app,
             AppEvent::MoveFinished {
-                session_id: "mv-b".to_string(),
+                session_ids: vec!["mv-b".to_string()],
                 status: claude_move::MOVE_LIVE_REFUSAL.to_string(),
                 success: false,
             },
@@ -12797,6 +12941,56 @@ mod tests {
         assert!(!app.moving_on("mv-b"));
         assert_eq!(app.status.as_deref(), Some(claude_move::MOVE_LIVE_REFUSAL));
         assert_eq!(app.status_ttl, None, "a refusal is sticky");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A job's ONE completion clears the in-flight entry of EVERY id it names —
+    /// and only those — then reloads the board and reports in its class.
+    #[test]
+    fn move_finished_clears_every_id_it_names_and_reloads_once() {
+        let root = unique_temp_dir("move-finished-many");
+        let proj = root.join("-tmp-proj");
+        std::fs::create_dir_all(&proj).expect("create the encoded-cwd dir");
+        write_store_session(&proj, "mv-a", "2026-07-14T10:00:00.000Z");
+        let mut store = store_at(&root);
+        let mut app = App::new(
+            store.reload().sessions,
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        for id in ["mv-a", "mv-b", "mv-c"] {
+            app.mark_moving(id);
+        }
+        // A transcript the board has not loaded yet, as a move leaves one.
+        let landed = root.join("-tmp-proj--wt");
+        std::fs::create_dir_all(&landed).expect("create the target's dir");
+        write_store_session(&landed, "mv-landed", "2026-07-14T11:00:00.000Z");
+        assert!(app.session_by_id("mv-landed").is_none());
+
+        handle_event(
+            &mut app,
+            AppEvent::MoveFinished {
+                session_ids: vec!["mv-a".to_string(), "mv-b".to_string()],
+                status: "2 moved to /tmp/proj/wt, 1 failed".to_string(),
+                success: false,
+            },
+            &mut store,
+        );
+        assert!(!app.moving_on("mv-a"), "every id the job names clears");
+        assert!(!app.moving_on("mv-b"), "every id the job names clears");
+        assert!(
+            app.moving_on("mv-c"),
+            "an id the job does not name keeps it"
+        );
+        assert!(
+            app.session_by_id("mv-landed").is_some(),
+            "the completion reloads the board"
+        );
+        assert_eq!(
+            app.status.as_deref(),
+            Some("2 moved to /tmp/proj/wt, 1 failed")
+        );
+        assert_eq!(app.status_ttl, None, "`success: false` is sticky");
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -12813,7 +13007,7 @@ mod tests {
         app.undelivered_handle().deliver(
             &dead_tx,
             AppEvent::MoveFinished {
-                session_id: "sb-move-1".to_string(),
+                session_ids: vec!["sb-move-1".to_string()],
                 status: "moved to /x".to_string(),
                 success: true,
             },
@@ -12834,6 +13028,637 @@ mod tests {
         feed(&mut app, key(KeyCode::Right), &mut store);
         feed(&mut app, key(KeyCode::Left), &mut store);
         assert_eq!(move_choices(&app), vec![wt], "picker unchanged and open");
+    }
+
+    /// [`move_board`] over a three-member fork lineage in `main` — `lmv-new` (the
+    /// head, selected), `lmv-mid` and the soft-HIDDEN `lmv-old`, one root uuid and
+    /// distinct stamps — folded. Returns the app, `main`, `wt` and the members in
+    /// the order `Move lineage (N)` carries them (the store's).
+    fn lineage_move_board(tag: &str) -> (App, PathBuf, PathBuf, Vec<String>) {
+        let main = resolve_dir(&unique_temp_dir(&format!("{tag}-main")));
+        let wt = resolve_dir(&unique_temp_dir(&format!("{tag}-wt")));
+        let sessions: Vec<Session> = [("lmv-new", 300), ("lmv-mid", 200), ("lmv-old", 100)]
+            .into_iter()
+            .map(|(id, unix_secs)| {
+                let mut s = resumable_session(&main, id);
+                s.root_uuid = Some(format!("{tag}-root"));
+                s.timestamp = Some(
+                    time::OffsetDateTime::from_unix_timestamp(unix_secs)
+                        .expect("a valid timestamp"),
+                );
+                s
+            })
+            .collect();
+        let mut app = App::new(sessions.clone(), Scope::Project, main.clone());
+        let set = WorktreeSet::from_resolved([main.clone(), wt.clone()], None);
+        app.set_worktree_probe(move |_| set.clone());
+        // `App::new` loads the persisted hidden set: start from exactly one hidden
+        // member, then re-filter through the public reload path.
+        app.hidden_ids.clear();
+        app.hidden_ids.insert("lmv-old".to_string());
+        app.apply_sessions(sessions);
+        seed_live(&mut app, &[]);
+        assert_eq!(
+            app.selected.as_deref(),
+            Some("lmv-new"),
+            "premise: the head"
+        );
+        assert_eq!(app.filtered.len(), 1, "premise: the lineage is folded");
+        let members = app.sessions.iter().map(|s| s.session_id.clone()).collect();
+        (app, main, wt, members)
+    }
+
+    /// `Ctrl-X w`, then `Enter` on the picker's one row: the lineage scope confirm.
+    fn open_move_scope(app: &mut App, store: &mut SessionStore) {
+        feed(app, ctrl(KeyCode::Char('x')), store);
+        feed(app, key(KeyCode::Char('w')), store);
+        feed(app, key(KeyCode::Enter), store);
+        let modal = app.modal.as_ref().expect("the scope confirm is open");
+        assert_eq!(modal.layout, ModalLayout::Row, "premise: the scope confirm");
+    }
+
+    /// On a lineage HEAD row the picker's rows carry the lineage, and `Enter` asks
+    /// `Move this` / `Move lineage (N)` / `Cancel` — Cancel highlighted, the hidden
+    /// member counted in `(N)` and disclosed — before anything moves. `Esc` leaves
+    /// with nothing moved.
+    #[test]
+    fn ctrl_x_w_on_a_lineage_head_asks_this_or_the_lineage_after_the_pick() {
+        let mut store = store_at(Path::new("/tmp"));
+        let (mut app, _main, wt, members) = lineage_move_board("lmv-ask");
+        assert_eq!(members.len(), 3, "premise: the hidden member is a member");
+
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('w')), &mut store);
+        let picker = app.modal.as_ref().expect("the move picker is open");
+        assert_eq!(picker.layout, ModalLayout::List);
+        let actions: Vec<ModalAction> = picker.choices.iter().map(|c| c.action.clone()).collect();
+        assert_eq!(
+            actions,
+            vec![ModalAction::ChooseMoveScope {
+                target: wt.clone(),
+                members: members.clone(),
+            }],
+            "every picker row on a lineage head carries the whole lineage"
+        );
+
+        let out = feed(&mut app, key(KeyCode::Enter), &mut store);
+        assert!(
+            matches!(out, Outcome::Continue),
+            "the pick dispatches nothing"
+        );
+        let confirm = app.modal.as_ref().expect("the scope confirm is open");
+        assert_eq!(confirm.layout, ModalLayout::Row);
+        let actions: Vec<ModalAction> = confirm.choices.iter().map(|c| c.action.clone()).collect();
+        assert_eq!(
+            actions,
+            vec![
+                ModalAction::MoveTo(wt.clone()),
+                ModalAction::MoveLineage {
+                    target: wt.clone(),
+                    ids: members.clone(),
+                },
+                ModalAction::Cancel,
+            ]
+        );
+        let labels: Vec<&str> = confirm.choices.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(labels, ["Move this", "Move lineage (3)", "Cancel"]);
+        assert_eq!(
+            confirm.selected_action(),
+            Some(&ModalAction::Cancel),
+            "Cancel is the default"
+        );
+        assert!(
+            confirm
+                .message
+                .starts_with("3 in this lineage, 1 of them hidden."),
+            "the hidden member is disclosed first: {:?}",
+            confirm.message
+        );
+        assert_eq!(confirm.session_id.as_deref(), Some("lmv-new"));
+        for id in &members {
+            assert!(
+                !app.moving_on(id),
+                "{id}: nothing is marked before a button"
+            );
+        }
+        assert_eq!(app.status, None);
+
+        let out = feed(&mut app, key(KeyCode::Esc), &mut store);
+        assert!(matches!(out, Outcome::Continue));
+        assert!(app.modal.is_none(), "Esc closes the scope confirm");
+        for id in &members {
+            assert!(!app.moving_on(id), "{id}: nothing moved");
+        }
+        assert_eq!(app.status, None);
+    }
+
+    /// The scope confirm names the folder the user PICKED: with two targets, the
+    /// second row's `Enter` opens a confirm whose prompt carries that row's label,
+    /// never the first row's — the label the `ChooseMoveScope` arm reads off the
+    /// picker's highlighted row.
+    #[test]
+    fn the_scope_confirm_names_the_picked_folder_not_the_first_row() {
+        use crate::tui::app::{lineage_confirm_message, move_scope_prompt};
+
+        let mut store = store_at(Path::new("/tmp"));
+        let (mut app, main, wt, members) = lineage_move_board("lmv-pick");
+        let second = resolve_dir(&unique_temp_dir("lmv-pick-second"));
+        let set = WorktreeSet::from_resolved([main.clone(), wt.clone(), second.clone()], None);
+        app.set_worktree_probe(move |_| set.clone());
+        let sessions = app.sessions.clone();
+        app.apply_sessions(sessions);
+        assert_eq!(
+            app.selected.as_deref(),
+            Some("lmv-new"),
+            "premise: the head"
+        );
+
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('w')), &mut store);
+        let picker = app.modal.as_ref().expect("the move picker is open");
+        let targets: Vec<PathBuf> = picker
+            .choices
+            .iter()
+            .map(|c| match &c.action {
+                ModalAction::ChooseMoveScope { target, .. } => target.clone(),
+                other => panic!("unexpected action {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            targets,
+            vec![wt.clone(), second.clone()],
+            "premise: two rows"
+        );
+        let first_label = picker.choices[0].label.clone();
+        let second_label = picker.choices[1].label.clone();
+        assert!(
+            !second_label.contains(&first_label) && !first_label.contains(&second_label),
+            "premise: neither label hides inside the other"
+        );
+
+        feed(&mut app, key(KeyCode::Down), &mut store);
+        feed(&mut app, key(KeyCode::Enter), &mut store);
+        let confirm = app.modal.as_ref().expect("the scope confirm is open");
+        assert_eq!(
+            confirm.layout,
+            ModalLayout::Row,
+            "premise: the scope confirm"
+        );
+        assert_eq!(
+            confirm.choices[0].action,
+            ModalAction::MoveTo(second.clone()),
+            "premise: the confirm targets the picked folder"
+        );
+        assert!(
+            confirm.message.contains(&second_label),
+            "the picked folder is named: {:?}",
+            confirm.message
+        );
+        assert!(
+            !confirm.message.contains(&first_label),
+            "the first row's folder is not: {:?}",
+            confirm.message
+        );
+        assert_eq!(
+            confirm.message,
+            lineage_confirm_message(members.len(), 1, &move_scope_prompt(&second_label)),
+            "the disclosure over the picked folder's prompt"
+        );
+
+        feed(&mut app, key(KeyCode::Esc), &mut store);
+        for dir in [&main, &wt, &second] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// `Move this` is the plain single move of the head row, and nothing else.
+    #[test]
+    fn move_this_from_the_scope_confirm_moves_only_the_head() {
+        let mut store = store_at(Path::new("/tmp"));
+        let (mut app, main, wt, members) = lineage_move_board("lmv-this");
+        open_move_scope(&mut app, &mut store);
+        app.set_live_probe(|| panic!("the key path must not probe: the worker does"));
+        feed(&mut app, key(KeyCode::Left), &mut store);
+        feed(&mut app, key(KeyCode::Left), &mut store);
+        match feed(&mut app, key(KeyCode::Enter), &mut store) {
+            Outcome::Move(job) => assert_eq!(
+                job,
+                MoveJob::One(MoveRequest {
+                    session_id: "lmv-new".to_string(),
+                    file: main.join("lmv-new.jsonl"),
+                    target: wt,
+                })
+            ),
+            _ => panic!("`Move this` starts the single move"),
+        }
+        let moving: Vec<&String> = members.iter().filter(|id| app.moving_on(id)).collect();
+        assert_eq!(moving, ["lmv-new"], "only the head is moving");
+        assert!(app.modal.is_none());
+    }
+
+    /// `Move lineage (N)` packs EVERY member — the hidden one included — into one
+    /// job, in the carried order, without a single blocking step on the key path
+    /// (the probe is armed to panic). Every member wears the badge; no status.
+    #[test]
+    fn move_lineage_dispatches_every_member_in_one_job() {
+        let mut store = store_at(Path::new("/tmp"));
+        let (mut app, main, wt, members) = lineage_move_board("lmv-all");
+        open_move_scope(&mut app, &mut store);
+        app.set_live_probe(|| panic!("the key path must not probe: the worker does"));
+        feed(&mut app, key(KeyCode::Left), &mut store);
+        match feed(&mut app, key(KeyCode::Enter), &mut store) {
+            Outcome::Move(job) => assert_eq!(
+                job,
+                MoveJob::Lineage(LineageMove {
+                    target: wt.clone(),
+                    moves: members
+                        .iter()
+                        .map(|id| MoveRequest {
+                            session_id: id.clone(),
+                            file: main.join(format!("{id}.jsonl")),
+                            target: wt.clone(),
+                        })
+                        .collect(),
+                    asked: 3,
+                    refused: 0,
+                })
+            ),
+            _ => panic!("`Move lineage` starts one lineage job"),
+        }
+        for id in &members {
+            assert!(app.moving_on(id), "{id} wears the moving badge");
+        }
+        assert!(app.modal.is_none());
+        assert_eq!(app.status, None, "the badges are the in-flight fact");
+    }
+
+    /// A member snapback is still replying to or moving is skipped on the board
+    /// and counted refused; the rest still go. The skipped reply is not marked
+    /// moving.
+    #[test]
+    fn move_lineage_skips_members_snapback_is_still_writing() {
+        let mut store = store_at(Path::new("/tmp"));
+        let (mut app, main, wt, _members) = lineage_move_board("lmv-skip");
+        app.sending = vec![crate::tui::app::Sending {
+            session_id: "lmv-mid".to_string(),
+            message: "still landing".to_string(),
+            baseline_msg_count: 0,
+        }];
+        app.mark_moving("lmv-old");
+        open_move_scope(&mut app, &mut store);
+        feed(&mut app, key(KeyCode::Left), &mut store);
+        match feed(&mut app, key(KeyCode::Enter), &mut store) {
+            Outcome::Move(job) => assert_eq!(
+                job,
+                MoveJob::Lineage(LineageMove {
+                    target: wt.clone(),
+                    moves: vec![MoveRequest {
+                        session_id: "lmv-new".to_string(),
+                        file: main.join("lmv-new.jsonl"),
+                        target: wt,
+                    }],
+                    asked: 3,
+                    refused: 2,
+                })
+            ),
+            _ => panic!("the free member still goes"),
+        }
+        assert!(app.moving_on("lmv-new"));
+        assert!(
+            !app.moving_on("lmv-mid"),
+            "a skipped reply is not marked moving"
+        );
+        assert!(app.moving_on("lmv-old"), "its own move keeps its entry");
+    }
+
+    /// With every member refused or gone there is nothing to spawn: the tally
+    /// lands at once, sticky, and nothing is marked moving.
+    #[test]
+    fn move_lineage_with_nothing_left_to_dispatch_reports_at_once() {
+        let mut store = store_at(Path::new("/tmp"));
+        let (mut app, _main, wt, _members) = lineage_move_board("lmv-none");
+        open_move_scope(&mut app, &mut store);
+        // While the confirm sits open: the head leaves the board on a reload, and
+        // snapback starts writing the other two.
+        let survivors: Vec<Session> = app
+            .sessions
+            .iter()
+            .filter(|s| s.session_id != "lmv-new")
+            .cloned()
+            .collect();
+        app.apply_sessions(survivors);
+        app.sending = vec![crate::tui::app::Sending {
+            session_id: "lmv-mid".to_string(),
+            message: "still landing".to_string(),
+            baseline_msg_count: 0,
+        }];
+        app.mark_moving("lmv-old");
+        assert!(
+            app.modal.is_some(),
+            "premise: the confirm survived the reload"
+        );
+
+        feed(&mut app, key(KeyCode::Left), &mut store);
+        let out = feed(&mut app, key(KeyCode::Enter), &mut store);
+        assert!(matches!(out, Outcome::Continue), "nothing to dispatch");
+        assert_eq!(
+            app.status.as_deref(),
+            Some(
+                format!(
+                    "0 moved to {}, 2 skipped (running), 1 already gone",
+                    wt.display()
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(app.status_ttl, None, "the tally is sticky");
+        assert!(!app.moving_on("lmv-new"));
+        assert!(!app.moving_on("lmv-mid"));
+    }
+
+    /// On an expanded lineage's `↳` row the picker moves that member at once:
+    /// plain `MoveTo` rows, no scope confirm.
+    #[test]
+    fn ctrl_x_w_on_a_child_row_moves_at_once() {
+        let mut store = store_at(Path::new("/tmp"));
+        let (mut app, main, wt, _members) = lineage_move_board("lmv-child");
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('f')), &mut store);
+        feed(&mut app, key(KeyCode::Down), &mut store);
+        assert_eq!(
+            app.selected.as_deref(),
+            Some("lmv-mid"),
+            "premise: standing on the `↳` row"
+        );
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('w')), &mut store);
+        assert_eq!(move_choices(&app), vec![wt.clone()], "plain MoveTo rows");
+        app.set_live_probe(|| panic!("the key path must not probe: the worker does"));
+        match feed(&mut app, key(KeyCode::Enter), &mut store) {
+            Outcome::Move(job) => assert_eq!(
+                job,
+                MoveJob::One(MoveRequest {
+                    session_id: "lmv-mid".to_string(),
+                    file: main.join("lmv-mid.jsonl"),
+                    target: wt,
+                })
+            ),
+            _ => panic!("a `↳` row moves at once"),
+        }
+        assert!(app.moving_on("lmv-mid"));
+        assert!(!app.moving_on("lmv-new"), "the head stays put");
+    }
+
+    /// The deliberate asymmetry in one place. A query leaves the lineage member
+    /// `lmv-mid` standing alone as a head, with no `(+N)`: its siblings are
+    /// filtered out, one of them soft-hidden. `Ctrl-X d` and `Ctrl-X w` still offer
+    /// the whole lineage, because both confirm with the count and disclose the
+    /// hidden member. `Ctrl-X x`, silent, hides that row alone.
+    ///
+    /// The delete half asserts the modal's SHAPE and leaves with `Esc`, never
+    /// `Enter`, so a broken gate can never unlink anything.
+    #[test]
+    fn a_lone_looking_head_under_a_query_hides_alone_but_still_deletes_and_moves_its_lineage() {
+        let _guard = crate::config::env_lock();
+        let state = unique_temp_dir("lone-head-state");
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &state);
+
+        let mut store = store_at(Path::new("/tmp"));
+        let (mut app, main, wt, members) = lineage_move_board("lmv-lone");
+        type_into_board(&mut app, "lmv-mid");
+        let drawn: Vec<(&str, usize, bool)> = app
+            .rows()
+            .into_iter()
+            .filter_map(|row| match row {
+                crate::tui::app::Row::Session {
+                    index,
+                    hidden,
+                    child,
+                } => Some((app.sessions[index].session_id.as_str(), hidden, child)),
+                crate::tui::app::Row::Group { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            drawn,
+            vec![("lmv-mid", 0, false)],
+            "premise: `lmv-mid` stands alone, with no `(+N)` and no `↳` rows"
+        );
+        assert_eq!(app.selected.as_deref(), Some("lmv-mid"), "premise");
+
+        // (1) Delete still offers the whole lineage, the hidden member disclosed.
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('d')), &mut store);
+        let confirm = app.modal.as_ref().expect("the delete confirm is open");
+        let actions: Vec<ModalAction> = confirm.choices.iter().map(|c| c.action.clone()).collect();
+        assert_eq!(
+            actions,
+            vec![
+                ModalAction::Delete,
+                ModalAction::DeleteLineage(members.clone()),
+                ModalAction::Cancel,
+            ],
+            "a head standing alone still offers its lineage to delete"
+        );
+        assert_eq!(
+            confirm.selected_action(),
+            Some(&ModalAction::Cancel),
+            "Cancel is the default"
+        );
+        assert!(
+            confirm
+                .message
+                .starts_with("3 in this lineage, 1 of them hidden."),
+            "the hidden member is disclosed first: {:?}",
+            confirm.message
+        );
+        feed(&mut app, key(KeyCode::Esc), &mut store);
+        assert!(app.modal.is_none(), "Esc closes the delete confirm");
+        assert_eq!(app.query(), "lmv-mid", "and keeps the query");
+
+        // (2) Move still offers the whole lineage.
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('w')), &mut store);
+        let picker = app.modal.as_ref().expect("the move picker is open");
+        let actions: Vec<ModalAction> = picker.choices.iter().map(|c| c.action.clone()).collect();
+        assert_eq!(
+            actions,
+            vec![ModalAction::ChooseMoveScope {
+                target: wt.clone(),
+                members: members.clone(),
+            }],
+            "a head standing alone still offers its lineage to move"
+        );
+        feed(&mut app, key(KeyCode::Esc), &mut store);
+        assert!(app.modal.is_none(), "Esc closes the move picker");
+        assert_eq!(app.query(), "lmv-mid", "and keeps the query");
+
+        // (3) Hide reaches that row alone.
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('x')), &mut store);
+        assert!(app.hidden_ids.contains("lmv-mid"), "the row is hidden");
+        assert!(
+            !app.hidden_ids.contains("lmv-new"),
+            "the newest session stays visible"
+        );
+        assert!(
+            app.hidden_ids.contains("lmv-old"),
+            "the copy hidden before stays hidden"
+        );
+        let persisted = crate::hidden::load_hidden(&crate::config::state_dir());
+        assert!(
+            persisted.contains("lmv-mid") && !persisted.contains("lmv-new"),
+            "only the row's hide is added to the persisted set: {persisted:?}"
+        );
+
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        for dir in [&state, &main, &wt] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// The asymmetry on the residual board. With show-hidden on, a query leaves
+    /// the two OLDER members (`lmv-mid`, and the soft-hidden `lmv-old`) folded
+    /// into a `(+1)` head, and the newest off the board. `Ctrl-X d` and
+    /// `Ctrl-X w` still offer the full-store lineage, the hidden member disclosed;
+    /// `Ctrl-X x`, silent, hides only the two copies the row stands for.
+    ///
+    /// The delete half asserts the modal's SHAPE and leaves with `Esc`, never
+    /// `Enter`, so a broken gate can never unlink anything.
+    #[test]
+    fn a_plus_n_head_under_a_query_hides_its_copies_but_still_deletes_and_moves_the_whole_lineage()
+    {
+        let _guard = crate::config::env_lock();
+        let state = unique_temp_dir("plus-n-head-state");
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &state);
+
+        let mut store = store_at(Path::new("/tmp"));
+        let (mut app, main, wt, members) = lineage_move_board("lmv-res");
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('h')), &mut store);
+        assert!(app.show_hidden, "premise: show-hidden is on");
+        // Name-only mode matches labels alone: `label lmv-mid` and
+        // `label lmv-old` hold a `d`, `label lmv-new` does not.
+        type_into_board(&mut app, "d");
+        let drawn: Vec<(&str, usize, bool)> = app
+            .rows()
+            .into_iter()
+            .filter_map(|row| match row {
+                crate::tui::app::Row::Session {
+                    index,
+                    hidden,
+                    child,
+                } => Some((app.sessions[index].session_id.as_str(), hidden, child)),
+                crate::tui::app::Row::Group { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            drawn,
+            vec![("lmv-mid", 1, false)],
+            "premise: the two older members fold into `(+1)`, the newest is off"
+        );
+        assert_eq!(app.selected.as_deref(), Some("lmv-mid"), "premise");
+
+        // (1) Delete still offers the full-store lineage, the hidden member
+        // disclosed.
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('d')), &mut store);
+        let confirm = app.modal.as_ref().expect("the delete confirm is open");
+        let actions: Vec<ModalAction> = confirm.choices.iter().map(|c| c.action.clone()).collect();
+        assert_eq!(
+            actions,
+            vec![
+                ModalAction::Delete,
+                ModalAction::DeleteLineage(members.clone()),
+                ModalAction::Cancel,
+            ],
+            "a `(+N)` head under a query still offers its whole lineage to delete"
+        );
+        assert_eq!(
+            confirm.selected_action(),
+            Some(&ModalAction::Cancel),
+            "Cancel is the default"
+        );
+        assert!(
+            confirm
+                .message
+                .starts_with("3 in this lineage, 1 of them hidden."),
+            "the hidden member is disclosed first: {:?}",
+            confirm.message
+        );
+        feed(&mut app, key(KeyCode::Esc), &mut store);
+        assert!(app.modal.is_none(), "Esc closes the delete confirm");
+        assert_eq!(app.query(), "d", "and keeps the query");
+
+        // (2) Move still offers the full-store lineage.
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('w')), &mut store);
+        let picker = app.modal.as_ref().expect("the move picker is open");
+        let actions: Vec<ModalAction> = picker.choices.iter().map(|c| c.action.clone()).collect();
+        assert_eq!(
+            actions,
+            vec![ModalAction::ChooseMoveScope {
+                target: wt.clone(),
+                members: members.clone(),
+            }],
+            "a `(+N)` head under a query still offers its whole lineage to move"
+        );
+        feed(&mut app, key(KeyCode::Esc), &mut store);
+        assert!(app.modal.is_none(), "Esc closes the move picker");
+        assert_eq!(app.query(), "d", "and keeps the query");
+
+        // (3) Hide flips only the two copies the row stands for.
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('x')), &mut store);
+        assert!(
+            app.hidden_ids.contains("lmv-mid") && app.hidden_ids.contains("lmv-old"),
+            "the row and the copy folded under it are hidden"
+        );
+        assert!(
+            !app.hidden_ids.contains("lmv-new"),
+            "the newest copy, off the board, is not"
+        );
+        let persisted = crate::hidden::load_hidden(&crate::config::state_dir());
+        assert!(
+            persisted.contains("lmv-mid")
+                && persisted.contains("lmv-old")
+                && !persisted.contains("lmv-new"),
+            "the persisted set says the same: {persisted:?}"
+        );
+
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        for dir in [&state, &main, &wt] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// The scope confirm is a `Row`: `Ctrl-O` does nothing there, and `←`/`→`
+    /// (and `h`/`l`) move its highlight.
+    #[test]
+    fn the_scope_confirm_keeps_ctrl_o_inert_and_moves_its_highlight_sideways() {
+        let mut store = store_at(Path::new("/tmp"));
+        let (mut app, _main, _wt, members) = lineage_move_board("lmv-keys");
+        open_move_scope(&mut app, &mut store);
+        let selected = |app: &App| app.modal.as_ref().expect("still open").selected;
+        assert_eq!(selected(&app), 2);
+
+        let out = feed(&mut app, ctrl(KeyCode::Char('o')), &mut store);
+        assert!(matches!(out, Outcome::Continue), "Ctrl-O is inert");
+        assert_eq!(selected(&app), 2, "and moves nothing");
+
+        feed(&mut app, key(KeyCode::Left), &mut store);
+        assert_eq!(selected(&app), 1);
+        feed(&mut app, key(KeyCode::Left), &mut store);
+        assert_eq!(selected(&app), 0);
+        feed(&mut app, key(KeyCode::Right), &mut store);
+        assert_eq!(selected(&app), 1);
+        feed(&mut app, key(KeyCode::Char('h')), &mut store);
+        assert_eq!(selected(&app), 0);
+        feed(&mut app, key(KeyCode::Char('l')), &mut store);
+        assert_eq!(selected(&app), 1);
+        for id in &members {
+            assert!(!app.moving_on(id), "{id}: no key here moved anything");
+        }
+        assert!(app.query().is_empty(), "no key leaked into the query");
     }
 
     /// The whole per-compose pick, end to end through `handle_event`: `Ctrl-L` in a
@@ -13850,6 +14675,94 @@ mod tests {
             );
             feed(&mut app, key(KeyCode::Esc), &mut store);
         }
+
+        std::env::remove_var("CLAUDE_PROJECTS_DIR");
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// `Ctrl-X d` on an expanded lineage's `↳` row offers that row ALONE and
+    /// deletes only its transcript: the head and the other member stay.
+    ///
+    /// The modal's SHAPE is asserted before any key that could confirm, so a
+    /// broken gate fails on the assertion rather than unlinking the lineage.
+    #[test]
+    fn ctrl_x_d_on_an_expanded_child_row_deletes_only_that_row() {
+        let _guard = crate::config::env_lock();
+        let root = unique_temp_dir("delete-child-store");
+        let state = unique_temp_dir("delete-child-state");
+        std::env::set_var("CLAUDE_PROJECTS_DIR", &root);
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &state);
+
+        let proj = root.join("-tmp-proj");
+        std::fs::create_dir_all(&proj).expect("create the encoded-cwd dir");
+        for (id, ts) in [
+            ("sbdch-head", "2026-07-14T10:00:00.000Z"),
+            ("sbdch-mid", "2026-07-13T10:00:00.000Z"),
+            ("sbdch-old", "2026-07-12T10:00:00.000Z"),
+        ] {
+            write_lineage_session(&proj, id, ts, "root-uuid-6");
+        }
+
+        let mut store = store_at(&root);
+
+        let mut app = App::new(
+            store.reload().sessions,
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        seed_live_records(&mut app, &[]); // nothing is live
+        assert_eq!(app.selected.as_deref(), Some("sbdch-head"));
+
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('f')), &mut store);
+        assert_eq!(app.filtered.len(), 3, "premise: the lineage is open");
+        feed(&mut app, key(KeyCode::Down), &mut store);
+        assert_eq!(
+            app.selected.as_deref(),
+            Some("sbdch-mid"),
+            "premise: standing on the first `↳` row"
+        );
+
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('d')), &mut store);
+        let modal = app.modal.as_ref().expect("the confirm is open");
+        assert_eq!(
+            modal
+                .choices
+                .iter()
+                .map(|c| c.action.clone())
+                .collect::<Vec<_>>(),
+            vec![ModalAction::Delete, ModalAction::Cancel],
+            "a `↳` row offers no lineage"
+        );
+        assert_eq!(
+            modal.selected_action(),
+            Some(&ModalAction::Cancel),
+            "still defaulted to Cancel"
+        );
+
+        feed(&mut app, key(KeyCode::Left), &mut store); // -> Delete this
+        let out = feed(&mut app, key(KeyCode::Enter), &mut store);
+        assert!(matches!(out, Outcome::Continue));
+
+        assert!(
+            !proj.join("sbdch-mid.jsonl").exists(),
+            "the `↳` row's transcript is gone"
+        );
+        assert!(
+            proj.join("sbdch-head.jsonl").is_file() && proj.join("sbdch-old.jsonl").is_file(),
+            "the head and the other member are untouched"
+        );
+        assert!(
+            app.session_by_id("sbdch-head").is_some() && app.session_by_id("sbdch-old").is_some(),
+            "and stay on the reloaded board"
+        );
+        assert_eq!(
+            app.status, None,
+            "a clean single delete says nothing; the row leaving the board is the message"
+        );
 
         std::env::remove_var("CLAUDE_PROJECTS_DIR");
         std::env::remove_var("SNAPBACK_CONFIG_DIR");

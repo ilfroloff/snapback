@@ -581,14 +581,15 @@ fn run_inner(
                 Outcome::Send(req) => {
                     crate::send::spawn_send(req, events.sender(), undelivered.clone());
                 }
-                // A confirmed `Ctrl-X w` move: its worker re-reads the transcript,
-                // probes liveness, reads claude's trust and runs the headless
-                // `claude` child, all on its own thread, and KEEPS drawing here,
-                // exactly like `Outcome::Send`. It reports back via
-                // `AppEvent::MoveFinished` on this channel, or through
+                // A confirmed `Ctrl-X w` move job: its worker re-reads the
+                // transcript, probes liveness, reads claude's trust and runs the
+                // headless `claude` child — per member, one after another, for a
+                // lineage — all on its own thread, and KEEPS drawing here, exactly
+                // like `Outcome::Send`. It reports back with ONE
+                // `AppEvent::MoveFinished` per job on this channel, or through
                 // `undelivered` once this board session has ended.
-                Outcome::Move(req) => {
-                    crate::claude_move::spawn_move(req, events.sender(), undelivered.clone());
+                Outcome::Move(job) => {
+                    crate::claude_move::spawn_move(job, events.sender(), undelivered.clone());
                 }
                 // A confirmed interrupt: fire `claude stop` on a detached thread and
                 // KEEP drawing, exactly like `Outcome::Send`. The stop reports back
@@ -668,7 +669,7 @@ fn run_inner(
     // The board session is over, but its channel may still hold a quick reply's
     // `SendFinished` (or a move's `MoveFinished`) that arrived after the key that
     // ended it. Dropping `events` would throw that away, and the reply's
-    // `App::sending` entry (the move's `App::moving` one), which only that event
+    // `App::sending` entry (the move job's `App::moving` ones), which only that event
     // clears, would then stay set into every later board session. So the
     // receiver is emptied into the queue and dropped under the queue's lock (the
     // input-reader join included), and a reply finishing at the same moment either

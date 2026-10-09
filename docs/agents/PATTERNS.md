@@ -145,9 +145,12 @@ it. Follow this split when adding behavior:
   `claude_move`'s `build_set_cwd_argv` / `set_cwd_request_line` /
   `parse_set_cwd_response` (fail-soft over `Value`, a move only on `ok` AND
   `changed: true`) / `status_for_move` / `liveness_refusal` (the probe verdict,
-  a probe that could not answer refusing), so the `Ctrl-X w` move's argv,
-  request, answer, liveness verdict and status are asserted with no `claude`
-  spawned;
+  a probe that could not answer refusing) / `own_writer_refusal` /
+  `stops_the_lineage` / `run_in_order` (over a stand-in `run`, so a lineage's
+  one-at-a-time order and its trust stop need no child) /
+  `status_for_lineage_move`, so the `Ctrl-X w` move's argv, request, answer,
+  liveness verdict and status — a lineage job's tally included — are asserted
+  with no `claude` spawned;
   `agents::elapsed_phrase` and `watch::epoch_ms`, which take their instants as
   parameters so no test reads a clock;
   `compose::compose_key_to_action`; `defined_agents::select_agents` /
@@ -208,9 +211,17 @@ it. Follow this split when adding behavior:
   call site) / `flatten_for_query`; every `App` state transition (incl.
   `pick_default_index`, the agent-picker cycle, `child_indices`, which marks
   the indented rows by reusing `lineage::head_of` rather than re-deriving a head,
-  and `delete_confirm_message`, the delete confirm's copy as a function of
-  `(members, hidden)` — so the sentence that discloses off-screen lineage members
-  is testable without a store, a modal or a terminal);
+  `is_lineage_child`, the row role delete and move read, which IS
+  membership in `child_indices` so a test can assert it against every rendered
+  row, `stands_for_others`, WHEN hide reaches past the selected row (the fold
+  map's `(+N)`, or an expanded head over `↳` rows), asserted the same way against
+  an oracle built from the rendered rows, `on_screen_lineage`, WHICH members it
+  then flips (the `group_members` group of the pre-fold list), asserted against
+  the rendered `(+N)` count and `↳` rows and against the ids expanding a `(+N)`
+  head draws, and `lineage_confirm_message`, the
+  delete and move-scope confirms' copy as a function of `(members, hidden,
+  prompt)` — so the sentence that discloses
+  off-screen lineage members is testable without a store, a modal or a terminal);
   `view`'s `wrapped_text_rows` / `wrapped_row_prefix` / `row_window` (which
   logical lines a viewport at a given wrapped-row offset reaches, and the rows
   left over inside the first of them — pure arithmetic over a prefix map, so the
@@ -930,9 +941,11 @@ the event, and it carries no shutdown flag for the alias probe's reason: it send
 once and returns.
 
 `claude_move::spawn_move` is the eighth, and the first to run the bare LIVENESS
-PROBE on a worker. A confirmed `Ctrl-X w` returns `Outcome::Move(MoveRequest)`,
-carrying only what the board already held (the row's id, its transcript, the
-chosen folder), and the driver starts the worker the way it starts `Send`.
+PROBE on a worker. A confirmed `Ctrl-X w` returns `Outcome::Move(MoveJob)` — one
+`MoveJob::One(MoveRequest)`, or a `MoveJob::Lineage(LineageMove)` holding one
+request per dispatched member — carrying only what the board already held (each
+row's id, its transcript, the chosen folder), and the driver starts the worker the
+way it starts `Send`.
 Everything that blocks is the worker's: the authoritative re-read
 (`resume::plan_at`), the folder pre-checks (`check_target`),
 `agents::try_live_agents`, the trust read and the child. The child runs through the
@@ -942,11 +955,19 @@ and reply parser. So the move's probe is this ORDINARY case, not the hand-off
 exception below: the key handler never probes
 (`confirming_a_move_starts_the_worker_and_marks_the_row_moving` arms the probe to
 panic), and hoisting the probe or the trust read onto the spawning thread is what
-`children::the_probe_and_the_trust_read_run_on_the_move_worker` pins. It delivers
-its one `AppEvent::MoveFinished` through `send::UndeliveredEvents::deliver`, as
-`spawn_send` does and for the same reason: that event alone clears the session's
-`App::moving` entry, which keeps the row's own keys off a transcript the child may
-still be renaming, so a hand-off on another row must not lose it.
+`children::the_probe_and_the_trust_read_run_on_the_move_worker` pins. A lineage
+job keeps that shape per member on the SAME one worker: `run_in_order` runs each
+member's whole `run_move` (probe included, right before its own child) strictly
+one after another and stops after the first `needs_trust`
+(`claude_move::stops_the_lineage`); the probe is never hoisted to one per set,
+and `children::a_lineage_job_probes_each_member_on_the_worker_before_its_own_child`
+pins it. The move is therefore NOT the one-probe-per-set case below: that rule
+exists because the delete's probe runs on the UI thread, and a worker's probe
+spends no render time. It delivers its one `AppEvent::MoveFinished` (naming every
+id the job dispatched, `session_ids`) through `send::UndeliveredEvents::deliver`,
+as `spawn_send` does and for the same reason: that event alone clears those
+sessions' `App::moving` entries, which keep the rows' own keys off a transcript a
+child may still be renaming, so a hand-off on another row must not lose it.
 
 The rule is about the **poll cadence**, not about the word "shell-out". A
 ONE-SHOT at hand-off is a different thing and is allowed — `agents::live_agents`
@@ -965,7 +986,8 @@ must be argued at the call site rather than assumed:
   deliberate hitch. Do not paper over it with a zero-render claim that only holds
   on one branch.
 - **One shot means one, whatever the target count.** The hard-delete confirm
-  (`confirm_delete`) judges a whole fork lineage, so it takes claude's active list
+  (`confirm_delete`) can judge a whole fork lineage (a head row's
+  `Delete lineage (N)`), so it takes claude's active list
   ONCE for the entire set (`App::live_agents_now`) and evaluates every member
   against that single map. Reaching for the per-session accessor in the loop would
   turn one probe into N blocking spawns on the render loop — the poll cadence rule
@@ -1335,9 +1357,10 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
 2. `apply_action` mutates the `App` and returns an `Outcome`
    (`Continue`/`Quit`/`Resume`/`Send`/`Move`/`Interrupt`/`BgLaunch`/`Signal`; `Copy` comes
    from `handle_chord_key` and `FinishCopy` from `handle_event`, below). `Send`,
-   `Move`, `Interrupt` and `BgLaunch` carry a confirmed `SendRequest` / `MoveRequest` /
+   `Move`, `Interrupt` and `BgLaunch` carry a confirmed `SendRequest` / `MoveJob` /
    `InterruptRequest` / `BgLaunchRequest` the driver spawns without a teardown (the
-   board stays up; `Move` comes from the move picker's confirm), the
+   board stays up; `Move` comes from the move picker's confirm or its lineage
+   scope confirm, ONE payload and one driver arm for both job kinds), the
    way `Resume` carries a confirmed `Ready` — the decision is data, the effect is
    the driver's. `Signal { pid }` carries a re-verified pid the same way; the driver
    sends it a SIGTERM inline rather than on a thread (see §6). Add a new effect
@@ -1355,8 +1378,9 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    HEADLESSLY): the `Ctrl-X w` move is a `set_cwd` child, not an interactive `/cd`.
 3. Modal state owns the keyboard: ONE `App.modal: Option<Modal>` serves every
    titled overlay — the running-session choice, the new-session agent picker, a
-   compose's `Ctrl-L` model picker, the `Ctrl-X w` move picker, and
-   the hard-delete confirm — through the generic `modal_key` → `confirm_modal`
+   compose's `Ctrl-L` model picker, the `Ctrl-X w` move picker and its lineage
+   scope confirm, and the hard-delete confirm — through the generic `modal_key` →
+   `confirm_modal`
    machine, dispatching each choice's `ModalAction` tag (a `Row` layout binds the
    horizontal `←`/`→`/`h`/`l` to MOVE its highlight; a `List` never moves sideways,
    binds `←`/`→` to `ModalNav::Adjust` instead and leaves `h`/`l` unbound — the two
@@ -1654,12 +1678,14 @@ state and renders on the surface that owns it:
   (`view::sending_tail`), not on the help line;
 - a background-agent launch lives in `App::draft.launch_id` and renders on the
   draft card (`view::draft_card`), not on the help line;
-- a `Ctrl-X w` move in flight lives in `App::moving` (one entry per session) and
-  renders as that row's `moving…` badge (`view::MOVING_ROW_BADGE`), not on the
-  help line: the picker's confirm sets no status. Its `AppEvent::MoveFinished` is
-  the OUTCOME, `moved to <folder>` transient and every failure or refusal sticky,
-  `needs_trust`'s "press Enter, then run /cd" hint included, since the user has to
-  act on it;
+- a `Ctrl-X w` move in flight lives in `App::moving` (one entry per session, so a
+  lineage job holds one per dispatched member) and renders as each such row's
+  `moving…` badge (`view::MOVING_ROW_BADGE`), not on the help line: neither the
+  picker's confirm nor the scope confirm sets a status for a dispatched job. Its
+  `AppEvent::MoveFinished` is the OUTCOME, `moved to <folder>` transient and every
+  failure or refusal sticky, `needs_trust`'s "press Enter, then run /cd" hint
+  included, since the user has to act on it; a lineage job's tally is sticky
+  always (below);
 - an interrupt in flight lives in `App::interrupting` and deliberately has **no**
   visible label — `claude stop` is fast and the badge clears on the next agents
   poll — but the guard still prevents a stale completion from landing on a
@@ -1709,9 +1735,17 @@ Some confirmations are deliberately sticky (`set_status`) all the same:
   went (`3 deleted`). That one line can carry `skipped (running)` refusals and
   `failed to remove` errors beside the count, and those must stay. A clean
   SINGLE delete says nothing at all: the row leaving the board is the message.
+- **A lineage move's tally.** The worker delivers
+  `claude_move::status_for_lineage_move`'s line with `success: false`, so the
+  `MoveFinished` arm sets it with `set_status` even when every member moved
+  (`3 moved to <folder>`), and `update::start_lineage_move` does the same when
+  nothing was left to dispatch. The same argument as the delete's tally: the one
+  line can carry `skipped (running)`, `failed` and `already gone` counts beside
+  the success, and its trailing trust remedy is text the user has to act on. The
+  single move keeps its split (transient success, sticky otherwise).
 
-Both still clear on the next actionable keypress like any sticky status. Do not
-"fix" either to `set_status_transient`.
+All three still clear on the next actionable keypress like any sticky status. Do
+not "fix" any of them to `set_status_transient`.
 
 The preview **drag-selection copy** is decided the other way, on purpose, although
 it goes through the very same `finish_copy` and clipboard path: its line —

@@ -1,7 +1,9 @@
 //! Moving a session to another folder WITHOUT leaving the board: what `Ctrl-X w`
 //! does once its picker has a target.
 //!
-//! One headless `claude` child per move ([`build_set_cwd_argv`]: `-p` with the
+//! One headless `claude` child per move — per member for a lineage, strictly one
+//! after another on the job's one worker ([`MoveJob::Lineage`]) —
+//! ([`build_set_cwd_argv`]: `-p` with the
 //! stream-json control protocol and `-r <id>`) starts in the session's CURRENT
 //! folder, reads ONE `set_cwd` control request ([`set_cwd_request_line`]) and
 //! answers it; its stdin is then closed and it exits. claude itself moves the
@@ -23,8 +25,8 @@
 //! runs on the move's own worker thread ([`spawn_move`]): the authoritative
 //! re-read of the transcript, the folder pre-checks ([`check_target`]), the
 //! liveness probe, claude's workspace-trust read and the child itself. The key
-//! handler only packs a [`MoveRequest`]; the worker reports back with exactly one
-//! [`AppEvent::MoveFinished`] (AGENTS.md OFF-UI-THREAD), through
+//! handler only packs a [`MoveJob`]; the worker reports back with exactly one
+//! [`AppEvent::MoveFinished`] per job (AGENTS.md OFF-UI-THREAD), through
 //! [`UndeliveredEvents`] so a hand-off cannot lose it.
 //!
 //! The child machinery is the catalog fetch's
@@ -146,7 +148,34 @@ pub const MOVE_SOURCE_GONE: &str = "This session's current folder no longer exis
      transcript could not be read), so nothing moved.";
 
 /// The success status's lead, followed by the folder claude moved the session to.
+/// A lineage tally leads with it too, after the count (`3 moved to <target>`).
 const MOVED_PREFIX: &str = "moved to ";
+
+/// What `needs_trust` cost the single move, between the folder and the remedy
+/// ([`needs_trust_wording`]). A lineage tally counts its members instead.
+const NEEDS_TRUST_NOTHING_MOVED: &str = ", so nothing moved";
+
+/// Lineage tally bucket ([`status_for_lineage_move`]): members refused because a
+/// writer holds them — snapback's own reply or move (board side) or claude's
+/// active list ([`MOVE_LIVE_REFUSAL`]). The word `delete::status_for_delete`
+/// uses for the same umbrella.
+const LINEAGE_SKIPPED_RUNNING: &str = "skipped (running)";
+
+/// Lineage tally bucket: members already in the target ([`MOVE_ALREADY_THERE`]).
+const LINEAGE_ALREADY_THERE: &str = "already there";
+
+/// Lineage tally bucket: members whose move failed for any other reason, a
+/// liveness probe that could not answer included (never counted as running).
+const LINEAGE_FAILED: &str = "failed";
+
+/// Lineage tally bucket: members that left the board between the confirm and the
+/// dispatch, so no move was asked for them.
+const LINEAGE_ALREADY_GONE: &str = "already gone";
+
+/// Lineage tally bucket: members claude's `needs_trust` left in place — the one
+/// that met it and every member the job then did not attempt
+/// ([`stops_the_lineage`]). It trails the tally with the shared remedy.
+const LINEAGE_NOT_MOVED: &str = "not moved";
 
 /// Status when claude answered `ok` but `changed` was not `true`: nothing moved.
 const MOVE_UNCHANGED: &str = "claude accepted the move but moved nothing — the session stays \
@@ -187,6 +216,37 @@ pub struct MoveRequest {
     pub file: PathBuf,
     /// The chosen folder, as the picker's choice carried it.
     pub target: PathBuf,
+}
+
+/// One dispatched `Ctrl-X w` job, as the driver hands it to [`spawn_move`]. Every
+/// job runs on ONE worker thread and reports back with exactly one
+/// [`AppEvent::MoveFinished`] naming every id it dispatched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MoveJob {
+    /// One session's move, through [`run_move`]; its status and class are
+    /// [`status_for_move`]'s.
+    One(MoveRequest),
+    /// A confirmed `Move lineage (N)`: every dispatched member, one after another,
+    /// each through the same [`run_move`] ([`run_in_order`]); its status is
+    /// [`status_for_lineage_move`]'s tally, always sticky.
+    Lineage(LineageMove),
+}
+
+/// A confirmed `Move lineage (N)`, packed by the key handler for the worker.
+/// Like [`MoveRequest`] it carries only what the board already held.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineageMove {
+    /// The folder every member is asked to move to.
+    pub target: PathBuf,
+    /// The dispatched members, in the order the confirm carried them; each
+    /// request's `target` is [`target`](Self::target).
+    pub moves: Vec<MoveRequest>,
+    /// The `N` the `Move lineage (N)` button named.
+    pub asked: usize,
+    /// Members the board skipped because snapback's own reply or move still holds
+    /// them ([`own_writer_refusal`]). Members that left the board before the
+    /// dispatch are `asked - refused - moves.len()`.
+    pub refused: usize,
 }
 
 /// What one move came to: claude's answer, or why there was none.
@@ -386,6 +446,151 @@ pub fn liveness_refusal(probe: Option<bool>) -> Option<&'static str> {
     }
 }
 
+/// The refusal for snapback's OWN writers on one session, the two the board
+/// knows without asking claude: its move still in flight
+/// ([`MOVE_IN_FLIGHT_REFUSAL`], asked first) and its quick reply still in flight
+/// ([`MOVE_SENDING_REFUSAL`]). `None` lets the move go on. One rule for the
+/// picker's open (`App::open_move_picker`) and every member of a lineage move
+/// (`update::start_lineage_move`).
+#[must_use]
+pub fn own_writer_refusal(move_in_flight: bool, reply_in_flight: bool) -> Option<&'static str> {
+    if move_in_flight {
+        Some(MOVE_IN_FLIGHT_REFUSAL)
+    } else if reply_in_flight {
+        Some(MOVE_SENDING_REFUSAL)
+    } else {
+        None
+    }
+}
+
+/// Whether a lineage job stops after a member's `outcome`: `true` for
+/// [`MoveOutcome::NeedsTrust`] alone.
+///
+/// `needs_trust` is claude's verdict on the shared TARGET, so every later member
+/// would get the same answer, and a refused move still appends metadata records
+/// to the transcript it was asked about (CLAUDE_CLI.md "A refused move still
+/// writes"): going on would spawn a child and write a transcript per member for
+/// a certain refusal. Trust is granted only by the user in claude's own dialog,
+/// and snapback never sends `trust_accepted` (AGENTS.md DRIVE `claude`
+/// HEADLESSLY), so the job stops and the tally counts the rest with it. Every
+/// other outcome — live, already there, failed, a probe that could not answer —
+/// is about one member, and the job goes on.
+#[must_use]
+pub fn stops_the_lineage(outcome: &MoveOutcome) -> bool {
+    matches!(outcome, MoveOutcome::NeedsTrust { .. })
+}
+
+/// Run `moves` through `run` strictly one after another, in order, stopping after
+/// the first outcome [`stops_the_lineage`] accepts. Returns the outcomes of the
+/// ATTEMPTED members only, so `moves.len() - outcomes.len()` were never tried.
+/// Never concurrent: `set_cwd` can answer `busy`, and parallel children on sibling
+/// transcripts were never probed (CLAUDE_CLI.md).
+fn run_in_order<F>(moves: &[MoveRequest], mut run: F) -> Vec<MoveOutcome>
+where
+    F: FnMut(&MoveRequest) -> MoveOutcome,
+{
+    let mut outcomes = Vec::with_capacity(moves.len());
+    for req in moves {
+        let outcome = run(req);
+        let stop = stops_the_lineage(&outcome);
+        outcomes.push(outcome);
+        if stop {
+            break;
+        }
+    }
+    outcomes
+}
+
+/// claude's `needs_trust` in words, the one wording the single move and a lineage
+/// tally share: `claude has not trusted <folder> yet<consequence> — press Enter,
+/// then run /cd <target> once so claude can ask.` The folder is claude's
+/// `trust_root`, else its `directory`, else `target`; both of claude's strings
+/// pass through `send::sanitize_status`, and `target` arrives sanitized.
+fn needs_trust_wording(
+    directory: Option<&str>,
+    trust_root: Option<&str>,
+    target: &str,
+    consequence: &str,
+) -> String {
+    let folder = trust_root
+        .or(directory)
+        .map_or_else(|| target.to_owned(), sanitize_status);
+    format!(
+        "claude has not trusted {folder} yet{consequence} — press Enter, then run /cd {target} \
+         once so claude can ask."
+    )
+}
+
+/// The ONE status a finished `Move lineage (N)` reports. Always sticky: the line
+/// can carry refusals, failures and the trust remedy beside the count, the same
+/// argument as a lineage delete's tally (PATTERNS.md §11).
+///
+/// `asked` is the `N` the button named, `refused` the members the board skipped
+/// for snapback's own writers, `dispatched` the members handed to the worker,
+/// and `outcomes` the attempted members' outcomes ([`run_in_order`]). Every
+/// member lands in exactly one bucket, counted apart and never merged, the way
+/// `delete::status_for_delete` reconciles its own:
+///
+/// - moved: [`MoveOutcome::Moved`];
+/// - skipped (running): `refused`, plus [`MOVE_LIVE_REFUSAL`];
+/// - already there: [`MOVE_ALREADY_THERE`];
+/// - failed: every other outcome, a probe that could not answer included;
+/// - already gone: `asked - refused - dispatched`, members that left the board;
+/// - not moved: [`MoveOutcome::NeedsTrust`] plus the members never attempted
+///   after it, trailing the counts with [`needs_trust_wording`]'s remedy.
+///
+/// The counts lead, so the line's cut on a narrow terminal costs the remedy
+/// first. The target and claude's folder pass through `send::sanitize_status`.
+#[must_use]
+pub fn status_for_lineage_move(
+    asked: usize,
+    refused: usize,
+    dispatched: usize,
+    outcomes: &[MoveOutcome],
+    target: &Path,
+) -> String {
+    let target = sanitize_status(&target.to_string_lossy());
+    let (mut moved, mut running, mut there, mut failed, mut trust) = (0, refused, 0, 0, 0);
+    let mut trust_folder: Option<(Option<&str>, Option<&str>)> = None;
+    for outcome in outcomes {
+        match outcome {
+            MoveOutcome::Moved { .. } => moved += 1,
+            MoveOutcome::Refused(refusal) if refusal == MOVE_LIVE_REFUSAL => running += 1,
+            MoveOutcome::Refused(refusal) if refusal == MOVE_ALREADY_THERE => there += 1,
+            MoveOutcome::NeedsTrust {
+                directory,
+                trust_root,
+            } => {
+                trust += 1;
+                trust_folder.get_or_insert((directory.as_deref(), trust_root.as_deref()));
+            }
+            _ => failed += 1,
+        }
+    }
+    let not_moved = trust + dispatched.saturating_sub(outcomes.len());
+    let gone = asked.saturating_sub(refused).saturating_sub(dispatched);
+
+    let mut status = format!("{moved} {MOVED_PREFIX}{target}");
+    for (count, bucket) in [
+        (running, LINEAGE_SKIPPED_RUNNING),
+        (there, LINEAGE_ALREADY_THERE),
+        (failed, LINEAGE_FAILED),
+        (gone, LINEAGE_ALREADY_GONE),
+    ] {
+        if count > 0 {
+            status.push_str(&format!(", {count} {bucket}"));
+        }
+    }
+    if not_moved > 0 {
+        let (directory, trust_root) = trust_folder.unwrap_or_default();
+        status.push_str(&format!(
+            ", {not_moved} {LINEAGE_NOT_MOVED} — {}",
+            needs_trust_wording(directory, trust_root, &target, "")
+        ));
+    }
+    status
+}
+
 /// The board status a finished move reports, and its class: `true` (a transient
 /// confirmation) for [`MoveOutcome::Moved`] alone, `false` (sticky until the next
 /// keypress) for every other outcome. `target` is the folder the move asked for.
@@ -406,18 +611,15 @@ pub fn status_for_move(outcome: &MoveOutcome, target: &Path) -> (String, bool) {
         MoveOutcome::NeedsTrust {
             directory,
             trust_root,
-        } => {
-            let folder = quoted(trust_root)
-                .or_else(|| quoted(directory))
-                .unwrap_or_else(|| target.clone());
-            (
-                format!(
-                    "claude has not trusted {folder} yet, so nothing moved — press Enter, then \
-                     run /cd {target} once so claude can ask."
-                ),
-                false,
-            )
-        }
+        } => (
+            needs_trust_wording(
+                directory.as_deref(),
+                trust_root.as_deref(),
+                &target,
+                NEEDS_TRUST_NOTHING_MOVED,
+            ),
+            false,
+        ),
         MoveOutcome::Rejected { reason, message } => {
             let status = match (quoted(message), quoted(reason)) {
                 (Some(message), Some(reason)) => {
@@ -506,14 +708,14 @@ where
     }
 }
 
-/// Run `req` on a thread of its own and deliver exactly one
-/// [`AppEvent::MoveFinished`] carrying `req.session_id` back. The ONE site that
-/// names the real liveness probe (`agents::try_live_agents`: the bare active
-/// list every hand-off asks, read so that a probe that could not answer is
-/// `None`), trust reader (`claude_trust::folder_trust`), program and timeout.
-pub fn spawn_move(req: MoveRequest, tx: Sender<AppEvent>, undelivered: UndeliveredEvents) {
+/// Run `job` on a thread of its own and deliver exactly one
+/// [`AppEvent::MoveFinished`] carrying every id it dispatched back. The ONE site
+/// that names the real liveness probe (`agents::try_live_agents`: the bare
+/// active list every hand-off asks, read so that a probe that could not answer
+/// is `None`), trust reader (`claude_trust::folder_trust`), program and timeout.
+pub fn spawn_move(job: MoveJob, tx: Sender<AppEvent>, undelivered: UndeliveredEvents) {
     spawn_move_in(
-        req,
+        job,
         tx,
         undelivered,
         |id: &str| agents::try_live_agents().map(|live| live.contains_key(id)),
@@ -524,11 +726,12 @@ pub fn spawn_move(req: MoveRequest, tx: Sender<AppEvent>, undelivered: Undeliver
 }
 
 /// [`spawn_move`] over a stated `is_live`, `trust_of`, `program` and `timeout`:
-/// one worker thread runs [`run_move`], the probe and the trust read included.
+/// one worker thread runs [`run_move`] for every member of the job, the probe and
+/// the trust read included, each member's own probe right before its own child.
 /// Both block, so they must stay INSIDE the worker; hoisting either to the
 /// spawning (UI) thread is the regression the suite pins here.
 fn spawn_move_in<L, T>(
-    req: MoveRequest,
+    job: MoveJob,
     tx: Sender<AppEvent>,
     undelivered: UndeliveredEvents,
     is_live: L,
@@ -536,38 +739,62 @@ fn spawn_move_in<L, T>(
     program: Vec<String>,
     timeout: Duration,
 ) where
-    L: FnOnce(&str) -> Option<bool> + Send + 'static,
-    T: FnOnce(&Path) -> FolderTrust + Send + 'static,
+    L: Fn(&str) -> Option<bool> + Send + 'static,
+    T: Fn(&Path) -> FolderTrust + Send + 'static,
 {
-    spawn_move_with(req, tx, undelivered, move |req| {
-        run_move(req, is_live, trust_of, &program, timeout)
+    spawn_move_with(job, tx, undelivered, move |req| {
+        run_move(req, &is_live, &trust_of, &program, timeout)
     });
 }
 
-/// [`spawn_move`] over a stated `run`: a one-shot thread that runs it, maps its
-/// outcome with [`status_for_move`] and delivers one [`AppEvent::MoveFinished`]
-/// through `undelivered` — onto the board's channel while it is up, into the
-/// queue the next board replays once it is not. `run` is a SEAM production swaps
-/// exactly never, so the suite can state an outcome instead of spawning `claude`.
+/// [`spawn_move`] over a stated `run`: a one-shot thread that runs the job's
+/// move(s) through it, maps the result to one status and its class, and delivers
+/// one [`AppEvent::MoveFinished`] through `undelivered` — onto the board's
+/// channel while it is up, into the queue the next board replays once it is not.
+/// `run` is a SEAM production swaps exactly never, so the suite can state an
+/// outcome instead of spawning `claude`.
+///
+/// A [`MoveJob::Lineage`] runs its members through `run` one at a time
+/// ([`run_in_order`]) on this same thread, and its event names EVERY dispatched
+/// id, attempted or not, so each member's in-flight entry clears with it.
 fn spawn_move_with<F>(
-    req: MoveRequest,
+    job: MoveJob,
     tx: Sender<AppEvent>,
     undelivered: UndeliveredEvents,
-    run: F,
+    mut run: F,
 ) where
-    F: FnOnce(&MoveRequest) -> MoveOutcome + Send + 'static,
+    F: FnMut(&MoveRequest) -> MoveOutcome + Send + 'static,
 {
     thread::spawn(move || {
-        let outcome = run(&req);
-        let (status, success) = status_for_move(&outcome, &req.target);
-        undelivered.deliver(
-            &tx,
-            AppEvent::MoveFinished {
-                session_id: req.session_id,
-                status,
-                success,
-            },
-        );
+        let finished = match job {
+            MoveJob::One(req) => {
+                let outcome = run(&req);
+                let (status, success) = status_for_move(&outcome, &req.target);
+                AppEvent::MoveFinished {
+                    session_ids: vec![req.session_id],
+                    status,
+                    success,
+                }
+            }
+            MoveJob::Lineage(job) => {
+                let outcomes = run_in_order(&job.moves, &mut run);
+                let status = status_for_lineage_move(
+                    job.asked,
+                    job.refused,
+                    job.moves.len(),
+                    &outcomes,
+                    &job.target,
+                );
+                AppEvent::MoveFinished {
+                    session_ids: job.moves.into_iter().map(|req| req.session_id).collect(),
+                    status,
+                    // Sticky whatever the tally says (PATTERNS.md §11; see
+                    // `status_for_lineage_move`).
+                    success: false,
+                }
+            }
+        };
+        undelivered.deliver(&tx, finished);
     });
 }
 
@@ -1001,19 +1228,24 @@ mod tests {
     /// A board's request for a transcript at `<root>/store/<id>.jsonl` whose `cwd`
     /// is `current`, moving to `target`.
     fn request_in(root: &Path, current: &Path, target: &Path) -> MoveRequest {
+        request_named(root, "sess-mv", current, target)
+    }
+
+    /// [`request_in`] for session `id`, so several can share one store.
+    fn request_named(root: &Path, id: &str, current: &Path, target: &Path) -> MoveRequest {
         let store = root.join("store");
         std::fs::create_dir_all(&store).expect("create the store dir");
-        let file = store.join("sess-mv.jsonl");
+        let file = store.join(format!("{id}.jsonl"));
         std::fs::write(
             &file,
             format!(
-                r#"{{"type":"user","sessionId":"sess-mv","cwd":"{}","message":{{"role":"user","content":"hi"}}}}"#,
+                r#"{{"type":"user","sessionId":"{id}","cwd":"{}","message":{{"role":"user","content":"hi"}}}}"#,
                 current.display()
             ),
         )
         .expect("write the transcript");
         MoveRequest {
-            session_id: "sess-mv".to_owned(),
+            session_id: id.to_owned(),
             file,
             target: target.to_path_buf(),
         }
@@ -1034,7 +1266,7 @@ mod tests {
             target: PathBuf::from("/r/wt"),
         };
         let spawned_at = Instant::now();
-        spawn_move_with(req, tx, UndeliveredEvents::default(), |_| {
+        spawn_move_with(MoveJob::One(req), tx, UndeliveredEvents::default(), |_| {
             thread::sleep(RUN_BLOCKS);
             MoveOutcome::Moved {
                 cwd: Some("/r/wt".to_owned()),
@@ -1043,11 +1275,11 @@ mod tests {
         assert!(spawned_at.elapsed() < RUN_BLOCKS, "spawning must not wait");
         match rx.recv_timeout(DELIVERED_WITHIN) {
             Ok(AppEvent::MoveFinished {
-                session_id,
+                session_ids,
                 status,
                 success,
             }) => {
-                assert_eq!(session_id, "row-1");
+                assert_eq!(session_ids, ["row-1"]);
                 assert_eq!(status, "moved to /r/wt");
                 assert!(success);
             }
@@ -1072,7 +1304,7 @@ mod tests {
             file: PathBuf::from("/nowhere/row-gone.jsonl"),
             target: PathBuf::from("/r/wt"),
         };
-        spawn_move_with(req, tx, queue.clone(), move |_| {
+        spawn_move_with(MoveJob::One(req), tx, queue.clone(), move |_| {
             let _ = done_tx.send(());
             MoveOutcome::NoAnswer
         });
@@ -1090,10 +1322,277 @@ mod tests {
         assert!(
             matches!(
                 kept.as_slice(),
-                [AppEvent::MoveFinished { session_id, success: false, .. }] if session_id == "row-gone"
+                [AppEvent::MoveFinished { session_ids, success: false, .. }] if session_ids == &["row-gone"]
             ),
             "{kept:?}"
         );
+    }
+
+    // --- a lineage move ------------------------------------------------------
+
+    /// One stand-in request per id, all asking for the same `target`.
+    fn lineage_requests(ids: &[&str], target: &str) -> Vec<MoveRequest> {
+        ids.iter()
+            .map(|id| MoveRequest {
+                session_id: (*id).to_owned(),
+                file: PathBuf::from(format!("/nowhere/{id}.jsonl")),
+                target: PathBuf::from(target),
+            })
+            .collect()
+    }
+
+    fn needs_trust() -> MoveOutcome {
+        MoveOutcome::NeedsTrust {
+            directory: None,
+            trust_root: None,
+        }
+    }
+
+    /// Only claude's `needs_trust`, a verdict on the shared target, stops a
+    /// lineage; every per-member outcome lets the job go on.
+    #[test]
+    fn only_needs_trust_stops_a_lineage() {
+        assert!(stops_the_lineage(&needs_trust()));
+        assert!(stops_the_lineage(&MoveOutcome::NeedsTrust {
+            directory: Some("/x/wt".to_owned()),
+            trust_root: Some("/x".to_owned()),
+        }));
+        for goes_on in [
+            MoveOutcome::Moved { cwd: None },
+            MoveOutcome::Unchanged,
+            MoveOutcome::Rejected {
+                reason: Some("busy".to_owned()),
+                message: None,
+            },
+            MoveOutcome::ProtocolError { error: None },
+            MoveOutcome::NoAnswer,
+            MoveOutcome::TimedOut,
+            MoveOutcome::SpawnFailed,
+        ] {
+            assert!(!stops_the_lineage(&goes_on), "{goes_on:?}");
+        }
+        for refusal in [
+            MOVE_LIVE_REFUSAL,
+            MOVE_PROBE_FAILED_REFUSAL,
+            MOVE_SENDING_REFUSAL,
+            MOVE_IN_FLIGHT_REFUSAL,
+            MOVE_TARGET_GONE,
+            MOVE_TARGET_UNUSABLE,
+            MOVE_ALREADY_THERE,
+            MOVE_SOURCE_GONE,
+        ] {
+            assert!(
+                !stops_the_lineage(&MoveOutcome::Refused(refusal.to_owned())),
+                "{refusal}"
+            );
+        }
+    }
+
+    /// Members run strictly one at a time, in the carried order, and nothing runs
+    /// after a `needs_trust`; without one every member runs.
+    #[test]
+    fn a_lineage_runs_one_member_at_a_time_in_order_and_stops_after_needs_trust() {
+        let moves = lineage_requests(&["a", "b", "c"], "/r/wt");
+        let in_flight = std::cell::Cell::new(false);
+        let mut called = Vec::new();
+        let mut answers = vec![MoveOutcome::Moved { cwd: None }, needs_trust()].into_iter();
+        let outcomes = run_in_order(&moves, |req| {
+            assert!(
+                !in_flight.replace(true),
+                "a member started while another ran"
+            );
+            called.push(req.session_id.clone());
+            let outcome = answers.next().expect("no member runs after needs_trust");
+            in_flight.set(false);
+            outcome
+        });
+        assert_eq!(
+            called,
+            ["a", "b"],
+            "stops after the member that met needs_trust"
+        );
+        assert_eq!(outcomes, [MoveOutcome::Moved { cwd: None }, needs_trust()]);
+
+        let mut called = Vec::new();
+        let outcomes = run_in_order(&moves, |req| {
+            assert!(
+                !in_flight.replace(true),
+                "a member started while another ran"
+            );
+            called.push(req.session_id.clone());
+            in_flight.set(false);
+            MoveOutcome::Refused(MOVE_LIVE_REFUSAL.to_owned())
+        });
+        assert_eq!(called, ["a", "b", "c"], "every member runs, in order");
+        assert_eq!(outcomes.len(), 3);
+    }
+
+    #[test]
+    fn status_for_lineage_move_reports_every_bucket_apart() {
+        let target = Path::new("/r/wt");
+        let moved = || MoveOutcome::Moved {
+            cwd: Some("/elsewhere".to_owned()),
+        };
+        let refused = |r: &str| MoveOutcome::Refused(r.to_owned());
+
+        // All moved: the count and the asked target alone.
+        assert_eq!(
+            status_for_lineage_move(3, 0, 3, &[moved(), moved(), moved()], target),
+            "3 moved to /r/wt"
+        );
+
+        // A mix: each bucket counted apart; board-side refusals join the live
+        // ones as "running"; a member that left the board is "already gone".
+        let mix = [
+            moved(),
+            refused(MOVE_LIVE_REFUSAL),
+            refused(MOVE_ALREADY_THERE),
+            MoveOutcome::TimedOut,
+            refused(MOVE_SOURCE_GONE),
+        ];
+        assert_eq!(
+            status_for_lineage_move(8, 2, 5, &mix, target),
+            "1 moved to /r/wt, 3 skipped (running), 1 already there, 2 failed, 1 already gone"
+        );
+
+        // A probe that could not answer is a failure, never "running".
+        assert_eq!(
+            status_for_lineage_move(
+                2,
+                0,
+                2,
+                &[moved(), refused(MOVE_PROBE_FAILED_REFUSAL)],
+                target
+            ),
+            "1 moved to /r/wt, 1 failed"
+        );
+
+        // The trust clause trails, names claude's trust_root, else its directory,
+        // else the target, and counts the unattempted members with it.
+        let remedy = "press Enter, then run /cd /r/wt once so claude can ask.";
+        assert_eq!(
+            status_for_lineage_move(
+                4,
+                0,
+                4,
+                &[
+                    moved(),
+                    MoveOutcome::NeedsTrust {
+                        directory: Some("/r/wt".to_owned()),
+                        trust_root: Some("/r".to_owned()),
+                    },
+                ],
+                target
+            ),
+            format!("1 moved to /r/wt, 3 not moved — claude has not trusted /r yet — {remedy}")
+        );
+        assert_eq!(
+            status_for_lineage_move(
+                2,
+                0,
+                2,
+                &[MoveOutcome::NeedsTrust {
+                    directory: Some("/r/wt/dir".to_owned()),
+                    trust_root: None,
+                }],
+                target
+            ),
+            format!(
+                "0 moved to /r/wt, 2 not moved — claude has not trusted /r/wt/dir yet — {remedy}"
+            )
+        );
+        assert_eq!(
+            status_for_lineage_move(1, 0, 1, &[needs_trust()], target),
+            format!("0 moved to /r/wt, 1 not moved — claude has not trusted /r/wt yet — {remedy}")
+        );
+
+        // Nothing dispatched: every member refused on the board or gone.
+        assert_eq!(
+            status_for_lineage_move(3, 2, 0, &[], target),
+            "0 moved to /r/wt, 2 skipped (running), 1 already gone"
+        );
+
+        // No escape reaches the status line, from the target or from claude.
+        let hostile = Path::new("/r/\u{1b}[31mwt");
+        let status = status_for_lineage_move(
+            1,
+            0,
+            1,
+            &[MoveOutcome::NeedsTrust {
+                directory: None,
+                trust_root: Some("/r/\u{1b}[1mroot\u{7}".to_owned()),
+            }],
+            hostile,
+        );
+        assert!(
+            !status.contains('\u{1b}') && !status.contains('\u{7}'),
+            "{status:?}"
+        );
+        assert!(status.starts_with("0 moved to /r/"), "{status:?}");
+    }
+
+    /// The order the picker has always refused in: snapback's own move first,
+    /// then its own reply.
+    #[test]
+    fn own_writer_refusal_names_the_move_first_then_the_reply() {
+        assert_eq!(own_writer_refusal(false, false), None);
+        assert_eq!(
+            own_writer_refusal(true, false),
+            Some(MOVE_IN_FLIGHT_REFUSAL)
+        );
+        assert_eq!(own_writer_refusal(false, true), Some(MOVE_SENDING_REFUSAL));
+        assert_eq!(
+            own_writer_refusal(true, true),
+            Some(MOVE_IN_FLIGHT_REFUSAL),
+            "a move in flight is named first"
+        );
+    }
+
+    /// A lineage job delivers ONE `MoveFinished` naming every dispatched id —
+    /// attempted or not — with the tally, always sticky, then ends.
+    #[test]
+    fn a_lineage_job_delivers_one_sticky_tally_for_every_dispatched_id() {
+        const DELIVERED_WITHIN: Duration = Duration::from_secs(2);
+
+        let (tx, rx) = mpsc::channel::<AppEvent>();
+        let job = LineageMove {
+            target: PathBuf::from("/r/wt"),
+            moves: lineage_requests(&["m-1", "m-2", "m-3", "m-4"], "/r/wt"),
+            asked: 4,
+            refused: 0,
+        };
+        let mut answers = vec![
+            MoveOutcome::Moved { cwd: None },
+            MoveOutcome::Refused(MOVE_LIVE_REFUSAL.to_owned()),
+            needs_trust(),
+        ]
+        .into_iter();
+        spawn_move_with(
+            MoveJob::Lineage(job),
+            tx,
+            UndeliveredEvents::default(),
+            move |_| answers.next().expect("no member runs after needs_trust"),
+        );
+        match rx.recv_timeout(DELIVERED_WITHIN) {
+            Ok(AppEvent::MoveFinished {
+                session_ids,
+                status,
+                success,
+            }) => {
+                assert_eq!(session_ids, ["m-1", "m-2", "m-3", "m-4"]);
+                assert_eq!(
+                    status,
+                    "1 moved to /r/wt, 1 skipped (running), 2 not moved — claude has not \
+                     trusted /r/wt yet — press Enter, then run /cd /r/wt once so claude can ask."
+                );
+                assert!(!success, "a lineage tally is sticky");
+            }
+            other => panic!("the worker must deliver MoveFinished, got {other:?}"),
+        }
+        match rx.recv_timeout(DELIVERED_WITHIN) {
+            Err(RecvTimeoutError::Disconnected) => {}
+            other => panic!("a one-shot sends once and ends, got {other:?}"),
+        }
     }
 
     /// Stand-in children (`sh`): no test spawns `claude`.
@@ -1409,7 +1908,7 @@ esac"#
 
             let spawned_at = Instant::now();
             spawn_move_in(
-                req,
+                MoveJob::One(req),
                 tx,
                 UndeliveredEvents::default(),
                 move |id: &str| {
@@ -1441,15 +1940,112 @@ esac"#
             assert_eq!(trust.1, format!("trust {}", current.display()));
             match rx.recv_timeout(ANSWERS_WITHIN) {
                 Ok(AppEvent::MoveFinished {
-                    session_id,
+                    session_ids,
                     success,
                     ..
                 }) => {
-                    assert_eq!(session_id, "sess-mv");
+                    assert_eq!(session_ids, ["sess-mv"]);
                     assert!(success);
                 }
                 other => panic!("the worker must deliver MoveFinished, got {other:?}"),
             }
+            std::fs::remove_dir_all(&root).ok();
+        }
+
+        /// The marker [`marking`]'s child leaves in the folder it runs in.
+        const SPAWNED_MARKER: &str = "spawned";
+
+        /// [`reporting`], which first leaves [`SPAWNED_MARKER`] in the folder it
+        /// runs in (the member's current folder), so a probe can tell whether a
+        /// member's child has already run.
+        fn marking() -> Vec<String> {
+            let mut argv = reporting();
+            argv[2] = format!(": > {SPAWNED_MARKER}\n{}", argv[2]);
+            argv
+        }
+
+        /// A lineage job asks each member's liveness on the WORKER, once per
+        /// member, in order, each right before that member's own child and after
+        /// the previous member's — never one probe hoisted for the set — and its
+        /// one event names both ids with the tally.
+        #[test]
+        fn a_lineage_job_probes_each_member_on_the_worker_before_its_own_child() {
+            let root = temp_dir("lineage");
+            let folders: Vec<(&str, PathBuf)> = ["lin-a", "lin-b"]
+                .into_iter()
+                .map(|id| (id, root.join(id)))
+                .collect();
+            let target = root.join("wt");
+            std::fs::create_dir_all(&target).expect("create target");
+            let moves: Vec<MoveRequest> = folders
+                .iter()
+                .map(|(id, current)| {
+                    std::fs::create_dir_all(current).expect("create current");
+                    request_named(&root, id, current, &target)
+                })
+                .collect();
+            let (tx, rx) = mpsc::channel::<AppEvent>();
+            let (seen_tx, seen_rx) = mpsc::channel();
+            let spawner = thread::current().id();
+            let spawned_in: Vec<(String, PathBuf)> = folders
+                .iter()
+                .map(|(id, current)| ((*id).to_owned(), current.join(SPAWNED_MARKER)))
+                .collect();
+
+            spawn_move_in(
+                MoveJob::Lineage(LineageMove {
+                    target: target.clone(),
+                    moves,
+                    asked: 2,
+                    refused: 0,
+                }),
+                tx,
+                UndeliveredEvents::default(),
+                move |id: &str| {
+                    let own_child_ran = spawned_in
+                        .iter()
+                        .any(|(member, marker)| member == id && marker.exists());
+                    let children_before = spawned_in
+                        .iter()
+                        .filter(|(_, marker)| marker.exists())
+                        .count();
+                    let _ = seen_tx.send((
+                        thread::current().id(),
+                        id.to_owned(),
+                        own_child_ran,
+                        children_before,
+                    ));
+                    Some(false)
+                },
+                |_: &Path| FolderTrust::Trusted,
+                marking(),
+                ANSWERS_WITHIN,
+            );
+            let first = seen_rx.recv_timeout(ANSWERS_WITHIN).expect("probe one");
+            let second = seen_rx.recv_timeout(ANSWERS_WITHIN).expect("probe two");
+            for probe in [&first, &second] {
+                assert_ne!(probe.0, spawner, "every probe runs on the worker");
+                assert!(!probe.2, "a probe runs before its own member's child");
+            }
+            assert_eq!((first.1.as_str(), first.3), ("lin-a", 0));
+            assert_eq!(
+                (second.1.as_str(), second.3),
+                ("lin-b", 1),
+                "the second probe runs after the first member's child"
+            );
+            match rx.recv_timeout(ANSWERS_WITHIN) {
+                Ok(AppEvent::MoveFinished {
+                    session_ids,
+                    status,
+                    success,
+                }) => {
+                    assert_eq!(session_ids, ["lin-a", "lin-b"]);
+                    assert_eq!(status, format!("2 moved to {}", target.display()));
+                    assert!(!success, "a lineage tally is sticky");
+                }
+                other => panic!("the worker must deliver MoveFinished, got {other:?}"),
+            }
+            assert!(seen_rx.try_recv().is_err(), "exactly one probe per member");
             std::fs::remove_dir_all(&root).ok();
         }
     }
