@@ -2,8 +2,9 @@
 
 Commands, scripts, CI, release automation, and the validation checklist. There
 is no `rustfmt.toml`/`clippy.toml` (toolchain defaults apply) and no build system
-beyond Cargo — one package, built by one `cargo build`. Three GitHub Actions
-workflows automate the quality gates, the release, and the npm publish (see
+beyond Cargo — one package, built by one `cargo build`. Four GitHub Actions
+workflows automate the quality gates, the release, the npm publish, and the
+coverage report (see
 [Continuous integration & releases](#continuous-integration--releases)).
 
 ## Build
@@ -111,7 +112,7 @@ with `-a`. See [docs/GUIDE.md](../GUIDE.md#keys) for the full key map.
 
 ## Continuous integration & releases
 
-Three GitHub Actions workflows, all installing the pinned toolchain from
+Four GitHub Actions workflows, all installing the pinned toolchain from
 `rust-toolchain.toml` via `actions-rust-lang/setup-rust-toolchain`:
 
 - **`🚀 CI`** (`.github/workflows/ci.yml`) — on every PR, runs the same gates as
@@ -123,6 +124,14 @@ Three GitHub Actions workflows, all installing the pinned toolchain from
 - **`📦 Publish to npm`** (`.github/workflows/npm-release.yml`) — on every
   `v*` tag, cross-compiles the four supported platforms and publishes the
   prebuilt binaries to npm as `snapback-tui` (package source: `npm/`).
+- **`📊 Coverage`** (`.github/workflows/coverage.yml`) — on every push to
+  `main` (and on manual dispatch), measures line coverage with
+  `cargo llvm-cov --all-targets --locked --lcov` and uploads `lcov.info` to
+  [Coveralls](https://coveralls.io/github/ilfroloff/snapback), which serves the
+  README badge. It is not a PR gate: it does not run on PRs and nothing requires
+  it. A run from another branch uploads under that branch's name. It adds
+  `llvm-tools-preview` for its own job only (not in `rust-toolchain.toml`) and
+  pins the Coveralls uploader version; bump the pin by hand.
 
 ### How a release happens
 

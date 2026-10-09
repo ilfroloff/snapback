@@ -32,8 +32,8 @@ find the same rule in two places, that is a bug to fix.
    overrides, the session facts the clipboard copy routes by, `claude`'s own
    model variables the compose boxes' `model:` labels read, and the two that
    locate claude's workspace-trust record), the runtime
-   prerequisites, the hidden `--print-list` mode, the CI + release-plz
-   automation, and the pre-finish validation checklist.
+   prerequisites, the hidden `--print-list` mode, the CI, coverage and
+   release-plz automation, and the pre-finish validation checklist.
 6. [CLAUDE_CLI.md](CLAUDE_CLI.md) — **the external `claude` binary**: version
    pin, the argv `snapback` spawns (including where a compose's `Ctrl-L` pick
    places `--model` / `--effort`), the one effect that is not a `claude`

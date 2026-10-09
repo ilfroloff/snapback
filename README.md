@@ -2,7 +2,7 @@
   <img src=".github/assets/logo.gif" width="120" alt="snapback" />
 </p>
 
-# snapback
+# snapback [![Coverage Status](https://coveralls.io/repos/github/ilfroloff/snapback/badge.svg?branch=main)](https://coveralls.io/github/ilfroloff/snapback?branch=main)
 
 Every Claude Code session and agent — one live board
 
