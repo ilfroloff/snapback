@@ -4258,9 +4258,9 @@ impl App {
     }
 
     /// The in-flight quick-reply send targeting `session_id`, or `None` when no
-    /// send is in flight for that session. The preview's optimistic echo and its
-    /// banner-suppression both key off this so render and the click hit-test agree,
-    /// the hard-delete guard reads it for snapback's own writer
+    /// send is in flight for that session. The preview's optimistic echo and the
+    /// pinned row's live-status suffix and fallback (which step aside for it) key off
+    /// this, the hard-delete guard reads it for snapback's own writer
     /// ([`crate::delete::can_delete_target`]), `Ctrl-R` refuses a second reply
     /// to a session it answers `Some` for ([`crate::send::reply_in_flight_refusal`]),
     /// and `Ctrl-X w` opens no move picker for it

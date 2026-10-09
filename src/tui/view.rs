@@ -1360,8 +1360,7 @@ const BANNER_AGE_SEPARATOR: &str = " \u{b7} ";
 
 /// WHETHER the preview reserves its pinned banner row — and the FALLBACK line for
 /// it — or `None` when the pane has no session transcript to pin a row above: nothing
-/// is selected, a new-session draft card owns the pane, or a quick reply to the
-/// selected session is in flight.
+/// is selected, or a new-session draft card owns the pane.
 ///
 /// This answers the RESERVATION, which is the question both callers actually need.
 /// What the row finally SHOWS is resolved in [`render_preview`], after the scroll
@@ -1381,7 +1380,7 @@ const BANNER_AGE_SEPARATOR: &str = " \u{b7} ";
 /// by `docs/agents/PATTERNS.md` §5 (the `has_banner` rule); do not restate it here.
 ///
 /// Read-only over state that already exists — the selected id (`App::selected`), the
-/// draft and in-flight send, and, for the fallback, the existing `App::reported_agent`
+/// draft and in-flight send (which only blanks the fallback), and, for the fallback, the existing `App::reported_agent`
 /// accessor and the stamp its map arrived with — so there is no new `App` state, no
 /// I/O, and no second interpretation of the `state`/`status` value set.
 ///
@@ -1436,48 +1435,39 @@ const BANNER_AGE_SEPARATOR: &str = " \u{b7} ";
 /// transcript rect ([`preview_transcript_rect`], built on [`preview_split`]); the
 /// two must agree, or a click would resolve to the wrong transcript row.
 ///
-/// An IN-FLIGHT quick-reply send takes precedence: while `App::sending` names the
-/// selected session there is NO pinned banner at all — this returns `None`, and
-/// the `cooking…` placeholder renders INLINE at the transcript's tail instead
-/// ([`sending_tail`]), so the exchange reads as ordinary turns. Returning `None`
-/// is also what keeps the render and the click hit-test agreeing on the geometry.
+/// An IN-FLIGHT quick-reply send does NOT take the row away: the pinned marker is
+/// the header of the real transcript's turn at the top of the viewport, and the
+/// `▶ you` echo and `cooking…` placeholder render INLINE at the transcript's tail
+/// ([`sending_tail`]) without a marker the row could pin. What the send does change is
+/// what the row SAYS beside that marker, so each fact is told once: the live
+/// status and age stay off it ([`marker_with_live_status`]) and the reported-status
+/// fallback is blank, because the tail already
+/// says claude is working.
 ///
-/// That precedence is also why the two surfaces divide the way they do, and the
-/// age depends on it. When the in-flight child is THIS board's, the tail already
-/// says so, and the banner (with its age) steps aside. The age is for the other
-/// case, where `App::sending` holds nothing for this session and the banner is all
-/// the user gets. At `claude 2.1.278` the samples of 2026-09-21 and 2026-09-23
-/// found that case dominant as a `claude -p` child that some OTHER snapback
-/// instance dispatched, or
-/// that outlived the board that did, so nothing here knew about the send. At
-/// `claude 2.1.280` it was also a pty-backed TUI, which is never a quick reply and
-/// so never in `App::sending` (see
-/// `docs/agents/DOMAIN.md`, "What `kind: "interactive"` denotes"). So the `cooking…`
-/// indicator is never copied into the banner,
-/// and the age is never copied into the tail. Each fact is told once, on the
-/// surface that owns it.
+/// The age is for the case the banner is all a user gets: `App::sending` holds
+/// nothing for this session, as with a `claude -p` child that some OTHER snapback
+/// instance dispatched or that outlived the board that did (`claude 2.1.278`, the
+/// samples of 2026-09-21 and 2026-09-23), or a pty-backed TUI, never a quick reply
+/// (`claude 2.1.280`; `docs/agents/DOMAIN.md`, "What `kind: "interactive"` denotes").
+/// So the `cooking…` indicator is never copied into the banner, and the age is never
+/// copied into the tail.
 pub(crate) fn preview_banner(app: &App) -> Option<Line<'static>> {
     // A NEW-SESSION draft owns the pane: the card replaces the transcript, so the
     // SELECTED session's status line has nothing left to sit above and would only
     // describe a session the user is no longer looking at. The click hit-test asks
     // THIS fn for the geometry, so returning `None` keeps render and hit-test
-    // agreeing that no banner row is reserved (same contract as the in-flight send
-    // below).
+    // agreeing that no banner row is reserved.
     if app.draft.is_some() {
         return None;
     }
     let selected = app.selected.as_deref()?;
-    // A quick-reply in flight owns the preview: the message and the
-    // `cooking…` placeholder render INLINE at the transcript's tail
-    // ([`sending_tail`] / [`preview::pending_reply_turns`]), so there is no pinned
-    // banner row. The click hit-test asks THIS fn for the geometry, so returning
-    // `None` here keeps render and hit-test agreeing that no banner is drawn.
-    if app.sending_to(selected).is_some() {
-        return None;
-    }
     // The fallback only: a session claude does not report still reserves the row,
     // and with no standing failure and no marker to pin it has nothing to say
     // there, so the row stays blank.
+    // Blank during an in-flight send: the `cooking…` tail already states it.
+    if app.sending_to(selected).is_some() {
+        return Some(Line::default());
+    }
     Some(
         reported_status(app, selected)
             .map(|status| Line::from(banner_status_span(status.text)))
@@ -1589,9 +1579,11 @@ fn banner_status_span(text: String) -> Span<'static> {
 /// therefore no longer exactly the marker line. A standing failure never reaches
 /// here: [`failed_task_banner_line`] outranks the marker and its suffix alike.
 fn marker_with_live_status(app: &App, mut marker: Line<'static>) -> Line<'static> {
+    // Not while THIS board's reply is in flight: the tail's `cooking…` says it.
     let live = app
         .selected
         .as_deref()
+        .filter(|selected| app.sending_to(selected).is_none())
         .and_then(|selected| reported_status(app, selected))
         .filter(|status| status.live && status.aged);
     if let Some(status) = live {
@@ -2258,8 +2250,7 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     // further down, once the scroll offset is known. It is PINNED as its own layout
     // row (see `preview_split`) — the transcript scrolls beneath it — so the
     // default bottom-anchored viewport cannot scroll it away. A pane with no
-    // session transcript on it (nothing selected, a draft card, an in-flight reply)
-    // reserves no row.
+    // session transcript on it (nothing selected, a draft card) reserves no row.
     let banner = preview_banner(app);
     // Dock the compose zone in the bottom of the pane when composing AND the pane
     // is tall enough (`docks_compose`); otherwise `render` gave compose a
@@ -2572,22 +2563,28 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     //    row for any other session.
     //
     // Whether anything is shown AT ALL is still exactly `banner.is_some()` from
-    // above — a card or an in-flight send already forced it to `None`, and nothing
-    // here widens that, a standing failure included: `preview_split`'s reservation
+    // above — a card already forced it to `None` (an in-flight send does not), and
+    // nothing here widens that, a standing failure included: `preview_split`'s reservation
     // and the click hit-test's `preview_banner(..).is_some()` contract are
     // UNCHANGED by this remap.
     //
-    // The marker is handed `offset_rows` — the SAME `usize` row the window above was
+    // The marker is handed `marker_row` — `offset_rows`, the SAME `usize` row the window above was
     // taken at, not a second narrowing of `offset` — and reads the SAME cached
     // `row_prefix` that `row_window` just windowed by. That shared identity is the
     // whole correctness argument: the pane's first painted row and the row the
     // banner names its turn from are resolved by one `line_at_row` over one map, so
-    // the banner cannot name a turn the pane did not paint there. A card is excluded
-    // structurally, since `preview_banner` already returned `None` for one.
+    // the banner cannot name a turn the pane did not paint there (it differs from
+    // `offset_rows` only past the transcript's end, clamped to its last row). A card
+    // is excluded structurally, since `preview_banner` already returned `None` for one.
+    // A viewport scrolled PAST the cached transcript (only the in-flight reply's
+    // synthetic tail is on screen) pins the LAST real turn's marker: the tail's
+    // pending turns carry no model or effort, and `visual_to_content` rejects a row
+    // past the map's end.
+    let marker_row = offset_rows.min(transcript_rows.saturating_sub(1));
     let banner = banner.map(|fallback| {
         failed_task_banner_line(app)
             .or_else(|| {
-                app.preview_marker_at(inner_width, offset_rows)
+                app.preview_marker_at(inner_width, marker_row)
                     .map(|marker| marker_with_live_status(app, marker))
             })
             .unwrap_or(fallback)
@@ -10744,18 +10741,16 @@ mod tests {
         );
     }
 
-    /// While a send is in flight for the selected session the pinned banner is
-    /// SUPPRESSED (so it cannot desync the hit-test) and the send renders INLINE at
-    /// the transcript tail: the echoed message under a `▶ you` turn plus a single
+    /// While a send is in flight for the selected session the pinned row stays
+    /// RESERVED (the render and the hit-test both read `preview_banner`) with an
+    /// empty fallback, and the send renders INLINE at the transcript tail: the echoed message under a `▶ you` turn plus a single
     /// `● claude` **cooking…** placeholder. The placeholder no longer depends on the
     /// agents poll; it reads `cooking…` before and after claude reports working.
     /// The `▶ you` echo drops the instant the real turn lands on disk; when the send
-    /// finishes the banner is no longer suppressed and the pinned row returns to
-    /// its normal content — the marker of the turn under the top of the viewport —
-    /// with the agent status reaching it only as the fallback for a transcript with
-    /// no marker at all.
+    /// finishes the pinned row's fallback returns to the agent status, which reaches
+    /// the screen only for a transcript with no marker at all.
     #[test]
-    fn an_in_flight_send_renders_inline_and_suppresses_the_banner() {
+    fn an_in_flight_send_renders_inline_and_keeps_the_banner_row() {
         use super::super::app::Sending;
 
         let flatten_lines = |lines: &[Line<'static>]| -> String {
@@ -10788,15 +10783,16 @@ mod tests {
         assert!(sending_tail(&app, 80).is_none());
 
         // In flight, nothing on disk yet (msg_count still the baseline) -> the
-        // pinned banner is suppressed and the tail echoes the message + "cooking…".
+        // pinned row stays reserved but its fallback is blank, and the tail echoes the message + "cooking…".
         app.sending = vec![Sending {
             session_id: "sess-normal-1".to_string(),
             message: "please summarize this".to_string(),
             baseline_msg_count: 0,
         }];
-        assert!(
-            preview_banner(&app).is_none(),
-            "an in-flight send suppresses the pinned banner"
+        assert_eq!(
+            preview_banner(&app),
+            Some(Line::default()),
+            "an in-flight send keeps the pinned row reserved, with a blank fallback"
         );
         let tail = flatten_lines(&sending_tail(&app, 80).expect("an in-flight send has a tail"));
         assert!(
@@ -10844,7 +10840,7 @@ mod tests {
             "the pending claude placeholder stays until the send finishes: {tail:?}"
         );
 
-        // Send done -> no inline tail, and the banner is no longer suppressed. What
+        // Send done -> no inline tail, and the fallback is the agent status again. What
         // `render_preview` finally draws in that row is the marker of the turn under
         // the top of the viewport; the agent status returned here reaches the screen
         // only as the fallback for a transcript with no marker at all.
@@ -11279,8 +11275,9 @@ mod tests {
         let rows = inner_rows(&mut app, width, height);
         assert_eq!(
             app.preview_scroll as usize,
-            transcript_only + tail_rows - usize::from(height - 2),
-            "the resolved offset must be measured over the transcript AND the tail"
+            transcript_only + tail_rows - usize::from(height - 3),
+            "the resolved offset must be measured over the transcript AND the tail \
+             (the pinned row keeps one inner row off the transcript)"
         );
         assert!(
             rows.last().is_some_and(|row| row.contains("cooking")),
@@ -13673,7 +13670,7 @@ mod tests {
     /// `preview_split` keyed on `preview_banner` — so a test states where
     /// the transcript REALLY sits instead of assuming it owns the whole inner rect:
     /// every selected session pins a banner row above it, and only a pane with no
-    /// session transcript on it (a draft card, an in-flight reply) gives that back.
+    /// session transcript on it (a draft card) gives that back.
     fn transcript_rect(app: &App, width: u16, height: u16) -> Rect {
         let pane = Rect {
             x: 0,
@@ -14314,6 +14311,52 @@ mod tests {
         assert!(
             !rows.iter().any(|row| row.contains("46m")),
             "an in-flight reply's pane must not repeat the age: {rows:?}"
+        );
+    }
+
+    /// The marker of the sample transcript's last real turn (a `you` turn).
+    const LAST_SAMPLE_TURN_MARKER: &str = "\u{25b6} you \u{b7} 10:01";
+
+    /// The turn marker stays PINNED while THIS board's quick reply is in flight: the
+    /// row above the transcript still names the real turn at the top of the viewport
+    /// (agent, model, effort, time), with the inline `▶ you` echo and `cooking…`
+    /// placeholder below it in the transcript flow. A live record's status and age
+    /// stay off the row (see [`an_in_flight_reply_draws_no_age_beside_its_cooking_tail`]).
+    ///
+    /// Read off the DRAWN pane, and the row must be the marker of a real turn, not
+    /// the synthetic pending one: the pending turns carry no model or effort.
+    #[test]
+    fn an_in_flight_reply_keeps_the_turn_marker_pinned() {
+        use super::super::app::Sending;
+
+        let (width, height) = BANNER_PANE;
+        let mut app = live_marker_app(Some(STARTED_AT), Some(POLLED_46M_LATER));
+        app.sending = vec![Sending {
+            session_id: "sess-normal-1".to_string(),
+            message: "1a".to_string(),
+            baseline_msg_count: 0,
+        }];
+        assert!(
+            preview_banner(&app).is_some(),
+            "the pinned row stays reserved during a send"
+        );
+
+        let rows = inner_rows(&mut app, width, height);
+        assert_eq!(
+            rows[0], LAST_SAMPLE_TURN_MARKER,
+            "the pinned row names the last REAL turn alone (the viewport top sits in \
+             the synthetic tail), no live suffix: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains(REPLY_COOKING_LABEL)),
+            "the inline tail is still drawn: {rows:?}"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.contains(REPLY_COOKING_LABEL))
+                .count(),
+            1,
+            "the placeholder is told once, never also on the pinned row: {rows:?}"
         );
     }
 
@@ -15390,22 +15433,15 @@ mod tests {
         // paint exactly the single `Paragraph::new(text).block(block)` it replaced
         // — rebuilt here from ratatui's own widgets and compared cell by cell.
         //
-        // Every selected session reserves the row now, so the one banner-less pane
-        // that still draws a transcript is an IN-FLIGHT quick reply: its inline
-        // echo turns take the banner's place, and the reference is the transcript
-        // with that same tail appended.
-        use super::super::app::Sending;
-
+        // Every selected session reserves the row, so the one banner-less pane left
+        // is a new-session draft CARD, which replaces the transcript outright; the
+        // reference is the card's own lines.
         let (width, height) = BANNER_PANE;
         let mut app = banner_app(None);
-        app.sending = vec![Sending {
-            session_id: "sess-normal-1".to_string(),
-            message: "please summarize this".to_string(),
-            baseline_msg_count: app.sessions[0].msg_count,
-        }];
+        crate::tui::compose::open_background(&mut app, None);
         assert!(
             preview_banner(&app).is_none(),
-            "an in-flight reply must reserve no banner, or this is the banner case"
+            "a draft card must reserve no banner, or this is the banner case"
         );
         let mut actual = Terminal::new(TestBackend::new(width, height))
             .expect("build an in-memory test terminal");
@@ -15416,19 +15452,9 @@ mod tests {
             })
             .expect("render_preview must not panic");
 
-        // The reference: one blocked, wrapped, scrolled paragraph over the WHOLE
-        // pane, at the offset the render above resolved.
-        let mut text = app.preview_text(width - 2);
-        text.lines
-            .extend(sending_tail(&app, width - 2).expect("the reply is still in flight"));
-        // Narrowed exactly as `render_preview` narrows it for `Paragraph::scroll`
-        // (ratatui's `Position.y` is `u16`), so the reference paragraph is drawn
-        // from the same value the pane under test handed the widget.
-        let offset = u16::try_from(app.preview_scroll).expect("this fixture fits a u16 offset");
-        assert!(
-            offset > 0,
-            "a scrolled pane, or this compares only offset 0"
-        );
+        // The reference: one blocked, wrapped paragraph over the WHOLE pane.
+        let draft = app.draft.as_ref().expect("the draft is open");
+        let text = draft_card(draft, &app.launch_dir, app.tick, false);
         let mut expected = Terminal::new(TestBackend::new(width, height))
             .expect("build an in-memory test terminal");
         expected
@@ -15436,8 +15462,7 @@ mod tests {
                 frame.render_widget(
                     Paragraph::new(text)
                         .block(preview_block())
-                        .wrap(Wrap { trim: false })
-                        .scroll((offset, 0)),
+                        .wrap(Wrap { trim: false }),
                     frame.area(),
                 );
             })
