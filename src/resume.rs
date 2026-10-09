@@ -27,6 +27,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::store::lineage::FORK_NAME_PREFIX;
 use crate::store::{parse, preview, Session};
 
 /// A ready-to-run hand-off, or a refusal with a user-facing message.
@@ -71,15 +72,19 @@ pub struct Ready {
     /// different reasons: a resume points at Fork/Attach
     /// ([`RESUME_NONZERO_HINT`]), whereas a new session — which has no live
     /// session and no fork target — points at the agent name instead
-    /// ([`NEW_SESSION_NONZERO_HINT`]). Reusing the resume wording on a new-session
-    /// failure would be actively misleading.
+    /// ([`NEW_SESSION_NONZERO_HINT`]), and an interactive fork (the fork box's run
+    /// or the Attach/Fork/Cancel choice's Fork) says only which run failed
+    /// ([`FORK_NONZERO_HINT`]). Reusing the resume wording on either would be
+    /// actively misleading.
     ///
-    /// A hand-off that actually EMITS `--model` overrides the new-session one with
+    /// A hand-off that actually EMITS `--model` overrides that hint with
     /// [`MODEL_NONZERO_HINT`], since an invalid model is a hard failure and the agent
-    /// wording does not name it. Only a NEW session can carry one — the `Ctrl-N`
-    /// draft's `Ctrl-O` run, with a model picked in that draft — because a resume, a
-    /// fork and an attach take no model at all. [`nonzero_hint_for`] makes that
-    /// selection, from the same predicate the argv is built with.
+    /// wording does not name it. Only two hand-offs can carry one — a new session
+    /// (the `Ctrl-N` draft's `Ctrl-O` run) and an interactive fork (the `Ctrl-F`
+    /// box's `Ctrl-O` run), each with a model picked in its own compose — because a
+    /// plain resume, the Fork choice and an attach take no model at all.
+    /// [`nonzero_hint_for`] makes that selection, from the same predicate the argv is
+    /// built with.
     pub nonzero_hint: &'static str,
     /// The session id to re-probe if this child exits non-zero — `Some` ONLY on
     /// the PLAIN-resume path.
@@ -135,20 +140,34 @@ pub const RESUME_RACE_STATUS: &str =
 pub const NEW_SESSION_NONZERO_HINT: &str =
     "claude exited with an error — if you picked an agent, check that its name is valid.";
 
-/// Neutral hint shown when a NEW session that CARRIED a `--model` exits NON-ZERO —
-/// it replaces [`NEW_SESSION_NONZERO_HINT`] for exactly those invocations.
+/// Neutral hint shown when an interactive fork exits NON-ZERO without having
+/// carried a `--model`: the `Ctrl-F` fork box's run (`Ctrl-O`, [`check_fork_run`])
+/// or the Attach/Fork/Cancel choice's Fork ([`check`] with `fork`).
 ///
-/// The one interactive hand-off that can carry a model is the `Ctrl-N` draft run
-/// with `Ctrl-O` after a model was picked in that draft (`Ctrl-L`); a resume, a fork
-/// and an attach take none. An invalid model is a HARD failure (claude exits
-/// non-zero rather than silently downgrading, the way an unknown `--agent` can), so
-/// on a launch that emitted one the pick is the first thing to check — and the
-/// agent-worded hint becomes actively misleading there. Like its siblings it does
-/// NOT assert a cause (a user Ctrl-C'ing a healthy session exits non-zero too); it
-/// names the one input this launch carried that a plain one does not, and the key
-/// that picked it.
+/// Its own wording because [`RESUME_NONZERO_HINT`]'s next moves are wrong here: it
+/// guesses the session is running and sends the user to Fork, which is the route
+/// that just failed, and a fork is never refused for a live session.
+/// Like its siblings it asserts no cause (a user Ctrl-C'ing a healthy fork exits
+/// non-zero too), so it only says which run ended that way.
+pub const FORK_NONZERO_HINT: &str = "claude exited with an error in the fork.";
+
+/// Neutral hint shown when a hand-off that CARRIED a `--model` exits NON-ZERO — it
+/// replaces the action's own hint ([`NEW_SESSION_NONZERO_HINT`], or
+/// [`FORK_NONZERO_HINT`] on the fork box's run) for exactly those invocations.
+///
+/// The interactive hand-offs that can carry a model are the `Ctrl-N` draft run and
+/// the `Ctrl-F` fork box's run, each with `Ctrl-O` after a model was picked in that
+/// compose (`Ctrl-L`); a resume, the Fork choice and an attach take none. The words
+/// name no box, because a pick is made the same way in each one that can carry it
+/// (the reply box, the fork box and the draft). An invalid model is a HARD failure
+/// (claude exits non-zero rather than silently downgrading, the way an unknown
+/// `--agent` can), so on a launch that emitted one the pick is the first thing to
+/// check — and the agent-worded hint becomes actively misleading there. Like its
+/// siblings it does NOT assert a cause (a user Ctrl-C'ing a healthy session exits
+/// non-zero too); it names the one input this launch carried that a plain one does
+/// not, and the key that picked it.
 pub const MODEL_NONZERO_HINT: &str = "claude exited with an error — check that the model you \
-     picked in the draft (Ctrl-L) names a model claude accepts.";
+     picked (Ctrl-L) names a model claude accepts.";
 
 /// Refusal shown when Attach is chosen for a session with no attachable agent
 /// job.
@@ -284,29 +303,36 @@ impl ModelPick {
 /// A plain tag carrying NO borrowed data, so it can ride on a modal choice and be
 /// matched by a confirm handler while the per-action inputs travel separately in
 /// [`HandoffCtx`]. The variants map one-to-one onto the internal builders
-/// [`argv_for`] delegates to: `Resume`/`Fork` → [`build_argv`], `Attach` →
-/// [`build_attach_argv`], `New` → [`build_new_argv`].
+/// [`argv_for`] delegates to: `Resume` → [`build_argv`], `Fork` →
+/// [`build_fork_argv`], `Attach` → [`build_attach_argv`], `New` →
+/// [`build_new_argv`], `ForkRun` → [`build_fork_run_argv`].
 #[derive(Debug, Clone, Copy)]
 pub enum SessionAction {
     /// Plain resume of an existing session (`claude -r <id>`).
     Resume,
-    /// Fork an existing session (`claude -r <id> --fork-session`).
+    /// Fork an existing session from the Attach/Fork/Cancel choice (`claude -r <id>
+    /// --fork-session --name "fork: <parent's label>"`).
     Fork,
     /// Reattach to a running agent job (`claude attach <job-id>`).
     Attach,
     /// Start a brand-new session (`claude [--agent <name>]`).
     New,
+    /// Fork an existing session interactively from the `Ctrl-F` box's `Ctrl-O`
+    /// (`claude -r <id> --fork-session --name <name> [--model <alias> [--effort
+    /// <level>]] [<message>]`). Unlike [`SessionAction::Fork`] it reads a model and
+    /// a message.
+    ForkRun,
 }
 
 /// The per-action inputs [`argv_for`] reads to build a hand-off's argv.
 ///
-/// Each [`SessionAction`] reads ONLY the fields its invocation needs — a
-/// Resume/Fork the `session_id`, an Attach the `job_id`, a New session the
-/// optional `agent`, `prompt` and `model` — so the `check_*` gate that owns the
-/// data fills just those fields (`..Default::default()`) and the rest stay inert
-/// (never emitted for the non-matching actions). Bundling the inputs here keeps the
-/// seam a single `(action, ctx)` call rather than widening it into a positional grab
-/// bag.
+/// Each [`SessionAction`] reads ONLY the fields its invocation needs — a Resume the
+/// `session_id`, a Fork that and the `parent_label`, an Attach the `job_id`, a New
+/// session the optional `agent`, `prompt` and `model` — so the `check_*` gate that
+/// owns the data fills just those fields (`..Default::default()`) and the rest stay
+/// inert (never emitted for the non-matching actions). Bundling the inputs here
+/// keeps the seam a single `(action, ctx)` call rather than widening it into a
+/// positional grab bag.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HandoffCtx<'a> {
     /// Authoritative session id for a `Resume`/`Fork` (read from inside the file).
@@ -317,25 +343,27 @@ pub struct HandoffCtx<'a> {
     pub job_id: &'a str,
     /// Optional agent name for a `New` session; `None` (or blank) launches bare.
     pub agent: Option<&'a str>,
-    /// Optional first prompt for a `New` session, emitted as claude's trailing
-    /// POSITIONAL argument. `None` (the default, and every other action's value)
-    /// launches with no positional — byte-identical to a bare interactive start.
-    /// See [`build_new_argv`] for what the positional does and does NOT do.
+    /// Optional first prompt for a `New` session, or the message of a `ForkRun`,
+    /// emitted as claude's trailing POSITIONAL argument. `None` (the default, and
+    /// every other action's value) launches with no positional — byte-identical to a
+    /// bare interactive start. See [`build_new_argv`] for what the positional does
+    /// and does NOT do.
     pub prompt: Option<&'a str>,
-    /// The model picked in the `Ctrl-N` draft (`Ctrl-L`), emitted as
-    /// `--model <alias>` (followed by `--effort <level>` when the pick carries one)
-    /// for a `New` session ONLY — the draft's `Ctrl-O` run.
+    /// The model picked in a compose (`Ctrl-L`), emitted as `--model <alias>`
+    /// (followed by `--effort <level>` when the pick carries one) for a `New` session
+    /// (the `Ctrl-N` draft's `Ctrl-O` run) and a `ForkRun` (the `Ctrl-F` box's
+    /// `Ctrl-O` run) ONLY.
     ///
     /// INERT for `Resume`, `Fork` and `Attach`, and not merely unused there: their
-    /// builders ([`build_argv`], [`build_attach_argv`]) take no pick at all, so the
-    /// exclusion is structural rather than a match arm that could be re-added by
-    /// accident. A `-r` launch without `--model` normally restores the model the
-    /// session last answered with (the exceptions, such as an environment override,
-    /// a non-first-party provider or a model claude declines at resume time, are in
-    /// `docs/agents/CLAUDE_CLI.md`), which is exactly what `Enter` and `^F` mean to
-    /// keep, and `claude attach <job-id>` joins a process ALREADY RUNNING under a
-    /// model, so a `--model` or `--effort` on it would claim to change something it
-    /// cannot.
+    /// builders ([`build_argv`], [`build_fork_argv`], [`build_attach_argv`]) take no
+    /// pick at all, so the exclusion is structural rather than a match arm that could
+    /// be re-added by accident. A `-r` launch without `--model` normally restores the
+    /// model the session last answered with (the exceptions, such as an environment
+    /// override, a non-first-party provider or a model claude declines at resume
+    /// time, are in `docs/agents/CLAUDE_CLI.md`), which is exactly what `Enter` and
+    /// the Attach/Fork/Cancel choice's Fork mean to keep, and `claude attach
+    /// <job-id>` joins a process ALREADY RUNNING under a model, so a `--model` or
+    /// `--effort` on it would claim to change something it cannot.
     ///
     /// `None` (the default, and the only value a launch with no compose — the agent
     /// picker's own `Ctrl-O` — can pass) emits nothing, so its argv stays
@@ -343,6 +371,10 @@ pub struct HandoffCtx<'a> {
     /// blank/whitespace is treated as `None` by [`flag_value`], exactly like `agent`
     /// — and takes its effort down with it.
     pub model: Option<&'a ModelPick>,
+    /// The label of the session a `Fork` or `ForkRun` forks: the fork's `--name`
+    /// when there is no message ([`fork_name`]), which a `Fork` never has. Read by
+    /// those two alone; defaults to `""`.
+    pub parent_label: &'a str,
 }
 
 /// Build the `claude` argv for `action`, reading the one input it needs from
@@ -356,21 +388,66 @@ pub struct HandoffCtx<'a> {
 /// one's. Pure so the exact invocation per action is directly assertable.
 ///
 /// This is also the ONE place that says WHICH actions a picked model reaches:
-/// `ctx.model` is handed to the New builder alone. [`build_argv`] and
-/// [`build_attach_argv`] cannot take one, so a resume, a fork and an attach are
-/// modelless (and effortless) by construction rather than by this match remembering
-/// to skip them. The flags are placed by the builder and not appended here, because
-/// for a New session they must precede the trailing POSITIONAL prompt — and the
-/// builder that owns that positional is the only thing that can know where "before
-/// it" is.
+/// `ctx.model` is handed to the New and ForkRun builders alone. [`build_argv`],
+/// [`build_fork_argv`] and [`build_attach_argv`] cannot take one, so a resume, the
+/// Attach/Fork/Cancel choice's fork and an attach are modelless (and effortless) by
+/// construction rather than by this match remembering to skip them. The flags are
+/// placed by the builder and not appended here, because for a New session they must
+/// precede the trailing POSITIONAL prompt — and the builder that owns that
+/// positional is the only thing that can know where "before it" is.
 #[must_use]
 pub fn argv_for(action: SessionAction, ctx: &HandoffCtx) -> Vec<String> {
     match action {
         SessionAction::Resume => build_argv(ctx.session_id, false),
-        SessionAction::Fork => build_argv(ctx.session_id, true),
+        SessionAction::Fork => build_fork_argv(ctx.session_id, ctx.parent_label),
         SessionAction::Attach => build_attach_argv(ctx.job_id),
         SessionAction::New => build_new_argv(ctx.agent, ctx.model, ctx.prompt),
+        SessionAction::ForkRun => {
+            build_fork_run_argv(ctx.session_id, ctx.model, ctx.prompt, ctx.parent_label)
+        }
     }
+}
+
+/// Most chars of a fork's `--name` after [`FORK_NAME_PREFIX`]: the first line of
+/// the fork box's message (or the parent's label) is cut here, on a char boundary.
+///
+/// 60: a one-line task title ("Review PR #152: isolate the auth migration" is 42)
+/// survives whole, while a first line that runs on like a paragraph is cut to
+/// something that still reads as a title where claude shows the name — the prompt
+/// box, the `/resume` picker and the terminal title. A judgment, not a limit
+/// claude imposes: claude 2.1.291's `--help` documents none for `--name`.
+pub const FORK_NAME_MAX_CHARS: usize = 60;
+
+/// The `--name` every fork snapback makes carries — from the `Ctrl-F` box or the
+/// Attach/Fork/Cancel choice: [`FORK_NAME_PREFIX`], then the first non-blank line
+/// of `message`, trimmed, with control characters turned into spaces and cut to
+/// [`FORK_NAME_MAX_CHARS`] chars. With no such line (an empty `Ctrl-O`, or the
+/// choice's Fork, which has no message), `parent_label` stands in for it under the
+/// same rules.
+///
+/// The prefix is what keeps the parent heading the fork on the board
+/// (`store::lineage::head_of`), so every name built here passes
+/// `store::lineage::is_fork_name`. Pure.
+#[must_use]
+pub fn fork_name(message: Option<&str>, parent_label: &str) -> String {
+    let source = message
+        .and_then(|m| m.lines().map(str::trim).find(|line| !line.is_empty()))
+        .unwrap_or(parent_label);
+    let cleaned: String = source
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let body: String = cleaned.trim().chars().take(FORK_NAME_MAX_CHARS).collect();
+    format!("{FORK_NAME_PREFIX}{}", body.trim_end())
+}
+
+/// Append `--name <name>` built by [`fork_name`] — the ONE place a fork's name
+/// becomes argv, shared with [`crate::send::build_fork_send_argv`] for the same
+/// reason [`push_model_flag`] is. Every caller appends it BEFORE its trailing
+/// positional message.
+pub(crate) fn push_fork_name(argv: &mut Vec<String>, message: Option<&str>, parent_label: &str) {
+    argv.push("--name".to_string());
+    argv.push(fork_name(message, parent_label));
 }
 
 /// The value a value-taking flag would actually be emitted with, or `None` when
@@ -433,9 +510,9 @@ pub(crate) fn push_model_flag(argv: &mut Vec<String>, pick: Option<&ModelPick>) 
     }
 }
 
-/// Pick a new session's non-zero hint: [`MODEL_NONZERO_HINT`] when this invocation
-/// actually EMITS `--model`, else the action's own `fallback`
-/// ([`NEW_SESSION_NONZERO_HINT`]).
+/// Pick a model-carrying hand-off's non-zero hint: [`MODEL_NONZERO_HINT`] when this
+/// invocation actually EMITS `--model`, else the action's own `fallback`
+/// ([`NEW_SESSION_NONZERO_HINT`], [`FORK_NONZERO_HINT`]).
 ///
 /// Decided by the SAME [`model_value`] predicate the argv is built from, so the
 /// hint can never name a pick the invocation did not carry — a blank pick
@@ -452,18 +529,20 @@ fn nonzero_hint_for(model: Option<&ModelPick>, fallback: &'static str) -> &'stat
     }
 }
 
-/// Build the `claude` argv for a resume (`claude -r <id>`) or fork
-/// (`claude -r <id> --fork-session`). Reached through [`argv_for`]
-/// (`Resume`/`Fork`); kept a standalone pure fn so the exact invocation stays
-/// directly assertable. `argv[0]` is the program to spawn.
+/// Build the `claude` argv for a resume (`claude -r <id>`) or, with `fork`, the
+/// bare fork (`claude -r <id> --fork-session`) that [`build_fork_argv`] and
+/// [`build_fork_run_argv`] extend. Reached through [`argv_for`] (`Resume`); kept a
+/// standalone pure fn so the exact invocation stays directly assertable.
+/// `argv[0]` is the program to spawn.
 ///
-/// It takes NO model, and that is the whole guarantee: `Enter` and `^F` hand the
-/// session over with no `--model`, leaving the model to claude, which normally
-/// restores the session's OWN from the transcript (`restoreModelFromSession`); the
-/// exceptions, such as an environment override, a non-first-party provider or a
-/// model claude declines at resume time, are in `docs/agents/CLAUDE_CLI.md`. With
-/// no parameter to pass one through, no state anywhere can put `--model` or
-/// `--effort` on a resume or a fork.
+/// It takes NO model, and that is the whole guarantee: `Enter` hands the session
+/// over with no `--model`, and so does the Attach/Fork/Cancel choice's Fork
+/// ([`build_fork_argv`]), leaving the model to claude, which normally restores the
+/// session's OWN from the transcript (`restoreModelFromSession`); the exceptions,
+/// such as an environment override, a non-first-party provider or a model claude
+/// declines at resume time, are in `docs/agents/CLAUDE_CLI.md`. With no parameter
+/// to pass one through, no state anywhere can put `--model` or `--effort` on a
+/// resume or on that fork.
 #[must_use]
 pub fn build_argv(session_id: &str, fork: bool) -> Vec<String> {
     let mut argv = vec![
@@ -473,6 +552,48 @@ pub fn build_argv(session_id: &str, fork: bool) -> Vec<String> {
     ];
     if fork {
         argv.push("--fork-session".to_string());
+    }
+    argv
+}
+
+/// Build the `claude` argv for the Attach/Fork/Cancel choice's Fork:
+/// `claude -r <id> --fork-session --name "fork: <parent_label>"`.
+///
+/// [`build_argv`]'s fork plus the name an untouched fork box's `Ctrl-O` gives it
+/// ([`push_fork_name`] with no message), so the two routes spawn the same argv and
+/// the parent keeps heading the fork (`store::lineage::head_of`). It takes NO model,
+/// like [`build_argv`], so no pick can reach this route. Reached through
+/// [`argv_for`] (`Fork`).
+#[must_use]
+pub fn build_fork_argv(session_id: &str, parent_label: &str) -> Vec<String> {
+    let mut argv = build_argv(session_id, true);
+    push_fork_name(&mut argv, None, parent_label);
+    argv
+}
+
+/// Build the `claude` argv for the `Ctrl-F` box's interactive run:
+/// `claude -r <id> --fork-session --name <name> [--model <alias> [--effort
+/// <level>]] [<message>]`.
+///
+/// [`build_argv`]'s fork plus what a fork compose adds: the fork's name
+/// ([`push_fork_name`] — the message's first line, or `parent_label` for an
+/// untouched box), the pick made in THAT compose ([`push_model_flag`]), both before
+/// the positional for the reason [`build_new_argv`] documents, and the typed
+/// message as claude's trailing positional. With no pick and no message it is
+/// [`build_fork_argv`]'s argv, the choice's Fork. Reached through [`argv_for`]
+/// (`ForkRun`).
+#[must_use]
+pub fn build_fork_run_argv(
+    session_id: &str,
+    model: Option<&ModelPick>,
+    message: Option<&str>,
+    parent_label: &str,
+) -> Vec<String> {
+    let mut argv = build_argv(session_id, true);
+    push_fork_name(&mut argv, message, parent_label);
+    push_model_flag(&mut argv, model);
+    if let Some(message) = message {
+        argv.push(message.to_string());
     }
     argv
 }
@@ -675,7 +796,9 @@ pub fn plan_at(file: &Path, fork: bool) -> ResumePlan {
 /// on a session that cannot be resumed anyway.
 ///
 /// It takes NO model: a resume and a fork keep the session's own model, which
-/// claude normally restores when no `--model` is passed (see [`build_argv`]).
+/// claude normally restores when no `--model` is passed (see [`build_argv`]). A
+/// fork is named after `session.label`, as an untouched fork box names it
+/// ([`build_fork_argv`]).
 pub fn check(session: &Session, fork: bool) -> Result<Ready, ResumeError> {
     match plan(session, fork) {
         ResumePlan::Ready {
@@ -691,16 +814,57 @@ pub fn check(session: &Session, fork: bool) -> Result<Ready, ResumeError> {
                 },
                 &HandoffCtx {
                     session_id: &session_id,
+                    parent_label: &session.label,
                     ..Default::default()
                 },
             ),
             // Only a PLAIN resume can lose the liveness race — a fork of a live
             // session is expected to work, so a non-zero exit there is a genuine
-            // failure and must keep the neutral hint. Deriving the flag from the
-            // same `fork` the argv is built from keeps the two in lockstep.
+            // failure, worded as the fork's own. The argv, the probe and the hint
+            // all read this one `fork`, which keeps the three in lockstep.
             race_probe_id: (!fork).then(|| session_id.clone()),
             cwd,
-            nonzero_hint: RESUME_NONZERO_HINT,
+            nonzero_hint: if fork {
+                FORK_NONZERO_HINT
+            } else {
+                RESUME_NONZERO_HINT
+            },
+        }),
+        ResumePlan::Refuse { message } => Err(ResumeError::Refused(message)),
+    }
+}
+
+/// Terminal-up gate for the `Ctrl-F` box's interactive run (`Ctrl-O`): the same
+/// authoritative re-read and `cwd` gate as [`check`], with the box's `model` and
+/// `message` threaded into a `ForkRun` argv, and the session's own label as the
+/// fork's name when the box is empty.
+///
+/// A fork of a live session is expected to work, so there is no race probe. When the
+/// argv actually carries `--model` the plan blames the pick ([`MODEL_NONZERO_HINT`]),
+/// like the `Ctrl-N` draft's run; otherwise it carries the fork's own
+/// [`FORK_NONZERO_HINT`].
+pub fn check_fork_run(
+    session: &Session,
+    model: Option<&ModelPick>,
+    message: Option<&str>,
+) -> Result<Ready, ResumeError> {
+    match plan(session, true) {
+        ResumePlan::Ready {
+            cwd, session_id, ..
+        } => Ok(Ready {
+            argv: argv_for(
+                SessionAction::ForkRun,
+                &HandoffCtx {
+                    session_id: &session_id,
+                    prompt: message,
+                    model,
+                    parent_label: &session.label,
+                    ..Default::default()
+                },
+            ),
+            race_probe_id: None,
+            cwd,
+            nonzero_hint: nonzero_hint_for(model, FORK_NONZERO_HINT),
         }),
         ResumePlan::Refuse { message } => Err(ResumeError::Refused(message)),
     }
@@ -817,9 +981,9 @@ fn command(argv: &[String]) -> Command {
 /// Preconditions: the terminal has already been torn down by `tui::run`, so the
 /// child inherits a clean, non-raw TTY (inherited stdin/stdout/stderr are the
 /// default for [`Command`]). This `chdir`s into the authoritative `cwd` first,
-/// then spawns `ready.argv` (`claude -r <id> [--fork-session]` for a
-/// resume/fork, `claude attach <id>` for an Attach, or `claude [--agent <name>]`
-/// for a new session) and blocks until it exits.
+/// then spawns `ready.argv` (`claude -r <id>` for a resume, `claude -r <id>
+/// --fork-session --name <name> …` for a fork, `claude attach <id>` for an Attach,
+/// or `claude [--agent <name>]` for a new session) and blocks until it exits.
 ///
 /// Returns `Ok(Some(status))` on a NON-ZERO / signalled child exit (a neutral
 /// board hint — see [`status_for_exit`]) and `Ok(None)` on a clean exit;
@@ -991,6 +1155,7 @@ mod tests {
             has_agent_name: false,
             has_agent_setting: false,
             failed_task: None,
+            custom_title: None,
         };
         (session, dir)
     }
@@ -1007,7 +1172,8 @@ mod tests {
     /// from, never by sniffing the argv for `--fork-session`.
     #[test]
     fn only_a_plain_resume_carries_a_race_probe_id() {
-        let (session, dir) = resumable_session("race-id", "sess-live");
+        let (mut session, dir) = resumable_session("race-id", "sess-live");
+        session.label = "live work".to_string();
 
         let plain = check(&session, false).expect("an existing cwd must proceed");
         assert_eq!(plain.argv.join(" "), "claude -r sess-live");
@@ -1019,7 +1185,10 @@ mod tests {
         );
 
         let forked = check(&session, true).expect("an existing cwd must proceed");
-        assert_eq!(forked.argv.join(" "), "claude -r sess-live --fork-session");
+        assert_eq!(
+            forked.argv.join(" "),
+            "claude -r sess-live --fork-session --name fork: live work"
+        );
         assert_eq!(
             forked.race_probe_id, None,
             "a fork of a live session is expected to work: its non-zero exit is a \
@@ -1089,6 +1258,7 @@ mod tests {
             has_agent_name: false,
             has_agent_setting: false,
             failed_task: None,
+            custom_title: None,
         };
         match plan(&session, false) {
             ResumePlan::Refuse { message } => {
@@ -1118,6 +1288,7 @@ mod tests {
             has_agent_name: false,
             has_agent_setting: false,
             failed_task: None,
+            custom_title: None,
         };
         match check(&session, false) {
             Err(ResumeError::Refused(message)) => {
@@ -1275,15 +1446,20 @@ mod tests {
 
     #[test]
     fn argv_for_fork_appends_fork_session() {
-        // Fork routes through the same `session_id` input, adding `--fork-session`.
+        // Fork routes through the same `session_id` input, adding `--fork-session`
+        // and the name the parent's label gives it.
         let argv = argv_for(
             SessionAction::Fork,
             &HandoffCtx {
                 session_id: "abc-123",
+                parent_label: "the parent",
                 ..Default::default()
             },
         );
-        assert_eq!(argv.join(" "), "claude -r abc-123 --fork-session");
+        assert_eq!(
+            argv.join(" "),
+            "claude -r abc-123 --fork-session --name fork: the parent"
+        );
     }
 
     #[test]
@@ -1347,14 +1523,17 @@ mod tests {
         );
     }
 
-    /// The `prompt` field is inert for every action that is not `New` — a
-    /// Resume/Fork/Attach must never grow a stray positional just because the ctx
-    /// could carry one.
+    /// The `prompt` field is inert for every action that is neither `New` nor
+    /// `ForkRun` — a Resume/Fork/Attach must never grow a stray positional just
+    /// because the ctx could carry one.
     #[test]
-    fn a_prompt_in_the_ctx_is_inert_for_every_action_but_new() {
+    fn a_prompt_in_the_ctx_is_inert_for_every_action_but_new_and_fork_run() {
         for (action, expected) in [
             (SessionAction::Resume, "claude -r abc-123"),
-            (SessionAction::Fork, "claude -r abc-123 --fork-session"),
+            (
+                SessionAction::Fork,
+                "claude -r abc-123 --fork-session --name fork: the parent",
+            ),
             (SessionAction::Attach, "claude attach ca56b543"),
         ] {
             let argv = argv_for(
@@ -1365,6 +1544,7 @@ mod tests {
                     agent: Some("planner"),
                     prompt: Some("ship the thing"),
                     model: None,
+                    parent_label: "the parent",
                 },
             );
             assert_eq!(
@@ -1373,31 +1553,56 @@ mod tests {
                 "{action:?} must ignore the agent and prompt inputs"
             );
         }
+        // `ForkRun` is the one other reader: the prompt is its trailing message, and
+        // its first line the fork's name.
+        let argv = argv_for(
+            SessionAction::ForkRun,
+            &HandoffCtx {
+                session_id: "abc-123",
+                agent: Some("planner"),
+                prompt: Some("ship the thing"),
+                parent_label: "the parent",
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            argv.join(" "),
+            "claude -r abc-123 --fork-session --name fork: ship the thing ship the thing"
+        );
     }
 
-    /// A picked model reaches ONE action, `New`, and is INERT for every `-r` launch
-    /// and for `Attach`.
+    /// A picked model reaches TWO actions, `New` and `ForkRun` (the `Ctrl-F` box's
+    /// own run), and is INERT for the plain `-r` launches and for `Attach`.
     ///
-    /// Both halves are hard invariants. `Enter` and `^F` hand a session over with
-    /// its OWN model — claude normally restores it on a `-r` launch that carries no
-    /// `--model` — so a model on a resume or a fork would override the very thing
-    /// they keep. And `claude attach` joins a process already running under a model,
-    /// so a `--model` there would claim to change something it cannot. The sibling
-    /// of [`a_prompt_in_the_ctx_is_inert_for_every_action_but_new`]: the prompt and
+    /// Both halves are hard invariants. `Enter` and the Attach/Fork/Cancel choice's
+    /// Fork hand a session over with its OWN model — claude normally restores it on
+    /// a `-r` launch that carries no `--model` — so a model on a resume or that fork
+    /// would override the very thing they keep. And `claude attach` joins a process
+    /// already running under a model, so a `--model` there would claim to change
+    /// something it cannot. The sibling of
+    /// [`a_prompt_in_the_ctx_is_inert_for_every_action_but_new`]: the prompt and
     /// the model are both read by `New` alone.
     #[test]
-    fn a_model_in_the_ctx_reaches_only_a_new_session() {
+    fn a_model_in_the_ctx_reaches_only_a_new_session_and_a_fork_run() {
         let sonnet_high = ModelPick {
             model: "sonnet".to_string(),
             effort: Some("high"),
         };
         for (action, expected) in [
             (SessionAction::Resume, "claude -r abc-123"),
-            (SessionAction::Fork, "claude -r abc-123 --fork-session"),
+            (
+                SessionAction::Fork,
+                "claude -r abc-123 --fork-session --name fork: the parent",
+            ),
             (SessionAction::Attach, "claude attach ca56b543"),
             (
                 SessionAction::New,
                 "claude --agent planner --model sonnet --effort high ship the thing",
+            ),
+            (
+                SessionAction::ForkRun,
+                "claude -r abc-123 --fork-session --name fork: ship the thing --model sonnet \
+                 --effort high ship the thing",
             ),
         ] {
             let argv = argv_for(
@@ -1408,6 +1613,7 @@ mod tests {
                     agent: Some("planner"),
                     prompt: Some("ship the thing"),
                     model: Some(&sonnet_high),
+                    parent_label: "the parent",
                 },
             );
             assert_eq!(argv.join(" "), expected, "{action:?} argv");
@@ -1573,9 +1779,16 @@ mod tests {
     fn no_pick_leaves_every_argv_byte_identical() {
         for (action, expected) in [
             (SessionAction::Resume, "claude -r abc-123"),
-            (SessionAction::Fork, "claude -r abc-123 --fork-session"),
+            (
+                SessionAction::Fork,
+                "claude -r abc-123 --fork-session --name fork: the parent",
+            ),
             (SessionAction::Attach, "claude attach ca56b543"),
             (SessionAction::New, "claude --agent planner ship the thing"),
+            (
+                SessionAction::ForkRun,
+                "claude -r abc-123 --fork-session --name fork: ship the thing ship the thing",
+            ),
         ] {
             let argv = argv_for(
                 action,
@@ -1585,6 +1798,7 @@ mod tests {
                     agent: Some("planner"),
                     prompt: Some("ship the thing"),
                     model: None,
+                    parent_label: "the parent",
                 },
             );
             assert_eq!(argv.join(" "), expected, "{action:?} argv");
@@ -1640,9 +1854,341 @@ mod tests {
         );
     }
 
+    /// A fork's name is the first NON-BLANK line of the message, trimmed: leading
+    /// blank lines and whitespace are skipped and every later line is left out.
+    #[test]
+    fn fork_name_is_the_first_non_blank_line_of_the_message_trimmed() {
+        assert_eq!(fork_name(Some("Review PR1"), "parent"), "fork: Review PR1");
+        assert_eq!(
+            fork_name(Some("Review PR1\nthen the details\nand more"), "parent"),
+            "fork: Review PR1"
+        );
+        assert_eq!(
+            fork_name(Some("\n   \n\t  Review PR1  \r\nnext"), "parent"),
+            "fork: Review PR1"
+        );
+        assert_eq!(
+            fork_name(Some("a\ttab\u{1b}esc"), "parent"),
+            "fork: a tab esc",
+            "control characters become spaces"
+        );
+    }
+
+    /// With no non-blank line (the empty `Ctrl-O`), the parent's label names the
+    /// fork, under the same trimming and cap.
+    #[test]
+    fn fork_name_falls_back_to_the_parents_label_for_an_empty_message() {
+        for empty in [None, Some(""), Some("   "), Some("\n \n\t\n")] {
+            assert_eq!(
+                fork_name(empty, "  the parent label "),
+                "fork: the parent label",
+                "{empty:?}"
+            );
+        }
+        let long = "p".repeat(FORK_NAME_MAX_CHARS + 5);
+        assert_eq!(
+            fork_name(None, &long).chars().count(),
+            FORK_NAME_PREFIX.chars().count() + FORK_NAME_MAX_CHARS
+        );
+    }
+
+    /// The cap counts CHARS and cuts on a char boundary, so a multibyte line at the
+    /// cap is never split mid-character (a byte slice at 60 would panic here), and
+    /// a cut that lands after a space leaves no trailing space.
+    #[test]
+    fn fork_name_is_capped_on_a_char_boundary() {
+        let wide = "é".repeat(FORK_NAME_MAX_CHARS + 10);
+        let name = fork_name(Some(&wide), "parent");
+        assert_eq!(name, format!("fork: {}", "é".repeat(FORK_NAME_MAX_CHARS)));
+
+        let exact = "日".repeat(FORK_NAME_MAX_CHARS);
+        assert_eq!(fork_name(Some(&exact), "parent"), format!("fork: {exact}"));
+
+        let spaced = format!("{} tail", "x".repeat(FORK_NAME_MAX_CHARS - 1));
+        assert_eq!(
+            fork_name(Some(&spaced), "parent"),
+            format!("fork: {}", "x".repeat(FORK_NAME_MAX_CHARS - 1))
+        );
+    }
+
+    /// Every name the fork commands carry is one the board reads back as a fork
+    /// (`lineage::is_fork_name`, the SAME prefix constant), and on the interactive
+    /// run it sits before the trailing message.
+    #[test]
+    fn the_fork_run_name_is_a_fork_name_ahead_of_the_message() {
+        let argv = build_fork_run_argv("abc-123", None, Some("\nReview PR1\nmore"), "parent");
+        let at = argv
+            .iter()
+            .position(|a| a == "--name")
+            .expect("a fork run names its fork");
+        assert!(crate::store::lineage::is_fork_name(&argv[at + 1]));
+        assert_eq!(argv[at + 1], "fork: Review PR1");
+        assert_eq!(
+            argv.last().map(String::as_str),
+            Some("\nReview PR1\nmore"),
+            "the message stays the LAST element, after the name"
+        );
+        for message in [None, Some(""), Some("go")] {
+            for label in ["", "parent", "pr #152 isolated review (2)"] {
+                let name = fork_name(message, label);
+                assert!(
+                    crate::store::lineage::is_fork_name(&name),
+                    "{message:?} / {label:?} -> {name:?}"
+                );
+            }
+        }
+    }
+
+    /// The plain fork `Ctrl-F` always handed off, named after `parent_label` — what
+    /// an untouched fork box runs.
+    fn named_plain_fork(id: &str, parent_label: &str) -> Vec<String> {
+        let mut argv = build_argv(id, true);
+        argv.extend(["--name".to_string(), format!("fork: {parent_label}")]);
+        argv
+    }
+
+    /// The fork box's interactive run: an untouched box (no pick, no message) is the
+    /// plain fork `Ctrl-F` always handed off, named after the parent's label; a
+    /// typed message names it instead, and the name and a pick land BEFORE the
+    /// trailing message, effort right behind the model.
+    #[test]
+    fn the_fork_run_argv_is_the_named_plain_fork_until_a_pick_or_message_is_added() {
+        assert_eq!(
+            build_fork_run_argv("abc-123", None, None, "the parent"),
+            named_plain_fork("abc-123", "the parent")
+        );
+        let blank = ModelPick::new("  ");
+        assert_eq!(
+            build_fork_run_argv("abc-123", Some(&blank), None, "the parent"),
+            named_plain_fork("abc-123", "the parent"),
+            "a blank pick emits nothing"
+        );
+        let pick = ModelPick {
+            model: "opus".to_string(),
+            effort: Some("low"),
+        };
+        assert_eq!(
+            build_fork_run_argv("abc-123", Some(&pick), Some("go"), "the parent"),
+            [
+                "claude",
+                "-r",
+                "abc-123",
+                "--fork-session",
+                "--name",
+                "fork: go",
+                "--model",
+                "opus",
+                "--effort",
+                "low",
+                "go"
+            ]
+        );
+        assert_eq!(
+            build_fork_run_argv("abc-123", None, Some("go"), "the parent")
+                .last()
+                .map(String::as_str),
+            Some("go")
+        );
+    }
+
+    /// Through the gate: it re-reads the authoritative id, names an untouched box's
+    /// fork after the session's own label, carries no race probe, and blames the
+    /// model only when `--model` is really emitted; a missing folder refuses like
+    /// any fork.
+    #[test]
+    fn check_fork_run_reads_the_file_and_picks_the_hint_from_the_emitted_model() {
+        let (mut session, dir) = resumable_session("fork-run", "sess-fork-run");
+        session.label = "the parent".to_string();
+        let plain = check_fork_run(&session, None, None).expect("an existing cwd proceeds");
+        assert_eq!(plain.argv, named_plain_fork("sess-fork-run", "the parent"));
+        assert_eq!(plain.nonzero_hint, FORK_NONZERO_HINT);
+        assert!(plain.race_probe_id.is_none());
+        let opus = ModelPick::new("opus");
+        let picked = check_fork_run(&session, Some(&opus), Some("go")).expect("proceeds");
+        assert_eq!(
+            picked.argv.join(" "),
+            "claude -r sess-fork-run --fork-session --name fork: go --model opus go"
+        );
+        assert_eq!(picked.nonzero_hint, MODEL_NONZERO_HINT);
+        let blank = ModelPick::new(" ");
+        assert_eq!(
+            check_fork_run(&session, Some(&blank), None)
+                .expect("proceeds")
+                .nonzero_hint,
+            FORK_NONZERO_HINT
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut gone = session;
+        gone.file = std::env::temp_dir().join("snapback-fork-run-missing.jsonl");
+        assert!(matches!(
+            check_fork_run(&gone, None, None),
+            Err(ResumeError::Refused(_))
+        ));
+    }
+
+    /// The Attach/Fork/Cancel choice's Fork is byte-identical to the fork box's
+    /// untouched `Ctrl-O` run (no pick, no message): both name the fork after the
+    /// parent's label, so the parent keeps heading it. The labels include one the
+    /// rule must CLEAN (control characters, outer whitespace) and one it must CAP
+    /// (past `FORK_NAME_MAX_CHARS`), so a second naming rule on either route would
+    /// diverge here.
+    #[test]
+    fn the_choice_fork_is_byte_identical_to_an_untouched_fork_box_run() {
+        let long = format!("{} tail", "x".repeat(FORK_NAME_MAX_CHARS + 7));
+        let messy = "  \tReview PR1\u{1b}[31m\r\nsecond line ";
+        for label in ["the parent", messy, long.as_str()] {
+            let ctx = HandoffCtx {
+                session_id: "abc-123",
+                parent_label: label,
+                ..Default::default()
+            };
+            let fork = argv_for(SessionAction::Fork, &ctx);
+            assert_eq!(fork, argv_for(SessionAction::ForkRun, &ctx), "{label:?}");
+            assert_eq!(
+                fork,
+                build_fork_run_argv("abc-123", None, None, label),
+                "{label:?}"
+            );
+            assert!(
+                crate::store::lineage::is_fork_name(fork.last().expect("a name")),
+                "{fork:?}"
+            );
+        }
+        // The premise: the rule really cleaned the one and capped the other.
+        assert_eq!(
+            argv_for(
+                SessionAction::Fork,
+                &HandoffCtx {
+                    session_id: "abc-123",
+                    parent_label: messy,
+                    ..Default::default()
+                }
+            )
+            .last()
+            .map(String::as_str),
+            Some("fork: Review PR1 [31m  second line")
+        );
+        assert_eq!(
+            argv_for(
+                SessionAction::Fork,
+                &HandoffCtx {
+                    session_id: "abc-123",
+                    parent_label: &long,
+                    ..Default::default()
+                }
+            )
+            .last()
+            .cloned(),
+            Some(format!("fork: {}", "x".repeat(FORK_NAME_MAX_CHARS)))
+        );
+    }
+
+    /// Through the gates the board calls: `check(_, true)` — the choice's Fork —
+    /// spawns exactly what `check_fork_run` spawns for an untouched box, named from
+    /// the session's own label (here one the rule must clean and cap), in the same
+    /// authoritative folder.
+    #[test]
+    fn the_choice_fork_gate_spawns_what_an_untouched_fork_box_run_spawns() {
+        let (mut session, dir) = resumable_session("choice-fork", "sess-choice");
+        session.label = format!("\u{1b}{}", "日".repeat(FORK_NAME_MAX_CHARS + 3));
+
+        let chosen = check(&session, true).expect("an existing cwd proceeds");
+        let boxed = check_fork_run(&session, None, None).expect("an existing cwd proceeds");
+        assert_eq!(chosen.argv, boxed.argv);
+        assert_eq!(chosen.cwd, boxed.cwd);
+        assert_eq!(
+            chosen.argv.last().cloned(),
+            Some(format!("fork: {}", "日".repeat(FORK_NAME_MAX_CHARS)))
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No pick can reach the choice's Fork: a ctx carrying a model AND an effort
+    /// builds the very argv the no-pick ctx builds — the untouched fork box's — with
+    /// no `--model` or `--effort` token anywhere.
+    #[test]
+    fn no_pick_reaches_the_choice_fork() {
+        let opus_max = ModelPick {
+            model: "opus".to_string(),
+            effort: Some("max"),
+        };
+        let picked = argv_for(
+            SessionAction::Fork,
+            &HandoffCtx {
+                session_id: "abc-123",
+                model: Some(&opus_max),
+                parent_label: "the parent",
+                ..Default::default()
+            },
+        );
+        assert!(
+            !picked
+                .iter()
+                .any(|arg| arg == "--model" || arg == "--effort"),
+            "the choice's Fork must never carry a model or an effort: {picked:?}"
+        );
+        assert_eq!(
+            picked,
+            argv_for(
+                SessionAction::Fork,
+                &HandoffCtx {
+                    session_id: "abc-123",
+                    parent_label: "the parent",
+                    ..Default::default()
+                }
+            )
+        );
+        assert_eq!(
+            picked,
+            build_fork_run_argv("abc-123", None, None, "the parent")
+        );
+    }
+
+    /// A non-zero exit of the choice's Fork is worded as the fork's own failure —
+    /// the resume hint would send the user to the Fork that just failed — and it
+    /// carries no race probe, while a plain resume keeps both of its own.
+    #[test]
+    fn the_choice_fork_carries_the_fork_hint_and_no_race_probe() {
+        let (session, dir) = resumable_session("choice-hint", "sess-choice-hint");
+
+        let forked = check(&session, true).expect("an existing cwd proceeds");
+        assert_eq!(forked.nonzero_hint, FORK_NONZERO_HINT);
+        assert_eq!(forked.race_probe_id, None);
+
+        let plain = check(&session, false).expect("an existing cwd proceeds");
+        assert_eq!(plain.nonzero_hint, RESUME_NONZERO_HINT);
+        assert_eq!(plain.race_probe_id.as_deref(), Some("sess-choice-hint"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The fork run's hint sends nobody back to `Ctrl-F`, the route that just
+    /// failed, and claims no running session; the model hint names no single box,
+    /// since the reply box, the fork box and the draft each carry a pick.
+    #[test]
+    fn the_fork_and_model_hints_fit_every_route_that_shows_them() {
+        assert_ne!(FORK_NONZERO_HINT, RESUME_NONZERO_HINT);
+        assert!(!FORK_NONZERO_HINT.contains("Ctrl-F"), "{FORK_NONZERO_HINT}");
+        assert!(
+            !FORK_NONZERO_HINT.contains("running"),
+            "{FORK_NONZERO_HINT}"
+        );
+        assert!(
+            !MODEL_NONZERO_HINT.contains("draft"),
+            "{MODEL_NONZERO_HINT}"
+        );
+        assert!(
+            MODEL_NONZERO_HINT.contains("(Ctrl-L)"),
+            "{MODEL_NONZERO_HINT}"
+        );
+    }
+
     /// A new session that emits `--model` carries the model-specific non-zero hint;
-    /// one that does not keeps the agent-worded one. A resume, a fork and an attach
-    /// can carry no model, so theirs is always the resume hint.
+    /// one that does not keeps the agent-worded one. A resume, the choice's fork and
+    /// an attach can carry no model, so theirs is always their own: the fork's hint
+    /// for the fork, the resume hint for the other two.
     ///
     /// An invalid model exits non-zero, and there the new-session hint ("check the
     /// agent name") points away from the cause. The selection is tied to what was
@@ -1655,7 +2201,7 @@ mod tests {
         let plain = check(&session, false).expect("an existing cwd must proceed");
         assert_eq!(plain.nonzero_hint, RESUME_NONZERO_HINT);
         let forked = check(&session, true).expect("an existing cwd must proceed");
-        assert_eq!(forked.nonzero_hint, RESUME_NONZERO_HINT);
+        assert_eq!(forked.nonzero_hint, FORK_NONZERO_HINT);
         let attached = check_attach(&session, Some("ca56b543")).expect("an attachable job");
         assert_eq!(attached.nonzero_hint, RESUME_NONZERO_HINT);
 
@@ -1689,7 +2235,8 @@ mod tests {
     /// caller actually feels.
     #[test]
     fn only_the_new_session_gate_carries_a_pick_into_the_spawned_argv() {
-        let (session, dir) = resumable_session("model-argv", "sess-argv");
+        let (mut session, dir) = resumable_session("model-argv", "sess-argv");
+        session.label = "argv parent".to_string();
 
         assert_eq!(
             check(&session, false)
@@ -1703,7 +2250,7 @@ mod tests {
                 .expect("an existing cwd must proceed")
                 .argv
                 .join(" "),
-            "claude -r sess-argv --fork-session"
+            "claude -r sess-argv --fork-session --name fork: argv parent"
         );
         assert_eq!(
             check_attach(&session, Some("ca56b543"))
@@ -1946,6 +2493,7 @@ mod tests {
             has_agent_name: false,
             has_agent_setting: false,
             failed_task: None,
+            custom_title: None,
         };
         match check_attach(&session, None) {
             Err(ResumeError::Refused(message)) => {

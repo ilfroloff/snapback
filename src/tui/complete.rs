@@ -1,7 +1,8 @@
-//! Pick-list core for the compose box, shared by BOTH drafts (the `Ctrl-R`
-//! reply and the `Ctrl-N` background draft): which token the caret is in, which
-//! candidates match it, and what accepting one writes. `/` offers skills and
-//! commands; `@` offers files and folders and, for a top-level token, agents.
+//! Pick-list core for the compose box, shared by EVERY compose box (the `Ctrl-R`
+//! reply, the `Ctrl-F` fork and the `Ctrl-N` background draft): which token the
+//! caret is in, which candidates match it, and what accepting one writes. `/`
+//! offers skills and commands; `@` offers files and folders and, for a top-level
+//! token, agents.
 //! Each candidate carries its source's description, if any.
 //!
 //! Candidates are matched by the board's ONE matcher

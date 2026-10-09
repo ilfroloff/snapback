@@ -44,6 +44,9 @@ probed at 2.1.291 (2026-10-08) in a throwaway profile, and claude's own
 [`/cd`](#cd-moving-a-session-to-another-folder), observed at 2.1.284 (2026-10-02):
 neither is captured from `--help`, and the refresh below re-probes `set_cwd`
 alone, because the move depends on it.
+The two `Ctrl-F` fork rows in [How snapback drives `claude`](#how-snapback-drives-claude)
+carry their own check against 2.1.291 (its `--help`, and probes of both forms),
+stated in each row.
 
 - **Installed == pinned** → this doc matches the live CLI. Trust it.
 - **Installed < pinned** → the local install is **behind this doc**. Newer flags
@@ -70,7 +73,7 @@ source ([Refreshing this doc](#refreshing-this-doc)).
 | `--search` | `/resume` filters by name, title, branch or PR URL, and agent view by name, first prompt or result. Neither documents transcript-text search. A live `claude --resume <term>` probe matched a title word but not an early message token. | the sessions and agent-view docs; the live probe | docs read 2026-10-02; installed claude 2.1.284 |
 | `--everything` | `/resume` leaves out `claude -p`, Agent SDK and `/loop`-first sessions. | the sessions doc | docs read 2026-10-02; installed claude 2.1.284 |
 | `--tidy` | There is no per-session transcript delete; `claude rm` keeps the transcript, and `claude project purge` wipes a whole project. | the sessions and agent-view docs | docs read 2026-10-02; installed claude 2.1.284 |
-| `--fold` | The picker groups entries that share a session ID, while background hand-off copies carry new IDs. The docs say nothing about folding by content. Confidence: medium. | the sessions doc | docs read 2026-10-02; installed claude 2.1.284 |
+| `--fold` | The picker groups entries that share a session ID, while background hand-off copies carry new IDs. "Sessions created with `/branch` or `--fork-session` get their own session IDs and appear as separate rows." The docs say nothing about folding by content. Confidence: medium. | the sessions doc | docs read 2026-10-02, the fork sentence re-read 2026-10-08; installed claude 2.1.284 |
 | `--move` | The only user command that moves a session is `/cd`, an interactive command with no headless twin: the one registry entry named `cd` is `type: "local-jsx"`, which claude's [print-mode gate](#the-initialize-control-handshake-compose-pick-list) never passes. `/cd` moves only the session it runs in (the commands doc: "Move this session to a new working directory"), and each copy a background hand-off leaves has its own session ID ([observed on disk](DOMAIN.md#the-mechanism-why-identical-rows-appear)), so moving a set of copies takes one interactive `/cd` per copy. The Agent SDK docs say "Neither SDK has a setter for `cwd`". The [`set_cwd`](#set_cwd-moving-a-session-without-leaving-the-board) request the move sends is undocumented. Confidence: medium. | the 2.1.291 bundle's `/cd` registry entry; https://code.claude.com/docs/en/commands; https://code.claude.com/docs/en/agent-sdk/configuration | bundle and docs read 2026-10-08, the commands doc again 2026-10-09; installed claude 2.1.291 |
 | `--model` | The model is set per session (`--model`, `/model`, the dispatch default); the docs say nothing about a per-reply pick. Confidence: medium. | the sessions and agent-view docs | docs read 2026-10-02; installed claude 2.1.284 |
 
@@ -84,12 +87,14 @@ inline test asserting the exact string, so drift here is caught by
 | Purpose | Argv | Builder |
 | --- | --- | --- |
 | Resume a session in place | `claude -r <session-id>` | `resume::build_argv` (`src/resume.rs`) |
-| Fork a session (new id) | `claude -r <session-id> --fork-session` | `resume::build_argv` |
+| Fork a session (new id) from the Attach/Fork/Cancel choice | `claude -r <session-id> --fork-session --name "fork: <the session's label>"` (`resume::fork_name`), never a model | `resume::build_fork_argv` (over `resume::build_argv`) |
+| Fork interactively from the `Ctrl-F` box (`Ctrl-O`) | `claude -r <session-id> --fork-session --name <name> [--model <alias> [--effort <level>]] [<message>]`, `<name>` being `fork: <first line of the message>` or, for an empty box, `fork: <the session's label>` (`resume::fork_name`). An empty box with no pick is byte-identical to the row above. Checked against claude 2.1.291: `--fork-session`, `-n, --name <name>` ("Set a display name for this session (shown in the prompt box, /resume picker, and terminal title)") and `--model`/`--effort` are in `claude --help` there. Probed 2026-10-08 at 2.1.291 under a pseudo-terminal (`expect`, 120×40, throwaway sessions since removed) with `claude -r A --fork-session --session-id F --name "fork: probe-msg" --model haiku "Reply with exactly: fork-ok"`, `--session-id` added only to know F's file: with NO keypress, the message became F's first new user turn after the copied history and was answered, so the trailing `<message>` AUTO-SUBMITS on `-r --fork-session` as on a new session. `--name` wrote `{"type":"custom-title","customTitle":"fork: probe-msg","sessionId":"<F>"}` and `{"type":"agent-name","agentName":"fork: probe-msg","sessionId":"<F>"}` into F ONLY, each twice (first in the file, then again after the message), and titled the prompt box and the exit hint (`claude --resume "fork: probe-msg"`); A stayed byte-identical. In a folder claude does not trust yet, the workspace-trust dialog comes first (its cursor starts on "No, exit") and the message is sent once the folder is trusted. A child that inherits another claude session's `CLAUDE_CODE_CHILD_SESSION` prints "Transcript saving is off" and writes no F, so the probe dropped those markers, as a plain terminal has none | `resume::build_fork_run_argv` via `check_fork_run` |
 | Dispatch a DEFINED agent | `claude --agent <name>` | `resume::build_new_argv` (`src/resume.rs`) |
 | Start a new session on a drafted prompt | `claude [--agent <name>] [--model <alias> [--effort <level>]] <prompt>` | `resume::build_new_argv` |
 | Start a BACKGROUND agent on a drafted prompt | `claude [--agent <name>] [--model <alias> [--effort <level>]] --bg <prompt>` | `send::build_bg_launch_argv` (`src/send.rs`) |
 | Attach to a live background job | `claude attach <job-id>` | `resume::build_attach_argv` |
 | Quick-send a reply (non-interactive) | `claude -p -r <session-id> --output-format json [--model <alias> [--effort <level>]] <message>` | `send::build_send_argv` (`src/send.rs`) |
+| Fork headless from the `Ctrl-F` box (`Enter`) | `claude -p -r <session-id> --fork-session --session-id <new-uuid> --name <name> --output-format json [--model <alias> [--effort <level>]] <message>`, `<name>` being `fork: <first line of the message>` (`resume::fork_name`). Checked against claude 2.1.291: exits 0, writes `<new-uuid>.jsonl` with that `sessionId`, leaves the original byte-identical, and shares the original's root record so the lineage fold groups the pair; `--session-id` with `--resume` is accepted only alongside `--fork-session`. Probed 2026-10-08 at 2.1.291 (`claude -p -r A --fork-session --session-id F --name "fork: Review PR1"`, throwaway sessions since removed): `--name` writes `{"type":"custom-title","customTitle":"fork: Review PR1","sessionId":"<F>"}` — twice — and an `agent-name` record with the same text into F ONLY; A stays byte-identical. Observed at 2.1.291, not documented: a fork carries no background stamp — the records it writes have no `sessionKind: "bg"`. snapback reads the LAST `custom-title` back as the fork marker ([DOMAIN.md](DOMAIN.md#named-forks-the-fork-name-prefix)) | `send::build_fork_send_argv` (`src/send.rs`) |
 | Release a held job before a reply, or interrupt a selected agent (`Ctrl-K`) | `claude stop <job-id>` | `send::build_stop_argv` |
 | Move a session to another folder (`Ctrl-X w`), the board staying up | In a folder claude TRUSTS: `claude -p --input-format stream-json --output-format stream-json --verbose --strict-mcp-config --settings {"disableAllHooks":true} -r <session-id>`, never with `--no-session-persistence`. In ANY OTHER folder: the same, followed by `--setting-sources user`, with `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1` added to the CHILD's environment. Either runs in the session's CURRENT folder (never the target), with ONE stdin line holding `{"type":"control_request","request_id":"snapback-move","request":{"subtype":"set_cwd","path":"<abs target>"}}` and then EOF; a lineage move runs one such child per member, in sequence (see [`set_cwd`](#set_cwd-moving-a-session-without-leaving-the-board)) | `claude_move::build_set_cwd_argv(session_id, FolderTrust)`, the catalog's `build_catalog_env(FolderTrust)` for the child's environment, and `set_cwd_request_line` (`src/claude_move.rs`); the verdict from `claude_trust::folder_trust`, read on the move's worker thread |
 | Detect live agents (gate probe) | `claude agents --json` | `agents::live_agents_argv` (`src/agents.rs`) |
@@ -125,7 +130,7 @@ byte-identical to its modelless form, so a reply normally keeps the session's la
 model and a new session runs on whatever `claude` gives one (see
 [Which model a launch runs on](#which-model-a-launch-runs-on-without---model)) —
 and it is always placed BEFORE a trailing positional (the new-session prompt, the
-reply message), since a flag trailing an operand is at the mercy of the parser.
+reply or fork message), since a flag trailing an operand is at the mercy of the parser.
 The `claude` behaviour that rule rests on: a `-r` launch without `--model`
 normally restores the session's own model (the exceptions are
 [below](#which-model-a-launch-runs-on-without---model)), and `claude attach` joins
@@ -341,9 +346,11 @@ is sent to a session. `-p/--print` switches to non-interactive one-shot output.
 ### The trailing positional AUTO-SUBMITS, and there is no pre-fill
 
 The positional (`--help`: "Your prompt") becomes the session's **first turn**,
-sent the moment claude starts. There is **no** way to put text in claude's input
-box UNSUBMITTED for the user to edit first — the whole flag surface was checked
-for one, and the two candidates are not it:
+sent the moment claude starts; on `-r <id> --fork-session` it is the fork's first
+NEW turn, after the copied history (probed at 2.1.291, the
+[interactive-fork row](#how-snapback-drives-claude)). There is **no** way to put
+text in claude's input box UNSUBMITTED for the user to edit first — the whole
+flag surface was checked for one, and the two candidates are not it:
 
 - `-n, --name <name>` sets a session **display name** (prompt box, `/resume`
   picker, terminal title). It labels the session; it puts nothing in the input.
@@ -1259,7 +1266,7 @@ with `-p/--print` (SDK/non-interactive mode).
 | `--fork-session` | On resume/continue, mint a NEW session id instead of reusing the original. |
 | `--from-pr [value]` | Resume a session linked to a PR (number/URL), or open the picker. |
 | `--session-id <uuid>` | Use a specific (valid UUID) session id. |
-| `-n, --name <name>` | Display name (prompt box, `/resume` picker, terminal title). |
+| `-n, --name <name>` | Display name (prompt box, `/resume` picker, terminal title). Persisted as a `custom-title` record (and an `agent-name` one) in the session it names; snapback passes it as `fork: …` on every fork it makes: the `Ctrl-F` box's `Enter` and `Ctrl-O`, and the Attach/Fork/Cancel choice's Fork (`resume::build_fork_argv`), all through `resume::push_fork_name` (see [How snapback drives `claude`](#how-snapback-drives-claude)). No length limit is documented at 2.1.291. |
 | `--model <model>` | Model for the session — alias or full id (`claude-fable-5`). **`--help` lists only `fable`/`opus`/`sonnet`; that list is INCOMPLETE — see [Model aliases](#model-aliases---model).** |
 | `--fallback-model <model>` | `[P]` Fallback model(s), comma-separated, tried in order when the primary is overloaded; the primary is re-tried at the start of each user turn. |
 | `--agent <agent>` | Agent for the session; overrides the `agent` setting. |

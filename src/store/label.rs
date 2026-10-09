@@ -309,8 +309,9 @@ pub fn finalize_label(summary: Option<&str>, first_user: Option<&str>, session_i
 }
 
 /// Replace tab/newline/carriage-return with spaces and truncate to `max`
-/// characters (codepoint-indexed).
-fn sanitize_and_truncate(s: &str, max: usize) -> String {
+/// characters (codepoint-indexed). Shared with `lineage::fork_title`, so a fork's
+/// name is made row-safe exactly as a label is.
+pub(super) fn sanitize_and_truncate(s: &str, max: usize) -> String {
     s.chars()
         .map(|c| match c {
             '\t' | '\n' | '\r' => ' ',

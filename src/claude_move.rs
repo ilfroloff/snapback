@@ -103,12 +103,12 @@ pub const MOVE_LIVE_REFUSAL: &str = "claude lists this session as active. Close 
 pub const MOVE_PROBE_FAILED_REFUSAL: &str = "snapback could not ask claude whether this \
      session is active (claude agents --json failed), so nothing moved.";
 
-/// Refusal (`Ctrl-X w`): snapback's OWN quick reply is in flight to the session,
-/// the writer claude's probe cannot be relied on to see. Names snapback, not
-/// claude, because that is the writer observed (see
-/// `delete::DELETE_SENDING_REFUSAL`).
-pub const MOVE_SENDING_REFUSAL: &str = "snapback is still sending a reply to this session — \
-     wait for it to land, then move it.";
+/// Refusal (`Ctrl-X w`): snapback's OWN `claude -p` child is in flight on the
+/// session — a quick reply to it, or the headless fork creating it — the writer
+/// claude's probe cannot be relied on to see. Names snapback, not claude, because
+/// that is the writer observed (see `delete::DELETE_SENDING_REFUSAL`).
+pub const MOVE_SENDING_REFUSAL: &str = "snapback is still sending a reply or fork on this \
+     session — wait for it to land, then move it.";
 
 /// Refusal (a second `Ctrl-X w`): this session's own move is still in flight, and
 /// a second child would race the first for the same file.
@@ -156,9 +156,9 @@ const MOVED_PREFIX: &str = "moved to ";
 const NEEDS_TRUST_NOTHING_MOVED: &str = ", so nothing moved";
 
 /// Lineage tally bucket ([`status_for_lineage_move`]): members refused because a
-/// writer holds them — snapback's own reply or move (board side) or claude's
-/// active list ([`MOVE_LIVE_REFUSAL`]). The word `delete::status_for_delete`
-/// uses for the same umbrella.
+/// writer holds them — snapback's own reply, fork or move (board side) or
+/// claude's active list ([`MOVE_LIVE_REFUSAL`]). The word
+/// `delete::status_for_delete` uses for the same umbrella.
 const LINEAGE_SKIPPED_RUNNING: &str = "skipped (running)";
 
 /// Lineage tally bucket: members already in the target ([`MOVE_ALREADY_THERE`]).
@@ -243,9 +243,9 @@ pub struct LineageMove {
     pub moves: Vec<MoveRequest>,
     /// The `N` the `Move lineage (N)` button named.
     pub asked: usize,
-    /// Members the board skipped because snapback's own reply or move still holds
-    /// them ([`own_writer_refusal`]). Members that left the board before the
-    /// dispatch are `asked - refused - moves.len()`.
+    /// Members the board skipped because snapback's own reply, fork or move
+    /// still holds them ([`own_writer_refusal`]). Members that left the board
+    /// before the dispatch are `asked - refused - moves.len()`.
     pub refused: usize,
 }
 
@@ -448,9 +448,10 @@ pub fn liveness_refusal(probe: Option<bool>) -> Option<&'static str> {
 
 /// The refusal for snapback's OWN writers on one session, the two the board
 /// knows without asking claude: its move still in flight
-/// ([`MOVE_IN_FLIGHT_REFUSAL`], asked first) and its quick reply still in flight
-/// ([`MOVE_SENDING_REFUSAL`]). `None` lets the move go on. One rule for the
-/// picker's open (`App::open_move_picker`) and every member of a lineage move
+/// ([`MOVE_IN_FLIGHT_REFUSAL`], asked first) and its `claude -p` child — a quick
+/// reply, or a headless fork — still in flight ([`MOVE_SENDING_REFUSAL`]).
+/// `None` lets the move go on. One rule for the picker's open
+/// (`App::open_move_picker`) and every member of a lineage move
 /// (`update::start_lineage_move`).
 #[must_use]
 pub fn own_writer_refusal(move_in_flight: bool, reply_in_flight: bool) -> Option<&'static str> {

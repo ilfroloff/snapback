@@ -62,7 +62,8 @@ pub const DELETE_RUNNING_REFUSAL: &str = "claude still reports this session as a
      agent — let it finish or stop it in Claude Code, then hard-delete.";
 
 /// User-facing refusal returned by [`can_delete_target`] when SNAPBACK ITSELF has a
-/// quick reply in flight to the target.
+/// `claude -p` child in flight on the target: a quick reply to it, or the headless
+/// fork (the `Ctrl-F` box's `Enter`) that is creating it, so the words name both.
 ///
 /// The THIRD writer, and the first of the two snapback runs itself that
 /// [`can_delete`] cannot be relied on to see (the other is the `Ctrl-X w` move,
@@ -70,8 +71,8 @@ pub const DELETE_RUNNING_REFUSAL: &str = "claude still reports this session as a
 /// that is what was observed: the child doing the writing is one snapback spawned,
 /// and telling the user to close a claude window would point at the wrong thing
 /// entirely.
-pub const DELETE_SENDING_REFUSAL: &str = "snapback is still sending a reply to this session — \
-     wait for it to land, then hard-delete.";
+pub const DELETE_SENDING_REFUSAL: &str = "snapback is still sending a reply or fork on this \
+     session — wait for it to land, then hard-delete.";
 
 /// User-facing refusal returned by [`can_delete_target`] when SNAPBACK ITSELF has a
 /// `Ctrl-X w` move in flight on the target (`App::moving`).
@@ -409,6 +410,7 @@ mod tests {
             has_agent_name: false,
             has_agent_setting: false,
             failed_task: None,
+            custom_title: None,
         }
     }
 

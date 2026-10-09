@@ -264,6 +264,13 @@ pub struct Session {
     /// `tui::view` — and by nothing else: no key, no gate. A fact about the bytes,
     /// carried through the parse cache like every other parsed field.
     pub failed_task: Option<FailedTask>,
+    /// The session's name as claude last recorded it (see
+    /// [`parse::ParsedFile::custom_title`]), raw; `None` when the file names none.
+    ///
+    /// Read for ONE purpose: telling a fork snapback named apart from the rest of
+    /// its lineage ([`lineage::is_fork_name`]), which picks the lineage head and
+    /// labels the fork's child row. It is never the row label itself.
+    pub custom_title: Option<String>,
 }
 
 /// A background task's FAILED notice still standing on a [`Session`] — the
@@ -329,6 +336,7 @@ impl Session {
                 has_agent_name: parsed.has_agent_name,
                 has_agent_setting: parsed.has_agent_setting,
                 failed_task,
+                custom_title: parsed.custom_title,
             }
         })
     }
@@ -595,8 +603,8 @@ mod tests {
                 .any(|p| p.components().any(|c| c.as_os_str() == "subagents")),
             "discovery must never descend into a subagents/ directory: {files:?}"
         );
-        // The twenty-one depth-2 `.jsonl` files, none of the nested subagent file.
-        assert_eq!(files.len(), 21, "unexpected discovered set: {files:?}");
+        // The twenty-two depth-2 `.jsonl` files, none of the nested subagent file.
+        assert_eq!(files.len(), 22, "unexpected discovered set: {files:?}");
     }
 
     #[test]
@@ -618,8 +626,8 @@ mod tests {
             !sessions.iter().any(|s| s.label.contains("Sidecar title")),
             "a sidecar file with no cwd was surfaced as a session"
         );
-        // Exactly twenty resumable sessions survive (21 discovered - 1 sidecar).
-        assert_eq!(sessions.len(), 20, "unexpected session count");
+        // Exactly twenty-one resumable sessions survive (22 discovered - 1 sidecar).
+        assert_eq!(sessions.len(), 21, "unexpected session count");
     }
 
     /// `sess-relocated-1` carries claude's `/cd` `relocated` record: the row is
@@ -882,6 +890,47 @@ mod tests {
         // The background copy is the newer one (D1's head), and it kept growing
         // after the fork while the ancestor stalled.
         assert!(bg.timestamp > fg.timestamp);
+    }
+
+    /// `sess-fork-named-1` is a fork the `Ctrl-F` box made from the delta pair's
+    /// foreground member, in the shape claude 2.1.291 wrote for a `--name`d
+    /// `claude -p` fork: the copied prefix (root included) and its `custom-title`
+    /// written twice. The name survives `Session::from_file`, nothing else in the
+    /// store carries one, and the fold keeps the pair's head although the named
+    /// fork is now the lineage's newest member.
+    #[test]
+    fn a_named_fork_carries_its_name_and_leaves_the_head_alone() {
+        let sessions = load();
+        let named = find(&sessions, "sess-fork-named-1");
+        let bg = find(&sessions, "sess-fork-bg-1");
+
+        assert_eq!(
+            named.custom_title.as_deref(),
+            Some("fork: Review the fold toggle")
+        );
+        assert_eq!(named.root_uuid, bg.root_uuid, "one lineage with the pair");
+        assert_eq!(named.label, bg.label, "the copied first prompt labels it");
+        assert!(
+            named.timestamp > bg.timestamp,
+            "the fork is the newest member"
+        );
+        assert!(
+            sessions
+                .iter()
+                .filter(|s| s.session_id != named.session_id)
+                .all(|s| s.custom_title.is_none()),
+            "no other fixture carries a name"
+        );
+
+        let members: Vec<usize> = (0..sessions.len())
+            .filter(|&i| sessions[i].root_uuid == named.root_uuid)
+            .collect();
+        assert_eq!(members.len(), 3);
+        let head = lineage::head_of(&sessions, &members);
+        assert_eq!(
+            sessions[head].session_id, "sess-fork-bg-1",
+            "the newest member that is not a named fork heads the lineage"
+        );
     }
 
     #[test]

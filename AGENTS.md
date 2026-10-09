@@ -74,16 +74,18 @@ one place.
   path in `src/tui/app.rs`)
 - **A MODEL IS PICKED PER COMPOSE, NEVER PER BOARD.** `--model`/`--effort` reach
   `claude` ONLY from an explicit `Ctrl-L` pick inside a compose box, and only on
-  that compose's own launch: the `Ctrl-R` quick reply, or the `Ctrl-N` draft's
-  `--bg` launch / `Ctrl-O` run. Resume (`Enter`), Fork (`Ctrl-F`), Attach and Move
-  (`Ctrl-X w`, a headless `set_cwd` control request, no model turn) NEVER carry
-  one, structurally: `build_argv`, `build_attach_argv` and `build_set_cwd_argv`
-  take no pick. The agent picker's `Ctrl-O` skips the compose, so
-  `launch_pick_interactively` has no pick and hands `None` on to `build_new_argv`,
-  the one hand-off builder that takes one. An effort rides only INSIDE a pick
-  (`ModelPick`), never alone. The pick is `ComposeState::model`, `None` in every
-  new compose, and dies with it: no board-wide pick, no launch flag, nothing
-  persisted. Why, and where each launch
+  that compose's own launch: the `Ctrl-R` quick reply, the `Ctrl-F` fork box's
+  headless `Enter` / `Ctrl-O` run, or the `Ctrl-N` draft's `--bg` launch /
+  `Ctrl-O` run. Resume (`Enter`), Attach, the Attach/Fork/Cancel choice's Fork
+  and Move (`Ctrl-X w`, a headless `set_cwd` control request, no model turn)
+  NEVER carry one, structurally: `build_argv`, `build_fork_argv`,
+  `build_attach_argv` and `build_set_cwd_argv` take no pick. The agent picker's `Ctrl-O` skips the
+  compose, so `launch_pick_interactively` has no pick and hands `None` on to
+  `build_new_argv`; that builder and `build_fork_run_argv` (the fork box's own
+  `SessionAction::ForkRun`) are the only hand-off builders that take one. An
+  effort rides only INSIDE a pick (`ModelPick`), never alone. The pick is
+  `ComposeState::model`, `None` in every new compose, and dies with it: no
+  board-wide pick, no launch flag, nothing persisted. Why, and where each launch
   gets its model: [DOMAIN.md](docs/agents/DOMAIN.md#compose-model-pick-ctrl-l).
   (`src/resume.rs`; `src/send.rs`; `src/claude_move.rs`; `src/tui/compose.rs`;
   `launch_pick_interactively` in `src/tui/update.rs`)
@@ -91,8 +93,9 @@ one place.
   `snapback` itself performs on `~/.claude/projects` is hard delete (`Ctrl-X d`),
   behind BOTH a confirmation modal AND the pure `can_delete_target` WRITER guard.
   Every OTHER change to a transcript is made by a `claude` CHILD and must stay
-  that way — a quick reply appends in place because `claude -p -r` writes it,
-  NEVER because snapback edits a session file; likewise `Ctrl-X w` MOVES a
+  that way — a quick reply appends in place because `claude -p -r` writes it, and
+  a headless fork's new transcript exists because its `claude -p` child creates
+  it, NEVER because snapback edits a session file; likewise `Ctrl-X w` MOVES a
   transcript only through a headless `claude` child's `set_cwd` — a lineage move
   is one such child per member. Do not add a direct writer.
   That guard asks "is anything WRITING this file?", NEVER "does claude know this
@@ -105,9 +108,10 @@ one place.
   bucket the send gates treat as live without re-deriving the writer question.
   The gate the confirm calls is `can_delete_target` — `can_delete` COMPOSED with
   snapback's OWN two in-flight writers, which claude's probe cannot be relied on
-  to see: its quick reply (`App::sending_to`, `DELETE_SENDING_REFUSAL`) and its
-  `Ctrl-X w` move (`App::moving_on`, `DELETE_MOVING_REFUSAL`), each refused in its
-  own words because the writer to name there is snapback, not claude; keep it a
+  to see: its `claude -p` child (`App::sending_to` — a quick reply, or a headless
+  fork under the fork's new id; `DELETE_SENDING_REFUSAL`) and its `Ctrl-X w` move
+  (`App::moving_on`, `DELETE_MOVING_REFUSAL`), each refused in its own words
+  because the writer to name there is snapback, not claude; keep it a
   composition of three facts, never a wider `can_delete`.
   A confirm may target the selected id ALONE or — on a lineage's HEAD row only,
   never a `↳` row — its whole fork lineage. The board position decides:
@@ -149,14 +153,16 @@ one place.
 - **DRIVE `claude` HEADLESSLY; HAND OVER THE TERMINAL ONLY TO PUT THE USER IN
   IT.** When snapback needs `claude` to PERFORM an operation on a session or
   folder — the `Ctrl-X w` move (`set_cwd`), the `Ctrl-R` reply (`claude -p -r`),
-  the `Ctrl-K` stop (`claude stop`), the compose pick list's catalog
+  the `Ctrl-F` fork box's `Enter` (`claude -p -r … --fork-session`), the `Ctrl-K`
+  stop (`claude stop`), the compose pick list's catalog
   (`initialize`), the `Ctrl-N` draft's background launch (`claude --bg`) — drive
   it HEADLESSLY: a `-p`, control-request, subcommand or `--bg` child with no TTY,
   on a thread of its own, reporting ONE `AppEvent` while the board stays up.
   NEVER open an interactive `claude` to run an operation. An interactive hand-off
   (`Outcome::Resume`, the terminal handed over) is reserved for actions whose
-  purpose IS to put the user into claude — `Enter` resume, `Ctrl-F` fork, Attach,
-  and the `Ctrl-O` runs (the `Ctrl-N` draft's and the agent picker's) — and for a
+  purpose IS to put the user into claude — `Enter` resume, Attach, the
+  Attach/Fork/Cancel choice's Fork, and the `Ctrl-O` runs (the `Ctrl-F` fork
+  box's, the `Ctrl-N` draft's and the agent picker's) — and for a
   prompt only claude may show, such as its workspace-trust dialog. snapback NEVER
   fakes such a prompt's answer: it never sends `set_cwd`'s `trust_accepted`, and a
   `needs_trust` move points the user at `Enter` and `/cd` instead — and STOPS a
@@ -206,11 +212,12 @@ one place.
   the liveness probe at hand-off, and the worktree resolve at
   construction/reload. Both are argued at the call site, and NEITHER may move
   onto a keystroke or the render path. The compose pick list's transcript
-  listing and folder reads (in both drafts, once per reply draft / per folder)
-  and the `Ctrl-X w` picker's resolve of the ONE selected session's folder are a
-  different, keystroke-time class (bounded, never render): `PATTERNS.md` §6 owns
-  them. Work that runs on its OWN thread and reports back with one `AppEvent` is
-  the rule's ordinary case, never a third exception: the clipboard copy (`CopyFinished` — `Ctrl-X y`'s id and a preview
+  listing and folder reads, in every compose box (once per reply or fork box /
+  per folder), and the `Ctrl-X w` picker's resolve of the ONE selected session's
+  folder are a different, keystroke-time class (bounded, never render):
+  `PATTERNS.md` §6 owns them. Work that runs on its OWN thread and reports back
+  with one `AppEvent` is the rule's ordinary case, never a third exception: the
+  clipboard copy (`CopyFinished` — `Ctrl-X y`'s id and a preview
   drag-selection alike, ONE path, its tool a THREADED child the driver starts, so
   no keystroke or mouse release waits on it), the `--model` alias probe
   (`ModelAliases`), the settings-model read (`SettingsModel`), the compose
@@ -242,23 +249,23 @@ one place.
 - **KEEP KEY DOCS IN SYNC.** A key/flag change must update, together: the
   keybinding table in `update.rs`'s module doc; `USAGE`/`KEYS` in `cli.rs`; the
   help line and the draft card in `view.rs` (EVERY key string that renders there:
-  the board keymap, `chord_hint`'s which-key list, and `compose_hint`'s reply
-  hint, the `COMPLETION_HINT` BOTH compose boxes show while the pick list is open,
-  and `BG_DRAFT_HINT`; the card's `draft_hint` names the same two, the list's
-  while it is open); the key map in `docs/GUIDE.md`; and any prose enumeration
-  of a key set in `docs/agents/*` (for example, PATTERNS.md's follow-bottom
-  re-arm passage). This is the ONE list of those surfaces; the other docs point
-  here.
+  the board keymap, `chord_hint`'s which-key list, `compose_hint`'s reply hint,
+  `FORK_HINT`, `BG_DRAFT_HINT`, and the `COMPLETION_HINT` every compose box shows
+  while the pick list is open; the card's `draft_hint` names `BG_DRAFT_HINT`, or
+  `COMPLETION_HINT` while the list is open); the key map in `docs/GUIDE.md`; and
+  any prose enumeration of a key set in `docs/agents/*` (for example,
+  PATTERNS.md's follow-bottom re-arm passage). This is the ONE list of those
+  surfaces; the other docs point here.
   The README AND the website's feature rows name only a few core keys and flags
   and NEVER enumerate routing: touch them only when a key change renames or
   removes one of those core keys, or changes what one of them does, or renames
   or removes one of the flags the README's quick start shows (`-p`, `-a`). A key
-  both compose boxes share (`Ctrl-L`, `/` or `@`) is ONE shared "in a compose
+  every compose box shares (`Ctrl-L`, `/` or `@`) is ONE shared "in a compose
   box" entry in each key map — the `update.rs` table, `KEYS`, `docs/GUIDE.md` —
-  that the `Ctrl-R` and `Ctrl-N` entries point to, never two copies.
-  The help line is ONE row, cut rather than wrapped: `chord_hint`, the reply hint
-  and `COMPLETION_HINT` are
-  column-budgeted to fit 80 whole (each pinned by a test), while the board keymap
+  that the `Ctrl-R`, `Ctrl-F` and `Ctrl-N` entries point to, never copies.
+  The help line is ONE row, cut rather than wrapped: `chord_hint`, the reply hint,
+  `FORK_HINT` and `COMPLETION_HINT` are column-budgeted to fit 80 whole (each
+  pinned by a test), while the board keymap
   and `BG_DRAFT_HINT` run past 80 and are cut there, so an 80-column terminal
   draws only their leading keys. It binds ROUTING too, not just bindings: when a
   key's gate gains a case (a new `AgentActivity` bucket, a new refusal), every

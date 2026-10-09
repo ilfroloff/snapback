@@ -7,9 +7,9 @@ const features = [
   { flag: "--one-board", desc: "Past sessions and live background agents in one place that stays open and updates as they write: this folder, the repo's worktrees (-p), or every repo (-a)." },
   { flag: "--search", desc: "Search inside the whole conversation, not only names. Words have to appear near each other, and the preview jumps to the line." },
   { flag: "--everything", desc: "Every transcript in the store, including claude -p, Agent SDK and /loop sessions." },
-  { flag: "--tidy", desc: "Hide a session, or delete one — or a whole set of background copies — from disk. Anything still being written is refused." },
-  { flag: "--fold", desc: "The look-alike copies a background hand-off leaves behind fold into one (+N) row, with message counts." },
-  { flag: "--move", desc: "Move a session — or a whole set of its background copies — to another of the repo's worktrees, main included, without opening it or leaving the board." },
+  { flag: "--tidy", desc: "Hide a session, or delete one — or a whole set of background copies and forks — from disk. Anything still being written is refused." },
+  { flag: "--fold", desc: "The look-alike copies a background hand-off leaves behind fold into one (+N) row, with message counts — and forks you make on the board stay under the session they came from, each under its own name." },
+  { flag: "--move", desc: "Move a session — or a whole set of its background copies and forks — to another of the repo's worktrees, main included, without opening it or leaving the board." },
   { flag: "--model", desc: "Pick the model and effort for a single reply, and see which model answered each turn." },
 ];
 
@@ -130,7 +130,7 @@ const comparison = [
         </div>
         <div class="flag-row">
           <dt>Act without leaving</dt>
-          <dd>Reply (Ctrl-R), stop (Ctrl-K), or start a background agent (Ctrl-N), then get straight back to the board.</dd>
+          <dd>Reply (Ctrl-R), fork (Ctrl-F), stop (Ctrl-K), or start a background agent (Ctrl-N), then get straight back to the board.</dd>
         </div>
         <div class="flag-row">
           <dt>Find it by what was said</dt>
