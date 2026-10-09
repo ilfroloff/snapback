@@ -1,0 +1,74 @@
+name: "📊 Coverage"
+
+# Generates line coverage with cargo-llvm-cov and uploads it to Coveralls, which
+# serves the README badge. See docs/agents/OPERATIONS.md ("Continuous
+# integration & releases").
+#
+# WHY A SEPARATE FILE: ci.yml is PR-only on purpose (a push-to-main run there
+# duplicated the PR run). Coverage is reported for `main` alone, so the badge
+# always shows the merged state; it does not run on pull requests, which keeps a
+# second instrumented build off every PR. A manual run from another branch
+# uploads under THAT branch's name and does not move the `main` badge.
+#
+# Needs no secret: Coveralls identifies the repo from the built-in GITHUB_TOKEN.
+# Before the first run, add `ilfroloff/snapback` on coveralls.io.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# The job only reads the repository; Coveralls needs the token to identify the
+# repo, not to write to it.
+permissions:
+  contents: read
+
+# A newer push to `main` supersedes an older run: only the latest commit's
+# coverage matters for the badge.
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    name: "📊 Measure and upload coverage"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the toolchain but not `llvm-tools-preview`,
+      # which cargo-llvm-cov needs; adding it there would install it for every
+      # developer and every other job, so it is requested here alone.
+      - name: "🦀 Set up Rust toolchain (from rust-toolchain.toml)"
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: llvm-tools-preview
+
+      - name: "🧰 Install cargo-llvm-cov"
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: "🧪 Measure coverage"
+        run: cargo llvm-cov --all-targets --locked --lcov --output-path lcov.info
+
+      # No `base-path`: cargo-llvm-cov writes absolute paths, but the uploader
+      # strips the working directory, so files arrive as `src/...`.
+      #
+      # `coverage-reporter-version` is a deliberate pin (the action's default,
+      # `latest`, would download whatever release is newest on every run, the
+      # same drift rust-toolchain.toml and Cargo.toml avoid). Bump it by hand.
+      #
+      # `github-token` is spelled out because, if Coveralls ever answers "cannot
+      # find matching repository", the action's README requires exactly this form.
+      - name: "📤 Upload to Coveralls"
+        uses: coverallsapp/github-action@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          file: lcov.info
+          format: lcov
+          coverage-reporter-version: v0.6.22
