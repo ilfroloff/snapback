@@ -117,18 +117,22 @@ it. Follow this split when adding behavior:
   guard, so no argv can carry an effort without its model) and
   `nonzero_hint_for` (which picks the hint from that SAME predicate, so a blank
   pick that emits nothing cannot blame a model that was never sent). A compose's
-  pick is passed IN as a parameter by the reply, the draft's `--bg` launch and its
-  `Ctrl-O` run, and the builders the A MODEL IS PICKED PER COMPOSE, NEVER PER
+  pick is passed IN as a parameter by the reply, the fork box's headless fork and
+  its `Ctrl-O` run, and the draft's `--bg` launch and its `Ctrl-O` run, and the
+  builders the A MODEL IS PICKED PER COMPOSE, NEVER PER
   BOARD rule in [AGENTS.md](../../AGENTS.md#critical-rules) keeps it from —
-  `build_argv` (Resume, Fork), `build_attach_argv` and the move's
-  `claude_move::build_set_cwd_argv` — simply take no pick, so
-  that guarantee is a signature rather than a branch a test has to catch; every
+  `build_argv` (Resume), `build_fork_argv` (the running-session choice's Fork),
+  `build_attach_argv` and the move's `claude_move::build_set_cwd_argv` — simply
+  take no pick, so that guarantee is a signature rather than a branch a test has
+  to catch; every
   decision in `send` — `reply_gate` /
   `interrupt_gate` (the whole routing tree, asserted with no process spawned),
   `reply_in_flight_refusal` (`Ctrl-R`'s per-session in-flight rule, which takes
   whether the SELECTED session has a reply of its own in flight as a parameter
-  rather than reading `App`),
-  `build_send_argv` / `build_stop_argv` / `build_bg_launch_argv`, `plan_send` /
+  rather than reading `App`) and its `Enter` twin `resume_in_flight_refusal`,
+  `build_send_argv` / `build_fork_send_argv` / `build_stop_argv` /
+  `build_bg_launch_argv`, `format_uuid_v4` (the fork id's layout, asserted
+  without randomness), `plan_send` /
   `plan_bg_launch`, the `status_for_send` success map with its `answering_models` /
   `model_readout` halves (the `modelUsage` readout, fail-soft over an absent,
   empty, non-object or mistyped map), the `status_for_output` /
@@ -203,9 +207,11 @@ it. Follow this split when adding behavior:
   `resume::EFFORT_LEVELS` in order, wrapping both ways — asserted without a
   modal); `store::preview::restorable_model` (claude's restore rule for ONE record
   — a non-`isMeta` `assistant` turn with a real model — so the reply's default is
-  pinned per record as well as per fixture); `store::lineage`'s `lineage_key` / `head_of` / `fold` (the whole
-  fold is one pure fn of `(sessions, filtered, expanded)`, so the `(+N)` board can
-  be tested as a list transformation with no terminal and no store);
+  pinned per record as well as per fixture); `store::lineage`'s `lineage_key` /
+  `is_fork_name` / `fork_title` / `head_of` / `fold` (the whole fold is one pure fn of
+  `(sessions, filtered, expanded)`, so the `(+N)` board can be tested as a list
+  transformation with no terminal and no store) and `resume::fork_name` (a fork's
+  `--name`, whose every output `is_fork_name` must accept);
   `update::key_to_action` / `wheel_target` / `accept_paste` (line-ending
   normalization plus the char-counted cap, fused so neither can be skipped at a
   call site) / `flatten_for_query`; every `App` state transition (incl.
@@ -248,7 +254,14 @@ it. Follow this split when adding behavior:
   clipped `171 msgs` reads back as a plausible `17` and a confidently WRONG
   number is worse than none, where a clipped label merely looks clipped. The
   segment folds its own leading gap in, exactly as `lineage_marker` does, so the
-  width weighed is the width drawn) / `compose_model_label` (a compose box's
+  width weighed is the width drawn) / `fit_child_name` (a named fork's
+  `⑂ <name>` in the child row's id slot, the count's opposite: fitted BEFORE the
+  count into what the timestamp, badge and reserved markers leave, so the count
+  drops first, ellipsized rather than dropped, and dropped only when not one
+  column is left for the name) / `fit_child_markers` (which of a child row's
+  `[task failed]` / `[unbound]` / `[hidden]` fit, in that order, each dropped
+  whole; a named fork's are decided before its name, an unnamed member's after
+  its id and count) / `compose_model_label` (a compose box's
   bottom-border `model:` label, wording AND styling as spans: the value — a pick,
   `session (<label>)`, `default (<value>)` or `default` — in `MODEL_LABEL_STYLE`,
   the prefix and the `(new sessions only)` scope unstyled) / `model_pick_label` (a
@@ -517,7 +530,7 @@ inner rect when there is no banner (so a banner-less pane's geometry is exactly
   pinned row. All three mouse actions are also gated off while a surface that hides the
   transcript or takes the keyboard for a decision is up (`preview_pointer_blocked`:
   a modal, a confirmation, a pending chord, or the draft card), so none fires over
-  a draft card. An open QUICK REPLY is not in that list: its docked box is outside
+  a draft card. An open QUICK REPLY or FORK box is not in that list: its docked box is outside
   the transcript rect by construction, so a press in the box selects nothing while
   one over the transcript acts as on the bare board. Both rects trace back
   to `preview_inner`, the ONE place the pane's border inset is applied — which
@@ -735,7 +748,7 @@ inner rect when there is no banner (so a banner-less pane's geometry is exactly
   the frame instead. Every transition is a USER ACT: ANY scroll releases the
   anchor (in either direction — a scroll states a position, not a subscription —
   and a drag held past the pane's edge included, on a step whose autoscroll
-  actually moves the pane), and only `End` (or its `Ctrl-E` twin; an open quick reply answers every scroll key through the same methods), another row, or a layout change that
+  actually moves the pane), and only `End` (or its `Ctrl-E` twin; an open quick reply or fork box answers every scroll key through the same methods), another row, or a layout change that
   brings the pane back from 1:0 (`App::set_pane_layout`, which `Shift-←` and an
   opening compose both go through) re-arms it. A step between two layouts that
   both show the pane neither arms nor releases it. The render writes the flag for
@@ -840,8 +853,8 @@ secondary exit — and a `join()` if, and only if, it holds something the next b
 session or a spawned child needs back (stdin is the one instance). Reason about
 the flag FIRST: "it exits when the send fails" is an argument about a send the
 thread may never attempt. The quick-reply send (`send::spawn_send`) is the
-reference instance: a **one-shot** detached thread — spawned per `Ctrl-R` send, not a
-poller — that runs the multi-second `claude -p` child to completion and delivers a
+reference instance: a **one-shot** detached thread — spawned per `Ctrl-R` send or
+`Ctrl-F` headless fork, not a poller — that runs the multi-second `claude -p` child to completion and delivers a
 single `AppEvent::SendFinished`. It mirrors `resume::open_url` (fire-and-forget off
 the render loop), never `resume::launch` (which spawns+waits after a teardown), so
 the board keeps drawing while the child runs. The pure send DECISION is returned as
@@ -1011,7 +1024,8 @@ indefinitely, so the gate's answer has no bounded freshness at all. **Nothing
 hands off on polled data; the poll draws badges.** Fork is the deliberate
 exception that proves the shape: it has no liveness question to ask (a fork works
 live or finished), so it must NOT be dragged behind the probe — it is the route
-the not-live refusal points at.
+the not-live refusal points at. Neither the `Ctrl-F` box nor either of its runs
+asks.
 
 The **second** allowed one-shot is `worktrees::resolve` (`git -C <dir> worktree
 list --porcelain`), and it is worth stating separately because its moment is not
@@ -1088,18 +1102,22 @@ one call, not a behaviour. Leave all of these untested rather than "fixing" them
 with a proxy assertion — see the false-clean modes below.
 
 The compose pick list adds two more BOUNDED synchronous reads, in the same class as
-`defined_agents::discover_agents` and `send::plan_send`: a reply's transcript
-listing (`store::skills::read_listing`, once per reply draft and only for a
-top-level `@`, never for `/` or a background draft, and not at all once the
+`defined_agents::discover_agents` and `send::plan_send`: a reply's or fork
+box's transcript listing (`store::skills::read_listing`, once per box and only for
+a top-level `@`, never for `/` or a background draft, and not at all once the
 folder's catalog has landed) and a
 folder walk (`complete::list_tree`, once per resolved folder, capped by
 `COMPLETION_MAX_DIR_ENTRIES` per folder and
-`COMPLETION_MAX_TREE_ENTRIES` in all, at any depth, on both drafts). They run from
+`COMPLETION_MAX_TREE_ENTRIES` in all, at any depth, in every compose box). They run from
 `compose::refresh_completion`, called by the key and paste handlers and by
 `update::dispatch`'s `CatalogFetched` arm — which reads nothing new in practice,
 since every read is keyed to a token a key handler already resolved — and NEVER
 from the render path, which only reads the cached `visible` list. claude's own
-list is not one of them: it is the event-delivering fetch above.
+list is not one of them: it is the event-delivering fetch above. The fork box adds
+two of the same class on its own keys: `Ctrl-F` runs the fork's folder check
+(`resume::check`) before the box opens, as `Enter` always has, and its `Enter`
+reads 16 bytes of `/dev/urandom` (`send::fresh_session_id`) beside the
+`plan_send` re-read a reply already makes.
 
 `Ctrl-X w`'s picker adds one more, smaller still: `App::open_move_picker`
 canonicalizes the ONE selected session's folder (`in_scope` and one
@@ -1410,9 +1428,13 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    `Outcome::Signal` on the pid route, rather than into compose), and the compose
    zone via
    `App.compose` + its `compose_key_to_action` machine — ONE keyboard owner for
-   BOTH drafts, since which one is open is a `ComposeTarget` rather than a
-   second piece of state. `handle_event` checks each in turn before the board,
-   and the MODAL first of all — which is what lets a compose's `Ctrl-L` open the
+   every compose target (reply, fork, new-session draft), since which one is open
+   is a `ComposeTarget` rather than a second piece of state. The five are the
+   variants of ONE enum, `app::KeyboardOwner`, declared in the order a key
+   reaches them (`KeyboardOwner::PRECEDENCE`); `App::keyboard_owner` names the
+   first one open, and `handle_event` routes the key by an exhaustive `match` on
+   it before the board, so a new owner fails to compile until it is routed. The
+   MODAL comes first of all — which is what lets a compose's `Ctrl-L` open the
    model picker OVER the still-open compose: while the picker is up it owns every
    key, and its close (`Enter` after writing the pick, or `Esc`) hands the keyboard
    straight back to the untouched draft, with no state saved or restored.
@@ -1421,7 +1443,7 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    the mouse's three actions over the preview — toggling a fold node, opening a
    preview link, and starting a preview selection (a drag-select, or a
    double-click's word-select) — so none fires while any is up. An open QUICK
-   REPLY (`compose` with no `draft`) is deliberately absent: it owns the keyboard
+   REPLY or FORK box (`compose` with no `draft`) is deliberately absent: it owns the keyboard
    but previews the REAL transcript above its own docked box, and none of the
    three actions touches what it holds — its text and caret, its target session
    id, or the row selection that id is addressed by. A selection is mouse state
@@ -1448,10 +1470,10 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    a selection over the transcript act on a decision it is waiting for, or on
    text it has hidden? If so it belongs there, or the mouse will act underneath
    it; if the owner leaves the transcript on screen and the three actions leave
-   its state alone (the quick reply), blocking them only costs the user the mouse.
-   What stays blocked while a reply is open is everything that would change which
-   row is selected, which is the target's identity: the wheel over the LIST (below)
-   and every key, since all of them are the reply's.
+   its state alone (the quick reply, the fork box), blocking them only costs the user the mouse.
+   What stays blocked while a reply or fork box is open is everything that would
+   change which row is selected, which is the target's identity: the wheel over
+   the LIST (below) and every key, since all of them are the box's.
 
    The wheel takes exactly ONE condition, and `update::wheel_target` owns it as a
    parameter (`composing`) the way `key_to_action` owns its own. It hit-tests
@@ -1479,20 +1501,22 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    the strict reading — dead everywhere but the preview — would have made a notch
    over the box you are typing in inert.
 
-   A **terminal paste** is routed by that same list, and `update::handle_paste`
-   walks it in the identical order — the per-owner table is
+   A **terminal paste** is routed by that same list: `update::handle_paste`
+   matches exhaustively on the same `App::keyboard_owner` — the per-owner table is
    [DOMAIN.md](DOMAIN.md#terminal-paste-routing-eventpaste). Two rules follow for
-   anyone editing this area. A new keyboard owner must be added to `handle_paste`
-   as well, not only to `handle_event` (and `preview_pointer_blocked`, when the
-   above says it belongs there), or pasted text lands on the surface underneath it. And `handle_paste` returns no `Outcome` on
+   anyone editing this area. A new keyboard owner is a new `KeyboardOwner` variant,
+   which `handle_paste` must route as well as `handle_event` — the compiler holds
+   both to that, but not `preview_pointer_blocked`, which a new owner joins by hand
+   when the above says it belongs there — or pasted text lands on the surface
+   underneath it. And `handle_paste` returns no `Outcome` on
    purpose: a paste is DATA, so it structurally cannot send, resume, or answer a
    confirmation. That is the shape of the fix for the bug where a pasted newline
    arrived as a bare `Enter` — `ComposeAction::Send` — and submitted a draft's
    first line before resuming on its second. `compose_key_to_action` is SHARED by
-   both compose targets, so that hit BOTH boxes: a quick reply sent one line, and a
-   `Ctrl-N` background draft launched an agent on one.
+   every compose target, so that bug hit both boxes that existed then: a quick
+   reply sent one line, and a `Ctrl-N` background draft launched an agent on one.
    `compose_key_to_action` also takes `list_open`: with the pick list open (in
-   either draft — the router never sees the target) bare `Enter`/`Tab` pick, `Up`/`Down` choose and `Esc` closes the list;
+   any compose box — the router never sees the target) bare `Enter`/`Tab` pick, `Up`/`Down` choose and `Esc` closes the list;
    `Ctrl-J`, `Alt`/`Shift+Enter` and `Ctrl-O` decode as ever, and `false` decodes
    exactly as before. Each key needs its decode test AND a `handle_event` test.
 
@@ -1574,7 +1598,8 @@ A COMPOSE key (`Ctrl-J`, `Ctrl-O`, `Ctrl-L`) is added a third way: a
 the kitty path) + its `handle_compose_key` arm. It belongs to the compose box and
 not to the board, so it is named in `view::compose_hint` (the reply hint fits 80
 columns exactly, so a new segment is paid for by shrinking another; a draft's key
-lands in `BG_DRAFT_HINT`, which the draft card shows too through `draft_hint`) and
+lands in `BG_DRAFT_HINT`, which the draft card shows too through `draft_hint`,
+and a fork box's in `FORK_HINT`, which fits 80 columns whole) and
 NOT in the board keymap or `chord_hint`. A NEW key must be FREE on the whole path to that
 router, and each claim needs evidence rather than a guess, because a key stolen
 anywhere upstream reads as the key doing nothing: the pinned `ratatui-textarea`
@@ -1591,16 +1616,16 @@ argument next to the arm.
 The deliberate exception to "free on the whole path" is the board's transcript
 scroll set (`ComposeAction::PreviewTop` / `PreviewBottom` / `PreviewPageUp` /
 `PreviewPageDown` / `PreviewHalfUp` / `PreviewHalfDown`: `Ctrl-T`/`Ctrl-E`/`Home`/
-`End`, `PgUp`/`PgDn`, `Ctrl-U`/`Ctrl-D`), shared with an open quick REPLY because
-it previews the real transcript. The router mirrors `update::key_to_action`'s
+`End`, `PgUp`/`PgDn`, `Ctrl-U`/`Ctrl-D`), shared with an open quick REPLY or FORK
+box because each previews the real transcript. The router mirrors `update::key_to_action`'s
 modifier rule (the `Ctrl` letters whatever else is held, the named keys only
 without `Ctrl`). Several are editor keys (`Ctrl-U` delete-to-head, `Ctrl-D`
 delete-char, `Ctrl-E`/`Home`/`End`/`PgUp`/`PgDn` caret moves), taken from the reply
-editor on purpose; all fall through to the editor on a new-session draft, whose
+and fork editors on purpose; all fall through to the editor on a new-session draft, whose
 pane shows a placeholder card. The handler only calls the board's `App::preview_*`
 methods, so the follow-bottom rules above apply unchanged and neither selection
 nor draft text/caret move. This is a conscious loss of those editing keys on a
-reply, not an oversight: do not add alternative chords for them.
+reply or fork, not an oversight: do not add alternative chords for them.
 
 A binding that is only meaningful sometimes is **CONDITIONAL, and falls through**
 rather than going inert. `key_to_action` takes the conditions as parameters
@@ -1674,8 +1699,8 @@ empty-buffer nudge. A fact that is true over an **interval** lives in typed
 state and renders on the surface that owns it:
 
 - the quick reply's in-flight echo lives in `App::sending` (one entry per
-  session) and renders **inline** in that session's preview pane
-  (`view::sending_tail`), not on the help line;
+  session; a headless fork's under the fork's own id) and renders **inline** in
+  that session's preview pane (`view::sending_tail`), not on the help line;
 - a background-agent launch lives in `App::draft.launch_id` and renders on the
   draft card (`view::draft_card`), not on the help line;
 - a `Ctrl-X w` move in flight lives in `App::moving` (one entry per session, so a
@@ -1690,6 +1715,9 @@ state and renders on the surface that owns it:
   visible label — `claude stop` is fast and the badge clears on the next agents
   poll — but the guard still prevents a stale completion from landing on a
   surface that has moved on;
+- a headless fork's pending cursor jump lives in `App::fork_jump` and has **no**
+  visible label either: the first reload that holds the fork spends it, moving
+  the cursor only when nothing owns the keyboard (`App::keyboard_owned`);
 - what a compose will run on lives in `ComposeState::model` (its `Ctrl-L` pick)
   and, with no pick, in `App::compose_default`, and renders on that compose box's
   own bottom border (`view::compose_model_label`), not on the help line: the
@@ -1822,7 +1850,11 @@ Tests are **inline** `#[cfg(test)] mod tests` at the bottom of each source file
   normal session, a no-summary session, a malformed-line session, a worktree
   cwd, a sidecar (no `cwd`), a nested subagent, a **background-fork pair**
   (two files sharing one tree root, `cwd`, branch and label — the duplicate-row
-  shape), a **root-less** session (no `parentUuid: null` record), four
+  shape) joined by a **named fork** (`sess-fork-named-1`: the same root, and the
+  `custom-title` `fork: …` the `Ctrl-F` box's `--name` writes — twice, each
+  beside an `agent-name` with the same text, as claude 2.1.291 did, and no
+  `sessionKind` — the lineage's NEWEST member, which must still not take the head),
+  a **root-less** session (no `parentUuid: null` record), four
   **failed-background-task pairs** under `-Users-me-project-epsilon` (`failed` vs
   `completed`; a quick reply vs an `sdk`-marked notification after the failure; a
   `turnOrigin: "sdk"` slash command vs a bare one; a `failed` notice with vs

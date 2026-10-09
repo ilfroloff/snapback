@@ -27,6 +27,9 @@
 //!   probe. While the selected session's OWN quick reply is still in flight,
 //!   `Ctrl-R` on that session refuses ([`SEND_IN_FLIGHT_REFUSED`]); a reply in
 //!   flight to any other session refuses nothing.
+//! * [`resume_in_flight_refusal`] — `Enter`'s twin of it, asked before the
+//!   resume gate's probe: the same per-session fact refuses a resume
+//!   ([`RESUME_SENDING_REFUSAL`]).
 //! * [`plan_send`] — the AUTHORITATIVE re-read of `(cwd, session_id)` from INSIDE
 //!   the file at send time (via [`crate::store::parse::parse_file`], the one
 //!   parser), plus the cwd-existence gate — the send counterpart of
@@ -113,7 +116,9 @@ pub const SEND_LIVE_REFUSED: &str =
      Try Ctrl-K to stop it, or Fork (Ctrl-F) to branch a copy.";
 
 /// Refusal shown when `Ctrl-R` is pressed on a session snapback is STILL sending a
-/// quick reply to.
+/// quick reply to — or on a fork whose headless `claude -p` (the `Ctrl-F` box's
+/// `Enter`, in flight under the FORK's id) is still running, so the words name
+/// both.
 ///
 /// Only that session refuses. `App::sending` keeps one in-flight entry PER
 /// SESSION, so a reply to any other row goes out beside it. Each entry is more
@@ -129,8 +134,19 @@ pub const SEND_LIVE_REFUSED: &str =
 /// It is only ever shown for the row `Ctrl-R` was pressed on, so it says "this
 /// session" rather than naming one, and it names no other move: waiting is the one
 /// that holds in every world.
-pub const SEND_IN_FLIGHT_REFUSED: &str = "snapback is still sending a reply to this session — \
-     wait for it to land, then reply again.";
+pub const SEND_IN_FLIGHT_REFUSED: &str = "snapback is still sending a reply or fork on this \
+     session — wait for it to land, then reply again.";
+
+/// Refusal shown when `Enter` is pressed on a session snapback's own `claude -p`
+/// child is still writing: a quick reply to it, or — on a fork's row — the headless
+/// fork creating it (under the FORK's id), so the words name both.
+///
+/// A resume would open a second `claude` on a transcript that child has not
+/// finished writing. The fork's ORIGIN is not refused: its child only reads that
+/// file, and nothing records it there. Like [`SEND_IN_FLIGHT_REFUSED`], waiting is
+/// the one move that holds in every world.
+pub const RESUME_SENDING_REFUSAL: &str = "snapback is still sending a reply or fork on this \
+     session — wait for it to land, then resume it.";
 
 /// Neutral success status when the JSON parsed but carried no `total_cost_usd`,
 /// or when stdout was unreadable/empty (the child ran, but said nothing we can
@@ -250,6 +266,18 @@ fn stoppable_job_id(agent: &ReportedAgent) -> Option<&str> {
 #[must_use]
 pub fn reply_in_flight_refusal(reply_in_flight: bool) -> Option<&'static str> {
     reply_in_flight.then_some(SEND_IN_FLIGHT_REFUSED)
+}
+
+/// `Enter`'s FIRST question, asked before the resume gate's liveness probe and
+/// before any Attach/Fork/Cancel choice opens: is snapback's own `claude -p` child
+/// still writing the SELECTED session? `send_in_flight` is the board's answer for
+/// that one session (`App::sending_to`), never whether a child runs anywhere else.
+///
+/// `true` refuses ([`RESUME_SENDING_REFUSAL`]); `None` lets the rest of the gate
+/// decide.
+#[must_use]
+pub fn resume_in_flight_refusal(send_in_flight: bool) -> Option<&'static str> {
+    send_in_flight.then_some(RESUME_SENDING_REFUSAL)
 }
 
 /// Decide [`ReplyGate`] from the session's current live-agent record (`None` when
@@ -644,6 +672,78 @@ pub fn build_send_argv(
     crate::resume::push_model_flag(&mut argv, model);
     argv.push(message.to_string());
     argv
+}
+
+/// Build the `claude` argv for the `Ctrl-F` box's one-shot fork:
+/// `claude -p -r <origin> --fork-session --session-id <fork> --name <name>
+/// --output-format json [--model <alias> [--effort <level>]] <message>`.
+///
+/// [`build_send_argv`] plus the flags that turn the resume into a fork snapback
+/// chose the id and the name of: `--session-id` is accepted with `--resume` only
+/// alongside `--fork-session` (checked against claude 2.1.291,
+/// `docs/agents/CLAUDE_CLI.md`), and naming the fork's id up front is what lets the
+/// board record the send under it and jump to it. `--name` is the message's first
+/// line under the fork prefix ([`crate::resume::push_fork_name`]; `parent_label`
+/// only if the message has no non-blank line), which keeps the parent heading the
+/// fork on the board. Flags precede the message positional, as in
+/// [`build_send_argv`].
+#[must_use]
+pub fn build_fork_send_argv(
+    origin_id: &str,
+    fork_id: &str,
+    model: Option<&crate::resume::ModelPick>,
+    message: &str,
+    parent_label: &str,
+) -> Vec<String> {
+    let mut argv = vec![
+        "claude".to_string(),
+        "-p".to_string(),
+        "-r".to_string(),
+        origin_id.to_string(),
+        "--fork-session".to_string(),
+        "--session-id".to_string(),
+        fork_id.to_string(),
+    ];
+    crate::resume::push_fork_name(&mut argv, Some(message), parent_label);
+    argv.push("--output-format".to_string());
+    argv.push("json".to_string());
+    crate::resume::push_model_flag(&mut argv, model);
+    argv.push(message.to_string());
+    argv
+}
+
+/// Bytes of entropy in a session id (a UUID is 128 bits).
+const SESSION_ID_BYTES: usize = 16;
+
+/// Where the kernel's random bytes are read from (darwin and linux, the only
+/// platforms snapback supports). No crate: one 16-byte read does not earn a
+/// dependency.
+const RANDOM_SOURCE: &str = "/dev/urandom";
+
+/// Format 16 random bytes as a UUID v4 string (`8-4-4-4-12` lowercase hex), forcing
+/// the version nibble to 4 and the variant bits to `10`, the shape claude accepts for
+/// `--session-id`. Pure so the layout is assertable without randomness.
+#[must_use]
+pub fn format_uuid_v4(mut bytes: [u8; SESSION_ID_BYTES]) -> String {
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let mut out = String::with_capacity(36);
+    for (i, byte) in bytes.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            out.push('-');
+        }
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+/// A fresh session id for a fork, or `Err` when the OS gave no entropy — the caller
+/// refuses with a status line, never panics and never falls back to a weaker source.
+pub fn fresh_session_id() -> std::io::Result<String> {
+    use std::io::Read;
+    let mut bytes = [0u8; SESSION_ID_BYTES];
+    std::fs::File::open(RANDOM_SOURCE)?.read_exact(&mut bytes)?;
+    Ok(format_uuid_v4(bytes))
 }
 
 /// Build the `claude stop <job-id>` argv that DEREGISTERS a background job so a
@@ -2061,6 +2161,37 @@ mod tests {
         assert!(
             !refusal.to_lowercase().contains("at a time"),
             "no board-wide rule is claimed: {refusal:?}"
+        );
+        for claim in OWNERSHIP_CLAIMS {
+            assert!(
+                !refusal.to_lowercase().contains(claim),
+                "{refusal:?} must not claim an owner ({claim:?})"
+            );
+        }
+    }
+
+    /// `Enter`'s per-session in-flight rule: with no `claude -p` child of
+    /// snapback's own on the selected session it stays out of the resume gate's
+    /// way; with one it refuses in words about resuming THIS session, never in
+    /// `Ctrl-R`'s.
+    #[test]
+    fn a_child_in_flight_refuses_a_resume_of_the_same_session() {
+        assert_eq!(
+            resume_in_flight_refusal(false),
+            None,
+            "nothing in flight on this session: the resume gate decides"
+        );
+
+        let refusal = resume_in_flight_refusal(true)
+            .expect("a child still writing this session must refuse a resume");
+        assert_eq!(refusal, RESUME_SENDING_REFUSAL);
+        assert_ne!(
+            refusal, SEND_IN_FLIGHT_REFUSED,
+            "a resume is refused in its own words, not a reply's"
+        );
+        assert!(
+            refusal.contains("this session") && refusal.ends_with("then resume it."),
+            "the refusal is about resuming the selected session: {refusal:?}"
         );
         for claim in OWNERSHIP_CLAIMS {
             assert!(
@@ -3550,5 +3681,100 @@ mod tests {
             "a poisoned queue still keeps and hands back every completion"
         );
         assert!(queue.take().is_empty(), "the take emptied it");
+    }
+
+    /// The fork send is the reply send plus `--fork-session --session-id <fork>
+    /// --name <name>`, flags ahead of the message and the model pair.
+    #[test]
+    fn the_fork_send_argv_names_the_fork_and_keeps_the_message_last() {
+        let pick = crate::resume::ModelPick {
+            model: "opus".to_string(),
+            effort: Some("high"),
+        };
+        assert_eq!(
+            build_fork_send_argv("orig", "new-id", Some(&pick), "hello", "parent").join(" "),
+            "claude -p -r orig --fork-session --session-id new-id --name fork: hello \
+             --output-format json --model opus --effort high hello"
+        );
+        assert_eq!(
+            build_fork_send_argv("orig", "new-id", None, "hello", "parent").join(" "),
+            "claude -p -r orig --fork-session --session-id new-id --name fork: hello \
+             --output-format json hello"
+        );
+    }
+
+    /// The `--name` the fork send carries is the one the board reads back as a
+    /// fork (`lineage::is_fork_name`), taken from the message's first line, and it
+    /// sits before the trailing message.
+    #[test]
+    fn the_fork_send_name_is_a_fork_name_ahead_of_the_message() {
+        let message = "\n  Review PR1  \nthen the rest of the brief";
+        let argv = build_fork_send_argv("orig", "new-id", None, message, "parent");
+        let at = argv
+            .iter()
+            .position(|a| a == "--name")
+            .expect("a fork send names its fork");
+        let name = &argv[at + 1];
+        assert!(crate::store::lineage::is_fork_name(name), "{name:?}");
+        assert_eq!(name, "fork: Review PR1");
+        assert_eq!(argv.last().map(String::as_str), Some(message));
+        assert!(at + 1 < argv.len() - 1, "the name precedes the message");
+    }
+
+    /// The id layout: `8-4-4-4-12` lowercase hex, version nibble 4, variant 8..b,
+    /// whatever the input bytes.
+    #[test]
+    fn a_session_id_is_a_v4_uuid_whatever_the_bytes() {
+        assert_eq!(
+            format_uuid_v4([0; 16]),
+            "00000000-0000-4000-8000-000000000000"
+        );
+        assert_eq!(
+            format_uuid_v4([0xff; 16]),
+            "ffffffff-ffff-4fff-bfff-ffffffffffff"
+        );
+        let id = format_uuid_v4(*b"0123456789abcdef");
+        assert_eq!(id.len(), 36);
+        let parts: Vec<&str> = id.split('-').collect();
+        assert_eq!(
+            parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
+            [8, 4, 4, 4, 12]
+        );
+        assert!(parts[2].starts_with('4'));
+        assert!(matches!(parts[3].as_bytes()[0], b'8' | b'9' | b'a' | b'b'));
+    }
+
+    /// The real source gives distinct, well-formed ids.
+    #[test]
+    fn fresh_session_ids_are_distinct() {
+        let a = fresh_session_id().expect("the OS random source is readable");
+        let b = fresh_session_id().expect("the OS random source is readable");
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 36);
+    }
+
+    /// `App::sending` holds a headless FORK's child under the fork's id as well as a
+    /// reply's under its target's, so every refusal that entry raises — `Ctrl-R`'s,
+    /// `Enter`'s, `Ctrl-X d`'s and `Ctrl-X w`'s — must be true of both, and still
+    /// name snapback as the writer.
+    #[test]
+    fn every_in_flight_child_refusal_names_a_reply_and_a_fork() {
+        for refusal in [
+            SEND_IN_FLIGHT_REFUSED,
+            RESUME_SENDING_REFUSAL,
+            crate::delete::DELETE_SENDING_REFUSAL,
+            crate::claude_move::MOVE_SENDING_REFUSAL,
+        ] {
+            assert!(
+                refusal.starts_with("snapback ")
+                    && refusal.contains("reply")
+                    && refusal.contains("fork"),
+                "{refusal:?}"
+            );
+            assert!(
+                !refusal.contains("reply to this session"),
+                "a fork row's child is no reply to it: {refusal:?}"
+            );
+        }
     }
 }

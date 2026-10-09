@@ -36,7 +36,12 @@ OPTIONS:
     -h, --help     Print this help and exit
 
 KEYS:
-    ↑/↓           move          Enter        resume (returns to the board on exit)
+    ↑/↓           move
+    Enter         resume (returns to the board on exit). Refused on a session
+                  snapback is still sending a reply to, or still making as a
+                  fork from the Ctrl-F box's Enter, until it lands (the session
+                  a fork came from still resumes), and on one Ctrl-X w is still
+                  moving
     ←/→           move the search query's cursor one character (the list and
                   the preview stay put)
     Alt+←/→       move the search query's cursor one WORD, as the reply box does
@@ -47,7 +52,19 @@ KEYS:
                   1:0 (starts at 1:1; Shift+← toward a full-width preview, Shift+→
                   toward a full-width list; a press at either end does nothing).
                   Always bound, query or not; the preview keeps your place
-    Ctrl-F        fork
+    Ctrl-F        fork the selected session: opens a fork box (after the folder
+                  check; a deleted folder is refused before you type). Enter forks
+                  it without leaving the board, like a quick reply, and the
+                  cursor opens the fold and jumps to the fork when it appears if
+                  you haven't moved and nothing else is open (another box, a
+                  picker or a prompt); Ctrl-O forks it interactively (an empty box
+                  is a plain fork; the message auto-submits), Ctrl-L picks the
+                  model, Ctrl-J or Alt+Enter newline, Esc cancels, and / or @
+                  opens the pick list (below). Either way the fork is named
+                  'fork: <first line of the message>' ('fork: <session label>'
+                  for an empty box) and folds under the session it came from.
+                  The headless fork can't answer permission prompts, like a
+                  reply
     Ctrl-A        flip scope: current folder ↔ project (the repo you launched in
                   and all of its git worktrees). Launched with -a it is a
                   three-stop cycle instead: current folder → project → all
@@ -74,29 +91,31 @@ KEYS:
                   · w move the session to another worktree of this project (or
                   back to the main folder); the board stays up and the status
                   line says where it went. A session claude lists as active, or
-                  one snapback is still replying to or moving, is refused, and
-                  so is any move while claude cannot be asked whether it is
-                  active (claude agents --json fails). While the move runs
-                  (under a second) the row reads moving… and refuses Enter,
-                  Ctrl-F, Ctrl-R, Ctrl-X d and another Ctrl-X w. On a stack's
-                  top row you then pick this session or its whole lineage: a
-                  lineage moves one session at a time, skips one snapback is
-                  still replying to or moving, stops at a folder claude does
-                  not trust yet, and one line tallies what moved
+                  one snapback is still replying to, forking or moving, is
+                  refused, and so is any move while claude cannot be asked
+                  whether it is active (claude agents --json fails). While the
+                  move runs (under a second) the row reads moving… and refuses
+                  Enter, Ctrl-F, Ctrl-R, Ctrl-X d and another Ctrl-X w. On a
+                  stack's top row you then pick this session or its whole
+                  lineage: a lineage moves one session at a time, skips one
+                  snapback is still replying to, forking or moving, stops at a
+                  folder claude does not trust yet, and one line tallies what
+                  moved
     Ctrl-R        quick reply — send a one-shot message to the selected session
                   without leaving the board. An agent whose run is over (done,
                   stopped, failed) is stopped first so the reply lands in place;
                   a waiting one (needs input) confirms first; a working, idle,
                   interrupted or unrecognized agent, or a session claude reports
                   with no job to stop, is refused — try Ctrl-K or Fork instead.
-                  While a session's own reply is still being sent, or the
+                  While a session's own reply is still being sent (or, on a
+                  fork from the Ctrl-F box's Enter, the fork itself), or the
                   session is being moved (Ctrl-X w), Ctrl-R on that session is
                   refused until it lands; other rows can still reply
                   (Enter sends, Ctrl-L picks the model, Ctrl-J or Alt+Enter
                   newline, Esc cancels, and / or @ opens the pick list below)
-    Ctrl-L        in a reply or draft box: pick the model, and optionally the
+    Ctrl-L        in a reply, fork or draft box: pick the model, and optionally the
                   effort, for THIS message only. The box names what it will run
-                  on — a reply 'model: session (<model>)', the model its session
+                  on — a reply or fork 'model: session (<model>)', the model its session
                   last answered with, which claude keeps by itself; a draft
                   'model: default (<value>) (new sessions only)', from your
                   claude settings — and --model/--effort are sent only when you
@@ -104,16 +123,16 @@ KEYS:
                   ANTHROPIC_DEFAULT_*_MODEL set, claude does not restore the
                   session's model, so a reply says 'model: default'. The first
                   row goes back to the default; every new box starts there and
-                  nothing is remembered. Enter, Ctrl-F, Attach and the
-                  Ctrl-X w move never send a model, and claude does not keep
-                  an effort for a later resume
+                  nothing is remembered. Enter (resume), the Attach/Fork
+                  choice, Attach and the Ctrl-X w move never send a model, and
+                  claude does not keep an effort for a later resume
     ←/→           in the model picker: step the highlighted model's effort
                   through default → low → medium → high → xhigh → max, wrapping,
                   sent as --effort beside --model; Enter sets both into the box,
                   which then reads 'model: <alias> · <effort>'. Nothing on the
                   default row. claude lowers a level the model can't use, and
                   ignores it for a model with no effort support
-    / or @        in a reply or draft box: a / as the first character lists
+    / or @        in a reply, fork or draft box: a / as the first character lists
                   claude's skills and commands for that folder, an @ at the
                   start of a word lists files and folders (and, at the top
                   level, agents, inserted as @agent-<name>); a skill, command or
@@ -128,9 +147,9 @@ KEYS:
                   folder reopens the list one level down), and Esc closes only
                   the list (the draft stays). The list is claude's own, fetched
                   once per folder in the background: until it lands / lists
-                  nothing in either box, while @ shows files and folders at
-                  once, a reply's agents come from its transcript and a draft's
-                  wait for the list
+                  nothing in any box, while @ shows files and folders at once,
+                  a reply's or fork's agents come from its transcript and a
+                  draft's wait for the list
     Ctrl-K        stop / interrupt the selected session's live agent. With a job
                   to stop it runs claude stop: an agent whose run is over (done,
                   stopped, failed) stops at once, every other one confirms
@@ -143,8 +162,9 @@ KEYS:
                   opens the preview on the most recent match, as typing does
     PgUp/PgDn     preview page  Ctrl-U/Ctrl-D  preview quarter-page
     Home/End      preview top / bottom (also Ctrl-T/Ctrl-E; every preview scroll key
-                  also works while a quick reply is open, not on a draft; fn+←/→ on a MacBook keyboard, where
-                  Home/End are not their own keys)
+                  also works while a quick reply or fork box is open, not on a
+                  draft; fn+←/→ on a MacBook keyboard, where Home/End are
+                  not their own keys)
     Shift+↑/↓     jump the preview to the previous / next line the query marks.
                   Only while something is marked there — with nothing marked they
                   stay plain move, so they never take a key away from you. One
@@ -158,15 +178,15 @@ KEYS:
                   hand-back, or context claude added) unfolds, and a second click
                   folds it back; otherwise a link opens (http/https only).
                   Like the drag and double-click below, it works while a reply
-                  box is open
+                  or fork box is open
     drag          in the preview: select transcript text; on release it is
                   copied the way Ctrl-X y copies (your clipboard tool, or OSC 52
                   over SSH). A drag that starts on a node or a link selects it
                   rather than unfolding or opening it. Hold the drag past the
                   pane's top or bottom edge and it scrolls that way, faster the
                   further out, so the selection keeps growing until you let go.
-                  Works while a reply box is open (it never touches what you
-                  are typing); off while a new-session draft is, since its
+                  Works while a reply or fork box is open (it never touches what
+                  you are typing); off while a new-session draft is, since its
                   placeholder replaces the transcript. Hold Shift/Option for
                   your terminal's own selection instead
     double-click  in the preview: select the word under the pointer and copy it

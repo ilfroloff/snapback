@@ -38,32 +38,32 @@
 //! | `Up` / `Down` | move selection (always) |
 //! | `Left` / `Right` | move the search query's caret one character back / forward (always). Not a query change: the list, the selection and the preview stay exactly where they were |
 //! | `Alt-Left` / `Alt-Right`, `Alt-b` / `Alt-f`, `Ctrl-Left` / `Ctrl-Right` | move the search query's caret one WORD back / forward (always) — the widget's own word hop (see [`App::move_query_caret_by_word`]), so forward lands on the START of the next word, as in the reply box. Not a query change either. Three pairs because `⌥←` / `⌥→` reaches the board as `CSI 1;3D` / `C` or as `ESC b` / `ESC f` depending on the terminal, and `Ctrl-Left` / `Ctrl-Right` is the non-`Alt` twin; `Alt-b` / `Alt-f` and `Ctrl-Left` / `Ctrl-Right` are also the pairs the compose box hops words on |
-//! | `Enter` | resume the selected session. Refused while snapback's own `Ctrl-X w` move of that session is still in flight (see [`App::moving_on`]) |
-//! | `Ctrl-F` | fork-resume the selected session. Refused, like `Enter`, while that session's move is in flight |
+//! | `Enter` | resume the selected session. Refused, before the liveness probe, while snapback's own `claude -p` child is still writing that session — a quick reply to it, or on a fork's row the headless fork creating it (see [`send::resume_in_flight_refusal`]) — and while its own `Ctrl-X w` move of that session is still in flight (see [`App::moving_on`]). A reply or fork in flight on another row refuses nothing here, and neither does a headless fork on the row it was forked from, which its child only reads |
+//! | `Ctrl-F` | fork the selected session: opens a fork compose box after the move and folder checks (refused, like `Enter`, while snapback's own `Ctrl-X w` move of that session is still in flight; a deleted folder is refused before you type; no live-agent check, claude skips it for a fork). `Enter` forks it headless without leaving the board (`claude -p -r <id> --fork-session --session-id <new> --name <name>`, like a quick reply — once the fork appears, folded under the session it came from, the cursor expands that lineage and jumps to it, if you have not moved and nothing owns the keyboard — see [`App::keyboard_owned`]), `Ctrl-O` forks it interactively (an empty box with no pick is the plain `claude -r <id> --fork-session` plus its `--name`), `Ctrl-L` picks the model for that fork, `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels. Both name the fork `fork: <first line of the message>` (`fork: <the session's label>` for an empty `Ctrl-O`; see `resume::fork_name`), which keeps the session heading its forks (`lineage::head_of`). The Attach/Fork/Cancel choice's Fork hands off exactly the argv of an empty `Ctrl-O` with no pick, and never carries a model. In the box `/` and `@` open the pick list (the `/` or `@` row below), which claims `Enter` and `Esc` while it is open |
 //! | `Ctrl-N` | start a new session in the launch directory. When agents are defined a picker opens first and `Enter` on a pick opens a draft pane for the session's first message; with none defined that draft opens straight away. In the draft, `Enter` starts a BACKGROUND agent without leaving the board, `Ctrl-O` runs it interactively instead, `Esc` cancels; `/` and `@` open the pick list (the `/` or `@` row below), which claims `Enter` and `Esc` while it is open |
 //! | `Ctrl-O` (in the agent picker) | start the highlighted agent INTERACTIVELY at once, skipping the draft — the same verb `Ctrl-O` names inside the draft, so BOTH routes out of the picker cost exactly one key. Bound on the picker alone — inert on every other modal |
-//! | `Ctrl-R` | quick-reply: send a one-shot message to the selected session without leaving the board. An agent whose run is OVER (`done` / `stopped` / `failed`) is stopped first so the reply lands in place; `needs input` confirms first; `working` / `idle` / `interrupted` / an unrecognized qualifier is refused, and so is a session claude reports with no stoppable job id — the refusal points at `Ctrl-K` or Fork (see [`send::reply_gate`]). While this session's OWN reply is still in flight, `Ctrl-R` on it is refused before any of the above (see [`send::reply_in_flight_refusal`]), and so it is while its `Ctrl-X w` move is; a reply or a move still in flight on another row refuses nothing here. In the box `/` and `@` open the pick list (the `/` or `@` row below), which claims `Enter` and `Esc` while it is open |
+//! | `Ctrl-R` | quick-reply: send a one-shot message to the selected session without leaving the board. An agent whose run is OVER (`done` / `stopped` / `failed`) is stopped first so the reply lands in place; `needs input` confirms first; `working` / `idle` / `interrupted` / an unrecognized qualifier is refused, and so is a session claude reports with no stoppable job id — the refusal points at `Ctrl-K` or Fork (see [`send::reply_gate`]). While this session's OWN reply is still in flight (on a fork's row, the headless fork making it — its `claude -p` child is recorded under the fork's id), `Ctrl-R` on it is refused before any of the above (see [`send::reply_in_flight_refusal`]), and so it is while its `Ctrl-X w` move is; a reply or a move still in flight on another row refuses nothing here. In the box `/` and `@` open the pick list (the `/` or `@` row below), which claims `Enter` and `Esc` while it is open |
 //! | `Ctrl-K` | stop / interrupt the selected session's live agent, by whichever handle claude's record carries (see [`send::interrupt_gate`]). A stoppable job id → `claude stop`: an agent whose run is OVER (`done` / `stopped` / `failed`) stops at once, every other live agent confirms first. NO job id but a `pid` → confirm, then re-ask claude at `Enter` and send that pid a SIGTERM (never SIGKILL) only if claude still reports the same pid with no job id; a record that is gone, now carries a job id, or reports another pid refuses instead (see [`send::signal_plan`]). A session claude is not holding, or one it reports with neither a job id nor a pid — or with no job id and a pid no signal could take (`0`, past `i32::MAX`, or the board's own process id) — is refused |
 //! | `Tab` | toggle name-only vs. name+content search. Widening to content also opens the preview on the most recent match, exactly as typing does: it goes through the same query funnel, and the mode is the gate that key just opened |
 //! | `Ctrl-A` | flip the scope: current folder <-> project (the launch repo and all of its git worktrees). ONE key for both, because the second is a refinement of the same question the first answers, not a separate mode. Launched with `--all`/`-a` it becomes a three-stop cycle through all folders as well — the whole store is on this key only when the launch flag put it there |
-//! | `Ctrl-X` then `x`/`d`/`h`/`r`/`y`/`f`/`w` | leader chord: hide (from a row that visibly stands for others — a folded `(+N)` head, or an expanded head with `↳` rows beneath it — that row and the members it stands for on screen, so the fold cannot re-head, while members off the board (filtered out by the query, out of scope, already hidden) stay as they are; any other row that session alone: a `↳` row, or a head whose other members are all off the board; un-hiding from such a head exposes every member it stands for, one hidden on its own included — see [`App::toggle_hidden_selected`]) / hard-delete (this row; on a multi-member lineage's HEAD row — the row not drawn `↳` — the confirm also offers its whole fork lineage, never on a `↳` row, and still on a head standing alone, since the confirm counts the lineage and discloses its hidden members; a member whose quick reply or move snapback still has in flight is refused, see [`delete::can_delete_target`]) / toggle show-hidden / re-read every transcript from disk / copy session ID (the selected session's full id, to the clipboard; the id also shows on the status line) / fold or expand the selected row's fork lineage (fold an open one, open a folded `(+N)` head, nothing otherwise — see [`App::toggle_selected_lineage`]) / move the selected session to another worktree of the launch project (the parent folder included, its own folder omitted): opens a picker, see the next row; refused, with no picker, while that session's own move or quick reply is still in flight (any other key cancels) |
-//! | `Enter` in the move picker | move the session to the chosen worktree; the board stays up. A worker thread re-reads the transcript, refuses a session claude lists as active — and, unlike every other gate, refuses too when claude cannot be asked (`claude agents --json` fails; see `crate::claude_move::liveness_refusal`) — then runs one headless `claude -p … -r <id>` in the session's current folder and sends it one `set_cwd` request (see `crate::claude_move`); the status line says `moved to <folder>`, or why not. While it runs the row wears `moving…` and refuses `Enter`, `Ctrl-F`, `Ctrl-R`, `Ctrl-X d` and another `Ctrl-X w`. On a multi-member lineage's HEAD row `Enter` first opens a `Move this` / `Move lineage (N)` / `Cancel` confirm, highlighted on `Cancel`, disclosing hidden members as the delete confirm does ([`App::open_move_scope_confirm`]); `Move this` is the move above. `Move lineage (N)` is BEST EFFORT: a member snapback is still replying to or moving is skipped, the rest move one at a time on ONE worker, each through the same steps, the run stops at the first `needs_trust` (the target's verdict, shared by every member), every member wears `moving…` until the last finishes, and ONE sticky tally says how many moved and why the rest did not (see `crate::claude_move::status_for_lineage_move`). On a `↳` row or a lone session `Enter` moves at once |
-//! | `Ctrl-L` (in a compose box) | pick the model — and optionally the effort — for THIS compose only: the `Ctrl-R` reply or the `Ctrl-N` draft it is pressed in (see [`compose::compose_key_to_action`]). The box's `model:` label names what it runs on: a reply's default is `session (<model>)`, the model its session last answered with, which claude normally restores by itself (`default` when an `ANTHROPIC_MODEL` / `ANTHROPIC_DEFAULT_*_MODEL` override, or a transcript with no answering model, means it would not); a draft's is `default (<value>) (new sessions only)` from the user's `claude` settings. `--model` / `--effort` are sent ONLY for a pick other than that default — on the reply, the draft's background launch and the draft's `Ctrl-O` run. The picker's first row returns to the default, `Enter` sets the highlighted row into the compose, `Esc` returns with the text and the previous pick intact. Every new compose starts at its default; nothing is remembered. `Enter`, `Ctrl-F`, Attach and the `Ctrl-X w` move never send a model |
+//! | `Ctrl-X` then `x`/`d`/`h`/`r`/`y`/`f`/`w` | leader chord: hide (from a row that visibly stands for others — a folded `(+N)` head, or an expanded head with `↳` rows beneath it — that row and the members it stands for on screen, so the fold cannot re-head, while members off the board (filtered out by the query, out of scope, already hidden) stay as they are; any other row that session alone: a `↳` row, or a head whose other members are all off the board; un-hiding from such a head exposes every member it stands for, one hidden on its own included — see [`App::toggle_hidden_selected`]) / hard-delete (this row; on a multi-member lineage's HEAD row — the row not drawn `↳` — the confirm also offers its whole fork lineage, never on a `↳` row, and still on a head standing alone, since the confirm counts the lineage and discloses its hidden members; a member whose quick reply, headless fork or move snapback still has in flight is refused, see [`delete::can_delete_target`]) / toggle show-hidden / re-read every transcript from disk / copy session ID (the selected session's full id, to the clipboard; the id also shows on the status line) / fold or expand the selected row's fork lineage (fold an open one, open a folded `(+N)` head, nothing otherwise — see [`App::toggle_selected_lineage`]) / move the selected session to another worktree of the launch project (the parent folder included, its own folder omitted): opens a picker, see the next row; refused, with no picker, while that session's own move, quick reply or headless fork is still in flight (any other key cancels) |
+//! | `Enter` in the move picker | move the session to the chosen worktree; the board stays up. A worker thread re-reads the transcript, refuses a session claude lists as active — and, unlike every other gate, refuses too when claude cannot be asked (`claude agents --json` fails; see `crate::claude_move::liveness_refusal`) — then runs one headless `claude -p … -r <id>` in the session's current folder and sends it one `set_cwd` request (see `crate::claude_move`); the status line says `moved to <folder>`, or why not. While it runs the row wears `moving…` and refuses `Enter`, `Ctrl-F`, `Ctrl-R`, `Ctrl-X d` and another `Ctrl-X w`. On a multi-member lineage's HEAD row `Enter` first opens a `Move this` / `Move lineage (N)` / `Cancel` confirm, highlighted on `Cancel`, disclosing hidden members as the delete confirm does ([`App::open_move_scope_confirm`]); `Move this` is the move above. `Move lineage (N)` is BEST EFFORT: a member snapback is still replying to, forking or moving is skipped, the rest move one at a time on ONE worker, each through the same steps, the run stops at the first `needs_trust` (the target's verdict, shared by every member), every member wears `moving…` until the last finishes, and ONE sticky tally says how many moved and why the rest did not (see `crate::claude_move::status_for_lineage_move`). On a `↳` row or a lone session `Enter` moves at once |
+//! | `Ctrl-L` (in a compose box) | pick the model — and optionally the effort — for THIS compose only: the `Ctrl-R` reply, the `Ctrl-F` fork or the `Ctrl-N` draft it is pressed in (see [`compose::compose_key_to_action`]). The box's `model:` label names what it runs on: a reply's or fork's default is `session (<model>)`, the model its session last answered with, which claude normally restores by itself (`default` when an `ANTHROPIC_MODEL` / `ANTHROPIC_DEFAULT_*_MODEL` override, or a transcript with no answering model, means it would not); a draft's is `default (<value>) (new sessions only)` from the user's `claude` settings. `--model` / `--effort` are sent ONLY for a pick other than that default — on the reply, the fork's `Enter` and `Ctrl-O` run, the draft's background launch and the draft's `Ctrl-O` run. The picker's first row returns to the default, `Enter` sets the highlighted row into the compose, `Esc` returns with the text and the previous pick intact. Every new compose starts at its default; nothing is remembered. `Enter` (resume), the Attach/Fork choice's Fork, Attach and the `Ctrl-X w` move never send a model |
 //! | `Left` / `Right` (in the model picker) | step the highlighted MODEL row's `--effort` down / up through unset → `low` → `medium` → `high` → `xhigh` → `max`, wrapping both ways; `Enter` then sets the model and the effort together into the compose. Inert on the picker's default row (no model, so no effort) and on every other list modal, so the agent picker keeps ignoring them; they never reach the board's search caret underneath |
-//! | `/` or `@` (in a compose box) | open the pick list — the SAME list in the `Ctrl-R` reply and the `Ctrl-N` draft, which differ only in where it reads from (`compose::completion_source`). `/` as the draft's first character lists claude's skills and commands for the target's folder; `@` at the start of a word lists files and folders and, for a top-level `@` token only, agents, picked as `@agent-<name>`; a skill, command or agent carries its description. The list is claude's own, fetched once per folder per board off the UI thread (`compose::take_catalog_fetch`); until it lands `/` lists nothing in either box, while `@` lists files and folders at once, a reply's agents come from its transcript and a draft's wait for the catalog. While the list is open `Up` / `Down` choose, `Enter` / `Tab` pick (a folder reopens the list one level down) and `Esc` closes only the list, never the draft (see [`compose::compose_key_to_action`]) |
+//! | `/` or `@` (in a compose box) | open the pick list — the SAME list in the `Ctrl-R` reply, the `Ctrl-F` fork and the `Ctrl-N` draft, which differ only in where it reads from (`compose::completion_source`). `/` as the draft's first character lists claude's skills and commands for the target's folder; `@` at the start of a word lists files and folders and, for a top-level `@` token only, agents, picked as `@agent-<name>`; a skill, command or agent carries its description. The list is claude's own, fetched once per folder per board off the UI thread (`compose::take_catalog_fetch`); until it lands `/` lists nothing in any box, while `@` lists files and folders at once, a reply's or fork's agents come from its transcript and a draft's wait for the catalog. While the list is open `Up` / `Down` choose, `Enter` / `Tab` pick (a folder reopens the list one level down) and `Esc` closes only the list, never the draft (see [`compose::compose_key_to_action`]) |
 //! | `Shift-Left` / `Shift-Right` | step the pane layout one stop toward a full-width preview / a full-width list, along `0:1 · 1:3 · 1:1 · 3:1 · 1:0` (list:preview; the board starts at `1:1`). A press at either end does nothing. Always — with or without a query, and whatever is marked. The step keeps the reader's place in the preview; leaving `1:0` opens it on the newest turn (see [`App::set_pane_layout`]) |
 //! | `PgUp` / `PgDn` | scroll the preview a page (always) |
 //! | `Ctrl-U` / `Ctrl-D` | scroll the preview a quarter page (always) |
-//! | `Ctrl-T` / `Ctrl-E`, `Home` / `End` | jump the preview to top / bottom (always). Every preview scroll key (these, `PgUp` / `PgDn`, `Ctrl-U` / `Ctrl-D`) also works while a quick reply is open, through the same `App` methods (see [`compose::ComposeAction::PreviewTop`]); there they take the editor's meaning (`Ctrl-U`/`Ctrl-D`/`Ctrl-E`, `Home`/`End`/`PgUp`/`PgDn`) away. A new-session draft keeps them all for its editor |
+//! | `Ctrl-T` / `Ctrl-E`, `Home` / `End` | jump the preview to top / bottom (always). Every preview scroll key (these, `PgUp` / `PgDn`, `Ctrl-U` / `Ctrl-D`) also works while a quick reply or fork box is open, through the same `App` methods (see [`compose::ComposeAction::PreviewTop`]); there they take the editor's meaning (`Ctrl-U`/`Ctrl-D`/`Ctrl-E`, `Home`/`End`/`PgUp`/`PgDn`) away. A new-session draft keeps them all for its editor |
 //! | `Shift-Up` / `Shift-Down` | scroll the preview onto the previous / next MARKED line, but only while the query marks something in the previewed transcript; with nothing marked they fall through to plain selection movement. One stop per marked LINE, not per occurrence — a line saying the query twice is marked, and stopped at, once |
 //! | `Backspace` | delete the query character before the caret |
 //! | `Alt-Backspace` / `Ctrl-W` / `Alt-H` | delete the query ATOM before the caret — one whole search word, not one character, so a path or a branch name goes in a single press; what follows the caret stays. THREE keys because `TextArea::input` word-deletes on all three in the compose box: binding the same SET here is what makes the gesture reach the board at all, whatever the user's option-as-meta setting turns `Alt-Backspace` into. The set matches; the EXTENT deliberately does not — the board cuts at the search atom and the compose box at `CharKind`'s punctuation boundary, so `feature/fold-fork-lineages` goes whole here and loses only `lineages` there |
 //! | printable char | type-to-search (insert at the query's caret) |
 //! | terminal paste | inserted as TEXT — never as keystrokes (see below) |
-//! | mouse: click a folded node's header | unfold the node — a subagent's hand-back (`◆`) or context claude injected (`◇`) — where it sits, and a second click folds it back; a click on a header toggles its node and never opens a link. On the RELEASE, like a link, and ahead of one (see [`click_effect`]). Works while a quick reply is open, like every pointer action over the transcript |
-//! | mouse: click a preview link | open its url in the browser — `http`/`https` only: any other scheme opens nothing and says so on a sticky status line. On the RELEASE, since only then is it known that the press was a click and not the start of a drag (see [`mouse_effect`]). Works while a quick reply is open |
-//! | mouse: drag in the preview | select transcript text in reading order, reverse-videoed — DRAWN text only: each row ends at its last drawn character, never at the pane's edge, and a drag over blank space alone selects nothing, so its release copies nothing. HOLD the drag past the transcript's top or bottom edge and the pane glides that way, a small step every `AUTOSCROLL_FRAME` — faster the further past the edge — so the selection keeps growing into rows that were never on screen until the button comes up (see [`App::autoscroll_preview_selection`]); a plain move while the button is held counts as the release the terminal lost. The release copies the WHOLE selection the way `Ctrl-X y` copies — [`Outcome::Copy`], the clipboard tool first, OSC 52 as the fallback — with a transient status. Never the in-flight reply's tail. A wheel notch, any key or a resize ends it. A drag that starts on a node header or a link selects, and toggles or opens nothing. Off under any overlay and a new-session draft's card, but ON while a quick reply is open (it previews the real transcript; the drag neither moves its caret nor touches its text), and never started on the pinned row or a docked compose zone (see [`press_starts_selection`]) |
-//! | mouse: double-click in the preview | select the WORD under the pointer (Unicode word boundaries, on the drawn row) and copy it on release, exactly as a drag copies. Two presses on the SAME cell within [`DOUBLE_CLICK_INTERVAL`] (see [`is_double_click`]); a blank word selects nothing; a quick third click keeps the word. The FIRST release is a plain click — it toggles a node header or opens a link, as above — and the SECOND copies the word and toggles or opens nothing, so a node header double-clicked is opened once and stays open. Any key, wheel notch or reload resets the count (a fold toggle does not: it is the first click's own effect), and a press that turned into a drag is not a first click. Same gate as a drag ([`press_starts_selection`]), so it too works while a quick reply is open |
+//! | mouse: click a folded node's header | unfold the node — a subagent's hand-back (`◆`) or context claude injected (`◇`) — where it sits, and a second click folds it back; a click on a header toggles its node and never opens a link. On the RELEASE, like a link, and ahead of one (see [`click_effect`]). Works while a quick reply or fork box is open, like every pointer action over the transcript |
+//! | mouse: click a preview link | open its url in the browser — `http`/`https` only: any other scheme opens nothing and says so on a sticky status line. On the RELEASE, since only then is it known that the press was a click and not the start of a drag (see [`mouse_effect`]). Works while a quick reply or fork box is open |
+//! | mouse: drag in the preview | select transcript text in reading order, reverse-videoed — DRAWN text only: each row ends at its last drawn character, never at the pane's edge, and a drag over blank space alone selects nothing, so its release copies nothing. HOLD the drag past the transcript's top or bottom edge and the pane glides that way, a small step every `AUTOSCROLL_FRAME` — faster the further past the edge — so the selection keeps growing into rows that were never on screen until the button comes up (see [`App::autoscroll_preview_selection`]); a plain move while the button is held counts as the release the terminal lost. The release copies the WHOLE selection the way `Ctrl-X y` copies — [`Outcome::Copy`], the clipboard tool first, OSC 52 as the fallback — with a transient status. Never the in-flight reply's tail. A wheel notch, any key or a resize ends it. A drag that starts on a node header or a link selects, and toggles or opens nothing. Off under any overlay and a new-session draft's card, but ON while a quick reply or fork box is open (each previews the real transcript; the drag neither moves its caret nor touches its text), and never started on the pinned row or a docked compose zone (see [`press_starts_selection`]) |
+//! | mouse: double-click in the preview | select the WORD under the pointer (Unicode word boundaries, on the drawn row) and copy it on release, exactly as a drag copies. Two presses on the SAME cell within [`DOUBLE_CLICK_INTERVAL`] (see [`is_double_click`]); a blank word selects nothing; a quick third click keeps the word. The FIRST release is a plain click — it toggles a node header or opens a link, as above — and the SECOND copies the word and toggles or opens nothing, so a node header double-clicked is opened once and stays open. Any key, wheel notch or reload resets the count (a fold toggle does not: it is the first click's own effect), and a press that turned into a drag is not a first click. Same gate as a drag ([`press_starts_selection`]), so it too works while a quick reply or fork box is open |
 //! | `Esc` | clear the search query when one is typed; quit when it is already empty |
 //! | `Ctrl-C` | quit (always) |
 //!
@@ -119,7 +119,8 @@ use crate::store::{preview, SessionStore};
 use crate::watch::{AppEvent, CopyPayload};
 
 use super::app::{
-    screen_at, App, ClickRecord, InterruptRoute, Interrupting, ModalAction, ModalLayout,
+    screen_at, App, ClickRecord, InterruptRoute, Interrupting, KeyboardOwner, ModalAction,
+    ModalLayout,
 };
 use super::{clipboard, compose, view};
 
@@ -144,13 +145,14 @@ pub enum Action {
     /// Move the search query's caret one WORD toward the tail of the line, onto
     /// the start of the next word (`Alt-→` / `Alt-f` / `Ctrl-→`).
     CaretWordForward,
-    /// Resume (or fork-resume) the selected session. The refusal gate and the
-    /// `claude` hand-off are decided in [`apply_action`]; a confirmed plan
-    /// surfaces as [`Outcome::Resume`].
-    Resume {
-        /// Whether to fork the session (`Ctrl-F`) rather than plain resume.
-        fork: bool,
-    },
+    /// Resume the selected session (`Enter`). The refusal gate and the `claude`
+    /// hand-off are decided in [`apply_action`]; a confirmed plan surfaces as
+    /// [`Outcome::Resume`].
+    Resume,
+    /// Open the fork compose box on the selected session (`Ctrl-F`). The folder
+    /// check runs first ([`fork`]); no liveness probe, since claude skips it for a
+    /// fork.
+    Fork,
     /// Start a brand-new `claude` session in the launch directory (`Ctrl-N`).
     /// When defined agents exist, [`apply_action`] opens the agent picker first;
     /// otherwise (or once a pick is confirmed) the launch-dir existence gate and
@@ -380,7 +382,7 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool
 
     if ctrl {
         return match key.code {
-            KeyCode::Char('f') | KeyCode::Char('F') => Action::Resume { fork: true },
+            KeyCode::Char('f') | KeyCode::Char('F') => Action::Fork,
             KeyCode::Char('a') | KeyCode::Char('A') => Action::ToggleScope,
             KeyCode::Char('n') | KeyCode::Char('N') => Action::NewSession,
             KeyCode::Char('r') | KeyCode::Char('R') => Action::Reply,
@@ -467,7 +469,7 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool
         KeyCode::PageDown => Action::PreviewPageDown,
         KeyCode::Home => Action::PreviewTop,
         KeyCode::End => Action::PreviewBottom,
-        KeyCode::Enter => Action::Resume { fork: false },
+        KeyCode::Enter => Action::Resume,
         // `Esc` unwinds one level: a typed query first, the board second.
         // `Ctrl-C` is bound above and always quits.
         KeyCode::Esc if !query_empty => Action::ClearQuery,
@@ -523,7 +525,8 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool
 ///   a press cannot start a selection, toggle a node or open a link while an
 ///   overlay is open or a new-session draft's card replaces the transcript (the
 ///   `App::preview_pointer_blocked` gate, behind [`press_starts_selection`]) — but
-///   it can while a QUICK REPLY is open, which previews the real transcript.
+///   it can while a QUICK REPLY or FORK box is open, each of which previews the
+///   real transcript.
 ///   Nothing else: the pane widths belong to the keyboard (`Shift-Left` /
 ///   `Shift-Right`).
 /// * `Input(Resize)` -> clear the preview's mouse selection (a new width re-wraps
@@ -556,7 +559,9 @@ pub fn handle_event(app: &mut App, event: AppEvent, store: &mut SessionStore) ->
         // The compose surface is bounded by the board session, and the IN-FLIGHT
         // draft card is why that has to be enforced here rather than left to each
         // route. It is the one part of the surface that outlives its editor, so
-        // `Ctrl-F` / `Enter` on a row stay routable underneath it — and the
+        // `Enter` on a row (and the choice it may open) and the agent picker's
+        // `Ctrl-O` stay routable underneath it — a compose box, the `Ctrl-F` fork
+        // box included, replaces the card as it opens — and the
         // `BgLaunchFinished` that would have closed it cannot survive the hand-off:
         // `tui::run_inner` builds a fresh `EventLoop` per board session and drops
         // the old receiver, while `lib::run` re-enters the board on the SAME `App`.
@@ -593,46 +598,44 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
             // (which redraw constantly) deliberately do NOT clear, so a finished
             // selection stays highlighted until the user acts.
             app.clear_preview_selection();
-            // While a modal overlay (the running-session choice, the new-session
-            // agent picker, a compose's model picker, the move picker, or the
-            // hard-delete confirm) is open it OWNS the keyboard: keys
-            // navigate/confirm/cancel the modal, never the board.
-            if app.modal.is_some() {
-                return handle_modal_key(app, key, store);
+            // No wildcard arm: a new `KeyboardOwner` fails to compile here until it
+            // is routed.
+            match app.keyboard_owner() {
+                // While a modal overlay (the running-session choice, the new-session
+                // agent picker, a compose's model picker, the move picker, or the
+                // hard-delete confirm) is open it OWNS the keyboard: keys
+                // navigate/confirm/cancel the modal, never the board.
+                Some(KeyboardOwner::Modal) => handle_modal_key(app, key, store),
+                // A pending `Ctrl-X` leader chord OWNS the next key too: route it
+                // through the chord machine BEFORE normal handling so a printable
+                // follow-up (`x`/`d`/`h`/`r`/`y`/`f`/`w`) completes the chord instead
+                // of leaking into the query.
+                Some(KeyboardOwner::Chord) => handle_chord_key(app, key, store),
+                // The "stop the waiting agent?" confirmation owns the keyboard until
+                // it resolves into compose (Enter) or is dismissed (Esc).
+                Some(KeyboardOwner::StopConfirm) => handle_stop_confirm_key(app, key),
+                // The "stop this agent?" interrupt confirmation likewise owns the
+                // keyboard until it resolves into a stop (Enter) or is dismissed (Esc).
+                Some(KeyboardOwner::InterruptConfirm) => handle_interrupt_confirm_key(app, key),
+                // The compose zone — a quick reply, a `Ctrl-F` fork box or a `Ctrl-N`
+                // draft — owns the keyboard while open: every key routes to the
+                // compose handler, bypassing `key_to_action` entirely — mirroring the
+                // two overlays above. While any compose box's `/` / `@` pick list is
+                // showing, Enter/Tab pick, Up/Down move the highlight and Esc closes
+                // only the list; with no list, Enter submits (a reply sends, a fork
+                // forks, a draft launches), Ctrl-J/Alt+Enter add a newline, Esc
+                // cancels and the rest edit the buffer (`compose_key_to_action`).
+                Some(KeyboardOwner::Compose) => compose::handle_compose_key(app, key),
+                None => {
+                    // A transient status (e.g. a resume refusal) lives exactly until
+                    // the next key; clear it first so this keypress may set a fresh
+                    // one.
+                    app.clear_status();
+                    let action =
+                        key_to_action(key, app.query_input.is_empty(), app.has_preview_matches());
+                    apply_action(app, action)
+                }
             }
-            // A pending `Ctrl-X` leader chord OWNS the next key too: route it through
-            // the chord machine BEFORE normal handling so a printable follow-up
-            // (`x`/`d`/`h`/`r`/`y`/`f`/`w`) completes the chord instead of leaking into
-            // the query.
-            if app.pending_chord {
-                return handle_chord_key(app, key, store);
-            }
-            // The "stop the waiting agent?" confirmation owns the keyboard until it
-            // resolves into compose (Enter) or is dismissed (Esc).
-            if app.pending_stop.is_some() {
-                return handle_stop_confirm_key(app, key);
-            }
-            // The "stop this agent?" interrupt confirmation likewise owns the keyboard
-            // until it resolves into a stop (Enter) or is dismissed (Esc).
-            if app.pending_interrupt.is_some() {
-                return handle_interrupt_confirm_key(app, key);
-            }
-            // The compose zone — a quick reply or a `Ctrl-N` draft — owns the
-            // keyboard while open: every key routes to the compose handler,
-            // bypassing `key_to_action` entirely — mirroring the two overlays
-            // above. While either draft's `/` / `@` pick list is showing, Enter/Tab
-            // pick, Up/Down move the highlight and Esc closes only the list; with
-            // no list, Enter submits (a reply sends, a draft launches),
-            // Ctrl-J/Alt+Enter add a newline, Esc cancels and the rest edit the
-            // buffer (`compose_key_to_action`).
-            if app.is_composing() {
-                return compose::handle_compose_key(app, key);
-            }
-            // A transient status (e.g. a resume refusal) lives exactly until the
-            // next key; clear it first so this keypress may set a fresh one.
-            app.clear_status();
-            let action = key_to_action(key, app.query_input.is_empty(), app.has_preview_matches());
-            apply_action(app, action)
         }
         // Mouse wheel scroll, preview fold-node toggles, preview link clicks and
         // preview drag-selection. A dedicated arm BEFORE the input catch-all and
@@ -640,9 +643,9 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
         // handler — a wheel just scrolls a pane and never crashes in any mode
         // (query active, modal open, ...), and a press neither toggles a node, opens
         // a link nor starts a selection while an overlay is up
-        // (`App::preview_pointer_blocked` gates it; an open QUICK REPLY does not, since
-        // none of the three touches what the reply holds). A finished drag answers
-        // `Outcome::Copy`, the same copy request `Ctrl-X y` makes.
+        // (`App::preview_pointer_blocked` gates it; an open QUICK REPLY or FORK box
+        // does not, since none of the three touches what the box holds). A finished
+        // drag answers `Outcome::Copy`, the same copy request `Ctrl-X y` makes.
         AppEvent::Input(Event::Mouse(mouse)) => handle_mouse(app, mouse),
         // A terminal PASTE (bracketed paste, enabled in `tui::init_terminal`). A
         // dedicated arm BEFORE the input catch-all that used to swallow it, and
@@ -720,6 +723,8 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
             if success {
                 app.set_status_transient(status);
             } else {
+                // A failed fork may never reach the store; its cursor jump is void.
+                app.forget_fork_jump(&session_id);
                 app.set_status(status);
             }
             // If the finished send targets the row on screen, re-anchor the
@@ -1009,9 +1014,10 @@ fn flatten_for_query(text: &str) -> String {
 
 /// Route one terminal paste (bracketed paste, enabled in [`crate::tui::init_terminal`]).
 ///
-/// The paste arm mirrors the KEY arm's precedence exactly, because the reason the
-/// key arm has that order applies unchanged: a surface that owns the keyboard must
-/// not have text land on the surface behind it. All six owners, in order:
+/// The paste arm routes by the KEY arm's [`App::keyboard_owner`], because the
+/// reason the key arm has that order applies unchanged: a surface that owns the
+/// keyboard must not have text land on the surface behind it. All six owners, in
+/// order:
 ///
 /// 1. **Modal** ([`handle_modal_key`]) — IGNORED. A modal is a fixed choice
 ///    (Attach/Fork/Cancel, the agent, model or move picker, the delete confirm);
@@ -1037,21 +1043,24 @@ fn flatten_for_query(text: &str) -> String {
 /// [`Outcome::Resume`] or any other board-ending outcome, and that is structural
 /// here rather than a promise: no branch reaches a submit path.
 fn handle_paste(app: &mut App, raw: &str) {
-    // Owners 1-4: swallow. Same order, same reasons, as the key arm in `dispatch`.
-    if app.modal.is_some()
-        || app.pending_chord
-        || app.pending_stop.is_some()
-        || app.pending_interrupt.is_some()
-    {
-        return;
-    }
+    // The owner the key arm in `dispatch` would route to. Owners 1-4: swallow.
+    let to_compose = match app.keyboard_owner() {
+        Some(
+            KeyboardOwner::Modal
+            | KeyboardOwner::Chord
+            | KeyboardOwner::StopConfirm
+            | KeyboardOwner::InterruptConfirm,
+        ) => return,
+        Some(KeyboardOwner::Compose) => true,
+        None => false,
+    };
 
     let accepted = accept_paste(raw);
     if accepted.text.is_empty() {
         return;
     }
 
-    if app.is_composing() {
+    if to_compose {
         // Owner 5: the draft takes it verbatim, newlines and all.
         compose::insert_paste(app, &accepted.text);
     } else {
@@ -1338,8 +1347,8 @@ fn is_double_click(previous: Option<ClickRecord>, pos: Position, now: Instant) -
 /// - nothing blocks the pointer ([`App::preview_pointer_blocked`]) — an overlay, a
 ///   pending confirmation or chord, or the new-session draft CARD (editor or in
 ///   flight), so no selection starts under a draft card and no node toggles or
-///   link opens from a transcript the card hides. An open QUICK-REPLY editor is
-///   not one: it previews the real transcript above its own docked box;
+///   link opens from a transcript the card hides. An open QUICK-REPLY or FORK
+///   editor is not one: it previews the real transcript above its own docked box;
 /// - a session is selected, so the "No session selected." placeholder is never
 ///   selectable text;
 /// - `pos` is inside the preview's TRANSCRIPT rect,
@@ -1642,10 +1651,10 @@ fn apply_action(app: &mut App, action: Action) -> Outcome {
             app.move_query_caret_by_word(true);
             Outcome::Continue
         }
-        Action::Resume { fork } => {
+        Action::Resume => {
             // Smart Enter: `claude -r` REFUSES to plain-resume a LIVE session, so
             // Enter (not Ctrl-F) on a running row opens the Attach/Fork/Cancel
-            // choice instead. Ctrl-F fork stays a direct hand-off for ANY session.
+            // choice instead.
             //
             // The gate asks CLAUDE, one-shot, right here — it must NOT read the
             // polled `--all` map. That map is up to ~5.26s stale while the board
@@ -1671,33 +1680,39 @@ fn apply_action(app: &mut App, action: Action) -> Outcome {
             //   deliberate hitch, accepted because the alternative is handing the
             //   user claude's refusal instead of the Attach/Fork choice.
             //
-            // FIRST, before that probe: snapback's own `Ctrl-X w` move of this
-            // row may still be renaming its transcript into another folder, so
-            // neither a resume nor a fork may read it yet (asked of THIS row only).
+            // FIRST, before that probe, snapback's own two writers, each asked of
+            // THIS row only, so no probe is spent and no choice opens on either:
+            // its `claude -p` child (a quick reply to this row, or the headless
+            // fork creating it — recorded under the FORK's id, so the origin it
+            // only reads is never refused for it), then its `Ctrl-X w` move,
+            // which may still be renaming the transcript into another folder
+            // (`Ctrl-F` asks only the move, in [`fork`]).
+            //
+            // Clone the id so the `&Session` borrow ends before the probe and
+            // `open_live_choice` touch `app`.
             if let Some(id) = app.selected_session().map(|s| s.session_id.clone()) {
+                if let Some(refusal) = send::resume_in_flight_refusal(app.sending_to(&id).is_some())
+                {
+                    app.set_status(refusal);
+                    return Outcome::Continue;
+                }
                 if app.moving_on(&id) {
                     app.set_status(claude_move::MOVING_RESUME_REFUSAL.to_string());
                     return Outcome::Continue;
                 }
-            }
-            if !fork {
-                // Clone the id so the `&Session` borrow ends before the probe and
-                // `open_live_choice` touch `app`.
-                if let Some(id) = app.selected_session().map(|s| s.session_id.clone()) {
-                    if app.is_live_now(&id) {
-                        app.open_live_choice(id);
-                        return Outcome::Continue;
-                    }
+                if app.is_live_now(&id) {
+                    app.open_live_choice(id);
+                    return Outcome::Continue;
                 }
             }
-            // Non-live (or Ctrl-F): run the refusal gate while the terminal is
+            // Non-live: run the refusal gate while the terminal is
             // still up — a deleted worktree / unreadable file becomes a transient
             // board status rather than a teardown/re-init flash. Only a confirmed
             // `Ready` plan escalates to `Outcome::Resume`. The `map` drops the
             // `&Session` borrow before we mutably touch `app` for `set_status`.
-            // No model is threaded in: `resume::check` takes none, so a resume and
-            // a fork keep the session's own model, which claude normally restores.
-            let checked = app.selected_session().map(|s| resume::check(s, fork));
+            // No model is threaded in: `resume::check` takes none, so a resume keeps
+            // the session's own model, which claude normally restores.
+            let checked = app.selected_session().map(|s| resume::check(s, false));
             match checked {
                 Some(Ok(ready)) => Outcome::Resume(ready),
                 Some(Err(err)) => {
@@ -1707,6 +1722,7 @@ fn apply_action(app: &mut App, action: Action) -> Outcome {
                 None => Outcome::Continue,
             }
         }
+        Action::Fork => fork(app),
         Action::NewSession => new_session(app),
         Action::Reply => reply(app),
         Action::Interrupt => interrupt(app),
@@ -2227,7 +2243,8 @@ enum Handoff {
     /// `claude attach <job-id>` — reattach to the running agent in this
     /// terminal, keyed on its short agent-view id (resolved in [`route_handoff`]).
     Attach,
-    /// `claude -r <id> --fork-session` — branch off a copy.
+    /// `claude -r <id> --fork-session --name "fork: <label>"` — branch off a named
+    /// copy.
     Fork,
 }
 
@@ -2525,7 +2542,9 @@ fn route_handoff(app: &mut App, session_id: &str, kind: Handoff) -> Outcome {
         }
         // Neither carries a model: `check` and `check_attach` take none (see
         // `HandoffCtx::model`), so a fork normally keeps the session's own model
-        // and an attach joins a process already running under one.
+        // and an attach joins a process already running under one. The fork is
+        // named after the session's label, exactly as an untouched fork box's
+        // `Ctrl-O` names it (`resume::build_fork_argv`).
         Handoff::Fork => app
             .session_by_id(session_id)
             .map(|s| resume::check(s, true)),
@@ -2559,6 +2578,36 @@ fn new_session(app: &mut App) -> Outcome {
         return Outcome::Continue;
     }
     app.open_agent_picker(agents);
+    Outcome::Continue
+}
+
+/// Handle `Ctrl-F`: open the fork compose box on the SELECTED session.
+///
+/// Runs the folder check a fork has always run ([`resume::check`] with `fork`) BEFORE
+/// the box opens, so a deleted worktree is refused on the board and nothing typed is
+/// thrown away. Its `Ready` is dropped: the fork is launched by the box (`Enter`
+/// sends headless, `Ctrl-O` hands off), each re-reading the file at that moment.
+/// There is no liveness probe and no reply-in-flight refusal, because claude skips
+/// the live-session refusal for a fork and a fork writes a NEW transcript. The one
+/// writer it does refuse, FIRST and in `Enter`'s words, is snapback's own `Ctrl-X w`
+/// move of this row ([`App::moving_on`]): that child is renaming the very
+/// transcript the fork would copy, so no box opens on it.
+fn fork(app: &mut App) -> Outcome {
+    let Some(session) = app.selected_session() else {
+        return Outcome::Continue;
+    };
+    let id = session.session_id.clone();
+    let refusal = if app.moving_on(&id) {
+        Some(claude_move::MOVING_RESUME_REFUSAL.to_string())
+    } else {
+        resume::check(session, true)
+            .err()
+            .map(|err| err.message().to_string())
+    };
+    match refusal {
+        None => compose::open_fork(app, id),
+        Some(message) => app.set_status(message),
+    }
     Outcome::Continue
 }
 
@@ -2847,6 +2896,33 @@ pub(super) fn launch_new_session(
     }
 }
 
+/// Run the fork gate for the session `id` while the terminal is still up and
+/// escalate a confirmed plan to [`Outcome::Resume`]: the fork box's `Ctrl-O`. The
+/// gate re-reads the original's authoritative `(cwd, session_id)` from its file
+/// ([`resume::check_fork_run`]); a gone session or a deleted folder sets a board
+/// status instead. `message` and `model` are the box's own, `None` when untouched.
+pub(super) fn launch_fork_run(
+    app: &mut App,
+    id: &str,
+    message: Option<&str>,
+    model: Option<&resume::ModelPick>,
+) -> Outcome {
+    let checked = app
+        .session_by_id(id)
+        .map(|s| resume::check_fork_run(s, model, message));
+    match checked {
+        Some(Ok(ready)) => Outcome::Resume(ready),
+        Some(Err(err)) => {
+            app.set_status(err.message().to_string());
+            Outcome::Continue
+        }
+        None => {
+            app.set_status(compose::COMPOSE_FORK_SESSION_GONE);
+            Outcome::Continue
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2932,6 +3008,7 @@ mod tests {
             has_agent_name: false,
             has_agent_setting: false,
             failed_task: None,
+            custom_title: None,
         }
     }
 
@@ -3191,6 +3268,7 @@ mod tests {
             has_agent_name: false,
             has_agent_setting: false,
             failed_task: None,
+            custom_title: None,
         }
     }
 
@@ -4056,7 +4134,7 @@ mod tests {
     }
 
     /// The SAME regression on the OTHER submit-capable box, which has the LARGER
-    /// blast radius: `compose::compose_key_to_action` is shared by both targets and
+    /// blast radius: `compose::compose_key_to_action` is shared by every target and
     /// maps a bare `Enter` to Send, and `submit_compose` routes a background draft
     /// to [`Outcome::BgLaunch`] — so a clipboard drop arriving as keystrokes did not
     /// merely truncate a reply, it STARTED a background agent on line one and threw
@@ -4472,7 +4550,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // --- the compose `/` and `@` pick list (both drafts) ---------------------
+    // --- the compose `/` and `@` pick list (every compose box) ---------------
 
     /// A reply box open on a real session ([`completion_app_with`] with no extra
     /// record) once claude's catalog for its folder has landed, listing `skills` as
@@ -5098,6 +5176,67 @@ mod tests {
         );
     }
 
+    /// While a quick reply is in flight, `Enter` on that reply's OWN row is refused
+    /// before the resume gate's probe: no probe is spent, no Attach/Fork/Cancel
+    /// choice opens and nothing is handed off, so no second `claude` opens on a
+    /// transcript snapback's child is still writing. The refusal is sticky. Another
+    /// row resumes as usual, its gate spending its probe.
+    #[test]
+    fn enter_refuses_only_the_session_whose_reply_is_in_flight() {
+        let dir = unique_temp_dir("enter-reply-in-flight");
+        let first = resumable_session_in(&dir, IN_FLIGHT_FIRST, "the first session");
+        let second = resumable_session_in(&dir, IN_FLIGHT_SECOND, "the second session");
+        let mut app = App::new(vec![first, second], Scope::All, dir.clone());
+        let probes = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let counter = std::rc::Rc::clone(&probes);
+        app.set_live_probe(move || {
+            counter.set(counter.get() + 1);
+            HashMap::new() // claude holds nothing: only the in-flight reply refuses
+        });
+        app.sending = vec![replying_to(IN_FLIGHT_FIRST)];
+        assert_eq!(app.selected.as_deref(), Some(IN_FLIGHT_FIRST));
+
+        let outcome = press(&mut app, KeyCode::Enter);
+        assert!(
+            matches!(outcome, Outcome::Continue),
+            "first: a refusal hands nothing off"
+        );
+        assert!(app.modal.is_none(), "first: no choice opens");
+        assert_eq!(
+            probes.get(),
+            0,
+            "first: the refusal comes before the probe, so none is spent"
+        );
+        let status = app
+            .status
+            .clone()
+            .expect("the refusal is on the status line");
+        assert_eq!(status, send::RESUME_SENDING_REFUSAL);
+        for _ in 0..=STATUS_DWELL_TICKS {
+            handle_event(&mut app, AppEvent::Tick, &mut store_at(Path::new("/tmp")));
+        }
+        assert_eq!(
+            app.status.as_deref(),
+            Some(status.as_str()),
+            "first: a refusal is sticky, so it must outlive the dwell"
+        );
+
+        // Another row: `first`'s reply in flight is none of its business.
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.selected.as_deref(), Some(IN_FLIGHT_SECOND));
+        let outcome = press(&mut app, KeyCode::Enter);
+        let _ = std::fs::remove_dir_all(&dir);
+        match outcome {
+            Outcome::Resume(ready) => assert!(
+                ready.argv.iter().any(|arg| arg == IN_FLIGHT_SECOND),
+                "second: resumes its own session: {:?}",
+                ready.argv
+            ),
+            _ => panic!("second: another session's reply in flight must not refuse this one"),
+        }
+        assert_eq!(probes.get(), 1, "second: its gate asked claude as usual");
+    }
+
     /// The first row of [`a_reply_in_flight_then_a_second_attempt`]'s board: the
     /// session whose reply is still in flight.
     const IN_FLIGHT_FIRST: &str = "sess-inflight-a";
@@ -5478,8 +5617,9 @@ mod tests {
     }
 
     /// Task 10.5, the review's MAJOR finding pinned end to end: a quick reply is
-    /// dispatched, then a hand-off (`Enter`) ends that board session while the
-    /// reply is still running, and the reply finishes with no board up to read it.
+    /// dispatched, then a hand-off (`Enter` on the OTHER row, since the reply's own
+    /// row refuses it) ends that board session while the reply is still running,
+    /// and the reply finishes with no board up to read it.
     ///
     /// Until the next board's tick its entry must still stand, and with it the
     /// hard-delete guard, because nothing has been delivered yet. Clearing it early
@@ -5505,7 +5645,9 @@ mod tests {
         type_into_draft(&mut app, "first");
         let dispatched = press(&mut app, KeyCode::Enter);
 
-        // 2. A hand-off ends this board session. The `Resume` is held, never launched.
+        // 2. A hand-off from the other row ends this board session. The `Resume` is
+        //    held, never launched.
+        press(&mut app, KeyCode::Down);
         let handoff = press(&mut app, KeyCode::Enter);
 
         // 3. The reply finishes with no board up: its send finds the receiver gone.
@@ -5520,9 +5662,11 @@ mod tests {
             app.moving_on(IN_FLIGHT_FIRST),
         );
 
-        // 5. The next board's tick, then `Ctrl-R` on the same row.
+        // 5. The next board's tick, then `Ctrl-R` back on the reply's row.
         tick(&mut app);
         let in_flight_after = !app.sending.is_empty();
+        press(&mut app, KeyCode::Up);
+        let selected_at_reopen = app.selected.clone();
         let reopened = press_ctrl(&mut app, KeyCode::Char('r'));
         let composing = app.is_composing();
         let status = app.status.clone();
@@ -5553,6 +5697,11 @@ mod tests {
         assert!(
             !in_flight_after,
             "the next board's tick settles the reply that finished across the hand-off"
+        );
+        assert_eq!(
+            selected_at_reopen.as_deref(),
+            Some(IN_FLIGHT_FIRST),
+            "precondition: Ctrl-R is pressed on the reply's own row"
         );
         assert!(
             matches!(reopened, Outcome::Continue) && composing,
@@ -5873,6 +6022,7 @@ mod tests {
             has_agent_name: false,
             has_agent_setting: false,
             failed_task: None,
+            custom_title: None,
         }
     }
 
@@ -8251,6 +8401,7 @@ mod tests {
             has_agent_name: false,
             has_agent_setting: false,
             failed_task: None,
+            custom_title: None,
         }
     }
 
@@ -8644,9 +8795,73 @@ mod tests {
         };
         assert_eq!(
             ready.argv.join(" "),
-            "claude -r sess-fork --fork-session",
+            "claude -r sess-fork --fork-session --name fork: label sess-fork",
             "Fork has no liveness question to ask, so it must never be gated on one"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The running-session choice's Fork, through the real key routing, spawns what
+    /// an untouched `Ctrl-F` box's `Ctrl-O` spawns — the same `--name` from the same
+    /// label, one the naming rule must clean and cap here — fails in the fork's own
+    /// words with no race probe, and carries no model even straight after a pick
+    /// was confirmed in a fork box.
+    #[test]
+    fn the_choice_fork_hands_off_the_untouched_fork_boxs_argv_and_hint() {
+        let dir = unique_temp_dir("choice-fork-named");
+        let mut session = resumable_session(&dir, "sbc-fork");
+        session.label = format!("\t{} tail", "w".repeat(resume::FORK_NAME_MAX_CHARS));
+        let mut app = App::new(vec![session], Scope::All, PathBuf::from("/tmp"));
+        seed_live(&mut app, &[]);
+
+        // The reference: an untouched fork box's interactive run.
+        press_ctrl(&mut app, KeyCode::Char('f'));
+        let Outcome::Resume(boxed) = press_ctrl(&mut app, KeyCode::Char('o')) else {
+            panic!(
+                "an untouched fork box's Ctrl-O must hand off: {:?}",
+                app.status
+            );
+        };
+
+        // A fork box with a CONFIRMED pick, then abandoned.
+        press_ctrl(&mut app, KeyCode::Char('f'));
+        press_ctrl(&mut app, KeyCode::Char('l'));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            app.compose.as_ref().is_some_and(|c| c.model.is_some()),
+            "fixture: the fork box holds a pick"
+        );
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.is_composing());
+
+        app.open_live_choice("sbc-fork".to_string());
+        press(&mut app, KeyCode::Right); // -> Fork
+        assert_eq!(
+            app.modal.as_ref().unwrap().selected_action(),
+            Some(&ModalAction::Fork)
+        );
+        let Outcome::Resume(chosen) = press(&mut app, KeyCode::Enter) else {
+            panic!("the choice's Fork must hand off: {:?}", app.status);
+        };
+
+        assert_eq!(chosen.argv, boxed.argv);
+        assert_eq!(
+            chosen.argv.last().cloned(),
+            Some(format!("fork: {}", "w".repeat(resume::FORK_NAME_MAX_CHARS)))
+        );
+        assert!(
+            !chosen
+                .argv
+                .iter()
+                .any(|arg| arg == "--model" || arg == "--effort"),
+            "{:?}",
+            chosen.argv
+        );
+        assert_eq!(chosen.nonzero_hint, resume::FORK_NONZERO_HINT);
+        assert_eq!(chosen.race_probe_id, None);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -8661,9 +8876,10 @@ mod tests {
         assert!(app.modal.is_none(), "Esc dismisses the overlay");
     }
 
-    /// Ctrl-F fork stays a direct hand-off for a LIVE session (no overlay).
+    /// Ctrl-F on a LIVE session opens no Attach/Fork/Cancel overlay (the fork box
+    /// needs no liveness check).
     #[test]
-    fn ctrl_f_forks_a_live_session_directly_without_the_overlay() {
+    fn ctrl_f_on_a_live_session_opens_no_overlay() {
         let mut app = app_with("live-1", Some("background"));
         let out = handle_event(
             &mut app,
@@ -9342,11 +9558,11 @@ mod tests {
     fn enter_resumes_and_ctrl_f_forks() {
         assert_eq!(
             key_to_action(key(KeyCode::Enter), true, false),
-            Action::Resume { fork: false }
+            Action::Resume
         );
         assert_eq!(
             key_to_action(ctrl(KeyCode::Char('f')), false, false),
-            Action::Resume { fork: true }
+            Action::Fork
         );
     }
 
@@ -10622,53 +10838,92 @@ mod tests {
 
     /// An in-flight card must not outlive the board session that dispatched it.
     ///
-    /// The editor closes at dispatch, so `Ctrl-F` / `Enter` on a row stay routable
-    /// while the card is up — and both hand the terminal over. The completion event
-    /// that would have ended the card cannot survive that: `run_inner` builds a new
-    /// `EventLoop` per board session and drops the old receiver, so the launch
-    /// reports back into a channel nobody is reading and the SAME `App` re-enters
-    /// the board still holding the card. That strands the preview on a placeholder
-    /// for every session, with `preview_pointer_blocked` stuck true (dead link clicks, dead
-    /// fold toggles, dead drag-selections), recoverable only by opening and
-    /// cancelling another compose.
+    /// The editor closes at dispatch, so `Enter` on a row stays routable while the
+    /// card is up, and it hands the terminal over. (A compose box, the `Ctrl-F` fork
+    /// box included, replaces the card as it opens instead — see
+    /// [`opening_the_fork_box_over_an_in_flight_card_ends_the_card`].) The completion
+    /// event that would have ended the card cannot survive the hand-off:
+    /// `run_inner` builds a new `EventLoop` per board session and drops the old
+    /// receiver, so the launch reports back into a channel nobody is reading and the
+    /// SAME `App` re-enters the board still holding the card. That strands the
+    /// preview on a placeholder for every session, with `preview_pointer_blocked`
+    /// stuck true (dead link clicks, dead fold toggles, dead drag-selections),
+    /// recoverable only by opening and cancelling another compose.
     /// Every hand-off therefore ends the card with the board session it belonged to.
     #[test]
     fn handing_off_while_a_launch_is_in_flight_leaves_no_stranded_card() {
         let dir = unique_temp_dir("stranded-card");
-        for fork in [true, false] {
-            let mut app = App::new(
-                vec![resumable_session(&dir, "sess-handoff")],
-                Scope::All,
-                PathBuf::from("/tmp"),
-            );
-            seed_live(&mut app, &[]);
-            app.open_agent_picker(vec![def_agent("planner")]);
-            press(&mut app, KeyCode::Enter);
-            type_into_draft(&mut app, "ship the thing");
-            assert!(
-                matches!(press(&mut app, KeyCode::Enter), Outcome::BgLaunch(_)),
-                "the draft must dispatch for the card to be in flight"
-            );
-            assert!(app.draft.is_some(), "the dispatched card is up");
+        let mut app = App::new(
+            vec![resumable_session(&dir, "sess-handoff")],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
+        seed_live(&mut app, &[]);
+        app.open_agent_picker(vec![def_agent("planner")]);
+        press(&mut app, KeyCode::Enter);
+        type_into_draft(&mut app, "ship the thing");
+        assert!(
+            matches!(press(&mut app, KeyCode::Enter), Outcome::BgLaunch(_)),
+            "the draft must dispatch for the card to be in flight"
+        );
+        assert!(app.draft.is_some(), "the dispatched card is up");
 
-            let out = if fork {
-                press_ctrl(&mut app, KeyCode::Char('f'))
-            } else {
-                press(&mut app, KeyCode::Enter)
-            };
-            assert!(
-                matches!(out, Outcome::Resume(_)),
-                "the row must really hand off, or this proves nothing (fork={fork})"
-            );
-            assert!(
-                app.draft.is_none(),
-                "the in-flight card must not survive the hand-off (fork={fork})"
-            );
-            assert!(
-                !app.preview_pointer_blocked(),
-                "a stranded card leaves the mouse gated forever (fork={fork})"
-            );
-        }
+        let out = press(&mut app, KeyCode::Enter);
+        assert!(
+            matches!(out, Outcome::Resume(_)),
+            "the row must really hand off, or this proves nothing"
+        );
+        assert!(
+            app.draft.is_none(),
+            "the in-flight card must not survive the hand-off"
+        );
+        assert!(
+            !app.preview_pointer_blocked(),
+            "a stranded card leaves the mouse gated forever"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `Ctrl-F` over an in-flight card ENDS the card as the fork box opens: the box
+    /// previews the real transcript it forks, so a placeholder left under it would
+    /// hide that transcript and keep the mouse gated while the user types.
+    #[test]
+    fn opening_the_fork_box_over_an_in_flight_card_ends_the_card() {
+        let dir = unique_temp_dir("fork-over-card");
+        let mut app = App::new(
+            vec![resumable_session(&dir, "sess-fork-card")],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
+        app.open_agent_picker(vec![def_agent("planner")]);
+        press(&mut app, KeyCode::Enter);
+        type_into_draft(&mut app, "ship the thing");
+        assert!(
+            matches!(press(&mut app, KeyCode::Enter), Outcome::BgLaunch(_)),
+            "the draft must dispatch for the card to be in flight"
+        );
+        assert!(app.draft.is_some(), "the dispatched card is up");
+
+        let out = press_ctrl(&mut app, KeyCode::Char('f'));
+        assert!(
+            matches!(out, Outcome::Continue),
+            "opening a box keeps the board session, so the hand-off seam never runs"
+        );
+        assert_eq!(
+            app.compose.as_ref().map(|c| &c.target),
+            Some(&ComposeTarget::Fork {
+                session_id: "sess-fork-card".to_string()
+            }),
+            "the fork box must really open, or this proves nothing"
+        );
+        assert!(
+            app.draft.is_none(),
+            "the fork box shows the session it forks, not the launch's card"
+        );
+        assert!(
+            !app.preview_pointer_blocked(),
+            "a card left under the fork box keeps the mouse gated"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -11654,6 +11909,7 @@ mod tests {
             has_agent_name: false,
             has_agent_setting: false,
             failed_task: None,
+            custom_title: None,
         }
     }
 
@@ -13661,6 +13917,294 @@ mod tests {
         assert!(app.query().is_empty(), "no key leaked into the query");
     }
 
+    /// The ids of a parent and the two forks the `Ctrl-F` box named from it, in
+    /// [`named_fork_board`].
+    const NAMED_FORK_IDS: [&str; 3] = ["nf-parent", "nf-fork-a", "nf-fork-b"];
+
+    /// The session rows `app` draws, as `(id, (+N) count, drawn ↳)`, in display
+    /// order; group rows are skipped.
+    fn drawn_session_rows(app: &App) -> Vec<(&str, usize, bool)> {
+        app.rows()
+            .into_iter()
+            .filter_map(|row| match row {
+                crate::tui::app::Row::Session {
+                    index,
+                    hidden,
+                    child,
+                } => Some((app.sessions[index].session_id.as_str(), hidden, child)),
+                crate::tui::app::Row::Group { .. } => None,
+            })
+            .collect()
+    }
+
+    /// [`lineage_move_board`]'s shape over a PARENT and two forks the `Ctrl-F` box
+    /// made from it: the unnamed `nf-parent` (the oldest) and `nf-fork-a` /
+    /// `nf-fork-b`, named `fork: …` and each newer than the parent, one root uuid.
+    /// `hidden` members start soft-hidden. Folded, the parent heads its forks
+    /// although both are newer (`lineage::head_of`), so its row is the one selected.
+    /// Returns the app, `main`, `wt` and the members in the order a lineage choice
+    /// carries them (the store's).
+    fn named_fork_board(tag: &str, hidden: &[&str]) -> (App, PathBuf, PathBuf, Vec<String>) {
+        let main = resolve_dir(&unique_temp_dir(&format!("{tag}-main")));
+        let wt = resolve_dir(&unique_temp_dir(&format!("{tag}-wt")));
+        let sessions: Vec<Session> = NAMED_FORK_IDS
+            .into_iter()
+            .zip([
+                (100, None),
+                (200, Some("fork: try a")),
+                (300, Some("fork: try b")),
+            ])
+            .map(|(id, (unix_secs, name))| {
+                let mut s = resumable_session(&main, id);
+                s.root_uuid = Some(format!("{tag}-root"));
+                s.timestamp = Some(
+                    time::OffsetDateTime::from_unix_timestamp(unix_secs)
+                        .expect("a valid timestamp"),
+                );
+                s.custom_title = name.map(str::to_string);
+                s
+            })
+            .collect();
+        let mut app = App::new(sessions.clone(), Scope::Project, main.clone());
+        let set = WorktreeSet::from_resolved([main.clone(), wt.clone()], None);
+        app.set_worktree_probe(move |_| set.clone());
+        // `App::new` loads the persisted hidden set: start from exactly `hidden`,
+        // then re-filter through the public reload path.
+        app.hidden_ids.clear();
+        app.hidden_ids
+            .extend(hidden.iter().map(|id| (*id).to_string()));
+        app.apply_sessions(sessions);
+        seed_live(&mut app, &[]);
+        assert_eq!(
+            drawn_session_rows(&app),
+            vec![("nf-parent", NAMED_FORK_IDS.len() - 1 - hidden.len(), false)],
+            "premise: the parent heads its named forks, folded"
+        );
+        assert_eq!(app.selected.as_deref(), Some("nf-parent"), "premise");
+        let members = app.sessions.iter().map(|s| s.session_id.clone()).collect();
+        (app, main, wt, members)
+    }
+
+    /// `Ctrl-X f` on the parent's row, then `Down` onto the NEWER fork's `↳` row.
+    fn select_named_fork_child_row(app: &mut App, store: &mut SessionStore) {
+        feed(app, ctrl(KeyCode::Char('x')), store);
+        feed(app, key(KeyCode::Char('f')), store);
+        feed(app, key(KeyCode::Down), store);
+        assert_eq!(
+            drawn_session_rows(app),
+            vec![
+                ("nf-parent", 0, false),
+                ("nf-fork-b", 0, true),
+                ("nf-fork-a", 0, true),
+            ],
+            "premise: the named forks are the parent's `↳` rows"
+        );
+        assert_eq!(app.selected.as_deref(), Some("nf-fork-b"), "premise");
+    }
+
+    /// The ids among [`NAMED_FORK_IDS`] in `set`, in that order.
+    fn named_forks_in(set: &std::collections::HashSet<String>) -> Vec<&'static str> {
+        NAMED_FORK_IDS
+            .into_iter()
+            .filter(|id| set.contains(*id))
+            .collect()
+    }
+
+    /// `Ctrl-X x` on a PARENT's folded row hides the parent and both forks named
+    /// from it: they are the `(+N)` members its row stands for, by the one lineage
+    /// grouping, with no named-fork exception.
+    #[test]
+    fn ctrl_x_x_on_a_parent_row_hides_its_named_forks_too() {
+        let _guard = crate::config::env_lock();
+        let state = unique_temp_dir("nf-hide-parent-state");
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &state);
+
+        let mut store = store_at(Path::new("/tmp"));
+        let (mut app, main, wt, _members) = named_fork_board("nf-hide-parent", &[]);
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('x')), &mut store);
+
+        assert_eq!(
+            named_forks_in(&app.hidden_ids),
+            NAMED_FORK_IDS.to_vec(),
+            "the parent and both named forks are hidden"
+        );
+        assert_eq!(
+            named_forks_in(&crate::hidden::load_hidden(&crate::config::state_dir())),
+            NAMED_FORK_IDS.to_vec(),
+            "and all three are persisted"
+        );
+        assert!(
+            drawn_session_rows(&app).is_empty(),
+            "no fork re-heads into the parent's place"
+        );
+
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        for dir in [&state, &main, &wt] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// `Ctrl-X x` on a named fork's own `↳` row hides that fork ALONE: the parent
+    /// and the other fork stay on the board.
+    #[test]
+    fn ctrl_x_x_on_a_named_forks_child_row_hides_only_that_fork() {
+        let _guard = crate::config::env_lock();
+        let state = unique_temp_dir("nf-hide-child-state");
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &state);
+
+        let mut store = store_at(Path::new("/tmp"));
+        let (mut app, main, wt, _members) = named_fork_board("nf-hide-child", &[]);
+        select_named_fork_child_row(&mut app, &mut store);
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('x')), &mut store);
+
+        assert_eq!(
+            named_forks_in(&app.hidden_ids),
+            vec!["nf-fork-b"],
+            "only the fork's own row is hidden"
+        );
+        assert_eq!(
+            named_forks_in(&crate::hidden::load_hidden(&crate::config::state_dir())),
+            vec!["nf-fork-b"],
+            "and only it is persisted"
+        );
+        assert_eq!(
+            drawn_session_rows(&app),
+            vec![("nf-parent", 0, false), ("nf-fork-a", 0, true)],
+            "the parent and the other fork stay on the board"
+        );
+
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        for dir in [&state, &main, &wt] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// On the PARENT's row, `Ctrl-X d` and `Ctrl-X w` offer its whole lineage
+    /// with both named forks in it — the full store, so the soft-hidden fork too —
+    /// and each confirm counts all three and discloses the hidden one.
+    ///
+    /// Both halves assert the modal's SHAPE and leave with `Esc`, never `Enter`
+    /// on a button, so a broken gate can never unlink or move anything.
+    #[test]
+    fn a_parent_row_offers_its_named_forks_to_delete_and_move_as_its_lineage() {
+        let mut store = store_at(Path::new("/tmp"));
+        let (mut app, main, wt, members) = named_fork_board("nf-lineage", &["nf-fork-a"]);
+        assert_eq!(members.len(), 3, "premise: both named forks are members");
+        let disclosure = "3 in this lineage, 1 of them hidden.";
+
+        // (1) Delete.
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('d')), &mut store);
+        let confirm = app.modal.as_ref().expect("the delete confirm is open");
+        let actions: Vec<ModalAction> = confirm.choices.iter().map(|c| c.action.clone()).collect();
+        assert_eq!(
+            actions,
+            vec![
+                ModalAction::Delete,
+                ModalAction::DeleteLineage(members.clone()),
+                ModalAction::Cancel,
+            ],
+            "the parent's lineage holds its named forks"
+        );
+        assert_eq!(confirm.choices[1].label, "Delete lineage (3)");
+        assert!(
+            confirm.message.starts_with(disclosure),
+            "the hidden fork is disclosed: {:?}",
+            confirm.message
+        );
+        assert_eq!(confirm.selected_action(), Some(&ModalAction::Cancel));
+        feed(&mut app, key(KeyCode::Esc), &mut store);
+        assert!(app.modal.is_none(), "Esc closes the delete confirm");
+
+        // (2) Move.
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('w')), &mut store);
+        feed(&mut app, key(KeyCode::Enter), &mut store);
+        let confirm = app.modal.as_ref().expect("the move scope confirm is open");
+        let actions: Vec<ModalAction> = confirm.choices.iter().map(|c| c.action.clone()).collect();
+        assert_eq!(
+            actions,
+            vec![
+                ModalAction::MoveTo(wt.clone()),
+                ModalAction::MoveLineage {
+                    target: wt.clone(),
+                    ids: members.clone(),
+                },
+                ModalAction::Cancel,
+            ],
+            "the parent's lineage move takes its named forks"
+        );
+        assert_eq!(confirm.choices[1].label, "Move lineage (3)");
+        assert!(
+            confirm.message.starts_with(disclosure),
+            "the hidden fork is disclosed: {:?}",
+            confirm.message
+        );
+        assert_eq!(confirm.selected_action(), Some(&ModalAction::Cancel));
+        feed(&mut app, key(KeyCode::Esc), &mut store);
+        assert!(app.modal.is_none(), "Esc closes the scope confirm");
+        for id in &members {
+            assert!(!app.moving_on(id), "{id}: nothing moved");
+        }
+
+        for dir in [&main, &wt] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// On a named fork's own `↳` row, `Ctrl-X d` offers that fork ALONE and
+    /// `Ctrl-X w` moves that fork ALONE, at once: the parent and the other fork
+    /// are not in either.
+    ///
+    /// The delete half asserts the modal's SHAPE and leaves with `Esc`, so a
+    /// broken gate can never unlink anything.
+    #[test]
+    fn a_named_forks_child_row_deletes_and_moves_only_that_fork() {
+        let mut store = store_at(Path::new("/tmp"));
+        let (mut app, main, wt, _members) = named_fork_board("nf-child", &[]);
+        select_named_fork_child_row(&mut app, &mut store);
+
+        // (1) Delete.
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('d')), &mut store);
+        let confirm = app.modal.as_ref().expect("the delete confirm is open");
+        let actions: Vec<ModalAction> = confirm.choices.iter().map(|c| c.action.clone()).collect();
+        assert_eq!(
+            actions,
+            vec![ModalAction::Delete, ModalAction::Cancel],
+            "a named fork's `↳` row offers no lineage"
+        );
+        assert_eq!(confirm.session_id.as_deref(), Some("nf-fork-b"));
+        feed(&mut app, key(KeyCode::Esc), &mut store);
+        assert!(app.modal.is_none(), "Esc closes the delete confirm");
+
+        // (2) Move.
+        feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
+        feed(&mut app, key(KeyCode::Char('w')), &mut store);
+        assert_eq!(move_choices(&app), vec![wt.clone()], "plain MoveTo rows");
+        app.set_live_probe(|| panic!("the key path must not probe: the worker does"));
+        match feed(&mut app, key(KeyCode::Enter), &mut store) {
+            Outcome::Move(job) => assert_eq!(
+                job,
+                MoveJob::One(MoveRequest {
+                    session_id: "nf-fork-b".to_string(),
+                    file: main.join("nf-fork-b.jsonl"),
+                    target: wt.clone(),
+                })
+            ),
+            _ => panic!("a named fork's `↳` row moves at once"),
+        }
+        assert!(app.moving_on("nf-fork-b"));
+        assert!(!app.moving_on("nf-parent"), "the parent stays put");
+        assert!(!app.moving_on("nf-fork-a"), "and so does the other fork");
+
+        for dir in [&main, &wt] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
     /// The whole per-compose pick, end to end through `handle_event`: `Ctrl-L` in a
     /// REPLY opens the picker over it, `Enter` on a model row writes that model into
     /// THIS compose — text untouched — and the next compose starts on its default
@@ -13915,6 +14459,233 @@ mod tests {
         );
     }
 
+    /// `Ctrl-F` opens the fork box on a resumable session — even a LIVE background
+    /// one, with no probe and no overlay — and a typed `Esc` leaves nothing behind.
+    #[test]
+    fn ctrl_f_opens_the_fork_box_even_on_a_live_session() {
+        let dir = unique_temp_dir("fork-box-open");
+        let mut app = app_with_agent_state(&dir, "sbf-live", "working", &["sbf-live"]);
+        assert!(matches!(
+            press_ctrl(&mut app, KeyCode::Char('f')),
+            Outcome::Continue
+        ));
+        assert!(app.modal.is_none(), "no Attach/Fork/Cancel overlay");
+        assert_eq!(
+            app.compose.as_ref().map(|c| &c.target),
+            Some(&ComposeTarget::Fork {
+                session_id: "sbf-live".to_string()
+            })
+        );
+        press(&mut app, KeyCode::Esc);
+        assert!(app.compose.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The folder check runs BEFORE the box opens: a session whose folder is gone is
+    /// refused on the board with the resume wording, and no box appears.
+    #[test]
+    fn ctrl_f_refuses_a_deleted_folder_before_the_box_opens() {
+        let dir = unique_temp_dir("fork-box-gone");
+        let mut app = App::new(
+            vec![resumable_session(&dir, "sbf-gone")],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
+        // The transcript stays; the folder it records is what disappears.
+        let file = dir.join("sbf-gone.jsonl");
+        let missing = dir.join("deleted-worktree");
+        std::fs::write(
+            &file,
+            format!(
+                r#"{{"type":"user","sessionId":"sbf-gone","cwd":"{}","message":{{"role":"user","content":"hi"}}}}"#,
+                missing.display()
+            ),
+        )
+        .expect("rewrite the transcript");
+        press_ctrl(&mut app, KeyCode::Char('f'));
+        assert!(app.compose.is_none(), "no box for a fork that cannot run");
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|s| s.contains("no longer exists")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed fork send voids the pending jump; a successful one keeps it for the
+    /// reload that shows the fork.
+    #[test]
+    fn a_fork_sends_completion_decides_the_pending_jump() {
+        for (success, jump_kept) in [(false, false), (true, true)] {
+            let mut app = app_with("sbf-origin", None);
+            app.set_fork_jump("sbf-origin".to_string(), "sbf-fork".to_string());
+            app.mark_sending(crate::tui::app::Sending {
+                session_id: "sbf-fork".to_string(),
+                message: "m".to_string(),
+                baseline_msg_count: 0,
+            });
+            handle_event(
+                &mut app,
+                AppEvent::SendFinished {
+                    session_id: "sbf-fork".to_string(),
+                    status: "s".to_string(),
+                    success,
+                },
+                &mut store_at(Path::new("/tmp")),
+            );
+            assert!(app.sending.is_empty());
+            assert_eq!(app.fork_jump.is_some(), jump_kept, "success={success}");
+        }
+    }
+
+    /// The rapid fork-again workflow (review PR1, then PR2, from the same session):
+    /// `Ctrl-F` + `Enter` on `A`, then `Ctrl-F` on `A` again, and the first fork
+    /// lands — folded under `A` — while that second box is open. The cursor is not
+    /// pulled to the fork under the box, the pair is spent, and the box's `Enter`
+    /// forks `A` again and arms the jump for the SECOND fork alone.
+    #[test]
+    fn forking_again_before_the_first_fork_lands_keeps_the_box_and_cursor_on_the_origin() {
+        let at = |secs| Some(time::OffsetDateTime::from_unix_timestamp(secs).expect("valid"));
+        let dir = unique_temp_dir("fork-again");
+        let mut origin = resumable_session(&dir, "sbf-a");
+        origin.root_uuid = Some("root-a".to_string());
+        origin.timestamp = at(100);
+        let mut app = App::new(vec![origin.clone()], Scope::All, PathBuf::from("/tmp"));
+
+        press_ctrl(&mut app, KeyCode::Char('f'));
+        type_into_draft(&mut app, "PR1");
+        let Outcome::Send(first) = press(&mut app, KeyCode::Enter) else {
+            panic!("the first fork must send: {:?}", app.status);
+        };
+
+        press_ctrl(&mut app, KeyCode::Char('f'));
+        type_into_draft(&mut app, "PR2");
+        let fork_one = Session {
+            session_id: first.session_id.clone(),
+            file: dir.join(format!("{}.jsonl", first.session_id)),
+            custom_title: Some("fork: PR1".to_string()),
+            timestamp: at(200),
+            ..origin.clone()
+        };
+        app.apply_sessions(vec![origin.clone(), fork_one]);
+
+        assert_eq!(
+            app.selected.as_deref(),
+            Some("sbf-a"),
+            "no jump under the box"
+        );
+        assert_eq!(
+            app.compose.as_ref().map(|c| &c.target),
+            Some(&ComposeTarget::Fork {
+                session_id: "sbf-a".to_string()
+            })
+        );
+        assert!(app.fork_jump.is_none(), "the first fork's pair is spent");
+
+        let Outcome::Send(second) = press(&mut app, KeyCode::Enter) else {
+            panic!("the second fork must send: {:?}", app.status);
+        };
+        assert_eq!(
+            second.argv[..5],
+            ["claude", "-p", "-r", "sbf-a", "--fork-session"],
+            "the second box forks the origin, not the first fork"
+        );
+        assert_ne!(second.session_id, first.session_id);
+        assert_eq!(
+            app.fork_jump,
+            Some(crate::tui::app::ForkJump {
+                origin: "sbf-a".to_string(),
+                fork: second.session_id.clone(),
+            })
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The jump lands the cursor on a headless fork's row while its `claude -p`
+    /// child is still making it (the `cooking…` window). `Enter` there is refused
+    /// before the probe — none spent, nothing handed off — because that child is
+    /// recorded under the FORK's id. The ORIGIN, which the child only reads, is
+    /// not refused: it resumes when claude is not holding it and opens the
+    /// Attach/Fork/Cancel choice when claude is.
+    #[test]
+    fn enter_refuses_a_fork_still_being_made_but_not_its_origin() {
+        let at = |secs| Some(time::OffsetDateTime::from_unix_timestamp(secs).expect("valid"));
+        for origin_live in [false, true] {
+            let dir = unique_temp_dir("enter-fork-in-flight");
+            let mut origin = resumable_session(&dir, "sbf-a");
+            origin.root_uuid = Some("root-a".to_string());
+            origin.timestamp = at(100);
+            let mut app = App::new(vec![origin.clone()], Scope::All, PathBuf::from("/tmp"));
+            let probes = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            let counter = std::rc::Rc::clone(&probes);
+            app.set_live_probe(move || {
+                counter.set(counter.get() + 1);
+                if origin_live {
+                    live_map(&[("sbf-a", "background", Some("job-a"))])
+                } else {
+                    HashMap::new()
+                }
+            });
+
+            press_ctrl(&mut app, KeyCode::Char('f'));
+            type_into_draft(&mut app, "PR1");
+            let Outcome::Send(req) = press(&mut app, KeyCode::Enter) else {
+                panic!("the fork must send: {:?}", app.status);
+            };
+            let fork_id = req.session_id;
+            assert!(
+                app.sending_to(&fork_id).is_some() && app.sending_to("sbf-a").is_none(),
+                "precondition: the child is in flight under the fork's id alone"
+            );
+
+            // The fork's row appears while its child still runs, and the jump
+            // lands on it.
+            let fork_row = Session {
+                session_id: fork_id.clone(),
+                file: dir.join(format!("{fork_id}.jsonl")),
+                custom_title: Some("fork: PR1".to_string()),
+                timestamp: at(200),
+                ..origin.clone()
+            };
+            app.apply_sessions(vec![origin.clone(), fork_row]);
+            assert_eq!(
+                app.selected.as_deref(),
+                Some(fork_id.as_str()),
+                "precondition: the jump selected the fork"
+            );
+
+            let out = press(&mut app, KeyCode::Enter);
+            assert!(
+                matches!(out, Outcome::Continue),
+                "fork (origin_live={origin_live}): a refusal hands nothing off"
+            );
+            assert!(app.modal.is_none(), "fork: no choice opens");
+            assert_eq!(probes.get(), 0, "fork: refused before any probe");
+            assert_eq!(
+                app.status.as_deref(),
+                Some(send::RESUME_SENDING_REFUSAL),
+                "fork: refused in the resume's own words"
+            );
+
+            press(&mut app, KeyCode::Up);
+            assert_eq!(app.selected.as_deref(), Some("sbf-a"), "back on the origin");
+            let out = press(&mut app, KeyCode::Enter);
+            let _ = std::fs::remove_dir_all(&dir);
+            assert_eq!(probes.get(), 1, "origin: its gate asked claude as usual");
+            if origin_live {
+                assert!(
+                    matches!(out, Outcome::Continue) && app.modal.is_some(),
+                    "a live origin opens the Attach/Fork/Cancel choice"
+                );
+            } else {
+                assert!(
+                    matches!(out, Outcome::Resume(_)),
+                    "a parked origin resumes: {:?}",
+                    app.status
+                );
+            }
+        }
+    }
+
     /// `Enter`, `Ctrl-F` and Attach NEVER carry `--model` or `--effort`, through the
     /// real key routing — even straight after a pick was confirmed in a compose. A
     /// resume and a fork keep the session's own model (claude normally restores it),
@@ -13955,13 +14726,22 @@ mod tests {
         assert!(!carries_a_model(&resumed.argv));
         assert_eq!(resumed.nonzero_hint, crate::resume::RESUME_NONZERO_HINT);
 
-        let Outcome::Resume(forked) = press_ctrl(&mut app, KeyCode::Char('f')) else {
+        // `Ctrl-F` now opens the fork box; an untouched box's `Ctrl-O` is the
+        // hand-off the old direct `Ctrl-F` made, named after the session's label.
+        assert!(matches!(
+            press_ctrl(&mut app, KeyCode::Char('f')),
+            Outcome::Continue
+        ));
+        let Outcome::Resume(forked) = press_ctrl(&mut app, KeyCode::Char('o')) else {
             panic!(
-                "Ctrl-F on a resumable session must hand off: {:?}",
+                "Ctrl-O in an untouched fork box must hand off: {:?}",
                 app.status
             );
         };
-        assert_eq!(forked.argv.join(" "), "claude -r sbm-plain --fork-session");
+        assert_eq!(
+            forked.argv.join(" "),
+            "claude -r sbm-plain --fork-session --name fork: label sbm-plain"
+        );
         assert!(!carries_a_model(&forked.argv));
 
         // Attach: claude reports the session running as a background job.

@@ -240,6 +240,15 @@ pub struct ParsedFile {
     /// it alone. A fact about the BYTES like every other field here, so the parse
     /// cache carries it unchanged.
     pub failed_task: Option<FailedTaskNotice>,
+    /// The `customTitle` of the LAST `custom-title` record in file order that
+    /// carries a non-blank string, kept as written; `None` when there is none.
+    ///
+    /// Last, not first: claude persists session metadata by RE-APPENDING it (a
+    /// `claude -p --name` fork wrote its `custom-title` twice at claude 2.1.291),
+    /// so a later record is the current name — a `/rename` included. A record whose
+    /// `customTitle` is absent, null, not a string or blank names nothing and leaves
+    /// the earlier name standing (FAIL-SOFT, the same blank rule as the agent fields).
+    pub custom_title: Option<String>,
 }
 
 /// A background task's `failed` notice, as the pass found it.
@@ -286,6 +295,7 @@ pub fn parse_file(path: &Path) -> FileVerdict<ParsedFile> {
     let mut has_agent_name = false;
     let mut has_agent_setting = false;
     let mut failed_task: Option<FailedTaskNotice> = None;
+    let mut custom_title: Option<String> = None;
 
     for line in reader.lines() {
         let line = match line {
@@ -414,6 +424,14 @@ pub fn parse_file(path: &Path) -> FileVerdict<ParsedFile> {
             Some("agent-setting") if !has_agent_setting => {
                 has_agent_setting = has_trimmed_field(&record, "agentSetting");
             }
+            // The session's name: no latch, the LAST readable one wins
+            // ([`ParsedFile::custom_title`]).
+            Some("custom-title") if has_trimmed_field(&record, "customTitle") => {
+                custom_title = record
+                    .get("customTitle")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
             _ => {}
         }
         // The failed-background-task flag, decided in THIS pass and in FILE ORDER,
@@ -468,6 +486,7 @@ pub fn parse_file(path: &Path) -> FileVerdict<ParsedFile> {
         has_agent_name,
         has_agent_setting,
         failed_task,
+        custom_title,
     })
 }
 
@@ -956,6 +975,78 @@ mod tests {
             parsed.background,
             "one bg-stamped record anywhere makes the transcript a background job"
         );
+    }
+
+    // --- the session name (`custom-title`) -----------------------------------
+
+    /// The shape claude 2.1.291 wrote for a `--name`d `claude -p` fork — the
+    /// record twice — followed by a later rename: the LAST record in file order is
+    /// the name, because claude re-appends its metadata rather than rewriting it.
+    #[test]
+    fn the_last_custom_title_in_file_order_is_the_name() {
+        let parsed = parse_lines(
+            "custom-title",
+            &[
+                r#"{"type":"custom-title","customTitle":"fork: Review PR1","sessionId":"f"}"#,
+                r#"{"type":"user","cwd":"/repo","sessionId":"f"}"#,
+                r#"{"type":"custom-title","customTitle":"fork: Review PR1","sessionId":"f"}"#,
+                r#"{"type":"custom-title","customTitle":"renamed later","sessionId":"f"}"#,
+            ],
+        )
+        .expect("a file with a cwd is a session");
+
+        assert_eq!(parsed.custom_title.as_deref(), Some("renamed later"));
+    }
+
+    /// A transcript that was never named carries no name, and a `customTitle`
+    /// outside a `custom-title` record names nothing.
+    #[test]
+    fn a_file_with_no_custom_title_record_names_nothing() {
+        let parsed = parse_lines(
+            "custom-title-absent",
+            &[
+                r#"{"type":"user","cwd":"/repo","sessionId":"s","customTitle":"fork: stray"}"#,
+                r#"{"type":"agent-name","agentName":"fork: not a title","sessionId":"s"}"#,
+                r#"{"type":null,"customTitle":"fork: no type"}"#,
+            ],
+        )
+        .expect("a file with a cwd is a session");
+
+        assert_eq!(parsed.custom_title, None);
+    }
+
+    /// FAIL-SOFT over every malformed `customTitle`: on its own it names nothing,
+    /// after a readable name it leaves that name standing, and in neither case does
+    /// it cost the session.
+    #[test]
+    fn a_malformed_custom_title_names_nothing_and_keeps_the_earlier_name() {
+        let malformed = [
+            r#"{"type":"custom-title","sessionId":"s"}"#,
+            r#"{"type":"custom-title","customTitle":null}"#,
+            r#"{"type":"custom-title","customTitle":42}"#,
+            r#"{"type":"custom-title","customTitle":["fork: x"]}"#,
+            r#"{"type":"custom-title","customTitle":""}"#,
+            r#"{"type":"custom-title","customTitle":"   "}"#,
+        ];
+        for bad in malformed {
+            let alone = parse_lines(
+                "custom-title-malformed",
+                &[r#"{"type":"user","cwd":"/repo","sessionId":"s"}"#, bad],
+            )
+            .unwrap_or_else(|| panic!("a file with a cwd is a session: {bad}"));
+            assert_eq!(alone.custom_title, None, "{bad}");
+
+            let after = parse_lines(
+                "custom-title-malformed-after",
+                &[
+                    r#"{"type":"custom-title","customTitle":"fork: kept"}"#,
+                    r#"{"type":"user","cwd":"/repo","sessionId":"s"}"#,
+                    bad,
+                ],
+            )
+            .unwrap_or_else(|| panic!("a file with a cwd is a session: {bad}"));
+            assert_eq!(after.custom_title.as_deref(), Some("fork: kept"), "{bad}");
+        }
     }
 
     // --- the failed-background-task flag -------------------------------------

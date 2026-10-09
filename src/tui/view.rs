@@ -38,7 +38,7 @@ use crate::agents::{self, AgentActivity, ReportedAgent};
 use crate::resume::ModelPick;
 use crate::search::SearchMode;
 use crate::store::preview::{self, FoldRegion, LinkRegion};
-use crate::store::FailedTask;
+use crate::store::{lineage, FailedTask};
 
 use super::app::{
     resolve_list_width, App, ComposeDefault, ContentPos, InterruptRoute, Modal, ModalAction,
@@ -373,7 +373,8 @@ const MOVING_ROW_BADGE: &str = "moving\u{2026}  ";
 /// the reason [`FAILED_TASK_MARKER`] gives.
 const FAILED_TASK_BANNER_LEAD: &str = "background task failed";
 
-/// How many leading chars of a `session_id` a lineage CHILD row shows.
+/// How many leading chars of a `session_id` a lineage CHILD row shows — every
+/// child but a named fork, which draws [`FORK_GLYPH`] and its name there instead.
 ///
 /// Eight: a session id is a uuid, whose first hyphen-delimited group is 8 hex
 /// chars — the form these sessions are named by everywhere else (`e4a59d02`), and
@@ -381,7 +382,8 @@ const FAILED_TASK_BANNER_LEAD: &str = "background task failed";
 /// which is the only comparison this row invites.
 const CHILD_ID_CHARS: usize = 8;
 
-/// The gap between a lineage CHILD row's id and its turn count.
+/// The gap between a lineage CHILD row's id (or named fork's name) and its turn
+/// count.
 ///
 /// Two columns, matching [`LINEAGE_MARKER_GAP`] and the row's other inter-column
 /// gaps, so a child's fields sit on the same rhythm as every other row's. Folded
@@ -399,6 +401,21 @@ const CHILD_MSGS_GAP: &str = "  ";
 /// value, and this segment's width has to be knowable before it is drawn — see
 /// [`fit_child_msgs`].
 const CHILD_MSGS_SUFFIX: &str = " msgs";
+
+/// The sign a named fork's CHILD row draws ahead of its name, in the slot an
+/// unnamed member's id takes: `⑂ Review PR1`.
+///
+/// claude's own fork glyph, so the board marks a fork the way claude does. In
+/// claude 2.1.291's glyph table `nT="\u2442"` (`⑂`) sits beside `\u21B3`
+/// (`↳`), `\u25C7` (`◇`) and `\u25C6` (`◆`), which this board already draws;
+/// `/fork` prints `` `${nT} forked ${r.name} (${r.agentId.slice(-4)})` ``; and
+/// claude names its own forks `<parent name> ⑂ <directive>`, cut to 60
+/// characters (read from the installed binary, 2026-10-09).
+///
+/// East-Asian-width Neutral, so ONE column — pinned by a test, since
+/// [`fit_child_name`] counts it as one. `f` is the fallback should a terminal
+/// font lack it: change this one const.
+const FORK_GLYPH: &str = "⑂";
 
 /// The preview scrollbar's `begin_symbol`, shown ONLY when the preview is
 /// pinned to the very top (`offset == 0`) — a clear directional glyph for the
@@ -943,8 +960,11 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                     // SAME label by construction (one conversation, copied), so
                     // repeating it would spend the row saying nothing. What is
                     // genuinely its own is the timestamp and badge already drawn
-                    // above, plus the id below — which is also the id `claude -r`
-                    // would resume, i.e. the reason this row is kept reachable.
+                    // above, plus what says WHICH member this is: a fork
+                    // snapback named draws `⑂ <name>` (prefix stripped), what
+                    // that fork was FOR, where the parent row draws its label;
+                    // every other member draws the id `claude -r` would resume.
+                    // A named fork's id stays one `Ctrl-X y` away.
                     //
                     // Note what is NOT claimed here: the sketch's "plain-resumable"
                     // would be an assertion about claude's gate, and the badge
@@ -954,7 +974,32 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                     // `preview_split`) and a polled snapshot is not authority
                     // for it, so the row REPORTS what claude said and
                     // leaves the verdict to the hand-off probe.
-                    spans.push(Span::raw(short_id(&session.session_id)));
+                    //
+                    // A named fork's markers are decided FIRST and held back from
+                    // its name and count — the marker-first discipline
+                    // [`fit_label`] gives a head row — so a narrow pane drops the
+                    // count, then cuts the name, and keeps the markers. An unnamed
+                    // member's markers take what its id and count leave.
+                    let name = lineage::fork_title(session);
+                    let failed = session.failed_task.is_some();
+                    let unbound = app.lost_agent_bindings.contains(&session.session_id);
+                    let named_markers = name.as_ref().map(|_| {
+                        let used: usize = spans.iter().map(Span::width).sum();
+                        fit_child_markers(failed, unbound, soft_hidden, content_width, used)
+                    });
+                    let reserved = named_markers.map_or(0, ChildMarkers::width);
+                    match name {
+                        // Fitted BEFORE the count, so the count drops first.
+                        Some(name) => {
+                            let used: usize = spans.iter().map(Span::width).sum();
+                            if let Some(segment) =
+                                fit_child_name(&name, content_width, used, reserved)
+                            {
+                                spans.push(Span::raw(segment));
+                            }
+                        }
+                        None => spans.push(Span::raw(short_id(&session.session_id))),
+                    }
 
                     // ...and how much conversation it actually holds, which is
                     // the only field on this row carrying real information.
@@ -964,49 +1009,29 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                     // user is actually asking when they expand a lineage whose
                     // members are, by construction, label-identical.
                     //
-                    // DIM, like the timestamp: the id is left the row's one
-                    // undimmed field so the eye can scan children by it, and the
-                    // count reads as an annotation hanging off it. A named
-                    // Modifier, never an embedded escape or an RGB value
+                    // DIM, like the timestamp: the id (or fork name) is left the
+                    // row's one undimmed field so the eye can scan children by
+                    // it, and the count reads as an annotation hanging off it. A
+                    // named Modifier, never an embedded escape or an RGB value
                     // (TERMINAL-SAFE STYLING).
-                    let used: usize = spans.iter().map(Span::width).sum();
+                    let used = spans.iter().map(Span::width).sum::<usize>() + reserved;
                     if let Some(msgs) = fit_child_msgs(session.msg_count, content_width, used) {
                         spans.push(Span::styled(
                             msgs,
                             Style::default().add_modifier(Modifier::DIM),
                         ));
                     }
-                    // A failed background task is a fact about THIS file, so a
-                    // child row draws it too — and a child is exactly where an
-                    // inherited one shows: a background fork copies its parent's
-                    // transcript, flag included, until its own first prompt.
-                    // Dropped only if the row has no room, exactly as the turn
-                    // count above is, and decided FIRST because it is the marker
-                    // that wants the user.
-                    let used: usize = spans.iter().map(Span::width).sum();
-                    if session.failed_task.is_some()
-                        && used + FAILED_TASK_MARKER.chars().count() <= content_width
-                    {
-                        spans.push(failed_task_marker_span());
-                    }
-                    // A downgraded member is not always the head: the fork is
-                    // usually NEWER than its root and so heads the lineage, but a
-                    // third member can push it into a child row. The badge is a
-                    // fact about the SESSION, not about its position in the fold,
-                    // so it draws here too — dropped only if the row has no room,
-                    // exactly as the turn count above is.
-                    let used: usize = spans.iter().map(Span::width).sum();
-                    if app.lost_agent_bindings.contains(&session.session_id)
-                        && used + AGENT_UNBOUND_MARKER.chars().count() <= content_width
-                    {
-                        spans.push(unbound_marker_span());
-                    }
-                    if soft_hidden {
-                        spans.push(Span::styled(
-                            HIDDEN_ROW_MARKER,
-                            Style::default().add_modifier(Modifier::DIM),
-                        ));
-                    }
+                    // An unnamed member's markers yield to its id and count, and its
+                    // `[hidden]` is pushed whatever the width; a named fork's
+                    // markers were reserved above.
+                    let markers = named_markers.unwrap_or_else(|| {
+                        let used: usize = spans.iter().map(Span::width).sum();
+                        ChildMarkers {
+                            hidden: soft_hidden,
+                            ..fit_child_markers(failed, unbound, false, content_width, used)
+                        }
+                    });
+                    push_child_markers(&mut spans, markers);
                     return dim_row_if(ListItem::new(Line::from(spans)), soft_hidden);
                 }
 
@@ -1088,10 +1113,7 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                     spans.push(unbound_marker_span());
                 }
                 if soft_hidden {
-                    spans.push(Span::styled(
-                        HIDDEN_ROW_MARKER,
-                        Style::default().add_modifier(Modifier::DIM),
-                    ));
+                    spans.push(hidden_marker_span());
                 }
                 dim_row_if(ListItem::new(Line::from(spans)), soft_hidden)
             }
@@ -1152,6 +1174,16 @@ const FAILED_TASK_COLOR: Color = Color::Red;
 /// [`unbound_marker_span`]).
 fn failed_task_marker_span() -> Span<'static> {
     Span::styled(FAILED_TASK_MARKER, Style::default().fg(FAILED_TASK_COLOR))
+}
+
+/// The styled [`HIDDEN_ROW_MARKER`] span, built in ONE place so the head row and a
+/// child row can never draw the same fact in two different styles. DIM: it is the
+/// row's footnote weight, like the `(+N)` marker.
+fn hidden_marker_span() -> Span<'static> {
+    Span::styled(
+        HIDDEN_ROW_MARKER,
+        Style::default().add_modifier(Modifier::DIM),
+    )
 }
 
 /// The styled [`MOVING_ROW_BADGE`] span, one place for the head and child rows.
@@ -2040,6 +2072,14 @@ fn compose_title(app: &App, compose: &ComposeState) -> String {
             } else {
                 format!(" reply to {label} ")
             }
+        }
+        ComposeTarget::Fork { session_id } => {
+            let label = app
+                .session_by_id(session_id)
+                .map(|s| s.label.as_str())
+                .filter(|l| !l.is_empty())
+                .unwrap_or(session_id.as_str());
+            format!(" fork: {label} ")
         }
         ComposeTarget::NewBackgroundAgent { agent } => {
             let name = agent
@@ -4208,7 +4248,7 @@ fn chord_hint(selected_hidden: bool) -> String {
 /// rides the REPLY arm ONLY: a draft keeps
 /// those keys for its editor, and [`BG_DRAFT_HINT`] is already past 80 columns.
 ///
-/// The model key (`Ctrl-L`, both targets) was PAID FOR on the reply hint, which sat
+/// The model key (`Ctrl-L`, every target) was PAID FOR on the reply hint, which sat
 /// at 78 columns: its `^L model` segment costs 11, so the newline clause went from
 /// `Ctrl-J newline (or Alt+Enter)` to `^J/Alt+Enter newline` — both keys still
 /// named, in the board keymap's caret notation — which lands the hint at EXACTLY
@@ -4216,25 +4256,32 @@ fn chord_hint(selected_hidden: bool) -> String {
 /// hint keeps its spelled-out keys: it was already cut at 80, and `Ctrl-L model`
 /// sits right after `Ctrl-O run interactively`, inside the columns that ARE drawn.
 ///
-/// With the pick list OPEN — on either draft — the row shows [`COMPLETION_HINT`]
-/// instead: while the list is up `Enter` picks and `Esc` closes only the list, so
-/// either closed-list hint would name keys that do not do that. The draft CARD
-/// switches with it, through [`draft_hint`], so the card and this row never name
-/// different keys for the same draft.
+/// With the pick list OPEN — in any compose box — the row shows
+/// [`COMPLETION_HINT`] instead: while the list is up `Enter` picks and `Esc` closes
+/// only the list, so every closed-list hint would name keys that do not do that.
+/// The draft CARD switches with it, through [`draft_hint`], so the card and this
+/// row never name different keys for the same draft.
 fn compose_hint(target: &ComposeTarget, list_open: bool) -> &'static str {
     match target {
         _ if list_open => COMPLETION_HINT,
         ComposeTarget::Reply { .. } => {
             "Enter send · ^L model · ^J/Alt+Enter newline · PgUp/PgDn scroll · Esc cancel"
         }
+        ComposeTarget::Fork { .. } => FORK_HINT,
         // The SAME const the draft card shows with the list closed ([`draft_hint`]),
         // so the two surfaces cannot describe the same keys differently.
         ComposeTarget::NewBackgroundAgent { .. } => BG_DRAFT_HINT,
     }
 }
 
-/// Either draft's hint while the pick list is open — on the help row, and on a
-/// background draft's card too ([`draft_hint`]). Budgeted to the 80-column help
+/// The fork box's hint. `Enter` forks headless (no terminal hand-off) and `Ctrl-O`
+/// forks interactively; 70 columns, inside the 80-column help row (pinned by
+/// `the_fork_hint_is_pinned_and_fits_an_eighty_column_terminal`). It leaves out
+/// the transcript-scroll keys the reply hint names, which work here too.
+const FORK_HINT: &str = "Enter fork · ^O run interactively · ^L model · ^J newline · Esc cancel";
+
+/// Every compose box's hint while the pick list is open — on the help row, and on
+/// a background draft's card too ([`draft_hint`]). Budgeted to the 80-column help
 /// row (pinned by `every_compose_hint_form_fits_an_eighty_column_terminal`).
 const COMPLETION_HINT: &str = "↑/↓ choose · Enter/Tab pick · Esc close list";
 
@@ -5152,7 +5199,7 @@ fn child_msgs(msg_count: usize) -> String {
 /// The turn-count segment a child row can afford, or `None` to draw none.
 ///
 /// `content_width` is the row's drawable columns and `used` what its fields
-/// (gutter, timestamp, badge, id) already spend.
+/// (gutter, timestamp, badge, id or fork name) already spend.
 ///
 /// ALL-OR-NOTHING, and that is the RULE rather than an implementation detail: a
 /// clipped count is not a degraded count, it is a WRONG one. `171 msgs` cut to
@@ -5170,12 +5217,109 @@ fn child_msgs(msg_count: usize) -> String {
 /// still tells one member of a lineage from another, so it has nothing left to
 /// give: shortening it further would trade a field that cannot be wrong for one
 /// that can, and could collapse two children onto a shared prefix. The count is
-/// the field that yields last and, when the columns run out, entirely.
+/// the field that yields last and, when the columns run out, entirely. A named
+/// fork's name, in the id's slot, outranks it the same way: see
+/// [`fit_child_name`].
 ///
 /// Pure, so the drop is tested as arithmetic rather than only through a pane.
 fn fit_child_msgs(msg_count: usize, content_width: usize, used: usize) -> Option<String> {
     let segment = child_msgs(msg_count);
     (segment.chars().count() <= content_width.saturating_sub(used)).then_some(segment)
+}
+
+/// The segment a named fork's child row draws in the id's slot — [`FORK_GLYPH`],
+/// a space, then `name` — or `None` to draw none.
+///
+/// `used` is what the gutter, timestamp and badge already spend, and `reserved`
+/// the width of the markers [`fit_child_markers`] kept, held back exactly as
+/// [`fit_label`] holds a head row's back: the markers outrank the name. The name
+/// is fitted BEFORE the turn count, so on a narrow pane the count drops first
+/// ([`fit_child_msgs`] weighs what this leaves) and the name is cut only once it
+/// alone overruns what the markers leave. Unlike the count it degrades rather than
+/// vanishing: a name cut short is still the start of the right name, so it is
+/// ellipsized by [`fit_label`]'s rule and dropped only when not one column is left
+/// for it. Pure.
+fn fit_child_name(
+    name: &str,
+    content_width: usize,
+    used: usize,
+    reserved: usize,
+) -> Option<String> {
+    let mark = format!("{FORK_GLYPH} ");
+    let fitted = fit_label(name, content_width, used + mark.chars().count(), reserved);
+    (!fitted.is_empty()).then(|| mark + &fitted)
+}
+
+/// Which trailing markers a lineage CHILD row draws, in drawing order:
+/// [`FAILED_TASK_MARKER`], [`AGENT_UNBOUND_MARKER`], [`HIDDEN_ROW_MARKER`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChildMarkers {
+    /// A background task this session launched stands failed.
+    failed: bool,
+    /// The #80811 lost-binding badge.
+    unbound: bool,
+    /// The session is soft-hidden (drawn only while show-hidden is on).
+    hidden: bool,
+}
+
+impl ChildMarkers {
+    /// The columns the kept markers draw, each with the leading gap it carries.
+    fn width(self) -> usize {
+        [
+            (self.failed, FAILED_TASK_MARKER),
+            (self.unbound, AGENT_UNBOUND_MARKER),
+            (self.hidden, HIDDEN_ROW_MARKER),
+        ]
+        .into_iter()
+        .filter(|&(kept, _)| kept)
+        .map(|(_, marker)| marker.chars().count())
+        .sum()
+    }
+}
+
+/// The markers a child row keeps, of those that apply, against the columns left
+/// after `used`.
+///
+/// Each is a fact about the SESSION, not about its place in the fold, so a child
+/// draws it like a head does: a background fork inherits its parent's failed task
+/// until its own first prompt, and a downgraded fork sits in a child row when a
+/// third member heads. Decided in drawing order, each against what the ones kept
+/// before it leave, and each DROPPED WHOLE when it does not fit — a half-drawn
+/// `[task fai` asserts nothing. The failed task goes first because it is the
+/// marker that wants the user. Pure.
+fn fit_child_markers(
+    failed: bool,
+    unbound: bool,
+    hidden: bool,
+    content_width: usize,
+    used: usize,
+) -> ChildMarkers {
+    let mut spent = used;
+    let mut keep = |applies: bool, marker: &str| {
+        let fits = applies && spent + marker.chars().count() <= content_width;
+        if fits {
+            spent += marker.chars().count();
+        }
+        fits
+    };
+    ChildMarkers {
+        failed: keep(failed, FAILED_TASK_MARKER),
+        unbound: keep(unbound, AGENT_UNBOUND_MARKER),
+        hidden: keep(hidden, HIDDEN_ROW_MARKER),
+    }
+}
+
+/// Push the spans of the markers `markers` kept, in drawing order.
+fn push_child_markers(spans: &mut Vec<Span<'_>>, markers: ChildMarkers) {
+    if markers.failed {
+        spans.push(failed_task_marker_span());
+    }
+    if markers.unbound {
+        spans.push(unbound_marker_span());
+    }
+    if markers.hidden {
+        spans.push(hidden_marker_span());
+    }
 }
 
 /// The label text for a row that must ALSO fit `marker` columns of `(+N)`.
@@ -6030,6 +6174,7 @@ mod tests {
             has_agent_name: false,
             has_agent_setting: false,
             failed_task: None,
+            custom_title: None,
         }
     }
 
@@ -7340,6 +7485,7 @@ mod tests {
             has_agent_name: false,
             has_agent_setting: false,
             failed_task: None,
+            custom_title: None,
         }
     }
 
@@ -9431,6 +9577,7 @@ mod tests {
             has_agent_name: false,
             has_agent_setting: false,
             failed_task: None,
+            custom_title: None,
         }
     }
 
@@ -10360,6 +10507,34 @@ mod tests {
         let bg = ComposeState::new_background(None).target;
         assert_eq!(compose_hint(&bg, true), COMPLETION_HINT);
         assert_eq!(compose_hint(&bg, false), BG_DRAFT_HINT);
+    }
+
+    /// The fork box's hint is pinned word for word, fits the 80-column help row
+    /// whole, and gives way to the pick-list hint while the list is open.
+    #[test]
+    fn the_fork_hint_is_pinned_and_fits_an_eighty_column_terminal() {
+        let fork = ComposeState::new_fork("s".to_string()).target;
+        let hint = compose_hint(&fork, false);
+        assert_eq!(
+            hint,
+            "Enter fork · ^O run interactively · ^L model · ^J newline · Esc cancel"
+        );
+        assert_eq!(hint.width(), 70);
+        assert_eq!(compose_hint(&fork, true), COMPLETION_HINT);
+    }
+
+    /// The fork box is titled `fork: <label>` from the session's own label.
+    #[test]
+    fn the_fork_box_is_titled_with_the_session_it_forks() {
+        let app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        let compose = ComposeState::new_fork("sess-normal-1".to_string());
+        assert_eq!(compose_title(&app, &compose), " fork: sess-normal-1 ");
+        let gone = ComposeState::new_fork("no-such".to_string());
+        assert_eq!(compose_title(&app, &gone), " fork: no-such ");
     }
 
     #[test]
@@ -11660,6 +11835,7 @@ mod tests {
             has_agent_name: false,
             has_agent_setting: false,
             failed_task: None,
+            custom_title: None,
         }
     }
 
@@ -11838,6 +12014,7 @@ mod tests {
             has_agent_name: false,
             has_agent_setting: false,
             failed_task: None,
+            custom_title: None,
         }
     }
 
@@ -11969,6 +12146,7 @@ mod tests {
             has_agent_name: false,
             has_agent_setting: false,
             failed_task: None,
+            custom_title: None,
         }
     }
 
@@ -12168,6 +12346,7 @@ mod tests {
             has_agent_name: false,
             has_agent_setting: false,
             failed_task: None,
+            custom_title: None,
         }
     }
 
@@ -12705,6 +12884,7 @@ mod tests {
             has_agent_name: false,
             has_agent_setting: false,
             failed_task: None,
+            custom_title: None,
         }
     }
 
@@ -14360,6 +14540,96 @@ mod tests {
                 .count(),
             1,
             "the placeholder is told once, never also on the pinned row: {rows:?}"
+        );
+    }
+
+    /// A headless fork from the `Ctrl-F` box is in flight under the FORK's id, so the
+    /// pinned row treats the two rows of that lineage differently. The jump lands on
+    /// the fork's row while its `claude -p` child still runs: the row keeps its turn
+    /// marker pinned, and the live status and age claude reports for that child stay
+    /// off it, since the `cooking…` tail already says it. The origin's row, which the
+    /// child only reads, keeps its own live status and age, and has no tail.
+    ///
+    /// Both are LIVE with a known age, so a suffix keyed on anything wider than the
+    /// selected row's own entry draws on both rows or on neither.
+    #[test]
+    fn an_in_flight_fork_steps_the_live_suffix_aside_on_its_own_row_only() {
+        use super::super::app::Sending;
+
+        const ORIGIN: &str = "sess-normal-1";
+        const FORK: &str = "sess-normal-1-fork";
+        let at = |secs| Some(OffsetDateTime::from_unix_timestamp(secs).expect("valid"));
+        let (width, height) = BANNER_PANE;
+        let origin = Session {
+            root_uuid: Some("root-normal-1".to_string()),
+            timestamp: at(100),
+            ..sample_session()
+        };
+        // The fork copies the origin's history, so the origin's transcript stands in
+        // for its file, already longer than the entry's baseline of 0 turns.
+        let fork = Session {
+            session_id: FORK.to_string(),
+            custom_title: Some(format!("{}try it", crate::store::lineage::FORK_NAME_PREFIX)),
+            timestamp: at(200),
+            msg_count: 4,
+            ..origin.clone()
+        };
+        let mut app = App::new(
+            vec![origin.clone()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        let live = || {
+            let mut agent =
+                ReportedAgent::fixture("interactive", None, Some("busy")).with_pid(LIVE_PID);
+            agent.started_at_ms = Some(STARTED_AT);
+            agent
+        };
+        app.set_reported_agents(
+            HashMap::from([(ORIGIN.to_string(), live()), (FORK.to_string(), live())]),
+            Some(POLLED_46M_LATER),
+        );
+        app.mark_sending(Sending {
+            session_id: FORK.to_string(),
+            message: "try it".to_string(),
+            baseline_msg_count: 0,
+        });
+        app.set_fork_jump(ORIGIN.to_string(), FORK.to_string());
+        app.apply_sessions(vec![origin, fork]);
+        assert_eq!(
+            app.selected.as_deref(),
+            Some(FORK),
+            "premise: the jump lands on the fork while its child runs"
+        );
+
+        let rows = inner_rows(&mut app, width, height);
+        assert_eq!(
+            rows[0], LAST_SAMPLE_TURN_MARKER,
+            "the fork's row pins its last real turn alone, no live suffix: {rows:?}"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.contains(REPLY_COOKING_LABEL))
+                .count(),
+            1,
+            "the fork's tail is drawn once: {rows:?}"
+        );
+
+        app.move_selection(-1);
+        assert_eq!(
+            app.selected.as_deref(),
+            Some(ORIGIN),
+            "premise: on the origin"
+        );
+        let rows = inner_rows(&mut app, width, height);
+        assert_eq!(
+            rows[0],
+            format!("{PINNED_SAMPLE_MARKER}{HEADER_SEPARATOR}live busy{BANNER_AGE_SEPARATOR}46m"),
+            "the origin's row keeps its own live status and age: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains(REPLY_COOKING_LABEL)),
+            "the fork's tail never draws on the origin: {rows:?}"
         );
     }
 
@@ -18546,6 +18816,7 @@ mod tests {
             has_agent_name: false,
             has_agent_setting: false,
             failed_task: None,
+            custom_title: None,
         }
     }
 
@@ -18919,6 +19190,422 @@ mod tests {
         for y in 0..height {
             assert!(!row_text(&buffer, y, width).contains(needle), "row {y}");
         }
+    }
+
+    // --- forks named by the `Ctrl-F` box: the child row's name ---------------
+
+    /// The turn count each fork in [`named_forks_board`] holds — multi-digit, like
+    /// [`BG_MSGS`], so a count clipped at the edge would read back as a smaller,
+    /// plausible number rather than vanish.
+    const FORK_MSGS: usize = 171;
+
+    /// [`ANCESTOR_ID`] as the parent of `forks` — `(id, name, timestamp)` — each
+    /// named `fork: <name>` the way the `Ctrl-F` box names it, plus `extra`
+    /// members as given, EXPANDED so every child row is drawn.
+    fn named_forks_board(forks: &[(&str, &str, i64)], extra: Vec<Session>) -> App {
+        let mut sessions = vec![lineage_session(
+            ANCESTOR_ID,
+            "fork-root",
+            LINEAGE_LABEL,
+            ANCESTOR_TS,
+            ANCESTOR_MSGS,
+        )];
+        for &(id, name, ts) in forks {
+            let mut fork = lineage_session(id, "fork-root", LINEAGE_LABEL, ts, FORK_MSGS);
+            fork.custom_title = Some(format!("fork: {name}"));
+            sessions.push(fork);
+        }
+        sessions.extend(extra);
+        let mut app = App::new(sessions, Scope::All, PathBuf::from("/tmp/launch"));
+        app.expand_selected();
+        app
+    }
+
+    /// The segment a named fork's child row draws in the id's slot.
+    fn fork_segment(name: &str) -> String {
+        format!("{FORK_GLYPH} {name}")
+    }
+
+    /// Decision 2, drawn: a parent and three forks made from the box, expanded.
+    /// The parent heads the lineage with the label they all share, and EACH child
+    /// row draws its OWN fork's name, `fork: ` stripped, as `⑂ <name>` in the slot
+    /// an unnamed member's id takes — after the timestamp, ahead of the count, and
+    /// with no id beside it.
+    #[test]
+    fn render_list_draws_each_named_forks_own_name_on_its_child_row() {
+        let forks = [
+            ("11111111-aaaa-bbbb-cccc-000000000001", "Review PR1", 200),
+            ("22222222-aaaa-bbbb-cccc-000000000002", "Review PR2", 300),
+            ("33333333-aaaa-bbbb-cccc-000000000003", "Review PR3", 400),
+        ];
+        let mut app = named_forks_board(&forks, Vec::new());
+        let (width, height) = LINEAGE_BOARD_SIZE;
+        let buffer = drawn_list(&mut app, width, height);
+
+        let head = row_text(
+            &buffer,
+            row_of(&buffer, width, height, LINEAGE_LABEL),
+            width,
+        );
+        assert!(
+            head.contains(&short_time(at(ANCESTOR_TS))) && !head.contains(CHILD_GUTTER.trim()),
+            "the parent heads its forks, as a head row: {head:?}"
+        );
+        for (id, name, ts) in forks {
+            let text = row_text(
+                &buffer,
+                row_of(&buffer, width, height, &fork_segment(name)),
+                width,
+            );
+            assert!(
+                text.contains(&format!(
+                    "{}{}  {}{}",
+                    CHILD_GUTTER.trim_start(),
+                    short_time(at(ts)),
+                    fork_segment(name),
+                    child_msgs(FORK_MSGS)
+                )),
+                "the child row draws `⑂ <name>` after its timestamp and ahead of \
+                 its count, never right after the arrow: {text:?}"
+            );
+            assert!(
+                !text.contains(&short_id(id)),
+                "the name takes the id's place, so the id is not drawn: {text:?}"
+            );
+            assert!(!text.contains("fork:"), "the prefix is stripped: {text:?}");
+            for (_, other, _) in forks {
+                assert!(
+                    other == name || !text.contains(other),
+                    "a child draws its OWN name, never a sibling's: {text:?}"
+                );
+            }
+        }
+    }
+
+    /// The name sits where the parent row draws its label: after the badge, not
+    /// only after the timestamp — the slot the id held.
+    #[test]
+    fn render_list_draws_a_named_forks_name_after_its_badge() {
+        const FORK_ID: &str = "11111111-aaaa-bbbb-cccc-000000000001";
+        let mut app = named_forks_board(&[(FORK_ID, "Review PR1", BG_TS)], Vec::new());
+        let blocked = ReportedAgent {
+            kind: "background".to_string(),
+            id: None,
+            state: Some("blocked".to_string()),
+            status: None,
+            pid: None,
+            started_at_ms: None,
+        };
+        app.set_reported_agents(HashMap::from([(FORK_ID.to_string(), blocked)]), None);
+        let (width, height) = LINEAGE_BOARD_SIZE;
+        let buffer = drawn_list(&mut app, width, height);
+
+        let child = row_of(&buffer, width, height, &fork_segment("Review PR1"));
+        let text = row_text(&buffer, child, width);
+        assert!(
+            text.contains(&format!("needs input  {}", fork_segment("Review PR1"))),
+            "the name follows the badge, in the id's slot: {text:?}"
+        );
+        assert!(
+            column_of(&buffer, child, width, FORK_GLYPH)
+                > column_of(&buffer, child, width, "needs input"),
+            "the badge comes first: {text:?}"
+        );
+        assert!(
+            !text.contains(&short_id(FORK_ID)),
+            "no id beside the name: {text:?}"
+        );
+    }
+
+    /// Two shapes of child row in ONE lineage: the named fork draws `⑂ <name>`, and
+    /// a member with no fork name — here the parent, pushed down by an unnamed
+    /// background copy that took the head — draws exactly what a child row always
+    /// drew: its id, then its count, and no fork sign.
+    #[test]
+    fn render_list_keeps_the_id_on_an_unnamed_members_child_row() {
+        const FORK_ID: &str = "11111111-aaaa-bbbb-cccc-000000000001";
+        const FORK_TS: i64 = 300;
+        let bg_copy = lineage_session(BG_ID, "fork-root", LINEAGE_LABEL, BG_TS, BG_MSGS);
+        let mut app = named_forks_board(&[(FORK_ID, "Review PR1", FORK_TS)], vec![bg_copy]);
+        let (width, height) = LINEAGE_BOARD_SIZE;
+        let buffer = drawn_list(&mut app, width, height);
+
+        // The premise: the unnamed copy heads, so the parent is a CHILD row.
+        let head = row_text(
+            &buffer,
+            row_of(&buffer, width, height, LINEAGE_LABEL),
+            width,
+        );
+        assert!(
+            head.contains(&short_time(at(BG_TS))),
+            "the unnamed background copy heads the lineage: {head:?}"
+        );
+        assert!(
+            row_text(
+                &buffer,
+                row_of(&buffer, width, height, &fork_segment("Review PR1")),
+                width
+            )
+            .contains(&short_time(at(FORK_TS))),
+            "the named fork's child row wears its name"
+        );
+
+        let id = short_id(ANCESTOR_ID);
+        let text = row_text(&buffer, row_of(&buffer, width, height, &id), width);
+        let unselected = " ".repeat(LIST_HIGHLIGHT_SYMBOL.chars().count());
+        assert_eq!(
+            text,
+            format!(
+                "{unselected}{CHILD_GUTTER}{}  {id}{}",
+                short_time(at(ANCESTOR_TS)),
+                child_msgs(ANCESTOR_MSGS)
+            ),
+            "an unnamed member's child row is unchanged"
+        );
+        assert!(!text.contains(FORK_GLYPH), "no fork sign without a name");
+    }
+
+    /// Wide enough for a named fork's child row to draw `⑂ Review PR1` whole but
+    /// not the `  171 msgs` after it.
+    ///
+    /// That row spends 23 columns before its name (gutter, the fixture's
+    /// sixteen-column epoch timestamp, the gap), `⑂ Review PR1` takes it to 35 and
+    /// the count would take it to 45. This width gives the row 40 drawable
+    /// columns: between the two.
+    const NAMED_FORK_NO_COUNT_WIDTH: u16 = 44;
+
+    /// Too narrow for even the whole name: 30 drawable columns, so the name keeps
+    /// the five left after the 23 before it and its own `⑂ `.
+    const NAMED_FORK_CUT_NAME_WIDTH: u16 = 34;
+
+    /// The name outranks the count: as the pane narrows, the count drops WHOLE
+    /// first, and only then is the name cut — ellipsized, filling the row exactly,
+    /// never dropped while a column is left for it.
+    #[test]
+    fn render_list_drops_a_named_forks_count_before_cutting_its_name() {
+        const NAME: &str = "Review PR1";
+        let forks = [("11111111-aaaa-bbbb-cccc-000000000001", NAME, BG_TS)];
+        let (full_width, height) = LINEAGE_BOARD_SIZE;
+
+        // The premise: with room, the row draws the name AND the count after it.
+        let mut app = named_forks_board(&forks, Vec::new());
+        let wide = drawn_list(&mut app, full_width, height);
+        let text = row_text(
+            &wide,
+            row_of(&wide, full_width, height, &fork_segment(NAME)),
+            full_width,
+        );
+        assert!(
+            text.ends_with(&format!("{}{}", fork_segment(NAME), child_msgs(FORK_MSGS))),
+            "the wide board must draw both, or this pins nothing: {text:?}"
+        );
+
+        // Room for the name, not the count: the count goes whole, the name stays.
+        let width = NAMED_FORK_NO_COUNT_WIDTH;
+        let narrow = drawn_list(&mut app, width, height);
+        let text = row_text(
+            &narrow,
+            row_of(&narrow, width, height, &fork_segment(NAME)),
+            width,
+        );
+        assert!(
+            text.ends_with(&fork_segment(NAME)),
+            "the count drops before the name, and no fragment of it follows: {text:?}"
+        );
+
+        // Room for neither whole: the name is cut, never the timestamp before it.
+        let width = NAMED_FORK_CUT_NAME_WIDTH;
+        let cut = drawn_list(&mut app, width, height);
+        let row = row_of(&cut, width, height, &format!("{FORK_GLYPH} "));
+        let text = row_text(&cut, row, width);
+        assert!(
+            !text.contains(NAME) && !text.contains(CHILD_MSGS_SUFFIX),
+            "the fixture must be too narrow for the whole name: {text:?}"
+        );
+        assert!(
+            text.contains(&format!("{}  {FORK_GLYPH} Rev", short_time(at(BG_TS))))
+                && text.ends_with(LABEL_ELLIPSIS),
+            "the name is ellipsized after an intact timestamp: {text:?}"
+        );
+        assert_eq!(
+            text.width(),
+            usize::from(width) - 2,
+            "the cut name fills the row exactly: {text:?}"
+        );
+    }
+
+    /// The fork sign is ONE column, the width [`fit_child_name`] counts it as.
+    #[test]
+    fn fork_glyph_is_one_column_wide() {
+        assert_eq!(UnicodeWidthStr::width(FORK_GLYPH), 1);
+        assert_eq!(FORK_GLYPH.chars().count(), 1);
+        assert_eq!(Span::raw(FORK_GLYPH).width(), 1);
+    }
+
+    /// The segment takes what the timestamp and badge leave: `⑂ ` plus the whole
+    /// name when it fits, ellipsized when it does not, and nothing once no column
+    /// is left for the name itself.
+    #[test]
+    fn fit_child_name_spends_only_what_the_row_leaves() {
+        let whole = fork_segment("Review PR1");
+        assert_eq!(fit_child_name("Review PR1", 40, 10, 0), Some(whole.clone()));
+        assert_eq!(
+            fit_child_name("Review PR1", 22, 10, 0),
+            Some(whole),
+            "the exact fit is a fit"
+        );
+        let tight = fit_child_name("Review PR1", 20, 12, 0).expect("six columns are left");
+        assert_eq!(tight, fork_segment(&format!("Revie{LABEL_ELLIPSIS}")));
+        assert_eq!(tight.width(), 8);
+        assert_eq!(
+            fit_child_name("Review PR1", 20, 17, 0),
+            Some(fork_segment(LABEL_ELLIPSIS)),
+            "one column for the name is still the start of it"
+        );
+        assert_eq!(fit_child_name("Review PR1", 20, 18, 0), None);
+        assert_eq!(fit_child_name("Review PR1", 20, 99, 0), None);
+    }
+
+    /// The markers' columns are held back from the name the way [`fit_label`]
+    /// holds a head row's back: the name gets what is left after them, cut first,
+    /// and dropped only when not one column remains.
+    #[test]
+    fn fit_child_name_holds_the_markers_columns_back() {
+        // 40 columns, 10 used, `⑂ ` takes 2: 28 left before any marker.
+        assert_eq!(
+            fit_child_name("Review PR1", 40, 10, 18),
+            Some(fork_segment("Review PR1")),
+            "exactly the name's ten columns are left"
+        );
+        assert_eq!(
+            fit_child_name("Review PR1", 40, 10, 19),
+            Some(fork_segment(&format!("Review P{LABEL_ELLIPSIS}")))
+        );
+        assert_eq!(
+            fit_child_name("Review PR1", 40, 10, 27),
+            Some(fork_segment(LABEL_ELLIPSIS))
+        );
+        assert_eq!(fit_child_name("Review PR1", 40, 10, 28), None);
+    }
+
+    /// Of the markers that apply, a child row keeps each that fits what the ones
+    /// before it leave, in drawing order, and drops the rest WHOLE.
+    #[test]
+    fn fit_child_markers_keeps_what_fits_in_order_and_drops_the_rest_whole() {
+        let failed = FAILED_TASK_MARKER.chars().count();
+        let unbound = AGENT_UNBOUND_MARKER.chars().count();
+        let hidden = HIDDEN_ROW_MARKER.chars().count();
+        let all = ChildMarkers {
+            failed: true,
+            unbound: true,
+            hidden: true,
+        };
+        let none = ChildMarkers {
+            failed: false,
+            unbound: false,
+            hidden: false,
+        };
+        let width = 10 + failed + unbound + hidden;
+
+        assert_eq!(fit_child_markers(true, true, true, width, 10), all);
+        assert_eq!(all.width(), failed + unbound + hidden);
+        assert_eq!(fit_child_markers(false, false, false, width, 10), none);
+        assert_eq!(none.width(), 0);
+        assert_eq!(
+            fit_child_markers(true, true, true, width - 1, 10),
+            ChildMarkers {
+                hidden: false,
+                ..all
+            },
+            "one column short: the last marker goes whole"
+        );
+        assert_eq!(
+            fit_child_markers(true, true, true, 10 + failed + hidden, 10),
+            ChildMarkers {
+                unbound: false,
+                ..all
+            },
+            "a marker that does not fit leaves its columns to the next"
+        );
+        assert_eq!(
+            fit_child_markers(true, true, true, 10 + failed - 1, 10),
+            ChildMarkers {
+                unbound: true,
+                ..none
+            },
+            "too narrow for the failed task, which then leaves room for `[unbound]`"
+        );
+        assert_eq!(fit_child_markers(true, true, true, 10, 10), none);
+    }
+
+    /// The fork whose row [`render_list_keeps_a_named_forks_markers_over_its_name`]
+    /// draws.
+    const MARKED_FORK_ID: &str = "11111111-aaaa-bbbb-cccc-000000000001";
+
+    /// Room on a named fork's child row for the 23 columns before its name, its
+    /// three markers (36) and `⑂ ` plus five columns of name — not for the whole
+    /// `⑂ Review PR1` (12), and not for the count (10) on top. 66 drawable columns.
+    const NAMED_FORK_MARKERS_WIDTH: u16 = 70;
+
+    /// A named fork carrying `[task failed]`, `[unbound]` and `[hidden]` on a
+    /// narrow pane: the count drops first, then the name is cut, and every marker
+    /// stays whole at the row's end — `[hidden]` included, never pushed past the
+    /// edge.
+    #[test]
+    fn render_list_keeps_a_named_forks_markers_over_its_name() {
+        const NAME: &str = "Review PR1";
+        let mut app = named_forks_board(&[(MARKED_FORK_ID, NAME, BG_TS)], Vec::new());
+        let fork = app
+            .sessions
+            .iter()
+            .position(|s| s.session_id == MARKED_FORK_ID)
+            .expect("the fork is on the board");
+        app.sessions[fork].failed_task = Some(failed_task(SHORT_FAILURE, None));
+        app.hidden_ids.insert(MARKED_FORK_ID.to_string());
+        app.toggle_show_hidden();
+        app.lost_agent_bindings.insert(MARKED_FORK_ID.to_string());
+        let markers = format!(
+            "{}{}{}",
+            FAILED_TASK_MARKER, AGENT_UNBOUND_MARKER, HIDDEN_ROW_MARKER
+        );
+        let (full_width, height) = LINEAGE_BOARD_SIZE;
+
+        // The premise: with room, the row draws name, count and all three markers.
+        let wide = drawn_list(&mut app, full_width, height);
+        let text = row_text(
+            &wide,
+            row_of(&wide, full_width, height, &fork_segment(NAME)),
+            full_width,
+        );
+        assert!(
+            text.ends_with(&format!(
+                "{}{}{markers}",
+                fork_segment(NAME),
+                child_msgs(FORK_MSGS)
+            )),
+            "the wide board must draw every field, or this pins nothing: {text:?}"
+        );
+
+        let width = NAMED_FORK_MARKERS_WIDTH;
+        let narrow = drawn_list(&mut app, width, height);
+        let text = row_text(
+            &narrow,
+            row_of(&narrow, width, height, &format!("{FORK_GLYPH} ")),
+            width,
+        );
+        assert!(
+            text.ends_with(&format!("{FORK_GLYPH} Revi{LABEL_ELLIPSIS}{markers}")),
+            "the name is cut and every marker is kept whole: {text:?}"
+        );
+        assert!(
+            !text.contains(CHILD_MSGS_SUFFIX),
+            "the count went first: {text:?}"
+        );
+        assert_eq!(
+            text.width(),
+            usize::from(width) - 2,
+            "the row fills the pane exactly, nothing past the edge: {text:?}"
+        );
     }
 
     // --- failed background task: the row marker -----------------------------

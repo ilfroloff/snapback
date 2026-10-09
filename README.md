@@ -14,7 +14,7 @@ For developers who run Claude Code in many repos and worktrees at once.
 
 - **One live board** — the repo and all its worktrees grouped by branch, `-a` for every repo, updating as agents write.
 - **Agent status at a glance** — needs input, working, done, failed.
-- **Act without leaving** — `Ctrl-R` reply, `Ctrl-K` stop, `Ctrl-N` start a background agent (optionally one of your agents, model per message), `Enter` resume or attach and return to the board.
+- **Act without leaving** — `Ctrl-R` reply, `Ctrl-F` fork, `Ctrl-K` stop, `Ctrl-N` start a background agent (optionally one of your agents, model per message), `Enter` resume or attach and return to the board.
 - **Find a session by what was said** — `Tab` searches transcripts and the preview jumps to the hit.
 - **Background hand-off copies folded** into one `(+N)` row.
 

@@ -386,7 +386,8 @@ pub enum ModalAction {
     /// carries an attachable job id; an interactive (`live`) session has none, so
     /// the choice refuses with a clear hint (Fork instead).
     Attach,
-    /// Fork the target session (`claude -r <id> --fork-session`).
+    /// Fork the target session (`claude -r <id> --fork-session --name "fork:
+    /// <label>"`).
     Fork,
     /// Start a brand-new session, optionally bound to the named agent. `None` is
     /// the "default (no agent)" row (a bare `claude`); the agent name rides the
@@ -554,6 +555,64 @@ pub struct PendingInterrupt {
     pub route: InterruptRoute,
 }
 
+/// Declares [`KeyboardOwner`] and its [`KeyboardOwner::PRECEDENCE`] from ONE
+/// variant list, so no owner can exist without being asked, and the order the
+/// variants are written in IS the order a key reaches them. Plain Rust has no way
+/// to iterate an enum's variants; this is what keeps the list from being kept by
+/// hand.
+macro_rules! keyboard_owners {
+    ($(#[$enum_attr:meta])* pub enum KeyboardOwner {
+        $($(#[$attr:meta])* $owner:ident,)+
+    }) => {
+        $(#[$enum_attr])*
+        pub enum KeyboardOwner {
+            $($(#[$attr])* $owner,)+
+        }
+
+        impl KeyboardOwner {
+            /// Every owner, in the order [`App::keyboard_owner`] asks them: the
+            /// first one open owns the key.
+            pub const PRECEDENCE: &'static [Self] = &[$(Self::$owner,)+];
+        }
+    };
+}
+
+keyboard_owners! {
+    /// A surface that owns the keyboard ahead of the board's `key_to_action`, as
+    /// [`App::keyboard_owner`] names it. The ONE list of them: `update::dispatch`
+    /// and `update::handle_paste` route by an exhaustive `match` on it, so a new
+    /// owner fails to compile until both route it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum KeyboardOwner {
+        /// A [`Modal`]: the Attach/Fork/Cancel choice, the agent picker, a
+        /// compose's model picker (which therefore outranks the compose it is
+        /// open over), the move picker and its lineage scope confirm, the delete
+        /// confirm.
+        Modal,
+        /// A pending `Ctrl-X` leader chord ([`App::pending_chord`]).
+        Chord,
+        /// The stop-then-reply confirmation ([`App::pending_stop`]).
+        StopConfirm,
+        /// The `Ctrl-K` interrupt confirmation ([`App::pending_interrupt`]).
+        InterruptConfirm,
+        /// An open compose box, any target ([`App::is_composing`]).
+        Compose,
+    }
+}
+
+impl KeyboardOwner {
+    /// Whether this owner is open on `app`.
+    fn is_open(self, app: &App) -> bool {
+        match self {
+            Self::Modal => app.modal.is_some(),
+            Self::Chord => app.pending_chord,
+            Self::StopConfirm => app.pending_stop.is_some(),
+            Self::InterruptConfirm => app.pending_interrupt.is_some(),
+            Self::Compose => app.is_composing(),
+        }
+    }
+}
+
 /// A quick-reply send that is IN FLIGHT (dispatched, not yet finished).
 ///
 /// Carries everything the preview needs to render the reply OPTIMISTICALLY while
@@ -574,6 +633,20 @@ pub struct Sending {
     /// when the send was dispatched. The echo shows only while the reloaded count
     /// still equals this — i.e. nothing new has landed on disk yet.
     pub baseline_msg_count: usize,
+}
+
+/// The pair a fork send leaves behind so the cursor can follow it: the row the fork
+/// was made from and the id the fork was given before claude ran.
+///
+/// Lives on [`App::fork_jump`] from the fork box's `Enter` until the first reload
+/// that shows `fork` in the store (or the fork's send fails), and is forgotten then
+/// whether or not the cursor moved — it is never a standing preference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkJump {
+    /// The row the fork box was opened on (the board's id for it).
+    pub origin: String,
+    /// The id snapback generated and passed as `--session-id`.
+    pub fork: String,
 }
 
 /// A `claude stop` interrupt that is IN FLIGHT (dispatched, not yet finished).
@@ -909,6 +982,11 @@ pub const MODEL_SETTINGS_TAG: &str = "(settings)";
 /// the box no height.
 pub const MODEL_PICKER_REPLY_MESSAGE: &str = "Model for this reply only (←/→ effort):";
 
+/// The model picker's prompt line when opened from a `Ctrl-F` FORK box: the pick is
+/// for this fork alone, and the original session is untouched. Same one-line budget
+/// as [`MODEL_PICKER_REPLY_MESSAGE`].
+pub const MODEL_PICKER_FORK_MESSAGE: &str = "Model for this fork only (←/→ effort):";
+
 /// The model picker's prompt line when opened from a `Ctrl-N` DRAFT: the pick is
 /// for the session this draft starts, whichever key starts it. Same one-line budget
 /// as [`MODEL_PICKER_REPLY_MESSAGE`].
@@ -1108,8 +1186,10 @@ pub fn resolve_compose_default(
 ) -> ComposeDefault {
     use super::compose::ComposeTarget;
     match target {
-        ComposeTarget::Reply { .. } if restore_overridden => ComposeDefault::RestoreOverridden,
-        ComposeTarget::Reply { .. } => session_model
+        ComposeTarget::Reply { .. } | ComposeTarget::Fork { .. } if restore_overridden => {
+            ComposeDefault::RestoreOverridden
+        }
+        ComposeTarget::Reply { .. } | ComposeTarget::Fork { .. } => session_model
             .map_or(ComposeDefault::NoSessionModel, |label| {
                 ComposeDefault::SessionModel(label.to_string())
             }),
@@ -2310,9 +2390,9 @@ pub struct App {
     /// structural rather than conventional.
     pub modal: Option<Modal>,
     /// The open compose editor, if any. `Some` while the compose modal owns the
-    /// keyboard — for EITHER draft: a quick reply (`Ctrl-R` on an idle session) or
-    /// a new background agent (`Ctrl-N`), told apart by its
-    /// [`ComposeTarget`](super::compose::ComposeTarget). Its type
+    /// keyboard — for ANY of its targets: a quick reply (`Ctrl-R` on an idle
+    /// session), a fork (`Ctrl-F`) or a new background agent (`Ctrl-N`), told
+    /// apart by its [`ComposeTarget`](super::compose::ComposeTarget). Its type
     /// ([`super::compose::ComposeState`]) holds the MULTILINE
     /// `ratatui_textarea` editor — one of exactly TWO `ratatui_textarea` values
     /// on this struct, the other being the one-line
@@ -2373,6 +2453,9 @@ pub struct App {
     /// wears a `moving…` badge (`view`). A fact true over an interval, so typed
     /// state, never the status line.
     moving: Vec<String>,
+    /// The cursor jump a fork send is waiting to make, consumed once by
+    /// [`apply_reload`](Self::apply_reload). See [`ForkJump`].
+    pub fork_jump: Option<ForkJump>,
     /// Completions a board session ended before it could read, kept here for the
     /// next board: the quick reply's `AppEvent::SendFinished` and the `Ctrl-X w`
     /// move job's `AppEvent::MoveFinished` (which alone clears its ids'
@@ -2815,6 +2898,7 @@ impl App {
             pending_stop: None,
             sending: Vec::new(),
             moving: Vec::new(),
+            fork_jump: None,
             undelivered: UndeliveredEvents::default(),
             interrupting: None,
             next_bg_launch_id: 0,
@@ -4354,10 +4438,10 @@ impl App {
     /// editor is up it is also what gates a new-session draft's pointer, because
     /// [`open_compose`](Self::open_compose) installs the two together.
     ///
-    /// An open QUICK-REPLY editor ([`compose`](Self::compose) with no draft card) is
-    /// deliberately NOT here, though it owns the keyboard. It previews the REAL
-    /// transcript, docked in its own rect that the transcript rect already stops
-    /// above, and none of the three actions reads or writes anything the reply
+    /// An open QUICK-REPLY or FORK editor ([`compose`](Self::compose) with no draft
+    /// card) is deliberately NOT here, though it owns the keyboard. It previews the
+    /// REAL transcript, docked in its own rect that the transcript rect already stops
+    /// above, and none of the three actions reads or writes anything the box
     /// holds: not its text or caret, not its target session, not the row selection
     /// that target is addressed by. A selection is mouse state ended by any key, a
     /// fold toggle re-renders the same session's transcript, and a link opens in
@@ -4397,7 +4481,7 @@ impl App {
         self.pending_interrupt = None;
     }
 
-    /// Whether the compose editor owns the keyboard — EITHER draft, since which one
+    /// Whether the compose editor owns the keyboard — ANY target, since which one
     /// is open is a `ComposeTarget` rather than a second piece of state. Gates key
     /// routing in [`super::update::handle_event`] (all keys go to the compose
     /// handler, bypassing `key_to_action`) and drives the compose-zone layout in
@@ -4408,6 +4492,24 @@ impl App {
     #[must_use]
     pub fn is_composing(&self) -> bool {
         self.compose.is_some()
+    }
+
+    /// The surface that owns the next key, or `None` when the board does: the
+    /// first [`KeyboardOwner`] open, in [`KeyboardOwner::PRECEDENCE`] order. Pure.
+    #[must_use]
+    pub fn keyboard_owner(&self) -> Option<KeyboardOwner> {
+        KeyboardOwner::PRECEDENCE
+            .iter()
+            .copied()
+            .find(|owner| owner.is_open(self))
+    }
+
+    /// Whether any [`KeyboardOwner`] is open. Read by
+    /// [`consume_fork_jump`](Self::consume_fork_jump), which must not move the
+    /// selection while any of them is acting on the row the user is looking at.
+    #[must_use]
+    pub fn keyboard_owned(&self) -> bool {
+        self.keyboard_owner().is_some()
     }
 
     // --- the compose surface: editor + draft card, opened and closed as one ---
@@ -4499,6 +4601,7 @@ impl App {
     /// this, the hard-delete guard reads it for snapback's own writer
     /// ([`crate::delete::can_delete_target`]), `Ctrl-R` refuses a second reply
     /// to a session it answers `Some` for ([`crate::send::reply_in_flight_refusal`]),
+    /// `Enter` refuses to resume it ([`crate::send::resume_in_flight_refusal`]),
     /// and `Ctrl-X w` opens no move picker for it
     /// ([`claude_move::MOVE_SENDING_REFUSAL`], in
     /// [`open_move_picker`](Self::open_move_picker)).
@@ -4521,6 +4624,56 @@ impl App {
     pub fn mark_sending(&mut self, sending: Sending) {
         self.clear_sending(&sending.session_id);
         self.sending.push(sending);
+    }
+
+    /// Arm the one-shot cursor jump from `origin` to the fork `fork` (replacing any
+    /// earlier pair: only the latest fork is followed).
+    pub fn set_fork_jump(&mut self, origin: String, fork: String) {
+        self.fork_jump = Some(ForkJump { origin, fork });
+    }
+
+    /// Forget the pending jump when it belongs to `fork` — its send failed, so the
+    /// fork may never appear. A different fork's pair is left alone.
+    pub fn forget_fork_jump(&mut self, fork: &str) {
+        if self.fork_jump.as_ref().is_some_and(|j| j.fork == fork) {
+            self.fork_jump = None;
+        }
+    }
+
+    /// Spend the pending [`ForkJump`], if the reload just applied shows its fork.
+    ///
+    /// Moves the cursor to the fork only when it is STILL on the origin (a user who
+    /// moved on keeps their place) AND nothing owns the keyboard
+    /// ([`keyboard_owned`](Self::keyboard_owned)): a box, prompt, picker or chord
+    /// open on the origin is acting on the row the user is looking at, and moving
+    /// the selection under it would change what it shows or targets. A fork FOLDED
+    /// under its origin — the usual case, since the origin heads its named forks
+    /// (`lineage::head_of`) — is revealed by expanding its lineage
+    /// ([`reveal_hidden`](Self::reveal_hidden)) and selected. A fork that is
+    /// filtered out (by the query, by hiding) leaves the cursor on the origin, never
+    /// on a neighbour, and the lineage as it was. The pair is forgotten as soon as
+    /// the fork is in the store, jump or no jump — DROPPED, never held for the owner
+    /// to close, so a cancelled box cannot fire a stale jump later; while the fork
+    /// is not in the store, the pair waits for a later reload.
+    fn consume_fork_jump(&mut self) {
+        let Some(jump) = self.fork_jump.as_ref() else {
+            return;
+        };
+        if !self.sessions.iter().any(|s| s.session_id == jump.fork) {
+            return;
+        }
+        let jump = self.fork_jump.take().expect("checked above");
+        if self.keyboard_owned() || self.selected.as_deref() != Some(jump.origin.as_str()) {
+            return;
+        }
+        let pos = self
+            .filtered
+            .iter()
+            .position(|&i| self.sessions[i].session_id == jump.fork)
+            .or_else(|| self.reveal_hidden(&jump.fork));
+        if let Some(pos) = pos {
+            self.select_pos(pos);
+        }
     }
 
     /// Forget the in-flight quick reply to `session_id`, because its
@@ -4843,6 +4996,7 @@ impl App {
         };
         let message = match compose.target {
             super::compose::ComposeTarget::Reply { .. } => MODEL_PICKER_REPLY_MESSAGE,
+            super::compose::ComposeTarget::Fork { .. } => MODEL_PICKER_FORK_MESSAGE,
             super::compose::ComposeTarget::NewBackgroundAgent { .. } => MODEL_PICKER_DRAFT_MESSAGE,
         };
         let current = compose.model.clone();
@@ -4961,7 +5115,8 @@ impl App {
     pub fn compose_default(&self) -> Option<ComposeDefault> {
         let compose = self.compose.as_ref()?;
         let session_model = match &compose.target {
-            super::compose::ComposeTarget::Reply { session_id, .. } => {
+            super::compose::ComposeTarget::Reply { session_id, .. }
+            | super::compose::ComposeTarget::Fork { session_id } => {
                 self.session_model_label(session_id)
             }
             super::compose::ComposeTarget::NewBackgroundAgent { .. } => None,
@@ -5146,6 +5301,7 @@ impl App {
         self.recompute_filtered();
 
         self.restore_selection(prev_id.clone(), prev_pos);
+        self.consume_fork_jump();
         self.clamp_scroll();
         // A mouse selection is anchored to rows of the previewed transcript as
         // it was RENDERED, so it goes when those rows may name other text — the
@@ -6124,6 +6280,7 @@ mod tests {
             has_agent_name: false,
             has_agent_setting: false,
             failed_task: None,
+            custom_title: None,
         }
     }
 
@@ -13285,5 +13442,288 @@ mod tests {
 
         assert!(app.catalogs_in_flight.is_empty());
         assert_eq!(app.catalogs.get(&cached), Some(&catalog("sbping")));
+    }
+
+    /// A board over `A` (older) with a jump armed to the fork `F`, cursor on `A`.
+    fn jump_board() -> App {
+        let mut app = app_all(vec![session_ts("A", "r", Some("main"), "/tmp/a", 100)]);
+        app.set_selected(Some("A".to_string()));
+        app.set_fork_jump("A".to_string(), "F".to_string());
+        app
+    }
+
+    /// The reload that brings the fork in, beside `A` and an unrelated `B`.
+    fn reload_with_fork(app: &mut App) {
+        app.apply_sessions(vec![
+            session_ts("A", "r", Some("main"), "/tmp/a", 100),
+            session_ts("B", "r", Some("main"), "/tmp/b", 50),
+            session_ts("F", "r", Some("main"), "/tmp/a", 300),
+        ]);
+    }
+
+    /// Still on `A` when `F` first shows up: the cursor follows to `F`, and the pair
+    /// is spent.
+    #[test]
+    fn the_cursor_follows_a_fork_it_is_still_waiting_on() {
+        let mut app = jump_board();
+        app.apply_sessions(vec![session_ts("A", "r", Some("main"), "/tmp/a", 100)]);
+        assert_eq!(app.selected.as_deref(), Some("A"));
+        assert!(
+            app.fork_jump.is_some(),
+            "F is not in the store yet: the pair waits"
+        );
+
+        reload_with_fork(&mut app);
+        assert_eq!(app.selected.as_deref(), Some("F"));
+        assert!(app.fork_jump.is_none());
+    }
+
+    /// Moved to another row before `F` appeared: the user's place wins, and the pair
+    /// is forgotten so a later reload cannot yank the cursor.
+    #[test]
+    fn the_cursor_stays_where_the_user_moved_it() {
+        let mut app = jump_board();
+        app.apply_sessions(vec![
+            session_ts("A", "r", Some("main"), "/tmp/a", 100),
+            session_ts("B", "r", Some("main"), "/tmp/b", 50),
+        ]);
+        app.set_selected(Some("B".to_string()));
+        reload_with_fork(&mut app);
+        assert_eq!(app.selected.as_deref(), Some("B"));
+        assert!(app.fork_jump.is_none());
+        app.set_selected(Some("A".to_string()));
+        reload_with_fork(&mut app);
+        assert_eq!(
+            app.selected.as_deref(),
+            Some("A"),
+            "forgotten, not deferred"
+        );
+    }
+
+    /// A fork that is not a visible row (here hidden) leaves the cursor on `A`, not
+    /// on whichever neighbour sits where `F` would have been.
+    #[test]
+    fn a_filtered_out_fork_leaves_the_cursor_on_the_original() {
+        let mut app = jump_board();
+        app.hidden_ids.insert("F".to_string());
+        // `B` is newer than `A`, so it heads the list: a jump that fell back to a
+        // position would land there.
+        app.apply_sessions(vec![
+            session_ts("A", "r", Some("main"), "/tmp/a", 100),
+            session_ts("B", "r", Some("main"), "/tmp/b", 200),
+            session_ts("F", "r", Some("main"), "/tmp/a", 300),
+        ]);
+        assert_eq!(app.selected.as_deref(), Some("A"));
+        assert!(
+            app.fork_jump.is_none(),
+            "forgotten whether or not it jumped"
+        );
+    }
+
+    /// A failed fork voids its pair; another fork's pair is untouched.
+    #[test]
+    fn a_failed_fork_forgets_only_its_own_pair() {
+        let mut app = jump_board();
+        app.forget_fork_jump("other");
+        assert!(app.fork_jump.is_some());
+        app.forget_fork_jump("F");
+        assert!(app.fork_jump.is_none());
+        reload_with_fork(&mut app);
+        assert_eq!(app.selected.as_deref(), Some("A"));
+    }
+
+    /// `F` as the fork box's `Enter` writes it: `A`'s root (the copied prefix) and a
+    /// `fork: ` name, so `A` keeps the head and `F` arrives FOLDED beneath it.
+    fn named_fork_of_a(label: &str) -> Session {
+        let mut fork = session_fork("F", "/tmp/a", "root-a", 300);
+        fork.custom_title = Some("fork: try it".to_string());
+        fork.label = label.to_string();
+        fork
+    }
+
+    /// `A`, the origin of [`named_fork_of_a`], older than its fork.
+    fn origin_a(label: &str) -> Session {
+        let mut origin = session_fork("A", "/tmp/a", "root-a", 100);
+        origin.label = label.to_string();
+        origin
+    }
+
+    /// The fork lands folded under the origin it was made from: the jump expands
+    /// that lineage and selects the fork, and the lineage sits where the fork sorts.
+    #[test]
+    fn the_jump_expands_a_folded_fork_and_selects_it() {
+        let mut app = app_all(vec![origin_a("shared")]);
+        app.set_selected(Some("A".to_string()));
+        app.set_fork_jump("A".to_string(), "F".to_string());
+
+        app.apply_sessions(vec![
+            origin_a("shared"),
+            session_fork("B", "/tmp/b", "root-b", 200),
+            named_fork_of_a("shared"),
+        ]);
+
+        assert_eq!(app.selected.as_deref(), Some("F"));
+        assert_eq!(visible_ids(&app), vec!["A", "F", "B"]);
+        assert!(app.fork_jump.is_none());
+    }
+
+    /// A fork the QUERY filters out is not folded, so nothing can reveal it: the
+    /// cursor stays on the origin — not on `B`, the row heading the list — and the
+    /// origin's lineage is not left open behind the user's back.
+    #[test]
+    fn a_fork_filtered_out_by_the_query_leaves_the_cursor_and_the_fold_alone() {
+        let neighbour = || {
+            let mut b = session_fork("B", "/tmp/b", "root-b", 200);
+            b.label = "alpha neighbour".to_string();
+            b
+        };
+        let mut app = app_all(vec![origin_a("alpha origin"), neighbour()]);
+        app.push_query_str("alpha");
+        app.set_selected(Some("A".to_string()));
+        app.set_fork_jump("A".to_string(), "F".to_string());
+
+        app.apply_sessions(vec![
+            origin_a("alpha origin"),
+            neighbour(),
+            named_fork_of_a("beta fork"),
+        ]);
+
+        assert_eq!(app.selected.as_deref(), Some("A"));
+        assert_eq!(visible_ids(&app), vec!["B", "A"]);
+        assert!(app.expanded.is_empty(), "no lineage was opened");
+        assert!(app.fork_jump.is_none());
+    }
+
+    /// The fork box's picker says whose model it picks, and its default is the
+    /// session's own like a reply's.
+    #[test]
+    fn the_fork_boxs_picker_names_the_fork_and_defaults_like_a_reply() {
+        let mut app = app_all(vec![session("s", "r", Some("main"), "/tmp/s")]);
+        app.open_compose(
+            super::super::compose::ComposeState::new_fork("s".to_string()),
+            None,
+        );
+        app.open_model_picker();
+        assert_eq!(
+            app.modal.take().expect("open").message,
+            MODEL_PICKER_FORK_MESSAGE
+        );
+        assert!(MODEL_PICKER_FORK_MESSAGE.chars().count() <= 60);
+        assert_eq!(
+            app.compose_default(),
+            Some(ComposeDefault::NoSessionModel),
+            "a fork restores the session's model like a reply: none on record here"
+        );
+    }
+
+    /// Opens one keyboard owner on the jump's origin `A`.
+    type OpenOwner = fn(&mut App);
+
+    /// The ways to open `owner` on `A`, each named so a failure says which one
+    /// leaked. The exhaustive `match` is what makes a new [`KeyboardOwner`] fail to
+    /// compile here until it has an opener; [`KeyboardOwner::PRECEDENCE`], which the
+    /// owner tests iterate, is generated from the same variant list.
+    fn openers(owner: KeyboardOwner) -> Vec<(&'static str, OpenOwner)> {
+        use super::super::compose::ComposeState;
+        match owner {
+            KeyboardOwner::Modal => vec![
+                ("Attach/Fork/Cancel choice", |app| {
+                    app.open_live_choice("A".to_string());
+                }),
+                ("model picker over a fork box", |app| {
+                    app.open_compose(ComposeState::new_fork("A".to_string()), None);
+                    app.open_model_picker();
+                }),
+            ],
+            KeyboardOwner::Chord => vec![("Ctrl-X chord", |app| app.pending_chord = true)],
+            KeyboardOwner::StopConfirm => vec![("stop confirm", |app| {
+                app.open_stop_confirm("A".to_string(), "job-a".to_string());
+            })],
+            KeyboardOwner::InterruptConfirm => vec![("interrupt confirm", |app| {
+                app.open_interrupt_confirm(
+                    "A".to_string(),
+                    InterruptRoute::Job {
+                        job_id: "job-a".to_string(),
+                    },
+                );
+            })],
+            KeyboardOwner::Compose => vec![
+                ("reply box", |app| {
+                    app.open_compose(ComposeState::new_reply("A".to_string(), None), None);
+                }),
+                ("fork box", |app| {
+                    app.open_compose(ComposeState::new_fork("A".to_string()), None);
+                }),
+            ],
+        }
+    }
+
+    /// Closes `owner`; exhaustive for the same reason as [`openers`].
+    fn close(app: &mut App, owner: KeyboardOwner) {
+        match owner {
+            KeyboardOwner::Modal => app.close_modal(),
+            KeyboardOwner::Chord => app.pending_chord = false,
+            KeyboardOwner::StopConfirm => app.stop_confirm_cancel(),
+            KeyboardOwner::InterruptConfirm => app.interrupt_confirm_cancel(),
+            KeyboardOwner::Compose => app.close_compose(),
+        }
+    }
+
+    /// Every opener of every owner, paired with the owner it opens.
+    fn every_opener() -> Vec<(KeyboardOwner, &'static str, OpenOwner)> {
+        KeyboardOwner::PRECEDENCE
+            .iter()
+            .flat_map(|&owner| {
+                openers(owner)
+                    .into_iter()
+                    .map(move |(name, open)| (owner, name, open))
+            })
+            .collect()
+    }
+
+    /// Each opener makes its own variant the owner `update::dispatch` routes the
+    /// next key to, and the bare board has none.
+    #[test]
+    fn keyboard_owner_names_each_owner_it_is_opened_as() {
+        let bare = jump_board();
+        assert_eq!(bare.keyboard_owner(), None, "the bare board owns nothing");
+        assert!(!bare.keyboard_owned());
+        for (owner, name, open) in every_opener() {
+            let mut app = jump_board();
+            open(&mut app);
+            assert_eq!(app.keyboard_owner(), Some(owner), "{name}");
+            assert!(app.keyboard_owned(), "{name}");
+        }
+    }
+
+    /// The fork lands while something owns the keyboard on the origin: the cursor
+    /// stays on `A` and the pair is SPENT, so closing the owner and reloading again
+    /// cannot fire a stale jump.
+    #[test]
+    fn the_jump_is_dropped_while_anything_owns_the_keyboard() {
+        let mut jumped = Vec::new();
+        for (_, name, open) in every_opener() {
+            let mut app = jump_board();
+            open(&mut app);
+            reload_with_fork(&mut app);
+            if app.selected.as_deref() != Some("A") {
+                jumped.push(name);
+            }
+            assert!(app.fork_jump.is_none(), "{name}: the pair is spent");
+
+            for &owner in KeyboardOwner::PRECEDENCE {
+                close(&mut app, owner);
+            }
+            assert_eq!(app.keyboard_owner(), None, "{name}: premise, all closed");
+            reload_with_fork(&mut app);
+            assert!(
+                app.selected.as_deref() == Some("A") || jumped.contains(&name),
+                "{name}: dropped, not held for the owner to close"
+            );
+        }
+        assert!(
+            jumped.is_empty(),
+            "the cursor jumped under these owners: {jumped:?}"
+        );
     }
 }

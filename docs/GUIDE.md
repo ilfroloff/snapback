@@ -29,13 +29,13 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | `↑` / `↓` | Move the selection |
 | `←` / `→` | Move the **cursor in your search** one character, to fix a typo without retyping the rest. The list and the preview stay where they are |
 | `Alt+←` / `Alt+→` (`⌥←` / `⌥→`) / `Alt+B` / `Alt+F` / `Ctrl-←` / `Ctrl-→` | Move the **cursor in your search** one **word**, landing where a word jump in the reply box does: forward goes to the start of the next word. Depending on the terminal, `⌥←` / `⌥→` arrives as `Alt+←` / `Alt+→` or as `Alt+B` / `Alt+F`, so both are bound; `Ctrl-←` / `Ctrl-→` does the same without Option. The list and the preview stay where they are |
-| `Enter` | **Resume** the selected session, returning to the board when it exits. On a **running** session it opens an **Attach / Fork / Cancel** choice instead. A session snapback is still moving (`Ctrl-X w`, the row reads `moving…`) is refused until the move finishes |
-| `Ctrl-F` | **Fork** the selected session into a copy — available for any session, running or not, except one snapback is still moving (`Ctrl-X w`) |
+| `Enter` | **Resume** the selected session, returning to the board when it exits. On a **running** session it opens an **Attach / Fork / Cancel** choice instead. A session snapback is still sending a quick reply to, or still making as a fork from the `Ctrl-F` box's `Enter` (its preview reads `claude cooking…`), is refused until that lands — the session the fork came from resumes as usual. A session snapback is still moving (`Ctrl-X w`, the row reads `moving…`) is refused until the move finishes |
+| `Ctrl-F` | **Fork** the selected session into a copy — available for any session, running or not, except one snapback is still moving (`Ctrl-X w`), which is refused until the move finishes. Opens a fork box (after a folder check: a deleted folder is refused before you type). `Enter` forks it **without leaving the board**, like a quick reply, and when the fork appears the cursor opens its fold and jumps to it if you haven't moved and nothing else is open (another box, a picker or a prompt); `Ctrl-O` forks it **interactively** (an empty box is the plain fork; a typed message auto-submits as the fork's first turn); `Ctrl-L` picks the model for that fork; `Ctrl-J` / `Alt+Enter` newline; `Esc` cancels; a `/` or `@` opens the pick list (the `/` or `@` row below). Either way the fork is **named** `fork: <first line of your message>` (`fork: <the session's label>` for an empty box) and folds under the session it came from, which stays the row on top (see *Fork without leaving the board* and *Forks you make stay under the session you forked*). The headless fork can't answer permission prompts, like a quick reply |
 | `Ctrl-N` | **Start a new session** in the launch directory; if you have Claude Code agents defined, pick one first (or `default (no agent)`). Then a **draft box** opens for the session's first message: `Enter` launches it with `claude --bg` and leaves you on the board, `Ctrl-O` runs it interactively instead, `Ctrl-L` picks its model, `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels, and a `/` or `@` opens the pick list (the `/` or `@` row below). Your message is sent as the session's first turn either way |
 | `Ctrl-O` (in that picker) | **Start the highlighted agent interactively at once**, skipping the draft — the same thing `Ctrl-O` means inside the draft box, so either route out of the picker is one keypress |
-| `Ctrl-R` | **Quick reply** — send a one-shot message to the selected session without leaving the board. A background agent whose run is over (`done`, `stopped`, `failed`) is stopped first so the reply lands in place; a waiting one (`needs input`) asks you to confirm that stop; one that is still live (`working`, `idle`, `interrupted`, or a state this version doesn't recognize) is left alone and refused, and so is a session with no background job to stop first (a `live` one, for instance); the refusal suggests `Ctrl-K` or Fork instead. While a session's own reply is still being sent, or snapback is moving the session (`Ctrl-X w`), `Ctrl-R` on that session is refused until that finishes; replies to other sessions can go out at the same time. Opens a compose box (`Enter` sends, `Ctrl-L` picks the model, `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels, and a `/` or `@` opens the pick list — the `/` or `@` row below) |
-| `Ctrl-L` (in a reply or draft box) | **Pick the model** — and, with `←` / `→`, its **effort** — for **this message only**. The box's bottom border names what it will run on: a reply says `model: session (Opus 5.5)`, the model that session last answered with, which Claude Code normally keeps on its own; a draft says `model: default (opus[1m]) (new sessions only)` when your Claude Code settings name a model. Either says plain `model: default` when there is nothing to name. `--model` / `--effort` are sent only when you pick something; the picker's first row goes back to the default. Every new box starts at the default, and nothing is remembered. `Enter` resume, `Ctrl-F` fork, Attach and the `Ctrl-X w` move never send a model |
-| `/` or `@` (in a reply or draft box) | **Pick a skill, command, file or agent** — the same list in a `Ctrl-R` reply and a `Ctrl-N` draft. `/` as the very first character lists the skills and commands Claude Code offers in that folder, built-in ones included; `@` at the start of a word lists files and folders (`@src/tu` narrows inside `src/`; once you type a letter the list also reaches files in deeper folders, so `@disc` finds `src/store/discover.rs`) and, for a top-level `@`, the folder's agents, inserted as `@agent-<name>`. A skill, command or agent shows its description on the right. The letters you type narrow the list to what holds them anywhere in its name or, for a skill, command or agent, its description, matched like the search box (an uppercase letter matches exactly): names that start with them come first, then other name matches, then description matches, with files and folders above agents; a file or folder whose name starts with `.` shows only once you type its leading `.`. While it is open `↑` / `↓` choose, `Enter` or `Tab` picks (a folder reopens the list one level down), and `Esc` closes only the list — never the draft; with no list open `Enter` and `Esc` do what the box's own row says. Where the list comes from is under *Quick reply without leaving the board* |
+| `Ctrl-R` | **Quick reply** — send a one-shot message to the selected session without leaving the board. A background agent whose run is over (`done`, `stopped`, `failed`) is stopped first so the reply lands in place; a waiting one (`needs input`) asks you to confirm that stop; one that is still live (`working`, `idle`, `interrupted`, or a state this version doesn't recognize) is left alone and refused, and so is a session with no background job to stop first (a `live` one, for instance); the refusal suggests `Ctrl-K` or Fork instead. While a session's own reply is still being sent (for a fork made with the `Ctrl-F` box's `Enter`, while the fork itself is still being made), or snapback is moving the session (`Ctrl-X w`), `Ctrl-R` on that session is refused until that finishes; replies to other sessions can go out at the same time. Opens a compose box (`Enter` sends, `Ctrl-L` picks the model, `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels, and a `/` or `@` opens the pick list — the `/` or `@` row below) |
+| `Ctrl-L` (in a reply, fork or draft box) | **Pick the model** — and, with `←` / `→`, its **effort** — for **this message only**. The box's bottom border names what it will run on: a reply or fork says `model: session (Opus 5.5)`, the model that session last answered with, which Claude Code normally keeps on its own; a draft says `model: default (opus[1m]) (new sessions only)` when your Claude Code settings name a model. Either says plain `model: default` when there is nothing to name. `--model` / `--effort` are sent only when you pick something; the picker's first row goes back to the default. Every new box starts at the default, and nothing is remembered. `Enter` resume, the Attach / Fork choice, Attach and the `Ctrl-X w` move never send a model |
+| `/` or `@` (in a reply, fork or draft box) | **Pick a skill, command, file or agent** — the same list in a `Ctrl-R` reply, a `Ctrl-F` fork and a `Ctrl-N` draft. `/` as the very first character lists the skills and commands Claude Code offers in that folder, built-in ones included; `@` at the start of a word lists files and folders (`@src/tu` narrows inside `src/`; once you type a letter the list also reaches files in deeper folders, so `@disc` finds `src/store/discover.rs`) and, for a top-level `@`, the folder's agents, inserted as `@agent-<name>`. A skill, command or agent shows its description on the right. The letters you type narrow the list to what holds them anywhere in its name or, for a skill, command or agent, its description, matched like the search box (an uppercase letter matches exactly): names that start with them come first, then other name matches, then description matches, with files and folders above agents; a file or folder whose name starts with `.` shows only once you type its leading `.`. While it is open `↑` / `↓` choose, `Enter` or `Tab` picks (a folder reopens the list one level down), and `Esc` closes only the list — never the draft; with no list open `Enter` and `Esc` do what the box's own row says. Where the list comes from is under *Quick reply without leaving the board* |
 | `Ctrl-K` | **Stop / interrupt** the selected session's live agent. On a background agent it runs `claude stop`: one whose run is over (`done`, `stopped`, `failed`) stops immediately; every other live agent (`working`, `needs input`, `idle`, `interrupted`, unrecognized) confirms first, since stopping ends the live job (its conversation is kept). A session with no background job (a `live` one, typically) has no job to stop, so if Claude Code reports a process id for it, `Ctrl-K` offers to send that process a **SIGTERM** instead: the confirmation shows the pid, and nothing is sent unless Claude Code still reports that same pid when you press `Enter`. A session that isn't running as an agent has nothing to stop, and neither does one Claude Code reports with no job and no process id that can be signalled |
 | `Ctrl-X` then `x` / `d` / `h` / `r` / `y` / `f` / `w` | **Leader chord** that acts on the selected row (`x`, `d`, `y`, `f`, `w`) or on the whole board (`h`, `r`) — `x` **hides** the selected session (reversible, persisted) — from a row that shows a stack (a `(+N)` row, or an open stack's top row with `↳` copies under it), that row and the copies it shows; from any other row, just that session — `d` **hard-deletes** it after a confirmation that, on a stack's top row, can also take the whole stack, `h` toggles **show hidden**, `r` **re-reads every transcript from disk**, `y` is **copy session ID**: the selected session's full id goes to your clipboard and shows on the status line, `f` **folds** / **expands** a stack of look-alike rows that are really one conversation — a row marked `(+N)` stands for `N` more; `f` opens it, and folds it back from any of its rows, `w` **moves** the session to another worktree of this project (the main folder included, the session's own folder left out) without leaving the board — from a stack's top row, that session or the whole stack. Any other key cancels the chord |
 | `←` / `→` (in the model picker) | **Step the highlighted model's effort** down / up: `default effort` (no `--effort`, your settings decide) → `low` → `medium` → `high` → `xhigh` → `max`, wrapping round both ways. `Enter` sets the model and the effort together into the box; `Esc` goes back to the box with your text and its previous choice untouched. They do nothing on the picker's first (default) row, and nothing in the agent picker or the move picker — and inside any picker they never move the search cursor on the board underneath |
@@ -44,15 +44,15 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | `Shift-←` / `Shift-→` | Change the **layout** one step — how the screen is split between the session list and the transcript preview, list:preview: `0:1` (preview only) · `1:3` · `1:1` · `3:1` · `1:0` (list only). You start at `1:1`; `Shift-←` gives the preview more room, `Shift-→` gives the list more, and a press at either end does nothing. Works with or without a search typed. The preview keeps your place as it resizes; coming back from `1:0` it opens on the newest turn. At `0:1` the preview's title names the selected session, and `↑` / `↓` still move between sessions |
 | `PgUp` / `PgDn` | Scroll the preview a full page |
 | `Ctrl-U` / `Ctrl-D` | Scroll the preview a quarter page |
-| `Ctrl-T` / `Ctrl-E`, `Home` / `End` | Jump the preview to the top / bottom. Every preview scroll key (`PgUp` / `PgDn`, `Ctrl-U` / `Ctrl-D`, `Ctrl-T` / `Ctrl-E`, `Home` / `End`) also works while a quick-reply box is open and leaves your text and cursor alone; there they replace the editor's own meaning (`Ctrl-U` delete to line start, `Ctrl-D` delete forward, `Ctrl-E` / `Home` / `End` / `PgUp` / `PgDn` caret moves — the arrows and `Ctrl-A` / `Ctrl-F` / `Ctrl-B` still move it). A new-session draft keeps all of them as editor keys, since its pane shows no transcript (on a MacBook keyboard without dedicated `Home`/`End` keys, `fn+←` / `fn+→` reach the same two) |
+| `Ctrl-T` / `Ctrl-E`, `Home` / `End` | Jump the preview to the top / bottom. Every preview scroll key (`PgUp` / `PgDn`, `Ctrl-U` / `Ctrl-D`, `Ctrl-T` / `Ctrl-E`, `Home` / `End`) also works while a quick-reply or fork box is open and leaves your text and cursor alone; there they replace the editor's own meaning (`Ctrl-U` delete to line start, `Ctrl-D` delete forward, `Ctrl-E` / `Home` / `End` / `PgUp` / `PgDn` caret moves — the arrows and `Ctrl-A` / `Ctrl-F` / `Ctrl-B` still move it). A new-session draft keeps all of them as editor keys, since its pane shows no transcript (on a MacBook keyboard without dedicated `Home`/`End` keys, `fn+←` / `fn+→` reach the same two) |
 | `Shift-↑` / `Shift-↓` | Walk the preview through the lines your query marks — previous / next. Only bound while something IS marked in the previewed transcript; with nothing marked they stay plain **move the selection**, so they never take a key away from you (and a terminal that swallows the modifier still moves). One stop per marked **line**, not per occurrence: a line saying your query twice is marked twice and stopped at once |
 | mouse wheel | Scroll the pane under the pointer — except while a compose or draft box is open, when the session list stops taking notches: a wheel over it does **nothing**, so the session you are writing to can never slide out from under you. Everywhere else it is unchanged, and a notch anywhere but the list still scrolls the transcript |
-| drag inside the preview | Select transcript text (in reading order, like your terminal's own selection, but only the transcript's drawn text — never the empty space right of a line, and never the session list beside it) and copy it to the clipboard when you let go. Hold the drag past the preview's top or bottom edge and it keeps scrolling that way — faster the further past the edge you hold it — with the selection growing until you let go, so it can copy far more than one screen. A drag over empty space alone copies nothing. A drag that starts on a link or a folded node selects it rather than opening or unfolding it. Works while a reply box is open — it neither moves your cursor nor touches what you typed — but not while a new-session draft is, whose placeholder replaces the transcript; and never from the pinned row at the top of the pane |
-| double-click in the preview | Select the **word** under the pointer and copy it when you let go, exactly as a drag copies. Two clicks on the same cell within half a second; words follow Unicode word boundaries, so `view.rs`, `don't` and `snake_case` are one word but `sess-link` is two, and paths and URLs split at their punctuation. The first click still does what a click does — opens a link, or unfolds a folded node — and the second only selects, so a node you double-click is unfolded once and stays open. Double-clicking blank space copies nothing; a quick third click keeps the word. Works while a reply box is open, like a drag |
-| click a preview link | Open its url in your browser — when you let go, so a drag that starts on a link selects it instead. `http`/`https` only: a link of any other scheme opens **nothing** and instead reports a refusal on the status line that names the link (`not opening <url> - only http/https links open`), so an underlined label that quietly does nothing never leaves you guessing which of the two happened. That refusal is **sticky** — it stays up until your next actionable keypress. Works while a reply box is open |
-| click a folded node | Unfold it where it sits — when you let go, like a link — and click it again to fold it back. Two kinds of turn arrive folded to one line: a subagent's hand-back — the `◆ message from @…` node, otherwise ~95 rows of `<agent-message>` frame attributed to **you** — and context Claude Code added on your behalf, such as the instructions a skill or slash command expands into — the `◇ added by claude code` node, otherwise often thousands of rows, also attributed to **you**. Folded each costs one line, and its text is still one click away. Which nodes you left open is remembered for this run only — snapback writes nothing for it. Works while a reply box is open |
+| drag inside the preview | Select transcript text (in reading order, like your terminal's own selection, but only the transcript's drawn text — never the empty space right of a line, and never the session list beside it) and copy it to the clipboard when you let go. Hold the drag past the preview's top or bottom edge and it keeps scrolling that way — faster the further past the edge you hold it — with the selection growing until you let go, so it can copy far more than one screen. A drag over empty space alone copies nothing. A drag that starts on a link or a folded node selects it rather than opening or unfolding it. Works while a reply or fork box is open — it neither moves your cursor nor touches what you typed — but not while a new-session draft is, whose placeholder replaces the transcript; and never from the pinned row at the top of the pane |
+| double-click in the preview | Select the **word** under the pointer and copy it when you let go, exactly as a drag copies. Two clicks on the same cell within half a second; words follow Unicode word boundaries, so `view.rs`, `don't` and `snake_case` are one word but `sess-link` is two, and paths and URLs split at their punctuation. The first click still does what a click does — opens a link, or unfolds a folded node — and the second only selects, so a node you double-click is unfolded once and stays open. Double-clicking blank space copies nothing; a quick third click keeps the word. Works while a reply or fork box is open, like a drag |
+| click a preview link | Open its url in your browser — when you let go, so a drag that starts on a link selects it instead. `http`/`https` only: a link of any other scheme opens **nothing** and instead reports a refusal on the status line that names the link (`not opening <url> - only http/https links open`), so an underlined label that quietly does nothing never leaves you guessing which of the two happened. That refusal is **sticky** — it stays up until your next actionable keypress. Works while a reply or fork box is open |
+| click a folded node | Unfold it where it sits — when you let go, like a link — and click it again to fold it back. Two kinds of turn arrive folded to one line: a subagent's hand-back — the `◆ message from @…` node, otherwise ~95 rows of `<agent-message>` frame attributed to **you** — and context Claude Code added on your behalf, such as the instructions a skill or slash command expands into — the `◇ added by claude code` node, otherwise often thousands of rows, also attributed to **you**. Folded each costs one line, and its text is still one click away. Which nodes you left open is remembered for this run only — snapback writes nothing for it. Works while a reply or fork box is open |
 | `Backspace` | Delete the query character before the cursor |
-| `Alt+Backspace` (`⌥⌫`) / `Ctrl-W` / `Alt+H` | Delete the query **word** before the cursor — one whole search term, so a path or a branch name goes in a single press instead of character by character (`Backspace` alone still takes one character); whatever follows the cursor stays. All three keys do the same thing, because which of them your terminal actually sends depends on how it treats **Option**; they are also the same three the reply and draft boxes word-delete on, so the gesture is bound wherever you type. What a press *cuts* differs on purpose: on the board it takes a whole search term, so `feature/fold-fork-lineages` goes in one press, while in a reply or draft box the cut stops at punctuation and takes only `lineages` |
+| `Alt+Backspace` (`⌥⌫`) / `Ctrl-W` / `Alt+H` | Delete the query **word** before the cursor — one whole search term, so a path or a branch name goes in a single press instead of character by character (`Backspace` alone still takes one character); whatever follows the cursor stays. All three keys do the same thing, because which of them your terminal actually sends depends on how it treats **Option**; they are also the same three the reply, fork and draft boxes word-delete on, so the gesture is bound wherever you type. What a press *cuts* differs on purpose: on the board it takes a whole search term, so `feature/fold-fork-lineages` goes in one press, while in a reply, fork or draft box the cut stops at punctuation and takes only `lineages` |
 | any printable char | Type to search, at the cursor |
 | paste (`Cmd`/`Ctrl-V`, middle-click) | Your terminal's own paste, taken as **text**: into a compose or draft box at the cursor, **newlines intact** (no more sending just the first line); on the board, into the query at its cursor with newlines as spaces. It never sends, resumes, or confirms |
 | `Esc` | Clear the search query; with nothing typed, quit |
@@ -320,6 +320,25 @@ says how many messages it holds — `6 msgs` next to `171 msgs` — so you can s
 which one is a stub the hand-off left behind and which one holds the real work.
 The names can't tell you that; they're identical.
 
+**Forks you make stay under the session you forked.** A fork from the `Ctrl-F`
+box lands in the same stack, but it's new work rather than a copy that took
+over, so snapback names it `fork: <first line of your message>` and keeps the
+session you forked from as the row on top. The Fork the Attach / Fork / Cancel
+choice offers is named the same way, `fork: <the session's label>`, just as an
+empty `Ctrl-O` in the box is. Fork one session three times to review
+three PRs and it shows as that session with `(+3)`; fanned out, newest first,
+each fork's row shows `⑂` and its own name after its time and status, where a
+copy shows its id — `⑂ Review PR3`, `⑂ Review PR2`, `⑂ Review PR1`. The name
+comes before the message count, so on a narrow pane the count goes first and
+then the name is cut short, while a marker on the row (`[task failed]`,
+`[unbound]`, `[hidden]`) stays whole; a wider pane (`Shift-→`) shows the whole
+name. The fork's id is still one `Ctrl-X y` away. The stack sits where its newest activity puts it, so a
+session whose forks are busy right now stays near the top of the list, even though
+the top row's own time can be older than the rows below it. Only forks snapback
+names are recognised: older forks and forks made elsewhere behave like any other
+copy, as does a fork you rename without the `fork: ` prefix — and a session you
+name `fork: …` yourself is treated as a fork. A fork of a fork lists flat under the original.
+
 Nothing is hidden from you and nothing is thrown away — every copy is still a
 real session you can resume, and that matters: a session that's running in the
 background can't be plain-resumed, so the older copy is often the one that
@@ -449,8 +468,9 @@ fails). Confirmations and nudges fade after a few seconds; failures and refusals
 stay until you press a key, so nothing is silently downgraded. You can reply to
 several sessions at once, each tracked on its own, but not twice to the same one:
 until a session's reply lands, `Ctrl-R` on that session is refused before a
-compose box opens (so nothing you type is lost), while every other row can still
-reply. That per-session record is also what lets the hard delete below keep
+compose box opens (so nothing you type is lost), and so is `Enter`, so a second
+Claude Code never opens on a transcript the reply is still writing; every other
+row can still reply. That per-session record is also what lets the hard delete below keep
 refusing a session while its reply is still being written. `Ctrl-R` is refused the
 same way while snapback is moving the session to another worktree (`Ctrl-X w`).
 
@@ -458,8 +478,8 @@ The `/` and `@` list is Claude Code's own for that folder: the first time you op
 a box there, snapback asks `claude` for it in the background — no message is sent
 and nothing is written to your sessions — and keeps the answer until you quit.
 Until it arrives (normally well under a second) `/` shows nothing yet, and a
-reply's `@` offers the agents its own transcript recorded; files and folders
-show at once. If `claude` could not answer, it stays that way and the next box
+reply's or fork's `@` offers the agents its own transcript recorded; files and
+folders show at once. If `claude` could not answer, it stays that way and the next box
 you open in that folder asks again. A command typed in full works without the
 list, so a skill you create after a folder's list arrived still works when typed,
 and is listed once you restart snapback.
@@ -487,6 +507,26 @@ sits still: that badge is snapback's *inference* from Claude Code contradicting
 itself, not a report that the run ended, and it isn't worth stopping live work over
 a guess. Use `Ctrl-K` if you do want it stopped — it will ask first.
 
+**Fork without leaving the board.** `Ctrl-F` opens a fork box on the selected
+session — any session, running or not, since a fork never disturbs the original;
+only a session snapback is still moving (`Ctrl-X w`) is refused until the move
+finishes. It is the reply box again (the same editor, the same `/` and `@` list, `Ctrl-L`
+for the model, the preview's scroll keys), titled `fork: <the session's label>`.
+`Enter` forks with a one-shot `claude -p`, like a quick reply: the session you
+forked is left exactly as it was, and the fork is a new session. When it appears
+on the list the cursor follows it, opening the stack it lands in, unless you have
+moved on or have something else open on the board — another fork box, say. So
+forking the same session again and again keeps you on it, and only the last fork,
+landing with nothing open, is followed. The fork's preview shows **claude
+cooking…** until its answer lands, `Enter` on it is refused until then (the
+session you forked resumes as usual), and the status line reports what it cost. Claude Code's own session picker leaves
+`claude -p` sessions out, so this is where you find such a fork. Like a quick
+reply it can't stop to ask you for a permission, and it needs a message: an empty
+`Enter` reminds you that `Ctrl-O` forks without one. `Ctrl-O` forks interactively
+instead, handing you the terminal in the new copy. Either way the fork is named
+`fork: ` plus the first line of your message (or the session's own label, for an
+empty box), which is what keeps it under the session it came from.
+
 **Hide, delete, copy, fold & move.** `Ctrl-X` is a leader chord that acts on the
 selected row or on the whole board: press it, and a hint shows the follow-ups —
 `x`, `d`, `h`, `r`, `y`, `f`, `w` — while any other key cancels.
@@ -494,15 +534,17 @@ selected row or on the whole board: press it, and a hint shows the follow-ups �
 - `Ctrl-X x` **hides** the selected session. This is the reversible default: the
   session stays on disk, it just drops off the board. On a row that shows a stack
   — a `(+N)` row, or an open stack's top row with its copies drawn `↳` beneath
-  it — that row and the copies it shows hide and return together, so the row
+  it; for a session you forked, its `Ctrl-F` forks are among those copies — that
+  row and the copies it shows hide and return together, so the row
   genuinely leaves rather than being replaced by the next copy behind it. Copies
   that aren't on the board stay as they are, whether search filtered them out,
   they are outside the current scope, or they are already hidden. Any other row
-  hides just itself: one of those `↳` rows (the top row stays, so nothing takes
-  its place), or a row standing alone. So hiding an old copy you searched for
-  never takes the newest one with it, even when your search folds two or more
-  old copies into a `(+N)` row. The hidden set is remembered across restarts, so
-  a session you hide stays hidden next time. Press `Ctrl-X x` again on a revealed
+  hides just itself: one of those `↳` rows, a fork's own row included (the top
+  row stays, so nothing takes its place), or a row standing alone. So hiding an
+  old copy you searched for never takes the newest one with it, even when your
+  search folds two or more old copies into a `(+N)` row. The hidden set is
+  remembered across restarts, so a session you hide stays hidden next time.
+  Press `Ctrl-X x` again on a revealed
   row to un-hide it, by the same rule: on a row that shows the stack — while
   hidden sessions are showing, a hidden stack is a `(+N)` row again — it brings
   back the copies that row shows, a copy you had hidden on its own included.
@@ -537,8 +579,9 @@ selected row or on the whole board: press it, and a hint shows the follow-ups �
   or why not. While the move runs the row reads `moving…`, and `Enter`, `Ctrl-F`,
   `Ctrl-R`, `Ctrl-X d` and another `Ctrl-X w` on it are refused until it
   finishes. A session Claude Code lists as active is refused (close it first, or
-  `Ctrl-K`), and so is one snapback is still replying to. If snapback can't ask
-  Claude Code whether the session is active (`claude agents --json` fails), the
+  `Ctrl-K`), and so is one snapback is still replying to or still making as a
+  fork. If snapback can't ask Claude Code whether the session is active
+  (`claude agents --json` fails), the
   move is refused too, rather than risk moving a transcript something is still
   writing. If Claude Code hasn't been told to trust the target folder, nothing
   moves and the status line says so: press `Enter` to open the session, then run
@@ -548,7 +591,8 @@ selected row or on the whole board: press it, and a hint shows the follow-ups �
   out of the folder you launched in leaves the list; `Ctrl-A` shows it under the
   target.
 
-  On a stack's top row, picking a folder asks one more question —
+  On a stack's top row — for a session you forked, the forks you made with
+  `Ctrl-F` are in its stack — picking a folder asks one more question —
   **Move this**, **Move lineage (N)** or **Cancel**, defaulted to Cancel and, like
   the delete prompt, led by how many of them are hidden when some are. As with
   delete, and unlike hiding, it takes the whole stack, copies off screen
@@ -556,15 +600,17 @@ selected row or on the whole board: press it, and a hint shows the follow-ups �
   question says how many it would take.
   **Move lineage** moves
   every copy, hidden ones included, one at a time, and does what it can: a copy
-  snapback is still replying to or moving is skipped, and so is one Claude Code
+  snapback is still replying to, making as a fork, or moving is skipped, and so
+  is one Claude Code
   lists as active. If Claude Code hasn't been told to trust the folder, the run
   stops at the first copy that hears so — every other copy would get the same
   answer — and the status line points at the same `Enter`, then `/cd <folder>`
   fix; once Claude Code trusts the folder, moving the rest works. Every copy
   reads `moving…` until the last one finishes (about a second each), and one line
   then tallies how many moved and why the others didn't (`2 moved to <folder>, 1
-  skipped (running)`); it stays until your next key. On a `↳` row, or a session
-  with no copies, `Enter` moves just that session at once.
+  skipped (running)`); it stays until your next key. On a `↳` row, a fork's own
+  row included, or a session with no copies, `Enter` moves just that session at
+  once.
 
   Quitting snapback mid-move neither waits for the move nor stops it. A session
   Claude Code has already started moving still moves, usually within a few
@@ -575,14 +621,16 @@ selected row or on the whole board: press it, and a hint shows the follow-ups �
 - `Ctrl-X d` **hard-deletes** the selected session — physically removing its
   transcript from disk. Because that is irreversible, it asks first with a
   confirmation prompt (defaulted to Cancel). On a stack's top row the prompt
-  also offers **Delete lineage** — the whole family of look-alike copies at once.
+  also offers **Delete lineage** — the whole family of look-alike copies at once,
+  the forks you made from it with `Ctrl-F` included.
   Without it, deleting the top row would leave the copies behind and the next one
   would simply take its place, so the row never actually left the board. Unlike
   hiding, it takes the whole stack, copies off screen included (filtered out by
   search, hidden, or outside the scope), and is offered even when that row
   stands alone on the board: the prompt asks first, and the button's `(N)` and
-  the hidden count say how many it takes. On one of an open stack's `↳` rows
-  the prompt offers just that copy. Deletion removes exactly each target
+  the hidden count say how many it takes. On one of an open stack's `↳` rows,
+  a fork's own row included, the prompt offers just that copy. Deletion removes
+  exactly each target
   session's own `<id>.jsonl` and its sibling `<id>/` directory of subagent
   transcripts — nothing else.
 
@@ -592,12 +640,13 @@ selected row or on the whole board: press it, and a hint shows the follow-ups �
   Claude Code still has up — working
   a turn, sitting idle between turns, or reporting something snapback can't read
   (an unreadable signal never gets to authorize an irreversible delete) — or one
-  snapback itself is still replying to or moving. A quick reply (`Ctrl-R`) keeps
-  writing after the board comes back, so a delete aimed at that session is
-  refused until the reply has landed, and one aimed at a session `Ctrl-X w` is
-  moving is refused until the move finishes. Fair game is a background agent
-  that isn't churning: one *waiting on you*, one Claude Code still reports as
-  working while its own status
+  snapback itself still has a reply, a fork or a move in progress on. A quick
+  reply (`Ctrl-R`) keeps writing after the board comes back, so a delete aimed at
+  that session waits until the reply has landed; the same goes for a new fork
+  from the `Ctrl-F` box's `Enter`, while the session it was forked from is not
+  held up. One aimed at a session `Ctrl-X w` is moving is refused until the move
+  finishes. Fair game is a background agent that isn't churning: one
+  *waiting on you*, one Claude Code still reports as working while its own status
   reads idle (**interrupted**), or one that has reported it finished. Claude Code
   keeps listing agents long after they go quiet, and refusing all of them made
   delete useless for almost every row on the board. Two things worth knowing before you
@@ -607,8 +656,9 @@ selected row or on the whole board: press it, and a hint shows the follow-ups �
   lineage, members that are still running are skipped and the rest are deleted;
   the board reports the split.
 
-  A lineage delete takes the whole family, including copies you've hidden —
-  hiding is a visibility choice, so it doesn't spare a copy here. When some of
+  A lineage delete takes the whole family, including the named forks under the
+  session and any copies you've hidden — hiding is a visibility choice, so it
+  doesn't spare a copy here. When some of
   them are hidden the prompt leads with the numbers (`3 in this lineage, 2 of
   them hidden`), so the count on the button is never more than you expected.
 
@@ -618,29 +668,31 @@ session ids lives in its own config directory —
 otherwise `~/.config/snapback/state/hidden_sessions` — never inside the Claude
 Code session store, which snapback otherwise only reads.
 
-**Pick the model for one message.** In a reply box (`Ctrl-R`) or a new-session
-draft (`Ctrl-N`), `Ctrl-L` opens a list of the models *your* Claude Code accepts.
-`Enter` sets the highlighted one for that box alone; `Esc` goes back to your text
-with the box's previous choice untouched. The pick goes out with that one message
-— the reply, or the session the draft starts, whether `Enter` runs it in the
-background or `Ctrl-O` interactively — and is gone when the box closes: every new
-box starts back at its default, and snapback never writes a pick down.
+**Pick the model for one message.** In a reply box (`Ctrl-R`), a fork box
+(`Ctrl-F`) or a new-session draft (`Ctrl-N`), `Ctrl-L` opens a list of the models
+*your* Claude Code accepts. `Enter` sets the highlighted one for that box alone;
+`Esc` goes back to your text with the box's previous choice untouched. The pick
+goes out with that one message — the reply, the fork, or the session the draft
+starts, whether `Enter` runs it headless or in the background or `Ctrl-O`
+interactively — and is gone when the box closes: every new box starts back at its
+default, and snapback never writes a pick down.
 
-Nothing else ever asks for a model. `Enter` resume and `Ctrl-F` fork send no
-`--model` at all, because a session already has one: when Claude Code resumes a
-session it normally restores the model that session last answered with (the
-exceptions are listed below). So a session carries on with its own model — and
-after a reply you picked a model for, it carries on with that one, because that
-is the model that answered last. Attach sends none either: it joins a process
-that is already running under a model. The agent picker's own `Ctrl-O` skips the
-box, so there is no pick to send, and Claude Code chooses the new session's model.
+Nothing else ever asks for a model. `Enter` resume and the Attach / Fork
+choice's Fork send no `--model` at all, because a session already has one: when
+Claude Code resumes a session it normally restores the model that session last
+answered with (the exceptions are listed below). So a session carries on with its
+own model — and after a reply you picked a model for, it carries on with that
+one, because that is the model that answered last. Attach sends none either: it
+joins a process that is already running under a model. The agent picker's own
+`Ctrl-O` skips the box, so there is no pick to send, and Claude Code chooses the
+new session's model.
 The `Ctrl-X w` move sends none either: it only moves the session's transcript to
 another folder, and no model answers anything.
 
 The box's bottom border always says what snapback expects the message to run on:
 
-- A reply with nothing picked says `model: session (Opus 5.5)` — the model the
-  session last answered with, spelled the way the preview's turn markers spell
+- A reply or fork with nothing picked says `model: session (Opus 5.5)` — the
+  model the session last answered with, spelled the way the preview's turn markers spell
   it. It says plain `model: default` instead when Claude Code would not restore
   that model — `ANTHROPIC_MODEL` or an `ANTHROPIC_DEFAULT_*_MODEL` (`FABLE`,
   `OPUS`, `SONNET` or `HAIKU`) is set, in your environment or in a settings
@@ -652,8 +704,8 @@ The box's bottom border always says what snapback expects the message to run on:
 - A pick says `model: opus`, or `model: opus · high` with an effort.
 
 The picker's first row is that same default, spelled out — `session's model
-(Opus 5.5)` in a reply box, `default (opus[1m]) (settings)` or `default` in a
-draft — with a line or two on why. The settings value is read the way Claude Code
+(Opus 5.5)` in a reply or fork box, `default (opus[1m]) (settings)` or `default`
+in a draft — with a line or two on why. The settings value is read the way Claude Code
 reads it — managed settings, then the launch folder's
 `.claude/settings.local.json` and `.claude/settings.json`, then your own
 `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`), with
@@ -663,7 +715,8 @@ the next draft.
 
 The label is snapback's best reading, and it is display only: with nothing picked
 snapback sends no `--model` and Claude Code decides, so a wrong label never
-changes what runs. The cases it is known to get wrong include:
+changes what runs. The cases it is known to get wrong include (a fork box reads
+like a reply box):
 
 - A session model Claude Code refuses to restore (a retired one, say) still reads
   `session (…)` while Claude Code warns and uses another.

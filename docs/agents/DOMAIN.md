@@ -76,7 +76,9 @@ claude's; snapback never renames or copies a session file.
 
 A transcript can still GROW under snapback without snapback writing it: the quick
 reply ([`Ctrl-R`](#quick-reply--non-interactive-send-srcsendrs)) appends an
-exchange to the same `<id>.jsonl` because the `claude -p -r` CHILD appends it. The
+exchange to the same `<id>.jsonl` because the `claude -p -r` CHILD appends it, and
+the [fork box](#fork-box-ctrl-f)'s headless fork gets a NEW `<fork-id>.jsonl`
+because its `claude -p` child creates it. The
 distinction is the rule, not a technicality — snapback opens no session file for
 writing, so the format's authorship stays entirely with Claude Code and no
 half-written record can be snapback's doing. Everything else in this tree stays
@@ -164,7 +166,9 @@ flight. The gate stays a COMPOSITION of three facts with three sources and three
 remedies, not a wider `can_delete`.
 
 That in-flight fact is only complete because the board records EVERY quick reply
-it has in flight, one entry per session. `App::sending` is keyed by session: a
+it has in flight, one entry per session — and every headless fork, under the
+FORK's new id, so the new file is refused until its child finishes while the
+original, which that child only reads, is not marked at all. `App::sending` is keyed by session: a
 reply to another row is added beside an entry still standing, and a
 `SendFinished` removes only its own session's entry, so replies to several
 sessions can run at once and each keeps its transcript's delete refused. What
@@ -287,7 +291,8 @@ never fatal:
 | `sessionId` | first non-null (else file stem) | stable id, resume target, reported-agent join key |
 | `gitBranch` | last non-null (`None` ⇒ `(detached)`) | branch grouping level |
 | `timestamp` | last non-null, RFC 3339 | sort + display (per-message too, in preview; a [failed notice](#failed-background-task-storeparse)'s own, on the banner) |
-| `type` | `"summary"` / `"user"` / `"assistant"` / `"agent-setting"` / `"agent-name"` | label, preview, content index, [turn count](#turn-count-storeparse) |
+| `type` | `"summary"` / `"user"` / `"assistant"` / `"agent-setting"` / `"agent-name"` / `"custom-title"` | label, preview, content index, [turn count](#turn-count-storeparse) |
+| `customTitle` | on `type:"custom-title"`, string (fail-soft: absent, null, non-string or blank ⇒ the record names nothing); the **LAST** such record in file order wins, because claude re-appends its metadata rather than rewriting it (a `--name`d `claude -p` fork wrote it twice at 2.1.291), so a later record — a rename's included — is the current name, and a malformed one leaves the earlier name standing | `Session::custom_title`: whether a member is a [fork snapback named](#named-forks-the-fork-name-prefix), which picks the lineage head and labels the fork's child row. Never the row label itself |
 | `attachment.type` = `skill_listing` | deliberately NOT read | nothing: it is the MODEL's skill list, which names skills claude's own `/` menu hides and refuses when typed, omits ones it offers, and carries no flag to tell them apart ([CLAUDE_CLI.md](CLAUDE_CLI.md#the-initialize-control-handshake-compose-pick-list)), so the [pick list](#compose-pick-list)'s `/` lists claude's catalog alone |
 | `attachment.type` = `agent_listing_delta` → `addedTypes`, `addedLines`, `removedTypes`, `isInitial` | on `type:"attachment"`: `addedTypes` / `removedTypes` arrays of names, `addedLines` an array of `- <name>: <description> (Tools: …)` strings (one `\n`-joined string tolerated), `isInitial` a bool (fail-soft) | a reply's `@` agent fallback in the [pick list](#compose-pick-list), folded in FILE ORDER: an `isInitial: true` record restarts the set (a file can carry more than one), then adds, then removes; the ` (Tools: …)` tail is cut. 414 records in 174 local transcripts, claude 2.1.235–2.1.284: `addedLines` an array in all 414, every entry in that shape. Read ONLY by `store::skills` |
 | `summary` | on `type:"summary"` | preferred label + searchable text |
@@ -752,7 +757,7 @@ permanently. Nothing else clears it.
 >
 > | Sense | Who does it | What it is |
 > | --- | --- | --- |
-> | **Fork, the hand-off** | **snapback**, when the user presses `Ctrl-F` | `claude -r <id> --fork-session` — a deliberate, asked-for branch of a session. See [Hand-off invocations](#hand-off-invocations-srcresumers). |
+> | **Fork, the hand-off** | **snapback**, from the `Ctrl-F` [fork box](#fork-box-ctrl-f) or the running-session choice | the box's `claude -p -r <id> --fork-session --session-id <new>` (headless, `Enter`) or `claude -r <id> --fork-session` (interactive, `Ctrl-O`), each with `--name "fork: …"`; the choice's Fork is that `Ctrl-O`'s empty-box argv, `--name "fork: <the session's label>"` included — a deliberate, asked-for branch of a session. See [Hand-off invocations](#hand-off-invocations-srcresumers). Such a fork joins the same lineage and is told apart by its name: [named forks](#named-forks-the-fork-name-prefix). |
 > | **Fork, the event** | **Claude Code**, unasked | handing a prompt to a **background** job copies the transcript into a new session file. Nobody requested it and nothing on the board announced it. This section is about *this* one. |
 >
 > They are unrelated mechanisms that happen to share a verb. Where it matters,
@@ -815,8 +820,8 @@ mis-assumed:
   conversation**.
 - **Types with no `uuid` sit outside the tree entirely** and must be ignored by
   lineage code: `last-prompt`, `mode`, `agent-setting`, `agent-name`,
-  `permission-mode`, `file-history-snapshot`. They carry **no `parentUuid` key at
-  all** — which is why absent must never be read as `null`.
+  `permission-mode`, `file-history-snapshot`, `custom-title`. They carry **no
+  `parentUuid` key at all** — which is why absent must never be read as `null`.
 - **It really branches.** The large majority of files contain a record with more
   than one child; only a minority are strictly linear. **Never assume a single
   chain.** (The lineage code only needs the root, so it never walks children —
@@ -865,17 +870,29 @@ row under its own branch's head.
 
 #### What the fold does
 
-Each collapsed lineage shows one **head** — its **newest** member, tie-broken by
-`session_id` — wearing a `(+N)` marker for the members it stands in for. Newest,
-rather than (say) the largest transcript, because the board already sorts
-timestamp-desc and ranks groups by their MAX timestamp: a head chosen any other
-way could carry a timestamp below its own lineage's max, and the folded row would
-sort incoherently against the very rows it represents.
+Each collapsed lineage shows one **head** wearing a `(+N)` marker for the members
+it stands in for. The head is the **newest member that is not a
+[named fork](#named-forks-the-fork-name-prefix)**, tie-broken by `session_id`
+(`lineage::head_of`); when every member is a named fork, the newest member of all.
+For a lineage of background copies alone that is simply the newest member: the
+copy that kept working is the conversation's latest state. Newest, rather than
+(say) the largest transcript, because the board sorts timestamp-desc and ranks
+groups by their MAX timestamp, and a head chosen by bulk could carry a timestamp
+below its own lineage's max; the two rules disagree in only 1 of 24 measured
+lineages.
+
+The lineage is drawn in the display slot of its **newest member**
+(`lineage::fold`), head first, whichever member the head is. So a parent whose
+named forks are being worked on right now stays where that work sorts instead of
+sinking to the parent's own older slot. Accepted cost: a collapsed head can show
+an older timestamp than the rows below it. With no named fork the head IS the
+newest member and nothing moves.
 
 Expanding (`Ctrl-X f` on a folded head; the same keys on any row of an open
 lineage fold it back — `App::toggle_selected_lineage`, decided by the pure
-`lineage_toggle`) **gathers** the other members immediately beneath their head
-rather than leaving them at their own timestamp slots. That is deliberate, and it
+`lineage_toggle`) **gathers** the other members immediately beneath their head,
+NEWEST FIRST (`member_rank` order), rather than leaving them at their own
+timestamp slots. That is deliberate, and it
 is not what plain filtering does: time scatters a lineage — the bg head keeps
 working while its stalled ancestor strands hours or days back, with unrelated
 rows between — so an un-gathered member surfaces as an indented, label-less row
@@ -884,7 +901,8 @@ complaint rather than solving it.
 
 A gathered member draws as an indented **child row** carrying only what can
 DIFFER from its head: its own timestamp, its badge, the first 8 chars of its
-`session_id`, its [turn count](#turn-count-storeparse), and any marker that is a
+`session_id` (a [named fork](#named-forks-the-fork-name-prefix) draws its name
+there instead, below), its [turn count](#turn-count-storeparse), and any marker that is a
 fact about that one session (`[task failed]`, `[unbound]`, `[hidden]`, and the
 `moving…` badge while that member's
 [`Ctrl-X w` move](#move-to-another-worktree-ctrl-x-w-srcclaude_movers) is in
@@ -894,7 +912,51 @@ label BY CONSTRUCTION — that identity *is* the reported bug — so `6 msgs` be
 a timestamp and an id only ever say WHICH member. The row **reports** and
 predicts nothing about whether a member will plain-resume: that is the hand-off
 probe's question, asked at hand-off (see [Why the gate does not read the `--all`
-map](#why-the-gate-does-not-read-the---all-map)).
+map](#why-the-gate-does-not-read-the---all-map)). A
+[named fork](#named-forks-the-fork-name-prefix)'s child row draws `⑂ <name>`
+(`view::FORK_GLYPH`, claude's own fork sign; the name prefix-stripped by
+`lineage::fork_title`) in the id's slot, after the timestamp and badge — where
+the parent row draws its label — since the name says what each fork was FOR; its
+id stays one `Ctrl-X y` away. Every other member, a background copy or an older
+fork, keeps the id. The name is fitted BEFORE the turn count
+(`view::fit_child_name`), and the row's markers (`[task failed]`, `[unbound]`,
+`[hidden]`) are reserved before either (`view::fit_child_markers`, the
+marker-first rule a head row's `fit_label` keeps), so a narrowing pane drops the
+count first, then ellipsizes the name (dropping it only when not one column is
+left for it), and keeps every marker that fits whole; a marker that cannot is
+dropped whole, never clipped at the edge. An unnamed member's markers still take
+what its id and count leave. A wider pane — `Shift-→` toward the list — shows more
+of the name, the whole of it once it fits. There is NO fixed cap. Unlike the turn count it is cut rather than dropped,
+because a cut name is still the start of the right name. Two forks whose
+messages share a first line therefore differ only by time and count. A named
+fork drawn as a top-level row (its parent filtered out, say) is not a child row:
+it keeps the label, with no `⑂`.
+
+#### Named forks: the fork-name prefix
+
+A fork snapback makes — from the `Ctrl-F` box (see [Fork box](#fork-box-ctrl-f))
+or the running-session choice's Fork — copies the root record like a background
+copy, so it joins its parent's lineage. But it is NEW work hanging off the
+parent — a review, an experiment — and it is newer than the parent from the moment
+it exists, so newest-as-head would hand the parent's row to whichever fork ran
+last. snapback therefore NAMES every such fork with
+`--name "fork: <first line of the message>"` (`resume::fork_name`: the first
+non-blank line, trimmed, control characters turned into spaces and cut on a char
+boundary at `resume::FORK_NAME_MAX_CHARS`; the parent's label stands in for an
+empty `Ctrl-O` and for the choice's Fork, which has no message), and the head rule
+skips a member whose `Session::custom_title` passes `lineage::is_fork_name`: it
+starts with `lineage::FORK_NAME_PREFIX` exactly, the ONE constant the argv
+builders and the head rule share.
+
+The marker is TEXT, and the trade-offs that follow are accepted: a session named
+`fork: …` by hand folds as a fork; a fork renamed without the prefix becomes an
+ordinary member that can take the head; and only forks snapback names are
+recognised — older forks and forks made outside snapback carry no such name and
+keep newest-as-head, exactly as claude's own background copies do (their names,
+like `pr #152 isolated review (2)`, never match). A name that is the prefix alone still marks a fork but its child row
+draws the id, not a name (`fork_title` answers `None`). A fork of a fork lists flat under the
+original, like every member. `sessionKind` plays no part: it still
+[does not drive folding](#sessionkind).
 
 Folding is **content-derived and never liveness-gated**. That is deliberate and
 easy to "improve" wrongly: the agents poll fires every `watch::AGENTS_REFRESH`
@@ -945,6 +1007,14 @@ never a second grouping rule.
 | HEAD row that stands for others: a folded `(+N)` head, or an expanded head with `↳` rows beneath it | flips the row and the members it stands for on screen (its `(+N)` members or its `↳` rows), pivoting on the selected id (`delete::toggle_hidden`); members off the board stay as they are | `Delete this` / `Delete lineage (N)` / `Cancel` over the full-store lineage, any hidden members disclosed ([On-disk layout](#on-disk-layout)) | the picker's `Enter` opens `Move this` / `Move lineage (N)` / `Cancel` over the full-store lineage, any hidden members disclosed ([Move](#move-to-another-worktree-ctrl-x-w-srcclaude_movers)) |
 | HEAD row standing alone: its other members are off the board (filtered out by the query, hidden with show-hidden off, out of scope) | flips that id alone | `Delete this` / `Delete lineage (N)` / `Cancel` over the full-store lineage, any hidden members disclosed | the picker's `Enter` opens `Move this` / `Move lineage (N)` / `Cancel` over the full-store lineage, any hidden members disclosed |
 | `↳` row, or a lone / rootless session | flips that id alone | `Delete this` / `Cancel`, the plain prompt | the picker's `Enter` moves at once |
+
+[Named forks](#named-forks-the-fork-name-prefix) take no row role of their own.
+`lineage::head_of` crowns the parent over the forks named from it, so the
+parent's row is the HEAD row and its named forks are its `(+N)` members or its
+`↳` rows: from the parent's row hide flips the forks it stands for on screen,
+and delete and move offer every one of them in the full-store lineage. A named
+fork's own `↳` row acts on that fork alone, like any `↳` row. Both follow from
+the rules above, by the one lineage key, with no named-fork exception.
 
 Both HEAD rows are a deliberate asymmetry: hide flips what the row shows, delete
 and move take the full store. Whole-lineage hide exists only so the fold cannot
@@ -1021,8 +1091,9 @@ named.
 root while that root **does** carry `has_agent_setting`.
 
 The **lineage root** is `lineage::root_of`: the **oldest member that has a
-timestamp**, taken from the far end of the same `member_rank` ordering `head_of`
-takes the top of. The dated filter is load-bearing — `member_rank` leads with
+timestamp**, taken from the far end of the same `member_rank` ordering whose top
+places the fold (`newest_of`; `head_of` takes that top over the non-forks). The
+dated filter is load-bearing — `member_rank` leads with
 `Reverse(Option<_>)` and `Reverse(None)` sorts *greatest*, so a plain `max` would
 crown a **timestamp-less** member "oldest". No dated member ⇒ no derivable root ⇒
 no badge.
@@ -1253,7 +1324,9 @@ the `Ctrl-X d` [hard-delete confirm](#on-disk-layout) and the
 [`Ctrl-X w` move](#move-to-another-worktree-ctrl-x-w-srcclaude_movers), which asks
 it on the move's worker rather than on the UI thread, reads membership alone, and
 is the one gate that REFUSES when the probe cannot answer
-([why](#why-the-gate-does-not-read-the---all-map)).
+([why](#why-the-gate-does-not-read-the---all-map)). A fork asks it nothing:
+neither the `Ctrl-F` box nor the running-session choice's Fork probes, since a
+fork works live or finished.
 The reply, interrupt and delete gates also CLASSIFY the record (via `agents::classify`) rather than reading membership alone —
 the only places a bucket informs an action rather than a pixel (see
 [the bucket's non-display consumers](#activity-buckets-agentactivity)) — and it is
@@ -2035,7 +2108,8 @@ in the population. Consequences worth keeping straight:
   members into `filtered`, so the numerator re-groups that list rather than
   taking its length. This is load-bearing beyond the arithmetic: a fold-sensitive
   number would drift on its own, because `restore_selection` → `reveal_hidden`
-  auto-expands on autorefresh whenever a background job appends to a transcript.
+  auto-expands on autorefresh whenever a background job appends to a transcript,
+  and the fork box's cursor jump expands the lineage its new fork lands in.
 - The population, **and its grouping**, are rebuilt **only** in
   `App::recompute_scope`. Deciding membership canonicalizes every `cwd`, the work
   that may not sit on a keystroke or a frame; the grouping is pure and could live
@@ -2140,16 +2214,18 @@ on is already on disk, per turn (`message.model`, see
 | Launch | Carries the compose's pick? | Built by |
 | --- | --- | --- |
 | `Enter` in a `Ctrl-R` reply box | yes, when one is set | `send::build_send_argv` |
+| `Enter` in a `Ctrl-F` fork box | yes, when one is set | `send::build_fork_send_argv` |
+| `Ctrl-O` in a `Ctrl-F` fork box | yes, when one is set | `resume::build_fork_run_argv`, via `check_fork_run` |
 | `Enter` in a `Ctrl-N` draft (`--bg`) | yes, when one is set | `send::build_bg_launch_argv` |
 | `Ctrl-O` in a `Ctrl-N` draft | yes, when one is set | `resume::build_new_argv`, via `check_new` |
 | `Ctrl-O` on the agent picker | never: it skips the draft, the only place a pick is made | `resume::build_new_argv` with `None` |
-| Resume (`Enter` on a row), Fork (`Ctrl-F`), Attach | never: their builders take no pick | `resume::build_argv` / `build_attach_argv` |
+| Resume (`Enter` on a row), the Attach/Fork/Cancel choice's Fork, Attach | never: their builders take no pick | `resume::build_argv` / `build_fork_argv` / `build_attach_argv` |
 | Move (`Ctrl-X w`, a headless `set_cwd` request) | never: it takes no model turn, and its builder takes no pick | `claude_move::build_set_cwd_argv` |
 
 `--model` goes out only for a `Some`, and `--effort` only right behind it, both
 through the ONE `resume::push_model_flag`; with no pick every argv is
 byte-identical to its modelless form and `claude` decides. That is the whole reason
-Resume and Fork carry none: a `-r` launch without `--model` normally restores the
+Resume and the running-session choice's Fork carry none: a `-r` launch without `--model` normally restores the
 session's own last model (the exceptions, such as an environment override, a
 non-first-party provider or a model it declines at resume time, are in
 [CLAUDE_CLI.md](CLAUDE_CLI.md#which-model-a-launch-runs-on-without---model)),
@@ -2159,12 +2235,13 @@ process already running under one. `claude` does NOT restore an effort, so a
 picked effort applies to that one launch, and a later resume runs at the settings
 level for the model it restores.
 
-**The picker.** `Ctrl-L` (`compose::ComposeAction::PickModel`, on both targets)
+**The picker.** `Ctrl-L` (`compose::ComposeAction::PickModel`, on every target)
 opens a `List` [modal](#user-facing-modes-tuiapp) OVER the compose, which keeps its
 text and pick untouched beneath it: `Enter` writes the highlighted row into that
 compose and hands the keyboard back to it, `Esc` returns to it with the previous
-pick intact. Its prompt names the scope (`Model for this reply only (←/→ effort):`
-or `Model for this new session (←/→ effort):`) and its footer the keys
+pick intact. Its prompt names the scope (`Model for this reply only (←/→ effort):`,
+`Model for this fork only (←/→ effort):` or
+`Model for this new session (←/→ effort):`) and its footer the keys
 (`MODEL_PICKER_FOOTER`, `↑/↓ choose · ←/→ effort · Enter set · Esc cancel` — no
 `^O`, which is inert here). Row 0 is the compose's DEFAULT
 (`ModalAction::SetModel(None)`, no `--model`): the one row NOT drawn from the alias
@@ -2202,13 +2279,13 @@ read the same answer:
 
 | `ComposeDefault` | When | Label (`view::compose_model_label`) | Picker row 0 |
 | --- | --- | --- | --- |
-| `SessionModel(label)` | a reply, no override in effect, and the session has an answering model on record | `model: session (<label>)` | `session's model (<label>)` |
-| `RestoreOverridden` | a reply while `ANTHROPIC_MODEL` or an `ANTHROPIC_DEFAULT_{FABLE,OPUS,SONNET,HAIKU}_MODEL` is non-empty — in the highest settings layer's `env` block, else in the process environment — so `claude` skips the restore | `model: default` | `default` |
-| `NoSessionModel` | a reply whose transcript records no answering model: nothing to restore | `model: default` | `default` |
+| `SessionModel(label)` | a reply or fork, no override in effect, and the session has an answering model on record | `model: session (<label>)` | `session's model (<label>)` |
+| `RestoreOverridden` | a reply or fork while `ANTHROPIC_MODEL` or an `ANTHROPIC_DEFAULT_{FABLE,OPUS,SONNET,HAIKU}_MODEL` is non-empty — in the highest settings layer's `env` block, else in the process environment — so `claude` skips the restore | `model: default` | `default` |
+| `NoSessionModel` | a reply or fork whose transcript records no answering model: nothing to restore | `model: default` | `default` |
 | `Settings(value)` | a draft whose `claude` settings name a model | `model: default (<value>) (new sessions only)` | `default (<value>) (settings)` |
 | `BuiltIn` | a draft whose settings name none | `model: default` | `default` |
 
-A reply's `<label>` is [the model a `-r` launch restores](#the-model-a--r-launch-restores-last_model),
+A reply's or fork's `<label>` is [the model a `-r` launch restores](#the-model-a--r-launch-restores-last_model),
 read off the cached preview and spelled as the turn markers spell it. The override
 flag and a draft's value come from ONE off-thread read,
 `claude_settings::model_defaults`, delivered once per board session as
@@ -2228,7 +2305,8 @@ lifetime, so it renders on the box and never on `App::status`.
 `--model`, so a wrong label never changes the argv or what runs; it only
 misnames it. The cases it is known to misname, each a `claude` rule
 ([CLAUDE_CLI.md](CLAUDE_CLI.md#which-model-a-launch-runs-on-without---model)) that
-snapback does not model, include:
+snapback does not model, include the following (a fork box's label is a reply's,
+so every reply case holds for it too):
 
 - A reply reads `session (<label>)` while `claude` DECLINES the restore for a model
   it rejects at resume time (retired, of an unknown family, not allowed for the
@@ -2258,10 +2336,10 @@ restored id; that is the same model's long-context variant, not a different mode
 
 **Held as the raw string and NEVER validated** — neither the probed set nor the
 seed is a whitelist, and an unknown value is `claude`'s to reject: a hard,
-non-zero failure, which the draft's `Ctrl-O` run explains with
-`resume::MODEL_NONZERO_HINT` (naming the draft's `Ctrl-L` pick instead of the
-agent-name wording) and the reply and the `--bg` launch report through their own
-honest status maps. **Precedence:** a draft's pick SUPERSEDES a defined agent's own
+non-zero failure, which the draft's and the fork box's `Ctrl-O` runs explain with
+`resume::MODEL_NONZERO_HINT` (naming the compose's `Ctrl-L` pick instead of the
+agent-name or resume wording) and the reply, the headless fork and the `--bg`
+launch report through their own honest status maps. **Precedence:** a draft's pick SUPERSEDES a defined agent's own
 `model:` frontmatter — deliberate, since the user picked it after that agent was
 written; `src/defined_agents.rs` does not read the field at all, so `claude`
 resolves it and the flag is the later word. The probed alias list and the settings
@@ -2276,7 +2354,7 @@ refresh, the fetch request), `src/claude_catalog.rs` (claude's list),
 `src/claude_trust.rs` (which form of claude's list a folder gets),
 `src/store/skills.rs` (a reply's `@` agents until claude's list lands).
 
-BOTH compose boxes — the `Ctrl-R` reply and the `Ctrl-N` draft — offer the same
+EVERY compose box — the `Ctrl-R` reply, the `Ctrl-F` fork and the `Ctrl-N` draft — offers the same
 `/` and `@` list, through the same editor, key router, driver and renderer, and
 narrow it by the [rule below](#how-the-letters-narrow-the-list):
 
@@ -2332,8 +2410,8 @@ narrow it by the [rule below](#how-the-letters-narrow-the-list):
   ([below](#which-settings-the-fetch-loads)).
 
 **Where it reads from.** The one per-target difference is
-`compose::completion_source`: a reply reads its session's `cwd` and transcript
-file, both from the `Session` the store parsed out of the file itself, and gets no
+`compose::completion_source`: a reply or fork reads its session's `cwd` and
+transcript file, both from the `Session` the store parsed out of the file itself, and gets no
 list once that session has left the store; a draft reads `App::launch_dir`, the
 folder its `--bg` / `Ctrl-O` child runs in, and has no transcript. For that folder
 the list reads, in order of precedence (a `/` reads the first row alone):
@@ -2341,8 +2419,8 @@ the list reads, in order of precedence (a `/` reads the first row alone):
 | Source | Used when | What it holds |
 | --- | --- | --- |
 | claude's catalog (`App::catalogs`) | it has landed for the folder | claude's own `initialize` handshake answer: commands (skills and built-ins, minus the built-ins claude hides from its own menu) and agents, with descriptions. It includes the repository's own `.claude/` skills, commands and agents only where claude TRUSTS the folder; anywhere else the fetch passes `--setting-sources user`, so the list is the user's own, bundled and built-in items alone ([below](#which-settings-the-fetch-loads)) |
-| the reply's transcript | a REPLY's top-level `@`, until the catalog lands or when its fetch failed | AGENTS only: `store::skills::read_listing` of the reply's own session file (its [`agent_listing_delta` records](#jsonl-record-model)), read at most once per draft, and only for a top-level `@`. A `/` never reads it, and an `@` with a folder part lists no agents |
-| none | otherwise, until the catalog lands or when its fetch failed | `/` lists nothing in either box, and a draft's `@` lists no agents; files and folders show at once in both, a local read |
+| the session's transcript | a reply's or fork's top-level `@`, until the catalog lands or when its fetch failed | AGENTS only: `store::skills::read_listing` of that box's own session file (its [`agent_listing_delta` records](#jsonl-record-model)), read at most once per draft, and only for a top-level `@`. A `/` never reads it, and an `@` with a folder part lists no agents |
+| none | otherwise, until the catalog lands or when its fetch failed | `/` lists nothing in any box, and a draft's `@` lists no agents; files and folders show at once in all three, a local read |
 
 **`/` is the catalog alone; for agents the catalog REPLACES the transcript.** A
 transcript's `skill_listing` records are the MODEL's skill list: they name the
@@ -2355,7 +2433,7 @@ them apart
 not read them, and a `/` lists nothing until claude's own list lands: typing a
 command still works, and a reply whose folder is gone, so that its fetch can never
 run, cannot be sent anyway (`send::plan_send`). Agents carry no such flag, so a
-reply's `@` takes them from its transcript until the catalog lands, and from then
+reply's or fork's `@` takes them from its transcript until the catalog lands, and from then
 on the catalog is that folder's whole agent list, never merged with the
 transcript's. The transcript is a SNAPSHOT: an agent added after its last record
 is missing but still works when typed. A slash command in `claude -p` was
@@ -2373,8 +2451,8 @@ names a folder only when a compose is open, that compose has not asked yet
 flight (`App::catalogs_in_flight`); the driver then starts
 `claude_catalog::spawn_fetch`, whose thread delivers exactly ONE
 `AppEvent::CatalogFetched`. Deriving the request from state covers every
-compose-opening path — `Ctrl-R`, the stop-then-reply confirm, `Ctrl-N` with or
-without its picker — without touching any of them. EACH COMPOSE ASKS ONCE,
+compose-opening path — `Ctrl-R`, the stop-then-reply confirm, `Ctrl-F`, `Ctrl-N`
+with or without its picker — without touching any of them. EACH COMPOSE ASKS ONCE,
 whatever the answer, and a compose that finds its folder's fetch already running
 waits on that one. `App::finish_catalog_fetch` always releases the in-flight mark
 and caches only an ANSWER: no `claude`, a timeout or a bad reply is not a verdict
@@ -2410,7 +2488,7 @@ STARTS with the query, then a name that holds it elsewhere, then (`@` paths only
 `complete::path_placement`) a hit only in a FOLDER component of the path, then a
 description-only hit. An `@` path entry's name is its last component. Within a tier the list keeps the order it has with no
 query — the source's order for commands and agents (claude's catalog, or a
-reply's transcript); folders before files, then by name, for `@` entries — and
+reply's or fork's transcript); folders before files, then by name, for `@` entries — and
 an `@` list keeps every entry above every agent, whatever their tiers. An empty
 query admits every candidate into that one order. claude 2.1.284 orders its own
 `/` menu the same way — name start, then the rest of the name, then the
@@ -2457,8 +2535,9 @@ prefetch: with it, that prefetch never runs the repository's git configuration (
 
 `tui::init_terminal` enables **bracketed paste**, so the terminal delivers a
 clipboard drop as ONE `crossterm::event::Event::Paste` carrying the whole string.
-`update::handle_paste` routes it through the SAME precedence the key arm uses —
-a partial enumeration here is a wrong one, so all six keyboard owners are stated:
+`update::handle_paste` routes it through the SAME precedence the key arm uses
+(`App::keyboard_owner`, the board being the sixth, when no `KeyboardOwner` is
+open) — a partial enumeration here is a wrong one, so all six are stated:
 
 | Owner (in precedence order) | What a paste does | Why |
 | --- | --- | --- |
@@ -2489,26 +2568,37 @@ different mechanism, same verb.
 | Action | argv |
 | --- | --- |
 | Resume | `claude -r <id>` (`<id>` = full `sessionId`) |
-| Fork | `claude -r <id> --fork-session` (`<id>` = full `sessionId`) |
+| Fork | `claude -r <id> --fork-session --name "fork: <the session's label>"` (`<id>` = full `sessionId`; see [named forks](#named-forks-the-fork-name-prefix)); the Attach/Fork/Cancel choice's hand-off, model-less |
+| Fork run (`Ctrl-O` in the `Ctrl-F` box) | `claude -r <id> --fork-session --name <name> [--model <alias> [--effort <level>]] [<message>]`; an empty box with no pick is byte-identical to the Fork row's argv |
 | Attach | `claude attach <job-id>` (one-shot reattach; `<job-id>` = the **short agent-view id** from `claude agents --json`, **not** the `sessionId`) |
 | New session | `claude [--agent <name>] [--model <alias> [--effort <level>]] [<prompt>]` (interactive launch, no `-r` — mints its own id; started in `App::launch_dir` via `Ctrl-N`, optionally bound to a picked agent, and optionally opening on a drafted `<prompt>` — see [the background draft pane](#background-agent-draft-pane-ctrl-n)) |
 
 **Which hand-off may carry a model** is the
 [compose model pick](#compose-model-pick-ctrl-l)'s table. On this side the
 exclusion is a SIGNATURE, not a match arm: `build_argv(session_id, fork)`,
-`build_attach_argv(job_id)` and their gates (`check(session, fork)`,
-`check_attach`) take no model parameter, so no `--model` or `--effort` token can
-reach a Resume, Fork or Attach argv even by mistake.
-`argv_for` hands `ctx.model` to `build_new_argv` alone rather than appending the
-flag itself, because it must precede the trailing POSITIONAL prompt and only the
+`build_fork_argv(session_id, parent_label)`, `build_attach_argv(job_id)` and their
+gates (`check(session, fork)`, `check_attach`) take no model parameter, so no
+`--model` or `--effort` token can reach a Resume, Fork or Attach argv even by
+mistake. The Fork's `build_fork_argv` is `build_argv`'s fork plus the
+`resume::push_fork_name` an empty box's run appends, named from the session's label
+(`check` reads `session.label`, while `cwd` and `sessionId` stay re-read from the
+file), so the two routes spawn the same argv. The fork box's own run is a SEPARATE
+action (`SessionAction::ForkRun`, `build_fork_run_argv`, `check_fork_run`) that
+also takes a pick and a message, so the model-less Fork stays model-less. Both
+fail in the fork's own words: `check` gives a fork `FORK_NONZERO_HINT` and no race
+probe, from the one `fork` flag its argv is built from. `argv_for` hands
+`ctx.model` to `build_new_argv` and `build_fork_run_argv` alone rather than
+appending the flag
+itself, because it must precede the trailing POSITIONAL prompt and only the
 builder that owns that positional knows where "before it" is. `--effort` rides
 inside the same `push_model_flag` guard, directly after `--model`, so it never
 appears without the model; with no pick the argv is byte-identical to its
 modelless form. The trim/blank guard is literally SHARED with `--agent`
 (`resume::flag_value`), so a blank pick can never emit a valueless flag, and
 `nonzero_hint_for` selects `MODEL_NONZERO_HINT` from that SAME predicate — a blank
-pick emits nothing and therefore keeps the new-session wording, rather than blaming
-a model that was never sent.
+pick emits nothing and therefore keeps the launch's own wording
+(`NEW_SESSION_NONZERO_HINT`, or `FORK_NONZERO_HINT` for a fork run), rather than
+blaming a model that was never sent.
 
 `claude attach` matches the agent-view **job id** (the short id), not the full
 `sessionId` — a full UUID exits 1 ("No job matching"). Only **background** agents
@@ -2525,8 +2615,10 @@ by splitting the UUID.
 Before any hand-off, `cwd` and `sessionId` are **re-read from inside the file**
 (authoritative at hand-off time) and the `cwd` must still exist on disk;
 otherwise the board surfaces a refusal (deleted worktrees are common) and stays
-up. That gate covers resume AND fork (and the `Ctrl-X w` move's worker asks it
-too, through `resume::plan_at`, for the folder the move starts from), and it is
+up. That gate covers resume AND every fork (`check(session, true)` when `Ctrl-F`
+opens the box, `check_fork_run` at its `Ctrl-O`, `send::plan_send` at its
+`Enter`; and the `Ctrl-X w` move's worker asks it too, through
+`resume::plan_at`, for the folder the move starts from), and it is
 what bounds the
 [project scope's root arm](#user-facing-modes-tuiapp): a removed worktree's
 sessions are back on the board, and are browsable, searchable, hideable and
@@ -2535,7 +2627,8 @@ Attach still `chdir`s into that authoritative `cwd`, but its argv is keyed on
 the agent-view job id rather than the re-read `sessionId`. **New session** is the
 exception: it has no source file to re-read, so `resume::check_new` gates on the
 existence of `App::launch_dir` itself and uses that dir as the authoritative
-`cwd`. All four escalate to the same `Outcome::Resume` round trip.
+`cwd`. Every hand-off in the table — Resume, Fork, Fork run, Attach, New —
+escalates to the same `Outcome::Resume` round trip.
 
 A new session can also be **bound to a DEFINED agent** (`claude --agent <name>`).
 These are DISTINCT from the live/running agents above: they are on-disk
@@ -2548,6 +2641,76 @@ blocks on it. `Ctrl-N` opens the picker only when at least one agent is
 discovered (otherwise it opens the draft pane below directly, with no agent
 bound), pre-highlighting the last-STARTED agent, which `App` remembers
 **in-memory only** (never persisted).
+
+### Fork box (`Ctrl-F`)
+
+`Ctrl-F` (`update::fork`) opens `compose::ComposeTarget::Fork { session_id }`
+after the folder check (`resume::check(session, true)`, its `Ready` dropped): a
+deleted folder is refused on the board before anything is typed. It has NO
+liveness gate and no reply-in-flight refusal: claude skips the live-session
+refusal for a fork, and a fork writes a NEW transcript, so neither the reply
+gate's table nor `send::reply_in_flight_refusal` applies. The one in-flight fact
+it does refuse, FIRST and like `Enter`, is snapback's own
+[`Ctrl-X w` move](#move-to-another-worktree-ctrl-x-w-srcclaude_movers) of that row
+(`App::moving_on`, `MOVING_RESUME_REFUSAL`): that child is renaming the very
+transcript the fork would copy, so no box opens. In every other respect the box behaves
+like a reply box: it previews the real session (no draft card, so the mouse stays
+live over the transcript), the transcript scroll keys reach the pane, its
+`model:` default is a reply's (`resolve_compose_default`), and its pick list reads
+the session's folder and transcript (`compose::completion_source`).
+
+| Key | Route |
+| --- | --- |
+| `Enter` | headless, over the reply's send path (`compose::submit_fork_with`). An empty message nudges (`COMPOSE_EMPTY_FORK_HINT`, transient) and keeps the box. Otherwise: re-read the original's authoritative `(cwd, id)` (`send::plan_send`), take ONE fresh id (`send::fresh_session_id`, 16 bytes of `/dev/urandom` through the pure `format_uuid_v4`; a failed read refuses with a sticky status, keeps the box and its text, and dispatches nothing), build `send::build_fork_send_argv`, mark the send in flight under the NEW id, arm the cursor jump, and hand the driver a `SendRequest` keyed by that id. Completion is the reply's `SendFinished`, with its `sent — $…` wording. |
+| `Ctrl-O` | interactive hand-off, `SessionAction::ForkRun` (`update::launch_fork_run` → `resume::check_fork_run`: the same authoritative re-read, no race probe, and a non-zero exit says `MODEL_NONZERO_HINT` when `--model` is really emitted, else `FORK_NONZERO_HINT` — never the resume hint, which would send the user back to `Ctrl-F`). A session gone from the board refuses with `COMPOSE_FORK_SESSION_GONE`. A typed message rides as the trailing positional. No cursor jump. |
+
+Both argvs, and what claude 2.1.291 was checked and probed for (both forms, the
+`Ctrl-O` message's auto-submit included), are
+[CLAUDE_CLI.md](CLAUDE_CLI.md#how-snapback-drives-claude)'s. Both routes name the
+fork through the one `resume::push_fork_name`, always before the trailing
+message; [named forks](#named-forks-the-fork-name-prefix) owns the name and why it
+exists.
+
+**One id, four uses.** The headless fork's id is the `--session-id`, the
+`App::sending` entry, the `SendRequest`'s session and the fork side of the jump.
+Keying the in-flight entry by the FORK leaves the original's own gates untouched
+(claude leaves its file byte-identical), while every gate that reads the entry
+refuses the new fork's row until its child finishes
+([the in-flight row's keys](#quick-reply--non-interactive-send-srcsendrs)):
+`delete::can_delete_target` its file — the [third writer](#on-disk-layout) rule,
+unchanged — and `Enter` a resume of it, which matters because the jump below lands
+the cursor on exactly that row while its child still runs. The fork has no transcript at
+send time, so the entry's baseline turn count is 0: once its file appears, the
+copied history already exceeds that, so the `▶ you` echo never shows and its
+preview carries only the `cooking…` placeholder until `SendFinished`. A headless
+fork cannot answer permission prompts, like `Ctrl-R`.
+
+**Cursor jump.** `App::fork_jump` holds `(origin, fork)` from `Enter`. Its one
+consumer is `App::apply_reload` (`consume_fork_jump`, after `restore_selection`),
+the funnel every reload takes: on the first reload whose store holds the fork,
+the cursor moves to it only if it is still on the origin AND nothing owns the
+keyboard (`App::keyboard_owned`: a modal, a compose's model picker among them; a
+pending `Ctrl-X` chord; the stop or interrupt confirm; an open compose box). Those
+are the `KeyboardOwner` variants, the one list `update::dispatch` routes a key by.
+Moving the selection under an owner would change the row it shows or acts on: a
+second fork box opened on the origin before the first fork lands (the
+fork-again workflow) keeps both its target and its preview. A fork FOLDED under the
+origin — the usual case, since the origin heads its named forks — is revealed by
+expanding that lineage (`App::reveal_hidden`, the same path `restore_selection`
+takes) and selected; a fork the query or a hide filters out is not folded, so the
+reveal rolls back and the cursor stays on the origin, never on a neighbour. The
+pair is forgotten then, jump or not: DROPPED under an owner, never held until it
+closes, so a cancelled box cannot fire a stale jump later, and of a run of forks
+only one that lands with nothing open is followed. A failed fork's `SendFinished`
+forgets it too (`App::forget_fork_jump`), and a later fork's `Enter` replaces it.
+
+**The `[unbound]` badge.** A `--name`d fork also gets an `agent-name` record
+(CLAUDE_CLI.md), so a fork of a BACKGROUND session could match the
+[`[unbound]` badge](#lost-agent-binding-storelineage)'s bare signature. The badge
+also needs the fork to lack the `agent-setting` its root has, and a fork copies the
+binding, so it is unlikely to show (untested). The records a fork writes carry no
+background stamp (CLAUDE_CLI.md records the observation), so only a stamp copied
+from a background parent's records can make a fork `background` at all.
 
 ### Background-agent draft pane (`Ctrl-N`)
 
@@ -2610,16 +2773,17 @@ nor "will it be delivered?", and the card is the only UI state that has to survi
 long enough to care:
 
 - **Which dispatch.** The card is still up when the result lands, but the SURFACE
-  underneath may have moved on — the user can open a quick reply (`Ctrl-R`) or a
-  second draft while `--bg` runs. So the event carries the `launch_id` back and
+  underneath may have moved on — the user can open a quick reply (`Ctrl-R`), a
+  fork box (`Ctrl-F`) or a second draft while `--bg` runs. So the event carries the `launch_id` back and
   `App::launching_draft` checks it, the way a quick reply's completion carries its
   session id back and `App::clear_sending` removes only that session's entry.
   Without that check a completing launch closes whatever compose is open and
   discards a half-typed message.
 - **Whether it arrives.** Delivery is bounded by the board session: `tui::run_inner`
   builds a new `EventLoop` per board and drops the old receiver, so a launch still
-  running when the user hands off (`Enter`/`Ctrl-F` on a row stay routable — the
-  editor is closed) reports into a dead channel while `lib::run` re-enters the board
+  running when the user hands off (`Enter` on a row stays routable — the editor
+  is closed; a compose box, the `Ctrl-F` fork box included, replaces the card as
+  it opens, so none hands off over it) reports into a dead channel while `lib::run` re-enters the board
   on the same `App`. `update::handle_event` therefore closes the compose surface on
   any outcome that ENDS the board session (`Outcome::ends_board_session`: `Quit` and
   every `Resume`), so the card can never strand the preview on a placeholder for
@@ -2694,8 +2858,8 @@ dropped the instant the real turn lands on disk — detected by the reloaded
 `Session::msg_count` growing past `Sending::baseline_msg_count` — so the real turn
 (styled identically) takes its place with no doubling; the placeholder stays until
 `AppEvent::SendFinished` clears that session's entry (and only it). That event survives a hand-off. If
-the board session that dispatched the send ends first (Enter, `Ctrl-F`, Attach,
-`Ctrl-O`), the event is kept in the app's `send::UndeliveredEvents` queue, and the
+the board session that dispatched the send ends first (Enter, Attach, a `Ctrl-O`
+run from a draft or the fork box), the event is kept in the app's `send::UndeliveredEvents` queue, and the
 next board replays it through the same arm: once at entry, before the first draw,
 and then on every `Tick` (see
 [the event sources](ARCHITECTURE.md#event-sources-watcheventloop)). So the entry
@@ -2736,7 +2900,7 @@ never the polled `--all` map — classified by the one `agents::classify`), and
 
 | Probe result | Bucket | `Ctrl-R` (`send::reply_gate`) |
 | --- | --- | --- |
-| not asked: the SELECTED session's own quick reply is still in flight (`App::sending_to` answers for it); a reply in flight to another row is not this row's and never lands here | — | refuse (`SEND_IN_FLIGHT_REFUSED`, about this session) BEFORE the probe, via `send::reply_in_flight_refusal`: no compose opens |
+| not asked: the SELECTED session's own quick reply is still in flight, or — on a fork's row — the headless fork that is creating it (`App::sending_to` answers for both, the fork's child being recorded under the fork's id); a reply in flight to another row is not this row's and never lands here | — | refuse (`SEND_IN_FLIGHT_REFUSED`, about this session, worded for a reply or a fork) BEFORE the probe, via `send::reply_in_flight_refusal`: no compose opens |
 | not asked: the SELECTED session's own [`Ctrl-X w` move](#move-to-another-worktree-ctrl-x-w-srcclaude_movers) is still in flight (`App::moving_on`); a move on another row never lands here | — | refuse (`MOVING_REPLY_REFUSAL`) BEFORE the probe, after the reply check above: no compose opens |
 | claude is not holding the session | — | reply in place, no stop (compose opens) |
 | held, but the record carries no stoppable job id (every `kind: "interactive"` record measured so far), with or without a `pid` | — | refuse (`SEND_LIVE_REFUSED`) — try `Ctrl-K` or Fork (`Ctrl-F`) |
@@ -2758,6 +2922,23 @@ probe is spent. The refusal says "this session" rather than naming one, because
 it is only ever shown for the row `Ctrl-R` was pressed on. The move check follows
 it for the same reasons: a `claude -p -r` would append to the file the move's
 child is relocating.
+
+**While snapback's own `claude -p` child is in flight on a row** (`App::sending_to`:
+a quick reply to it, or the headless fork creating it), every key that would write
+that transcript, move it, or open a second `claude` on it refuses THAT row, each in
+its own words; a child on another row refuses nothing here, and neither does a
+headless fork on the row it was forked from, which its child only reads:
+
+| Key on the row | Refusal |
+| --- | --- |
+| `Enter` | `RESUME_SENDING_REFUSAL` (`send::resume_in_flight_refusal`), FIRST: before the move check, the probe and any Attach/Fork/Cancel choice, so no probe is spent |
+| `Ctrl-R` | `SEND_IN_FLIGHT_REFUSED`, before the probe (the table above) |
+| `Ctrl-X d`'s confirm | `DELETE_SENDING_REFUSAL` ([the third writer](#on-disk-layout)) |
+| `Ctrl-X w` | `MOVE_SENDING_REFUSAL`, before any picker opens |
+
+`Ctrl-F` is deliberately not gated: a fork only READS the row, as it reads a live
+agent's. The choice's Fork is never reached on such a row: the choice opens only
+from `Enter`, which refuses first.
 
 The **job-id check runs BEFORE the bucket** and wins in every state: an agent
 `claude stop` cannot address is unstoppable by this path whatever it is doing, so
@@ -2797,7 +2978,7 @@ choose one on this path at all, since the in-session `/model` command cannot rea
 a non-interactive `-p` run — so a [compose pick](#compose-model-pick-ctrl-l) is
 honored for this one reply, its effort included, emitted through the SAME
 `resume::push_model_flag` rather than a second copy of its guard. The identical
-split holds for the draft's background launch. With no pick the argv carries no
+split holds for the fork box's headless fork and the draft's background launch. With no pick the argv carries no
 `--model`, and `claude` normally restores the model the session last answered with
 — the `model: session (<label>)` the box showed, unless an environment override
 made it say `default`.
@@ -3058,7 +3239,7 @@ names:
 | Case | Where decided | Refusal |
 | --- | --- | --- |
 | this session's own move is still in flight (a second child would race the first for the file) | `App::open_move_picker`, before any picker opens | `MOVE_IN_FLIGHT_REFUSAL` |
-| snapback's own quick reply is in flight to the session (`App::sending_to`, a writer the probe cannot be relied on to see) | `App::open_move_picker`, before any picker opens | `MOVE_SENDING_REFUSAL`, naming snapback |
+| snapback's own `claude -p` child is in flight on the session (`App::sending_to`: a quick reply, or a headless fork under the fork's new id; a writer the probe cannot be relied on to see) | `App::open_move_picker`, before any picker opens | `MOVE_SENDING_REFUSAL`, naming snapback |
 | the session's folder is outside the launch project (its worktrees are not in the cached set; resolving them would put `git` on a keypress) | `App::open_move_picker` | `MOVE_OUTSIDE_PROJECT` |
 | the cached worktree list names no folder but the session's own | `App::open_move_picker` | `MOVE_NO_TARGET` |
 | no worktree list was resolved (git unavailable) | `App::open_move_picker` | `MOVE_WORKTREES_UNKNOWN` |
@@ -3086,7 +3267,7 @@ lands after its LAST member:
 
 | Key on the moving row | Refusal |
 | --- | --- |
-| `Enter`, `Ctrl-F` | `MOVING_RESUME_REFUSAL`, before any probe |
+| `Enter`, `Ctrl-F` | `MOVING_RESUME_REFUSAL`, before any probe (and, for `Ctrl-F`, before its folder check, so no [fork box](#fork-box-ctrl-f) opens) |
 | `Ctrl-R` | `MOVING_REPLY_REFUSAL`, before the probe ([the reply gate](#quick-reply--non-interactive-send-srcsendrs)) |
 | `Ctrl-X d`'s confirm | `DELETE_MOVING_REFUSAL` ([the fourth writer](#on-disk-layout)) |
 | `Ctrl-X w` | `MOVE_IN_FLIGHT_REFUSAL` |

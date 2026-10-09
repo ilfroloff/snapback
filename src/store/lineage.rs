@@ -11,6 +11,13 @@
 //! a single visible head. It is presentation-only: [`fold`] hides indices from a
 //! display list, and nothing here can drop a session.
 //!
+//! A fork snapback makes — from the `Ctrl-F` box or the Attach/Fork/Cancel
+//! choice — joins its parent's lineage the same way (it copies the root record
+//! too), but it is NEW work hanging off that parent rather than the parent's
+//! continuation. snapback names every such fork
+//! with [`FORK_NAME_PREFIX`], and [`head_of`] reads that name so the parent keeps
+//! heading the forks made from it.
+//!
 //! Because it is the one place that knows which rows are copies of ONE
 //! conversation, it also answers the question that needs a member compared against
 //! its own origin: [`lost_agent_bindings`] flags a background fork that lost the
@@ -26,7 +33,49 @@ use std::collections::{HashMap, HashSet};
 
 use time::OffsetDateTime;
 
-use super::Session;
+use super::{label, Session};
+
+/// The prefix the `Ctrl-F` fork box puts at the front of every fork's `--name`
+/// (`resume::fork_name`), and the ONE marker [`head_of`] reads to tell such a fork
+/// from the conversation it was forked from ([`is_fork_name`]).
+///
+/// The text IS the marker, so the builder that writes it and the rule that reads
+/// it share this one constant and cannot spell it differently. Two costs follow
+/// from a text marker, both accepted: a session the user names `fork: …` by hand
+/// folds as a fork, and a fork renamed without the prefix becomes an ordinary
+/// member that can take the head. Claude's own background copies carry other names
+/// (`pr #152 isolated review (2)` in a real store), so they never match.
+pub const FORK_NAME_PREFIX: &str = "fork: ";
+
+/// Whether `name` marks a fork snapback made: it starts with
+/// [`FORK_NAME_PREFIX`] exactly, case and trailing space included. Pure.
+#[must_use]
+pub fn is_fork_name(name: &str) -> bool {
+    name.starts_with(FORK_NAME_PREFIX)
+}
+
+/// Whether `session` is a fork snapback named ([`is_fork_name`] on its
+/// [`Session::custom_title`]). A session with no name is never one.
+fn is_named_fork(session: &Session) -> bool {
+    session.custom_title.as_deref().is_some_and(is_fork_name)
+}
+
+/// What a named fork's CHILD row draws after its `⑂`, in the slot an unnamed
+/// member's id takes: the name without [`FORK_NAME_PREFIX`], trimmed and made
+/// row-safe the way a label is (tabs and line breaks become spaces, capped at
+/// [`label::LABEL_MAX`]).
+///
+/// `None` for a session that is not a named fork, and for one whose name is the
+/// prefix alone, so such a row keeps the id it always drew.
+#[must_use]
+pub fn fork_title(session: &Session) -> Option<String> {
+    let title = session
+        .custom_title
+        .as_deref()?
+        .strip_prefix(FORK_NAME_PREFIX)?
+        .trim();
+    (!title.is_empty()).then(|| label::sanitize_and_truncate(title, label::LABEL_MAX))
+}
 
 /// Identity of one fork lineage.
 ///
@@ -52,8 +101,9 @@ pub struct LineageKey {
 /// surviving head is standing in for.
 #[derive(Debug, Clone, Default)]
 pub struct Folded {
-    /// The visible session indices. Heads keep the incoming display order; an
-    /// expanded lineage's other members are gathered beneath their own head.
+    /// The visible session indices, in the incoming display order except that a
+    /// lineage is drawn in its newest member's slot, head first, with an expanded
+    /// lineage's other members gathered beneath the head (see [`fold`]).
     pub visible: Vec<usize>,
     /// Head index -> how many lineage members that head hides. A head that hides
     /// nothing (a lone session, or an expanded lineage) has NO entry, so a `(+N)`
@@ -124,21 +174,40 @@ pub fn group_members(sessions: &[Session], indices: &[usize]) -> Vec<Vec<usize>>
 /// `App::order_filtered` sorts on, so a lineage ranked here lands where the
 /// display ordering already puts it.
 ///
-/// The ONE place D1's ordering is written down: [`head_of`] takes its minimum and
-/// [`fold`] sorts gathered members by it, so the head can never drift from the top
-/// of the run drawn beneath it.
+/// The ONE place D1's ordering is written down: [`head_of`] takes its minimum over
+/// the members that are not named forks, [`fold`] places each lineage at the slot
+/// of its overall minimum ([`newest_of`]) and sorts gathered members by it.
 fn member_rank(session: &Session) -> (Reverse<Option<OffsetDateTime>>, &str) {
     (Reverse(session.timestamp), session.session_id.as_str())
 }
 
-/// The lineage's head: the member with the NEWEST timestamp (a member with no
-/// timestamp sorts last), tie-broken by `session_id` ascending — [`member_rank`].
+/// The lineage's NEWEST member by [`member_rank`], whose display slot [`fold`]
+/// draws the whole lineage in. `None` only for an empty `members`.
+fn newest_of(sessions: &[Session], members: &[usize]) -> Option<usize> {
+    members
+        .iter()
+        .copied()
+        .min_by_key(|&i| member_rank(&sessions[i]))
+}
+
+/// The lineage's head: its NEWEST member that is NOT a named fork
+/// ([`is_fork_name`]), tie-broken by `session_id` ascending — [`member_rank`] over
+/// those members. When every member is a named fork, the newest member of all.
 ///
-/// Newest — NOT most-messages — because the board already sorts repo -> branch
-/// -> timestamp-desc and ranks groups by their MAX timestamp. A head chosen any
-/// other way could carry a timestamp below its own lineage's max, and the folded
-/// row would then sort incoherently against the very rows it stands for. (The two
-/// rules disagree in only 1 of 24 measured lineages, so this is nearly free.)
+/// Named forks are skipped because a fork made from the `Ctrl-F` box is new work
+/// hanging off its parent, and it is newer than the parent from the moment it
+/// exists: newest-as-head would hand the parent's row to whichever fork ran last
+/// and bury the conversation they all came from. A background copy claude makes
+/// on its own carries no such name and keeps newest-as-head — the copy that kept
+/// working IS that conversation's latest state.
+///
+/// Newest among the rest — NOT most-messages — because the board sorts repo ->
+/// branch -> timestamp-desc and ranks groups by their MAX timestamp; a head chosen
+/// by bulk could carry a timestamp below its own lineage's max. (The two rules
+/// disagree in only 1 of 24 measured lineages, so this is nearly free.) A head
+/// that skips a newer named fork does carry an older timestamp than that fork;
+/// [`fold`] keeps the lineage where the fork sorts anyway, and a collapsed head
+/// showing an older time than the rows below it is the accepted cost.
 ///
 /// # Panics
 ///
@@ -148,16 +217,18 @@ pub fn head_of(sessions: &[Session], members: &[usize]) -> usize {
     members
         .iter()
         .copied()
+        .filter(|&i| !is_named_fork(&sessions[i]))
         .min_by_key(|&i| member_rank(&sessions[i]))
+        .or_else(|| newest_of(sessions, members))
         .expect("head_of requires a non-empty lineage")
 }
 
 /// The lineage's ROOT: the OLDEST member that HAS a timestamp — the original
 /// foreground transcript every later member was forked from.
 ///
-/// The exact opposite end of the SAME total order [`head_of`] takes the top of,
+/// The exact opposite end of the SAME total order [`newest_of`] takes the top of,
 /// so there is still only ONE ordering in this module ([`member_rank`]) and a root
-/// can never be derived by a rule the head disagrees with.
+/// can never be derived by a rule the fold placement disagrees with.
 ///
 /// # Why the dated filter is load-bearing
 ///
@@ -290,10 +361,20 @@ pub fn lost_agent_bindings(sessions: &[Session]) -> HashSet<String> {
 ///
 /// # Ordering
 ///
-/// - **Heads keep their incoming order.** The visible set is never re-sorted, so
-///   folding and expanding can never re-rank one head against another.
-/// - **An expanded lineage's other members are GATHERED** immediately beneath
-///   their head, in the lineage's own [`member_rank`] order.
+/// - **Each lineage is drawn in the slot of its NEWEST member** ([`newest_of`]);
+///   every other member's own slot is dropped. Rows outside any lineage, and
+///   lineages of one, keep their incoming order. The visible set is never
+///   re-sorted, so folding and expanding can never re-rank one lineage against
+///   another.
+/// - **The run drawn in that slot starts with the head** ([`head_of`]); an
+///   expanded lineage's other members are GATHERED immediately beneath it, in the
+///   lineage's own [`member_rank`] order.
+///
+/// The newest member's slot, not the head's: when the head is a parent whose
+/// named forks are newer ([`head_of`]), the head's own slot would sink a lineage
+/// whose forks are being worked on right now to wherever the parent last moved.
+/// The cost, accepted: a collapsed head can show an older timestamp than the rows
+/// below it. With no named fork the head IS the newest member, and nothing moves.
 ///
 /// Gathering is deliberate, and filtering alone does NOT produce it: time
 /// scatters a lineage (measured over the real store, 18 of 27 head->child pairs
@@ -303,9 +384,10 @@ pub fn lost_agent_bindings(sessions: &[Session]) -> HashSet<String> {
 ///
 /// It is safe by construction: D4 scopes a lineage to one `(repo, branch)`, so a
 /// gathered member stays INSIDE its own group and same-group rows stay contiguous
-/// with exactly one head — `tui::app::build_rows`' invariant. D1 makes the head
-/// the newest member of its lineage, so a child only ever moves UP toward its
-/// head and can never land above it.
+/// with exactly one head — `tui::app::build_rows`' invariant. The incoming order
+/// sorts a group newest-first (`App::order_filtered`, the same key as
+/// [`member_rank`]), so the newest member is the lineage's FIRST row in it and
+/// every other member only ever moves UP into its slot.
 pub fn fold(sessions: &[Session], filtered: &[usize], expanded: &HashSet<LineageKey>) -> Folded {
     // Collect each lineage's members. A session with no derivable key has no
     // lineage and joins none, so it can never be folded or moved (FAIL-SOFT).
@@ -317,10 +399,11 @@ pub fn fold(sessions: &[Session], filtered: &[usize], expanded: &HashSet<Lineage
     }
 
     let mut hidden: HashMap<usize, usize> = HashMap::new();
-    // Head -> the members drawn beneath it, for expanded lineages only.
-    let mut gathered: HashMap<usize, Vec<usize>> = HashMap::new();
-    // Every non-head member of a multi-member lineage: dropped where it sits, then
-    // either left out (collapsed) or re-emitted under its head (expanded).
+    // Newest member -> the rows drawn in its slot: the head, then (expanded only)
+    // every other member.
+    let mut runs: HashMap<usize, Vec<usize>> = HashMap::new();
+    // Every member of a multi-member lineage but the newest: dropped where it sits,
+    // then either left out (collapsed) or re-emitted in the newest's slot.
     let mut displaced: HashSet<usize> = HashSet::new();
     for (key, group) in &members {
         // A lineage of one has nothing to hide and nothing to gather.
@@ -328,24 +411,26 @@ pub fn fold(sessions: &[Session], filtered: &[usize], expanded: &HashSet<Lineage
             continue;
         }
         let head = head_of(sessions, group);
+        let slot = newest_of(sessions, group).expect("a lineage of two is not empty");
+        displaced.extend(group.iter().copied().filter(|&i| i != slot));
         let mut rest: Vec<usize> = group.iter().copied().filter(|&i| i != head).collect();
-        displaced.extend(rest.iter().copied());
+        let mut run = vec![head];
         if expanded.contains(key) {
             rest.sort_by_key(|&i| member_rank(&sessions[i]));
-            gathered.insert(head, rest);
+            run.extend(rest);
         } else {
             hidden.insert(head, rest.len());
         }
+        runs.insert(slot, run);
     }
 
-    // One pass over the incoming order: heads stay put, and an expanded head's
-    // members follow it immediately. Deterministic despite `HashMap` iteration —
-    // `filtered` drives the order and each lineage is independent.
+    // One pass over the incoming order: a lineage's run lands in its newest
+    // member's slot, everything else stays put. Deterministic despite `HashMap`
+    // iteration — `filtered` drives the order and each lineage is independent.
     let mut visible = Vec::with_capacity(filtered.len());
     for &i in filtered {
-        if let Some(rest) = gathered.get(&i) {
-            visible.push(i);
-            visible.extend(rest.iter().copied());
+        if let Some(run) = runs.get(&i) {
+            visible.extend(run.iter().copied());
         } else if !displaced.contains(&i) {
             visible.push(i);
         }
@@ -379,6 +464,15 @@ mod tests {
             has_agent_name: false,
             has_agent_setting: false,
             failed_task: None,
+            custom_title: None,
+        }
+    }
+
+    /// [`session`] carrying the name claude recorded for it (`custom-title`).
+    fn named(id: &str, name: &str, ts: i64) -> Session {
+        Session {
+            custom_title: Some(name.to_string()),
+            ..session(id, BRANCH, Some(FORK_ROOT), Some(ts))
         }
     }
 
@@ -766,6 +860,146 @@ mod tests {
             2,
             "a timestamp-less lone member still heads its own lineage"
         );
+    }
+
+    // --- forks named by the `Ctrl-F` box ------------------------------------
+
+    /// The marker is the prefix, exactly. Claude's own background copies are named
+    /// otherwise and must never read as a fork.
+    #[test]
+    fn only_the_exact_prefix_marks_a_fork_name() {
+        assert!(is_fork_name(FORK_NAME_PREFIX));
+        assert!(is_fork_name("fork: Review PR1"));
+        for not_a_fork in [
+            "pr #152 isolated review (2)",
+            "Fork: Review PR1",
+            "fork:Review PR1",
+            " fork: Review PR1",
+            "my fork: Review PR1",
+            "",
+        ] {
+            assert!(!is_fork_name(not_a_fork), "{not_a_fork:?}");
+        }
+    }
+
+    /// Decision 2: one parent and three forks made from the box. The parent heads
+    /// them although every fork is newer, the three fold beneath it as `(+3)`, and
+    /// expanding gathers them under it. The lineage sits where its newest fork
+    /// sorts, above an interloper that is newer than the parent.
+    #[test]
+    fn a_parent_heads_its_three_named_forks_and_they_fold_beneath_it() {
+        let sessions = vec![
+            named("pr3", "fork: Review PR3", 400),
+            named("pr2", "fork: Review PR2", 300),
+            session("interloper", BRANCH, Some("other-root"), Some(250)),
+            named("pr1", "fork: Review PR1", 200),
+            session("parent", BRANCH, Some(FORK_ROOT), Some(100)),
+        ];
+        let incoming = vec![0, 1, 2, 3, 4];
+
+        assert_eq!(head_of(&sessions, &[0, 1, 3, 4]), 4, "the parent is head");
+
+        let folded = fold(&sessions, &incoming, &HashSet::new());
+        assert_eq!(
+            ids(&sessions, &folded.visible),
+            vec!["parent", "interloper"]
+        );
+        assert_eq!(folded.hidden.get(&4).copied(), Some(3));
+
+        let open = expanded(&[lineage_key(&sessions[4]).unwrap()]);
+        let folded = fold(&sessions, &incoming, &open);
+        assert_eq!(
+            ids(&sessions, &folded.visible),
+            vec!["parent", "pr3", "pr2", "pr1", "interloper"],
+            "the three forks are gathered beneath the parent they came from"
+        );
+        assert!(folded.hidden.is_empty());
+    }
+
+    /// Decision 3: the fork is the NEWEST member, and the unnamed original is
+    /// still crowned head — newest-as-head would have picked the fork.
+    #[test]
+    fn the_unnamed_original_heads_even_when_a_fork_is_the_newest() {
+        let sessions = vec![
+            session("original", BRANCH, Some(FORK_ROOT), Some(100)),
+            named("fork", "fork: try it", 200),
+        ];
+
+        assert_eq!(head_of(&sessions, &[0, 1]), 0);
+        let folded = fold(&sessions, &[1, 0], &HashSet::new());
+        assert_eq!(ids(&sessions, &folded.visible), vec!["original"]);
+        assert_eq!(folded.hidden.get(&0).copied(), Some(1));
+    }
+
+    /// A background copy claude made on its own carries a name WITHOUT the prefix,
+    /// so it keeps today's rule: it is the newest non-fork, and it heads.
+    #[test]
+    fn a_background_copy_named_by_claude_keeps_newest_as_head() {
+        let sessions = vec![
+            session("original", BRANCH, Some(FORK_ROOT), Some(100)),
+            named("snap-fork", "fork: try it", 200),
+            named("bg-copy", "pr #152 isolated review (2)", 300),
+        ];
+
+        assert_eq!(head_of(&sessions, &[0, 1, 2]), 2);
+    }
+
+    /// When every member is a named fork there is no parent to crown, and the
+    /// newest member heads, as before.
+    #[test]
+    fn when_every_member_is_a_named_fork_the_newest_heads() {
+        let sessions = vec![
+            named("older", "fork: one", 100),
+            named("newer", "fork: two", 200),
+        ];
+
+        assert_eq!(head_of(&sessions, &[0, 1]), 1);
+    }
+
+    /// The lineage keeps its newest member's slot, collapsed or expanded, and a
+    /// row outside it keeps its own. Drawn at the parent's slot it would sink
+    /// below the interloper.
+    #[test]
+    fn a_lineage_is_drawn_where_its_newest_member_sorts() {
+        let sessions = vec![
+            named("fork", "fork: try it", 300),
+            session("interloper", BRANCH, Some("other-root"), Some(200)),
+            session("parent", BRANCH, Some(FORK_ROOT), Some(100)),
+        ];
+        let incoming = vec![0, 1, 2];
+
+        let folded = fold(&sessions, &incoming, &HashSet::new());
+        assert_eq!(
+            ids(&sessions, &folded.visible),
+            vec!["parent", "interloper"]
+        );
+
+        let open = expanded(&[lineage_key(&sessions[2]).unwrap()]);
+        let folded = fold(&sessions, &incoming, &open);
+        assert_eq!(
+            ids(&sessions, &folded.visible),
+            vec!["parent", "fork", "interloper"]
+        );
+    }
+
+    /// The child-row title: the name without the prefix, trimmed and row-safe;
+    /// nothing for a session that is not a named fork or names only the prefix.
+    #[test]
+    fn fork_title_strips_the_prefix_and_names_only_forks() {
+        let title = |name: Option<&str>| {
+            fork_title(&Session {
+                custom_title: name.map(str::to_string),
+                ..session("s", BRANCH, Some(FORK_ROOT), Some(1))
+            })
+        };
+        assert_eq!(
+            title(Some("fork: Review PR1")).as_deref(),
+            Some("Review PR1")
+        );
+        assert_eq!(title(Some("fork:  a\tb\nc ")).as_deref(), Some("a b c"));
+        assert_eq!(title(Some("fork:   ")), None);
+        assert_eq!(title(Some("pr #152 isolated review (2)")), None);
+        assert_eq!(title(None), None);
     }
 
     // --- the #80811 downgrade badge ---------------------------------------

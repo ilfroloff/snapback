@@ -27,11 +27,14 @@
 //! exception, and a deliberate one — `App::dispatch_draft` closes the editor but
 //! leaves the card up, in flight, until `AppEvent::BgLaunchFinished` lands.
 //!
-//! ONE editor and ONE key router serve TWO drafts, distinguished by
+//! ONE editor and ONE key router serve THREE targets, distinguished by
 //! [`ComposeTarget`] rather than by parallel state:
 //!
 //! * [`ComposeTarget::Reply`] — the quick reply `Ctrl-R` opens on a selected
 //!   session. `Enter` sends a one-shot `claude -p -r` ([`crate::send`]).
+//! * [`ComposeTarget::Fork`] — the box `Ctrl-F` opens on a selected session.
+//!   `Enter` forks it headless (`claude -p -r <id> --fork-session --session-id
+//!   <new>`, over the reply's send path) and `Ctrl-O` forks it interactively.
 //! * [`ComposeTarget::NewBackgroundAgent`] — the draft `Ctrl-N` opens: via `Enter`
 //!   on the agent picker's highlighted row, or directly when no agents are defined.
 //!   `Enter` starts a BACKGROUND agent with the draft as its first prompt, and
@@ -45,9 +48,9 @@
 //! hand-offs live in [`handle_compose_key`], a thin driver over that decision and
 //! over the pure cores in [`crate::send`] / [`crate::resume`].
 //!
-//! BOTH drafts carry the same pick list ([`CompletionState`]), through the same
-//! editor, router and driver: `/` first in the draft lists the folder's skills and
-//! commands, `@` at the start of a word lists files and folders and, at the top
+//! ALL THREE targets carry the same pick list ([`CompletionState`]), through the
+//! same editor, router and driver: `/` first in the draft lists the folder's skills
+//! and commands, `@` at the start of a word lists files and folders and, at the top
 //! level, agents. The one per-target difference is WHERE the list reads from, and
 //! [`completion_source`] alone decides it. While the list is showing the router
 //! claims `Enter`/`Tab` (pick), `Up`/`Down` (highlight) and `Esc` (close the list,
@@ -90,9 +93,25 @@ pub(crate) const COMPOSE_EMPTY_HINT: &str = "nothing to send — type a message 
 /// nothing for it to do".
 const COMPOSE_EMPTY_BG_HINT: &str = "nothing to run — a background agent needs a first message";
 
+/// The [`COMPOSE_EMPTY_HINT`] of the fork box: `Enter` forks headless and a headless
+/// run needs a message, so it names the key that forks without one.
+const COMPOSE_EMPTY_FORK_HINT: &str =
+    "nothing to send — type a message, or Ctrl-O to fork without one";
+
+/// Prefix of the refusal shown when no session id could be generated for a fork
+/// (the OS gave no entropy). The compose stays open; nothing was dispatched.
+const FORK_ID_FAILED_PREFIX: &str = "could not generate an id for the fork: ";
+
 /// Status when the composed session vanished from the store between opening the
 /// compose zone and pressing Send (e.g. its file was removed).
 const COMPOSE_SESSION_GONE: &str = "that session is no longer loaded — nothing sent";
+
+/// The [`COMPOSE_SESSION_GONE`] of the fork box's `Ctrl-O` run
+/// (`update::launch_fork_run`): the box's session left the store before the
+/// interactive fork could start, so nothing was forked and no terminal was handed
+/// over.
+pub(super) const COMPOSE_FORK_SESSION_GONE: &str =
+    "that session is no longer loaded — nothing forked";
 
 /// What an open compose buffer is addressed to — the ONE fork the shared editor
 /// and key router branch on.
@@ -116,6 +135,15 @@ pub enum ComposeTarget {
         /// plain in-place reply.
         stop_job: Option<String>,
     },
+    /// A FORK of an EXISTING session (`Ctrl-F`). Addresses the same row a reply
+    /// does, but writes a NEW transcript, so it carries no `stop_job`: claude
+    /// skips the live-session refusal for a fork.
+    Fork {
+        /// Stable `session_id` of the original (STABLE-ID STATE), re-resolved to the
+        /// authoritative `(cwd, session_id)` from inside the file at `Enter` or
+        /// `Ctrl-O` time.
+        session_id: String,
+    },
     /// A first prompt for a BRAND-NEW background agent (`Enter` on the new-session
     /// agent picker, or `Ctrl-N` itself when no agents are defined). There is no
     /// session id — claude mints one — so this variant structurally cannot pretend
@@ -134,9 +162,10 @@ pub enum ComposeTarget {
 /// as `modal` and `pending_stop`) so the compose modal is a small, inspectable
 /// piece of state.
 pub struct ComposeState {
-    /// What this draft is addressed to — a reply, or a new background agent.
+    /// What this draft is addressed to — a reply, a fork, or a new background
+    /// agent.
     pub target: ComposeTarget,
-    /// The multiline editor buffer, shared by BOTH targets. One of exactly TWO
+    /// The multiline editor buffer, shared by EVERY target. One of exactly TWO
     /// `ratatui_textarea` values in the program — the other is the board's
     /// one-line [`App::query_input`](super::app::App::query_input), which is a
     /// separate buffer with its own configuration and is never routed through
@@ -155,12 +184,12 @@ pub struct ComposeState {
     /// read by the submit paths below, which emit `--model`/`--effort` ONLY when it
     /// is `Some`, and by the compose box's `model:` label.
     pub model: Option<ModelPick>,
-    /// The `/` and `@` pick list of this draft, reply and background draft alike
-    /// (see [`CompletionState`]).
+    /// The `/` and `@` pick list of this draft, reply, fork and background draft
+    /// alike (see [`CompletionState`]).
     pub completion: CompletionState,
 }
 
-/// The compose pick list of either draft: what is showing, plus the per-draft
+/// The compose pick list of any compose box: what is showing, plus the per-draft
 /// caches that keep its filesystem reads bounded. Born empty with every
 /// [`ComposeState::new`] and dead with the compose — nothing global, nothing
 /// persisted. Claude's own list for a folder is NOT kept here: it outlives the
@@ -179,12 +208,12 @@ pub struct CompletionState {
     /// The token `Esc` closed the list for: `(trigger, row, start column)`. The
     /// list stays closed while the caret is still in that same token.
     dismissed: Option<(Trigger, usize, usize)>,
-    /// A REPLY's `@` agents until a catalog lands, read from its session transcript
-    /// by [`read_listing`]: `None` = not read yet, an empty listing = read and
-    /// nothing found. Read at most once per draft, only while no catalog has landed
-    /// for the folder, only for a top-level `@` (an `@` with a folder part lists no
-    /// agent, and `/` lists the catalog alone), and never for a background draft
-    /// (it has no transcript).
+    /// A REPLY's or FORK's `@` agents until a catalog lands, read from its session
+    /// transcript by [`read_listing`]: `None` = not read yet, an empty listing =
+    /// read and nothing found. Read at most once per draft, only while no catalog
+    /// has landed for the folder, only for a top-level `@` (an `@` with a folder
+    /// part lists no agent, and `/` lists the catalog alone), and never for a
+    /// background draft (it has no transcript).
     transcript: Option<Listing>,
     /// Whether this compose has had its ONE ask for a catalog fetch
     /// ([`take_catalog_fetch`]). Born `false` with every compose, so the next
@@ -195,8 +224,8 @@ pub struct CompletionState {
 }
 
 /// What one refresh of the list reads from, borrowed for that refresh alone: the
-/// target's folder, its transcript (a reply's only) and the folder's cached
-/// catalog, if one has landed. Borrowed, so a catalog is never cloned per
+/// target's folder, its transcript (a reply's or fork's only) and the folder's
+/// cached catalog, if one has landed. Borrowed, so a catalog is never cloned per
 /// keystroke.
 struct SourceView<'a> {
     cwd: &'a Path,
@@ -207,18 +236,18 @@ struct SourceView<'a> {
 impl CompletionState {
     /// Recompute the list for the caret at `cursor` in `lines`. `source` is what
     /// this draft's list reads from ([`completion_source`]), or `None` for a reply
-    /// whose session left the store, which shows no list.
+    /// or fork whose session left the store, which shows no list.
     ///
     /// `/` lists the folder's `catalog` alone, and nothing until it lands: only
     /// claude's own list knows which skills and commands its `/` menu hides, while
     /// a transcript's `skill_listing` is the MODEL's list and carries no flag to
     /// tell them apart (`docs/agents/CLAUDE_CLI.md`, "The `initialize` control
     /// handshake"). A top-level `@` takes its agents from the catalog once it has
-    /// landed — it REPLACES the reply's transcript, never merges with it — else
+    /// landed — it REPLACES the session's transcript, never merges with it — else
     /// from that transcript, else none.
     ///
     /// The ONLY reads the pick list makes happen here: the transcript listing (once
-    /// per reply draft, and only for a top-level `@`) and one folder listing
+    /// per reply or fork box, and only for a top-level `@`) and one folder listing
     /// (once per folder, capped by `COMPLETION_MAX_DIR_ENTRIES`). Bounded
     /// synchronous reads on the key/paste path are the same shape as
     /// `defined_agents::discover_agents` on `Ctrl-N` and `send::plan_send` on
@@ -326,7 +355,7 @@ pub(crate) struct CompletionSource {
 ///   transcript.
 pub(crate) fn completion_source(app: &App, target: &ComposeTarget) -> Option<CompletionSource> {
     match target {
-        ComposeTarget::Reply { session_id, .. } => {
+        ComposeTarget::Reply { session_id, .. } | ComposeTarget::Fork { session_id } => {
             app.session_by_id(session_id).map(|s| CompletionSource {
                 cwd: s.cwd.clone(),
                 transcript: Some(s.file.clone()),
@@ -341,10 +370,10 @@ pub(crate) fn completion_source(app: &App, target: &ComposeTarget) -> Option<Com
 
 impl ComposeState {
     /// Open a fresh compose buffer for `target`, configured for plain multiline
-    /// input. The single constructor, so both drafts get an identically-configured
-    /// editor and the widget setup lives in exactly one place — and so every
-    /// compose starts on its default model ([`model`](Self::model) `None`), however
-    /// the last one ended.
+    /// input. The single constructor, so every target gets an
+    /// identically-configured editor and the widget setup lives in exactly one
+    /// place — and so every compose starts on its default model
+    /// ([`model`](Self::model) `None`), however the last one ended.
     #[must_use]
     pub fn new(target: ComposeTarget) -> Self {
         let mut textarea = TextArea::default();
@@ -371,6 +400,12 @@ impl ComposeState {
             session_id,
             stop_job,
         })
+    }
+
+    /// Open a fresh FORK buffer for `session_id`.
+    #[must_use]
+    pub fn new_fork(session_id: String) -> Self {
+        Self::new(ComposeTarget::Fork { session_id })
     }
 
     /// Open a fresh BACKGROUND-AGENT draft buffer for `agent` (`None` = the
@@ -442,16 +477,16 @@ pub enum ComposeAction {
     Cancel,
     /// Run the draft INTERACTIVELY instead of in the background (`Ctrl-O`).
     ///
-    /// Only [`ComposeTarget::NewBackgroundAgent`] acts on this; on a
-    /// [`ComposeTarget::Reply`] it is INERT (there is no interactive launch to
+    /// [`ComposeTarget::NewBackgroundAgent`] and [`ComposeTarget::Fork`] act on this;
+    /// on a [`ComposeTarget::Reply`] it is INERT (there is no interactive launch to
     /// escape to — a reply addresses a session that already exists). The decision
     /// stays target-free here so the pure router remains a plain key → intent map;
     /// [`handle_compose_key`] is where the target decides whether the intent is
     /// actionable. `Ctrl-O` is unbound in `ratatui_textarea`, so claiming it costs
     /// the reply editor nothing it previously did.
     OpenInteractive,
-    /// Open the model picker for THIS compose (`Ctrl-L`) — both targets act on it,
-    /// since a reply and a draft each carry their own pick
+    /// Open the model picker for THIS compose (`Ctrl-L`) — every target acts on it,
+    /// since a reply, a fork and a draft each carry their own pick
     /// ([`ComposeState::model`]).
     ///
     /// `Ctrl-L` because it is the one control letter left that nothing on the path
@@ -475,26 +510,28 @@ pub enum ComposeAction {
     PickModel,
     /// Jump the transcript to its top (`Ctrl-T`, the board's key).
     ///
-    /// Acts only on a [`ComposeTarget::Reply`], whose compose previews the real
-    /// transcript; a draft shows a placeholder card, so there the key falls back to
-    /// the editor ([`handle_compose_key`]). `Ctrl-T` is unbound in the widget.
+    /// Acts only on a [`ComposeTarget::Reply`] or [`ComposeTarget::Fork`], whose
+    /// compose previews the real transcript; a draft shows a placeholder card, so
+    /// there the key falls back to the editor ([`handle_compose_key`]). `Ctrl-T` is
+    /// unbound in the widget.
     PreviewTop,
     /// Jump the transcript to its bottom and re-follow the newest turn (`Ctrl-E`).
     ///
     /// Same target rule as [`ComposeAction::PreviewTop`]. `Ctrl-E` IS the widget's
-    /// end-of-line, so on a reply it is taken from the editor on purpose (the caret
-    /// still reaches line end with `End`/`Ctrl-F`); a draft keeps it.
+    /// end-of-line, so on a reply or fork it is taken from the editor on purpose (the
+    /// caret still reaches line end with `End`/`Ctrl-F`); a draft keeps it.
     PreviewBottom,
-    /// Scroll the transcript a page up (`PgUp`, the board's key). Reply-only, like
-    /// [`ComposeAction::PreviewTop`]; the editor loses its caret page-up there.
+    /// Scroll the transcript a page up (`PgUp`, the board's key). Reply and fork
+    /// only, like [`ComposeAction::PreviewTop`]; the editor loses its caret page-up
+    /// there.
     PreviewPageUp,
     /// A page down (`PgDn`). Same rule as [`ComposeAction::PreviewPageUp`].
     PreviewPageDown,
-    /// A quarter page up (`Ctrl-U`). On a reply it is taken from the editor's
-    /// delete-to-line-head on purpose; a draft keeps it.
+    /// A quarter page up (`Ctrl-U`). On a reply or fork it is taken from the
+    /// editor's delete-to-line-head on purpose; a draft keeps it.
     PreviewHalfUp,
-    /// A quarter page down (`Ctrl-D`). On a reply it is taken from the editor's
-    /// delete-char on purpose; a draft keeps it.
+    /// A quarter page down (`Ctrl-D`). On a reply or fork it is taken from the
+    /// editor's delete-char on purpose; a draft keeps it.
     PreviewHalfDown,
     /// Insert the highlighted pick-list row (`Enter` or `Tab`, list open only).
     AcceptCompletion,
@@ -528,16 +565,16 @@ pub enum ComposeAction {
 ///   enabled). snapback enables NO kitty protocol (AGENTS.md TERMINAL SAFETY treats
 ///   a leftover level as corruption), so under its own setup this arm is dead and
 ///   `Alt+Enter` remains the guaranteed newline.
-/// * `Ctrl-O` → **OpenInteractive** (the background draft's escape hatch; inert on
-///   a reply — see [`ComposeAction::OpenInteractive`]).
-/// * `Ctrl-L` → **PickModel** (this compose's model picker, on both targets — see
+/// * `Ctrl-O` → **OpenInteractive** (the background draft's and the fork's
+///   interactive run; inert on a reply — see [`ComposeAction::OpenInteractive`]).
+/// * `Ctrl-L` → **PickModel** (this compose's model picker, on every target — see
 ///   [`ComposeAction::PickModel`] for why the key is free).
 /// * `Ctrl-T` / `Ctrl-E` / `Home` / `End` → **PreviewTop** / **PreviewBottom**,
 ///   `PgUp` / `PgDn` → **PreviewPageUp** / **PreviewPageDown**, `Ctrl-U` / `Ctrl-D`
 ///   → **PreviewHalfUp** / **PreviewHalfDown**: exactly the board's transcript
 ///   scroll keys (`update::key_to_action` — the `Ctrl` letters whatever else is
-///   held, the named keys only WITHOUT `Ctrl`). A reply acts on them, a draft
-///   forwards them to the editor.
+///   held, the named keys only WITHOUT `Ctrl`). A reply or fork acts on them, a
+///   draft forwards them to the editor.
 /// * `Esc` → **Cancel** (dismiss compose, not the app).
 /// * everything else → **Forward** to the editor.
 ///
@@ -589,6 +626,13 @@ pub fn compose_key_to_action(key: KeyEvent, list_open: bool) -> ComposeAction {
 pub fn open(app: &mut App, session_id: String, stop_job: Option<String>) {
     // No draft card: a reply previews the REAL session it is addressed to.
     app.open_compose(ComposeState::new_reply(session_id, stop_job), None);
+}
+
+/// Open the FORK compose zone for `session_id`, bringing back a hidden preview like
+/// [`open`]. The folder check has already run at the call site (`Ctrl-F` in
+/// `update`). No draft card: the preview shows the real session being forked.
+pub fn open_fork(app: &mut App, session_id: String) {
+    app.open_compose(ComposeState::new_fork(session_id), None);
 }
 
 /// Open the BACKGROUND-AGENT draft pane for `agent` (`None` = the picker's
@@ -686,10 +730,11 @@ pub fn handle_compose_key(app: &mut App, key: KeyEvent) -> Outcome {
         }
         ComposeAction::Send => submit_compose(app),
         ComposeAction::OpenInteractive => open_interactive(app),
-        // The transcript the reply previews is the SELECTED row's, which is the reply's
-        // target (STABLE-ID STATE: nothing here moves the selection), so the board's
-        // own jump applies; the caret and text are not touched. A draft has no
-        // transcript on screen, so the key reaches the editor as it always did.
+        // The transcript a reply or fork box previews is the SELECTED row's, which
+        // is the box's target (STABLE-ID STATE: nothing here moves the selection),
+        // so the board's own jump applies; the caret and text are not touched. A
+        // draft has no transcript on screen, so the key reaches the editor as it
+        // always did.
         scroll @ (ComposeAction::PreviewTop
         | ComposeAction::PreviewBottom
         | ComposeAction::PreviewPageUp
@@ -698,7 +743,7 @@ pub fn handle_compose_key(app: &mut App, key: KeyEvent) -> Outcome {
         | ComposeAction::PreviewHalfDown) => {
             let replying = matches!(
                 app.compose.as_ref().map(|c| &c.target),
-                Some(ComposeTarget::Reply { .. })
+                Some(ComposeTarget::Reply { .. } | ComposeTarget::Fork { .. })
             );
             if !replying {
                 if let Some(compose) = app.compose.as_mut() {
@@ -750,13 +795,14 @@ pub fn insert_paste(app: &mut App, text: &str) {
     refresh_completion(app);
 }
 
-/// Recompute the open draft's pick list from its editor, reply and background
-/// draft alike, from the source [`completion_source`] names and the folder's
-/// cached catalog; a reply whose session left the store gets no list.
+/// Recompute the open draft's pick list from its editor, reply, fork and
+/// background draft alike, from the source [`completion_source`] names and the
+/// folder's cached catalog; a reply or fork whose session left the store gets no
+/// list.
 ///
 /// Its bounded reads ([`CompletionState::refresh`]: the transcript listing, once
-/// per reply draft and only for a top-level `@`, and folder listings, once
-/// per folder on both targets) run from the key and paste handlers and from
+/// per reply or fork box and only for a top-level `@`, and folder listings, once
+/// per folder on every target) run from the key and paste handlers and from
 /// `update::dispatch`'s `CatalogFetched` arm — which calls this so a catalog that
 /// lands mid-draft reaches an open list — and never from the render path.
 ///
@@ -883,8 +929,9 @@ fn draft(app: &App) -> Option<Draft> {
 }
 
 /// Resolve the compose buffer into a driver [`Outcome`], routing on the open
-/// [`ComposeTarget`]: a reply sends, a background draft launches — each with the
-/// model picked in THIS compose, if any.
+/// [`ComposeTarget`]: a reply sends, a fork sends headless under a fresh id
+/// ([`submit_fork`]), a background draft launches — each with the model picked in
+/// THIS compose, if any.
 fn submit_compose(app: &mut App) -> Outcome {
     let Some(Draft {
         message,
@@ -899,6 +946,7 @@ fn submit_compose(app: &mut App) -> Outcome {
             session_id,
             stop_job,
         } => submit_reply(app, message, session_id, stop_job, model.as_ref()),
+        ComposeTarget::Fork { session_id } => submit_fork(app, message, session_id, model.as_ref()),
         ComposeTarget::NewBackgroundAgent { agent } => {
             submit_bg_launch(app, message, agent, model.as_ref())
         }
@@ -1001,25 +1049,134 @@ fn submit_bg_launch(
 /// pick the argv carries no model, like the picker's own `Ctrl-O` — which skips the
 /// draft and so never has a pick to pass.
 ///
+/// On a [`ComposeTarget::Fork`] it forks INTERACTIVELY instead: an ordinary
+/// hand-off through [`super::update::launch_fork_run`] and [`crate::resume`]'s
+/// `ForkRun` action, `claude -r <id> --fork-session --name <name> [--model <alias>
+/// [--effort <level>]] [<message>]`. An empty box with no pick is the old `Ctrl-F`
+/// plus `--name "fork: <the session's label>"`. The message AUTO-SUBMITS as a
+/// trailing positional, like a new session's prompt (probed for `-r
+/// --fork-session` at claude 2.1.291 on 2026-10-08; `docs/agents/CLAUDE_CLI.md`).
+///
 /// INERT on a [`ComposeTarget::Reply`]: a reply addresses a session that already
 /// exists, so there is no new-session launch to escape to.
 fn open_interactive(app: &mut App) -> Outcome {
     let Some(Draft {
         message,
-        target: ComposeTarget::NewBackgroundAgent { agent },
+        target,
         model,
     }) = draft(app)
     else {
-        return Outcome::Continue; // no interactive launch on the reply target
+        return Outcome::Continue;
     };
-    // An empty / whitespace draft launches BARE — no positional at all — which is
-    // exactly what the picker's own `Ctrl-O` emits.
+    // An empty / whitespace draft launches with NO positional, which is exactly what
+    // the picker's own `Ctrl-O` (and, for a fork, plain `Ctrl-F`) always emitted; a
+    // fork is still named, from the session's label.
     let prompt = (!message.trim().is_empty()).then_some(message);
-    // The board is about to be torn down for the interactive child, so the card has
-    // nothing left to report: close the whole surface.
-    app.close_compose();
-    app.set_last_new_agent(agent.clone());
-    super::update::launch_new_session(app, agent.as_deref(), prompt.as_deref(), model.as_ref())
+    match target {
+        ComposeTarget::NewBackgroundAgent { agent } => {
+            // The board is about to be torn down for the interactive child, so the
+            // card has nothing left to report: close the whole surface.
+            app.close_compose();
+            app.set_last_new_agent(agent.clone());
+            super::update::launch_new_session(
+                app,
+                agent.as_deref(),
+                prompt.as_deref(),
+                model.as_ref(),
+            )
+        }
+        ComposeTarget::Fork { session_id } => {
+            app.close_compose();
+            super::update::launch_fork_run(app, &session_id, prompt.as_deref(), model.as_ref())
+        }
+        // No interactive launch on the reply target.
+        ComposeTarget::Reply { .. } => Outcome::Continue,
+    }
+}
+
+/// Fork the composed session headless — the `Enter` half of the fork target.
+///
+/// A fork is a reply that lands in a NEW session, so it rides [`send`]'s reply path
+/// whole: this function only decides what is different. In order: (1) guard an empty
+/// message (a headless run needs one); (2) re-read the original's AUTHORITATIVE
+/// `(cwd, session_id)` from inside its file ([`send::plan_send`]), exactly as a
+/// reply does; (3) take ONE fresh id for the fork; (4) build
+/// `claude -p -r <original> --fork-session --session-id <fork> --name <name> ...`
+/// ([`send::build_fork_send_argv`]; the name is the message's first line under the
+/// fork prefix, the original's label being the fallback); (5) record the send as in
+/// progress under the FORK's id, the same id the request carries so its completion
+/// lands on it; and (6) arm the cursor jump to it ([`App::set_fork_jump`]). That one
+/// id is the `--session-id`, the in-flight entry, the request and the jump's fork
+/// side.
+///
+/// The id is `fork_id`, a parameter, so a test supplies it; the caller passes
+/// [`send::fresh_session_id`]. When it is an error the fork is refused with a sticky
+/// status and the box stays open, nothing dispatched.
+fn submit_fork_with(
+    app: &mut App,
+    message: String,
+    origin_id: String,
+    model: Option<&ModelPick>,
+    fork_id: std::io::Result<String>,
+) -> Outcome {
+    if message.trim().is_empty() {
+        app.set_status_transient(COMPOSE_EMPTY_FORK_HINT);
+        return Outcome::Continue;
+    }
+    let (file, label) = match app.session_by_id(&origin_id) {
+        Some(session) => (session.file.clone(), session.label.clone()),
+        None => {
+            app.close_compose();
+            app.set_status(COMPOSE_SESSION_GONE);
+            return Outcome::Continue;
+        }
+    };
+    match send::plan_send(&file) {
+        SendPlan::Ready {
+            cwd,
+            session_id: authoritative_id,
+        } => {
+            let fork_id = match fork_id {
+                Ok(id) => id,
+                Err(err) => {
+                    app.set_status(format!("{FORK_ID_FAILED_PREFIX}{err}"));
+                    return Outcome::Continue;
+                }
+            };
+            let argv =
+                send::build_fork_send_argv(&authoritative_id, &fork_id, model, &message, &label);
+            app.close_compose();
+            // The fork has no transcript yet, so there is no turn count to compare
+            // the echo against: once the file exists its history is already longer.
+            app.mark_sending(super::app::Sending {
+                session_id: fork_id.clone(),
+                message,
+                baseline_msg_count: 0,
+            });
+            app.set_fork_jump(origin_id, fork_id.clone());
+            Outcome::Send(SendRequest {
+                argv,
+                cwd,
+                session_id: fork_id,
+                stop_job: None,
+            })
+        }
+        SendPlan::Refuse(message) => {
+            app.close_compose();
+            app.set_status(message);
+            Outcome::Continue
+        }
+    }
+}
+
+/// [`submit_fork_with`] over a fresh OS-random id.
+fn submit_fork(
+    app: &mut App,
+    message: String,
+    origin_id: String,
+    model: Option<&ModelPick>,
+) -> Outcome {
+    submit_fork_with(app, message, origin_id, model, send::fresh_session_id())
 }
 
 /// Send the drafted quick reply — the `Enter` half of the reply target.
@@ -1501,6 +1658,7 @@ mod tests {
                 has_agent_name: false,
                 has_agent_setting: false,
                 failed_task: None,
+                custom_title: None,
             }],
             Scope::All,
             PathBuf::from("/tmp"),
@@ -1559,6 +1717,7 @@ mod tests {
             has_agent_name: false,
             has_agent_setting: false,
             failed_task: None,
+            custom_title: None,
         }
     }
 
@@ -2246,5 +2405,262 @@ mod tests {
         // The widget's Ctrl-U is undo: it undid the Ctrl-D delete.
         assert_eq!(app.compose.as_ref().unwrap().textarea.lines(), ["abc"]);
         assert_eq!((app.preview_scroll, app.preview_follow_bottom), (7, false));
+    }
+
+    /// The fork box's `Enter` ties ONE generated id together: it is the
+    /// `--session-id` in the command, the id of the in-flight send, the id of the
+    /// request (so the completion lands on it), and the fork side of the jump pair,
+    /// and it is not the original's. The command forks the AUTHORITATIVE original.
+    #[test]
+    fn the_fork_boxs_enter_ties_one_fresh_id_through_command_send_and_jump() {
+        let dir = unique_temp_dir("fork-ties");
+        let mut app = App::new(
+            vec![sendable_session(&dir, "sbf-origin")],
+            Scope::All,
+            dir.clone(),
+        );
+        open_fork(&mut app, "sbf-origin".to_string());
+        app.set_compose_model(Some(ModelPick {
+            model: "opus".to_string(),
+            effort: Some("low"),
+        }));
+        type_into(&mut app, "try it");
+        let fork_id = "11111111-2222-4333-8444-555555555555";
+        let pick = app.compose.as_ref().and_then(|c| c.model.clone());
+        let out = submit_fork_with(
+            &mut app,
+            "try it".to_string(),
+            "sbf-origin".to_string(),
+            pick.as_ref(),
+            Ok(fork_id.to_string()),
+        );
+        let Outcome::Send(req) = out else {
+            panic!("Enter on a typed fork box must send");
+        };
+        assert_eq!(
+            req.argv.join(" "),
+            format!(
+                "claude -p -r sbf-origin --fork-session --session-id {fork_id} \
+                 --name fork: try it --output-format json --model opus --effort low try it"
+            )
+        );
+        assert_eq!(req.session_id, fork_id);
+        assert_ne!(req.session_id, "sbf-origin");
+        assert!(req.stop_job.is_none());
+        let sending = app
+            .sending_to(fork_id)
+            .expect("the send is recorded under the fork");
+        assert_eq!(sending.message, "try it");
+        assert!(
+            app.sending_to("sbf-origin").is_none(),
+            "the original is not marked"
+        );
+        assert_eq!(
+            app.fork_jump,
+            Some(crate::tui::app::ForkJump {
+                origin: "sbf-origin".to_string(),
+                fork: fork_id.to_string(),
+            })
+        );
+        assert!(app.compose.is_none(), "the box closes");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Through the real key and the real id source: `Enter` generates a UUID-shaped id
+    /// that differs from the original's and is the one command, request and jump use.
+    #[test]
+    fn the_fork_boxs_enter_uses_a_real_generated_id() {
+        let dir = unique_temp_dir("fork-real-id");
+        let mut app = App::new(
+            vec![sendable_session(&dir, "sbf-real")],
+            Scope::All,
+            dir.clone(),
+        );
+        open_fork(&mut app, "sbf-real".to_string());
+        type_into(&mut app, "go");
+        let Outcome::Send(req) = handle_compose_key(&mut app, key(KeyCode::Enter)) else {
+            panic!("Enter on a typed fork box must send");
+        };
+        assert_ne!(req.session_id, "sbf-real");
+        assert_eq!(req.session_id.len(), 36);
+        assert!(req.argv.contains(&req.session_id));
+        assert_eq!(
+            app.fork_jump.as_ref().map(|j| j.fork.as_str()),
+            Some(req.session_id.as_str())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An empty fork box keeps the box open with a nudge; an id the OS would not give
+    /// refuses with a sticky status, keeps the box (and the text) and dispatches
+    /// nothing — no in-flight entry, no jump.
+    #[test]
+    fn the_fork_box_nudges_when_empty_and_refuses_without_an_id() {
+        let dir = unique_temp_dir("fork-refusals");
+        let mut app = App::new(
+            vec![sendable_session(&dir, "sbf-refuse")],
+            Scope::All,
+            dir.clone(),
+        );
+        open_fork(&mut app, "sbf-refuse".to_string());
+        assert!(matches!(
+            handle_compose_key(&mut app, key(KeyCode::Enter)),
+            Outcome::Continue
+        ));
+        assert!(app.compose.is_some(), "an empty fork box stays open");
+        assert_eq!(app.status.as_deref(), Some(COMPOSE_EMPTY_FORK_HINT));
+
+        type_into(&mut app, "go");
+        let out = submit_fork_with(
+            &mut app,
+            "go".to_string(),
+            "sbf-refuse".to_string(),
+            None,
+            Err(std::io::Error::other("no entropy")),
+        );
+        assert!(matches!(out, Outcome::Continue));
+        assert!(app.compose.is_some(), "the box and its text survive");
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|s| s.starts_with(FORK_ID_FAILED_PREFIX) && s.contains("no entropy")));
+        assert!(app.sending.is_empty());
+        assert!(app.fork_jump.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `Ctrl-O` in the fork box forks interactively: an untouched box is
+    /// `claude -r <id> --fork-session` (what `Ctrl-F` always handed off) named after
+    /// the session's label, a typed one is named after its first line and adds the
+    /// message, and a pick adds `--model`/`--effort` BEFORE the message with the
+    /// model-worded non-zero hint.
+    #[test]
+    fn ctrl_o_in_the_fork_box_forks_interactively() {
+        let dir = unique_temp_dir("fork-interactive");
+        let mut app = App::new(
+            vec![sendable_session(&dir, "sbf-run")],
+            Scope::All,
+            dir.clone(),
+        );
+        let ctrl_o = || with_mods(KeyCode::Char('o'), KeyModifiers::CONTROL);
+
+        open_fork(&mut app, "sbf-run".to_string());
+        let Outcome::Resume(ready) = handle_compose_key(&mut app, ctrl_o()) else {
+            panic!("Ctrl-O must hand off");
+        };
+        let mut plain_named = crate::resume::build_argv("sbf-run", true);
+        plain_named.extend(["--name".to_string(), "fork: label sbf-run".to_string()]);
+        assert_eq!(ready.argv, plain_named);
+        assert_eq!(ready.nonzero_hint, crate::resume::FORK_NONZERO_HINT);
+        assert!(ready.race_probe_id.is_none());
+        assert!(app.compose.is_none());
+
+        open_fork(&mut app, "sbf-run".to_string());
+        app.set_compose_model(Some(ModelPick {
+            model: "haiku".to_string(),
+            effort: Some("medium"),
+        }));
+        type_into(&mut app, "ship it");
+        let Outcome::Resume(ready) = handle_compose_key(&mut app, ctrl_o()) else {
+            panic!("Ctrl-O must hand off");
+        };
+        assert_eq!(
+            ready.argv.join(" "),
+            "claude -r sbf-run --fork-session --name fork: ship it --model haiku --effort \
+             medium ship it"
+        );
+        assert_eq!(ready.nonzero_hint, crate::resume::MODEL_NONZERO_HINT);
+        assert!(app.fork_jump.is_none(), "no jump after Ctrl-O");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The fork box offers the same pick list source as a reply: the session's
+    /// folder and transcript.
+    #[test]
+    fn the_fork_box_reads_its_sessions_folder_for_its_pick_list() {
+        let dir = unique_temp_dir("fork-source");
+        let app = App::new(
+            vec![sendable_session(&dir, "sbf-src")],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
+        let source = completion_source(
+            &app,
+            &ComposeTarget::Fork {
+                session_id: "sbf-src".to_string(),
+            },
+        )
+        .expect("the session is on the board");
+        assert_eq!(source.cwd, dir);
+        assert!(source.transcript.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The fork box's session leaves the store while the box is open: `Enter` and
+    /// `Ctrl-O` (through `update::launch_fork_run`) each close the box, say so in
+    /// their own words, and dispatch nothing — no send, no in-flight entry, no jump,
+    /// no hand-off.
+    #[test]
+    fn the_fork_box_dispatches_nothing_for_a_session_that_left_the_store() {
+        let dir = unique_temp_dir("fork-gone");
+        let mut app = App::new(Vec::new(), Scope::All, dir.clone());
+        let ctrl_o = with_mods(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        for (pressed, gone) in [
+            (key(KeyCode::Enter), COMPOSE_SESSION_GONE),
+            (ctrl_o, COMPOSE_FORK_SESSION_GONE),
+        ] {
+            app.apply_sessions(vec![sendable_session(&dir, "sbf-gone")]);
+            open_fork(&mut app, "sbf-gone".to_string());
+            type_into(&mut app, "go");
+            app.apply_sessions(Vec::new());
+
+            assert!(
+                matches!(handle_compose_key(&mut app, pressed), Outcome::Continue),
+                "{gone}"
+            );
+            assert!(app.compose.is_none(), "{gone}");
+            assert_eq!(app.status.as_deref(), Some(gone));
+            assert!(app.sending.is_empty(), "{gone}");
+            assert!(app.fork_jump.is_none(), "{gone}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `Enter` re-reads the original from its file at that moment
+    /// ([`send::plan_send`]): a folder deleted after the box opened refuses with the
+    /// re-read's own words, closes the box and dispatches nothing.
+    #[test]
+    fn the_fork_boxs_enter_refuses_a_folder_deleted_after_the_box_opened() {
+        let dir = unique_temp_dir("fork-plan-refused");
+        let mut app = App::new(
+            vec![sendable_session(&dir, "sbf-deleted")],
+            Scope::All,
+            dir.clone(),
+        );
+        open_fork(&mut app, "sbf-deleted".to_string());
+        type_into(&mut app, "go");
+        let missing = dir.join("deleted-worktree");
+        std::fs::write(
+            dir.join("sbf-deleted.jsonl"),
+            format!(
+                r#"{{"type":"user","sessionId":"sbf-deleted","cwd":"{}","message":{{"role":"user","content":"hi"}}}}"#,
+                missing.display()
+            ),
+        )
+        .expect("rewrite the transcript");
+
+        assert!(matches!(
+            handle_compose_key(&mut app, key(KeyCode::Enter)),
+            Outcome::Continue
+        ));
+        assert!(app.compose.is_none(), "the box closes on the refusal");
+        assert!(app.status.as_deref().is_some_and(
+            |s| s.contains("no longer exists") && s.contains(&missing.display().to_string())
+        ));
+        assert!(app.sending.is_empty());
+        assert!(app.fork_jump.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
