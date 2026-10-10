@@ -22,6 +22,39 @@ to read them from elsewhere.
 There is no separate "search mode": you always start in browse, and typing
 filters the list live. `Tab` widens the match from name-only to name+content.
 
+## Use in VS Code
+
+A VS Code extension opens snapback in a fullscreen terminal pane with one command.
+
+**Installation:** Download the `.vsix` from the [GitHub releases](https://github.com/ilfroloff/snapback/releases) and install via **"Extensions: Install from VSIX..."** in VS Code.
+
+**Usage:** Open the Command Palette (`Ctrl+Shift+P` / `Cmd+Shift+P`) and run **"Snapback: Open Snapback"**. The board opens in a fullscreen editor tab (or maximized panel, per settings). From there, use snapback as usual — `Enter` to resume, `Ctrl-R` to quick reply, `Ctrl-N` to start a background agent, etc.
+
+**Settings:**
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `snapback.location` | `"editor"` | `"editor"` opens a fullscreen editor tab; `"panel"` opens a maximized panel |
+| `snapback.command` | `"sb"` | The snapback binary (resolved from PATH, `~/.local/bin`, `/usr/local/bin`, or `$SNAPBACK_INSTALL_DIR`) |
+| `snapback.args` | `["-p"]` | Arguments to pass (default: project scope) |
+
+**Suggested keybinding:** No default is provided to avoid collisions. Add your own in `keybindings.json`:
+
+```json
+// Linux/Windows
+{ "key": "ctrl+alt+s", "command": "snapback.open" }
+
+// macOS
+{ "key": "cmd+alt+s", "command": "snapback.open" }
+```
+
+**Troubleshooting:**
+
+- **Binary not found:** The extension checks PATH, `~/.local/bin`, `/usr/local/bin`, and `$SNAPBACK_INSTALL_DIR`. If `sb` is elsewhere, set `snapback.command` to the full path.
+- **Ctrl-chord interception:** Some snapback keys (`Ctrl-R`, `Ctrl-N`, etc.) may be intercepted by VS Code. Add them to `terminal.integrated.commandsToSkipShell` in your settings.
+
+Full details: [editors/vscode/README.md](../editors/vscode/README.md)
+
 ## Keys
 
 | Key | Action |
