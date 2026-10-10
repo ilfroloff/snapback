@@ -36,13 +36,27 @@ One board, everything live — no more grepping `~/.claude` to find which agent 
 
 ## Install
 
+Pick one — all three install the same prebuilt binary, no Rust toolchain needed.
+
+**npm** (recommended):
+
 ```sh
 npx snapback-tui install
-# or
-bunx snapback-tui install
 ```
 
-Installs prebuilt binaries for macOS (arm64/x64) and Linux (x64/arm64) — no Rust toolchain needed. The npm package is `snapback-tui`; the commands it installs are `snapback` and `sb`. To install somewhere other than `~/.local/bin`, set `SNAPBACK_INSTALL_DIR`. To uninstall, delete the two binaries — `install` prints the exact command.
+**Homebrew**:
+
+```sh
+brew install snapback
+```
+
+**Direct download** (curl + install script):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ilfroloff/snapback/main/scripts/install.sh | sh
+```
+
+All three methods install the `snapback` and `sb` commands. By default they land in `~/.local/bin`; set `SNAPBACK_INSTALL_DIR` to install somewhere else. To uninstall, delete the two binaries — `install` prints the exact command.
 
 ### From source
 
@@ -86,7 +100,7 @@ snapback reads your sessions; the only file it writes is its hidden-session list
 
 ## Requirements
 
-`claude` on your `PATH`; macOS or Linux.
+`claude` on your `PATH`; macOS or Linux (arm64/x64). Windows support is deferred until Claude CLI supports Windows.
 
 ## Contributing
 

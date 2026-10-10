@@ -156,8 +156,10 @@ released". Note the scope of that flag: it governs **`cargo publish`**, not
 separate workflow keyed off the tag — the two do not conflict, and the npm
 publish must not be folded into `release-plz.toml`.
 
-Users install from npm (`npx snapback-tui install`) or from the tagged git ref —
-see the README [Install](../../README.md#install) section.
+Users install via three channels — npm (`npx snapback-tui install`, primary),
+Homebrew (`brew install snapback`), or a curl-based install script that
+downloads a prebuilt binary from GitHub Releases — plus `cargo install` from
+source. See the README [Install](../../README.md#install) section.
 
 ### Demo GIF
 

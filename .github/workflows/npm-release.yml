@@ -2,7 +2,10 @@ name: "📦 Publish to npm"
 
 # Cross-compiles the tagged source for every supported platform and publishes the
 # binaries to npm as `snapback-tui`, so `npx snapback-tui install` works without a
-# Rust toolchain. See docs/agents/OPERATIONS.md ("How a release happens").
+# Rust toolchain. Also attaches each platform's binary to the GitHub Release that
+# release-plz.yml created for this tag, enabling direct downloads and serving as
+# the prerequisite for Homebrew and curl-based install methods. See
+# docs/agents/OPERATIONS.md ("How a release happens").
 #
 # WHY A TAG TRIGGER, and why it actually fires: `🔖 Release` (release-plz.yml)
 # cuts the `vX.Y.Z` tag using RELEASE_PLZ_TOKEN, a PAT authored by a real
@@ -15,7 +18,8 @@ name: "📦 Publish to npm"
 # github-actions[bot].
 #
 # NO LOOP: nothing here pushes a commit or a tag. It only reads the tag, builds,
-# and publishes to a registry.
+# publishes to a registry, and attaches artifacts to the release release-plz
+# already created.
 #
 # NOT release-plz's job: release-plz is deliberately git-only (`publish = false`
 # in release-plz.toml) and must stay that way — that flag governs `cargo publish`
@@ -32,11 +36,12 @@ env:
 
 # Least privilege, matching release-plz.yml's stance.
 #
-# `contents: read` is all the build needs. Note what is deliberately ABSENT:
-# `contents: write`. Attaching the built binaries to the GitHub Release would be a
-# nice-to-have, but it is not what this workflow is for, and it would widen a
-# publishing workflow's write scope for a feature nobody asked for. If that is
-# wanted later, add it THEN, with the permission scoped to the job that needs it.
+# `contents: read` is all the BUILD job needs. The PUBLISH job widens this to
+# `contents: write` (scoped to that job only) so it can attach the built binaries
+# to the GitHub Release via `gh release upload`. That write scope is the
+# prerequisite for Homebrew bottles and direct curl-based installs (Phase 2 and 3
+# of the installation extension plan). The build job never writes; only the
+# publish job does, and only to attach release assets.
 #
 # `id-token: write` is required for both the OIDC publish AUTH and provenance
 # (see the publish job) and is scoped to that job only, not granted
@@ -152,7 +157,12 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      # `contents: write` lets this job attach the built binaries to the GitHub
+      # Release via `gh release upload`. Scoped HERE — the only job that needs
+      # it — rather than workflow-wide, so the build job keeps `contents: read`
+      # only. This is the permission expansion documented in the workflow header
+      # and in the plan (docs/plans/2026-10-06T04:50:25Z-extend-installation-options/).
+      contents: write
       # Does DOUBLE duty, and both halves are why there is NO npm token here:
       #  1. AUTH — npm trusted publishing (OIDC). npm exchanges this short-lived
       #     id-token for a one-time publish credential, so nothing long-lived is
@@ -236,3 +246,28 @@ jobs:
       - name: "🚀 Publish"
         working-directory: npm
         run: npm publish --provenance --access public
+
+      # Attaches each platform's binary to the GitHub Release that release-plz.yml
+      # created for this tag. This is the prerequisite for Homebrew bottles and
+      # direct `curl` installs (Phase 2 and Phase 3 of the installation extension
+      # plan). The `#` syntax in `gh release upload` renames the staged file to
+      # the asset name expected by downstream consumers (Homebrew formula,
+      # install script): `snapback-<version>-<platform>` (e.g.
+      # `snapback-v0.12.0-darwin-arm64`). `--clobber` replaces any existing asset
+      # with the same name, so a re-run of this workflow on the same tag does not
+      # fail with "asset already exists".
+      #
+      # WHY `gh` and not `actions/upload-release-asset`: the `gh` CLI is
+      # pre-installed on GitHub-hosted runners, needs no third-party action, and
+      # authenticates with the job's built-in GITHUB_TOKEN automatically — the
+      # same token whose `contents: write` scope was granted above.
+      - name: "📎 Attach binaries to GitHub Release"
+        run: |
+          version="${GITHUB_REF_NAME}"
+          for platform in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
+            binary="npm/bin/${platform}/snapback"
+            asset_name="snapback-${version}-${platform}"
+            echo "Uploading ${asset_name}..."
+            gh release upload "${version}" "${binary}#${asset_name}" --clobber
+          done
+          echo "All 4 platform binaries attached to release ${version}"
