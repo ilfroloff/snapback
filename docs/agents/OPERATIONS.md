@@ -163,8 +163,10 @@ see the README [Install](../../README.md#install) section.
 
 `website/public/demo.gif` (embedded by the README and the website) is produced
 from SYNTHETIC data by `website/demo/record.sh`: it builds a release binary, copies
-`website/demo/home` to a temporary `$HOME`, shadows `claude` with the stub in
-`website/demo/bin`, and records `website/demo/snapback.tape` with `vhs`. It needs
+`website/demo/home` to a temporary `$HOME`, builds a throwaway `web-app` git
+repository there with the worktrees the fixtures name (the `Ctrl-X w` scene's
+picker lists them; no git config of yours is read), shadows `claude` with the stub
+in `website/demo/bin`, and records `website/demo/snapback.tape` with `vhs`. It needs
 `vhs`, `ttyd` and `ffmpeg` on `PATH` and never touches the real `~/.claude`,
 `~/.config/snapback` or `claude`. Re-run it when a change alters what a scene shows;
 `npm run demo` from `website/` is the same command. It is deliberately not part of

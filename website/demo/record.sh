@@ -35,14 +35,34 @@ remove_demo_home "$demo_home"
 mkdir -p "$demo_home"
 cp -R "$demo/home/." "$demo_home/"
 cp "$demo/agents.json" "$demo_home/agents.json"
-# A quick reply refuses a cwd that does not exist (src/send.rs plan_send).
-grep -rhoE '"cwd":"[^"]+"' "$demo_home/.claude/projects" | sort -u |
-  sed -e 's/^"cwd":"//' -e 's/"$//' | while IFS= read -r dir; do mkdir -p "$dir"; done
 
 export HOME="$demo_home"
 unset CLAUDE_PROJECTS_DIR CLAUDE_CONFIG_DIR SNAPBACK_CONFIG_DIR ANTHROPIC_MODEL
 # The compose box's model label must not vary by machine.
 for var in $(compgen -e | grep -E '^ANTHROPIC_DEFAULT_.*_MODEL$' || true); do unset "$var"; done
+# Every git below (here, snapback's worktree list, the stub's branch read) reads
+# no config of yours and cannot be pointed at another repository.
+export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY
+
+# The Ctrl-X w picker lists the launch repo's worktrees from `git worktree list`
+# (src/worktrees.rs), so web-app is a real repo with its worktrees at the paths
+# the fixture `cwd`s name. The tape launches snapback from its main checkout.
+web_app=$demo_home/code/web-app
+demo_git() { git -C "$web_app" -c user.name="snapback demo" -c user.email=demo@example.invalid "$@"; }
+mkdir -p "$web_app"
+demo_git init --quiet --initial-branch=main
+printf '# web-app\n' >"$web_app/README.md"
+demo_git add README.md
+demo_git commit --quiet --message "Initial commit"
+for branch in chore/deps feat/cart-redesign fix/login-redirect; do
+  demo_git worktree add --quiet -b "$branch" ".agents/worktrees/${branch//\//-}"
+done
+
+# A quick reply refuses a cwd that does not exist (src/send.rs plan_send).
+grep -rhoE '"cwd":"[^"]+"' "$demo_home/.claude/projects" | sort -u |
+  sed -e 's/^"cwd":"//' -e 's/"$//' | while IFS= read -r dir; do mkdir -p "$dir"; done
+
 export PATH="$demo/bin:$target_dir/release:$PATH"
 
 # Privacy gate: the stub must shadow the real `claude` before anything runs.
