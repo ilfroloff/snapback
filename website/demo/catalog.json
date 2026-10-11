@@ -1,0 +1,16 @@
+{"commands":[
+{"name":"clear","description":"Clear conversation history and free up context","argumentHint":"","aliases":["reset","new"],"builtin":true},
+{"name":"compact","description":"Free up context by summarizing the conversation so far","argumentHint":"<optional custom summarization instructions>","builtin":true},
+{"name":"context","description":"Visualize current context usage as a colored grid","argumentHint":"","builtin":true},
+{"name":"init","description":"Initialize a new CLAUDE.md file with codebase documentation","argumentHint":"","builtin":true},
+{"name":"load-test","description":"Run the k6 load test against staging and summarize p95 latency (user)","argumentHint":"[endpoint]"},
+{"name":"model","description":"Set the AI model for Claude Code","argumentHint":"[model]","builtin":true},
+{"name":"pr-create","description":"Open or update the pull request for the current branch (user)","argumentHint":""},
+{"name":"security-review","description":"Complete a security review of the pending changes on the current branch","argumentHint":"","builtin":true},
+{"name":"test-flaky","description":"Re-run one test until it fails and report the failure rate (user)","argumentHint":"<test>"}
+],
+"agents":[
+{"name":"Explore","description":"Fast read-only search agent for locating code","model":"inherit"},
+{"name":"lead","description":"Plans the work and delegates it to specialist agents"},
+{"name":"reviewer","description":"Reviews a change for bugs and missing tests"}
+]}

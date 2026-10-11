@@ -1,8 +1,111 @@
 #!/bin/sh
 # Stub `claude` for the synthetic demo (see website/demo/record.sh). It answers
-# only what the board asks; its state lives in the throwaway $HOME, never in git.
+# only what the board asks; its state lives in the throwaway $HOME, never in git,
+# and it writes nothing outside $HOME. Each shape below mirrors what snapback's
+# parser reads (docs/agents/CLAUDE_CLI.md "How snapback drives `claude`"):
+#
+#   agents --json [--all]           cat $HOME/agents.json
+#   stop <job-id>                   mark that job stopped in $HOME/agents.json
+#   -p -r <id> … <message>          quick reply: append reply.jsonl to <id>
+#   -p -r <id> --fork-session --session-id <new> --name <name> … <message>
+#                                   headless fork: write <new>.jsonl beside <id>,
+#                                   leaving <id> byte-identical
+#   -p --input-format stream-json … one control request on stdin:
+#                                   `initialize` → catalog.json (the `/` list),
+#                                   `set_cwd` with `-r <id>` → move <id> there
+#
+# Workspace trust is not mirrored: every folder answers as trusted, so a move
+# always succeeds (claude's own `needs_trust` answer never comes from here).
 here=$(cd "$(dirname "$0")" && pwd)
 agents="$HOME/agents.json"
+projects="$HOME/.claude/projects"
+
+now() { date -u +%Y-%m-%dT%H:%M:%S.000Z; }
+
+# The transcript of session $1, wherever claude's project folders hold it.
+transcript() { ls "$projects"/*/"$1".jsonl 2>/dev/null | head -n 1; }
+
+# The uuid of the last tree record in file $1: where a new turn hangs.
+leaf_uuid() { grep -o '"uuid":"[^"]*"' "$1" | tail -n 1 | sed -e 's/^"uuid":"//' -e 's/"$//'; }
+
+# $1 as the inside of a JSON string (snapback strips control characters from a
+# fork name, so quotes and backslashes are all that need escaping).
+json_text() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+
+# The value of key $2 in the one-line JSON request $1.
+field() { printf '%s\n' "$1" | sed -n "s/.*\"$2\":\"\\([^\"]*\\)\".*/\\1/p"; }
+
+# Answer the `initialize` request $1 with the catalog fixture.
+answer_catalog() {
+  printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":%s}}\n' \
+    "$1" "$(tr -d '\n' <"$here/../catalog.json")"
+}
+
+# Answer request $1, a `set_cwd` to folder $3 for session $2, the way claude
+# 2.1.291 does: a `relocated` record and the hidden "directory changed" note go
+# into the transcript, which then moves (with its sibling <id>/ dir) into the
+# target's project folder.
+answer_move() {
+  request_id=$1 session=$2 target=$3
+  sleep 0.7
+  real_home=$(cd -P "$HOME" && pwd)
+  real_target=$(cd -P "$target" 2>/dev/null && pwd)
+  file=$(transcript "$session")
+  case "$real_target" in
+  "$real_home"/*) ;;
+  *)
+    printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"status":"rejected","reason":"unsafe_path","message":"the demo stub moves sessions only inside its HOME"}}}\n' "$request_id"
+    return
+    ;;
+  esac
+  [ -n "$file" ] || return
+  path=$(json_text "$target")
+  branch=$(git -C "$target" branch --show-current 2>/dev/null)
+  stamp=$(now)
+  printf '{"type":"relocated","relocatedCwd":"%s","sessionId":"%s"}\n' "$path" "$session" >>"$file"
+  printf '{"type":"user","sessionId":"%s","cwd":"%s","gitBranch":"%s","timestamp":"%s","uuid":"moved-%s","parentUuid":"%s","isSidechain":false,"isMeta":true,"message":{"role":"user","content":"<system-reminder>The working directory changed to %s.</system-reminder>"}}\n' \
+    "$session" "$path" "$branch" "$stamp" "$session" "$(leaf_uuid "$file")" "$path" >>"$file"
+  dest="$projects/$(printf '%s' "$target" | sed 's/[^A-Za-z0-9]/-/g')"
+  mkdir -p "$dest"
+  mv "$file" "$dest/"
+  [ ! -d "${file%.jsonl}" ] || mv "${file%.jsonl}" "$dest/"
+  printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"status":"ok","cwd":"%s","changed":true,"transcript_relocated":true}}}\n' \
+    "$request_id" "$path"
+}
+
+# fork.jsonl's record of type $1, for the fork $2 whose new turn hangs off $3.
+fork_turn() {
+  sed -e "s/SESSION/$2/g" -e "s/PARENT/$3/g" -e "s/\"TS\"/\"$(now)\"/g" "$here/../fork.jsonl" |
+    grep "\"type\":\"$1\""
+}
+
+# Fork session $1 into the new session $2 named $3, in claude's order: the new
+# file appears holding the name, the original's tree records under the new id
+# (so it shares their root and folds under its parent) and the message; the
+# answer and the name again follow it.
+fork() {
+  session=$1 forked=$2 name=$(json_text "$3")
+  file=$(transcript "$session")
+  [ -n "$file" ] || return
+  new="$(dirname "$file")/$forked.jsonl"
+  leaf=$(leaf_uuid "$file")
+  title=$(printf '{"type":"custom-title","customTitle":"%s","sessionId":"%s"}' "$name" "$forked")
+  agent=$(printf '{"type":"agent-name","agentName":"%s","sessionId":"%s"}' "$name" "$forked")
+  tmp="$HOME/.fork-$forked.tmp"
+  sleep 0.5
+  {
+    printf '%s\n%s\n' "$title" "$agent"
+    grep '"uuid":"' "$file" | sed "s/\"sessionId\":\"$session\"/\"sessionId\":\"$forked\"/g"
+    fork_turn user "$forked" "$leaf"
+  } >"$tmp" && mv "$tmp" "$new"
+  sleep 1.5
+  {
+    fork_turn assistant "$forked" "$leaf"
+    printf '%s\n%s\n' "$title" "$agent"
+  } >>"$new"
+  printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s","num_turns":3,"total_cost_usd":0.0587,"modelUsage":{"claude-sonnet-5":{"inputTokens":24871,"outputTokens":655,"costUSD":0.0587}}}\n' "$forked"
+}
+
 case "$1" in
 agents)
   cat "$agents"
@@ -12,22 +115,36 @@ stop)
   sed "s/\"state\":\"[a-z]*\"\(,\"id\":\"$2\"\)/\"state\":\"stopped\"\1/" "$agents" >"$tmp" && mv "$tmp" "$agents"
   ;;
 -p)
-  # claude -p -r <session-id> --output-format json [--model ..] <message>
-  session=""
+  session="" forked="" name="" forking=false streaming=false
+  shift
   while [ $# -gt 0 ]; do
-    if [ "$1" = "-r" ]; then
-      session="$2"
-      break
-    fi
+    case "$1" in
+    -r) session=$2 && shift ;;
+    --session-id) forked=$2 && shift ;;
+    --name) name=$2 && shift ;;
+    --fork-session) forking=true ;;
+    --input-format) streaming=true && shift ;;
+    --output-format | --model | --effort | --settings | --setting-sources) shift ;;
+    esac
     shift
   done
-  sleep 1.5
-  file=$(ls "$HOME"/.claude/projects/*/"$session".jsonl 2>/dev/null | head -n 1)
-  if [ -n "$file" ]; then
-    now=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
-    sed -e "s/SESSION/$session/g" -e "s/\"TS\"/\"$now\"/g" "$here/../reply.jsonl" >>"$file"
+  if $streaming; then
+    IFS= read -r request || true
+    cat >/dev/null
+    case "$request" in
+    *'"subtype":"initialize"'*) answer_catalog "$(field "$request" request_id)" ;;
+    *'"subtype":"set_cwd"'*) answer_move "$(field "$request" request_id)" "$session" "$(field "$request" path)" ;;
+    esac
+  elif $forking; then
+    fork "$session" "$forked" "$name"
+  else
+    sleep 1.5
+    file=$(transcript "$session")
+    if [ -n "$file" ]; then
+      sed -e "s/SESSION/$session/g" -e "s/\"TS\"/\"$(now)\"/g" "$here/../reply.jsonl" >>"$file"
+    fi
+    printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s","num_turns":2,"total_cost_usd":0.0412,"modelUsage":{"claude-sonnet-5":{"inputTokens":18234,"outputTokens":412,"costUSD":0.0412}}}\n' "$session"
   fi
-  printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s","num_turns":2,"total_cost_usd":0.0412,"modelUsage":{"claude-sonnet-5":{"inputTokens":18234,"outputTokens":412,"costUSD":0.0412}}}\n' "$session"
   ;;
 esac
 exit 0
