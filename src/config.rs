@@ -35,7 +35,7 @@ const CONFIG_DIR_ENV: &str = "SNAPBACK_CONFIG_DIR";
 const CONFIG_DIR_NAME: &str = "snapback";
 
 /// Subdirectory of the config dir holding snapback's PERSISTENT state (today the
-/// hidden-session id set). Split out from the config root so a future
+/// per-session state map). Split out from the config root so a future
 /// settings/config file at the root never sits beside churny state files.
 const STATE_SUBDIR: &str = "state";
 
@@ -65,8 +65,8 @@ pub fn config_dir() -> PathBuf {
 
 /// Resolve snapback's PERSISTENT-state directory: `<config>/state`
 /// (`~/.config/snapback/state` by default). This is where snapback's own state
-/// — today the hidden-session id set (`hidden::save_hidden`) — lives. The nested
-/// `state/` need not pre-exist: the atomic write `create_dir_all`s it on demand.
+/// — today the per-session state map (`hidden::save_hidden`) — lives. The nested
+/// `state/` need not pre-exist: the save `create_dir_all`s it on demand.
 pub fn state_dir() -> PathBuf {
     config_dir().join(STATE_SUBDIR)
 }

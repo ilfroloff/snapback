@@ -86,11 +86,13 @@ The JSONL format is external and undocumented, so treat every read as hostile:
 - **Reading is the default, but not the whole story.** `snapback` is
   overwhelmingly a reader of a hostile external store, and the Claude store stays
   read-only save for the one gated hard delete. It does, though, have exactly one
-  file of its OWN — the hidden-session id set (`hidden::load_hidden`) — and that
-  read gets the identical fail-soft discipline: a blank line is skipped and a
-  missing or unreadable file collapses to an empty set, never a panic, and its
-  write is atomic (temp + rename) so a crashed write can never leave a half-file
-  that fails the next read.
+  file of its OWN — the per-session state map (`hidden::load_hidden`) — and the
+  board's read of it gets the identical fail-soft discipline: a missing,
+  unreadable or malformed file, a non-object entry or a `hidden` other than JSON
+  `true` collapses toward NOTHING HIDDEN, never a panic, so the board always
+  comes up. Its WRITE fails the other way, and on purpose: a file the save cannot
+  read is REFUSED (a status, the file untouched), never treated as empty, because
+  the write replaces the whole file and would destroy hides it never saw.
   The two write postures (owned state; gated store mutation) are the AGENTS.md
   critical rules; their store/layout mechanism is in
   [DOMAIN.md](DOMAIN.md#snapback-owned-state-srchiddenrs).
@@ -1125,6 +1127,13 @@ canonicalizes the ONE selected session's folder (`in_scope` and one
 existence check, against the CACHED worktree set, never a fresh `git` call. The
 move itself is the worker above, never this keypress.
 
+`Ctrl-X x` adds the last: `hidden::save_hidden`, a read-modify-write of one small
+file under an exclusive lock on its sidecar. The lock waits only while another
+snapback process runs that same short section, and the OS releases it when the
+holder's handle closes, a dead holder's included. The read side is no keystroke
+at all: every reload re-reads that file once, without the lock, inside the reload
+one-shot ([DOMAIN.md](DOMAIN.md#snapback-owned-state-srchiddenrs)).
+
 ## 7. Restrained, terminal-safe styling
 
 The preview and list are styled with ratatui `Style` only — **never** embedded
@@ -1904,6 +1913,17 @@ Tests are **inline** `#[cfg(test)] mod tests` at the bottom of each source file
   takes the record's path, so each test writes its own under a canonicalised temp
   dir (on macOS `/var` is `/private/var`) and never reads the real
   `~/.claude.json`.
+- **Hidden state lives on disk in tests too.** A board reads its hidden set at
+  construction and re-reads it on every reload, so a set seeded only in
+  `App::hidden_ids` does not survive a reload or a hide's save: seed it with
+  `hidden::seed_hidden`. A test that SAVES a hide holds `config::env_lock` and
+  points `SNAPBACK_CONFIG_DIR` at its own temp dir, so no save can reach the real
+  `~/.config/snapback`. That variable is process-wide, though, so a board that
+  needs a hidden set across a reload while sharing fixture ids with other tests
+  (`A`/`F`, `lmv-*`, `sbpop-*`) is pinned to a dir of its own with the
+  `#[cfg(test)]` `App::set_state_dir`, which no concurrent board can read; ids
+  under a set `SNAPBACK_CONFIG_DIR` stay prefixed to the test (`sbx-*`,
+  `sbwin-*`) for the same reason.
 - **Test the pure helper, not the impure driver**: exit handling is tested via
   `status_for_exit`, teardown via the `Write`-generic `disable_mouse`, argv via
   `build_argv` — no real `claude` process is ever spawned, and no real `git`

@@ -16,8 +16,9 @@ Resolved by `store::discover::store_root()`:
 ## snapback-owned state (`src/hidden.rs`)
 
 The store above is READ-ONLY to `snapback` with one exception (hard delete, below).
-`snapback`'s one persistent write of its own is the **soft-hidden session id set**,
-kept in a SEPARATE directory it owns — never inside the Claude store. Its path is
+`snapback`'s one persistent write of its own is the **per-session state map**,
+which today records only which sessions are soft-hidden, kept in a SEPARATE
+directory it owns — never inside the Claude store. Its path is
 resolved by the `config` module (`src/config.rs`), the SINGLE place that reads the
 environment for any snapback-owned path:
 
@@ -30,12 +31,48 @@ environment for any snapback-owned path:
    `.config/snapback`, never a panic.
 2. `config::state_dir()` = `config_dir()/state`, where persistent state lives.
 
-The set is a single file, `<config>/state/hidden_sessions` (default
-`~/.config/snapback/state/hidden_sessions`): newline-delimited session ids,
-serialized in SORTED order for stable diffs. Reads are fail-soft: each line is
-trimmed and a blank one skipped, and a missing or unreadable file (non-UTF-8 bytes
-included) is an empty set, never a panic. Writes are atomic (temp file + rename),
-matching the JSONL fail-soft discipline.
+The map is a single file, `<config>/state/sessions.json` (default
+`~/.config/snapback/state/sessions.json`): a JSON object keyed by session id, each
+value an object of per-session fields — today only `hidden`
+(`{"<id>": {"hidden": true}}`). It is handled as a `serde_json::Value`, so an entry
+or a field this version does not know, which a newer snapback may have written,
+survives every save. serde_json is built without `preserve_order`, so the map
+serializes with SORTED keys and an unchanged map is byte-stable (a test goes red
+if the feature is ever enabled).
+
+- **Read** (`hidden::load_hidden`): at `App::new` and again on EVERY store reload
+  (`App::apply_reload`, the one funnel every reload path takes) — one small-file
+  read, no lock, never on a keystroke or the render path. A missing, unreadable
+  (non-UTF-8 included) or malformed file, or a non-object top level, is an empty
+  set; an entry that is not an object, or whose `hidden` is anything but the JSON
+  boolean `true`, is not hidden. So another snapback window's hides reach this
+  board at its next reload.
+- **Write** (`hidden::save_hidden`, once per `Ctrl-X x`): the keystroke's change is
+  a `HideDelta` (these ids → hidden or not), decided by the pure
+  `delete::toggle_hidden` from what THIS window shows (its in-memory set, pivoting
+  on the selected row) — never from disk, or a hide pressed on a row another window
+  already hid would un-hide it. Under an exclusive `File::lock` on the sidecar
+  `sessions.json.lock` (never deleted: a recreated lock file is a different file,
+  and two saves would race again), the save re-reads `sessions.json`, applies the
+  delta (`apply_delta`: a hide sets `hidden: true` and keeps the entry's other
+  fields, replacing only an entry that is not an object, which the format never
+  holds; an un-hide removes `hidden` and drops the entry only if that empties it),
+  writes a pid-suffixed temp file beside it and renames it over. The board then
+  ADOPTS the merged result. Saving the board's whole set instead was the lost
+  update this replaced: two windows each held a snapshot, and the last rename
+  dropped the other's hides; the rename alone prevents a torn file, not that.
+- **A save never overwrites what it could not read.** A `sessions.json` that is
+  present but unreadable, or not a JSON object, fails the save with
+  `could not save hidden sessions: …` on the status line and the file untouched.
+  The keypress still applies on that board, and the next reload, which re-reads
+  disk, reverts it.
+- **Migration.** The newline-delimited `hidden_sessions` file of older versions is
+  read (one id per trimmed, non-blank line) while `sessions.json` is missing; a
+  load never writes. The first save, under the lock, seeds the map from it (an
+  unreadable one fails the save), applies its delta, writes `sessions.json`, and
+  only then removes `hidden_sessions`. Once `sessions.json` exists the legacy file
+  is ignored, and a second instance migrating at the same moment sees the new file
+  under the lock and seeds nothing.
 
 Hiding is a **visibility preference, not a status flag**. A hidden session is
 still discovered, parsed, and indexed at load — its bytes stay on disk — and is
@@ -1860,8 +1897,8 @@ and no `body`, and together they outnumber the peer records, so a gate of "has a
 The fold key is the SENDER, never the record `uuid`: `(session, origin.from)`
 pairs are unique across the store, and keying it this way lets a later
 delegation node resolve to the SAME node. Which nodes are open lives in
-`tui::app`'s `expanded_peers`, IN MEMORY for the run — the hidden-id set above
-stays the only thing snapback persists. A record that passes the gate but
+`tui::app`'s `expanded_peers`, IN MEMORY for the run — the per-session state map
+above stays the only thing snapback persists. A record that passes the gate but
 carries no `from` has no key, so it claims no click region and renders EXPANDED:
 a collapsed node nobody can click would put its body permanently out of reach.
 The same set also holds the [injected nodes'](#injected-context-node-storepreview)
@@ -3363,8 +3400,9 @@ is:
 
 Every member the job had not reached gets no re-read, no probe, no child and no
 write. No `MoveFinished` is sent, and `App::moving` and the undelivered queue die
-with the process. snapback persists nothing about a move (the hidden-id set is
-its only file), so nothing reports the outcome, then or at the next launch.
+with the process. snapback persists nothing about a move (its per-session state
+map holds only `hidden`), so nothing reports the outcome, then or at the next
+launch.
 
 That launch reads each transcript where the disk has it: a moved one through its
 `relocated` record, an unmoved one in its old folder. A lineage's members can

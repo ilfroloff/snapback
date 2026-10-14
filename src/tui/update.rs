@@ -12735,15 +12735,16 @@ mod tests {
         let state = unique_temp_dir("unhide-state");
         std::env::set_var("SNAPBACK_CONFIG_DIR", &state);
 
+        // Precondition: sbx-b is hidden — on disk, where the board loads it from
+        // and the un-hide must remove it — AND the show-hidden view is on, so the
+        // hidden row is on screen for the un-hide.
+        crate::hidden::seed_hidden(&crate::config::state_dir(), &["sbx-b"]);
         let mut app = App::new(
             vec![session("sbx-a"), session("sbx-b")],
             Scope::All,
             PathBuf::from("/tmp/launch"),
         );
-        // Precondition: sbx-b is hidden AND the show-hidden view is on, so the
-        // hidden row is on screen for the un-hide. `toggle_show_hidden` flips the
-        // view on (false -> true) and re-filters with the new hidden id in place.
-        app.hidden_ids.insert("sbx-b".to_string());
+        assert!(app.hidden_ids.contains("sbx-b"), "premise: loaded hidden");
         app.toggle_show_hidden();
         assert!(app.show_hidden);
         app.move_selection(1);
@@ -13290,6 +13291,9 @@ mod tests {
     /// head, selected), `lmv-mid` and the soft-HIDDEN `lmv-old`, one root uuid and
     /// distinct stamps — folded. Returns the app, `main`, `wt` and the members in
     /// the order `Move lineage (N)` carries them (the store's).
+    ///
+    /// The hidden set lives in the board's own pinned state dir
+    /// ([`App::state_dir`]), which a test that persists a hide reads back.
     fn lineage_move_board(tag: &str) -> (App, PathBuf, PathBuf, Vec<String>) {
         let main = resolve_dir(&unique_temp_dir(&format!("{tag}-main")));
         let wt = resolve_dir(&unique_temp_dir(&format!("{tag}-wt")));
@@ -13308,10 +13312,12 @@ mod tests {
         let mut app = App::new(sessions.clone(), Scope::Project, main.clone());
         let set = WorktreeSet::from_resolved([main.clone(), wt.clone()], None);
         app.set_worktree_probe(move |_| set.clone());
-        // `App::new` loads the persisted hidden set: start from exactly one hidden
-        // member, then re-filter through the public reload path.
-        app.hidden_ids.clear();
-        app.hidden_ids.insert("lmv-old".to_string());
+        // Start from exactly one hidden member, saved to a state dir of the
+        // board's own, then re-filter through the public reload path, which
+        // re-reads it.
+        let state = unique_temp_dir(&format!("{tag}-state"));
+        crate::hidden::seed_hidden(&state, &["lmv-old"]);
+        app.set_state_dir(state);
         app.apply_sessions(sessions);
         seed_live(&mut app, &[]);
         assert_eq!(
@@ -13482,7 +13488,7 @@ mod tests {
         );
 
         feed(&mut app, key(KeyCode::Esc), &mut store);
-        for dir in [&main, &wt, &second] {
+        for dir in [&app.state_dir(), &main, &wt, &second] {
             let _ = std::fs::remove_dir_all(dir);
         }
     }
@@ -13675,12 +13681,15 @@ mod tests {
     /// `Enter`, so a broken gate can never unlink anything.
     #[test]
     fn a_lone_looking_head_under_a_query_hides_alone_but_still_deletes_and_moves_its_lineage() {
+        // The board saves to its pinned dir; `SNAPBACK_CONFIG_DIR` is the net
+        // that keeps a broken pin off the real state dir.
         let _guard = crate::config::env_lock();
-        let state = unique_temp_dir("lone-head-state");
-        std::env::set_var("SNAPBACK_CONFIG_DIR", &state);
+        let net = unique_temp_dir("lone-head-net");
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &net);
 
         let mut store = store_at(Path::new("/tmp"));
         let (mut app, main, wt, members) = lineage_move_board("lmv-lone");
+        let state = app.state_dir();
         type_into_board(&mut app, "lmv-mid");
         let drawn: Vec<(&str, usize, bool)> = app
             .rows()
@@ -13760,14 +13769,14 @@ mod tests {
             app.hidden_ids.contains("lmv-old"),
             "the copy hidden before stays hidden"
         );
-        let persisted = crate::hidden::load_hidden(&crate::config::state_dir());
+        let persisted = crate::hidden::load_hidden(&state);
         assert!(
             persisted.contains("lmv-mid") && !persisted.contains("lmv-new"),
             "only the row's hide is added to the persisted set: {persisted:?}"
         );
 
         std::env::remove_var("SNAPBACK_CONFIG_DIR");
-        for dir in [&state, &main, &wt] {
+        for dir in [&net, &state, &main, &wt] {
             let _ = std::fs::remove_dir_all(dir);
         }
     }
@@ -13783,12 +13792,15 @@ mod tests {
     #[test]
     fn a_plus_n_head_under_a_query_hides_its_copies_but_still_deletes_and_moves_the_whole_lineage()
     {
+        // The board saves to its pinned dir; `SNAPBACK_CONFIG_DIR` is the net
+        // that keeps a broken pin off the real state dir.
         let _guard = crate::config::env_lock();
-        let state = unique_temp_dir("plus-n-head-state");
-        std::env::set_var("SNAPBACK_CONFIG_DIR", &state);
+        let net = unique_temp_dir("plus-n-head-net");
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &net);
 
         let mut store = store_at(Path::new("/tmp"));
         let (mut app, main, wt, members) = lineage_move_board("lmv-res");
+        let state = app.state_dir();
         feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
         feed(&mut app, key(KeyCode::Char('h')), &mut store);
         assert!(app.show_hidden, "premise: show-hidden is on");
@@ -13873,7 +13885,7 @@ mod tests {
             !app.hidden_ids.contains("lmv-new"),
             "the newest copy, off the board, is not"
         );
-        let persisted = crate::hidden::load_hidden(&crate::config::state_dir());
+        let persisted = crate::hidden::load_hidden(&state);
         assert!(
             persisted.contains("lmv-mid")
                 && persisted.contains("lmv-old")
@@ -13882,7 +13894,7 @@ mod tests {
         );
 
         std::env::remove_var("SNAPBACK_CONFIG_DIR");
-        for dir in [&state, &main, &wt] {
+        for dir in [&net, &state, &main, &wt] {
             let _ = std::fs::remove_dir_all(dir);
         }
     }
@@ -13940,10 +13952,11 @@ mod tests {
     /// [`lineage_move_board`]'s shape over a PARENT and two forks the `Ctrl-F` box
     /// made from it: the unnamed `nf-parent` (the oldest) and `nf-fork-a` /
     /// `nf-fork-b`, named `fork: …` and each newer than the parent, one root uuid.
-    /// `hidden` members start soft-hidden. Folded, the parent heads its forks
-    /// although both are newer (`lineage::head_of`), so its row is the one selected.
-    /// Returns the app, `main`, `wt` and the members in the order a lineage choice
-    /// carries them (the store's).
+    /// `hidden` members start soft-hidden, in the board's own pinned state dir
+    /// ([`App::state_dir`]). Folded, the parent heads its forks although both are
+    /// newer (`lineage::head_of`), so its row is the one selected. Returns the app,
+    /// `main`, `wt` and the members in the order a lineage choice carries them (the
+    /// store's).
     fn named_fork_board(tag: &str, hidden: &[&str]) -> (App, PathBuf, PathBuf, Vec<String>) {
         let main = resolve_dir(&unique_temp_dir(&format!("{tag}-main")));
         let wt = resolve_dir(&unique_temp_dir(&format!("{tag}-wt")));
@@ -13968,11 +13981,11 @@ mod tests {
         let mut app = App::new(sessions.clone(), Scope::Project, main.clone());
         let set = WorktreeSet::from_resolved([main.clone(), wt.clone()], None);
         app.set_worktree_probe(move |_| set.clone());
-        // `App::new` loads the persisted hidden set: start from exactly `hidden`,
-        // then re-filter through the public reload path.
-        app.hidden_ids.clear();
-        app.hidden_ids
-            .extend(hidden.iter().map(|id| (*id).to_string()));
+        // Start from exactly `hidden`, saved to a state dir of the board's own,
+        // then re-filter through the public reload path, which re-reads it.
+        let state = unique_temp_dir(&format!("{tag}-state"));
+        crate::hidden::seed_hidden(&state, hidden);
+        app.set_state_dir(state);
         app.apply_sessions(sessions);
         seed_live(&mut app, &[]);
         assert_eq!(
@@ -14015,12 +14028,15 @@ mod tests {
     /// grouping, with no named-fork exception.
     #[test]
     fn ctrl_x_x_on_a_parent_row_hides_its_named_forks_too() {
+        // The board saves to its pinned dir; `SNAPBACK_CONFIG_DIR` is the net
+        // that keeps a broken pin off the real state dir.
         let _guard = crate::config::env_lock();
-        let state = unique_temp_dir("nf-hide-parent-state");
-        std::env::set_var("SNAPBACK_CONFIG_DIR", &state);
+        let net = unique_temp_dir("nf-hide-parent-net");
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &net);
 
         let mut store = store_at(Path::new("/tmp"));
         let (mut app, main, wt, _members) = named_fork_board("nf-hide-parent", &[]);
+        let state = app.state_dir();
         feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
         feed(&mut app, key(KeyCode::Char('x')), &mut store);
 
@@ -14030,7 +14046,7 @@ mod tests {
             "the parent and both named forks are hidden"
         );
         assert_eq!(
-            named_forks_in(&crate::hidden::load_hidden(&crate::config::state_dir())),
+            named_forks_in(&crate::hidden::load_hidden(&state)),
             NAMED_FORK_IDS.to_vec(),
             "and all three are persisted"
         );
@@ -14040,7 +14056,7 @@ mod tests {
         );
 
         std::env::remove_var("SNAPBACK_CONFIG_DIR");
-        for dir in [&state, &main, &wt] {
+        for dir in [&net, &state, &main, &wt] {
             let _ = std::fs::remove_dir_all(dir);
         }
     }
@@ -14049,12 +14065,15 @@ mod tests {
     /// and the other fork stay on the board.
     #[test]
     fn ctrl_x_x_on_a_named_forks_child_row_hides_only_that_fork() {
+        // The board saves to its pinned dir; `SNAPBACK_CONFIG_DIR` is the net
+        // that keeps a broken pin off the real state dir.
         let _guard = crate::config::env_lock();
-        let state = unique_temp_dir("nf-hide-child-state");
-        std::env::set_var("SNAPBACK_CONFIG_DIR", &state);
+        let net = unique_temp_dir("nf-hide-child-net");
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &net);
 
         let mut store = store_at(Path::new("/tmp"));
         let (mut app, main, wt, _members) = named_fork_board("nf-hide-child", &[]);
+        let state = app.state_dir();
         select_named_fork_child_row(&mut app, &mut store);
         feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
         feed(&mut app, key(KeyCode::Char('x')), &mut store);
@@ -14065,7 +14084,7 @@ mod tests {
             "only the fork's own row is hidden"
         );
         assert_eq!(
-            named_forks_in(&crate::hidden::load_hidden(&crate::config::state_dir())),
+            named_forks_in(&crate::hidden::load_hidden(&state)),
             vec!["nf-fork-b"],
             "and only it is persisted"
         );
@@ -14076,7 +14095,7 @@ mod tests {
         );
 
         std::env::remove_var("SNAPBACK_CONFIG_DIR");
-        for dir in [&state, &main, &wt] {
+        for dir in [&net, &state, &main, &wt] {
             let _ = std::fs::remove_dir_all(dir);
         }
     }
@@ -14149,7 +14168,7 @@ mod tests {
             assert!(!app.moving_on(id), "{id}: nothing moved");
         }
 
-        for dir in [&main, &wt] {
+        for dir in [&app.state_dir(), &main, &wt] {
             let _ = std::fs::remove_dir_all(dir);
         }
     }
@@ -14200,7 +14219,7 @@ mod tests {
         assert!(!app.moving_on("nf-parent"), "the parent stays put");
         assert!(!app.moving_on("nf-fork-a"), "and so does the other fork");
 
-        for dir in [&main, &wt] {
+        for dir in [&app.state_dir(), &main, &wt] {
             let _ = std::fs::remove_dir_all(dir);
         }
     }
