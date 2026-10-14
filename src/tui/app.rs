@@ -126,11 +126,12 @@ const LIST_WIDE_LIST_PERCENT: u32 = 75;
 /// rather than inlined so the one wording lives in one place (NO MAGIC VALUES).
 const MATCH_OUTSIDE_PREVIEW: &str = "match is outside the previewed transcript";
 
-/// Prefix of the board status shown when persisting the hidden-id set fails.
+/// Prefix of the board status shown when persisting a hide or un-hide fails.
 /// Hidden state is a CONVENIENCE, so a write error degrades to a message rather
-/// than aborting the board; the in-memory set stays authoritative for the rest
-/// of the session (FAIL-SOFT). Named rather than inlined so the one user-facing
-/// wording lives in exactly one place (NO MAGIC VALUES).
+/// than aborting the board; the change still applies on this board until the
+/// next store reload re-reads disk (see [`App::persist_hidden`]). Named rather
+/// than inlined so the one user-facing wording lives in exactly one place (NO
+/// MAGIC VALUES).
 const HIDDEN_SAVE_ERROR_PREFIX: &str = "could not save hidden sessions";
 
 /// The HARD-delete confirm's standing prompt: the irreversibility warning plus
@@ -2500,8 +2501,9 @@ pub struct App {
     /// DERIVED, IN-MEMORY state: it describes another program's binary, snapback
     /// owns none of it, and nothing here ever reaches disk. AGENTS.md settles that
     /// category twice over — THE PARSE CACHE keeps derived state in memory, and
-    /// SNAPBACK-OWNED STATE keeps the hidden-session id set the only thing snapback
-    /// persists. Written only by [`set_model_aliases`](Self::set_model_aliases),
+    /// SNAPBACK-OWNED STATE keeps the per-session state map the only thing
+    /// snapback persists. Written only by
+    /// [`set_model_aliases`](Self::set_model_aliases),
     /// from [`AppEvent::ModelAliases`](crate::watch::AppEvent::ModelAliases); read
     /// only by [`offered_model_aliases`], which decides what the picker offers.
     ///
@@ -2663,9 +2665,12 @@ pub struct App {
     /// line (AGENTS.md, STATUS-LINE OWNERSHIP).
     pub lost_agent_bindings: HashSet<String>,
     /// The PERSISTED set of user-hidden session ids — snapback's OWN visibility
-    /// preference, loaded once at construction from
-    /// [`config::state_dir`] and re-saved
-    /// on every hide/un-hide. When [`show_hidden`](Self::show_hidden) is off,
+    /// preference, read from [`config::state_dir`] at construction and again on
+    /// every store reload ([`apply_reload`](Self::apply_reload)), and replaced by
+    /// what disk holds after each hide/un-hide saves its change
+    /// ([`persist_hidden`](Self::persist_hidden)). Disk is the source of truth,
+    /// since another snapback window may save to it too. When
+    /// [`show_hidden`](Self::show_hidden) is off,
     /// [`recompute_filtered`](Self::recompute_filtered) drops these ids so their
     /// rows leave the board entirely.
     ///
@@ -2676,6 +2681,17 @@ pub struct App {
     /// vocabulary on purpose — `hidden_ids` / "hide" here vs. the fold's `hidden`
     /// / "fold".
     pub hidden_ids: HashSet<String>,
+    /// A test's own state dir for this board, read and saved in place of
+    /// [`config::state_dir`] (see [`state_dir`](Self::state_dir)).
+    ///
+    /// A seam, like [`worktree_probe`](Self::worktree_probe), and absent from
+    /// production builds. Every reload re-reads the hidden set from disk, so a
+    /// test that needs one across a reload must save it there, and
+    /// `SNAPBACK_CONFIG_DIR` is process-wide: a set saved under it reaches every
+    /// board a concurrent test builds or reloads, fixture ids (`A`, `lmv-*`)
+    /// included.
+    #[cfg(test)]
+    state_dir_pin: Option<PathBuf>,
     /// Whether user-hidden sessions are currently revealed inline (drawn dimmed
     /// with a `[hidden]` marker). `false` by default: hidden rows stay off the
     /// board until the show-hidden toggle brings them back for review or un-hide.
@@ -2923,12 +2939,12 @@ impl App {
             hidden: HashMap::new(),
             unfolded: Vec::new(),
             lost_agent_bindings,
-            // Load the persisted hidden set ONCE at startup. Resolve the dir here
-            // (and again at save time) rather than caching a path, so a
-            // `SNAPBACK_CONFIG_DIR` override is honored per call and tests can
-            // inject an isolated dir. Fail-soft: a missing/unreadable file is an
-            // empty set (nothing hidden yet), never a startup error.
+            // The same dir `state_dir` resolves at reload and save time; no test
+            // can have pinned another yet. Fail-soft: a missing/unreadable file
+            // is an empty set (nothing hidden yet), never a startup error.
             hidden_ids: hidden::load_hidden(&config::state_dir()),
+            #[cfg(test)]
+            state_dir_pin: None,
             show_hidden: false,
             pending_chord: false,
             preview_cache: HashMap::new(),
@@ -3477,8 +3493,8 @@ impl App {
             return;
         };
         let members = self.hide_choice().unwrap_or_else(|| vec![id.clone()]);
-        delete::toggle_hidden(&mut self.hidden_ids, &members, &id);
-        self.persist_hidden();
+        let delta = delete::toggle_hidden(&self.hidden_ids, &members, &id);
+        self.persist_hidden(&delta);
         self.reapply_preserving_selection();
     }
 
@@ -3494,17 +3510,38 @@ impl App {
         self.reapply_preserving_selection();
     }
 
-    /// Persist the hidden-id set to snapback's own state dir, FAIL-SOFT.
+    /// Save one hide keystroke's `delta` to snapback's own state dir, then adopt
+    /// what disk holds afterwards as [`hidden_ids`](Self::hidden_ids).
     ///
-    /// Resolves the dir at SAVE time (never a cached path) so a `SNAPBACK_CONFIG_DIR`
-    /// override is honored per call. A write error is surfaced as a transient board
-    /// status but leaves the in-memory set AUTHORITATIVE for the rest of the
-    /// session: the hidden state is a convenience, so a failed write must never
-    /// abort the hide or the board.
-    fn persist_hidden(&mut self) {
-        if let Err(err) = hidden::save_hidden(&config::state_dir(), &self.hidden_ids) {
-            self.set_status(format!("{HIDDEN_SAVE_ERROR_PREFIX}: {err}"));
+    /// The save merges `delta` alone into the file under a lock
+    /// ([`hidden::save_hidden`]), so it keeps every hide another snapback window
+    /// saved since this one last read, and adopting the result brings those onto
+    /// this board too.
+    ///
+    /// FAIL-SOFT: a failed save still applies `delta` to this board, so the
+    /// keypress does what the user saw, and reports the error on the status line.
+    /// Disk stays the source of truth, so the next store reload reverts that
+    /// unsaved change.
+    fn persist_hidden(&mut self, delta: &hidden::HideDelta) {
+        match hidden::save_hidden(&self.state_dir(), delta) {
+            Ok(on_disk) => self.hidden_ids = on_disk,
+            Err(err) => {
+                delta.apply_to(&mut self.hidden_ids);
+                self.set_status(format!("{HIDDEN_SAVE_ERROR_PREFIX}: {err}"));
+            }
         }
+    }
+
+    /// The dir this board reads its hidden set from and saves it to:
+    /// [`config::state_dir`], resolved on every call rather than cached, so a
+    /// `SNAPBACK_CONFIG_DIR` a test sets is honored. Under test, a dir pinned by
+    /// [`set_state_dir`](Self::set_state_dir) answers instead.
+    pub(crate) fn state_dir(&self) -> PathBuf {
+        #[cfg(test)]
+        if let Some(dir) = &self.state_dir_pin {
+            return dir.clone();
+        }
+        config::state_dir()
     }
 
     // --- pane layout -----------------------------------------------------------
@@ -4218,6 +4255,17 @@ impl App {
     #[cfg(test)]
     pub fn set_worktree_probe(&mut self, probe: impl Fn(&Path) -> WorktreeSet + 'static) {
         self.worktree_probe = Box::new(probe);
+    }
+
+    /// Pin this board's state dir to `dir`, a test's own, instead of
+    /// `SNAPBACK_CONFIG_DIR`'s (see [`state_dir_pin`](Self::state_dir_pin)).
+    ///
+    /// Like [`set_worktree_probe`](Self::set_worktree_probe), pinning does NOT
+    /// re-read on its own: the hidden set is re-read at the next reload, the
+    /// moment production re-reads it.
+    #[cfg(test)]
+    pub fn set_state_dir(&mut self, dir: PathBuf) {
+        self.state_dir_pin = Some(dir);
     }
 
     /// Look up a loaded session by its stable id.
@@ -5247,16 +5295,16 @@ impl App {
     /// selection by stable id and the scroll offset. If the selected id
     /// vanished, the selection clamps to the nearest surviving row.
     ///
-    /// This is also where the launch project's worktree set is RE-RESOLVED, and
-    /// it needs no wiring at any caller: every reload path already funnels
-    /// through here — the `SessionsChanged` watcher event and the post-resume
-    /// reload in `lib::run` (the two the autoreload exists for), plus the
-    /// post-delete reload, the post-move reload (`MoveFinished`) and the
-    /// `Ctrl-X r` rescan — so all of them pick a
-    /// worktree created mid-run up by construction, and a future reload path gets
-    /// the same behavior for free. Off-UI-thread: a reload is a bounded one-shot,
-    /// unlike `recompute_scope` / `toggle_scope`, which run on a keystroke and
-    /// must never ask git.
+    /// This is also where the launch project's worktree set is RE-RESOLVED and the
+    /// hidden set RE-READ from disk, and neither needs wiring at any caller:
+    /// every reload path already funnels through here — the `SessionsChanged`
+    /// watcher event and the post-resume reload in `lib::run` (the two the
+    /// autoreload exists for), plus the post-delete reload, the post-move reload
+    /// (`MoveFinished`) and the `Ctrl-X r` rescan — so all of them pick up a
+    /// worktree created mid-run, and a hide another snapback window saved, by
+    /// construction, and a future reload path gets the same behavior for free.
+    /// Off-UI-thread: a reload is a bounded one-shot, unlike `recompute_scope` /
+    /// `toggle_scope`, which run on a keystroke and must never ask git.
     ///
     /// The [`Reload`] says WHICH transcripts were re-read, and that is what keeps
     /// the derived caches honest without throwing them away: an incremental
@@ -5292,6 +5340,11 @@ impl App {
         // expression `App::new` seeds with, on purpose: launch and reload must not
         // be able to disagree about what a project is.
         self.worktrees = (self.worktree_probe)(&self.launch_dir);
+        // Another snapback window may have saved hides since this one last read
+        // them. One small-file read per reload, never per frame or keystroke, and
+        // no lock: every save lands by an atomic rename, so this sees a whole
+        // file. Before `recompute_filtered`, which drops the hidden rows.
+        self.hidden_ids = hidden::load_hidden(&self.state_dir());
         // Whether the transcript under the preview was re-read — asked of the
         // SAME `changed` set the cache eviction above reads.
         let preview_reread = prev_id
@@ -7230,14 +7283,14 @@ mod tests {
         std::env::set_var("SNAPBACK_CONFIG_DIR", &dir);
 
         let members = ["sbalone-new", "sbalone-mid", "sbalone-old"];
+        // Hidden on DISK before the board loads: a hide's save adopts what disk
+        // holds, so a copy hidden only in memory would not survive it.
+        crate::hidden::seed_hidden(&crate::config::state_dir(), &["sbalone-mid", "sbalone-old"]);
         let mut app = app_all(vec![
             session_fork("sbalone-new", "/tmp/p", "alone-root", 300),
             session_fork("sbalone-mid", "/tmp/p", "alone-root", 200),
             session_fork("sbalone-old", "/tmp/p", "alone-root", 100),
         ]);
-        app.hidden_ids.insert("sbalone-mid".to_string());
-        app.hidden_ids.insert("sbalone-old".to_string());
-        app.recompute_filtered();
         app.set_selected(Some("sbalone-new".to_string()));
         assert_eq!(
             visible_ids(&app),
@@ -7280,14 +7333,13 @@ mod tests {
         std::env::set_var("SNAPBACK_CONFIG_DIR", &dir);
 
         let members = ["sbplus-new", "sbplus-mid", "sbplus-old"];
+        // Hidden on DISK, so the un-hide below has a persisted hide to remove.
+        crate::hidden::seed_hidden(&crate::config::state_dir(), &members);
         let mut app = app_all(vec![
             session_fork("sbplus-new", "/tmp/p", "plus-root", 300),
             session_fork("sbplus-mid", "/tmp/p", "plus-root", 200),
             session_fork("sbplus-old", "/tmp/p", "plus-root", 100),
         ]);
-        for id in members {
-            app.hidden_ids.insert(id.to_string());
-        }
         app.toggle_show_hidden();
         app.set_selected(Some("sbplus-new".to_string()));
         assert_eq!(
@@ -7716,14 +7768,14 @@ mod tests {
         std::env::set_var("SNAPBACK_CONFIG_DIR", &dir);
 
         let members = ["sbun-new", "sbun-old-a", "sbun-old-b"];
+        // Hidden on DISK: a save adopts what disk holds, so the newest copy must
+        // be hidden there to stay hidden through the un-hide below.
+        crate::hidden::seed_hidden(&crate::config::state_dir(), &members);
         let mut app = app_all(vec![
             session_fork("sbun-new", "/tmp/p", "un-root", 300),
             session_fork("sbun-old-a", "/tmp/p", "un-root", 200),
             session_fork("sbun-old-b", "/tmp/p", "un-root", 100),
         ]);
-        for id in members {
-            app.hidden_ids.insert(id.to_string());
-        }
         app.toggle_show_hidden();
         app.push_query_str("sbun-old");
         app.set_selected(Some("sbun-old-a".to_string()));
@@ -7785,6 +7837,156 @@ mod tests {
             visible_ids(&rebuilt),
             vec!["sbhide-a"],
             "a session hidden in a previous run stays hidden across a restart"
+        );
+
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Three sessions for the two-window tests below, prefixed so a leaked
+    /// `SNAPBACK_CONFIG_DIR` cannot collide with another test's ids.
+    fn two_window_sessions() -> Vec<Session> {
+        vec![
+            session("sbwin-a", "r1", Some("main"), "/tmp/a"),
+            session("sbwin-b", "r2", Some("main"), "/tmp/b"),
+            session("sbwin-c", "r3", Some("main"), "/tmp/c"),
+        ]
+    }
+
+    /// REGRESSION (lost update): two snapback windows over one state dir, each
+    /// loaded before either hides, each hide a DIFFERENT session. Both hides must
+    /// land on disk — the second save must not write its stale snapshot over the
+    /// first — and the second window adopts the first's hide with its own.
+    #[test]
+    fn two_windows_hiding_different_sessions_both_persist() {
+        let _guard = crate::config::env_lock();
+        let dir = unique_temp_dir("hide-two-windows");
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &dir);
+
+        // Both windows start from the same (empty) disk state.
+        let mut first = app_all(two_window_sessions());
+        let mut second = app_all(two_window_sessions());
+
+        first.set_selected(Some("sbwin-a".to_string()));
+        first.toggle_hidden_selected();
+        second.set_selected(Some("sbwin-b".to_string()));
+        second.toggle_hidden_selected();
+
+        let on_disk = crate::hidden::load_hidden(&crate::config::state_dir());
+        assert!(
+            on_disk.contains("sbwin-a") && on_disk.contains("sbwin-b"),
+            "both windows' hides persist, not just the last writer's: {on_disk:?}"
+        );
+        assert_eq!(
+            visible_ids(&second),
+            vec!["sbwin-c"],
+            "the second window's save adopts the first window's hide too"
+        );
+
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The hide-or-un-hide DIRECTION is what THIS window shows, never what disk
+    /// says: a stale window still showing a session another window hid must hide
+    /// it on its own keypress, not un-hide it.
+    #[test]
+    fn a_stale_window_hiding_a_session_another_window_hid_keeps_it_hidden() {
+        let _guard = crate::config::env_lock();
+        let dir = unique_temp_dir("hide-stale-direction");
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &dir);
+
+        let mut first = app_all(two_window_sessions());
+        let mut second = app_all(two_window_sessions());
+
+        first.set_selected(Some("sbwin-a".to_string()));
+        first.toggle_hidden_selected();
+        // The second window has not reloaded, so it still shows `sbwin-a`.
+        second.set_selected(Some("sbwin-a".to_string()));
+        assert!(visible_ids(&second).contains(&"sbwin-a"));
+        second.toggle_hidden_selected();
+
+        assert!(
+            crate::hidden::load_hidden(&crate::config::state_dir()).contains("sbwin-a"),
+            "a hide pressed on a visible row stays a hide"
+        );
+        assert!(
+            !visible_ids(&second).contains(&"sbwin-a"),
+            "the row leaves the window the user pressed hide in"
+        );
+
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A store reload re-reads the hidden set from disk, so a window catches up
+    /// with another window's hide without a keypress of its own.
+    #[test]
+    fn a_store_reload_picks_up_another_windows_hide() {
+        let _guard = crate::config::env_lock();
+        let dir = unique_temp_dir("hide-reload");
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &dir);
+
+        let mut first = app_all(two_window_sessions());
+        let mut second = app_all(two_window_sessions());
+
+        first.set_selected(Some("sbwin-c".to_string()));
+        first.toggle_hidden_selected();
+        assert_eq!(
+            visible_ids(&second),
+            vec!["sbwin-a", "sbwin-b", "sbwin-c"],
+            "no reload yet, so the second window still shows the row"
+        );
+
+        second.apply_sessions(two_window_sessions());
+        assert_eq!(
+            visible_ids(&second),
+            vec!["sbwin-a", "sbwin-b"],
+            "the reload re-read the hidden set the first window saved"
+        );
+
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A hide whose save FAILS still applies on this board and says why, and
+    /// writes nothing over the file it could not read. Disk stays the source of
+    /// truth, so the next store reload brings the row back.
+    #[test]
+    fn a_hide_whose_save_fails_holds_only_until_the_next_reload() {
+        let _guard = crate::config::env_lock();
+        let dir = unique_temp_dir("hide-save-fails");
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &dir);
+        let state = crate::config::state_dir();
+        std::fs::create_dir_all(&state).expect("create the state dir");
+        let unreadable = "not a JSON object";
+        std::fs::write(state.join("sessions.json"), unreadable).expect("write it");
+
+        let mut app = app_all(two_window_sessions());
+        app.set_selected(Some("sbwin-a".to_string()));
+        app.toggle_hidden_selected();
+
+        let status = app.status.clone().unwrap_or_default();
+        assert!(
+            status.starts_with(HIDDEN_SAVE_ERROR_PREFIX) && status.contains("sessions.json"),
+            "the failure is reported, naming the file: {status:?}"
+        );
+        assert_eq!(
+            visible_ids(&app),
+            vec!["sbwin-b", "sbwin-c"],
+            "the keypress still hides the row on this board"
+        );
+        assert_eq!(
+            std::fs::read_to_string(state.join("sessions.json")).expect("still there"),
+            unreadable,
+            "nothing was written over the file the save could not read"
+        );
+
+        app.apply_sessions(two_window_sessions());
+        assert_eq!(
+            visible_ids(&app),
+            vec!["sbwin-a", "sbwin-b", "sbwin-c"],
+            "the reload re-reads disk, which never got the hide"
         );
 
         std::env::remove_var("SNAPBACK_CONFIG_DIR");
@@ -10516,12 +10718,14 @@ mod tests {
     /// family is common, and the counter must not assume otherwise.
     #[test]
     fn a_partially_hidden_lineage_still_counts_as_visible() {
+        let state = unique_temp_dir("sbpop-partial-state");
         let mut app = App::new(
             lineage_population_store(),
             Scope::Project,
             PathBuf::from("/tmp/sbpop-proj"),
         );
-        app.hidden_ids.insert("sbpop-fork-b".to_string());
+        app.set_state_dir(state.clone());
+        crate::hidden::seed_hidden(&state, &["sbpop-fork-b"]);
         app.apply_sessions(lineage_population_store());
 
         let counts = app.session_counts();
@@ -10535,7 +10739,7 @@ mod tests {
             "one member hidden leaves the conversation on the board: {counts:?}"
         );
 
-        app.hidden_ids.insert("sbpop-fork-a".to_string());
+        crate::hidden::seed_hidden(&state, &["sbpop-fork-a"]);
         app.apply_sessions(lineage_population_store());
 
         let counts = app.session_counts();
@@ -10548,6 +10752,8 @@ mod tests {
             },
             "hiding the LAST member is what moves it into the segment: {counts:?}"
         );
+
+        let _ = std::fs::remove_dir_all(&state);
     }
 
     /// A scope toggle rebuilds the population, and it is the ONLY keystroke
@@ -13504,8 +13710,10 @@ mod tests {
     /// on whichever neighbour sits where `F` would have been.
     #[test]
     fn a_filtered_out_fork_leaves_the_cursor_on_the_original() {
+        let state = unique_temp_dir("jump-hidden-fork-state");
         let mut app = jump_board();
-        app.hidden_ids.insert("F".to_string());
+        app.set_state_dir(state.clone());
+        crate::hidden::seed_hidden(&state, &["F"]);
         // `B` is newer than `A`, so it heads the list: a jump that fell back to a
         // position would land there.
         app.apply_sessions(vec![
@@ -13518,6 +13726,8 @@ mod tests {
             app.fork_jump.is_none(),
             "forgotten whether or not it jumped"
         );
+
+        let _ = std::fs::remove_dir_all(&state);
     }
 
     /// A failed fork voids its pair; another fork's pair is untouched.

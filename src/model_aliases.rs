@@ -102,7 +102,7 @@
 //! outright — *"Keep the cache IN MEMORY (derived state, not the owned state
 //! below)."* The alias list is DERIVED state, derived from the claude binary, and
 //! is the same category as the parse cache. SNAPBACK-OWNED STATE keeps the
-//! hidden-session id set as the ONLY persistent state snapback writes, and this
+//! per-session state map as the ONLY persistent state snapback writes, and this
 //! module leaves that true. One background scan per launch costs nothing, for the
 //! same reason the scan speed does not matter: nothing waits on it.
 

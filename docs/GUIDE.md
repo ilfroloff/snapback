@@ -662,11 +662,21 @@ selected row or on the whole board: press it, and a hint shows the follow-ups �
   them are hidden the prompt leads with the numbers (`3 in this lineage, 2 of
   them hidden`), so the count on the button is never more than you expected.
 
-Hiding is the only thing snapback ever writes for itself. The list of hidden
-session ids lives in its own config directory —
-`$SNAPBACK_CONFIG_DIR/state/hidden_sessions` if you set `SNAPBACK_CONFIG_DIR`,
-otherwise `~/.config/snapback/state/hidden_sessions` — never inside the Claude
-Code session store, which snapback otherwise only reads.
+Hiding is the only thing snapback ever writes for itself. It keeps a small file
+of per-session settings in its own config directory —
+`$SNAPBACK_CONFIG_DIR/state/sessions.json` if you set `SNAPBACK_CONFIG_DIR`,
+otherwise `~/.config/snapback/state/sessions.json` — never inside the Claude Code
+session store, which snapback otherwise only reads. It is plain JSON, one entry
+per session (`{"<session id>": {"hidden": true}}`), with a `sessions.json.lock`
+beside it; leave the lock file where it is.
+
+Two snapback windows can hide sessions at the same time: each hide adds only its
+own change to the file, so neither window undoes the other's, and each window
+picks up the other's hides the next time its board reloads. A `hidden_sessions`
+list left by an older snapback is still honored, and your first hide moves it
+into `sessions.json`. If a hide can't be saved — say the file was edited into
+something snapback can't read — the status line says so and snapback leaves the
+file alone; the row stays hidden only until the board next reloads.
 
 **Pick the model for one message.** In a reply box (`Ctrl-R`), a fork box
 (`Ctrl-F`) or a new-session draft (`Ctrl-N`), `Ctrl-L` opens a list of the models

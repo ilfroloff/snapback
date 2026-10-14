@@ -64,14 +64,23 @@ one place.
   [DOMAIN.md](docs/agents/DOMAIN.md#incremental-reload-storesessionstore).
   (`src/store/mod.rs`)
 - **SNAPBACK-OWNED STATE.** The ONLY persistent state `snapback` writes is the
-  hidden-session id set. It lives under `$SNAPBACK_CONFIG_DIR` (default
+  per-session state map, `sessions.json` (keyed by session id; its only field
+  today is `hidden`). It lives under `$SNAPBACK_CONFIG_DIR` (default
   `~/.config/snapback`), specifically the `state/` subdir — resolved by the
   `config` module, the SINGLE place that reads the environment for any
   snapback-owned path — NEVER inside the read-only `~/.claude/projects` store.
-  Read + write are FAIL-SOFT (a missing or unreadable file ⇒ an empty set, never
-  a panic) and the write is ATOMIC (temp file + rename). Hiding is a VISIBILITY
-  preference, not a status flag. (`src/config.rs`; `src/hidden.rs`; the persist
-  path in `src/tui/app.rs`)
+  The READ is FAIL-SOFT (a missing, unreadable or malformed file ⇒ an empty set,
+  never a panic), takes no lock, and runs at construction and on EVERY store
+  reload — never on the render path. Every WRITE is a read-modify-write of ONE
+  keystroke's DELTA under an exclusive lock, landed by an ATOMIC rename (temp
+  file + rename), and the board adopts the merged result: NEVER save the
+  in-memory set whole (two windows' snapshots overwrite each other), NEVER
+  decide a hide's direction from the re-read, and NEVER overwrite what the save
+  could not read — it fails to a status instead. Hiding is a VISIBILITY
+  preference, not a status flag. Mechanism and migration:
+  [DOMAIN.md](docs/agents/DOMAIN.md#snapback-owned-state-srchiddenrs).
+  (`src/config.rs`; `src/hidden.rs`; the persist and reload paths in
+  `src/tui/app.rs`)
 - **A MODEL IS PICKED PER COMPOSE, NEVER PER BOARD.** `--model`/`--effort` reach
   `claude` ONLY from an explicit `Ctrl-L` pick inside a compose box, and only on
   that compose's own launch: the `Ctrl-R` quick reply, the `Ctrl-F` fork box's
@@ -213,8 +222,9 @@ one place.
   construction/reload. Both are argued at the call site, and NEITHER may move
   onto a keystroke or the render path. The compose pick list's transcript
   listing and folder reads, in every compose box (once per reply or fork box /
-  per folder), and the `Ctrl-X w` picker's resolve of the ONE selected session's
-  folder are a different, keystroke-time class (bounded, never render):
+  per folder), the `Ctrl-X w` picker's resolve of the ONE selected session's
+  folder, and `Ctrl-X x`'s locked save of the state map are a different,
+  keystroke-time class (bounded, never render):
   `PATTERNS.md` §6 owns them. Work that runs on its OWN thread and reports back
   with one `AppEvent` is the rule's ordinary case, never a third exception: the
   clipboard copy (`CopyFinished` — `Ctrl-X y`'s id and a preview

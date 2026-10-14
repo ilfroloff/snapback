@@ -6286,8 +6286,10 @@ mod tests {
     /// rootless fixture is one per file.
     #[test]
     fn a_hidden_session_leaves_the_denominator_for_its_own_segment() {
+        let state = unique_temp_dir("count-segment-state");
         let mut app = counter_board(Scope::CurrentFolder);
-        app.hidden_ids.insert("sbcount-wt1".to_string());
+        app.set_state_dir(state.clone());
+        crate::hidden::seed_hidden(&state, &["sbcount-wt1"]);
         // A reload is the public path that re-runs the whole pipeline; the
         // counts must survive it without a scope toggle (see the caching case
         // below).
@@ -6308,6 +6310,8 @@ mod tests {
             3,
             "the two numbers must reconcile to the project's lineages"
         );
+
+        let _ = std::fs::remove_dir_all(&state);
     }
 
     /// With show-hidden on the rows are back on the board, so they belong INSIDE
@@ -6315,8 +6319,10 @@ mod tests {
     /// same visible rows twice.
     #[test]
     fn revealing_hidden_rows_folds_them_back_into_the_denominator() {
+        let state = unique_temp_dir("count-reveal-state");
         let mut app = counter_board(Scope::CurrentFolder);
-        app.hidden_ids.insert("sbcount-wt1".to_string());
+        app.set_state_dir(state.clone());
+        crate::hidden::seed_hidden(&state, &["sbcount-wt1"]);
         app.apply_sessions(counter_store());
         app.toggle_show_hidden();
 
@@ -6329,6 +6335,8 @@ mod tests {
             !header.contains("hidden"),
             "so disclosing it separately would double-count it: {header}"
         );
+
+        let _ = std::fs::remove_dir_all(&state);
     }
 
     /// A fork lineage is ONE conversation on BOTH sides of the `/`. Its members
@@ -6413,8 +6421,10 @@ mod tests {
                 counted_session("sbcount-fork-b", COUNTER_LAUNCH, Some("root-1")),
             ]
         };
+        let state = unique_temp_dir("count-partial-state");
         let mut app = App::new(store(), Scope::Project, PathBuf::from(COUNTER_LAUNCH));
-        app.hidden_ids.insert("sbcount-fork-b".to_string());
+        app.set_state_dir(state.clone());
+        crate::hidden::seed_hidden(&state, &["sbcount-fork-b"]);
         app.apply_sessions(store());
 
         let header = drawn_header(&app);
@@ -6426,6 +6436,8 @@ mod tests {
             !header.contains("hidden"),
             "and nothing about it is hidden from the user: {header}"
         );
+
+        let _ = std::fs::remove_dir_all(&state);
     }
 
     /// The caching guard. The population is resolved ONCE per reload/scope
@@ -6498,8 +6510,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// An isolated temp dir for the one counter case that PERSISTS a hide, so it
-    /// never touches the real state dir. Mirrors the
+    /// An isolated temp dir for the cases that keep a hidden set on disk, so they
+    /// never touch the real state dir. Mirrors the
     /// `snapback-<tag>-<pid>-<nanos>` convention used across the crate's tests.
     fn unique_temp_dir(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -18211,11 +18223,11 @@ mod tests {
     /// hiding (`App::toggle_hidden_selected` flips one session alone from a `↳` row
     /// or a row standing alone) and by a set PERSISTED while the lineage was smaller
     /// plus a later fork joining as the new head. This helper builds it the second
-    /// way: the set is seeded and the board is then rebuilt through `apply_sessions`
-    /// — the PUBLIC reload path that such a fork actually arrives on. The rebuild is
-    /// the point: a board left as `App::new` filtered it would still count the
-    /// hidden members into the head's `(+N)` marker, a board the running app cannot
-    /// draw.
+    /// way: the set is saved to the board's own pinned state dir and the board is
+    /// then rebuilt through `apply_sessions` — the PUBLIC reload path that such a
+    /// fork actually arrives on, and which re-reads that set. The rebuild is the
+    /// point: a board left as `App::new` filtered it would still count the hidden
+    /// members into the head's `(+N)` marker, a board the running app cannot draw.
     fn hidden_lineage_board(members: usize, hidden: usize) -> App {
         let ids: Vec<String> = (0..members).map(|i| format!("disc-{i:02}")).collect();
         let sessions: Vec<Session> = ids
@@ -18238,13 +18250,14 @@ mod tests {
             })
             .collect();
         let mut app = App::new(sessions.clone(), Scope::All, PathBuf::from("/tmp/launch"));
-        // `App::new` LOADS the persisted hidden set, so start from a known one —
-        // the counts below are exact, and an inherited id must not reach them.
-        app.hidden_ids.clear();
+        // A state dir of the board's own, so the counts below are exact: no id
+        // another test saved can reach them.
+        let state = unique_temp_dir(&format!("disclose-{members}-{hidden}-state"));
         // Hide from the OLD end, so the selected head stays visible: the surprising
         // shape is a board showing one row while the button counts several.
-        app.hidden_ids
-            .extend(ids.iter().rev().take(hidden).cloned());
+        let hidden_ids: Vec<&str> = ids.iter().rev().take(hidden).map(String::as_str).collect();
+        crate::hidden::seed_hidden(&state, &hidden_ids);
+        app.set_state_dir(state);
         // Re-derive `filtered`, the fold counts and the selection from that set. The
         // head survives the reload by id, so the selection lands where a startup's
         // `select_first` would leave it.

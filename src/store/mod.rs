@@ -353,7 +353,7 @@ impl Session {
 /// never keys which files exist.
 ///
 /// The cache is IN-MEMORY ONLY and is never written to disk: the one persistent
-/// thing `snapback` owns is the hidden-session id set (see [`crate::hidden`]).
+/// thing `snapback` owns is the per-session state map (see [`crate::hidden`]).
 pub struct SessionStore {
     /// The store root every reload discovers from. Owned rather than passed per
     /// call because the cache below is keyed by paths under it, so a cache and

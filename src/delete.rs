@@ -24,6 +24,7 @@
 use std::collections::HashSet;
 
 use crate::agents::{self, AgentActivity, ReportedAgent};
+use crate::hidden::HideDelta;
 use crate::store::Session;
 
 /// User-facing refusal returned by [`can_delete`] when claude reports the target
@@ -300,10 +301,10 @@ pub(crate) fn status_for_delete(
     Some(status)
 }
 
-/// Flip the hidden state of a whole GROUP of session ids together, pivoting on
-/// `pivot`'s current membership: when `pivot` is currently visible, HIDE every id
-/// in `members`; when it is already hidden, EXPOSE them all. Returns the NEW hidden
-/// state (`true` = now hidden).
+/// Decide how one hide keystroke flips a whole GROUP of session ids together,
+/// pivoting on `pivot`'s current membership: when `pivot` is currently visible,
+/// HIDE every id in `members`; when it is already hidden, EXPOSE them all. Returns
+/// that change as a [`HideDelta`] (`hidden` is the NEW state) without applying it.
 ///
 /// The caller picks the group by what the board shows: from a row that visibly
 /// stands for others (a folded `(+N)` head, or an expanded head with `↳` rows) it
@@ -318,16 +319,15 @@ pub(crate) fn status_for_delete(
 /// for, one hidden on its own included. The caller owns the side effects —
 /// persist via `hidden::save_hidden` and re-filter — keeping this decision pure
 /// and trivially testable.
-pub fn toggle_hidden(set: &mut HashSet<String>, members: &[String], pivot: &str) -> bool {
-    let hide = !set.contains(pivot);
-    for id in members {
-        if hide {
-            set.insert(id.clone());
-        } else {
-            set.remove(id);
-        }
+///
+/// `set` is what the CALLER'S board shows, never a fresh read of disk: the
+/// direction must match the row the user pressed on, even when another window
+/// has already saved that row's other state.
+pub fn toggle_hidden(set: &HashSet<String>, members: &[String], pivot: &str) -> HideDelta {
+    HideDelta {
+        ids: members.to_vec(),
+        hidden: !set.contains(pivot),
     }
-    hide
 }
 
 /// Thin, impure HARD-delete driver: unlink the session's `<id>.jsonl` transcript
@@ -798,6 +798,13 @@ mod tests {
 
     // --- toggle_hidden (Task 2.2) -----------------------------------------
 
+    /// Apply [`toggle_hidden`]'s delta to `set` and return the new hidden state.
+    fn toggle_in_place(set: &mut HashSet<String>, members: &[String], pivot: &str) -> bool {
+        let delta = toggle_hidden(set, members, pivot);
+        delta.apply_to(set);
+        delta.hidden
+    }
+
     #[test]
     fn toggle_hidden_flips_a_whole_group_pivoting_on_the_selected_id() {
         let mut ids: HashSet<String> = HashSet::new();
@@ -805,7 +812,7 @@ mod tests {
 
         // Pivot s1 is visible → the first toggle hides the WHOLE lineage.
         assert!(
-            toggle_hidden(&mut ids, &members, "s1"),
+            toggle_in_place(&mut ids, &members, "s1"),
             "hiding a visible pivot reports the new state as hidden = true"
         );
         assert!(
@@ -815,7 +822,7 @@ mod tests {
 
         // Pivot s1 is now hidden → the second toggle exposes the whole lineage.
         assert!(
-            !toggle_hidden(&mut ids, &members, "s1"),
+            !toggle_in_place(&mut ids, &members, "s1"),
             "exposing a hidden pivot reports the new state as hidden = false"
         );
         assert!(
@@ -825,17 +832,39 @@ mod tests {
 
         // A singleton (members = [pivot]) still round-trips.
         let solo = vec!["only".to_string()];
-        assert!(toggle_hidden(&mut ids, &solo, "only"));
+        assert!(toggle_in_place(&mut ids, &solo, "only"));
         assert!(ids.contains("only"));
-        assert!(!toggle_hidden(&mut ids, &solo, "only"));
+        assert!(!toggle_in_place(&mut ids, &solo, "only"));
         assert!(!ids.contains("only"));
 
         // A PARTIALLY-hidden group resolves uniformly to the pivot's opposite:
         // s2 pre-hidden, visible pivot s1 → hide all (both end hidden).
         let mut mixed: HashSet<String> = HashSet::from(["s2".to_string()]);
         let group = vec!["s1".to_string(), "s2".to_string()];
-        assert!(toggle_hidden(&mut mixed, &group, "s1"));
+        assert!(toggle_in_place(&mut mixed, &group, "s1"));
         assert!(mixed.contains("s1") && mixed.contains("s2"));
+    }
+
+    #[test]
+    fn toggle_hidden_hands_back_the_whole_group_and_the_pivots_opposite() {
+        let set: HashSet<String> = HashSet::from(["s2".to_string()]);
+        let members = vec!["s1".to_string(), "s2".to_string()];
+        assert_eq!(
+            toggle_hidden(&set, &members, "s1"),
+            HideDelta {
+                ids: members.clone(),
+                hidden: true,
+            },
+            "a visible pivot hides every member it is handed"
+        );
+        assert_eq!(
+            toggle_hidden(&set, &members, "s2"),
+            HideDelta {
+                ids: members,
+                hidden: false,
+            },
+            "a hidden pivot exposes every member it is handed"
+        );
     }
 
     // --- remove (Tasks 2.3 + 2.4) -----------------------------------------
