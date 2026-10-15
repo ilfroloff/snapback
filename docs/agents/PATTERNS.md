@@ -346,12 +346,18 @@ one line are normal, and marks are a **union** (overlapping or abutting runs mer
 into one span, never two).
 
 The compose pick list is a further CONSUMER of those seams, not a third rule.
-`tui::complete` compiles its token with `SearchIndex::new` + `set_query` and asks
+`tui::complete` splits its whitespace-free token into parts by its own rule and
+compiles them with `SearchIndex::new` + `set_atoms` (DOMAIN.md owns the rule:
+[How the letters narrow the list](DOMAIN.md#how-the-letters-narrow-the-list)).
+`set_atoms` takes each part LITERALLY, and that is load-bearing: joining the
+parts with spaces for `set_query` would hand them to `gate_atoms`, whose `\ `
+escape turns a token like `foo\-bar` into the one phrase `foo bar`. It then asks
 `admits` — the filter's own membership predicate, the very gate `match_indices`
-runs — of a candidate's name and then its description. Its tier comes from the
-per-atom seam, because "does the name START with it" is a positional question: a
-name-start hit is an `atom_match_positions` run at char 0. The token is
-whitespace-free, so it is ONE atom, and on one atom the two rules coincide.
+runs — of a candidate's name and then its description, and marks the row with
+`match_indices` itself, the row-label rule, since a pick-list row is one string
+like a board label. Its tier comes from the per-atom seam, because "does the
+name START with it" is a positional question: a name-start hit is an
+`atom_match_positions` run at char 0, from whichever part.
 
 Sharing the finders is only half of asking the same question. The other half is
 the **fold**: every lowercased string the module searches — the filter's
@@ -390,9 +396,11 @@ Two invariants are easy to break and expensive to get wrong:
   lowercased one the case-insensitive branch. Neither is dead; deleting the cased
   one breaks every uppercase query.
 
-`gate_atoms` is the ONE splitter: the filter, `admits` (and through it the
-compose pick list), the row-label highlight and the preview marks all take the
-same atoms from it — never re-split a query somewhere else.
+`gate_atoms` is the ONE splitter of the search box's query: the filter, the
+row-label highlight and the preview marks all take the same atoms from it —
+never re-split that query somewhere else. The compose pick list's token is a
+different query, split by `tui::complete`'s own rule and handed in through
+`set_atoms`, which splits nothing; it never reaches the board's surfaces.
 
 `last_atom_start` is the ONE exception, and it proves the rule rather than
 bending it. The word-delete keys need a BOUNDARY (the byte index one press
@@ -1110,7 +1118,9 @@ a top-level `@`, never for `/` or a background draft, and not at all once the
 folder's catalog has landed) and a
 folder walk (`complete::list_tree`, once per resolved folder, capped by
 `COMPLETION_MAX_DIR_ENTRIES` per folder and
-`COMPLETION_MAX_TREE_ENTRIES` in all, at any depth, in every compose box). They run from
+`COMPLETION_MAX_TREE_ENTRIES` in all, at any depth, in every compose box; an `@`
+root fallback re-filters the compose folder's own walk, the same cached entry a
+top-level `@` fills, so it adds no folder of its own). They run from
 `compose::refresh_completion`, called by the key and paste handlers and by
 `update::dispatch`'s `CatalogFetched` arm — which reads nothing new in practice,
 since every read is keyed to a token a key handler already resolved — and NEVER
@@ -1145,7 +1155,9 @@ hand-rolled and self-contained — no external markdown crate.
 
 **A mark laid OVER existing style is a `Modifier`, never a color.** The two
 search-match highlights are the pair to compare: a list row's label is plain text
-the view owns, so it takes a color plus BOLD, whereas a preview line arrives
+the view owns, so it takes a color plus BOLD (`view::MATCH_HIGHLIGHT_STYLE`, which
+a compose pick-list row's name and its `DIM` description — the view's own, whose
+dim the mark lifts — take too), whereas a preview line arrives
 already styled by `store::preview`, so `view::PREVIEW_MATCH_MODIFIER`
 (`REVERSED`) is COMPOSED onto whatever style it lands on. A foreground color
 there would erase the line's own meaning — and on the wrong terminal theme, the
@@ -1160,9 +1172,10 @@ enclosing run (`base.patch(link_style())`) so a bold, italic, or quoted run's
 modifiers survive on the label. The color is the NAMED bright blue — the
 conventional link hue, readable on a dark theme where ANSI `Blue` often is not —
 never an RGB value; the italic underline echoes how terminals such as JetBrains'
-mark a url they auto-detect. Nothing else in the preview pane is `LightBlue`
-(the list's search-match highlight shares the hue, but in the other pane and
-BOLD), and its color and italic are what tell a link from an H1, which is
+mark a url they auto-detect. Nothing else the preview pane draws is `LightBlue`
+(the search-match highlight shares the hue, but BOLD and never italic, on the
+list's rows and on a compose pick list drawn over the pane), and its color and
+italic are what tell a link from an H1, which is
 underlined too. A link inside a DIM run (a blockquote) keeps that DIM and draws
 a fainter blue — an accepted trade.
 
@@ -1329,7 +1342,9 @@ spellings and locations it refuses a worktree pointer into, `UNC_PREFIX`,
 `FIRMLINK_PREFIX` and `MOUNT_NAME_FORMAT_CHARS`; `store::skills`'
 `AGENT_LISTING_MARKER` and the line shapes `LISTING_LINE_PREFIX`,
 `NAME_DESCRIPTION_SEPARATOR` and `AGENT_TOOLS_SUFFIX`;
-`tui::complete`'s `AGENT_MENTION_PREFIX` / `AGENT_LABEL_SUFFIX`), the raw control bytes the
+`tui::complete`'s `AGENT_MENTION_PREFIX` / `AGENT_LABEL_SUFFIX` /
+`COMMAND_LABEL_PREFIX`, and its token splitters `QUERY_PART_SEPARATORS` and
+`ROOT_FALLBACK_SEPARATORS`, the second built from the first), the raw control bytes the
 terminal seams write because crossterm publishes no typed command for them
 (`tui`'s `CAN` / `ST` / `KITTY_DISABLE_KEYBOARD` / `DECSTR` / `DECCKM_OFF`, and
 `tui::clipboard`'s OSC 52 wire bytes `OSC_INTRODUCER` / `OSC52_COMMAND` /

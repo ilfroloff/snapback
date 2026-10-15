@@ -4728,6 +4728,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A path typed from memory (`@modules/site-stor`) names no folder, so the
+    /// list falls back to the folder's whole walk with `/` splitting parts too, and
+    /// a pick REPLACES the whole query with the full path. A fallback folder pick
+    /// gets no space and reopens the list on that real folder.
+    #[test]
+    fn an_at_root_fallback_pick_replaces_the_whole_query() {
+        let (mut app, dir) = completion_app(&[]);
+        let sitemaps = dir.join("src/modules/sitemaps");
+        std::fs::create_dir_all(&sitemaps).expect("create src/modules/sitemaps");
+        for file in ["sitemaps-storage.service.ts", "sitemaps.controller.ts"] {
+            std::fs::write(sitemaps.join(file), "s").expect("write a sitemaps file");
+        }
+        type_into_draft(&mut app, "see @modules/site-stor");
+        assert_eq!(
+            list_rows(&app),
+            rows(&[("src/modules/sitemaps/sitemaps-storage.service.ts", None)])
+        );
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            draft_text(&app),
+            "see @src/modules/sitemaps/sitemaps-storage.service.ts "
+        );
+
+        type_into_draft(&mut app, "@sitemaps/");
+        assert_eq!(
+            list_rows(&app),
+            rows(&[
+                ("src/modules/sitemaps/", None),
+                ("src/modules/sitemaps/sitemaps-storage.service.ts", None),
+                ("src/modules/sitemaps/sitemaps.controller.ts", None),
+            ])
+        );
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            draft_text(&app),
+            "see @src/modules/sitemaps/sitemaps-storage.service.ts @src/modules/sitemaps/",
+            "a folder gets no space"
+        );
+        assert_eq!(
+            list_rows(&app),
+            rows(&[
+                ("sitemaps-storage.service.ts", None),
+                ("sitemaps.controller.ts", None),
+            ]),
+            "the list reopens on the real folder through the folder step"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 3.8(f): after `Esc` the same token stays closed; deleting the trigger and
     /// retyping it reopens.
     #[test]

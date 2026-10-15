@@ -2,16 +2,22 @@
 //! reply, the `Ctrl-F` fork and the `Ctrl-N` background draft): which token the
 //! caret is in, which candidates match it, and what accepting one writes. `/`
 //! offers skills and commands; `@` offers files and folders and, for a top-level
-//! token, agents.
+//! token, agents. An `@` holding a `/` lists the folder it names first (the
+//! FOLDER STEP) and falls back to the compose folder's whole walk only when that
+//! finds nothing ([`at_list`]).
 //! Each candidate carries its source's description, if any.
 //!
 //! Candidates are matched by the board's ONE matcher
 //! ([`SearchIndex::admits`]), asked of a candidate's name and then its
-//! description, and what matches is ordered by [`Placement`] — the pick list's
-//! own order, never the board's. `memchr` and `nucleo` stay in `search.rs`
-//! (AGENTS.md MATCHER ISOLATION). A pure core plus one thin impure `read_dir`
-//! walker ([`list_tree`]); the caller decides WHEN to read (once per folder,
-//! from the key handler, never the render path).
+//! description, with the token split into parts on [`QUERY_PART_SEPARATORS`]
+//! ([`query_parts`]) — on [`ROOT_FALLBACK_SEPARATORS`], `/` included, for that
+//! `@` fallback alone — each part one atom. What matches is ordered by
+//! [`Placement`] — the pick list's own order, never the board's — and carries
+//! the marks the board's row-label rule draws ([`Candidate::label_marks`]).
+//! `memchr` and `nucleo` stay in `search.rs` (AGENTS.md MATCHER ISOLATION). A
+//! pure core plus one thin impure `read_dir` walker ([`list_tree`]); the caller
+//! decides WHEN to read (once per folder, from the key handler, never the render
+//! path).
 //!
 //! Every column is a CHARACTER column (what `TextArea::cursor` reports), never
 //! a byte offset, so multi-byte text before the caret cannot mis-cut a token.
@@ -84,6 +90,33 @@ pub const AGENT_MENTION_PREFIX: &str = "agent-";
 /// title: claude 2.1.284's own typeahead labels an agent `<name> (agent)`.
 pub const AGENT_LABEL_SUFFIX: &str = " (agent)";
 
+/// Put before a command's name in its label, `/name`, as claude's own `/` menu
+/// shows it.
+const COMMAND_LABEL_PREFIX: &str = "/";
+
+/// The characters a pick-list token is split into parts on, each part matched as
+/// its own atom: every part must occur, in any order. They are the word
+/// separators of the names the list offers — file names
+/// (`sitemaps-storage.service.ts`, `test_page.py`), skill, command and agent
+/// names (`cr-review`) — so `@site-stor` finds `sitemaps-storage.service.ts`.
+/// Whitespace is not one, because it ends the token ([`completion_context`]);
+/// nor is `/`, which is the `@` folder step ([`split_path_query`]) everywhere but
+/// the root fallback ([`ROOT_FALLBACK_SEPARATORS`]). The board's own search box
+/// does not split on these: whitespace is its only separator.
+const QUERY_PART_SEPARATORS: [char; 3] = ['-', '_', '.'];
+
+/// [`QUERY_PART_SEPARATORS`] plus `/`, for the `@` ROOT FALLBACK alone
+/// ([`at_list`]). A query whose folder step found nothing is a path typed from
+/// memory rather than a real folder, so its folder names are parts too:
+/// `@modules/site-stor` is `modules`, `site` and `stor`. Kept out of the folder
+/// step, where `/` resolves a real folder (`@/etc/ho`, `@../x/`, the
+/// folder-by-folder walk). Built FROM the base set, so the two cannot drift: a
+/// base separator added there fails to compile here until this is updated too.
+const ROOT_FALLBACK_SEPARATORS: [char; 4] = {
+    let [dash, underscore, dot] = QUERY_PART_SEPARATORS;
+    [dash, underscore, dot, '/']
+};
+
 /// The non-alphanumeric characters claude 2.1.284's mention parser accepts in an
 /// agent name: its class `[\w:.@-]`, where `\w` is ASCII `[A-Za-z0-9_]` (read
 /// from the 2.1.284 binary, 2026-09-30). See [`is_mention_safe`].
@@ -111,13 +144,22 @@ pub struct Context {
 }
 
 /// One pick-list row: what it shows versus what replaces the query.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Candidate {
     pub label: String,
     pub insert: String,
     /// What the listing says a command or agent does; `None` for a file or
     /// folder, and for an entry its source gave no description.
     pub description: Option<String>,
+    /// The CHAR positions of `label` the query matched, ascending, under the
+    /// board's ROW-LABEL rule ([`SearchIndex::match_indices`]) asked of the name or
+    /// path alone, so the label's decoration — a command's `/`, an agent's
+    /// [`AGENT_LABEL_SUFFIX`], a folder's trailing `/` — is never marked. Set when
+    /// the list is filtered, so drawing it matches nothing.
+    pub label_marks: Vec<usize>,
+    /// The same, in `description`, for a candidate the query matched by its
+    /// description alone; empty for every other.
+    pub description_marks: Vec<usize>,
 }
 
 /// One folder entry, as read by [`list_tree`]. `name` is a path relative to the
@@ -167,27 +209,69 @@ pub fn completion_context(lines: &[String], cursor: (usize, usize)) -> Option<Co
 enum Placement {
     NameStart,
     InName,
-    /// A path entry whose folder components hold the query but whose own name
-    /// does not (`src/store/discover.rs` for `store`). Only [`select_entries`]
-    /// produces it.
+    /// A path entry whose own name does not hold every part but whose path does
+    /// (`src/store/discover.rs` for `store`, `store/mod.rs` for `store-mod`).
+    /// Only [`select_paths`] (an `@` path, either step) produces it.
     InPath,
     InDescription,
 }
 
-/// The board's own matcher, compiled for one pick-list token. The token holds no
-/// whitespace ([`completion_context`] ends it there), so it is exactly ONE atom,
-/// under the board's per-atom smart case.
-fn matcher(query: &str) -> SearchIndex {
+/// The board's own matcher, compiled for one pick-list token: each of its
+/// [`query_parts`] on `separators` is one atom, under the board's per-atom smart
+/// case. The parts go in through [`SearchIndex::set_atoms`], never as a
+/// space-joined query, so a backslash in the token stays a literal char and never
+/// escapes a space.
+fn matcher(query: &str, separators: &[char]) -> SearchIndex {
     let mut matcher = SearchIndex::new();
-    matcher.set_query(query);
+    matcher.set_atoms(&query_parts(query, separators));
     matcher
 }
 
-/// Where `matcher`'s query lands in a candidate: its `name`, else its
-/// `description`, else `None`. Asked of the NAME, never the row's label (`/name`,
-/// `<name> (agent)`), so the decoration can never match. An empty query admits
-/// every name and marks nothing, so every candidate lands in ONE tier and keeps
-/// its source order.
+/// The parts `query` is matched by: split on `separators` ([`QUERY_PART_SEPARATORS`],
+/// or [`ROOT_FALLBACK_SEPARATORS`] for the `@` root fallback), empty parts dropped
+/// (`site--stor`, a `site-` still being typed). A LEADING `.` stays on the first
+/// part, so `.env` is the one part `.env` and a dot-name is still matched by its
+/// dot: `@.env` lists `.env` as a name-start hit and never `env.example`. A token
+/// of separators alone (`-`, `__`) has no part, so it is ONE part, matched whole:
+/// no parts is the EMPTY query, which would admit every entry of the walk at
+/// every depth.
+fn query_parts<'q>(query: &'q str, separators: &[char]) -> Vec<&'q str> {
+    // `.` is one byte, so `lead` is a char boundary.
+    let lead = usize::from(query.starts_with('.'));
+    let mut pieces = query[lead..].split(separators);
+    // The first piece starts right after the leading dot, so widening it back to
+    // byte 0 puts the dot on it.
+    let first = pieces.next().map(|piece| &query[..lead + piece.len()]);
+    let parts: Vec<&str> = first
+        .into_iter()
+        .chain(pieces)
+        .filter(|part| !part.is_empty())
+        .collect();
+    if parts.is_empty() && !query.is_empty() {
+        vec![query]
+    } else {
+        parts
+    }
+}
+
+/// What `matcher` marks in `text` under the board's ROW-LABEL rule
+/// ([`SearchIndex::match_indices`]: every part in `text`, then every occurrence of
+/// each), each CHAR position moved `offset` chars right — past the decoration a
+/// label draws before `text`.
+fn marks_in(matcher: &SearchIndex, text: &str, offset: usize) -> Vec<usize> {
+    matcher
+        .match_indices(text)
+        .into_iter()
+        .map(|pos| pos as usize + offset)
+        .collect()
+}
+
+/// Where `matcher`'s query lands in a candidate: its `name` (every part in it),
+/// else its `description`, else `None`. The name STARTS with the query when any
+/// part's hit covers its first char, whichever part that is. Asked of the NAME,
+/// never the row's label (`/name`, `<name> (agent)`), so the decoration can never
+/// match. An empty query admits every name and marks nothing, so every candidate
+/// lands in ONE tier and keeps its source order.
 fn placement(matcher: &SearchIndex, name: &str, description: Option<&str>) -> Option<Placement> {
     if matcher.admits(name) {
         Some(if matcher.atom_match_positions(name).first() == Some(&0) {
@@ -204,40 +288,68 @@ fn placement(matcher: &SearchIndex, name: &str, description: Option<&str>) -> Op
 
 /// [`placement`] of a path entry: judged on its own name (the last component)
 /// first, so a name that starts with the query outranks one that merely holds it,
-/// and a hit only in a folder component ranks last.
+/// and a path that needs a folder component for some part ranks last.
 fn path_placement(matcher: &SearchIndex, rel: &str) -> Option<Placement> {
     let base = rel.rsplit('/').next().unwrap_or(rel);
     placement(matcher, base, None).or_else(|| matcher.admits(rel).then_some(Placement::InPath))
 }
 
-/// The listing entries `query` matches, ordered by [`Placement`]. The sort is
-/// stable, which is what keeps the caller's order within a tier.
+/// The listing entries `matcher` admits, each with where it landed, ordered by
+/// [`Placement`]. The sort is stable, which is what keeps the caller's order
+/// within a tier.
 fn select_listed<'a>(
+    matcher: &SearchIndex,
     entries: impl IntoIterator<Item = &'a ListingEntry>,
-    query: &str,
-) -> Vec<&'a ListingEntry> {
-    let matcher = matcher(query);
+) -> Vec<(Placement, &'a ListingEntry)> {
     let mut picked: Vec<(Placement, &ListingEntry)> = entries
         .into_iter()
-        .filter_map(|e| placement(&matcher, &e.name, e.description.as_deref()).map(|p| (p, e)))
+        .filter_map(|e| placement(matcher, &e.name, e.description.as_deref()).map(|p| (p, e)))
         .collect();
     picked.sort_by_key(|(placement, _)| *placement);
-    picked.into_iter().map(|(_, e)| e).collect()
+    picked
 }
 
-/// Commands (skills included) whose name holds `query` anywhere, or else whose
-/// description does, matched like the board's search box (an uppercase letter
-/// matches exactly). A name that starts with it lists first, then a name that
-/// holds it elsewhere, then a description hit, each tier in the given order.
-/// `label` is `/name`; `insert` is the bare name (the space is
+/// The row of a listing entry that landed at `placement`: its name between
+/// `prefix` and `suffix`, its description, and the marks of whichever of the two
+/// the query matched — the name's, moved past `prefix`, or for a description-only
+/// hit the description's.
+fn listed_candidate(
+    matcher: &SearchIndex,
+    (placement, entry): (Placement, &ListingEntry),
+    (prefix, suffix): (&str, &str),
+    insert: String,
+) -> Candidate {
+    let (label_marks, description_marks) = match (placement, entry.description.as_deref()) {
+        (Placement::InDescription, Some(description)) => {
+            (Vec::new(), marks_in(matcher, description, 0))
+        }
+        _ => (
+            marks_in(matcher, &entry.name, prefix.chars().count()),
+            Vec::new(),
+        ),
+    };
+    Candidate {
+        label: format!("{prefix}{}{suffix}", entry.name),
+        insert,
+        description: entry.description.clone(),
+        label_marks,
+        description_marks,
+    }
+}
+
+/// Commands (skills included) whose name holds every part of `query` anywhere,
+/// or else whose description does, matched like the board's search box (an
+/// uppercase letter matches exactly). A name that starts with a part lists first,
+/// then a name that holds them elsewhere, then a description hit, each tier in
+/// the given order. `label` is `/name`; `insert` is the bare name (the space is
 /// [`replacement`]'s); `description` is the entry's.
 pub fn filter_commands(entries: &[ListingEntry], query: &str) -> Vec<Candidate> {
-    select_listed(entries, query)
+    let matcher = matcher(query, &QUERY_PART_SEPARATORS);
+    select_listed(&matcher, entries)
         .into_iter()
-        .map(|e| Candidate {
-            label: format!("/{}", e.name),
-            insert: e.name.clone(),
-            description: e.description.clone(),
+        .map(|picked| {
+            let insert = picked.1.name.clone();
+            listed_candidate(&matcher, picked, (COMMAND_LABEL_PREFIX, ""), insert)
         })
         .collect()
 }
@@ -256,21 +368,22 @@ pub fn is_mention_safe(name: &str) -> bool {
 /// Agents matched and ordered as [`filter_commands`] matches commands — by name
 /// anywhere, then by description — skipping every name that is not
 /// [`is_mention_safe`]. A query that already starts with [`AGENT_MENTION_PREFIX`]
-/// (typed in any case) is matched by what follows it; any other query by itself,
-/// against the name and description and never the label — so `@a` lists only
-/// the agents that hold an `a` there, never every agent through the prefix or
-/// [`AGENT_LABEL_SUFFIX`]. `label` is the name plus [`AGENT_LABEL_SUFFIX`];
-/// `insert` is [`AGENT_MENTION_PREFIX`] plus the name.
+/// (typed in any case) is matched by what follows it, stripped BEFORE the query
+/// is split into parts; any other query by itself, against the name and
+/// description and never the label — so `@a` lists only the agents that hold an
+/// `a` there, never every agent through the prefix or [`AGENT_LABEL_SUFFIX`].
+/// `label` is the name plus [`AGENT_LABEL_SUFFIX`]; `insert` is
+/// [`AGENT_MENTION_PREFIX`] plus the name.
 pub fn select_agents(entries: &[ListingEntry], query: &str) -> Vec<Candidate> {
+    let matcher = matcher(strip_mention_prefix(query), &QUERY_PART_SEPARATORS);
     select_listed(
+        &matcher,
         entries.iter().filter(|e| is_mention_safe(&e.name)),
-        strip_mention_prefix(query),
     )
     .into_iter()
-    .map(|e| Candidate {
-        label: format!("{}{AGENT_LABEL_SUFFIX}", e.name),
-        insert: format!("{AGENT_MENTION_PREFIX}{}", e.name),
-        description: e.description.clone(),
+    .map(|picked| {
+        let insert = format!("{AGENT_MENTION_PREFIX}{}", picked.1.name);
+        listed_candidate(&matcher, picked, ("", AGENT_LABEL_SUFFIX), insert)
     })
     .collect()
 }
@@ -287,11 +400,12 @@ fn strip_mention_prefix(query: &str) -> &str {
     }
 }
 
-/// Every `@` candidate for `query`: the entries of the folder its `dir_part`
-/// names (`dir_entries`, read by the caller) that its leaf matches, in
+/// The FOLDER STEP's `@` candidates for `query`: the entries of the folder its
+/// `dir_part` names (`dir_entries`, read by the caller) that its leaf matches, in
 /// [`select_entries`]' order, followed, ONLY for a top-level token (no
 /// `dir_part`), by the matching [`select_agents`] — entries above agents
 /// whatever their tiers. An agent is not a path, so `@src/…` never lists one.
+/// [`at_list`] decides whether these rows are the list.
 pub fn at_candidates(
     dir_entries: &[DirEntryInfo],
     agents: &[ListingEntry],
@@ -305,6 +419,44 @@ pub fn at_candidates(
     candidates
 }
 
+/// An `@` pick list: its rows, and the folder part [`replacement`] writes before
+/// each pick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtList {
+    pub candidates: Vec<Candidate>,
+    /// The query's own `dir_part` ([`split_path_query`]) for the folder step;
+    /// EMPTY for the root fallback, whose rows are full paths from the compose
+    /// folder and so replace the WHOLE query.
+    pub dir_part: String,
+}
+
+/// The `@` list for `query`, given `folder_hits`, the FOLDER STEP's rows
+/// ([`at_candidates`] over the folder the query's `dir_part` names). Those rows
+/// ARE the list when there are any, or when the query holds no `/`. Otherwise —
+/// the folder is missing, empty or unreadable, or nothing in it matched — it is
+/// the ROOT FALLBACK: the compose folder's own walk, which `root` reads only then,
+/// matched by the WHOLE query split on [`ROOT_FALLBACK_SEPARATORS`] under
+/// [`select_entries`]' gates and order, and inserted with an empty `dir_part`. It
+/// never lists an agent: a query holding `/` is a path.
+pub fn at_list<'r>(
+    query: &str,
+    folder_hits: Vec<Candidate>,
+    root: impl FnOnce() -> &'r [DirEntryInfo],
+) -> AtList {
+    let (dir_part, _) = split_path_query(query);
+    if folder_hits.is_empty() && !dir_part.is_empty() {
+        AtList {
+            candidates: select_paths(root(), query, &ROOT_FALLBACK_SEPARATORS),
+            dir_part: String::new(),
+        }
+    } else {
+        AtList {
+            candidates: folder_hits,
+            dir_part: dir_part.to_owned(),
+        }
+    }
+}
+
 /// Split an `@` query after its LAST `/` into `(dir_part, leaf)`:
 /// `"src/tu"` -> `("src/", "tu")`, `"README"` -> `("", "README")`.
 pub fn split_path_query(query: &str) -> (&str, &str) {
@@ -314,21 +466,29 @@ pub fn split_path_query(query: &str) -> (&str, &str) {
     }
 }
 
-/// Entries whose path holds `leaf` anywhere (an uppercase letter matches
-/// exactly, as in the board's search box): its own name or any folder above it, so
-/// `disc` finds `store/discover.rs`. An empty `leaf` lists only the folder's direct
-/// children, keeping the list a folder-by-folder walk. A dot-name (any component
-/// starting with `.`) shows only when `leaf` itself starts with `.`, a visibility
-/// gate applied before matching. Ordered by [`path_placement`] (own name starts
-/// with `leaf`, then holds it, then folder components hold it), then folders
-/// before files, then by path. Paths are inserted VERBATIM; folders carry a
-/// trailing `/`.
+/// Entries whose path holds every part of `leaf` anywhere (an uppercase letter
+/// matches exactly, as in the board's search box): its own name or any folder
+/// above it, so `disc` finds `store/discover.rs`. An empty `leaf` lists only the
+/// folder's direct children, keeping the list a folder-by-folder walk. A dot-name
+/// (any component starting with `.`) shows only when `leaf` itself starts with
+/// `.`, a visibility gate applied before matching. Both gates read the raw `leaf`,
+/// never its parts. Ordered by [`path_placement`] (own name starts with a part,
+/// then holds them, then folder components do), then folders before files, then
+/// by path. Paths are inserted VERBATIM; folders carry a trailing `/`, which is
+/// never marked.
 pub fn select_entries(entries: &[DirEntryInfo], leaf: &str) -> Vec<Candidate> {
-    let matcher = matcher(leaf);
-    let show_hidden = leaf.starts_with('.');
+    select_paths(entries, leaf, &QUERY_PART_SEPARATORS)
+}
+
+/// [`select_entries`] with `query` split into parts on `separators`: the folder
+/// step's leaf on [`QUERY_PART_SEPARATORS`], the root fallback's WHOLE query on
+/// [`ROOT_FALLBACK_SEPARATORS`]. Both gates read the raw `query`.
+fn select_paths(entries: &[DirEntryInfo], query: &str, separators: &[char]) -> Vec<Candidate> {
+    let matcher = matcher(query, separators);
+    let show_hidden = query.starts_with('.');
     let mut picked: Vec<(Placement, &DirEntryInfo)> = entries
         .iter()
-        .filter(|e| !leaf.is_empty() || !e.name.contains('/'))
+        .filter(|e| !query.is_empty() || !e.name.contains('/'))
         .filter(|e| show_hidden || !e.name.split('/').any(|c| c.starts_with('.')))
         .filter_map(|e| path_placement(&matcher, &e.name).map(|p| (p, e)))
         .collect();
@@ -348,7 +508,8 @@ pub fn select_entries(entries: &[DirEntryInfo], leaf: &str) -> Vec<Candidate> {
             Candidate {
                 label: text.clone(),
                 insert: text,
-                description: None,
+                label_marks: marks_in(&matcher, &e.name, 0),
+                ..Candidate::default()
             }
         })
         .collect()
@@ -450,7 +611,7 @@ mod tests {
         Candidate {
             label: s.to_owned(),
             insert: s.to_owned(),
-            description: None,
+            ..Candidate::default()
         }
     }
 
@@ -545,6 +706,8 @@ mod tests {
                 label: "/Handoff".into(),
                 insert: "Handoff".into(),
                 description: None,
+                label_marks: vec![1],
+                description_marks: Vec::new(),
             }
         );
         assert_eq!(filter_commands(&names, "").len(), 3);
@@ -589,6 +752,8 @@ mod tests {
                 label: "sby-agent (agent)".into(),
                 insert: "agent-sby-agent".into(),
                 description: Some("Pings back".into()),
+                label_marks: vec![0, 1],
+                description_marks: Vec::new(),
             }]
         );
     }
@@ -1079,5 +1244,500 @@ mod tests {
             ]
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- a token matched by its parts ---------------------------------------
+
+    /// The reported shape: a NestJS-style module tree.
+    fn sitemaps_tree() -> Vec<DirEntryInfo> {
+        vec![
+            entry("src", true),
+            entry("src/modules", true),
+            entry("src/modules/sitemaps", true),
+            entry("src/modules/sitemaps/sitemaps-storage.service.ts", false),
+            entry("src/modules/sitemaps/sitemaps.controller.ts", false),
+            entry("src/modules/storage", true),
+            entry("src/modules/storage/site-settings.ts", false),
+        ]
+    }
+
+    /// `@site-stor` is two parts, each a substring of the path, in either order;
+    /// the file whose own name holds both lists first, then a path that holds them
+    /// across a folder and a name.
+    #[test]
+    fn a_token_matches_by_its_parts_in_any_order() {
+        let tree = sitemaps_tree();
+        let expected = vec![
+            "src/modules/sitemaps/sitemaps-storage.service.ts",
+            "src/modules/storage/site-settings.ts",
+        ];
+        assert_eq!(inserts(&at_candidates(&tree, &[], "site-stor")), expected);
+        assert_eq!(
+            inserts(&at_candidates(&tree, &[], "stor-site")),
+            expected,
+            "part order does not matter"
+        );
+        assert_eq!(
+            inserts(&at_candidates(&tree, &[], "sitemaps-storage")),
+            vec!["src/modules/sitemaps/sitemaps-storage.service.ts"],
+            "the full name typed still matches"
+        );
+    }
+
+    /// Substring per part, never fuzzy: a misspelt part finds nothing.
+    #[test]
+    fn a_misspelt_part_finds_nothing() {
+        assert_eq!(
+            inserts(&at_candidates(&sitemaps_tree(), &[], "site-stro")),
+            Vec::<&str>::new()
+        );
+    }
+
+    #[test]
+    fn underscore_and_dot_split_a_token_too() {
+        let e = vec![
+            entry("src/sitemaps-storage.service.ts", false),
+            entry("tests/test_page_heading.py", false),
+            entry("README.md", false),
+        ];
+        assert_eq!(
+            inserts(&select_entries(&e, "stor.ts")),
+            vec!["src/sitemaps-storage.service.ts"]
+        );
+        assert_eq!(
+            inserts(&select_entries(&e, "head_test")),
+            vec!["tests/test_page_heading.py"]
+        );
+    }
+
+    /// A LEADING `.` belongs to the first part, so `@.env` still matches `.env`
+    /// by its dot (never `env.example` or `venv/` by a bare `env`), lists it as a
+    /// name-start hit, and keeps the dot-name gate.
+    #[test]
+    fn a_leading_dot_stays_part_of_the_first_part() {
+        let e = vec![
+            entry("env.example", false),
+            entry("venv", true),
+            entry(".env.local", false),
+            entry("config/.env", false),
+            entry(".env", false),
+        ];
+        assert_eq!(
+            inserts(&select_entries(&e, ".env")),
+            vec![".env", ".env.local", "config/.env"]
+        );
+        assert_eq!(inserts(&select_entries(&e, ".env.loc")), vec![".env.local"]);
+        assert_eq!(
+            inserts(&select_entries(&e, "env")),
+            vec!["env.example", "venv/"],
+            "with no leading dot the dot-names stay hidden"
+        );
+    }
+
+    /// A token of separators alone has no part to split into, so it is matched
+    /// whole, as before parts existed — never as an empty query that would list
+    /// every entry of the walk at every depth.
+    #[test]
+    fn a_token_of_separators_alone_is_matched_whole() {
+        let e = vec![
+            entry("src", true),
+            entry("src/cr-review.md", false),
+            entry("src/__init__.py", false),
+            entry("notes.txt", false),
+        ];
+        assert_eq!(inserts(&select_entries(&e, "-")), vec!["src/cr-review.md"]);
+        assert_eq!(inserts(&select_entries(&e, "__")), vec!["src/__init__.py"]);
+        let agents = vec![listed("sby-agent", None), listed("Explore", None)];
+        assert_eq!(
+            inserts(&select_agents(&agents, "-")),
+            vec!["agent-sby-agent"]
+        );
+    }
+
+    /// `agent-` is stripped BEFORE the split, so the parts are what follows it: an
+    /// `agent` part would match neither the name nor the description here.
+    #[test]
+    fn the_mention_prefix_is_stripped_before_the_split() {
+        let agents = vec![
+            listed("explore-docs", Some("Reads the docs")),
+            listed("sby-agent", None),
+        ];
+        assert_eq!(
+            inserts(&select_agents(&agents, "agent-exp-doc")),
+            vec!["agent-explore-docs"]
+        );
+        assert_eq!(
+            inserts(&select_agents(&agents, "AGENT-doc-exp")),
+            vec!["agent-explore-docs"]
+        );
+    }
+
+    /// Smart case per PART: `Site` matches exactly, `stor` in any case — so a
+    /// per-token rule (one uppercase letter makes every part exact) would miss
+    /// `SiteMap-STORAGE.ts`.
+    #[test]
+    fn smart_case_is_decided_per_part() {
+        let e = vec![
+            entry("SiteMap-STORAGE.ts", false),
+            entry("sitemap-storage.ts", false),
+        ];
+        assert_eq!(
+            inserts(&select_entries(&e, "Site-stor")),
+            vec!["SiteMap-STORAGE.ts"]
+        );
+        assert_eq!(
+            inserts(&select_entries(&e, "site-STOR")),
+            vec!["SiteMap-STORAGE.ts"]
+        );
+        assert_eq!(
+            inserts(&select_entries(&e, "site-stor")),
+            vec!["SiteMap-STORAGE.ts", "sitemap-storage.ts"]
+        );
+    }
+
+    /// A backslash in a token is a literal character of its part, never an escape:
+    /// `foo\-bar` is the parts `foo\` and `bar`, so it never becomes the escaped
+    /// phrase `foo bar` the board's search box would read in `foo\ bar`.
+    #[test]
+    fn a_backslash_is_literal_in_a_part() {
+        let e = vec![entry("foo bar.txt", false), entry(r"foo\-bar.txt", false)];
+        assert_eq!(
+            inserts(&select_entries(&e, r"foo\-bar")),
+            vec![r"foo\-bar.txt"]
+        );
+    }
+
+    /// A name STARTS with the query when any part's hit sits at its first char,
+    /// whichever part that is.
+    #[test]
+    fn a_name_start_is_any_parts_hit_at_the_first_char() {
+        let commands = vec![
+            listed("my-site-storage", None),
+            listed("storage-site", None),
+            listed("site-storage", None),
+        ];
+        assert_eq!(
+            inserts(&filter_commands(&commands, "site-stor")),
+            vec!["storage-site", "site-storage", "my-site-storage"]
+        );
+    }
+
+    // --- the `@` root fallback ----------------------------------------------
+
+    /// The entries of `tree` below `folder` (`"src/"`), relative to it: what the
+    /// folder step reads for a query whose `dir_part` is `folder`.
+    fn under(tree: &[DirEntryInfo], folder: &str) -> Vec<DirEntryInfo> {
+        tree.iter()
+            .filter_map(|e| e.name.strip_prefix(folder).map(|rel| entry(rel, e.is_dir)))
+            .collect()
+    }
+
+    /// The `@` list for `query` with `tree` as the compose folder's walk: the
+    /// folder step reads `tree` below the query's `dir_part` (all of it for a
+    /// top-level token), the root fallback reads `tree` whole.
+    fn at_list_over(tree: &[DirEntryInfo], agents: &[ListingEntry], query: &str) -> AtList {
+        let (dir_part, _) = split_path_query(query);
+        let folder = under(tree, dir_part);
+        at_list(query, at_candidates(&folder, agents, query), || tree)
+    }
+
+    /// What picking each row writes after the `@`.
+    fn written(list: &AtList) -> Vec<String> {
+        list.candidates
+            .iter()
+            .map(|c| replacement(Trigger::At, &list.dir_part, c, false))
+            .collect()
+    }
+
+    /// The reported shape: a path typed from memory names no real folder, so the
+    /// folder step finds nothing and the WHOLE query, split on `/` too, is matched
+    /// against the compose folder's walk. A pick writes the full path, replacing
+    /// the whole query — never `modules/` + `src/modules/…`.
+    #[test]
+    fn a_slash_query_whose_folder_step_finds_nothing_falls_back_to_the_root_walk() {
+        let tree = sitemaps_tree();
+        let list = at_list_over(&tree, &[], "modules/site-stor");
+        assert_eq!(list.dir_part, "", "a fallback row replaces the whole query");
+        assert_eq!(
+            written(&list),
+            vec![
+                "src/modules/sitemaps/sitemaps-storage.service.ts ",
+                "src/modules/storage/site-settings.ts ",
+            ]
+        );
+        assert_eq!(
+            written(&at_list_over(&tree, &[], "sitemaps/stor")),
+            vec!["src/modules/sitemaps/sitemaps-storage.service.ts "]
+        );
+    }
+
+    /// `@sitemaps/` names no folder at the root, so it lists every path holding
+    /// `sitemaps`, folders first; a folder pick writes `path/` with no space, so
+    /// the list reopens on that REAL folder through the folder step.
+    #[test]
+    fn a_slash_query_naming_no_real_folder_lists_every_path_holding_it() {
+        assert_eq!(
+            written(&at_list_over(&sitemaps_tree(), &[], "sitemaps/")),
+            vec![
+                "src/modules/sitemaps/",
+                "src/modules/sitemaps/sitemaps-storage.service.ts ",
+                "src/modules/sitemaps/sitemaps.controller.ts ",
+            ]
+        );
+    }
+
+    /// The folder step comes first: when the folder the query names lists
+    /// anything, that IS the list, inserted under the query's own `dir_part`, and
+    /// the root walk is never read. An empty leaf still lists only the folder's
+    /// direct children.
+    #[test]
+    fn a_folder_step_that_finds_something_wins_over_the_root_fallback() {
+        let tree = sitemaps_tree();
+        let src = under(&tree, "src/");
+        let root_read = std::cell::Cell::new(false);
+        let root = || {
+            root_read.set(true);
+            tree.as_slice()
+        };
+        let list = at_list(
+            "src/site-stor",
+            at_candidates(&src, &[], "src/site-stor"),
+            root,
+        );
+        assert_eq!(list.dir_part, "src/");
+        assert_eq!(
+            inserts(&list.candidates),
+            vec![
+                "modules/sitemaps/sitemaps-storage.service.ts",
+                "modules/storage/site-settings.ts",
+            ],
+            "rows relative to the folder, as before"
+        );
+        let list = at_list("src/", at_candidates(&src, &[], "src/"), || tree.as_slice());
+        assert_eq!(
+            (list.dir_part.as_str(), inserts(&list.candidates)),
+            ("src/", vec!["modules/"]),
+            "an empty leaf lists the direct children alone"
+        );
+        assert!(
+            !root_read.get(),
+            "the root walk is read only for a fallback"
+        );
+    }
+
+    /// An absolute or parent folder part that lists anything is the folder step,
+    /// untouched by the fallback.
+    #[test]
+    fn an_absolute_or_parent_folder_that_matches_is_untouched() {
+        let tree = sitemaps_tree();
+        let etc = vec![entry("hosts", false), entry("hostname", false)];
+        let list = at_list("/etc/ho", at_candidates(&etc, &[], "/etc/ho"), || {
+            tree.as_slice()
+        });
+        assert_eq!(list.dir_part, "/etc/");
+        assert_eq!(written(&list), vec!["/etc/hostname ", "/etc/hosts "]);
+        let other = vec![entry("x.rs", false)];
+        let list = at_list("../other/", at_candidates(&other, &[], "../other/"), || {
+            tree.as_slice()
+        });
+        assert_eq!(written(&list), vec!["../other/x.rs "]);
+    }
+
+    /// An agent is not a path: a query holding `/` lists none in either mode,
+    /// even one whose description holds what was typed.
+    #[test]
+    fn a_slash_query_never_lists_an_agent() {
+        let agents = vec![listed("sby-agent", Some("Pings back/forth"))];
+        assert_eq!(
+            written(&at_list_over(&sitemaps_tree(), &agents, "back/")),
+            Vec::<String>::new()
+        );
+        assert!(
+            written(&at_list_over(&sitemaps_tree(), &agents, "sitemaps/"))
+                .iter()
+                .all(|w| w.starts_with("src/"))
+        );
+    }
+
+    /// A fallback row is marked on its full path: every part, folder names
+    /// included, every occurrence.
+    #[test]
+    fn a_fallback_row_is_marked_on_its_full_path() {
+        assert_eq!(
+            marked_labels(&at_list_over(&sitemaps_tree(), &[], "modules/site-stor").candidates),
+            vec![
+                "src/[modules]/[site]maps/[site]maps-[stor]age.service.ts",
+                "src/[modules]/[stor]age/[site]-settings.ts",
+            ]
+        );
+    }
+
+    /// The dot-name gate reads the WHOLE query in fallback mode, and a leading `.`
+    /// stays on its first part: `.gith` never matches `notgithub/` by a bare
+    /// `gith`.
+    #[test]
+    fn the_fallback_shows_dot_names_only_for_a_query_starting_with_a_dot() {
+        let tree = vec![
+            entry(".github", true),
+            entry(".github/workflows", true),
+            entry(".github/workflows/ci.yml", false),
+            entry("docs", true),
+            entry("docs/workflows-ci.md", false),
+            entry("notgithub", true),
+            entry("notgithub/ci.md", false),
+        ];
+        assert_eq!(
+            written(&at_list_over(&tree, &[], "workflows/ci")),
+            vec!["docs/workflows-ci.md "]
+        );
+        assert_eq!(
+            written(&at_list_over(&tree, &[], ".gith/ci")),
+            vec![".github/workflows/ci.yml "]
+        );
+    }
+
+    /// Every part of the WHOLE query must sit in one path, so parts spread over
+    /// different paths list nothing, and neither does a query the walk lacks.
+    #[test]
+    fn a_query_neither_step_matches_lists_nothing() {
+        let tree = sitemaps_tree();
+        assert_eq!(
+            written(&at_list_over(&tree, &[], "sitemaps/settings")),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            written(&at_list_over(&tree, &[], "nope/zzz")),
+            Vec::<String>::new()
+        );
+    }
+
+    // --- marks ----------------------------------------------------------------
+
+    /// `text` with each run of `marks` (CHAR positions) wrapped in `[` `]`, so a
+    /// test reads the marks as text.
+    fn bracketed(text: &str, marks: &[usize]) -> String {
+        let mut out = String::new();
+        let mut open = false;
+        for (pos, c) in text.chars().enumerate() {
+            let hit = marks.contains(&pos);
+            if hit != open {
+                out.push(if hit { '[' } else { ']' });
+                open = hit;
+            }
+            out.push(c);
+        }
+        if open {
+            out.push(']');
+        }
+        out
+    }
+
+    /// Every row's label, marked.
+    fn marked_labels(candidates: &[Candidate]) -> Vec<String> {
+        candidates
+            .iter()
+            .map(|c| bracketed(&c.label, &c.label_marks))
+            .collect()
+    }
+
+    /// A path marks EVERY occurrence of every part, folder components included —
+    /// the board's row-label rule — and a folder's trailing `/` never.
+    #[test]
+    fn a_path_marks_every_occurrence_of_every_part() {
+        assert_eq!(
+            marked_labels(&at_candidates(&sitemaps_tree(), &[], "site-stor")),
+            vec![
+                "src/modules/[site]maps/[site]maps-[stor]age.service.ts",
+                "src/modules/[stor]age/[site]-settings.ts",
+            ]
+        );
+        assert_eq!(
+            marked_labels(&select_entries(&sitemaps_tree(), "maps")),
+            vec![
+                "src/modules/site[maps]/",
+                "src/modules/site[maps]/site[maps]-storage.service.ts",
+                "src/modules/site[maps]/site[maps].controller.ts",
+            ]
+        );
+        assert_eq!(
+            marked_labels(&select_entries(&[entry(".env.local", false)], ".env.loc")),
+            vec!["[.env].[loc]al"],
+            "a leading dot is marked with its part"
+        );
+    }
+
+    /// A command's marks sit one char right of its name's, past the `/`.
+    #[test]
+    fn a_command_mark_is_moved_past_its_slash() {
+        let commands = vec![listed("cr-review", None), listed("review", None)];
+        assert_eq!(
+            marked_labels(&filter_commands(&commands, "cr-rev")),
+            vec!["/[cr]-[rev]iew"]
+        );
+        assert_eq!(
+            marked_labels(&filter_commands(&commands, "re")),
+            vec!["/[re]view", "/cr-[re]view"]
+        );
+    }
+
+    /// An agent is marked in its NAME: an `agent` part marks `sby-agent`'s own
+    /// `agent`, never the ` (agent)` the label adds.
+    #[test]
+    fn an_agent_mark_never_reaches_its_label_suffix() {
+        let agents = vec![listed("sby-agent", None)];
+        assert_eq!(
+            marked_labels(&select_agents(&agents, "agent")),
+            vec!["sby-[agent] (agent)"]
+        );
+        assert_eq!(
+            marked_labels(&select_agents(&agents, "agent-sby-ag")),
+            vec!["[sby]-[ag]ent (agent)"]
+        );
+    }
+
+    /// A description-only hit marks its description, and its label not at all; a
+    /// name hit marks the name alone, even when the description holds the query.
+    #[test]
+    fn a_description_hit_marks_the_description_alone() {
+        let commands = vec![
+            listed("zeta", Some("Review a change")),
+            listed("review", Some("review it")),
+        ];
+        let got = filter_commands(&commands, "rev-chan");
+        assert_eq!(marked_labels(&got), vec!["/zeta"]);
+        assert_eq!(
+            bracketed(
+                got[0].description.as_deref().unwrap(),
+                &got[0].description_marks
+            ),
+            "[Rev]iew a [chan]ge"
+        );
+        let got = filter_commands(&commands, "rev");
+        assert_eq!(marked_labels(&got), vec!["/[rev]iew", "/zeta"]);
+        assert!(
+            got[0].description_marks.is_empty(),
+            "a name hit leaves its description unmarked"
+        );
+        assert_eq!(
+            bracketed(
+                got[1].description.as_deref().unwrap(),
+                &got[1].description_marks
+            ),
+            "[Rev]iew a change"
+        );
+    }
+
+    /// No query, no marks — the list is the folder walk, not a search.
+    #[test]
+    fn an_empty_query_marks_nothing() {
+        let entries = at_candidates(
+            &sitemaps_tree(),
+            &[listed("sby-agent", Some("Pings back"))],
+            "",
+        );
+        assert!(!entries.is_empty());
+        assert!(entries
+            .iter()
+            .all(|c| c.label_marks.is_empty() && c.description_marks.is_empty()));
     }
 }

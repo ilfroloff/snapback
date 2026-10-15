@@ -140,6 +140,14 @@ const HEADER_SEPARATOR: &str = "  ·  ";
 /// colour only (TERMINAL-SAFE STYLING).
 const MODEL_LABEL_STYLE: Style = Style::new().fg(Color::Magenta);
 
+/// How a search match is drawn in a row: the board list's label highlight and the
+/// compose pick list's marks alike, so a match reads the same on both. A named
+/// ANSI colour and modifier only (TERMINAL-SAFE STYLING); a selected row's
+/// `REVERSED` composes over it and keeps it visible.
+const MATCH_HIGHLIGHT_STYLE: Style = Style::new()
+    .fg(Color::LightBlue)
+    .add_modifier(Modifier::BOLD);
+
 /// What joins a model and its effort — `opus · high` — in a compose's `model:`
 /// label and on a model-picker row. The middot with ONE space either side is the
 /// preview's turn marker separator (`● claude · Opus 5.5 · xhigh`), so a picked
@@ -1091,9 +1099,7 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                         &label,
                         matched,
                         Style::default(),
-                        Style::default()
-                            .fg(Color::LightBlue)
-                            .add_modifier(Modifier::BOLD),
+                        MATCH_HIGHLIGHT_STYLE,
                     )),
                     None => spans.push(Span::raw(label)),
                 }
@@ -2186,13 +2192,14 @@ fn completion_name_width(candidates: &[Candidate], inner_width: u16) -> u16 {
 /// commands — so no one title is true), the name on the left and its description
 /// `DIM` on the right, cut at the box's inner edge.
 ///
-/// Reads only the cached `completion.visible` — the render path performs no I/O.
-/// The highlighted row is `Modifier::REVERSED` (named modifiers, no colors), and
-/// the `TableState` scrolls the window with the highlight. A list with no
-/// description at all is ONE column: a second, always-empty column would still
-/// cost its [`COMPLETION_COLUMN_GAP`], cutting the longest names short of the box
-/// edge for nothing (the gap outranks a `Length` in the layout solver of
-/// ratatui 0.30.2).
+/// Reads only the cached `completion.visible` — the render path performs no I/O
+/// and no matching: each row's marks were set when the list was filtered, and
+/// [`completion_cell`] only draws them. The highlighted row is
+/// `Modifier::REVERSED` (named modifiers, no colors), and the `TableState`
+/// scrolls the window with the highlight. A list with no description at all is
+/// ONE column: a second, always-empty column would still cost its
+/// [`COMPLETION_COLUMN_GAP`], cutting the longest names short of the box edge for
+/// nothing (the gap outranks a `Length` in the layout solver of ratatui 0.30.2).
 fn render_completion_list(frame: &mut Frame, compose: &ComposeState, compose_area: Rect) {
     let Some(visible) = &compose.completion.visible else {
         return;
@@ -2209,11 +2216,25 @@ fn render_completion_list(frame: &mut Frame, compose: &ComposeState, compose_are
     } else {
         &[Constraint::Length(name_width)]
     };
-    let rows = visible.iter().map(|candidate| {
+    // The row ratatui keeps in view: it clamps the selection to the last row too.
+    let highlight = compose
+        .completion
+        .highlight
+        .min(visible.len().saturating_sub(1));
+    let rows = visible.iter().enumerate().map(|(row, candidate)| {
+        let (label_marks, description_marks): (&[usize], &[usize]) =
+            if completion_row_may_show(row, highlight) {
+                (&candidate.label_marks, &candidate.description_marks)
+            } else {
+                (&[], &[])
+            };
         TableRow::new([
-            TableCell::from(candidate.label.as_str()),
-            TableCell::from(candidate.description.as_deref().unwrap_or_default())
-                .style(Style::default().add_modifier(Modifier::DIM)),
+            completion_cell(&candidate.label, label_marks, Style::default()),
+            completion_cell(
+                candidate.description.as_deref().unwrap_or_default(),
+                description_marks,
+                Style::default().add_modifier(Modifier::DIM),
+            ),
         ])
     });
     let table = Table::new(rows, widths.iter().copied())
@@ -2223,6 +2244,45 @@ fn render_completion_list(frame: &mut Frame, compose: &ComposeState, compose_are
     let mut state = TableState::default().with_selected(Some(compose.completion.highlight));
     frame.render_widget(Clear, rect);
     frame.render_stateful_widget(table, rect, &mut state);
+}
+
+/// Whether pick-list row `row` can be on screen while row `highlight` is
+/// highlighted. The table shows at most [`COMPLETION_VISIBLE_ROWS`] rows, the
+/// highlighted one always among them, so every row it draws sits closer to the
+/// highlight than that. Only such rows have their marks split into spans: a list
+/// at the `@` walk's entry cap would otherwise pay for every row's marks on every
+/// frame (measured 2026-10-14, release build, 25,000 marked rows: ~36 ms a frame
+/// marking every row, ~5 ms marking these alone or none).
+fn completion_row_may_show(row: usize, highlight: usize) -> bool {
+    row.abs_diff(highlight) < COMPLETION_VISIBLE_ROWS
+}
+
+/// One pick-list cell: `text` in the cell's own `style`, its `marks` (CHAR
+/// positions) in [`MATCH_HIGHLIGHT_STYLE`] — the board's row-label match look.
+/// A matched run lifts a `DIM` cell style, so a match in a dim description reads
+/// as plainly as one in a name. The runs split at grapheme-cluster edges
+/// ([`match_runs`]), so a wide char is never split and the column's cut drops a
+/// mark past it like any other text. Borrows `text`.
+fn completion_cell<'a>(text: &'a str, marks: &[usize], style: Style) -> TableCell<'a> {
+    let cell = if marks.is_empty() {
+        TableCell::from(text)
+    } else {
+        let marks: HashSet<usize> = marks.iter().copied().collect();
+        let mark = MATCH_HIGHLIGHT_STYLE.remove_modifier(Modifier::DIM);
+        TableCell::from(Line::from(
+            match_runs(text, 0, &marks)
+                .into_iter()
+                .map(|(run, hit)| {
+                    if hit {
+                        Span::styled(run, mark)
+                    } else {
+                        Span::raw(run)
+                    }
+                })
+                .collect::<Vec<_>>(),
+        ))
+    };
+    cell.style(style)
 }
 
 /// The preview block's title whenever the pane is NOT standing in for a hidden
@@ -10580,6 +10640,7 @@ mod tests {
             label: label.to_string(),
             insert: label.trim_start_matches('/').to_string(),
             description: description.map(str::to_string),
+            ..Candidate::default()
         }
     }
 
@@ -10901,6 +10962,165 @@ mod tests {
             !open.iter().any(|row| row.contains(BG_ENTER)),
             "no surface may offer the closed-list Enter while the list is open: {open:#?}"
         );
+    }
+
+    /// The pick list draws each row's cached marks in the board's own match style
+    /// — and ONLY the marked chars: in a name, across wide chars, on the REVERSED
+    /// highlighted row (where the colour must survive the reversal), in a DIM
+    /// description (where the match is lifted out of the dim), and up to the name
+    /// column's cut, past which a mark draws nothing. Every column is read off the
+    /// buffer.
+    #[test]
+    fn a_pick_list_draws_its_marks_in_the_board_match_style() {
+        let marked = |label: &str, label_marks: &[usize], description: Option<&str>| Candidate {
+            label_marks: label_marks.to_vec(),
+            ..pick(label, description)
+        };
+        let long = "src/modules/sitemaps/sitemaps-storage.service.ts";
+        let long_marks: Vec<usize> = (12..16).chain(21..25).chain(30..34).collect();
+        let mut zeta = pick("/zeta", Some("Reviews it"));
+        zeta.description_marks = vec![0, 1, 2];
+        let rows = vec![
+            marked("/cr-review", &[1, 2, 4, 5, 6], Some("runs it")),
+            marked("日本-site.ts", &[3, 4, 5, 6], None),
+            zeta,
+            marked(long, &long_marks, None),
+        ];
+
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.set_pane_layout(DOCK_LAYOUT);
+        let mut compose = ComposeState::new_reply("sess-normal-1".to_string(), None);
+        compose.completion.visible = Some(rows.clone());
+        compose.completion.highlight = 1;
+        app.compose = Some(compose);
+        let (w, h) = DOCK_BOARD;
+        let buffer = drawn_board(&mut app, w, h);
+        let cell = |x: u16, y: u16| buffer.cell((x, y)).expect("a cell on the board");
+        let is_match = |x: u16, y: u16| {
+            let c = cell(x, y);
+            c.fg == Color::LightBlue && c.modifier.contains(Modifier::BOLD)
+        };
+
+        let top = (0..h)
+            .find(|&y| full_row_text(&buffer, y, w).contains("/cr-review"))
+            .expect("the first pick is drawn");
+        let (left, right) = drawn_pick_list_columns(&buffer, top, "/cr-review", w);
+        let name_x = left + 1;
+        let description_x = column_of(&buffer, top, w, "runs it");
+        let name_end = description_x - COMPLETION_COLUMN_GAP;
+        assert!(
+            name_end - name_x < u16::try_from(long.len()).expect("a short label"),
+            "the premise: the long path is cut at the name column"
+        );
+
+        // Each label char's drawn column, wide chars counted as the renderer counts.
+        for (row, candidate) in rows.iter().enumerate() {
+            let y = top + u16::try_from(row).expect("a short list");
+            let mut x = name_x;
+            for (pos, ch) in candidate.label.chars().enumerate() {
+                if x >= name_end {
+                    break;
+                }
+                assert_eq!(
+                    is_match(x, y),
+                    candidate.label_marks.contains(&pos),
+                    "{:?} char {pos} ({ch:?}) on row {row}",
+                    candidate.label
+                );
+                if row == 1 {
+                    assert!(
+                        cell(x, y).modifier.contains(Modifier::REVERSED),
+                        "the highlighted row stays REVERSED under its marks"
+                    );
+                }
+                let columns = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                x += u16::try_from(columns).expect("a glyph a few columns wide");
+            }
+            assert!(
+                (name_end..description_x).all(|gap| !is_match(gap, y)),
+                "nothing past the name column's cut is marked on row {row}"
+            );
+        }
+
+        // The description-only hit: its marked run is the match style, NOT dim; the
+        // rest of the description stays DIM and unmarked.
+        let zeta_y = top + 2;
+        let review_x = column_of(&buffer, zeta_y, w, "Reviews it");
+        for (offset, ch) in "Reviews it".chars().enumerate() {
+            let x = review_x + u16::try_from(offset).expect("a short description");
+            let marked = offset < 3;
+            assert_eq!(is_match(x, zeta_y), marked, "description char {ch:?}");
+            assert_eq!(
+                cell(x, zeta_y).modifier.contains(Modifier::DIM),
+                !marked,
+                "description char {ch:?}: a mark lifts the dim, the rest keeps it"
+            );
+        }
+        assert_eq!(
+            cell(right, top + 3).symbol(),
+            "│",
+            "the right border survives"
+        );
+    }
+
+    /// A board tall enough for the pick list's full [`COMPLETION_VISIBLE_ROWS`].
+    const TALL_DOCK_BOARD: (u16, u16) = (60, 40);
+
+    /// Scrolled to the bottom of a long list, EVERY row the table draws carries
+    /// its marks — the window's top row included, the one furthest from the
+    /// highlight — while the rows scrolled away are never drawn at all.
+    #[test]
+    fn every_row_a_scrolled_pick_list_draws_carries_its_marks() {
+        const ROWS: usize = 20;
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.set_pane_layout(DOCK_LAYOUT);
+        let mut compose = ComposeState::new_reply("sess-normal-1".to_string(), None);
+        compose.completion.visible = Some(
+            (0..ROWS)
+                .map(|i| Candidate {
+                    label_marks: vec![1, 2, 3],
+                    ..pick(&format!("/cmd-{i:02}"), None)
+                })
+                .collect(),
+        );
+        compose.completion.highlight = ROWS - 1;
+        app.compose = Some(compose);
+        let (w, h) = TALL_DOCK_BOARD;
+        let buffer = drawn_board(&mut app, w, h);
+        let drawn: Vec<(usize, u16)> = (0..ROWS)
+            .filter_map(|i| {
+                let label = format!("/cmd-{i:02}");
+                (0..h)
+                    .find(|&y| full_row_text(&buffer, y, w).contains(&label))
+                    .map(|y| (i, y))
+            })
+            .collect();
+        assert_eq!(
+            drawn.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            (ROWS - COMPLETION_VISIBLE_ROWS..ROWS).collect::<Vec<_>>(),
+            "the premise: the list shows its full window, scrolled to the highlight"
+        );
+        let (first, top) = drawn[0];
+        let name_x = drawn_pick_list_columns(&buffer, top, &format!("/cmd-{first:02}"), w).0 + 1;
+        for (i, y) in drawn {
+            let marked = |x: u16| {
+                buffer
+                    .cell((x, y))
+                    .is_some_and(|c| c.fg == Color::LightBlue)
+            };
+            assert!(
+                (1..=3).all(|offset| marked(name_x + offset)) && !marked(name_x),
+                "row {i} draws its `cmd` mark and nothing else"
+            );
+        }
     }
 
     /// With no description anywhere the list is ONE column, so a name exactly as
@@ -11921,9 +12141,10 @@ mod tests {
     /// assert drawn cells): a style the parser set but the render lost is not a link
     /// anyone can see. Both directions are pinned. Every `LightBlue` cell spells the
     /// label, so the color reaches neither the prose around it nor the pane's chrome
-    /// (nothing else the preview pane draws is `LightBlue` — the list's search-match
-    /// highlight is, but it is not in this pane — which is what makes the color a
-    /// sound locator); and every one of them is italic and underlined, the half of the
+    /// (nothing else the preview pane draws is `LightBlue` — the search-match
+    /// highlight is, but on the list's rows and on a compose pick list, and no
+    /// compose is open here — which is what makes the color a sound locator); and
+    /// every one of them is italic and underlined, the half of the
     /// look that does not depend on how the terminal's theme draws the blue.
     #[test]
     fn a_preview_link_is_drawn_light_blue_italic_and_underlined() {

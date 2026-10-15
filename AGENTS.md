@@ -203,11 +203,19 @@ one place.
   [DOMAIN.md](docs/agents/DOMAIN.md#content-index-storeparse), the two rules in
   [PATTERNS.md](docs/agents/PATTERNS.md#4-isolate-volatile-dependencies). The
   compose pick list (`src/tui/complete.rs`) is a consumer of this SAME matcher
-  and never matches by itself: it asks `SearchIndex::admits`, the filter's own
-  question, of a candidate's NAME and then its DESCRIPTION — never its label —
-  its whitespace-free token is ONE atom, and it orders what matches by where it
-  landed (name start, elsewhere in the name, description only), an order that is
-  the pick list's alone.
+  and never matches by itself. It splits its whitespace-free token into PARTS on
+  `-`, `_` and `.` (a LEADING `.` stays on the first part), and on `/` too ONLY
+  in the `@` ROOT FALLBACK: an `@` holding a `/` lists the folder it names FIRST,
+  and only when that finds nothing matches the WHOLE query against the compose
+  folder's own walk (`complete::at_list`). Each part is ONE atom,
+  handed in through `SearchIndex::set_atoms` — never re-joined into a query for
+  `set_query`, whose whitespace and backslash rule is the search box's alone, and
+  the board's search box splits on whitespace only. It asks `SearchIndex::admits`,
+  the filter's own question, of a candidate's NAME and then its DESCRIPTION —
+  never its label — marks the hit with the ROW-LABEL rule (`match_indices`) over
+  that same name or description when the list is filtered, never in render, and
+  orders what matches by where it landed (name start, elsewhere in the name,
+  description only), an order that is the pick list's alone.
   (`src/search.rs`, `src/tui/complete.rs`)
 - **STABLE-ID STATE.** Track selection by `session_id`, never list index, so it
   survives autorefresh reloads. (`src/tui/app.rs`)

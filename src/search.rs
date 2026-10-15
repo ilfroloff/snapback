@@ -183,9 +183,12 @@
 //!
 //! Both rules mark through the SAME per-atom machinery and both take their atoms
 //! from the one splitter ([`gate_atoms`]), so "which words" and "where do they
-//! occur" are each decided once. A consequence worth stating: a label marks EVERY
-//! occurrence of an atom, not one chosen run — `fix search, then fix preview`
-//! searched for `fix` marks both, exactly as the preview would.
+//! occur" are each decided once. (The compose pick list asks these seams of its
+//! OWN query, a token it splits by its own rule and hands in through
+//! [`set_atoms`](SearchIndex::set_atoms) — never the board's query, so it cannot
+//! make two board surfaces disagree.) A consequence worth stating: a label marks
+//! EVERY occurrence of an atom, not one chosen run — `fix search, then fix
+//! preview` searched for `fix` marks both, exactly as the preview would.
 //!
 //! Matching is **substring, not fuzzy**, and that is a property of the mechanism
 //! rather than a setting: memmem searches substrings by nature, so a query marks
@@ -598,14 +601,29 @@ impl SearchIndex {
         self.query.push_str(query);
         // Compile the substring searchers ONCE per keystroke, reused across every
         // entry by the scan in `matching_candidates` and by both marking rules.
-        self.atom_finders = gate_atoms(query)
-            .into_iter()
-            .filter(|atom| !atom.is_empty())
-            .map(|atom| AtomFinder::new(&atom))
-            .collect();
+        self.atom_finders = compile_atoms(gate_atoms(query).iter().map(String::as_str));
         // Derived from the QUERY, so it is computed once here rather than
         // recomputed identically for every entry in the scan.
         self.proximity_window = proximity_window(query.len());
+    }
+
+    /// Set the active query from atoms the CALLER has already split — the entry
+    /// point for a query that is not typed into the board's search box and so does
+    /// not split on [`gate_atoms`]' rule. The compose pick list (`tui::complete`)
+    /// splits its token on its own separators and hands the parts in here.
+    ///
+    /// Each atom is taken LITERALLY: no whitespace split and no `\ ` unescape, so
+    /// a backslash in a caller's atom can never turn into an escaped phrase.
+    /// Everything past the split is [`set_query`](Self::set_query)'s: empty atoms
+    /// are dropped and every atom is compiled by the same [`AtomFinder::new`], so
+    /// smart case stays per atom and both marking rules mark these atoms exactly
+    /// as they mark typed ones. The query text reads back as the atoms joined by a
+    /// space.
+    pub fn set_atoms(&mut self, atoms: &[&str]) {
+        let atoms: Vec<&str> = atoms.iter().copied().filter(|a| !a.is_empty()).collect();
+        self.query = atoms.join(" ");
+        self.atom_finders = compile_atoms(atoms);
+        self.proximity_window = proximity_window(self.query.len());
     }
 
     /// The active query text.
@@ -1052,7 +1070,10 @@ fn fingerprint(session: &Session) -> u64 {
 /// ([`match_indices`](SearchIndex::match_indices)) and the preview marks
 /// ([`atom_match_positions`](SearchIndex::atom_match_positions)) all take their
 /// atoms from the finders built here. Re-splitting a query anywhere else is how
-/// two surfaces start disagreeing about which words the user typed.
+/// two surfaces start disagreeing about which words the user typed. The compose
+/// pick list's token is not a search-box query: `tui::complete` splits it by its
+/// own rule and hands the parts to [`SearchIndex::set_atoms`], which splits
+/// nothing.
 ///
 /// Split on an ASCII space that is NOT escaped by an immediately preceding
 /// backslash, drop the empty atoms, and unescape `\ ` → ` ` inside each atom (any
@@ -1091,6 +1112,17 @@ fn gate_atoms(query: &str) -> Vec<String> {
         atoms.push(current);
     }
     atoms
+}
+
+/// Compile `atoms` into the finders every rule searches with, dropping the empty
+/// ones — the one compile step behind [`SearchIndex::set_query`] and
+/// [`SearchIndex::set_atoms`], so the two differ only in who split the atoms.
+fn compile_atoms<'a>(atoms: impl IntoIterator<Item = &'a str>) -> Vec<AtomFinder> {
+    atoms
+        .into_iter()
+        .filter(|atom| !atom.is_empty())
+        .map(AtomFinder::new)
+        .collect()
 }
 
 /// The BYTE index `query` must be truncated to in order to drop exactly one atom
@@ -2079,6 +2111,52 @@ mod tests {
         assert!(
             index_for("οδοσ").admits("ΟΔΟΣ notes"),
             "the per-char fold turns a word-final `Σ` into `σ`"
+        );
+    }
+
+    /// `set_atoms` takes a caller's atoms LITERALLY — `set_query` would read the
+    /// same text through `gate_atoms`, splitting on a space and turning `\ ` into
+    /// an escaped phrase — and compiles each by the same per-atom smart case, so
+    /// admission and both marking rules treat them as typed atoms.
+    #[test]
+    fn set_atoms_takes_each_atom_literally_under_per_atom_smart_case() {
+        let atoms_for = |atoms: &[&str]| {
+            let mut index = SearchIndex::new();
+            index.set_atoms(atoms);
+            index
+        };
+
+        let escaped = atoms_for(&[r"foo\ bar"]);
+        assert!(
+            escaped.admits(r"x foo\ bar y") && !escaped.admits("foo bar"),
+            "a backslash stays a literal char of its atom, never an escape"
+        );
+        let spaced = atoms_for(&["foo bar"]);
+        assert!(
+            spaced.admits("foo bar") && !spaced.admits("bar foo"),
+            "a space inside an atom is literal too, never a split"
+        );
+
+        let mixed = atoms_for(&["Site", "stor"]);
+        assert!(
+            mixed.admits("SiteMap-STORAGE") && !mixed.admits("sitemap-storage"),
+            "smart case rides each atom: `Site` exact, `stor` in any case"
+        );
+        assert_eq!(
+            mixed.match_indices("SiteMap-STORAGE"),
+            vec![0, 1, 2, 3, 8, 9, 10, 11],
+            "the row-label rule marks every atom of the set"
+        );
+
+        let with_empty = atoms_for(&["", "x"]);
+        assert!(
+            with_empty.admits("x") && !with_empty.admits("y"),
+            "an empty atom is dropped, never a vacuous match"
+        );
+        assert_eq!(with_empty.query(), "x");
+        assert!(
+            atoms_for(&[]).admits("anything") && atoms_for(&[""]).admits("anything"),
+            "no atoms admit every string, as the empty query does"
         );
     }
 

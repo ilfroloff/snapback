@@ -2400,7 +2400,9 @@ narrow it by the [rule below](#how-the-letters-narrow-the-list):
   hides from its own `/` menu (`claude_catalog::CLAUDE_HIDDEN_BUILTINS`), and
   nothing until that list is in.
 - `@` at the start of a word lists files and folders under the folder
-  (`@src/tu` narrows inside `src/`). The leaf is matched against each entry's
+  (`@src/tu` narrows inside `src/`: a `/` names the folder to list FIRST, and
+  only when that finds nothing does the list fall back to the folder's whole walk,
+  [below](#how-the-letters-narrow-the-list)). The leaf is matched against each entry's
   FULL path relative to that folder, so `@disc` lists `src/store/discover.rs`
   (the walk is `complete::list_tree`: breadth first, bounded by
   `COMPLETION_MAX_TREE_ENTRIES` at any depth, never descending a
@@ -2432,7 +2434,9 @@ narrow it by the [rule below](#how-the-letters-narrow-the-list):
   `store::skills::normalize_description` has dropped every control character and
   folded whitespace; files and folders carry none. The list draws as an UNTITLED
   table, name left and `DIM` description right, cut at the box edge: a title such
-  as "skills" or "files" would be false for a list that mixes kinds.
+  as "skills" or "files" would be false for a list that mixes kinds. What the
+  query matched is marked in the board's own label highlight
+  ([below](#how-the-letters-narrow-the-list)).
 - The list opens only with the caret at the END of the token. While open,
   `Up`/`Down` choose (wrapping), `Enter`/`Tab` pick, `Esc` closes only the list. A
   closed token stays closed while the caret stays at its end (typing more of it
@@ -2509,21 +2513,89 @@ a wrong list, and a skill created mid-run is listed after a restart.
 
 #### How the letters narrow the list
 
-The letters after the trigger go to the board's own matcher:
+The letters after the trigger go to the board's own matcher, in PARTS. The token
+holds no whitespace, so `complete::query_parts` splits it on the pick list's own
+separators instead (`complete::QUERY_PART_SEPARATORS`: `-`, `_`, `.` — the word
+separators of file, skill, command and agent names), and each part is one atom:
+`@site-stor` is `site` AND `stor`, in any order, so it finds
+`src/modules/sitemaps/sitemaps-storage.service.ts`. Each part is still a
+SUBSTRING — a misspelt `@site-stro` finds nothing. Three edges:
+
+- A LEADING `.` stays on the first part, so `@.env` is the one part `.env`: it
+  lists `.env` as a name-start hit and never `env.example` or `venv/` by a bare
+  `env`. The dot-name gate and the empty-leaf rule above read the RAW leaf, never
+  its parts.
+- Empty parts are dropped (`site--stor`, a `site-` still being typed), and a
+  token of separators alone (`@-`, `@__`) is ONE part, matched whole: no parts
+  is the empty query, which would list the whole walk at every depth.
+- An agent's `agent-` prefix is stripped BEFORE the split, so `@agent-exp-doc`
+  is `exp` AND `doc`.
+
+The parts reach the matcher through `SearchIndex::set_atoms`, never re-joined
+with spaces for `set_query`
+([PATTERNS.md §4](PATTERNS.md#4-isolate-volatile-dependencies) says why). The
+board's own search box keeps whitespace as its only separator.
+
+**The `@` root fallback.** In an `@` query `/` is no separator at first: it is
+the FOLDER STEP, naming the folder to list (`complete::split_path_query`), which
+is what serves `@/etc/ho`, `@../other/` and the folder-by-folder walk. A path typed from memory names no
+real folder, though, so when the folder step finds NOTHING — its folder is
+missing, empty or unreadable, or nothing in it matches — `complete::at_list`
+matches the WHOLE query against the compose folder's own walk instead, split on
+`complete::ROOT_FALLBACK_SEPARATORS`, the separators above plus `/`:
+`@modules/site-stor` is `modules`, `site` AND `stor` and finds
+`src/modules/sitemaps/sitemaps-storage.service.ts`, as does `@sitemaps/stor`,
+and `@sitemaps/` with no such folder at the root lists every path holding
+`sitemaps`. A folder step that finds anything IS the list, unchanged
+(`@src/site-stor`, `@src/`'s direct children). The fallback otherwise works like a
+top-level `@` over that walk:
+
+- Same tiers, folders-first ties and marks, the marks landing on the full path.
+  The dot-name gate reads the WHOLE query's first character, and a leading `.`
+  stays on its first part, so `@.gith/ci` reaches `.github/workflows/ci.yml` and
+  never `notgithub/ci.md`.
+- It never lists an agent, like every `@` holding a `/`, so it never reads the
+  transcript either.
+- A pick writes the full path from the compose folder and REPLACES the whole
+  query: the rows travel with an empty `complete::AtList::dir_part`, which
+  `CompletionState` keeps beside them, so accepting never re-derives it from the
+  query (that would write `modules/src/modules/…`). A folder pick gets no space,
+  so the list reopens on that real folder through the folder step.
+- Its walk is the one a top-level `@` reads, the same cached entry, so it
+  normally re-filters an in-memory listing on a keystroke; a fallback reached
+  with no top-level `@` listed before it in that compose (a pasted path, say)
+  reads it, once. It adds no folder of its own
+  ([PATTERNS.md §6](PATTERNS.md#6-off-ui-thread-for-anything-that-can-block)).
+
+`/` splits nothing anywhere else: not the folder step, not the `/` trigger's
+commands and skills, and not the board's search box.
+
 `complete::placement` asks `SearchIndex::admits` — the
-[filter's](#content-index-storeparse) own membership question — of a candidate's
-NAME, and only then of its description. So a query matches ANYWHERE in the name
-or, for a skill, command or agent, anywhere in its description; a file or folder
-has only its name. It is a substring match under the board's per-atom smart case
-and its one fold: an all-lowercase query matches in any case and a typed
-uppercase letter matches exactly, so `@exp` lists both `Explore` and `explain`
-while `@Ex` lists only `Explore`. The token holds no whitespace, so it is always
-ONE atom.
+[filter's](#content-index-storeparse) own membership question, every part
+present — of a candidate's NAME, and only then of its description. So a query
+matches ANYWHERE in the name or, for a skill, command or agent, anywhere in its
+description; a file or folder has only its name. It is a substring match under
+the board's per-atom smart case and its one fold, decided PER PART: an
+all-lowercase part matches in any case and a part with an uppercase letter
+matches exactly, so `@exp` lists both `Explore` and `explain` while `@Ex` lists
+only `Explore`, and `@Site-stor` lists `SiteMap-STORAGE.ts`.
+
+Each row carries its MARKS, computed when the list is filtered
+(`Candidate::label_marks` / `description_marks`) under the board's ROW-LABEL
+rule (`SearchIndex::match_indices`: every part in the string, every occurrence of
+each marked), asked of the NAME or path alone — a command's marks moved past its
+`/`, an agent's never reaching its ` (agent)`, a folder's trailing `/` never
+marked — or, for a description-only hit, of the description. The view draws them
+in the board's label highlight (`view::MATCH_HIGHLIGHT_STYLE`), lifting a
+description's `DIM` under a mark, and splits only the rows the table can show
+(`view::completion_row_may_show`, whose doc carries the frame-cost measurement
+at the walk's entry cap).
 
 What matches is ordered in four tiers (`complete::Placement`): a name that
-STARTS with the query, then a name that holds it elsewhere, then (`@` paths only,
-`complete::path_placement`) a hit only in a FOLDER component of the path, then a
-description-only hit. An `@` path entry's name is its last component. Within a tier the list keeps the order it has with no
+STARTS with the query — any part's hit at its first char — then a name that holds
+every part elsewhere, then (`@` paths only, `complete::path_placement`) a path
+that needs a FOLDER component for some part, then a description-only hit. An
+`@` path entry's name is its last component. Within a tier the list keeps the order it has with no
 query — the source's order for commands and agents (claude's catalog, or a
 reply's or fork's transcript); folders before files, then by name, for `@` entries — and
 an `@` list keeps every entry above every agent, whatever their tiers. An empty
