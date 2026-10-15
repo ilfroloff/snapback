@@ -76,8 +76,8 @@ use crate::store::skills::{read_listing, Listing};
 
 use super::app::{App, NewSessionDraft};
 use super::complete::{
-    at_candidates, completion_context, filter_commands, list_tree, move_highlight, replacement,
-    settle_highlight, split_path_query, Candidate, Context, DirEntryInfo, Trigger,
+    at_candidates, at_list, completion_context, filter_commands, list_tree, move_highlight,
+    replacement, settle_highlight, split_path_query, Candidate, Context, DirEntryInfo, Trigger,
 };
 use super::update::Outcome;
 
@@ -201,6 +201,10 @@ pub struct CompletionState {
     /// [`compose_key_to_action`]), so "no match" must mean "no list", never an
     /// empty one.
     pub visible: Option<Vec<Candidate>>,
+    /// What every pick of `visible` is inserted under, set WITH it
+    /// (`complete::AtList::dir_part`; empty for `/`), so accepting never re-derives
+    /// it from the query: an `@` root-fallback row replaces the whole query.
+    dir_part: String,
     /// The highlighted row of `visible`.
     pub highlight: usize,
     /// The token the caret ends, whether or not its list is showing.
@@ -247,8 +251,11 @@ impl CompletionState {
     /// from that transcript, else none.
     ///
     /// The ONLY reads the pick list makes happen here: the transcript listing (once
-    /// per reply or fork box, and only for a top-level `@`) and one folder listing
-    /// (once per folder, capped by `COMPLETION_MAX_DIR_ENTRIES`). Bounded
+    /// per reply or fork box, and only for a top-level `@`) and folder walks (once
+    /// per folder, capped by `COMPLETION_MAX_DIR_ENTRIES` and
+    /// `COMPLETION_MAX_TREE_ENTRIES`) — the folder an `@` names, plus, for an `@`
+    /// root fallback alone (`complete::at_list`), the compose folder's own walk,
+    /// the same cache entry a top-level `@` fills. Bounded
     /// synchronous reads on the key/paste path are the same shape as
     /// `defined_agents::discover_agents` on `Ctrl-N` and `send::plan_send` on
     /// `Enter` (PATTERNS.md section 6); the render path only ever reads the cached
@@ -283,17 +290,15 @@ impl CompletionState {
             self.visible = None;
             return;
         }
-        let candidates = match ctx.trigger {
-            Trigger::Slash => source.catalog.map_or_else(Vec::new, |listing| {
-                filter_commands(&listing.commands, &ctx.query)
-            }),
+        let (candidates, dir_part) = match ctx.trigger {
+            Trigger::Slash => (
+                source.catalog.map_or_else(Vec::new, |listing| {
+                    filter_commands(&listing.commands, &ctx.query)
+                }),
+                String::new(),
+            ),
             Trigger::At => {
                 let (dir_part, _) = split_path_query(&ctx.query);
-                let dir = source.cwd.join(dir_part);
-                let entries = self
-                    .dirs
-                    .entry(dir.clone())
-                    .or_insert_with(|| list_tree(&dir));
                 // Only a top-level `@` lists agents (`complete::at_candidates`), so
                 // only then may the transcript be read.
                 let agents = if dir_part.is_empty() {
@@ -302,7 +307,15 @@ impl CompletionState {
                 } else {
                     &[]
                 };
-                at_candidates(entries, agents, &ctx.query)
+                let folder = cached_tree(&mut self.dirs, source.cwd.join(dir_part));
+                let folder_hits = at_candidates(folder, agents, &ctx.query);
+                // The root fallback's walk is the one a top-level `@` reads: the
+                // same cache entry, read only when the folder step found nothing.
+                let dirs = &mut self.dirs;
+                let list = at_list(&ctx.query, folder_hits, move || {
+                    cached_tree(dirs, source.cwd.to_path_buf())
+                });
+                (list.candidates, list.dir_part)
             }
         };
         if candidates.is_empty() {
@@ -311,7 +324,14 @@ impl CompletionState {
         }
         self.highlight = settle_highlight(self.highlight, candidates.len(), start_changed);
         self.visible = Some(candidates);
+        self.dir_part = dir_part;
     }
+}
+
+/// `dir`'s walk from `dirs`, read into it by `complete::list_tree` on first use:
+/// at most once per folder per compose.
+fn cached_tree(dirs: &mut HashMap<PathBuf, Vec<DirEntryInfo>>, dir: PathBuf) -> &[DirEntryInfo] {
+    dirs.entry(dir).or_insert_with_key(|dir| list_tree(dir))
 }
 
 /// The listing a top-level `@` takes its agents from: `source`'s catalog when one
@@ -886,17 +906,13 @@ fn accept_completion(compose: &mut ComposeState) {
     let Some(candidate) = visible.get(state.highlight) else {
         return;
     };
-    let dir_part = match ctx.trigger {
-        Trigger::Slash => "",
-        Trigger::At => split_path_query(&ctx.query).0,
-    };
     let (row, col) = cursor_pos(&compose.textarea);
     let next_is_whitespace = compose
         .textarea
         .lines()
         .get(row)
         .is_some_and(|l| l.chars().nth(col).is_some());
-    let text = replacement(ctx.trigger, dir_part, candidate, next_is_whitespace);
+    let text = replacement(ctx.trigger, &state.dir_part, candidate, next_is_whitespace);
     let query_chars = ctx.query.chars().count();
     for _ in 0..query_chars {
         compose.textarea.move_cursor(CursorMove::Back);
@@ -1767,7 +1783,7 @@ mod tests {
             visible: Some(vec![Candidate {
                 label: "/sbping".to_string(),
                 insert: "sbping".to_string(),
-                description: None,
+                ..Candidate::default()
             }]),
             catalog_requested: true,
             ..CompletionState::default()
@@ -1896,6 +1912,82 @@ mod tests {
             ["agent-Explore"],
             "listed from the draft's one read, not from the file again"
         );
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// A compose folder holding `src/modules/sitemaps/sitemaps-storage.service.ts`.
+    fn sitemaps_dir(tag: &str) -> PathBuf {
+        let cwd = unique_temp_dir(tag);
+        let sitemaps = cwd.join("src/modules/sitemaps");
+        std::fs::create_dir_all(&sitemaps).expect("create src/modules/sitemaps/");
+        std::fs::write(sitemaps.join("sitemaps-storage.service.ts"), "")
+            .expect("write the service");
+        cwd
+    }
+
+    /// An `@` query whose folder step finds nothing falls back to the compose
+    /// folder's root walk, inserted with NO folder part, and like every `@` with a
+    /// `/` never reads the transcript the agents come from. When the folder step
+    /// finds something, the root walk is never read at all.
+    #[test]
+    fn a_root_fallback_inserts_whole_paths_and_never_reads_the_transcript() {
+        let cwd = sitemaps_dir("at-fallback");
+        let transcript = listing_fixture();
+
+        let mut state = CompletionState::default();
+        refresh_token(&mut state, "@sitemaps/stor", &cwd, &transcript);
+        assert_eq!(
+            shown(&state),
+            ["src/modules/sitemaps/sitemaps-storage.service.ts"]
+        );
+        assert_eq!(
+            state.dir_part, "",
+            "a fallback row replaces the whole query"
+        );
+        assert!(
+            state.transcript.is_none(),
+            "a `/` query must not read the transcript"
+        );
+
+        let mut folder_step = CompletionState::default();
+        refresh_token(&mut folder_step, "@src/", &cwd, &transcript);
+        assert_eq!(shown(&folder_step), ["modules/"]);
+        assert_eq!(folder_step.dir_part, "src/");
+        assert_eq!(
+            folder_step.dirs.keys().collect::<Vec<_>>(),
+            [&cwd.join("src/")],
+            "a folder step that found something never reads the root walk"
+        );
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// The fallback re-filters the root walk a top-level `@` already read — the
+    /// same cache entry — rather than reading the folder again: a file written
+    /// after that read is not listed.
+    #[test]
+    fn a_root_fallback_reuses_the_top_level_walk() {
+        let cwd = sitemaps_dir("at-fallback-cache");
+        let transcript = listing_fixture();
+        let mut state = CompletionState::default();
+        refresh_token(&mut state, "@", &cwd, &transcript);
+        std::fs::write(cwd.join("sitemaps-stored-late.ts"), "").expect("write a late file");
+        refresh_token(&mut state, "@sitemaps/stor", &cwd, &transcript);
+        assert_eq!(
+            shown(&state),
+            ["src/modules/sitemaps/sitemaps-storage.service.ts"],
+            "listed from the cached walk, not a second read"
+        );
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// A query neither the folder step nor the root fallback matches shows NO
+    /// list, never an empty one that would still claim `Enter`.
+    #[test]
+    fn a_slash_query_neither_step_matches_shows_no_list() {
+        let cwd = sitemaps_dir("at-fallback-none");
+        let mut state = CompletionState::default();
+        refresh_token(&mut state, "@nope/zzz", &cwd, &listing_fixture());
+        assert!(state.visible.is_none());
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
