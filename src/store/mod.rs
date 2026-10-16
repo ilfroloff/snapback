@@ -233,8 +233,9 @@ pub struct Session {
     /// How many conversation turns the transcript holds (see
     /// [`parse::ParsedFile::msg_count`]).
     ///
-    /// Drawn on an expanded lineage CHILD row, and it is the one field there
-    /// that carries real information: every member of a lineage shares a label
+    /// Drawn on an expanded lineage CHILD row and in the preview's session
+    /// title. On the child row it is the one field that carries real
+    /// information: every member of a lineage shares a label
     /// BY CONSTRUCTION (a background hand-off copies the conversation), so the
     /// label cannot tell them apart and neither a timestamp nor an id says
     /// which member is a stalled stub and which holds the work. `6` beside

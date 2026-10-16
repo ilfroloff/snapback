@@ -1359,8 +1359,9 @@ field, and the banner reads the selected session's.
 
 `Session::msg_count` is how many **conversation turns** a transcript holds:
 records typed `user` or `assistant`, counted in `parse`'s existing streaming
-pass. Its consumer is the expanded lineage
-[child row](#fork-lineage-storelineage).
+pass. Its consumers are the expanded lineage
+[child row](#fork-lineage-storelineage) and the preview's
+[session title](#subagent-record-and-running-list-storesubagents).
 
 **Turns are a NARROWER set than tree records, and the two are deliberately not
 unified.** Four types carry `uuid` + `parentUuid` and form the tree
@@ -2161,9 +2162,10 @@ them. The line carries no live status.
 
 ### Subagent record and running list (`store::subagents`)
 
-ONE record of the SELECTED session's subagents feeds three surfaces: the
-`Ctrl-X ↓` open target, the subagent view's `←`/`→` steps and its title, and
-the running list at the foot of the preview. It is a
+ONE record of the SELECTED session's subagents feeds four surfaces: the
+`Ctrl-X ↓` open target, the subagent view's `←`/`→` steps and its title, the
+running list at the foot of the preview, and the session's own title above it.
+It is a
 `subagents::SubagentRecord`: every subagent the session launched, at any depth,
 in launch order, each a `Subagent` carrying its id, `agentType` and description
 (from its meta file), its launch time, its `newest_write` and whether its own
@@ -2297,6 +2299,31 @@ file read and no second copy of the rule, and
 `the_view_and_the_record_judge_the_same_records_to_the_same_status` pins the two
 agreeing. `view::render_preview` builds the title only after the frame has
 warmed the cache, so a view's first frame already states the render's verdict.
+
+**The session's title** (`view::session_title`, pure over `SessionTitleFacts`
+and the width the border gives it) is the preview's title everywhere else:
+` <status> · last write <age> · N msgs · N subagents · N running `, the
+session's name (its label, or its id for an empty one) leading it only in the
+`0:1` layout (`PaneLayout::PreviewOnly`), where no list shows which row is
+selected. `view::session_title_facts` reads it all from memory, with no file or
+clock read: the status is `agents::friendly_status`, the pinned row's phrase,
+without its age; the age is the subagent title's, from `Session::timestamp` —
+the session's most recent activity — against `App::wall_clock`; `N msgs` is
+`Session::msg_count`; the counts are this record's, `N running` through
+`view::running_in`, the same `is_running` at the same `App::wall_clock` the
+running list filters by, so the two never disagree, drawn in `RUNNING_COLOR`. A
+fact not known is left out: no status for a session claude does not report, nor
+while this board's quick reply to it is in flight, whose `cooking…` tail
+already says it, as on the pinned row; no age before the wall clock is first
+stamped, for a timestamp after it, or for one the platform's clock cannot hold
+(`view::system_time_of`); no subagent segment before the record lands or when
+it lists none; no `N running` while nothing runs. Unlike the running list, the
+count stays while a compose box is open. On a narrow border the name is cut
+with an ellipsis and then dropped, then `last write …`, then `N msgs`: the
+subagent title's own fit, `view::fit_title`, which both titles share. The
+status and the counts are never cut by it; narrower than they are, the border
+cuts the title at its edge. With nothing selected, or a draft card on the pane,
+the title is ` preview `.
 
 **The running list** (`view::running_subagents`, `running_list`): while the
 record lists subagents running as of `App::wall_clock`, the foot of the preview

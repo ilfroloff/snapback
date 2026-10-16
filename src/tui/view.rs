@@ -40,7 +40,7 @@ use crate::agents::{self, AgentActivity, ReportedAgent};
 use crate::resume::ModelPick;
 use crate::search::SearchMode;
 use crate::store::preview::{self, FoldRegion, LinkRegion, SubagentRegion};
-use crate::store::subagents::{is_running, Subagent, SubagentStatus};
+use crate::store::subagents::{is_running, Subagent, SubagentRecord, SubagentStatus};
 use crate::store::{lineage, FailedTask};
 
 use super::app::{
@@ -402,13 +402,14 @@ const CHILD_ID_CHARS: usize = 8;
 /// its own gap in: the width reserved is then the width drawn.
 const CHILD_MSGS_GAP: &str = "  ";
 
-/// The unit a lineage CHILD row's turn count wears: `6 msgs`.
+/// The unit a turn count wears on a lineage CHILD row and in the session's title
+/// ([`session_title`]): `6 msgs`.
 ///
-/// Spelled out rather than left a bare number, because a bare `6` sitting beside
-/// an 8-char hex id reads as more id. The unit is what makes the number
-/// self-describing at the glance this row is built for. Uniform across every
-/// count (`1 msgs` is not special-cased): the plural rule would buy a
-/// grammatically nicer edge case at the price of a width that depends on the
+/// Spelled out rather than left a bare number, because on the child row a bare
+/// `6` sitting beside an 8-char hex id reads as more id. The unit is what makes
+/// the number self-describing at the glance this row is built for. Uniform
+/// across every count (`1 msgs` is not special-cased): the plural rule would buy
+/// a grammatically nicer edge case at the price of a width that depends on the
 /// value, and this segment's width has to be knowable before it is drawn — see
 /// [`fit_child_msgs`].
 const CHILD_MSGS_SUFFIX: &str = " msgs";
@@ -1991,12 +1992,13 @@ const RUNNING_LIST_PANE_SHARE: u16 = 2;
 /// The separator between a running-list row's facts, and between the one-line
 /// form's count and its hint: the middot the banner's age and the draft card
 /// use between facts. The subagent view's title parts its facts with it too
-/// ([`subagent_title`]), so a subagent reads alike in both.
+/// ([`subagent_title`]), so a subagent reads alike in both, and so does the
+/// session's ([`session_title`]), so the two titles read as one family.
 const RUNNING_LIST_SEPARATOR: &str = " \u{b7} ";
 
-/// The green the running list's `●` and the subagent view title's `running` are
-/// drawn in: one colour, so the two say running alike. A NAMED ANSI colour
-/// (TERMINAL-SAFE STYLING).
+/// The green the running list's `●`, the subagent view title's `running` and the
+/// session title's `N running` are drawn in: one colour, so all three say running
+/// alike. A NAMED ANSI colour (TERMINAL-SAFE STYLING).
 const RUNNING_COLOR: Color = Color::Green;
 
 /// The running list's hint on the board: the key that opens the subagent view.
@@ -2035,14 +2037,20 @@ fn running_subagents(app: &App) -> Vec<&Subagent> {
     if app.is_composing() || app.draft.is_some() {
         return Vec::new();
     }
-    let now = app.wall_clock();
-    app.selected_subagents().map_or_else(Vec::new, |record| {
-        record
-            .subagents()
-            .iter()
-            .filter(|subagent| is_running(subagent.ended, subagent.newest_write, now))
-            .collect()
-    })
+    app.selected_subagents()
+        .map_or_else(Vec::new, |record| running_in(record, app.wall_clock()))
+}
+
+/// The subagents of `record` RUNNING at `now` ([`is_running`]), in launch order:
+/// the ONE count the running list ([`running_subagents`]) and the session's title
+/// ([`session_title_facts`]) both draw, so the two can never disagree about how
+/// many run. Pure.
+fn running_in(record: &SubagentRecord, now: SystemTime) -> Vec<&Subagent> {
+    record
+        .subagents()
+        .iter()
+        .filter(|subagent| is_running(subagent.ended, subagent.newest_write, now))
+        .collect()
 }
 
 /// How many rows the running list takes for `running` running subagents in a
@@ -2591,9 +2599,10 @@ fn completion_cell<'a>(text: &'a str, marks: &[usize], style: Style) -> TableCel
     cell.style(style)
 }
 
-/// The preview block's title whenever the pane is NOT standing in for a hidden
-/// list — which is every layout but [`PaneLayout::PreviewOnly`]. Named once so the
-/// string drawn and the string the tests look for cannot drift apart.
+/// The preview block's title when the pane has no session transcript to state
+/// the facts of: nothing is selected, or a new-session draft card holds the pane.
+/// Named once so the string drawn and the string the tests look for cannot drift
+/// apart.
 const PREVIEW_TITLE: &str = " preview ";
 
 /// What the preview block's title says while the pane shows the SUBAGENT VIEW,
@@ -2601,17 +2610,26 @@ const PREVIEW_TITLE: &str = " preview ";
 /// selected session's own transcript.
 const SUBAGENT_TITLE_PREFIX: &str = "subagent";
 
-/// The blank either side of the subagent view's title, which sets it off the
-/// border's line as [`PREVIEW_TITLE`]'s blanks set it.
-const SUBAGENT_TITLE_PAD: &str = " ";
+/// The blank either side of the session's and the subagent view's titles, which
+/// sets them off the border's line as [`PREVIEW_TITLE`]'s blanks set it.
+const PREVIEW_TITLE_PAD: &str = " ";
 
 /// What leads the subagent view title's launch time (`started 14:02`).
 const SUBAGENT_STARTED_LABEL: &str = "started ";
 
-/// What leads the subagent view title's age (`last write 12s ago`): the age of
-/// its newest write — its own, or a subagent's below it — the instant the
-/// running check measures from, never of its launch.
-const SUBAGENT_LAST_WRITE_LABEL: &str = "last write ";
+/// What leads a title's age (`last write 12s ago`). In the subagent view's it
+/// is the age of the subagent's newest write — its own, or a subagent's below
+/// it — the instant the running check measures from, never of its launch; in
+/// the session's, of the session's most recent activity
+/// ([`Session::timestamp`](crate::store::Session::timestamp)).
+const LAST_WRITE_LABEL: &str = "last write ";
+
+/// The unit the session title's subagent count wears (`5 subagents`): uniform
+/// across every count, as [`CHILD_MSGS_SUFFIX`] is.
+const SESSION_SUBAGENTS_SUFFIX: &str = " subagents";
+
+/// The unit the session title's running count wears (`2 running`).
+const SESSION_RUNNING_SUFFIX: &str = " running";
 
 /// The subagent view title's `quiet`: the NAMED dim gray an ended job's badge
 /// reads as dormant in ([`BADGE_ENDED`]), since a quiet run is not doing
@@ -2672,46 +2690,73 @@ fn subagent_title_facts(app: &App) -> Option<SubagentTitleFacts<'_>> {
 ///
 /// What does not fit gives way in this order: the DESCRIPTION, cut with an
 /// ellipsis ([`fit_label`]) and then dropped, then `last write …`, then
-/// `started …`, each of those two dropped whole. `subagent`, `@<agentType>`, the
-/// state and `N/M` are never cut here: narrower than those four, the title is
-/// returned as they are and the border cuts it at its edge, as it cuts any
-/// title. Pure.
+/// `started …`, each of those two dropped whole ([`fit_title`]). `subagent`,
+/// `@<agentType>`, the state and `N/M` are never cut here: narrower than those
+/// four, the title is returned as they are and the border cuts it at its edge, as
+/// it cuts any title. Pure.
 fn subagent_title(facts: &SubagentTitleFacts<'_>, width: u16) -> Line<'static> {
-    let width = usize::from(width);
     let started = facts
         .launched
         .map(|at| format!("{SUBAGENT_STARTED_LABEL}{}", launch_time(at, facts.now)));
-    let last_write = subagent_age(
-        facts
-            .newest_write
-            .and_then(|written| facts.now.duration_since(written).ok()),
-    )
-    .map(|age| format!("{SUBAGENT_LAST_WRITE_LABEL}{age}"));
-    let (started, last_write) = (started.as_deref(), last_write.as_deref());
+    let last_write = written_ago(facts.newest_write, facts.now);
     let description = facts.description.filter(|text| !text.trim().is_empty());
-    let draw = |description: Option<&str>, started: Option<&str>, last_write: Option<&str>| {
-        subagent_title_line(facts, description, started, last_write)
-    };
-    let whole = draw(description, started, last_write);
+    fit_title(
+        width,
+        description,
+        [last_write.as_deref(), started.as_deref()],
+        |description, [last_write, started]| {
+            subagent_title_line(facts, description, started, last_write)
+        },
+    )
+}
+
+/// A title's `last write <age>` segment for a write at `written`, as of `now`,
+/// in the running list's age wording ([`subagent_age`]), or `None` with no age
+/// to state: no write, or one after `now` (the clocks disagree). Pure.
+fn written_ago(written: Option<SystemTime>, now: SystemTime) -> Option<String> {
+    subagent_age(written.and_then(|written| now.duration_since(written).ok()))
+        .map(|age| format!("{LAST_WRITE_LABEL}{age}"))
+}
+
+/// The ONE fitting the preview block's titles share ([`subagent_title`],
+/// [`session_title`]): `draw(flexible, droppable)` drawn with as much as fits in
+/// `width` columns.
+///
+/// What does not fit gives way in a fixed order. First the `flexible` segment,
+/// cut with an ellipsis ([`fit_label`]) and then dropped; `draw` must add it to
+/// the title as its text and one [`RUNNING_LIST_SEPARATOR`], the columns held
+/// back for it. Then each `droppable` segment, dropped whole, in the order the
+/// array lists them. What `draw` adds beyond those is never cut here: narrower
+/// than that, the title is returned as it is and the border cuts it at its edge.
+/// Pure.
+fn fit_title<const N: usize>(
+    width: u16,
+    flexible: Option<&str>,
+    droppable: [Option<&str>; N],
+    draw: impl Fn(Option<&str>, [Option<&str>; N]) -> Line<'static>,
+) -> Line<'static> {
+    let width = usize::from(width);
+    let whole = draw(flexible, droppable);
     if whole.width() <= width {
         return whole;
     }
-    let bare = draw(None, started, last_write);
-    if let Some(description) = description {
-        let used = bare.width() + UnicodeWidthStr::width(RUNNING_LIST_SEPARATOR);
-        let cut = fit_label(description, width, used, 0);
+    let mut kept = droppable;
+    let mut line = draw(None, kept);
+    if let Some(flexible) = flexible {
+        let used = line.width() + UnicodeWidthStr::width(RUNNING_LIST_SEPARATOR);
+        let cut = fit_label(flexible, width, used, 0);
         if !cut.is_empty() {
-            return draw(Some(&cut), started, last_write);
+            return draw(Some(&cut), kept);
         }
     }
-    if bare.width() <= width {
-        return bare;
+    for dropped in 0..N {
+        if line.width() <= width {
+            return line;
+        }
+        kept[dropped] = None;
+        line = draw(None, kept);
     }
-    let undated = draw(None, started, None);
-    if undated.width() <= width {
-        return undated;
-    }
-    draw(None, None, None)
+    line
 }
 
 /// The subagent view's title with exactly the given `description`, `started`
@@ -2724,7 +2769,7 @@ fn subagent_title_line(
     last_write: Option<&str>,
 ) -> Line<'static> {
     let mut spans = vec![Span::raw(format!(
-        "{SUBAGENT_TITLE_PAD}{SUBAGENT_TITLE_PREFIX} @{}",
+        "{PREVIEW_TITLE_PAD}{SUBAGENT_TITLE_PREFIX} @{}",
         facts.agent_type
     ))];
     if let Some(description) = description {
@@ -2742,7 +2787,7 @@ fn subagent_title_line(
             "{RUNNING_LIST_SEPARATOR}{position}/{count}"
         )));
     }
-    spans.push(Span::raw(SUBAGENT_TITLE_PAD));
+    spans.push(Span::raw(PREVIEW_TITLE_PAD));
     Line::from(spans)
 }
 
@@ -2779,10 +2824,151 @@ fn day_at(now: SystemTime, offset: UtcOffset) -> Option<Date> {
     )
 }
 
-/// The preview block's title: [`PREVIEW_TITLE`], or — in the 0:1
-/// [`PaneLayout::PreviewOnly`] layout, where no list is drawn to show which row is
-/// selected — the SELECTED session's label, so the pane still says whose
-/// transcript it is. `↑`/`↓` keep moving the selection there, and the title is
+/// `at` as a [`SystemTime`], or `None` before the Unix epoch or past what the
+/// platform's clock can hold: a transcript's timestamp is hostile input, and
+/// `SystemTime::from` panics where the platform cannot hold it. Pure.
+fn system_time_of(at: OffsetDateTime) -> Option<SystemTime> {
+    let secs = u64::try_from(at.unix_timestamp()).ok()?;
+    SystemTime::UNIX_EPOCH.checked_add(Duration::new(secs, at.nanosecond()))
+}
+
+/// What the session's title states ([`session_title`]), gathered from state
+/// `App` already holds ([`session_title_facts`]), never from a file or a clock.
+#[derive(Debug, Clone)]
+struct SessionTitleFacts<'a> {
+    /// Its name — its label, or its id for an empty one, as [`compose_title`]
+    /// falls back — in the 0:1 [`PaneLayout::PreviewOnly`] layout alone, where no
+    /// list is drawn to show which row is selected; `None` in every other.
+    name: Option<&'a str>,
+    /// claude's status for it in words ([`agents::friendly_status`], the pinned
+    /// row's phrase), `None` when claude does not report it or while this
+    /// board's quick reply to it is in flight ([`session_title_facts`]).
+    status: Option<String>,
+    /// Its most recent activity ([`Session::timestamp`](crate::store::Session::timestamp)).
+    last_write: Option<SystemTime>,
+    /// Its turn count ([`Session::msg_count`](crate::store::Session::msg_count)).
+    msg_count: usize,
+    /// How many subagents its record lists: `0` before the record lands too.
+    subagents: usize,
+    /// How many of those run at `now` ([`running_in`]).
+    running: usize,
+    /// The instant the age and the running count are stated as of:
+    /// `App::wall_clock`.
+    now: SystemTime,
+}
+
+/// The selected session's [`SessionTitleFacts`], or `None` with nothing
+/// selected. Read-only over `App`: no clock, no I/O.
+///
+/// The status is left out while THIS board's quick reply to the session is in
+/// flight ([`App::sending_to`]), as the pinned row leaves it out
+/// ([`preview_banner`]): the transcript's `cooking…` tail already says claude is
+/// working. The running count is NOT hidden while a compose box is open, as the
+/// running list is ([`running_subagents`]): the list steps aside for the box's
+/// rows, and a title that dropped the count would read as nothing running.
+fn session_title_facts(app: &App) -> Option<SessionTitleFacts<'_>> {
+    let session = app.selected_session()?;
+    let id = session.session_id.as_str();
+    let label = if session.label.is_empty() {
+        id
+    } else {
+        session.label.as_str()
+    };
+    let name = (app.pane_layout() == PaneLayout::PreviewOnly).then_some(label);
+    let status = app
+        .reported_agent(id)
+        .filter(|_| app.sending_to(id).is_none())
+        .map(agents::friendly_status);
+    let now = app.wall_clock();
+    let record = app.selected_subagents();
+    Some(SessionTitleFacts {
+        name,
+        status,
+        last_write: session.timestamp.and_then(system_time_of),
+        msg_count: session.msg_count,
+        subagents: record.map_or(0, |record| record.subagents().len()),
+        running: record.map_or(0, |record| running_in(record, now).len()),
+        now,
+    })
+}
+
+/// The session's title for a top border that gives it `width` columns between
+/// its corners: ` <name> · <status> · last write <age> · N msgs · N subagents · N running `,
+/// for example ` live working · last write 12s ago · 171 msgs · 5 subagents · 2 running `
+/// — the name only in the 0:1 layout ([`SessionTitleFacts::name`]).
+///
+/// A segment whose fact is unknown is left out, never a placeholder or a
+/// dangling separator: no name, no status, no age to state ([`written_ago`]), no
+/// subagents counted (no record yet, or one listing none), none running. The
+/// age is the subagent view title's, the turn count [`CHILD_MSGS_SUFFIX`]'s, and
+/// `N running` is drawn in [`RUNNING_COLOR`], as the subagent view's `running`.
+///
+/// What does not fit gives way in this order ([`fit_title`], the subagent
+/// view's own fitting): the NAME, cut with an ellipsis and then dropped, then
+/// `last write …`, then `N msgs`. The status and the subagent counts are never
+/// cut here: narrower than those, the border cuts the title at its edge. With
+/// nothing left to state the title is empty. Pure.
+fn session_title(facts: &SessionTitleFacts<'_>, width: u16) -> Line<'static> {
+    let last_write = written_ago(facts.last_write, facts.now);
+    let msgs = format!("{}{CHILD_MSGS_SUFFIX}", facts.msg_count);
+    fit_title(
+        width,
+        facts.name,
+        [last_write.as_deref(), Some(msgs.as_str())],
+        |name, [last_write, msgs]| session_title_line(facts, name, last_write, msgs),
+    )
+}
+
+/// The session's title with exactly the given `name`, `last_write` and `msgs`
+/// segments, and every other fact `facts` states, joined by
+/// [`RUNNING_LIST_SEPARATOR`] between [`PREVIEW_TITLE_PAD`]s; an empty line when
+/// there is no segment at all. Pure.
+fn session_title_line(
+    facts: &SessionTitleFacts<'_>,
+    name: Option<&str>,
+    last_write: Option<&str>,
+    msgs: Option<&str>,
+) -> Line<'static> {
+    let mut segments: Vec<Span<'static>> = [name, facts.status.as_deref(), last_write, msgs]
+        .into_iter()
+        .flatten()
+        .map(|segment| Span::raw(segment.to_string()))
+        .collect();
+    if facts.subagents > 0 {
+        segments.push(Span::raw(format!(
+            "{}{SESSION_SUBAGENTS_SUFFIX}",
+            facts.subagents
+        )));
+    }
+    if facts.running > 0 {
+        segments.push(Span::styled(
+            format!("{}{SESSION_RUNNING_SUFFIX}", facts.running),
+            Style::default().fg(RUNNING_COLOR),
+        ));
+    }
+    if segments.is_empty() {
+        return Line::default();
+    }
+    let mut spans = Vec::with_capacity(2 * segments.len() + 1);
+    for (index, segment) in segments.into_iter().enumerate() {
+        let lead = if index == 0 {
+            PREVIEW_TITLE_PAD
+        } else {
+            RUNNING_LIST_SEPARATOR
+        };
+        spans.push(Span::raw(lead));
+        spans.push(segment);
+    }
+    spans.push(Span::raw(PREVIEW_TITLE_PAD));
+    Line::from(spans)
+}
+
+/// The preview block's title: the SELECTED session's state ([`session_title`]),
+/// ` live working · last write 12s ago · 171 msgs · 5 subagents · 2 running `,
+/// fitted to the `width` columns the border gives a title. In the 0:1
+/// [`PaneLayout::PreviewOnly`] layout, where no list is drawn to show which row
+/// is selected, the session's name leads it, so the pane still says whose
+/// transcript it is: `↑`/`↓` keep moving the selection there, and the title is
 /// what tells the reader where it went.
 ///
 /// While the pane shows the subagent view, in any layout, it names that subagent
@@ -2793,15 +2979,13 @@ fn day_at(now: SystemTime, offset: UtcOffset) -> Option<Date> {
 /// how long ago it last wrote, and where it stands in the launch order `←`/`→`
 /// step through
 /// (` subagent @parser-auditor · Audit the parser · finished · started 23:50 · last write 2h ago · 2/5 `),
-/// fitted to the `width` columns the border gives a title ([`subagent_title`]).
+/// fitted by the same [`fit_title`] ([`subagent_title`]).
 ///
-/// Falls back to the session id for an empty label, as [`compose_title`] does, and
-/// to [`PREVIEW_TITLE`] when there is no transcript to name: nothing selected, or a
-/// new-session DRAFT card replacing the transcript — naming the selected row over
-/// a placeholder for a session that does not exist yet would claim the card
-/// belongs to an unrelated conversation. Only the subagent view's title is fitted:
-/// the others are cut at the border's edge. Pure, so the wording is assertable
-/// without a terminal.
+/// [`PREVIEW_TITLE`] when there is no transcript to state the facts of: nothing
+/// selected, or a new-session DRAFT card replacing the transcript — the selected
+/// row's facts over a placeholder for a session that does not exist yet would
+/// claim the card belongs to an unrelated conversation. Pure, so the wording is
+/// assertable without a terminal.
 fn preview_title(app: &App, width: u16) -> Line<'static> {
     if app.draft.is_some() {
         return Line::from(PREVIEW_TITLE);
@@ -2809,14 +2993,10 @@ fn preview_title(app: &App, width: u16) -> Line<'static> {
     if let Some(facts) = subagent_title_facts(app) {
         return subagent_title(&facts, width);
     }
-    if app.pane_layout() != PaneLayout::PreviewOnly {
-        return Line::from(PREVIEW_TITLE);
-    }
-    Line::from(match app.selected_session() {
-        Some(session) if !session.label.is_empty() => format!(" {} ", session.label),
-        Some(session) => format!(" {} ", session.session_id),
-        None => PREVIEW_TITLE.to_string(),
-    })
+    session_title_facts(app).map_or_else(
+        || Line::from(PREVIEW_TITLE),
+        |facts| session_title(&facts, width),
+    )
 }
 
 /// The readable transcript preview for the selected session, vertically
@@ -13936,10 +14116,11 @@ mod tests {
         line_string(&preview_title(app, u16::MAX))
     }
 
-    /// The preview's title is the generic one wherever a list still shows which row
-    /// is selected, and the selected session's name only at 0:1 — falling back to
-    /// the id for an empty label, and to the generic title with nothing selected or
-    /// with a draft card standing in for a session that does not exist yet.
+    /// The preview's title states the selected session's facts with no name
+    /// wherever a list still shows which row is selected, and leads with the
+    /// session's name only at 0:1 — falling back to the id for an empty label —
+    /// and is the generic title with nothing selected or with a draft card
+    /// standing in for a session that does not exist yet.
     #[test]
     fn the_preview_title_names_the_selected_session_only_when_the_list_is_hidden() {
         use crate::tui::compose::ComposeState;
@@ -13955,16 +14136,19 @@ mod tests {
             PaneLayout::ListWide,
         ] {
             app.set_pane_layout(layout);
-            assert_eq!(title_text(&app), PREVIEW_TITLE, "{layout:?}");
+            assert_eq!(title_text(&app), " 0 msgs ", "{layout:?}");
         }
 
         app.set_pane_layout(PaneLayout::PreviewOnly);
-        assert_eq!(title_text(&app), " Fix the payment webhook retries ");
+        assert_eq!(
+            title_text(&app),
+            " Fix the payment webhook retries \u{b7} 0 msgs "
+        );
 
         app.sessions[0].label.clear();
         assert_eq!(
             title_text(&app),
-            " sess-normal-1 ",
+            " sess-normal-1 \u{b7} 0 msgs ",
             "an empty label falls back to the id"
         );
 
@@ -15463,7 +15647,8 @@ mod tests {
             rows.iter().any(|row| row.contains(REPLY_COOKING_LABEL)),
             "premise: the session's pane draws its in-flight reply: {rows:?}"
         );
-        assert_eq!(title_text(&app), PREVIEW_TITLE);
+        let session_title = title_text(&app);
+        assert_eq!(session_title, " 0 msgs ", "the session's own title");
 
         app.open_subagent_view("a1b2c3d4e5f6a7b8c", "parser-auditor");
         let rows = inner_rows(&mut app, width, height);
@@ -15479,7 +15664,7 @@ mod tests {
 
         app.leave_subagent_view();
         assert_eq!(inner_rows(&mut app, width, height)[0], failure);
-        assert_eq!(title_text(&app), PREVIEW_TITLE);
+        assert_eq!(title_text(&app), session_title);
     }
 
     /// R4-4a: the subagent view's title states where the subagent stands in the
@@ -15529,7 +15714,11 @@ mod tests {
             "a subagent the record does not list yet has no place"
         );
         app.leave_subagent_view();
-        assert_eq!(title_text(&app), PREVIEW_TITLE);
+        assert_eq!(
+            title_text(&app),
+            " 0 msgs \u{b7} 5 subagents ",
+            "the session's own title"
+        );
     }
 
     // --- the subagent view's title ---------------------------------------------
@@ -15795,6 +15984,362 @@ mod tests {
         let buffer = drawn_board(&mut app, width, 24);
         let title = " subagent @parser-auditor \u{b7} Audit the parser \u{b7} running \u{b7} \
                      started 10-01 23:50 \u{b7} last write 30s ago \u{b7} 1/1 ";
+        let rule = "\u{2500}".repeat(usize::from(width - 2 - columns(title)));
+        assert_eq!(
+            full_row_text(&buffer, app.preview_rect.y, width),
+            format!("\u{250c}{title}{rule}\u{2510}")
+        );
+    }
+
+    // --- the session's title ---------------------------------------------------
+
+    /// A reported session that last wrote 12 s before [`title_now`], holding 171
+    /// turns and five subagents, two of them running; no name, as outside 0:1.
+    fn session_facts() -> SessionTitleFacts<'static> {
+        SessionTitleFacts {
+            name: None,
+            status: Some("live working".to_string()),
+            last_write: Some(title_now() - Duration::from_secs(12)),
+            msg_count: 171,
+            subagents: 5,
+            running: 2,
+            now: title_now(),
+        }
+    }
+
+    /// The name the 0:1 layout leads a session's title with.
+    const SESSION_NAME: &str = "Fix the payment webhook retries";
+
+    /// [`session_facts`]' whole title.
+    const SESSION_TITLE: &str = " live working \u{b7} last write 12s ago \u{b7} 171 msgs \u{b7} \
+                                 5 subagents \u{b7} 2 running ";
+
+    /// [`session_facts`]' whole title led by [`SESSION_NAME`].
+    const NAMED_SESSION_TITLE: &str = " Fix the payment webhook retries \u{b7} live working \u{b7} \
+                                       last write 12s ago \u{b7} 171 msgs \u{b7} 5 subagents \u{b7} \
+                                       2 running ";
+
+    /// [`session_facts`] led by [`SESSION_NAME`].
+    fn named_session_facts() -> SessionTitleFacts<'static> {
+        SessionTitleFacts {
+            name: Some(SESSION_NAME),
+            ..session_facts()
+        }
+    }
+
+    /// The text of [`session_title`] over `facts` at `width`.
+    fn fitted_session_title(facts: &SessionTitleFacts<'_>, width: u16) -> String {
+        line_string(&session_title(facts, width))
+    }
+
+    /// The session's title states every fact it knows, in order —
+    /// `<name> · <status> · last write <age> · N msgs · N subagents · N running`
+    /// — and draws `N running` in the running list's green, the status unstyled.
+    #[test]
+    fn the_session_title_states_every_fact_it_knows_in_order() {
+        assert_eq!(
+            fitted_session_title(&session_facts(), u16::MAX),
+            SESSION_TITLE
+        );
+        assert_eq!(
+            fitted_session_title(&named_session_facts(), u16::MAX),
+            NAMED_SESSION_TITLE
+        );
+
+        let line = session_title(&session_facts(), u16::MAX);
+        let style = |text: &str| {
+            line.spans
+                .iter()
+                .find(|span| span.content == text)
+                .unwrap_or_else(|| panic!("{text:?} is its own span: {line:?}"))
+                .style
+        };
+        assert_eq!(style("2 running").fg, Some(Color::Green));
+        assert_eq!(style("live working"), Style::default());
+    }
+
+    /// A fact the session's title does not know is left out — no placeholder, no
+    /// dangling separator: no status, no write or one after `now` (the clocks
+    /// disagree), no subagent counted, none running. With only the turn count
+    /// known, that is the title; with nothing left to state, there is none.
+    #[test]
+    fn the_session_title_leaves_out_every_fact_it_does_not_know() {
+        let without = |facts: SessionTitleFacts<'static>, gone: &str| {
+            assert_eq!(
+                fitted_session_title(&facts, u16::MAX),
+                SESSION_TITLE.replacen(gone, "", 1),
+                "{gone:?} is left out"
+            );
+        };
+        without(
+            SessionTitleFacts {
+                status: None,
+                ..session_facts()
+            },
+            " live working \u{b7}",
+        );
+        for last_write in [None, Some(title_now() + Duration::from_secs(5))] {
+            without(
+                SessionTitleFacts {
+                    last_write,
+                    ..session_facts()
+                },
+                " \u{b7} last write 12s ago",
+            );
+        }
+        without(
+            SessionTitleFacts {
+                running: 0,
+                ..session_facts()
+            },
+            " \u{b7} 2 running",
+        );
+        without(
+            SessionTitleFacts {
+                subagents: 0,
+                running: 0,
+                ..session_facts()
+            },
+            " \u{b7} 5 subagents \u{b7} 2 running",
+        );
+
+        let nothing = SessionTitleFacts {
+            status: None,
+            last_write: None,
+            subagents: 0,
+            running: 0,
+            ..session_facts()
+        };
+        assert_eq!(fitted_session_title(&nothing, u16::MAX), " 171 msgs ");
+        assert_eq!(
+            fitted_session_title(&nothing, 0),
+            "",
+            "the count gave way, so no title"
+        );
+    }
+
+    /// What does not fit gives way in order, at each boundary — the width a
+    /// segment goes at and one column wider: the name is cut with an ellipsis,
+    /// down to the ellipsis alone, then dropped; then `last write …`; then
+    /// `N msgs`. The status and the subagent counts are never cut by the fit:
+    /// narrower than those, the title is theirs whole.
+    #[test]
+    fn the_session_title_gives_way_name_then_last_write_then_msgs() {
+        let named = named_session_facts();
+        let full = columns(NAMED_SESSION_TITLE);
+        assert_eq!(
+            fitted_session_title(&named, full),
+            NAMED_SESSION_TITLE,
+            "fits exactly"
+        );
+        let cut = fitted_session_title(&named, full - 1);
+        assert_eq!(
+            cut,
+            format!(" Fix the payment webhook retri\u{2026} \u{b7}{SESSION_TITLE}")
+        );
+        assert_eq!(columns(&cut), full - 1);
+
+        let bare = columns(SESSION_TITLE);
+        let separator = columns(RUNNING_LIST_SEPARATOR);
+        assert_eq!(
+            fitted_session_title(&named, bare + separator + 1),
+            format!(" \u{2026} \u{b7}{SESSION_TITLE}"),
+            "the ellipsis alone"
+        );
+        assert_eq!(
+            fitted_session_title(&named, bare + separator),
+            SESSION_TITLE,
+            "the name goes"
+        );
+
+        let undated = " live working \u{b7} 171 msgs \u{b7} 5 subagents \u{b7} 2 running ";
+        assert_eq!(fitted_session_title(&named, bare), SESSION_TITLE);
+        assert_eq!(
+            fitted_session_title(&named, bare - 1),
+            undated,
+            "last write goes"
+        );
+
+        let kept = " live working \u{b7} 5 subagents \u{b7} 2 running ";
+        assert_eq!(fitted_session_title(&named, columns(undated)), undated);
+        assert_eq!(
+            fitted_session_title(&named, columns(undated) - 1),
+            kept,
+            "the turn count goes"
+        );
+        assert_eq!(fitted_session_title(&named, columns(kept)), kept);
+        assert_eq!(
+            fitted_session_title(&named, columns(kept) - 1),
+            kept,
+            "never cut"
+        );
+        assert_eq!(fitted_session_title(&named, 0), kept);
+        assert_eq!(
+            fitted_session_title(&session_facts(), bare - 1),
+            undated,
+            "with no name the order starts at last write"
+        );
+    }
+
+    /// A transcript's timestamp becomes the instant it names, to the
+    /// nanosecond, from the Unix epoch on; one before the epoch gives none, so
+    /// the title states no age for it.
+    #[test]
+    fn a_timestamp_before_the_unix_epoch_has_no_system_time() {
+        let at = time::macros::datetime!(2026-10-13 14:29:48.5 UTC);
+        assert_eq!(
+            system_time_of(at),
+            Some(title_now() - Duration::from_millis(11_500))
+        );
+        assert_eq!(
+            system_time_of(time::macros::datetime!(1969-12-31 23:59:59 UTC)),
+            None
+        );
+        assert_eq!(
+            system_time_of(time::OffsetDateTime::UNIX_EPOCH),
+            Some(SystemTime::UNIX_EPOCH)
+        );
+    }
+
+    /// The selected session as `App` holds it: last written 12 s before
+    /// [`title_now`], 171 turns, reported `live busy`; the wall clock unstamped.
+    fn session_title_app() -> App {
+        let mut session = sample_session();
+        session.timestamp = Some(time::macros::datetime!(2026-10-13 14:29:48 UTC));
+        session.msg_count = 171;
+        let agent = ReportedAgent::fixture("interactive", None, Some("busy"));
+        reported_app(session, agent, None)
+    }
+
+    /// The title reads the SELECTED session's facts off `App` — claude's status
+    /// in the pinned row's words, the session's last write aged against
+    /// `App::wall_clock`, its turn count, its subagent record — and leads with
+    /// its name in the 0:1 layout alone. Each fact `App` does not hold is left
+    /// out: the age before the wall clock is first stamped; the status while this
+    /// board's quick reply to the session is in flight, or when claude does not
+    /// report it; the subagent counts before the record lands or when it lists
+    /// none; the running count when nothing runs.
+    #[test]
+    fn the_session_title_reads_the_selected_sessions_facts_and_leaves_out_the_rest() {
+        use super::super::app::Sending;
+        use crate::store::subagents::SubagentRecord;
+
+        assert_eq!(
+            title_text(&session_title_app()),
+            " live busy \u{b7} 171 msgs ",
+            "an unstamped wall clock states no age"
+        );
+
+        let base = " live busy \u{b7} last write 12s ago \u{b7} 171 msgs ";
+        let mut app = session_title_app();
+        app.note_wall_clock(title_now());
+        assert_eq!(title_text(&app), base, "no record yet");
+
+        for layout in [
+            PaneLayout::PreviewWide,
+            PaneLayout::Even,
+            PaneLayout::ListWide,
+        ] {
+            app.set_pane_layout(layout);
+            assert_eq!(title_text(&app), base, "{layout:?}: no name");
+        }
+        app.set_pane_layout(PaneLayout::PreviewOnly);
+        assert_eq!(title_text(&app), format!(" sess-normal-1 \u{b7}{base}"));
+        app.set_pane_layout(PaneLayout::Even);
+
+        app.apply_subagent_record("sess-normal-1", SubagentRecord::new(Vec::new()));
+        assert_eq!(title_text(&app), base, "a record listing none");
+
+        let subagent = |agent_id: &str, ended: Option<bool>| Subagent {
+            agent_id: agent_id.to_string(),
+            agent_type: "writer".to_string(),
+            description: None,
+            launched: None,
+            newest_write: Some(title_now() - Duration::from_secs(5)),
+            ended,
+        };
+        app.apply_subagent_record(
+            "sess-normal-1",
+            SubagentRecord::new(vec![
+                subagent("a1", Some(false)),
+                subagent("b2", Some(true)),
+            ]),
+        );
+        assert_eq!(
+            title_text(&app),
+            format!("{base}\u{b7} 2 subagents \u{b7} 1 running ")
+        );
+        app.apply_subagent_record(
+            "sess-normal-1",
+            SubagentRecord::new(vec![subagent("a1", None), subagent("b2", Some(true))]),
+        );
+        let quiet = format!("{base}\u{b7} 2 subagents ");
+        assert_eq!(title_text(&app), quiet, "none running");
+
+        app.sending = vec![Sending {
+            session_id: "sess-normal-1".to_string(),
+            message: "1a".to_string(),
+            baseline_msg_count: 0,
+        }];
+        let unstated = " last write 12s ago \u{b7} 171 msgs \u{b7} 2 subagents ";
+        assert_eq!(
+            title_text(&app),
+            unstated,
+            "the reply's cooking tail states it"
+        );
+        app.sending.clear();
+        assert_eq!(title_text(&app), quiet);
+
+        app.set_reported_agents(HashMap::new(), None);
+        assert_eq!(title_text(&app), unstated, "claude does not report it");
+    }
+
+    /// The title's running count is the running list's — the same `is_running`
+    /// over the same record at the same `App::wall_clock` — so the two agree as
+    /// subagents go quiet. A reply box hides the list but not the count: a title
+    /// that dropped it would read as nothing running.
+    #[test]
+    fn the_session_titles_running_count_is_the_running_lists() {
+        let count = |app: &App| {
+            session_title_facts(app)
+                .expect("a session is selected")
+                .running
+        };
+        let mut app = running_list_app();
+        assert_eq!(running_subagents(&app).len(), 2, "premise: two run");
+        assert_eq!(count(&app), 2);
+
+        // Past the auditor's window (its write 125 s before the list's instant)
+        // and inside the docs writer's (5 s before it).
+        app.note_wall_clock(list_now() + Duration::from_secs(9 * 60));
+        assert_eq!(running_subagents(&app).len(), 1, "premise: one runs");
+        assert_eq!(count(&app), 1);
+        assert!(
+            title_text(&app).ends_with(" \u{b7} 4 subagents \u{b7} 1 running "),
+            "{:?}",
+            title_text(&app)
+        );
+
+        app.note_wall_clock(list_now() + Duration::from_secs(11 * 60));
+        assert!(running_subagents(&app).is_empty(), "premise: none runs");
+        assert_eq!(count(&app), 0);
+
+        let mut composing = running_list_app();
+        composing.open_compose(
+            ComposeState::new_reply("sess-normal-1".to_string(), None),
+            None,
+        );
+        assert!(running_subagents(&composing).is_empty(), "the list hides");
+        assert_eq!(count(&composing), 2, "the title still counts");
+    }
+
+    /// The drawn preview's top border carries the selected session's title.
+    #[test]
+    fn the_drawn_preview_title_states_the_selected_sessions_facts() {
+        let mut app = running_list_app();
+        let width = 80;
+        let buffer = drawn_board(&mut app, width, 24);
+        let title = " sess-normal-1 \u{b7} 0 msgs \u{b7} 4 subagents \u{b7} 2 running ";
         let rule = "\u{2500}".repeat(usize::from(width - 2 - columns(title)));
         assert_eq!(
             full_row_text(&buffer, app.preview_rect.y, width),

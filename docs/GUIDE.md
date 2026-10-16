@@ -43,7 +43,7 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | `←` / `→` (in the model picker) | **Step the highlighted model's effort** down / up: `default effort` (no `--effort`, your settings decide) → `low` → `medium` → `high` → `xhigh` → `max`, wrapping round both ways. `Enter` sets the model and the effort together into the box; `Esc` goes back to the box with your text and its previous choice untouched. They do nothing on the picker's first (default) row, and nothing in the agent picker or the move picker — and inside any picker they never move the search cursor on the board underneath |
 | `Tab` | Toggle search: **name-only ↔ name+content**. Widening to content also opens the preview on the most recent match, the same way typing does |
 | `Ctrl-A` | Flip scope: **current folder ↔ project** — the project being the repo you launched in and all of its git worktrees. Started with `-a` it is a three-stop cycle instead (current folder → project → all folders), which is the only way to reach all folders |
-| `Shift-←` / `Shift-→` | Change the **layout** one step — how the screen is split between the session list and the transcript preview, list:preview: `0:1` (preview only) · `1:3` · `1:1` · `3:1` · `1:0` (list only). You start at `1:1`; `Shift-←` gives the preview more room, `Shift-→` gives the list more, and a press at either end does nothing. Works with or without a search typed. The preview keeps your place as it resizes; coming back from `1:0` it opens on the newest turn. At `0:1` the preview's title names the selected session, and `↑` / `↓` still move between sessions |
+| `Shift-←` / `Shift-→` | Change the **layout** one step — how the screen is split between the session list and the transcript preview, list:preview: `0:1` (preview only) · `1:3` · `1:1` · `3:1` · `1:0` (list only). You start at `1:1`; `Shift-←` gives the preview more room, `Shift-→` gives the list more, and a press at either end does nothing. Works with or without a search typed. The preview keeps your place as it resizes; coming back from `1:0` it opens on the newest turn. At `0:1` the preview's title leads with the selected session's name, and `↑` / `↓` still move between sessions |
 | `PgUp` / `PgDn` | Scroll the preview a full page |
 | `Ctrl-U` / `Ctrl-D` | Scroll the preview a quarter page |
 | `Ctrl-T` / `Ctrl-E`, `Home` / `End` | Jump the preview to the top / bottom. Every preview scroll key (`PgUp` / `PgDn`, `Ctrl-U` / `Ctrl-D`, `Ctrl-T` / `Ctrl-E`, `Home` / `End`) also works while a quick-reply or fork box is open and leaves your text and cursor alone; there they replace the editor's own meaning (`Ctrl-U` delete to line start, `Ctrl-D` delete forward, `Ctrl-E` / `Home` / `End` / `PgUp` / `PgDn` caret moves — the arrows and `Ctrl-A` / `Ctrl-F` / `Ctrl-B` still move it). A new-session draft keeps all of them as editor keys, since its pane shows no transcript (on a MacBook keyboard without dedicated `Home`/`End` keys, `fn+←` / `fn+→` reach the same two) |
@@ -270,8 +270,9 @@ write in the session, the pinned row quotes that failure instead of naming the t
 (see *When a job you sent off fails* below).
 
 The session's *status* in words is on the list row instead, as the word beside the
-badge. It reports what Claude Code reports, in Claude Code's own words, with two
-exceptions. The two states that both mean *the session is waiting on you*
+badge, and in the preview's title (see *Readable transcript preview*). It reports
+what Claude Code reports, in Claude Code's own words, with two exceptions. The two
+states that both mean *the session is waiting on you*
 (`blocked` and `waiting`) are spelled out as `needs input`. And a background agent
 Claude Code still calls `working` while its own status reads `idle` — the shape of
 one that was interrupted and never cleaned up — is labelled `interrupted` (Claude
@@ -813,7 +814,17 @@ restores. A level the model can't use is quietly lowered by Claude Code (`max` o
 **Readable transcript preview.** Beside the list sits a preview of the selected
 session rendered as clean, scrollable markdown — the real conversation, whole,
 from its first turn to its last, however long it ran. So you
-can confirm it's the right session before jumping back in. Links show in light
+can confirm it's the right session before jumping back in. The preview's title
+says how the session stands: its status in Claude Code's words, how long ago it
+last wrote, how many messages it holds, and how many subagents it launched and
+how many of those are running —
+`live working · last write 12s ago · 171 msgs · 5 subagents · 2 running`. At
+`0:1`, where the list is hidden, the session's name leads it. Whatever snapback
+doesn't know is left out: no status for a session Claude Code doesn't report, or
+while a reply you sent it is in flight (its `cooking…` line says so already); no
+subagent count until snapback has read the session's subagents, or for a session
+that launched none; no running count while none runs. On a narrow pane the name
+is cut first, then the last write, then the message count. Links show in light
 blue, italic and underlined — the italic underline echoing how many terminals
 mark a url they detect — and are clickable, except in a table too wide for a
 narrow pane, which is stacked into `Header: value` lines where a link shows as
