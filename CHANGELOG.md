@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0](https://github.com/ilfroloff/snapback/compare/v0.13.0...v0.14.0) - 2026-10-16
+
+### Added
+
+- read an age of a day or more in whole days
+- head the preview with the selected session's state
+- show a session's subagents in the preview and follow them live
+- match the compose pick list by parts and highlight the hits
+
+### Fixed
+
+- *(tui)* copy preview selections as written and stop wrap crashes
+- keep hides made in parallel snapback windows
+
+### Other
+
+- *(tui/view)* draw every list overlay through one scrolling box
+- re-record the demo GIF with the pick list, fork box and move
+
 ## [0.13.0](https://github.com/ilfroloff/snapback/compare/v0.12.0...v0.13.0) - 2026-10-09
 
 ### Added
