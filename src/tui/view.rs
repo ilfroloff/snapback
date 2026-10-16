@@ -1439,8 +1439,8 @@ const BANNER_AGE_SEPARATOR: &str = " \u{b7} ";
 /// * **Its "now" is the POLL's, never a clock read here.** It subtracts the record's
 ///   `startedAt` from `App::reported_at_ms`, the wall-clock instant the poller
 ///   stamped this same map with. The age is therefore true "as of the last poll", and
-///   this render path reads no clock. A few seconds of staleness cannot move an `m`/`h`
-///   answer.
+///   this render path reads no clock. A few seconds of staleness cannot move an
+///   `m`/`h`/`d` answer.
 /// * **It reads the POLLED `--all` map, deliberately.** An age is a DISPLAY fact, so
 ///   the snapshot that draws badges is the right source. The `pid` a `Ctrl-K` signal
 ///   targets comes from the one-shot probe (`App::live_agent_now`) and never from

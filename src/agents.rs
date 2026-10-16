@@ -189,10 +189,13 @@ const MS_PER_SECOND: i64 = 1_000;
 const SECS_PER_MINUTE: i64 = 60;
 
 /// Seconds per hour. Also a SWITCH: [`elapsed_phrase`] goes from `59m` to `1h`
-/// here and stays in hours above it. There is no day unit, so a child wedged for
-/// three days reads `72h`. That is still legible, and it keeps the phrase to the
-/// three coarse units the banner was designed around.
+/// here and stays in hours up to [`SECS_PER_DAY`].
 const SECS_PER_HOUR: i64 = 3_600;
+
+/// Seconds per day. The last SWITCH: [`elapsed_phrase`] goes from `23h` to `1d`
+/// here and counts whole days above it, so 368 hours reads `15d`, not `368h`.
+/// Its unit test pins that switch point.
+const SECS_PER_DAY: i64 = 86_400;
 
 /// The slice of a REPORTED agent the board UI needs, joined to a session by the
 /// full `sessionId`.
@@ -280,7 +283,7 @@ pub struct ReportedAgent {
     /// Unlike [`ReportedAgent::pid`] this MAY be read off [`reported_agents`]'
     /// polled `--all` map: an age is a DISPLAY fact, not a gate, so "as of the
     /// last poll" is an honest answer and a few seconds of staleness cost
-    /// nothing at the `m`/`h` resolution the banner shows. Two sources, two
+    /// nothing at the `m`/`h`/`d` resolution the banner shows. Two sources, two
     /// questions.
     ///
     /// Epoch millis — NOT the MONOTONIC clock [`crate::watch`] counts in, which
@@ -550,7 +553,7 @@ pub fn friendly_status(agent: &ReportedAgent) -> String {
 }
 
 /// How long before `now_ms` claude says a session started, in ONE coarse unit —
-/// `42s`, `46m`, `3h` — or `None` when there is nothing honest to say.
+/// `42s`, `46m`, `3h`, `15d` — or `None` when there is nothing honest to say.
 ///
 /// Its one consumer is the pinned preview banner
 /// ([`crate::tui::view::preview_banner`]), which composes it beside
@@ -578,7 +581,7 @@ pub fn friendly_status(agent: &ReportedAgent) -> String {
 ///
 /// It TRUNCATES and never rounds, so 59 999 ms reads `59s`, not `1m`: the phrase
 /// never claims more time has passed than has. The unit switches at
-/// [`SECS_PER_MINUTE`] and [`SECS_PER_HOUR`].
+/// [`SECS_PER_MINUTE`], [`SECS_PER_HOUR`] and [`SECS_PER_DAY`].
 #[must_use]
 pub fn elapsed_phrase(started_at_ms: Option<i64>, now_ms: i64) -> Option<String> {
     let elapsed_ms = now_ms.checked_sub(started_at_ms?)?;
@@ -590,8 +593,10 @@ pub fn elapsed_phrase(started_at_ms: Option<i64>, now_ms: i64) -> Option<String>
         format!("{secs}s")
     } else if secs < SECS_PER_HOUR {
         format!("{}m", secs / SECS_PER_MINUTE)
-    } else {
+    } else if secs < SECS_PER_DAY {
         format!("{}h", secs / SECS_PER_HOUR)
+    } else {
+        format!("{}d", secs / SECS_PER_DAY)
     })
 }
 
@@ -1299,13 +1304,13 @@ mod tests {
         assert_eq!(qualifier_copy(&unknown), Some("compacting"));
     }
 
-    /// The age phrase: one coarse unit, truncated, switching at the two pinned
+    /// The age phrase: one coarse unit, truncated, switching at the three pinned
     /// points, and `None` wherever an age would claim something nobody observed.
     ///
     /// Both instants are stated, never read from a clock, so each row is exact.
     /// The rows sit on both sides of each switch (`SECS_PER_MINUTE`,
-    /// `SECS_PER_HOUR`): a retune of either moves a row here before it moves a
-    /// banner.
+    /// `SECS_PER_HOUR`, `SECS_PER_DAY`): a retune of any moves a row here before
+    /// it moves a banner.
     #[test]
     fn elapsed_phrase_says_one_coarse_unit_and_nothing_it_did_not_observe() {
         // A real `startedAt` from the 2.1.278 capture, so the arithmetic runs at the
@@ -1314,6 +1319,7 @@ mod tests {
         const SEC: i64 = 1_000;
         const MIN: i64 = 60 * SEC;
         const HOUR: i64 = 60 * MIN;
+        const DAY: i64 = 24 * HOUR;
 
         for (elapsed_ms, expected) in [
             (0, Some("0s")),
@@ -1324,7 +1330,10 @@ mod tests {
             (46 * MIN + 59 * SEC, Some("46m")), // the wedged child the banner is for
             (HOUR - 1, Some("59m")), // the last row before the m -> h switch
             (HOUR, Some("1h")),     // ...and the switch itself
-            (72 * HOUR + 59 * MIN, Some("72h")), // no day unit: three days is 72h
+            (DAY - 1, Some("23h")), // the last row before the h -> d switch
+            (DAY, Some("1d")),      // ...and the switch itself
+            (72 * HOUR + 59 * MIN, Some("3d")), // whole days: the 59m is dropped
+            (368 * HOUR, Some("15d")), // not `368h`: 15 days, the 8h dropped
             (-1, None),             // a start 1 ms in the FUTURE: the clocks disagree
             (-HOUR, None),
         ] {
