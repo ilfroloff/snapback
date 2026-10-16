@@ -45,10 +45,30 @@
 //! way and keyed by its record `uuid`. It is tried AFTER the peer gate, because
 //! every hand-back also carries `isMeta`. See [`injected_node_lines`].
 //!
-//! An OPEN node of either kind draws its body DIM ([`FOLD_NODE_MODIFIER`]), so
-//! text nobody in this session typed recedes from — and reads as set apart from —
-//! the session's own `▶ you` / `● claude` turns. The node's header — its title —
-//! is NOT dimmed: it keeps its full-intensity Magenta, open or collapsed.
+//! An assistant `tool_use` block that LAUNCHED a subagent renders as a one-line
+//! DELEGATION line in place of its `[tool_use: …]` marker
+//! (`◆ delegated to @parser-auditor · Audit the parser · (click to view)`). A
+//! launch is one when its `id` joins a subagent meta file in the session's own
+//! `subagents/` dir ([`subagents::index_for`], built once per render): by the id
+//! alone, NEVER the tool name, since `Agent` and `Task` both launch, and a miss
+//! keeps the plain marker. It is NOT a fold node and opens nothing in place: its
+//! click target is a [`SubagentRegion`] naming the subagent, and the app answers
+//! a click on it by switching the whole pane to that subagent's transcript
+//! ([`render_subagent`]). The meta's description is drawn verbatim as plain text,
+//! never through the markdown pass. See [`delegation_node_lines`].
+//!
+//! [`render_subagent`] draws a subagent's OWN transcript through the same record
+//! loop as the session's ([`render_stream`]) in [`RenderMode::Subagent`]: its
+//! prompt reads `▶ prompt`, never `▶ you`, and it yields no restorable model. A
+//! launch inside it is a delegation line of its own, joined against the same
+//! session's index, so a click on it switches to that nested subagent. The same
+//! pass judges whether the subagent's run ENDED
+//! ([`RenderedPreview::run_ended`]), by the subagent record's own fold.
+//!
+//! An OPEN node of either fold kind draws its body DIM ([`FOLD_NODE_MODIFIER`]),
+//! so text nobody in this session typed recedes from — and reads as set apart
+//! from — the session's own `▶ you` / `● claude` turns. The node's header — its
+//! title — is NOT dimmed: it keeps its full-intensity Magenta, open or collapsed.
 //!
 //! Ahead of the markdown pass, each message BODY runs through an allowlist-driven
 //! control-wrapper collapse (`store::command::collapse_control_wrappers`, the
@@ -95,6 +115,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::command::{self, collapse_control_wrappers, Segment};
 use super::label::{self, PeerOrigin};
+use super::subagents::{self, RunProgress, SubagentIndex, SubagentMeta};
 use super::Session;
 
 /// Floor on a GFM table column's rendered width in GRID mode — and, because a
@@ -219,9 +240,9 @@ pub struct LinkRegion {
 /// `key` is the node's fold key, and each KIND of node draws it from its own
 /// source — the two share one open set, so their shapes must never collide:
 ///
-/// - a PEER node's key is `origin.from`, the sending agent's stem — NOT the record
-///   `uuid`, so a future delegation node resolves to the SAME key and the two
-///   anchors drive one node;
+/// - a PEER node's key is `origin.from`, the sending agent's stem — NOT the
+///   record `uuid`. The delegation line that launched that agent names the same
+///   id, but in a [`SubagentRegion`], never in this set: it is not a fold node;
 /// - an INJECTED node's key is its record `uuid` behind
 ///   [`INJECTED_FOLD_KEY_PREFIX`] ([`injected_fold_key`]). The prefix is what
 ///   keeps the kinds apart: a sender is a stem, an agent type name or a socket
@@ -238,14 +259,38 @@ pub struct FoldRegion {
     pub key: String,
 }
 
-/// A block-relative region the running rebase in [`render_file_collect`] can
-/// shift onto the growing transcript.
+/// A clickable DELEGATION line inside the rendered preview
+/// ([`delegation_node_lines`]): a click on it switches the pane to the transcript
+/// of the subagent it names ([`render_subagent`]). In the SAME content
+/// coordinates and under the SAME width discipline as [`LinkRegion`] and
+/// [`FoldRegion`], and like a fold region it spans its line's whole display
+/// width.
 ///
-/// Implemented by [`LinkRegion`], [`FoldRegion`] and [`UnindexedRows`] so all
-/// three are rebased by the ONE [`rebased`] function and the ONE offset. A second
-/// rebase — even a faithful copy — is exactly how a node's click target, the links
-/// inside its body and the rows search skips would come to disagree about which
-/// row they sit on.
+/// Not a [`FoldRegion`]: nothing opens in place, so no open set ever holds its
+/// id, and the hand-back of the same agent folds on its own key alone.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubagentRegion {
+    /// Line index into the rendered [`Text`] the delegation line sits on.
+    pub content_row: usize,
+    /// Display column where the clickable line starts (inclusive).
+    pub col_start: usize,
+    /// Display column just past the clickable line (exclusive).
+    pub col_end: usize,
+    /// The subagent's id, the stem of its transcript `agent-<agent_id>.jsonl` in
+    /// the session's own `subagents/` dir.
+    pub agent_id: String,
+    /// The subagent's `agentType`, the handle the line names.
+    pub agent_type: String,
+}
+
+/// A block-relative region the running rebase in [`render_stream`] can shift
+/// onto the growing transcript.
+///
+/// Implemented by [`LinkRegion`], [`FoldRegion`], [`SubagentRegion`] and
+/// [`UnindexedRows`] so all four are rebased by the ONE [`rebased`] function and
+/// the ONE offset. A second rebase — even a faithful copy — is exactly how a
+/// node's click target, the links inside its body and the rows search skips would
+/// come to disagree about which row they sit on.
 trait BlockRegion {
     /// The region's row index, for [`rebased`] to advance.
     fn content_row_mut(&mut self) -> &mut usize;
@@ -258,6 +303,12 @@ impl BlockRegion for LinkRegion {
 }
 
 impl BlockRegion for FoldRegion {
+    fn content_row_mut(&mut self) -> &mut usize {
+        &mut self.content_row
+    }
+}
+
+impl BlockRegion for SubagentRegion {
     fn content_row_mut(&mut self) -> &mut usize {
         &mut self.content_row
     }
@@ -310,10 +361,11 @@ pub struct MarkerLine {
 }
 
 /// A rendered transcript preview: the styled [`Text`] plus the clickable
-/// [`LinkRegion`]s and [`FoldRegion`]s discovered while building it, the
-/// [`UnindexedRows`] search must not mark, and the turn [`MarkerLine`]s. All of
-/// them are produced from one pass at a fixed `width`, so a region's rows and
-/// columns — and a marker's content row — always match the text as drawn.
+/// [`LinkRegion`]s, [`FoldRegion`]s and [`SubagentRegion`]s discovered while
+/// building it, the [`UnindexedRows`] search must not mark, and the turn
+/// [`MarkerLine`]s. All of them are produced from one pass at a fixed `width`, so a
+/// region's rows and columns — and a marker's content row — always match the text
+/// as drawn.
 #[derive(Debug, Default)]
 pub struct RenderedPreview {
     /// The styled, markdown-rendered transcript.
@@ -322,6 +374,9 @@ pub struct RenderedPreview {
     pub links: Vec<LinkRegion>,
     /// Clickable fold regions, in content coordinates (see [`FoldRegion`]).
     pub folds: Vec<FoldRegion>,
+    /// Clickable delegation lines, in content coordinates (see
+    /// [`SubagentRegion`]).
+    pub subagents: Vec<SubagentRegion>,
     /// Runs of lines the content index never held (see [`UnindexedRows`]).
     pub unindexed: Vec<UnindexedRows>,
     /// Every turn's marker line, in content-row (i.e. file) order (see
@@ -337,8 +392,16 @@ pub struct RenderedPreview {
     /// reads it off this cached render, never on a keystroke or in a draw of its own.
     /// It is a FILE-level fact, unlike the per-turn marker labels, and it is the
     /// only one: the answer to "which model would claude restore?" is by definition
-    /// the newest one.
+    /// the newest one. Always `None` in a subagent's render ([`render_subagent`]):
+    /// claude restores the session's model, never a subagent's.
     pub last_model: Option<String>,
+    /// Whether the subagent's own run ENDED, judged over every record this render
+    /// streamed by the subagent record's own fold ([`subagents::RunProgress`]), so
+    /// the subagent view's title can tell a finished run from a quiet one without
+    /// a read of its own: the record reads a transcript's tail only while it can
+    /// be running. `Some` only in a subagent's render that drew a line; `None` in
+    /// the session's own and in the [`SUBAGENT_UNREADABLE`] one.
+    pub run_ended: Option<bool>,
 }
 
 impl RenderedPreview {
@@ -374,6 +437,58 @@ pub fn render(
     expanded: &HashSet<&str>,
 ) -> RenderedPreview {
     render_file_collect(&session.file, width, known_agents, expanded)
+}
+
+/// Render the transcript of the subagent `agent_id` that the session file
+/// `session_file` launched, for the preview pane's subagent view, under the same
+/// `width`, `known_agents` and `expanded` rules as [`render`].
+///
+/// The transcript is `agent-<agent_id>.jsonl` in the session's OWN `subagents/`
+/// dir ([`subagents::transcript_path`]), opened only as a regular file
+/// ([`subagents::open_transcript`]), and streamed through the session's own record
+/// loop in [`RenderMode::Subagent`]: its turns collect their [`MarkerLine`]s, so
+/// the pinned row names the subagent's turn at the top of the view, it yields
+/// NO [`RenderedPreview::last_model`], and it judges
+/// [`RenderedPreview::run_ended`] in the same pass. The session's
+/// [`SubagentIndex`] is built here too, so a launch inside the transcript joins
+/// its meta file and renders as a delegation line of its own: one session's
+/// `subagents/` dir holds every agent it launched at any depth.
+///
+/// FAIL-SOFT: a transcript that cannot be opened, or that renders no line at all
+/// (empty or garbage), is the single DIM [`SUBAGENT_UNREADABLE`] line, so the
+/// switch still visibly happened. Called only for the subagent view a click,
+/// `Ctrl-X ↓` or a `←`/`→` step switched to, never by the session's own render.
+pub fn render_subagent(
+    session_file: &Path,
+    agent_id: &str,
+    width: usize,
+    known_agents: &HashSet<&str>,
+    expanded: &HashSet<&str>,
+) -> RenderedPreview {
+    let unreadable = || RenderedPreview {
+        text: Text::from(vec![marker_line(SUBAGENT_UNREADABLE.to_string())]),
+        ..RenderedPreview::default()
+    };
+    let index = subagents::index_for(session_file);
+    let Some(file) = index
+        .dir()
+        .map(|dir| subagents::transcript_path(dir, agent_id))
+        .and_then(|path| subagents::open_transcript(&path))
+    else {
+        return unreadable();
+    };
+    let stream = StreamContext {
+        mode: RenderMode::Subagent,
+        width,
+        known_agents,
+        expanded,
+        index: &index,
+    };
+    let rendered = render_stream(BufReader::new(file), &stream);
+    if rendered.text.lines.is_empty() {
+        return unreadable();
+    }
+    rendered
 }
 
 /// The optimistic trailing turns shown in the preview while a quick-reply send is
@@ -438,6 +553,12 @@ pub fn pending_reply_turns(
 /// That the cap is gone is what makes the marker list TOTAL: every turn in the file
 /// has a marker at a live row, so the banner's lookup can never miss because the
 /// turn it wanted was cut off the top.
+///
+/// The session's [`SubagentIndex`] is built here, ONCE per render, and only once
+/// the session file has opened: it lists the session's own subagents dir and reads
+/// its meta files, never a transcript. That is cache-miss work, like the rest of
+/// the render, and a failure only leaves launches out of it. The records stream
+/// through [`render_stream`] in [`RenderMode::Session`].
 fn render_file_collect(
     path: &Path,
     width: usize,
@@ -453,16 +574,88 @@ fn render_file_collect(
             }
         }
     };
-    let reader = BufReader::new(file);
+    let index = subagents::index_for(path);
+    let stream = StreamContext {
+        mode: RenderMode::Session,
+        width,
+        known_agents,
+        expanded,
+        index: &index,
+    };
+    render_stream(BufReader::new(file), &stream)
+}
 
+/// Which transcript a [`render_stream`] draws, and so which rules its records
+/// follow. The two differ only where a subagent's transcript is not the
+/// session's own conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenderMode {
+    /// The session's own transcript: its sidechain user turns are dropped, a
+    /// plain user turn is `▶ you`, and its turns feed the pinned row's
+    /// [`MarkerLine`]s and [`RenderedPreview::last_model`].
+    Session,
+    /// A subagent's transcript, drawn in the pane's subagent view
+    /// ([`render_subagent`]). Every turn in it is `isSidechain` (all 253,342 user
+    /// and assistant records across 1825 subagent transcripts in a local store,
+    /// 2026-10-11), so the session's sidechain drop would erase its every prompt:
+    /// that drop does not apply here. A plain user turn is
+    /// [`SUBAGENT_PROMPT_MARKER`]. Its turns still feed the [`MarkerLine`]s, so the
+    /// view's pinned row names the subagent's own turn, but never a `last_model`:
+    /// claude restores the session's model, never a subagent's.
+    Subagent,
+}
+
+impl RenderMode {
+    /// The marker a plain user turn renders under.
+    fn user_marker(self) -> &'static str {
+        match self {
+            RenderMode::Session => YOU_MARKER,
+            RenderMode::Subagent => SUBAGENT_PROMPT_MARKER,
+        }
+    }
+}
+
+/// What every record of ONE stream renders under — the session's transcript, or a
+/// subagent's in the subagent view — fixed for the whole stream: a record reads it
+/// and never changes it. The state that DOES move record by record (the bound
+/// agent, the day rollover) is [`render_stream`]'s own.
+#[derive(Clone, Copy)]
+struct StreamContext<'a> {
+    /// Which transcript this is.
+    mode: RenderMode,
+    /// The pane's inner width every body wraps to.
+    width: usize,
+    /// The DEFINED agent names that gate the `agent-name` fallback
+    /// ([`render_record`]).
+    known_agents: &'a HashSet<&'a str>,
+    /// The open fold keys; only the two fold nodes read it.
+    expanded: &'a HashSet<&'a str>,
+    /// The session's launches, by `tool_use.id`. Built ONCE per render: one
+    /// session's `subagents/` dir holds every agent it launched at any depth, so a
+    /// subagent's transcript joins its own launches against the same index.
+    index: &'a SubagentIndex,
+}
+
+/// Stream `reader`'s JSONL records into a [`RenderedPreview`]: the ONE per-record
+/// loop the session's transcript and a subagent's run through, so a subagent's
+/// turns render exactly like the session's except where [`RenderMode`] says
+/// otherwise.
+///
+/// The state that moves record by record starts here, for this stream alone: a
+/// fresh [`AgentState`] and day rollover. FAIL-SOFT: a line that cannot be read,
+/// is not JSON, or is not an object is skipped.
+fn render_stream(reader: impl BufRead, stream: &StreamContext) -> RenderedPreview {
+    let session_own = stream.mode == RenderMode::Session;
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut links: Vec<LinkRegion> = Vec::new();
     let mut folds: Vec<FoldRegion> = Vec::new();
+    let mut subagent_regions: Vec<SubagentRegion> = Vec::new();
     let mut unindexed: Vec<UnindexedRows> = Vec::new();
     let mut markers: Vec<MarkerLine> = Vec::new();
     // The newest model claude would restore on `-r`, overwritten record by record
     // as the file streams past, so the last one standing is the answer.
     let mut last_model: Option<String> = None;
+    let mut run = (!session_own).then(RunProgress::default);
     // Day of the previously ANNOTATED turn, threaded through the loop so a
     // per-message timestamp can switch to `MM-DD HH:MM` on a day rollover.
     let mut prev_day: Option<Date> = None;
@@ -487,31 +680,26 @@ fn render_file_collect(
         if !record.is_object() {
             continue;
         }
-        if let Some(label) = restorable_model(&record) {
-            last_model = Some(label);
+        if session_own {
+            if let Some(label) = restorable_model(&record) {
+                last_model = Some(label);
+            }
         }
-        if let Some((block, block_links, block_folds, block_unindexed, block_marker)) =
-            render_record(
-                &record,
-                &mut agent,
-                known_agents,
-                expanded,
-                &mut prev_day,
-                width,
-            )
-        {
+        run = run.map(|run| run.after(&record));
+        if let Some(block) = render_record(&record, &mut agent, &mut prev_day, stream) {
             // ONE offset, ONE rebase, every kind of region: a node's fold target,
-            // the links inside its body and the rows search must skip must never
-            // disagree about a row.
+            // a delegation line's, the links inside a body and the rows search must
+            // skip must never disagree about a row.
             let offset = lines.len();
-            links.extend(rebased(block_links, offset));
-            folds.extend(rebased(block_folds, offset));
-            unindexed.extend(rebased(block_unindexed, offset));
-            if let Some(mut marker) = block_marker {
+            links.extend(rebased(block.links, offset));
+            folds.extend(rebased(block.folds, offset));
+            subagent_regions.extend(rebased(block.subagents, offset));
+            unindexed.extend(rebased(block.unindexed, offset));
+            if let Some(mut marker) = block.marker {
                 marker.content_row += offset;
                 markers.push(marker);
             }
-            lines.extend(block);
+            lines.extend(block.lines);
         }
     }
 
@@ -519,15 +707,18 @@ fn render_file_collect(
         text: Text::from(lines),
         links,
         folds,
+        subagents: subagent_regions,
         unindexed,
         markers,
         last_model,
+        run_ended: run.map(RunProgress::ended),
     }
 }
 
 /// Shift a batch of block-relative regions down by `offset` rows so they address
-/// the growing transcript. Generic over [`BlockRegion`] so links and folds share
-/// the one implementation — see that trait for why a second copy is a defect.
+/// the growing transcript. Generic over [`BlockRegion`] so every region kind
+/// shares the one implementation — see that trait for why a second copy is a
+/// defect.
 fn rebased<R: BlockRegion>(regions: Vec<R>, offset: usize) -> Vec<R> {
     regions
         .into_iter()
@@ -538,17 +729,25 @@ fn rebased<R: BlockRegion>(regions: Vec<R>, offset: usize) -> Vec<R> {
         .collect()
 }
 
-/// One record's rendered block: its lines plus its block-relative link, fold and
-/// unindexed regions, in that order — all rebased together by
-/// [`render_file_collect`] — and its block-relative [`MarkerLine`] when the record
-/// is a turn, rebased there by the same running line offset.
-type Block = (
-    Vec<Line<'static>>,
-    Vec<LinkRegion>,
-    Vec<FoldRegion>,
-    Vec<UnindexedRows>,
-    Option<MarkerLine>,
-);
+/// One record's rendered block: its lines plus its block-relative regions — all
+/// rebased together by [`render_stream`] by the one running line offset — and its
+/// block-relative [`MarkerLine`] when the record is a turn, rebased there by that
+/// same offset.
+#[derive(Default)]
+struct Block {
+    /// The record's rendered lines.
+    lines: Vec<Line<'static>>,
+    /// Its [`LinkRegion`]s.
+    links: Vec<LinkRegion>,
+    /// Its [`FoldRegion`]s: a peer or injected node's header.
+    folds: Vec<FoldRegion>,
+    /// Its [`SubagentRegion`]s: one per delegation line an assistant turn draws.
+    subagents: Vec<SubagentRegion>,
+    /// Its [`UnindexedRows`]: an open injected node's body.
+    unindexed: Vec<UnindexedRows>,
+    /// Its turn marker, when the record is a turn.
+    marker: Option<MarkerLine>,
+}
 
 /// Render a single record into a transcript block, or `None` to omit it.
 ///
@@ -560,18 +759,21 @@ type Block = (
 /// `agent` carries the bound agent in effect at this point in the file: an
 /// `agent-setting` or (validated) `agent-name` record updates it — contributing no
 /// lines — and each assistant turn is labeled with its [`effective`] value.
-/// `known_agents` gates the `agent-name` fallback. State is threaded — never
+/// `stream.known_agents` gates the `agent-name` fallback. State is threaded — never
 /// hoisted — so attribution is positional; see the module doc.
 ///
-/// `expanded` is the open fold keys; only the two fold nodes read it.
+/// `stream` is what the whole stream renders under ([`StreamContext`]): its
+/// [`RenderMode`] decides the two user-turn rules that differ inside a subagent's
+/// transcript, only the fold nodes read its open keys, and only an assistant
+/// turn's launches read its subagent index ([`assistant_lines`]).
 ///
 /// Returns the record's [`Block`]: its lines plus its block-relative
-/// [`LinkRegion`]s, [`FoldRegion`]s and [`UnindexedRows`]. The fold and unindexed
-/// vecs hold at most one entry today (a record renders at most one node), but they
-/// are vecs so the caller rebases them through the SAME [`rebased`] the links go
-/// through.
+/// [`LinkRegion`]s, [`FoldRegion`]s, [`SubagentRegion`]s and [`UnindexedRows`]. A
+/// peer or injected record renders at most one node, while an assistant turn
+/// renders one delegation line per launch that joins a meta file, so every region
+/// kind is a vec, rebased through the SAME [`rebased`] the links go through.
 ///
-/// The fifth tuple element is the block's own [`MarkerLine`] (block-relative
+/// [`Block::marker`] is the block's own [`MarkerLine`] (block-relative
 /// `content_row`, rebased by the caller like the links) for a "summary" record or
 /// an ordinary "user"/"assistant" turn — the ONE line the pinned preview banner can
 /// show when the user scrolls this turn to the top of the viewport
@@ -585,10 +787,8 @@ type Block = (
 fn render_record(
     record: &Value,
     agent: &mut AgentState,
-    known_agents: &HashSet<&str>,
-    expanded: &HashSet<&str>,
     prev_day: &mut Option<Date>,
-    width: usize,
+    stream: &StreamContext,
 ) -> Option<Block> {
     match record.get("type").and_then(Value::as_str) {
         Some("summary") => {
@@ -597,16 +797,14 @@ fn render_record(
             let marker =
                 marker_line_with_time(format!("# {s}"), summary_style(), None, record, prev_day);
             let lines = vec![marker.clone()];
-            Some((
+            Some(Block {
                 lines,
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Some(MarkerLine {
+                marker: Some(MarkerLine {
                     content_row: 0,
                     line: marker,
                 }),
-            ))
+                ..Block::default()
+            })
         }
         Some("user") => {
             // A message from ANOTHER session collapses to a one-line node, and is
@@ -626,16 +824,25 @@ fn render_record(
                 // `expanded` decides which shape this node renders in; it is READ
                 // here and owned by the app, never mutated by the renderer.
                 let (lines, links, folds) =
-                    peer_node_lines(&origin, expanded, record, prev_day, width);
+                    peer_node_lines(&origin, stream.expanded, record, prev_day, stream.width);
                 // NO marker for the pinned row: the node is not a turn, and its
                 // header's click affordance would be a promise the pinned row
                 // cannot keep. The row keeps naming the turn above the node.
-                return Some((lines, links, folds, Vec::new(), None));
+                return Some(Block {
+                    lines,
+                    links,
+                    folds,
+                    ..Block::default()
+                });
             }
-            if record
-                .get("isSidechain")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
+            // The session's own transcript only: in a subagent's, EVERY turn is a
+            // sidechain one, so the drop would erase its every prompt (see
+            // `RenderMode::Subagent`).
+            if stream.mode == RenderMode::Session
+                && record
+                    .get("isSidechain")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
             {
                 return None;
             }
@@ -656,32 +863,42 @@ fn render_record(
             // above it.
             if label::is_injected(record) {
                 let (lines, links, folds, unindexed) =
-                    injected_node_lines(&text, expanded, record, prev_day, width);
-                return Some((lines, links, folds, unindexed, None));
+                    injected_node_lines(&text, stream.expanded, record, prev_day, stream.width);
+                return Some(Block {
+                    lines,
+                    links,
+                    folds,
+                    unindexed,
+                    ..Block::default()
+                });
             }
-            let marker =
-                marker_line_with_time(YOU_MARKER.to_string(), you_style(), None, record, prev_day);
+            let marker = marker_line_with_time(
+                stream.mode.user_marker().to_string(),
+                you_style(),
+                None,
+                record,
+                prev_day,
+            );
             let mut lines = vec![Line::from(""), marker.clone()];
             // Body links are relative to the body; rebase them past the blank +
             // marker lines that lead every turn. The marker itself sits at row 1
             // (the blank line at row 0 leads every turn).
             let offset = lines.len();
-            let (body, body_links) = collapse_body_lines_collect(&text, width);
+            let (body, body_links) = collapse_body_lines_collect(&text, stream.width);
             lines.extend(body);
-            Some((
+            Some(Block {
                 lines,
-                rebased(body_links, offset),
-                Vec::new(),
-                Vec::new(),
-                Some(MarkerLine {
+                links: rebased(body_links, offset),
+                marker: Some(MarkerLine {
                     content_row: 1,
                     line: marker,
                 }),
-            ))
+                ..Block::default()
+            })
         }
         Some("assistant") => {
             let content = record.get("message").and_then(|m| m.get("content"))?;
-            let (body, body_links) = assistant_lines(content, width);
+            let (body, body_links, body_subagents) = assistant_lines(content, stream);
             if body.is_empty() {
                 return None;
             }
@@ -693,18 +910,20 @@ fn render_record(
                 prev_day,
             );
             let mut lines = vec![Line::from(""), marker.clone()];
+            // ONE offset for every region the body carries: a delegation line's
+            // click target and the links beside it must agree about their rows.
             let offset = lines.len();
             lines.extend(body);
-            Some((
+            Some(Block {
                 lines,
-                rebased(body_links, offset),
-                Vec::new(),
-                Vec::new(),
-                Some(MarkerLine {
+                links: rebased(body_links, offset),
+                subagents: rebased(body_subagents, offset),
+                marker: Some(MarkerLine {
                     content_row: 1,
                     line: marker,
                 }),
-            ))
+                ..Block::default()
+            })
         }
         Some("agent-setting") => {
             // Positional state, not a rendered line: record the interactive BIND in
@@ -725,7 +944,7 @@ fn render_record(
             // as a bogus `@handle`. `agent-setting` still wins over this (see
             // `AgentState::effective`). Read FAIL-SOFT; contributes no lines.
             agent.job = trimmed_field(record, "agentName")
-                .filter(|name| known_agents.contains(name.as_str()));
+                .filter(|name| stream.known_agents.contains(name.as_str()));
             None
         }
         _ => None,
@@ -997,8 +1216,9 @@ fn record_model(record: &Value) -> Option<&str> {
 /// (`restoreModelFromSession`): an `assistant` record that is not an `isMeta`
 /// injection (the SAME [`label::is_meta`] predicate the parser uses) and
 /// whose `message.model` names a model — never a pseudo-model like `<synthetic>`,
-/// which [`model_label`] suppresses, and never a blank one. [`render_file_collect`]
-/// keeps the LAST such record's answer as [`RenderedPreview::last_model`].
+/// which [`model_label`] suppresses, and never a blank one. [`render_stream`]
+/// keeps the LAST such record's answer as [`RenderedPreview::last_model`], in the
+/// session's own transcript only ([`RenderMode`]).
 ///
 /// Built from the existing [`record_model`] / [`model_label`] pair rather than a
 /// second reading of the id, so the reply box names the model exactly as the turn
@@ -1049,8 +1269,10 @@ fn record_timestamp(record: &Value) -> Option<OffsetDateTime> {
 /// else `MM-DD HH:MM`. The first annotated turn (`prev_day` is `None`) also
 /// shows `MM-DD HH:MM`, since there is no prior day to compare against. Offset
 /// fields are rendered as-is — no timezone conversion, matching
-/// `view.rs::short_time`.
-fn timestamp_annotation(ts: OffsetDateTime, prev_day: Option<Date>) -> String {
+/// `view.rs::short_time`. The subagent view's title states a launch time through
+/// it too (`view::subagent_title`), so the two never write a time two ways.
+#[must_use]
+pub fn timestamp_annotation(ts: OffsetDateTime, prev_day: Option<Date>) -> String {
     if prev_day == Some(ts.date()) {
         format!("{:02}:{:02}", ts.hour(), ts.minute())
     } else {
@@ -1261,9 +1483,10 @@ fn peer_fold(from: Option<&str>, expanded: &HashSet<&str>) -> PeerFold {
 /// silent — a [`FoldRegion`] pointing at the blank would make every click miss by
 /// one row.
 ///
-/// BOTH node kinds put their header here, and nothing ever renders ABOVE it:
-/// opening a node only appends body lines BELOW the header, which is what lets
-/// `tui::app`'s `fold_scroll_delta` hold a clicked node on its screen row.
+/// BOTH fold node kinds put their header here, and nothing ever renders ABOVE it:
+/// opening a node only appends body lines BELOW the header, and no other node
+/// shares its key, which is what lets `tui::app`'s `fold_scroll_delta` hold a
+/// clicked node on its screen row.
 const PEER_HEADER_BLOCK_ROW: usize = 1;
 
 /// Render a peer message as a fold node: a blank separator, the one-line header,
@@ -1471,6 +1694,92 @@ fn injected_node_lines(
     (lines, rebased(body_links, offset), folds, unindexed)
 }
 
+// --- delegation line -------------------------------------------------------------
+//
+// An assistant `tool_use` block that launched a subagent is drawn as a one-line
+// delegation line in place of its `[tool_use: …]` marker: `◆ delegated to
+// @parser-auditor · Audit the parser · (click to view)`. A launch is one when its
+// `id` joins a subagent meta file (`store::subagents`), which claude writes only
+// for an agent that really started. The join is on the id ALONE and never on the
+// tool name: both `Agent` and `Task` launch subagents in real data. A miss, or a
+// block with no `id`, keeps the plain marker, so every failure of the join is
+// fail-soft.
+//
+// The line is NOT a fold node: it opens nothing in place. Its click target is a
+// `SubagentRegion` naming the subagent, and the app answers a click on it by
+// switching the whole pane to that subagent's transcript (`render_subagent`).
+
+/// The delegation line's marker (glyph + label). It wears the peer node's `◆`
+/// because both name another agent of this session — the launch of a subagent and
+/// its hand-back — and the text names the direction: this session delegated to
+/// the agent, where the hand-back is a message from it.
+const DELEGATION_MARKER: &str = "\u{25c6} delegated to";
+
+/// The indent an assistant turn draws its non-text blocks at — the
+/// `[tool_use: …]`, `[tool_result]` and `[thinking]` markers, and the delegation
+/// line that replaces a launch's marker — so they read as part of the
+/// `● claude` turn above them.
+const IN_TURN_INDENT: &str = "  ";
+
+/// Where a delegation line sits inside its own block: FIRST. It is drawn where
+/// the one marker line it replaces would be, with no blank separator, so it costs
+/// exactly the line the marker did.
+const DELEGATION_HEADER_BLOCK_ROW: usize = 0;
+
+/// The trailing affordance on a delegation line: a click switches the pane to the
+/// subagent's transcript. Not the fold nodes' `(click to expand)`, because nothing
+/// opens where the line sits.
+const DELEGATION_VIEW_AFFORDANCE: &str = "(click to view)";
+
+/// The subagent the `tool_use` block `block` launched, when its `id` joins a meta
+/// file in `index`. The block's `name` is never read.
+fn delegated_meta<'i>(block: &Value, index: &'i SubagentIndex) -> Option<&'i SubagentMeta> {
+    index.lookup(block.get("id").and_then(Value::as_str)?)
+}
+
+/// The one line the subagent view draws when the subagent's transcript cannot be
+/// opened, or holds no line a render can draw ([`render_subagent`]). Without it
+/// such a click would switch to an empty pane, which reads as a render that never
+/// happened.
+const SUBAGENT_UNREADABLE: &str = "[subagent transcript unreadable]";
+
+/// Render a launch that joined a meta file as a delegation line: the line itself
+/// and its block-relative [`SubagentRegion`], which [`assistant_lines`] rebases
+/// with the rest of the turn.
+///
+/// The line carries the [`IN_TURN_INDENT`], then [`DELEGATION_MARKER`] and the
+/// agent's `@<agentType>` in [`peer_style`], then the meta's description and
+/// [`DELEGATION_VIEW_AFFORDANCE`] as DIM [`annotation_span`]s. The description is
+/// the delegating model's words, drawn VERBATIM as plain text: never through the
+/// markdown or link pass, so a link it spells claims no [`LinkRegion`] on the row
+/// a click switches from. It carries no timestamp: the `● claude` turn above it
+/// has one.
+///
+/// The whole line is the click target, so a reader need not hit the affordance
+/// text exactly. PURE.
+fn delegation_node_lines(meta: &SubagentMeta) -> (Line<'static>, SubagentRegion) {
+    let mut spans = vec![
+        Span::raw(IN_TURN_INDENT),
+        Span::styled(
+            format!("{DELEGATION_MARKER} @{}", meta.agent_type),
+            peer_style(),
+        ),
+    ];
+    if let Some(description) = &meta.description {
+        spans.push(annotation_span(description));
+    }
+    spans.push(annotation_span(DELEGATION_VIEW_AFFORDANCE));
+    let line = Line::from(spans);
+    let region = SubagentRegion {
+        content_row: DELEGATION_HEADER_BLOCK_ROW,
+        col_start: 0,
+        col_end: line_display_width(&line),
+        agent_id: meta.agent_id.clone(),
+        agent_type: meta.agent_type.clone(),
+    };
+    (line, region)
+}
+
 /// User `message.content` -> readable text (string, or text blocks joined with
 /// newlines). Bash `utxt` (preview variant).
 fn user_text(content: &Value) -> String {
@@ -1486,17 +1795,27 @@ fn user_text(content: &Value) -> String {
     }
 }
 
-/// Assistant `message.content` -> styled lines plus their link regions: text
-/// blocks pass through the markdown pass; `tool_use` / `tool_result` / `thinking`
-/// become DIM markers (kept verbatim, no links). Bash `atxt`, but the markers are
-/// styled rather than inlined. Link regions are block-relative; the caller rebases
-/// them onto the turn.
-fn assistant_lines(content: &Value, width: usize) -> (Vec<Line<'static>>, Vec<LinkRegion>) {
+/// Assistant `message.content` -> styled lines plus their link and subagent
+/// regions: text blocks pass through the markdown pass; `tool_use` / `tool_result`
+/// / `thinking` become DIM markers (kept verbatim, no links). Bash `atxt`, but the
+/// markers are styled rather than inlined. A `tool_use` that joins a meta file in
+/// the stream's index is a delegation line instead ([`delegation_node_lines`]).
+/// Every region is block-relative; the caller rebases them all onto the turn by
+/// one offset.
+fn assistant_lines(
+    content: &Value,
+    stream: &StreamContext,
+) -> (Vec<Line<'static>>, Vec<LinkRegion>, Vec<SubagentRegion>) {
+    let width = stream.width;
     match content {
-        Value::String(s) => collapse_body_lines_collect(s, width),
+        Value::String(s) => {
+            let (lines, links) = collapse_body_lines_collect(s, width);
+            (lines, links, Vec::new())
+        }
         Value::Array(blocks) => {
             let mut lines: Vec<Line<'static>> = Vec::new();
             let mut links: Vec<LinkRegion> = Vec::new();
+            let mut subagent_regions: Vec<SubagentRegion> = Vec::new();
             for b in blocks {
                 match b.get("type").and_then(Value::as_str) {
                     Some("text") => {
@@ -1506,18 +1825,29 @@ fn assistant_lines(content: &Value, width: usize) -> (Vec<Line<'static>>, Vec<Li
                             lines.extend(text_lines);
                         }
                     }
-                    Some("tool_use") => {
-                        let name = b.get("name").and_then(Value::as_str).unwrap_or("");
-                        lines.push(marker_line(format!("  [tool_use: {name}]")));
+                    Some("tool_use") => match delegated_meta(b, stream.index) {
+                        Some(meta) => {
+                            let (line, region) = delegation_node_lines(meta);
+                            subagent_regions.extend(rebased(vec![region], lines.len()));
+                            lines.push(line);
+                        }
+                        None => {
+                            let name = b.get("name").and_then(Value::as_str).unwrap_or("");
+                            lines.push(marker_line(format!("{IN_TURN_INDENT}[tool_use: {name}]")));
+                        }
+                    },
+                    Some("tool_result") => {
+                        lines.push(marker_line(format!("{IN_TURN_INDENT}[tool_result]")));
                     }
-                    Some("tool_result") => lines.push(marker_line("  [tool_result]".to_string())),
-                    Some("thinking") => lines.push(marker_line("  [thinking]".to_string())),
+                    Some("thinking") => {
+                        lines.push(marker_line(format!("{IN_TURN_INDENT}[thinking]")))
+                    }
                     _ => {}
                 }
             }
-            (lines, links)
+            (lines, links, subagent_regions)
         }
-        _ => (Vec::new(), Vec::new()),
+        _ => (Vec::new(), Vec::new(), Vec::new()),
     }
 }
 
@@ -1539,6 +1869,12 @@ fn summary_style() -> Style {
 /// real render ([`render_record`]) and the optimistic echo ([`pending_reply_turns`]),
 /// so the two are byte-identical and the swap on disk-landing is seamless.
 const YOU_MARKER: &str = "\u{25b6} you";
+/// The marker a plain user turn renders under in a subagent's transcript
+/// ([`RenderMode::Subagent`]), where [`YOU_MARKER`] would be a lie: the delegating
+/// model wrote that brief, not the person reading the board. It is the mislabel
+/// the peer node fixed for a hand-back, here for the message that went the other
+/// way. The glyph stays `▶`, since the turn still opens the conversation it leads.
+const SUBAGENT_PROMPT_MARKER: &str = "\u{25b6} prompt";
 /// The `● claude` assistant-turn marker (glyph + label); see [`YOU_MARKER`].
 const CLAUDE_MARKER: &str = "\u{25cf} claude";
 /// The `◆ message from` peer-message node marker (glyph + label), leading the
@@ -1650,7 +1986,7 @@ fn header_style(level: usize) -> Style {
 /// locate a drawn link label by it.
 ///
 /// No other style in this pane wears `LightBlue` — Yellow is a heading, Green
-/// `you`, Cyan `claude`, Magenta a peer or injected node — so a link is still told
+/// `you`, Cyan `claude`, Magenta a fold node's header — so a link is still told
 /// apart from an H1, which is underlined too. (The session LIST's search-match
 /// highlight shares the hue, but it sits in the other pane and is BOLD, never italic
 /// or underlined.) A link INSIDE a DIM run (a blockquote) keeps that DIM on top of
@@ -3289,7 +3625,7 @@ mod tests {
     /// for tests that exercise it), and no open folds, so a peer node renders
     /// COLLAPSED (see [`render_file_expanded`]).
     fn render_file(path: &Path, width: usize) -> Text<'static> {
-        render_file_collect(path, width, &HashSet::new(), &HashSet::new()).text
+        render_file_expanded(path, width, &[]).text
     }
 
     /// Like [`render_file`] but with an explicit set of known DEFINED agents, so a
@@ -3299,12 +3635,29 @@ mod tests {
         render_file_collect(path, width, &known, &HashSet::new()).text
     }
 
-    /// Like [`render_file`] but with an explicit set of OPEN peer-message fold
-    /// keys, so a test can exercise the expanded shape end to end through the
-    /// JSONL path rather than by calling [`peer_node_lines`] directly.
+    /// Like [`render_file`] but with an explicit set of OPEN fold keys, so a test
+    /// can exercise the expanded shape end to end through the JSONL path rather
+    /// than by calling [`peer_node_lines`] directly.
     fn render_file_expanded(path: &Path, width: usize, expanded: &[&str]) -> RenderedPreview {
         let expanded: HashSet<&str> = expanded.iter().copied().collect();
         render_file_collect(path, width, &HashSet::new(), &expanded)
+    }
+
+    /// The empty set, for [`test_stream`]'s two borrows: no known agents, and no
+    /// open fold keys.
+    static EMPTY_SET: std::sync::LazyLock<HashSet<&'static str>> =
+        std::sync::LazyLock::new(HashSet::new);
+
+    /// The [`StreamContext`] a test hands a single record or block: `mode` over
+    /// `index`, with no known agents and no open folds, at [`WIDE`].
+    fn test_stream(mode: RenderMode, index: &SubagentIndex) -> StreamContext<'_> {
+        StreamContext {
+            mode,
+            width: WIDE,
+            known_agents: &EMPTY_SET,
+            expanded: &EMPTY_SET,
+            index,
+        }
     }
 
     /// Flatten a `Text` back to a plain string (span contents joined, lines by
@@ -4131,13 +4484,17 @@ mod tests {
             "origin": {"kind": "peer", "from": PEER_STEM, "body": "the report"},
             "message": {"content": "Another Claude session sent a message: the report"}
         });
-        let (lines, _, folds, unindexed, _) = render_record(
+        let index = SubagentIndex::default();
+        let Block {
+            lines,
+            folds,
+            unindexed,
+            ..
+        } = render_record(
             &record,
             &mut AgentState::default(),
-            &HashSet::new(),
-            &HashSet::new(),
             &mut None,
-            WIDE,
+            &test_stream(RenderMode::Session, &index),
         )
         .expect("a hand-back renders");
         let plain = flatten(&Text::from(lines));
@@ -4342,6 +4699,746 @@ mod tests {
         );
     }
 
+    // --- delegation line ------------------------------------------------------
+
+    /// The delegation fixture: an `Agent` launch that joins a meta file, an
+    /// `Agent` launch that joins none, a `Task`-named launch that joins one, and
+    /// the first launch's hand-back.
+    const DELEGATION_FIXTURE: (&str, &str) =
+        ("-Users-me-project-epsilon", "sess-delegation-1.jsonl");
+    /// The first launch's agent id: the stem of its transcript, and the id its
+    /// hand-back names as `origin.from`.
+    const DELEGATION_KEY: &str = "a1b2c3d4e5f6a7b8c";
+    /// The first launch's line, flattened. Its description spells a markdown link,
+    /// drawn verbatim.
+    const AUDITOR_HEADER: &str =
+        "  \u{25c6} delegated to @parser-auditor \u{b7} Audit the parser per \
+                                  [docs](https://example.com) \u{b7} (click to view)";
+    /// The `Task`-named launch's line, flattened.
+    const DOCS_WRITER_HEADER: &str =
+        "  \u{25c6} delegated to @docs-writer \u{b7} Refresh the parser docs \u{b7} (click to view)";
+
+    fn delegation_fixture() -> PathBuf {
+        let (folder, file) = DELEGATION_FIXTURE;
+        fixture(folder, file)
+    }
+
+    /// Every flattened line that is a delegation line.
+    fn delegation_headers(text: &Text) -> Vec<String> {
+        text.lines
+            .iter()
+            .map(line_text)
+            .filter(|line| line.trim_start().starts_with(DELEGATION_MARKER))
+            .collect()
+    }
+
+    /// The whole point: a launch whose `tool_use.id` joins a meta file renders as
+    /// ONE node line naming the agent and its description, where it used to render
+    /// `[tool_use: Agent]`. An exact match on the whole line pins that it carries
+    /// nothing else — no timestamp, no size segment.
+    #[test]
+    fn a_launch_that_joins_a_meta_file_renders_a_delegation_node() {
+        let text = render_file(&delegation_fixture(), WIDE);
+        let plain = flatten(&text);
+
+        assert_eq!(
+            delegation_headers(&text),
+            vec![AUDITOR_HEADER, DOCS_WRITER_HEADER],
+            "one collapsed node per joined launch, in transcript order:\n{plain}"
+        );
+        assert!(
+            plain.contains("Delegating the parser audit now."),
+            "the text block beside the launch still renders:\n{plain}"
+        );
+        assert!(!plain.contains('\u{1b}'), "the node must not embed ANSI");
+    }
+
+    /// A launch with NO meta file keeps today's marker, unchanged: the orphan
+    /// `Agent` launch is the one `[tool_use: Agent]` line left, still DIM.
+    #[test]
+    fn a_launch_that_joins_no_meta_file_keeps_its_tool_use_marker() {
+        let text = render_file(&delegation_fixture(), WIDE);
+        let markers: Vec<&Line> = text
+            .lines
+            .iter()
+            .filter(|line| line_text(line) == "  [tool_use: Agent]")
+            .collect();
+
+        assert_eq!(
+            markers.len(),
+            1,
+            "only the orphan launch keeps the marker:\n{}",
+            flatten(&text)
+        );
+        assert_eq!(markers[0].spans.len(), 1);
+        assert_eq!(markers[0].spans[0].style, marker_style());
+    }
+
+    /// The join reads the block's `id` and NEVER its `name`: a launch named `Task`
+    /// that joins renders as a node, exactly like an `Agent` one.
+    #[test]
+    fn the_join_ignores_the_tool_name() {
+        let text = render_file(&delegation_fixture(), WIDE);
+        let plain = flatten(&text);
+
+        assert!(
+            plain.lines().any(|line| line == DOCS_WRITER_HEADER),
+            "the `Task`-named launch renders its node:\n{plain}"
+        );
+        assert!(
+            !plain.contains("[tool_use: Task]"),
+            "and not the marker:\n{plain}"
+        );
+    }
+
+    /// The join, block by block: no `id`, or an `id` that is not a string, keeps
+    /// the marker; an `id` that joins is a delegation line even with no `name` at
+    /// all, and claims one subagent region.
+    #[test]
+    fn only_a_string_id_that_joins_makes_a_launch_a_node() {
+        let index = subagents::index_for(&delegation_fixture());
+        let stream = test_stream(RenderMode::Session, &index);
+        let render = |block: Value| {
+            let content = Value::Array(vec![block]);
+            let (lines, _, regions) = assistant_lines(&content, &stream);
+            (flatten(&Text::from(lines)), regions.len())
+        };
+
+        assert_eq!(
+            render(serde_json::json!({"type": "tool_use", "name": "Agent"})),
+            ("  [tool_use: Agent]".to_string(), 0)
+        );
+        assert_eq!(
+            render(serde_json::json!({"type": "tool_use", "id": 7, "name": "Agent"})),
+            ("  [tool_use: Agent]".to_string(), 0)
+        );
+        let (node, regions) =
+            render(serde_json::json!({"type": "tool_use", "id": "toolu_delegation_1"}));
+        assert_eq!(node, AUDITOR_HEADER);
+        assert_eq!(regions, 1);
+    }
+
+    /// The header's look: the marker and handle in the peer node's own style, the
+    /// description and the affordance as DIM annotations, behind an unstyled
+    /// in-turn indent.
+    #[test]
+    fn a_delegation_header_draws_its_marker_in_peer_style_and_its_annotations_dim() {
+        let text = render_file(&delegation_fixture(), WIDE);
+        let header = text
+            .lines
+            .iter()
+            .find(|line| line_text(line) == AUDITOR_HEADER)
+            .expect("the joined launch renders its node");
+        let spans: Vec<(&str, Style)> = header
+            .spans
+            .iter()
+            .map(|span| (span.content.as_ref(), span.style))
+            .collect();
+
+        assert_eq!(
+            spans,
+            vec![
+                (IN_TURN_INDENT, Style::default()),
+                ("\u{25c6} delegated to @parser-auditor", peer_style()),
+                (
+                    " \u{b7} Audit the parser per [docs](https://example.com)",
+                    marker_style()
+                ),
+                (" \u{b7} (click to view)", marker_style()),
+            ]
+        );
+        assert!(marker_style().add_modifier.contains(Modifier::DIM));
+    }
+
+    /// A delegation line is NOT a fold node: each joined launch claims one
+    /// [`SubagentRegion`] naming its subagent, over the line's whole width, and no
+    /// [`FoldRegion`]. The hand-back of the same agent keeps its own fold region,
+    /// the only one carrying that agent's id, so nothing ties the two lines into
+    /// one node any more.
+    #[test]
+    fn a_delegation_line_claims_a_subagent_region_and_no_fold_region() {
+        let rendered = render_file_expanded(&delegation_fixture(), WIDE, &[]);
+        let row_text = |row: usize| line_text(&rendered.text.lines[row]);
+        let regions: Vec<(String, &str, &str)> = rendered
+            .subagents
+            .iter()
+            .map(|region| {
+                (
+                    row_text(region.content_row),
+                    region.agent_id.as_str(),
+                    region.agent_type.as_str(),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            regions,
+            vec![
+                (AUDITOR_HEADER.to_string(), DELEGATION_KEY, "parser-auditor"),
+                (
+                    DOCS_WRITER_HEADER.to_string(),
+                    "c2d3e4f5a6b7c8d9e",
+                    "docs-writer"
+                ),
+            ],
+            "one region per joined launch, on its own line, and none for the orphan"
+        );
+        for region in &rendered.subagents {
+            assert_eq!(
+                (region.col_start, region.col_end),
+                (0, display_width(&row_text(region.content_row))),
+                "each region spans its line's whole display width"
+            );
+        }
+        assert_eq!(
+            rendered
+                .folds
+                .iter()
+                .map(|fold| (fold.key.as_str(), row_text(fold.content_row)))
+                .map(|(key, row)| (key, row.starts_with(PEER_MARKER)))
+                .collect::<Vec<_>>(),
+            vec![(DELEGATION_KEY, true)],
+            "the hand-back is the one fold node; no delegation line claims a fold"
+        );
+    }
+
+    /// A delegation line costs exactly the one line the marker it replaces did:
+    /// the same transcript with its meta files removed renders the same number of
+    /// lines, and differs only on the two launch rows.
+    #[test]
+    fn a_delegation_line_costs_the_one_line_its_marker_did() {
+        let fixture = delegation_fixture();
+        let dir = unique_temp_dir("delegation-no-meta");
+        let session = dir.join("sess-delegation-1.jsonl");
+        std::fs::copy(&fixture, &session).expect("copy the session");
+        let from = subagents::subagents_dir(&fixture).expect("the fixture's subagents dir");
+        let to = subagents::subagents_dir(&session).expect("the copy's subagents dir");
+        std::fs::create_dir_all(&to).expect("create the copy's subagents dir");
+        for entry in std::fs::read_dir(&from).expect("list the fixture's subagents") {
+            let name = entry.expect("a dir entry").file_name();
+            if !name.to_string_lossy().ends_with(".meta.json") {
+                std::fs::copy(from.join(&name), to.join(&name)).expect("copy a subagent file");
+            }
+        }
+
+        let with_meta = render_file(&fixture, WIDE);
+        let without_meta = render_file(&session, WIDE);
+
+        assert!(
+            delegation_headers(&without_meta).is_empty(),
+            "the copy must lose every node, or this proves nothing:\n{}",
+            flatten(&without_meta)
+        );
+        assert_eq!(with_meta.lines.len(), without_meta.lines.len());
+        let differing: Vec<(String, String)> = with_meta
+            .lines
+            .iter()
+            .zip(&without_meta.lines)
+            .map(|(with, without)| (line_text(with), line_text(without)))
+            .filter(|(with, without)| with != without)
+            .collect();
+        assert_eq!(
+            differing,
+            vec![
+                (
+                    AUDITOR_HEADER.to_string(),
+                    "  [tool_use: Agent]".to_string()
+                ),
+                (
+                    DOCS_WRITER_HEADER.to_string(),
+                    "  [tool_use: Task]".to_string()
+                ),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The session's own render never draws a line of a subagent's transcript,
+    /// whatever fold keys are open: the key that opens the hand-back is that
+    /// agent's id, and it opens the hand-back alone.
+    #[test]
+    fn the_sessions_own_render_never_draws_a_subagents_transcript() {
+        let rendered = render_file_expanded(&delegation_fixture(), WIDE, &[DELEGATION_KEY]);
+        let plain = flatten(&rendered.text);
+
+        assert!(
+            plain.contains("the malformed-line fixtures already cover each shape"),
+            "the hand-back must be open, or this proves nothing:\n{plain}"
+        );
+        assert!(
+            delegation_headers(&rendered.text).contains(&AUDITOR_HEADER.to_string()),
+            "the launch is still its one line:\n{plain}"
+        );
+        assert!(
+            !plain.contains(SUBAGENT_PROMPT_MARKER) && !plain.contains("Splitting off"),
+            "no line of the subagent's transcript is drawn:\n{plain}"
+        );
+    }
+
+    // --- the subagent view ----------------------------------------------------
+
+    /// The nested launch's agent id: the agent the first launch's own transcript
+    /// delegates to.
+    const NESTED_KEY: &str = "b0c1d2e3f4a5b6c7d";
+    /// What the nested launch's line opens with, past its in-turn indent.
+    const REVIEWER_HEAD: &str = "\u{25c6} delegated to @fixture-reviewer";
+    /// The brief the nested agent was given: text only its own transcript holds.
+    const REVIEWER_PROMPT: &str = "Review the malformed-line fixtures.";
+    /// The link the first launch's subagent spells in its own transcript.
+    const AUDITOR_BODY_LINK: &str = "https://example.com/parser";
+
+    /// [`render_subagent`] over `session` for `agent_id`, at [`WIDE`], with no
+    /// known agents and no open folds.
+    fn render_view(session: &Path, agent_id: &str) -> RenderedPreview {
+        render_subagent(session, agent_id, WIDE, &HashSet::new(), &HashSet::new())
+    }
+
+    /// The row of the first line whose text, past its indent, opens with `head`.
+    fn row_led_by(rendered: &RenderedPreview, head: &str) -> usize {
+        rendered
+            .text
+            .lines
+            .iter()
+            .position(|line| line_text(line).trim_start().starts_with(head))
+            .unwrap_or_else(|| panic!("no line opens with {head:?}:\n{}", flatten(&rendered.text)))
+    }
+
+    /// The flattened text of every line of `rendered`.
+    fn texts(rendered: &RenderedPreview) -> Vec<String> {
+        rendered.text.lines.iter().map(line_text).collect()
+    }
+
+    /// A transcript record of `kind` at `ts`: a session's own when `sidechain` is
+    /// false, a subagent's when true.
+    fn transcript_record(kind: &str, sidechain: bool, ts: &str, content: Value) -> Value {
+        serde_json::json!({
+            "type": kind, "isSidechain": sidechain, "timestamp": ts,
+            "message": {"role": kind, "content": content}
+        })
+    }
+
+    /// An assistant record that launches `tool_use_id`, named `Agent`.
+    fn launch_record(sidechain: bool, ts: &str, tool_use_id: &str) -> Value {
+        transcript_record(
+            "assistant",
+            sidechain,
+            ts,
+            serde_json::json!([
+                {"type": "tool_use", "id": tool_use_id, "name": "Agent", "input": {}}
+            ]),
+        )
+    }
+
+    /// One subagent of a [`write_delegation_session`]: its agent id, its
+    /// `agentType`, the `toolUseId` that launched it, and its transcript.
+    type TestAgent<'a> = (&'a str, &'a str, &'a str, Vec<Value>);
+
+    /// Write `records` as the session `<dir>/sess.jsonl`, and each of `agents` as a
+    /// meta file and a transcript in that session's own subagents dir. Returns the
+    /// session file; the caller removes `dir`.
+    fn write_delegation_session(dir: &Path, records: &[Value], agents: &[TestAgent]) -> PathBuf {
+        let jsonl = |records: &[Value]| -> String {
+            records.iter().map(|record| format!("{record}\n")).collect()
+        };
+        let session = dir.join("sess.jsonl");
+        std::fs::write(&session, jsonl(records)).expect("write the session");
+        let subagents_dir = subagents::subagents_dir(&session).expect("a subagents dir");
+        std::fs::create_dir_all(&subagents_dir).expect("create the subagents dir");
+        for (agent_id, agent_type, tool_use_id, transcript) in agents {
+            let meta = serde_json::json!({"agentType": agent_type, "toolUseId": tool_use_id});
+            std::fs::write(
+                subagents_dir.join(format!("agent-{agent_id}.meta.json")),
+                meta.to_string(),
+            )
+            .expect("write a meta file");
+            std::fs::write(
+                subagents::transcript_path(&subagents_dir, agent_id),
+                jsonl(transcript),
+            )
+            .expect("write a transcript");
+        }
+        session
+    }
+
+    /// Copy the delegation fixture — the session and every file in its subagents
+    /// dir — into a fresh temp dir, so a test can damage one file of it. Returns
+    /// the temp dir and the copied session.
+    fn copy_delegation_fixture(tag: &str) -> (PathBuf, PathBuf) {
+        let fixture = delegation_fixture();
+        let dir = unique_temp_dir(tag);
+        let session = dir.join("sess-delegation-1.jsonl");
+        std::fs::copy(&fixture, &session).expect("copy the session");
+        let from = subagents::subagents_dir(&fixture).expect("the fixture's subagents dir");
+        let to = subagents::subagents_dir(&session).expect("the copy's subagents dir");
+        std::fs::create_dir_all(&to).expect("create the copy's subagents dir");
+        for entry in std::fs::read_dir(&from).expect("list the fixture's subagents") {
+            let name = entry.expect("a dir entry").file_name();
+            std::fs::copy(from.join(&name), to.join(&name)).expect("copy a subagent file");
+        }
+        (dir, session)
+    }
+
+    /// Inside a subagent's transcript every turn is a sidechain one. In
+    /// `RenderMode::Subagent` a plain user turn therefore renders — as the
+    /// delegator's `▶ prompt`, never `▶ you` — where the session's own render drops
+    /// it, and a peer or injected record there keeps its own node.
+    #[test]
+    fn a_subagents_user_turns_render_as_its_prompt_and_keep_their_nodes() {
+        let index = SubagentIndex::default();
+        let render = |mode: RenderMode, record: &Value| {
+            render_record(
+                record,
+                &mut AgentState::default(),
+                &mut None,
+                &test_stream(mode, &index),
+            )
+            .map(|block| flatten(&Text::from(block.lines)))
+        };
+        let prompt = transcript_record(
+            "user",
+            true,
+            "2026-10-01T23:50:21.000Z",
+            serde_json::json!("Audit the parser."),
+        );
+
+        assert_eq!(
+            render(RenderMode::Session, &prompt),
+            None,
+            "the session's own render still drops a sidechain user turn"
+        );
+        assert_eq!(
+            render(RenderMode::Subagent, &prompt).as_deref(),
+            Some("\n\u{25b6} prompt \u{b7} 10-01 23:50\nAudit the parser.")
+        );
+
+        let mut injected = prompt.clone();
+        injected["isMeta"] = Value::Bool(true);
+        injected["uuid"] = Value::from("injected-in-a-body");
+        let shown = render(RenderMode::Subagent, &injected).expect("an injected node");
+        assert!(
+            shown.contains(INJECTED_MARKER) && !shown.contains(SUBAGENT_PROMPT_MARKER),
+            "{shown}"
+        );
+
+        let mut peer = injected.clone();
+        peer["origin"] = serde_json::json!({
+            "kind": "peer", "from": NESTED_KEY, "body": "the nested report"
+        });
+        let shown = render(RenderMode::Subagent, &peer).expect("a peer node");
+        assert!(
+            shown.contains(&format!("{PEER_MARKER} @{NESTED_KEY}"))
+                && !shown.contains(SUBAGENT_PROMPT_MARKER),
+            "{shown}"
+        );
+    }
+
+    /// The subagent view draws the subagent's OWN transcript through the session's
+    /// record loop: prompt first, each turn drawn as the session's are, at full
+    /// intensity — it is the pane's whole content, not a body receding inside the
+    /// session's — and its own link clickable where it is drawn. The
+    /// `tool_result` record draws nothing.
+    #[test]
+    fn the_subagent_view_draws_the_subagents_own_transcript() {
+        let rendered = render_view(&delegation_fixture(), DELEGATION_KEY);
+
+        assert_eq!(
+            texts(&rendered),
+            vec![
+                "",
+                "\u{25b6} prompt \u{b7} 10-01 23:50",
+                "Audit the JSONL parser for panics on malformed input and report findings.",
+                "",
+                "\u{25cf} claude \u{b7} Sonnet 5 \u{b7} 10-02 00:05",
+                "Splitting off the fixture review.",
+                "  \u{25c6} delegated to @fixture-reviewer \u{b7} Review malformed fixtures \u{b7} \
+                 (click to view)",
+                "",
+                "\u{25cf} claude \u{b7} Sonnet 5 \u{b7} 00:19",
+                "No panics found; see the parser notes for details.",
+            ]
+        );
+        let prompt = row_led_by(&rendered, SUBAGENT_PROMPT_MARKER);
+        assert_eq!(rendered.text.lines[prompt].spans[0].style, you_style());
+        let link = rendered
+            .links
+            .iter()
+            .find(|link| link.url == AUDITOR_BODY_LINK)
+            .expect("the transcript's link is clickable");
+        assert_eq!(
+            line_text(&rendered.text.lines[link.content_row]),
+            "No panics found; see the parser notes for details."
+        );
+        assert!(rendered.folds.is_empty() && rendered.unindexed.is_empty());
+    }
+
+    /// A launch inside a subagent's transcript is a delegation line of its own,
+    /// joined against the same session's index: its region names the NESTED
+    /// subagent, on the row it is drawn on, and that subagent's own view draws its
+    /// own transcript — drill-down is a switch per level, never a body nested in a
+    /// body.
+    #[test]
+    fn a_launch_inside_a_subagents_transcript_names_the_nested_subagent() {
+        let outer = render_view(&delegation_fixture(), DELEGATION_KEY);
+        let nested_row = row_led_by(&outer, REVIEWER_HEAD);
+
+        assert_eq!(
+            outer
+                .subagents
+                .iter()
+                .map(|region| (
+                    region.content_row,
+                    region.agent_id.as_str(),
+                    region.agent_type.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![(nested_row, NESTED_KEY, "fixture-reviewer")]
+        );
+        assert!(!flatten(&outer.text).contains(REVIEWER_PROMPT));
+
+        let nested = render_view(&delegation_fixture(), NESTED_KEY);
+        assert_eq!(
+            texts(&nested),
+            vec![
+                "",
+                "\u{25b6} prompt \u{b7} 10-02 00:05",
+                REVIEWER_PROMPT,
+                "",
+                "\u{25cf} claude \u{b7} Sonnet 5 \u{b7} 00:14",
+                "The fixtures already cover every malformed shape.",
+            ]
+        );
+    }
+
+    /// The view's turns feed the pinned row: every `▶ prompt` and `● claude` turn
+    /// leaves its marker on its own row. They never feed a restorable model — the
+    /// subagent answered on Sonnet, the session last on Opus, and the reply box
+    /// must keep naming the session's.
+    #[test]
+    fn a_subagent_view_collects_its_turn_markers_but_never_a_model() {
+        let rendered = render_view(&delegation_fixture(), DELEGATION_KEY);
+        let marker_rows: Vec<usize> = rendered.markers.iter().map(|m| m.content_row).collect();
+        let turn_rows: Vec<usize> = rendered
+            .text
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| {
+                let text = line_text(line);
+                text.starts_with(SUBAGENT_PROMPT_MARKER) || text.starts_with(CLAUDE_MARKER)
+            })
+            .map(|(row, _)| row)
+            .collect();
+
+        assert_eq!(turn_rows.len(), 3, "premise: the transcript's three turns");
+        assert_eq!(marker_rows, turn_rows);
+        for marker in &rendered.markers {
+            assert_eq!(
+                marker.line, rendered.text.lines[marker.content_row],
+                "a marker is its turn's own line, verbatim"
+            );
+        }
+        assert_eq!(rendered.last_model, None);
+        assert_eq!(
+            render_file_expanded(&delegation_fixture(), WIDE, &[])
+                .last_model
+                .as_deref(),
+            Some("Opus 5.5"),
+            "premise: the session itself restores a model"
+        );
+    }
+
+    /// A view that cannot be drawn is ONE dim line saying so, never a panic and
+    /// never an empty pane that leaves the click looking like it did nothing: a
+    /// transcript that is missing, one that is a dir, ones with no line a render
+    /// can draw, and an agent id the session never launched.
+    #[test]
+    fn a_subagent_view_whose_transcript_cannot_be_drawn_says_so() {
+        type Damage = fn(&Path);
+        let cases: [(&str, Damage); 4] = [
+            ("missing", |path| {
+                std::fs::remove_file(path).expect("remove the transcript")
+            }),
+            ("dir", |path| {
+                std::fs::remove_file(path).expect("remove the transcript");
+                std::fs::create_dir_all(path).expect("a dir in its place");
+            }),
+            ("empty", |path| {
+                std::fs::write(path, "").expect("empty the transcript")
+            }),
+            ("garbage", |path| {
+                std::fs::write(path, "not json\n{\n[1,2]\n\u{0}\n").expect("garble it")
+            }),
+        ];
+        let says_so = |tag: &str, rendered: &RenderedPreview| {
+            assert_eq!(texts(rendered), vec![SUBAGENT_UNREADABLE], "{tag}");
+            let spans = &rendered.text.lines[0].spans;
+            assert!(
+                spans
+                    .iter()
+                    .all(|span| span.style.add_modifier.contains(Modifier::DIM)),
+                "{tag}: {spans:?}"
+            );
+        };
+        for (tag, damage) in cases {
+            let (dir, session) = copy_delegation_fixture(&format!("subagent-view-{tag}"));
+            let subagents_dir = subagents::subagents_dir(&session).expect("a subagents dir");
+            damage(&subagents::transcript_path(&subagents_dir, DELEGATION_KEY));
+            says_so(tag, &render_view(&session, DELEGATION_KEY));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        says_so(
+            "unknown",
+            &render_view(&delegation_fixture(), "f0f0f0f0f0f0f0f0f"),
+        );
+    }
+
+    /// A subagent's render judges whether its run ENDED over every record it
+    /// streamed — open while its last turn is a reply still being written, ended
+    /// by a hand-back answered as its last turn — and no other render judges
+    /// anything: not the session's own, and not one that drew no line, even
+    /// where the records it did parse would have read as open.
+    #[test]
+    fn a_subagent_render_judges_whether_its_run_ended_and_no_other_render_does() {
+        assert_eq!(
+            render_view(&delegation_fixture(), DELEGATION_KEY).run_ended,
+            Some(false),
+            "its last reply carries no stop reason"
+        );
+
+        let dir = unique_temp_dir("subagent-view-run-ended");
+        let text = |text: &str| serde_json::json!([{"type": "text", "text": text}]);
+        let handback = serde_json::json!([{
+            "type": "tool_use", "id": "toolu_h", "name": "SubagentHandback",
+            "input": {"message": "done"}
+        }]);
+        let answer = serde_json::json!([{
+            "type": "tool_result", "tool_use_id": "toolu_h", "content": "ok"
+        }]);
+        let session = write_delegation_session(
+            &dir,
+            &[launch_record(false, "2026-10-05T10:01:00Z", "toolu_done")],
+            &[(
+                "a0000000000000d01",
+                "finisher",
+                "toolu_done",
+                vec![
+                    transcript_record("user", true, "2026-10-05T10:01:01Z", text("Go.")),
+                    transcript_record("assistant", true, "2026-10-05T10:02:00Z", handback),
+                    transcript_record("user", true, "2026-10-05T10:02:01Z", answer),
+                ],
+            )],
+        );
+        assert_eq!(
+            render_view(&session, "a0000000000000d01").run_ended,
+            Some(true)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            render_file_expanded(&delegation_fixture(), WIDE, &[]).run_ended,
+            None,
+            "the session's own render"
+        );
+        assert_eq!(
+            render_view(&delegation_fixture(), "f0f0f0f0f0f0f0f0f").run_ended,
+            None,
+            "an unknown agent"
+        );
+        let (dir, session) = copy_delegation_fixture("subagent-view-run-ended-garbage");
+        let subagents_dir = subagents::subagents_dir(&session).expect("a subagents dir");
+        std::fs::write(
+            subagents::transcript_path(&subagents_dir, DELEGATION_KEY),
+            "not json\n{\"type\":\"attachment\"}\n",
+        )
+        .expect("garble it");
+        assert_eq!(
+            render_view(&session, DELEGATION_KEY).run_ended,
+            None,
+            "a transcript that drew no line"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The bound agent is per stream: the view starts from no binding whatever the
+    /// session had bound at the launch, and a binding inside the transcript labels
+    /// the subagent's own later turns.
+    #[test]
+    fn a_subagent_view_starts_from_no_bound_agent() {
+        const AGENT: &str = "a0000000000000b01";
+        let dir = unique_temp_dir("subagent-view-bound-agent");
+        let bind = |name: &str| serde_json::json!({"type": "agent-setting", "agentSetting": name});
+        let text = |text: &str| serde_json::json!([{"type": "text", "text": text}]);
+        let session = write_delegation_session(
+            &dir,
+            &[
+                bind("lead"),
+                transcript_record("user", false, "2026-10-05T10:00:00Z", text("Go.")),
+                launch_record(false, "2026-10-05T10:01:00Z", "toolu_bound"),
+            ],
+            &[(
+                AGENT,
+                "worker",
+                "toolu_bound",
+                vec![
+                    transcript_record("user", true, "2026-10-05T10:02:00Z", text("Work.")),
+                    transcript_record("assistant", true, "2026-10-05T10:03:00Z", text("First.")),
+                    bind("swe"),
+                    transcript_record("assistant", true, "2026-10-05T10:04:00Z", text("Second.")),
+                ],
+            )],
+        );
+
+        let rendered = render_view(&session, AGENT);
+        let claude_turns: Vec<String> = lines_led_by(&rendered.text, CLAUDE_MARKER)
+            .into_iter()
+            .map(line_text)
+            .collect();
+
+        assert_eq!(
+            claude_turns,
+            vec![
+                "\u{25cf} claude \u{b7} 10:03",
+                "\u{25cf} claude \u{b7} @swe \u{b7} 10:04",
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A transcript whose own launch joins its OWN meta file draws that launch as
+    /// one more line naming the same subagent, and the render ends: the view draws
+    /// one transcript, so nothing recurses and no cycle guard is needed.
+    #[test]
+    fn an_agent_that_launches_itself_draws_one_line_naming_itself() {
+        const SELF_KEY: &str = "a0000000000000c01";
+        let dir = unique_temp_dir("subagent-view-self");
+        let session = write_delegation_session(
+            &dir,
+            &[launch_record(false, "2026-10-05T10:00:00Z", "toolu_self")],
+            &[(
+                SELF_KEY,
+                "looper",
+                "toolu_self",
+                vec![launch_record(true, "2026-10-05T10:01:00Z", "toolu_self")],
+            )],
+        );
+
+        let rendered = render_view(&session, SELF_KEY);
+
+        assert_eq!(
+            delegation_headers(&rendered.text),
+            vec!["  \u{25c6} delegated to @looper \u{b7} (click to view)"]
+        );
+        assert_eq!(
+            rendered
+                .subagents
+                .iter()
+                .map(|region| region.agent_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![SELF_KEY]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn render_keeps_turn_separators_and_tool_markers() {
         let text = render_file(
@@ -4420,7 +5517,7 @@ mod tests {
                 .expect("a summary record names its summary")
         );
 
-        let rendered = render_file_collect(&path, WIDE, &HashSet::new(), &HashSet::new());
+        let rendered = render_file_expanded(&path, WIDE, &[]);
         let text_of =
             |line: &Line<'_>| -> String { line.spans.iter().map(|s| s.content.as_ref()).collect() };
 
@@ -5715,7 +6812,7 @@ mod tests {
         );
         std::fs::write(&file, jsonl).expect("write temp jsonl");
 
-        let rendered = render_file_collect(&file, WIDE, &HashSet::new(), &HashSet::new());
+        let rendered = render_file_expanded(&file, WIDE, &[]);
         assert_eq!(rendered.links.len(), 1, "one link region end to end");
         let region = &rendered.links[0];
         assert_eq!(region.url, "https://example.com/page");
@@ -5767,7 +6864,7 @@ mod tests {
         }
         std::fs::write(&file, jsonl).expect("write temp jsonl");
 
-        let rendered = render_file_collect(&file, WIDE, &HashSet::new(), &HashSet::new());
+        let rendered = render_file_expanded(&file, WIDE, &[]);
         assert!(
             rendered.text.lines.len() > FORMER_TAIL_CAP,
             "the fixture must render past the old cap, or this proves nothing \
@@ -6945,15 +8042,7 @@ mod tests {
     /// comes back wrong rather than coincidentally right.
     #[test]
     fn the_last_model_is_the_newest_one_claude_would_restore() {
-        let last = |file: &str| {
-            render_file_collect(
-                &preview_fixture(file),
-                WIDE,
-                &HashSet::new(),
-                &HashSet::new(),
-            )
-            .last_model
-        };
+        let last = |file: &str| render_file_expanded(&preview_fixture(file), WIDE, &[]).last_model;
         assert_eq!(
             last("sess-model-switch-1.jsonl").as_deref(),
             Some("Sonnet 5"),
@@ -7200,12 +8289,8 @@ mod tests {
 
     #[test]
     fn the_pinned_row_carries_the_effort_verbatim() {
-        let rendered = render_file_collect(
-            &preview_fixture("sess-effort-present-1.jsonl"),
-            WIDE,
-            &HashSet::new(),
-            &HashSet::new(),
-        );
+        let rendered =
+            render_file_expanded(&preview_fixture("sess-effort-present-1.jsonl"), WIDE, &[]);
         let row = rendered
             .text
             .lines

@@ -20,6 +20,7 @@ pub mod lineage;
 pub mod parse;
 pub mod preview;
 pub mod skills;
+pub mod subagents;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -603,8 +604,20 @@ mod tests {
                 .any(|p| p.components().any(|c| c.as_os_str() == "subagents")),
             "discovery must never descend into a subagents/ directory: {files:?}"
         );
-        // The twenty-two depth-2 `.jsonl` files, none of the nested subagent file.
-        assert_eq!(files.len(), 22, "unexpected discovered set: {files:?}");
+        // `sess-delegation-1/subagents/` holds subagent meta files and a forked
+        // skill's two decoys beside its transcripts; none is a session either.
+        assert!(
+            !files.iter().any(|p| {
+                p.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.ends_with(".meta.json") || name.contains(".forked-skill")
+                    })
+            }),
+            "a subagent meta or forked-skill file was discovered: {files:?}"
+        );
+        // The twenty-three depth-2 `.jsonl` files, none of the nested subagent files.
+        assert_eq!(files.len(), 23, "unexpected discovered set: {files:?}");
     }
 
     #[test]
@@ -626,8 +639,8 @@ mod tests {
             !sessions.iter().any(|s| s.label.contains("Sidecar title")),
             "a sidecar file with no cwd was surfaced as a session"
         );
-        // Exactly twenty-one resumable sessions survive (22 discovered - 1 sidecar).
-        assert_eq!(sessions.len(), 21, "unexpected session count");
+        // Exactly twenty-two resumable sessions survive (23 discovered - 1 sidecar).
+        assert_eq!(sessions.len(), 22, "unexpected session count");
     }
 
     /// `sess-relocated-1` carries claude's `/cd` `relocated` record: the row is

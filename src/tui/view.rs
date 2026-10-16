@@ -19,25 +19,28 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::time::{Duration, SystemTime};
 
 use ratatui::buffer::{Buffer, Cell};
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, Borders, Cell as TableCell, Clear, List, ListItem, ListState, Paragraph,
+    Block, Borders, Cell as TableCell, Clear, List, ListItem, ListState, Padding, Paragraph,
     Row as TableRow, Scrollbar, ScrollbarOrientation, ScrollbarState, Table, TableState, Widget,
     Wrap,
 };
 use ratatui::Frame;
-use time::OffsetDateTime;
+use time::{Date, OffsetDateTime, UtcOffset};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::agents::{self, AgentActivity, ReportedAgent};
 use crate::resume::ModelPick;
 use crate::search::SearchMode;
-use crate::store::preview::{self, FoldRegion, LinkRegion};
+use crate::store::preview::{self, FoldRegion, LinkRegion, SubagentRegion};
+use crate::store::subagents::{is_running, Subagent, SubagentStatus};
 use crate::store::{lineage, FailedTask};
 
 use super::app::{
@@ -1861,20 +1864,26 @@ fn preview_compose_split(area: Rect, has_banner: bool, compose_height: u16) -> (
     if compose_height == 0 {
         return (banner, transcript, Rect::default());
     }
-    // Degrade gracefully: `min` keeps the reservation inside the transcript, so a
-    // pane that only just clears the dock threshold collapses the transcript to
-    // zero rows rather than overlapping the two.
-    let compose_h = transcript.height.min(compose_height);
-    let shrunk = Rect {
-        height: transcript.height.saturating_sub(compose_h),
-        ..transcript
-    };
-    let compose = Rect {
-        y: shrunk.y.saturating_add(shrunk.height),
-        height: compose_h,
-        ..transcript
-    };
+    let (shrunk, compose) = split_off_bottom(transcript, compose_height);
     (banner, shrunk, compose)
+}
+
+/// Split `rows` rows off the bottom of `rect`: `(what is left above, the bottom
+/// rows)`, both at `rect`'s width. Degrades gracefully: `min` keeps the
+/// reservation inside `rect`, so a rect too short for it collapses what is left
+/// above to zero rows rather than overlapping the two. Pure.
+fn split_off_bottom(rect: Rect, rows: u16) -> (Rect, Rect) {
+    let bottom_h = rect.height.min(rows);
+    let top = Rect {
+        height: rect.height.saturating_sub(bottom_h),
+        ..rect
+    };
+    let bottom = Rect {
+        y: top.y.saturating_add(top.height),
+        height: bottom_h,
+        ..rect
+    };
+    (top, bottom)
 }
 
 /// Whether the compose zone docks INSIDE a preview pane drawn at `area` — only
@@ -1887,22 +1896,55 @@ fn docks_compose(app: &App, area: Rect) -> bool {
     app.is_composing() && preview_inner(area).height >= COMPOSE_MIN_DOCK_HEIGHT
 }
 
-/// The preview pane's `(banner, transcript, compose)` rects for a pane drawn at
-/// `area` — THE one derivation of that geometry. [`render_preview`] draws against
-/// it, and [`preview_transcript_rect`] hands the same answer to every pointer
-/// hit-test, so the rows a click or a drag resolves against are the rows the text
-/// was drawn in: never the pinned banner row, never the docked compose zone.
+/// The rects a preview pane is carved into ([`preview_areas`]), top to bottom:
+/// the pinned banner row, the scrolling transcript, the running list and the
+/// docked compose zone. The last two never both hold rows: the running list is
+/// hidden while a compose box is open ([`running_subagents`]).
+struct PreviewAreas {
+    /// The pinned banner row ([`preview_banner`]); empty when none is reserved.
+    banner: Rect,
+    /// The scrolling transcript: the one rect every pointer hit-test resolves
+    /// against ([`preview_transcript_rect`]).
+    transcript: Rect,
+    /// The running list ([`running_list`]); empty while nothing runs or it is
+    /// hidden ([`running_subagents`]).
+    running: Rect,
+    /// The docked compose zone; empty unless it docks ([`docks_compose`]).
+    compose: Rect,
+}
+
+/// The preview pane's [`PreviewAreas`] for a pane drawn at `area` — THE one
+/// derivation of that geometry. [`render_preview`] draws against it, and
+/// [`preview_transcript_rect`] hands the same answer to every pointer hit-test,
+/// so the rows a click or a drag resolves against are the rows the text was drawn
+/// in: never the pinned banner row, the running list or the docked compose zone.
 ///
 /// `has_banner` is [`preview_banner`]`(..).is_some()` (see [`preview_split`] for
 /// why it is never liveness). The docked zone's height is read off the editor
-/// itself ([`compose_zone_height`]), which knows the width it was last drawn at.
-fn preview_areas(app: &App, area: Rect, has_banner: bool) -> (Rect, Rect, Rect) {
+/// itself ([`compose_zone_height`]), which knows the width it was last drawn at;
+/// the running list's is [`running_list_height`] of what runs as of
+/// [`App::wall_clock`] and of the rows left under the banner, so it is carved
+/// from the bottom of the transcript only when a selected session's transcript
+/// is on the pane at all.
+fn preview_areas(app: &App, area: Rect, has_banner: bool) -> PreviewAreas {
     let compose_h = if docks_compose(app, area) {
         compose_zone_height(app)
     } else {
         0
     };
-    preview_compose_split(area, has_banner, compose_h)
+    let (banner, transcript, compose) = preview_compose_split(area, has_banner, compose_h);
+    let running_h = if has_banner {
+        running_list_height(running_subagents(app).len(), transcript.height)
+    } else {
+        0
+    };
+    let (transcript, running) = split_off_bottom(transcript, running_h);
+    PreviewAreas {
+        banner,
+        transcript,
+        running,
+        compose,
+    }
 }
 
 /// The TRANSCRIPT rect of the preview pane as the last frame laid it out — what
@@ -1915,16 +1957,280 @@ fn preview_areas(app: &App, area: Rect, has_banner: bool) -> (Rect, Rect, Rect) 
 /// the pinned row above it pushed a line onto.
 ///
 /// The pinned row ([`preview_banner`], reserved for every selected session whose
-/// transcript is on the pane) and a docked compose zone both sit OUTSIDE it by
-/// construction, so neither is ever clickable transcript or selectable text.
+/// transcript is on the pane), the running list and a docked compose zone all sit
+/// OUTSIDE it by construction, so none is ever clickable transcript or selectable
+/// text: a click on a running-list row opens nothing.
 ///
 /// Derived on demand from [`App::preview_rect`] (written by `render_body` each
 /// frame) through [`preview_areas`], rather than stored: a stored copy is a second
 /// answer that can drift from the draw. EMPTY-sized when the preview is not drawn
 /// (`PaneLayout::ListOnly` leaves `preview_rect` empty), so nothing hit-tests there.
 pub(crate) fn preview_transcript_rect(app: &App) -> Rect {
-    let (_, transcript, _) = preview_areas(app, app.preview_rect, preview_banner(app).is_some());
-    transcript
+    preview_areas(app, app.preview_rect, preview_banner(app).is_some()).transcript
+}
+
+/// The most running subagents the running list gives a row of their own; past
+/// it, a `+N more` line counts the rest ([`running_list_lines`]).
+///
+/// Measured 2026-10-13 over a local store: of 189 sessions that launched
+/// subagents (2,056 transcripts), the most that ran at once — each from its
+/// first record to its last write — was at most 3 in 181 and at most 5 in 185;
+/// the other four peaked at 6, 6, 6 and 16. With its `+N more` line and the rule
+/// the full list is then at most seven rows, which [`RUNNING_LIST_PANE_SHARE`]
+/// still draws whole on a standard 24-row terminal (18 rows under the pinned
+/// row).
+const RUNNING_LIST_MAX_ROWS: usize = 5;
+
+/// The running list drawn whole takes at most one part in this many of the
+/// rows under the pinned row; a pane that cannot spare that much gets the
+/// one-line form instead ([`running_list_height`]). Two: the list is a glance at
+/// what runs, the transcript is what the pane is for, so the list never takes
+/// more of it than it leaves.
+const RUNNING_LIST_PANE_SHARE: u16 = 2;
+
+/// The separator between a running-list row's facts, and between the one-line
+/// form's count and its hint: the middot the banner's age and the draft card
+/// use between facts. The subagent view's title parts its facts with it too
+/// ([`subagent_title`]), so a subagent reads alike in both.
+const RUNNING_LIST_SEPARATOR: &str = " \u{b7} ";
+
+/// The green the running list's `●` and the subagent view title's `running` are
+/// drawn in: one colour, so the two say running alike. A NAMED ANSI colour
+/// (TERMINAL-SAFE STYLING).
+const RUNNING_COLOR: Color = Color::Green;
+
+/// The running list's hint on the board: the key that opens the subagent view.
+const RUNNING_LIST_HINT: &str = "^X \u{2193} explore";
+
+/// The running list's hint inside the subagent view: the keys that step through
+/// the session's subagents and leave the view.
+const RUNNING_LIST_VIEW_HINT: &str = "\u{2190}/\u{2192} switch \u{b7} \u{2191}/Esc back";
+
+/// How many glyphs of the running list's rule lead its title
+/// (`── ^X ↓ explore ───`): with the rule on both sides, the title reads as set
+/// into it rather than as the first text row.
+const RUNNING_RULE_LEAD: usize = 2;
+
+/// The columns the running list's rows are set in under its rule, so they read
+/// as the list the rule heads rather than as transcript text.
+const RUNNING_LIST_INDENT: u16 = 1;
+
+/// What an age reads as after its number (`2m ago`).
+const SUBAGENT_AGE_SUFFIX: &str = " ago";
+
+/// The selected session's subagents RUNNING as of [`App::wall_clock`]
+/// ([`is_running`], over the facts the background refresh stored), in launch
+/// order — what the running list draws, so a subagent drops off it once it goes
+/// quiet, with no file read. Read-only over `App`: no clock, no I/O.
+///
+/// EMPTY, hiding the list, while a compose box is open or a draft card holds
+/// the pane: the `Ctrl-R` reply, the `Ctrl-F` fork box and the `Ctrl-N` draft
+/// card alike. A docked box takes the same bottom rows
+/// ([`preview_compose_split`]), and the rule is keyed on the box being open, not
+/// on where it is drawn, so the list stays hidden in the short-terminal
+/// full-width-bar fallback ([`compose_uses_bottom_bar`]) too: the box is still
+/// what the user is working in, that pane is already short of rows, and the list
+/// never comes and goes as a resize crosses the dock threshold mid-draft.
+fn running_subagents(app: &App) -> Vec<&Subagent> {
+    if app.is_composing() || app.draft.is_some() {
+        return Vec::new();
+    }
+    let now = app.wall_clock();
+    app.selected_subagents().map_or_else(Vec::new, |record| {
+        record
+            .subagents()
+            .iter()
+            .filter(|subagent| is_running(subagent.ended, subagent.newest_write, now))
+            .collect()
+    })
+}
+
+/// How many rows the running list takes for `running` running subagents in a
+/// pane with `available` rows under its pinned row: none while nothing runs; the
+/// whole list ([`running_list_full_height`]) when it takes at most one part in
+/// [`RUNNING_LIST_PANE_SHARE`] of them; else ONE, the one-line form, or none at
+/// all in a pane with no row to give. Pure, so the threshold is tested at its
+/// boundary without drawing.
+fn running_list_height(running: usize, available: u16) -> u16 {
+    if running == 0 {
+        return 0;
+    }
+    let full = running_list_full_height(running);
+    if full.saturating_mul(RUNNING_LIST_PANE_SHARE) <= available {
+        full
+    } else {
+        available.min(1)
+    }
+}
+
+/// The whole running list's height for `running` running subagents: a row each
+/// up to [`RUNNING_LIST_MAX_ROWS`], the `+N more` line past it, and the rule
+/// that carries the hint. Pure.
+fn running_list_full_height(running: usize) -> u16 {
+    let rows = running.min(RUNNING_LIST_MAX_ROWS);
+    let more = usize::from(running > RUNNING_LIST_MAX_ROWS);
+    u16::try_from(rows + more + 1).unwrap_or(u16::MAX)
+}
+
+/// How long ago a subagent last wrote, as its running-list row says it
+/// (`2m ago`), or `None` with no age to state. The number is
+/// [`agents::elapsed_phrase`]'s, the unit rule the preview banner's age follows,
+/// over the span from zero to `idle`. PURE.
+fn subagent_age(idle: Option<Duration>) -> Option<String> {
+    let idle_ms = i64::try_from(idle?.as_millis()).ok()?;
+    agents::elapsed_phrase(Some(0), idle_ms).map(|phrase| format!("{phrase}{SUBAGENT_AGE_SUFFIX}"))
+}
+
+/// The running list as drawn into `area`: a DIM rule along its top row that
+/// carries [`running_list_title`], over the rows ([`running_list_lines`]) set
+/// [`RUNNING_LIST_INDENT`] in — or the rule alone, the one-line form, in a rect
+/// too short for the whole list ([`running_list_full_height`]). `None` while
+/// nothing runs or `area` has no room. The rule is DIM and never Cyan, the
+/// docked reply box's border ([`render_compose_zone`]): the list must not read
+/// as an input box. Never touches the status line (STATUS-LINE OWNERSHIP): the
+/// list is an interval fact on a surface of its own. Pure.
+fn running_list(
+    running: &[&Subagent],
+    marked: Option<&str>,
+    now: SystemTime,
+    area: Rect,
+) -> Option<Paragraph<'static>> {
+    if running.is_empty() || area.is_empty() {
+        return None;
+    }
+    let one_line = area.height < running_list_full_height(running.len());
+    let rule = Block::new()
+        .borders(Borders::TOP)
+        .border_style(Style::default().add_modifier(Modifier::DIM))
+        // The title is drawn over the rule's cells and would keep their DIM; it
+        // carries its own styles instead.
+        .title_style(Style::default().remove_modifier(Modifier::DIM))
+        .title(running_list_title(
+            running.len(),
+            marked.is_some(),
+            one_line,
+        ))
+        .padding(Padding::left(RUNNING_LIST_INDENT));
+    let rows = if one_line {
+        Vec::new()
+    } else {
+        running_list_lines(running, marked, now, rule.inner(area).width)
+    };
+    Some(Paragraph::new(rows).block(rule))
+}
+
+/// The title the running list's rule carries, after [`RUNNING_RULE_LEAD`] glyphs
+/// of the rule itself: the hint — [`RUNNING_LIST_VIEW_HINT`] in the subagent view
+/// (`in_view`), else [`RUNNING_LIST_HINT`] — led in the one-line form by the count
+/// of every running subagent (`── ● 3 running · ^X ↓ explore ──`). The lead and
+/// the hint are DIM like the rule; the count is not. Pure.
+fn running_list_title(running: usize, in_view: bool, one_line: bool) -> Line<'static> {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let hint = if in_view {
+        RUNNING_LIST_VIEW_HINT
+    } else {
+        RUNNING_LIST_HINT
+    };
+    // The glyph the rule's `Borders::TOP` draws, so the lead joins it seamlessly.
+    let lead = symbols::border::PLAIN
+        .horizontal_top
+        .repeat(RUNNING_RULE_LEAD);
+    let mut spans = vec![Span::styled(format!("{lead} "), dim)];
+    if one_line {
+        spans.push(running_dot());
+        spans.push(Span::raw(format!("{running} running")));
+        spans.push(Span::styled(
+            format!("{RUNNING_LIST_SEPARATOR}{hint} "),
+            dim,
+        ));
+    } else {
+        spans.push(Span::styled(format!("{hint} "), dim));
+    }
+    Line::from(spans)
+}
+
+/// The running list's rows for a `width`-column rect: the subagents `running`
+/// names, one row each ([`running_row`]) up to [`RUNNING_LIST_MAX_ROWS`], then a
+/// `+N more` line counting the rest. `marked` names the subagent the pane shows
+/// (the subagent view), whose row is marked when it runs. Pure.
+fn running_list_lines(
+    running: &[&Subagent],
+    marked: Option<&str>,
+    now: SystemTime,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let mut lines: Vec<Line<'static>> = running
+        .iter()
+        .take(RUNNING_LIST_MAX_ROWS)
+        .map(|subagent| {
+            running_row(
+                subagent,
+                marked == Some(subagent.agent_id.as_str()),
+                now,
+                width,
+            )
+        })
+        .collect();
+    let more = running.len().saturating_sub(RUNNING_LIST_MAX_ROWS);
+    if more > 0 {
+        lines.push(Line::from(Span::styled(format!("+{more} more"), dim)));
+    }
+    lines
+}
+
+/// The `●` that leads every running-list line, in [`RUNNING_COLOR`].
+fn running_dot() -> Span<'static> {
+    Span::styled(format!("{BADGE_DOT} "), Style::default().fg(RUNNING_COLOR))
+}
+
+/// One running subagent's row, `● @<agentType> · <description> · <age>`, fitted to
+/// `width` columns. A subagent with no description, or none left after fitting,
+/// has no description segment (`● @<agentType> · <age>`), and one with no age to
+/// state ([`subagent_age`]: a write after `now`, the clocks disagreeing) has no
+/// age segment — never an invented one or a dangling separator.
+///
+/// On a narrow pane the DESCRIPTION gives way first: the `●`, the
+/// `@<agentType>` and the age are held back whole, and the description takes what
+/// is left, cut with an ellipsis ([`fit_label`]). Narrower still, the row is cut
+/// at the pane's edge, the age first. `marked` — the subagent the pane shows —
+/// draws its `@<agentType> · <description>` REVERSED and BOLD. Pure.
+fn running_row(subagent: &Subagent, marked: bool, now: SystemTime, width: u16) -> Line<'static> {
+    let dot = running_dot();
+    let age = subagent_age(
+        subagent
+            .newest_write
+            .and_then(|written| now.duration_since(written).ok()),
+    )
+    .map(|age| format!("{RUNNING_LIST_SEPARATOR}{age}"))
+    .unwrap_or_default();
+    let mut label = format!("@{}", subagent.agent_type);
+    if let Some(description) = &subagent.description {
+        let used = UnicodeWidthStr::width(dot.content.as_ref())
+            + UnicodeWidthStr::width(label.as_str())
+            + UnicodeWidthStr::width(RUNNING_LIST_SEPARATOR);
+        let fitted = fit_label(
+            description,
+            usize::from(width),
+            used,
+            UnicodeWidthStr::width(age.as_str()),
+        );
+        if !fitted.is_empty() {
+            label = format!("{label}{RUNNING_LIST_SEPARATOR}{fitted}");
+        }
+    }
+    let label_style = if marked {
+        Style::default()
+            .add_modifier(Modifier::REVERSED)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    Line::from(vec![
+        dot,
+        Span::styled(label, label_style),
+        Span::styled(age, Style::default().add_modifier(Modifier::DIM)),
+    ])
 }
 
 /// The draft pane's title when the picked agent is the "default (no agent)" row —
@@ -2290,27 +2596,227 @@ fn completion_cell<'a>(text: &'a str, marks: &[usize], style: Style) -> TableCel
 /// string drawn and the string the tests look for cannot drift apart.
 const PREVIEW_TITLE: &str = " preview ";
 
+/// What the preview block's title says while the pane shows the SUBAGENT VIEW,
+/// ahead of the subagent's `@<agentType>`: the view must never pass for the
+/// selected session's own transcript.
+const SUBAGENT_TITLE_PREFIX: &str = "subagent";
+
+/// The blank either side of the subagent view's title, which sets it off the
+/// border's line as [`PREVIEW_TITLE`]'s blanks set it.
+const SUBAGENT_TITLE_PAD: &str = " ";
+
+/// What leads the subagent view title's launch time (`started 14:02`).
+const SUBAGENT_STARTED_LABEL: &str = "started ";
+
+/// What leads the subagent view title's age (`last write 12s ago`): the age of
+/// its newest write — its own, or a subagent's below it — the instant the
+/// running check measures from, never of its launch.
+const SUBAGENT_LAST_WRITE_LABEL: &str = "last write ";
+
+/// The subagent view title's `quiet`: the NAMED dim gray an ended job's badge
+/// reads as dormant in ([`BADGE_ENDED`]), since a quiet run is not doing
+/// anything either (TERMINAL-SAFE STYLING).
+const SUBAGENT_QUIET_COLOR: Color = Color::DarkGray;
+
+/// What the subagent view's title states ([`subagent_title`]), gathered from
+/// state `App` already holds ([`subagent_title_facts`]), never from a file or a
+/// clock. A fact that is not known is `None`.
+#[derive(Debug, Clone, Copy)]
+struct SubagentTitleFacts<'a> {
+    /// Its `agentType`.
+    agent_type: &'a str,
+    /// Its meta's description — the subagent's title: a subagent transcript
+    /// carries no `ai-title` record (none across a local store, 2026-10-13).
+    description: Option<&'a str>,
+    /// Where its run stands ([`App::subagent_view_status`]).
+    status: Option<SubagentStatus>,
+    /// When it launched ([`Subagent::launched`]).
+    launched: Option<OffsetDateTime>,
+    /// Its newest write ([`Subagent::newest_write`]).
+    newest_write: Option<SystemTime>,
+    /// Its place in launch order ([`App::subagent_view_position`]).
+    position: Option<(usize, usize)>,
+    /// The instant the age is stated as of: `App::wall_clock`.
+    now: SystemTime,
+}
+
+/// The facts of the subagent the pane shows, or `None` outside the subagent
+/// view: its `agentType` from the view, the rest from the selected session's
+/// record entry for it ([`App::viewed_subagent`]) and the view's render. No
+/// clock, no I/O.
+fn subagent_title_facts(app: &App) -> Option<SubagentTitleFacts<'_>> {
+    let agent_type = app.subagent_view_type()?;
+    let listed = app.viewed_subagent();
+    Some(SubagentTitleFacts {
+        agent_type,
+        description: listed.and_then(|subagent| subagent.description.as_deref()),
+        status: app.subagent_view_status(),
+        launched: listed.and_then(|subagent| subagent.launched),
+        newest_write: listed.and_then(|subagent| subagent.newest_write),
+        position: app.subagent_view_position(),
+        now: app.wall_clock(),
+    })
+}
+
+/// The subagent view's title for a top border that gives it `width` columns
+/// between its corners:
+/// ` subagent @<agentType> · <description> · <state> · started <time> · last write <age> · N/M `,
+/// for example
+/// ` subagent @cr-swe-rust · Fix fork-box review findings · running · started 14:02 · last write 12s ago · 2/5 `.
+///
+/// A segment whose fact is unknown is left out, never a placeholder or a
+/// dangling separator: no description, no launch time, no age to state
+/// ([`subagent_age`]: no write, or one after `now`), no place in launch order,
+/// no state. The state is [`subagent_status_span`]'s; the time is
+/// [`launch_time`]'s, the turn markers' own form; the age is the running list's.
+///
+/// What does not fit gives way in this order: the DESCRIPTION, cut with an
+/// ellipsis ([`fit_label`]) and then dropped, then `last write …`, then
+/// `started …`, each of those two dropped whole. `subagent`, `@<agentType>`, the
+/// state and `N/M` are never cut here: narrower than those four, the title is
+/// returned as they are and the border cuts it at its edge, as it cuts any
+/// title. Pure.
+fn subagent_title(facts: &SubagentTitleFacts<'_>, width: u16) -> Line<'static> {
+    let width = usize::from(width);
+    let started = facts
+        .launched
+        .map(|at| format!("{SUBAGENT_STARTED_LABEL}{}", launch_time(at, facts.now)));
+    let last_write = subagent_age(
+        facts
+            .newest_write
+            .and_then(|written| facts.now.duration_since(written).ok()),
+    )
+    .map(|age| format!("{SUBAGENT_LAST_WRITE_LABEL}{age}"));
+    let (started, last_write) = (started.as_deref(), last_write.as_deref());
+    let description = facts.description.filter(|text| !text.trim().is_empty());
+    let draw = |description: Option<&str>, started: Option<&str>, last_write: Option<&str>| {
+        subagent_title_line(facts, description, started, last_write)
+    };
+    let whole = draw(description, started, last_write);
+    if whole.width() <= width {
+        return whole;
+    }
+    let bare = draw(None, started, last_write);
+    if let Some(description) = description {
+        let used = bare.width() + UnicodeWidthStr::width(RUNNING_LIST_SEPARATOR);
+        let cut = fit_label(description, width, used, 0);
+        if !cut.is_empty() {
+            return draw(Some(&cut), started, last_write);
+        }
+    }
+    if bare.width() <= width {
+        return bare;
+    }
+    let undated = draw(None, started, None);
+    if undated.width() <= width {
+        return undated;
+    }
+    draw(None, None, None)
+}
+
+/// The subagent view's title with exactly the given `description`, `started`
+/// and `last_write` segments, and every other fact `facts` knows, each after
+/// [`RUNNING_LIST_SEPARATOR`]. Pure.
+fn subagent_title_line(
+    facts: &SubagentTitleFacts<'_>,
+    description: Option<&str>,
+    started: Option<&str>,
+    last_write: Option<&str>,
+) -> Line<'static> {
+    let mut spans = vec![Span::raw(format!(
+        "{SUBAGENT_TITLE_PAD}{SUBAGENT_TITLE_PREFIX} @{}",
+        facts.agent_type
+    ))];
+    if let Some(description) = description {
+        spans.push(Span::raw(format!("{RUNNING_LIST_SEPARATOR}{description}")));
+    }
+    if let Some(status) = facts.status {
+        spans.push(Span::raw(RUNNING_LIST_SEPARATOR));
+        spans.push(subagent_status_span(status));
+    }
+    for segment in [started, last_write].into_iter().flatten() {
+        spans.push(Span::raw(format!("{RUNNING_LIST_SEPARATOR}{segment}")));
+    }
+    if let Some((position, count)) = facts.position {
+        spans.push(Span::raw(format!(
+            "{RUNNING_LIST_SEPARATOR}{position}/{count}"
+        )));
+    }
+    spans.push(Span::raw(SUBAGENT_TITLE_PAD));
+    Line::from(spans)
+}
+
+/// The subagent view title's state, in [`SubagentStatus`]'s words: `running` in
+/// [`RUNNING_COLOR`], the running list's `●` green; `quiet` in
+/// [`SUBAGENT_QUIET_COLOR`]; `finished` unstyled, a settled run that asks
+/// nothing of the reader. NAMED ANSI colours only (TERMINAL-SAFE STYLING). Pure.
+fn subagent_status_span(status: SubagentStatus) -> Span<'static> {
+    match status {
+        SubagentStatus::Running => Span::styled("running", Style::default().fg(RUNNING_COLOR)),
+        SubagentStatus::Finished => Span::raw("finished"),
+        SubagentStatus::Quiet => Span::styled("quiet", Style::default().fg(SUBAGENT_QUIET_COLOR)),
+    }
+}
+
+/// When a subagent launched, as its view's title states it: the turn markers'
+/// own [`preview::timestamp_annotation`], against the day `now` falls on in
+/// `at`'s offset — the offset the time is written in, unconverted, as a marker
+/// writes it — so a launch that day reads `HH:MM` and one on another day
+/// `MM-DD HH:MM`. A `now` that cannot be placed reads as another day. Pure.
+fn launch_time(at: OffsetDateTime, now: SystemTime) -> String {
+    preview::timestamp_annotation(at, day_at(now, at.offset()))
+}
+
+/// The calendar day `now` falls on at `offset`, or `None` when `now` is before
+/// the Unix epoch or outside the range `time` can place.
+fn day_at(now: SystemTime, offset: UtcOffset) -> Option<Date> {
+    let secs = i64::try_from(now.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs()).ok()?;
+    Some(
+        OffsetDateTime::from_unix_timestamp(secs)
+            .ok()?
+            .checked_to_offset(offset)?
+            .date(),
+    )
+}
+
 /// The preview block's title: [`PREVIEW_TITLE`], or — in the 0:1
 /// [`PaneLayout::PreviewOnly`] layout, where no list is drawn to show which row is
 /// selected — the SELECTED session's label, so the pane still says whose
 /// transcript it is. `↑`/`↓` keep moving the selection there, and the title is
 /// what tells the reader where it went.
 ///
+/// While the pane shows the subagent view, in any layout, it names that subagent
+/// instead (` subagent @parser-auditor `), so a subagent's transcript never reads
+/// as the selected session's own — followed, once the session's subagent record
+/// lists it, by what that record and the view's render know of it: its
+/// description, its state (`running`, `finished` or `quiet`), when it started,
+/// how long ago it last wrote, and where it stands in the launch order `←`/`→`
+/// step through
+/// (` subagent @parser-auditor · Audit the parser · finished · started 23:50 · last write 2h ago · 2/5 `),
+/// fitted to the `width` columns the border gives a title ([`subagent_title`]).
+///
 /// Falls back to the session id for an empty label, as [`compose_title`] does, and
 /// to [`PREVIEW_TITLE`] when there is no transcript to name: nothing selected, or a
 /// new-session DRAFT card replacing the transcript — naming the selected row over
 /// a placeholder for a session that does not exist yet would claim the card
-/// belongs to an unrelated conversation. Pure, so the wording is assertable
+/// belongs to an unrelated conversation. Only the subagent view's title is fitted:
+/// the others are cut at the border's edge. Pure, so the wording is assertable
 /// without a terminal.
-fn preview_title(app: &App) -> String {
-    if app.pane_layout() != PaneLayout::PreviewOnly || app.draft.is_some() {
-        return PREVIEW_TITLE.to_string();
+fn preview_title(app: &App, width: u16) -> Line<'static> {
+    if app.draft.is_some() {
+        return Line::from(PREVIEW_TITLE);
     }
-    match app.selected_session() {
+    if let Some(facts) = subagent_title_facts(app) {
+        return subagent_title(&facts, width);
+    }
+    if app.pane_layout() != PaneLayout::PreviewOnly {
+        return Line::from(PREVIEW_TITLE);
+    }
+    Line::from(match app.selected_session() {
         Some(session) if !session.label.is_empty() => format!(" {} ", session.label),
         Some(session) => format!(" {} ", session.session_id),
         None => PREVIEW_TITLE.to_string(),
-    }
+    })
 }
 
 /// The readable transcript preview for the selected session, vertically
@@ -2322,8 +2828,8 @@ fn preview_title(app: &App) -> String {
 /// `render_list` writes back `app.scroll` — this clamps the offset against the
 /// wrapped content and writes both the resolved offset and the viewport height
 /// back into `App`. Those are the TRANSCRIPT's bounds, not the pane's: a pinned
-/// banner costs the scrollable area one row, so a page key sizes a page from
-/// what actually scrolls.
+/// banner costs the scrollable area one row, and the running list its rows, so a
+/// page key sizes a page from what actually scrolls.
 ///
 /// A vertical scrollbar is drawn over the block's own right border (the
 /// idiomatic ratatui composition: the `Scrollbar` widget is rendered as a
@@ -2335,10 +2841,6 @@ fn preview_title(app: &App) -> String {
 /// full-length/inactive thumb, keeping "a scrollbar is visible" a reliable
 /// signal that there is more transcript to see.
 fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(preview_title(app));
-
     // The selected session leads with the marker of whichever turn owns the TOP
     // row of the viewport, so who spoke — under which agent, on which model, when —
     // stays readable long after that turn's own marker scrolled off the top of a
@@ -2362,8 +2864,21 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     // `preview_compose_split` carves it out of `preview_inner`, and the box's height
     // is read off the editor itself, which knows the width it was last drawn at —
     // so there is no second width to get wrong. `preview_areas` is the SAME
-    // derivation every pointer hit-test reads (`preview_transcript_rect`).
-    let (banner_area, transcript_area, compose_area) = preview_areas(app, area, banner.is_some());
+    // derivation every pointer hit-test reads (`preview_transcript_rect`), and the
+    // running list's rows come out of the transcript's there, so the bottom
+    // anchor, the scrollbar and the match jump below all measure what is left.
+    let PreviewAreas {
+        banner: banner_area,
+        transcript: transcript_area,
+        running: running_area,
+        compose: compose_area,
+    } = preview_areas(app, area, banner.is_some());
+    let running = running_list(
+        &running_subagents(app),
+        app.subagent_view_id(),
+        app.wall_clock(),
+        running_area,
+    );
     // The transcript's width is also the table shrink-to-fit budget, so it must
     // be resolved BEFORE rendering the preview text (which fits GFM tables to
     // it). The banner split is vertical only, so this width — and therefore the
@@ -2391,9 +2906,9 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
 
     // Optimistic reply turns for an in-flight send, resolved BEFORE the mutable
     // preview borrow so the message you just sent shows immediately at the tail.
-    // Suppressed under a card: the echo belongs to the SELECTED session's
-    // transcript, which is not what the pane is showing.
-    let reply_tail = if card.is_some() {
+    // Suppressed under a card and in the subagent view alike: the echo belongs to
+    // the SELECTED session's transcript, which is not what the pane is showing.
+    let reply_tail = if card.is_some() || app.in_subagent_view() {
         None
     } else {
         sending_tail(app, inner_width)
@@ -2448,6 +2963,12 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     // Also the call that WARMS the cache for this (session, width), which
     // `preview_match_target` below reads without being able to fill.
     let transcript_lines = app.preview_line_count(inner_width);
+    // Titled only once that call has warmed the cache: the subagent view's state
+    // reads its render's verdict (`App::subagent_view_status`), which a cold
+    // render has not given yet.
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(preview_title(app, preview_inner(area).width));
 
     // Nothing selected (no text AND no banner, since a banner implies a SELECTED
     // session). A selected session whose transcript is still empty falls through
@@ -2683,7 +3204,18 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     // pending turns carry no model or effort, and `visual_to_content` rejects a row
     // past the map's end.
     let marker_row = offset_rows.min(transcript_rows.saturating_sub(1));
+    //
+    // The subagent view takes NONE of that precedence but the marker: the row names
+    // the subagent's own turn at the top of the view, and nothing of the session's —
+    // no standing failure, no live status, no reported-status fallback — so the
+    // view never reads as the session's transcript. Blank when no turn is pinnable.
+    let in_subagent_view = app.in_subagent_view();
     let banner = banner.map(|fallback| {
+        if in_subagent_view {
+            return app
+                .preview_marker_at(inner_width, marker_row)
+                .unwrap_or_default();
+        }
         failed_task_banner_line(app)
             .or_else(|| {
                 app.preview_marker_at(inner_width, marker_row)
@@ -2764,8 +3296,9 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
             .end_symbol(Some(end_symbol));
         // The track spans exactly the TRANSCRIPT's rows — the thing it scrolls —
         // which keeps it off the block's top/bottom border corners and title, and
-        // starts it below the pinned banner on a session that has one (the banner
-        // does not scroll, so no track cell should address it). Full pane width, so
+        // starts it below the pinned banner on a session that has one and ends it
+        // above the running list (neither scrolls, so no track cell should address
+        // them). Full pane width, so
         // the rightmost column it draws on is the block's own right border.
         frame.render_stateful_widget(
             scrollbar,
@@ -2777,6 +3310,12 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
             },
             &mut scrollbar_state,
         );
+    }
+
+    // Not wrapped, like the pinned row: a row that grew would steal a transcript
+    // row the hit-test still counts as the transcript's.
+    if let Some(running) = running {
+        frame.render_widget(running, running_area);
     }
 
     // A DOCKED compose zone occupies the bottom rows the transcript was shrunk away
@@ -3569,6 +4108,30 @@ pub(crate) fn fold_at<'a>(
         .map(|r| r.key.as_str())
 }
 
+/// The delegation line — its [`SubagentRegion`], naming the subagent a click
+/// switches the pane to — under a mouse click at screen `(col, row)`, or `None`.
+///
+/// [`fold_at`]'s twin over the other whole-line region kind, resolved through the
+/// SAME [`content_hit`], so the two can never disagree about which line or column a
+/// click landed on. A region spans its line's WHOLE display width, the property
+/// that makes the packed column answer sufficient ([`fold_at`] owns why), and a
+/// line that soft-wraps is hit on any of its segments. Fail-soft the same way: a
+/// click outside `inner`, on a blank row, or past the content answers `None`. Pure
+/// and terminal-free.
+pub(crate) fn subagent_at<'a>(
+    col: u16,
+    row: u16,
+    inner: Rect,
+    scroll_offset: u32,
+    row_prefix: &[usize],
+    regions: &'a [SubagentRegion],
+) -> Option<&'a SubagentRegion> {
+    let (content_row, content_col) = content_hit(col, row, inner, scroll_offset, row_prefix)?;
+    regions.iter().find(|r| {
+        r.content_row == content_row && r.col_start <= content_col && content_col < r.col_end
+    })
+}
+
 /// Order a selection's two endpoints into reading order: `(start, end)` where
 /// `start` is never after `end` — top-to-bottom, and left-to-right within one
 /// row. Pure so the selection geometry is unit-testable without a terminal.
@@ -4284,10 +4847,16 @@ fn render_search(frame: &mut Frame, app: &mut App, area: Rect) {
 /// targets the confirm offers — the stack only on its top row, never on a `↳`
 /// row — though not in the modal's own `Delete this` /
 /// `Delete lineage (N)` words; "stack" is the `(+N)` row's name in the key map),
-/// and the `^X` lead lost its second space.
+/// and the `^X` lead lost its second space. The `↓ subagent` verb (it opens ONE
+/// subagent's transcript in the preview, or leaves it) cost 14 more, landing it
+/// at 93, and two entries paid:
+/// `d del row/stack` became `d delete` (the confirm itself offers the stack on
+/// its top row) and `y copy ID` became `y ID` (the status line still says
+/// `Copied session ID …`), with the verb itself singular, which lands it at
+/// exactly 80.
 fn chord_hint(selected_hidden: bool) -> String {
     let x = if selected_hidden { "show" } else { "hide" };
-    format!("^X x {x} · d del row/stack · h hidden · r reload · y copy ID · f fold · w move")
+    format!("^X x {x} · d delete · h hidden · r reload · y ID · f fold · w move · ↓ subagent")
 }
 
 /// The compose zone's key hints, per open draft. Pure so the wording is assertable
@@ -4468,17 +5037,43 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         // release copies. A double-click selects and copies a word the same way and
         // is spelled out in `KEYS` and `docs/GUIDE.md`, not here. Like everything past
         // `^X` it is off-screen at 80 columns.
-        // The rest — a click on its release still opens a link or unfolds a node,
-        // a drag held past the pane's top or bottom edge scrolls it and keeps
-        // selecting, the copy goes the way `Ctrl-X y`'s does, Shift/Option for the
-        // terminal's own selection — is spelled out in `KEYS` and `docs/GUIDE.md`,
-        // where there is room.
+        // The rest — a click on its release still opens a link, unfolds a node or
+        // switches the pane to the subagent a `◆ delegated to …` line names, a drag
+        // held past the pane's top or bottom edge scrolls it and keeps selecting,
+        // the copy goes the way `Ctrl-X y`'s does, Shift/Option for the terminal's
+        // own selection — is spelled out in `KEYS` and `docs/GUIDE.md`, where there
+        // is room.
+        //
+        // `Esc clear/back/quit` names `Esc`'s three steps in order: clear a typed
+        // query, else go BACK from the subagent view to the session's own
+        // transcript, else quit (`update::key_to_action`).
+        //
+        // The leading arrows name what the plain arrows do NOW
+        // ([`board_arrows_hint`]): `↑↓` the selection and `←→` the search query's
+        // cursor, or — while the pane shows the subagent view, query or not — `↑`
+        // back to the session's own transcript and `←→` the step to the previous /
+        // next subagent.
         Line::from(vec![Span::styled(
-            "↑↓ move · ←→ query cursor · Enter resume · ^F fork · ^N new · ^R reply · ^K stop · ^X hide/del · type to search · A-←→·^←→ word · Tab name/content · S-↑↓ match · ^A scope · S-←→ layout · PgUp/PgDn·^U/^D·^T/^E·Home/End·wheel scroll · drag copy · Esc clear/quit",
+            format!("{} · Enter resume · ^F fork · ^N new · ^R reply · ^K stop · ^X hide/del · type to search · A-←→·^←→ word · Tab name/content · S-↑↓ match · ^A scope · S-←→ layout · PgUp/PgDn·^U/^D·^T/^E·Home/End·wheel scroll · drag copy · Esc clear/back/quit", board_arrows_hint(app.in_subagent_view())),
             Style::default().add_modifier(Modifier::DIM),
         )])
     };
     frame.render_widget(Paragraph::new(line), area);
+}
+
+/// What the board keymap says the plain arrows do (`update::key_to_action`):
+/// `↑`/`↓` move the selection and `←`/`→` the search query's cursor, or — while
+/// the preview shows the subagent view, query or not — `↑` goes back to the
+/// session's own transcript and `←`/`→` step to the previous / next subagent.
+/// The view's form leaves out `↓`, which still moves there: naming it would push
+/// `^K stop` past column 80, and each form must keep the keymap's leading keys
+/// inside 80 columns (the board's ends there exactly). PURE.
+fn board_arrows_hint(in_subagent_view: bool) -> &'static str {
+    if in_subagent_view {
+        "↑ back · ←→ subagent"
+    } else {
+        "↑↓ move · ←→ query cursor"
+    }
 }
 
 /// Shared width (columns) of every modal overlay. ONE constant retiring the
@@ -8679,6 +9274,63 @@ mod tests {
         );
     }
 
+    /// A delegation line's region, as `preview::delegation_node_lines` emits it.
+    fn subagent_region(content_row: usize, col_end: usize, agent_id: &str) -> SubagentRegion {
+        SubagentRegion {
+            content_row,
+            col_start: 0,
+            col_end,
+            agent_id: agent_id.to_string(),
+            agent_type: "parser-auditor".to_string(),
+        }
+    }
+
+    /// [`subagent_at`] resolves a click the way [`fold_at`] does: anywhere along
+    /// the line's whole width and on every soft-wrapped segment of it, through the
+    /// scroll offset, and never on the row above, past the line's end or past the
+    /// content.
+    #[test]
+    fn subagent_at_names_the_delegation_line_under_a_click_and_nothing_beside_it() {
+        let inner = inner_rect();
+        // Line 0 is a turn marker; line 1 a delegation line 46 columns wide, which
+        // wraps to 3 visual rows at inner width 20; line 2 a plain line.
+        let prefix = [0usize, 1, 4, 5];
+        let regions = [subagent_region(1, 46, "a1b2c3d4e5f6a7b8c")];
+        let hit = |col: u16, row: u16, scroll: u32| {
+            subagent_at(
+                inner.x + col,
+                inner.y + row,
+                inner,
+                scroll,
+                &prefix,
+                &regions,
+            )
+            .map(|region| region.agent_id.as_str())
+        };
+
+        assert_eq!(hit(0, 1, 0), Some("a1b2c3d4e5f6a7b8c"), "its first cell");
+        assert_eq!(
+            hit(19, 2, 0),
+            Some("a1b2c3d4e5f6a7b8c"),
+            "a wrapped segment"
+        );
+        assert_eq!(hit(5, 3, 0), Some("a1b2c3d4e5f6a7b8c"), "its last segment");
+        assert_eq!(hit(6, 3, 0), None, "one column past the line's end");
+        assert_eq!(hit(5, 0, 0), None, "the line above");
+        assert_eq!(hit(5, 4, 0), None, "the line below");
+        assert_eq!(hit(5, 9, 0), None, "past the content");
+        assert_eq!(
+            hit(5, 0, 1),
+            Some("a1b2c3d4e5f6a7b8c"),
+            "scrolled one row, the top screen row is the line's first segment"
+        );
+        assert_eq!(
+            subagent_at(0, inner.y + 1, inner, 0, &prefix, &regions),
+            None,
+            "left of the inner rect"
+        );
+    }
+
     // --- preview offset clamping (no overflow / underflow) ----------------
 
     #[test]
@@ -12159,7 +12811,7 @@ mod tests {
             .expect("the fixture's link label must be drawn inside the pane");
 
         let scroll = app.preview_scroll;
-        let (row_prefix, lines, regions, _folds) = app
+        let (row_prefix, lines, regions, ..) = app
             .preview_hit_context(inner_w)
             .expect("a selected preview");
         assert_eq!(
@@ -12351,7 +13003,7 @@ mod tests {
             .expect("the fixture's link label must be drawn inside the pane");
 
         let scroll = app.preview_scroll;
-        let (row_prefix, hit_lines, regions, _folds) = app
+        let (row_prefix, hit_lines, regions, ..) = app
             .preview_hit_context(inner_w)
             .expect("a selected preview");
         assert_eq!(
@@ -12483,7 +13135,7 @@ mod tests {
             .expect("the label's row must draw a grid column rule at this pane width");
 
         let scroll = app.preview_scroll;
-        let (row_prefix, lines, regions, _folds) = app
+        let (row_prefix, lines, regions, ..) = app
             .preview_hit_context(inner_w)
             .expect("a selected preview");
         assert_eq!(
@@ -13278,6 +13930,12 @@ mod tests {
         );
     }
 
+    /// The text of [`preview_title`] for a border wide enough that nothing is
+    /// cut.
+    fn title_text(app: &App) -> String {
+        line_string(&preview_title(app, u16::MAX))
+    }
+
     /// The preview's title is the generic one wherever a list still shows which row
     /// is selected, and the selected session's name only at 0:1 — falling back to
     /// the id for an empty label, and to the generic title with nothing selected or
@@ -13297,15 +13955,15 @@ mod tests {
             PaneLayout::ListWide,
         ] {
             app.set_pane_layout(layout);
-            assert_eq!(preview_title(&app), PREVIEW_TITLE, "{layout:?}");
+            assert_eq!(title_text(&app), PREVIEW_TITLE, "{layout:?}");
         }
 
         app.set_pane_layout(PaneLayout::PreviewOnly);
-        assert_eq!(preview_title(&app), " Fix the payment webhook retries ");
+        assert_eq!(title_text(&app), " Fix the payment webhook retries ");
 
         app.sessions[0].label.clear();
         assert_eq!(
-            preview_title(&app),
+            title_text(&app),
             " sess-normal-1 ",
             "an empty label falls back to the id"
         );
@@ -13315,14 +13973,14 @@ mod tests {
             Some(NewSessionDraft::default()),
         );
         assert_eq!(
-            preview_title(&app),
+            title_text(&app),
             PREVIEW_TITLE,
             "a draft card is not the selected session's transcript"
         );
 
         let mut empty = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp/launch"));
         empty.set_pane_layout(PaneLayout::PreviewOnly);
-        assert_eq!(preview_title(&empty), PREVIEW_TITLE, "nothing selected");
+        assert_eq!(title_text(&empty), PREVIEW_TITLE, "nothing selected");
     }
 
     /// A layout step keeps the reader's place: the line at the top of the pane
@@ -14770,6 +15428,916 @@ mod tests {
             !rows.iter().any(|row| row.contains("46m")),
             "an in-flight reply's pane must not repeat the age: {rows:?}"
         );
+    }
+
+    /// The subagent view never passes for the session's own transcript. Its
+    /// title names the subagent; its pinned row names the SUBAGENT's turn at the
+    /// top of the view and nothing of the session's — not the failure that
+    /// outranks every other line on the session's pane, not a live agent's status
+    /// and age; and the session's in-flight reply tail stays off it. Leaving the
+    /// view puts all of it back.
+    #[test]
+    fn the_subagent_view_shows_nothing_of_the_sessions_own() {
+        use super::super::app::Sending;
+
+        let (width, height) = BANNER_PANE;
+        let mut session = sample_session();
+        session.file = fixture("-Users-me-project-epsilon", "sess-delegation-1.jsonl");
+        let mut agent =
+            ReportedAgent::fixture("interactive", None, Some("busy")).with_pid(LIVE_PID);
+        agent.started_at_ms = Some(STARTED_AT);
+        let mut app = reported_app(session, agent, Some(POLLED_46M_LATER));
+        app.sessions[0].failed_task = Some(failed_task(SHORT_FAILURE, None));
+        app.sending = vec![Sending {
+            session_id: "sess-normal-1".to_string(),
+            message: "1a".to_string(),
+            baseline_msg_count: 0,
+        }];
+        let failure = format!("background task failed: {SHORT_FAILURE}");
+        let rows = inner_rows(&mut app, width, height);
+        assert_eq!(
+            rows[0], failure,
+            "premise: the session's pane pins its failure"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains(REPLY_COOKING_LABEL)),
+            "premise: the session's pane draws its in-flight reply: {rows:?}"
+        );
+        assert_eq!(title_text(&app), PREVIEW_TITLE);
+
+        app.open_subagent_view("a1b2c3d4e5f6a7b8c", "parser-auditor");
+        let rows = inner_rows(&mut app, width, height);
+        assert_eq!(
+            rows[0], "\u{25cf} claude \u{b7} Sonnet 5 \u{b7} 10-02 00:05",
+            "the subagent's own turn at the top of the view, alone: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains(REPLY_COOKING_LABEL)),
+            "the session's reply tail stays off the view: {rows:?}"
+        );
+        assert_eq!(title_text(&app), " subagent @parser-auditor ");
+
+        app.leave_subagent_view();
+        assert_eq!(inner_rows(&mut app, width, height)[0], failure);
+        assert_eq!(title_text(&app), PREVIEW_TITLE);
+    }
+
+    /// R4-4a: the subagent view's title states where the subagent stands in the
+    /// launch order `←`/`→` step through — 1-based, out of everything the
+    /// selected session's record lists — and claims no place before the record
+    /// lists it.
+    #[test]
+    fn the_subagent_views_title_states_its_place_in_launch_order() {
+        use crate::store::subagents::{Subagent, SubagentRecord};
+
+        let mut session = sample_session();
+        session.file = fixture("-Users-me-project-epsilon", "sess-delegation-1.jsonl");
+        let session_id = session.session_id.clone();
+        let mut app = App::new(vec![session], Scope::All, PathBuf::from("/tmp"));
+        app.open_subagent_view("b2", "writer");
+        assert_eq!(title_text(&app), " subagent @writer ", "no record yet");
+
+        let launched = |agent_id: &str, secs: i64| Subagent {
+            agent_id: agent_id.to_string(),
+            agent_type: format!("{agent_id}-type"),
+            description: None,
+            launched: Some(time::OffsetDateTime::from_unix_timestamp(secs).expect("an instant")),
+            newest_write: None,
+            ended: None,
+        };
+        app.apply_subagent_record(
+            &session_id,
+            SubagentRecord::new(vec![
+                launched("c3", 3),
+                launched("a1", 1),
+                launched("e5", 5),
+                launched("b2", 2),
+                launched("d4", 4),
+            ]),
+        );
+        // The entry's other facts ride ahead of the place: never read, so
+        // quiet, and launched on the wall clock's day, the Unix epoch's.
+        assert_eq!(
+            title_text(&app),
+            " subagent @writer \u{b7} quiet \u{b7} started 00:00 \u{b7} 2/5 "
+        );
+
+        app.open_subagent_view("zz", "late");
+        assert_eq!(
+            title_text(&app),
+            " subagent @late ",
+            "a subagent the record does not list yet has no place"
+        );
+        app.leave_subagent_view();
+        assert_eq!(title_text(&app), PREVIEW_TITLE);
+    }
+
+    // --- the subagent view's title ---------------------------------------------
+
+    /// The instant the title tests state ages as of.
+    fn title_now() -> SystemTime {
+        SystemTime::from(time::macros::datetime!(2026-10-13 14:30 UTC))
+    }
+
+    /// A running subagent that started at 14:02 on [`title_now`]'s day, last
+    /// wrote 12 s before it, and stands second of five.
+    fn title_facts() -> SubagentTitleFacts<'static> {
+        SubagentTitleFacts {
+            agent_type: "cr-swe-rust",
+            description: Some("Fix fork-box review findings"),
+            status: Some(SubagentStatus::Running),
+            launched: Some(time::macros::datetime!(2026-10-13 14:02 UTC)),
+            newest_write: Some(title_now() - Duration::from_secs(12)),
+            position: Some((2, 5)),
+            now: title_now(),
+        }
+    }
+
+    /// [`title_facts`]' whole title.
+    const FULL_TITLE: &str = " subagent @cr-swe-rust \u{b7} Fix fork-box review findings \u{b7} \
+                              running \u{b7} started 14:02 \u{b7} last write 12s ago \u{b7} 2/5 ";
+
+    /// The text of [`subagent_title`] over `facts` at `width`.
+    fn fitted_title(facts: &SubagentTitleFacts<'_>, width: u16) -> String {
+        line_string(&subagent_title(facts, width))
+    }
+
+    /// The columns `text` takes.
+    fn columns(text: &str) -> u16 {
+        u16::try_from(UnicodeWidthStr::width(text)).expect("a short title")
+    }
+
+    /// The title states every fact it knows, in order —
+    /// `subagent @<agentType> · <description> · <state> · started <time> · last write <age> · N/M`
+    /// — and draws the state in its colour: `running` in the running list's
+    /// green, `quiet` in the dim gray, `finished` in none.
+    #[test]
+    fn the_subagent_title_states_every_fact_it_knows_in_order() {
+        assert_eq!(fitted_title(&title_facts(), u16::MAX), FULL_TITLE);
+
+        let state_style = |status: SubagentStatus, word: &str| {
+            let facts = SubagentTitleFacts {
+                status: Some(status),
+                ..title_facts()
+            };
+            let line = subagent_title(&facts, u16::MAX);
+            line.spans
+                .iter()
+                .find(|span| span.content == word)
+                .unwrap_or_else(|| panic!("{word:?} is its own span: {line:?}"))
+                .style
+        };
+        assert_eq!(
+            state_style(SubagentStatus::Running, "running").fg,
+            Some(Color::Green)
+        );
+        assert_eq!(
+            state_style(SubagentStatus::Quiet, "quiet").fg,
+            Some(Color::DarkGray)
+        );
+        assert_eq!(
+            state_style(SubagentStatus::Finished, "finished"),
+            Style::default()
+        );
+    }
+
+    /// What does not fit gives way in order, at each boundary: the description
+    /// is cut with an ellipsis, down to the ellipsis alone, then dropped; then
+    /// `last write …`; then `started …`. `subagent`, `@<agentType>`, the state and
+    /// `N/M` are never cut by the fit: narrower than those four, the title is
+    /// theirs whole, and the border cuts it at its edge.
+    #[test]
+    fn the_subagent_title_gives_way_description_then_last_write_then_started() {
+        let facts = title_facts();
+        let full = columns(FULL_TITLE);
+        assert_eq!(fitted_title(&facts, full), FULL_TITLE, "fits exactly");
+
+        let cut = fitted_title(&facts, full - 1);
+        assert_eq!(
+            cut,
+            " subagent @cr-swe-rust \u{b7} Fix fork-box review findin\u{2026} \u{b7} running \
+             \u{b7} started 14:02 \u{b7} last write 12s ago \u{b7} 2/5 "
+        );
+        assert_eq!(columns(&cut), full - 1);
+
+        let bare = " subagent @cr-swe-rust \u{b7} running \u{b7} started 14:02 \u{b7} \
+                    last write 12s ago \u{b7} 2/5 ";
+        let separator = columns(RUNNING_LIST_SEPARATOR);
+        assert_eq!(
+            fitted_title(&facts, columns(bare) + separator + 1),
+            " subagent @cr-swe-rust \u{b7} \u{2026} \u{b7} running \u{b7} started 14:02 \u{b7} \
+             last write 12s ago \u{b7} 2/5 ",
+            "the ellipsis alone"
+        );
+        assert_eq!(fitted_title(&facts, columns(bare) + separator), bare);
+        assert_eq!(fitted_title(&facts, columns(bare)), bare, "no description");
+
+        let undated = " subagent @cr-swe-rust \u{b7} running \u{b7} started 14:02 \u{b7} 2/5 ";
+        assert_eq!(fitted_title(&facts, columns(bare) - 1), undated);
+        assert_eq!(
+            fitted_title(&facts, columns(undated)),
+            undated,
+            "no last write"
+        );
+
+        let kept = " subagent @cr-swe-rust \u{b7} running \u{b7} 2/5 ";
+        assert_eq!(fitted_title(&facts, columns(undated) - 1), kept);
+        assert_eq!(fitted_title(&facts, columns(kept)), kept, "no started");
+        assert_eq!(fitted_title(&facts, columns(kept) - 1), kept, "never cut");
+        assert_eq!(fitted_title(&facts, 0), kept);
+
+        let width = columns(kept) - 3;
+        let area = Rect::new(0, 0, width + 2, 3);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        Block::default()
+            .borders(Borders::ALL)
+            .title(subagent_title(&facts, width))
+            .render(area, &mut buffer);
+        let shown: String = kept.chars().take(usize::from(width)).collect();
+        assert_eq!(
+            full_row_text(&buffer, 0, area.width),
+            format!("\u{250c}{shown}\u{2510}"),
+            "the border cuts it at its edge"
+        );
+    }
+
+    /// A fact the title does not know is left out — no placeholder, no dangling
+    /// separator: no description (none, empty or blank), no state, no launch
+    /// time, no write or one after `now` (the clocks disagree), no place.
+    #[test]
+    fn the_subagent_title_leaves_out_every_fact_it_does_not_know() {
+        let wide = u16::MAX;
+        let without = |facts: SubagentTitleFacts<'static>, gone: &str| {
+            let text = fitted_title(&facts, wide);
+            assert_eq!(
+                text,
+                FULL_TITLE.replacen(gone, "", 1),
+                "{gone:?} is left out"
+            );
+        };
+        for description in [None, Some(""), Some("   ")] {
+            without(
+                SubagentTitleFacts {
+                    description,
+                    ..title_facts()
+                },
+                " \u{b7} Fix fork-box review findings",
+            );
+        }
+        without(
+            SubagentTitleFacts {
+                status: None,
+                ..title_facts()
+            },
+            " \u{b7} running",
+        );
+        without(
+            SubagentTitleFacts {
+                launched: None,
+                ..title_facts()
+            },
+            " \u{b7} started 14:02",
+        );
+        for newest_write in [None, Some(title_now() + Duration::from_secs(5))] {
+            without(
+                SubagentTitleFacts {
+                    newest_write,
+                    ..title_facts()
+                },
+                " \u{b7} last write 12s ago",
+            );
+        }
+        without(
+            SubagentTitleFacts {
+                position: None,
+                ..title_facts()
+            },
+            " \u{b7} 2/5",
+        );
+        let nothing = SubagentTitleFacts {
+            description: None,
+            status: None,
+            launched: None,
+            newest_write: None,
+            position: None,
+            ..title_facts()
+        };
+        assert_eq!(fitted_title(&nothing, wide), " subagent @cr-swe-rust ");
+    }
+
+    /// The launch time is the turn markers' own form, through their own
+    /// formatter: `HH:MM` on the wall clock's day, `MM-DD HH:MM` on another —
+    /// that day taken in the offset the time is written in — and the fuller form
+    /// for a wall clock that cannot be placed.
+    #[test]
+    fn the_subagent_title_states_its_launch_time_as_a_turn_marker_does() {
+        use time::macros::datetime;
+
+        let today = datetime!(2026-10-13 14:02 UTC);
+        assert_eq!(launch_time(today, title_now()), "14:02");
+        assert_eq!(
+            launch_time(today, title_now()),
+            preview::timestamp_annotation(today, Some(today.date()))
+        );
+
+        let yesterday = datetime!(2026-10-12 23:50 UTC);
+        assert_eq!(launch_time(yesterday, title_now()), "10-12 23:50");
+        let facts = SubagentTitleFacts {
+            launched: Some(yesterday),
+            ..title_facts()
+        };
+        assert!(
+            fitted_title(&facts, u16::MAX).contains(" \u{b7} started 10-12 23:50 \u{b7} "),
+            "{:?}",
+            fitted_title(&facts, u16::MAX)
+        );
+
+        // 23:30 UTC on the 13th is 01:30 on the 14th at +02:00, the day the
+        // launch is written on, though in UTC it is still the 13th.
+        let local = datetime!(2026-10-14 01:00 +02:00);
+        let now = SystemTime::from(datetime!(2026-10-13 23:30 UTC));
+        assert_eq!(launch_time(local, now), "01:00");
+
+        let before_epoch = SystemTime::UNIX_EPOCH - Duration::from_secs(1);
+        assert_eq!(day_at(before_epoch, time::UtcOffset::UTC), None);
+        assert_eq!(launch_time(today, before_epoch), "10-13 14:02");
+    }
+
+    /// The drawn subagent view's title reads the facts the record and the view's
+    /// render hold, and its state is the render's — judged in the SAME frame the
+    /// title is drawn in, though the record's own `ended` (a tail it never read)
+    /// would read quiet.
+    #[test]
+    fn the_drawn_subagent_view_title_reads_the_record_and_the_render_of_its_frame() {
+        use crate::store::subagents::SubagentRecord;
+
+        let at = SystemTime::from(time::macros::datetime!(2026-10-02 00:30 UTC));
+        let mut session = sample_session();
+        session.file = fixture("-Users-me-project-epsilon", "sess-delegation-1.jsonl");
+        let session_id = session.session_id.clone();
+        let mut app = App::new(vec![session], Scope::All, PathBuf::from("/tmp"));
+        app.set_pane_layout(PaneLayout::PreviewOnly);
+        app.apply_subagent_record(
+            &session_id,
+            SubagentRecord::new(vec![Subagent {
+                agent_id: "a1b2c3d4e5f6a7b8c".to_string(),
+                agent_type: "parser-auditor".to_string(),
+                description: Some("Audit the parser".to_string()),
+                launched: Some(time::macros::datetime!(2026-10-01 23:50:21 UTC)),
+                newest_write: Some(at - Duration::from_secs(30)),
+                ended: None,
+            }]),
+        );
+        app.note_wall_clock(at);
+        app.open_subagent_view("a1b2c3d4e5f6a7b8c", "parser-auditor");
+
+        let width = 160;
+        let buffer = drawn_board(&mut app, width, 24);
+        let title = " subagent @parser-auditor \u{b7} Audit the parser \u{b7} running \u{b7} \
+                     started 10-01 23:50 \u{b7} last write 30s ago \u{b7} 1/1 ";
+        let rule = "\u{2500}".repeat(usize::from(width - 2 - columns(title)));
+        assert_eq!(
+            full_row_text(&buffer, app.preview_rect.y, width),
+            format!("\u{250c}{title}{rule}\u{2510}")
+        );
+    }
+
+    // --- the running list ------------------------------------------------------
+
+    /// The instant the running-list tests draw at: `App::wall_clock` once
+    /// stamped, and the `now` the pure builders are handed.
+    fn list_now() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)
+    }
+
+    /// A subagent RUNNING at [`list_now`] — its tail read and unended — last
+    /// written `idle_secs` before it. No launch time, so launch order is the id's.
+    fn running_subagent(
+        agent_id: &str,
+        agent_type: &str,
+        description: Option<&str>,
+        idle_secs: u64,
+    ) -> Subagent {
+        Subagent {
+            agent_id: agent_id.to_string(),
+            agent_type: agent_type.to_string(),
+            description: description.map(str::to_string),
+            launched: None,
+            newest_write: Some(list_now() - Duration::from_secs(idle_secs)),
+            ended: Some(false),
+        }
+    }
+
+    /// `count` running subagents, `a0`, `a1`, … in launch order.
+    fn running_many(count: usize) -> Vec<Subagent> {
+        (0..count)
+            .map(|i| running_subagent(&format!("a{i}"), &format!("type-{i}"), None, 30))
+            .collect()
+    }
+
+    /// The text of a line, span by span.
+    fn line_string(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    /// The parser auditor of the running-list tests, last written 2m 5s ago.
+    fn auditor() -> Subagent {
+        running_subagent("a1", "parser-auditor", Some("Audit the parser"), 125)
+    }
+
+    /// A row reads `● @<agentType> · <description> · <age>`, the age as
+    /// `2m ago`; a subagent with no description has no description segment,
+    /// and one whose write is after `now` (the clocks disagree) states no age —
+    /// never an invented one, never a dangling separator.
+    #[test]
+    fn a_running_row_states_the_agent_type_the_description_and_the_age() {
+        let wide = 200;
+        let row = running_row(&auditor(), false, list_now(), wide);
+        assert_eq!(
+            line_string(&row),
+            "\u{25cf} @parser-auditor \u{b7} Audit the parser \u{b7} 2m ago"
+        );
+        assert_eq!(row.spans[0].style.fg, Some(Color::Green), "a running dot");
+        assert!(row.spans[2].style.add_modifier.contains(Modifier::DIM));
+
+        let bare = running_subagent("a1", "parser-auditor", None, 59);
+        assert_eq!(
+            line_string(&running_row(&bare, false, list_now(), wide)),
+            "\u{25cf} @parser-auditor \u{b7} 59s ago"
+        );
+
+        let ahead = Subagent {
+            newest_write: Some(list_now() + Duration::from_secs(5)),
+            ..auditor()
+        };
+        assert_eq!(
+            line_string(&running_row(&ahead, false, list_now(), wide)),
+            "\u{25cf} @parser-auditor \u{b7} Audit the parser"
+        );
+        assert_eq!(subagent_age(None), None);
+        assert_eq!(
+            subagent_age(Some(Duration::from_secs(7_200))).as_deref(),
+            Some("2h ago")
+        );
+    }
+
+    /// On a narrow pane the description gives way first: the `●`, the
+    /// `@<agentType>` and the age stay whole while the description is cut with an
+    /// ellipsis to fill the row exactly; with no room for any of it, the row
+    /// drops the description segment altogether.
+    #[test]
+    fn a_narrow_pane_cuts_the_description_before_the_type_or_the_age() {
+        let whole = "\u{25cf} @parser-auditor \u{b7} Audit the parser \u{b7} 2m ago";
+        let whole_width = u16::try_from(whole.chars().count()).expect("a short row");
+        assert_eq!(
+            line_string(&running_row(&auditor(), false, list_now(), whole_width)),
+            whole,
+            "a row that fits is drawn whole"
+        );
+
+        let cut = line_string(&running_row(&auditor(), false, list_now(), whole_width - 5));
+        assert_eq!(
+            cut,
+            "\u{25cf} @parser-auditor \u{b7} Audit the \u{2026} \u{b7} 2m ago"
+        );
+        assert_eq!(cut.chars().count(), usize::from(whole_width - 5));
+
+        let fixed = "\u{25cf} @parser-auditor \u{b7} \u{b7} 2m ago"
+            .chars()
+            .count();
+        let no_room = u16::try_from(fixed).expect("a short row");
+        assert_eq!(
+            line_string(&running_row(&auditor(), false, list_now(), no_room)),
+            "\u{25cf} @parser-auditor \u{b7} 2m ago"
+        );
+    }
+
+    /// The running list drawn alone into a `width` × `height` rect at the
+    /// origin, at [`list_now`].
+    fn drawn_running_list(
+        running: &[&Subagent],
+        marked: Option<&str>,
+        width: u16,
+        height: u16,
+    ) -> ratatui::buffer::Buffer {
+        let area = Rect::new(0, 0, width, height);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        if let Some(list) = running_list(running, marked, list_now(), area) {
+            list.render(area, &mut buffer);
+        }
+        buffer
+    }
+
+    /// Every row of a drawn list, trailing blanks trimmed.
+    fn list_rows(buffer: &ratatui::buffer::Buffer) -> Vec<String> {
+        let area = buffer.area;
+        (area.y..area.bottom())
+            .map(|y| full_row_text(buffer, y, area.width))
+            .collect()
+    }
+
+    /// The running list's rule `width` columns wide carrying `title`: two rule
+    /// glyphs, the title between single spaces, then the rule to the edge.
+    fn rule_row(title: &str, width: usize) -> String {
+        let set = format!("\u{2500}\u{2500} {title} ");
+        let fill = width - UnicodeWidthStr::width(set.as_str());
+        format!("{set}{}", "\u{2500}".repeat(fill))
+    }
+
+    /// Past [`RUNNING_LIST_MAX_ROWS`] the first ones in launch order keep their
+    /// rows and a `+N more` line counts the rest, under the rule; at the cap there
+    /// is no such line.
+    #[test]
+    fn the_running_list_caps_its_rows_and_counts_the_rest() {
+        let seven = running_many(RUNNING_LIST_MAX_ROWS + 2);
+        let refs: Vec<&Subagent> = seven.iter().collect();
+        let full = running_list_full_height(refs.len());
+        assert_eq!(full, 7, "the rule, five rows and the more line");
+        let rows = list_rows(&drawn_running_list(&refs, None, 80, full));
+        assert_eq!(rows[0], rule_row("^X \u{2193} explore", 80), "{rows:?}");
+        for (i, row) in rows.iter().skip(1).take(RUNNING_LIST_MAX_ROWS).enumerate() {
+            assert!(row.contains(&format!("@type-{i} ")), "{rows:?}");
+        }
+        assert_eq!(rows[6], " +2 more");
+
+        let five = running_many(RUNNING_LIST_MAX_ROWS);
+        let refs: Vec<&Subagent> = five.iter().collect();
+        let rows = list_rows(&drawn_running_list(&refs, None, 80, 6));
+        assert!(
+            rows[5].contains("@type-4 "),
+            "no more line at the cap: {rows:?}"
+        );
+        assert!(!rows.iter().any(|row| row.contains("more")), "{rows:?}");
+    }
+
+    /// The whole list is drawn while it takes at most half the rows under the
+    /// pinned row ([`RUNNING_LIST_PANE_SHARE`]); one row fewer and it shrinks to
+    /// ONE line, its rule counting every running subagent; nothing runs, no rows
+    /// at all.
+    #[test]
+    fn the_running_list_shrinks_to_one_line_below_its_share_of_the_pane() {
+        assert_eq!(running_list_height(0, 40), 0);
+        assert_eq!(running_list_height(3, 8), 4, "4 rows of 8: drawn whole");
+        assert_eq!(running_list_height(3, 7), 1, "4 rows of 7: one line");
+        assert_eq!(running_list_height(3, 1), 1);
+        assert_eq!(running_list_height(3, 0), 0, "no row to give");
+        assert_eq!(running_list_height(9, 14), 7, "capped: 7 rows of 14");
+        assert_eq!(running_list_height(9, 13), 1);
+
+        let three = running_many(3);
+        let refs: Vec<&Subagent> = three.iter().collect();
+        assert_eq!(
+            list_rows(&drawn_running_list(&refs, None, 80, 1)),
+            [rule_row(
+                "\u{25cf} 3 running \u{b7} ^X \u{2193} explore",
+                80
+            )]
+        );
+    }
+
+    /// Inside the subagent view the row of the subagent on screen is marked —
+    /// REVERSED and BOLD, the others plain — and the rule's hint names the keys
+    /// that step and leave, in the one-line form too. A subagent on screen that
+    /// is not running marks nothing.
+    #[test]
+    fn inside_the_subagent_view_the_list_marks_its_subagent_and_hints_the_arrows() {
+        let three = running_many(3);
+        let refs: Vec<&Subagent> = three.iter().collect();
+        let lines = running_list_lines(&refs, Some("a1"), list_now(), 80);
+        let marked = |line: &Line<'_>| {
+            line.spans[1]
+                .style
+                .add_modifier
+                .contains(Modifier::REVERSED)
+                && line.spans[1].style.add_modifier.contains(Modifier::BOLD)
+        };
+        assert_eq!(
+            lines.iter().map(marked).collect::<Vec<_>>(),
+            [false, true, false]
+        );
+        assert_eq!(
+            list_rows(&drawn_running_list(&refs, Some("a1"), 80, 4))[0],
+            rule_row("\u{2190}/\u{2192} switch \u{b7} \u{2191}/Esc back", 80)
+        );
+
+        assert_eq!(
+            list_rows(&drawn_running_list(&refs, Some("a1"), 80, 1)),
+            [rule_row(
+                "\u{25cf} 3 running \u{b7} \u{2190}/\u{2192} switch \u{b7} \u{2191}/Esc back",
+                80
+            )]
+        );
+
+        let lines = running_list_lines(&refs, Some("not-running"), list_now(), 80);
+        assert!(!lines.iter().any(marked));
+    }
+
+    /// The rule heads the list as one of its own rows, never an extra one
+    /// ([`running_list_full_height`]): the rule along the top, the rows under it
+    /// set one column in, none lost. The rule is DIM with no color of its own — never the docked
+    /// reply box's Cyan — and its title keeps the hint DIM; in the one-line form
+    /// the count it leads with is NOT dim, its `●` still green. On a narrow pane
+    /// the title is cut at the edge, never wrapped onto a row.
+    #[test]
+    fn the_running_list_is_headed_by_a_dim_rule_and_its_rows_are_set_in() {
+        let three = running_many(3);
+        let refs: Vec<&Subagent> = three.iter().collect();
+        let (width, full) = (40, running_list_full_height(refs.len()));
+        assert_eq!(full, 4, "the rule and three rows");
+        let buffer = drawn_running_list(&refs, None, width, full);
+        let rows = list_rows(&buffer);
+        assert_eq!(rows[0], rule_row("^X \u{2193} explore", 40));
+        for row in &rows[1..] {
+            assert!(row.starts_with(" \u{25cf} @type-"), "set in: {rows:?}");
+        }
+
+        let cell = |buffer: &ratatui::buffer::Buffer, x: u16, y: u16| {
+            buffer.cell((x, y)).expect("inside the list").clone()
+        };
+        for x in 0..width {
+            let rule = cell(&buffer, x, 0);
+            assert!(
+                rule.modifier.contains(Modifier::DIM),
+                "rule cell {x} {:?} is DIM",
+                rule.symbol()
+            );
+            assert_eq!(rule.fg, Color::Reset, "rule cell {x} has no color");
+            for y in 0..full {
+                assert_ne!(cell(&buffer, x, y).fg, Color::Cyan, "({x}, {y})");
+            }
+        }
+
+        let one = drawn_running_list(&refs, None, width, 1);
+        let at = |needle: &str| {
+            let row = &list_rows(&one)[0];
+            u16::try_from(row[..row.find(needle).expect("drawn")].chars().count())
+                .expect("a short row")
+        };
+        let dot = cell(&one, at("\u{25cf}"), 0);
+        assert_eq!(dot.fg, Color::Green);
+        assert!(!dot.modifier.contains(Modifier::DIM), "the dot is not dim");
+        let count = at("3 running");
+        for x in count..count + 9 {
+            assert!(!cell(&one, x, 0).modifier.contains(Modifier::DIM), "{x}");
+        }
+        assert!(cell(&one, at("explore"), 0)
+            .modifier
+            .contains(Modifier::DIM));
+        assert!(
+            cell(&one, 0, 0).modifier.contains(Modifier::DIM),
+            "the lead"
+        );
+
+        assert_eq!(
+            list_rows(&drawn_running_list(&refs, None, 10, 1)),
+            ["\u{2500}\u{2500} \u{25cf} 3 run"]
+        );
+    }
+
+    /// The sample session selected, its record landed with two RUNNING subagents
+    /// (`a1`, `b2`), one finished and one quiet for an hour, and the wall clock
+    /// stamped at [`list_now`]. The preview fills the board, so the pane is the
+    /// whole width.
+    fn running_list_app() -> App {
+        use crate::store::subagents::SubagentRecord;
+
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.set_pane_layout(PaneLayout::PreviewOnly);
+        app.apply_subagent_record(
+            "sess-normal-1",
+            SubagentRecord::new(vec![
+                auditor(),
+                running_subagent("b2", "docs-writer", None, 5),
+                Subagent {
+                    ended: Some(true),
+                    ..running_subagent("c3", "finished-one", None, 5)
+                },
+                Subagent {
+                    ended: None,
+                    ..running_subagent("d4", "quiet-one", None, 3_600)
+                },
+            ]),
+        );
+        app.note_wall_clock(list_now());
+        app
+    }
+
+    /// The preview pane's inner rows from `from` to its bottom border, as drawn.
+    fn pane_rows_from(buffer: &ratatui::buffer::Buffer, pane: Rect, from: u16) -> Vec<String> {
+        (from..pane.bottom().saturating_sub(1))
+            .map(|y| {
+                (pane.x + 1..pane.right().saturating_sub(1))
+                    .filter_map(|x| buffer.cell((x, y)).map(|cell| cell.symbol().to_string()))
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// The running list sits at the foot of the preview, under the transcript,
+    /// listing only what RUNS at the wall clock: its rows come OUT of the
+    /// transcript's, so the transcript rect every hit-test reads, and the viewport
+    /// the scroll keys page by, shrink by exactly its height and the pane stays
+    /// anchored to the newest row above it. Once the wall clock passes every
+    /// subagent's running window the list is gone — no record read again — and
+    /// the transcript has its rows back.
+    #[test]
+    fn the_running_list_sits_at_the_foot_of_the_preview_and_takes_its_rows_from_the_transcript() {
+        // Eight rows under the pinned row: the sample's 11 overflow them, and the
+        // three-row list is still drawn whole.
+        let (width, height) = (80, 14);
+        let mut app = running_list_app();
+        let record = app.selected_subagents().cloned();
+        let quiet = list_now() + Duration::from_secs(11 * 60);
+
+        let mut bare = running_list_app();
+        bare.note_wall_clock(quiet);
+        let _ = drawn_board(&mut bare, width, height);
+        let whole = preview_transcript_rect(&bare);
+
+        let buffer = drawn_board(&mut app, width, height);
+        let transcript = preview_transcript_rect(&app);
+        assert_eq!(
+            (transcript.y, transcript.height),
+            (whole.y, whole.height - 3),
+            "the rule and two rows come out of the transcript's foot"
+        );
+        assert_eq!(app.preview_viewport_h, transcript.height);
+        assert!(
+            app.preview_content_h > usize::from(whole.height),
+            "premise: the transcript overflows the pane, so the anchor shows: {} rows",
+            app.preview_content_h
+        );
+        assert_eq!(
+            u32::try_from(app.preview_content_h).expect("a short transcript"),
+            app.preview_scroll + u32::from(transcript.height),
+            "anchored to the newest row above the list"
+        );
+        assert_eq!(
+            pane_rows_from(&buffer, app.preview_rect, transcript.bottom()),
+            [
+                rule_row("^X \u{2193} explore", usize::from(transcript.width)),
+                " \u{25cf} @parser-auditor \u{b7} Audit the parser \u{b7} 2m ago".to_string(),
+                " \u{25cf} @docs-writer \u{b7} 5s ago".to_string(),
+            ]
+        );
+        assert_eq!(app.status, None, "the list never writes the status line");
+
+        app.note_wall_clock(quiet);
+        let buffer = drawn_board(&mut app, width, height);
+        assert_eq!(preview_transcript_rect(&app), whole);
+        assert_eq!(
+            app.selected_subagents().cloned(),
+            record,
+            "nothing read again"
+        );
+        assert!(
+            !pane_rows_from(&buffer, app.preview_rect, whole.y)
+                .iter()
+                .any(|row| row.contains("explore") || row.contains("@docs-writer")),
+            "every subagent went quiet, so no list"
+        );
+    }
+
+    /// Inside the subagent view the drawn list marks the subagent on screen and
+    /// its rule hints `←/→ switch · ↑/Esc back`; leaving the view puts the board's
+    /// hint back.
+    #[test]
+    fn the_drawn_list_marks_the_subagent_view_and_hints_its_keys() {
+        let (width, height) = (80, 24);
+        let mut app = running_list_app();
+        app.open_subagent_view("b2", "docs-writer");
+        let buffer = drawn_board(&mut app, width, height);
+        let transcript = preview_transcript_rect(&app);
+        let rows = pane_rows_from(&buffer, app.preview_rect, transcript.bottom());
+        assert_eq!(
+            rows.first(),
+            Some(&rule_row(
+                "\u{2190}/\u{2192} switch \u{b7} \u{2191}/Esc back",
+                usize::from(transcript.width)
+            ))
+        );
+        // Under the rule and the auditor's row; past the border, the indent and `● `.
+        let writer_y = transcript.bottom() + 2;
+        let at = (app.preview_rect.x + 4, writer_y);
+        assert!(
+            buffer
+                .cell(at)
+                .is_some_and(|cell| cell.modifier.contains(Modifier::REVERSED)),
+            "the docs-writer row is marked: {rows:?}"
+        );
+
+        app.leave_subagent_view();
+        let buffer = drawn_board(&mut app, width, height);
+        let transcript = preview_transcript_rect(&app);
+        let rows = pane_rows_from(&buffer, app.preview_rect, transcript.bottom());
+        assert_eq!(
+            rows.first(),
+            Some(&rule_row(
+                "^X \u{2193} explore",
+                usize::from(transcript.width)
+            ))
+        );
+    }
+
+    /// No running list while a compose box or a draft card holds the preview —
+    /// the `Ctrl-R` reply, the `Ctrl-F` fork box and the `Ctrl-N` draft card, the
+    /// draft also once its launch is in flight with the editor gone — docked, or
+    /// as the full-width bar of a terminal too short to dock it.
+    #[test]
+    fn the_running_list_is_hidden_under_a_reply_box_a_fork_box_and_a_draft_card() {
+        let open = |app: &mut App, name: &str| match name {
+            "reply" => app.open_compose(
+                ComposeState::new_reply("sess-normal-1".to_string(), None),
+                None,
+            ),
+            "fork" => app.open_compose(ComposeState::new_fork("sess-normal-1".to_string()), None),
+            "draft" => app.open_compose(
+                ComposeState::new_background(None),
+                Some(NewSessionDraft::default()),
+            ),
+            _ => app.draft = Some(NewSessionDraft::default()),
+        };
+        for name in ["reply", "fork", "draft", "in-flight draft"] {
+            for (width, height) in [DOCK_BOARD, BAR_BOARD] {
+                let mut app = running_list_app();
+                assert_eq!(running_subagents(&app).len(), 2, "premise: two run");
+                open(&mut app, name);
+                assert!(running_subagents(&app).is_empty(), "{name}");
+                let buffer = drawn_board(&mut app, width, height);
+                let drawn: Vec<String> = (0..height)
+                    .map(|y| full_row_text(&buffer, y, width))
+                    .collect();
+                assert!(
+                    !drawn
+                        .iter()
+                        .any(|row| row.contains("explore") || row.contains("@docs-writer")),
+                    "{name} at {width}x{height}: {drawn:#?}"
+                );
+            }
+        }
+    }
+    /// The board keymap names what the plain `←`/`→` do NOW: the search query's
+    /// cursor on the board, the subagent step while the pane shows the subagent
+    /// view — and either way an 80-column terminal still draws `^K stop` whole.
+    #[test]
+    fn the_board_keymap_names_what_the_plain_arrows_do_now() {
+        let mut session = sample_session();
+        session.file = fixture("-Users-me-project-epsilon", "sess-delegation-1.jsonl");
+        let mut app = App::new(vec![session], Scope::All, PathBuf::from("/tmp"));
+        let height = 24;
+        let help = |app: &mut App, width: u16| {
+            let buffer = drawn_board(app, width, height);
+            full_row_text(&buffer, height - 1, width)
+        };
+
+        let board = help(&mut app, 300);
+        assert!(board.contains("←→ query cursor"), "{board:?}");
+        assert!(!board.contains("←→ subagent"), "{board:?}");
+
+        app.open_subagent_view("a1b2c3d4e5f6a7b8c", "parser-auditor");
+        let view = help(&mut app, 300);
+        assert!(view.contains("←→ subagent"), "{view:?}");
+        assert!(!view.contains("query cursor"), "{view:?}");
+
+        for in_view in [true, false] {
+            if !in_view {
+                app.leave_subagent_view();
+            }
+            let narrow = help(&mut app, 80);
+            assert!(narrow.contains("^K stop"), "in_view={in_view}: {narrow:?}");
+        }
+    }
+
+    /// The keymap's `↑` follows the key too: `↑↓ move` on the board, `↑ back`
+    /// while the pane shows the subagent view, where `↑` leaves it.
+    #[test]
+    fn the_board_keymap_names_up_as_back_in_the_subagent_view() {
+        let mut session = sample_session();
+        session.file = fixture("-Users-me-project-epsilon", "sess-delegation-1.jsonl");
+        let mut app = App::new(vec![session], Scope::All, PathBuf::from("/tmp"));
+        let (width, height) = (80, 24);
+        let help = |app: &mut App| {
+            let buffer = drawn_board(app, width, height);
+            full_row_text(&buffer, height - 1, width)
+        };
+
+        let board = help(&mut app);
+        assert!(board.starts_with("↑↓ move · "), "{board:?}");
+        assert!(!board.contains("↑ back"), "{board:?}");
+
+        app.open_subagent_view("a1b2c3d4e5f6a7b8c", "parser-auditor");
+        let view = help(&mut app);
+        assert!(view.starts_with("↑ back · "), "{view:?}");
+        assert!(!view.contains("↑↓ move"), "{view:?}");
     }
 
     /// The marker of the sample transcript's last real turn (a `you` turn).
@@ -17450,17 +19018,17 @@ mod tests {
             text.contains(&chord_hint(false)),
             "a pending chord must draw the which-key hint on the help line; drawn: {text:?}"
         );
-        // `d` names both targets the confirm offers, in the board's vocabulary
-        // (`row`, `stack`) — NOT the modal's button wording (`Delete this`,
-        // `Delete lineage (N)`), so this needle pins the hint's own words only.
+        // `d` is the hint's own word — NOT the modal's button wording (`Delete
+        // this`, `Delete lineage (N)`), so this needle pins the hint alone.
         for needle in [
             "x hide",
-            "d del row/stack",
+            "d delete",
             "h hidden",
             "r reload",
-            "y copy ID",
+            "y ID",
             "f fold",
             "w move",
+            "↓ subagent",
         ] {
             assert!(
                 text.contains(needle),

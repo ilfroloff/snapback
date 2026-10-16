@@ -11,7 +11,8 @@
 //!   rapid writes collapses to one reload signal. Each batch is also *filtered*
 //!   by the same depth-2 `.jsonl` predicate `store::discover::discover` uses;
 //!   irrelevant files and deep subagent paths are dropped, and any uncertain
-//!   path falls through to reload.
+//!   path falls through to reload. The subagent TRANSCRIPTS the batch wrote are
+//!   passed on apart, as one [`AppEvent::SubagentsWritten`]: never a reload.
 //! * [`EventLoop`] — merges three sources into ONE receiver: a crossterm input
 //!   thread, the watcher channel, and a periodic tick.
 //!
@@ -34,8 +35,11 @@ use notify_debouncer_mini::{new_debouncer, DebounceEventResult, DebouncedEventKi
 use crate::agents::{self, ReportedAgent};
 use crate::claude_settings;
 use crate::model_aliases;
-use crate::store::discover::{is_session_path, store_depth, StoreDepth};
+use crate::store::discover::{
+    is_session_path, store_depth, subagent_transcript_at, StoreDepth, SubagentTranscript,
+};
 use crate::store::skills::Listing;
+use crate::store::subagents::{self, SubagentRecord};
 
 /// Debounce window for coalescing filesystem event storms into one reload.
 ///
@@ -151,6 +155,22 @@ pub enum AppEvent {
     /// Emitted at most once per debounce window regardless of how many raw
     /// filesystem events fired within it.
     SessionsChanged,
+    /// The subagent transcripts one settled watcher batch wrote,
+    /// `<id>/subagents/agent-*.jsonl`, each named by the session that launched it
+    /// and its own id ([`crate::store::discover::subagent_transcript_at`]).
+    ///
+    /// NEVER a session reload: a subagent is never a session, so the rows, the
+    /// parse cache and every session's own preview stay as they are. The one
+    /// consumer draws the preview's subagent view again when it shows one of these
+    /// transcripts, and does nothing otherwise. Nor is it board ACTIVITY: it never
+    /// touches the stamp [`AGENTS_IDLE_AFTER`] gates on, since a background agent's
+    /// subagents write on a board nobody is using.
+    ///
+    /// Emitted at most once per debounce window, like
+    /// [`SessionsChanged`](Self::SessionsChanged) and after it when the batch has
+    /// both, so a running subagent's view is drawn again at the cadence a live
+    /// session's own transcript is.
+    SubagentsWritten(Vec<SubagentTranscript>),
     /// A refreshed reported-agent set from `claude agents --json --all`, computed
     /// OFF the UI thread by the agents poller and delivered on the same channel
     /// so the shell-out never blocks rendering.
@@ -341,6 +361,21 @@ pub enum AppEvent {
         /// claude's listing for that folder, or `None` for no answer.
         listing: Option<Listing>,
     },
+    /// The SELECTED session's subagents, read OFF the UI thread by the background
+    /// refresh ([`SubagentRefresh`]): a session can hold hundreds of them, so the
+    /// read never runs on a keystroke or a frame.
+    ///
+    /// ONE per request the worker took up — a request still pending when a newer
+    /// one arrives is replaced, never answered. It names the session it answers
+    /// for by its STABLE id, so a record for a session that is no longer selected
+    /// is dropped rather than shown under another row. An EMPTY record is an
+    /// answer: the session launched no subagent, or none could be read.
+    SubagentRuns {
+        /// The session whose `subagents/` dir was read.
+        session_id: String,
+        /// Its subagents, in launch order ([`subagents::read_record`]).
+        record: SubagentRecord,
+    },
     /// A periodic wake-up. The update loop does nothing costly on this.
     Tick,
 }
@@ -466,11 +501,37 @@ pub fn batch_needs_reload(classes: impl IntoIterator<Item = WatchPathClass>) -> 
     classes.into_iter().any(|c| c != WatchPathClass::Ignorable)
 }
 
+/// The subagent transcripts among one settled batch's `paths`
+/// ([`subagent_transcript_at`]), each named under the store `root` as given.
+///
+/// `notify` reports paths under the CANONICAL `watch_root` (on macOS `/var` is
+/// `/private/var`), while the board names a session by the path discovery built
+/// under `root`. So each path is put back under `root` before it is named, and
+/// the session file it names compares equal to the board's. A path that is not
+/// under `watch_root` — a backend reporting under the root as watched — is
+/// named as it is.
+fn written_subagents<'a>(
+    watch_root: &Path,
+    root: &Path,
+    paths: impl IntoIterator<Item = &'a Path>,
+) -> Vec<SubagentTranscript> {
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let in_root = path
+                .strip_prefix(watch_root)
+                .map_or_else(|_| path.to_path_buf(), |relative| root.join(relative));
+            subagent_transcript_at(root, &in_root)
+        })
+        .collect()
+}
+
 /// A live, debounced filesystem watcher over the store root.
 ///
 /// Holds the underlying debouncer alive for its lifetime; dropping this stops
-/// watching. Each debounce batch is coalesced into exactly one
-/// [`AppEvent::SessionsChanged`] sent on the provided channel.
+/// watching. Each debounce batch is coalesced into at most one
+/// [`AppEvent::SessionsChanged`] and at most one [`AppEvent::SubagentsWritten`]
+/// sent on the provided channel.
 pub struct SessionWatcher {
     // The debouncer owns the notify watcher + its worker thread. It must be kept
     // alive for events to keep flowing, hence stored even though never read.
@@ -490,11 +551,16 @@ impl SessionWatcher {
     /// [`classify_watch_path`]). Paths that cannot be a session file and are
     /// provably not a directory that could contain one are dropped; anything
     /// uncertain falls through to reload so a real change is never missed.
+    ///
+    /// The same batch's subagent transcripts are then sent on as ONE
+    /// [`AppEvent::SubagentsWritten`] ([`written_subagents`]), which never stamps
+    /// `activity`.
     pub fn spawn(root: &Path, tx: Sender<AppEvent>, activity: Arc<AtomicU64>) -> Result<Self> {
         // `notify` reports canonical paths (on macOS `/var` resolves to
         // `/private/var`), so classify against the canonical root to keep
         // `strip_prefix` from failing on every event.
         let watch_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let store_root = root.to_path_buf();
         let mut debouncer = new_debouncer(DEBOUNCE, move |res: DebounceEventResult| {
             // Coalesce an entire debounce batch into exactly ONE reload signal,
             // reacting only to SETTLED changes. notify-debouncer-mini emits an
@@ -523,6 +589,16 @@ impl SessionWatcher {
                     // A send failure means the receiver (TUI) has gone away; ignore.
                     let _ = tx.send(AppEvent::SessionsChanged);
                 }
+                // Deliberately AFTER the reload decision and outside it: a
+                // subagent's write is no session change and no board activity.
+                let written = written_subagents(
+                    &watch_root,
+                    &store_root,
+                    events.iter().map(|e| e.path.as_path()),
+                );
+                if !written.is_empty() {
+                    let _ = tx.send(AppEvent::SubagentsWritten(written));
+                }
             }
         })
         .context("failed to create filesystem debouncer")?;
@@ -542,7 +618,8 @@ impl SessionWatcher {
 ///
 /// On construction it spawns:
 /// * a crossterm input thread forwarding [`AppEvent::Input`],
-/// * the [`SessionWatcher`] forwarding [`AppEvent::SessionsChanged`],
+/// * the [`SessionWatcher`] forwarding [`AppEvent::SessionsChanged`] and
+///   [`AppEvent::SubagentsWritten`],
 /// * a tick thread forwarding [`AppEvent::Tick`] every `tick`,
 ///
 /// all onto one channel. The TUI update loop reads that single receiver.
@@ -566,7 +643,8 @@ pub struct EventLoop {
     // Board-activity timestamp: millis since [`EPOCH`], touched only by real
     // activity sources (crossterm input events and emitted `SessionsChanged`)
     // and read by the agents poller to decide whether to shell out. The 250 ms
-    // `Tick` thread MUST NEVER touch this stamp, or the board would never idle.
+    // `Tick` thread MUST NEVER touch this stamp, or the board would never idle,
+    // and neither may a `SubagentsWritten`.
     activity: Arc<AtomicU64>,
 }
 
@@ -677,6 +755,23 @@ impl EventLoop {
         spawn_settings_model_thread(self.tx.clone(), move || {
             claude_settings::model_defaults(&launch_dir)
         });
+    }
+
+    /// Start the selected session's background subagent refresh (real runtime path
+    /// only): its ONE worker for this board session, which reads the session each
+    /// request names ([`subagents::read_record`], as of the worker's own clock at
+    /// that read) and answers on this channel as [`AppEvent::SubagentRuns`].
+    ///
+    /// Not started by [`new`](Self::new), for the same reason the probes above are
+    /// not: the event-loop unit tests must never read a real store. This is the
+    /// ONE production call site, and where the real read is named.
+    /// [`crate::tui::run`] calls it once per BOARD SESSION, and the handle it
+    /// returns dies with that session.
+    #[must_use = "dropping the handle ends the worker"]
+    pub fn spawn_subagent_refresh(&self) -> SubagentRefresh {
+        spawn_subagent_refresh_thread(self.tx.clone(), |session_file| {
+            subagents::read_record(session_file, SystemTime::now())
+        })
     }
 
     /// A clone of the merged channel's sender, for spawning a one-shot off-thread
@@ -903,6 +998,70 @@ where
         // A send failure means the receiver (TUI) has gone away; ignore it.
         let _ = tx.send(AppEvent::SettingsModel(probe()));
     });
+}
+
+/// The handle of the selected session's BACKGROUND SUBAGENT REFRESH: ONE
+/// long-lived worker per board session ([`EventLoop::spawn_subagent_refresh`])
+/// that reads a session's subagents ([`subagents::read_record`]) and answers each
+/// request it takes up with one [`AppEvent::SubagentRuns`].
+///
+/// LATEST WINS: a request the worker has not started yet is REPLACED by any newer
+/// one, so a run of arrow presses costs one read for the row they stop on, never
+/// a thread or a read per press. The driver asks for one on every change of the
+/// selected session and on every watcher batch that wrote under its `subagents/`
+/// dir (`tui::app::App::take_subagent_refresh`).
+///
+/// Dropping the handle ends the worker once its current read, if any, is done:
+/// its request channel closes. So the worker is bounded by the board session that
+/// spawned it and cannot accumulate across resume round trips (PATTERNS §6).
+pub struct SubagentRefresh {
+    /// Where requests go: `(session_id, session_file)`.
+    requests: Sender<(String, PathBuf)>,
+}
+
+impl SubagentRefresh {
+    /// Ask for `session_id`'s subagents, read from its transcript `session_file`'s
+    /// own `subagents/` dir. Returns at once; the answer arrives as an
+    /// [`AppEvent::SubagentRuns`] naming `session_id`, unless a newer request
+    /// replaces this one first. A request after the worker ended is dropped.
+    pub fn request(&self, session_id: String, session_file: PathBuf) {
+        let _ = self.requests.send((session_id, session_file));
+    }
+}
+
+/// Start the background subagent refresh's ONE worker over `read`, answering on
+/// `tx`, and return its [`SubagentRefresh`] handle.
+///
+/// The worker blocks for a request, drains every request queued behind it so only
+/// the NEWEST is read, reads it, sends the answer, and loops. It ends when the
+/// handle drops (its `recv` fails) or the receiver is gone (its send fails). It
+/// is AGENTS.md OFF-UI-THREAD's ORDINARY case — its own thread, reporting with an
+/// `AppEvent` — not an entry on its list of UI-thread one-shot exceptions.
+///
+/// `read` is a PARAMETER so the suite can STATE an answer, and block it, instead
+/// of reading a store; [`EventLoop::spawn_subagent_refresh`] is the only site that
+/// names the real one.
+fn spawn_subagent_refresh_thread<F>(tx: Sender<AppEvent>, mut read: F) -> SubagentRefresh
+where
+    F: FnMut(&Path) -> SubagentRecord + Send + 'static,
+{
+    let (requests, pending) = mpsc::channel::<(String, PathBuf)>();
+    thread::spawn(move || {
+        while let Ok(mut newest) = pending.recv() {
+            while let Ok(newer) = pending.try_recv() {
+                newest = newer;
+            }
+            let (session_id, session_file) = newest;
+            let record = read(&session_file);
+            if tx
+                .send(AppEvent::SubagentRuns { session_id, record })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    SubagentRefresh { requests }
 }
 
 /// Emit an [`AppEvent::Tick`] every `interval` until the receiver drops.
@@ -1154,8 +1313,9 @@ mod tests {
     /// naming `phase`); every further signal that arrived within a rolling
     /// [`SETTLE_WINDOW`] of the previous one is in the count; and the channel is
     /// QUIET on return, so the next phase starts from a slate this one emptied.
-    /// It asserts the watcher only ever emits that variant, as
-    /// [`drain_changes`] does.
+    /// It asserts every event it reads is that variant: its one caller's phases
+    /// write no subagent transcript, so no [`AppEvent::SubagentsWritten`] can
+    /// arrive.
     ///
     /// It deliberately does NOT bound how long a phase takes. That is the whole
     /// point: sleeping a fixed span and counting whatever turned up measures the
@@ -1191,17 +1351,38 @@ mod tests {
     }
 
     /// Drain and count the `SessionsChanged` signals queued on `rx`, asserting
-    /// the watcher only ever emits that variant.
+    /// the watcher emits nothing but its two variants. A `SubagentsWritten` is
+    /// drained uncounted: it is the watcher's answer to a subagent's write, never
+    /// a reload, and [`drain_subagent_writes`] is the helper that reads it.
     fn drain_changes(rx: &Receiver<AppEvent>) -> usize {
         let mut count = 0;
         while let Ok(ev) = rx.try_recv() {
-            assert!(
-                matches!(ev, AppEvent::SessionsChanged),
-                "watcher must only emit SessionsChanged, got {ev:?}"
-            );
-            count += 1;
+            match ev {
+                AppEvent::SessionsChanged => count += 1,
+                AppEvent::SubagentsWritten(_) => {}
+                other => panic!(
+                    "watcher must only emit SessionsChanged or SubagentsWritten, got {other:?}"
+                ),
+            }
         }
         count
+    }
+
+    /// Drain `rx`, returning every subagent transcript its `SubagentsWritten`
+    /// events named, in order, and how many `SessionsChanged` it held.
+    fn drain_subagent_writes(rx: &Receiver<AppEvent>) -> (Vec<SubagentTranscript>, usize) {
+        let mut written = Vec::new();
+        let mut reloads = 0;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                AppEvent::SessionsChanged => reloads += 1,
+                AppEvent::SubagentsWritten(batch) => written.extend(batch),
+                other => panic!(
+                    "watcher must only emit SessionsChanged or SubagentsWritten, got {other:?}"
+                ),
+            }
+        }
+        (written, reloads)
     }
 
     /// Task 3.3: a storm of rapid writes to a `.jsonl` under a temp store dir
@@ -1370,6 +1551,65 @@ mod tests {
             UNTOUCHED,
             "a subagent path below the session level must leave the \
              board-activity clock alone"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of a subagent's write: the watcher passes it on as an event
+    /// of its own, naming the transcript by the session that launched it and its
+    /// id — under the store root AS GIVEN, which a macOS temp dir is not in its
+    /// canonical form, so the run there pins the re-rooting too. Still no reload,
+    /// and still no board-activity stamp. A write to the meta file beside it
+    /// names nothing.
+    ///
+    /// End-to-end evidence, not the guarantee — the same caveat as the two tests
+    /// above; `written_subagents_names_only_subagent_transcripts_under_the_store_root`
+    /// states it with no backend in the loop.
+    #[test]
+    fn a_subagent_transcript_write_emits_subagents_written_and_no_reload() {
+        let dir = unique_temp_dir("subagent-written");
+        let (tx, rx) = mpsc::channel::<AppEvent>();
+        let activity = Arc::new(AtomicU64::new(UNTOUCHED));
+        let _watcher =
+            SessionWatcher::spawn(&dir, tx, Arc::clone(&activity)).expect("spawn watcher");
+
+        thread::sleep(Duration::from_millis(300));
+        let cwd = dir.join("encoded-cwd");
+        let subagent_dir = cwd.join("sess").join("subagents");
+        fs::create_dir_all(&subagent_dir).expect("create subagent dir");
+        let agent = subagent_dir.join("agent-1.jsonl");
+        let meta = subagent_dir.join("agent-1.meta.json");
+        fs::write(&agent, b"{}\n").expect("seed subagent jsonl");
+        fs::write(&meta, b"{}\n").expect("seed subagent meta");
+        thread::sleep(Duration::from_millis(600));
+        drain_changes(&rx);
+        rearm(&activity);
+
+        fs::write(&meta, b"{\"x\":1}\n").expect("modify subagent meta");
+        thread::sleep(Duration::from_millis(600));
+        assert_eq!(
+            drain_subagent_writes(&rx),
+            (Vec::new(), 0),
+            "a meta file's write names no transcript and reloads nothing"
+        );
+
+        fs::write(&agent, b"{\"x\":1}\n").expect("modify subagent jsonl");
+        thread::sleep(Duration::from_millis(600));
+        let (written, reloads) = drain_subagent_writes(&rx);
+        assert_eq!(reloads, 0, "a subagent's write is never a session reload");
+        let expected = SubagentTranscript {
+            session_file: cwd.join("sess.jsonl"),
+            agent_id: "1".to_string(),
+        };
+        assert!(
+            !written.is_empty() && written.iter().all(|w| *w == expected),
+            "the write must be passed on naming {expected:?}, got {written:?}"
+        );
+        assert_eq!(
+            activity.load(Ordering::Relaxed),
+            UNTOUCHED,
+            "passing a subagent's write on must leave the board-activity clock alone"
         );
 
         let _ = fs::remove_dir_all(&dir);
@@ -1961,6 +2201,119 @@ mod tests {
         }
     }
 
+    /// A record no test reads: the worker tests tell answers apart by the
+    /// session id each names.
+    fn an_empty_record(_: &Path) -> SubagentRecord {
+        SubagentRecord::default()
+    }
+
+    /// The next `SubagentRuns` on `rx`, as the session id it names.
+    fn next_refresh(rx: &Receiver<AppEvent>) -> Result<String, RecvTimeoutError> {
+        match rx.recv_timeout(Duration::from_secs(2))? {
+            AppEvent::SubagentRuns { session_id, .. } => Ok(session_id),
+            other => panic!("the refresh must deliver SubagentRuns, got {other:?}"),
+        }
+    }
+
+    /// The background refresh reads OFF the calling thread — a request returns
+    /// before a read that blocks does — on ONE worker for every request, and the
+    /// NEWEST request wins: of three made while the worker was busy reading the
+    /// first, only the last is read and answered.
+    #[test]
+    fn the_subagent_refresh_reads_on_one_worker_and_the_newest_request_wins() {
+        const READ_BLOCKS: Duration = Duration::from_millis(300);
+        let (tx, rx) = mpsc::channel::<AppEvent>();
+        let (started_tx, started) = mpsc::channel::<()>();
+        let readers = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reads = Arc::clone(&readers);
+        let refresh = spawn_subagent_refresh_thread(tx, move |file: &Path| {
+            reads
+                .lock()
+                .expect("reads lock")
+                .push((thread::current().id(), file.to_path_buf()));
+            let _ = started_tx.send(());
+            thread::sleep(READ_BLOCKS);
+            SubagentRecord::default()
+        });
+
+        let asked_at = Instant::now();
+        refresh.request("s1".to_string(), PathBuf::from("/s/s1.jsonl"));
+        let returned_in = asked_at.elapsed();
+        assert!(
+            returned_in < READ_BLOCKS,
+            "a request must return before the read finishes — it returned in \
+             {returned_in:?} against a read that blocks for {READ_BLOCKS:?}"
+        );
+        started
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the worker took up the first request");
+        for id in ["s2", "s3", "s4"] {
+            refresh.request(id.to_string(), PathBuf::from(format!("/s/{id}.jsonl")));
+        }
+
+        assert_eq!(next_refresh(&rx).as_deref(), Ok("s1"));
+        assert_eq!(
+            next_refresh(&rx).as_deref(),
+            Ok("s4"),
+            "the requests the worker had not started are replaced by the newest"
+        );
+        drop(refresh);
+        assert_eq!(
+            next_refresh(&rx),
+            Err(RecvTimeoutError::Disconnected),
+            "nothing else is answered, and the worker ends with its handle"
+        );
+        let reads = readers.lock().expect("reads lock");
+        let files: Vec<&Path> = reads.iter().map(|(_, file)| file.as_path()).collect();
+        assert_eq!(
+            files,
+            [Path::new("/s/s1.jsonl"), Path::new("/s/s4.jsonl")],
+            "only the first and the newest were read"
+        );
+        assert!(
+            reads.iter().all(|(id, _)| *id == reads[0].0),
+            "every read ran on the ONE worker"
+        );
+        assert_ne!(
+            reads[0].0,
+            thread::current().id(),
+            "and never on the caller's"
+        );
+    }
+
+    /// A worker whose board session ended stops: once its receiver is gone the
+    /// next answer fails to send and the worker exits, closing its request
+    /// channel, so no later request is ever read.
+    #[test]
+    fn the_subagent_refresh_worker_ends_when_its_receiver_is_gone() {
+        let (tx, rx) = mpsc::channel::<AppEvent>();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let read_calls = Arc::clone(&calls);
+        let refresh = spawn_subagent_refresh_thread(tx, move |file: &Path| {
+            read_calls.fetch_add(1, Ordering::Relaxed);
+            an_empty_record(file)
+        });
+        drop(rx);
+        refresh.request("s1".to_string(), PathBuf::from("/s/s1.jsonl"));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let closed = loop {
+            let probe = ("probe".to_string(), PathBuf::from("/s/probe.jsonl"));
+            if refresh.requests.send(probe).is_err() {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert!(closed, "the worker exits once its answer cannot be sent");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "the read whose answer could not be sent was the last"
+        );
+    }
+
     // --- classify_with_metadata matrix tests (pure, no filesystem) ---
     //
     // The levels are named, not counted: the depth arithmetic these used to
@@ -2219,6 +2572,42 @@ mod tests {
             WatchPathClass::Session,
             WatchPathClass::Ignorable,
         ]));
+    }
+
+    // --- written_subagents (pure, no filesystem) ---
+
+    /// Of one batch's paths only the subagent transcripts are named, each under
+    /// the store root AS GIVEN, whether the backend reported it under the
+    /// canonical root or under that root itself — so the session file named
+    /// compares equal to the one discovery built.
+    #[test]
+    fn written_subagents_names_only_subagent_transcripts_under_the_store_root() {
+        let watch_root = Path::new("/private/var/store");
+        let root = Path::new("/var/store");
+        let canonical = watch_root.join("cwd").join("sess").join("subagents");
+        let paths = [
+            canonical.join("agent-a1.jsonl"),
+            canonical.join("agent-a1.meta.json"),
+            canonical.join("notes.txt"),
+            watch_root.join("cwd").join("sess.jsonl"),
+            root.join("cwd")
+                .join("other")
+                .join("subagents")
+                .join("agent-b2.jsonl"),
+        ];
+        assert_eq!(
+            written_subagents(watch_root, root, paths.iter().map(PathBuf::as_path)),
+            [
+                SubagentTranscript {
+                    session_file: root.join("cwd").join("sess.jsonl"),
+                    agent_id: "a1".to_string(),
+                },
+                SubagentTranscript {
+                    session_file: root.join("cwd").join("other.jsonl"),
+                    agent_id: "b2".to_string(),
+                },
+            ]
+        );
     }
 
     // --- epoch_ms (pure, no clock) ---

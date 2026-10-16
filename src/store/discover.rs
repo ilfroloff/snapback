@@ -5,9 +5,15 @@
 //! directory below the root. Never descends into `<session-id>/subagents/` —
 //! subagent transcripts (~62% of files) masquerade as sessions and must be
 //! excluded (see the Risks table). Returns candidate file paths.
+//!
+//! It also owns the one shape check for a subagent TRANSCRIPT's path,
+//! [`subagent_transcript_at`], which the watcher alone asks. Discovery never
+//! does: a subagent is never a session.
 
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
+
+use super::subagents;
 
 /// Resolve the store root: `$CLAUDE_PROJECTS_DIR` if set and non-empty, else
 /// `~/.claude/projects`.
@@ -121,7 +127,53 @@ pub fn is_session_path(root: &Path, path: &Path) -> bool {
 fn has_jsonl_extension(file: &OsStr) -> bool {
     Path::new(file)
         .extension()
-        .is_some_and(|ext| ext == "jsonl")
+        .is_some_and(|ext| ext == SESSION_EXTENSION)
+}
+
+/// The extension every consumable session file carries, `<session-id>.jsonl`.
+const SESSION_EXTENSION: &str = "jsonl";
+
+/// A subagent's transcript, named the way the board names the view showing it:
+/// by the session that launched it and the subagent's own id. What
+/// [`subagent_transcript_at`] reads off a path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentTranscript {
+    /// The launching session's transcript, `<root>/<encoded-cwd>/<id>.jsonl`,
+    /// under the same `root` the path was given under: the file whose
+    /// `subagents::subagents_dir` holds this transcript.
+    pub session_file: PathBuf,
+    /// The subagent's id, from the transcript's name `agent-<agent_id>.jsonl`.
+    pub agent_id: String,
+}
+
+/// Pure name-shape check, for the WATCHER only: is `path` a subagent's
+/// transcript, `<root>/<encoded-cwd>/<id>/subagents/agent-<agentId>.jsonl`?
+///
+/// `Some` names it; `None` answers everything else — a session, a meta file
+/// (`agent-<id>.meta.json`), a forked skill's `.json` files, any other name, a
+/// path one level shallower or deeper, one outside `root`, and a name that is not
+/// UTF-8 (no meta file's name is, so no subagent view can show it). Like
+/// [`is_session_path`] it reads no metadata, so it answers for any path a watcher
+/// reports.
+///
+/// It counts no level of its own. The launching session's file must pass
+/// [`is_session_path`], the one depth rule, and the transcript must sit in THAT
+/// file's `subagents::subagents_dir` under a name `subagents::transcript_agent_id`
+/// reads: the two derivations the subagent view opens a transcript through, so
+/// the watcher can never name a file the view would not read. Discovery never
+/// asks, because a subagent is never a session (AGENTS.md SUBAGENT EXCLUSION BY
+/// DEPTH).
+pub fn subagent_transcript_at(root: &Path, path: &Path) -> Option<SubagentTranscript> {
+    let agent_id = subagents::transcript_agent_id(path.file_name()?.to_str()?)?;
+    let dir = path.parent()?;
+    // `<id>` + `.jsonl`, appended rather than set: an id holding a dot keeps it.
+    let mut session_file = dir.parent()?.to_path_buf();
+    session_file.add_extension(SESSION_EXTENSION);
+    let in_its_own_dir = subagents::subagents_dir(&session_file).is_some_and(|own| own == dir);
+    (in_its_own_dir && is_session_path(root, &session_file)).then(|| SubagentTranscript {
+        session_file,
+        agent_id: agent_id.to_owned(),
+    })
 }
 
 /// Enumerate resumable session files: `<root>/<encoded-cwd>/<session-id>.jsonl`.
@@ -346,5 +398,75 @@ mod tests {
             store_depth(root, Path::new("/other/cwd/sess.jsonl")),
             StoreDepth::Outside
         );
+    }
+
+    // --- subagent_transcript_at: the watcher's subagent shape ---------------
+
+    /// The one shape it names, with the launching session's file and the id.
+    #[test]
+    fn a_subagent_transcript_names_its_session_file_and_agent_id() {
+        let root = Path::new("/store");
+        let path = root
+            .join("cwd")
+            .join("sess")
+            .join("subagents")
+            .join("agent-a1b2.jsonl");
+        assert_eq!(
+            subagent_transcript_at(root, &path),
+            Some(SubagentTranscript {
+                session_file: root.join("cwd").join("sess.jsonl"),
+                agent_id: "a1b2".to_string(),
+            })
+        );
+    }
+
+    /// It reads back exactly what the subagent view's own derivations build from
+    /// a session file — an id holding a dot included, which a `with_extension`
+    /// would have cut short — so the watcher names the file the view opens.
+    #[test]
+    fn a_subagent_transcript_reads_back_the_views_own_derivation() {
+        let root = Path::new("/store");
+        for session_file in [
+            root.join("-Users-me-p").join("sess-1.jsonl"),
+            root.join("-Users-me-p").join("sess.v2.jsonl"),
+        ] {
+            let dir = subagents::subagents_dir(&session_file).expect("a session has a dir");
+            let path = subagents::transcript_path(&dir, "a1b2");
+            assert_eq!(
+                subagent_transcript_at(root, &path),
+                Some(SubagentTranscript {
+                    session_file: session_file.clone(),
+                    agent_id: "a1b2".to_string(),
+                }),
+                "{path:?}"
+            );
+        }
+    }
+
+    /// Every other file the store holds near one is refused: a session, the meta
+    /// and forked-skill files beside the transcript, any other name, a level
+    /// shallower or deeper, another dir under the session's, and a path outside
+    /// the root.
+    #[test]
+    fn subagent_transcript_at_refuses_every_other_shape() {
+        let root = Path::new("/store");
+        let sess = root.join("cwd").join("sess");
+        let subagents_dir = sess.join("subagents");
+        for path in [
+            root.join("cwd").join("sess.jsonl"),
+            subagents_dir.join("agent-a1b2.meta.json"),
+            subagents_dir.join("agent-a1b2.forked-skill.json"),
+            subagents_dir.join("agent-a1b2.forked-skill.marker.json"),
+            subagents_dir.join("notes.txt"),
+            subagents_dir.join("a1b2.jsonl"),
+            subagents_dir.clone(),
+            sess.join("agent-a1b2.jsonl"),
+            subagents_dir.join("nested").join("agent-a1b2.jsonl"),
+            sess.join("tool-results").join("agent-a1b2.jsonl"),
+            root.join("sess").join("subagents").join("agent-a1b2.jsonl"),
+            PathBuf::from("/other/cwd/sess/subagents/agent-a1b2.jsonl"),
+        ] {
+            assert_eq!(subagent_transcript_at(root, &path), None, "{path:?}");
+        }
     }
 }

@@ -14,7 +14,7 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use ratatui::layout::{Position, Rect};
 use ratatui::text::Line;
@@ -33,8 +33,10 @@ use crate::{config, delete, hidden};
 
 use crate::search::{self, MarkScratch, SearchIndex, SearchMode};
 use crate::send::UndeliveredEvents;
+use crate::store::discover::SubagentTranscript;
 use crate::store::lineage::{self, LineageKey};
 use crate::store::skills::Listing;
+use crate::store::subagents::{Subagent, SubagentRecord, SubagentStatus};
 use crate::store::{preview, Reload, Session};
 use crate::watch::AppEvent;
 // The scope predicate and the worktree resolver MUST canonicalize paths the same
@@ -737,9 +739,9 @@ pub struct ContentPos {
 /// `anchor` is the content cell the left button was pressed on; `cursor` is the
 /// content cell under the latest pointer position, clamped into the preview's
 /// TRANSCRIPT rect (`view::preview_transcript_rect`, the one rect every pointer
-/// hit-test over the preview reads, so the banner row and a docked compose zone are
-/// never in it) and converted through the scroll the pane last RESOLVED, never a
-/// raw requested one.
+/// hit-test over the preview reads, so the banner row, the running list and a
+/// docked compose zone are never in it) and converted through the scroll the pane
+/// last RESOLVED, never a raw requested one.
 ///
 /// Content-anchored rather than screen cells, so it survives the pane moving under
 /// it: a held drag past the transcript's top or bottom edge AUTOSCROLLS, a small
@@ -2041,18 +2043,66 @@ impl CachedPreview {
     }
 }
 
+/// Why `Ctrl-X ↓`, or a `←`/`→` step in the subagent view, switched to no
+/// subagent ([`App::open_subagent_target`], [`App::step_subagent_view`]): the
+/// key handler says so on the status line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubagentsUnavailable {
+    /// The background refresh has not answered for the selected session yet.
+    NotRead,
+    /// Its record lists no subagent.
+    None,
+}
+
+/// The preview pane's SUBAGENT VIEW: the transcript of one subagent the selected
+/// session launched, shown in the pane in place of the session's own until the
+/// user leaves it (`↑`, `Esc`, `Ctrl-X ↓`), moves the selection, or opens a reply
+/// or fork box.
+///
+/// Keyed by STABLE ids, never a list index (AGENTS.md STABLE-ID STATE): the
+/// session whose `subagents/` dir holds the transcript, and the subagent's own id.
+/// Its render is cached HERE, apart from [`App::preview_cache`], so nothing that
+/// reads the session's own entry — its `last_model`, and with it the reply box's
+/// model label — can ever be handed a subagent's render. Which of the two the pane
+/// shows is decided in ONE place, [`App::live_subagent_view`], which
+/// [`App::ensure_preview`] and its read-only twin [`App::peek_preview`] both ask.
+///
+/// IN MEMORY ONLY, like the fold state: a view is a transient look at one pane,
+/// never persisted (AGENTS.md SNAPBACK-OWNED STATE).
+struct SubagentView {
+    /// The session the view was opened on, whose `subagents/` dir holds the
+    /// transcript. Only shown while it is still the selection.
+    session_id: String,
+    /// The subagent's id: its transcript is `agent-<agent_id>.jsonl`.
+    agent_id: String,
+    /// The subagent's `agentType`, which the pane's title names.
+    agent_type: String,
+    /// Where the session's OWN transcript was scrolled when the view opened —
+    /// `App::preview_scroll` and `App::preview_follow_bottom` — so leaving the view
+    /// puts the reader back where they clicked. Carried over a drill-down, since
+    /// the place to return to is the session's, never another subagent's.
+    return_to: (u32, bool),
+    /// The view's render at [`App::preview_width`], or `None` until the next
+    /// [`App::ensure_preview`] fills it. Never carries search marks: the content
+    /// index never held a subagent's text, so `matches` stays empty. It carries
+    /// the run's ended verdict the title's state reads
+    /// ([`App::subagent_view_status`]), which every eviction takes with it.
+    cached: Option<CachedPreview>,
+}
+
 /// Everything ONE preview click resolves against, borrowed out of a single
 /// [`CachedPreview`] entry: the per-line wrapped-row prefix map, the rendered lines,
-/// and both clickable region lists.
+/// and every clickable region list — links, fold headers and delegation lines.
 ///
 /// Named because it travels as one value and is returned as one — see
-/// [`App::preview_hit_context`], which owns why the four are inseparable and why they
+/// [`App::preview_hit_context`], which owns why they are inseparable and why they
 /// are borrowed rather than cloned.
 type PreviewHitContext<'a> = (
     &'a [usize],
     &'a [Line<'static>],
     &'a [preview::LinkRegion],
     &'a [preview::FoldRegion],
+    &'a [preview::SubagentRegion],
 );
 
 /// The slice of a rendered preview a viewport can actually reach, cloned out of the
@@ -2230,7 +2280,13 @@ pub struct App {
     ///   brings the preview back from [`PaneLayout::ListOnly`], by `End`
     ///   ([`preview_bottom`](Self::preview_bottom)), and when a send to the
     ///   previewed row FINISHES (so the reply lands in view) — which `End` is how it
-    ///   is said, so that is one site, not two.
+    ///   is said, so that is one site, not two — and when a click switches the pane
+    ///   to a subagent's transcript ([`open_subagent_view`](Self::open_subagent_view)),
+    ///   which opens at its newest turn like a newly selected row.
+    /// * PUT BACK, with [`preview_scroll`](Self::preview_scroll), to what it was when
+    ///   that view opened, when the view is left
+    ///   ([`leave_subagent_view`](Self::leave_subagent_view): `↑`, `Esc`,
+    ///   `Ctrl-X ↓` again, or a reply or fork box opening).
     /// * CLEARED by ANY explicit scroll ([`preview_scroll_by`](Self::preview_scroll_by),
     ///   [`preview_top`](Self::preview_top)), in either direction — a held drag's
     ///   autoscroll included, through that same funnel, on a step that actually
@@ -2274,9 +2330,9 @@ pub struct App {
     preview_selection: Option<PreviewSelection>,
     /// The CONTENT cell the left button went down on inside the transcript, while
     /// the button is held, or `None`. Distinguishes a plain CLICK (press + release,
-    /// no drag → open a link) from a DRAG (press + move → select): the selection
-    /// materializes only once the pointer moves off this cell (see
-    /// [`extend_preview_selection`]).
+    /// no drag → toggle a fold, switch to a subagent or open a link) from a DRAG
+    /// (press + move → select): the selection materializes only once the pointer
+    /// moves off this cell (see [`extend_preview_selection`]).
     ///
     /// [`extend_preview_selection`]: Self::extend_preview_selection
     preview_press: Option<ContentPos>,
@@ -2699,7 +2755,8 @@ pub struct App {
     /// Whether a `Ctrl-X` leader chord is pending — the moment between the leader
     /// keypress and its follow-up (`x` hide, `d` hard-delete, `h` show-hidden,
     /// `r` forced rescan, `y` copy session ID, `f` fold / expand the selected
-    /// row's lineage, `w` open the move picker, anything else cancels). While `true`
+    /// row's lineage, `w` open the move picker, `↓` open a subagent's transcript
+    /// in the preview, or leave it, anything else cancels). While `true`
     /// the view draws the which-key hint and
     /// [`handle_event`](crate::tui::update) routes the NEXT key through the pure
     /// `chord_key` machine BEFORE normal key handling, so a printable follow-up
@@ -2743,10 +2800,17 @@ pub struct App {
     ///
     /// Holds TWO kinds of key, one per node kind (see [`preview::FoldRegion`]): a
     /// peer node's `origin.from` — the SENDING AGENT'S STEM, never the record
-    /// `uuid`, so a future delegation node resolves to the SAME key and the two
-    /// anchors drive one node — and an injected node's record `uuid` behind a
-    /// fixed prefix, which keeps the two kinds from ever colliding. The set does
-    /// not care which is which: a key is simply open or not.
+    /// `uuid` — and an injected node's record `uuid` behind a fixed prefix, which
+    /// keeps the two kinds from ever colliding. The set does not care which is
+    /// which: a key is simply open or not.
+    ///
+    /// A delegation line is NOT one of its nodes, though it names the very agent a
+    /// hand-back's key does: a click on it switches the pane to that subagent's
+    /// transcript ([`open_subagent_view`](Self::open_subagent_view)) and never
+    /// touches this set. That RETIRES the earlier shared-anchor decision — the
+    /// launch and the hand-back as two headers driving ONE node, opened in place
+    /// together — so a hand-back's key opens that hand-back and nothing else, and
+    /// there is one way to read a subagent's transcript, the view.
     ///
     /// IN MEMORY ONLY. It is NEVER written to disk: AGENTS.md SNAPBACK-OWNED
     /// STATE permits exactly one persisted set, the hidden-session ids under
@@ -2758,6 +2822,34 @@ pub struct App {
     /// [`toggle_peer_fold`](Self::toggle_peer_fold), which evicts the cache
     /// entry it invalidates in the same breath so the two cannot drift.
     expanded_peers: HashSet<String>,
+    /// The subagent transcript the preview pane shows in place of the selected
+    /// session's own, or `None` while it shows the session's ([`SubagentView`]).
+    /// Opened ONLY through [`open_subagent_view`](Self::open_subagent_view), by a
+    /// click on a `◆ delegated to …` line, `Ctrl-X ↓`, or a `←`/`→` step inside
+    /// the view; left by `↑`, `Esc`, `Ctrl-X ↓` again, a selection move and
+    /// opening a reply or fork box.
+    subagent_view: Option<SubagentView>,
+    /// The SELECTED session's subagents as the background refresh last read them
+    /// ([`SubagentRecord`]), keyed by the session they were read for, which only
+    /// [`selected_subagents`](Self::selected_subagents) hands out — never for
+    /// another row. `None` until the first record lands.
+    ///
+    /// Typed state, never the status line (STATUS-LINE OWNERSHIP), and IN MEMORY
+    /// ONLY (AGENTS.md SNAPBACK-OWNED STATE).
+    subagents: Option<(String, SubagentRecord)>,
+    /// The selected session — its id and transcript — the background subagent
+    /// refresh was last asked for ([`take_subagent_refresh`](Self::take_subagent_refresh)),
+    /// or `None` when it must be asked afresh.
+    subagents_requested: Option<(String, PathBuf)>,
+    /// Whether a watcher batch wrote under the selected session's `subagents/` dir
+    /// since that request ([`apply_subagent_writes`](Self::apply_subagent_writes)),
+    /// so the record must be read again.
+    subagents_written: bool,
+    /// The wall clock as of the last `Tick` or landed subagent record
+    /// ([`note_wall_clock`](Self::note_wall_clock)): the `now` the subagent running
+    /// check reads, so nothing on the draw or key path reads a clock. The Unix
+    /// epoch until the first event stamps it; no record can land before one does.
+    wall_clock: SystemTime,
     /// The `(session_id, query)` the [`MATCH_OUTSIDE_PREVIEW`] nudge was last
     /// fired for, so one state of affairs is reported exactly once.
     ///
@@ -2829,6 +2921,11 @@ pub struct App {
     /// pass ran over the rendered lines.
     #[cfg(test)]
     preview_match_rebuilds: usize,
+    /// How many times a subagent's transcript has been rendered for the subagent
+    /// view. Test-only instrumentation: "no search route reads a subagent
+    /// transcript" is a claim about a READ, which a test cannot see in the pane.
+    #[cfg(test)]
+    subagent_renders: usize,
     /// Live substring index over `sessions` (isolated in [`crate::search`],
     /// which also confines every `memchr` call).
     index: SearchIndex,
@@ -2950,12 +3047,19 @@ impl App {
             preview_cache: HashMap::new(),
             preview_width: None,
             expanded_peers: HashSet::new(),
+            subagent_view: None,
+            subagents: None,
+            subagents_requested: None,
+            subagents_written: false,
+            wall_clock: SystemTime::UNIX_EPOCH,
             preview_match_notice: None,
             preview_match_jump: false,
             preview_match_line: None,
             preview_anchor_line: None,
             #[cfg(test)]
             preview_match_rebuilds: 0,
+            #[cfg(test)]
+            subagent_renders: 0,
             index,
         };
         // Resolve the launch project's worktree set ONCE, here, BEFORE the first
@@ -3108,9 +3212,17 @@ impl App {
     /// that is merely growing: the reload restores the SAME id, so this whole body
     /// is skipped. A reload whose selected row vanished from disk does reach it,
     /// carrying a neighbour's id — by then the previewed session has changed anyway.
+    ///
+    /// A CHANGED selection also leaves the subagent view: the view is a look at
+    /// one subagent of the session it was opened on, and the pane must show the
+    /// newly selected session's own transcript, never a subagent of another. The
+    /// background subagent refresh follows the new selection on its own
+    /// ([`take_subagent_refresh`](Self::take_subagent_refresh)), so nothing here
+    /// asks for it.
     fn set_selected(&mut self, next: Option<String>) {
         if self.selected != next {
             self.selected = next;
+            self.subagent_view = None;
             self.preview_follow_bottom = true;
             self.preview_scroll = 0;
             self.request_preview_match_jump();
@@ -3613,11 +3725,7 @@ impl App {
         if self.preview_follow_bottom {
             return;
         }
-        let Some(entry) = self
-            .selected
-            .as_ref()
-            .and_then(|id| self.preview_cache.get(id))
-        else {
+        let Some(entry) = self.peek_preview() else {
             return;
         };
         let top_row = usize::try_from(self.preview_scroll).unwrap_or(usize::MAX);
@@ -3747,12 +3855,12 @@ impl App {
     /// outlives both and a stale `true` here binds a key to nothing the user can
     /// see: a map whose `matches_query` has moved on, and a pane that is not being
     /// drawn at all (the 1:0 [`PaneLayout::ListOnly`] layout hides it without
-    /// clearing the cache).
+    /// clearing the cache). The subagent view is never marked, so it has none.
     fn current_preview_matches(&self) -> Option<&HashMap<usize, HashSet<usize>>> {
         if !self.pane_layout.shows_preview() {
             return None;
         }
-        let entry = self.preview_cache.get(self.selected.as_ref()?)?;
+        let entry = self.peek_preview()?;
         (entry.matches_query == self.query() && !entry.matches.is_empty()).then_some(&entry.matches)
     }
 
@@ -3856,10 +3964,10 @@ impl App {
     /// transcript's edge included — and re-derive the selection's cursor from it.
     ///
     /// A no-op unless a press is active, so a drag that began anywhere but the
-    /// transcript (the list, the banner, a docked compose zone, nowhere) never
-    /// selects. `transcript` is the SAME rect the press was gated on
-    /// (`view::preview_transcript_rect`), passed in rather than stored so there is
-    /// no second copy of it to drift. The pointer is kept unclamped (it is what the
+    /// transcript (the list, the banner, the preview's running list, a docked
+    /// compose zone, nowhere) never selects. `transcript` is the SAME rect the
+    /// press was gated on (`view::preview_transcript_rect`), passed in rather than
+    /// stored so there is no second copy of it to drift. The pointer is kept unclamped (it is what the
     /// autoscroll reads), while the cursor is the content cell under it CLAMPED into
     /// that rect, so dragging past the pane's edge, or down over the compose zone,
     /// selects to the boundary row on screen — and the autoscroll carries that
@@ -4052,11 +4160,14 @@ impl App {
     /// The selection is anchored to CONTENT, so a scroll alone never needs this; it
     /// is called when the user acts on the board or what the anchors name may
     /// change — any keypress, a wheel notch, a resize (a new width re-wraps the
-    /// transcript, so a row number names other text), or a store reload that
+    /// transcript, so a row number names other text), a store reload that
     /// re-read the previewed transcript or moved the selection
-    /// ([`apply_reload`](Self::apply_reload) decides which). A new press drops a
+    /// ([`apply_reload`](Self::apply_reload) decides which), or a write to the
+    /// transcript the subagent view shows
+    /// ([`apply_subagent_writes`](Self::apply_subagent_writes)). A new press drops a
     /// prior selection on its own ([`begin_preview_press`](Self::begin_preview_press)),
-    /// and a fold node toggled open or closed drops it WITHOUT the chain reset
+    /// and a fold node toggled open or closed, or the subagent view switched to,
+    /// drops it WITHOUT the chain reset
     /// ([`drop_preview_selection`](Self::drop_preview_selection) owns why).
     pub fn clear_preview_selection(&mut self) {
         self.drop_preview_selection();
@@ -4067,13 +4178,18 @@ impl App {
     /// [`clear_preview_selection`](Self::clear_preview_selection) clears EXCEPT the
     /// double-click chain ([`ClickRecord`]).
     ///
-    /// Its one other caller is [`toggle_peer_fold`](Self::toggle_peer_fold). A
-    /// toggle IS a click's own effect — the release of a plain click on a node
-    /// header — and it keeps that header on the row it was clicked on, so the
-    /// second press of a double-click lands on the same header and must still find
-    /// the chain: that press selects the word under it and toggles nothing. A chain
-    /// reset here would read it as a fresh click instead, and a double-click on a
-    /// header would open the node and shut it again.
+    /// Its other callers replace the render under the pane:
+    /// [`toggle_peer_fold`](Self::toggle_peer_fold), and the subagent view's
+    /// [`open_subagent_view`](Self::open_subagent_view) and
+    /// [`leave_subagent_view`](Self::leave_subagent_view). A toggle IS a click's own
+    /// effect — the release of a plain click on a node header — and it keeps that
+    /// header on the row it was clicked on, so the second press of a double-click
+    /// lands on the same header and must still find the chain: that press selects
+    /// the word under it and toggles nothing. A chain reset here would read it as a
+    /// fresh click instead, and a double-click on a header would open the node and
+    /// shut it again. The switch a click on a delegation line makes keeps the chain
+    /// for the same reason: the second press selects a word in the view, and never
+    /// switches again to whatever line now sits under it.
     fn drop_preview_selection(&mut self) {
         self.preview_selection = None;
         self.preview_press = None;
@@ -4455,32 +4571,35 @@ impl App {
 
     // --- new-session agent picker -----------------------------------------
 
-    /// Whether the mouse's three actions over the preview — toggling a fold node,
-    /// opening a link, and starting a selection (a drag-selection, or a
-    /// double-click's word) — are shut off. The SINGLE gate predicate callers use
-    /// (never `self.modal.is_some()` inline), so a later gate extension lives in
-    /// exactly one place. All three begin from a press
+    /// Whether the mouse's four actions over the preview — toggling a fold node,
+    /// switching the pane to a subagent, opening a link, and starting a selection
+    /// (a drag-selection, or a double-click's word) — are shut off. The SINGLE
+    /// gate predicate callers use (never `self.modal.is_some()` inline), so a later
+    /// gate extension lives in exactly one place. All four begin from a press
     /// `update::press_starts_selection` admits: the PRESS only records where it
     /// landed (a second admitted press on the same cell within
     /// `update::DOUBLE_CLICK_INTERVAL` records the word under it instead), and the
     /// RELEASE resolves it (a drag or a double-clicked word selects and copies; a
-    /// plain click toggles the fold under it, else opens the link) — so a press
-    /// this gate refuses leaves its release nothing to act on, and is no first half
-    /// of a double-click either.
+    /// plain click toggles the fold under it, else switches to the subagent a
+    /// `◆ delegated to …` line there names, else opens the link) — so a press this
+    /// gate refuses leaves its release nothing to act on, and is no first half of a
+    /// double-click either.
     ///
     /// True while a [`Modal`] is open, the stop-then-reply confirmation or the
     /// interrupt confirmation owns the keyboard, OR a `Ctrl-X` leader chord is
     /// [pending](Self::pending_chord): each takes the keyboard for a decision, so
     /// each must equally gate the mouse (a stray click mid-chord must not toggle a
-    /// fold, open a link, or start a selection), per PATTERNS §10.
+    /// fold, switch to a subagent, open a link, or start a selection), per
+    /// PATTERNS §10.
     ///
     /// A [`draft`](Self::draft) counts for a different reason: it owns the PANE
     /// rather than the keyboard. While its card is drawn the transcript is not, so
-    /// the cached link AND fold regions — both handed out of the ONE
-    /// [`preview_hit_context`](Self::preview_hit_context) entry — describe text
+    /// the cached link, fold AND delegation-line regions — all handed out of the
+    /// ONE [`preview_hit_context`](Self::preview_hit_context) entry — describe text
     /// that is no longer on screen, and a click resolved against them would open a
-    /// link or toggle a fold in a session the user cannot see, while a drag would
-    /// select the placeholder card rather than any transcript.
+    /// link, toggle a fold or switch to a subagent in a session the user cannot
+    /// see, while a drag would select the placeholder card rather than any
+    /// transcript.
     /// It outlives the editor by AT MOST one in-flight launch (whichever comes
     /// first: that launch's own result, or the end of the board session). While the
     /// editor is up it is also what gates a new-session draft's pointer, because
@@ -4489,11 +4608,14 @@ impl App {
     /// An open QUICK-REPLY or FORK editor ([`compose`](Self::compose) with no draft
     /// card) is deliberately NOT here, though it owns the keyboard. It previews the
     /// REAL transcript, docked in its own rect that the transcript rect already stops
-    /// above, and none of the three actions reads or writes anything the box
+    /// above, and none of the four actions reads or writes anything the box
     /// holds: not its text or caret, not its target session, not the row selection
     /// that target is addressed by. A selection is mouse state ended by any key, a
     /// fold toggle re-renders the same session's transcript, and a link opens in
-    /// the browser. Gating them only made a reply a reason to lose the mouse.
+    /// the browser. The subagent switch alone would change what the pane shows
+    /// beneath the box, so `update::click_effect` refuses that one click itself,
+    /// leaving this gate open for the other three. Gating them only made a reply a
+    /// reason to lose the mouse.
     #[must_use]
     pub fn preview_pointer_blocked(&self) -> bool {
         self.modal.is_some()
@@ -4573,11 +4695,21 @@ impl App {
     /// [`PaneLayout::ListOnly`] board opens at the 1:1 [`PaneLayout::Even`], through
     /// the one layout setter like any other change. Every other layout already
     /// shows the pane and is left exactly as the user set it.
+    ///
+    /// A compose with no draft — a quick reply or a fork box — previews the
+    /// selected session's OWN transcript and sends into it, so it leaves the
+    /// subagent view first ([`leave_subagent_view`](Self::leave_subagent_view)):
+    /// the pane must never show a subagent above a box whose text lands in the
+    /// parent session. Here, in the one writer, so no route into either box can
+    /// skip it.
     pub fn open_compose(
         &mut self,
         state: super::compose::ComposeState,
         draft: Option<NewSessionDraft>,
     ) {
+        if draft.is_none() {
+            self.leave_subagent_view();
+        }
         if !self.pane_layout.shows_preview() {
             self.set_pane_layout(PaneLayout::Even);
         }
@@ -5335,6 +5467,14 @@ impl App {
             .collect();
         self.preview_cache
             .retain(|id, _| live.contains(id.as_str()) && !reload.changed.contains(id));
+        // The subagent view goes with the session it was opened on: a reload that
+        // re-read that session — its own write, or `Ctrl-X r`, which re-reads every
+        // one — re-renders the view as well, so the rescan catches it up too.
+        if let Some(view) = self.subagent_view.as_mut() {
+            if reload.changed.contains(&view.session_id) {
+                view.cached = None;
+            }
+        }
         // Re-resolve BEFORE `recompute_scope` so this reload is already scoped by
         // the CURRENT worktree set rather than one reload behind it. The same
         // expression `App::new` seeds with, on purpose: launch and reload must not
@@ -5735,18 +5875,23 @@ impl App {
         self.index.match_indices(display)
     }
 
-    /// The width-scoped preview cache entry for the current selection, rendering
-    /// and inserting it on a miss.
+    /// The width-scoped cache entry the preview pane shows, rendering and inserting
+    /// it on a miss: the selected session's own transcript, or — while the subagent
+    /// view is live — that subagent's ([`ensure_subagent_preview`](Self::ensure_subagent_preview)).
     ///
-    /// A change in `inner_width` CLEARS the whole cache first: GFM tables
-    /// shrink-to-fit, so the layout, the link-region columns AND the wrapped row
-    /// count all depend on the width (see `preview_cache`). `None` when nothing is
-    /// selected or the selected id is no longer among the loaded sessions.
+    /// A change in `inner_width` CLEARS the whole cache first, the subagent view's
+    /// render included: GFM tables shrink-to-fit, so the layout, the link-region
+    /// columns AND the wrapped row count all depend on the width (see
+    /// `preview_cache`). `None` when nothing is selected or the selected id is no
+    /// longer among the loaded sessions.
     ///
     /// This is the single source EVERY preview accessor reads, so the lines drawn,
     /// the marks laid on them, the height scrolled against and the regions
-    /// hit-tested can never come from different renders. The complete set, since a
-    /// partial enumeration is a wrong one:
+    /// hit-tested can never come from different renders — and it is the ONE place
+    /// the pane switches between the session and a subagent, through
+    /// [`live_subagent_view`](Self::live_subagent_view), so no reader can show one
+    /// while another hit-tests the other. The complete set, since a partial
+    /// enumeration is a wrong one:
     /// [`preview_window`](Self::preview_window) (the lines drawn),
     /// [`preview_matches`](Self::preview_matches) (the marks on them),
     /// [`preview_wrapped_rows`](Self::preview_wrapped_rows) (the height),
@@ -5754,15 +5899,25 @@ impl App {
     /// all), [`preview_rows_above`](Self::preview_rows_above) (the match jump and
     /// the layout step's reading-position anchor),
     /// [`preview_hit_context`](Self::preview_hit_context) (the click hit-test),
+    /// [`preview_marker_at`](Self::preview_marker_at) (the pinned row),
     /// [`preview_transcript`](Self::preview_transcript) (a released selection's
-    /// off-screen redraw),
+    /// off-screen redraw), [`toggle_peer_fold`](Self::toggle_peer_fold) (a fold's
+    /// scroll anchor),
     /// [`note_match_outside_preview`](Self::note_match_outside_preview) (whether the
     /// query occurs in the pane), and the test-only
-    /// [`preview_text`](Self::preview_text).
+    /// [`preview_text`](Self::preview_text). The readers that must not render —
+    /// the keystroke-time ones, and the subagent view title's state — ask
+    /// [`peek_preview`](Self::peek_preview), which switches the same way.
     fn ensure_preview(&mut self, inner_width: u16) -> Option<&CachedPreview> {
         if self.preview_width != Some(inner_width) {
             self.preview_cache.clear();
+            if let Some(view) = self.subagent_view.as_mut() {
+                view.cached = None;
+            }
             self.preview_width = Some(inner_width);
+        }
+        if self.live_subagent_view().is_some() {
+            return self.ensure_subagent_preview(inner_width);
         }
         let id = self.selected.clone()?;
         if !self.preview_cache.contains_key(&id) {
@@ -5770,9 +5925,8 @@ impl App {
             // Defined-agent names gate the preview's `agent-name` fallback so a
             // free-form background-job title never renders as a bogus handle.
             let known_agents: HashSet<&str> = self.agent_names.iter().map(String::as_str).collect();
-            // Open fold keys of BOTH node kinds — peer messages and injected
-            // context — borrowed out of the app's own set (`expanded_peers`).
-            // The renderer only ever READS it, which is what
+            // Open fold keys of BOTH node kinds, borrowed out of the app's own set
+            // (`expanded_peers`). The renderer only ever READS it, which is what
             // keeps `preview::render` pure; a key is added or removed by
             // `toggle_peer_fold` alone, and that evicts this entry so the next
             // miss re-renders under the new set.
@@ -5792,6 +5946,12 @@ impl App {
             // the UI thread would buy one frame at the price of a partially-measured
             // pane (the scroll clamp, the scrollbar and the jump all read this map),
             // which is a worse trade than the hitch.
+            //
+            // Every render also builds the session's `subagents::index_for`: one
+            // dir listing and one read per meta file. Measured 2026-10-11 (Apple M4
+            // Max, release build) over the real store's largest `subagents/` dir,
+            // 254 meta files among 508 entries: ~3.6 ms warm (median of 21 runs),
+            // ~27 ms on a first, cold read.
             let row_prefix = view::wrapped_row_prefix(&rendered.text.lines, inner_width);
             self.preview_cache.insert(
                 id.clone(),
@@ -5808,6 +5968,388 @@ impl App {
         }
         self.refresh_preview_matches(&id);
         self.preview_cache.get(&id)
+    }
+
+    /// [`ensure_preview`](Self::ensure_preview)'s subagent half: the live subagent
+    /// view's render, rendering it on a miss ([`preview::render_subagent`]) under
+    /// the same width, known agents and open folds as the session's own. Its
+    /// `matches` stay EMPTY and are never recomputed: the content index never held
+    /// a subagent's text, so the view takes no search marks, no `Shift`-arrow
+    /// stops and no match jump.
+    ///
+    /// The miss reads the subagent's transcript ON THE UI THREAD, in the class
+    /// PATTERNS.md §6 gives the session's own cache-miss render, and only ever
+    /// because a click on a delegation line, `Ctrl-X ↓` or a `←`/`→` step opened
+    /// the view: the view is its only caller, and `open_subagent_view` its only
+    /// opener. It pays both passes, the
+    /// render and the row map, and is redone whenever the entry is evicted while
+    /// the view stays up: a write to the viewed transcript itself
+    /// (`apply_subagent_writes`, over the watcher's `SubagentsWritten`), a click
+    /// toggling a fold node in it (`toggle_peer_fold`), a reload that re-reads the
+    /// parent session (`apply_reload` over `Reload::changed` — each write to it,
+    /// and `Ctrl-X r`), and a pane-width change (above). So while the subagent
+    /// RUNS, its writes re-read its whole transcript as often as once per watcher
+    /// batch (`watch::DEBOUNCE`), the cadence a live session's own render is
+    /// redone at, and once more in a batch that wrote its parent session as well.
+    /// Measured 2026-10-11 (Apple M4 Max, release build, width
+    /// 100, median of 9 runs): a 10.6 MB synthetic subagent transcript (assistant
+    /// text, tool_use, tool_result and thinking records, all `isSidechain`) renders
+    /// 27,804 lines in ~44 ms and maps them (54,077 wrapped rows) in ~70 ms, ~114 ms
+    /// in all, about seven 60 Hz frames; an all-text 10.6 MB one takes ~240 ms. The
+    /// largest real one (14.5 MB, nearly all tool_result bytes the render drops)
+    /// took ~6 ms. Why a large RUNNING subagent paying that on every write is
+    /// accepted, and the known fix if it bites, is PATTERNS.md §6's.
+    fn ensure_subagent_preview(&mut self, inner_width: u16) -> Option<&CachedPreview> {
+        let session_id = self.live_subagent_view()?.session_id.clone();
+        let session_file = self
+            .sessions
+            .iter()
+            .find(|s| s.session_id == session_id)?
+            .file
+            .clone();
+        let known_agents: HashSet<&str> = self.agent_names.iter().map(String::as_str).collect();
+        let expanded: HashSet<&str> = self.expanded_peers.iter().map(String::as_str).collect();
+        let subagent = self.subagent_view.as_mut()?;
+        if subagent.cached.is_none() {
+            #[cfg(test)]
+            {
+                self.subagent_renders += 1;
+            }
+            let rendered = preview::render_subagent(
+                &session_file,
+                &subagent.agent_id,
+                usize::from(inner_width),
+                &known_agents,
+                &expanded,
+            );
+            let row_prefix = view::wrapped_row_prefix(&rendered.text.lines, inner_width);
+            subagent.cached = Some(CachedPreview {
+                rendered,
+                row_prefix,
+                matches: HashMap::new(),
+                matches_query: String::new(),
+            });
+        }
+        subagent.cached.as_ref()
+    }
+
+    /// The cached render the preview pane shows — the live subagent view's, else
+    /// the selected session's own — WITHOUT rendering anything: the read-only twin
+    /// of [`ensure_preview`](Self::ensure_preview), for the readers that run on a
+    /// keystroke ([`current_preview_matches`](Self::current_preview_matches),
+    /// [`note_preview_anchor`](Self::note_preview_anchor)) and the one the draw
+    /// asks through `&App` ([`subagent_view_status`](Self::subagent_view_status)),
+    /// which must never read a file. It switches through the same
+    /// [`live_subagent_view`](Self::live_subagent_view), so the two cannot pick
+    /// different renders. `None` on a cold cache, which those readers treat as
+    /// "nothing to act on".
+    fn peek_preview(&self) -> Option<&CachedPreview> {
+        match self.live_subagent_view() {
+            Some(view) => view.cached.as_ref(),
+            None => self.preview_cache.get(self.selected.as_ref()?),
+        }
+    }
+
+    /// The subagent view while it applies: open, and opened on the session that is
+    /// still selected. The ONE switch between the session's transcript and a
+    /// subagent's, asked by [`ensure_preview`](Self::ensure_preview) and
+    /// [`peek_preview`](Self::peek_preview) alike. A view whose session is no
+    /// longer the selection is never shown ([`set_selected`](Self::set_selected)
+    /// drops it on every change anyway).
+    fn live_subagent_view(&self) -> Option<&SubagentView> {
+        self.subagent_view
+            .as_ref()
+            .filter(|view| self.selected.as_deref() == Some(view.session_id.as_str()))
+    }
+
+    /// Whether the preview pane shows a subagent's transcript rather than the
+    /// selected session's own: what `↑` leaves, and `Esc` before it quits
+    /// (`update::key_to_action`), and what keeps the session's in-flight reply
+    /// tail and its live status off the pane (`view::render_preview`).
+    #[must_use]
+    pub fn in_subagent_view(&self) -> bool {
+        self.live_subagent_view().is_some()
+    }
+
+    /// The `agentType` of the subagent the pane shows, for its title, or `None`
+    /// while it shows the session's own transcript.
+    #[must_use]
+    pub fn subagent_view_type(&self) -> Option<&str> {
+        self.live_subagent_view()
+            .map(|view| view.agent_type.as_str())
+    }
+
+    /// The agent id of the subagent the pane shows, which the preview's running
+    /// list marks, or `None` while it shows the session's own transcript.
+    #[must_use]
+    pub fn subagent_view_id(&self) -> Option<&str> {
+        self.live_subagent_view().map(|view| view.agent_id.as_str())
+    }
+
+    /// Switch the preview pane to the transcript of the selected session's
+    /// subagent `agent_id` (`agentType` `agent_type`): the answer to a click on a
+    /// `◆ delegated to …` line ([`preview::SubagentRegion`]), whether the pane
+    /// showed the session or another of its subagents (the drill-down — one
+    /// session's `subagents/` dir holds every agent it launched at any depth).
+    ///
+    /// The ONLY opener of the view, and it has exactly three callers: the click
+    /// route (`update::click_effect`), `Ctrl-X ↓`
+    /// ([`open_subagent_target`](Self::open_subagent_target)) and a `←`/`→` step
+    /// inside the view ([`step_subagent_view`](Self::step_subagent_view)). No search
+    /// route — typing, `Tab`, `Shift-Up` / `Shift-Down` — can switch the pane to a
+    /// subagent or read a subagent's transcript. The read itself waits for the
+    /// next [`ensure_preview`](Self::ensure_preview).
+    ///
+    /// The view opens at its newest turn, as a newly selected session does, and
+    /// remembers where the SESSION's own transcript was scrolled — kept across a
+    /// drill-down — for [`leave_subagent_view`](Self::leave_subagent_view). Any
+    /// mouse selection goes (its anchors name lines of the render being replaced),
+    /// but the click chain stays, as for a fold toggle: a quick second press on the
+    /// same cell selects a word in the view rather than switching again. A no-op
+    /// when nothing is selected.
+    pub(crate) fn open_subagent_view(&mut self, agent_id: &str, agent_type: &str) {
+        let Some(session_id) = self.selected.clone() else {
+            return;
+        };
+        let return_to = self
+            .live_subagent_view()
+            .map_or((self.preview_scroll, self.preview_follow_bottom), |view| {
+                view.return_to
+            });
+        self.subagent_view = Some(SubagentView {
+            session_id,
+            agent_id: agent_id.to_string(),
+            agent_type: agent_type.to_string(),
+            return_to,
+            cached: None,
+        });
+        self.preview_scroll = 0;
+        self.preview_follow_bottom = true;
+        self.preview_anchor_line = None;
+        self.drop_preview_selection();
+    }
+
+    /// Leave the subagent view for the selected session's own transcript, scrolled
+    /// where it was when the view opened. `true` when a view was open — what `↑`
+    /// does there, and `Esc`'s middle step, between clearing the query and
+    /// quitting — and `false`, changing nothing, when none was. Any mouse
+    /// selection goes with the render it was anchored to.
+    pub(crate) fn leave_subagent_view(&mut self) -> bool {
+        let live = self.live_subagent_view().is_some();
+        let Some(view) = self.subagent_view.take() else {
+            return false;
+        };
+        if live {
+            (self.preview_scroll, self.preview_follow_bottom) = view.return_to;
+        }
+        self.preview_anchor_line = None;
+        self.drop_preview_selection();
+        true
+    }
+
+    /// Draw the subagent view again when a settled watcher batch wrote the
+    /// transcript it shows ([`AppEvent::SubagentsWritten`], at most once per
+    /// debounce batch), so a running subagent's view updates as it writes.
+    ///
+    /// Only the view's own render is evicted, and the next
+    /// [`ensure_preview`](Self::ensure_preview) reads the transcript again. The
+    /// view is matched by the session FILE its transcript sits beside and the
+    /// agent id — the pair `preview::render_subagent` opens it through, the file
+    /// found as [`ensure_subagent_preview`](Self::ensure_subagent_preview) finds
+    /// it — never by a folder name. The session's own `preview_cache` entry (and
+    /// with it `last_model`), the rows and the selection stay as they are: a
+    /// subagent is never a session. A batch that wrote only OTHER subagents, or
+    /// any batch while no view is up, reads nothing.
+    ///
+    /// A batch that wrote under the SELECTED session's `subagents/` dir, the view
+    /// up or not, also marks its subagent record for the background refresh to
+    /// read again ([`take_subagent_refresh`](Self::take_subagent_refresh)); that
+    /// read runs off this thread.
+    ///
+    /// A mouse selection goes with the render it was anchored to, by the rule a
+    /// reload that re-read the previewed transcript follows
+    /// ([`apply_reload`](Self::apply_reload)). Sets no status (STATUS-LINE
+    /// OWNERSHIP): the redrawn transcript is the surface.
+    pub fn apply_subagent_writes(&mut self, written: &[SubagentTranscript]) {
+        if let Some(session) = self.selected_session() {
+            if written.iter().any(|w| w.session_file == session.file) {
+                self.subagents_written = true;
+            }
+        }
+        let Some(view) = self.live_subagent_view() else {
+            return;
+        };
+        let Some(session) = self.session_by_id(&view.session_id) else {
+            return;
+        };
+        let shown = written
+            .iter()
+            .any(|w| w.agent_id == view.agent_id && w.session_file == session.file);
+        if !shown {
+            return;
+        }
+        if let Some(view) = self.subagent_view.as_mut() {
+            view.cached = None;
+        }
+        self.clear_preview_selection();
+    }
+
+    /// The background subagent refresh to request NOW, if any: the selected
+    /// session's id and transcript, whenever they differ from the last request —
+    /// or a watcher batch wrote under its `subagents/` dir since
+    /// ([`apply_subagent_writes`](Self::apply_subagent_writes)). Marks it
+    /// requested, so one state asks once. `None` with no session selected, which
+    /// also forgets the last request, so selecting that session again asks again.
+    ///
+    /// The ONE choke point for the refresh. The driver asks it after every event,
+    /// so whatever moved the selection — a key, the wheel, a search keystroke, a
+    /// reload, a scope or filter change — is seen here, and no route asks for a
+    /// read itself, or reads a file (AGENTS.md OFF-UI-THREAD). No I/O: a decision
+    /// over `App` alone, so a test drives it with no driver.
+    #[must_use = "the refresh must be requested, or the record never arrives"]
+    pub fn take_subagent_refresh(&mut self) -> Option<(String, PathBuf)> {
+        let Some(session) = self.selected_session() else {
+            self.subagents_requested = None;
+            return None;
+        };
+        let wanted = (session.session_id.clone(), session.file.clone());
+        if !self.subagents_written && self.subagents_requested.as_ref() == Some(&wanted) {
+            return None;
+        }
+        self.subagents_written = false;
+        self.subagents_requested = Some(wanted.clone());
+        Some(wanted)
+    }
+
+    /// Forget the last subagent refresh request, so the next
+    /// [`take_subagent_refresh`](Self::take_subagent_refresh) asks again: the
+    /// answer to it reports on a board session's channel that is ending, so it
+    /// can never land, and the next board session has to ask anew.
+    pub fn forget_subagent_request(&mut self) {
+        self.subagents_requested = None;
+    }
+
+    /// Land the background refresh's record for `session_id`
+    /// ([`AppEvent::SubagentRuns`]). A record for a session that is no longer
+    /// selected is DROPPED, so it can never show for another row. Sets no status
+    /// (STATUS-LINE OWNERSHIP).
+    pub fn apply_subagent_record(&mut self, session_id: &str, record: SubagentRecord) {
+        if self.selected.as_deref() == Some(session_id) {
+            self.subagents = Some((session_id.to_string(), record));
+        }
+    }
+
+    /// The selected session's subagent record, or `None` while the background
+    /// refresh has not answered for it. Never another session's record.
+    #[must_use]
+    pub fn selected_subagents(&self) -> Option<&SubagentRecord> {
+        let (session_id, record) = self.subagents.as_ref()?;
+        (self.selected.as_deref() == Some(session_id.as_str())).then_some(record)
+    }
+
+    /// Stamp the wall clock the subagent running check reads (`App::wall_clock`),
+    /// from an event handler: the `Tick` and a landed record. Never earlier than
+    /// the stamp it replaces, so a stamp taken out of order cannot step it back.
+    pub fn note_wall_clock(&mut self, now: SystemTime) {
+        self.wall_clock = self.wall_clock.max(now);
+    }
+
+    /// `Ctrl-X ↓` from the board: switch the preview to the selected session's
+    /// subagent its record names as the target
+    /// ([`SubagentRecord::open_target`], as of `App::wall_clock`) — the first
+    /// RUNNING one in launch order, else the most recently written — through
+    /// [`open_subagent_view`](Self::open_subagent_view), bringing a hidden preview
+    /// back at `1:1` first so the switch shows. The query stays as typed.
+    ///
+    /// Reads no file and no clock: it asks the record the background refresh
+    /// already landed. Switches nothing, and says why, while that record has not
+    /// arrived ([`SubagentsUnavailable::NotRead`] — never "none", which it does not
+    /// know yet) and when it lists none ([`SubagentsUnavailable::None`]). With no
+    /// session selected, nothing at all.
+    pub fn open_subagent_target(&mut self) -> Result<(), SubagentsUnavailable> {
+        if self.selected.is_none() {
+            return Ok(());
+        }
+        let record = self
+            .selected_subagents()
+            .ok_or(SubagentsUnavailable::NotRead)?;
+        let target = record
+            .open_target(self.wall_clock)
+            .ok_or(SubagentsUnavailable::None)?;
+        let (agent_id, agent_type) = (target.agent_id.clone(), target.agent_type.clone());
+        if !self.pane_layout.shows_preview() {
+            self.set_pane_layout(PaneLayout::Even);
+        }
+        self.open_subagent_view(&agent_id, &agent_type);
+        Ok(())
+    }
+
+    /// `←` / `→` inside the subagent view: switch to the previous / next
+    /// (`forward`) subagent of the selected session in launch order, wrapping
+    /// round ([`SubagentRecord::step`], which also says where a subagent the
+    /// record does not list yet steps to). Like a drill-down, it keeps where the
+    /// session's own transcript was scrolled, for `↑` or `Esc`. Nothing changes
+    /// outside the view, or when the step lands on the subagent already shown; nothing
+    /// changes either, and it says why, while the record has not arrived or lists
+    /// none.
+    pub fn step_subagent_view(&mut self, forward: bool) -> Result<(), SubagentsUnavailable> {
+        let Some(view) = self.live_subagent_view() else {
+            return Ok(());
+        };
+        let record = self
+            .selected_subagents()
+            .ok_or(SubagentsUnavailable::NotRead)?;
+        let next = record
+            .step(&view.agent_id, forward)
+            .ok_or(SubagentsUnavailable::None)?;
+        if next.agent_id != view.agent_id {
+            let (agent_id, agent_type) = (next.agent_id.clone(), next.agent_type.clone());
+            self.open_subagent_view(&agent_id, &agent_type);
+        }
+        Ok(())
+    }
+
+    /// Where the subagent the pane shows stands in launch order, `(k, n)`, for
+    /// the view's title: `None` outside the view, and while the selected session's
+    /// record has not arrived or does not list it.
+    #[must_use]
+    pub fn subagent_view_position(&self) -> Option<(usize, usize)> {
+        let view = self.live_subagent_view()?;
+        self.selected_subagents()?.position(&view.agent_id)
+    }
+
+    /// The selected session's record entry for the subagent the pane shows — its
+    /// description, launch time and newest write, for the view's title — or
+    /// `None` outside the view and while the record has not arrived or does not
+    /// list it.
+    #[must_use]
+    pub fn viewed_subagent(&self) -> Option<&Subagent> {
+        let view = self.live_subagent_view()?;
+        self.selected_subagents()?.get(&view.agent_id)
+    }
+
+    /// Where the run of the subagent the pane shows stands as of
+    /// `App::wall_clock`, for the view's title: [`SubagentStatus::of`] over its
+    /// record entry's `newest_write` and the `ended` its cached render judged
+    /// (`preview::RenderedPreview::run_ended`), falling back to the record's own
+    /// `ended` whenever that render has no verdict (none is cached yet, or it is
+    /// the unreadable one) — the render reads the whole transcript, where the
+    /// record reads no tail once the subagent cannot be running. Evicting the
+    /// render (a `SubagentsWritten` naming the transcript among the rest) takes
+    /// its verdict with it, so the next render judges again. `None` where
+    /// [`viewed_subagent`](Self::viewed_subagent) is: without its `newest_write`
+    /// no running can be told. Reads no file and no clock.
+    #[must_use]
+    pub fn subagent_view_status(&self) -> Option<SubagentStatus> {
+        let listed = self.viewed_subagent()?;
+        let rendered = self
+            .peek_preview()
+            .and_then(|cached| cached.rendered.run_ended);
+        Some(SubagentStatus::of(
+            rendered.or(listed.ended),
+            listed.newest_write,
+            self.wall_clock,
+        ))
     }
 
     /// Bring the cached entry's [`matches`](CachedPreview::matches) up to date with
@@ -5953,11 +6495,16 @@ impl App {
     /// back on, a selection returning to the row), is stated once rather than on
     /// every visit.
     ///
+    /// Nothing is said while the pane shows the subagent view: the view is never
+    /// marked, so an unmarked pane there explains itself, and asking the render
+    /// would let a keystroke read a subagent's transcript.
+    ///
     /// [`SearchIndex::atom_match_positions`]: crate::search::SearchIndex::atom_match_positions
     fn note_match_outside_preview(&mut self) {
         if self.query_input.is_empty()
             || self.search_mode != SearchMode::NameAndContent
             || !self.pane_layout.shows_preview()
+            || self.in_subagent_view()
         {
             return;
         }
@@ -5997,6 +6544,21 @@ impl App {
     #[cfg(test)]
     fn preview_cache_len(&self) -> usize {
         self.preview_cache.len()
+    }
+
+    /// The wall clock the subagent running check reads (`App::wall_clock`): the
+    /// `now` the preview's running list is drawn against, so the draw reads no
+    /// clock of its own.
+    #[must_use]
+    pub fn wall_clock(&self) -> SystemTime {
+        self.wall_clock
+    }
+
+    /// How many times a subagent's transcript has been rendered for the subagent
+    /// view. Test-only, for the module's siblings: the field is private.
+    #[cfg(test)]
+    pub(crate) fn subagent_renders(&self) -> usize {
+        self.subagent_renders
     }
 
     /// Readable, markdown-styled transcript for the selected session, fit to
@@ -6106,21 +6668,22 @@ impl App {
 
     /// The wrapped-layout context needed to hit-test a mouse click into a preview:
     /// the per-line wrapped-row PREFIX MAP
-    /// ([`row_prefix`](CachedPreview::row_prefix)), the rendered LINES, and BOTH kinds
-    /// of clickable region — the [`LinkRegion`](preview::LinkRegion)s and the fold-node
-    /// [`FoldRegion`](preview::FoldRegion)s, peer messages and injected context
-    /// alike — all pulled from the SAME width-scoped
-    /// cache the view drew from, so a hit-test can never disagree with what is on
-    /// screen. `None` when nothing is selected.
+    /// ([`row_prefix`](CachedPreview::row_prefix)), the rendered LINES, and EVERY kind
+    /// of clickable region — the [`LinkRegion`](preview::LinkRegion)s, the fold-node
+    /// [`FoldRegion`](preview::FoldRegion)s (peer messages and injected context
+    /// alike) and the delegation lines' [`SubagentRegion`](preview::SubagentRegion)s
+    /// — all pulled from the SAME width-scoped cache the view drew from, so a
+    /// hit-test can never disagree with what is on screen. `None` when nothing is
+    /// selected.
     ///
-    /// The two region kinds come back TOGETHER, out of ONE cache entry, for the same
+    /// The region kinds come back TOGETHER, out of ONE cache entry, for the same
     /// reason the renderer emits them from one pass: a click is resolved to a row
     /// once, and a fold whose row was read from a different render than the link
-    /// beside it would toggle a node the user did not click. Asking twice — once per
-    /// kind — is the shape that makes that possible, so do not split this in two.
+    /// beside it would toggle a node the user did not click. Asking once per kind
+    /// is the shape that makes that possible, so do not split this up.
     ///
     /// It hands over the very map the DRAW windows by, and that shared identity is
-    /// the point: `view::link_at` and `view::fold_at` resolve a clicked row to a
+    /// the point: `view::link_at`, `view::fold_at` and `view::subagent_at` resolve a clicked row to a
     /// logical line through the same binary search `view::row_window` starts the
     /// window with, so the two cannot disagree about which line was painted where.
     /// Answering that from a per-line model instead — as a walk over each line's
@@ -6129,11 +6692,11 @@ impl App {
     ///
     /// The LINES come along because resolving which CELL of that line was clicked is
     /// answered that way on the LINK side — by re-rendering the line rather than by
-    /// modelling the wrap (see `view::region_paints_cell`); the fold side needs only
-    /// the map, and `view::content_hit` owns why the cheaper column answer is enough
-    /// for it. Everything here is BORROWED, never cloned: a click would otherwise
-    /// copy a whole transcript to read one line of it, and both region lists ride in
-    /// that same borrow rather than paying a clone of their own.
+    /// modelling the wrap (see `view::region_paints_cell`); the fold and delegation
+    /// sides need only the map, and `view::content_hit` owns why the cheaper column
+    /// answer is enough for them. Everything here is BORROWED, never cloned: a click would otherwise
+    /// copy a whole transcript to read one line of it, and every region list rides
+    /// in that same borrow rather than paying a clone of its own.
     pub fn preview_hit_context(&mut self, inner_width: u16) -> Option<PreviewHitContext<'_>> {
         self.ensure_preview(inner_width).map(|p| {
             (
@@ -6141,6 +6704,7 @@ impl App {
                 &p.rendered.text.lines[..],
                 &p.rendered.links[..],
                 &p.rendered.folds[..],
+                &p.rendered.subagents[..],
             )
         })
     }
@@ -6149,11 +6713,13 @@ impl App {
     /// keyed by `key`, then keep it on the screen row it was clicked on.
     ///
     /// The ONE place `expanded_peers` is mutated, and it evicts the selected
-    /// session's `preview_cache` entry in the same breath. That pairing is the whole
-    /// design: the fold set is deliberately NOT part of the cache key (a second key
-    /// component buys a retained collapsed render nobody asks for — YAGNI), so an
-    /// entry that outlived a toggle would serve the OLD shape forever, and the two
-    /// steps drifting apart is exactly the bug the single call site prevents.
+    /// session's `preview_cache` entry — and the subagent view's render, which
+    /// draws its fold nodes from the same set — in the same breath. That pairing is
+    /// the whole design: the fold set is deliberately NOT part of the cache key (a
+    /// second key component buys a retained collapsed render nobody asks for —
+    /// YAGNI), so an entry that outlived a toggle would serve the OLD shape forever,
+    /// and the two steps drifting apart is exactly the bug the single call site
+    /// prevents.
     ///
     /// It also drops any mouse text selection
     /// ([`drop_preview_selection`](Self::drop_preview_selection)): the re-render
@@ -6193,6 +6759,9 @@ impl App {
             self.expanded_peers.insert(key.to_string());
         }
         self.preview_cache.remove(&id);
+        if let Some(view) = self.subagent_view.as_mut() {
+            view.cached = None;
+        }
         // The toggle re-renders the transcript — its lines, its row map and the
         // scroll below all move — so a mouse selection's content anchors would now
         // name other text. Drop it here, beside the mutation, so no route into a
@@ -8590,7 +9159,7 @@ mod tests {
     /// has to outlive the borrow it came from. Copying here keeps that need in the test
     /// instead of paying for it on every click.
     fn peer_hit_snapshot(app: &mut App) -> (Vec<usize>, Vec<preview::FoldRegion>) {
-        let (map, _lines, _links, folds) = app
+        let (map, _lines, _links, folds, _) = app
             .preview_hit_context(PEER_WIDTH)
             .expect("the fixture session is selected, so it has a preview");
         (map.to_vec(), folds.to_vec())
@@ -8648,6 +9217,510 @@ mod tests {
         );
     }
 
+    // --- the subagent view: opened by a click, `Ctrl-X ↓` or a step, never passed off as the session ---
+
+    /// The delegation fixture: a session whose `Agent` launch joins a subagent with
+    /// a transcript of its own, answered on a DIFFERENT model than the session's.
+    const DELEGATION_FIXTURE: (&str, &str) =
+        ("-Users-me-project-epsilon", "sess-delegation-1.jsonl");
+    /// That launch's subagent: its agent id and its `agentType`.
+    const DELEGATION_AGENT: (&str, &str) = ("a1b2c3d4e5f6a7b8c", "parser-auditor");
+    /// A pane wide enough that no fixture line wraps.
+    const DELEGATION_WIDTH: u16 = 120;
+
+    /// The delegation fixture as row `id`, labelled so a query of `parser` keeps it
+    /// on the board.
+    fn delegation_session(id: &str) -> Session {
+        let (folder, file) = DELEGATION_FIXTURE;
+        let mut s = fixture_session(id, folder, file);
+        s.label = "Audit the JSONL parser and refresh its docs".to_string();
+        s
+    }
+
+    /// Open the subagent view on [`DELEGATION_AGENT`] of the selected session, as a
+    /// click on its line does.
+    fn open_delegation_view(app: &mut App) {
+        let (agent_id, agent_type) = DELEGATION_AGENT;
+        app.open_subagent_view(agent_id, agent_type);
+    }
+
+    /// The wall clock only moves forward: a stamp older than the one held never
+    /// steps it back.
+    #[test]
+    fn the_wall_clock_never_steps_back() {
+        let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp"));
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        app.note_wall_clock(at);
+        assert_eq!(app.wall_clock, at);
+        app.note_wall_clock(at - Duration::from_secs(5));
+        assert_eq!(app.wall_clock, at, "an older stamp is ignored");
+        app.note_wall_clock(at + Duration::from_secs(5));
+        assert_eq!(app.wall_clock, at + Duration::from_secs(5));
+    }
+
+    /// `Ctrl-X ↓`'s target is worked out at the HELD wall clock, with no file
+    /// read: the subagent running at one stamp is quiet at a later one, and the
+    /// most recent write wins then.
+    #[test]
+    fn the_open_target_follows_the_held_wall_clock() {
+        use crate::store::subagents::Subagent;
+
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let subagent = |agent_id: &str, launched: i64, idle_secs: u64, ended: bool| Subagent {
+            agent_id: agent_id.to_string(),
+            agent_type: format!("{agent_id}-type"),
+            description: None,
+            launched: Some(
+                time::OffsetDateTime::from_unix_timestamp(launched).expect("an instant"),
+            ),
+            newest_write: Some(at - Duration::from_secs(idle_secs)),
+            ended: Some(ended),
+        };
+        let mut app = App::new(
+            vec![delegation_session("s1")],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
+        app.apply_subagent_record(
+            "s1",
+            SubagentRecord::new(vec![
+                subagent("early", 1, 60, false),
+                subagent("late", 2, 30, true),
+            ]),
+        );
+        app.note_wall_clock(at);
+        assert_eq!(app.open_subagent_target(), Ok(()));
+        assert_eq!(
+            app.subagent_view_type(),
+            Some("early-type"),
+            "it runs at `at`"
+        );
+
+        app.leave_subagent_view();
+        app.note_wall_clock(at + Duration::from_secs(3_600));
+        assert_eq!(app.open_subagent_target(), Ok(()));
+        assert_eq!(
+            app.subagent_view_type(),
+            Some("late-type"),
+            "an hour on nothing runs, and the most recent write wins"
+        );
+    }
+
+    /// A reply or fork box sends into the SESSION, so opening one leaves the view
+    /// first and puts the session's own transcript back where it was scrolled. A
+    /// `Ctrl-N` draft lands in a NEW session and replaces the pane with its card, so
+    /// it leaves the view alone.
+    #[test]
+    fn opening_a_reply_or_fork_box_leaves_the_subagent_view_but_a_draft_does_not() {
+        use super::super::compose::ComposeState;
+
+        for (what, state) in [
+            ("reply", ComposeState::new_reply("s1".to_string(), None)),
+            ("fork", ComposeState::new_fork("s1".to_string())),
+        ] {
+            let mut app = app_all(vec![delegation_session("s1")]);
+            app.preview_scroll = 3;
+            app.preview_follow_bottom = false;
+            open_delegation_view(&mut app);
+            assert!(app.in_subagent_view(), "{what}: premise");
+
+            app.open_compose(state, None);
+
+            assert!(!app.in_subagent_view(), "{what}: the box leaves the view");
+            assert_eq!(
+                (app.preview_scroll, app.preview_follow_bottom),
+                (3, false),
+                "{what}: and the session's pane is where it was"
+            );
+        }
+
+        let mut app = app_all(vec![delegation_session("s1")]);
+        open_delegation_view(&mut app);
+        open_draft(&mut app);
+        assert!(app.in_subagent_view(), "a draft leaves the view alone");
+    }
+
+    /// The view belongs to the session it was opened on: moving the selection
+    /// leaves it, and coming back shows the session's own transcript, not the view.
+    #[test]
+    fn moving_the_selection_leaves_the_subagent_view() {
+        let mut app = app_all(vec![delegation_session("s1"), delegation_session("s2")]);
+        let first = app.selected.clone();
+        open_delegation_view(&mut app);
+        assert!(app.in_subagent_view(), "premise");
+
+        app.move_selection(1);
+        assert_ne!(app.selected, first, "premise: the selection moved");
+        assert!(
+            !app.in_subagent_view(),
+            "moving the selection leaves the view"
+        );
+
+        app.move_selection(-1);
+        assert_eq!(app.selected, first);
+        assert!(
+            !app.in_subagent_view(),
+            "and coming back does not reopen it"
+        );
+    }
+
+    /// The reply box's model label is read off the SESSION's own render, never the
+    /// view's: the subagent answered on Sonnet, the session last on Opus. With the
+    /// session's render cold and only the view's warm, there is no label at all
+    /// rather than the subagent's.
+    #[test]
+    fn the_reply_boxs_model_label_never_comes_from_the_subagent_view() {
+        let mut app = app_all(vec![delegation_session("s1")]);
+        open_delegation_view(&mut app);
+        assert!(
+            app.preview_text(DELEGATION_WIDTH)
+                .lines
+                .iter()
+                .any(|line| line_text(line).contains("Sonnet 5")),
+            "premise: the view's own turns answered on another model"
+        );
+        assert_eq!(
+            app.session_model_label("s1"),
+            None,
+            "the view's render never stands in for the session's"
+        );
+
+        app.leave_subagent_view();
+        app.preview_text(DELEGATION_WIDTH);
+        open_delegation_view(&mut app);
+        app.preview_text(DELEGATION_WIDTH);
+        assert_eq!(app.session_model_label("s1"), Some("Opus 5.5"));
+    }
+
+    /// The view takes NO search marks: the content index never held a subagent's
+    /// text, so a query its lines say still marks nothing there and gives the
+    /// `Shift` arrows nothing to step — while the same query marks the session's
+    /// own lines once the view is left.
+    #[test]
+    fn the_subagent_view_takes_no_search_marks() {
+        let mut app = app_all(vec![delegation_session("s1")]);
+        app.push_query_str("parser");
+        assert!(
+            app.preview_matches(DELEGATION_WIDTH)
+                .is_some_and(|matches| !matches.is_empty())
+                && app.has_preview_matches(),
+            "premise: the query marks the session's own lines"
+        );
+
+        open_delegation_view(&mut app);
+        assert!(
+            app.preview_text(DELEGATION_WIDTH)
+                .lines
+                .iter()
+                .any(|line| line_text(line).contains("parser")),
+            "premise: the view's own lines say the query"
+        );
+        assert!(app
+            .preview_matches(DELEGATION_WIDTH)
+            .is_some_and(HashMap::is_empty));
+        assert!(
+            !app.has_preview_matches(),
+            "the session's marks never stand in for the view's"
+        );
+
+        app.leave_subagent_view();
+        assert!(
+            app.has_preview_matches(),
+            "back on the session, its marks are"
+        );
+    }
+
+    /// A search key pressed while the view is up reads no subagent transcript and
+    /// says nothing: the view is never marked, so its unmarked pane needs no
+    /// "match is outside the previewed transcript" note, and asking would render
+    /// the view on a keystroke. Pinned on the one shape where that ask could
+    /// render — the view's render evicted by a reload, and a content-only query
+    /// its label does not say.
+    #[test]
+    fn a_query_typed_in_the_subagent_view_reads_no_transcript_and_says_nothing() {
+        let mut session = delegation_session("s1");
+        session.content_index = "splitting off the fixture review".to_string();
+        let mut app = app_all(vec![session.clone()]);
+        app.toggle_search_mode();
+        assert_eq!(app.search_mode, SearchMode::NameAndContent);
+        open_delegation_view(&mut app);
+        app.preview_text(DELEGATION_WIDTH);
+        assert_eq!(
+            app.subagent_renders(),
+            1,
+            "premise: the view was drawn once"
+        );
+        app.apply_reload(Reload {
+            sessions: vec![session],
+            changed: HashSet::from(["s1".to_string()]),
+        });
+
+        app.push_query_str("splitting");
+
+        assert!(
+            app.in_subagent_view(),
+            "premise: the row survived the filter"
+        );
+        assert_eq!(app.subagent_renders(), 1, "the keystroke read nothing");
+        assert_ne!(app.status.as_deref(), Some(MATCH_OUTSIDE_PREVIEW));
+    }
+
+    /// The view's render is cached apart and read once: frames re-use it, and only
+    /// a reload that RE-READ its session — that session's write, or `Ctrl-X r` —
+    /// renders it again. A reload that re-read nothing of it does not.
+    #[test]
+    fn only_a_reload_that_rereads_the_session_renders_the_subagent_view_again() {
+        let mut app = app_all(vec![delegation_session("s1")]);
+        open_delegation_view(&mut app);
+        app.preview_text(DELEGATION_WIDTH);
+        app.preview_text(DELEGATION_WIDTH);
+        assert_eq!(
+            app.subagent_renders(),
+            1,
+            "one read for any number of frames"
+        );
+
+        app.apply_reload(Reload {
+            sessions: vec![delegation_session("s1")],
+            changed: HashSet::new(),
+        });
+        app.preview_text(DELEGATION_WIDTH);
+        assert!(
+            app.in_subagent_view(),
+            "a reload keeps the selection, and the view"
+        );
+        assert_eq!(app.subagent_renders(), 1, "nothing of it was re-read");
+
+        app.apply_reload(Reload {
+            sessions: vec![delegation_session("s1")],
+            changed: HashSet::from(["s1".to_string()]),
+        });
+        app.preview_text(DELEGATION_WIDTH);
+        assert_eq!(app.subagent_renders(), 2, "its session was re-read");
+    }
+
+    /// The write the watcher reports for the selected session's subagent
+    /// [`DELEGATION_AGENT`], named the way the watcher names it.
+    fn delegation_write(app: &App) -> SubagentTranscript {
+        SubagentTranscript {
+            session_file: app.session_by_id("s1").expect("s1 is loaded").file.clone(),
+            agent_id: DELEGATION_AGENT.0.to_string(),
+        }
+    }
+
+    /// A write to the transcript the view shows draws the view again — and
+    /// touches nothing of the session's: its own render stays cached, so its
+    /// model label stays the session's, and the row and the view stay put.
+    #[test]
+    fn a_write_to_the_viewed_subagent_draws_the_view_again_and_nothing_else() {
+        let mut app = app_all(vec![delegation_session("s1")]);
+        app.preview_text(DELEGATION_WIDTH);
+        open_delegation_view(&mut app);
+        app.preview_text(DELEGATION_WIDTH);
+        assert_eq!(
+            app.subagent_renders(),
+            1,
+            "premise: the view was drawn once"
+        );
+
+        let write = delegation_write(&app);
+        app.apply_subagent_writes(&[write]);
+
+        assert_eq!(
+            app.preview_cache_len(),
+            1,
+            "the session's own render is not the view's, and stays cached"
+        );
+        assert_eq!(app.session_model_label("s1"), Some("Opus 5.5"));
+        assert_eq!(app.selected.as_deref(), Some("s1"));
+        assert!(app.in_subagent_view(), "the write keeps the view up");
+        app.preview_text(DELEGATION_WIDTH);
+        assert_eq!(
+            app.subagent_renders(),
+            2,
+            "the view read its transcript again"
+        );
+        app.preview_text(DELEGATION_WIDTH);
+        assert_eq!(app.subagent_renders(), 2, "once per write, not per frame");
+    }
+
+    /// A write the view does not show reads nothing: another subagent of the same
+    /// session, the same agent id beside another session file, or any write while
+    /// no view is up — which leaves the session's own render cached as well.
+    #[test]
+    fn a_write_the_subagent_view_does_not_show_reads_nothing() {
+        let mut app = app_all(vec![delegation_session("s1")]);
+        let shown = delegation_write(&app);
+        app.preview_text(DELEGATION_WIDTH);
+        app.apply_subagent_writes(std::slice::from_ref(&shown));
+        assert_eq!(
+            app.preview_cache_len(),
+            1,
+            "with no view up, the session's render stays cached"
+        );
+        app.preview_text(DELEGATION_WIDTH);
+        assert_eq!(app.subagent_renders(), 0, "and no subagent was read");
+
+        open_delegation_view(&mut app);
+        app.preview_text(DELEGATION_WIDTH);
+        app.apply_subagent_writes(&[
+            SubagentTranscript {
+                agent_id: "b0c1d2e3f4a5b6c7d".to_string(),
+                ..shown.clone()
+            },
+            SubagentTranscript {
+                session_file: shown.session_file.with_file_name("sess-other.jsonl"),
+                ..shown
+            },
+        ]);
+        app.preview_text(DELEGATION_WIDTH);
+        assert_eq!(
+            app.subagent_renders(),
+            1,
+            "neither write is the transcript the view shows"
+        );
+    }
+
+    /// A mouse selection in the view goes when its transcript is written, by the
+    /// rule a reload re-reading the previewed transcript follows, and stays when
+    /// another subagent is.
+    #[test]
+    fn a_write_to_the_viewed_subagent_clears_the_preview_selection() {
+        let transcript = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        };
+        let mut app = app_all(vec![delegation_session("s1")]);
+        open_delegation_view(&mut app);
+        app.preview_text(DELEGATION_WIDTH);
+        let shown = delegation_write(&app);
+        app.begin_preview_press(Position { x: 1, y: 1 }, transcript);
+        app.extend_preview_selection(Position { x: 8, y: 2 }, transcript);
+        assert!(app.has_preview_selection(), "premise: a selection is held");
+
+        app.apply_subagent_writes(&[SubagentTranscript {
+            agent_id: "b0c1d2e3f4a5b6c7d".to_string(),
+            ..shown.clone()
+        }]);
+        assert!(
+            app.has_preview_selection(),
+            "another subagent's write keeps it"
+        );
+
+        app.apply_subagent_writes(&[shown]);
+        assert!(
+            !app.has_preview_selection(),
+            "a write to the viewed transcript clears it"
+        );
+    }
+
+    /// The view's state is its RENDER's verdict on whether the run ended, over
+    /// the record's own `ended` — even one that says otherwise — which it falls
+    /// back to whenever the render has no verdict (none is cached yet, or it is
+    /// the unreadable one): a write to the transcript evicts the render and its
+    /// verdict with it, and the next render judges the new content. Asking
+    /// reads nothing: the one read is the render's. Outside the view, or for a
+    /// subagent the record does not list, there is no state.
+    #[test]
+    fn the_subagent_views_state_is_its_renders_verdict_and_goes_with_each_eviction() {
+        use crate::store::subagents::{subagents_dir, transcript_path};
+        use SubagentStatus::{Finished, Quiet, Running};
+
+        // A run waiting on the sub-subagent it launched, then the same run
+        // handing back: the last turn a hand-back answered.
+        const LAUNCHED: &str = concat!(
+            r#"{"type":"user","isSidechain":true,"message":{"role":"user","content":"Go."}}"#,
+            "\n",
+            r#"{"type":"assistant","isSidechain":true,"message":{"role":"assistant","content":"#,
+            r#"[{"type":"tool_use","id":"toolu_a","name":"Agent","input":{}}]}}"#,
+            "\n",
+        );
+        const HANDED_BACK: &str = concat!(
+            r#"{"type":"assistant","isSidechain":true,"message":{"role":"assistant","content":"#,
+            r#"[{"type":"tool_use","id":"toolu_h","name":"SubagentHandback","input":{}}]}}"#,
+            "\n",
+            r#"{"type":"user","isSidechain":true,"message":{"role":"user","content":"#,
+            r#"[{"type":"tool_result","tool_use_id":"toolu_h","content":"ok"}]}}"#,
+            "\n",
+        );
+        let root = unique_temp_dir("subagent-view-status");
+        let mut session = delegation_session("s1");
+        session.file = root.join("s1.jsonl");
+        std::fs::write(&session.file, "{}\n").expect("write the session");
+        let dir = subagents_dir(&session.file).expect("a subagents dir");
+        std::fs::create_dir_all(&dir).expect("create the subagents dir");
+        let transcript = transcript_path(&dir, DELEGATION_AGENT.0);
+        std::fs::write(&transcript, LAUNCHED).expect("write it");
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let mut app = app_all(vec![session]);
+        app.apply_subagent_record(
+            "s1",
+            SubagentRecord::new(vec![Subagent {
+                agent_id: DELEGATION_AGENT.0.to_string(),
+                agent_type: DELEGATION_AGENT.1.to_string(),
+                description: None,
+                launched: None,
+                newest_write: Some(at - Duration::from_secs(30)),
+                // A tail the record never read, so its own answer is neither
+                // verdict a render can give.
+                ended: None,
+            }]),
+        );
+        app.note_wall_clock(at);
+        assert_eq!(app.subagent_view_status(), None, "no view");
+
+        open_delegation_view(&mut app);
+        assert_eq!(
+            app.subagent_view_status(),
+            Some(Quiet),
+            "no render: the record's"
+        );
+        app.preview_text(DELEGATION_WIDTH);
+        assert_eq!(
+            app.subagent_view_status(),
+            Some(Running),
+            "the render's: open"
+        );
+        let renders = app.subagent_renders();
+
+        std::fs::write(&transcript, format!("{LAUNCHED}{HANDED_BACK}")).expect("hand back");
+        let write = delegation_write(&app);
+        app.apply_subagent_writes(&[write]);
+        assert_eq!(
+            app.subagent_view_status(),
+            Some(Quiet),
+            "the verdict went with the render"
+        );
+        app.preview_text(DELEGATION_WIDTH);
+        assert_eq!(app.subagent_view_status(), Some(Finished), "judged again");
+        let stale = Subagent {
+            ended: Some(false),
+            ..app.viewed_subagent().expect("listed").clone()
+        };
+        app.apply_subagent_record("s1", SubagentRecord::new(vec![stale]));
+        assert_eq!(
+            app.subagent_view_status(),
+            Some(Finished),
+            "the render's verdict over a record that says otherwise"
+        );
+        assert_eq!(
+            app.subagent_renders(),
+            renders + 1,
+            "the one read is the render's"
+        );
+
+        app.open_subagent_view("f0f0f0f0f0f0f0f0f", "unlisted");
+        app.preview_text(DELEGATION_WIDTH);
+        assert_eq!(
+            app.subagent_view_status(),
+            None,
+            "the record does not list it"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // --- injected-context node: the same fold, and search skips its body ----
 
     /// The command-started fixture: its `/review-branch` skill body is an
@@ -8677,7 +9750,7 @@ mod tests {
         app.preview_scroll = 2;
         let (before_map, folds) = app
             .preview_hit_context(COMMAND_WIDTH)
-            .map(|(map, _lines, _links, folds)| (map.to_vec(), folds.to_vec()))
+            .map(|(map, _lines, _links, folds, _)| (map.to_vec(), folds.to_vec()))
             .expect("the fixture session is selected, so it has a preview");
         let region = folds
             .iter()
@@ -8689,7 +9762,7 @@ mod tests {
         app.toggle_peer_fold(SKILL_BODY_KEY, COMMAND_WIDTH);
         let (open_map, open_folds) = app
             .preview_hit_context(COMMAND_WIDTH)
-            .map(|(map, _lines, _links, folds)| (map.to_vec(), folds.to_vec()))
+            .map(|(map, _lines, _links, folds, _)| (map.to_vec(), folds.to_vec()))
             .expect("the fixture session is selected, so it has a preview");
         assert!(
             open_map.last() > before_map.last(),
@@ -13264,10 +14337,11 @@ mod tests {
     /// has already closed and no keyboard owner is left.
     ///
     /// It owns the PANE: while the card is drawn the transcript is not, so the
-    /// cached link AND fold regions describe text no longer on screen and a
-    /// click resolved against them would open a link or toggle a fold in a
-    /// session the user cannot see, while a drag would select the placeholder
-    /// card. That window is exactly the one the editor no longer covers.
+    /// cached link, fold AND delegation-line regions describe text no longer on
+    /// screen and a click resolved against them would open a link, toggle a fold
+    /// or switch to a subagent in a session the user cannot see, while a drag
+    /// would select the placeholder card. That window is exactly the one the
+    /// editor no longer covers.
     #[test]
     fn an_in_flight_draft_card_still_gates_the_mouse() {
         let mut app = app_all(vec![session("s", "r", Some("main"), "/tmp/s")]);
