@@ -560,8 +560,23 @@ fn run_inner(
     // one that has already landed.
     // Anything queued later is picked up by the next `Tick`.
     update::replay_undelivered(app, store);
+    // The selected session's subagents, read OFF the UI thread by ONE long-lived
+    // worker for this board session, where the newest request replaces any it has
+    // not started (`watch::SubagentRefresh`). Its handle drops with this function,
+    // which ends the worker. Untested for the same accepted reason as the spawns
+    // above.
+    let subagent_refresh = events.spawn_subagent_refresh();
 
     let outcome = loop {
+        // Ask for the selected session's subagents whenever the selection moved or
+        // a watcher batch wrote under its `subagents/` dir — at board entry and
+        // after EVERY wake-up, so no route that moves the selection (a key, the
+        // wheel, a search keystroke, a reload) can be missed. The DECISION is
+        // `App::take_subagent_refresh`'s, pure and tested; the read is the
+        // worker's, and lands as one `AppEvent::SubagentRuns` on this channel.
+        if let Some((session_id, session_file)) = app.take_subagent_refresh() {
+            subagent_refresh.request(session_id, session_file);
+        }
         terminal.draw(|frame| view::render(frame, app))?;
         // Block for the next event — unless a preview drag is held past the
         // transcript's edge, when the wait gets a deadline (`app::AUTOSCROLL_FRAME`

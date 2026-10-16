@@ -26,8 +26,8 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 
 | Key | Action |
 | --- | ------ |
-| `↑` / `↓` | Move the selection |
-| `←` / `→` | Move the **cursor in your search** one character, to fix a typo without retyping the rest. The list and the preview stay where they are |
+| `↑` / `↓` | Move the selection. While the preview shows a subagent's transcript, `↑` takes you back to the session's own instead (the `↑` row below) |
+| `←` / `→` | Move the **cursor in your search** one character, to fix a typo without retyping the rest. The list and the preview stay where they are. While the preview shows a subagent's transcript they step through the session's subagents instead (the `←` / `→` row below) |
 | `Alt+←` / `Alt+→` (`⌥←` / `⌥→`) / `Alt+B` / `Alt+F` / `Ctrl-←` / `Ctrl-→` | Move the **cursor in your search** one **word**, landing where a word jump in the reply box does: forward goes to the start of the next word. Depending on the terminal, `⌥←` / `⌥→` arrives as `Alt+←` / `Alt+→` or as `Alt+B` / `Alt+F`, so both are bound; `Ctrl-←` / `Ctrl-→` does the same without Option. The list and the preview stay where they are |
 | `Enter` | **Resume** the selected session, returning to the board when it exits. On a **running** session it opens an **Attach / Fork / Cancel** choice instead. A session snapback is still sending a quick reply to, or still making as a fork from the `Ctrl-F` box's `Enter` (its preview reads `claude cooking…`), is refused until that lands — the session the fork came from resumes as usual. A session snapback is still moving (`Ctrl-X w`, the row reads `moving…`) is refused until the move finishes |
 | `Ctrl-F` | **Fork** the selected session into a copy — available for any session, running or not, except one snapback is still moving (`Ctrl-X w`), which is refused until the move finishes. Opens a fork box (after a folder check: a deleted folder is refused before you type). `Enter` forks it **without leaving the board**, like a quick reply, and when the fork appears the cursor opens its fold and jumps to it if you haven't moved and nothing else is open (another box, a picker or a prompt); `Ctrl-O` forks it **interactively** (an empty box is the plain fork; a typed message auto-submits as the fork's first turn); `Ctrl-L` picks the model for that fork; `Ctrl-J` / `Alt+Enter` newline; `Esc` cancels; a `/` or `@` opens the pick list (the `/` or `@` row below). Either way the fork is **named** `fork: <first line of your message>` (`fork: <the session's label>` for an empty box) and folds under the session it came from, which stays the row on top (see *Fork without leaving the board* and *Forks you make stay under the session you forked*). The headless fork can't answer permission prompts, like a quick reply |
@@ -37,7 +37,9 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | `Ctrl-L` (in a reply, fork or draft box) | **Pick the model** — and, with `←` / `→`, its **effort** — for **this message only**. The box's bottom border names what it will run on: a reply or fork says `model: session (Opus 5.5)`, the model that session last answered with, which Claude Code normally keeps on its own; a draft says `model: default (opus[1m]) (new sessions only)` when your Claude Code settings name a model. Either says plain `model: default` when there is nothing to name. `--model` / `--effort` are sent only when you pick something; the picker's first row goes back to the default. Every new box starts at the default, and nothing is remembered. `Enter` resume, the Attach / Fork choice, Attach and the `Ctrl-X w` move never send a model |
 | `/` or `@` (in a reply, fork or draft box) | **Pick a skill, command, file or agent** — the same list in a `Ctrl-R` reply, a `Ctrl-F` fork and a `Ctrl-N` draft. `/` as the very first character lists the skills and commands Claude Code offers in that folder, built-in ones included; `@` at the start of a word lists files and folders (`@src/tu` narrows inside `src/`; once you type a letter the list also reaches files in deeper folders, so `@disc` finds `src/store/discover.rs`) and, for a top-level `@`, the folder's agents, inserted as `@agent-<name>`. A skill, command or agent shows its description on the right. The letters you type narrow the list to what holds them anywhere in its name or, for a skill, command or agent, its description, matched like the search box (an uppercase letter matches exactly) and highlighted the same way. `-`, `_` and `.` split what you type into parts that match in any order, so `@site-stor` finds `src/modules/sitemaps/sitemaps-storage.service.ts`; each part is still matched as typed, never fuzzily. A `/` lists the folder it names first; when that lists nothing (no such folder, or nothing in it matches), `/` splits parts too and the whole path is searched from the top, so `@modules/site-stor` finds the same file and picking it writes its full path. Names that start with them come first, then other name matches, then description matches, with files and folders above agents; a file or folder whose name starts with `.` shows only once you type its leading `.`. While it is open `↑` / `↓` choose, `Enter` or `Tab` picks (a folder reopens the list one level down), and `Esc` closes only the list — never the draft; with no list open `Enter` and `Esc` do what the box's own row says. Where the list comes from is under *Quick reply without leaving the board* |
 | `Ctrl-K` | **Stop / interrupt** the selected session's live agent. On a background agent it runs `claude stop`: one whose run is over (`done`, `stopped`, `failed`) stops immediately; every other live agent (`working`, `needs input`, `idle`, `interrupted`, unrecognized) confirms first, since stopping ends the live job (its conversation is kept). A session with no background job (a `live` one, typically) has no job to stop, so if Claude Code reports a process id for it, `Ctrl-K` offers to send that process a **SIGTERM** instead: the confirmation shows the pid, and nothing is sent unless Claude Code still reports that same pid when you press `Enter`. A session that isn't running as an agent has nothing to stop, and neither does one Claude Code reports with no job and no process id that can be signalled |
-| `Ctrl-X` then `x` / `d` / `h` / `r` / `y` / `f` / `w` | **Leader chord** that acts on the selected row (`x`, `d`, `y`, `f`, `w`) or on the whole board (`h`, `r`) — `x` **hides** the selected session (reversible, persisted) — from a row that shows a stack (a `(+N)` row, or an open stack's top row with `↳` copies under it), that row and the copies it shows; from any other row, just that session — `d` **hard-deletes** it after a confirmation that, on a stack's top row, can also take the whole stack, `h` toggles **show hidden**, `r` **re-reads every transcript from disk**, `y` is **copy session ID**: the selected session's full id goes to your clipboard and shows on the status line, `f` **folds** / **expands** a stack of look-alike rows that are really one conversation — a row marked `(+N)` stands for `N` more; `f` opens it, and folds it back from any of its rows, `w` **moves** the session to another worktree of this project (the main folder included, the session's own folder left out) without leaving the board — from a stack's top row, that session or the whole stack. Any other key cancels the chord |
+| `Ctrl-X` then `x` / `d` / `h` / `r` / `y` / `f` / `w` / `↓` | **Leader chord** that acts on the selected row (`x`, `d`, `y`, `f`, `w`, `↓`) or on the whole board (`h`, `r`) — `x` **hides** the selected session (reversible, persisted) — from a row that shows a stack (a `(+N)` row, or an open stack's top row with `↳` copies under it), that row and the copies it shows; from any other row, just that session — `d` **hard-deletes** it after a confirmation that, on a stack's top row, can also take the whole stack, `h` toggles **show hidden**, `r` **re-reads every transcript from disk**, `y` is **copy session ID**: the selected session's full id goes to your clipboard and shows on the status line, `f` **folds** / **expands** a stack of look-alike rows that are really one conversation — a row marked `(+N)` stands for `N` more; `f` opens it, and folds it back from any of its rows, `w` **moves** the session to another worktree of this project (the main folder included, the session's own folder left out) without leaving the board — from a stack's top row, that session or the whole stack, `↓` **shows a subagent's transcript** in the preview — the first one still running, else the one written most recently — and, pressed again, goes back (see *Hide, delete, copy, fold & move*). Any other key cancels the chord |
+| `←` / `→` (in a subagent's transcript) | **Step to the previous / next subagent** of the session, in the order they were launched, wrapping round at both ends — every one it launched, finished ones too. The preview's title ends with which one of how many (`… · 2/5`). They do this even with a search typed: it is the one thing the search box gives up while a subagent is on screen, and `Alt+←` / `Alt+→` or `Ctrl-←` / `Ctrl-→` still move its cursor a word. A subagent you opened from its line before snapback had read it counts as the newest: `→` goes to the first, `←` to the last. Until the session's subagents are read, or when it has none, the status line says so |
+| `↑` (in a subagent's transcript) | **Go back to the session's own transcript**, where you were reading, on the same row — what `Esc` does there, and straight back to the session from a subagent another one launched. Unlike `Esc` it leaves a search you typed as it is. `Shift-↑` does the same there, since nothing in a subagent's transcript is marked. `↓` still moves to the next row, which leaves the subagent's transcript too |
 | `←` / `→` (in the model picker) | **Step the highlighted model's effort** down / up: `default effort` (no `--effort`, your settings decide) → `low` → `medium` → `high` → `xhigh` → `max`, wrapping round both ways. `Enter` sets the model and the effort together into the box; `Esc` goes back to the box with your text and its previous choice untouched. They do nothing on the picker's first (default) row, and nothing in the agent picker or the move picker — and inside any picker they never move the search cursor on the board underneath |
 | `Tab` | Toggle search: **name-only ↔ name+content**. Widening to content also opens the preview on the most recent match, the same way typing does |
 | `Ctrl-A` | Flip scope: **current folder ↔ project** — the project being the repo you launched in and all of its git worktrees. Started with `-a` it is a three-stop cycle instead (current folder → project → all folders), which is the only way to reach all folders |
@@ -45,17 +47,18 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | `PgUp` / `PgDn` | Scroll the preview a full page |
 | `Ctrl-U` / `Ctrl-D` | Scroll the preview a quarter page |
 | `Ctrl-T` / `Ctrl-E`, `Home` / `End` | Jump the preview to the top / bottom. Every preview scroll key (`PgUp` / `PgDn`, `Ctrl-U` / `Ctrl-D`, `Ctrl-T` / `Ctrl-E`, `Home` / `End`) also works while a quick-reply or fork box is open and leaves your text and cursor alone; there they replace the editor's own meaning (`Ctrl-U` delete to line start, `Ctrl-D` delete forward, `Ctrl-E` / `Home` / `End` / `PgUp` / `PgDn` caret moves — the arrows and `Ctrl-A` / `Ctrl-F` / `Ctrl-B` still move it). A new-session draft keeps all of them as editor keys, since its pane shows no transcript (on a MacBook keyboard without dedicated `Home`/`End` keys, `fn+←` / `fn+→` reach the same two) |
-| `Shift-↑` / `Shift-↓` | Walk the preview through the lines your query marks — previous / next. Only bound while something IS marked in the previewed transcript; with nothing marked they stay plain **move the selection**, so they never take a key away from you (and a terminal that swallows the modifier still moves). One stop per marked **line**, not per occurrence: a line saying your query twice is marked twice and stopped at once |
+| `Shift-↑` / `Shift-↓` | Walk the preview through the lines your query marks — previous / next. Only bound while something IS marked in the previewed transcript; with nothing marked they stay plain `↑` / `↓` — **move the selection**, or in a subagent's transcript, which is never marked, `↑` goes back — so they never take a key away from you (and a terminal that swallows the modifier still gets the plain key). One stop per marked **line**, not per occurrence: a line saying your query twice is marked twice and stopped at once |
 | mouse wheel | Scroll the pane under the pointer — except while a compose or draft box is open, when the session list stops taking notches: a wheel over it does **nothing**, so the session you are writing to can never slide out from under you. Everywhere else it is unchanged, and a notch anywhere but the list still scrolls the transcript |
-| drag inside the preview | Select transcript text (in reading order, like your terminal's own selection, but only the transcript's drawn text — never the empty space right of a line, and never the session list beside it) and copy it to the clipboard when you let go. Hold the drag past the preview's top or bottom edge and it keeps scrolling that way — faster the further past the edge you hold it — with the selection growing until you let go, so it can copy far more than one screen. A drag over empty space alone copies nothing. A drag that starts on a link or a folded node selects it rather than opening or unfolding it. Works while a reply or fork box is open — it neither moves your cursor nor touches what you typed — but not while a new-session draft is, whose placeholder replaces the transcript; and never from the pinned row at the top of the pane |
-| double-click in the preview | Select the **word** under the pointer and copy it when you let go, exactly as a drag copies. Two clicks on the same cell within half a second; words follow Unicode word boundaries, so `view.rs`, `don't` and `snake_case` are one word but `sess-link` is two, and paths and URLs split at their punctuation. The first click still does what a click does — opens a link, or unfolds a folded node — and the second only selects, so a node you double-click is unfolded once and stays open. Double-clicking blank space copies nothing; a quick third click keeps the word. Works while a reply or fork box is open, like a drag |
+| drag inside the preview | Select transcript text (in reading order, like your terminal's own selection, but only the transcript's drawn text — never the empty space right of a line, and never the session list beside it) and copy it to the clipboard when you let go. Hold the drag past the preview's top or bottom edge and it keeps scrolling that way — faster the further past the edge you hold it — with the selection growing until you let go, so it can copy far more than one screen. A drag over empty space alone copies nothing. A drag that starts on a link, a folded node or a `◆ delegated to @…` line selects it rather than opening, unfolding or switching to it. Works while a reply or fork box is open — it neither moves your cursor nor touches what you typed — but not while a new-session draft is, whose placeholder replaces the transcript; and never from the pinned row at the top of the pane |
+| double-click in the preview | Select the **word** under the pointer and copy it when you let go, exactly as a drag copies. Two clicks on the same cell within half a second; words follow Unicode word boundaries, so `view.rs`, `don't` and `snake_case` are one word but `sess-link` is two, and paths and URLs split at their punctuation. The first click still does what a click does — opens a link, unfolds a folded node, or switches to a subagent's transcript — and the second only selects, so a node you double-click is unfolded once and stays open. Double-clicking blank space copies nothing; a quick third click keeps the word. Works while a reply or fork box is open, like a drag |
 | click a preview link | Open its url in your browser — when you let go, so a drag that starts on a link selects it instead. `http`/`https` only: a link of any other scheme opens **nothing** and instead reports a refusal on the status line that names the link (`not opening <url> - only http/https links open`), so an underlined label that quietly does nothing never leaves you guessing which of the two happened. That refusal is **sticky** — it stays up until your next actionable keypress. Works while a reply or fork box is open |
 | click a folded node | Unfold it where it sits — when you let go, like a link — and click it again to fold it back. Two kinds of turn arrive folded to one line: a subagent's hand-back — the `◆ message from @…` node, otherwise ~95 rows of `<agent-message>` frame attributed to **you** — and context Claude Code added on your behalf, such as the instructions a skill or slash command expands into — the `◇ added by claude code` node, otherwise often thousands of rows, also attributed to **you**. Folded each costs one line, and its text is still one click away. Which nodes you left open is remembered for this run only — snapback writes nothing for it. Works while a reply or fork box is open |
+| click a `◆ delegated to @…` line | **Switch the preview to that subagent's own transcript** — when you let go, like a link. Each subagent Claude launched shows as one such line where a bare `[tool_use: Agent]` used to be. The pane's title then names the subagent and says how it stands (see *Readable transcript preview*), it opens at the subagent's newest turn, and a `◆ delegated to @…` line inside it switches to the subagent *that* one launched. `↑` or `Esc` takes you back to the session's own transcript, where you were reading; `Ctrl-X ↓`, moving to another row, `Ctrl-R` and `Ctrl-F` take you back too. Not while a reply or fork box is open — the box sends into the session, so its transcript stays on screen and the status line says so |
 | `Backspace` | Delete the query character before the cursor |
 | `Alt+Backspace` (`⌥⌫`) / `Ctrl-W` / `Alt+H` | Delete the query **word** before the cursor — one whole search term, so a path or a branch name goes in a single press instead of character by character (`Backspace` alone still takes one character); whatever follows the cursor stays. All three keys do the same thing, because which of them your terminal actually sends depends on how it treats **Option**; they are also the same three the reply, fork and draft boxes word-delete on, so the gesture is bound wherever you type. What a press *cuts* differs on purpose: on the board it takes a whole search term, so `feature/fold-fork-lineages` goes in one press, while in a reply, fork or draft box the cut stops at punctuation and takes only `lineages` |
 | any printable char | Type to search, at the cursor |
 | paste (`Cmd`/`Ctrl-V`, middle-click) | Your terminal's own paste, taken as **text**: into a compose or draft box at the cursor, **newlines intact** (no more sending just the first line); on the board, into the query at its cursor with newlines as spaces. It never sends, resumes, or confirms |
-| `Esc` | Clear the search query; with nothing typed, quit |
+| `Esc` | Clear the search query; with nothing typed, leave a subagent's transcript for the session's own; with neither, quit |
 | `Ctrl-C` | Quit (always) |
 
 The `Ctrl-X y` copy goes through your OS clipboard tool — `pbcopy` on macOS;
@@ -67,9 +70,10 @@ escape, which reaches your clipboard only if the terminal — and tmux, via
 `Sent session ID …`, never `Copied`. Either way the full id stays on the status
 line until your next key, so you can select it by hand.
 
-Mouse mode is on so the wheel can scroll, a preview link can be clicked open and
-a folded node clicked to unfold — each click acting when you let go, since only
-then is it a click rather than the start of a drag.
+Mouse mode is on so the wheel can scroll, a preview link can be clicked open, a
+folded node clicked to unfold and a `◆ delegated to @…` line clicked to show its
+subagent's transcript — each click acting when you let go, since only then is it
+a click rather than the start of a drag.
 **Drag inside the preview** to select transcript text — the selection is
 reverse-videoed and copied to your clipboard on release, the same way `Ctrl-X y`
 copies: through your OS clipboard tool, or over SSH as an OSC 52 escape. Only
@@ -182,9 +186,10 @@ until you position the pane yourself. Scroll it, jump to a match, or press `Home
 back down onto the newest turn, which parks the pane there rather than
 resubscribing it. `End` (or `Ctrl-E`) is how you hand it back. Until you do, only
 selecting a row, typing, `Tab`, `Shift-↑` / `Shift-↓`, bringing the pane back
-from the `1:0` layout, or a quick reply of your own finishing moves it, never an
-autorefresh. Changing the layout between the other stops keeps your place: the
-line at the top of the pane stays at the top at the new width.
+from the `1:0` layout, switching to a subagent's transcript or back, or a quick
+reply of your own finishing moves it, never an autorefresh. Changing the layout
+between the other stops keeps your place: the line at the top of the pane stays
+at the top at the new width.
 
 **Autorefresh.** The list keeps itself current as you work: new sessions appear,
 finished ones update, deleted ones drop out — all in place, with your selection
@@ -251,8 +256,12 @@ that lands after later turns names the latest of them, and a peer message that
 follows a `▶ you` turn names that turn. The `◆ message from …` line that opens
 the message is what names its sender. The same goes for context Claude Code added
 on your behalf, the `◇ added by claude code` line: it is not a turn either and has
-no marker, so inside an opened one the pinned row names the turn above it. The
-row steps aside only while something else holds the pane: a quick reply you sent
+no marker, so inside an opened one the pinned row names the turn above it. While
+the preview shows a subagent's transcript, switched to from its
+`◆ delegated to @…` line, `Ctrl-X ↓` or `←` / `→`, the pinned row names the
+subagent's own `▶ prompt` or `● claude` turn at the top of the pane, and nothing
+of the session's — no status, no failed task. The row steps
+aside only while something else holds the pane: a quick reply you sent
 to that session is still in flight, when the reply's own turns take its place at
 the bottom of the transcript, or a `Ctrl-N` draft has replaced the transcript
 altogether. And it gives way to one
@@ -538,7 +547,7 @@ empty box), which is what keeps it under the session it came from.
 
 **Hide, delete, copy, fold & move.** `Ctrl-X` is a leader chord that acts on the
 selected row or on the whole board: press it, and a hint shows the follow-ups —
-`x`, `d`, `h`, `r`, `y`, `f`, `w` — while any other key cancels.
+`x`, `d`, `h`, `r`, `y`, `f`, `w`, `↓` — while any other key cancels.
 
 - `Ctrl-X x` **hides** the selected session. This is the reversible default: the
   session stays on disk, it just drops off the board. On a row that shows a stack
@@ -627,6 +636,20 @@ selected row or on the whole board: press it, and a hint shows the follow-ups �
   **Move lineage** run hadn't got to. Nothing reports how it went: the next time
   you open snapback, each session shows in the folder it is really in, and you
   can move the rest again.
+- `Ctrl-X ↓` **shows a subagent's own transcript** in the preview, exactly as a
+  click on its `◆ delegated to @…` line does: the first one still **running** —
+  not finished, and it or a subagent it launched wrote in the last 10 minutes —
+  else the one written most recently. `←` / `→` then step through every
+  subagent the session launched, at any depth and finished ones included, in
+  the order they were launched, wrapping round at both ends; the preview's title
+  ends with which one of how many (`… · 2/5`). `↑`, `Esc`, or
+  `Ctrl-X ↓` again, takes you back to the session's own transcript, and a search
+  you typed stays as it was. snapback reads the selected session's subagents in
+  the background whenever you move to another row or one of them writes, so the
+  key never waits on a session with hundreds of them; until that read lands, or
+  for a session that launched none, the status line says so. The ones still
+  running are listed at the foot of the preview, under a rule that carries a
+  `^X ↓ explore` hint (see *Readable transcript preview*).
 - `Ctrl-X d` **hard-deletes** the selected session — physically removing its
   transcript from disk. Because that is irreversible, it asks first with a
   confirmation prompt (defaulted to Cancel). On a stack's top row the prompt
@@ -800,6 +823,45 @@ line — it is that agent's report, not something you said — and context Claud
 Code added on your behalf (the instructions a skill or slash command expands
 into, a command's caveat) to a single `◇ added by claude code` line; either opens
 where it sits on a click.
+Each subagent Claude launched shows as a
+`◆ delegated to @<agent> · <what it was asked> · (click to view)` line where a
+bare `[tool_use: Agent]` used to be, and a click switches the preview to that
+subagent's **own transcript**: the brief it was given under `▶ prompt`, its work
+under `● claude`, and any subagent it launched in turn as a line that switches to
+that one. `Ctrl-X ↓` switches the same way without finding its line first — to
+the first subagent still running, else the one written most recently — and
+`←` / `→` then step through all of them in the order they were launched. The
+pane's title
+names the subagent, so it never passes for your session, and once snapback has
+read the session's subagents it says how that one stands too: what it was asked,
+whether it is **running** (green), **finished**, or **quiet** (gray: not
+finished, but neither it nor a subagent it launched wrote in the last 10
+minutes), when it started — a time on its own today, with the date on another
+day, as a turn's is — how long ago it last wrote, and which one of how many it
+is:
+`subagent @parser-auditor · Audit the parser · finished · started 23:50 · last write 2h ago · 2/5`.
+Whatever snapback doesn't know is left out; on a narrow pane what it was asked is
+cut first, then the last write, then the start time. `↑` or `Esc` takes you
+back to the session's own transcript where you were reading. The transcript
+updates as the subagent writes it, the way a running session's own does. Its
+text is not searched or marked — content search reads the session's own
+transcript — and a launch whose subagent left no record beside the session,
+such as one a fork copied, keeps its plain `[tool_use: …]` line.
+While the selected session has subagents **running** — not finished, and it or a
+subagent it launched wrote in the last 10 minutes — the foot of the preview lists
+them under a dim rule that carries a `^X ↓ explore` hint,
+`── ^X ↓ explore ──────`, one per row and set in by a column, in the order they
+were launched: `● @parser-auditor · Audit the parser · 2m ago`, its agent, what
+it was asked and how long ago it, or a subagent it launched, last wrote. A
+subagent leaves the list once it finishes or goes quiet, and a new one joins
+when it first writes — now and then only at its next write. Past five, a
+`+N more` line counts the rest; in a short pane the list shrinks to the rule
+alone, which then reads `── ● 3 running · ^X ↓ explore ──`; on a narrow one a
+long description is cut first. While a subagent's transcript is on screen its
+row is highlighted and the rule's hint reads `←/→ switch · ↑/Esc back`. The rows
+come off the bottom of the transcript only while something runs, the list steps
+aside while a reply box, a fork box or a `Ctrl-N` draft holds the preview, and
+clicking it does nothing.
 Dragging over the transcript selects and copies just the transcript text — hold
 the drag past the pane's edge and it scrolls on, so the copy can span many
 screens; double-clicking a word copies that word.

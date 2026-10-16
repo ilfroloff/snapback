@@ -1,0 +1,1 @@
+{"agentType":"fixture-reviewer","description":"Review malformed fixtures","toolUseId":"toolu_delegation_nested","parentAgentId":"a1b2c3d4e5f6a7b8c","spawnDepth":2,"requestShape":"foreground","requestNonInteractive":true}

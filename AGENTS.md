@@ -30,7 +30,16 @@ one place.
   where a bad file is "no value from this file", never an error. Same for
   claude's workspace-trust record (`~/.claude.json` `projects`), whose direction
   is UNTRUSTED: a missing, unreadable or malformed record, or an unknown folder,
-  is untrusted, never trusted. A `claude agents --json` probe that cannot answer
+  is untrusted, never trusted. Same for the subagent meta files
+  (`agent-<id>.meta.json`) `store::subagents` reads, whose direction is the
+  launch's plain `[tool_use: …]` marker: a missing, unreadable, oversized,
+  non-regular or malformed one only leaves that launch without its
+  `◆ delegated to …` line and out of the selected session's subagent record (the
+  `Ctrl-X ↓` target, the `←`/`→` steps, the running list). A subagent
+  transcript tail the background refresh cannot read or parse reads as a run
+  that has not ended, and a head with no readable timestamp as an unknown launch
+  time.
+  A `claude agents --json` probe that cannot answer
   reads as "not live" everywhere but the `Ctrl-X w` move, which REFUSES
   ([PATTERNS.md §1](docs/agents/PATTERNS.md#1-fail-soft-over-external-input)).
   (`src/store/*`, `src/agents.rs`, `src/claude_catalog.rs`,
@@ -48,9 +57,36 @@ one place.
   sibling `store::discover::store_depth` answers the other half — WHICH LEVEL a
   path sits at — for the watcher, which must react to each level separately.
   Those two own the shape between them: the depth literals exist in exactly one
-  `match`, and no consumer counts path components itself.
-  NEVER descend into `<id>/subagents/`. Do not make discovery recursive.
-  (`src/store/discover.rs`, `src/watch.rs`)
+  `match`, and no consumer counts path components itself. A THIRD check,
+  `store::discover::subagent_transcript_at`, lives beside them and is DERIVED,
+  never a depth of its own: it names a subagent TRANSCRIPT,
+  `<id>/subagents/agent-*.jsonl`, only when its launching session passes
+  `is_session_path` and the file sits in that session's own `subagents/` dir
+  under a name `store::subagents` reads.
+  Discovery and the content index NEVER descend into `<id>/subagents/`, and the
+  watcher never reloads for anything there. Do not make discovery recursive.
+  The watcher passes a write to a subagent transcript on as an event of its own
+  (`AppEvent::SubagentsWritten`): never a session reload, never touching the
+  board's idle clock, and it reads no file for it. EXACTLY ONE reader is
+  sanctioned there, PARENT-SCOPED and DISPLAY-ONLY: `store::subagents`, which
+  lists ONE session's own `<id>/subagents/` for its `agent-<id>.meta.json` files
+  (`index_for`, once per preview render and once per background refresh), opens a
+  sibling `agent-<id>.jsonl` whole only to render the SUBAGENT VIEW
+  (`open_transcript`) — which a CLICK on that launch's delegation line,
+  `Ctrl-X ↓` or a `←`/`→` step inside the view alone opens, never a search step —
+  once it opens and again after each eviction of that render while it stays up (a
+  write the watcher reports to that transcript is one; the mechanism below lists
+  them all), and, for the SELECTED session's subagent record (`read_record`, on
+  the background refresh's worker; that session's dir alone), stats each listed
+  transcript, reads a bounded head of it for its launch time and — only when it,
+  or a subagent below it, wrote within `RUNNING_WINDOW` — its END. Nothing it
+  reads feeds
+  discovery, the watcher, the content index, resume, fork, delete or move, or
+  becomes a board row; do not add a second reader. Mechanism:
+  [DOMAIN.md](docs/agents/DOMAIN.md#delegation-line-and-subagent-view-storepreview)
+  and its
+  [subagent record](docs/agents/DOMAIN.md#subagent-record-and-running-list-storesubagents).
+  (`src/store/discover.rs`, `src/watch.rs`, `src/store/subagents.rs`)
 - **THE PARSE CACHE NEVER DECIDES WHICH FILES EXIST — OR WHETHER A FILE IS A
   SESSION IT COULD NOT READ.** `SessionStore` reuses the parse of a file whose
   `(mtime, len)` stamp did not move, so it may leave a row STALE; it must never
@@ -223,7 +259,9 @@ one place.
   their own threads and deliver `AppEvent`s; the render loop never blocks. The
   watcher filters each debounce batch through the SUBAGENT-EXCLUSION shape rule
   above — BOTH halves, never a depth of its own — before emitting
-  `SessionsChanged`; the agents poller runs on `AGENTS_REFRESH` (5 s) and skips
+  `SessionsChanged`, and passes the batch's subagent transcript writes on as ONE
+  `SubagentsWritten`, which never stamps the idle clock; the agents poller runs
+  on `AGENTS_REFRESH` (5 s) and skips
   the shell-out once the board has been idle past `AGENTS_IDLE_AFTER` (60 s).
   TWO bounded one-shots are deliberate, documented exceptions (`PATTERNS.md` §6):
   the liveness probe at hand-off, and the worktree resolve at
@@ -233,8 +271,17 @@ one place.
   per folder), the `Ctrl-X w` picker's resolve of the ONE selected session's
   folder, and `Ctrl-X x`'s locked save of the state map are a different,
   keystroke-time class (bounded, never render):
-  `PATTERNS.md` §6 owns them. Work that runs on its OWN thread and reports back
-  with one `AppEvent` is the rule's ordinary case, never a third exception: the
+  `PATTERNS.md` §6 owns them. The preview's cache-miss render reads on the UI
+  thread too — the selected transcript, that session's subagent meta files, and
+  the SUBAGENT VIEW's transcript, which only a click on a `◆ delegated to …`
+  line, `Ctrl-X ↓` or a `←`/`→` step inside the view opens (never a search
+  step): read the first time the pane needs that render after the switch, and
+  again after each eviction of it while the view stays up (each
+  `SubagentsWritten` that names it is one; `PATTERNS.md` §6 points to the full
+  list). `PATTERNS.md` §6
+  classifies it, and `App::ensure_preview` / `ensure_subagent_preview` argue its
+  cost. Work that runs on its OWN thread and reports back with one `AppEvent` is
+  the rule's ordinary case, never a third exception: the
   clipboard copy (`CopyFinished` — `Ctrl-X y`'s id and a preview
   drag-selection alike, ONE path, its tool a THREADED child the driver starts, so
   no keystroke or mouse release waits on it), the `--model` alias probe
@@ -246,9 +293,21 @@ one place.
   probe, trust read and `claude` child all run on the move's own worker, so that
   probe is not the hand-off exception above; a lineage job runs every member's,
   strictly one after another on that ONE worker, each probe right before its own
-  child, never hoisted to one per set) are all that shape.
+  child, never hoisted to one per set) are all that shape, and so is the
+  selected session's RECURRING subagent refresh (`SubagentRuns`, one per request
+  it reads): ONE long-lived worker per board session, ended by dropping its
+  handle, on which the newest request replaces any it has not started. The
+  driver requests it whenever the pure `App::take_subagent_refresh` says so — at
+  board entry, on each change of the selected session, and on each
+  `SubagentsWritten` under that session's `subagents/` — and it reads that one
+  dir stat-first: every meta file, each transcript's mtime and first timestamped
+  record, and the tail only of those that can be running — written within
+  `RUNNING_WINDOW`, themselves or through a subagent below them.
+  `Ctrl-X ↓`, `←`/`→` and the running list read no file: they ask the record it
+  landed.
   (`src/watch.rs`, `src/worktrees.rs`, `src/tui/clipboard.rs`,
-  `src/claude_catalog.rs`, `src/claude_trust.rs`, `src/claude_move.rs`)
+  `src/claude_catalog.rs`, `src/claude_trust.rs`, `src/claude_move.rs`,
+  `src/store/subagents.rs`)
 - **PURE, GIT-FREE STORE CORE.** `src/store/*` decides everything from the bytes
   it was given: `repo_of`'s worktree collapse is a pure string heuristic, and NO
   module under `src/store/` may shell out (to `git` or anything else) or read
@@ -266,11 +325,13 @@ one place.
   `src/watch.rs`, `src/worktrees.rs`)
 - **KEEP KEY DOCS IN SYNC.** A key/flag change must update, together: the
   keybinding table in `update.rs`'s module doc; `USAGE`/`KEYS` in `cli.rs`; the
-  help line and the draft card in `view.rs` (EVERY key string that renders there:
-  the board keymap, `chord_hint`'s which-key list, `compose_hint`'s reply hint,
-  `FORK_HINT`, `BG_DRAFT_HINT`, and the `COMPLETION_HINT` every compose box shows
-  while the pick list is open; the card's `draft_hint` names `BG_DRAFT_HINT`, or
-  `COMPLETION_HINT` while the list is open); the key map in `docs/GUIDE.md`; and
+  help line, the draft card and the preview's running list in `view.rs` (EVERY
+  key string that renders there: the board keymap, `chord_hint`'s which-key list,
+  `compose_hint`'s reply hint, `FORK_HINT`, `BG_DRAFT_HINT`, and the
+  `COMPLETION_HINT` every compose box shows while the pick list is open; the
+  card's `draft_hint` names `BG_DRAFT_HINT`, or `COMPLETION_HINT` while the list
+  is open; the running list's `RUNNING_LIST_HINT`, or `RUNNING_LIST_VIEW_HINT`
+  in the subagent view); the key map in `docs/GUIDE.md`; and
   any prose enumeration of a key set in `docs/agents/*` (for example,
   PATTERNS.md's follow-bottom re-arm passage). This is the ONE list of those
   surfaces; the other docs point here.

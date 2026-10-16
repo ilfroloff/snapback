@@ -36,14 +36,18 @@ OPTIONS:
     -h, --help     Print this help and exit
 
 KEYS:
-    ↑/↓           move
+    ↑/↓           move. While the preview shows a subagent's transcript ↑ goes
+                  back to the session's own instead, on the same row, a search
+                  kept as typed (Ctrl-X ↓ below)
     Enter         resume (returns to the board on exit). Refused on a session
                   snapback is still sending a reply to, or still making as a
                   fork from the Ctrl-F box's Enter, until it lands (the session
                   a fork came from still resumes), and on one Ctrl-X w is still
                   moving
     ←/→           move the search query's cursor one character (the list and
-                  the preview stay put)
+                  the preview stay put). While the preview shows a subagent's
+                  transcript they step through the session's subagents instead
+                  (Ctrl-X ↓ below)
     Alt+←/→       move the search query's cursor one WORD, as the reply box does
                   (→ lands on the start of the next word). Alt+B/Alt+F and
                   Ctrl+←/→ do the same, so it works whatever your terminal sends
@@ -101,6 +105,16 @@ KEYS:
                   snapback is still replying to, forking or moving, stops at a
                   folder claude does not trust yet, and one line tallies what
                   moved
+                  · ↓ show a subagent's own transcript in the preview, as a
+                  click on its ◆ delegated to line does: the first running one
+                  (unfinished, and it or a subagent it launched wrote in the
+                  last 10 minutes), else the most recently written. ←/→ then
+                  step through all of the session's subagents in launch order,
+                  wrapping round, even with a search typed (Alt+←/→ and
+                  Ctrl+←/→ still move the search cursor a word); the title says
+                  which one of how many (2/5). ↑, Esc, or Ctrl-X ↓ again, goes
+                  back; a search stays as typed. Refused while the session's
+                  subagents are still being read, or when it has none
     Ctrl-R        quick reply — send a one-shot message to the selected session
                   without leaving the board. An agent whose run is over (done,
                   stopped, failed) is stopped first so the reply lands in place;
@@ -173,7 +187,8 @@ KEYS:
                   not their own keys)
     Shift+↑/↓     jump the preview to the previous / next line the query marks.
                   Only while something is marked there — with nothing marked they
-                  stay plain move, so they never take a key away from you. One
+                  stay plain ↑/↓ (a subagent's transcript marks nothing, so there
+                  Shift+↑ goes back), so they never take a key away from you. One
                   stop per marked line, not per repeated word
     wheel         scroll preview / list (mouse mode on). While a compose or draft
                   box is open the list stops taking notches — a wheel over it
@@ -181,16 +196,21 @@ KEYS:
                   away under the pointer. Anywhere else the wheel still scrolls
                   the transcript
     click         in the preview, on release: a folded node (a subagent's
-                  hand-back, or context claude added) unfolds, and a second click
-                  folds it back; otherwise a link opens (http/https only).
-                  Like the drag and double-click below, it works while a reply
-                  or fork box is open
+                  hand-back, or context claude added) unfolds, and a second
+                  click folds it back; a subagent launch, its line reading
+                  ◆ delegated to @agent, switches the preview to that
+                  subagent's own transcript (a launch inside it switches to the
+                  subagent it launched; ↑ or Esc goes back); otherwise a link opens
+                  (http/https only). Like the drag and double-click below, it
+                  works while a reply or fork box is open, except the switch,
+                  which waits until the box is closed
     drag          in the preview: select transcript text; on release it is
                   copied the way Ctrl-X y copies (your clipboard tool, or OSC 52
-                  over SSH). A drag that starts on a node or a link selects it
-                  rather than unfolding or opening it. Hold the drag past the
-                  pane's top or bottom edge and it scrolls that way, faster the
-                  further out, so the selection keeps growing until you let go.
+                  over SSH). A drag that starts on a node, a subagent launch or
+                  a link selects it rather than unfolding, switching to or
+                  opening it. Hold the drag past the pane's top or bottom edge
+                  and it scrolls that way, faster the further out, so the
+                  selection keeps growing until you let go.
                   Works while a reply or fork box is open (it never touches what
                   you are typing); off while a new-session draft is, since its
                   placeholder replaces the transcript. Hold Shift/Option for
@@ -198,8 +218,8 @@ KEYS:
     double-click  in the preview: select the word under the pointer and copy it
                   on release, the same way a drag copies (two clicks on one
                   cell within half a second). The first click still unfolds a
-                  node or opens a link; the second only selects, so a node
-                  double-clicked stays open
+                  node, switches to a subagent or opens a link; the second only
+                  selects, so a node double-clicked stays open
     Backspace     delete the query character before the cursor
     Alt+Backspace delete the WORD before the cursor — one whole search atom, so
                   a path or a branch name goes in one press. Ctrl-W and Alt+H do
@@ -209,7 +229,8 @@ KEYS:
                   as TEXT: into a compose draft at the cursor, newlines and all, or
                   into the search query at its cursor with newlines flattened to
                   spaces. It never sends, resumes, or answers a confirmation
-    Esc           clear the search query; with none typed, quit
+    Esc           clear the search query; with none typed, leave a subagent's
+                  transcript for the session's own; with neither, quit
     Ctrl-C        quit          (always)
 
 BACK TO THE BOARD (typed inside a resumed Claude session, not a snapback key):

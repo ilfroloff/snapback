@@ -90,6 +90,7 @@ status flag.
     <session-id>/
       subagents/
         agent-*.jsonl                 # ← a SUBAGENT transcript (NOT a session)
+        agent-*.meta.json             # ← a SUBAGENT META file (NOT a session)
     agent-title-xyz.jsonl             # ← a SIDECAR (no cwd, NOT a session)
 ```
 
@@ -301,12 +302,13 @@ guards the pid with an unconditional confirm and a confirm-time re-probe
   gate's verdict on it cannot go stale, and the only pid that reaches `kill(2)`
   is the one `signal_plan` matched against a pid that gate accepted.
 
-### The three file kinds
+### The four file kinds
 
 | Kind | Location | Has `cwd`? | Resumable? | How it is excluded |
 | --- | --- | --- | --- | --- |
 | **Session** | `<encoded-cwd>/<id>.jsonl` (depth 2) | yes | **yes** | — |
 | **Subagent** | `<encoded-cwd>/<id>/subagents/agent-*.jsonl` (deeper) | yes (the *parent's*) | no | by **location** (depth), not by `cwd` |
+| **Subagent meta** | `<encoded-cwd>/<id>/subagents/agent-<id>.meta.json` (deeper; one JSON object, not JSONL) | **no** | no | by **location** (depth) and by name (not a `.jsonl`); read ONLY by `store::subagents`, for the preview's [delegation lines](#delegation-line-and-subagent-view-storepreview) and the selected session's [subagent record](#subagent-record-and-running-list-storesubagents) |
 | **Sidecar** | e.g. `agent-title-*.jsonl` at depth 2 | **no** | no | dropped when parse finds no `cwd` |
 
 Subagents are the load-bearing hazard: historically ~62% of all `.jsonl` files,
@@ -314,6 +316,38 @@ and they carry the parent's `cwd` **and** `sessionId`, so a `cwd`-based guard
 cannot tell them apart. Discovery therefore constrains by **depth**: it
 enumerates only `.jsonl` files exactly one directory below the root and never
 descends into `<session-id>/subagents/`. Do not relax this to a recursive walk.
+The content index never descends there either, and the watcher never reloads for
+it: a write to a subagent transcript only goes on as `AppEvent::SubagentsWritten`,
+named by path shape (`store::discover::subagent_transcript_at`), which draws a
+[subagent view](#delegation-line-and-subagent-view-storepreview) showing it
+again and, under the selected session, has its
+[subagent record](#subagent-record-and-running-list-storesubagents) read again.
+The one reader that does read there is `store::subagents`, parent-scoped and
+display-only: it lists ONE session's own `subagents/` for the preview and the
+background subagent refresh, and nothing it reads becomes a row (AGENTS.md
+SUBAGENT EXCLUSION BY DEPTH owns the rule).
+
+A **subagent meta** file is what claude writes beside a subagent's transcript
+when that agent really launched: no failed dispatch (a permission denial,
+`Agent type 'fork' not found`) has one (none of 15 in a local store, measured
+2026-10-09/11). One flat `subagents/` dir holds every agent the session launched
+at ANY depth, each as `agent-<17 hex>.meta.json` beside its
+`agent-<17 hex>.jsonl` (1811 meta files in a local store, 2026-10-11), and a read
+of one is capped at `subagents::META_MAX_BYTES`. Never call it a "sidecar": that
+kind is the depth-2 `agent-title-*.jsonl` above.
+
+| Read | Field | For |
+| --- | --- | --- |
+| yes | the `<id>` in the FILE NAME `agent-<id>.meta.json` | the subagent the delegation line's click (or `Ctrl-X ↓`, or a `←`/`→` step) switches to (the id that agent's hand-back names as `origin.from`) and its transcript, `agent-<id>.jsonl`; an id holding a path separator is refused |
+| yes | `toolUseId`, a non-blank string | the join to the launching `tool_use` block's `id`; absent ⇒ no delegation line and no place in the subagent record (one forked skill's meta has none) |
+| yes | `agentType`, a non-blank string | the delegation line's and the running-list row's `@<agentType>`, and the subagent view's title; absent ⇒ no line and no place in the record |
+| yes | `description`, optional | the delegation line's and the running-list row's annotation, and the subagent view's title |
+| yes | `parentAgentId`, optional | the [subagent record](#subagent-record-and-running-list-storesubagents)'s running rule: a write counts for every agent above the writer, whose tail the refresh then reads too; absent, blank or not a string ⇒ no parent, never a refused meta |
+| no | `spawnDepth`, `requestShape`, `requestNonInteractive`, `model`, `isFork`, `stoppedByUser`, `name`, and anything else | nothing: a nested delegation is DRAWN by walking the transcript that launched it |
+
+A forked skill's `subagents/` dir also holds `agent-<id>.forked-skill.json` and
+`agent-<id>.forked-skill.marker.json`. Neither is a meta file, and the name rule
+(exactly `agent-<id>.meta.json`) never matches them.
 
 ## JSONL record model
 
@@ -341,7 +375,8 @@ never fatal:
 | `perTurnEffort`, then `effort` | TOP-LEVEL (siblings of `message`), per `assistant` record, string (fail-soft) | the [effort level](#effort-level-record_effort) on preview turns; read **positionally**, never hoisted |
 | `origin` | on `type:"user"`, object (fail-soft) | WHO the turn came from, when it was not the person at the keyboard. `kind` is `"peer"`, `"human"` or `"task-notification"`; only a `"peer"` record ever carries `from` (the sending agent) and `body` (its message). A peer record with a NON-EMPTY `body` renders as the preview's collapsible **peer node** and `from` is that node's fold key — see [Peer message node](#peer-message-node-storepreview) |
 | `origin.kind` | on `type:"user"`: `origin` is an object with a string `kind` (fail-soft — see the flag); observed `"human"`, `"task-notification"`, `"peer"`, and very often **absent** | who wrote the record. Ruled on **first** by the [failed-task flag](#failed-background-task-storeparse): `"task-notification"` is a notice, and only an absent `origin` or `"human"` can clear |
-| `isSidechain` | bool (`label::is_sidechain`; non-bool ⇒ `false`) | skip sub-agent turns when picking a label/preview — except that the preview checks the [peer node](#peer-message-node-storepreview) gate FIRST, so a peer record with a body still renders even on a sidechain turn; a sub-agent turn neither raises nor clears the [failed-task flag](#failed-background-task-storeparse) |
+| `isSidechain` | bool (`label::is_sidechain`; non-bool ⇒ `false`) | skip sub-agent turns when picking a label/preview — except that the preview checks the [peer node](#peer-message-node-storepreview) gate FIRST, so a peer record with a body still renders even on a sidechain turn, and a subagent's OWN transcript, drawn in the [subagent view](#delegation-line-and-subagent-view-storepreview), keeps them (every turn there is one); a sub-agent turn neither raises nor clears the [failed-task flag](#failed-background-task-storeparse) |
+| `id` on a `tool_use` block in `message.content` | string (fail-soft: absent or non-string ⇒ no join) | the preview's [delegation line](#delegation-line-and-subagent-view-storepreview): the launch whose `id` equals a subagent meta's `toolUseId`. The block's `name` is NEVER read for the join, only for the plain `[tool_use: <name>]` marker a miss keeps |
 | `promptSource` | on `type:"user"`, string (fail-soft); observed `typed`, `sdk`, `system`, `queued` | `typed` / `sdk` mark the USER writing — clears the flag, but is **never read before `origin`** (51 of 169 notices say `sdk` too) |
 | `turnOrigin` | on `type:"user"`, string (fail-soft); observed `human`, `sdk`, `peer`, `task_notification` | `human` / `sdk` mark the user writing — the ONLY marker a quick-reply slash command carries, [from Claude Code 2.1.278 on](#why-turnorigin-counts) |
 | `isMeta` | bool on `type:"user"` and `type:"assistant"`; anything but absent or `false` reads as meta (`label::is_meta`, the ONE reading of it) | an injection nobody typed: on a user record it never clears the flag; on an assistant record it is skipped when finding [the model a `-r` launch restores](#the-model-a--r-launch-restores-last_model). Every subagent hand-back carries it too, so "Claude Code injected this" is `isMeta` AND not a [peer message](#peer-message-node-storepreview) (`label::is_injected`) — the ONE check the preview's [injected node](#injected-context-node-storepreview), the [content index](#content-index-storeparse) and the [label](#label-storelabel) all read |
@@ -479,6 +514,10 @@ answered — and not what Claude Code wrote around it:
   skill-body text in a real store). A subagent hand-back is NOT injected — the
   same check says so — and stays searchable like any reply, as do background task
   notices;
+- a subagent's OWN transcript is never read: the index is built from the session
+  file alone and never descends into `<id>/subagents/`, so what the subagent view
+  a [delegation line](#delegation-line-and-subagent-view-storepreview) switches to draws is not
+  searchable text (its agent's hand-back, which sits in the session file, is);
 - a slash command is kept as the `/name args` the user typed
   (`store::command::typed_text`), never as its `<command-name>` / `<command-args>`
   tags — the literal tag name alone made `args` match 59 of 127 sessions. Every
@@ -680,6 +719,9 @@ The re-search SKIPS the body rows of an OPEN [injected node](#injected-context-n
 held that text, so a mark there would be a hit the filter did not count. That one
 walk feeds the highlights, the `Shift`-arrow stops, the match jump and the
 outside-the-preview note, so the skip keeps all four consistent with the filter.
+The [subagent view](#delegation-line-and-subagent-view-storepreview) is never searched at all, for
+the same reason: its render's match map stays empty, so it takes no marks, no
+stops, no jump and no note.
 
 The two pipelines also disagree about what EXISTS: a query can match the index
 and occur nowhere in the rendered preview — the same one-off probe put it near
@@ -1895,8 +1937,12 @@ and no `body`, and together they outnumber the peer records, so a gate of "has a
 | `origin.from` | the sending agent's STEM for the great majority; real data also holds an agent TYPE name and a unix socket path | the node's FOLD KEY, and its label only when stem-shaped (`PEER_STEM_LEN` lowercase hex) — anything else renders `a peer session`, the same refusal the [bound agent](#bound-agent-storepreview) makes of a free-form `agent-name`, so a socket path never draws as an `@handle` |
 
 The fold key is the SENDER, never the record `uuid`: `(session, origin.from)`
-pairs are unique across the store, and keying it this way lets a later
-delegation node resolve to the SAME node. Which nodes are open lives in
+pairs are unique across the store. The
+[delegation line](#delegation-line-and-subagent-view-storepreview) that launched that agent names
+the same id, but it is NOT a fold node: the earlier design that SHARED this key
+between the launch and the hand-back — two headers driving ONE node, opened in
+place together — is retired, so the hand-back stays a fold of its own and its
+key opens the hand-back alone. Which nodes are open lives in
 `tui::app`'s `expanded_peers`, IN MEMORY for the run — the per-session state map
 above stays the only thing snapback persists. A record that passes the gate but
 carries no `from` has no key, so it claims no click region and renders EXPANDED:
@@ -1946,8 +1992,9 @@ cannot disagree about which records are instructions.
 - **No `uuid`** ⇒ no key ⇒ the peer node's `Unfoldable` state: the body renders
   OPEN, with no affordance and no click region.
 - **Header on row 1** of the node's block, exactly like the peer node, so opening
-  it only appends lines below the header and `fold_scroll_delta` holds the node
-  on the row it was clicked on.
+  it only appends lines below the header, and its key is its own alone, so
+  `fold_scroll_delta` holds the node on the row it was clicked on with a delta of
+  zero.
 - **An open node's body is not searchable text.** It rides out of the renderer as
   an `UnindexedRows` run, and the pane's search marks skip it (see
   [the mark walk](#a-content-index-position-never-projects-into-preview-coordinates)).
@@ -1955,11 +2002,11 @@ cannot disagree about which records are instructions.
   itself, the turn above only says `[tool_use: Skill]`), and auto-opening a fold
   whose body is the only place a query occurs.
 
-**A fold node — a hand-back or injected context — renders no turn marker, so the
-pinned row names the last turn above it.** Neither node is a turn, and each
-header ends in a click affordance the pinned preview row could not honor, so
-`store::preview` captures no marker for either, collapsed or expanded. The pinned
-row — which names whichever turn owns the line at the top of the viewport —
+**A fold node — a hand-back or injected context — and a delegation line render no
+turn marker, so the pinned row names the last turn above them.** None of them is a
+turn, and each ends in a click affordance the pinned preview row could not honor,
+so `store::preview` captures no marker for any of them, collapsed or expanded.
+The pinned row — which names whichever turn owns the line at the top of the viewport —
 therefore goes on naming the LAST turn marker above the node, whichever turn that
 is (the FIRST marker when none precedes it, the same fallback as at the top of any
 transcript), for an open injected node as for a hand-back: while you read inside an
@@ -1969,7 +2016,322 @@ ties the node to it — a background hand-back that lands after later turns name
 the latest of them, and a peer message that follows a `▶ you` turn names
 `▶ you` (the fixture store's `sess-peer-nonstem-1` does exactly that). The
 node's own `◆ message from …` header is what names that sender, and it scrolls
-with the transcript.
+with the transcript. A delegation line sits inside the `● claude` turn whose
+`tool_use` it replaced, so the pinned row over it names that turn. The
+subagent's own `▶ prompt` and `● claude` turns are drawn only in the subagent
+view, where they pin their own markers and nothing of the session's.
+
+### Delegation line and subagent view (`store::preview`)
+
+A launch of a subagent is an assistant `tool_use` block, drawn as a bare DIM
+`[tool_use: Agent]` marker. That marker says nothing about which agent ran or
+what it was asked, and the agent's own transcript sits under
+`<id>/subagents/`, where nothing on the board reaches it. The preview renders a
+launch it can JOIN to a [subagent meta](#the-four-file-kinds) file as a one-line
+DELEGATION LINE instead, in the marker's place inside its `● claude` turn, and a
+click on it switches the whole pane to that subagent's own transcript, the
+SUBAGENT VIEW:
+
+```text
+◆ delegated to @parser-auditor · Audit the parser · (click to view)
+```
+
+**The join is by id, NEVER by tool name.** A block is a launch when its `id`
+equals a meta file's `toolUseId` (`delegated_meta`); its `name` is not read,
+since both `Agent` and `Task` launch subagents in real data (the fixture's
+`Task`-named launch pins it). Measured 2026-10-09/11 over a local store, the id
+matched 1609 of 1610 meta files, and the one miss had no `toolUseId` at all.
+Every miss is fail-soft toward the plain `[tool_use: <name>]` marker: no `id`,
+no meta file, a meta `store::subagents` refuses, or a launch whose meta has not
+landed yet (the parent's next write re-renders it). The index
+(`subagents::index_for`) is built ONCE per render from the session's OWN
+`subagents/` dir, and the subagent view joins its transcript's own launches
+against that same index, because the one dir holds every agent the session
+launched at any depth. That scope has a
+known miss: in the same measurement, 30 of 1022 delegations in session files had
+their meta under ANOTHER session's dir — a fork copied the launch, not the subagents — so they keep the
+plain marker. A fork-lineage-aware index is not built.
+
+**The line** is the in-turn indent (`IN_TURN_INDENT`, the indent the marker had),
+then `DELEGATION_MARKER` (`◆ delegated to`) and `@<agentType>` in the peer node's
+Magenta + BOLD (`peer_style`), then the meta's description and the affordance
+(`DELEGATION_VIEW_AFFORDANCE`) as DIM annotations. It wears the hand-back's `◆`
+because both name another agent of this session; the words name the direction.
+It sits FIRST in its block (`DELEGATION_HEADER_BLOCK_ROW`, no blank separator), so
+it costs exactly the one line the marker did, and it carries no timestamp, since
+the turn above it has one. The description is the delegating model's words,
+drawn VERBATIM as plain text and never through the markdown or link pass, so a
+link it spells claims no `LinkRegion` on the row a click switches from
+(`a_delegation_line_carries_no_link_or_fold_region_at_any_width`).
+
+**It is not a fold node.** The whole line claims one `SubagentRegion` naming the
+subagent (its agent id and `agentType`), rebased through the same `rebased` /
+`BlockRegion` pass as every other region, and NO `FoldRegion`.
+`update::click_effect` routes a hit on it, after the fold headers and before the
+links, to `App::open_subagent_view`. An earlier design opened the transcript IN
+PLACE beneath the line and made the line and the agent's hand-back two anchors of
+ONE fold node; it is retired, with its depth cap and its two-header scroll
+anchor. There is one way to read a subagent's transcript, the view.
+
+**Only a click, `Ctrl-X ↓` or a `←`/`→` step switches to it.**
+`App::open_subagent_view` is the view's one opener, and it has exactly three
+callers: that click, `Ctrl-X ↓` (`App::open_subagent_target`) and a `←`/`→` step
+inside the view (`App::step_subagent_view`), the last two over the
+[subagent record](#subagent-record-and-running-list-storesubagents). So no search route —
+typing, `Tab`, `Shift-Up` / `Shift-Down`, `Backspace` — can switch the pane to a
+subagent or read a subagent transcript (the largest measured 10.8 MB,
+2026-10-09/11) on the UI thread
+(`no_search_route_switches_to_a_subagent_or_reads_its_transcript`). The click is
+refused, on a sticky status line, while a reply or fork box is open: what the box
+sends lands in the session. The keys cannot reach the view then at all, since
+the box owns the keyboard.
+
+**The view** (`App::subagent_view`, a `SubagentView` keyed by the selected
+session's id and the subagent's) renders through `preview::render_subagent`: the
+transcript is opened by `subagents::open_transcript` (a REGULAR file only: a
+symlink, a FIFO or a dir is refused) and streamed through the session's own
+record loop (`render_stream`) at the pane's width in `RenderMode::Subagent`,
+which differs from the session's mode in exactly these ways:
+
+- the `isSidechain` user-turn drop is OFF: every subagent turn is a sidechain
+  one (all 253,342 user and assistant records over 1825 subagent transcripts in
+  a local store, 2026-10-11), so the drop would erase every prompt;
+- a plain user turn renders `▶ prompt` (`SUBAGENT_PROMPT_MARKER`), never
+  `▶ you`: the delegating model wrote that brief, the mislabel the peer node fixed
+  for the message going the other way. Peer and injected records inside keep
+  their own nodes, and a launch inside is a delegation line of its own, joined
+  against the SAME session's index — one `subagents/` dir holds every agent the
+  session launched at any depth — so a click on it switches to that nested
+  subagent: drill-down is one switch per level, never a body inside a body;
+- no turn contributes a `last_model` (claude restores the session's model, never
+  a subagent's), while every turn does contribute its `MarkerLine`, so the view's
+  pinned row names the subagent's own turn at the top of the pane;
+- every record is folded through the subagent record's run-ended rule into
+  `RenderedPreview::run_ended`, which the view's title states
+  ([where it comes from](#subagent-record-and-running-list-storesubagents)); the
+  session's own render judges none.
+
+The bound agent and the day rollover start fresh. A transcript `open_transcript`
+refuses, or one that renders no line at all (empty or garbage), draws the single
+DIM line `[subagent transcript unreadable]` (`SUBAGENT_UNREADABLE`), so the click
+still visibly did something.
+
+**The view never passes for the session's own transcript.** Its render is cached
+apart from `App::preview_cache`, so `last_model` and the reply box's model label
+never come from it. The pane's title names the subagent (` subagent @<agentType> `,
+then, once the record lists it, how it stands and its `k/n` place in
+[launch order](#subagent-record-and-running-list-storesubagents));
+its pinned row shows nothing of the session's — no failed task, no live status,
+no reported-status fallback; the session's in-flight reply tail stays off it; and
+it takes no search marks, since the content index never held its text. Opening a
+reply or fork box, or moving the selection, leaves it; `Esc` with an empty query
+leaves it (after clearing a typed query, before quitting), and so do a plain
+`↑` — the selection and a typed query kept; `Shift-Up` too, since the view
+marks nothing for it to step — and `Ctrl-X ↓` pressed in it, back to where the
+session's own transcript was scrolled. `App::ensure_preview` is the ONE place the
+pane switches, through `App::live_subagent_view`, so the lines drawn, the marks,
+the height, the hit-test, the copy and the pinned row all come from one render.
+
+**The view updates as the subagent writes.** The watcher names every subagent
+transcript a settled batch wrote — the launching session's file and the agent id,
+read off the path by `store::discover::subagent_transcript_at` through the same
+`subagents_dir` and transcript-name derivations the view opens it by — and passes
+them on as ONE `AppEvent::SubagentsWritten`: never a session reload, and never
+board activity. `App::apply_subagent_writes` evicts the view's render only when
+the view shows one of them, so the next frame reads the transcript again: at most
+once per debounce batch (`watch::DEBOUNCE`, so five times a second), the cadence
+a live session's own transcript is redrawn at, and a pane following the newest
+turn keeps following it. Each such redraw renders the WHOLE transcript again;
+what that costs a large running subagent, and the known fix if it bites, are
+[PATTERNS.md §6](PATTERNS.md#6-off-ui-thread-for-anything-that-can-block)'s. A
+write to any other subagent, or with no view up, renders nothing; under the
+selected session it only has the
+[subagent record](#subagent-record-and-running-list-storesubagents) read again,
+off the UI thread. The render is
+redone as well on the
+parent session's next write (its reload evicts the view's render too),
+`Ctrl-X r`, a resize or layout step that changes the pane's width, a click that
+toggles a fold node inside the view (`App::toggle_peer_fold` evicts it beside the
+session's own entry), and leaving and switching back. A meta file is not such a
+write: a launch inside the view whose
+meta file lands after its line was drawn joins on the next write to the viewed
+transcript. Those, with the switch that opens the view, are all the reads of the
+viewed transcript; AGENTS.md and PATTERNS.md §6 point here rather than repeat
+them. The line carries no live status.
+
+### Subagent record and running list (`store::subagents`)
+
+ONE record of the SELECTED session's subagents feeds three surfaces: the
+`Ctrl-X ↓` open target, the subagent view's `←`/`→` steps and its title, and
+the running list at the foot of the preview. It is a
+`subagents::SubagentRecord`: every subagent the session launched, at any depth,
+in launch order, each a `Subagent` carrying its id, `agentType` and description
+(from its meta file), its launch time, its `newest_write` and whether its own
+run `ended`. `App` holds it keyed by the session it was read for, and
+`App::selected_subagents` hands it out for that session alone; a record landing
+for a session no longer selected is dropped (`App::apply_subagent_record`). It
+is in memory only.
+
+**The background refresh.** The pure `App::take_subagent_refresh` decides when
+to read: at board entry, whenever the selected session (its id or its file)
+changes, and whenever a `SubagentsWritten` batch wrote under that session's own
+`subagents/` (`App::apply_subagent_writes` marks it). The driver asks it before
+every draw and hands each answer to ONE long-lived worker per board session
+(`watch::SubagentRefresh`), where the newest request replaces any it has not
+started, so a run of arrow presses costs one read for the row they stop on. The
+worker runs `subagents::read_record` as of its own clock and answers with one
+`AppEvent::SubagentRuns { session_id, record }`; the thread shape is
+[PATTERNS.md §6](PATTERNS.md#6-off-ui-thread-for-anything-that-can-block)'s.
+The read is stat-first, and only that session's `subagents/` dir is read:
+
+- it lists the dir through `index_for`'s rules, so the subagents are exactly
+  the meta files the delegation lines join, and a meta the index refuses is no
+  subagent;
+- it stats each listed transcript (a regular file only, as `open_transcript`
+  takes: no symlink, FIFO or dir) for its mtime and length;
+- it reads each transcript's HEAD for its launch time: the RFC 3339 `timestamp`
+  of the first record carrying one within `HEAD_MAX_BYTES`, read a line at a
+  time, passing over a forked subagent's leading `fork-context-ref` record,
+  which has none;
+- it reads the TAIL (`TAIL_MAX_BYTES`) only of a subagent whose `newest_write`
+  — its own write, or any subagent's below it, found through the meta files'
+  `parentAgentId` transitively, a cycle walked once — lies within
+  `RUNNING_WINDOW` of the read, so a parent waiting on a running child is read
+  too. Every other subagent cannot be running and is stat and head only, its
+  `ended` `None`.
+
+**A run has ENDED** (`run_ended`, pure, over the tail; its first line skipped
+when the read starts mid-file, a line that is not JSON skipped — the ONE fold
+`subagents::RunProgress` over `after_record`, which the subagent view's render
+runs too, below) when its last
+turn is either an assistant `tool_use` of `SubagentHandback` (the `tool_result`
+answering it is not a turn) or a FINAL REPLY: an assistant record holding text
+and no `tool_use`, whose `message.stop_reason` is `end_turn` or `stop_sequence`
+(`FINAL_STOP_REASONS`). Text after a hand-back — an assistant record holding text
+and no `tool_use` — keeps the run ended whatever its `stop_reason`, null
+included. Anywhere else, text
+whose `stop_reason` is null, missing or `tool_use` is a turn still being written
+— claude writes a narrated tool call's text ahead of its `tool_use` — so it keeps
+the run open, and so does any later turn: a pending `tool_use` (a sub-subagent
+launch among them), the `tool_result` of an ordinary call, a thinking-only
+record, or any user text (a new prompt, claude's `isMeta` nudge to hand back,
+`[Request interrupted by user]`). A hand-back followed by any of those later
+turns is open again. `attachment` and other record types are not turns, and a
+tail with no complete record reads as not ended.
+`SubagentHandback` is a tool NAME, read for this one question and never for the
+delegation join (which joins by id). The measurements behind the tool name, the
+stop reasons, the window and both byte caps are the doc comments of
+`HANDBACK_TOOL`, `FINAL_STOP_REASONS`, `RUNNING_WINDOW`, `TAIL_MAX_BYTES` and
+`HEAD_MAX_BYTES`; the one behind text after a hand-back sits beside its arm in
+`after_record`.
+
+**Running is worked out at DRAW time** (`subagents::is_running`, pure): a
+subagent runs while its tail was read and it had not ended
+(`ended == Some(false)`) and its `newest_write` lies within `RUNNING_WINDOW` of
+`App::wall_clock`, the window inclusive and a write after that instant counted as
+recent. `App::wall_clock` is stamped by every `Tick` and every landed record
+(`App::note_wall_clock`, which never steps it back), so neither the draw nor a
+key reads a clock, and a subagent that goes silent turns not-running when its
+window passes, with no file read. An unfinished subagent silent past the window
+(stranded, or stuck in a long tool call) is simply not running; its next write
+is a `SubagentsWritten`, which reads the record again.
+
+**Launch order** (`subagents::launch_order`, kept by `SubagentRecord::new`): the
+launch time ascending, a subagent with none after every one with one, ties — and
+the undated among themselves — by agent id, so the order holds from read to read.
+
+**`Ctrl-X ↓`** (`update::toggle_subagent_view`) leaves the subagent view when it
+is up, as `Esc` does. Otherwise it opens the view on the record's
+`open_target` as of `App::wall_clock` (`App::open_subagent_target`): the FIRST
+running subagent in launch order, else the most recently written one — the
+newest `newest_write`, a tie going to the later launch, since a parent shares
+its running child's write. A hidden preview comes back at `1:1` first, and a
+typed query stays. The key reads no file, so it refuses, on a sticky status
+line, when the record cannot answer: `SUBAGENTS_NOT_READ_REFUSAL` while the
+refresh has not landed one for the selected session (never "none", which is not
+known yet), and `SUBAGENTS_NONE_REFUSAL` when it lists no subagent.
+
+**`←`/`→` inside the view** (`App::step_subagent_view`, over
+`SubagentRecord::step`) switch to the previous / next subagent in launch order,
+wrapping round at both ends: every subagent the session launched, finished ones
+included. They are bound whenever the view is up, a query typed or not (the
+accepted trade: there the search caret moves only by word, through the `Alt` and
+`Ctrl` arrows), and refuse with the same two lines. A subagent the record does
+not list yet — a click opened it before its meta file was read — counts as the
+newest launch: `→` wraps to the first, `←` lands on the last. Like a drill-down,
+a step keeps where the session's own transcript was scrolled, for `↑` or `Esc`.
+
+**The view's title** (`view::subagent_title`, pure over `SubagentTitleFacts`
+and the width the border gives it) reads
+` subagent @<agentType> · <description> · <state> · started <time> · last write <age> · k/n `.
+Everything after `@<agentType>` is the record's entry for the viewed subagent
+(`App::viewed_subagent`, `SubagentRecord::get`) and the view's render; with no
+entry — the record has not landed or does not list it — the title is
+` subagent @<agentType> ` alone. The description is the meta's: a subagent
+transcript carries no `ai-title` record (none across a local store,
+2026-10-13). The state is `subagents::SubagentStatus::of` at `App::wall_clock`
+(`App::subagent_view_status`): `running` exactly where `is_running` says so, in
+the running list's green (`view::RUNNING_COLOR`); else `finished` once the run's
+end was read; else `quiet`, in `DarkGray`. The time is
+`preview::timestamp_annotation`'s, the turn markers' own form, against the wall
+clock's day in the launch time's own offset; the age is the running list's,
+from `newest_write`, with `k/n` from `App::subagent_view_position`. A fact not
+known is left out, never a placeholder. On a narrow border the description is
+cut with an ellipsis and then dropped, then `last write …`, then `started …`;
+the fit never cuts the four segments left, and narrower than they are the
+border cuts the title at its edge.
+
+**The title's `ended` is the render's.** The record reads a tail only while the
+subagent can be running, so for every older one its `ended` is `None` and
+cannot tell `finished` from `quiet`. The view reads its transcript whole anyway,
+to render it, so `render_stream` folds the SAME `RunProgress` over every record
+it streams in `RenderMode::Subagent` and keeps the verdict on the render
+(`RenderedPreview::run_ended`; `None` for the session's own render and for the
+unreadable one). `App::subagent_view_status` reads it off the cached render
+(`App::peek_preview`) and falls back to the record's `ended` whenever the render
+has no verdict (none is cached yet, or it is the unreadable one); each eviction
+of the render
+([the view's section](#delegation-line-and-subagent-view-storepreview) lists
+them) takes the verdict with it, so the next render judges again. It costs no
+file read and no second copy of the rule, and
+`the_view_and_the_record_judge_the_same_records_to_the_same_status` pins the two
+agreeing. `view::render_preview` builds the title only after the frame has
+warmed the cache, so a view's first frame already states the render's verdict.
+
+**The running list** (`view::running_subagents`, `running_list`): while the
+record lists subagents running as of `App::wall_clock`, the foot of the preview
+lists them in launch order under a DIM rule whose title is the `^X ↓ explore`
+hint (`RUNNING_LIST_HINT`), `── ^X ↓ explore ───`, one row each, set
+`RUNNING_LIST_INDENT` in: `● @<agentType> · <description> · <age>` — the age
+how long before `App::wall_clock` its `newest_write` was, the instant running is
+measured from. The rule is a `Borders::TOP` block, never Cyan — the docked reply
+box's border — so the list never reads as an input box, and it is one of the
+list's own rows (`running_list_full_height`), never an extra one. Past
+`RUNNING_LIST_MAX_ROWS` a `+N more` line counts the rest. The whole list is
+drawn only when it takes at most one part in `RUNNING_LIST_PANE_SHARE` of the
+rows under the pinned row; otherwise it shrinks to the rule alone, titled
+`● 3 running · ^X ↓ explore`. On a narrow pane the description gives way first,
+and narrower still a row, or the rule's title, is cut at the pane's edge. Inside
+the subagent view the row of the subagent on screen is drawn REVERSED and BOLD
+and the rule's hint is `←/→ switch · ↑/Esc back` (`RUNNING_LIST_VIEW_HINT`). The
+list is hidden while a compose box is open or a draft card holds the pane — the
+`Ctrl-R` and `Ctrl-F` boxes dock into those same bottom rows — keyed on the box
+being open, so it stays hidden in the short-pane bottom-bar fallback too. Its
+rows, the rule's included, come off the bottom of the transcript rect
+(`view::PreviewAreas`), so it is never clickable or selectable: a click on it
+opens nothing. It never writes the status line.
+
+**A new launch can show up late.** A subagent joins the record at the first
+read after its meta file lands — normally the one its transcript's first write
+triggers, as a `SubagentsWritten`. The watcher names transcripts only, never a
+meta file, so a meta file written after that write leaves the subagent out until
+the next read: its transcript's next write, or any other trigger above.
+
+**Two "finished" answers, and no check between them.** The record answers "did
+the subagent's OWN run end?", from its transcript. Whether the agent that
+launched it GOT the result is a different question — the stranded-agent ledger,
+once it lands, answers that one — and nothing compares the two. They can
+legitimately differ: a subagent can finish while its hand-back is lost.
 
 ### Answering model (`store::preview`)
 
@@ -2103,6 +2465,7 @@ that differ.
 | **Compose model pick** | `None` (the default, in every new compose) / a `resume::ModelPick`: an offered alias plus an optional `--effort` level | the `--model` (and effort) a compose's own launch asks for, picked with `Ctrl-L` inside that compose and held on it (`ComposeState::model`); which launches it may reach is the A MODEL IS PICKED PER COMPOSE, NEVER PER BOARD rule in [AGENTS.md](../../AGENTS.md#critical-rules). With no pick the compose's `model:` label names what `claude` will choose instead. See [Compose model pick](#compose-model-pick-ctrl-l). |
 | **Forced rescan** | `Ctrl-X r` | not a mode: a one-shot that drops the store's parse cache and re-reads every transcript, reporting the count it landed on. The board autorefreshes and reuses unchanged files by itself, so this is the escape hatch for a row that looks stale — see [incremental reload](#incremental-reload-storesessionstore). |
 | **Modal** | `Row` \| `List` layout in one `Option<Modal>` | the SINGLE type for a TITLED, choice-bearing overlay. `Enter` on a running session builds the `Attach` / `Fork` / `Cancel` choice (a `Row`); `Ctrl-N` with defined agents builds the agent picker (a `List`); `Ctrl-L` inside a compose builds the model picker (a `List` opened OVER that compose, which stays open beneath it; row 0 is the compose's default, and the compose's current pick — effort included — is pre-highlighted by MATCHING the built choices rather than by index arithmetic, so a pick that is no longer offered falls back to row 0; its `←`/`→` step the highlighted model row's effort, which the row draws inline as ` · <level>`, or a dim ` · default effort` while unset and highlighted — see [Compose model pick](#compose-model-pick-ctrl-l)); `Ctrl-X d` builds the hard-delete confirm (a `Row`: `Delete this` / `Delete lineage (N)` — offered only on the HEAD row of a real multi-member lineage (`App::lineage_choice`, see [Row role](#row-role-head-row-or--row)), carrying the member ids resolved at OPEN time — / `Cancel`, default-highlighted on Cancel by that choice's position); `Ctrl-X w` builds the move picker (a `List` of the launch project's worktrees, main first, the session's current folder omitted; each choice carries `ModalAction::MoveTo(path)`, and `Enter` starts the headless move — or, on a lineage HEAD row, `ModalAction::ChooseMoveScope { target, members }`, whose `Enter` opens the move's SCOPE confirm (`App::open_move_scope_confirm`, a `Row` under the same title: `Move this` → `MoveTo` / `Move lineage (N)` → `ModalAction::MoveLineage { target, ids }` / `Cancel`, default-highlighted on Cancel by position, its prompt disclosing hidden members through `lineage_confirm_message`); the member ids ride both actions from the picker's open, see [Move](#move-to-another-worktree-ctrl-x-w-srcclaude_movers)). Each choice carries a `ModalAction` tag the one confirm handler (`confirm_modal`) routes on. The plain Enter/Esc stop confirmations (`Ctrl-R`, `Ctrl-K`), the compose zone and the `Ctrl-X` chord are separate keyboard owners, NOT `Modal`s — see [PATTERNS.md](PATTERNS.md#10-keys-actions-outcomes). |
+| **Subagent view** | off (default) / ONE subagent of the selected session (`App::subagent_view`, keyed by the session's id and the agent's) | what the preview pane shows: the selected session's own transcript, or a subagent's own in its place. Switched to ONLY by a click on a `◆ delegated to …` line, `Ctrl-X ↓` or a `←`/`→` step inside the view (through the [subagent record](#subagent-record-and-running-list-storesubagents)), never by a search route; left by a plain `↑` (the selection and a typed query kept), `Esc` (its middle step: a typed query is cleared first, and the board quits only from the session's own transcript), `Ctrl-X ↓` again, a selection move, or opening a `Ctrl-R` / `Ctrl-F` box. In memory only, like the fold state. See [Delegation line and subagent view](#delegation-line-and-subagent-view-storepreview). |
 
 The current-folder scope is an **exact** canonical `cwd` match by design: a
 repo's *other* worktree folders do not appear there, no matter how the paths
@@ -2799,7 +3162,8 @@ consumer is `App::apply_reload` (`consume_fork_jump`, after `restore_selection`)
 the funnel every reload takes: on the first reload whose store holds the fork,
 the cursor moves to it only if it is still on the origin AND nothing owns the
 keyboard (`App::keyboard_owned`: a modal, a compose's model picker among them; a
-pending `Ctrl-X` chord; the stop or interrupt confirm; an open compose box). Those
+pending `Ctrl-X` chord; the stop or interrupt confirm; an open compose box).
+Those
 are the `KeyboardOwner` variants, the one list `update::dispatch` routes a key by.
 Moving the selection under an owner would change the row it shows or acts on: a
 second fork box opened on the origin before the first fork lands (the
@@ -3442,7 +3806,8 @@ LAST member finishes: normally N × ~0.7 s, at worst N × (the probe +
 refuses per id.
 
 **Quitting mid-move** works the same way for a single move and a lineage job.
-Quit waits on nothing. `Ctrl-C`, or `Esc` on an empty query, is `Outcome::Quit`
+Quit waits on nothing. `Ctrl-C`, or `Esc` on an empty query outside the subagent
+view, is `Outcome::Quit`
 whatever `App::moving` holds. `run_inner` tears the board down: its drain moves a
 `MoveFinished` that has already arrived into the `App`'s own queue. Then the
 terminal is restored and `lib::run` returns. Nothing joins the move's worker

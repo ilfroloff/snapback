@@ -76,7 +76,7 @@ sb -a     # every folder, grouped repo → branch
 | `Ctrl-R` | quick reply |
 | `Ctrl-K` | stop an agent |
 | `Ctrl-N` | start a background agent |
-| `Esc` | clear search / quit |
+| `Esc` | clear search / back from a subagent / quit |
 
 All keys: `sb --help` · Full guide: [docs/GUIDE.md](docs/GUIDE.md)
 

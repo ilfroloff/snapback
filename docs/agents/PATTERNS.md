@@ -83,6 +83,30 @@ The JSONL format is external and undocumented, so treat every read as hostile:
   repository's settings, and with them its helper commands and `env` block, and
   leave claude's own git prefetch running its git configuration, just because a
   compose box opened.
+- The subagent meta files the preview joins launches against (`store::subagents`,
+  which files and which fields is [DOMAIN.md](DOMAIN.md#the-four-file-kinds)'s)
+  are the same again: each is a `Value`, and an unreadable dir, a symlink, FIFO or
+  dir under a meta name, a file over `META_MAX_BYTES`, garbage JSON, a non-object
+  or a missing `toolUseId` / `agentType` only leaves that launch out of the index.
+  The direction is toward the plain `[tool_use: …]` marker the launch draws
+  without a meta, so a failure costs the delegation line (and, since the
+  subagent record lists that same index, the subagent's place in it: no
+  `Ctrl-X ↓` target, `←`/`→` stop or running-list row), never the transcript
+  around it. A subagent transcript the subagent view cannot open
+  (`subagents::open_transcript` takes a regular file only), or one that renders
+  no line, costs less still: the view is the one DIM
+  `[subagent transcript unreadable]` line, so the switch still visibly did
+  something. A transcript tail the background refresh cannot open, or whose
+  records do not parse, reads as a run that has NOT ended — running or not by
+  when it or a subagent below it last wrote — the direction that never drops a
+  live subagent from the running list, and assistant text whose `stop_reason`
+  is not one `FINAL_STOP_REASONS` names leans the same way, save text after a
+  hand-back, which never reopens the run the hand-back ended
+  ([DOMAIN.md](DOMAIN.md#subagent-record-and-running-list-storesubagents)). A
+  head with no readable timestamp is an unknown launch time, ordered after every
+  known one.
+  The drawn `agentType` and `description` pass
+  `store::skills::normalize_description`, like the pick list's descriptions.
 - **Reading is the default, but not the whole story.** `snapback` is
   overwhelmingly a reader of a hostile external store, and the Claude store stays
   read-only save for the one gated hard delete. It does, though, have exactly one
@@ -493,7 +517,11 @@ A fold toggle clears it too, for the same reason: `App::toggle_peer_fold` evicts
 and re-renders the previewed transcript, so the rows below the node are
 re-numbered and the selection's anchors would name other text — and the clear
 sits beside that eviction, inside the one mutator, so no route into a toggle can
-skip it.
+skip it. Switching the pane into or out of the subagent view
+(`App::open_subagent_view`, `App::leave_subagent_view`) replaces the whole render,
+and clears it the same way, and so does a write the watcher reports to the
+transcript that view shows (`App::apply_subagent_writes`), by the rule a reload
+re-reading the previewed transcript follows.
 
 A released selection is copied from an OFF-SCREEN REDRAW, not from the frame: the
 selected rows are drawn again, `view::SELECTION_COPY_CHUNK_ROWS` at a time, with the
@@ -522,13 +550,18 @@ inner rect when there is no banner (so a banner-less pane's geometry is exactly
 `Block::inner`, unchanged). The rules that follow from it:
 
 - `preview_split` is the ONE place the banner/transcript geometry is derived,
-  and `view::preview_areas` the one place the docked compose zone is carved off
-  it (`preview_compose_split`, sized by `docks_compose` + the editor's own
-  height). `render_preview` draws against `preview_areas`' rects, and
+  and `view::preview_areas` (a `PreviewAreas`) the one place the docked compose
+  zone and the running list are carved off it: the zone by
+  `preview_compose_split`, sized by `docks_compose` + the editor's own height,
+  then the running list off the transcript's bottom, sized by
+  `running_list_height` (the two never both hold rows: the list is hidden while
+  a compose box is open). `render_preview` draws against `preview_areas`' rects,
+  and
   `view::preview_transcript_rect` hands the SAME transcript rect — re-derived on
   demand from `App::preview_rect`, never stored — to EVERY pointer action over
-  the preview: BOTH click hit-tests (`update::fold_under_pointer` and
-  `update::resolve_link_click`) resolve a click against it, it supplies the width
+  the preview: EVERY click hit-test (`update::fold_under_pointer`,
+  `update::subagent_under_pointer` and `update::resolve_link_click`) resolves a
+  click against it, it supplies the width
   the fold toggle re-renders at (so the hit-test and the re-render cannot resolve
   through different widths), and the selection's press gate
   (`update::press_starts_selection`, a drag's and a double-click's word alike),
@@ -536,13 +569,21 @@ inner rect when there is no banner (so a banner-less pane's geometry is exactly
   copy's width all read it. There is no second copy of it in `update`. A click
   resolves through `App::preview_scroll` and the width-scoped hit cache, both
   measured from that rect's origin — derive it anywhere else and a click
-  silently opens the wrong link or folds the wrong node, or a drag starts on the
-  pinned row. All three mouse actions are also gated off while a surface that hides the
+  silently opens the wrong link, folds the wrong node or switches to the wrong
+  subagent, or a drag starts on the pinned row. The running list sits outside
+  that rect by the same construction, so a click on its rule or one of its rows
+  opens nothing and a drag never starts there. All four mouse actions — a fold
+  toggle, a subagent switch, a link open and a selection — are also gated off
+  while a surface that hides the
   transcript or takes the keyboard for a decision is up (`preview_pointer_blocked`:
-  a modal, a confirmation, a pending chord, or the draft card), so none fires over
+  a modal, a confirmation, a pending chord, or the draft
+  card), so none fires over
   a draft card. An open QUICK REPLY or FORK box is not in that list: its docked box is outside
   the transcript rect by construction, so a press in the box selects nothing while
-  one over the transcript acts as on the bare board. Both rects trace back
+  one over the transcript acts as on the bare board — except a click on a
+  `◆ delegated to …` line, which `update::click_effect` refuses there on a sticky
+  `SUBAGENT_VIEW_COMPOSING_REFUSAL`, since the box sends into the session whose
+  transcript the pane must keep showing. Both rects trace back
   to `preview_inner`, the ONE place the pane's border inset is applied — which
   matters most for the docked compose
   zone, because it then draws a border of its OWN: measure it from the pane's
@@ -599,10 +640,11 @@ inner rect when there is no banner (so a banner-less pane's geometry is exactly
   TRANSCRIPT, and the match map is keyed by transcript line, so a window adds its
   own start index back before looking one up.
 - **The CLICK reads that same map, and `view::line_at_row` is the one place a row
-  becomes a line.** `row_window` starts the window with it, and BOTH click consumers
-  resolve their ROW with it — `link_at` (a url to open) and `fold_at` (the fold key
-  of a node to toggle — a peer message or injected context) — so the paint and the
-  two hit-tests cannot disagree about
+  becomes a line.** `row_window` starts the window with it, and EVERY click consumer
+  resolves its ROW with it — `link_at` (a url to open), `fold_at` (the fold key of
+  a node to toggle — a peer message or injected context) and `subagent_at` (the
+  subagent a `◆ delegated to …` line switches the pane to) — so the paint and the
+  hit-tests cannot disagree about
   which line sits where. That is the failure a second derivation guarantees, and the
   one that nearly landed: the first cut of `content_hit` kept only the ROW half of
   its pane guard and clamped the column, which aliased every click LEFT of the pane's
@@ -612,15 +654,16 @@ inner rect when there is no banner (so a banner-less pane's geometry is exactly
   per-line model instead — a packing walk down the whole transcript — grew the error
   with every wrapping line above the click, bounded by nothing once the preview's
   600-line tail cap was deleted.
-- **The two hit-tests part on the COLUMN, and only the FOLD still approximates.**
-  `fold_at` takes the character-packed answer from the private `content_hit`
+- **The hit-tests part on the COLUMN, and only the whole-line ones approximate.**
+  `fold_at` and `subagent_at` take the character-packed answer from the private
+  `content_hit`
   (`sub_row * inner_width`, packed because the wrapper will not say where inside a
   line it broke), so its error is bounded by ONE logical line's wrapped extent and
   can never reach another line whichever way that column slips — and it slips BOTH
   ways. `content_hit`'s doc comment owns the two directions and what each one costs
-  a click; do not restate them. The bound is harmless there because a `FoldRegion`
-  claims its header's whole display width, so a slipped column lands on the same
-  node either way. A link label occupies only part of its row and could not afford
+  a click; do not restate them. The bound is harmless there because a
+  `FoldRegion` claims its header's whole display width, and a `SubagentRegion` its
+  line's, so a slipped column lands on the same line's target either way. A link label occupies only part of its row and could not afford
   it, which is what the probe below buys.
 - **Which CELL of that line was clicked is asked of the RENDERER too, by a PROBE.**
   `view::region_paints_cell` re-styles one candidate `LinkRegion`'s graphemes with a
@@ -760,7 +803,12 @@ inner rect when there is no banner (so a banner-less pane's geometry is exactly
   and a drag held past the pane's edge included, on a step whose autoscroll
   actually moves the pane), and only `End` (or its `Ctrl-E` twin; an open quick reply or fork box answers every scroll key through the same methods), another row, or a layout change that
   brings the pane back from 1:0 (`App::set_pane_layout`, which `Shift-←` and an
-  opening compose both go through) re-arms it. A step between two layouts that
+  opening compose both go through), or a switch of the pane to a subagent's
+  transcript (`App::open_subagent_view`: a click on its delegation line,
+  `Ctrl-X ↓`, or a `←`/`→` step inside the view) re-arms it; leaving that view
+  (`↑`, `Esc`, `Ctrl-X ↓` again, an opening reply or fork box) puts back the
+  session pane's own flag and offset. A
+  step between two layouts that
   both show the pane neither arms nor releases it. The render writes the flag for
   exactly one thing, the match jump it alone can resolve, and
   never infers a re-arm from its own CLAMP: an offset the content cannot satisfy
@@ -789,7 +837,10 @@ inner rect when there is no banner (so a banner-less pane's geometry is exactly
   the marker. So the failure takes the sticky header's place — and
   the live status's — on that session until the user writes into it, and the
   reported status alone is only the fallback for a transcript with no marker and
-  no standing failure. None of that
+  no standing failure. The SUBAGENT VIEW takes none of that precedence but the
+  marker: the row names the subagent's own turn at the top of the view, or stays
+  blank, and shows nothing of the session's, so the view never reads as the
+  session's transcript. None of that
   touches the reservation: the remap is `Option::map`, so a failure can neither
   add a row nor revive one a replacement pane suppressed. Keying it on the
   polled `--all` map hid the pinned turn for every session claude does not list —
@@ -862,7 +913,10 @@ variant, the shutdown flag read at the top of every loop turn, a failed send as 
 secondary exit — and a `join()` if, and only if, it holds something the next board
 session or a spawned child needs back (stdin is the one instance). Reason about
 the flag FIRST: "it exits when the send fails" is an argument about a send the
-thread may never attempt. The quick-reply send (`send::spawn_send`) is the
+thread may never attempt. A worker that blocks on a REQUEST channel instead
+needs no flag: the board session owns that channel's only sender, so the
+worker's `recv` is guaranteed to fail when the session drops it — the subagent
+refresh below is the instance. The quick-reply send (`send::spawn_send`) is the
 reference instance: a **one-shot** detached thread — spawned per `Ctrl-R` send or
 `Ctrl-F` headless fork, not a poller — that runs the multi-second `claude -p` child to completion and delivers a
 single `AppEvent::SendFinished`. It mirrors `resume::open_url` (fire-and-forget off
@@ -992,6 +1046,31 @@ as `spawn_send` does and for the same reason: that event alone clears those
 sessions' `App::moving` entries, which keep the rows' own keys off a transcript a
 child may still be renaming, so a hand-off on another row must not lose it.
 
+The selected session's subagent refresh (`watch::SubagentRefresh`) is the ninth,
+and the one that is neither a one-shot nor a poller: ONE long-lived worker per
+board session, started by `EventLoop::spawn_subagent_refresh` from `run_inner`,
+that reads a session's subagents (`store::subagents::read_record`, stat-first:
+what it reads is [DOMAIN.md](DOMAIN.md#subagent-record-and-running-list-storesubagents)'s)
+for each REQUEST it takes up and answers each with one `AppEvent::SubagentRuns`
+naming the session. It keeps the catalog fetch's split of decision from effect:
+the pure `App::take_subagent_refresh` derives "read this session now" from state
+(a new selection, or a `SubagentsWritten` under its `subagents/`), the run loop
+asks it before every draw, and only the driver hands the answer to the worker,
+so no key handler, wheel notch, search keystroke or reload reads a subagent dir
+or starts a thread. A session can hold hundreds of subagents, and a held arrow
+key moves the selection many times a second, so the worker is LATEST-WINS: it
+blocks for a request, drains every request queued behind it and reads only the
+newest, so a burst costs one read for the row it stops on, never a thread or a
+read per press. It is bounded by OWNERSHIP, the watcher's way, not by the
+shutdown flag: the `SubagentRefresh` handle `run_inner` holds is the request
+channel's only sender, so when the board session ends the worker's blocking
+`recv` fails and it exits once any read in flight finishes, unjoined, so
+teardown never waits on a read; a failed send is the secondary exit. Its answer
+to the dying channel is lost, so `handle_event`'s teardown seam forgets the last
+request (`App::forget_subagent_request`) and the next board asks anew.
+`spawn_subagent_refresh_thread` takes its `read` as a parameter, the seam the
+suite states (and blocks) answers through.
+
 The rule is about the **poll cadence**, not about the word "shell-out". A
 ONE-SHOT at hand-off is a different thing and is allowed — `agents::live_agents`
 is the instance, directly analogous to `resume`'s authoritative re-read of
@@ -1103,8 +1182,9 @@ assert the error path and call that coverage. It carries no decision of its own
 everything downstream of it is pinned through the seam. The `run_inner` lines that
 START these threads (`spawn_agents_poller`, `spawn_model_alias_probe`,
 `spawn_settings_model_probe`, the `claude_catalog::spawn_fetch` call behind
-`compose::take_catalog_fetch`, and the `claude_move::spawn_move` call behind
-`Outcome::Move`) are
+`compose::take_catalog_fetch`, the `claude_move::spawn_move` call behind
+`Outcome::Move`, and the `EventLoop::spawn_subagent_refresh` call with the
+`request` behind `App::take_subagent_refresh`) are
 accepted the same way and for the same reason: `run_inner` needs a real terminal,
 so there is nothing to assert them from, while the thread's shape is pinned
 through the seam and the event's effect through `update::dispatch` — the gap is
@@ -1143,6 +1223,42 @@ snapback process runs that same short section, and the OS releases it when the
 holder's handle closes, a dead holder's included. The read side is no keystroke
 at all: every reload re-reads that file once, without the lock, inside the reload
 one-shot ([DOMAIN.md](DOMAIN.md#snapback-owned-state-srchiddenrs)).
+
+The preview's CACHE-MISS render is a read the DRAW itself can trigger, and it is
+its own class: `App::ensure_preview` renders the selected transcript on
+the first frame after a row is selected, after a resize or layout step changes
+the pane's width, and after a reload re-read that transcript, and
+`App::toggle_peer_fold` re-renders inside a click's release. Every frame after
+that reads the `(session, width)` cache entry, never the disk. A render reads
+two things, all on the UI thread: the session file, and the session's own
+`subagents/` dir with its meta files (`store::subagents::index_for`: one
+listing, each meta capped at `META_MAX_BYTES`). The SUBAGENT VIEW's render, cached
+apart (`App::ensure_subagent_preview`), reads one subagent transcript
+(`subagents::open_transcript`) besides that index, and only ever because a CLICK
+on a `◆ delegated to …` line, `Ctrl-X ↓` or a `←`/`→` step inside the view
+switched the pane to it: no search step, reload or other keystroke can open the
+view ([DOMAIN.md](DOMAIN.md#delegation-line-and-subagent-view-storepreview)).
+Keep it that way — a subagent transcript rendered with no view one of those
+opened is the regression. The subagent refresh above never renders a
+transcript, and runs off this thread. Once the
+view is open, its render is redone on every eviction, never on a frame alone: the
+session render's own triggers above evict it too (a width change, a reload that
+re-read the parent session, a fold toggle in it), and so does the watcher's
+`AppEvent::SubagentsWritten` naming its transcript, so a running subagent's
+transcript is re-read at most once per debounce batch — the cadence a live
+session's own render is redone at — and a write to any other subagent renders
+nothing (under the selected session it only has the subagent record read again,
+on the refresh's worker). DOMAIN.md's "The view updates as the subagent writes" lists every
+trigger. What a render
+costs, and why moving it off the UI thread is the worse trade, is argued once,
+in `App::ensure_preview`'s doc and, for the view, `App::ensure_subagent_preview`'s;
+do not restate figures here. One consequence is ACCEPTED rather than solved:
+each write re-renders the WHOLE transcript, so watching a large RUNNING subagent
+pays a full render up to five times a second (once per `watch::DEBOUNCE`
+batch), exactly as watching a live session's own transcript already does. If
+that bites, the known fix is to render only the records appended since the last
+render, for subagent and session transcripts alike — not a cache or a thread of
+the view's own.
 
 ## 7. Restrained, terminal-safe styling
 
@@ -1314,7 +1430,8 @@ CADENCES and LIMITS, so a retune knows what it is next to:
 | `store::label` | `LABEL_MAX` (180) |
 | `search` | `PROXIMITY_WINDOW_MIN_BYTES` (200) · `PROXIMITY_WINDOW_QUERY_MULTIPLIER` (3) · `PROXIMITY_MAX_ANCHORS` (512 — asked of the rarest atom alone; see [DOMAIN.md](DOMAIN.md#content-index-storeparse)) |
 | `model_aliases` | `MAX_ALIAS_ARRAY_BYTES` (4096) · `SCAN_CHUNK_BYTES` (1 MiB) · `SCAN_OVERLAP_BYTES` (= `MAX_ALIAS_ARRAY_BYTES` by definition — that equality is what proves no match straddles a chunk unseen, so neither is retuned alone) |
-| `store::preview` | `MODEL_VERSION_MAX_DIGITS` (2) · `MODEL_DATE_DIGITS` (8 — kept above the version cap so a date never reads as a version) · `TABLE_MIN_COL_WIDTH` (10) · `RECORD_RULE_WIDTH` (32) · `COLUMN_RULE_WIDTH` (3) · `ELLIPSIS_WIDTH` (1) · `PEER_STEM_LEN` (17 — the agent-stem length a peer sender must match before it renders as an `@handle`, so a socket path or an agent TYPE name falls back to the generic label) · `PEER_HEADER_BLOCK_ROW` (1 — not a knob but a SHAPE: every fold node's header index — peer and injected alike — inside its own `[blank, header, body…]` block, named so the fold region and the body links rebase off one number) |
+| `store::preview` | `MODEL_VERSION_MAX_DIGITS` (2) · `MODEL_DATE_DIGITS` (8 — kept above the version cap so a date never reads as a version) · `TABLE_MIN_COL_WIDTH` (10) · `RECORD_RULE_WIDTH` (32) · `COLUMN_RULE_WIDTH` (3) · `ELLIPSIS_WIDTH` (1) · `PEER_STEM_LEN` (17 — the agent-stem length a peer sender must match before it renders as an `@handle`, so a socket path or an agent TYPE name falls back to the generic label) · `PEER_HEADER_BLOCK_ROW` (1 — not a knob but a SHAPE: a peer or injected node's header index inside its own `[blank, header, body…]` block, named so the fold region and the body links rebase off one number) · `DELEGATION_HEADER_BLOCK_ROW` (0 — a SHAPE too: a delegation line leads its block with no blank separator, so it costs exactly the one line of the marker it replaces) |
+| `store::subagents` | `META_MAX_BYTES` (64 KiB — the largest of 1811 meta files measured 264 bytes on 2026-10-11, so the cap refuses only a file that is not a meta and bounds what a hostile one can make a render read) · `TAIL_MAX_BYTES` (64 KiB — the end of a transcript the background subagent refresh reads, only for one that can be running; every measured tail held a complete turn, 2026-10-12) · `HEAD_MAX_BYTES` (64 KiB — the head it reads for a launch time; the largest first record of 2,049 measured 28,646 bytes, 2026-10-13) · `RUNNING_WINDOW` (10 min — how long an unfinished subagent, counting its sub-subagents' writes, may stay silent and still read as running; at 10 minutes 2.9% of real runs show a longer silence while still running, 2026-10-12) |
 | `send` | `SEND_ERROR_MAX` (200) |
 | `claude_catalog` | `CATALOG_FETCH_TIMEOUT` (10 s — bounds the reply, the close of stdout AND the exit; the reply measured 0.21–0.22 s) · `CATALOG_READER_GRACE` (500 ms — how long a timed-out fetch waits, after the group and child kills, for its stdout reader to see EOF; the worker's worst case is the timeout plus this) · `CATALOG_EXIT_POLL` (20 ms — claude exits 25–50 ms after its stdin's EOF) |
 | `claude_move` | `MOVE_TIMEOUT` (30 s — the answer, the close of stdout AND the exit together; a move measured ~0.7 s end to end on a small transcript at claude 2.1.291, and `-r` loads the whole transcript first, so the cap only ever cuts off a stuck child) |
@@ -1322,7 +1439,7 @@ CADENCES and LIMITS, so a retune knows what it is next to:
 | `tui::complete` | `COMPLETION_MAX_DIR_ENTRIES` (2000 — one keystroke's worst read of a huge folder) · `COMPLETION_MAX_TREE_ENTRIES` (25000 — the whole `@` walk, breadth first, no depth cap: a depth cap hid a 9-level monorepo path) · `COMPLETION_VISIBLE_ROWS` (8) |
 | `tui::app` | `PREVIEW_WHEEL_STEP` (2) · `LIST_WHEEL_STEP` (1) · `STATUS_DWELL_TICKS` (16) · `MIN_PANE_WIDTH` (15) · the list's share of the body per split `PaneLayout` stop: `PREVIEW_WIDE_LIST_PERCENT` (25) / `DEFAULT_LIST_PERCENT` (48) / `LIST_WIDE_LIST_PERCENT` (75) · a held drag's autoscroll: `AUTOSCROLL_FRAME` (33 ms, the run loop's wait deadline while one is held past the edge — §7's one exception to animating from the tick) / `AUTOSCROLL_PAGE_PERIOD` (1 s, a page per row past the edge) / `AUTOSCROLL_MAX_DISTANCE` (4) |
 | `tui::update` | `PASTE_MAX_CHARS` (4096) |
-| `tui::view` | `BLINK_TICKS` (2) · `CHILD_ID_CHARS` (8) · `MATCH_JUMP_LEAD_DIVISOR` (3 — a jumped-to match parks `h / 3` rows down) · `WIDE_GLYPH_COLUMNS` (2) · `LINK_PROBE_BYTE_BUDGET` (131_072) · the layout rows `PREVIEW_BANNER_ROWS` / `BOARD_CHROME_ROWS` / `COMPOSE_*` / `MODAL_WIDTH` / `MODAL_*_CHROME_ROWS` / `MODAL_BORDER_ROWS` / `MODAL_BORDER_COLS` / `MODAL_LIST_MAX_ROWS` (12 — the most CHOICES a `List` picker offers before it scrolls, so an overlay stays an overlay on a tall terminal; a wrapped row's extra lines are paid on top, see [§5](#5-selection-and-scroll-survive-reloads)) · the compose pick list's `COMPLETION_BORDER_ROWS` / `COMPLETION_COLUMN_GAP` (2 — the table's only separator) / `COMPLETION_NAME_MAX_PERCENT` (50 — descriptions keep the other half of the box) |
+| `tui::view` | `BLINK_TICKS` (2) · `CHILD_ID_CHARS` (8) · `MATCH_JUMP_LEAD_DIVISOR` (3 — a jumped-to match parks `h / 3` rows down) · `WIDE_GLYPH_COLUMNS` (2) · `LINK_PROBE_BYTE_BUDGET` (131_072) · the layout rows `PREVIEW_BANNER_ROWS` / `BOARD_CHROME_ROWS` / `COMPOSE_*` / `MODAL_WIDTH` / `MODAL_*_CHROME_ROWS` / `MODAL_BORDER_ROWS` / `MODAL_BORDER_COLS` / `MODAL_LIST_MAX_ROWS` (12 — the most CHOICES a `List` picker offers before it scrolls, so an overlay stays an overlay on a tall terminal; a wrapped row's extra lines are paid on top, see [§5](#5-selection-and-scroll-survive-reloads)) · the preview's running list: `RUNNING_LIST_MAX_ROWS` (5 — the subagents it gives a row before a `+N more` line; at most 5 ran at once in 185 of 189 measured sessions, 2026-10-13) / `RUNNING_LIST_PANE_SHARE` (2 — the whole list takes at most half the rows under the pinned row, else it shrinks to one line) · the compose pick list's `COMPLETION_BORDER_ROWS` / `COMPLETION_COLUMN_GAP` (2 — the table's only separator) / `COMPLETION_NAME_MAX_PERCENT` (50 — descriptions keep the other half of the box) |
 
 Add a new tunable the same way. The rule is not only about numbers — a literal
 with a meaning gets a name whatever its type: the undocumented `claude` wire
@@ -1341,7 +1458,11 @@ spellings and locations it refuses a worktree pointer into, `UNC_PREFIX`,
 `BACKSLASH`, `NT_OBJECT_MARKER`, `REFUSED_MOUNT_ROOTS`, `HOME_MOUNT_ROOT`,
 `FIRMLINK_PREFIX` and `MOUNT_NAME_FORMAT_CHARS`; `store::skills`'
 `AGENT_LISTING_MARKER` and the line shapes `LISTING_LINE_PREFIX`,
-`NAME_DESCRIPTION_SEPARATOR` and `AGENT_TOOLS_SUFFIX`;
+`NAME_DESCRIPTION_SEPARATOR` and `AGENT_TOOLS_SUFFIX`; `store::subagents`' on-disk
+name shapes `SUBAGENTS_DIR`, `AGENT_FILE_PREFIX`, `META_FILE_SUFFIX` and
+`TRANSCRIPT_FILE_SUFFIX`, the version-pinned tool name `HANDBACK_TOOL` that
+ends a subagent's run, and the measured `stop_reason` tokens
+`FINAL_STOP_REASONS` that make its text a final reply;
 `tui::complete`'s `AGENT_MENTION_PREFIX` / `AGENT_LABEL_SUFFIX` /
 `COMMAND_LABEL_PREFIX`, and its token splitters `QUERY_PART_SEPARATORS` and
 `ROOT_FALLBACK_SEPARATORS`, the second built from the first), the raw control bytes the
@@ -1393,12 +1514,12 @@ take the narrow allow instead.
 
 Input handling is a three-stage pipeline, all terminal-free and testable:
 
-1. `key_to_action(key, query_empty, has_preview_matches)` → an `Action` (every
-   printable char types into the query; arrows, Enter, Tab, and `Ctrl-*` always
-   act so search never blocks navigation).
+1. `key_to_action(key, query_empty, has_preview_matches, in_subagent_view)` → an
+   `Action` (every printable char types into the query; arrows, Enter, Tab, and
+   `Ctrl-*` always act so search never blocks navigation).
 2. `apply_action` mutates the `App` and returns an `Outcome`
-   (`Continue`/`Quit`/`Resume`/`Send`/`Move`/`Interrupt`/`BgLaunch`/`Signal`; `Copy` comes
-   from `handle_chord_key` and `FinishCopy` from `handle_event`, below). `Send`,
+   (`Continue`/`Quit`/`Resume`/`Send`/`Move`/`Interrupt`/`BgLaunch`/`Signal`; `Copy`
+   comes from `handle_chord_key` and `FinishCopy` from `handle_event`, below). `Send`,
    `Move`, `Interrupt` and `BgLaunch` carry a confirmed `SendRequest` / `MoveJob` /
    `InterruptRequest` / `BgLaunchRequest` the driver spawns without a teardown (the
    board stays up; `Move` comes from the move picker's confirm or its lineage
@@ -1411,7 +1532,10 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    `handle_chord_key` returns `Outcome::Copy` (the full id) — and a finished
    preview drag returns it with the selected text — for the driver to start, and `handle_event` turns the worker's `AppEvent::CopyFinished` into
    `Outcome::FinishCopy` rather than finishing it itself, because its OSC 52
-   fallback is a terminal write only the driver may make (§6).
+   fallback is a terminal write only the driver may make (§6). The chord's `↓`
+   verb has no driver effect at all: it opens the subagent view from the record
+   the background refresh already landed, reading no file, and returns
+   `Continue`.
    Which of the two shapes a new action takes is decided by the CHILD, not by what
    it is called: a background-agent launch is `--bg` (returns at once, needs no
    TTY) so it stays on the no-teardown side, while its `Ctrl-O` twin hands the
@@ -1419,7 +1543,7 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    OPERATES on a session picks the headless child (AGENTS.md DRIVE `claude`
    HEADLESSLY): the `Ctrl-X w` move is a `set_cwd` child, not an interactive `/cd`.
 3. Modal state owns the keyboard: ONE `App.modal: Option<Modal>` serves every
-   titled overlay — the running-session choice, the new-session agent picker, a
+   titled overlay whose choices are fixed when it opens — the running-session choice, the new-session agent picker, a
    compose's `Ctrl-L` model picker, the `Ctrl-X w` move picker and its lineage
    scope confirm, and the hard-delete confirm — through the generic `modal_key` →
    `confirm_modal`
@@ -1440,11 +1564,13 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    overlay kind), because the `List` pickers (agent, model, move) share a key map but not what the
    keys do — a layout-derived footer advertised the agent picker's
    `Enter draft · ^O interactive` on the model picker, where `Ctrl-O` is inert. Four
-   more keyboard owners sit alongside it: the `Ctrl-X` leader chord (while
+   more keyboard owners sit alongside it: the
+   `Ctrl-X` leader chord (while
    `App.pending_chord` is set, `chord_key` routes the next key — `x` hide, `d`
    delete-confirm, `h` show-hidden, `r` forced full store re-read, `y` copy
    session ID, `f` fold / expand the selected row's lineage, `w` open the
-   move-to-worktree picker, anything else cancels), the "stop the
+   move-to-worktree picker, `↓` open the subagent view or leave it, anything
+   else cancels), the "stop the
    waiting agent?" confirmation via `App.pending_stop` (a plain Enter/Esc gate
    before compose, for the `needs input` quick-reply path), its `Ctrl-K` sibling
    `App.pending_interrupt` (the same Enter/Esc gate, but resolving to a bare
@@ -1464,24 +1590,31 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    straight back to the untouched draft, with no state saved or restored.
    `App::preview_pointer_blocked` (`modal.is_some() || draft.is_some() ||
    pending_stop.is_some() || pending_interrupt.is_some() || pending_chord`) gates
-   the mouse's three actions over the preview — toggling a fold node, opening a
-   preview link, and starting a preview selection (a drag-select, or a
-   double-click's word-select) — so none fires while any is up. An open QUICK
+   the mouse's four actions over the preview — toggling a fold node, switching
+   the pane to a subagent, opening a preview link, and starting a preview
+   selection (a drag-select, or a double-click's word-select) — so none fires
+   while any is up. An open QUICK
    REPLY or FORK box (`compose` with no `draft`) is deliberately absent: it owns the keyboard
    but previews the REAL transcript above its own docked box, and none of the
-   three actions touches what it holds — its text and caret, its target session
+   four actions touches what it holds — its text and caret, its target session
    id, or the row selection that id is addressed by. A selection is mouse state
    that any key ends (so typing never fights it), a fold toggle re-renders the
-   same session, and a link opens in the browser. A new-session draft is still
+   same session, and a link opens in the browser. The subagent switch alone would
+   change what the pane shows beneath the box, so `update::click_effect` refuses
+   that one click itself (below) rather than the gate taking the other three
+   away. A new-session draft is still
    gated, by its `draft` card (`App::open_compose` installs editor and card
-   together). All three begin from a left PRESS the one gate
+   together). All four begin from a left PRESS the one gate
    (`update::press_starts_selection`) admits; the press only RECORDS where it
    landed — a second admitted press on the same cell within
    `DOUBLE_CLICK_INTERVAL` records the word under it instead — and the RELEASE
    resolves it: a drag or a double-clicked word selects and copies, a plain click
-   toggles the fold under the press, else opens the link there. So a press the
-   gate refuses leaves its release nothing to act on, and is no first half of a
-   double-click either. A mouse
+   toggles the fold under the press, else switches the pane to the subagent a
+   `◆ delegated to …` line there names (refused on a sticky status line,
+   `SUBAGENT_VIEW_COMPOSING_REFUSAL`, while a quick reply or fork box is open,
+   since what the box sends lands in the session), else opens the link there. So
+   a press the gate refuses leaves its release nothing to act on, and is no first
+   half of a double-click either. A mouse
    wheel is handled **before** and **independent of** that gate: it never routes
    into an overlay handler, it only scrolls a pane, and it (like any keypress)
    clears an active preview text selection first. The selection is
@@ -1493,11 +1626,12 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    added to `preview_pointer_blocked` or left out: does a click, a fold toggle or
    a selection over the transcript act on a decision it is waiting for, or on
    text it has hidden? If so it belongs there, or the mouse will act underneath
-   it; if the owner leaves the transcript on screen and the three actions leave
+   it; if the owner leaves the transcript on screen and the four actions leave
    its state alone (the quick reply, the fork box), blocking them only costs the user the mouse.
    What stays blocked while a reply or fork box is open is everything that would
-   change which row is selected, which is the target's identity: the wheel over
-   the LIST (below) and every key, since all of them are the box's.
+   change which row is selected, which is the target's identity — the wheel over
+   the LIST (below) and every key, since all of them are the box's — and the one
+   click that would change which transcript the pane shows, the subagent switch.
 
    The wheel takes exactly ONE condition, and `update::wheel_target` owns it as a
    parameter (`composing`) the way `key_to_action` owns its own. It hit-tests
@@ -1582,7 +1716,8 @@ four, and each theft reads as the key doing nothing. The board binds its keys in
 for the word delete that also puts the caret back at the cut without the widget's
 `u16` column jump — `App::pop_query_word`'s doc comment says why), each
 routed through `App::apply_query_change` exactly ONCE so a keypress still costs
-one re-filter. The caret itself moves a character on `←`/`→`
+one re-filter. The caret itself moves a character on `←`/`→` outside the
+subagent view (inside it they step subagents)
 (`App::move_query_caret`, `CursorMove::Back`/`Forward`) and a word on the word
 hops — `Alt-←`/`Alt-→`, `Alt-b`/`Alt-f`, `Ctrl-←`/`Ctrl-→`
 (`App::move_query_caret_by_word`, the widget's own
@@ -1653,13 +1788,19 @@ reply or fork, not an oversight: do not add alternative chords for them.
 
 A binding that is only meaningful sometimes is **CONDITIONAL, and falls through**
 rather than going inert. `key_to_action` takes the conditions as parameters
-(`query_empty`, `has_preview_matches`) so the decision stays pure and the
+(`query_empty`, `has_preview_matches`, `in_subagent_view`) so the decision stays
+pure and the
 fall-through is what a test can pin; the guarded arm sits ABOVE the unguarded one
 and the unguarded one is reached whenever the guard fails. The shifted VERTICAL
 arrows are the instance: with nothing marked to move between they are
-bit-for-bit the `MoveUp`/`MoveDown` they have always been, so a user who never
-searches loses nothing AND a terminal that drops the modifier degrades to a
-working key. The shifted HORIZONTAL arrows are the contrast: `Shift-←`/`Shift-→`
+bit-for-bit the plain arrows — the `MoveUp`/`MoveDown` they have always been —
+so a user who never searches loses nothing AND a terminal that drops the
+modifier degrades to a working key. The plain `↑` is conditional on the
+subagent view: there it is `LeaveSubagentView`, query or not, from an arm
+BELOW the `Shift-Up` match step and above `MoveUp`; the view takes no marks, so
+the match guard fails there and `Shift-Up` falls through to leaving the view
+too (`shift_up_in_the_subagent_view_falls_through_to_leaving_it`), while the
+plain `↓` stays `MoveDown` everywhere. The shifted HORIZONTAL arrows are the contrast: `Shift-←`/`Shift-→`
 step the `PaneLayout` UNCONDITIONALLY, taking neither parameter — but their arms
 still sit above the plain `Left`/`Right` caret arms, because the unguarded arm
 matches the shifted key too and the first matching arm wins
@@ -1667,14 +1808,19 @@ matches the shifted key too and the first matching arm wins
 `Alt` word-hop arms as well, so `Shift-Alt-←` still steps the layout
 (`a_held_shift_wins_over_the_alt_word_hop_arms`). A dropped
 modifier degrades them to a search-caret step, a working key if not the one
-pressed. The plain arrows are unconditional too: they move the caret with or
-without a query, and the lineage fold is the `Ctrl-X f` chord verb, so caret
-movement and folding never share a key. Prefer
+pressed. The plain arrows are conditional on the subagent view alone: outside
+it they move the caret with or without a query; while it is up they step the
+session's subagents, query or not — the accepted trade, since the `Alt` and
+`Ctrl` word hops, whose arms sit above theirs, still move the caret by word
+(`the_plain_arrows_step_subagents_only_in_the_view_and_modified_ones_keep_their_meaning`).
+The lineage fold is the `Ctrl-X f` chord verb, so caret movement and folding
+never share a key. Prefer
 `Shift`+key over `Alt`+key for anything new here: snapback never pushes the kitty
 keyboard protocol and clears it on every board (re)entry
 (`tui::reset_terminal_state`), so on default macOS terminals `Alt` arrives as a
 composed character that types junk into the query, and a split `ESC` read
-surfaces as a bare `Esc` — which quits an empty-query board. `Shift` rides the ordinary
+surfaces as a bare `Esc` — which quits an empty-query board (outside the subagent
+view, which it leaves instead). `Shift` rides the ordinary
 `CSI 1;2<final>` encoding crossterm already decodes into a `KeyModifiers::SHIFT`.
 
 `Alt` is bindable in ONE narrow case: the binding MIRRORS a gesture the compose
@@ -1694,7 +1840,8 @@ for Option.
 
 The exception does not WAIVE the hazard above, it ACCEPTS it: a split `ESC` read
 on a slow or multiplexed link can surface an `ESC`-prefixed key (`Alt-Backspace`,
-`Alt-b`) as a bare `Esc`, and a bare `Esc` quits an empty-query board — so the keys this
+`Alt-b`) as a bare `Esc`, and a bare `Esc` quits an empty-query board (or leaves the
+subagent view) — so the keys this
 case blesses can drop the user off the board instead of deleting or hopping a
 word. It is taken anyway on two grounds. `⌥⌫` and `⌥←`/`⌥→` are the gestures
 users actually press, and were the originating requests for the two features;
@@ -1755,7 +1902,14 @@ state and renders on the surface that owns it:
   wall-clock instant the poller's map was answered. The poller stamps it
   (`AppEvent::ReportedAgents { agents, reported_at_ms }`) and the event arm only
   stores it, so the age is "as of the last poll", no clock is read in render, and
-  applying a map never writes `App::status`.
+  applying a map never writes `App::status`;
+- which of the selected session's subagents are running lives in the subagent
+  record (`App::selected_subagents`, landed silently by `AppEvent::SubagentRuns`)
+  and renders as the preview's running list (`view::running_list`), not on
+  the help line: it is judged at draw time against `App::wall_clock`, which the
+  `Tick` and each landed record stamp, so no clock is read in render. What does
+  reach the status line is a keypress's outcome: `Ctrl-X ↓`'s and `←`/`→`'s two
+  sticky refusals while the record has not landed or lists no subagent.
 
 `Ctrl-K`'s SIGTERM is the opposite case, an OUTCOME: the driver hands the
 syscall's result to `update::show_signal_result`, which sets `SIGNAL_SENT` /
@@ -1892,7 +2046,15 @@ Tests are **inline** `#[cfg(test)] mod tests` at the bottom of each source file
   paths), the two BARE kinds (`human`, `task-notification` — no `from`, no
   `body`), and a record with NO `origin` whose content quotes the
   `<agent-message …>` frame inside a fenced block, which pins that the text frame
-  alone collapses nothing. Under `-Users-me-project-zeta`, one COMMAND-STARTED
+  alone collapses nothing. Beside them, ONE DELEGATION session,
+  `sess-delegation-1`, with a `subagents/` dir of its own: an `Agent` launch
+  whose meta's description spells a markdown link, an `Agent` launch with NO
+  meta, a `Task`-named launch that DOES join (the join ignores the name), that
+  first agent's peer hand-back, and a closing turn a day after the subagent's
+  last record. The dir holds the three meta files with
+  their transcripts — the first launching a nested agent — and a forked skill's
+  two decoys, which carry valid meta keys so only the name rule keeps them out.
+  Under `-Users-me-project-zeta`, one COMMAND-STARTED
   session in the real record order: an `isMeta` caveat, a LOCAL `/model` with its
   `<local-command-stdout>`, then a PROMPT command whose `isMeta` skill body
   follows it with `parentUuid` pointing back — it pins the `/name args` label,
@@ -1913,7 +2075,13 @@ Tests are **inline** `#[cfg(test)] mod tests` at the bottom of each source file
   effort readings), `tests/fixtures/skill_listing/` (`listing.jsonl`: real
   record shapes with shortened descriptions — the `agent_listing_delta` records
   `store::skills` reads, beside a `skill_listing` record and a non-JSON line it
-  must skip) and `tests/fixtures/claude_catalog/` (two trimmed claude 2.1.284
+  must skip), `tests/fixtures/subagent_status/` (four subagent transcripts, one per tail
+  shape `store::subagents::run_ended` decides: three trimmed from claude 2.1.226
+  and 2.1.296 records — a `SubagentHandback` answered as the last turn, a final
+  reply, and a launch still waiting on its sub-subagent — and `mid-turn.jsonl`,
+  in claude 2.1.296's shape, a narration written ahead of its `tool_use` whose
+  `stop_reason` is still null, so the run stays open) and
+  `tests/fixtures/claude_catalog/` (two trimmed claude 2.1.284
   `initialize` replies, every body key but `commands` and `agents` removed —
   `account` among them — whose `request_id` the test restamps:
   `initialize_response.json`, and `initialize_hidden_builtins.json`, which keeps

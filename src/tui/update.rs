@@ -15,6 +15,12 @@
 //! preview drag-selection), but hands it back to the driver
 //! ([`Outcome::FinishCopy`]) because only the driver holds the writer its OSC 52
 //! fallback needs.
+//! `ModelAliases` and `SettingsModel` store the one answer each of the `--model`
+//! alias probe and the settings read. `SubagentsWritten`, the watcher's batch of
+//! subagent transcript writes, draws the subagent view again when it shows one of
+//! them and marks the selected session's subagent record to be read again — never
+//! a reload — and `SubagentRuns` lands the background refresh's record while it
+//! still names the selected session.
 //! Because such a result can arrive after the board it belongs to is gone,
 //! [`handle_event`] closes the compose surface, and forgets every compose
 //! pick-list catalog fetch still in flight (`CatalogFetched`), on any [`Outcome`]
@@ -25,9 +31,9 @@
 //! and returns an [`Outcome`] telling the driver (in [`crate::tui`]) whether to
 //! continue, quit, hand off a resume, fire one of the four no-teardown children
 //! (`Send` / `Move` / `Interrupt` / `BgLaunch`), deliver `Ctrl-K`'s child-free SIGTERM
-//! (`Signal`, a `kill(2)` the driver runs inline — see [`Outcome::Signal`]), or
-//! start / finish a clipboard copy — `Ctrl-X y`'s id or a preview drag-selection —
-//! (`Copy` / `FinishCopy`). All of it is
+//! (`Signal`, a `kill(2)` the driver runs inline — see [`Outcome::Signal`]),
+//! or start / finish a clipboard copy — `Ctrl-X y`'s id or a preview
+//! drag-selection — (`Copy` / `FinishCopy`). All of it is
 //! terminal-free and unit tested; the terminal-driving loop that calls it lives in
 //! [`crate::tui::run`].
 //!
@@ -35,8 +41,10 @@
 //!
 //! | Key | Action |
 //! | --- | ------ |
-//! | `Up` / `Down` | move selection (always) |
-//! | `Left` / `Right` | move the search query's caret one character back / forward (always). Not a query change: the list, the selection and the preview stay exactly where they were |
+//! | `Up` / `Down` | move selection: `Down` always, `Up` outside the subagent view. Inside the view `Up` goes back to the session's own transcript instead (the next row) |
+//! | `Up` (in the subagent view) | leave the view for the SELECTED session's own transcript, scrolled where it was, with the selection unchanged — what `Esc` does there with an empty query, straight back from a nested subagent too. Bound whenever the view is up, EVEN WITH A QUERY TYPED, and it never clears the query (`Esc` clears a typed one first). `Shift-Up` does the same: the view takes no search marks, so it falls through to this row (see [`App::leave_subagent_view`]) |
+//! | `Left` / `Right` | outside the subagent view: move the search query's caret one character back / forward. Not a query change: the list, the selection and the preview stay exactly where they were. Inside the view they step subagents instead (the next row) |
+//! | `Left` / `Right` (in the subagent view) | switch the preview to the previous / next subagent of the selected session in LAUNCH ORDER — its transcript's first timestamp, one with none last — wrapping round at both ends: every subagent it launched, at any depth, finished ones too. The view's title ends with where it stands (`… · 2/5`). Bound whenever the view is up, EVEN WITH A QUERY TYPED — the accepted trade: there the caret moves only by word (the next row). A subagent the record does not list yet (a click opened it before its meta file was read) counts as the newest launch: `Right` wraps to the first, `Left` lands on the last. Refused on a sticky status line while the session's subagents are still being read, or when none are listed (see [`App::step_subagent_view`]) |
 //! | `Alt-Left` / `Alt-Right`, `Alt-b` / `Alt-f`, `Ctrl-Left` / `Ctrl-Right` | move the search query's caret one WORD back / forward (always) — the widget's own word hop (see [`App::move_query_caret_by_word`]), so forward lands on the START of the next word, as in the reply box. Not a query change either. Three pairs because `⌥←` / `⌥→` reaches the board as `CSI 1;3D` / `C` or as `ESC b` / `ESC f` depending on the terminal, and `Ctrl-Left` / `Ctrl-Right` is the non-`Alt` twin; `Alt-b` / `Alt-f` and `Ctrl-Left` / `Ctrl-Right` are also the pairs the compose box hops words on |
 //! | `Enter` | resume the selected session. Refused, before the liveness probe, while snapback's own `claude -p` child is still writing that session — a quick reply to it, or on a fork's row the headless fork creating it (see [`send::resume_in_flight_refusal`]) — and while its own `Ctrl-X w` move of that session is still in flight (see [`App::moving_on`]). A reply or fork in flight on another row refuses nothing here, and neither does a headless fork on the row it was forked from, which its child only reads |
 //! | `Ctrl-F` | fork the selected session: opens a fork compose box after the move and folder checks (refused, like `Enter`, while snapback's own `Ctrl-X w` move of that session is still in flight; a deleted folder is refused before you type; no live-agent check, claude skips it for a fork). `Enter` forks it headless without leaving the board (`claude -p -r <id> --fork-session --session-id <new> --name <name>`, like a quick reply — once the fork appears, folded under the session it came from, the cursor expands that lineage and jumps to it, if you have not moved and nothing owns the keyboard — see [`App::keyboard_owned`]), `Ctrl-O` forks it interactively (an empty box with no pick is the plain `claude -r <id> --fork-session` plus its `--name`), `Ctrl-L` picks the model for that fork, `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels. Both name the fork `fork: <first line of the message>` (`fork: <the session's label>` for an empty `Ctrl-O`; see `resume::fork_name`), which keeps the session heading its forks (`lineage::head_of`). The Attach/Fork/Cancel choice's Fork hands off exactly the argv of an empty `Ctrl-O` with no pick, and never carries a model. In the box `/` and `@` open the pick list (the `/` or `@` row below), which claims `Enter` and `Esc` while it is open |
@@ -46,7 +54,7 @@
 //! | `Ctrl-K` | stop / interrupt the selected session's live agent, by whichever handle claude's record carries (see [`send::interrupt_gate`]). A stoppable job id → `claude stop`: an agent whose run is OVER (`done` / `stopped` / `failed`) stops at once, every other live agent confirms first. NO job id but a `pid` → confirm, then re-ask claude at `Enter` and send that pid a SIGTERM (never SIGKILL) only if claude still reports the same pid with no job id; a record that is gone, now carries a job id, or reports another pid refuses instead (see [`send::signal_plan`]). A session claude is not holding, or one it reports with neither a job id nor a pid — or with no job id and a pid no signal could take (`0`, past `i32::MAX`, or the board's own process id) — is refused |
 //! | `Tab` | toggle name-only vs. name+content search. Widening to content also opens the preview on the most recent match, exactly as typing does: it goes through the same query funnel, and the mode is the gate that key just opened |
 //! | `Ctrl-A` | flip the scope: current folder <-> project (the launch repo and all of its git worktrees). ONE key for both, because the second is a refinement of the same question the first answers, not a separate mode. Launched with `--all`/`-a` it becomes a three-stop cycle through all folders as well — the whole store is on this key only when the launch flag put it there |
-//! | `Ctrl-X` then `x`/`d`/`h`/`r`/`y`/`f`/`w` | leader chord: hide (from a row that visibly stands for others — a folded `(+N)` head, or an expanded head with `↳` rows beneath it — that row and the members it stands for on screen, so the fold cannot re-head, while members off the board (filtered out by the query, out of scope, already hidden) stay as they are; any other row that session alone: a `↳` row, or a head whose other members are all off the board; un-hiding from such a head exposes every member it stands for, one hidden on its own included — see [`App::toggle_hidden_selected`]) / hard-delete (this row; on a multi-member lineage's HEAD row — the row not drawn `↳` — the confirm also offers its whole fork lineage, never on a `↳` row, and still on a head standing alone, since the confirm counts the lineage and discloses its hidden members; a member whose quick reply, headless fork or move snapback still has in flight is refused, see [`delete::can_delete_target`]) / toggle show-hidden / re-read every transcript from disk / copy session ID (the selected session's full id, to the clipboard; the id also shows on the status line) / fold or expand the selected row's fork lineage (fold an open one, open a folded `(+N)` head, nothing otherwise — see [`App::toggle_selected_lineage`]) / move the selected session to another worktree of the launch project (the parent folder included, its own folder omitted): opens a picker, see the next row; refused, with no picker, while that session's own move, quick reply or headless fork is still in flight (any other key cancels) |
+//! | `Ctrl-X` then `x`/`d`/`h`/`r`/`y`/`f`/`w`/`↓` | leader chord: hide (from a row that visibly stands for others — a folded `(+N)` head, or an expanded head with `↳` rows beneath it — that row and the members it stands for on screen, so the fold cannot re-head, while members off the board (filtered out by the query, out of scope, already hidden) stay as they are; any other row that session alone: a `↳` row, or a head whose other members are all off the board; un-hiding from such a head exposes every member it stands for, one hidden on its own included — see [`App::toggle_hidden_selected`]) / hard-delete (this row; on a multi-member lineage's HEAD row — the row not drawn `↳` — the confirm also offers its whole fork lineage, never on a `↳` row, and still on a head standing alone, since the confirm counts the lineage and discloses its hidden members; a member whose quick reply, headless fork or move snapback still has in flight is refused, see [`delete::can_delete_target`]) / toggle show-hidden / re-read every transcript from disk / copy session ID (the selected session's full id, to the clipboard; the id also shows on the status line) / fold or expand the selected row's fork lineage (fold an open one, open a folded `(+N)` head, nothing otherwise — see [`App::toggle_selected_lineage`]) / move the selected session to another worktree of the launch project (the parent folder included, its own folder omitted): opens a picker, see the next row; refused, with no picker, while that session's own move, quick reply or headless fork is still in flight / `↓` opens a subagent's own transcript in the preview — the SUBAGENT VIEW (the `◆ delegated to …` click row below) — on the first RUNNING subagent in launch order (unfinished, and it or a subagent it launched wrote in the last 10 minutes), else the most recently written one, and, pressed again in the view, leaves it as `Esc` does; a typed query stays. It reads no file: the selected session's subagents are read in the background whenever the selection moves or one of them writes, and `↓` refuses on a sticky status line while that read has not landed, or when the session has none (see [`App::open_subagent_target`]) (any other key cancels) |
 //! | `Enter` in the move picker | move the session to the chosen worktree; the board stays up. A worker thread re-reads the transcript, refuses a session claude lists as active — and, unlike every other gate, refuses too when claude cannot be asked (`claude agents --json` fails; see `crate::claude_move::liveness_refusal`) — then runs one headless `claude -p … -r <id>` in the session's current folder and sends it one `set_cwd` request (see `crate::claude_move`); the status line says `moved to <folder>`, or why not. While it runs the row wears `moving…` and refuses `Enter`, `Ctrl-F`, `Ctrl-R`, `Ctrl-X d` and another `Ctrl-X w`. On a multi-member lineage's HEAD row `Enter` first opens a `Move this` / `Move lineage (N)` / `Cancel` confirm, highlighted on `Cancel`, disclosing hidden members as the delete confirm does ([`App::open_move_scope_confirm`]); `Move this` is the move above. `Move lineage (N)` is BEST EFFORT: a member snapback is still replying to, forking or moving is skipped, the rest move one at a time on ONE worker, each through the same steps, the run stops at the first `needs_trust` (the target's verdict, shared by every member), every member wears `moving…` until the last finishes, and ONE sticky tally says how many moved and why the rest did not (see `crate::claude_move::status_for_lineage_move`). On a `↳` row or a lone session `Enter` moves at once |
 //! | `Ctrl-L` (in a compose box) | pick the model — and optionally the effort — for THIS compose only: the `Ctrl-R` reply, the `Ctrl-F` fork or the `Ctrl-N` draft it is pressed in (see [`compose::compose_key_to_action`]). The box's `model:` label names what it runs on: a reply's or fork's default is `session (<model>)`, the model its session last answered with, which claude normally restores by itself (`default` when an `ANTHROPIC_MODEL` / `ANTHROPIC_DEFAULT_*_MODEL` override, or a transcript with no answering model, means it would not); a draft's is `default (<value>) (new sessions only)` from the user's `claude` settings. `--model` / `--effort` are sent ONLY for a pick other than that default — on the reply, the fork's `Enter` and `Ctrl-O` run, the draft's background launch and the draft's `Ctrl-O` run. The picker's first row returns to the default, `Enter` sets the highlighted row into the compose, `Esc` returns with the text and the previous pick intact. Every new compose starts at its default; nothing is remembered. `Enter` (resume), the Attach/Fork choice's Fork, Attach and the `Ctrl-X w` move never send a model |
 //! | `Left` / `Right` (in the model picker) | step the highlighted MODEL row's `--effort` down / up through unset → `low` → `medium` → `high` → `xhigh` → `max`, wrapping both ways; `Enter` then sets the model and the effort together into the compose. Inert on the picker's default row (no model, so no effort) and on every other list modal, so the agent picker keeps ignoring them; they never reach the board's search caret underneath |
@@ -55,35 +63,42 @@
 //! | `PgUp` / `PgDn` | scroll the preview a page (always) |
 //! | `Ctrl-U` / `Ctrl-D` | scroll the preview a quarter page (always) |
 //! | `Ctrl-T` / `Ctrl-E`, `Home` / `End` | jump the preview to top / bottom (always). Every preview scroll key (these, `PgUp` / `PgDn`, `Ctrl-U` / `Ctrl-D`) also works while a quick reply or fork box is open, through the same `App` methods (see [`compose::ComposeAction::PreviewTop`]); there they take the editor's meaning (`Ctrl-U`/`Ctrl-D`/`Ctrl-E`, `Home`/`End`/`PgUp`/`PgDn`) away. A new-session draft keeps them all for its editor |
-//! | `Shift-Up` / `Shift-Down` | scroll the preview onto the previous / next MARKED line, but only while the query marks something in the previewed transcript; with nothing marked they fall through to plain selection movement. One stop per marked LINE, not per occurrence — a line saying the query twice is marked, and stopped at, once |
+//! | `Shift-Up` / `Shift-Down` | scroll the preview onto the previous / next MARKED line, but only while the query marks something in the previewed transcript; with nothing marked they fall through to the plain `Up` / `Down` — selection movement, or `Up`'s leaving of the subagent view, which takes no marks. One stop per marked LINE, not per occurrence — a line saying the query twice is marked, and stopped at, once |
 //! | `Backspace` | delete the query character before the caret |
 //! | `Alt-Backspace` / `Ctrl-W` / `Alt-H` | delete the query ATOM before the caret — one whole search word, not one character, so a path or a branch name goes in a single press; what follows the caret stays. THREE keys because `TextArea::input` word-deletes on all three in the compose box: binding the same SET here is what makes the gesture reach the board at all, whatever the user's option-as-meta setting turns `Alt-Backspace` into. The set matches; the EXTENT deliberately does not — the board cuts at the search atom and the compose box at `CharKind`'s punctuation boundary, so `feature/fold-fork-lineages` goes whole here and loses only `lineages` there |
 //! | printable char | type-to-search (insert at the query's caret) |
 //! | terminal paste | inserted as TEXT — never as keystrokes (see below) |
-//! | mouse: click a folded node's header | unfold the node — a subagent's hand-back (`◆`) or context claude injected (`◇`) — where it sits, and a second click folds it back; a click on a header toggles its node and never opens a link. On the RELEASE, like a link, and ahead of one (see [`click_effect`]). Works while a quick reply or fork box is open, like every pointer action over the transcript |
+//! | mouse: click a folded node's header | unfold the node — a subagent's hand-back (`◆ message from`) or context claude injected (`◇`) — where it sits, and a second click folds it back; a click on a header toggles its node and never opens a link. On the RELEASE, like a link, and ahead of one (see [`click_effect`]). Works while a quick reply or fork box is open, like every pointer action over the transcript but the `◆ delegated to …` switch below |
+//! | mouse: click a `◆ delegated to …` line | switch the preview to that subagent's OWN transcript — the SUBAGENT VIEW: the pane's title names the subagent, its pinned row names the subagent's turn, it takes no search marks, and it updates as the subagent writes. A `◆ delegated to …` line inside it switches to that nested subagent. `Up` or `Esc` goes back to the session's own transcript where it was scrolled; `Ctrl-X ↓` again, moving the selection, `Ctrl-R` and `Ctrl-F` leave it too. Only this click, `Ctrl-X ↓` and `Left` / `Right` inside the view open it — no search key does (see [`App::open_subagent_view`]). On the RELEASE, like a link. Refused, on a sticky status line, while a quick reply or fork box is open: what the box sends lands in the session, so the pane keeps showing the session's own transcript |
 //! | mouse: click a preview link | open its url in the browser — `http`/`https` only: any other scheme opens nothing and says so on a sticky status line. On the RELEASE, since only then is it known that the press was a click and not the start of a drag (see [`mouse_effect`]). Works while a quick reply or fork box is open |
-//! | mouse: drag in the preview | select transcript text in reading order, reverse-videoed — DRAWN text only: each row ends at its last drawn character, never at the pane's edge, and a drag over blank space alone selects nothing, so its release copies nothing. HOLD the drag past the transcript's top or bottom edge and the pane glides that way, a small step every `AUTOSCROLL_FRAME` — faster the further past the edge — so the selection keeps growing into rows that were never on screen until the button comes up (see [`App::autoscroll_preview_selection`]); a plain move while the button is held counts as the release the terminal lost. The release copies the WHOLE selection the way `Ctrl-X y` copies — [`Outcome::Copy`], the clipboard tool first, OSC 52 as the fallback — with a transient status. Never the in-flight reply's tail. A wheel notch, any key or a resize ends it. A drag that starts on a node header or a link selects, and toggles or opens nothing. Off under any overlay and a new-session draft's card, but ON while a quick reply or fork box is open (each previews the real transcript; the drag neither moves its caret nor touches its text), and never started on the pinned row or a docked compose zone (see [`press_starts_selection`]) |
-//! | mouse: double-click in the preview | select the WORD under the pointer (Unicode word boundaries, on the drawn row) and copy it on release, exactly as a drag copies. Two presses on the SAME cell within [`DOUBLE_CLICK_INTERVAL`] (see [`is_double_click`]); a blank word selects nothing; a quick third click keeps the word. The FIRST release is a plain click — it toggles a node header or opens a link, as above — and the SECOND copies the word and toggles or opens nothing, so a node header double-clicked is opened once and stays open. Any key, wheel notch or reload resets the count (a fold toggle does not: it is the first click's own effect), and a press that turned into a drag is not a first click. Same gate as a drag ([`press_starts_selection`]), so it too works while a quick reply or fork box is open |
-//! | `Esc` | clear the search query when one is typed; quit when it is already empty |
+//! | mouse: drag in the preview | select transcript text in reading order, reverse-videoed — DRAWN text only: each row ends at its last drawn character, never at the pane's edge, and a drag over blank space alone selects nothing, so its release copies nothing. HOLD the drag past the transcript's top or bottom edge and the pane glides that way, a small step every `AUTOSCROLL_FRAME` — faster the further past the edge — so the selection keeps growing into rows that were never on screen until the button comes up (see [`App::autoscroll_preview_selection`]); a plain move while the button is held counts as the release the terminal lost. The release copies the WHOLE selection the way `Ctrl-X y` copies — [`Outcome::Copy`], the clipboard tool first, OSC 52 as the fallback — with a transient status. Never the in-flight reply's tail. A wheel notch, any key or a resize ends it. A drag that starts on a node header, a `◆ delegated to …` line or a link selects, and toggles, switches or opens nothing. Off under any overlay and a new-session draft's card, but ON while a quick reply or fork box is open (each previews the real transcript; the drag neither moves its caret nor touches its text), and never started on the pinned row, the running list or a docked compose zone (see [`press_starts_selection`]) |
+//! | mouse: double-click in the preview | select the WORD under the pointer (Unicode word boundaries, on the drawn row) and copy it on release, exactly as a drag copies. Two presses on the SAME cell within [`DOUBLE_CLICK_INTERVAL`] (see [`is_double_click`]); a blank word selects nothing; a quick third click keeps the word. The FIRST release is a plain click — it toggles a node header, switches to a subagent or opens a link, as above — and the SECOND copies the word and toggles, switches or opens nothing, so a node header double-clicked is opened once and stays open. Any key, wheel notch or reload resets the count (a fold toggle does not: it is the first click's own effect), and a press that turned into a drag is not a first click. Same gate as a drag ([`press_starts_selection`]), so it too works while a quick reply or fork box is open |
+//! | `Esc` | unwind one level: clear the search query when one is typed; else leave the subagent view for the session's own transcript; else quit |
 //! | `Ctrl-C` | quit (always) |
 //!
 //! No bare printable character is a command: every one of them types into the
 //! query, so no search term can navigate or quit on its way in. Arrows, `Enter`,
 //! `Tab`, and every `Ctrl-` binding work regardless of the query, so search is
-//! never blocked either. `Shift-Up` / `Shift-Down` are the one conditional binding,
+//! never blocked either. `Shift-Up` / `Shift-Down` are conditional on the marks,
 //! disambiguated by whether there is anything marked to move between — and they
 //! fall through to the unshifted binding when there is not, so a terminal that
-//! drops the modifier still moves the selection. `Shift-Left` / `Shift-Right` are
-//! NOT conditional: they step the layout whatever the query or the marks, and their
-//! arms sit above the plain `Left` / `Right` ones because the first matching arm
-//! wins. A terminal that drops THAT modifier delivers a plain `Left` / `Right`,
-//! which moves the search caret instead — a working key, just not the one
+//! drops the modifier still gets the unshifted key's action. Plain `Up` is
+//! conditional on the subagent view: while it is up, a query typed or not, `Up`
+//! leaves it, from an arm below the `Shift-Up` match step — which the view, taking
+//! no marks, never satisfies — so `Shift-Up` leaves it too; plain `Down` moves the
+//! selection everywhere. Plain `Left` / `Right` are
+//! conditional on the subagent view, and step subagents while it is up, a query
+//! typed or not. `Shift-Left` / `Shift-Right` are NOT conditional: they step the
+//! layout whatever the query, the marks or the view, and their arms sit above the
+//! plain `Left` / `Right` ones because the first matching arm wins. A terminal
+//! that drops THAT modifier delivers a plain `Left` / `Right`, which moves the
+//! search caret (or steps a subagent) instead — a working key, just not the one
 //! pressed. Caret movement and the lineage fold never share a key: the fold is
-//! `Ctrl-X f`. The `Alt` arrows' word-hop arms sit BETWEEN the two: below the
-//! shifted ones, so `Shift-Alt` still steps the layout, and above the plain ones,
-//! which match an `Alt` arrow too and would step it one character. `Ctrl-Left` /
-//! `Ctrl-Right` hop from inside the `Ctrl` block, which returns before any of them
-//! is tried.
+//! `Ctrl-X f`. The `Alt` arrows' word-hop arms sit below the shifted ones, so
+//! `Shift-Alt` still steps the layout, and above the subagent-view and plain ones,
+//! which match an `Alt` arrow too and would step a subagent or move the caret one
+//! character — so the word hop works in the view too. `Ctrl-Left` / `Ctrl-Right`
+//! hop from inside the `Ctrl` block, which returns before any of them is tried.
 //!
 //! ## Terminal paste
 //!
@@ -101,7 +116,7 @@
 
 use std::io::Write;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -120,7 +135,7 @@ use crate::watch::{AppEvent, CopyPayload};
 
 use super::app::{
     screen_at, App, ClickRecord, InterruptRoute, Interrupting, KeyboardOwner, ModalAction,
-    ModalLayout,
+    ModalLayout, SubagentsUnavailable,
 };
 use super::{clipboard, compose, view};
 
@@ -225,13 +240,24 @@ pub enum Action {
     /// would leave all but `lineages`.
     BackspaceWord,
     /// Empty the search query (`Esc` while one is typed). With an empty query
-    /// `Esc` is [`Action::Quit`] instead, so a first press never quits a board the
-    /// user was still searching.
+    /// `Esc` is [`Action::LeaveSubagentView`] or [`Action::Quit`] instead, so a
+    /// first press never quits a board the user was still searching.
     ClearQuery,
+    /// Leave the preview's subagent view for the selected session's own transcript
+    /// (`Esc` with an empty query, or `↑` with any, while the view is open), so an
+    /// `Esc` never quits a board whose pane shows a subagent and an `↑` never moves
+    /// the selection away from it ([`App::leave_subagent_view`]).
+    LeaveSubagentView,
+    /// Switch the subagent view to the previous subagent in launch order (`←`
+    /// while the view is up, query or not; [`App::step_subagent_view`]).
+    PrevSubagent,
+    /// Switch the subagent view to the next subagent in launch order (`→` while
+    /// the view is up, query or not; [`App::step_subagent_view`]).
+    NextSubagent,
     /// Enter the `Ctrl-X` leader chord: arm [`App::pending_chord`] so the NEXT key
     /// routes through the pure [`chord_key`] machine (hide / hard-delete /
     /// show-hidden / forced rescan / copy session ID / fold toggle / move picker /
-    /// cancel) instead of the board.
+    /// subagent view / cancel) instead of the board.
     Chord,
     /// A key with no binding in the current state.
     Ignore,
@@ -362,20 +388,30 @@ impl Outcome {
 /// match navigation is only meaningful once a query exists to have marked
 /// something, so an empty query leaves them plain selection movement.
 /// `has_preview_matches` ([`App::has_preview_matches`]) decides whether the
-/// SHIFTED arrows have anywhere to go.
+/// SHIFTED arrows have anywhere to go. `in_subagent_view`
+/// ([`App::in_subagent_view`]) is `Esc`'s middle step — with an empty query it
+/// leaves the view rather than quitting — turns the PLAIN `↑` from a selection
+/// move into leaving the view, query or not, and turns the PLAIN `←`/`→` from the
+/// search caret into the subagent steps, query or not.
 ///
-/// The shifted arrows are bound CONDITIONALLY and fall through to plain selection
-/// movement otherwise, which buys two things at once. With no query — or a query
-/// the previewed transcript does not say — `Shift-Up` is bit-for-bit the
-/// `MoveUp` it has always been, so nothing a user already relies on changes. And
-/// on a terminal that drops the modifier (or a multiplexer that eats the `CSI
-/// 1;2A` form), the key arrives as a bare arrow and still moves the selection,
-/// which is the graceful degradation rather than a dead key.
+/// The shifted arrows are bound CONDITIONALLY and fall through to the plain arrows
+/// otherwise, which buys two things at once. With no query — or a query the
+/// previewed transcript does not say — `Shift-Up` is bit-for-bit the plain `↑`:
+/// the `MoveUp` it has always been, or in the subagent view, which takes no marks,
+/// leaving it. So nothing a user already relies on changes. And on a terminal that
+/// drops the modifier (or a multiplexer that eats the `CSI 1;2A` form), the key
+/// arrives as a bare arrow and still does what that arrow does, which is the
+/// graceful degradation rather than a dead key.
 ///
 /// The SHIFTED HORIZONTAL arrows take neither condition: stepping the pane layout
 /// means the same thing with or without a query, marks or no marks.
 #[must_use]
-pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool) -> Action {
+pub fn key_to_action(
+    key: KeyEvent,
+    query_empty: bool,
+    has_preview_matches: bool,
+    in_subagent_view: bool,
+) -> Action {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -390,7 +426,8 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool
             KeyCode::Char('c') | KeyCode::Char('C') => Action::Quit,
             // Ctrl-X (0x18 CAN) is the board's leader chord: act on the selected
             // row (hide / hard-delete / copy session ID / fold toggle / move to
-            // another worktree) or on the board (show-hidden / forced rescan).
+            // another worktree / open its subagent view) or on the board (show-hidden /
+            // forced rescan).
             // Unbound and terminal-safe — unlike Ctrl-H/I/M, which alias
             // Backspace/Tab/Enter.
             // It only ARMS the chord; the follow-up key decides (see `chord_key`).
@@ -435,6 +472,10 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool
         // such case exists for the vertical arrows.
         KeyCode::Up if shift && !query_empty && has_preview_matches => Action::PreviewMatchPrev,
         KeyCode::Down if shift && !query_empty && has_preview_matches => Action::PreviewMatchNext,
+        // Inside the subagent view `↑` goes back to the session's own transcript,
+        // query or not, and leaves the query alone. Below the match step, which the
+        // view never satisfies (it takes no marks), so `Shift-Up` lands here too.
+        KeyCode::Up if in_subagent_view => Action::LeaveSubagentView,
         KeyCode::Up => Action::MoveUp,
         KeyCode::Down => Action::MoveDown,
         // Pane layout, on the SHIFTED horizontal arrows: one stop along the
@@ -456,11 +497,17 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool
         // the caret one character instead.
         KeyCode::Left if alt => Action::CaretWordBack,
         KeyCode::Right if alt => Action::CaretWordForward,
-        // The search caret, unconditionally: editing the query is what the board
-        // does on every search, so it gets the plain arrows. Not gated on the query
-        // either — an empty query has nowhere to move, and the widget treats a move
-        // past either end as a no-op. The lineage fold is `Ctrl-X f` (`chord_key`),
-        // so the two never share a key.
+        // Inside the subagent view the plain arrows step through the session's
+        // subagents, EVEN WITH A QUERY TYPED: the accepted trade (R4) is that the
+        // caret moves only by word there, through the arms above. Below them, so
+        // `Shift` still steps the layout and `Alt` still hops a word.
+        KeyCode::Left if in_subagent_view => Action::PrevSubagent,
+        KeyCode::Right if in_subagent_view => Action::NextSubagent,
+        // Elsewhere the search caret: editing the query is what the board does on
+        // every search, so it gets the plain arrows. Not gated on the query either —
+        // an empty query has nowhere to move, and the widget treats a move past
+        // either end as a no-op. The lineage fold is `Ctrl-X f` (`chord_key`), so
+        // the two never share a key.
         KeyCode::Left => Action::CaretBack,
         KeyCode::Right => Action::CaretForward,
         // Preview scroll: page + jump. Bound regardless of query state (they are
@@ -470,9 +517,11 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool
         KeyCode::Home => Action::PreviewTop,
         KeyCode::End => Action::PreviewBottom,
         KeyCode::Enter => Action::Resume,
-        // `Esc` unwinds one level: a typed query first, the board second.
-        // `Ctrl-C` is bound above and always quits.
+        // `Esc` unwinds one level: a typed query first, then the subagent view the
+        // preview may be showing, then the board. `Ctrl-C` is bound above and
+        // always quits.
         KeyCode::Esc if !query_empty => Action::ClearQuery,
+        KeyCode::Esc if in_subagent_view => Action::LeaveSubagentView,
         KeyCode::Esc => Action::Quit,
         KeyCode::Tab => Action::ToggleSearchMode,
         // Word-delete on the macOS gesture. This arm MUST sit above the plain
@@ -513,20 +562,24 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool
 ///   left-button PRESS over the preview transcript only records where it landed,
 ///   and its RELEASE decides what it was ([`handle_mouse`] over the pure
 ///   [`mouse_effect`]). A press that DRAGGED selects transcript text and its
-///   release copies it through [`Outcome::Copy`], toggling and opening nothing. A
-///   plain CLICK (no drag) on a fold node's header — a peer message or injected
-///   context — toggles that node open or closed, and otherwise is resolved
+///   release copies it through [`Outcome::Copy`], toggling, switching and opening
+///   nothing. A plain CLICK (no drag) on a fold node's header — a peer message or
+///   injected context — toggles that node open or closed, one on a
+///   `◆ delegated to …` line
+///   switches the pane to that subagent's transcript (refused, sticky, while a
+///   reply or fork box is open), and otherwise it is resolved
 ///   against the rendered preview links: a hit on an `http`/`https` url opens it
 ///   in the default browser and reports `opening <url>` transiently, a hit on any
 ///   other scheme opens NOTHING and reports a sticky refusal naming the url, a
 ///   line too big to hit-test reports a sticky [`LinkClick::Unresolvable`]
 ///   message, and a miss writes nothing (the mapping lives in
 ///   [`note_link_click`]). All are routed independently of the modal key gate, and
-///   a press cannot start a selection, toggle a node or open a link while an
-///   overlay is open or a new-session draft's card replaces the transcript (the
-///   `App::preview_pointer_blocked` gate, behind [`press_starts_selection`]) — but
-///   it can while a QUICK REPLY or FORK box is open, each of which previews the
-///   real transcript.
+///   a press cannot start a selection, toggle a node, switch to a subagent or open
+///   a link while an overlay is open or a new-session draft's card replaces the
+///   transcript (the `App::preview_pointer_blocked` gate, behind
+///   [`press_starts_selection`]) — but it can while a QUICK REPLY or FORK box is
+///   open, each of which previews the real transcript, the subagent switch aside
+///   (refused there, as above).
 ///   Nothing else: the pane widths belong to the keyboard (`Shift-Left` /
 ///   `Shift-Right`).
 /// * `Input(Resize)` -> clear the preview's mouse selection (a new width re-wraps
@@ -543,7 +596,15 @@ pub fn key_to_action(key: KeyEvent, query_empty: bool, has_preview_matches: bool
 /// * `CatalogFetched` -> settle a folder's off-thread catalog fetch (an answer is
 ///   cached for the board's lifetime, no answer only releases the folder), then
 ///   re-derive an open compose's pick list from it. Silent.
-/// * `Tick` -> nothing costly: advance the board clock, age a transient status,
+/// * `SubagentsWritten` -> draw the subagent view again when it shows one of the
+///   written transcripts, and mark the selected session's subagent record to be
+///   read again when the batch wrote under its `subagents/` dir
+///   ([`App::apply_subagent_writes`]); never a reload. Silent.
+/// * `SubagentRuns` -> stamp the wall clock and land the background refresh's
+///   record while it names the selected session ([`App::apply_subagent_record`]);
+///   one for any other session is dropped. Silent.
+/// * `Tick` -> nothing costly: stamp the wall clock the subagent running check
+///   reads ([`App::note_wall_clock`]), advance the board clock, age a transient status,
 ///   then replay any completion an earlier board session could not read
 ///   ([`replay_undelivered`]). It never steps a held drag's autoscroll: the run
 ///   loop does that after every event and at a frame deadline of its own
@@ -576,6 +637,9 @@ pub fn handle_event(app: &mut App, event: AppEvent, store: &mut SessionStore) ->
         // `CatalogFetched` can never land.
         // A mark left standing would block every later fetch for that folder.
         app.forget_catalog_fetches_in_flight();
+        // The background subagent refresh answers on that same channel, so the
+        // record last asked for can never land either; the next board asks anew.
+        app.forget_subagent_request();
     }
     outcome
 }
@@ -608,8 +672,8 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
                 Some(KeyboardOwner::Modal) => handle_modal_key(app, key, store),
                 // A pending `Ctrl-X` leader chord OWNS the next key too: route it
                 // through the chord machine BEFORE normal handling so a printable
-                // follow-up (`x`/`d`/`h`/`r`/`y`/`f`/`w`) completes the chord instead
-                // of leaking into the query.
+                // follow-up (`x`/`d`/`h`/`r`/`y`/`f`/`w`, or `↓`) completes the chord
+                // instead of leaking into the query.
                 Some(KeyboardOwner::Chord) => handle_chord_key(app, key, store),
                 // The "stop the waiting agent?" confirmation owns the keyboard until
                 // it resolves into compose (Enter) or is dismissed (Esc).
@@ -631,21 +695,27 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
                     // the next key; clear it first so this keypress may set a fresh
                     // one.
                     app.clear_status();
-                    let action =
-                        key_to_action(key, app.query_input.is_empty(), app.has_preview_matches());
+                    let action = key_to_action(
+                        key,
+                        app.query_input.is_empty(),
+                        app.has_preview_matches(),
+                        app.in_subagent_view(),
+                    );
                     apply_action(app, action)
                 }
             }
         }
-        // Mouse wheel scroll, preview fold-node toggles, preview link clicks and
-        // preview drag-selection. A dedicated arm BEFORE the input catch-all and
-        // INDEPENDENT of the modal overlay gate above: none routes into the modal
-        // handler — a wheel just scrolls a pane and never crashes in any mode
-        // (query active, modal open, ...), and a press neither toggles a node, opens
-        // a link nor starts a selection while an overlay is up
-        // (`App::preview_pointer_blocked` gates it; an open QUICK REPLY or FORK box
-        // does not, since none of the three touches what the box holds). A finished
-        // drag answers `Outcome::Copy`, the same copy request `Ctrl-X y` makes.
+        // Mouse wheel scroll, preview fold-node toggles, subagent switches, preview
+        // link clicks and preview drag-selection. A dedicated arm BEFORE the input
+        // catch-all and INDEPENDENT of the modal overlay gate above: none routes
+        // into the modal handler — a wheel just scrolls a pane and never crashes in
+        // any mode (query active, modal open, ...), and a press neither toggles a
+        // node, switches to a subagent, opens a link nor starts a selection while an
+        // overlay is up (`App::preview_pointer_blocked` gates it; an open QUICK
+        // REPLY or FORK box does not, since none of the four touches what the box
+        // holds — `click_effect` refuses the subagent switch under one itself). A
+        // finished drag answers `Outcome::Copy`, the same copy request `Ctrl-X y`
+        // makes.
         AppEvent::Input(Event::Mouse(mouse)) => handle_mouse(app, mouse),
         // A terminal PASTE (bracketed paste, enabled in `tui::init_terminal`). A
         // dedicated arm BEFORE the input catch-all that used to swallow it, and
@@ -667,6 +737,14 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
         AppEvent::Input(_) => Outcome::Continue,
         AppEvent::SessionsChanged => {
             reload_board(app, store);
+            Outcome::Continue
+        }
+        // A subagent's transcript was written. NEVER a reload — a subagent is never
+        // a session — and silent: only a subagent view showing one of these is
+        // drawn again, and the selected session's record marked to be read again
+        // off this thread (`App::apply_subagent_writes`).
+        AppEvent::SubagentsWritten(written) => {
+            app.apply_subagent_writes(&written);
             Outcome::Continue
         }
         AppEvent::ReportedAgents {
@@ -831,12 +909,26 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
             compose::refresh_completion(app);
             Outcome::Continue
         }
+        // The background refresh's record of a session's subagents, read on its
+        // worker. Landed only while that session is still the selection
+        // (`App::apply_subagent_record`), silently: it is typed state, never a
+        // status (STATUS-LINE OWNERSHIP). The clock is stamped first, so the
+        // running check never measures a fresh record against an older `now`.
+        AppEvent::SubagentRuns { session_id, record } => {
+            app.note_wall_clock(SystemTime::now());
+            app.apply_subagent_record(&session_id, record);
+            Outcome::Continue
+        }
         AppEvent::Tick => {
             // The tick already drove a redraw; counting it turns that existing
             // cadence into the board's clock, which `view::blink_visible` phases
             // the live-badge pulse from. `wrapping_add` so a board left running
             // for eons rolls over instead of overflow-panicking in debug.
             app.tick = app.tick.wrapping_add(1);
+            // The wall clock the subagent running check reads at draw time, so a
+            // running subagent turns quiet on time with no file read and no clock
+            // read on the render path.
+            app.note_wall_clock(SystemTime::now());
             // Age transient statuses (confirmations/nudges) on the same cadence.
             // Failures/refusals stay sticky until the next actionable keypress.
             app.tick_status();
@@ -1136,7 +1228,8 @@ fn wheel_target(col: u16, row: u16, preview: Rect, list: Rect, composing: bool) 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MouseEffect {
     /// Nothing beyond the state change already applied — which may be a fold node
-    /// toggled open or closed, or a link click's status line.
+    /// toggled open or closed, the pane switched to a subagent (or that switch's
+    /// refusal), or a link click's status line.
     None,
     /// A plain CLICK — press and release with no drag — over a drawn link whose
     /// scheme snapback opens ([`LinkClick::Opening`]): open this url.
@@ -1178,7 +1271,8 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Outcome {
 /// is only known when it comes back UP — so nothing acts on the press:
 ///
 /// - the PRESS records the CONTENT cell it landed on ([`App::begin_preview_press`]),
-///   if [`press_starts_selection`] admits it, and toggles or opens nothing;
+///   if [`press_starts_selection`] admits it, and toggles, switches or opens
+///   nothing;
 /// - a DRAG moves the held pointer and extends a selection from that press to the
 ///   content under it ([`App::extend_preview_selection`]); a pointer held past the
 ///   transcript's top or bottom edge is then scrolled toward by the run loop's
@@ -1189,8 +1283,9 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Outcome {
 ///   [`MouseEffect::Copy`]) — or does nothing when it holds no drawn text — while a
 ///   plain click is resolved by [`click_effect`] at the press's content cell, where
 ///   the pane shows it now: the fold node whose header is under it toggles, else
-///   the link under it opens. So a drag that happens to start on a node header or a
-///   link selects, and toggles or opens nothing.
+///   the delegation line under it switches the pane to its subagent, else the link
+///   under it opens. So a drag that happens to start on a node header, a
+///   delegation line or a link selects, and toggles, switches or opens nothing.
 ///
 /// A plain MOVE while the press is still held is also the release. With the
 /// button really down the terminal reports a DRAG, never a move, so a move means
@@ -1200,16 +1295,16 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Outcome {
 /// Any other event (other buttons, horizontal wheel, a move with no press held) is
 /// ignored: the pane widths belong to the keyboard (`Shift-Left` / `Shift-Right`),
 /// so the mouse has no border to drag. Never touches the query, and the press gate
-/// keeps a click from toggling a node or opening a link — or a drag or a
-/// double-click from selecting — under an overlay: a press it refuses records
-/// nothing, so its release has nothing to resolve.
+/// keeps a click from toggling a node, switching to a subagent or opening a link —
+/// or a drag or a double-click from selecting — under an overlay: a press it
+/// refuses records nothing, so its release has nothing to resolve.
 ///
 /// A SECOND admitted press on the SAME cell as the previous one, within
 /// [`DOUBLE_CLICK_INTERVAL`], is a DOUBLE-CLICK ([`is_double_click`]): it records a
 /// WORD selection
 /// ([`App::begin_word_selection`]), so its release takes the copy arm above and
-/// never reaches [`click_effect`] — the first release already toggled or opened
-/// whatever sat under the cell, and the second must not do it again.
+/// never reaches [`click_effect`] — the first release already toggled, switched or
+/// opened whatever sat under the cell, and the second must not do it again.
 ///
 /// `now` is the instant the press is handled at, passed in so the double-click
 /// decision ([`is_double_click`]) is a pure function a test can drive with
@@ -1244,19 +1339,20 @@ fn mouse_effect(app: &mut App, mouse: MouseEvent, now: Instant) -> MouseEffect {
             }
         }
         // A left press inside the transcript starts a POTENTIAL drag-select and
-        // toggles or opens NOTHING yet: the selection only materializes once the
-        // pointer moves, and a press that never moves is a plain click, resolved
-        // on release (`click_effect`: fold toggle, else link open). So a single
-        // click both toggles a node or opens a link as before and de-highlights
-        // any prior selection. `press_starts_selection` owns where a press may
-        // land and when — gated by any overlay (`App::preview_pointer_blocked`),
-        // so a press while one owns input records nothing.
+        // toggles, switches or opens NOTHING yet: the selection only materializes
+        // once the pointer moves, and a press that never moves is a plain click,
+        // resolved on release (`click_effect`: fold toggle, else subagent switch,
+        // else link open). So a single click both toggles a node, switches to a
+        // subagent or opens a link as before and de-highlights any prior
+        // selection. `press_starts_selection` owns where a press may land and
+        // when — gated by any overlay (`App::preview_pointer_blocked`), so a press
+        // while one owns input records nothing.
         //
         // A SECOND admitted press on the same cell within `DOUBLE_CLICK_INTERVAL`
         // records a WORD selection instead (`is_double_click`); the view expands it
         // and the release copies it through the same path a drag's does — and,
         // holding a selection, never reaches `click_effect`, so the second click
-        // toggles or opens nothing the first one already did.
+        // toggles, switches or opens nothing the first one already did.
         MouseEventKind::Down(MouseButton::Left) if press_starts_selection(app, pos) => {
             let transcript = view::preview_transcript_rect(app);
             if is_double_click(app.last_click(), pos, now) {
@@ -1269,19 +1365,19 @@ fn mouse_effect(app: &mut App, mouse: MouseEvent, now: Instant) -> MouseEffect {
         // A held-button drag moves the pointer and extends the text selection to
         // the content under it. A no-op unless a press is active
         // (`begin_preview_press` set it), so a drag that began on the list, the
-        // pinned row or a docked compose zone never selects; the cursor is clamped
-        // into the SAME transcript rect the press was gated on, while the raw
-        // pointer is kept for the autoscroll.
+        // pinned row, the preview's running list or a docked compose zone never
+        // selects; the cursor is clamped into the SAME transcript rect the press
+        // was gated on, while the raw pointer is kept for the autoscroll.
         MouseEventKind::Drag(MouseButton::Left) => {
             app.extend_preview_selection(pos, view::preview_transcript_rect(app));
         }
         // The release resolves the press, and only a press the gate admitted: a
         // completed drag (or a double-click's word) copies the selection and never
-        // toggles a node or opens a link, even one it started on; a plain click
-        // with no drag is THE one pane click, resolved at the press's content cell
-        // (`release_preview_press`). A MOVE while the press is held stands in for a
-        // release the terminal lost (see the doc above); with no press held it
-        // finds nothing to take.
+        // toggles a node, switches to a subagent or opens a link, even one it
+        // started on; a plain click with no drag is THE one pane click, resolved
+        // at the press's content cell (`release_preview_press`). A MOVE while the
+        // press is held stands in for a release the terminal lost (see the doc
+        // above); with no press held it finds nothing to take.
         MouseEventKind::Up(MouseButton::Left) | MouseEventKind::Moved => {
             return release_preview_press(app);
         }
@@ -1294,11 +1390,12 @@ fn mouse_effect(app: &mut App, mouse: MouseEvent, now: Instant) -> MouseEffect {
 /// any autoscroll. A completed drag (or a double-click's word) copies the WHOLE
 /// selection — redrawn off screen by the rules its highlight is drawn with
 /// ([`view::preview_selection_copy`]), so rows scrolled past during the drag are
-/// copied too — and never toggles a node or opens a link, even one it started on;
-/// a selection over blank cells alone copies nothing. A plain click with no drag
-/// is handed to [`click_effect`] at the press's CONTENT cell, found on screen where
-/// the pane shows it now ([`screen_at`]) — nothing when that cell has left the
-/// transcript rect. [`MouseEffect::None`] when no press was held.
+/// copied too — and never toggles a node, switches to a subagent or opens a link,
+/// even one it started on; a selection over blank cells alone copies nothing. A
+/// plain click with no drag is handed to [`click_effect`] at the press's CONTENT
+/// cell, found on screen where the pane shows it now ([`screen_at`]) — nothing
+/// when that cell has left the transcript rect. [`MouseEffect::None`] when no
+/// press was held.
 fn release_preview_press(app: &mut App) -> MouseEffect {
     let Some(press) = app.take_preview_press() else {
         return MouseEffect::None;
@@ -1337,25 +1434,28 @@ fn is_double_click(previous: Option<ClickRecord>, pos: Position, now: Instant) -
 }
 
 /// Whether a left press at `pos` may begin a preview press — the ONE gate in
-/// front of all three mouse actions over the preview, since a node toggles, a link
-/// opens and a selection starts — a drag's, or a double-click's word — only from a
-/// press this admits. A press it refuses is not a click either: it records
-/// nothing, so it cannot become the first half of a double-click.
+/// front of all four mouse actions over the preview, since a node toggles, a
+/// delegation line switches the pane to its subagent, a link opens and a selection
+/// starts — a drag's, or a double-click's word — only from a press this admits. A
+/// press it refuses is not a click either: it records nothing, so it cannot become
+/// the first half of a double-click.
 ///
 /// Three conditions, all required:
 ///
 /// - nothing blocks the pointer ([`App::preview_pointer_blocked`]) — an overlay, a
 ///   pending confirmation or chord, or the new-session draft CARD (editor or in
-///   flight), so no selection starts under a draft card and no node toggles or
-///   link opens from a transcript the card hides. An open QUICK-REPLY or FORK
-///   editor is not one: it previews the real transcript above its own docked box;
+///   flight), so no selection starts under a draft card and nothing toggles,
+///   switches or opens from a transcript the card hides. An open QUICK-REPLY or
+///   FORK editor is not one: it previews the real transcript above its own docked
+///   box (the subagent switch alone is refused under it, by [`click_effect`]);
 /// - a session is selected, so the "No session selected." placeholder is never
 ///   selectable text;
 /// - `pos` is inside the preview's TRANSCRIPT rect,
-///   [`view::preview_transcript_rect`] — the same rect [`fold_under_pointer`] and
-///   [`resolve_link_click`] resolve a click against, and the one the view drew the
-///   text in. The pinned row above it, the pane's own border and a docked compose
-///   zone are outside it by construction.
+///   [`view::preview_transcript_rect`] — the same rect [`fold_under_pointer`],
+///   [`subagent_under_pointer`] and [`resolve_link_click`] resolve a click
+///   against, and the one the view drew the text in. The pinned row above it, the
+///   pane's own border, the running list and a docked compose zone are outside it
+///   by construction, so a click on a running-list row opens nothing.
 fn press_starts_selection(app: &App, pos: Position) -> bool {
     !app.preview_pointer_blocked()
         && app.selected_session().is_some()
@@ -1364,13 +1464,21 @@ fn press_starts_selection(app: &App, pos: Position) -> bool {
 
 /// Resolve a plain CLICK — a press released with no drag — at its PRESS cell:
 /// THE one owner of a pane click, and the one place its precedence lives. Read
-/// end to end: fold toggle -> link open.
+/// end to end: fold toggle -> subagent switch -> link open.
 ///
 /// - On a fold node's HEADER — a peer message or injected context — it toggles
 ///   that node open or closed ([`App::toggle_peer_fold`], which also drops any
 ///   mouse selection but KEEPS the click chain, so a quick second press on the
 ///   header is a double-click that selects a word rather than a second toggle)
 ///   and asks for nothing more.
+/// - On a `◆ delegated to …` line it switches the pane to the transcript of the
+///   subagent the line names ([`App::open_subagent_view`], which keeps the click
+///   chain the same way) and asks for nothing more. One of the view's THREE
+///   routes in — `Ctrl-X ↓` and a `←`/`→` step inside the view are the others —
+///   and no search route reaches any (`docs/agents/DOMAIN.md`, "Delegation line
+///   and subagent view"). Refused, with a STICKY [`SUBAGENT_VIEW_COMPOSING_REFUSAL`], while a
+///   quick reply or fork box is open: the box sends into the session, so the pane
+///   must keep showing the session's own transcript beneath it.
 /// - Otherwise it is resolved by [`resolve_link_click`] and given its status by
 ///   [`note_link_click`]: a hit on an `http`/`https` link asks [`handle_mouse`]
 ///   to open its url ([`MouseEffect::OpenLink`]) and reports `opening <url>`
@@ -1381,23 +1489,26 @@ fn press_starts_selection(app: &App, pos: Position) -> bool {
 ///
 /// Resolved at the PRESS cell because that is the cell the gate vetted: a press
 /// is admitted only inside the transcript rect ([`press_starts_selection`]), so a
-/// press on the pane's own BORDER or on its pinned row never records at all. The
-/// hit-tests keep their own containment behind that gate — `view::content_hit`
-/// checks the transcript's INNER rect on both axes — so a border cell could not
-/// alias onto content column 0 even if it got this far.
+/// press on the pane's own BORDER, its pinned row or its running list never
+/// records at all. The hit-tests keep their own containment behind that gate —
+/// `view::content_hit` checks the transcript's INNER rect on both axes — so a
+/// border cell could not alias onto content column 0 even if it got this far.
 ///
-/// Fold-before-link is FREE, not a tie-break. A node's header line is built from
-/// the marker, the sender, the timestamp and the affordance alone; every link
-/// region a node produces belongs to its BODY and is rebased strictly BELOW the
-/// header row (`store::preview::peer_node_lines`, `injected_node_lines`), so no
-/// content row is ever claimed by both a `FoldRegion` and a `LinkRegion` and
-/// neither order can swallow the other's click. The order is written down anyway
-/// because that is a property
+/// The whole order is FREE, not a tie-break. A node's header line is built from
+/// the marker, the sender, the timestamp and the affordance alone; a delegation
+/// line from the marker, the agent, its launch's description — drawn VERBATIM as
+/// plain text, never through the link pass — and the affordance; every link region
+/// a node produces belongs to its BODY and is rebased strictly BELOW the header row
+/// (`store::preview::peer_node_lines`, `injected_node_lines`,
+/// `delegation_node_lines`), so no content row is ever claimed by two kinds of
+/// region and no order can swallow another's click. The order is written down
+/// anyway because that is a property
 /// of today's render rather than a guarantee of it: it is what would decide the
 /// collision if a header ever did carry a link, and
-/// `a_peer_node_header_carries_no_link_regions_at_any_width` and
-/// `an_injected_node_header_carries_no_link_regions_at_any_width` — one per node
-/// kind, since each builds its header on its own path — are the tests that go red
+/// `a_peer_node_header_carries_no_link_regions_at_any_width`,
+/// `an_injected_node_header_carries_no_link_regions_at_any_width` and
+/// `a_delegation_line_carries_no_link_or_fold_region_at_any_width` — one per line
+/// kind, since each builds its line on its own path — are the tests that go red
 /// the moment the premise stops holding.
 fn click_effect(app: &mut App, press: Position) -> MouseEffect {
     // One derivation of the transcript rect for both halves, so the width the
@@ -1405,6 +1516,14 @@ fn click_effect(app: &mut App, press: Position) -> MouseEffect {
     let transcript = view::preview_transcript_rect(app);
     if let Some(key) = fold_under_pointer(app, press.x, press.y) {
         app.toggle_peer_fold(&key, transcript.width);
+        return MouseEffect::None;
+    }
+    if let Some((agent_id, agent_type)) = subagent_under_pointer(app, press.x, press.y) {
+        if app.is_composing() {
+            app.set_status(SUBAGENT_VIEW_COMPOSING_REFUSAL);
+        } else {
+            app.open_subagent_view(&agent_id, &agent_type);
+        }
         return MouseEffect::None;
     }
     let click = resolve_link_click(app, press.x, press.y);
@@ -1485,8 +1604,7 @@ fn resolve_link_click(app: &mut App, col: u16, row: u16) -> LinkClick {
     // Read before the borrow below: the hit context borrows `app` for as long as its
     // lines are in hand, and the offset is a plain `Copy` field.
     let scroll = app.preview_scroll;
-    let Some((row_prefix, lines, regions, _folds)) = app.preview_hit_context(transcript.width)
-    else {
+    let Some((row_prefix, lines, regions, ..)) = app.preview_hit_context(transcript.width) else {
         return LinkClick::NoLink;
     };
     match view::link_at(col, row, transcript, scroll, row_prefix, lines, regions) {
@@ -1616,8 +1734,36 @@ fn fold_under_pointer(app: &mut App, col: u16, row: u16) -> Option<String> {
     // Read before the borrow below, which holds `app` for as long as the regions are
     // in hand; the offset is a plain `Copy` field.
     let scroll = app.preview_scroll;
-    let (row_prefix, _lines, _links, folds) = app.preview_hit_context(transcript.width)?;
+    let (row_prefix, _lines, _links, folds, _subagents) =
+        app.preview_hit_context(transcript.width)?;
     view::fold_at(col, row, transcript, scroll, row_prefix, folds).map(str::to_string)
+}
+
+/// The sticky refusal a click on a `◆ delegated to …` line reports while a quick
+/// reply or fork box is open ([`click_effect`]): the box sends into the session,
+/// so the pane stays on the session's own transcript, and a click that silently
+/// did nothing beside a `(click to view)` affordance would read as broken.
+const SUBAGENT_VIEW_COMPOSING_REFUSAL: &str =
+    "close the reply or fork box to view a subagent's transcript";
+
+/// The subagent named by the `◆ delegated to …` line under a pointer at screen
+/// `(col, row)` — its id and its `agentType` — or `None` when the pointer is over
+/// no such line.
+///
+/// [`fold_under_pointer`]'s twin: the same [`view::preview_transcript_rect`], the
+/// same width-scoped [`App::preview_hit_context`] entry and, inside
+/// [`view::subagent_at`], the same `view::content_hit` geometry, so a click can
+/// never resolve to a delegation line on one row and a fold header on another.
+/// Terminal- and process-free: it answers a subagent and changes nothing; the
+/// switch is [`App::open_subagent_view`]'s, which [`click_effect`] calls on a
+/// click's release.
+fn subagent_under_pointer(app: &mut App, col: u16, row: u16) -> Option<(String, String)> {
+    let transcript = view::preview_transcript_rect(app);
+    let scroll = app.preview_scroll;
+    let (row_prefix, _lines, _links, _folds, subagents) =
+        app.preview_hit_context(transcript.width)?;
+    view::subagent_at(col, row, transcript, scroll, row_prefix, subagents)
+        .map(|region| (region.agent_id.clone(), region.agent_type.clone()))
 }
 
 /// Apply a decoded [`Action`] to the app.
@@ -1788,6 +1934,20 @@ fn apply_action(app: &mut App, action: Action) -> Outcome {
         }
         Action::ClearQuery => {
             app.clear_query();
+            Outcome::Continue
+        }
+        Action::LeaveSubagentView => {
+            app.leave_subagent_view();
+            Outcome::Continue
+        }
+        Action::PrevSubagent => {
+            let stepped = app.step_subagent_view(false);
+            refuse_unavailable_subagents(app, stepped);
+            Outcome::Continue
+        }
+        Action::NextSubagent => {
+            let stepped = app.step_subagent_view(true);
+            refuse_unavailable_subagents(app, stepped);
             Outcome::Continue
         }
         Action::Chord => {
@@ -1973,10 +2133,11 @@ pub fn finish_copy<W: Write>(app: &mut App, w: &mut W, payload: &CopyPayload, co
     }
 }
 
-/// The seven keys a pending `Ctrl-X` chord binds, plus cancel — the PURE decision
+/// The eight keys a pending `Ctrl-X` chord binds, plus cancel — the PURE decision
 /// half of the leader chord (PATTERNS §10, keys -> actions -> outcomes). The impure
 /// completion (hide / open confirm / toggle / rescan / copy session ID / fold
-/// toggle / open the move picker) lives in [`handle_chord_key`].
+/// toggle / open the move picker / open or leave the subagent view) lives in
+/// [`handle_chord_key`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChordOutcome {
     /// `x` — toggle the selected session's hidden state (soft delete / un-hide).
@@ -1998,6 +2159,10 @@ enum ChordOutcome {
     /// `w` — open the move-to-worktree picker for the selected session
     /// ([`App::open_move_picker`]).
     Move,
+    /// `↓` — open the selected session's subagent view on its open target
+    /// ([`App::open_subagent_target`]), the way OpenCode's `Down` enters a
+    /// session's subagents; pressed while the view is up, leave it.
+    Subagents,
     /// `Esc` / `Ctrl-C` / any unbound key — abandon the chord with no side effect.
     Cancel,
 }
@@ -2009,7 +2174,8 @@ enum ChordOutcome {
 /// mid-leader and no completion is bound to a Ctrl combo), and any unbound key
 /// cancels too, so a mistyped follow-up abandons the chord rather than doing
 /// something surprising. Each binding accepts its shifted form so a held Shift on
-/// the follow-up still completes the chord.
+/// the follow-up still completes the chord; for `↓` that is a `Shift-↓`, which
+/// matches the same arm because only `Ctrl` is read.
 fn chord_key(key: KeyEvent) -> ChordOutcome {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return ChordOutcome::Cancel;
@@ -2022,6 +2188,7 @@ fn chord_key(key: KeyEvent) -> ChordOutcome {
         KeyCode::Char('y') | KeyCode::Char('Y') => ChordOutcome::Copy,
         KeyCode::Char('f') | KeyCode::Char('F') => ChordOutcome::Fold,
         KeyCode::Char('w') | KeyCode::Char('W') => ChordOutcome::Move,
+        KeyCode::Down => ChordOutcome::Subagents,
         _ => ChordOutcome::Cancel,
     }
 }
@@ -2035,11 +2202,15 @@ fn chord_key(key: KeyEvent) -> ChordOutcome {
 /// a clipboard copy of the selected session's full id ([`copy_selected_id`], which
 /// hands the driver an [`Outcome::Copy`]), `f` folds or expands the selected row's
 /// fork lineage, `w` opens the move-to-worktree picker ([`App::open_move_picker`];
-/// the move itself runs at its confirm), and anything else (`Esc` / `Ctrl-C` / an
-/// unbound key) abandons the chord with no side effect. The pending state is
-/// cleared FIRST so an early return can never wedge the board in the chord.
-/// Routed BEFORE `key_to_action` in
-/// [`handle_event`], so a printable completion never leaks into the query.
+/// the move itself runs at its confirm), `↓` opens the subagent view on the
+/// selected session's open target, or leaves the view when it is up
+/// ([`toggle_subagent_view`]), and anything else (`Esc` / `Ctrl-C` / an unbound
+/// key) abandons the chord with no side effect.
+/// The pending state is cleared FIRST so an early return can never wedge the
+/// board in the chord. Routed BEFORE `key_to_action` in
+/// [`handle_event`], so a printable completion never leaks into the query. The
+/// chord arms from the board alone ([`Action::Chord`]), so no verb can act while
+/// a compose box, a picker or a prompt owns the keyboard.
 ///
 /// `r` is the store cache's ESCAPE HATCH, and it is a user-reachable key rather
 /// than an internal call for exactly that reason: reloads reuse the parse of every
@@ -2068,9 +2239,48 @@ fn handle_chord_key(app: &mut App, key: KeyEvent, store: &mut SessionStore) -> O
         ChordOutcome::Copy => return copy_selected_id(app),
         ChordOutcome::Fold => app.toggle_selected_lineage(),
         ChordOutcome::Move => app.open_move_picker(),
+        ChordOutcome::Subagents => toggle_subagent_view(app),
         ChordOutcome::Cancel => {}
     }
     Outcome::Continue
+}
+
+/// `Ctrl-X ↓`: leave the subagent view when it is up, as `Esc` does; else open it
+/// on the selected session's open target ([`App::open_subagent_target`]), which
+/// reads the record the background refresh landed and no file. The query is left
+/// as typed either way.
+fn toggle_subagent_view(app: &mut App) {
+    if app.in_subagent_view() {
+        app.leave_subagent_view();
+    } else {
+        let opened = app.open_subagent_target();
+        refuse_unavailable_subagents(app, opened);
+    }
+}
+
+/// `Ctrl-X ↓`'s and the subagent view's `←`/`→` refusal while the selected
+/// session's subagents have not been read yet: it says so, and never claims there
+/// are none, which nothing knows until the read lands.
+const SUBAGENTS_NOT_READ_REFUSAL: &str =
+    "still reading this session's subagents — try again in a moment";
+
+/// The same keys' refusal when the selected session's record lists no subagent.
+const SUBAGENTS_NONE_REFUSAL: &str = "no subagents found for this session";
+
+/// The refusal line for why no subagent could be switched to. PURE.
+fn subagents_refusal(why: SubagentsUnavailable) -> &'static str {
+    match why {
+        SubagentsUnavailable::NotRead => SUBAGENTS_NOT_READ_REFUSAL,
+        SubagentsUnavailable::None => SUBAGENTS_NONE_REFUSAL,
+    }
+}
+
+/// Put `result`'s refusal, if any, on the status line — STICKY, as every refusal
+/// is (STATUS-LINE OWNERSHIP).
+fn refuse_unavailable_subagents(app: &mut App, result: Result<(), SubagentsUnavailable>) {
+    if let Err(why) = result {
+        app.set_status(subagents_refusal(why));
+    }
 }
 
 /// The `Ctrl-X r` outcome line. Pure so the wording is assertable without a store.
@@ -2938,13 +3148,17 @@ mod tests {
     use crate::agents::ReportedAgent;
     use crate::resume::ModelPick;
     use crate::search::{filter, SearchMode};
+    use crate::store::discover::SubagentTranscript;
     use crate::store::skills::{Listing, ListingEntry};
-    use crate::store::Session;
+    use crate::store::subagents::{Subagent, SubagentRecord};
+    use crate::store::{Reload, Session};
     use crate::tui::app::{
         NewSessionDraft, PaneLayout, Scope, AUTOSCROLL_FRAME, STATUS_DWELL_TICKS,
     };
     use crate::tui::compose::ComposeTarget;
     use crate::worktrees::{resolve_dir, WorktreeSet};
+    use std::collections::HashSet;
+    use time::OffsetDateTime;
 
     /// A store over `root` for a test that drives [`handle_event`]. Most routing
     /// tests never reload at all, so the root is usually a placeholder — where a
@@ -3296,9 +3510,9 @@ mod tests {
 
     /// A whole left CLICK at `(col, row)` — press, then release, no drag — through
     /// the real `handle_event`, the way a user's click arrives. The press only
-    /// records where it landed; the RELEASE is what toggles a node or opens a link
-    /// (`click_effect`), so a press alone proves nothing about either. Returns the
-    /// release's outcome.
+    /// records where it landed; the RELEASE is what toggles a node, switches to a
+    /// subagent or opens a link (`click_effect`), so a press alone proves nothing
+    /// about any of them. Returns the release's outcome.
     fn left_click(app: &mut App, col: u16, row: u16) -> Outcome {
         wheel(app, MouseEventKind::Down(MouseButton::Left), col, row);
         wheel(app, MouseEventKind::Up(MouseButton::Left), col, row)
@@ -7601,7 +7815,7 @@ mod tests {
                 if open {
                     app.toggle_peer_fold(PEER_KEY, width);
                 }
-                let (_row_prefix, _lines, links, folds) = app
+                let (_row_prefix, _lines, links, folds, _) = app
                     .preview_hit_context(width)
                     .expect("the fixture session is selected, so it has a preview");
                 assert!(
@@ -8045,7 +8259,7 @@ mod tests {
                 if open {
                     app.toggle_peer_fold(INJECTED_KEY, width);
                 }
-                let (_row_prefix, _lines, links, folds) = app
+                let (_row_prefix, _lines, links, folds, _) = app
                     .preview_hit_context(width)
                     .expect("the fixture session is selected, so it has a preview");
                 assert!(
@@ -8070,6 +8284,1342 @@ mod tests {
                 }
             }
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The checked-in delegation fixture: an `Agent` launch whose subagent meta
+    /// file's description spells a markdown link, and that agent's hand-back.
+    const DELEGATION_FIXTURE: (&str, &str) =
+        ("-Users-me-project-epsilon", "sess-delegation-1.jsonl");
+    /// That launch's subagent: its meta's agent id, the stem of its transcript.
+    const DELEGATION_KEY: &str = "a1b2c3d4e5f6a7b8c";
+    /// That subagent's `agentType`, which the subagent view's title names.
+    const DELEGATION_AGENT_TYPE: &str = "parser-auditor";
+    /// What that launch's line opens with, after its in-turn indent.
+    /// `store::preview` owns the literal; it is restated for the reason
+    /// [`COLLAPSED_AFFORDANCE`] is.
+    const DELEGATION_HEADER_HEAD: &str = "\u{25c6} delegated to @parser-auditor";
+    /// What the launch INSIDE that subagent's transcript opens with: the line a
+    /// drill-down clicks.
+    const DELEGATION_NESTED_HEAD: &str = "\u{25c6} delegated to @fixture-reviewer";
+    /// The affordance a delegation line ends with, restated for the same reason.
+    const DELEGATION_VIEW_AFFORDANCE: &str = "(click to view)";
+    /// The markdown link that launch's description spells, which the line draws
+    /// as plain text.
+    const DELEGATION_DESCRIPTION_LINK: &str = "[docs](https://example.com)";
+    /// The url of the link the launched subagent's own transcript spells: a link
+    /// only the subagent view draws.
+    const DELEGATION_BODY_LINK: &str = "https://example.com/parser";
+    /// A line only the session's OWN transcript draws.
+    const DELEGATION_SESSION_PHRASE: &str = "Delegating the parser audit now.";
+    /// A line only that launched subagent's own transcript draws.
+    const DELEGATION_VIEW_PHRASE: &str = "Splitting off the fixture review.";
+    /// A line only the NESTED subagent's own transcript draws.
+    const DELEGATION_NESTED_PHRASE: &str = "Review the malformed-line fixtures.";
+
+    /// The premise the click's precedence rests on, for the DELEGATION line: its
+    /// row carries no link region and no fold region at every pane width it is
+    /// readable at — though its description spells a markdown link, because the
+    /// line draws it verbatim instead of through the link pass. Checked in the
+    /// session's own transcript and inside the subagent view, where the nested
+    /// launch is a delegation line too and the subagent's own link makes the check
+    /// non-vacuous: a real link region exists, on another row.
+    /// The other kinds' twins are
+    /// `a_peer_node_header_carries_no_link_regions_at_any_width` and
+    /// `an_injected_node_header_carries_no_link_regions_at_any_width`; each kind
+    /// builds its line on its own path.
+    #[test]
+    fn a_delegation_line_carries_no_link_or_fold_region_at_any_width() {
+        let (folder, file) = DELEGATION_FIXTURE;
+        let mut app = App::new(
+            vec![fixture_session("s1", folder, file)],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
+        let text_of = |line: &ratatui::text::Line| -> String {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        };
+        for width in [80u16, 40, 24, 16] {
+            for in_view in [false, true] {
+                if in_view {
+                    app.open_subagent_view(DELEGATION_KEY, DELEGATION_AGENT_TYPE);
+                } else {
+                    app.leave_subagent_view();
+                }
+                let head = if in_view {
+                    DELEGATION_NESTED_HEAD
+                } else {
+                    DELEGATION_HEADER_HEAD
+                };
+                let (_row_prefix, lines, links, folds, subagents) = app
+                    .preview_hit_context(width)
+                    .expect("the fixture session is selected, so it has a preview");
+                let line = subagents
+                    .iter()
+                    .map(|region| text_of(&lines[region.content_row]))
+                    .find(|text| text.trim_start().starts_with(head))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "the delegation line must render its region at width \
+                             {width} (in_view={in_view}), or this width proves nothing"
+                        )
+                    });
+                assert!(
+                    line.ends_with(DELEGATION_VIEW_AFFORDANCE),
+                    "the line offers the switch: {line:?}"
+                );
+                if !in_view {
+                    assert!(
+                        line.contains(DELEGATION_DESCRIPTION_LINK),
+                        "the line must spell its description's link, or the check \
+                         below is vacuous: {line:?}"
+                    );
+                }
+                for region in subagents {
+                    assert!(
+                        !links.iter().any(|l| l.content_row == region.content_row),
+                        "a delegation line must carry no link at width {width} \
+                         (in_view={in_view}), or the click order stops being free"
+                    );
+                    assert!(
+                        !folds.iter().any(|f| f.content_row == region.content_row),
+                        "a delegation line must carry no fold region at width {width} \
+                         (in_view={in_view})"
+                    );
+                }
+                if in_view {
+                    assert!(
+                        links.iter().any(|link| link.url == DELEGATION_BODY_LINK),
+                        "the view must contribute its transcript's link at width \
+                         {width}, or the disjointness above is vacuous"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A real click on a `◆ delegated to …` line switches the preview to that
+    /// subagent's OWN transcript — the session's lines leave the pane, the
+    /// subagent's take their place at its newest turn, and the title names the
+    /// subagent — and a click on the launch INSIDE it drills down to the nested
+    /// subagent. `Esc` then goes back to the session's own transcript, scrolled
+    /// where it was when the first click landed.
+    ///
+    /// Driven END TO END through [`handle_mouse`] and [`handle_event`], so the
+    /// line is found where the pane DREW it and the click takes the real route:
+    /// [`subagent_under_pointer`] through [`click_effect`] into the switch.
+    #[test]
+    fn a_click_on_a_delegation_line_switches_the_preview_and_esc_goes_back() {
+        let (folder, file) = DELEGATION_FIXTURE;
+        let mut app = App::new(
+            vec![fixture_session("s1", folder, file)],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
+        // Off the bottom anchor, onto a row that is neither the top nor the
+        // bottom, with the launch's line still on screen: a position of the
+        // reader's own, which going back must restore.
+        render_board(&mut app);
+        press(&mut app, KeyCode::Home);
+        render_board(&mut app);
+        let rect = view::preview_transcript_rect(&app);
+        wheel(&mut app, MouseEventKind::ScrollDown, rect.x, rect.y);
+        let buffer = render_board(&mut app);
+        let session_scroll = (app.preview_scroll, app.preview_follow_bottom);
+        assert!(
+            session_scroll.0 > 0 && !session_scroll.1,
+            "premise: the session's pane sits at a position of the reader's own: \
+             {session_scroll:?}"
+        );
+        let width = view::preview_transcript_rect(&app).width;
+        let cell = drawn_text_cell(&buffer, app.preview_rect, DELEGATION_HEADER_HEAD);
+
+        left_click(&mut app, cell.0, cell.1);
+        assert_eq!(app.subagent_view_type(), Some(DELEGATION_AGENT_TYPE));
+        let text = preview_string(&mut app, width);
+        assert!(
+            text.contains(DELEGATION_VIEW_PHRASE) && !text.contains(DELEGATION_SESSION_PHRASE),
+            "the pane shows the subagent's transcript, not the session's:\n{text}"
+        );
+        assert!(
+            app.preview_follow_bottom,
+            "the view opens at its newest turn"
+        );
+
+        let buffer = render_board(&mut app);
+        let nested = drawn_text_cell(&buffer, app.preview_rect, DELEGATION_NESTED_HEAD);
+        left_click(&mut app, nested.0, nested.1);
+        assert_eq!(app.subagent_view_type(), Some("fixture-reviewer"));
+        assert!(
+            preview_string(&mut app, width).contains(DELEGATION_NESTED_PHRASE),
+            "the drill-down shows the nested subagent's own transcript"
+        );
+
+        let outcome = press(&mut app, KeyCode::Esc);
+        assert!(
+            matches!(outcome, Outcome::Continue),
+            "Esc in the view never quits"
+        );
+        assert!(!app.in_subagent_view(), "Esc leaves the view");
+        assert!(
+            preview_string(&mut app, width).contains(DELEGATION_SESSION_PHRASE),
+            "back on the session's own transcript"
+        );
+        assert_eq!(
+            (app.preview_scroll, app.preview_follow_bottom),
+            session_scroll,
+            "where it was scrolled when the first click landed, not the drill-down's"
+        );
+    }
+
+    /// `Esc` unwinds ONE level per press, in this order: a typed query first, then
+    /// the subagent view, then the board. With a query typed in the view, the first
+    /// press clears it and the view stays; the second leaves the view; only the
+    /// third quits.
+    #[test]
+    fn esc_clears_the_query_then_leaves_the_subagent_view_then_quits() {
+        assert_eq!(
+            key_to_action(key(KeyCode::Esc), false, false, true),
+            Action::ClearQuery
+        );
+        assert_eq!(
+            key_to_action(key(KeyCode::Esc), true, false, true),
+            Action::LeaveSubagentView
+        );
+        assert_eq!(
+            key_to_action(key(KeyCode::Esc), true, false, false),
+            Action::Quit
+        );
+
+        let (folder, file) = DELEGATION_FIXTURE;
+        let mut app = App::new(
+            vec![fixture_session("s1", folder, file)],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
+        app.open_subagent_view(DELEGATION_KEY, DELEGATION_AGENT_TYPE);
+        press(&mut app, KeyCode::Char('a'));
+        assert!(
+            app.in_subagent_view(),
+            "premise: typing keeps the session selected, so the view stays"
+        );
+
+        assert!(matches!(press(&mut app, KeyCode::Esc), Outcome::Continue));
+        assert_eq!(app.query(), "", "the first Esc clears the query");
+        assert!(app.in_subagent_view(), "and leaves the view open");
+
+        assert!(matches!(press(&mut app, KeyCode::Esc), Outcome::Continue));
+        assert!(!app.in_subagent_view(), "the second Esc leaves the view");
+
+        assert!(
+            matches!(press(&mut app, KeyCode::Esc), Outcome::Quit),
+            "the third Esc quits"
+        );
+    }
+
+    /// Only THREE routes may switch the preview to a subagent or read a
+    /// subagent's transcript (`docs/agents/DOMAIN.md`, "Delegation line and
+    /// subagent view (`store::preview`)"): a CLICK on a `◆ delegated to …` line,
+    /// `Ctrl-X ↓`, and `←`/`→` inside the view. Every search route — typing a
+    /// query the subagents' transcripts hold too, `Tab` to content search,
+    /// `Shift-Down` and `Shift-Up` over the marks, `Backspace` — leaves the pane on
+    /// the session's own transcript and reads no subagent file — with the
+    /// session's subagent record already landed, as the background refresh, which
+    /// follows the selection through those routes, would have it, so a route that
+    /// opened the view could. The record landing reads no transcript on the UI
+    /// thread. The click that follows is what does both, which proves the counter
+    /// can see a read at all; then `Ctrl-X ↓` and a `→` do both again.
+    #[test]
+    fn no_search_route_switches_to_a_subagent_or_reads_its_transcript() {
+        let (folder, file) = DELEGATION_FIXTURE;
+        // A label the query matches, so the row survives the filter and the pane
+        // keeps previewing it while every search key below is pressed.
+        let mut session = fixture_session("s1", folder, file);
+        session.label = "Audit the JSONL parser and refresh its docs".to_string();
+        let mut app = App::new(vec![session], Scope::All, PathBuf::from("/tmp"));
+        deliver_record(&mut app, "s1", fixture_record(&[]));
+        render_board(&mut app);
+        for c in "parser".chars() {
+            press(&mut app, KeyCode::Char(c));
+            render_board(&mut app);
+        }
+        press(&mut app, KeyCode::Tab);
+        render_board(&mut app);
+        assert!(
+            app.has_preview_matches(),
+            "premise: the query marks the session's own lines, so the Shift arrows \
+             step marks rather than falling through"
+        );
+        for code in [KeyCode::Down, KeyCode::Up] {
+            press_shift(&mut app, code);
+            render_board(&mut app);
+        }
+        press(&mut app, KeyCode::Backspace);
+        render_board(&mut app);
+
+        assert!(!app.in_subagent_view(), "no search route opens the view");
+        assert_eq!(
+            app.subagent_renders(),
+            0,
+            "no search route reads a transcript"
+        );
+
+        app.preview_top();
+        let buffer = render_board(&mut app);
+        let cell = drawn_text_cell(&buffer, app.preview_rect, DELEGATION_HEADER_HEAD);
+        left_click(&mut app, cell.0, cell.1);
+        render_board(&mut app);
+        assert!(app.in_subagent_view(), "the click opens the view");
+        assert_eq!(
+            app.subagent_renders(),
+            1,
+            "and the view reads its transcript once"
+        );
+
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Esc);
+        render_board(&mut app);
+        assert!(
+            !app.in_subagent_view() && app.query().is_empty(),
+            "premise: back on the session's own transcript, no query"
+        );
+        ctrl_x_down(&mut app);
+        render_board(&mut app);
+        assert_eq!(app.subagent_view_type(), Some("fixture-reviewer"));
+        assert_eq!(app.subagent_renders(), 2, "Ctrl-X ↓ reads the transcript");
+        press(&mut app, KeyCode::Right);
+        render_board(&mut app);
+        assert_eq!(app.subagent_view_type(), Some(DELEGATION_AGENT_TYPE));
+        assert_eq!(
+            app.subagent_renders(),
+            3,
+            "and so does a step inside the view"
+        );
+    }
+
+    /// Move the board's selection onto `id` with the board's own mover.
+    fn select_id(app: &mut App, id: &str) {
+        let rows = app.filtered.len();
+        app.move_selection(-isize::try_from(rows).expect("a small board"));
+        for _ in 0..rows {
+            if app.selected.as_deref() == Some(id) {
+                break;
+            }
+            app.move_selection(1);
+        }
+        assert_eq!(app.selected.as_deref(), Some(id), "{id} is on the board");
+    }
+
+    /// `Ctrl-X` then `↓`, through the board's own key route.
+    fn ctrl_x_down(app: &mut App) -> Outcome {
+        press_ctrl(app, KeyCode::Char('x'));
+        press(app, KeyCode::Down)
+    }
+
+    /// The background refresh's one `SubagentRuns` for `session_id`, through
+    /// `handle_event`.
+    fn deliver_record(app: &mut App, session_id: &str, record: SubagentRecord) -> Outcome {
+        handle_event(
+            app,
+            AppEvent::SubagentRuns {
+                session_id: session_id.to_string(),
+                record,
+            },
+            &mut store_at(Path::new("/tmp")),
+        )
+    }
+
+    /// The delegation fixture's other two subagents, beside [`DELEGATION_KEY`].
+    const DOCS_WRITER_KEY: &str = "c2d3e4f5a6b7c8d9e";
+    const REVIEWER_KEY: &str = "b0c1d2e3f4a5b6c7d";
+    /// A line only the `docs-writer` subagent's own transcript draws.
+    const DOCS_WRITER_PHRASE: &str = "Docs refreshed for the new parser rules.";
+
+    /// One recorded subagent, launched at `launched` (Unix seconds) and last
+    /// written `idle_secs` before the real clock: RUNNING (read and unended) when
+    /// `running`, otherwise a tail the read never opened.
+    fn recorded(
+        agent_id: &str,
+        agent_type: &str,
+        launched: i64,
+        idle_secs: u64,
+        running: bool,
+    ) -> Subagent {
+        Subagent {
+            agent_id: agent_id.to_string(),
+            agent_type: agent_type.to_string(),
+            description: None,
+            launched: Some(OffsetDateTime::from_unix_timestamp(launched).expect("an instant")),
+            newest_write: Some(SystemTime::now() - Duration::from_secs(idle_secs)),
+            ended: running.then_some(false),
+        }
+    }
+
+    /// The delegation fixture's three subagents as the background refresh would
+    /// record them, in launch order — `parser-auditor`, `docs-writer`,
+    /// `fixture-reviewer` — each id in `running` written a minute ago and
+    /// unended, the rest quiet for hours, `fixture-reviewer` the most recently.
+    fn fixture_record(running: &[&str]) -> SubagentRecord {
+        let entry = |id: &str, agent_type: &str, launched: i64, idle_secs: u64| {
+            let runs = running.contains(&id);
+            recorded(
+                id,
+                agent_type,
+                launched,
+                if runs { 60 } else { idle_secs },
+                runs,
+            )
+        };
+        SubagentRecord::new(vec![
+            entry(REVIEWER_KEY, "fixture-reviewer", 300, 3_600),
+            entry(DELEGATION_KEY, DELEGATION_AGENT_TYPE, 100, 7_200),
+            entry(DOCS_WRITER_KEY, "docs-writer", 200, 5_400),
+        ])
+    }
+
+    /// An app over the delegation fixture, its session `s1` selected.
+    fn delegation_app() -> App {
+        let (folder, file) = DELEGATION_FIXTURE;
+        App::new(
+            vec![fixture_session("s1", folder, file)],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        )
+    }
+
+    /// R4-4a: `Ctrl-X ↓` opens the FIRST running subagent in launch order straight
+    /// in the preview — `docs-writer`, launched before the running
+    /// `fixture-reviewer` — from the record the background refresh landed, so the
+    /// key itself reads no file: the transcript is read by the next frame.
+    #[test]
+    fn ctrl_x_down_opens_the_first_running_subagent_and_reads_no_file_on_the_key() {
+        let mut app = delegation_app();
+        deliver_record(
+            &mut app,
+            "s1",
+            fixture_record(&[REVIEWER_KEY, DOCS_WRITER_KEY]),
+        );
+
+        let outcome = ctrl_x_down(&mut app);
+
+        assert!(matches!(outcome, Outcome::Continue));
+        assert!(!app.pending_chord, "the chord resolved");
+        assert_eq!(app.subagent_view_type(), Some("docs-writer"));
+        assert_eq!(app.subagent_view_position(), Some((2, 3)));
+        assert_eq!(app.subagent_renders(), 0, "the key reads no transcript");
+        assert_eq!(app.status, None, "opening says nothing");
+        assert!(
+            preview_string(&mut app, 80).contains(DOCS_WRITER_PHRASE),
+            "the pane shows that subagent's own transcript"
+        );
+        assert_eq!(app.subagent_renders(), 1, "read once, by the frame");
+    }
+
+    /// R4-4a: with none running, `Ctrl-X ↓` opens the most recently written one.
+    #[test]
+    fn ctrl_x_down_with_none_running_opens_the_most_recently_written_subagent() {
+        let mut app = delegation_app();
+        deliver_record(&mut app, "s1", fixture_record(&[]));
+
+        ctrl_x_down(&mut app);
+
+        assert_eq!(app.subagent_view_type(), Some("fixture-reviewer"));
+        assert_eq!(app.subagent_view_position(), Some((3, 3)));
+    }
+
+    /// Before the selected session's record lands, `Ctrl-X ↓` refuses and says it
+    /// is still reading — never that there are none, which it does not know — and
+    /// a record for ANOTHER session never stands in for it. On a record with no
+    /// subagent it says so. Both refusals are sticky, and nothing is read.
+    #[test]
+    fn ctrl_x_down_refuses_honestly_before_the_record_lands_and_on_a_session_with_none() {
+        let mut app = delegation_app();
+
+        ctrl_x_down(&mut app);
+        assert!(!app.in_subagent_view());
+        assert_eq!(app.status.as_deref(), Some(SUBAGENTS_NOT_READ_REFUSAL));
+        handle_event(&mut app, AppEvent::Tick, &mut store_at(Path::new("/tmp")));
+        assert_eq!(
+            app.status.as_deref(),
+            Some(SUBAGENTS_NOT_READ_REFUSAL),
+            "a refusal is sticky"
+        );
+
+        deliver_record(&mut app, "s2", fixture_record(&[DOCS_WRITER_KEY]));
+        ctrl_x_down(&mut app);
+        assert!(
+            !app.in_subagent_view(),
+            "another session's record is never this one's"
+        );
+        assert_eq!(app.status.as_deref(), Some(SUBAGENTS_NOT_READ_REFUSAL));
+
+        deliver_record(&mut app, "s1", SubagentRecord::default());
+        ctrl_x_down(&mut app);
+        assert!(!app.in_subagent_view());
+        assert_eq!(app.status.as_deref(), Some(SUBAGENTS_NONE_REFUSAL));
+        assert_eq!(app.subagent_renders(), 0);
+    }
+
+    /// The refusal lines, worded per reason.
+    #[test]
+    fn each_unavailable_reason_has_its_own_refusal() {
+        assert_eq!(
+            subagents_refusal(SubagentsUnavailable::NotRead),
+            SUBAGENTS_NOT_READ_REFUSAL
+        );
+        assert_eq!(
+            subagents_refusal(SubagentsUnavailable::None),
+            SUBAGENTS_NONE_REFUSAL
+        );
+        assert!(
+            !SUBAGENTS_NOT_READ_REFUSAL.contains("no subagents"),
+            "the not-read line never claims there are none"
+        );
+    }
+
+    /// Pressed again while the view is up, `Ctrl-X ↓` leaves it as `Esc` does:
+    /// back on the session's own transcript, scrolled where it was.
+    #[test]
+    fn ctrl_x_down_in_the_view_leaves_it() {
+        let mut app = delegation_app();
+        render_board(&mut app);
+        press(&mut app, KeyCode::Home);
+        render_board(&mut app);
+        let session_scroll = (app.preview_scroll, app.preview_follow_bottom);
+        deliver_record(&mut app, "s1", fixture_record(&[]));
+        ctrl_x_down(&mut app);
+        assert!(app.in_subagent_view(), "premise: the view is up");
+
+        ctrl_x_down(&mut app);
+
+        assert!(!app.in_subagent_view(), "the second Ctrl-X ↓ leaves it");
+        assert_eq!(
+            (app.preview_scroll, app.preview_follow_bottom),
+            session_scroll
+        );
+        assert!(preview_string(&mut app, 80).contains(DELEGATION_SESSION_PHRASE));
+        assert_eq!(app.status, None);
+    }
+
+    /// R4: searching for a session and then pressing `Ctrl-X ↓` leaves the query
+    /// in place, and in the view `←`/`→` step subagents EVEN WITH THE QUERY
+    /// TYPED, never moving its caret, while `Alt`-arrows still hop it by word.
+    /// `Esc` then unwinds the query first, then the view.
+    #[test]
+    fn with_a_query_typed_the_view_keeps_it_and_the_arrows_step_subagents() {
+        let (folder, file) = DELEGATION_FIXTURE;
+        let mut session = fixture_session("s1", folder, file);
+        session.label = "Audit the JSONL parser and refresh its docs".to_string();
+        let mut app = App::new(vec![session], Scope::All, PathBuf::from("/tmp"));
+        type_into_board(&mut app, "the parser");
+        assert_eq!(app.selected.as_deref(), Some("s1"), "premise: still listed");
+        deliver_record(&mut app, "s1", fixture_record(&[]));
+
+        ctrl_x_down(&mut app);
+        assert_eq!(app.subagent_view_type(), Some("fixture-reviewer"));
+        assert_eq!(app.query(), "the parser", "Ctrl-X ↓ leaves the query");
+        let caret = app.query_caret();
+
+        press(&mut app, KeyCode::Right);
+        assert_eq!(
+            app.subagent_view_type(),
+            Some(DELEGATION_AGENT_TYPE),
+            "→ from the last wraps to the first"
+        );
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.subagent_view_type(), Some("fixture-reviewer"));
+        assert_eq!(
+            (app.query(), app.query_caret()),
+            ("the parser", caret),
+            "the plain arrows never moved the caret"
+        );
+
+        press_alt(&mut app, KeyCode::Left);
+        assert!(
+            app.query_caret() < caret,
+            "Alt-← still hops the caret a word in the view"
+        );
+        assert_eq!(app.subagent_view_type(), Some("fixture-reviewer"));
+
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.query(), "", "the first Esc clears the query");
+        assert!(app.in_subagent_view());
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.in_subagent_view());
+    }
+
+    /// R4-4a: `←`/`→` step through every subagent in LAUNCH order and wrap round
+    /// at both ends, the title's position following; `Esc` still goes back to
+    /// where the session's own transcript was, however many steps were taken.
+    #[test]
+    fn left_and_right_step_through_launch_order_and_wrap_round() {
+        let mut app = delegation_app();
+        render_board(&mut app);
+        press(&mut app, KeyCode::Home);
+        render_board(&mut app);
+        let session_scroll = (app.preview_scroll, app.preview_follow_bottom);
+        deliver_record(&mut app, "s1", fixture_record(&[]));
+        app.open_subagent_view(DELEGATION_KEY, DELEGATION_AGENT_TYPE);
+        assert_eq!(app.subagent_view_position(), Some((1, 3)));
+
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Right);
+            seen.push(app.subagent_view_position());
+        }
+        assert_eq!(seen, [Some((2, 3)), Some((3, 3)), Some((1, 3))]);
+        press(&mut app, KeyCode::Left);
+        assert_eq!(
+            app.subagent_view_type(),
+            Some("fixture-reviewer"),
+            "← from the first wraps to the last"
+        );
+        assert!(
+            preview_string(&mut app, 80).contains(DELEGATION_NESTED_PHRASE),
+            "the pane shows the stepped-to subagent's transcript"
+        );
+
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.in_subagent_view());
+        assert_eq!(
+            (app.preview_scroll, app.preview_follow_bottom),
+            session_scroll
+        );
+    }
+
+    /// A view on a subagent the record does not list yet — a click opened it
+    /// before its meta file was read — has no position, and steps as if it were
+    /// the newest launch: `→` to the first listed, `←` to the last.
+    #[test]
+    fn left_and_right_from_a_subagent_the_record_does_not_list() {
+        let without_auditor = || {
+            SubagentRecord::new(vec![
+                recorded(DOCS_WRITER_KEY, "docs-writer", 200, 5_400, false),
+                recorded(REVIEWER_KEY, "fixture-reviewer", 300, 3_600, false),
+            ])
+        };
+        let mut app = delegation_app();
+        deliver_record(&mut app, "s1", without_auditor());
+        app.open_subagent_view(DELEGATION_KEY, DELEGATION_AGENT_TYPE);
+        assert_eq!(app.subagent_view_position(), None, "no position to state");
+
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.subagent_view_type(), Some("docs-writer"));
+
+        app.open_subagent_view(DELEGATION_KEY, DELEGATION_AGENT_TYPE);
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.subagent_view_type(), Some("fixture-reviewer"));
+        assert_eq!(app.status, None);
+    }
+
+    /// In the view, `←`/`→` before the record lands refuse as `Ctrl-X ↓` does and
+    /// stay on the subagent shown; with one subagent listed they stay on it.
+    #[test]
+    fn left_and_right_refuse_before_the_record_lands_and_stay_on_a_lone_subagent() {
+        let mut app = delegation_app();
+        app.open_subagent_view(DELEGATION_KEY, DELEGATION_AGENT_TYPE);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.subagent_view_type(), Some(DELEGATION_AGENT_TYPE));
+        assert_eq!(app.status.as_deref(), Some(SUBAGENTS_NOT_READ_REFUSAL));
+
+        deliver_record(
+            &mut app,
+            "s1",
+            SubagentRecord::new(vec![recorded(
+                DELEGATION_KEY,
+                DELEGATION_AGENT_TYPE,
+                100,
+                60,
+                true,
+            )]),
+        );
+        let _ = preview_string(&mut app, 80);
+        let renders = app.subagent_renders();
+        for code in [KeyCode::Right, KeyCode::Left] {
+            press(&mut app, code);
+            assert_eq!(app.subagent_view_type(), Some(DELEGATION_AGENT_TYPE));
+            assert_eq!(app.status, None, "a step onto itself is no refusal");
+            let _ = preview_string(&mut app, 80);
+            assert_eq!(
+                app.subagent_renders(),
+                renders,
+                "and no switch: the view is not read again"
+            );
+        }
+        deliver_record(&mut app, "s1", SubagentRecord::default());
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.status.as_deref(), Some(SUBAGENTS_NONE_REFUSAL));
+    }
+
+    /// From a `1:0` board, whose preview is hidden, `Ctrl-X ↓` brings the preview
+    /// back at `1:1` so the switch shows.
+    #[test]
+    fn ctrl_x_down_brings_a_hidden_preview_back() {
+        let mut app = delegation_app();
+        while app.pane_layout().shows_preview() {
+            press_shift(&mut app, KeyCode::Right);
+        }
+        deliver_record(&mut app, "s1", fixture_record(&[]));
+        ctrl_x_down(&mut app);
+        assert!(app.pane_layout().shows_preview());
+        assert!(app.in_subagent_view());
+    }
+
+    /// Plain `←`/`→` step subagents exactly while the view is up — with or
+    /// without a query — and move the caret otherwise; `Shift` still steps the
+    /// layout, and `Alt` and `Ctrl` still hop a word, in the view or not.
+    #[test]
+    fn the_plain_arrows_step_subagents_only_in_the_view_and_modified_ones_keep_their_meaning() {
+        for query_empty in [true, false] {
+            for (in_view, back, forward) in [
+                (false, Action::CaretBack, Action::CaretForward),
+                (true, Action::PrevSubagent, Action::NextSubagent),
+            ] {
+                let action = |key: KeyEvent| key_to_action(key, query_empty, false, in_view);
+                let what = format!("query_empty={query_empty}, in_view={in_view}");
+                assert_eq!(action(self::key(KeyCode::Left)), back, "{what}");
+                assert_eq!(action(self::key(KeyCode::Right)), forward, "{what}");
+                assert_eq!(
+                    action(shift(KeyCode::Left)),
+                    Action::LayoutTowardPreview,
+                    "{what}"
+                );
+                assert_eq!(
+                    action(shift(KeyCode::Right)),
+                    Action::LayoutTowardList,
+                    "{what}"
+                );
+                for word in [alt, ctrl] {
+                    assert_eq!(action(word(KeyCode::Left)), Action::CaretWordBack, "{what}");
+                    assert_eq!(
+                        action(word(KeyCode::Right)),
+                        Action::CaretWordForward,
+                        "{what}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Two rows over the delegation fixture with the selection on the LOWER one,
+    /// so a `↑` that moved the selection would land on the other, and its pane
+    /// parked at the top: a position of the reader's own, which leaving the
+    /// subagent view must put back. Returns the app, the selected id and that
+    /// position.
+    fn lower_row_delegation_app() -> (App, String, (u32, bool)) {
+        let (folder, file) = DELEGATION_FIXTURE;
+        let mut app = App::new(
+            vec![
+                fixture_session("s1", folder, file),
+                fixture_session("s2", folder, file),
+            ],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
+        let upper = app.selected.clone();
+        press(&mut app, KeyCode::Down);
+        assert_ne!(
+            app.selected, upper,
+            "premise: a row sits above the selection"
+        );
+        let selected = app.selected.clone().expect("a selection");
+        render_board(&mut app);
+        press(&mut app, KeyCode::Home);
+        render_board(&mut app);
+        let session_scroll = (app.preview_scroll, app.preview_follow_bottom);
+        assert!(
+            !session_scroll.1,
+            "premise: the pane sits at a position of the reader's own"
+        );
+        (app, selected, session_scroll)
+    }
+
+    /// Inside the subagent view a plain `↑` goes back to the SELECTED session's
+    /// own transcript, as `Esc` does — scrolled where it was, and straight back
+    /// from a nested subagent — and never moves the selection, query or not.
+    #[test]
+    fn up_in_the_subagent_view_leaves_it_and_keeps_the_selection() {
+        for query_empty in [true, false] {
+            assert_eq!(
+                key_to_action(key(KeyCode::Up), query_empty, false, true),
+                Action::LeaveSubagentView,
+                "query_empty={query_empty}"
+            );
+        }
+
+        let (mut app, selected, session_scroll) = lower_row_delegation_app();
+        app.open_subagent_view(DELEGATION_KEY, DELEGATION_AGENT_TYPE);
+        app.open_subagent_view(REVIEWER_KEY, "fixture-reviewer");
+        assert_eq!(
+            app.subagent_view_type(),
+            Some("fixture-reviewer"),
+            "premise: drilled down to the nested subagent"
+        );
+
+        let outcome = press(&mut app, KeyCode::Up);
+
+        assert!(matches!(outcome, Outcome::Continue));
+        assert!(!app.in_subagent_view(), "↑ leaves the view");
+        assert_eq!(
+            app.selected.as_deref(),
+            Some(selected.as_str()),
+            "and keeps the selection"
+        );
+        assert_eq!(
+            (app.preview_scroll, app.preview_follow_bottom),
+            session_scroll,
+            "back where the session's own transcript was scrolled"
+        );
+        assert!(preview_string(&mut app, 80).contains(DELEGATION_SESSION_PHRASE));
+        assert_eq!(app.status, None);
+    }
+
+    /// `Shift-Up` in the view leaves it too: the view takes no search marks, so
+    /// the match step's guard fails even with a query that marks the session's
+    /// own lines, and the key falls through to the plain `↑` — the key a terminal
+    /// that drops the modifier delivers anyway.
+    #[test]
+    fn shift_up_in_the_subagent_view_falls_through_to_leaving_it() {
+        for query_empty in [true, false] {
+            assert_eq!(
+                key_to_action(shift(KeyCode::Up), query_empty, false, true),
+                Action::LeaveSubagentView,
+                "query_empty={query_empty}"
+            );
+        }
+
+        let (folder, file) = DELEGATION_FIXTURE;
+        let row = |id: &str| {
+            let mut session = fixture_session(id, folder, file);
+            session.label = format!("Audit the JSONL parser ({id})");
+            session
+        };
+        let mut app = App::new(
+            vec![row("s1"), row("s2")],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
+        press(&mut app, KeyCode::Down);
+        let selected = app.selected.clone();
+        type_into_board(&mut app, "parser");
+        render_board(&mut app);
+        assert_eq!(app.selected, selected, "premise: still on the lower row");
+        assert!(
+            app.has_preview_matches(),
+            "premise: the query marks the session's own lines"
+        );
+        app.open_subagent_view(DELEGATION_KEY, DELEGATION_AGENT_TYPE);
+        render_board(&mut app);
+        assert!(
+            !app.has_preview_matches(),
+            "premise: the view takes no marks"
+        );
+
+        press_shift(&mut app, KeyCode::Up);
+
+        assert!(!app.in_subagent_view(), "Shift-Up leaves the view");
+        assert_eq!(app.selected, selected, "and keeps the selection");
+        assert_eq!(app.query(), "parser");
+    }
+
+    /// `↓` keeps its meaning in the view: it moves the selection, and the view
+    /// closes only because the selection changed — the newly selected row opens
+    /// at its newest turn, never at the place the view saved for the other.
+    #[test]
+    fn down_in_the_subagent_view_still_moves_the_selection() {
+        for query_empty in [true, false] {
+            for down in [key(KeyCode::Down), shift(KeyCode::Down)] {
+                assert_eq!(
+                    key_to_action(down, query_empty, false, true),
+                    Action::MoveDown,
+                    "query_empty={query_empty}, {down:?}"
+                );
+            }
+        }
+
+        let (mut app, selected, _) = lower_row_delegation_app();
+        press(&mut app, KeyCode::Up);
+        let upper = app.selected.clone();
+        assert_ne!(
+            upper.as_deref(),
+            Some(selected.as_str()),
+            "premise: back on the upper row"
+        );
+        press(&mut app, KeyCode::Home);
+        app.open_subagent_view(DELEGATION_KEY, DELEGATION_AGENT_TYPE);
+
+        press(&mut app, KeyCode::Down);
+
+        assert_eq!(
+            app.selected.as_deref(),
+            Some(selected.as_str()),
+            "↓ moves the selection"
+        );
+        assert!(!app.in_subagent_view(), "which closes the view");
+        assert!(
+            app.preview_follow_bottom,
+            "the new row opens at its newest turn"
+        );
+    }
+
+    /// Outside the view `↑` is the selection move it always was — query or not,
+    /// marks or not: the new arm is the view's alone.
+    #[test]
+    fn up_outside_the_subagent_view_still_moves_the_selection() {
+        for (query_empty, marked) in [(true, false), (false, false), (false, true)] {
+            assert_eq!(
+                key_to_action(key(KeyCode::Up), query_empty, marked, false),
+                Action::MoveUp,
+                "query_empty={query_empty}, marked={marked}"
+            );
+        }
+
+        let (mut app, selected, _) = lower_row_delegation_app();
+        assert!(!app.in_subagent_view(), "premise: no view is up");
+
+        press(&mut app, KeyCode::Up);
+
+        assert_ne!(
+            app.selected.as_deref(),
+            Some(selected.as_str()),
+            "↑ moves the selection"
+        );
+    }
+
+    /// `↑` is not `Esc`: with a query typed it leaves the view at once, and the
+    /// query and its caret stay exactly as they were — `Esc` would clear it first.
+    #[test]
+    fn up_in_the_subagent_view_leaves_a_typed_query_intact() {
+        let (folder, file) = DELEGATION_FIXTURE;
+        let mut session = fixture_session("s1", folder, file);
+        session.label = "Audit the JSONL parser and refresh its docs".to_string();
+        let mut app = App::new(vec![session], Scope::All, PathBuf::from("/tmp"));
+        type_into_board(&mut app, "the parser");
+        press(&mut app, KeyCode::Left);
+        let caret = app.query_caret();
+        app.open_subagent_view(DELEGATION_KEY, DELEGATION_AGENT_TYPE);
+
+        press(&mut app, KeyCode::Up);
+
+        assert!(
+            !app.in_subagent_view(),
+            "↑ leaves the view with a query typed"
+        );
+        assert_eq!(
+            (app.query(), app.query_caret()),
+            ("the parser", caret),
+            "and the query and its caret stay as they were"
+        );
+        assert_eq!(app.selected.as_deref(), Some("s1"));
+    }
+
+    /// What the driver would ask the background refresh for now, as the id.
+    fn refresh_asked(app: &mut App) -> Option<String> {
+        app.take_subagent_refresh()
+            .map(|(session_id, _)| session_id)
+    }
+
+    /// Apply `route` and assert it MOVED the selection — the premise — and that
+    /// the driver's next ask is for exactly the new selection, once.
+    fn assert_route_asks_for_the_new_selection(
+        app: &mut App,
+        what: &str,
+        route: impl FnOnce(&mut App),
+    ) {
+        let before = app.selected.clone();
+        route(app);
+        assert_ne!(app.selected, before, "premise: {what} moves the selection");
+        assert_eq!(refresh_asked(app), app.selected.clone(), "{what}");
+        assert_eq!(refresh_asked(app), None, "{what}: asked once");
+    }
+
+    /// The background refresh follows the selection through EVERY route that moves
+    /// it — keys, the wheel, search typing, `Backspace` and `Tab`, a reload that
+    /// lost the selected row — because the ONE choke point compares the selection
+    /// with the last request; and again for a watcher batch that wrote under the
+    /// selected session's `subagents/` dir, never for another session's. The
+    /// search routes among them read no subagent transcript.
+    #[test]
+    fn the_subagent_refresh_follows_every_route_that_moves_the_selection() {
+        let mut beta = session("s2");
+        beta.content_index = "zebracontent".to_string();
+        let mut app = App::new(
+            vec![session("s1"), beta, session("s3"), session("s4")],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
+        assert_eq!(refresh_asked(&mut app), app.selected.clone(), "at entry");
+        assert_eq!(refresh_asked(&mut app), None, "once");
+
+        assert_route_asks_for_the_new_selection(&mut app, "Down", |app| {
+            press(app, KeyCode::Down);
+        });
+        assert_route_asks_for_the_new_selection(&mut app, "Up", |app| {
+            press(app, KeyCode::Up);
+        });
+        assert_route_asks_for_the_new_selection(&mut app, "Shift-Down, nothing marked", |app| {
+            press_shift(app, KeyCode::Down);
+        });
+        render_board(&mut app);
+        let list = app.list_rect;
+        assert_route_asks_for_the_new_selection(&mut app, "the wheel over the list", |app| {
+            wheel(app, MouseEventKind::ScrollUp, list.x + 1, list.y + 1);
+        });
+        assert_route_asks_for_the_new_selection(&mut app, "typing a query", |app| {
+            type_into_board(app, "label s4");
+        });
+
+        type_into_board(&mut app, "x");
+        assert_eq!(app.selected, None, "premise: nothing matches");
+        assert_eq!(refresh_asked(&mut app), None, "nothing to ask for");
+        assert_route_asks_for_the_new_selection(&mut app, "Backspace", |app| {
+            press(app, KeyCode::Backspace);
+        });
+
+        press(&mut app, KeyCode::Esc);
+        type_into_board(&mut app, "zebra");
+        assert_eq!(app.selected, None, "premise: no label says it");
+        let _ = refresh_asked(&mut app);
+        assert_route_asks_for_the_new_selection(&mut app, "Tab to content search", |app| {
+            press(app, KeyCode::Tab);
+        });
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Tab);
+        let _ = refresh_asked(&mut app);
+
+        let selected = app.selected.clone().expect("a selection");
+        let remaining: Vec<Session> = app
+            .sessions
+            .iter()
+            .filter(|s| s.session_id != selected)
+            .cloned()
+            .collect();
+        assert_route_asks_for_the_new_selection(&mut app, "a reload that lost the row", |app| {
+            app.apply_reload(Reload {
+                sessions: remaining,
+                changed: HashSet::new(),
+            });
+        });
+
+        let selected = app.selected_session().expect("a selection").clone();
+        let other = app
+            .sessions
+            .iter()
+            .find(|s| s.session_id != selected.session_id)
+            .expect("another session")
+            .clone();
+        let written = |file: &Path| {
+            AppEvent::SubagentsWritten(vec![SubagentTranscript {
+                session_file: file.to_path_buf(),
+                agent_id: "a1".to_string(),
+            }])
+        };
+        handle_event(
+            &mut app,
+            written(&other.file),
+            &mut store_at(Path::new("/tmp")),
+        );
+        assert_eq!(refresh_asked(&mut app), None, "another session's write");
+        handle_event(
+            &mut app,
+            written(&selected.file),
+            &mut store_at(Path::new("/tmp")),
+        );
+        assert_eq!(
+            refresh_asked(&mut app),
+            Some(selected.session_id.clone()),
+            "a write under the selected session's own subagents/ dir"
+        );
+        assert_eq!(refresh_asked(&mut app), None, "once");
+        assert_eq!(app.subagent_renders(), 0, "no route read a transcript");
+    }
+
+    /// An outcome that ends the board session forgets the request in flight —
+    /// its answer reports on the channel that dies with the board — so the next
+    /// board asks for the same selection again.
+    #[test]
+    fn ending_the_board_session_forgets_the_refresh_in_flight() {
+        let mut app = App::new(vec![session("s1")], Scope::All, PathBuf::from("/tmp"));
+        assert_eq!(refresh_asked(&mut app).as_deref(), Some("s1"));
+        assert!(matches!(
+            press_ctrl(&mut app, KeyCode::Char('c')),
+            Outcome::Quit
+        ));
+        assert_eq!(
+            refresh_asked(&mut app).as_deref(),
+            Some("s1"),
+            "the next board asks again"
+        );
+    }
+
+    /// A landed record is the SELECTED session's alone: one for another session
+    /// is dropped, and once the selection moves the old record no longer answers.
+    #[test]
+    fn a_record_shows_only_for_the_session_it_was_read_for() {
+        let mut app = App::new(
+            vec![session("s1"), session("s2")],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
+        select_id(&mut app, "s1");
+        deliver_record(&mut app, "s2", fixture_record(&[]));
+        assert!(app.selected_subagents().is_none(), "s2's record is dropped");
+        let record = fixture_record(&[]);
+        deliver_record(&mut app, "s1", record.clone());
+        assert_eq!(app.selected_subagents(), Some(&record));
+        deliver_record(&mut app, "s2", SubagentRecord::default());
+        assert_eq!(
+            app.selected_subagents(),
+            Some(&record),
+            "a late record for another session never replaces this one's"
+        );
+        select_id(&mut app, "s2");
+        assert!(
+            app.selected_subagents().is_none(),
+            "s1's record never answers for s2"
+        );
+        assert_eq!(app.status, None, "a record says nothing");
+    }
+
+    /// The wall clock the running check reads is stamped in event handling — by
+    /// a `Tick` and by a landed record — never on the draw path.
+    #[test]
+    fn a_tick_and_a_landed_record_stamp_the_wall_clock() {
+        let mut app = App::new(vec![session("s1")], Scope::All, PathBuf::from("/tmp"));
+        assert_eq!(app.wall_clock(), UNIX_EPOCH, "unstamped before any event");
+        let before = SystemTime::now();
+        handle_event(&mut app, AppEvent::Tick, &mut store_at(Path::new("/tmp")));
+        assert!(app.wall_clock() >= before, "the tick stamps it");
+
+        let mut fresh = App::new(vec![session("s1")], Scope::All, PathBuf::from("/tmp"));
+        let before = SystemTime::now();
+        deliver_record(&mut fresh, "s1", SubagentRecord::default());
+        assert!(fresh.wall_clock() >= before, "a landed record stamps it");
+    }
+
+    /// While a quick reply or fork box is open, a click on a delegation line does
+    /// NOT switch the pane: the box sends into the session, so its own transcript
+    /// stays beneath it, and a sticky status line says why the click did nothing.
+    #[test]
+    fn a_click_on_a_delegation_line_under_a_reply_box_is_refused() {
+        let (folder, file) = DELEGATION_FIXTURE;
+        let mut app = App::new(
+            vec![fixture_session("s1", folder, file)],
+            Scope::All,
+            PathBuf::from("/tmp"),
+        );
+        app.open_compose(
+            compose::ComposeState::new_reply("s1".to_string(), None),
+            None,
+        );
+        render_board(&mut app);
+        app.preview_top();
+        let buffer = render_board(&mut app);
+        let cell = drawn_text_cell(&buffer, app.preview_rect, DELEGATION_HEADER_HEAD);
+
+        left_click(&mut app, cell.0, cell.1);
+
+        assert!(!app.in_subagent_view(), "the pane stays on the session");
+        assert_eq!(app.status.as_deref(), Some(SUBAGENT_VIEW_COMPOSING_REFUSAL));
+        assert_eq!(app.subagent_renders(), 0, "and no transcript was read");
+    }
+
+    /// Cuts the delegation board so the running list — its three subagents
+    /// running, four rows — covers the `◆ delegated to …` line with the list row
+    /// `rows_below` rows above its foot, checks the list drew `drawn_there` on
+    /// that row, then presses, drags and clicks there: the press gate refuses
+    /// every cell of the list while the transcript row just above still admits a
+    /// press, a drag from the list onto the transcript selects nothing, and the
+    /// click opens nothing.
+    ///
+    /// Arranged so a fall-through would SHOW: without the list that row is the
+    /// transcript's delegation line, so a click there resolved against the
+    /// un-carved rect would switch the pane to that subagent.
+    fn click_the_running_list_over_the_delegation_line(rows_below: u16, drawn_there: &str) {
+        let width = BOARD.0;
+        let draw = |app: &mut App, height: u16| {
+            let mut terminal = Terminal::new(TestBackend::new(width, height))
+                .expect("build an in-memory test terminal");
+            terminal
+                .draw(|frame| view::render(frame, app))
+                .expect("render must not panic");
+            terminal.backend().buffer().clone()
+        };
+        let mut app = delegation_app();
+        render_board(&mut app);
+        app.preview_top();
+        let buffer = render_board(&mut app);
+        let tall = view::preview_transcript_rect(&app);
+        let (_, line_y) = drawn_text_cell(&buffer, tall, DELEGATION_HEADER_HEAD);
+        let height = BOARD.1 - (tall.bottom() - 1 - line_y) + rows_below;
+        let buffer = draw(&mut app, height);
+        let before = view::preview_transcript_rect(&app);
+        let (col, y) = drawn_text_cell(&buffer, before, DELEGATION_HEADER_HEAD);
+        assert_eq!(
+            y,
+            before.bottom() - 1 - rows_below,
+            "premise: the delegation line sits {rows_below} rows above the transcript's foot"
+        );
+
+        deliver_record(
+            &mut app,
+            "s1",
+            fixture_record(&[DELEGATION_KEY, DOCS_WRITER_KEY, REVIEWER_KEY]),
+        );
+        let buffer = draw(&mut app, height);
+        let transcript = view::preview_transcript_rect(&app);
+        assert_eq!(transcript.y, before.y);
+        assert!(
+            transcript.bottom() <= y,
+            "the list took the delegation line's row: {transcript:?}"
+        );
+        let row: String = (before.x..before.right())
+            .filter_map(|x| buffer.cell((x, y)).map(|c| c.symbol().to_string()))
+            .collect();
+        assert!(
+            row.contains(drawn_there) && !row.contains(DELEGATION_HEADER_HEAD),
+            "premise: the running list draws {drawn_there:?} there: {row:?}"
+        );
+        for list_y in transcript.bottom()..before.bottom() {
+            for x in before.x..before.right() {
+                assert!(
+                    !press_starts_selection(&app, Position { x, y: list_y }),
+                    "no press starts on the list at ({x}, {list_y})"
+                );
+            }
+        }
+        let above = (col, transcript.bottom() - 1);
+        assert!(
+            press_starts_selection(
+                &app,
+                Position {
+                    x: above.0,
+                    y: above.1
+                }
+            ),
+            "premise: the transcript row above the list still admits a press"
+        );
+
+        wheel(&mut app, MouseEventKind::Down(MouseButton::Left), col, y);
+        draw(&mut app, height);
+        wheel(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            above.0,
+            above.1,
+        );
+        draw(&mut app, height);
+        let released = wheel(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            above.0,
+            above.1,
+        );
+        assert!(matches!(released, Outcome::Continue), "nothing copied");
+        assert!(
+            !app.has_preview_selection(),
+            "a drag from the list selects nothing"
+        );
+
+        let outcome = left_click(&mut app, col, y);
+
+        assert!(matches!(outcome, Outcome::Continue));
+        assert!(!app.in_subagent_view(), "a click on the list opens nothing");
+        assert_eq!(app.subagent_renders(), 0);
+        assert!(!app.has_preview_selection());
+        assert_eq!(app.status, None);
+    }
+
+    /// A click on one of the running list's rows opens nothing and never falls
+    /// through to the transcript line the list is drawn over: the list's rows
+    /// come out of the transcript rect every pointer hit-test reads
+    /// ([`view::preview_transcript_rect`]). Here the list's last row covers the
+    /// delegation line.
+    #[test]
+    fn a_click_on_the_running_list_never_reaches_the_transcript_line_it_covers() {
+        click_the_running_list_over_the_delegation_line(0, "@fixture-reviewer");
+    }
+
+    /// The rule that heads the running list is inside the list's rect, not the
+    /// transcript's: a click on it opens nothing and a drag never starts there,
+    /// even with the rule drawn over the delegation line.
+    #[test]
+    fn a_click_on_the_running_lists_rule_never_reaches_the_transcript_line_it_covers() {
+        click_the_running_list_over_the_delegation_line(
+            3,
+            "\u{2500}\u{2500} ^X \u{2193} explore \u{2500}",
+        );
+    }
+
+    /// A running subagent's view updates as it writes, through the route the
+    /// watcher's own event takes: a turn the subagent appends shows once a
+    /// `SubagentsWritten` names its transcript, and not before. The event never
+    /// reloads the board — this store's root holds nothing, so a reload would
+    /// have emptied it — and sets no status.
+    #[test]
+    fn a_subagents_written_event_draws_the_viewed_transcript_again_and_never_reloads() {
+        use crate::store::discover::SubagentTranscript;
+        use crate::store::subagents;
+
+        const WIDTH: u16 = 80;
+        let turn = |text: &str| {
+            format!(
+                concat!(
+                    r#"{{"type":"assistant","isSidechain":true,"#,
+                    r#""timestamp":"2026-10-12T10:00:00.000Z","#,
+                    r#""message":{{"role":"assistant","content":"#,
+                    r#"[{{"type":"text","text":"{text}"}}]}}}}"#,
+                    "\n",
+                ),
+                text = text,
+            )
+        };
+        let dir = unique_temp_dir("subagent-live");
+        let mut live = session("sess-live");
+        live.file = dir.join("-tmp-live").join("sess-live.jsonl");
+        let subagents_dir = subagents::subagents_dir(&live.file).expect("a session has a dir");
+        std::fs::create_dir_all(&subagents_dir).expect("create the subagents dir");
+        let transcript = subagents::transcript_path(&subagents_dir, "a1");
+        std::fs::write(&transcript, turn("First finding.")).expect("write the transcript");
+        let mut app = App::new(vec![live.clone()], Scope::All, PathBuf::from("/tmp"));
+        app.open_subagent_view("a1", "auditor");
+        assert!(
+            preview_string(&mut app, WIDTH).contains("First finding."),
+            "premise: the view draws the subagent's transcript"
+        );
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .expect("open the transcript");
+        file.write_all(turn("Second finding.").as_bytes())
+            .expect("append a turn");
+        assert!(
+            !preview_string(&mut app, WIDTH).contains("Second finding."),
+            "premise: the render is cached until the watcher says otherwise"
+        );
+
+        let written = AppEvent::SubagentsWritten(vec![SubagentTranscript {
+            session_file: live.file.clone(),
+            agent_id: "a1".to_string(),
+        }]);
+        let outcome = handle_event(&mut app, written, &mut store_at(&dir.join("no-store")));
+
+        assert!(matches!(outcome, Outcome::Continue));
+        assert!(
+            preview_string(&mut app, WIDTH).contains("Second finding."),
+            "the view draws the turn its subagent appended"
+        );
+        assert!(app.in_subagent_view(), "and stays up");
+        assert!(
+            app.session_by_id("sess-live").is_some(),
+            "the event never reloads the board"
+        );
+        assert_eq!(app.status, None, "nor says anything");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -9292,27 +10842,35 @@ mod tests {
         );
     }
 
+    /// Outside the subagent view, that is: inside it `↑` leaves the view instead
+    /// (`up_in_the_subagent_view_leaves_it_and_keeps_the_selection`).
     #[test]
     fn arrows_always_move() {
-        assert_eq!(key_to_action(key(KeyCode::Up), true, false), Action::MoveUp);
         assert_eq!(
-            key_to_action(key(KeyCode::Down), true, false),
+            key_to_action(key(KeyCode::Up), true, false, false),
+            Action::MoveUp
+        );
+        assert_eq!(
+            key_to_action(key(KeyCode::Down), true, false, false),
             Action::MoveDown
         );
         // Arrows navigate even mid-query.
         assert_eq!(
-            key_to_action(key(KeyCode::Up), false, false),
+            key_to_action(key(KeyCode::Up), false, false, false),
             Action::MoveUp
         );
         assert_eq!(
-            key_to_action(key(KeyCode::Down), false, false),
+            key_to_action(key(KeyCode::Down), false, false, false),
             Action::MoveDown
         );
         // And an UNSHIFTED arrow keeps moving even when the preview HAS marks —
         // the new binding takes the shifted form alone.
-        assert_eq!(key_to_action(key(KeyCode::Up), false, true), Action::MoveUp);
         assert_eq!(
-            key_to_action(key(KeyCode::Down), false, true),
+            key_to_action(key(KeyCode::Up), false, true, false),
+            Action::MoveUp
+        );
+        assert_eq!(
+            key_to_action(key(KeyCode::Down), false, true, false),
             Action::MoveDown
         );
     }
@@ -9329,12 +10887,12 @@ mod tests {
     fn shifted_arrows_fall_through_to_plain_move_with_nothing_marked() {
         for (query_empty, marked) in [(true, false), (false, false), (true, true)] {
             assert_eq!(
-                key_to_action(shift(KeyCode::Up), query_empty, marked),
+                key_to_action(shift(KeyCode::Up), query_empty, marked, false),
                 Action::MoveUp,
                 "Shift-Up must still move (query_empty={query_empty}, marked={marked})"
             );
             assert_eq!(
-                key_to_action(shift(KeyCode::Down), query_empty, marked),
+                key_to_action(shift(KeyCode::Down), query_empty, marked, false),
                 Action::MoveDown,
                 "Shift-Down must still move (query_empty={query_empty}, marked={marked})"
             );
@@ -9346,11 +10904,11 @@ mod tests {
     #[test]
     fn shifted_arrows_step_the_preview_matches_when_something_is_marked() {
         assert_eq!(
-            key_to_action(shift(KeyCode::Up), false, true),
+            key_to_action(shift(KeyCode::Up), false, true, false),
             Action::PreviewMatchPrev
         );
         assert_eq!(
-            key_to_action(shift(KeyCode::Down), false, true),
+            key_to_action(shift(KeyCode::Down), false, true, false),
             Action::PreviewMatchNext
         );
     }
@@ -9363,11 +10921,11 @@ mod tests {
         // what fails if a bare-letter navigation binding is ever reintroduced.
         for empty in [true, false] {
             assert_eq!(
-                key_to_action(key(KeyCode::Char('j')), empty, false),
+                key_to_action(key(KeyCode::Char('j')), empty, false, false),
                 Action::Insert('j')
             );
             assert_eq!(
-                key_to_action(key(KeyCode::Char('k')), empty, false),
+                key_to_action(key(KeyCode::Char('k')), empty, false, false),
                 Action::Insert('k')
             );
         }
@@ -9381,12 +10939,12 @@ mod tests {
     fn left_right_move_the_search_caret_regardless_of_query() {
         for (query_empty, marked) in [(true, false), (false, false), (true, true), (false, true)] {
             assert_eq!(
-                key_to_action(key(KeyCode::Left), query_empty, marked),
+                key_to_action(key(KeyCode::Left), query_empty, marked, false),
                 Action::CaretBack,
                 "Left (query_empty={query_empty}, marked={marked})"
             );
             assert_eq!(
-                key_to_action(key(KeyCode::Right), query_empty, marked),
+                key_to_action(key(KeyCode::Right), query_empty, marked, false),
                 Action::CaretForward,
                 "Right (query_empty={query_empty}, marked={marked})"
             );
@@ -9411,7 +10969,7 @@ mod tests {
                 (alt_shift(KeyCode::Char('F')), Action::CaretWordForward),
             ] {
                 assert_eq!(
-                    key_to_action(event, query_empty, marked),
+                    key_to_action(event, query_empty, marked, false),
                     want,
                     "{event:?} (query_empty={query_empty}, marked={marked})"
                 );
@@ -9438,7 +10996,7 @@ mod tests {
                 (ctrl(KeyCode::Right), Action::CaretWordForward),
             ] {
                 assert_eq!(
-                    key_to_action(event, query_empty, marked),
+                    key_to_action(event, query_empty, marked, false),
                     want,
                     "{event:?} (query_empty={query_empty}, marked={marked})"
                 );
@@ -9453,11 +11011,11 @@ mod tests {
     #[test]
     fn a_held_shift_wins_over_the_alt_word_hop_arms() {
         assert_eq!(
-            key_to_action(alt_shift(KeyCode::Left), false, false),
+            key_to_action(alt_shift(KeyCode::Left), false, false, false),
             Action::LayoutTowardPreview
         );
         assert_eq!(
-            key_to_action(alt_shift(KeyCode::Right), false, false),
+            key_to_action(alt_shift(KeyCode::Right), false, false, false),
             Action::LayoutTowardList
         );
     }
@@ -9470,7 +11028,7 @@ mod tests {
         // fails if the bare-`q` quit binding is ever reintroduced.
         for empty in [true, false] {
             assert_eq!(
-                key_to_action(key(KeyCode::Char('q')), empty, false),
+                key_to_action(key(KeyCode::Char('q')), empty, false, false),
                 Action::Insert('q')
             );
         }
@@ -9536,7 +11094,7 @@ mod tests {
 
     /// Both copy status lines name the thing the way the `Ctrl-X y` verb is labelled
     /// on the key-doc surfaces with room for it (`copy session ID`; the which-key
-    /// hint's column budget shortens it to `y copy ID`): a tool-confirmed copy reads
+    /// hint's column budget shortens it to `y ID`): a tool-confirmed copy reads
     /// EXACTLY `Copied session ID <uuid>`, and the OSC 52 line says `session ID
     /// <uuid>` too, so a relabel cannot leave one route naming it differently.
     #[test]
@@ -9557,7 +11115,7 @@ mod tests {
         // it is what fails if the withdrawn bare-`y` copy binding ever returns.
         for empty in [true, false] {
             assert_eq!(
-                key_to_action(key(KeyCode::Char('y')), empty, false),
+                key_to_action(key(KeyCode::Char('y')), empty, false, false),
                 Action::Insert('y')
             );
         }
@@ -9565,9 +11123,12 @@ mod tests {
 
     #[test]
     fn esc_clears_a_typed_query_and_quits_on_an_empty_one() {
-        assert_eq!(key_to_action(key(KeyCode::Esc), true, false), Action::Quit);
         assert_eq!(
-            key_to_action(key(KeyCode::Esc), false, false),
+            key_to_action(key(KeyCode::Esc), true, false, false),
+            Action::Quit
+        );
+        assert_eq!(
+            key_to_action(key(KeyCode::Esc), false, false, false),
             Action::ClearQuery
         );
     }
@@ -9598,7 +11159,7 @@ mod tests {
     #[test]
     fn ctrl_c_always_quits() {
         assert_eq!(
-            key_to_action(ctrl(KeyCode::Char('c')), false, false),
+            key_to_action(ctrl(KeyCode::Char('c')), false, false, false),
             Action::Quit
         );
     }
@@ -9606,11 +11167,11 @@ mod tests {
     #[test]
     fn enter_resumes_and_ctrl_f_forks() {
         assert_eq!(
-            key_to_action(key(KeyCode::Enter), true, false),
+            key_to_action(key(KeyCode::Enter), true, false, false),
             Action::Resume
         );
         assert_eq!(
-            key_to_action(ctrl(KeyCode::Char('f')), false, false),
+            key_to_action(ctrl(KeyCode::Char('f')), false, false, false),
             Action::Fork
         );
     }
@@ -9622,11 +11183,11 @@ mod tests {
         // user is mid-query. Both `n` and `N` (Shift) decode the same.
         for empty in [true, false] {
             assert_eq!(
-                key_to_action(ctrl(KeyCode::Char('n')), empty, false),
+                key_to_action(ctrl(KeyCode::Char('n')), empty, false, false),
                 Action::NewSession
             );
             assert_eq!(
-                key_to_action(ctrl(KeyCode::Char('N')), empty, false),
+                key_to_action(ctrl(KeyCode::Char('N')), empty, false, false),
                 Action::NewSession
             );
         }
@@ -9636,11 +11197,11 @@ mod tests {
     fn toggles_are_reachable_regardless_of_query() {
         // Tab toggles search mode; Ctrl-A scope.
         assert_eq!(
-            key_to_action(key(KeyCode::Tab), false, false),
+            key_to_action(key(KeyCode::Tab), false, false, false),
             Action::ToggleSearchMode
         );
         assert_eq!(
-            key_to_action(ctrl(KeyCode::Char('a')), false, false),
+            key_to_action(ctrl(KeyCode::Char('a')), false, false, false),
             Action::ToggleScope
         );
     }
@@ -9654,11 +11215,11 @@ mod tests {
     fn the_retired_ctrl_slash_is_ignored_and_never_types() {
         for empty in [true, false] {
             assert_eq!(
-                key_to_action(ctrl(KeyCode::Char('/')), empty, false),
+                key_to_action(ctrl(KeyCode::Char('/')), empty, false, false),
                 Action::Ignore
             );
             assert_eq!(
-                key_to_action(ctrl(KeyCode::Char('_')), empty, false),
+                key_to_action(ctrl(KeyCode::Char('_')), empty, false, false),
                 Action::Ignore
             );
         }
@@ -9681,12 +11242,12 @@ mod tests {
     fn shifted_horizontal_arrows_step_the_layout_regardless_of_query_or_marks() {
         for (query_empty, marked) in [(true, false), (false, false), (true, true), (false, true)] {
             assert_eq!(
-                key_to_action(shift(KeyCode::Left), query_empty, marked),
+                key_to_action(shift(KeyCode::Left), query_empty, marked, false),
                 Action::LayoutTowardPreview,
                 "Shift-Left (query_empty={query_empty}, marked={marked})"
             );
             assert_eq!(
-                key_to_action(shift(KeyCode::Right), query_empty, marked),
+                key_to_action(shift(KeyCode::Right), query_empty, marked, false),
                 Action::LayoutTowardList,
                 "Shift-Right (query_empty={query_empty}, marked={marked})"
             );
@@ -9701,19 +11262,19 @@ mod tests {
     #[test]
     fn the_layout_arms_win_over_the_plain_caret_arms() {
         assert_eq!(
-            key_to_action(shift(KeyCode::Left), false, false),
+            key_to_action(shift(KeyCode::Left), false, false, false),
             Action::LayoutTowardPreview
         );
         assert_eq!(
-            key_to_action(key(KeyCode::Left), false, false),
+            key_to_action(key(KeyCode::Left), false, false, false),
             Action::CaretBack
         );
         assert_eq!(
-            key_to_action(shift(KeyCode::Right), false, false),
+            key_to_action(shift(KeyCode::Right), false, false, false),
             Action::LayoutTowardList
         );
         assert_eq!(
-            key_to_action(key(KeyCode::Right), false, false),
+            key_to_action(key(KeyCode::Right), false, false, false),
             Action::CaretForward
         );
     }
@@ -9724,38 +11285,38 @@ mod tests {
         // or not the user is mid-query.
         for empty in [true, false] {
             assert_eq!(
-                key_to_action(key(KeyCode::PageUp), empty, false),
+                key_to_action(key(KeyCode::PageUp), empty, false, false),
                 Action::PreviewPageUp
             );
             assert_eq!(
-                key_to_action(key(KeyCode::PageDown), empty, false),
+                key_to_action(key(KeyCode::PageDown), empty, false, false),
                 Action::PreviewPageDown
             );
             assert_eq!(
-                key_to_action(key(KeyCode::Home), empty, false),
+                key_to_action(key(KeyCode::Home), empty, false, false),
                 Action::PreviewTop
             );
             assert_eq!(
-                key_to_action(key(KeyCode::End), empty, false),
+                key_to_action(key(KeyCode::End), empty, false, false),
                 Action::PreviewBottom
             );
             // Ctrl-U / Ctrl-D quarter-page, also independent of query state.
             assert_eq!(
-                key_to_action(ctrl(KeyCode::Char('u')), empty, false),
+                key_to_action(ctrl(KeyCode::Char('u')), empty, false, false),
                 Action::PreviewHalfUp
             );
             assert_eq!(
-                key_to_action(ctrl(KeyCode::Char('d')), empty, false),
+                key_to_action(ctrl(KeyCode::Char('d')), empty, false, false),
                 Action::PreviewHalfDown
             );
             // Ctrl-T / Ctrl-E reach the same top/bottom jump as Home/End, also
             // independent of query state.
             assert_eq!(
-                key_to_action(ctrl(KeyCode::Char('t')), empty, false),
+                key_to_action(ctrl(KeyCode::Char('t')), empty, false, false),
                 Action::PreviewTop
             );
             assert_eq!(
-                key_to_action(ctrl(KeyCode::Char('e')), empty, false),
+                key_to_action(ctrl(KeyCode::Char('e')), empty, false, false),
                 Action::PreviewBottom
             );
         }
@@ -9764,15 +11325,15 @@ mod tests {
     #[test]
     fn printable_characters_type_into_the_query() {
         assert_eq!(
-            key_to_action(key(KeyCode::Char('a')), true, false),
+            key_to_action(key(KeyCode::Char('a')), true, false, false),
             Action::Insert('a')
         );
         assert_eq!(
-            key_to_action(key(KeyCode::Char('z')), false, false),
+            key_to_action(key(KeyCode::Char('z')), false, false, false),
             Action::Insert('z')
         );
         assert_eq!(
-            key_to_action(key(KeyCode::Backspace), false, false),
+            key_to_action(key(KeyCode::Backspace), false, false, false),
             Action::Backspace
         );
     }
@@ -9800,36 +11361,36 @@ mod tests {
         for empty in [true, false] {
             // The macOS gesture, ESC 0x7F.
             assert_eq!(
-                key_to_action(alt(KeyCode::Backspace), empty, false),
+                key_to_action(alt(KeyCode::Backspace), empty, false, false),
                 Action::BackspaceWord
             );
             // readline's Ctrl-W (0x17), needing no Alt at all.
             assert_eq!(
-                key_to_action(ctrl(KeyCode::Char('w')), empty, false),
+                key_to_action(ctrl(KeyCode::Char('w')), empty, false, false),
                 Action::BackspaceWord
             );
             assert_eq!(
-                key_to_action(ctrl(KeyCode::Char('W')), empty, false),
+                key_to_action(ctrl(KeyCode::Char('W')), empty, false, false),
                 Action::BackspaceWord
             );
             assert_eq!(
-                key_to_action(ctrl_shift(KeyCode::Char('W')), empty, false),
+                key_to_action(ctrl_shift(KeyCode::Char('W')), empty, false, false),
                 Action::BackspaceWord
             );
             // The third key `TextArea::input` maps to a word delete, so the
             // board answers the same set the reply box does.
             assert_eq!(
-                key_to_action(alt(KeyCode::Char('h')), empty, false),
+                key_to_action(alt(KeyCode::Char('h')), empty, false, false),
                 Action::BackspaceWord
             );
             assert_eq!(
-                key_to_action(alt(KeyCode::Char('H')), empty, false),
+                key_to_action(alt(KeyCode::Char('H')), empty, false, false),
                 Action::BackspaceWord
             );
 
             // ...and the unmodified key is untouched: one character, as always.
             assert_eq!(
-                key_to_action(key(KeyCode::Backspace), empty, false),
+                key_to_action(key(KeyCode::Backspace), empty, false, false),
                 Action::Backspace
             );
         }
@@ -9849,11 +11410,11 @@ mod tests {
     fn an_unbound_alt_printable_is_ignored_rather_than_typed() {
         for empty in [true, false] {
             assert_eq!(
-                key_to_action(alt(KeyCode::Char('j')), empty, false),
+                key_to_action(alt(KeyCode::Char('j')), empty, false, false),
                 Action::Ignore
             );
             assert_eq!(
-                key_to_action(alt(KeyCode::Char('z')), empty, false),
+                key_to_action(alt(KeyCode::Char('z')), empty, false, false),
                 Action::Ignore
             );
         }
@@ -11357,6 +12918,17 @@ mod tests {
         assert_eq!(chord_key(key(KeyCode::Char('y'))), ChordOutcome::Copy);
         assert_eq!(chord_key(key(KeyCode::Char('f'))), ChordOutcome::Fold);
         assert_eq!(chord_key(key(KeyCode::Char('w'))), ChordOutcome::Move);
+        assert_eq!(chord_key(key(KeyCode::Down)), ChordOutcome::Subagents);
+        assert_eq!(
+            chord_key(shift(KeyCode::Down)),
+            ChordOutcome::Subagents,
+            "a held Shift on the follow-up still opens the subagent view"
+        );
+        assert_eq!(
+            chord_key(key(KeyCode::Up)),
+            ChordOutcome::Cancel,
+            "only ↓ opens the subagent view"
+        );
         assert_eq!(
             chord_key(key(KeyCode::Char('F'))),
             ChordOutcome::Fold,
