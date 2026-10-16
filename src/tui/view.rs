@@ -4767,61 +4767,39 @@ fn render_interrupt_confirm(frame: &mut Frame, app: &App) {
 /// a layout but not their verbs, so each modal carries its own ([`Modal::footer`])
 /// and this draws it as given.
 ///
-/// A `List` also SCROLLS, which is why this takes `&mut`: the box asks for at most
-/// [`MODAL_LIST_MAX_ROWS`] choices' worth of lines, [`centered_rect`] clamps even
-/// that on a short terminal, and [`modal_list_window`] then resolves which slice of
-/// the choices the surviving lines show — writing the resolved offset back onto the
-/// modal the way [`render_list`] writes back `App::scroll`, because only a render
-/// knows the viewport. Without it the box drew every choice top-down and a clamped
-/// height simply lost the tail: a picker's later rows were unreachable rather than
-/// scrolled, and all three pickers grow with data (one row per defined agent, one
-/// per model alias, one per worktree) rather than being fixed-size.
-///
-/// A choice is not always one line. Its height is the number of lines
-/// [`modal_list_row_lines`] draws for it, and the asked height, the window and the
-/// drawn slice all take that height from the SAME built lines.
+/// A `List` is drawn by [`render_list_box`], the box every list overlay shares,
+/// which SCROLLS — why this takes `&mut`: the resolved offset is written back onto
+/// [`Modal::scroll`]. A choice is not always one line: its height is the number of
+/// lines [`modal_list_row_lines`] draws for it.
 fn render_modal(frame: &mut Frame, modal: &mut Modal) {
-    let accent = match modal.layout {
-        ModalLayout::Row => Color::Yellow,
-        ModalLayout::List => Color::Cyan,
-    };
+    if modal.layout == ModalLayout::List {
+        let rows = modal
+            .choices
+            .iter()
+            .enumerate()
+            .map(|(i, choice)| modal_list_row_lines(choice, i == modal.selected))
+            .collect();
+        render_list_box(
+            frame,
+            ListBox {
+                title: &modal.title,
+                message: &modal.message,
+                footer: modal.footer,
+            },
+            rows,
+            modal.selected,
+            &mut modal.scroll,
+        );
+        return;
+    }
 
     // Wrap the message to the box's inner width (borders excluded) so a long prompt
     // — e.g. the delete confirmation — shows in full instead of clipping at the
     // border; the box height below counts the wrapped rows so the two agree.
     let message = wrap_message(&modal.message, MODAL_INNER_WIDTH);
-    let message_rows = message.len() as u16;
-
-    // A `List`'s choices as the lines they DRAW, built once. Each row's height is
-    // its `len()`, and the box height, the window and the lines drawn below all
-    // read that one count. A wrapped description can then never be drawn taller
-    // than the arithmetic made room for. Empty for a `Row`, which has no list.
-    let list_rows: Vec<Vec<Line<'static>>> = match modal.layout {
-        ModalLayout::Row => Vec::new(),
-        ModalLayout::List => modal
-            .choices
-            .iter()
-            .enumerate()
-            .map(|(i, choice)| modal_list_row_lines(choice, i == modal.selected))
-            .collect(),
-    };
-    let row_heights: Vec<usize> = list_rows.iter().map(Vec::len).collect();
-    let max_rows = usize::from(MODAL_LIST_MAX_ROWS);
-
-    // The height the box ASKS for (message rows + chrome + borders; a list also
-    // grows with the lines its choices draw, up to the cap). `centered_rect` clamps
-    // it, and for a `List` the surviving rows are what the window below is measured
-    // against — so the height is resolved BEFORE the window, not alongside it.
-    let height = match modal.layout {
-        ModalLayout::Row => message_rows
-            .saturating_add(MODAL_ROW_CHROME_ROWS)
-            .saturating_add(MODAL_BORDER_ROWS),
-        ModalLayout::List => u16::try_from(modal_list_lines_asked(&row_heights, max_rows))
-            .unwrap_or(u16::MAX)
-            .saturating_add(message_rows)
-            .saturating_add(MODAL_LIST_CHROME_ROWS)
-            .saturating_add(MODAL_BORDER_ROWS),
-    };
+    let height = (message.len() as u16)
+        .saturating_add(MODAL_ROW_CHROME_ROWS)
+        .saturating_add(MODAL_BORDER_ROWS);
     let area = centered_rect(frame.area(), MODAL_WIDTH, height);
 
     let mut lines: Vec<Line> = message
@@ -4829,60 +4807,15 @@ fn render_modal(frame: &mut Frame, modal: &mut Modal) {
         .map(|l| {
             Line::from(Span::styled(
                 l,
-                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             ))
         })
         .collect();
-
-    match modal.layout {
-        ModalLayout::Row => {
-            lines.push(Line::from(""));
-            lines.push(Line::from(modal_button_row(&modal.choices, modal.selected)));
-            lines.push(Line::from(""));
-        }
-        ModalLayout::List => {
-            // How many list LINES the CLAMPED box actually has room for — the same
-            // subtraction the height was built from, run backwards.
-            let viewport = usize::from(
-                area.height
-                    .saturating_sub(message_rows)
-                    .saturating_sub(MODAL_LIST_CHROME_ROWS)
-                    .saturating_sub(MODAL_BORDER_ROWS),
-            );
-            let total = list_rows.len();
-            modal.scroll = modal_list_window(
-                &row_heights,
-                modal.selected,
-                viewport,
-                max_rows,
-                modal.scroll,
-            );
-            let shown = modal_list_shown(&row_heights, modal.scroll, viewport, max_rows);
-            // The two spacers carry the overflow hint instead of being blank, so the
-            // affordance costs the box nothing.
-            lines.push(modal_more_line(MODAL_MORE_ABOVE, modal.scroll));
-            // A row taller than the room left is cut at the viewport: its first line
-            // (the marker and label) is drawn and the rest is clipped.
-            let drawn: Vec<Line<'static>> = list_rows
-                .into_iter()
-                .skip(modal.scroll)
-                .take(shown)
-                .flatten()
-                .take(viewport)
-                .collect();
-            // Pad to the viewport, so the lower spacer and the footer stay on the
-            // box's last rows when the window holds fewer lines than the tallest
-            // window the box was sized for.
-            let padding = viewport.saturating_sub(drawn.len());
-            lines.extend(drawn);
-            lines.extend(std::iter::repeat_n(Line::from(""), padding));
-            lines.push(modal_more_line(
-                MODAL_MORE_BELOW,
-                total.saturating_sub(modal.scroll.saturating_add(shown)),
-            ));
-        }
-    }
-
+    lines.push(Line::from(""));
+    lines.push(Line::from(modal_button_row(&modal.choices, modal.selected)));
+    lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         modal.footer,
         Style::default().add_modifier(Modifier::DIM),
@@ -4892,13 +4825,122 @@ fn render_modal(frame: &mut Frame, modal: &mut Modal) {
         .borders(Borders::ALL)
         .title(format!(" {} ", modal.title));
     frame.render_widget(Clear, area);
-    let mut paragraph = Paragraph::new(lines).block(block);
-    if matches!(modal.layout, ModalLayout::Row) {
-        // Center the whole box (message, buttons, footer), as the old
-        // running-session overlay did.
-        paragraph = paragraph.alignment(Alignment::Center);
-    }
-    frame.render_widget(paragraph, area);
+    // Center the whole box (message, buttons, footer), as the old running-session
+    // overlay did.
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .alignment(Alignment::Center),
+        area,
+    );
+}
+
+/// The chrome a [`render_list_box`] draws around its rows: the box's title, the
+/// prompt above the rows, and the dim key-hint footer below them.
+struct ListBox<'a> {
+    /// The bordered box title (drawn padded with a space either side).
+    title: &'a str,
+    /// The prompt drawn above the rows, wrapped to the box.
+    message: &'a str,
+    /// The dim key-hint line at the foot of the box.
+    footer: &'a str,
+}
+
+/// A centered, bordered, SCROLLING list box: the one every list overlay draws,
+/// a `List`-layout [`Modal`] ([`render_modal`]) among them, so no two can size,
+/// scroll or clip differently.
+///
+/// `rows` holds each row as the lines it DRAWS, and `selected` is the highlighted
+/// row's index. The box asks for at most [`MODAL_LIST_MAX_ROWS`] rows' worth of
+/// lines, [`centered_rect`] clamps even that on a short terminal, and
+/// [`modal_list_window`] then resolves which slice of the rows the surviving lines
+/// show — writing the resolved offset back through `scroll` the way [`render_list`]
+/// writes back `App::scroll`, because only a render knows the viewport. Without
+/// it a clamped height simply lost the tail: later rows were unreachable rather
+/// than scrolled. The asked height, the window and the drawn slice all take each
+/// row's height from the SAME built lines. The prompt is `Cyan` + BOLD and the box
+/// left-aligned, a picker's chrome; named colors and modifiers only (TERMINAL-SAFE
+/// STYLING).
+fn render_list_box(
+    frame: &mut Frame,
+    chrome: ListBox<'_>,
+    rows: Vec<Vec<Line<'static>>>,
+    selected: usize,
+    scroll: &mut usize,
+) {
+    // Wrap the message to the box's inner width (borders excluded); the box height
+    // below counts the wrapped rows so the two agree.
+    let message = wrap_message(chrome.message, MODAL_INNER_WIDTH);
+    let message_rows = message.len() as u16;
+    let row_heights: Vec<usize> = rows.iter().map(Vec::len).collect();
+    let max_rows = usize::from(MODAL_LIST_MAX_ROWS);
+
+    // The height the box ASKS for: message rows + the lines its rows draw, up to
+    // the cap, + chrome + borders. `centered_rect` clamps it, and the surviving
+    // rows are what the window below is measured against — so the height is
+    // resolved BEFORE the window, not alongside it.
+    let height = u16::try_from(modal_list_lines_asked(&row_heights, max_rows))
+        .unwrap_or(u16::MAX)
+        .saturating_add(message_rows)
+        .saturating_add(MODAL_LIST_CHROME_ROWS)
+        .saturating_add(MODAL_BORDER_ROWS);
+    let area = centered_rect(frame.area(), MODAL_WIDTH, height);
+
+    let mut lines: Vec<Line> = message
+        .into_iter()
+        .map(|l| {
+            Line::from(Span::styled(
+                l,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ))
+        })
+        .collect();
+
+    // How many list LINES the CLAMPED box actually has room for — the same
+    // subtraction the height was built from, run backwards.
+    let viewport = usize::from(
+        area.height
+            .saturating_sub(message_rows)
+            .saturating_sub(MODAL_LIST_CHROME_ROWS)
+            .saturating_sub(MODAL_BORDER_ROWS),
+    );
+    let total = rows.len();
+    *scroll = modal_list_window(&row_heights, selected, viewport, max_rows, *scroll);
+    let shown = modal_list_shown(&row_heights, *scroll, viewport, max_rows);
+    // The two spacers carry the overflow hint instead of being blank, so the
+    // affordance costs the box nothing.
+    lines.push(modal_more_line(MODAL_MORE_ABOVE, *scroll));
+    // A row taller than the room left is cut at the viewport: its first line (the
+    // marker and label) is drawn and the rest is clipped.
+    let drawn: Vec<Line<'static>> = rows
+        .into_iter()
+        .skip(*scroll)
+        .take(shown)
+        .flatten()
+        .take(viewport)
+        .collect();
+    // Pad to the viewport, so the lower spacer and the footer stay on the box's
+    // last rows when the window holds fewer lines than the tallest window the box
+    // was sized for.
+    let padding = viewport.saturating_sub(drawn.len());
+    lines.extend(drawn);
+    lines.extend(std::iter::repeat_n(Line::from(""), padding));
+    lines.push(modal_more_line(
+        MODAL_MORE_BELOW,
+        total.saturating_sub(scroll.saturating_add(shown)),
+    ));
+    lines.push(Line::from(Span::styled(
+        chrome.footer,
+        Style::default().add_modifier(Modifier::DIM),
+    )));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {} ", chrome.title));
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 /// A `Row`-layout modal's horizontal button strip: each choice as ` label `
