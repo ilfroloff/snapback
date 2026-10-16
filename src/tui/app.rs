@@ -756,7 +756,7 @@ pub struct ContentPos {
 /// column, the last row stops at the cursor column, and the rows between reach
 /// across the pane. What it SELECTS is only the drawn text in that reach, the way
 /// an editor highlights a selection: each row ends at its last drawn cell rather
-/// than at the pane's edge, blank rows at either end drop out, and a blank row
+/// than at the pane's edge, blank rows at either end drop out, and a blank LINE
 /// between two drawn ones copies as an empty line with nothing highlighted. A drag
 /// over blank cells alone selects nothing, so its release copies nothing. The press
 /// may still land on a blank cell (below a short transcript, inside a line's
@@ -767,9 +767,12 @@ pub struct ContentPos {
 /// Each frame, the view highlights the part of it that is VISIBLE, mapped into the
 /// current transcript rect (`view::overlay_preview_selection`); the release copies
 /// all of it by redrawing the selected rows off screen with the pane's own widget
-/// and width (`view::preview_selection_copy`). Both apply the same blank rule, the
-/// same per-row cut and the same edge-row trim, so a selection that is fully on
-/// screen copies exactly what it highlights.
+/// and width (`view::preview_selection_copy`). Both apply the same blank rule and
+/// the same per-row cut, so the copy holds the text the highlight covers; only the
+/// joins between rows differ from the screen: a `\n` at each of the transcript's
+/// own line breaks, and a soft-wrapped line's rows joined by that line's own text
+/// (`view::copied_text`; PATTERNS.md §5 owns the rule, and why a grid table's
+/// wrapped cells still copy row by row).
 ///
 /// A DOUBLE-CLICK records a [`SelectionUnit::Word`] selection instead: `anchor` and
 /// `cursor` are both the clicked cell, and the view expands it to the UAX #29 word

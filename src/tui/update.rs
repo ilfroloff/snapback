@@ -2016,9 +2016,11 @@ const SELECTION_COPY_STATUS_PREFIX: &str = "Copied selection ";
 const SELECTION_SENT_STATUS_PREFIX: &str = "Sent selection ";
 
 /// How big a selection was, as the status line states it: `(1 line)` or
-/// `(N lines)`, counting the screen rows the drag covered. The selected TEXT itself
-/// is never echoed — a multi-row selection cannot fit the one help row, and the
-/// highlight in the pane already shows what it was. Pure.
+/// `(N lines)`, counting the lines of the copied `text` (`view::copied_text`
+/// joins them), never the screen rows the drag covered, so a paragraph the pane
+/// wraps onto three rows is `(1 line)`. The selected TEXT itself is never echoed —
+/// a multi-line selection cannot fit the one help row, and the highlight in the
+/// pane already shows what it was. Pure.
 fn selection_size(text: &str) -> String {
     let rows = text.split('\n').count();
     let noun = if rows == 1 { "line" } else { "lines" };
@@ -2060,7 +2062,7 @@ pub(super) fn copy_result_status(payload: &CopyPayload, copied: bool) -> String 
 /// `STATUS_DWELL_TICKS` x `watch::TICK` = 4 s dwell is too short for that.
 ///
 /// A drag SELECTION: TRANSIENT, on both routes. The hand-selection reason does not
-/// carry over: the line holds only a row count, never the text, and the text the
+/// carry over: the line holds only a line count, never the text, and the text the
 /// user would re-select natively is still on screen, still highlighted, in the
 /// pane. Nor does the line carry a failure or a refusal. The route it names is read
 /// the moment the button comes up, while the user is looking, so the dwell is

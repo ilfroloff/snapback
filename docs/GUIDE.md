@@ -79,7 +79,11 @@ reverse-videoed and copied to your clipboard on release, the same way `Ctrl-X y`
 copies: through your OS clipboard tool, or over SSH as an OSC 52 escape. Only
 drawn text is selected, the way an editor highlights: each line stops at its last
 character rather than running to the pane's edge, and a drag over empty space
-alone selects nothing and leaves your clipboard as it was. To select more than
+alone selects nothing and leaves your clipboard as it was. A line the preview
+wraps to fit the pane copies as the one line it is: the copy breaks lines where
+the transcript does, never where the pane wrapped. A table drawn as a grid is
+the exception: it copies as the grid you see, line by line, its wrapped cells
+included. To select more than
 fits on screen, hold the drag just past the preview's top or bottom edge: the
 transcript glides that way in small steps (about a screen a second, faster the
 further past the edge you hold it) and the selection grows with it until you let

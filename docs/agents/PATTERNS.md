@@ -526,14 +526,51 @@ re-reading the previewed transcript follows.
 A released selection is copied from an OFF-SCREEN REDRAW, not from the frame: the
 selected rows are drawn again, `view::SELECTION_COPY_CHUNK_ROWS` at a time, with the
 pane's own widget, wrap and `row_window` windowing over the cached lines
-(`view::selection_copy_text`), and walked by the SAME blank rule, per-row cut and
-edge-row trim the highlight uses — the trim applied once to the whole selection,
-never per chunk. A per-frame record of drawn text is the rejected shape: rows the
+(`view::selection_copy_text`), and walked by the SAME blank rule and per-row cut
+the highlight uses. A per-frame record of drawn text is the rejected shape: rows the
 pane never drew would be missing from it. The selection is clamped to the cached
 TRANSCRIPT rows for both highlight and copy, because an in-flight reply's tail is
 drawn below them but is not in that cache — the one place the frame and the
-redraw would disagree. The parity test pins that an on-screen selection copies
-exactly what the drawn frame shows.
+redraw would disagree.
+
+The copy puts a `\n` ONLY between two of the transcript's LOGICAL lines — the
+`Line`s `store::preview` renders — never where the pane soft-wrapped one
+(`view::copied_text`): its drawn rows keep the content row each shows, and two
+rows of different logical lines are joined by one `\n` per line boundary between
+them, so a blank line still copies as an empty line and a chunk's edge changes
+nothing. Two rows of the SAME
+logical line are a soft wrap, and are joined by that line's OWN text at the seam
+(`view::soft_wrap_seams`), never by the cells: at a break `WordWrapper` drops some
+of the whitespace it broke on and carries the rest to the start of the next row,
+and the per-row cut drops what was left at the row's end, so gluing the rows would
+lose spaces (`foo  bar` → `foobar`). The seam is found by counting, not by
+matching text: the wrapper drops no non-blank grapheme the pane can paint, so a
+row's count of non-blank cells above it in its line says which of the line's
+graphemes it starts on. Inside a word the seam is empty. The counting premise
+fails only where `WordWrapper` (`ratatui-widgets` 0.3.2) STARTS a glyph past the
+pane's edge. A row it merely builds wider than the pane copies right: a
+two-column glyph starting in the pane's last column keeps its own cell inside the
+pane, as `aaa 漢` does at width 5, a six-column row. A glyph starting past the
+edge was seen only on a line holding a glyph two or more columns wide: at a
+transcript width of 2, and at wider panes when that glyph is three or more
+columns wide (`ratatui-core` 0.1.2 counts `ｶﾞﾞ` as three) or the line also holds a
+zero-width grapheme (U+200B) — an exhaustive sweep, 2026-10-15. The clip
+(`view::render_wrapped_clipped`) drops each non-blank glyph that starts past the
+edge, so the copy leaves it out, and every seam after it on that line lands one
+glyph late per glyph dropped: at width 2, `a漢漢 a漢a` copies as `a漢a 漢`. That
+is wrong text, never a panic, and the maintainer accepted it as a known
+limitation (2026-10-15); a test pins only the no-panic half. The parity test pins
+that an on-screen selection copies exactly what the committed on-screen rule
+reads off the drawn frame, joined the same way.
+
+So only the PANE's wraps are joined. A wrap snapback makes ITSELF is a logical
+line break and copies as a `\n`, and the transcript has one: a GFM table in GRID
+layout, whose over-wide cells `store::preview` wraps down their columns
+(`wrap_span_cells` / `wrap_cell_spans`). Each grid line copies as a line of its
+own, so the copy reproduces the drawn grid row by row, as a terminal selection
+would. That is deliberate: do not join a cell's wrapped fragments back into one
+line. A table in RECORD layout is ordinary logical lines the pane soft-wraps, so
+its wraps are joined like any other line's.
 
 The preview's own scroll is **bottom-anchored by default**
 (`App::preview_follow_bottom` starts true, is re-armed on every selection change
@@ -1439,7 +1476,7 @@ CADENCES and LIMITS, so a retune knows what it is next to:
 | `tui::complete` | `COMPLETION_MAX_DIR_ENTRIES` (2000 — one keystroke's worst read of a huge folder) · `COMPLETION_MAX_TREE_ENTRIES` (25000 — the whole `@` walk, breadth first, no depth cap: a depth cap hid a 9-level monorepo path) · `COMPLETION_VISIBLE_ROWS` (8) |
 | `tui::app` | `PREVIEW_WHEEL_STEP` (2) · `LIST_WHEEL_STEP` (1) · `STATUS_DWELL_TICKS` (16) · `MIN_PANE_WIDTH` (15) · the list's share of the body per split `PaneLayout` stop: `PREVIEW_WIDE_LIST_PERCENT` (25) / `DEFAULT_LIST_PERCENT` (48) / `LIST_WIDE_LIST_PERCENT` (75) · a held drag's autoscroll: `AUTOSCROLL_FRAME` (33 ms, the run loop's wait deadline while one is held past the edge — §7's one exception to animating from the tick) / `AUTOSCROLL_PAGE_PERIOD` (1 s, a page per row past the edge) / `AUTOSCROLL_MAX_DISTANCE` (4) |
 | `tui::update` | `PASTE_MAX_CHARS` (4096) |
-| `tui::view` | `BLINK_TICKS` (2) · `CHILD_ID_CHARS` (8) · `MATCH_JUMP_LEAD_DIVISOR` (3 — a jumped-to match parks `h / 3` rows down) · `WIDE_GLYPH_COLUMNS` (2) · `LINK_PROBE_BYTE_BUDGET` (131_072) · the layout rows `PREVIEW_BANNER_ROWS` / `BOARD_CHROME_ROWS` / `COMPOSE_*` / `MODAL_WIDTH` / `MODAL_*_CHROME_ROWS` / `MODAL_BORDER_ROWS` / `MODAL_BORDER_COLS` / `MODAL_LIST_MAX_ROWS` (12 — the most CHOICES a `List` picker offers before it scrolls, so an overlay stays an overlay on a tall terminal; a wrapped row's extra lines are paid on top, see [§5](#5-selection-and-scroll-survive-reloads)) · the preview's running list: `RUNNING_LIST_MAX_ROWS` (5 — the subagents it gives a row before a `+N more` line; at most 5 ran at once in 185 of 189 measured sessions, 2026-10-13) / `RUNNING_LIST_PANE_SHARE` (2 — the whole list takes at most half the rows under the pinned row, else it shrinks to one line) · the compose pick list's `COMPLETION_BORDER_ROWS` / `COMPLETION_COLUMN_GAP` (2 — the table's only separator) / `COMPLETION_NAME_MAX_PERCENT` (50 — descriptions keep the other half of the box) |
+| `tui::view` | `BLINK_TICKS` (2) · `CHILD_ID_CHARS` (8) · `MATCH_JUMP_LEAD_DIVISOR` (3 — a jumped-to match parks `h / 3` rows down) · `WIDE_GLYPH_COLUMNS` (2) · `LINK_PROBE_BYTE_BUDGET` (131_072) · `SELECTION_COPY_CHUNK_ROWS` (256 — the rows a release copy redraws per off-screen buffer, a BOUND on one buffer rather than a tune) · `WRAP_ROOM_WIDTHS` (3 — how many transcript widths the scratch of `render_wrapped_clipped` spans, since ratatui's wrapper can build a row wider than the pane; every frame pays for it) · the layout rows `PREVIEW_BANNER_ROWS` / `BOARD_CHROME_ROWS` / `COMPOSE_*` / `MODAL_WIDTH` / `MODAL_*_CHROME_ROWS` / `MODAL_BORDER_ROWS` / `MODAL_BORDER_COLS` / `MODAL_LIST_MAX_ROWS` (12 — the most CHOICES a `List` picker offers before it scrolls, so an overlay stays an overlay on a tall terminal; a wrapped row's extra lines are paid on top, see [§5](#5-selection-and-scroll-survive-reloads)) · the preview's running list: `RUNNING_LIST_MAX_ROWS` (5 — the subagents it gives a row before a `+N more` line; at most 5 ran at once in 185 of 189 measured sessions, 2026-10-13) / `RUNNING_LIST_PANE_SHARE` (2 — the whole list takes at most half the rows under the pinned row, else it shrinks to one line) · the compose pick list's `COMPLETION_BORDER_ROWS` / `COMPLETION_COLUMN_GAP` (2 — the table's only separator) / `COMPLETION_NAME_MAX_PERCENT` (50 — descriptions keep the other half of the box) |
 
 Add a new tunable the same way. The rule is not only about numbers — a literal
 with a meaning gets a name whatever its type: the undocumented `claude` wire
@@ -1960,8 +1997,9 @@ OSC 52 fallback — is TRANSIENT on both routes (`copy_status_is_sticky` answers
 false for a `CopyPayload::Selection`, and a test pins it). The `Ctrl-X y` reasons
 do not carry over. The id line sticks because the user may have to act on its
 TEXT — select the full id by hand when the terminal drops the escape — and a
-selection's line carries no text to act on: it names only a row count, since a
-multi-row selection cannot fit the one help row. The fallback's fallback is a
+selection's line carries no text to act on: it names only how many lines were
+copied (`update::selection_size`), since a multi-line selection cannot fit the one
+help row. The fallback's fallback is a
 native Shift/Option selection of the transcript itself, which is still on screen
 and still highlighted in the pane. Nor does the line carry a failure or a refusal.
 The route it names is read the moment the button comes up, while the user is

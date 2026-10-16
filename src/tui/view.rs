@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-use ratatui::buffer::{Buffer, Cell};
+use ratatui::buffer::{Buffer, Cell, CellWidth};
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols;
@@ -3412,11 +3412,12 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.render_widget(Paragraph::new(banner), banner_area);
     }
 
-    frame.render_widget(
+    render_wrapped_clipped(
         Paragraph::new(Text::from(window))
             .wrap(Wrap { trim: false })
             .scroll((widget_offset, 0)),
         transcript_area,
+        frame.buffer_mut(),
     );
 
     if content_h > usize::from(inner_height) {
@@ -4042,10 +4043,11 @@ fn region_char_positions(line: &Line<'_>, col_start: usize, col_end: usize) -> H
 /// obtained by ASKING THE RENDERER rather than by modelling it. The region's
 /// graphemes are re-styled with [`LINK_PROBE_MARKER`], that one line is pushed
 /// through the SAME `Paragraph::wrap(Wrap { trim: false })` the pane paints with,
-/// into an in-memory [`Buffer`] `inner_width` wide, and the clicked cell is read
-/// back. A cell carrying the marker is a cell the region painted — wherever the
-/// wrapper chose to break, and whether or not the region straddles that break. No
-/// second wrapping model exists to drift from the first.
+/// into an in-memory [`Buffer`] `inner_width` wide — cut at its edge as the pane's
+/// draw is ([`render_wrapped_clipped`]) — and the clicked cell is read back. A cell
+/// carrying the marker is a cell the region painted — wherever the wrapper chose to
+/// break, and whether or not the region straddles that break. No second wrapping
+/// model exists to drift from the first.
 ///
 /// Re-styling is what makes the probe sound: [`highlight_matched_spans`] leaves the
 /// text BYTE-IDENTICAL and splits only at grapheme-cluster edges, so no glyph's
@@ -4105,9 +4107,11 @@ fn region_paints_cell(
         height: rows,
     };
     let mut buf = Buffer::filled(area, Cell::new(LINK_PROBE_UNWRITTEN));
-    Paragraph::new(Text::from(vec![marked]))
-        .wrap(Wrap { trim: false })
-        .render(area, &mut buf);
+    render_wrapped_clipped(
+        Paragraph::new(Text::from(vec![marked])).wrap(Wrap { trim: false }),
+        area,
+        &mut buf,
+    );
     // The clicked row is the last one allocated; `Buffer::cell` answers `None` for a
     // position outside the area, which is the "nothing was rendered here" case.
     let y = rows - 1;
@@ -4387,9 +4391,11 @@ fn cut_at_last_text_cell(buf: &Buffer, y: u16, (x0, x1): (u16, u16)) -> Option<(
 /// Drop the wholly blank rows (`None`) at the START and the END of a selection's
 /// rows, and keep the ones BETWEEN two drawn rows. Empty when no row holds text.
 ///
-/// A blank row inside the selection is a paragraph break, which the copy must keep;
-/// one at either edge is only the empty space the drag began or ended over. Pure
-/// and generic, so it is tested as a list transformation.
+/// A blank row inside the selection keeps its place; one at either edge is only the
+/// empty space the drag began or ended over. The release copy does not walk this
+/// trim: it keeps only the drawn rows, and [`copied_text`] counts the line breaks
+/// between them from their content rows. Pure and generic, so it is tested as a
+/// list transformation.
 fn trim_blank_edge_rows<T>(rows: &[Option<T>]) -> &[Option<T>] {
     let Some(first) = rows.iter().position(Option::is_some) else {
         return &[];
@@ -4412,9 +4418,10 @@ struct SelectedRun {
 /// `None` for a row that cut found blank — the edge rows NOT yet trimmed.
 ///
 /// Untrimmed because the release copy ([`selection_copy_text`]) draws a long
-/// selection in chunks and must trim the edges of the WHOLE selection, never of
-/// each chunk: a blank row at a chunk's edge may be a paragraph break inside it.
-/// Pure over a `Buffer`.
+/// selection in chunks, and a blank row at a chunk's edge may be a paragraph break
+/// inside the selection rather than an edge of it. The copy keeps each chunk's
+/// drawn rows and needs no trim: a blank row adds no text of its own. Pure over a
+/// `Buffer`.
 fn flow_runs(buf: &Buffer, start: Position, end: Position, rect: Rect) -> Vec<Option<SelectedRun>> {
     (start.y..=end.y)
         .filter_map(|y| flow_span_on_row(start, end, rect, y).map(|span| (y, span)))
@@ -4431,10 +4438,10 @@ fn flow_runs(buf: &Buffer, start: Position, end: Position, rect: Rect) -> Vec<Op
 ///
 /// The ONE rule both the highlight and the copy apply, which is what keeps the
 /// reverse-videoed cells and the copied text the same cells: the highlight calls it
-/// over the frame's visible slice ([`visible_selection_runs`]); the copy applies
-/// its two halves across an off-screen redraw ([`selection_copy_text`]) —
-/// [`flow_runs`] per chunk, the edge-row trim once over the whole selection. Pure
-/// over a `Buffer`.
+/// over the frame's visible slice ([`visible_selection_runs`]); the copy walks
+/// [`flow_runs`] over each chunk of an off-screen redraw ([`selection_copy_text`])
+/// and keeps the drawn rows — the same runs, since the edge trim drops only blank
+/// ones. Pure over a `Buffer`.
 fn selected_runs(
     buf: &Buffer,
     start: Position,
@@ -4450,22 +4457,33 @@ fn selected_runs(
 /// unchanged. Empty when `at` is outside `rect`, or the segment under it is blank
 /// ([`is_blank_symbol`]): a blank word selects nothing, exactly as a blank drag.
 ///
-/// Word boundaries come ONLY from `unicode-segmentation`; the row is the cells'
-/// symbols inside `rect`, so a word never reaches past the pane and never wraps to
-/// another row. A wide character's continuation cell is not specially handled.
-/// Pure over a `Buffer`.
+/// Word boundaries come ONLY from `unicode-segmentation`, over the row's DRAWN text
+/// inside `rect` ([`drawn_cells`]): a column a wide character covers is part of
+/// that character, never a space after it, so it splits no word, and a click on it
+/// is a click on the character. The run spans every column of the word's
+/// characters, both of a wide one's included, so the highlight lights each glyph
+/// whole. A word never reaches past the pane and never wraps to another row. Pure
+/// over a `Buffer`.
 fn word_runs(buf: &Buffer, at: Position, rect: Rect) -> Vec<Option<SelectedRun>> {
     if !rect.contains(at) {
         return Vec::new();
     }
-    // The row as one string, with the byte offset each cell starts at.
+    // The row's drawn text as one string, and per drawn cell: its column, the column
+    // past the glyph, and the byte offset its symbol starts at.
     let mut row = String::new();
-    let mut starts = Vec::with_capacity(usize::from(rect.width));
-    for x in rect.x..rect.right() {
-        starts.push(row.len());
-        row.push_str(buf.cell((x, at.y)).map_or(" ", |cell| cell.symbol()));
+    let mut cells: Vec<(u16, u16, usize)> = Vec::with_capacity(usize::from(rect.width));
+    for (x, cell) in drawn_cells(buf, at.y, rect.x..rect.right()) {
+        let past = x.saturating_add(cell.cell_width().max(1)).min(rect.right());
+        cells.push((x, past, row.len()));
+        row.push_str(cell.symbol());
     }
-    let at_byte = starts[usize::from(at.x - rect.x)];
+    // The glyph drawn over `at`: none when one left of `rect` covers it.
+    let Some(&(_, past, at_byte)) = cells.iter().rev().find(|&&(x, _, _)| x <= at.x) else {
+        return Vec::new();
+    };
+    if at.x >= past {
+        return Vec::new();
+    }
     let Some((seg_start, seg)) = row
         .split_word_bound_indices()
         .find(|&(start, seg)| start <= at_byte && at_byte < start + seg.len())
@@ -4476,29 +4494,55 @@ fn word_runs(buf: &Buffer, at: Position, rect: Rect) -> Vec<Option<SelectedRun>>
         return Vec::new();
     }
     let seg_end = seg_start + seg.len();
-    let first = starts.iter().position(|&s| s >= seg_start);
-    let past = starts
+    let mut word = cells
         .iter()
-        .position(|&s| s >= seg_end)
-        .unwrap_or(starts.len());
-    let (Some(first), Ok(past)) = (first, u16::try_from(past)) else {
+        .filter(|&&(_, _, start)| (seg_start..seg_end).contains(&start));
+    let Some(&(x0, first_past, _)) = word.next() else {
         return Vec::new();
     };
-    let Ok(first) = u16::try_from(first) else {
-        return Vec::new();
-    };
-    vec![Some(SelectedRun {
-        y: at.y,
-        x0: rect.x + first,
-        x1: rect.x + past,
-    })]
+    let x1 = word.next_back().map_or(first_past, |&(_, past, _)| past);
+    vec![Some(SelectedRun { y: at.y, x0, x1 })]
 }
 
-/// The symbols of `run`'s cells in `buf`, in order — one selected row's text.
+/// The cells row `y` of `buf` actually DRAWS in `columns`, each with its column,
+/// left to right — every cell but the ones a wide glyph to their left covers.
+///
+/// Such a cell carries no mark: `Paragraph` draws a glyph `w` columns wide by
+/// writing its left cell and stepping `w`, so the cells it covers keep the blank
+/// `" "` they held, and only the glyph's width says they are covered — the rule
+/// ratatui's own diff reads to never send them to the terminal (`ratatui-widgets`
+/// 0.3.2, `ratatui-core` 0.1.2). So the walk starts at the row's LEFT EDGE wherever
+/// `columns` starts, and a glyph that starts left of `columns` is not yielded even
+/// when it covers some of them. Every read of a row's TEXT off a drawn buffer asks
+/// this — the copy's ([`run_text`]), the double-click's ([`word_runs`]) and a
+/// soft-wrap seam's ([`soft_wrap_seams`]). Pure.
+fn drawn_cells(
+    buf: &Buffer,
+    y: u16,
+    columns: std::ops::Range<u16>,
+) -> impl Iterator<Item = (u16, &Cell)> + '_ {
+    let first = columns.start;
+    let mut covered: u16 = 0;
+    (buf.area.left()..columns.end)
+        .map_while(move |x| buf.cell((x, y)).map(|cell| (x, cell)))
+        .filter(move |&(x, cell)| {
+            if covered > 0 {
+                covered -= 1;
+                return false;
+            }
+            covered = cell.cell_width().saturating_sub(1);
+            x >= first
+        })
+}
+
+/// The symbols of `run`'s [drawn](drawn_cells) cells in `buf`, in order — one
+/// selected row's text.
+///
+/// A run may start in a covered cell, which the highlight lights but the terminal
+/// never draws, so the glyph shows unselected and is not copied.
 fn run_text(buf: &Buffer, run: SelectedRun) -> String {
-    (run.x0..run.x1)
-        .filter_map(|x| buf.cell((x, run.y)))
-        .map(|cell| cell.symbol())
+    drawn_cells(buf, run.y, run.x0..run.x1)
+        .map(|(_, cell)| cell.symbol())
         .collect()
 }
 
@@ -4507,6 +4551,11 @@ fn run_text(buf: &Buffer, run: SelectedRun) -> String {
 /// a selection over blank cells alone has nothing to copy. Nothing is trimmed here:
 /// every run already ends on a drawn cell, so the text holds exactly the cells the
 /// highlight covers. Pure over a `Buffer`.
+///
+/// The `\n` join treats every row as a line of its own, which only a one-row
+/// selection can rely on, so a double-click's word is its one runtime caller. A
+/// flowing selection's rows are joined by [`copied_text`], which knows where the
+/// pane soft-wrapped.
 fn selection_text(buf: &Buffer, runs: &[Option<SelectedRun>]) -> Option<String> {
     if runs.is_empty() {
         return None;
@@ -4516,6 +4565,146 @@ fn selection_text(buf: &Buffer, runs: &[Option<SelectedRun>]) -> Option<String> 
         .map(|run| run.map(|run| run_text(buf, run)).unwrap_or_default())
         .collect();
     Some(rows.join("\n"))
+}
+
+/// Whether the pane paints `grapheme` as a NON-BLANK cell when
+/// `Wrap { trim: false }` wraps its line at `width`: it is not blank
+/// ([`is_blank_symbol`]), not zero-width (never painted), and not wider than the
+/// pane (`WordWrapper` drops it — `ratatui-widgets` 0.3.2). The wrapper drops no
+/// other non-blank grapheme, so the `n`th such grapheme of a logical line is the
+/// `n`th non-blank cell of its wrapped rows — except after a glyph the wrapper
+/// starts past the pane's edge, which the clip ([`render_wrapped_clipped`]) drops:
+/// an accepted limitation, PATTERNS.md §5.
+fn paints_text_cell(grapheme: &str, width: u16) -> bool {
+    !is_blank_symbol(grapheme) && (1..=width).contains(&grapheme.cell_width())
+}
+
+/// For each of `rows` — content rows of logical line `line` below its first row,
+/// ascending — the SEAM that joins it to the rows above it in that line: the
+/// line's own text between the last non-blank grapheme drawn above the row and the
+/// row's first one, and the bytes the row's leading blank cells take in its text.
+/// Exactly one entry per row.
+///
+/// The text is read from the line, never from the cells, because the cells cannot
+/// tell it: at a break `WordWrapper` (`trim: false`, `ratatui-widgets` 0.3.2) drops
+/// some of the whitespace it broke on and carries the rest to the start of the
+/// next row, and the per-row cut drops what was left at the end of the row above.
+/// Inside a word the seam is empty. The line's rows from its first through the last
+/// of `rows` are redrawn with the pane's own widget ([`draw_transcript_rows`]),
+/// [`SELECTION_COPY_CHUNK_ROWS`] at a time, so each row's count of non-blank cells
+/// above it says which of the line's graphemes ([`paints_text_cell`]) it starts on.
+/// Both counts read the cells a row DRAWS ([`drawn_cells`]): a column a wide glyph
+/// covers is no blank of its own, so it never adds to a row's leading blanks. Pure.
+fn soft_wrap_seams(
+    lines: &[Line<'_>],
+    row_prefix: &[usize],
+    width: u16,
+    line: usize,
+    rows: &[usize],
+) -> Vec<(String, usize)> {
+    let start = row_prefix.get(line).copied().unwrap_or(0);
+    // Per row from `start`: non-blank cells on the line's rows above it, and the
+    // bytes of its leading blank cells.
+    let mut facts: Vec<(usize, usize)> = Vec::new();
+    if let Some(&through) = rows.last() {
+        let mut drawn = 0;
+        let mut top = start;
+        while top <= through && width > 0 {
+            let height =
+                u16::try_from((through - top + 1).min(usize::from(SELECTION_COPY_CHUNK_ROWS)))
+                    .unwrap_or(SELECTION_COPY_CHUNK_ROWS);
+            let buf = draw_transcript_rows(lines, row_prefix, top, height, width);
+            for y in 0..height {
+                let symbols: Vec<&str> = drawn_cells(&buf, y, 0..width)
+                    .map(|(_, cell)| cell.symbol())
+                    .collect();
+                let lead = symbols
+                    .iter()
+                    .take_while(|symbol| is_blank_symbol(symbol))
+                    .map(|symbol| symbol.len())
+                    .sum();
+                facts.push((drawn, lead));
+                drawn += symbols
+                    .iter()
+                    .filter(|symbol| !is_blank_symbol(symbol))
+                    .count();
+            }
+            top += usize::from(height);
+        }
+    }
+    // One walk over the line's graphemes, as the widget is handed them, serves
+    // every seam: they are asked for in order.
+    let mut graphemes = lines
+        .get(line)
+        .into_iter()
+        .flat_map(|text| text.styled_graphemes(Style::default()))
+        .map(|grapheme| grapheme.symbol)
+        .peekable();
+    let mut seen = 0;
+    rows.iter()
+        .map(|&row| {
+            let (above, lead) = row
+                .checked_sub(start)
+                .and_then(|i| facts.get(i))
+                .copied()
+                .unwrap_or_default();
+            let mut seam = String::new();
+            while let Some(&grapheme) = graphemes.peek() {
+                let painted = paints_text_cell(grapheme, width);
+                if painted && seen == above {
+                    break;
+                }
+                if painted {
+                    seen += 1;
+                } else if seen == above {
+                    seam.push_str(grapheme);
+                }
+                graphemes.next();
+            }
+            (seam, lead)
+        })
+        .collect()
+}
+
+/// The text a flowing selection copies from its DRAWN rows `rows`: content rows of
+/// `lines` (with their [`wrapped_row_prefix`] map `row_prefix`, wrapped at
+/// `width`), each with its text cut at its last drawn cell, top to bottom, the
+/// blank rows left out. `None` when there are none.
+///
+/// A `\n` stands ONLY at a break between two of `lines`: two rows of different
+/// logical lines are joined by one per line boundary between them, so a blank line
+/// between two drawn ones is still an empty line. Two rows of the SAME logical line
+/// are one line the pane soft-wrapped, and are joined by that line's own text at
+/// the seam ([`soft_wrap_seams`]), which stands in for the lower row's leading blank
+/// cells. A GFM grid table's wrapped cells are lines `store::preview` broke itself,
+/// so they copy row by row, as drawn — on purpose (PATTERNS.md §5). Pure.
+fn copied_text(
+    lines: &[Line<'_>],
+    row_prefix: &[usize],
+    width: u16,
+    rows: &[(usize, String)],
+) -> Option<String> {
+    let mut out = String::new();
+    let mut above: Option<usize> = None;
+    for group in rows.chunk_by(|a, b| line_at_row(row_prefix, a.0) == line_at_row(row_prefix, b.0))
+    {
+        let Some(((head_row, head), tail)) = group.split_first() else {
+            continue;
+        };
+        let line = line_at_row(row_prefix, *head_row);
+        if let Some(above) = above {
+            out.extend(std::iter::repeat_n('\n', line.saturating_sub(above)));
+        }
+        above = Some(line);
+        out.push_str(head);
+        let tail_rows: Vec<usize> = tail.iter().map(|(row, _)| *row).collect();
+        let seams = soft_wrap_seams(lines, row_prefix, width, line, &tail_rows);
+        for ((_, text), (seam, lead)) in tail.iter().zip(seams) {
+            out.push_str(&seam);
+            out.push_str(text.get(lead..).unwrap_or(text));
+        }
+    }
+    above.map(|_| out)
 }
 
 /// A window of content rows `top..bottom` drawn from the top of `rect`: the
@@ -4624,8 +4813,9 @@ fn visible_selection_runs(
 /// blank row between two drawn rows gets no highlight at all. The release copies
 /// the WHOLE selection by the same rule over an off-screen redraw
 /// ([`preview_selection_copy`]), so a cell on screen is reverse-videoed if and only
-/// if it is copied. It sets no status: the copy's status comes from its RESULT, in
-/// `update::finish_copy`, once the clipboard path has run.
+/// if it is copied; only the joins between rows differ ([`copied_text`]). It sets
+/// no status: the copy's status comes from its RESULT, in `update::finish_copy`,
+/// once the clipboard path has run.
 fn overlay_preview_selection(frame: &mut Frame, app: &mut App) {
     let Some(selection) = app.preview_selection() else {
         return;
@@ -4660,21 +4850,27 @@ fn overlay_preview_selection(frame: &mut Frame, app: &mut App) {
 /// and one `Paragraph` re-wraps every line it is handed, so drawing a
 /// 10,000-row selection in one buffer would allocate it whole and hand the widget
 /// every selected line at once — and a buffer's height is a `u16`, which a long
-/// selection in a narrow pane can outgrow. 256 rows keeps each buffer a small,
+/// selection in a narrow pane can outgrow. Each chunk is drawn through a scratch
+/// [`WRAP_ROOM_WIDTHS`] times its buffer's width too ([`render_wrapped_clipped`]
+/// measures what that adds to the time below), and 256 rows keeps its buffer a small,
 /// fixed size (a 100-column pane: about 25,600 cells) while leaving the per-chunk
-/// overhead negligible: 10,000 rows × 100 columns was measured at ~34 ms in a
-/// release build (~486 ms debug) in chunks of this size, spent once, on release,
-/// never per frame.
+/// overhead negligible; the seams' redraw ([`soft_wrap_seams`]) is bounded by it
+/// too. Measured 2026-10-15 in chunks of this size, clip included, a 10,000-row ×
+/// 100-column copy of nearly full rows takes ~42 ms in a release build (~640 ms
+/// debug) when no line wraps, and ~91 ms (~1.5 s debug) when every line does, each
+/// wrapped line then being redrawn once more for its seams — spent once, on
+/// release, never per frame.
 const SELECTION_COPY_CHUNK_ROWS: u16 = 256;
 
 /// Draw `height` wrapped rows of the transcript `lines`, starting at content row
 /// `top`, into a fresh `width`-wide off-screen buffer — with the SAME widget, wrap
 /// and windowing the pane draws with ([`render_preview`]): the lines
 /// [`row_window`] says those rows reach, in a `Paragraph` with
-/// `Wrap { trim: false }`, scrolled by the residual inside the first of them. So
-/// row `y` of the buffer holds exactly what the pane shows at content row
-/// `top + y`, style marks aside (a search mark or the highlight never changes a
-/// symbol). Pure.
+/// `Wrap { trim: false }`, scrolled by the residual inside the first of them, drawn
+/// through [`render_wrapped_clipped`] so a row the wrapper overran cannot panic it.
+/// So row `y` of the buffer holds exactly what the pane shows at content row
+/// `top + y` inside its transcript rect, style marks aside (a search mark or the
+/// highlight never changes a symbol). Pure.
 fn draw_transcript_rows(
     lines: &[Line<'_>],
     row_prefix: &[usize],
@@ -4685,7 +4881,7 @@ fn draw_transcript_rows(
     let area = Rect::new(0, 0, width, height);
     let mut buf = Buffer::empty(area);
     let (range, residual) = row_window(row_prefix, top, height);
-    Widget::render(
+    render_wrapped_clipped(
         Paragraph::new(Text::from(lines[range].to_vec()))
             .wrap(Wrap { trim: false })
             .scroll((u16::try_from(residual).unwrap_or(u16::MAX), 0)),
@@ -4695,17 +4891,80 @@ fn draw_transcript_rows(
     buf
 }
 
+/// How many times its area's width [`render_wrapped_clipped`] gives a wrapped
+/// `Paragraph` to write into.
+///
+/// Three, as no row the wrapper makes for a width `w` reaches `3w` columns:
+/// `WordWrapper` (`ratatui-widgets` 0.3.2) flushes a full pending line and then
+/// appends the glyph at hand to the word it carries past that line without checking
+/// the word's width, so the word becomes a row up to `w + 2g - 1` columns wide for a
+/// widest glyph of `g` columns — and it skips every glyph wider than `w`. An
+/// exhaustive run over every string of up to seven glyphs of widths 0 to 3, at
+/// widths 1 to 6, found no wider row (2026-10).
+const WRAP_ROOM_WIDTHS: u16 = 3;
+
+/// Render the wrapped `paragraph` into `area` of `buf`, keeping ONLY what lands
+/// inside `area`; every cell outside it is left as it was. Every wrapped render of
+/// the transcript goes through here — the pane's draw ([`render_preview`]), the link
+/// probe ([`region_paints_cell`]) and the release copy's redraw
+/// ([`draw_transcript_rows`]) — so all three cut a row at the same edge.
+///
+/// `Paragraph` draws a row its wrapper made wider than `area` ([`WRAP_ROOM_WIDTHS`]
+/// says how) on past `area`'s right edge, unbounded, so a glyph that starts past the
+/// edge of `buf` itself indexes outside it and PANICS — as the release copy's redraw
+/// and the link probe of `"漢字 仮名  交じり文"` at width 2 did, and the pane's own
+/// draw of five-column `ｶﾞﾞﾞﾞ` glyphs in a 7-column frame. Hence the scratch buffer,
+/// as tall as `area` and wide enough for any row, seeded with `area`'s own cells so
+/// the ones the paragraph leaves alone come back unchanged, whatever was drawn or
+/// pre-filled there. What is cut is what the pane cannot show inside its transcript
+/// rect either.
+///
+/// The price is the scratch, allocated on every call, so on EVERY FRAME. Measured
+/// 2026-10-15 in a release build: one preview draw of a 104×57 pane in a 200×60
+/// frame, over a 50,000-row transcript, took ~125 µs drawn straight into the frame
+/// and ~175 µs clipped, ~36 µs of that allocating the scratch; a 10,000-row ×
+/// 100-column release copy took ~32 ms and ~41 ms when no line wraps, and ~74 ms
+/// and ~91 ms when every line does.
+fn render_wrapped_clipped(paragraph: Paragraph<'_>, area: Rect, buf: &mut Buffer) {
+    let area = area.intersection(buf.area);
+    if area.is_empty() {
+        return;
+    }
+    let mut scratch = Buffer::empty(Rect::new(
+        0,
+        0,
+        area.width.saturating_mul(WRAP_ROOM_WIDTHS),
+        area.height,
+    ));
+    // `area`'s rows MOVE to the scratch's left columns and back, never cloned.
+    let width = usize::from(area.width);
+    let swap_area = |buf: &mut Buffer, scratch: &mut Buffer| {
+        for dy in 0..area.height {
+            let from = buf.index_of(area.x, area.y + dy);
+            let to = scratch.index_of(0, dy);
+            buf.content[from..from + width].swap_with_slice(&mut scratch.content[to..to + width]);
+        }
+    };
+    swap_area(buf, &mut scratch);
+    Widget::render(
+        paragraph,
+        Rect::new(0, 0, area.width, area.height),
+        &mut scratch,
+    );
+    swap_area(buf, &mut scratch);
+}
+
 /// The text a released `selection` copies from the transcript `lines` (with their
 /// [`wrapped_row_prefix`] map `row_prefix`) wrapped at `width` — ALL of it, rows
 /// the pane never drew included, by the same rules the highlight draws with.
 ///
 /// Redraws the selected rows off screen, [`SELECTION_COPY_CHUNK_ROWS`] at a time
 /// ([`draw_transcript_rows`]), and walks each chunk with [`flow_runs`]: the one
-/// blank rule, the one per-row cut at the last drawn cell. The rows of every chunk
-/// are gathered first and only then is the WHOLE selection's edge trimmed
-/// ([`trim_blank_edge_rows`]) — per chunk, it would turn a paragraph break that
-/// happens to sit on a chunk's edge into a lost line. A double-click's word is its
-/// one row's [`word_runs`]. The selection is clamped to the transcript's own rows,
+/// blank rule, the one per-row cut at the last drawn cell. The drawn rows of every
+/// chunk are gathered with the content row each shows, and [`copied_text`] joins
+/// them — a `\n` only at the transcript's own line breaks — so neither a chunk's
+/// edge nor a blank row on it changes the text. A double-click's word is its one
+/// row's [`word_runs`]. The selection is clamped to the transcript's own rows,
 /// so the in-flight reply tail the pane draws below them — never in this cache —
 /// is never copied, which is also why the highlight never covers it. `None` when
 /// the selection holds no drawn text: its release copies nothing. Pure.
@@ -4765,7 +5024,9 @@ fn selection_copy_text_in_chunks(
     if first > last {
         return None;
     }
-    let mut rows: Vec<Option<String>> = Vec::with_capacity(last - first + 1);
+    // Only the DRAWN rows, each with the content row it shows: a blank row adds no
+    // text, and the line breaks it stood for are counted from the content rows.
+    let mut rows: Vec<(usize, String)> = Vec::with_capacity(last - first + 1);
     let mut top = first;
     while top <= last {
         let height =
@@ -4780,22 +5041,13 @@ fn selection_copy_text_in_chunks(
             rows.extend(
                 flow_runs(&buf, from, to, buf.area)
                     .into_iter()
-                    .map(|run| run.map(|run| run_text(&buf, run))),
+                    .flatten()
+                    .map(|run| (top + usize::from(run.y), run_text(&buf, run))),
             );
         }
         top = window.bottom;
     }
-    // The edge-row trim of the WHOLE selection, only now that every chunk is in.
-    let rows = trim_blank_edge_rows(&rows);
-    if rows.is_empty() {
-        return None;
-    }
-    Some(
-        rows.iter()
-            .map(|row| row.as_deref().unwrap_or(""))
-            .collect::<Vec<_>>()
-            .join("\n"),
-    )
+    copied_text(lines, row_prefix, width, &rows)
 }
 
 /// What a released preview selection copies: [`selection_copy_text`] over the
@@ -8071,6 +8323,60 @@ mod tests {
         Buffer::with_lines(["hello     ", "", "world     ", ""])
     }
 
+    /// `(column, symbol)` of every cell [`drawn_cells`] yields.
+    fn drawn(buf: &Buffer, y: u16, columns: std::ops::Range<u16>) -> Vec<(u16, String)> {
+        drawn_cells(buf, y, columns)
+            .map(|(x, cell)| (x, cell.symbol().to_string()))
+            .collect()
+    }
+
+    /// A row's drawn cells are its glyphs at the columns they start on: the columns a
+    /// wide glyph covers are left out, a real space is not, and whether a column is
+    /// covered is decided from the row's left edge — wherever the asked columns
+    /// start, and wherever the buffer itself starts.
+    #[test]
+    fn drawn_cells_leave_out_the_columns_a_wide_glyph_covers() {
+        let buf = Buffer::with_lines(["漢a字 b"]);
+        let cell = |x: u16, symbol: &str| (x, symbol.to_string());
+        assert_eq!(
+            drawn(&buf, 0, 0..7),
+            vec![
+                cell(0, "漢"),
+                cell(2, "a"),
+                cell(3, "字"),
+                cell(5, " "),
+                cell(6, "b")
+            ]
+        );
+        assert_eq!(
+            drawn(&buf, 0, 1..4),
+            vec![cell(2, "a"), cell(3, "字")],
+            "a range starting in a covered column starts at the next glyph"
+        );
+        assert_eq!(
+            drawn(&buf, 0, 4..7),
+            vec![cell(5, " "), cell(6, "b")],
+            "the column 字 covers is not a space"
+        );
+        assert_eq!(
+            drawn(&buf, 0, 3..4),
+            vec![cell(3, "字")],
+            "a glyph starting inside the range is yielded whole"
+        );
+        assert_eq!(drawn(&buf, 0, 5..40), vec![cell(5, " "), cell(6, "b")]);
+        assert_eq!(drawn(&buf, 1, 0..7), Vec::new(), "a row past the buffer");
+
+        // A glyph wider than two columns covers all of them, and a buffer that does
+        // not start at column 0 is walked from ITS left edge.
+        let mut offset = Buffer::empty(Rect::new(3, 1, 7, 1));
+        offset.set_string(3, 1, "ｶﾞﾞx漢y", Style::new());
+        assert_eq!("ｶﾞﾞ".cell_width(), 3, "premise: three columns");
+        assert_eq!(
+            drawn(&offset, 1, 4..10),
+            vec![cell(6, "x"), cell(7, "漢"), cell(9, "y")]
+        );
+    }
+
     /// The word a double-click at column `x` of a one-row buffer selects, as text.
     fn word_at(line: &str, x: u16) -> Option<String> {
         let buf = Buffer::with_lines([line]);
@@ -8091,6 +8397,49 @@ mod tests {
         assert_eq!(word_at(line, 31).as_deref(), Some("link"));
         assert_eq!(word_at(line, 7), None, "the space between words is blank");
         assert_eq!(word_at(line, 35), None, "trailing empty cells are blank");
+    }
+
+    /// A double-click selects a word of the DRAWN text, so the columns its wide
+    /// characters cover never split it: a Hangul word and a Katakana one come whole,
+    /// from either half of any character in them, and the run covers both columns of
+    /// every character, so the highlight lights each glyph whole. Han ideographs stay
+    /// one word each, the UAX #29 break between two of them.
+    #[test]
+    fn a_double_click_on_a_word_of_wide_characters_selects_the_whole_word() {
+        let line = "한국어 カタカナ 東京タワー";
+        let words = [
+            (0..6, "한국어"),
+            (7..15, "カタカナ"),
+            (16..18, "東"),
+            (18..20, "京"),
+            (20..26, "タワー"),
+        ];
+        for (columns, word) in words {
+            for x in columns {
+                assert_eq!(word_at(line, x).as_deref(), Some(word), "column {x}");
+            }
+        }
+        assert_eq!(word_at(line, 6), None, "the space between words is blank");
+
+        let buf = Buffer::with_lines([line]);
+        let at = |x: u16| word_runs(&buf, Position { x, y: 0 }, buf.area);
+        assert_eq!(at(3), vec![Some(SelectedRun { y: 0, x0: 0, x1: 6 })]);
+        assert_eq!(
+            at(25),
+            vec![Some(SelectedRun {
+                y: 0,
+                x0: 20,
+                x1: 26
+            })]
+        );
+        assert_eq!(
+            at(17),
+            vec![Some(SelectedRun {
+                y: 0,
+                x0: 16,
+                x1: 18
+            })]
+        );
     }
 
     /// The word's run is exactly its cells — the highlight range — and stays
@@ -8158,6 +8507,73 @@ mod tests {
             selected_runs(&buf, Position { x: 7, y: 0 }, Position { x: 2, y: 2 }, rect);
         assert_eq!(from_blank, vec![Some(SelectedRun { y: 2, x0: 0, x1: 3 })]);
         assert_eq!(selection_text(&buf, &from_blank).as_deref(), Some("wor"));
+    }
+
+    /// The release copy of `anchor..=cursor` on the one row `text` is drawn on by the
+    /// pane's own widget, `width` wide.
+    fn copy_on_one_row(text: &str, width: u16, anchor: u16, cursor: u16) -> Option<String> {
+        let lines = vec![Line::from(text.to_string())];
+        let prefix = wrapped_row_prefix(&lines, width);
+        assert_eq!(prefix.last(), Some(&1), "premise: {text:?} fits one row");
+        selection_copy_text(&lines, &prefix, chars((0, anchor), (0, cursor)), width)
+    }
+
+    /// A wide character copies as itself: the column to its right that it covers is
+    /// part of the glyph, never a space after it, while a REAL space beside one still
+    /// copies. CJK and emoji (a VS16 sequence, a flag, a ZWJ sequence) alike.
+    #[test]
+    fn a_wide_character_copies_without_the_column_it_covers() {
+        for glyph in ["漢", "🦀", "❤️", "🇯🇵", "👩‍💻"] {
+            assert_eq!(glyph.cell_width(), 2, "premise: {glyph:?} is two columns");
+        }
+        for text in [
+            "漢字",
+            "漢字仮名交じり文",
+            "漢 字",
+            "漢  字 x",
+            "a漢b字c",
+            "🦀🚀 crab ❤️🇯🇵👩‍💻!",
+        ] {
+            assert_eq!(copy_on_one_row(text, 24, 0, 23).as_deref(), Some(text));
+        }
+    }
+
+    /// A selection that STARTS in a wide character's right half begins at the next
+    /// character: the highlight lights from that half, which the terminal never
+    /// draws, so the glyph shows unselected and is not copied. One that ENDS in a
+    /// right half takes the whole glyph, and one over a right half alone is blank.
+    #[test]
+    fn a_selection_starting_inside_a_wide_character_copies_from_the_next_one() {
+        let text = "漢字仮";
+        assert_eq!(copy_on_one_row(text, 10, 1, 9).as_deref(), Some("字仮"));
+        assert_eq!(copy_on_one_row(text, 10, 3, 5).as_deref(), Some("仮"));
+        assert_eq!(copy_on_one_row(text, 10, 0, 3).as_deref(), Some("漢字"));
+        assert_eq!(copy_on_one_row(text, 10, 1, 1), None);
+
+        // The highlight starts on the right half the drag began in, the cell the
+        // terminal never draws.
+        let buf = Buffer::with_lines([text]);
+        let runs = selected_runs(
+            &buf,
+            Position { x: 1, y: 0 },
+            Position { x: 5, y: 0 },
+            buf.area,
+        );
+        assert_eq!(runs, vec![Some(SelectedRun { y: 0, x0: 1, x1: 5 })]);
+        assert_eq!(selection_text(&buf, &runs).as_deref(), Some("字仮"));
+    }
+
+    /// A double-click on a Han ideograph or an emoji copies that character alone —
+    /// UAX #29 breaks on both sides of each — and one on a word drawn after wide
+    /// characters copies that word alone.
+    #[test]
+    fn a_double_click_beside_wide_characters_copies_the_word_alone() {
+        let line = "漢字 abc 🦀x";
+        assert_eq!(word_at(line, 0).as_deref(), Some("漢"));
+        assert_eq!(word_at(line, 2).as_deref(), Some("字"));
+        assert_eq!(word_at(line, 6).as_deref(), Some("abc"));
+        assert_eq!(word_at(line, 9).as_deref(), Some("🦀"));
+        assert_eq!(word_at(line, 11).as_deref(), Some("x"));
     }
 
     // --- a content-anchored selection: the visible slice, and the release copy ---
@@ -8276,9 +8692,28 @@ mod tests {
         buf
     }
 
+    /// The committed on-screen rule's copy of `runs` read off a drawn `buf`: each
+    /// drawn row's text, tagged with the content row it shows (content row `top`
+    /// is drawn on `rect.y`), joined by [`copied_text`] over the transcript `lines`
+    /// and their prefix map.
+    fn copy_off_buffer(
+        buf: &Buffer,
+        runs: &[Option<SelectedRun>],
+        rect: Rect,
+        top: usize,
+        lines: &[Line<'_>],
+        prefix: &[usize],
+    ) -> Option<String> {
+        let rows: Vec<(usize, String)> = runs
+            .iter()
+            .flatten()
+            .map(|&run| (top + usize::from(run.y - rect.y), run_text(buf, run)))
+            .collect();
+        copied_text(lines, prefix, rect.width, &rows)
+    }
+
     /// The copy is the same whatever the chunk height: every chunk edge — a blank
-    /// row on it, a wrapped line split by it — is invisible in the result, and the
-    /// edge-row trim applies to the WHOLE selection, never per chunk. Checked
+    /// row on it, a wrapped line split by it — is invisible in the result. Checked
     /// against the selection drawn in ONE buffer by the committed on-screen rule,
     /// and past the transcript's last row the copy stops at that row.
     #[test]
@@ -8311,7 +8746,14 @@ mod tests {
                 }
             };
             let (start, end) = ordered(pin(anchor), pin(cursor));
-            let expected = selection_text(&whole, &selected_runs(&whole, start, end, whole.area));
+            let expected = copy_off_buffer(
+                &whole,
+                &selected_runs(&whole, start, end, whole.area),
+                whole.area,
+                0,
+                &lines,
+                &prefix,
+            );
             assert!(
                 expected.is_some(),
                 "premise: {anchor:?}..{cursor:?} holds text"
@@ -8335,6 +8777,189 @@ mod tests {
             None,
             "a selection wholly past the transcript copies nothing"
         );
+    }
+
+    /// The whole of `lines` selected, edge to edge, and copied at `width`.
+    fn copy_all(lines: &[Line<'static>], width: u16) -> Option<String> {
+        let prefix = wrapped_row_prefix(lines, width);
+        let rows = *prefix.last().expect("a prefix map");
+        selection_copy_text(lines, &prefix, chars((0, 0), (rows - 1, width - 1)), width)
+    }
+
+    /// A line the pane only SOFT-wrapped copies as the one line it is: a row the
+    /// wrapper broke at a space joins the next with that space, never with `\n`.
+    #[test]
+    fn a_soft_wrapped_line_copies_without_a_newline_at_the_wrap() {
+        let text = "alpha bravo charlie delta echo";
+        let lines = vec![Line::from(text)];
+        assert!(
+            wrapped_text_rows(&lines, 12) > 1,
+            "premise: the line wraps at width 12"
+        );
+        assert_eq!(copy_all(&lines, 12).as_deref(), Some(text));
+    }
+
+    /// Whatever the wrapper did with the whitespace it broke on — dropped it,
+    /// left it at the end of the row (where the per-row cut drops it), or carried
+    /// it to the start of the next row — and wherever it broke a word too long for
+    /// a row, a wrapped line copies back to its own text, at every width.
+    #[test]
+    fn a_wrapped_line_copies_its_own_text_at_every_width() {
+        for text in [
+            "foo  bar",
+            "aaaa      bbbb",
+            "a          b",
+            "x = f(a,  b,   c)    // aligned   comment",
+            "https://example.com/a/really/long/path?q=1",
+            "word-with-hyphens and_underscores, plus.dots",
+        ] {
+            let lines = vec![Line::from(text)];
+            let full = u16::try_from(text.len()).expect("fits");
+            for width in 1..=full + 1 {
+                assert_eq!(
+                    copy_all(&lines, width).as_deref(),
+                    Some(text),
+                    "{text:?} at width {width}"
+                );
+            }
+            assert!(
+                wrapped_text_rows(&lines, 4) > 1,
+                "premise: {text:?} wraps at width 4"
+            );
+        }
+    }
+
+    /// The premise the sweep above depends on, seen in the cells: at width 6 the
+    /// wrapper drops three of the six spaces and carries the other three to the
+    /// start of the next row, so gluing the rows could never give the six back.
+    #[test]
+    fn the_wrapper_carries_part_of_a_broken_space_run_to_the_next_row() {
+        let lines = vec![Line::from("aaaa      bbbb")];
+        let buf = draw_whole(&lines, 6, 3);
+        assert_eq!(buf, Buffer::with_lines(["aaaa  ", "   bbb", "b     "]));
+    }
+
+    /// A wrap with no whitespace in it — wide characters broken between two of
+    /// them — joins the rows with NOTHING: the copy is each row's own text, as
+    /// drawn, glued together.
+    #[test]
+    fn a_wrap_between_wide_characters_joins_the_rows_with_nothing() {
+        let width = 5;
+        let lines = vec![Line::from("漢字仮名交じり文")];
+        let rows = wrapped_text_rows(&lines, width);
+        assert!(rows > 1, "premise: the line wraps at width {width}");
+        let buf = draw_whole(&lines, width, u16::try_from(rows).expect("fits"));
+        let glued: String = (0..buf.area.height)
+            .filter_map(|y| {
+                cut_at_last_text_cell(&buf, y, (0, width))
+                    .map(|(x0, x1)| run_text(&buf, SelectedRun { y, x0, x1 }))
+            })
+            .collect();
+        assert_eq!(copy_all(&lines, width), Some(glued));
+    }
+
+    /// A wrapped line whose rows start on a WIDE blank (U+3000) copies back to its own
+    /// text at every width that draws it: the seam measures a row's leading blank
+    /// cells as the row draws them ([`drawn_cells`]), never counting the column a
+    /// wide blank covers as a space of its own. Width 1 draws no wide character.
+    #[test]
+    fn a_wrapped_line_of_wide_blanks_copies_its_own_text_at_every_width() {
+        for text in [
+            "aaaa\u{3000}\u{3000}\u{3000}bbbb",
+            "漢字\u{3000}\u{3000}仮名",
+        ] {
+            let lines = vec![Line::from(text)];
+            let full = u16::try_from(UnicodeWidthStr::width(text)).expect("fits");
+            for width in 2..=full + 1 {
+                assert_eq!(
+                    copy_all(&lines, width).as_deref(),
+                    Some(text),
+                    "{text:?} at width {width}"
+                );
+            }
+        }
+    }
+
+    /// The transcript's own line breaks still copy as `\n` — one per break, so a
+    /// blank line between two wrapped paragraphs is still an empty line — while
+    /// the wraps inside each paragraph copy as the text they broke.
+    #[test]
+    fn real_line_breaks_still_copy_between_wrapped_lines() {
+        let lines = vec![
+            Line::from("alpha bravo charlie delta echo"),
+            Line::from(""),
+            Line::from("foxtrot golf hotel india"),
+            Line::from("juliet"),
+        ];
+        assert_eq!(
+            copy_all(&lines, 12).as_deref(),
+            Some("alpha bravo charlie delta echo\n\nfoxtrot golf hotel india\njuliet")
+        );
+    }
+
+    /// A selection that starts or ends partway through a wrapped line copies
+    /// that part of the line's own text: the row ends keep their per-row cut and
+    /// their edge rule (a row whose selected cells are all blank adds nothing), and
+    /// a selection that starts BELOW the line's first row still joins its rows
+    /// with the line's own text.
+    #[test]
+    fn a_partial_selection_across_a_wrap_copies_that_part_of_the_line() {
+        // Rows at width 12: "alpha bravo ", "charlie", "delta echo".
+        let prose = vec![Line::from("alpha bravo charlie delta echo")];
+        let prose_prefix = wrapped_row_prefix(&prose, 12);
+        // Rows at width 6: "aaaa", "   bbb", "b" — three spaces carried down.
+        let spaced = vec![Line::from("aaaa      bbbb")];
+        let spaced_prefix = wrapped_row_prefix(&spaced, 6);
+        let cases = [
+            (
+                &prose,
+                &prose_prefix,
+                12,
+                (0, 6),
+                (2, 2),
+                "bravo charlie del",
+            ),
+            (&prose, &prose_prefix, 12, (1, 3), (2, 8), "rlie delta ech"),
+            (
+                &prose,
+                &prose_prefix,
+                12,
+                (1, 0),
+                (2, 11),
+                "charlie delta echo",
+            ),
+            (
+                &prose,
+                &prose_prefix,
+                12,
+                (0, 0),
+                (1, 10),
+                "alpha bravo charlie",
+            ),
+            (&prose, &prose_prefix, 12, (1, 9), (2, 4), "delta"),
+            (&spaced, &spaced_prefix, 6, (0, 0), (1, 1), "aaaa"),
+            (&spaced, &spaced_prefix, 6, (0, 0), (1, 4), "aaaa      bb"),
+            (&spaced, &spaced_prefix, 6, (0, 2), (2, 0), "aa      bbbb"),
+            (&spaced, &spaced_prefix, 6, (1, 3), (2, 5), "bbbb"),
+            // Starting inside the carried spaces copies the blank cells it covers,
+            // as any row's start does: no row above it in the selection to seam to.
+            (&spaced, &spaced_prefix, 6, (1, 1), (2, 5), "  bbbb"),
+        ];
+        for (lines, prefix, width, anchor, cursor, expected) in cases {
+            assert_eq!(
+                selection_copy_text(lines, prefix, chars(anchor, cursor), width).as_deref(),
+                Some(expected),
+                "{anchor:?}..{cursor:?} at width {width}"
+            );
+        }
+    }
+
+    /// An indent the first row keeps is copied as drawn, and the wraps after it
+    /// still copy as the text they broke.
+    #[test]
+    fn an_indented_wrapped_line_keeps_its_indent_and_its_spaces() {
+        let text = "    let x = some_function(argument_one, argument_two);";
+        assert_eq!(copy_all(&[Line::from(text)], 20).as_deref(), Some(text));
     }
 
     /// The transcript for the parity test: several turns whose lines word-wrap in
@@ -8382,13 +9007,13 @@ mod tests {
     /// short, so the transcript overflows it several times.
     const PARITY_PANE: (u16, u16) = (32, 12);
 
-    /// PARITY: a selection fully on screen copies EXACTLY what the drawn frame
-    /// shows under it — the text the committed on-screen rule reads off the frame
-    /// the pane drew ([`selected_runs`] / [`word_runs`] -> [`selection_text`]), for
-    /// every pair of a grid of cells, at several scroll positions including ones
-    /// that start inside a wrapped line, and for a double-click's word on every
-    /// cell. The release redraws those rows off screen instead of reading the
-    /// frame, so this is what proves the redraw IS the frame.
+    /// PARITY: a selection fully on screen copies EXACTLY the text the committed
+    /// on-screen rule reads off the frame the pane drew under it, joined the same
+    /// way ([`selected_runs`] -> [`copy_off_buffer`], [`word_runs`] ->
+    /// [`selection_text`]), for every pair of a grid of cells, at several scroll
+    /// positions including ones that start inside a wrapped line, and for a
+    /// double-click's word on every cell. The release redraws those rows off screen
+    /// instead of reading the frame, so this is what proves the redraw IS the frame.
     #[test]
     fn a_selection_on_screen_copies_exactly_what_the_drawn_frame_shows() {
         let (width, height) = PARITY_PANE;
@@ -8415,6 +9040,11 @@ mod tests {
             }
             let drawn = preview_buffer(&mut app, width, height);
             scrolls.push(app.preview_scroll);
+            let (lines, prefix) = app
+                .preview_transcript(rect.width)
+                .map(|(lines, prefix)| (lines.to_vec(), prefix.to_vec()))
+                .expect("the parity session's transcript");
+            let top = usize::try_from(app.preview_scroll).expect("fits");
             for &a in &cells {
                 for &b in &cells {
                     app.begin_preview_press(a, rect);
@@ -8423,7 +9053,8 @@ mod tests {
                         continue; // a zero-length drag is a click, not a selection
                     }
                     let (start, end) = ordered(a, b);
-                    let shown = selection_text(&drawn, &selected_runs(&drawn, start, end, rect));
+                    let runs = selected_runs(&drawn, start, end, rect);
+                    let shown = copy_off_buffer(&drawn, &runs, rect, top, &lines, &prefix);
                     assert_eq!(
                         preview_selection_copy(&mut app),
                         shown,
@@ -8453,6 +9084,601 @@ mod tests {
         );
         assert!(compared > 1000, "premise: the sweep compared {compared}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The paragraphs of every turn of [`wide_parity_session`]: CJK and emoji, each
+    /// wide character beside another one or beside a real space.
+    const WIDE_PARITY_LINES: [&str; 3] = [
+        "漢字仮名交じり文",
+        "🦀 蟹 ❤️ と 한국어 x",
+        "日本語のテキスト 🇯🇵👩‍💻",
+    ];
+
+    /// A session `id` in `dir` of `turns` turns, user and assistant in turn, each
+    /// holding `paragraphs`.
+    fn paragraphs_session(dir: &Path, id: &str, turns: usize, paragraphs: &[&str]) -> Session {
+        let file = dir.join(format!("{id}.jsonl"));
+        let mut out = String::new();
+        for turn in 0..turns {
+            let role = if turn % 2 == 0 { "user" } else { "assistant" };
+            let record = serde_json::json!({
+                "type": role,
+                "sessionId": id,
+                "cwd": "/tmp",
+                "timestamp": "2026-07-01T10:00:00.000Z",
+                "message": { "role": role, "content": paragraphs.join("\n\n") },
+            });
+            out.push_str(&format!("{record}\n"));
+        }
+        std::fs::write(&file, out).expect("write the session fixture");
+        let mut session = sample_session();
+        session.file = file;
+        session.session_id = id.to_string();
+        session.cwd = PathBuf::from("/tmp");
+        session
+    }
+
+    /// A transcript of [`WIDE_PARITY_LINES`] turns, longer than [`PARITY_PANE`].
+    fn wide_parity_session(dir: &Path) -> Session {
+        paragraphs_session(dir, "sess-wide", 4, &WIDE_PARITY_LINES)
+    }
+
+    /// PARITY over WIDE characters: a selection on screen copies exactly what the
+    /// drawn frame shows under it ([`selected_runs`] / [`word_runs`] ->
+    /// [`selection_text`]), for every pair of a grid of cells that lands on both
+    /// halves of wide characters, at several scrolls, and for a double-click on
+    /// every cell. And what both read is the transcript's own text: each paragraph
+    /// copies back without a space the wide characters never had.
+    ///
+    /// No line wraps in the pane, so this pins the wide columns alone.
+    #[test]
+    fn a_selection_over_wide_characters_copies_exactly_what_the_drawn_frame_shows() {
+        let (width, height) = PARITY_PANE;
+        let dir = unique_temp_dir("copy-parity-wide");
+        let mut app = App::new(
+            vec![wide_parity_session(&dir)],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        app.preview_rect = Rect::new(0, 0, width, height);
+        let rect = preview_transcript_rect(&app);
+        let (lines, prefix) = app.preview_transcript(rect.width).expect("a transcript");
+        assert!(
+            prefix.windows(2).all(|w| w[1] - w[0] == 1),
+            "premise: every line is one row at width {}",
+            rect.width
+        );
+        let rows = lines.len();
+        assert!(
+            rows > usize::from(rect.height),
+            "premise: the transcript overflows the pane"
+        );
+        let all = chars((0, 0), (rows - 1, rect.width - 1));
+        let whole = selection_copy_text(lines, prefix, all, rect.width).expect("text");
+        for line in WIDE_PARITY_LINES {
+            assert!(
+                whole.contains(line),
+                "{line:?} copies as itself in {whole:?}"
+            );
+        }
+
+        let half = rect.width / 2;
+        let cols = [0, 1, 2, 3, half, half + 1, rect.width - 1];
+        let cells: Vec<Position> = (rect.y..rect.bottom())
+            .flat_map(|y| cols.iter().map(move |&c| Position { x: rect.x + c, y }))
+            .collect();
+        let mut compared = 0;
+        for scroll in [0, 1, 4] {
+            app.preview_follow_bottom = false;
+            app.preview_scroll = scroll;
+            let drawn = preview_buffer(&mut app, width, height);
+            for &a in &cells {
+                for &b in &cells {
+                    app.begin_preview_press(a, rect);
+                    app.extend_preview_selection(b, rect);
+                    if !app.has_preview_selection() {
+                        continue;
+                    }
+                    let (start, end) = ordered(a, b);
+                    let shown = selection_text(&drawn, &selected_runs(&drawn, start, end, rect));
+                    assert_eq!(
+                        preview_selection_copy(&mut app),
+                        shown,
+                        "scroll {scroll}: {a:?} -> {b:?}"
+                    );
+                    compared += 1;
+                }
+            }
+            for y in rect.y..rect.bottom() {
+                for x in rect.x..rect.right() {
+                    let at = Position { x, y };
+                    app.begin_word_selection(at, rect);
+                    let shown = selection_text(&drawn, &word_runs(&drawn, at, rect));
+                    assert_eq!(
+                        preview_selection_copy(&mut app),
+                        shown,
+                        "scroll {scroll}: word at {at:?}"
+                    );
+                }
+            }
+        }
+        assert!(compared > 1000, "premise: the sweep compared {compared}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `Paragraph`'s wrapper can hand back a row WIDER than the pane: at width 2 it
+    /// wraps `交じ` of `"漢字 仮名  交じり文"` onto one 4-column row. The release copy
+    /// redraws that row without panicking: the line's rows down to it copy as the
+    /// line's own text, and a double-click on it selects what the pane shows of it,
+    /// the row cut at the pane's edge — `じ` starts past that edge, so the clip
+    /// ([`render_wrapped_clipped`]) draws it nowhere, not even on the pane's border.
+    /// What a flowing copy makes of the line from that row on is the limitation
+    /// PATTERNS.md §5 accepts, so it is not pinned here.
+    #[test]
+    fn a_release_copy_survives_a_wrapped_row_wider_than_the_pane() {
+        let lines = vec![Line::from("漢字 仮名  交じり文")];
+        let prefix = wrapped_row_prefix(&lines, 2);
+        let rows = *prefix.last().expect("a prefix map");
+        let mut roomy = Buffer::empty(Rect::new(0, 0, 8, 8));
+        Widget::render(
+            Paragraph::new(Text::from(lines.clone())).wrap(Wrap { trim: false }),
+            Rect::new(0, 0, 2, 8),
+            &mut roomy,
+        );
+        assert_eq!(rows, 8, "premise: eight rows");
+        assert_eq!(
+            roomy[(2, 5)].symbol(),
+            "じ",
+            "premise: row 5 overruns the pane"
+        );
+
+        let copied = selection_copy_text(&lines, &prefix, chars((0, 0), (rows - 1, 1)), 2)
+            .expect("the line copies");
+        assert!(copied.starts_with("漢字 仮名  交"), "{copied:?}");
+        let word = |col: u16| PreviewSelection {
+            anchor: ContentPos { row: 5, col },
+            cursor: ContentPos { row: 5, col },
+            unit: SelectionUnit::Word,
+        };
+        assert_eq!(
+            selection_copy_text(&lines, &prefix, word(0), 2).as_deref(),
+            Some("交")
+        );
+        assert_eq!(
+            selection_copy_text(&lines, &prefix, word(1), 2).as_deref(),
+            Some("交")
+        );
+    }
+
+    /// The limitation PATTERNS.md §5 accepts, pinned on its PANIC half only: on a
+    /// line the wrapper overruns — at width 2 with a 2-column glyph, at wider panes
+    /// with a zero-width grapheme or one 3+ columns wide on the line too — the glyph
+    /// drawn past the pane's edge is not copied, and the seams after it on that line
+    /// land a glyph late. Wrong text, never a panic: every flowing selection over each
+    /// such line, from any cell to any cell, copies. WHAT it copies is not asserted,
+    /// since it is not the line's own text.
+    #[test]
+    fn a_line_the_wrapper_overruns_copies_without_panicking() {
+        for (text, width) in [
+            ("a漢漢 a漢a", 2),
+            ("한국어 텍스트  한국어   텍스트", 2),
+            ("a\u{200B}aa漢aa", 4),
+            ("a ｶﾞﾞｶﾞﾞa", 6),
+        ] {
+            let lines = vec![Line::from(text)];
+            assert!(
+                wrapper_overruns(&lines, width),
+                "premise: {text:?} overruns at width {width}"
+            );
+            let prefix = wrapped_row_prefix(&lines, width);
+            let rows = *prefix.last().expect("a prefix map");
+            let cells: Vec<(usize, u16)> = (0..rows)
+                .flat_map(|row| (0..width).map(move |col| (row, col)))
+                .collect();
+            for &anchor in &cells {
+                for &cursor in &cells {
+                    let _ = selection_copy_text(&lines, &prefix, chars(anchor, cursor), width);
+                }
+            }
+            let all = chars((0, 0), (rows - 1, width - 1));
+            assert!(
+                selection_copy_text(&lines, &prefix, all, width).is_some(),
+                "{text:?} at width {width} copies"
+            );
+        }
+    }
+
+    /// A clipped render is the paragraph's own render inside its area — the cells it
+    /// writes there and the ones it leaves alone — and touches nothing outside it,
+    /// where the row the wrapper overran would have drawn.
+    #[test]
+    fn a_clipped_render_keeps_only_what_lands_inside_its_area() {
+        let paragraph = || {
+            Paragraph::new(Text::from(vec![Line::from("漢字 仮名  交じり文")]))
+                .wrap(Wrap { trim: false })
+        };
+        let before = Cell::new("·");
+        let area = Rect::new(1, 1, 2, 8);
+        let mut clipped = Buffer::filled(Rect::new(0, 0, 4, 10), before.clone());
+        render_wrapped_clipped(paragraph(), area, &mut clipped);
+        let mut roomy = Buffer::filled(Rect::new(0, 0, 12, 10), before.clone());
+        Widget::render(paragraph(), area, &mut roomy);
+        assert_eq!(
+            roomy[(3, 6)].symbol(),
+            "じ",
+            "premise: a row overruns the area"
+        );
+        assert_eq!(
+            roomy[(2, 5)],
+            before,
+            "premise: a cell the paragraph leaves"
+        );
+
+        for y in 0..10 {
+            for x in 0..4 {
+                let expected = if area.contains(Position { x, y }) {
+                    &roomy[(x, y)]
+                } else {
+                    &before
+                };
+                assert_eq!(&clipped[(x, y)], expected, "cell ({x}, {y})");
+            }
+        }
+    }
+
+    /// Paragraphs the wrapper wraps into rows wider than a narrow pane: wide
+    /// characters after a space or a run of spaces, U+3000 ideographic spaces,
+    /// emoji, Hangul.
+    const OVERRUN_LINES: [&str; 9] = [
+        "漢字 仮名  交じり文",
+        "aaaa\u{3000}\u{3000}\u{3000}bbbb",
+        "漢字\u{3000}\u{3000}仮名",
+        "🦀 蟹 ❤️ と 한국어 x",
+        "日本語のテキスト 🇯🇵👩‍💻",
+        "  漢字仮名交じり文 漢字  仮名",
+        "x  🦀🦀🦀🦀  🦀 🦀🦀",
+        "한국어 텍스트  한국어   텍스트",
+        "a漢漢 a漢a",
+    ];
+
+    /// A paragraph of glyphs wider than two columns: ratatui-core 0.1.2 counts a
+    /// column per halfwidth sound mark, so `ｶﾞﾞﾞﾞ` is five.
+    const STACKED_MARKS_LINE: &str = "a 漢ｶﾞﾞﾞﾞa a 漢ｶﾞﾞﾞﾞｶﾞﾞﾞﾞ b";
+
+    /// No pane width makes the release copy panic: over [`OVERRUN_LINES`] and
+    /// [`STACKED_MARKS_LINE`], the whole transcript and a double-click on every
+    /// cell, at every width from 1 to 60 — and every string of up to five glyphs of
+    /// widths 0 to 3, spaces among them, drawn whole at every width from 1 to 6, each
+    /// redraw holding exactly the cells an unclipped render draws inside the pane,
+    /// though some of those renders draw past it.
+    #[test]
+    fn no_pane_width_makes_a_release_copy_panic() {
+        assert_eq!("ｶﾞﾞﾞﾞ".cell_width(), 5, "premise: five columns");
+        let lines: Vec<Line<'static>> = OVERRUN_LINES
+            .iter()
+            .chain([&STACKED_MARKS_LINE])
+            .map(|text| Line::from(text.to_string()))
+            .collect();
+        for width in 1..=60u16 {
+            let prefix = wrapped_row_prefix(&lines, width);
+            let rows = *prefix.last().expect("a prefix map");
+            let all = chars((0, 0), (rows - 1, width - 1));
+            assert!(
+                selection_copy_text(&lines, &prefix, all, width).is_some(),
+                "width {width}: the transcript copies"
+            );
+            for row in 0..rows {
+                for col in 0..width {
+                    let at = ContentPos { row, col };
+                    let word = PreviewSelection {
+                        anchor: at,
+                        cursor: at,
+                        unit: SelectionUnit::Word,
+                    };
+                    let _ = selection_copy_text(&lines, &prefix, word, width);
+                }
+            }
+        }
+
+        let glyphs = ["a", "漢", " ", "\u{200B}", "ｶﾞﾞ"];
+        let mut strings = vec![String::new()];
+        let mut overran = 0;
+        for _ in 0..5 {
+            strings = strings
+                .iter()
+                .flat_map(|s| glyphs.iter().map(move |g| format!("{s}{g}")))
+                .collect();
+            for text in &strings {
+                let lines = vec![Line::from(text.clone())];
+                for width in 1..=6u16 {
+                    let prefix = wrapped_row_prefix(&lines, width);
+                    let rows = u16::try_from(*prefix.last().expect("a map")).expect("fits");
+                    let buf = draw_transcript_rows(&lines, &prefix, 0, rows, width);
+                    let roomy = roomy_render(&lines[0], width);
+                    overran += usize::from(drawn_past(&roomy, width));
+                    for y in 0..rows {
+                        for x in 0..width {
+                            assert_eq!(
+                                buf[(x, y)],
+                                roomy[(x, y)],
+                                "{text:?} at {width}: cell ({x}, {y})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(overran > 0, "premise: no redraw overran its pane");
+    }
+
+    /// The subagent `(agent id, agent type)` the width sweeps open the subagent
+    /// view on ([`with_overrun_subagent`]).
+    const OVERRUN_SUBAGENT: (&str, &str) = ("a0b1c2d3e4f5a6b7c", "auditor");
+
+    /// Give `session` the subagent [`OVERRUN_SUBAGENT`], its transcript a copy of
+    /// the session's own records, which the subagent view renders as they are.
+    fn with_overrun_subagent(session: &Session) {
+        use crate::store::subagents::{subagents_dir, transcript_path};
+        let dir = subagents_dir(&session.file).expect("a subagents dir");
+        std::fs::create_dir_all(&dir).expect("create the subagents dir");
+        std::fs::copy(&session.file, transcript_path(&dir, OVERRUN_SUBAGENT.0))
+            .expect("write the subagent transcript");
+    }
+
+    /// An app over `session` alone, its pane showing the session's own transcript,
+    /// or with `in_view` the subagent view on [`OVERRUN_SUBAGENT`].
+    fn overrun_app(session: &Session, in_view: bool) -> App {
+        let mut app = App::new(
+            vec![session.clone()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        if in_view {
+            app.open_subagent_view(OVERRUN_SUBAGENT.0, OVERRUN_SUBAGENT.1);
+        }
+        assert_eq!(app.in_subagent_view(), in_view, "premise: the pane shown");
+        app
+    }
+
+    /// The release copy and the frame agree at EVERY pane width, the narrow ones the
+    /// wrapper overruns included: over a transcript of [`OVERRUN_LINES`], at every
+    /// transcript width from 1 to 60 and every scroll a page apart, the whole
+    /// visible pane, and a double-click on the first, middle and last columns of
+    /// every row, copy exactly what the committed on-screen rule reads off the drawn
+    /// frame, joined the same way ([`copy_off_buffer`]; [`selection_text`] for a
+    /// word) — in the session's own pane, and in the subagent view over a subagent
+    /// transcript of the same records, which copies by the same path.
+    #[test]
+    fn a_selection_copies_what_the_frame_shows_at_every_pane_width() {
+        let dir = unique_temp_dir("copy-every-width");
+        let session = paragraphs_session(&dir, "sess-overrun", 2, &OVERRUN_LINES);
+        with_overrun_subagent(&session);
+        let height = 10;
+        // Per pane: the session's own (`0`), then the subagent view (`1`).
+        let mut compared = [0; 2];
+        for (width, in_view) in (3..=62u16).flat_map(|width| [(width, false), (width, true)]) {
+            let pane = usize::from(in_view);
+            let mut app = overrun_app(&session, in_view);
+            app.preview_rect = Rect::new(0, 0, width, height);
+            let rect = preview_transcript_rect(&app);
+            assert_eq!(rect.width, width - 2, "premise: the transcript width");
+            let rows = app.preview_wrapped_rows(rect.width);
+            for scroll in (0..rows).step_by(usize::from(rect.height)) {
+                app.preview_follow_bottom = false;
+                app.preview_scroll = u32::try_from(scroll).expect("fits");
+                let drawn = preview_buffer(&mut app, width, height);
+                let (lines, prefix) = app
+                    .preview_transcript(rect.width)
+                    .map(|(lines, prefix)| (lines.to_vec(), prefix.to_vec()))
+                    .expect("the transcript");
+                let top = usize::try_from(app.preview_scroll).expect("fits");
+                let (a, b) = (
+                    Position {
+                        x: rect.x,
+                        y: rect.y,
+                    },
+                    Position {
+                        x: rect.right() - 1,
+                        y: rect.bottom() - 1,
+                    },
+                );
+                app.begin_preview_press(a, rect);
+                app.extend_preview_selection(b, rect);
+                if app.has_preview_selection() {
+                    let runs = selected_runs(&drawn, a, b, rect);
+                    let shown = copy_off_buffer(&drawn, &runs, rect, top, &lines, &prefix);
+                    assert_eq!(
+                        preview_selection_copy(&mut app),
+                        shown,
+                        "width {width}, scroll {scroll}, subagent view {in_view}"
+                    );
+                    compared[pane] += 1;
+                }
+                let w = rect.width;
+                let mut cols = vec![0, 1, 2, w / 2, w / 2 + 1, w.saturating_sub(2), w - 1];
+                cols.retain(|&c| c < w);
+                for y in rect.y..rect.bottom() {
+                    for &c in &cols {
+                        let at = Position { x: rect.x + c, y };
+                        app.begin_word_selection(at, rect);
+                        let shown = selection_text(&drawn, &word_runs(&drawn, at, rect));
+                        assert_eq!(
+                            preview_selection_copy(&mut app),
+                            shown,
+                            "width {width}, scroll {scroll}, subagent view {in_view}: \
+                             word at {at:?}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            compared.iter().all(|&n| n > 100),
+            "premise: the sweep compared {compared:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// How many halfwidth sound marks [`no_pane_width_makes_the_draw_panic`] stacks on
+    /// one `ｶ`, making a single glyph of one column per mark and one for the `ｶ`.
+    const STACKED_MARK_COUNT: usize = 20;
+
+    /// `line` wrapped at `width` by `Paragraph`, UNCLIPPED: rendered into a buffer
+    /// as wide as all of the line's glyphs side by side, which no row the wrapper
+    /// makes of them can outgrow.
+    fn roomy_render(line: &Line<'_>, width: u16) -> Buffer {
+        let rows = wrapped_text_rows(std::slice::from_ref(line), width);
+        let rows = u16::try_from(rows).expect("a short fixture line");
+        let wide = line
+            .styled_graphemes(Style::new())
+            .map(|grapheme| grapheme.symbol.cell_width())
+            .sum::<u16>()
+            .max(width);
+        let mut roomy = Buffer::empty(Rect::new(0, 0, wide, rows));
+        Widget::render(
+            Paragraph::new(Text::from(vec![line.clone()])).wrap(Wrap { trim: false }),
+            Rect::new(0, 0, width, rows),
+            &mut roomy,
+        );
+        roomy
+    }
+
+    /// Whether a [`roomy_render`] drew text right of column `width`.
+    fn drawn_past(roomy: &Buffer, width: u16) -> bool {
+        let area = roomy.area;
+        (0..area.height)
+            .any(|y| (width..area.width).any(|x| !is_blank_symbol(roomy[(x, y)].symbol())))
+    }
+
+    /// Whether `Paragraph` wraps any of `lines` at `width` into a row wider than
+    /// `width`.
+    fn wrapper_overruns(lines: &[Line<'_>], width: u16) -> bool {
+        lines
+            .iter()
+            .any(|line| drawn_past(&roomy_render(line, width), width))
+    }
+
+    /// No pane width makes the LIVE draw panic, nor a click on what it drew: over a
+    /// transcript of [`OVERRUN_LINES`], the five-column glyphs of
+    /// [`STACKED_MARKS_LINE`], a glyph of [`STACKED_MARK_COUNT`] sound marks, and
+    /// links labelled with each of them, at every pane width from 1 to 62 (no
+    /// transcript to a 60-column one) and every scroll a page apart, the pane draws,
+    /// and the link, fold and delegation-line probes resolve a click on every row of
+    /// its transcript — the session's own pane, and the subagent view over a
+    /// subagent transcript of the same records. The wrapper overruns the pane at
+    /// some of those widths, at some far enough to reach past the frame's right
+    /// edge.
+    #[test]
+    fn no_pane_width_makes_the_draw_panic() {
+        let cluster = format!("ｶ{}", "ﾞ".repeat(STACKED_MARK_COUNT));
+        assert_eq!(
+            usize::from(cluster.cell_width()),
+            STACKED_MARK_COUNT + 1,
+            "premise: one glyph, a column per mark"
+        );
+        let tall = format!("a 漢{cluster}a b {cluster}{cluster} c");
+        let linked = format!(
+            "[{}](https://example.com/a) x [{STACKED_MARKS_LINE}](https://example.com/b) \
+             [{tall}](https://example.com/c)",
+            OVERRUN_LINES[0]
+        );
+        let paragraphs: Vec<&str> = OVERRUN_LINES
+            .iter()
+            .copied()
+            .chain([STACKED_MARKS_LINE, &tall, &linked])
+            .collect();
+        let dir = unique_temp_dir("draw-every-width");
+        let session = paragraphs_session(&dir, "sess-draw-overrun", 2, &paragraphs);
+        with_overrun_subagent(&session);
+        let height = 10;
+        // Per pane — the session's own (`0`), then the subagent view (`1`) — the
+        // transcript widths the wrapper overran, and the clicks that landed on a link.
+        let (mut overran, mut hits) = ([Vec::new(), Vec::new()], [0; 2]);
+        for (width, in_view) in (1..=62u16).flat_map(|width| [(width, false), (width, true)]) {
+            let pane = usize::from(in_view);
+            let mut app = overrun_app(&session, in_view);
+            app.preview_rect = Rect::new(0, 0, width, height);
+            let rect = preview_transcript_rect(&app);
+            assert_eq!(rect.width, width.saturating_sub(2), "premise: the width");
+            let rows = app.preview_wrapped_rows(rect.width);
+            // A pane with no room for a transcript still draws, once.
+            for scroll in (0..rows.max(1)).step_by(usize::from(rect.height)) {
+                app.preview_follow_bottom = false;
+                app.preview_scroll = u32::try_from(scroll).expect("fits");
+                let _ = preview_buffer(&mut app, width, height);
+                let scroll = app.preview_scroll;
+                let (prefix, lines, links, folds, delegations) =
+                    app.preview_hit_context(rect.width).expect("a transcript");
+                // The link probe renders its line down to the clicked ROW whichever
+                // column was clicked, so three columns a row reach every render.
+                let w = rect.width;
+                for y in rect.y..rect.bottom() {
+                    for x in [0, w / 2, w.saturating_sub(1)].map(|c| rect.x + c) {
+                        let probe = link_at(x, y, rect, scroll, prefix, lines, links);
+                        hits[pane] += usize::from(matches!(probe, LinkProbe::Hit(_)));
+                        let _ = fold_at(x, y, rect, scroll, prefix, folds);
+                        let _ = subagent_at(x, y, rect, scroll, prefix, delegations);
+                    }
+                }
+            }
+            let (_, lines, ..) = app.preview_hit_context(rect.width).expect("a transcript");
+            if wrapper_overruns(lines, rect.width) {
+                overran[pane].push(rect.width);
+            }
+        }
+        for (overran, hits) in overran.iter().zip(hits) {
+            assert!(
+                [2, 5, 21].iter().all(|width| overran.contains(width)),
+                "premise: the wrapper overruns the pane, at {overran:?}"
+            );
+            assert!(hits > 100, "premise: {hits} clicks landed on a link");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A link click on a row BELOW one the wrapper overran resolves: the probe
+    /// re-renders the clicked line down to that row, overrun one included, at the
+    /// pane's own width. At width 2 `交じ` of `"漢字 仮名  交じり文"` wraps onto one
+    /// 4-column row, and the label `り文` sits on the two rows under it: each cell of
+    /// it the pane shows opens its url, and every row above opens nothing.
+    #[test]
+    fn a_link_click_below_a_row_the_wrapper_overran_does_not_panic() {
+        const HEAD: &str = "漢字 仮名  交じ";
+        let lines = vec![Line::from(vec![
+            Span::raw(HEAD),
+            Span::styled("り文", preview::link_style()),
+        ])];
+        let inner = Rect::new(1, 1, 2, 10);
+        let prefix = wrapped_row_prefix(&lines, inner.width);
+        assert_eq!(prefix, vec![0, 8], "premise: eight rows");
+        assert!(
+            wrapper_overruns(&lines, inner.width),
+            "premise: a row overruns the pane"
+        );
+        let start = UnicodeWidthStr::width(HEAD);
+        let regions = [region(0, start, start + 4, "wide")];
+        for y in 0..8u16 {
+            for x in 0..inner.width {
+                let expected = if y >= 6 {
+                    LinkProbe::Hit("wide")
+                } else {
+                    LinkProbe::NoLink
+                };
+                assert_eq!(
+                    link_at(
+                        inner.x + x,
+                        inner.y + y,
+                        inner,
+                        0,
+                        &prefix,
+                        &lines,
+                        &regions
+                    ),
+                    expected,
+                    "cell ({x}, {y})"
+                );
+            }
+        }
     }
 
     /// A 20-wide inner pane at origin (1,1); most link tests share it.
