@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.1](https://github.com/ilfroloff/snapback/compare/v0.14.0...v0.14.1) - 2026-10-17
+
+### Other
+
+- re-record the demo GIF with a working agent's subagents
+
 ## [0.14.0](https://github.com/ilfroloff/snapback/compare/v0.13.0...v0.14.0) - 2026-10-16
 
 ### Added
