@@ -33,6 +33,12 @@ remove_demo_home() {
 }
 remove_demo_home "$demo_home"
 mkdir -p "$demo_home"
+# A plain copy stamps every file with the time of the copy, which keeps the
+# working session's unfinished subagents inside the running window
+# (RUNNING_WINDOW in src/store/subagents.rs) while the tape records. A copy that
+# keeps the fixtures' own mtimes (cp -p, cp -a) would date them to the checkout,
+# and they would read quiet. The window must also cover vhs fetching its browser
+# into this fresh HOME before it records (2.5 min, measured 2026-10-17).
 cp -R "$demo/home/." "$demo_home/"
 cp "$demo/agents.json" "$demo_home/agents.json"
 
