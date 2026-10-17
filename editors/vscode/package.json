@@ -1,0 +1,80 @@
+{
+  "name": "snapback",
+  "displayName": "Snapback",
+  "description": "Open snapback (sb) in a fullscreen terminal pane",
+  "version": "0.1.0",
+  "publisher": "ilfroloff",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ilfroloff/snapback.git",
+    "directory": "editors/vscode"
+  },
+  "engines": {
+    "vscode": "^1.89.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "claude",
+    "claude-code",
+    "tui",
+    "sessions",
+    "terminal"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onCommand:snapback.open"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "snapback.open",
+        "title": "Open Snapback",
+        "category": "Snapback"
+      }
+    ],
+    "configuration": {
+      "title": "Snapback",
+      "properties": {
+        "snapback.location": {
+          "type": "string",
+          "enum": [
+            "editor",
+            "panel"
+          ],
+          "default": "editor",
+          "description": "Where to open the snapback terminal. 'editor' opens it as a fullscreen editor tab; 'panel' opens it in the integrated terminal panel (maximized)."
+        },
+        "snapback.command": {
+          "type": "string",
+          "default": "sb",
+          "description": "The snapback binary to run. Resolved from PATH, ~/.local/bin, /usr/local/bin, or $SNAPBACK_INSTALL_DIR."
+        },
+        "snapback.args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "-p"
+          ],
+          "description": "Arguments to pass to the snapback command. Default is ['-p'] for project scope (repo + worktrees)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^18.0.0",
+    "@types/vscode": "^1.89.0",
+    "@vscode/vsce": "^2.0.0",
+    "typescript": "^5.0.0"
+  }
+}
