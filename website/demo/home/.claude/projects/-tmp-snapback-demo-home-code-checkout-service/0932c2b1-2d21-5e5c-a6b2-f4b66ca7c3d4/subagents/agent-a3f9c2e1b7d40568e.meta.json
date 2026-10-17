@@ -1,0 +1,1 @@
+{"agentType":"general-purpose","description":"Benchmark the composite index","toolUseId":"toolu_demo_bench","spawnDepth":1,"requestShape":"background","requestNonInteractive":true,"model":"sonnet"}

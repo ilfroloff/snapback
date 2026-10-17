@@ -40,11 +40,24 @@ Type "snapback -a"
 Enter
 Sleep 3s
 
-# --- Scene 2: the agent that needs you ---
+# --- Scene 2: the working agent's subagents (Ctrl-X ↓ opens the running one,
+# → steps to the next, ↑ goes back; the selection never moves). Leave with ↑,
+# never Esc: had the view not opened, Esc on the board would quit ---
+Sleep 1.5s
+Ctrl+X
+Sleep 700ms
+Down
+Sleep 3s
+Right
+Sleep 2.5s
+Up
+Sleep 1s
+
+# --- Scene 3: the agent that needs you ---
 Down 1
 Sleep 2s
 
-# --- Scene 3: reply without leaving the board (Ctrl-R) ---
+# --- Scene 4: reply without leaving the board (Ctrl-R) ---
 Ctrl+R
 Sleep 1.5s
 Enter
@@ -54,7 +67,7 @@ Sleep 600ms
 Enter
 Sleep 5s
 
-# --- Scene 4: find a session by what was said (Tab = search transcripts) ---
+# --- Scene 5: find a session by what was said (Tab = search transcripts) ---
 Tab
 Sleep 400ms
 Type "backoff"
@@ -63,7 +76,7 @@ Backspace 7
 Tab
 Sleep 600ms
 
-# --- Scene 5: background hand-offs folded into one (+N) row ---
+# --- Scene 6: background hand-offs folded into one (+N) row ---
 Down 6
 Sleep 800ms
 Ctrl+X
@@ -75,7 +88,7 @@ Sleep 300ms
 Type "f"
 Sleep 1.2s
 
-# --- Scene 6: move a main-checkout session into its worktree (Ctrl-X w) ---
+# --- Scene 7: move a main-checkout session into its worktree (Ctrl-X w) ---
 Down 1
 Sleep 1s
 Ctrl+X
@@ -87,7 +100,7 @@ Sleep 800ms
 Enter
 Sleep 3.5s
 
-# --- Scene 7: fork headless (Ctrl-F), a command from the / pick list ---
+# --- Scene 8: fork headless (Ctrl-F), a command from the / pick list ---
 Down 3
 Sleep 800ms
 Ctrl+F
