@@ -135,8 +135,9 @@
 //! every byte that follows it.
 //!
 //! **That fold is the module's ONE fold, and every seam takes it.** The filter
-//! builds its haystacks with it, the row-label highlight gates on it, and the
-//! preview marks search it. This is not tidiness: the surfaces share the
+//! builds its haystacks with it, the row-label highlight gates on it, the
+//! preview marks search it, and the pick list's word-start rule compares a
+//! case-insensitive part through it. This is not tidiness: the surfaces share the
 //! [`AtomFinder`]s, and a finder only answers the SAME question on two surfaces if
 //! each was handed a haystack lowercased by the same rule. Fold one seam with
 //! [`str::to_lowercase`] instead and the two part company on the narrow class the
@@ -198,8 +199,28 @@
 //! `SessionsChanged` refresh rebuilds only the entries whose session actually
 //! changed.
 //!
+//! # The pick list's third rule: WORD-START
+//!
+//! One rule here belongs to the compose pick list ALONE:
+//! [`word_start_hit`](SearchIndex::word_start_hit), which `tui::complete` asks of
+//! an `@` file or folder's own NAME when the substring parts rejected it. The
+//! query matches when it can be consumed as consecutive chunks, each a PREFIX of
+//! a word of the name, on words in order — `calis` is `Ca` + `Lis` of
+//! `CategoryListings.tsx`. Its smart case is the substring parts' own, decided
+//! per part ([`is_case_sensitive`]): a part holding a capital matches exactly,
+//! any other through the ONE fold. A capital, like each part's first char, also
+//! forces a chunk start. Its rationale, scope and bounds are DOMAIN.md's
+//! ("How the letters narrow the list"); here, what keeps it off the board:
+//! only [`set_atoms`](SearchIndex::set_atoms) compiles it and
+//! [`set_query`](SearchIndex::set_query) clears it, and nothing else reads it —
+//! the filter, [`admits`](SearchIndex::admits) and both marking rules stay
+//! substring. It is still never fuzzy: a chunk is a word PREFIX, so letters that
+//! merely occur in order are no hit.
+//!
 //! Every `memchr` call is contained below. The rest of the crate sees only
-//! [`SearchIndex`], [`SearchMode`], and [`filter`].
+//! [`SearchIndex`], [`SearchMode`], [`filter`], the caller-owned [`MarkScratch`]
+//! the per-string seams share, and the [`WordStartHit`] the third rule answers
+//! with.
 //!
 //! # nucleo survives as the ORACLE, not as the matcher
 //!
@@ -313,6 +334,27 @@ const PROXIMITY_WINDOW_QUERY_MULTIPLIER: usize = 3;
 /// one window of each other, so the unbounded answer admits nothing the window
 /// would have rejected.
 const PROXIMITY_MAX_ANCHORS: usize = 512;
+
+/// Shortest pick-list query, in chars across all its parts, the WORD-START rule
+/// runs for.
+///
+/// Lossless, not a tune: a one-char query's only chunk is a word's first char,
+/// met in its part's case ([`is_case_sensitive`]), and the substring match, under
+/// that same case, already admits every name holding that char, so skipping the
+/// rule there drops no hit (`a_one_char_query_never_runs_word_start`).
+const WORD_START_MIN_QUERY: usize = 2;
+
+/// Longest pick-list query, in chars across all its parts, the WORD-START rule
+/// runs for: the DP keeps one `u64` mask per word, one bit per query position plus
+/// one for the end ([`word_start_reach`]). A longer query is matched by substring
+/// alone.
+const WORD_START_MAX_QUERY: usize = u64::BITS as usize - 1;
+
+/// The bytes that end a word in a NAME under the WORD-START rule, and are never
+/// part of one: the pick list's own part separators (`-`, `_`, `.`), `/` and a
+/// space. The pick list splits its query on the first three before it reaches
+/// here, so `@cat-lis` asks for `cat` then `lis`.
+const WORD_SEPARATORS: [u8; 5] = [b'-', b'_', b'.', b'/', b' '];
 
 /// Which haystack the filter searches.
 ///
@@ -449,15 +491,22 @@ struct AtomFinder {
     case_sensitive: bool,
 }
 
+/// The smart-case decision for ONE atom: whether it matches case-sensitively,
+/// because it carries an uppercase char. The one predicate behind both an
+/// [`AtomFinder`] and a [`WordStartQuery`] part, so a pick-list part matches by
+/// its word starts in the case it matches as a substring.
+///
+/// The uppercase test is the Unicode `Uppercase` property, which over ASCII — the
+/// realistic input space for a search box — is exactly an `is_ascii_uppercase`
+/// test. See the module docs for the narrow non-ASCII divergence from the oracle.
+fn is_case_sensitive(atom: &str) -> bool {
+    atom.chars().any(char::is_uppercase)
+}
+
 impl AtomFinder {
     /// Compile one (already unescaped, non-empty) query `atom`.
-    ///
-    /// The uppercase test is the Unicode `Uppercase` property, which over ASCII —
-    /// the realistic input space for a search box — is exactly an
-    /// `is_ascii_uppercase` test. See the module docs for the narrow non-ASCII
-    /// divergence from the oracle.
     fn new(atom: &str) -> Self {
-        let case_sensitive = atom.chars().any(char::is_uppercase);
+        let case_sensitive = is_case_sensitive(atom);
         // Bake the needle into the case it will be searched in, so the scan
         // itself is a raw byte compare with nothing to fold per keystroke.
         let needle = if case_sensitive {
@@ -470,6 +519,110 @@ impl AtomFinder {
             case_sensitive,
         }
     }
+}
+
+/// A pick-list query compiled for the WORD-START rule
+/// ([`SearchIndex::word_start_hit`]): its atoms concatenated, which of the name's
+/// two forms each position meets, and where a chunk must start.
+///
+/// Built by [`set_atoms`](SearchIndex::set_atoms) alone, never by
+/// [`set_query`](SearchIndex::set_query), so the board's search box can never
+/// reach the rule.
+struct WordStartQuery {
+    /// The atoms' bytes, concatenated, as typed. A part with no capital is already
+    /// in the ONE fold: for ASCII, the fold only lowers capitals
+    /// ([`fold_lowercase_into`]'s ASCII arm).
+    bytes: Vec<u8>,
+    /// For each position, whether its part is case-sensitive
+    /// ([`is_case_sensitive`]), and so meets the name's CASED bytes rather than
+    /// its fold ([`NameBytes`]).
+    exact: Vec<bool>,
+    /// For each position `i`, the first position AFTER it a chunk must start at, or
+    /// `bytes.len()`: a chunk from `i` may not run past it. A chunk must start at
+    /// each atom's first byte and at each uppercase byte, so `ca-lis` is never
+    /// consumed as `cal` + `is`, nor `HTPa` as `HT` + `Pa`.
+    next_forced: Vec<usize>,
+}
+
+impl WordStartQuery {
+    /// The word-start form of `atoms`, or `None` where the rule does not run: an
+    /// atom that is not ASCII, or a query outside
+    /// [`WORD_START_MIN_QUERY`]..=[`WORD_START_MAX_QUERY`].
+    ///
+    /// Every byte is KEPT, a [`WORD_SEPARATORS`] byte included — the leading `.`
+    /// the pick list leaves on a dot-name's part, a token of separators alone. No
+    /// word holds one, so such a query never matches: `.env` never reaches
+    /// `env.example` by a bare `env`, as the substring parts never do either.
+    fn compile(atoms: &[&str]) -> Option<Self> {
+        let mut bytes = Vec::new();
+        let mut exact = Vec::new();
+        let mut forced = Vec::new();
+        for atom in atoms {
+            if !atom.is_ascii() {
+                return None;
+            }
+            let case_sensitive = is_case_sensitive(atom);
+            for (at, byte) in atom.bytes().enumerate() {
+                forced.push(at == 0 || byte.is_ascii_uppercase());
+                exact.push(case_sensitive);
+                bytes.push(byte);
+            }
+        }
+        let len = bytes.len();
+        if !(WORD_START_MIN_QUERY..=WORD_START_MAX_QUERY).contains(&len) {
+            return None;
+        }
+        let mut next_forced = vec![len; len];
+        let mut next = len;
+        for at in (0..len).rev() {
+            next_forced[at] = next;
+            if forced[at] {
+                next = at;
+            }
+        }
+        Some(WordStartQuery {
+            bytes,
+            exact,
+            next_forced,
+        })
+    }
+
+    /// The form of `name` the query's position `at` meets: its cased bytes for a
+    /// case-sensitive part, else its fold.
+    fn haystack<'n>(&self, name: NameBytes<'n>, at: usize) -> &'n [u8] {
+        if self.exact[at] {
+            name.cased
+        } else {
+            name.folded
+        }
+    }
+}
+
+/// A name as the WORD-START rule reads it: its CASED bytes, which a
+/// case-sensitive part meets, and its fold, which every other part meets. The ONE
+/// fold keeps byte length, so a word's byte range indexes both.
+#[derive(Clone, Copy)]
+struct NameBytes<'n> {
+    cased: &'n [u8],
+    folded: &'n [u8],
+}
+
+/// Where a WORD-START hit landed in a name: what the pick list orders and marks
+/// it by ([`SearchIndex::word_start_hit`]).
+///
+/// The chunks are the decomposition with the FEWEST chunks, then the fewest
+/// skipped words — among those whose first chunk begins the name's first word,
+/// when there is one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WordStartHit {
+    /// Whether the first chunk is a prefix of the name's FIRST word.
+    pub at_name_start: bool,
+    /// How many chunks the query was consumed in.
+    pub chunks: usize,
+    /// How many words up to the last chunk's word carry no chunk.
+    pub skipped: usize,
+    /// The CHAR positions of the name the chunks cover, ascending.
+    pub marks: Vec<usize>,
 }
 
 /// A live, updatable substring index over the current session list.
@@ -503,6 +656,11 @@ pub struct SearchIndex {
     /// ([`atom_match_positions`](Self::atom_match_positions)) — reuse the SAME
     /// finders, which is what makes a mark and an admission the same decision.
     atom_finders: Vec<AtomFinder>,
+    /// The active query in its WORD-START form, compiled by
+    /// [`set_atoms`](Self::set_atoms) when the rule's bounds allow and cleared by
+    /// [`set_query`](Self::set_query). Read by
+    /// [`word_start_hit`](Self::word_start_hit) alone.
+    word_start: Option<WordStartQuery>,
     /// The active query's proximity window in BYTES, derived once per keystroke
     /// by [`proximity_window`] and read by every entry in the scan. It depends on
     /// the QUERY alone, so computing it per entry would be the same number paid
@@ -530,6 +688,7 @@ impl SearchIndex {
             // No atoms => the empty query: `results` returns all, and neither
             // marking rule marks anything.
             atom_finders: Vec::new(),
+            word_start: None,
             proximity_window: proximity_window(0),
             last_rebuilt: 0,
         }
@@ -602,6 +761,8 @@ impl SearchIndex {
         // Compile the substring searchers ONCE per keystroke, reused across every
         // entry by the scan in `matching_candidates` and by both marking rules.
         self.atom_finders = compile_atoms(gate_atoms(query).iter().map(String::as_str));
+        // The board's query never takes the pick list's word-start rule.
+        self.word_start = None;
         // Derived from the QUERY, so it is computed once here rather than
         // recomputed identically for every entry in the scan.
         self.proximity_window = proximity_window(query.len());
@@ -619,9 +780,16 @@ impl SearchIndex {
     /// smart case stays per atom and both marking rules mark these atoms exactly
     /// as they mark typed ones. The query text reads back as the atoms joined by a
     /// space.
+    ///
+    /// It also compiles the atoms for the pick list's WORD-START rule
+    /// ([`word_start_hit`](Self::word_start_hit)), each atom's first char a forced
+    /// chunk start and each atom its own smart case. Nothing but that method reads
+    /// it: the filter, [`admits`](Self::admits) and both marking rules stay
+    /// substring.
     pub fn set_atoms(&mut self, atoms: &[&str]) {
         let atoms: Vec<&str> = atoms.iter().copied().filter(|a| !a.is_empty()).collect();
         self.query = atoms.join(" ");
+        self.word_start = WordStartQuery::compile(&atoms);
         self.atom_finders = compile_atoms(atoms);
         self.proximity_window = proximity_window(self.query.len());
     }
@@ -777,14 +945,24 @@ impl SearchIndex {
     /// Membership only: it marks nothing. Which chars matched is
     /// [`match_indices`](Self::match_indices)' or
     /// [`atom_match_positions`](Self::atom_match_positions)' question.
+    ///
+    /// A ONE-SHOT convenience over [`admits_with`](Self::admits_with), folding into
+    /// a fresh buffer per call.
     #[must_use]
     pub fn admits(&self, text: &str) -> bool {
-        self.atom_finders.is_empty()
-            || atoms_match(
-                text,
-                &lowercase_preserving_byte_len(text),
-                &self.atom_finders,
-            )
+        self.admits_with(text, &mut MarkScratch::new())
+    }
+
+    /// [`admits`](Self::admits) over a CALLER-OWNED [`MarkScratch`], whose
+    /// lowercased buffer takes the fold — the entry point for a caller asking it of
+    /// many strings in one pass (the pick list's `@` walk), which then allocates
+    /// nothing per string.
+    pub fn admits_with(&self, text: &str, scratch: &mut MarkScratch) -> bool {
+        if self.atom_finders.is_empty() {
+            return true;
+        }
+        fold_lowercase_into(text, &mut scratch.lowered);
+        atoms_match(text, &scratch.lowered, &self.atom_finders)
     }
 
     /// The CHAR indices within `display` that the active query matches — the
@@ -814,7 +992,23 @@ impl SearchIndex {
     /// Returns CHAR indices into `display` (never byte offsets), sorted
     /// ascending and deduplicated. An empty/whitespace query parses to zero
     /// atoms and yields an empty set — nothing to highlight.
+    ///
+    /// A ONE-SHOT convenience over [`match_indices_with`](Self::match_indices_with),
+    /// in the board row's `u32`. `try_from` cannot realistically fail (a row label
+    /// is display-sized); dropping an out-of-range position is the fail-soft way
+    /// to say so.
     pub fn match_indices(&self, display: &str) -> Vec<u32> {
+        self.match_indices_with(display, &mut MarkScratch::new())
+            .into_iter()
+            .filter_map(|pos| u32::try_from(pos).ok())
+            .collect()
+    }
+
+    /// [`match_indices`](Self::match_indices) over a CALLER-OWNED [`MarkScratch`] —
+    /// the entry point for a caller marking many labels in one pass (the pick
+    /// list's rows), which then allocates only the answer per label. The same
+    /// rule: the scratch decides who owns the buffers, never what is marked.
+    pub fn match_indices_with(&self, display: &str, scratch: &mut MarkScratch) -> Vec<usize> {
         // No atoms => empty/whitespace query: nothing is highlighted.
         if self.atom_finders.is_empty() {
             return Vec::new();
@@ -822,17 +1016,13 @@ impl SearchIndex {
         // The WHOLE-STRING gate is the filter's own predicate, so it folds the
         // way the label arm that admitted the row does. One atom missing from
         // `display` means no highlight at all, even where the others land.
-        if !self.admits(display) {
+        if !self.admits_with(display, scratch) {
             return Vec::new();
         }
         // Past the gate, WHICH chars is the per-atom question, and the preview's
-        // seam already answers it in ascending, deduplicated CHAR positions.
-        // `try_from` cannot realistically fail (a row label is display-sized);
-        // dropping an out-of-range position is the fail-soft way to say so.
-        self.atom_match_positions(display)
-            .into_iter()
-            .filter_map(|pos| u32::try_from(pos).ok())
-            .collect()
+        // seam already answers it in ascending, deduplicated CHAR positions. The
+        // gate left `display`'s fold in the scratch, so it is not folded twice.
+        self.mark_folded(display, scratch)
     }
 
     /// The CHAR positions within `text` that the active query's atoms cover — the
@@ -903,17 +1093,25 @@ impl SearchIndex {
         if self.atom_finders.is_empty() || text.is_empty() {
             return Vec::new();
         }
+        // The haystack a case-INSENSITIVE atom searches, folded by the module's ONE
+        // fold. `fold_lowercase_into` clears the buffer first, so a reused scratch
+        // never prepends the previous line.
+        fold_lowercase_into(text, &mut scratch.lowered);
+        self.mark_folded(text, scratch)
+    }
+
+    /// The per-atom marking core behind both rules, over a scratch whose
+    /// `lowered` ALREADY holds `text`'s fold — each caller folded it to ask its own
+    /// question first, so the fold is paid once per string.
+    fn mark_folded(&self, text: &str, scratch: &mut MarkScratch) -> Vec<usize> {
         // Destructured so each buffer is borrowed on its own — the map below is read
         // from `starts` while `marked` is written.
         let MarkScratch {
             marked,
             lowered,
             starts,
+            ..
         } = scratch;
-        // The haystack a case-INSENSITIVE atom searches, folded by the module's ONE
-        // fold. `fold_lowercase_into` clears the buffer first, so a reused scratch
-        // never prepends the previous line.
-        fold_lowercase_into(text, lowered);
         if !any_atom_occurs(text, lowered, &self.atom_finders) {
             return Vec::new();
         }
@@ -965,25 +1163,98 @@ impl SearchIndex {
             .filter_map(|(pos, &hit)| hit.then_some(pos))
             .collect()
     }
+
+    /// Whether the active pick-list query WORD-START matches `name`, and where —
+    /// the pick list's own rule, asked of a candidate the substring parts rejected.
+    ///
+    /// `name` is split into words ([`split_words`]) and the query matches when it
+    /// can be consumed left to right as chunks, each a non-empty PREFIX of a word,
+    /// on words strictly increasing in position (not necessarily adjacent): `calis`
+    /// is `ca` + `lis` in `CategoryListings.tsx`. Smart case is decided PER PART,
+    /// by the substring parts' own rule ([`is_case_sensitive`]): a part holding a
+    /// capital meets the name's cased chars, any other its ONE fold. So `CaLis`
+    /// finds that name too, but never `ClickAwayListener`, whose `Away` its `a`
+    /// would have to meet, while `calis` finds both. A capital, like a part's first
+    /// char, also FORCES a chunk start (see [`WordStartQuery::next_forced`]). Never
+    /// fuzzy: a chunk is a word prefix, so the letters merely occurring in order
+    /// (`contract-alias` holds `c`, `a`, `l`, `i`, `s`) is not a hit.
+    ///
+    /// `None` when no word-start query is compiled — after
+    /// [`set_query`](Self::set_query), or when [`set_atoms`](Self::set_atoms)' atoms
+    /// are outside the rule's bounds ([`WORD_START_MIN_QUERY`],
+    /// [`WORD_START_MAX_QUERY`]) or not ASCII — and for a name it does not match.
+    /// A name's non-ASCII char never matches a query char and no case boundary is
+    /// read at one, so a word that starts with one never takes a chunk.
+    ///
+    /// Three passes, cheapest first, each run only for what the one before let
+    /// through: the query's bytes in order anywhere in the name ([`holds_in_order`],
+    /// a necessary condition), the membership DP over per-word masks
+    /// ([`word_start_reach`]), and, for a hit alone, the ranking DP that picks the
+    /// chunks ([`word_start_rank`]).
+    pub fn word_start_hit(&self, name: &str, scratch: &mut MarkScratch) -> Option<WordStartHit> {
+        let query = self.word_start.as_ref()?;
+        let MarkScratch {
+            lowered,
+            starts,
+            words,
+            reach,
+            ranks,
+            ..
+        } = scratch;
+        fold_lowercase_into(name, lowered);
+        let bytes = NameBytes {
+            cased: name.as_bytes(),
+            folded: lowered.as_bytes(),
+        };
+        if !holds_in_order(query, bytes) {
+            return None;
+        }
+        split_words(name.as_bytes(), words);
+        word_start_reach(query, bytes, words, reach);
+        if reach[0] & 1 == 0 {
+            return None;
+        }
+        let (at_name_start, (count, last_word), mut marks) =
+            word_start_rank(query, bytes, words, ranks)?;
+        if !name.is_ascii() {
+            // A chunk byte matched an ASCII query byte, so it starts a char of its
+            // own: its CHAR position is how many chars start before it.
+            char_starts_into(name, starts);
+            for mark in &mut marks {
+                *mark = starts.partition_point(|&start| start < *mark);
+            }
+        }
+        Some(WordStartHit {
+            at_name_start,
+            chunks: count,
+            skipped: last_word + 1 - count,
+            marks,
+        })
+    }
 }
 
-/// The working buffers one line's marking needs, owned by the CALLER so a pane's
-/// worth of lines allocates them once instead of once per line.
+/// The working buffers the per-string seams need, owned by the CALLER so a pass
+/// over many strings — a pane's worth of lines, the pick list's `@` walk —
+/// allocates them once instead of once per string.
 ///
-/// [`SearchIndex::atom_match_positions_with`] marks through these three: a flag per
-/// CHAR of the line, the line's lowercased sibling (the haystack a case-insensitive
-/// atom searches), and — for non-ASCII text only — the byte -> char map. The
-/// preview asks for marks once per rendered line, so allocating them per call put
-/// three allocations on every line of a pane that is overwhelmingly lines the query
-/// is not in.
+/// [`SearchIndex::atom_match_positions_with`] marks through three of them: a flag
+/// per CHAR of the line, the line's lowercased sibling (the haystack a
+/// case-insensitive atom searches), and — for non-ASCII text only — the byte ->
+/// char map. The preview asks for marks once per rendered line, so allocating them
+/// per call put three allocations on every line of a pane that is overwhelmingly
+/// lines the query is not in. [`SearchIndex::admits_with`] and
+/// [`SearchIndex::match_indices_with`] fold into the same lowercased buffer, and
+/// [`SearchIndex::word_start_hit`] adds the name's words and its two DP tables.
 ///
-/// It carries NO state between lines, and must not start to. Every buffer is reset
-/// against the line being marked BEFORE anything reads it — `lowered` by the fold,
-/// `marked` by a `clear` + `resize`, `starts` by [`char_starts_into`] — so the
-/// answer for a line never depends on which line ran before it, and marking through
-/// a reused scratch and through a fresh one are the same function. That equivalence
+/// It carries NO state between strings, and must not start to. Every buffer is
+/// reset against the string being asked about BEFORE anything reads it — `lowered`
+/// by the fold, `marked` by a `clear` + `resize`, `starts` by [`char_starts_into`],
+/// `words` by [`split_words`], `reach` and `ranks` by their DP — so the answer for
+/// a string never depends on which string ran before it, and asking through a
+/// reused scratch and through a fresh one are the same function. That equivalence
 /// is what makes this a pure performance detail; it is pinned by
-/// `a_reused_scratch_marks_each_line_as_a_fresh_one_would`.
+/// `a_reused_scratch_marks_each_line_as_a_fresh_one_would` and
+/// `a_reused_scratch_answers_every_pick_list_question_as_a_fresh_one_would`.
 pub struct MarkScratch {
     /// One flag per CHAR of the line being marked — the union of every atom's runs.
     marked: Vec<bool>,
@@ -992,6 +1263,14 @@ pub struct MarkScratch {
     /// The byte offset of each CHAR of the line. Filled only for text that needs
     /// it: an ASCII line takes [`CharMap::Ascii`] and never touches this.
     starts: Vec<usize>,
+    /// A name's words as byte ranges, for the word-start rule ([`split_words`]).
+    words: Vec<(usize, usize)>,
+    /// The word-start membership DP's masks, one per word plus the end
+    /// ([`word_start_reach`]).
+    reach: Vec<u64>,
+    /// The word-start ranking DP's table, one cell per (word, query position)
+    /// ([`word_start_rank`]).
+    ranks: Vec<Option<ChunkCost>>,
 }
 
 impl Default for MarkScratch {
@@ -1012,6 +1291,9 @@ impl MarkScratch {
             marked: Vec::new(),
             lowered: String::new(),
             starts: Vec::new(),
+            words: Vec::new(),
+            reach: Vec::new(),
+            ranks: Vec::new(),
         }
     }
 }
@@ -1215,14 +1497,18 @@ fn lowercase_preserving_byte_len(text: &str) -> String {
 /// which is what keeps the `İ` and word-final-sigma behaviour described above
 /// exactly as it is.
 ///
+/// That arm copies the text and lowercases the copy in place
+/// ([`str::make_ascii_lowercase`], the same per-byte rule) rather than pushing one
+/// `char` at a time: measured 2026-10-19 (release build, Apple M4 Max) over 25,000
+/// walk paths of ~70 bytes, 0.23 ms against 1.2 ms. The compose pick list folds
+/// every path of an `@` walk, more than once, on every keystroke.
+///
 /// The buffer is CLEARED first, so a reused one never prepends the previous text.
 fn fold_lowercase_into(text: &str, out: &mut String) {
     out.clear();
     if text.is_ascii() {
-        out.extend(
-            text.bytes()
-                .map(|byte| char::from(byte.to_ascii_lowercase())),
-        );
+        out.push_str(text);
+        out.make_ascii_lowercase();
         return;
     }
     for ch in text.chars() {
@@ -1502,6 +1788,186 @@ fn char_span(starts: &[usize], start: usize, end: usize) -> Range<usize> {
 fn char_starts_into(text: &str, out: &mut Vec<usize>) {
     out.clear();
     out.extend(text.char_indices().map(|(byte, _)| byte));
+}
+
+/// `(chunks, last word)` of one word-start decomposition: how many chunks, and the
+/// index of the word the last one sits on. Compared as a tuple: fewer chunks, then
+/// an earlier last word — which, for the same chunk count, is fewer skipped words
+/// (`last word + 1 - chunks`).
+type ChunkCost = (usize, usize);
+
+/// Whether the query's bytes occur in `name` in order, not necessarily adjacent,
+/// each met in the form its part reads ([`WordStartQuery::haystack`]) — the
+/// word-start rule's cheap NECESSARY condition: every chunk is taken left to
+/// right, so a name that fails this has no hit and no DP runs.
+fn holds_in_order(query: &WordStartQuery, name: NameBytes<'_>) -> bool {
+    let mut at = 0;
+    for offset in 0..name.cased.len() {
+        if at == query.bytes.len() {
+            return true;
+        }
+        if query.haystack(name, at)[offset] == query.bytes[at] {
+            at += 1;
+        }
+    }
+    at == query.bytes.len()
+}
+
+/// The words of `name` (its CASED bytes) as byte ranges, written into a
+/// caller-owned buffer, which is cleared first. A word ends at a
+/// [`WORD_SEPARATORS`] byte; at a lowercase letter or digit followed by an
+/// uppercase one (`category|Listings`, `v2|Api`); and before the last capital of
+/// an uppercase run that a lowercase letter follows (`HTML|Parser`). A non-ASCII
+/// byte is neither case, so no boundary is read at one.
+fn split_words(name: &[u8], out: &mut Vec<(usize, usize)>) {
+    out.clear();
+    let mut start = None;
+    for (at, &byte) in name.iter().enumerate() {
+        if WORD_SEPARATORS.contains(&byte) {
+            if let Some(word) = start.take() {
+                out.push((word, at));
+            }
+            continue;
+        }
+        let Some(word) = start else {
+            start = Some(at);
+            continue;
+        };
+        // `at > word`, so `at - 1` is in this word: never a separator.
+        let previous = name[at - 1];
+        let upper = byte.is_ascii_uppercase();
+        let hump = upper && (previous.is_ascii_lowercase() || previous.is_ascii_digit());
+        let acronym_end = upper
+            && previous.is_ascii_uppercase()
+            && name.get(at + 1).is_some_and(u8::is_ascii_lowercase);
+        if hump || acronym_end {
+            out.push((word, at));
+            start = Some(at);
+        }
+    }
+    if let Some(word) = start {
+        out.push((word, name.len()));
+    }
+}
+
+/// The longest chunk of `query` from position `at` that is a prefix of `word` (a
+/// byte range of `name`), cut at the next forced chunk start; 0 when the word does
+/// not start with the query's byte there.
+fn chunk_len(
+    query: &WordStartQuery,
+    name: NameBytes<'_>,
+    (start, end): (usize, usize),
+    at: usize,
+) -> usize {
+    let cap = (end - start).min(query.next_forced[at] - at);
+    // Every part's first byte is a forced start, so the chunk stays inside the part
+    // at `at`, and that part's case decides the form for all of it.
+    query.haystack(name, at)[start..start + cap]
+        .iter()
+        .zip(&query.bytes[at..])
+        .take_while(|(name, wanted)| name == wanted)
+        .count()
+}
+
+/// The word-start MEMBERSHIP DP, bottom-up over `words`, into a caller-owned
+/// buffer: bit `i` of `reach[k]` is set when the query from position `i` can be
+/// consumed by chunks on words `k..`, so a name matches when bit 0 of `reach[0]` is.
+/// Bit `len` (nothing left to consume) is set in every mask. A chunk of length `l`
+/// from `i` on word `k` needs bit `i + l` of `reach[k + 1]`, so every length the
+/// word allows is ONE mask test: O(words × query) chunk tests, never a search over
+/// the ways to split the query.
+fn word_start_reach(
+    query: &WordStartQuery,
+    name: NameBytes<'_>,
+    words: &[(usize, usize)],
+    reach: &mut Vec<u64>,
+) {
+    let len = query.bytes.len();
+    reach.clear();
+    reach.resize(words.len() + 1, 1u64 << len);
+    for k in (0..words.len()).rev() {
+        let next = reach[k + 1];
+        // Skipping word `k` keeps everything the words after it reach.
+        let mut here = next;
+        for at in 0..len {
+            if here & (1u64 << at) != 0 {
+                continue;
+            }
+            let chunk = chunk_len(query, name, words[k], at);
+            // Bits `at + 1 ..= at + chunk`: every chunk length the word allows.
+            if chunk > 0 && next & (((1u64 << chunk) - 1) << (at + 1)) != 0 {
+                here |= 1u64 << at;
+            }
+        }
+        reach[k] = here;
+    }
+}
+
+/// The word-start RANKING DP, run for a hit alone, into a caller-owned table:
+/// `ranks[k * (len + 1) + i]` is the lowest [`ChunkCost`] consuming the query from
+/// `i` on words `k..`, `None` where nothing can. A name whose FIRST word can take
+/// the first chunk is ranked on its best decomposition that starts there — a
+/// name-start hit outranks every other, so that is the one it is shown by — and
+/// every other name on its best overall.
+///
+/// Returns whether the chunks start at the first word, their cost, and the BYTE
+/// positions they cover, ascending: where several decompositions tie, the earliest
+/// word that can take a chunk takes it, and the longest chunk it can. `None` only
+/// if the table disagreed with the membership DP — fail-soft, never a panic.
+fn word_start_rank(
+    query: &WordStartQuery,
+    name: NameBytes<'_>,
+    words: &[(usize, usize)],
+    ranks: &mut Vec<Option<ChunkCost>>,
+) -> Option<(bool, ChunkCost, Vec<usize>)> {
+    let len = query.bytes.len();
+    let width = len + 1;
+    ranks.clear();
+    ranks.resize((words.len() + 1) * width, None);
+    // The cost of a chunk of `chunk` bytes from `at` on word `k`, then the rest of
+    // the query on the words after it.
+    let take = |ranks: &[Option<ChunkCost>], k: usize, at: usize, chunk: usize| {
+        if at + chunk == len {
+            Some((1, k))
+        } else {
+            ranks[(k + 1) * width + at + chunk].map(|(chunks, last)| (chunks + 1, last))
+        }
+    };
+    for k in (0..words.len()).rev() {
+        for at in 0..len {
+            let skip = ranks[(k + 1) * width + at];
+            let best = (1..=chunk_len(query, name, words[k], at))
+                .filter_map(|chunk| take(ranks, k, at, chunk))
+                .chain(skip)
+                .min();
+            ranks[k * width + at] = best;
+        }
+    }
+    let first_word = words.first().and_then(|&word| {
+        (1..=chunk_len(query, name, word, 0))
+            .filter_map(|chunk| take(ranks, 0, 0, chunk))
+            .min()
+    });
+    let at_name_start = first_word.is_some();
+    let cost = first_word.or(ranks[0])?;
+
+    let mut marks = Vec::new();
+    let (mut k, mut at, mut wanted) = (0, 0, cost);
+    while at < len {
+        let &word = words.get(k)?;
+        // Word `k` takes a chunk when one reaches the cost still wanted; otherwise
+        // that cost comes from skipping it.
+        let chunk = (1..=chunk_len(query, name, word, at))
+            .rev()
+            .find(|&chunk| take(ranks, k, at, chunk) == Some(wanted));
+        if let Some(chunk) = chunk {
+            marks.extend(word.0..word.0 + chunk);
+            at += chunk;
+            wanted.0 -= 1;
+        }
+        k += 1;
+    }
+    Some((at_name_start, cost, marks))
 }
 
 /// One-shot substring filter: match `sessions` against `query` in `mode`.
@@ -2157,6 +2623,609 @@ mod tests {
         assert!(
             atoms_for(&[]).admits("anything") && atoms_for(&[""]).admits("anything"),
             "no atoms admit every string, as the empty query does"
+        );
+    }
+
+    // --- the pick list's WORD-START rule ------------------------------------
+
+    /// An index whose query is `atoms`, the way the pick list compiles a token.
+    fn word_start_index(atoms: &[&str]) -> SearchIndex {
+        let mut index = SearchIndex::new();
+        index.set_atoms(atoms);
+        index
+    }
+
+    /// The word-start hit of `atoms` in `name`, through a fresh scratch.
+    fn word_start(atoms: &[&str], name: &str) -> Option<WordStartHit> {
+        word_start_index(atoms).word_start_hit(name, &mut MarkScratch::new())
+    }
+
+    /// `name`'s words as text.
+    fn words_of(name: &str) -> Vec<&str> {
+        let mut words = Vec::new();
+        split_words(name.as_bytes(), &mut words);
+        words
+            .into_iter()
+            .map(|(start, end)| &name[start..end])
+            .collect()
+    }
+
+    #[test]
+    fn a_name_splits_into_words_at_separators_humps_and_acronym_ends() {
+        assert_eq!(words_of("categoryListings"), ["category", "Listings"]);
+        assert_eq!(words_of("CategoryListings"), ["Category", "Listings"]);
+        assert_eq!(words_of("HTMLParser"), ["HTML", "Parser"]);
+        assert_eq!(words_of("useURLState.ts"), ["use", "URL", "State", "ts"]);
+        assert_eq!(
+            words_of("ABC"),
+            ["ABC"],
+            "an uppercase run alone is one word"
+        );
+        assert_eq!(words_of("ABCd"), ["AB", "Cd"]);
+        assert_eq!(
+            words_of("my-file_name.test.tsx"),
+            ["my", "file", "name", "test", "tsx"]
+        );
+        assert_eq!(words_of("v2Api/ABC def"), ["v2", "Api", "ABC", "def"]);
+        assert_eq!(
+            words_of("page2Header"),
+            ["page2", "Header"],
+            "a digit then a capital is a hump; a letter then a digit is not"
+        );
+        assert_eq!(
+            words_of("--a__b.."),
+            ["a", "b"],
+            "a separator run is one break"
+        );
+        assert_eq!(
+            words_of("ÜberParser"),
+            ["Über", "Parser"],
+            "a non-ASCII byte is neither case, so it reads no boundary"
+        );
+        assert!(words_of("").is_empty() && words_of("-._/ ").is_empty());
+    }
+
+    /// The reported shape: `calis` and `CaLis` find `CategoryListings.tsx` as
+    /// `ca` + `lis`, marked on those chars, while names that merely hold the
+    /// letters in order, or hold them out of order, are not hits.
+    #[test]
+    fn a_query_matches_as_word_prefix_chunks_in_order() {
+        let name = "CategoryListings.tsx";
+        for atoms in [&["calis"][..], &["CaLis"], &["ca", "lis"], &["Ca", "Lis"]] {
+            assert_eq!(
+                word_start(atoms, name),
+                Some(WordStartHit {
+                    at_name_start: true,
+                    chunks: 2,
+                    skipped: 0,
+                    marks: vec![0, 1, 8, 9, 10],
+                }),
+                "{atoms:?} over {name}"
+            );
+        }
+        for atoms in [&["calis"][..], &["CaLis"]] {
+            assert_eq!(
+                word_start(atoms, "contract-alias"),
+                None,
+                "the letters in order are not a hit: no word starts with `lis` ({atoms:?})"
+            );
+        }
+        assert_eq!(
+            word_start(&["lisca"], name),
+            None,
+            "chunks take words in order"
+        );
+        assert_eq!(word_start(&["calis"], "Calendar.tsx"), None);
+        assert_eq!(
+            word_start(&["catx"], name),
+            None,
+            "a chunk never runs past its word"
+        );
+        assert_eq!(
+            word_start(&["calis"], "CalendarListings.tsx").map(|hit| hit.marks),
+            Some(vec![0, 1, 8, 9, 10]),
+            "`cal` would fit `Calendar` and leave `is` with no word; `ca` + `lis` is found"
+        );
+        assert!(word_start(&["htpa"], "HTMLParser").is_some(), "`ht` + `pa`");
+        assert_eq!(
+            word_start(&["HTPa"], "HTMLParser"),
+            None,
+            "a capital forces a chunk start, so `HTPa` is never `HT` + `Pa`: no word starts with `T`"
+        );
+        assert!(
+            word_start(&["calis"], "Cal-Is.ts").is_some(),
+            "`cal` + `is`"
+        );
+        assert_eq!(
+            word_start(&["ca", "lis"], "Cal-Is.ts"),
+            None,
+            "a part's first char forces a chunk start, so `ca-lis` is never `cal` + `is`"
+        );
+        assert!(
+            word_start(&["calis"], "categorylistings.tsx").is_none(),
+            "one lowercase word has no `lis` word to start"
+        );
+    }
+
+    /// Smart case is decided PER PART, as the substring parts decide it: a part
+    /// holding a capital meets the name's letters exactly, any other in any case.
+    /// So `CaLis` finds `CategoryListings.tsx` but never `ClickAwayListener`, whose
+    /// `Away` its `a` would have to meet, while `calis` finds both.
+    #[test]
+    fn a_part_holding_a_capital_matches_its_word_starts_exactly() {
+        for name in [
+            "CategoryListings.tsx",
+            "categoryListings.tsx",
+            "ClickAwayListener",
+        ] {
+            assert!(word_start(&["calis"], name).is_some(), "calis over {name}");
+        }
+        assert!(word_start(&["CaLis"], "CategoryListings.tsx").is_some());
+        for name in [
+            "categoryListings.tsx",
+            "ClickAwayListener",
+            "CategoryLISTINGS.tsx",
+        ] {
+            assert_eq!(word_start(&["CaLis"], name), None, "CaLis over {name}");
+        }
+        assert_eq!(
+            word_start(&["Ca"], "cat.rs"),
+            None,
+            "`C` meets a capital alone"
+        );
+        assert!(word_start(&["Ca"], "Cat.rs").is_some());
+        // `Cat-lis`: `Cat` exact, `lis` in any case.
+        for name in [
+            "CategoryListings.tsx",
+            "CategoryLISTINGS.tsx",
+            "Category-listings.tsx",
+        ] {
+            assert!(
+                word_start(&["Cat", "lis"], name).is_some(),
+                "Cat-lis over {name}"
+            );
+        }
+        for name in ["categoryListings.tsx", "CATEGORYListings.tsx"] {
+            assert_eq!(
+                word_start(&["Cat", "lis"], name),
+                None,
+                "Cat-lis over {name}"
+            );
+        }
+        assert!(word_start(&["cat", "Lis"], "categoryListings.tsx").is_some());
+        assert_eq!(word_start(&["cat", "Lis"], "CategoryLISTINGS.tsx"), None);
+    }
+
+    /// Fewest chunks first, then fewest skipped words — the OPTIMUM, which taking
+    /// the longest chunk at each word would miss: `abc` then `d`, `e` is three
+    /// chunks where `ab` then `cde` is two. A name whose first word can take the
+    /// first chunk is shown by its best decomposition from there.
+    #[test]
+    fn the_chunks_are_the_fewest_then_the_least_scattered() {
+        let hit = word_start(&["abcde"], "abc-d-e-cde").expect("a hit");
+        assert_eq!(
+            (hit.chunks, hit.skipped, hit.marks),
+            (2, 2, vec![0, 1, 8, 9, 10]),
+            "`ab` + `cde`, skipping `d` and `e`"
+        );
+        let click = word_start(&["calis"], "ClickAwayListener").expect("a hit");
+        assert_eq!(
+            (click.at_name_start, click.chunks, click.skipped),
+            (true, 3, 0),
+            "`c` + `a` + `lis`"
+        );
+        let scattered = word_start(&["calis"], "CategoryFooListings").expect("a hit");
+        assert_eq!((scattered.chunks, scattered.skipped), (2, 1));
+        let later = word_start(&["calis"], "MyCategoryListings").expect("a hit");
+        assert_eq!(
+            (later.at_name_start, later.chunks, later.skipped),
+            (false, 2, 1),
+            "a leading word with no chunk is skipped too"
+        );
+        let anchored = word_start(&["ab"], "ax-b-ab").expect("a hit");
+        assert_eq!(
+            (anchored.at_name_start, anchored.chunks, anchored.marks),
+            (true, 2, vec![0, 3]),
+            "`a` + `b` from the first word, though `ab` alone is one chunk later"
+        );
+        // Ties are marked one way: the longest chunk, on the earliest word.
+        assert_eq!(
+            word_start(&["aaa"], "aa-aa").map(|hit| hit.marks),
+            Some(vec![0, 1, 3]),
+            "`aa` + `a`, never `a` + `aa`"
+        );
+        assert_eq!(
+            word_start(&["ab"], "a-a-b").map(|hit| hit.marks),
+            Some(vec![0, 4]),
+            "the first `a`, never the second"
+        );
+    }
+
+    /// Marks are CHAR positions, so a non-ASCII char before a chunk counts once.
+    #[test]
+    fn word_start_marks_are_char_positions() {
+        assert_eq!(
+            word_start(&["calis"], "ÜberCategoryListings.tsx"),
+            Some(WordStartHit {
+                at_name_start: false,
+                chunks: 2,
+                skipped: 1,
+                marks: vec![4, 5, 12, 13, 14],
+            })
+        );
+        assert!(word_start(&["fb"], "fooBar").is_some());
+        assert_eq!(
+            word_start(&["fb"], "fooÜBar"),
+            None,
+            "no case boundary is read at a non-ASCII char, so `Bar` is no word there"
+        );
+    }
+
+    /// A one-char query never runs the rule, and loses no hit by it: its only
+    /// chunk is a word's first letter met in its part's case, and the substring
+    /// match, under the same per-part case, already admits every name holding that
+    /// letter.
+    #[test]
+    fn a_one_char_query_never_runs_word_start() {
+        assert_eq!(word_start(&["C"], "Cat.rs"), None);
+        assert_eq!(word_start(&["c"], "cat.rs"), None);
+        assert!(
+            word_start(&["ca"], "cat.rs").is_some(),
+            "two chars do run it, so the two above are the bound's doing"
+        );
+        let mut hits = 0;
+        for name in [
+            "cat.rs",
+            "Cat.rs",
+            "CategoryListings.tsx",
+            "HTMLParser",
+            "my-file_name.ts",
+        ] {
+            for query in ["c", "C", "l", "L", "t", "T", "p", "P", "-"] {
+                if brute_force_decompositions(&[query], name).is_empty() {
+                    continue;
+                }
+                hits += 1;
+                assert!(
+                    word_start_index(&[query]).admits(name),
+                    "{query:?} word-starts {name:?}, which the substring match rejects"
+                );
+            }
+        }
+        assert!(hits > 5, "the premise: one-char hits exist, {hits}");
+    }
+
+    /// The DP's `u64` mask holds a query of up to 63 chars (one bit per position
+    /// plus the end); a longer one is substring alone, and so is a non-ASCII one. A
+    /// part that keeps a separator never matches: no word holds one.
+    #[test]
+    fn the_word_start_rule_is_bounded_by_the_dp_mask_and_ascii() {
+        let mask_width = u64::BITS as usize;
+        let name = "a".repeat(mask_width);
+        let longest = "a".repeat(mask_width - 1);
+        assert!(word_start(&[&longest], &name).is_some());
+        assert_eq!(word_start(&[&format!("{longest}a")], &name), None);
+        assert_eq!(word_start(&["cä"], "cäse.txt"), None, "a non-ASCII query");
+        assert_eq!(
+            word_start(&[".env"], "env.example"),
+            None,
+            "a dot-name's leading `.` asks for a dot no word holds"
+        );
+        assert_eq!(
+            word_start(&["--"], "a--b"),
+            None,
+            "nor a token of separators"
+        );
+    }
+
+    /// The board never takes the rule: `set_query` compiles no word-start form, and
+    /// with one compiled the filter, `admits` and both marking rules stay
+    /// substring — only `word_start_hit` reads it.
+    #[test]
+    fn word_start_never_reaches_the_board_filter() {
+        let sessions = [session("s0", "CategoryListings.tsx", "")];
+        let mut index = SearchIndex::build(&sessions);
+        index.set_query("calis");
+        assert!(index.results().is_empty());
+        assert_eq!(
+            index.word_start_hit("CategoryListings.tsx", &mut MarkScratch::new()),
+            None,
+            "the search box's query never compiles the rule"
+        );
+
+        index.set_atoms(&["calis"]);
+        assert!(
+            index
+                .word_start_hit("CategoryListings.tsx", &mut MarkScratch::new())
+                .is_some(),
+            "the premise: these atoms DO word-start match the label"
+        );
+        assert!(index.results().is_empty(), "the filter stays substring");
+        index.set_mode(SearchMode::NameAndContent);
+        assert!(index.results().is_empty());
+        assert!(!index.admits("CategoryListings.tsx"));
+        assert!(index.match_indices("CategoryListings.tsx").is_empty());
+        assert!(index
+            .atom_match_positions("CategoryListings.tsx")
+            .is_empty());
+
+        index.set_query("calis");
+        assert_eq!(
+            index.word_start_hit("CategoryListings.tsx", &mut MarkScratch::new()),
+            None,
+            "a later `set_query` clears what `set_atoms` compiled"
+        );
+    }
+
+    /// ONE scratch asked every pick-list question, string after string, answers
+    /// each as a fresh scratch would: the buffers decide who owns the memory,
+    /// never the answer.
+    #[test]
+    fn a_reused_scratch_answers_every_pick_list_question_as_a_fresh_one_would() {
+        let texts = [
+            "apps/mono/src/modules/ProductPages/CategoryListings/CategoryListings.tsx",
+            "CategoryListings.tsx",
+            "ÜberCategoryListings.tsx",
+            "x",
+            "",
+            "ClickAwayListener",
+            "MyCategoryListings",
+            "contract-alias",
+            "café ☕ Calis notes",
+        ];
+        for atoms in [
+            &["calis"][..],
+            &["CaLis"],
+            &["ca", "lis"],
+            &["Ca"],
+            &["Cat", "lis"],
+        ] {
+            let index = word_start_index(atoms);
+            let mut reused = MarkScratch::new();
+            for order in [false, true] {
+                let mut texts = texts.to_vec();
+                if order {
+                    texts.reverse();
+                }
+                for text in texts {
+                    assert_eq!(
+                        index.admits_with(text, &mut reused),
+                        index.admits(text),
+                        "admits {atoms:?} {text:?}"
+                    );
+                    assert_eq!(
+                        index
+                            .match_indices_with(text, &mut reused)
+                            .into_iter()
+                            .map(|pos| u32::try_from(pos).expect("a short text"))
+                            .collect::<Vec<_>>(),
+                        index.match_indices(text),
+                        "match_indices {atoms:?} {text:?}"
+                    );
+                    assert_eq!(
+                        index.word_start_hit(text, &mut reused),
+                        index.word_start_hit(text, &mut MarkScratch::new()),
+                        "word_start_hit {atoms:?} {text:?}"
+                    );
+                }
+            }
+        }
+        // Premises: each question has both answers over this corpus.
+        let index = word_start_index(&["calis"]);
+        assert!(index.admits("café ☕ Calis notes") && !index.admits("CategoryListings.tsx"));
+        assert!(index
+            .word_start_hit("CategoryListings.tsx", &mut MarkScratch::new())
+            .is_some());
+        assert!(index
+            .word_start_hit("contract-alias", &mut MarkScratch::new())
+            .is_none());
+    }
+
+    /// Whether a name byte `got` meets a query byte `wanted` under the oracle's own
+    /// smart case: exactly for a part holding an ASCII capital, else ignoring
+    /// ASCII case.
+    fn oracle_meets(exact: bool, got: u8, wanted: u8) -> bool {
+        if exact {
+            got == wanted
+        } else {
+            got.eq_ignore_ascii_case(&wanted)
+        }
+    }
+
+    /// `atoms` as the oracle reads them: per query byte, the byte, whether a chunk
+    /// must start there (a part's first byte, a capital), and whether its part
+    /// holds a capital and so matches exactly.
+    fn oracle_query(atoms: &[&str]) -> Vec<(u8, bool, bool)> {
+        let mut query = Vec::new();
+        for atom in atoms {
+            let exact = atom.bytes().any(|byte| byte.is_ascii_uppercase());
+            for (at, byte) in atom.bytes().enumerate() {
+                query.push((byte, at == 0 || byte.is_ascii_uppercase(), exact));
+            }
+        }
+        query
+    }
+
+    /// The ORACLE for the word-start DPs: every decomposition of the query into
+    /// word-prefix chunks, enumerated by brute force, as `(first chunk's word,
+    /// chunks, last chunk's word)`. Exponential, and fine on test-sized names.
+    fn brute_force_decompositions(atoms: &[&str], name: &str) -> Vec<(usize, usize, usize)> {
+        let query = oracle_query(atoms);
+        let mut words = Vec::new();
+        split_words(name.as_bytes(), &mut words);
+
+        fn extend(
+            query: &[(u8, bool, bool)],
+            name: &[u8],
+            words: &[(usize, usize)],
+            (at, from_word): (usize, usize),
+            (first, chunks): (Option<usize>, usize),
+            out: &mut Vec<(usize, usize, usize)>,
+        ) {
+            for (k, &(start, end)) in words.iter().enumerate().skip(from_word) {
+                for len in 1..=(end - start).min(query.len() - at) {
+                    let (wanted, forced, exact) = query[at + len - 1];
+                    // A chunk byte must match, and only its first may be forced.
+                    if !oracle_meets(exact, name[start + len - 1], wanted) || (len > 1 && forced) {
+                        break;
+                    }
+                    let first = first.unwrap_or(k);
+                    if at + len == query.len() {
+                        out.push((first, chunks + 1, k));
+                    } else {
+                        extend(
+                            query,
+                            name,
+                            words,
+                            (at + len, k + 1),
+                            (Some(first), chunks + 1),
+                            out,
+                        );
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        extend(&query, name.as_bytes(), &words, (0, 0), (None, 0), &mut out);
+        out
+    }
+
+    /// A deterministic xorshift64* stream for generated cases.
+    struct CaseRng(u64);
+
+    impl CaseRng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            (self.0.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 33) as usize % n
+        }
+    }
+
+    /// The membership DP, the ranking DP and the marks agree with the brute-force
+    /// oracle over generated names and queries — hits and misses, name-start and
+    /// later, one chunk and many, forced starts and free ones, exact-case parts and
+    /// any-case ones.
+    #[test]
+    fn the_word_start_dps_agree_with_brute_force() {
+        const WORDS: [&str; 12] = [
+            "cat", "category", "ca", "list", "listings", "lis", "a", "ab", "abc", "bcd", "map", "c",
+        ];
+        const SEPARATORS: [&str; 5] = ["", "-", "_", ".", "/"];
+        let mut rng = CaseRng(0x9E37_79B9_7F4A_7C15);
+        let (mut hits, mut misses, mut name_starts, mut many_chunks, mut exact_hits) =
+            (0, 0, 0, 0, 0);
+        for _ in 0..600 {
+            let mut name = String::new();
+            for word_index in 0..1 + rng.below(4) {
+                let word = WORDS[rng.below(WORDS.len())];
+                if word_index > 0 {
+                    name.push_str(SEPARATORS[rng.below(SEPARATORS.len())]);
+                }
+                // Capitalise, upper-case or keep the word, so humps and acronyms occur.
+                match rng.below(3) {
+                    0 => name.push_str(&word.to_ascii_uppercase()),
+                    1 => {
+                        name.push_str(&word[..1].to_ascii_uppercase());
+                        name.push_str(&word[1..]);
+                    }
+                    _ => name.push_str(word),
+                }
+            }
+            let letters: Vec<u8> = name
+                .bytes()
+                .filter(|byte| !WORD_SEPARATORS.contains(byte))
+                .collect();
+            let words = words_of(&name);
+            for case in 0..12 {
+                let mut query = String::new();
+                if case % 2 == 0 {
+                    // The name's letters in order, skipping some: mostly near misses.
+                    let mut at = rng.below(letters.len().max(1));
+                    while query.len() < 2 + rng.below(5) && at < letters.len() {
+                        query.push(char::from(letters[at]));
+                        at += 1 + rng.below(3);
+                    }
+                } else {
+                    // Prefixes of some of its words in order: mostly hits.
+                    for word in &words {
+                        if rng.below(3) > 0 {
+                            query.push_str(&word[..1 + rng.below(word.len().min(3))]);
+                        }
+                    }
+                }
+                // Typed as the name spells it, lowered, or re-cased at random: a
+                // capital makes its part exact and moves the forced starts.
+                let query: String = match rng.below(3) {
+                    0 => query,
+                    1 => query.to_ascii_lowercase(),
+                    _ => query
+                        .chars()
+                        .map(|c| {
+                            if rng.below(4) == 0 {
+                                c.to_ascii_uppercase()
+                            } else {
+                                c.to_ascii_lowercase()
+                            }
+                        })
+                        .collect(),
+                };
+                if query.len() < WORD_START_MIN_QUERY {
+                    continue;
+                }
+                // Sometimes two parts, as `@ca-lis` hands them in.
+                let split = rng.below(query.len());
+                let atoms: Vec<&str> = if split > 0 && rng.below(3) == 0 {
+                    vec![&query[..split], &query[split..]]
+                } else {
+                    vec![&query]
+                };
+
+                let all = brute_force_decompositions(&atoms, &name);
+                let got = word_start(&atoms, &name);
+                let Some(hit) = got else {
+                    assert!(all.is_empty(), "missed {atoms:?} in {name:?}: {all:?}");
+                    misses += 1;
+                    continue;
+                };
+                assert!(!all.is_empty(), "false hit {atoms:?} in {name:?}");
+                hits += 1;
+                let from_first: Vec<_> = all.iter().filter(|d| d.0 == 0).collect();
+                let best = if from_first.is_empty() {
+                    all.iter().map(|&(_, chunks, last)| (chunks, last)).min()
+                } else {
+                    from_first
+                        .iter()
+                        .map(|&&(_, chunks, last)| (chunks, last))
+                        .min()
+                }
+                .expect("a decomposition");
+                assert_eq!(
+                    (hit.at_name_start, hit.chunks, hit.skipped),
+                    (!from_first.is_empty(), best.0, best.1 + 1 - best.0),
+                    "rank of {atoms:?} in {name:?}"
+                );
+                let query = oracle_query(&atoms);
+                assert_eq!(hit.marks.len(), query.len(), "{atoms:?} in {name:?}");
+                for (&pos, &(wanted, _, exact)) in hit.marks.iter().zip(&query) {
+                    assert!(
+                        oracle_meets(exact, name.as_bytes()[pos], wanted),
+                        "the marks spell {atoms:?} in {name:?}, each in its part's case"
+                    );
+                }
+                name_starts += usize::from(hit.at_name_start);
+                many_chunks += usize::from(hit.chunks > 1);
+                exact_hits += usize::from(query.iter().any(|&(_, _, exact)| exact));
+            }
+        }
+        assert!(
+            hits > 1000
+                && misses > 1000
+                && name_starts > 500
+                && many_chunks > 500
+                && exact_hits > 300,
+            "the corpus must exercise every branch: {hits} hits, {misses} misses, \
+             {name_starts} name starts, {many_chunks} multi-chunk, {exact_hits} exact-case"
         );
     }
 

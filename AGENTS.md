@@ -220,7 +220,8 @@ one place.
   a **dev-dependency** and survives ONLY as the test-only parity ORACLE inside that
   same module — NO runtime path may reach it, and nothing outside `mod tests` may
   `use` it. Matching is SUBSTRING, not fuzzy, by the mechanism rather than by a
-  setting. ONE matcher answers everything, under TWO rules. The FILTER answers
+  setting. ONE matcher answers everything, under TWO rules, plus a THIRD,
+  WORD-START, that only the compose pick list reaches (below). The FILTER answers
   MEMBERSHIP with `memchr::memmem`; smart case is decided **PER ATOM**, never per
   query, and each atom searches the cased or lowercased haystack accordingly —
   BOTH haystacks are load-bearing. In `NameAndContent` a MULTI-atom AND is
@@ -229,14 +230,14 @@ one place.
   over the COMBINED label+content string, so a pair straddling that seam
   co-occurs, and its occurrence cap is asked of the ANCHOR (RAREST) atom ALONE. A
   single-atom query and `NameOnly` keep the plain AND. EVERY lowercased string in
-  the module — the filter's haystacks and BOTH marking seams' — is folded by the
-  ONE per-char, byte-length-preserving fold. The ROW-LABEL highlight
-  (`match_indices`) applies the WHOLE-STRING rule over the same finders — EVERY
-  atom in the one string, every occurrence of each marked; the PREVIEW marks apply
-  the PER-ATOM rule (`atom_match_positions`). Never rank the BOARD filter's
-  results: display order is `App::order_filtered`'s alone. The window, the cap and
-  the fold are argued in
-  [DOMAIN.md](docs/agents/DOMAIN.md#content-index-storeparse), the two rules in
+  the module — the filter's haystacks, BOTH marking seams' and the word-start
+  rule's — is folded by the ONE per-char, byte-length-preserving fold. The
+  ROW-LABEL highlight (`match_indices`) applies the WHOLE-STRING rule over the
+  same finders — EVERY atom in the one string, every occurrence of each marked;
+  the PREVIEW marks apply the PER-ATOM rule (`atom_match_positions`). Never rank
+  the BOARD filter's results: display order is `App::order_filtered`'s alone.
+  The window, the cap and the fold are argued in
+  [DOMAIN.md](docs/agents/DOMAIN.md#content-index-storeparse), the rules in
   [PATTERNS.md](docs/agents/PATTERNS.md#4-isolate-volatile-dependencies). The
   compose pick list (`src/tui/complete.rs`) is a consumer of this SAME matcher
   and never matches by itself. It splits its whitespace-free token into PARTS on
@@ -250,8 +251,22 @@ one place.
   the filter's own question, of a candidate's NAME and then its DESCRIPTION —
   never its label — marks the hit with the ROW-LABEL rule (`match_indices`) over
   that same name or description when the list is filtered, never in render, and
-  orders what matches by where it landed (name start, elsewhere in the name,
-  description only), an order that is the pick list's alone.
+  orders what matches by where it landed (name start, elsewhere in the name, a
+  path's folder component, description only — a word-start hit just below the
+  substring hits of its tier), an order that is the pick list's alone. The
+  WORD-START rule (`SearchIndex::word_start_hit`) lives in `src/search.rs` too,
+  and only the pick list reaches it: `set_atoms` ALONE compiles it and nothing
+  else reads it — the filter, `admits` and both marking rules stay substring, so
+  it NEVER reaches the board. The pick list asks it ONLY of an `@` file or
+  folder's own BASENAME in the FOLDER STEP (never the root fallback, a `/`
+  command or an agent), and only once the substring parts rejected that entry:
+  consecutive word-PREFIX chunks of that name, on words in order, never fuzzy.
+  It follows the SAME per-part smart case — a part holding a capital matches
+  exactly, any other through the ONE fold — and a hit marks its chunks, the one
+  row the row-label rule does not mark. Its bounds, tiers and ranking:
+  [DOMAIN.md](docs/agents/DOMAIN.md#how-the-letters-narrow-the-list); the
+  `_with` forms and the caller-owned `MarkScratch` the `@` walk asks through:
+  [PATTERNS.md §4](docs/agents/PATTERNS.md#4-isolate-volatile-dependencies).
   (`src/search.rs`, `src/tui/complete.rs`)
 - **STABLE-ID STATE.** Track selection by `session_id`, never list index, so it
   survives autorefresh reloads. (`src/tui/app.rs`)
