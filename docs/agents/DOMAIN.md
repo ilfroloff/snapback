@@ -390,6 +390,7 @@ never fatal:
 | `origin` | on `type:"user"`, object (fail-soft) | WHO the turn came from, when it was not the person at the keyboard. `kind` is `"peer"`, `"human"` or `"task-notification"`; only a `"peer"` record ever carries `from` (the sending agent) and `body` (its message). A peer record with a NON-EMPTY `body` renders as the preview's collapsible **peer node** and `from` is that node's fold key — see [Peer message node](#peer-message-node-storepreview) |
 | `origin.kind` | on `type:"user"`: `origin` is an object with a string `kind` (fail-soft — see the flag); observed `"human"`, `"task-notification"`, `"peer"`, and very often **absent** | who wrote the record. Ruled on **first** by the [failed-task flag](#failed-background-task-storeparse): `"task-notification"` is a notice, and only an absent `origin` or `"human"` can clear |
 | `isSidechain` | bool (`label::is_sidechain`; non-bool ⇒ `false`) | skip sub-agent turns when picking a label/preview — except that the preview checks the [peer node](#peer-message-node-storepreview) gate FIRST, so a peer record with a body still renders even on a sidechain turn, and a subagent's OWN transcript, drawn in the [subagent view](#delegation-line-and-subagent-view-storepreview), keeps them (every turn there is one); a sub-agent turn neither raises nor clears the [failed-task flag](#failed-background-task-storeparse) |
+| `isApiErrorMessage` | TOP-LEVEL on an `assistant` record, bool (fail-soft: only the JSON `true` counts; any other value, or none, is no failure) | the [subagent record](#subagent-record-and-running-list-storesubagents)'s run-ended rule, in a subagent transcript only: the API error claude writes in the model's place when the call fails ends the run FAILED. Never `message.model`'s `<synthetic>`, which marks claude's other injected records too |
 | `id` on a `tool_use` block in `message.content` | string (fail-soft: absent or non-string ⇒ no join) | the preview's [delegation line](#delegation-line-and-subagent-view-storepreview): the launch whose `id` equals a subagent meta's `toolUseId`. The block's `name` is NEVER read for the join, only for the plain `[tool_use: <name>]` marker a miss keeps |
 | `promptSource` | on `type:"user"`, string (fail-soft); observed `typed`, `sdk`, `system`, `queued` | `typed` / `sdk` mark the USER writing — clears the flag, but is **never read before `origin`** (51 of 169 notices say `sdk` too) |
 | `turnOrigin` | on `type:"user"`, string (fail-soft); observed `human`, `sdk`, `peer`, `task_notification` | `human` / `sdk` mark the user writing — the ONLY marker a quick-reply slash command carries, [from Claude Code 2.1.278 on](#why-turnorigin-counts) |
@@ -2340,8 +2341,9 @@ running list at the foot of the preview, and the session's own title above it.
 It is a
 `subagents::SubagentRecord`: every subagent the session launched, at any depth,
 in launch order, each a `Subagent` carrying its id, `agentType` and description
-(from its meta file), its launch time, its `newest_write` and whether its own
-run `ended`. `App` holds it keyed by the session it was read for, and
+(from its meta file), its launch time, its `newest_write` and whether, and how,
+its own run `ended` (a `subagents::RunVerdict`: open, finished or failed). `App`
+holds it keyed by the session it was read for, and
 `App::selected_subagents` hands it out for that session alone; a record landing
 for a session no longer selected is dropped (`App::apply_subagent_record`). It
 is in memory only.
@@ -2378,30 +2380,38 @@ The read is stat-first, and only that session's `subagents/` dir is read:
 when the read starts mid-file, a line that is not JSON skipped — the ONE fold
 `subagents::RunProgress` over `after_record`, which the subagent view's render
 runs too, below) when its last
-turn is either an assistant `tool_use` of `SubagentHandback` (the `tool_result`
-answering it is not a turn) or a FINAL REPLY: an assistant record holding text
+turn is an assistant `tool_use` of `SubagentHandback` (the `tool_result`
+answering it is not a turn), a FINAL REPLY — an assistant record holding text
 and no `tool_use`, whose `message.stop_reason` is `end_turn` or `stop_sequence`
-(`FINAL_STOP_REASONS`). Text after a hand-back — an assistant record holding text
-and no `tool_use` — keeps the run ended whatever its `stop_reason`, null
-included. Anywhere else, text
+(`FINAL_STOP_REASONS`) — or an API ERROR: an assistant record with no `tool_use`
+flagged `isApiErrorMessage: true`, which claude writes in the model's place when
+the API call fails (a lost login, a dropped connection, a refusal). The first two
+end the run FINISHED (`RunVerdict::Finished`), the API error FAILED
+(`RunVerdict::Failed`). Text after a hand-back — an assistant record holding text
+and no `tool_use`, an API error's included — keeps the run ended, finished,
+whatever its `stop_reason`, null included. The flag is read fail-soft — only the
+JSON `true` counts; any other value, or none, leaves the record to the other
+rules — and ALONE: `<synthetic>`, the model claude stamps on an API error, also
+marks its `No response requested.` records, which fail nothing. Anywhere else, text
 whose `stop_reason` is null, missing or `tool_use` is a turn still being written
 — claude writes a narrated tool call's text ahead of its `tool_use` — so it keeps
 the run open, and so does any later turn: a pending `tool_use` (a sub-subagent
 launch among them), the `tool_result` of an ordinary call, a thinking-only
 record, or any user text (a new prompt, claude's `isMeta` nudge to hand back,
-`[Request interrupted by user]`). A hand-back followed by any of those later
-turns is open again. `attachment` and other record types are not turns, and a
+`[Request interrupted by user]`). A hand-back, a final reply or an API error
+followed by any of those later turns is open again. `attachment` and other record types are not turns, and a
 tail with no complete record reads as not ended.
 `SubagentHandback` is a tool NAME, read for this one question and never for the
 delegation join (which joins by id). The measurements behind the tool name, the
 stop reasons, the window and both byte caps are the doc comments of
 `HANDBACK_TOOL`, `FINAL_STOP_REASONS`, `RUNNING_WINDOW`, `TAIL_MAX_BYTES` and
-`HEAD_MAX_BYTES`; the one behind text after a hand-back sits beside its arm in
-`after_record`.
+`HEAD_MAX_BYTES`; the ones behind text after a hand-back and behind the API
+error flag sit beside their arms in `after_record`.
 
 **Running is worked out at DRAW time** (`subagents::is_running`, pure): a
 subagent runs while its tail was read and it had not ended
-(`ended == Some(false)`) and its `newest_write` lies within `RUNNING_WINDOW` of
+(`ended == Some(RunVerdict::Open)`; a failed run, like a finished one, never runs)
+and its `newest_write` lies within `RUNNING_WINDOW` of
 `App::wall_clock`, the window inclusive and a write after that instant counted as
 recent. `App::wall_clock` is stamped by every `Tick` and every landed record
 (`App::note_wall_clock`, which never steps it back), so neither the draw nor a
@@ -2445,8 +2455,9 @@ entry — the record has not landed or does not list it — the title is
 transcript carries no `ai-title` record (none across a local store,
 2026-10-13). The state is `subagents::SubagentStatus::of` at `App::wall_clock`
 (`App::subagent_view_status`): `running` exactly where `is_running` says so, in
-the running list's green (`view::RUNNING_COLOR`); else `finished` once the run's
-end was read; else `quiet`, in `DarkGray`. The time is
+the running list's green (`view::RUNNING_COLOR`); else `finished` or `failed`
+once the run's end was read, as it was read — `failed` in a failed background
+task's red (`view::FAILED_TASK_COLOR`); else `quiet`, in `DarkGray`. The time is
 `preview::timestamp_annotation`'s, the turn markers' own form, against the wall
 clock's day in the launch time's own offset; the age is the running list's,
 from `newest_write`, with `k/n` from `App::subagent_view_position`. A fact not
@@ -2457,7 +2468,7 @@ border cuts the title at its edge.
 
 **The title's `ended` is the render's.** The record reads a tail only while the
 subagent can be running, so for every older one its `ended` is `None` and
-cannot tell `finished` from `quiet`. The view reads its transcript whole anyway,
+cannot tell `finished` or `failed` from `quiet`. The view reads its transcript whole anyway,
 to render it, so `render_stream` folds the SAME `RunProgress` over every record
 it streams in `RenderMode::Subagent` and keeps the verdict on the render
 (`RenderedPreview::run_ended`; `None` for the session's own render and for the

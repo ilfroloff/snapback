@@ -3152,7 +3152,7 @@ mod tests {
     use crate::search::{filter, SearchMode};
     use crate::store::discover::SubagentTranscript;
     use crate::store::skills::{Listing, ListingEntry};
-    use crate::store::subagents::{Subagent, SubagentRecord};
+    use crate::store::subagents::{RunVerdict, Subagent, SubagentRecord};
     use crate::store::{Reload, Session};
     use crate::tui::app::{
         NewSessionDraft, PaneLayout, Scope, AUTOSCROLL_FRAME, STATUS_DWELL_TICKS,
@@ -8656,7 +8656,7 @@ mod tests {
             description: None,
             launched: Some(OffsetDateTime::from_unix_timestamp(launched).expect("an instant")),
             newest_write: Some(SystemTime::now() - Duration::from_secs(idle_secs)),
-            ended: running.then_some(false),
+            ended: running.then_some(RunVerdict::Open),
         }
     }
 

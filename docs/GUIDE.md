@@ -865,11 +865,12 @@ the first subagent still running, else the one written most recently — and
 pane's title
 names the subagent, so it never passes for your session, and once snapback has
 read the session's subagents it says how that one stands too: what it was asked,
-whether it is **running** (green), **finished**, or **quiet** (gray: not
-finished, but neither it nor a subagent it launched wrote in the last 10
-minutes), when it started — a time on its own today, with the date on another
-day, as a turn's is — how long ago it last wrote, and which one of how many it
-is:
+whether it is **running** (green), **finished**, **failed** (red: an API error,
+such as a lost login or a dropped connection, ended its run), or **quiet** (gray:
+not finished or failed, but neither it nor a subagent it launched wrote in the
+last 10 minutes), when it started — a time on its own today, with the date on
+another day, as a turn's is — how long ago it last wrote, and which one of how
+many it is:
 `subagent @parser-auditor · Audit the parser · finished · started 23:50 · last write 2h ago · 2/5`.
 Whatever snapback doesn't know is left out; on a narrow pane what it was asked is
 cut first, then the last write, then the start time. `↑` or `Esc` takes you
@@ -878,13 +879,13 @@ updates as the subagent writes it, the way a running session's own does. Its
 text is not searched or marked — content search reads the session's own
 transcript — and a launch whose subagent left no record beside the session,
 such as one a fork copied, keeps its plain `[tool_use: …]` line.
-While the selected session has subagents **running** — not finished, and it or a
-subagent it launched wrote in the last 10 minutes — the foot of the preview lists
-them under a dim rule that carries a `^X ↓ explore` hint,
+While the selected session has subagents **running** — not finished or failed,
+and it or a subagent it launched wrote in the last 10 minutes — the foot of the
+preview lists them under a dim rule that carries a `^X ↓ explore` hint,
 `── ^X ↓ explore ──────`, one per row and set in by a column, in the order they
 were launched: `● @parser-auditor · Audit the parser · 2m ago`, its agent, what
 it was asked and how long ago it, or a subagent it launched, last wrote. A
-subagent leaves the list once it finishes or goes quiet, and a new one joins
+subagent leaves the list once it finishes, fails or goes quiet, and a new one joins
 when it first writes — now and then only at its next write. Past five, a
 `+N more` line counts the rest; in a short pane the list shrinks to the rule
 alone, which then reads `── ● 3 running · ^X ↓ explore ──`; on a narrow one a

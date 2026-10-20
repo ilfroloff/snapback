@@ -115,7 +115,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::command::{self, collapse_control_wrappers, Segment};
 use super::label::{self, PeerOrigin};
-use super::subagents::{self, RunProgress, SubagentIndex, SubagentMeta};
+use super::subagents::{self, RunProgress, RunVerdict, SubagentIndex, SubagentMeta};
 use super::Session;
 
 /// Floor on a GFM table column's rendered width in GRID mode — and, because a
@@ -395,13 +395,14 @@ pub struct RenderedPreview {
     /// the newest one. Always `None` in a subagent's render ([`render_subagent`]):
     /// claude restores the session's model, never a subagent's.
     pub last_model: Option<String>,
-    /// Whether the subagent's own run ENDED, judged over every record this render
-    /// streamed by the subagent record's own fold ([`subagents::RunProgress`]), so
-    /// the subagent view's title can tell a finished run from a quiet one without
-    /// a read of its own: the record reads a transcript's tail only while it can
-    /// be running. `Some` only in a subagent's render that drew a line; `None` in
-    /// the session's own and in the [`SUBAGENT_UNREADABLE`] one.
-    pub run_ended: Option<bool>,
+    /// Whether, and how, the subagent's own run ENDED, judged over every record
+    /// this render streamed by the subagent record's own fold
+    /// ([`subagents::RunProgress`]), so the subagent view's title can tell a
+    /// finished or failed run from a quiet one without a read of its own: the
+    /// record reads a transcript's tail only while it can be running. `Some` only
+    /// in a subagent's render that drew a line; `None` in the session's own and in
+    /// the [`SUBAGENT_UNREADABLE`] one.
+    pub run_ended: Option<RunVerdict>,
 }
 
 impl RenderedPreview {
@@ -5301,7 +5302,7 @@ mod tests {
     fn a_subagent_render_judges_whether_its_run_ended_and_no_other_render_does() {
         assert_eq!(
             render_view(&delegation_fixture(), DELEGATION_KEY).run_ended,
-            Some(false),
+            Some(RunVerdict::Open),
             "its last reply carries no stop reason"
         );
 
@@ -5330,7 +5331,7 @@ mod tests {
         );
         assert_eq!(
             render_view(&session, "a0000000000000d01").run_ended,
-            Some(true)
+            Some(RunVerdict::Finished)
         );
         let _ = std::fs::remove_dir_all(&dir);
 

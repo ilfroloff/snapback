@@ -104,7 +104,9 @@ The JSONL format is external and undocumented, so treat every read as hostile:
   when it or a subagent below it last wrote — the direction that never drops a
   live subagent from the running list, and assistant text whose `stop_reason`
   is not one `FINAL_STOP_REASONS` names leans the same way, save text after a
-  hand-back, which never reopens the run the hand-back ended
+  hand-back, which never reopens the run the hand-back ended; an
+  `isApiErrorMessage` that is not the JSON `true` fails no run, so a record
+  claude stopped flagging falls to those same rules
   ([DOMAIN.md](DOMAIN.md#subagent-record-and-running-list-storesubagents)). A
   head with no readable timestamp is an unknown launch time, ordered after every
   known one.
@@ -2151,12 +2153,15 @@ Tests are **inline** `#[cfg(test)] mod tests` at the bottom of each source file
   effort readings), `tests/fixtures/skill_listing/` (`listing.jsonl`: real
   record shapes with shortened descriptions — the `agent_listing_delta` records
   `store::skills` reads, beside a `skill_listing` record and a non-JSON line it
-  must skip), `tests/fixtures/subagent_status/` (four subagent transcripts, one per tail
+  must skip), `tests/fixtures/subagent_status/` (five subagent transcripts, one per tail
   shape `store::subagents::run_ended` decides: three trimmed from claude 2.1.226
   and 2.1.296 records — a `SubagentHandback` answered as the last turn, a final
-  reply, and a launch still waiting on its sub-subagent — and `mid-turn.jsonl`,
+  reply, and a launch still waiting on its sub-subagent — `mid-turn.jsonl`,
   in claude 2.1.296's shape, a narration written ahead of its `tool_use` whose
-  `stop_reason` is still null, so the run stays open) and
+  `stop_reason` is still null, so the run stays open, and `api-error.jsonl`,
+  trimmed from claude 2.1.300 records, a tool call answered and an `api-request`
+  record that is no turn before an API error flagged `isApiErrorMessage`, so the
+  run ended failed) and
   `tests/fixtures/claude_catalog/` (two trimmed claude 2.1.284
   `initialize` replies, every body key but `commands` and `agents` removed —
   `account` among them — whose `request_id` the test restamps:
