@@ -42,6 +42,9 @@ one place.
   A `claude agents --json` probe that cannot answer
   reads as "not live" everywhere but the `Ctrl-X w` move, which REFUSES
   ([PATTERNS.md §1](docs/agents/PATTERNS.md#1-fail-soft-over-external-input)).
+  Only an `interactive` record whose `pid` the kernel DEFINITELY reports gone
+  is dropped; every other record is KEPT
+  ([DOMAIN.md](docs/agents/DOMAIN.md#records-that-name-a-gone-process)).
   (`src/store/*`, `src/agents.rs`, `src/claude_catalog.rs`,
   `src/claude_move.rs`, `src/defined_agents.rs`, `src/claude_settings.rs`,
   `src/claude_trust.rs`)

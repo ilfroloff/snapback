@@ -19,6 +19,9 @@ The JSONL format is external and undocumented, so treat every read as hostile:
   place the wire shape is interpreted per source. The `Ctrl-X w` move's reading
   of the bare probe, `agents::try_live_agents`, sees those same four as `None`
   instead, through the same parser, so it can tell them from an empty list.
+  That parser also drops an `interactive` record whose `pid` the kernel
+  definitely reports gone, and fails toward KEEPING every other record
+  ([DOMAIN.md](DOMAIN.md#records-that-name-a-gone-process)).
 - **Fail-soft has a DIRECTION, and it is chosen per consumer.** The display
   classifier fails toward *active* (drift must not hide a busy session);
   `agents::live_agents` fails toward *not live* (empty ⇒ plain resume ⇒
@@ -182,7 +185,12 @@ it. Follow this split when adding behavior:
   liveness verdict and status — a lineage job's tally included — are asserted
   with no `claude` spawned;
   `agents::elapsed_phrase` and `watch::epoch_ms`, which take their instants as
-  parameters so no test reads a clock;
+  parameters so no test reads a clock; `agents::reports_a_gone_process`, which
+  takes the kernel's answer as a parameter (`pid_gone`, threaded through
+  `parse_agents_json`, `agents_from_output` and `agents_reading`) so the
+  gone-process filter is asserted with no process, and
+  `agents::proc_stat_says_gone` and `agents::proc_read_says_gone`, the Linux
+  procfs parse and its read verdict, compiled under test on every platform;
   `compose::compose_key_to_action`; `defined_agents::select_agents` /
   `parse_frontmatter`; `agents::classify` and the outputs derived from it
   (`qualifier_copy`, the LIST ROW's worded qualifier — which `friendly_status`
@@ -310,10 +318,12 @@ it. Follow this split when adding behavior:
   decision to `resolve_new_session_model` and `resolve_restore_overridden`), the `watch` threads, `tui::run` (draw loop), and
   `send::signal_term` (`Ctrl-K`'s one syscall, `kill(2)` with SIGTERM, whose only
   caller is that loop and which NO test may call — see "Watch every test fail"
-  below), `claude_trust::folder_trust` (the real environment, home and record,
+  below), `agents::kernel_says_gone` (macOS: the crate's one `proc_pidinfo`;
+  Linux: a procfs read; it signals nothing, so a test may call it, on a child
+  of its own), `claude_trust::folder_trust` (the real environment, home and record,
   delegating to the pure `global_config_path`, `trust_keys` and `is_trusted`
   through `folder_trust_in`, which tests drive with a temp record) and
-  `claude_catalog::kill_group` (the crate's other syscall, `killpg(2)` with
+  `claude_catalog::kill_group` (the crate's other signal syscall, `killpg(2)` with
   SIGKILL on a timed-out catalog fetch's or `Ctrl-X w` move's own child group,
   reached in tests only through stand-in children, `sh` and one `perl` leader: see
   [Testing patterns](#testing-patterns)) and `claude_move::check_target` (the
@@ -1146,7 +1156,10 @@ must be argued at the call site rather than assumed:
   two refusals, EVERY branch of the delete confirm, and EVERY branch of the
   `Ctrl-K` signal confirm's `Enter` — it lands ~0.26s after the keypress: a real,
   deliberate hitch. Do not paper over it with a zero-render claim that only holds
-  on one branch.
+  on one branch. The parse adds one kernel query per INTERACTIVE record that
+  carries a `pid` (4 and 2 in DOMAIN.md's Sample F captures), each one
+  `proc_pidinfo` call or one procfs read, so the `claude` child is still what
+  that figure measures.
 - **One shot means one, whatever the target count.** The hard-delete confirm
   (`confirm_delete`) can judge a whole fork lineage (a head row's
   `Delete lineage (N)`), so it takes claude's active list
@@ -1529,10 +1542,12 @@ ends a subagent's run, and the measured `stop_reason` tokens
 terminal seams write because crossterm publishes no typed command for them
 (`tui`'s `CAN` / `ST` / `KITTY_DISABLE_KEYBOARD` / `DECSTR` / `DECCKM_OFF`, and
 `tui::clipboard`'s OSC 52 wire bytes `OSC_INTRODUCER` / `OSC52_COMMAND` /
-`OSC52_CLIPBOARD_SELECTOR` / `OSC_PARAM_SEPARATOR` / `OSC_STRING_TERMINATOR`), and
-the path literals the grouping heuristic scans for (`store::group`'s
-`PATH_SEPARATOR` / `HIDDEN_DIR_PREFIX`). `tui::TICK` is not a second knob — it is
-an alias of `watch::TICK`, which stays the one definition.
+`OSC52_CLIPBOARD_SELECTOR` / `OSC_PARAM_SEPARATOR` / `OSC_STRING_TERMINATOR`), the
+kernel values the gone-process check passes and reads (`agents`' `proc_pidinfo`
+argument `NO_ZOMBIE_LOOKUP` and the procfs states `PROC_STATE_ZOMBIE` /
+`PROC_STATE_DEAD`), and the path literals the grouping heuristic scans for
+(`store::group`'s `PATH_SEPARATOR` / `HIDDEN_DIR_PREFIX`). `tui::TICK` is not a
+second knob — it is an alias of `watch::TICK`, which stays the one definition.
 
 A const whose rationale depends on ANOTHER const says so and names it:
 `BLINK_TICKS` is meaningless without `watch::TICK` (they multiply into the pulse's
@@ -2190,7 +2205,17 @@ Tests are **inline** `#[cfg(test)] mod tests` at the bottom of each source file
   `PATH` (macOS and the `ubuntu-latest` CI runner ship it), because `sh` cannot
   `setpgid` itself. Without `perl` it FAILS on its marker assertion, never passes
   vacuously. The `Ctrl-X w` move's child tests (`claude_move`'s unix-only
-  `children` module) run `sh` alone, over the same `exchange_reaped`.
+  `children` module) run `sh` alone, over the same `exchange_reaped`. The two
+  tests that query the kernel, in `agents` and on macOS and Linux only, each
+  spawn a `sleep` child and kill it themselves.
+  `the_kernel_check_keeps_a_running_process_and_calls_an_exited_one_gone` asks
+  `kernel_says_gone` about it running, unreaped and reaped (gone on macOS, kept
+  on Linux, where a missing `/proc` entry is no answer).
+  `both_runners_filter_their_records_through_the_real_kernel_check` runs
+  `run_agents` and `try_run_agents` with `printf` in `claude`'s place, over a
+  stdout naming the unreaped child and the test's own process, so a runner that
+  stops passing `kernel_says_gone` fails. That query only reads, so breaking it
+  to watch a test fail can drop a record but never reach a process.
 - **Assert structure, not styling**: preview tests flatten `Text` to plain
   strings to check markers, and separately assert `Style`/`Modifier` on specific
   spans.

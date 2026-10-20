@@ -86,21 +86,27 @@ unicode-segmentation = "=1.13.3"
 # columns aligned. Already in the tree transitively via ratatui; pinned exact.
 unicode-width = "=0.2.2"
 
-# Unix-only, like the two calls it exists for: off unix `send::signal_term` is
+# Unix-only, like the three calls it exists for: off unix `send::signal_term` is
 # a same-signature fallback that REFUSES instead of signalling, the catalog
-# fetch kills its child alone (`Child::kill`), and nothing else in the crate
-# names a `libc` item.
+# fetch kills its child alone (`Child::kill`), the gone-process check drops no
+# record, and nothing else in the crate names a `libc` item.
 [target.'cfg(unix)'.dependencies]
-# TWO calls, each in one `unsafe` block:
+# THREE calls, each in one `unsafe` block:
 # - `kill(2)`, SIGTERM, for `Ctrl-K`'s signal route (`send::signal_term`), the
 #   only handle left on a reported session that carries no stoppable job `id`.
 #   SIGTERM only on that route: no SIGKILL, no escalation ladder.
 # - `killpg(2)`, SIGKILL, for the compose pick list's catalog fetch
 #   (`claude_catalog::kill_group`): a timed-out fetch ends the whole process
 #   group of the `claude` child it spawned, never any other group.
-# Preferred over shelling out to `/bin/kill`, which would cost a PATH
-# dependency and a child process (and, for `Ctrl-K`, a thread) for calls that
-# return immediately. Already in the tree transitively on unix (notify, mio,
+# - `proc_pidinfo`, macOS only, for the `claude agents --json` parse's
+#   gone-process check (`agents::kernel_says_gone`): an interactive record whose
+#   `pid` it answers `ESRCH` for names no running process and is left out. It
+#   signals nothing. Linux answers the same question from procfs, with no `libc`
+#   call.
+# The two signal calls are preferred over shelling out to `/bin/kill`, which
+# would cost a PATH dependency and a child process (and, for `Ctrl-K`, a
+# thread) for calls that return immediately.
+# Already in the tree transitively on unix (notify, mio,
 # signal-hook, dirs-sys and parking_lot_core, among others, pull it); pinned
 # exact, so the direct dependency adds nothing to the build graph.
 libc = "=0.2.186"

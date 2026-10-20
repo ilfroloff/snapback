@@ -24,7 +24,8 @@
 //!   vanishing the moment claude drops it.
 //! * **[`live_agents`] — `--json`, NO `--all` — the HAND-OFF's signal.** A
 //!   one-shot probe at hand-off; MEMBERSHIP in what it returns is liveness,
-//!   structurally, because the bare command IS claude's active list. It returns
+//!   structurally, because the bare command IS claude's active list (less the
+//!   interactive records the kernel rules out, below). It returns
 //!   the RECORDS, so the same authoritative read also carries each live agent's
 //!   attach job [`id`](ReportedAgent::id) — and the `kind` + qualifier that
 //!   [`classify`]'s ONE non-display consumer reads, the hard-delete writer guard
@@ -48,6 +49,13 @@
 //! hand-off reading has one more form, [`try_live_agents`], for the one consumer
 //! that must tell "could not ask" from "nothing is live": the `Ctrl-X w` move,
 //! which refuses on the first.
+//!
+//! Both readings also leave out an INTERACTIVE record whose `pid` the KERNEL
+//! definitely says names no running process, and they do it before the
+//! per-session collapse, so a session claude still lists through a dead process
+//! keeps whatever else claude reported for it ([`parse_agents_json`]). Every other
+//! record is kept ([`reports_a_gone_process`]; DOMAIN.md's "Records that name a
+//! gone process" owns the rule).
 //!
 //! The split is drawn at the QUESTION, not at the caller: **every hand-off
 //! re-asks claude, and nothing hands off on polled data.** The `--all` map is a
@@ -235,9 +243,15 @@ pub struct ReportedAgent {
     /// A JSON NUMBER on the wire, read fail-soft and narrowed (see
     /// [`parse_agents_json`]).
     ///
-    /// **TWO consumers, each named so a third one cannot arrive quietly, and only
-    /// the first reads the NUMBER:**
+    /// **THREE consumers, each named so a fourth one cannot arrive quietly, and only
+    /// the first two read the NUMBER:**
     ///
+    /// * the parse's gone-process filter ([`reports_a_gone_process`], inside
+    ///   [`parse_agents_json`] for BOTH readings), which asks the kernel whether an
+    ///   INTERACTIVE record's number still names a running process and leaves that
+    ///   record out on a definite no. It never reads the number of a record of any
+    ///   other kind. It reads the value in the same call that read claude's answer,
+    ///   never off a stored map.
     /// * [`crate::send::interrupt_gate`]'s signal route — the `Ctrl-K` case for a
     ///   reported session that has NO stoppable job `id`. `claude stop <job-id>`
     ///   stays the verb wherever a job id exists, so no other route reads the value.
@@ -253,8 +267,8 @@ pub struct ReportedAgent {
     /// ones — but an earlier sample carried one on 2/150 BACKGROUND records, so
     /// "has a pid" must never be read as "is interactive".
     ///
-    /// **Its VALUE is read from [`live_agents`]' records ONLY — never from
-    /// [`reported_agents`]'** (i.e. never through
+    /// **Past the parse, its VALUE is read from [`live_agents`]' records ONLY — never
+    /// from [`reported_agents`]'** (i.e. never through
     /// [`crate::tui::app::App::reported_agent`]). Same rule as
     /// [`ReportedAgent::id`], for a strictly worse reason: a pid off that
     /// ~5.3s-stale (unboundedly stale while idle) `--all` map may already have
@@ -265,12 +279,16 @@ pub struct ReportedAgent {
     /// safe there for the reason the value is not: a stale PRESENCE draws a suffix
     /// one poll late, while a stale NUMBER can land a signal on a reused pid.
     ///
-    /// **It must NEVER be reachable from [`crate::delete::can_delete`].** That
-    /// guard asks "is a WRITER present?"; a pid does not answer that, and
-    /// DOMAIN.md's "pid is deliberately unused" note stands for that question
-    /// unchanged. This field answers different ones — "which process do I
-    /// signal?", and by its presence alone "is this agent live on the pinned
-    /// row?" — and neither may be conflated with the writer question.
+    /// **[`crate::delete::can_delete`] must NEVER read it.** That guard asks "is a
+    /// WRITER present?", and a pid that names a RUNNING process does not answer
+    /// that: DOMAIN.md's "pid is deliberately unused" note stands for that question
+    /// unchanged. The filter above is the one way the pid reaches the guard's
+    /// answer, and only by REMOVING an interactive record from the map the guard
+    /// is handed, so it can lift a refusal and never cause one (DOMAIN.md's
+    /// "Records that name a gone process" owns why). The other two consumers
+    /// answer different questions — "which process do I signal?", and by its
+    /// presence alone "is this agent live on the pinned row?" — and neither may be
+    /// conflated with the writer question.
     pub pid: Option<u32>,
     /// `startedAt` field: when claude says this session started, as epoch
     /// MILLISECONDS (a 13-digit JSON number on the wire at `claude 2.1.278`,
@@ -645,21 +663,35 @@ pub fn is_active(agent: &ReportedAgent) -> bool {
 /// or panics. This is the ONLY place the wire shape is interpreted: its body is
 /// [`try_parse_agents_json`], with "no signal" collapsed to that empty map.
 ///
+/// An interactive record whose `pid` `pid_gone` rules out is left out of the map
+/// ([`reports_a_gone_process`]). Production hands in [`kernel_says_gone`]; a test
+/// states the answer.
+///
 /// Last-one-wins per `sessionId`: two records sharing a session id collapse to
-/// whichever came last in the array. Observed not to happen (`--all` reported no
-/// duplicate ids), and deliberately not engineered around — see DOMAIN.md for
-/// the accepted risk if that ever changes.
+/// whichever came last in the array, among the records the filter kept. The
+/// filter runs BEFORE that collapse because duplicates do occur: at
+/// `claude 2.1.303` (2026-10-20) `--all` listed one session as a `stopped`
+/// background record followed by an `interactive` one whose pid named a process
+/// stuck in exit, and dropping that record must leave the background one, not
+/// nothing. The collapse itself is still not engineered around — see DOMAIN.md
+/// for the accepted risk.
 #[must_use]
-pub fn parse_agents_json(raw: &str) -> HashMap<String, ReportedAgent> {
-    try_parse_agents_json(raw).unwrap_or_default()
+pub fn parse_agents_json(
+    raw: &str,
+    pid_gone: impl Fn(i32) -> bool,
+) -> HashMap<String, ReportedAgent> {
+    try_parse_agents_json(raw, pid_gone).unwrap_or_default()
 }
 
 /// [`parse_agents_json`] with "no signal" kept apart from "an empty list":
 /// `None` when `raw` is not JSON or its top level is not the documented array,
 /// else the records. Per-element drift is still skipped, never `None`: the
-/// array itself was claude's answer.
+/// array itself was claude's answer. So is a record the filter leaves out.
 #[must_use]
-fn try_parse_agents_json(raw: &str) -> Option<HashMap<String, ReportedAgent>> {
+fn try_parse_agents_json(
+    raw: &str,
+    pid_gone: impl Fn(i32) -> bool,
+) -> Option<HashMap<String, ReportedAgent>> {
     // Not JSON at all, or a top level that is not the documented array: no
     // signal.
     let value = serde_json::from_str::<Value>(raw).ok()?;
@@ -674,28 +706,161 @@ fn try_parse_agents_json(raw: &str) -> Option<HashMap<String, ReportedAgent>> {
             continue; // No join key -> unusable record, skip (never fatal).
         };
         let str_field = |key: &str| element.get(key).and_then(Value::as_str).map(str::to_owned);
-        reported.insert(
-            session_id.to_owned(),
-            ReportedAgent {
-                kind: str_field("kind").unwrap_or_default(),
-                id: str_field("id"),
-                state: str_field("state"),
-                status: str_field("status"),
-                // `pid` and `startedAt` are JSON NUMBERS on the wire (measured
-                // at claude 2.1.278), so they need their own readers: passing
-                // either through `str_field` would silently yield `None` on
-                // EVERY real record. Both stay fail-soft — absent, mistyped, or
-                // (for `pid`) out of `u32` range all degrade to `None` and never
-                // discard the record.
-                pid: element
-                    .get("pid")
-                    .and_then(Value::as_u64)
-                    .and_then(|pid| u32::try_from(pid).ok()),
-                started_at_ms: element.get("startedAt").and_then(Value::as_i64),
-            },
-        );
+        let agent = ReportedAgent {
+            kind: str_field("kind").unwrap_or_default(),
+            id: str_field("id"),
+            state: str_field("state"),
+            status: str_field("status"),
+            // `pid` and `startedAt` are JSON NUMBERS on the wire (measured
+            // at claude 2.1.278), so they need their own readers: passing
+            // either through `str_field` would silently yield `None` on
+            // EVERY real record. Both stay fail-soft — absent, mistyped, or
+            // (for `pid`) out of `u32` range all degrade to `None` and never
+            // discard the record.
+            pid: element
+                .get("pid")
+                .and_then(Value::as_u64)
+                .and_then(|pid| u32::try_from(pid).ok()),
+            started_at_ms: element.get("startedAt").and_then(Value::as_i64),
+        };
+        // Skipped before the insert, never removed after it: the insert is the
+        // last-one-wins collapse, and the session's other record must survive.
+        if reports_a_gone_process(&agent, &pid_gone) {
+            continue;
+        }
+        reported.insert(session_id.to_owned(), agent);
     }
     Some(reported)
+}
+
+/// Whether `agent` is an INTERACTIVE record whose process the kernel has ruled
+/// GONE, which leaves it out of both readings ([`parse_agents_json`]).
+///
+/// The rule, its keep cases and why it is interactive-only are DOMAIN.md's
+/// "Records that name a gone process". What this body must keep, locally:
+///
+/// * `kind` is tested FIRST, against [`KIND_INTERACTIVE`] exactly, and never
+///   inferred from the pid or the job `id` ([`ReportedAgent::pid`] forbids that).
+///   Every other kind — background, absent, drifted — is kept, and its pid is
+///   never put to the kernel.
+/// * The pid reaches `pid_gone` only through [`crate::send::positive_pid_t`], so
+///   a pid no `pid_t` can hold as ONE process is never asked and its record kept.
+/// * Only `pid_gone`'s `true` drops: a dropped record reads as "not live" to the
+///   hard-delete writer guard ([`crate::delete::can_delete`]) and the send gates,
+///   so [`kernel_says_gone`] answers `false` to everything it cannot settle.
+///
+/// Pure: the kernel is behind `pid_gone`, so the decision is tested without one.
+#[must_use]
+fn reports_a_gone_process(agent: &ReportedAgent, pid_gone: impl Fn(i32) -> bool) -> bool {
+    agent.kind == KIND_INTERACTIVE
+        && agent
+            .pid
+            .and_then(crate::send::positive_pid_t)
+            .is_some_and(pid_gone)
+}
+
+/// `proc_pidinfo`'s `arg` for the BSD-info flavor: ZERO, so that XNU does not look
+/// the pid up among ZOMBIES.
+///
+/// With it zero, a zombie answers `ESRCH` exactly like a pid nobody holds, and
+/// so does a process that is still EXITING (`ps` STAT `E`), which is what makes
+/// one errno the whole check. Measured on macOS 27.0.1 (Darwin 27.0.0) on
+/// 2026-10-20: a process stuck mid-exit and a zombie both answered `ESRCH` with
+/// `arg` 0, while with `arg` 1 the zombie answered `pbi_status` `SZOMB` and the
+/// exiting process answered `SRUN`, so a status check would have missed the
+/// second. `kill(pid, 0)` succeeded for both.
+#[cfg(target_os = "macos")]
+const NO_ZOMBIE_LOOKUP: u64 = 0;
+
+/// Whether the kernel DEFINITELY says no running process holds `pid`: none
+/// exists, or the one that does is exiting or a zombie. `false` for every other
+/// answer, so the caller keeps the record ([`reports_a_gone_process`]; the
+/// per-platform table is DOMAIN.md's "Records that name a gone process").
+///
+/// macOS: one `proc_pidinfo(PROC_PIDTBSDINFO)` call; only `ESRCH` is "gone", so
+/// `EPERM` (a process the board may not inspect) keeps the record. `kill(pid, 0)`
+/// is NOT this check: it succeeds for a zombie and for a process stuck in exit
+/// ([`NO_ZOMBIE_LOOKUP`] has the measurement).
+///
+/// Runs only where a `claude agents --json` answer is being read — the poller's
+/// thread, the hand-off probe, the move's worker — and only for an interactive
+/// record that carries a pid.
+#[cfg(target_os = "macos")]
+fn kernel_says_gone(pid: i32) -> bool {
+    let Ok(size) = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()) else {
+        return false;
+    };
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    // SAFETY: `proc_pidinfo` writes at most `size` bytes into `info`, a buffer of
+    // exactly `size` bytes that lives across the call, and keeps no pointer to it.
+    // The buffer is never read: only the return value and `errno` are, and libproc
+    // returns 0 only when the underlying syscall failed and set `errno`, which is
+    // read immediately below before anything else can overwrite it.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            NO_ZOMBIE_LOOKUP,
+            info.as_mut_ptr().cast::<libc::c_void>(),
+            size,
+        )
+    };
+    written <= 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// Whether the kernel DEFINITELY says no running process holds `pid` — the
+/// Linux answer, read from procfs ([`proc_read_says_gone`] decides).
+///
+/// Runs only where a `claude agents --json` answer is being read, and only for an
+/// interactive record that carries a pid (see the macOS twin).
+#[cfg(target_os = "linux")]
+fn kernel_says_gone(pid: i32) -> bool {
+    proc_read_says_gone(std::fs::read_to_string(format!("/proc/{pid}/stat")))
+}
+
+/// Whether a read of `/proc/<pid>/stat` says the process is gone: only a line
+/// that WAS read, and names a zombie or a dead task ([`proc_stat_says_gone`]).
+///
+/// A MISSING entry keeps the record, like every other read failure: a live pid
+/// has none either when snapback runs in another PID namespace than claude (a
+/// container sharing `~/.claude`) or over a `hidepid` procfs, so "no entry" is
+/// never a definite "gone" here.
+///
+/// Compiled under test on every platform, so the rule is pinned on macOS too.
+#[cfg(any(target_os = "linux", test))]
+fn proc_read_says_gone(read: std::io::Result<String>) -> bool {
+    read.is_ok_and(|stat| proc_stat_says_gone(&stat))
+}
+
+/// No definite check on this platform, so no record is ever dropped. Shipped
+/// targets are darwin and linux only; this keeps the crate compiling elsewhere.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn kernel_says_gone(pid: i32) -> bool {
+    let _ = pid; // no definite answer here: keep the record
+    false
+}
+
+/// `/proc/<pid>/stat`'s state for a ZOMBIE: exited, not yet reaped.
+#[cfg(any(target_os = "linux", test))]
+const PROC_STATE_ZOMBIE: &str = "Z";
+
+/// `/proc/<pid>/stat`'s state for a DEAD task, the instant between reaping and
+/// the entry's removal.
+#[cfg(any(target_os = "linux", test))]
+const PROC_STATE_DEAD: &str = "X";
+
+/// Whether a `/proc/<pid>/stat` line names a zombie or a dead task. A line it
+/// cannot read is not "gone".
+///
+/// The state is the first field after the LAST `)`: the field before it is the
+/// command name in parentheses, which may itself hold `)` and spaces.
+///
+/// Compiled under test on every platform, so the parse is pinned on macOS too.
+#[cfg(any(target_os = "linux", test))]
+fn proc_stat_says_gone(stat: &str) -> bool {
+    stat.rsplit_once(')')
+        .and_then(|(_, fields)| fields.split_whitespace().next())
+        .is_some_and(|state| matches!(state, PROC_STATE_ZOMBIE | PROC_STATE_DEAD))
 }
 
 /// The argv shared by BOTH readings: the program, the subcommand, and `--json`.
@@ -769,45 +934,54 @@ fn live_agents_argv() -> Vec<String> {
 /// The status is checked BEFORE the parse, and that order is the contract: a
 /// failed run's stdout is not a reading even when it happens to parse cleanly, so
 /// it must never reach [`parse_agents_json`] — which remains the ONLY place the
-/// wire shape is interpreted.
+/// wire shape is interpreted. `pid_gone` goes to that parse unchanged.
 #[must_use]
-fn agents_from_output(success: bool, stdout: &str) -> HashMap<String, ReportedAgent> {
+fn agents_from_output(
+    success: bool,
+    stdout: &str,
+    pid_gone: impl Fn(i32) -> bool,
+) -> HashMap<String, ReportedAgent> {
     if !success {
         return HashMap::new(); // Non-zero exit -> treat as "no signal".
     }
-    parse_agents_json(stdout)
+    parse_agents_json(stdout, pid_gone)
 }
 
 /// [`agents_from_output`] with "no signal" kept apart from "an empty list":
 /// `None` for a non-zero exit, or for stdout that is not the documented array
 /// ([`try_parse_agents_json`]), else the records. The same order contract: the
-/// status is checked BEFORE the parse.
+/// status is checked BEFORE the parse, which applies the same `pid_gone` filter.
 #[must_use]
-fn agents_reading(success: bool, stdout: &str) -> Option<HashMap<String, ReportedAgent>> {
+fn agents_reading(
+    success: bool,
+    stdout: &str,
+    pid_gone: impl Fn(i32) -> bool,
+) -> Option<HashMap<String, ReportedAgent>> {
     if !success {
         return None; // Non-zero exit -> "no signal".
     }
-    try_parse_agents_json(stdout)
+    try_parse_agents_json(stdout, pid_gone)
 }
 
 /// Run an agents shell-out and parse it, or yield EMPTY on any failure (missing
 /// binary, non-zero exit, unreadable / non-JSON output).
 ///
 /// The impure step both readings share: the spawn is [`spawn_agents`]'s, and
-/// what the result means is [`agents_from_output`]'s pure decision. Never
-/// panics; every error path returns an empty map.
+/// what the result means is [`agents_from_output`]'s pure decision, over the real
+/// kernel check ([`kernel_says_gone`]). Never panics; every error path returns an
+/// empty map.
 fn run_agents(argv: &[String]) -> HashMap<String, ReportedAgent> {
     spawn_agents(argv).map_or_else(HashMap::new, |(success, stdout)| {
-        agents_from_output(success, &stdout)
+        agents_from_output(success, &stdout, kernel_says_gone)
     })
 }
 
 /// [`run_agents`] with "no signal" kept apart from "an empty list": `None` when
 /// no child could be spawned or [`agents_reading`] finds no signal in what it
-/// printed. Never panics.
+/// printed. The same kernel check filters its records. Never panics.
 fn try_run_agents(argv: &[String]) -> Option<HashMap<String, ReportedAgent>> {
     let (success, stdout) = spawn_agents(argv)?;
-    agents_reading(success, &stdout)
+    agents_reading(success, &stdout, kernel_says_gone)
 }
 
 /// The SPAWN both runners share: run `argv` and return whether it exited zero
@@ -844,7 +1018,12 @@ pub fn reported_agents() -> HashMap<String, ReportedAgent> {
 ///
 /// * **"Will `claude -r <id>` refuse?"** — MEMBERSHIP, and the reason that is
 ///   enough is structural: the bare command IS claude's active list, so there is
-///   no bucket to infer from and nothing to be uncertain about.
+///   no bucket to infer from and nothing to be uncertain about. The exception is
+///   an interactive record the parse leaves out ([`reports_a_gone_process`]):
+///   claude may still count it and refuse `-r` (read out of the `claude 2.1.303`
+///   bundle, not seen in a run), so for that record alone the answer is
+///   snapback's, not claude's. Why that is safe: DOMAIN.md, "Records that name a
+///   gone process".
 /// * **"What does `claude attach` take?"** — the matched record's own short
 ///   agent-view [`id`](ReportedAgent::id).
 /// * **"Is anything WRITING this transcript?"** — the matched record's `kind`
@@ -922,6 +1101,12 @@ pub fn try_live_agents() -> Option<HashMap<String, ReportedAgent>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The kernel's answer every fixture that is not about the gone-process filter
+    /// assumes: no pid in it names a gone process, so the filter drops nothing.
+    fn no_pid_is_gone(_pid: i32) -> bool {
+        false
+    }
 
     /// A synthetic `ReportedAgent` carrying only what the classifier reads, so
     /// each test below states just the kind + qualifier source it cares about.
@@ -1439,7 +1624,7 @@ mod tests {
             "{\"sessionId\":\"x\"}", // a JSON OBJECT, not the documented array
             "[1, 2, 3]",             // array of non-objects
         ] {
-            let reported = parse_agents_json(raw);
+            let reported = parse_agents_json(raw, no_pid_is_gone);
             assert!(
                 reported.is_empty(),
                 "expected an empty reported set for {raw:?}, got {reported:?}"
@@ -1471,7 +1656,7 @@ mod tests {
             {"sessionId":"bbbbbbbb-cccc-dddd-eeee-ffffffffffff","kind":"interactive","status":"busy","pid":"29628","startedAt":"1790152789592"},
             {"sessionId":"cccccccc-dddd-eeee-ffff-000000000000","kind":"interactive","status":"busy","pid":99999999999}
         ]"#;
-        let reported = parse_agents_json(raw);
+        let reported = parse_agents_json(raw, no_pid_is_gone);
         assert_eq!(reported.len(), 4);
 
         let bg = reported
@@ -1584,7 +1769,7 @@ mod tests {
     /// `live_agents` reads them through.
     #[test]
     fn a_successful_run_parses_its_stdout_into_records() {
-        let agents = agents_from_output(true, ONE_AGENT_JSON);
+        let agents = agents_from_output(true, ONE_AGENT_JSON, no_pid_is_gone);
         assert_eq!(agents.len(), 1);
 
         let agent = agents
@@ -1610,14 +1795,14 @@ mod tests {
     #[test]
     fn a_failed_run_yields_empty_even_when_its_stdout_is_valid_json() {
         assert!(
-            agents_from_output(false, ONE_AGENT_JSON).is_empty(),
+            agents_from_output(false, ONE_AGENT_JSON, no_pid_is_gone).is_empty(),
             "a non-zero exit is no signal: its stdout must never be read, even \
              when it parses cleanly"
         );
         // The same bytes DO parse on a zero exit, so the emptiness above is the
         // status check's doing rather than an unreadable fixture quietly passing.
         assert!(
-            !agents_from_output(true, ONE_AGENT_JSON).is_empty(),
+            !agents_from_output(true, ONE_AGENT_JSON, no_pid_is_gone).is_empty(),
             "the fixture must be parseable, else the assertion above is vacuous"
         );
     }
@@ -1629,7 +1814,7 @@ mod tests {
     #[test]
     fn a_successful_run_with_non_json_stdout_yields_empty() {
         assert!(
-            agents_from_output(true, "claude: unexpected error").is_empty(),
+            agents_from_output(true, "claude: unexpected error", no_pid_is_gone).is_empty(),
             "unparseable stdout on a clean exit is still no signal"
         );
     }
@@ -1646,28 +1831,28 @@ mod tests {
             (true, r#"{"sessionId":"sess-1","kind":"background"}"#),
         ] {
             assert_eq!(
-                agents_reading(success, stdout),
+                agents_reading(success, stdout, no_pid_is_gone),
                 None,
                 "no signal: success={success} stdout={stdout}"
             );
             assert!(
-                agents_from_output(success, stdout).is_empty(),
+                agents_from_output(success, stdout, no_pid_is_gone).is_empty(),
                 "the fail-soft reading stays empty: success={success} stdout={stdout}"
             );
         }
         assert_eq!(
-            agents_reading(true, "[]"),
+            agents_reading(true, "[]", no_pid_is_gone),
             Some(HashMap::new()),
             "claude's empty list is an answer, not a failure"
         );
         assert_eq!(
-            agents_reading(true, r#"[{"kind":"background"}]"#),
+            agents_reading(true, r#"[{"kind":"background"}]"#, no_pid_is_gone),
             Some(HashMap::new()),
             "per-element drift is skipped; the array itself was the answer"
         );
         assert_eq!(
-            agents_reading(true, ONE_AGENT_JSON),
-            Some(agents_from_output(true, ONE_AGENT_JSON)),
+            agents_reading(true, ONE_AGENT_JSON, no_pid_is_gone),
+            Some(agents_from_output(true, ONE_AGENT_JSON, no_pid_is_gone)),
             "a clean run reads the same records either way"
         );
     }
@@ -1680,7 +1865,7 @@ mod tests {
             {"kind":"background"},
             {"sessionId":"kept","future":"field","kind":42}
         ]"#;
-        let reported = parse_agents_json(raw);
+        let reported = parse_agents_json(raw, no_pid_is_gone);
         // The sessionId-less element is skipped; the other survives.
         assert_eq!(reported.len(), 1);
         let kept = reported
@@ -1693,5 +1878,367 @@ mod tests {
         // the two numeric ones.
         assert_eq!(kept.pid, None);
         assert_eq!(kept.started_at_ms, None);
+    }
+
+    /// The pid of the record the gone-process fixtures below rule out: the one the
+    /// `claude 2.1.303` capture (2026-10-20) carried for a process stuck in exit.
+    const GONE_PID: i32 = 90_179;
+
+    /// A stated kernel answer: only [`GONE_PID`] is gone.
+    fn only_gone_pid_is_gone(pid: i32) -> bool {
+        pid == GONE_PID
+    }
+
+    /// Parse `raw` with a kernel that calls EVERY pid gone, and hand back the
+    /// session ids kept (sorted) and the pids the kernel was asked about (sorted).
+    fn kept_and_asked_when_every_pid_is_gone(raw: &str) -> (Vec<String>, Vec<i32>) {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let reported = parse_agents_json(raw, |pid| {
+            asked.borrow_mut().push(pid);
+            true
+        });
+        let mut kept: Vec<String> = reported.into_keys().collect();
+        kept.sort_unstable();
+        let mut asked = asked.into_inner();
+        asked.sort_unstable();
+        (kept, asked)
+    }
+
+    /// The filter leaves out an INTERACTIVE record whose pid the kernel calls gone
+    /// and keeps every other one. The kernel is asked once per interactive record
+    /// that CARRIES a pid, and never about a record without one.
+    #[test]
+    fn an_interactive_record_whose_process_the_kernel_calls_gone_is_left_out_and_every_other_kept()
+    {
+        let raw = r#"[
+            {"sessionId":"gone-live","kind":"interactive","status":"idle","pid":90179},
+            {"sessionId":"running-live","kind":"interactive","status":"busy","pid":29628},
+            {"sessionId":"parked-bg","kind":"background","state":"blocked","id":"parked1"},
+            {"sessionId":"gone-bg","kind":"background","state":"done","id":"gone1","pid":4242}
+        ]"#;
+        let asked = std::cell::RefCell::new(Vec::new());
+        let reported = parse_agents_json(raw, |pid| {
+            asked.borrow_mut().push(pid);
+            pid == GONE_PID || pid == 4242
+        });
+
+        let mut kept: Vec<&str> = reported.keys().map(String::as_str).collect();
+        kept.sort_unstable();
+        assert_eq!(
+            kept,
+            ["gone-bg", "parked-bg", "running-live"],
+            "only the interactive record whose process is gone is left out"
+        );
+        let mut asked = asked.into_inner();
+        asked.sort_unstable();
+        assert_eq!(
+            asked,
+            [29628, GONE_PID],
+            "the kernel is asked about each interactive record with a pid, and only those"
+        );
+    }
+
+    /// A BACKGROUND record is kept whatever the kernel would say about its pid, in
+    /// every state — a `working` job above all, which the delete guard must go on
+    /// refusing — and its pid is never put to the kernel. The interactive control
+    /// IS asked and IS dropped, so the kept records hinge on their kind alone.
+    #[test]
+    fn a_background_record_whose_pid_is_gone_is_kept_and_never_put_to_the_kernel() {
+        let raw = r#"[
+            {"sessionId":"bg-working","kind":"background","state":"working","id":"w1","pid":4242},
+            {"sessionId":"bg-done","kind":"background","state":"done","status":"idle","id":"d1","pid":4243},
+            {"sessionId":"bg-blocked","kind":"background","state":"blocked","status":"idle","id":"b1","pid":4244},
+            {"sessionId":"bg-stopped","kind":"background","state":"stopped","id":"s1","pid":4245},
+            {"sessionId":"control","kind":"interactive","status":"idle","pid":90179}
+        ]"#;
+        let (kept, asked) = kept_and_asked_when_every_pid_is_gone(raw);
+        assert_eq!(
+            kept,
+            ["bg-blocked", "bg-done", "bg-stopped", "bg-working"],
+            "every background record is kept; only the interactive control is dropped"
+        );
+        assert_eq!(
+            asked,
+            [GONE_PID],
+            "only the interactive record's pid is put to the kernel"
+        );
+    }
+
+    /// A record whose `kind` is ABSENT, mistyped, or a value claude has not been
+    /// seen to send (schema drift, a re-cased token included) is kept whatever the
+    /// kernel would say about its pid, and the kernel is never asked: only the
+    /// exact interactive token drops a record. The interactive control IS dropped.
+    #[test]
+    fn a_record_of_absent_or_unknown_kind_whose_pid_is_gone_is_kept() {
+        let raw = r#"[
+            {"sessionId":"no-kind","status":"idle","pid":4242},
+            {"sessionId":"empty-kind","kind":"","status":"idle","pid":4243},
+            {"sessionId":"mistyped-kind","kind":1,"status":"idle","pid":4244},
+            {"sessionId":"drifted-kind","kind":"foreground","status":"idle","pid":4245},
+            {"sessionId":"recased-kind","kind":"Interactive","status":"idle","pid":4246},
+            {"sessionId":"control","kind":"interactive","status":"idle","pid":90179}
+        ]"#;
+        let (kept, asked) = kept_and_asked_when_every_pid_is_gone(raw);
+        assert_eq!(
+            kept,
+            [
+                "drifted-kind",
+                "empty-kind",
+                "mistyped-kind",
+                "no-kind",
+                "recased-kind"
+            ],
+            "every record not of the interactive kind is kept"
+        );
+        assert_eq!(
+            asked,
+            [GONE_PID],
+            "only the interactive record's pid is put to the kernel"
+        );
+    }
+
+    /// The `claude 2.1.303` capture's shape: `--all` listed ONE session twice, a
+    /// `stopped` background job and then an `interactive` record whose process
+    /// was stuck in exit. Dropping the dead record must leave the job, in either
+    /// order, through both readings — which is why the filter runs before the
+    /// last-one-wins collapse and not after it.
+    #[test]
+    fn a_session_listed_twice_keeps_its_other_record_when_one_names_a_gone_process() {
+        let job = r#"{"id":"0a1b2c3d","cwd":"/work/backend","kind":"background","startedAt":1792412145367,"sessionId":"0a1b2c3d-0000-4000-8000-000000000001","name":"catalog","state":"stopped"}"#;
+        let dead = r#"{"pid":90179,"cwd":"/work/backend","kind":"interactive","startedAt":1792424622347,"sessionId":"0a1b2c3d-0000-4000-8000-000000000001","name":"catalog","status":"idle"}"#;
+        let expected = ReportedAgent {
+            kind: "background".to_string(),
+            id: Some("0a1b2c3d".to_string()),
+            state: Some("stopped".to_string()),
+            status: None,
+            pid: None,
+            started_at_ms: Some(1_792_412_145_367),
+        };
+
+        for raw in [format!("[{job},{dead}]"), format!("[{dead},{job}]")] {
+            let reported = agents_from_output(true, &raw, only_gone_pid_is_gone);
+            assert_eq!(
+                reported.get("0a1b2c3d-0000-4000-8000-000000000001"),
+                Some(&expected),
+                "the session falls back to its background job: {raw}"
+            );
+            assert_eq!(
+                agents_reading(true, &raw, only_gone_pid_is_gone),
+                Some(reported),
+                "the strict reading drops the same record: {raw}"
+            );
+        }
+
+        // The control: with the pid RUNNING, the plain collapse keeps whichever
+        // came last, so the fixture really does hinge on the filter.
+        let reported = parse_agents_json(&format!("[{job},{dead}]"), no_pid_is_gone);
+        assert_eq!(
+            reported["0a1b2c3d-0000-4000-8000-000000000001"].pid,
+            Some(90_179)
+        );
+    }
+
+    /// A background record FOLLOWED BY a kept (live) interactive one for the same
+    /// session collapses to the interactive record, so the hard-delete guard
+    /// takes its INTERACTIVE arm, not the background one the first record names.
+    #[test]
+    fn a_background_record_then_a_live_interactive_one_refuses_delete_as_interactive() {
+        let job = r#"{"id":"0a1b2c3d","kind":"background","startedAt":1792412145367,"sessionId":"0a1b2c3d-0000-4000-8000-000000000001","state":"stopped"}"#;
+        let live = r#"{"pid":90180,"kind":"interactive","startedAt":1792424622347,"sessionId":"0a1b2c3d-0000-4000-8000-000000000001","status":"idle"}"#;
+
+        let reported = parse_agents_json(&format!("[{job},{live}]"), no_pid_is_gone);
+        let kept = &reported["0a1b2c3d-0000-4000-8000-000000000001"];
+        assert_eq!(kept.kind, KIND_INTERACTIVE, "the later record wins");
+        assert_eq!(
+            crate::delete::can_delete(Some(kept)),
+            Err(crate::delete::DELETE_INTERACTIVE_REFUSAL.to_string())
+        );
+    }
+
+    /// A pid no `pid_t` can hold as ONE process — `0`, or past `i32::MAX` — is
+    /// never put to the kernel, and its record is KEPT: fail toward keeping, as
+    /// for a record with no pid. `i32::MAX` itself is a pid and IS asked.
+    #[test]
+    fn a_pid_no_pid_t_can_hold_is_never_put_to_the_kernel_and_its_record_is_kept() {
+        let raw = r#"[
+            {"sessionId":"zero","kind":"interactive","pid":0},
+            {"sessionId":"past-i32","kind":"interactive","pid":2147483648},
+            {"sessionId":"max-u32","kind":"interactive","pid":4294967295}
+        ]"#;
+        let reported = parse_agents_json(raw, |pid| {
+            panic!("pid {pid} is no single process and must never reach the kernel")
+        });
+        assert_eq!(reported.len(), 3, "every such record is kept");
+
+        let raw = r#"[{"sessionId":"max-i32","kind":"interactive","pid":2147483647}]"#;
+        assert!(
+            parse_agents_json(raw, |pid| pid == i32::MAX).is_empty(),
+            "the largest pid_t is a pid, so the kernel's answer counts"
+        );
+    }
+
+    /// The Linux procfs answer: the state after the LAST `)` decides, and only a
+    /// zombie (`Z`) or a dead task (`X`) is gone. Pinned on every platform.
+    #[test]
+    fn a_proc_stat_line_is_gone_only_for_a_zombie_or_a_dead_task() {
+        for (stat, gone) in [
+            ("4242 (sleep) S 4241 4242 4241 0 -1 4194304 85 0", false),
+            ("4242 (sleep) R 4241 4242 4241 0 -1 4194304 85 0", false),
+            ("4242 (sleep) D 4241 4242 4241 0 -1 4194304 85 0", false),
+            ("4242 (sleep) T 4241 4242 4241 0 -1 4194304 85 0", false),
+            ("4242 (sleep) Z 4241 4242 4241 0 -1 4194316 85 0", true),
+            ("4242 (sleep) X 4241 4242 4241 0 -1 4194316 85 0", true),
+            // A command name may hold `)`, spaces and a state letter of its own.
+            ("4242 (a) Z (b) S 4241 4242", false),
+            ("4242 (a) S (b) Z 4241 4242", true),
+            // Unreadable lines are not "gone".
+            ("4242 (sleep)", false),
+            ("4242 sleep Z", false),
+            ("", false),
+        ] {
+            assert_eq!(proc_stat_says_gone(stat), gone, "{stat:?}");
+        }
+    }
+
+    /// The Linux read verdict: only a line that WAS read can say gone. A missing
+    /// entry — what a live pid looks like from another PID namespace, or behind a
+    /// `hidepid` procfs — keeps the record, as every other read failure does.
+    /// Pinned on every platform.
+    #[test]
+    fn a_proc_read_is_gone_only_for_a_read_line_and_a_missing_entry_keeps() {
+        use std::io::{Error, ErrorKind};
+
+        for (stat, gone) in [
+            ("4242 (sleep) Z 4241 4242", true),
+            ("4242 (sleep) X 4241 4242", true),
+            ("4242 (sleep) S 4241 4242", false),
+        ] {
+            assert_eq!(proc_read_says_gone(Ok(stat.to_string())), gone, "{stat:?}");
+        }
+        for kind in [
+            ErrorKind::NotFound,
+            ErrorKind::PermissionDenied,
+            ErrorKind::InvalidData,
+            ErrorKind::Other,
+        ] {
+            assert!(
+                !proc_read_says_gone(Err(Error::from(kind))),
+                "a failed read ({kind:?}) is no answer, so the record is kept"
+            );
+        }
+    }
+
+    /// How many times [`kernel_calls_it_gone_in_time`] asks while a killed child
+    /// exits: with [`GONE_POLL_EVERY`], a 5 s bound on a kill that lands in
+    /// milliseconds.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    const GONE_POLLS: u32 = 500;
+    /// The pause between two of those asks.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    const GONE_POLL_EVERY: std::time::Duration = std::time::Duration::from_millis(10);
+
+    /// Ask the REAL kernel check about `pid` until it says gone, at most
+    /// [`GONE_POLLS`] times: `kill` returns before the child has exited.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn kernel_calls_it_gone_in_time(pid: i32) -> bool {
+        (0..GONE_POLLS).any(|_| {
+            if kernel_says_gone(pid) {
+                return true;
+            }
+            std::thread::sleep(GONE_POLL_EVERY);
+            false
+        })
+    }
+
+    /// The REAL kernel check, on a child this test owns: running is not gone; once
+    /// killed and not yet reaped (exiting, then a zombie) it is gone. Through the
+    /// parse too, as the readers use it. Once reaped it is gone on macOS (`ESRCH`)
+    /// and KEPT on Linux, where a missing `/proc` entry is no answer
+    /// ([`proc_read_says_gone`]). The board's own pid and pid 1 are not gone
+    /// either — pid 1 answers `EPERM` on macOS for an unprivileged user, the
+    /// "could not settle" case that keeps.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn the_kernel_check_keeps_a_running_process_and_calls_an_exited_one_gone() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn a stand-in child");
+        let pid = i32::try_from(child.id()).expect("a real pid fits a pid_t");
+        let raw = format!(
+            r#"[{{"sessionId":"child","kind":"interactive","status":"busy","pid":{pid}}}]"#
+        );
+
+        assert!(!kernel_says_gone(pid), "a running child is not gone");
+        assert!(agents_from_output(true, &raw, kernel_says_gone).contains_key("child"));
+        let own = i32::try_from(std::process::id()).expect("our pid fits a pid_t");
+        assert!(!kernel_says_gone(own), "the test's own process is running");
+        assert!(
+            !kernel_says_gone(1),
+            "pid 1 is running, or not ours to inspect"
+        );
+
+        child.kill().expect("kill the stand-in child");
+        let gone = kernel_calls_it_gone_in_time(pid);
+        assert!(gone, "a killed, unreaped child is gone");
+        assert!(
+            !agents_from_output(true, &raw, kernel_says_gone).contains_key("child"),
+            "its record is left out"
+        );
+
+        child.wait().expect("reap the stand-in child");
+        assert_eq!(
+            kernel_says_gone(pid),
+            cfg!(target_os = "macos"),
+            "a reaped child is gone on macOS, and kept on Linux (no /proc entry)"
+        );
+    }
+
+    /// BOTH runners hand the parse the REAL kernel check: a runner that passed a
+    /// stand-in instead would keep a gone process's session live on the board.
+    /// Each runs `printf` in `claude`'s place over one stdout naming a killed,
+    /// unreaped child (gone on macOS and Linux alike) and the test's own process
+    /// (running): the first record is left out and the second kept.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn both_runners_filter_their_records_through_the_real_kernel_check() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn a stand-in child");
+        let gone = child.id();
+        child.kill().expect("kill the stand-in child");
+        assert!(
+            kernel_calls_it_gone_in_time(i32::try_from(gone).expect("a real pid fits a pid_t")),
+            "a killed, unreaped child is gone"
+        );
+        let running = std::process::id();
+        let stdout = format!(
+            r#"[{{"sessionId":"gone","kind":"interactive","status":"idle","pid":{gone}}},{{"sessionId":"running","kind":"interactive","status":"busy","pid":{running}}}]"#
+        );
+        assert_eq!(
+            parse_agents_json(&stdout, no_pid_is_gone).len(),
+            2,
+            "unfiltered, both records are kept, so a missing one below is the check's doing"
+        );
+        let argv = ["printf".to_string(), "%s".to_string(), stdout];
+
+        let kept: Vec<String> = run_agents(&argv).into_keys().collect();
+        assert_eq!(
+            kept,
+            ["running"],
+            "run_agents filters through kernel_says_gone"
+        );
+        let kept: Option<Vec<String>> =
+            try_run_agents(&argv).map(|agents| agents.into_keys().collect());
+        assert_eq!(
+            kept,
+            Some(vec!["running".to_string()]),
+            "try_run_agents filters through kernel_says_gone"
+        );
+
+        child.wait().expect("reap the stand-in child");
     }
 }
