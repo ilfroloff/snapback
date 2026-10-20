@@ -34,7 +34,7 @@ This pin covers the COMMAND surface: flags, commands and their help text. The
 carry `id` and `pid`, and what `kind: "interactive"` turned out to denote) is
 measured separately in [DOMAIN.md](DOMAIN.md#reported-agents-srcagentsrs). It was
 captured at 2.1.278 and spot-checked at 2.1.280 with the same nine-key union, and
-again at 2.1.282 ([DOMAIN.md, Sample E](DOMAIN.md#observed-value-distribution)).
+again at 2.1.282 and 2.1.303 ([DOMAIN.md, Samples E and F](DOMAIN.md#observed-value-distribution)).
 The `initialize` control handshake is pinned separately too, at 2.1.284, in
 [its own section](#the-initialize-control-handshake-compose-pick-list), with the
 workspace-trust rule the fetch's form depends on: both are probed or read out of
@@ -1662,7 +1662,7 @@ rest, `claude <command> --help` is authoritative.
 
 | Flag | Effect |
 | --- | --- |
-| `--json` | Print active sessions (interactive + background) as a JSON array and exit — no TTY needed. This is the shape `snapback` parses fail-soft; its fields, and which records carry `id` / `pid`, are measured in [DOMAIN.md](DOMAIN.md#reported-agents-srcagentsrs). A run that cannot answer (no child, a non-zero exit, no readable array) counts as "not live" for every gate but the `Ctrl-X w` move, which refuses instead ([DOMAIN.md](DOMAIN.md#why-the-gate-does-not-read-the---all-map)). |
+| `--json` | Print active sessions (interactive + background) as a JSON array and exit — no TTY needed. This is the shape `snapback` parses fail-soft; its fields, and which records carry `id` / `pid`, are measured in [DOMAIN.md](DOMAIN.md#reported-agents-srcagentsrs). A run that cannot answer (no child, a non-zero exit, no readable array) counts as "not live" for every gate but the `Ctrl-X w` move, which refuses instead ([DOMAIN.md](DOMAIN.md#why-the-gate-does-not-read-the---all-map)). It can list a record whose process no longer runs (seen at 2.1.303 for a process stuck in exit), so snapback drops an `interactive` record whose `pid` the kernel says is gone ([DOMAIN.md](DOMAIN.md#records-that-name-a-gone-process)). |
 | `--all` | With `--json`, also include completed background sessions. |
 | `--cwd <path>` | Only background sessions started under `<path>`. |
 | `--agent` / `--model` / `--effort` / `--permission-mode` | Defaults for sessions dispatched from agent view. |

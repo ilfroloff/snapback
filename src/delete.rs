@@ -107,7 +107,13 @@ pub const DELETE_MOVING_REFUSAL: &str = "snapback is still moving this session t
 ///
 /// The arms:
 ///
-/// * `None` — claude is not holding it ⇒ `Ok(())`.
+/// * `None` — claude is not holding it ⇒ `Ok(())`. That includes a session
+///   claude lists ONLY through an INTERACTIVE record the parse left out as naming
+///   a gone process ([`crate::agents::parse_agents_json`]). A BACKGROUND record is
+///   never left out that way, so it reaches the BACKGROUND arm below unless a
+///   later, kept INTERACTIVE record for the same session wins the collapse. Why
+///   that drop answers this guard's question, and every case that keeps a record:
+///   DOMAIN.md, "Records that name a gone process".
 /// * `Some` INTERACTIVE ⇒ [`DELETE_INTERACTIVE_REFUSAL`]. The one arm that must
 ///   never widen.
 /// * `Some` BACKGROUND — every other `kind`, INCLUDING a drifted or empty one:

@@ -229,6 +229,16 @@ reports about it and never guesses where it is running. With no job, a `live`
 session can't be attached to or stopped with `claude stop`; `Ctrl-K` in the
 [key table](#keys) covers what the board can do instead.
 
+Claude Code can keep listing a session as open (`live`) after the process it
+names has ended (exited, or stuck while exiting). snapback asks the operating
+system about that process, and when the answer is that it no longer runs, it
+ignores that entry. The session then shows whatever else Claude Code reports for
+it, such as an earlier background job's `bg stopped`, or no badge at all. `Enter`,
+`Ctrl-R`, `Ctrl-K`, `Ctrl-X w` and `Ctrl-X d` all treat it as not running. When
+the answer is unclear, the entry is kept, and a background job's entry is always
+kept. Claude Code itself may still count that entry, and refuse to open the
+session, until it lets go of it.
+
 The pulse is the tell for activity, and it is the *first* thing to read — not the
 shade. Only a working (or unrecognized) badge pulses, once a second, and only its dot,
 which fades between the bright and the dim gray rather than blinking out, so no

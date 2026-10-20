@@ -169,7 +169,9 @@ background agent is judged by its
 [activity bucket](#activity-buckets-agentactivity): `NeedsInput`,
 `WorkingButIdle`, `Done` and `Ended` are parked and deletable; `Working`, `Idle`
 and `Other` are refused, the last of those because an unreadable qualifier must
-not authorize an irreversible unlink.
+not authorize an irreversible unlink. An INTERACTIVE record whose process the
+kernel says is gone never reaches the guard at all; a background record always
+does, whatever its pid, and its bucket decides as above (the `pid` note below).
 
 Those are `can_delete`'s two refusals, and they cover only TWO of the four
 writers. The other two are snapback's OWN. The third is a
@@ -262,15 +264,27 @@ other or from `kind`. The re-measurement changes the figure, not the decision: a
 present pid is still no evidence of a write, and an absent one no evidence of
 none.
 
-The pid now has TWO consumers, and neither asks the writer question. The
+The pid now has THREE consumers. Two never ask the writer question. The
 [`Ctrl-K` interrupt gate's signal route](#the-signal-route-no-job-id-a-pid) asks
 "which process do I signal?" for a reported session that has no stoppable job
-id — the only reader of its VALUE, and the reason `ReportedAgent::pid` was
-parsed. The pinned preview row asks only whether one is PRESENT, to decide
-whether a live agent's status and age ride after the turn marker (see
-[reported agents](#reported-agents-srcagentsrs)). The field's doc comment names
-both and carries the same prohibition as this note, so the pid cannot drift into
-the writer guard without contradicting both.
+id, and it is the reason `ReportedAgent::pid` was parsed. The pinned preview row
+asks only whether one is PRESENT, to decide whether a live agent's status and age
+ride after the turn marker (see [reported agents](#reported-agents-srcagentsrs)).
+
+The third, the parse's [gone-process filter](#records-that-name-a-gone-process),
+answers the writer question for ONE case, and only by removal. It leaves out an
+INTERACTIVE record whose pid the kernel says names no running process, so the
+guard never sees that record and the `None` arm allows. That is the writer
+question asked again, not skipped: that pid was the record's writer, claude
+appends by re-opening the path, and a process that no longer runs cannot. A
+background record's pid was never shown to be its writer, so the filter keeps
+every background record and the guard keeps judging it by its bucket. It reaches
+the guard in that direction only. It never adds a record, and a pid the kernel
+calls running, or cannot settle, leaves the record exactly as it was, so a
+present pid is still no evidence of a write. `delete::can_delete` itself still
+never reads the field. The field's doc comment names all three and carries the
+same prohibition as this note, so the pid cannot drift into the writer guard any
+other way without contradicting both.
 
 **Known, accepted risk on that route (ratified, not engineered around).** The
 route sends a SIGTERM and nothing stronger: no SIGKILL and no escalation. It
@@ -1435,11 +1449,13 @@ step that branches on it:
 - `state`/`status`, the activity qualifier (see below).
 - `pid`, the OS process id claude reports: a JSON number, read with `as_u64` and
   narrowed with `u32::try_from`, so an absent, mistyped (a string) or out-of-range
-  value is `None` and never discards the record. Its VALUE has one consumer,
-  `Ctrl-K`'s [signal route](#the-signal-route-no-job-id-a-pid); its PRESENCE is
-  the pinned preview row's LIVE test (`view::reports_live_process`, next
-  bullet). It is NOT a writer signal; see
-  [the one write into this tree](#on-disk-layout).
+  value is `None` and never discards the record. Its VALUE has two consumers:
+  the parse's [gone-process filter](#records-that-name-a-gone-process), which
+  asks the kernel about an interactive record's pid before that record is kept,
+  and `Ctrl-K`'s
+  [signal route](#the-signal-route-no-job-id-a-pid). Its PRESENCE is the pinned
+  preview row's LIVE test (`view::reports_live_process`, next bullet). It is
+  NOT a writer signal; see [the one write into this tree](#on-disk-layout).
 - `startedAt`, when claude says the session started: epoch MILLISECONDS as a JSON
   number (13 digits, e.g. `1790152789592`), read with `as_i64`, fail-soft. Its
   one consumer is the preview banner's age phrase (`live busy · 46m`, built by
@@ -1461,14 +1477,18 @@ step that branches on it:
 `name` is still on the wire (69/83 background and 3/3 interactive records in the
 2.1.278 bare probe) but is no longer parsed: `ReportedAgent` dropped it because
 nothing read it, not because claude stopped sending it. Parsing is fail-soft: any
-failure ⇒ empty map, and one bad field never discards its record. The move's
+failure ⇒ empty map, and one bad field never discards its record. The one record
+the parse does discard is an interactive one whose process the kernel says is gone
+([below](#records-that-name-a-gone-process)). The move's
 reading alone (`try_live_agents`) gets `None` there instead, so it can tell "could
 not ask" from "nothing is live"
 ([below](#why-the-gate-does-not-read-the---all-map)).
 
-**Two fields, two sources, two questions.** The signal route's `pid` comes ONLY
-from the bare one-shot probe (`App::live_agent_now`), never from the polled
-`--all` map. That is the rule `id` already follows, and it matters more here: a
+**Two fields, two sources, two questions.** Past the parse, the signal route's
+`pid` comes ONLY from the bare one-shot probe (`App::live_agent_now`), never from
+the polled `--all` map (the parse's own kernel check reads it inside the same
+call that read claude's answer, before any map exists).
+That is the rule `id` already follows, and it matters more here: a
 stale job id makes `claude stop` fail with "No job matching", while a stale pid
 may already belong to an unrelated process. The banner's `startedAt` DOES come
 from the polled `--all` map, because an age is a display fact and not a gate. So
@@ -1489,6 +1509,127 @@ job only until claude reaps it from the active list (a just-`done` background jo
 lingers there for a while, then drops out): without the flag a finished session's
 badge would vanish the moment claude reaps it, so `--all` is what keeps every
 `done` session — reaped or not — reliably badged.
+
+#### Records that name a gone process
+
+claude can go on listing a record whose process no longer runs. Both readings,
+and the move's `try_live_agents`, therefore leave out an INTERACTIVE record —
+`kind` exactly `agents::KIND_INTERACTIVE` — whose `pid` the kernel DEFINITELY
+says names no running process. The rule is the pure
+`agents::reports_a_gone_process` over an injected `pid_gone`, applied inside the
+one parse to each element BEFORE the last-one-wins collapse. It tests `kind`
+first, never inferring it from the pid or the job `id`, so no other record's pid
+is put to the kernel at all. The real check is `agents::kernel_says_gone`.
+
+**It fails toward KEEPING**, and this is the one list of what keeps a record. A
+dropped record reads as "not live" to every gate the bare probe feeds, the
+hard-delete writer guard included, so a record is dropped only when it is
+interactive AND the kernel says "gone". Every other record is kept:
+
+- a record whose `kind` is not exactly `interactive`: `background`, absent,
+  mistyped, or a value claude has not been seen to send. The kernel is not asked.
+- a record with no `pid`, or one `send::positive_pid_t` (the range half of
+  `send::signallable_pid`) refuses: `0`, or anything past `i32::MAX`. The kernel
+  is not asked.
+- an interactive record for which the kernel gives any answer but "gone":
+
+| Platform | Gone: the record is left out | Anything else: the record is kept |
+| --- | --- | --- |
+| macOS | `proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, …)` fails with `ESRCH`: no such process, a zombie, or one still exiting | success; `EPERM` (a process the board may not inspect, e.g. pid 1 for an unprivileged user); any other errno |
+| Linux | `/proc/<pid>/stat` is READ and its state is `Z` or `X` (the pure `agents::proc_read_says_gone`) | any other state; NO entry, because a live pid has none either from another PID namespace (snapback in a container sharing `~/.claude` with a host `claude`) or behind a `hidepid` procfs; any other read error |
+| anything else | never | always |
+
+**Known, accepted risk: a `claude` in another PID namespace (ratified, not
+engineered around).** A `claude` running in a Linux container or VM that shares
+the macOS host's `~/.claude` lists its records with pids from its own PID
+namespace, numbers that mean nothing to the host kernel. On that host
+`proc_pidinfo` answers `ESRCH` for such a pid unless a host process happens to
+hold the same number, so a live interactive `claude`'s record is dropped. Every
+gate the bare probe feeds then reads the session as "not live": the hard-delete
+writer guard lifts its interactive refusal, and `Enter`, `Ctrl-R` and the
+`Ctrl-X w` move no longer treat that `claude` as holding the session. The setup
+is niche, so a foreign pid is not told apart from a gone one. When snapback
+runs on Linux, in the container or on its host, the check reads
+`/proc/<pid>/stat` for the number as claude reported it, from the procfs
+snapback sees at `/proc`. Where that number has no entry, the read fails and the
+record is kept (`agents::proc_read_says_gone`). Where it has one, the entry is
+whichever process holds that number there, and the record is dropped exactly
+when that process's state is `Z` or `X` (`agents::proc_stat_says_gone`) and kept
+for any other state. How often a foreign number has an entry, on either side,
+was not measured. Derived from the check's rule; not reproduced.
+
+**Known, accepted risk: a Linux process whose main thread has exited (accepted
+and documented, not closed).** On Linux the check decides from one field, the
+state after the command name's closing `)` in `/proc/<pid>/stat`
+(`agents::proc_stat_says_gone`), and calls a `Z` there gone. A process whose
+MAIN thread has exited, for example through `pthread_exit`, while another of its
+threads still runs reads `Z` there too. Such a `claude` would have its
+interactive record dropped as gone while it still runs, and every gate the bare
+probe feeds would read its session as "not live", as above. Measured on
+2026-10-20 in a throwaway `node:24.17.0` (Debian) container: a C program whose
+main thread called `pthread_exit` while a second thread kept sleeping read `Z`
+in `/proc/<pid>/stat` (and `State: Z (zombie)` in `/proc/<pid>/status`) with
+`Threads: 2` and task states `S Z`. So the OS behaviour is verified; whether
+claude's runtime (Bun) ever exits its main thread this way is NOT verified. The
+check stays as reviewed: confirming that no thread still runs was considered
+and rejected.
+
+**Why interactive only.** A drop settles the writer question only where the
+record's pid IS the transcript's writer: then a process that no longer runs
+cannot re-open the path to append ([the one write into this tree](#on-disk-layout)).
+That holds for an interactive record, whose pid named the `claude` session
+process itself or a `claude -p -r` child appending a reply
+([Sample F](#observed-value-distribution)). It was not shown for a background
+record. Every background pid seen named a running `claude bg-spare` process on a
+parked `done` or `blocked` job, the one `working` job carried no pid, and whether
+claude keeps a job running after the process its record names has gone was not
+observed. So the writer question is not re-derived for a background record, and
+dropping one could let the delete guard unlink, `Ctrl-R` reply to, and the move
+relocate a job that still runs. A background record therefore always reaches the
+gates, and the delete guard still refuses a `Working`, `Idle` or `Other` one.
+
+A reused pid is safe both ways: a running newcomer keeps the record, as before
+this filter, and a pid is only reused once claude's own process was reaped.
+`kill(pid, 0)` is NOT this check: it succeeds for a zombie and for a process
+stuck in exit. `arg` 0 is what makes `ESRCH` cover both: with `arg` 1 XNU also
+looks up zombies, and answers a zombie `SZOMB` and a process stuck in exit
+`SRUN`, so a status check would miss the second (measured on macOS 27.0.1,
+2026-10-20). It runs only where a `claude agents --json` answer is read (the
+poller's thread, the hand-off probe, the move's worker), and only for an
+interactive record that carries a pid.
+
+**The case that prompted it, measured 2026-10-20 at `claude 2.1.303` on macOS
+27.0.1, in both [Sample F](#observed-value-distribution) captures.** A session had
+TWO records under `--all`: a `stopped` background job, then an `interactive`
+record whose pid named a `claude 2.1.300` process stuck in exit (`ps` STAT `E`, a
+zombie child under it). `kill(pid, 0)` succeeded for it, while `proc_pidinfo`
+answered `ESRCH`. The bare list held only the interactive record. Unfiltered, the
+collapse kept the interactive record in both readings, so the session read as an
+open `live` session that `Ctrl-R`, `Ctrl-X d` and `Enter` treated as running.
+Filtered, the `--all` map falls back to the job (`bg stopped`) and the bare list
+drops the session. Over capture F2 (11:55:04 UTC) the bare reading went from 109
+sessions to 108 and the `--all` reading kept its 346, and no other session's
+record changed. With nothing held, `Enter` resumes plainly, `Ctrl-R` replies in
+place with no `claude stop` step (the stopped job is not in claude's active
+list), `Ctrl-K` finds nothing to stop, and the delete guard allows.
+
+claude's own registry still lists that process, and the 2.1.303 bundle checks the
+same live-session list before it opens a session ("Can't open — this session is
+running in another terminal"). That was read out of the bundle, not seen in a run,
+so a resume or reply snapback now lets through may still be refused by claude.
+That is the "not live" direction a failed probe already takes: claude's own check
+decides one step later, and the user sees its message. snapback never edits
+claude's registry.
+
+The pids, per capture (the same records under both flags in each). F1, 11:13:50
+UTC: 9 records carried one. 4 were interactive — 3 running `claude -p -r`
+children and the stuck process above — and 5 background (`done` ×2, `blocked`
+×3), each naming a running `claude bg-spare` process. F2, 11:55:04 UTC: 7 did,
+the same 5 background records with the same pids, `ps` again naming
+`claude bg-spare` processes, and 2 interactive: the stuck process and one running
+`claude -p -r` child. In both, the kernel called the stuck process gone and every
+other pid running. Under the interactive-only rule the kernel is asked about 4
+pids at F1 and 2 at F2.
 
 #### What `kind: "interactive"` denotes
 
@@ -1568,8 +1709,10 @@ pressed Enter on a `● bg done` row and got claude's refusal instead of a
 resume — a TOCTOU race.
 
 The bare command needs no inference because **it IS claude's active list**:
-membership is liveness, structurally. So the two readings are kept apart on
-purpose, and the split is load-bearing in both directions:
+membership is liveness, structurally. The one subtraction is an interactive
+record the kernel says names a [gone process](#records-that-name-a-gone-process),
+and it errs toward "not live", as a failed probe does. So the two readings are
+kept apart on purpose, and the split is load-bearing in both directions:
 
 - Adding `--all` to the probe would report every finished session as live and
   divert all ~123 of them into the overlay instead of resuming.
@@ -1826,6 +1969,27 @@ also in [the one write into this tree](#on-disk-layout)):
 | `background` | 85 | `cwd` 85, `id` 85, `kind` 85, `name` 71, `pid` 1, `sessionId` 85, `startedAt` 85, `state` 85, `status` 1 |
 | `interactive` | 3 | `cwd` 3, `kind` 3, `name` 3, `pid` 3, `sessionId` 3, `startedAt` 3, `status` 3 (no `id`, no `state`) |
 
+Sample F, dated 2026-10-20 at `claude 2.1.303` on macOS 27.0.1, taken for the
+[gone-process filter](#records-that-name-a-gone-process) at two instants, each a
+bare probe and an `--all` probe taken within two seconds of each other: F1 at
+11:13:50 UTC and F2 at 11:55:04 UTC. The counts moved between the two (two
+interactive records left, and `--all` holds one `blocked` fewer and one `stopped`
+more); the shape did not. F1's bare list was not counted by session:
+
+| Capture | Command | Entries | `state` (background only) | `status` |
+| --- | --- | --- | --- | --- |
+| F1 | `claude agents --json` | 112 (108 background, 4 interactive) | `blocked`×105, `done`×2, `working`×1 | `idle`×5 on background records; `busy`×3, `idle`×1 interactive |
+| F1 | `claude agents --json --all` | 350 in 346 sessions (346 background, 4 interactive) | `stopped`×155, `blocked`×105, `done`×84, `failed`×1, `working`×1 | the same 9 as the bare list |
+| F2 | `claude agents --json` | 109 in 109 sessions (107 background, 2 interactive) | `blocked`×104, `done`×2, `working`×1 | `idle`×5 on background records; `busy`×1, `idle`×1 interactive |
+| F2 | `claude agents --json --all` | 348 in 346 sessions (346 background, 2 interactive) | `stopped`×156, `blocked`×104, `done`×84, `failed`×1, `working`×1 | the same 7 as the bare list |
+
+In all four probes `id` was on every background record and on no interactive one,
+and `pid` on every interactive record and on 5 background ones: the same records
+under both flags (9 in F1, 7 in F2), the same 5 background sessions in both
+captures, and those 5 the only background records carrying a `status` beside
+their `state`. The bare `done`×2 are two of those 5, each its own session. The
+nine-key union was unchanged.
+
 In Samples C and D, `state` and `status` were **kind-exclusive**: every background
 record carried a `state` and no `status`, and every interactive record the
 reverse. Sample A had records carrying BOTH (35 with a `state` and 21 with a
@@ -1854,12 +2018,20 @@ carries **123** records the gate must never treat as live.
 
 **Known, accepted risk:** `parse_agents_json` is **last-one-wins per
 `sessionId`**. Sample A showed **zero** duplicate `sessionId`s across all 160
-entries, but that is a sampled observation, not a structural guarantee. If it
-ever broke and a `done` record overwrote an active one, the row's **badge** would
-read `done` while the session ran. That is now cosmetic rather than behavioral:
-the resume gate does not read this map, so Enter still probes claude and still
-routes to Attach/Fork correctly. Deliberately **not** engineered around (YAGNI);
-recorded so the failure mode is recognizable if it ever surfaces.
+entries. Sample F's `--all` shows them: 4 in F1 (350 records in 346 sessions) and
+2 in F2 (348 in 346). In F2 each of its 2 interactive records shares its session
+with a finished background record (`stopped` for one, `done` for the other)
+listed BEFORE it, and for both sessions the bare list holds the interactive
+record alone (109 entries in 109 sessions). So the collapse keeps the interactive
+record, which is the right one while its process runs, and the
+[gone-process filter](#records-that-name-a-gone-process) runs before the
+collapse so that, once that process is gone, the background record is what stays.
+The order is an observation at 2.1.303, not a contract. If it flipped and a
+finished record overwrote an active one, the row's **badge** would read `done` or
+`stopped` while the session ran. That is cosmetic rather than behavioral: the
+gates do not read this map, so Enter still probes claude and still routes to
+Attach/Fork correctly. Deliberately **not** engineered around (YAGNI); recorded
+so the failure mode is recognizable if it ever surfaces.
 
 ### Bound agent (`store::preview`)
 
@@ -3462,7 +3634,7 @@ never the polled `--all` map — classified by the one `agents::classify`), and
 | --- | --- | --- |
 | not asked: the SELECTED session's own quick reply is still in flight, or — on a fork's row — the headless fork that is creating it (`App::sending_to` answers for both, the fork's child being recorded under the fork's id); a reply in flight to another row is not this row's and never lands here | — | refuse (`SEND_IN_FLIGHT_REFUSED`, about this session, worded for a reply or a fork) BEFORE the probe, via `send::reply_in_flight_refusal`: no compose opens |
 | not asked: the SELECTED session's own [`Ctrl-X w` move](#move-to-another-worktree-ctrl-x-w-srcclaude_movers) is still in flight (`App::moving_on`); a move on another row never lands here | — | refuse (`MOVING_REPLY_REFUSAL`) BEFORE the probe, after the reply check above: no compose opens |
-| claude is not holding the session | — | reply in place, no stop (compose opens) |
+| claude is not holding the session, counting one it lists only through an interactive record naming a [gone process](#records-that-name-a-gone-process) | — | reply in place, no stop (compose opens) |
 | held, but the record carries no stoppable job id (every `kind: "interactive"` record measured so far), with or without a `pid` | — | refuse (`SEND_LIVE_REFUSED`) — try `Ctrl-K` or Fork (`Ctrl-F`) |
 | `done` | `Done` | stop the ended job, then reply — straight to compose |
 | `stopped`, `failed` | `Ended` | same: stop, then reply |
@@ -3617,7 +3789,7 @@ a refusal.
 
 | Probe result | Bucket | `Ctrl-K` (`send::interrupt_gate`) |
 | --- | --- | --- |
-| claude is not holding the session | — | refuse (`INTERRUPT_NOT_LIVE`) — a transcript on disk is not a running process |
+| claude is not holding the session, counting one it lists only through an interactive record naming a [gone process](#records-that-name-a-gone-process) | — | refuse (`INTERRUPT_NOT_LIVE`) — a transcript on disk is not a running process |
 | held, no stoppable job id, a `pid` on the record that a signal could take | not read | **confirm** first (`App::pending_interrupt` carrying `InterruptRoute::Signal { pid }`, drawn as "signal this process?"), then [re-probe and SIGTERM](#the-signal-route-no-job-id-a-pid) |
 | held, no stoppable job id, a `pid` no signal could take (`0`, past `i32::MAX`, or the board's own process id) | not read | refuse (`INTERRUPT_PID_UNUSABLE`), so no confirm opens — worded for the record: no attachable job and a process id that cannot be signalled |
 | held, NEITHER a stoppable job id nor a `pid` | — | refuse (`INTERRUPT_NO_JOB_ID`) — worded for the record: no attachable job and no process id, so no handle here to stop or signal it |
@@ -3805,7 +3977,7 @@ names:
 | no worktree list was resolved (git unavailable) | `App::open_move_picker` | `MOVE_WORKTREES_UNKNOWN` |
 | the transcript is gone, unreadable or yields no `cwd`, or its current folder is gone | the worker (`resume::plan_at`) | `MOVE_SOURCE_GONE`, one line naming no path, never `plan_at`'s own multi-line resume wording |
 | the target is unusable (relative or not UTF-8), gone, or resolves to the current folder | the worker (`claude_move::check_target`) | `MOVE_TARGET_UNUSABLE`, `MOVE_TARGET_GONE`, `MOVE_ALREADY_THERE` |
-| claude lists the session as active: moving a file something is writing would split its transcript | the worker (`claude_move::liveness_refusal`) | `MOVE_LIVE_REFUSAL` |
+| claude lists the session as active (an interactive record naming a [gone process](#records-that-name-a-gone-process) does not count; a background one always does): moving a file something is writing would split its transcript | the worker (`claude_move::liveness_refusal`) | `MOVE_LIVE_REFUSAL` |
 | claude could not be asked: `claude agents --json` did not start, exited non-zero, or printed no readable list (`agents::try_live_agents` is `None`) | the worker (`claude_move::liveness_refusal`) | `MOVE_PROBE_FAILED_REFUSAL`, worded apart from `MOVE_LIVE_REFUSAL`. The move alone fails toward refusing here; every other gate reads a failed probe as "not live" ([why](#why-the-gate-does-not-read-the---all-map)) |
 | a lineage member snapback itself is still moving or replying to | `update::start_lineage_move`, per member (`claude_move::own_writer_refusal`, the rule the picker's open asks of the head) | skipped on the key, counted `skipped (running)` |
 | a lineage member a reload dropped from the board | `update::start_lineage_move` | skipped on the key, counted `already gone` |

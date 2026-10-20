@@ -1388,7 +1388,9 @@ pub(crate) fn signallable_pid(pid: u32, own_pid: u32) -> Option<i32> {
 /// STRICTLY POSITIVE, else `None`. Stated once here and read by both
 /// [`signallable_pid`] (at the gate) and [`signal_target`] (right before `kill(2)`),
 /// so the check that keeps a process group or a broadcast out of `kill(2)` still runs
-/// twice without being written twice.
+/// twice without being written twice. Its third reader is the `claude agents` parse's
+/// gone-process filter (`agents::reports_a_gone_process`), which puts only a pid this
+/// accepts to the kernel and keeps every record whose pid it refuses.
 ///
 /// The parser accepts the whole `u32` range, so the conversion is `try_from` and never
 /// `as`: `as` would WRAP `u32::MAX` to `-1` (a broadcast) and everything past
@@ -1396,7 +1398,7 @@ pub(crate) fn signallable_pid(pid: u32, own_pid: u32) -> Option<i32> {
 /// a real kernel, so refusing it costs nothing and removes the only route by which a
 /// sign could flip.
 #[must_use]
-fn positive_pid_t(pid: u32) -> Option<i32> {
+pub(crate) fn positive_pid_t(pid: u32) -> Option<i32> {
     i32::try_from(pid).ok().filter(|target| *target > 0)
 }
 
@@ -1422,7 +1424,7 @@ fn positive_pid_t(pid: u32) -> Option<i32> {
 /// compiling rather than narrow silently.
 ///
 /// The rule's BOARD half (the board's own pid) is NOT asked again here, deliberately.
-/// This step takes the pid alone because [`signal_term`] — one of the crate's two
+/// This step takes the pid alone because [`signal_term`] — one of the crate's three
 /// `unsafe` blocks, kept exactly as reviewed — hands it the pid alone, and reading
 /// the board's pid in here would make it impure. Nothing is lost: a process's id
 /// never changes while it runs, so the gate's verdict on the board's pid cannot go
@@ -1439,8 +1441,9 @@ fn signal_target(pid: u32) -> Result<libc::pid_t, std::io::Error> {
 }
 
 /// Send `pid` a **SIGTERM**. The ONE impure step on the signal route, and `Ctrl-K`'s
-/// one syscall; the crate's only other one is the catalog fetch's `killpg(2)`, aimed
-/// at a process group that fetch spawned itself.
+/// one syscall; the crate's only other signal is the catalog fetch's `killpg(2)`, aimed
+/// at a process group that fetch spawned itself. Its one other `libc` call,
+/// `proc_pidinfo` (`agents::kernel_says_gone`, macOS), signals nothing.
 ///
 /// Thin on purpose: every decision that led here is pure and tested elsewhere
 /// ([`interrupt_gate`] chose the route, [`signal_plan`] re-verified the pid,
@@ -1476,7 +1479,7 @@ fn signal_target(pid: u32) -> Result<libc::pid_t, std::io::Error> {
 /// Unix-only. Off unix a same-signature fallback compiles in its place and REFUSES
 /// rather than signals, so the driver's one call site builds on every target. The
 /// split is two `#[cfg]` ITEMS rather than `#[cfg]` statements inside one body, so
-/// this function — one of the crate's two `unsafe` blocks — stays exactly as reviewed.
+/// this function — one of the crate's three `unsafe` blocks — stays exactly as reviewed.
 #[cfg(unix)]
 pub fn signal_term(pid: u32) -> Result<(), std::io::Error> {
     let target = signal_target(pid)?;
