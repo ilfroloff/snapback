@@ -9266,19 +9266,20 @@ mod tests {
     /// most recent write wins then.
     #[test]
     fn the_open_target_follows_the_held_wall_clock() {
-        use crate::store::subagents::Subagent;
+        use crate::store::subagents::{RunVerdict, Subagent};
 
         let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
-        let subagent = |agent_id: &str, launched: i64, idle_secs: u64, ended: bool| Subagent {
-            agent_id: agent_id.to_string(),
-            agent_type: format!("{agent_id}-type"),
-            description: None,
-            launched: Some(
-                time::OffsetDateTime::from_unix_timestamp(launched).expect("an instant"),
-            ),
-            newest_write: Some(at - Duration::from_secs(idle_secs)),
-            ended: Some(ended),
-        };
+        let subagent =
+            |agent_id: &str, launched: i64, idle_secs: u64, ended: RunVerdict| Subagent {
+                agent_id: agent_id.to_string(),
+                agent_type: format!("{agent_id}-type"),
+                description: None,
+                launched: Some(
+                    time::OffsetDateTime::from_unix_timestamp(launched).expect("an instant"),
+                ),
+                newest_write: Some(at - Duration::from_secs(idle_secs)),
+                ended: Some(ended),
+            };
         let mut app = App::new(
             vec![delegation_session("s1")],
             Scope::All,
@@ -9287,8 +9288,8 @@ mod tests {
         app.apply_subagent_record(
             "s1",
             SubagentRecord::new(vec![
-                subagent("early", 1, 60, false),
-                subagent("late", 2, 30, true),
+                subagent("early", 1, 60, RunVerdict::Open),
+                subagent("late", 2, 30, RunVerdict::Finished),
             ]),
         );
         app.note_wall_clock(at);
@@ -9628,7 +9629,7 @@ mod tests {
     /// subagent the record does not list, there is no state.
     #[test]
     fn the_subagent_views_state_is_its_renders_verdict_and_goes_with_each_eviction() {
-        use crate::store::subagents::{subagents_dir, transcript_path};
+        use crate::store::subagents::{subagents_dir, transcript_path, RunVerdict};
         use SubagentStatus::{Finished, Quiet, Running};
 
         // A run waiting on the sub-subagent it launched, then the same run
@@ -9699,7 +9700,7 @@ mod tests {
         app.preview_text(DELEGATION_WIDTH);
         assert_eq!(app.subagent_view_status(), Some(Finished), "judged again");
         let stale = Subagent {
-            ended: Some(false),
+            ended: Some(RunVerdict::Open),
             ..app.viewed_subagent().expect("listed").clone()
         };
         app.apply_subagent_record("s1", SubagentRecord::new(vec![stale]));

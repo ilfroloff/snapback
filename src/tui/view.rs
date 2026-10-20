@@ -1167,7 +1167,8 @@ fn unbound_marker_span() -> Span<'static> {
 }
 
 /// The color that says "a background task failed" — the row marker and the
-/// banner sentence alike, so the two surfaces read as one fact.
+/// banner sentence alike, so the two surfaces read as one fact — and, for the
+/// same fact about a subagent's run, the subagent view title's `failed`.
 ///
 /// `Red`: the board's one accent for "this wants you" (the `NeedsInput` glyph,
 /// [`BADGE_NEEDS_INPUT_COLOR`], already speaks it), and a failure nobody has
@@ -2792,13 +2793,15 @@ fn subagent_title_line(
 }
 
 /// The subagent view title's state, in [`SubagentStatus`]'s words: `running` in
-/// [`RUNNING_COLOR`], the running list's `●` green; `quiet` in
+/// [`RUNNING_COLOR`], the running list's `●` green; `failed` in
+/// [`FAILED_TASK_COLOR`], a failed background task's red; `quiet` in
 /// [`SUBAGENT_QUIET_COLOR`]; `finished` unstyled, a settled run that asks
 /// nothing of the reader. NAMED ANSI colours only (TERMINAL-SAFE STYLING). Pure.
 fn subagent_status_span(status: SubagentStatus) -> Span<'static> {
     match status {
         SubagentStatus::Running => Span::styled("running", Style::default().fg(RUNNING_COLOR)),
         SubagentStatus::Finished => Span::raw("finished"),
+        SubagentStatus::Failed => Span::styled("failed", Style::default().fg(FAILED_TASK_COLOR)),
         SubagentStatus::Quiet => Span::styled("quiet", Style::default().fg(SUBAGENT_QUIET_COLOR)),
     }
 }
@@ -6656,6 +6659,7 @@ mod tests {
     use super::super::app::ModalAction;
     use super::*;
     use crate::send::OWNERSHIP_CLAIMS;
+    use crate::store::subagents::RunVerdict;
     use crate::store::Session;
 
     #[test]
@@ -16985,7 +16989,8 @@ mod tests {
     /// The title states every fact it knows, in order —
     /// `subagent @<agentType> · <description> · <state> · started <time> · last write <age> · N/M`
     /// — and draws the state in its colour: `running` in the running list's
-    /// green, `quiet` in the dim gray, `finished` in none.
+    /// green, `quiet` in the dim gray, `failed` in the failed task's red,
+    /// `finished` in none.
     #[test]
     fn the_subagent_title_states_every_fact_it_knows_in_order() {
         assert_eq!(fitted_title(&title_facts(), u16::MAX), FULL_TITLE);
@@ -17009,6 +17014,10 @@ mod tests {
         assert_eq!(
             state_style(SubagentStatus::Quiet, "quiet").fg,
             Some(Color::DarkGray)
+        );
+        assert_eq!(
+            state_style(SubagentStatus::Failed, "failed").fg,
+            Some(Color::Red)
         );
         assert_eq!(
             state_style(SubagentStatus::Finished, "finished"),
@@ -17476,7 +17485,7 @@ mod tests {
         app.apply_subagent_record("sess-normal-1", SubagentRecord::new(Vec::new()));
         assert_eq!(title_text(&app), base, "a record listing none");
 
-        let subagent = |agent_id: &str, ended: Option<bool>| Subagent {
+        let subagent = |agent_id: &str, ended: Option<RunVerdict>| Subagent {
             agent_id: agent_id.to_string(),
             agent_type: "writer".to_string(),
             description: None,
@@ -17487,8 +17496,8 @@ mod tests {
         app.apply_subagent_record(
             "sess-normal-1",
             SubagentRecord::new(vec![
-                subagent("a1", Some(false)),
-                subagent("b2", Some(true)),
+                subagent("a1", Some(RunVerdict::Open)),
+                subagent("b2", Some(RunVerdict::Finished)),
             ]),
         );
         assert_eq!(
@@ -17497,7 +17506,10 @@ mod tests {
         );
         app.apply_subagent_record(
             "sess-normal-1",
-            SubagentRecord::new(vec![subagent("a1", None), subagent("b2", Some(true))]),
+            SubagentRecord::new(vec![
+                subagent("a1", None),
+                subagent("b2", Some(RunVerdict::Finished)),
+            ]),
         );
         let quiet = format!("{base}\u{b7} 2 subagents ");
         assert_eq!(title_text(&app), quiet, "none running");
@@ -17595,7 +17607,7 @@ mod tests {
             description: description.map(str::to_string),
             launched: None,
             newest_write: Some(list_now() - Duration::from_secs(idle_secs)),
-            ended: Some(false),
+            ended: Some(RunVerdict::Open),
         }
     }
 
@@ -17887,7 +17899,7 @@ mod tests {
                 auditor(),
                 running_subagent("b2", "docs-writer", None, 5),
                 Subagent {
-                    ended: Some(true),
+                    ended: Some(RunVerdict::Finished),
                     ..running_subagent("c3", "finished-one", None, 5)
                 },
                 Subagent {

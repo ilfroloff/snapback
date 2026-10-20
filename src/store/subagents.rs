@@ -363,13 +363,13 @@ pub struct Subagent {
     /// [`is_running`] measures from, and the one an age is stated from. `None`
     /// when none of them has an mtime.
     pub newest_write: Option<SystemTime>,
-    /// Whether its own run ENDED, from its tail ([`run_ended`]). `Some` when the
-    /// read parsed that tail — a tail it could not read, or no regular
-    /// transcript, is `Some(false)`, a run that has not ended — and `None` when
-    /// it did not open it at all: nothing at or below the subagent was written
-    /// within [`RUNNING_WINDOW`] of the read, so it cannot be running. The record
-    /// never claims a run finished from a tail it did not parse.
-    pub ended: Option<bool>,
+    /// Whether its own run ENDED, and how, from its tail ([`run_ended`]). `Some`
+    /// when the read parsed that tail — a tail it could not read, or no regular
+    /// transcript, is `Some(RunVerdict::Open)`, a run that has not ended — and
+    /// `None` when it did not open it at all: nothing at or below the subagent
+    /// was written within [`RUNNING_WINDOW`] of the read, so it cannot be
+    /// running. The record never claims a run ended from a tail it did not parse.
+    pub ended: Option<RunVerdict>,
 }
 
 /// Every subagent ONE session launched, at any depth, in LAUNCH ORDER
@@ -490,8 +490,12 @@ pub fn launch_order(a: &Subagent, b: &Subagent) -> Ordering {
 /// holds, so a subagent turns quiet when its window passes with no file read.
 /// PURE.
 #[must_use]
-pub fn is_running(ended: Option<bool>, newest_write: Option<SystemTime>, now: SystemTime) -> bool {
-    ended == Some(false) && within_window(newest_write, now)
+pub fn is_running(
+    ended: Option<RunVerdict>,
+    newest_write: Option<SystemTime>,
+    now: SystemTime,
+) -> bool {
+    ended == Some(RunVerdict::Open) && within_window(newest_write, now)
 }
 
 /// Where a subagent's own run stands at a `now`, in the words the subagent
@@ -500,10 +504,13 @@ pub fn is_running(ended: Option<bool>, newest_write: Option<SystemTime>, now: Sy
 pub enum SubagentStatus {
     /// [`is_running`].
     Running,
-    /// Its end was read: `ended` is `Some(true)`.
+    /// Its end was read: `ended` is `Some(RunVerdict::Finished)`.
     Finished,
-    /// Neither: an unfinished run silent past [`RUNNING_WINDOW`], or one whose end
-    /// was never read (`ended` `None`), which cannot be running either.
+    /// Its end was read, and it ended in a failure: `ended` is
+    /// `Some(RunVerdict::Failed)`.
+    Failed,
+    /// None of these: an unfinished run silent past [`RUNNING_WINDOW`], or one
+    /// whose end was never read (`ended` `None`), which cannot be running either.
     Quiet,
 }
 
@@ -513,13 +520,18 @@ impl SubagentStatus {
     /// so the title can never call running what the list leaves off. Worked out
     /// at draw time, like [`is_running`]. PURE.
     #[must_use]
-    pub fn of(ended: Option<bool>, newest_write: Option<SystemTime>, now: SystemTime) -> Self {
+    pub fn of(
+        ended: Option<RunVerdict>,
+        newest_write: Option<SystemTime>,
+        now: SystemTime,
+    ) -> Self {
         if is_running(ended, newest_write, now) {
-            Self::Running
-        } else if ended == Some(true) {
-            Self::Finished
-        } else {
-            Self::Quiet
+            return Self::Running;
+        }
+        match ended {
+            Some(RunVerdict::Finished) => Self::Finished,
+            Some(RunVerdict::Failed) => Self::Failed,
+            Some(RunVerdict::Open) | None => Self::Quiet,
         }
     }
 }
@@ -536,13 +548,33 @@ fn within_window(written: Option<SystemTime>, now: SystemTime) -> bool {
 /// reply ([`after_record`]) in a run that has not handed back: claude ended the
 /// turn there. Text after a hand-back needs none of them.
 ///
-/// Measured 2026-10-12 over a local store: of the assistant text records later
-/// joined by a `tool_use` of the same turn, 14,942 carried a null `stop_reason`
-/// and 92 `tool_use`, never `end_turn`; of the real final replies, 1,117 carried
-/// `end_turn`, 2 `stop_sequence` and 5 null. So a null or `tool_use` one keeps the
-/// run open — a narrated tool call never reads as finished mid-turn — and those 5
-/// read as unfinished unless a hand-back came before them.
+/// Measured 2026-10-19 over the 2,289 subagent transcripts of a local store: of
+/// the assistant text records later joined by a `tool_use` of the same message,
+/// 17,028 carried a null `stop_reason` and 94 `tool_use`, never `end_turn`; of
+/// the text records with no `tool_use` standing as a transcript's last turn,
+/// 1,108 real replies carried `end_turn`, 5 null and none `stop_sequence`, and
+/// 5 API errors (`isApiErrorMessage`, counted apart: they end a run failed,
+/// [`after_record`]) all carried `stop_sequence`. The 2 `stop_sequence` replies a
+/// 2026-10-12 count found among 1,117 `end_turn` and 5 null match the two of
+/// those errors dated before it. So a null or `tool_use` one keeps the run open
+/// — a narrated tool call never reads as finished mid-turn — and those 5 read as
+/// unfinished unless a hand-back came before them.
 const FINAL_STOP_REASONS: [&str; 2] = ["end_turn", "stop_sequence"];
+
+/// Whether a subagent's own run has ENDED, and how: the verdict [`RunProgress`]
+/// folds out of its records, which the record ([`Subagent::ended`]) and the
+/// subagent view's render (`store::preview::RenderedPreview::run_ended`) carry
+/// alike to [`SubagentStatus::of`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunVerdict {
+    /// It has not ended: still going, or no turn read yet.
+    Open,
+    /// It ended with its work done: a hand-back, or a final reply.
+    Finished,
+    /// It ended because it FAILED: its last turn was an API error claude wrote
+    /// in the model's place.
+    Failed,
+}
 
 /// Where a run stands after the records [`run_ended`] has walked so far.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -556,19 +588,26 @@ enum RunState {
     /// Its last turn called [`HANDBACK_TOOL`], or was text with no `tool_use`
     /// after that call.
     HandedBack,
+    /// Its last turn was an API error claude wrote in the model's place
+    /// (`isApiErrorMessage`), anywhere but after a hand-back.
+    Failed,
 }
 
 /// Whether a subagent's own run has ENDED, judged from the END of its
 /// transcript: `tail` holds its last bytes, and `cut` says they start mid-file,
 /// so their first line may be a fragment and is skipped.
 ///
-/// The run has ended when its LAST turn is either
+/// The run has ended when its LAST turn is one of
 ///
 /// * an assistant record holding a [`HANDBACK_TOOL`] `tool_use` — the
 ///   `tool_result` answering it is not a turn of its own — or a text reply
 ///   after it: an assistant record holding text and no `tool_use`, whatever its
 ///   `message.stop_reason` (claude 2.1.29x often writes one after the
-///   hand-back's answer); or
+///   hand-back's answer);
+/// * an API ERROR claude wrote in the model's place: an assistant record whose
+///   `isApiErrorMessage` is `true`, holding no `tool_use`, anywhere the first
+///   case does not keep the run ended — the one end that is
+///   [`RunVerdict::Failed`]; or
 /// * a FINAL REPLY: an assistant record holding text and no `tool_use`, whose
 ///   `message.stop_reason` is one of [`FINAL_STOP_REASONS`].
 ///
@@ -580,7 +619,7 @@ enum RunState {
 /// `[Request interrupted by user]`. A record of any other
 /// type (`attachment`, `system`, …) is not a turn, and a line that is not JSON —
 /// the cut first line, a last one still being written — is skipped. PURE.
-fn run_ended(tail: &[u8], cut: bool) -> bool {
+fn run_ended(tail: &[u8], cut: bool) -> RunVerdict {
     let whole = if cut {
         tail.iter()
             .position(|&byte| byte == b'\n')
@@ -610,10 +649,14 @@ impl RunProgress {
         Self(after_record(self.0, record))
     }
 
-    /// Whether the run has ENDED after the records folded in so far.
+    /// Whether, and how, the run has ENDED after the records folded in so far.
     #[must_use]
-    pub fn ended(self) -> bool {
-        self.0 != RunState::Open
+    pub fn ended(self) -> RunVerdict {
+        match self.0 {
+            RunState::Open => RunVerdict::Open,
+            RunState::Replied | RunState::HandedBack => RunVerdict::Finished,
+            RunState::Failed => RunVerdict::Failed,
+        }
     }
 }
 
@@ -630,6 +673,7 @@ fn after_record(state: RunState, record: &Value) -> RunState {
         .and_then(Value::as_str)
         .is_some_and(|reason| FINAL_STOP_REASONS.contains(&reason));
     let text = has("text") || content.is_some_and(Value::is_string);
+    let api_error = record.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true);
     match record.get("type").and_then(Value::as_str) {
         Some("assistant") if blocks.iter().any(is_handback) => RunState::HandedBack,
         Some("assistant") if has("tool_use") => RunState::Open,
@@ -640,6 +684,15 @@ fn after_record(state: RunState, record: &Value) -> RunState {
         // few runs did go on after one (a new prompt, more tool calls), so a
         // hand-back is not ended for good: the other arms still reopen it.
         Some("assistant") if text && state == RunState::HandedBack => state,
+        // Undocumented, seen 2026-10-19 in a local store: claude 2.1.272 to
+        // 2.1.300 write a failed API call (auth, a lost connection, a refusal) in
+        // the model's place as an assistant record flagged `isApiErrorMessage`,
+        // 9 across 2,289 subagent transcripts, and end the turn there. Keyed on
+        // the flag alone: `<synthetic>` also marks claude's "No response
+        // requested." records. Were the flag dropped, the record would read as
+        // the final reply its `stop_sequence` makes it: finished, wrong but
+        // harmless.
+        Some("assistant") if api_error => RunState::Failed,
         Some("assistant") if text && final_stop => RunState::Replied,
         Some("assistant") => RunState::Open,
         // The answer to a tool call — the hand-back's own included — is no turn.
@@ -738,7 +791,7 @@ fn read_record_with(
     read_meta: impl FnMut(&Path) -> Option<String>,
     mut stat: impl FnMut(&Path) -> Option<TranscriptStat>,
     mut launched_at: impl FnMut(&Path) -> Option<OffsetDateTime>,
-    mut tail_ended: impl FnMut(&Path, u64) -> bool,
+    mut tail_ended: impl FnMut(&Path, u64) -> RunVerdict,
 ) -> SubagentRecord {
     let index = index_with(session_file, list, read_meta);
     let Some(dir) = index.dir() else {
@@ -771,9 +824,9 @@ fn read_record_with(
             let id = meta.agent_id.as_str();
             let newest_write = latest_write(id, &children, &written);
             let ended = within_window(newest_write, now).then(|| {
-                stats
-                    .get(id)
-                    .is_some_and(|stat| tail_ended(&transcript_path(dir, id), stat.len))
+                stats.get(id).map_or(RunVerdict::Open, |stat| {
+                    tail_ended(&transcript_path(dir, id), stat.len)
+                })
             });
             Subagent {
                 agent_id: meta.agent_id.clone(),
@@ -829,11 +882,11 @@ fn record_timestamp(line: &[u8]) -> Option<OffsetDateTime> {
     OffsetDateTime::parse(raw, &Rfc3339).ok()
 }
 
-/// Whether the run in the transcript at `path`, `len` bytes long when it was
-/// stat'ed, ENDED, from its last [`TAIL_MAX_BYTES`] ([`run_ended`]). A tail that
-/// cannot be read is a run that has not ended.
-fn read_tail_ended(path: &Path, len: u64) -> bool {
-    read_tail(path, len).is_some_and(|(tail, cut)| run_ended(&tail, cut))
+/// Whether, and how, the run in the transcript at `path`, `len` bytes long when
+/// it was stat'ed, ENDED, from its last [`TAIL_MAX_BYTES`] ([`run_ended`]). A
+/// tail that cannot be read is a run that has not ended.
+fn read_tail_ended(path: &Path, len: u64) -> RunVerdict {
+    read_tail(path, len).map_or(RunVerdict::Open, |(tail, cut)| run_ended(&tail, cut))
 }
 
 /// The last [`TAIL_MAX_BYTES`] of the file at `path`, which was `len` bytes long
@@ -1314,7 +1367,7 @@ mod tests {
     // --- the status rule: whether a run ended --------------------------------
 
     /// One of the per-reader fixtures beside the store: a subagent transcript
-    /// per tail shape, trimmed from claude 2.1.226 and 2.1.296 records.
+    /// per tail shape, trimmed from claude 2.1.226, 2.1.296 and 2.1.300 records.
     fn status_fixture(name: &str) -> Vec<u8> {
         fs::read(
             Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1371,22 +1424,184 @@ mod tests {
         lines.join("\n").into_bytes()
     }
 
+    /// The text of an API error, as claude writes it in the model's place.
+    const API_ERROR_TEXT: &str =
+        r#"{"type":"text","text":"API Error: Connection lost mid-response."}"#;
+
+    /// A record claude wrote in the model's place (`<synthetic>`), its text an
+    /// API error, stopped with the JSON `stop_reason`, and carrying
+    /// `isApiErrorMessage` as the JSON `flag`, or not at all when `None`.
+    fn synthetic(flag: Option<&str>, stop_reason: &str) -> String {
+        let flag = flag.map_or_else(String::new, |flag| {
+            format!(r#","isApiErrorMessage":{flag}"#)
+        });
+        format!(
+            r#"{{"type":"assistant"{flag},"message":{{"role":"assistant","model":"<synthetic>","content":[{API_ERROR_TEXT}],"stop_reason":{stop_reason}}}}}"#
+        )
+    }
+
+    /// An API error as claude 2.1.272 to 2.1.300 write one: [`synthetic`],
+    /// flagged `true`, stopped at a stop sequence.
+    fn api_error() -> String {
+        synthetic(Some("true"), r#""stop_sequence""#)
+    }
+
+    /// An API error ENDS the run, FAILED: as the fixture's last turn, in claude
+    /// 2.1.300's shape behind an `api-request` record that is no turn, and built
+    /// record by record whatever its `stop_reason` or content shape, after any
+    /// turn but a hand-back, and with records that are no turn after it.
+    #[test]
+    fn an_api_error_ends_the_run_failed() {
+        assert_eq!(
+            run_ended(&status_fixture("api-error.jsonl"), false),
+            RunVerdict::Failed,
+            "a tool call answered, then an API error"
+        );
+        let refusal = synthetic(Some("true"), r#""refusal""#);
+        let bare = r#"{"type":"assistant","isApiErrorMessage":true,"message":{"role":"assistant","model":"<synthetic>","content":"You've hit your session limit."}}"#;
+        for (what, lines) in [
+            ("on its own", vec![api_error()]),
+            ("stopped as a refusal", vec![refusal]),
+            ("a null stop reason", vec![synthetic(Some("true"), "null")]),
+            ("a bare string, no stop reason", vec![bare.to_string()]),
+            (
+                "after a tool call answered",
+                vec![assistant(BASH), user(ANSWER), api_error()],
+            ),
+            ("after a final reply", vec![final_reply(TEXT), api_error()]),
+            (
+                "after a narration",
+                vec![assistant_stopped(TEXT, "null"), api_error()],
+            ),
+            (
+                "then an attachment",
+                vec![api_error(), ATTACHMENT.to_string()],
+            ),
+            ("then another", vec![api_error(), api_error()]),
+        ] {
+            assert_eq!(
+                run_ended(&tail_of(&lines), false),
+                RunVerdict::Failed,
+                "{what}"
+            );
+        }
+    }
+
+    /// FAIL-SOFT, and keyed on the flag ALONE: `isApiErrorMessage` fails the run
+    /// only as the JSON `true`. Any other value, or none, leaves the same
+    /// `<synthetic>` record to the other arms — a final reply at a stop sequence
+    /// — so `<synthetic>` alone never fails a run. A user record carrying the
+    /// flag is a new prompt like any other.
+    #[test]
+    fn only_an_api_error_flag_of_true_fails_the_run() {
+        let stop = r#""stop_sequence""#;
+        for (flag, verdict) in [
+            (Some("true"), RunVerdict::Failed),
+            (None, RunVerdict::Finished),
+            (Some("false"), RunVerdict::Finished),
+            (Some("null"), RunVerdict::Finished),
+            (Some(r#""true""#), RunVerdict::Finished),
+            (Some("1"), RunVerdict::Finished),
+            (Some("{}"), RunVerdict::Finished),
+        ] {
+            assert_eq!(
+                run_ended(&tail_of(&[synthetic(flag, stop)]), false),
+                verdict,
+                "{flag:?}"
+            );
+        }
+        let flagged_user =
+            r#"{"type":"user","isApiErrorMessage":true,"message":{"role":"user","content":"Go."}}"#;
+        assert_eq!(
+            run_ended(&tail_of(&[api_error(), flagged_user.to_string()]), false),
+            RunVerdict::Open
+        );
+    }
+
+    /// The boundary the arm's place draws: an API error AFTER a hand-back keeps
+    /// the run handed back — FINISHED, its result already delivered — as any
+    /// text after a hand-back does, the reply after it included. Anywhere else
+    /// it fails the run.
+    #[test]
+    fn an_api_error_after_a_handback_keeps_the_run_finished() {
+        assert_eq!(
+            run_ended(&tail_of(&[final_reply(TEXT), api_error()]), false),
+            RunVerdict::Failed,
+            "premise: after a final reply, it fails the run"
+        );
+        for (what, rest) in [
+            ("right after the hand-back's answer", vec![api_error()]),
+            (
+                "after the reply that followed it",
+                vec![final_reply(TEXT), api_error()],
+            ),
+        ] {
+            assert_eq!(
+                run_ended(&tail_of(&after_handback(&rest)), false),
+                RunVerdict::Finished,
+                "{what}"
+            );
+        }
+    }
+
+    /// A failed run is no more ended for good than a replied one: any later turn
+    /// reopens it — a new prompt; `[Request interrupted by user]`, which claude
+    /// 2.1.272 and 2.1.284 wrote after an API error in a local store
+    /// (2026-10-19); a tool call; a thinking-only record — and a final reply after
+    /// that ends it finished.
+    #[test]
+    fn a_later_turn_reopens_a_failed_run() {
+        assert_eq!(
+            run_ended(&tail_of(&[api_error()]), false),
+            RunVerdict::Failed,
+            "premise: on its own, it failed"
+        );
+        let retry = user(r#""Try again.""#);
+        let interrupt = user(r#"[{"type":"text","text":"[Request interrupted by user]"}]"#);
+        for (what, rest, verdict) in [
+            ("a new prompt", vec![retry.clone()], RunVerdict::Open),
+            (
+                "an interrupt",
+                vec![ATTACHMENT.to_string(), interrupt],
+                RunVerdict::Open,
+            ),
+            ("a tool call", vec![assistant(BASH)], RunVerdict::Open),
+            (
+                "a thinking-only record",
+                vec![assistant(THINKING)],
+                RunVerdict::Open,
+            ),
+            (
+                "a new prompt, then a final reply",
+                vec![retry, final_reply(TEXT)],
+                RunVerdict::Finished,
+            ),
+        ] {
+            let mut lines = vec![api_error()];
+            lines.extend(rest);
+            assert_eq!(run_ended(&tail_of(&lines), false), verdict, "{what}");
+        }
+    }
+
     /// The two shapes an ENDED run's tail takes in claude's own transcripts — a
     /// `SubagentHandback` answered as the last turn, and a final reply — and an
     /// unfinished one, waiting on the sub-subagent it just launched after a line
     /// of text.
     #[test]
     fn a_handback_or_a_final_reply_ends_the_run_and_a_pending_launch_does_not() {
-        assert!(
+        assert_eq!(
             run_ended(&status_fixture("handback.jsonl"), false),
+            RunVerdict::Finished,
             "a SubagentHandback, then its answer"
         );
-        assert!(
+        assert_eq!(
             run_ended(&status_fixture("final-reply.jsonl"), false),
+            RunVerdict::Finished,
             "a final reply, then an attachment"
         );
-        assert!(
-            !run_ended(&status_fixture("unfinished.jsonl"), false),
+        assert_eq!(
+            run_ended(&status_fixture("unfinished.jsonl"), false),
+            RunVerdict::Open,
             "a launch still waiting on its sub-subagent"
         );
     }
@@ -1426,7 +1641,7 @@ mod tests {
                 vec![string_reply(r#""end_turn""#)],
             ),
         ] {
-            assert!(run_ended(&tail_of(&lines), false), "{what}");
+            assert_eq!(run_ended(&tail_of(&lines), false), RunVerdict::Finished, "{what}");
         }
     }
 
@@ -1442,7 +1657,11 @@ mod tests {
                 vec![assistant(HANDBACK), user(ANSWER), final_reply(TEXT)],
             ),
         ] {
-            assert!(run_ended(&tail_of(&lines), false), "{what}");
+            assert_eq!(
+                run_ended(&tail_of(&lines), false),
+                RunVerdict::Finished,
+                "{what}"
+            );
         }
     }
 
@@ -1454,7 +1673,11 @@ mod tests {
             ("text blocks", vec![assistant_stopped(TEXT, stop)]),
             ("a bare string", vec![string_reply(stop)]),
         ] {
-            assert!(run_ended(&tail_of(&lines), false), "{what}");
+            assert_eq!(
+                run_ended(&tail_of(&lines), false),
+                RunVerdict::Finished,
+                "{what}"
+            );
         }
     }
 
@@ -1477,10 +1700,15 @@ mod tests {
                 ],
             ),
         ] {
-            assert!(!run_ended(&tail_of(&lines), false), "{what}");
+            assert_eq!(
+                run_ended(&tail_of(&lines), false),
+                RunVerdict::Open,
+                "{what}"
+            );
         }
-        assert!(
-            !run_ended(&status_fixture("mid-turn.jsonl"), false),
+        assert_eq!(
+            run_ended(&status_fixture("mid-turn.jsonl"), false),
+            RunVerdict::Open,
             "a narration caught before its tool call"
         );
     }
@@ -1498,7 +1726,11 @@ mod tests {
                 vec![assistant_stopped(&format!("{THINKING},{TEXT}"), tool_use)],
             ),
         ] {
-            assert!(!run_ended(&tail_of(&lines), false), "{what}");
+            assert_eq!(
+                run_ended(&tail_of(&lines), false),
+                RunVerdict::Open,
+                "{what}"
+            );
         }
     }
 
@@ -1527,17 +1759,21 @@ mod tests {
                 vec![ATTACHMENT.to_string(), assistant_stopped(TEXT, "null")],
             ),
         ] {
-            assert!(run_ended(&tail_of(&after_handback(&rest)), false), "{what}");
+            assert_eq!(
+                run_ended(&tail_of(&after_handback(&rest)), false),
+                RunVerdict::Finished,
+                "{what}"
+            );
         }
     }
 
     /// An `end_turn` reply after a hand-back ends the run as well.
     #[test]
     fn an_end_turn_reply_after_a_handback_ends_the_run() {
-        assert!(run_ended(
-            &tail_of(&after_handback(&[final_reply(TEXT)])),
-            false
-        ));
+        assert_eq!(
+            run_ended(&tail_of(&after_handback(&[final_reply(TEXT)])), false),
+            RunVerdict::Finished
+        );
     }
 
     /// A hand-back is not ended for good: a tool call or a thinking-only record
@@ -1549,8 +1785,9 @@ mod tests {
             ("a tool call", vec![reply.clone(), assistant(BASH)]),
             ("a thinking-only record", vec![reply, assistant(THINKING)]),
         ] {
-            assert!(
-                !run_ended(&tail_of(&after_handback(&rest)), false),
+            assert_eq!(
+                run_ended(&tail_of(&after_handback(&rest)), false),
+                RunVerdict::Open,
                 "{what}"
             );
         }
@@ -1570,8 +1807,9 @@ mod tests {
             ),
             ("a null reply, then the prompt", vec![reply, prompt]),
         ] {
-            assert!(
-                !run_ended(&tail_of(&after_handback(&rest)), false),
+            assert_eq!(
+                run_ended(&tail_of(&after_handback(&rest)), false),
+                RunVerdict::Open,
                 "{what}"
             );
         }
@@ -1589,7 +1827,11 @@ mod tests {
                 vec![assistant(BASH), user(ANSWER), reply],
             ),
         ] {
-            assert!(!run_ended(&tail_of(&lines), false), "{what}");
+            assert_eq!(
+                run_ended(&tail_of(&lines), false),
+                RunVerdict::Open,
+                "{what}"
+            );
         }
     }
 
@@ -1631,11 +1873,16 @@ mod tests {
             ("only attachments", vec![ATTACHMENT.to_string()]),
             ("an empty user record", vec![final_reply(TEXT), user("[]")]),
         ] {
-            assert!(!run_ended(&tail_of(&lines), false), "{what}");
+            assert_eq!(
+                run_ended(&tail_of(&lines), false),
+                RunVerdict::Open,
+                "{what}"
+            );
         }
-        assert!(!run_ended(b"", false), "an empty tail");
-        assert!(
-            !run_ended(b"not json\n{\n[]\n\"x\"\n42", false),
+        assert_eq!(run_ended(b"", false), RunVerdict::Open, "an empty tail");
+        assert_eq!(
+            run_ended(b"not json\n{\n[]\n\"x\"\n42", false),
+            RunVerdict::Open,
             "garbage never ends a run, and never panics"
         );
     }
@@ -1645,27 +1892,35 @@ mod tests {
     #[test]
     fn a_cut_tail_skips_its_first_line() {
         let reply_first = tail_of(&[final_reply(TEXT), ATTACHMENT.to_string()]);
-        assert!(run_ended(&reply_first, false), "premise: whole, it ends");
-        assert!(
-            !run_ended(&reply_first, true),
+        assert_eq!(
+            run_ended(&reply_first, false),
+            RunVerdict::Finished,
+            "premise: whole, it ends"
+        );
+        assert_eq!(
+            run_ended(&reply_first, true),
+            RunVerdict::Open,
             "cut, the first line is dropped"
         );
 
         let mut mid_codepoint = vec![0x80, 0xbf, b'"', b'}', b'\n'];
         mid_codepoint.extend(final_reply(TEXT).into_bytes());
-        assert!(
+        assert_eq!(
             run_ended(&mid_codepoint, true),
+            RunVerdict::Finished,
             "a fragment starting mid-codepoint is skipped, the reply after it read"
         );
-        assert!(
-            !run_ended(&[0x80, 0xbf], true),
+        assert_eq!(
+            run_ended(&[0x80, 0xbf], true),
+            RunVerdict::Open,
             "a tail with no newline at all"
         );
 
         let mut half_written = tail_of(&[final_reply(TEXT)]);
         half_written.extend_from_slice(b"\n{\"type\":\"user\",\"mess");
-        assert!(
+        assert_eq!(
             run_ended(&half_written, false),
+            RunVerdict::Finished,
             "a last line still being written is skipped"
         );
     }
@@ -1685,7 +1940,10 @@ mod tests {
     #[test]
     fn an_ended_run_is_never_running_whenever_it_last_wrote() {
         for written in [Some(ago(1)), Some(ago(86_400)), None] {
-            assert!(!is_running(Some(true), written, now()), "{written:?}");
+            assert!(
+                !is_running(Some(RunVerdict::Finished), written, now()),
+                "{written:?}"
+            );
         }
     }
 
@@ -1694,12 +1952,16 @@ mod tests {
     #[test]
     fn an_open_run_is_running_within_the_window_and_quiet_past_it() {
         let window = RUNNING_WINDOW.as_secs();
-        assert!(is_running(Some(false), Some(ago(1)), now()));
-        assert!(is_running(Some(false), Some(ago(window)), now()));
-        assert!(!is_running(Some(false), Some(ago(window + 1)), now()));
-        assert!(!is_running(Some(false), None, now()));
+        assert!(is_running(Some(RunVerdict::Open), Some(ago(1)), now()));
+        assert!(is_running(Some(RunVerdict::Open), Some(ago(window)), now()));
+        assert!(!is_running(
+            Some(RunVerdict::Open),
+            Some(ago(window + 1)),
+            now()
+        ));
+        assert!(!is_running(Some(RunVerdict::Open), None, now()));
         assert!(is_running(
-            Some(false),
+            Some(RunVerdict::Open),
             Some(now() + Duration::from_secs(5)),
             now()
         ));
@@ -1719,28 +1981,37 @@ mod tests {
     #[test]
     fn a_running_subagent_turns_quiet_as_now_moves_past_the_window() {
         let written = Some(ago(60));
-        assert!(is_running(Some(false), written, now()));
-        assert!(!is_running(Some(false), written, now() + RUNNING_WINDOW));
+        assert!(is_running(Some(RunVerdict::Open), written, now()));
+        assert!(!is_running(
+            Some(RunVerdict::Open),
+            written,
+            now() + RUNNING_WINDOW
+        ));
     }
 
-    /// A status is RUNNING exactly where [`is_running`] says so; else FINISHED
-    /// once the end was read, whenever it last wrote; else QUIET — an unfinished
-    /// run silent past the window, and a run whose end was never read.
+    /// A status is RUNNING exactly where [`is_running`] says so; else FINISHED or
+    /// FAILED once the end was read, as it was read, whenever it last wrote — a
+    /// failed run is never running, however fresh its write; else QUIET — an
+    /// unfinished run silent past the window, and a run whose end was never read.
     #[test]
     fn a_status_is_running_where_is_running_says_else_finished_once_its_end_was_read() {
-        use SubagentStatus::{Finished, Quiet, Running};
+        use SubagentStatus::{Failed, Finished, Quiet, Running};
 
         let window = RUNNING_WINDOW.as_secs();
         let ahead = Some(now() + Duration::from_secs(5));
         for (ended, written, status) in [
-            (Some(false), Some(ago(1)), Running),
-            (Some(false), Some(ago(window)), Running),
-            (Some(false), ahead, Running),
-            (Some(false), Some(ago(window + 1)), Quiet),
-            (Some(false), None, Quiet),
-            (Some(true), Some(ago(1)), Finished),
-            (Some(true), Some(ago(86_400)), Finished),
-            (Some(true), None, Finished),
+            (Some(RunVerdict::Open), Some(ago(1)), Running),
+            (Some(RunVerdict::Open), Some(ago(window)), Running),
+            (Some(RunVerdict::Open), ahead, Running),
+            (Some(RunVerdict::Open), Some(ago(window + 1)), Quiet),
+            (Some(RunVerdict::Open), None, Quiet),
+            (Some(RunVerdict::Finished), Some(ago(1)), Finished),
+            (Some(RunVerdict::Finished), Some(ago(86_400)), Finished),
+            (Some(RunVerdict::Finished), None, Finished),
+            (Some(RunVerdict::Failed), Some(ago(1)), Failed),
+            (Some(RunVerdict::Failed), ahead, Failed),
+            (Some(RunVerdict::Failed), Some(ago(86_400)), Failed),
+            (Some(RunVerdict::Failed), None, Failed),
             (None, Some(ago(1)), Quiet),
             (None, Some(ago(86_400)), Quiet),
             (None, None, Quiet),
@@ -1762,14 +2033,14 @@ mod tests {
     /// SAME records alike: over each status fixture, the `ended` the view's
     /// render folds out of the whole transcript and the one the record's read
     /// folds out of its tail give the same status — finished for a hand-back and
-    /// for a final reply, running for an open run while it writes, and quiet for
-    /// that run once its window has passed. Past the window the record reads no
-    /// tail, so there only the view's verdict still tells a finished run from a
-    /// quiet one.
+    /// for a final reply, failed for an API error, running for an open run while
+    /// it writes, and quiet for that run once its window has passed. Past the
+    /// window the record reads no tail, so there only the view's verdict still
+    /// tells a finished or failed run from a quiet one.
     #[test]
     fn the_view_and_the_record_judge_the_same_records_to_the_same_status() {
         use crate::store::preview;
-        use SubagentStatus::{Finished, Quiet, Running};
+        use SubagentStatus::{Failed, Finished, Quiet, Running};
 
         let root = unique_temp_dir("status-agreement");
         let session_file = root.join("cwd").join("sess.jsonl");
@@ -1779,6 +2050,7 @@ mod tests {
         let cases = [
             ("hb", "handback.jsonl", Finished),
             ("fr", "final-reply.jsonl", Finished),
+            ("err", "api-error.jsonl", Failed),
             ("open", "unfinished.jsonl", Running),
             ("mid", "mid-turn.jsonl", Running),
         ];
@@ -1824,7 +2096,7 @@ mod tests {
             } else {
                 assert_eq!(
                     (from_record, from_view),
-                    (Quiet, Finished),
+                    (Quiet, *status),
                     "{id}: only the view still reads its end"
                 );
             }
@@ -1959,24 +2231,30 @@ mod tests {
     }
 
     /// R4-4a: `Ctrl-X ↓` opens the FIRST running subagent in launch order — not
-    /// the freshest writer, and never an ended one, however fresh. Once `now`
-    /// passes every window nothing runs, and the most recent write wins instead.
+    /// the freshest writer, and never an ended one, finished or failed, however
+    /// fresh. Once `now` passes every window nothing runs, and the most recent
+    /// write wins instead.
     #[test]
     fn the_open_target_is_the_first_running_subagent_in_launch_order() {
         let record = SubagentRecord::new(vec![
             Subagent {
+                newest_write: Some(ago(4)),
+                ended: Some(RunVerdict::Failed),
+                ..sub("failed-fresh", Some(0))
+            },
+            Subagent {
                 newest_write: Some(ago(3)),
-                ended: Some(true),
+                ended: Some(RunVerdict::Finished),
                 ..sub("done-fresh", Some(1))
             },
             Subagent {
                 newest_write: Some(ago(300)),
-                ended: Some(false),
+                ended: Some(RunVerdict::Open),
                 ..sub("running-early", Some(2))
             },
             Subagent {
                 newest_write: Some(ago(5)),
-                ended: Some(false),
+                ended: Some(RunVerdict::Open),
                 ..sub("running-late", Some(3))
             },
         ]);
@@ -2159,7 +2437,11 @@ mod tests {
             |path, len| {
                 assert_eq!(len, LEN, "the tail is bounded by the stat's length");
                 tails.push(path.to_path_buf());
-                ends[path]
+                if ends[path] {
+                    RunVerdict::Finished
+                } else {
+                    RunVerdict::Open
+                }
             },
         );
         tails.sort();
@@ -2217,10 +2499,10 @@ mod tests {
                 "{id}: its tail was not read"
             );
         }
-        assert_eq!(entry(&record, "fresh").ended, Some(true));
+        assert_eq!(entry(&record, "fresh").ended, Some(RunVerdict::Finished));
         assert_eq!(
             entry(&record, "hollow").ended,
-            Some(false),
+            Some(RunVerdict::Open),
             "no transcript under a running child: an unended run"
         );
         assert!(running(&record, "hollow"));
@@ -2319,8 +2601,9 @@ mod tests {
         fs::write(&long, format!("{filler}\n{}\n", final_reply(TEXT))).expect("write long");
         let stat = stat_transcript(&long).expect("a regular file has a stat");
         assert!(stat.written.is_some(), "and its mtime is read");
-        assert!(
+        assert_eq!(
             read_tail_ended(&long, stat.len),
+            RunVerdict::Finished,
             "the final reply sits in the tail"
         );
         assert!(
@@ -2331,13 +2614,17 @@ mod tests {
         let huge_last = root.join("huge-last.jsonl");
         fs::write(&huge_last, format!("{}\n{filler}\n", final_reply(TEXT))).expect("write huge");
         let len = stat_transcript(&huge_last).expect("a stat").len;
-        assert!(
-            !read_tail_ended(&huge_last, len),
+        assert_eq!(
+            read_tail_ended(&huge_last, len),
+            RunVerdict::Open,
             "no complete record in the tail reads as unended"
         );
 
         assert_eq!(stat_transcript(&root.join("missing.jsonl")), None);
-        assert!(!read_tail_ended(&root.join("missing.jsonl"), 10));
+        assert_eq!(
+            read_tail_ended(&root.join("missing.jsonl"), 10),
+            RunVerdict::Open
+        );
         let dir = root.join("dir.jsonl");
         fs::create_dir_all(&dir).expect("create dir");
         assert_eq!(stat_transcript(&dir), None);
@@ -2447,10 +2734,18 @@ mod tests {
                 is_running(subagent.ended, subagent.newest_write, now),
             )
         };
-        assert_eq!(state("fr"), (Some(true), false), "read, and ended");
+        assert_eq!(
+            state("fr"),
+            (Some(RunVerdict::Finished), false),
+            "read, and ended"
+        );
         assert_eq!(state("hb"), (None, false), "too old to be opened");
-        assert_eq!(state("lead"), (Some(false), true), "its child writes");
-        assert_eq!(state("rev"), (Some(false), true));
+        assert_eq!(
+            state("lead"),
+            (Some(RunVerdict::Open), true),
+            "its child writes"
+        );
+        assert_eq!(state("rev"), (Some(RunVerdict::Open), true));
         assert_eq!(state("gone"), (None, false));
         let lead = entry(&record, "lead");
         assert_eq!(lead.agent_type, "lead");
