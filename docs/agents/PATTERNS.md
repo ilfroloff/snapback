@@ -345,8 +345,9 @@ returns candidates in the order given. Do not re-introduce ranking:
 rank cannot reach the screen, and computing one cost 76–81% of each keystroke
 through nucleo's `Utf32Str` UTF-32 conversion. The compose pick list's tiered
 order does not bend this: it is a pure decision in `tui::complete`
-(`Placement`), read off answers `search.rs` already gives, never a rank computed
-inside the matcher.
+(`Placement`), read off answers `search.rs` already gives — a word-start hit's
+chunk and skipped-word counts among them — never a rank computed inside the
+matcher.
 
 Membership is "every atom present as a byte substring" in name-only mode and for
 a single atom. A **multi-atom name+content** query is narrower: the AND is
@@ -369,9 +370,10 @@ pane cannot explain why the row is there. Consequences to keep: several runs on
 one line are normal, and marks are a **union** (overlapping or abutting runs merge
 into one span, never two).
 
-The compose pick list is a further CONSUMER of those seams, not a third rule.
-`tui::complete` splits its whitespace-free token into parts by its own rule and
-compiles them with `SearchIndex::new` + `set_atoms` (DOMAIN.md owns the rule:
+The compose pick list is a further CONSUMER of those seams, and the one caller
+of a THIRD rule kept beside them (below). `tui::complete` splits its
+whitespace-free token into parts by its own rule and compiles them with
+`SearchIndex::new` + `set_atoms` (DOMAIN.md owns the rule:
 [How the letters narrow the list](DOMAIN.md#how-the-letters-narrow-the-list)).
 `set_atoms` takes each part LITERALLY, and that is load-bearing: joining the
 parts with spaces for `set_query` would hand them to `gate_atoms`, whose `\ `
@@ -379,14 +381,35 @@ escape turns a token like `foo\-bar` into the one phrase `foo bar`. It then asks
 `admits` — the filter's own membership predicate, the very gate `match_indices`
 runs — of a candidate's name and then its description, and marks the row with
 `match_indices` itself, the row-label rule, since a pick-list row is one string
-like a board label. Its tier comes from the per-atom seam, because "does the
-name START with it" is a positional question: a name-start hit is an
-`atom_match_positions` run at char 0, from whichever part.
+like a board label. Its `@` walk asks the `_with` forms of both over ONE
+caller-owned `MarkScratch`, so a keystroke over a 25,000-entry walk allocates
+nothing per entry it rejects (the measurement is `complete::select_paths`' doc).
+Its tier comes from the per-atom seam, because "does the name START with it" is
+a positional question: a name-start hit is an `atom_match_positions` run at char
+0, from whichever part. An `@` path reads it off its own row marks instead — a
+mark on the name's first char, which a part of a name hit, holding no `/`, can
+only cover by starting there.
+
+The THIRD rule, WORD-START (`SearchIndex::word_start_hit`), is the pick list's
+alone, and nothing above reads it: `set_atoms` compiles it and `set_query`
+clears it, so the board's search box can never reach it, and the filter, `admits`
+and both marking rules stay substring. `tui::complete` asks it of an `@` entry's
+NAME only once the substring parts rejected that entry, and it is no fuzzy match:
+each chunk is a word PREFIX. Its smart case is the finders' own, per part: one
+predicate, `is_case_sensitive`, decides both an `AtomFinder`'s case and a
+word-start part's, so a part's chunks meet the name in the very case that part
+matches as a substring. A hit marks its own chunks, the one pick-list row
+`match_indices` does not mark. DOMAIN.md owns the rule, its bounds and its scope
+([How the letters narrow the list](DOMAIN.md#how-the-letters-narrow-the-list)).
+Its two DPs are pinned against a brute-force ORACLE,
+`the_word_start_dps_agree_with_brute_force`, for the reason nucleo is kept: a
+hand-written expectation of the fewest-chunks decomposition encodes what its
+author believed the optimum to be.
 
 Sharing the finders is only half of asking the same question. The other half is
 the **fold**: every lowercased string the module searches — the filter's
-haystacks (the pair `admits` builds from a caller's string included) and both
-marking seams' — goes through the one per-char,
+haystacks (the pair `admits` builds from a caller's string included), both
+marking seams' and the word-start rule's — goes through the one per-char,
 byte-length-preserving fold. Reach for `str::to_lowercase` on any one of them and
 the surfaces diverge on the chars that fold differently, which shows up as a row
 the filter admitted drawing with nothing marked.
@@ -1465,7 +1488,7 @@ CADENCES and LIMITS, so a retune knows what it is next to:
 | `store` | `MTIME_SETTLE_WINDOW` (2 s) |
 | `store::parse` | `CONTENT_INDEX_CAP` (1 MB) |
 | `store::label` | `LABEL_MAX` (180) |
-| `search` | `PROXIMITY_WINDOW_MIN_BYTES` (200) · `PROXIMITY_WINDOW_QUERY_MULTIPLIER` (3) · `PROXIMITY_MAX_ANCHORS` (512 — asked of the rarest atom alone; see [DOMAIN.md](DOMAIN.md#content-index-storeparse)) |
+| `search` | `PROXIMITY_WINDOW_MIN_BYTES` (200) · `PROXIMITY_WINDOW_QUERY_MULTIPLIER` (3) · `PROXIMITY_MAX_ANCHORS` (512 — asked of the rarest atom alone; see [DOMAIN.md](DOMAIN.md#content-index-storeparse)) · the pick list's word-start bounds: `WORD_START_MIN_QUERY` (2 — lossless, since a one-char query's only chunk is a word's first char met in its part's case, which the substring match, under that same case, admits already) / `WORD_START_MAX_QUERY` (63 — the DP's `u64` mask, one bit per query position plus the end; see [DOMAIN.md](DOMAIN.md#how-the-letters-narrow-the-list)) |
 | `model_aliases` | `MAX_ALIAS_ARRAY_BYTES` (4096) · `SCAN_CHUNK_BYTES` (1 MiB) · `SCAN_OVERLAP_BYTES` (= `MAX_ALIAS_ARRAY_BYTES` by definition — that equality is what proves no match straddles a chunk unseen, so neither is retuned alone) |
 | `store::preview` | `MODEL_VERSION_MAX_DIGITS` (2) · `MODEL_DATE_DIGITS` (8 — kept above the version cap so a date never reads as a version) · `TABLE_MIN_COL_WIDTH` (10) · `RECORD_RULE_WIDTH` (32) · `COLUMN_RULE_WIDTH` (3) · `ELLIPSIS_WIDTH` (1) · `PEER_STEM_LEN` (17 — the agent-stem length a peer sender must match before it renders as an `@handle`, so a socket path or an agent TYPE name falls back to the generic label) · `PEER_HEADER_BLOCK_ROW` (1 — not a knob but a SHAPE: a peer or injected node's header index inside its own `[blank, header, body…]` block, named so the fold region and the body links rebase off one number) · `DELEGATION_HEADER_BLOCK_ROW` (0 — a SHAPE too: a delegation line leads its block with no blank separator, so it costs exactly the one line of the marker it replaces) |
 | `store::subagents` | `META_MAX_BYTES` (64 KiB — the largest of 1811 meta files measured 264 bytes on 2026-10-11, so the cap refuses only a file that is not a meta and bounds what a hostile one can make a render read) · `TAIL_MAX_BYTES` (64 KiB — the end of a transcript the background subagent refresh reads, only for one that can be running; every measured tail held a complete turn, 2026-10-12) · `HEAD_MAX_BYTES` (64 KiB — the head it reads for a launch time; the largest first record of 2,049 measured 28,646 bytes, 2026-10-13) · `RUNNING_WINDOW` (10 min — how long an unfinished subagent, counting its sub-subagents' writes, may stay silent and still read as running; at 10 minutes 2.9% of real runs show a longer silence while still running, 2026-10-12) |

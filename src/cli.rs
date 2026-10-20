@@ -155,21 +155,24 @@ KEYS:
                   for a skill, command or agent, its description, matched and
                   highlighted like the search box (an uppercase letter matches
                   exactly); - _ and . split them into parts that match in any
-                  order, so @site-stor finds sitemaps-storage.service.ts. An @
-                  path lists the folder its / names first; when that lists
-                  nothing, / splits parts too and the whole path is searched
-                  from the top, so @modules/site-stor finds that file as well
-                  and a pick writes its full path. Names that start with them
-                  come first, then other name hits, then description hits —
-                  files and folders above agents. A file or folder named with a
-                  leading dot shows only once you type that dot. While the list
-                  is open ↑/↓ choose, Enter or Tab pick (a folder reopens the
-                  list one level down), and Esc closes only the list (the draft
-                  stays). The list is claude's own, fetched once per folder in
-                  the background: until it lands / lists nothing in any box,
-                  while @ shows files and folders at once, a reply's or fork's
-                  agents come from its transcript and a draft's wait for the
-                  list
+                  order, so @site-stor finds sitemaps-storage.service.ts. A file
+                  or folder is also found by the starts of the words in its own
+                  name, in order (a capital you type matches exactly and starts
+                  a word), so @calis or @CaLis finds CategoryListings.tsx, just
+                  below the names that hold the letters as typed. An @ path
+                  lists the folder its / names first; when that lists nothing,
+                  / splits parts too and the whole path is searched from the
+                  top, so @modules/site-stor finds that file as well and a pick
+                  writes its full path. Names that start with them come first,
+                  then other name hits, then description hits — files and
+                  folders above agents. A file or folder named with a leading
+                  dot shows only once you type that dot. While the list is open
+                  ↑/↓ choose, Enter or Tab pick (a folder reopens the list one
+                  level down), and Esc closes only the list (the draft stays).
+                  The list is claude's own, fetched once per folder in the
+                  background: until it lands / lists nothing in any box, while
+                  @ shows files and folders at once, a reply's or fork's agents
+                  come from its transcript and a draft's wait for the list
     Ctrl-K        stop / interrupt the selected session's live agent. With a job
                   to stop it runs claude stop: an agent whose run is over (done,
                   stopped, failed) stops at once, every other one confirms

@@ -11,20 +11,23 @@
 //! ([`SearchIndex::admits`]), asked of a candidate's name and then its
 //! description, with the token split into parts on [`QUERY_PART_SEPARATORS`]
 //! ([`query_parts`]) — on [`ROOT_FALLBACK_SEPARATORS`], `/` included, for that
-//! `@` fallback alone — each part one atom. What matches is ordered by
-//! [`Placement`] — the pick list's own order, never the board's — and carries
-//! the marks the board's row-label rule draws ([`Candidate::label_marks`]).
-//! `memchr` and `nucleo` stay in `search.rs` (AGENTS.md MATCHER ISOLATION). A
-//! pure core plus one thin impure `read_dir` walker ([`list_tree`]); the caller
-//! decides WHEN to read (once per folder, from the key handler, never the render
-//! path).
+//! `@` fallback alone — each part one atom. An `@` file or folder the parts reject
+//! may still match by the WORD STARTS of its own name
+//! ([`SearchIndex::word_start_hit`], the folder step only: `@calis` finds
+//! `CategoryListings.tsx`). What matches is ordered by [`Placement`] — the pick
+//! list's own order, never the board's — and carries the marks the board's
+//! row-label rule draws, or a word-start hit's chunks
+//! ([`Candidate::label_marks`]). `memchr` and `nucleo` stay in `search.rs`, and so
+//! does the word-start rule (AGENTS.md MATCHER ISOLATION). A pure core plus one
+//! thin impure `read_dir` walker ([`list_tree`]); the caller decides WHEN to read
+//! (once per folder, from the key handler, never the render path).
 //!
 //! Every column is a CHARACTER column (what `TextArea::cursor` reports), never
 //! a byte offset, so multi-byte text before the caret cannot mis-cut a token.
 
 use std::path::Path;
 
-use crate::search::SearchIndex;
+use crate::search::{MarkScratch, SearchIndex, WordStartHit};
 use crate::store::skills::ListingEntry;
 
 /// Cap on entries read from one folder. Bounds a single keystroke's cost on a
@@ -154,8 +157,10 @@ pub struct Candidate {
     /// The CHAR positions of `label` the query matched, ascending, under the
     /// board's ROW-LABEL rule ([`SearchIndex::match_indices`]) asked of the name or
     /// path alone, so the label's decoration — a command's `/`, an agent's
-    /// [`AGENT_LABEL_SUFFIX`], a folder's trailing `/` — is never marked. Set when
-    /// the list is filtered, so drawing it matches nothing.
+    /// [`AGENT_LABEL_SUFFIX`], a folder's trailing `/` — is never marked; for an
+    /// `@` entry admitted by the word starts of its name, the chunks that matched
+    /// ([`WordStartHit::marks`]). Set when the list is filtered, so drawing it
+    /// matches nothing.
     pub label_marks: Vec<usize>,
     /// The same, in `description`, for a candidate the query matched by its
     /// description alone; empty for every other.
@@ -204,16 +209,57 @@ pub fn completion_context(lines: &[String], cursor: (usize, usize)) -> Option<Co
 /// order IS the pick list's order. claude 2.1.284 orders its own `/` list the
 /// same way: a name that starts with the query, then a name that holds it
 /// elsewhere, then a description-only hit (read from the binary, 2026-10-02).
-/// See DOMAIN.md "Compose pick list".
+/// A WORD-START hit ranks in the tier it lands in, BELOW that tier's substring
+/// hits, and among its own kind by its [`WordStartRank`]. See DOMAIN.md "Compose
+/// pick list".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Placement {
     NameStart,
+    /// A word-start hit whose first chunk begins the name: `CategoryListings.tsx`
+    /// for `calis`. Only [`path_hit`] on the [`PathStep::Folder`] step produces it.
+    WordStartNameStart(WordStartRank),
     InName,
+    /// A word-start hit whose first chunk is on a later word of the name:
+    /// `MyCategoryListings.tsx` for `calis`. Only [`path_hit`] on the
+    /// [`PathStep::Folder`] step produces it.
+    WordStartInName(WordStartRank),
     /// A path entry whose own name does not hold every part but whose path does
     /// (`src/store/discover.rs` for `store`, `store/mod.rs` for `store-mod`).
     /// Only [`select_paths`] (an `@` path, either step) produces it.
     InPath,
     InDescription,
+}
+
+/// How tight a word-start hit is ([`WordStartHit`]), declared so the derived order
+/// is its tier's: fewer chunks, then fewer skipped words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct WordStartRank {
+    chunks: usize,
+    skipped: usize,
+}
+
+/// Which `@` step a path list serves ([`select_paths`]): the separators its query
+/// is split on, and whether the WORD-START rule may admit a name the parts reject.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathStep {
+    /// The folder the query's `dir_part` names, matched by its leaf
+    /// ([`select_entries`]): parts on [`QUERY_PART_SEPARATORS`], and word-start
+    /// over each entry's own name.
+    Folder,
+    /// The ROOT FALLBACK ([`at_list`]): the WHOLE query on
+    /// [`ROOT_FALLBACK_SEPARATORS`], substring parts alone. Its parts name folders
+    /// as well as the file, so they are not one name's word starts; a word-start
+    /// leaf is typed bare (`@calis`) instead.
+    RootFallback,
+}
+
+impl PathStep {
+    fn separators(self) -> &'static [char] {
+        match self {
+            PathStep::Folder => &QUERY_PART_SEPARATORS,
+            PathStep::RootFallback => &ROOT_FALLBACK_SEPARATORS,
+        }
+    }
 }
 
 /// The board's own matcher, compiled for one pick-list token: each of its
@@ -286,12 +332,65 @@ fn placement(matcher: &SearchIndex, name: &str, description: Option<&str>) -> Op
     }
 }
 
-/// [`placement`] of a path entry: judged on its own name (the last component)
+/// Where `matcher`'s query lands in the path entry `rel`, with the CHAR positions
+/// of `rel` its row marks. Judged on the entry's own name (the last component)
 /// first, so a name that starts with the query outranks one that merely holds it,
-/// and a path that needs a folder component for some part ranks last.
-fn path_placement(matcher: &SearchIndex, rel: &str) -> Option<Placement> {
-    let base = rel.rsplit('/').next().unwrap_or(rel);
-    placement(matcher, base, None).or_else(|| matcher.admits(rel).then_some(Placement::InPath))
+/// then on the whole path, so a path that needs a folder component for some part
+/// ranks below both. On the [`PathStep::Folder`] step a path the parts reject may
+/// still be a WORD-START hit of its own name ([`SearchIndex::word_start_hit`]).
+///
+/// A substring hit is marked under the board's ROW-LABEL rule over the whole path
+/// ([`SearchIndex::match_indices_with`]), and its name STARTS with the query when
+/// one of those marks covers the name's first char, as in [`placement`]: every
+/// part of a name hit lies in the name and so holds no `/`, so a mark there is a
+/// part's hit starting there. A word-start hit marks its chunks instead.
+fn path_hit(
+    matcher: &SearchIndex,
+    rel: &str,
+    step: PathStep,
+    scratch: &mut MarkScratch,
+) -> Option<(Placement, Vec<usize>)> {
+    let name_at = rel.rfind('/').map_or(0, |slash| slash + 1);
+    let name = &rel[name_at..];
+    let name_char = || {
+        if rel.is_ascii() {
+            name_at
+        } else {
+            rel[..name_at].chars().count()
+        }
+    };
+    if matcher.admits_with(name, scratch) {
+        let marks = matcher.match_indices_with(rel, scratch);
+        let placement = if marks.binary_search(&name_char()).is_ok() {
+            Placement::NameStart
+        } else {
+            Placement::InName
+        };
+        return Some((placement, marks));
+    }
+    if matcher.admits_with(rel, scratch) {
+        return Some((Placement::InPath, matcher.match_indices_with(rel, scratch)));
+    }
+    if step == PathStep::RootFallback {
+        return None;
+    }
+    let WordStartHit {
+        at_name_start,
+        chunks,
+        skipped,
+        marks,
+    } = matcher.word_start_hit(name, scratch)?;
+    let rank = WordStartRank { chunks, skipped };
+    let placement = if at_name_start {
+        Placement::WordStartNameStart(rank)
+    } else {
+        Placement::WordStartInName(rank)
+    };
+    let offset = name_char();
+    Some((
+        placement,
+        marks.into_iter().map(|pos| pos + offset).collect(),
+    ))
 }
 
 /// The listing entries `matcher` admits, each with where it landed, ordered by
@@ -446,7 +545,7 @@ pub fn at_list<'r>(
     let (dir_part, _) = split_path_query(query);
     if folder_hits.is_empty() && !dir_part.is_empty() {
         AtList {
-            candidates: select_paths(root(), query, &ROOT_FALLBACK_SEPARATORS),
+            candidates: select_paths(root(), query, PathStep::RootFallback),
             dir_part: String::new(),
         }
     } else {
@@ -468,38 +567,57 @@ pub fn split_path_query(query: &str) -> (&str, &str) {
 
 /// Entries whose path holds every part of `leaf` anywhere (an uppercase letter
 /// matches exactly, as in the board's search box): its own name or any folder
-/// above it, so `disc` finds `store/discover.rs`. An empty `leaf` lists only the
-/// folder's direct children, keeping the list a folder-by-folder walk. A dot-name
-/// (any component starting with `.`) shows only when `leaf` itself starts with
-/// `.`, a visibility gate applied before matching. Both gates read the raw `leaf`,
-/// never its parts. Ordered by [`path_placement`] (own name starts with a part,
-/// then holds them, then folder components do), then folders before files, then
-/// by path. Paths are inserted VERBATIM; folders carry a trailing `/`, which is
-/// never marked.
+/// above it, so `disc` finds `store/discover.rs` — or whose own name the leaf
+/// WORD-START matches under that same per-part case, so `calis` and `CaLis` find
+/// `CategoryListings.tsx`. An empty `leaf` lists only the folder's direct
+/// children, keeping the list a folder-by-folder walk. A dot-name (any component starting with `.`) shows only when `leaf`
+/// itself starts with `.`, a visibility gate applied before matching. Both gates
+/// read the raw `leaf`, never its parts. Ordered by [`path_hit`]'s [`Placement`]
+/// (own name starts with a part, then holds them, then folder components do, a
+/// word-start hit below the substring hits of its tier), then folders before
+/// files, then by path. Paths are inserted VERBATIM; folders carry a trailing
+/// `/`, which is never marked.
 pub fn select_entries(entries: &[DirEntryInfo], leaf: &str) -> Vec<Candidate> {
-    select_paths(entries, leaf, &QUERY_PART_SEPARATORS)
+    select_paths(entries, leaf, PathStep::Folder)
 }
 
-/// [`select_entries`] with `query` split into parts on `separators`: the folder
-/// step's leaf on [`QUERY_PART_SEPARATORS`], the root fallback's WHOLE query on
-/// [`ROOT_FALLBACK_SEPARATORS`]. Both gates read the raw `query`.
-fn select_paths(entries: &[DirEntryInfo], query: &str, separators: &[char]) -> Vec<Candidate> {
-    let matcher = matcher(query, separators);
+/// [`select_entries`] for either `step`: the folder step's leaf, or the root
+/// fallback's WHOLE query, split on that step's separators. Both gates read the
+/// raw `query`.
+///
+/// It runs on every keystroke over a walk of up to [`COMPLETION_MAX_TREE_ENTRIES`],
+/// so the pass allocates nothing per entry it rejects: ONE [`MarkScratch`] serves
+/// every question asked of every entry, an admitted row's marks are computed once,
+/// and the walk arrives sorted. Measured 2026-10-19 (release build, Apple M4 Max,
+/// median / p95 of 101 runs over a synthetic 25,000-entry monorepo walk): a
+/// one-char `@c` or `@s`, which admits nearly every entry, took 16.5 / 17.7 ms and
+/// 18.0 / 18.8 ms — past one 60 Hz frame — while every question allocated its own
+/// buffers, the fold pushed one char at a time and every keystroke sorted the
+/// whole walk by path, and takes 6.8 / 7.1 ms and 7.9 / 8.3 ms this way. The
+/// word-start rule's own share of a longer query is 0.2-1.1 ms over that walk and
+/// two real ones (10,084 and 25,000 entries).
+fn select_paths(entries: &[DirEntryInfo], query: &str, step: PathStep) -> Vec<Candidate> {
+    let matcher = matcher(query, step.separators());
     let show_hidden = query.starts_with('.');
-    let mut picked: Vec<(Placement, &DirEntryInfo)> = entries
+    let mut scratch = MarkScratch::new();
+    let mut picked: Vec<(Placement, &DirEntryInfo, Vec<usize>)> = entries
         .iter()
         .filter(|e| !query.is_empty() || !e.name.contains('/'))
-        .filter(|e| show_hidden || !e.name.split('/').any(|c| c.starts_with('.')))
-        .filter_map(|e| path_placement(&matcher, &e.name).map(|p| (p, e)))
+        .filter(|e| show_hidden || !has_dot_component(&e.name))
+        .filter_map(|e| {
+            path_hit(&matcher, &e.name, step, &mut scratch)
+                .map(|(placement, marks)| (placement, e, marks))
+        })
         .collect();
-    picked.sort_by(|(pa, a), (pb, b)| {
-        pa.cmp(pb)
-            .then_with(|| b.is_dir.cmp(&a.is_dir))
-            .then_with(|| a.name.cmp(&b.name))
-    });
+    // Ordered by placement, then by `listing_order`: stably by the second, then
+    // stably by the first. A walk arrives in `listing_order` already
+    // ([`list_tree`]), so the first sort is one pass that confirms it, and the
+    // second compares tiers alone, never two long paths.
+    picked.sort_by(|(_, a, _), (_, b, _)| listing_order(a, b));
+    picked.sort_by_key(|(placement, _, _)| *placement);
     picked
         .into_iter()
-        .map(|(_, e)| {
+        .map(|(_, e, label_marks)| {
             let text = if e.is_dir {
                 format!("{}/", e.name)
             } else {
@@ -508,11 +626,23 @@ fn select_paths(entries: &[DirEntryInfo], query: &str, separators: &[char]) -> V
             Candidate {
                 label: text.clone(),
                 insert: text,
-                label_marks: marks_in(&matcher, &e.name, 0),
+                label_marks,
                 ..Candidate::default()
             }
         })
         .collect()
+}
+
+/// Whether any `/`-separated component of `rel` starts with `.` — the dot-name
+/// gate of [`select_paths`].
+fn has_dot_component(rel: &str) -> bool {
+    rel.starts_with('.') || rel.contains("/.")
+}
+
+/// The order `@` entries list in within one tier: folders before files, then by
+/// path.
+fn listing_order(a: &DirEntryInfo, b: &DirEntryInfo) -> std::cmp::Ordering {
+    b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name))
 }
 
 /// The text that replaces the query after the trigger character. A command, an
@@ -558,15 +688,24 @@ pub fn settle_highlight(current: usize, len: usize, token_start_changed: bool) -
     }
 }
 
-/// Entries of `dir` and the folders below it, as `/`-relative paths, breadth
-/// first, bounded by [`COMPLETION_MAX_TREE_ENTRIES`]. Never descends a symlink (no cycles), a
-/// dot-folder or a [`TREE_SKIPPED_DIRS`] folder. FAIL-SOFT: a missing or
-/// unreadable folder is empty and a failing entry is skipped.
+/// Entries of `dir` and the folders below it, as `/`-relative paths, walked
+/// breadth first and bounded by [`COMPLETION_MAX_TREE_ENTRIES`], then returned in
+/// [`listing_order`] — the order a tier of the `@` list shows, so the walk is
+/// sorted once per read rather than on every keystroke ([`select_paths`]). Never
+/// descends a symlink (no cycles), a dot-folder or a [`TREE_SKIPPED_DIRS`]
+/// folder. FAIL-SOFT: a missing or unreadable folder is empty and a failing entry
+/// is skipped.
 pub fn list_tree(dir: &Path) -> Vec<DirEntryInfo> {
     list_tree_capped(dir, COMPLETION_MAX_TREE_ENTRIES)
 }
 
 fn list_tree_capped(root: &Path, cap: usize) -> Vec<DirEntryInfo> {
+    let mut out = walk_breadth_first(root, cap);
+    out.sort_by(listing_order);
+    out
+}
+
+fn walk_breadth_first(root: &Path, cap: usize) -> Vec<DirEntryInfo> {
     let mut out = Vec::new();
     let mut queue = std::collections::VecDeque::from([String::new()]);
     while let Some(prefix) = queue.pop_front() {
@@ -1221,6 +1360,26 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The walk comes back in the order a tier lists in — folders first, then by
+    /// path — not in the breadth-first order it was read in, so a keystroke's sort
+    /// over it is one confirming pass.
+    #[test]
+    fn list_tree_returns_folders_first_then_by_path() {
+        let dir = temp_dir("complete-order");
+        std::fs::create_dir_all(dir.join("c/deep")).unwrap();
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::fs::write(dir.join("b.txt"), "x").unwrap();
+        std::fs::write(dir.join("A.txt"), "x").unwrap();
+        std::fs::write(dir.join("a/x.txt"), "x").unwrap();
+        let got: Vec<String> = list_tree(&dir).into_iter().map(|e| e.name).collect();
+        assert_eq!(
+            got,
+            vec!["a", "c", "c/deep", "A.txt", "a/x.txt", "b.txt"],
+            "a breadth-first order would put every top-level entry before `a/x.txt`"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn a_deep_path_survives_a_big_sibling() {
         // The reported shape: a monorepo whose target sits 9 levels down beside a
@@ -1374,7 +1533,8 @@ mod tests {
 
     /// Smart case per PART: `Site` matches exactly, `stor` in any case — so a
     /// per-token rule (one uppercase letter makes every part exact) would miss
-    /// `SiteMap-STORAGE.ts`.
+    /// `SiteMap-STORAGE.ts`. The word-start rule decides case the same way, so
+    /// `sitemap-storage.ts` is no word-start hit for `Site-stor` either.
     #[test]
     fn smart_case_is_decided_per_part() {
         let e = vec![
@@ -1384,6 +1544,21 @@ mod tests {
         assert_eq!(
             inserts(&select_entries(&e, "Site-stor")),
             vec!["SiteMap-STORAGE.ts"]
+        );
+        let site = matcher("Site-stor", &QUERY_PART_SEPARATORS);
+        assert!(
+            !site.admits("sitemap-storage.ts"),
+            "the substring parts reject it: `Site` matches exactly"
+        );
+        assert_eq!(
+            path_hit(
+                &site,
+                "sitemap-storage.ts",
+                PathStep::Folder,
+                &mut MarkScratch::new()
+            ),
+            None,
+            "and so do its word starts: `Site` meets `sitemap` exactly too"
         );
         assert_eq!(
             inserts(&select_entries(&e, "site-STOR")),
@@ -1420,6 +1595,208 @@ mod tests {
             inserts(&filter_commands(&commands, "site-stor")),
             vec!["storage-site", "site-storage", "my-site-storage"]
         );
+    }
+
+    // --- word-start (camel-hump) matching -------------------------------------
+
+    /// The reported shape: a CamelCase file deep in a monorepo, beside a name
+    /// that holds the same letters in order without starting words with them.
+    fn product_pages_tree() -> Vec<DirEntryInfo> {
+        vec![
+            entry("apps", true),
+            entry("apps/mono", true),
+            entry("apps/mono/src", true),
+            entry("apps/mono/src/modules", true),
+            entry("apps/mono/src/modules/ProductPages", true),
+            entry("apps/mono/src/modules/ProductPages/CategoryListings", true),
+            entry(
+                "apps/mono/src/modules/ProductPages/CategoryListings/CategoryListings.tsx",
+                false,
+            ),
+            entry(
+                "apps/mono/src/modules/ProductPages/CategoryListings/index.ts",
+                false,
+            ),
+            entry("packages", true),
+            entry("packages/contract-alias", true),
+            entry("packages/contract-alias/index.ts", false),
+        ]
+    }
+
+    /// `@calis` and `@CaLis` hold no substring of `CategoryListings.tsx`, so only
+    /// the word-start rule finds it, as `Ca` + `Lis` of its OWN name: the marks are
+    /// those chunks, never the folder above that spells the same words.
+    #[test]
+    fn a_camel_case_file_is_found_by_its_word_starts() {
+        for query in ["calis", "CaLis"] {
+            assert_eq!(
+                marked_labels(&at_candidates(&product_pages_tree(), &[], query)),
+                vec![
+                    "apps/mono/src/modules/ProductPages/[Ca]tegory[Lis]tings/",
+                    "apps/mono/src/modules/ProductPages/CategoryListings/[Ca]tegory[Lis]tings.tsx",
+                ],
+                "@{query}: `contract-alias` holds the letters in order, and is no hit"
+            );
+        }
+    }
+
+    /// Smart case binds a word-start hit as it binds a substring one, per part: a
+    /// capital meets a capital alone. So `@C` and `@Ca` keep `cat.rs` out, `@CaLis`
+    /// lists `CategoryListings.tsx` alone where `@calis` lists every name whose
+    /// word starts spell it, and `@CaLi-st` holds `Ca` + `Li` exact while its `st`
+    /// meets `Store` and `STORE` alike.
+    #[test]
+    fn a_capital_matches_exactly_in_a_word_start_hit_too() {
+        let cat = vec![entry("cat.rs", false)];
+        for query in ["C", "Ca"] {
+            assert_eq!(
+                inserts(&select_entries(&cat, query)),
+                Vec::<&str>::new(),
+                "@{query}"
+            );
+        }
+        let e = vec![
+            entry("ClickAwayListener", false),
+            entry("CategoryListings.tsx", false),
+            entry("categoryListings.tsx", false),
+        ];
+        assert_eq!(
+            inserts(&select_entries(&e, "CaLis")),
+            vec!["CategoryListings.tsx"],
+            "`ClickAwayListener` would need its `a` to meet `Away`"
+        );
+        assert_eq!(
+            inserts(&select_entries(&e, "calis")),
+            vec![
+                "CategoryListings.tsx",
+                "categoryListings.tsx",
+                "ClickAwayListener"
+            ]
+        );
+        let stores = vec![
+            entry("CategoryLinkStore.ts", false),
+            entry("CategoryLinkSTORE.ts", false),
+            entry("categoryLinkStore.ts", false),
+            entry("CategoryLINKStore.ts", false),
+        ];
+        assert_eq!(
+            inserts(&select_entries(&stores, "CaLi-st")),
+            vec!["CategoryLinkSTORE.ts", "CategoryLinkStore.ts"]
+        );
+    }
+
+    /// Each word-start tier sits right below the substring tier it lands in: a
+    /// substring name start, then a word-start name start, then a substring hit
+    /// elsewhere in the name, then a word-start hit on a later word, then a path.
+    #[test]
+    fn a_word_start_hit_ranks_below_the_substring_hits_of_its_tier() {
+        let e = vec![
+            entry("calis/zz.ts", false),
+            entry("MyCategoryListings.tsx", false),
+            entry("xcalis.ts", false),
+            entry("CategoryListings.tsx", false),
+            entry("CalisThing.ts", false),
+        ];
+        assert_eq!(
+            inserts(&select_entries(&e, "calis")),
+            vec![
+                "CalisThing.ts",
+                "CategoryListings.tsx",
+                "xcalis.ts",
+                "MyCategoryListings.tsx",
+                "calis/zz.ts",
+            ]
+        );
+    }
+
+    /// Within a word-start tier, fewer chunks first, then fewer skipped words, and
+    /// only then folders first and the path: `ClickAwayListener` (`c` + `a` +
+    /// `lis`) lists below both `Category…Listings` names though it is a folder, and
+    /// `CategoryFooListings` skips a word, so it follows `CategoryListings`.
+    #[test]
+    fn word_start_hits_order_by_fewest_chunks_then_fewest_skipped_words() {
+        let e = vec![
+            entry("ClickAwayListener", true),
+            entry("CategoryFooListings.tsx", false),
+            entry("CategoryListings.tsx", false),
+        ];
+        assert_eq!(
+            marked_labels(&select_entries(&e, "calis")),
+            vec![
+                "[Ca]tegory[Lis]tings.tsx",
+                "[Ca]tegoryFoo[Lis]tings.tsx",
+                "[C]lick[A]way[Lis]tener/",
+            ]
+        );
+    }
+
+    /// The ROOT FALLBACK stays substring: its parts name folders as well as the
+    /// file, so `@ProductPages/calis` finds nothing, while the folder step on the
+    /// real folder does word-start match its leaf.
+    #[test]
+    fn the_root_fallback_lists_no_word_start_hit() {
+        let tree = product_pages_tree();
+        assert_eq!(
+            written(&at_list_over(&tree, &[], "ProductPages/calis")),
+            Vec::<String>::new()
+        );
+        // `cat` + `calis` WOULD word-start match `CatCategoryListings.tsx` (`Cat` +
+        // `Ca` + `Lis`), and `calis` is no substring, so only the rule's absence
+        // keeps the fallback empty; the folder step on `src/` does find it.
+        let cats = vec![
+            entry("src", true),
+            entry("src/CatCategoryListings.tsx", false),
+        ];
+        assert_eq!(
+            written(&at_list_over(&cats, &[], "cat/calis")),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            written(&at_list_over(&cats, &[], "src/calis")),
+            vec!["src/CatCategoryListings.tsx "]
+        );
+        assert_eq!(
+            written(&at_list_over(
+                &tree,
+                &[],
+                "apps/mono/src/modules/ProductPages/calis"
+            )),
+            vec![
+                "apps/mono/src/modules/ProductPages/CategoryListings/",
+                "apps/mono/src/modules/ProductPages/CategoryListings/CategoryListings.tsx ",
+            ]
+        );
+    }
+
+    /// Word-start is for `@` files and folders alone: a command or an agent named
+    /// in CamelCase is matched by substring, as before.
+    #[test]
+    fn commands_and_agents_list_no_word_start_hit() {
+        let listing = vec![
+            listed("CategoryListings", None),
+            listed("category-listings", Some("Lists every category")),
+        ];
+        assert!(filter_commands(&listing, "calis").is_empty());
+        assert!(select_agents(&listing, "calis").is_empty());
+        assert_eq!(
+            inserts(&at_candidates(
+                &[entry("CategoryListings.tsx", false)],
+                &listing,
+                "calis"
+            )),
+            vec!["CategoryListings.tsx"],
+            "the same query lists the file, so the agents' absence is the rule's"
+        );
+    }
+
+    #[test]
+    fn a_dot_component_is_any_component_starting_with_a_dot() {
+        for dotted in [".env", ".git/config", "src/.env", "a/.b/c"] {
+            assert!(has_dot_component(dotted), "{dotted}");
+        }
+        for plain in ["src/x.rs", "a.b/c", "a./b", "env.example", ""] {
+            assert!(!has_dot_component(plain), "{plain}");
+        }
     }
 
     // --- the `@` root fallback ----------------------------------------------
