@@ -21,6 +21,7 @@ pub mod parse;
 pub mod preview;
 pub mod skills;
 pub mod subagents;
+pub mod tasks;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -266,6 +267,13 @@ pub struct Session {
     /// `tui::view` — and by nothing else: no key, no gate. A fact about the bytes,
     /// carried through the parse cache like every other parsed field.
     pub failed_task: Option<FailedTask>,
+    /// Each background task's latest notified status (see
+    /// [`parse::ParsedFile::task_ledger`]).
+    ///
+    /// Read by ONE question: whether a subagent the session launched has a
+    /// `failed` notice standing (`subagents::is_failed`). A fact about the bytes,
+    /// carried through the parse cache like every other parsed field.
+    pub task_ledger: tasks::TaskLedger,
     /// The session's name as claude last recorded it (see
     /// [`parse::ParsedFile::custom_title`]), raw; `None` when the file names none.
     ///
@@ -338,6 +346,7 @@ impl Session {
                 has_agent_name: parsed.has_agent_name,
                 has_agent_setting: parsed.has_agent_setting,
                 failed_task,
+                task_ledger: parsed.task_ledger,
                 custom_title: parsed.custom_title,
             }
         })
@@ -860,6 +869,37 @@ mod tests {
         );
     }
 
+    /// The ledger reaches the `Session` from the parse: the fixture's `failed`
+    /// notice reads failed there, a `completed` one does not, and a later quick
+    /// reply — which clears `failed_task` — clears nothing in the ledger.
+    #[test]
+    fn the_task_ledger_reaches_the_session_from_the_parse() {
+        let sessions = load();
+        let task = "af4404196ddbcd945";
+
+        assert!(
+            find(&sessions, "sess-task-failed-1")
+                .task_ledger
+                .is_failed(task),
+            "a failed notice is the ledger's failed task"
+        );
+        assert!(
+            !find(&sessions, "sess-task-completed-1")
+                .task_ledger
+                .is_failed(task),
+            "a completed notice is not"
+        );
+        let replied = find(&sessions, "sess-task-reply-1");
+        assert_eq!(
+            replied.failed_task, None,
+            "premise: the reply cleared the flag"
+        );
+        assert!(
+            replied.task_ledger.is_failed(task),
+            "the user's reply clears the flag, not a fact about the task"
+        );
+    }
+
     /// Nothing ELSE in the fixture store is flagged — the guard against a flag
     /// that is really just always on.
     #[test]
@@ -1064,6 +1104,7 @@ mod tests {
         let rendered = preview::render(
             s,
             80,
+            &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
         );

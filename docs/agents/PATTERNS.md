@@ -1303,7 +1303,11 @@ The preview's CACHE-MISS render is a read the DRAW itself can trigger, and it is
 its own class: `App::ensure_preview` renders the selected transcript on
 the first frame after a row is selected, after a resize or layout step changes
 the pane's width, and after a reload re-read that transcript, and
-`App::toggle_peer_fold` re-renders inside a click's release. Every frame after
+`App::toggle_peer_fold` re-renders inside a click's release. A landing subagent
+record, or a subagent view's render, that moves the set of failed subagents
+evicts the SESSION's render too (`· failed` on its delegation lines is drawn from
+that set), so the next frame renders the session transcript again here; an
+unchanged set, the common case, evicts nothing. Every frame after
 that reads the `(session, width)` cache entry, never the disk. A render reads
 two things, all on the UI thread: the session file, and the session's own
 `subagents/` dir with its meta files (`store::subagents::index_for`: one
@@ -1318,12 +1322,11 @@ opened is the regression. The subagent refresh above never renders a
 transcript, and runs off this thread. Once the
 view is open, its render is redone on every eviction, never on a frame alone: the
 session render's own triggers above evict it too (a width change, a reload that
-re-read the parent session, a fold toggle in it), and so does the watcher's
-`AppEvent::SubagentsWritten` naming its transcript, so a running subagent's
-transcript is re-read at most once per debounce batch — the cadence a live
-session's own render is redone at — and a write to any other subagent renders
-nothing (under the selected session it only has the subagent record read again,
-on the refresh's worker). DOMAIN.md's "The view updates as the subagent writes" lists every
+re-read the parent session, a fold toggle in it), as does a landing subagent
+record that moves the failed set the render drew `· failed` from, and so does
+the watcher's `AppEvent::SubagentsWritten` naming its transcript, so a running
+subagent's transcript is re-read about once per debounce batch — the cadence a
+live session's own render is redone at (a batch can cost a second read). DOMAIN.md's "The view updates as the subagent writes" lists every
 trigger. What a render
 costs, and why moving it off the UI thread is the worse trade, is argued once,
 in `App::ensure_preview`'s doc and, for the view, `App::ensure_subagent_preview`'s;

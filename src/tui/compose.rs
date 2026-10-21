@@ -1675,6 +1675,7 @@ mod tests {
                 has_agent_setting: false,
                 failed_task: None,
                 custom_title: None,
+                task_ledger: Default::default(),
             }],
             Scope::All,
             PathBuf::from("/tmp"),
@@ -1734,6 +1735,7 @@ mod tests {
             has_agent_setting: false,
             failed_task: None,
             custom_title: None,
+            task_ledger: Default::default(),
         }
     }
 

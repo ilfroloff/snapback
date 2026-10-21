@@ -1365,7 +1365,10 @@ each with claude's summary intact. A snapshot, not a contract.
 #### Where it is computed
 
 In the parse pass, into `ParsedFile::failed_task` and then `Session::failed_task`
-(the timestamp parsed on the way, like `Session::timestamp`). It is a fact about
+(the timestamp parsed on the way, like `Session::timestamp`). The same notices
+also feed `store::tasks`' ledger (`Session::task_ledger`), through the same
+`tasks::is_task_notification` and `tasks::tag_inner`, for the
+[subagent `failed` rule](#subagent-record-and-running-list-storesubagents). It is a fact about
 the BYTES, so the [parse cache](#incremental-reload-storesessionstore) carries it
 unchanged. No `App` state is derived from it: the row reads its own session's
 field, and the banner reads the selected session's.
@@ -2210,6 +2213,10 @@ SUBAGENT VIEW:
 ◆ delegated to @parser-auditor · Audit the parser · (click to view)
 ```
 
+A subagent that FAILED reads `◆ delegated to @parser-auditor · Audit the parser ·
+failed · (click to view)` ([the failed rule](#subagent-record-and-running-list-storesubagents)
+owns who failed).
+
 **The join is by id, NEVER by tool name.** A block is a launch when its `id`
 equals a meta file's `toolUseId` (`delegated_meta`); its `name` is not read,
 since both `Agent` and `Task` launch subagents in real data (the fixture's
@@ -2312,21 +2319,28 @@ read off the path by `store::discover::subagent_transcript_at` through the same
 `subagents_dir` and transcript-name derivations the view opens it by — and passes
 them on as ONE `AppEvent::SubagentsWritten`: never a session reload, and never
 board activity. `App::apply_subagent_writes` evicts the view's render only when
-the view shows one of them, so the next frame reads the transcript again: at most
-once per debounce batch (`watch::DEBOUNCE`, so five times a second), the cadence
+the view shows one of them, so the next frame reads the transcript again: once
+per debounce batch for that cause (`watch::DEBOUNCE`, so five times a second), the cadence
 a live session's own transcript is redrawn at, and a pane following the newest
 turn keeps following it. Each such redraw renders the WHOLE transcript again;
 what that costs a large running subagent, and the known fix if it bites, are
 [PATTERNS.md §6](PATTERNS.md#6-off-ui-thread-for-anything-that-can-block)'s. A
-write to any other subagent, or with no view up, renders nothing; under the
-selected session it only has the
+write to any other subagent, or with no view up, re-reads no transcript for the
+view itself; under the selected session it has the
 [subagent record](#subagent-record-and-running-list-storesubagents) read again,
-off the UI thread. The render is
+off the UI thread, and that record's landing evicts the view's render when it
+moves the failed set (below), so one batch can re-read the viewed transcript
+twice. The render is
 redone as well on the
 parent session's next write (its reload evicts the view's render too),
 `Ctrl-X r`, a resize or layout step that changes the pane's width, a click that
 toggles a fold node inside the view (`App::toggle_peer_fold` evicts it beside the
-session's own entry), and leaving and switching back. A meta file is not such a
+session's own entry), a landing subagent record that moves the set of
+subagents that failed (`· failed` is drawn from that set, so the SESSION's
+render and the view's, whichever was drawn for another set, are evicted, and
+only then), and leaving and switching back. A view render that itself moves
+that set evicts the SESSION's render only: it restamps its own with the set its
+verdict produced, since its verdict names no line of its own transcript. A meta file is not such a
 write: a launch inside the view whose
 meta file lands after its line was drawn joins on the next write to the viewed
 transcript. Those, with the switch that opens the view, are all the reads of the
@@ -2410,7 +2424,7 @@ error flag sit beside their arms in `after_record`.
 
 **Running is worked out at DRAW time** (`subagents::is_running`, pure): a
 subagent runs while its tail was read and it had not ended
-(`ended == Some(RunVerdict::Open)`; a failed run, like a finished one, never runs)
+(`ended == Some(RunVerdict::Open)`; a failed run, like a finished one, never runs — and neither does a subagent a `failed` task notice names, `Subagent::is_running` asking the ONE `is_failed` below first)
 and its `newest_write` lies within `RUNNING_WINDOW` of
 `App::wall_clock`, the window inclusive and a write after that instant counted as
 recent. `App::wall_clock` is stamped by every `Tick` and every landed record
@@ -2429,7 +2443,11 @@ is up, as `Esc` does. Otherwise it opens the view on the record's
 `open_target` as of `App::wall_clock` (`App::open_subagent_target`): the FIRST
 running subagent in launch order, else the most recently written one — the
 newest `newest_write`, a tie going to the later launch, since a parent shares
-its running child's write. A hidden preview comes back at `1:1` first, and a
+its running child's write. A subagent a `failed` task notice names is never the
+running one, however recently it wrote (`Subagent::is_running`, through
+`SubagentStatus::of`, where `failed` ranks first): one subagent never counts as
+both running and failed, so the running list, the title's `N running` and this
+target all leave it out. A hidden preview comes back at `1:1` first, and a
 typed query stays. The key reads no file, so it refuses, on a sticky status
 line, when the record cannot answer: `SUBAGENTS_NOT_READ_REFUSAL` while the
 refresh has not landed one for the selected session (never "none", which is not
@@ -2457,7 +2475,9 @@ transcript carries no `ai-title` record (none across a local store,
 (`App::subagent_view_status`): `running` exactly where `is_running` says so, in
 the running list's green (`view::RUNNING_COLOR`); else `finished` or `failed`
 once the run's end was read, as it was read — `failed` in a failed background
-task's red (`view::FAILED_TASK_COLOR`); else `quiet`, in `DarkGray`. The time is
+task's red (`view::FAILED_TASK_COLOR`); else `quiet`, in `DarkGray`. `failed`
+ranks FIRST, ahead of `running` (the ONE rule is below: **A subagent failed when
+either source says so**), so no run reads both. The time is
 `preview::timestamp_annotation`'s, the turn markers' own form, against the wall
 clock's day in the launch time's own offset; the age is the running list's,
 from `newest_write`, with `k/n` from `App::subagent_view_position`. A fact not
@@ -2466,15 +2486,61 @@ cut with an ellipsis and then dropped, then `last write …`, then `started …`
 the fit never cuts the four segments left, and narrower than they are the
 border cuts the title at its edge.
 
+**A subagent failed when either source says so** (`subagents::is_failed`, the one
+function; `Subagent::is_failed` and `SubagentRecord::failed_ids` apply it). The
+sources are its transcript's end (`RunVerdict::Failed`, an API error — read by
+the record only while the subagent can be running, and by the view's render
+whenever it is open) and its latest task notification
+(`tasks::TaskLedger::is_failed`, joined by `<task-id>`, which names the
+subagent's id; a ledger entry naming no subagent the record lists, such as a
+background command's, marks nothing). Neither covers the other. Measured
+2026-10-21 over a local `~/.claude/projects`: 15 subagents' latest notification is
+`failed`, across 13 sessions — 10 "Agent stalled: no progress for 600s", whose
+transcripts end quietly and read `quiet` before this rule, and 5 auth or API
+errors, the only ones the transcript rule reads. A notification's `<task-id>`
+always named the subagent's id, an `agent-<task-id>.meta.json` existed for every
+agent notice, and `<tool-use-id>` is absent on builds 2.1.261 to 2.1.296, so the
+join is by `<task-id>`. The `<status>` tokens are undocumented: the LATEST notice
+per task id decides, and an unrecognised token is recorded as `Unknown` and reads
+as not failed (it still supersedes an earlier `failed`). Fail-soft direction: toward NOT
+failed — a body that is not a string, a notice naming no `<task-id>` or an
+unreadable `<status>` records nothing, since a wrong `failed` accuses a healthy
+subagent. The ledger is the
+selected session's own, never a fork lineage's union. A foreground failure older
+than `RUNNING_WINDOW` carries no notification and no record tail, so it shows
+on the title and the delegation line only once its view has been opened (or if
+the board saw it inside the window): the three surfaces agree on the verdict
+they stand on, with that one documented lag. Three surfaces SHOW it (the running
+count and `Ctrl-X ↓` only leave a failed one out): the session title's `N failed`, the launch's delegation line
+(`· failed` before the affordance, in `preview::FAILED_COLOR`, which
+`view::FAILED_TASK_COLOR` names) and the view title's state. The line is drawn
+by the render, which is handed the failed ids (`preview::render`'s and
+`render_subagent`'s `failed` set, from `App::failed_subagent_ids`), and each
+cached render keeps the set it was drawn with, so `App::apply_subagent_record`
+(and a view render that judges a failure) evicts the renders drawn for another
+set, and the next miss re-renders: that is a re-read of the SESSION's
+transcript on the UI thread (the cache-miss render's cost,
+[PATTERNS.md §6](PATTERNS.md#6-off-ui-thread-for-anything-that-can-block)),
+and, with the view up, of the viewed subagent's. An unchanged set, a
+re-selection included, keeps them. The board row keeps `[task failed]` and its until-you-write rule;
+`stopped` and `killed` subagents are not shown.
+
 **The title's `ended` is the render's.** The record reads a tail only while the
 subagent can be running, so for every older one its `ended` is `None` and
-cannot tell `finished` or `failed` from `quiet`. The view reads its transcript whole anyway,
+cannot tell `finished` or `failed` from `quiet`. The three failure surfaces
+stand on one verdict, `FailureMemory::judged_end`: the view's cached render when
+it has one, else a `Failed` already judged (by the render, or by a tail the
+record read inside the window) whose `newest_write` stamp the record still
+holds, else the record's `ended`. The memory is `App`'s, in memory only, and
+keeps a verdict from a read that FINISHED alone — a record's `Some(Open)` may be
+an unreadable tail and is never stored — and drops it when the stamp moves. No
+new file is read for it. The view reads its transcript whole anyway,
 to render it, so `render_stream` folds the SAME `RunProgress` over every record
 it streams in `RenderMode::Subagent` and keeps the verdict on the render
 (`RenderedPreview::run_ended`; `None` for the session's own render and for the
-unreadable one). `App::subagent_view_status` reads it off the cached render
-(`App::peek_preview`) and falls back to the record's `ended` whenever the render
-has no verdict (none is cached yet, or it is the unreadable one); each eviction
+unreadable one). `App::subagent_view_status` reads it through `App::judged_end`: the cached
+render's verdict, then the failure memory, then the record's `ended` whenever
+neither has one (no render is cached yet, or it is the unreadable one); each eviction
 of the render
 ([the view's section](#delegation-line-and-subagent-view-storepreview) lists
 them) takes the verdict with it, so the next render judges again. It costs no
@@ -2485,7 +2551,7 @@ warmed the cache, so a view's first frame already states the render's verdict.
 
 **The session's title** (`view::session_title`, pure over `SessionTitleFacts`
 and the width the border gives it) is the preview's title everywhere else:
-` <status> · last write <age> · N msgs · N subagents · N running `, the
+` <status> · N failed · last write <age> · N msgs · N subagents · N running `, the
 session's name (its label, or its id for an empty one) leading it only in the
 `0:1` layout (`PaneLayout::PreviewOnly`), where no list shows which row is
 selected. `view::session_title_facts` reads it all from memory, with no file or
@@ -2494,18 +2560,24 @@ without its age; the age is the subagent title's, from `Session::timestamp` —
 the session's most recent activity — against `App::wall_clock`; `N msgs` is
 `Session::msg_count`; the counts are this record's, `N running` through
 `view::running_in`, the same `is_running` at the same `App::wall_clock` the
-running list filters by, so the two never disagree, drawn in `RUNNING_COLOR`. A
+running list filters by (through `Subagent::is_running`, which reads the same
+`FailureMemory::judged_end` and ledger as the failed count, so a failed subagent
+is never running), so the two never disagree, drawn in `RUNNING_COLOR`; `N failed` is
+`App::failed_subagent_ids` (`SubagentRecord::failed_ids` over the selected
+session's ledger and `FailureMemory::judged_end`), drawn in
+`FAILED_TASK_COLOR`, right after the status so the border's edge cuts every other
+count before it. A
 fact not known is left out: no status for a session claude does not report, nor
 while this board's quick reply to it is in flight, whose `cooking…` tail
 already says it, as on the pinned row; no age before the wall clock is first
 stamped, for a timestamp after it, or for one the platform's clock cannot hold
 (`view::system_time_of`); no subagent segment before the record lands or when
-it lists none; no `N running` while nothing runs. Unlike the running list, the
+it lists none; no `N running` while nothing runs, no `N failed` while nothing failed. Unlike the running list, the
 count stays while a compose box is open. On a narrow border the name is cut
 with an ellipsis and then dropped, then `last write …`, then `N msgs`: the
 subagent title's own fit, `view::fit_title`, which both titles share. The
-status and the counts are never cut by it; narrower than they are, the border
-cuts the title at its edge. With nothing selected, or a draft card on the pane,
+status, `N failed` and the counts are never cut by it; narrower than they are, the border
+cuts the title at its edge, reaching `N failed` after every other count. With nothing selected, or a draft card on the pane,
 the title is ` preview `.
 
 **The running list** (`view::running_subagents`, `running_list`): while the
