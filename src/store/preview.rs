@@ -436,8 +436,9 @@ pub fn render(
     width: usize,
     known_agents: &HashSet<&str>,
     expanded: &HashSet<&str>,
+    failed: &HashSet<&str>,
 ) -> RenderedPreview {
-    render_file_collect(&session.file, width, known_agents, expanded)
+    render_file_collect(&session.file, width, known_agents, expanded, failed)
 }
 
 /// Render the transcript of the subagent `agent_id` that the session file
@@ -465,6 +466,7 @@ pub fn render_subagent(
     width: usize,
     known_agents: &HashSet<&str>,
     expanded: &HashSet<&str>,
+    failed: &HashSet<&str>,
 ) -> RenderedPreview {
     let unreadable = || RenderedPreview {
         text: Text::from(vec![marker_line(SUBAGENT_UNREADABLE.to_string())]),
@@ -483,6 +485,7 @@ pub fn render_subagent(
         width,
         known_agents,
         expanded,
+        failed,
         index: &index,
     };
     let rendered = render_stream(BufReader::new(file), &stream);
@@ -565,6 +568,7 @@ fn render_file_collect(
     width: usize,
     known_agents: &HashSet<&str>,
     expanded: &HashSet<&str>,
+    failed: &HashSet<&str>,
 ) -> RenderedPreview {
     let file = match File::open(path) {
         Ok(f) => f,
@@ -581,6 +585,7 @@ fn render_file_collect(
         width,
         known_agents,
         expanded,
+        failed,
         index: &index,
     };
     render_stream(BufReader::new(file), &stream)
@@ -631,6 +636,11 @@ struct StreamContext<'a> {
     known_agents: &'a HashSet<&'a str>,
     /// The open fold keys; only the two fold nodes read it.
     expanded: &'a HashSet<&'a str>,
+    /// The ids of the subagents that FAILED (`subagents::is_failed`), which a
+    /// delegation line states ([`delegation_node_lines`]). Handed in by the app,
+    /// which holds both sources of the answer, so this render stays a read of one
+    /// transcript and its meta files.
+    failed: &'a HashSet<&'a str>,
     /// The session's launches, by `tool_use.id`. Built ONCE per render: one
     /// session's `subagents/` dir holds every agent it launched at any depth, so a
     /// subagent's transcript joins its own launches against the same index.
@@ -1732,6 +1742,18 @@ const DELEGATION_HEADER_BLOCK_ROW: usize = 0;
 /// opens where the line sits.
 const DELEGATION_VIEW_AFFORDANCE: &str = "(click to view)";
 
+/// What a delegation line says of a subagent that FAILED, ahead of the
+/// affordance: `· failed`, in [`FAILED_COLOR`].
+const DELEGATION_FAILED: &str = "failed";
+
+/// The color that says "this failed": a failed background task's row marker and
+/// banner, the session title's `N failed`, the subagent view title's `failed` and
+/// a delegation line's `· failed` alike, so every surface reads as one fact.
+///
+/// `Red`: the board's one accent for "this wants you". A NAMED ANSI color, never
+/// RGB (TERMINAL-SAFE STYLING). `tui::view` names it `FAILED_TASK_COLOR`.
+pub const FAILED_COLOR: Color = Color::Red;
+
 /// The subagent the `tool_use` block `block` launched, when its `id` joins a meta
 /// file in `index`. The block's `name` is never read.
 fn delegated_meta<'i>(block: &Value, index: &'i SubagentIndex) -> Option<&'i SubagentMeta> {
@@ -1749,8 +1771,10 @@ const SUBAGENT_UNREADABLE: &str = "[subagent transcript unreadable]";
 /// with the rest of the turn.
 ///
 /// The line carries the [`IN_TURN_INDENT`], then [`DELEGATION_MARKER`] and the
-/// agent's `@<agentType>` in [`peer_style`], then the meta's description and
-/// [`DELEGATION_VIEW_AFFORDANCE`] as DIM [`annotation_span`]s. The description is
+/// agent's `@<agentType>` in [`peer_style`], then the meta's description, a
+/// `failed` segment when `failed` ([`DELEGATION_FAILED`], in [`FAILED_COLOR`]) and
+/// [`DELEGATION_VIEW_AFFORDANCE`] as DIM [`annotation_span`]s (the `failed`
+/// segment is not dim). The description is
 /// the delegating model's words, drawn VERBATIM as plain text: never through the
 /// markdown or link pass, so a link it spells claims no [`LinkRegion`] on the row
 /// a click switches from. It carries no timestamp: the `● claude` turn above it
@@ -1758,7 +1782,7 @@ const SUBAGENT_UNREADABLE: &str = "[subagent transcript unreadable]";
 ///
 /// The whole line is the click target, so a reader need not hit the affordance
 /// text exactly. PURE.
-fn delegation_node_lines(meta: &SubagentMeta) -> (Line<'static>, SubagentRegion) {
+fn delegation_node_lines(meta: &SubagentMeta, failed: bool) -> (Line<'static>, SubagentRegion) {
     let mut spans = vec![
         Span::raw(IN_TURN_INDENT),
         Span::styled(
@@ -1768,6 +1792,12 @@ fn delegation_node_lines(meta: &SubagentMeta) -> (Line<'static>, SubagentRegion)
     ];
     if let Some(description) = &meta.description {
         spans.push(annotation_span(description));
+    }
+    if failed {
+        spans.push(Span::styled(
+            format!(" \u{b7} {DELEGATION_FAILED}"),
+            Style::default().fg(FAILED_COLOR),
+        ));
     }
     spans.push(annotation_span(DELEGATION_VIEW_AFFORDANCE));
     let line = Line::from(spans);
@@ -1828,7 +1858,10 @@ fn assistant_lines(
                     }
                     Some("tool_use") => match delegated_meta(b, stream.index) {
                         Some(meta) => {
-                            let (line, region) = delegation_node_lines(meta);
+                            let (line, region) = delegation_node_lines(
+                                meta,
+                                stream.failed.contains(meta.agent_id.as_str()),
+                            );
                             subagent_regions.extend(rebased(vec![region], lines.len()));
                             lines.push(line);
                         }
@@ -3633,7 +3666,7 @@ mod tests {
     /// test can exercise the validated `agent-name` fallback.
     fn render_file_known(path: &Path, width: usize, known: &[&str]) -> Text<'static> {
         let known: HashSet<&str> = known.iter().copied().collect();
-        render_file_collect(path, width, &known, &HashSet::new()).text
+        render_file_collect(path, width, &known, &HashSet::new(), &HashSet::new()).text
     }
 
     /// Like [`render_file`] but with an explicit set of OPEN fold keys, so a test
@@ -3641,7 +3674,7 @@ mod tests {
     /// than by calling [`peer_node_lines`] directly.
     fn render_file_expanded(path: &Path, width: usize, expanded: &[&str]) -> RenderedPreview {
         let expanded: HashSet<&str> = expanded.iter().copied().collect();
-        render_file_collect(path, width, &HashSet::new(), &expanded)
+        render_file_collect(path, width, &HashSet::new(), &expanded, &HashSet::new())
     }
 
     /// The empty set, for [`test_stream`]'s two borrows: no known agents, and no
@@ -3657,6 +3690,7 @@ mod tests {
             width: WIDE,
             known_agents: &EMPTY_SET,
             expanded: &EMPTY_SET,
+            failed: &EMPTY_SET,
             index,
         }
     }
@@ -4991,7 +5025,14 @@ mod tests {
     /// [`render_subagent`] over `session` for `agent_id`, at [`WIDE`], with no
     /// known agents and no open folds.
     fn render_view(session: &Path, agent_id: &str) -> RenderedPreview {
-        render_subagent(session, agent_id, WIDE, &HashSet::new(), &HashSet::new())
+        render_subagent(
+            session,
+            agent_id,
+            WIDE,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+        )
     }
 
     /// The row of the first line whose text, past its indent, opens with `head`.

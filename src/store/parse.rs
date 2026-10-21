@@ -22,6 +22,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
+use super::tasks::{self, STATUS_FAILED, TAG_STATUS, TAG_SUMMARY};
 use super::{command, label};
 
 /// SAFETY CEILING on the per-session searchable transcript text — a bound
@@ -54,30 +55,14 @@ pub const CONTENT_INDEX_CAP: usize = 1024 * 1024;
 /// file non-background rather than producing a verdict.
 pub const SESSION_KIND_BACKGROUND: &str = "bg";
 
-/// The `origin.kind` Claude Code stamps on the `user` record it SYNTHESIZES to
-/// deliver a background task's `<task-notification>` into the session that
-/// launched it.
-///
-/// `origin` is undocumented upstream. It is an object whose `kind` names who
-/// wrote the record; the other kinds observed in a real store are
-/// [`ORIGIN_KIND_HUMAN`] and `"peer"` (a message from another agent). The read is
-/// FAIL-SOFT: see [`OriginKind`].
-const ORIGIN_KIND_TASK_NOTIFICATION: &str = "task-notification";
-
 /// The `origin.kind` of a record a PERSON wrote into the session.
 ///
 /// The only kind that may clear the failed-task flag besides an absent `origin`:
-/// every other kind is a machine speaking (see [`task_signal`]).
+/// every other kind is a machine speaking (see [`task_signal`]) — a task
+/// notification ([`tasks::TASK_NOTIFICATION_ORIGIN`]) or `"peer"`, another agent's
+/// message. `origin` is undocumented upstream; the read is FAIL-SOFT, see
+/// [`OriginKind`].
 const ORIGIN_KIND_HUMAN: &str = "human";
-
-/// The `<status>` a task notification carries when the background task FAILED —
-/// the one value that raises the flag.
-///
-/// Compared EXACTLY, like [`SESSION_KIND_BACKGROUND`]: `completed`, `stopped`,
-/// `killed`, a missing tag and any other spelling raise nothing. `stopped` and
-/// `killed` are deliberately out of scope, and a `completed` notice does not
-/// CLEAR the flag either — only the user writing does.
-const TASK_STATUS_FAILED: &str = "failed";
 
 /// The `promptSource` values that mean the USER wrote the record: `typed` at the
 /// prompt, `sdk` from a `claude -p` quick reply.
@@ -96,14 +81,6 @@ const USER_PROMPT_SOURCES: [&str; 2] = ["typed", "sdk"];
 /// writes that marker from 2.1.278 on; one sent by an older version carries none,
 /// so it does not clear — a leftover marker, the direction the flag accepts.
 const USER_TURN_ORIGINS: [&str; 2] = ["human", "sdk"];
-
-/// The `<status>` tag of a task notification's body, as its `(open, close)` pair.
-const STATUS_TAG: (&str, &str) = ("<status>", "</status>");
-
-/// The `<summary>` tag of a task notification's body — claude's own one-line
-/// account of what happened, which the board quotes WORD FOR WORD. Optional: a
-/// `failed` notice without one still raises the flag ([`failed_notice`]).
-const SUMMARY_TAG: (&str, &str) = ("<summary>", "</summary>");
 
 /// What one candidate file turned out to be — the three answers a fail-soft read
 /// can give, kept apart because only TWO of them are statements about the file.
@@ -240,6 +217,10 @@ pub struct ParsedFile {
     /// it alone. A fact about the BYTES like every other field here, so the parse
     /// cache carries it unchanged.
     pub failed_task: Option<FailedTaskNotice>,
+    /// Each task id's LATEST notified `<status>`, folded record by record in file
+    /// order by [`tasks::scan_record`] in the same pass. Unlike
+    /// [`failed_task`](Self::failed_task) nothing the user writes clears it.
+    pub task_ledger: tasks::TaskLedger,
     /// The `customTitle` of the LAST `custom-title` record in file order that
     /// carries a non-blank string, kept as written; `None` when there is none.
     ///
@@ -295,6 +276,7 @@ pub fn parse_file(path: &Path) -> FileVerdict<ParsedFile> {
     let mut has_agent_name = false;
     let mut has_agent_setting = false;
     let mut failed_task: Option<FailedTaskNotice> = None;
+    let mut task_ledger = tasks::TaskLedger::default();
     let mut custom_title: Option<String> = None;
 
     for line in reader.lines() {
@@ -444,6 +426,8 @@ pub fn parse_file(path: &Path) -> FileVerdict<ParsedFile> {
             TaskSignal::UserTurn => failed_task = None,
             TaskSignal::Neither => {}
         }
+        // The same notices, kept per task id rather than as one standing flag.
+        tasks::scan_record(&record, &mut task_ledger);
         // gitBranch + timestamp: last non-null (most-recent activity wins).
         if let Some(b) = record.get("gitBranch").and_then(Value::as_str) {
             git_branch = Some(b.to_string());
@@ -486,6 +470,7 @@ pub fn parse_file(path: &Path) -> FileVerdict<ParsedFile> {
         has_agent_name,
         has_agent_setting,
         failed_task,
+        task_ledger,
         custom_title,
     })
 }
@@ -535,8 +520,8 @@ fn origin_kind(record: &Value) -> OriginKind<'_> {
 /// the store's one "not from a subagent" rule) can say anything. Then `origin`
 /// is ruled on FIRST, before any other marker is read:
 ///
-/// - [`ORIGIN_KIND_TASK_NOTIFICATION`] is a notice. It raises the flag when its
-///   `<status>` is exactly [`TASK_STATUS_FAILED`], whether or not it carries a
+/// - A task notification ([`tasks::is_task_notification`]) is a notice. It raises the flag when its
+///   `<status>` is exactly [`STATUS_FAILED`], whether or not it carries a
 ///   `<summary>` ([`failed_notice`]); otherwise it is [`TaskSignal::Neither`]. A
 ///   notice NEVER clears — not even a `completed` one.
 /// - An ABSENT `origin`, or [`ORIGIN_KIND_HUMAN`], MAY be the user writing. It is
@@ -572,10 +557,10 @@ fn task_signal(record: &Value) -> TaskSignal {
     if record.get("type").and_then(Value::as_str) != Some("user") || label::is_sidechain(record) {
         return TaskSignal::Neither;
     }
+    if tasks::is_task_notification(record) {
+        return failed_notice(record).map_or(TaskSignal::Neither, TaskSignal::Failed);
+    }
     match origin_kind(record) {
-        OriginKind::Kind(ORIGIN_KIND_TASK_NOTIFICATION) => {
-            failed_notice(record).map_or(TaskSignal::Neither, TaskSignal::Failed)
-        }
         OriginKind::Absent => user_turn_signal(record, false),
         OriginKind::Kind(ORIGIN_KIND_HUMAN) => user_turn_signal(record, true),
         OriginKind::Kind(_) | OriginKind::Unrecognised => TaskSignal::Neither,
@@ -627,7 +612,7 @@ fn is_tool_result(record: &Value) -> bool {
 /// The `failed` notice a task-notification record carries, or `None`.
 ///
 /// `None` unless `message.content` is a STRING whose `<status>` is exactly
-/// [`TASK_STATUS_FAILED`] — a missing or unclosed `<status>` or a non-string body
+/// [`STATUS_FAILED`] — a missing or unclosed `<status>` or a non-string body
 /// reads as an unrecognised shape and raises nothing, the flag's one SET-side miss
 /// (see [`task_signal`]).
 ///
@@ -638,32 +623,19 @@ fn is_tool_result(record: &Value) -> bool {
 /// Dropping a failure whose status was read, over a missing account of it, would
 /// err toward a hidden failure — the one direction the flag refuses.
 fn failed_notice(record: &Value) -> Option<FailedTaskNotice> {
-    let body = record
-        .get("message")
-        .and_then(|message| message.get("content"))
-        .and_then(Value::as_str)?;
-    if tag_inner(body, STATUS_TAG)? != TASK_STATUS_FAILED {
+    let body = tasks::notification_body(record)?;
+    if tasks::tag_inner(body, TAG_STATUS)? != STATUS_FAILED {
         return None;
     }
     Some(FailedTaskNotice {
-        summary: tag_inner(body, SUMMARY_TAG).unwrap_or_default().to_string(),
+        summary: tasks::tag_inner(body, TAG_SUMMARY)
+            .unwrap_or_default()
+            .to_string(),
         timestamp_raw: record
             .get("timestamp")
             .and_then(Value::as_str)
             .map(str::to_string),
     })
-}
-
-/// The text between the FIRST `open` tag in `body` and the first `close` after
-/// it, exactly as written — or `None` when either is missing.
-///
-/// First wins because claude writes the envelope's own tags (`<status>`,
-/// `<summary>`) AHEAD of the free-form `<result>` it closes with, so a result
-/// that happens to quote a tag cannot take precedence.
-fn tag_inner<'a>(body: &'a str, (open, close): (&str, &str)) -> Option<&'a str> {
-    let start = body.find(open)? + open.len();
-    let rest = &body[start..];
-    Some(&rest[..rest.find(close)?])
 }
 
 /// Whether `record[key]` is a string with non-whitespace content.
@@ -1336,7 +1308,7 @@ mod tests {
         }
     }
 
-    /// "First occurrence wins" ([`tag_inner`]): claude writes the envelope's own
+    /// "First occurrence wins" ([`tasks::tag_inner`]): claude writes the envelope's own
     /// `<status>` AHEAD of the free-form `<result>`, so a result that happens to
     /// QUOTE a status tag must never take precedence — in either direction.
     #[test]
@@ -1349,11 +1321,11 @@ mod tests {
             )
         };
         assert_eq!(
-            tag_inner(&quoting("completed", "failed"), STATUS_TAG),
+            tasks::tag_inner(&quoting("completed", "failed"), TAG_STATUS),
             Some("completed")
         );
         assert_eq!(
-            tag_inner(&quoting("failed", "completed"), STATUS_TAG),
+            tasks::tag_inner(&quoting("failed", "completed"), TAG_STATUS),
             Some("failed")
         );
         // And through the classifier: a completed notice whose result quotes a
@@ -1832,5 +1804,34 @@ mod tests {
         // 41 is mid-codepoint; must back off to 40.
         assert_eq!(s.len(), 40);
         assert!(s.chars().all(|c| c == 'é'));
+    }
+
+    /// The ledger the real streaming pass keeps: every task id's LATEST status in
+    /// file order, whatever the user writes after it (which clears the board's
+    /// flag but not a fact about a task). The id-less and status-less notice
+    /// shapes are `tasks.rs`'s own tests'.
+    #[test]
+    fn the_pass_keeps_each_task_ids_latest_status_and_a_user_turn_clears_nothing() {
+        let mut other = notification("completed", "s", "2026-09-21T15:31:00.000Z");
+        other["message"]["content"] = Value::String(
+            notification_body("completed", "s").replace("af4404196ddbcd945", "other"),
+        );
+        let records = [
+            notification("failed", "s", "2026-09-21T15:30:00.000Z"),
+            other,
+            user_record(serde_json::json!({"promptSource": "typed"})),
+        ];
+        let lines = lines_of(&records);
+        let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let parsed = parse_lines("ledger", &borrowed).expect("a file with a cwd is a session");
+        assert!(
+            parsed.failed_task.is_none(),
+            "the user's turn clears the flag"
+        );
+        assert!(parsed.task_ledger.is_failed("af4404196ddbcd945"));
+        assert_eq!(
+            parsed.task_ledger.status_of("other"),
+            Some(tasks::TaskStatus::Completed)
+        );
     }
 }

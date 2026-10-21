@@ -40,7 +40,7 @@ use crate::agents::{self, AgentActivity, ReportedAgent};
 use crate::resume::ModelPick;
 use crate::search::SearchMode;
 use crate::store::preview::{self, FoldRegion, LinkRegion, SubagentRegion};
-use crate::store::subagents::{is_running, Subagent, SubagentRecord, SubagentStatus};
+use crate::store::subagents::{Subagent, SubagentRecord, SubagentStatus};
 use crate::store::{lineage, FailedTask};
 
 use super::app::{
@@ -1174,7 +1174,7 @@ fn unbound_marker_span() -> Span<'static> {
 /// [`BADGE_NEEDS_INPUT_COLOR`], already speaks it), and a failure nobody has
 /// looked at yet is exactly that. A NAMED ANSI color, never RGB (TERMINAL-SAFE
 /// STYLING).
-const FAILED_TASK_COLOR: Color = Color::Red;
+const FAILED_TASK_COLOR: Color = preview::FAILED_COLOR;
 
 /// The styled [`FAILED_TASK_MARKER`] span, built in ONE place so the head row
 /// and a child row can never draw the same fact in two different styles.
@@ -2022,9 +2022,9 @@ const RUNNING_LIST_INDENT: u16 = 1;
 const SUBAGENT_AGE_SUFFIX: &str = " ago";
 
 /// The selected session's subagents RUNNING as of [`App::wall_clock`]
-/// ([`is_running`], over the facts the background refresh stored), in launch
-/// order — what the running list draws, so a subagent drops off it once it goes
-/// quiet, with no file read. Read-only over `App`: no clock, no I/O.
+/// ([`running_in`]: the judged verdict [`App::judged_end`] stands on, plus the
+/// selected session's ledger), in launch order — what the running list draws, so
+/// a subagent drops off it once it goes quiet or fails, with no file read. Read-only over `App`: no clock, no I/O.
 ///
 /// EMPTY, hiding the list, while a compose box is open or a draft card holds
 /// the pane: the `Ctrl-R` reply, the `Ctrl-F` fork box and the `Ctrl-N` draft
@@ -2039,18 +2039,20 @@ fn running_subagents(app: &App) -> Vec<&Subagent> {
         return Vec::new();
     }
     app.selected_subagents()
-        .map_or_else(Vec::new, |record| running_in(record, app.wall_clock()))
+        .map_or_else(Vec::new, |record| running_in(record, app, app.wall_clock()))
 }
 
-/// The subagents of `record` RUNNING at `now` ([`is_running`]), in launch order:
-/// the ONE count the running list ([`running_subagents`]) and the session's title
-/// ([`session_title_facts`]) both draw, so the two can never disagree about how
-/// many run. Pure.
-fn running_in(record: &SubagentRecord, now: SystemTime) -> Vec<&Subagent> {
+/// The subagents of `record` RUNNING at `now` ([`Subagent::is_running`] over the
+/// verdict [`App::judged_end`] stands on, the failed count's own: a subagent
+/// judged failed never runs), in launch order: the ONE count the running list
+/// ([`running_subagents`]) and the session's title ([`session_title_facts`]) both
+/// draw, so the two can never disagree about how many run. Pure.
+fn running_in<'r>(record: &'r SubagentRecord, app: &App, now: SystemTime) -> Vec<&'r Subagent> {
+    let ledger = app.selected_ledger();
     record
         .subagents()
         .iter()
-        .filter(|subagent| is_running(subagent.ended, subagent.newest_write, now))
+        .filter(|subagent| subagent.is_running(&ledger, app.judged_end(subagent), now))
         .collect()
 }
 
@@ -2632,6 +2634,9 @@ const SESSION_SUBAGENTS_SUFFIX: &str = " subagents";
 /// The unit the session title's running count wears (`2 running`).
 const SESSION_RUNNING_SUFFIX: &str = " running";
 
+/// The unit the session title's failed count wears (`1 failed`).
+const SESSION_FAILED_SUFFIX: &str = " failed";
+
 /// The subagent view title's `quiet`: the NAMED dim gray an ended job's badge
 /// reads as dormant in ([`BADGE_ENDED`]), since a quiet run is not doing
 /// anything either (TERMINAL-SAFE STYLING).
@@ -2855,6 +2860,9 @@ struct SessionTitleFacts<'a> {
     subagents: usize,
     /// How many of those run at `now` ([`running_in`]).
     running: usize,
+    /// How many of those FAILED ([`SubagentRecord::failed_ids`]): the same answer
+    /// a delegation line's `· failed` and the subagent view's state give.
+    failed: usize,
     /// The instant the age and the running count are stated as of:
     /// `App::wall_clock`.
     now: SystemTime,
@@ -2890,26 +2898,31 @@ fn session_title_facts(app: &App) -> Option<SessionTitleFacts<'_>> {
         last_write: session.timestamp.and_then(system_time_of),
         msg_count: session.msg_count,
         subagents: record.map_or(0, |record| record.subagents().len()),
-        running: record.map_or(0, |record| running_in(record, now).len()),
+        running: record.map_or(0, |record| running_in(record, app, now).len()),
+        failed: app.failed_subagent_ids().len(),
         now,
     })
 }
 
 /// The session's title for a top border that gives it `width` columns between
-/// its corners: ` <name> · <status> · last write <age> · N msgs · N subagents · N running `,
-/// for example ` live working · last write 12s ago · 171 msgs · 5 subagents · 2 running `
+/// its corners: ` <name> · <status> · N failed · last write <age> · N msgs · N subagents · N running `,
+/// for example ` live working · 1 failed · last write 12s ago · 171 msgs · 5 subagents · 2 running `
 /// — the name only in the 0:1 layout ([`SessionTitleFacts::name`]).
 ///
 /// A segment whose fact is unknown is left out, never a placeholder or a
 /// dangling separator: no name, no status, no age to state ([`written_ago`]), no
-/// subagents counted (no record yet, or one listing none), none running. The
-/// age is the subagent view title's, the turn count [`CHILD_MSGS_SUFFIX`]'s, and
-/// `N running` is drawn in [`RUNNING_COLOR`], as the subagent view's `running`.
+/// subagents counted (no record yet, or one listing none), none running, none
+/// failed. The age is the subagent view title's, the turn count
+/// [`CHILD_MSGS_SUFFIX`]'s, `N running` is drawn in [`RUNNING_COLOR`], as the
+/// subagent view's `running`, and `N failed` in [`FAILED_TASK_COLOR`], as its
+/// `failed`; a subagent counts in one of the two at most.
 ///
 /// What does not fit gives way in this order ([`fit_title`], the subagent
 /// view's own fitting): the NAME, cut with an ellipsis and then dropped, then
-/// `last write …`, then `N msgs`. The status and the subagent counts are never
-/// cut here: narrower than those, the border cuts the title at its edge. With
+/// `last write …`, then `N msgs`. The status, `N failed` and the subagent counts
+/// are never cut here: narrower than those, the border cuts the title at its
+/// edge, and `N failed` sits right after the status so that edge reaches the
+/// other counts first and a failure shows at any pane width. With
 /// nothing left to state the title is empty. Pure.
 fn session_title(facts: &SessionTitleFacts<'_>, width: u16) -> Line<'static> {
     let last_write = written_ago(facts.last_write, facts.now);
@@ -2932,11 +2945,21 @@ fn session_title_line(
     last_write: Option<&str>,
     msgs: Option<&str>,
 ) -> Line<'static> {
-    let mut segments: Vec<Span<'static>> = [name, facts.status.as_deref(), last_write, msgs]
+    let raw = |segment: &str| Span::raw(segment.to_string());
+    let mut segments: Vec<Span<'static>> = [name, facts.status.as_deref()]
         .into_iter()
         .flatten()
-        .map(|segment| Span::raw(segment.to_string()))
+        .map(raw)
         .collect();
+    // Right after the status, so the border's edge cuts every other count before
+    // it: a failure must show at any pane width.
+    if facts.failed > 0 {
+        segments.push(Span::styled(
+            format!("{}{SESSION_FAILED_SUFFIX}", facts.failed),
+            Style::default().fg(FAILED_TASK_COLOR),
+        ));
+    }
+    segments.extend([last_write, msgs].into_iter().flatten().map(raw));
     if facts.subagents > 0 {
         segments.push(Span::raw(format!(
             "{}{SESSION_SUBAGENTS_SUFFIX}",
@@ -2978,7 +3001,7 @@ fn session_title_line(
 /// instead (` subagent @parser-auditor `), so a subagent's transcript never reads
 /// as the selected session's own — followed, once the session's subagent record
 /// lists it, by what that record and the view's render know of it: its
-/// description, its state (`running`, `finished` or `quiet`), when it started,
+/// description, its state (`running`, `finished`, `failed` or `quiet`), when it started,
 /// how long ago it last wrote, and where it stands in the launch order `←`/`→`
 /// step through
 /// (` subagent @parser-auditor · Audit the parser · finished · started 23:50 · last write 2h ago · 2/5 `),
@@ -7308,6 +7331,7 @@ mod tests {
             has_agent_setting: false,
             failed_task: None,
             custom_title: None,
+            task_ledger: Default::default(),
         }
     }
 
@@ -9004,6 +9028,7 @@ mod tests {
             has_agent_setting: false,
             failed_task: None,
             custom_title: None,
+            task_ledger: Default::default(),
         }
     }
 
@@ -11754,6 +11779,7 @@ mod tests {
             has_agent_setting: false,
             failed_task: None,
             custom_title: None,
+            task_ledger: Default::default(),
         }
     }
 
@@ -14172,6 +14198,7 @@ mod tests {
             has_agent_setting: false,
             failed_task: None,
             custom_title: None,
+            task_ledger: Default::default(),
         }
     }
 
@@ -14352,6 +14379,7 @@ mod tests {
             has_agent_setting: false,
             failed_task: None,
             custom_title: None,
+            task_ledger: Default::default(),
         }
     }
 
@@ -14484,6 +14512,7 @@ mod tests {
             has_agent_setting: false,
             failed_task: None,
             custom_title: None,
+            task_ledger: Default::default(),
         }
     }
 
@@ -14684,6 +14713,7 @@ mod tests {
             has_agent_setting: false,
             failed_task: None,
             custom_title: None,
+            task_ledger: Default::default(),
         }
     }
 
@@ -15222,6 +15252,7 @@ mod tests {
             has_agent_setting: false,
             failed_task: None,
             custom_title: None,
+            task_ledger: Default::default(),
         }
     }
 
@@ -17226,6 +17257,285 @@ mod tests {
         );
     }
 
+    /// One subagent of a temp copy of the delegation fixture, failed by the
+    /// given sources, drawn on all three surfaces.
+    ///
+    /// `notice` puts a `failed` task notice for the subagent in the session's
+    /// ledger; `transcript` ends its transcript in an API error. The record's
+    /// `ended` is what the background refresh would have read from that
+    /// transcript: `Failed` for an API error, `Open` for a run mid-turn, written
+    /// 30 s before the wall clock, so that without the notice it reads RUNNING.
+    ///
+    /// `stale` makes the subagent old news to the record: its last write is past
+    /// `RUNNING_WINDOW`, so the refresh read no tail (`ended: None`) and only the
+    /// view's full render can judge the transcript. The view is opened, drawn, and
+    /// left again, and the session title and delegation line are read AFTER that.
+    ///
+    /// `unread` is `stale`'s sibling: the subagent is still inside `RUNNING_WINDOW`
+    /// but the record read its transcript's tail as `Open` (a run the refresh cannot
+    /// yet call failed), so again only the view's full render can judge it. The view
+    /// is left again before the session surfaces are read.
+    ///
+    /// Returns the three surfaces' text and the session's board as last drawn.
+    fn failed_surfaces(
+        notice: bool,
+        transcript: bool,
+        stale: bool,
+        unread: bool,
+    ) -> FailedSurfaces {
+        use crate::store::subagents::{RunVerdict, SubagentRecord};
+        use crate::store::tasks;
+
+        const AGENT: &str = "a1b2c3d4e5f6a7b8c";
+        let at = SystemTime::from(time::macros::datetime!(2026-10-02 00:30 UTC));
+        let dir = unique_temp_dir("failed-surfaces");
+        let source = fixture("-Users-me-project-epsilon", "sess-delegation-1.jsonl");
+        let file = dir.join("sess-delegation-1.jsonl");
+        std::fs::copy(&source, &file).unwrap();
+        let subagents = dir.join("sess-delegation-1").join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        std::fs::copy(
+            source
+                .with_file_name("sess-delegation-1")
+                .join("subagents")
+                .join(format!("agent-{AGENT}.meta.json")),
+            subagents.join(format!("agent-{AGENT}.meta.json")),
+        )
+        .unwrap();
+        let prompt = r#"{"type":"user","timestamp":"2026-10-01T23:50:21.000Z","message":{"role":"user","content":"go"}}"#;
+        let last_turn = if transcript {
+            r#"{"type":"assistant","isApiErrorMessage":true,"message":{"role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"API Error: lost"}],"stop_reason":"stop_sequence"}}"#
+        } else {
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_b","name":"Bash","input":{}}]}}"#
+        };
+        std::fs::write(
+            subagents.join(format!("agent-{AGENT}.jsonl")),
+            format!("{prompt}\n{last_turn}\n"),
+        )
+        .unwrap();
+
+        let mut session = sample_session();
+        session.file = file;
+        session.session_id = "sess-delegation-1".to_string();
+        if notice {
+            let body = format!(
+                "<task-notification>\n<task-id>{AGENT}</task-id>\n<status>failed</status>\n\
+                 <summary>Agent stalled: no progress for 600s</summary>\n</task-notification>"
+            );
+            tasks::scan_record(
+                &serde_json::json!({
+                    "type": "user",
+                    "origin": { "kind": tasks::TASK_NOTIFICATION_ORIGIN },
+                    "message": { "role": "user", "content": body },
+                }),
+                &mut session.task_ledger,
+            );
+        }
+        let session_id = session.session_id.clone();
+        let mut app = App::new(vec![session], Scope::All, PathBuf::from("/tmp"));
+        app.set_pane_layout(PaneLayout::PreviewOnly);
+        app.note_wall_clock(at);
+
+        // Everything is read off the board as DRAWN, at the one width, so the
+        // delegation line is the cached render the screen shows, never a second
+        // render of the session made for the test.
+        let width = 160;
+        let top = |app: &mut App| {
+            let buffer = drawn_board(app, width, 24);
+            full_row_text(&buffer, app.preview_rect.y, width)
+        };
+        let delegation_line = |app: &mut App| {
+            let buffer = drawn_board(app, width, 24);
+            (0..24)
+                .map(|y| full_row_text(&buffer, y, width))
+                .find(|row| row.contains("delegated to @parser-auditor"))
+                .expect("the delegation line is on the drawn board")
+        };
+
+        // The session's render is cached BEFORE the record lands: the record's
+        // arrival must refresh the delegation line, not wait for a reload.
+        let before = delegation_line(&mut app);
+        assert!(before.contains("delegated to"), "premise: {before}");
+        assert!(!before.contains("\u{b7} failed"), "premise: {before}");
+        app.apply_subagent_record(
+            &session_id,
+            SubagentRecord::new(vec![Subagent {
+                agent_id: AGENT.to_string(),
+                agent_type: "parser-auditor".to_string(),
+                description: Some("Audit the parser".to_string()),
+                launched: Some(time::macros::datetime!(2026-10-01 23:50:21 UTC)),
+                newest_write: Some(at - Duration::from_secs(if stale { 660 } else { 30 })),
+                ended: match (stale, unread, transcript) {
+                    (true, _, _) => None,
+                    (false, false, true) => Some(RunVerdict::Failed),
+                    _ => Some(RunVerdict::Open),
+                },
+            }]),
+        );
+
+        let mut delegation = delegation_line(&mut app);
+        let mut session_title = top(&mut app);
+        app.open_subagent_view(AGENT, "parser-auditor");
+        let view_title = top(&mut app);
+        if stale || unread {
+            assert!(app.leave_subagent_view(), "premise: the view was up");
+            session_title = top(&mut app);
+            delegation = delegation_line(&mut app);
+        }
+        let board = drawn_board(&mut app, width, 24);
+        let _ = std::fs::remove_dir_all(&dir);
+        FailedSurfaces {
+            session_title,
+            delegation,
+            view_title,
+            board,
+        }
+    }
+
+    /// What [`failed_surfaces`] drew.
+    struct FailedSurfaces {
+        /// The session's title row.
+        session_title: String,
+        /// The launch's `◆ delegated to …` line.
+        delegation: String,
+        /// The subagent view's title row.
+        view_title: String,
+        /// The board as last drawn, 160 columns by 24 rows: the session's once
+        /// the view was left (`stale` or `unread`), else the view's.
+        board: ratatui::buffer::Buffer,
+    }
+
+    /// The one "failed" answer reads the same on the session title's `N failed`,
+    /// the launch's delegation line and the subagent view's state, whichever
+    /// source says so: its task notification (the stalled run, whose transcript
+    /// ends quietly and, written lately, would read RUNNING), its transcript's
+    /// API error, both, or neither.
+    #[test]
+    fn a_failed_subagent_reads_failed_on_the_title_the_delegation_line_and_the_view() {
+        for (what, notice, transcript, failed) in [
+            ("notice only", true, false, true),
+            ("transcript only", false, true, true),
+            ("both", true, true, true),
+            ("neither", false, false, false),
+        ] {
+            let FailedSurfaces {
+                session_title: title,
+                delegation,
+                view_title: view,
+                ..
+            } = failed_surfaces(notice, transcript, false, false);
+            assert_eq!(
+                title.contains("\u{b7} 1 failed \u{b7}"),
+                failed,
+                "{what}: {title}"
+            );
+            assert_eq!(
+                delegation.contains(" \u{b7} failed \u{b7} "),
+                failed,
+                "{what}: {delegation}"
+            );
+            assert_eq!(
+                view.contains(" \u{b7} failed \u{b7} "),
+                failed,
+                "{what}: {view}"
+            );
+            // No run reads both: a failed one is not running, and the one that
+            // did not fail keeps running.
+            assert_eq!(title.contains("1 running"), !failed, "{what}: {title}");
+            assert_eq!(
+                view.contains(" \u{b7} running \u{b7} "),
+                !failed,
+                "{what}: {view}"
+            );
+        }
+    }
+
+    /// A foreground run whose transcript ends on an API error, written more than
+    /// `RUNNING_WINDOW` ago and with no notice, is one the refresh read no tail
+    /// of. Once its view's full render has judged it, the session title, the
+    /// delegation line and the view title still give the SAME answer: failed.
+    /// Without that judgment the board cannot know, and says nothing.
+    #[test]
+    fn a_stale_foreground_failure_reads_failed_everywhere_once_its_view_judged_it() {
+        let FailedSurfaces {
+            session_title: title,
+            delegation,
+            view_title: view,
+            ..
+        } = failed_surfaces(false, true, true, false);
+        assert!(view.contains(" \u{b7} failed \u{b7} "), "view: {view}");
+        assert!(title.contains("1 failed"), "title: {title}");
+        assert!(
+            delegation.contains(" \u{b7} failed \u{b7} "),
+            "delegation: {delegation}"
+        );
+        let FailedSurfaces {
+            session_title: title,
+            delegation,
+            view_title: view,
+            ..
+        } = failed_surfaces(false, false, true, false);
+        assert!(!view.contains(" \u{b7} failed \u{b7} "), "view: {view}");
+        assert!(!title.contains("failed"), "title: {title}");
+        assert!(
+            !delegation.contains(" \u{b7} failed \u{b7} "),
+            "{delegation}"
+        );
+    }
+
+    /// A subagent the board JUDGED failed (its view's full render read an API error)
+    /// while its record still reads `Open` and lately written is failed and NOT
+    /// running: the running list does not list it and the title counts no running
+    /// subagent for it, where the same record with a transcript that did not fail
+    /// still runs.
+    #[test]
+    fn a_subagent_judged_failed_is_not_in_the_running_list_or_the_running_count() {
+        let running = failed_surfaces(false, false, false, true);
+        assert!(
+            (0..24).any(|y| full_row_text(&running.board, y, 160).contains("explore")),
+            "premise: a run that did not fail is listed running"
+        );
+        assert!(running.session_title.contains("1 running"), "premise");
+
+        let failed = failed_surfaces(false, true, false, true);
+        let rows: Vec<String> = (0..24)
+            .map(|y| full_row_text(&failed.board, y, 160))
+            .collect();
+        assert!(
+            !rows.iter().any(|row| row.contains("explore")),
+            "no running list: {rows:#?}"
+        );
+        assert!(
+            !failed.session_title.contains("running"),
+            "{}",
+            failed.session_title
+        );
+        assert!(
+            failed.session_title.contains("\u{b7} 1 failed \u{b7}"),
+            "{}",
+            failed.session_title
+        );
+    }
+
+    /// The delegation line's `· failed` is drawn in the failed red, the color of
+    /// `[task failed]` ([`FAILED_TASK_COLOR`]).
+    #[test]
+    fn the_delegation_lines_failed_is_drawn_in_the_failed_red() {
+        let surfaces = failed_surfaces(false, true, false, true);
+        let y = (0..24)
+            .find(|&y| {
+                full_row_text(&surfaces.board, y, 160).contains("delegated to @parser-auditor")
+            })
+            .expect("the delegation line is on the drawn board");
+        let row = full_row_text(&surfaces.board, y, 160);
+        let at = row.find("\u{b7} failed").expect("it says failed");
+        let x = u16::try_from(row[..at].chars().count() + 2).expect("a column");
+        let cell = surfaces.board.cell((x, y)).expect("a drawn cell");
+        assert_eq!(cell.symbol(), "f", "the cell under `failed`");
+        assert_eq!(cell.fg, FAILED_TASK_COLOR);
+        assert_eq!(FAILED_TASK_COLOR, Color::Red);
+    }
+
     // --- the session's title ---------------------------------------------------
 
     /// A reported session that last wrote 12 s before [`title_now`], holding 171
@@ -17238,6 +17548,7 @@ mod tests {
             msg_count: 171,
             subagents: 5,
             running: 2,
+            failed: 0,
             now: title_now(),
         }
     }
@@ -17291,6 +17602,42 @@ mod tests {
         };
         assert_eq!(style("2 running").fg, Some(Color::Green));
         assert_eq!(style("live working"), Style::default());
+    }
+
+    /// `N failed` follows the status in the failed-task red, is left out at zero,
+    /// and is never cut for room: the droppable segments give way first and the
+    /// count stays in a title too narrow for them — and, right after the status, it
+    /// is the last count the border's edge reaches, so it shows at any pane width.
+    #[test]
+    fn the_session_title_states_how_many_subagents_failed_and_never_cuts_it() {
+        let facts = SessionTitleFacts {
+            failed: 1,
+            ..session_facts()
+        };
+        let whole = fitted_session_title(&facts, u16::MAX);
+        assert_eq!(
+            whole,
+            " live working \u{b7} 1 failed \u{b7} last write 12s ago \u{b7} 171 msgs \u{b7} \
+             5 subagents \u{b7} 2 running "
+        );
+        let line = session_title(&facts, u16::MAX);
+        let failed = line
+            .spans
+            .iter()
+            .find(|span| span.content == "1 failed")
+            .expect("its own span");
+        assert_eq!(failed.style.fg, Some(FAILED_TASK_COLOR));
+        let tight = fitted_session_title(&facts, 30);
+        assert!(
+            tight.starts_with(" live working \u{b7} 1 failed \u{b7} 5 subagents"),
+            "{tight}"
+        );
+        assert!(!tight.contains("msgs"), "{tight}");
+        // The border's edge cuts what trails: `N failed` is inside the first
+        // columns, `N running` is the first count out.
+        let edge: String = tight.chars().take(30).collect();
+        assert!(edge.contains("1 failed"), "{edge}");
+        assert!(!edge.contains("running"), "{edge}");
     }
 
     /// A fact the session's title does not know is left out — no placeholder, no
@@ -22444,6 +22791,7 @@ mod tests {
             has_agent_setting: false,
             failed_task: None,
             custom_title: None,
+            task_ledger: Default::default(),
         }
     }
 

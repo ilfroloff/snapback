@@ -107,14 +107,15 @@ KEYS:
                   moved
                   · ↓ show a subagent's own transcript in the preview, as a
                   click on its ◆ delegated to line does: the first running one
-                  (unfinished, and it or a subagent it launched wrote in the
-                  last 10 minutes), else the most recently written. ←/→ then
-                  step through all of the session's subagents in launch order,
-                  wrapping round, even with a search typed (Alt+←/→ and
-                  Ctrl+←/→ still move the search cursor a word); the title says
-                  which one of how many (2/5). ↑, Esc, or Ctrl-X ↓ again, goes
-                  back; a search stays as typed. Refused while the session's
-                  subagents are still being read, or when it has none
+                  (unfinished and not failed, and it or a subagent it launched
+                  wrote in the last 10 minutes), else the most recently
+                  written. ←/→ then step through all of the session's
+                  subagents in launch order, wrapping round, even with a
+                  search typed (Alt+←/→ and Ctrl+←/→ still move the search
+                  cursor a word); the title says which one of how many (2/5).
+                  ↑, Esc, or Ctrl-X ↓ again, goes back; a search stays as
+                  typed. Refused while the session's subagents are still being
+                  read, or when it has none
     Ctrl-R        quick reply — send a one-shot message to the selected session
                   without leaving the board. An agent whose run is over (done,
                   stopped, failed) is stopped first so the reply lands in place;

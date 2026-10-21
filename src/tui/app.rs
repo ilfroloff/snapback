@@ -11,6 +11,7 @@
 //! lives in [`crate::tui`] (run) and the key/event dispatch in
 //! [`crate::tui::update`].
 
+use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -36,7 +37,10 @@ use crate::send::UndeliveredEvents;
 use crate::store::discover::SubagentTranscript;
 use crate::store::lineage::{self, LineageKey};
 use crate::store::skills::Listing;
-use crate::store::subagents::{Subagent, SubagentRecord, SubagentStatus};
+use crate::store::subagents::{
+    FailureMemory, RunVerdict, Subagent, SubagentRecord, SubagentStatus,
+};
+use crate::store::tasks::TaskLedger;
 use crate::store::{preview, Reload, Session};
 use crate::watch::AppEvent;
 // The scope predicate and the worktree resolver MUST canonicalize paths the same
@@ -2035,6 +2039,10 @@ struct CachedPreview {
     /// in the display string alone, so widening the filter to content cannot move
     /// where the query occurs in these lines.
     matches_query: String,
+    /// The ids `· failed` was drawn for on its delegation lines
+    /// ([`App::failed_subagent_ids`] at the render): the key that evicts this
+    /// entry when the set moves, and only then.
+    failed: HashSet<String>,
 }
 
 impl CachedPreview {
@@ -2848,6 +2856,9 @@ pub struct App {
     /// since that request ([`apply_subagent_writes`](Self::apply_subagent_writes)),
     /// so the record must be read again.
     subagents_written: bool,
+    /// Failures already judged, so the title and the delegation lines keep stating
+    /// one after the read that made it is gone ([`FailureMemory`]). In memory only.
+    failure_memory: FailureMemory,
     /// The wall clock as of the last `Tick` or landed subagent record
     /// ([`note_wall_clock`](Self::note_wall_clock)): the `now` the subagent running
     /// check reads, so nothing on the draw or key path reads a clock. The Unix
@@ -3054,6 +3065,7 @@ impl App {
             subagents: None,
             subagents_requested: None,
             subagents_written: false,
+            failure_memory: FailureMemory::default(),
             wall_clock: SystemTime::UNIX_EPOCH,
             preview_match_notice: None,
             preview_match_jump: false,
@@ -5879,8 +5891,15 @@ impl App {
     }
 
     /// The width-scoped cache entry the preview pane shows, rendering and inserting
-    /// it on a miss: the selected session's own transcript, or — while the subagent
-    /// view is live — that subagent's ([`ensure_subagent_preview`](Self::ensure_subagent_preview)).
+    /// it on a miss (read on the UI thread; PATTERNS.md §6). Beside a first frame
+    /// after a selection, a width change, a reload that re-read the session and a
+    /// fold toggle, a miss follows a landing subagent record or a subagent view's
+    /// render that moved the failed set
+    /// ([`evict_renders_of_a_moved_failed_set`](Self::evict_renders_of_a_moved_failed_set)),
+    /// which evicts the SESSION's render and the view's; an unchanged set evicts
+    /// neither. What it renders is the selected session's own transcript, or —
+    /// while the subagent view is live — that subagent's
+    /// ([`ensure_subagent_preview`](Self::ensure_subagent_preview)).
     ///
     /// A change in `inner_width` CLEARS the whole cache first, the subagent view's
     /// render included: GFM tables shrink-to-fit, so the layout, the link-region
@@ -5908,9 +5927,9 @@ impl App {
     /// scroll anchor),
     /// [`note_match_outside_preview`](Self::note_match_outside_preview) (whether the
     /// query occurs in the pane), and the test-only
-    /// [`preview_text`](Self::preview_text). The readers that must not render —
-    /// the keystroke-time ones, and the subagent view title's state — ask
-    /// [`peek_preview`](Self::peek_preview), which switches the same way.
+    /// [`preview_text`](Self::preview_text). The keystroke-time readers that must
+    /// not render ask [`peek_preview`](Self::peek_preview), which switches the
+    /// same way.
     fn ensure_preview(&mut self, inner_width: u16) -> Option<&CachedPreview> {
         if self.preview_width != Some(inner_width) {
             self.preview_cache.clear();
@@ -5924,6 +5943,7 @@ impl App {
         }
         let id = self.selected.clone()?;
         if !self.preview_cache.contains_key(&id) {
+            let failed_ids = self.failed_subagent_ids();
             let session = self.sessions.iter().find(|s| s.session_id == id)?;
             // Defined-agent names gate the preview's `agent-name` fallback so a
             // free-form background-job title never renders as a bogus handle.
@@ -5934,8 +5954,16 @@ impl App {
             // `toggle_peer_fold` alone, and that evicts this entry so the next
             // miss re-renders under the new set.
             let expanded: HashSet<&str> = self.expanded_peers.iter().map(String::as_str).collect();
-            let rendered =
-                preview::render(session, usize::from(inner_width), &known_agents, &expanded);
+            let rendered = {
+                let failed: HashSet<&str> = failed_ids.iter().map(String::as_str).collect();
+                preview::render(
+                    session,
+                    usize::from(inner_width),
+                    &known_agents,
+                    &expanded,
+                    &failed,
+                )
+            };
             // Measure ONCE, here, where the text and the width it was rendered for
             // are both in hand — the wrapper walks every line, so a per-frame
             // measurement would put a whole-transcript pass on the draw path.
@@ -5945,7 +5973,8 @@ impl App {
             // SELECTED. Measured at ~24 ms for a 16,000-line transcript, so a
             // pathological one stalls exactly one frame on selection — visible as a
             // hitch while arrowing onto that row, and gone by the next frame because
-            // the entry is then cached for as long as the width holds. Moving it off
+            // the entry is then cached until something evicts it (a width change, a
+            // reload, a fold toggle, a moved failed set). Moving it off
             // the UI thread would buy one frame at the price of a partially-measured
             // pane (the scroll clamp, the scrollbar and the jump all read this map),
             // which is a worse trade than the hitch.
@@ -5966,6 +5995,7 @@ impl App {
                     // yet", so a non-empty query recomputes on this same call.
                     matches: HashMap::new(),
                     matches_query: String::new(),
+                    failed: failed_ids,
                 },
             );
         }
@@ -5990,7 +6020,10 @@ impl App {
     /// (`apply_subagent_writes`, over the watcher's `SubagentsWritten`), a click
     /// toggling a fold node in it (`toggle_peer_fold`), a reload that re-reads the
     /// parent session (`apply_reload` over `Reload::changed` — each write to it,
-    /// and `Ctrl-X r`), and a pane-width change (above). So while the subagent
+    /// and `Ctrl-X r`), a pane-width change (above), and a landing record that
+    /// moves the failed set it was drawn with
+    /// ([`evict_renders_of_a_moved_failed_set`](Self::evict_renders_of_a_moved_failed_set)).
+    /// So while the subagent
     /// RUNS, its writes re-read its whole transcript as often as once per watcher
     /// batch (`watch::DEBOUNCE`), the cadence a live session's own render is
     /// redone at, and once more in a batch that wrote its parent session as well.
@@ -6012,6 +6045,12 @@ impl App {
             .clone();
         let known_agents: HashSet<&str> = self.agent_names.iter().map(String::as_str).collect();
         let expanded: HashSet<&str> = self.expanded_peers.iter().map(String::as_str).collect();
+        let failed_ids = self.failed_subagent_ids();
+        let failed: HashSet<&str> = failed_ids.iter().map(String::as_str).collect();
+        let listed = self
+            .selected_subagents()
+            .and_then(|record| record.get(&self.subagent_view.as_ref()?.agent_id))
+            .cloned();
         let subagent = self.subagent_view.as_mut()?;
         if subagent.cached.is_none() {
             #[cfg(test)]
@@ -6024,25 +6063,70 @@ impl App {
                 usize::from(inner_width),
                 &known_agents,
                 &expanded,
+                &failed,
             );
+            // The render read the whole transcript to its end: a verdict the record
+            // may never get (no tail is read past `RUNNING_WINDOW`), kept for the
+            // title and the delegation lines after the view is left.
+            if let (Some(listed), Some(verdict)) = (&listed, rendered.run_ended) {
+                self.failure_memory.note_render(listed, verdict);
+            }
             let row_prefix = view::wrapped_row_prefix(&rendered.text.lines, inner_width);
             subagent.cached = Some(CachedPreview {
                 rendered,
                 row_prefix,
                 matches: HashMap::new(),
                 matches_query: String::new(),
+                failed: failed_ids.clone(),
             });
+            // The viewed run's own verdict names no line of its own transcript, so
+            // the set it was just drawn with is the one the view now stands on.
+            let current = self.failed_subagent_ids();
+            if let Some(cached) = self
+                .subagent_view
+                .as_mut()
+                .and_then(|view| view.cached.as_mut())
+            {
+                cached.failed = current;
+            }
+            self.evict_renders_of_a_moved_failed_set();
         }
-        subagent.cached.as_ref()
+        self.subagent_view.as_ref()?.cached.as_ref()
+    }
+
+    /// Evict the cached renders whose delegation lines were drawn for a failed set
+    /// that is no longer [`failed_subagent_ids`](Self::failed_subagent_ids): the
+    /// selected session's own and the subagent view's. A render drawn for the
+    /// current set stays, so re-selecting a session or a refresh that moved nothing
+    /// costs no re-render.
+    fn evict_renders_of_a_moved_failed_set(&mut self) {
+        let current = self.failed_subagent_ids();
+        if let Some(id) = self.selected.as_ref() {
+            if self
+                .preview_cache
+                .get(id)
+                .is_some_and(|cached| cached.failed != current)
+            {
+                self.preview_cache.remove(id);
+            }
+        }
+        if let Some(view) = self.subagent_view.as_mut() {
+            if view
+                .cached
+                .as_ref()
+                .is_some_and(|cached| cached.failed != current)
+            {
+                view.cached = None;
+            }
+        }
     }
 
     /// The cached render the preview pane shows — the live subagent view's, else
     /// the selected session's own — WITHOUT rendering anything: the read-only twin
     /// of [`ensure_preview`](Self::ensure_preview), for the readers that run on a
     /// keystroke ([`current_preview_matches`](Self::current_preview_matches),
-    /// [`note_preview_anchor`](Self::note_preview_anchor)) and the one the draw
-    /// asks through `&App` ([`subagent_view_status`](Self::subagent_view_status)),
-    /// which must never read a file. It switches through the same
+    /// [`note_preview_anchor`](Self::note_preview_anchor)), which must never read
+    /// a file. It switches through the same
     /// [`live_subagent_view`](Self::live_subagent_view), so the two cannot pick
     /// different renders. `None` on a cold cache, which those readers treat as
     /// "nothing to act on".
@@ -6236,10 +6320,23 @@ impl App {
     /// ([`AppEvent::SubagentRuns`]). A record for a session that is no longer
     /// selected is DROPPED, so it can never show for another row. Sets no status
     /// (STATUS-LINE OWNERSHIP).
+    ///
+    /// The cached renders draw a delegation line's `· failed` from the failed set
+    /// ([`failed_subagent_ids`](Self::failed_subagent_ids)), so a landing record
+    /// that changes WHICH subagents failed evicts the renders drawn for another
+    /// set ([`evict_renders_of_a_moved_failed_set`](Self::evict_renders_of_a_moved_failed_set)),
+    /// and the next draw re-renders them: the one read the render already pays, on
+    /// a miss, never one more. An unchanged set (the common case, every refresh,
+    /// and a re-selection) keeps them.
     pub fn apply_subagent_record(&mut self, session_id: &str, record: SubagentRecord) {
-        if self.selected.as_deref() == Some(session_id) {
-            self.subagents = Some((session_id.to_string(), record));
+        if self.selected.as_deref() != Some(session_id) {
+            return;
         }
+        for subagent in record.subagents() {
+            self.failure_memory.note_record(subagent);
+        }
+        self.subagents = Some((session_id.to_string(), record));
+        self.evict_renders_of_a_moved_failed_set();
     }
 
     /// The selected session's subagent record, or `None` while the background
@@ -6276,8 +6373,13 @@ impl App {
         let record = self
             .selected_subagents()
             .ok_or(SubagentsUnavailable::NotRead)?;
+        let ledger = self.selected_ledger();
         let target = record
-            .open_target(self.wall_clock)
+            .open_target(
+                &ledger,
+                |subagent| self.judged_end(subagent),
+                self.wall_clock,
+            )
             .ok_or(SubagentsUnavailable::None)?;
         let (agent_id, agent_type) = (target.agent_id.clone(), target.agent_type.clone());
         if !self.pane_layout.shows_preview() {
@@ -6333,26 +6435,65 @@ impl App {
 
     /// Where the run of the subagent the pane shows stands as of
     /// `App::wall_clock`, for the view's title: [`SubagentStatus::of`] over its
-    /// record entry's `newest_write` and the `ended` its cached render judged
-    /// (`preview::RenderedPreview::run_ended`), falling back to the record's own
-    /// `ended` whenever that render has no verdict (none is cached yet, or it is
-    /// the unreadable one) — the render reads the whole transcript, where the
-    /// record reads no tail once the subagent cannot be running. Evicting the
-    /// render (a `SubagentsWritten` naming the transcript among the rest) takes
-    /// its verdict with it, so the next render judges again. `None` where
+    /// record entry's `newest_write`, whether the selected session's ledger holds
+    /// a `failed` notice for it, and the verdict [`judged_end`](Self::judged_end)
+    /// stands on: its cached render's (`preview::RenderedPreview::run_ended`),
+    /// else a failure remembered for an unmoved transcript, else the record's own
+    /// `ended` — the render reads the whole transcript, where the record reads no
+    /// tail once the subagent cannot be running. Evicting the render (a
+    /// `SubagentsWritten` naming the transcript among the rest) takes its verdict
+    /// with it, so the next render judges again. `None` where
     /// [`viewed_subagent`](Self::viewed_subagent) is: without its `newest_write`
     /// no running can be told. Reads no file and no clock.
     #[must_use]
     pub fn subagent_view_status(&self) -> Option<SubagentStatus> {
         let listed = self.viewed_subagent()?;
-        let rendered = self
-            .peek_preview()
-            .and_then(|cached| cached.rendered.run_ended);
+        let notified = self.selected_ledger().is_failed(&listed.agent_id);
         Some(SubagentStatus::of(
-            rendered.or(listed.ended),
+            self.judged_end(listed),
             listed.newest_write,
             self.wall_clock,
+            notified,
         ))
+    }
+
+    /// The verdict on how `listed`'s own run ended that every failure surface
+    /// stands on ([`FailureMemory::judged_end`]): the subagent view's cached full
+    /// render when `listed` is the subagent it shows, a failure remembered for an
+    /// unmoved transcript, else the record's own. Reads no file and no clock.
+    pub fn judged_end(&self, listed: &Subagent) -> Option<RunVerdict> {
+        let rendered = self
+            .live_subagent_view()
+            .filter(|view| view.agent_id == listed.agent_id)
+            .and_then(|view| view.cached.as_ref())
+            .and_then(|cached| cached.rendered.run_ended);
+        self.failure_memory.judged_end(listed, rendered)
+    }
+
+    /// The selected session's task ledger, or an empty one with nothing selected:
+    /// the notifications [`Subagent::is_failed`] reads with the record, and the one
+    /// place that choice is made. Pure.
+    #[must_use]
+    pub fn selected_ledger(&self) -> Cow<'_, TaskLedger> {
+        self.selected_session().map_or_else(
+            || Cow::Owned(TaskLedger::default()),
+            |s| Cow::Borrowed(&s.task_ledger),
+        )
+    }
+
+    /// The ids of the selected session's subagents that FAILED
+    /// ([`SubagentRecord::failed_ids`], each over [`judged_end`](Self::judged_end))
+    /// as its record stands: the set the session's and the subagent view's
+    /// delegation lines draw `· failed` from, and the one the session title counts.
+    /// EMPTY while the record has not arrived, so a task notice naming no listed
+    /// subagent (a background shell's) marks nothing. Reads no file and no clock.
+    #[must_use]
+    pub fn failed_subagent_ids(&self) -> HashSet<String> {
+        let ledger = self.selected_ledger();
+        self.selected_subagents()
+            .map_or_else(HashSet::new, |record| {
+                record.failed_ids(&ledger, |subagent| self.judged_end(subagent))
+            })
     }
 
     /// Bring the cached entry's [`matches`](CachedPreview::matches) up to date with
@@ -6906,6 +7047,7 @@ mod tests {
             has_agent_setting: false,
             failed_task: None,
             custom_title: None,
+            task_ledger: Default::default(),
         }
     }
 
@@ -9247,6 +9389,188 @@ mod tests {
         app.open_subagent_view(agent_id, agent_type);
     }
 
+    /// A landing subagent record evicts the cached renders only when it changes
+    /// WHICH subagents failed: the delegation line's `· failed` is drawn from that
+    /// set, and a refresh that leaves it alone (the common case) costs no
+    /// re-render.
+    #[test]
+    fn a_record_evicts_the_cached_render_only_when_the_failed_set_moves() {
+        use crate::store::subagents::{RunVerdict, Subagent};
+
+        let subagent = |ended: RunVerdict| Subagent {
+            agent_id: DELEGATION_AGENT.0.to_string(),
+            agent_type: DELEGATION_AGENT.1.to_string(),
+            description: None,
+            launched: None,
+            newest_write: None,
+            ended: Some(ended),
+        };
+        let mut app = app_all(vec![delegation_session("s1")]);
+        let _ = app.preview_text(DELEGATION_WIDTH);
+        assert_eq!(app.preview_cache_len(), 1, "premise: rendered");
+
+        app.apply_subagent_record("s1", SubagentRecord::new(vec![subagent(RunVerdict::Open)]));
+        assert_eq!(app.preview_cache_len(), 1, "no failure either side: kept");
+        app.apply_subagent_record(
+            "s1",
+            SubagentRecord::new(vec![subagent(RunVerdict::Failed)]),
+        );
+        assert_eq!(app.preview_cache_len(), 0, "a subagent failed: evicted");
+        let drawn = app.preview_text(DELEGATION_WIDTH);
+        let text: String = drawn
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(text.contains("\u{b7} failed"), "{text}");
+        app.apply_subagent_record(
+            "s1",
+            SubagentRecord::new(vec![subagent(RunVerdict::Failed)]),
+        );
+        assert_eq!(app.preview_cache_len(), 1, "still failed: kept");
+        app.apply_subagent_record("s1", SubagentRecord::new(vec![subagent(RunVerdict::Open)]));
+        assert_eq!(app.preview_cache_len(), 0, "no longer failed: evicted");
+    }
+
+    /// Coming back to a session whose render was drawn for the failed set its
+    /// landing record now names costs no re-render: the entry is judged by the set
+    /// it was drawn with, not by the set the board held in between (none, while
+    /// another session's record stood).
+    #[test]
+    fn re_selecting_a_session_with_an_unchanged_failed_set_keeps_its_render() {
+        use crate::store::subagents::{RunVerdict, Subagent};
+
+        let failed = || {
+            SubagentRecord::new(vec![Subagent {
+                agent_id: DELEGATION_AGENT.0.to_string(),
+                agent_type: DELEGATION_AGENT.1.to_string(),
+                description: None,
+                launched: None,
+                newest_write: None,
+                ended: Some(RunVerdict::Failed),
+            }])
+        };
+        let mut app = app_all(vec![delegation_session("s1"), delegation_session("s2")]);
+        app.set_selected(Some("s1".to_string()));
+        app.apply_subagent_record("s1", failed());
+        let _ = app.preview_text(DELEGATION_WIDTH);
+        app.set_selected(Some("s2".to_string()));
+        app.apply_subagent_record("s2", SubagentRecord::default());
+        let _ = app.preview_text(DELEGATION_WIDTH);
+        assert_eq!(app.preview_cache_len(), 2, "premise: both rendered");
+
+        app.set_selected(Some("s1".to_string()));
+        app.apply_subagent_record("s1", failed());
+        assert_eq!(
+            app.preview_cache_len(),
+            2,
+            "the same set: s1's render stays"
+        );
+    }
+
+    /// The delegation agent as a record lists it, `Open` and written at a fixed
+    /// stamp: what the refresh reads of a run it cannot yet call failed.
+    fn open_delegation_record() -> SubagentRecord {
+        use crate::store::subagents::{RunVerdict, Subagent};
+        SubagentRecord::new(vec![Subagent {
+            agent_id: DELEGATION_AGENT.0.to_string(),
+            agent_type: DELEGATION_AGENT.1.to_string(),
+            description: None,
+            launched: None,
+            newest_write: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000)),
+            ended: Some(RunVerdict::Open),
+        }])
+    }
+
+    /// A session `s1` in a temp dir whose [`DELEGATION_AGENT`] transcript ENDS IN
+    /// AN API ERROR, so the subagent view's full render judges the run failed
+    /// where the record (`Open`, [`open_delegation_record`]) cannot. Returns the
+    /// app and the dir to remove.
+    fn app_with_a_subagent_that_renders_failed() -> (App, PathBuf) {
+        let dir = unique_temp_dir("render-failed");
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let file = dir.join("sess-fail-1.jsonl");
+        let (folder, name) = DELEGATION_FIXTURE;
+        std::fs::copy(fixtures.join("store").join(folder).join(name), &file).unwrap();
+        let subagents = dir.join("sess-fail-1").join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        std::fs::copy(
+            fixtures.join("subagent_status/api-error.jsonl"),
+            subagents.join(format!("agent-{}.jsonl", DELEGATION_AGENT.0)),
+        )
+        .unwrap();
+        let mut session = delegation_session("s1");
+        session.file = file;
+        let mut app = app_all(vec![session]);
+        app.apply_subagent_record("s1", open_delegation_record());
+        (app, dir)
+    }
+
+    /// WIRING: a view render that judges a run failed moves the failed set the
+    /// SESSION's cached render was drawn with, so that render is evicted at once.
+    #[test]
+    fn a_view_render_that_judges_a_failure_evicts_the_sessions_render() {
+        let (mut app, dir) = app_with_a_subagent_that_renders_failed();
+        let _ = app.preview_text(DELEGATION_WIDTH);
+        assert_eq!(app.preview_cache_len(), 1, "premise: the session rendered");
+        assert!(app.failed_subagent_ids().is_empty(), "premise: none failed");
+
+        open_delegation_view(&mut app);
+        let _ = app.preview_text(DELEGATION_WIDTH);
+
+        assert_eq!(app.failed_subagent_ids().len(), 1, "the render judged it");
+        assert_eq!(
+            app.preview_cache_len(),
+            0,
+            "the session's render was drawn for the old set"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// WIRING: the view's own render is restamped with the failed set its verdict
+    /// produced, so the next frame reuses it instead of reading the transcript
+    /// again.
+    #[test]
+    fn a_view_render_that_judges_a_failure_is_not_redone_on_the_next_frame() {
+        let (mut app, dir) = app_with_a_subagent_that_renders_failed();
+        open_delegation_view(&mut app);
+        let _ = app.preview_text(DELEGATION_WIDTH);
+        let _ = app.preview_text(DELEGATION_WIDTH);
+        assert_eq!(app.failed_subagent_ids().len(), 1, "premise: it failed");
+        assert_eq!(
+            app.subagent_renders(),
+            1,
+            "one read for any number of frames"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// WIRING: a landing record feeds the failure memory, so a failure read from a
+    /// tail outlives the refresh that stops reading tails past `RUNNING_WINDOW`
+    /// (`ended: None` at the same stamp).
+    #[test]
+    fn a_failure_a_record_read_outlives_the_record_that_reads_no_tail() {
+        use crate::store::subagents::{RunVerdict, Subagent};
+        let mut app = app_all(vec![delegation_session("s1")]);
+        let failed = SubagentRecord::new(vec![Subagent {
+            ended: Some(RunVerdict::Failed),
+            ..open_delegation_record().subagents()[0].clone()
+        }]);
+        app.apply_subagent_record("s1", failed);
+        assert_eq!(app.failed_subagent_ids().len(), 1, "premise: failed");
+
+        let unread = SubagentRecord::new(vec![Subagent {
+            ended: None,
+            ..open_delegation_record().subagents()[0].clone()
+        }]);
+        app.apply_subagent_record("s1", unread);
+        assert_eq!(
+            app.failed_subagent_ids().len(),
+            1,
+            "remembered while the stamp has not moved"
+        );
+    }
+
     /// The wall clock only moves forward: a stamp older than the one held never
     /// steps it back.
     #[test]
@@ -9308,6 +9632,174 @@ mod tests {
             Some("late-type"),
             "an hour on nothing runs, and the most recent write wins"
         );
+    }
+
+    /// Two `Open` subagents written lately: the delegation agent (launched
+    /// first) and `other` (launched second). Whichever of the two the board
+    /// judges failed, `Ctrl-X ↓` must name the other.
+    fn two_open_subagents() -> SubagentRecord {
+        use crate::store::subagents::{RunVerdict, Subagent};
+        let subagent = |agent_id: &str, agent_type: &str, wrote: u64| Subagent {
+            agent_id: agent_id.to_string(),
+            agent_type: agent_type.to_string(),
+            description: None,
+            launched: None,
+            newest_write: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(wrote)),
+            ended: Some(RunVerdict::Open),
+        };
+        SubagentRecord::new(vec![
+            subagent(DELEGATION_AGENT.0, DELEGATION_AGENT.1, 1_000),
+            subagent("other", "other-type", 1_005),
+        ])
+    }
+
+    /// WIRING: `Ctrl-X ↓` skips a subagent the board JUDGED failed (here by the
+    /// view's own render, remembered after the view is left) though its record
+    /// still reads `Open` and lately written: the target stands on
+    /// [`App::judged_end`], not the record's `ended`.
+    #[test]
+    fn the_open_target_skips_a_subagent_the_board_judged_failed() {
+        let (mut app, dir) = app_with_a_subagent_that_renders_failed();
+        app.apply_subagent_record("s1", two_open_subagents());
+        app.note_wall_clock(SystemTime::UNIX_EPOCH + Duration::from_secs(1_010));
+        open_delegation_view(&mut app);
+        let _ = app.preview_text(DELEGATION_WIDTH);
+        assert!(app.leave_subagent_view(), "premise: the view was up");
+        assert_eq!(app.failed_subagent_ids().len(), 1, "premise: judged failed");
+
+        assert_eq!(app.open_subagent_target(), Ok(()));
+        assert_eq!(app.subagent_view_type(), Some("other-type"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// WIRING: `Ctrl-X ↓` skips a subagent the SESSION's task ledger holds a
+    /// `failed` notice for though its record reads `Open` and lately written: the
+    /// target is asked with the selected session's ledger.
+    #[test]
+    fn the_open_target_skips_a_subagent_the_sessions_ledger_failed() {
+        use crate::store::tasks;
+
+        let mut session = delegation_session("s1");
+        let body = format!(
+            "<task-notification>\n<task-id>{}</task-id>\n<status>failed</status>\n\
+             </task-notification>",
+            DELEGATION_AGENT.0
+        );
+        tasks::scan_record(
+            &serde_json::json!({
+                "type": "user",
+                "origin": { "kind": tasks::TASK_NOTIFICATION_ORIGIN },
+                "message": { "role": "user", "content": body },
+            }),
+            &mut session.task_ledger,
+        );
+        let mut app = app_all(vec![session]);
+        app.apply_subagent_record("s1", two_open_subagents());
+        app.note_wall_clock(SystemTime::UNIX_EPOCH + Duration::from_secs(1_010));
+
+        assert_eq!(app.open_subagent_target(), Ok(()));
+        assert_eq!(app.subagent_view_type(), Some("other-type"));
+    }
+
+    /// WIRING: the subagent view's render verdict is about the subagent it shows
+    /// and no other. With the view open on a subagent its render judges failed, a
+    /// sibling the record lists `Open` and lately written is not failed, still
+    /// runs, and is `Ctrl-X ↓`'s target once the view is left.
+    #[test]
+    fn the_views_verdict_judges_only_the_subagent_it_shows() {
+        let (mut app, dir) = app_with_a_subagent_that_renders_failed();
+        app.apply_subagent_record("s1", two_open_subagents());
+        app.note_wall_clock(SystemTime::UNIX_EPOCH + Duration::from_secs(1_010));
+        open_delegation_view(&mut app);
+        let _ = app.preview_text(DELEGATION_WIDTH);
+
+        assert_eq!(
+            app.failed_subagent_ids(),
+            HashSet::from([DELEGATION_AGENT.0.to_string()]),
+            "only the viewed subagent is judged failed, not its sibling"
+        );
+        let ledger = app.selected_ledger();
+        let record = app.selected_subagents().expect("the record landed");
+        let running: Vec<&str> = record
+            .subagents()
+            .iter()
+            .filter(|s| s.is_running(&ledger, app.judged_end(s), app.wall_clock))
+            .map(|s| s.agent_id.as_str())
+            .collect();
+        assert_eq!(running, ["other"], "the sibling still runs");
+        drop(ledger);
+
+        app.leave_subagent_view();
+        assert_eq!(app.open_subagent_target(), Ok(()));
+        assert_eq!(app.subagent_view_type(), Some("other-type"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// WIRING: a nested launch that fails while the subagent view is up moves the
+    /// failed set the VIEW's cached render was drawn with, so a landing record
+    /// evicts that render too (the view's lines read `· failed` from the set),
+    /// while a record that moves nothing costs no re-render.
+    #[test]
+    fn a_record_that_fails_a_nested_launch_evicts_the_views_render() {
+        use crate::store::subagents::{RunVerdict, Subagent};
+
+        let mut app = app_all(vec![delegation_session("s1")]);
+        app.apply_subagent_record("s1", open_delegation_record());
+        open_delegation_view(&mut app);
+        let _ = app.preview_text(DELEGATION_WIDTH);
+        assert_eq!(app.subagent_renders(), 1, "premise: the view rendered");
+
+        app.apply_subagent_record("s1", open_delegation_record());
+        let _ = app.preview_text(DELEGATION_WIDTH);
+        assert_eq!(app.subagent_renders(), 1, "nothing moved: kept");
+
+        let mut listed = open_delegation_record().subagents().to_vec();
+        listed.push(Subagent {
+            agent_id: "b0c1d2e3f4a5b6c7d".to_string(),
+            agent_type: "fixture-reviewer".to_string(),
+            description: None,
+            launched: None,
+            newest_write: None,
+            ended: Some(RunVerdict::Failed),
+        });
+        app.apply_subagent_record("s1", SubagentRecord::new(listed));
+        let _ = app.preview_text(DELEGATION_WIDTH);
+        assert_eq!(app.subagent_renders(), 2, "a failure landed: re-rendered");
+    }
+
+    /// WIRING: a failed subagent LAUNCHED FROM INSIDE the subagent view (a nested
+    /// one) keeps its `· failed` on its delegation line there: the view's render is
+    /// handed the selected session's failed set, not an empty one.
+    #[test]
+    fn a_failed_nested_launch_reads_failed_inside_the_subagent_view() {
+        use crate::store::subagents::{RunVerdict, Subagent};
+
+        let mut app = app_all(vec![delegation_session("s1")]);
+        app.apply_subagent_record(
+            "s1",
+            SubagentRecord::new(vec![Subagent {
+                agent_id: "b0c1d2e3f4a5b6c7d".to_string(),
+                agent_type: "fixture-reviewer".to_string(),
+                description: None,
+                launched: None,
+                newest_write: None,
+                ended: Some(RunVerdict::Failed),
+            }]),
+        );
+        open_delegation_view(&mut app);
+        let drawn = app.preview_text(DELEGATION_WIDTH);
+        let line = drawn
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .find(|text| text.contains("delegated to @fixture-reviewer"))
+            .expect("the nested launch's delegation line is drawn in the view");
+        assert!(line.contains("\u{b7} failed"), "{line}");
     }
 
     /// A reply or fork box sends into the SESSION, so opening one leaves the view

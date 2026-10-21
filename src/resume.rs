@@ -1156,6 +1156,7 @@ mod tests {
             has_agent_setting: false,
             failed_task: None,
             custom_title: None,
+            task_ledger: Default::default(),
         };
         (session, dir)
     }
@@ -1259,6 +1260,7 @@ mod tests {
             has_agent_setting: false,
             failed_task: None,
             custom_title: None,
+            task_ledger: Default::default(),
         };
         match plan(&session, false) {
             ResumePlan::Refuse { message } => {
@@ -1289,6 +1291,7 @@ mod tests {
             has_agent_setting: false,
             failed_task: None,
             custom_title: None,
+            task_ledger: Default::default(),
         };
         match check(&session, false) {
             Err(ResumeError::Refused(message)) => {
@@ -2494,6 +2497,7 @@ mod tests {
             has_agent_setting: false,
             failed_task: None,
             custom_title: None,
+            task_ledger: Default::default(),
         };
         match check_attach(&session, None) {
             Err(ResumeError::Refused(message)) => {

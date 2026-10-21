@@ -659,8 +659,8 @@ selected row or on the whole board: press it, and a hint shows the follow-ups �
   can move the rest again.
 - `Ctrl-X ↓` **shows a subagent's own transcript** in the preview, exactly as a
   click on its `◆ delegated to @…` line does: the first one still **running** —
-  not finished, and it or a subagent it launched wrote in the last 10 minutes —
-  else the one written most recently. `←` / `→` then step through every
+  not finished or failed, and it or a subagent it launched wrote in the last 10
+  minutes — else the one written most recently. `←` / `→` then step through every
   subagent the session launched, at any depth and finished ones included, in
   the order they were launched, wrapping round at both ends; the preview's title
   ends with which one of how many (`… · 2/5`). `↑`, `Esc`, or
@@ -837,13 +837,18 @@ from its first turn to its last, however long it ran. So you
 can confirm it's the right session before jumping back in. The preview's title
 says how the session stands: its status in Claude Code's words, how long ago it
 last wrote, how many messages it holds, and how many subagents it launched and
-how many of those are running —
-`live working · last write 12s ago · 171 msgs · 5 subagents · 2 running`. At
+how many of those are running and how many failed —
+`live working · 1 failed · last write 12s ago · 171 msgs · 5 subagents · 2 running`
+(`failed` in red, right after the status so it shows at any pane width: a narrow
+pane cuts the other counts first). A subagent that failed long ago, with no
+notice from Claude Code, is counted once you have opened its transcript, or if
+snapback saw it fail within the last 10 minutes. That memory lasts only until
+you quit snapback, and is dropped if the subagent's transcript changes. At
 `0:1`, where the list is hidden, the session's name leads it. Whatever snapback
 doesn't know is left out: no status for a session Claude Code doesn't report, or
 while a reply you sent it is in flight (its `cooking…` line says so already); no
 subagent count until snapback has read the session's subagents, or for a session
-that launched none; no running count while none runs. On a narrow pane the name
+that launched none; no running or failed count while none does. On a narrow pane the name
 is cut first, then the last write, then the message count. Links show in light
 blue, italic and underlined — the italic underline echoing how many terminals
 mark a url they detect — and are clickable, except in a table too wide for a
@@ -856,7 +861,8 @@ into, a command's caveat) to a single `◇ added by claude code` line; either op
 where it sits on a click.
 Each subagent Claude launched shows as a
 `◆ delegated to @<agent> · <what it was asked> · (click to view)` line where a
-bare `[tool_use: Agent]` used to be, and a click switches the preview to that
+bare `[tool_use: Agent]` used to be (a subagent that failed reads
+`… · <what it was asked> · failed · (click to view)`, `failed` in red), and a click switches the preview to that
 subagent's **own transcript**: the brief it was given under `▶ prompt`, its work
 under `● claude`, and any subagent it launched in turn as a line that switches to
 that one. `Ctrl-X ↓` switches the same way without finding its line first — to
@@ -866,7 +872,9 @@ pane's title
 names the subagent, so it never passes for your session, and once snapback has
 read the session's subagents it says how that one stands too: what it was asked,
 whether it is **running** (green), **finished**, **failed** (red: an API error,
-such as a lost login or a dropped connection, ended its run), or **quiet** (gray:
+such as a lost login or a dropped connection, ended its run, or Claude Code's own
+task notice for it said `failed`, as it does for a subagent it gave up on after
+10 minutes without progress), or **quiet** (gray:
 not finished or failed, but neither it nor a subagent it launched wrote in the
 last 10 minutes), when it started — a time on its own today, with the date on
 another day, as a turn's is — how long ago it last wrote, and which one of how

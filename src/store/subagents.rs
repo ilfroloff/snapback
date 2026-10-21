@@ -50,6 +50,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use super::skills::normalize_description;
+use super::tasks::TaskLedger;
 
 /// The dir under a session's `<id>/` that holds its subagents' files.
 const SUBAGENTS_DIR: &str = "subagents";
@@ -372,6 +373,37 @@ pub struct Subagent {
     pub ended: Option<RunVerdict>,
 }
 
+impl Subagent {
+    /// Whether it FAILED, by [`is_failed`] over `ended` (the verdict the caller
+    /// stands on: [`FailureMemory::judged_end`]) and what `ledger` last heard of
+    /// its id (a notification's `<task-id>` is the subagent's id). PURE.
+    #[must_use]
+    pub fn is_failed(&self, ledger: &TaskLedger, ended: Option<RunVerdict>) -> bool {
+        is_failed(ledger.is_failed(&self.agent_id), ended)
+    }
+
+    /// Whether it reads RUNNING at `now`: [`SubagentStatus::of`] says
+    /// [`Running`](SubagentStatus::Running) over `judged` (the verdict the caller
+    /// stands on: [`FailureMemory::judged_end`]) and what `ledger` last heard of
+    /// it, the SAME inputs [`is_failed`](Self::is_failed) reads, so a subagent
+    /// judged failed is never running and the running count, the running list and
+    /// `Ctrl-X ↓` agree with the status the title states. PURE.
+    #[must_use]
+    pub fn is_running(
+        &self,
+        ledger: &TaskLedger,
+        judged: Option<RunVerdict>,
+        now: SystemTime,
+    ) -> bool {
+        SubagentStatus::of(
+            judged,
+            self.newest_write,
+            now,
+            ledger.is_failed(&self.agent_id),
+        ) == SubagentStatus::Running
+    }
+}
+
 /// Every subagent ONE session launched, at any depth, in LAUNCH ORDER
 /// ([`launch_order`]): the one record the subagent view's title, its `←`/`→`
 /// steps and the preview's running list read, and the `Ctrl-X ↓` target is
@@ -443,13 +475,20 @@ impl SubagentRecord {
     /// ([`is_running`]) in launch order; else the most recently written one — the
     /// newest [`newest_write`](Subagent::newest_write), one with none only when
     /// none has one — a tie going to the LATER launch, the one whose own write it
-    /// most likely was (a parent shares its running child's write). `None` with
-    /// no subagents. PURE.
+    /// most likely was (a parent shares its running child's write). A subagent
+    /// judged FAILED (`judged`, `ledger`) is never the running one
+    /// ([`Subagent::is_running`]).
+    /// `None` with no subagents. PURE.
     #[must_use]
-    pub fn open_target(&self, now: SystemTime) -> Option<&Subagent> {
+    pub fn open_target(
+        &self,
+        ledger: &TaskLedger,
+        judged: impl Fn(&Subagent) -> Option<RunVerdict>,
+        now: SystemTime,
+    ) -> Option<&Subagent> {
         self.subagents
             .iter()
-            .find(|subagent| is_running(subagent.ended, subagent.newest_write, now))
+            .find(|subagent| subagent.is_running(ledger, judged(subagent), now))
             .or_else(|| {
                 self.subagents
                     .iter()
@@ -457,6 +496,22 @@ impl SubagentRecord {
                     .max_by_key(|&(index, subagent)| (subagent.newest_write, index))
                     .map(|(_, subagent)| subagent)
             })
+    }
+
+    /// The ids of the subagents that FAILED ([`Subagent::is_failed`], each over
+    /// the verdict `judged` names for it): what the preview's delegation lines
+    /// draw `· failed` from and the session title counts. PURE.
+    #[must_use]
+    pub fn failed_ids(
+        &self,
+        ledger: &TaskLedger,
+        judged: impl Fn(&Subagent) -> Option<RunVerdict>,
+    ) -> HashSet<String> {
+        self.subagents
+            .iter()
+            .filter(|subagent| subagent.is_failed(ledger, judged(subagent)))
+            .map(|subagent| subagent.agent_id.clone())
+            .collect()
     }
 
     /// `agent_id`'s index in launch order.
@@ -498,16 +553,99 @@ pub fn is_running(
     ended == Some(RunVerdict::Open) && within_window(newest_write, now)
 }
 
+/// Whether a subagent FAILED: the ONE rule every surface asks (the session
+/// title's `N failed`, a delegation line's `· failed`, the subagent view's
+/// state). The three agree on the INPUTS too, bar one documented lag: all read
+/// the verdict [`FailureMemory::judged_end`] stands on, so a foreground failure
+/// older than [`RUNNING_WINDOW`] that the board never saw inside it (the refresh
+/// reads no tail of it) shows on the title and the delegation line only once its
+/// subagent view has been opened.
+///
+/// EITHER source says so: `notified_failed`, its latest task notification said
+/// `failed` ([`TaskLedger::is_failed`]), or `ended`, its own transcript's end
+/// read [`RunVerdict::Failed`]. The sources overlap on purpose and neither
+/// covers the other (measured 2026-10-21): the notification catches the 10
+/// subagents claude marked `Agent stalled: no progress for 600s`, whose
+/// transcripts end quietly, and the transcript catches an API error the moment
+/// it is written, before any notification. PURE.
+#[must_use]
+pub fn is_failed(notified_failed: bool, ended: Option<RunVerdict>) -> bool {
+    notified_failed || ended == Some(RunVerdict::Failed)
+}
+
+/// The failures the board has already JUDGED, kept in memory so a verdict outlives
+/// the read that made it: the refresh reads no tail once a subagent's last write
+/// is past [`RUNNING_WINDOW`] ([`Subagent::ended`] is `None` then), and the subagent
+/// view's render, the only other reader of a whole transcript, goes with the view.
+///
+/// Only `Failed` is remembered, keyed by agent id and stamped with the
+/// [`Subagent::newest_write`] the verdict was taken at: it stands only while the
+/// record's stamp for that subagent is the same, so a transcript that moved is
+/// judged afresh. A verdict is remembered from a read that FINISHED alone: the
+/// record's `Some(Open)` that stands for an unreadable tail is never one
+/// ([`Open`](RunVerdict::Open) is never stored), and a subagent with no stamp
+/// has nothing to vouch for a stored verdict, so none is stored. IN MEMORY ONLY.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FailureMemory(HashMap<String, SystemTime>);
+
+impl FailureMemory {
+    /// Learn from a landing record's `subagent`: a `Failed` tail read is kept; a
+    /// stored verdict whose stamp the record has moved past is dropped. Any other
+    /// `ended` leaves a standing verdict alone — `Some(Open)` may be a failed read.
+    pub fn note_record(&mut self, subagent: &Subagent) {
+        match (subagent.ended, subagent.newest_write) {
+            (Some(RunVerdict::Failed), Some(stamp)) => {
+                self.0.insert(subagent.agent_id.clone(), stamp);
+            }
+            (_, stamp) if self.0.get(&subagent.agent_id) != stamp.as_ref() => {
+                self.0.remove(&subagent.agent_id);
+            }
+            _ => {}
+        }
+    }
+
+    /// Learn from the subagent view's full render of `subagent`'s transcript,
+    /// which judged it `verdict`: a finished read of the whole file, so any
+    /// verdict replaces what was stored.
+    pub fn note_render(&mut self, subagent: &Subagent, verdict: RunVerdict) {
+        match (verdict, subagent.newest_write) {
+            (RunVerdict::Failed, Some(stamp)) => {
+                self.0.insert(subagent.agent_id.clone(), stamp);
+            }
+            _ => {
+                self.0.remove(&subagent.agent_id);
+            }
+        }
+    }
+
+    /// The verdict on `subagent`'s end that every surface stands on: the view's
+    /// full render (`rendered`) when it has one, else a remembered `Failed` whose
+    /// stamp is still the record's, else the record's own `ended`. PURE.
+    #[must_use]
+    pub fn judged_end(
+        &self,
+        subagent: &Subagent,
+        rendered: Option<RunVerdict>,
+    ) -> Option<RunVerdict> {
+        rendered
+            .or_else(|| {
+                let stamp = subagent.newest_write?;
+                (self.0.get(&subagent.agent_id) == Some(&stamp)).then_some(RunVerdict::Failed)
+            })
+            .or(subagent.ended)
+    }
+}
+
 /// Where a subagent's own run stands at a `now`, in the words the subagent
 /// view's title states it in (`tui::view`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubagentStatus {
-    /// [`is_running`].
+    /// [`is_running`], and not [`is_failed`].
     Running,
     /// Its end was read: `ended` is `Some(RunVerdict::Finished)`.
     Finished,
-    /// Its end was read, and it ended in a failure: `ended` is
-    /// `Some(RunVerdict::Failed)`.
+    /// [`is_failed`]: its transcript's end was read as a failure, or its latest
+    /// task notification said `failed`.
     Failed,
     /// None of these: an unfinished run silent past [`RUNNING_WINDOW`], or one
     /// whose end was never read (`ended` `None`), which cannot be running either.
@@ -516,22 +654,27 @@ pub enum SubagentStatus {
 
 impl SubagentStatus {
     /// The status of a run with the stored facts `ended` and `newest_write` at
-    /// `now`, over the SAME [`is_running`] the running list and `Ctrl-X ↓` ask,
-    /// so the title can never call running what the list leaves off. Worked out
-    /// at draw time, like [`is_running`]. PURE.
+    /// `now`, and whether its latest task notification said `failed`
+    /// (`notified_failed`). [`is_failed`] ranks FIRST, so no run reads both
+    /// `running` and `failed`; the running list and `Ctrl-X ↓` ask this too
+    /// ([`Subagent::is_running`]), so the title can never call running what the
+    /// list leaves off. Worked out at draw time, like [`is_running`]. PURE.
     #[must_use]
     pub fn of(
         ended: Option<RunVerdict>,
         newest_write: Option<SystemTime>,
         now: SystemTime,
+        notified_failed: bool,
     ) -> Self {
+        if is_failed(notified_failed, ended) {
+            return Self::Failed;
+        }
         if is_running(ended, newest_write, now) {
             return Self::Running;
         }
         match ended {
             Some(RunVerdict::Finished) => Self::Finished,
-            Some(RunVerdict::Failed) => Self::Failed,
-            Some(RunVerdict::Open) | None => Self::Quiet,
+            Some(RunVerdict::Failed | RunVerdict::Open) | None => Self::Quiet,
         }
     }
 }
@@ -2017,7 +2160,7 @@ mod tests {
             (None, None, Quiet),
         ] {
             assert_eq!(
-                SubagentStatus::of(ended, written, now()),
+                SubagentStatus::of(ended, written, now(), false),
                 status,
                 "{ended:?} {written:?}"
             );
@@ -2064,8 +2207,14 @@ mod tests {
             );
         }
         let view_ended = |id: &str| {
-            let rendered =
-                preview::render_subagent(&session_file, id, 80, &HashSet::new(), &HashSet::new());
+            let rendered = preview::render_subagent(
+                &session_file,
+                id,
+                80,
+                &HashSet::new(),
+                &HashSet::new(),
+                &HashSet::new(),
+            );
             assert!(rendered.run_ended.is_some(), "{id}: premise, it rendered");
             rendered.run_ended
         };
@@ -2073,8 +2222,8 @@ mod tests {
             let record = read_record(&session_file, at);
             cases.map(|(id, _, _)| {
                 let listed = entry(&record, id);
-                let from_record = SubagentStatus::of(listed.ended, listed.newest_write, at);
-                let from_view = SubagentStatus::of(view_ended(id), listed.newest_write, at);
+                let from_record = SubagentStatus::of(listed.ended, listed.newest_write, at, false);
+                let from_view = SubagentStatus::of(view_ended(id), listed.newest_write, at, false);
                 (from_record, from_view)
             })
         };
@@ -2258,9 +2407,16 @@ mod tests {
                 ..sub("running-late", Some(3))
             },
         ]);
-        assert_eq!(id_of(record.open_target(now())), Some("running-early"));
         assert_eq!(
-            id_of(record.open_target(now() + RUNNING_WINDOW + RUNNING_WINDOW)),
+            id_of(record.open_target(&TaskLedger::default(), |s| s.ended, now())),
+            Some("running-early")
+        );
+        assert_eq!(
+            id_of(record.open_target(
+                &TaskLedger::default(),
+                |s| s.ended,
+                now() + RUNNING_WINDOW + RUNNING_WINDOW
+            )),
             Some("done-fresh"),
             "with none running, the most recent write"
         );
@@ -2281,19 +2437,27 @@ mod tests {
             quiet("no-write", 3, None),
             quiet("older", 4, Some(3_600)),
         ]);
-        assert_eq!(id_of(record.open_target(now())), Some("newest"));
+        assert_eq!(
+            id_of(record.open_target(&TaskLedger::default(), |s| s.ended, now())),
+            Some("newest")
+        );
         let tied = SubagentRecord::new(vec![
             quiet("parent", 1, Some(900)),
             quiet("child", 2, Some(900)),
         ]);
-        assert_eq!(id_of(tied.open_target(now())), Some("child"));
+        assert_eq!(
+            id_of(tied.open_target(&TaskLedger::default(), |s| s.ended, now())),
+            Some("child")
+        );
         let unwritten = SubagentRecord::new(vec![quiet("a", 1, None), quiet("b", 2, None)]);
         assert_eq!(
-            id_of(unwritten.open_target(now())),
+            id_of(unwritten.open_target(&TaskLedger::default(), |s| s.ended, now())),
             Some("b"),
             "no write anywhere: the latest launch"
         );
-        assert!(SubagentRecord::default().open_target(now()).is_none());
+        assert!(SubagentRecord::default()
+            .open_target(&TaskLedger::default(), |s| s.ended, now())
+            .is_none());
     }
 
     // --- the record: the launch time --------------------------------------------
@@ -2855,5 +3019,190 @@ mod tests {
             assert!(!discovered.contains(path), "{path:?} is discoverable");
         }
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A ledger whose latest notice for each of `ids` said `failed`.
+    fn ledger_failing(ids: &[&str]) -> TaskLedger {
+        let mut ledger = TaskLedger::default();
+        for id in ids {
+            let body =
+                format!("<task-id>{id}</task-id><status>failed</status><summary>s</summary>");
+            crate::store::tasks::scan_record(
+                &serde_json::json!({
+                    "origin": { "kind": crate::store::tasks::TASK_NOTIFICATION_ORIGIN },
+                    "message": { "content": body },
+                }),
+                &mut ledger,
+            );
+        }
+        ledger
+    }
+
+    /// Either source fails a subagent; neither covers the other; an unread tail
+    /// and a quiet run fail on a notice alone.
+    #[test]
+    fn a_subagent_failed_when_either_source_says_so() {
+        for (notified, ended, failed) in [
+            (true, None, true),
+            (true, Some(RunVerdict::Open), true),
+            (true, Some(RunVerdict::Finished), true),
+            (true, Some(RunVerdict::Failed), true),
+            (false, Some(RunVerdict::Failed), true),
+            (false, None, false),
+            (false, Some(RunVerdict::Open), false),
+            (false, Some(RunVerdict::Finished), false),
+        ] {
+            assert_eq!(is_failed(notified, ended), failed, "{notified} {ended:?}");
+        }
+    }
+
+    /// A notice-failed run that is still within the window reads FAILED, never
+    /// running, and the running check every other surface asks agrees.
+    #[test]
+    fn a_failed_subagent_is_never_running_and_failed_outranks_every_other_state() {
+        use SubagentStatus::{Failed, Finished, Quiet, Running};
+        for (notified, ended, written, status) in [
+            (true, Some(RunVerdict::Open), Some(ago(1)), Failed),
+            (true, Some(RunVerdict::Finished), Some(ago(1)), Failed),
+            (true, None, None, Failed),
+            (true, Some(RunVerdict::Open), Some(ago(86_400)), Failed),
+            (false, Some(RunVerdict::Open), Some(ago(1)), Running),
+            (false, Some(RunVerdict::Finished), Some(ago(1)), Finished),
+            (false, Some(RunVerdict::Open), Some(ago(86_400)), Quiet),
+        ] {
+            assert_eq!(
+                SubagentStatus::of(ended, written, now(), notified),
+                status,
+                "{notified} {ended:?} {written:?}"
+            );
+            let subagent = Subagent {
+                newest_write: written,
+                ended,
+                ..sub("t", Some(1))
+            };
+            let ledger = if notified {
+                ledger_failing(&["t"])
+            } else {
+                TaskLedger::default()
+            };
+            assert_eq!(
+                subagent.is_running(&ledger, ended, now()),
+                status == Running
+            );
+            assert_eq!(subagent.is_failed(&ledger, ended), status == Failed);
+        }
+    }
+
+    /// `Ctrl-X ↓` skips a notice-failed run that looks running, and the failed
+    /// set lists only subagents the record lists: a notice naming any other task
+    /// marks nothing.
+    #[test]
+    fn the_open_target_and_the_failed_ids_follow_the_notices() {
+        let record = SubagentRecord::new(vec![
+            Subagent {
+                newest_write: Some(ago(5)),
+                ended: Some(RunVerdict::Open),
+                ..sub("failed-looks-running", Some(0))
+            },
+            Subagent {
+                newest_write: Some(ago(9)),
+                ended: Some(RunVerdict::Open),
+                ..sub("running", Some(1))
+            },
+        ]);
+        let ledger = ledger_failing(&["failed-looks-running", "a-background-shell"]);
+        assert_eq!(
+            id_of(record.open_target(&ledger, |s| s.ended, now())),
+            Some("running")
+        );
+        assert_eq!(
+            record.failed_ids(&ledger, |s| s.ended),
+            HashSet::from(["failed-looks-running".to_string()])
+        );
+        assert!(record
+            .failed_ids(&TaskLedger::default(), |s| s.ended)
+            .is_empty());
+    }
+
+    /// A subagent whose record reads `Open` and recent but whom the board JUDGED
+    /// failed (a remembered or rendered verdict) is failed AND not running, in the
+    /// running check and in the `Ctrl-X ↓` target alike: "never both" is the
+    /// code's, not a coincidence of the inputs.
+    #[test]
+    fn a_subagent_judged_failed_is_never_running() {
+        let subagent = Subagent {
+            newest_write: Some(ago(5)),
+            ended: Some(RunVerdict::Open),
+            ..sub("t", Some(1))
+        };
+        let judged = Some(RunVerdict::Failed);
+        let none = TaskLedger::default();
+        assert!(subagent.is_failed(&none, judged));
+        assert!(!subagent.is_running(&none, judged, now()));
+        assert!(subagent.is_running(&none, subagent.ended, now()), "premise");
+        let other = Subagent {
+            newest_write: Some(ago(9)),
+            ended: Some(RunVerdict::Open),
+            ..sub("u", Some(2))
+        };
+        let record = SubagentRecord::new(vec![subagent, other]);
+        let judge = |s: &Subagent| {
+            if s.agent_id == "t" {
+                judged
+            } else {
+                s.ended
+            }
+        };
+        assert_eq!(id_of(record.open_target(&none, judge, now())), Some("u"));
+    }
+
+    /// Which verdict a surface stands on: the view's render over everything, a
+    /// remembered failure while the stamp has not moved, else the record's own.
+    /// A failure is remembered from a failed tail or a finished render, never from
+    /// the `Open` an unreadable tail reads as, and goes when the stamp moves.
+    #[test]
+    fn a_remembered_failure_stands_until_the_transcript_moves() {
+        use RunVerdict::{Failed, Finished, Open};
+        let old = |ended| Subagent {
+            newest_write: Some(ago(3_600)),
+            ended,
+            ..sub("t", Some(1))
+        };
+        let mut memory = FailureMemory::default();
+        assert_eq!(memory.judged_end(&old(None), None), None, "nothing known");
+
+        // The view's render judged it failed; the record reads no tail.
+        memory.note_render(&old(None), Failed);
+        assert_eq!(memory.judged_end(&old(None), None), Some(Failed));
+        // An unreadable tail's fallback does not unseat it.
+        memory.note_record(&old(Some(Open)));
+        assert_eq!(memory.judged_end(&old(Some(Open)), None), Some(Failed));
+        // The full render outranks what is remembered.
+        assert_eq!(
+            memory.judged_end(&old(None), Some(Finished)),
+            Some(Finished)
+        );
+        // A moved stamp: the verdict no longer vouches, and the record drops it.
+        let moved = Subagent {
+            newest_write: Some(ago(5)),
+            ..old(None)
+        };
+        assert_eq!(memory.judged_end(&moved, None), None);
+        memory.note_record(&moved);
+        assert_eq!(memory.judged_end(&old(None), None), None, "dropped");
+
+        // A failed tail the record read is remembered for after its window.
+        memory.note_record(&old(Some(Failed)));
+        assert_eq!(memory.judged_end(&old(None), None), Some(Failed));
+        // A finished render replaces it; a subagent with no stamp stores nothing.
+        memory.note_render(&old(None), Finished);
+        assert_eq!(memory.judged_end(&old(None), None), None);
+        let unstamped = Subagent {
+            newest_write: None,
+            ..old(None)
+        };
+        memory.note_render(&unstamped, Failed);
+        assert_eq!(memory.judged_end(&unstamped, None), None);
+        assert_eq!(memory, FailureMemory::default());
     }
 }
