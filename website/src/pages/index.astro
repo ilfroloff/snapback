@@ -86,11 +86,61 @@ const comparison = [
           reply, stop, or start an agent without leaving.
         </p>
 
-        <div class="prompt">
-          <span class="prompt-sigil">$</span>
-          <span class="prompt-cmd">npx snapback-tui install</span
-          ><span class="cursor" aria-hidden="true">_</span>
+        <div class="install-tabs" data-install-tabs>
+          <div class="install-tablist" role="tablist" aria-label="Installation methods">
+            <button class="install-tab active" role="tab" aria-selected="true" aria-controls="panel-npm" id="tab-npm" data-tab="npm" tabindex="0">
+              <svg class="install-tab-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="2" y="2" width="20" height="20" rx="3" fill="#CB3837"/><path d="M7 7h10v10h-3V10H11v7H7V7z" fill="#fff"/></svg>
+              <span>npm</span>
+            </button>
+            <button class="install-tab" role="tab" aria-selected="false" aria-controls="panel-brew" id="tab-brew" data-tab="brew" tabindex="-1">
+              <svg class="install-tab-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 2C10.5 2 9 3 9 5c0 1.5.5 2.5 1 3.5L8 12c-.5 1-1 2-1 3 0 3 2 5 5 5s5-2 5-5c0-1-.5-2-1-3l-2-3.5c.5-1 1-2 1-3.5 0-2-1.5-3-3-3z" fill="#FFB454"/><rect x="10" y="18" width="4" height="3" rx="1" fill="#FFB454"/></svg>
+              <span>Homebrew</span>
+            </button>
+            <button class="install-tab" role="tab" aria-selected="false" aria-controls="panel-curl" id="tab-curl" data-tab="curl" tabindex="-1">
+              <svg class="install-tab-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="2" y="4" width="20" height="16" rx="3" stroke="currentColor" stroke-width="2"/><path d="M6 10l3 2-3 2M12 14h4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              <span>curl</span>
+            </button>
+          </div>
+          <div class="install-panels">
+            <div class="install-panel active" role="tabpanel" id="panel-npm" aria-labelledby="tab-npm" data-panel="npm">
+              <div class="install-cmd">
+                <span class="prompt-sigil">$</span>
+                <code class="install-cmd-text">npx snapback-tui install</code>
+                <button class="install-copy" aria-label="Copy command" data-copy="npx snapback-tui install">
+                  <svg class="install-copy-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2" stroke="currentColor" stroke-width="2"/><path d="M5 15V5a2 2 0 012-2h10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+                  <span class="install-copy-label">Copy</span>
+                </button>
+              </div>
+            </div>
+            <div class="install-panel" role="tabpanel" id="panel-brew" aria-labelledby="tab-brew" data-panel="brew" hidden>
+              <div class="install-cmd">
+                <span class="prompt-sigil">$</span>
+                <code class="install-cmd-text">brew install snapback</code>
+                <button class="install-copy" aria-label="Copy command" data-copy="brew install snapback">
+                  <svg class="install-copy-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2" stroke="currentColor" stroke-width="2"/><path d="M5 15V5a2 2 0 012-2h10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+                  <span class="install-copy-label">Copy</span>
+                </button>
+              </div>
+            </div>
+            <div class="install-panel" role="tabpanel" id="panel-curl" aria-labelledby="tab-curl" data-panel="curl" hidden>
+              <div class="install-cmd">
+                <span class="prompt-sigil">$</span>
+                <code class="install-cmd-text">curl -fsSL https://raw.githubusercontent.com/ilfroloff/snapback/main/scripts/install.sh | sh</code>
+                <button class="install-copy" aria-label="Copy command" data-copy="curl -fsSL https://raw.githubusercontent.com/ilfroloff/snapback/main/scripts/install.sh | sh">
+                  <svg class="install-copy-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2" stroke="currentColor" stroke-width="2"/><path d="M5 15V5a2 2 0 012-2h10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+                  <span class="install-copy-label">Copy</span>
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
+        <noscript>
+          <div class="install-noscript">
+            <div class="install-noscript-row"><span>npm</span> <code>npx snapback-tui install</code></div>
+            <div class="install-noscript-row"><span>Homebrew</span> <code>brew install snapback</code></div>
+            <div class="install-noscript-row"><span>curl</span> <code>curl -fsSL https://raw.githubusercontent.com/ilfroloff/snapback/main/scripts/install.sh | sh</code></div>
+          </div>
+        </noscript>
         <p class="alt-install">or build from source — see the README</p>
 
         <a class="cta" href={REPO}>View on GitHub</a>
@@ -339,6 +389,157 @@ const comparison = [
     margin: 10px 0 30px;
   }
 
+  /* Tabbed installation UI */
+  .install-tabs {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    max-width: 100%;
+  }
+  .install-tablist {
+    display: flex;
+    gap: 4px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 0;
+  }
+  .install-tab {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 16px;
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: var(--text-dim);
+    font-family: inherit;
+    font-size: 0.88rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: color 0.15s ease, border-color 0.15s ease;
+    margin-bottom: -1px;
+  }
+  .install-tab:hover {
+    color: var(--text);
+  }
+  .install-tab.active {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+  }
+  .install-tab:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+    border-radius: 4px 4px 0 0;
+  }
+  .install-tab-icon {
+    width: 18px;
+    height: 18px;
+    flex-shrink: 0;
+  }
+  .install-panels {
+    position: relative;
+  }
+  .install-panel {
+    display: none;
+  }
+  .install-panel.active {
+    display: block;
+  }
+  .install-cmd {
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-top: none;
+    border-radius: 0 0 8px 8px;
+    padding: 14px 16px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 0.95rem;
+    width: 100%;
+    overflow-x: auto;
+  }
+  .install-cmd-text {
+    white-space: nowrap;
+    flex: 1;
+    font-family: inherit;
+    background: none;
+    border: none;
+    padding: 0;
+    color: var(--text);
+    font-size: inherit;
+  }
+  .install-copy {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 10px;
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text-dim);
+    font-family: inherit;
+    font-size: 0.8rem;
+    cursor: pointer;
+    transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+    flex-shrink: 0;
+  }
+  .install-copy:hover {
+    color: var(--text);
+    border-color: var(--text-dim);
+    background: var(--bg);
+  }
+  .install-copy:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .install-copy.copied {
+    color: var(--accent);
+    border-color: var(--accent);
+  }
+  .install-copy-icon {
+    width: 16px;
+    height: 16px;
+    flex-shrink: 0;
+  }
+  .install-copy-label {
+    white-space: nowrap;
+  }
+  .install-noscript {
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    font-size: 0.9rem;
+  }
+  .install-noscript-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .install-noscript-row span {
+    color: var(--accent);
+    font-weight: 600;
+    min-width: 80px;
+  }
+  .install-noscript-row code {
+    font-family: inherit;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 4px 8px;
+    font-size: 0.88rem;
+    word-break: break-all;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .install-tab,
+    .install-copy {
+      transition: none;
+    }
+  }
+
   .cta {
     display: inline-block;
     background: var(--accent);
@@ -525,5 +726,174 @@ const comparison = [
     .compare-head span:first-child {
       display: none;
     }
+    .install-tablist {
+      flex-direction: column;
+      gap: 0;
+      border-bottom: none;
+    }
+    .install-tab {
+      border-bottom: none;
+      border-left: 2px solid transparent;
+      margin-bottom: 0;
+      margin-left: -1px;
+      padding: 12px 16px;
+      width: 100%;
+      justify-content: flex-start;
+    }
+    .install-tab.active {
+      border-left-color: var(--accent);
+    }
+    .install-tab:focus-visible {
+      border-radius: 0;
+    }
+    .install-cmd {
+      border-radius: 0 0 8px 8px;
+      border-top: none;
+      border-left: 1px solid var(--border);
+    }
+    .install-cmd-text {
+      font-size: 0.82rem;
+      white-space: normal;
+      word-break: break-all;
+    }
+    .install-noscript-row {
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 4px;
+    }
   }
 </style>
+
+<script>
+  (function () {
+    const container = document.querySelector("[data-install-tabs]");
+    if (!container) return;
+
+    const tabs = Array.from(container.querySelectorAll(".install-tab"));
+    const panels = Array.from(container.querySelectorAll(".install-panel"));
+    const copyButtons = Array.from(container.querySelectorAll(".install-copy"));
+
+    // Restore last-selected tab from localStorage
+    const STORAGE_KEY = "snapback-install-tab";
+    let storedTab = null;
+    try {
+      storedTab = localStorage.getItem(STORAGE_KEY);
+    } catch (_) {
+      // localStorage unavailable — ignore
+    }
+
+    function activateTab(tabName) {
+      tabs.forEach((tab) => {
+        const isActive = tab.dataset.tab === tabName;
+        tab.classList.toggle("active", isActive);
+        tab.setAttribute("aria-selected", String(isActive));
+        tab.tabIndex = isActive ? 0 : -1;
+      });
+      panels.forEach((panel) => {
+        const isActive = panel.dataset.panel === tabName;
+        panel.classList.toggle("active", isActive);
+        if (isActive) {
+          panel.removeAttribute("hidden");
+        } else {
+          panel.setAttribute("hidden", "");
+        }
+      });
+      try {
+        localStorage.setItem(STORAGE_KEY, tabName);
+      } catch (_) {
+        // localStorage unavailable — ignore
+      }
+    }
+
+    // Initialize from stored preference or default to npm
+    const initialTab = storedTab && tabs.some((t) => t.dataset.tab === storedTab)
+      ? storedTab
+      : "npm";
+    activateTab(initialTab);
+
+    // Tab click handler
+    tabs.forEach((tab) => {
+      tab.addEventListener("click", () => {
+        activateTab(tab.dataset.tab);
+        tab.focus();
+      });
+    });
+
+    // Keyboard navigation (arrow keys, Home, End)
+    container.querySelector(".install-tablist").addEventListener("keydown", (e) => {
+      const currentTab = document.activeElement;
+      if (!tabs.includes(currentTab)) return;
+
+      const currentIndex = tabs.indexOf(currentTab);
+      let nextIndex = currentIndex;
+
+      switch (e.key) {
+        case "ArrowRight":
+        case "ArrowDown":
+          nextIndex = (currentIndex + 1) % tabs.length;
+          e.preventDefault();
+          break;
+        case "ArrowLeft":
+        case "ArrowUp":
+          nextIndex = (currentIndex - 1 + tabs.length) % tabs.length;
+          e.preventDefault();
+          break;
+        case "Home":
+          nextIndex = 0;
+          e.preventDefault();
+          break;
+        case "End":
+          nextIndex = tabs.length - 1;
+          e.preventDefault();
+          break;
+        case "Enter":
+        case " ":
+          activateTab(currentTab.dataset.tab);
+          e.preventDefault();
+          return;
+        default:
+          return;
+      }
+
+      activateTab(tabs[nextIndex].dataset.tab);
+      tabs[nextIndex].focus();
+    });
+
+    // Copy button handler
+    copyButtons.forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const command = btn.dataset.copy;
+        if (!command) return;
+
+        const label = btn.querySelector(".install-copy-label");
+        const originalLabel = label ? label.textContent : "Copy";
+
+        try {
+          await navigator.clipboard.writeText(command);
+        } catch (_) {
+          // Fallback for older browsers / non-HTTPS
+          const textarea = document.createElement("textarea");
+          textarea.value = command;
+          textarea.style.position = "fixed";
+          textarea.style.opacity = "0";
+          document.body.appendChild(textarea);
+          textarea.select();
+          try {
+            document.execCommand("copy");
+          } catch (_) {
+            // Copy failed — silently ignore
+          }
+          document.body.removeChild(textarea);
+        }
+
+        btn.classList.add("copied");
+        if (label) label.textContent = "Copied!";
+
+        setTimeout(() => {
+          btn.classList.remove("copied");
+          if (label) label.textContent = originalLabel;
+        }, 2000);
+      });
+    });
+  })();
+</script>
