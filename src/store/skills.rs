@@ -50,6 +50,21 @@ const NAME_DESCRIPTION_SEPARATOR: char = ':';
 /// description alone, so the LAST occurrence is cut when the line ends with `)`.
 const AGENT_TOOLS_SUFFIX: &str = " (Tools: ";
 
+/// What a `/` row is, as far as snapback can tell: the three words the pick
+/// list's kind column can show. Decided on the catalog fetch's worker thread
+/// (`crate::command_kinds`), never here; the words themselves are written once,
+/// in `tui::view`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandKind {
+    /// A skill defined by a `skills/` folder snapback reads.
+    Skill,
+    /// A command defined by a `commands/` folder snapback reads.
+    Command,
+    /// claude flags it `builtin: true`: its built-in commands AND the skills it
+    /// ships (`/loop`, `/simplify`), which the reply does not tell apart.
+    BuiltIn,
+}
+
 /// One pick-list row's data: a command or agent name, and what claude says it
 /// does.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -58,6 +73,9 @@ pub struct ListingEntry {
     /// Already passed through [`normalize_description`]; `None` when the source
     /// gave none.
     pub description: Option<String>,
+    /// What the row is; `None` for an agent, a transcript entry and any command
+    /// no rule could name.
+    pub kind: Option<CommandKind>,
 }
 
 /// Everything the pick list can offer for one folder: `/` commands (skills
@@ -225,7 +243,11 @@ fn strip_tools_suffix(raw: &str) -> &str {
 
 fn into_entries(map: BTreeMap<String, Option<String>>) -> Vec<ListingEntry> {
     map.into_iter()
-        .map(|(name, description)| ListingEntry { name, description })
+        .map(|(name, description)| ListingEntry {
+            name,
+            description,
+            kind: None,
+        })
         .collect()
 }
 
@@ -242,6 +264,7 @@ mod tests {
         ListingEntry {
             name: name.to_owned(),
             description: description.map(str::to_owned),
+            kind: None,
         }
     }
 

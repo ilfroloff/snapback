@@ -40,6 +40,7 @@ use crate::agents::{self, AgentActivity, ReportedAgent};
 use crate::resume::ModelPick;
 use crate::search::SearchMode;
 use crate::store::preview::{self, FoldRegion, LinkRegion, SubagentRegion};
+use crate::store::skills::CommandKind;
 use crate::store::subagents::{Subagent, SubagentRecord, SubagentStatus};
 use crate::store::{lineage, FailedTask};
 
@@ -2498,6 +2499,33 @@ const COMPLETION_COLUMN_GAP: u16 = 2;
 /// cannot push every description off the box.
 const COMPLETION_NAME_MAX_PERCENT: u16 = 50;
 
+/// The words of the pick list's kind column: the ONE place they are written.
+/// Rows store [`CommandKind`], never the text.
+const KIND_SKILL: &str = "skill";
+const KIND_COMMAND: &str = "command";
+const KIND_BUILT_IN: &str = "built-in";
+
+/// What the kind column says of `kind`.
+fn command_kind_word(kind: CommandKind) -> &'static str {
+    match kind {
+        CommandKind::Skill => KIND_SKILL,
+        CommandKind::Command => KIND_COMMAND,
+        CommandKind::BuiltIn => KIND_BUILT_IN,
+    }
+}
+
+/// The kind column's width: the widest of its three words, in terminal columns
+/// (`unicode-width`, as the renderer counts), not a literal that a reworded word
+/// would leave stale.
+fn completion_kind_width() -> u16 {
+    [KIND_SKILL, KIND_COMMAND, KIND_BUILT_IN]
+        .into_iter()
+        .map(UnicodeWidthStr::width)
+        .max()
+        .and_then(|width| u16::try_from(width).ok())
+        .unwrap_or(0)
+}
+
 /// Where the pick list is drawn: directly ABOVE `compose_area` (same x and
 /// width), `min(rows, COMPLETION_VISIBLE_ROWS)` rows tall plus its two borders,
 /// clipped to `bounds` -- fewer rows when the room above is short, `None` when
@@ -2522,15 +2550,18 @@ fn completion_rect(compose_area: Rect, rows: usize, bounds: Rect) -> Option<Rect
 /// not only the rows in view, so the columns stay put while the list scrolls —
 /// counted in terminal columns (`unicode-width`, as the renderer counts). Capped at
 /// [`COMPLETION_NAME_MAX_PERCENT`] of `inner_width` once any candidate has a
-/// description, otherwise at `inner_width`. Pure, so the widths are assertable
-/// without a terminal.
+/// description or a kind, otherwise at `inner_width`. Pure, so the widths are
+/// assertable without a terminal.
 fn completion_name_width(candidates: &[Candidate], inner_width: u16) -> u16 {
     let widest = candidates
         .iter()
         .map(|c| UnicodeWidthStr::width(c.label.as_str()))
         .max()
         .unwrap_or(0);
-    let cap = if candidates.iter().any(|c| c.description.is_some()) {
+    let cap = if candidates
+        .iter()
+        .any(|c| c.description.is_some() || c.kind.is_some())
+    {
         let share = u32::from(inner_width) * u32::from(COMPLETION_NAME_MAX_PERCENT) / 100;
         u16::try_from(share).unwrap_or(inner_width)
     } else {
@@ -2542,7 +2573,11 @@ fn completion_name_width(candidates: &[Candidate], inner_width: u16) -> u16 {
 /// Draw the compose box's pick list, when one is showing, above `compose_area`:
 /// an untitled table (the list mixes kinds — files with agents, skills with
 /// commands — so no one title is true), the name on the left and its description
-/// `DIM` on the right, cut at the box's inner edge.
+/// `DIM` on the right, cut at the box's inner edge. When some row has a kind
+/// ([`Candidate::kind`], a `/` row), a `DIM` kind column sits between the two,
+/// [`completion_kind_width`] wide and blank on a row without one; it takes its
+/// width from the description's half, and no list without a kind (an `@` list)
+/// gets it. The cell is never matched or marked.
 ///
 /// Reads only the cached `completion.visible` — the render path performs no I/O
 /// and no matching: each row's marks were set when the list was filtered, and
@@ -2563,10 +2598,16 @@ fn render_completion_list(frame: &mut Frame, compose: &ComposeState, compose_are
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
     let name_width = completion_name_width(visible, block.inner(rect).width);
-    let widths: &[Constraint] = if visible.iter().any(|c| c.description.is_some()) {
-        &[Constraint::Length(name_width), Constraint::Fill(1)]
-    } else {
-        &[Constraint::Length(name_width)]
+    let kind_width = completion_kind_width();
+    let has_kind = visible.iter().any(|c| c.kind.is_some());
+    let widths: &[Constraint] = match (has_kind, visible.iter().any(|c| c.description.is_some())) {
+        (true, _) => &[
+            Constraint::Length(name_width),
+            Constraint::Length(kind_width),
+            Constraint::Fill(1),
+        ],
+        (false, true) => &[Constraint::Length(name_width), Constraint::Fill(1)],
+        (false, false) => &[Constraint::Length(name_width)],
     };
     // The row ratatui keeps in view: it clamps the selection to the last row too.
     let highlight = compose
@@ -2580,14 +2621,22 @@ fn render_completion_list(frame: &mut Frame, compose: &ComposeState, compose_are
             } else {
                 (&[], &[])
             };
-        TableRow::new([
-            completion_cell(&candidate.label, label_marks, Style::default()),
-            completion_cell(
-                candidate.description.as_deref().unwrap_or_default(),
-                description_marks,
-                Style::default().add_modifier(Modifier::DIM),
-            ),
-        ])
+        let dim = Style::default().add_modifier(Modifier::DIM);
+        let mut cells = vec![completion_cell(
+            &candidate.label,
+            label_marks,
+            Style::default(),
+        )];
+        if has_kind {
+            let word = candidate.kind.map_or("", command_kind_word);
+            cells.push(completion_cell(word, &[], dim));
+        }
+        cells.push(completion_cell(
+            candidate.description.as_deref().unwrap_or_default(),
+            description_marks,
+            dim,
+        ));
+        TableRow::new(cells)
     });
     let table = Table::new(rows, widths.iter().copied())
         .block(block)
@@ -13216,6 +13265,115 @@ mod tests {
                 "row {other} is not highlighted"
             );
         }
+    }
+
+    /// A `/` list with a kind on some row draws a `DIM` kind column BETWEEN the
+    /// name and the description: the same column on every row, the three words'
+    /// widest wide, blank (not shifted) on an unlabelled row, never marked by the
+    /// search highlight, and covered by the highlighted row's `REVERSED`. An `@`
+    /// list (no kind anywhere) keeps its two columns, the description a gap past
+    /// the name column.
+    #[test]
+    fn a_kind_column_sits_between_the_name_and_the_description_dim() {
+        const DESCRIPTION: &str = "does it";
+        let (w, h) = DOCK_BOARD;
+        let drawn = |rows: Vec<Candidate>, highlight: usize| {
+            let mut app = App::new(
+                vec![sample_session()],
+                Scope::All,
+                PathBuf::from("/tmp/launch"),
+            );
+            app.set_pane_layout(DOCK_LAYOUT);
+            let mut compose = ComposeState::new_reply("sess-normal-1".to_string(), None);
+            compose.completion.visible = Some(rows);
+            compose.completion.highlight = highlight;
+            app.compose = Some(compose);
+            drawn_board(&mut app, w, h)
+        };
+        let with_kind = |label: &str, kind: Option<CommandKind>| Candidate {
+            kind,
+            // A mark on the NAME: the search highlight must stay off the kind cell.
+            label_marks: vec![1],
+            ..pick(label, Some(DESCRIPTION))
+        };
+        let buffer = drawn(
+            vec![
+                with_kind("/alpha", Some(CommandKind::Skill)),
+                with_kind("/beta", None),
+                with_kind("/gamma", Some(CommandKind::BuiltIn)),
+            ],
+            0,
+        );
+        let find = |needle: &str| (0..h).find(|&y| full_row_text(&buffer, y, w).contains(needle));
+        let (alpha, beta, gamma) = (
+            find("/alpha").expect("the first row is drawn"),
+            find("/beta").expect("the second row is drawn"),
+            find("/gamma").expect("the third row is drawn"),
+        );
+        let (left, right) = drawn_pick_list_columns(&buffer, alpha, "/alpha", w);
+        let name_x = left + 1;
+        let kind_width = completion_kind_width();
+        assert_eq!(kind_width, 8, "`built-in` is the widest of the three words");
+
+        // The name column is the widest label; the kind column follows a gap past
+        // it and the description a gap past the kind column, on every row.
+        let kind_x = column_of(&buffer, alpha, w, "skill");
+        assert_eq!(
+            kind_x,
+            name_x + u16::try_from("/alpha".width()).expect("short") + COMPLETION_COLUMN_GAP
+        );
+        assert_eq!(column_of(&buffer, gamma, w, "built-in"), kind_x);
+        for row in [alpha, beta, gamma] {
+            assert_eq!(
+                column_of(&buffer, row, w, DESCRIPTION),
+                kind_x + kind_width + COMPLETION_COLUMN_GAP,
+                "the description starts after the kind column, even on a blank cell (row {row})"
+            );
+        }
+        let cell = |x: u16, y: u16| buffer.cell((x, y)).expect("a cell inside the board");
+        // DIM on a labelled row; blank and DIM-or-plain-but-empty on the other.
+        assert!(cell(kind_x, gamma).modifier.contains(Modifier::DIM));
+        assert!(cell(kind_x, gamma).fg != MATCH_HIGHLIGHT_STYLE.fg.expect("a colour"));
+        assert!(
+            (kind_x..kind_x + kind_width).all(|x| cell(x, beta).symbol() == " "),
+            "an unlabelled row has a blank cell"
+        );
+        // The highlighted row (alpha) is REVERSED across its kind cell too.
+        assert!(cell(kind_x, alpha).modifier.contains(Modifier::REVERSED));
+        assert!(!cell(kind_x, gamma).modifier.contains(Modifier::REVERSED));
+        assert!(
+            !cell(kind_x, gamma).modifier.contains(Modifier::BOLD),
+            "the search highlight never marks the kind cell"
+        );
+        assert_eq!(cell(right, gamma).symbol(), "│", "the border survives");
+
+        // No kind anywhere: today's two columns, the description a gap past the name.
+        let plain = drawn(
+            vec![pick("/alpha", Some(DESCRIPTION)), pick("/beta", None)],
+            0,
+        );
+        let plain_row = (0..h)
+            .find(|&y| full_row_text(&plain, y, w).contains("/alpha"))
+            .expect("the plain list is drawn");
+        assert_eq!(
+            column_of(&plain, plain_row, w, DESCRIPTION),
+            name_x + u16::try_from("/alpha".width()).expect("short") + COMPLETION_COLUMN_GAP,
+            "a list without a kind has no kind column"
+        );
+    }
+
+    /// With a kind on some row the name column keeps its half-width cap even
+    /// when no row has a description, so the kind column is never starved.
+    #[test]
+    fn a_kind_alone_still_caps_the_name_column() {
+        let kinded = Candidate {
+            kind: Some(CommandKind::Command),
+            ..pick("/a-name-wider-than-half-of-the-box", None)
+        };
+        assert_eq!(
+            completion_name_width(&[kinded], 40),
+            40 * COMPLETION_NAME_MAX_PERCENT / 100
+        );
     }
 
     /// A `Ctrl-N` background draft draws the same list, in the same place, and

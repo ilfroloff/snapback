@@ -3177,7 +3177,9 @@ either.
 Code: `src/tui/complete.rs` (the pure core), `src/tui/compose.rs` (the source, the
 refresh, the fetch request), `src/claude_catalog.rs` (claude's list),
 `src/claude_trust.rs` (which form of claude's list a folder gets),
-`src/store/skills.rs` (a reply's `@` agents until claude's list lands).
+`src/command_kinds.rs` (what kind each `/` row is),
+`src/store/skills.rs` (a reply's `@` agents until claude's list lands, and
+`CommandKind`, the kind a row carries).
 
 EVERY compose box — the `Ctrl-R` reply, the `Ctrl-F` fork and the `Ctrl-N` draft — offers the same
 `/` and `@` list, through the same editor, key router, driver and renderer, and
@@ -3227,6 +3229,8 @@ narrow it by the [rule below](#how-the-letters-narrow-the-list):
   as "skills" or "files" would be false for a list that mixes kinds. What the
   query matched is marked in the board's own label highlight
   ([below](#how-the-letters-narrow-the-list)).
+- A `/` row may also carry a KIND, drawn in a `DIM` column between the name and
+  the description ([below](#the-kind-column)). An `@` list has none.
 - The list opens only with the caret at the END of the token. While open,
   `Up`/`Down` choose (wrapping), `Enter`/`Tab` pick, `Esc` closes only the list. A
   closed token stays closed while the caret stays at its end (typing more of it
@@ -3249,7 +3253,7 @@ the list reads, in order of precedence (a `/` reads the first row alone):
 
 | Source | Used when | What it holds |
 | --- | --- | --- |
-| claude's catalog (`App::catalogs`) | it has landed for the folder | claude's own `initialize` handshake answer: commands (skills and built-ins, minus the built-ins claude hides from its own menu) and agents, with descriptions. It includes the repository's own `.claude/` skills, commands and agents only where claude TRUSTS the folder; anywhere else the fetch passes `--setting-sources user`, so the list is the user's own, bundled and built-in items alone ([below](#which-settings-the-fetch-loads)) |
+| claude's catalog (`App::catalogs`) | it has landed for the folder | claude's own `initialize` handshake answer: commands (skills and built-ins, minus the built-ins claude hides from its own menu, each with the [kind](#the-kind-column) the worker gave it) and agents, with descriptions. It includes the repository's own `.claude/` skills, commands and agents only where claude TRUSTS the folder; anywhere else the fetch passes `--setting-sources user`, so the list is the user's own, bundled and built-in items alone ([below](#which-settings-the-fetch-loads)) |
 | the session's transcript | a reply's or fork's top-level `@`, until the catalog lands or when its fetch failed | AGENTS only: `store::skills::read_listing` of that box's own session file (its [`agent_listing_delta` records](#jsonl-record-model)), read at most once per draft, and only for a top-level `@`. A `/` never reads it, and an `@` with a folder part lists no agents |
 | none | otherwise, until the catalog lands or when its fetch failed | `/` lists nothing in any box, and a draft's `@` lists no agents; files and folders show at once in all three, a local read |
 
@@ -3300,6 +3304,46 @@ is never evicted — one ~34 KB entry per distinct folder composed in — and ne
 reaches disk. It is keyed by the path as given (`Session.cwd` from the file, the
 canonical launch dir), so two spellings of one folder cost one extra fetch, never
 a wrong list, and a skill created mid-run is listed after a restart.
+
+#### The kind column
+
+A `/` row says what it is: `built-in`, `skill` or `command`. claude's reply names
+no folder, so the kind is decided on the catalog fetch's worker, right after the
+reply, by `command_kinds::label_commands` with the trust verdict the SAME fetch
+already holds (`claude_catalog::fetch_in`; a second read could give project
+labels to a folder whose fetch skipped project items). One precedence, asked of
+each row's name:
+
+1. the reply's own `builtin: true` (`claude_catalog::reply_kind`, set on the entry
+   the dedup keeps): `BuiltIn`. It also covers the skills claude ships
+   (`/loop`, `/simplify`), which the reply does not tell apart from `/clear`, and
+   no folder lookup overrides it;
+2. a skill the readable folders define: `Skill`;
+3. a command they define: `Command`;
+4. otherwise no label. The row is never wrongly named: plugin, managed and synced
+   skills are not read, so they stay blank.
+
+SKILL FIRST, because claude loads every skills folder before every commands folder
+and keeps the first entry of a name; checking commands first would mislabel real
+clashes. The one wrong label left is a name a read `commands/` file and an unread
+skill both define, which shows `command`. The folders are the user's own
+(`claude_settings::user_config_dir`, so `$CLAUDE_CONFIG_DIR` is honored) and,
+only under `FolderTrust::Trusted`, each project `.claude/` from the compose
+folder up to the first ancestor holding a `.git` entry (found on disk, no `git`
+command) or to just below home. The name rules, the caps (`MAX_ENTRIES`,
+`MAX_COMMAND_DEPTH`, `MAX_SKILL_HEAD_BYTES`) and the facts they rest on:
+[CLAUDE_CLI.md](CLAUDE_CLI.md#which-folder-a--row-came-from). Reads are FAIL-SOFT:
+a missing or unreadable folder, a bad frontmatter or a cap only leaves a row
+blank. A linked worktree's own `.git` file stopping claude's walk is NOT verified.
+
+The view draws the column only when some row of the list carries a kind. Its
+width is the widest of the three words in terminal columns, and it comes out of
+the description's half: the name keeps its 50% cap, so at 80 columns the
+description keeps at least 27. An unlabelled row has a blank cell, the cell is
+`DIM`, the search highlight never marks it (the matcher never sees it: a query
+of `skill` matches no name or description) and the selected row's `REVERSED`
+covers it. The three words are written once, in `view.rs`; rows store the
+`CommandKind`.
 
 #### How the letters narrow the list
 

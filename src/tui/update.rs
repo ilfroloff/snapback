@@ -5052,6 +5052,7 @@ mod tests {
             .map(|name| ListingEntry {
                 name: (*name).to_owned(),
                 description: None,
+                kind: None,
             })
             .collect();
         deliver_catalog(
@@ -5123,6 +5124,7 @@ mod tests {
                 .map(|(name, description)| ListingEntry {
                     name: (*name).to_owned(),
                     description: Some((*description).to_owned()),
+                    kind: None,
                 })
                 .collect()
         };
@@ -13472,6 +13474,7 @@ mod tests {
             commands: vec![crate::store::skills::ListingEntry {
                 name: "sbping".to_string(),
                 description: Some("answers pong".to_string()),
+                kind: None,
             }],
             agents: Vec::new(),
         };

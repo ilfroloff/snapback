@@ -2110,6 +2110,7 @@ mod tests {
             commands: vec![crate::store::skills::ListingEntry {
                 name: "sbping".to_string(),
                 description: None,
+                kind: None,
             }],
             agents: Vec::new(),
         };

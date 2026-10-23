@@ -58,6 +58,11 @@ The JSONL format is external and undocumented, so treat every read as hostile:
   new-session answer collapses to `None`, which a `Ctrl-N` draft labels as plain
   `model: default`, and the restore-override answer to `false`, which leaves a
   reply naming its session's own model — each true, if less specific.
+- The kind column's folder read (`command_kinds`) is the same again: a missing or
+  unreadable folder, a non-UTF-8 name, a bad or unclosed frontmatter, a `SKILL.md`
+  that is not a regular file (a FIFO is never opened) or a hit cap leaves a row
+  UNLABELLED. The direction is toward no label, never a guess, and an UNTRUSTED
+  verdict reads no project folder.
 - The compose pick list's two sources are the same again. claude's `initialize`
   handshake reply (`claude_catalog::parse_initialize_response`) and a transcript's
   `agent_listing_delta` records (`store::skills`, a reply's `@` agents only) are
@@ -1071,7 +1076,11 @@ is a blocking file read too: claude's workspace-trust verdict for the folder
 It stays inside the
 worker, where `spawn_fetch_in` hands it in as `trust_of`; hoisting it onto the
 spawning thread is the regression
-`children::the_trust_read_runs_on_the_fetch_worker` pins. The child
+`children::the_trust_read_runs_on_the_fetch_worker` pins. So is the LAST one, run
+after the reply: the skills and commands folder reads that name each row's kind
+(`command_kinds::label_commands`, handed in as `label`), which take the verdict
+`fetch_in` already holds and never read the trust twice
+(`children::the_kind_labeller_runs_on_the_worker_with_the_fetch_verdict`). The child
 is the first one-shot here whose run is BOUNDED by snapback rather than by the
 child. It is spawned as the leader of a process group of its own, and
 `CATALOG_FETCH_TIMEOUT` covers the reply, the close of stdout and the exit. Past
@@ -1513,12 +1522,13 @@ CADENCES and LIMITS, so a retune knows what it is next to:
 | `store::subagents` | `META_MAX_BYTES` (64 KiB — the largest of 1811 meta files measured 264 bytes on 2026-10-11, so the cap refuses only a file that is not a meta and bounds what a hostile one can make a render read) · `TAIL_MAX_BYTES` (64 KiB — the end of a transcript the background subagent refresh reads, only for one that can be running; every measured tail held a complete turn, 2026-10-12) · `HEAD_MAX_BYTES` (64 KiB — the head it reads for a launch time; the largest first record of 2,049 measured 28,646 bytes, 2026-10-13) · `RUNNING_WINDOW` (10 min — how long an unfinished subagent, counting its sub-subagents' writes, may stay silent and still read as running; at 10 minutes 2.9% of real runs show a longer silence while still running, 2026-10-12) |
 | `send` | `SEND_ERROR_MAX` (200) · `COMPOSE_PROMPT_MAX_BYTES` (the most bytes one compose prompt argv element may be, by OS: Linux `LINUX_MAX_ARG_STRLEN` 131,072 less the NUL = 131,071; macOS `MACOS_ARG_MAX` 1 MiB less `MACOS_ARG_ALLOWANCE` 256 KiB = 786,432; any other target takes the Linux value — measured 2026-10-30; a unix-only test spawns a program with an argument of exactly this length, so a retune past the real ceiling fails; the send refusal's text, `prompt_too_long_refusal`, is pinned to fit the 80-column status row at its widest) |
 | `claude_catalog` | `CATALOG_FETCH_TIMEOUT` (10 s — bounds the reply, the close of stdout AND the exit; the reply measured 0.21–0.22 s) · `CATALOG_READER_GRACE` (500 ms — how long a timed-out fetch waits, after the group and child kills, for its stdout reader to see EOF; the worker's worst case is the timeout plus this) · `CATALOG_EXIT_POLL` (20 ms — claude exits 25–50 ms after its stdin's EOF) |
+| `command_kinds` | `MAX_ENTRIES` (5000 — directory entries one read looks at over every folder together; real folders hold tens to ~100) · `MAX_COMMAND_DEPTH` (8 — ends a symlink cycle under `commands/`) · `MAX_SKILL_HEAD_BYTES` (16 KiB — the frontmatter head read of a `SKILL.md`) |
 | `claude_move` | `MOVE_TIMEOUT` (30 s — the answer, the close of stdout AND the exit together; a move measured ~0.7 s end to end on a small transcript at claude 2.1.291, and `-r` loads the whole transcript first, so the cap only ever cuts off a stuck child) |
 | `claude_trust` | `GIT_POINTER_MAX_BYTES` (8192 — a git pointer file holds one path line, and a path is at most `PATH_MAX`, so a longer file is not a pointer and gets the untrusted-direction fallback rather than a whole read) |
 | `tui::complete` | `COMPLETION_MAX_DIR_ENTRIES` (2000 — one keystroke's worst read of a huge folder) · `COMPLETION_MAX_TREE_ENTRIES` (25000 — the whole `@` walk, breadth first, no depth cap: a depth cap hid a 9-level monorepo path) · `COMPLETION_VISIBLE_ROWS` (8) |
 | `tui::app` | `PREVIEW_WHEEL_STEP` (2) · `LIST_WHEEL_STEP` (1) · `STATUS_DWELL_TICKS` (16) · `MIN_PANE_WIDTH` (15) · the list's share of the body per split `PaneLayout` stop: `PREVIEW_WIDE_LIST_PERCENT` (25) / `DEFAULT_LIST_PERCENT` (48) / `LIST_WIDE_LIST_PERCENT` (75) · a held drag's autoscroll: `AUTOSCROLL_FRAME` (33 ms, the run loop's wait deadline while one is held past the edge — §7's one exception to animating from the tick) / `AUTOSCROLL_PAGE_PERIOD` (1 s, a page per row past the edge) / `AUTOSCROLL_MAX_DISTANCE` (4) |
 | `tui::update` | `PASTE_MAX_CHARS` (4096 — the BOARD query's paste cap in chars; a compose paste is capped by `send::COMPOSE_PROMPT_MAX_BYTES` instead) |
-| `tui::view` | `BLINK_TICKS` (2) · `CHILD_ID_CHARS` (8) · `MATCH_JUMP_LEAD_DIVISOR` (3 — a jumped-to match parks `h / 3` rows down) · `WIDE_GLYPH_COLUMNS` (2) · `LINK_PROBE_BYTE_BUDGET` (131_072) · `SELECTION_COPY_CHUNK_ROWS` (256 — the rows a release copy redraws per off-screen buffer, a BOUND on one buffer rather than a tune) · `WRAP_ROOM_WIDTHS` (3 — how many transcript widths the scratch of `render_wrapped_clipped` spans, since ratatui's wrapper can build a row wider than the pane; every frame pays for it) · the layout rows `PREVIEW_BANNER_ROWS` / `BOARD_CHROME_ROWS` / `COMPOSE_*` / `MODAL_WIDTH` / `MODAL_*_CHROME_ROWS` / `MODAL_BORDER_ROWS` / `MODAL_BORDER_COLS` / `MODAL_LIST_MAX_ROWS` (12 — the most CHOICES a `List` picker offers before it scrolls, so an overlay stays an overlay on a tall terminal; a wrapped row's extra lines are paid on top, see [§5](#5-selection-and-scroll-survive-reloads)) · the preview's running list: `RUNNING_LIST_MAX_ROWS` (5 — the subagents it gives a row before a `+N more` line; at most 5 ran at once in 185 of 189 measured sessions, 2026-10-13) / `RUNNING_LIST_PANE_SHARE` (2 — the whole list takes at most half the rows under the pinned row, else it shrinks to one line) · the compose pick list's `COMPLETION_BORDER_ROWS` / `COMPLETION_COLUMN_GAP` (2 — the table's only separator) / `COMPLETION_NAME_MAX_PERCENT` (50 — descriptions keep the other half of the box) |
+| `tui::view` | `BLINK_TICKS` (2) · `CHILD_ID_CHARS` (8) · `MATCH_JUMP_LEAD_DIVISOR` (3 — a jumped-to match parks `h / 3` rows down) · `WIDE_GLYPH_COLUMNS` (2) · `LINK_PROBE_BYTE_BUDGET` (131_072) · `SELECTION_COPY_CHUNK_ROWS` (256 — the rows a release copy redraws per off-screen buffer, a BOUND on one buffer rather than a tune) · `WRAP_ROOM_WIDTHS` (3 — how many transcript widths the scratch of `render_wrapped_clipped` spans, since ratatui's wrapper can build a row wider than the pane; every frame pays for it) · the layout rows `PREVIEW_BANNER_ROWS` / `BOARD_CHROME_ROWS` / `COMPOSE_*` / `MODAL_WIDTH` / `MODAL_*_CHROME_ROWS` / `MODAL_BORDER_ROWS` / `MODAL_BORDER_COLS` / `MODAL_LIST_MAX_ROWS` (12 — the most CHOICES a `List` picker offers before it scrolls, so an overlay stays an overlay on a tall terminal; a wrapped row's extra lines are paid on top, see [§5](#5-selection-and-scroll-survive-reloads)) · the preview's running list: `RUNNING_LIST_MAX_ROWS` (5 — the subagents it gives a row before a `+N more` line; at most 5 ran at once in 185 of 189 measured sessions, 2026-10-13) / `RUNNING_LIST_PANE_SHARE` (2 — the whole list takes at most half the rows under the pinned row, else it shrinks to one line) · the compose pick list's `COMPLETION_BORDER_ROWS` / `COMPLETION_COLUMN_GAP` (2 — the table's only separator) / `COMPLETION_NAME_MAX_PERCENT` (50 — descriptions keep the other half of the box) / the kind column's words `KIND_SKILL` / `KIND_COMMAND` / `KIND_BUILT_IN`, whose widest sets its width |
 
 Add a new tunable the same way. The rule is not only about numbers — a literal
 with a meaning gets a name whatever its type: the undocumented `claude` wire
@@ -1526,7 +1536,7 @@ tokens (`agents::KIND_*` / `QUALIFIER_*`; `claude_catalog`'s `CATALOG_REQUEST_ID
 `CATALOG_SETTINGS`, `USER_SETTING_SOURCES`, the git-prefetch switch
 `DISABLE_GIT_INSTRUCTIONS_ENV` / `DISABLE_GIT_INSTRUCTIONS_ON`, `CLAUDE_PROGRAM`,
 `CONTROL_RESPONSE_MARKER`, the `process_group` argument `NEW_PROCESS_GROUP` and
-the pinned built-in names `CLAUDE_HIDDEN_BUILTINS`; `claude_move`'s
+the pinned built-in names `CLAUDE_HIDDEN_BUILTINS`; `command_kinds`' folder and file names `SKILLS_SUBDIR` / `COMMANDS_SUBDIR` / `SKILL_FILE`; `claude_move`'s
 `MOVE_REQUEST_ID`, `SET_CWD_SUBTYPE`, `MOVE_SETTINGS` and the answer tokens
 `SUBTYPE_SUCCESS` / `STATUS_OK` / `STATUS_NEEDS_TRUST` / `STATUS_REJECTED`;
 `claude_trust`'s record and pointer names — `GLOBAL_CONFIG_FILE`,
