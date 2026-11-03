@@ -460,6 +460,14 @@ says so plainly if Claude Code had a complaint (an agent name it doesn't
 recognize, for instance, starts the session *without* that agent — snapback tells
 you rather than reporting a clean start).
 
+**Claude Code's background-agent status line has a token cost.** Starting with Claude Code 2.1.232 (Aug 2026), interactive sessions that have background agents enabled re-send each agent's full transcript to that agent's own model roughly every 30 seconds. The only purpose of that side query is to refresh the three-to-five-word `agent_summary` line shown in Claude Code's agents panel. There is no official off switch as of Nov 2026. User measurements (not Anthropic-published figures) in subagent-heavy sessions put the extra traffic at about 15–26 % of requests and of the spend estimate; on a subscription that mostly eats rate-limit headroom. The behavior is documented in the Flamerix AI gist [`no-agent-summary.js`](https://gist.github.com/flamerix-ai/c3905705cc4205e5de3011fa2e74efce) (MIT, tested on Linux and macOS) and in Claude Code issue [#86879](https://github.com/anthropics/claude-code/issues/86879).
+
+The gist works as an unofficial, third-party opt-out: a Bun `--preload` script installed by exporting `BUN_OPTIONS=--preload=<absolute path>` in your shell. It suppresses the summary timer without patching the `claude` binary. It is not affiliated with Anthropic, it is MIT-licensed © Flamerix AI, and its own disclaimer says you are responsible for checking Claude Code's terms of service and deciding whether the risk is acceptable.
+
+Because snapback launches every `claude` child — resume/attach hand-offs, `Ctrl-N` `--bg` launches, headless quick replies and forks, catalog fetches — with the environment it inherited, it never sanitizes or overrides env. A globally installed hook therefore automatically reaches every `claude` process snapback starts, including the daemon a `--bg` launch may start. snapback neither bundles, installs, nor configures the hook, and its own write footprint is unchanged: it still only writes the hidden-session list.
+
+The hook is fail-open: it matches source-text anchors inside a closed-source bundle, so any Claude Code update can silently undo it. Re-run the gist's "Verify" steps after each update. The visible sign that it is active is that the per-agent status line in Claude Code's panel stops updating. snapback's own headless operations (`claude -p` and control requests) do not arm the summary timer by default, according to the gist's tests and Claude Code issue [#105981](https://github.com/anthropics/claude-code/issues/105981), so the hook mainly helps interactive sessions and background agents hosted by the daemon.
+
 **Quick reply without leaving the board.** Sometimes you just want to ask
 yesterday's session a fast question. `Ctrl-R` opens a compose box for the selected
 session and sends your message with a one-shot `claude -p` — it replays the full
