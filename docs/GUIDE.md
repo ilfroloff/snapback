@@ -57,7 +57,7 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | `Backspace` | Delete the query character before the cursor |
 | `Alt+Backspace` (`⌥⌫`) / `Ctrl-W` / `Alt+H` | Delete the query **word** before the cursor — one whole search term, so a path or a branch name goes in a single press instead of character by character (`Backspace` alone still takes one character); whatever follows the cursor stays. All three keys do the same thing, because which of them your terminal actually sends depends on how it treats **Option**; they are also the same three the reply, fork and draft boxes word-delete on, so the gesture is bound wherever you type. What a press *cuts* differs on purpose: on the board it takes a whole search term, so `feature/fold-fork-lineages` goes in one press, while in a reply, fork or draft box the cut stops at punctuation and takes only `lineages` |
 | any printable char | Type to search, at the cursor |
-| paste (`Cmd`/`Ctrl-V`, middle-click) | Your terminal's own paste, taken as **text**: into a compose or draft box at the cursor, **newlines intact** (no more sending just the first line); on the board, into the query at its cursor with newlines as spaces. It never sends, resumes, or confirms |
+| paste (`Cmd`/`Ctrl-V`, middle-click) | Your terminal's own paste, taken as **text**: into a compose or draft box at the cursor, **newlines intact** (no more sending just the first line), up to the size one `claude` argument can be (about 128 KB on Linux, 768 KB on macOS; a longer paste is cut and says so, and a longer message — typed, or built up from several pastes — is refused, with the box and your text kept, on `Enter` in any box and on `Ctrl-O` in a fork or draft box); on the board, into the query at its cursor with newlines as spaces, up to 4,096 characters. It never sends, resumes, or confirms |
 | `Esc` | Clear the search query; with nothing typed, leave a subagent's transcript for the session's own; with neither, quit |
 | `F1`, `Ctrl-X ?`, `Ctrl+Shift+/` (`Ctrl-?`) | Open the **full key map** as a table in a modal; `↑`/`↓` (or `k`/`j`)/`PgUp`/`PgDn`/`Home`/`End` and the mouse wheel scroll it; `Esc`, `Ctrl-C`, `F1` or `Ctrl+Shift+/` closes it (`Ctrl-X ?` only opens it — inside the modal the leader chord is inert). It owns the keyboard like every modal. `Ctrl-X ?` (two plain keys) works in every terminal and `F1` in most (GNOME Terminal keeps it for its own Help, and a Mac laptop keyboard needs `Fn`+`F1`); `Ctrl+Shift+/` often cannot be delivered at all (many terminals send `Ctrl-?` as Backspace), and without the kitty keyboard protocol it is indistinguishable from `Ctrl-/`, so that and `Ctrl-?` open it where they arrive |
 | `Ctrl-C` | Quit from the board; while a modal, a confirmation, the key map or a pending `Ctrl-X` chord is open it closes or cancels that instead, and in a compose box it never quits (`Esc` cancels the box) |
@@ -570,7 +570,9 @@ cooking…** until its answer lands, `Enter` on it is refused until then (the
 session you forked resumes as usual), and the status line reports what it cost. Claude Code's own session picker leaves
 `claude -p` sessions out, so this is where you find such a fork. Like a quick
 reply it can't stop to ask you for a permission, and it needs a message: an empty
-`Enter` reminds you that `Ctrl-O` forks without one. `Ctrl-O` forks interactively
+`Enter` reminds you that `Ctrl-O` forks without one, and a message longer than one
+`claude` argument can be is refused on `Enter` and `Ctrl-O` alike, the box kept
+(see the paste row above). `Ctrl-O` forks interactively
 instead, handing you the terminal in the new copy. Either way the fork is named
 `fork: ` plus the first line of your message (or the session's own label, for an
 empty box), which is what keeps it under the session it came from.

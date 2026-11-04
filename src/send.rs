@@ -627,6 +627,71 @@ pub struct InterruptRequest {
     pub session_id: String,
 }
 
+/// Linux's cap on ONE argv element, `MAX_ARG_STRLEN`: 32 pages of 4 KiB, counting
+/// the terminating NUL, so an argument may be one byte shorter. Measured 2026-10-30
+/// in a `node:24-alpine` arm64 container: a 131,071-byte argument starts, 131,072
+/// fails with `E2BIG`.
+const LINUX_MAX_ARG_STRLEN: usize = 32 * 4 * 1024;
+
+/// What macOS lets ALL arguments and the environment add up to (`getconf ARG_MAX`).
+/// There is no per-argument limit, only this shared total. Measured 2026-10-30 on
+/// Darwin 27.0.0: a 1,040,000-byte argument started, a 1,048,576-byte one failed.
+const MACOS_ARG_MAX: usize = 1024 * 1024;
+
+/// What a macOS prompt leaves for the environment and the other arguments. Generous
+/// on purpose: the measured environment was 3,360 bytes, and a fork's `--name` adds
+/// at most a few hundred bytes: `FORK_NAME_PREFIX` plus `resume::FORK_NAME_MAX_CHARS`
+/// chars of up to 4 bytes each.
+const MACOS_ARG_ALLOWANCE: usize = 256 * 1024;
+
+/// The most BYTES a compose prompt may be: the draft becomes ONE argv element of
+/// `claude`, whichever box it came from, so the operating system's limit on it is
+/// the box's limit. Linux: [`LINUX_MAX_ARG_STRLEN`] less its NUL. macOS:
+/// [`MACOS_ARG_MAX`] less [`MACOS_ARG_ALLOWANCE`]. Any other target takes the
+/// smaller Linux bound; snapback ships for macOS and Linux only.
+///
+/// Used twice, both before anything closes the box: a compose paste is cut at it
+/// (`tui::update`), and a send over it is refused ([`check_prompt_len`]). The
+/// board's search box keeps its own, far smaller `PASTE_MAX_CHARS`.
+///
+/// Not verified: how `claude` itself behaves given a prompt of several hundred KB
+/// as an argument; the figures above are what the OS accepts.
+pub const COMPOSE_PROMPT_MAX_BYTES: usize = if cfg!(target_os = "macos") {
+    MACOS_ARG_MAX - MACOS_ARG_ALLOWANCE
+} else {
+    LINUX_MAX_ARG_STRLEN - 1
+};
+
+/// Whether a draft fits in one argv element, or the refusal to show when it does
+/// not. Pure. Measures `message` itself — the exact string every builder pushes as
+/// ONE element — in BYTES, the unit the OS counts and the one the refusal names so
+/// the user can see how far over they are. A draft of exactly
+/// [`COMPOSE_PROMPT_MAX_BYTES`] fits.
+///
+/// # Errors
+///
+/// A sentence naming the draft's size and the limit, for a sticky status
+/// ([`prompt_too_long_refusal`]).
+pub fn check_prompt_len(message: &str) -> Result<(), String> {
+    let len = message.len();
+    if len <= COMPOSE_PROMPT_MAX_BYTES {
+        Ok(())
+    } else {
+        Err(prompt_too_long_refusal(len, COMPOSE_PROMPT_MAX_BYTES))
+    }
+}
+
+/// The refusal for a draft of `len` bytes against a `limit`, a pure function of the
+/// two so a test can ask it for any pair on any platform. Both are plain decimal
+/// byte counts. It is shown on the status row, ONE row that is cut rather than
+/// wrapped, so its widest form must fit 80 columns: pinned for `len == usize::MAX`
+/// (the draft is bounded by nothing but the user, since each paste is capped on its
+/// own) against the larger platform limit by
+/// `the_refusal_fits_the_eighty_column_status_row_at_its_widest`.
+fn prompt_too_long_refusal(len: usize, limit: usize) -> String {
+    format!("message too long to send — {len} bytes, limit {limit}; shorten it")
+}
+
 /// Build the `claude` argv for a one-shot send:
 /// `claude -p -r <id> --output-format json [--model <alias> [--effort <level>]] <message>`.
 ///
@@ -1803,6 +1868,76 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::resume::ModelPick;
+
+    /// A draft fits up to and including the limit; one byte more is refused, and the
+    /// refusal names both the draft's size and the limit. Bytes, not chars: a
+    /// multi-byte draft of fewer chars than the limit can still be over it.
+    #[test]
+    fn a_prompt_fits_up_to_the_limit_and_the_refusal_names_both_sizes() {
+        assert!(check_prompt_len("").is_ok());
+        assert!(check_prompt_len(&"x".repeat(COMPOSE_PROMPT_MAX_BYTES)).is_ok());
+
+        let over = "x".repeat(COMPOSE_PROMPT_MAX_BYTES + 1);
+        let refusal = check_prompt_len(&over).expect_err("one byte over is refused");
+        assert!(refusal.contains(&(COMPOSE_PROMPT_MAX_BYTES + 1).to_string()));
+        assert!(refusal.contains(&COMPOSE_PROMPT_MAX_BYTES.to_string()));
+
+        // 3-byte chars: the char count is a third of the byte count.
+        let wide = "☃".repeat(COMPOSE_PROMPT_MAX_BYTES / 3 + 1);
+        assert!(wide.chars().count() <= COMPOSE_PROMPT_MAX_BYTES);
+        assert!(check_prompt_len(&wide).is_err(), "the limit counts bytes");
+    }
+
+    /// The refusal is cut on the one-row status line, so its WORST case must fit 80
+    /// columns, measured with the `unicode-width` the renderer counts in. The worst
+    /// case is the widest size the message can be given, `usize::MAX` (one paste is
+    /// capped on its own, so the draft is not bounded by the limit plus one), with the
+    /// larger platform limit at full digit count — stated here from the constants, not
+    /// from [`COMPOSE_PROMPT_MAX_BYTES`], so the pin holds whichever OS runs it. The
+    /// text must also be its own flattened form: `render_help` joins whitespace runs,
+    /// so a doubled space or newline would change what is drawn.
+    #[test]
+    fn the_refusal_fits_the_eighty_column_status_row_at_its_widest() {
+        use unicode_width::UnicodeWidthStr;
+        const STATUS_ROW_BUDGET: usize = 80;
+        let widest_limit = (MACOS_ARG_MAX - MACOS_ARG_ALLOWANCE).max(LINUX_MAX_ARG_STRLEN - 1);
+        assert_eq!(
+            widest_limit, 786_432,
+            "six digits, the longest a limit gets"
+        );
+
+        let widest = prompt_too_long_refusal(usize::MAX, widest_limit);
+        assert!(
+            widest.width() <= STATUS_ROW_BUDGET,
+            "the widest refusal is {} columns: {widest:?}",
+            widest.width()
+        );
+        assert!(widest.contains(&usize::MAX.to_string()));
+        assert!(widest.contains(&widest_limit.to_string()));
+        assert_eq!(
+            widest.split_whitespace().collect::<Vec<_>>().join(" "),
+            widest,
+            "the status row flattens whitespace; the text must already be flat"
+        );
+    }
+
+    /// The limit's premise, against the real OS: a program starts with ONE argument
+    /// of exactly [`COMPOSE_PROMPT_MAX_BYTES`] bytes under this test's own
+    /// environment. Raise the constant past the OS ceiling and this fails with
+    /// `E2BIG`. It starts a real program (`true`), so it is unix-only like the other
+    /// tests that do. On macOS the limit is `ARG_MAX` shared with the environment, so
+    /// the test assumes the environment it runs in stays well under
+    /// [`MACOS_ARG_ALLOWANCE`] (256 KiB); a CI or shell environment past that fails
+    /// it with `E2BIG`, which is the allowance being too small, not the test.
+    #[cfg(unix)]
+    #[test]
+    fn the_os_starts_a_program_given_an_argument_of_exactly_the_limit() {
+        let status = std::process::Command::new("true")
+            .arg("x".repeat(COMPOSE_PROMPT_MAX_BYTES))
+            .status()
+            .expect("the OS must accept one argument of COMPOSE_PROMPT_MAX_BYTES");
+        assert!(status.success());
+    }
 
     /// A send builds `claude -p -r <id> --output-format json <message>` — no
     /// permission flags, the prompt as the trailing positional argument.

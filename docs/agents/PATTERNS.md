@@ -249,8 +249,9 @@ it. Follow this split when adding behavior:
   transformation with no terminal and no store) and `resume::fork_name` (a fork's
   `--name`, whose every output `is_fork_name` must accept);
   `update::key_to_action` / `wheel_target` / `accept_paste` (line-ending
-  normalization plus the char-counted cap, fused so neither can be skipped at a
-  call site) / `flatten_for_query`; every `App` state transition (incl.
+  normalization plus the destination's cap — chars on the board, bytes in a
+  compose draft — fused so neither can be skipped at a call site) /
+  `flatten_for_query`; every `App` state transition (incl.
   `pick_default_index`, the agent-picker cycle, `child_indices`, which marks
   the indented rows by reusing `lineage::head_of` rather than re-deriving a head,
   `is_lineage_child`, the row role delete and move read, which IS
@@ -1510,13 +1511,13 @@ CADENCES and LIMITS, so a retune knows what it is next to:
 | `model_aliases` | `MAX_ALIAS_ARRAY_BYTES` (4096) · `SCAN_CHUNK_BYTES` (1 MiB) · `SCAN_OVERLAP_BYTES` (= `MAX_ALIAS_ARRAY_BYTES` by definition — that equality is what proves no match straddles a chunk unseen, so neither is retuned alone) |
 | `store::preview` | `MODEL_VERSION_MAX_DIGITS` (2) · `MODEL_DATE_DIGITS` (8 — kept above the version cap so a date never reads as a version) · `TABLE_MIN_COL_WIDTH` (10) · `RECORD_RULE_WIDTH` (32) · `COLUMN_RULE_WIDTH` (3) · `ELLIPSIS_WIDTH` (1) · `PEER_STEM_LEN` (17 — the agent-stem length a peer sender must match before it renders as an `@handle`, so a socket path or an agent TYPE name falls back to the generic label) · `PEER_HEADER_BLOCK_ROW` (1 — not a knob but a SHAPE: a peer or injected node's header index inside its own `[blank, header, body…]` block, named so the fold region and the body links rebase off one number) · `DELEGATION_HEADER_BLOCK_ROW` (0 — a SHAPE too: a delegation line leads its block with no blank separator, so it costs exactly the one line of the marker it replaces) |
 | `store::subagents` | `META_MAX_BYTES` (64 KiB — the largest of 1811 meta files measured 264 bytes on 2026-10-11, so the cap refuses only a file that is not a meta and bounds what a hostile one can make a render read) · `TAIL_MAX_BYTES` (64 KiB — the end of a transcript the background subagent refresh reads, only for one that can be running; every measured tail held a complete turn, 2026-10-12) · `HEAD_MAX_BYTES` (64 KiB — the head it reads for a launch time; the largest first record of 2,049 measured 28,646 bytes, 2026-10-13) · `RUNNING_WINDOW` (10 min — how long an unfinished subagent, counting its sub-subagents' writes, may stay silent and still read as running; at 10 minutes 2.9% of real runs show a longer silence while still running, 2026-10-12) |
-| `send` | `SEND_ERROR_MAX` (200) |
+| `send` | `SEND_ERROR_MAX` (200) · `COMPOSE_PROMPT_MAX_BYTES` (the most bytes one compose prompt argv element may be, by OS: Linux `LINUX_MAX_ARG_STRLEN` 131,072 less the NUL = 131,071; macOS `MACOS_ARG_MAX` 1 MiB less `MACOS_ARG_ALLOWANCE` 256 KiB = 786,432; any other target takes the Linux value — measured 2026-10-30; a unix-only test spawns a program with an argument of exactly this length, so a retune past the real ceiling fails; the send refusal's text, `prompt_too_long_refusal`, is pinned to fit the 80-column status row at its widest) |
 | `claude_catalog` | `CATALOG_FETCH_TIMEOUT` (10 s — bounds the reply, the close of stdout AND the exit; the reply measured 0.21–0.22 s) · `CATALOG_READER_GRACE` (500 ms — how long a timed-out fetch waits, after the group and child kills, for its stdout reader to see EOF; the worker's worst case is the timeout plus this) · `CATALOG_EXIT_POLL` (20 ms — claude exits 25–50 ms after its stdin's EOF) |
 | `claude_move` | `MOVE_TIMEOUT` (30 s — the answer, the close of stdout AND the exit together; a move measured ~0.7 s end to end on a small transcript at claude 2.1.291, and `-r` loads the whole transcript first, so the cap only ever cuts off a stuck child) |
 | `claude_trust` | `GIT_POINTER_MAX_BYTES` (8192 — a git pointer file holds one path line, and a path is at most `PATH_MAX`, so a longer file is not a pointer and gets the untrusted-direction fallback rather than a whole read) |
 | `tui::complete` | `COMPLETION_MAX_DIR_ENTRIES` (2000 — one keystroke's worst read of a huge folder) · `COMPLETION_MAX_TREE_ENTRIES` (25000 — the whole `@` walk, breadth first, no depth cap: a depth cap hid a 9-level monorepo path) · `COMPLETION_VISIBLE_ROWS` (8) |
 | `tui::app` | `PREVIEW_WHEEL_STEP` (2) · `LIST_WHEEL_STEP` (1) · `STATUS_DWELL_TICKS` (16) · `MIN_PANE_WIDTH` (15) · the list's share of the body per split `PaneLayout` stop: `PREVIEW_WIDE_LIST_PERCENT` (25) / `DEFAULT_LIST_PERCENT` (48) / `LIST_WIDE_LIST_PERCENT` (75) · a held drag's autoscroll: `AUTOSCROLL_FRAME` (33 ms, the run loop's wait deadline while one is held past the edge — §7's one exception to animating from the tick) / `AUTOSCROLL_PAGE_PERIOD` (1 s, a page per row past the edge) / `AUTOSCROLL_MAX_DISTANCE` (4) |
-| `tui::update` | `PASTE_MAX_CHARS` (4096) |
+| `tui::update` | `PASTE_MAX_CHARS` (4096 — the BOARD query's paste cap in chars; a compose paste is capped by `send::COMPOSE_PROMPT_MAX_BYTES` instead) |
 | `tui::view` | `BLINK_TICKS` (2) · `CHILD_ID_CHARS` (8) · `MATCH_JUMP_LEAD_DIVISOR` (3 — a jumped-to match parks `h / 3` rows down) · `WIDE_GLYPH_COLUMNS` (2) · `LINK_PROBE_BYTE_BUDGET` (131_072) · `SELECTION_COPY_CHUNK_ROWS` (256 — the rows a release copy redraws per off-screen buffer, a BOUND on one buffer rather than a tune) · `WRAP_ROOM_WIDTHS` (3 — how many transcript widths the scratch of `render_wrapped_clipped` spans, since ratatui's wrapper can build a row wider than the pane; every frame pays for it) · the layout rows `PREVIEW_BANNER_ROWS` / `BOARD_CHROME_ROWS` / `COMPOSE_*` / `MODAL_WIDTH` / `MODAL_*_CHROME_ROWS` / `MODAL_BORDER_ROWS` / `MODAL_BORDER_COLS` / `MODAL_LIST_MAX_ROWS` (12 — the most CHOICES a `List` picker offers before it scrolls, so an overlay stays an overlay on a tall terminal; a wrapped row's extra lines are paid on top, see [§5](#5-selection-and-scroll-survive-reloads)) · the preview's running list: `RUNNING_LIST_MAX_ROWS` (5 — the subagents it gives a row before a `+N more` line; at most 5 ran at once in 185 of 189 measured sessions, 2026-10-13) / `RUNNING_LIST_PANE_SHARE` (2 — the whole list takes at most half the rows under the pinned row, else it shrinks to one line) · the compose pick list's `COMPLETION_BORDER_ROWS` / `COMPLETION_COLUMN_GAP` (2 — the table's only separator) / `COMPLETION_NAME_MAX_PERCENT` (50 — descriptions keep the other half of the box) |
 
 Add a new tunable the same way. The rule is not only about numbers — a literal
@@ -2244,7 +2245,14 @@ Tests are **inline** `#[cfg(test)] mod tests` at the bottom of each source file
   `run_agents` and `try_run_agents` with `printf` in `claude`'s place, over a
   stdout naming the unreaped child and the test's own process, so a runner that
   stops passing `kernel_says_gone` fails. That query only reads, so breaking it
-  to watch a test fail can drop a record but never reach a process.
+  to watch a test fail can drop a record but never reach a process. One more
+  runs a real program on unix alone: `send`'s
+  `the_os_starts_a_program_given_an_argument_of_exactly_the_limit` starts `true`
+  with ONE `COMPOSE_PROMPT_MAX_BYTES`-byte argument, so a retune past the OS's
+  real ceiling fails with `E2BIG`. On macOS the limit is `ARG_MAX` shared with the
+  environment, so it assumes the environment it runs in stays well under
+  `MACOS_ARG_ALLOWANCE` (256 KiB); past that it fails, and the allowance is what
+  to revisit.
 - **Assert structure, not styling**: preview tests flatten `Text` to plain
   strings to check markers, and separately assert `Style`/`Modifier` on specific
   spans.

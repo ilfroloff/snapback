@@ -59,6 +59,11 @@
 //! ([`refresh_completion`]), never the render path; claude's own list for the
 //! folder is fetched off the UI thread, requested by [`take_catalog_fetch`].
 //!
+//! A draft too long to be one `claude` argument ([`send::check_prompt_len`]) is
+//! REFUSED before any target routes: `Enter` in all three boxes ([`submit_compose`])
+//! and `Ctrl-O` in the fork box and the draft ([`open_interactive`], the reply's
+//! being inert). The box stays open with the draft intact — see [`refuse_too_long`].
+//!
 //! [`insert_paste`] is the ONE entry point that is not a keypress: a terminal paste
 //! arrives as whole TEXT (`super::update::handle_paste`) and goes straight into the
 //! editor, bypassing the key router entirely. That bypass is the point — routed as
@@ -452,14 +457,46 @@ impl ComposeState {
     /// map it forward), so the pair lands on the last screen row of the last logical
     /// line whatever the wrap mode, and `row + 1` is the row COUNT.
     ///
-    /// The clone is a WHOLE `TextArea` copy — the draft's lines, its undo history (50
-    /// edits at the crate's default) and its already-built screen map — not a cheap
-    /// handle. The two moves on it then RE-WRAP NOTHING: `move_cursor` only resolves
-    /// the cursor against that copied map, which the editor rebuilds on an EDIT and on
-    /// a RENDER whose area changed, never on a move. So the cost is one copy of a
-    /// human-typed draft per frame, on the redraw path and only while the compose zone
-    /// is open — affordable, not free. Do NOT "optimize" it into a shared cursor move:
-    /// the probe must not disturb where the user's caret actually is.
+    /// The clone is a WHOLE `TextArea` copy, not a cheap handle: the draft's lines, its
+    /// undo history, its yank buffer and its already-built screen map. The two moves on
+    /// it then RE-WRAP NOTHING: `move_cursor` only resolves the cursor against that
+    /// copied map, which the editor rebuilds on an EDIT and on a RENDER whose area
+    /// changed, never on a move (it does scan the caret's line: 0.19 ms on one
+    /// 786,432-byte line). Do NOT "optimize" it into a shared cursor move: the probe
+    /// must not disturb where the user's caret actually is.
+    ///
+    /// The cost is PER FRAME, not per keystroke. Every wake-up of the run loop draws —
+    /// each `watch::TICK` (250 ms, unconditional), key, mouse move and worker event —
+    /// and a DOCKED box pays this copy at LEAST THREE times per wake-up: in the render
+    /// (`preview_areas` → `compose_zone_height`) and in each of the two
+    /// `view::preview_transcript_rect` calls in the loop of `tui/mod.rs`, which go
+    /// through `preview_areas` too. The bottom-bar layout pays it once. Every OTHER
+    /// `view::preview_transcript_rect` call pays it again, so a docked box pays MORE
+    /// while a preview selection is shown (`view::overlay_preview_selection`) and
+    /// while the pointer acts over the preview (`update::mouse_effect`).
+    ///
+    /// What one copy weighs is set by the UNDO HISTORY at least as much as by the
+    /// draft. It holds 50 edits (the crate's default), and an insert or delete entry
+    /// keeps its full text, so EACH large edit still in the history adds its own
+    /// size to every copy. A draft is at most [`send::COMPOSE_PROMPT_MAX_BYTES`] from
+    /// ONE paste and can exceed even that through several, since each paste is
+    /// capped on its own. Per DOCKED wake-up of the three copies above (no selection
+    /// shown, no pointer event), with the draft at the macOS limit of 786,432 bytes
+    /// (median of the worse of two draft shapes, a 7,788-line log and a single line):
+    ///
+    /// * no history: 0.7 ms;
+    /// * history depth 1, one maximal paste: 1.1 ms;
+    /// * history depth 5, three maximal pastes with the first two each deleted whole:
+    ///   3.3 ms;
+    /// * the ceiling, 50 maximal edits in the history, about 50 MB per copy: 29 ms.
+    ///
+    /// The per-EDIT cost is separate: every edit rebuilds the screen map, about 11 ms
+    /// per typed character at that size.
+    ///
+    /// Measured 2026-11-04 on an Apple M4 Max: release build, `ratatui-textarea`
+    /// 0.9.2 configured as [`ComposeState::new`] does (`WrapMode::WordOrGlyph`), one
+    /// `insert_str` per paste as `insert_paste` does, an 80x6 editor (the docked box on
+    /// a 160x48 terminal), 300 iterations.
     ///
     /// The logical line count is a FLOOR (`max`): a draft can never need fewer rows
     /// than it has lines, so a probe that ever degrades still cannot report a box
@@ -944,10 +981,30 @@ fn draft(app: &App) -> Option<Draft> {
     })
 }
 
+/// Refuse a draft too long to be one `claude` argument ([`send::check_prompt_len`]):
+/// a STICKY status naming its size and the limit, and the box left open with the
+/// draft intact. Asked before any launch path routes — `Enter` in every box
+/// ([`submit_compose`]) and the fork box's and the draft's `Ctrl-O`
+/// ([`open_interactive`]) — so nothing has closed the box, marked a send, armed a
+/// fork jump or recorded the agent ([`App::set_last_new_agent`]) by the time it
+/// answers: a refused launch is not a start. A draft grows past the limit by typing
+/// or by several pastes, each within the paste cap, which is why the check is the
+/// draft's, not the paste's. Returns whether it refused.
+fn refuse_too_long(app: &mut App, message: &str) -> bool {
+    match send::check_prompt_len(message) {
+        Ok(()) => false,
+        Err(refusal) => {
+            app.set_status(refusal);
+            true
+        }
+    }
+}
+
 /// Resolve the compose buffer into a driver [`Outcome`], routing on the open
 /// [`ComposeTarget`]: a reply sends, a fork sends headless under a fresh id
 /// ([`submit_fork`]), a background draft launches — each with the model picked in
-/// THIS compose, if any.
+/// THIS compose, if any. A draft over [`send::COMPOSE_PROMPT_MAX_BYTES`] is refused
+/// FIRST, for every target ([`refuse_too_long`]), before the target's own guards.
 fn submit_compose(app: &mut App) -> Outcome {
     let Some(Draft {
         message,
@@ -957,6 +1014,9 @@ fn submit_compose(app: &mut App) -> Outcome {
     else {
         return Outcome::Continue;
     };
+    if refuse_too_long(app, &message) {
+        return Outcome::Continue;
+    }
     match target {
         ComposeTarget::Reply {
             session_id,
@@ -974,16 +1034,19 @@ fn submit_compose(app: &mut App) -> Outcome {
 /// It rides the [`crate::send`] family, NOT [`Outcome::Resume`]: there is no
 /// terminal teardown, so the board stays up and the result arrives as an
 /// [`AppEvent::BgLaunchFinished`](crate::watch::AppEvent::BgLaunchFinished).
-/// An empty/whitespace draft keeps the pane open with a gentle nudge (a background
-/// agent with no prompt would do nothing); otherwise the launch dir is gated
-/// ([`send::plan_bg_launch`]), the argv built, the draft card is marked launching
-/// in place, and a [`BgLaunchRequest`] handed to the driver.
+/// By the time this runs [`submit_compose`] has already refused a draft over
+/// [`send::COMPOSE_PROMPT_MAX_BYTES`]. An empty/whitespace draft keeps the pane open
+/// with a gentle nudge (a background agent with no prompt would do nothing);
+/// otherwise the launch dir is gated ([`send::plan_bg_launch`]), the argv built, the
+/// draft card is marked launching in place, and a [`BgLaunchRequest`] handed to the
+/// driver.
 ///
 /// The ONE thing recorded is the AGENT, as the pick `Ctrl-N`'s picker pre-highlights
 /// next time — because this is a real launch, and that memory means "the agent of
-/// the last new session actually started". It is written past the empty-buffer nudge
-/// (a draft that launched nothing is not a start) and before the launch-dir gate, so
-/// it survives a refusal, exactly like the picker's `Ctrl-O`.
+/// the last new session actually started". It is written past the too-long refusal
+/// and the empty-buffer nudge (a draft that launched nothing is not a start) and
+/// before the launch-dir gate, so it survives a launch-dir refusal, exactly like the
+/// picker's `Ctrl-O`.
 ///
 /// Nothing ELSE is recorded about the launch: no virtual/pending row is created and
 /// no attempt is made to reconcile the short job id back to a `sessionId`. The new
@@ -1073,8 +1136,13 @@ fn submit_bg_launch(
 /// trailing positional, like a new session's prompt (probed for `-r
 /// --fork-session` at claude 2.1.291 on 2026-10-08; `docs/agents/CLAUDE_CLI.md`).
 ///
+/// A draft over [`send::COMPOSE_PROMPT_MAX_BYTES`] is refused first, on the fork and
+/// the draft ([`refuse_too_long`]: sticky status, box kept, nothing recorded — the
+/// agent memory above is written only past it).
+///
 /// INERT on a [`ComposeTarget::Reply`]: a reply addresses a session that already
-/// exists, so there is no new-session launch to escape to.
+/// exists, so there is no new-session launch to escape to — and so nothing to
+/// refuse either, over the limit or not.
 fn open_interactive(app: &mut App) -> Outcome {
     let Some(Draft {
         message,
@@ -1084,6 +1152,10 @@ fn open_interactive(app: &mut App) -> Outcome {
     else {
         return Outcome::Continue;
     };
+    // A reply launches nothing, so it has no prompt to refuse either.
+    if !matches!(target, ComposeTarget::Reply { .. }) && refuse_too_long(app, &message) {
+        return Outcome::Continue;
+    }
     // An empty / whitespace draft launches with NO positional, which is exactly what
     // the picker's own `Ctrl-O` (and, for a fork, plain `Ctrl-F`) always emitted; a
     // fork is still named, from the session's label.
@@ -1124,6 +1196,9 @@ fn open_interactive(app: &mut App) -> Outcome {
 /// lands on it; and (6) arm the cursor jump to it ([`App::set_fork_jump`]). That one
 /// id is the `--session-id`, the in-flight entry, the request and the jump's fork
 /// side.
+///
+/// A draft over [`send::COMPOSE_PROMPT_MAX_BYTES`] never gets here: [`submit_compose`]
+/// refused it before this step (1).
 ///
 /// The id is `fork_id`, a parameter, so a test supplies it; the caller passes
 /// [`send::fresh_session_id`]. When it is an error the fork is refused with a sticky
@@ -1197,12 +1272,13 @@ fn submit_fork(
 
 /// Send the drafted quick reply — the `Enter` half of the reply target.
 ///
-/// Guards an empty/whitespace buffer (keep composing, gentle status). Otherwise it
-/// re-reads the AUTHORITATIVE `(cwd, session_id)` from inside the file
-/// ([`send::plan_send`]) — never the stale in-memory copy — builds the argv,
-/// marks the send in flight, clears the compose state, and hands a [`SendRequest`]
-/// to the driver as [`Outcome::Send`]. A refusal (deleted worktree / unreadable file)
-/// sets a board status and stays on the board.
+/// [`submit_compose`] has already refused a draft over
+/// [`send::COMPOSE_PROMPT_MAX_BYTES`]. Guards an empty/whitespace buffer (keep
+/// composing, gentle status). Otherwise it re-reads the AUTHORITATIVE
+/// `(cwd, session_id)` from inside the file ([`send::plan_send`]) — never the stale
+/// in-memory copy — builds the argv, marks the send in flight, clears the compose
+/// state, and hands a [`SendRequest`] to the driver as [`Outcome::Send`]. A refusal
+/// (deleted worktree / unreadable file) sets a board status and stays on the board.
 ///
 /// The model picked in THIS reply box (`model`, from `Ctrl-L`) rides along into the
 /// argv, and this path is the one where it is not merely a convenience:
@@ -2625,6 +2701,225 @@ mod tests {
             .is_some_and(|s| s.starts_with(FORK_ID_FAILED_PREFIX) && s.contains("no entropy")));
         assert!(app.sending.is_empty());
         assert!(app.fork_jump.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A draft over [`send::COMPOSE_PROMPT_MAX_BYTES`], one byte too many.
+    fn over_long_draft() -> String {
+        "z".repeat(send::COMPOSE_PROMPT_MAX_BYTES + 1)
+    }
+
+    /// Assert `out` was a REFUSAL of an over-long draft: nothing dispatched, the box
+    /// still open with the whole draft, and a STICKY status naming the size and limit.
+    fn assert_refused_and_kept(app: &App, out: &Outcome, draft: &str) {
+        assert!(
+            matches!(out, Outcome::Continue),
+            "a refusal dispatches nothing"
+        );
+        let compose = app.compose.as_ref().expect("the box stays open");
+        assert_eq!(
+            compose.textarea.lines().join("\n"),
+            draft,
+            "the draft is intact"
+        );
+        let status = app.status.as_deref().expect("a refusal is shown");
+        assert!(
+            status.contains(&draft.len().to_string()),
+            "names the size: {status}"
+        );
+        assert!(
+            status.contains(&send::COMPOSE_PROMPT_MAX_BYTES.to_string()),
+            "names the limit: {status}"
+        );
+        assert_eq!(
+            app.status_ttl, None,
+            "a refusal stays until the next keypress"
+        );
+        assert!(app.sending.is_empty(), "no send was marked");
+        assert!(app.fork_jump.is_none());
+    }
+
+    /// Every launch path that would carry the draft as ONE `claude` argument refuses
+    /// a draft past the limit before it closes the box: the reply's `Enter`, the
+    /// fork's `Enter` and `Ctrl-O`, the background draft's `Enter` and `Ctrl-O`.
+    #[test]
+    fn an_over_long_draft_is_refused_on_every_launch_path_and_the_box_stays_open() {
+        let dir = unique_temp_dir("over-long");
+        let draft = over_long_draft();
+        let enter = || key(KeyCode::Enter);
+        let ctrl_o = || with_mods(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        let fresh = || {
+            App::new(
+                vec![sendable_session(&dir, "sbl-origin")],
+                Scope::All,
+                dir.clone(),
+            )
+        };
+
+        let mut app = fresh();
+        open(&mut app, "sbl-origin".to_string(), None);
+        type_into(&mut app, &draft);
+        let out = handle_compose_key(&mut app, enter());
+        assert_refused_and_kept(&app, &out, &draft);
+
+        let mut app = fresh();
+        open_fork(&mut app, "sbl-origin".to_string());
+        type_into(&mut app, &draft);
+        let out = handle_compose_key(&mut app, enter());
+        assert_refused_and_kept(&app, &out, &draft);
+
+        let mut app = fresh();
+        open_fork(&mut app, "sbl-origin".to_string());
+        type_into(&mut app, &draft);
+        let out = handle_compose_key(&mut app, ctrl_o());
+        assert_refused_and_kept(&app, &out, &draft);
+
+        let mut app = fresh();
+        open_background(&mut app, None);
+        type_into(&mut app, &draft);
+        let out = handle_compose_key(&mut app, enter());
+        assert_refused_and_kept(&app, &out, &draft);
+
+        let mut app = fresh();
+        open_background(&mut app, None);
+        type_into(&mut app, &draft);
+        let out = handle_compose_key(&mut app, ctrl_o());
+        assert_refused_and_kept(&app, &out, &draft);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The agent the next `Ctrl-N` picker pre-highlights, which is the only public
+    /// read of `App::last_new_agent`: closes the compose, opens the picker over
+    /// `previous` and `reviewer`, and names the highlighted row's agent.
+    fn remembered_agent(app: &mut App) -> Option<String> {
+        use crate::defined_agents::DefinedAgent;
+        use crate::tui::app::ModalAction;
+
+        let agent = |name: &str| DefinedAgent {
+            name: name.to_string(),
+            description: None,
+        };
+        app.close_compose();
+        app.open_agent_picker(vec![agent("previous"), agent("reviewer")]);
+        match app.modal.as_ref().and_then(|m| m.selected_action()) {
+            Some(ModalAction::New(picked)) => picked.clone(),
+            other => panic!("the agent picker did not open on a New row: {other:?}"),
+        }
+    }
+
+    /// A refused draft records NO agent: `last_new_agent` means "the agent of the last
+    /// new session actually started", so the refusal must come before
+    /// `set_last_new_agent`, on `Enter` and on `Ctrl-O` alike. The draft opens on an
+    /// agent that DIFFERS from the one already remembered, so a refusal that recorded
+    /// first would be visible; the existing every-path test opens its drafts with
+    /// `agent: None`, over an app that remembers none, and would not notice.
+    #[test]
+    fn a_refused_draft_does_not_record_its_agent() {
+        let dir = unique_temp_dir("over-long-agent");
+        let draft = over_long_draft();
+        let fresh = || {
+            let mut app = App::new(
+                vec![sendable_session(&dir, "sbl-agent")],
+                Scope::All,
+                dir.clone(),
+            );
+            app.set_last_new_agent(Some("previous".to_string()));
+            open_background(&mut app, Some("reviewer".to_string()));
+            type_into(&mut app, &draft);
+            app
+        };
+
+        let mut app = fresh();
+        let out = handle_compose_key(&mut app, key(KeyCode::Enter));
+        assert_refused_and_kept(&app, &out, &draft);
+        assert_eq!(
+            remembered_agent(&mut app).as_deref(),
+            Some("previous"),
+            "Enter's refusal must not record the draft's agent"
+        );
+
+        let mut app = fresh();
+        let out = handle_compose_key(
+            &mut app,
+            with_mods(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        );
+        assert_refused_and_kept(&app, &out, &draft);
+        assert_eq!(
+            remembered_agent(&mut app).as_deref(),
+            Some("previous"),
+            "Ctrl-O's refusal must not record the draft's agent"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A draft of EXACTLY the limit is not refused: it launches on every path, and the
+    /// reply's inert `Ctrl-O` stays inert (no launch, no refusal) however long.
+    #[test]
+    fn a_draft_at_exactly_the_limit_is_not_refused() {
+        let dir = unique_temp_dir("at-limit");
+        let draft = "z".repeat(send::COMPOSE_PROMPT_MAX_BYTES);
+        let enter = || key(KeyCode::Enter);
+        let ctrl_o = || with_mods(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        let fresh = || {
+            App::new(
+                vec![sendable_session(&dir, "sbl-edge")],
+                Scope::All,
+                dir.clone(),
+            )
+        };
+
+        let mut app = fresh();
+        open(&mut app, "sbl-edge".to_string(), None);
+        type_into(&mut app, &draft);
+        assert!(matches!(
+            handle_compose_key(&mut app, enter()),
+            Outcome::Send(_)
+        ));
+        assert!(app.compose.is_none());
+
+        let mut app = fresh();
+        open_fork(&mut app, "sbl-edge".to_string());
+        type_into(&mut app, &draft);
+        assert!(matches!(
+            handle_compose_key(&mut app, enter()),
+            Outcome::Send(_)
+        ));
+
+        let mut app = fresh();
+        open_fork(&mut app, "sbl-edge".to_string());
+        type_into(&mut app, &draft);
+        assert!(matches!(
+            handle_compose_key(&mut app, ctrl_o()),
+            Outcome::Resume(_)
+        ));
+
+        let mut app = fresh();
+        open_background(&mut app, None);
+        type_into(&mut app, &draft);
+        assert!(matches!(
+            handle_compose_key(&mut app, enter()),
+            Outcome::BgLaunch(_)
+        ));
+
+        let mut app = fresh();
+        open_background(&mut app, None);
+        type_into(&mut app, &draft);
+        assert!(matches!(
+            handle_compose_key(&mut app, ctrl_o()),
+            Outcome::Resume(_)
+        ));
+
+        // The reply's Ctrl-O launches nothing: inert, and says nothing, over the
+        // limit or not.
+        let mut app = fresh();
+        open(&mut app, "sbl-edge".to_string(), None);
+        type_into(&mut app, &over_long_draft());
+        assert!(matches!(
+            handle_compose_key(&mut app, ctrl_o()),
+            Outcome::Continue
+        ));
+        assert!(app.compose.is_some());
+        assert_eq!(app.status, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
