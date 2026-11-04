@@ -1,0 +1,2 @@
+{"type":"attachment","sessionId":"sess-compact-unrelated-1","cwd":"/Users/me/project-theta","gitBranch":"main","timestamp":"2026-10-01T09:00:00.000Z","uuid":"root-unrelated","parentUuid":null,"isSidechain":false,"attachment":{"type":"session_start_hook"}}
+{"type":"user","sessionId":"sess-compact-unrelated-1","cwd":"/Users/me/project-theta","gitBranch":"main","timestamp":"2026-10-01T09:00:01.000Z","uuid":"un-u1","parentUuid":"root-unrelated","isSidechain":false,"message":{"role":"user","content":"Something else entirely"}}

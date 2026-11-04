@@ -2180,6 +2180,12 @@ Tests are **inline** `#[cfg(test)] mod tests` at the bottom of each source file
   trimmed from claude 2.1.300 records, a tool call answered and an `api-request`
   record that is no turn before an API error flagged `isApiErrorMessage`, so the
   run ended failed) and
+  `tests/fixtures/compaction_store/` (a store root of its own, hand-built, so the
+  shared store's file counts stay put: a parent that compacted once, two named forks that
+  start at its boundary root, an unrelated session, and two moved sessions —
+  one written to in its new folder, one not — for the branch-from-own-folder rule;
+  the parent's last record sits in a side worktree on another branch, so the rule
+  has something to ignore) and
   `tests/fixtures/claude_catalog/` (two trimmed claude 2.1.284
   `initialize` replies, every body key but `commands` and `agents` removed —
   `account` among them — whose `request_id` the test restamps:

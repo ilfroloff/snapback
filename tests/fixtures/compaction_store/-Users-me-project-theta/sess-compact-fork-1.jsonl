@@ -1,0 +1,6 @@
+{"type":"custom-title","sessionId":"sess-compact-fork-1","customTitle":"fork: Try the other approach"}
+{"type":"system","sessionId":"sess-compact-fork-1","cwd":"/Users/me/project-theta","gitBranch":"main","timestamp":"2026-10-01T11:00:00.000Z","uuid":"root-boundary","parentUuid":null,"isSidechain":false,"subtype":"compact_boundary","logicalParentUuid":"cp-a1"}
+{"type":"user","sessionId":"sess-compact-fork-1","cwd":"/Users/me/project-theta","gitBranch":"main","timestamp":"2026-10-01T11:00:01.000Z","uuid":"cp-u2","parentUuid":"root-boundary","isSidechain":false,"message":{"role":"user","content":"Continue after compaction"}}
+{"type":"assistant","sessionId":"sess-compact-fork-1","cwd":"/Users/me/project-theta","gitBranch":"main","timestamp":"2026-10-01T11:00:02.000Z","uuid":"cp-a2","parentUuid":"cp-u2","isSidechain":false,"message":{"role":"assistant","content":[{"type":"text","text":"Continuing"}]}}
+{"type":"user","sessionId":"sess-compact-fork-1","cwd":"/Users/me/project-theta","gitBranch":"main","timestamp":"2026-10-01T13:00:00.000Z","uuid":"f0-u1","parentUuid":"cp-a2","isSidechain":false,"message":{"role":"user","content":"Fork turn"}}
+{"type":"custom-title","sessionId":"sess-compact-fork-1","customTitle":"fork: Try the other approach"}

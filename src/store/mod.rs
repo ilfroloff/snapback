@@ -226,11 +226,26 @@ pub struct Session {
     pub repo: String,
     /// Derived display label (see [`label::finalize_label`]).
     pub label: String,
-    /// `uuid` of the transcript tree's root record (see [`parse::ParsedFile`]).
-    /// Shared verbatim by every member of a background-fork lineage, so it is
-    /// what identifies one (read by [`lineage::lineage_key`]). `None` (no
-    /// derivable root) means "no lineage", and is never folded.
+    /// `uuid` of the FIRST null-parent record in this file (see
+    /// [`parse::ParsedFile`]): this file's own root, a fact about its bytes that
+    /// the parse cache carries. `None` (no derivable root) means "no lineage",
+    /// and is never folded. A lineage is identified by
+    /// [`lineage_root`](Self::lineage_root), not by this.
     pub root_uuid: Option<String>,
+    /// The `compact_boundary` null-parent records after
+    /// [`root_uuid`](Self::root_uuid), one per compaction (see
+    /// [`parse::ParsedFile::later_roots`]). Input to [`lineage::resolve_roots`]
+    /// alone.
+    pub later_roots: Vec<String>,
+    /// The root of the CONVERSATION this session belongs to, which
+    /// [`lineage::lineage_key`] reads: [`root_uuid`](Self::root_uuid) unless
+    /// [`lineage::resolve_roots`] joined the session to another file's roots.
+    ///
+    /// Set once per reload over the whole session set, so it is a fact about the
+    /// STORE and never enters the parse cache. `None` until that pass has run (a
+    /// session built outside a reload), and then the key falls back to
+    /// [`root_uuid`](Self::root_uuid).
+    pub lineage_root: Option<String>,
     /// How many conversation turns the transcript holds (see
     /// [`parse::ParsedFile::msg_count`]).
     ///
@@ -340,6 +355,8 @@ impl Session {
                 repo,
                 label,
                 root_uuid: parsed.root_uuid,
+                later_roots: parsed.later_roots,
+                lineage_root: None,
                 msg_count: parsed.msg_count,
                 content_index: parsed.content_index,
                 background: parsed.background,
@@ -526,6 +543,9 @@ impl SessionStore {
         self.cache = cache;
         self.last_parsed = parsed;
         self.last_discovered = discovered;
+        // AFTER the cache took its copies: the resolved root describes this
+        // reload's whole session set, not any one file's bytes.
+        lineage::resolve_roots(&mut sessions);
         sessions.sort_by(session_ordering);
         Reload { sessions, changed }
     }
@@ -1678,5 +1698,205 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // --- forks across a compaction, and the branch of a session's own folder ---
+
+    /// Path to the committed compaction fixture store (its own root, so the shared
+    /// store's file counts stay what their tests pin).
+    fn compaction_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("compaction_store")
+    }
+
+    #[test]
+    fn a_fork_made_after_a_compaction_joins_its_parents_lineage() {
+        let sessions = SessionStore::load_from(&compaction_root());
+        let parent = find(&sessions, "sess-compact-parent-1");
+        let fork1 = find(&sessions, "sess-compact-fork-1");
+        let fork2 = find(&sessions, "sess-compact-fork-2");
+
+        // The premise: the forks' own first root is the parent's LATER root.
+        assert_eq!(parent.root_uuid.as_deref(), Some("root-orig"));
+        assert_eq!(parent.later_roots, vec!["root-boundary"]);
+        assert_eq!(fork1.root_uuid.as_deref(), Some("root-boundary"));
+        assert_eq!(fork2.root_uuid.as_deref(), Some("root-boundary"));
+
+        let key = lineage::lineage_key(parent).expect("the parent has a lineage");
+        assert_eq!(key.root, "root-orig");
+        assert_eq!(lineage::lineage_key(fork1), Some(key.clone()));
+        assert_eq!(lineage::lineage_key(fork2), Some(key));
+        assert_ne!(
+            lineage::lineage_key(find(&sessions, "sess-compact-unrelated-1")),
+            lineage::lineage_key(parent),
+            "an unrelated session joins nothing"
+        );
+
+        // The parent heads the lineage although both forks are newer.
+        let members: Vec<usize> = (0..sessions.len())
+            .filter(|&i| lineage::lineage_key(&sessions[i]) == lineage::lineage_key(parent))
+            .collect();
+        assert_eq!(members.len(), 3);
+        let head = lineage::head_of(&sessions, &members);
+        assert_eq!(sessions[head].session_id, "sess-compact-parent-1");
+    }
+
+    #[test]
+    fn forks_of_a_deleted_parent_stay_one_lineage_headed_by_the_newest() {
+        let mut sessions = SessionStore::load_from(&compaction_root());
+        sessions.retain(|s| s.session_id != "sess-compact-parent-1");
+        lineage::resolve_roots(&mut sessions);
+
+        let keys: Vec<_> = ["sess-compact-fork-1", "sess-compact-fork-2"]
+            .map(|id| lineage::lineage_key(find(&sessions, id)).expect("a lineage"))
+            .into();
+        assert_eq!(keys[0], keys[1]);
+        assert_eq!(keys[0].root, "root-boundary");
+        let members: Vec<usize> = (0..sessions.len())
+            .filter(|&i| lineage::lineage_key(&sessions[i]).as_ref() == Some(&keys[0]))
+            .collect();
+        let head = lineage::head_of(&sessions, &members);
+        assert_eq!(sessions[head].session_id, "sess-compact-fork-2");
+    }
+
+    /// The resolved root belongs to the reload, never to the cache: the cache keeps
+    /// each file's own first root, and a later reload that reuses a cached parse
+    /// still resolves against the set that reload actually holds.
+    #[test]
+    fn the_resolved_root_is_computed_per_reload_and_never_cached() {
+        let root = unique_temp_dir("resolved-root");
+        let dir = root.join("-Users-me-project-alpha");
+        std::fs::create_dir_all(&dir).unwrap();
+        let line = |id: &str, uuid: &str, ts: &str| {
+            format!(
+                r#"{{"type":"system","subtype":"compact_boundary","cwd":"/Users/me/project-alpha","sessionId":"{id}","gitBranch":"main","timestamp":"{ts}","uuid":"{uuid}","parentUuid":null}}"#
+            )
+        };
+        let parent = [
+            line("parent", "r1", "2026-10-01T10:00:00.000Z"),
+            line("parent", "r2", "2026-10-01T11:00:00.000Z"),
+        ]
+        .join("\n");
+        std::fs::write(dir.join("parent.jsonl"), parent).unwrap();
+
+        let mut store = SessionStore::new(&root);
+        let first = store.reload_at(settled_now());
+        assert_eq!(
+            find(&first.sessions, "parent").lineage_root.as_deref(),
+            Some("r1")
+        );
+
+        // A fork appears; the parent's parse is reused from the cache.
+        std::fs::write(
+            dir.join("fork.jsonl"),
+            line("fork", "r2", "2026-10-01T12:00:00.000Z"),
+        )
+        .unwrap();
+        let second = store.reload_at(settled_now());
+        assert_eq!(store.last_parsed(), 1, "only the new file is read");
+        assert_eq!(
+            find(&second.sessions, "fork").lineage_root.as_deref(),
+            Some("r1")
+        );
+        assert!(
+            store
+                .cache
+                .values()
+                .filter_map(|e| e.session.as_ref())
+                .all(|s| s.lineage_root.is_none()),
+            "no cached parse carries a resolved root"
+        );
+
+        // The parent leaves: the fork's cached parse resolves to what is left.
+        std::fs::remove_file(dir.join("parent.jsonl")).unwrap();
+        let third = store.reload_at(settled_now());
+        assert_eq!(store.last_parsed(), 0);
+        assert_eq!(
+            find(&third.sessions, "fork").lineage_root.as_deref(),
+            Some("r2")
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A store of two files in one folder, read through the real parse and reload:
+    /// `a` lists the root `ra` and then `later` (a null-parent record of whatever
+    /// kind the caller passes); `b` lists only the uuid `later` as its first root.
+    /// Returns the two sessions' lineage roots.
+    fn roots_of_two_files_sharing(later_record: &str) -> (Option<String>, Option<String>) {
+        let root = unique_temp_dir("shared-root");
+        let dir = root.join("-Users-me-project-alpha");
+        std::fs::create_dir_all(&dir).unwrap();
+        let envelope = |id: &str, uuid: &str, rest: &str| {
+            format!(
+                r#"{{"cwd":"/Users/me/project-alpha","sessionId":"{id}","gitBranch":"main","timestamp":"2026-10-01T10:00:00.000Z","uuid":"{uuid}","parentUuid":null,{rest}}}"#
+            )
+        };
+        let a = [
+            envelope("a", "ra", r#""type":"attachment","attachment":{}"#),
+            envelope("a", "shared", later_record),
+        ]
+        .join("\n");
+        std::fs::write(dir.join("a.jsonl"), a).unwrap();
+        std::fs::write(dir.join("b.jsonl"), envelope("b", "shared", later_record)).unwrap();
+
+        let sessions = SessionStore::load_from(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        let root_of = |id: &str| lineage::lineage_key(find(&sessions, id)).map(|k| k.root);
+        (root_of("a"), root_of("b"))
+    }
+
+    /// Only a `compact_boundary` may link files. A later null-parent record of any
+    /// other kind that another file lists as its root leaves the two as separate
+    /// lineages, however it fails to be a boundary: no `subtype`, another one, an
+    /// unreadable one, or a conversation turn.
+    #[test]
+    fn a_shared_null_parent_root_that_is_not_a_compact_boundary_links_nothing() {
+        let not_boundaries = [
+            r#""type":"system""#,
+            r#""type":"system","subtype":"informational""#,
+            r#""type":"system","subtype":7"#,
+            r#""type":"system","subtype":null"#,
+            r#""type":"user","message":{"role":"user","content":"hi"}"#,
+            r#""type":"attachment","attachment":{}"#,
+        ];
+        for record in not_boundaries {
+            let (a, b) = roots_of_two_files_sharing(record);
+            assert_eq!(a.as_deref(), Some("ra"), "{record}");
+            assert_eq!(b.as_deref(), Some("shared"), "{record}");
+        }
+    }
+
+    /// The positive control for the test above: the same two files, the later
+    /// record a `compact_boundary`, are one lineage rooted at the original.
+    #[test]
+    fn a_shared_compact_boundary_links_the_two_files_into_one_lineage() {
+        let (a, b) = roots_of_two_files_sharing(r#""type":"system","subtype":"compact_boundary""#);
+        assert_eq!(a.as_deref(), Some("ra"));
+        assert_eq!(b.as_deref(), Some("ra"));
+    }
+
+    #[test]
+    fn a_session_lists_under_the_branch_of_its_own_folder() {
+        let sessions = SessionStore::load_from(&compaction_root());
+
+        // Its last record anywhere sits in a side worktree on `feature/side`, but
+        // the folder the row lists under (its first `cwd`) last saw `main`.
+        assert_eq!(
+            find(&sessions, "sess-compact-parent-1").branch_display(),
+            "main"
+        );
+
+        // Moved by a `relocated` record: the new folder's branch, not the old one's.
+        let moved = find(&sessions, "sess-branch-moved-1");
+        assert_eq!(moved.cwd, PathBuf::from("/Users/me/project-theta-wt"));
+        assert_eq!(moved.branch_display(), "feature/moved");
+
+        // Moved to a folder that never saw a record: the last branch anywhere.
+        let bare = find(&sessions, "sess-branch-moved-bare-1");
+        assert_eq!(bare.cwd, PathBuf::from("/Users/me/project-theta-wt"));
+        assert_eq!(bare.branch_display(), "feature/other");
     }
 }

@@ -92,8 +92,9 @@ pub struct LineageKey {
     pub repo: String,
     /// Branch label as displayed, so `(detached)` groups with itself.
     pub branch: String,
-    /// `uuid` of the transcript tree's root record, copied verbatim into every
-    /// fork of the conversation.
+    /// `uuid` of the conversation's ORIGINAL root record, which every fork of it
+    /// copies verbatim or, past a compaction, links back to
+    /// ([`resolve_roots`]).
     pub root: String,
 }
 
@@ -113,15 +114,116 @@ pub struct Folded {
 
 /// The lineage a session belongs to, or `None` when it has none.
 ///
+/// Its root is the one [`resolve_roots`] gave the session
+/// ([`Session::lineage_root`]), not the file's own first root: a fork of a
+/// compacted session starts at a later root of its parent. A session no reload
+/// resolved falls back to its own first root.
+///
 /// FAIL-SOFT: a file with no derivable root uuid yields `None`, which means "no
 /// lineage" — that session is never folded and always keeps its own row. A
 /// degraded parse must cost a user a fold, never a session.
 pub fn lineage_key(session: &Session) -> Option<LineageKey> {
-    session.root_uuid.as_ref().map(|root| LineageKey {
+    let root = session.lineage_root.as_ref().or(session.root_uuid.as_ref());
+    root.map(|root| LineageKey {
         repo: session.repo.clone(),
         branch: session.branch_display().to_string(),
         root: root.clone(),
     })
+}
+
+/// Resolve every session's lineage root across the whole set. Run once per
+/// reload, AFTER the per-file parse cache took its copies, and the only writer of
+/// [`Session::lineage_root`].
+///
+/// See [`resolved_roots`] for the rule; this assigns its answer.
+pub fn resolve_roots(sessions: &mut [Session]) {
+    let resolved = resolved_roots(sessions);
+    for (session, root) in sessions.iter_mut().zip(resolved) {
+        session.lineage_root = root;
+    }
+}
+
+/// The representative of `x`'s set in a union-find forest (path halving).
+fn find(parent: &mut [usize], mut x: usize) -> usize {
+    while parent[x] != x {
+        parent[x] = parent[parent[x]];
+        x = parent[x];
+    }
+    x
+}
+
+/// Each session's conversation root, index for index with `sessions`; `None` for
+/// a session with no root (no lineage).
+///
+/// A file lists its first root (`root_uuid`) and a `compact_boundary` root per
+/// compaction (`later_roots`), and a fork of a compacted session starts at one of
+/// the parent's boundary roots, so the fork's FIRST root is not the parent's.
+/// Sessions that share ANY listed root are one conversation (a null-parent record
+/// that is no boundary is not listed, so it links nothing), and its root is the
+/// ORIGINAL one: the single root that no file lists AFTER another root. Roots are
+/// only ever added after the original, so a new fork cannot change that answer,
+/// whatever its id or age, and a lineage kept expanded in `App::expanded` stays
+/// expanded across the reload that adds it. A file that breaks that premise is
+/// the next paragraph's case.
+/// With the parent's file gone its forks still share their boundary root, and
+/// that root is then the original they can see.
+///
+/// A conversation whose files disagree on a single original (several roots with
+/// nothing before them, or a cycle) is not guessed at: each of its sessions keeps
+/// its own first root, as before the roots were linked.
+fn resolved_roots(sessions: &[Session]) -> Vec<Option<String>> {
+    let mut ids: HashMap<&str, usize> = HashMap::new();
+    let mut names: Vec<&str> = Vec::new();
+    // Every session's roots as indices into `names`, in file order.
+    let mut roots_of: Vec<Vec<usize>> = Vec::with_capacity(sessions.len());
+    for session in sessions {
+        let own = session.root_uuid.iter().chain(&session.later_roots);
+        roots_of.push(
+            own.map(|uuid| {
+                *ids.entry(uuid.as_str()).or_insert_with(|| {
+                    names.push(uuid.as_str());
+                    names.len() - 1
+                })
+            })
+            .collect(),
+        );
+    }
+
+    // One conversation per set of roots that share a file; `preceded` marks a
+    // root some file lists after another root.
+    let mut parent: Vec<usize> = (0..names.len()).collect();
+    let mut preceded = vec![false; names.len()];
+    for roots in &roots_of {
+        for pair in roots.windows(2) {
+            preceded[pair[1]] = true;
+        }
+        for &root in roots.iter().skip(1) {
+            let (a, b) = (find(&mut parent, roots[0]), find(&mut parent, root));
+            parent[a] = b;
+        }
+    }
+
+    // Per conversation: how many unpreceded roots it has, and the last seen.
+    let mut originals: HashMap<usize, (usize, usize)> = HashMap::new();
+    for root in (0..names.len()).filter(|&r| !preceded[r]) {
+        let entry = originals
+            .entry(find(&mut parent, root))
+            .or_insert((0, root));
+        entry.0 += 1;
+        entry.1 = root;
+    }
+
+    sessions
+        .iter()
+        .zip(&roots_of)
+        .map(|(session, roots)| {
+            let first = *roots.first()?;
+            match originals.get(&find(&mut parent, first)) {
+                Some(&(1, original)) => Some(names[original].to_string()),
+                _ => session.root_uuid.clone(),
+            }
+        })
+        .collect()
 }
 
 /// Partition `indices` into the lineages they belong to: one entry per
@@ -458,6 +560,8 @@ mod tests {
             repo: "snapback".to_string(),
             label: "I see kinda double-sessions in the sessions list".to_string(),
             root_uuid: root.map(str::to_string),
+            later_roots: Vec::new(),
+            lineage_root: None,
             msg_count: 0,
             content_index: String::new(),
             background: false,
@@ -1134,6 +1238,8 @@ mod tests {
         let sessions = vec![
             Session {
                 root_uuid: None,
+                later_roots: Vec::new(),
+                lineage_root: None,
                 ..downgraded_fork("rootless", Some(300))
             },
             bound_root("has-a-root", Some(100)),
@@ -1271,5 +1377,287 @@ mod tests {
             vec!["ca45ce75".to_string()],
             "an undated sibling must not become the root and hide the downgrade"
         );
+    }
+
+    // --- resolve_roots: forks that start at a compaction boundary ---------
+
+    /// A session whose file lists `roots` in order: the first is its
+    /// `root_uuid`, the rest its `later_roots`, as `parse_file` fills them.
+    fn rooted(id: &str, roots: &[&str], ts: i64) -> Session {
+        Session {
+            later_roots: roots.iter().skip(1).map(|r| r.to_string()).collect(),
+            ..session(id, BRANCH, roots.first().copied(), Some(ts))
+        }
+    }
+
+    /// The resolved key root of every session, in order.
+    fn roots(sessions: &[Session]) -> Vec<Option<String>> {
+        sessions
+            .iter()
+            .map(|s| lineage_key(s).map(|k| k.root))
+            .collect()
+    }
+
+    fn resolved(mut sessions: Vec<Session>) -> Vec<Session> {
+        resolve_roots(&mut sessions);
+        sessions
+    }
+
+    /// The reported case: a parent compacted twice, and forks that copied it from
+    /// a compaction boundary on, so their FIRST root is one of the parent's LATER
+    /// roots. Without the link each fork read as a conversation of its own.
+    #[test]
+    fn a_fork_that_starts_at_a_boundary_root_shares_its_parents_key() {
+        let sessions = resolved(vec![
+            rooted("parent", &["r1", "r2", "r3"], 300),
+            rooted("fork-at-r2", &["r2"], 200),
+            rooted("fork-at-r3", &["r3"], 250),
+            rooted("unrelated", &["r9"], 100),
+        ]);
+
+        assert_eq!(
+            roots(&sessions),
+            vec![
+                Some("r1".to_string()),
+                Some("r1".to_string()),
+                Some("r1".to_string()),
+                Some("r9".to_string())
+            ]
+        );
+        let all = group_members(&sessions, &[0, 1, 2, 3]);
+        assert_eq!(all, vec![vec![0, 1, 2], vec![3]]);
+        assert_eq!(head_of(&sessions, &all[0]), 0, "the parent heads its forks");
+    }
+
+    /// The root is the ORIGINAL one by structure, not by being the smallest or the
+    /// first-sorted: the original uuid and the parent id here are the LARGEST, so
+    /// a smallest-id tie-break would pick a fork's boundary root.
+    #[test]
+    fn the_resolved_root_is_the_original_not_the_smallest() {
+        let sessions = resolved(vec![
+            rooted("zz-parent", &["zz-original", "aa-boundary"], 300),
+            rooted("aa-fork", &["aa-boundary"], 200),
+        ]);
+
+        assert_eq!(
+            roots(&sessions),
+            vec![Some("zz-original".into()), Some("zz-original".into())]
+        );
+    }
+
+    /// A new fork must not move the root, or `App::expanded` (keyed by
+    /// `LineageKey`) would lose the lineage on the reload that brings the fork in.
+    /// Pinned end to end through `fold`: the key taken BEFORE the fork exists
+    /// still expands the lineage AFTER it does.
+    #[test]
+    fn a_new_fork_does_not_change_the_resolved_root_or_collapse_an_expanded_group() {
+        let before = resolved(vec![
+            rooted("parent", &["r1", "r2"], 300),
+            rooted("fork-a", &["r2"], 200),
+        ]);
+        let key = lineage_key(&before[0]).unwrap();
+
+        // Newer than everyone, own boundary after the shared one, and an id that
+        // sorts before every existing one.
+        let after = resolved(vec![
+            rooted("parent", &["r1", "r2"], 300),
+            rooted("fork-a", &["r2"], 200),
+            rooted("0-newest-fork", &["r2", "r2b"], 400),
+        ]);
+
+        assert_eq!(lineage_key(&after[0]).unwrap(), key);
+        assert_eq!(lineage_key(&after[2]).unwrap(), key);
+        let folded = fold(&after, &[2, 0, 1], &expanded(&[key]));
+        assert_eq!(
+            folded.visible.len(),
+            3,
+            "the expanded lineage keeps every member"
+        );
+        assert!(folded.hidden.is_empty());
+    }
+
+    /// With the parent's file gone the forks still share the boundary root they
+    /// copied, so they stay one lineage; the newest heads it when all are named
+    /// forks (`head_of`'s existing rule).
+    #[test]
+    fn forks_of_a_deleted_parent_still_share_one_key_headed_by_the_newest() {
+        let sessions = resolved(vec![
+            Session {
+                custom_title: Some("fork: older".into()),
+                ..rooted("fork-old", &["r2"], 200)
+            },
+            Session {
+                custom_title: Some("fork: newer".into()),
+                ..rooted("fork-new", &["r2", "r3"], 300)
+            },
+            Session {
+                custom_title: Some("fork: mid".into()),
+                ..rooted("fork-mid", &["r3"], 250)
+            },
+        ]);
+
+        assert_eq!(roots(&sessions), vec![Some("r2".into()); 3]);
+        let groups = group_members(&sessions, &[0, 1, 2]);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(head_of(&sessions, &groups[0]), 1);
+    }
+
+    /// The pass is a function of the SET: input order must not change any answer.
+    #[test]
+    fn resolution_does_not_depend_on_input_order() {
+        let set = || {
+            vec![
+                rooted("p", &["r1", "r2", "r3"], 300),
+                rooted("f1", &["r3"], 200),
+                rooted("f2", &["r2", "r4"], 250),
+                rooted("x", &["r8"], 100),
+            ]
+        };
+        let forward = resolved(set());
+        let mut reversed = set();
+        reversed.reverse();
+        let reversed = resolved(reversed);
+
+        for s in &forward {
+            let other = reversed.iter().find(|r| r.session_id == s.session_id);
+            assert_eq!(
+                lineage_key(s),
+                lineage_key(other.unwrap()),
+                "{}",
+                s.session_id
+            );
+        }
+    }
+
+    /// Files that disagree on ONE original are not guessed at: two roots with
+    /// nothing before them (a shared later root joins a and b), and a cycle. Each
+    /// session keeps its own first root, as before roots were linked.
+    #[test]
+    fn a_conversation_with_no_single_original_keeps_each_sessions_own_root() {
+        let two_originals = resolved(vec![
+            rooted("a", &["ra", "shared"], 100),
+            rooted("b", &["rb", "shared"], 200),
+        ]);
+        assert_eq!(
+            roots(&two_originals),
+            vec![Some("ra".into()), Some("rb".into())]
+        );
+
+        let cycle = resolved(vec![
+            rooted("a", &["r1", "r2"], 100),
+            rooted("b", &["r2", "r1"], 200),
+        ]);
+        assert_eq!(roots(&cycle), vec![Some("r1".into()), Some("r2".into())]);
+    }
+
+    /// The stability rule rests on one premise: roots are only ever added AFTER the
+    /// original. A new file that lists a FRESH root before the shared boundary root
+    /// breaks it, leaving the conversation with two originals, and the pass then
+    /// gives up on linking: each session falls back to its own first root. That
+    /// fails toward a NARROWER grouping (an expanded lineage loses its fork on that
+    /// reload), never a wider one.
+    #[test]
+    fn a_file_listing_a_fresh_root_before_the_shared_one_narrows_the_grouping() {
+        let old_set = || {
+            vec![
+                rooted("parent", &["r1", "r2"], 300),
+                rooted("fork", &["r2"], 200),
+            ]
+        };
+        let before = resolved(old_set());
+        assert_eq!(roots(&before), vec![Some("r1".into()), Some("r1".into())]);
+        assert_eq!(group_members(&before, &[0, 1]), vec![vec![0, 1]]);
+
+        // `r0` precedes the shared `r2` in the new file, as `r1` does in the
+        // parent's: `r1` and `r0` are both originals.
+        let mut set = old_set();
+        set.push(rooted("newcomer", &["r0", "r2"], 400));
+        let after = resolved(set);
+
+        assert_eq!(
+            roots(&after),
+            vec![Some("r1".into()), Some("r2".into()), Some("r0".into())]
+        );
+        assert_ne!(lineage_key(&after[0]), lineage_key(&after[1]));
+        assert_eq!(group_members(&after, &[0, 1, 2]).len(), 3);
+        // Narrower, never wider: no pair shares a key now that did not before.
+        for (i, j) in [(0, 1), (0, 2), (1, 2)] {
+            let shared_now = lineage_key(&after[i]) == lineage_key(&after[j]);
+            let shared_before =
+                j < before.len() && lineage_key(&before[i]) == lineage_key(&before[j]);
+            assert!(shared_before || !shared_now, "{i} and {j} gained a key");
+        }
+    }
+
+    /// A file with several roots resolves to its first, and a file that lists only
+    /// a later one joins it.
+    #[test]
+    fn a_forest_resolves_to_the_files_first_root() {
+        let sessions = resolved(vec![
+            rooted("forest", &["a", "b"], 100),
+            rooted("copy-of-b", &["b"], 200),
+        ]);
+        assert_eq!(roots(&sessions), vec![Some("a".into()); 2]);
+    }
+
+    /// FAIL-SOFT: no root, no lineage, however many other sessions link up. The
+    /// rootless session is never folded and is a group of one.
+    #[test]
+    fn a_rootless_session_stays_without_a_lineage_and_unfolded() {
+        let sessions = resolved(vec![
+            rooted("parent", &["r1", "r2"], 300),
+            rooted("fork", &["r2"], 200),
+            session("rootless", BRANCH, None, Some(250)),
+        ]);
+
+        assert_eq!(lineage_key(&sessions[2]), None);
+        assert_eq!(sessions[2].lineage_root, None);
+        let folded = fold(&sessions, &[0, 2, 1], &HashSet::new());
+        assert_eq!(ids(&sessions, &folded.visible), vec!["parent", "rootless"]);
+        assert_eq!(folded.hidden.get(&0), Some(&1));
+    }
+
+    /// The branch still scopes a lineage (D4): linked sessions on two branches
+    /// share a resolved root but not a key.
+    #[test]
+    fn linked_sessions_on_different_branches_keep_different_keys() {
+        let mut fork = rooted("fork", &["r2"], 200);
+        fork.git_branch = Some("other".into());
+        let sessions = resolved(vec![rooted("parent", &["r1", "r2"], 300), fork]);
+
+        assert_eq!(sessions[0].lineage_root, sessions[1].lineage_root);
+        assert_ne!(lineage_key(&sessions[0]), lineage_key(&sessions[1]));
+    }
+
+    /// `lineage_key` reads the resolved root; a session no reload resolved still
+    /// answers with its own first root.
+    #[test]
+    fn lineage_key_prefers_the_resolved_root_and_falls_back_to_the_first() {
+        let mut s = rooted("s", &["r1", "r2"], 100);
+        assert_eq!(lineage_key(&s).unwrap().root, "r1");
+        s.lineage_root = Some("resolved".into());
+        assert_eq!(lineage_key(&s).unwrap().root, "resolved");
+    }
+
+    /// The badge's own grouping loop reads the same key: a background fork that
+    /// started at a boundary and lost the binding is flagged against the ORIGINAL
+    /// root's binding. Before the link it sat in a lineage of its own and was
+    /// never compared.
+    #[test]
+    fn the_lost_binding_badge_sees_forks_linked_across_a_compaction() {
+        let sessions = resolved(vec![
+            Session {
+                has_agent_name: true,
+                has_agent_setting: true,
+                ..rooted("parent", &["r1", "r2"], 100)
+            },
+            Session {
+                background: true,
+                has_agent_name: true,
+                ..rooted("fork-at-r2", &["r2"], 200)
+            },
+        ]);
+
+        assert_eq!(flagged(&sessions), vec!["fork-at-r2".to_string()]);
     }
 }
