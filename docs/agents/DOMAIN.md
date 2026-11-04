@@ -3195,7 +3195,8 @@ narrow it by the [rule below](#how-the-letters-narrow-the-list):
   [below](#how-the-letters-narrow-the-list)). The leaf is matched against each entry's
   FULL path relative to that folder, so `@disc` lists `src/store/discover.rs`,
   and by the word starts of the entry's own name, so `@calis` lists
-  `CategoryListings.tsx`
+  `CategoryListings.tsx` (a `/` command or an `@` agent is found by the word
+  starts of its name too: `/gws` lists `git-worktree-setup`)
   (the walk is `complete::list_tree`: breadth first, bounded by
   `COMPLETION_MAX_TREE_ENTRIES` at any depth, never descending a
   symlink, a dot-folder or a `TREE_SKIPPED_DIRS` name: generated output / installed
@@ -3354,7 +3355,8 @@ separators of file, skill, command and agent names), and each part is one atom:
 `@site-stor` is `site` AND `stor`, in any order, so it finds
 `src/modules/sitemaps/sitemaps-storage.service.ts`. Each part is a SUBSTRING —
 a misspelt `@site-stro` finds nothing — and an `@` file or folder the parts
-reject may still match by its word starts (below). Three edges:
+reject may still match by the word starts of its own name (below; the `@` root
+fallback excepted). Three edges:
 
 - A LEADING `.` stays on the first part, so `@.env` is the one part `.env`: it
   lists `.env` as a name-start hit and never `env.example` or `venv/` by a bare
@@ -3371,11 +3373,13 @@ with spaces for `set_query`
 ([PATTERNS.md §4](PATTERNS.md#4-isolate-volatile-dependencies) says why). The
 board's own search box keeps whitespace as its only separator.
 
-**Word starts (`@` files and folders).** A CamelCase name holds its words with
-no separator between them, so `@calis` is no substring of
-`CategoryListings.tsx`. So in the FOLDER STEP an entry the parts reject is asked
-one more question, `SearchIndex::word_start_hit`, of its own NAME (the last path
-component): can the query be consumed left to right as
+**Word starts (every pick-list name but the root fallback's).** A CamelCase name
+holds its words with no separator between them, so `@calis` is no substring of
+`CategoryListings.tsx`, and a kebab-case name's initials (`gws` for
+`git-worktree-setup`) are none either. So a command, an agent, or an `@` entry
+in the FOLDER STEP that the parts reject is asked one more question,
+`SearchIndex::word_start_hit`, of its own NAME (an `@` path's last component):
+can the query be consumed left to right as
 consecutive chunks, each a non-empty PREFIX of a word of the name, on words in
 order but not necessarily adjacent? A name's words end at `-`, `_`, `.`, `/` and
 a space; at a lowercase letter or digit followed by a capital
@@ -3403,12 +3407,15 @@ are all `Ca` + `Lis` and list `CategoryListings.tsx`:
   queries only, and a name's non-ASCII char never matches a query char nor reads
   a case boundary. A part that keeps a separator (`@.env`'s leading `.`, a token
   of separators alone) never matches, since no word holds one.
-- Its scope: an `@` file or folder's own name, in the folder step. Never a
-  folder component of the path, never a `/` command or skill, never an agent,
-  never the root fallback (below), and never the board's search box or filter
-  (AGENTS.md MATCHER ISOLATION).
+- Its scope: the own name of a `/` command or skill, of an agent (after the
+  `agent-` prefix is stripped, so `@agent-csr` is `@csr`) and of an `@` file or
+  folder in the folder step (`@csr` lists the agent `cr-swe-rust`; `/gws` the
+  skill `git-worktree-setup`). Never a description, never a folder component of
+  a path, never the root fallback (below), and never the board's search box or
+  filter (AGENTS.md MATCHER ISOLATION). The bounds above are the rule's, so they
+  bind a command name just as they bind a file name.
 
-Why the NAME and not the whole path: measured 2026-10-19 (release build, Apple
+Why the NAME and not the whole path (or a description): measured 2026-10-19 (release build, Apple
 M4 Max), word-start over full paths admitted 132 rows for `@calis` on a
 10,084-entry React monorepo walk where names admitted 12 (444 against 50 on a
 synthetic 25,000-entry walk), because folder names spell chunks for every file
@@ -3454,9 +3461,12 @@ top-level `@` over that walk:
 `/` splits nothing anywhere else: not the folder step, not the `/` trigger's
 commands and skills, and not the board's search box.
 
-`complete::placement` (for an `@` path, `complete::path_hit`) asks
-`SearchIndex::admits` — the [filter's](#content-index-storeparse) own membership
-question, every part present — of a candidate's NAME, and only then of its
+ONE function, `complete::rank`, ranks every pick-list row from plain data (a
+`complete::Subject`: its name, the text its marks land on, its description and
+whether word starts apply). It asks the [filter's](#content-index-storeparse)
+own membership question (`SearchIndex::admits_with`: every part present) of a
+candidate's NAME, then of the whole path (for an `@` path only), then asks the
+word-start rule of the name, and only then asks the membership question of the
 description. So a query matches ANYWHERE in the name or, for a skill, command or
 agent, anywhere in its description; a file or folder has only its name. It is a
 substring match under the board's per-atom smart case and its one fold, decided
@@ -3471,8 +3481,10 @@ rule (`SearchIndex::match_indices`: every part in the string, every occurrence o
 each marked), asked of the NAME or path alone — a command's marks moved past its
 `/`, an agent's never reaching its ` (agent)`, a folder's trailing `/` never
 marked — or, for a description-only hit, of the description. A word-start hit
-marks its chunks instead (`[Ca]tegory[Lis]tings.tsx`), the one row the
-row-label rule does not mark, since no part of it is a substring there. The
+marks its chunks instead (`[Ca]tegory[Lis]tings.tsx`, `/[g]it-[w]orktree-[s]etup`,
+moved past the `/` a command draws, past the folders of a path, and not at all
+for an agent), the one row the row-label rule does not mark, since no part of it
+is a substring there. The
 view draws them in the board's label highlight (`view::MATCH_HIGHLIGHT_STYLE`), lifting a
 description's `DIM` under a mark, and splits only the rows the table can show
 (`view::completion_row_may_show`, whose doc carries the frame-cost measurement
@@ -3482,9 +3494,9 @@ What matches is ordered in six tiers (`complete::Placement`): a name that
 STARTS with the query — any part's hit at its first char — then a word-start hit
 whose first chunk begins the name, then a name that holds every part elsewhere,
 then a word-start hit on a later word of the name, then (`@` paths only,
-`complete::path_hit`) a path that needs a FOLDER component for some part, then a
+`complete::rank`) a path that needs a FOLDER component for some part, then a
 description-only hit. A word-start hit thus lists right below the substring hits
-of the tier it lands in, and within its tier by fewer chunks, then fewer skipped
+of the tier it lands in, above a description-only hit, and within its tier by fewer chunks, then fewer skipped
 words: for `@calis`, `CategoryListings.tsx` (`Ca` + `Lis`) lists above `CategoryFooListings.tsx`,
 which skips a word, and both above `ClickAwayListener/` (`C` + `A` + `Lis`). An
 `@` path entry's name is its last component. Within a tier the list keeps the order it has with no
