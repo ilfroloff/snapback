@@ -234,7 +234,11 @@ KEYS:
     paste         your terminal's own paste (Cmd/Ctrl-V, middle-click) is inserted
                   as TEXT: into a compose draft at the cursor, newlines and all, or
                   into the search query at its cursor with newlines flattened to
-                  spaces. It never sends, resumes, or answers a confirmation
+                  spaces. It never sends, resumes, or answers a confirmation.
+                  A draft paste is cut at the size one claude argument can be
+                  (about 128 KB on Linux, 768 KB on macOS) and says so; a longer
+                  message is refused on Enter in any box and on Ctrl-O in a fork
+                  or draft box, the box kept
     Esc           clear the search query; with none typed, leave a subagent's
                   transcript for the session's own; with neither, quit
     Ctrl-C        quit from the board; while a modal, a confirmation, the key map

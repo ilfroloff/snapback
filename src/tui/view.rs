@@ -2453,6 +2453,34 @@ fn render_compose_zone(frame: &mut Frame, app: &App, area: Rect) {
     }
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    // KNOWN CEILING at caret SCREEN row 65_535, deliberately left UNFIXED — the
+    // vertical scroll is computed in `u16` inside the pinned
+    // `ratatui-textarea-0.9.2`, the same widget limit [`render_search`] argues for
+    // columns. `TextArea::scroll_top_row` casts the caret's screen row DOWN with
+    // `self.screen_cursor().row as u16` (`src/widget.rs:108-110`), and
+    // `next_scroll_top` adds in `u16` too: `prev_top + len` and `cursor + 1 - len`
+    // (`src/widget.rs:85-93`). Past 65_535 rows the cast row is wrong: the editor
+    // scrolls to rows that are not the caret's and the caret is off screen, and a
+    // DEBUG build can panic in the render loop — e.g. whenever the cast row is
+    // 65_535 — taking the unsent draft with it.
+    //
+    // Measured 2026-11-04 by rendering a draft of numbered lines into a 6-row
+    // buffer (a debug and a release test build): with the caret on row 65_535
+    // exactly, a debug build panicked (`attempt to add with overflow`,
+    // `widget.rs:89`) while a release build drew the right rows; a 100_000-line
+    // draft drew lines 34_458..34_463 with the caret off screen.
+    //
+    // REACHABLE by ONE paste the send check accepts: a paste leaves the caret at
+    // the END of the pasted text (`insert_chunk`, `src/textarea.rs:833-837`), a
+    // paste is cut at `send::COMPOSE_PROMPT_MAX_BYTES`, and `send::check_prompt_len`
+    // asks that limit of the whole draft only when it is SENT. On macOS (786_432
+    // bytes) one paste of `seq 1 100000` (588_895 bytes) puts the caret on row
+    // 100_000. A narrower editor wraps more and reaches it with fewer lines.
+    //
+    // Accepted anyway: it is far beyond any real reply, and a release build
+    // degrades the box's rendering without ever changing what a send carries or
+    // dropping the draft. Fixing it means capping rows in the draft's funnel — a
+    // behaviour change to every input path, not a render-site tweak.
     frame.render_widget(&compose.textarea, inner);
     render_completion_list(frame, compose, area);
 }

@@ -3463,9 +3463,42 @@ open) — a partial enumeration here is a wrong one, so all seven are stated:
 
 Two rules hold on every path, both in `update::accept_paste`: line endings
 normalize to `\n` (`\r\n` collapses to one, a lone `\r` becomes one), and the text
-is capped at `PASTE_MAX_CHARS`, counted in **chars** so truncation can never split
-a UTF-8 codepoint. Over-long pastes **truncate** rather than being rejected — the
-head still lands — and say so on the status line, so it is never silent.
+is capped, counted after that normalization and one WHOLE char at a time so
+truncation can never split a UTF-8 codepoint. The cap and its unit follow the
+destination (`update::PasteCap`): the board query takes at most `PASTE_MAX_CHARS`
+(4096) **chars**, because every space-separated word is rebuilt into a matcher and
+the query editor cannot draw a caret past column 65,535 (a known, accepted limit,
+argued at `view::render_search`); a compose draft takes at
+most `send::COMPOSE_PROMPT_MAX_BYTES` **bytes**, the limit below. Over-long pastes
+**truncate** rather than being rejected — the head still lands — and say so on the
+status line in the unit that applied ("kept the first N characters" / "kept the
+first N bytes"), so it is never silent.
+
+The compose limit exists because the draft becomes ONE argv element of the `claude`
+child on every launch path (`build_send_argv`, `build_fork_send_argv`,
+`build_bg_launch_argv`, `build_fork_run_argv`, `build_new_argv`). The OS caps one
+element, and the rule is `send::COMPOSE_PROMPT_MAX_BYTES`: on Linux 131,071 bytes
+(`MAX_ARG_STRLEN`, 32 pages of 4 KiB, less the NUL); on macOS 1 MiB (`ARG_MAX`,
+shared by all arguments and the environment) less a 256 KiB allowance, 786,432
+bytes; any other target takes the Linux value (measured 2026-10-30, Darwin 27.0.0
+and a `node:24-alpine` arm64 container). A paste is cut at it, but several pastes
+or typing can still pass it, so the SEND is checked too. `compose::submit_compose`
+(`Enter`, in ALL THREE boxes) and `compose::open_interactive` (`Ctrl-O`, in the fork
+box and the draft; the reply's `Ctrl-O` is inert and checks nothing) call
+`send::check_prompt_len` on the whole draft before any target routes, and a draft
+over the limit is refused with a STICKY status naming its size and the limit in
+bytes, the box left open with the draft intact, nothing sent, forked or launched,
+no fork jump armed and no agent recorded (`last_new_agent`). The status is one row
+cut at 80 columns, so `send::prompt_too_long_refusal` keeps its widest form
+(`usize::MAX` against the larger platform limit) inside them, pinned by a test. The
+draft is not bounded by the limit plus one: each paste is capped on its own, so two
+maximal macOS pastes already make 1,572,864 bytes. Not tested: how `claude` itself
+behaves given a prompt of several hundred KB as an argument.
+
+The compose box also has a drawing ceiling no cap here prevents: the editor
+computes its vertical scroll in 16 bits, so past 65,535 screen rows it scrolls to
+the wrong rows with the caret off screen, and a debug build can panic in the
+render loop. A known, accepted limit, argued at `view::render_compose_zone`.
 
 `handle_paste` returns no `Outcome`. A paste is DATA and structurally cannot send,
 resume, launch, or quit. There is deliberately **no `Ctrl-V` binding**: the paste
@@ -3574,8 +3607,8 @@ the session's folder and transcript (`compose::completion_source`).
 
 | Key | Route |
 | --- | --- |
-| `Enter` | headless, over the reply's send path (`compose::submit_fork_with`). An empty message nudges (`COMPOSE_EMPTY_FORK_HINT`, transient) and keeps the box. Otherwise: re-read the original's authoritative `(cwd, id)` (`send::plan_send`), take ONE fresh id (`send::fresh_session_id`, 16 bytes of `/dev/urandom` through the pure `format_uuid_v4`; a failed read refuses with a sticky status, keeps the box and its text, and dispatches nothing), build `send::build_fork_send_argv`, mark the send in flight under the NEW id, arm the cursor jump, and hand the driver a `SendRequest` keyed by that id. Completion is the reply's `SendFinished`, with its `sent — $…` wording. |
-| `Ctrl-O` | interactive hand-off, `SessionAction::ForkRun` (`update::launch_fork_run` → `resume::check_fork_run`: the same authoritative re-read, no race probe, and a non-zero exit says `MODEL_NONZERO_HINT` when `--model` is really emitted, else `FORK_NONZERO_HINT` — never the resume hint, which would send the user back to `Ctrl-F`). A session gone from the board refuses with `COMPOSE_FORK_SESSION_GONE`. A typed message rides as the trailing positional. No cursor jump. |
+| `Enter` | headless, over the reply's send path (`compose::submit_fork_with`). A message over `send::COMPOSE_PROMPT_MAX_BYTES` is refused FIRST, before any other step (`compose::submit_compose` → `send::check_prompt_len`: a sticky status naming its size and the limit, the box and its text kept, nothing dispatched, no jump armed). An empty message nudges (`COMPOSE_EMPTY_FORK_HINT`, transient) and keeps the box. Otherwise: re-read the original's authoritative `(cwd, id)` (`send::plan_send`), take ONE fresh id (`send::fresh_session_id`, 16 bytes of `/dev/urandom` through the pure `format_uuid_v4`; a failed read refuses with a sticky status, keeps the box and its text, and dispatches nothing), build `send::build_fork_send_argv`, mark the send in flight under the NEW id, arm the cursor jump, and hand the driver a `SendRequest` keyed by that id. Completion is the reply's `SendFinished`, with its `sent — $…` wording. |
+| `Ctrl-O` | interactive hand-off, `SessionAction::ForkRun` (`update::launch_fork_run` → `resume::check_fork_run`: the same authoritative re-read, no race probe, and a non-zero exit says `MODEL_NONZERO_HINT` when `--model` is really emitted, else `FORK_NONZERO_HINT` — never the resume hint, which would send the user back to `Ctrl-F`). A message over `send::COMPOSE_PROMPT_MAX_BYTES` is refused first, with `Enter`'s same sticky status and the box kept (`compose::open_interactive`, before the hand-off is built). A session gone from the board refuses with `COMPOSE_FORK_SESSION_GONE`. A typed message rides as the trailing positional. No cursor jump. |
 
 Both argvs, and what claude 2.1.291 was checked and probed for (both forms, the
 `Ctrl-O` message's auto-submit included), are
@@ -3636,9 +3669,9 @@ launching, and from there:
 
 | Key | argv | Route |
 | --- | --- | --- |
-| `Enter` (pick list closed) | `claude [--agent <name>] [--model <alias> [--effort <level>]] --bg <prompt>` | `Outcome::BgLaunch` → `send::spawn_bg_launch` → one `AppEvent::BgLaunchFinished`. **No teardown** — the board stays up. |
+| `Enter` (pick list closed) | `claude [--agent <name>] [--model <alias> [--effort <level>]] --bg <prompt>` | `Outcome::BgLaunch` → `send::spawn_bg_launch` → one `AppEvent::BgLaunchFinished`. **No teardown** — the board stays up. Refused first, with the box kept, for a draft over `send::COMPOSE_PROMPT_MAX_BYTES` or an empty one. |
 | `Enter` / `Tab` (pick list OPEN) | none | `ComposeAction::AcceptCompletion`: picks the highlighted row into the draft → `Outcome::Continue`. Launches nothing ([compose pick list](#compose-pick-list)). |
-| `Ctrl-O` | `claude [--agent <name>] [--model <alias> [--effort <level>]] [<prompt>]` | `Outcome::Resume` → the ordinary teardown round trip, via `resume::check_new`. |
+| `Ctrl-O` | `claude [--agent <name>] [--model <alias> [--effort <level>]] [<prompt>]` | `Outcome::Resume` → the ordinary teardown round trip, via `resume::check_new`. Refused first, with the box kept, for a draft over `send::COMPOSE_PROMPT_MAX_BYTES`; an empty one is fine. |
 
 `Esc` with the pick list open closes only the list (`ComposeAction::CloseCompletion`);
 with it closed, `Esc` cancels the draft and its card together.
@@ -3648,7 +3681,9 @@ family, not the hand-off one: `--bg` registers the agent and returns immediately
 with no TTY, so tearing the board down for it would buy nothing. An empty draft
 refuses `Enter` (a background agent with no prompt does nothing) but is fine for
 `Ctrl-O`, which then launches with no positional — with no pick, exactly what the
-picker's own `Ctrl-O` emits. Both routes carry the draft's own `Ctrl-L` pick when
+picker's own `Ctrl-O` emits. A draft too long to be one `claude` argument
+(`send::COMPOSE_PROMPT_MAX_BYTES`, [paste routing](#terminal-paste-routing-eventpaste))
+refuses BOTH keys, before either does anything else. Both routes carry the draft's own `Ctrl-L` pick when
 it has one, and only then ([compose model pick](#compose-model-pick-ctrl-l)): the
 draft chose its model, and which key starts it does not change that.
 
@@ -3713,8 +3748,10 @@ inside the draft alike. `Ctrl-B` is not bound anywhere.
 **`last_new_agent` is written where a launch ACTUALLY happens**, never where a
 draft merely opens, so a cancelled draft cannot rewrite it. That is three points:
 the picker's `Ctrl-O` (before the existence gate, so it survives a refusal),
-`compose::submit_bg_launch` (past the empty-buffer nudge — an empty draft is not a
-launch), and `compose::open_interactive`. The memory means "the agent of the last
+`compose::submit_bg_launch` (past the too-long refusal and the empty-buffer nudge —
+a draft that launched nothing is not a launch), and `compose::open_interactive`
+(past the too-long refusal; the picker's `Ctrl-O` has no draft to be too long). The
+memory means "the agent of the last
 new session actually started", which is exactly what pre-highlights the next
 `Ctrl-N`.
 

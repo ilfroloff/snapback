@@ -67,7 +67,7 @@
 //! | `Backspace` | delete the query character before the caret |
 //! | `Alt-Backspace` / `Ctrl-W` / `Alt-H` | delete the query ATOM before the caret — one whole search word, not one character, so a path or a branch name goes in a single press; what follows the caret stays. THREE keys because `TextArea::input` word-deletes on all three in the compose box: binding the same SET here is what makes the gesture reach the board at all, whatever the user's option-as-meta setting turns `Alt-Backspace` into. The set matches; the EXTENT deliberately does not — the board cuts at the search atom and the compose box at `CharKind`'s punctuation boundary, so `feature/fold-fork-lineages` goes whole here and loses only `lineages` there |
 //! | printable char | type-to-search (insert at the query's caret) |
-//! | terminal paste | inserted as TEXT — never as keystrokes (see below) |
+//! | terminal paste | inserted as TEXT — never as keystrokes (see below). A compose paste is cut at `send::COMPOSE_PROMPT_MAX_BYTES`; a draft over it is refused, box kept, on `Enter` in every box and on `Ctrl-O` in the fork box and the draft (`compose::refuse_too_long`) |
 //! | mouse: click a folded node's header | unfold the node — a subagent's hand-back (`◆ message from`) or context claude injected (`◇`) — where it sits, and a second click folds it back; a click on a header toggles its node and never opens a link. On the RELEASE, like a link, and ahead of one (see [`click_effect`]). Works while a quick reply or fork box is open, like every pointer action over the transcript but the `◆ delegated to …` switch below |
 //! | mouse: click a `◆ delegated to …` line | switch the preview to that subagent's OWN transcript — the SUBAGENT VIEW: the pane's title names the subagent, its pinned row names the subagent's turn, it takes no search marks, and it updates as the subagent writes. A `◆ delegated to …` line inside it switches to that nested subagent. `Up` or `Esc` goes back to the session's own transcript where it was scrolled; `Ctrl-X ↓` again, moving the selection, `Ctrl-R` and `Ctrl-F` leave it too. Only this click, `Ctrl-X ↓` and `Left` / `Right` inside the view open it — no search key does (see [`App::open_subagent_view`]). On the RELEASE, like a link. Refused, on a sticky status line, while a quick reply or fork box is open: what the box sends lands in the session, so the pane keeps showing the session's own transcript |
 //! | mouse: click a preview link | open its url in the browser — `http`/`https` only: any other scheme opens nothing and says so on a sticky status line. On the RELEASE, since only then is it known that the press was a click and not the start of a drag (see [`mouse_effect`]). Works while a quick reply or fork box is open |
@@ -110,10 +110,11 @@
 //! and inside tmux where an app-side clipboard read would not.
 //!
 //! [`handle_paste`] routes it through the SAME six-owner precedence the key arm
-//! uses, and the row above is deliberately terse because the interesting part is
-//! that routing — the four overlay owners swallow a paste, the compose zone inserts
-//! it at the caret, and the board inserts it at the query's caret with newlines
-//! flattened to spaces. A paste can never submit, resume, or quit.
+//! uses, and the row above says only what a compose draft's cap does, because the
+//! interesting part is that routing — the four overlay owners swallow a paste, the
+//! compose zone inserts it at the caret, and the board inserts it at the query's
+//! caret with newlines flattened to spaces. A paste can never submit, resume, or
+//! quit.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -1032,28 +1033,53 @@ fn is_actionable(key: KeyEvent) -> bool {
     matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
 }
 
-/// The most CHARACTERS one terminal paste may contribute, to the compose draft and
-/// to the board query alike.
+/// The most CHARACTERS one terminal paste may contribute to the BOARD query.
 ///
-/// The limit is about COST, not layout: `view::COMPOSE_MAX_TEXT_ROWS` already caps
-/// the compose box at 6 rows and the editor scrolls beyond that, so an enormous
-/// paste never breaks the geometry. What it does break is the per-frame work behind
-/// it — `compose::ComposeState::screen_rows` CLONES the whole `TextArea` (lines,
-/// undo history and screen map) on every redraw to probe its wrapped height, at the
-/// `watch::TICK` cadence for as long as the draft is open. On the board the same
-/// text feeds `search::SearchIndex::set_query`, which rebuilds the pattern and one
-/// substring finder per space-separated atom.
+/// The limit is about COST: the query feeds `search::SearchIndex::set_query`, which
+/// rebuilds the pattern and one substring finder per space-separated atom, and the
+/// query editor cannot DRAW a caret past column 65,535 — a known, accepted limit
+/// (`view::render_search` argues it). Commit `2ba3517` fixed only the delete-side
+/// cursor jump at that length, not the drawing. 4096 sits far above anything a human
+/// searches for while keeping that rebuild the same order of magnitude as typed
+/// input.
 ///
-/// 4096 is chosen to sit far above anything a human composes or pastes into a
-/// one-shot reply — a stack trace, a failing test's output, a diff hunk — while
-/// keeping both of those costs the same order of magnitude as typed input. ONE
-/// const covers both destinations deliberately: "how much text can arrive in a
-/// single paste?" deserves one greppable answer, and the board query's cost curve
-/// (linear in atoms) is gentler than the draft's, so a cap safe for the draft is
-/// safe there too.
+/// The compose box is NOT bound by this: its draft becomes one `claude` argument,
+/// so it has its own cap in bytes, [`send::COMPOSE_PROMPT_MAX_BYTES`]. What a draft
+/// that large costs PER FRAME — `compose::ComposeState::screen_rows` clones the whole
+/// `TextArea`, undo history included — is measured in that method's doc, not here.
 const PASTE_MAX_CHARS: usize = 4_096;
 
-/// The status a paste longer than [`PASTE_MAX_CHARS`] reports.
+/// What one paste is capped at, and in which unit: the board query counts
+/// CHARACTERS ([`PASTE_MAX_CHARS`]), a compose draft counts BYTES
+/// ([`send::COMPOSE_PROMPT_MAX_BYTES`]) because the operating system does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PasteCap {
+    /// At most this many chars, for the board query.
+    Chars(usize),
+    /// At most this many bytes, for a compose draft.
+    Bytes(usize),
+}
+
+impl PasteCap {
+    /// Whether `next` still fits after `taken` chars already stored as `text`.
+    fn admits(self, text: &str, taken: usize, next: char) -> bool {
+        match self {
+            Self::Chars(max) => taken < max,
+            Self::Bytes(max) => text.len() + next.len_utf8() <= max,
+        }
+    }
+
+    /// The cap for the surface a paste lands on.
+    fn for_destination(to_compose: bool) -> Self {
+        if to_compose {
+            Self::Bytes(send::COMPOSE_PROMPT_MAX_BYTES)
+        } else {
+            Self::Chars(PASTE_MAX_CHARS)
+        }
+    }
+}
+
+/// The status a paste longer than its [`PasteCap`] reports.
 ///
 /// TRUNCATE, not reject, and say so: rejecting a too-long paste outright throws away
 /// the part that DID fit and leaves the user nothing to edit down, while truncating
@@ -1064,16 +1090,24 @@ const PASTE_MAX_CHARS: usize = 4_096;
 ///
 /// A fn rather than a `const` because the NUMBER is the message: naming the cap is
 /// what turns "some of it was dropped" into "here is exactly how much landed", and
-/// a `&'static str` cannot interpolate it.
-fn paste_truncated_status() -> String {
-    format!("pasted text was too long — kept the first {PASTE_MAX_CHARS} characters")
+/// a `&'static str` cannot interpolate it. It names the cap in the unit that
+/// applied, so the compose box's figure is never read as characters.
+fn paste_truncated_status(cap: PasteCap) -> String {
+    match cap {
+        PasteCap::Chars(max) => {
+            format!("pasted text was too long — kept the first {max} characters")
+        }
+        PasteCap::Bytes(max) => {
+            format!("pasted text was too long — kept the first {max} bytes")
+        }
+    }
 }
 
 /// One terminal paste, normalized and capped — what the routing below is allowed to
 /// insert anywhere.
 struct AcceptedPaste {
-    /// The accepted text: line endings normalized to `\n`, at most
-    /// [`PASTE_MAX_CHARS`] chars.
+    /// The accepted text: line endings normalized to `\n`, within the [`PasteCap`]
+    /// it was accepted under.
     text: String,
     /// Whether the cap dropped a tail, so the caller can say so.
     truncated: bool,
@@ -1091,23 +1125,18 @@ struct AcceptedPaste {
 ///   as-is, a stray `\r` reaches the draft as an invisible control character and the
 ///   query as a byte no session label can contain, so the text silently stops
 ///   matching. `\r\n` collapses to ONE `\n`, never two.
-/// * **The cap is counted in CHARS, and taken from the NORMALIZED stream.** Counting
-///   chars rather than bytes is what makes truncation UTF-8 safe by construction:
-///   there is no index to land mid-codepoint on, so a paste ending in emoji or CJK
-///   cannot panic the way a naive byte slice would. Counting AFTER normalization
-///   means a CRLF pair costs one character, exactly like the `\n` it becomes.
-fn accept_paste(raw: &str) -> AcceptedPaste {
+/// * **The cap is taken from the NORMALIZED stream, one whole char at a time.**
+///   Chars are admitted or dropped whole, so truncation is UTF-8 safe by
+///   construction, in either unit: there is no index to land mid-codepoint on, so a
+///   paste ending in emoji or CJK cannot panic the way a naive byte slice would, and
+///   a multi-byte char that would straddle a byte cap is dropped, not split.
+///   Counting AFTER normalization means a CRLF pair costs one character, exactly
+///   like the `\n` it becomes.
+fn accept_paste(raw: &str, cap: PasteCap) -> AcceptedPaste {
     let mut text = String::new();
     let mut taken = 0usize;
     let mut chars = raw.chars().peekable();
     while let Some(c) = chars.next() {
-        if taken == PASTE_MAX_CHARS {
-            // Something is left, so the tail was dropped.
-            return AcceptedPaste {
-                text,
-                truncated: true,
-            };
-        }
         let c = if c == '\r' {
             // CRLF is ONE newline: swallow the LF that follows a CR.
             if chars.peek() == Some(&'\n') {
@@ -1117,6 +1146,13 @@ fn accept_paste(raw: &str) -> AcceptedPaste {
         } else {
             c
         };
+        if !cap.admits(&text, taken, c) {
+            // Something is left, so the tail was dropped.
+            return AcceptedPaste {
+                text,
+                truncated: true,
+            };
+        }
         text.push(c);
         taken += 1;
     }
@@ -1190,7 +1226,8 @@ fn handle_paste(app: &mut App, raw: &str) {
         None => false,
     };
 
-    let accepted = accept_paste(raw);
+    let cap = PasteCap::for_destination(to_compose);
+    let accepted = accept_paste(raw, cap);
     if accepted.text.is_empty() {
         return;
     }
@@ -1206,7 +1243,7 @@ fn handle_paste(app: &mut App, raw: &str) {
     }
 
     if accepted.truncated {
-        app.set_status_transient(paste_truncated_status());
+        app.set_status_transient(paste_truncated_status(cap));
     }
 }
 
@@ -3271,6 +3308,9 @@ mod tests {
     use std::collections::HashSet;
     use time::OffsetDateTime;
 
+    /// The board query's paste cap, as `handle_paste` applies it.
+    const BOARD_CAP: PasteCap = PasteCap::Chars(PASTE_MAX_CHARS);
+
     /// A store over `root` for a test that drives [`handle_event`]. Most routing
     /// tests never reload at all, so the root is usually a placeholder — where a
     /// reload IS exercised (the delete tests), it is the test's own temp store.
@@ -4632,14 +4672,14 @@ mod tests {
     /// invisible control char in the draft and an unmatchable byte in the query.
     #[test]
     fn accept_paste_normalizes_every_line_ending_to_lf() {
-        let accepted = accept_paste("crlf\r\ncr\rlf\ntail");
+        let accepted = accept_paste("crlf\r\ncr\rlf\ntail", BOARD_CAP);
         assert_eq!(accepted.text, "crlf\ncr\nlf\ntail");
         assert!(!accepted.truncated);
 
         // A CRLF is ONE newline, never two.
-        assert_eq!(accept_paste("a\r\n\r\nb").text, "a\n\nb");
+        assert_eq!(accept_paste("a\r\n\r\nb", BOARD_CAP).text, "a\n\nb");
         // A trailing CR still normalizes (nothing follows it to pair with).
-        assert_eq!(accept_paste("a\r").text, "a\n");
+        assert_eq!(accept_paste("a\r", BOARD_CAP).text, "a\n");
     }
 
     /// The cap counts CHARACTERS, so truncation can never split a UTF-8 codepoint —
@@ -4649,7 +4689,7 @@ mod tests {
     fn accept_paste_caps_by_chars_without_splitting_a_codepoint() {
         // 3-byte chars, so a byte-indexed cap would land mid-codepoint.
         let at_cap: String = "☃".repeat(PASTE_MAX_CHARS);
-        let accepted = accept_paste(&at_cap);
+        let accepted = accept_paste(&at_cap, BOARD_CAP);
         assert_eq!(accepted.text.chars().count(), PASTE_MAX_CHARS);
         assert!(
             !accepted.truncated,
@@ -4657,7 +4697,7 @@ mod tests {
         );
 
         let over_cap = format!("{at_cap}☃tail");
-        let accepted = accept_paste(&over_cap);
+        let accepted = accept_paste(&over_cap, BOARD_CAP);
         assert!(accepted.truncated, "one char past the cap is a truncation");
         assert_eq!(accepted.text.chars().count(), PASTE_MAX_CHARS);
         assert_eq!(
@@ -4670,7 +4710,7 @@ mod tests {
         // A CRLF pair costs ONE char against the cap, like the newline it becomes:
         // 2 * PASTE_MAX_CHARS raw chars normalize to exactly the cap and fit.
         let crlfs = "\r\n".repeat(PASTE_MAX_CHARS);
-        let accepted = accept_paste(&crlfs);
+        let accepted = accept_paste(&crlfs, BOARD_CAP);
         assert!(
             !accepted.truncated,
             "the cap counts NORMALIZED chars, so a CRLF pair costs one"
@@ -4754,39 +4794,96 @@ mod tests {
 
     /// An over-long paste is TRUNCATED rather than rejected — the head still lands —
     /// and never silently: the status line says the tail was dropped, on both
-    /// destinations.
+    /// destinations, each in its own unit.
     #[test]
     fn an_over_long_paste_is_truncated_and_says_so() {
-        let huge = "x".repeat(PASTE_MAX_CHARS + 100);
-
-        // Into the draft.
+        // Into the draft: the cap is the argv limit in BYTES.
+        let huge = "x".repeat(send::COMPOSE_PROMPT_MAX_BYTES + 100);
         let mut app = app_with("idle", None);
         press_ctrl(&mut app, KeyCode::Char('r'));
         paste(&mut app, &huge);
         assert_eq!(
-            draft_text(&app).chars().count(),
-            PASTE_MAX_CHARS,
+            draft_text(&app).len(),
+            send::COMPOSE_PROMPT_MAX_BYTES,
             "the head still lands — truncate, never reject"
         );
+        let draft_status = paste_truncated_status(PasteCap::Bytes(send::COMPOSE_PROMPT_MAX_BYTES));
         assert_eq!(
             app.status.as_deref(),
-            Some(paste_truncated_status().as_str()),
+            Some(draft_status.as_str()),
             "a shortened paste must not be silent"
         );
 
-        // Into the board query.
+        // Into the board query: still 4,096 CHARACTERS.
+        let huge = "x".repeat(PASTE_MAX_CHARS + 100);
         let mut app = app_with("idle", None);
         paste(&mut app, &huge);
         assert_eq!(app.query().chars().count(), PASTE_MAX_CHARS);
         assert_eq!(
             app.status.as_deref(),
-            Some(paste_truncated_status().as_str())
+            Some(paste_truncated_status(BOARD_CAP).as_str())
         );
 
         // A paste WITHIN the cap sets no status at all.
         let mut app = app_with("idle", None);
         paste(&mut app, "small");
         assert_eq!(app.status, None);
+    }
+
+    /// The compose box takes a paste well past the board's 4,096 characters whole,
+    /// up to exactly the argv limit, with no status: the draft is one `claude`
+    /// argument, not a search query.
+    #[test]
+    fn a_compose_paste_past_the_board_cap_but_within_the_limit_lands_whole() {
+        let text = "y".repeat(PASTE_MAX_CHARS * 10);
+        assert!(text.len() < send::COMPOSE_PROMPT_MAX_BYTES);
+        let mut app = app_with("idle", None);
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        paste(&mut app, &text);
+        assert_eq!(draft_text(&app), text);
+        assert_eq!(app.status, None);
+
+        // Exactly the limit is not a truncation either.
+        let exact = "y".repeat(send::COMPOSE_PROMPT_MAX_BYTES);
+        let mut app = app_with("idle", None);
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        paste(&mut app, &exact);
+        assert_eq!(draft_text(&app).len(), send::COMPOSE_PROMPT_MAX_BYTES);
+        assert_eq!(app.status, None);
+    }
+
+    /// The byte cap lands on a char boundary: a multi-byte char that would straddle
+    /// it is dropped whole, never split, and the status names BYTES.
+    #[test]
+    fn a_byte_cap_never_splits_a_multibyte_char() {
+        let cap = PasteCap::Bytes(send::COMPOSE_PROMPT_MAX_BYTES);
+        // `max - 1` one-byte chars leave room for one byte; a 3-byte char straddles.
+        let straddling = format!("{}☃tail", "a".repeat(send::COMPOSE_PROMPT_MAX_BYTES - 1));
+        let accepted = accept_paste(&straddling, cap);
+        assert!(accepted.truncated);
+        assert_eq!(
+            accepted.text,
+            "a".repeat(send::COMPOSE_PROMPT_MAX_BYTES - 1)
+        );
+
+        // Three bytes per char: the cut is a whole number of them.
+        let wide = "☃".repeat(send::COMPOSE_PROMPT_MAX_BYTES / 3 + 2);
+        let accepted = accept_paste(&wide, cap);
+        assert!(accepted.truncated);
+        assert_eq!(accepted.text.len(), send::COMPOSE_PROMPT_MAX_BYTES / 3 * 3);
+
+        // Through the real paste path, into a draft.
+        let mut app = app_with("idle", None);
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        paste(&mut app, &wide);
+        assert_eq!(
+            draft_text(&app).len(),
+            send::COMPOSE_PROMPT_MAX_BYTES / 3 * 3
+        );
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|s| s.ends_with(" bytes") && !s.contains("characters")));
     }
 
     /// The paste-too-long nudge is a transient confirmation, not a sticky refusal.
@@ -4800,7 +4897,7 @@ mod tests {
 
         assert_eq!(
             app.status.as_deref(),
-            Some(paste_truncated_status().as_str()),
+            Some(paste_truncated_status(BOARD_CAP).as_str()),
             "the nudge appears immediately"
         );
         assert_eq!(
@@ -4822,15 +4919,20 @@ mod tests {
         assert_eq!(app.status_ttl, None);
     }
 
-    /// The truncation status must name the CAP, so "some of it was dropped" becomes
-    /// "here is exactly how much landed" — the number is the whole point of the
-    /// message.
+    /// The truncation status must name the CAP in the unit that applied, so "some
+    /// of it was dropped" becomes "here is exactly how much landed" — the number is
+    /// the whole point of the message.
     #[test]
-    fn the_truncation_status_names_the_cap() {
-        let status = paste_truncated_status();
+    fn the_truncation_status_names_the_cap_in_its_unit() {
+        let board = paste_truncated_status(BOARD_CAP);
         assert!(
-            status.contains(&PASTE_MAX_CHARS.to_string()),
-            "the status must state how much was kept, got {status:?}"
+            board.contains(&PASTE_MAX_CHARS.to_string()) && board.ends_with("characters"),
+            "the board status states its cap in characters, got {board:?}"
+        );
+        let draft = paste_truncated_status(PasteCap::Bytes(send::COMPOSE_PROMPT_MAX_BYTES));
+        assert!(
+            draft.contains(&send::COMPOSE_PROMPT_MAX_BYTES.to_string()) && draft.ends_with("bytes"),
+            "the compose status states its cap in bytes, got {draft:?}"
         );
     }
 
