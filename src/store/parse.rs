@@ -16,6 +16,7 @@
 //! about the file. Fail-soft is unchanged either way — both yield no row and
 //! neither can panic.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -54,6 +55,14 @@ pub const CONTENT_INDEX_CAP: usize = 1024 * 1024;
 /// not exactly this string (absent, null, a number, a different word) leaves the
 /// file non-background rather than producing a verdict.
 pub const SESSION_KIND_BACKGROUND: &str = "bg";
+
+/// The `subtype` of the `system` record claude writes at a compaction, a null-parent
+/// record that starts a new tree. The only later root that may link files into a
+/// lineage: a later null-parent record of any other kind (a second original
+/// conversation's root, say) says nothing about a shared conversation. Observed in
+/// a real store, not documented upstream, so the read is FAIL-SOFT: a missing or
+/// non-string `subtype` is no boundary.
+pub const SUBTYPE_COMPACT_BOUNDARY: &str = "compact_boundary";
 
 /// The `origin.kind` of a record a PERSON wrote into the session.
 ///
@@ -148,7 +157,10 @@ pub struct ParsedFile {
     pub cwd: String,
     /// `sessionId` from inside the file (first non-null), else the file stem.
     pub session_id: String,
-    /// `gitBranch` from inside the file (last non-null).
+    /// The branch the session lists under: the last non-null `gitBranch` seen on
+    /// a record whose own `cwd` is [`cwd`](Self::cwd), the authoritative folder
+    /// (a `relocatedCwd` override included); the last non-null one anywhere in
+    /// the file when that folder saw none. Rule and why: `docs/agents/DOMAIN.md`.
     pub git_branch: Option<String>,
     /// `timestamp` from inside the file (last non-null), unparsed RFC 3339.
     pub timestamp_raw: Option<String>,
@@ -157,8 +169,8 @@ pub struct ParsedFile {
     /// First prompt the user wrote, if any — a typed prompt or a confirmed prompt
     /// command as `/name args` (see [`label::FirstPrompt`]).
     pub first_user: Option<String>,
-    /// `uuid` of the record whose `parentUuid` is JSON `null` — the transcript
-    /// TREE's root, which identifies a fork lineage (a background hand-off copies
+    /// `uuid` of the FIRST record whose `parentUuid` is JSON `null` — the
+    /// transcript TREE's root, which identifies a fork lineage (a background hand-off copies
     /// the whole leading prefix, root included, into the new session file).
     ///
     /// NOT the first `user`/`assistant` uuid: the root is an `attachment` in the
@@ -168,6 +180,15 @@ pub struct ParsedFile {
     /// the file has no null-parent record — fail-soft, meaning "no lineage",
     /// never a dropped session.
     pub root_uuid: Option<String>,
+    /// The `uuid` of every `compact_boundary` ([`SUBTYPE_COMPACT_BOUNDARY`])
+    /// null-parent record after [`root_uuid`](Self::root_uuid), in file order,
+    /// without duplicates. Claude writes one per compaction, and a fork of a
+    /// compacted session copies from that boundary on, so a fork's first root can
+    /// be one of these rather than the parent's [`root_uuid`](Self::root_uuid).
+    /// The pass that links such a fork to its parent is `lineage::resolve_roots`;
+    /// empty when the file has no compaction. A later null-parent record of any
+    /// other kind is not kept, so it can never link files.
+    pub later_roots: Vec<String>,
     /// How many conversation TURNS the file holds: records typed `user` or
     /// `assistant`.
     ///
@@ -270,6 +291,10 @@ pub fn parse_file(path: &Path) -> FileVerdict<ParsedFile> {
     let mut summary: Option<String> = None;
     let mut first_user = label::FirstPrompt::default();
     let mut root_uuid: Option<String> = None;
+    let mut later_roots: Vec<String> = Vec::new();
+    // The last non-null `gitBranch` per record `cwd`, so the session's branch can
+    // be the one seen in its authoritative folder.
+    let mut branch_by_cwd: HashMap<String, String> = HashMap::new();
     let mut msg_count: usize = 0;
     let mut content_index = String::new();
     let mut background = false;
@@ -336,24 +361,35 @@ pub fn parse_file(path: &Path) -> FileVerdict<ParsedFile> {
                 session_id = Some(s.to_string());
             }
         }
-        // Lineage root: the FIRST record in file order whose `parentUuid` is JSON
-        // null. The transcript is a TREE and this is its root, so it is copied
-        // verbatim into every fork of the session — which is what makes it a
-        // stable lineage identity. Deliberately NOT filtered by `type`: the root
-        // is usually an `attachment` (hook-injected context), only sometimes a
-        // `user` message.
+        // Lineage roots: records whose `parentUuid` is JSON null. The transcript
+        // is a TREE and a root is copied verbatim into every fork of it, which is
+        // what makes it a stable lineage identity. The FIRST in file order is
+        // `root_uuid`, whatever its kind; a LATER one is kept in `later_roots`
+        // only when it is a compaction boundary. Deliberately NOT filtered by
+        // `type`: the first root is usually an `attachment` (hook-injected
+        // context), only sometimes a `user`.
         //
         // `get` distinguishes the two cases this depends on: an ABSENT
         // `parentUuid` yields `None` (records outside the tree — `last-prompt`,
         // `mode`, `agent-setting`, `permission-mode`, `file-history-snapshot` —
-        // carry no such key and must never be mistaken for the root), whereas the
-        // root yields `Some(Value::Null)`. A null-parent record with no readable
-        // `uuid` is skipped rather than latching, so a later one can still win
-        // (fail-soft). A file may carry more than one null-parent record (a
-        // forest); the first wins, deterministically.
-        if root_uuid.is_none() && record.get("parentUuid").is_some_and(Value::is_null) {
+        // carry no such key and must never be mistaken for a root), whereas a root
+        // yields `Some(Value::Null)`. A null-parent record with no readable `uuid`
+        // is skipped rather than latching, so a later one can still win
+        // (fail-soft).
+        if record.get("parentUuid").is_some_and(Value::is_null) {
             if let Some(u) = record.get("uuid").and_then(Value::as_str) {
-                root_uuid = Some(u.to_string());
+                match &root_uuid {
+                    None => root_uuid = Some(u.to_string()),
+                    Some(first)
+                        if first != u
+                            && record.get("subtype").and_then(Value::as_str)
+                                == Some(SUBTYPE_COMPACT_BOUNDARY)
+                            && !later_roots.iter().any(|r| r == u) =>
+                    {
+                        later_roots.push(u.to_string());
+                    }
+                    Some(_) => {}
+                }
             }
         }
         // Conversation TURNS: `user` + `assistant` records, counted here in the
@@ -431,6 +467,18 @@ pub fn parse_file(path: &Path) -> FileVerdict<ParsedFile> {
         // gitBranch + timestamp: last non-null (most-recent activity wins).
         if let Some(b) = record.get("gitBranch").and_then(Value::as_str) {
             git_branch = Some(b.to_string());
+            if let Some(c) = record.get("cwd").and_then(Value::as_str) {
+                match branch_by_cwd.get_mut(c) {
+                    Some(seen) => {
+                        if seen != b {
+                            *seen = b.to_string();
+                        }
+                    }
+                    None => {
+                        branch_by_cwd.insert(c.to_string(), b.to_string());
+                    }
+                }
+            }
         }
         if let Some(t) = record.get("timestamp").and_then(Value::as_str) {
             timestamp_raw = Some(t.to_string());
@@ -453,6 +501,8 @@ pub fn parse_file(path: &Path) -> FileVerdict<ParsedFile> {
         return FileVerdict::NotASession;
     };
     let cwd = relocated_cwd.unwrap_or(cwd);
+    // The branch of the folder the row lists under, else today's last-seen rule.
+    let git_branch = branch_by_cwd.remove(&cwd).or(git_branch);
     let session_id = session_id.unwrap_or_else(|| file_stem(path));
     truncate_on_char_boundary(&mut content_index, CONTENT_INDEX_CAP);
 
@@ -464,6 +514,7 @@ pub fn parse_file(path: &Path) -> FileVerdict<ParsedFile> {
         summary,
         first_user: first_user.into_first(),
         root_uuid,
+        later_roots,
         msg_count,
         content_index,
         background,
@@ -1575,6 +1626,123 @@ mod tests {
         let parsed = parse_lines("forest", &lines).expect("file has a cwd");
 
         assert_eq!(parsed.root_uuid.as_deref(), Some("root-first"));
+    }
+
+    #[test]
+    fn every_compact_boundary_after_the_first_root_is_kept_in_file_order() {
+        // One compaction boundary is one more null-parent record. The first stays
+        // `root_uuid`; each boundary after it is kept, in file order, so a fork that
+        // starts at a boundary can be linked back to this file
+        // (`lineage::resolve_roots`).
+        let lines = [
+            r#"{"type":"attachment","sessionId":"s","cwd":"/w","uuid":"root-1","parentUuid":null,"attachment":{}}"#,
+            r#"{"type":"user","sessionId":"s","cwd":"/w","uuid":"u-1","parentUuid":"root-1","message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"system","sessionId":"s","cwd":"/w","uuid":"root-2","parentUuid":null,"subtype":"compact_boundary"}"#,
+            // Not roots: an absent `parentUuid` (out of tree), a null-parent record
+            // with no readable `uuid`, a repeat of a root already kept, and a
+            // non-string `uuid`.
+            r#"{"type":"file-history-snapshot","sessionId":"s","uuid":"out-of-tree"}"#,
+            r#"{"type":"system","sessionId":"s","cwd":"/w","parentUuid":null}"#,
+            r#"{"type":"system","sessionId":"s","cwd":"/w","uuid":"root-2","parentUuid":null}"#,
+            r#"{"type":"system","sessionId":"s","cwd":"/w","uuid":"root-1","parentUuid":null}"#,
+            r#"{"type":"system","sessionId":"s","cwd":"/w","uuid":7,"parentUuid":null}"#,
+            r#"{"type":"system","sessionId":"s","cwd":"/w","uuid":"root-3","parentUuid":null,"subtype":"compact_boundary"}"#,
+        ];
+        let parsed = parse_lines("compacted", &lines).expect("file has a cwd");
+
+        assert_eq!(parsed.root_uuid.as_deref(), Some("root-1"));
+        assert_eq!(parsed.later_roots, vec!["root-2", "root-3"]);
+    }
+
+    #[test]
+    fn a_later_null_parent_record_that_is_not_a_compact_boundary_is_not_kept() {
+        // Only a boundary may link files, so a later root of any other kind (no
+        // `subtype`, another one, an unreadable one, a conversation turn) is
+        // dropped. Each lives in its own file: the first root is always kept, and
+        // the boundary at the end is the positive control.
+        let first = r#"{"type":"attachment","sessionId":"s","cwd":"/w","uuid":"root-1","parentUuid":null,"attachment":{}}"#;
+        let boundary = r#"{"type":"system","sessionId":"s","cwd":"/w","uuid":"root-b","parentUuid":null,"subtype":"compact_boundary"}"#;
+        let others = [
+            r#"{"type":"system","sessionId":"s","cwd":"/w","uuid":"root-x","parentUuid":null}"#,
+            r#"{"type":"system","sessionId":"s","cwd":"/w","uuid":"root-x","parentUuid":null,"subtype":"informational"}"#,
+            r#"{"type":"system","sessionId":"s","cwd":"/w","uuid":"root-x","parentUuid":null,"subtype":7}"#,
+            r#"{"type":"system","sessionId":"s","cwd":"/w","uuid":"root-x","parentUuid":null,"subtype":null}"#,
+            r#"{"type":"user","sessionId":"s","cwd":"/w","uuid":"root-x","parentUuid":null,"message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"attachment","sessionId":"s","cwd":"/w","uuid":"root-x","parentUuid":null,"attachment":{}}"#,
+        ];
+        for other in others {
+            let parsed = parse_lines("not-a-boundary", &[first, other, boundary]).unwrap();
+            assert_eq!(parsed.root_uuid.as_deref(), Some("root-1"), "{other}");
+            assert_eq!(parsed.later_roots, vec!["root-b"], "{other}");
+        }
+    }
+
+    #[test]
+    fn a_file_with_one_root_or_none_has_no_later_roots() {
+        let one = [
+            r#"{"type":"attachment","sessionId":"s","cwd":"/w","uuid":"root-1","parentUuid":null,"attachment":{}}"#,
+        ];
+        assert!(parse_lines("one-root", &one)
+            .unwrap()
+            .later_roots
+            .is_empty());
+        let none = [
+            r#"{"type":"user","sessionId":"s","cwd":"/w","uuid":"u-1","parentUuid":"gone","message":{"role":"user","content":"x"}}"#,
+        ];
+        assert!(parse_lines("no-root", &none)
+            .unwrap()
+            .later_roots
+            .is_empty());
+    }
+
+    #[test]
+    fn the_branch_is_the_last_one_seen_in_the_sessions_own_folder() {
+        // The session starts in /w (main); a later turn in another folder sits on
+        // another branch. That record does not move the row's branch: the folder
+        // the row lists under saw `main` last.
+        let lines = [
+            r#"{"type":"user","sessionId":"s","cwd":"/w","gitBranch":"dev","uuid":"u-1","parentUuid":null,"message":{"role":"user","content":"a"}}"#,
+            r#"{"type":"user","sessionId":"s","cwd":"/w","gitBranch":"main","uuid":"u-2","parentUuid":"u-1","message":{"role":"user","content":"b"}}"#,
+            r#"{"type":"user","sessionId":"s","cwd":"/other","gitBranch":"feature/x","uuid":"u-3","parentUuid":"u-2","message":{"role":"user","content":"c"}}"#,
+        ];
+        let parsed = parse_lines("own-folder", &lines).unwrap();
+
+        assert_eq!(parsed.cwd, "/w");
+        assert_eq!(parsed.git_branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn a_relocated_session_takes_the_branch_of_the_folder_it_moved_to() {
+        // `relocatedCwd` is the authoritative folder, so its branch is the row's,
+        // although the file's last record anywhere sits on another branch.
+        let lines = [
+            r#"{"type":"user","sessionId":"s","cwd":"/old","gitBranch":"main","uuid":"u-1","parentUuid":null,"message":{"role":"user","content":"a"}}"#,
+            r#"{"type":"relocated","sessionId":"s","relocatedCwd":"/new"}"#,
+            r#"{"type":"user","sessionId":"s","cwd":"/new","gitBranch":"feature/moved","uuid":"u-2","parentUuid":"u-1","message":{"role":"user","content":"b"}}"#,
+            r#"{"type":"user","sessionId":"s","cwd":"/old","gitBranch":"main","uuid":"u-3","parentUuid":"u-2","message":{"role":"user","content":"c"}}"#,
+        ];
+        let parsed = parse_lines("relocated-branch", &lines).unwrap();
+
+        assert_eq!(parsed.cwd, "/new");
+        assert_eq!(parsed.git_branch.as_deref(), Some("feature/moved"));
+    }
+
+    #[test]
+    fn a_folder_that_saw_no_branch_falls_back_to_the_last_branch_anywhere() {
+        // Moved to /new but never written to there: no branch to read for it, so
+        // the old rule (last non-null overall) answers. A record with a branch but
+        // no `cwd` takes part in that fallback only.
+        let lines = [
+            r#"{"type":"user","sessionId":"s","cwd":"/old","gitBranch":"main","uuid":"u-1","parentUuid":null,"message":{"role":"user","content":"a"}}"#,
+            r#"{"type":"user","sessionId":"s","gitBranch":"feature/no-cwd","uuid":"u-2","parentUuid":"u-1","message":{"role":"user","content":"b"}}"#,
+            r#"{"type":"relocated","sessionId":"s","relocatedCwd":"/new"}"#,
+        ];
+        let parsed = parse_lines("fallback-branch", &lines).unwrap();
+
+        assert_eq!(parsed.cwd, "/new");
+        assert_eq!(parsed.git_branch.as_deref(), Some("feature/no-cwd"));
+        let none = [r#"{"type":"user","sessionId":"s","cwd":"/w","uuid":"u","parentUuid":null}"#];
+        assert_eq!(parse_lines("no-branch", &none).unwrap().git_branch, None);
     }
 
     #[test]

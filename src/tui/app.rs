@@ -7040,6 +7040,8 @@ mod tests {
             repo: repo.to_string(),
             label: format!("label for {id}"),
             root_uuid: None,
+            later_roots: Vec::new(),
+            lineage_root: None,
             msg_count: 0,
             content_index: String::new(),
             background: false,
@@ -7982,6 +7984,38 @@ mod tests {
 
         std::env::remove_var("SNAPBACK_CONFIG_DIR");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `Delete lineage (N)` and `Move lineage (N)` both take their set from
+    /// `lineage_choice`, so this pins what they now cover: forks made AFTER the
+    /// parent compacted (their first root is one of the parent's later roots) are
+    /// members, read off the committed compaction fixture through the real store.
+    /// Before roots were linked the parent's row offered no lineage at all.
+    #[test]
+    fn lineage_choice_from_the_parents_head_row_includes_post_compaction_forks() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("compaction_store");
+        let mut app = app_all(crate::store::SessionStore::load_from(&root));
+        app.set_selected(Some("sess-compact-parent-1".to_string()));
+
+        assert_eq!(
+            hidden_for(&app, "sess-compact-parent-1"),
+            Some(2),
+            "premise: the parent's folded row stands for both forks"
+        );
+        let mut members = app.lineage_choice().expect("a head row offers its lineage");
+        members.sort();
+        assert_eq!(
+            members,
+            vec![
+                "sess-compact-fork-1".to_string(),
+                "sess-compact-fork-2".to_string(),
+                "sess-compact-parent-1".to_string(),
+            ],
+            "the unrelated session in the same folder is not swept in"
+        );
     }
 
     /// A head whose copies are all already hidden (show-hidden off) stands alone,

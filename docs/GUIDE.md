@@ -344,6 +344,14 @@ says how many messages it holds — `6 msgs` next to `171 msgs` — so you can s
 which one is a stub the hand-off left behind and which one holds the real work.
 The names can't tell you that; they're identical.
 
+A conversation that Claude Code compacted keeps its stack: forks made after the
+compaction are still copies of it, and snapback links them back to the original
+session by the compaction records they share, so they fold under it (and
+**Delete lineage** / **Move lineage** on the top row cover them too). A row also
+lists under the branch of the folder the session belongs to (where it started, or where
+you moved it), so a turn run in a worktree it merely visited does not move it to
+that worktree's branch.
+
 **Forks you make stay under the session you forked.** A fork from the `Ctrl-F`
 box lands in the same stack, but it's new work rather than a copy that took
 over, so snapback names it `fork: <first line of your message>` and keeps the

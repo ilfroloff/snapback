@@ -374,7 +374,7 @@ never fatal:
 | `cwd` | the LAST non-empty `relocatedCwd` of a `relocated` record, else first non-null | authoritative working dir; **absence of a plain `cwd` ⇒ not a session** (a `relocated` record alone never makes one) |
 | `relocated` → `relocatedCwd` | on `type:"relocated"`, string (fail-soft: missing, blank, non-string, or on any other record type ⇒ ignored; a blank one never displaces an earlier valid one) | the move marker claude writes for its own `/cd` ([CLAUDE_CLI.md](CLAUDE_CLI.md#cd-moving-a-session-to-another-folder)) and for the `Ctrl-X w` move's `set_cwd` ([CLAUDE_CLI.md](CLAUDE_CLI.md#set_cwd-moving-a-session-without-leaving-the-board)): it overrides the head `cwd`, so the row is homed, scoped, grouped, resumed and quick-replied in the folder the session moved to |
 | `sessionId` | first non-null (else file stem) | stable id, resume target, reported-agent join key |
-| `gitBranch` | last non-null (`None` ⇒ `(detached)`) | branch grouping level |
+| `gitBranch` | the last non-null one on a record whose own `cwd` is the session's authoritative folder (the `relocatedCwd` override included); when that folder saw none, the last non-null anywhere in the file (`None` ⇒ `(detached)`) | branch grouping level. A turn run in another folder (a worktree entered mid-session, a `cd`) is another folder's branch and does not move the row |
 | `timestamp` | last non-null, RFC 3339 | sort + display (per-message too, in preview; a [failed notice](#failed-background-task-storeparse)'s own, on the banner) |
 | `type` | `"summary"` / `"user"` / `"assistant"` / `"agent-setting"` / `"agent-name"` / `"custom-title"` | label, preview, content index, [turn count](#turn-count-storeparse) |
 | `customTitle` | on `type:"custom-title"`, string (fail-soft: absent, null, non-string or blank ⇒ the record names nothing); the **LAST** such record in file order wins, because claude re-appends its metadata rather than rewriting it (a `--name`d `claude -p` fork wrote it twice at 2.1.291), so a later record — a rename's included — is the current name, and a malformed one leaves the earlier name standing | `Session::custom_title`: whether a member is a [fork snapback named](#named-forks-the-fork-name-prefix), which picks the lineage head and labels the fork's child row. Never the row label itself |
@@ -397,10 +397,15 @@ never fatal:
 | `isMeta` | bool on `type:"user"` and `type:"assistant"`; anything but absent or `false` reads as meta (`label::is_meta`, the ONE reading of it) | an injection nobody typed: on a user record it never clears the flag; on an assistant record it is skipped when finding [the model a `-r` launch restores](#the-model-a--r-launch-restores-last_model). Every subagent hand-back carries it too, so "Claude Code injected this" is `isMeta` AND not a [peer message](#peer-message-node-storepreview) (`label::is_injected`) — the ONE check the preview's [injected node](#injected-context-node-storepreview), the [content index](#content-index-storeparse) and the [label](#label-storelabel) all read |
 | `<status>` / `<summary>` | tags inside the **string** `message.content` of an `origin.kind: "task-notification"` record; first occurrence, inner text | `<status>failed</status>` raises the flag on its own; the `<summary>` is kept and quoted **verbatim** on the banner. Optional: absent or unclosed ⇒ kept empty, exactly like `<summary></summary>`, and the banner quotes nothing |
 | `uuid` | per record | a record's identity in the transcript **tree**; an [injected node](#injected-context-node-storepreview)'s fold key |
-| `parentUuid` | per record; **JSON `null` on the root** | the tree edge; the null-parent record's `uuid` is the fork-lineage identity (see [Fork lineage](#fork-lineage-storelineage)); an injected record pointing at the slash-command wrapper just before it confirms a [prompt command label](#label-storelabel) |
+| `parentUuid` | per record; **JSON `null` on a root** | the tree edge; the `uuid`s of the null-parent records, in file order, are the fork-lineage identity: the first is the file's `root_uuid`, and each later one that is a `compact_boundary` (`subtype`; one per compaction) is in its `later_roots`, which a fork of a compacted session may start at (see [Fork lineage](#fork-lineage-storelineage)); an injected record pointing at the slash-command wrapper just before it confirms a [prompt command label](#label-storelabel) |
 
 "First non-null" vs "last non-null" is deliberate: identity fields take the
-earliest value, activity fields (branch, timestamp) take the most recent. `cwd` is
+earliest value, activity fields (branch, timestamp) take the most recent. The
+branch is the one activity field read within the session's own folder first
+(`parse_file` keeps the last `gitBranch` per record `cwd`): claude stamps every
+record with the folder it ran in, so a turn run in a worktree the session
+visited carries that worktree's branch and would otherwise rename the row, and
+split a fork from its parent, for a place the row does not list under. `cwd` is
 the one identity field with an explicit override: a `relocated` record is claude's
 own statement that the session now belongs elsewhere (it derives a session's folder
 as `relocatedCwd ?? headCwdStrict` and merges the record `last-wins`, observed at
@@ -506,8 +511,9 @@ live set, `repo_root_of` for the removed worktrees git can no longer name. A rep
 whose worktrees match no marker here still aggregates correctly through the git
 arm, for exactly as long as those worktrees exist.
 
-The branch level comes from the authoritative `gitBranch` (missing ⇒
-`(detached)`). The store returns sessions repo↑ / branch↑ / timestamp↓ (the order
+The branch level comes from the authoritative `gitBranch` — the one seen in the
+session's own folder, else the last anywhere (missing ⇒
+`(detached)`); see the [record model](#jsonl-record-model). The store returns sessions repo↑ / branch↑ / timestamp↓ (the order
 `--print-list` prints); the board re-orders them in `App::order_filtered`. The
 current-folder scope is a flat timestamp↓ list with no heads; the project and
 all-folders scopes render one group head per repo→branch group (the project scope
@@ -841,6 +847,12 @@ what really differs (a file inside the settle window is listed even if its bytes
 did not move). Consumers evict derived caches from it, so over-reporting costs a
 re-render while under-reporting would show stale text.
 
+One reload answer is not purely per-file: `lineage::resolve_roots` runs over the
+whole session set AFTER the cache took its copies and sets each session's resolved
+lineage root (`Session::lineage_root`; [why](#the-root-uuid-is-the-lineage-identity)).
+It is never stored in the cache: a cached parse is a fact about its file's bytes,
+and which other files share its roots is not.
+
 `Ctrl-X r` is the escape hatch: it drops the cache and re-reads everything, so a
 filesystem that lies about either half of the stamp can never leave a row wrong
 permanently. Nothing else clears it.
@@ -920,13 +932,23 @@ mis-assumed:
   than one child; only a minority are strictly linear. **Never assume a single
   chain.** (The lineage code only needs the root, so it never walks children —
   do not add code that assumes linearity.)
-- **A file may be a forest** — more than one `parentUuid: null` record. Rare, but
-  real; the first in file order wins, deterministically.
+- **A file may be a forest** — more than one `parentUuid: null` record. Claude
+  writes one at each compaction (the boundary record starts a new tree, with only
+  a `logicalParentUuid` back to the old one); a few files hold more for other
+  reasons. The first in file order is the file's own root (`root_uuid`); each later
+  one is kept in order as `later_roots` only when its `subtype` is
+  `compact_boundary`. A repeat, a record with no readable `uuid`, a record with no
+  `parentUuid` key and a null-parent record of any other kind (no `subtype`,
+  another one, an unreadable one, a `user` or `attachment`) are not kept, so they
+  link nothing.
 
 #### The root uuid is the lineage identity
 
-`root_uuid` is the `uuid` of the record whose **`parentUuid` is JSON `null`** —
-the tree's root — captured in `parse`'s existing streaming pass.
+A file's `root_uuid` is the `uuid` of the first record whose **`parentUuid` is
+JSON `null`** — the tree's root — captured in `parse`'s existing streaming pass,
+and its `later_roots` are the `compact_boundary` null-parent records after it. The lineage is
+identified by the CONVERSATION's root, resolved across files (below), not by
+`root_uuid` alone.
 
 **It is NOT the first `user`/`assistant` uuid**, and that distinction is
 load-bearing rather than pedantic:
@@ -952,9 +974,65 @@ a **copied prefix** can collide, and a copied prefix *is* a fork.
 lineage" — never folded, never dropped. A degraded parse costs a fold, never a
 session.
 
+**A compaction starts a new root, and a fork copies from the latest one.** A parent
+compacted twice lists three roots (`r1`, `r2`, `r3`); a fork made after the second
+compaction copies only the records from `r3` on, so its FIRST root is the
+parent's THIRD. Keyed on the first root alone, that fork was a conversation of its
+own: a measured session with five compactions had ten forks, and its row offered
+no lineage at all.
+
+`lineage::resolve_roots` links them. It runs ONCE per reload over the whole
+session set (`SessionStore::reload_at`, after the per-file cache took its copies)
+and sets `Session::lineage_root`, which `lineage_key` reads in place of
+`root_uuid`. Sessions that share ANY listed root are one conversation, and only a
+`compact_boundary` record may be a later root: a later null-parent record of any
+other kind, or whose `subtype` cannot be read, is not listed, so a second
+conversation's original root, shared by two files, never merges them into one
+delete/move set. The conversation's root is the ORIGINAL one: the one root that no file lists AFTER another root. That is
+structural, so nothing a new member brings can move it: a fork's id, age or
+boundary roots never change which root comes first in the parent's file. Hence
+`App::expanded` (keyed by `LineageKey`) keeps an expanded lineage open across
+the reload that brings a new fork in. No smallest-id tie-break exists to break
+that.
+
+The stability rests on one premise: roots are only ever added AFTER the original,
+so the original is the one root no file lists after another. A new file that lists
+a FRESH root before a shared boundary root breaks it: the conversation then has
+two originals (the first file's and the fresh one), and by the no-single-original
+rule below each session falls back to its own first root. A fork whose only root
+is the shared boundary then keys on that boundary, apart from its parent, so an
+expanded lineage loses that fork on the reload that brings the file in. It fails
+toward a NARROWER grouping and never a wider one: no two sessions share a key they
+did not share before. A unit test pins the transition
+(`a_file_listing_a_fresh_root_before_the_shared_one_narrows_the_grouping`). As
+measured on 2026-11-04, nothing in the store does this; a snapshot, not a
+contract.
+
+- **Deleted parent.** Its forks still share the boundary root they copied, so
+  they stay one lineage; that root is the original they can see, and the newest
+  fork heads it when all are named forks (`head_of`'s rule). The lineage key's
+  root changes when the parent goes, because the original left with it. A fork
+  made before the first compaction that shares no root with these is a lineage
+  of its own then.
+- **No single original** (several roots with nothing before them, or a cycle:
+  contradictory files) is not guessed at: each session of that conversation keeps
+  its own first root, as before roots were linked.
+- **Never cached.** The resolved root describes the reload's whole session set,
+  not one file's bytes, so `Session::lineage_root` is `None` in every cached
+  parse (`later_roots` is a fact about the bytes and is cached). A `Session`
+  built outside a reload has no resolved root and its key falls back to its own
+  first root.
+- It widens what lineage-wide actions cover: **`Delete lineage (N)` and `Move
+  lineage (N)`** from the parent's head row now include forks made after a
+  compaction (`App::lineage_choice` over `lineage_member_ids`, the one
+  grouping). Each member is still guarded on its own and the confirm still
+  counts the set and discloses hidden members.
+- Every loop that groups by lineage reads the resolved root through
+  `lineage_key`: `group_members`, `fold` and `lost_agent_bindings`.
+
 #### The lineage key is `(repo, branch, root)`
 
-Not the root uuid alone. Some lineages span more than one `gitBranch`, and, once
+Not the root uuid alone (and the root is the [resolved](#the-root-uuid-is-the-lineage-identity) one). Some lineages span more than one `gitBranch`, and, once
 `Ctrl-X w` has moved one member (the move writes a `relocated` record), more than one
 `cwd`; folding across branches would gather members across
 branch group heads, breaking `build_rows`' invariant that same-group rows are
@@ -1151,6 +1229,19 @@ gone entirely. The **relationships** are what the code relies on and they are
 structural: a background fork copies uuids verbatim; a root uuid never spans a
 `cwd`. The counts are not.
 
+Measured on 2026-11-04 on one machine (400 sessions): the parent of the reported
+case had 5 roots and 10 forks whose first root was one of its later ones; linked,
+its lineage is 11 members headed by the parent, where it was 1. Reading the branch
+from the session's own folder changed 5 sessions' rows, among them that parent
+(`mrk-2954-…` → `main`, the branch its forks sit on). The change accepted the
+trade-off for two others, `c3069055` and `475ea1eb`: a row lists under the branch
+read in its own folder, not the last branch written anywhere. Two more moved
+beyond that trade-off, under the same rule (the branch read in the session's
+authoritative folder, a `relocatedCwd` override included): `d4f144a8`
+(`mrk-2964-sellers-sitemap` → `DEV`) and `8f6a1318` (`main` →
+`ctrl-x-w-move-session-to-worktree`, a session the `Ctrl-X w` move relocated).
+A snapshot, not a contract.
+
 That every file yields a root today is likewise a statistic, not a licence: the
 `Option` and its never-folded fallback stay regardless, and are pinned by the
 `sess-rootless-1` fixture rather than by the store.
@@ -1210,9 +1301,16 @@ one** (its own root). Store-wide context: 74 background, 73 named, 76 bound, and
 **68** carry *both* name and binding — the population the badge must never touch.
 A snapshot, not a contract; re-measure before relying on it.
 
+**Re-measured over a real store (2026-11-04), before and after the
+[root linking](#the-root-uuid-is-the-lineage-identity):** the gate flagged
+**none**, both times. The bare signature matched **10** sessions, each a lineage of
+one, and a full scroll of the board showed no `[unbound]` marker. The linking did
+not change the badge set. A snapshot, not a contract, like the one above, which
+stays as it was measured.
+
 #### Fail-soft
 
-Every way of not knowing yields **no badge**: no `root_uuid`, no dated member, a
+Every way of not knowing yields **no badge**: no root (`lineage_key` is `None`), no dated member, a
 lineage of one, a root on another branch (a lineage is `(repo, branch, root)`, so
 that is different work), and any unreadable `sessionKind` / `agentName` /
 `agentSetting` shape. A degraded parse costs a badge, never a session.

@@ -1,0 +1,4 @@
+{"type":"attachment","sessionId":"sess-branch-moved-1","cwd":"/Users/me/project-theta","gitBranch":"main","timestamp":"2026-10-02T09:00:00.000Z","uuid":"root-moved","parentUuid":null,"isSidechain":false,"attachment":{"type":"session_start_hook"}}
+{"type":"user","sessionId":"sess-branch-moved-1","cwd":"/Users/me/project-theta","gitBranch":"main","timestamp":"2026-10-02T09:00:01.000Z","uuid":"bm-u1","parentUuid":"root-moved","isSidechain":false,"message":{"role":"user","content":"Start in the main checkout"}}
+{"type":"relocated","sessionId":"sess-branch-moved-1","relocatedCwd":"/Users/me/project-theta-wt","timestamp":"2026-10-02T09:30:00.000Z"}
+{"type":"user","sessionId":"sess-branch-moved-1","cwd":"/Users/me/project-theta-wt","gitBranch":"feature/moved","timestamp":"2026-10-02T10:00:00.000Z","uuid":"bm-u2","parentUuid":"bm-u1","isSidechain":false,"message":{"role":"user","content":"Continue in the worktree"}}

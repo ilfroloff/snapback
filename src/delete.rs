@@ -410,6 +410,8 @@ mod tests {
             repo: "project".to_string(),
             label: "label".to_string(),
             root_uuid: None,
+            later_roots: Vec::new(),
+            lineage_root: None,
             msg_count: 0,
             content_index: String::new(),
             background: false,
