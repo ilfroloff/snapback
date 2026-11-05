@@ -1595,7 +1595,8 @@ take the narrow allow instead.
 
 Input handling is a three-stage pipeline, all terminal-free and testable:
 
-1. `key_to_action(key, query_empty, has_preview_matches, in_subagent_view)` → an
+1. `key_to_action(key, query_empty, has_preview_matches, in_subagent_view,
+   view_on_screen)` → an
    `Action` (every printable char types into the query; arrows, Enter, Tab, and
    `Ctrl-*` always act so search never blocks navigation).
 2. `apply_action` mutates the `App` and returns an `Outcome`
@@ -1884,7 +1885,7 @@ reply or fork, not an oversight: do not add alternative chords for them.
 
 A binding that is only meaningful sometimes is **CONDITIONAL, and falls through**
 rather than going inert. `key_to_action` takes the conditions as parameters
-(`query_empty`, `has_preview_matches`, `in_subagent_view`) so the decision stays
+(`query_empty`, `has_preview_matches`, `in_subagent_view`, `view_on_screen`) so the decision stays
 pure and the
 fall-through is what a test can pin; the guarded arm sits ABOVE the unguarded one
 and the unguarded one is reached whenever the guard fails. The shifted VERTICAL
@@ -1892,11 +1893,19 @@ arrows are the instance: with nothing marked to move between they are
 bit-for-bit the plain arrows — the `MoveUp`/`MoveDown` they have always been —
 so a user who never searches loses nothing AND a terminal that drops the
 modifier degrades to a working key. The plain `↑` is conditional on the
-subagent view: there it is `LeaveSubagentView`, query or not, from an arm
-BELOW the `Shift-Up` match step and above `MoveUp`; the view takes no marks, so
-the match guard fails there and `Shift-Up` falls through to leaving the view
-too (`shift_up_in_the_subagent_view_falls_through_to_leaving_it`), while the
-plain `↓` stays `MoveDown` everywhere. The shifted HORIZONTAL arrows are the contrast: `Shift-←`/`Shift-→`
+subagent view being ON SCREEN (`App::subagent_view_on_screen`: open, the preview
+drawn, no `Ctrl-N` card over it): there it is `LeaveSubagentView`, query or not,
+from an arm BELOW the `Shift-Up` match step and above `MoveUp`; the view takes no
+marks, so the match guard fails there and `Shift-Up` falls through to leaving the
+view too (`shift_up_in_the_subagent_view_falls_through_to_leaving_it`), while the
+plain `↓` stays `MoveDown` everywhere. The condition is what is VISIBLE, not what
+is open: a view the 1:0 list-only layout or a card hides leaves `↑` `MoveUp`
+(`the_arrows_act_on_the_board_while_the_open_view_is_hidden_by_the_list_only_layout`,
+`..._while_an_in_flight_card_holds_the_pane_over_the_open_view`), so a key never
+acts on a pane nobody sees. `Esc` is the one key that reads the OPEN state, as its
+own parameter, so it still leaves a hidden view before it can quit
+(`esc_leaves_an_open_view_even_while_the_list_only_layout_hides_it`); never widen
+one parameter to the other. The shifted HORIZONTAL arrows are the contrast: `Shift-←`/`Shift-→`
 step the `PaneLayout` UNCONDITIONALLY, taking neither parameter — but their arms
 still sit above the plain `Left`/`Right` caret arms, because the unguarded arm
 matches the shifted key too and the first matching arm wins
@@ -1904,19 +1913,19 @@ matches the shifted key too and the first matching arm wins
 `Alt` word-hop arms as well, so `Shift-Alt-←` still steps the layout
 (`a_held_shift_wins_over_the_alt_word_hop_arms`). A dropped
 modifier degrades them to a search-caret step, a working key if not the one
-pressed. The plain arrows are conditional on the subagent view alone: outside
-it they move the caret with or without a query; while it is up they step the
+pressed. The plain `Left`/`Right` are conditional on the same on-screen view:
+outside it they move the caret with or without a query; while it is on screen they step the
 session's subagents, query or not — the accepted trade, since the `Alt` and
 `Ctrl` word hops, whose arms sit above theirs, still move the caret by word
-(`the_plain_arrows_step_subagents_only_in_the_view_and_modified_ones_keep_their_meaning`).
+(`the_plain_arrows_act_on_the_view_only_while_it_is_on_screen_and_modified_ones_keep_their_meaning`).
 The lineage fold is the `Ctrl-X f` chord verb, so caret movement and folding
 never share a key. Prefer
 `Shift`+key over `Alt`+key for anything new here: snapback never pushes the kitty
 keyboard protocol and clears it on every board (re)entry
 (`tui::reset_terminal_state`), so on default macOS terminals `Alt` arrives as a
 composed character that types junk into the query, and a split `ESC` read
-surfaces as a bare `Esc` — which quits an empty-query board (outside the subagent
-view, which it leaves instead). `Shift` rides the ordinary
+surfaces as a bare `Esc` — which quits an empty-query board (outside an open
+subagent view, which it leaves instead). `Shift` rides the ordinary
 `CSI 1;2<final>` encoding crossterm already decodes into a `KeyModifiers::SHIFT`.
 
 `Alt` is bindable in ONE narrow case: the binding MIRRORS a gesture the compose

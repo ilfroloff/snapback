@@ -38,7 +38,9 @@ OPTIONS:
 KEYS:
     ↑/↓           move. While the preview shows a subagent's transcript ↑ goes
                   back to the session's own instead, on the same row, a search
-                  kept as typed (Ctrl-X ↓ below)
+                  kept as typed (Ctrl-X ↓ below). Only while that transcript is
+                  on screen: with the 1:0 layout or a Ctrl-N card hiding it ↑
+                  moves as usual
     Enter         resume (returns to the board on exit). Refused on a session
                   snapback is still sending a reply to, or still making as a
                   fork from the Ctrl-F box's Enter, until it lands (the session
@@ -47,7 +49,7 @@ KEYS:
     ←/→           move the search query's cursor one character (the list and
                   the preview stay put). While the preview shows a subagent's
                   transcript they step through the session's subagents instead
-                  (Ctrl-X ↓ below)
+                  (Ctrl-X ↓ below), again only while it is on screen
     Alt+←/→       move the search query's cursor one WORD, as the reply box does
                   (→ lands on the start of the next word). Alt+B/Alt+F and
                   Ctrl+←/→ do the same, so it works whatever your terminal sends
@@ -115,7 +117,8 @@ KEYS:
                   cursor a word); the title says which one of how many (2/5).
                   ↑, Esc, or Ctrl-X ↓ again, goes back; a search stays as
                   typed. Refused while the session's subagents are still being
-                  read, or when it has none
+                  read, or when it has none. Esc leaves the view even while
+                  the 1:0 layout or a card hides it
                   · ? open the key-map table (same as F1)
     Ctrl-R        quick reply — send a one-shot message to the selected session
                   without leaving the board. An agent whose run is over (done,

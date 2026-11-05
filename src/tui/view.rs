@@ -5521,7 +5521,10 @@ const KEY_MAP: &[KeyMapSection] = &[
         title: "In a subagent's transcript",
         rows: &[
             ("←/→", "previous / next subagent, in launch order"),
-            ("↑ or Esc", "back to the session's own transcript"),
+            (
+                "↑ or Esc",
+                "back to the session's own transcript (↑ only while it is drawn)",
+            ),
         ],
     },
     KeyMapSection {
@@ -5735,25 +5738,27 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
     // resume) is documented where there is room to say it: `KEYS` in `cli.rs` and
     // the `docs/GUIDE.md` key map — same as every binding this line does not list.
     let line = Line::from(vec![Span::styled(
-        board_hint(app.in_subagent_view()),
+        board_hint(app.subagent_view_on_screen()),
         Style::default().add_modifier(Modifier::DIM),
     )]);
     frame.render_widget(Paragraph::new(line), area);
 }
 
-/// The board hint while the preview shows the subagent view
-/// (`App::in_subagent_view`). There the plain arrows stop being obvious — `↑`
-/// goes BACK to the session's own transcript and `←`/`→` step to the previous /
-/// next subagent (`update::key_to_action`) — so they lead the line, and
-/// `Tab content` gives up its columns for them. Kept under
-/// the 80-column help row by `default_help_hint_fits_the_target_width`.
+/// The board hint while the subagent view is ON SCREEN
+/// ([`App::subagent_view_on_screen`]). There the plain arrows stop being obvious
+/// — `↑` goes BACK to the session's own transcript and `←`/`→` step to the
+/// previous / next subagent (`update::key_to_action`) — so they lead the line,
+/// and `Tab content` gives up its columns for them. A view that is open but not
+/// drawn (the 1:0 layout, a draft card) leaves the arrows the board's own, so it
+/// shows [`DEFAULT_HELP_HINT`]. Kept under the 80-column help row by
+/// `default_help_hint_fits_the_target_width`.
 const SUBAGENT_HELP_HINT: &str =
     "↑ back · ←→ subagent · ^N new · ^R reply · ^K stop · ^X hide/del · F1 keys";
 
-/// Which board hint the help line shows: [`SUBAGENT_HELP_HINT`] while the pane
-/// shows the subagent view, else [`DEFAULT_HELP_HINT`]. PURE.
-fn board_hint(in_subagent_view: bool) -> &'static str {
-    if in_subagent_view {
+/// Which board hint the help line shows: [`SUBAGENT_HELP_HINT`] while the
+/// subagent view is on screen, else [`DEFAULT_HELP_HINT`]. PURE.
+fn board_hint(view_on_screen: bool) -> &'static str {
+    if view_on_screen {
         SUBAGENT_HELP_HINT
     } else {
         DEFAULT_HELP_HINT
@@ -18693,8 +18698,10 @@ mod tests {
     }
 
     /// The keymap's `↑` follows the key too: unnamed on the board, where it just
-    /// moves, and `↑ back` while the pane shows the subagent view, where `↑`
-    /// leaves it.
+    /// moves, and `↑ back` while the subagent view is ON SCREEN, where `↑`
+    /// leaves it. A view that is open but not drawn — the list-only layout, a
+    /// draft card over the pane — shows the board's own hint, because the arrows
+    /// are the board's there.
     #[test]
     fn the_board_keymap_names_up_as_back_in_the_subagent_view() {
         let mut session = sample_session();
@@ -18714,6 +18721,23 @@ mod tests {
         let view = help(&mut app);
         assert!(view.starts_with("↑ back · "), "{view:?}");
         assert!(!view.contains("↑↓ move"), "{view:?}");
+
+        app.set_pane_layout(PaneLayout::ListOnly);
+        assert!(app.in_subagent_view(), "premise: the view is still open");
+        let hidden = help(&mut app);
+        assert!(hidden.starts_with("Tab content · "), "{hidden:?}");
+        assert!(!hidden.contains("↑ back"), "{hidden:?}");
+        app.set_pane_layout(PaneLayout::PreviewOnly);
+        assert!(help(&mut app).starts_with("↑ back · "));
+
+        app.draft = Some(NewSessionDraft::default());
+        assert!(
+            app.in_subagent_view(),
+            "premise: a card leaves the view open"
+        );
+        let carded = help(&mut app);
+        assert!(carded.starts_with("Tab content · "), "{carded:?}");
+        assert!(!carded.contains("↑ back"), "{carded:?}");
     }
 
     /// The marker of the sample transcript's last real turn (a `you` turn).
