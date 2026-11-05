@@ -171,8 +171,9 @@ KEYS:
                   / splits parts too and the whole path is searched from the
                   top, so @modules/site-stor finds that file as well and a pick
                   writes its full path. Names that start with them come first,
-                  then other name hits, then description hits — files and
-                  folders above agents. A file or folder named with a leading
+                  then other name hits, then description hits — an agent
+                  ahead of a file or folder in the same tier, so a bare @
+                  lists the agents first. A file or folder named with a leading
                   dot shows only once you type that dot. While the list is open
                   ↑/↓ choose, Enter or Tab pick (a folder reopens the list one
                   level down), and Esc closes only the list (the draft stays).

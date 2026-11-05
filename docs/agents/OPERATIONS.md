@@ -165,7 +165,7 @@ see the README [Install](../../README.md#install) section.
 from SYNTHETIC data by `website/demo/record.sh`: it builds a release binary, copies
 `website/demo/home` to a temporary `$HOME`, builds a throwaway `web-app` git
 repository there with the worktrees the fixtures name (the `Ctrl-X w` scene's
-picker lists them; no git config of yours is read), shadows `claude` with the stub
+picker lists them; no git config of yours is read; the home's `.claude/skills` and `.claude/commands` are what the `/` list's kind column reads for the stub's user rows), shadows `claude` with the stub
 in `website/demo/bin`, and records `website/demo/snapback.tape` with `vhs`. It needs
 `vhs`, `ttyd` and `ffmpeg` on `PATH` and never touches the real `~/.claude`,
 `~/.config/snapback` or `claude`. Re-run it when a change alters what a scene shows;

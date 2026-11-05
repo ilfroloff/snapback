@@ -23,7 +23,10 @@ one place.
   Same for `claude agents --json`, for claude's `initialize` handshake reply,
   for claude's `set_cwd` reply (the `Ctrl-X w` move's, where only `ok` with
   `changed: true` is a move),
-  for DEFINED-agent frontmatter (hand-parsed, no YAML crate), and for every
+  for DEFINED-agent frontmatter (hand-parsed, no YAML crate), for the skills and
+  commands folders `command_kinds` reads to label the pick list's `/` rows (a
+  missing, unreadable or malformed one leaves the row unlabelled, never a guess,
+  and an UNTRUSTED verdict reads no project folder), and for every
   `claude` settings file `claude_settings` reads
   (which ones, and in which precedence, is
   [CLAUDE_CLI.md](docs/agents/CLAUDE_CLI.md#which-model-a-launch-runs-on-without---model)'s),
@@ -46,8 +49,8 @@ one place.
   is dropped; every other record is KEPT
   ([DOMAIN.md](docs/agents/DOMAIN.md#records-that-name-a-gone-process)).
   (`src/store/*`, `src/agents.rs`, `src/claude_catalog.rs`,
-  `src/claude_move.rs`, `src/defined_agents.rs`, `src/claude_settings.rs`,
-  `src/claude_trust.rs`)
+  `src/claude_move.rs`, `src/command_kinds.rs`, `src/defined_agents.rs`,
+  `src/claude_settings.rs`, `src/claude_trust.rs`)
 - **AUTHORITATIVE-FROM-FILE.** Read `cwd`/`sessionId` from INSIDE the file,
   never decode the `<encoded-cwd>` folder name (the `/`→`-` encoding is lossy).
   Re-read them at hand-off time. A `relocated` record (written by claude's `/cd`
@@ -251,18 +254,22 @@ one place.
   handed in through `SearchIndex::set_atoms` — never re-joined into a query for
   `set_query`, whose whitespace and backslash rule is the search box's alone, and
   the board's search box splits on whitespace only. It asks `SearchIndex::admits`,
-  the filter's own question, of a candidate's NAME and then its DESCRIPTION —
-  never its label — marks the hit with the ROW-LABEL rule (`match_indices`) over
+  the filter's own question, through `admits_with`, of a candidate's NAME and then
+  its DESCRIPTION — never its label — marks the hit with the ROW-LABEL rule (`match_indices`) over
   that same name or description when the list is filtered, never in render, and
   orders what matches by where it landed (name start, elsewhere in the name, a
   path's folder component, description only — a word-start hit just below the
-  substring hits of its tier), an order that is the pick list's alone. The
+  substring hits of its tier), an order that is the pick list's alone and that ONE
+  function, `complete::rank`, decides for every row; a top-level `@` merges its
+  agents into its entries by that order, an agent ahead of an entry of the SAME
+  tier ([DOMAIN.md](docs/agents/DOMAIN.md#how-the-letters-narrow-the-list)). The
   WORD-START rule (`SearchIndex::word_start_hit`) lives in `src/search.rs` too,
   and only the pick list reaches it: `set_atoms` ALONE compiles it and nothing
   else reads it — the filter, `admits` and both marking rules stay substring, so
-  it NEVER reaches the board. The pick list asks it ONLY of an `@` file or
-  folder's own BASENAME in the FOLDER STEP (never the root fallback, a `/`
-  command or an agent), and only once the substring parts rejected that entry:
+  it NEVER reaches the board. The pick list asks it ONLY of a candidate's own NAME (a `/` command's, an
+  agent's, an `@` file or folder's BASENAME in the FOLDER STEP — never the root
+  fallback, a description or a folder component), and only once the substring
+  parts rejected that name:
   consecutive word-PREFIX chunks of that name, on words in order, never fuzzy.
   It follows the SAME per-part smart case — a part holding a capital matches
   exactly, any other through the ONE fold — and a hit marks its chunks, the one
@@ -306,8 +313,8 @@ one place.
   (`ModelAliases`), the settings-model read (`SettingsModel`), the compose
   pick list's catalog fetch (`CatalogFetched` — a `claude` child the DRIVER
   starts when the pure `take_catalog_fetch` says so, never a key handler; its
-  workspace-trust read runs on that same worker thread, never on a key or the
-  render path) and the `Ctrl-X w` move (`MoveFinished` — its re-read, liveness
+  workspace-trust read and its `command_kinds` folder reads run on that same
+  worker thread, never on a key or the render path) and the `Ctrl-X w` move (`MoveFinished` — its re-read, liveness
   probe, trust read and `claude` child all run on the move's own worker, so that
   probe is not the hand-off exception above; a lineage job runs every member's,
   strictly one after another on that ONE worker, each probe right before its own
@@ -324,8 +331,8 @@ one place.
   `Ctrl-X ↓`, `←`/`→`, `↑`/`↓` and the running list read no file: they ask the record it
   landed.
   (`src/watch.rs`, `src/worktrees.rs`, `src/tui/clipboard.rs`,
-  `src/claude_catalog.rs`, `src/claude_trust.rs`, `src/claude_move.rs`,
-  `src/store/subagents.rs`)
+  `src/claude_catalog.rs`, `src/claude_trust.rs`, `src/command_kinds.rs`,
+  `src/claude_move.rs`, `src/store/subagents.rs`)
 - **PURE, GIT-FREE STORE CORE.** `src/store/*` decides everything from the bytes
   it was given: `repo_of`'s worktree collapse is a pure string heuristic, and NO
   module under `src/store/` may shell out (to `git` or anything else) or read
