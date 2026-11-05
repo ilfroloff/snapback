@@ -2403,11 +2403,17 @@ then, once the record lists it, how it stands and its `k/n` place in
 its pinned row shows nothing of the session's — no failed task, no live status,
 no reported-status fallback; the session's in-flight reply tail stays off it; and
 it takes no search marks, since the content index never held its text. Opening a
-reply or fork box, or moving the selection, leaves it; `Esc` with an empty query
-leaves it (after clearing a typed query, before quitting), and so do a plain
-`↑` — the selection and a typed query kept; `Shift-Up` too, since the view
-marks nothing for it to step — and `Ctrl-X ↓` pressed in it, back to where the
-session's own transcript was scrolled. `App::ensure_preview` is the ONE place the
+reply or fork box leaves it, and so does ANY change of the selected session
+(`App::set_selected` drops the view): `↓`, `↑` once the view is open but not
+[on screen](#subagent-view-on-screen), the wheel over the list, a search edit,
+`Tab` or `Ctrl-A` that filters the row out, `Ctrl-X x` or `Ctrl-X h` hiding it,
+`Ctrl-X d` or `Ctrl-X w` taking it off the board, `Ctrl-X f` from a `↳` row (it
+re-targets the head), a reload that drops the row, and the cursor following a
+headless fork onto its new row. `Esc` with an empty query leaves it, open or
+hidden (after clearing a typed query, before quitting), and so do a plain
+`↑` while it is on screen — the selection and a typed query kept; `Shift-Up` too,
+since the view marks nothing for it to step — and `Ctrl-X ↓` pressed in it, back to
+where the session's own transcript was scrolled. `App::ensure_preview` is the ONE place the
 pane switches, through `App::live_subagent_view`, so the lines drawn, the marks,
 the height, the hit-test, the copy and the pinned row all come from one render.
 
@@ -2554,12 +2560,27 @@ known yet), and `SUBAGENTS_NONE_REFUSAL` when it lists no subagent.
 **`←`/`→` inside the view** (`App::step_subagent_view`, over
 `SubagentRecord::step`) switch to the previous / next subagent in launch order,
 wrapping round at both ends: every subagent the session launched, finished ones
-included. They are bound whenever the view is up, a query typed or not (the
-accepted trade: there the search caret moves only by word, through the `Alt` and
-`Ctrl` arrows), and refuse with the same two lines. A subagent the record does
+included. They are bound whenever the view is ON SCREEN (below), a query typed or
+not (the accepted trade: there the search caret moves only by word, through the
+`Alt` and `Ctrl` arrows), and refuse with the same two lines. A subagent the record does
 not list yet — a click opened it before its meta file was read — counts as the
 newest launch: `→` wraps to the first, `←` lands on the last. Like a drill-down,
 a step keeps where the session's own transcript was scrolled, for `↑` or `Esc`.
+
+<a id="subagent-view-on-screen"></a>**On screen** (`App::subagent_view_on_screen`, pure) is the one fact the
+plain `↑`, `←` and `→` and the help line's choice of hint read: the view is OPEN
+(`App::in_subagent_view`), the layout draws the preview at all (not the 1:0
+`PaneLayout::ListOnly`) and no `Ctrl-N` draft card holds the pane (`App::draft`,
+the fact `view::running_subagents` hides the running list on). The view stays
+OPEN behind the 1:0 layout or a card (neither closes it: a draft leaving it up
+is pinned by `opening_a_reply_or_fork_box_leaves_the_subagent_view_but_a_draft_does_not`),
+but nothing of it shows, so a key there would act on a pane nobody sees: off
+screen `↑` is `MoveUp` (a selection move closes the view, as on the board) and
+`←`/`→` move the search caret, and the help line shows `DEFAULT_HELP_HINT`.
+`↓` is `MoveDown` on screen or off. `Esc` alone reads the OPEN state, as a
+separate parameter of `key_to_action`, so with an empty query it leaves a hidden
+view before it can quit. While it is on screen the help line shows
+`SUBAGENT_HELP_HINT`, which leads with `↑ back · ←→ subagent` (`view::board_hint`).
 
 **The view's title** (`view::subagent_title`, pure over `SubagentTitleFacts`
 and the width the border gives it) reads
@@ -2845,7 +2866,7 @@ that differ.
 | **Compose model pick** | `None` (the default, in every new compose) / a `resume::ModelPick`: an offered alias plus an optional `--effort` level | the `--model` (and effort) a compose's own launch asks for, picked with `Ctrl-L` inside that compose and held on it (`ComposeState::model`); which launches it may reach is the A MODEL IS PICKED PER COMPOSE, NEVER PER BOARD rule in [AGENTS.md](../../AGENTS.md#critical-rules). With no pick the compose's `model:` label names what `claude` will choose instead. See [Compose model pick](#compose-model-pick-ctrl-l). |
 | **Forced rescan** | `Ctrl-X r` | not a mode: a one-shot that drops the store's parse cache and re-reads every transcript, reporting the count it landed on. The board autorefreshes and reuses unchanged files by itself, so this is the escape hatch for a row that looks stale — see [incremental reload](#incremental-reload-storesessionstore). |
 | **Modal** | `Row` \| `List` layout in one `Option<Modal>` | the SINGLE type for a TITLED, choice-bearing overlay. `Enter` on a running session builds the `Attach` / `Fork` / `Cancel` choice (a `Row`); `Ctrl-N` with defined agents builds the agent picker (a `List`); `Ctrl-L` inside a compose builds the model picker (a `List` opened OVER that compose, which stays open beneath it; row 0 is the compose's default, and the compose's current pick — effort included — is pre-highlighted by MATCHING the built choices rather than by index arithmetic, so a pick that is no longer offered falls back to row 0; its `←`/`→` step the highlighted model row's effort, which the row draws inline as ` · <level>`, or a dim ` · default effort` while unset and highlighted — see [Compose model pick](#compose-model-pick-ctrl-l)); `Ctrl-X d` builds the hard-delete confirm (a `Row`: `Delete this` / `Delete lineage (N)` — offered only on the HEAD row of a real multi-member lineage (`App::lineage_choice`, see [Row role](#row-role-head-row-or--row)), carrying the member ids resolved at OPEN time — / `Cancel`, default-highlighted on Cancel by that choice's position); `Ctrl-X w` builds the move picker (a `List` of the launch project's worktrees, main first, the session's current folder omitted; each choice carries `ModalAction::MoveTo(path)`, and `Enter` starts the headless move — or, on a lineage HEAD row, `ModalAction::ChooseMoveScope { target, members }`, whose `Enter` opens the move's SCOPE confirm (`App::open_move_scope_confirm`, a `Row` under the same title: `Move this` → `MoveTo` / `Move lineage (N)` → `ModalAction::MoveLineage { target, ids }` / `Cancel`, default-highlighted on Cancel by position, its prompt disclosing hidden members through `lineage_confirm_message`); the member ids ride both actions from the picker's open, see [Move](#move-to-another-worktree-ctrl-x-w-srcclaude_movers)). Each choice carries a `ModalAction` tag the one confirm handler (`confirm_modal`) routes on. The plain Enter/Esc stop confirmations (`Ctrl-R`, `Ctrl-K`), the compose zone and the `Ctrl-X` chord are separate keyboard owners, NOT `Modal`s — see [PATTERNS.md](PATTERNS.md#10-keys-actions-outcomes). |
-| **Subagent view** | off (default) / ONE subagent of the selected session (`App::subagent_view`, keyed by the session's id and the agent's) | what the preview pane shows: the selected session's own transcript, or a subagent's own in its place. Switched to ONLY by a click on a `◆ delegated to …` line, `Ctrl-X ↓` or a `←`/`→` step inside the view (through the [subagent record](#subagent-record-and-running-list-storesubagents)), never by a search route; left by a plain `↑` (the selection and a typed query kept), `Esc` (its middle step: a typed query is cleared first, and the board quits only from the session's own transcript), `Ctrl-X ↓` again, a selection move, or opening a `Ctrl-R` / `Ctrl-F` box. In memory only, like the fold state. See [Delegation line and subagent view](#delegation-line-and-subagent-view-storepreview). |
+| **Subagent view** | off (default) / ONE subagent of the selected session (`App::subagent_view`, keyed by the session's id and the agent's) | what the preview pane shows: the selected session's own transcript, or a subagent's own in its place. Switched to ONLY by a click on a `◆ delegated to …` line, `Ctrl-X ↓` or a `←`/`→` step inside the view (through the [subagent record](#subagent-record-and-running-list-storesubagents)), never by a search route; left by a plain `↑` while it is [on screen](#subagent-view-on-screen) (the selection and a typed query kept), `Esc` (its middle step: a typed query is cleared first, and the board quits only from the session's own transcript), `Ctrl-X ↓` again, opening a `Ctrl-R` / `Ctrl-F` box, or any change of the selected session (the routes: [Delegation line and subagent view](#delegation-line-and-subagent-view-storepreview)). In memory only, like the fold state. See [Delegation line and subagent view](#delegation-line-and-subagent-view-storepreview). |
 
 The current-folder scope is an **exact** canonical `cwd` match by design: a
 repo's *other* worktree folders do not appear there, no matter how the paths

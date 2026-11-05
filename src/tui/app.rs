@@ -2071,8 +2071,8 @@ pub enum SubagentsUnavailable {
 
 /// The preview pane's SUBAGENT VIEW: the transcript of one subagent the selected
 /// session launched, shown in the pane in place of the session's own until the
-/// user leaves it (`↑`, `Esc`, `Ctrl-X ↓`), moves the selection, or opens a reply
-/// or fork box.
+/// user leaves it (`↑`, `Esc`, `Ctrl-X ↓`), changes the selected session (the
+/// routes: the `App::subagent_view` field), or opens a reply or fork box.
 ///
 /// Keyed by STABLE ids, never a list index (AGENTS.md STABLE-ID STATE): the
 /// session whose `subagents/` dir holds the transcript, and the subagent's own id.
@@ -2854,8 +2854,13 @@ pub struct App {
     /// session's own, or `None` while it shows the session's ([`SubagentView`]).
     /// Opened ONLY through [`open_subagent_view`](Self::open_subagent_view), by a
     /// click on a `◆ delegated to …` line, `Ctrl-X ↓`, or a `←`/`→` step inside
-    /// the view; left by `↑`, `Esc`, `Ctrl-X ↓` again, a selection move and
-    /// opening a reply or fork box.
+    /// the view; left by `↑` while the view is on screen, `Esc`, `Ctrl-X ↓` again,
+    /// opening a reply or fork box, and ANY change of the selected session
+    /// ([`set_selected`](Self::set_selected) drops it): `↓`, `↑` while the open view
+    /// is hidden, the mouse wheel over the list, a search edit, `Tab` or `Ctrl-A`
+    /// that filters the row out, `Ctrl-X x` or `Ctrl-X h` hiding it, `Ctrl-X d` or
+    /// `Ctrl-X w` taking it off the board, `Ctrl-X f` from a `↳` row, a reload that
+    /// drops the row, and the cursor following a headless fork onto its new row.
     subagent_view: Option<SubagentView>,
     /// The SELECTED session's subagents as the background refresh last read them
     /// ([`SubagentRecord`]), keyed by the session they were read for, which only
@@ -6183,12 +6188,25 @@ impl App {
     }
 
     /// Whether the preview pane shows a subagent's transcript rather than the
-    /// selected session's own: what `↑` leaves, and `Esc` before it quits
+    /// selected session's own: what `Esc` leaves before it quits
     /// (`update::key_to_action`), and what keeps the session's in-flight reply
-    /// tail and its live status off the pane (`view::render_preview`).
+    /// tail and its live status off the pane (`view::render_preview`). `↑` leaves
+    /// it only while it is also [on screen](Self::subagent_view_on_screen).
     #[must_use]
     pub fn in_subagent_view(&self) -> bool {
         self.live_subagent_view().is_some()
+    }
+
+    /// Whether the subagent view is DRAWN: open ([`in_subagent_view`](Self::in_subagent_view)),
+    /// the layout draws the preview pane at all (not the 1:0 `ListOnly` stop) and
+    /// no `Ctrl-N` draft card holds the pane ([`draft`](Self::draft), the fact
+    /// `view::running_subagents` hides the running list on). The view stays OPEN
+    /// behind the list-only layout or a card, but nothing of it shows, so `↑` and
+    /// the plain `←`/`→` are the view's (`update::key_to_action`) and the help line
+    /// names them so ([`view::board_hint`]) only while this holds. PURE.
+    #[must_use]
+    pub fn subagent_view_on_screen(&self) -> bool {
+        self.in_subagent_view() && self.pane_layout.shows_preview() && self.draft.is_none()
     }
 
     /// The `agentType` of the subagent the pane shows, for its title, or `None`
@@ -6251,8 +6269,8 @@ impl App {
 
     /// Leave the subagent view for the selected session's own transcript, scrolled
     /// where it was when the view opened. `true` when a view was open — what `↑`
-    /// does there, and `Esc`'s middle step, between clearing the query and
-    /// quitting — and `false`, changing nothing, when none was. Any mouse
+    /// does there while it is on screen, and `Esc`'s middle step, between clearing
+    /// the query and quitting — and `false`, changing nothing, when none was. Any mouse
     /// selection goes with the render it was anchored to.
     pub(crate) fn leave_subagent_view(&mut self) -> bool {
         let live = self.live_subagent_view().is_some();
@@ -9901,6 +9919,38 @@ mod tests {
         open_delegation_view(&mut app);
         open_draft(&mut app);
         assert!(app.in_subagent_view(), "a draft leaves the view alone");
+    }
+
+    /// The view is ON SCREEN only while it is open AND drawn: no view, the 1:0
+    /// list-only layout and a `Ctrl-N` draft card each take it off, though the
+    /// last two leave it open.
+    #[test]
+    fn the_subagent_view_is_on_screen_only_while_open_and_drawn() {
+        let mut app = app_all(vec![delegation_session("s1")]);
+        assert!(!app.subagent_view_on_screen(), "no view is open");
+
+        open_delegation_view(&mut app);
+        assert!(app.subagent_view_on_screen());
+
+        for layout in [
+            PaneLayout::PreviewOnly,
+            PaneLayout::PreviewWide,
+            PaneLayout::Even,
+            PaneLayout::ListWide,
+        ] {
+            app.set_pane_layout(layout);
+            assert!(app.subagent_view_on_screen(), "{layout:?} draws the pane");
+        }
+
+        app.set_pane_layout(PaneLayout::ListOnly);
+        assert!(app.in_subagent_view(), "list-only leaves the view open");
+        assert!(!app.subagent_view_on_screen(), "but draws none of it");
+
+        app.set_pane_layout(PaneLayout::Even);
+        assert!(app.subagent_view_on_screen());
+        open_draft(&mut app);
+        assert!(app.in_subagent_view(), "a card leaves the view open");
+        assert!(!app.subagent_view_on_screen(), "but holds the pane");
     }
 
     /// The view belongs to the session it was opened on: moving the selection

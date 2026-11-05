@@ -76,7 +76,7 @@ one place.
   (`index_for`, once per preview render and once per background refresh), opens a
   sibling `agent-<id>.jsonl` whole only to render the SUBAGENT VIEW
   (`open_transcript`) — which a CLICK on that launch's delegation line,
-  `Ctrl-X ↓` or a `←`/`→` step inside the view alone opens, never a search step —
+  `Ctrl-X ↓` or a `←`/`→` step inside the view (while it is on screen) alone opens, never a search step —
   once it opens and again after each eviction of that render while it stays up (a
   write the watcher reports to that transcript is one; the mechanism below lists
   them all), and, for the SELECTED session's subagent record (`read_record`, on
@@ -292,7 +292,7 @@ one place.
   `PATTERNS.md` §6 owns them. The preview's cache-miss render reads on the UI
   thread too — the selected transcript, that session's subagent meta files, and
   the SUBAGENT VIEW's transcript, which only a click on a `◆ delegated to …`
-  line, `Ctrl-X ↓` or a `←`/`→` step inside the view opens (never a search
+  line, `Ctrl-X ↓` or a `←`/`→` step inside the view (on screen) opens (never a search
   step): read the first time the pane needs that render after the switch, and
   again after each eviction of it while the view stays up (each
   `SubagentsWritten` that names it is one; `PATTERNS.md` §6 points to the full

@@ -41,10 +41,10 @@
 //!
 //! | Key | Action |
 //! | --- | ------ |
-//! | `Up` / `Down` | move selection: `Down` always, `Up` outside the subagent view. Inside the view `Up` goes back to the session's own transcript instead (the next row) |
-//! | `Up` (in the subagent view) | leave the view for the SELECTED session's own transcript, scrolled where it was, with the selection unchanged — what `Esc` does there with an empty query, straight back from a nested subagent too. Bound whenever the view is up, EVEN WITH A QUERY TYPED, and it never clears the query (`Esc` clears a typed one first). `Shift-Up` does the same: the view takes no search marks, so it falls through to this row (see [`App::leave_subagent_view`]) |
-//! | `Left` / `Right` | outside the subagent view: move the search query's caret one character back / forward. Not a query change: the list, the selection and the preview stay exactly where they were. Inside the view they step subagents instead (the next row) |
-//! | `Left` / `Right` (in the subagent view) | switch the preview to the previous / next subagent of the selected session in LAUNCH ORDER — its transcript's first timestamp, one with none last — wrapping round at both ends: every subagent it launched, at any depth, finished ones too. The view's title ends with where it stands (`… · 2/5`). Bound whenever the view is up, EVEN WITH A QUERY TYPED — the accepted trade: there the caret moves only by word (the next row). A subagent the record does not list yet (a click opened it before its meta file was read) counts as the newest launch: `Right` wraps to the first, `Left` lands on the last. Refused on a sticky status line while the session's subagents are still being read, or when none are listed (see [`App::step_subagent_view`]) |
+//! | `Up` / `Down` | move selection: `Down` always, `Up` except while the subagent view is ON SCREEN (open, the preview pane drawn, no `Ctrl-N` card over it — [`App::subagent_view_on_screen`]). There `Up` goes back to the session's own transcript instead (the next row). An open view the 1:0 list-only layout or a card hides leaves `Up` the selection's: moving it closes the view |
+//! | `Up` (in the subagent view, on screen) | leave the view for the SELECTED session's own transcript, scrolled where it was, with the selection unchanged — what `Esc` does there with an empty query, straight back from a nested subagent too. Bound whenever the view is on screen, EVEN WITH A QUERY TYPED, and it never clears the query (`Esc` clears a typed one first). `Shift-Up` does the same: the view takes no search marks, so it falls through to this row (see [`App::leave_subagent_view`]) |
+//! | `Left` / `Right` | outside the subagent view — or while it is open but not on screen (the 1:0 list-only layout, a `Ctrl-N` card over the pane) — move the search query's caret one character back / forward. Not a query change: the list, the selection and the preview stay exactly where they were. Inside the view, on screen, they step subagents instead (the next row) |
+//! | `Left` / `Right` (in the subagent view, on screen) | switch the preview to the previous / next subagent of the selected session in LAUNCH ORDER — its transcript's first timestamp, one with none last — wrapping round at both ends: every subagent it launched, at any depth, finished ones too. The view's title ends with where it stands (`… · 2/5`). Bound whenever the view is on screen, EVEN WITH A QUERY TYPED — the accepted trade: there the caret moves only by word (the next row). A subagent the record does not list yet (a click opened it before its meta file was read) counts as the newest launch: `Right` wraps to the first, `Left` lands on the last. Refused on a sticky status line while the session's subagents are still being read, or when none are listed (see [`App::step_subagent_view`]) |
 //! | `Alt-Left` / `Alt-Right`, `Alt-b` / `Alt-f`, `Ctrl-Left` / `Ctrl-Right` | move the search query's caret one WORD back / forward (always) — the widget's own word hop (see [`App::move_query_caret_by_word`]), so forward lands on the START of the next word, as in the reply box. Not a query change either. Three pairs because `⌥←` / `⌥→` reaches the board as `CSI 1;3D` / `C` or as `ESC b` / `ESC f` depending on the terminal, and `Ctrl-Left` / `Ctrl-Right` is the non-`Alt` twin; `Alt-b` / `Alt-f` and `Ctrl-Left` / `Ctrl-Right` are also the pairs the compose box hops words on |
 //! | `Enter` | resume the selected session. Refused, before the liveness probe, while snapback's own `claude -p` child is still writing that session — a quick reply to it, or on a fork's row the headless fork creating it (see [`send::resume_in_flight_refusal`]) — and while its own `Ctrl-X w` move of that session is still in flight (see [`App::moving_on`]). A reply or fork in flight on another row refuses nothing here, and neither does a headless fork on the row it was forked from, which its child only reads |
 //! | `Ctrl-F` | fork the selected session: opens a fork compose box after the move and folder checks (refused, like `Enter`, while snapback's own `Ctrl-X w` move of that session is still in flight; a deleted folder is refused before you type; no live-agent check, claude skips it for a fork). `Enter` forks it headless without leaving the board (`claude -p -r <id> --fork-session --session-id <new> --name <name>`, like a quick reply — once the fork appears, folded under the session it came from, the cursor expands that lineage and jumps to it, if you have not moved and nothing owns the keyboard — see [`App::keyboard_owned`]), `Ctrl-O` forks it interactively (an empty box with no pick is the plain `claude -r <id> --fork-session` plus its `--name`), `Ctrl-L` picks the model for that fork, `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels. Both name the fork `fork: <first line of the message>` (`fork: <the session's label>` for an empty `Ctrl-O`; see `resume::fork_name`), which keeps the session heading its forks (`lineage::head_of`). The Attach/Fork/Cancel choice's Fork hands off exactly the argv of an empty `Ctrl-O` with no pick, and never carries a model. In the box `/` and `@` open the pick list (the `/` or `@` row below), which claims `Enter` and `Esc` while it is open |
@@ -69,11 +69,11 @@
 //! | printable char | type-to-search (insert at the query's caret) |
 //! | terminal paste | inserted as TEXT — never as keystrokes (see below). A compose paste is cut at `send::COMPOSE_PROMPT_MAX_BYTES`; a draft over it is refused, box kept, on `Enter` in every box and on `Ctrl-O` in the fork box and the draft (`compose::refuse_too_long`) |
 //! | mouse: click a folded node's header | unfold the node — a subagent's hand-back (`◆ message from`) or context claude injected (`◇`) — where it sits, and a second click folds it back; a click on a header toggles its node and never opens a link. On the RELEASE, like a link, and ahead of one (see [`click_effect`]). Works while a quick reply or fork box is open, like every pointer action over the transcript but the `◆ delegated to …` switch below |
-//! | mouse: click a `◆ delegated to …` line | switch the preview to that subagent's OWN transcript — the SUBAGENT VIEW: the pane's title names the subagent, its pinned row names the subagent's turn, it takes no search marks, and it updates as the subagent writes. A `◆ delegated to …` line inside it switches to that nested subagent. `Up` or `Esc` goes back to the session's own transcript where it was scrolled; `Ctrl-X ↓` again, moving the selection, `Ctrl-R` and `Ctrl-F` leave it too. Only this click, `Ctrl-X ↓` and `Left` / `Right` inside the view open it — no search key does (see [`App::open_subagent_view`]). On the RELEASE, like a link. Refused, on a sticky status line, while a quick reply or fork box is open: what the box sends lands in the session, so the pane keeps showing the session's own transcript |
+//! | mouse: click a `◆ delegated to …` line | switch the preview to that subagent's OWN transcript — the SUBAGENT VIEW: the pane's title names the subagent, its pinned row names the subagent's turn, it takes no search marks, and it updates as the subagent writes. A `◆ delegated to …` line inside it switches to that nested subagent. `Up` (while the view is on screen) or `Esc` goes back to the session's own transcript where it was scrolled; `Ctrl-X ↓` again, `Ctrl-R` and `Ctrl-F` leave it too, and so does ANY change of the selected session (`App::set_selected`): `Down`, `Up` while the open view is hidden, the mouse wheel over the list, a search edit, `Tab` or `Ctrl-A` that filters the row out, `Ctrl-X x` or `Ctrl-X h` hiding it, `Ctrl-X d` or `Ctrl-X w` taking it off the board, `Ctrl-X f` from a `↳` row, a reload that drops the row, and the cursor following a headless fork onto its new row. Only this click, `Ctrl-X ↓` and `Left` / `Right` inside the view open it — no search key does (see [`App::open_subagent_view`]). On the RELEASE, like a link. Refused, on a sticky status line, while a quick reply or fork box is open: what the box sends lands in the session, so the pane keeps showing the session's own transcript |
 //! | mouse: click a preview link | open its url in the browser — `http`/`https` only: any other scheme opens nothing and says so on a sticky status line. On the RELEASE, since only then is it known that the press was a click and not the start of a drag (see [`mouse_effect`]). Works while a quick reply or fork box is open |
 //! | mouse: drag in the preview | select transcript text in reading order, reverse-videoed — DRAWN text only: each row ends at its last drawn character, never at the pane's edge, and a drag over blank space alone selects nothing, so its release copies nothing. HOLD the drag past the transcript's top or bottom edge and the pane glides that way, a small step every `AUTOSCROLL_FRAME` — faster the further past the edge — so the selection keeps growing into rows that were never on screen until the button comes up (see [`App::autoscroll_preview_selection`]); a plain move while the button is held counts as the release the terminal lost. The release copies the WHOLE selection the way `Ctrl-X y` copies — [`Outcome::Copy`], the clipboard tool first, OSC 52 as the fallback — with a transient status. Never the in-flight reply's tail. A wheel notch, any key or a resize ends it. A drag that starts on a node header, a `◆ delegated to …` line or a link selects, and toggles, switches or opens nothing. Off under any overlay and a new-session draft's card, but ON while a quick reply or fork box is open (each previews the real transcript; the drag neither moves its caret nor touches its text), and never started on the pinned row, the running list or a docked compose zone (see [`press_starts_selection`]) |
 //! | mouse: double-click in the preview | select the WORD under the pointer (Unicode word boundaries, on the drawn row) and copy it on release, exactly as a drag copies. Two presses on the SAME cell within [`DOUBLE_CLICK_INTERVAL`] (see [`is_double_click`]); a blank word selects nothing; a quick third click keeps the word. The FIRST release is a plain click — it toggles a node header, switches to a subagent or opens a link, as above — and the SECOND copies the word and toggles, switches or opens nothing, so a node header double-clicked is opened once and stays open. Any key, wheel notch or reload resets the count (a fold toggle does not: it is the first click's own effect), and a press that turned into a drag is not a first click. Same gate as a drag ([`press_starts_selection`]), so it too works while a quick reply or fork box is open |
-//! | `Esc` | unwind one level: clear the search query when one is typed; else leave the subagent view for the session's own transcript; else quit |
+//! | `Esc` | unwind one level: clear the search query when one is typed; else leave the subagent view for the session's own transcript — an OPEN view, drawn or not, so `Esc` never quits past a view the list-only layout or a card hides; else quit |
 //! | `Ctrl-C` | quit from the board; while a modal, a confirmation, the key map or a pending `Ctrl-X` chord is open it closes or cancels that instead, and in a compose box it never quits (`Esc` cancels the box) |
 //! | `F1`, `Ctrl-X ?`, `Ctrl+Shift+/` (`Ctrl-?`) | open the full key-map MODAL (a table of every binding); `↑`/`↓` (or `k`/`j`)/`PgUp`/`PgDn`/`Home`/`End` and the mouse wheel scroll it; `Esc`, `Ctrl-C`, `F1` or `Ctrl+Shift+/` (in any form it arrives as) closes it — `Ctrl-X ?` only opens it, since inside the modal the `Ctrl-X` leader is inert. It owns the keyboard like every modal. `Ctrl-X ?` (two plain keys) is the way in that works in every terminal and `F1` works in most (GNOME Terminal binds it to its own Help, and a Mac laptop keyboard needs `Fn`+`F1`): a terminal often cannot deliver `Ctrl+Shift+/` at all (`Ctrl-?` is the legacy 0x7F, which arrives as Backspace). Without the kitty keyboard protocol it cannot be told from `Ctrl-/`, so `Ctrl-?`, `Ctrl-/` and the legacy 0x1F (`Ctrl-7`) all count (see [`App::show_key_map`]) |
 //!
@@ -84,12 +84,15 @@
 //! disambiguated by whether there is anything marked to move between — and they
 //! fall through to the unshifted binding when there is not, so a terminal that
 //! drops the modifier still gets the unshifted key's action. Plain `Up` is
-//! conditional on the subagent view: while it is up, a query typed or not, `Up`
-//! leaves it, from an arm below the `Shift-Up` match step — which the view, taking
-//! no marks, never satisfies — so `Shift-Up` leaves it too; plain `Down` moves the
-//! selection everywhere. Plain `Left` / `Right` are
-//! conditional on the subagent view, and step subagents while it is up, a query
-//! typed or not. `Shift-Left` / `Shift-Right` are NOT conditional: they step the
+//! conditional on the subagent view being ON SCREEN
+//! ([`App::subagent_view_on_screen`]: open, the preview pane drawn, no `Ctrl-N`
+//! card over it): while it is, a query typed or not, `Up` leaves it, from an arm
+//! below the `Shift-Up` match step — which the view, taking no marks, never
+//! satisfies — so `Shift-Up` leaves it too; plain `Down` moves the selection
+//! everywhere. A view that is open but not drawn (the 1:0 layout, a card) leaves
+//! nothing anyone can see to go back to, so there `Up` is the board's. Plain
+//! `Left` / `Right` are conditional on the same fact, and step subagents while the
+//! view is on screen, a query typed or not. `Shift-Left` / `Shift-Right` are NOT conditional: they step the
 //! layout whatever the query, the marks or the view, and their arms sit above the
 //! plain `Left` / `Right` ones because the first matching arm wins. A terminal
 //! that drops THAT modifier delivers a plain `Left` / `Right`, which moves the
@@ -252,15 +255,16 @@ pub enum Action {
     /// first press never quits a board the user was still searching.
     ClearQuery,
     /// Leave the preview's subagent view for the selected session's own transcript
-    /// (`Esc` with an empty query, or `↑` with any, while the view is open), so an
-    /// `Esc` never quits a board whose pane shows a subagent and an `↑` never moves
-    /// the selection away from it ([`App::leave_subagent_view`]).
+    /// (`Esc` with an empty query while the view is open, or `↑` with any while it
+    /// is on screen), so an `Esc` never quits a board whose pane shows a subagent
+    /// and an `↑` never moves the selection away from it
+    /// ([`App::leave_subagent_view`]).
     LeaveSubagentView,
     /// Switch the subagent view to the previous subagent in launch order (`←`
-    /// while the view is up, query or not; [`App::step_subagent_view`]).
+    /// while the view is on screen, query or not; [`App::step_subagent_view`]).
     PrevSubagent,
     /// Switch the subagent view to the next subagent in launch order (`→` while
-    /// the view is up, query or not; [`App::step_subagent_view`]).
+    /// the view is on screen, query or not; [`App::step_subagent_view`]).
     NextSubagent,
     /// Enter the `Ctrl-X` leader chord: arm [`App::pending_chord`] so the NEXT key
     /// routes through the pure [`chord_key`] machine (hide / hard-delete /
@@ -421,10 +425,14 @@ fn is_key_map_toggle(key: KeyEvent) -> bool {
 /// something, so an empty query leaves them plain selection movement.
 /// `has_preview_matches` ([`App::has_preview_matches`]) decides whether the
 /// SHIFTED arrows have anywhere to go. `in_subagent_view`
-/// ([`App::in_subagent_view`]) is `Esc`'s middle step — with an empty query it
-/// leaves the view rather than quitting — turns the PLAIN `↑` from a selection
-/// move into leaving the view, query or not, and turns the PLAIN `←`/`→` from the
-/// search caret into the subagent steps, query or not.
+/// ([`App::in_subagent_view`]) is `Esc`'s middle step alone — with an empty query
+/// it leaves the view, open or not on screen, rather than quitting.
+/// `view_on_screen` ([`App::subagent_view_on_screen`]) turns the PLAIN `↑` from a
+/// selection move into leaving the view, query or not, and the PLAIN `←`/`→` from
+/// the search caret into the subagent steps, query or not: it is true only while
+/// the view is DRAWN, so a view hidden by the list-only layout or a draft card
+/// leaves those arrows to the board. Two parameters, never one widened to the
+/// other: `Esc` must still leave a hidden view first.
 ///
 /// The shifted arrows are bound CONDITIONALLY and fall through to the plain arrows
 /// otherwise, which buys two things at once. With no query — or a query the
@@ -443,6 +451,7 @@ pub fn key_to_action(
     query_empty: bool,
     has_preview_matches: bool,
     in_subagent_view: bool,
+    view_on_screen: bool,
 ) -> Action {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -508,10 +517,13 @@ pub fn key_to_action(
         // such case exists for the vertical arrows.
         KeyCode::Up if shift && !query_empty && has_preview_matches => Action::PreviewMatchPrev,
         KeyCode::Down if shift && !query_empty && has_preview_matches => Action::PreviewMatchNext,
-        // Inside the subagent view `↑` goes back to the session's own transcript,
-        // query or not, and leaves the query alone. Below the match step, which the
-        // view never satisfies (it takes no marks), so `Shift-Up` lands here too.
-        KeyCode::Up if in_subagent_view => Action::LeaveSubagentView,
+        // Inside the subagent view, while it is drawn (`view_on_screen`), `↑` goes
+        // back to the session's own transcript, query or not, and leaves the query
+        // alone. A view that is open but not drawn (list-only layout, a draft card)
+        // has nothing on screen to go back from, so there `↑` stays the board's.
+        // Below the match step, which the view never satisfies (it takes no marks),
+        // so `Shift-Up` lands here too.
+        KeyCode::Up if view_on_screen => Action::LeaveSubagentView,
         KeyCode::Up => Action::MoveUp,
         KeyCode::Down => Action::MoveDown,
         // Pane layout, on the SHIFTED horizontal arrows: one stop along the
@@ -533,12 +545,13 @@ pub fn key_to_action(
         // the caret one character instead.
         KeyCode::Left if alt => Action::CaretWordBack,
         KeyCode::Right if alt => Action::CaretWordForward,
-        // Inside the subagent view the plain arrows step through the session's
-        // subagents, EVEN WITH A QUERY TYPED: the accepted trade (R4) is that the
-        // caret moves only by word there, through the arms above. Below them, so
-        // `Shift` still steps the layout and `Alt` still hops a word.
-        KeyCode::Left if in_subagent_view => Action::PrevSubagent,
-        KeyCode::Right if in_subagent_view => Action::NextSubagent,
+        // Inside the subagent view, while it is drawn (`view_on_screen`, as for `↑`
+        // above), the plain arrows step through the session's subagents, EVEN WITH A
+        // QUERY TYPED: the accepted trade (R4) is that the caret moves only by word
+        // there, through the arms above. Below them, so `Shift` still steps the
+        // layout and `Alt` still hops a word.
+        KeyCode::Left if view_on_screen => Action::PrevSubagent,
+        KeyCode::Right if view_on_screen => Action::NextSubagent,
         // Elsewhere the search caret: editing the query is what the board does on
         // every search, so it gets the plain arrows. Not gated on the query either —
         // an empty query has nowhere to move, and the widget treats a move past
@@ -554,7 +567,8 @@ pub fn key_to_action(
         KeyCode::End => Action::PreviewBottom,
         KeyCode::Enter => Action::Resume,
         // `Esc` unwinds one level: a typed query first, then the subagent view the
-        // preview may be showing, then the board. `Ctrl-C` is bound above and
+        // preview may be showing — open, drawn or not (`in_subagent_view`, not
+        // `view_on_screen`) — then the board. `Ctrl-C` is bound above and
         // always quits.
         KeyCode::Esc if !query_empty => Action::ClearQuery,
         KeyCode::Esc if in_subagent_view => Action::LeaveSubagentView,
@@ -740,6 +754,7 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
                         app.query_input.is_empty(),
                         app.has_preview_matches(),
                         app.in_subagent_view(),
+                        app.subagent_view_on_screen(),
                     );
                     apply_action(app, action)
                 }
@@ -8772,16 +8787,21 @@ mod tests {
     #[test]
     fn esc_clears_the_query_then_leaves_the_subagent_view_then_quits() {
         assert_eq!(
-            key_to_action(key(KeyCode::Esc), false, false, true),
+            key_to_action(key(KeyCode::Esc), false, false, true, true),
             Action::ClearQuery
         );
         assert_eq!(
-            key_to_action(key(KeyCode::Esc), true, false, true),
+            key_to_action(key(KeyCode::Esc), true, false, true, true),
             Action::LeaveSubagentView
         );
         assert_eq!(
-            key_to_action(key(KeyCode::Esc), true, false, false),
+            key_to_action(key(KeyCode::Esc), true, false, false, false),
             Action::Quit
+        );
+        assert_eq!(
+            key_to_action(key(KeyCode::Esc), true, false, true, false),
+            Action::LeaveSubagentView,
+            "an open view the layout hides is still Esc's middle step"
         );
 
         let (folder, file) = DELEGATION_FIXTURE;
@@ -9258,20 +9278,49 @@ mod tests {
         assert!(app.in_subagent_view());
     }
 
-    /// Plain `←`/`→` step subagents exactly while the view is up — with or
-    /// without a query — and move the caret otherwise; `Shift` still steps the
-    /// layout, and `Alt` and `Ctrl` still hop a word, in the view or not.
+    /// Plain `←`/`→` step subagents and plain `↑` leaves the view exactly while it
+    /// is ON SCREEN (open, drawn) — with or without a query — and are the board's
+    /// otherwise: `←`/`→` the caret, `↑` the selection; `↓` is the selection's in
+    /// all three states. An OPEN view that is not drawn (the list-only layout, a
+    /// draft card) is the third state, and there the arrows are the board's too.
+    /// `Shift` still steps the layout, and `Alt` and `Ctrl` still hop a word, in any
+    /// of the three; `Esc` is the one key that reads the OPEN state
+    /// (`esc_clears_the_query_then_leaves_the_subagent_view_then_quits`).
     #[test]
-    fn the_plain_arrows_step_subagents_only_in_the_view_and_modified_ones_keep_their_meaning() {
+    fn the_plain_arrows_act_on_the_view_only_while_it_is_on_screen_and_modified_ones_keep_their_meaning(
+    ) {
         for query_empty in [true, false] {
-            for (in_view, back, forward) in [
-                (false, Action::CaretBack, Action::CaretForward),
-                (true, Action::PrevSubagent, Action::NextSubagent),
+            for (open, on_screen, back, forward, up) in [
+                (
+                    false,
+                    false,
+                    Action::CaretBack,
+                    Action::CaretForward,
+                    Action::MoveUp,
+                ),
+                (
+                    true,
+                    true,
+                    Action::PrevSubagent,
+                    Action::NextSubagent,
+                    Action::LeaveSubagentView,
+                ),
+                (
+                    true,
+                    false,
+                    Action::CaretBack,
+                    Action::CaretForward,
+                    Action::MoveUp,
+                ),
             ] {
-                let action = |key: KeyEvent| key_to_action(key, query_empty, false, in_view);
-                let what = format!("query_empty={query_empty}, in_view={in_view}");
+                let action =
+                    |key: KeyEvent| key_to_action(key, query_empty, false, open, on_screen);
+                let what = format!("query_empty={query_empty}, open={open}, on_screen={on_screen}");
                 assert_eq!(action(self::key(KeyCode::Left)), back, "{what}");
                 assert_eq!(action(self::key(KeyCode::Right)), forward, "{what}");
+                assert_eq!(action(self::key(KeyCode::Up)), up, "{what}");
+                assert_eq!(action(shift(KeyCode::Up)), up, "{what}");
+                assert_eq!(action(self::key(KeyCode::Down)), Action::MoveDown, "{what}");
                 assert_eq!(
                     action(shift(KeyCode::Left)),
                     Action::LayoutTowardPreview,
@@ -9292,6 +9341,102 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Two delegation rows with the selection on the LOWER one and the subagent
+    /// view open on its subagent, so a `↑` that moved the selection lands on the
+    /// upper row while one that left the view keeps it. Returns the app and the
+    /// selected id.
+    fn open_view_over_two_rows() -> (App, String) {
+        let (mut app, selected, _) = lower_row_delegation_app();
+        app.open_subagent_view(DELEGATION_KEY, DELEGATION_AGENT_TYPE);
+        assert!(app.subagent_view_on_screen(), "premise: the view is drawn");
+        (app, selected)
+    }
+
+    /// With the view OPEN but hidden by the list-only layout, `↑` is the board's:
+    /// it moves the selection — which closes the view, as it does on the board —
+    /// instead of leaving a view nobody can see with the selection kept; `←`/`→`
+    /// move the search caret. Pressed through `handle_event`, the route the keys
+    /// really take.
+    #[test]
+    fn the_arrows_act_on_the_board_while_the_open_view_is_hidden_by_the_list_only_layout() {
+        let (mut app, selected) = open_view_over_two_rows();
+        app.set_pane_layout(PaneLayout::ListOnly);
+        assert!(app.in_subagent_view() && !app.subagent_view_on_screen());
+
+        press(&mut app, KeyCode::Up);
+
+        assert_ne!(
+            app.selected.as_deref(),
+            Some(selected.as_str()),
+            "↑ moves the selection"
+        );
+        assert!(!app.in_subagent_view(), "which closes the view");
+        assert_eq!(app.status, None);
+
+        let (mut app, selected) = open_view_over_two_rows();
+        type_into_board(&mut app, "ab");
+        app.set_pane_layout(PaneLayout::ListOnly);
+        assert_eq!(app.query_caret(), 2);
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.query_caret(), 1, "← moves the search caret");
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.query_caret(), 2, "→ moves it back");
+        assert_eq!(app.subagent_view_type(), Some(DELEGATION_AGENT_TYPE));
+        assert_eq!(app.selected.as_deref(), Some(selected.as_str()));
+        assert_eq!(app.query(), "ab");
+    }
+
+    /// The same behind an in-flight `Ctrl-N` card, which holds the preview pane
+    /// while it launches and leaves the view open under it.
+    #[test]
+    fn the_arrows_act_on_the_board_while_an_in_flight_card_holds_the_pane_over_the_open_view() {
+        let open_behind_a_card = || {
+            let (mut app, selected) = open_view_over_two_rows();
+            app.open_agent_picker(vec![def_agent("planner")]);
+            press(&mut app, KeyCode::Enter);
+            type_into_draft(&mut app, "ship the thing");
+            assert!(
+                matches!(press(&mut app, KeyCode::Enter), Outcome::BgLaunch(_)),
+                "the draft must dispatch for the card to be in flight"
+            );
+            assert!(app.draft.is_some() && app.in_subagent_view());
+            assert!(!app.subagent_view_on_screen(), "the card hides the view");
+            (app, selected)
+        };
+
+        let (mut app, selected) = open_behind_a_card();
+        press(&mut app, KeyCode::Up);
+        assert_ne!(
+            app.selected.as_deref(),
+            Some(selected.as_str()),
+            "↑ moves the selection"
+        );
+        assert!(!app.in_subagent_view(), "which closes the view");
+
+        let (mut app, _) = open_behind_a_card();
+        type_into_board(&mut app, "ab");
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.query_caret(), 1, "← moves the search caret");
+        assert_eq!(app.subagent_view_type(), Some(DELEGATION_AGENT_TYPE));
+    }
+
+    /// `Esc` reads the OPEN view, not the drawn one: with an empty query it leaves
+    /// a view the list-only layout hides before it quits, so the press that would
+    /// have quit never does.
+    #[test]
+    fn esc_leaves_an_open_view_even_while_the_list_only_layout_hides_it() {
+        let (mut app, _) = open_view_over_two_rows();
+        app.set_pane_layout(PaneLayout::ListOnly);
+
+        assert!(matches!(press(&mut app, KeyCode::Esc), Outcome::Continue));
+        assert!(!app.in_subagent_view(), "the first Esc leaves the view");
+
+        assert!(
+            matches!(press(&mut app, KeyCode::Esc), Outcome::Quit),
+            "and only the second quits"
+        );
     }
 
     /// Two rows over the delegation fixture with the selection on the LOWER one,
@@ -9334,7 +9479,7 @@ mod tests {
     fn up_in_the_subagent_view_leaves_it_and_keeps_the_selection() {
         for query_empty in [true, false] {
             assert_eq!(
-                key_to_action(key(KeyCode::Up), query_empty, false, true),
+                key_to_action(key(KeyCode::Up), query_empty, false, true, true),
                 Action::LeaveSubagentView,
                 "query_empty={query_empty}"
             );
@@ -9375,7 +9520,7 @@ mod tests {
     fn shift_up_in_the_subagent_view_falls_through_to_leaving_it() {
         for query_empty in [true, false] {
             assert_eq!(
-                key_to_action(shift(KeyCode::Up), query_empty, false, true),
+                key_to_action(shift(KeyCode::Up), query_empty, false, true, true),
                 Action::LeaveSubagentView,
                 "query_empty={query_empty}"
             );
@@ -9423,7 +9568,7 @@ mod tests {
         for query_empty in [true, false] {
             for down in [key(KeyCode::Down), shift(KeyCode::Down)] {
                 assert_eq!(
-                    key_to_action(down, query_empty, false, true),
+                    key_to_action(down, query_empty, false, true, true),
                     Action::MoveDown,
                     "query_empty={query_empty}, {down:?}"
                 );
@@ -9461,7 +9606,7 @@ mod tests {
     fn up_outside_the_subagent_view_still_moves_the_selection() {
         for (query_empty, marked) in [(true, false), (false, false), (false, true)] {
             assert_eq!(
-                key_to_action(key(KeyCode::Up), query_empty, marked, false),
+                key_to_action(key(KeyCode::Up), query_empty, marked, false, false),
                 Action::MoveUp,
                 "query_empty={query_empty}, marked={marked}"
             );
@@ -11140,30 +11285,30 @@ mod tests {
     #[test]
     fn arrows_always_move() {
         assert_eq!(
-            key_to_action(key(KeyCode::Up), true, false, false),
+            key_to_action(key(KeyCode::Up), true, false, false, false),
             Action::MoveUp
         );
         assert_eq!(
-            key_to_action(key(KeyCode::Down), true, false, false),
+            key_to_action(key(KeyCode::Down), true, false, false, false),
             Action::MoveDown
         );
         // Arrows navigate even mid-query.
         assert_eq!(
-            key_to_action(key(KeyCode::Up), false, false, false),
+            key_to_action(key(KeyCode::Up), false, false, false, false),
             Action::MoveUp
         );
         assert_eq!(
-            key_to_action(key(KeyCode::Down), false, false, false),
+            key_to_action(key(KeyCode::Down), false, false, false, false),
             Action::MoveDown
         );
         // And an UNSHIFTED arrow keeps moving even when the preview HAS marks —
         // the new binding takes the shifted form alone.
         assert_eq!(
-            key_to_action(key(KeyCode::Up), false, true, false),
+            key_to_action(key(KeyCode::Up), false, true, false, false),
             Action::MoveUp
         );
         assert_eq!(
-            key_to_action(key(KeyCode::Down), false, true, false),
+            key_to_action(key(KeyCode::Down), false, true, false, false),
             Action::MoveDown
         );
     }
@@ -11180,12 +11325,12 @@ mod tests {
     fn shifted_arrows_fall_through_to_plain_move_with_nothing_marked() {
         for (query_empty, marked) in [(true, false), (false, false), (true, true)] {
             assert_eq!(
-                key_to_action(shift(KeyCode::Up), query_empty, marked, false),
+                key_to_action(shift(KeyCode::Up), query_empty, marked, false, false),
                 Action::MoveUp,
                 "Shift-Up must still move (query_empty={query_empty}, marked={marked})"
             );
             assert_eq!(
-                key_to_action(shift(KeyCode::Down), query_empty, marked, false),
+                key_to_action(shift(KeyCode::Down), query_empty, marked, false, false),
                 Action::MoveDown,
                 "Shift-Down must still move (query_empty={query_empty}, marked={marked})"
             );
@@ -11197,11 +11342,11 @@ mod tests {
     #[test]
     fn shifted_arrows_step_the_preview_matches_when_something_is_marked() {
         assert_eq!(
-            key_to_action(shift(KeyCode::Up), false, true, false),
+            key_to_action(shift(KeyCode::Up), false, true, false, false),
             Action::PreviewMatchPrev
         );
         assert_eq!(
-            key_to_action(shift(KeyCode::Down), false, true, false),
+            key_to_action(shift(KeyCode::Down), false, true, false, false),
             Action::PreviewMatchNext
         );
     }
@@ -11214,11 +11359,11 @@ mod tests {
         // what fails if a bare-letter navigation binding is ever reintroduced.
         for empty in [true, false] {
             assert_eq!(
-                key_to_action(key(KeyCode::Char('j')), empty, false, false),
+                key_to_action(key(KeyCode::Char('j')), empty, false, false, false),
                 Action::Insert('j')
             );
             assert_eq!(
-                key_to_action(key(KeyCode::Char('k')), empty, false, false),
+                key_to_action(key(KeyCode::Char('k')), empty, false, false, false),
                 Action::Insert('k')
             );
         }
@@ -11232,12 +11377,12 @@ mod tests {
     fn left_right_move_the_search_caret_regardless_of_query() {
         for (query_empty, marked) in [(true, false), (false, false), (true, true), (false, true)] {
             assert_eq!(
-                key_to_action(key(KeyCode::Left), query_empty, marked, false),
+                key_to_action(key(KeyCode::Left), query_empty, marked, false, false),
                 Action::CaretBack,
                 "Left (query_empty={query_empty}, marked={marked})"
             );
             assert_eq!(
-                key_to_action(key(KeyCode::Right), query_empty, marked, false),
+                key_to_action(key(KeyCode::Right), query_empty, marked, false, false),
                 Action::CaretForward,
                 "Right (query_empty={query_empty}, marked={marked})"
             );
@@ -11262,7 +11407,7 @@ mod tests {
                 (alt_shift(KeyCode::Char('F')), Action::CaretWordForward),
             ] {
                 assert_eq!(
-                    key_to_action(event, query_empty, marked, false),
+                    key_to_action(event, query_empty, marked, false, false),
                     want,
                     "{event:?} (query_empty={query_empty}, marked={marked})"
                 );
@@ -11289,7 +11434,7 @@ mod tests {
                 (ctrl(KeyCode::Right), Action::CaretWordForward),
             ] {
                 assert_eq!(
-                    key_to_action(event, query_empty, marked, false),
+                    key_to_action(event, query_empty, marked, false, false),
                     want,
                     "{event:?} (query_empty={query_empty}, marked={marked})"
                 );
@@ -11304,11 +11449,11 @@ mod tests {
     #[test]
     fn a_held_shift_wins_over_the_alt_word_hop_arms() {
         assert_eq!(
-            key_to_action(alt_shift(KeyCode::Left), false, false, false),
+            key_to_action(alt_shift(KeyCode::Left), false, false, false, false),
             Action::LayoutTowardPreview
         );
         assert_eq!(
-            key_to_action(alt_shift(KeyCode::Right), false, false, false),
+            key_to_action(alt_shift(KeyCode::Right), false, false, false, false),
             Action::LayoutTowardList
         );
     }
@@ -11321,7 +11466,7 @@ mod tests {
         // fails if the bare-`q` quit binding is ever reintroduced.
         for empty in [true, false] {
             assert_eq!(
-                key_to_action(key(KeyCode::Char('q')), empty, false, false),
+                key_to_action(key(KeyCode::Char('q')), empty, false, false, false),
                 Action::Insert('q')
             );
         }
@@ -11415,24 +11560,24 @@ mod tests {
         for empty in [true, false] {
             for form in forms {
                 assert_eq!(
-                    key_to_action(form, empty, false, false),
+                    key_to_action(form, empty, false, false, false),
                     Action::ToggleKeyMap
                 );
             }
         }
         for c in ['?', '/'] {
             assert_eq!(
-                key_to_action(key(KeyCode::Char(c)), true, false, false),
+                key_to_action(key(KeyCode::Char(c)), true, false, false, false),
                 Action::Insert(c)
             );
         }
         assert_eq!(
-            key_to_action(key(KeyCode::F(1)), true, false, false),
+            key_to_action(key(KeyCode::F(1)), true, false, false, false),
             Action::ToggleKeyMap,
             "F1 is the key-map key"
         );
         assert_eq!(
-            key_to_action(key(KeyCode::F(2)), true, false, false),
+            key_to_action(key(KeyCode::F(2)), true, false, false, false),
             Action::Ignore,
             "only F1 is bound"
         );
@@ -11483,7 +11628,7 @@ mod tests {
     fn near_miss_forms_and_releases_do_not_toggle_the_key_map() {
         for empty in [true, false] {
             assert_eq!(
-                key_to_action(ctrl(KeyCode::Char('_')), empty, false, false),
+                key_to_action(ctrl(KeyCode::Char('_')), empty, false, false, false),
                 Action::Ignore
             );
         }
@@ -11551,7 +11696,7 @@ mod tests {
         // it is what fails if the withdrawn bare-`y` copy binding ever returns.
         for empty in [true, false] {
             assert_eq!(
-                key_to_action(key(KeyCode::Char('y')), empty, false, false),
+                key_to_action(key(KeyCode::Char('y')), empty, false, false, false),
                 Action::Insert('y')
             );
         }
@@ -11560,11 +11705,11 @@ mod tests {
     #[test]
     fn esc_clears_a_typed_query_and_quits_on_an_empty_one() {
         assert_eq!(
-            key_to_action(key(KeyCode::Esc), true, false, false),
+            key_to_action(key(KeyCode::Esc), true, false, false, false),
             Action::Quit
         );
         assert_eq!(
-            key_to_action(key(KeyCode::Esc), false, false, false),
+            key_to_action(key(KeyCode::Esc), false, false, false, false),
             Action::ClearQuery
         );
     }
@@ -11595,7 +11740,7 @@ mod tests {
     #[test]
     fn ctrl_c_always_quits() {
         assert_eq!(
-            key_to_action(ctrl(KeyCode::Char('c')), false, false, false),
+            key_to_action(ctrl(KeyCode::Char('c')), false, false, false, false),
             Action::Quit
         );
     }
@@ -11603,11 +11748,11 @@ mod tests {
     #[test]
     fn enter_resumes_and_ctrl_f_forks() {
         assert_eq!(
-            key_to_action(key(KeyCode::Enter), true, false, false),
+            key_to_action(key(KeyCode::Enter), true, false, false, false),
             Action::Resume
         );
         assert_eq!(
-            key_to_action(ctrl(KeyCode::Char('f')), false, false, false),
+            key_to_action(ctrl(KeyCode::Char('f')), false, false, false, false),
             Action::Fork
         );
     }
@@ -11619,11 +11764,11 @@ mod tests {
         // user is mid-query. Both `n` and `N` (Shift) decode the same.
         for empty in [true, false] {
             assert_eq!(
-                key_to_action(ctrl(KeyCode::Char('n')), empty, false, false),
+                key_to_action(ctrl(KeyCode::Char('n')), empty, false, false, false),
                 Action::NewSession
             );
             assert_eq!(
-                key_to_action(ctrl(KeyCode::Char('N')), empty, false, false),
+                key_to_action(ctrl(KeyCode::Char('N')), empty, false, false, false),
                 Action::NewSession
             );
         }
@@ -11633,11 +11778,11 @@ mod tests {
     fn toggles_are_reachable_regardless_of_query() {
         // Tab toggles search mode; Ctrl-A scope.
         assert_eq!(
-            key_to_action(key(KeyCode::Tab), false, false, false),
+            key_to_action(key(KeyCode::Tab), false, false, false, false),
             Action::ToggleSearchMode
         );
         assert_eq!(
-            key_to_action(ctrl(KeyCode::Char('a')), false, false, false),
+            key_to_action(ctrl(KeyCode::Char('a')), false, false, false, false),
             Action::ToggleScope
         );
     }
@@ -11651,12 +11796,12 @@ mod tests {
     fn shifted_horizontal_arrows_step_the_layout_regardless_of_query_or_marks() {
         for (query_empty, marked) in [(true, false), (false, false), (true, true), (false, true)] {
             assert_eq!(
-                key_to_action(shift(KeyCode::Left), query_empty, marked, false),
+                key_to_action(shift(KeyCode::Left), query_empty, marked, false, false),
                 Action::LayoutTowardPreview,
                 "Shift-Left (query_empty={query_empty}, marked={marked})"
             );
             assert_eq!(
-                key_to_action(shift(KeyCode::Right), query_empty, marked, false),
+                key_to_action(shift(KeyCode::Right), query_empty, marked, false, false),
                 Action::LayoutTowardList,
                 "Shift-Right (query_empty={query_empty}, marked={marked})"
             );
@@ -11671,19 +11816,19 @@ mod tests {
     #[test]
     fn the_layout_arms_win_over_the_plain_caret_arms() {
         assert_eq!(
-            key_to_action(shift(KeyCode::Left), false, false, false),
+            key_to_action(shift(KeyCode::Left), false, false, false, false),
             Action::LayoutTowardPreview
         );
         assert_eq!(
-            key_to_action(key(KeyCode::Left), false, false, false),
+            key_to_action(key(KeyCode::Left), false, false, false, false),
             Action::CaretBack
         );
         assert_eq!(
-            key_to_action(shift(KeyCode::Right), false, false, false),
+            key_to_action(shift(KeyCode::Right), false, false, false, false),
             Action::LayoutTowardList
         );
         assert_eq!(
-            key_to_action(key(KeyCode::Right), false, false, false),
+            key_to_action(key(KeyCode::Right), false, false, false, false),
             Action::CaretForward
         );
     }
@@ -11790,38 +11935,38 @@ mod tests {
         // or not the user is mid-query.
         for empty in [true, false] {
             assert_eq!(
-                key_to_action(key(KeyCode::PageUp), empty, false, false),
+                key_to_action(key(KeyCode::PageUp), empty, false, false, false),
                 Action::PreviewPageUp
             );
             assert_eq!(
-                key_to_action(key(KeyCode::PageDown), empty, false, false),
+                key_to_action(key(KeyCode::PageDown), empty, false, false, false),
                 Action::PreviewPageDown
             );
             assert_eq!(
-                key_to_action(key(KeyCode::Home), empty, false, false),
+                key_to_action(key(KeyCode::Home), empty, false, false, false),
                 Action::PreviewTop
             );
             assert_eq!(
-                key_to_action(key(KeyCode::End), empty, false, false),
+                key_to_action(key(KeyCode::End), empty, false, false, false),
                 Action::PreviewBottom
             );
             // Ctrl-U / Ctrl-D quarter-page, also independent of query state.
             assert_eq!(
-                key_to_action(ctrl(KeyCode::Char('u')), empty, false, false),
+                key_to_action(ctrl(KeyCode::Char('u')), empty, false, false, false),
                 Action::PreviewHalfUp
             );
             assert_eq!(
-                key_to_action(ctrl(KeyCode::Char('d')), empty, false, false),
+                key_to_action(ctrl(KeyCode::Char('d')), empty, false, false, false),
                 Action::PreviewHalfDown
             );
             // Ctrl-T / Ctrl-E reach the same top/bottom jump as Home/End, also
             // independent of query state.
             assert_eq!(
-                key_to_action(ctrl(KeyCode::Char('t')), empty, false, false),
+                key_to_action(ctrl(KeyCode::Char('t')), empty, false, false, false),
                 Action::PreviewTop
             );
             assert_eq!(
-                key_to_action(ctrl(KeyCode::Char('e')), empty, false, false),
+                key_to_action(ctrl(KeyCode::Char('e')), empty, false, false, false),
                 Action::PreviewBottom
             );
         }
@@ -11830,15 +11975,15 @@ mod tests {
     #[test]
     fn printable_characters_type_into_the_query() {
         assert_eq!(
-            key_to_action(key(KeyCode::Char('a')), true, false, false),
+            key_to_action(key(KeyCode::Char('a')), true, false, false, false),
             Action::Insert('a')
         );
         assert_eq!(
-            key_to_action(key(KeyCode::Char('z')), false, false, false),
+            key_to_action(key(KeyCode::Char('z')), false, false, false, false),
             Action::Insert('z')
         );
         assert_eq!(
-            key_to_action(key(KeyCode::Backspace), false, false, false),
+            key_to_action(key(KeyCode::Backspace), false, false, false, false),
             Action::Backspace
         );
     }
@@ -11866,36 +12011,36 @@ mod tests {
         for empty in [true, false] {
             // The macOS gesture, ESC 0x7F.
             assert_eq!(
-                key_to_action(alt(KeyCode::Backspace), empty, false, false),
+                key_to_action(alt(KeyCode::Backspace), empty, false, false, false),
                 Action::BackspaceWord
             );
             // readline's Ctrl-W (0x17), needing no Alt at all.
             assert_eq!(
-                key_to_action(ctrl(KeyCode::Char('w')), empty, false, false),
+                key_to_action(ctrl(KeyCode::Char('w')), empty, false, false, false),
                 Action::BackspaceWord
             );
             assert_eq!(
-                key_to_action(ctrl(KeyCode::Char('W')), empty, false, false),
+                key_to_action(ctrl(KeyCode::Char('W')), empty, false, false, false),
                 Action::BackspaceWord
             );
             assert_eq!(
-                key_to_action(ctrl_shift(KeyCode::Char('W')), empty, false, false),
+                key_to_action(ctrl_shift(KeyCode::Char('W')), empty, false, false, false),
                 Action::BackspaceWord
             );
             // The third key `TextArea::input` maps to a word delete, so the
             // board answers the same set the reply box does.
             assert_eq!(
-                key_to_action(alt(KeyCode::Char('h')), empty, false, false),
+                key_to_action(alt(KeyCode::Char('h')), empty, false, false, false),
                 Action::BackspaceWord
             );
             assert_eq!(
-                key_to_action(alt(KeyCode::Char('H')), empty, false, false),
+                key_to_action(alt(KeyCode::Char('H')), empty, false, false, false),
                 Action::BackspaceWord
             );
 
             // ...and the unmodified key is untouched: one character, as always.
             assert_eq!(
-                key_to_action(key(KeyCode::Backspace), empty, false, false),
+                key_to_action(key(KeyCode::Backspace), empty, false, false, false),
                 Action::Backspace
             );
         }
@@ -11915,11 +12060,11 @@ mod tests {
     fn an_unbound_alt_printable_is_ignored_rather_than_typed() {
         for empty in [true, false] {
             assert_eq!(
-                key_to_action(alt(KeyCode::Char('j')), empty, false, false),
+                key_to_action(alt(KeyCode::Char('j')), empty, false, false, false),
                 Action::Ignore
             );
             assert_eq!(
-                key_to_action(alt(KeyCode::Char('z')), empty, false, false),
+                key_to_action(alt(KeyCode::Char('z')), empty, false, false, false),
                 Action::Ignore
             );
         }
