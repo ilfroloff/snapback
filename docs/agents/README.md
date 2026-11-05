@@ -17,7 +17,7 @@ find the same rule in two places, that is a bug to fix.
    on, the derived concepts (label, grouping, content index, fork lineage and
    the named forks it keeps under their parent, turn count, live agents, the
    preview's peer and injected-context nodes, its delegation lines and the
-   subagent view they, `Ctrl-X ↓` and `←`/`→` switch to, the selected session's
+   subagent view they, `Ctrl-X ↓`, `←`/`→` and `↑`/`↓` switch to, the selected session's
    subagent record with its running rule, the preview's running list and the
    session's title, the answering model
    and the one a `-r` launch restores, scopes, the per-compose model pick and

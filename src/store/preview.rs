@@ -459,7 +459,7 @@ pub fn render(
 /// FAIL-SOFT: a transcript that cannot be opened, or that renders no line at all
 /// (empty or garbage), is the single DIM [`SUBAGENT_UNREADABLE`] line, so the
 /// switch still visibly happened. Called only for the subagent view a click,
-/// `Ctrl-X ↓` or a `←`/`→` step switched to, never by the session's own render.
+/// `Ctrl-X ↓` or a `←`/`→` / `↑`/`↓` step switched to, never by the session's own render.
 pub fn render_subagent(
     session_file: &Path,
     agent_id: &str,

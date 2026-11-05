@@ -41,10 +41,10 @@
 //!
 //! | Key | Action |
 //! | --- | ------ |
-//! | `Up` / `Down` | move selection: `Down` always, `Up` except while the subagent view is ON SCREEN (open, the preview pane drawn, no `Ctrl-N` card over it — [`App::subagent_view_on_screen`]). There `Up` goes back to the session's own transcript instead (the next row). An open view the 1:0 list-only layout or a card hides leaves `Up` the selection's: moving it closes the view |
-//! | `Up` (in the subagent view, on screen) | leave the view for the SELECTED session's own transcript, scrolled where it was, with the selection unchanged — what `Esc` does there with an empty query, straight back from a nested subagent too. Bound whenever the view is on screen, EVEN WITH A QUERY TYPED, and it never clears the query (`Esc` clears a typed one first). `Shift-Up` does the same: the view takes no search marks, so it falls through to this row (see [`App::leave_subagent_view`]) |
+//! | `Up` / `Down` | move selection, except while the subagent view is ON SCREEN (open, the preview pane drawn, no `Ctrl-N` card over it — [`App::subagent_view_on_screen`]), where they step between its RUNNING subagents instead and never move the selection (the next row). An open view the 1:0 list-only layout or a card hides leaves them the selection's: moving it closes the view |
+//! | `Up` / `Down` (in the subagent view, on screen) | switch the preview to the previous / next RUNNING subagent of the selected session — the preview's running list's set, judged by the same check over the same inputs, in LAUNCH ORDER, wrapping round at both ends. The subagent shown need not be running (a click or a `Left` / `Right` step can have opened a finished one): `Down` then goes to the first running one after it, `Up` to the last one before it; a subagent the record does not list yet counts as the newest launch; the only running one stays where it is. Bound whenever the view is on screen, EVEN WITH A QUERY TYPED, and ALWAYS — never only while something runs, so the key never turns back into a selection move when the last subagent finishes. The query and the selection stay as they were. `Shift-Up` / `Shift-Down` do the same: the view takes no search marks, so they fall through to this row. Refused on a sticky status line while the session's subagents are still being read, when none are listed, or when none is running (that one names `Left` / `Right`; see [`App::step_running_subagent_view`]). `Esc` and `Ctrl-X ↓` leave the view; `Esc` even when it is open but hidden |
 //! | `Left` / `Right` | outside the subagent view — or while it is open but not on screen (the 1:0 list-only layout, a `Ctrl-N` card over the pane) — move the search query's caret one character back / forward. Not a query change: the list, the selection and the preview stay exactly where they were. Inside the view, on screen, they step subagents instead (the next row) |
-//! | `Left` / `Right` (in the subagent view, on screen) | switch the preview to the previous / next subagent of the selected session in LAUNCH ORDER — its transcript's first timestamp, one with none last — wrapping round at both ends: every subagent it launched, at any depth, finished ones too. The view's title ends with where it stands (`… · 2/5`). Bound whenever the view is on screen, EVEN WITH A QUERY TYPED — the accepted trade: there the caret moves only by word (the next row). A subagent the record does not list yet (a click opened it before its meta file was read) counts as the newest launch: `Right` wraps to the first, `Left` lands on the last. Refused on a sticky status line while the session's subagents are still being read, or when none are listed (see [`App::step_subagent_view`]) |
+//! | `Left` / `Right` (in the subagent view, on screen) | switch the preview to the previous / next subagent of the selected session in LAUNCH ORDER — its transcript's first timestamp, one with none last — wrapping round at both ends: every subagent it launched, at any depth, finished ones too (`Up` / `Down` step only the running ones). The view's title ends with where it stands (`… · 2/5`). Bound whenever the view is on screen, EVEN WITH A QUERY TYPED — the accepted trade: there the caret moves only by word (the next row). A subagent the record does not list yet (a click opened it before its meta file was read) counts as the newest launch: `Right` wraps to the first, `Left` lands on the last. Refused on a sticky status line while the session's subagents are still being read, or when none are listed (see [`App::step_subagent_view`]) |
 //! | `Alt-Left` / `Alt-Right`, `Alt-b` / `Alt-f`, `Ctrl-Left` / `Ctrl-Right` | move the search query's caret one WORD back / forward (always) — the widget's own word hop (see [`App::move_query_caret_by_word`]), so forward lands on the START of the next word, as in the reply box. Not a query change either. Three pairs because `⌥←` / `⌥→` reaches the board as `CSI 1;3D` / `C` or as `ESC b` / `ESC f` depending on the terminal, and `Ctrl-Left` / `Ctrl-Right` is the non-`Alt` twin; `Alt-b` / `Alt-f` and `Ctrl-Left` / `Ctrl-Right` are also the pairs the compose box hops words on |
 //! | `Enter` | resume the selected session. Refused, before the liveness probe, while snapback's own `claude -p` child is still writing that session — a quick reply to it, or on a fork's row the headless fork creating it (see [`send::resume_in_flight_refusal`]) — and while its own `Ctrl-X w` move of that session is still in flight (see [`App::moving_on`]). A reply or fork in flight on another row refuses nothing here, and neither does a headless fork on the row it was forked from, which its child only reads |
 //! | `Ctrl-F` | fork the selected session: opens a fork compose box after the move and folder checks (refused, like `Enter`, while snapback's own `Ctrl-X w` move of that session is still in flight; a deleted folder is refused before you type; no live-agent check, claude skips it for a fork). `Enter` forks it headless without leaving the board (`claude -p -r <id> --fork-session --session-id <new> --name <name>`, like a quick reply — once the fork appears, folded under the session it came from, the cursor expands that lineage and jumps to it, if you have not moved and nothing owns the keyboard — see [`App::keyboard_owned`]), `Ctrl-O` forks it interactively (an empty box with no pick is the plain `claude -r <id> --fork-session` plus its `--name`), `Ctrl-L` picks the model for that fork, `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels. Both name the fork `fork: <first line of the message>` (`fork: <the session's label>` for an empty `Ctrl-O`; see `resume::fork_name`), which keeps the session heading its forks (`lineage::head_of`). The Attach/Fork/Cancel choice's Fork hands off exactly the argv of an empty `Ctrl-O` with no pick, and never carries a model. In the box `/` and `@` open the pick list (the `/` or `@` row below), which claims `Enter` and `Esc` while it is open |
@@ -63,13 +63,13 @@
 //! | `PgUp` / `PgDn` | scroll the preview a page (always) |
 //! | `Ctrl-U` / `Ctrl-D` | scroll the preview a quarter page (always) |
 //! | `Ctrl-T` / `Ctrl-E`, `Home` / `End` | jump the preview to top / bottom (always). Every preview scroll key (these, `PgUp` / `PgDn`, `Ctrl-U` / `Ctrl-D`) also works while a quick reply or fork box is open, through the same `App` methods (see [`compose::ComposeAction::PreviewTop`]); there they take the editor's meaning (`Ctrl-U`/`Ctrl-D`/`Ctrl-E`, `Home`/`End`/`PgUp`/`PgDn`) away. A new-session draft keeps them all for its editor |
-//! | `Shift-Up` / `Shift-Down` | scroll the preview onto the previous / next MARKED line, but only while the query marks something in the previewed transcript; with nothing marked they fall through to the plain `Up` / `Down` — selection movement, or `Up`'s leaving of the subagent view, which takes no marks. One stop per marked LINE, not per occurrence — a line saying the query twice is marked, and stopped at, once |
+//! | `Shift-Up` / `Shift-Down` | scroll the preview onto the previous / next MARKED line, but only while the query marks something in the previewed transcript; with nothing marked they fall through to the plain `Up` / `Down` — selection movement, or in the subagent view, which takes no marks, its running-subagent step. One stop per marked LINE, not per occurrence — a line saying the query twice is marked, and stopped at, once |
 //! | `Backspace` | delete the query character before the caret |
 //! | `Alt-Backspace` / `Ctrl-W` / `Alt-H` | delete the query ATOM before the caret — one whole search word, not one character, so a path or a branch name goes in a single press; what follows the caret stays. THREE keys because `TextArea::input` word-deletes on all three in the compose box: binding the same SET here is what makes the gesture reach the board at all, whatever the user's option-as-meta setting turns `Alt-Backspace` into. The set matches; the EXTENT deliberately does not — the board cuts at the search atom and the compose box at `CharKind`'s punctuation boundary, so `feature/fold-fork-lineages` goes whole here and loses only `lineages` there |
 //! | printable char | type-to-search (insert at the query's caret) |
 //! | terminal paste | inserted as TEXT — never as keystrokes (see below). A compose paste is cut at `send::COMPOSE_PROMPT_MAX_BYTES`; a draft over it is refused, box kept, on `Enter` in every box and on `Ctrl-O` in the fork box and the draft (`compose::refuse_too_long`) |
 //! | mouse: click a folded node's header | unfold the node — a subagent's hand-back (`◆ message from`) or context claude injected (`◇`) — where it sits, and a second click folds it back; a click on a header toggles its node and never opens a link. On the RELEASE, like a link, and ahead of one (see [`click_effect`]). Works while a quick reply or fork box is open, like every pointer action over the transcript but the `◆ delegated to …` switch below |
-//! | mouse: click a `◆ delegated to …` line | switch the preview to that subagent's OWN transcript — the SUBAGENT VIEW: the pane's title names the subagent, its pinned row names the subagent's turn, it takes no search marks, and it updates as the subagent writes. A `◆ delegated to …` line inside it switches to that nested subagent. `Up` (while the view is on screen) or `Esc` goes back to the session's own transcript where it was scrolled; `Ctrl-X ↓` again, `Ctrl-R` and `Ctrl-F` leave it too, and so does ANY change of the selected session (`App::set_selected`): `Down`, `Up` while the open view is hidden, the mouse wheel over the list, a search edit, `Tab` or `Ctrl-A` that filters the row out, `Ctrl-X x` or `Ctrl-X h` hiding it, `Ctrl-X d` or `Ctrl-X w` taking it off the board, `Ctrl-X f` from a `↳` row, a reload that drops the row, and the cursor following a headless fork onto its new row. Only this click, `Ctrl-X ↓` and `Left` / `Right` inside the view open it — no search key does (see [`App::open_subagent_view`]). On the RELEASE, like a link. Refused, on a sticky status line, while a quick reply or fork box is open: what the box sends lands in the session, so the pane keeps showing the session's own transcript |
+//! | mouse: click a `◆ delegated to …` line | switch the preview to that subagent's OWN transcript — the SUBAGENT VIEW: the pane's title names the subagent, its pinned row names the subagent's turn, it takes no search marks, and it updates as the subagent writes. A `◆ delegated to …` line inside it switches to that nested subagent. `Esc` or `Ctrl-X ↓` again goes back to the session's own transcript where it was scrolled; `Ctrl-R` and `Ctrl-F` leave it too, and so does ANY change of the selected session (`App::set_selected`): `Up` / `Down` while the open view is hidden, the mouse wheel over the list, a search edit, `Tab` or `Ctrl-A` that filters the row out, `Ctrl-X x` or `Ctrl-X h` hiding it, `Ctrl-X d` or `Ctrl-X w` taking it off the board, `Ctrl-X f` from a `↳` row, a reload that drops the row, and the cursor following a headless fork onto its new row. Only this click, `Ctrl-X ↓`, `Left` / `Right` and `Up` / `Down` inside the view open it — no search key does (see [`App::open_subagent_view`]). On the RELEASE, like a link. Refused, on a sticky status line, while a quick reply or fork box is open: what the box sends lands in the session, so the pane keeps showing the session's own transcript |
 //! | mouse: click a preview link | open its url in the browser — `http`/`https` only: any other scheme opens nothing and says so on a sticky status line. On the RELEASE, since only then is it known that the press was a click and not the start of a drag (see [`mouse_effect`]). Works while a quick reply or fork box is open |
 //! | mouse: drag in the preview | select transcript text in reading order, reverse-videoed — DRAWN text only: each row ends at its last drawn character, never at the pane's edge, and a drag over blank space alone selects nothing, so its release copies nothing. HOLD the drag past the transcript's top or bottom edge and the pane glides that way, a small step every `AUTOSCROLL_FRAME` — faster the further past the edge — so the selection keeps growing into rows that were never on screen until the button comes up (see [`App::autoscroll_preview_selection`]); a plain move while the button is held counts as the release the terminal lost. The release copies the WHOLE selection the way `Ctrl-X y` copies — [`Outcome::Copy`], the clipboard tool first, OSC 52 as the fallback — with a transient status. Never the in-flight reply's tail. A wheel notch, any key or a resize ends it. A drag that starts on a node header, a `◆ delegated to …` line or a link selects, and toggles, switches or opens nothing. Off under any overlay and a new-session draft's card, but ON while a quick reply or fork box is open (each previews the real transcript; the drag neither moves its caret nor touches its text), and never started on the pinned row, the running list or a docked compose zone (see [`press_starts_selection`]) |
 //! | mouse: double-click in the preview | select the WORD under the pointer (Unicode word boundaries, on the drawn row) and copy it on release, exactly as a drag copies. Two presses on the SAME cell within [`DOUBLE_CLICK_INTERVAL`] (see [`is_double_click`]); a blank word selects nothing; a quick third click keeps the word. The FIRST release is a plain click — it toggles a node header, switches to a subagent or opens a link, as above — and the SECOND copies the word and toggles, switches or opens nothing, so a node header double-clicked is opened once and stays open. Any key, wheel notch or reload resets the count (a fold toggle does not: it is the first click's own effect), and a press that turned into a drag is not a first click. Same gate as a drag ([`press_starts_selection`]), so it too works while a quick reply or fork box is open |
@@ -83,16 +83,20 @@
 //! never blocked either. `Shift-Up` / `Shift-Down` are conditional on the marks,
 //! disambiguated by whether there is anything marked to move between — and they
 //! fall through to the unshifted binding when there is not, so a terminal that
-//! drops the modifier still gets the unshifted key's action. Plain `Up` is
-//! conditional on the subagent view being ON SCREEN
+//! drops the modifier still gets the unshifted key's action. Plain `Up` /
+//! `Down` are conditional on the subagent view being ON SCREEN
 //! ([`App::subagent_view_on_screen`]: open, the preview pane drawn, no `Ctrl-N`
-//! card over it): while it is, a query typed or not, `Up` leaves it, from an arm
-//! below the `Shift-Up` match step — which the view, taking no marks, never
-//! satisfies — so `Shift-Up` leaves it too; plain `Down` moves the selection
-//! everywhere. A view that is open but not drawn (the 1:0 layout, a card) leaves
-//! nothing anyone can see to go back to, so there `Up` is the board's. Plain
-//! `Left` / `Right` are conditional on the same fact, and step subagents while the
-//! view is on screen, a query typed or not. `Shift-Left` / `Shift-Right` are NOT conditional: they step the
+//! card over it): while it is, a query typed or not, they step the running
+//! subagents, from arms below the `Shift-Up` / `Shift-Down` match step — which the
+//! view, taking no marks, never satisfies — so the shifted keys step too. Unlike
+//! the shifted arrows, that decode has no further condition to fall through on: it
+//! is bound on the view being drawn alone, never on "something runs", so the key
+//! cannot turn back into a selection move when the last subagent finishes
+//! (PATTERNS.md names it as the exception). A view that is open but not drawn
+//! (the 1:0 layout, a card) steps nothing anyone can see, so there the arrows are
+//! the board's. Plain `Left` / `Right` are conditional on the same fact, and step
+//! subagents while the view is on screen, a query
+//! typed or not. `Shift-Left` / `Shift-Right` are NOT conditional: they step the
 //! layout whatever the query, the marks or the view, and their arms sit above the
 //! plain `Left` / `Right` ones because the first matching arm wins. A terminal
 //! that drops THAT modifier delivers a plain `Left` / `Right`, which moves the
@@ -255,11 +259,18 @@ pub enum Action {
     /// first press never quits a board the user was still searching.
     ClearQuery,
     /// Leave the preview's subagent view for the selected session's own transcript
-    /// (`Esc` with an empty query while the view is open, or `↑` with any while it
-    /// is on screen), so an `Esc` never quits a board whose pane shows a subagent
-    /// and an `↑` never moves the selection away from it
-    /// ([`App::leave_subagent_view`]).
+    /// (`Esc` with an empty query while the view is open), so an `Esc` never quits
+    /// a board whose pane shows a subagent ([`App::leave_subagent_view`]).
+    /// `Ctrl-X ↓` leaves it too, but through the chord's own route, never this
+    /// action.
     LeaveSubagentView,
+    /// Switch the subagent view to the previous RUNNING subagent in launch order
+    /// (`↑` while the view is on screen, query or not, running or not;
+    /// [`App::step_running_subagent_view`]).
+    PrevRunningSubagent,
+    /// Switch the subagent view to the next RUNNING subagent in launch order (`↓`
+    /// while the view is on screen, same terms; [`App::step_running_subagent_view`]).
+    NextRunningSubagent,
     /// Switch the subagent view to the previous subagent in launch order (`←`
     /// while the view is on screen, query or not; [`App::step_subagent_view`]).
     PrevSubagent,
@@ -427,18 +438,19 @@ fn is_key_map_toggle(key: KeyEvent) -> bool {
 /// SHIFTED arrows have anywhere to go. `in_subagent_view`
 /// ([`App::in_subagent_view`]) is `Esc`'s middle step alone — with an empty query
 /// it leaves the view, open or not on screen, rather than quitting.
-/// `view_on_screen` ([`App::subagent_view_on_screen`]) turns the PLAIN `↑` from a
-/// selection move into leaving the view, query or not, and the PLAIN `←`/`→` from
-/// the search caret into the subagent steps, query or not: it is true only while
-/// the view is DRAWN, so a view hidden by the list-only layout or a draft card
-/// leaves those arrows to the board. Two parameters, never one widened to the
-/// other: `Esc` must still leave a hidden view first.
+/// `view_on_screen` ([`App::subagent_view_on_screen`]) turns the PLAIN `↑`/`↓`
+/// from a selection move into the running-subagent steps, query or not and
+/// running or not, and the PLAIN `←`/`→` from the search caret into the subagent
+/// steps, query or not: it is true only while the view is DRAWN, so a view hidden
+/// by the list-only layout or a draft card leaves the four arrows to the board.
+/// Two parameters, never one widened to the other: `Esc` must still leave a
+/// hidden view first.
 ///
 /// The shifted arrows are bound CONDITIONALLY and fall through to the plain arrows
 /// otherwise, which buys two things at once. With no query — or a query the
 /// previewed transcript does not say — `Shift-Up` is bit-for-bit the plain `↑`:
 /// the `MoveUp` it has always been, or in the subagent view, which takes no marks,
-/// leaving it. So nothing a user already relies on changes. And on a terminal that
+/// the running-subagent step. So nothing a user already relies on changes. And on a terminal that
 /// drops the modifier (or a multiplexer that eats the `CSI 1;2A` form), the key
 /// arrives as a bare arrow and still does what that arrow does, which is the
 /// graceful degradation rather than a dead key.
@@ -517,13 +529,18 @@ pub fn key_to_action(
         // such case exists for the vertical arrows.
         KeyCode::Up if shift && !query_empty && has_preview_matches => Action::PreviewMatchPrev,
         KeyCode::Down if shift && !query_empty && has_preview_matches => Action::PreviewMatchNext,
-        // Inside the subagent view, while it is drawn (`view_on_screen`), `↑` goes
-        // back to the session's own transcript, query or not, and leaves the query
-        // alone. A view that is open but not drawn (list-only layout, a draft card)
-        // has nothing on screen to go back from, so there `↑` stays the board's.
-        // Below the match step, which the view never satisfies (it takes no marks),
-        // so `Shift-Up` lands here too.
-        KeyCode::Up if view_on_screen => Action::LeaveSubagentView,
+        // Inside the subagent view `↑`/`↓` step between the RUNNING subagents,
+        // query or not, and leave the query and the selection alone. Bound on the
+        // view being ON SCREEN alone, never on "something is running": were the
+        // decode gated on that, the key would turn back into a selection move the
+        // moment the last subagent finished, under the user's finger (PATTERNS.md's
+        // conditional-binding passage names this as its deliberate exception). A
+        // view that is open but not drawn (list-only layout, a draft card) steps
+        // nothing the user can see, so there they stay the board's. Below the match
+        // step, which the view never satisfies (it takes no marks), so `Shift-↑`/
+        // `Shift-↓` land here too.
+        KeyCode::Up if view_on_screen => Action::PrevRunningSubagent,
+        KeyCode::Down if view_on_screen => Action::NextRunningSubagent,
         KeyCode::Up => Action::MoveUp,
         KeyCode::Down => Action::MoveDown,
         // Pane layout, on the SHIFTED horizontal arrows: one stop along the
@@ -545,11 +562,11 @@ pub fn key_to_action(
         // the caret one character instead.
         KeyCode::Left if alt => Action::CaretWordBack,
         KeyCode::Right if alt => Action::CaretWordForward,
-        // Inside the subagent view, while it is drawn (`view_on_screen`, as for `↑`
-        // above), the plain arrows step through the session's subagents, EVEN WITH A
-        // QUERY TYPED: the accepted trade (R4) is that the caret moves only by word
-        // there, through the arms above. Below them, so `Shift` still steps the
-        // layout and `Alt` still hops a word.
+        // Inside the subagent view, while it is drawn (`view_on_screen`, as for
+        // `↑`/`↓` above), the plain arrows step through the session's subagents,
+        // EVEN WITH A QUERY TYPED: the accepted trade (R4) is that the caret moves
+        // only by word there, through the arms above. Below them, so `Shift` still
+        // steps the layout and `Alt` still hops a word.
         KeyCode::Left if view_on_screen => Action::PrevSubagent,
         KeyCode::Right if view_on_screen => Action::NextSubagent,
         // Elsewhere the search caret: editing the query is what the board does on
@@ -1589,8 +1606,8 @@ fn press_starts_selection(app: &App, pos: Position) -> bool {
 ///   and asks for nothing more.
 /// - On a `◆ delegated to …` line it switches the pane to the transcript of the
 ///   subagent the line names ([`App::open_subagent_view`], which keeps the click
-///   chain the same way) and asks for nothing more. One of the view's THREE
-///   routes in — `Ctrl-X ↓` and a `←`/`→` step inside the view are the others —
+///   chain the same way) and asks for nothing more. One of the view's FOUR
+///   routes in — `Ctrl-X ↓` and a `←`/`→` or `↑`/`↓` step inside the view are the others —
 ///   and no search route reaches any (`docs/agents/DOMAIN.md`, "Delegation line
 ///   and subagent view"). Refused, with a STICKY [`SUBAGENT_VIEW_COMPOSING_REFUSAL`], while a
 ///   quick reply or fork box is open: the box sends into the session, so the pane
@@ -2070,6 +2087,16 @@ fn apply_action(app: &mut App, action: Action) -> Outcome {
             refuse_unavailable_subagents(app, stepped);
             Outcome::Continue
         }
+        Action::PrevRunningSubagent => {
+            let stepped = app.step_running_subagent_view(false);
+            refuse_unavailable_subagents(app, stepped);
+            Outcome::Continue
+        }
+        Action::NextRunningSubagent => {
+            let stepped = app.step_running_subagent_view(true);
+            refuse_unavailable_subagents(app, stepped);
+            Outcome::Continue
+        }
         Action::Chord => {
             // Arm the leader chord; `handle_event` routes the next key through
             // `handle_chord_key` before it can reach the board or the query.
@@ -2387,7 +2414,7 @@ fn toggle_subagent_view(app: &mut App) {
     }
 }
 
-/// `Ctrl-X ↓`'s and the subagent view's `←`/`→` refusal while the selected
+/// `Ctrl-X ↓`'s and the subagent view's `←`/`→` / `↑`/`↓` refusal while the selected
 /// session's subagents have not been read yet: it says so, and never claims there
 /// are none, which nothing knows until the read lands.
 const SUBAGENTS_NOT_READ_REFUSAL: &str =
@@ -2396,11 +2423,17 @@ const SUBAGENTS_NOT_READ_REFUSAL: &str =
 /// The same keys' refusal when the selected session's record lists no subagent.
 const SUBAGENTS_NONE_REFUSAL: &str = "no subagents found for this session";
 
+/// The view's `↑`/`↓` refusal when the record lists subagents and none is running:
+/// it names `←`/`→`, which still step through every one of them.
+const SUBAGENTS_NONE_RUNNING_REFUSAL: &str =
+    "no subagent is running \u{2014} \u{2190}/\u{2192} step through all of them";
+
 /// The refusal line for why no subagent could be switched to. PURE.
 fn subagents_refusal(why: SubagentsUnavailable) -> &'static str {
     match why {
         SubagentsUnavailable::NotRead => SUBAGENTS_NOT_READ_REFUSAL,
         SubagentsUnavailable::None => SUBAGENTS_NONE_REFUSAL,
+        SubagentsUnavailable::NoneRunning => SUBAGENTS_NONE_RUNNING_REFUSAL,
     }
 }
 
@@ -8830,10 +8863,10 @@ mod tests {
         );
     }
 
-    /// Only THREE routes may switch the preview to a subagent or read a
+    /// Only FOUR routes may switch the preview to a subagent or read a
     /// subagent's transcript (`docs/agents/DOMAIN.md`, "Delegation line and
     /// subagent view (`store::preview`)"): a CLICK on a `◆ delegated to …` line,
-    /// `Ctrl-X ↓`, and `←`/`→` inside the view. Every search route — typing a
+    /// `Ctrl-X ↓`, and `←`/`→` and `↑`/`↓` inside the view. Every search route — typing a
     /// query the subagents' transcripts hold too, `Tab` to content search,
     /// `Shift-Down` and `Shift-Up` over the marks, `Backspace` — leaves the pane on
     /// the session's own transcript and reads no subagent file — with the
@@ -8841,7 +8874,7 @@ mod tests {
     /// follows the selection through those routes, would have it, so a route that
     /// opened the view could. The record landing reads no transcript on the UI
     /// thread. The click that follows is what does both, which proves the counter
-    /// can see a read at all; then `Ctrl-X ↓` and a `→` do both again.
+    /// can see a read at all; then `Ctrl-X ↓`, a `→` and a `↓` do both again.
     #[test]
     fn no_search_route_switches_to_a_subagent_or_reads_its_transcript() {
         let (folder, file) = DELEGATION_FIXTURE;
@@ -8907,6 +8940,16 @@ mod tests {
             app.subagent_renders(),
             3,
             "and so does a step inside the view"
+        );
+
+        deliver_record(&mut app, "s1", fixture_record(&[DOCS_WRITER_KEY]));
+        press(&mut app, KeyCode::Down);
+        render_board(&mut app);
+        assert_eq!(app.subagent_view_type(), Some("docs-writer"));
+        assert_eq!(
+            app.subagent_renders(),
+            4,
+            "and so does a running step inside the view"
         );
     }
 
@@ -9083,6 +9126,14 @@ mod tests {
         assert_eq!(
             subagents_refusal(SubagentsUnavailable::None),
             SUBAGENTS_NONE_REFUSAL
+        );
+        assert_eq!(
+            subagents_refusal(SubagentsUnavailable::NoneRunning),
+            SUBAGENTS_NONE_RUNNING_REFUSAL
+        );
+        assert!(
+            SUBAGENTS_NONE_RUNNING_REFUSAL.contains("\u{2190}/\u{2192}"),
+            "the none-running line names the keys that still step through all"
         );
         assert!(
             !SUBAGENTS_NOT_READ_REFUSAL.contains("no subagents"),
@@ -9278,32 +9329,33 @@ mod tests {
         assert!(app.in_subagent_view());
     }
 
-    /// Plain `←`/`→` step subagents and plain `↑` leaves the view exactly while it
-    /// is ON SCREEN (open, drawn) — with or without a query — and are the board's
-    /// otherwise: `←`/`→` the caret, `↑` the selection; `↓` is the selection's in
-    /// all three states. An OPEN view that is not drawn (the list-only layout, a
-    /// draft card) is the third state, and there the arrows are the board's too.
-    /// `Shift` still steps the layout, and `Alt` and `Ctrl` still hop a word, in any
-    /// of the three; `Esc` is the one key that reads the OPEN state
+    /// The four plain arrows act on the subagent view exactly while it is ON SCREEN
+    /// (open, drawn) — with or without a query — and are the board's otherwise: `←`
+    /// / `→` the caret, `↑` / `↓` the selection. An OPEN view that is not drawn (the
+    /// list-only layout, a draft card) is the third state, and there they are the
+    /// board's too. `Shift` still steps the layout, and `Alt` and `Ctrl` still hop
+    /// a word, in any of the three; `Esc` is the one key that reads the OPEN state
     /// (`esc_clears_the_query_then_leaves_the_subagent_view_then_quits`).
     #[test]
-    fn the_plain_arrows_act_on_the_view_only_while_it_is_on_screen_and_modified_ones_keep_their_meaning(
+    fn the_plain_arrows_step_subagents_only_while_the_view_is_on_screen_and_modified_ones_keep_their_meaning(
     ) {
         for query_empty in [true, false] {
-            for (open, on_screen, back, forward, up) in [
+            for (open, on_screen, back, forward, up, down) in [
                 (
                     false,
                     false,
                     Action::CaretBack,
                     Action::CaretForward,
                     Action::MoveUp,
+                    Action::MoveDown,
                 ),
                 (
                     true,
                     true,
                     Action::PrevSubagent,
                     Action::NextSubagent,
-                    Action::LeaveSubagentView,
+                    Action::PrevRunningSubagent,
+                    Action::NextRunningSubagent,
                 ),
                 (
                     true,
@@ -9311,6 +9363,7 @@ mod tests {
                     Action::CaretBack,
                     Action::CaretForward,
                     Action::MoveUp,
+                    Action::MoveDown,
                 ),
             ] {
                 let action =
@@ -9319,8 +9372,9 @@ mod tests {
                 assert_eq!(action(self::key(KeyCode::Left)), back, "{what}");
                 assert_eq!(action(self::key(KeyCode::Right)), forward, "{what}");
                 assert_eq!(action(self::key(KeyCode::Up)), up, "{what}");
+                assert_eq!(action(self::key(KeyCode::Down)), down, "{what}");
                 assert_eq!(action(shift(KeyCode::Up)), up, "{what}");
-                assert_eq!(action(self::key(KeyCode::Down)), Action::MoveDown, "{what}");
+                assert_eq!(action(shift(KeyCode::Down)), down, "{what}");
                 assert_eq!(
                     action(shift(KeyCode::Left)),
                     Action::LayoutTowardPreview,
@@ -9343,37 +9397,52 @@ mod tests {
         }
     }
 
-    /// Two delegation rows with the selection on the LOWER one and the subagent
-    /// view open on its subagent, so a `↑` that moved the selection lands on the
-    /// upper row while one that left the view keeps it. Returns the app and the
-    /// selected id.
+    /// The delegation fixture's two sessions with the selection on the LOWER row
+    /// and the subagent view open on its first (finished) subagent over a record
+    /// of [`TWO_RUNNING`], so a `↑` that moved the selection lands on the upper row
+    /// and a step lands on a running subagent. Returns the app and the selected id.
     fn open_view_over_two_rows() -> (App, String) {
         let (mut app, selected, _) = lower_row_delegation_app();
+        deliver_record(&mut app, &selected, fixture_record(&TWO_RUNNING));
         app.open_subagent_view(DELEGATION_KEY, DELEGATION_AGENT_TYPE);
         assert!(app.subagent_view_on_screen(), "premise: the view is drawn");
         (app, selected)
     }
 
-    /// With the view OPEN but hidden by the list-only layout, `↑` is the board's:
-    /// it moves the selection — which closes the view, as it does on the board —
-    /// instead of leaving a view nobody can see with the selection kept; `←`/`→`
-    /// move the search caret. Pressed through `handle_event`, the route the keys
-    /// really take.
+    /// With the view OPEN but hidden by the list-only layout, `↑`/`↓` are the
+    /// board's: they move the selection — which closes the view, as it does on the
+    /// board — instead of stepping a subagent nobody can see; `←`/`→` move the
+    /// search caret. Pressed through `handle_event`, the route the keys really take.
     #[test]
     fn the_arrows_act_on_the_board_while_the_open_view_is_hidden_by_the_list_only_layout() {
-        let (mut app, selected) = open_view_over_two_rows();
-        app.set_pane_layout(PaneLayout::ListOnly);
-        assert!(app.in_subagent_view() && !app.subagent_view_on_screen());
+        for (code, moved) in [(KeyCode::Up, true), (KeyCode::Down, false)] {
+            let (mut app, selected) = open_view_over_two_rows();
+            app.set_pane_layout(PaneLayout::ListOnly);
+            assert!(app.in_subagent_view() && !app.subagent_view_on_screen());
 
-        press(&mut app, KeyCode::Up);
+            press(&mut app, code);
 
-        assert_ne!(
-            app.selected.as_deref(),
-            Some(selected.as_str()),
-            "↑ moves the selection"
-        );
-        assert!(!app.in_subagent_view(), "which closes the view");
-        assert_eq!(app.status, None);
+            if moved {
+                assert_ne!(
+                    app.selected.as_deref(),
+                    Some(selected.as_str()),
+                    "{code:?} moves the selection"
+                );
+                assert!(!app.in_subagent_view(), "which closes the view");
+            } else {
+                assert_eq!(
+                    app.selected.as_deref(),
+                    Some(selected.as_str()),
+                    "{code:?} is the board's: already on the last row"
+                );
+                assert_eq!(
+                    app.subagent_view_type(),
+                    Some(DELEGATION_AGENT_TYPE),
+                    "and steps no subagent"
+                );
+            }
+            assert_eq!(app.status, None);
+        }
 
         let (mut app, selected) = open_view_over_two_rows();
         type_into_board(&mut app, "ab");
@@ -9472,56 +9541,70 @@ mod tests {
         (app, selected, session_scroll)
     }
 
-    /// Inside the subagent view a plain `↑` goes back to the SELECTED session's
-    /// own transcript, as `Esc` does — scrolled where it was, and straight back
-    /// from a nested subagent — and never moves the selection, query or not.
+    /// The delegation fixture's running subagents for the step tests:
+    /// `docs-writer` and `fixture-reviewer`, launched after the (finished)
+    /// `parser-auditor` — so `parser-auditor` is a subagent that can be on screen
+    /// without running.
+    const TWO_RUNNING: [&str; 2] = [DOCS_WRITER_KEY, REVIEWER_KEY];
+
+    /// Inside the subagent view a plain `↑` steps to the previous RUNNING subagent
+    /// — wrapping, from a finished one on screen — and never leaves the view or
+    /// moves the SELECTED session's selection, query or not; `Esc` then goes back
+    /// to the session's own transcript where it was scrolled.
     #[test]
-    fn up_in_the_subagent_view_leaves_it_and_keeps_the_selection() {
+    fn up_in_the_subagent_view_steps_to_a_running_subagent_and_keeps_the_selection() {
         for query_empty in [true, false] {
             assert_eq!(
                 key_to_action(key(KeyCode::Up), query_empty, false, true, true),
-                Action::LeaveSubagentView,
+                Action::PrevRunningSubagent,
                 "query_empty={query_empty}"
             );
         }
 
         let (mut app, selected, session_scroll) = lower_row_delegation_app();
+        deliver_record(&mut app, &selected, fixture_record(&TWO_RUNNING));
         app.open_subagent_view(DELEGATION_KEY, DELEGATION_AGENT_TYPE);
-        app.open_subagent_view(REVIEWER_KEY, "fixture-reviewer");
         assert_eq!(
             app.subagent_view_type(),
-            Some("fixture-reviewer"),
-            "premise: drilled down to the nested subagent"
+            Some(DELEGATION_AGENT_TYPE),
+            "premise: the first, finished subagent is on screen"
         );
 
         let outcome = press(&mut app, KeyCode::Up);
 
         assert!(matches!(outcome, Outcome::Continue));
-        assert!(!app.in_subagent_view(), "↑ leaves the view");
+        assert_eq!(
+            app.subagent_view_type(),
+            Some("fixture-reviewer"),
+            "↑ from the first wraps to the last running one"
+        );
         assert_eq!(
             app.selected.as_deref(),
             Some(selected.as_str()),
             "and keeps the selection"
         );
+        assert_eq!(app.status, None);
+
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.in_subagent_view(), "Esc is the way back");
         assert_eq!(
             (app.preview_scroll, app.preview_follow_bottom),
             session_scroll,
             "back where the session's own transcript was scrolled"
         );
         assert!(preview_string(&mut app, 80).contains(DELEGATION_SESSION_PHRASE));
-        assert_eq!(app.status, None);
     }
 
-    /// `Shift-Up` in the view leaves it too: the view takes no search marks, so
-    /// the match step's guard fails even with a query that marks the session's
-    /// own lines, and the key falls through to the plain `↑` — the key a terminal
+    /// `Shift-Up` in the view steps too: the view takes no search marks, so the
+    /// match step's guard fails even with a query that marks the session's own
+    /// lines, and the key falls through to the plain `↑` — the key a terminal
     /// that drops the modifier delivers anyway.
     #[test]
-    fn shift_up_in_the_subagent_view_falls_through_to_leaving_it() {
+    fn shift_up_in_the_subagent_view_falls_through_to_the_running_step() {
         for query_empty in [true, false] {
             assert_eq!(
                 key_to_action(shift(KeyCode::Up), query_empty, false, true, true),
-                Action::LeaveSubagentView,
+                Action::PrevRunningSubagent,
                 "query_empty={query_empty}"
             );
         }
@@ -9546,6 +9629,7 @@ mod tests {
             app.has_preview_matches(),
             "premise: the query marks the session's own lines"
         );
+        deliver_record(&mut app, "s2", fixture_record(&TWO_RUNNING));
         app.open_subagent_view(DELEGATION_KEY, DELEGATION_AGENT_TYPE);
         render_board(&mut app);
         assert!(
@@ -9555,21 +9639,26 @@ mod tests {
 
         press_shift(&mut app, KeyCode::Up);
 
-        assert!(!app.in_subagent_view(), "Shift-Up leaves the view");
+        assert_eq!(
+            app.subagent_view_type(),
+            Some("fixture-reviewer"),
+            "Shift-Up steps to the previous running subagent"
+        );
         assert_eq!(app.selected, selected, "and keeps the selection");
         assert_eq!(app.query(), "parser");
     }
 
-    /// `↓` keeps its meaning in the view: it moves the selection, and the view
-    /// closes only because the selection changed — the newly selected row opens
-    /// at its newest turn, never at the place the view saved for the other.
+    /// `↓` no longer moves the selection in the view: it steps to the next RUNNING
+    /// subagent, so the pane stays on the subagents until `Esc` — the misclick
+    /// that carried the board off to the next session is gone. From a finished
+    /// subagent on screen it goes to the first running one after it.
     #[test]
-    fn down_in_the_subagent_view_still_moves_the_selection() {
+    fn down_in_the_subagent_view_steps_to_the_next_running_subagent_and_keeps_the_selection() {
         for query_empty in [true, false] {
             for down in [key(KeyCode::Down), shift(KeyCode::Down)] {
                 assert_eq!(
                     key_to_action(down, query_empty, false, true, true),
-                    Action::MoveDown,
+                    Action::NextRunningSubagent,
                     "query_empty={query_empty}, {down:?}"
                 );
             }
@@ -9577,21 +9666,147 @@ mod tests {
 
         let (mut app, selected, _) = lower_row_delegation_app();
         press(&mut app, KeyCode::Up);
-        let upper = app.selected.clone();
         assert_ne!(
-            upper.as_deref(),
+            app.selected.as_deref(),
             Some(selected.as_str()),
-            "premise: back on the upper row"
+            "premise: on the upper row, with the lower one below"
         );
-        press(&mut app, KeyCode::Home);
+        let upper = app.selected.clone().expect("a selection");
+        deliver_record(&mut app, &upper, fixture_record(&TWO_RUNNING));
         app.open_subagent_view(DELEGATION_KEY, DELEGATION_AGENT_TYPE);
 
         press(&mut app, KeyCode::Down);
 
         assert_eq!(
             app.selected.as_deref(),
+            Some(upper.as_str()),
+            "↓ leaves the selection where it was"
+        );
+        assert_eq!(
+            app.subagent_view_type(),
+            Some("docs-writer"),
+            "and goes to the first running subagent after the finished one"
+        );
+    }
+
+    /// The start points of the running step, through the keys: a finished subagent
+    /// on screen steps to the first running one after it (`↓`) or the last before
+    /// it (`↑`), wrapping; a viewed subagent the record does not list counts as the
+    /// newest launch; and the only running subagent stays where it is, as a lone
+    /// `←`/`→` step does. Launch order here is `parser-auditor`, `docs-writer`,
+    /// `fixture-reviewer`.
+    #[test]
+    fn the_running_step_starts_from_a_finished_or_unlisted_subagent() {
+        let mut app = delegation_app();
+        deliver_record(&mut app, "s1", fixture_record(&[DOCS_WRITER_KEY]));
+        let viewed = |app: &App| app.subagent_view_type().map(str::to_string);
+
+        app.open_subagent_view(REVIEWER_KEY, "fixture-reviewer");
+        press(&mut app, KeyCode::Down);
+        assert_eq!(
+            viewed(&app).as_deref(),
+            Some("docs-writer"),
+            "↓ from the last, finished one wraps to the first running one"
+        );
+        press(&mut app, KeyCode::Down);
+        assert_eq!(
+            viewed(&app).as_deref(),
+            Some("docs-writer"),
+            "the only running subagent steps onto itself"
+        );
+        press(&mut app, KeyCode::Up);
+        assert_eq!(viewed(&app).as_deref(), Some("docs-writer"));
+        assert_eq!(app.status, None, "a no-op is not a refusal");
+
+        app.open_subagent_view(REVIEWER_KEY, "fixture-reviewer");
+        press(&mut app, KeyCode::Up);
+        assert_eq!(
+            viewed(&app).as_deref(),
+            Some("docs-writer"),
+            "↑ from a finished one goes to the running one before it"
+        );
+
+        app.open_subagent_view("not-listed-yet", "late-launch");
+        press(&mut app, KeyCode::Up);
+        assert_eq!(
+            viewed(&app).as_deref(),
+            Some("docs-writer"),
+            "an unlisted subagent counts as the newest launch, after every listed one"
+        );
+        app.open_subagent_view("not-listed-yet", "late-launch");
+        press(&mut app, KeyCode::Down);
+        assert_eq!(viewed(&app).as_deref(), Some("docs-writer"));
+    }
+
+    /// `↑`/`↓` are bound on the VIEW alone, never on something running: with nothing
+    /// running, or the record unread or empty, they refuse on a sticky status line
+    /// in the right words and still neither leave the view nor move the selection
+    /// — so the key does not change meaning when the last subagent finishes.
+    #[test]
+    fn the_running_step_refuses_in_its_own_words_and_never_falls_back_to_the_selection() {
+        let (mut app, selected, _) = lower_row_delegation_app();
+        app.open_subagent_view(DELEGATION_KEY, DELEGATION_AGENT_TYPE);
+        let still_here = |app: &App| {
+            assert!(app.in_subagent_view(), "the view stays up");
+            assert_eq!(app.selected.as_deref(), Some(selected.as_str()));
+            assert_eq!(app.subagent_view_type(), Some(DELEGATION_AGENT_TYPE));
+        };
+
+        for code in [KeyCode::Down, KeyCode::Up] {
+            press(&mut app, code);
+            still_here(&app);
+            assert_eq!(app.status.as_deref(), Some(SUBAGENTS_NOT_READ_REFUSAL));
+        }
+
+        deliver_record(&mut app, &selected, SubagentRecord::default());
+        for code in [KeyCode::Down, KeyCode::Up] {
+            press(&mut app, code);
+            still_here(&app);
+            assert_eq!(app.status.as_deref(), Some(SUBAGENTS_NONE_REFUSAL));
+        }
+
+        deliver_record(&mut app, &selected, fixture_record(&[]));
+        for code in [KeyCode::Down, KeyCode::Up] {
+            app.status = None;
+            press(&mut app, code);
+            still_here(&app);
+            assert_eq!(
+                app.status.as_deref(),
+                Some(SUBAGENTS_NONE_RUNNING_REFUSAL),
+                "every subagent is finished"
+            );
+        }
+        handle_event(&mut app, AppEvent::Tick, &mut store_at(Path::new("/tmp")));
+        assert_eq!(
+            app.status.as_deref(),
+            Some(SUBAGENTS_NONE_RUNNING_REFUSAL),
+            "a refusal is sticky"
+        );
+    }
+
+    /// The wheel over the list is the selection move left to the view: it closes
+    /// the view, and the newly selected row opens at its newest turn, never at the
+    /// place the view saved for the other.
+    #[test]
+    fn wheel_over_the_list_in_the_subagent_view_opens_the_new_row_at_its_newest_turn() {
+        let (mut app, selected, _) = lower_row_delegation_app();
+        press(&mut app, KeyCode::Up);
+        assert_ne!(
+            app.selected.as_deref(),
             Some(selected.as_str()),
-            "↓ moves the selection"
+            "premise: back on the upper row"
+        );
+        press(&mut app, KeyCode::Home);
+        app.open_subagent_view(DELEGATION_KEY, DELEGATION_AGENT_TYPE);
+        render_board(&mut app);
+        let list = app.list_rect;
+
+        wheel(&mut app, MouseEventKind::ScrollDown, list.x, list.y);
+
+        assert_eq!(
+            app.selected.as_deref(),
+            Some(selected.as_str()),
+            "the wheel moves the selection"
         );
         assert!(!app.in_subagent_view(), "which closes the view");
         assert!(
@@ -9624,10 +9839,10 @@ mod tests {
         );
     }
 
-    /// `↑` is not `Esc`: with a query typed it leaves the view at once, and the
-    /// query and its caret stay exactly as they were — `Esc` would clear it first.
+    /// `↑` is not `Esc`: with a query typed it steps in the view all the same, and
+    /// the query and its caret stay exactly as they were.
     #[test]
-    fn up_in_the_subagent_view_leaves_a_typed_query_intact() {
+    fn up_in_the_subagent_view_steps_with_a_typed_query_intact() {
         let (folder, file) = DELEGATION_FIXTURE;
         let mut session = fixture_session("s1", folder, file);
         session.label = "Audit the JSONL parser and refresh its docs".to_string();
@@ -9635,13 +9850,15 @@ mod tests {
         type_into_board(&mut app, "the parser");
         press(&mut app, KeyCode::Left);
         let caret = app.query_caret();
+        deliver_record(&mut app, "s1", fixture_record(&TWO_RUNNING));
         app.open_subagent_view(DELEGATION_KEY, DELEGATION_AGENT_TYPE);
 
         press(&mut app, KeyCode::Up);
 
-        assert!(
-            !app.in_subagent_view(),
-            "↑ leaves the view with a query typed"
+        assert_eq!(
+            app.subagent_view_type(),
+            Some("fixture-reviewer"),
+            "↑ steps with a query typed"
         );
         assert_eq!(
             (app.query(), app.query_caret()),
@@ -11280,8 +11497,8 @@ mod tests {
         );
     }
 
-    /// Outside the subagent view, that is: inside it `↑` leaves the view instead
-    /// (`up_in_the_subagent_view_leaves_it_and_keeps_the_selection`).
+    /// Outside the subagent view, that is: inside it `↑` steps the running subagents instead
+    /// (`up_in_the_subagent_view_steps_to_a_running_subagent_and_keeps_the_selection`).
     #[test]
     fn arrows_always_move() {
         assert_eq!(

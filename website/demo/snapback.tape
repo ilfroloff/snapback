@@ -41,8 +41,9 @@ Enter
 Sleep 3s
 
 # --- Scene 2: the working agent's subagents (Ctrl-X ↓ opens the running one,
-# → steps to the next, ↑ goes back; the selection never moves). Leave with ↑,
-# never Esc: had the view not opened, Esc on the board would quit ---
+# → steps to the next; ↑/↓ step only the running ones and never move the
+# selection). Leave with Ctrl-X ↓ again, never Esc: had the view not opened,
+# Esc on the board would quit ---
 Sleep 1.5s
 Ctrl+X
 Sleep 700ms
@@ -50,7 +51,9 @@ Down
 Sleep 3s
 Right
 Sleep 2.5s
-Up
+Ctrl+X
+Sleep 300ms
+Down
 Sleep 1s
 
 # --- Scene 3: the agent that needs you ---
