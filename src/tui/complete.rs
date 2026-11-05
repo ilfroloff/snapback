@@ -229,8 +229,9 @@ enum Placement {
     /// `MyCategoryListings.tsx` for `calis`. [`rank`] produces it for every row
     /// but an `@` root-fallback one.
     WordStartInName(WordStartRank),
-    /// A path entry whose own name does not hold every part but whose path does
-    /// (`src/store/discover.rs` for `store`, `store/mod.rs` for `store-mod`).
+    /// A path entry whose own name does not hold every part, and is no word-start
+    /// hit, but whose path does holds them (`src/store/discover.rs` for `store`,
+    /// `store/mod.rs` for `store-mod`).
     /// Only a candidate whose marks text is wider than its name (an `@` path,
     /// either step) produces it.
     InPath,
@@ -343,15 +344,19 @@ struct Ranked {
 /// 1. the NAME holds every part: [`Placement::NameStart`] when one of the marks
 ///    covers the name's first char, whichever part that is, else
 ///    [`Placement::InName`];
-/// 2. only when `marked` is wider than the name (a path): `marked` holds every
-///    part, the folder components included, so [`Placement::InPath`];
-/// 3. only when [`Subject::word_starts`]: the name's WORD STARTS spell the query
+/// 2. only when [`Subject::word_starts`]: the name's WORD STARTS spell the query
 ///    ([`SearchIndex::word_start_hit`]), a word-start tier whose marks are its
 ///    chunks;
+/// 3. only when `marked` is wider than the name (a path): `marked` holds every
+///    part, the folder components included, so [`Placement::InPath`];
 /// 4. the DESCRIPTION holds every part: [`Placement::InDescription`].
 ///
-/// A word-start hit asked after the substring questions is what puts it below the
-/// substring hits of its tier, and above a description-only hit. The decoration a
+/// A word-start hit asked after the name's own substring question is what puts it
+/// below the substring hits of its tier; asked BEFORE the path's, a file whose own
+/// name is a word-start hit lists in its word-start tier even when a folder above
+/// it holds the query too (`calistoga/CategoryListings.tsx` for `calis`), while a
+/// path hit is left to a name that is no hit of its own. Both sit above a
+/// description-only hit. The decoration a
 /// label draws around the name (a command's `/`, an agent's suffix) is never asked
 /// about, and the caller moves the marks past what precedes `marked`. An empty
 /// query admits every name and marks nothing, so every candidate lands in ONE tier
@@ -393,12 +398,6 @@ fn rank(matcher: &SearchIndex, subject: &Subject, scratch: &mut MarkScratch) -> 
         };
         return hit(placement, marks);
     }
-    if name_at > 0 && matcher.admits_with(marked, scratch) {
-        return hit(
-            Placement::InPath,
-            matcher.match_indices_with(marked, scratch),
-        );
-    }
     if word_starts {
         if let Some(WordStartHit {
             at_name_start,
@@ -419,6 +418,12 @@ fn rank(matcher: &SearchIndex, subject: &Subject, scratch: &mut MarkScratch) -> 
                 marks.into_iter().map(|pos| pos + offset).collect(),
             );
         }
+    }
+    if name_at > 0 && matcher.admits_with(marked, scratch) {
+        return hit(
+            Placement::InPath,
+            matcher.match_indices_with(marked, scratch),
+        );
     }
     let description = description.filter(|d| matcher.admits_with(d, scratch))?;
     Some(Ranked {
@@ -518,7 +523,20 @@ pub fn is_mention_safe(name: &str) -> bool {
 /// `a` there, never every agent through the prefix or [`AGENT_LABEL_SUFFIX`].
 /// `label` is the name plus [`AGENT_LABEL_SUFFIX`]; `insert` is
 /// [`AGENT_MENTION_PREFIX`] plus the name.
+#[allow(
+    dead_code,
+    reason = "at_candidates merges the tiered form; this is the same rows for the tests"
+)]
 pub fn select_agents(entries: &[ListingEntry], query: &str) -> Vec<Candidate> {
+    tiered_agents(entries, query)
+        .into_iter()
+        .map(|(_, candidate)| candidate)
+        .collect()
+}
+
+/// [`select_agents`]' rows, each with the [`Placement`] [`rank`] gave it, for
+/// [`at_candidates`] to merge against the entries' tiers.
+fn tiered_agents(entries: &[ListingEntry], query: &str) -> Vec<(Placement, Candidate)> {
     let matcher = matcher(strip_mention_prefix(query), &QUERY_PART_SEPARATORS);
     select_listed(
         &matcher,
@@ -526,8 +544,12 @@ pub fn select_agents(entries: &[ListingEntry], query: &str) -> Vec<Candidate> {
     )
     .into_iter()
     .map(|picked| {
+        let placement = picked.0.placement;
         let insert = format!("{AGENT_MENTION_PREFIX}{}", picked.1.name);
-        listed_candidate(picked, ("", AGENT_LABEL_SUFFIX), insert)
+        (
+            placement,
+            listed_candidate(picked, ("", AGENT_LABEL_SUFFIX), insert),
+        )
     })
     .collect()
 }
@@ -546,21 +568,34 @@ fn strip_mention_prefix(query: &str) -> &str {
 
 /// The FOLDER STEP's `@` candidates for `query`: the entries of the folder its
 /// `dir_part` names (`dir_entries`, read by the caller) that its leaf matches, in
-/// [`select_entries`]' order, followed, ONLY for a top-level token (no
-/// `dir_part`), by the matching [`select_agents`] — entries above agents
-/// whatever their tiers. An agent is not a path, so `@src/…` never lists one.
-/// [`at_list`] decides whether these rows are the list.
+/// [`select_entries`]' order, merged, ONLY for a top-level token (no `dir_part`),
+/// with the matching [`select_agents`] by [`Placement`]: the better tier first,
+/// and an agent before an entry of the SAME tier (so a bare `@` lists every agent,
+/// then the folders, then the files). Each kind keeps its own order, so the merge
+/// reorders neither list, and an entry in a better tier than an agent still lists
+/// above it. An agent is not a path, so `@src/…` never lists one. [`at_list`]
+/// decides whether these rows are the list.
 pub fn at_candidates(
     dir_entries: &[DirEntryInfo],
     agents: &[ListingEntry],
     query: &str,
 ) -> Vec<Candidate> {
     let (dir_part, leaf) = split_path_query(query);
-    let mut candidates = select_entries(dir_entries, leaf);
-    if dir_part.is_empty() {
-        candidates.extend(select_agents(agents, query));
+    if !dir_part.is_empty() {
+        return select_entries(dir_entries, leaf);
     }
-    candidates
+    let entries = tiered_paths(dir_entries, leaf, PathStep::Folder);
+    let mut agents = tiered_agents(agents, query).into_iter().peekable();
+    let mut merged = Vec::with_capacity(entries.len() + agents.len());
+    for (placement, entry) in entries {
+        // `<=`, not `<`: an agent of the entry's own tier lists first.
+        while let Some((_, agent)) = agents.next_if(|(tier, _)| *tier <= placement) {
+            merged.push(agent);
+        }
+        merged.push(entry);
+    }
+    merged.extend(agents.map(|(_, agent)| agent));
+    merged
 }
 
 /// An `@` pick list: its rows, and the folder part [`replacement`] writes before
@@ -646,6 +681,19 @@ pub fn select_entries(entries: &[DirEntryInfo], leaf: &str) -> Vec<Candidate> {
 /// 24,520-entry synthetic walk, so only the pair compares): `@c` 3.8 / 3.9 ms and
 /// `@s` 4.9 / 5.0 ms before, 3.9 / 4.1 ms and 5.0 / 5.3 ms after.
 fn select_paths(entries: &[DirEntryInfo], query: &str, step: PathStep) -> Vec<Candidate> {
+    tiered_paths(entries, query, step)
+        .into_iter()
+        .map(|(_, candidate)| candidate)
+        .collect()
+}
+
+/// [`select_paths`]' rows, each with the [`Placement`] [`rank`] gave it, for
+/// [`at_candidates`] to merge against the agents' tiers.
+fn tiered_paths(
+    entries: &[DirEntryInfo],
+    query: &str,
+    step: PathStep,
+) -> Vec<(Placement, Candidate)> {
     let matcher = matcher(query, step.separators());
     let show_hidden = query.starts_with('.');
     let mut scratch = MarkScratch::new();
@@ -672,18 +720,19 @@ fn select_paths(entries: &[DirEntryInfo], query: &str, step: PathStep) -> Vec<Ca
     picked.sort_by_key(|(placement, _, _)| *placement);
     picked
         .into_iter()
-        .map(|(_, e, label_marks)| {
+        .map(|(placement, e, label_marks)| {
             let text = if e.is_dir {
                 format!("{}/", e.name)
             } else {
                 e.name.clone()
             };
-            Candidate {
+            let candidate = Candidate {
                 label: text.clone(),
                 insert: text,
                 label_marks,
                 ..Candidate::default()
-            }
+            };
+            (placement, candidate)
         })
         .collect()
 }
@@ -1155,17 +1204,81 @@ mod tests {
         assert_eq!(inserts(&select_agents(&agents, "")), vec!["agent-ok-agent"]);
     }
 
+    /// A bare `@` admits everything into ONE tier, so the agents lead (a tie is
+    /// the agent's), then the folders, then the files; `@s` keeps that order within
+    /// each tier: the agent and the folder that start with `s`, then the file that
+    /// holds one.
     #[test]
-    fn a_top_level_at_lists_folders_then_files_then_agents() {
+    fn a_top_level_at_lists_agents_then_folders_then_files_within_a_tier() {
         let dir = vec![entry("notes.txt", false), entry("src", true)];
         let agents = vec![listed("sby-agent", None), listed("Explore", None)];
         assert_eq!(
             inserts(&at_candidates(&dir, &agents, "")),
-            vec!["src/", "notes.txt", "agent-sby-agent", "agent-Explore"]
+            vec!["agent-sby-agent", "agent-Explore", "src/", "notes.txt"]
         );
         assert_eq!(
             inserts(&at_candidates(&dir, &agents, "s")),
-            vec!["src/", "notes.txt", "agent-sby-agent"]
+            vec!["agent-sby-agent", "src/", "notes.txt"]
+        );
+    }
+
+    /// The reported shape: `@l` and `@le` put the agent `lead` on row 1, because
+    /// its name starts with the letters, above every file that only holds them. An
+    /// agent that holds `l` elsewhere (`Explore`) ties the files of that tier and
+    /// lists first in it; a file that starts with the letters ties `lead` and lists
+    /// after it.
+    #[test]
+    fn at_l_and_at_le_list_the_agent_lead_above_files_holding_the_letters() {
+        let dir = vec![
+            entry("Cargo.lock", false),
+            entry("build.rs", false),
+            entry("handle.rs", false),
+            entry("level.rs", false),
+            entry("lib", true),
+            entry("src", true),
+        ];
+        let agents = vec![listed("lead", Some("Team lead")), listed("Explore", None)];
+        assert_eq!(
+            inserts(&at_candidates(&dir, &agents, "l")),
+            vec![
+                "agent-lead",
+                "lib/",
+                "level.rs",
+                "agent-Explore",
+                "Cargo.lock",
+                "build.rs",
+                "handle.rs"
+            ]
+        );
+        assert_eq!(
+            inserts(&at_candidates(&dir, &agents, "le")),
+            vec!["agent-lead", "level.rs", "handle.rs"]
+        );
+    }
+
+    /// A file in a BETTER tier than an agent still lists above it, and an agent
+    /// wins only a tie: `@s` lists `statusline-setup` (name start) then `src/` (name
+    /// start, the agent first), then `cr-swe-rust` and `build.rs` (both hold an
+    /// `s`, the agent first), and last the agent whose description alone holds one.
+    /// `src/` above `cr-swe-rust` is the file whose name starts with the letters
+    /// beating an agent that holds them only elsewhere.
+    #[test]
+    fn a_better_file_match_still_lists_above_an_agent() {
+        let dir = vec![entry("build.rs", false), entry("src", true)];
+        let agents = vec![
+            listed("zz", Some("Runs things")),
+            listed("cr-swe-rust", None),
+            listed("statusline-setup", None),
+        ];
+        assert_eq!(
+            inserts(&at_candidates(&dir, &agents, "s")),
+            vec![
+                "agent-statusline-setup",
+                "src/",
+                "agent-cr-swe-rust",
+                "build.rs",
+                "agent-zz"
+            ]
         );
     }
 
@@ -1865,8 +1978,9 @@ mod tests {
     /// starts of its name too, as a file is: `calis` is `ca` + `lis` in both
     /// `CategoryListings` and `category-listings`, and for an agent the mention
     /// form `agent-calis` reads the same. The description is never word-start
-    /// matched, so it keeps `zz` out. The same query lists the file above the
-    /// agents, as any `@` query does.
+    /// matched, so it keeps `zz` out. The same query lists the agents above the
+    /// file: all three land in the same word-start tier, and an agent wins every
+    /// tie, a word-start tier's included.
     #[test]
     fn commands_and_agents_are_found_by_their_word_starts() {
         let listing = vec![
@@ -1893,11 +2007,23 @@ mod tests {
                 "calis"
             )),
             vec![
-                "CategoryListings.tsx",
                 "agent-CategoryListings",
-                "agent-category-listings"
+                "agent-category-listings",
+                "CategoryListings.tsx"
             ],
-            "the file lists above the agents whatever their tiers"
+            "the agents lead a tied word-start tier"
+        );
+        // A tighter word-start hit is a better `Placement`, so it is no tie: the
+        // file (`Ca` + `Lis`) lists above the agent that needs one more chunk.
+        let loose = vec![listed("ClickAwayListener", None)];
+        assert_eq!(
+            inserts(&at_candidates(
+                &[entry("CategoryListings.tsx", false)],
+                &loose,
+                "calis"
+            )),
+            vec!["CategoryListings.tsx", "agent-ClickAwayListener"],
+            "a file in a better word-start tier still lists above an agent"
         );
     }
 
@@ -2074,6 +2200,54 @@ mod tests {
             ask(true).map(|ranked| ranked.placement),
             Some(Placement::WordStartNameStart(_))
         ));
+    }
+
+    /// A file whose own name is a word-start hit lands in its word-start tier even
+    /// when a folder above it holds the query too: `calistoga/CategoryListings.tsx`
+    /// for `calis` is `Ca` + `Lis` of its own name, not a path hit. A file whose
+    /// name is no hit of its own is still `InPath`, and the word-start tier sits
+    /// above the substring hit elsewhere in a name.
+    #[test]
+    fn a_word_start_name_hit_beats_the_folder_component_that_holds_the_query() {
+        let calis = matcher("calis", &QUERY_PART_SEPARATORS);
+        let ask = |name, marked| {
+            rank(
+                &calis,
+                &Subject {
+                    name,
+                    marked,
+                    description: None,
+                    word_starts: true,
+                },
+                &mut MarkScratch::new(),
+            )
+            .expect("a hit")
+            .placement
+        };
+        assert_eq!(
+            ask("CategoryListings.tsx", "calistoga/CategoryListings.tsx"),
+            Placement::WordStartNameStart(WordStartRank {
+                chunks: 2,
+                skipped: 0
+            })
+        );
+        assert_eq!(ask("other.rs", "calistoga/other.rs"), Placement::InPath);
+
+        let e = vec![
+            entry("calistoga", true),
+            entry("calistoga/CategoryListings.tsx", false),
+            entry("calistoga/other.rs", false),
+            entry("xcalis.txt", false),
+        ];
+        assert_eq!(
+            marked_labels(&select_entries(&e, "calis")),
+            vec![
+                "[calis]toga/",
+                "calistoga/[Ca]tegory[Lis]tings.tsx",
+                "x[calis].txt",
+                "[calis]toga/other.rs",
+            ]
+        );
     }
 
     /// A path's substring hit still marks the folder components that hold the part,

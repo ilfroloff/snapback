@@ -1940,8 +1940,8 @@ mod tests {
         assert!(state.transcript.is_some(), "a later top-level `@` reads it");
         assert_eq!(
             shown(&state),
-            ["src/", "agent-Explore", "agent-sby-agent"],
-            "and lists the transcript's agents"
+            ["agent-Explore", "agent-sby-agent", "src/"],
+            "and lists the transcript's agents, which lead the one tier a bare `@` has"
         );
 
         let mut slash_after = CompletionState::default();

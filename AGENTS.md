@@ -260,7 +260,9 @@ one place.
   orders what matches by where it landed (name start, elsewhere in the name, a
   path's folder component, description only — a word-start hit just below the
   substring hits of its tier), an order that is the pick list's alone and that ONE
-  function, `complete::rank`, decides for every row. The
+  function, `complete::rank`, decides for every row; a top-level `@` merges its
+  agents into its entries by that order, an agent ahead of an entry of the SAME
+  tier ([DOMAIN.md](docs/agents/DOMAIN.md#how-the-letters-narrow-the-list)). The
   WORD-START rule (`SearchIndex::word_start_hit`) lives in `src/search.rs` too,
   and only the pick list reaches it: `set_atoms` ALONE compiles it and nothing
   else reads it — the filter, `admits` and both marking rules stay substring, so

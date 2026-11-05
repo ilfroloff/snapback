@@ -3206,8 +3206,8 @@ narrow it by the [rule below](#how-the-letters-narrow-the-list):
   `.` — a visibility gate applied before any match, so `@env` never lists
   `.env` — folders come first within a tier, and a folder pick reopens the list
   one level down. For a TOP-LEVEL `@` token only (no folder part), the folder's
-  agents follow, labelled `<name> (agent)` — claude's own typeahead label — and
-  inserted as
+  agents are merged into that list by tier (below), labelled `<name> (agent)` —
+  claude's own typeahead label — and inserted as
   `@agent-<name> `, the form claude turns into a structured `agent_mention` and
   documents for typing by hand — never claude's own picker form
   `@"<name> (agent)"`, which misses a name containing `agent-`
@@ -3493,17 +3493,29 @@ at the walk's entry cap).
 What matches is ordered in six tiers (`complete::Placement`): a name that
 STARTS with the query — any part's hit at its first char — then a word-start hit
 whose first chunk begins the name, then a name that holds every part elsewhere,
-then a word-start hit on a later word of the name, then (`@` paths only,
-`complete::rank`) a path that needs a FOLDER component for some part, then a
-description-only hit. A word-start hit thus lists right below the substring hits
+then a word-start hit on a later word of the name, then (`@` paths only) a path
+that needs a FOLDER component for some part, then a description-only hit.
+`complete::rank` asks these in the order name substring, name word starts, path,
+description and stops at the first yes, so a file whose own name is a word-start
+hit lands in its word-start tier even when a folder above it holds the query too
+(`calistoga/CategoryListings.tsx` for `@calis`), and only a name that is no hit of
+its own is left to the path. A word-start hit thus lists right below the substring hits
 of the tier it lands in, above a description-only hit, and within its tier by fewer chunks, then fewer skipped
 words: for `@calis`, `CategoryListings.tsx` (`Ca` + `Lis`) lists above `CategoryFooListings.tsx`,
 which skips a word, and both above `ClickAwayListener/` (`C` + `A` + `Lis`). An
 `@` path entry's name is its last component. Within a tier the list keeps the order it has with no
 query — the source's order for commands and agents (claude's catalog, or a
-reply's or fork's transcript); folders before files, then by name, for `@` entries — and
-an `@` list keeps every entry above every agent, whatever their tiers. An empty
-query admits every candidate into that one order. claude 2.1.284 orders its own
+reply's or fork's transcript); folders before files, then by name, for `@` entries.
+A TOP-LEVEL `@` merges its agents into its entries by that tier
+(`complete::at_candidates`, a linear merge of the two ordered lists, never a
+second sort): an agent lists before an entry of the SAME `Placement`, and an entry
+in a better one (a tighter word-start hit included) still lists above an agent.
+`@l` therefore lists the agent `lead` ahead of every file that only holds an `l`,
+and `@s` lists `statusline-setup`, then `src/` (both start with an `s`, and the agent wins the tie). An empty query
+admits every candidate into that one tier, so a bare `@` lists every agent, then
+the folders, then the files. A tie among agents keeps the catalog's order (byte
+order, so `Explore` and `Plan` before `adr-writer`). `@src/…` and the root
+fallback list no agent. claude 2.1.284 orders its own
 `/` menu the same way — name start, then the rest of the name, then the
 description (read from the binary, 2026-10-02) — but it matches fuzzily, and
 ranks aliases and usage too.
