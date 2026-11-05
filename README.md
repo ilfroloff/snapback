@@ -61,6 +61,10 @@ cargo install --git https://github.com/ilfroloff/snapback --tag vX.Y.Z
 
 Pick `vX.Y.Z` from the [Releases page](https://github.com/ilfroloff/snapback/releases).
 
+### VS Code extension
+
+Download the `.vsix` from the [Releases page](https://github.com/ilfroloff/snapback/releases) and install via **"Extensions: Install from VSIX..."** in VS Code. The extension opens snapback in a fullscreen terminal pane with one command — see [editors/vscode/README.md](editors/vscode/README.md) for details.
+
 ## Quick start
 
 ```sh
