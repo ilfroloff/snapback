@@ -36,11 +36,11 @@ OPTIONS:
     -h, --help     Print this help and exit
 
 KEYS:
-    ↑/↓           move. While the preview shows a subagent's transcript ↑ goes
-                  back to the session's own instead, on the same row, a search
-                  kept as typed (Ctrl-X ↓ below). Only while that transcript is
-                  on screen: with the 1:0 layout or a Ctrl-N card hiding it ↑
-                  moves as usual
+    ↑/↓           move. While the preview shows a subagent's transcript they
+                  step to the previous / next RUNNING subagent instead and never
+                  move the selection, a search kept as typed (Ctrl-X ↓ below).
+                  Only while that transcript is on screen: with the 1:0 layout
+                  or a Ctrl-N card hiding it they move as usual
     Enter         resume (returns to the board on exit). Refused on a session
                   snapback is still sending a reply to, or still making as a
                   fork from the Ctrl-F box's Enter, until it lands (the session
@@ -114,11 +114,13 @@ KEYS:
                   written. ←/→ then step through all of the session's
                   subagents in launch order, wrapping round, even with a
                   search typed (Alt+←/→ and Ctrl+←/→ still move the search
-                  cursor a word); the title says which one of how many (2/5).
-                  ↑, Esc, or Ctrl-X ↓ again, goes back; a search stays as
-                  typed. Refused while the session's subagents are still being
-                  read, or when it has none. Esc leaves the view even while
-                  the 1:0 layout or a card hides it
+                  cursor a word); ↑/↓ step through just the running ones, the
+                  preview's running list, the same way, from a finished one
+                  too; the title says which one of how many (2/5). Esc, or
+                  Ctrl-X ↓ again, goes back; a search stays as typed. Refused
+                  while the session's subagents are still being read, or when it
+                  has none (↑/↓ also when none is running). Esc leaves the
+                  view even while the 1:0 layout or a card hides it
                   · ? open the key-map table (same as F1)
     Ctrl-R        quick reply — send a one-shot message to the selected session
                   without leaving the board. An agent whose run is over (done,
@@ -196,8 +198,8 @@ KEYS:
     Shift+↑/↓     jump the preview to the previous / next line the query marks.
                   Only while something is marked there — with nothing marked they
                   stay plain ↑/↓ (a subagent's transcript marks nothing, so there
-                  Shift+↑ goes back), so they never take a key away from you. One
-                  stop per marked line, not per repeated word
+                  they step the running subagents), so they never take a key
+                  away from you. One stop per marked line, not per repeated word
     wheel         scroll preview / list (mouse mode on); the key-map table while
                   it is open, wherever the pointer is. While a compose or draft
                   box is open the list stops taking notches — a wheel over it
@@ -209,7 +211,7 @@ KEYS:
                   click folds it back; a subagent launch, its line reading
                   ◆ delegated to @agent, switches the preview to that
                   subagent's own transcript (a launch inside it switches to the
-                  subagent it launched; ↑ or Esc goes back); otherwise a link opens
+                  subagent it launched; Esc goes back); otherwise a link opens
                   (http/https only). Like the drag and double-click below, it
                   works while a reply or fork box is open, except the switch,
                   which waits until the box is closed

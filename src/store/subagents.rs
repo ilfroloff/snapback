@@ -6,7 +6,7 @@
 //! `<encoded-cwd>/<id>/subagents/` and reads only the
 //! `agent-<agentId>.meta.json` files there. [`transcript_path`] names each one's
 //! sibling `agent-<agentId>.jsonl`, which the preview's subagent view reads whole
-//! once a click, `Ctrl-X ↓` or a `←`/`→` step switched the pane to it, and which
+//! once a click, `Ctrl-X ↓` or a `←`/`→` / `↑`/`↓` step switched the pane to it, and which
 //! [`read_record`] stats, reads the head of and — for one that can be running —
 //! the END of, for the selected session's [`SubagentRecord`], on a worker
 //! thread. Nothing it reads feeds
@@ -298,7 +298,7 @@ fn list_file_names(dir: &Path) -> Vec<String> {
 /// The subagent transcript at `path` ([`transcript_path`]), opened for a render,
 /// or `None` unless it is a REGULAR file: not a symlink (per `symlink_metadata`),
 /// and never a FIFO, whose open would block the render on the UI thread. Only the
-/// subagent view — a click, `Ctrl-X ↓` or a `←`/`→` step switched to it — calls it
+/// subagent view — a click, `Ctrl-X ↓` or a `←`/`→` / `↑`/`↓` step switched to it — calls it
 /// (`store::preview::render_subagent`), and nothing bounds the read after it: the
 /// view draws the whole transcript, as the session's own render does.
 pub fn open_transcript(path: &Path) -> Option<File> {
@@ -405,7 +405,7 @@ impl Subagent {
 }
 
 /// Every subagent ONE session launched, at any depth, in LAUNCH ORDER
-/// ([`launch_order`]): the one record the subagent view's title, its `←`/`→`
+/// ([`launch_order`]): the one record the subagent view's title, its `←`/`→` and `↑`/`↓`
 /// steps and the preview's running list read, and the `Ctrl-X ↓` target is
 /// picked from.
 ///
@@ -469,6 +469,37 @@ impl SubagentRecord {
             (None, false) => count - 1,
         };
         self.subagents.get(next)
+    }
+
+    /// The RUNNING subagent one step `forward` (`↓`) or back (`↑`) from `agent_id`
+    /// in launch order, wrapping round at both ends: [`step`](Self::step) over the
+    /// subagents `running` accepts, skipping every other. `agent_id` itself need
+    /// not be running — a click or a `←`/`→` step can have opened a finished one —
+    /// and is a start point only: the walk goes to the next running one after it
+    /// (before it, going back). It is the answer only when it is the sole running
+    /// one, which steps onto itself, as `step` does for a lone subagent.
+    /// An `agent_id` the record does not list counts as the NEWEST launch, as for
+    /// `step`. `None` when none runs (or the record is empty). `running` is the
+    /// caller's [`Subagent::is_running`], over the inputs the running list draws
+    /// from, so this never lands on a row that list omits. PURE.
+    #[must_use]
+    pub fn step_running(
+        &self,
+        agent_id: &str,
+        forward: bool,
+        running: impl Fn(&Subagent) -> bool,
+    ) -> Option<&Subagent> {
+        let count = self.subagents.len();
+        // A subagent not listed sits one past the last, the newest launch.
+        let at = self.index_of(agent_id).unwrap_or(count);
+        let walk: Vec<usize> = if forward {
+            (at + 1..count).chain(0..count.min(at + 1)).collect()
+        } else {
+            (0..at).rev().chain((at..count).rev()).collect()
+        };
+        walk.into_iter()
+            .filter_map(|index| self.subagents.get(index))
+            .find(|subagent| running(subagent))
     }
 
     /// The subagent `Ctrl-X ↓` opens, as of `now`: the FIRST one RUNNING
@@ -2343,6 +2374,49 @@ mod tests {
         let record = launched_in_order(&["a", "b", "c"]);
         assert_eq!(id_of(record.step("unlisted", true)), Some("a"));
         assert_eq!(id_of(record.step("unlisted", false)), Some("c"));
+    }
+
+    /// `↓` and `↑` walk the RUNNING subagents alone, in launch order, wrapping
+    /// round; the viewed one may itself be finished, and is then a start point
+    /// only.
+    #[test]
+    fn running_steps_skip_every_subagent_that_is_not_running() {
+        let record = launched_in_order(&["a", "b", "c", "d", "e"]);
+        let running = |s: &Subagent| ["b", "d"].contains(&s.agent_id.as_str());
+        let step = |from: &str, forward: bool| id_of(record.step_running(from, forward, running));
+        assert_eq!(step("b", true), Some("d"));
+        assert_eq!(step("d", true), Some("b"), "wraps past the finished tail");
+        assert_eq!(step("d", false), Some("b"));
+        assert_eq!(step("b", false), Some("d"), "wraps past the finished head");
+        assert_eq!(step("a", true), Some("b"), "from a finished one: the next");
+        assert_eq!(step("a", false), Some("d"), "and the previous, wrapping");
+        assert_eq!(step("c", true), Some("d"));
+        assert_eq!(step("c", false), Some("b"));
+        assert_eq!(step("e", true), Some("b"));
+        assert_eq!(step("e", false), Some("d"));
+    }
+
+    /// A subagent the record does not list counts as the newest launch (as for
+    /// `step`); the only running one steps onto itself; none running, or no
+    /// subagent at all, is `None`.
+    #[test]
+    fn running_steps_treat_an_unlisted_subagent_as_newest_and_answer_none_without_a_runner() {
+        let record = launched_in_order(&["a", "b", "c"]);
+        let only_b = |s: &Subagent| s.agent_id == "b";
+        let all = |_: &Subagent| true;
+        assert_eq!(id_of(record.step_running("unlisted", true, all)), Some("a"));
+        assert_eq!(
+            id_of(record.step_running("unlisted", false, all)),
+            Some("c")
+        );
+        for forward in [true, false] {
+            assert_eq!(id_of(record.step_running("b", forward, only_b)), Some("b"));
+            assert_eq!(id_of(record.step_running("a", forward, only_b)), Some("b"));
+            assert!(record.step_running("a", forward, |_| false).is_none());
+            assert!(SubagentRecord::default()
+                .step_running("a", forward, all)
+                .is_none());
+        }
     }
 
     /// One subagent steps onto itself; a record with none has nowhere to go.

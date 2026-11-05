@@ -94,7 +94,7 @@ The JSONL format is external and undocumented, so treat every read as hostile:
   The direction is toward the plain `[tool_use: …]` marker the launch draws
   without a meta, so a failure costs the delegation line (and, since the
   subagent record lists that same index, the subagent's place in it: no
-  `Ctrl-X ↓` target, `←`/`→` stop or running-list row), never the transcript
+  `Ctrl-X ↓` target, `←`/`→` / `↑`/`↓` stop or running-list row), never the transcript
   around it. A subagent transcript the subagent view cannot open
   (`subagents::open_transcript` takes a regular file only), or one that renders
   no line, costs less still: the view is the one DIM
@@ -878,8 +878,8 @@ inner rect when there is no banner (so a banner-less pane's geometry is exactly
   brings the pane back from 1:0 (`App::set_pane_layout`, which `Shift-←` and an
   opening compose both go through), or a switch of the pane to a subagent's
   transcript (`App::open_subagent_view`: a click on its delegation line,
-  `Ctrl-X ↓`, or a `←`/`→` step inside the view) re-arms it; leaving that view
-  (`↑`, `Esc`, `Ctrl-X ↓` again, an opening reply or fork box) puts back the
+  `Ctrl-X ↓`, or a `←`/`→` or `↑`/`↓` step inside the view) re-arms it; leaving that view
+  (`Esc`, `Ctrl-X ↓` again, an opening reply or fork box) puts back the
   session pane's own flag and offset. A
   step between two layouts that
   both show the pane neither arms nor releases it. The render writes the flag for
@@ -1315,7 +1315,7 @@ two things, all on the UI thread: the session file, and the session's own
 listing, each meta capped at `META_MAX_BYTES`). The SUBAGENT VIEW's render, cached
 apart (`App::ensure_subagent_preview`), reads one subagent transcript
 (`subagents::open_transcript`) besides that index, and only ever because a CLICK
-on a `◆ delegated to …` line, `Ctrl-X ↓` or a `←`/`→` step inside the view
+on a `◆ delegated to …` line, `Ctrl-X ↓` or a `←`/`→` / `↑`/`↓` step inside the view
 switched the pane to it: no search step, reload or other keystroke can open the
 view ([DOMAIN.md](DOMAIN.md#delegation-line-and-subagent-view-storepreview)).
 Keep it that way — a subagent transcript rendered with no view one of those
@@ -1892,20 +1892,29 @@ and the unguarded one is reached whenever the guard fails. The shifted VERTICAL
 arrows are the instance: with nothing marked to move between they are
 bit-for-bit the plain arrows — the `MoveUp`/`MoveDown` they have always been —
 so a user who never searches loses nothing AND a terminal that drops the
-modifier degrades to a working key. The plain `↑` is conditional on the
+modifier degrades to a working key. The plain `↑`/`↓` are conditional on the
 subagent view being ON SCREEN (`App::subagent_view_on_screen`: open, the preview
-drawn, no `Ctrl-N` card over it): there it is `LeaveSubagentView`, query or not,
-from an arm BELOW the `Shift-Up` match step and above `MoveUp`; the view takes no
-marks, so the match guard fails there and `Shift-Up` falls through to leaving the
-view too (`shift_up_in_the_subagent_view_falls_through_to_leaving_it`), while the
-plain `↓` stays `MoveDown` everywhere. The condition is what is VISIBLE, not what
-is open: a view the 1:0 list-only layout or a card hides leaves `↑` `MoveUp`
+drawn, no `Ctrl-N` card over it): there they are `PrevRunningSubagent`/`NextRunningSubagent`, query
+or not, from arms BELOW the `Shift-Up`/`Shift-Down` match steps and above
+`MoveUp`/`MoveDown`; the view takes no marks, so the match guard fails there and
+the shifted keys fall through to the running steps too
+(`shift_up_in_the_subagent_view_falls_through_to_the_running_step`). That
+decode is the DELIBERATE EXCEPTION to "conditional and falls through": it is
+bound on `view_on_screen` ALONE and never on "something runs". Gated on that,
+the key would fall through to `MoveDown` the moment the last subagent finished,
+and its meaning would flip under the user's finger — the very misclick the
+binding exists to remove. "Nothing runs" is the handler's refusal
+(`SubagentsUnavailable::NoneRunning`), not a different key
+(`the_running_step_refuses_in_its_own_words_and_never_falls_back_to_the_selection`).
+The condition is what is VISIBLE, not what is open: a view the 1:0 list-only
+layout or a card hides leaves them `MoveUp`/`MoveDown`
 (`the_arrows_act_on_the_board_while_the_open_view_is_hidden_by_the_list_only_layout`,
 `..._while_an_in_flight_card_holds_the_pane_over_the_open_view`), so a key never
-acts on a pane nobody sees. `Esc` is the one key that reads the OPEN state, as its
-own parameter, so it still leaves a hidden view before it can quit
+acts on a pane nobody sees. `Esc` is the one key that reads the OPEN state, as
+its own parameter, so it still leaves a hidden view before it can quit
 (`esc_leaves_an_open_view_even_while_the_list_only_layout_hides_it`); never widen
-one parameter to the other. The shifted HORIZONTAL arrows are the contrast: `Shift-←`/`Shift-→`
+one parameter to the other.
+The shifted HORIZONTAL arrows are the contrast: `Shift-←`/`Shift-→`
 step the `PaneLayout` UNCONDITIONALLY, taking neither parameter — but their arms
 still sit above the plain `Left`/`Right` caret arms, because the unguarded arm
 matches the shifted key too and the first matching arm wins
@@ -1917,7 +1926,7 @@ pressed. The plain `Left`/`Right` are conditional on the same on-screen view:
 outside it they move the caret with or without a query; while it is on screen they step the
 session's subagents, query or not — the accepted trade, since the `Alt` and
 `Ctrl` word hops, whose arms sit above theirs, still move the caret by word
-(`the_plain_arrows_act_on_the_view_only_while_it_is_on_screen_and_modified_ones_keep_their_meaning`).
+(`the_plain_arrows_step_subagents_only_while_the_view_is_on_screen_and_modified_ones_keep_their_meaning`).
 The lineage fold is the `Ctrl-X f` chord verb, so caret movement and folding
 never share a key. Prefer
 `Shift`+key over `Alt`+key for anything new here: snapback never pushes the kitty
@@ -2013,8 +2022,11 @@ state and renders on the surface that owns it:
   and renders as the preview's running list (`view::running_list`), not on
   the help line: it is judged at draw time against `App::wall_clock`, which the
   `Tick` and each landed record stamp, so no clock is read in render. What does
-  reach the status line is a keypress's outcome: `Ctrl-X ↓`'s and `←`/`→`'s two
-  sticky refusals while the record has not landed or lists no subagent.
+  reach the status line is a keypress's outcome: the sticky refusals of
+  `Ctrl-X ↓`, `←`/`→` and the `↑`/`↓` step — while the record has not landed
+  (`SUBAGENTS_NOT_READ_REFUSAL`) or lists no subagent
+  (`SUBAGENTS_NONE_REFUSAL`), and, for the `↑`/`↓` step alone, while it lists
+  some and none is running (`SUBAGENTS_NONE_RUNNING_REFUSAL`).
 
 `Ctrl-K`'s SIGTERM is the opposite case, an OUTCOME: the driver hands the
 syscall's result to `update::show_signal_result`, which sets `SIGNAL_SENT` /

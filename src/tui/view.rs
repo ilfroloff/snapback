@@ -744,7 +744,7 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
     match app.pane_layout() {
         PaneLayout::PreviewOnly => {
             // 0:1 — the preview owns the whole body and the list is not drawn.
-            // The selection still moves (`↑`/`↓` act regardless), so the preview
+            // The selection still moves (`↑`/`↓` act, unless the subagent view is on screen), so the preview
             // names the row it is showing in its title instead (`preview_title`).
             app.list_rect = Rect::default();
             app.preview_rect = area;
@@ -2011,8 +2011,10 @@ const RUNNING_COLOR: Color = Color::Green;
 const RUNNING_LIST_HINT: &str = "^X \u{2193} explore";
 
 /// The running list's hint inside the subagent view: the keys that step through
-/// the session's subagents and leave the view.
-const RUNNING_LIST_VIEW_HINT: &str = "\u{2190}/\u{2192} switch \u{b7} \u{2191}/Esc back";
+/// the running (`live`) subagents (`↑`/`↓`) and through `all` of them (`←`/`→`),
+/// and leave the view. The labels are the help line's ([`SUBAGENT_HELP_HINT`]).
+const RUNNING_LIST_VIEW_HINT: &str =
+    "\u{2191}/\u{2193} live \u{b7} \u{2190}/\u{2192} all \u{b7} Esc back";
 
 /// How many glyphs of the running list's rule lead its title
 /// (`── ^X ↓ explore ───`): with the rule on both sides, the title reads as set
@@ -3027,7 +3029,8 @@ fn session_title_line(
 /// fitted to the `width` columns the border gives a title. In the 0:1
 /// [`PaneLayout::PreviewOnly`] layout, where no list is drawn to show which row
 /// is selected, the session's name leads it, so the pane still says whose
-/// transcript it is: `↑`/`↓` keep moving the selection there, and the title is
+/// transcript it is: `↑`/`↓` keep moving the selection there (unless the subagent
+/// view is on screen), and the title is
 /// what tells the reader where it went.
 ///
 /// While the pane shows the subagent view, in any layout, it names that subagent
@@ -5520,11 +5523,10 @@ const KEY_MAP: &[KeyMapSection] = &[
     KeyMapSection {
         title: "In a subagent's transcript",
         rows: &[
-            ("←/→", "previous / next subagent, in launch order"),
-            (
-                "↑ or Esc",
-                "back to the session's own transcript (↑ only while it is drawn)",
-            ),
+            ("↑/↓", "previous / next RUNNING subagent, in launch order"),
+            ("←/→", "previous / next subagent of any state, in launch order"),
+            ("Esc", "back to the session's own transcript"),
+            ("Ctrl-X ↓", "back to the session's own transcript"),
         ],
     },
     KeyMapSection {
@@ -5746,14 +5748,17 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
 
 /// The board hint while the subagent view is ON SCREEN
 /// ([`App::subagent_view_on_screen`]). There the plain arrows stop being obvious
-/// — `↑` goes BACK to the session's own transcript and `←`/`→` step to the
-/// previous / next subagent (`update::key_to_action`) — so they lead the line,
-/// and `Tab content` gives up its columns for them. A view that is open but not
+/// — `↑`/`↓` step the RUNNING subagents and `←`/`→` every one, in launch order
+/// (`update::key_to_action`) — so they lead the line, and `Tab content` gives up
+/// its columns for them. `Esc back` names the way out, since `↑` no longer
+/// leaves the view and it must always be on screen. A view that is open but not
 /// drawn (the 1:0 layout, a draft card) leaves the arrows the board's own, so it
-/// shows [`DEFAULT_HELP_HINT`]. Kept under the 80-column help row by
-/// `default_help_hint_fits_the_target_width`.
+/// shows [`DEFAULT_HELP_HINT`]. The leading keys cost 5 columns more than the
+/// ones they replaced, so `^X hide/del` is shortened to `^X more` (the chord's
+/// own which-key hint lists its verbs). 75 columns by `unicode-width`, kept
+/// under the 80-column help row by `default_help_hint_fits_the_target_width`.
 const SUBAGENT_HELP_HINT: &str =
-    "↑ back · ←→ subagent · ^N new · ^R reply · ^K stop · ^X hide/del · F1 keys";
+    "↑↓ live ←→ all · Esc back · ^N new · ^R reply · ^K stop · ^X more · F1 keys";
 
 /// Which board hint the help line shows: [`SUBAGENT_HELP_HINT`] while the
 /// subagent view is on screen, else [`DEFAULT_HELP_HINT`]. PURE.
@@ -18398,13 +18403,16 @@ mod tests {
         );
         assert_eq!(
             list_rows(&drawn_running_list(&refs, Some("a1"), 80, 4))[0],
-            rule_row("\u{2190}/\u{2192} switch \u{b7} \u{2191}/Esc back", 80)
+            rule_row(
+                "\u{2191}/\u{2193} live \u{b7} \u{2190}/\u{2192} all \u{b7} Esc back",
+                80
+            )
         );
 
         assert_eq!(
             list_rows(&drawn_running_list(&refs, Some("a1"), 80, 1)),
             [rule_row(
-                "\u{25cf} 3 running \u{b7} \u{2190}/\u{2192} switch \u{b7} \u{2191}/Esc back",
+                "\u{25cf} 3 running \u{b7} \u{2191}/\u{2193} live \u{b7} \u{2190}/\u{2192} all \u{b7} Esc back",
                 80
             )]
         );
@@ -18507,6 +18515,113 @@ mod tests {
         app
     }
 
+    /// DRIFT CHECK: `↑`/`↓` in the subagent view visit exactly the subagents the
+    /// running list DRAWS ([`running_subagents`]), in its launch order, wrapping —
+    /// over a record mixing running, finished, failed and quiet ones, started
+    /// from a failed one. The step asks `Subagent::is_running` with the inputs the
+    /// list does; were it to ask anything else, the two would drift apart and a key
+    /// would land on a row the list does not show. Driven through the board's real
+    /// key route.
+    ///
+    /// The fixture can tell the inputs apart. `g6` is fresh and unended but
+    /// FAILED by the session's task ledger alone (a `failed` notification): a step
+    /// that ignored the ledger would stop on it. `h7` is unended but last wrote an
+    /// hour before the wall clock, and `i8` wrote a minute before it: the wall
+    /// clock sits at [`list_now`], far from real time in either direction, so a step
+    /// judging by real time would call `h7` running (its write is "in the future")
+    /// or `i8` quiet (its window long passed), and stop on / skip the wrong row.
+    #[test]
+    fn up_and_down_in_the_view_visit_exactly_the_running_lists_subagents() {
+        use crate::store::tasks;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+        let mut session = sample_session();
+        let body = "<task-notification>\n<task-id>g6</task-id>\n<status>failed</status>\n\
+                    <summary>Agent stalled: no progress for 600s</summary>\n</task-notification>";
+        tasks::scan_record(
+            &serde_json::json!({
+                "type": "user",
+                "origin": { "kind": tasks::TASK_NOTIFICATION_ORIGIN },
+                "message": { "role": "user", "content": body },
+            }),
+            &mut session.task_ledger,
+        );
+        let mut app = App::new(vec![session], Scope::All, PathBuf::from("/tmp/launch"));
+        app.set_pane_layout(PaneLayout::PreviewOnly);
+        app.apply_subagent_record(
+            "sess-normal-1",
+            SubagentRecord::new(vec![
+                running_subagent("a0", "runner-one", None, 30),
+                Subagent {
+                    ended: Some(RunVerdict::Failed),
+                    ..running_subagent("b1", "failed-one", None, 5)
+                },
+                Subagent {
+                    ended: Some(RunVerdict::Finished),
+                    ..running_subagent("c2", "finished-one", None, 5)
+                },
+                running_subagent("d3", "runner-two", None, 5),
+                Subagent {
+                    ended: None,
+                    ..running_subagent("e4", "quiet-one", None, 3_600)
+                },
+                running_subagent("f5", "runner-three", None, 90),
+                running_subagent("g6", "ledger-failed-one", None, 5),
+                running_subagent("h7", "stale-open-one", None, 3_600),
+                running_subagent("i8", "runner-four", None, 60),
+            ]),
+        );
+        app.note_wall_clock(list_now());
+        let drawn: Vec<String> = running_subagents(&app)
+            .iter()
+            .map(|subagent| subagent.agent_id.clone())
+            .collect();
+        assert_eq!(
+            drawn,
+            ["a0", "d3", "f5", "i8"],
+            "premise: the list draws the running ones alone"
+        );
+
+        let press = |app: &mut App, code: KeyCode| {
+            let _ = crate::tui::update::handle_event(
+                app,
+                crate::watch::AppEvent::Input(Event::Key(KeyEvent::new(code, KeyModifiers::NONE))),
+                &mut crate::store::SessionStore::new(Path::new("/tmp")),
+            );
+        };
+        let viewed = |app: &App| {
+            app.viewed_subagent()
+                .map(|subagent| subagent.agent_id.clone())
+                .expect("the view stays up on a listed subagent")
+        };
+
+        app.open_subagent_view("b1", "failed-one");
+        let forward: Vec<String> = (0..=drawn.len())
+            .map(|_| {
+                press(&mut app, KeyCode::Down);
+                viewed(&app)
+            })
+            .collect();
+        assert_eq!(
+            forward,
+            ["d3", "f5", "i8", "a0", "d3"],
+            "↓ from a failed one visits the list's rows in launch order, wrapping"
+        );
+
+        let backward: Vec<String> = (0..=drawn.len())
+            .map(|_| {
+                press(&mut app, KeyCode::Up);
+                viewed(&app)
+            })
+            .collect();
+        assert_eq!(
+            backward,
+            ["a0", "i8", "f5", "d3", "a0"],
+            "↑ visits them in reverse, wrapping"
+        );
+        assert!(app.in_subagent_view(), "no step left the view");
+    }
+
     /// The preview pane's inner rows from `from` to its bottom border, as drawn.
     fn pane_rows_from(buffer: &ratatui::buffer::Buffer, pane: Rect, from: u16) -> Vec<String> {
         (from..pane.bottom().saturating_sub(1))
@@ -18586,7 +18701,7 @@ mod tests {
     }
 
     /// Inside the subagent view the drawn list marks the subagent on screen and
-    /// its rule hints `←/→ switch · ↑/Esc back`; leaving the view puts the board's
+    /// its rule hints `↑/↓ live · ←/→ all · Esc back`; leaving the view puts the board's
     /// hint back.
     #[test]
     fn the_drawn_list_marks_the_subagent_view_and_hints_its_keys() {
@@ -18599,7 +18714,7 @@ mod tests {
         assert_eq!(
             rows.first(),
             Some(&rule_row(
-                "\u{2190}/\u{2192} switch \u{b7} \u{2191}/Esc back",
+                "\u{2191}/\u{2193} live \u{b7} \u{2190}/\u{2192} all \u{b7} Esc back",
                 usize::from(transcript.width)
             ))
         );
@@ -18664,8 +18779,8 @@ mod tests {
         }
     }
     /// The board keymap names the plain `←`/`→` only where they are not obvious:
-    /// never on the board (they move the search cursor), but as the subagent step
-    /// while the pane shows the subagent view — and either way an 80-column
+    /// never on the board (they move the search cursor), but as the step through
+    /// every subagent while the pane shows the subagent view — and either way an 80-column
     /// terminal draws the whole line, `F1 keys` included.
     #[test]
     fn the_board_keymap_names_what_the_plain_arrows_do_now() {
@@ -18680,11 +18795,11 @@ mod tests {
 
         let board = help(&mut app, 300);
         assert!(!board.contains("query cursor"), "{board:?}");
-        assert!(!board.contains("←→ subagent"), "{board:?}");
+        assert!(!board.contains("←→ all"), "{board:?}");
 
         app.open_subagent_view("a1b2c3d4e5f6a7b8c", "parser-auditor");
         let view = help(&mut app, 300);
-        assert!(view.contains("←→ subagent"), "{view:?}");
+        assert!(view.contains("←→ all"), "{view:?}");
         assert!(!view.contains("query cursor"), "{view:?}");
 
         for in_view in [true, false] {
@@ -18697,13 +18812,14 @@ mod tests {
         }
     }
 
-    /// The keymap's `↑` follows the key too: unnamed on the board, where it just
-    /// moves, and `↑ back` while the subagent view is ON SCREEN, where `↑`
-    /// leaves it. A view that is open but not drawn — the list-only layout, a
-    /// draft card over the pane — shows the board's own hint, because the arrows
-    /// are the board's there.
+    /// The keymap's arrows follow the key: unnamed on the board, where they just
+    /// move, and while the subagent view is ON SCREEN `↑↓ live ←→ all · Esc
+    /// back` — the running step, the step through all, and the way out, which the
+    /// hint always names because `↑` no longer leaves. A view that is open but
+    /// not drawn — the list-only layout, a draft card over the pane — shows the
+    /// board's own hint, because the arrows are the board's there.
     #[test]
-    fn the_board_keymap_names_up_as_back_in_the_subagent_view() {
+    fn the_board_keymap_names_the_view_keys_and_its_exit_only_while_the_view_is_on_screen() {
         let mut session = sample_session();
         session.file = fixture("-Users-me-project-epsilon", "sess-delegation-1.jsonl");
         let mut app = App::new(vec![session], Scope::All, PathBuf::from("/tmp"));
@@ -18712,23 +18828,25 @@ mod tests {
             let buffer = drawn_board(app, width, height);
             full_row_text(&buffer, height - 1, width)
         };
+        let view_form = "↑↓ live ←→ all · Esc back";
 
         let board = help(&mut app);
         assert!(board.starts_with("Tab content · "), "{board:?}");
-        assert!(!board.contains("↑ back"), "{board:?}");
+        assert!(!board.contains(view_form), "{board:?}");
 
         app.open_subagent_view("a1b2c3d4e5f6a7b8c", "parser-auditor");
         let view = help(&mut app);
-        assert!(view.starts_with("↑ back · "), "{view:?}");
-        assert!(!view.contains("↑↓ move"), "{view:?}");
+        assert!(view.starts_with(&format!("{view_form} · ")), "{view:?}");
+        assert!(!view.contains("↑ back"), "↑ no longer leaves: {view:?}");
+        assert!(view.contains("F1 keys"), "the budget holds at 80: {view:?}");
 
         app.set_pane_layout(PaneLayout::ListOnly);
         assert!(app.in_subagent_view(), "premise: the view is still open");
         let hidden = help(&mut app);
         assert!(hidden.starts_with("Tab content · "), "{hidden:?}");
-        assert!(!hidden.contains("↑ back"), "{hidden:?}");
+        assert!(!hidden.contains(view_form), "{hidden:?}");
         app.set_pane_layout(PaneLayout::PreviewOnly);
-        assert!(help(&mut app).starts_with("↑ back · "));
+        assert!(help(&mut app).starts_with(&format!("{view_form} · ")));
 
         app.draft = Some(NewSessionDraft::default());
         assert!(
@@ -18737,7 +18855,7 @@ mod tests {
         );
         let carded = help(&mut app);
         assert!(carded.starts_with("Tab content · "), "{carded:?}");
-        assert!(!carded.contains("↑ back"), "{carded:?}");
+        assert!(!carded.contains(view_form), "{carded:?}");
     }
 
     /// The marker of the sample transcript's last real turn (a `you` turn).
@@ -21535,6 +21653,57 @@ mod tests {
             "hide / un-hide",
         ] {
             assert!(text.contains(needle), "key map must mention {needle:?}");
+        }
+    }
+
+    /// The subagent view's section names the arrows by what they step — `↑`/`↓`
+    /// the RUNNING subagents, `←`/`→` every one — and `Esc` and `Ctrl-X ↓`, each
+    /// on a row of its own, as the way back: `↑` no longer leaves the view, so no
+    /// row may still say it does.
+    #[test]
+    fn key_map_names_the_subagent_steps_and_the_way_back() {
+        let section = KEY_MAP
+            .iter()
+            .find(|s| s.title == "In a subagent's transcript")
+            .expect("the subagent section");
+        let row = |key: &str| {
+            section
+                .rows
+                .iter()
+                .find(|(k, _)| *k == key)
+                .unwrap_or_else(|| panic!("no {key:?} row in {:?}", section.rows))
+                .1
+        };
+        assert!(row("↑/↓").contains("RUNNING"));
+        assert!(!row("←/→").contains("RUNNING"));
+        assert!(row("Esc").contains("back"));
+        assert!(row("Ctrl-X ↓").contains("back"));
+        assert!(
+            section.rows.iter().all(|(k, _)| !k.contains("↑ or")),
+            "↑ alone no longer leaves the view: {:?}",
+            section.rows
+        );
+    }
+
+    /// The widest key label the table carried before the subagent view's rows
+    /// landed (`Backspace`, `PgUp/PgDn`, `dbl-click`: 9 display columns, measured
+    /// at `0eac1c9`). `key_map_lines` sizes the key column to the widest label, so
+    /// a wider one steals columns from every action and wraps rows unrelated to it.
+    const KEY_MAP_KEY_COLUMN_MAX: usize = 9;
+
+    /// No key label widens the key column past [`KEY_MAP_KEY_COLUMN_MAX`]: list a
+    /// chord on one row per key rather than joining them with ` / `.
+    #[test]
+    fn no_key_map_label_widens_the_key_column() {
+        for section in KEY_MAP {
+            for (keys, _) in section.rows {
+                let width = UnicodeWidthStr::width(*keys);
+                assert!(
+                    width <= KEY_MAP_KEY_COLUMN_MAX,
+                    "{keys:?} in {:?} is {width} columns wide, past {KEY_MAP_KEY_COLUMN_MAX}",
+                    section.title
+                );
+            }
         }
     }
 

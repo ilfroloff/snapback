@@ -2058,21 +2058,25 @@ impl CachedPreview {
     }
 }
 
-/// Why `Ctrl-X ↓`, or a `←`/`→` step in the subagent view, switched to no
-/// subagent ([`App::open_subagent_target`], [`App::step_subagent_view`]): the
-/// key handler says so on the status line.
+/// Why `Ctrl-X ↓`, or a `←`/`→` / `↑`/`↓` step in the subagent view, switched to
+/// no subagent ([`App::open_subagent_target`], [`App::step_subagent_view`],
+/// [`App::step_running_subagent_view`]): the key handler says so on the status
+/// line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubagentsUnavailable {
     /// The background refresh has not answered for the selected session yet.
     NotRead,
     /// Its record lists no subagent.
     None,
+    /// Its record lists some, and none is running: only the `↑`/`↓` step, which
+    /// walks the running ones alone, can meet this.
+    NoneRunning,
 }
 
 /// The preview pane's SUBAGENT VIEW: the transcript of one subagent the selected
 /// session launched, shown in the pane in place of the session's own until the
-/// user leaves it (`↑`, `Esc`, `Ctrl-X ↓`), changes the selected session (the
-/// routes: the `App::subagent_view` field), or opens a reply or fork box.
+/// user leaves it (`Esc`, `Ctrl-X ↓`), changes the selected session (the routes:
+/// the `App::subagent_view` field), or opens a reply or fork box.
 ///
 /// Keyed by STABLE ids, never a list index (AGENTS.md STABLE-ID STATE): the
 /// session whose `subagents/` dir holds the transcript, and the subagent's own id.
@@ -2300,7 +2304,7 @@ pub struct App {
     ///   which opens at its newest turn like a newly selected row.
     /// * PUT BACK, with [`preview_scroll`](Self::preview_scroll), to what it was when
     ///   that view opened, when the view is left
-    ///   ([`leave_subagent_view`](Self::leave_subagent_view): `↑`, `Esc`,
+    ///   ([`leave_subagent_view`](Self::leave_subagent_view): `Esc`,
     ///   `Ctrl-X ↓` again, or a reply or fork box opening).
     /// * CLEARED by ANY explicit scroll ([`preview_scroll_by`](Self::preview_scroll_by),
     ///   [`preview_top`](Self::preview_top)), in either direction — a held drag's
@@ -2853,10 +2857,10 @@ pub struct App {
     /// The subagent transcript the preview pane shows in place of the selected
     /// session's own, or `None` while it shows the session's ([`SubagentView`]).
     /// Opened ONLY through [`open_subagent_view`](Self::open_subagent_view), by a
-    /// click on a `◆ delegated to …` line, `Ctrl-X ↓`, or a `←`/`→` step inside
-    /// the view; left by `↑` while the view is on screen, `Esc`, `Ctrl-X ↓` again,
-    /// opening a reply or fork box, and ANY change of the selected session
-    /// ([`set_selected`](Self::set_selected) drops it): `↓`, `↑` while the open view
+    /// click on a `◆ delegated to …` line, `Ctrl-X ↓`, or a `←`/`→` or `↑`/`↓` step
+    /// inside the view; left by `Esc`, `Ctrl-X ↓` again, opening a reply or fork
+    /// box, and ANY change of the selected session
+    /// ([`set_selected`](Self::set_selected) drops it): `↑`/`↓` while the open view
     /// is hidden, the mouse wheel over the list, a search edit, `Tab` or `Ctrl-A`
     /// that filters the row out, `Ctrl-X x` or `Ctrl-X h` hiding it, `Ctrl-X d` or
     /// `Ctrl-X w` taking it off the board, `Ctrl-X f` from a `↳` row, a reload that
@@ -6050,8 +6054,8 @@ impl App {
     ///
     /// The miss reads the subagent's transcript ON THE UI THREAD, in the class
     /// PATTERNS.md §6 gives the session's own cache-miss render, and only ever
-    /// because a click on a delegation line, `Ctrl-X ↓` or a `←`/`→` step opened
-    /// the view: the view is its only caller, and `open_subagent_view` its only
+    /// because a click on a delegation line, `Ctrl-X ↓` or a `←`/`→` / `↑`/`↓`
+    /// step opened the view: the view is its only caller, and `open_subagent_view` its only
     /// opener. It pays both passes, the
     /// render and the row map, and is redone whenever the entry is evicted while
     /// the view stays up: a write to the viewed transcript itself
@@ -6190,8 +6194,7 @@ impl App {
     /// Whether the preview pane shows a subagent's transcript rather than the
     /// selected session's own: what `Esc` leaves before it quits
     /// (`update::key_to_action`), and what keeps the session's in-flight reply
-    /// tail and its live status off the pane (`view::render_preview`). `↑` leaves
-    /// it only while it is also [on screen](Self::subagent_view_on_screen).
+    /// tail and its live status off the pane (`view::render_preview`).
     #[must_use]
     pub fn in_subagent_view(&self) -> bool {
         self.live_subagent_view().is_some()
@@ -6201,9 +6204,9 @@ impl App {
     /// the layout draws the preview pane at all (not the 1:0 `ListOnly` stop) and
     /// no `Ctrl-N` draft card holds the pane ([`draft`](Self::draft), the fact
     /// `view::running_subagents` hides the running list on). The view stays OPEN
-    /// behind the list-only layout or a card, but nothing of it shows, so `↑` and
-    /// the plain `←`/`→` are the view's (`update::key_to_action`) and the help line
-    /// names them so ([`view::board_hint`]) only while this holds. PURE.
+    /// behind the list-only layout or a card, but nothing of it shows, so the plain
+    /// arrows are the view's (`update::key_to_action`) and the help line names them
+    /// so ([`view::board_hint`]) only while this holds. PURE.
     #[must_use]
     pub fn subagent_view_on_screen(&self) -> bool {
         self.in_subagent_view() && self.pane_layout.shows_preview() && self.draft.is_none()
@@ -6230,10 +6233,11 @@ impl App {
     /// showed the session or another of its subagents (the drill-down — one
     /// session's `subagents/` dir holds every agent it launched at any depth).
     ///
-    /// The ONLY opener of the view, and it has exactly three callers: the click
+    /// The ONLY opener of the view, and it has exactly four callers: the click
     /// route (`update::click_effect`), `Ctrl-X ↓`
-    /// ([`open_subagent_target`](Self::open_subagent_target)) and a `←`/`→` step
-    /// inside the view ([`step_subagent_view`](Self::step_subagent_view)). No search
+    /// ([`open_subagent_target`](Self::open_subagent_target)), a `←`/`→` step
+    /// inside the view ([`step_subagent_view`](Self::step_subagent_view)) and a
+    /// `↑`/`↓` step ([`step_running_subagent_view`](Self::step_running_subagent_view)). No search
     /// route — typing, `Tab`, `Shift-Up` / `Shift-Down` — can switch the pane to a
     /// subagent or read a subagent's transcript. The read itself waits for the
     /// next [`ensure_preview`](Self::ensure_preview).
@@ -6268,9 +6272,8 @@ impl App {
     }
 
     /// Leave the subagent view for the selected session's own transcript, scrolled
-    /// where it was when the view opened. `true` when a view was open — what `↑`
-    /// does there while it is on screen, and `Esc`'s middle step, between clearing
-    /// the query and quitting — and `false`, changing nothing, when none was. Any mouse
+    /// where it was when the view opened. `true` when a view was open — `Esc`'s middle step, between clearing the query and
+    /// quitting — and `false`, changing nothing, when none was. Any mouse
     /// selection goes with the render it was anchored to.
     pub(crate) fn leave_subagent_view(&mut self) -> bool {
         let live = self.live_subagent_view().is_some();
@@ -6444,7 +6447,7 @@ impl App {
     /// (`forward`) subagent of the selected session in launch order, wrapping
     /// round ([`SubagentRecord::step`], which also says where a subagent the
     /// record does not list yet steps to). Like a drill-down, it keeps where the
-    /// session's own transcript was scrolled, for `↑` or `Esc`. Nothing changes
+    /// session's own transcript was scrolled, for `Esc`. Nothing changes
     /// outside the view, or when the step lands on the subagent already shown; nothing
     /// changes either, and it says why, while the record has not arrived or lists
     /// none.
@@ -6458,6 +6461,43 @@ impl App {
         let next = record
             .step(&view.agent_id, forward)
             .ok_or(SubagentsUnavailable::None)?;
+        if next.agent_id != view.agent_id {
+            let (agent_id, agent_type) = (next.agent_id.clone(), next.agent_type.clone());
+            self.open_subagent_view(&agent_id, &agent_type);
+        }
+        Ok(())
+    }
+
+    /// `↑` / `↓` inside the subagent view: switch to the previous / next
+    /// (`forward`) RUNNING subagent of the selected session in launch order,
+    /// wrapping round ([`SubagentRecord::step_running`]). "Running" is asked of
+    /// [`Subagent::is_running`] over the very inputs the running list draws from
+    /// (the selected ledger, [`judged_end`](Self::judged_end), `App::wall_clock`),
+    /// so the step never lands on a row that list omits. The subagent shown need
+    /// not be running itself. Otherwise as [`step_subagent_view`](Self::step_subagent_view):
+    /// nothing changes outside the view or when the walk lands on the subagent
+    /// already shown, and it says why while the record has not arrived, lists
+    /// none, or lists none running ([`SubagentsUnavailable::NoneRunning`]).
+    pub fn step_running_subagent_view(
+        &mut self,
+        forward: bool,
+    ) -> Result<(), SubagentsUnavailable> {
+        let Some(view) = self.live_subagent_view() else {
+            return Ok(());
+        };
+        let record = self
+            .selected_subagents()
+            .ok_or(SubagentsUnavailable::NotRead)?;
+        if record.subagents().is_empty() {
+            return Err(SubagentsUnavailable::None);
+        }
+        let ledger = self.selected_ledger();
+        let wall_clock = self.wall_clock;
+        let next = record
+            .step_running(&view.agent_id, forward, |subagent| {
+                subagent.is_running(&ledger, self.judged_end(subagent), wall_clock)
+            })
+            .ok_or(SubagentsUnavailable::NoneRunning)?;
         if next.agent_id != view.agent_id {
             let (agent_id, agent_type) = (next.agent_id.clone(), next.agent_type.clone());
             self.open_subagent_view(&agent_id, &agent_type);
