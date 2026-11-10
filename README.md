@@ -8,13 +8,14 @@ Every Claude Code session and agent — one live board
 
 ![snapback demo](website/public/demo.gif)
 
-Terminal board for Claude Code: every session and background agent across your repos and worktrees, live. See which agent needs you, reply or stop it without leaving, and find any session by what was said.
+Terminal board for Claude Code: every session, background agent and its subagents across your repos and worktrees, live. See which agent needs you, reply, fork or stop it without leaving, and find any session by what was said.
 
 For developers who run Claude Code in many repos and worktrees at once.
 
 - **One live board** — the repo and all its worktrees grouped by branch, `-a` for every repo, updating as agents write.
 - **Agent status at a glance** — needs input, working, done, failed.
-- **Act without leaving** — `Ctrl-R` reply, `Ctrl-F` fork, `Ctrl-K` stop, `Ctrl-N` start a background agent (optionally one of your agents, model per message), `Enter` resume or attach and return to the board.
+- **Subagents live** — a session's subagents show in the preview and update as they run.
+- **Act without leaving** — `Ctrl-R` reply, `Ctrl-F` fork, `Ctrl-X w` move to another worktree, `Ctrl-K` stop, `Ctrl-N` start a background agent (optionally one of your agents, model per message), `Enter` resume or attach and return to the board.
 - **Find a session by what was said** — `Tab` searches transcripts and the preview jumps to the hit.
 - **Background hand-off copies folded** into one `(+N)` row.
 
@@ -28,8 +29,9 @@ snapback puts it back together.
 | --- | --- | --- |
 | `-p`, SDK and `/loop` sessions | hidden from the picker | shown (`--everything`) |
 | Background agents | one at a time | all at once, live |
+| Subagents | buried in the session | shown and followed live |
 | Search | session names | inside full transcripts |
-| Act on an agent | switch between picker and CLI | reply, stop, start from one board |
+| Act on an agent | switch between picker and CLI | reply, fork, move, stop, start from one board |
 | Scope | one project | every repo and worktree (`-a`) |
 
 One board, everything live — no more grepping `~/.claude` to find which agent needs you.
