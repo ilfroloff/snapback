@@ -16,8 +16,9 @@ const features = [
 const comparison = [
   { aspect: "-p, SDK and /loop sessions", alone: "hidden from the picker", snapback: "shown (--everything)" },
   { aspect: "Background agents", alone: "one at a time", snapback: "all at once, live" },
+  { aspect: "Subagents", alone: "buried in the session", snapback: "shown and followed live" },
   { aspect: "Search", alone: "session names", snapback: "inside full transcripts" },
-  { aspect: "Act on an agent", alone: "switch between picker and CLI", snapback: "reply, stop, start from one board" },
+  { aspect: "Act on an agent", alone: "switch between picker and CLI", snapback: "reply, fork, move, stop, start from one board" },
   { aspect: "Scope", alone: "one project", snapback: "every repo and worktree (-a)" },
 ];
 ---
@@ -27,20 +28,20 @@ const comparison = [
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>snapback — Claude Code session & agent manager for the terminal</title>
-  <meta name="description" content="Manage every Claude Code session and running agent from one terminal board — search transcripts, see the sessions the picker hides, and act without leaving." />
+  <meta name="description" content="Manage every Claude Code session, agent and subagent from one terminal board — search transcripts, see the sessions the picker hides, and act without leaving." />
 
   <link rel="canonical" href="https://www.if-developer.fyi/snapback/" />
 
   <meta property="og:type" content="website" />
   <meta property="og:site_name" content="snapback" />
-  <meta property="og:title" content="snapback — every Claude Code session and agent on one live board" />
-  <meta property="og:description" content="Manage every Claude Code session and running agent from one terminal board — search transcripts, see the sessions the picker hides, and act without leaving." />
+  <meta property="og:title" content="snapback — every Claude Code session, agent and subagent on one live board" />
+  <meta property="og:description" content="Manage every Claude Code session, agent and subagent from one terminal board — search transcripts, see the sessions the picker hides, and act without leaving." />
   <meta property="og:url" content="https://www.if-developer.fyi/snapback/" />
   <meta property="og:image" content="https://www.if-developer.fyi/snapback/og.png" />
 
   <meta name="twitter:card" content="summary_large_image" />
-  <meta name="twitter:title" content="snapback — every Claude Code session and agent on one live board" />
-  <meta name="twitter:description" content="Manage every Claude Code session and running agent from one terminal board — search transcripts, see the sessions the picker hides, and act without leaving." />
+  <meta name="twitter:title" content="snapback — every Claude Code session, agent and subagent on one live board" />
+  <meta name="twitter:description" content="Manage every Claude Code session, agent and subagent from one terminal board — search transcripts, see the sessions the picker hides, and act without leaving." />
   <meta name="twitter:image" content="https://www.if-developer.fyi/snapback/og.png" />
 
   <script type="application/ld+json" is:inline>
@@ -48,7 +49,7 @@ const comparison = [
     "@context": "https://schema.org",
     "@type": "SoftwareApplication",
     "name": "snapback",
-    "description": "A terminal board for every Claude Code session and running agent — search transcripts, see the sessions the picker hides, reply, stop, or start agents.",
+    "description": "A terminal board for every Claude Code session, agent and subagent — search transcripts, see the sessions the picker hides, reply, fork, move, stop, or start agents.",
     "applicationCategory": "DeveloperApplication",
     "operatingSystem": "macOS, Linux",
     "url": "https://www.if-developer.fyi/snapback/",
@@ -82,8 +83,9 @@ const comparison = [
         <p class="sub">
           Claude Code's picker skips -p, Agent SDK and /loop sessions, and
           running agents scatter across your repos and worktrees. snapback puts
-          all of it on one live board — search inside full transcripts, then
-          reply, stop, or start an agent without leaving.
+          every session, agent and subagent on one live board — search full
+          transcripts, then reply, fork, move, stop, or start one without
+          leaving.
         </p>
 
         <div class="prompt">
@@ -126,11 +128,11 @@ const comparison = [
       <dl class="flags">
         <div class="flag-row">
           <dt>See everything, live</dt>
-          <dd>Every session and running background agent — this folder, the repo's worktrees (-p), or every repo (-a) — updating as agents write.</dd>
+          <dd>Every session, running background agent and its subagents — this folder, the repo's worktrees (-p), or every repo (-a) — updating as they run.</dd>
         </div>
         <div class="flag-row">
           <dt>Act without leaving</dt>
-          <dd>Reply (Ctrl-R), fork (Ctrl-F), stop (Ctrl-K), or start a background agent (Ctrl-N), then get straight back to the board.</dd>
+          <dd>Reply (Ctrl-R), fork (Ctrl-F), move between worktrees (Ctrl-X w), stop (Ctrl-K), or start a background agent (Ctrl-N), then get straight back to the board.</dd>
         </div>
         <div class="flag-row">
           <dt>Find it by what was said</dt>
