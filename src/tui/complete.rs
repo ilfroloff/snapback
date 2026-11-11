@@ -131,8 +131,9 @@ const MENTION_NAME_PUNCTUATION: [char; 5] = ['_', ':', '.', '@', '-'];
 pub enum Trigger {
     /// `/` as the first character of the draft: skills and commands.
     Slash,
-    /// `@` at the start of a word: files and folders, then (for a top-level
-    /// token) agents.
+    /// `@` at the start of a word: files and folders and, for a top-level token,
+    /// agents merged in with them by match tier, an agent ahead of an entry of
+    /// its own tier ([`at_candidates`]).
     At,
 }
 
@@ -2061,7 +2062,7 @@ mod tests {
         assert_eq!(
             inserts(&at_candidates(&files, &agents, "csr")),
             vec!["CsrTable.tsx", "agent-cr-swe-rust"],
-            "a top-level `@` lists the file, then the agent"
+            "the file's name STARTS with `csr`, a better tier than the agent's word-start hit"
         );
     }
 
