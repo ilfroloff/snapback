@@ -3354,9 +3354,9 @@ separators instead (`complete::QUERY_PART_SEPARATORS`: `-`, `_`, `.` — the wor
 separators of file, skill, command and agent names), and each part is one atom:
 `@site-stor` is `site` AND `stor`, in any order, so it finds
 `src/modules/sitemaps/sitemaps-storage.service.ts`. Each part is a SUBSTRING —
-a misspelt `@site-stro` finds nothing — and an `@` file or folder the parts
-reject may still match by the word starts of its own name (below; the `@` root
-fallback excepted). Three edges:
+a misspelt `@site-stro` finds nothing — and a command, an agent or an `@` file or
+folder the parts reject may still match by the word starts of its own name
+(below; the `@` root fallback excepted). Three edges:
 
 - A LEADING `.` stays on the first part, so `@.env` is the one part `.env`: it
   lists `.env` as a name-start hit and never `env.example` or `venv/` by a bare
