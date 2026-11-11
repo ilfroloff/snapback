@@ -5052,6 +5052,7 @@ mod tests {
             .map(|name| ListingEntry {
                 name: (*name).to_owned(),
                 description: None,
+                kind: None,
             })
             .collect();
         deliver_catalog(
@@ -5123,6 +5124,7 @@ mod tests {
                 .map(|(name, description)| ListingEntry {
                     name: (*name).to_owned(),
                     description: Some((*description).to_owned()),
+                    kind: None,
                 })
                 .collect()
         };
@@ -5371,11 +5373,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A top-level `@` lists folders, then files, then the catalog's agents; picking
-    /// an agent inserts the mention claude reads, `@agent-<name>`, and an `@` under a
-    /// folder lists no agent, since an agent is not a path.
+    /// A bare top-level `@` lists the catalog's agents, then folders, then files (one
+    /// tier, a tie is the agent's); picking an agent inserts the mention claude reads,
+    /// `@agent-<name>`, and an `@` under a folder lists no agent, since an agent is
+    /// not a path.
     #[test]
-    fn a_top_level_at_lists_folders_then_files_then_the_catalogs_agents() {
+    fn a_top_level_at_lists_the_catalogs_agents_then_folders_then_files() {
         let (mut app, dir) = completion_app(&[]);
         deliver_catalog(
             &mut app,
@@ -5386,13 +5389,13 @@ mod tests {
         assert_eq!(
             list_rows(&app),
             rows(&[
+                ("sby-agent (agent)", Some("Pings back")),
                 ("src/", None),
                 ("notes.txt", None),
                 ("sess-send-e2e.jsonl", None),
-                ("sby-agent (agent)", Some("Pings back")),
             ])
         );
-        press(&mut app, KeyCode::Up); // wraps to the last row: the agent
+        // The agent is the first row, already highlighted.
         assert!(matches!(press(&mut app, KeyCode::Enter), Outcome::Continue));
         assert_eq!(draft_text(&app), "@agent-sby-agent ");
 
@@ -13472,6 +13475,7 @@ mod tests {
             commands: vec![crate::store::skills::ListingEntry {
                 name: "sbping".to_string(),
                 description: Some("answers pong".to_string()),
+                kind: None,
             }],
             agents: Vec::new(),
         };

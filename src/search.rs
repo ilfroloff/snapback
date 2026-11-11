@@ -203,7 +203,8 @@
 //!
 //! One rule here belongs to the compose pick list ALONE:
 //! [`word_start_hit`](SearchIndex::word_start_hit), which `tui::complete` asks of
-//! an `@` file or folder's own NAME when the substring parts rejected it. The
+//! a `/` command's, an agent's or an `@` file or folder's own NAME when the
+//! substring parts rejected it. The
 //! query matches when it can be consumed as consecutive chunks, each a PREFIX of
 //! a word of the name, on words in order — `calis` is `Ca` + `Lis` of
 //! `CategoryListings.tsx`. Its smart case is the substring parts' own, decided
@@ -940,7 +941,8 @@ impl SearchIndex {
     ///
     /// Vacuously true for an empty or whitespace-only query, because the filter
     /// admits every candidate then. The compose pick list (`tui::complete`) asks
-    /// it of a candidate's name and description.
+    /// it of a candidate's name and description, through
+    /// [`admits_with`](Self::admits_with).
     ///
     /// Membership only: it marks nothing. Which chars matched is
     /// [`match_indices`](Self::match_indices)' or
@@ -948,6 +950,9 @@ impl SearchIndex {
     ///
     /// A ONE-SHOT convenience over [`admits_with`](Self::admits_with), folding into
     /// a fresh buffer per call.
+    // Binary crate: the pick list now asks every candidate through `admits_with`,
+    // so this one-shot form is reached by the unit tests alone.
+    #[allow(dead_code)]
     #[must_use]
     pub fn admits(&self, text: &str) -> bool {
         self.admits_with(text, &mut MarkScratch::new())

@@ -162,17 +162,20 @@ KEYS:
                   for a skill, command or agent, its description, matched and
                   highlighted like the search box (an uppercase letter matches
                   exactly); - _ and . split them into parts that match in any
-                  order, so @site-stor finds sitemaps-storage.service.ts. A file
-                  or folder is also found by the starts of the words in its own
-                  name, in order (a capital you type matches exactly and starts
-                  a word), so @calis or @CaLis finds CategoryListings.tsx, just
-                  below the names that hold the letters as typed. An @ path
+                  order, so @site-stor finds sitemaps-storage.service.ts. A name
+                  is also found by the starts of its words, in order (a capital
+                  you type matches exactly and starts a word), so @calis or
+                  @CaLis finds CategoryListings.tsx, /gws finds
+                  git-worktree-setup and @csr finds the agent cr-swe-rust, just
+                  below the names that hold the letters as typed; never by a
+                  description, and not in the whole-path search below. An @ path
                   lists the folder its / names first; when that lists nothing,
                   / splits parts too and the whole path is searched from the
                   top, so @modules/site-stor finds that file as well and a pick
                   writes its full path. Names that start with them come first,
-                  then other name hits, then description hits — files and
-                  folders above agents. A file or folder named with a leading
+                  then other name hits, then description hits — an agent
+                  ahead of a file or folder in the same tier, so a bare @
+                  lists the agents first. A file or folder named with a leading
                   dot shows only once you type that dot. While the list is open
                   ↑/↓ choose, Enter or Tab pick (a folder reopens the list one
                   level down), and Esc closes only the list (the draft stays).

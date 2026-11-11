@@ -3177,7 +3177,9 @@ either.
 Code: `src/tui/complete.rs` (the pure core), `src/tui/compose.rs` (the source, the
 refresh, the fetch request), `src/claude_catalog.rs` (claude's list),
 `src/claude_trust.rs` (which form of claude's list a folder gets),
-`src/store/skills.rs` (a reply's `@` agents until claude's list lands).
+`src/command_kinds.rs` (what kind each `/` row is),
+`src/store/skills.rs` (a reply's `@` agents until claude's list lands, and
+`CommandKind`, the kind a row carries).
 
 EVERY compose box — the `Ctrl-R` reply, the `Ctrl-F` fork and the `Ctrl-N` draft — offers the same
 `/` and `@` list, through the same editor, key router, driver and renderer, and
@@ -3193,7 +3195,8 @@ narrow it by the [rule below](#how-the-letters-narrow-the-list):
   [below](#how-the-letters-narrow-the-list)). The leaf is matched against each entry's
   FULL path relative to that folder, so `@disc` lists `src/store/discover.rs`,
   and by the word starts of the entry's own name, so `@calis` lists
-  `CategoryListings.tsx`
+  `CategoryListings.tsx` (a `/` command or an `@` agent is found by the word
+  starts of its name too: `/gws` lists `git-worktree-setup`)
   (the walk is `complete::list_tree`: breadth first, bounded by
   `COMPLETION_MAX_TREE_ENTRIES` at any depth, never descending a
   symlink, a dot-folder or a `TREE_SKIPPED_DIRS` name: generated output / installed
@@ -3203,8 +3206,8 @@ narrow it by the [rule below](#how-the-letters-narrow-the-list):
   `.` — a visibility gate applied before any match, so `@env` never lists
   `.env` — folders come first within a tier, and a folder pick reopens the list
   one level down. For a TOP-LEVEL `@` token only (no folder part), the folder's
-  agents follow, labelled `<name> (agent)` — claude's own typeahead label — and
-  inserted as
+  agents are merged into that list by tier (below), labelled `<name> (agent)` —
+  claude's own typeahead label — and inserted as
   `@agent-<name> `, the form claude turns into a structured `agent_mention` and
   documents for typing by hand — never claude's own picker form
   `@"<name> (agent)"`, which misses a name containing `agent-`
@@ -3227,6 +3230,8 @@ narrow it by the [rule below](#how-the-letters-narrow-the-list):
   as "skills" or "files" would be false for a list that mixes kinds. What the
   query matched is marked in the board's own label highlight
   ([below](#how-the-letters-narrow-the-list)).
+- A `/` row may also carry a KIND, drawn in a `DIM` column between the name and
+  the description ([below](#the-kind-column)). An `@` list has none.
 - The list opens only with the caret at the END of the token. While open,
   `Up`/`Down` choose (wrapping), `Enter`/`Tab` pick, `Esc` closes only the list. A
   closed token stays closed while the caret stays at its end (typing more of it
@@ -3249,7 +3254,7 @@ the list reads, in order of precedence (a `/` reads the first row alone):
 
 | Source | Used when | What it holds |
 | --- | --- | --- |
-| claude's catalog (`App::catalogs`) | it has landed for the folder | claude's own `initialize` handshake answer: commands (skills and built-ins, minus the built-ins claude hides from its own menu) and agents, with descriptions. It includes the repository's own `.claude/` skills, commands and agents only where claude TRUSTS the folder; anywhere else the fetch passes `--setting-sources user`, so the list is the user's own, bundled and built-in items alone ([below](#which-settings-the-fetch-loads)) |
+| claude's catalog (`App::catalogs`) | it has landed for the folder | claude's own `initialize` handshake answer: commands (skills and built-ins, minus the built-ins claude hides from its own menu, each with the [kind](#the-kind-column) the worker gave it) and agents, with descriptions. It includes the repository's own `.claude/` skills, commands and agents only where claude TRUSTS the folder; anywhere else the fetch passes `--setting-sources user`, so the list is the user's own, bundled and built-in items alone ([below](#which-settings-the-fetch-loads)) |
 | the session's transcript | a reply's or fork's top-level `@`, until the catalog lands or when its fetch failed | AGENTS only: `store::skills::read_listing` of that box's own session file (its [`agent_listing_delta` records](#jsonl-record-model)), read at most once per draft, and only for a top-level `@`. A `/` never reads it, and an `@` with a folder part lists no agents |
 | none | otherwise, until the catalog lands or when its fetch failed | `/` lists nothing in any box, and a draft's `@` lists no agents; files and folders show at once in all three, a local read |
 
@@ -3301,6 +3306,46 @@ reaches disk. It is keyed by the path as given (`Session.cwd` from the file, the
 canonical launch dir), so two spellings of one folder cost one extra fetch, never
 a wrong list, and a skill created mid-run is listed after a restart.
 
+#### The kind column
+
+A `/` row says what it is: `built-in`, `skill` or `command`. claude's reply names
+no folder, so the kind is decided on the catalog fetch's worker, right after the
+reply, by `command_kinds::label_commands` with the trust verdict the SAME fetch
+already holds (`claude_catalog::fetch_in`; a second read could give project
+labels to a folder whose fetch skipped project items). One precedence, asked of
+each row's name:
+
+1. the reply's own `builtin: true` (`claude_catalog::reply_kind`, set on the entry
+   the dedup keeps): `BuiltIn`. It also covers the skills claude ships
+   (`/loop`, `/simplify`), which the reply does not tell apart from `/clear`, and
+   no folder lookup overrides it;
+2. a skill the readable folders define: `Skill`;
+3. a command they define: `Command`;
+4. otherwise no label. The row is never wrongly named: plugin, managed and synced
+   skills are not read, so they stay blank.
+
+SKILL FIRST, because claude loads every skills folder before every commands folder
+and keeps the first entry of a name; checking commands first would mislabel real
+clashes. The one wrong label left is a name a read `commands/` file and an unread
+skill both define, which shows `command`. The folders are the user's own
+(`claude_settings::user_config_dir`, so `$CLAUDE_CONFIG_DIR` is honored) and,
+only under `FolderTrust::Trusted`, each project `.claude/` from the compose
+folder up to the first ancestor holding a `.git` entry (found on disk, no `git`
+command) or to just below home. The name rules, the caps (`MAX_ENTRIES`,
+`MAX_COMMAND_DEPTH`, `MAX_SKILL_HEAD_BYTES`) and the facts they rest on:
+[CLAUDE_CLI.md](CLAUDE_CLI.md#which-folder-a--row-came-from). Reads are FAIL-SOFT:
+a missing or unreadable folder, a bad frontmatter or a cap only leaves a row
+blank. A linked worktree's own `.git` file stopping claude's walk is NOT verified.
+
+The view draws the column only when some row of the list carries a kind. Its
+width is the widest of the three words in terminal columns, and it comes out of
+the description's half: the name keeps its 50% cap, so at 80 columns the
+description keeps at least 27. An unlabelled row has a blank cell, the cell is
+`DIM`, the search highlight never marks it (the matcher never sees it: a query
+of `skill` matches no name or description) and the selected row's `REVERSED`
+covers it. The three words are written once, in `view.rs`; rows store the
+`CommandKind`.
+
 #### How the letters narrow the list
 
 The letters after the trigger go to the board's own matcher, in PARTS. The token
@@ -3309,8 +3354,9 @@ separators instead (`complete::QUERY_PART_SEPARATORS`: `-`, `_`, `.` — the wor
 separators of file, skill, command and agent names), and each part is one atom:
 `@site-stor` is `site` AND `stor`, in any order, so it finds
 `src/modules/sitemaps/sitemaps-storage.service.ts`. Each part is a SUBSTRING —
-a misspelt `@site-stro` finds nothing — and an `@` file or folder the parts
-reject may still match by its word starts (below). Three edges:
+a misspelt `@site-stro` finds nothing — and a command, an agent or an `@` file or
+folder the parts reject may still match by the word starts of its own name
+(below; the `@` root fallback excepted). Three edges:
 
 - A LEADING `.` stays on the first part, so `@.env` is the one part `.env`: it
   lists `.env` as a name-start hit and never `env.example` or `venv/` by a bare
@@ -3327,11 +3373,13 @@ with spaces for `set_query`
 ([PATTERNS.md §4](PATTERNS.md#4-isolate-volatile-dependencies) says why). The
 board's own search box keeps whitespace as its only separator.
 
-**Word starts (`@` files and folders).** A CamelCase name holds its words with
-no separator between them, so `@calis` is no substring of
-`CategoryListings.tsx`. So in the FOLDER STEP an entry the parts reject is asked
-one more question, `SearchIndex::word_start_hit`, of its own NAME (the last path
-component): can the query be consumed left to right as
+**Word starts (every pick-list name but the root fallback's).** A CamelCase name
+holds its words with no separator between them, so `@calis` is no substring of
+`CategoryListings.tsx`, and a kebab-case name's initials (`gws` for
+`git-worktree-setup`) are none either. So a command, an agent, or an `@` entry
+in the FOLDER STEP that the parts reject is asked one more question,
+`SearchIndex::word_start_hit`, of its own NAME (an `@` path's last component):
+can the query be consumed left to right as
 consecutive chunks, each a non-empty PREFIX of a word of the name, on words in
 order but not necessarily adjacent? A name's words end at `-`, `_`, `.`, `/` and
 a space; at a lowercase letter or digit followed by a capital
@@ -3359,12 +3407,15 @@ are all `Ca` + `Lis` and list `CategoryListings.tsx`:
   queries only, and a name's non-ASCII char never matches a query char nor reads
   a case boundary. A part that keeps a separator (`@.env`'s leading `.`, a token
   of separators alone) never matches, since no word holds one.
-- Its scope: an `@` file or folder's own name, in the folder step. Never a
-  folder component of the path, never a `/` command or skill, never an agent,
-  never the root fallback (below), and never the board's search box or filter
-  (AGENTS.md MATCHER ISOLATION).
+- Its scope: the own name of a `/` command or skill, of an agent (after the
+  `agent-` prefix is stripped, so `@agent-csr` is `@csr`) and of an `@` file or
+  folder in the folder step (`@csr` lists the agent `cr-swe-rust`; `/gws` the
+  skill `git-worktree-setup`). Never a description, never a folder component of
+  a path, never the root fallback (below), and never the board's search box or
+  filter (AGENTS.md MATCHER ISOLATION). The bounds above are the rule's, so they
+  bind a command name just as they bind a file name.
 
-Why the NAME and not the whole path: measured 2026-10-19 (release build, Apple
+Why the NAME and not the whole path (or a description): measured 2026-10-19 (release build, Apple
 M4 Max), word-start over full paths admitted 132 rows for `@calis` on a
 10,084-entry React monorepo walk where names admitted 12 (444 against 50 on a
 synthetic 25,000-entry walk), because folder names spell chunks for every file
@@ -3410,9 +3461,12 @@ top-level `@` over that walk:
 `/` splits nothing anywhere else: not the folder step, not the `/` trigger's
 commands and skills, and not the board's search box.
 
-`complete::placement` (for an `@` path, `complete::path_hit`) asks
-`SearchIndex::admits` — the [filter's](#content-index-storeparse) own membership
-question, every part present — of a candidate's NAME, and only then of its
+ONE function, `complete::rank`, ranks every pick-list row from plain data (a
+`complete::Subject`: its name, the text its marks land on, its description and
+whether word starts apply). It asks the [filter's](#content-index-storeparse)
+own membership question (`SearchIndex::admits_with`: every part present) of a
+candidate's NAME, then of the whole path (for an `@` path only), then asks the
+word-start rule of the name, and only then asks the membership question of the
 description. So a query matches ANYWHERE in the name or, for a skill, command or
 agent, anywhere in its description; a file or folder has only its name. It is a
 substring match under the board's per-atom smart case and its one fold, decided
@@ -3427,8 +3481,10 @@ rule (`SearchIndex::match_indices`: every part in the string, every occurrence o
 each marked), asked of the NAME or path alone — a command's marks moved past its
 `/`, an agent's never reaching its ` (agent)`, a folder's trailing `/` never
 marked — or, for a description-only hit, of the description. A word-start hit
-marks its chunks instead (`[Ca]tegory[Lis]tings.tsx`), the one row the
-row-label rule does not mark, since no part of it is a substring there. The
+marks its chunks instead (`[Ca]tegory[Lis]tings.tsx`, `/[g]it-[w]orktree-[s]etup`,
+moved past the `/` a command draws, past the folders of a path, and not at all
+for an agent), the one row the row-label rule does not mark, since no part of it
+is a substring there. The
 view draws them in the board's label highlight (`view::MATCH_HIGHLIGHT_STYLE`), lifting a
 description's `DIM` under a mark, and splits only the rows the table can show
 (`view::completion_row_may_show`, whose doc carries the frame-cost measurement
@@ -3437,17 +3493,29 @@ at the walk's entry cap).
 What matches is ordered in six tiers (`complete::Placement`): a name that
 STARTS with the query — any part's hit at its first char — then a word-start hit
 whose first chunk begins the name, then a name that holds every part elsewhere,
-then a word-start hit on a later word of the name, then (`@` paths only,
-`complete::path_hit`) a path that needs a FOLDER component for some part, then a
-description-only hit. A word-start hit thus lists right below the substring hits
-of the tier it lands in, and within its tier by fewer chunks, then fewer skipped
+then a word-start hit on a later word of the name, then (`@` paths only) a path
+that needs a FOLDER component for some part, then a description-only hit.
+`complete::rank` asks these in the order name substring, name word starts, path,
+description and stops at the first yes, so a file whose own name is a word-start
+hit lands in its word-start tier even when a folder above it holds the query too
+(`calistoga/CategoryListings.tsx` for `@calis`), and only a name that is no hit of
+its own is left to the path. A word-start hit thus lists right below the substring hits
+of the tier it lands in, above a description-only hit, and within its tier by fewer chunks, then fewer skipped
 words: for `@calis`, `CategoryListings.tsx` (`Ca` + `Lis`) lists above `CategoryFooListings.tsx`,
 which skips a word, and both above `ClickAwayListener/` (`C` + `A` + `Lis`). An
 `@` path entry's name is its last component. Within a tier the list keeps the order it has with no
 query — the source's order for commands and agents (claude's catalog, or a
-reply's or fork's transcript); folders before files, then by name, for `@` entries — and
-an `@` list keeps every entry above every agent, whatever their tiers. An empty
-query admits every candidate into that one order. claude 2.1.284 orders its own
+reply's or fork's transcript); folders before files, then by name, for `@` entries.
+A TOP-LEVEL `@` merges its agents into its entries by that tier
+(`complete::at_candidates`, a linear merge of the two ordered lists, never a
+second sort): an agent lists before an entry of the SAME `Placement`, and an entry
+in a better one (a tighter word-start hit included) still lists above an agent.
+`@l` therefore lists the agent `lead` ahead of every file that only holds an `l`,
+and `@s` lists `statusline-setup`, then `src/` (both start with an `s`, and the agent wins the tie). An empty query
+admits every candidate into that one tier, so a bare `@` lists every agent, then
+the folders, then the files. A tie among agents keeps the catalog's order (byte
+order, so `Explore` and `Plan` before `adr-writer`). `@src/…` and the root
+fallback list no agent. claude 2.1.284 orders its own
 `/` menu the same way — name start, then the rest of the name, then the
 description (read from the binary, 2026-10-02) — but it matches fuzzily, and
 ranks aliases and usage too.
