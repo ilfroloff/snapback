@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.1](https://github.com/ilfroloff/snapback/compare/v0.15.0...v0.15.1) - 2026-11-14
+
+### Other
+
+- pitch subagents and fork/move on the website and README
+
 ## [0.15.0](https://github.com/ilfroloff/snapback/compare/v0.14.0...v0.15.0) - 2026-11-05
 
 ### Added
