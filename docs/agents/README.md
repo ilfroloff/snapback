@@ -22,7 +22,7 @@ find the same rule in two places, that is a bug to fix.
    session's title, the answering model
    and the one a `-r` launch restores, scopes, the per-compose model pick and
    its defaults, the compose pick list, how it matches and where it reads
-   from), and the per-state routing tables — the hand-offs, the `Ctrl-F` fork
+   from), and the per-state routing tables — the hand-offs, the `Ctrl-X f` fork
    box, the `Ctrl-R` / `Ctrl-K` gates, the row role (head row or `↳` row, and
    for `Ctrl-X x` whether the row visibly stands for others and which members it
    shows) that decides how far `Ctrl-X x` / `d` / `w` reach, the `Ctrl-X w`
@@ -66,7 +66,7 @@ install and quick start only.
 | Topic | Lives in |
 | --- | --- |
 | Module responsibilities, stack, runtime wiring | ARCHITECTURE |
-| Store layout, JSONL fields, label/grouping/fork-lineage (named forks included)/turn-count/live-agent/answering-model semantics, the delegation line, the subagent view, the subagent record's running rule, the running list and the session's title, the per-compose model pick and its `ComposeDefault` cases, the compose pick list's sources, precedence, fetch/retry behaviour and how it matches, marks and orders, and the routing tables (hand-off, the `Ctrl-F` fork box, `Ctrl-R`, `Ctrl-K`, the head-row / `↳`-row reach of `Ctrl-X x` / `d` / `w` and hide's narrower stands-for-others reach and on-screen set, the `Ctrl-X w` move, its lineage job and a quit mid-move, `Event::Paste`) | DOMAIN |
+| Store layout, JSONL fields, label/grouping/fork-lineage (named forks included)/turn-count/live-agent/answering-model semantics, the delegation line, the subagent view, the subagent record's running rule, the running list and the session's title, the per-compose model pick and its `ComposeDefault` cases, the compose pick list's sources, precedence, fetch/retry behaviour and how it matches, marks and orders, and the routing tables (hand-off, the `Ctrl-X f` fork box, `Ctrl-R`, `Ctrl-K`, the head-row / `↳`-row reach of `Ctrl-X x` / `d` / `w` and hide's narrower stands-for-others reach and on-screen set, the `Ctrl-X w` move, its lineage job and a quit mid-move, `Event::Paste`) | DOMAIN |
 | How the critical rules are carried out in code (fail-soft direction, authoritative re-read, matcher isolation, styling, off-thread shapes, status ownership), the tunables table, testing conventions | PATTERNS |
 | Commands, env vars, CI + release automation, validation checklist | OPERATIONS |
 | External `claude` CLI surface (flags, commands, version pin, spawned argv, the captured `--model` alias set + its refresh command, the `--effort` levels and how claude treats them, the settings precedence and `-r` model restore a launch without `--model` follows, the `initialize` handshake's probed wire shape and side effects, the built-ins and skills claude hides from its `/` menu, the agent-mention forms, claude's workspace-trust record and rule, what an untrusted folder can run (claude's own git prefetch included), and the fetch's two forms, argv and child environment; the `set_cwd` move request's probed wire shape and answers, what its child does once snapback is gone, and claude's own `/cd`) | CLAUDE_CLI |

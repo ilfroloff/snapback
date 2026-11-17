@@ -80,7 +80,7 @@ pub struct Ready {
     /// A hand-off that actually EMITS `--model` overrides that hint with
     /// [`MODEL_NONZERO_HINT`], since an invalid model is a hard failure and the agent
     /// wording does not name it. Only two hand-offs can carry one — a new session
-    /// (the `Ctrl-N` draft's `Ctrl-O` run) and an interactive fork (the `Ctrl-F`
+    /// (the `Ctrl-N` draft's `Ctrl-O` run) and an interactive fork (the `Ctrl-X f`
     /// box's `Ctrl-O` run), each with a model picked in its own compose — because a
     /// plain resume, the Fork choice and an attach take no model at all.
     /// [`nonzero_hint_for`] makes that selection, from the same predicate the argv is
@@ -112,7 +112,7 @@ pub struct Ready {
 /// live) and a user Ctrl-C'ing a healthy session both exit non-zero, so the
 /// message only points at the next moves rather than diagnosing.
 pub const RESUME_NONZERO_HINT: &str =
-    "claude exited with an error — if this session is running, use Fork (Ctrl-F) or Attach.";
+    "claude exited with an error — if this session is running, use Fork (Ctrl-X f) or Attach.";
 
 /// Status shown when a plain resume exited non-zero AND a fresh probe confirms
 /// the session IS live — the TOCTOU race, caught after the fact.
@@ -127,7 +127,7 @@ pub const RESUME_NONZERO_HINT: &str =
 /// the probe's word.
 pub const RESUME_RACE_STATUS: &str =
     "claude exited with an error, and this session is now running as an agent — \
-     Attach or Fork (Ctrl-F) instead of resuming.";
+     Attach or Fork (Ctrl-X f) instead of resuming.";
 
 /// Neutral hint shown when a NEW session's `claude` exits NON-ZERO.
 ///
@@ -141,7 +141,7 @@ pub const NEW_SESSION_NONZERO_HINT: &str =
     "claude exited with an error — if you picked an agent, check that its name is valid.";
 
 /// Neutral hint shown when an interactive fork exits NON-ZERO without having
-/// carried a `--model`: the `Ctrl-F` fork box's run (`Ctrl-O`, [`check_fork_run`])
+/// carried a `--model`: the `Ctrl-X f` fork box's run (`Ctrl-O`, [`check_fork_run`])
 /// or the Attach/Fork/Cancel choice's Fork ([`check`] with `fork`).
 ///
 /// Its own wording because [`RESUME_NONZERO_HINT`]'s next moves are wrong here: it
@@ -156,7 +156,7 @@ pub const FORK_NONZERO_HINT: &str = "claude exited with an error in the fork.";
 /// [`FORK_NONZERO_HINT`] on the fork box's run) for exactly those invocations.
 ///
 /// The interactive hand-offs that can carry a model are the `Ctrl-N` draft run and
-/// the `Ctrl-F` fork box's run, each with `Ctrl-O` after a model was picked in that
+/// the `Ctrl-X f` fork box's run, each with `Ctrl-O` after a model was picked in that
 /// compose (`Ctrl-L`); a resume, the Fork choice and an attach take none. The words
 /// name no box, because a pick is made the same way in each one that can carry it
 /// (the reply box, the fork box and the draft). An invalid model is a HARD failure
@@ -188,7 +188,7 @@ pub const MODEL_NONZERO_HINT: &str = "claude exited with an error — check that
 /// `kind: "interactive"` denotes"). The copy now states only the absent job id, and
 /// names the one move that works on the same record either way: Fork.
 pub const ATTACH_NO_JOB_ID: &str = "claude reports no attachable job for this session, \
-     so there is nothing to attach to. Press Ctrl-F to fork it instead.";
+     so there is nothing to attach to. Press Ctrl-X f to fork it instead.";
 
 /// Refusal shown when Attach is chosen but claude's ACTIVE list no longer
 /// reports the session as a running agent.
@@ -211,7 +211,7 @@ pub const ATTACH_NO_JOB_ID: &str = "claude reports no attachable job for this se
 /// claude's own refusal check, and a fork of a finished session is just an
 /// ordinary fork. Attach is the ONLY choice that needs a live job id.
 pub const ATTACH_NOT_LIVE: &str = "claude no longer reports this session as a running agent, \
-     so there is nothing to attach to. Press Enter to resume it, or Ctrl-F to fork.";
+     so there is nothing to attach to. Press Enter to resume it, or Ctrl-X f to fork.";
 
 /// Why a resume did not hand off to `claude`.
 ///
@@ -321,7 +321,7 @@ pub enum SessionAction {
     Attach,
     /// Start a brand-new session (`claude [--agent <name>]`).
     New,
-    /// Fork an existing session interactively from the `Ctrl-F` box's `Ctrl-O`
+    /// Fork an existing session interactively from the `Ctrl-X f` box's `Ctrl-O`
     /// (`claude -r <id> --fork-session --name <name> [--model <alias> [--effort
     /// <level>] | --effort <level>] [<message>]`). Unlike [`SessionAction::Fork`] it
     /// reads a model, the session's carried effort and a message.
@@ -355,7 +355,7 @@ pub struct HandoffCtx<'a> {
     pub prompt: Option<&'a str>,
     /// The model picked in a compose (`Ctrl-L`), emitted as `--model <alias>`
     /// (followed by `--effort <level>` when the pick carries one) for a `New` session
-    /// (the `Ctrl-N` draft's `Ctrl-O` run) and a `ForkRun` (the `Ctrl-F` box's
+    /// (the `Ctrl-N` draft's `Ctrl-O` run) and a `ForkRun` (the `Ctrl-X f` box's
     /// `Ctrl-O` run) ONLY.
     ///
     /// INERT for `Resume`, `Fork` and `Attach`, and not merely unused there: their
@@ -433,7 +433,7 @@ pub fn argv_for(action: SessionAction, ctx: &HandoffCtx) -> Vec<String> {
 /// claude imposes: claude 2.1.291's `--help` documents none for `--name`.
 pub const FORK_NAME_MAX_CHARS: usize = 60;
 
-/// The `--name` every fork snapback makes carries — from the `Ctrl-F` box or the
+/// The `--name` every fork snapback makes carries — from the `Ctrl-X f` box or the
 /// Attach/Fork/Cancel choice: [`FORK_NAME_PREFIX`], then the first non-blank line
 /// of `message`, trimmed, with control characters turned into spaces and cut to
 /// [`FORK_NAME_MAX_CHARS`] chars. With no such line (an empty `Ctrl-O`, or the
@@ -629,7 +629,7 @@ pub fn build_fork_argv(session_id: &str, parent_label: &str) -> Vec<String> {
     argv
 }
 
-/// Build the `claude` argv for the `Ctrl-F` box's interactive run:
+/// Build the `claude` argv for the `Ctrl-X f` box's interactive run:
 /// `claude -r <id> --fork-session --name <name> [--model <alias> [--effort
 /// <level>] | --effort <level>] [<message>]`.
 ///
@@ -895,7 +895,7 @@ pub fn check(session: &Session, fork: bool) -> Result<Ready, ResumeError> {
     }
 }
 
-/// Terminal-up gate for the `Ctrl-F` box's interactive run (`Ctrl-O`): the same
+/// Terminal-up gate for the `Ctrl-X f` box's interactive run (`Ctrl-O`): the same
 /// authoritative re-read and `cwd` gate as [`check`], with the box's `model`, the
 /// session's `carried_effort` and `message` threaded into a `ForkRun` argv, and the session's own label as the
 /// fork's name when the box is empty.
@@ -1645,7 +1645,7 @@ mod tests {
         );
     }
 
-    /// A picked model reaches TWO actions, `New` and `ForkRun` (the `Ctrl-F` box's
+    /// A picked model reaches TWO actions, `New` and `ForkRun` (the `Ctrl-X f` box's
     /// own run), and is INERT for the plain `-r` launches and for `Attach`.
     ///
     /// Both halves are hard invariants. `Enter` and the Attach/Fork/Cancel choice's
@@ -2015,7 +2015,7 @@ mod tests {
         }
     }
 
-    /// The plain fork `Ctrl-F` always handed off, named after `parent_label` — what
+    /// The plain fork `Ctrl-X f` always handed off, named after `parent_label` — what
     /// an untouched fork box runs.
     fn named_plain_fork(id: &str, parent_label: &str) -> Vec<String> {
         let mut argv = build_argv(id, true);
@@ -2024,7 +2024,7 @@ mod tests {
     }
 
     /// The fork box's interactive run: an untouched box (no pick, no message) is the
-    /// plain fork `Ctrl-F` always handed off, named after the parent's label; a
+    /// plain fork `Ctrl-X f` always handed off, named after the parent's label; a
     /// typed message names it instead, and the name and a pick land BEFORE the
     /// trailing message, effort right behind the model.
     #[test]
@@ -2374,13 +2374,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The fork run's hint sends nobody back to `Ctrl-F`, the route that just
+    /// The fork run's hint sends nobody back to `Ctrl-X f`, the route that just
     /// failed, and claims no running session; the model hint names no single box,
     /// since the reply box, the fork box and the draft each carry a pick.
     #[test]
     fn the_fork_and_model_hints_fit_every_route_that_shows_them() {
         assert_ne!(FORK_NONZERO_HINT, RESUME_NONZERO_HINT);
         assert!(!FORK_NONZERO_HINT.contains("Ctrl-F"), "{FORK_NONZERO_HINT}");
+        assert!(
+            !FORK_NONZERO_HINT.contains("Ctrl-X f"),
+            "{FORK_NONZERO_HINT}"
+        );
         assert!(
             !FORK_NONZERO_HINT.contains("running"),
             "{FORK_NONZERO_HINT}"

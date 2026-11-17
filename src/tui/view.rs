@@ -2032,7 +2032,7 @@ const SUBAGENT_AGE_SUFFIX: &str = " ago";
 /// a subagent drops off it once it goes quiet or fails, with no file read. Read-only over `App`: no clock, no I/O.
 ///
 /// EMPTY, hiding the list, while a compose box is open or a draft card holds
-/// the pane: the `Ctrl-R` reply, the `Ctrl-F` fork box and the `Ctrl-N` draft
+/// the pane: the `Ctrl-R` reply, the `Ctrl-X f` fork box and the `Ctrl-N` draft
 /// card alike. A docked box takes the same bottom rows
 /// ([`preview_compose_split`]), and the rule is keyed on the box being open, not
 /// on where it is drawn, so the list stays hidden in the short-terminal
@@ -5378,7 +5378,7 @@ fn render_search(frame: &mut Frame, app: &mut App, area: Rect) {
 /// it copies, it made 90 columns with `· Esc cancel`, so `Esc cancel` went — the
 /// trade this note had set aside for the next verb: it was the one entry naming
 /// no action, and any key the chord does not bind still cancels it, `Esc`
-/// included. The `f fold` verb (the lineage toggle `←`/`→` gave up to the search
+/// included. The fold verb (`f fold` when it landed, now `z fold`; the lineage toggle `←`/`→` gave up to the search
 /// caret) made 86, and `y` paid again: `y copy ID` still says WHAT is copied —
 /// the reason it grew — and the status line still prints `Copied session ID …`
 /// in full. The `w move` verb (move the session to another worktree) made 87, and
@@ -5393,13 +5393,17 @@ fn render_search(frame: &mut Frame, app: &mut App, area: Rect) {
 /// `d del row/stack` became `d delete` (the confirm itself offers the stack on
 /// its top row) and `y copy ID` became `y ID` (the status line still says
 /// `Copied session ID …`), with the verb itself singular, which lands it at
-/// exactly 80. `?` (the key-map modal, the terminal-independent twin of `F1`) is
+/// exactly 80. The `f fork` verb (the fork box, moved off `Ctrl-F`) and the
+/// fold's new letter, `z fold`, cost 9 columns together, and three entries paid:
+/// `d delete` became `d del`, `r reload` became `r scan` and `↓ subagent` became
+/// `↓ sub`, which lands the widest form at 79.
+/// `?` (the key-map modal, the terminal-independent twin of `F1`) is
 /// bound but NOT listed: the line is full, and the board hint's `F1 keys` points at
 /// the same modal in most terminals; where F1 does not arrive, `Ctrl-X ?` is found
 /// through `sb --help`, `docs/GUIDE.md` or the key map itself.
 fn chord_hint(selected_hidden: bool) -> String {
     let x = if selected_hidden { "show" } else { "hide" };
-    format!("^X x {x} · d delete · h hidden · r reload · y ID · f fold · w move · ↓ subagent")
+    format!("^X x {x} · d del · h hidden · r scan · y ID · f fork · z fold · w move · ↓ sub")
 }
 
 /// The compose zone's key hints, per open draft. Pure so the wording is assertable
@@ -5495,10 +5499,6 @@ const KEY_MAP: &[KeyMapSection] = &[
                 "resume (a running session offers Attach / Fork / Cancel)",
             ),
             (
-                "Ctrl-F",
-                "fork the selected session: a box for the fork's first message",
-            ),
-            (
                 "Ctrl-N",
                 "new session: pick an agent, then draft its first message",
             ),
@@ -5560,7 +5560,11 @@ const KEY_MAP: &[KeyMapSection] = &[
             ("Ctrl-X h", "show / hide hidden sessions"),
             ("Ctrl-X r", "re-read every transcript from disk"),
             ("Ctrl-X y", "copy the session ID"),
-            ("Ctrl-X f", "fold / expand the fork lineage"),
+            (
+                "Ctrl-X f",
+                "fork the selected session: a box for the fork's first message",
+            ),
+            ("Ctrl-X z", "fold / expand the fork lineage"),
             ("Ctrl-X w", "move the session to another worktree"),
             ("Ctrl-X ↓", "show a subagent's transcript; again to go back"),
             ("Ctrl-X ?", "this key map"),
@@ -18921,7 +18925,7 @@ mod tests {
     }
 
     /// No running list while a compose box or a draft card holds the preview —
-    /// the `Ctrl-R` reply, the `Ctrl-F` fork box and the `Ctrl-N` draft card, the
+    /// the `Ctrl-R` reply, the `Ctrl-X f` fork box and the `Ctrl-N` draft card, the
     /// draft also once its launch is in flight with the editor gone — docked, or
     /// as the full-width bar of a terminal too short to dock it.
     #[test]
@@ -19083,7 +19087,7 @@ mod tests {
         );
     }
 
-    /// A headless fork from the `Ctrl-F` box is in flight under the FORK's id, so the
+    /// A headless fork from the `Ctrl-X f` box is in flight under the FORK's id, so the
     /// pinned row treats the two rows of that lineage differently. The jump lands on
     /// the fork's row while its `claude -p` child still runs: the row keeps its turn
     /// marker pinned, and the live status and age claude reports for that child stay
@@ -21720,14 +21724,7 @@ mod tests {
         // `d` is the hint's own word — NOT the modal's button wording (`Delete
         // this`, `Delete lineage (N)`), so this needle pins the hint alone.
         for needle in [
-            "x hide",
-            "d delete",
-            "h hidden",
-            "r reload",
-            "y ID",
-            "f fold",
-            "w move",
-            "↓ subagent",
+            "x hide", "d del", "h hidden", "r scan", "y ID", "f fork", "z fold", "w move", "↓ sub",
         ] {
             assert!(
                 text.contains(needle),
@@ -21747,6 +21744,19 @@ mod tests {
             "the which-key hint must not overflow an 80-column help row: {} cols in {widest:?}",
             widest.chars().count()
         );
+    }
+
+    /// The fork and the fold each name their own letter: `f` forks and `z` folds,
+    /// so a swap of the two letters in the which-key hint fails here as it would in
+    /// `update::chord_key`.
+    #[test]
+    fn the_chord_hint_names_f_as_fork_and_z_as_fold() {
+        for hidden in [false, true] {
+            let hint = chord_hint(hidden);
+            assert!(hint.contains("f fork"), "{hint:?}");
+            assert!(hint.contains("z fold"), "{hint:?}");
+            assert!(!hint.contains("f fold"), "{hint:?}");
+        }
     }
 
     #[test]
@@ -21812,7 +21822,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         for needle in [
-            "Ctrl-F",
+            "Ctrl-X f",
             "Ctrl-N",
             "Ctrl-R",
             "Ctrl-K",
@@ -23981,7 +23991,7 @@ mod tests {
         }
     }
 
-    // --- forks named by the `Ctrl-F` box: the child row's name ---------------
+    // --- forks named by the `Ctrl-X f` box: the child row's name ---------------
 
     /// The turn count each fork in [`named_forks_board`] holds — multi-digit, like
     /// [`BG_MSGS`], so a count clipped at the edge would read back as a smaller,
@@ -23989,7 +23999,7 @@ mod tests {
     const FORK_MSGS: usize = 171;
 
     /// [`ANCESTOR_ID`] as the parent of `forks` — `(id, name, timestamp)` — each
-    /// named `fork: <name>` the way the `Ctrl-F` box names it, plus `extra`
+    /// named `fork: <name>` the way the `Ctrl-X f` box names it, plus `extra`
     /// members as given, EXPANDED so every child row is drawn.
     fn named_forks_board(forks: &[(&str, &str, i64)], extra: Vec<Session>) -> App {
         let mut sessions = vec![lineage_session(

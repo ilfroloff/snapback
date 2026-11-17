@@ -64,7 +64,7 @@ pub const DELETE_RUNNING_REFUSAL: &str = "claude still reports this session as a
 
 /// User-facing refusal returned by [`can_delete_target`] when SNAPBACK ITSELF has a
 /// `claude -p` child in flight on the target: a quick reply to it, or the headless
-/// fork (the `Ctrl-F` box's `Enter`) that is creating it, so the words name both.
+/// fork (the `Ctrl-X f` box's `Enter`) that is creating it, so the words name both.
 ///
 /// The THIRD writer, and the first of the two snapback runs itself that
 /// [`can_delete`] cannot be relied on to see (the other is the `Ctrl-X w` move,

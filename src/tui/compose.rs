@@ -32,7 +32,7 @@
 //!
 //! * [`ComposeTarget::Reply`] — the quick reply `Ctrl-R` opens on a selected
 //!   session. `Enter` sends a one-shot `claude -p -r` ([`crate::send`]).
-//! * [`ComposeTarget::Fork`] — the box `Ctrl-F` opens on a selected session.
+//! * [`ComposeTarget::Fork`] — the box `Ctrl-X f` opens on a selected session.
 //!   `Enter` forks it headless (`claude -p -r <id> --fork-session --session-id
 //!   <new>`, over the reply's send path) and `Ctrl-O` forks it interactively.
 //! * [`ComposeTarget::NewBackgroundAgent`] — the draft `Ctrl-N` opens: via `Enter`
@@ -140,7 +140,7 @@ pub enum ComposeTarget {
         /// plain in-place reply.
         stop_job: Option<String>,
     },
-    /// A FORK of an EXISTING session (`Ctrl-F`). Addresses the same row a reply
+    /// A FORK of an EXISTING session (`Ctrl-X f`). Addresses the same row a reply
     /// does, but writes a NEW transcript, so it carries no `stop_job`: claude
     /// skips the live-session refusal for a fork.
     Fork {
@@ -687,7 +687,7 @@ pub fn open(app: &mut App, session_id: String, stop_job: Option<String>) {
 }
 
 /// Open the FORK compose zone for `session_id`, bringing back a hidden preview like
-/// [`open`]. The folder check has already run at the call site (`Ctrl-F` in
+/// [`open`]. The folder check has already run at the call site (`Ctrl-X f` in
 /// `update`). No draft card: the preview shows the real session being forked.
 pub fn open_fork(app: &mut App, session_id: String) {
     app.open_compose(ComposeState::new_fork(session_id), None);
@@ -1151,7 +1151,7 @@ fn submit_bg_launch(
 /// hand-off through [`super::update::launch_fork_run`] and [`crate::resume`]'s
 /// `ForkRun` action, `claude -r <id> --fork-session --name <name> [--model <alias>
 /// [--effort <level>] | --effort <level>] [<message>]`. An empty box with no pick and
-/// no carried effort is the old `Ctrl-F` plus `--name "fork: <the session's label>"`. The message AUTO-SUBMITS as a
+/// no carried effort is the plain `claude -r <id> --fork-session` plus `--name "fork: <the session's label>"`. The message AUTO-SUBMITS as a
 /// trailing positional, like a new session's prompt (probed for `-r
 /// --fork-session` at claude 2.1.291 on 2026-10-08; `docs/agents/CLAUDE_CLI.md`).
 ///
@@ -1177,7 +1177,7 @@ fn open_interactive(app: &mut App) -> Outcome {
         return Outcome::Continue;
     }
     // An empty / whitespace draft launches with NO positional, which is exactly what
-    // the picker's own `Ctrl-O` (and, for a fork, plain `Ctrl-F`) always emitted; a
+    // the picker's own `Ctrl-O` (and an untouched fork box's) always emitted; a
     // fork is still named, from the session's label.
     let prompt = (!message.trim().is_empty()).then_some(message);
     match target {
@@ -3210,7 +3210,7 @@ mod tests {
     }
 
     /// `Ctrl-O` in the fork box forks interactively: an untouched box is
-    /// `claude -r <id> --fork-session` (what `Ctrl-F` always handed off) named after
+    /// `claude -r <id> --fork-session` (what a fork has always handed off) named after
     /// the session's label, a typed one is named after its first line and adds the
     /// message, and a pick adds `--model`/`--effort` BEFORE the message with the
     /// model-worded non-zero hint.

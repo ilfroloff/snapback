@@ -43,7 +43,7 @@ KEYS:
                   or a Ctrl-N card hiding it they move as usual
     Enter         resume (returns to the board on exit). Refused on a session
                   snapback is still sending a reply to, or still making as a
-                  fork from the Ctrl-F box's Enter, until it lands (the session
+                  fork from the Ctrl-X f box's Enter, until it lands (the session
                   a fork came from still resumes), and on one Ctrl-X w is still
                   moving
     ←/→           move the search query's cursor one character (the list and
@@ -58,20 +58,6 @@ KEYS:
                   1:0 (starts at 1:1; Shift+← toward a full-width preview, Shift+→
                   toward a full-width list; a press at either end does nothing).
                   Always bound, query or not; the preview keeps your place
-    Ctrl-F        fork the selected session: opens a fork box (after the folder
-                  check; a deleted folder is refused before you type). Enter forks
-                  it without leaving the board, like a quick reply, and the
-                  cursor opens the fold and jumps to the fork when it appears if
-                  you haven't moved and nothing else is open (another box, a
-                  picker or a prompt); Ctrl-O forks it interactively (an empty box
-                  is a plain fork, plus --effort when the session's last turn
-                  recorded one; the message auto-submits), Ctrl-L picks the
-                  model, Ctrl-J or Alt+Enter newline, Esc cancels, and / or @
-                  opens the pick list (below). Either way the fork is named
-                  'fork: <first line of the message>' ('fork: <session label>'
-                  for an empty box) and folds under the session it came from.
-                  The headless fork can't answer permission prompts, like a
-                  reply
     Ctrl-A        flip scope: current folder ↔ project (the repo you launched in
                   and all of its git worktrees). Launched with -a it is a
                   three-stop cycle instead: current folder → project → all
@@ -93,8 +79,22 @@ KEYS:
                   r is the force, for a row that looks stale)
                   · y copy session ID (the selected session's full id; it also
                   shows on the status line)
-                  · f fold / expand the selected row's fork lineage (a row marked
-                  (+N) stands for more)
+                  · f fork the selected session: opens a fork box (after the
+                  folder check; a deleted folder is refused before you type).
+                  Enter forks it without leaving the board, like a quick reply,
+                  and the cursor opens the fold and jumps to the fork when it
+                  appears if you haven't moved and nothing else is open
+                  (another box, a picker or a prompt); Ctrl-O forks it
+                  interactively (an empty box is a plain fork, plus --effort
+                  when the session's last turn recorded one; the message
+                  auto-submits), Ctrl-L picks the model, Ctrl-J or Alt+Enter
+                  newline, Esc cancels, and / or @ opens the pick list
+                  (below). Either way the fork is named 'fork: <first line of
+                  the message>' ('fork: <session label>' for an empty box) and
+                  folds under the session it came from. The headless fork
+                  can't answer permission prompts, like a reply
+                  · z fold / expand the selected row's fork lineage (a row
+                  marked (+N) stands for more)
                   · w move the session to another worktree of this project (or
                   back to the main folder); the board stays up and the status
                   line says where it went. A session claude lists as active, or
@@ -102,7 +102,7 @@ KEYS:
                   refused, and so is any move while claude cannot be asked
                   whether it is active (claude agents --json fails). While the
                   move runs (under a second) the row reads moving… and refuses
-                  Enter, Ctrl-F, Ctrl-R, Ctrl-X d and another Ctrl-X w. On a
+                  Enter, Ctrl-X f, Ctrl-R, Ctrl-X d and another Ctrl-X w. On a
                   stack's top row you then pick this session or its whole
                   lineage: a lineage moves one session at a time, skips one
                   snapback is still replying to, forking or moving, stops at a
@@ -130,7 +130,7 @@ KEYS:
                   interrupted or unrecognized agent, or a session claude reports
                   with no job to stop, is refused — try Ctrl-K or Fork instead.
                   While a session's own reply is still being sent (or, on a
-                  fork from the Ctrl-F box's Enter, the fork itself), or the
+                  fork from the Ctrl-X f box's Enter, the fork itself), or the
                   session is being moved (Ctrl-X w), Ctrl-R on that session is
                   refused until it lands; other rows can still reply
                   (Enter sends, Ctrl-L picks the model, Ctrl-J or Alt+Enter

@@ -11,7 +11,7 @@
 //! a single visible head. It is presentation-only: [`fold`] hides indices from a
 //! display list, and nothing here can drop a session.
 //!
-//! A fork snapback makes — from the `Ctrl-F` box or the Attach/Fork/Cancel
+//! A fork snapback makes — from the `Ctrl-X f` box or the Attach/Fork/Cancel
 //! choice — joins its parent's lineage the same way (it copies the root record
 //! too), but it is NEW work hanging off that parent rather than the parent's
 //! continuation. snapback names every such fork
@@ -35,7 +35,7 @@ use time::OffsetDateTime;
 
 use super::{label, Session};
 
-/// The prefix the `Ctrl-F` fork box puts at the front of every fork's `--name`
+/// The prefix the `Ctrl-X f` fork box puts at the front of every fork's `--name`
 /// (`resume::fork_name`), and the ONE marker [`head_of`] reads to tell such a fork
 /// from the conversation it was forked from ([`is_fork_name`]).
 ///
@@ -296,7 +296,7 @@ fn newest_of(sessions: &[Session], members: &[usize]) -> Option<usize> {
 /// ([`is_fork_name`]), tie-broken by `session_id` ascending — [`member_rank`] over
 /// those members. When every member is a named fork, the newest member of all.
 ///
-/// Named forks are skipped because a fork made from the `Ctrl-F` box is new work
+/// Named forks are skipped because a fork made from the `Ctrl-X f` box is new work
 /// hanging off its parent, and it is newer than the parent from the moment it
 /// exists: newest-as-head would hand the parent's row to whichever fork ran last
 /// and bury the conversation they all came from. A background copy claude makes
@@ -967,7 +967,7 @@ mod tests {
         );
     }
 
-    // --- forks named by the `Ctrl-F` box ------------------------------------
+    // --- forks named by the `Ctrl-X f` box ------------------------------------
 
     /// The marker is the prefix, exactly. Claude's own background copies are named
     /// otherwise and must never read as a fork.

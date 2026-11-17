@@ -996,7 +996,7 @@ pub const MODEL_SETTINGS_TAG: &str = "(settings)";
 /// the box no height.
 pub const MODEL_PICKER_REPLY_MESSAGE: &str = "Model for this reply only (←/→ effort):";
 
-/// The model picker's prompt line when opened from a `Ctrl-F` FORK box: the pick is
+/// The model picker's prompt line when opened from a `Ctrl-X f` FORK box: the pick is
 /// for this fork alone, and the original session is untouched. Same one-line budget
 /// as [`MODEL_PICKER_REPLY_MESSAGE`].
 pub const MODEL_PICKER_FORK_MESSAGE: &str = "Model for this fork only (←/→ effort):";
@@ -1624,7 +1624,7 @@ fn on_screen_lineage(
         .filter(|group| group.len() > 1)
 }
 
-/// What `Ctrl-X f` does to the selected row's fork lineage — the decision
+/// What `Ctrl-X z` does to the selected row's fork lineage — the decision
 /// [`App::toggle_selected_lineage`] carries out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LineageToggle {
@@ -1636,7 +1636,7 @@ enum LineageToggle {
     Nothing,
 }
 
-/// Decide the `Ctrl-X f` toggle from the two facts the list holds about the
+/// Decide the `Ctrl-X z` toggle from the two facts the list holds about the
 /// selected row: whether it is a head currently standing in for folded members
 /// (`folded_head`, an entry in the fold's `hidden` map), and how many members of
 /// its lineage are on screen (`visible_members`, `0` with no lineage at all).
@@ -2533,7 +2533,7 @@ pub struct App {
     pub modal: Option<Modal>,
     /// The open compose editor, if any. `Some` while the compose modal owns the
     /// keyboard — for ANY of its targets: a quick reply (`Ctrl-R` on an idle
-    /// session), a fork (`Ctrl-F`) or a new background agent (`Ctrl-N`), told
+    /// session), a fork (`Ctrl-X f`) or a new background agent (`Ctrl-N`), told
     /// apart by its [`ComposeTarget`](super::compose::ComposeTarget). Its type
     /// ([`super::compose::ComposeState`]) holds the MULTILINE
     /// `ratatui_textarea` editor — one of exactly TWO `ratatui_textarea` values
@@ -2590,7 +2590,7 @@ pub struct App {
     /// ([`clear_moving`](Self::clear_moving)), on this board or, through
     /// [`undelivered`](Self::undelivered), the next one. While an id is here
     /// snapback's own `claude` child may be moving and appending to its
-    /// transcript, so `Enter`, `Ctrl-F`, `Ctrl-R`, `Ctrl-X d` and a second
+    /// transcript, so `Enter`, `Ctrl-X f`, `Ctrl-R`, `Ctrl-X d` and a second
     /// `Ctrl-X w` refuse that row ([`moving_on`](Self::moving_on)), and the row
     /// wears a `moving…` badge (`view`). A fact true over an interval, so typed
     /// state, never the status line.
@@ -2839,7 +2839,7 @@ pub struct App {
     pub show_hidden: bool,
     /// Whether a `Ctrl-X` leader chord is pending — the moment between the leader
     /// keypress and its follow-up (`x` hide, `d` hard-delete, `h` show-hidden,
-    /// `r` forced rescan, `y` copy session ID, `f` fold / expand the selected
+    /// `r` forced rescan, `y` copy session ID, `f` fork box, `z` fold / expand the selected
     /// row's lineage, `w` open the move picker, `↓` open a subagent's transcript
     /// in the preview, or leave it, anything else cancels). While `true`
     /// the view draws the which-key hint and
@@ -2929,7 +2929,7 @@ pub struct App {
     /// ([`set_selected`](Self::set_selected) drops it): `↑`/`↓` while the open view
     /// is hidden, the mouse wheel over the list, a search edit, `Tab` or `Ctrl-A`
     /// that filters the row out, `Ctrl-X x` or `Ctrl-X h` hiding it, `Ctrl-X d` or
-    /// `Ctrl-X w` taking it off the board, `Ctrl-X f` from a `↳` row, a reload that
+    /// `Ctrl-X w` taking it off the board, `Ctrl-X z` from a `↳` row, a reload that
     /// drops the row, and the cursor following a headless fork onto its new row.
     subagent_view: Option<SubagentView>,
     /// The SELECTED session's subagents as the background refresh last read them
@@ -3661,7 +3661,7 @@ impl App {
     }
 
     /// Fold the selected row's lineage if it is open, open it if the row is a
-    /// folded `(+N)` head, and otherwise do nothing — the `Ctrl-X f` chord verb.
+    /// folded `(+N)` head, and otherwise do nothing — the `Ctrl-X z` chord verb.
     pub fn toggle_selected_lineage(&mut self) {
         let folded_head = self
             .selected_index()
@@ -13178,7 +13178,7 @@ mod tests {
         );
     }
 
-    // --- the `Ctrl-X f` lineage toggle -------------------------------------
+    // --- the `Ctrl-X z` lineage toggle -------------------------------------
 
     /// The toggle's decision, over every shape of the two facts it reads: a folded
     /// head opens, a lineage with more than one member on screen folds, and a lone
