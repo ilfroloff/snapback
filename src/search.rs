@@ -203,7 +203,8 @@
 //!
 //! One rule here belongs to the compose pick list ALONE:
 //! [`word_start_hit`](SearchIndex::word_start_hit), which `tui::complete` asks of
-//! an `@` file or folder's own NAME when the substring parts rejected it. The
+//! a `/` command's, an agent's or an `@` file or folder's own NAME when the
+//! substring parts rejected it. The
 //! query matches when it can be consumed as consecutive chunks, each a PREFIX of
 //! a word of the name, on words in order — `calis` is `Ca` + `Lis` of
 //! `CategoryListings.tsx`. Its smart case is the substring parts' own, decided
