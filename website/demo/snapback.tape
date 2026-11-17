@@ -87,11 +87,11 @@ Down 6
 Sleep 800ms
 Ctrl+X
 Sleep 300ms
-Type "f"
+Type "z"
 Sleep 2s
 Ctrl+X
 Sleep 300ms
-Type "f"
+Type "z"
 Sleep 1.2s
 
 # --- Scene 7: move a main-checkout session into its worktree (Ctrl-X w) ---
@@ -106,10 +106,12 @@ Sleep 800ms
 Enter
 Sleep 3.5s
 
-# --- Scene 8: fork headless (Ctrl-F), a command from the / pick list ---
+# --- Scene 8: fork headless (Ctrl-X f), a command from the / pick list ---
 Down 3
 Sleep 800ms
-Ctrl+F
+Ctrl+X
+Sleep 300ms
+Type "f"
 Sleep 1.2s
 Type "/"
 Sleep 2s

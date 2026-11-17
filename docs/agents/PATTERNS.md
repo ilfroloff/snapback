@@ -1005,7 +1005,7 @@ needs no flag: the board session owns that channel's only sender, so the
 worker's `recv` is guaranteed to fail when the session drops it — the subagent
 refresh below is the instance. The quick-reply send (`send::spawn_send`) is the
 reference instance: a **one-shot** detached thread — spawned per `Ctrl-R` send or
-`Ctrl-F` headless fork, not a poller — that runs the multi-second `claude -p` child to completion and delivers a
+`Ctrl-X f` headless fork, not a poller — that runs the multi-second `claude -p` child to completion and delivers a
 single `AppEvent::SendFinished`. It mirrors `resume::open_url` (fire-and-forget off
 the render loop), never `resume::launch` (which spawns+waits after a teardown), so
 the board keeps drawing while the child runs. The pure send DECISION is returned as
@@ -1207,7 +1207,7 @@ indefinitely, so the gate's answer has no bounded freshness at all. **Nothing
 hands off on polled data; the poll draws badges.** Fork is the deliberate
 exception that proves the shape: it has no liveness question to ask (a fork works
 live or finished), so it must NOT be dragged behind the probe — it is the route
-the not-live refusal points at. Neither the `Ctrl-F` box nor either of its runs
+the not-live refusal points at. Neither the `Ctrl-X f` box nor either of its runs
 asks.
 
 The **second** allowed one-shot is `worktrees::resolve` (`git -C <dir> worktree
@@ -1300,7 +1300,7 @@ top-level `@` fills, so it adds no folder of its own). They run from
 since every read is keyed to a token a key handler already resolved — and NEVER
 from the render path, which only reads the cached `visible` list. claude's own
 list is not one of them: it is the event-delivering fetch above. The fork box adds
-two of the same class on its own keys: `Ctrl-F` runs the fork's folder check
+two of the same class on its own keys: `Ctrl-X f` runs the fork's folder check
 (`resume::check`) before the box opens, as `Enter` always has, and its `Enter`
 reads 16 bytes of `/dev/urandom` (`send::fresh_session_id`) beside the
 `plan_send` re-read a reply already makes.
@@ -1674,7 +1674,7 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    `Ctrl-X` leader chord (while
    `App.pending_chord` is set, `chord_key` routes the next key — `x` hide, `d`
    delete-confirm, `h` show-hidden, `r` forced full store re-read, `y` copy
-   session ID, `f` fold / expand the selected row's lineage, `w` open the
+   session ID, `f` open the fork box, `z` fold / expand the selected row's lineage, `w` open the
    move-to-worktree picker, `↓` open the subagent view or leave it, `?` open the
    key map, anything else cancels), the "stop the
    waiting agent?" confirmation via `App.pending_stop` (a plain Enter/Esc gate
@@ -1863,7 +1863,7 @@ that feeds `Ctrl-X` then the letter through `handle_event`. Its verb also has to
 fit `view::chord_hint`, whose widest form is budgeted against an 80-column help
 row — the COLUMN BUDGET note there says how to pay for a new one. The one
 exception is `?` (`ChordOutcome::KeyMap`): bound, pinned and listed in every key
-map, but NOT in `chord_hint`, whose line is already exactly 80 columns; the board
+map, but NOT in `chord_hint`, whose widest form is 79 of the 80 columns, too full for it; the board
 hint's `F1 keys` points at the same modal in most terminals; where F1 does not
 arrive (GNOME Terminal keeps it, a Mac laptop needs `Fn`), `Ctrl-X ?` is found
 through `sb --help`, `docs/GUIDE.md` or the key map itself.
@@ -1946,7 +1946,7 @@ outside it they move the caret with or without a query; while it is on screen th
 session's subagents, query or not — the accepted trade, since the `Alt` and
 `Ctrl` word hops, whose arms sit above theirs, still move the caret by word
 (`the_plain_arrows_step_subagents_only_while_the_view_is_on_screen_and_modified_ones_keep_their_meaning`).
-The lineage fold is the `Ctrl-X f` chord verb, so caret movement and folding
+The lineage fold is the `Ctrl-X z` chord verb, so caret movement and folding
 never share a key. Prefer
 `Shift`+key over `Alt`+key for anything new here: snapback never pushes the kitty
 keyboard protocol and clears it on every board (re)entry
@@ -2166,7 +2166,7 @@ Tests are **inline** `#[cfg(test)] mod tests` at the bottom of each source file
   cwd, a sidecar (no `cwd`), a nested subagent, a **background-fork pair**
   (two files sharing one tree root, `cwd`, branch and label — the duplicate-row
   shape) joined by a **named fork** (`sess-fork-named-1`: the same root, and the
-  `custom-title` `fork: …` the `Ctrl-F` box's `--name` writes — twice, each
+  `custom-title` `fork: …` the `Ctrl-X f` box's `--name` writes — twice, each
   beside an `agent-name` with the same text, as claude 2.1.291 did, and no
   `sessionKind` — the lineage's NEWEST member, which must still not take the head),
   a **root-less** session (no `parentUuid: null` record), four

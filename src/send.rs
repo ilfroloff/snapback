@@ -100,7 +100,7 @@ use crate::watch::AppEvent;
 /// refuses that second kind ([`crate::resume::ATTACH_NO_JOB_ID`]), so the hint led
 /// to a second refusal. It now names:
 ///
-/// * Fork (`Ctrl-F`), which works on either kind;
+/// * Fork (`Ctrl-X f`), which works on either kind;
 /// * `Ctrl-K`, which has a route for both: `claude stop` for a job id, a confirmed
 ///   SIGTERM for a reported `pid` (see [`interrupt_gate`]). It is offered with
 ///   "Try", never promised, because a record with neither handle is still refused
@@ -113,10 +113,10 @@ use crate::watch::AppEvent;
 /// every world" shape.
 pub const SEND_LIVE_REFUSED: &str =
     "claude reports this session as a running agent, so it won't resume it in place. \
-     Try Ctrl-K to stop it, or Fork (Ctrl-F) to branch a copy.";
+     Try Ctrl-K to stop it, or Fork (Ctrl-X f) to branch a copy.";
 
 /// Refusal shown when `Ctrl-R` is pressed on a session snapback is STILL sending a
-/// quick reply to — or on a fork whose headless `claude -p` (the `Ctrl-F` box's
+/// quick reply to — or on a fork whose headless `claude -p` (the `Ctrl-X f` box's
 /// `Enter`, in flight under the FORK's id) is still running, so the words name
 /// both.
 ///
@@ -749,7 +749,7 @@ pub fn build_send_argv(
     argv
 }
 
-/// Build the `claude` argv for the `Ctrl-F` box's one-shot fork:
+/// Build the `claude` argv for the `Ctrl-X f` box's one-shot fork:
 /// `claude -p -r <origin> --fork-session --session-id <fork> --name <name>
 /// --output-format json [--model <alias> [--effort <level>] | --effort <level>]
 /// <message>`.
@@ -1139,7 +1139,7 @@ pub(crate) fn sanitize_status(s: &str) -> String {
 /// It exists because the channel a completion reports on lasts ONE board session
 /// and the state it clears does not. `tui::run_inner` builds a new
 /// [`crate::watch::EventLoop`] per board session and drops the old receiver at
-/// every hand-off (Enter, `Ctrl-F`, Attach, `Ctrl-O`), while `lib::run` re-enters
+/// every hand-off (Enter, `Ctrl-X f`, Attach, `Ctrl-O`), while `lib::run` re-enters
 /// the board on the SAME `App`. A quick reply's `claude -p` child routinely
 /// outlives that seam, and its [`AppEvent::SendFinished`] is the ONLY thing that
 /// clears that session's `App::sending` entry. A lost one left the entry standing
@@ -2844,12 +2844,24 @@ mod tests {
                 "cannot be signalled",
             ),
             ("SEND_LIVE_REFUSED", SEND_LIVE_REFUSED, "Ctrl-K"),
-            ("SEND_LIVE_REFUSED", SEND_LIVE_REFUSED, "Ctrl-F"),
+            ("SEND_LIVE_REFUSED", SEND_LIVE_REFUSED, "Ctrl-X f"),
             ("ATTACH_NO_JOB_ID", attach_no_job_id, "no attachable job"),
-            ("ATTACH_NO_JOB_ID", attach_no_job_id, "Ctrl-F"),
+            ("ATTACH_NO_JOB_ID", attach_no_job_id, "Ctrl-X f"),
         ] {
             if !copy.contains(required) {
                 violations.push(format!("{name} must say {required:?}: {copy:?}"));
+            }
+        }
+        // `Ctrl-F` no longer forks; fork is the `Ctrl-X f` chord verb.
+        for (name, copy) in [
+            ("SEND_LIVE_REFUSED", SEND_LIVE_REFUSED),
+            ("RESUME_NONZERO_HINT", crate::resume::RESUME_NONZERO_HINT),
+            ("RESUME_RACE_STATUS", crate::resume::RESUME_RACE_STATUS),
+            ("ATTACH_NO_JOB_ID", attach_no_job_id),
+            ("ATTACH_NOT_LIVE", crate::resume::ATTACH_NOT_LIVE),
+        ] {
+            if copy.contains("Ctrl-F") {
+                violations.push(format!("{name} names the find key as fork: {copy:?}"));
             }
         }
         // A pid IS on the record `INTERRUPT_PID_UNUSABLE` answers, so it must never

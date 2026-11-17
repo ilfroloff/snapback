@@ -125,7 +125,7 @@ one place.
   `src/tui/app.rs`)
 - **A MODEL IS PICKED PER COMPOSE, NEVER PER BOARD.** `--model` reaches `claude`
   ONLY from an explicit `Ctrl-L` pick inside a compose box, and only on that
-  compose's own launch: the `Ctrl-R` quick reply, the `Ctrl-F` fork box's
+  compose's own launch: the `Ctrl-R` quick reply, the `Ctrl-X f` fork box's
   headless `Enter` / `Ctrl-O` run, or the `Ctrl-N` draft's `--bg` launch /
   `Ctrl-O` run. Resume (`Enter`), Attach, the Attach/Fork/Cancel choice's Fork
   and Move (`Ctrl-X w`, a headless `set_cwd` control request, no model turn)
@@ -215,7 +215,7 @@ one place.
 - **DRIVE `claude` HEADLESSLY; HAND OVER THE TERMINAL ONLY TO PUT THE USER IN
   IT.** When snapback needs `claude` to PERFORM an operation on a session or
   folder — the `Ctrl-X w` move (`set_cwd`), the `Ctrl-R` reply (`claude -p -r`),
-  the `Ctrl-F` fork box's `Enter` (`claude -p -r … --fork-session`), the `Ctrl-K`
+  the `Ctrl-X f` fork box's `Enter` (`claude -p -r … --fork-session`), the `Ctrl-K`
   stop (`claude stop`), the compose pick list's catalog
   (`initialize`), the `Ctrl-N` draft's background launch (`claude --bg`) — drive
   it HEADLESSLY: a `-p`, control-request, subcommand or `--bg` child with no TTY,
@@ -223,7 +223,7 @@ one place.
   NEVER open an interactive `claude` to run an operation. An interactive hand-off
   (`Outcome::Resume`, the terminal handed over) is reserved for actions whose
   purpose IS to put the user into claude — `Enter` resume, Attach, the
-  Attach/Fork/Cancel choice's Fork, and the `Ctrl-O` runs (the `Ctrl-F` fork
+  Attach/Fork/Cancel choice's Fork, and the `Ctrl-O` runs (the `Ctrl-X f` fork
   box's, the `Ctrl-N` draft's and the agent picker's) — and for a
   prompt only claude may show, such as its workspace-trust dialog. snapback NEVER
   fakes such a prompt's answer: it never sends `set_cwd`'s `trust_accepted`, and a
@@ -380,7 +380,7 @@ one place.
   or removes one of the flags the README's quick start shows (`-p`, `-a`). A key
   every compose box shares (`Ctrl-L`, `/` or `@`) is ONE shared "in a compose
   box" entry in each key map — the `update.rs` table, `KEYS`, `docs/GUIDE.md` —
-  that the `Ctrl-R`, `Ctrl-F` and `Ctrl-N` entries point to, never copies.
+  that the `Ctrl-R`, `Ctrl-X f` and `Ctrl-N` entries point to, never copies.
   The help line is ONE row, cut rather than wrapped: the board keymap,
   `chord_hint`, the reply hint, `FORK_HINT` and `COMPLETION_HINT` are
   column-budgeted to fit 80 whole (each pinned by a test), while `BG_DRAFT_HINT`

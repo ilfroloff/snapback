@@ -47,18 +47,17 @@
 //! | `Left` / `Right` (in the subagent view, on screen) | switch the preview to the previous / next subagent of the selected session in LAUNCH ORDER — its transcript's first timestamp, one with none last — wrapping round at both ends: every subagent it launched, at any depth, finished ones too (`Up` / `Down` step only the running ones). The view's title ends with where it stands (`… · 2/5`). Bound whenever the view is on screen, EVEN WITH A QUERY TYPED — the accepted trade: there the caret moves only by word (the next row). A subagent the record does not list yet (a click opened it before its meta file was read) counts as the newest launch: `Right` wraps to the first, `Left` lands on the last. Refused on a sticky status line while the session's subagents are still being read, or when none are listed (see [`App::step_subagent_view`]) |
 //! | `Alt-Left` / `Alt-Right`, `Alt-b` / `Alt-f`, `Ctrl-Left` / `Ctrl-Right` | move the search query's caret one WORD back / forward (always) — the widget's own word hop (see [`App::move_query_caret_by_word`]), so forward lands on the START of the next word, as in the reply box. Not a query change either. Three pairs because `⌥←` / `⌥→` reaches the board as `CSI 1;3D` / `C` or as `ESC b` / `ESC f` depending on the terminal, and `Ctrl-Left` / `Ctrl-Right` is the non-`Alt` twin; `Alt-b` / `Alt-f` and `Ctrl-Left` / `Ctrl-Right` are also the pairs the compose box hops words on |
 //! | `Enter` | resume the selected session. Refused, before the liveness probe, while snapback's own `claude -p` child is still writing that session — a quick reply to it, or on a fork's row the headless fork creating it (see [`send::resume_in_flight_refusal`]) — and while its own `Ctrl-X w` move of that session is still in flight (see [`App::moving_on`]). A reply or fork in flight on another row refuses nothing here, and neither does a headless fork on the row it was forked from, which its child only reads |
-//! | `Ctrl-F` | fork the selected session: opens a fork compose box after the move and folder checks (refused, like `Enter`, while snapback's own `Ctrl-X w` move of that session is still in flight; a deleted folder is refused before you type; no live-agent check, claude skips it for a fork). `Enter` forks it headless without leaving the board (`claude -p -r <id> --fork-session --session-id <new> --name <name>`, like a quick reply — once the fork appears, folded under the session it came from, the cursor expands that lineage and jumps to it, if you have not moved and nothing owns the keyboard — see [`App::keyboard_owned`]), `Ctrl-O` forks it interactively (an empty box with no pick is the plain `claude -r <id> --fork-session` plus its `--name`, plus `--effort <level>` when the session's last turn recorded a known one — see the `Ctrl-L` row), `Ctrl-L` picks the model for that fork, `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels. Both name the fork `fork: <first line of the message>` (`fork: <the session's label>` for an empty `Ctrl-O`; see `resume::fork_name`), which keeps the session heading its forks (`lineage::head_of`). The Attach/Fork/Cancel choice's Fork hands off exactly the argv of an empty `Ctrl-O` with no pick only while the session has no carried effort (otherwise that `Ctrl-O` adds `--effort <level>`), and never carries a model or an effort. In the box `/` and `@` open the pick list (the `/` or `@` row below), which claims `Enter` and `Esc` while it is open |
 //! | `Ctrl-N` | start a new session in the launch directory. When agents are defined a picker opens first and `Enter` on a pick opens a draft pane for the session's first message; with none defined that draft opens straight away. In the draft, `Enter` starts a BACKGROUND agent without leaving the board, `Ctrl-O` runs it interactively instead, `Esc` cancels; `/` and `@` open the pick list (the `/` or `@` row below), which claims `Enter` and `Esc` while it is open |
 //! | `Ctrl-O` (in the agent picker) | start the highlighted agent INTERACTIVELY at once, skipping the draft — the same verb `Ctrl-O` names inside the draft, so BOTH routes out of the picker cost exactly one key. Bound on the picker alone — inert on every other modal |
 //! | `Ctrl-R` | quick-reply: send a one-shot message to the selected session without leaving the board. An agent whose run is OVER (`done` / `stopped` / `failed`) is stopped first so the reply lands in place; `needs input` confirms first; `working` / `idle` / `interrupted` / an unrecognized qualifier is refused, and so is a session claude reports with no stoppable job id — the refusal points at `Ctrl-K` or Fork (see [`send::reply_gate`]). While this session's OWN reply is still in flight (on a fork's row, the headless fork making it — its `claude -p` child is recorded under the fork's id), `Ctrl-R` on it is refused before any of the above (see [`send::reply_in_flight_refusal`]), and so it is while its `Ctrl-X w` move is; a reply or a move still in flight on another row refuses nothing here. In the box `/` and `@` open the pick list (the `/` or `@` row below), which claims `Enter` and `Esc` while it is open |
 //! | `Ctrl-K` | stop / interrupt the selected session's live agent, by whichever handle claude's record carries (see [`send::interrupt_gate`]). A stoppable job id → `claude stop`: an agent whose run is OVER (`done` / `stopped` / `failed`) stops at once, every other live agent confirms first. NO job id but a `pid` → confirm, then re-ask claude at `Enter` and send that pid a SIGTERM (never SIGKILL) only if claude still reports the same pid with no job id; a record that is gone, now carries a job id, or reports another pid refuses instead (see [`send::signal_plan`]). A session claude is not holding, or one it reports with neither a job id nor a pid — or with no job id and a pid no signal could take (`0`, past `i32::MAX`, or the board's own process id) — is refused |
 //! | `Tab` | toggle name-only vs. name+content search. Widening to content also opens the preview on the most recent match, exactly as typing does: it goes through the same query funnel, and the mode is the gate that key just opened |
 //! | `Ctrl-A` | flip the scope: current folder <-> project (the launch repo and all of its git worktrees). ONE key for both, because the second is a refinement of the same question the first answers, not a separate mode. Launched with `--all`/`-a` it becomes a three-stop cycle through all folders as well — the whole store is on this key only when the launch flag put it there |
-//! | `Ctrl-X` then `x`/`d`/`h`/`r`/`y`/`f`/`w`/`↓`/`?` | leader chord: hide (from a row that visibly stands for others — a folded `(+N)` head, or an expanded head with `↳` rows beneath it — that row and the members it stands for on screen, so the fold cannot re-head, while members off the board (filtered out by the query, out of scope, already hidden) stay as they are; any other row that session alone: a `↳` row, or a head whose other members are all off the board; un-hiding from such a head exposes every member it stands for, one hidden on its own included — see [`App::toggle_hidden_selected`]) / hard-delete (this row; on a multi-member lineage's HEAD row — the row not drawn `↳` — the confirm also offers its whole fork lineage, never on a `↳` row, and still on a head standing alone, since the confirm counts the lineage and discloses its hidden members; a member whose quick reply, headless fork or move snapback still has in flight is refused, see [`delete::can_delete_target`]) / toggle show-hidden / re-read every transcript from disk / copy session ID (the selected session's full id, to the clipboard; the id also shows on the status line) / fold or expand the selected row's fork lineage (fold an open one, open a folded `(+N)` head, nothing otherwise — see [`App::toggle_selected_lineage`]) / move the selected session to another worktree of the launch project (the parent folder included, its own folder omitted): opens a picker, see the next row; refused, with no picker, while that session's own move, quick reply or headless fork is still in flight / `↓` opens a subagent's own transcript in the preview — the SUBAGENT VIEW (the `◆ delegated to …` click row below) — on the first RUNNING subagent in launch order (unfinished and not failed, and it or a subagent it launched wrote in the last 10 minutes), else the most recently written one, and, pressed again in the view, leaves it as `Esc` does; a typed query stays. It reads no file: the selected session's subagents are read in the background whenever the selection moves or one of them writes, and `↓` refuses on a sticky status line while that read has not landed, or when the session has none (see [`App::open_subagent_target`]) / `?` opens the key-map modal (the terminal-independent twin of `F1`) (any other key cancels) |
-//! | `Enter` in the move picker | move the session to the chosen worktree; the board stays up. A worker thread re-reads the transcript, refuses a session claude lists as active — and, unlike every other gate, refuses too when claude cannot be asked (`claude agents --json` fails; see `crate::claude_move::liveness_refusal`) — then runs one headless `claude -p … -r <id>` in the session's current folder and sends it one `set_cwd` request (see `crate::claude_move`); the status line says `moved to <folder>`, or why not. While it runs the row wears `moving…` and refuses `Enter`, `Ctrl-F`, `Ctrl-R`, `Ctrl-X d` and another `Ctrl-X w`. On a multi-member lineage's HEAD row `Enter` first opens a `Move this` / `Move lineage (N)` / `Cancel` confirm, highlighted on `Cancel`, disclosing hidden members as the delete confirm does ([`App::open_move_scope_confirm`]); `Move this` is the move above. `Move lineage (N)` is BEST EFFORT: a member snapback is still replying to, forking or moving is skipped, the rest move one at a time on ONE worker, each through the same steps, the run stops at the first `needs_trust` (the target's verdict, shared by every member), every member wears `moving…` until the last finishes, and ONE sticky tally says how many moved and why the rest did not (see `crate::claude_move::status_for_lineage_move`). On a `↳` row or a lone session `Enter` moves at once |
-//! | `Ctrl-L` (in a compose box) | pick the model — and optionally the effort — for THIS compose only: the `Ctrl-R` reply, the `Ctrl-F` fork or the `Ctrl-N` draft it is pressed in (see [`compose::compose_key_to_action`]). The box's `model:` label names what it runs on: a reply's or fork's default is `session (<model>)`, or `session (<model> · <effort>)` when its last turn recorded a known effort, the model its session last answered with, which claude normally restores by itself (`default` when an `ANTHROPIC_MODEL` / `ANTHROPIC_DEFAULT_*_MODEL` override, or a transcript with no answering model, means it would not); a draft's is `default (<value>) (new sessions only)` from the user's `claude` settings. `--model` is sent ONLY for a pick other than that default — on the reply, the fork's `Enter` and `Ctrl-O` run, the draft's background launch and the draft's `Ctrl-O` run — and the default's own effort goes out alone as `--effort` on the first three, when the box shows one. The picker's first row returns to the default, `Enter` sets the highlighted row into the compose, `Esc` returns with the text and the previous pick intact. Every new compose starts at its default; nothing is remembered. `Enter` (resume), the Attach/Fork choice's Fork, Attach and the `Ctrl-X w` move never send a model or an effort |
+//! | `Ctrl-X` then `x`/`d`/`h`/`r`/`y`/`f`/`z`/`w`/`↓`/`?` | leader chord: hide (from a row that visibly stands for others — a folded `(+N)` head, or an expanded head with `↳` rows beneath it — that row and the members it stands for on screen, so the fold cannot re-head, while members off the board (filtered out by the query, out of scope, already hidden) stay as they are; any other row that session alone: a `↳` row, or a head whose other members are all off the board; un-hiding from such a head exposes every member it stands for, one hidden on its own included — see [`App::toggle_hidden_selected`]) / hard-delete (this row; on a multi-member lineage's HEAD row — the row not drawn `↳` — the confirm also offers its whole fork lineage, never on a `↳` row, and still on a head standing alone, since the confirm counts the lineage and discloses its hidden members; a member whose quick reply, headless fork or move snapback still has in flight is refused, see [`delete::can_delete_target`]) / toggle show-hidden / re-read every transcript from disk / copy session ID (the selected session's full id, to the clipboard; the id also shows on the status line) / fork the selected session: opens a fork compose box after the move and folder checks (refused, like `Enter`, while snapback's own `Ctrl-X w` move of that session is still in flight; a deleted folder is refused before you type; no live-agent check, claude skips it for a fork). `Enter` forks it headless without leaving the board (`claude -p -r <id> --fork-session --session-id <new> --name <name>`, like a quick reply — once the fork appears, folded under the session it came from, the cursor expands that lineage and jumps to it, if you have not moved and nothing owns the keyboard — see [`App::keyboard_owned`]), `Ctrl-O` forks it interactively (an empty box with no pick is the plain `claude -r <id> --fork-session` plus its `--name`, plus `--effort <level>` when the session's last turn recorded a known one — see the `Ctrl-L` row), `Ctrl-L` picks the model for that fork, `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels. Both name the fork `fork: <first line of the message>` (`fork: <the session's label>` for an empty `Ctrl-O`; see `resume::fork_name`), which keeps the session heading its forks (`lineage::head_of`). The Attach/Fork/Cancel choice's Fork hands off exactly the argv of an empty `Ctrl-O` with no pick only while the session has no carried effort (otherwise that `Ctrl-O` adds `--effort <level>`), and never carries a model or an effort. In the box `/` and `@` open the pick list (the `/` or `@` row below), which claims `Enter` and `Esc` while it is open / fold (`z`) or expand the selected row's fork lineage (fold an open one, open a folded `(+N)` head, nothing otherwise — see [`App::toggle_selected_lineage`]) / move the selected session to another worktree of the launch project (the parent folder included, its own folder omitted): opens a picker, see the next row; refused, with no picker, while that session's own move, quick reply or headless fork is still in flight / `↓` opens a subagent's own transcript in the preview — the SUBAGENT VIEW (the `◆ delegated to …` click row below) — on the first RUNNING subagent in launch order (unfinished and not failed, and it or a subagent it launched wrote in the last 10 minutes), else the most recently written one, and, pressed again in the view, leaves it as `Esc` does; a typed query stays. It reads no file: the selected session's subagents are read in the background whenever the selection moves or one of them writes, and `↓` refuses on a sticky status line while that read has not landed, or when the session has none (see [`App::open_subagent_target`]) / `?` opens the key-map modal (the terminal-independent twin of `F1`) (any other key cancels) |
+//! | `Enter` in the move picker | move the session to the chosen worktree; the board stays up. A worker thread re-reads the transcript, refuses a session claude lists as active — and, unlike every other gate, refuses too when claude cannot be asked (`claude agents --json` fails; see `crate::claude_move::liveness_refusal`) — then runs one headless `claude -p … -r <id>` in the session's current folder and sends it one `set_cwd` request (see `crate::claude_move`); the status line says `moved to <folder>`, or why not. While it runs the row wears `moving…` and refuses `Enter`, `Ctrl-X f`, `Ctrl-R`, `Ctrl-X d` and another `Ctrl-X w`. On a multi-member lineage's HEAD row `Enter` first opens a `Move this` / `Move lineage (N)` / `Cancel` confirm, highlighted on `Cancel`, disclosing hidden members as the delete confirm does ([`App::open_move_scope_confirm`]); `Move this` is the move above. `Move lineage (N)` is BEST EFFORT: a member snapback is still replying to, forking or moving is skipped, the rest move one at a time on ONE worker, each through the same steps, the run stops at the first `needs_trust` (the target's verdict, shared by every member), every member wears `moving…` until the last finishes, and ONE sticky tally says how many moved and why the rest did not (see `crate::claude_move::status_for_lineage_move`). On a `↳` row or a lone session `Enter` moves at once |
+//! | `Ctrl-L` (in a compose box) | pick the model — and optionally the effort — for THIS compose only: the `Ctrl-R` reply, the `Ctrl-X f` fork or the `Ctrl-N` draft it is pressed in (see [`compose::compose_key_to_action`]). The box's `model:` label names what it runs on: a reply's or fork's default is `session (<model>)`, or `session (<model> · <effort>)` when its last turn recorded a known effort, the model its session last answered with, which claude normally restores by itself (`default` when an `ANTHROPIC_MODEL` / `ANTHROPIC_DEFAULT_*_MODEL` override, or a transcript with no answering model, means it would not); a draft's is `default (<value>) (new sessions only)` from the user's `claude` settings. `--model` is sent ONLY for a pick other than that default — on the reply, the fork's `Enter` and `Ctrl-O` run, the draft's background launch and the draft's `Ctrl-O` run — and the default's own effort goes out alone as `--effort` on the first three, when the box shows one. The picker's first row returns to the default, `Enter` sets the highlighted row into the compose, `Esc` returns with the text and the previous pick intact. Every new compose starts at its default; nothing is remembered. `Enter` (resume), the Attach/Fork choice's Fork, Attach and the `Ctrl-X w` move never send a model or an effort |
 //! | `Left` / `Right` (in the model picker) | step the highlighted MODEL row's `--effort` down / up through unset → `low` → `medium` → `high` → `xhigh` → `max`, wrapping both ways; `Enter` then sets the model and the effort together into the compose. Inert on the picker's default row (no model, so no effort) and on every other list modal, so the agent picker keeps ignoring them; they never reach the board's search caret underneath |
-//! | `/` or `@` (in a compose box) | open the pick list — the SAME list in the `Ctrl-R` reply, the `Ctrl-F` fork and the `Ctrl-N` draft, which differ only in where it reads from (`compose::completion_source`). `/` as the draft's first character lists claude's skills and commands for the target's folder; `@` at the start of a word lists files and folders and, for a top-level `@` token only, agents, picked as `@agent-<name>`; a skill, command or agent carries its description. The list is claude's own, fetched once per folder per board off the UI thread (`compose::take_catalog_fetch`); until it lands `/` lists nothing in any box, while `@` lists files and folders at once, a reply's or fork's agents come from its transcript and a draft's wait for the catalog. While the list is open `Up` / `Down` choose, `Enter` / `Tab` pick (a folder reopens the list one level down) and `Esc` closes only the list, never the draft (see [`compose::compose_key_to_action`]) |
+//! | `/` or `@` (in a compose box) | open the pick list — the SAME list in the `Ctrl-R` reply, the `Ctrl-X f` fork and the `Ctrl-N` draft, which differ only in where it reads from (`compose::completion_source`). `/` as the draft's first character lists claude's skills and commands for the target's folder; `@` at the start of a word lists files and folders and, for a top-level `@` token only, agents, picked as `@agent-<name>`; a skill, command or agent carries its description. The list is claude's own, fetched once per folder per board off the UI thread (`compose::take_catalog_fetch`); until it lands `/` lists nothing in any box, while `@` lists files and folders at once, a reply's or fork's agents come from its transcript and a draft's wait for the catalog. While the list is open `Up` / `Down` choose, `Enter` / `Tab` pick (a folder reopens the list one level down) and `Esc` closes only the list, never the draft (see [`compose::compose_key_to_action`]) |
 //! | `Shift-Left` / `Shift-Right` | step the pane layout one stop toward a full-width preview / a full-width list, along `0:1 · 1:3 · 1:1 · 3:1 · 1:0` (list:preview; the board starts at `1:1`). A press at either end does nothing. Always — with or without a query, and whatever is marked. The step keeps the reader's place in the preview; leaving `1:0` opens it on the newest turn (see [`App::set_pane_layout`]) |
 //! | `PgUp` / `PgDn` | scroll the preview a page (always) |
 //! | `Ctrl-U` / `Ctrl-D` | scroll the preview a quarter page (always) |
@@ -69,7 +68,7 @@
 //! | printable char | type-to-search (insert at the query's caret) |
 //! | terminal paste | inserted as TEXT — never as keystrokes (see below). A compose paste is cut at `send::COMPOSE_PROMPT_MAX_BYTES`; a draft over it is refused, box kept, on `Enter` in every box and on `Ctrl-O` in the fork box and the draft (`compose::refuse_too_long`) |
 //! | mouse: click a folded node's header | unfold the node — a subagent's hand-back (`◆ message from`) or context claude injected (`◇`) — where it sits, and a second click folds it back; a click on a header toggles its node and never opens a link. On the RELEASE, like a link, and ahead of one (see [`click_effect`]). Works while a quick reply or fork box is open, like every pointer action over the transcript but the `◆ delegated to …` switch below |
-//! | mouse: click a `◆ delegated to …` line | switch the preview to that subagent's OWN transcript — the SUBAGENT VIEW: the pane's title names the subagent, its pinned row names the subagent's turn, it takes no search marks, and it updates as the subagent writes. A `◆ delegated to …` line inside it switches to that nested subagent. `Esc` or `Ctrl-X ↓` again goes back to the session's own transcript where it was scrolled; `Ctrl-R` and `Ctrl-F` leave it too, and so does ANY change of the selected session (`App::set_selected`): `Up` / `Down` while the open view is hidden, the mouse wheel over the list, a search edit, `Tab` or `Ctrl-A` that filters the row out, `Ctrl-X x` or `Ctrl-X h` hiding it, `Ctrl-X d` or `Ctrl-X w` taking it off the board, `Ctrl-X f` from a `↳` row, a reload that drops the row, and the cursor following a headless fork onto its new row. Only this click, `Ctrl-X ↓`, `Left` / `Right` and `Up` / `Down` inside the view open it — no search key does (see [`App::open_subagent_view`]). On the RELEASE, like a link. Refused, on a sticky status line, while a quick reply or fork box is open: what the box sends lands in the session, so the pane keeps showing the session's own transcript |
+//! | mouse: click a `◆ delegated to …` line | switch the preview to that subagent's OWN transcript — the SUBAGENT VIEW: the pane's title names the subagent, its pinned row names the subagent's turn, it takes no search marks, and it updates as the subagent writes. A `◆ delegated to …` line inside it switches to that nested subagent. `Esc` or `Ctrl-X ↓` again goes back to the session's own transcript where it was scrolled; `Ctrl-R` and `Ctrl-X f` leave it too, and so does ANY change of the selected session (`App::set_selected`): `Up` / `Down` while the open view is hidden, the mouse wheel over the list, a search edit, `Tab` or `Ctrl-A` that filters the row out, `Ctrl-X x` or `Ctrl-X h` hiding it, `Ctrl-X d` or `Ctrl-X w` taking it off the board, `Ctrl-X z` from a `↳` row, a reload that drops the row, and the cursor following a headless fork onto its new row. Only this click, `Ctrl-X ↓`, `Left` / `Right` and `Up` / `Down` inside the view open it — no search key does (see [`App::open_subagent_view`]). On the RELEASE, like a link. Refused, on a sticky status line, while a quick reply or fork box is open: what the box sends lands in the session, so the pane keeps showing the session's own transcript |
 //! | mouse: click a preview link | open its url in the browser — `http`/`https` only: any other scheme opens nothing and says so on a sticky status line. On the RELEASE, since only then is it known that the press was a click and not the start of a drag (see [`mouse_effect`]). Works while a quick reply or fork box is open |
 //! | mouse: drag in the preview | select transcript text in reading order, reverse-videoed — DRAWN text only: each row ends at its last drawn character, never at the pane's edge, and a drag over blank space alone selects nothing, so its release copies nothing. HOLD the drag past the transcript's top or bottom edge and the pane glides that way, a small step every `AUTOSCROLL_FRAME` — faster the further past the edge — so the selection keeps growing into rows that were never on screen until the button comes up (see [`App::autoscroll_preview_selection`]); a plain move while the button is held counts as the release the terminal lost. The release copies the WHOLE selection the way `Ctrl-X y` copies — [`Outcome::Copy`], the clipboard tool first, OSC 52 as the fallback — with a transient status. Never the in-flight reply's tail. A wheel notch, any key or a resize ends it. A drag that starts on a node header, a `◆ delegated to …` line or a link selects, and toggles, switches or opens nothing. Off under any overlay and a new-session draft's card, but ON while a quick reply or fork box is open (each previews the real transcript; the drag neither moves its caret nor touches its text), and never started on the pinned row, the running list or a docked compose zone (see [`press_starts_selection`]) |
 //! | mouse: double-click in the preview | select the WORD under the pointer (Unicode word boundaries, on the drawn row) and copy it on release, exactly as a drag copies. Two presses on the SAME cell within [`DOUBLE_CLICK_INTERVAL`] (see [`is_double_click`]); a blank word selects nothing; a quick third click keeps the word. The FIRST release is a plain click — it toggles a node header, switches to a subagent or opens a link, as above — and the SECOND copies the word and toggles, switches or opens nothing, so a node header double-clicked is opened once and stays open. Any key, wheel notch or reload resets the count (a fold toggle does not: it is the first click's own effect), and a press that turned into a drag is not a first click. Same gate as a drag ([`press_starts_selection`]), so it too works while a quick reply or fork box is open |
@@ -173,10 +172,6 @@ pub enum Action {
     /// hand-off are decided in [`apply_action`]; a confirmed plan surfaces as
     /// [`Outcome::Resume`].
     Resume,
-    /// Open the fork compose box on the selected session (`Ctrl-F`). The folder
-    /// check runs first ([`fork`]); no liveness probe, since claude skips it for a
-    /// fork.
-    Fork,
     /// Start a brand-new `claude` session in the launch directory (`Ctrl-N`).
     /// When defined agents exist, [`apply_action`] opens the agent picker first;
     /// otherwise (or once a pick is confirmed) the launch-dir existence gate and
@@ -475,14 +470,13 @@ pub fn key_to_action(
 
     if ctrl {
         return match key.code {
-            KeyCode::Char('f') | KeyCode::Char('F') => Action::Fork,
             KeyCode::Char('a') | KeyCode::Char('A') => Action::ToggleScope,
             KeyCode::Char('n') | KeyCode::Char('N') => Action::NewSession,
             KeyCode::Char('r') | KeyCode::Char('R') => Action::Reply,
             KeyCode::Char('k') | KeyCode::Char('K') => Action::Interrupt,
             KeyCode::Char('c') | KeyCode::Char('C') => Action::Quit,
             // Ctrl-X (0x18 CAN) is the board's leader chord: act on the selected
-            // row (hide / hard-delete / copy session ID / fold toggle / move to
+            // row (hide / hard-delete / copy session ID / fork / fold toggle / move to
             // another worktree / open its subagent view) or on the board (show-hidden /
             // forced rescan).
             // Unbound and terminal-safe — unlike Ctrl-H/I/M, which alias
@@ -572,7 +566,7 @@ pub fn key_to_action(
         // Elsewhere the search caret: editing the query is what the board does on
         // every search, so it gets the plain arrows. Not gated on the query either —
         // an empty query has nowhere to move, and the widget treats a move past
-        // either end as a no-op. The lineage fold is `Ctrl-X f` (`chord_key`), so
+        // either end as a no-op. The lineage fold is `Ctrl-X z` (`chord_key`), so
         // the two never share a key.
         KeyCode::Left => Action::CaretBack,
         KeyCode::Right => Action::CaretForward,
@@ -689,7 +683,7 @@ pub fn handle_event(app: &mut App, event: AppEvent, store: &mut SessionStore) ->
         // draft card is why that has to be enforced here rather than left to each
         // route. It is the one part of the surface that outlives its editor, so
         // `Enter` on a row (and the choice it may open) and the agent picker's
-        // `Ctrl-O` stay routable underneath it — a compose box, the `Ctrl-F` fork
+        // `Ctrl-O` stay routable underneath it — a compose box, the `Ctrl-X f` fork
         // box included, replaces the card as it opens — and the
         // `BgLaunchFinished` that would have closed it cannot survive the hand-off:
         // `tui::run_inner` builds a fresh `EventLoop` per board session and drops
@@ -743,7 +737,7 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
                 Some(KeyboardOwner::KeyMap) => handle_key_map_key(app, key),
                 // A pending `Ctrl-X` leader chord OWNS the next key too: route it
                 // through the chord machine BEFORE normal handling so a printable
-                // follow-up (`x`/`d`/`h`/`r`/`y`/`f`/`w`/`?`, or `↓`) completes the chord
+                // follow-up (`x`/`d`/`h`/`r`/`y`/`f`/`z`/`w`/`?`, or `↓`) completes the chord
                 // instead of leaking into the query.
                 Some(KeyboardOwner::Chord) => handle_chord_key(app, key, store),
                 // The "stop the waiting agent?" confirmation owns the keyboard until
@@ -752,7 +746,7 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
                 // The "stop this agent?" interrupt confirmation likewise owns the
                 // keyboard until it resolves into a stop (Enter) or is dismissed (Esc).
                 Some(KeyboardOwner::InterruptConfirm) => handle_interrupt_confirm_key(app, key),
-                // The compose zone — a quick reply, a `Ctrl-F` fork box or a `Ctrl-N`
+                // The compose zone — a quick reply, a `Ctrl-X f` fork box or a `Ctrl-N`
                 // draft — owns the keyboard while open: every key routes to the
                 // compose handler, bypassing `key_to_action` entirely — mirroring the
                 // two overlays above. While any compose box's `/` / `@` pick list is
@@ -1932,7 +1926,7 @@ fn apply_action(app: &mut App, action: Action) -> Outcome {
         }
         Action::Resume => {
             // Smart Enter: `claude -r` REFUSES to plain-resume a LIVE session, so
-            // Enter (not Ctrl-F) on a running row opens the Attach/Fork/Cancel
+            // Enter (not Ctrl-X f) on a running row opens the Attach/Fork/Cancel
             // choice instead.
             //
             // The gate asks CLAUDE, one-shot, right here — it must NOT read the
@@ -1965,7 +1959,7 @@ fn apply_action(app: &mut App, action: Action) -> Outcome {
             // fork creating it — recorded under the FORK's id, so the origin it
             // only reads is never refused for it), then its `Ctrl-X w` move,
             // which may still be renaming the transcript into another folder
-            // (`Ctrl-F` asks only the move, in [`fork`]).
+            // (`Ctrl-X f` asks only the move, in [`fork`]).
             //
             // Clone the id so the `&Session` borrow ends before the probe and
             // `open_live_choice` touch `app`.
@@ -2001,7 +1995,6 @@ fn apply_action(app: &mut App, action: Action) -> Outcome {
                 None => Outcome::Continue,
             }
         }
-        Action::Fork => fork(app),
         Action::NewSession => new_session(app),
         Action::Reply => reply(app),
         Action::Interrupt => interrupt(app),
@@ -2282,11 +2275,11 @@ pub fn finish_copy<W: Write>(app: &mut App, w: &mut W, payload: &CopyPayload, co
     }
 }
 
-/// The eight keys a pending `Ctrl-X` chord binds, plus cancel — the PURE decision
+/// The ten keys a pending `Ctrl-X` chord binds, plus cancel — the PURE decision
 /// half of the leader chord (PATTERNS §10, keys -> actions -> outcomes). The impure
-/// completion (hide / open confirm / toggle / rescan / copy session ID / fold
-/// toggle / open the move picker / open or leave the subagent view) lives in
-/// [`handle_chord_key`].
+/// completion (hide / open confirm / toggle / rescan / copy session ID / open the
+/// fork box / fold toggle / open the move picker / open or leave the subagent
+/// view) lives in [`handle_chord_key`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChordOutcome {
     /// `x` — toggle the selected session's hidden state (soft delete / un-hide).
@@ -2301,7 +2294,11 @@ enum ChordOutcome {
     /// `session_id` to copy ([`Outcome::Copy`] — an OS clipboard tool first, OSC 52
     /// only as the fallback), and the status line then says what actually happened.
     Copy,
-    /// `f` — fold the selected row's fork lineage if it is open, open it if the
+    /// `f` — open the fork compose box on the selected session ([`fork`]). The
+    /// folder check runs first; no liveness probe, since claude skips it for a
+    /// fork.
+    Fork,
+    /// `z` — fold the selected row's fork lineage if it is open, open it if the
     /// row is a folded `(+N)` head, otherwise nothing
     /// ([`App::toggle_selected_lineage`]).
     Fold,
@@ -2338,7 +2335,8 @@ fn chord_key(key: KeyEvent) -> ChordOutcome {
         KeyCode::Char('h') | KeyCode::Char('H') => ChordOutcome::ShowHidden,
         KeyCode::Char('r') | KeyCode::Char('R') => ChordOutcome::Rescan,
         KeyCode::Char('y') | KeyCode::Char('Y') => ChordOutcome::Copy,
-        KeyCode::Char('f') | KeyCode::Char('F') => ChordOutcome::Fold,
+        KeyCode::Char('f') | KeyCode::Char('F') => ChordOutcome::Fork,
+        KeyCode::Char('z') | KeyCode::Char('Z') => ChordOutcome::Fold,
         KeyCode::Char('w') | KeyCode::Char('W') => ChordOutcome::Move,
         KeyCode::Down => ChordOutcome::Subagents,
         // Reached only after `Ctrl-X`, so the printable `?` is a chord verb, not a
@@ -2355,8 +2353,8 @@ fn chord_key(key: KeyEvent) -> ChordOutcome {
 /// hard-delete confirm (it does NOT delete here — the confirm handler does), `h`
 /// toggles the show-hidden view, `r` forces a full re-read of the store, `y` requests
 /// a clipboard copy of the selected session's full id ([`copy_selected_id`], which
-/// hands the driver an [`Outcome::Copy`]), `f` folds or expands the selected row's
-/// fork lineage, `w` opens the move-to-worktree picker ([`App::open_move_picker`];
+/// hands the driver an [`Outcome::Copy`]), `f` opens the fork box on the selected
+/// session ([`fork`]), `z` folds or expands the selected row's fork lineage, `w` opens the move-to-worktree picker ([`App::open_move_picker`];
 /// the move itself runs at its confirm), `↓` opens the subagent view on the
 /// selected session's open target, or leaves the view when it is up
 /// ([`toggle_subagent_view`]), `?` opens the key-map modal, and anything else
@@ -2392,6 +2390,10 @@ fn handle_chord_key(app: &mut App, key: KeyEvent, store: &mut SessionStore) -> O
         // runs a tool on its own thread or writes an OSC 52 escape, so the request
         // leaves here as data (`Outcome::Copy`) rather than as `Continue`.
         ChordOutcome::Copy => return copy_selected_id(app),
+        // `fork` returns the outcome itself, like the copy above: folder check,
+        // `Ctrl-X w` moving refusal, then the compose box. The chord arms from the
+        // board alone, so no compose box, picker or prompt can have it run.
+        ChordOutcome::Fork => return fork(app),
         ChordOutcome::Fold => app.toggle_selected_lineage(),
         ChordOutcome::Move => app.open_move_picker(),
         ChordOutcome::Subagents => toggle_subagent_view(app),
@@ -2987,7 +2989,7 @@ fn new_session(app: &mut App) -> Outcome {
     Outcome::Continue
 }
 
-/// Handle `Ctrl-F`: open the fork compose box on the SELECTED session.
+/// Handle `Ctrl-X f`: open the fork compose box on the SELECTED session.
 ///
 /// Runs the folder check a fork has always run ([`resume::check`] with `fork`) BEFORE
 /// the box opens, so a deleted worktree is refused on the board and nothing typed is
@@ -3592,6 +3594,13 @@ mod tests {
             AppEvent::Input(Event::Key(ctrl(code))),
             &mut store_at(Path::new("/tmp")),
         )
+    }
+
+    /// Open the fork box the way the user does: `Ctrl-X`, then `f`, each through
+    /// `handle_event`. Returns the follow-up's outcome.
+    fn press_fork(app: &mut App) -> Outcome {
+        press_ctrl(app, KeyCode::Char('x'));
+        press(app, KeyCode::Char('f'))
     }
 
     fn press_alt(app: &mut App, code: KeyCode) -> Outcome {
@@ -11063,7 +11072,7 @@ mod tests {
     }
 
     /// The running-session choice's Fork, through the real key routing, spawns what
-    /// an untouched `Ctrl-F` box's `Ctrl-O` spawns — the same `--name` from the same
+    /// an untouched `Ctrl-X f` box's `Ctrl-O` spawns — the same `--name` from the same
     /// label, one the naming rule must clean and cap here — fails in the fork's own
     /// words with no race probe, and carries no model even straight after a pick
     /// was confirmed in a fork box.
@@ -11076,7 +11085,7 @@ mod tests {
         seed_live(&mut app, &[]);
 
         // The reference: an untouched fork box's interactive run.
-        press_ctrl(&mut app, KeyCode::Char('f'));
+        press_fork(&mut app);
         let Outcome::Resume(boxed) = press_ctrl(&mut app, KeyCode::Char('o')) else {
             panic!(
                 "an untouched fork box's Ctrl-O must hand off: {:?}",
@@ -11085,7 +11094,7 @@ mod tests {
         };
 
         // A fork box with a CONFIRMED pick, then abandoned.
-        press_ctrl(&mut app, KeyCode::Char('f'));
+        press_fork(&mut app);
         press_ctrl(&mut app, KeyCode::Char('l'));
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Right);
@@ -11136,20 +11145,16 @@ mod tests {
         assert!(app.modal.is_none(), "Esc dismisses the overlay");
     }
 
-    /// Ctrl-F on a LIVE session opens no Attach/Fork/Cancel overlay (the fork box
-    /// needs no liveness check).
+    /// `Ctrl-X f` on a LIVE session opens no Attach/Fork/Cancel overlay (the fork
+    /// box needs no liveness check).
     #[test]
-    fn ctrl_f_on_a_live_session_opens_no_overlay() {
+    fn ctrl_x_f_on_a_live_session_opens_no_overlay() {
         let mut app = app_with("live-1", Some("background"));
-        let out = handle_event(
-            &mut app,
-            AppEvent::Input(Event::Key(ctrl(KeyCode::Char('f')))),
-            &mut store_at(Path::new("/tmp")),
-        );
+        let out = press_fork(&mut app);
         assert!(matches!(out, Outcome::Continue));
         assert!(
             app.modal.is_none(),
-            "Ctrl-F must not open the choice overlay, even for a live session"
+            "Ctrl-X f must not open the choice overlay, even for a live session"
         );
     }
 
@@ -11969,20 +11974,21 @@ mod tests {
     }
 
     #[test]
-    fn enter_resumes_and_ctrl_f_forks() {
+    fn enter_resumes_and_ctrl_f_is_unbound() {
         assert_eq!(
             key_to_action(key(KeyCode::Enter), true, false, false, false),
             Action::Resume
         );
+        // Fork moved into the `Ctrl-X` chord (`f`), so the old key does nothing.
         assert_eq!(
             key_to_action(ctrl(KeyCode::Char('f')), false, false, false, false),
-            Action::Fork
+            Action::Ignore
         );
     }
 
     #[test]
     fn ctrl_n_starts_a_new_session_regardless_of_query() {
-        // Ctrl-N is an always-available action key (like Ctrl-F / Ctrl-A): it
+        // Ctrl-N is an always-available action key (like Ctrl-X / Ctrl-A): it
         // never becomes query input, so it maps to NewSession whether or not the
         // user is mid-query. Both `n` and `N` (Shift) decode the same.
         for empty in [true, false] {
@@ -13322,7 +13328,7 @@ mod tests {
     /// An in-flight card must not outlive the board session that dispatched it.
     ///
     /// The editor closes at dispatch, so `Enter` on a row stays routable while the
-    /// card is up, and it hands the terminal over. (A compose box, the `Ctrl-F` fork
+    /// card is up, and it hands the terminal over. (A compose box, the `Ctrl-X f` fork
     /// box included, replaces the card as it opens instead — see
     /// [`opening_the_fork_box_over_an_in_flight_card_ends_the_card`].) The completion
     /// event that would have ended the card cannot survive the hand-off:
@@ -13367,7 +13373,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `Ctrl-F` over an in-flight card ENDS the card as the fork box opens: the box
+    /// `Ctrl-X f` over an in-flight card ENDS the card as the fork box opens: the box
     /// previews the real transcript it forks, so a placeholder left under it would
     /// hide that transcript and keep the mouse gated while the user types.
     #[test]
@@ -13387,7 +13393,7 @@ mod tests {
         );
         assert!(app.draft.is_some(), "the dispatched card is up");
 
-        let out = press_ctrl(&mut app, KeyCode::Char('f'));
+        let out = press_fork(&mut app);
         assert!(
             matches!(out, Outcome::Continue),
             "opening a box keeps the board session, so the hand-off seam never runs"
@@ -13790,7 +13796,8 @@ mod tests {
         assert_eq!(chord_key(key(KeyCode::Char('h'))), ChordOutcome::ShowHidden);
         assert_eq!(chord_key(key(KeyCode::Char('r'))), ChordOutcome::Rescan);
         assert_eq!(chord_key(key(KeyCode::Char('y'))), ChordOutcome::Copy);
-        assert_eq!(chord_key(key(KeyCode::Char('f'))), ChordOutcome::Fold);
+        assert_eq!(chord_key(key(KeyCode::Char('f'))), ChordOutcome::Fork);
+        assert_eq!(chord_key(key(KeyCode::Char('z'))), ChordOutcome::Fold);
         assert_eq!(chord_key(key(KeyCode::Char('w'))), ChordOutcome::Move);
         assert_eq!(chord_key(key(KeyCode::Down)), ChordOutcome::Subagents);
         assert_eq!(
@@ -13806,6 +13813,11 @@ mod tests {
         assert_eq!(chord_key(key(KeyCode::Char('?'))), ChordOutcome::KeyMap);
         assert_eq!(
             chord_key(key(KeyCode::Char('F'))),
+            ChordOutcome::Fork,
+            "a held Shift on the follow-up still opens the fork box"
+        );
+        assert_eq!(
+            chord_key(key(KeyCode::Char('Z'))),
             ChordOutcome::Fold,
             "a held Shift on the follow-up still folds"
         );
@@ -13831,7 +13843,7 @@ mod tests {
             "Esc abandons the chord"
         );
         assert_eq!(
-            chord_key(key(KeyCode::Char('z'))),
+            chord_key(key(KeyCode::Char('q'))),
             ChordOutcome::Cancel,
             "an unbound key abandons the chord"
         );
@@ -15297,15 +15309,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&state);
     }
 
-    /// `Ctrl-X f` toggles the selected row's fork lineage BOTH ways, pressed
+    /// `Ctrl-X z` toggles the selected row's fork lineage BOTH ways, pressed
     /// through `handle_event`: a folded `(+N)` head opens, an open lineage folds —
     /// from the head or from a child, which the fold retargets to its head — and the
-    /// `f` is consumed by the chord every time rather than typed into the query.
+    /// `z` is consumed by the chord every time rather than typed into the query.
     /// The query is live on purpose: a `(+N)` head found BY searching is the row a
     /// user most wants to open, so the toggle must not depend on the query being
     /// empty.
     #[test]
-    fn ctrl_x_f_folds_and_expands_the_selected_rows_lineage() {
+    fn ctrl_x_z_folds_and_expands_the_selected_rows_lineage() {
         let mut head = session("sbf-head");
         head.root_uuid = Some("root-shared".to_string());
         let mut fork = session("sbf-fork");
@@ -15315,28 +15327,28 @@ mod tests {
         type_into_board(&mut app, "label");
         assert_eq!(app.filtered.len(), 1, "premise: the lineage starts folded");
         let head_id = app.selected.clone().expect("the folded head is selected");
-        let mut ctrl_x_f = |app: &mut App| {
+        let mut ctrl_x_z = |app: &mut App| {
             feed(app, ctrl(KeyCode::Char('x')), &mut store);
-            feed(app, key(KeyCode::Char('f')), &mut store);
+            feed(app, key(KeyCode::Char('z')), &mut store);
             assert!(!app.pending_chord, "the chord resolves on its one key");
-            assert_eq!(app.query(), "label", "the `f` must not leak into the query");
+            assert_eq!(app.query(), "label", "the `z` must not leak into the query");
         };
 
-        ctrl_x_f(&mut app);
+        ctrl_x_z(&mut app);
         assert_eq!(app.filtered.len(), 2, "a folded head opens");
         assert_eq!(app.selected.as_deref(), Some(head_id.as_str()));
 
-        ctrl_x_f(&mut app);
+        ctrl_x_z(&mut app);
         assert_eq!(app.filtered.len(), 1, "an open lineage folds from its head");
 
-        ctrl_x_f(&mut app);
+        ctrl_x_z(&mut app);
         press(&mut app, KeyCode::Down);
         assert_ne!(
             app.selected.as_deref(),
             Some(head_id.as_str()),
             "premise: the selection stands on the child"
         );
-        ctrl_x_f(&mut app);
+        ctrl_x_z(&mut app);
         assert_eq!(app.filtered.len(), 1, "and from a child");
         assert_eq!(
             app.selected.as_deref(),
@@ -15377,7 +15389,7 @@ mod tests {
         assert_eq!(app.selected.as_deref(), Some("sbxc-new"));
 
         feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
-        feed(&mut app, key(KeyCode::Char('f')), &mut store);
+        feed(&mut app, key(KeyCode::Char('z')), &mut store);
         assert_eq!(app.filtered.len(), 3, "premise: the lineage is open");
         feed(&mut app, key(KeyCode::Down), &mut store);
         assert_eq!(
@@ -15417,21 +15429,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&state);
     }
 
-    /// `Ctrl-X f` on a row with no lineage to toggle — a session that is its own
+    /// `Ctrl-X z` on a row with no lineage to toggle — a session that is its own
     /// lineage — changes nothing: the list, the selection and the query all stay.
     #[test]
-    fn ctrl_x_f_on_a_row_with_nothing_to_fold_changes_nothing() {
+    fn ctrl_x_z_on_a_row_with_nothing_to_fold_changes_nothing() {
         let mut app = app_with("sbf-lone", None);
         let mut store = store_at(Path::new("/tmp"));
         let filtered = app.filtered.clone();
 
         feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
-        feed(&mut app, key(KeyCode::Char('f')), &mut store);
+        feed(&mut app, key(KeyCode::Char('z')), &mut store);
 
         assert!(!app.pending_chord, "the chord resolves on its one key");
         assert_eq!(app.filtered, filtered, "nothing to fold or open");
         assert_eq!(app.selected.as_deref(), Some("sbf-lone"));
-        assert!(app.query().is_empty(), "`f` must not leak into the query");
+        assert!(app.query().is_empty(), "`z` must not leak into the query");
     }
 
     /// `Ctrl-X m` is NOT a chord verb any more: there is no board-wide model to
@@ -15603,7 +15615,7 @@ mod tests {
         assert!(app.query().is_empty(), "`w` must not leak into the query");
     }
 
-    /// While a row's move is in flight, `Enter`, `Ctrl-F` and `Ctrl-R` on THAT row
+    /// While a row's move is in flight, `Enter`, `Ctrl-X f` and `Ctrl-R` on THAT row
     /// refuse in their own words, before any probe (it is armed to panic), and
     /// hand off or open nothing.
     #[test]
@@ -15614,11 +15626,23 @@ mod tests {
         app.set_live_probe(|| panic!("a moving row is refused before any probe"));
 
         for (press, refusal) in [
-            (key(KeyCode::Enter), claude_move::MOVING_RESUME_REFUSAL),
-            (ctrl(KeyCode::Char('f')), claude_move::MOVING_RESUME_REFUSAL),
-            (ctrl(KeyCode::Char('r')), claude_move::MOVING_REPLY_REFUSAL),
+            (
+                vec![key(KeyCode::Enter)],
+                claude_move::MOVING_RESUME_REFUSAL,
+            ),
+            (
+                vec![ctrl(KeyCode::Char('x')), key(KeyCode::Char('f'))],
+                claude_move::MOVING_RESUME_REFUSAL,
+            ),
+            (
+                vec![ctrl(KeyCode::Char('r'))],
+                claude_move::MOVING_REPLY_REFUSAL,
+            ),
         ] {
-            let out = feed(&mut app, press, &mut store);
+            let mut out = Outcome::Continue;
+            for k in press.iter().copied() {
+                out = feed(&mut app, k, &mut store);
+            }
             assert!(matches!(out, Outcome::Continue), "{press:?}");
             assert_eq!(app.status.as_deref(), Some(refusal), "{press:?}");
             assert!(app.modal.is_none(), "{press:?}");
@@ -16144,7 +16168,7 @@ mod tests {
         let mut store = store_at(Path::new("/tmp"));
         let (mut app, main, wt, _members) = lineage_move_board("lmv-child");
         feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
-        feed(&mut app, key(KeyCode::Char('f')), &mut store);
+        feed(&mut app, key(KeyCode::Char('z')), &mut store);
         feed(&mut app, key(KeyCode::Down), &mut store);
         assert_eq!(
             app.selected.as_deref(),
@@ -16428,7 +16452,7 @@ mod tests {
         assert!(app.query().is_empty(), "no key leaked into the query");
     }
 
-    /// The ids of a parent and the two forks the `Ctrl-F` box named from it, in
+    /// The ids of a parent and the two forks the `Ctrl-X f` box named from it, in
     /// [`named_fork_board`].
     const NAMED_FORK_IDS: [&str; 3] = ["nf-parent", "nf-fork-a", "nf-fork-b"];
 
@@ -16448,7 +16472,7 @@ mod tests {
             .collect()
     }
 
-    /// [`lineage_move_board`]'s shape over a PARENT and two forks the `Ctrl-F` box
+    /// [`lineage_move_board`]'s shape over a PARENT and two forks the `Ctrl-X f` box
     /// made from it: the unnamed `nf-parent` (the oldest) and `nf-fork-a` /
     /// `nf-fork-b`, named `fork: …` and each newer than the parent, one root uuid.
     /// `hidden` members start soft-hidden, in the board's own pinned state dir
@@ -16497,10 +16521,10 @@ mod tests {
         (app, main, wt, members)
     }
 
-    /// `Ctrl-X f` on the parent's row, then `Down` onto the NEWER fork's `↳` row.
+    /// `Ctrl-X z` on the parent's row, then `Down` onto the NEWER fork's `↳` row.
     fn select_named_fork_child_row(app: &mut App, store: &mut SessionStore) {
         feed(app, ctrl(KeyCode::Char('x')), store);
-        feed(app, key(KeyCode::Char('f')), store);
+        feed(app, key(KeyCode::Char('z')), store);
         feed(app, key(KeyCode::Down), store);
         assert_eq!(
             drawn_session_rows(app),
@@ -16977,16 +17001,13 @@ mod tests {
         );
     }
 
-    /// `Ctrl-F` opens the fork box on a resumable session — even a LIVE background
+    /// `Ctrl-X f` opens the fork box on a resumable session — even a LIVE background
     /// one, with no probe and no overlay — and a typed `Esc` leaves nothing behind.
     #[test]
-    fn ctrl_f_opens_the_fork_box_even_on_a_live_session() {
+    fn ctrl_x_f_opens_the_fork_box_even_on_a_live_session() {
         let dir = unique_temp_dir("fork-box-open");
         let mut app = app_with_agent_state(&dir, "sbf-live", "working", &["sbf-live"]);
-        assert!(matches!(
-            press_ctrl(&mut app, KeyCode::Char('f')),
-            Outcome::Continue
-        ));
+        assert!(matches!(press_fork(&mut app), Outcome::Continue));
         assert!(app.modal.is_none(), "no Attach/Fork/Cancel overlay");
         assert_eq!(
             app.compose.as_ref().map(|c| &c.target),
@@ -17002,7 +17023,7 @@ mod tests {
     /// The folder check runs BEFORE the box opens: a session whose folder is gone is
     /// refused on the board with the resume wording, and no box appears.
     #[test]
-    fn ctrl_f_refuses_a_deleted_folder_before_the_box_opens() {
+    fn ctrl_x_f_refuses_a_deleted_folder_before_the_box_opens() {
         let dir = unique_temp_dir("fork-box-gone");
         let mut app = App::new(
             vec![resumable_session(&dir, "sbf-gone")],
@@ -17020,7 +17041,7 @@ mod tests {
             ),
         )
         .expect("rewrite the transcript");
-        press_ctrl(&mut app, KeyCode::Char('f'));
+        press_fork(&mut app);
         assert!(app.compose.is_none(), "no box for a fork that cannot run");
         assert!(app
             .status
@@ -17056,7 +17077,7 @@ mod tests {
     }
 
     /// The rapid fork-again workflow (review PR1, then PR2, from the same session):
-    /// `Ctrl-F` + `Enter` on `A`, then `Ctrl-F` on `A` again, and the first fork
+    /// `Ctrl-X f` + `Enter` on `A`, then `Ctrl-X f` on `A` again, and the first fork
     /// lands — folded under `A` — while that second box is open. The cursor is not
     /// pulled to the fork under the box, the pair is spent, and the box's `Enter`
     /// forks `A` again and arms the jump for the SECOND fork alone.
@@ -17069,13 +17090,13 @@ mod tests {
         origin.timestamp = at(100);
         let mut app = App::new(vec![origin.clone()], Scope::All, PathBuf::from("/tmp"));
 
-        press_ctrl(&mut app, KeyCode::Char('f'));
+        press_fork(&mut app);
         type_into_draft(&mut app, "PR1");
         let Outcome::Send(first) = press(&mut app, KeyCode::Enter) else {
             panic!("the first fork must send: {:?}", app.status);
         };
 
-        press_ctrl(&mut app, KeyCode::Char('f'));
+        press_fork(&mut app);
         type_into_draft(&mut app, "PR2");
         let fork_one = Session {
             session_id: first.session_id.clone(),
@@ -17144,7 +17165,7 @@ mod tests {
                 }
             });
 
-            press_ctrl(&mut app, KeyCode::Char('f'));
+            press_fork(&mut app);
             type_into_draft(&mut app, "PR1");
             let Outcome::Send(req) = press(&mut app, KeyCode::Enter) else {
                 panic!("the fork must send: {:?}", app.status);
@@ -17204,7 +17225,7 @@ mod tests {
         }
     }
 
-    /// `Enter`, `Ctrl-F` and Attach NEVER carry `--model` or `--effort`, through the
+    /// `Enter`, `Ctrl-X f` and Attach NEVER carry `--model` or `--effort`, through the
     /// real key routing — even straight after a pick was confirmed in a compose. A
     /// resume and a fork keep the session's own model (claude normally restores it),
     /// and an attach joins a running process: the argvs are byte-identical to what they
@@ -17244,12 +17265,9 @@ mod tests {
         assert!(!carries_a_model(&resumed.argv));
         assert_eq!(resumed.nonzero_hint, crate::resume::RESUME_NONZERO_HINT);
 
-        // `Ctrl-F` now opens the fork box; an untouched box's `Ctrl-O` is the
-        // hand-off the old direct `Ctrl-F` made, named after the session's label.
-        assert!(matches!(
-            press_ctrl(&mut app, KeyCode::Char('f')),
-            Outcome::Continue
-        ));
+        // `Ctrl-X f` opens the fork box; an untouched box's `Ctrl-O` is the plain
+        // fork hand-off, named after the session's label.
+        assert!(matches!(press_fork(&mut app), Outcome::Continue));
         let Outcome::Resume(forked) = press_ctrl(&mut app, KeyCode::Char('o')) else {
             panic!(
                 "Ctrl-O in an untouched fork box must hand off: {:?}",
@@ -18014,7 +18032,7 @@ mod tests {
         assert_eq!(app.selected.as_deref(), Some("sbdch-head"));
 
         feed(&mut app, ctrl(KeyCode::Char('x')), &mut store);
-        feed(&mut app, key(KeyCode::Char('f')), &mut store);
+        feed(&mut app, key(KeyCode::Char('z')), &mut store);
         assert_eq!(app.filtered.len(), 3, "premise: the lineage is open");
         feed(&mut app, key(KeyCode::Down), &mut store);
         assert_eq!(

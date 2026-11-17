@@ -115,7 +115,7 @@ pub const MOVE_SENDING_REFUSAL: &str = "snapback is still sending a reply or for
 pub const MOVE_IN_FLIGHT_REFUSAL: &str = "snapback is already moving this session — wait for \
      it to finish.";
 
-/// Refusal (`Enter` / `Ctrl-F`): the session's move is in flight, so its file is
+/// Refusal (`Enter` / `Ctrl-X f`): the session's move is in flight, so its file is
 /// being renamed into another folder while `claude -r` would read it.
 pub const MOVING_RESUME_REFUSAL: &str = "snapback is still moving this session to another \
      folder — wait for it to finish, then resume or fork it.";

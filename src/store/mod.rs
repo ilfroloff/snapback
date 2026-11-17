@@ -966,7 +966,7 @@ mod tests {
         assert!(bg.timestamp > fg.timestamp);
     }
 
-    /// `sess-fork-named-1` is a fork the `Ctrl-F` box made from the delta pair's
+    /// `sess-fork-named-1` is a fork the `Ctrl-X f` box made from the delta pair's
     /// foreground member, in the shape claude 2.1.291 wrote for a `--name`d
     /// `claude -p` fork: the copied prefix (root included) and its `custom-title`
     /// written twice. The name survives `Session::from_file`, nothing else in the
