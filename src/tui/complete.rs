@@ -28,7 +28,7 @@
 use std::path::Path;
 
 use crate::search::{MarkScratch, SearchIndex, WordStartHit};
-use crate::store::skills::ListingEntry;
+use crate::store::skills::{CommandKind, ListingEntry};
 
 /// Cap on entries read from one folder. Bounds a single keystroke's cost on a
 /// huge or slow-mounted folder; a folder past it lists its first entries only.
@@ -165,6 +165,10 @@ pub struct Candidate {
     /// The same, in `description`, for a candidate the query matched by its
     /// description alone; empty for every other.
     pub description_marks: Vec<usize>,
+    /// What a `/` command is, copied from its entry by [`filter_commands`] alone;
+    /// `None` for every other row. Drawn in the list's kind column, never matched
+    /// and never marked.
+    pub kind: Option<CommandKind>,
 }
 
 /// One folder entry, as read by [`list_tree`]. `name` is a path relative to the
@@ -433,6 +437,7 @@ fn listed_candidate(
         description: entry.description.clone(),
         label_marks,
         description_marks,
+        ..Candidate::default()
     }
 }
 
@@ -448,7 +453,10 @@ pub fn filter_commands(entries: &[ListingEntry], query: &str) -> Vec<Candidate> 
         .into_iter()
         .map(|picked| {
             let insert = picked.1.name.clone();
-            listed_candidate(&matcher, picked, (COMMAND_LABEL_PREFIX, ""), insert)
+            Candidate {
+                kind: picked.1.kind,
+                ..listed_candidate(&matcher, picked, (COMMAND_LABEL_PREFIX, ""), insert)
+            }
         })
         .collect()
 }
@@ -758,6 +766,7 @@ mod tests {
         ListingEntry {
             name: name.to_owned(),
             description: description.map(str::to_owned),
+            kind: None,
         }
     }
 
@@ -847,6 +856,7 @@ mod tests {
                 description: None,
                 label_marks: vec![1],
                 description_marks: Vec::new(),
+                kind: None,
             }
         );
         assert_eq!(filter_commands(&names, "").len(), 3);
@@ -873,6 +883,37 @@ mod tests {
     }
 
     #[test]
+    fn the_command_filter_copies_each_kind_and_never_matches_on_it() {
+        let kinded = |name: &str, kind: Option<CommandKind>| ListingEntry {
+            kind,
+            ..listed(name, None)
+        };
+        let entries = vec![
+            kinded("alpha", Some(CommandKind::Skill)),
+            kinded("beta", Some(CommandKind::BuiltIn)),
+            kinded("gamma", None),
+        ];
+        let got = filter_commands(&entries, "");
+        assert_eq!(
+            got.iter().map(|c| c.kind).collect::<Vec<_>>(),
+            vec![Some(CommandKind::Skill), Some(CommandKind::BuiltIn), None]
+        );
+        // The kind is a column, not text: `skill` matches no name or description.
+        assert!(filter_commands(&entries, "skill").is_empty());
+        assert!(filter_commands(&entries, "built").is_empty());
+    }
+
+    #[test]
+    fn an_agent_row_never_carries_a_kind() {
+        let entry = ListingEntry {
+            kind: Some(CommandKind::Skill),
+            ..listed("sby-agent", None)
+        };
+        let got = select_agents(&[entry], "sb");
+        assert_eq!(got[0].kind, None);
+    }
+
+    #[test]
     fn mention_safe_names_follow_claudes_name_class() {
         for ok in ["plugin:agent", "Explore", "a.b@c-d_e", "sby-agent"] {
             assert!(is_mention_safe(ok), "{ok} should be offered");
@@ -893,6 +934,7 @@ mod tests {
                 description: Some("Pings back".into()),
                 label_marks: vec![0, 1],
                 description_marks: Vec::new(),
+                kind: None,
             }]
         );
     }
