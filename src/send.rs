@@ -2852,7 +2852,7 @@ mod tests {
                 violations.push(format!("{name} must say {required:?}: {copy:?}"));
             }
         }
-        // `Ctrl-F` no longer forks; fork is the `Ctrl-X f` chord verb.
+        // `Ctrl-F` is the preview find bar; fork is the `Ctrl-X f` chord verb.
         for (name, copy) in [
             ("SEND_LIVE_REFUSED", SEND_LIVE_REFUSED),
             ("RESUME_NONZERO_HINT", crate::resume::RESUME_NONZERO_HINT),

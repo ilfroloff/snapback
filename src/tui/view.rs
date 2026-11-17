@@ -32,6 +32,7 @@ use ratatui::widgets::{
     Wrap,
 };
 use ratatui::Frame;
+use ratatui_textarea::TextArea;
 use time::{Date, OffsetDateTime, UtcOffset};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -2427,10 +2428,11 @@ fn compose_title(app: &App, compose: &ComposeState) -> String {
 /// cyan border marks the box as the board speaking, like the search prompt and the
 /// status banner. The `TextArea` widget draws its own buffer and cursor into the
 /// block's inner rect — one of exactly TWO places a `ratatui_textarea` value is
-/// rendered, the other being [`render_search`], which draws the board's one-line
-/// query. The two differ in what they let the widget own: this one takes the
-/// widget's cursor as it comes, while the search line overrides the cursor STYLE
-/// per frame to drive the blink (see [`super::compose`] and [`render_search`]).
+/// rendered, the other being `render_input_line`, which draws the board's one-line
+/// query ([`render_search`]) and the find bar ([`render_find_bar`]). The two
+/// differ in what they let the widget own: this one takes the widget's cursor as
+/// it comes, while the one-line inputs override the cursor STYLE per frame to
+/// drive the blink (see [`super::compose`] and [`render_search`]).
 ///
 /// The box's BOTTOM border carries its `model: …` label ([`compose_model_label`]):
 /// what this reply or draft will run on. On the border rather than inside the box,
@@ -3254,9 +3256,13 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     // Titled only once that call has warmed the cache: the subagent view's state
     // reads its render's verdict (`App::subagent_view_status`), which a cold
     // render has not given yet.
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(preview_title(app, preview_inner(area).width));
+    // The find bar rides the border row the title already fills, so the title is
+    // fitted to what the bar leaves it.
+    let find_cols = find_bar_cols(app, area);
+    let block = Block::default().borders(Borders::ALL).title(preview_title(
+        app,
+        preview_inner(area).width.saturating_sub(find_cols),
+    ));
 
     // Nothing selected (no text AND no banner, since a banner implies a SELECTED
     // session). A selected session whose transcript is still empty falls through
@@ -3276,6 +3282,7 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
                 .block(block),
             area,
         );
+        render_find_bar(frame, app, area, find_cols);
         return;
     }
 
@@ -3290,6 +3297,9 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     // resolved `offset` below. Only the draw moves — the block still precedes it, so
     // the border can never paint over the pinned row.
     frame.render_widget(block, area);
+    // After the block, so the bar paints over the border it shares a row with. It
+    // takes no row of the pane's inner rect: `preview_areas` never hears of it.
+    render_find_bar(frame, app, area, find_cols);
 
     // The wrapped height of what this pane is ACTUALLY showing — the WHOLE of it,
     // window or no window, because this is what the scroll clamp, the bottom anchor
@@ -5283,14 +5293,119 @@ fn scrollbar_thumb_position(
         .min(hi)
 }
 
+/// The find bar's label. Declared once, like [`SEARCH_LABEL`], so the string DRAWN
+/// and the columns RESERVED for it cannot drift apart.
+const FIND_LABEL: &str = "find: ";
+
+/// Columns [`FIND_LABEL`] occupies.
+const FIND_LABEL_WIDTH: u16 = label_cols(FIND_LABEL);
+
+/// Columns of typed text the bar shows before its [`TextArea`] scrolls: enough for
+/// a word or two, small enough that the title keeps most of the border.
+const FIND_TEXT_COLS: u16 = 18;
+
+/// The mark that opens the find bar's frame on the border line, then one space
+/// of padding before the label. Drawn in the bar's own cyan, so the segment reads
+/// as set into the border (`┤ find: foo ├`) without taking a row of the pane.
+const FIND_EDGE_OPEN: &str = "┤ ";
+
+/// The padding space, then the mark that closes the frame. See [`FIND_EDGE_OPEN`].
+const FIND_EDGE_CLOSE: &str = " ├";
+
+/// Columns ONE edge of the frame occupies: its mark and its padding space. Both
+/// edges are this wide, which a test pins against the strings' display width.
+const FIND_EDGE_COLS: u16 = 2;
+
+/// Columns the find bar asks of the preview's top border: both frame edges, its
+/// label and its [`FIND_TEXT_COLS`] of text.
+const FIND_BAR_COLS: u16 = 2 * FIND_EDGE_COLS + FIND_LABEL_WIDTH + FIND_TEXT_COLS;
+
+/// The most of the pane's inner width the bar may take is 1 / this, so a narrow
+/// pane keeps at least half its border for the title.
+const FIND_BAR_MAX_SHARE_DIVISOR: u16 = 2;
+
+/// Columns the find bar takes of `area`'s top border, or 0 when it is not drawn
+/// (closed). It never draws over a draft card: `App::open_find` and
+/// `App::open_compose` keep the bar closed there. Pure, so [`render_preview`]
+/// sizes the title and the bar from one answer.
+fn find_bar_cols(app: &App, area: Rect) -> u16 {
+    if app.find.is_none() {
+        return 0;
+    }
+    FIND_BAR_COLS.min(preview_inner(area).width / FIND_BAR_MAX_SHARE_DIVISOR)
+}
+
+/// The bar's rect, frame edges included: `cols` wide on `area`'s top border row,
+/// right-aligned just inside the corner. Pure.
+fn find_bar_rect(area: Rect, cols: u16) -> Rect {
+    Rect {
+        x: area.right().saturating_sub(1).saturating_sub(cols),
+        y: area.y,
+        width: cols,
+        height: 1,
+    }
+}
+
+/// The label's style: cyan like the board's search row, or red once there is text
+/// that marks nothing. A STYLE on the bar itself, never `App::status` — it is a
+/// fact true for as long as the text stays, not an outcome (STATUS-LINE
+/// OWNERSHIP).
+fn find_label_style(app: &App) -> Style {
+    let has_text = app
+        .find
+        .as_ref()
+        .is_some_and(|find| !find.input.lines()[0].is_empty());
+    if has_text && !app.has_preview_matches() {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Cyan)
+    }
+}
+
+/// Draw the preview's find bar over `cols` columns of `area`'s top border, after
+/// the pane's block: a cyan frame edge, the input line, a cyan closing edge.
+/// Cleared first, so the border it replaces does not show through the gaps. The
+/// edges stay cyan when the label turns red (see [`find_label_style`]): the frame
+/// is the bar's outline, not its verdict. Draws nothing for `cols == 0`.
+fn render_find_bar(frame: &mut Frame, app: &mut App, area: Rect, cols: u16) {
+    if cols == 0 {
+        return;
+    }
+    let label_style = find_label_style(app);
+    let tick = app.tick;
+    let Some(find) = app.find.as_mut() else {
+        return;
+    };
+    let rect = find_bar_rect(area, cols);
+    frame.render_widget(Clear, rect);
+    let [open, line, close] = Layout::horizontal([
+        Constraint::Length(FIND_EDGE_COLS),
+        Constraint::Min(0),
+        Constraint::Length(FIND_EDGE_COLS),
+    ])
+    .areas(rect);
+    let edge_style = Style::default().fg(Color::Cyan);
+    frame.render_widget(
+        Paragraph::new(Span::styled(FIND_EDGE_OPEN, edge_style)),
+        open,
+    );
+    frame.render_widget(
+        Paragraph::new(Span::styled(FIND_EDGE_CLOSE, edge_style)),
+        close,
+    );
+    render_input_line(frame, FIND_LABEL, label_style, &mut find.input, tick, line);
+}
+
 /// The search line's label. Declared once, so the string DRAWN and the columns
 /// RESERVED for it below cannot drift apart.
 const SEARCH_LABEL: &str = "search: ";
 
-/// Columns [`SEARCH_LABEL`] occupies. Derived from the label rather than typed,
-/// so re-wording it re-sizes the column with it (NO MAGIC VALUES). The label is
-/// ASCII, so its byte length IS its column count.
-const SEARCH_LABEL_WIDTH: u16 = SEARCH_LABEL.len() as u16;
+/// Columns an input line's label occupies, derived from the label rather than typed
+/// so re-wording it re-sizes the column with it (NO MAGIC VALUES). The labels are
+/// ASCII, so a byte length IS the column count.
+const fn label_cols(label: &str) -> u16 {
+    label.len() as u16
+}
 
 /// The search input line: a fixed label, then the query editor itself.
 ///
@@ -5313,24 +5428,44 @@ const SEARCH_LABEL_WIDTH: u16 = SEARCH_LABEL.len() as u16;
 /// what [`blink_visible`] exists to explain.
 ///
 /// Takes `&mut App` because the cursor style is set on the widget per frame;
-/// [`render`] already holds one.
+/// [`render`] already holds one. The drawing itself is [`render_input_line`], which
+/// the preview's find bar shares.
 fn render_search(frame: &mut Frame, app: &mut App, area: Rect) {
+    render_input_line(
+        frame,
+        SEARCH_LABEL,
+        Style::default().fg(Color::Cyan),
+        &mut app.query_input,
+        app.tick,
+        area,
+    );
+}
+
+/// One input line: `label` in `label_style`, then `input` drawn by its own
+/// [`TextArea`](ratatui_textarea::TextArea) with the pulsing caret. The board's
+/// search row ([`render_search`]) and the preview's find bar
+/// ([`render_find_bar`]) are both this, so the two cannot draw their caret or
+/// scroll their text differently.
+fn render_input_line(
+    frame: &mut Frame,
+    label: &str,
+    label_style: Style,
+    input: &mut TextArea<'static>,
+    tick: u64,
+    area: Rect,
+) {
     let [label_area, input_area] =
-        Layout::horizontal([Constraint::Length(SEARCH_LABEL_WIDTH), Constraint::Min(0)])
-            .areas(area);
+        Layout::horizontal([Constraint::Length(label_cols(label)), Constraint::Min(0)]).areas(area);
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            SEARCH_LABEL,
-            Style::default().fg(Color::Cyan),
-        ))),
+        Paragraph::new(Line::from(Span::styled(label.to_string(), label_style))),
         label_area,
     );
-    let cursor_style = if blink_visible(app.tick) {
+    let cursor_style = if blink_visible(tick) {
         Style::default().add_modifier(Modifier::REVERSED)
     } else {
         Style::default()
     };
-    app.query_input.set_cursor_style(cursor_style);
+    input.set_cursor_style(cursor_style);
     // KNOWN CEILING at caret column 65_535, deliberately left UNFIXED — the
     // horizontal scroll this row leans on is computed in `u16` inside the pinned
     // `ratatui-textarea-0.9.2`. `TextArea::scroll_top_col` casts the caret column
@@ -5356,7 +5491,7 @@ fn render_search(frame: &mut Frame, app: &mut App, area: Rect) {
     // release build degrades this row's rendering rather than crashing. Fixing it
     // means capping the query length in the query funnel — a behaviour change to
     // every input path, not a render-site tweak.
-    frame.render_widget(&app.query_input, input_area);
+    frame.render_widget(&*input, input_area);
 }
 
 /// The which-key hint that takes over the help line while a `Ctrl-X` leader chord
@@ -5393,10 +5528,10 @@ fn render_search(frame: &mut Frame, app: &mut App, area: Rect) {
 /// `d del row/stack` became `d delete` (the confirm itself offers the stack on
 /// its top row) and `y copy ID` became `y ID` (the status line still says
 /// `Copied session ID …`), with the verb itself singular, which lands it at
-/// exactly 80. The `f fork` verb (the fork box, moved off `Ctrl-F`) and the
-/// fold's new letter, `z fold`, cost 9 columns together, and three entries paid:
-/// `d delete` became `d del`, `r reload` became `r scan` and `↓ subagent` became
-/// `↓ sub`, which lands the widest form at 79.
+/// exactly 80. The `f fork` verb (the fork box, moved off `Ctrl-F` for the
+/// preview's find bar) and the fold's new letter, `z fold`, cost 9 columns
+/// together, and three entries paid: `d delete` became `d del`, `r reload` became
+/// `r scan` and `↓ subagent` became `↓ sub`, which lands the widest form at 79.
 /// `?` (the key-map modal, the terminal-independent twin of `F1`) is
 /// bound but NOT listed: the line is full, and the board hint's `F1 keys` points at
 /// the same modal in most terminals; where F1 does not arrive, `Ctrl-X ?` is found
@@ -5456,6 +5591,14 @@ fn compose_hint(target: &ComposeTarget, list_open: bool) -> &'static str {
 /// the transcript-scroll keys the reply hint names, which work here too.
 const FORK_HINT: &str = "Enter fork · ^O run interactively · ^L model · ^J newline · Esc cancel";
 
+/// The help row while the preview's find bar is open (and no chord, status or
+/// compose box owns the row): the keys the bar re-routes, in the board's own
+/// notation. 65 columns, inside the 80-column help row (pinned by
+/// `the_find_hint_fits_an_eighty_column_terminal`). `Enter` is named because it
+/// does NOT resume while the bar is open, and `Esc` because it closes the bar
+/// before it clears the query.
+const FIND_HINT: &str = "find  type to search · S-↑↓ match · Enter older match · Esc close";
+
 /// Every compose box's hint while the pick list is open — on the help row, and on
 /// a background draft's card too ([`draft_hint`]). Budgeted to the 80-column help
 /// row (pinned by `every_compose_hint_form_fits_an_eighty_column_terminal`).
@@ -5499,6 +5642,10 @@ const KEY_MAP: &[KeyMapSection] = &[
                 "resume (a running session offers Attach / Fork / Cancel)",
             ),
             (
+                "Ctrl-F",
+                "find text in the previewed transcript (Esc closes the bar)",
+            ),
+            (
                 "Ctrl-N",
                 "new session: pick an agent, then draft its first message",
             ),
@@ -5519,7 +5666,7 @@ const KEY_MAP: &[KeyMapSection] = &[
             ("type", "search; Tab toggles name / name+content"),
             (
                 "Esc",
-                "clear the search; else leave a subagent's transcript; else quit",
+                "close the find bar; else clear the search; else leave a subagent's transcript; else quit",
             ),
             (
                 "←/→",
@@ -5529,7 +5676,11 @@ const KEY_MAP: &[KeyMapSection] = &[
             ("Alt+Bksp", "delete a word (also Ctrl-W, Alt+H)"),
             (
                 "S-↑/↓",
-                "previous / next line the query marks in the preview",
+                "previous / next line the query (or the find bar) marks in the preview",
+            ),
+            (
+                "Enter",
+                "with the find bar open: the previous (older) match; never resumes",
             ),
         ],
     },
@@ -5738,7 +5889,8 @@ fn render_key_map(frame: &mut Frame, app: &mut App) {
 
 /// The bottom help line: the [`chord_hint`] while a `Ctrl-X` leader chord is
 /// pending, else a transient board status (e.g. a resume refusal) when one is
-/// set, else the [`compose_hint`] while composing, else the trimmed
+/// set, else the [`compose_hint`] while composing, else the [`FIND_HINT`] while
+/// the preview's find bar is open, else the trimmed
 /// [`DEFAULT_HELP_HINT`] cheat sheet. The row is always ONE row tall; the full
 /// key map lives in its own modal ([`render_key_map`]). A status is flattened to
 /// a single row (newlines -> spaces).
@@ -5778,6 +5930,16 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         // keymap. Ctrl-J is the primary newline; Alt+Enter the guaranteed fallback.
         let line = Line::from(vec![Span::styled(
             compose_hint(&compose.target, compose.completion.visible.is_some()),
+            Style::default().add_modifier(Modifier::DIM),
+        )]);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
+    if app.is_finding() {
+        // Below the compose hint: a fork or reply box over the pane owns the
+        // keyboard's text keys, so its hint is the one that is true.
+        let line = Line::from(vec![Span::styled(
+            FIND_HINT,
             Style::default().add_modifier(Modifier::DIM),
         )]);
         frame.render_widget(Paragraph::new(line), area);
@@ -21575,7 +21737,7 @@ mod tests {
         let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp/launch"));
         app.push_query_str(LONG_QUERY);
         assert!(
-            LONG_QUERY.len() > usize::from(NARROW - SEARCH_LABEL_WIDTH),
+            LONG_QUERY.len() > usize::from(NARROW - label_cols(SEARCH_LABEL)),
             "premise: the query is wider than the column left for it, so a wrapping \
              widget WOULD need a second row"
         );
@@ -21702,6 +21864,340 @@ mod tests {
         }
     }
 
+    /// The pane the find-bar tests draw, and the session they preview: wide enough
+    /// that the title, the bar and a word of the transcript all fit one frame.
+    const FIND_PANE: (u16, u16) = (60, 20);
+
+    /// A find word the `sess-normal-1` fixture says, and one it never does.
+    const FIND_HIT: &str = "webhook";
+    const FIND_MISS: &str = "zzzqqq";
+
+    /// The sample session with a stamped wall clock, so its title carries every
+    /// fact [`fit_title`] can drop, and a find bar open over `text`.
+    fn finding_app(text: &str) -> App {
+        let mut app = session_title_app();
+        app.note_wall_clock(title_now());
+        app.open_find();
+        app.push_find_str(text);
+        app
+    }
+
+    /// The bar's rect on the pane drawn at the origin: the columns the bar asks and
+    /// where it starts on the top row.
+    fn bar_geometry(app: &App, width: u16, height: u16) -> (u16, u16) {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        let cols = find_bar_cols(app, area);
+        (find_bar_rect(area, cols).x, cols)
+    }
+
+    /// The find bar draws `find: <text>` on the preview's TOP BORDER row, right
+    /// aligned inside the corners, and the title is fitted to the columns it
+    /// leaves rather than drawn full width and cut by the bar.
+    #[test]
+    fn the_find_bar_draws_on_the_top_border_and_the_title_fits_what_it_leaves() {
+        let (width, height) = FIND_PANE;
+        let mut app = finding_app(FIND_HIT);
+        let (bar_x, cols) = bar_geometry(&app, width, height);
+        let inner = width - 2;
+        let fitted = line_string(&preview_title(&app, inner - cols));
+        let full = line_string(&preview_title(&app, inner));
+        assert_ne!(
+            fitted, full,
+            "premise: the bar must squeeze the title, or this test cannot tell the two fits apart"
+        );
+
+        let top = full_row_text(&preview_buffer(&mut app, width, height), 0, width);
+        let chars: Vec<char> = top.chars().collect();
+        assert_eq!(chars[0], '┌', "{top:?}");
+        assert_eq!(chars[usize::from(width) - 1], '┐', "{top:?}");
+        let bar: String = chars[usize::from(bar_x)..usize::from(bar_x + cols)]
+            .iter()
+            .collect();
+        assert!(
+            bar.starts_with(&format!("{FIND_EDGE_OPEN}{FIND_LABEL}{FIND_HIT}")),
+            "the bar must draw its frame, label and text at its rect: {bar:?} in {top:?}"
+        );
+        assert!(bar.ends_with(FIND_EDGE_CLOSE), "{bar:?} in {top:?}");
+        let left: String = chars[1..usize::from(bar_x)].iter().collect();
+        assert!(
+            left.starts_with(fitted.as_str()),
+            "the title must be the one fitted to {} columns: {left:?} in {top:?}",
+            inner - cols
+        );
+    }
+
+    /// A closed bar leaves the border alone: the title keeps its full width.
+    #[test]
+    fn a_closed_find_bar_draws_nothing_on_the_border() {
+        let (width, height) = FIND_PANE;
+        let mut app = session_title_app();
+        app.note_wall_clock(title_now());
+        let top = full_row_text(&preview_buffer(&mut app, width, height), 0, width);
+        assert!(!top.contains(FIND_LABEL), "{top:?}");
+        let full = line_string(&preview_title(&app, width - 2));
+        assert!(top.contains(full.trim_end()), "{top:?}");
+    }
+
+    /// The bar takes no row of the pane: the transcript rect every pointer
+    /// hit-test reads is identical with the bar open and closed, and the bar is
+    /// really on screen while it is open.
+    #[test]
+    fn the_find_bar_never_moves_the_transcript_rect() {
+        let (width, height) = (100, 30);
+        let mut app = App::new(
+            vec![markable_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        let closed_buffer = drawn_board(&mut app, width, height);
+        let closed = preview_transcript_rect(&app);
+        assert!(!buffer_rows(&closed_buffer, width, height)
+            .iter()
+            .any(|row| row.contains(FIND_LABEL)));
+        assert!(closed.height > 0, "premise: the pane is drawn");
+
+        app.open_find();
+        app.push_find_str(FIND_HIT);
+        let open_buffer = drawn_board(&mut app, width, height);
+        assert!(
+            buffer_rows(&open_buffer, width, height)
+                .iter()
+                .any(|row| row.contains(&format!("{FIND_LABEL}{FIND_HIT}"))),
+            "premise: the bar is drawn"
+        );
+        assert_eq!(preview_transcript_rect(&app), closed);
+    }
+
+    /// A new-session draft card replaces the transcript, so there is nothing for
+    /// the bar to search: `Ctrl-F` over it opens none, nothing is drawn on the
+    /// border and the help row keeps the board's keys rather than `FIND_HINT`. The
+    /// invariant is `App::open_find`'s; the view draws only what is open.
+    #[test]
+    fn no_find_bar_is_drawn_over_a_draft_card() {
+        let (width, height) = FIND_PANE;
+        let mut app = session_title_app();
+        app.note_wall_clock(title_now());
+        app.draft = Some(NewSessionDraft::default());
+        app.open_find();
+        app.push_find_str(FIND_HIT);
+        assert!(!app.is_finding(), "premise: the bar did not open");
+
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        assert_eq!(find_bar_cols(&app, area), 0);
+        let top = full_row_text(&preview_buffer(&mut app, width, height), 0, width);
+        assert!(!top.contains(FIND_LABEL), "{top:?}");
+
+        let (width, height) = FULL_BOARD_SIZE;
+        let help = full_row_text(&drawn_board(&mut app, width, height), height - 1, width);
+        assert!(!help.contains(FIND_HINT), "{help:?}");
+    }
+
+    /// The bar searches whatever the pane shows, so it is drawn over the subagent
+    /// view's title too.
+    #[test]
+    fn the_find_bar_is_drawn_in_the_subagent_view() {
+        let (width, height) = BANNER_PANE;
+        let mut session = sample_session();
+        session.file = fixture("-Users-me-project-epsilon", "sess-delegation-1.jsonl");
+        let mut app = App::new(vec![session], Scope::All, PathBuf::from("/tmp/launch"));
+        app.open_subagent_view("a1b2c3d4e5f6a7b8c", "parser-auditor");
+        app.open_find();
+        app.push_find_str(FIND_HIT);
+
+        let top = full_row_text(&preview_buffer(&mut app, width, height), 0, width);
+        assert!(top.contains("subagent @parser-auditor"), "{top:?}");
+        assert!(top.contains(&format!("{FIND_LABEL}{FIND_HIT}")), "{top:?}");
+    }
+
+    /// The no-match state is a STYLE on the bar's label, shown only for non-empty
+    /// text that marks nothing; a hit and an empty bar keep the label's normal
+    /// colour, and it is a named colour, never RGB.
+    #[test]
+    fn the_find_bar_flags_text_that_marks_nothing_by_its_label_colour() {
+        let (width, height) = FIND_PANE;
+        let label_fg = |text: &str| {
+            let mut app = finding_app(text);
+            let (bar_x, cols) = bar_geometry(&app, width, height);
+            let buffer = preview_buffer(&mut app, width, height);
+            let label = buffer
+                .cell((bar_x + FIND_EDGE_COLS, 0))
+                .expect("the label's first cell");
+            assert_eq!(label.symbol(), "f", "the bar starts at {bar_x}");
+            // The frame is the bar's outline, never its verdict: both edge marks
+            // stay cyan whatever colour the label takes.
+            for x in [bar_x, bar_x + cols - 1] {
+                let mark = buffer.cell((x, 0)).expect("an edge mark");
+                assert!(["┤", "├"].contains(&mark.symbol()), "{:?}", mark.symbol());
+                assert_eq!(mark.fg, Color::Cyan, "edge mark at column {x}");
+            }
+            label.fg
+        };
+        assert_eq!(label_fg(FIND_MISS), Color::Red, "text with no mark");
+        assert_eq!(label_fg(FIND_HIT), Color::Cyan, "text that marks");
+        assert_eq!(label_fg(""), Color::Cyan, "an empty bar flags nothing");
+    }
+
+    /// While the bar is open the help row names the keys it re-routes, under every
+    /// owner that outranks it: a pending chord, then a status, then a compose box.
+    #[test]
+    fn the_help_row_shows_the_find_hint_unless_something_outranks_it() {
+        let (width, height) = FULL_BOARD_SIZE;
+        let help_y = height - 1;
+        let help = |app: &mut App| full_row_text(&drawn_board(app, width, height), help_y, width);
+        let mut app = App::new(
+            vec![sample_session()],
+            Scope::All,
+            PathBuf::from("/tmp/launch"),
+        );
+        assert!(!help(&mut app).contains(FIND_HINT), "closed bar");
+
+        app.open_find();
+        assert!(help(&mut app).contains(FIND_HINT), "open bar");
+
+        app.status = Some("a refusal".to_string());
+        let text = help(&mut app);
+        assert!(
+            text.contains("a refusal") && !text.contains(FIND_HINT),
+            "{text:?}"
+        );
+        app.status = None;
+
+        // A reply box keeps the bar open (`App::open_compose` closes it only for a
+        // draft card), and its hint outranks the find's: the box owns the text keys.
+        let reply = ComposeState::new_reply("sess-normal-1".to_string(), None);
+        let reply_hint = compose_hint(&reply.target, false);
+        app.compose = Some(reply);
+        assert!(app.is_finding(), "premise: the bar is still open");
+        let text = help(&mut app);
+        assert!(text.contains(reply_hint), "{text:?}");
+        assert!(!text.contains(FIND_HINT), "{text:?}");
+        app.compose = None;
+
+        app.pending_chord = true;
+        let text = help(&mut app);
+        assert!(text.contains(&chord_hint(false)), "{text:?}");
+        assert!(!text.contains(FIND_HINT), "{text:?}");
+    }
+
+    /// A narrow pane keeps at least half its border for the title: the bar asks
+    /// `inner width / FIND_BAR_MAX_SHARE_DIVISOR` columns rather than its full
+    /// [`FIND_BAR_COLS`], and the title still draws in what remains.
+    #[test]
+    fn a_narrow_pane_caps_the_find_bar_and_keeps_the_title() {
+        let width = 2 * FIND_BAR_COLS - 6;
+        let height = FIND_PANE.1;
+        let inner = width - 2;
+        assert!(inner < 2 * FIND_BAR_COLS, "premise: a narrow pane");
+        let mut app = finding_app(FIND_HIT);
+        let (bar_x, cols) = bar_geometry(&app, width, height);
+        assert_eq!(cols, inner / FIND_BAR_MAX_SHARE_DIVISOR);
+        assert!(cols < FIND_BAR_COLS, "premise: the cap binds");
+
+        let top = full_row_text(&preview_buffer(&mut app, width, height), 0, width);
+        let chars: Vec<char> = top.chars().collect();
+        let bar: String = chars[usize::from(bar_x)..usize::from(bar_x + cols)]
+            .iter()
+            .collect();
+        assert!(
+            bar.starts_with(&format!("{FIND_EDGE_OPEN}{}", FIND_LABEL.trim_end())),
+            "{bar:?} in {top:?}"
+        );
+        assert!(bar.ends_with(FIND_EDGE_CLOSE), "{bar:?} in {top:?}");
+        let fitted = line_string(&preview_title(&app, inner - cols));
+        let left: String = chars[1..usize::from(bar_x)].iter().collect();
+        assert!(
+            !fitted.trim().is_empty() && left.starts_with(fitted.as_str()),
+            "the title must draw in the {} columns the bar leaves: {left:?} in {top:?}",
+            inner - cols
+        );
+    }
+
+    /// The frame is a mark and a padding space on each side, each as wide as
+    /// [`FIND_EDGE_COLS`] says: a re-worded edge that changes width must not leave
+    /// [`FIND_BAR_COLS`], and so the title's fit, counting the wrong columns.
+    #[test]
+    fn the_find_frame_columns_match_the_edge_strings() {
+        assert_eq!(
+            UnicodeWidthStr::width(FIND_EDGE_OPEN),
+            usize::from(FIND_EDGE_COLS)
+        );
+        assert_eq!(
+            UnicodeWidthStr::width(FIND_EDGE_CLOSE),
+            usize::from(FIND_EDGE_COLS)
+        );
+    }
+
+    /// At a roomy width the bar is exactly its frame around the label and the text
+    /// column: `┤ find: webhook` padded to the text columns, then ` ├`, with the
+    /// closing mark the last cell before the pane's corner.
+    #[test]
+    fn the_find_bar_is_framed_by_edge_marks_and_padding_on_the_border_line() {
+        let (width, height) = FIND_PANE;
+        let mut app = finding_app(FIND_HIT);
+        let (bar_x, cols) = bar_geometry(&app, width, height);
+        assert_eq!(cols, FIND_BAR_COLS, "premise: the cap does not bind");
+        let top = full_row_text(&preview_buffer(&mut app, width, height), 0, width);
+        let chars: Vec<char> = top.chars().collect();
+        let bar: String = chars[usize::from(bar_x)..usize::from(bar_x + cols)]
+            .iter()
+            .collect();
+        assert_eq!(
+            bar,
+            format!(
+                "{FIND_EDGE_OPEN}{FIND_LABEL}{FIND_HIT:<text$}{FIND_EDGE_CLOSE}",
+                text = usize::from(FIND_TEXT_COLS)
+            )
+        );
+        assert_eq!(chars[usize::from(width) - 1], '┐', "{top:?}");
+        assert_eq!(chars[usize::from(bar_x + cols)], '┐', "{top:?}");
+    }
+
+    /// The find hint fits an 80-column help row whole.
+    #[test]
+    fn the_find_hint_fits_an_eighty_column_terminal() {
+        let cols = UnicodeWidthStr::width(FIND_HINT);
+        assert!(cols <= 80, "{cols} columns in {FIND_HINT:?}");
+    }
+
+    /// The key-map modal names the find bar on `Ctrl-F`, the fork box on
+    /// `Ctrl-X f` and the fold on `Ctrl-X z`, and no row still gives `Ctrl-F`
+    /// to the fork or `Ctrl-X f` to the fold.
+    #[test]
+    fn key_map_gives_ctrl_f_to_the_find_and_the_chord_letters_to_fork_and_fold() {
+        let row = |key: &str| {
+            KEY_MAP
+                .iter()
+                .flat_map(|section| section.rows.iter())
+                .find(|(k, _)| *k == key)
+                .unwrap_or_else(|| panic!("no {key:?} row"))
+                .1
+        };
+        assert!(row("Ctrl-F").contains("find"), "{}", row("Ctrl-F"));
+        assert!(!row("Ctrl-F").contains("fork"), "{}", row("Ctrl-F"));
+        assert!(row("Ctrl-X f").contains("fork"), "{}", row("Ctrl-X f"));
+        assert!(!row("Ctrl-X f").contains("fold"), "{}", row("Ctrl-X f"));
+        assert!(row("Ctrl-X z").contains("fold"), "{}", row("Ctrl-X z"));
+        assert!(
+            KEY_MAP
+                .iter()
+                .flat_map(|section| section.rows.iter())
+                .any(|(k, action)| *k == "Enter" && action.contains("find bar")),
+            "an Enter row must say it steps the find bar's matches and never resumes"
+        );
+        assert!(row("Esc").contains("find bar"), "{}", row("Esc"));
+        assert!(row("S-↑/↓").contains("find"), "{}", row("S-↑/↓"));
+    }
+
     /// Task 4.2: while a `Ctrl-X` leader chord is pending, the which-key hint takes
     /// over the help line so the follow-up keys are discoverable — asserted on the
     /// DRAWN cells, not on the source string.
@@ -21739,16 +22235,16 @@ mod tests {
     #[test]
     fn the_chord_hint_fits_an_eighty_column_terminal() {
         let widest = chord_hint(true);
+        let cols = UnicodeWidthStr::width(widest.as_str());
         assert!(
-            widest.chars().count() <= 80,
-            "the which-key hint must not overflow an 80-column help row: {} cols in {widest:?}",
-            widest.chars().count()
+            cols <= 80,
+            "the which-key hint must not overflow an 80-column help row: {cols} cols in {widest:?}"
         );
     }
 
-    /// The fork and the fold each name their own letter: `f` forks and `z` folds,
-    /// so a swap of the two letters in the which-key hint fails here as it would in
-    /// `update::chord_key`.
+    /// The fork and the fold each name their own letter: `f` forks (the key the
+    /// find bar freed by taking `Ctrl-F`) and `z` folds, so a swap of the two
+    /// letters in the which-key hint fails here as it would in `update::chord_key`.
     #[test]
     fn the_chord_hint_names_f_as_fork_and_z_as_fold() {
         for hidden in [false, true] {
@@ -21822,7 +22318,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         for needle in [
-            "Ctrl-X f",
+            "Ctrl-F",
             "Ctrl-N",
             "Ctrl-R",
             "Ctrl-K",

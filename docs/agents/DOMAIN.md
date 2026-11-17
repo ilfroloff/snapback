@@ -735,14 +735,24 @@ between marked LINES, not between occurrences, because a stop is a place to look
 and a line is what the jump can scroll to. A line saying the query twice, or
 carrying two different atoms, is marked twice and stopped at once.
 
-The re-search SKIPS the body rows of an OPEN [injected node](#injected-context-node-storepreview)
+For the BOARD query the re-search SKIPS the body rows of an OPEN
+[injected node](#injected-context-node-storepreview)
 (`RenderedPreview::unindexed`, asked through `is_indexed_line`): the index never
 held that text, so a mark there would be a hit the filter did not count. That one
 walk feeds the highlights, the `Shift`-arrow stops, the match jump and the
 outside-the-preview note, so the skip keeps all four consistent with the filter.
-The [subagent view](#delegation-line-and-subagent-view-storepreview) is never searched at all, for
-the same reason: its render's match map stays empty, so it takes no marks, no
-stops, no jump and no note.
+The [subagent view](#delegation-line-and-subagent-view-storepreview) is never
+searched by the board query, for the same reason: under that source its render's
+match map stays empty, so it takes no marks, no stops, no jump and no note.
+
+The preview's [find bar](#find-bar-ctrl-f) is the SECOND source of that same map,
+and the reason above does not bind it: it admits nothing, so no mark of its is a
+hit the filter did not count. It walks through the same function, so the
+matcher call, the smart case and the fold are shared, and it differs from the
+board only in what the walk SKIPS — it marks an open injected node's body and the
+subagent view's render alike. Which source a map belongs to is part of the cache
+entry's recompute key (`MarkKey`), so the board's map is never served for the
+find's text or the reverse.
 
 The two pipelines also disagree about what EXISTS: a query can match the index
 and occur nowhere in the rendered preview — the same one-off probe put it near
@@ -2403,15 +2413,15 @@ then, once the record lists it, how it stands and its `k/n` place in
 [launch order](#subagent-record-and-running-list-storesubagents));
 its pinned row shows nothing of the session's — no failed task, no live status,
 no reported-status fallback; the session's in-flight reply tail stays off it; and
-it takes no search marks, since the content index never held its text. Opening a
+the board query puts no marks on it, since the content index never held its text (the [find bar](#find-bar-ctrl-f) does mark it). Opening a
 reply or fork box leaves it, and so does ANY change of the selected session
 (`App::set_selected` drops the view): `↑`/`↓` once the view is open but not
 [on screen](#subagent-view-on-screen), the mouse wheel over the list, a search
 edit, `Tab` or `Ctrl-A` that filters the row out, `Ctrl-X x` or `Ctrl-X h` hiding
 it, `Ctrl-X d` or `Ctrl-X w` taking it off the board, `Ctrl-X z` from a `↳` row
 (it re-targets the head), a reload that drops the row, and the cursor following a
-headless fork onto its new row. `Esc` with an empty query leaves it, open or
-hidden (after clearing a typed query, before quitting), and so does `Ctrl-X ↓`
+headless fork onto its new row. `Esc` with the find bar closed and an empty query leaves it, open or
+hidden (after closing the bar and clearing a typed query, before quitting), and so does `Ctrl-X ↓`
 pressed in it, back to where the session's own transcript was scrolled. `App::ensure_preview` is the ONE place the
 pane switches, through `App::live_subagent_view`, so the lines drawn, the marks,
 the height, the hit-test, the copy and the pinned row all come from one render.
@@ -2582,11 +2592,12 @@ lone `←`/`→` step does. They are bound on the view being ON SCREEN ALONE
 typed or not:
 falling through to a selection move once the last subagent finished would turn
 the key into the misclick this binding exists to remove, under the user's
-finger. `Shift-Up` / `Shift-Down` reach them too, since the view marks nothing
-for the match step to take. They refuse, sticky, with the two lines above and a
+finger. `Shift-Up` / `Shift-Down` reach them too, since the board query marks
+nothing in the view for the match step to take (with the find bar open on it they
+step its marks instead). They refuse, sticky, with the two lines above and a
 third, `SUBAGENTS_NONE_RUNNING_REFUSAL` (`SubagentsUnavailable::NoneRunning`),
 when the record lists subagents and none runs; it names `←`/`→`. The way back
-is `Esc` (after a typed query is cleared) or `Ctrl-X ↓` again. A step
+is `Esc` (after the find bar is closed and a typed query is cleared) or `Ctrl-X ↓` again. A step
 re-renders the newly viewed subagent's whole transcript on the UI thread at the
 next draw, the cache-miss class a `←`/`→` step has.
 
@@ -2893,7 +2904,8 @@ that differ.
 | **Compose model pick** | `None` (the default, in every new compose) / a `resume::ModelPick`: an offered alias plus an optional `--effort` level | the `--model` (and effort) a compose's own launch asks for, picked with `Ctrl-L` inside that compose and held on it (`ComposeState::model`); which launches it may reach is the A MODEL IS PICKED PER COMPOSE, NEVER PER BOARD rule in [AGENTS.md](../../AGENTS.md#critical-rules). With no pick the compose's `model:` label names what `claude` will choose instead. See [Compose model pick](#compose-model-pick-ctrl-l). |
 | **Forced rescan** | `Ctrl-X r` | not a mode: a one-shot that drops the store's parse cache and re-reads every transcript, reporting the count it landed on. The board autorefreshes and reuses unchanged files by itself, so this is the escape hatch for a row that looks stale — see [incremental reload](#incremental-reload-storesessionstore). |
 | **Modal** | `Row` \| `List` layout in one `Option<Modal>` | the SINGLE type for a TITLED, choice-bearing overlay. `Enter` on a running session builds the `Attach` / `Fork` / `Cancel` choice (a `Row`); `Ctrl-N` with defined agents builds the agent picker (a `List`); `Ctrl-L` inside a compose builds the model picker (a `List` opened OVER that compose, which stays open beneath it; row 0 is the compose's default, and the compose's current pick — effort included — is pre-highlighted by MATCHING the built choices rather than by index arithmetic, so a pick that is no longer offered falls back to row 0; its `←`/`→` step the highlighted model row's effort, which the row draws inline as ` · <level>`, or a dim ` · default effort` while unset and highlighted — see [Compose model pick](#compose-model-pick-ctrl-l)); `Ctrl-X d` builds the hard-delete confirm (a `Row`: `Delete this` / `Delete lineage (N)` — offered only on the HEAD row of a real multi-member lineage (`App::lineage_choice`, see [Row role](#row-role-head-row-or--row)), carrying the member ids resolved at OPEN time — / `Cancel`, default-highlighted on Cancel by that choice's position); `Ctrl-X w` builds the move picker (a `List` of the launch project's worktrees, main first, the session's current folder omitted; each choice carries `ModalAction::MoveTo(path)`, and `Enter` starts the headless move — or, on a lineage HEAD row, `ModalAction::ChooseMoveScope { target, members }`, whose `Enter` opens the move's SCOPE confirm (`App::open_move_scope_confirm`, a `Row` under the same title: `Move this` → `MoveTo` / `Move lineage (N)` → `ModalAction::MoveLineage { target, ids }` / `Cancel`, default-highlighted on Cancel by position, its prompt disclosing hidden members through `lineage_confirm_message`); the member ids ride both actions from the picker's open, see [Move](#move-to-another-worktree-ctrl-x-w-srcclaude_movers)). Each choice carries a `ModalAction` tag the one confirm handler (`confirm_modal`) routes on. The plain Enter/Esc stop confirmations (`Ctrl-R`, `Ctrl-K`), the compose zone and the `Ctrl-X` chord are separate keyboard owners, NOT `Modal`s — see [PATTERNS.md](PATTERNS.md#10-keys-actions-outcomes). |
-| **Subagent view** | off (default) / ONE subagent of the selected session (`App::subagent_view`, keyed by the session's id and the agent's) | what the preview pane shows: the selected session's own transcript, or a subagent's own in its place. Switched to ONLY by a click on a `◆ delegated to …` line, `Ctrl-X ↓`, or a `←`/`→` or `↑`/`↓` step inside the view (through the [subagent record](#subagent-record-and-running-list-storesubagents)), never by a search route; left by `Esc` (its middle step: a typed query is cleared first, and the board quits only from the session's own transcript), `Ctrl-X ↓` again, opening a `Ctrl-R` / `Ctrl-X f` box, or any change of the selected session (the routes, `↑`/`↓` while the view is open but NOT [on screen](#subagent-view-on-screen) among them: [Delegation line and subagent view](#delegation-line-and-subagent-view-storepreview)). In memory only, like the fold state. See [Delegation line and subagent view](#delegation-line-and-subagent-view-storepreview). |
+| **Find bar** | closed (default) / open (`App::find`, a `FindBar` holding the typed text and a zero-entry `SearchIndex`) | an in-preview search: `Ctrl-F` opens a `find:` input on the preview's top border and its text marks the transcript the pane shows (the session's own or the subagent view's), by the same per-atom rule as the board query's marks, without ever touching the list, the selection or the board query. In memory only, never persisted, closed by `Esc`, a step to the `1:0` layout and a `Ctrl-N` draft card, which stop showing the transcript, and never opened over a draft card (`Ctrl-F` there does nothing, the card's background launch in flight included). See [Find bar](#find-bar-ctrl-f). |
+| **Subagent view** | off (default) / ONE subagent of the selected session (`App::subagent_view`, keyed by the session's id and the agent's) | what the preview pane shows: the selected session's own transcript, or a subagent's own in its place. Switched to ONLY by a click on a `◆ delegated to …` line, `Ctrl-X ↓`, or a `←`/`→` or `↑`/`↓` step inside the view (through the [subagent record](#subagent-record-and-running-list-storesubagents)), never by a search route; left by `Esc` (its last step before quitting: the find bar closes first, then a typed query is cleared, and the board quits only from the session's own transcript), `Ctrl-X ↓` again, opening a `Ctrl-R` / `Ctrl-X f` box, or any change of the selected session (the routes, `↑`/`↓` while the view is open but NOT [on screen](#subagent-view-on-screen) among them: [Delegation line and subagent view](#delegation-line-and-subagent-view-storepreview)). In memory only, like the fold state. See [Delegation line and subagent view](#delegation-line-and-subagent-view-storepreview). |
 
 The current-folder scope is an **exact** canonical `cwd` match by design: a
 repo's *other* worktree folders do not appear there, no matter how the paths
@@ -3603,6 +3615,62 @@ prefetch: with it, that prefetch never runs the repository's git configuration (
     was trusted. They are display only, and nothing runs.
   - A failed fetch is never cached, so its retry reads trust again.
 
+### Find bar (`Ctrl-F`)
+
+The board query answers "which sessions", and re-filters the list to do it: a word
+absent from the selected session's label takes that session off the board in
+name-only mode, and in content mode the filter can still miss it (the index keeps
+only the oldest `CONTENT_INDEX_CAP` bytes, a multi-word query must co-occur within
+the proximity window, and an open injected node's body is never marked). The find
+bar answers "where in THIS transcript" and re-filters nothing.
+
+`Ctrl-F` opens `App::find` (`Some(FindBar)`) unless a `Ctrl-N` draft card is on the
+pane, and `Esc` closes it, as do a step to the `1:0` layout and a draft card opening
+(below). It holds the typed text (a one-line
+input built like `App::query_input`, edited through the same helpers) and a
+`SearchIndex::new()` that holds ZERO entries: `set_query` compiles the text
+into atoms there and nothing is ever admitted or filtered, so the bar marks by the
+board's own PER-ATOM, smart-case, folded rule and cannot disturb `filtered`, the
+selection or the board query. Opening it never leaves the subagent view: it
+searches whatever the pane shows, which is why it, unlike the board query, marks a
+subagent's transcript. From the list-only layout (`1:0`) it brings the preview
+back at `Even`, as `open_compose` does; a step to `1:0` and a `Ctrl-N` draft card
+close it, while a reply or fork box, which previews the real transcript, leaves it
+open. The bar is open only while its pane draws it, and a draft card draws no bar, so
+`open_find` does nothing while `App::draft` is set: the card outlives its editor
+during a background launch, and text typed into a bar nobody can see would be lost.
+`view::find_bar_cols` therefore asks only whether the bar is open.
+
+While it is open it REPLACES the board query as the source of
+`CachedPreview::matches`, so the highlights, the `Shift`-arrow stops and the match
+jump all read the one map (see the re-search above for the walk
+and the one filter, the injected body, that is the board source's alone). A
+text edit parks no match line and arms the match jump directly, in either search
+mode, so the preview lands on the NEWEST match as it does for content search. A
+re-apply of the BOARD query while the bar is open (the `Tab` mode toggle) arms
+nothing and keeps the parked line, since the marks come from the find's text; a
+re-filter that moves the selection arms the jump through the selection setter, as
+any new transcript does, and the subagent view opening arms it directly (a find edit
+and the view opening are the two arms that skip the mode gate; the explicit
+`Shift`-arrow step is a third, and the five sites are
+[PATTERNS.md](PATTERNS.md#5-selection-and-scroll-survive-reloads)'s). The
+"match lies outside the previewed transcript" nudge judges the board query and so
+stays silent while the bar is open. The bar is NOT a keyboard owner (PATTERNS §10):
+printable keys, the three delete keys, the caret keys (bar the subagent view's `←` / `→`, which keep stepping subagents) and a paste go to its input,
+and every other key decodes as it would without it, with two exceptions that
+`key_to_action` makes — `Esc` closes the bar before it clears a query or leaves a
+view, and `Enter` steps to the previous (older) match, as `Shift-↑` does, and never
+resumes (with nothing marked it does nothing). `Shift-↑` / `Shift-↓` step the marks
+whenever any source marked something, so they work with an empty board query.
+
+It is drawn right-aligned on the preview's top border, framed by a cyan `┤ ` and
+` ├` (a mark and a padding space each side, counted in `view::find_bar_cols` and so
+in the width the title is fitted to), the pane's title fitted to
+the width that remains, and its label (not the edges) turns red when the text is non-empty and
+marks nothing: a fact on the bar, never on the status line. The text is
+not persisted. A hit inside a collapsed `◆` / `◇` node is not drawn and so not
+findable until the node is clicked open.
+
 ### Terminal paste routing (`Event::Paste`)
 
 `tui::init_terminal` enables **bracketed paste**, so the terminal delivers a
@@ -3619,7 +3687,7 @@ open) — a partial enumeration here is a wrong one, so all seven are stated:
 | **Stop confirm** (`handle_stop_confirm_key`) | ignored | A plain Enter/Esc gate; a paste is neither, and must never stop an agent. |
 | **Interrupt confirm** (`handle_interrupt_confirm_key`) | ignored | Same. |
 | **Compose** (`App::is_composing`) | inserted at the caret, newlines intact (`compose::insert_paste` → `TextArea::insert_str`), then the [pick list](#compose-pick-list) re-derived, so a pasted `/` or `@` opens it like a typed one | The fix: as keystrokes, the first embedded newline was a bare `Enter` = `ComposeAction::Send`. |
-| **Board** | inserted at the query's caret, newlines flattened to spaces | The query is one line and `search::gate_atoms` splits it on spaces into substring atoms, so `foo\nbar` becomes exactly the `foo bar` the user could have typed. First-line-only would silently discard input. |
+| **Board** | inserted at the query's caret — at the [find bar](#find-bar-ctrl-f)'s while it is open — newlines flattened to spaces | The query is one line and `search::gate_atoms` splits it on spaces into substring atoms, so `foo\nbar` becomes exactly the `foo bar` the user could have typed. First-line-only would silently discard input. |
 
 Two rules hold on every path, both in `update::accept_paste`: line endings
 normalize to `\n` (`\r\n` collapses to one, a lone `\r` becomes one), and the text

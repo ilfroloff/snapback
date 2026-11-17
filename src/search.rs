@@ -796,9 +796,9 @@ impl SearchIndex {
     }
 
     /// The active query text.
-    // The `App` owns its own query string and renders that; this getter is the
-    // index-side accessor asserted on by the refresh tests.
-    #[allow(dead_code)]
+    // The `App` keeps its own query string for the search box; the preview's
+    // mark walk asks the INDEX's, because the marks must follow the matcher's
+    // atoms (the split the filter used), not the box's raw text.
     #[must_use]
     pub fn query(&self) -> &str {
         &self.query

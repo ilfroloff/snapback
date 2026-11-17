@@ -2,12 +2,17 @@
 //!
 //! This module owns the MULTILINE `ratatui_textarea` editor (plus the
 //! `App::compose` field, whose type is [`ComposeState`]) — one of exactly TWO
-//! sites that reference the crate. The other is the board's ONE-LINE search
-//! query, [`App::query_input`](super::app::App::query_input), edited by `App`'s
-//! query mutators and drawn by `view::render_search`. Each site owns its own
-//! configuration and its own key routing, and neither reads the other's; the
-//! pairing is not a `memchr`-style single-module confinement, and `Cargo.toml`
-//! states the same two-site boundary as the blast radius of a version bump.
+//! sites that HOLD a `ratatui_textarea` value (three values in all). The other is
+//! `tui::app`, which holds the board's ONE-LINE inputs: the search query,
+//! [`App::query_input`](super::app::App::query_input), and the preview find bar's
+//! text, [`FindBar::input`](super::app::FindBar::input), edited by `App`'s
+//! mutators and drawn by `view::render_search` / `view::render_find_bar`. Those
+//! two draw through the one `view::render_input_line`, whose `input` parameter is
+//! the only place `tui::view` names the type: three files `use` the crate, two
+//! hold a value. Each site owns its own configuration and its own key routing,
+//! and neither reads the other's; the pairing is not a `memchr`-style
+//! single-module confinement, and `Cargo.toml` states the same boundary as the
+//! blast radius of a version bump.
 //!
 //! The difference that matters between the two: this editor IS a keyboard owner,
 //! so it may forward raw keys to `TextArea::input`. The board is not, and must
@@ -170,11 +175,12 @@ pub struct ComposeState {
     /// What this draft is addressed to — a reply, a fork, or a new background
     /// agent.
     pub target: ComposeTarget,
-    /// The multiline editor buffer, shared by EVERY target. One of exactly TWO
-    /// `ratatui_textarea` values in the program — the other is the board's
-    /// one-line [`App::query_input`](super::app::App::query_input), which is a
-    /// separate buffer with its own configuration and is never routed through
-    /// this one (see the module doc).
+    /// The multiline editor buffer, shared by EVERY target. One of exactly THREE
+    /// `ratatui_textarea` values in the program — the others are the board's
+    /// one-line [`App::query_input`](super::app::App::query_input) and the
+    /// preview find bar's [`FindBar::input`](super::app::FindBar::input), which
+    /// are separate buffers with their own configuration and are never routed
+    /// through this one (see the module doc).
     pub textarea: TextArea<'static>,
     /// The model (and optional effort) picked for THIS compose with `Ctrl-L`, or
     /// `None` for its default — no `--model` at all, so a reply normally keeps the

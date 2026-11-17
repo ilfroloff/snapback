@@ -2059,6 +2059,69 @@ fn own_process_id() -> u32 {
 #[cfg(test)]
 const TEST_OWN_PID: u32 = 1 << 22;
 
+/// Whose text the preview's marks are computed from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum MarkSource {
+    /// The board's search query — the default, and the only source a pane that is
+    /// not being searched has.
+    #[default]
+    Board,
+    /// The preview's find bar ([`FindBar`]), while it is open.
+    Find,
+}
+
+/// A [`CachedPreview`]'s recompute key: which source the marks were computed
+/// for and the text it held. The default is the EMPTY board key, so a fresh
+/// entry with an empty map reads as "never searched": a non-empty text, or the
+/// find source, recomputes on the call that built it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct MarkKey {
+    source: MarkSource,
+    text: String,
+}
+
+impl MarkKey {
+    /// Whether this key describes `(source, text)`, without building one.
+    fn is(&self, source: MarkSource, text: &str) -> bool {
+        self.source == source && self.text == text
+    }
+}
+
+/// Where every line of `entry` holds an atom of `index`: line index -> matched
+/// CHAR positions. The ONE walk behind both [`MarkSource`]s.
+///
+/// Shared by both sources: the matcher call and the caller's [`MarkScratch`]
+/// (one set of buffers for the whole pane). Specific to `Board`: the lines the
+/// list's admission never counted (an open injected-context node's body), which
+/// exist only to keep a board mark from being a hit the filter did not count. An
+/// empty query marks nothing, so the walk is skipped outright.
+fn walk_preview_matches(
+    entry: &CachedPreview,
+    index: &SearchIndex,
+    source: MarkSource,
+) -> HashMap<usize, HashSet<usize>> {
+    if index.query().is_empty() {
+        return HashMap::new();
+    }
+    let mut scratch = MarkScratch::new();
+    entry
+        .rendered
+        .text
+        .lines
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| source == MarkSource::Find || entry.rendered.is_indexed_line(*i))
+        .filter_map(|(i, line)| {
+            let matched = index.atom_match_positions_with(&line_text(line), &mut scratch);
+            if matched.is_empty() {
+                None
+            } else {
+                Some((i, matched.into_iter().collect()))
+            }
+        })
+        .collect()
+}
+
 /// One session's preview as rendered at [`App::preview_width`] — the styled text
 /// and its link regions, plus everything else that is a function of that same
 /// (session, width) pair.
@@ -2084,18 +2147,24 @@ struct CachedPreview {
     /// only the lines the viewport can reach, and lets a search jump read a matched
     /// line's first row as one index instead of re-wrapping everything above it.
     row_prefix: Vec<usize>,
-    /// Where the active query occurs in `rendered`: line index -> the matched CHAR
-    /// positions within THAT line's plain text.
+    /// Where the active MARK SOURCE's text occurs in `rendered`: line index -> the
+    /// matched CHAR positions within THAT line's plain text.
+    ///
+    /// Two sources write it ([`MarkSource`]): the board's query and the preview's
+    /// find bar. Both walk through ONE function ([`walk_preview_matches`]) and so
+    /// mark by the same per-atom, smart-case, folded rule; only the BOARD source is
+    /// held to the list's admission, which is the open injected-context node's body
+    /// ([`preview::RenderedPreview::is_indexed_line`]): the content index does not
+    /// hold it, so a board mark there would be a hit the filter never counted. The
+    /// find admits nothing, so it marks that body too.
     ///
     /// Derived by re-searching the RENDERED lines through
-    /// [`SearchIndex::atom_match_positions`] — never by projecting a position out of
-    /// `Session::content_index`, which is a different, lossy extraction with no
-    /// offset function into these lines (see
-    /// [DOMAIN.md](../../docs/agents/DOMAIN.md#a-content-index-position-never-projects-into-preview-coordinates)). Only
-    /// lines with at least one match are present, so an unmatched transcript costs
-    /// an empty map. The rows of an open injected-context node's body are never
-    /// searched ([`preview::RenderedPreview::is_indexed_line`]): the index does not
-    /// hold them, so a mark there would be a hit the filter never counted.
+    /// [`SearchIndex::atom_match_positions_with`] — never by projecting a position
+    /// out of `Session::content_index`, which is a different, lossy extraction with
+    /// no offset function into these lines (see
+    /// [DOMAIN.md](../../docs/agents/DOMAIN.md#a-content-index-position-never-projects-into-preview-coordinates)).
+    /// Only lines with at least one match are present, so an unmatched transcript
+    /// costs an empty map.
     ///
     /// That seam marks PER ATOM, with the FILTER's own memmem finders, so the marks
     /// reproduce the rule the row was admitted by: a multi-atom query marks each
@@ -2103,12 +2172,15 @@ struct CachedPreview {
     /// The row LABEL is the other case — one string, matched as a whole — and takes
     /// the WHOLE-STRING rule over the same finders.
     matches: HashMap<usize, HashSet<usize>>,
-    /// The query [`matches`](Self::matches) was computed for — the recompute key.
+    /// The source and text [`matches`](Self::matches) was computed for — the
+    /// recompute key.
     ///
-    /// The MODE is deliberately not part of it: the seam searches the query's atoms
-    /// in the display string alone, so widening the filter to content cannot move
-    /// where the query occurs in these lines.
-    matches_query: String,
+    /// The SOURCE is part of it because the same text marks differently under the
+    /// two (the board's admission filter), so a map served across a source change
+    /// would be the other source's. The search MODE is deliberately not: the seam
+    /// searches the atoms in the display string alone, so widening the filter to
+    /// content cannot move where the text occurs in these lines.
+    matches_key: MarkKey,
     /// The ids `· failed` was drawn for on its delegation lines
     /// ([`App::failed_subagent_ids`] at the render): the key that evicts this
     /// entry when the set moves, and only then.
@@ -2260,6 +2332,27 @@ fn step_match_line(lines: &[usize], current: Option<usize>, forward: bool) -> Op
     }
 }
 
+/// The preview pane's FIND BAR: a second single-line input, and the matcher its
+/// text compiles into.
+///
+/// `input` is built like the board's [`query_input`](App::query_input) (one line,
+/// the same edit helpers), and `marker` is a [`SearchIndex`] that holds ZERO
+/// entries: it admits and filters nothing, it only carries the compiled atoms the
+/// preview's per-atom mark rule reads. So the bar marks by exactly the board's
+/// rule without ever re-filtering the session list.
+///
+/// The marking rule reads the compiled ATOMS alone. The search mode and the
+/// entries only decide LIST admission, so on this base there is no matching-rule
+/// setting to mirror from the board's index onto `marker`; one that is added
+/// later must be copied here when the bar opens and on every toggle.
+pub struct FindBar {
+    /// The typed text — one line, written only through the `input_*` helpers.
+    pub input: TextArea<'static>,
+    /// Compiled with `set_query` (the board's whitespace-atom rule), never
+    /// `set_atoms`, which is the compose pick list's.
+    pub marker: SearchIndex,
+}
+
 /// The full TUI state model.
 ///
 /// Selection is stored as a stable `session_id` (never a list index) so it
@@ -2300,6 +2393,15 @@ pub struct App {
     /// `Tab` to insert-tab — which are the board's quit, stop, leader chord and
     /// search-mode toggle. Explicit method calls only.
     pub query_input: TextArea<'static>,
+    /// The preview's find bar, `Some` while it is open.
+    ///
+    /// Like [`query_input`](Self::query_input) it is NOT a keyboard owner
+    /// (PATTERNS §10): while open it takes printable keys, edits and pastes, and
+    /// every other key keeps its board meaning. It is never persisted, and its
+    /// [`marker`](FindBar::marker) only marks. Open only while the pane draws it:
+    /// [`open_find`](Self::open_find) refuses over a draft card, and a step to the
+    /// list-only layout or a draft card opening closes it.
+    pub find: Option<FindBar>,
     /// Name-only vs. name+content search (mirrors the search index mode).
     pub search_mode: SearchMode,
     /// Which sessions the board is showing: current folder, project, or all.
@@ -2536,11 +2638,12 @@ pub struct App {
     /// session), a fork (`Ctrl-X f`) or a new background agent (`Ctrl-N`), told
     /// apart by its [`ComposeTarget`](super::compose::ComposeTarget). Its type
     /// ([`super::compose::ComposeState`]) holds the MULTILINE
-    /// `ratatui_textarea` editor — one of exactly TWO `ratatui_textarea` values
-    /// on this struct, the other being the one-line
-    /// [`query_input`](Self::query_input) beside it. The two never share a
+    /// `ratatui_textarea` editor — one of exactly THREE `ratatui_textarea` values
+    /// on this struct, the others being the one-line
+    /// [`query_input`](Self::query_input) beside it and the find bar's
+    /// ([`FindBar::input`], under [`find`](Self::find)). The three never share a
     /// buffer, a configuration or a key route: this one is a keyboard owner and
-    /// forwards raw keys to the widget, the query is not and never may
+    /// forwards raw keys to the widget, the other two are not and never may
     /// (PATTERNS.md §10).
     pub compose: Option<super::compose::ComposeState>,
     /// The open NEW-SESSION draft, if any — see [`NewSessionDraft`].
@@ -2973,9 +3076,16 @@ pub struct App {
     /// by the next frame whether or not that frame can act on it (see
     /// [`take_preview_match_jump`](Self::take_preview_match_jump)).
     ///
-    /// Set when the selection actually MOVES to a DIFFERENT session, and on a QUERY
-    /// change — which the `Tab` mode toggle is, since it makes the same text match
-    /// more. That first word is the whole point: a live session appends turns at the
+    /// Armed at exactly five sites. Through the mode-gated
+    /// [`request_preview_match_jump`](Self::request_preview_match_jump): when the
+    /// selection actually MOVES to a DIFFERENT session, and on a QUERY change —
+    /// which the `Tab` mode toggle is, since it makes the same text match more
+    /// (skipped while the find bar is open). Directly, past the gate: a find edit
+    /// ([`apply_find_change`](Self::apply_find_change)), the explicit match step
+    /// ([`preview_match_step`](Self::preview_match_step)) and the subagent view
+    /// opening while the bar is open
+    /// ([`open_subagent_view`](Self::open_subagent_view)). The selection arm is
+    /// the whole point: a live session appends turns at the
     /// watcher's cadence, and a reload that re-reads it must leave the reader's
     /// viewport exactly where they put it. A reload keeps the selection by id, so
     /// [`set_selected`](Self::set_selected) is a no-op there and a growing transcript
@@ -3056,6 +3166,79 @@ fn new_query_input() -> TextArea<'static> {
     input
 }
 
+// --- single-line input edits -------------------------------------------------
+//
+// The edit mutations behind the board's query widget, over a bare `TextArea` so
+// the preview's find bar (a second single-line input, same PATTERNS §10 shape)
+// edits by the SAME code. Each returns whether the TEXT changed; the caller
+// re-applies what depends on the text only then. A caret move never changes it.
+
+/// Insert `c` at the caret. Always a change.
+fn input_insert_char(input: &mut TextArea<'static>, c: char) -> bool {
+    input.insert_char(c);
+    true
+}
+
+/// Insert a whole string at the caret as ONE edit. An empty string changes
+/// nothing. The caller owns the single-line shape of `text` (`insert_str` splits
+/// on a newline).
+fn input_insert_str(input: &mut TextArea<'static>, text: &str) -> bool {
+    input.insert_str(text)
+}
+
+/// Delete the character BEFORE the caret; a caret at the head changes nothing.
+fn input_delete_char(input: &mut TextArea<'static>) -> bool {
+    input.delete_char()
+}
+
+/// Delete the search ATOM before the caret in ONE edit — the body of
+/// [`App::pop_query_word`]'s doc contract. Nothing before the caret changes
+/// nothing.
+fn input_delete_atom(input: &mut TextArea<'static>) -> bool {
+    // Both halves are taken by VALUE: the widget calls below need
+    // `&mut input`, so the borrow of its line has to END first.
+    let (head, tail) = {
+        let text = &input.lines()[0];
+        let caret = text
+            .char_indices()
+            .nth(input.cursor().1)
+            .map_or(text.len(), |(byte, _)| byte);
+        let boundary = search::last_atom_start(&text[..caret]);
+        if boundary == caret {
+            return false;
+        }
+        (text[..boundary].to_string(), text[caret..].to_string())
+    };
+
+    // An empty half inserts nothing, and `insert_str` reports that as a no-op.
+    input.clear();
+    input.insert_str(&tail);
+    input.move_cursor(CursorMove::Head);
+    input.insert_str(&head);
+    true
+}
+
+/// Empty the line; an already-empty one changes nothing.
+fn input_clear(input: &mut TextArea<'static>) -> bool {
+    if input.is_empty() {
+        return false;
+    }
+    input.clear();
+    true
+}
+
+/// Move the caret one character (`by_word` false) or one word toward the tail
+/// (`forward`) or the head. Never a text change.
+fn input_move_caret(input: &mut TextArea<'static>, forward: bool, by_word: bool) {
+    let step = match (forward, by_word) {
+        (true, false) => CursorMove::Forward,
+        (false, false) => CursorMove::Back,
+        (true, true) => CursorMove::WordForward,
+        (false, true) => CursorMove::WordBack,
+    };
+    input.move_cursor(step);
+}
+
 impl App {
     /// Build an app over `sessions` with the given `scope` and canonicalized
     /// `launch_dir`. Computes the initial filter and selects the first row.
@@ -3080,6 +3263,7 @@ impl App {
             selected: None,
             scroll: 0,
             query_input: new_query_input(),
+            find: None,
             search_mode,
             scope,
             // OFF unless the launch flag says otherwise (`crate::run` sets it
@@ -3407,6 +3591,10 @@ impl App {
 
     /// Where the caret sits in [`query`](Self::query), counted in CHARACTERS from
     /// the head of the line — the widget's own unit, never a byte offset.
+    ///
+    /// Test-only since the edit helpers read the caret off the widget themselves:
+    /// the renderer draws the widget directly, so no runtime path asks for it.
+    #[cfg(test)]
     #[must_use]
     pub fn query_caret(&self) -> usize {
         self.query_input.cursor().1
@@ -3421,12 +3609,7 @@ impl App {
     /// and forget the parked match line — moving the reader's pane on a key that
     /// edits nothing.
     pub fn move_query_caret(&mut self, forward: bool) {
-        let step = if forward {
-            CursorMove::Forward
-        } else {
-            CursorMove::Back
-        };
-        self.query_input.move_cursor(step);
+        input_move_caret(&mut self.query_input, forward, false);
     }
 
     /// Move the query's caret one WORD toward the tail (`forward`) or the head —
@@ -3438,12 +3621,7 @@ impl App {
     /// nothing, and it skips the query funnel for the reason
     /// [`move_query_caret`](Self::move_query_caret) gives.
     pub fn move_query_caret_by_word(&mut self, forward: bool) {
-        let step = if forward {
-            CursorMove::WordForward
-        } else {
-            CursorMove::WordBack
-        };
-        self.query_input.move_cursor(step);
+        input_move_caret(&mut self.query_input, forward, true);
     }
 
     /// Re-apply everything that depends on the query TEXT: the matcher's pattern,
@@ -3461,15 +3639,22 @@ impl App {
         // FIELD PATH, not the `query()` accessor: that borrows all of `self` and
         // cannot be held across the `&mut self.index` this line needs.
         self.index.set_query(&self.query_input.lines()[0]);
-        self.request_preview_match_jump();
+        // While finding the marks come from the find's text, not this query, so a
+        // re-apply that keeps the previewed transcript (`Tab`'s mode toggle) must
+        // not drop the place the user stepped to. A re-filter that moves the
+        // selection arms the jump itself, through `set_selected`.
+        if !self.is_finding() {
+            self.request_preview_match_jump();
+        }
         self.reapply_preserving_selection();
         self.note_match_outside_preview();
     }
 
     /// Insert a character at the query's caret and re-filter (type-to-search).
     pub fn push_query_char(&mut self, c: char) {
-        self.query_input.insert_char(c);
-        self.apply_query_change();
+        if input_insert_char(&mut self.query_input, c) {
+            self.apply_query_change();
+        }
     }
 
     /// Insert a whole STRING at the query's caret and re-filter ONCE — the
@@ -3493,7 +3678,7 @@ impl App {
     pub fn push_query_str(&mut self, text: &str) {
         // `insert_str` reports whether anything was inserted; an empty string is a
         // no-op, so there is no pointless re-filter.
-        if self.query_input.insert_str(text) {
+        if input_insert_str(&mut self.query_input, text) {
             self.apply_query_change();
         }
     }
@@ -3504,7 +3689,7 @@ impl App {
     /// whether anything went — so a caret at the head of the line, an empty query
     /// included, re-filters not at all.
     pub fn pop_query_char(&mut self) {
-        if self.query_input.delete_char() {
+        if input_delete_char(&mut self.query_input) {
             self.apply_query_change();
         }
     }
@@ -3549,27 +3734,9 @@ impl App {
     /// stepping the caret back with `CursorMove::Back` one widget pass per
     /// character stepped over.
     pub fn pop_query_word(&mut self) {
-        // Both halves are taken by VALUE: the widget calls below need
-        // `&mut self.query_input`, so the borrow of its line has to END first.
-        let (head, tail) = {
-            let query = &self.query_input.lines()[0];
-            let caret = query
-                .char_indices()
-                .nth(self.query_caret())
-                .map_or(query.len(), |(byte, _)| byte);
-            let boundary = search::last_atom_start(&query[..caret]);
-            if boundary == caret {
-                return;
-            }
-            (query[..boundary].to_string(), query[caret..].to_string())
-        };
-
-        // An empty half inserts nothing, and `insert_str` reports that as a no-op.
-        self.query_input.clear();
-        self.query_input.insert_str(&tail);
-        self.query_input.move_cursor(CursorMove::Head);
-        self.query_input.insert_str(&head);
-        self.apply_query_change();
+        if input_delete_atom(&mut self.query_input) {
+            self.apply_query_change();
+        }
     }
 
     /// Empty the query and re-filter ONCE (`Esc` on the board while a query is
@@ -3577,11 +3744,131 @@ impl App {
     /// cannot move the preview or the selection. Selection follows the session id
     /// through the shared funnel, like every other query edit.
     pub fn clear_query(&mut self) {
-        if self.query_input.is_empty() {
+        if input_clear(&mut self.query_input) {
+            self.apply_query_change();
+        }
+    }
+
+    // --- preview find bar ---------------------------------------------------
+
+    /// Whether the preview's find bar is open.
+    #[must_use]
+    pub fn is_finding(&self) -> bool {
+        self.find.is_some()
+    }
+
+    /// Open the find bar over an empty input (a no-op while it is open).
+    ///
+    /// INVARIANT: the bar is open only while its pane draws it — the preview is
+    /// shown and no draft card replaces the transcript. A draft card has nothing
+    /// to search and the view draws no bar over it, so typed text would land in an
+    /// input nobody can see: while `draft` is set (the card outlives its editor
+    /// during a background launch, [`dispatch_draft`](Self::dispatch_draft)) this
+    /// does nothing, as on any surface that has no target for the key. The other
+    /// side is held by [`set_pane_layout`](Self::set_pane_layout) and
+    /// [`open_compose`](Self::open_compose), which close the bar.
+    ///
+    /// Brings a hidden preview back at [`PaneLayout::Even`], as
+    /// [`open_compose`](Self::open_compose) does: the bar is drawn on the pane's
+    /// border, so it must not open on a pane that is not there. It does NOT leave
+    /// the subagent view — the bar searches whatever the pane shows.
+    pub fn open_find(&mut self) {
+        if self.find.is_some() || self.draft.is_some() {
             return;
         }
-        self.query_input.clear();
-        self.apply_query_change();
+        if !self.pane_layout.shows_preview() {
+            self.set_pane_layout(PaneLayout::Even);
+        }
+        self.find = Some(FindBar {
+            input: new_query_input(),
+            marker: SearchIndex::new(),
+        });
+    }
+
+    /// Close the find bar, so the next frame marks by the board query again.
+    ///
+    /// Clears the parked match line: an index into the find's marks means nothing
+    /// under the board query's. Closing a bar that is not open does nothing.
+    pub fn close_find(&mut self) {
+        if self.find.take().is_some() {
+            self.preview_match_line = None;
+        }
+    }
+
+    /// Re-apply what depends on the find TEXT: the compiled atoms, the parked
+    /// match line and the pending jump.
+    ///
+    /// The find's counterpart of [`apply_query_change`](Self::apply_query_change)
+    /// and deliberately NOT a caller of it: no re-filter, no selection move, no
+    /// "match outside the preview" nudge. The jump is armed DIRECTLY rather than
+    /// through the mode-gated `request_preview_match_jump`, because a find edit
+    /// is a question about the open transcript in either search mode.
+    fn apply_find_change(&mut self) {
+        let Some(find) = self.find.as_mut() else {
+            return;
+        };
+        find.marker.set_query(&find.input.lines()[0]);
+        self.preview_match_line = None;
+        self.preview_match_jump = true;
+    }
+
+    /// Insert a character at the find caret. No-op while the bar is closed.
+    pub fn push_find_char(&mut self, c: char) {
+        if self
+            .find
+            .as_mut()
+            .is_some_and(|f| input_insert_char(&mut f.input, c))
+        {
+            self.apply_find_change();
+        }
+    }
+
+    /// Insert a whole string at the find caret as ONE edit (a terminal paste).
+    /// The caller flattens newlines first, as for the board query.
+    pub fn push_find_str(&mut self, text: &str) {
+        if self
+            .find
+            .as_mut()
+            .is_some_and(|f| input_insert_str(&mut f.input, text))
+        {
+            self.apply_find_change();
+        }
+    }
+
+    /// Delete the find character before the caret.
+    pub fn pop_find_char(&mut self) {
+        if self
+            .find
+            .as_mut()
+            .is_some_and(|f| input_delete_char(&mut f.input))
+        {
+            self.apply_find_change();
+        }
+    }
+
+    /// Delete the search ATOM before the find caret, by the board query's rule.
+    pub fn pop_find_word(&mut self) {
+        if self
+            .find
+            .as_mut()
+            .is_some_and(|f| input_delete_atom(&mut f.input))
+        {
+            self.apply_find_change();
+        }
+    }
+
+    /// Move the find caret one character; never a text change.
+    pub fn move_find_caret(&mut self, forward: bool) {
+        if let Some(find) = self.find.as_mut() {
+            input_move_caret(&mut find.input, forward, false);
+        }
+    }
+
+    /// Move the find caret one word; never a text change.
+    pub fn move_find_caret_by_word(&mut self, forward: bool) {
+        if let Some(find) = self.find.as_mut() {
+            input_move_caret(&mut find.input, forward, true);
+        }
     }
 
     /// Toggle name-only vs. name+content search and re-filter.
@@ -3804,6 +4091,9 @@ impl App {
             return;
         }
         self.pane_layout = next;
+        if !next.shows_preview() {
+            self.close_find();
+        }
         if !previous.shows_preview() {
             self.preview_anchor_line = None;
             self.preview_follow_bottom = true;
@@ -3937,7 +4227,15 @@ impl App {
     /// Ask the next preview render to scroll the transcript onto a search match.
     ///
     /// The AUTOMATIC half of the jump, and the only place its mode gate lives:
-    /// autoscrolling is [`SearchMode::NameAndContent`]'s alone. In name-only mode
+    /// autoscrolling is [`SearchMode::NameAndContent`]'s alone, or the find bar's,
+    /// whose edit is a question about the open transcript in either mode and so
+    /// arms the jump itself ([`apply_find_change`](Self::apply_find_change)). The
+    /// find arm here covers a selection change while the bar is open, never a
+    /// board-query re-apply, which leaves the previewed transcript where it was
+    /// ([`apply_query_change`](Self::apply_query_change)). The other transcript
+    /// switch the bar can see, the subagent view opening or stepping, arms the
+    /// flag itself in [`open_subagent_view`](Self::open_subagent_view) rather than
+    /// through here, so it too skips the mode gate. In name-only mode
     /// a hit IS its label — the row the user is already looking at is marked, and
     /// nothing about the transcript was asked for — so moving the pane there would
     /// answer a question nobody put. Marking stays on in BOTH modes (it costs no
@@ -3949,7 +4247,7 @@ impl App {
     /// under another, so the next jump starts from the last match again.
     fn request_preview_match_jump(&mut self) {
         self.preview_match_line = None;
-        if self.search_mode == SearchMode::NameAndContent {
+        if self.search_mode == SearchMode::NameAndContent || self.is_finding() {
             self.preview_match_jump = true;
         }
     }
@@ -3968,25 +4266,39 @@ impl App {
         std::mem::take(&mut self.preview_match_jump)
     }
 
-    /// The selected session's CURRENT match map — the cached one, and only while
-    /// it describes the active query and holds at least one match.
+    /// The pane's CURRENT match map — the cached one, and only while it describes
+    /// the active mark source ([`mark_key`](Self::mark_key)) and holds at least
+    /// one match.
     ///
     /// Read without rendering: the board draws before every `recv`, so the entry
     /// is already warm for the selection, the query and the pane's width by the
     /// time a keypress arrives. Two things it must refuse, because the cache
     /// outlives both and a stale `true` here binds a key to nothing the user can
-    /// see: a map whose `matches_query` has moved on, and a pane that is not being
+    /// see: a map whose `matches_key` has moved on, and a pane that is not being
     /// drawn at all (the 1:0 [`PaneLayout::ListOnly`] layout hides it without
-    /// clearing the cache). The subagent view is never marked, so it has none.
+    /// clearing the cache). The subagent view is never marked by the BOARD query,
+    /// so under that source it has none; the find bar marks it.
     fn current_preview_matches(&self) -> Option<&HashMap<usize, HashSet<usize>>> {
         if !self.pane_layout.shows_preview() {
             return None;
         }
         let entry = self.peek_preview()?;
-        (entry.matches_query == self.query() && !entry.matches.is_empty()).then_some(&entry.matches)
+        let (source, text) = self.mark_key();
+        (entry.matches_key.is(source, text) && !entry.matches.is_empty()).then_some(&entry.matches)
     }
 
-    /// Whether there is anything for `Shift-Up`/`Shift-Down` to move between.
+    /// The ACTIVE mark source and its text: the find bar's while it is open,
+    /// otherwise the board query's. The key a [`CachedPreview`]'s map must carry
+    /// to be the one on screen.
+    fn mark_key(&self) -> (MarkSource, &str) {
+        match &self.find {
+            Some(find) => (MarkSource::Find, &find.input.lines()[0]),
+            None => (MarkSource::Board, &self.query_input.lines()[0]),
+        }
+    }
+
+    /// Whether there is anything for `Shift-Up`/`Shift-Down` to move between,
+    /// under the active mark source.
     ///
     /// The keybinding's gate: with nothing to navigate, those keys FALL THROUGH to
     /// plain selection movement, so a board with no query behaves exactly as it
@@ -4832,6 +5144,10 @@ impl App {
     ) {
         if draft.is_none() {
             self.leave_subagent_view();
+        } else {
+            // A draft card replaces the transcript the bar searches; a reply or
+            // fork box previews the real one, so it keeps the bar.
+            self.close_find();
         }
         if !self.pane_layout.shows_preview() {
             self.set_pane_layout(PaneLayout::Even);
@@ -6118,7 +6434,7 @@ impl App {
                     // the EMPTY query is exactly "no query has been searched here
                     // yet", so a non-empty query recomputes on this same call.
                     matches: HashMap::new(),
-                    matches_query: String::new(),
+                    matches_key: MarkKey::default(),
                     failed: failed_ids,
                 },
             );
@@ -6130,9 +6446,9 @@ impl App {
     /// [`ensure_preview`](Self::ensure_preview)'s subagent half: the live subagent
     /// view's render, rendering it on a miss ([`preview::render_subagent`]) under
     /// the same width, known agents and open folds as the session's own. Its
-    /// `matches` stay EMPTY and are never recomputed: the content index never held
-    /// a subagent's text, so the view takes no search marks, no `Shift`-arrow
-    /// stops and no match jump.
+    /// `matches` stay EMPTY under the BOARD query — the content index never held a
+    /// subagent's text, so the view takes no board-query marks, stops or jump — and
+    /// are computed only for the FIND bar ([`refresh_subagent_matches`](Self::refresh_subagent_matches)).
     ///
     /// The miss reads the subagent's transcript ON THE UI THREAD, in the class
     /// PATTERNS.md §6 gives the session's own cache-miss render, and only ever
@@ -6200,7 +6516,7 @@ impl App {
                 rendered,
                 row_prefix,
                 matches: HashMap::new(),
-                matches_query: String::new(),
+                matches_key: MarkKey::default(),
                 failed: failed_ids.clone(),
             });
             // The viewed run's own verdict names no line of its own transcript, so
@@ -6215,6 +6531,7 @@ impl App {
             }
             self.evict_renders_of_a_moved_failed_set();
         }
+        self.refresh_subagent_matches();
         self.subagent_view.as_ref()?.cached.as_ref()
     }
 
@@ -6329,8 +6646,11 @@ impl App {
     /// drill-down — for [`leave_subagent_view`](Self::leave_subagent_view). Any
     /// mouse selection goes (its anchors name lines of the render being replaced),
     /// but the click chain stays, as for a fold toggle: a quick second press on the
-    /// same cell selects a word in the view rather than switching again. A no-op
-    /// when nothing is selected.
+    /// same cell selects a word in the view rather than switching again. While the
+    /// find bar is open it also arms the match jump DIRECTLY, past
+    /// [`request_preview_match_jump`](Self::request_preview_match_jump)'s mode
+    /// gate, so the pane lands on the newest find match of the new transcript. A
+    /// no-op when nothing is selected.
     pub(crate) fn open_subagent_view(&mut self, agent_id: &str, agent_type: &str) {
         let Some(session_id) = self.selected.clone() else {
             return;
@@ -6351,6 +6671,10 @@ impl App {
         self.preview_follow_bottom = true;
         self.preview_anchor_line = None;
         self.drop_preview_selection();
+        // A parked match line indexes the transcript this view replaces; the find
+        // searches the NEW one, so it jumps to that one's newest match.
+        self.preview_match_line = None;
+        self.preview_match_jump |= self.is_finding();
     }
 
     /// Leave the subagent view for the selected session's own transcript, scrolled
@@ -6367,6 +6691,9 @@ impl App {
         }
         self.preview_anchor_line = None;
         self.drop_preview_selection();
+        // The parked line indexed the view's transcript. No jump: the reader's
+        // saved place was just restored.
+        self.preview_match_line = None;
         true
     }
 
@@ -6687,10 +7014,12 @@ impl App {
     /// other side of — scoring EVERY session's megabyte-scale haystack — so keep the
     /// recompute keyed and keep it here.
     fn refresh_preview_matches(&mut self, id: &str) {
+        let (source, text) = self.mark_key();
         match self.preview_cache.get(id) {
-            // Already computed for this query: nothing to do (the common case —
-            // the pane redraws several times a second while the query sits still).
-            Some(entry) if entry.matches_query == self.query_input.lines()[0] => return,
+            // Already computed for this source and text: nothing to do (the common
+            // case — the pane redraws several times a second while the text sits
+            // still).
+            Some(entry) if entry.matches_key.is(source, text) => return,
             Some(_) => {}
             None => return,
         }
@@ -6699,60 +7028,66 @@ impl App {
             self.preview_match_rebuilds += 1;
         }
         // DISJOINT field borrows, so the matcher can be asked while the cached lines
-        // are still borrowed. The lines used to be snapshotted into a `Vec<String>`
-        // first — the whole rendered transcript copied on every query change — for
-        // one reason only: the matcher took `&mut self` and could not overlap the
-        // cache borrow. It takes `&self` now, so the copy buys nothing and the walk
-        // reads the cached lines in place.
+        // are still borrowed: the matcher takes `&self`, so the walk reads the
+        // cached lines in place instead of copying the transcript per change.
         let Self {
             preview_cache,
             index,
             query_input,
+            find,
             ..
         } = self;
-        // Read the query line out of the widget ONCE, as a borrow: the disjoint
-        // split above is what lets this coexist with the cache borrow below, and a
-        // clone here would give that up for nothing.
-        let query = &query_input.lines()[0];
-        // ONE scratch for the whole pane, not one per line. Its buffers grow to the
-        // widest line on the first few lines and are then reused down the
-        // transcript, which is what a pane of mostly non-matching lines otherwise
-        // spends its time allocating and dropping.
-        let mut scratch = MarkScratch::new();
-        // An empty query marks nothing, so the walk is skipped outright rather than
-        // asked line by line.
-        //
-        // The body of an OPEN injected-context node is never asked at all: the
-        // content index left that record out, so a hit there is one the filter did
-        // not count. This one walk feeds the pane's highlights, the `Shift`-arrow
-        // stops, the match jump and the "outside the preview" verdict alike, so
-        // skipping here keeps all four honest together.
-        let matches: HashMap<usize, HashSet<usize>> = if query.is_empty() {
-            HashMap::new()
-        } else {
-            preview_cache.get(id).map_or_else(HashMap::new, |entry| {
-                entry
-                    .rendered
-                    .text
-                    .lines
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| entry.rendered.is_indexed_line(*i))
-                    .filter_map(|(i, line)| {
-                        let matched =
-                            index.atom_match_positions_with(&line_text(line), &mut scratch);
-                        if matched.is_empty() {
-                            None
-                        } else {
-                            Some((i, matched.into_iter().collect()))
-                        }
-                    })
-                    .collect()
-            })
+        let (source, key, marker) = match find {
+            Some(find) => (MarkSource::Find, &find.input.lines()[0], &find.marker),
+            None => (MarkSource::Board, &query_input.lines()[0], &*index),
         };
+        let matches = preview_cache.get(id).map_or_else(HashMap::new, |entry| {
+            walk_preview_matches(entry, marker, source)
+        });
         if let Some(entry) = preview_cache.get_mut(id) {
             entry.matches = matches;
-            entry.matches_query = query.clone();
+            entry.matches_key = MarkKey {
+                source,
+                text: key.clone(),
+            };
+        }
+    }
+
+    /// [`refresh_preview_matches`](Self::refresh_preview_matches) for the subagent
+    /// view's render. Only the FIND source marks it: the BOARD query never does,
+    /// because the content index never held a subagent's text, so a board mark
+    /// there would be a hit the list did not count. The find admits nothing, so
+    /// that reason does not bind it. Under the board source the entry holds an
+    /// empty map under the empty board key, which is also what evicts a find's marks
+    /// once the bar closes.
+    fn refresh_subagent_matches(&mut self) {
+        let Self {
+            subagent_view,
+            find,
+            ..
+        } = self;
+        let Some(entry) = subagent_view.as_mut().and_then(|view| view.cached.as_mut()) else {
+            return;
+        };
+        match find {
+            Some(find) => {
+                let text = &find.input.lines()[0];
+                if entry.matches_key.is(MarkSource::Find, text) {
+                    return;
+                }
+                entry.matches = walk_preview_matches(entry, &find.marker, MarkSource::Find);
+                entry.matches_key = MarkKey {
+                    source: MarkSource::Find,
+                    text: text.clone(),
+                };
+            }
+            None => {
+                if entry.matches_key == MarkKey::default() {
+                    return;
+                }
+                entry.matches = HashMap::new();
+                entry.matches_key = MarkKey::default();
+            }
         }
     }
 
@@ -6818,7 +7153,10 @@ impl App {
     ///
     /// [`SearchIndex::atom_match_positions`]: crate::search::SearchIndex::atom_match_positions
     fn note_match_outside_preview(&mut self) {
-        if self.query_input.is_empty()
+        // While the find bar is open the cached map holds ITS marks, which say
+        // nothing about where the board query occurs.
+        if self.is_finding()
+            || self.query_input.is_empty()
             || self.search_mode != SearchMode::NameAndContent
             || !self.pane_layout.shows_preview()
             || self.in_subagent_view()
@@ -6971,14 +7309,14 @@ impl App {
         }
     }
 
-    /// Where the active query occurs in the selected session's RENDERED preview:
-    /// line index -> matched CHAR positions (see [`CachedPreview::matches`]).
+    /// Where the active mark source's text occurs in the RENDERED preview the pane
+    /// shows: line index -> matched CHAR positions (see [`CachedPreview::matches`]).
     ///
     /// Read off the SAME width-scoped cache the text is drawn from, so a marked
     /// position can never describe a different render than the one on screen.
     /// Borrowed rather than cloned: the pane redraws several times a second and
-    /// nothing here needs a copy. Empty when nothing is selected, when the query is
-    /// empty, or when the query occurs nowhere in the rendered lines.
+    /// nothing here needs a copy. Empty when nothing is selected, when the source's
+    /// text is empty, or when it occurs nowhere in the rendered lines.
     pub fn preview_matches(&mut self, inner_width: u16) -> Option<&HashMap<usize, HashSet<usize>>> {
         self.ensure_preview(inner_width).map(|p| &p.matches)
     }
@@ -13136,6 +13474,416 @@ mod tests {
         assert_eq!(app.query_caret(), 0);
         assert_eq!(app.preview_match_line, Some(7), "the pane stays parked");
         assert!(!app.take_preview_match_jump(), "and no jump is armed");
+    }
+
+    /// The find bar edits by the SAME helpers as the board query, so a word delete
+    /// at a mid-line caret cuts the same atom, keeps the same tail and leaves the
+    /// caret at the same column. It marks (the compiled atoms) and never filters.
+    #[test]
+    fn the_find_bar_edits_exactly_as_the_board_query_does() {
+        let mut board = word_delete_board();
+        board.push_query_str("beta alpha");
+        board.open_find();
+        board.push_find_str("beta alpha");
+        for _ in 0.." alpha".len() {
+            board.move_query_caret(false);
+            board.move_find_caret(false);
+        }
+        let find_caret = |app: &App| app.find.as_ref().map(|f| f.input.cursor().1);
+        assert_eq!(find_caret(&board), Some(board.query_caret()));
+
+        board.pop_query_word();
+        board.pop_find_word();
+
+        let find_text = board.find.as_ref().map(|f| f.input.lines()[0].clone());
+        assert_eq!(find_text.as_deref(), Some(board.query()));
+        assert_eq!(find_caret(&board), Some(board.query_caret()));
+
+        board.pop_query_char();
+        board.pop_find_char();
+        board.push_query_char('x');
+        board.push_find_char('x');
+        board.move_query_caret_by_word(true);
+        board.move_find_caret_by_word(true);
+        let find_text = board.find.as_ref().map(|f| f.input.lines()[0].clone());
+        assert_eq!(find_text.as_deref(), Some(board.query()));
+        assert_eq!(find_caret(&board), Some(board.query_caret()));
+    }
+
+    /// A find edit compiles the marker and arms the jump in name-only mode too,
+    /// while the board query, the list and the selection stay exactly as they were.
+    #[test]
+    fn a_find_edit_marks_and_arms_the_jump_without_touching_the_board() {
+        let mut app = word_delete_board();
+        assert_eq!(app.search_mode, SearchMode::NameOnly, "premise");
+        let filtered = app.filtered.clone();
+        let selected = app.selected.clone();
+        let _ = app.take_preview_match_jump();
+        app.preview_match_line = Some(7);
+
+        app.push_find_char('z');
+        assert!(!app.is_finding(), "an edit while closed does nothing");
+        assert_eq!(app.preview_match_line, Some(7));
+
+        app.open_find();
+        app.push_find_str("zzz");
+
+        let marker = &app.find.as_ref().expect("open").marker;
+        assert_eq!(marker.query(), "zzz");
+        assert_eq!(marker.len(), 0, "the marker holds no entries");
+        assert_eq!(app.preview_match_line, None);
+        assert!(app.take_preview_match_jump(), "the edit armed the jump");
+        assert_eq!(app.query(), "");
+        assert_eq!(app.filtered, filtered, "no re-filter");
+        assert_eq!(app.selected, selected);
+
+        let _ = app.take_preview_match_jump();
+        app.preview_match_line = Some(3);
+        app.move_find_caret(false);
+        app.move_find_caret_by_word(false);
+        assert_eq!(
+            app.preview_match_line,
+            Some(3),
+            "a caret move edits nothing"
+        );
+        assert!(!app.take_preview_match_jump());
+    }
+
+    /// The bar's lifecycle follows its pane: a hidden preview comes back at `Even`
+    /// on open, stepping to `ListOnly` or opening a draft card closes it, and a
+    /// reply or fork box does not.
+    #[test]
+    fn the_find_bar_follows_its_pane() {
+        use super::super::compose::ComposeState;
+
+        let mut app = app_all(vec![session("a", "r1", Some("main"), "/tmp/a")]);
+        app.set_pane_layout(PaneLayout::ListOnly);
+        app.open_find();
+        assert!(app.is_finding());
+        assert_eq!(app.pane_layout(), PaneLayout::Even);
+
+        app.push_find_str("x");
+        app.open_find();
+        assert_eq!(
+            app.find.as_ref().map(|f| f.input.lines()[0].clone()),
+            Some("x".to_string()),
+            "opening an open bar keeps its text"
+        );
+
+        app.set_pane_layout(PaneLayout::ListOnly);
+        assert!(!app.is_finding(), "no pane, no bar");
+
+        app.open_find();
+        app.open_compose(ComposeState::new_reply("a".to_string(), None), None);
+        assert!(app.is_finding(), "a reply box previews the real transcript");
+        app.close_compose();
+
+        app.open_compose(
+            ComposeState::new_reply("a".to_string(), None),
+            Some(NewSessionDraft::default()),
+        );
+        assert!(!app.is_finding(), "a draft card replaces the transcript");
+
+        app.open_find();
+        assert!(!app.is_finding(), "and nothing opens a bar over it");
+        app.close_compose();
+
+        app.open_find();
+        app.preview_match_line = Some(4);
+        app.close_find();
+        assert_eq!(
+            app.preview_match_line, None,
+            "close forgets the parked line"
+        );
+        app.close_find();
+    }
+
+    /// The find and the board query mark the same text differently only where the
+    /// LIST's admission says so: the body of an open injected node is never marked
+    /// by the board query (the content index never held it) and IS marked by the
+    /// find. The same text, the same transcript, the other source: the recompute key
+    /// has to carry the source, or one source's map is served to the other.
+    #[test]
+    fn the_mark_source_is_part_of_the_recompute_key() {
+        const QUERY: &str = "review";
+        let mut app = command_app(QUERY);
+        app.push_query_str(QUERY);
+        app.toggle_peer_fold(SKILL_BODY_KEY, COMMAND_WIDTH);
+        let text = app.preview_text(COMMAND_WIDTH);
+        let body_line = text
+            .lines
+            .iter()
+            .position(|l| line_text(l).contains("Your task is to review"))
+            .expect("the open body draws the query on screen");
+        let command_line = text
+            .lines
+            .iter()
+            .position(|l| line_text(l).contains("/review-branch"))
+            .expect("the typed command's line");
+        let marked = |app: &mut App| -> (bool, bool) {
+            let matches = app
+                .preview_matches(COMMAND_WIDTH)
+                .expect("a selected session has a match map");
+            (
+                matches.contains_key(&body_line),
+                matches.contains_key(&command_line),
+            )
+        };
+        assert_eq!(
+            marked(&mut app),
+            (false, true),
+            "premise: the board's marks"
+        );
+
+        app.open_find();
+        app.push_find_str(QUERY);
+        assert_eq!(
+            marked(&mut app),
+            (true, true),
+            "the find admits nothing, so it marks the open body too"
+        );
+
+        app.close_find();
+        assert_eq!(
+            marked(&mut app),
+            (false, true),
+            "closing the bar serves the board's map again, not the find's"
+        );
+    }
+
+    /// On text no admission filter touches, the find marks EXACTLY as the board
+    /// query does: one walk, one matcher rule, whatever the atoms.
+    #[test]
+    fn the_find_marks_exactly_as_the_board_query_does() {
+        let mut compared = 0;
+        for text in [FIXTURE_WORD, "web hook", "payment retries", "Webhook"] {
+            let mut app = app_all(vec![markable_fixture("s1")]);
+            app.push_query_str(text);
+            // A case-sensitive atom may not keep the row on the board; the
+            // comparison needs the pane, so skip a text whose board has none.
+            let Some(board) = app.preview_matches(60).cloned() else {
+                continue;
+            };
+            app.open_find();
+            app.push_find_str(text);
+            let find = app.preview_matches(60).cloned();
+            assert_eq!(find, Some(board.clone()), "text {text:?}");
+            compared += usize::from(!board.is_empty());
+        }
+        assert!(compared >= 2, "the premise: some texts really mark lines");
+    }
+
+    /// A run of find edits changes neither the list, the selection, the board
+    /// query nor the status line, in name-only mode with text no label holds.
+    #[test]
+    fn find_edits_never_refilter_or_touch_the_board() {
+        let mut app = app_all(vec![
+            markable_fixture("s1"),
+            session("b", "r2", Some("main"), "/tmp/b"),
+        ]);
+        app.push_query_str("payment");
+        let (filtered, selected) = (app.filtered.clone(), app.selected.clone());
+        app.clear_status();
+        // A probe only the board's own funnel (`apply_query_change`) would erase:
+        // it re-compiles the board's matcher from the query widget.
+        app.index.set_query("probe");
+
+        app.open_find();
+        for c in "no label says this".chars() {
+            app.push_find_char(c);
+        }
+        app.pop_find_char();
+        app.pop_find_word();
+        app.push_find_str("zzz qqq");
+        app.preview_text(60);
+
+        assert_eq!(app.query(), "payment");
+        assert_eq!(
+            app.index.query(),
+            "probe",
+            "the board's matcher is untouched"
+        );
+        assert_eq!(app.filtered, filtered);
+        assert_eq!(app.selected, selected);
+        assert_eq!(app.status, None);
+    }
+
+    /// Every way into the jump while the bar is open: a selection change, the
+    /// subagent view opening, and NOT the view closing, which restores the
+    /// reader's place. A board-query re-apply that keeps the transcript is NOT one
+    /// (`a_board_reapply_while_finding_keeps_the_stepped_place`).
+    #[test]
+    fn the_find_arms_the_jump_where_the_board_would_not() {
+        let mut app = app_all(vec![delegation_session("s1"), delegation_session("s2")]);
+        assert_eq!(app.search_mode, SearchMode::NameOnly, "premise");
+
+        app.push_query_char('p');
+        assert!(
+            !app.take_preview_match_jump(),
+            "premise: name-only is quiet"
+        );
+
+        app.open_find();
+        app.move_selection(1);
+        assert!(
+            app.take_preview_match_jump(),
+            "while finding, a new transcript arms the jump in name-only mode"
+        );
+
+        app.preview_match_line = Some(5);
+        open_delegation_view(&mut app);
+        assert_eq!(app.preview_match_line, None, "the parked line is dropped");
+        assert!(
+            app.take_preview_match_jump(),
+            "a view opens on its newest match"
+        );
+
+        app.preview_match_line = Some(5);
+        assert!(app.leave_subagent_view());
+        assert_eq!(app.preview_match_line, None);
+        assert!(
+            !app.take_preview_match_jump(),
+            "leaving restores the saved place, it does not jump"
+        );
+
+        app.close_find();
+        open_delegation_view(&mut app);
+        assert!(
+            !app.take_preview_match_jump(),
+            "with no bar, a view opening arms nothing"
+        );
+    }
+
+    /// `Tab` re-applies the board query while the bar is open. The find, not the
+    /// query, feeds the marks, so a toggle that keeps the previewed session must
+    /// neither clear the parked match line nor re-arm the jump.
+    #[test]
+    fn a_board_reapply_while_finding_keeps_the_stepped_place() {
+        let mut app = app_all(vec![markable_fixture("s1")]);
+        app.open_find();
+        app.push_find_str(FIXTURE_WORD);
+        app.preview_text(60);
+        assert!(app.matched_preview_lines().len() >= 2, "premise: matches");
+        let _ = app.take_preview_match_jump();
+        app.preview_match_step(false);
+        app.preview_match_step(false);
+        let parked = app.preview_match_line;
+        assert!(parked.is_some(), "premise: stepped onto a match");
+        let _ = app.take_preview_match_jump();
+
+        app.toggle_search_mode();
+
+        assert_eq!(app.selected.as_deref(), Some("s1"), "premise: kept");
+        assert_eq!(app.preview_match_line, parked, "the stepped place stays");
+        assert!(!app.take_preview_match_jump(), "and no jump is re-armed");
+    }
+
+    /// The counterpart: when the toggle's re-filter moves the selection the pane
+    /// shows another transcript, so the jump is armed and the parked line dropped.
+    #[test]
+    fn a_board_reapply_that_moves_the_selection_arms_the_jump_while_finding() {
+        let mut app = app_all(vec![markable_fixture("s1"), markable_fixture("s2")]);
+        app.sessions[1].label = "unrelated".to_string();
+        app.sessions[1].content_index = "collapsed wrapper says frobnicate".to_string();
+        app.apply_sessions(app.sessions.clone());
+        app.toggle_search_mode();
+        app.push_query_str("frobnicate");
+        assert_eq!(app.selected.as_deref(), Some("s2"), "premise: content hit");
+        app.open_find();
+        app.push_find_str(FIXTURE_WORD);
+        app.preview_text(60);
+        let _ = app.take_preview_match_jump();
+        app.preview_match_line = Some(7);
+
+        app.toggle_search_mode();
+
+        assert_ne!(app.selected.as_deref(), Some("s2"), "the selection moved");
+        assert_eq!(app.preview_match_line, None, "the parked line is dropped");
+        assert!(
+            app.take_preview_match_jump(),
+            "the new transcript is offered"
+        );
+    }
+
+    /// The board query's "match is outside the previewed transcript" nudge judges
+    /// the board query against the cached map, which holds the find's marks while
+    /// the bar is open: it stays silent there.
+    #[test]
+    fn the_outside_the_preview_nudge_is_silent_while_finding() {
+        let mut app = app_all(vec![markable_fixture("s1")]);
+        app.sessions[0].content_index = "collapsed wrapper says frobnicate".to_string();
+        app.apply_sessions(app.sessions.clone());
+        app.toggle_search_mode();
+        app.preview_text(60);
+
+        app.open_find();
+        app.push_query_str("frobnicate");
+        assert!(
+            app.selected.is_some(),
+            "premise: the content hit keeps the row"
+        );
+        assert_eq!(app.status, None, "no nudge while the bar is open");
+
+        app.close_find();
+        app.pop_query_char();
+        app.push_query_char('e');
+        assert_eq!(
+            app.status.as_deref(),
+            Some(MATCH_OUTSIDE_PREVIEW),
+            "premise: the same keys nudge once the bar is closed"
+        );
+    }
+
+    /// The find marks the subagent view's own render; the board query never does,
+    /// and closing the bar takes the find's marks off the view again.
+    #[test]
+    fn the_find_marks_the_subagent_view_and_the_board_query_does_not() {
+        let mut app = app_all(vec![delegation_session("s1")]);
+        open_delegation_view(&mut app);
+        assert!(
+            app.preview_text(DELEGATION_WIDTH)
+                .lines
+                .iter()
+                .any(|line| line_text(line).contains("parser")),
+            "premise: the view's own lines say the word"
+        );
+        assert!(!app.has_preview_matches(), "premise: nothing is searched");
+
+        app.open_find();
+        assert!(app.in_subagent_view(), "opening the bar keeps the view");
+        app.push_find_str("parser");
+        assert!(
+            app.preview_matches(DELEGATION_WIDTH)
+                .is_some_and(|matches| !matches.is_empty()),
+            "the view's lines are marked"
+        );
+        assert!(app.has_preview_matches(), "and the steps follow the view");
+
+        app.pop_find_word();
+        app.push_find_str("nothing-says-this");
+        let _ = app.preview_matches(DELEGATION_WIDTH);
+        assert!(!app.has_preview_matches(), "a new text re-marks the view");
+
+        app.close_find();
+        app.push_query_str("parser");
+        assert!(
+            app.preview_matches(DELEGATION_WIDTH)
+                .is_some_and(HashMap::is_empty),
+            "the board query leaves the view unmarked"
+        );
+        assert!(!app.has_preview_matches());
+    }
+
+    /// A fork box previews the real transcript like a reply box, so it keeps the
+    /// bar (the reply box and the draft card are pinned beside it).
+    #[test]
+    fn a_fork_box_keeps_the_find_bar() {
+        use super::super::compose::ComposeState;
+
+        let mut app = app_all(vec![session("a", "r1", Some("main"), "/tmp/a")]);
+        app.open_find();
+        app.open_compose(ComposeState::new_fork("a".to_string()), None);
+        assert!(app.is_finding());
     }
 
     /// The caret a word delete leaves behind is EXACT past `u16::MAX` characters,
