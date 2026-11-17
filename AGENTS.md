@@ -254,18 +254,20 @@ one place.
   handed in through `SearchIndex::set_atoms` — never re-joined into a query for
   `set_query`, whose whitespace and backslash rule is the search box's alone, and
   the board's search box splits on whitespace only. It asks `SearchIndex::admits`,
-  the filter's own question, of a candidate's NAME and then its DESCRIPTION —
-  never its label — marks the hit with the ROW-LABEL rule (`match_indices`) over
+  the filter's own question, through `admits_with`, of a candidate's NAME and then
+  its DESCRIPTION — never its label — marks the hit with the ROW-LABEL rule (`match_indices`) over
   that same name or description when the list is filtered, never in render, and
   orders what matches by where it landed (name start, elsewhere in the name, a
   path's folder component, description only — a word-start hit just below the
-  substring hits of its tier), an order that is the pick list's alone. The
+  substring hits of its tier), an order that is the pick list's alone and that ONE
+  function, `complete::rank`, decides for every row. The
   WORD-START rule (`SearchIndex::word_start_hit`) lives in `src/search.rs` too,
   and only the pick list reaches it: `set_atoms` ALONE compiles it and nothing
   else reads it — the filter, `admits` and both marking rules stay substring, so
-  it NEVER reaches the board. The pick list asks it ONLY of an `@` file or
-  folder's own BASENAME in the FOLDER STEP (never the root fallback, a `/`
-  command or an agent), and only once the substring parts rejected that entry:
+  it NEVER reaches the board. The pick list asks it ONLY of a candidate's own NAME (a `/` command's, an
+  agent's, an `@` file or folder's BASENAME in the FOLDER STEP — never the root
+  fallback, a description or a folder component), and only once the substring
+  parts rejected that name:
   consecutive word-PREFIX chunks of that name, on words in order, never fuzzy.
   It follows the SAME per-part smart case — a part holding a capital matches
   exactly, any other through the ONE fold — and a hit marks its chunks, the one

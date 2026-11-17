@@ -363,7 +363,7 @@ returns candidates in the order given. Do not re-introduce ranking:
 rank cannot reach the screen, and computing one cost 76–81% of each keystroke
 through nucleo's `Utf32Str` UTF-32 conversion. The compose pick list's tiered
 order does not bend this: it is a pure decision in `tui::complete`
-(`Placement`), read off answers `search.rs` already gives — a word-start hit's
+(`complete::rank` and `Placement`), read off answers `search.rs` already gives — a word-start hit's
 chunk and skipped-word counts among them — never a rank computed inside the
 matcher.
 
@@ -396,23 +396,26 @@ whitespace-free token into parts by its own rule and compiles them with
 `set_atoms` takes each part LITERALLY, and that is load-bearing: joining the
 parts with spaces for `set_query` would hand them to `gate_atoms`, whose `\ `
 escape turns a token like `foo\-bar` into the one phrase `foo bar`. It then asks
-`admits` — the filter's own membership predicate, the very gate `match_indices`
-runs — of a candidate's name and then its description, and marks the row with
+`admits` (always through `admits_with`) — the filter's own membership predicate,
+the very gate `match_indices` runs — of a candidate's name and then its description, and marks the row with
 `match_indices` itself, the row-label rule, since a pick-list row is one string
 like a board label. Its `@` walk asks the `_with` forms of both over ONE
 caller-owned `MarkScratch`, so a keystroke over a 25,000-entry walk allocates
 nothing per entry it rejects (the measurement is `complete::select_paths`' doc).
-Its tier comes from the per-atom seam, because "does the name START with it" is
-a positional question: a name-start hit is an `atom_match_positions` run at char
-0, from whichever part. An `@` path reads it off its own row marks instead — a
-mark on the name's first char, which a part of a name hit, holding no `/`, can
-only cover by starting there.
+Its tier comes from one rule for every row: a name-start hit is a mark on the
+name's first char, from whichever part — which a part of a name hit, holding no
+`/`, can only cover by starting there. `complete::rank` is the ONE function that
+decides it, for a command, an agent and an `@` path alike, over a plain-data
+`Subject` (name, the text the marks land on, description, whether word starts
+apply), so a new list kind adds a caller, never a second ranking.
 
 The THIRD rule, WORD-START (`SearchIndex::word_start_hit`), is the pick list's
 alone, and nothing above reads it: `set_atoms` compiles it and `set_query`
 clears it, so the board's search box can never reach it, and the filter, `admits`
-and both marking rules stay substring. `tui::complete` asks it of an `@` entry's
-NAME only once the substring parts rejected that entry, and it is no fuzzy match:
+and both marking rules stay substring. `tui::complete` asks it of a command's,
+an agent's or an `@` entry's NAME (never the `@` root fallback's, a description's
+or a folder component's) only once the substring parts rejected that name, and it
+is no fuzzy match:
 each chunk is a word PREFIX. Its smart case is the finders' own, per part: one
 predicate, `is_case_sensitive`, decides both an `AtomFinder`'s case and a
 word-start part's, so a part's chunks meet the name in the very case that part
