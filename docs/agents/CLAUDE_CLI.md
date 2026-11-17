@@ -39,6 +39,8 @@ The `initialize` control handshake is pinned separately too, at 2.1.284, in
 [its own section](#the-initialize-control-handshake-compose-pick-list), with the
 workspace-trust rule the fetch's form depends on: both are probed or read out of
 the bundle, not `--help` captures, and the refresh below does not re-verify them.
+The folders a `/` row can come from are pinned separately again, at 2.1.306
+(2026-10-21), in [their own section](#which-folder-a--row-came-from).
 So is the [`set_cwd` move](#set_cwd-moving-a-session-without-leaving-the-board),
 probed at 2.1.291 (2026-10-08) in a throwaway profile, and claude's own
 [`/cd`](#cd-moving-a-session-to-another-folder), observed at 2.1.284 (2026-10-02):
@@ -1251,6 +1253,85 @@ helper and that `return null` body. Anything else (no match, several names, or a
 body that does work) is a reason to re-probe [the rule](#workspace-trust-what-an-untrusted-folder-can-run-and-the-two-argv-forms)
 before trusting the mirror, and possibly to make `claude_trust` fail toward
 untrusted wherever such a root exists.
+
+## Which folder a `/` row came from
+
+> **Captured against `claude 2.1.306`, probed or read from its binary on
+> 2026-10-21.** Pinned separately from the [command surface](#version-pin-self-healing)
+> and from the [handshake](#the-initialize-control-handshake-compose-pick-list)
+> (2.1.284): the refresh below does not re-verify it.
+
+The pick list's kind column ([DOMAIN.md](DOMAIN.md#compose-pick-list)) is decided by
+`src/command_kinds.rs` from the facts below. Every probe ran in a throwaway
+`CLAUDE_CONFIG_DIR` and a throwaway project, never the user's own folders.
+
+- **The reply names no folder.** A `commands` entry of the `initialize` reply
+  carries only `name`, `description`, `argumentHint`, `aliases?` and `builtin?`
+  (2.1.306's mapper can also emit `plugin`). `builtin: true` covers the skills
+  claude ships (`dataviz`, `loop`, `simplify`, `code-review`, …) as well as its
+  built-in commands, so snapback reads it as one kind. Nothing else answers
+  either: `get_skills_dialog` lists `commands/` files as skills and omits the
+  bundled skills, `system/init` is emitted only once a user turn starts, and
+  `ListProjectCommands` answers `Unsupported control request subtype`.
+- **Skills load before commands, and the first entry of a name wins.** The loader
+  puts every skills folder (managed, user, synced, project, add-dir) before every
+  commands folder. The user's four real clashes (`git-commit`,
+  `git-sync-with-base`, `pr-merge`, `skill-creator`, each in both
+  `~/.claude/skills/` and `~/.claude/commands/`) arrive with the SKILL.md's
+  description, and a project probe with `clash` in both folders listed one
+  `clash` with the skill's. So a name both folders define is a skill.
+- **Names.** `skills/<dir>/SKILL.md` is its frontmatter `name:` when present
+  (probe: `skills/dir-x/SKILL.md` with `name: other-y` listed as `/other-y`), else
+  `<dir>`. `commands/ns/deep.md` is `ns:deep`; `commands/pkg/SKILL.md` is `pkg`,
+  and a folder holding a `SKILL.md` drops its other `.md` files.
+- **Project folders.** claude walks from the working folder up to and including the
+  git root (it stops there), or up to but excluding the home directory when there
+  is none. A `commands/` folder above the git root was not listed;
+  `sub/.claude/commands/inner.md` run from `sub/` was. Project folders load only
+  when the project setting source is on, so the untrusted `--setting-sources user`
+  fetch lists none of them.
+- **Not probed.** Whether claude, in a LINKED WORKTREE, stops at the worktree's
+  own `.git` FILE (`command_kinds` stops at any `.git` entry); whether it reads
+  below a `commands/` folder that holds a `SKILL.md` (`command_kinds` does); and
+  a `commands/SKILL.md` at the top (it names nothing here).
+- **One wrong label is accepted.** A name a read `commands/` file AND a skill in a
+  folder snapback does not read (managed, synced) both define shows `command`
+  while claude runs the skill. Plugin, managed and synced skills get no label
+  (a plugin's name already starts its description).
+
+**Re-verify** (read-only apart from two throwaway directories; the reply carries
+the user's account identity, so the filter below prints only the names it is told
+to look for and the reply is never saved or logged):
+
+```sh
+cfg=$(mktemp -d); proj=$(mktemp -d); mkdir -p "$proj/.git" "$proj/sub"
+mkdir -p "$cfg/skills/dir-x" "$cfg/skills/clash" "$cfg/commands/ns" "$cfg/commands/pkg" "$proj/.claude/commands"
+printf -- '---\nname: other-y\ndescription: s\n---\n' > "$cfg/skills/dir-x/SKILL.md"
+printf -- '---\ndescription: the skill\n---\n' > "$cfg/skills/clash/SKILL.md"
+printf -- '---\ndescription: the command\n---\n' > "$cfg/commands/clash.md"
+for f in ns/deep pkg/SKILL pkg/sibling; do printf -- '---\ndescription: x\n---\n' > "$cfg/commands/$f.md"; done
+# The record that trusts the project, where claude_trust looks for it.
+printf '{"projects":{"%s":{"hasTrustDialogAccepted":true}}}' "$(cd "$proj" && pwd -P)" > "$cfg/.claude.json"
+printf '%s\n' '{"type":"control_request","request_id":"v","request":{"subtype":"initialize"}}' |
+  (cd "$proj/sub" && CLAUDE_CONFIG_DIR="$cfg" claude -p --input-format stream-json \
+    --output-format stream-json --verbose --no-session-persistence --strict-mcp-config \
+    --settings '{"disableAllHooks":true}') |
+  python3 -I -c '
+import json, sys
+want = {"other-y", "dir-x", "clash", "ns:deep", "pkg", "sibling", "pkg:sibling"}
+for line in sys.stdin:
+    if "control_response" not in line:
+        continue
+    for c in json.loads(line)["response"]["response"]["commands"]:
+        if c["name"] in want:
+            print(c["name"], "|", c.get("description"), "|", c.get("builtin"))'
+rm -rf "$cfg" "$proj"
+```
+
+Expect `other-y` (and no `dir-x`), `clash` with `the skill`, `ns:deep` and `pkg`, and
+neither `sibling` nor `pkg:sibling`. Add `--setting-sources user` to see the
+project's own folders drop out. Anything else is a reason to re-derive the rules in
+`command_kinds` before trusting its labels.
 
 ## Top-level options
 

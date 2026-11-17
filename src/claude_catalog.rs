@@ -28,6 +28,12 @@
 //! Reading the verdict is blocking FS work, so no key handler, no render path
 //! and not `compose::take_catalog_fetch` ever reads it (AGENTS.md OFF-UI-THREAD).
 //!
+//! Right after the reply, on that same worker, [`command_kinds`] names each
+//! command the reply did not flag `builtin` from the skills and commands folders
+//! claude loads, with the verdict [`fetch_in`] already holds (CLAUDE_CLI.md,
+//! "Which folder a `/` row came from"). The reply carries no folder field, so
+//! the folders are the only evidence there is.
+//!
 //! The answer is a [`Listing`], the shape `store::skills::read_listing` gives a
 //! reply's `@` agents too, so the pick list turns either into rows the same way.
 //!
@@ -46,7 +52,8 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::claude_trust::{self, FolderTrust};
-use crate::store::skills::{normalize_description, Listing, ListingEntry};
+use crate::command_kinds;
+use crate::store::skills::{normalize_description, CommandKind, Listing, ListingEntry};
 use crate::watch::AppEvent;
 
 /// The `request_id` snapback stamps on its one control request. claude echoes it
@@ -237,10 +244,11 @@ pub fn initialize_request_line() -> String {
 /// (`response.response`) must be an object holding a `commands` or an `agents`
 /// array. Entries are objects with a non-empty string `name` (trimmed) and an
 /// optional string `description` ([`normalize_description`]). A command's
-/// `builtin` is read only to drop claude's hidden built-ins
-/// ([`is_hidden_builtin`]), ahead of the dedup so a same-named skill listed
-/// after one survives; every other key is ignored, a malformed entry is
-/// skipped, and each list is sorted by name with later duplicates dropped.
+/// `builtin` is read to drop claude's hidden built-ins ([`is_hidden_builtin`]),
+/// ahead of the dedup so a same-named skill listed after one survives, and to
+/// give the entries that stay [`CommandKind::BuiltIn`]; an agent never gets a
+/// kind. Every other key is ignored, a malformed entry is skipped, and each list
+/// is sorted by name with later duplicates dropped.
 #[must_use]
 pub fn parse_initialize_response(line: &str) -> Option<Listing> {
     if !line.contains(CONTROL_RESPONSE_MARKER) {
@@ -264,9 +272,12 @@ pub fn parse_initialize_response(line: &str) -> Option<Listing> {
     }
     Some(Listing {
         commands: commands.map_or_else(Vec::new, |items| {
-            catalog_entries(items.iter().filter(|item| !is_hidden_builtin(item)))
+            catalog_entries(
+                items.iter().filter(|item| !is_hidden_builtin(item)),
+                reply_kind,
+            )
         }),
-        agents: agents.map_or_else(Vec::new, catalog_entries),
+        agents: agents.map_or_else(Vec::new, |items| catalog_entries(items, |_| None)),
     })
 }
 
@@ -282,13 +293,25 @@ fn is_hidden_builtin(item: &Value) -> bool {
             .is_some_and(|name| CLAUDE_HIDDEN_BUILTINS.contains(&name.trim()))
 }
 
-/// The well-formed entries of one reply array, sorted by name, first of each
-/// name kept (the sort is stable, so input order breaks ties).
-fn catalog_entries<'a>(items: impl IntoIterator<Item = &'a Value>) -> Vec<ListingEntry> {
+/// The kind a reply `commands` entry states itself: [`CommandKind::BuiltIn`]
+/// when its `builtin` is the JSON boolean `true`, else none. That flag also marks
+/// the skills claude ships, which is why it outranks the folder lookup
+/// ([`command_kinds`]); it is the only kind the reply itself carries.
+fn reply_kind(item: &Value) -> Option<CommandKind> {
+    (item.get("builtin") == Some(&Value::Bool(true))).then_some(CommandKind::BuiltIn)
+}
+
+/// The well-formed entries of one reply array, each with the `kind` `kind_of`
+/// reads off its item, sorted by name, first of each name kept (the sort is
+/// stable, so input order breaks ties, and the kept entry keeps its own kind).
+fn catalog_entries<'a>(
+    items: impl IntoIterator<Item = &'a Value>,
+    kind_of: fn(&Value) -> Option<CommandKind>,
+) -> Vec<ListingEntry> {
     let mut entries: Vec<ListingEntry> = items
         .into_iter()
-        .filter_map(|item| {
-            let item = item.as_object()?;
+        .filter_map(|value| {
+            let item = value.as_object()?;
             let name = item.get("name")?.as_str()?.trim();
             if name.is_empty() {
                 return None;
@@ -300,6 +323,7 @@ fn catalog_entries<'a>(items: impl IntoIterator<Item = &'a Value>) -> Vec<Listin
             Some(ListingEntry {
                 name: name.to_owned(),
                 description,
+                kind: kind_of(value),
             })
         })
         .collect();
@@ -312,15 +336,25 @@ fn catalog_entries<'a>(items: impl IntoIterator<Item = &'a Value>) -> Vec<Listin
 /// FIRST, then [`fetch_with`] over `program` followed by the rest of
 /// [`build_catalog_argv`] and the child environment [`build_catalog_env`] for
 /// that ONE verdict, with the one [`initialize_request_line`] and `timeout`.
+/// Once the reply is in, `label` names the commands no `builtin` flag already
+/// named, handed the SAME verdict: a second read could hand project folders to a
+/// folder whose fetch skipped its project items.
 ///
-/// Blocking, the trust read included: only [`spawn_fetch_in`]'s worker thread
-/// calls it, so the verdict is read at fetch time, for this fetch, off the UI
-/// thread. `trust_of` and `program` are parameters so the suite can state a
-/// record and run a stand-in child; [`spawn_fetch`] is the one site naming the
-/// real ones.
-fn fetch_in<T>(cwd: &Path, trust_of: T, program: &[String], timeout: Duration) -> Option<Listing>
+/// Blocking, the trust read and `label`'s folder reads included: only
+/// [`spawn_fetch_in`]'s worker thread calls it, so the verdict is read at fetch
+/// time, for this fetch, off the UI thread. `trust_of`, `label` and `program` are
+/// parameters so the suite can state a record, the folders and a stand-in child;
+/// [`spawn_fetch`] is the one site naming the real ones.
+fn fetch_in<T, L>(
+    cwd: &Path,
+    trust_of: T,
+    label: L,
+    program: &[String],
+    timeout: Duration,
+) -> Option<Listing>
 where
     T: FnOnce(&Path) -> FolderTrust,
+    L: FnOnce(&mut [ListingEntry], &Path, FolderTrust),
 {
     let trust = trust_of(cwd);
     let argv: Vec<String> = program
@@ -328,13 +362,15 @@ where
         .cloned()
         .chain(build_catalog_argv(trust).into_iter().skip(1))
         .collect();
-    fetch_with(
+    let mut listing = fetch_with(
         &argv,
         build_catalog_env(trust),
         cwd,
         &initialize_request_line(),
         timeout,
-    )
+    )?;
+    label(&mut listing.commands, cwd, trust);
+    Some(listing)
 }
 
 /// Run `argv` in `cwd` with `env` added to the child's environment, write
@@ -623,33 +659,38 @@ fn kill_group(child: &mut Child) {
 
 /// Fetch `cwd`'s catalog on a thread of its own and deliver exactly one
 /// [`AppEvent::CatalogFetched`] carrying `cwd` back. The ONE site that names the
-/// real trust reader (`claude_trust::folder_trust`), program and timeout, as
+/// real trust reader (`claude_trust::folder_trust`), kind labeller
+/// ([`command_kinds::label_commands`]), program and timeout, as
 /// `watch::EventLoop::spawn_settings_model_probe` is for its read.
 pub fn spawn_fetch(cwd: PathBuf, tx: Sender<AppEvent>) {
     spawn_fetch_in(
         cwd,
         tx,
         claude_trust::folder_trust,
+        command_kinds::label_commands,
         vec![CLAUDE_PROGRAM.to_owned()],
         CATALOG_FETCH_TIMEOUT,
     );
 }
 
-/// [`spawn_fetch`] over a stated `trust_of`, `program` and `timeout`: one
-/// worker thread runs [`fetch_in`], the trust read included. The read is
-/// blocking FS work, so it must stay INSIDE the worker; hoisting it to the
-/// spawning (UI) thread is the regression the suite pins here.
-fn spawn_fetch_in<T>(
+/// [`spawn_fetch`] over a stated `trust_of`, `label`, `program` and `timeout`:
+/// one worker thread runs [`fetch_in`], the trust read and the folder reads
+/// included. They are blocking FS work, so they must stay INSIDE the worker;
+/// hoisting either to the spawning (UI) thread is the regression the suite pins
+/// here.
+fn spawn_fetch_in<T, L>(
     cwd: PathBuf,
     tx: Sender<AppEvent>,
     trust_of: T,
+    label: L,
     program: Vec<String>,
     timeout: Duration,
 ) where
     T: FnOnce(&Path) -> FolderTrust + Send + 'static,
+    L: FnOnce(&mut [ListingEntry], &Path, FolderTrust) + Send + 'static,
 {
     spawn_fetch_with(cwd, tx, move |cwd| {
-        fetch_in(cwd, trust_of, &program, timeout)
+        fetch_in(cwd, trust_of, label, &program, timeout)
     });
 }
 
@@ -678,6 +719,18 @@ mod tests {
         ListingEntry {
             name: name.to_owned(),
             description: description.map(str::to_owned),
+            kind: None,
+        }
+    }
+
+    /// The `label` seam of a fetch that names no kind, so a test of the fetch
+    /// never reads the machine's own skills and commands folders.
+    fn no_kinds(_: &mut [ListingEntry], _: &Path, _: FolderTrust) {}
+
+    fn built_in(name: &str, description: Option<&str>) -> ListingEntry {
+        ListingEntry {
+            kind: Some(CommandKind::BuiltIn),
+            ..entry(name, description)
         }
     }
 
@@ -894,6 +947,47 @@ mod tests {
         }
     }
 
+    /// The reply's `builtin: true` is the one kind it states: it also covers the
+    /// skills claude ships, so it is the row's kind and the folders never
+    /// override it. Only the JSON boolean `true` counts, an agent never gets one,
+    /// and the entry the dedup KEEPS carries its own flag.
+    #[test]
+    fn a_builtin_flag_makes_the_row_built_in_and_only_for_a_command() {
+        let got = parse_initialize_response(&success(
+            r#"{"commands":[
+                {"name":"loop","builtin":true},
+                {"name":"flagless"},
+                {"name":"false-flag","builtin":false},
+                {"name":"string-flag","builtin":"true"},
+                {"name":"clash","builtin":true},
+                {"name":"clash","description":"a skill with the same name"},
+                {"name":"later","description":"first of its name"},
+                {"name":"later","builtin":true}],
+              "agents":[{"name":"Explore","builtin":true},{"name":"mine"}]}"#,
+        ))
+        .expect("the reply is the answer");
+        let kinds: Vec<(&str, Option<CommandKind>)> = got
+            .commands
+            .iter()
+            .map(|e| (e.name.as_str(), e.kind))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("clash", Some(CommandKind::BuiltIn)),
+                ("false-flag", None),
+                ("flagless", None),
+                ("later", None),
+                ("loop", Some(CommandKind::BuiltIn)),
+                ("string-flag", None),
+            ]
+        );
+        assert!(
+            got.agents.iter().all(|a| a.kind.is_none()),
+            "an agent is never labelled, whatever its entry says"
+        );
+    }
+
     #[test]
     fn a_body_with_only_agents_still_yields_them() {
         let got = parse_initialize_response(&success(
@@ -920,7 +1014,7 @@ mod tests {
                 entry("b", None),
                 entry("c", None),
                 entry("d", Some("say [1mhi now")),
-                entry("ok", Some("fine")),
+                built_in("ok", Some("fine")),
             ]
         );
         assert!(got.agents.is_empty());
@@ -975,11 +1069,11 @@ mod tests {
             got.commands,
             [
                 entry("agents", None),
-                entry("compact", None),
+                built_in("compact", None),
                 entry("extra-usage", None),
                 entry("heapdump", Some("mine (user)")),
-                entry("pro-trial-expired", None),
-                entry("update", None),
+                built_in("pro-trial-expired", None),
+                built_in("update", None),
             ]
         );
     }
@@ -1297,6 +1391,7 @@ esac"#,
             fetch_in(
                 folder,
                 |folder| claude_trust::folder_trust_in(cfg, folder),
+                no_kinds,
                 &telling_its_form(),
                 ANSWERS_WITHIN,
             )
@@ -1389,6 +1484,7 @@ printf '{reply}\n' "${{{DISABLE_GIT_INSTRUCTIONS_ENV}-{GIT_ENV_UNSET}}}""#
                 fetch_in(
                     &folder,
                     |f| claude_trust::folder_trust_in(&cfg, f),
+                    no_kinds,
                     &telling_its_git_env(),
                     ANSWERS_WITHIN,
                 )
@@ -1440,6 +1536,7 @@ printf '{reply}\n' "${{{DISABLE_GIT_INSTRUCTIONS_ENV}-{GIT_ENV_UNSET}}}""#
                     thread::sleep(READ_BLOCKS);
                     FolderTrust::Untrusted
                 },
+                no_kinds,
                 telling_its_form(),
                 ANSWERS_WITHIN,
             );
@@ -1466,6 +1563,84 @@ printf '{reply}\n' "${{{DISABLE_GIT_INSTRUCTIONS_ENV}-{GIT_ENV_UNSET}}}""#
                 }
                 other => panic!("the worker must deliver CatalogFetched, got {other:?}"),
             }
+            std::fs::remove_dir_all(&folder).ok();
+        }
+
+        /// The kind labeller runs on the fetch's WORKER, after the reply, and is
+        /// handed the ONE verdict the fetch's argv was built from: the trust read
+        /// runs exactly once, so project folders can never be labelled for a fetch
+        /// that skipped its project items (AGENTS.md OFF-UI-THREAD).
+        #[test]
+        fn the_kind_labeller_runs_on_the_worker_with_the_fetch_verdict() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            use std::sync::Arc;
+
+            for verdict in [FolderTrust::Trusted, FolderTrust::Untrusted] {
+                let folder = temp_dir("labeller");
+                let (tx, rx) = mpsc::channel::<AppEvent>();
+                let (seen_tx, seen_rx) = mpsc::channel();
+                let reads = Arc::new(AtomicUsize::new(0));
+                let spawner = thread::current().id();
+
+                let counted = Arc::clone(&reads);
+                spawn_fetch_in(
+                    folder.clone(),
+                    tx,
+                    move |_: &Path| {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        verdict
+                    },
+                    move |entries: &mut [ListingEntry], cwd: &Path, trust: FolderTrust| {
+                        let _ = seen_tx.send((thread::current().id(), cwd.to_path_buf(), trust));
+                        for entry in entries.iter_mut() {
+                            entry.kind = Some(CommandKind::Skill);
+                        }
+                    },
+                    telling_its_form(),
+                    ANSWERS_WITHIN,
+                );
+
+                let (on, for_folder, trust) = seen_rx
+                    .recv_timeout(ANSWERS_WITHIN)
+                    .expect("the reply is labelled");
+                assert_ne!(on, spawner, "the labelling runs on the worker");
+                assert_eq!(for_folder, folder);
+                assert_eq!(trust, verdict, "the labeller gets the fetch's own verdict");
+                match rx.recv_timeout(ANSWERS_WITHIN) {
+                    Ok(AppEvent::CatalogFetched {
+                        listing: Some(listing),
+                        ..
+                    }) => assert_eq!(
+                        listing.commands.iter().map(|e| e.kind).collect::<Vec<_>>(),
+                        [Some(CommandKind::Skill)],
+                        "the delivered listing carries what the labeller set"
+                    ),
+                    other => panic!("the worker must deliver the listing, got {other:?}"),
+                }
+                assert_eq!(reads.load(Ordering::SeqCst), 1, "the trust is read ONCE");
+                std::fs::remove_dir_all(&folder).ok();
+            }
+        }
+
+        /// A fetch that got no answer is never labelled: there is no listing to
+        /// name, and no folder is read for it.
+        #[test]
+        fn a_fetch_with_no_answer_labels_nothing() {
+            let folder = temp_dir("no-answer");
+            let got = fetch_in(
+                &folder,
+                |_| FolderTrust::Trusted,
+                |_: &mut [ListingEntry], _: &Path, _: FolderTrust| {
+                    panic!("nothing to label without a reply")
+                },
+                &[
+                    "sh".to_owned(),
+                    "-c".to_owned(),
+                    "cat >/dev/null".to_owned(),
+                ],
+                ANSWERS_WITHIN,
+            );
+            assert_eq!(got, None);
             std::fs::remove_dir_all(&folder).ok();
         }
     }

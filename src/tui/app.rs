@@ -15302,6 +15302,7 @@ mod tests {
             commands: vec![crate::store::skills::ListingEntry {
                 name: command.to_string(),
                 description: Some(format!("{command} does a thing")),
+                kind: None,
             }],
             agents: Vec::new(),
         }

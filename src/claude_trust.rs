@@ -432,8 +432,9 @@ pub(crate) fn is_trusted(config: &Value, keys: &TrustKeys) -> bool {
 
 /// Whether `dir` holds a `.git` entry of ANY kind, as `symlink_metadata` sees it.
 /// An error other than "not found" counts as one too: it may hide a repository,
-/// and a shorter walk can only remove trust.
-fn has_git_entry(dir: &Path) -> bool {
+/// and a shorter walk can only remove trust. `crate::command_kinds` bounds its
+/// project-folder walk with it too, where a shorter walk can only remove a label.
+pub(crate) fn has_git_entry(dir: &Path) -> bool {
     match fs::symlink_metadata(dir.join(GIT_ENTRY)) {
         Ok(_) => true,
         Err(err) => err.kind() != std::io::ErrorKind::NotFound,

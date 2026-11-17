@@ -22,6 +22,7 @@ mod claude_move;
 mod claude_settings;
 mod claude_trust;
 mod cli;
+mod command_kinds;
 mod config;
 mod defined_agents;
 mod delete;
