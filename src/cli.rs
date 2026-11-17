@@ -41,7 +41,9 @@ KEYS:
                   move the selection, a search kept as typed (Ctrl-X ↓ below).
                   Only while that transcript is on screen: with the 1:0 layout
                   or a Ctrl-N card hiding it they move as usual
-    Enter         resume (returns to the board on exit). Refused on a session
+    Enter         resume (returns to the board on exit); with the find bar
+                  open it steps to the older match instead and never resumes.
+                  Refused on a session
                   snapback is still sending a reply to, or still making as a
                   fork from the Ctrl-X f box's Enter, until it lands (the session
                   a fork came from still resumes), and on one Ctrl-X w is still
@@ -58,6 +60,15 @@ KEYS:
                   1:0 (starts at 1:1; Shift+← toward a full-width preview, Shift+→
                   toward a full-width list; a press at either end does nothing).
                   Always bound, query or not; the preview keeps your place
+    Ctrl-F        find text in the preview: opens a find: bar on the preview's
+                  top border and marks what you type in the transcript shown
+                  (a session's own, or a subagent's), the same way the search
+                  query marks it. The session list, the selection and the
+                  search query are never touched. Typing, Backspace, the
+                  cursor keys and a paste edit the bar; every other key keeps
+                  its meaning. The preview jumps to the newest match;
+                  Shift+↑/↓ step between matches, Enter steps to the older
+                  one, Esc closes the bar. Opens the preview if it was hidden
     Ctrl-A        flip scope: current folder ↔ project (the repo you launched in
                   and all of its git worktrees). Launched with -a it is a
                   three-stop cycle instead: current folder → project → all
@@ -202,10 +213,11 @@ KEYS:
                   also works while a quick reply or fork box is open, not on a
                   draft; fn+←/→ on a MacBook keyboard, where Home/End are
                   not their own keys)
-    Shift+↑/↓     jump the preview to the previous / next line the query marks.
-                  Only while something is marked there — with nothing marked they
-                  stay plain ↑/↓ (a subagent's transcript marks nothing, so there
-                  they step the running subagents), so they never take a key
+    Shift+↑/↓     jump the preview to the previous / next line the query (or the
+                  find bar) marks. Only while something is marked there — with
+                  nothing marked they stay plain ↑/↓ (the query never marks a
+                  subagent's transcript, so there they step the running
+                  subagents unless the find bar marks it), so they never take a key
                   away from you. One stop per marked line, not per repeated word
     wheel         scroll preview / list (mouse mode on); the key-map table while
                   it is open, wherever the pointer is. While a compose or draft
@@ -245,14 +257,16 @@ KEYS:
                   Option, and it is the same set the reply box word-deletes on
     paste         your terminal's own paste (Cmd/Ctrl-V, middle-click) is inserted
                   as TEXT: into a compose draft at the cursor, newlines and all, or
-                  into the search query at its cursor with newlines flattened to
-                  spaces. It never sends, resumes, or answers a confirmation.
+                  into the search query (or the find bar, while it is open) at its
+                  cursor with newlines flattened to spaces. It never sends,
+                  resumes, or answers a confirmation.
                   A draft paste is cut at the size one claude argument can be
                   (about 128 KB on Linux, 768 KB on macOS) and says so; a longer
                   message is refused on Enter in any box and on Ctrl-O in a fork
                   or draft box, the box kept
-    Esc           clear the search query; with none typed, leave a subagent's
-                  transcript for the session's own; with neither, quit
+    Esc           close the find bar; else clear the search query; with none
+                  typed, leave a subagent's transcript for the session's own;
+                  with none of those, quit
     Ctrl-C        quit from the board; while a modal, a confirmation, the key map
                   or a Ctrl-X chord is open it closes or cancels that instead, and
                   in a compose box it never quits (Esc cancels the box)

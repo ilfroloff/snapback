@@ -394,6 +394,17 @@ pane cannot explain why the row is there. Consequences to keep: several runs on
 one line are normal, and marks are a **union** (overlapping or abutting runs merge
 into one span, never two).
 
+The preview's mark map has TWO sources under that per-atom rule: the board query
+and the preview's find bar (`Ctrl-F`). The find compiles its text with
+`SearchIndex::new` + `set_query` into a SECOND index that holds zero entries, so
+it only marks: `atom_match_positions_with` reads the compiled atoms alone. Both
+sources walk through ONE function (`walk_preview_matches`); the single
+source-specific line is the board's list-admission filter (the body of an open
+injected node, which the content index never held), and the source is part of the
+cache entry's recompute key so one source's map is never served for the other's
+text. Never give the find its own matcher or its own marking rule: a mark that
+disagrees with the board's on the same text is the defect.
+
 The compose pick list is a further CONSUMER of those seams, and the one caller
 of a THIRD rule kept beside them (below). `tui::complete` splits its
 whitespace-free token into parts by its own rule and compiles them with
@@ -838,10 +849,22 @@ inner rect when there is no banner (so a banner-less pane's geometry is exactly
   from where the wrapper paints it.
 - **The match jump is armed by a USER ACT, not by a session being written.** It is a
   pending FLAG (`App::preview_match_jump`), and its whole correctness is in where
-  it is armed: `request_preview_match_jump` is called from the selection setter and
-  from the one query-change funnel (`apply_query_change`), and nowhere else — which
-  is why the `Tab` mode toggle goes through that funnel rather than straight to the
-  re-filter: the query text does not move, but the same text now matches more. The
+  it is armed, so the list is closed: five sites, and no other. TWO call
+  `request_preview_match_jump`, the one place the mode gate lives (it clears the
+  parked line, and arms in `NameAndContent` or while the find bar is open): the
+  selection setter (`set_selected`) and the one query-change funnel
+  (`apply_query_change`, which skips it while the find bar is open). THREE set the
+  flag directly, never through the gate: the find bar's own edit
+  (`apply_find_change`, since a find edit is a question about the open transcript
+  in either mode; it parks no line), the explicit `Shift-Up`/`Shift-Down` step
+  (`preview_match_step`, which keeps the line it just chose) and
+  `open_subagent_view` (only while the bar is open; it clears the parked line
+  itself). That is why the `Tab` mode toggle goes through the funnel rather than
+  straight to the re-filter: the query text does not move, but the
+  same text now matches more. While the find bar is open the funnel does NOT arm: the
+  marks come from the find's text, so a re-apply that keeps the previewed transcript
+  must not drop the place the reader stepped to, and one that moves the selection
+  arms through the setter. The
   setter arms only when the id actually MOVES, and a reload restores the selection by
   id, so the setter is a no-op there — which is what stops a live session appending
   turns at the watcher's cadence from yanking the reader's viewport every few hundred
@@ -889,8 +912,8 @@ inner rect when there is no banner (so a banner-less pane's geometry is exactly
   anchor (in either direction — a scroll states a position, not a subscription —
   and a drag held past the pane's edge included, on a step whose autoscroll
   actually moves the pane), and only `End` (or its `Ctrl-E` twin; an open quick reply or fork box answers every scroll key through the same methods), another row, or a layout change that
-  brings the pane back from 1:0 (`App::set_pane_layout`, which `Shift-←` and an
-  opening compose both go through), or a switch of the pane to a subagent's
+  brings the pane back from 1:0 (`App::set_pane_layout`, which `Shift-←`, an
+  opening compose and an opening find bar all go through), or a switch of the pane to a subagent's
   transcript (`App::open_subagent_view`: a click on its delegation line,
   `Ctrl-X ↓`, or a `←`/`→` or `↑`/`↓` step inside the view) re-arms it; leaving that view
   (`Esc`, `Ctrl-X ↓` again, an opening reply or fork box) puts back the
@@ -1615,9 +1638,10 @@ take the narrow allow instead.
 Input handling is a three-stage pipeline, all terminal-free and testable:
 
 1. `key_to_action(key, query_empty, has_preview_matches, in_subagent_view,
-   view_on_screen)` → an
-   `Action` (every printable char types into the query; arrows, Enter, Tab, and
-   `Ctrl-*` always act so search never blocks navigation).
+   view_on_screen, finding)` → an
+   `Action` (every printable char types into the query, or into the find bar
+   while it is open; arrows, Enter, Tab, and `Ctrl-*` always act so search never
+   blocks navigation).
 2. `apply_action` mutates the `App` and returns an `Outcome`
    (`Continue`/`Quit`/`Resume`/`Send`/`Move`/`Interrupt`/`BgLaunch`/`Signal`; `Copy`
    comes from `handle_chord_key` and `FinishCopy` from `handle_event`, below). `Send`,
@@ -1803,7 +1827,8 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    carries.
 
 The board's search query is a **widget** that is deliberately NOT a keyboard
-owner. `App::query_input` is a `ratatui_textarea::TextArea`, so it measures,
+owner, and the preview's find bar (`App::find`, `Ctrl-F`) is a second one built on
+the same rule. `App::query_input` is a `ratatui_textarea::TextArea`, so it measures,
 scrolls and draws its own caret — but every key that reaches it came through the
 pipeline above, and two rules keep it that way.
 
@@ -1842,6 +1867,19 @@ stays that way: it IS a keyboard owner, so forwarding to `TextArea::input` is
 correct there — and that is precisely why the same crate can answer
 `Alt-Backspace` in the reply box without the board ever inheriting the rest of the
 map.
+
+The find bar's input is edited through the same free helpers over a
+`TextArea<'static>` (insert char, insert str, delete char, delete atom, clear, the
+caret moves) as the query's, so the two cannot drift: `key_to_action` decodes a
+typed key identically either way and `apply_action` alone picks the target, by
+`App::is_finding()` (`push_find_char`, `pop_find_word`, `move_find_caret`, …; a
+terminal paste likewise, in `handle_paste`). Its text change runs
+`App::apply_find_change`, never `apply_query_change`: the find must re-filter
+nothing, move no selection and raise no outside-the-preview nudge. The `finding`
+parameter re-decodes exactly two keys, `Esc` (`CloseFind`, above the query-clear
+and view-leave arms) and `Enter` (`PreviewMatchPrev` — the older match, bound
+unconditionally and never falling through to `Resume`); every other key, the
+subagent view's arrows included, decodes as it does with the bar closed.
 
 Add a keybinding by extending the `Action` enum + `key_to_action` + `apply_action`.
 Cover it with a `key_to_action` unit test AND one test that presses the key through
@@ -1904,7 +1942,7 @@ reply or fork, not an oversight: do not add alternative chords for them.
 
 A binding that is only meaningful sometimes is **CONDITIONAL, and falls through**
 rather than going inert. `key_to_action` takes the conditions as parameters
-(`query_empty`, `has_preview_matches`, `in_subagent_view`, `view_on_screen`) so the decision stays
+(`query_empty`, `has_preview_matches`, `in_subagent_view`, `view_on_screen`, `finding`) so the decision stays
 pure and the
 fall-through is what a test can pin; the guarded arm sits ABOVE the unguarded one
 and the unguarded one is reached whenever the guard fails. The shifted VERTICAL
@@ -1915,8 +1953,9 @@ modifier degrades to a working key. The plain `↑`/`↓` are conditional on the
 subagent view being ON SCREEN (`App::subagent_view_on_screen`: open, the preview
 drawn, no `Ctrl-N` card over it): there they are `PrevRunningSubagent`/`NextRunningSubagent`, query
 or not, from arms BELOW the `Shift-Up`/`Shift-Down` match steps and above
-`MoveUp`/`MoveDown`; the view takes no marks, so the match guard fails there and
-the shifted keys fall through to the running steps too
+`MoveUp`/`MoveDown`; the board query never marks the view, so the match guard fails
+there (unless the find bar marks it) and the shifted keys fall through to the
+running steps too
 (`shift_up_in_the_subagent_view_falls_through_to_the_running_step`). That
 decode is the DELIBERATE EXCEPTION to "conditional and falls through": it is
 bound on `view_on_screen` ALONE and never on "something runs". Gated on that,
@@ -2036,6 +2075,12 @@ state and renders on the surface that owns it:
   (`AppEvent::ReportedAgents { agents, reported_at_ms }`) and the event arm only
   stores it, so the age is "as of the last poll", no clock is read in render, and
   applying a map never writes `App::status`;
+- the find bar's "this text marks nothing" state lives on the bar itself, its
+  label drawn in a named warning colour for as long as the text is non-empty and
+  `App::has_preview_matches` is false (`view::find_label_style`), never on the
+  help line; and while the bar is open `note_match_outside_preview`, which judges
+  the BOARD query against a map that then holds the find's marks, returns early
+  instead of writing a nudge;
 - which of the selected session's subagents are running lives in the subagent
   record (`App::selected_subagents`, landed silently by `AppEvent::SubagentRuns`)
   and renders as the preview's running list (`view::running_list`), not on

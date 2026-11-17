@@ -251,7 +251,11 @@ one place.
   rule's — is folded by the ONE per-char, byte-length-preserving fold. The
   ROW-LABEL highlight (`match_indices`) applies the WHOLE-STRING rule over the
   same finders — EVERY atom in the one string, every occurrence of each marked;
-  the PREVIEW marks apply the PER-ATOM rule (`atom_match_positions`). Never rank
+  the PREVIEW marks apply the PER-ATOM rule (`atom_match_positions`), whichever of
+  TWO sources feeds them: the board query, or the preview's find bar
+  (`Ctrl-F`), whose own `SearchIndex` holds ZERO entries and so only marks. Only
+  the board source is held to the list's admission (an open injected body is
+  unmarked for it alone); the find never filters the list. Never rank
   the BOARD filter's results: display order is `App::order_filtered`'s alone.
   The window, the cap and the fold are argued in
   [DOMAIN.md](docs/agents/DOMAIN.md#content-index-storeparse), the rules in
@@ -365,6 +369,7 @@ one place.
   `view.rs` (EVERY key string that renders there: the board keymap
   (`DEFAULT_HELP_HINT`, or `SUBAGENT_HELP_HINT` in the subagent view),
   `chord_hint`'s which-key list, `compose_hint`'s reply hint, `FORK_HINT`,
+  `FIND_HINT` (the help row while the find bar is open),
   `BG_DRAFT_HINT`, and the `COMPLETION_HINT` every compose box shows while the
   pick list is open; the card's `draft_hint` names `BG_DRAFT_HINT`, or
   `COMPLETION_HINT` while the list is open; the key-map modal's `KEY_MAP` table,
@@ -382,7 +387,7 @@ one place.
   box" entry in each key map — the `update.rs` table, `KEYS`, `docs/GUIDE.md` —
   that the `Ctrl-R`, `Ctrl-X f` and `Ctrl-N` entries point to, never copies.
   The help line is ONE row, cut rather than wrapped: the board keymap,
-  `chord_hint`, the reply hint, `FORK_HINT` and `COMPLETION_HINT` are
+  `chord_hint`, the reply hint, `FORK_HINT`, `FIND_HINT` and `COMPLETION_HINT` are
   column-budgeted to fit 80 whole (each pinned by a test), while `BG_DRAFT_HINT`
   runs past 80 and is cut there, so an 80-column terminal draws only its leading
   keys. It binds ROUTING too, not just bindings: when a key's gate gains a case
