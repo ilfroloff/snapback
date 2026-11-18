@@ -186,8 +186,9 @@ pub struct ComposeState {
     /// learns it — a pick is a request for one message, and claude itself keeps a
     /// session on the model a reply ran with (it normally restores that model on the
     /// next `-r`). Written only by `App::set_compose_model`, from the picker's confirm;
-    /// read by the submit paths below, which emit `--model`/`--effort` ONLY when it
-    /// is `Some`, and by the compose box's `model:` label.
+    /// read by the submit paths below, which emit `--model` ONLY when it is `Some`
+    /// (and then its own effort, never the session's carried one), and by the compose
+    /// box's `model:` label.
     pub model: Option<ModelPick>,
     /// The `/` and `@` pick list of this draft, reply, fork and background draft
     /// alike (see [`CompletionState`]).
@@ -969,6 +970,11 @@ struct Draft {
     target: ComposeTarget,
     /// The compose's own model pick ([`ComposeState::model`]).
     model: Option<ModelPick>,
+    /// The effort the box's default carries ([`ComposeDefault::carried_effort`]):
+    /// asked of the SAME decision that words the `model:` label, so the launch sends
+    /// exactly what the label names. Only read when `model` is `None`
+    /// ([`crate::resume::push_model_or_carried_effort`]).
+    carried_effort: Option<&'static str>,
 }
 
 /// Read the open draft out of the app (see [`Draft`]).
@@ -978,6 +984,9 @@ fn draft(app: &App) -> Option<Draft> {
         message: compose.textarea.lines().join("\n"),
         target: compose.target.clone(),
         model: compose.model.clone(),
+        carried_effort: app
+            .compose_default()
+            .and_then(|default| default.carried_effort()),
     })
 }
 
@@ -1010,6 +1019,7 @@ fn submit_compose(app: &mut App) -> Outcome {
         message,
         target,
         model,
+        carried_effort,
     }) = draft(app)
     else {
         return Outcome::Continue;
@@ -1021,8 +1031,17 @@ fn submit_compose(app: &mut App) -> Outcome {
         ComposeTarget::Reply {
             session_id,
             stop_job,
-        } => submit_reply(app, message, session_id, stop_job, model.as_ref()),
-        ComposeTarget::Fork { session_id } => submit_fork(app, message, session_id, model.as_ref()),
+        } => submit_reply(
+            app,
+            message,
+            session_id,
+            stop_job,
+            model.as_ref(),
+            carried_effort,
+        ),
+        ComposeTarget::Fork { session_id } => {
+            submit_fork(app, message, session_id, model.as_ref(), carried_effort)
+        }
         ComposeTarget::NewBackgroundAgent { agent } => {
             submit_bg_launch(app, message, agent, model.as_ref())
         }
@@ -1131,8 +1150,8 @@ fn submit_bg_launch(
 /// On a [`ComposeTarget::Fork`] it forks INTERACTIVELY instead: an ordinary
 /// hand-off through [`super::update::launch_fork_run`] and [`crate::resume`]'s
 /// `ForkRun` action, `claude -r <id> --fork-session --name <name> [--model <alias>
-/// [--effort <level>]] [<message>]`. An empty box with no pick is the old `Ctrl-F`
-/// plus `--name "fork: <the session's label>"`. The message AUTO-SUBMITS as a
+/// [--effort <level>] | --effort <level>] [<message>]`. An empty box with no pick and
+/// no carried effort is the old `Ctrl-F` plus `--name "fork: <the session's label>"`. The message AUTO-SUBMITS as a
 /// trailing positional, like a new session's prompt (probed for `-r
 /// --fork-session` at claude 2.1.291 on 2026-10-08; `docs/agents/CLAUDE_CLI.md`).
 ///
@@ -1148,6 +1167,7 @@ fn open_interactive(app: &mut App) -> Outcome {
         message,
         target,
         model,
+        carried_effort,
     }) = draft(app)
     else {
         return Outcome::Continue;
@@ -1175,7 +1195,13 @@ fn open_interactive(app: &mut App) -> Outcome {
         }
         ComposeTarget::Fork { session_id } => {
             app.close_compose();
-            super::update::launch_fork_run(app, &session_id, prompt.as_deref(), model.as_ref())
+            super::update::launch_fork_run(
+                app,
+                &session_id,
+                prompt.as_deref(),
+                model.as_ref(),
+                carried_effort,
+            )
         }
         // No interactive launch on the reply target.
         ComposeTarget::Reply { .. } => Outcome::Continue,
@@ -1208,6 +1234,7 @@ fn submit_fork_with(
     message: String,
     origin_id: String,
     model: Option<&ModelPick>,
+    carried_effort: Option<&str>,
     fork_id: std::io::Result<String>,
 ) -> Outcome {
     if message.trim().is_empty() {
@@ -1234,8 +1261,14 @@ fn submit_fork_with(
                     return Outcome::Continue;
                 }
             };
-            let argv =
-                send::build_fork_send_argv(&authoritative_id, &fork_id, model, &message, &label);
+            let argv = send::build_fork_send_argv(
+                &authoritative_id,
+                &fork_id,
+                model,
+                carried_effort,
+                &message,
+                &label,
+            );
             app.close_compose();
             // The fork has no transcript yet, so there is no turn count to compare
             // the echo against: once the file exists its history is already longer.
@@ -1266,8 +1299,16 @@ fn submit_fork(
     message: String,
     origin_id: String,
     model: Option<&ModelPick>,
+    carried_effort: Option<&str>,
 ) -> Outcome {
-    submit_fork_with(app, message, origin_id, model, send::fresh_session_id())
+    submit_fork_with(
+        app,
+        message,
+        origin_id,
+        model,
+        carried_effort,
+        send::fresh_session_id(),
+    )
 }
 
 /// Send the drafted quick reply — the `Enter` half of the reply target.
@@ -1286,14 +1327,18 @@ fn submit_fork(
 /// it and `--model` is the ONLY way to choose a model for a quick reply. With no
 /// pick (`None`) the argv is unchanged and carries no `--model`, so claude normally
 /// restores the model the session last answered with — the `model: session (…)`
-/// the box showed. After a picked reply claude keeps the session on that model by
-/// itself (the next `-r` normally restores it); its effort is not kept.
+/// the box showed — and the argv carries `--effort` alone when that label names an
+/// effort too (`carried_effort`, [`crate::resume::push_effort_flag`]). After a picked
+/// reply claude keeps the session on that model by itself (the next `-r` normally
+/// restores it); the effort is kept the same way a carried one is: the next box reads
+/// the level that reply recorded off the transcript and sends it again.
 fn submit_reply(
     app: &mut App,
     message: String,
     session_id: String,
     stop_job: Option<String>,
     model: Option<&ModelPick>,
+    carried_effort: Option<&str>,
 ) -> Outcome {
     if message.trim().is_empty() {
         // Nothing to send: keep the compose zone open so the user can type.
@@ -1315,7 +1360,7 @@ fn submit_reply(
             cwd,
             session_id: authoritative_id,
         } => {
-            let argv = send::build_send_argv(&authoritative_id, model, &message);
+            let argv = send::build_send_argv(&authoritative_id, model, carried_effort, &message);
             app.close_compose();
             // Mark the send in flight so the preview echoes the message under a
             // synthetic `▶ you` turn plus a live `cooking…` indicator until the
@@ -2193,6 +2238,244 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A sendable session whose last answering turn is Opus 5.5 recording
+    /// `effort_fields` (raw JSON members, e.g. `"perTurnEffort":"xhigh"`, or empty),
+    /// with its preview already rendered — the state a compose box opens over, since
+    /// the carried effort comes off the cached render and no file is read on a key.
+    fn app_over_effort_session(dir: &std::path::Path, id: &str, effort_fields: &str) -> App {
+        let file = dir.join(format!("{id}.jsonl"));
+        let comma = if effort_fields.is_empty() { "" } else { "," };
+        std::fs::write(
+            &file,
+            format!(
+                r#"{{"type":"user","sessionId":"{id}","cwd":"{cwd}","message":{{"role":"user","content":"hi"}}}}
+{{"type":"assistant","sessionId":"{id}","cwd":"{cwd}","message":{{"role":"assistant","model":"claude-opus-5-5","content":"ok"}}{comma}{effort_fields}}}
+"#,
+                cwd = dir.display()
+            ),
+        )
+        .expect("write the effort fixture");
+        let mut app = App::new(
+            vec![session_at(id, file, dir.to_path_buf())],
+            Scope::All,
+            dir.to_path_buf(),
+        );
+        let _ = app.preview_text(80);
+        app
+    }
+
+    /// With no pick, the reply, the fork box's `Enter` and its `Ctrl-O` all send the
+    /// effort the `model: session (Opus 5.5 · <level>)` label names, `--effort`
+    /// alone and ahead of the message, end to end from the cached render through the
+    /// submit. A `Ctrl-L` pick wins over it on all three.
+    #[test]
+    fn the_session_effort_reaches_the_reply_and_both_fork_launches_until_a_pick_wins() {
+        let dir = unique_temp_dir("carry-effort");
+        let ctrl_o = || with_mods(KeyCode::Char('o'), KeyModifiers::CONTROL);
+
+        let mut app = app_over_effort_session(&dir, "sbc-carry", r#""perTurnEffort":"xhigh""#);
+        app.open_compose(ComposeState::new_reply("sbc-carry".to_string(), None), None);
+        assert_eq!(
+            app.compose_default().map(|d| d.picker_label()),
+            Some("session's model (Opus 5.5 \u{b7} xhigh)".to_string())
+        );
+        type_into(&mut app, "ship it");
+        match handle_compose_key(&mut app, key(KeyCode::Enter)) {
+            Outcome::Send(req) => assert_eq!(
+                req.argv.join(" "),
+                "claude -p -r sbc-carry --output-format json --effort xhigh ship it"
+            ),
+            _ => panic!("Enter on a drafted reply must send"),
+        }
+
+        let mut app = app_over_effort_session(&dir, "sbc-carry", r#""perTurnEffort":"xhigh""#);
+        open_fork(&mut app, "sbc-carry".to_string());
+        type_into(&mut app, "try it");
+        let Outcome::Send(req) = handle_compose_key(&mut app, key(KeyCode::Enter)) else {
+            panic!("Enter on a typed fork box must send");
+        };
+        let tail = &req.argv[req.argv.len() - 4..];
+        assert_eq!(
+            tail,
+            ["json", "--effort", "xhigh", "try it"],
+            "the flag sits after the fixed head and ahead of the message: {:?}",
+            req.argv
+        );
+        assert!(req.argv.iter().any(|a| a == "--fork-session"));
+        assert!(!req.argv.iter().any(|a| a == "--model"));
+
+        let mut app = app_over_effort_session(&dir, "sbc-carry", r#""perTurnEffort":"xhigh""#);
+        open_fork(&mut app, "sbc-carry".to_string());
+        type_into(&mut app, "try it");
+        let Outcome::Resume(ready) = handle_compose_key(&mut app, ctrl_o()) else {
+            panic!("Ctrl-O must hand off");
+        };
+        assert_eq!(
+            ready.argv.join(" "),
+            "claude -r sbc-carry --fork-session --name fork: try it --effort xhigh try it"
+        );
+        assert_eq!(ready.nonzero_hint, crate::resume::FORK_NONZERO_HINT);
+
+        // A pick wins on every route: its own model, its own effort, never the
+        // session's.
+        let mut app = app_over_effort_session(&dir, "sbc-carry", r#""perTurnEffort":"xhigh""#);
+        app.open_compose(ComposeState::new_reply("sbc-carry".to_string(), None), None);
+        app.set_compose_model(Some(ModelPick::new("sonnet")));
+        type_into(&mut app, "ship it");
+        match handle_compose_key(&mut app, key(KeyCode::Enter)) {
+            Outcome::Send(req) => assert_eq!(
+                req.argv.join(" "),
+                "claude -p -r sbc-carry --output-format json --model sonnet ship it"
+            ),
+            _ => panic!("Enter on a drafted reply must send"),
+        }
+        let mut app = app_over_effort_session(&dir, "sbc-carry", r#""perTurnEffort":"xhigh""#);
+        open_fork(&mut app, "sbc-carry".to_string());
+        app.set_compose_model(Some(ModelPick::new("sonnet")));
+        type_into(&mut app, "try it");
+        let Outcome::Resume(ready) = handle_compose_key(&mut app, ctrl_o()) else {
+            panic!("Ctrl-O must hand off");
+        };
+        assert_eq!(
+            ready.argv.join(" "),
+            "claude -r sbc-carry --fork-session --name fork: try it --model sonnet try it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Nothing is carried when the box's default is not the session's own model with
+    /// a KNOWN effort: a last turn that recorded none, an unknown or flag-shaped level, an environment override of the
+    /// model, and a session with no answering model.
+    #[test]
+    fn no_effort_is_carried_for_a_cleared_strange_overridden_or_modelless_session() {
+        let dir = unique_temp_dir("carry-effort-none");
+        let bare = "claude -p -r sbc-none --output-format json ship it";
+        let send_from = |app: &mut App| {
+            app.open_compose(ComposeState::new_reply("sbc-none".to_string(), None), None);
+            type_into(app, "ship it");
+            match handle_compose_key(app, key(KeyCode::Enter)) {
+                Outcome::Send(req) => req.argv.join(" "),
+                _ => panic!("Enter on a drafted reply must send"),
+            }
+        };
+
+        for strange in [
+            r#""perTurnEffort":"ultra""#,
+            r#""perTurnEffort":"--model""#,
+            r#""perTurnEffort":"""#,
+            r#""perTurnEffort":7"#,
+            "",
+        ] {
+            let mut app = app_over_effort_session(&dir, "sbc-none", strange);
+            assert_eq!(send_from(&mut app), bare, "{strange:?}");
+        }
+
+        let mut app = app_over_effort_session(&dir, "sbc-none", r#""perTurnEffort":"high""#);
+        app.set_restore_overridden(true);
+        assert_eq!(
+            send_from(&mut app),
+            bare,
+            "an overridden model carries nothing"
+        );
+
+        // A session with no answering model: the plain fixture has no assistant turn.
+        let mut app = App::new(
+            vec![sendable_session(&dir, "sbc-none")],
+            Scope::All,
+            dir.clone(),
+        );
+        let _ = app.preview_text(80);
+        assert_eq!(send_from(&mut app), bare, "no answering model on record");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A real two-turn transcript whose first turn ran at `xhigh` and whose LAST turn
+    /// recorded no effort (`sess-effort-cleared-1`) sends no `--effort` on the reply,
+    /// the fork box's `Enter` or its `Ctrl-O`: the newer turn clears the older level
+    /// rather than leaving it standing. The control, `sess-effort-present-1` (one turn
+    /// at `xhigh`), carries it on the same three routes, so a fixture that failed to
+    /// load could not pass this vacuously.
+    #[test]
+    fn a_last_turn_without_effort_after_one_with_it_sends_no_effort_on_any_route() {
+        let dir = unique_temp_dir("carry-effort-cleared");
+        // The fixtures name a `cwd` that does not exist here; the send gate needs one
+        // that does, so the copy is pointed at the temp dir.
+        let app_over_fixture = |id: &str| {
+            let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/preview")
+                .join(format!("{id}.jsonl"));
+            let file = dir.join(format!("{id}.jsonl"));
+            std::fs::write(
+                &file,
+                std::fs::read_to_string(&source)
+                    .expect("read the preview fixture")
+                    .replace("/Users/me/project-alpha", &dir.display().to_string()),
+            )
+            .expect("write the fixture copy");
+            let mut app = App::new(
+                vec![session_at(id, file, dir.clone())],
+                Scope::All,
+                dir.clone(),
+            );
+            let _ = app.preview_text(80);
+            app
+        };
+        let ctrl_o = || with_mods(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        // The argv of the reply, the fork's `Enter` and the fork's `Ctrl-O`, in order.
+        let argvs = |id: &str| -> [Vec<String>; 3] {
+            let mut app = app_over_fixture(id);
+            app.open_compose(ComposeState::new_reply(id.to_string(), None), None);
+            type_into(&mut app, "go on");
+            let Outcome::Send(reply) = handle_compose_key(&mut app, key(KeyCode::Enter)) else {
+                panic!("Enter on a drafted reply must send");
+            };
+
+            let mut app = app_over_fixture(id);
+            open_fork(&mut app, id.to_string());
+            type_into(&mut app, "go on");
+            let Outcome::Send(fork) = handle_compose_key(&mut app, key(KeyCode::Enter)) else {
+                panic!("Enter on a typed fork box must send");
+            };
+
+            let mut app = app_over_fixture(id);
+            open_fork(&mut app, id.to_string());
+            type_into(&mut app, "go on");
+            let Outcome::Resume(run) = handle_compose_key(&mut app, ctrl_o()) else {
+                panic!("Ctrl-O must hand off");
+            };
+            [reply.argv, fork.argv, run.argv]
+        };
+
+        let routes = ["reply Enter", "fork Enter", "fork Ctrl-O"];
+        let carried = argvs("sess-effort-present-1");
+        for (route, argv) in routes.iter().zip(&carried) {
+            assert!(
+                argv.windows(2).any(|pair| pair == ["--effort", "xhigh"]),
+                "{route}: the control must carry its xhigh: {argv:?}"
+            );
+        }
+
+        let cleared = argvs("sess-effort-cleared-1");
+        for (route, argv) in routes.iter().zip(&cleared) {
+            assert!(
+                !argv.iter().any(|a| a == "--effort" || a == "xhigh"),
+                "{route}: the older turn's effort must not outlive a later turn without one: {argv:?}"
+            );
+        }
+        assert_eq!(
+            cleared[0].join(" "),
+            "claude -p -r sess-effort-cleared-1 --output-format json go on"
+        );
+        assert_eq!(
+            cleared[2].join(" "),
+            "claude -r sess-effort-cleared-1 --fork-session --name fork: go on go on"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The draft's pick reaches the BACKGROUND LAUNCH argv, beside the agent — the
     /// `Enter` half of the `Ctrl-N` draft.
     #[test]
@@ -2607,6 +2890,7 @@ mod tests {
             "try it".to_string(),
             "sbf-origin".to_string(),
             pick.as_ref(),
+            None,
             Ok(fork_id.to_string()),
         );
         let Outcome::Send(req) = out else {
@@ -2691,6 +2975,7 @@ mod tests {
             &mut app,
             "go".to_string(),
             "sbf-refuse".to_string(),
+            None,
             None,
             Err(std::io::Error::other("no entropy")),
         );

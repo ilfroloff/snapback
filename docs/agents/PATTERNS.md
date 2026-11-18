@@ -150,7 +150,11 @@ it. Follow this split when adding behavior:
   `push_model_flag` (the ONE place the flag is formatted, over the same
   `flag_value` trim/blank guard `--agent` uses, and shared verbatim by `send`; it
   writes the pick's `--effort` too, directly after `--model` and INSIDE that
-  guard, so no argv can carry an effort without its model) and
+  guard, so no argv can carry a PICK's effort without the model it was picked for), its sibling
+  `push_effort_flag` (the CHECKED carried effort, which goes out with no model: only an `EFFORT_LEVELS` entry
+  becomes `--effort`, so a level read off a transcript can never reach argv as
+  anything else; `push_model_or_carried_effort` lets a pick win over it, one call
+  in each of the reply, fork-send and fork-run builders), and
   `nonzero_hint_for` (which picks the hint from that SAME predicate, so a blank
   pick that emits nothing cannot blame a model that was never sent). A compose's
   pick is passed IN as a parameter by the reply, the fork box's headless fork and
@@ -240,15 +244,17 @@ it. Follow this split when adding behavior:
   — the probe's answer verbatim, or the seed when it is empty — pure so the one
   decision the runtime alias read turns on is asserted directly rather than only
   through a rendered modal) and `tui::app::resolve_compose_default` (what a
-  compose runs on with no pick, over its target, the session's restorable model,
-  the restore-override flag and the settings model — every `ComposeDefault` case
+  compose runs on with no pick, over its target, the session's restorable model
+  and its last turn's effort, the restore-override flag and the settings model — every `ComposeDefault` case
   asserted with no board) with its two wordings, `ComposeDefault::picker_label` /
   `picker_description` (the picker's first row) and
   `tui::app::cycle_effort` (the picker's whole `←`/`→` cycle — unset, then
   `resume::EFFORT_LEVELS` in order, wrapping both ways — asserted without a
   modal); `store::preview::restorable_model` (claude's restore rule for ONE record
   — a non-`isMeta` `assistant` turn with a real model — so the reply's default is
-  pinned per record as well as per fixture); `store::lineage`'s `lineage_key` /
+  pinned per record as well as per fixture) and `restorable_turn` (that model's
+  label paired with the effort of the SAME record, so a later turn that recorded
+  none clears an earlier one's); `store::lineage`'s `lineage_key` /
   `is_fork_name` / `fork_title` / `head_of` / `fold` (the whole fold is one pure fn of
   `(sessions, filtered, expanded)`, so the `(+N)` board can be tested as a list
   transformation with no terminal and no store) and `resume::fork_name` (a fork's

@@ -271,7 +271,11 @@ pub const EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 /// from the user's settings (`modelSettings`) or its built-in default. The picker
 /// only ever sets a `Some` drawn from [`EFFORT_LEVELS`]. Claude does NOT restore an
 /// effort on a later `-r` the way it restores a model, so an effort picked for one
-/// reply applies to that reply alone.
+/// reply applies to that reply alone, unless the NEXT compose carries it: with no
+/// pick, a reply or fork box sends the effort its session's last turn recorded
+/// ([`push_model_or_carried_effort`]), so a raised level persists without being
+/// re-picked. That carried effort is read off the transcript on every load and is
+/// never held in a pick.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelPick {
     /// The raw `--model` value: an alias or a full model id, never validated here
@@ -319,8 +323,8 @@ pub enum SessionAction {
     New,
     /// Fork an existing session interactively from the `Ctrl-F` box's `Ctrl-O`
     /// (`claude -r <id> --fork-session --name <name> [--model <alias> [--effort
-    /// <level>]] [<message>]`). Unlike [`SessionAction::Fork`] it reads a model and
-    /// a message.
+    /// <level>] | --effort <level>] [<message>]`). Unlike [`SessionAction::Fork`] it
+    /// reads a model, the session's carried effort and a message.
     ForkRun,
 }
 
@@ -371,6 +375,13 @@ pub struct HandoffCtx<'a> {
     /// blank/whitespace is treated as `None` by [`flag_value`], exactly like `agent`
     /// — and takes its effort down with it.
     pub model: Option<&'a ModelPick>,
+    /// The effort the session's last turn ran at, carried on a `ForkRun` that has no
+    /// `model` pick ([`push_model_or_carried_effort`]) — read off the transcript by
+    /// the compose, and checked against [`EFFORT_LEVELS`] where it becomes argv.
+    ///
+    /// INERT for every other action, `Resume`, `Fork` and `Attach` structurally (their
+    /// builders take none) and `New` because a new session has no last turn.
+    pub carried_effort: Option<&'a str>,
     /// The label of the session a `Fork` or `ForkRun` forks: the fork's `--name`
     /// when there is no message ([`fork_name`]), which a `Fork` never has. Read by
     /// those two alone; defaults to `""`.
@@ -402,9 +413,13 @@ pub fn argv_for(action: SessionAction, ctx: &HandoffCtx) -> Vec<String> {
         SessionAction::Fork => build_fork_argv(ctx.session_id, ctx.parent_label),
         SessionAction::Attach => build_attach_argv(ctx.job_id),
         SessionAction::New => build_new_argv(ctx.agent, ctx.model, ctx.prompt),
-        SessionAction::ForkRun => {
-            build_fork_run_argv(ctx.session_id, ctx.model, ctx.prompt, ctx.parent_label)
-        }
+        SessionAction::ForkRun => build_fork_run_argv(
+            ctx.session_id,
+            ctx.model,
+            ctx.carried_effort,
+            ctx.prompt,
+            ctx.parent_label,
+        ),
     }
 }
 
@@ -510,6 +525,47 @@ pub(crate) fn push_model_flag(argv: &mut Vec<String>, pick: Option<&ModelPick>) 
     }
 }
 
+/// Append `--effort <level>` to `argv` when `effort` is one of [`EFFORT_LEVELS`],
+/// else nothing — the CHECKED flag a session's CARRIED effort goes out through.
+///
+/// A session's carried effort is read off its transcript
+/// ([`crate::store::preview::RenderedPreview::last_effort`]), a file claude wrote, so
+/// it is hostile input until it passes here: only an exact [`EFFORT_LEVELS`] entry is
+/// sent. Anything else — a level this build does not know, a blank, a value shaped
+/// like another flag — sends no flag, which keeps the parsing rule (skip bad input,
+/// never fail) and stops a strange value being read as a flag of claude's own.
+///
+/// SEPARATE from [`push_model_flag`] on purpose: a [`ModelPick`]'s effort rides only
+/// behind the `--model` it was picked for, while a carried effort has no model of
+/// its own and goes out with none (claude restores the session's model, and
+/// `--effort` alone does not stop it; `docs/agents/CLAUDE_CLI.md`).
+pub(crate) fn push_effort_flag(argv: &mut Vec<String>, effort: Option<&str>) {
+    if let Some(level) = effort.filter(|level| EFFORT_LEVELS.contains(level)) {
+        argv.push("--effort".to_string());
+        argv.push(level.to_string());
+    }
+}
+
+/// The model and effort flags of a compose launch that may carry a session's own
+/// effort: the pick's `--model` (and its effort) when the compose picked one, else
+/// the session's `carried` effort alone ([`push_effort_flag`]).
+///
+/// A pick WINS outright: with one, `carried` is not read, so a `Ctrl-L` pick with no
+/// effort runs at the picked model's own level rather than the old session's, which
+/// belongs to a model the pick replaced. Shared by [`build_fork_run_argv`] and the
+/// two [`crate::send`] reply/fork builders, so the three can never decide it apart.
+pub(crate) fn push_model_or_carried_effort(
+    argv: &mut Vec<String>,
+    pick: Option<&ModelPick>,
+    carried: Option<&str>,
+) {
+    if model_value(pick).is_some() {
+        push_model_flag(argv, pick);
+    } else {
+        push_effort_flag(argv, carried);
+    }
+}
+
 /// Pick a model-carrying hand-off's non-zero hint: [`MODEL_NONZERO_HINT`] when this
 /// invocation actually EMITS `--model`, else the action's own `fallback`
 /// ([`NEW_SESSION_NONZERO_HINT`], [`FORK_NONZERO_HINT`]).
@@ -560,9 +616,11 @@ pub fn build_argv(session_id: &str, fork: bool) -> Vec<String> {
 /// `claude -r <id> --fork-session --name "fork: <parent_label>"`.
 ///
 /// [`build_argv`]'s fork plus the name an untouched fork box's `Ctrl-O` gives it
-/// ([`push_fork_name`] with no message), so the two routes spawn the same argv and
-/// the parent keeps heading the fork (`store::lineage::head_of`). It takes NO model,
-/// like [`build_argv`], so no pick can reach this route. Reached through
+/// ([`push_fork_name`] with no message), so the parent keeps heading the fork
+/// (`store::lineage::head_of`). The two routes spawn the same argv only while the
+/// session has no carried effort: the box's `Ctrl-O` adds `--effort`
+/// ([`build_fork_run_argv`]), this choice never does. It takes NO model or effort,
+/// like [`build_argv`], so nothing can reach this route. Reached through
 /// [`argv_for`] (`Fork`).
 #[must_use]
 pub fn build_fork_argv(session_id: &str, parent_label: &str) -> Vec<String> {
@@ -573,25 +631,28 @@ pub fn build_fork_argv(session_id: &str, parent_label: &str) -> Vec<String> {
 
 /// Build the `claude` argv for the `Ctrl-F` box's interactive run:
 /// `claude -r <id> --fork-session --name <name> [--model <alias> [--effort
-/// <level>]] [<message>]`.
+/// <level>] | --effort <level>] [<message>]`.
 ///
 /// [`build_argv`]'s fork plus what a fork compose adds: the fork's name
 /// ([`push_fork_name`] — the message's first line, or `parent_label` for an
-/// untouched box), the pick made in THAT compose ([`push_model_flag`]), both before
-/// the positional for the reason [`build_new_argv`] documents, and the typed
-/// message as claude's trailing positional. With no pick and no message it is
-/// [`build_fork_argv`]'s argv, the choice's Fork. Reached through [`argv_for`]
-/// (`ForkRun`).
+/// untouched box), the pick made in THAT compose, or with no pick the session's own
+/// `carried_effort` ([`push_model_or_carried_effort`], which checks it against
+/// [`EFFORT_LEVELS`]), both before the positional for the reason [`build_new_argv`]
+/// documents, and the typed message as claude's trailing positional. With no pick,
+/// no carried effort and no message it is [`build_fork_argv`]'s argv, the choice's
+/// Fork; with a carried effort it is that argv plus `--effort`, which the choice's
+/// Fork never carries. Reached through [`argv_for`] (`ForkRun`).
 #[must_use]
 pub fn build_fork_run_argv(
     session_id: &str,
     model: Option<&ModelPick>,
+    carried_effort: Option<&str>,
     message: Option<&str>,
     parent_label: &str,
 ) -> Vec<String> {
     let mut argv = build_argv(session_id, true);
     push_fork_name(&mut argv, message, parent_label);
-    push_model_flag(&mut argv, model);
+    push_model_or_carried_effort(&mut argv, model, carried_effort);
     if let Some(message) = message {
         argv.push(message.to_string());
     }
@@ -835,17 +896,19 @@ pub fn check(session: &Session, fork: bool) -> Result<Ready, ResumeError> {
 }
 
 /// Terminal-up gate for the `Ctrl-F` box's interactive run (`Ctrl-O`): the same
-/// authoritative re-read and `cwd` gate as [`check`], with the box's `model` and
-/// `message` threaded into a `ForkRun` argv, and the session's own label as the
+/// authoritative re-read and `cwd` gate as [`check`], with the box's `model`, the
+/// session's `carried_effort` and `message` threaded into a `ForkRun` argv, and the session's own label as the
 /// fork's name when the box is empty.
 ///
 /// A fork of a live session is expected to work, so there is no race probe. When the
 /// argv actually carries `--model` the plan blames the pick ([`MODEL_NONZERO_HINT`]),
 /// like the `Ctrl-N` draft's run; otherwise it carries the fork's own
-/// [`FORK_NONZERO_HINT`].
+/// [`FORK_NONZERO_HINT`] — a carried effort alone never changes it, since claude
+/// never fails a launch over `--effort`.
 pub fn check_fork_run(
     session: &Session,
     model: Option<&ModelPick>,
+    carried_effort: Option<&str>,
     message: Option<&str>,
 ) -> Result<Ready, ResumeError> {
     match plan(session, true) {
@@ -858,6 +921,7 @@ pub fn check_fork_run(
                     session_id: &session_id,
                     prompt: message,
                     model,
+                    carried_effort,
                     parent_label: &session.label,
                     ..Default::default()
                 },
@@ -1553,6 +1617,7 @@ mod tests {
                     agent: Some("planner"),
                     prompt: Some("ship the thing"),
                     model: None,
+                    carried_effort: None,
                     parent_label: "the parent",
                 },
             );
@@ -1622,6 +1687,7 @@ mod tests {
                     agent: Some("planner"),
                     prompt: Some("ship the thing"),
                     model: Some(&sonnet_high),
+                    carried_effort: None,
                     parent_label: "the parent",
                 },
             );
@@ -1807,6 +1873,7 @@ mod tests {
                     agent: Some("planner"),
                     prompt: Some("ship the thing"),
                     model: None,
+                    carried_effort: None,
                     parent_label: "the parent",
                 },
             );
@@ -1925,7 +1992,7 @@ mod tests {
     /// run it sits before the trailing message.
     #[test]
     fn the_fork_run_name_is_a_fork_name_ahead_of_the_message() {
-        let argv = build_fork_run_argv("abc-123", None, Some("\nReview PR1\nmore"), "parent");
+        let argv = build_fork_run_argv("abc-123", None, None, Some("\nReview PR1\nmore"), "parent");
         let at = argv
             .iter()
             .position(|a| a == "--name")
@@ -1963,12 +2030,12 @@ mod tests {
     #[test]
     fn the_fork_run_argv_is_the_named_plain_fork_until_a_pick_or_message_is_added() {
         assert_eq!(
-            build_fork_run_argv("abc-123", None, None, "the parent"),
+            build_fork_run_argv("abc-123", None, None, None, "the parent"),
             named_plain_fork("abc-123", "the parent")
         );
         let blank = ModelPick::new("  ");
         assert_eq!(
-            build_fork_run_argv("abc-123", Some(&blank), None, "the parent"),
+            build_fork_run_argv("abc-123", Some(&blank), None, None, "the parent"),
             named_plain_fork("abc-123", "the parent"),
             "a blank pick emits nothing"
         );
@@ -1977,7 +2044,7 @@ mod tests {
             effort: Some("low"),
         };
         assert_eq!(
-            build_fork_run_argv("abc-123", Some(&pick), Some("go"), "the parent"),
+            build_fork_run_argv("abc-123", Some(&pick), None, Some("go"), "the parent"),
             [
                 "claude",
                 "-r",
@@ -1993,11 +2060,145 @@ mod tests {
             ]
         );
         assert_eq!(
-            build_fork_run_argv("abc-123", None, Some("go"), "the parent")
+            build_fork_run_argv("abc-123", None, None, Some("go"), "the parent")
                 .last()
                 .map(String::as_str),
             Some("go")
         );
+    }
+
+    /// The checked effort flag sends exactly the [`EFFORT_LEVELS`] and nothing
+    /// else: an unknown level, a blank, another case, padding, or a value shaped like
+    /// a claude flag all send NO flag — the value is read from a file claude wrote.
+    #[test]
+    fn push_effort_flag_sends_only_a_known_level() {
+        for level in EFFORT_LEVELS {
+            let mut argv = vec!["claude".to_string()];
+            push_effort_flag(&mut argv, Some(level));
+            assert_eq!(argv, ["claude", "--effort", level]);
+        }
+        for strange in [
+            "",
+            " ",
+            "ultra",
+            "XHIGH",
+            " high",
+            "high ",
+            "--model",
+            "--dangerously-skip-permissions",
+            "high --model opus",
+            "-h",
+        ] {
+            let mut argv = vec!["claude".to_string()];
+            push_effort_flag(&mut argv, Some(strange));
+            assert_eq!(argv, ["claude"], "{strange:?} must send no flag");
+        }
+        let mut argv = vec!["claude".to_string()];
+        push_effort_flag(&mut argv, None);
+        assert_eq!(argv, ["claude"]);
+    }
+
+    /// The fork box's `Ctrl-O` carries the session's effort when no model is picked
+    /// — after the name, before the message — and a pick wins outright: a pick with
+    /// no effort carries NONE, rather than the old session's level for a model the
+    /// pick replaced. A strange carried level sends no flag.
+    #[test]
+    fn the_fork_run_argv_carries_the_session_effort_only_without_a_pick() {
+        assert_eq!(
+            build_fork_run_argv("abc-123", None, Some("xhigh"), Some("go"), "the parent"),
+            [
+                "claude",
+                "-r",
+                "abc-123",
+                "--fork-session",
+                "--name",
+                "fork: go",
+                "--effort",
+                "xhigh",
+                "go"
+            ]
+        );
+        assert_eq!(
+            build_fork_run_argv("abc-123", None, Some("max"), None, "the parent"),
+            [
+                "claude",
+                "-r",
+                "abc-123",
+                "--fork-session",
+                "--name",
+                "fork: the parent",
+                "--effort",
+                "max"
+            ],
+            "an empty box still carries it"
+        );
+        let pick = ModelPick::new("sonnet");
+        assert_eq!(
+            build_fork_run_argv("abc-123", Some(&pick), Some("xhigh"), Some("go"), "p").join(" "),
+            "claude -r abc-123 --fork-session --name fork: go --model sonnet go",
+            "a pick wins over the carried level"
+        );
+        let picked_effort = ModelPick {
+            model: "sonnet".to_string(),
+            effort: Some("low"),
+        };
+        assert_eq!(
+            build_fork_run_argv("abc-123", Some(&picked_effort), Some("xhigh"), None, "p")
+                .join(" "),
+            "claude -r abc-123 --fork-session --name fork: p --model sonnet --effort low"
+        );
+        assert_eq!(
+            build_fork_run_argv("abc-123", None, Some("--model"), Some("go"), "p"),
+            build_fork_run_argv("abc-123", None, None, Some("go"), "p"),
+            "a strange level sends no flag"
+        );
+    }
+
+    /// Which actions the carried effort reaches, by construction: `ForkRun` alone.
+    /// `Resume`, `Attach` and the choice's `Fork` have builders that take none, and a
+    /// `New` session has no last turn to repeat.
+    #[test]
+    fn the_carried_effort_reaches_only_the_fork_run_action() {
+        let ctx = HandoffCtx {
+            session_id: "abc-123",
+            job_id: "ca56b543",
+            carried_effort: Some("high"),
+            parent_label: "the parent",
+            ..Default::default()
+        };
+        let carries = |action| {
+            argv_for(action, &ctx)
+                .iter()
+                .any(|arg| arg == "--effort" || arg == "high")
+        };
+        assert!(carries(SessionAction::ForkRun));
+        for action in [
+            SessionAction::Resume,
+            SessionAction::Fork,
+            SessionAction::Attach,
+            SessionAction::New,
+        ] {
+            assert!(
+                !carries(action),
+                "{action:?} must not carry a session effort"
+            );
+        }
+    }
+
+    /// The gate threads the carried effort into the `Ctrl-O` fork argv without
+    /// touching the hint: claude never fails a launch over `--effort`, so an
+    /// effort-only argv still blames the fork, not a pick.
+    #[test]
+    fn check_fork_run_carries_the_session_effort_and_keeps_the_fork_hint() {
+        let (mut session, dir) = resumable_session("fork-run-effort", "sess-fork-effort");
+        session.label = "the parent".to_string();
+        let ready = check_fork_run(&session, None, Some("xhigh"), Some("go")).expect("proceeds");
+        assert_eq!(
+            ready.argv.join(" "),
+            "claude -r sess-fork-effort --fork-session --name fork: go --effort xhigh go"
+        );
+        assert_eq!(ready.nonzero_hint, FORK_NONZERO_HINT);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Through the gate: it re-reads the authoritative id, names an untouched box's
@@ -2008,12 +2209,12 @@ mod tests {
     fn check_fork_run_reads_the_file_and_picks_the_hint_from_the_emitted_model() {
         let (mut session, dir) = resumable_session("fork-run", "sess-fork-run");
         session.label = "the parent".to_string();
-        let plain = check_fork_run(&session, None, None).expect("an existing cwd proceeds");
+        let plain = check_fork_run(&session, None, None, None).expect("an existing cwd proceeds");
         assert_eq!(plain.argv, named_plain_fork("sess-fork-run", "the parent"));
         assert_eq!(plain.nonzero_hint, FORK_NONZERO_HINT);
         assert!(plain.race_probe_id.is_none());
         let opus = ModelPick::new("opus");
-        let picked = check_fork_run(&session, Some(&opus), Some("go")).expect("proceeds");
+        let picked = check_fork_run(&session, Some(&opus), None, Some("go")).expect("proceeds");
         assert_eq!(
             picked.argv.join(" "),
             "claude -r sess-fork-run --fork-session --name fork: go --model opus go"
@@ -2021,7 +2222,7 @@ mod tests {
         assert_eq!(picked.nonzero_hint, MODEL_NONZERO_HINT);
         let blank = ModelPick::new(" ");
         assert_eq!(
-            check_fork_run(&session, Some(&blank), None)
+            check_fork_run(&session, Some(&blank), None, None)
                 .expect("proceeds")
                 .nonzero_hint,
             FORK_NONZERO_HINT
@@ -2031,13 +2232,13 @@ mod tests {
         let mut gone = session;
         gone.file = std::env::temp_dir().join("snapback-fork-run-missing.jsonl");
         assert!(matches!(
-            check_fork_run(&gone, None, None),
+            check_fork_run(&gone, None, None, None),
             Err(ResumeError::Refused(_))
         ));
     }
 
     /// The Attach/Fork/Cancel choice's Fork is byte-identical to the fork box's
-    /// untouched `Ctrl-O` run (no pick, no message): both name the fork after the
+    /// untouched `Ctrl-O` run (no pick, no carried effort, no message): both name the fork after the
     /// parent's label, so the parent keeps heading it. The labels include one the
     /// rule must CLEAN (control characters, outer whitespace) and one it must CAP
     /// (past `FORK_NAME_MAX_CHARS`), so a second naming rule on either route would
@@ -2056,7 +2257,7 @@ mod tests {
             assert_eq!(fork, argv_for(SessionAction::ForkRun, &ctx), "{label:?}");
             assert_eq!(
                 fork,
-                build_fork_run_argv("abc-123", None, None, label),
+                build_fork_run_argv("abc-123", None, None, None, label),
                 "{label:?}"
             );
             assert!(
@@ -2103,7 +2304,7 @@ mod tests {
         session.label = format!("\u{1b}{}", "日".repeat(FORK_NAME_MAX_CHARS + 3));
 
         let chosen = check(&session, true).expect("an existing cwd proceeds");
-        let boxed = check_fork_run(&session, None, None).expect("an existing cwd proceeds");
+        let boxed = check_fork_run(&session, None, None, None).expect("an existing cwd proceeds");
         assert_eq!(chosen.argv, boxed.argv);
         assert_eq!(chosen.cwd, boxed.cwd);
         assert_eq!(
@@ -2151,7 +2352,7 @@ mod tests {
         );
         assert_eq!(
             picked,
-            build_fork_run_argv("abc-123", None, None, "the parent")
+            build_fork_run_argv("abc-123", None, None, None, "the parent")
         );
     }
 

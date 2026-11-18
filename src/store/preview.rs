@@ -395,6 +395,16 @@ pub struct RenderedPreview {
     /// the newest one. Always `None` in a subagent's render ([`render_subagent`]):
     /// claude restores the session's model, never a subagent's.
     pub last_model: Option<String>,
+    /// The effort level ([`record_effort`], as WRITTEN, trimmed) of the SAME record
+    /// [`last_model`](Self::last_model) was taken from — the level that turn ran at —
+    /// or `None` when that record names none.
+    ///
+    /// Set together with `last_model`, never on its own: a newer answering turn
+    /// with no effort CLEARS an older turn's, so what the session last ran at is
+    /// never read off an earlier turn. UNCHECKED: it is a string a file claude
+    /// wrote, so whoever sends it as `--effort` checks it first
+    /// ([`crate::resume::push_effort_flag`]). Always `None` where `last_model` is.
+    pub last_effort: Option<String>,
     /// Whether, and how, the subagent's own run ENDED, judged over every record
     /// this render streamed by the subagent record's own fold
     /// ([`subagents::RunProgress`]), so the subagent view's title can tell a
@@ -666,6 +676,7 @@ fn render_stream(reader: impl BufRead, stream: &StreamContext) -> RenderedPrevie
     // The newest model claude would restore on `-r`, overwritten record by record
     // as the file streams past, so the last one standing is the answer.
     let mut last_model: Option<String> = None;
+    let mut last_effort: Option<String> = None;
     let mut run = (!session_own).then(RunProgress::default);
     // Day of the previously ANNOTATED turn, threaded through the loop so a
     // per-message timestamp can switch to `MM-DD HH:MM` on a day rollover.
@@ -692,8 +703,9 @@ fn render_stream(reader: impl BufRead, stream: &StreamContext) -> RenderedPrevie
             continue;
         }
         if session_own {
-            if let Some(label) = restorable_model(&record) {
+            if let Some((label, effort)) = restorable_turn(&record) {
                 last_model = Some(label);
+                last_effort = effort;
             }
         }
         run = run.map(|run| run.after(&record));
@@ -722,6 +734,7 @@ fn render_stream(reader: impl BufRead, stream: &StreamContext) -> RenderedPrevie
         unindexed,
         markers,
         last_model,
+        last_effort,
         run_ended: run.map(RunProgress::ended),
     }
 }
@@ -1240,6 +1253,17 @@ fn restorable_model(record: &Value) -> Option<String> {
         return None;
     }
     model_label(record_model(record))
+}
+
+/// The model [`restorable_model`] names and the effort ([`record_effort`]) the SAME
+/// record ran it at, or `None` when the record restores no model.
+///
+/// ONE record answers both, so a compose box can name the level the session's last
+/// turn ran at beside its model, and no earlier turn's effort can survive a later
+/// turn that recorded none. The effort is not checked here; see
+/// [`RenderedPreview::last_effort`]. PURE — see the unit test.
+fn restorable_turn(record: &Value) -> Option<(String, Option<String>)> {
+    restorable_model(record).map(|label| (label, record_effort(record)))
 }
 
 /// The EFFORT level a record's turn ran at (`xhigh`, `max`, …), or `None` when it
@@ -8158,6 +8182,76 @@ mod tests {
             "misread restorable models:\n{}",
             wrong.join("\n")
         );
+    }
+
+    /// The render pass answers "what effort did the session last run at?" from the
+    /// SAME record as `last_model`: the effort of the newest answering turn, and a
+    /// newer turn that recorded none CLEARS an older one's rather than letting it
+    /// stand. The cleared fixture's first turn is `xhigh` and its last records
+    /// nothing, so an answer that kept "the last effort seen" comes back `xhigh`.
+    #[test]
+    fn the_last_effort_is_the_newest_answering_turns_and_a_later_turn_without_one_clears_it() {
+        let last = |file: &str| {
+            let rendered = render_file_expanded(&preview_fixture(file), WIDE, &[]);
+            (rendered.last_model, rendered.last_effort)
+        };
+        assert_eq!(
+            last("sess-effort-present-1.jsonl"),
+            (Some("Opus 5.5".to_string()), Some("xhigh".to_string())),
+        );
+        assert_eq!(
+            last("sess-effort-cleared-1.jsonl"),
+            (Some("Opus 5.5".to_string()), None),
+            "the last turn recorded no effort: the earlier xhigh is not carried"
+        );
+        assert_eq!(
+            last("sess-effort-synthetic-1.jsonl"),
+            (Some("Opus 5.5".to_string()), Some("xhigh".to_string())),
+            "a <synthetic> tail restores no model, so its record clears nothing"
+        );
+        assert_eq!(
+            last("sess-effort-absent-haiku-1.jsonl").1,
+            None,
+            "a model with no recorded effort carries none"
+        );
+        assert_eq!(
+            last("sess-model-absent-1.jsonl"),
+            (None, None),
+            "no answering model, no effort"
+        );
+    }
+
+    /// [`restorable_turn`] reads the effort off the record the model came from, with
+    /// [`record_effort`]'s own precedence, and only for a record that restores a model.
+    #[test]
+    fn restorable_turn_pairs_the_model_with_the_same_records_effort() {
+        let cases = [
+            (
+                serde_json::json!({"type": "assistant", "message": {"model": "claude-opus-5-5"}, "perTurnEffort": "high", "effort": "max"}),
+                Some(("Opus 5.5", Some("high"))),
+            ),
+            (
+                serde_json::json!({"type": "assistant", "message": {"model": "claude-opus-5-5"}, "perTurnEffort": null, "effort": "max"}),
+                Some(("Opus 5.5", Some("max"))),
+            ),
+            (
+                serde_json::json!({"type": "assistant", "message": {"model": "claude-opus-5-5"}}),
+                Some(("Opus 5.5", None)),
+            ),
+            (
+                serde_json::json!({"type": "assistant", "isMeta": true, "message": {"model": "claude-opus-5-5"}, "effort": "max"}),
+                None,
+            ),
+            (
+                serde_json::json!({"type": "user", "message": {"model": "claude-opus-5-5"}, "effort": "max"}),
+                None,
+            ),
+        ];
+        for (record, want) in cases {
+            let got = restorable_turn(&record);
+            let want = want.map(|(label, effort)| (label.to_string(), effort.map(str::to_string)));
+            assert_eq!(got, want, "{record}");
+        }
     }
 
     #[test]

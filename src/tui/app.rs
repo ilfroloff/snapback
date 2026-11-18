@@ -1072,6 +1072,14 @@ fn move_choice_label(target: &Path, main: Option<&Path>, project_label: &str) ->
 /// the picker does not have.
 pub const MODEL_PICKER_FOOTER: &str = "↑/↓ choose · ←/→ effort · Enter set · Esc cancel";
 
+/// What joins a model and its effort — `opus · high` — in a compose's `model:`
+/// label (a pick's and a session's carried effort alike) and on a model-picker row.
+/// The middot with ONE space either side is the preview's turn marker separator (`● claude · Opus 5.5 · xhigh`), so a picked
+/// effort reads exactly like the effort a turn records; it is deliberately tighter
+/// than [`HEADER_SEPARATOR`], which parts whole header SEGMENTS rather than the two
+/// halves of one value.
+pub const MODEL_EFFORT_SEPARATOR: &str = " · ";
+
 /// The scope a DRAFT's settings-default model carries on its compose label:
 /// `model: default (opus[1m]) (new sessions only)`. It is its own parenthesized
 /// part, drawn AFTER the value's rather than folded into it, and it only ever
@@ -1093,9 +1101,22 @@ pub const MODEL_NEW_SESSION_SCOPE: &str = "(new sessions only)";
 /// the three reasons a reply says `default` are three different facts to explain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComposeDefault {
-    /// A REPLY that claude restores the session's own model for: carries that
-    /// model's label (`Opus 5.5`), as the preview's turn markers spell it.
-    SessionModel(String),
+    /// A REPLY or FORK that claude restores the session's own model for: carries
+    /// that model's label (`Opus 5.5`), as the preview's turn markers spell it, and
+    /// the effort its last turn ran at when that is a known level.
+    ///
+    /// The ONLY case that carries an effort: the reply, the fork box's `Enter` and
+    /// its `Ctrl-O` send it as `--effort` when the box has no pick
+    /// ([`ComposeDefault::carried_effort`]), so the label names exactly what the
+    /// launch sends. `effort` is already checked against [`EFFORT_LEVELS`]
+    /// ([`resolve_compose_default`]), which is why it is one of their `'static`
+    /// entries.
+    SessionModel {
+        /// The model's label.
+        label: String,
+        /// The level the session's last turn ran at, if a known one.
+        effort: Option<&'static str>,
+    },
     /// A REPLY where an environment override (`ANTHROPIC_MODEL` or an
     /// `ANTHROPIC_DEFAULT_*_MODEL`) makes claude skip the restore and use its
     /// startup model.
@@ -1117,7 +1138,10 @@ impl ComposeDefault {
     #[must_use]
     pub fn picker_label(&self) -> String {
         match self {
-            Self::SessionModel(label) => format!("{MODEL_SESSION_ROW_LABEL} ({label})"),
+            Self::SessionModel { label, effort } => format!(
+                "{MODEL_SESSION_ROW_LABEL} ({})",
+                session_model_text(label, *effort)
+            ),
             Self::Settings(value) => {
                 format!("{MODEL_DEFAULT_LABEL} ({value}) {MODEL_SETTINGS_TAG}")
             }
@@ -1127,16 +1151,33 @@ impl ComposeDefault {
         }
     }
 
+    /// The effort a launch from this compose sends when no model is picked in it,
+    /// or `None`: only [`ComposeDefault::SessionModel`] has one. The ONE place that
+    /// decides "carried", so the label, the picker row and the argv agree. Pure.
+    #[must_use]
+    pub fn carried_effort(&self) -> Option<&'static str> {
+        match self {
+            Self::SessionModel { effort, .. } => *effort,
+            _ => None,
+        }
+    }
+
     /// The picker's first-row DESCRIPTION: what sending no `--model` means for
     /// this compose, and — for the three `default` cases — why. Drawn WHOLE,
     /// wrapped under the label ([`ModalChoice::wrap_description`]), so it may be
-    /// honest rather than short. A reply's names the effort caveat too: claude
-    /// restores a session's model but not its effort. Pure.
+    /// honest rather than short. A session-model row's names the effort too: claude
+    /// restores a session's model but not its effort, so it says whether snapback
+    /// sends the last turn's (`--effort`) or the settings' applies. Pure.
     #[must_use]
     pub fn picker_description(&self) -> &'static str {
-        /// A reply claude restores: the session's model, not its effort.
+        /// A reply claude restores: the session's model, and its effort only when the
+        /// transcript records a known one.
         const SESSION_MODEL: &str = "no --model · claude restores the model this session \
              last answered with; the effort comes from your settings";
+        /// The same, with the effort the session's last turn ran at sent as
+        /// `--effort`.
+        const SESSION_MODEL_EFFORT: &str = "no --model · claude restores the model this \
+             session last answered with, and --effort repeats the level its last turn ran at";
         /// A reply an environment override takes the restore away from.
         const RESTORE_OVERRIDDEN: &str = "no --model · ANTHROPIC_MODEL or an \
              ANTHROPIC_DEFAULT_*_MODEL is set, so claude uses its startup model, not \
@@ -1151,7 +1192,8 @@ impl ComposeDefault {
         const BUILT_IN: &str = "no --model · your claude settings name no model, so \
              claude uses its own default";
         match self {
-            Self::SessionModel(_) => SESSION_MODEL,
+            Self::SessionModel { effort: None, .. } => SESSION_MODEL,
+            Self::SessionModel { .. } => SESSION_MODEL_EFFORT,
             Self::RestoreOverridden => RESTORE_OVERRIDDEN,
             Self::NoSessionModel => NO_SESSION_MODEL,
             Self::Settings(_) => SETTINGS,
@@ -1160,14 +1202,31 @@ impl ComposeDefault {
     }
 }
 
+/// The `model: session (…)` text for a session's model `label` and carried `effort`:
+/// `Opus 5.5 · xhigh`, or just `Opus 5.5` with none. The ONE spelling, shared by the
+/// compose's `model:` label (`view`) and the picker's first row
+/// ([`ComposeDefault::picker_label`]), and joined as the turn markers join their
+/// annotations (` · `). Pure.
+#[must_use]
+pub fn session_model_text(label: &str, effort: Option<&str>) -> String {
+    match effort {
+        Some(level) => format!("{label}{MODEL_EFFORT_SEPARATOR}{level}"),
+        None => label.to_string(),
+    }
+}
+
 /// What a compose runs on when no model is picked in it: the PURE decision over
-/// the four facts it depends on, each already in hand.
+/// the five facts it depends on, each already in hand.
 ///
 /// * `target` — a quick reply restores; a `Ctrl-N` draft starts fresh.
 /// * `session_model` — for a reply, the label of the model its session last
 ///   answered with, read off the preview the board already parsed
 ///   (`store::preview`'s `last_model`), or `None` when the transcript records no
 ///   answering model. Ignored for a draft.
+/// * `session_effort` — the effort that same record ran at (`last_effort`), as the
+///   transcript wrote it. Carried ONLY when it is one of [`EFFORT_LEVELS`]: anything
+///   else is dropped here, so the label never names a level the launch would not
+///   send. Ignored with no `session_model`, for an override and for a draft.
 /// * `restore_overridden` — whether an environment override makes claude skip the
 ///   restore (`claude_settings::resolve_restore_overridden`). Ignored for a draft.
 /// * `settings_model` — the model the user's `claude` settings name for a new
@@ -1195,6 +1254,7 @@ impl ComposeDefault {
 pub fn resolve_compose_default(
     target: &super::compose::ComposeTarget,
     session_model: Option<&str>,
+    session_effort: Option<&str>,
     restore_overridden: bool,
     settings_model: Option<&str>,
 ) -> ComposeDefault {
@@ -1203,10 +1263,16 @@ pub fn resolve_compose_default(
         ComposeTarget::Reply { .. } | ComposeTarget::Fork { .. } if restore_overridden => {
             ComposeDefault::RestoreOverridden
         }
-        ComposeTarget::Reply { .. } | ComposeTarget::Fork { .. } => session_model
-            .map_or(ComposeDefault::NoSessionModel, |label| {
-                ComposeDefault::SessionModel(label.to_string())
-            }),
+        ComposeTarget::Reply { .. } | ComposeTarget::Fork { .. } => {
+            session_model.map_or(ComposeDefault::NoSessionModel, |label| {
+                ComposeDefault::SessionModel {
+                    label: label.to_string(),
+                    effort: session_effort
+                        .and_then(|level| EFFORT_LEVELS.iter().find(|known| **known == level))
+                        .copied(),
+                }
+            })
+        }
         ComposeTarget::NewBackgroundAgent { .. } => settings_model
             .map_or(ComposeDefault::BuiltIn, |value| {
                 ComposeDefault::Settings(value.to_string())
@@ -5351,16 +5417,18 @@ impl App {
     #[must_use]
     pub fn compose_default(&self) -> Option<ComposeDefault> {
         let compose = self.compose.as_ref()?;
-        let session_model = match &compose.target {
+        let (session_model, session_effort) = match &compose.target {
             super::compose::ComposeTarget::Reply { session_id, .. }
-            | super::compose::ComposeTarget::Fork { session_id } => {
-                self.session_model_label(session_id)
-            }
-            super::compose::ComposeTarget::NewBackgroundAgent { .. } => None,
+            | super::compose::ComposeTarget::Fork { session_id } => (
+                self.session_model_label(session_id),
+                self.session_effort_label(session_id),
+            ),
+            super::compose::ComposeTarget::NewBackgroundAgent { .. } => (None, None),
         };
         Some(resolve_compose_default(
             &compose.target,
             session_model,
+            session_effort,
             self.restore_overridden,
             self.settings_model.as_deref(),
         ))
@@ -5384,6 +5452,20 @@ impl App {
         self.preview_cache
             .get(session_id)
             .and_then(|entry| entry.rendered.last_model.as_deref())
+    }
+
+    /// The effort `session_id`'s last answering turn ran at, as the preview parsed it
+    /// (`preview::RenderedPreview::last_effort`) — UNCHECKED, so
+    /// [`resolve_compose_default`] screens it before anything sends it. Read off the
+    /// same width-scoped cache, for the same reasons, as
+    /// [`session_model_label`](Self::session_model_label): it comes from the
+    /// transcript on every load and is stored nowhere (no field here, nothing in
+    /// `sessions.json`).
+    #[must_use]
+    fn session_effort_label(&self, session_id: &str) -> Option<&str> {
+        self.preview_cache
+            .get(session_id)
+            .and_then(|entry| entry.rendered.last_effort.as_deref())
     }
 
     /// Adopt the `--model` alias set read off the installed `claude` binary.
@@ -14774,40 +14856,153 @@ mod tests {
 
         // A reply: the session's own model, which claude restores...
         assert_eq!(
-            resolve_compose_default(&reply, Some("Opus 5.5"), false, Some("opus[1m]")),
-            ComposeDefault::SessionModel("Opus 5.5".to_string()),
+            resolve_compose_default(&reply, Some("Opus 5.5"), None, false, Some("opus[1m]")),
+            ComposeDefault::SessionModel {
+                label: "Opus 5.5".to_string(),
+                effort: None,
+            },
             "a reply restores the session's model; the settings model is not its answer"
         );
         // ...unless an environment override means claude will not restore it...
         assert_eq!(
-            resolve_compose_default(&reply, Some("Opus 5.5"), true, Some("opus[1m]")),
+            resolve_compose_default(&reply, Some("Opus 5.5"), None, true, Some("opus[1m]")),
             ComposeDefault::RestoreOverridden,
             "an ANTHROPIC_MODEL / ANTHROPIC_DEFAULT_*_MODEL override outranks the \
              transcript"
         );
         // ...or the transcript records no answering model to restore.
         assert_eq!(
-            resolve_compose_default(&reply, None, false, Some("opus[1m]")),
+            resolve_compose_default(&reply, None, None, false, Some("opus[1m]")),
             ComposeDefault::NoSessionModel,
             "no answering model on record: nothing for claude to restore"
         );
         assert_eq!(
-            resolve_compose_default(&reply, None, true, None),
+            resolve_compose_default(&reply, None, None, true, None),
             ComposeDefault::RestoreOverridden,
             "the override is the stated reason whenever it is in effect"
         );
 
         // A draft: the settings' model for a new session, or none.
         assert_eq!(
-            resolve_compose_default(&draft, Some("Opus 5.5"), true, Some("opus[1m]")),
+            resolve_compose_default(&draft, Some("Opus 5.5"), None, true, Some("opus[1m]")),
             ComposeDefault::Settings("opus[1m]".to_string()),
             "a draft starts fresh: the session model and the restore play no part"
         );
         assert_eq!(
-            resolve_compose_default(&draft, None, false, None),
+            resolve_compose_default(&draft, None, None, false, None),
             ComposeDefault::BuiltIn,
             "no settings value: claude's own default"
         );
+    }
+
+    /// A reply's or fork's default carries the session's effort ONLY when it is one
+    /// of [`EFFORT_LEVELS`]: a strange, blank or differently-cased level is dropped
+    /// here, so the label never names what the launch would not send. An override, a
+    /// session with no model and a draft carry none whatever the transcript says.
+    #[test]
+    fn the_compose_default_carries_only_a_known_session_effort() {
+        use super::super::compose::ComposeTarget;
+        let reply = ComposeTarget::Reply {
+            session_id: "s".to_string(),
+            stop_job: None,
+        };
+        let fork = ComposeTarget::Fork {
+            session_id: "s".to_string(),
+        };
+        let draft = ComposeTarget::NewBackgroundAgent { agent: None };
+        for target in [&reply, &fork] {
+            for level in EFFORT_LEVELS {
+                let default =
+                    resolve_compose_default(target, Some("Opus 5.5"), Some(level), false, None);
+                assert_eq!(default.carried_effort(), Some(level), "{target:?}");
+            }
+            for strange in ["", "ultra", "XHIGH", " high", "--model"] {
+                let default =
+                    resolve_compose_default(target, Some("Opus 5.5"), Some(strange), false, None);
+                assert_eq!(default.carried_effort(), None, "{strange:?}");
+                assert_eq!(
+                    default,
+                    ComposeDefault::SessionModel {
+                        label: "Opus 5.5".to_string(),
+                        effort: None,
+                    },
+                    "a strange level leaves the model and drops only the effort"
+                );
+            }
+            assert_eq!(
+                resolve_compose_default(target, Some("Opus 5.5"), Some("high"), true, None)
+                    .carried_effort(),
+                None,
+                "an environment override restores no model, and carries no effort"
+            );
+            assert_eq!(
+                resolve_compose_default(target, None, Some("high"), false, None).carried_effort(),
+                None,
+                "no answering model on record: nothing carried"
+            );
+        }
+        assert_eq!(
+            resolve_compose_default(&draft, Some("Opus 5.5"), Some("high"), false, Some("opus"))
+                .carried_effort(),
+            None,
+            "a new session has no last turn to repeat"
+        );
+    }
+
+    /// The label wording on the picker's first row, and the description that says
+    /// what is sent: `session's model (Opus 5.5 · xhigh)` with `--effort`, plain
+    /// `session's model (Opus 5.5)` without.
+    #[test]
+    fn the_session_row_names_the_carried_effort_beside_the_model() {
+        let with = ComposeDefault::SessionModel {
+            label: "Opus 5.5".to_string(),
+            effort: Some("xhigh"),
+        };
+        assert_eq!(
+            with.picker_label(),
+            "session's model (Opus 5.5 \u{b7} xhigh)"
+        );
+        assert!(with.picker_description().contains("--effort"));
+        let without = ComposeDefault::SessionModel {
+            label: "Opus 5.5".to_string(),
+            effort: None,
+        };
+        assert_eq!(without.picker_label(), "session's model (Opus 5.5)");
+        assert!(!without.picker_description().contains("--effort"));
+        assert!(without.picker_description().contains("settings"));
+        assert_eq!(
+            session_model_text("Opus 5.5", Some("max")),
+            "Opus 5.5 \u{b7} max"
+        );
+        assert_eq!(session_model_text("Opus 5.5", None), "Opus 5.5");
+    }
+
+    /// Through `App`: the effort the label names comes off the cached preview, so a
+    /// transcript whose last turn ran at `xhigh` reads `Opus 5.5 · xhigh`, one whose
+    /// last turn recorded none reads plain `Opus 5.5` (the earlier `xhigh` is not
+    /// carried), and before any render there is nothing on record.
+    #[test]
+    fn the_pickers_first_row_names_the_effort_off_the_cached_preview() {
+        for (file, want) in [
+            ("sess-effort-present-1.jsonl", Some("xhigh")),
+            ("sess-effort-cleared-1.jsonl", None),
+        ] {
+            let mut app = app_all(vec![preview_fixture_session("sbp-effort", file)]);
+            open_reply(&mut app, "sbp-effort");
+            assert_eq!(
+                app.compose_default(),
+                Some(ComposeDefault::NoSessionModel),
+                "{file}: nothing on record before the preview renders"
+            );
+            let _ = app.preview_text(80);
+            let default = app.compose_default().expect("a compose is open");
+            assert_eq!(default.carried_effort(), want, "{file}");
+            let wanted_label = match want {
+                Some(level) => format!("session's model (Opus 5.5 \u{b7} {level})"),
+                None => "session's model (Opus 5.5)".to_string(),
+            };
+            assert_eq!(default.picker_label(), wanted_label, "{file}");
+        }
     }
 
     /// The default row's LABEL per case, stated directly: it names the model a
@@ -14815,7 +15010,11 @@ mod tests {
     #[test]
     fn the_default_rows_label_names_the_model_or_says_default() {
         assert_eq!(
-            ComposeDefault::SessionModel("Opus 5.5".to_string()).picker_label(),
+            ComposeDefault::SessionModel {
+                label: "Opus 5.5".to_string(),
+                effort: None,
+            }
+            .picker_label(),
             "session's model (Opus 5.5)"
         );
         assert_eq!(
@@ -14832,7 +15031,10 @@ mod tests {
         // Every description says no flag is sent, and the reply's names the effort
         // caveat: claude restores a session's model, never its effort.
         for default in [
-            ComposeDefault::SessionModel("Opus 5.5".to_string()),
+            ComposeDefault::SessionModel {
+                label: "Opus 5.5".to_string(),
+                effort: None,
+            },
             ComposeDefault::RestoreOverridden,
             ComposeDefault::NoSessionModel,
             ComposeDefault::Settings("opus[1m]".to_string()),
@@ -14844,9 +15046,12 @@ mod tests {
                 default.picker_description()
             );
         }
-        assert!(ComposeDefault::SessionModel(String::new())
-            .picker_description()
-            .contains("effort"));
+        assert!(ComposeDefault::SessionModel {
+            label: String::new(),
+            effort: None,
+        }
+        .picker_description()
+        .contains("effort"));
     }
 
     /// The picker's first row, through `App`, for each state the board can be in —

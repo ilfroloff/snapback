@@ -46,6 +46,11 @@ probed at 2.1.291 (2026-10-08) in a throwaway profile, and claude's own
 [`/cd`](#cd-moving-a-session-to-another-folder), observed at 2.1.284 (2026-10-02):
 neither is captured from `--help`, and the refresh below re-probes `set_cwd`
 alone, because the move depends on it.
+The [carried effort](#a-carried-effort-probed-at-claude-21322-2026-11-17) is
+pinned separately as well: probed at 2.1.322 (2026-11-17) for the reply and the
+headless fork, and at 2.1.326 (2026-11-17) for the interactive `Ctrl-O` fork. Those
+are behaviour probes, not `--help` captures, and the refresh below does not
+re-verify them.
 The two `Ctrl-F` fork rows in [How snapback drives `claude`](#how-snapback-drives-claude)
 carry their own check against 2.1.291 (its `--help`, and probes of both forms),
 stated in each row.
@@ -90,13 +95,13 @@ inline test asserting the exact string, so drift here is caught by
 | --- | --- | --- |
 | Resume a session in place | `claude -r <session-id>` | `resume::build_argv` (`src/resume.rs`) |
 | Fork a session (new id) from the Attach/Fork/Cancel choice | `claude -r <session-id> --fork-session --name "fork: <the session's label>"` (`resume::fork_name`), never a model | `resume::build_fork_argv` (over `resume::build_argv`) |
-| Fork interactively from the `Ctrl-F` box (`Ctrl-O`) | `claude -r <session-id> --fork-session --name <name> [--model <alias> [--effort <level>]] [<message>]`, `<name>` being `fork: <first line of the message>` or, for an empty box, `fork: <the session's label>` (`resume::fork_name`). An empty box with no pick is byte-identical to the row above. Checked against claude 2.1.291: `--fork-session`, `-n, --name <name>` ("Set a display name for this session (shown in the prompt box, /resume picker, and terminal title)") and `--model`/`--effort` are in `claude --help` there. Probed 2026-10-08 at 2.1.291 under a pseudo-terminal (`expect`, 120×40, throwaway sessions since removed) with `claude -r A --fork-session --session-id F --name "fork: probe-msg" --model haiku "Reply with exactly: fork-ok"`, `--session-id` added only to know F's file: with NO keypress, the message became F's first new user turn after the copied history and was answered, so the trailing `<message>` AUTO-SUBMITS on `-r --fork-session` as on a new session. `--name` wrote `{"type":"custom-title","customTitle":"fork: probe-msg","sessionId":"<F>"}` and `{"type":"agent-name","agentName":"fork: probe-msg","sessionId":"<F>"}` into F ONLY, each twice (first in the file, then again after the message), and titled the prompt box and the exit hint (`claude --resume "fork: probe-msg"`); A stayed byte-identical. In a folder claude does not trust yet, the workspace-trust dialog comes first (its cursor starts on "No, exit") and the message is sent once the folder is trusted. A child that inherits another claude session's `CLAUDE_CODE_CHILD_SESSION` prints "Transcript saving is off" and writes no F, so the probe dropped those markers, as a plain terminal has none | `resume::build_fork_run_argv` via `check_fork_run` |
+| Fork interactively from the `Ctrl-F` box (`Ctrl-O`) | `claude -r <session-id> --fork-session --name <name> [--model <alias> [--effort <level>] \| --effort <level>] [<message>]`, `<name>` being `fork: <first line of the message>` or, for an empty box, `fork: <the session's label>` (`resume::fork_name`). An empty box with no pick and no [carried effort](#effort-levels---effort) is byte-identical to the row above; with one it adds `--effort <level>` after the name. Checked against claude 2.1.291: `--fork-session`, `-n, --name <name>` ("Set a display name for this session (shown in the prompt box, /resume picker, and terminal title)") and `--model`/`--effort` are in `claude --help` there. Probed 2026-10-08 at 2.1.291 under a pseudo-terminal (`expect`, 120×40, throwaway sessions since removed) with `claude -r A --fork-session --session-id F --name "fork: probe-msg" --model haiku "Reply with exactly: fork-ok"`, `--session-id` added only to know F's file: with NO keypress, the message became F's first new user turn after the copied history and was answered, so the trailing `<message>` AUTO-SUBMITS on `-r --fork-session` as on a new session. `--name` wrote `{"type":"custom-title","customTitle":"fork: probe-msg","sessionId":"<F>"}` and `{"type":"agent-name","agentName":"fork: probe-msg","sessionId":"<F>"}` into F ONLY, each twice (first in the file, then again after the message), and titled the prompt box and the exit hint (`claude --resume "fork: probe-msg"`); A stayed byte-identical. Re-probed 2026-11-17 at 2.1.326 with a carried `--effort high` and no `--model`, the exit hint reads `claude --effort high --resume <F>` and `--name`'s two records still land in F only, twice each ([carried effort](#a-carried-effort-probed-at-claude-21322-2026-11-17) has the rest). In a folder claude does not trust yet, the workspace-trust dialog comes first (its cursor starts on "No, exit") and the message is sent once the folder is trusted; a probe script matches the dialog by `confirm` ("Enter to confirm · Esc to cancel", 2.1.326), never "I trust this folder", whose words are each drawn with their own escape sequence, then sends Down + Enter. A child that inherits another claude session's `CLAUDE_CODE_CHILD_SESSION` prints "Transcript saving is off" and writes no F, so the probe dropped those markers, as a plain terminal has none | `resume::build_fork_run_argv` via `check_fork_run` |
 | Dispatch a DEFINED agent | `claude --agent <name>` | `resume::build_new_argv` (`src/resume.rs`) |
 | Start a new session on a drafted prompt | `claude [--agent <name>] [--model <alias> [--effort <level>]] <prompt>` | `resume::build_new_argv` |
 | Start a BACKGROUND agent on a drafted prompt | `claude [--agent <name>] [--model <alias> [--effort <level>]] --bg <prompt>` | `send::build_bg_launch_argv` (`src/send.rs`) |
 | Attach to a live background job | `claude attach <job-id>` | `resume::build_attach_argv` |
-| Quick-send a reply (non-interactive) | `claude -p -r <session-id> --output-format json [--model <alias> [--effort <level>]] <message>` | `send::build_send_argv` (`src/send.rs`) |
-| Fork headless from the `Ctrl-F` box (`Enter`) | `claude -p -r <session-id> --fork-session --session-id <new-uuid> --name <name> --output-format json [--model <alias> [--effort <level>]] <message>`, `<name>` being `fork: <first line of the message>` (`resume::fork_name`). Checked against claude 2.1.291: exits 0, writes `<new-uuid>.jsonl` with that `sessionId`, leaves the original byte-identical, and shares the original's root record so the lineage fold groups the pair; `--session-id` with `--resume` is accepted only alongside `--fork-session`. Probed 2026-10-08 at 2.1.291 (`claude -p -r A --fork-session --session-id F --name "fork: Review PR1"`, throwaway sessions since removed): `--name` writes `{"type":"custom-title","customTitle":"fork: Review PR1","sessionId":"<F>"}` — twice — and an `agent-name` record with the same text into F ONLY; A stays byte-identical. Observed at 2.1.291, not documented: a fork carries no background stamp — the records it writes have no `sessionKind: "bg"`. snapback reads the LAST `custom-title` back as the fork marker ([DOMAIN.md](DOMAIN.md#named-forks-the-fork-name-prefix)) | `send::build_fork_send_argv` (`src/send.rs`) |
+| Quick-send a reply (non-interactive) | `claude -p -r <session-id> --output-format json [--model <alias> [--effort <level>] \| --effort <level>] <message>` | `send::build_send_argv` (`src/send.rs`) |
+| Fork headless from the `Ctrl-F` box (`Enter`) | `claude -p -r <session-id> --fork-session --session-id <new-uuid> --name <name> --output-format json [--model <alias> [--effort <level>] \| --effort <level>] <message>`, `<name>` being `fork: <first line of the message>` (`resume::fork_name`). Checked against claude 2.1.291: exits 0, writes `<new-uuid>.jsonl` with that `sessionId`, leaves the original byte-identical, and shares the original's root record so the lineage fold groups the pair; `--session-id` with `--resume` is accepted only alongside `--fork-session`. Probed 2026-10-08 at 2.1.291 (`claude -p -r A --fork-session --session-id F --name "fork: Review PR1"`, throwaway sessions since removed): `--name` writes `{"type":"custom-title","customTitle":"fork: Review PR1","sessionId":"<F>"}` — twice — and an `agent-name` record with the same text into F ONLY; A stays byte-identical. Observed at 2.1.291, not documented: a fork carries no background stamp — the records it writes have no `sessionKind: "bg"`. snapback reads the LAST `custom-title` back as the fork marker ([DOMAIN.md](DOMAIN.md#named-forks-the-fork-name-prefix)) | `send::build_fork_send_argv` (`src/send.rs`) |
 | Release a held job before a reply, or interrupt a selected agent (`Ctrl-K`) | `claude stop <job-id>` | `send::build_stop_argv` |
 | Move a session to another folder (`Ctrl-X w`), the board staying up | In a folder claude TRUSTS: `claude -p --input-format stream-json --output-format stream-json --verbose --strict-mcp-config --settings {"disableAllHooks":true} -r <session-id>`, never with `--no-session-persistence`. In ANY OTHER folder: the same, followed by `--setting-sources user`, with `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1` added to the CHILD's environment. Either runs in the session's CURRENT folder (never the target), with ONE stdin line holding `{"type":"control_request","request_id":"snapback-move","request":{"subtype":"set_cwd","path":"<abs target>"}}` and then EOF; a lineage move runs one such child per member, in sequence (see [`set_cwd`](#set_cwd-moving-a-session-without-leaving-the-board)) | `claude_move::build_set_cwd_argv(session_id, FolderTrust)`, the catalog's `build_catalog_env(FolderTrust)` for the child's environment, and `set_cwd_request_line` (`src/claude_move.rs`); the verdict from `claude_trust::folder_trust`, read on the move's worker thread |
 | Detect live agents (gate probe) | `claude agents --json` | `agents::live_agents_argv` (`src/agents.rs`) |
@@ -128,7 +133,7 @@ is the A MODEL IS PICKED PER COMPOSE, NEVER PER BOARD rule in
 [AGENTS.md](../../AGENTS.md#critical-rules), and which builder emits it for each
 launch is [DOMAIN.md](DOMAIN.md#compose-model-pick-ctrl-l)'s table. It is emitted
 ONLY for an explicit pick — with none, every argv that can carry it is
-byte-identical to its modelless form, so a reply normally keeps the session's last
+byte-identical to its modelless form (bar the carried `--effort` below), so a reply normally keeps the session's last
 model and a new session runs on whatever `claude` gives one (see
 [Which model a launch runs on](#which-model-a-launch-runs-on-without---model)) —
 and it is always placed BEFORE a trailing positional (the new-session prompt, the
@@ -139,13 +144,20 @@ normally restores the session's own model (the exceptions are
 a process already running under a model. `--agent` and `--model` compose freely,
 and snapback emits both when both are set; the accepted alias set is below.
 
-`[--effort <level>]` is the same pick's optional effort (`←`/`→` inside that
-compose's model picker). It lives INSIDE the model pick (`resume::ModelPick`), so
-it is emitted only together with `--model`: immediately after it, before any
-trailing positional, through the one `resume::push_model_flag` guard — a pick
-whose model is blank emits neither flag. With no effort each of those argvs is
-byte-identical to its `--model`-only form, and no row that cannot carry a model
-can carry an effort. What claude does with the value is
+`[--effort <level>]` after `--model` is the same pick's optional effort (`←`/`→`
+inside that compose's model picker). It lives INSIDE the model pick
+(`resume::ModelPick`), so it is emitted only together with `--model`: immediately
+after it, before any trailing positional, through the one `resume::push_model_flag`
+guard — a pick whose model is blank emits neither flag. With no effort each of
+those argvs is byte-identical to its `--model`-only form.
+
+The `\| --effort <level>` alternative on the three session rows (the reply, the
+fork box's `Enter` and its `Ctrl-O`) is the session's CARRIED effort: with no pick,
+and only when the box's default is the session's own model, `--effort` goes out
+ALONE, with the level the session's last answering turn recorded, through
+`resume::push_effort_flag`, which sends only an `EFFORT_LEVELS` entry. No row that
+cannot carry a model — Resume, Attach, the Attach/Fork/Cancel choice's Fork — can
+carry an effort. What claude does with the value is
 [below](#effort-levels---effort).
 
 ### `/cd`: moving a session to another folder
@@ -1433,17 +1445,53 @@ code. Unlike `--model`, the flag can never make a hand-off FAIL:
   settings level, or claude's built-in default. That is what the picker's unset
   stop (`default effort`) means; the board does not read which level it is.
 
-snapback's effort pick lives inside its model pick, so the A MODEL IS PICKED PER
+snapback's effort PICK lives inside its model pick, so the A MODEL IS PICKED PER
 COMPOSE, NEVER PER BOARD rule in [AGENTS.md](../../AGENTS.md#critical-rules)
 governs it as well. Unlike the model, **claude does not restore an effort** on a
 later `-r` (`restoreModelFromSession`, below, restores the model alone), so a
-picked effort applies to that one reply or launch; a later resume runs at the
-settings level for whatever model it restores. Each preview turn marker already
+picked effort applies to that one reply or launch, and a plain resume (`Enter`,
+the choice's Fork) runs at the settings level for whatever model it restores.
+snapback therefore sends the session's own level back for the three launches that
+name a session in a compose box ([carried effort](#a-carried-effort-probed-at-claude-21322-2026-11-17)).
+Each preview turn marker already
 shows the effort that turn actually ran at (`record_effort`,
 [DOMAIN.md](DOMAIN.md#effort-level-record_effort)), so a lowered or overridden
 level is visible after the fact. Because an effort can never cause a non-zero exit,
 `resume::MODEL_NONZERO_HINT` is chosen on whether `--model` was emitted, never on
 the effort, and never names it.
+
+##### A carried effort (probed at claude 2.1.322, 2026-11-17)
+
+Probed against claude 2.1.322 on 2026-11-17 (throwaway sessions since removed), each fact the
+carried effort rests on:
+
+- **A flagless `-r` does not restore the effort.** `claude -p --model opus --effort xhigh`,
+  then `claude -p -r <id>` with no flags: turn 1 recorded `perTurnEffort: xhigh`,
+  turn 2 `high` (the user's `modelSettings.claude-opus-5-5.effortLevel`).
+- **`--effort` alone still restores the model.** `claude -p --model sonnet --effort low`,
+  then `claude -p -r <id> --effort high` with no `--model` (settings default model
+  opus): `modelUsage` named `claude-sonnet-5-5` and the turn recorded `high`; a
+  following flagless `-p -r` recorded `medium`. So an effort-only flag raises the
+  level and leaves the session's model to claude.
+- **A fork carries it the same way.** `claude -p -r <A> --fork-session --session-id <F> --name "fork: probe" --output-format json --effort high "…"`
+  with no `--model`: F recorded the copied `sonnet-5-5 low` turn and then
+  `sonnet-5-5 high`; A was unchanged.
+- **So does the interactive `Ctrl-O` fork** (re-probed 2026-11-17 at 2.1.326 under
+  a pseudo-terminal). `claude -r <A> --fork-session --session-id <F> --name "fork: probe-msg" --effort high "Reply with exactly: fork-ok"`,
+  no `-p`, no `--model`, A from `claude -p --model sonnet --effort low`: F's new
+  turn recorded `claude-sonnet-5-5` at `high` (the copied turn kept
+  `sonnet-5-5 low`, no Opus model appeared, the banner read "Sonnet 5.5 with high
+  effort"), A kept the same sha256, and the exit hint read
+  `claude --effort high --resume <F>`.
+- **Settings decide the unflagged level.** With `--setting-sources project,local`
+  (user settings excluded) Opus 5.5 ran at `medium`.
+
+The level snapback carries is the one on the SAME `assistant` record as the model
+it names (`RenderedPreview::last_effort`, see
+[DOMAIN.md](DOMAIN.md#the-sessions-carried-effort)); it is checked against
+`resume::EFFORT_LEVELS` before it reaches argv, so an unknown or flag-shaped value
+sends nothing. `CLAUDE_CODE_EFFORT_LEVEL` still wins over a carried `--effort`, and
+the label does not account for it.
 
 To re-verify after a `claude` update: `claude --help | grep -A1 -- --effort` for
 the level list, and search the bundle (`strings -a`) for `Unknown --effort value`,
