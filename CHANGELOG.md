@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0](https://github.com/ilfroloff/snapback/compare/v0.15.0...v0.16.0) - 2026-11-18
+
+### Added
+
+- carry a session's last recorded effort into replies and fork runs
+- rank agents with files by match tier in a top-level @ list
+- match word starts in / command and @ agent names too
+- label each / pick-list row as a skill, command or built-in
+
+### Other
+
+- re-record the demo for v0.15.0 with a failed subagent and the step
+- pitch subagents and fork/move on the website and README
+
 ## [0.15.0](https://github.com/ilfroloff/snapback/compare/v0.14.0...v0.15.0) - 2026-11-05
 
 ### Added
