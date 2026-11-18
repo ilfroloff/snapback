@@ -2011,7 +2011,7 @@ const RUNNING_LIST_HINT: &str = "^X \u{2193} explore";
 
 /// The running list's hint inside the subagent view: the keys that step through
 /// the running (`live`) subagents (`↑`/`↓`) and through `all` of them (`←`/`→`),
-/// and leave the view. The labels are the help line's ([`SUBAGENT_HELP_HINT`]).
+/// and leave the view. The labels are the help line's ([`SUBAGENT_HELP_LEAD`]).
 const RUNNING_LIST_VIEW_HINT: &str =
     "\u{2191}/\u{2193} live \u{b7} \u{2190}/\u{2192} all \u{b7} Esc back";
 
@@ -2824,26 +2824,40 @@ fn fit_title<const N: usize>(
     droppable: [Option<&str>; N],
     draw: impl Fn(Option<&str>, [Option<&str>; N]) -> Line<'static>,
 ) -> Line<'static> {
+    let width_cols = width;
     let width = usize::from(width);
     let whole = draw(flexible, droppable);
     if whole.width() <= width {
         return whole;
     }
-    let mut kept = droppable;
-    let mut line = draw(None, kept);
     if let Some(flexible) = flexible {
-        let used = line.width() + UnicodeWidthStr::width(RUNNING_LIST_SEPARATOR);
+        let used = draw(None, droppable).width() + UnicodeWidthStr::width(RUNNING_LIST_SEPARATOR);
         let cut = fit_label(flexible, width, used, 0);
         if !cut.is_empty() {
-            return draw(Some(&cut), kept);
+            return draw(Some(&cut), droppable);
         }
     }
+    drop_until_fits(width_cols, droppable, |kept| draw(None, kept))
+}
+
+/// What both width-fitted rows share: `draw(kept)` with the `kept` segments
+/// dropped whole, in the order the array lists them (the first slot first), until
+/// the line fits `width` columns. What `draw` adds beyond the segments is never
+/// cut here: narrower than that, the line is returned as it is and the row's edge
+/// cuts it. [`fit_title`] ends in it, and so does the help row ([`help_row`]). Pure.
+fn drop_until_fits<const N: usize>(
+    width: u16,
+    mut kept: [Option<&str>; N],
+    draw: impl Fn([Option<&str>; N]) -> Line<'static>,
+) -> Line<'static> {
+    let width = usize::from(width);
+    let mut line = draw(kept);
     for dropped in 0..N {
         if line.width() <= width {
             return line;
         }
         kept[dropped] = None;
-        line = draw(None, kept);
+        line = draw(kept);
     }
     line
 }
@@ -5604,23 +5618,97 @@ const FIND_HINT: &str = "find  type to search · S-↑↓ match · Enter older m
 /// row (pinned by `every_compose_hint_form_fits_an_eighty_column_terminal`).
 const COMPLETION_HINT: &str = "↑/↓ choose · Enter/Tab pick · Esc close list";
 
-/// The default board hint — no pending chord, no status, not composing, and the
-/// key-map modal ([`render_key_map`]) not open. It replaced a line that listed
-/// every binding in well over 80 columns and clipped silently past column 80 (see
-/// git history).
+/// The default board hint's keys, in PRIORITY order: the row keeps a prefix of
+/// them and drops the rest from the END ([`help_row`]). Every `Ctrl` key the
+/// board binds (`update::key_to_action`) is here but the key map's own
+/// (`Ctrl+Shift+/`, which [`HELP_KEY_MAP_KEY`] stands for), so a wide terminal
+/// lists them all; the order is what a narrow one keeps.
 ///
-/// It names only keys a user cannot guess. Those a list UI makes self-evident
-/// (arrows move, `Enter` resumes, `Esc` quits) are left out. What stays is
-/// snapback's own: `Tab` widens the search into transcript content; the three
-/// agent actions (`Ctrl-N` new, `Ctrl-R` reply, `Ctrl-K` stop); the `Ctrl-X`
-/// leader, whose follow-ups [`chord_hint`] shows the moment it is pressed; and
-/// `F1`, the key-map modal, for everything else. That is `F1`, not
-/// `Ctrl+Shift+/`, because a terminal often cannot deliver the latter (it arrives
-/// as Backspace or nothing).
+/// Ranked by how much a user loses by not seeing the key: `^F` (find in the
+/// transcript, snapback's own), the three agent actions (`^N` new, `^R` reply,
+/// `^K` stop), `^A` (scope), `^X` (the leader, whose follow-ups [`chord_hint`]
+/// shows the moment it is pressed, so it reads `actions`, what pressing it gives
+/// you) and `Tab` (widen the search into content) next. The preview's scroll
+/// pairs (`^U`/`^D`, `^T`/`^E`) come after, as `PgUp`/`PgDn` and `Home`/`End`
+/// already scroll. Last are the two query editors, `^W` (delete a query word) and
+/// `^←`/`^→` (hop the query's caret by a word), and `^C`, the one key a user
+/// cannot fail to guess. `Tab` is the one entry that is not a `Ctrl` key: it sits
+/// after `^X`, not first as it did on the fixed line, so the six
+/// `Ctrl` keys ahead of it are what an 80-column terminal shows. Keys a
+/// list UI makes self-evident (arrows, `Enter`, `Esc`) are left out.
+const DEFAULT_HELP_KEYS: [&str; 11] = [
+    "^F find",
+    "^N new",
+    "^R reply",
+    "^K stop",
+    "^A scope",
+    "^X actions",
+    "Tab content",
+    "^U/^D\u{b7}^T/^E scroll",
+    "^W word",
+    "^\u{2190}/\u{2192} caret",
+    "^C quit",
+];
+
+/// The subagent view's keys, in the same priority order as
+/// [`DEFAULT_HELP_KEYS`] and without `Tab content`: the board query never marks a
+/// subagent's transcript, so widening it into content has nothing to show there.
+const SUBAGENT_HELP_KEYS: [&str; 10] = [
+    "^F find",
+    "^N new",
+    "^R reply",
+    "^K stop",
+    "^A scope",
+    "^X actions",
+    "^U/^D\u{b7}^T/^E scroll",
+    "^W word",
+    "^\u{2190}/\u{2192} caret",
+    "^C quit",
+];
+
+/// The subagent view's leading keys, which the row NEVER drops. There the plain
+/// arrows stop being obvious — `↑`/`↓` step the RUNNING subagents and `←`/`→`
+/// every one, in launch order (`update::key_to_action`) — so they lead the line,
+/// and `Esc back` names the way out, since `↑` no longer leaves the view and it
+/// must always be on screen. The default row has none.
+const SUBAGENT_HELP_LEAD: [&str; 2] = ["\u{2191}\u{2193} live \u{2190}\u{2192} all", "Esc back"];
+
+/// The key-map modal's key, which the row ALWAYS ends with and never drops: it is
+/// the way to every key the row had no columns for. `F1`, not `Ctrl+Shift+/`,
+/// because a terminal often cannot deliver the latter (it arrives as Backspace or
+/// nothing).
+const HELP_KEY_MAP_KEY: &str = "F1 keys";
+
+/// The board's help row for `width` columns: `lead`, then as many of `keys` (in
+/// priority order) as fit, then [`HELP_KEY_MAP_KEY`], each after
+/// [`RUNNING_LIST_SEPARATOR`]. The row FITS BY DROPPING: whole entries leave from
+/// the end of `keys`, never cut mid-word, through [`drop_until_fits`] — the
+/// drop-in-order [`fit_title`] fits the preview's titles with. `lead` and the
+/// `F1` key are never dropped, so narrower than those the row is returned as it
+/// is and the terminal's edge cuts it.
 ///
-/// 65 columns by `unicode-width`, kept inside the 80-column help row by
-/// `default_help_hint_fits_the_target_width`.
-const DEFAULT_HELP_HINT: &str = "Tab content · ^N new · ^R reply · ^K stop · ^X hide/del · F1 keys";
+/// This answers commit `8641aad`, which trimmed an all-keys line because it
+/// "silently clipped past 80 columns": the clipped keys were the ones the user
+/// could not discover, and a fixed-length line cannot be both complete and fit.
+/// A fitted one drops whole entries by priority instead of being cut by the
+/// terminal, and what it drops is always one `F1` away. At 80 columns the first
+/// six default keys fit; a wide terminal lists every `Ctrl` key. Pure; pinned by
+/// `help_row_fits_by_dropping_whole_entries_from_the_end`.
+fn help_row<const N: usize>(width: u16, lead: &[&str], keys: [&str; N]) -> Line<'static> {
+    // `drop_until_fits` drops the FIRST slot first, so the lowest priority goes
+    // there; `draw` reads the slots back in priority order.
+    let mut drop_order = keys.map(Some);
+    drop_order.reverse();
+    drop_until_fits(width, drop_order, |kept| {
+        let entries: Vec<&str> = lead
+            .iter()
+            .copied()
+            .chain(kept.iter().rev().flatten().copied())
+            .chain([HELP_KEY_MAP_KEY])
+            .collect();
+        Line::from(entries.join(RUNNING_LIST_SEPARATOR))
+    })
+}
 
 /// One section of the key-map modal: a heading and its `(keys, action)` rows.
 struct KeyMapSection {
@@ -5890,8 +5978,8 @@ fn render_key_map(frame: &mut Frame, app: &mut App) {
 /// The bottom help line: the [`chord_hint`] while a `Ctrl-X` leader chord is
 /// pending, else a transient board status (e.g. a resume refusal) when one is
 /// set, else the [`compose_hint`] while composing, else the [`FIND_HINT`] while
-/// the preview's find bar is open, else the trimmed
-/// [`DEFAULT_HELP_HINT`] cheat sheet. The row is always ONE row tall; the full
+/// the preview's find bar is open, else the [`board_hint`] cheat sheet, fitted to
+/// the row's width. The row is always ONE row tall; the full
 /// key map lives in its own modal ([`render_key_map`]). A status is flattened to
 /// a single row (newlines -> spaces).
 fn render_help(frame: &mut Frame, app: &App, area: Rect) {
@@ -5946,39 +6034,26 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
     // The board keymap — one of the surfaces AGENTS.md's KEEP KEY DOCS IN SYNC
-    // names. See `DEFAULT_HELP_HINT`'s doc comment for what it names and why. It
+    // names. See `DEFAULT_HELP_KEYS`'s doc comment for what it names and why. It
     // does NOT mention the terminal's paste, on COLUMN BUDGET: what a board paste
     // DOES (insert at the query's cursor with newlines flattened to spaces, and never
     // resume) is documented where there is room to say it: `KEYS` in `cli.rs` and
     // the `docs/GUIDE.md` key map — same as every binding this line does not list.
-    let line = Line::from(vec![Span::styled(
-        board_hint(app.subagent_view_on_screen()),
-        Style::default().add_modifier(Modifier::DIM),
-    )]);
+    let line = board_hint(app.subagent_view_on_screen(), area.width)
+        .patch_style(Style::default().add_modifier(Modifier::DIM));
     frame.render_widget(Paragraph::new(line), area);
 }
 
-/// The board hint while the subagent view is ON SCREEN
-/// ([`App::subagent_view_on_screen`]). There the plain arrows stop being obvious
-/// — `↑`/`↓` step the RUNNING subagents and `←`/`→` every one, in launch order
-/// (`update::key_to_action`) — so they lead the line, and `Tab content` gives up
-/// its columns for them. `Esc back` names the way out, since `↑` no longer
-/// leaves the view and it must always be on screen. A view that is open but not
-/// drawn (the 1:0 layout, a draft card) leaves the arrows the board's own, so it
-/// shows [`DEFAULT_HELP_HINT`]. The leading keys cost 5 columns more than the
-/// ones they replaced, so `^X hide/del` is shortened to `^X more` (the chord's
-/// own which-key hint lists its verbs). 75 columns by `unicode-width`, kept
-/// under the 80-column help row by `default_help_hint_fits_the_target_width`.
-const SUBAGENT_HELP_HINT: &str =
-    "↑↓ live ←→ all · Esc back · ^N new · ^R reply · ^K stop · ^X more · F1 keys";
-
-/// Which board hint the help line shows: [`SUBAGENT_HELP_HINT`] while the
-/// subagent view is on screen, else [`DEFAULT_HELP_HINT`]. PURE.
-fn board_hint(view_on_screen: bool) -> &'static str {
+/// Which board hint the help line shows at `width` columns: the subagent view's
+/// ([`SUBAGENT_HELP_LEAD`], [`SUBAGENT_HELP_KEYS`]) while that view is ON SCREEN
+/// ([`App::subagent_view_on_screen`]), else [`DEFAULT_HELP_KEYS`]. A view that is
+/// open but not drawn (the 1:0 layout, a draft card) leaves the arrows the
+/// board's own, so it shows the default. Both go through [`help_row`]. PURE.
+fn board_hint(view_on_screen: bool, width: u16) -> Line<'static> {
     if view_on_screen {
-        SUBAGENT_HELP_HINT
+        help_row(width, &SUBAGENT_HELP_LEAD, SUBAGENT_HELP_KEYS)
     } else {
-        DEFAULT_HELP_HINT
+        help_row(width, &[], DEFAULT_HELP_KEYS)
     }
 }
 
@@ -7124,11 +7199,13 @@ fn highlight_label_spans(
 mod tests {
     use std::path::{Path, PathBuf};
 
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use unicode_width::UnicodeWidthStr;
 
     use super::super::app::ModalAction;
+    use super::super::update::{key_to_action, Action};
     use super::*;
     use crate::send::OWNERSHIP_CLAIMS;
     use crate::store::subagents::RunVerdict;
@@ -19176,19 +19253,19 @@ mod tests {
         let view_form = "↑↓ live ←→ all · Esc back";
 
         let board = help(&mut app);
-        assert!(board.starts_with("Tab content · "), "{board:?}");
+        assert!(board.starts_with("^F find · "), "{board:?}");
         assert!(!board.contains(view_form), "{board:?}");
 
         app.open_subagent_view("a1b2c3d4e5f6a7b8c", "parser-auditor");
         let view = help(&mut app);
         assert!(view.starts_with(&format!("{view_form} · ")), "{view:?}");
         assert!(!view.contains("↑ back"), "↑ no longer leaves: {view:?}");
-        assert!(view.contains("F1 keys"), "the budget holds at 80: {view:?}");
+        assert!(view.contains("F1 keys"), "the fit keeps F1 at 80: {view:?}");
 
         app.set_pane_layout(PaneLayout::ListOnly);
         assert!(app.in_subagent_view(), "premise: the view is still open");
         let hidden = help(&mut app);
-        assert!(hidden.starts_with("Tab content · "), "{hidden:?}");
+        assert!(hidden.starts_with("^F find · "), "{hidden:?}");
         assert!(!hidden.contains(view_form), "{hidden:?}");
         app.set_pane_layout(PaneLayout::PreviewOnly);
         assert!(help(&mut app).starts_with(&format!("{view_form} · ")));
@@ -19199,7 +19276,7 @@ mod tests {
             "premise: a card leaves the view open"
         );
         let carded = help(&mut app);
-        assert!(carded.starts_with("Tab content · "), "{carded:?}");
+        assert!(carded.starts_with("^F find · "), "{carded:?}");
         assert!(!carded.contains(view_form), "{carded:?}");
     }
 
@@ -22264,47 +22341,217 @@ mod tests {
         assert!(!chord_hint(true).contains("x hide"));
     }
 
-    /// The trimmed default hint must fit an 80-column terminal with room to
-    /// spare — a real assertion, not only the doc-comment's prose measurement,
-    /// so a future edit that widens the string past budget fails loudly here
-    /// instead of silently clipping on a real terminal (the bug this line
-    /// replaced).
+    /// The help row's width: the terminal's, since the row spans it.
+    const HELP_ROW_AT_80: u16 = 80;
+
+    /// A width no row of either variant needs to drop an entry at.
+    const HELP_ROW_AT_WIDE: u16 = 200;
+
+    /// `board_hint`'s row as plain text and its entries, split on the separator.
+    fn help_entries(view_on_screen: bool, width: u16) -> (String, Vec<String>) {
+        let text = line_string(&board_hint(view_on_screen, width));
+        let entries = text
+            .split(RUNNING_LIST_SEPARATOR)
+            .map(str::to_string)
+            .collect();
+        (text, entries)
+    }
+
+    /// The row FITS BY DROPPING: at every width it keeps the LONGEST prefix of the
+    /// wide row's entries that fits (checked against an oracle that joins the
+    /// prefixes itself), so it only ever loses whole entries from the END of its
+    /// priority order, none cut mid-word and none dropped that would have fit. It
+    /// never loses `F1 keys`, and in the subagent view never its leading keys,
+    /// `Esc back` among them. Both variants.
     #[test]
-    fn default_help_hint_fits_the_target_width() {
-        const HELP_ROW_BUDGET: usize = 80;
-        for hint in [DEFAULT_HELP_HINT, SUBAGENT_HELP_HINT] {
-            let width = UnicodeWidthStr::width(hint);
-            // Comfortable room to spare, not just barely under budget.
-            assert!(
-                width + 4 <= HELP_ROW_BUDGET,
-                "{hint:?} ({width} cols) leaves less than 4 columns of headroom \
-                 under the {HELP_ROW_BUDGET}-column budget"
-            );
+    fn help_row_fits_by_dropping_whole_entries_from_the_end() {
+        for view_on_screen in [false, true] {
+            let (_, wide) = help_entries(view_on_screen, HELP_ROW_AT_WIDE);
+            let pinned = if view_on_screen {
+                SUBAGENT_HELP_LEAD.len()
+            } else {
+                0
+            };
+            let cols = |entries: &[String]| {
+                UnicodeWidthStr::width(entries.join(RUNNING_LIST_SEPARATOR).as_str())
+            };
+            for width in 0..=HELP_ROW_AT_WIDE {
+                // Everything but the F1 key, in order: the lead, then the keys.
+                let keys = &wide[..wide.len() - 1];
+                let with_f1 = |kept: usize| {
+                    let mut entries = keys[..kept].to_vec();
+                    entries.push(HELP_KEY_MAP_KEY.to_string());
+                    entries
+                };
+                let expected = (pinned..=keys.len())
+                    .rev()
+                    .find(|&kept| cols(&with_f1(kept)) <= usize::from(width))
+                    .unwrap_or(pinned);
+                let (text, entries) = help_entries(view_on_screen, width);
+                assert_eq!(entries, with_f1(expected), "at {width}: {text:?}");
+                assert_eq!(entries.last().map(String::as_str), Some(HELP_KEY_MAP_KEY));
+            }
+            if view_on_screen {
+                assert_eq!(wide[..pinned], SUBAGENT_HELP_LEAD, "the lead leads");
+            }
         }
     }
 
-    /// It names the keys a user cannot guess and none a list UI makes
-    /// self-evident, so re-adding an obvious one fails here.
+    /// At 80 columns the row fits whole and still names `^F find`, `F1 keys` and
+    /// the three agent actions, in both variants; the exact rows are pinned so a
+    /// reordered priority list shows up here.
     #[test]
-    fn default_help_hint_names_only_the_non_obvious_keys() {
-        for needle in [
-            "Tab content",
-            "^N new",
-            "^R reply",
-            "^K stop",
-            "^X hide/del",
-            "F1 keys",
-        ] {
-            assert!(
-                DEFAULT_HELP_HINT.contains(needle),
-                "DEFAULT_HELP_HINT must mention {needle:?}: {DEFAULT_HELP_HINT:?}"
-            );
+    fn help_row_at_eighty_columns_keeps_the_leading_keys() {
+        let (default, _) = help_entries(false, HELP_ROW_AT_80);
+        assert_eq!(
+            default,
+            "^F find \u{b7} ^N new \u{b7} ^R reply \u{b7} ^K stop \u{b7} ^A scope \u{b7} ^X actions \u{b7} F1 keys"
+        );
+        let (subagent, _) = help_entries(true, HELP_ROW_AT_80);
+        assert_eq!(
+            subagent,
+            "\u{2191}\u{2193} live \u{2190}\u{2192} all \u{b7} Esc back \u{b7} ^F find \u{b7} ^N new \u{b7} ^R reply \u{b7} ^K stop \u{b7} F1 keys"
+        );
+        for text in [&default, &subagent] {
+            assert!(UnicodeWidthStr::width(text.as_str()) <= 80, "{text:?}");
         }
-        for obvious in ["↑", "↓", "Enter", "Esc"] {
+    }
+
+    /// Every `Ctrl`-modified key `key_to_action` could bind: each ASCII character
+    /// (letters, digits, punctuation, control codes) and every named key. A key
+    /// the board gains later lands in this set without the test being edited.
+    fn ctrl_key_codes() -> Vec<KeyCode> {
+        let mut codes: Vec<KeyCode> = (0..=0x7f_u8)
+            .map(|byte| KeyCode::Char(char::from(byte)))
+            .collect();
+        codes.extend([
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::Tab,
+            KeyCode::BackTab,
+            KeyCode::Backspace,
+            KeyCode::Delete,
+            KeyCode::Insert,
+            KeyCode::Null,
+        ]);
+        codes.extend((1..=24).map(KeyCode::F));
+        codes
+    }
+
+    /// How the help row spells `Ctrl` + `code`: `^F`, `^←`.
+    fn help_spelling(code: KeyCode) -> String {
+        match code {
+            KeyCode::Char(c) => format!("^{}", c.to_ascii_uppercase()),
+            KeyCode::Left => "^\u{2190}".to_string(),
+            KeyCode::Right => "^\u{2192}".to_string(),
+            other => format!("^{other:?}"),
+        }
+    }
+
+    /// The `Ctrl` keys a help-row entry names: the keys before its label, split on
+    /// `/` and the `·` that pairs them, each spelled with its `^` (`^U/^D·^T/^E
+    /// scroll` names four, `^←/→ caret` two). An entry that does not open with `^`
+    /// (`Tab content`, `Esc back`, `F1 keys`) names none.
+    fn ctrl_keys_named(entry: &str) -> Vec<String> {
+        if !entry.starts_with('^') {
+            return Vec::new();
+        }
+        let keys = entry.split(' ').next().unwrap_or_default();
+        keys.split(['/', '\u{b7}'])
+            .map(|key| {
+                if key.starts_with('^') {
+                    key.to_string()
+                } else {
+                    format!("^{key}")
+                }
+            })
+            .collect()
+    }
+
+    /// A wide terminal lists every `Ctrl` key the board binds, DERIVED from
+    /// `update::key_to_action` rather than from a list written here: every
+    /// `Ctrl` (and `Ctrl+Shift`) key it decodes to anything but `Ignore`, in every
+    /// state the board row describes (the default row and the subagent view's, over
+    /// every query / match / view state `key_to_action` reads; the find bar's own
+    /// help row is `FIND_HINT`, not this one), must be named by an entry. The one
+    /// exception is the key map's own chord, `Ctrl+Shift+/`, which `F1 keys` stands
+    /// for: it arrives as `Ctrl` with `?`, `/` or `7`, and `F1`, which `key_to_action`
+    /// takes whatever the modifiers, is the `F1` of `F1 keys` itself. The default row also names `Tab content`; the subagent view's does
+    /// not, since the board query marks nothing there.
+    #[test]
+    fn help_row_at_a_wide_width_lists_every_ctrl_key() {
+        let key_map_keys_allowed = [
+            KeyCode::Char('?'),
+            KeyCode::Char('/'),
+            KeyCode::Char('7'),
+            KeyCode::F(1),
+        ];
+        for view_on_screen in [false, true] {
+            let (text, entries) = help_entries(view_on_screen, HELP_ROW_AT_WIDE);
+            let named: Vec<String> = entries.iter().flat_map(|e| ctrl_keys_named(e)).collect();
+            assert_eq!(entries.last().map(String::as_str), Some(HELP_KEY_MAP_KEY));
+            let mut key_map_keys = Vec::new();
+            for state in 0..8_u8 {
+                let (query_empty, has_matches, in_view) =
+                    (state & 1 != 0, state & 2 != 0, state & 4 != 0);
+                for modifiers in [
+                    KeyModifiers::CONTROL,
+                    KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                ] {
+                    for code in ctrl_key_codes() {
+                        let action = key_to_action(
+                            KeyEvent::new(code, modifiers),
+                            query_empty,
+                            has_matches,
+                            in_view,
+                            view_on_screen,
+                            false,
+                        );
+                        match action {
+                            Action::Ignore => {}
+                            Action::ToggleKeyMap => key_map_keys.push(code),
+                            bound => assert!(
+                                named.contains(&help_spelling(code)),
+                                "Ctrl+{code:?} ({modifiers:?}) is bound to {bound:?} but {:?} \
+                                 names no such key: {text:?}",
+                                help_spelling(code)
+                            ),
+                        }
+                    }
+                }
+            }
+            for code in key_map_keys_allowed {
+                assert!(
+                    key_map_keys.contains(&code),
+                    "{code:?} no longer opens the key map"
+                );
+            }
             assert!(
-                !DEFAULT_HELP_HINT.contains(obvious),
-                "DEFAULT_HELP_HINT must not spend columns on {obvious:?}: {DEFAULT_HELP_HINT:?}"
+                key_map_keys
+                    .iter()
+                    .all(|code| key_map_keys_allowed.contains(code)),
+                "an unlisted Ctrl key opens the key map: {key_map_keys:?}"
             );
+            for old in ["hide/del", "^X more"] {
+                assert!(!text.contains(old), "{old:?} still in {text:?}");
+            }
+            if view_on_screen {
+                assert!(!text.contains("Tab content"), "{text:?}");
+                assert!(text.contains("Esc back"), "{text:?}");
+            } else {
+                assert!(text.contains("Tab content"), "{text:?}");
+                for obvious in ["\u{2191}", "\u{2193}", "Enter", "Esc"] {
+                    assert!(!text.contains(obvious), "{obvious:?} in {text:?}");
+                }
+            }
         }
     }
 
@@ -22488,7 +22735,7 @@ mod tests {
             .join("\n");
         assert!(painted.contains("Ctrl-X d"), "table drawn:\n{painted}");
         assert!(
-            painted.contains(DEFAULT_HELP_HINT),
+            painted.contains(&line_string(&board_hint(false, 100))),
             "help row stays one line"
         );
         assert_eq!(app.key_map_scroll, 0, "tall terminal clamps scroll to 0");

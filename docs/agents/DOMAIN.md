@@ -2611,11 +2611,12 @@ is pinned by `opening_a_reply_or_fork_box_leaves_the_subagent_view_but_a_draft_d
 but nothing of it shows, so a step there would act on a pane nobody sees: off
 screen `↑`/`↓` are `MoveUp`/`MoveDown` (a selection move closes the view, as on
 the board) and `←`/`→` move the search caret, and the help line shows
-`DEFAULT_HELP_HINT`. `Esc` alone reads the OPEN state, as a separate parameter
+the default keys (`DEFAULT_HELP_KEYS`). `Esc` alone reads the OPEN state, as a separate parameter
 of `key_to_action`, so with an empty query it leaves a hidden view before it can
-quit. While it is on screen the help line shows `SUBAGENT_HELP_HINT`
-(`view::board_hint`), which leads with `↑↓ live ←→ all · Esc back`; it names
-`Esc` because the way out must always be on screen.
+quit. While it is on screen the help line shows the subagent keys
+(`view::board_hint`: `SUBAGENT_HELP_LEAD`, then `SUBAGENT_HELP_KEYS`), which lead with `↑↓ live ←→ all · Esc back`;
+the lead is never dropped by the row's fit (`view::help_row`), because the way
+out must always be on screen.
 
 **The view's title** (`view::subagent_title`, pure over `SubagentTitleFacts`
 and the width the border gives it) reads

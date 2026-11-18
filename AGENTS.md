@@ -367,7 +367,8 @@ one place.
   keybinding table in `update.rs`'s module doc; `USAGE`/`KEYS` in `cli.rs`; the
   help line, the draft card, the key-map modal and the preview's running list in
   `view.rs` (EVERY key string that renders there: the board keymap
-  (`DEFAULT_HELP_HINT`, or `SUBAGENT_HELP_HINT` in the subagent view),
+  (`board_hint`: `DEFAULT_HELP_KEYS`, or `SUBAGENT_HELP_LEAD` and
+  `SUBAGENT_HELP_KEYS` in the subagent view),
   `chord_hint`'s which-key list, `compose_hint`'s reply hint, `FORK_HINT`,
   `FIND_HINT` (the help row while the find bar is open),
   `BG_DRAFT_HINT`, and the `COMPLETION_HINT` every compose box shows while the
@@ -386,8 +387,12 @@ one place.
   every compose box shares (`Ctrl-L`, `/` or `@`) is ONE shared "in a compose
   box" entry in each key map — the `update.rs` table, `KEYS`, `docs/GUIDE.md` —
   that the `Ctrl-R`, `Ctrl-X f` and `Ctrl-N` entries point to, never copies.
-  The help line is ONE row, cut rather than wrapped: the board keymap,
-  `chord_hint`, the reply hint, `FORK_HINT`, `FIND_HINT` and `COMPLETION_HINT` are
+  The help line is ONE row, cut rather than wrapped. The board keymap FITS BY
+  DROPPING (`view::help_row`): whole entries leave from the end of a priority
+  order until the row fits its width, `F1 keys` (and the subagent view's lead,
+  `↑↓ live ←→ all · Esc back`) never dropped, so a wide terminal lists every
+  `Ctrl` key but the key map's own, which `F1 keys` stands for. `chord_hint`,
+  the reply hint, `FORK_HINT`, `FIND_HINT` and `COMPLETION_HINT` are
   column-budgeted to fit 80 whole (each pinned by a test), while `BG_DRAFT_HINT`
   runs past 80 and is cut there, so an 80-column terminal draws only its leading
   keys. It binds ROUTING too, not just bindings: when a key's gate gains a case
