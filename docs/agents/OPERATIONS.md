@@ -80,7 +80,8 @@ snapback -h                 # help
 ```
 
 There is no model flag and no `--effort` flag: a model (and its effort) is picked
-inside a compose box with `Ctrl-L`. Which launches send it is the A MODEL IS PICKED
+inside a compose box with `Ctrl-L`, and a reply or fork box with no pick repeats
+its session's own last effort. Which launches send either is the A MODEL IS PICKED
 PER COMPOSE, NEVER PER BOARD rule in [AGENTS.md](../../AGENTS.md#critical-rules).
 
 `-a` means TWO things — start in the all scope, and keep it as the third stop of

@@ -2383,7 +2383,7 @@ which differs from the session's mode in exactly these ways:
   against the SAME session's index — one `subagents/` dir holds every agent the
   session launched at any depth — so a click on it switches to that nested
   subagent: drill-down is one switch per level, never a body inside a body;
-- no turn contributes a `last_model` (claude restores the session's model, never
+- no turn contributes a `last_model` or a `last_effort` (claude restores the session's model, never
   a subagent's), while every turn does contribute its `MarkerLine`, so the view's
   pinned row names the subagent's own turn at the top of the pane;
 - every record is folded through the subagent record's run-ended rule into
@@ -2397,7 +2397,7 @@ DIM line `[subagent transcript unreadable]` (`SUBAGENT_UNREADABLE`), so the clic
 still visibly did something.
 
 **The view never passes for the session's own transcript.** Its render is cached
-apart from `App::preview_cache`, so `last_model` and the reply box's model label
+apart from `App::preview_cache`, so `last_model`, `last_effort` and the reply box's model label
 never come from it. The pane's title names the subagent (` subagent @<agentType> `,
 then, once the record lists it, how it stands and its `k/n` place in
 [launch order](#subagent-record-and-running-list-storesubagents));
@@ -2828,7 +2828,10 @@ record that is not `isMeta` — asked through the shared `label::is_meta`, so th
 readings of the flag cannot drift — and whose `message.model` survives
 `model_label`, so `<synthetic>` and every other pseudo-model, a blank and a
 non-string id all name nothing. The render pass keeps the LAST such record's label
-as `RenderedPreview::last_model`. Hoisting is correct here, where it would be false
+as `RenderedPreview::last_model`, and the effort of that SAME record
+(`restorable_turn`, over `record_effort`) as `RenderedPreview::last_effort`, which
+a newer answering turn with no effort clears; the
+[carried effort](#the-sessions-carried-effort) is built on it. Hoisting is correct here, where it would be false
 for a turn label, because the newest answer is by definition the one claude
 restores. It is collected by the SAME pass that renders the turns, so the reply box
 reads it off the width-scoped cache and no file is read or parsed a second time, on
@@ -3038,18 +3041,19 @@ on is already on disk, per turn (`message.model`, see
 
 | Launch | Carries the compose's pick? | Built by |
 | --- | --- | --- |
-| `Enter` in a `Ctrl-R` reply box | yes, when one is set | `send::build_send_argv` |
-| `Enter` in a `Ctrl-F` fork box | yes, when one is set | `send::build_fork_send_argv` |
-| `Ctrl-O` in a `Ctrl-F` fork box | yes, when one is set | `resume::build_fork_run_argv`, via `check_fork_run` |
+| `Enter` in a `Ctrl-R` reply box | yes, when one is set; with none, the session's [carried effort](#the-sessions-carried-effort) | `send::build_send_argv` |
+| `Enter` in a `Ctrl-F` fork box | yes, when one is set; with none, the carried effort | `send::build_fork_send_argv` |
+| `Ctrl-O` in a `Ctrl-F` fork box | yes, when one is set; with none, the carried effort | `resume::build_fork_run_argv`, via `check_fork_run` |
 | `Enter` in a `Ctrl-N` draft (`--bg`) | yes, when one is set | `send::build_bg_launch_argv` |
 | `Ctrl-O` in a `Ctrl-N` draft | yes, when one is set | `resume::build_new_argv`, via `check_new` |
 | `Ctrl-O` on the agent picker | never: it skips the draft, the only place a pick is made | `resume::build_new_argv` with `None` |
-| Resume (`Enter` on a row), the Attach/Fork/Cancel choice's Fork, Attach | never: their builders take no pick | `resume::build_argv` / `build_fork_argv` / `build_attach_argv` |
+| Resume (`Enter` on a row), the Attach/Fork/Cancel choice's Fork, Attach | never a pick or an effort: their builders take neither | `resume::build_argv` / `build_fork_argv` / `build_attach_argv` |
 | Move (`Ctrl-X w`, a headless `set_cwd` request) | never: it takes no model turn, and its builder takes no pick | `claude_move::build_set_cwd_argv` |
 
-`--model` goes out only for a `Some`, and `--effort` only right behind it, both
-through the ONE `resume::push_model_flag`; with no pick every argv is
-byte-identical to its modelless form and `claude` decides. That is the whole reason
+`--model` goes out only for a `Some`, and a pick's `--effort` only right behind
+it, both through the ONE `resume::push_model_flag`; with no pick no `--model` goes
+out, `claude` decides the model, and the argv is byte-identical to its modelless
+form except for the one carried `--effort` below. That is the whole reason
 Resume and the running-session choice's Fork carry none: a `-r` launch without `--model` normally restores the
 session's own last model (the exceptions, such as an environment override, a
 non-first-party provider or a model it declines at resume time, are in
@@ -3057,8 +3061,10 @@ non-first-party provider or a model it declines at resume time, are in
 and a reply that picked a model leaves the session on it, because that model
 answered last. Attach carries none for a plainer reason: `claude attach` joins a
 process already running under one. `claude` does NOT restore an effort, so a
-picked effort applies to that one launch, and a later resume runs at the settings
-level for the model it restores.
+picked effort applies to that one launch, and the plain resumes above (Resume,
+the choice's Fork) run at the settings level for the model they restore; the
+reply and the two fork-box launches get the session's own level back through the
+carried effort below.
 
 **The picker.** `Ctrl-L` (`compose::ComposeAction::PickModel`, on every target)
 opens a `List` [modal](#user-facing-modes-tuiapp) OVER the compose, which keeps its
@@ -3097,14 +3103,14 @@ the board does not read; what `claude` does with a set level — and why it can 
 fail a launch — is [CLAUDE_CLI.md](CLAUDE_CLI.md#effort-levels---effort)'s.
 
 **What a compose runs on with no pick** is ONE pure decision,
-`tui::app::resolve_compose_default(target, session_model, restore_overridden, settings_model) -> ComposeDefault`,
+`tui::app::resolve_compose_default(target, session_model, session_effort, restore_overridden, settings_model) -> ComposeDefault`,
 asked through `App::compose_default` from state already in hand, so both surfaces
 that show it — the compose's bottom-border `model:` label and the picker's row 0 —
 read the same answer:
 
 | `ComposeDefault` | When | Label (`view::compose_model_label`) | Picker row 0 |
 | --- | --- | --- | --- |
-| `SessionModel(label)` | a reply or fork, no override in effect, and the session has an answering model on record | `model: session (<label>)` | `session's model (<label>)` |
+| `SessionModel { label, effort }` | a reply or fork, no override in effect, and the session has an answering model on record; `effort` is its last turn's level when that is a known one | `model: session (<label>)`, or `model: session (<label> · <effort>)` | `session's model (<label>)`, or `session's model (<label> · <effort>)` |
 | `RestoreOverridden` | a reply or fork while `ANTHROPIC_MODEL` or an `ANTHROPIC_DEFAULT_{FABLE,OPUS,SONNET,HAIKU}_MODEL` is non-empty — in the highest settings layer's `env` block, else in the process environment — so `claude` skips the restore | `model: default` | `default` |
 | `NoSessionModel` | a reply or fork whose transcript records no answering model: nothing to restore | `model: default` | `default` |
 | `Settings(value)` | a draft whose `claude` settings name a model | `model: default (<value>) (new sessions only)` | `default (<value>) (settings)` |
@@ -3126,9 +3132,10 @@ value — `default` included — is drawn in `MODEL_LABEL_STYLE` magenta, and th
 their words rather than by colour. The label is the compose's state for its whole
 lifetime, so it renders on the box and never on `App::status`.
 
-**Known limits — the label is display-only.** With no pick snapback sends no
-`--model`, so a wrong label never changes the argv or what runs; it only
-misnames it. The cases it is known to misname, each a `claude` rule
+**Known limits — the label's MODEL is display-only.** With no pick snapback sends no
+`--model`, so a wrong model in the label never changes the argv or what runs; it
+only misnames it. (The effort in the label is not display-only: it is exactly what
+`--effort` carries.) The cases it is known to misname, each a `claude` rule
 ([CLAUDE_CLI.md](CLAUDE_CLI.md#which-model-a-launch-runs-on-without---model)) that
 snapback does not model, include the following (a fork box's label is a reply's,
 so every reply case holds for it too):
@@ -3171,6 +3178,45 @@ resolves it and the flag is the later word. The probed alias list and the settin
 answers are derived, in-memory state about ANOTHER program — memoized for the
 process and re-read per board session respectively — and are written nowhere
 either.
+
+#### The session's carried effort
+
+With NO pick, the reply, the fork box's `Enter` and its `Ctrl-O` send
+`--effort <level>` — and no `--model`, since `claude` restores the model itself and
+an effort-only flag does not stop it (probed, claude 2.1.322:
+[CLAUDE_CLI.md](CLAUDE_CLI.md#effort-levels---effort)). The level is the one the
+session's last answering turn ran at: `store::preview::restorable_turn` returns the
+model label and `record_effort` of the SAME record, and `render_stream` stores them
+together as `RenderedPreview::last_model` / `last_effort`, so a newer answering turn
+that recorded no effort CLEARS an older turn's rather than leaving it standing.
+That is what makes a raised level persist across replies without a re-pick, and
+what leaves a session that was never raised on whatever its last turn recorded.
+
+It is DERIVED, never owned: it is read from the transcript on every load and
+survives a restart because the transcript does; there is no `App` field for it and
+nothing in `sessions.json`. `resolve_compose_default` hands it into
+`ComposeDefault::SessionModel { label, effort }` — only when it is one of
+`resume::EFFORT_LEVELS`, so the label never names a level the launch would not
+send — and `ComposeDefault::carried_effort` is the ONE answer the submit paths
+read (`compose::draft`), which is why a carried effort goes out only when the
+box's default IS the session's own model: an environment override
+(`RestoreOverridden`), a transcript with no answering model (`NoSessionModel`) and
+every draft carry none. A pick wins outright (`resume::push_model_or_carried_effort`):
+a `Ctrl-L` pick with no effort runs at its model's own level, not the old
+session's, which belonged to the model the pick replaced.
+
+The value comes from a file claude wrote, so it is checked where it becomes argv:
+`resume::push_effort_flag` sends it only if it is an exact `EFFORT_LEVELS` entry,
+and anything else — an unknown level, a blank, a value shaped like another flag —
+sends no flag (the skip-bad-input rule; a strange value is never read as a flag of
+claude's own). It is a separate function beside `push_model_flag`, so a
+`ModelPick` still never holds an effort without a model.
+
+Resume, Attach and the Attach/Fork/Cancel choice's Fork keep their structural
+"never carries" rule, so an empty fork box's `Ctrl-O` equals that choice's Fork
+only while the session has no carried effort; with one it adds `--effort`. Out of
+scope and unchanged: `CLAUDE_CODE_EFFORT_LEVEL` in the environment wins over
+`--effort`, so the label may name a level that variable overrides.
 
 ### Compose pick list
 
@@ -3629,7 +3675,7 @@ different mechanism, same verb.
 | --- | --- |
 | Resume | `claude -r <id>` (`<id>` = full `sessionId`) |
 | Fork | `claude -r <id> --fork-session --name "fork: <the session's label>"` (`<id>` = full `sessionId`; see [named forks](#named-forks-the-fork-name-prefix)); the Attach/Fork/Cancel choice's hand-off, model-less |
-| Fork run (`Ctrl-O` in the `Ctrl-F` box) | `claude -r <id> --fork-session --name <name> [--model <alias> [--effort <level>]] [<message>]`; an empty box with no pick is byte-identical to the Fork row's argv |
+| Fork run (`Ctrl-O` in the `Ctrl-F` box) | `claude -r <id> --fork-session --name <name> [--model <alias> [--effort <level>] \| --effort <level>] [<message>]`; an empty box with no pick and no carried effort is byte-identical to the Fork row's argv |
 | Attach | `claude attach <job-id>` (one-shot reattach; `<job-id>` = the **short agent-view id** from `claude agents --json`, **not** the `sessionId`) |
 | New session | `claude [--agent <name>] [--model <alias> [--effort <level>]] [<prompt>]` (interactive launch, no `-r` — mints its own id; started in `App::launch_dir` via `Ctrl-N`, optionally bound to a picked agent, and optionally opening on a drafted `<prompt>` — see [the background draft pane](#background-agent-draft-pane-ctrl-n)) |
 
@@ -3637,22 +3683,26 @@ different mechanism, same verb.
 [compose model pick](#compose-model-pick-ctrl-l)'s table. On this side the
 exclusion is a SIGNATURE, not a match arm: `build_argv(session_id, fork)`,
 `build_fork_argv(session_id, parent_label)`, `build_attach_argv(job_id)` and their
-gates (`check(session, fork)`, `check_attach`) take no model parameter, so no
+gates (`check(session, fork)`, `check_attach`) take no model or effort parameter, so no
 `--model` or `--effort` token can reach a Resume, Fork or Attach argv even by
 mistake. The Fork's `build_fork_argv` is `build_argv`'s fork plus the
 `resume::push_fork_name` an empty box's run appends, named from the session's label
 (`check` reads `session.label`, while `cwd` and `sessionId` stay re-read from the
-file), so the two routes spawn the same argv. The fork box's own run is a SEPARATE
+file), so the two routes spawn the same argv while the session has no carried
+effort. The fork box's own run is a SEPARATE
 action (`SessionAction::ForkRun`, `build_fork_run_argv`, `check_fork_run`) that
-also takes a pick and a message, so the model-less Fork stays model-less. Both
+also takes a pick, the carried effort (`HandoffCtx::carried_effort`) and a message,
+so the model-less Fork stays model-less. Both
 fail in the fork's own words: `check` gives a fork `FORK_NONZERO_HINT` and no race
 probe, from the one `fork` flag its argv is built from. `argv_for` hands
-`ctx.model` to `build_new_argv` and `build_fork_run_argv` alone rather than
+`ctx.model` to `build_new_argv` and `build_fork_run_argv` alone (and `ctx.carried_effort` to `build_fork_run_argv` alone) rather than
 appending the flag
 itself, because it must precede the trailing POSITIONAL prompt and only the
-builder that owns that positional knows where "before it" is. `--effort` rides
+builder that owns that positional knows where "before it" is. A pick's `--effort` rides
 inside the same `push_model_flag` guard, directly after `--model`, so it never
-appears without the model; with no pick the argv is byte-identical to its
+appears without the model; the carried effort goes out through the separate,
+checked `push_effort_flag` (one `push_model_or_carried_effort` per builder, so a
+pick wins); with neither the argv is byte-identical to its
 modelless form. The trim/blank guard is literally SHARED with `--agent`
 (`resume::flag_value`), so a blank pick can never emit a valueless flag, and
 `nonzero_hint_for` selects `MODEL_NONZERO_HINT` from that SAME predicate — a blank
@@ -3722,7 +3772,7 @@ the session's folder and transcript (`compose::completion_source`).
 | Key | Route |
 | --- | --- |
 | `Enter` | headless, over the reply's send path (`compose::submit_fork_with`). A message over `send::COMPOSE_PROMPT_MAX_BYTES` is refused FIRST, before any other step (`compose::submit_compose` → `send::check_prompt_len`: a sticky status naming its size and the limit, the box and its text kept, nothing dispatched, no jump armed). An empty message nudges (`COMPOSE_EMPTY_FORK_HINT`, transient) and keeps the box. Otherwise: re-read the original's authoritative `(cwd, id)` (`send::plan_send`), take ONE fresh id (`send::fresh_session_id`, 16 bytes of `/dev/urandom` through the pure `format_uuid_v4`; a failed read refuses with a sticky status, keeps the box and its text, and dispatches nothing), build `send::build_fork_send_argv`, mark the send in flight under the NEW id, arm the cursor jump, and hand the driver a `SendRequest` keyed by that id. Completion is the reply's `SendFinished`, with its `sent — $…` wording. |
-| `Ctrl-O` | interactive hand-off, `SessionAction::ForkRun` (`update::launch_fork_run` → `resume::check_fork_run`: the same authoritative re-read, no race probe, and a non-zero exit says `MODEL_NONZERO_HINT` when `--model` is really emitted, else `FORK_NONZERO_HINT` — never the resume hint, which would send the user back to `Ctrl-F`). A message over `send::COMPOSE_PROMPT_MAX_BYTES` is refused first, with `Enter`'s same sticky status and the box kept (`compose::open_interactive`, before the hand-off is built). A session gone from the board refuses with `COMPOSE_FORK_SESSION_GONE`. A typed message rides as the trailing positional. No cursor jump. |
+| `Ctrl-O` | interactive hand-off, `SessionAction::ForkRun` (`update::launch_fork_run` → `resume::check_fork_run`: the same authoritative re-read, no race probe, and a non-zero exit says `MODEL_NONZERO_HINT` when `--model` is really emitted (a carried `--effort` alone does not count), else `FORK_NONZERO_HINT` — never the resume hint, which would send the user back to `Ctrl-F`). A message over `send::COMPOSE_PROMPT_MAX_BYTES` is refused first, with `Enter`'s same sticky status and the box kept (`compose::open_interactive`, before the hand-off is built). A session gone from the board refuses with `COMPOSE_FORK_SESSION_GONE`. A typed message rides as the trailing positional. No cursor jump. |
 
 Both argvs, and what claude 2.1.291 was checked and probed for (both forms, the
 `Ctrl-O` message's auto-submit included), are
@@ -3902,7 +3952,7 @@ carries the same row for its own zero-exit downgrade (below).
 ## Quick reply — non-interactive send (`src/send.rs`)
 
 `Ctrl-R` sends a one-shot message to the selected session WITHOUT the teardown
-hand-off above. `claude -p -r <id> --output-format json [--model <alias> [--effort <level>]] "<msg>"`
+hand-off above. `claude -p -r <id> --output-format json [--model <alias> [--effort <level>] | --effort <level>] "<msg>"`
 resumes the
 session non-interactively (its stdio is a pipe, no TTY), replays the full
 context, **appends the exchange in place** to the same `<id>.jsonl` — same
@@ -4045,7 +4095,7 @@ a non-interactive `-p` run — so a [compose pick](#compose-model-pick-ctrl-l) i
 honored for this one reply, its effort included, emitted through the SAME
 `resume::push_model_flag` rather than a second copy of its guard. The identical
 split holds for the fork box's headless fork and the draft's background launch. With no pick the argv carries no
-`--model`, and `claude` normally restores the model the session last answered with
+`--model` (it carries the session's [carried effort](#the-sessions-carried-effort), when it has one), and `claude` normally restores the model the session last answered with
 — the `model: session (<label>)` the box showed, unless an environment override
 made it say `default`.
 

@@ -693,7 +693,8 @@ fn prompt_too_long_refusal(len: usize, limit: usize) -> String {
 }
 
 /// Build the `claude` argv for a one-shot send:
-/// `claude -p -r <id> --output-format json [--model <alias> [--effort <level>]] <message>`.
+/// `claude -p -r <id> --output-format json [--model <alias> [--effort <level>] |
+/// --effort <level>] <message>`.
 ///
 /// A DUMB pure formatter, like [`crate::resume::build_argv`] — no trimming or
 /// validation beyond formatting (the empty-message guard lives at the call site).
@@ -707,8 +708,14 @@ fn prompt_too_long_refusal(len: usize, limit: usize) -> String {
 /// uses, rather than a second copy of its trim/blank guard here, so the two can
 /// never disagree about what a pick means. `None` (no pick: the reply keeps the
 /// session's own model, which claude normally restores) and a blank pick both emit
-/// nothing, leaving this argv byte-identical to the one it has always produced; a
-/// pick with no effort emits `--model` alone.
+/// no `--model`; a pick with no effort emits `--model` alone.
+///
+/// `carried_effort` is the level the session's last turn ran at, which the box
+/// sends when it has NO pick ([`crate::resume::push_model_or_carried_effort`]):
+/// claude restores a session's model on `-r` but not its effort, so without it a
+/// raised level would fall back to the user's settings on the next reply. It is
+/// checked against [`crate::resume::EFFORT_LEVELS`] on the way in; a pick wins over
+/// it. With neither, this argv is byte-identical to the one it has always produced.
 ///
 /// # What a send inherits, and what it does not
 ///
@@ -718,12 +725,15 @@ fn prompt_too_long_refusal(len: usize, limit: usize) -> String {
 /// a deliberate carve-out: it is an explicit, visible choice the user made in the
 /// reply box (and the only way to choose one at all on this path, since the
 /// in-session `/model` command cannot reach a non-interactive `-p` run), so a pick
-/// is honored here and nowhere else — it belongs to this one reply. The same split
+/// is honored here and nowhere else — it belongs to this one reply. The carried
+/// effort is a second carve-out, and the session's own: the level its last turn
+/// recorded, repeated so a raised level survives the reply. The same split
 /// holds for [`build_bg_launch_argv`]; the two must be read together.
 #[must_use]
 pub fn build_send_argv(
     session_id: &str,
     model: Option<&crate::resume::ModelPick>,
+    carried_effort: Option<&str>,
     message: &str,
 ) -> Vec<String> {
     let mut argv = vec![
@@ -734,16 +744,17 @@ pub fn build_send_argv(
         "--output-format".to_string(),
         "json".to_string(),
     ];
-    crate::resume::push_model_flag(&mut argv, model);
+    crate::resume::push_model_or_carried_effort(&mut argv, model, carried_effort);
     argv.push(message.to_string());
     argv
 }
 
 /// Build the `claude` argv for the `Ctrl-F` box's one-shot fork:
 /// `claude -p -r <origin> --fork-session --session-id <fork> --name <name>
-/// --output-format json [--model <alias> [--effort <level>]] <message>`.
+/// --output-format json [--model <alias> [--effort <level>] | --effort <level>]
+/// <message>`.
 ///
-/// [`build_send_argv`] plus the flags that turn the resume into a fork snapback
+/// [`build_send_argv`] (its `carried_effort` included) plus the flags that turn the resume into a fork snapback
 /// chose the id and the name of: `--session-id` is accepted with `--resume` only
 /// alongside `--fork-session` (checked against claude 2.1.291,
 /// `docs/agents/CLAUDE_CLI.md`), and naming the fork's id up front is what lets the
@@ -757,6 +768,7 @@ pub fn build_fork_send_argv(
     origin_id: &str,
     fork_id: &str,
     model: Option<&crate::resume::ModelPick>,
+    carried_effort: Option<&str>,
     message: &str,
     parent_label: &str,
 ) -> Vec<String> {
@@ -772,7 +784,7 @@ pub fn build_fork_send_argv(
     crate::resume::push_fork_name(&mut argv, Some(message), parent_label);
     argv.push("--output-format".to_string());
     argv.push("json".to_string());
-    crate::resume::push_model_flag(&mut argv, model);
+    crate::resume::push_model_or_carried_effort(&mut argv, model, carried_effort);
     argv.push(message.to_string());
     argv
 }
@@ -1943,7 +1955,7 @@ mod tests {
     /// permission flags, the prompt as the trailing positional argument.
     #[test]
     fn argv_is_claude_dash_p_resume_json_for_a_plain_send() {
-        let argv = build_send_argv("abc-123", None, "hello there");
+        let argv = build_send_argv("abc-123", None, None, "hello there");
         assert_eq!(
             argv.join(" "),
             "claude -p -r abc-123 --output-format json hello there"
@@ -1973,7 +1985,7 @@ mod tests {
     /// so a multiline reply reaches claude intact.
     #[test]
     fn argv_keeps_a_multiline_message_as_a_single_argument() {
-        let argv = build_send_argv("id", None, "line one\nline two");
+        let argv = build_send_argv("id", None, None, "line one\nline two");
         assert_eq!(argv.last().map(String::as_str), Some("line one\nline two"));
         assert_eq!(argv.len(), 7, "no extra args from the newline: {argv:?}");
     }
@@ -1983,7 +1995,12 @@ mod tests {
     /// the prompt (the ordering `resume::build_new_argv` argues for).
     #[test]
     fn argv_carries_the_model_pick_before_the_positional_message() {
-        let argv = build_send_argv("abc-123", Some(&ModelPick::new("opus")), "hello there");
+        let argv = build_send_argv(
+            "abc-123",
+            Some(&ModelPick::new("opus")),
+            None,
+            "hello there",
+        );
         assert_eq!(
             argv.join(" "),
             "claude -p -r abc-123 --output-format json --model opus hello there"
@@ -2007,7 +2024,7 @@ mod tests {
     /// `resume::flag_value` guard, shared through `push_model_flag`).
     #[test]
     fn a_blank_or_absent_model_leaves_the_send_argv_untouched() {
-        let bare = build_send_argv("abc-123", None, "hi");
+        let bare = build_send_argv("abc-123", None, None, "hi");
         assert_eq!(
             bare.join(" "),
             "claude -p -r abc-123 --output-format json hi"
@@ -2019,14 +2036,14 @@ mod tests {
                 effort: Some("high"),
             };
             assert_eq!(
-                build_send_argv("abc-123", Some(&pick), "hi"),
+                build_send_argv("abc-123", Some(&pick), None, "hi"),
                 bare,
                 "a blank model {blank:?} must emit nothing at all"
             );
         }
         // And a value that survives is TRIMMED into the argv, never padded.
         assert_eq!(
-            build_send_argv("abc-123", Some(&ModelPick::new("  sonnet  ")), "hi").join(" "),
+            build_send_argv("abc-123", Some(&ModelPick::new("  sonnet  ")), None, "hi").join(" "),
             "claude -p -r abc-123 --output-format json --model sonnet hi"
         );
     }
@@ -2040,7 +2057,7 @@ mod tests {
             model: "opus".to_string(),
             effort: Some("medium"),
         };
-        let argv = build_send_argv("abc-123", Some(&pick), "hello there");
+        let argv = build_send_argv("abc-123", Some(&pick), None, "hello there");
         assert_eq!(
             argv.join(" "),
             "claude -p -r abc-123 --output-format json --model opus --effort medium hello there"
@@ -2050,12 +2067,91 @@ mod tests {
             Some("hello there"),
             "the message stays the trailing positional: {argv:?}"
         );
-        let no_effort = build_send_argv("abc-123", Some(&ModelPick::new("opus")), "hello there");
+        let no_effort = build_send_argv(
+            "abc-123",
+            Some(&ModelPick::new("opus")),
+            None,
+            "hello there",
+        );
         assert_eq!(
             no_effort.join(" "),
             "claude -p -r abc-123 --output-format json --model opus hello there"
         );
         assert!(!no_effort.iter().any(|arg| arg == "--effort"));
+    }
+
+    /// The reply carries the session's effort as `--effort <level>` when no model is
+    /// picked, ahead of the positional message and with no `--model` beside it
+    /// (claude restores the session's model on its own). A pick wins over it, a
+    /// level this build does not know sends nothing, and a level shaped like a flag
+    /// is never read as one.
+    #[test]
+    fn the_reply_carries_the_session_effort_before_the_message_unless_picked_over() {
+        let argv = build_send_argv("abc-123", None, Some("xhigh"), "hello there");
+        assert_eq!(
+            argv.join(" "),
+            "claude -p -r abc-123 --output-format json --effort xhigh hello there"
+        );
+        assert_eq!(argv.iter().position(|a| a == "--effort"), Some(6));
+        assert_eq!(argv.last().map(String::as_str), Some("hello there"));
+        assert!(!argv.iter().any(|a| a == "--model"));
+
+        assert_eq!(
+            build_send_argv(
+                "abc-123",
+                Some(&ModelPick::new("sonnet")),
+                Some("xhigh"),
+                "hi"
+            )
+            .join(" "),
+            "claude -p -r abc-123 --output-format json --model sonnet hi",
+            "a pick without an effort still wins over the carried one"
+        );
+        let picked = ModelPick {
+            model: "sonnet".to_string(),
+            effort: Some("low"),
+        };
+        assert_eq!(
+            build_send_argv("abc-123", Some(&picked), Some("xhigh"), "hi").join(" "),
+            "claude -p -r abc-123 --output-format json --model sonnet --effort low hi"
+        );
+        for strange in ["ultra", "", "--model", "high --model opus"] {
+            assert_eq!(
+                build_send_argv("abc-123", None, Some(strange), "hi"),
+                build_send_argv("abc-123", None, None, "hi"),
+                "{strange:?} must send no flag"
+            );
+        }
+    }
+
+    /// The fork box's `Enter` carries it the same way: after `--output-format json`,
+    /// before the message, none when picked over or strange.
+    #[test]
+    fn the_fork_send_carries_the_session_effort_before_the_message_unless_picked_over() {
+        assert_eq!(
+            build_fork_send_argv("orig", "new-id", None, Some("max"), "hello", "parent").join(" "),
+            "claude -p -r orig --fork-session --session-id new-id --name fork: hello \
+             --output-format json --effort max hello"
+        );
+        let pick = ModelPick::new("opus");
+        assert_eq!(
+            build_fork_send_argv(
+                "orig",
+                "new-id",
+                Some(&pick),
+                Some("max"),
+                "hello",
+                "parent"
+            )
+            .join(" "),
+            "claude -p -r orig --fork-session --session-id new-id --name fork: hello \
+             --output-format json --model opus hello"
+        );
+        assert_eq!(
+            build_fork_send_argv("orig", "new-id", None, Some("sure"), "hello", "parent"),
+            build_fork_send_argv("orig", "new-id", None, None, "hello", "parent"),
+            "an unknown level sends no flag"
+        );
     }
 
     /// A successful payload surfaces `total_cost_usd` in the status (the whole
@@ -3830,12 +3926,12 @@ mod tests {
             effort: Some("high"),
         };
         assert_eq!(
-            build_fork_send_argv("orig", "new-id", Some(&pick), "hello", "parent").join(" "),
+            build_fork_send_argv("orig", "new-id", Some(&pick), None, "hello", "parent").join(" "),
             "claude -p -r orig --fork-session --session-id new-id --name fork: hello \
              --output-format json --model opus --effort high hello"
         );
         assert_eq!(
-            build_fork_send_argv("orig", "new-id", None, "hello", "parent").join(" "),
+            build_fork_send_argv("orig", "new-id", None, None, "hello", "parent").join(" "),
             "claude -p -r orig --fork-session --session-id new-id --name fork: hello \
              --output-format json hello"
         );
@@ -3847,7 +3943,7 @@ mod tests {
     #[test]
     fn the_fork_send_name_is_a_fork_name_ahead_of_the_message() {
         let message = "\n  Review PR1  \nthen the rest of the brief";
-        let argv = build_fork_send_argv("orig", "new-id", None, message, "parent");
+        let argv = build_fork_send_argv("orig", "new-id", None, None, message, "parent");
         let at = argv
             .iter()
             .position(|a| a == "--name")

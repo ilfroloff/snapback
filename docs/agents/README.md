@@ -39,7 +39,8 @@ find the same rule in two places, that is a bug to fix.
    release-plz automation, and the pre-finish validation checklist.
 6. [CLAUDE_CLI.md](CLAUDE_CLI.md) — **the external `claude` binary**: version
    pin, the argv `snapback` spawns (including where a compose's `Ctrl-L` pick
-   places `--model` / `--effort`), the one effect that is not a `claude`
+   places `--model` / `--effort`, and where a session's carried `--effort` goes),
+   the one effect that is not a `claude`
    invocation (a `kill(2)` on a pid `claude agents --json` reported), top-level
    flags, commands, the `--model` alias set (which `claude --help` reports
    incompletely, so it is captured from the binary instead — a point-in-time

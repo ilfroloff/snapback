@@ -123,23 +123,34 @@ one place.
   [DOMAIN.md](docs/agents/DOMAIN.md#snapback-owned-state-srchiddenrs).
   (`src/config.rs`; `src/hidden.rs`; the persist and reload paths in
   `src/tui/app.rs`)
-- **A MODEL IS PICKED PER COMPOSE, NEVER PER BOARD.** `--model`/`--effort` reach
-  `claude` ONLY from an explicit `Ctrl-L` pick inside a compose box, and only on
-  that compose's own launch: the `Ctrl-R` quick reply, the `Ctrl-F` fork box's
+- **A MODEL IS PICKED PER COMPOSE, NEVER PER BOARD.** `--model` reaches `claude`
+  ONLY from an explicit `Ctrl-L` pick inside a compose box, and only on that
+  compose's own launch: the `Ctrl-R` quick reply, the `Ctrl-F` fork box's
   headless `Enter` / `Ctrl-O` run, or the `Ctrl-N` draft's `--bg` launch /
   `Ctrl-O` run. Resume (`Enter`), Attach, the Attach/Fork/Cancel choice's Fork
   and Move (`Ctrl-X w`, a headless `set_cwd` control request, no model turn)
-  NEVER carry one, structurally: `build_argv`, `build_fork_argv`,
-  `build_attach_argv` and `build_set_cwd_argv` take no pick. The agent picker's `Ctrl-O` skips the
-  compose, so `launch_pick_interactively` has no pick and hands `None` on to
-  `build_new_argv`; that builder and `build_fork_run_argv` (the fork box's own
-  `SessionAction::ForkRun`) are the only hand-off builders that take one. An
-  effort rides only INSIDE a pick (`ModelPick`), never alone. The pick is
-  `ComposeState::model`, `None` in every new compose, and dies with it: no
-  board-wide pick, no launch flag, nothing persisted. Why, and where each launch
-  gets its model: [DOMAIN.md](docs/agents/DOMAIN.md#compose-model-pick-ctrl-l).
+  NEVER carry a model or an effort, structurally: `build_argv`, `build_fork_argv`,
+  `build_attach_argv` and `build_set_cwd_argv` take no pick and no effort. The
+  agent picker's `Ctrl-O` skips the compose, so `launch_pick_interactively` has no
+  pick and hands `None` on to `build_new_argv`; that builder and
+  `build_fork_run_argv` (the fork box's own `SessionAction::ForkRun`) are the only
+  hand-off builders that take a pick. A PICK's effort rides only INSIDE it
+  (`ModelPick`), never alone. The ONE other effort is the session's CARRIED one:
+  with no pick, the `Ctrl-R` reply, the fork box's `Enter` and its `Ctrl-O` send
+  `--effort <level>` alone (no `--model`), the level the session's last answering
+  turn recorded, and only when the box's default is `ComposeDefault::SessionModel`
+  (an override or no answering model carries nothing, and a pick wins outright).
+  It is derived from the transcript on every load
+  (`RenderedPreview::last_effort`, the pass that sets `last_model`), held nowhere
+  (no `App` field, nothing in `sessions.json`), and sent only through the CHECKED
+  `resume::push_effort_flag`: a level outside `resume::EFFORT_LEVELS` sends no
+  flag. The pick is `ComposeState::model`, `None` in every new compose, and dies
+  with it: no board-wide pick, no launch flag, nothing persisted. Why, and where
+  each launch gets its model and effort:
+  [DOMAIN.md](docs/agents/DOMAIN.md#compose-model-pick-ctrl-l).
   (`src/resume.rs`; `src/send.rs`; `src/claude_move.rs`; `src/tui/compose.rs`;
-  `launch_pick_interactively` in `src/tui/update.rs`)
+  `src/tui/app.rs`, where the default and its effort resolve; `src/store/preview.rs`,
+  where the carried effort is read; `launch_pick_interactively` in `src/tui/update.rs`)
 - **STORE WRITES ARE GATED, AND ALL BUT ONE ARE DELEGATED.** The only mutation
   `snapback` itself performs on `~/.claude/projects` is hard delete (`Ctrl-X d`),
   behind BOTH a confirmation modal AND the pure `can_delete_target` WRITER guard.

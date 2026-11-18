@@ -45,9 +45,9 @@ use crate::store::subagents::{Subagent, SubagentRecord, SubagentStatus};
 use crate::store::{lineage, FailedTask};
 
 use super::app::{
-    resolve_list_width, App, ComposeDefault, ContentPos, InterruptRoute, Modal, ModalAction,
-    ModalChoice, ModalLayout, NewSessionDraft, PaneLayout, PreviewSelection, Row, Scope,
-    SelectionUnit, MODEL_DEFAULT_LABEL, MODEL_NEW_SESSION_SCOPE,
+    resolve_list_width, session_model_text, App, ComposeDefault, ContentPos, InterruptRoute, Modal,
+    ModalAction, ModalChoice, ModalLayout, NewSessionDraft, PaneLayout, PreviewSelection, Row,
+    Scope, SelectionUnit, MODEL_DEFAULT_LABEL, MODEL_EFFORT_SEPARATOR, MODEL_NEW_SESSION_SCOPE,
 };
 use super::complete::{Candidate, COMPLETION_VISIBLE_ROWS};
 use super::compose::{ComposeState, ComposeTarget};
@@ -156,14 +156,6 @@ const MODEL_LABEL_STYLE: Style = Style::new().fg(Color::Magenta);
 const MATCH_HIGHLIGHT_STYLE: Style = Style::new()
     .fg(Color::LightBlue)
     .add_modifier(Modifier::BOLD);
-
-/// What joins a model and its effort — `opus · high` — in a compose's `model:`
-/// label and on a model-picker row. The middot with ONE space either side is the
-/// preview's turn marker separator (`● claude · Opus 5.5 · xhigh`), so a picked
-/// effort reads exactly like the effort a turn records; it is deliberately tighter
-/// than [`HEADER_SEPARATOR`], which parts whole header SEGMENTS rather than the two
-/// halves of one value.
-const MODEL_EFFORT_SEPARATOR: &str = " · ";
 
 /// What a compose's `model:` label calls a REPLY's default — the model its session
 /// last answered with, which claude normally restores with no `--model`:
@@ -689,7 +681,9 @@ fn model_pick_label(pick: &ModelPick) -> String {
 /// * A pick reads `model: <alias>` or `model: <alias> · <effort>`
 ///   ([`model_pick_label`]).
 /// * A reply's default reads `model: session (<model>)` — the model its session
-///   last answered with, which claude normally restores — or `model: default` when
+///   last answered with, which claude normally restores — or `model: session
+///   (<model> · <effort>)` when that turn recorded a known effort, which the launch
+///   then sends as `--effort`; or `model: default` when
 ///   claude would not restore it (an environment override, or no answering model
 ///   on record).
 /// * A draft's default reads `model: default (<value>) (new sessions only)` with the
@@ -709,8 +703,11 @@ fn compose_model_label(pick: Option<&ModelPick>, default: &ComposeDefault) -> Li
     let mut spans = vec![Span::raw(" model: ")];
     match (pick, default) {
         (Some(pick), _) => spans.push(Span::styled(model_pick_label(pick), MODEL_LABEL_STYLE)),
-        (None, ComposeDefault::SessionModel(label)) => spans.push(Span::styled(
-            format!("{MODEL_SESSION_LABEL} ({label})"),
+        (None, ComposeDefault::SessionModel { label, effort }) => spans.push(Span::styled(
+            format!(
+                "{MODEL_SESSION_LABEL} ({})",
+                session_model_text(label, *effort)
+            ),
             MODEL_LABEL_STYLE,
         )),
         (None, ComposeDefault::Settings(value)) => {
@@ -7206,10 +7203,31 @@ mod tests {
         // A reply's default: the session's own model, or `default` when claude
         // would not restore it.
         assert_eq!(
-            label(None, ComposeDefault::SessionModel("Opus 5.5".to_string())),
+            label(
+                None,
+                ComposeDefault::SessionModel {
+                    label: "Opus 5.5".to_string(),
+                    effort: None,
+                }
+            ),
             vec![
                 Span::raw(" model: "),
                 Span::styled("session (Opus 5.5)", magenta),
+                Span::raw(" "),
+            ]
+        );
+        // ...with the effort its last turn ran at, which the launch then sends.
+        assert_eq!(
+            label(
+                None,
+                ComposeDefault::SessionModel {
+                    label: "Opus 5.5".to_string(),
+                    effort: Some("xhigh"),
+                }
+            ),
+            vec![
+                Span::raw(" model: "),
+                Span::styled("session (Opus 5.5 \u{b7} xhigh)", magenta),
                 Span::raw(" "),
             ]
         );
@@ -7241,7 +7259,10 @@ mod tests {
         );
         // A pick replaces whichever default, with its effort after it.
         for default in [
-            ComposeDefault::SessionModel("Opus 5.5".to_string()),
+            ComposeDefault::SessionModel {
+                label: "Opus 5.5".to_string(),
+                effort: None,
+            },
             ComposeDefault::Settings("opus[1m]".to_string()),
         ] {
             assert_eq!(

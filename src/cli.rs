@@ -64,7 +64,8 @@ KEYS:
                   cursor opens the fold and jumps to the fork when it appears if
                   you haven't moved and nothing else is open (another box, a
                   picker or a prompt); Ctrl-O forks it interactively (an empty box
-                  is a plain fork; the message auto-submits), Ctrl-L picks the
+                  is a plain fork, plus --effort when the session's last turn
+                  recorded one; the message auto-submits), Ctrl-L picks the
                   model, Ctrl-J or Alt+Enter newline, Esc cancels, and / or @
                   opens the pick list (below). Either way the fork is named
                   'fork: <first line of the message>' ('fork: <session label>'
@@ -137,16 +138,17 @@ KEYS:
     Ctrl-L        in a reply, fork or draft box: pick the model, and optionally the
                   effort, for THIS message only. The box names what it will run
                   on — a reply or fork 'model: session (<model>)', the model its session
-                  last answered with, which claude keeps by itself; a draft
-                  'model: default (<value>) (new sessions only)', from your
-                  claude settings — and --model/--effort are sent only when you
-                  pick something else. With ANTHROPIC_MODEL or an
+                  last answered with, which claude keeps by itself (with an
+                  ' · <effort>' when that turn recorded one, sent as --effort
+                  alone); a draft 'model: default (<value>) (new sessions
+                  only)', from your claude settings — and --model is sent only
+                  when you pick something else. With ANTHROPIC_MODEL or an
                   ANTHROPIC_DEFAULT_*_MODEL set, claude does not restore the
                   session's model, so a reply says 'model: default'. The first
                   row goes back to the default; every new box starts there and
                   nothing is remembered. Enter (resume), the Attach/Fork
-                  choice, Attach and the Ctrl-X w move never send a model, and
-                  claude does not keep an effort for a later resume
+                  choice, Attach and the Ctrl-X w move never send a model or an
+                  effort, and claude does not keep an effort for a later resume
     ←/→           in the model picker: step the highlighted model's effort
                   through default → low → medium → high → xhigh → max, wrapping,
                   sent as --effort beside --model; Enter sets both into the box,
