@@ -5,7 +5,8 @@
 # parser reads (docs/agents/CLAUDE_CLI.md "How snapback drives `claude`"):
 #
 #   agents --json [--all]           cat $HOME/agents.json
-#   stop <job-id>                   mark that job stopped in $HOME/agents.json
+#   stop <job-id>                   mark that job stopped in $HOME/agents.json,
+#                                   dropping its `status` and `waitingFor`
 #   -p -r <id> … <message>          quick reply: append reply.jsonl to <id>
 #   -p -r <id> --fork-session --session-id <new> --name <name> … <message>
 #                                   headless fork: write <new>.jsonl beside <id>,
@@ -112,7 +113,8 @@ agents)
   ;;
 stop)
   tmp="$agents.tmp"
-  sed "s/\"state\":\"[a-z]*\"\(,\"id\":\"$2\"\)/\"state\":\"stopped\"\1/" "$agents" >"$tmp" && mv "$tmp" "$agents"
+  # A stopped job's record keeps neither `status` nor `waitingFor` (DOMAIN.md, Sample H).
+  sed "/\"id\":\"$2\"/{s/\"state\":\"[a-z]*\"/\"state\":\"stopped\"/;s/\"status\":\"[a-z]*\",//;s/\"waitingFor\":\"[^\"]*\",//;}" "$agents" >"$tmp" && mv "$tmp" "$agents"
   ;;
 -p)
   session="" forked="" name="" forking=false streaming=false

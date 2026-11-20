@@ -314,7 +314,13 @@ it. Follow this split when adding behavior:
   column is left for the name) / `fit_child_markers` (which of a child row's
   `[task failed]` / `[unbound]` / `[hidden]` fit, in that order, each dropped
   whole; a named fork's are decided before its name, an unnamed member's after
-  its id and count) / `compose_model_label` (a compose box's
+  its id and count) / `child_tail` (a child row's whole tail after the badge
+  gap, the two rules above as ONE pure fn of the row's facts, so the row can
+  be fitted again beside a reason without the markers noticing) /
+  `fit_waiting_reason` (the ` · reason` a `needs input` row draws, fitted into
+  what every other field leaves: cut, then dropped, never the label's or a
+  marker's columns; `fill_reason_slot` runs it LAST on the row's spans) /
+  `compose_model_label` (a compose box's
   bottom-border `model:` label, wording AND styling as spans: the value — a pick,
   `session (<label>)`, `default (<value>)` or `default` — in `MODEL_LABEL_STYLE`,
   the prefix and the `(new sessions only)` scope unstyled) / `model_pick_label` (a
@@ -1732,7 +1738,8 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    move-to-worktree picker, `↓` open the subagent view or leave it, `?` open the
    key map, anything else cancels), the "stop the
    waiting agent?" confirmation via `App.pending_stop` (a plain Enter/Esc gate
-   before compose, for the `needs input` quick-reply path), its `Ctrl-K` sibling
+   before compose, for the quick-reply path of a `needs input` agent that is not
+   registry-only, `agents::is_registry_only`), its `Ctrl-K` sibling
    `App.pending_interrupt` (the same Enter/Esc gate, but resolving to a bare
    `Outcome::Interrupt` on the job-id route, or — after a re-probe — to
    `Outcome::Signal` on the pid route, rather than into compose), and the compose
