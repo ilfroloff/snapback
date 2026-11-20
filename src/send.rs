@@ -298,10 +298,9 @@ pub fn resume_in_flight_refusal(send_in_flight: bool) -> Option<&'static str> {
 /// [`AgentActivity::Ended`], even though both badge steady. The difference is
 /// EVIDENCE: `Ended` is claude reporting a terminal token, so "the job is over" is
 /// claude's own answer, while `WorkingButIdle` is snapback INFERRING it from a
-/// `state`/`status` contradiction whose documented false positive is a healthy
-/// agent caught mid-flip (it self-heals on the next poll). Acting on that inference
-/// would stop live work on a guess, so the bucket stays display-only exactly as its
-/// own docs promise.
+/// working `state` beside an `idle` `status` (DOMAIN.md, "Activity buckets").
+/// Acting on that inference could stop live work on a guess, so the bucket never
+/// routes a stop here.
 #[must_use]
 pub fn reply_gate(record: Option<&ReportedAgent>) -> ReplyGate {
     let Some(agent) = record else {
@@ -316,8 +315,8 @@ pub fn reply_gate(record: Option<&ReportedAgent>) -> ReplyGate {
         AgentActivity::Done | AgentActivity::Ended => ReplyGate::StopThenReply { job_id },
         AgentActivity::NeedsInput => ReplyGate::ConfirmStopThenReply { job_id },
         // `WorkingButIdle` refuses WITH the live states: claude's agent list still
-        // reports it as working, and the contradiction is a display inference, not
-        // proof the turn ended (see this function's docs).
+        // reports it as working, and the pair is an inference, not proof the turn
+        // ended (see this function's docs).
         AgentActivity::Working
         | AgentActivity::WorkingButIdle
         | AgentActivity::Idle
@@ -461,10 +460,11 @@ pub enum InterruptGate {
 ///
 /// [`AgentActivity::WorkingButIdle`] CONFIRMS rather than stopping immediately, for
 /// the same evidence gap [`reply_gate`] documents: `Ended` is claude's own terminal
-/// token, whereas the interrupted bucket is inferred from a contradiction that can
-/// legitimately catch a healthy agent mid-flip. Skipping the confirm here would kill
-/// live work on that false positive with no way back; the confirm costs one keypress
-/// and is exactly the safety net for a bucket that cannot prove its own cause.
+/// token, whereas the interrupted bucket is inferred from a working `state` beside
+/// an `idle` `status` that does not rule out a live agent (DOMAIN.md, "Activity
+/// buckets"). Skipping the confirm here could stop live work on that inference
+/// with no way back; the confirm costs one keypress and is exactly the safety net
+/// for a bucket that cannot prove its own cause.
 #[must_use]
 pub fn interrupt_gate(record: Option<&ReportedAgent>, own_pid: u32) -> InterruptGate {
     let Some(agent) = record else {
@@ -2960,13 +2960,13 @@ mod tests {
     ///
     /// `Ended` is claude reporting a terminal token, so both gates act on it
     /// unprompted. `WorkingButIdle` is snapback INFERRING the same thing from a
-    /// `state`/`status` contradiction whose documented false positive is a healthy
-    /// agent caught mid-flip — so it routes with the LIVE states instead: the reply
-    /// gate refuses it, and the interrupt gate confirms first. Granting it `Ended`'s
-    /// treatment would stop live work on a guess, with no undo.
+    /// working-beside-idle pair (DOMAIN.md, "Activity buckets") — so it routes
+    /// with the LIVE states instead: the reply gate refuses it, and the interrupt
+    /// gate confirms first. Granting it `Ended`'s treatment could stop live work on
+    /// a guess, with no undo.
     #[test]
     fn the_interrupted_bucket_gates_as_live_while_ended_gates_as_over() {
-        // The contradiction shape: a working `state` its own `status` calls `idle`.
+        // The interrupted shape: a working `state` its own `status` calls `idle`.
         let interrupted = ReportedAgent {
             kind: "background".to_string(),
             id: Some("job-9".to_string()),

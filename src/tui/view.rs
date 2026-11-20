@@ -1299,7 +1299,7 @@ pub(crate) fn badge_color(agent: &ReportedAgent) -> Color {
         // ended, so it must not read as a clean finish. See [`BADGE_ENDED`].
         AgentActivity::Ended => BADGE_ENDED,
         // Gray is the working base, and the interrupted bucket shares it: it IS a
-        // working `state`, only one claude's own `status` contradicts. It renders
+        // working `state`, only one the session's own `status` does not back. It renders
         // the same gray but STEADY (see `is_active`), so the missing pulse — not a
         // second color — is what tells it apart from a genuinely churning agent.
         // That is the split from `Ended` above: same rest, different cause, so it
@@ -22275,7 +22275,7 @@ going until a third line | alice |\n\
     ///
     /// Returns the whole [`ReportedAgent`] rather than a lone qualifier because
     /// [`AgentActivity::WorkingButIdle`] is read from the raw `state`/`status`
-    /// PAIR (a working `state` contradicted by an `idle` `status`), which a
+    /// PAIR (a working `state` beside an `idle` `status`), which a
     /// single qualifier token cannot express.
     ///
     /// EXHAUSTIVE on purpose: adding an `AgentActivity` bucket fails to compile

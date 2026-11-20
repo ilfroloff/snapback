@@ -238,9 +238,11 @@ red `!` beside its yellow tag.
   The word beside the badge says which.
 - **gray, pulsing** — working right now, or reporting a state this version doesn't
   recognize (shown as busy rather than hidden behind a steady dot).
-- **gray, steady** — **interrupted**: a background agent Claude Code still lists
-  as working while its own status for it reads idle, so the badge holds still
-  instead of pulsing as if a turn were in flight.
+- **gray, steady** — **interrupted**: a background agent whose job Claude Code
+  lists as working while the session's own status reads idle, so the badge holds
+  still instead of pulsing as if a turn were in flight. snapback cannot tell
+  whether it was interrupted, is resting for another reason, or will write again,
+  so the word names a guess, not a report.
 - **dim gray, steady** — the agent has ended: it was stopped or its run failed.
   The word beside the badge says which.
 
@@ -310,17 +312,17 @@ write in the session, the pinned row quotes that failure instead of naming the t
 The session's *status* in words is on the list row instead, as the word beside the
 badge, and in the preview's title (see *Readable transcript preview*). It reports
 what Claude Code reports, in Claude Code's own words, with two exceptions. The two
-states that both mean *the session is waiting on you*
-(`blocked` and `waiting`) are spelled out as `needs input`. And a background agent
-Claude Code still calls `working` while its own status reads `idle` — the shape of
-one that was interrupted and never cleaned up — is labelled `interrupted` (Claude
-Code's own word) and held steady. Anything else is passed through as-is rather
-than guessed at. That status reaches the pinned row on its own only when the
-transcript has no turn to name at all — an empty one, or a session file that can
-no longer be read — the one case the preview leads with words rather than with a
-turn (a session without a badge has no status to show, so its row stays blank
-then). Beside a turn, it appears only for an agent that is still running — one
-Claude Code reports a process id for (below).
+states that both mean *the session is waiting on you* (`blocked` and `waiting`) are
+spelled out as `needs input`. And a background agent whose job Claude Code calls
+`working` while the session's own status reads `idle` — which may mean it was
+interrupted, is resting for another reason, or will carry on later — is labelled
+`interrupted` and held steady. Anything else is passed through as-is rather than
+guessed at. That status reaches the pinned row on its own only when the
+transcript has no turn to name at all — an empty one, or a session file that can no
+longer be read — the one case the preview leads with words rather than with a turn
+(a session without a badge has no status to show, so its row stays blank then).
+Beside a turn, it appears only for an agent that is still running — one Claude Code
+reports a process id for (below).
 
 When Claude Code reports when the session started, the pinned row also says how
 long ago that was, as of the board's last check. For a running agent the status
@@ -587,9 +589,9 @@ this version doesn't recognize. So is a session with no background job to stop
 first, such as a `live` one. The refusal suggests `Ctrl-K` to stop it or Fork
 (`Ctrl-X f`) to branch a copy; on a background agent, `Enter`'s **Attach** still
 reconnects you to it. `interrupted` refuses on purpose even though it
-sits still: that badge is snapback's *inference* from Claude Code contradicting
-itself, not a report that the run ended, and it isn't worth stopping live work over
-a guess. Use `Ctrl-K` if you do want it stopped — it will ask first.
+sits still: that badge is snapback's *inference* from a `working` job beside an `idle`
+session, not a report that the run ended, and it isn't worth stopping an agent
+that may still be working over a guess. Use `Ctrl-K` if you do want it stopped — it will ask first.
 
 **Fork without leaving the board.** `Ctrl-X f` opens a fork box on the selected
 session — any session, running or not, since a fork never disturbs the original;
@@ -743,24 +745,27 @@ the modal `F1` opens.
   What it refuses is a session something might be **writing**: a `live` one
   (whatever runs behind it, an interactive Claude Code session or a `claude -p`
   reply still in progress, can append to the transcript), a background agent
-  Claude Code still has up — working
-  a turn, sitting idle between turns, or reporting something snapback can't read
-  (an unreadable signal never gets to authorize an irreversible delete) — or one
-  snapback itself still has a reply, a fork or a move in progress on. A quick
-  reply (`Ctrl-R`) keeps writing after the board comes back, so a delete aimed at
-  that session waits until the reply has landed; the same goes for a new fork
-  from the `Ctrl-X f` box's `Enter`, while the session it was forked from is not
-  held up. One aimed at a session `Ctrl-X w` is moving is refused until the move
-  finishes. Fair game is a background agent that isn't churning: one
-  *waiting on you*, one Claude Code still reports as working while its own status
-  reads idle (**interrupted**), or one that has reported it finished. Claude Code
-  keeps listing agents long after they go quiet, and refusing all of them made
-  delete useless for almost every row on the board. Two things worth knowing before you
-  confirm, and the prompt says both: removing the transcript doesn't stop the
-  agent — it stays in Claude Code until you stop it there — and if you later
-  attach to it and reply, a new transcript is written under that session. In a
-  lineage, members that are still running are skipped and the rest are deleted;
-  the board reports the split.
+  Claude Code still has up — working a turn, sitting idle between turns, marked
+  `interrupted` (snapback cannot tell whether it was interrupted, is resting for
+  another reason, or will write again on its own), or reporting something
+  snapback can't read (an unreadable signal never gets to authorize an
+  irreversible delete) — or one snapback itself still has a
+  reply, a fork or a move in progress on. For a background agent that is still up,
+  the refusal points at `Ctrl-K` (it asks first) or at stopping it in Claude Code,
+  or you can let it finish. A quick reply (`Ctrl-R`) keeps writing
+  after the board comes back, so a delete aimed at that session waits until the
+  reply has landed; the same goes for a new fork from the `Ctrl-X f` box's `Enter`,
+  while the session it was forked from is not held up. One aimed at a session
+  `Ctrl-X w` is moving is refused until the move finishes. Fair game is a
+  background agent that is waiting or finished: one *waiting on you*, or one
+  that has reported it finished (`done`, `stopped` or `failed`). Claude Code keeps listing
+  agents long after they go quiet, and refusing all of them made delete useless
+  for almost every row on the board. Two things worth knowing before you confirm,
+  and the prompt says both: removing the transcript doesn't stop the agent — it
+  stays in Claude Code until you stop it there — and if you later attach to it and
+  reply, a new transcript is written under that session. In a lineage, members
+  that are still running are skipped and the rest are deleted; the board reports
+  the split.
 
   A lineage delete takes the whole family, including the named forks under the
   session and any copies you've hidden — hiding is a visibility choice, so it

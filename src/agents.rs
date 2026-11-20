@@ -147,8 +147,8 @@ const QUALIFIER_DONE: &str = "done";
 ///
 /// Distinct from the OTHER steady background bucket,
 /// [`AgentActivity::WorkingButIdle`]: this one is claude REPORTING a terminal token
-/// outright, while that one is inferred from a `state`/`status` contradiction claude
-/// never reconciled. Different causes, different colors, both steady.
+/// outright, while that one is inferred from a working `state` beside an `idle`
+/// `status`. Different causes, different colors, both steady.
 const QUALIFIER_STOPPED: &str = "stopped";
 
 /// The `state`/`status` value for a background agent whose run FAILED.
@@ -172,18 +172,16 @@ const NEEDS_INPUT_COPY: &str = "needs input";
 
 /// User-facing copy for [`AgentActivity::WorkingButIdle`] — the SECOND
 /// translated bucket, and the only one with no single claude token behind it:
-/// there is no `interrupted` qualifier on the wire, so this names the CONTRADICTION
+/// there is no `interrupted` qualifier on the wire, so this names the PAIR
 /// snapback detected (a working `state` its own `status` calls `idle`) rather
 /// than restating either half of the pair (which would read as a bare, endless
 /// `working`).
 ///
-/// The word is the product owner's, chosen to match claude's own vocabulary —
-/// "interrupted" is the term claude uses for a background agent that was stopped,
-/// so it is the phrasing users already recognize. It deliberately reads as a
-/// CAUSE the raw signal cannot prove; the accepted false-positive risk (a healthy
-/// agent briefly at `working`/`idle`) is documented in DOMAIN.md, and the
-/// internal enum name stays descriptive ([`AgentActivity::WorkingButIdle`]) so
-/// the code never asserts that cause.
+/// The word is the product owner's; whether claude's own UI uses it for THIS pair
+/// is undetermined. It deliberately reads as a CAUSE the raw
+/// signal cannot prove: DOMAIN.md ("Activity buckets") says what the pair does
+/// show and what it leaves undetermined. The internal enum name stays descriptive
+/// ([`AgentActivity::WorkingButIdle`]) so the code never asserts that cause.
 const INTERRUPTED_COPY: &str = "interrupted";
 
 /// Milliseconds per second. `startedAt` arrives as epoch MILLISECONDS
@@ -395,14 +393,13 @@ impl ReportedAgent {
 ///   * **"how should a stop be routed?"** — the `Ctrl-R` / `Ctrl-K` gates
 ///     ([`crate::send::reply_gate`], [`crate::send::interrupt_gate`]).
 ///
-/// [`AgentActivity::WorkingButIdle`] is the sharp edge, and the two consumers
-/// deliberately read it DIFFERENTLY. In the send gates it is granted no action of
-/// its own — it rides with the LIVE states, so nothing acts on a guess. In the
-/// writer guard it is an ALLOW arm, because the question there is narrower ("is a
-/// write in flight?") and claude appends by re-opening the path. So widening this
-/// bucket does not merely steady a dot: it makes transcripts deletable that were
-/// refused before. Judge any retune here against BOTH matrices as well as the
-/// badge.
+/// [`AgentActivity::WorkingButIdle`] is the sharp edge: in BOTH consumers it rides
+/// with the LIVE states. In the send gates nothing acts on a guess, and in the
+/// writer guard it is refused like [`AgentActivity::Working`], because the pair
+/// cannot show that no turn is coming (DOMAIN.md, "Activity buckets"). So retuning
+/// this bucket does not merely steady a dot: moving it into an allow arm would make
+/// transcripts deletable that are refused. Judge any retune here against BOTH
+/// matrices as well as the badge.
 ///
 /// Payload-free on purpose — a variant answers "which bucket", never "what did
 /// the wire say". The raw qualifier stays available on the [`ReportedAgent`]
@@ -417,17 +414,18 @@ pub enum AgentActivity {
     Idle,
     /// Actively working a turn ([`QUALIFIER_WORKING`] / [`QUALIFIER_BUSY`]).
     Working,
-    /// claude reports a working `state` its own `status` contradicts as `idle`;
-    /// the single bucket snapback authors rather than passes through verbatim.
-    /// It gates no resume and no attach — but it IS an ALLOW arm of
+    /// claude reports a working `state` its own `status` calls `idle`; the single
+    /// bucket snapback authors rather than passes through verbatim. The pair proves
+    /// no cause (DOMAIN.md, "Activity buckets").
+    /// It gates no resume and no attach, and it is a REFUSE arm of
     /// [`crate::delete::can_delete`]'s writer guard, so retuning it moves an
     /// irreversible unlink and not just a dot (see [`AgentActivity`]).
     ///
     /// The internal name stays DESCRIPTIVE — it names exactly what was observed
-    /// (a working `state` contradicted by an `idle` `status`) and asserts no
+    /// (a working `state` beside an `idle` `status`) and asserts no
     /// cause, unlike the user-facing word. It renders gray + STEADY (see
     /// [`is_active`]): the pulse would claim work is in flight while claude's own
-    /// `status` says nothing is churning. Keyed on `state`, so it fires only for
+    /// `status` reads `idle`. Keyed on `state`, so it fires only for
     /// background agents (interactive sessions report no `state`).
     WorkingButIdle,
     /// Reported completion ([`QUALIFIER_DONE`]). Badges green and steady, and it
@@ -437,8 +435,9 @@ pub enum AgentActivity {
     /// [`crate::delete::can_delete`]'s writer guard, because the BARE list this
     /// module's docs describe holds a `done` job until claude reaps it. So
     /// retuning what lands in this bucket moves an IRREVERSIBLE unlink and not
-    /// just a dot, exactly as it does for [`AgentActivity::WorkingButIdle`]; that
-    /// guard's doc comment owns why the arm once read as unreachable and is not.
+    /// just a dot, exactly as it does for [`AgentActivity::NeedsInput`] and
+    /// [`AgentActivity::Ended`]; that guard's doc comment owns why the arm once
+    /// read as unreachable and is not.
     Done,
     /// A TERMINAL background state — the job has ENDED, whether cleanly stopped or
     /// failed ([`QUALIFIER_STOPPED`] / [`QUALIFIER_FAILED`]). Badges STEADY
@@ -452,7 +451,7 @@ pub enum AgentActivity {
     ///
     /// Also distinct from [`WorkingButIdle`](Self::WorkingButIdle), the OTHER
     /// steady background bucket: this one is claude REPORTING a terminal token
-    /// outright, that one is INFERRED from a contradiction claude never reconciled.
+    /// outright, that one is INFERRED from a working `state` beside an `idle` `status`.
     /// Both rest steady; they differ in cause and in color (dim here, working gray
     /// there), so neither replaces the other.
     Ended,
@@ -471,27 +470,26 @@ pub enum AgentActivity {
 ///
 /// The ONE exception reads the raw `state`/`status` PAIR rather than the
 /// collapsed qualifier: [`AgentActivity::WorkingButIdle`] fires when a working
-/// `state` is contradicted by an `idle` `status`, and it is checked BEFORE the
+/// `state` sits beside an `idle` `status`, and it is checked BEFORE the
 /// qualifier match — which would otherwise collapse the pair to `state=working`
-/// and hide the contradiction as a plain [`AgentActivity::Working`].
+/// and hide the pair as a plain [`AgentActivity::Working`].
 /// [`ReportedAgent::qualifier`] itself is left untouched, so every other seam
 /// still speaks through the same collapsed precedence.
 ///
 /// That early return cannot shadow the other resting-terminal bucket,
 /// [`AgentActivity::Ended`]: the two are DISJOINT by construction. The
-/// contradiction check requires `state` to be [`QUALIFIER_WORKING`] /
+/// pair check requires `state` to be [`QUALIFIER_WORKING`] /
 /// [`QUALIFIER_BUSY`], while [`AgentActivity::Ended`]'s tokens
 /// ([`QUALIFIER_STOPPED`] / [`QUALIFIER_FAILED`]) can never be either — so a
 /// `stopped` job whose `status` also reads `idle` still buckets as `Ended`, and
 /// both buckets stay reachable regardless of arm order.
 #[must_use]
 pub fn classify(agent: &ReportedAgent) -> AgentActivity {
-    // Surface claude's own self-contradiction before the qualifier collapses it:
-    // a background agent that died at startup keeps reporting a working `state`
-    // while its `status` reads `idle`. It reaches no liveness, resume or attach
-    // decision — but it DOES reach the hard-delete writer guard, which ALLOWS on
-    // this bucket (see `WorkingButIdle`), so widening this branch widens an
-    // irreversible unlink.
+    // Surface the working-beside-idle pair before the qualifier collapses it (see
+    // `WorkingButIdle`). It reaches no liveness, resume or attach
+    // decision. It does reach the hard-delete writer guard, which refuses this
+    // bucket exactly as it refuses `Working`, so this branch moves no unlink by
+    // itself: what would is moving the bucket into an ALLOW arm of `can_delete`.
     if matches!(
         agent.state.as_deref(),
         Some(QUALIFIER_WORKING | QUALIFIER_BUSY)
@@ -523,9 +521,8 @@ pub fn classify(agent: &ReportedAgent) -> AgentActivity {
 ///   is the thing being named and two spellings of "it wants you" must not read as
 ///   two different states.
 /// * [`AgentActivity::WorkingButIdle`] → [`INTERRUPTED_COPY`], because that bucket
-///   has no single wire token to pass through — it is the CONTRADICTION between a
-///   working `state` and an `idle` `status`, which read verbatim would be a bare,
-///   endless `working`.
+///   has no single wire token to pass through — it is a working `state` beside an
+///   `idle` `status`, which read verbatim would be a bare, endless `working`.
 ///
 /// Its two consumers are the pinned preview banner's status
 /// ([`friendly_status`], which fuses the phrase onto the kind label) — its
@@ -545,7 +542,7 @@ pub fn qualifier_copy(agent: &ReportedAgent) -> Option<&str> {
     Some(match classify(agent) {
         AgentActivity::NeedsInput => NEEDS_INPUT_COPY,
         // The one bucket with no wire token to pass through: it names the
-        // state/status CONTRADICTION, not either half of it (see `INTERRUPTED_COPY`).
+        // working/idle PAIR, not either half of it (see `INTERRUPTED_COPY`).
         AgentActivity::WorkingButIdle => INTERRUPTED_COPY,
         AgentActivity::Idle
         | AgentActivity::Working
@@ -625,10 +622,10 @@ pub fn elapsed_phrase(started_at_ms: Option<i64>, now_ms: i64) -> Option<String>
 /// banner about what the qualifier meant. The RESTING buckets are steady:
 /// [`AgentActivity::NeedsInput`] (stopped, waiting on the user),
 /// [`AgentActivity::Idle`] (up, but not working a turn),
-/// [`AgentActivity::WorkingButIdle`] (claude's own `status` says nothing is
-/// churning, so a pulse would claim work that is not in flight),
+/// [`AgentActivity::WorkingButIdle`] (claude's own `status` reads `idle`,
+/// so a pulse would claim a turn in flight that `status` does not show),
 /// [`AgentActivity::Done`] (finished cleanly), and [`AgentActivity::Ended`]
-/// (stopped or failed — the job is over) — in none of these is anything happening
+/// (stopped or failed — the job is over) — none of these shows a turn in flight
 /// to animate.
 ///
 /// [`AgentActivity::Other`] — an unknown or absent qualifier — counts as ACTIVE
@@ -1139,7 +1136,7 @@ mod tests {
         );
 
         // WorkingButIdle is the SECOND translated bucket: its working/idle
-        // contradiction has no wire token, so it reads as the product word rather
+        // pair has no wire token, so it reads as the product word rather
         // than either half of the pair.
         assert_eq!(
             qualifier_copy(&agent("background", Some("working"), Some("idle"))),
@@ -1387,19 +1384,18 @@ mod tests {
         // a pulse would claim work claude's own `status` says is not running.
         assert!(
             !is_active(&agent("background", Some("working"), Some("idle"))),
-            "working/idle is claude's stalled-agent shape; it must not pulse"
+            "working/idle is the interrupted shape; it must not pulse"
         );
     }
 
-    /// The joint-read bucket end to end: ONLY a working `state` CONTRADICTED by
-    /// an `idle` `status` is `WorkingButIdle`. It reads `interrupted` (the second
+    /// The joint-read bucket end to end: ONLY a working `state` beside an
+    /// `idle` `status` is `WorkingButIdle`. It reads `interrupted` (the second
     /// translated bucket) and rests steady, while every neighbouring shape stays
-    /// exactly what it was — the contradiction is the whole trigger, so dropping
+    /// exactly what it was — the pair is the whole trigger, so dropping
     /// either half falls back to a plain `Working` or `Idle`.
     #[test]
     fn working_state_with_idle_status_is_interrupted_and_steady() {
-        // The stalled-agent shape claude never reconciles: working state that its
-        // own status calls idle.
+        // The `interrupted` shape: a working state that its own status calls idle.
         let interrupted = agent("background", Some("working"), Some("idle"));
         assert_eq!(classify(&interrupted), AgentActivity::WorkingButIdle);
         assert_eq!(friendly_status(&interrupted), "bg interrupted");
@@ -1413,7 +1409,7 @@ mod tests {
         assert_eq!(classify(&interrupted_busy), AgentActivity::WorkingButIdle);
         assert_eq!(friendly_status(&interrupted_busy), "bg interrupted");
 
-        // Neither half alone is the contradiction, so each falls back to the
+        // Neither half alone is the pair, so each falls back to the
         // ordinary bucket it always had:
         // - a working state with NO idle status is a plain, PULSING Working...
         let working_none = agent("background", Some("working"), None);
@@ -1437,7 +1433,7 @@ mod tests {
     /// earlier one shadows the later.
     ///
     /// They answer different questions: `Ended` is claude REPORTING a terminal
-    /// token, `WorkingButIdle` is a contradiction claude never reconciled. Both
+    /// token, `WorkingButIdle` is a working `state` beside an `idle` `status`. Both
     /// hold steady, and the fail-soft ACTIVE default must survive BOTH of them so
     /// genuine schema drift still pulses.
     #[test]
@@ -1450,7 +1446,7 @@ mod tests {
         );
 
         // Both KNOWN terminal tokens reach `Ended` — neither is shadowed by the
-        // contradiction check that runs before the qualifier match.
+        // pair check that runs before the qualifier match.
         for token in ["stopped", "failed"] {
             let ended = agent("background", Some(token), None);
             assert_eq!(classify(&ended), AgentActivity::Ended, "{token:?} -> Ended");
@@ -1459,7 +1455,7 @@ mod tests {
             assert_eq!(qualifier_copy(&ended), Some(token));
         }
 
-        // The contradiction reaches `WorkingButIdle` — not shadowed by the
+        // The pair reaches `WorkingButIdle` — not shadowed by the
         // qualifier match, which would otherwise collapse it to a plain `Working`.
         let interrupted = agent("background", Some("working"), Some("idle"));
         assert_eq!(classify(&interrupted), AgentActivity::WorkingButIdle);
@@ -1467,14 +1463,14 @@ mod tests {
         assert_eq!(qualifier_copy(&interrupted), Some(INTERRUPTED_COPY));
 
         // ORDER-PROOF: the two triggers are disjoint, so a terminal token wins even
-        // when the record ALSO carries the `idle` status the contradiction keys on.
-        // If the contradiction check ever widened to swallow this shape, a stopped
+        // when the record ALSO carries the `idle` status the pair keys on.
+        // If the pair check ever widened to swallow this shape, a stopped
         // job would silently read `interrupted` in the working gray instead.
         let stopped_and_idle = agent("background", Some("stopped"), Some("idle"));
         assert_eq!(
             classify(&stopped_and_idle),
             AgentActivity::Ended,
-            "a reported terminal token outranks the inferred contradiction"
+            "a reported terminal token outranks the inferred pair"
         );
 
         // The FAIL-SOFT default survives both new buckets: a genuinely unknown

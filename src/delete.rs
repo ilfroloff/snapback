@@ -43,24 +43,35 @@ pub const DELETE_INTERACTIVE_REFUSAL: &str = "claude has this session open inter
 /// target as a running agent.
 ///
 /// The copy claims neither a KIND nor an activity, because the arm covers more
-/// than either would state. Three buckets reach it:
+/// than either would state. Four buckets reach it:
 ///
 /// * [`AgentActivity::Working`] — a turn really is in flight.
+/// * [`AgentActivity::WorkingButIdle`] — the `interrupted` pair, which cannot show
+///   that no turn is coming (the paragraph on [`can_delete`] below).
 /// * [`AgentActivity::Idle`] — the agent is up, between turns. Nothing is being
 ///   written this instant, but claude is holding it and may write next.
 /// * [`AgentActivity::Other`] — the qualifier was unreadable or absent, so
 ///   NOTHING is known about what it is doing.
 ///
-/// Only the first is literally *working*; saying so for the other two would claim
-/// more than the signal carries. The KIND is the same discipline one field over:
-/// this is also the message for a record whose `kind` DRIFTED or arrived empty
-/// (see [`can_delete`]'s background arm), so calling it a "background agent"
-/// would assert a shape the record never stated. What holds across every one of
-/// those worlds is that claude still lists the session as an active agent, so
-/// that — and only that — is what the message reports (PATTERNS §1, the same
+/// Only the first is literally *working*; saying so for the other three would
+/// claim more than the signal carries. The KIND is the same discipline one field
+/// over: this is also the message for a record whose `kind` DRIFTED or arrived
+/// empty (see [`can_delete`]'s background arm), so calling it a "background
+/// agent" would assert a shape the record never stated. What holds across every
+/// one of those worlds is that claude still lists the session as an active agent,
+/// so that — and only that — is what the message reports (PATTERNS §1, the same
 /// "say only what you observed" rule behind [`crate::resume::ATTACH_NOT_LIVE`]).
+///
+/// The next move it names is `Ctrl-K`, which is open to all four buckets: the
+/// interrupt gate ([`crate::send::interrupt_gate`]) confirms a stop for each of them
+/// whenever the record carries a job id or a pid a signal could take. A record with
+/// neither gets `Ctrl-K`'s own refusal, which is why "in Claude Code" stays as the
+/// other way out. `Ctrl-K` leads because the status line is one row, cut rather than
+/// wrapped, and the first words are the ones an 80-column terminal keeps. The copy
+/// promises no outcome: it does not say a stop clears the refusal, only that it is
+/// the way to ask claude to end the agent.
 pub const DELETE_RUNNING_REFUSAL: &str = "claude still reports this session as a running \
-     agent — let it finish or stop it in Claude Code, then hard-delete.";
+     agent — stop it with Ctrl-K or in Claude Code, or let it finish, then hard-delete.";
 
 /// User-facing refusal returned by [`can_delete_target`] when SNAPBACK ITSELF has a
 /// `claude -p` child in flight on the target: a quick reply to it, or the headless
@@ -119,13 +130,20 @@ pub const DELETE_MOVING_REFUSAL: &str = "snapback is still moving this session t
 /// * `Some` BACKGROUND — every other `kind`, INCLUDING a drifted or empty one:
 ///   an unrecognized kind falls to this arm rather than the permissive `None`,
 ///   because this arm carries its own conservative matrix (below) while `None`
-///   deletes outright. The bucket then decides: the RESTING ones
-///   ([`AgentActivity::NeedsInput`], [`AgentActivity::WorkingButIdle`],
-///   [`AgentActivity::Done`], [`AgentActivity::Ended`]) are parked and deletable,
-///   while [`AgentActivity::Working`], [`AgentActivity::Idle`] and
+///   deletes outright. The bucket then decides: the PARKED ones
+///   ([`AgentActivity::NeedsInput`], [`AgentActivity::Done`],
+///   [`AgentActivity::Ended`]) are deletable, while [`AgentActivity::Working`],
+///   [`AgentActivity::WorkingButIdle`], [`AgentActivity::Idle`] and
 ///   [`AgentActivity::Other`] are refused with [`DELETE_RUNNING_REFUSAL`]. An
 ///   unknown or absent qualifier therefore fails toward REFUSING: an irreversible
 ///   unlink must not be authorized by a signal that could not be read.
+///
+/// **[`AgentActivity::WorkingButIdle`] refuses because the pair cannot show that
+/// no turn is coming.** An irreversible unlink must not rest on a pair that does
+/// not rule out an agent which will write again; DOMAIN.md ("Activity buckets")
+/// owns what the pair shows and leaves undetermined. Only
+/// [`AgentActivity::NeedsInput`], [`AgentActivity::Done`] and
+/// [`AgentActivity::Ended`] are admitted.
 ///
 /// The two FINISHED arms, [`AgentActivity::Done`] and [`AgentActivity::Ended`],
 /// are in the ALLOW half for one reason: the run is OVER, so there is no turn in
@@ -152,12 +170,13 @@ pub const DELETE_MOVING_REFUSAL: &str = "snapback is still moving this session t
 /// here from sampling; judge it by what the bucket MEANS for a writer.
 ///
 /// **Deliberately NOT expressed over [`agents::is_active`]**, even though the two
-/// matrices nearly agree — they differ only at [`AgentActivity::Idle`], which
-/// `is_active` calls resting and this guard refuses. `is_active` answers a
-/// COSMETIC question (does a list badge's dot pulse), and a future retune of that
-/// pulse must never silently widen an IRREVERSIBLE gate. Two small predicates
-/// over the same enum, each written where its own consequence lives, is the
-/// point; sharing one would couple a repaint to an unlink.
+/// matrices nearly agree — they differ at [`AgentActivity::Idle`] and
+/// [`AgentActivity::WorkingButIdle`], which `is_active` calls resting and this
+/// guard refuses. `is_active` answers a COSMETIC question (does a list badge's
+/// dot pulse), and a future retune of that pulse must never silently widen an
+/// IRREVERSIBLE gate. Two small predicates over the same enum, each written
+/// where its own consequence lives, is the point; sharing one would couple a
+/// repaint to an unlink.
 ///
 /// Returns `Err(user-facing message)` so the caller can hand it straight to
 /// `set_status`, or `Ok(())` when the delete may proceed.
@@ -171,13 +190,11 @@ pub fn can_delete(reported: Option<&ReportedAgent>) -> Result<(), String> {
     }
     // Background (and any drifted kind): the activity bucket decides.
     match agents::classify(agent) {
-        AgentActivity::NeedsInput
+        AgentActivity::NeedsInput | AgentActivity::Done | AgentActivity::Ended => Ok(()),
+        AgentActivity::Working
         | AgentActivity::WorkingButIdle
-        | AgentActivity::Done
-        | AgentActivity::Ended => Ok(()),
-        AgentActivity::Working | AgentActivity::Idle | AgentActivity::Other => {
-            Err(DELETE_RUNNING_REFUSAL.to_string())
-        }
+        | AgentActivity::Idle
+        | AgentActivity::Other => Err(DELETE_RUNNING_REFUSAL.to_string()),
     }
 }
 
@@ -430,10 +447,11 @@ mod tests {
     ///
     /// The rule under test is "is a writer present?", NOT "does claude know this
     /// session?" — so the interesting half is everything claude REPORTS that is
-    /// nonetheless deletable. A parked background agent (needs-input, interrupted)
-    /// holds no open handle on its transcript; refusing it was the defect, and it
-    /// is the majority of claude's active list. The `done` row is the one that is
-    /// NOT drawn from that list — see its own note below.
+    /// nonetheless deletable. A parked background agent (needs-input, done, ended)
+    /// holds no open handle on its transcript, and refusing it was the defect.
+    /// The needs-input rows are the bulk of claude's active list; `done` is on it
+    /// only until claude reaps the job, and `ended` is claude's own reported
+    /// terminal token — see their notes below.
     ///
     /// Table-driven so a mutant that collapses two arms into one cannot survive:
     /// each row names its own bucket, and both refusal texts appear as distinct
@@ -485,13 +503,6 @@ mod tests {
                 Some(agent("background", Some("waiting"), None)),
                 Ok(()),
             ),
-            // The interrupted shape: a working state claude's own status calls
-            // idle. Nothing is churning, so nothing is writing.
-            (
-                "background working with an idle status (interrupted)",
-                Some(agent("background", Some("working"), Some("idle"))),
-                Ok(()),
-            ),
             // Reported completion. A LIVE arm, not the contingency an earlier
             // revision of `can_delete`'s doc comment took it for: claude keeps a
             // `done` background job in its active list until it reaps it, so a
@@ -527,9 +538,18 @@ mod tests {
                 Some(agent("background", Some("busy"), None)),
                 Err(DELETE_RUNNING_REFUSAL),
             ),
-            // Up between turns: claude holds it and may write next. This is the
-            // ONE arm where the guard deliberately disagrees with `is_active`,
-            // which calls `Idle` resting because a resting BADGE must not pulse.
+            // The `interrupted` shape (a working `state` beside an `idle` `status`)
+            // refuses like `working`: the pair cannot show that no turn is coming
+            // (issue #83; `can_delete`'s docs and DOMAIN.md say why).
+            (
+                "background working with an idle status (interrupted)",
+                Some(agent("background", Some("working"), Some("idle"))),
+                Err(DELETE_RUNNING_REFUSAL),
+            ),
+            // Up between turns: claude holds it and may write next. Like the
+            // `interrupted` row above, this is an arm where the guard
+            // deliberately disagrees with `is_active`, which calls `Idle`
+            // resting because a resting BADGE must not pulse.
             (
                 "background idle",
                 Some(agent("background", Some("idle"), None)),
@@ -585,11 +605,20 @@ mod tests {
         );
         assert!(!DELETE_INTERACTIVE_REFUSAL.is_empty());
         assert!(!DELETE_RUNNING_REFUSAL.is_empty());
-        // The running refusal covers Working, Idle AND Other, so it must not
-        // claim the agent is *working* — only that claude still reports it.
+        // The running refusal covers Working, WorkingButIdle, Idle AND Other, so
+        // it must not claim the agent is *working* — only that claude still
+        // reports it.
         assert!(
             !DELETE_RUNNING_REFUSAL.contains("is working"),
             "the copy must not assert work for the idle/unknown arms it also covers"
+        );
+        // The next move leads with `Ctrl-K` and must survive the one-row status
+        // line on an 80-column terminal, which cuts the rest.
+        assert!(
+            DELETE_RUNNING_REFUSAL
+                .find("Ctrl-K")
+                .is_some_and(|byte| DELETE_RUNNING_REFUSAL[..byte].chars().count() + 6 <= 80),
+            "a running agent's refusal points at Ctrl-K within the first 80 columns"
         );
         // It is ALSO the message for a record whose `kind` drifted or arrived
         // empty (the "a drifted kind with no qualifier" row above), so naming a
