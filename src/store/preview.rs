@@ -283,17 +283,75 @@ pub struct SubagentRegion {
     pub agent_type: String,
 }
 
+/// One wrapped line of one GRID table cell, in the same content coordinates and
+/// under the same width discipline as [`LinkRegion`]: where the cell sits, so a
+/// mouse selection that began inside it can stay inside it
+/// ([`crate::tui::view`]'s `TableCells::confine`).
+///
+/// A cell that wraps over N lines records N regions, all with the same
+/// `col_start..col_end` — the COLUMN's whole span, alignment padding included, never
+/// the text's — and one `content_row` each. Recorded for grid tables only: record
+/// mode soft-wraps its lines, so columns measured here would not survive to the
+/// paint (see [`markdown_body_lines_collect`]), and an empty cell, which wraps to no
+/// line, records none.
+///
+/// A cell is identified by [`cell`](Self::cell), never by `cell_id` alone: `cell_id`
+/// is the content row of the cell's FIRST line, so two cells that start on one row
+/// share it and only their columns tell them apart. Both fields move with the
+/// region when it is rebased ([`BlockRegion::shift`]). Regions come out in ascending
+/// `content_row`, which the selection's lookups rely on.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CellRegion {
+    /// Line index into the rendered [`Text`] this wrapped line sits on.
+    pub content_row: usize,
+    /// Display column where the cell's column starts (inclusive).
+    pub col_start: usize,
+    /// Display column just past the cell's column (exclusive).
+    pub col_end: usize,
+    /// Content row of the cell's first line; see the type's doc.
+    pub cell_id: usize,
+    /// The text the cell wrapper dropped at the break before this line: the
+    /// whitespace it broke on, or empty for a cell's first line and for a line
+    /// that starts inside a word it had to split ([`WrappedRun::seam`]).
+    pub seam: String,
+}
+
+impl CellRegion {
+    /// What identifies the cell this line belongs to: its `cell_id` and its column.
+    pub fn cell(&self) -> (usize, usize) {
+        (self.cell_id, self.col_start)
+    }
+}
+
 /// A block-relative region the running rebase in [`render_stream`] can shift
 /// onto the growing transcript.
 ///
-/// Implemented by [`LinkRegion`], [`FoldRegion`], [`SubagentRegion`] and
-/// [`UnindexedRows`] so all four are rebased by the ONE [`rebased`] function and
-/// the ONE offset. A second rebase — even a faithful copy — is exactly how a
-/// node's click target, the links inside its body and the rows search skips would
-/// come to disagree about which row they sit on.
+/// Implemented by [`LinkRegion`], [`FoldRegion`], [`SubagentRegion`],
+/// [`CellRegion`] and [`UnindexedRows`] so all five are rebased by the ONE
+/// [`rebased`] function and the ONE offset. A second rebase — even a faithful copy
+/// — is exactly how a node's click target, the links inside its body and the rows
+/// search skips would come to disagree about which row they sit on.
 trait BlockRegion {
-    /// The region's row index, for [`rebased`] to advance.
+    /// The region's row index, for [`shift`](Self::shift) to advance.
     fn content_row_mut(&mut self) -> &mut usize;
+
+    /// Move the region down `offset` rows. Every row the region carries moves
+    /// with it, so a kind holding a second row ([`CellRegion::cell_id`]) overrides
+    /// this.
+    fn shift(&mut self, offset: usize) {
+        *self.content_row_mut() += offset;
+    }
+}
+
+impl BlockRegion for CellRegion {
+    fn content_row_mut(&mut self) -> &mut usize {
+        &mut self.content_row
+    }
+
+    fn shift(&mut self, offset: usize) {
+        self.content_row += offset;
+        self.cell_id += offset;
+    }
 }
 
 impl BlockRegion for LinkRegion {
@@ -379,6 +437,9 @@ pub struct RenderedPreview {
     pub subagents: Vec<SubagentRegion>,
     /// Runs of lines the content index never held (see [`UnindexedRows`]).
     pub unindexed: Vec<UnindexedRows>,
+    /// Every wrapped line of every grid table cell, in content-row order (see
+    /// [`CellRegion`]).
+    pub cells: Vec<CellRegion>,
     /// Every turn's marker line, in content-row (i.e. file) order (see
     /// [`MarkerLine`]).
     pub markers: Vec<MarkerLine>,
@@ -535,7 +596,7 @@ pub fn pending_reply_turns(
         )));
         // Same body pass as a real user turn, so the echo wraps and styles
         // identically to the turn that will replace it.
-        lines.extend(collapse_body_lines_collect(message, width).0);
+        lines.extend(collapse_body_collect(message, width).0);
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
@@ -672,6 +733,7 @@ fn render_stream(reader: impl BufRead, stream: &StreamContext) -> RenderedPrevie
     let mut folds: Vec<FoldRegion> = Vec::new();
     let mut subagent_regions: Vec<SubagentRegion> = Vec::new();
     let mut unindexed: Vec<UnindexedRows> = Vec::new();
+    let mut cells: Vec<CellRegion> = Vec::new();
     let mut markers: Vec<MarkerLine> = Vec::new();
     // The newest model claude would restore on `-r`, overwritten record by record
     // as the file streams past, so the last one standing is the answer.
@@ -718,6 +780,7 @@ fn render_stream(reader: impl BufRead, stream: &StreamContext) -> RenderedPrevie
             folds.extend(rebased(block.folds, offset));
             subagent_regions.extend(rebased(block.subagents, offset));
             unindexed.extend(rebased(block.unindexed, offset));
+            cells.extend(rebased(block.cells, offset));
             if let Some(mut marker) = block.marker {
                 marker.content_row += offset;
                 markers.push(marker);
@@ -732,6 +795,7 @@ fn render_stream(reader: impl BufRead, stream: &StreamContext) -> RenderedPrevie
         folds,
         subagents: subagent_regions,
         unindexed,
+        cells,
         markers,
         last_model,
         last_effort,
@@ -747,7 +811,7 @@ fn rebased<R: BlockRegion>(regions: Vec<R>, offset: usize) -> Vec<R> {
     regions
         .into_iter()
         .map(|mut r| {
-            *r.content_row_mut() += offset;
+            r.shift(offset);
             r
         })
         .collect()
@@ -769,6 +833,9 @@ struct Block {
     subagents: Vec<SubagentRegion>,
     /// Its [`UnindexedRows`]: an open injected node's body.
     unindexed: Vec<UnindexedRows>,
+    /// Its [`CellRegion`]s: the grid table cells of a body — a user or assistant
+    /// turn's, or an OPEN peer or injected node's.
+    cells: Vec<CellRegion>,
     /// Its turn marker, when the record is a turn.
     marker: Option<MarkerLine>,
 }
@@ -847,8 +914,13 @@ fn render_record(
             if let Some(origin) = label::peer_origin(record) {
                 // `expanded` decides which shape this node renders in; it is READ
                 // here and owned by the app, never mutated by the renderer.
-                let (lines, links, folds) =
-                    peer_node_lines(&origin, stream.expanded, record, prev_day, stream.width);
+                let Block {
+                    lines,
+                    links,
+                    folds,
+                    cells,
+                    ..
+                } = peer_node_lines(&origin, stream.expanded, record, prev_day, stream.width);
                 // NO marker for the pinned row: the node is not a turn, and its
                 // header's click affordance would be a promise the pinned row
                 // cannot keep. The row keeps naming the turn above the node.
@@ -856,6 +928,7 @@ fn render_record(
                     lines,
                     links,
                     folds,
+                    cells,
                     ..Block::default()
                 });
             }
@@ -886,13 +959,20 @@ fn render_record(
             // pinned row: it is not a turn, and the row keeps naming the turn
             // above it.
             if label::is_injected(record) {
-                let (lines, links, folds, unindexed) =
-                    injected_node_lines(&text, stream.expanded, record, prev_day, stream.width);
+                let Block {
+                    lines,
+                    links,
+                    folds,
+                    unindexed,
+                    cells,
+                    ..
+                } = injected_node_lines(&text, stream.expanded, record, prev_day, stream.width);
                 return Some(Block {
                     lines,
                     links,
                     folds,
                     unindexed,
+                    cells,
                     ..Block::default()
                 });
             }
@@ -908,11 +988,12 @@ fn render_record(
             // marker lines that lead every turn. The marker itself sits at row 1
             // (the blank line at row 0 leads every turn).
             let offset = lines.len();
-            let (body, body_links) = collapse_body_lines_collect(&text, stream.width);
+            let (body, body_links, body_cells) = collapse_body_collect(&text, stream.width);
             lines.extend(body);
             Some(Block {
                 lines,
                 links: rebased(body_links, offset),
+                cells: rebased(body_cells, offset),
                 marker: Some(MarkerLine {
                     content_row: 1,
                     line: marker,
@@ -922,7 +1003,7 @@ fn render_record(
         }
         Some("assistant") => {
             let content = record.get("message").and_then(|m| m.get("content"))?;
-            let (body, body_links, body_subagents) = assistant_lines(content, stream);
+            let (body, body_links, body_subagents, body_cells) = assistant_lines(content, stream);
             if body.is_empty() {
                 return None;
             }
@@ -942,6 +1023,7 @@ fn render_record(
                 lines,
                 links: rebased(body_links, offset),
                 subagents: rebased(body_subagents, offset),
+                cells: rebased(body_cells, offset),
                 marker: Some(MarkerLine {
                     content_row: 1,
                     line: marker,
@@ -1528,15 +1610,18 @@ const PEER_HEADER_BLOCK_ROW: usize = 1;
 /// and — unless the node is collapsed — the message body beneath it.
 ///
 /// The body is the structural `origin.body`, preamble-stripped and dedented, run
-/// through the SAME [`collapse_body_lines_collect`] pass every other turn body
+/// through the SAME [`collapse_body_collect`] pass every other turn body
 /// takes, so a peer report wraps exactly like a `▶ you` turn and keeps every style
 /// that pass gives it — then [`recede_fold_body`] dims it as a whole, so the open
 /// report reads as set apart from the turns around it. Its link regions are
 /// block-relative and are rebased past the lines that lead the node.
 ///
-/// Returns the node's [`FoldRegion`] alongside them — one per node that HAS a
-/// fold key, none for an [`Unfoldable`] one. PURE: `expanded` is read, never
-/// written.
+/// Returns the node as a [`Block`] with its [`FoldRegion`] — one per node that HAS a
+/// fold key, none for an [`Unfoldable`] one — and the body's [`CellRegion`]s,
+/// rebased by the same offset. The body is not indented, only dimmed
+/// ([`recede_fold_body`] restyles spans and moves no column), so a region's columns
+/// are the drawn cell's. A COLLAPSED node draws no body and so records none. PURE:
+/// `expanded` is read, never written.
 ///
 /// [`Unfoldable`]: PeerFold::Unfoldable
 fn peer_node_lines(
@@ -1545,7 +1630,7 @@ fn peer_node_lines(
     record: &Value,
     prev_day: &mut Option<Date>,
     width: usize,
-) -> (Vec<Line<'static>>, Vec<LinkRegion>, Vec<FoldRegion>) {
+) -> Block {
     let fold = peer_fold(origin.from(), expanded);
     let header = peer_header_line(origin.from().unwrap_or_default(), fold, record, prev_day);
     // The whole header line is the click target, so a reader need not hit the
@@ -1564,16 +1649,26 @@ fn peer_node_lines(
 
     let mut lines = vec![Line::from(""), header];
     if !fold.shows_body() {
-        return (lines, Vec::new(), folds);
+        return Block {
+            lines,
+            folds,
+            ..Block::default()
+        };
     }
-    // Body links are relative to the body; rebase them past the blank + header
-    // lines that lead the node, exactly as a `▶ you` turn rebases its own.
+    // Body links and cells are relative to the body; rebase them past the blank +
+    // header lines that lead the node, exactly as a `▶ you` turn rebases its own.
     let offset = lines.len();
     let body = dedent_uniformly(strip_handback_preamble(origin.body()));
-    let (mut body_lines, body_links) = collapse_body_lines_collect(&body, width);
+    let (mut body_lines, body_links, body_cells) = collapse_body_collect(&body, width);
     recede_fold_body(&mut body_lines);
     lines.extend(body_lines);
-    (lines, rebased(body_links, offset), folds)
+    Block {
+        lines,
+        links: rebased(body_links, offset),
+        folds,
+        cells: rebased(body_cells, offset),
+        ..Block::default()
+    }
 }
 
 /// The node's one-line header: `◆ message from @a03505fe4b1c2d3e0 · 14:15 ·
@@ -1662,7 +1757,7 @@ fn injected_style() -> Style {
 /// Render an injected record as a fold node: a blank separator, the one-line
 /// header (`◇ added by claude code · 08:05 · (click to expand)`), and — unless the
 /// node is collapsed — its `text` beneath it, through the SAME
-/// [`collapse_body_lines_collect`] pass every other body takes.
+/// [`collapse_body_collect`] pass every other body takes.
 ///
 /// The shape is the peer node's exactly: header on [`PEER_HEADER_BLOCK_ROW`], the
 /// whole header line one [`FoldRegion`], none for an [`Unfoldable`] node, and the
@@ -1671,7 +1766,9 @@ fn injected_style() -> Style {
 /// [`injected_style`].
 ///
 /// An open node's body is ALSO returned as one [`UnindexedRows`] run: the content
-/// index leaves injected records out, so the pane's search marks must too.
+/// index leaves injected records out, so the pane's search marks must too. Its
+/// grid tables' [`CellRegion`]s are rebased as the peer node's are
+/// ([`peer_node_lines`]); a collapsed node records none.
 ///
 /// It returns no [`MarkerLine`], for the peer node's reason: the node is not a
 /// turn, and its header's click affordance would be a promise the pinned row could
@@ -1686,12 +1783,7 @@ fn injected_node_lines(
     record: &Value,
     prev_day: &mut Option<Date>,
     width: usize,
-) -> (
-    Vec<Line<'static>>,
-    Vec<LinkRegion>,
-    Vec<FoldRegion>,
-    Vec<UnindexedRows>,
-) {
+) -> Block {
     let key = injected_fold_key(record);
     let fold = peer_fold(key.as_deref(), expanded);
     let mut header = marker_line_with_time(
@@ -1716,17 +1808,28 @@ fn injected_node_lines(
 
     let mut lines = vec![Line::from(""), header];
     if !fold.shows_body() {
-        return (lines, Vec::new(), folds, Vec::new());
+        return Block {
+            lines,
+            folds,
+            ..Block::default()
+        };
     }
     let offset = lines.len();
-    let (mut body_lines, body_links) = collapse_body_lines_collect(text, width);
+    let (mut body_lines, body_links, body_cells) = collapse_body_collect(text, width);
     recede_fold_body(&mut body_lines);
     let unindexed = vec![UnindexedRows {
         content_row: offset,
         len: body_lines.len(),
     }];
     lines.extend(body_lines);
-    (lines, rebased(body_links, offset), folds, unindexed)
+    Block {
+        lines,
+        links: rebased(body_links, offset),
+        folds,
+        unindexed,
+        cells: rebased(body_cells, offset),
+        ..Block::default()
+    }
 }
 
 // --- delegation line -------------------------------------------------------------
@@ -1860,23 +1963,31 @@ fn user_text(content: &Value) -> String {
 fn assistant_lines(
     content: &Value,
     stream: &StreamContext,
-) -> (Vec<Line<'static>>, Vec<LinkRegion>, Vec<SubagentRegion>) {
+) -> (
+    Vec<Line<'static>>,
+    Vec<LinkRegion>,
+    Vec<SubagentRegion>,
+    Vec<CellRegion>,
+) {
     let width = stream.width;
     match content {
         Value::String(s) => {
-            let (lines, links) = collapse_body_lines_collect(s, width);
-            (lines, links, Vec::new())
+            let (lines, links, cells) = collapse_body_collect(s, width);
+            (lines, links, Vec::new(), cells)
         }
         Value::Array(blocks) => {
             let mut lines: Vec<Line<'static>> = Vec::new();
             let mut links: Vec<LinkRegion> = Vec::new();
+            let mut cells: Vec<CellRegion> = Vec::new();
             let mut subagent_regions: Vec<SubagentRegion> = Vec::new();
             for b in blocks {
                 match b.get("type").and_then(Value::as_str) {
                     Some("text") => {
                         if let Some(t) = b.get("text").and_then(Value::as_str) {
-                            let (text_lines, text_links) = collapse_body_lines_collect(t, width);
+                            let (text_lines, text_links, text_cells) =
+                                collapse_body_collect(t, width);
                             links.extend(rebased(text_links, lines.len()));
+                            cells.extend(rebased(text_cells, lines.len()));
                             lines.extend(text_lines);
                         }
                     }
@@ -1903,9 +2014,9 @@ fn assistant_lines(
                     _ => {}
                 }
             }
-            (lines, links, subagent_regions)
+            (lines, links, subagent_regions, cells)
         }
-        _ => (Vec::new(), Vec::new(), Vec::new()),
+        _ => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
     }
 }
 
@@ -2137,25 +2248,34 @@ fn marker_line(text: String) -> Line<'static> {
 /// from the `▶` (U+25B6) `you` turn marker so a command reads as its own thing.
 const COMMAND_GLYPH: &str = "\u{25b7}";
 
-/// Text-only view over [`collapse_body_lines_collect`] (link regions discarded),
-/// used by the transcript-shape tests. Runtime code calls the `_collect` variant
-/// directly so it also gets the regions.
+/// Text-only view over [`collapse_body_collect`] (regions discarded), used by the
+/// transcript-shape tests. Runtime code calls the `_collect` variant directly so it
+/// also gets the regions.
 #[cfg(test)]
 fn collapse_body_lines(body: &str, width: usize) -> Vec<Line<'static>> {
-    collapse_body_lines_collect(body, width).0
+    collapse_body_collect(body, width).0
 }
 
-/// Like [`collapse_body_lines`] but also returns the block-relative [`LinkRegion`]s
-/// found in the literal (markdown) segments. Marker and command segments carry no
-/// links. Regions from each literal segment are rebased onto the growing block.
-fn collapse_body_lines_collect(body: &str, width: usize) -> (Vec<Line<'static>>, Vec<LinkRegion>) {
+/// Render a body as styled lines plus the block-relative [`LinkRegion`]s found in
+/// its literal (markdown) segments and the [`CellRegion`]s of their grid tables.
+/// Marker and command segments carry neither. Each segment's regions are rebased
+/// onto the growing block.
+///
+/// The ONE body pass: a user or assistant turn, an open peer node and an open
+/// injected node all draw through it, so a table behaves the same in each.
+fn collapse_body_collect(
+    body: &str,
+    width: usize,
+) -> (Vec<Line<'static>>, Vec<LinkRegion>, Vec<CellRegion>) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut links: Vec<LinkRegion> = Vec::new();
+    let mut cells: Vec<CellRegion> = Vec::new();
     for seg in collapse_control_wrappers(body) {
         match seg {
             Segment::Literal(text) => {
-                let (seg_lines, seg_links) = markdown_body_lines_collect(&text, width);
+                let (seg_lines, seg_links, seg_cells) = markdown_body_collect(&text, width);
                 links.extend(rebased(seg_links, lines.len()));
+                cells.extend(rebased(seg_cells, lines.len()));
                 lines.extend(seg_lines);
             }
             Segment::Marker { label, .. } => lines.push(marker_line(label.to_string())),
@@ -2166,7 +2286,7 @@ fn collapse_body_lines_collect(body: &str, width: usize) -> (Vec<Line<'static>>,
             }
         }
     }
-    (lines, links)
+    (lines, links, cells)
 }
 
 /// Render a collapsed slash-command turn as a single `▷ /name args` DIM marker —
@@ -2182,11 +2302,18 @@ fn command_line(name: Option<&str>, args: &str) -> Option<Line<'static>> {
 // --- minimal markdown pass ----------------------------------------------------
 
 /// Text-only view over [`markdown_body_lines_collect`] (link regions discarded),
-/// used by the markdown/table tests. Runtime code calls the `_collect` variant
-/// directly so it also gets the regions.
+/// used by the markdown/table tests. Runtime code calls
+/// [`markdown_body_collect`] directly so it also gets the regions.
 #[cfg(test)]
 fn markdown_body_lines(body: &str, width: usize) -> Vec<Line<'static>> {
     markdown_body_lines_collect(body, width).0
+}
+
+/// [`markdown_body_collect`] without the [`CellRegion`]s: what the link tests read.
+#[cfg(test)]
+fn markdown_body_lines_collect(body: &str, width: usize) -> (Vec<Line<'static>>, Vec<LinkRegion>) {
+    let (lines, links, _) = markdown_body_collect(body, width);
+    (lines, links)
 }
 
 /// Convert an inline run's [`InlineLink`]s into [`LinkRegion`]s on line
@@ -2235,7 +2362,8 @@ fn regions_from_inline(
 }
 
 /// Render a message BODY as styled lines PLUS the [`LinkRegion`]s for every
-/// rendered link, in coordinates relative to the FIRST returned line.
+/// rendered link and the [`CellRegion`]s of every GRID table cell, in coordinates
+/// relative to the FIRST returned line.
 ///
 /// Block constructs handled line-by-line: fenced code (``` / ~~~), ATX headers
 /// (`#`..`######`), blockquotes (`>`), unordered (`-`/`*`/`+`) / ordered
@@ -2260,9 +2388,13 @@ fn regions_from_inline(
 /// url — and a table in record mode is in a narrow pane by definition. Its links
 /// are drawn [`LinkRender::Inert`] to match, so nothing there LOOKS clickable
 /// either.
-fn markdown_body_lines_collect(body: &str, width: usize) -> (Vec<Line<'static>>, Vec<LinkRegion>) {
+fn markdown_body_collect(
+    body: &str,
+    width: usize,
+) -> (Vec<Line<'static>>, Vec<LinkRegion>, Vec<CellRegion>) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut links: Vec<LinkRegion> = Vec::new();
+    let mut cells: Vec<CellRegion> = Vec::new();
     let mut in_fence = false;
 
     // Collect the rows up front and walk them by index so a block can PEEK at the
@@ -2295,8 +2427,9 @@ fn markdown_body_lines_collect(body: &str, width: usize) -> (Vec<Line<'static>>,
         // Grid mode maps each wrapped cell label back to its row and columns;
         // record mode records nothing (see the doc comment for why).
         if trimmed.contains('|') && rows.get(i + 1).copied().is_some_and(is_table_delimiter) {
-            let (table_lines, table_links, consumed) = render_table(&rows[i..], width);
+            let (table_lines, table_links, table_cells, consumed) = render_table(&rows[i..], width);
             links.extend(rebased(table_links, lines.len()));
+            cells.extend(rebased(table_cells, lines.len()));
             lines.extend(table_lines);
             i += consumed;
             continue;
@@ -2361,7 +2494,7 @@ fn markdown_body_lines_collect(body: &str, width: usize) -> (Vec<Line<'static>>,
         i += 1;
     }
 
-    (lines, links)
+    (lines, links, cells)
 }
 
 /// An ATX header: 1..=6 leading `#` followed by a space (or end of line).
@@ -2643,7 +2776,8 @@ fn link_tagged_cells<'a>(spans: &'a [Span<'static>], links: &[InlineLink]) -> Ve
 /// Breaks at whitespace where it can, and HARD-BREAKS any token wider than the
 /// whole column (a path, a url, an unbroken CJK run) because no word boundary can
 /// help there. Only the whitespace a line actually BROKE on is dropped; every
-/// other char survives into some line.
+/// other char survives into some line, and what was dropped is handed back as the
+/// next line's [`WrappedRun::seam`].
 ///
 /// Every break lands on a GRAPHEME CLUSTER edge, never inside one, and that is
 /// not cosmetic. `Line::width` sums `unicode-width` PER SPAN and that width is a
@@ -2666,14 +2800,17 @@ fn link_tagged_cells<'a>(spans: &'a [Span<'static>], links: &[InlineLink]) -> Ve
 /// only the whitespace a line actually broke on is dropped, and nothing is ever
 /// reordered. That is what lets a caller follow a link label across the break —
 /// [`cell_link_fragments`].
-fn wrap_span_cells<'a>(cells: &[WrapCell<'a>], width: usize) -> Vec<Vec<WrapCell<'a>>> {
+fn wrap_span_cells<'a>(cells: &[WrapCell<'a>], width: usize) -> Vec<WrappedRun<'a>> {
     if width == 0 {
         return Vec::new();
     }
 
-    let mut lines: Vec<Vec<WrapCell<'a>>> = Vec::new();
+    let mut lines: Vec<WrappedRun<'a>> = Vec::new();
     let mut cur: Vec<WrapCell<'a>> = Vec::new();
     let mut cur_w = 0usize;
+    // What the break ahead of `cur` dropped, recorded where the drop happens so it
+    // cannot be re-derived (and mis-derived) from the lines afterwards.
+    let mut cur_seam = String::new();
 
     let mut i = 0usize;
     while i < cells.len() {
@@ -2705,7 +2842,11 @@ fn wrap_span_cells<'a>(cells: &[WrapCell<'a>], width: usize) -> Vec<Vec<WrapCell
 
         if !cur.is_empty() {
             if cur_w + gap_w + word_w > width {
-                lines.push(std::mem::take(&mut cur));
+                lines.push(WrappedRun {
+                    cells: std::mem::take(&mut cur),
+                    seam: std::mem::take(&mut cur_seam),
+                });
+                cur_seam = gap.iter().map(|c| c.text).collect();
                 cur_w = 0;
             } else {
                 cur.extend_from_slice(gap);
@@ -2735,7 +2876,11 @@ fn wrap_span_cells<'a>(cells: &[WrapCell<'a>], width: usize) -> Vec<Vec<WrapCell
                 take = 1;
             }
             cur.extend_from_slice(&rest[..take]);
-            lines.push(std::mem::take(&mut cur));
+            // A break INSIDE a word drops nothing, so the next line's seam is empty.
+            lines.push(WrappedRun {
+                cells: std::mem::take(&mut cur),
+                seam: std::mem::take(&mut cur_seam),
+            });
             cur_w = 0;
             rest = &rest[take..];
             if rest.is_empty() {
@@ -2744,9 +2889,23 @@ fn wrap_span_cells<'a>(cells: &[WrapCell<'a>], width: usize) -> Vec<Vec<WrapCell
         }
     }
     if !cur.is_empty() {
-        lines.push(cur);
+        lines.push(WrappedRun {
+            cells: cur,
+            seam: cur_seam,
+        });
     }
     lines
+}
+
+/// One visual line [`wrap_span_cells`] produced: its clusters, and the SEAM that
+/// joined it to the line above it — the whitespace the wrap dropped at the break
+/// before it, exactly as written (one space, or more where the cell held more), and
+/// empty for the first line and for a line that begins inside a word the wrap had
+/// to split. Joining a cell's lines by their seams gives the cell's text back
+/// ([`CellRegion::seam`]).
+struct WrappedRun<'a> {
+    cells: Vec<WrapCell<'a>>,
+    seam: String,
 }
 
 /// Is this grapheme cluster whitespace — i.e. a break opportunity for
@@ -2832,6 +2991,8 @@ fn pad_cell_spans(
 struct WrappedCellLine {
     spans: Vec<Span<'static>>,
     links: Vec<InlineLink>,
+    /// What the wrap dropped at the break before this line ([`WrappedRun::seam`]).
+    seam: String,
 }
 
 /// Wrap one table cell to `width` display columns: inline-parse `raw` over `base`
@@ -2851,13 +3012,14 @@ fn wrap_cell_spans(raw: &str, width: usize, align: Align, base: Style) -> Vec<Wr
     let cells = link_tagged_cells(&spans, &links);
     wrap_span_cells(&cells, width)
         .into_iter()
-        .map(|line| {
-            let fitted = coalesce_cells(&line);
+        .map(|run| {
+            let fitted = coalesce_cells(&run.cells);
             let w = spans_display_width(&fitted);
             let left = cell_pad_left(w, width, align);
             WrappedCellLine {
-                links: cell_link_fragments(&line, left, &links),
+                links: cell_link_fragments(&run.cells, left, &links),
                 spans: pad_cell_spans(fitted, w, width, align, base),
+                seam: run.seam,
             }
         })
         .collect()
@@ -3007,11 +3169,15 @@ fn column_floors(natural: &[usize]) -> Vec<usize> {
 ///   left for the pane's own soft wrap.
 ///
 /// Only the GRID layout records link regions: it returns one [`LinkRegion`] per
-/// wrapped cell-label fragment, in columns relative to its first line. Record mode
+/// wrapped cell-label fragment, in columns relative to its first line, and one
+/// [`CellRegion`] per wrapped cell line. Record mode
 /// returns none and draws its links [`LinkRender::Inert`] to match — see
 /// [`markdown_body_lines_collect`] for why, and [`TABLE_MIN_COL_WIDTH`] for what
 /// that means for a table a `Shift-←`/`→` layout step re-flows between the two.
-fn render_table(rows: &[&str], width: usize) -> (Vec<Line<'static>>, Vec<LinkRegion>, usize) {
+fn render_table(
+    rows: &[&str],
+    width: usize,
+) -> (Vec<Line<'static>>, Vec<LinkRegion>, Vec<CellRegion>, usize) {
     let headers = split_table_row(rows[0]);
     let ncols = headers.len().max(1);
 
@@ -3059,15 +3225,19 @@ fn render_table(rows: &[&str], width: usize) -> (Vec<Line<'static>>, Vec<LinkReg
     // chosen when its floors are actually affordable inside it.
     let floors = column_floors(&natural);
     let min_grid_width = floors.iter().sum::<usize>() + sep_total;
-    let (lines, links) = if min_grid_width <= width {
+    let (lines, links, cells) = if min_grid_width <= width {
         render_table_grid(&header_cells, &body_rows, &aligns, natural, &floors, width)
     } else {
         // Record mode records no regions at all: its lines are handed to the pane's
         // own soft wrap, which would move any column measured here. Its links are
         // drawn inert for the same reason (see `render_table_records`).
-        (render_table_records(&header_cells, &body_rows), Vec::new())
+        (
+            render_table_records(&header_cells, &body_rows),
+            Vec::new(),
+            Vec::new(),
+        )
     };
-    (lines, links, consumed)
+    (lines, links, cells, consumed)
 }
 
 /// The GRID layout: header row, `─┼─` separator, then one block of visual lines
@@ -3103,21 +3273,23 @@ fn render_table_grid(
     natural: Vec<usize>,
     floors: &[usize],
     width: usize,
-) -> (Vec<Line<'static>>, Vec<LinkRegion>) {
+) -> (Vec<Line<'static>>, Vec<LinkRegion>, Vec<CellRegion>) {
     let sep_total = COLUMN_RULE_WIDTH * floors.len().saturating_sub(1);
     let budget = width.saturating_sub(sep_total);
     let widths = fit_widths(natural, floors, budget);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut links: Vec<LinkRegion> = Vec::new();
+    let mut cells: Vec<CellRegion> = Vec::new();
 
-    let (header_lines, header_links) = table_data_lines(
+    let (header_lines, header_links, header_cells_at) = table_data_lines(
         header_cells,
         &widths,
         aligns,
         base_style().add_modifier(Modifier::BOLD),
     );
     links.extend(rebased(header_links, lines.len()));
+    cells.extend(rebased(header_cells_at, lines.len()));
     lines.extend(header_lines);
     lines.push(table_separator_line(&widths));
     for (i, row) in body_rows.iter().enumerate() {
@@ -3129,29 +3301,33 @@ fn render_table_grid(
         if i > 0 {
             lines.push(table_separator_line(&widths));
         }
-        let (row_lines, row_links) = table_data_lines(row, &widths, aligns, base_style());
+        let (row_lines, row_links, row_cells) =
+            table_data_lines(row, &widths, aligns, base_style());
         links.extend(rebased(row_links, lines.len()));
+        cells.extend(rebased(row_cells, lines.len()));
         lines.extend(row_lines);
     }
 
-    clamped_grid(lines, links, width)
+    clamped_grid(lines, links, cells, width)
 }
 
 /// Apply the [`clamp_line_to_width`] backstop to a finished grid, and keep its link
-/// regions honest about what the clamp left behind: a region reaching past the cut
-/// is CLIPPED to the columns that survived, and one left with no columns at all is
-/// DROPPED.
+/// and cell regions honest about what the clamp left behind: a region reaching past
+/// the cut is CLIPPED to the columns that survived, and one left with no columns at
+/// all is DROPPED.
 ///
 /// The clamp should never fire — grid mode is only entered when every column's
 /// floor fits the pane — but if drift ever made it fire, a region must not keep
 /// pointing at columns the line no longer draws, nor at the `…` that replaced them.
 /// Chrome is never clickable, including chrome that only appears once something
-/// else has already gone wrong.
+/// else has already gone wrong; and a selection must never be confined to a column
+/// the line no longer draws.
 fn clamped_grid(
     lines: Vec<Line<'static>>,
     links: Vec<LinkRegion>,
+    cells: Vec<CellRegion>,
     width: usize,
-) -> (Vec<Line<'static>>, Vec<LinkRegion>) {
+) -> (Vec<Line<'static>>, Vec<LinkRegion>, Vec<CellRegion>) {
     // Per row, the columns that still hold CELL TEXT: the whole line when it fit,
     // and everything but the trailing ellipsis when it did not.
     let mut visible: Vec<usize> = Vec::with_capacity(lines.len());
@@ -3177,7 +3353,17 @@ fn clamped_grid(
             })
         })
         .collect();
-    (clamped, links)
+    let cells = cells
+        .into_iter()
+        .filter_map(|r| {
+            let limit = visible.get(r.content_row).copied().unwrap_or(0);
+            (r.col_start < limit).then(|| CellRegion {
+                col_end: r.col_end.min(limit),
+                ..r
+            })
+        })
+        .collect();
+    (clamped, links, cells)
 }
 
 /// The narrow-pane FALLBACK layout: with no grid that can seat every column at
@@ -3258,7 +3444,9 @@ fn render_table_records(header_cells: &[String], body_rows: &[Vec<String>]) -> V
 /// and the grid never scatters. A row always occupies at least one line, even
 /// when every cell in it is empty.
 ///
-/// Alongside the lines it returns ONE [`LinkRegion`] per wrapped label fragment,
+/// Alongside the lines it returns ONE [`CellRegion`] per wrapped cell line (column
+/// span of the whole column, `cell_id` 0 as the cell's first line is always row 0 of
+/// the row) and ONE [`LinkRegion`] per wrapped label fragment,
 /// with `content_row` relative to the FIRST line returned here (the caller rebases
 /// it onto the transcript). A cell's fragments arrive in columns relative to that
 /// cell, and are shifted onto the row by the cell's own left edge — the running
@@ -3275,7 +3463,7 @@ fn table_data_lines(
     widths: &[usize],
     aligns: &[Align],
     cell_style: Style,
-) -> (Vec<Line<'static>>, Vec<LinkRegion>) {
+) -> (Vec<Line<'static>>, Vec<LinkRegion>, Vec<CellRegion>) {
     let wrapped: Vec<Vec<WrappedCellLine>> = widths
         .iter()
         .enumerate()
@@ -3285,6 +3473,7 @@ fn table_data_lines(
 
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(height);
     let mut links: Vec<LinkRegion> = Vec::new();
+    let mut cell_regions: Vec<CellRegion> = Vec::new();
     for row in 0..height {
         let mut spans: Vec<Span<'static>> = Vec::new();
         let mut edge = 0usize;
@@ -3296,6 +3485,15 @@ fn table_data_lines(
             match wrapped[c].get(row) {
                 Some(cell) => {
                     spans.extend(cell.spans.iter().cloned());
+                    // A cell's lines are consecutive from the row's first, so its
+                    // first line is row 0 here — the id the caller's rebase carries.
+                    cell_regions.push(CellRegion {
+                        content_row: row,
+                        col_start: edge,
+                        col_end: edge + *width,
+                        cell_id: 0,
+                        seam: cell.seam.clone(),
+                    });
                     links.extend(cell.links.iter().map(|l| LinkRegion {
                         content_row: row,
                         col_start: edge + l.col_start,
@@ -3310,7 +3508,7 @@ fn table_data_lines(
         }
         lines.push(Line::from(spans));
     }
-    (lines, links)
+    (lines, links, cell_regions)
 }
 
 /// Build a DIM box-drawing separator row: `─` fill per column, `─┼─` at the
@@ -3937,7 +4135,7 @@ mod tests {
         }));
         let origin = peer_origin(&record).expect("gate admits the record");
         let open: HashSet<&str> = [PEER_STEM].into_iter().collect();
-        let (lines, _, _) = peer_node_lines(&origin, &open, &record, &mut None, WIDE);
+        let lines = peer_node_lines(&origin, &open, &record, &mut None, WIDE).lines;
         let plain = flatten(&Text::from(lines));
 
         assert!(
@@ -4242,7 +4440,8 @@ mod tests {
             "body": format!("Preamble. {HANDBACK_PREAMBLE_MARKER}\n  a body no click could reach"),
         }));
         let origin = peer_origin(&record).expect("the gate does not require `from`");
-        let (lines, _, folds) = peer_node_lines(&origin, &HashSet::new(), &record, &mut None, WIDE);
+        let Block { lines, folds, .. } =
+            peer_node_lines(&origin, &HashSet::new(), &record, &mut None, WIDE);
         let plain = flatten(&Text::from(lines));
 
         assert!(
@@ -4501,7 +4700,12 @@ mod tests {
             "type": "user", "isMeta": true, "timestamp": "2026-09-25T08:05:00.000Z",
             "message": {"content": "Continue from where you left off."}
         });
-        let (lines, _, folds, unindexed) = injected_node_lines(
+        let Block {
+            lines,
+            folds,
+            unindexed,
+            ..
+        } = injected_node_lines(
             "Continue from where you left off.",
             &HashSet::new(),
             &record,
@@ -4662,9 +4866,8 @@ mod tests {
         });
         let open: HashSet<&str> = [PEER_STEM, INJECTED_UUID_KEY].into_iter().collect();
         let origin = peer_origin(&peer).expect("gate admits the record");
-        let (peer_lines, _, _) = peer_node_lines(&origin, &open, &peer, &mut None, WIDE);
-        let (injected_lines, _, _, _) =
-            injected_node_lines(BODY, &open, &injected, &mut None, WIDE);
+        let peer_lines = peer_node_lines(&origin, &open, &peer, &mut None, WIDE).lines;
+        let injected_lines = injected_node_lines(BODY, &open, &injected, &mut None, WIDE).lines;
 
         let plain_body = flatten(&Text::from(collapse_body_lines(BODY, WIDE)));
         for (kind, lines) in [("peer", peer_lines), ("injected", injected_lines)] {
@@ -4859,7 +5062,7 @@ mod tests {
         let stream = test_stream(RenderMode::Session, &index);
         let render = |block: Value| {
             let content = Value::Array(vec![block]);
-            let (lines, _, regions) = assistant_lines(&content, &stream);
+            let (lines, _, regions, _) = assistant_lines(&content, &stream);
             (flatten(&Text::from(lines)), regions.len())
         };
 
@@ -7325,7 +7528,7 @@ mod tests {
                 url: "dropped".to_string(),
             },
         ];
-        let (clamped, out) = clamped_grid(vec![line], links, 6);
+        let (clamped, out, _) = clamped_grid(vec![line], links, Vec::new(), 6);
         assert_eq!(
             line_text(&clamped[0]),
             "abcde\u{2026}",
@@ -7349,11 +7552,378 @@ mod tests {
                 col_end: 3,
                 url: "kept".to_string(),
             }],
+            Vec::new(),
             6,
         )
         .1;
         assert_eq!(kept.len(), 1);
         assert_eq!((kept[0].col_start, kept[0].col_end), (0, 3));
+    }
+
+    /// The text one wrapped cell line shows: its spans minus the alignment padding.
+    fn cell_line_text(line: &WrappedCellLine) -> String {
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        text.trim().to_string()
+    }
+
+    /// A cell's lines joined by their seams are the cell's text again, at EVERY width
+    /// — the invariant the copy of a cell confined selection ([`CellRegion::seam`])
+    /// stands on. A seam is only right if the wrapper records exactly what it
+    /// dropped at each break, so this wraps one cell several ways: plain prose, a
+    /// gap of two spaces (dropped whole at a break, so the seam is both), a token
+    /// wider than the column (split mid-word, so the seam there is empty) and a
+    /// wide-glyph run.
+    #[test]
+    fn a_cells_lines_joined_by_their_seams_are_the_cells_text_at_every_width() {
+        for raw in [
+            "first line of a long cell that wraps down its column",
+            "two  spaces  between  some  words here",
+            "short https://example.com/a/very/long/unbroken/path then words",
+            "\u{6f22}\u{5b57} \u{4eee}\u{540d} \u{4ea4}\u{3058}\u{308a}\u{6587}",
+            "one",
+        ] {
+            for width in 2..=64 {
+                let lines = wrap_cell_spans(raw, width, Align::Left, base_style());
+                let mut joined = String::new();
+                for (i, line) in lines.iter().enumerate() {
+                    if i == 0 {
+                        assert_eq!(line.seam, "", "the first line has nothing above it");
+                    }
+                    joined.push_str(&line.seam);
+                    joined.push_str(&cell_line_text(line));
+                }
+                assert_eq!(joined, raw, "width {width}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_line_that_starts_inside_a_split_word_has_an_empty_seam_and_a_line_after_a_break_the_gap() {
+        let lines = wrap_cell_spans("abcdefghij kl", 4, Align::Left, base_style());
+        let seams: Vec<(&str, String)> = lines
+            .iter()
+            .map(|l| (l.seam.as_str(), cell_line_text(l)))
+            .collect();
+        assert_eq!(
+            seams,
+            [
+                ("", "abcd".to_string()),
+                ("", "efgh".to_string()),
+                ("", "ij".to_string()),
+                (" ", "kl".to_string()),
+            ],
+            "a split inside a word drops nothing; the break before `kl` dropped a space"
+        );
+    }
+
+    /// The same table the selection tests are stated over: one long cell that wraps
+    /// onto two lines at 50 columns and three at 36, beside cells that do not.
+    const CELL_TABLE: &str = "| Key | Description | Owner |\n\
+                              |---|---|---|\n\
+                              | a1 | first line of a long cell that wraps down its column | alice |\n\
+                              | b2 | short | bob |";
+
+    #[test]
+    fn every_wrapped_cell_line_of_a_grid_records_its_columns_row_and_seam() {
+        let (lines, _, cells) = markdown_body_collect(CELL_TABLE, 36);
+        // The long cell: three lines, one region each, the same whole-column span.
+        // Its column starts after `Key`'s three columns and the rule's three.
+        let long: Vec<&CellRegion> = cells
+            .iter()
+            .filter(|c| c.cell_id == 2 && c.col_start == 6)
+            .collect();
+        assert_eq!(long.len(), 3, "one region per wrapped line: {cells:?}");
+        assert_eq!(
+            long.iter().map(|c| c.content_row).collect::<Vec<_>>(),
+            [2, 3, 4]
+        );
+        assert!(
+            long.iter()
+                .all(|c| (c.col_start, c.col_end) == (long[0].col_start, long[0].col_end)),
+            "every line spans the same column"
+        );
+        assert_eq!(
+            long.iter().map(|c| c.seam.as_str()).collect::<Vec<_>>(),
+            ["", " ", " "]
+        );
+        // The span is the column, rule to rule: the text inside it is the cell's.
+        let row = line_text(&lines[2]);
+        let text: String = row
+            .chars()
+            .skip(long[0].col_start)
+            .take(long[0].col_end - long[0].col_start)
+            .collect();
+        assert!(text.trim_end().starts_with("first line"), "{text:?}");
+        // The cells of one table row that start on the same row are told apart by
+        // column, and a cell is the (id, column) pair.
+        let keys: std::collections::HashSet<(usize, usize)> = cells
+            .iter()
+            .filter(|c| c.content_row == 2)
+            .map(CellRegion::cell)
+            .collect();
+        assert_eq!(keys.len(), 3, "Key, Description and Owner on the first row");
+    }
+
+    #[test]
+    fn cell_regions_shift_with_the_block_they_sit_in() {
+        let body = format!("intro\n\n{CELL_TABLE}");
+        let (_, _, cells) = markdown_body_collect(&body, 50);
+        let first = cells.iter().map(|c| c.cell_id).min().expect("cells");
+        assert_eq!(
+            first, 2,
+            "the header row sits two lines below `intro` + blank"
+        );
+        // Through a whole turn the block is rebased once more; the id moves with the
+        // row, or a cell's lines would stop agreeing on which cell they are.
+        let dir = unique_temp_dir("cell-regions");
+        let file = dir.join("sess.jsonl");
+        let jsonl = format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "assistant", "sessionId": "s", "cwd": "/x",
+                "timestamp": "2026-07-01T10:00:00.000Z",
+                "message": {"role": "assistant", "content": [
+                    {"type": "text", "text": body}
+                ]}
+            })
+        );
+        std::fs::write(&file, jsonl).expect("write temp jsonl");
+        let rendered = render_file_expanded(&file, 50, &[]);
+        let _ = std::fs::remove_dir_all(&dir);
+        let top = rendered
+            .cells
+            .iter()
+            .map(|c| c.cell_id)
+            .min()
+            .expect("cells");
+        assert_eq!(top, 2 + 2, "a blank line and the marker lead every turn");
+        for c in &rendered.cells {
+            assert!(
+                c.content_row >= c.cell_id,
+                "a line never sits above its cell's first: {c:?}"
+            );
+            let line = &rendered.text.lines[c.content_row];
+            assert!(
+                line_display_width(line) >= c.col_end,
+                "the span lies inside the drawn line: {c:?}"
+            );
+        }
+        let rows: Vec<usize> = rendered.cells.iter().map(|c| c.content_row).collect();
+        assert!(rows.windows(2).all(|w| w[0] <= w[1]), "content-row order");
+    }
+
+    /// Render `records` (JSONL, in order) at `width` with `open` fold keys open.
+    fn render_records(
+        tag: &str,
+        records: &[Value],
+        width: usize,
+        open: &[&str],
+    ) -> RenderedPreview {
+        let dir = unique_temp_dir(tag);
+        let file = dir.join("sess.jsonl");
+        let jsonl: String = records.iter().map(|r| format!("{r}\n")).collect();
+        std::fs::write(&file, jsonl).expect("write temp jsonl");
+        let rendered = render_file_expanded(&file, width, open);
+        let _ = std::fs::remove_dir_all(&dir);
+        rendered
+    }
+
+    /// A user turn ahead of a fold node, so the node's block is rebased past
+    /// earlier output and a region's row is not its row inside the block.
+    fn lead_in_turn() -> Value {
+        serde_json::json!({
+            "type": "assistant", "sessionId": "s", "cwd": "/x",
+            "timestamp": "2026-07-01T10:00:00.000Z",
+            "message": {"role": "assistant", "content": "an earlier turn\n\nwith two paragraphs"}
+        })
+    }
+
+    /// The fold node fixtures that carry [`CELL_TABLE`] as their body: the record,
+    /// and the fold key that opens it.
+    fn table_node_records() -> [(&'static str, Value, &'static str); 2] {
+        [
+            (
+                "peer",
+                peer_record(serde_json::json!({
+                    "kind": "peer", "from": PEER_STEM, "body": CELL_TABLE,
+                })),
+                PEER_STEM,
+            ),
+            (
+                "injected",
+                serde_json::json!({
+                    "type": "user", "isMeta": true, "uuid": "cell-inj-1",
+                    "timestamp": "2026-07-01T10:00:00.000Z",
+                    "message": {"content": CELL_TABLE}
+                }),
+                "injected:cell-inj-1",
+            ),
+        ]
+    }
+
+    /// A grid table in an OPEN peer or injected node records the same cells the
+    /// main body does, rebased onto the transcript: every region's columns hold the
+    /// drawn cell, its `cell_id` is the row the cell's first line is drawn on, and
+    /// the regions come out in content-row order. At a width that wraps the long
+    /// cell onto more lines than a wide pane does.
+    #[test]
+    fn an_open_peer_or_injected_node_records_its_grid_cells_where_they_are_drawn() {
+        for (kind, record, key) in table_node_records() {
+            for width in [50, 36] {
+                let rendered = render_records(
+                    "node-cells",
+                    &[lead_in_turn(), record.clone()],
+                    width,
+                    &[key],
+                );
+                let text = |row: usize| line_text(&rendered.text.lines[row]);
+                let header_row = (0..rendered.text.lines.len())
+                    .find(|&row| text(row).contains("Description"))
+                    .unwrap_or_else(|| panic!("{kind}: the table is not drawn"));
+                assert!(
+                    header_row > PEER_HEADER_BLOCK_ROW + 1,
+                    "{kind}: premise: the node sits below an earlier turn"
+                );
+                let ids: Vec<usize> = rendered.cells.iter().map(|c| c.cell_id).collect();
+                assert_eq!(
+                    ids.iter().min().copied(),
+                    Some(header_row),
+                    "{kind} @{width}: the first cell starts on the header row: {:?}",
+                    rendered.cells
+                );
+                let long: Vec<&CellRegion> = rendered
+                    .cells
+                    .iter()
+                    .filter(|c| c.cell_id == header_row + 2 && c.col_start == 6)
+                    .collect();
+                assert_eq!(
+                    long.len(),
+                    if width == 50 { 2 } else { 3 },
+                    "{kind} @{width}: one region per wrapped line of the long cell"
+                );
+                for c in &rendered.cells {
+                    assert!(c.content_row >= c.cell_id, "{kind}: {c:?}");
+                    let row = text(c.content_row);
+                    assert!(
+                        line_display_width(&rendered.text.lines[c.content_row]) >= c.col_end,
+                        "{kind} @{width}: the span lies inside the drawn line: {c:?}"
+                    );
+                    assert!(c.col_end <= width, "{kind}: cut to the pane: {c:?}");
+                    if c.col_start == 6 && c.cell_id == header_row + 2 {
+                        let in_column: String = row
+                            .chars()
+                            .skip(c.col_start)
+                            .take(c.col_end - c.col_start)
+                            .collect();
+                        let words = in_column.trim();
+                        assert!(
+                            !words.is_empty() && text(c.content_row).contains(words),
+                            "{kind} @{width}: the columns land on the cell's text: {in_column:?}"
+                        );
+                    }
+                }
+                let rows: Vec<usize> = rendered.cells.iter().map(|c| c.content_row).collect();
+                assert!(
+                    rows.windows(2).all(|w| w[0] <= w[1]),
+                    "{kind}: content-row order"
+                );
+                let first_long = long[0];
+                assert!(
+                    text(first_long.content_row)
+                        .chars()
+                        .skip(first_long.col_start)
+                        .collect::<String>()
+                        .trim_start()
+                        .starts_with("first line"),
+                    "{kind} @{width}: the long cell's first line sits at its region"
+                );
+            }
+        }
+    }
+
+    /// A COLLAPSED node draws no body, so there is no table to confine a drag to.
+    #[test]
+    fn a_collapsed_peer_or_injected_node_records_no_cell() {
+        for (kind, record, key) in table_node_records() {
+            let closed = render_records("node-closed", std::slice::from_ref(&record), 50, &[]);
+            assert!(
+                closed.cells.is_empty(),
+                "{kind}: a closed node records none: {:?}",
+                closed.cells
+            );
+            assert!(
+                !flatten(&closed.text).contains("Description"),
+                "{kind}: premise: the table is not drawn"
+            );
+            let open = render_records("node-open", &[record], 50, &[key]);
+            assert!(!open.cells.is_empty(), "{kind}: premise: open records");
+        }
+    }
+
+    /// A table in RECORD layout, or in a code fence, inside a node records none,
+    /// as in the main body.
+    #[test]
+    fn a_record_layout_or_fenced_table_in_a_node_records_no_cell() {
+        let fenced = format!("```\n{CELL_TABLE}\n```");
+        let peer = |body: &str| {
+            peer_record(serde_json::json!({"kind": "peer", "from": PEER_STEM, "body": body}))
+        };
+        let injected = |body: &str| {
+            serde_json::json!({
+                "type": "user", "isMeta": true, "uuid": "cell-inj-2",
+                "message": {"content": body}
+            })
+        };
+        for (kind, record, width, key) in [
+            ("peer record", peer(CELL_TABLE), 14, PEER_STEM),
+            ("peer fenced", peer(&fenced), 50, PEER_STEM),
+            (
+                "injected record",
+                injected(CELL_TABLE),
+                14,
+                "injected:cell-inj-2",
+            ),
+            (
+                "injected fenced",
+                injected(&fenced),
+                50,
+                "injected:cell-inj-2",
+            ),
+        ] {
+            let rendered = render_records("node-none", &[record], width, &[key]);
+            assert!(
+                flatten(&rendered.text).contains("first line")
+                    || flatten(&rendered.text).contains("Description"),
+                "{kind}: premise: the body is drawn"
+            );
+            assert!(rendered.cells.is_empty(), "{kind}: {:?}", rendered.cells);
+        }
+    }
+
+    #[test]
+    fn a_table_drawn_as_records_or_inside_a_fence_records_no_cell() {
+        let (_, _, records) = markdown_body_collect(CELL_TABLE, 14);
+        assert!(records.is_empty(), "record mode soft-wraps: {records:?}");
+        let fenced = format!("```\n{CELL_TABLE}\n```");
+        let (_, _, fenced) = markdown_body_collect(&fenced, 50);
+        assert!(
+            fenced.is_empty(),
+            "a table in a code block is text: {fenced:?}"
+        );
+    }
+
+    #[test]
+    fn the_clamp_backstop_clips_a_cell_region_like_a_link_region() {
+        let line = Line::from(Span::styled("abcdefghij".to_string(), base_style()));
+        let cell = |col_start, col_end| CellRegion {
+            content_row: 0,
+            col_start,
+            col_end,
+            cell_id: 0,
+            seam: String::new(),
+        };
+        let (_, _, out) = clamped_grid(vec![line], Vec::new(), vec![cell(1, 9), cell(7, 9)], 6);
+        assert_eq!(out, [cell(1, 5)], "clipped off the cut, the other dropped");
     }
 
     #[test]
