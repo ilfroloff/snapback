@@ -34,6 +34,23 @@ SNAPBACK_INSTALL_DIR=/usr/local/bin npx snapback-tui install
 
 To uninstall, delete the two binaries — `install` prints the exact command.
 
+### Alternative installation methods
+
+**Homebrew** (macOS and Linux):
+
+```sh
+brew install snapback
+```
+
+**Direct download** (curl + install script):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ilfroloff/snapback/main/scripts/install.sh | sh
+```
+
+Both alternatives install the same `snapback` and `sb` commands. See the
+[README](https://github.com/ilfroloff/snapback#install) for details.
+
 ### Run without installing
 
 ```sh
@@ -47,7 +64,8 @@ between your terminal and a program that owns raw mode and hands the terminal to
 ## Requirements
 
 - **`claude` on your `PATH`** — snapback resumes into it.
-- macOS (arm64/x64) or Linux (x64/arm64). On other platforms, build from source:
+- macOS (arm64/x64) or Linux (x64/arm64). Windows support is deferred until
+  Claude CLI supports Windows. On other platforms, build from source:
   `cargo install --git https://github.com/ilfroloff/snapback`
 
 ## Docs
