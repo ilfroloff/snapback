@@ -628,10 +628,32 @@ So only the PANE's wraps are joined. A wrap snapback makes ITSELF is a logical
 line break and copies as a `\n`, and the transcript has one: a GFM table in GRID
 layout, whose over-wide cells `store::preview` wraps down their columns
 (`wrap_span_cells` / `wrap_cell_spans`). Each grid line copies as a line of its
-own, so the copy reproduces the drawn grid row by row, as a terminal selection
-would. That is deliberate: do not join a cell's wrapped fragments back into one
-line. A table in RECORD layout is ordinary logical lines the pane soft-wraps, so
-its wraps are joined like any other line's.
+own, so a flowing drag across the grid reproduces it row by row, as a terminal
+selection would. That is deliberate: do not join a cell's wrapped fragments back
+into one line — with ONE exception, a selection confined to a single cell.
+
+A drag whose PRESS lands in a grid cell and whose pointer stays in that cell's
+column is confined to the cell: `view::TableCells::confine` pulls each end back
+into the cell's own lines (an end above the first line to its start, below the
+last to its end), `flow_runs` cuts every row to the column and starts each at its
+first drawn cell (alignment padding is chrome), and the copy joins the rows by
+each line's `CellRegion::seam` — the whitespace `wrap_span_cells` dropped at the
+break, empty inside a split word — instead of a `\n`, so a cell drawn on three
+lines pastes as the one line it was written as. The seam is recorded where the
+wrapper drops it (`WrappedRun::seam`), never re-derived from the lines. Highlight
+and copy both come from `selected_runs`, so they confine identically. The pointer
+leaving the column, a press outside every cell, and a double-click's word all keep
+the flowing rule. Regions are recorded for GRID tables of a user or assistant
+body and of an OPEN peer-message or injected-context node's body, all drawn by the
+one `collapse_body_collect` pass (a collapsed node draws no body and records none;
+a RECORD layout and a table drawn inside a code fence record none), are cut to the
+pane by `clamped_grid` like link regions, and come out in content-row order, which
+the lookups rely on. A node's body is dimmed, never indented, so its regions'
+columns are the drawn cell's, and they are rebased past the node's blank and
+header lines by the one `rebased` pass.
+
+A table in RECORD layout is ordinary logical lines the pane soft-wraps, so its
+wraps are joined like any other line's.
 
 The preview's own scroll is **bottom-anchored by default**
 (`App::preview_follow_bottom` starts true, is re-armed on every selection change
@@ -709,7 +731,7 @@ inner rect when there is no banner (so a banner-less pane's geometry is exactly
   structural reason, not by care — a grid line is clamped to the pane width, so it
   NEVER reaches ratatui's wrapper, and the two models therefore cannot disagree
   about a table. That same fact is what lets a grid cell record a clickable
-  `LinkRegion` at all: its columns are the columns painted, with no wrap in between
+  `LinkRegion` (or a `CellRegion`) at all: its columns are the columns painted, with no wrap in between
   to move them, so a grid region always resolves at `sub_row` 0. Record mode is the
   other side of it and records nothing — its lines ARE handed to ratatui's wrapper.
   The one height it does take — `table_data_lines` sizing a row by

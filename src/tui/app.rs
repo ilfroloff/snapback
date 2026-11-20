@@ -780,7 +780,7 @@ pub struct ContentPos {
 /// joins between rows differ from the screen: a `\n` at each of the transcript's
 /// own line breaks, and a soft-wrapped line's rows joined by that line's own text
 /// (`view::copied_text`; PATTERNS.md §5 owns the rule, and why a grid table's
-/// wrapped cells still copy row by row).
+/// wrapped cells still copy row by row unless the drag is confined to one cell).
 ///
 /// A DOUBLE-CLICK records a [`SelectionUnit::Word`] selection instead: `anchor` and
 /// `cursor` are both the clicked cell, and the view expands it to the UAX #29 word
@@ -7475,7 +7475,7 @@ impl App {
     }
 
     /// The selected session's WHOLE rendered transcript at `inner_width` — its
-    /// logical lines and their wrapped-row prefix map — BORROWED from the SAME
+    /// logical lines, their wrapped-row prefix map and its grid table cells' regions — BORROWED from the SAME
     /// width-scoped cache the pane draws from, or `None` when nothing is selected.
     ///
     /// What a released selection is copied from: `view::preview_selection_copy`
@@ -7483,12 +7483,21 @@ impl App {
     /// pane's own widget over these very lines — so rows the pane never drew copy
     /// exactly as it would have drawn them. Borrowed, not cloned: the redraw clones
     /// only the lines each chunk can reach (`view::row_window`), never the whole.
+    ///
+    /// The table cells' regions ride along from the SAME entry: the highlight reads
+    /// them through here too, so what it covers and what the copy takes cannot come
+    /// from two renders (`view::TableCells::confine`).
     pub(crate) fn preview_transcript(
         &mut self,
         inner_width: u16,
-    ) -> Option<(&[Line<'static>], &[usize])> {
-        self.ensure_preview(inner_width)
-            .map(|p| (p.rendered.text.lines.as_slice(), p.row_prefix.as_slice()))
+    ) -> Option<(&[Line<'static>], &[usize], &[preview::CellRegion])> {
+        self.ensure_preview(inner_width).map(|p| {
+            (
+                p.rendered.text.lines.as_slice(),
+                p.row_prefix.as_slice(),
+                p.rendered.cells.as_slice(),
+            )
+        })
     }
 }
 
