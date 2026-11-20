@@ -40,7 +40,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::agents::{self, AgentActivity, ReportedAgent};
 use crate::resume::ModelPick;
 use crate::search::SearchMode;
-use crate::store::preview::{self, FoldRegion, LinkRegion, SubagentRegion};
+use crate::store::preview::{self, CellRegion, FoldRegion, LinkRegion, SubagentRegion};
 use crate::store::skills::CommandKind;
 use crate::store::subagents::{Subagent, SubagentRecord, SubagentStatus};
 use crate::store::{lineage, FailedTask};
@@ -4549,24 +4549,65 @@ struct SelectedRun {
 /// [`flow_span_on_row`] span cut at its last drawn cell ([`cut_at_last_text_cell`]),
 /// `None` for a row that cut found blank — the edge rows NOT yet trimmed.
 ///
-/// Untrimmed because the release copy ([`selection_copy_text`]) draws a long
+/// `band` is the half-open range of buffer columns a drag confined to one table
+/// cell ([`CellSpan`]) may reach: with it, EVERY row's span is cut to the band
+/// before the blank rule runs (so a middle row no longer reaches edge to edge), and
+/// its start moves on to the first drawn cell, so the alignment padding a centered
+/// or right-aligned cell draws ahead of its text is not selected. `None` is the
+/// flowing selection of every other drag. Untrimmed because the release copy
+/// ([`selection_copy_text`]) draws a long
 /// selection in chunks, and a blank row at a chunk's edge may be a paragraph break
 /// inside the selection rather than an edge of it. The copy keeps each chunk's
 /// drawn rows and needs no trim: a blank row adds no text of its own. Pure over a
 /// `Buffer`.
-fn flow_runs(buf: &Buffer, start: Position, end: Position, rect: Rect) -> Vec<Option<SelectedRun>> {
+fn flow_runs(
+    buf: &Buffer,
+    start: Position,
+    end: Position,
+    rect: Rect,
+    band: Option<(u16, u16)>,
+) -> Vec<Option<SelectedRun>> {
     (start.y..=end.y)
         .filter_map(|y| flow_span_on_row(start, end, rect, y).map(|span| (y, span)))
         .map(|(y, span)| {
-            cut_at_last_text_cell(buf, y, span).map(|(x0, x1)| SelectedRun { y, x0, x1 })
+            let span = match band {
+                Some(band) => clip_to_band(span, band)?,
+                None => span,
+            };
+            let (x0, x1) = cut_at_last_text_cell(buf, y, span)?;
+            let x0 = if band.is_some() {
+                first_text_cell(buf, y, (x0, x1))
+            } else {
+                x0
+            };
+            Some(SelectedRun { y, x0, x1 })
         })
         .collect()
 }
 
+/// The part of row span `[x0, x1)` inside `band`, or `None` when none of it is.
+fn clip_to_band((x0, x1): (u16, u16), (b0, b1): (u16, u16)) -> Option<(u16, u16)> {
+    let (x0, x1) = (x0.max(b0), x1.min(b1));
+    (x0 < x1).then_some((x0, x1))
+}
+
+/// The first drawn (non-blank, [`is_blank_symbol`]) column of row `y` in `[x0, x1)`,
+/// or `x0` when the span holds none. The start-side twin of
+/// [`cut_at_last_text_cell`].
+fn first_text_cell(buf: &Buffer, y: u16, (x0, x1): (u16, u16)) -> u16 {
+    (x0..x1)
+        .find(|&x| {
+            buf.cell((x, y))
+                .is_some_and(|cell| !is_blank_symbol(cell.symbol()))
+        })
+        .unwrap_or(x0)
+}
+
 /// What a selection between the ordered endpoints `start` and `end`, confined to
 /// transcript rect `rect`, actually selects in `buf`, top to bottom: its
-/// [`flow_runs`] with the blank rows at either edge dropped
-/// ([`trim_blank_edge_rows`]). Empty when the selection covers blank cells alone.
+/// [`flow_runs`] (cut to `band` for a drag inside one table cell) with the blank
+/// rows at either edge dropped ([`trim_blank_edge_rows`]). Empty when the selection
+/// covers blank cells alone.
 ///
 /// The ONE rule both the highlight and the copy apply, which is what keeps the
 /// reverse-videoed cells and the copied text the same cells: the highlight calls it
@@ -4579,8 +4620,151 @@ fn selected_runs(
     start: Position,
     end: Position,
     rect: Rect,
+    band: Option<(u16, u16)>,
 ) -> Vec<Option<SelectedRun>> {
-    trim_blank_edge_rows(&flow_runs(buf, start, end, rect)).to_vec()
+    trim_blank_edge_rows(&flow_runs(buf, start, end, rect, band)).to_vec()
+}
+
+/// The transcript's grid table cells, as a selection reads them: every
+/// [`CellRegion`] and the wrapped-row map ([`wrapped_row_prefix`]) that says which
+/// row each one is drawn on. Both come from the ONE cache entry the pane draws
+/// from. `default()` is a transcript with no table, which confines nothing.
+#[derive(Debug, Clone, Copy, Default)]
+struct TableCells<'a> {
+    regions: &'a [CellRegion],
+    row_prefix: &'a [usize],
+}
+
+/// A drag that began in a grid table cell and has not left its column: the
+/// selection stays INSIDE that one cell, whichever rows the pointer crossed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CellSpan {
+    /// The drag's ends in reading order, each pulled back into the cell's lines
+    /// ([`TableCells::confine`]).
+    start: ContentPos,
+    end: ContentPos,
+    /// The cell's column, `[start, end)` in cells from the transcript rect's left
+    /// edge: what every row of the selection is cut to.
+    band: (u16, u16),
+}
+
+impl<'a> TableCells<'a> {
+    /// The region of the grid cell drawn at content cell `at`, or `None` when no
+    /// cell is. A grid line is clamped to the pane and never soft-wraps, so a line
+    /// that occupies more than the one row `at` names is no grid line this map
+    /// describes, and answers `None` rather than a guess.
+    fn region_at(self, at: ContentPos) -> Option<&'a CellRegion> {
+        let line = line_at_row(self.row_prefix, at.row);
+        let one_row = self.row_prefix.get(line) == Some(&at.row)
+            && self.row_prefix.get(line + 1) == Some(&(at.row + 1));
+        if !one_row {
+            return None;
+        }
+        let from = self.regions.partition_point(|r| r.content_row < line);
+        self.regions[from..]
+            .iter()
+            .take_while(|r| r.content_row == line)
+            .find(|r| (r.col_start..r.col_end).contains(&usize::from(at.col)))
+    }
+
+    /// The last LINE of the cell `cell` ([`CellRegion::cell`]) starts at: the
+    /// cell's lines are consecutive from its `cell_id`, and the regions are in
+    /// line order, so one forward walk from there finds the end.
+    fn last_line_of(self, cell: (usize, usize)) -> usize {
+        let mut last = cell.0;
+        let from = self.regions.partition_point(|r| r.content_row < cell.0);
+        for r in &self.regions[from..] {
+            if r.content_row > last + 1 {
+                break;
+            }
+            if r.content_row == last + 1 && r.cell() == cell {
+                last += 1;
+            }
+        }
+        last
+    }
+
+    /// Where a drag from `anchor` to `cursor` stays inside one table cell: `Some`
+    /// when the PRESS (`anchor`) landed in a grid cell and the pointer (`cursor`)
+    /// is still in that cell's column, on whichever row.
+    ///
+    /// Each end is pulled back into the cell's own lines — an end above the first
+    /// to that line's start, an end below the last to that line's end — so an
+    /// overshoot stops at the cell instead of running on into the rule and the next
+    /// row. `None` for everything else, which keeps the flowing selection: a press
+    /// outside any cell, a pointer that left the column, a transcript with no table.
+    ///
+    /// Pure and shared: the highlight ([`visible_selection_runs`]) and the copy
+    /// ([`selection_copy_text`]) both ask it, over the same cache entry, so they
+    /// confine identically.
+    fn confine(self, anchor: ContentPos, cursor: ContentPos) -> Option<CellSpan> {
+        let press = self.region_at(anchor)?;
+        let band = (
+            u16::try_from(press.col_start).ok()?,
+            u16::try_from(press.col_end).ok()?,
+        );
+        if !(band.0..band.1).contains(&cursor.col) {
+            return None;
+        }
+        let first = *self.row_prefix.get(press.cell_id)?;
+        let last = *self.row_prefix.get(self.last_line_of(press.cell()))?;
+        let pull = |at: ContentPos| {
+            if at.row < first {
+                ContentPos {
+                    row: first,
+                    col: band.0,
+                }
+            } else if at.row > last {
+                ContentPos {
+                    row: last,
+                    col: band.1 - 1,
+                }
+            } else {
+                at
+            }
+        };
+        let (a, b) = (pull(anchor), pull(cursor));
+        Some(CellSpan {
+            start: a.min(b),
+            end: a.max(b),
+            band,
+        })
+    }
+}
+
+/// What joins the rows of a copy confined to one table cell: the regions to read
+/// each line's seam from, and the cell's column, which picks the cell's own region
+/// out of a row's.
+#[derive(Debug, Clone, Copy)]
+struct CellCopy<'a> {
+    regions: &'a [CellRegion],
+    col_start: u16,
+}
+
+impl<'a> CellCopy<'a> {
+    /// The text the cell wrapper dropped at the break before logical line `line`
+    /// ([`CellRegion::seam`]); empty where this cell has no region on it.
+    fn seam(self, line: usize) -> &'a str {
+        let from = self.regions.partition_point(|r| r.content_row < line);
+        self.regions[from..]
+            .iter()
+            .take_while(|r| r.content_row == line)
+            .find(|r| r.col_start == usize::from(self.col_start))
+            .map_or("", |r| r.seam.as_str())
+    }
+
+    /// The cell's drawn rows `rows` as the text the cell holds: each row after the
+    /// first behind the seam of the break that put it there, so a cell drawn on
+    /// three lines copies as the one line it was written as. `None` for no rows.
+    fn join(self, row_prefix: &[usize], rows: &[(usize, String)]) -> Option<String> {
+        let ((_, head), tail) = rows.split_first()?;
+        let mut out = head.clone();
+        for (row, text) in tail {
+            out.push_str(self.seam(line_at_row(row_prefix, *row)));
+            out.push_str(text);
+        }
+        Some(out)
+    }
 }
 
 /// The runs a double-click at `at` selects: the ONE word under that cell on its
@@ -4809,13 +4993,19 @@ fn soft_wrap_seams(
 /// are one line the pane soft-wrapped, and are joined by that line's own text at
 /// the seam ([`soft_wrap_seams`]), which stands in for the lower row's leading blank
 /// cells. A GFM grid table's wrapped cells are lines `store::preview` broke itself,
-/// so they copy row by row, as drawn — on purpose (PATTERNS.md §5). Pure.
+/// so a flowing selection over them copies row by row, as drawn — on purpose
+/// (PATTERNS.md §5) — and only a selection confined to ONE cell (`cell`) joins its
+/// rows by that cell's own seams instead ([`CellCopy::join`]). Pure.
 fn copied_text(
     lines: &[Line<'_>],
     row_prefix: &[usize],
     width: u16,
     rows: &[(usize, String)],
+    cell: Option<CellCopy<'_>>,
 ) -> Option<String> {
+    if let Some(cell) = cell {
+        return cell.join(row_prefix, rows);
+    }
     let mut out = String::new();
     let mut above: Option<usize> = None;
     for group in rows.chunk_by(|a, b| line_at_row(row_prefix, a.0) == line_at_row(row_prefix, b.0))
@@ -4916,6 +5106,7 @@ fn visible_selection_runs(
     rect: Rect,
     scroll: u32,
     transcript_rows: usize,
+    cells: TableCells<'_>,
 ) -> Vec<Option<SelectedRun>> {
     let top = usize::try_from(scroll).unwrap_or(usize::MAX);
     let bottom = top
@@ -4926,9 +5117,20 @@ fn visible_selection_runs(
     }
     let window = RowWindow { rect, top, bottom };
     match selection.unit {
-        SelectionUnit::Chars => window
-            .flow_ends(selection.anchor, selection.cursor)
-            .map_or_else(Vec::new, |(from, to)| selected_runs(buf, from, to, rect)),
+        SelectionUnit::Chars => {
+            let span = cells.confine(selection.anchor, selection.cursor);
+            let (a, b) = span.map_or((selection.anchor, selection.cursor), |s| (s.start, s.end));
+            // The band is in content columns; the buffer's are the rect's offset.
+            let band = span.map(|s| {
+                (
+                    rect.x.saturating_add(s.band.0),
+                    rect.x.saturating_add(s.band.1),
+                )
+            });
+            window.flow_ends(a, b).map_or_else(Vec::new, |(from, to)| {
+                selected_runs(buf, from, to, rect, band)
+            })
+        }
         SelectionUnit::Word => window
             .word_cell(selection.anchor)
             .map_or_else(Vec::new, |at| word_runs(buf, at, rect)),
@@ -4960,8 +5162,15 @@ fn overlay_preview_selection(frame: &mut Frame, app: &mut App) {
     }
     let transcript_rows = app.preview_wrapped_rows(rect.width);
     let scroll = app.preview_scroll;
+    let cells = app
+        .preview_transcript(rect.width)
+        .map(|(_, row_prefix, regions)| TableCells {
+            regions,
+            row_prefix,
+        })
+        .unwrap_or_default();
     let buf = frame.buffer_mut();
-    for run in visible_selection_runs(buf, selection, rect, scroll, transcript_rows)
+    for run in visible_selection_runs(buf, selection, rect, scroll, transcript_rows, cells)
         .iter()
         .flatten()
     {
@@ -5105,12 +5314,14 @@ fn selection_copy_text(
     row_prefix: &[usize],
     selection: PreviewSelection,
     width: u16,
+    regions: &[CellRegion],
 ) -> Option<String> {
     selection_copy_text_in_chunks(
         lines,
         row_prefix,
         selection,
         width,
+        regions,
         SELECTION_COPY_CHUNK_ROWS,
     )
 }
@@ -5122,6 +5333,7 @@ fn selection_copy_text_in_chunks(
     row_prefix: &[usize],
     selection: PreviewSelection,
     width: u16,
+    regions: &[CellRegion],
     chunk_rows: u16,
 ) -> Option<String> {
     let transcript_rows = row_prefix.last().copied().unwrap_or(0);
@@ -5147,12 +5359,17 @@ fn selection_copy_text_in_chunks(
     }
     // The selection's rows, clamped to the transcript's own: the reply tail below
     // them is not in this cache, and the highlight never covers it either.
-    let first = selection.anchor.min(selection.cursor).row;
-    let last = selection
-        .anchor
-        .max(selection.cursor)
-        .row
-        .min(transcript_rows - 1);
+    // A drag inside one table cell reaches the cell alone ([`TableCells::confine`]),
+    // the same ends the highlight draws.
+    let span = TableCells {
+        regions,
+        row_prefix,
+    }
+    .confine(selection.anchor, selection.cursor);
+    let (a, b) = span.map_or((selection.anchor, selection.cursor), |s| (s.start, s.end));
+    let band = span.map(|s| s.band);
+    let first = a.min(b).row;
+    let last = a.max(b).row.min(transcript_rows - 1);
     if first > last {
         return None;
     }
@@ -5169,9 +5386,9 @@ fn selection_copy_text_in_chunks(
             top,
             bottom: top + usize::from(height),
         };
-        if let Some((from, to)) = window.flow_ends(selection.anchor, selection.cursor) {
+        if let Some((from, to)) = window.flow_ends(a, b) {
             rows.extend(
-                flow_runs(&buf, from, to, buf.area)
+                flow_runs(&buf, from, to, buf.area, band)
                     .into_iter()
                     .flatten()
                     .map(|run| (top + usize::from(run.y), run_text(&buf, run))),
@@ -5179,7 +5396,11 @@ fn selection_copy_text_in_chunks(
         }
         top = window.bottom;
     }
-    copied_text(lines, row_prefix, width, &rows)
+    let cell = span.map(|s| CellCopy {
+        regions,
+        col_start: s.band.0,
+    });
+    copied_text(lines, row_prefix, width, &rows, cell)
 }
 
 /// What a released preview selection copies: [`selection_copy_text`] over the
@@ -5190,8 +5411,8 @@ fn selection_copy_text_in_chunks(
 pub(crate) fn preview_selection_copy(app: &mut App) -> Option<String> {
     let selection = app.preview_selection()?;
     let width = preview_transcript_rect(app).width;
-    let (lines, row_prefix) = app.preview_transcript(width)?;
-    selection_copy_text(lines, row_prefix, selection, width)
+    let (lines, row_prefix, regions) = app.preview_transcript(width)?;
+    selection_copy_text(lines, row_prefix, selection, width, regions)
 }
 
 /// Resolve the final vertical preview offset: pin to the bottom when following,
@@ -9051,7 +9272,7 @@ mod tests {
             // Right of "world", down through the empty last row.
             (Position { x: 6, y: 2 }, Position { x: 9, y: 3 }),
         ] {
-            let runs = selected_runs(&buf, start, end, rect);
+            let runs = selected_runs(&buf, start, end, rect, None);
             assert_eq!(runs, Vec::new(), "{start:?}..{end:?} covers no drawn text");
             assert_eq!(selection_text(&buf, &runs), None);
         }
@@ -9066,7 +9287,13 @@ mod tests {
         let buf = paragraph_buffer();
         let rect = buf.area;
 
-        let whole = selected_runs(&buf, Position { x: 0, y: 0 }, Position { x: 9, y: 3 }, rect);
+        let whole = selected_runs(
+            &buf,
+            Position { x: 0, y: 0 },
+            Position { x: 9, y: 3 },
+            rect,
+            None,
+        );
         assert_eq!(
             whole,
             vec![
@@ -9083,8 +9310,13 @@ mod tests {
 
         // A drag that starts right of "hello" drops that row AND the empty one
         // under it: both are blank edge rows, so no leading newline survives.
-        let from_blank =
-            selected_runs(&buf, Position { x: 7, y: 0 }, Position { x: 2, y: 2 }, rect);
+        let from_blank = selected_runs(
+            &buf,
+            Position { x: 7, y: 0 },
+            Position { x: 2, y: 2 },
+            rect,
+            None,
+        );
         assert_eq!(from_blank, vec![Some(SelectedRun { y: 2, x0: 0, x1: 3 })]);
         assert_eq!(selection_text(&buf, &from_blank).as_deref(), Some("wor"));
     }
@@ -9095,7 +9327,7 @@ mod tests {
         let lines = vec![Line::from(text.to_string())];
         let prefix = wrapped_row_prefix(&lines, width);
         assert_eq!(prefix.last(), Some(&1), "premise: {text:?} fits one row");
-        selection_copy_text(&lines, &prefix, chars((0, anchor), (0, cursor)), width)
+        selection_copy_text(&lines, &prefix, chars((0, anchor), (0, cursor)), width, &[])
     }
 
     /// A wide character copies as itself: the column to its right that it covers is
@@ -9138,6 +9370,7 @@ mod tests {
             Position { x: 1, y: 0 },
             Position { x: 5, y: 0 },
             buf.area,
+            None,
         );
         assert_eq!(runs, vec![Some(SelectedRun { y: 0, x0: 1, x1: 5 })]);
         assert_eq!(selection_text(&buf, &runs).as_deref(), Some("字仮"));
@@ -9186,7 +9419,14 @@ mod tests {
         let rect = Rect::new(1, 2, 4, 3);
         let run = |y: u16, x0: u16, x1: u16| Some(SelectedRun { y, x0, x1 });
         let visible = |selection: PreviewSelection, transcript_rows: usize| {
-            visible_selection_runs(&buf, selection, rect, 10, transcript_rows)
+            visible_selection_runs(
+                &buf,
+                selection,
+                rect,
+                10,
+                transcript_rows,
+                TableCells::default(),
+            )
         };
 
         assert_eq!(
@@ -9289,7 +9529,7 @@ mod tests {
             .flatten()
             .map(|&run| (top + usize::from(run.y - rect.y), run_text(buf, run)))
             .collect();
-        copied_text(lines, prefix, rect.width, &rows)
+        copied_text(lines, prefix, rect.width, &rows, None)
     }
 
     /// The copy is the same whatever the chunk height: every chunk edge — a blank
@@ -9328,7 +9568,7 @@ mod tests {
             let (start, end) = ordered(pin(anchor), pin(cursor));
             let expected = copy_off_buffer(
                 &whole,
-                &selected_runs(&whole, start, end, whole.area),
+                &selected_runs(&whole, start, end, whole.area, None),
                 whole.area,
                 0,
                 &lines,
@@ -9345,6 +9585,7 @@ mod tests {
                         &prefix,
                         chars(anchor, cursor),
                         width,
+                        &[],
                         chunk
                     ),
                     expected,
@@ -9353,7 +9594,7 @@ mod tests {
             }
         }
         assert_eq!(
-            selection_copy_text(&lines, &prefix, chars((rows, 0), (rows + 9, 5)), width),
+            selection_copy_text(&lines, &prefix, chars((rows, 0), (rows + 9, 5)), width, &[]),
             None,
             "a selection wholly past the transcript copies nothing"
         );
@@ -9363,7 +9604,13 @@ mod tests {
     fn copy_all(lines: &[Line<'static>], width: u16) -> Option<String> {
         let prefix = wrapped_row_prefix(lines, width);
         let rows = *prefix.last().expect("a prefix map");
-        selection_copy_text(lines, &prefix, chars((0, 0), (rows - 1, width - 1)), width)
+        selection_copy_text(
+            lines,
+            &prefix,
+            chars((0, 0), (rows - 1, width - 1)),
+            width,
+            &[],
+        )
     }
 
     /// A line the pane only SOFT-wrapped copies as the one line it is: a row the
@@ -9527,7 +9774,7 @@ mod tests {
         ];
         for (lines, prefix, width, anchor, cursor, expected) in cases {
             assert_eq!(
-                selection_copy_text(lines, prefix, chars(anchor, cursor), width).as_deref(),
+                selection_copy_text(lines, prefix, chars(anchor, cursor), width, &[]).as_deref(),
                 Some(expected),
                 "{anchor:?}..{cursor:?} at width {width}"
             );
@@ -9625,7 +9872,7 @@ mod tests {
             scrolls.push(app.preview_scroll);
             let (lines, prefix) = app
                 .preview_transcript(rect.width)
-                .map(|(lines, prefix)| (lines.to_vec(), prefix.to_vec()))
+                .map(|(lines, prefix, _)| (lines.to_vec(), prefix.to_vec()))
                 .expect("the parity session's transcript");
             let top = usize::try_from(app.preview_scroll).expect("fits");
             for &a in &cells {
@@ -9636,7 +9883,7 @@ mod tests {
                         continue; // a zero-length drag is a click, not a selection
                     }
                     let (start, end) = ordered(a, b);
-                    let runs = selected_runs(&drawn, start, end, rect);
+                    let runs = selected_runs(&drawn, start, end, rect, None);
                     let shown = copy_off_buffer(&drawn, &runs, rect, top, &lines, &prefix);
                     assert_eq!(
                         preview_selection_copy(&mut app),
@@ -9667,6 +9914,581 @@ mod tests {
         );
         assert!(compared > 1000, "premise: the sweep compared {compared}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- a drag inside a grid table cell stays in the cell --------------------
+
+    /// A grid whose Description cell wraps onto several lines at [`CELL_PANE`].
+    const CELL_TABLE_MD: &str = "| Key | Description | Owner |\n\
+         |---|---|---|\n\
+         | a1 | first line of a long cell that wraps down its column and then keeps \
+going until a third line | alice |\n\
+         | b2 | short | bob |";
+
+    /// The cell's text as written, which a confined copy must give back whole.
+    const CELL_TEXT: &str = "first line of a long cell that wraps down its column and then \
+                             keeps going until a third line";
+
+    /// The pane the cell tests draw: wide enough for a grid, tall enough to show
+    /// the whole transcript, so no row is off screen unless a test scrolls.
+    const CELL_PANE: (u16, u16) = (56, 24);
+
+    /// A pane over one session whose only turn holds `paragraphs`, with the helpers
+    /// the cell tests share: draw it WITH the selection overlay, find text on the
+    /// screen, and drag between two cells reading both the highlight and the copy.
+    struct CellPane {
+        app: App,
+        rect: Rect,
+        dir: PathBuf,
+    }
+
+    impl CellPane {
+        fn new(tag: &str, paragraphs: &[&str]) -> Self {
+            let dir = unique_temp_dir(tag);
+            let session = paragraphs_session(&dir, tag, 1, paragraphs);
+            Self::over(dir, session)
+        }
+
+        /// A pane over a session whose only record is `record`, a peer or an
+        /// injected node, with the node under `key` OPENED through the toggle a
+        /// click on its header makes.
+        fn over_node(tag: &str, record: &serde_json::Value, key: &str) -> Self {
+            let dir = unique_temp_dir(tag);
+            let file = dir.join(format!("{tag}.jsonl"));
+            std::fs::write(&file, format!("{record}\n")).expect("write the node fixture");
+            let mut session = sample_session();
+            session.file = file;
+            session.session_id = tag.to_string();
+            session.cwd = PathBuf::from("/tmp");
+            let mut pane = Self::over(dir, session);
+            let width = pane.rect.width;
+            pane.app.toggle_peer_fold(key, width);
+            pane
+        }
+
+        fn over(dir: PathBuf, session: Session) -> Self {
+            let (width, height) = CELL_PANE;
+            let mut app = App::new(vec![session], Scope::All, PathBuf::from("/tmp/launch"));
+            app.preview_rect = Rect::new(0, 0, width, height);
+            let rect = preview_transcript_rect(&app);
+            CellPane { app, rect, dir }
+        }
+
+        /// The pane as the real frame draws it: the transcript, then the overlay.
+        fn buffer(&mut self) -> Buffer {
+            let (width, height) = CELL_PANE;
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+            terminal
+                .draw(|frame| {
+                    render_preview(frame, &mut self.app, frame.area());
+                    overlay_preview_selection(frame, &mut self.app);
+                })
+                .expect("draw");
+            terminal.backend().buffer().clone()
+        }
+
+        fn row_text(&self, buf: &Buffer, y: u16) -> String {
+            (0..buf.area.width)
+                .map(|x| buf.cell((x, y)).map_or(" ", |c| c.symbol()))
+                .collect()
+        }
+
+        /// Where `needle` starts on screen: its first occurrence in reading order,
+        /// or its last with `last`. A column is a char: every glyph the grid draws is one cell.
+        fn find(&mut self, needle: &str, last: bool) -> Position {
+            let buf = self.buffer();
+            let mut hits = (0..buf.area.height).flat_map(|y| {
+                let row = self.row_text(&buf, y);
+                row.match_indices(needle)
+                    .map(|(byte, _)| Position {
+                        x: u16::try_from(row[..byte].chars().count()).expect("fits"),
+                        y,
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let hit = if last { hits.next_back() } else { hits.next() };
+            hit.unwrap_or_else(|| panic!("{needle:?} is not drawn"))
+        }
+
+        /// Drag from `from` to `to`; the text of every row the overlay reverse-videoed
+        /// (one string per row, top to bottom) and what a release copies.
+        fn drag(&mut self, from: Position, to: Position) -> (Vec<String>, Option<String>) {
+            let rect = self.rect;
+            self.app.begin_preview_press(from, rect);
+            self.app.extend_preview_selection(to, rect);
+            let buf = self.buffer();
+            let highlighted = (0..buf.area.height)
+                .filter_map(|y| {
+                    let row: String = (0..buf.area.width)
+                        .filter(|&x| {
+                            buf.cell((x, y))
+                                .is_some_and(|c| c.modifier.contains(Modifier::REVERSED))
+                        })
+                        .map(|x| buf.cell((x, y)).map_or(" ", |c| c.symbol()))
+                        .collect();
+                    (!row.is_empty()).then_some(row)
+                })
+                .collect();
+            (highlighted, preview_selection_copy(&mut self.app))
+        }
+
+        /// Assert the drag highlights the cell's text row by row and copies it as one
+        /// line, equal to `expected`.
+        fn assert_drag(&mut self, from: Position, to: Position, expected: &str) {
+            let (shown, copied) = self.drag(from, to);
+            assert_eq!(copied.as_deref(), Some(expected), "{from:?} -> {to:?}");
+            assert_eq!(
+                shown.join(" "),
+                expected,
+                "the highlight covers the copied text and nothing else: {shown:?}"
+            );
+        }
+    }
+
+    impl Drop for CellPane {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// The cell's last drawn cell: its last line's last character.
+    fn end_of_cell_text(pane: &mut CellPane) -> Position {
+        let at = pane.find("line", true);
+        Position {
+            x: at.x + 3,
+            y: at.y,
+        }
+    }
+
+    /// The reproduction: dragging from the cell's first word to the end of its text
+    /// copies the cell as ONE line, and the highlight is the cell's text alone — not
+    /// the next column, not the `│` rule.
+    #[test]
+    fn a_drag_inside_a_cell_copies_the_cell_as_written_and_highlights_only_it() {
+        let mut pane = CellPane::new("cell-whole", &[CELL_TABLE_MD]);
+        let from = pane.find("first", false);
+        let to = end_of_cell_text(&mut pane);
+        assert!(to.y >= from.y + 2, "premise: the cell wraps onto 3+ lines");
+        pane.assert_drag(from, to, CELL_TEXT);
+        let (shown, _) = pane.drag(from, to);
+        assert!(
+            shown
+                .iter()
+                .all(|row| !row.contains('\u{2502}') && !row.contains("alice")),
+            "{shown:?}"
+        );
+    }
+
+    /// An overshoot that stays in the column stops at the cell's last line: down
+    /// past it (through the row rule into the next row) copies the same cell.
+    #[test]
+    fn an_overshoot_down_the_column_stops_at_the_cells_last_line() {
+        let mut pane = CellPane::new("cell-down", &[CELL_TABLE_MD]);
+        let from = pane.find("first", false);
+        let last = end_of_cell_text(&mut pane);
+        for rows_past in [1, 2, 3] {
+            let to = Position {
+                x: from.x + 2,
+                y: last.y + rows_past,
+            };
+            pane.assert_drag(from, to, CELL_TEXT);
+        }
+        // Down to the transcript's own bottom edge, still in the column.
+        let bottom = Position {
+            x: from.x,
+            y: pane.rect.bottom() - 1,
+        };
+        pane.assert_drag(from, bottom, CELL_TEXT);
+    }
+
+    /// A drag that goes UP — the pointer ends before the press — and overshoots the
+    /// cell's first line (into the header cell above it) copies from the cell's
+    /// start to the pressed cell.
+    #[test]
+    fn a_drag_going_up_stops_at_the_cells_first_line() {
+        let mut pane = CellPane::new("cell-up", &[CELL_TABLE_MD]);
+        let press = end_of_cell_text(&mut pane);
+        let header = pane.find("Description", false);
+        pane.assert_drag(press, header, CELL_TEXT);
+        // Up within the cell, from the end to a word mid-cell.
+        let mid = pane.find("wraps", false);
+        pane.assert_drag(
+            press,
+            mid,
+            "wraps down its column and then keeps going until a third line",
+        );
+    }
+
+    /// A drag that starts mid-cell, on the first line or on a later one, begins
+    /// where it was pressed and runs to the cell's end.
+    #[test]
+    fn a_drag_starting_mid_cell_begins_at_the_press_on_any_of_its_lines() {
+        let mut pane = CellPane::new("cell-mid", &[CELL_TABLE_MD]);
+        let to = end_of_cell_text(&mut pane);
+        let on_first_line = pane.find("long", false);
+        pane.assert_drag(
+            on_first_line,
+            to,
+            "long cell that wraps down its column and then keeps going until a third line",
+        );
+        let on_later_line = pane.find("keeps", false);
+        assert!(on_later_line.y > on_first_line.y, "premise: a later line");
+        pane.assert_drag(on_later_line, to, "keeps going until a third line");
+        // A short drag wholly inside one line is a plain word-range copy.
+        let a = pane.find("wraps", false);
+        pane.assert_drag(a, Position { x: a.x + 4, y: a.y }, "wraps");
+    }
+
+    /// A pointer that LEAVES the cell's column hands the drag back to the flowing
+    /// selection: the rule, the next column and the next row are all selected and the
+    /// copy goes row by row, as drawn.
+    #[test]
+    fn a_drag_that_leaves_the_column_flows_as_it_always_did() {
+        let mut pane = CellPane::new("cell-leaves", &[CELL_TABLE_MD]);
+        let from = pane.find("first", false);
+        let owner = pane.find("alice", false);
+        let (shown, copied) = pane.drag(
+            from,
+            Position {
+                x: owner.x + 2,
+                y: owner.y + 1,
+            },
+        );
+        let copied = copied.expect("a flowing copy");
+        assert!(
+            copied.contains('\u{2502}') && copied.contains("alice") && copied.contains('\n'),
+            "row by row, rule and next column included: {copied:?}"
+        );
+        assert_ne!(copied, CELL_TEXT);
+        assert!(shown.len() >= 2, "{shown:?}");
+        // Dragged from the same press into the Key column to its left.
+        let key = pane.find("a1", false);
+        let (_, copied) = pane.drag(from, key);
+        assert!(
+            copied.expect("copy").contains("a1"),
+            "left of the column too"
+        );
+    }
+
+    /// A press outside any cell — prose above the grid, the `│` rule, a short
+    /// cell's padding below its text — is the flowing selection it always was, even
+    /// when the drag then runs down a column.
+    #[test]
+    fn a_press_outside_any_cell_flows_as_it_always_did() {
+        let mut pane = CellPane::new("cell-outside", &["intro text above", CELL_TABLE_MD]);
+        let from = pane.find("intro", false);
+        let to = pane.find("first", false);
+        let (_, copied) = pane.drag(
+            from,
+            Position {
+                x: to.x + 4,
+                y: to.y,
+            },
+        );
+        let copied = copied.expect("a flowing copy");
+        assert!(
+            copied.starts_with("intro text above") && copied.contains("Description"),
+            "{copied:?}"
+        );
+        // A press on the rule between two columns.
+        let rule = pane.find("\u{2502}", false);
+        let (_, copied) = pane.drag(
+            rule,
+            Position {
+                x: to.x + 4,
+                y: to.y,
+            },
+        );
+        assert!(
+            copied.expect("copy").contains("Key"),
+            "from the rule: flowing"
+        );
+    }
+
+    /// A cell split MID-WORD (a token wider than the column) joins with an empty
+    /// seam, so the copy is the token with nothing inserted at the breaks.
+    #[test]
+    fn a_cell_split_mid_word_copies_without_a_seam() {
+        let token = "abcdefghij".repeat(8);
+        let table = format!("| K | D |\n|---|---|\n| a | {token} |\n| b | z |");
+        let mut pane = CellPane::new("cell-split", &[&table]);
+        let from = pane.find("abcdefghij", false);
+        let (_, copied) = pane.drag(
+            from,
+            Position {
+                x: from.x,
+                y: from.y + 8,
+            },
+        );
+        assert_eq!(copied.as_deref(), Some(token.as_str()));
+    }
+
+    /// A right-aligned cell draws a short line behind padding; neither the highlight
+    /// nor the copy takes it, though the press landed in the padding.
+    #[test]
+    fn a_right_aligned_cell_selects_its_text_without_the_padding() {
+        let table =
+            "| K | D |\n|---|---:|\n| a | one two three four five six seven eight nine ten \
+                     eleven twelve thirteen fourteen fifteen |";
+        let mut pane = CellPane::new("cell-right", &[table]);
+        let first = pane.find("one", false);
+        let second = pane.find("eleven", false);
+        assert_eq!(
+            second.y,
+            first.y + 1,
+            "premise: the cell wraps onto two lines"
+        );
+        // The column starts after `K`'s one column and the rule's three.
+        let column = pane.find("K", false).x + 4;
+        assert!(
+            second.x > column + 5,
+            "premise: the short line sits behind padding"
+        );
+        let (shown, copied) = pane.drag(
+            Position {
+                x: column,
+                y: second.y,
+            },
+            Position {
+                x: column + 2,
+                y: second.y + 3,
+            },
+        );
+        assert_eq!(
+            copied.as_deref(),
+            Some("eleven twelve thirteen fourteen fifteen")
+        );
+        assert_eq!(shown, ["eleven twelve thirteen fourteen fifteen"]);
+    }
+
+    /// A double-click selects the one word under it, in a cell as anywhere.
+    #[test]
+    fn a_double_click_in_a_cell_still_selects_one_word() {
+        let mut pane = CellPane::new("cell-word", &[CELL_TABLE_MD]);
+        let at = pane.find("wraps", false);
+        let rect = pane.rect;
+        pane.app.begin_word_selection(at, rect);
+        assert_eq!(
+            preview_selection_copy(&mut pane.app).as_deref(),
+            Some("wraps")
+        );
+    }
+
+    /// The release copy draws the transcript in chunks; a cell crossing every chunk
+    /// edge copies the same text as one big chunk.
+    #[test]
+    fn a_confined_copy_is_the_same_across_any_chunk_size() {
+        let mut pane = CellPane::new("cell-chunks", &[CELL_TABLE_MD]);
+        let from = pane.find("first", false);
+        let to = end_of_cell_text(&mut pane);
+        let rect = pane.rect;
+        pane.app.begin_preview_press(from, rect);
+        pane.app.extend_preview_selection(
+            Position {
+                x: to.x,
+                y: to.y + 2,
+            },
+            rect,
+        );
+        let selection = pane.app.preview_selection().expect("a selection");
+        let (lines, prefix, regions) = pane
+            .app
+            .preview_transcript(rect.width)
+            .map(|(l, p, r)| (l.to_vec(), p.to_vec(), r.to_vec()))
+            .expect("a transcript");
+        for chunk in [1, 2, 3, 5, SELECTION_COPY_CHUNK_ROWS] {
+            assert_eq!(
+                selection_copy_text_in_chunks(
+                    &lines, &prefix, selection, rect.width, &regions, chunk
+                )
+                .as_deref(),
+                Some(CELL_TEXT),
+                "chunks of {chunk}"
+            );
+        }
+    }
+
+    /// The two fold node kinds that carry [`CELL_TABLE_MD`] as their body: a peer
+    /// (hand-back) record and an injected-context record, each with the fold key
+    /// that opens it.
+    fn table_node_fixtures() -> [(&'static str, serde_json::Value, &'static str); 2] {
+        let from = "a03505fe4b1c2d3e0";
+        [
+            (
+                "peer",
+                serde_json::json!({
+                    "type": "user", "sessionId": "p", "cwd": "/tmp",
+                    "timestamp": "2026-07-01T10:00:00.000Z",
+                    "origin": {"kind": "peer", "from": from, "body": CELL_TABLE_MD},
+                    "message": {"content": "Another Claude session sent a message"}
+                }),
+                from,
+            ),
+            (
+                "injected",
+                serde_json::json!({
+                    "type": "user", "sessionId": "i", "cwd": "/tmp", "isMeta": true,
+                    "uuid": "cell-inj-1", "timestamp": "2026-07-01T10:00:00.000Z",
+                    "message": {"content": CELL_TABLE_MD}
+                }),
+                "injected:cell-inj-1",
+            ),
+        ]
+    }
+
+    /// The table inside an open peer (hand-back) node or injected-context node
+    /// behaves as the same table in a turn: a drag inside the long cell, down or up
+    /// past it, from mid-cell, copies the cell as the one line it was written as
+    /// and highlights only it, and a drag out of the column still flows row by row.
+    #[test]
+    fn a_drag_inside_a_cell_of_a_peer_or_injected_node_stays_in_the_cell() {
+        for (kind, record, key) in table_node_fixtures() {
+            let mut pane = CellPane::over_node(&format!("cell-node-{kind}"), &record, key);
+            let from = pane.find("first", false);
+            let to = end_of_cell_text(&mut pane);
+            assert!(to.y >= from.y + 2, "{kind}: premise: the cell wraps");
+            pane.assert_drag(from, to, CELL_TEXT);
+            let (shown, _) = pane.drag(from, to);
+            assert!(
+                shown
+                    .iter()
+                    .all(|row| !row.contains('\u{2502}') && !row.contains("alice")),
+                "{kind}: {shown:?}"
+            );
+            // Down past the cell's last line, into the next row, still in the column.
+            let past = Position {
+                x: from.x + 2,
+                y: to.y + 2,
+            };
+            pane.assert_drag(from, past, CELL_TEXT);
+            // Up from the end into the header cell above it.
+            let header = pane.find("Description", false);
+            pane.assert_drag(to, header, CELL_TEXT);
+            // From a later line, to the cell's end: the wrapped seam joins as written.
+            let later = pane.find("keeps", false);
+            pane.assert_drag(later, to, "keeps going until a third line");
+            // Out of the column the flowing rule is back.
+            let owner = pane.find("alice", false);
+            let (_, copied) = pane.drag(
+                from,
+                Position {
+                    x: owner.x + 2,
+                    y: owner.y + 1,
+                },
+            );
+            let copied = copied.expect("a flowing copy");
+            assert!(
+                copied.contains('\u{2502}') && copied.contains("alice") && copied.contains('\n'),
+                "{kind}: {copied:?}"
+            );
+        }
+    }
+
+    fn cell_line(row: usize, cell_id: usize, cols: (usize, usize), seam: &str) -> CellRegion {
+        CellRegion {
+            content_row: row,
+            col_start: cols.0,
+            col_end: cols.1,
+            cell_id,
+            seam: seam.to_string(),
+        }
+    }
+
+    fn content_at(row: usize, col: u16) -> ContentPos {
+        ContentPos { row, col }
+    }
+
+    /// The pure rule over hand-built regions: a cell on rows 2..=4, columns 6..20,
+    /// beside another on row 2 and a rule on row 5. One row per line (prefix is the
+    /// identity map).
+    #[test]
+    fn confine_pulls_both_ends_into_the_cell_when_the_pointer_stays_in_its_column() {
+        let regions = [
+            cell_line(2, 2, (0, 4), ""),
+            cell_line(2, 2, (6, 20), ""),
+            cell_line(3, 2, (6, 20), " "),
+            cell_line(4, 2, (6, 20), " "),
+        ];
+        let prefix: Vec<usize> = (0..10).collect();
+        let cells = TableCells {
+            regions: &regions,
+            row_prefix: &prefix,
+        };
+        let span = |a, b| cells.confine(a, b).map(|s| (s.start, s.end, s.band));
+        // Press mid-cell, drag down past its last line, in the column.
+        assert_eq!(
+            span(content_at(3, 8), content_at(8, 10)),
+            Some((content_at(3, 8), content_at(4, 19), (6, 20)))
+        );
+        // Up past its first line: the start is the first line's left edge.
+        assert_eq!(
+            span(content_at(3, 8), content_at(0, 7)),
+            Some((content_at(2, 6), content_at(3, 8), (6, 20)))
+        );
+        // Upward drag within the cell: ends come back in reading order.
+        assert_eq!(
+            span(content_at(4, 12), content_at(2, 9)),
+            Some((content_at(2, 9), content_at(4, 12), (6, 20)))
+        );
+        // Pointer left the column: not confined.
+        assert_eq!(span(content_at(3, 8), content_at(3, 20)), None);
+        assert_eq!(span(content_at(3, 8), content_at(3, 5)), None);
+        // Press outside any cell: the other column's gap, the rule row, a row
+        // beyond the regions.
+        assert_eq!(span(content_at(3, 2), content_at(3, 8)), None);
+        assert_eq!(span(content_at(5, 8), content_at(5, 9)), None);
+        assert_eq!(span(content_at(9, 8), content_at(9, 9)), None);
+        // The other cell on the first row is its own cell.
+        assert_eq!(
+            span(content_at(2, 1), content_at(6, 2)),
+            Some((content_at(2, 1), content_at(2, 3), (0, 4)))
+        );
+    }
+
+    /// A line that occupies more than one row is no grid line: nothing confines,
+    /// whatever the regions say, rather than a guess at which row the region is on.
+    #[test]
+    fn confine_answers_none_for_a_line_that_spans_more_than_one_row() {
+        let regions = [cell_line(1, 1, (0, 4), "")];
+        let prefix = [0, 1, 3, 4]; // line 1 wraps onto rows 1 and 2
+        let cells = TableCells {
+            regions: &regions,
+            row_prefix: &prefix,
+        };
+        assert_eq!(cells.confine(content_at(1, 1), content_at(1, 2)), None);
+        assert_eq!(cells.confine(content_at(2, 1), content_at(2, 2)), None);
+        assert_eq!(
+            TableCells::default().confine(content_at(0, 0), content_at(0, 1)),
+            None
+        );
+    }
+
+    /// A cell's rows join by each line's own seam, whatever the seam is.
+    #[test]
+    fn a_cells_rows_join_by_the_seam_of_the_line_each_one_starts() {
+        let regions = [
+            cell_line(2, 2, (6, 20), ""),
+            cell_line(3, 2, (6, 20), "  "),
+            cell_line(4, 2, (6, 20), ""),
+            cell_line(4, 4, (30, 40), "other"),
+        ];
+        let prefix: Vec<usize> = (0..10).collect();
+        let copy = CellCopy {
+            regions: &regions,
+            col_start: 6,
+        };
+        let rows = |texts: &[&str]| -> Vec<(usize, String)> {
+            texts
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (2 + i, (*t).to_string()))
+                .collect()
+        };
+        assert_eq!(
+            copy.join(&prefix, &rows(&["ab", "cd", "ef"])).as_deref(),
+            Some("ab  cdef")
+        );
+        assert_eq!(copy.join(&prefix, &[]), None);
     }
 
     /// The paragraphs of every turn of [`wide_parity_session`]: CJK and emoji, each
@@ -9725,7 +10547,7 @@ mod tests {
         );
         app.preview_rect = Rect::new(0, 0, width, height);
         let rect = preview_transcript_rect(&app);
-        let (lines, prefix) = app.preview_transcript(rect.width).expect("a transcript");
+        let (lines, prefix, _) = app.preview_transcript(rect.width).expect("a transcript");
         assert!(
             prefix.windows(2).all(|w| w[1] - w[0] == 1),
             "premise: every line is one row at width {}",
@@ -9737,7 +10559,7 @@ mod tests {
             "premise: the transcript overflows the pane"
         );
         let all = chars((0, 0), (rows - 1, rect.width - 1));
-        let whole = selection_copy_text(lines, prefix, all, rect.width).expect("text");
+        let whole = selection_copy_text(lines, prefix, all, rect.width, &[]).expect("text");
         for line in WIDE_PARITY_LINES {
             assert!(
                 whole.contains(line),
@@ -9763,7 +10585,8 @@ mod tests {
                         continue;
                     }
                     let (start, end) = ordered(a, b);
-                    let shown = selection_text(&drawn, &selected_runs(&drawn, start, end, rect));
+                    let shown =
+                        selection_text(&drawn, &selected_runs(&drawn, start, end, rect, None));
                     assert_eq!(
                         preview_selection_copy(&mut app),
                         shown,
@@ -9815,7 +10638,7 @@ mod tests {
             "premise: row 5 overruns the pane"
         );
 
-        let copied = selection_copy_text(&lines, &prefix, chars((0, 0), (rows - 1, 1)), 2)
+        let copied = selection_copy_text(&lines, &prefix, chars((0, 0), (rows - 1, 1)), 2, &[])
             .expect("the line copies");
         assert!(copied.starts_with("漢字 仮名  交"), "{copied:?}");
         let word = |col: u16| PreviewSelection {
@@ -9824,11 +10647,11 @@ mod tests {
             unit: SelectionUnit::Word,
         };
         assert_eq!(
-            selection_copy_text(&lines, &prefix, word(0), 2).as_deref(),
+            selection_copy_text(&lines, &prefix, word(0), 2, &[]).as_deref(),
             Some("交")
         );
         assert_eq!(
-            selection_copy_text(&lines, &prefix, word(1), 2).as_deref(),
+            selection_copy_text(&lines, &prefix, word(1), 2, &[]).as_deref(),
             Some("交")
         );
     }
@@ -9860,12 +10683,12 @@ mod tests {
                 .collect();
             for &anchor in &cells {
                 for &cursor in &cells {
-                    let _ = selection_copy_text(&lines, &prefix, chars(anchor, cursor), width);
+                    let _ = selection_copy_text(&lines, &prefix, chars(anchor, cursor), width, &[]);
                 }
             }
             let all = chars((0, 0), (rows - 1, width - 1));
             assert!(
-                selection_copy_text(&lines, &prefix, all, width).is_some(),
+                selection_copy_text(&lines, &prefix, all, width, &[]).is_some(),
                 "{text:?} at width {width} copies"
             );
         }
@@ -9947,7 +10770,7 @@ mod tests {
             let rows = *prefix.last().expect("a prefix map");
             let all = chars((0, 0), (rows - 1, width - 1));
             assert!(
-                selection_copy_text(&lines, &prefix, all, width).is_some(),
+                selection_copy_text(&lines, &prefix, all, width, &[]).is_some(),
                 "width {width}: the transcript copies"
             );
             for row in 0..rows {
@@ -9958,7 +10781,7 @@ mod tests {
                         cursor: at,
                         unit: SelectionUnit::Word,
                     };
-                    let _ = selection_copy_text(&lines, &prefix, word, width);
+                    let _ = selection_copy_text(&lines, &prefix, word, width, &[]);
                 }
             }
         }
@@ -10052,7 +10875,7 @@ mod tests {
                 let drawn = preview_buffer(&mut app, width, height);
                 let (lines, prefix) = app
                     .preview_transcript(rect.width)
-                    .map(|(lines, prefix)| (lines.to_vec(), prefix.to_vec()))
+                    .map(|(lines, prefix, _)| (lines.to_vec(), prefix.to_vec()))
                     .expect("the transcript");
                 let top = usize::try_from(app.preview_scroll).expect("fits");
                 let (a, b) = (
@@ -10068,7 +10891,7 @@ mod tests {
                 app.begin_preview_press(a, rect);
                 app.extend_preview_selection(b, rect);
                 if app.has_preview_selection() {
-                    let runs = selected_runs(&drawn, a, b, rect);
+                    let runs = selected_runs(&drawn, a, b, rect, None);
                     let shown = copy_off_buffer(&drawn, &runs, rect, top, &lines, &prefix);
                     assert_eq!(
                         preview_selection_copy(&mut app),
