@@ -166,12 +166,23 @@ keystroke appends here — or, for the other process shape claude reports under
 that `kind`, its in-flight `claude -p` reply does; see
 [what `kind: "interactive"` denotes](#what-kind-interactive-denotes)) and a
 background agent is judged by its
-[activity bucket](#activity-buckets-agentactivity): `NeedsInput`,
-`WorkingButIdle`, `Done` and `Ended` are parked and deletable; `Working`, `Idle`
-and `Other` are refused, the last of those because an unreadable qualifier must
-not authorize an irreversible unlink. An INTERACTIVE record whose process the
-kernel says is gone never reaches the guard at all; a background record always
-does, whatever its pid, and its bucket decides as above (the `pid` note below).
+[activity bucket](#activity-buckets-agentactivity): `NeedsInput`, `Done` and
+`Ended` are parked and deletable; `Working`, `WorkingButIdle`, `Idle` and `Other`
+are refused, `Other` because an unreadable qualifier must not authorize an
+irreversible unlink, and `WorkingButIdle` because its pair cannot show that no
+turn is coming (the [activity buckets](#activity-buckets-agentactivity) section
+says why). An INTERACTIVE record whose process the kernel says is gone never
+reaches the guard at all; a background record always does, whatever its pid, and
+its bucket decides as above (the `pid` note below).
+
+The refusal for a running agent (`DELETE_RUNNING_REFUSAL`) names `Ctrl-K` first
+and Claude Code second as the way to stop it. `Ctrl-K` is open to every bucket
+that gets that refusal: `send::interrupt_gate` confirms a stop for `Working`,
+`WorkingButIdle`, `Idle` and `Other` alike, whenever the record carries a job id
+or a pid a signal could take. A record with neither gets `Ctrl-K`'s own refusal,
+which is why the Claude Code route stays in the message. The copy does not say a
+stop lifts the refusal: whether `claude stop` clears a `WorkingButIdle` job
+has not been tried.
 
 Those are `can_delete`'s two refusals, and they cover only TWO of the four
 writers. The other two are snapback's OWN. The third is a
@@ -1698,7 +1709,8 @@ claude keeps a job running after the process its record names has gone was not
 observed. So the writer question is not re-derived for a background record, and
 dropping one could let the delete guard unlink, `Ctrl-R` reply to, and the move
 relocate a job that still runs. A background record therefore always reaches the
-gates, and the delete guard still refuses a `Working`, `Idle` or `Other` one.
+gates, and the delete guard still refuses a `Working`, `WorkingButIdle`, `Idle`
+or `Other` one.
 
 A reused pid is safe both ways: a running newcomer keeps the record, as before
 this filter, and a pid is only reused once claude's own process was reaped.
@@ -1914,28 +1926,57 @@ bucket property: `NeedsInput` draws its `needs input` at the badge's own color +
 **`WorkingButIdle` is the only bucket classified from the raw `state`/`status`
 PAIR rather than the collapsed qualifier, and the only translated one with no
 wire token behind it** (`NeedsInput` relabels tokens `claude` actually sends;
-this one names a contradiction `claude` never spells out). When `claude`
-interrupts a background agent it
-does **not** reconcile the job: `claude agents --json` keeps reporting
-`state=working` while that same record's `status` reads `idle`. `classify`
-detects that self-contradiction **before** the qualifier collapse (which would
-otherwise hide it as a plain `Working`) and buckets it here. It then renders the
-working `Gray` but **STEADY** — the absent pulse, not a second color, is what
-sets it apart — and translates the phrase to `interrupted` (there is no
-`interrupted` token on the wire; the word names the contradiction, in `claude`'s
-own vocabulary). Like every other bucket it never answers "live?" and never
-gates resume/attach, which stay on `live_agents` membership — but it is **not**
-display-only, and its two non-display consumers read it DELIBERATELY DIFFERENTLY.
-At the `Ctrl-R`/`Ctrl-K` gates it is granted **no action of its own**: it rides
-with the LIVE states rather than with `Ended`, so nothing is ever stopped on the
-strength of the inference. At the hard-delete writer guard (`delete::can_delete`)
-it is an ALLOW arm, because that gate asks the narrower "is a write in flight?"
-and `claude` appends by re-opening the path — so retuning what lands here widens
-an irreversible unlink and not just a steady dot. The internal name stays
-descriptive (`WorkingButIdle`) precisely because the signal cannot prove the
-*cause* the UI word implies; the accepted false-positive (a healthy agent briefly
-at `working`/`idle`) self-heals to `Working`+pulse on the next poll once `status`
-flips to `busy`.
+this one names a pair `claude` never spells out).
+
+*What the pair means (read from the `claude` 2.1.322/2.1.326 bundle, not
+observed):* for a background job, `claude agents --json` prints a `state` that
+`y(i,s)` computes from the job record `i` and a process `status` `s`. `y` is,
+verbatim
+(2.1.326 @334939115, just before `export{L as printAgentsJson}`; 2.1.322
+@306640834, the same body under other minified names):
+
+```js
+function y(i,s){if(s==="busy")return"working";let n=DE(i.state);if(zl(i)&&!(n==="success"&&zue(i)))return n==="success"?"done":n==="failure"?"failed":"stopped";if(i.tempo==="blocked"||s==="waiting")return"blocked";return"working"}
+```
+
+`DE` maps exactly `done`, `failed` and `stopped` to a word; `zl(e)` is
+`CM(e.state)&&e.tempo!=="active"` (2.1.326 @292720338), a job whose `state` is
+one of those three at a tempo other than `active`; and `zue(e)` (@292720987)
+lets some `done` jobs fall through to the checks after it. Whatever reaches the
+last two checks reads `working` unless the tempo is `blocked` or `s` is
+`waiting`. So `working` beside `idle` is a job record for which `y` returned none
+of `done`/`failed`/`stopped`, and which was not at a `blocked` tempo, on a process
+record whose `status` was neither `busy` nor `waiting`. `y` reads no clock: the
+code read here sets no time limit on the pair, so it holds as long as the two
+records keep those values and can persist. What puts a record in that shape,
+and whether anything else changes it later, is not recorded here.
+
+`classify` detects the pair **before** the qualifier collapse (which would
+otherwise hide it as a plain `Working`) and renders the working `Gray` but
+**STEADY** — the absent pulse, not a second color, sets it apart — with the
+phrase `interrupted`. That word is snapback's own: no such token is on the wire,
+`y` does not say why a record is in this shape, and whether `claude`'s own UI
+uses the word for it is undetermined. The internal name stays descriptive
+(`WorkingButIdle`) because the signal cannot prove the cause the word implies.
+It never gates resume/attach (`live_agents` membership does), but both
+non-display consumers route it with the LIVE states:
+
+- `Ctrl-R` refuses it and `Ctrl-K` confirms first. It is granted **no action of
+  its own**, so nothing is stopped on the strength of the inference.
+- The hard-delete writer guard (`delete::can_delete`) REFUSES it, with
+  `Working`, `Idle` and `Other` (`DELETE_RUNNING_REFUSAL`): that gate asks "is a
+  write in flight?", and nothing in `y` rules out a live agent that writes
+  again. Only `NeedsInput`, `Done` and `Ended` are deletable, so retuning what
+  lands here moves an irreversible unlink and not just a steady dot.
+
+*Observed:* a live `claude --bg` probe at 2.1.326 (2026-11-17, bare `claude
+agents --json` about every 250 ms)
+went `working` with no `status` → `working`+`busy` → `blocked`+`waiting` and
+read no `working`+`idle` poll; no local observation of the pair is claimed.
+
+*Undetermined:* why a record reaches the pair and how long it stays; whether a
+launch's first seconds ever show it; whether `claude stop` clears such a job;
+and whether `claude`'s own UI calls it "interrupted".
 
 **Every column above is a DISPLAY decision, and no bucket answers "live?".** The
 table once carried a liveness column and it was the bug: liveness is not a
@@ -1950,25 +1991,25 @@ it doing right now":
 
 * the hard-delete writer guard (`delete::can_delete`, see
   [the one write into this tree](#on-disk-layout)), which asks "is a WRITER
-  present?" and allows `NeedsInput` / `WorkingButIdle` / `Done` / `Ended` while
-  refusing `Working` / `Idle` / `Other` (`DELETE_RUNNING_REFUSAL`) — the one of
-  the gate's FOUR refusals a bucket decides: the interactive refusal reads `kind`,
-  and the other two (snapback's own in-flight quick reply and `Ctrl-X w` move,
-  added by `delete::can_delete_target`) read no agent record at all. That gate is
-  IRREVERSIBLE, so a change to `classify` is now weighed against it as well as
-  against the badge it draws;
+  present?" and allows `NeedsInput` / `Done` / `Ended` while refusing
+  `Working` / `WorkingButIdle` / `Idle` / `Other` (`DELETE_RUNNING_REFUSAL`) —
+  the one of the gate's FOUR refusals a bucket decides: the interactive refusal
+  reads `kind`, and the other two (snapback's own in-flight quick reply and
+  `Ctrl-X w` move, added by `delete::can_delete_target`) read no agent record at
+  all. That gate is IRREVERSIBLE, so a change to `classify` is now weighed
+  against it as well as against the badge it draws;
 * the `Ctrl-R`/`Ctrl-K` stop routing (`send::reply_gate` /
   `send::interrupt_gate`) on a record that carries a job id, which is reversible
   by comparison — it ends a job but keeps the conversation. `Ctrl-K`'s
   [signal route](#the-signal-route-no-job-id-a-pid), for a record with no job id,
   reads no bucket at all: it confirms in every state.
 
-ALL FOUR of those allow arms can fire: the BARE list the guard reads carries a
+ALL THREE of those allow arms can fire: the BARE list the guard reads carries a
 `done` job for the whole window before claude reaps it, so retuning `Done` moves
-an irreversible unlink exactly as retuning `NeedsInput`, `WorkingButIdle` or
-`Ended` does — never just a badge. Why that arm once read as unreachable is
-settled at [the one write into this tree](#on-disk-layout) and is not re-argued
-here.
+an irreversible unlink exactly as retuning `NeedsInput` or `Ended` does — never
+just a badge. Retuning `WorkingButIdle`, a refuse arm, does the same in the
+other direction. Why the `Done` arm once read as unreachable is settled at
+[the one write into this tree](#on-disk-layout) and is not re-argued here.
 
 A pulsing bucket alternates its dot between the badge color and the dim partner
 shown above; the badge glyph (`●`, or `!` for `NeedsInput` — see the **Badge
@@ -2005,8 +2046,9 @@ things keep the row readable anyway, and neither is the dot's instantaneous colo
   `WorkingButIdle` holds the working `Gray`, `Ended` holds the dim `DarkGray`.
 
 So: gray dot that moves ⇒ churning (`Working`/`Other`); gray dot that holds ⇒
-`WorkingButIdle`, the interrupted agent claude never reconciled; dim gray dot that
-holds ⇒ `Ended`. Read the pulse first, the shade second — never the shade alone.
+`WorkingButIdle`, the `working`-but-`idle` pair; dim gray dot
+that holds ⇒ `Ended`. Read the pulse first, the shade second — never the shade
+alone.
 
 `Ended` is the counterpart to that default, and the two must not be conflated:
 `stopped` and `failed` are KNOWN terminal tokens, so they are recognized and read
@@ -2019,17 +2061,17 @@ true schema drift still errs toward showing activity.
 
 **`Ended` and `WorkingButIdle` are two DISTINCT resting buckets, never collapsed
 into one.** Different causes: `Ended` is claude REPORTING a terminal token
-outright, `WorkingButIdle` is a contradiction claude never reconciled. Different
-colors: dim `DarkGray` versus the working `Gray`. Since both hold STEADY, shade is
-what separates the two of THEM from each other — but only once the absent pulse has
-already ruled out a churning agent, whose dot passes through that same `DarkGray`
-every cycle (above). They also gate differently, and that is the sharper split:
-`Ended` is stoppable evidence, `WorkingButIdle` is not (see
-[Quick reply](#quick-reply--non-interactive-send-srcsendrs)). They are further
-**disjoint by construction** —
-`WorkingButIdle` requires `state`=`working`/`busy`, which `stopped`/`failed` can
-never be — so neither can shadow the other whichever order `classify` tests them
-in, and a `stopped` job whose `status` also reads `idle` still buckets as `Ended`.
+outright, `WorkingButIdle` is a `working` `state` beside an `idle` `status`.
+Different colors: dim `DarkGray` versus the working `Gray`. Since both hold STEADY, shade is what separates the two of THEM
+from each other — but only once the absent pulse has already ruled out a
+churning agent, whose dot passes through that same `DarkGray` every cycle
+(above). They also gate differently, and that is the sharper split: `Ended` is
+stoppable and deletable evidence, `WorkingButIdle` is neither (see
+[Quick reply](#quick-reply--non-interactive-send-srcsendrs) and the hard-delete
+guard above). They are further **disjoint by construction** — `WorkingButIdle`
+requires `state`=`working`/`busy`, which `stopped`/`failed` can never be — so
+neither can shadow the other whichever order `classify` tests them in, and a
+`stopped` job whose `status` also reads `idle` still buckets as `Ended`.
 
 #### Observed value distribution
 
@@ -4143,11 +4185,11 @@ running-session choice.
 takes the stop-then-reply path while `WorkingButIdle` refuses with the live states,
 even though both badge at rest. The difference is EVIDENCE: `Ended` is claude
 REPORTING a terminal token, so "the run is over" is claude's own answer, whereas
-`WorkingButIdle` is snapback INFERRING it from a `state`/`status` contradiction
-whose documented false positive is a healthy agent caught mid-flip. Acting on that
-inference would stop live work on a guess, so the bucket stays display-only exactly
-as [its own rules](#activity-buckets-agentactivity) promise. A badge that merely
-LOOKS at rest is not licence to stop a job.
+`WorkingButIdle` is snapback INFERRING it from a `state`/`status` pair that does not
+rule out a live agent that will write again ([what the pair shows](#activity-buckets-agentactivity)).
+Acting on that inference could stop live work on a guess, so the bucket is granted
+no stop here, as [its own rules](#activity-buckets-agentactivity) promise. A badge
+that merely LOOKS at rest is not licence to stop a job.
 
 The stop step (`build_stop_argv`, the SHORT agent-view job id from the probe's
 `ReportedAgent.id`) runs in `run_send` BEFORE the send, **best-effort**: if the job
@@ -4261,7 +4303,7 @@ record is all there is to describe.
 
 `WorkingButIdle` confirms rather than stopping outright for the same evidence gap
 the reply gate turns on: the inferred rest cannot prove the run ended, and skipping
-the guard would kill live work on that false positive with no way back. The confirm
+the guard could stop an agent that is still working, with no way back. The confirm
 costs one keypress.
 
 `claude stop` acts on the GLOBAL background-job registry, so the child runs in
