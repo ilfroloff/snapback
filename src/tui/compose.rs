@@ -685,8 +685,8 @@ pub fn compose_key_to_action(key: KeyEvent, list_open: bool) -> ComposeAction {
 /// docks in the preview pane, or falls back to a full-width bottom bar on a short
 /// terminal — the renderer decides. `stop_job` is the job id to
 /// `claude stop` before sending, or `None` for a plain in-place reply. The reply
-/// gate (and, for a waiting agent, the stop confirmation) has already run at the
-/// call site (`Ctrl-R` in `update`).
+/// gate (and, for a waiting agent that is not registry-only, the stop
+/// confirmation) has already run at the call site (`Ctrl-R` in `update`).
 pub fn open(app: &mut App, session_id: String, stop_job: Option<String>) {
     // No draft card: a reply previews the REAL session it is addressed to.
     app.open_compose(ComposeState::new_reply(session_id, stop_job), None);

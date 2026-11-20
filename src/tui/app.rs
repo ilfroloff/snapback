@@ -505,16 +505,22 @@ pub struct ModalChoice {
 }
 
 /// The open "stop the waiting agent?" confirmation, shown when `Ctrl-R` targets a
-/// `needs input` background agent: stopping it to reply in place would abandon a
-/// live agent, so the user confirms first (`Enter`) or cancels (`Esc`). A simple
-/// yes/no gate (no navigation), so it holds only what a confirmed stop-then-reply
-/// needs: the target session and the job id to `claude stop`.
+/// `needs input` background agent that is not registry-only
+/// ([`crate::agents::is_registry_only`]):
+/// stopping it to reply in place would abandon a live agent, so the user confirms
+/// first (`Enter`) or cancels (`Esc`). A simple yes/no gate (no navigation), so it
+/// holds only what a confirmed stop-then-reply needs — the target session and the
+/// job id to `claude stop` — and the one fact the box draws.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingStop {
     /// Stable `session_id` the reply will target once confirmed.
     pub session_id: String,
     /// Short agent-view job id to `claude stop` before the reply.
     pub job_id: String,
+    /// What the agent reported it waits on, as the hand-off probe's record carried
+    /// it ([`crate::agents::waiting_reason`]). Drawn by the confirm and read by
+    /// nothing else: it decides no gate.
+    pub waiting_for: Option<String>,
 }
 
 /// WHICH of `Ctrl-K`'s two stop mechanisms the open confirmation will run on
@@ -2655,8 +2661,8 @@ pub struct App {
     /// / [`dispatch_draft`](Self::dispatch_draft), so they cannot drift apart.
     pub draft: Option<NewSessionDraft>,
     /// The open "stop the waiting agent?" confirmation, if any. `Some` while that
-    /// modal owns the keyboard (`Ctrl-R` on a `needs input` background agent, before
-    /// compose opens).
+    /// modal owns the keyboard (`Ctrl-R` on a `needs input` background agent that is
+    /// not registry-only, before compose opens).
     pub pending_stop: Option<PendingStop>,
     /// The open "stop this agent?" interrupt confirmation, if any. `Some` while that
     /// modal owns the keyboard (`Ctrl-K` on a live, not-yet-finished agent). Distinct
@@ -5061,8 +5067,17 @@ impl App {
     }
 
     /// Open the "stop the waiting agent?" confirmation for a `needs input` agent.
-    pub fn open_stop_confirm(&mut self, session_id: String, job_id: String) {
-        self.pending_stop = Some(PendingStop { session_id, job_id });
+    pub fn open_stop_confirm(
+        &mut self,
+        session_id: String,
+        job_id: String,
+        waiting_for: Option<String>,
+    ) {
+        self.pending_stop = Some(PendingStop {
+            session_id,
+            job_id,
+            waiting_for,
+        });
     }
 
     /// Dismiss the stop confirmation, returning to the board.
@@ -16180,7 +16195,7 @@ mod tests {
         );
 
         let mut stop = board();
-        stop.open_stop_confirm("s".to_string(), "job".to_string());
+        stop.open_stop_confirm("s".to_string(), "job".to_string(), None);
         assert!(stop.preview_pointer_blocked(), "the stop confirm decides");
 
         let mut chord = board();
@@ -16538,7 +16553,7 @@ mod tests {
             KeyboardOwner::KeyMap => vec![("key-map modal", |app| app.toggle_key_map())],
             KeyboardOwner::Chord => vec![("Ctrl-X chord", |app| app.pending_chord = true)],
             KeyboardOwner::StopConfirm => vec![("stop confirm", |app| {
-                app.open_stop_confirm("A".to_string(), "job-a".to_string());
+                app.open_stop_confirm("A".to_string(), "job-a".to_string(), None);
             })],
             KeyboardOwner::InterruptConfirm => vec![("interrupt confirm", |app| {
                 app.open_interrupt_confirm(

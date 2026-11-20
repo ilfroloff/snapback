@@ -20,8 +20,9 @@
 //!   Session <id> is currently running as a background agent (bg)…`), but `claude
 //!   stop <job-id>` deregisters the job (conversation kept), after which `-p -r`
 //!   resumes and appends in place. So: not held → reply; `done` → stop then reply;
-//!   `needs input` → confirm then stop then reply; `working`/`idle`/unstoppable →
-//!   refuse ([`SEND_LIVE_REFUSED`]). [`build_stop_argv`] is the stop step;
+//!   `needs input` → confirm then stop then reply (a registry-only one,
+//!   [`crate::agents::is_registry_only`], skips the confirm); `working`/`idle`/
+//!   unstoppable → refuse ([`SEND_LIVE_REFUSED`]). [`build_stop_argv`] is the stop step;
 //!   [`run_send`] runs it (best-effort) before the send.
 //! * [`reply_in_flight_refusal`] — what `Ctrl-R` asks BEFORE that gate and its
 //!   probe. While the selected session's OWN quick reply is still in flight,
@@ -223,17 +224,24 @@ pub enum ReplyGate {
     /// Not a live agent — open compose and reply in place directly.
     Reply,
     /// A FINISHED (`done`) or TERMINAL (`stopped` / `failed`) agent — the job is
-    /// over, so stopping it is harmless; stop it, then reply. Opens compose
-    /// straight away; the send stops `job_id` first.
+    /// over, so stopping it is harmless; stop it, then reply — and so is a
+    /// REGISTRY-ONLY one ([`agents::is_registry_only`]): `blocked` with nothing on
+    /// the record that says a process is behind it. Opens compose straight away; the
+    /// send stops `job_id` first.
     StopThenReply {
         /// The short agent-view job id to `claude stop`.
         job_id: String,
     },
-    /// A WAITING (`needs input`) agent — stopping abandons a live agent, so CONFIRM
-    /// first; on confirm, compose opens and the send stops `job_id`.
+    /// A WAITING (`needs input`) agent that is NOT registry-only — stopping abandons a
+    /// live agent, so CONFIRM first; on confirm, compose opens and the send stops
+    /// `job_id`.
     ConfirmStopThenReply {
         /// The short agent-view job id to `claude stop`.
         job_id: String,
+        /// What the agent reported it waits on ([`agents::waiting_reason`]), for the
+        /// confirm to name: `It's waiting on: permission prompt`. `None` when the
+        /// record carried no usable value.
+        waiting_for: Option<String>,
     },
     /// A busy/idle agent (or one with no stoppable job id) — refuse with a hint.
     Refuse(&'static str),
@@ -286,9 +294,13 @@ pub fn resume_in_flight_refusal(send_in_flight: bool) -> Option<&'static str> {
 /// Pure so the whole decision tree is unit-tested without a probe. It reuses the
 /// one classifier ([`agents::classify`]) so "what state is this" is answered in one
 /// place. `done` — or a TERMINAL `stopped` / `failed` — → stop-then-reply (safe:
-/// the job has ended, so stopping it interrupts nothing); `needs input` → confirm
-/// first (stopping abandons a waiting agent); `working`/`idle`/`interrupted`/unknown
-/// → refuse (stopping would interrupt live work, and the user should Attach/Fork). A
+/// the job has ended, so stopping it interrupts nothing); a REGISTRY-ONLY
+/// `needs input` ([`agents::is_registry_only`]: `blocked` with no `pid`, `status` or
+/// `waitingFor` key) → stop-then-reply too, with no confirm, because nothing on
+/// the record says a process is behind it; any other `needs input` → confirm first
+/// (stopping abandons a waiting agent), naming what it waits on when claude said;
+/// `working`/`idle`/`interrupted`/unknown → refuse (stopping would interrupt live
+/// work, and the user should Attach/Fork). A
 /// held agent with no stoppable job id (`id == None`, e.g. an interactive session)
 /// gives this path's `claude stop` step nothing to take, so it refuses too (a
 /// `pid` does not change that: signalling is `Ctrl-K`'s own confirmed verb, never a
@@ -313,7 +325,13 @@ pub fn reply_gate(record: Option<&ReportedAgent>) -> ReplyGate {
     let job_id = job_id.to_string();
     match agents::classify(agent) {
         AgentActivity::Done | AgentActivity::Ended => ReplyGate::StopThenReply { job_id },
-        AgentActivity::NeedsInput => ReplyGate::ConfirmStopThenReply { job_id },
+        AgentActivity::NeedsInput if agents::is_registry_only(agent) => {
+            ReplyGate::StopThenReply { job_id }
+        }
+        AgentActivity::NeedsInput => ReplyGate::ConfirmStopThenReply {
+            job_id,
+            waiting_for: agents::waiting_reason(agent).map(str::to_owned),
+        },
         // `WorkingButIdle` refuses WITH the live states: claude's agent list still
         // reports it as working, and the pair is an inference, not proof the turn
         // ended (see this function's docs).
@@ -2361,6 +2379,8 @@ mod tests {
             id: job_id.map(str::to_owned),
             state: Some(state.to_string()),
             status: None,
+            waiting_for: None,
+            process_key_unread: false,
             pid: None,
             started_at_ms: None,
         }
@@ -2435,7 +2455,8 @@ mod tests {
         }
     }
 
-    /// The reply gate: not held → reply; `done` → stop-then-reply; `needs input` →
+    /// The reply gate: not held → reply; `done` → stop-then-reply; a registry-only
+    /// `blocked` → stop-then-reply; any other `needs input` →
     /// confirm-then-stop-then-reply; busy/idle → refuse; held-without-a-job-id →
     /// refuse. The stop paths carry the SHORT job id.
     #[test]
@@ -2463,16 +2484,26 @@ mod tests {
             );
         }
 
-        // needs input (blocked / waiting) -> CONFIRM before stopping a live agent.
-        for waiting in ["blocked", "waiting"] {
-            assert_eq!(
-                reply_gate(Some(&bg(waiting, Some("job-2")))),
-                ReplyGate::ConfirmStopThenReply {
-                    job_id: "job-2".to_string()
-                },
-                "{waiting:?} must confirm before stopping"
-            );
-        }
+        // `blocked` with nothing else on the record is REGISTRY-ONLY (issue #83): it takes
+        // the stop-then-reply path of `done`, with no confirm.
+        assert_eq!(
+            reply_gate(Some(&bg("blocked", Some("job-2")))),
+            ReplyGate::StopThenReply {
+                job_id: "job-2".to_string()
+            },
+            "a registry-only `blocked` agent stops and replies without asking"
+        );
+
+        // needs input spelled `waiting` is no registry-only shape -> CONFIRM
+        // before stopping a live agent.
+        assert_eq!(
+            reply_gate(Some(&bg("waiting", Some("job-2")))),
+            ReplyGate::ConfirmStopThenReply {
+                job_id: "job-2".to_string(),
+                waiting_for: None,
+            },
+            "`waiting` must confirm before stopping"
+        );
 
         // working / idle / unknown -> refuse (stopping would interrupt live work).
         for busy in ["working", "busy", "idle", "compacting"] {
@@ -2493,6 +2524,80 @@ mod tests {
             reply_gate(Some(&bg("blocked", Some("   ")))),
             ReplyGate::Refuse(SEND_LIVE_REFUSED),
             "a blank job id is not stoppable -> refuse"
+        );
+    }
+
+    /// Issue #83: only a REGISTRY-ONLY `blocked` agent skips the confirm.
+    /// Each of the three signs of a live process — a `pid`, a `status`, a `waitingFor` —
+    /// keeps it on its own, and so does anything that is not plainly a registry-held
+    /// background `blocked`. The confirm carries the reason when claude gave one.
+    #[test]
+    fn reply_gate_confirms_a_blocked_agent_that_shows_a_sign_of_a_process() {
+        let confirm = |waiting_for: Option<&str>| ReplyGate::ConfirmStopThenReply {
+            job_id: "job-4".to_string(),
+            waiting_for: waiting_for.map(str::to_owned),
+        };
+        let blocked = || bg("blocked", Some("job-4"));
+
+        assert_eq!(
+            reply_gate(Some(&blocked().with_pid(4_242))),
+            confirm(None),
+            "a pid says a process is behind it"
+        );
+        let mut with_status = blocked();
+        with_status.status = Some("waiting".to_string());
+        assert_eq!(
+            reply_gate(Some(&with_status)),
+            confirm(None),
+            "a status says a session process is behind it"
+        );
+        assert_eq!(
+            reply_gate(Some(&blocked().with_waiting_for("permission prompt"))),
+            confirm(Some("permission prompt")),
+            "a waitingFor keeps the confirm and names the reason"
+        );
+        // A key of the wrong JSON type reads as absent in the typed fields, but the
+        // key was on the wire (`ReportedAgent::process_key_unread`): still a sign.
+        let mut unread = blocked();
+        unread.process_key_unread = true;
+        assert_eq!(
+            reply_gate(Some(&unread)),
+            confirm(None),
+            "a pid, status or waitingFor of the wrong type is still a key on the wire"
+        );
+        // Present but empty after cleaning: still a sign (it fails toward asking),
+        // yet there is no reason to name.
+        assert_eq!(
+            reply_gate(Some(&blocked().with_waiting_for(""))),
+            confirm(None),
+            "an empty waitingFor is still the key being present"
+        );
+
+        // Not plainly a registry-only BACKGROUND record: ask.
+        let mut interactive = blocked();
+        interactive.kind = "interactive".to_string();
+        assert_eq!(
+            reply_gate(Some(&interactive)),
+            confirm(None),
+            "only a background record is registry-only"
+        );
+
+        // A `waitingFor` on a bucket that is not `needs input` changes nothing: the
+        // state wins, and a working agent still refuses.
+        assert_eq!(
+            reply_gate(Some(
+                &bg("working", Some("job-4")).with_waiting_for("dialog open")
+            )),
+            ReplyGate::Refuse(SEND_LIVE_REFUSED),
+            "state wins over waitingFor"
+        );
+        // A finished agent takes the stop-then-reply path whatever else it carries.
+        assert_eq!(
+            reply_gate(Some(&bg("done", Some("job-4")).with_pid(4_242))),
+            ReplyGate::StopThenReply {
+                job_id: "job-4".to_string()
+            },
+            "`done` is unchanged by the registry-only rule"
         );
     }
 
@@ -2972,6 +3077,8 @@ mod tests {
             id: Some("job-9".to_string()),
             state: Some("working".to_string()),
             status: Some("idle".to_string()),
+            waiting_for: None,
+            process_key_unread: false,
             pid: None,
             started_at_ms: None,
         };

@@ -50,7 +50,7 @@
 //! | `Ctrl-F` | open the FIND BAR on the preview's top border: a `find:` input whose text marks the transcript the pane shows — the selected session's own, or the subagent view's — by the board search's own rule ([`App::open_find`]). Printable keys, edits and a paste go to it while it is open; every other key keeps its board meaning, so it is not a keyboard owner and `Left` / `Right` still step subagents in the view. It never re-filters the list, moves the selection or touches the board query, and a typed word jumps the preview to the newest match. `Shift-Up` / `Shift-Down` and `Enter` step the marks (below); `Esc` closes it. From the 1:0 layout it brings the preview back at 1:1; a step to 1:0 and a `Ctrl-N` draft card close it, and it does not open while a draft card is on the pane, while a reply or fork box leaves it open |
 //! | `Ctrl-N` | start a new session in the launch directory. When agents are defined a picker opens first and `Enter` on a pick opens a draft pane for the session's first message; with none defined that draft opens straight away. In the draft, `Enter` starts a BACKGROUND agent without leaving the board, `Ctrl-O` runs it interactively instead, `Esc` cancels; `/` and `@` open the pick list (the `/` or `@` row below), which claims `Enter` and `Esc` while it is open |
 //! | `Ctrl-O` (in the agent picker) | start the highlighted agent INTERACTIVELY at once, skipping the draft — the same verb `Ctrl-O` names inside the draft, so BOTH routes out of the picker cost exactly one key. Bound on the picker alone — inert on every other modal |
-//! | `Ctrl-R` | quick-reply: send a one-shot message to the selected session without leaving the board. An agent whose run is OVER (`done` / `stopped` / `failed`) is stopped first so the reply lands in place; `needs input` confirms first; `working` / `idle` / `interrupted` / an unrecognized qualifier is refused, and so is a session claude reports with no stoppable job id — the refusal points at `Ctrl-K` or Fork (see [`send::reply_gate`]). While this session's OWN reply is still in flight (on a fork's row, the headless fork making it — its `claude -p` child is recorded under the fork's id), `Ctrl-R` on it is refused before any of the above (see [`send::reply_in_flight_refusal`]), and so it is while its `Ctrl-X w` move is; a reply or a move still in flight on another row refuses nothing here. In the box `/` and `@` open the pick list (the `/` or `@` row below), which claims `Enter` and `Esc` while it is open |
+//! | `Ctrl-R` | quick-reply: send a one-shot message to the selected session without leaving the board. An agent whose run is OVER (`done` / `stopped` / `failed`) is stopped first so the reply lands in place, and so is a REGISTRY-ONLY `needs input` agent (`blocked` with no `pid`, `status` or `waitingFor` key); any other `needs input` confirms first, naming what it waits on when claude said; `working` / `idle` / `interrupted` / an unrecognized qualifier is refused, and so is a session claude reports with no stoppable job id — the refusal points at `Ctrl-K` or Fork (see [`send::reply_gate`]). While this session's OWN reply is still in flight (on a fork's row, the headless fork making it — its `claude -p` child is recorded under the fork's id), `Ctrl-R` on it is refused before any of the above (see [`send::reply_in_flight_refusal`]), and so it is while its `Ctrl-X w` move is; a reply or a move still in flight on another row refuses nothing here. In the box `/` and `@` open the pick list (the `/` or `@` row below), which claims `Enter` and `Esc` while it is open |
 //! | `Ctrl-K` | stop / interrupt the selected session's live agent, by whichever handle claude's record carries (see [`send::interrupt_gate`]). A stoppable job id → `claude stop`: an agent whose run is OVER (`done` / `stopped` / `failed`) stops at once, every other live agent confirms first. NO job id but a `pid` → confirm, then re-ask claude at `Enter` and send that pid a SIGTERM (never SIGKILL) only if claude still reports the same pid with no job id; a record that is gone, now carries a job id, or reports another pid refuses instead (see [`send::signal_plan`]). A session claude is not holding, or one it reports with neither a job id nor a pid — or with no job id and a pid no signal could take (`0`, past `i32::MAX`, or the board's own process id) — is refused |
 //! | `Tab` | toggle name-only vs. name+content search. Widening to content also opens the preview on the most recent match, exactly as typing does: it goes through the same query funnel, and the mode is the gate that key just opened |
 //! | `Ctrl-A` | flip the scope: current folder <-> project (the launch repo and all of its git worktrees). ONE key for both, because the second is a refinement of the same question the first answers, not a separate mode. Launched with `--all`/`-a` it becomes a three-stop cycle through all folders as well — the whole store is on this key only when the launch flag put it there |
@@ -194,8 +194,10 @@ pub enum Action {
     /// Open the quick-reply compose zone for the selected session (`Ctrl-R`).
     /// [`apply_action`] runs the reply gate ([`send::reply_gate`]) first, because
     /// `claude -p -r` REFUSES a session claude is holding as an agent: an agent
-    /// whose run is over is stopped first and compose opens, a `needs input` one
-    /// confirms before that stop, and a still-live one is refused with a hint.
+    /// whose run is over — or a registry-only `needs input` one, `blocked` with no
+    /// `pid`, `status` or `waitingFor` key — is stopped first and compose opens, any other
+    /// `needs input` one confirms before that stop, and a still-live one is
+    /// refused with a hint.
     /// Before that gate, a reply of the selected session's own still in flight
     /// refuses ([`send::reply_in_flight_refusal`]); a reply in flight to another
     /// row does not.
@@ -3118,8 +3120,12 @@ fn fork(app: &mut App) -> Outcome {
 /// * not held → open compose, reply in place;
 /// * `done`, or a TERMINAL `stopped`/`failed` → open compose in stop-then-reply
 ///   mode (the run is over, so stopping it interrupts nothing);
-/// * `needs input` → CONFIRM first ([`App::open_stop_confirm`]) — stopping abandons
-///   a waiting agent — then compose;
+/// * a REGISTRY-ONLY `needs input` (`blocked` with no `pid`, `status` or
+///   `waitingFor` key, [`crate::agents::is_registry_only`]) → the same
+///   stop-then-reply, no confirm;
+/// * any other `needs input` → CONFIRM first ([`App::open_stop_confirm`]) —
+///   stopping abandons a waiting agent, and the box names what it waits on — then
+///   compose;
 /// * `working`/`idle`/`interrupted`/an unrecognized qualifier/unstoppable → refuse
 ///   ([`send::SEND_LIVE_REFUSED`]).
 ///
@@ -3145,7 +3151,10 @@ fn reply(app: &mut App) -> Outcome {
     match send::reply_gate(app.live_agent_now(&id).as_ref()) {
         ReplyGate::Reply => compose::open(app, id, None),
         ReplyGate::StopThenReply { job_id } => compose::open(app, id, Some(job_id)),
-        ReplyGate::ConfirmStopThenReply { job_id } => app.open_stop_confirm(id, job_id),
+        ReplyGate::ConfirmStopThenReply {
+            job_id,
+            waiting_for,
+        } => app.open_stop_confirm(id, job_id, waiting_for),
         ReplyGate::Refuse(message) => app.set_status(message),
     }
     Outcome::Continue
@@ -3522,6 +3531,8 @@ mod tests {
             id: None,
             state: None,
             status: None,
+            waiting_for: None,
+            process_key_unread: false,
             pid: None,
             started_at_ms: None,
         }
@@ -3536,6 +3547,8 @@ mod tests {
             id: job_id.map(str::to_owned),
             state: None,
             status: None,
+            waiting_for: None,
+            process_key_unread: false,
             pid: None,
             started_at_ms: None,
         }
@@ -3876,13 +3889,19 @@ mod tests {
     }
 
     /// Ctrl-R routes by the held agent's state: not held → reply; `done` → compose
-    /// in stop-then-reply mode; `needs input` → the stop confirmation first;
-    /// `working`/`idle` → refuse. Stopping a job first is what lets `-p -r` land.
+    /// in stop-then-reply mode; a registry-only `blocked` (no `pid`, `status`,
+    /// `waitingFor`) → the same, with no confirm; any other `needs input` → the
+    /// stop confirmation first, carrying what it waits on; `working`/`idle` →
+    /// refuse. Stopping a job first is what lets `-p -r` land.
     #[test]
     fn ctrl_r_routes_by_agent_state() {
         // Seed claude's ACTIVE (bare) list with a background agent of a given state,
         // carrying the short job id `claude stop` would target.
-        fn held(id: &str, state: &str) -> HashMap<String, ReportedAgent> {
+        fn held(
+            id: &str,
+            state: &str,
+            waiting_for: Option<&str>,
+        ) -> HashMap<String, ReportedAgent> {
             let mut map = HashMap::new();
             map.insert(
                 id.to_string(),
@@ -3891,6 +3910,8 @@ mod tests {
                     id: Some("job-x".to_string()),
                     state: Some(state.to_string()),
                     status: None,
+                    waiting_for: waiting_for.map(str::to_owned),
+                    process_key_unread: false,
                     pid: None,
                     started_at_ms: None,
                 },
@@ -3899,7 +3920,7 @@ mod tests {
         }
         let app_for = |id: &str, state: &str| {
             let mut app = App::new(vec![session(id)], Scope::All, PathBuf::from("/tmp"));
-            let live = held(id, state);
+            let live = held(id, state, None);
             app.set_live_probe(move || live.clone());
             app
         };
@@ -3915,13 +3936,30 @@ mod tests {
         );
         assert!(app.pending_stop.is_none());
 
-        // needs input -> the stop confirmation, NOT compose yet.
-        for waiting in ["blocked", "waiting"] {
-            let mut app = app_for("wait-1", waiting);
+        // A REGISTRY-ONLY `blocked` agent (nothing on the record says a process is
+        // behind it) goes straight to compose too, no confirm (issue #83).
+        let mut app = app_for("registry-only-1", "blocked");
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        assert!(
+            app.is_composing(),
+            "a registry-only agent goes straight to compose"
+        );
+        assert_eq!(composing_stop_job(&app), Some("job-x"));
+        assert!(
+            app.pending_stop.is_none(),
+            "a registry-only agent is not asked"
+        );
+
+        // needs input with a sign of a process -> the stop confirmation, NOT compose
+        // yet; it carries what the agent said it waits on.
+        for (state, waiting_for) in [("waiting", None), ("blocked", Some("permission prompt"))] {
+            let mut app = App::new(vec![session("wait-1")], Scope::All, PathBuf::from("/tmp"));
+            let live = held("wait-1", state, waiting_for);
+            app.set_live_probe(move || live.clone());
             press_ctrl(&mut app, KeyCode::Char('r'));
             assert!(
                 !app.is_composing(),
-                "{waiting:?} must confirm before composing"
+                "{state:?} / {waiting_for:?} must confirm before composing"
             );
             let pending = app
                 .pending_stop
@@ -3929,6 +3967,7 @@ mod tests {
                 .expect("a waiting agent opens the stop confirmation");
             assert_eq!(pending.session_id, "wait-1");
             assert_eq!(pending.job_id, "job-x");
+            assert_eq!(pending.waiting_for.as_deref(), waiting_for);
         }
 
         // working / idle -> refuse outright.
@@ -3968,6 +4007,10 @@ mod tests {
                     id: Some("job-y".to_string()),
                     state: Some("blocked".to_string()),
                     status: None,
+                    // Names what it waits on: a bare `blocked` record is REGISTRY-ONLY and
+                    // would skip the confirm this test is about.
+                    waiting_for: Some("permission prompt".to_string()),
+                    process_key_unread: false,
                     pid: None,
                     started_at_ms: None,
                 },
@@ -4012,6 +4055,8 @@ mod tests {
                     id: job.map(str::to_owned),
                     state: Some(state.to_string()),
                     status: None,
+                    waiting_for: None,
+                    process_key_unread: false,
                     pid: None,
                     started_at_ms: None,
                 },
@@ -4096,6 +4141,8 @@ mod tests {
                     id: Some("job-z".to_string()),
                     state: Some("working".to_string()),
                     status: None,
+                    waiting_for: None,
+                    process_key_unread: false,
                     pid: None,
                     started_at_ms: None,
                 },
@@ -4487,6 +4534,8 @@ mod tests {
                     id: Some("job-a".to_string()),
                     state: Some("done".to_string()),
                     status: None,
+                    waiting_for: None,
+                    process_key_unread: false,
                     pid: None,
                     started_at_ms: None,
                 },
@@ -4498,6 +4547,8 @@ mod tests {
                     id: Some("job-b".to_string()),
                     state: Some("done".to_string()),
                     status: None,
+                    waiting_for: None,
+                    process_key_unread: false,
                     pid: None,
                     started_at_ms: None,
                 },
@@ -4767,6 +4818,9 @@ mod tests {
                 id: Some("job-w".to_string()),
                 state: Some("blocked".to_string()),
                 status: None,
+                // A bare `blocked` record is REGISTRY-ONLY and would skip the confirm.
+                waiting_for: Some("permission prompt".to_string()),
+                process_key_unread: false,
                 pid: None,
                 started_at_ms: None,
             },
@@ -4789,6 +4843,8 @@ mod tests {
                 id: Some("job-z".to_string()),
                 state: Some("working".to_string()),
                 status: None,
+                waiting_for: None,
+                process_key_unread: false,
                 pid: None,
                 started_at_ms: None,
             },
@@ -5675,6 +5731,8 @@ mod tests {
                 id: Some("job-e2e".to_string()),
                 state: Some("done".to_string()),
                 status: None,
+                waiting_for: None,
+                process_key_unread: false,
                 pid: None,
                 started_at_ms: None,
             },
@@ -6830,6 +6888,8 @@ mod tests {
                     id: None,
                     state: Some(state.to_string()),
                     status: None,
+                    waiting_for: None,
+                    process_key_unread: false,
                     pid: None,
                     started_at_ms: None,
                 },
@@ -10777,6 +10837,8 @@ mod tests {
                 id: Some("job-1".to_string()),
                 state: Some(state.to_string()),
                 status: None,
+                waiting_for: None,
+                process_key_unread: false,
                 pid: None,
                 started_at_ms: None,
             },
@@ -10975,6 +11037,8 @@ mod tests {
                 id: Some(polled_job.to_string()),
                 state: Some("working".to_string()),
                 status: None,
+                waiting_for: None,
+                process_key_unread: false,
                 pid: None,
                 started_at_ms: None,
             },
@@ -13902,6 +13966,8 @@ mod tests {
                         id: None,
                         state: state.map(str::to_owned),
                         status: None,
+                        waiting_for: None,
+                        process_key_unread: false,
                         pid: None,
                         started_at_ms: None,
                     },
@@ -14928,6 +14994,8 @@ mod tests {
                 id: None,
                 state: Some("blocked".to_string()),
                 status: None,
+                waiting_for: None,
+                process_key_unread: false,
                 pid: None,
                 started_at_ms: None,
             },

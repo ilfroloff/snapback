@@ -300,6 +300,21 @@ const LINEAGE_MARKER_GAP: &str = "  ";
 /// [`fit_label`] stays in columns without a width table.
 const LABEL_ELLIPSIS: &str = "…";
 
+/// The gap between a row's agent badge and what follows it, the label or a child's
+/// id. One constant so [`fit_waiting_reason`] holds back the width the row draws.
+const BADGE_GAP: &str = "  ";
+
+/// The columns a row's label keeps no matter what a `needs input` agent waits on,
+/// a named fork's name in a child row's id slot included: a reason may never take
+/// more from either than what they would leave short of this many.
+/// [`fit_waiting_reason`] cuts the reason first.
+const MIN_LABEL_COLS_BESIDE_REASON: usize = 10;
+
+/// The fewest characters of a `waitingFor` reason worth drawing after its
+/// separator. A shorter stub (`p…`) reads as noise, so the reason is dropped whole
+/// instead; the preview banner and the stop confirm still carry it in full.
+const MIN_REASON_COLS: usize = 8;
+
 /// The footnote a soft-hidden session row wears while the show-hidden toggle is
 /// on: a dim `[hidden]` marker so the user can see what they hid (and un-hide
 /// it). Carries its own leading gap, exactly as [`LINEAGE_MARKER_GAP`] folds its
@@ -884,6 +899,7 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 // persisted `hidden_ids` set, NOT the fold's per-row `hidden` count
                 // matched above — the two are deliberately distinct.
                 let soft_hidden = app.hidden_ids.contains(&session.session_id);
+                let mut reason_slot: Option<ReasonSlot> = None;
                 let mut spans = vec![
                     // An expanded lineage member hangs off the head above it;
                     // every other row keeps the gutter it has always had.
@@ -968,7 +984,16 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                         spans.push(Span::raw(" "));
                         spans.push(Span::styled(phrase.to_string(), style));
                     }
-                    spans.push(Span::raw("  "));
+                    // What a `needs input` agent waits ON takes the slot right
+                    // after the phrase, but is only filled in once the rest of the
+                    // row has claimed its columns: it is the first thing to give
+                    // way, see [`fill_reason_slot`].
+                    reason_slot = agents::waiting_reason(agent).map(|reason| ReasonSlot {
+                        reason,
+                        at: spans.len(),
+                        left: spans.iter().map(Span::width).sum(),
+                    });
+                    spans.push(Span::raw(BADGE_GAP));
                 }
                 if *child {
                     // A child spends its width on what DIFFERS from its head,
@@ -995,59 +1020,39 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                     // its name and count — the marker-first discipline
                     // [`fit_label`] gives a head row — so a narrow pane drops the
                     // count, then cuts the name, and keeps the markers. An unnamed
-                    // member's markers take what its id and count leave.
-                    let name = lineage::fork_title(session);
-                    let failed = session.failed_task.is_some();
-                    let unbound = app.lost_agent_bindings.contains(&session.session_id);
-                    let named_markers = name.as_ref().map(|_| {
-                        let used: usize = spans.iter().map(Span::width).sum();
-                        fit_child_markers(failed, unbound, soft_hidden, content_width, used)
-                    });
-                    let reserved = named_markers.map_or(0, ChildMarkers::width);
-                    match name {
-                        // Fitted BEFORE the count, so the count drops first.
-                        Some(name) => {
-                            let used: usize = spans.iter().map(Span::width).sum();
-                            if let Some(segment) =
-                                fit_child_name(&name, content_width, used, reserved)
-                            {
-                                spans.push(Span::raw(segment));
-                            }
-                        }
-                        None => spans.push(Span::raw(short_id(&session.session_id))),
-                    }
-
-                    // ...and how much conversation it actually holds, which is
-                    // the only field on this row carrying real information.
-                    // Timestamp and id say WHICH member this is; `6 msgs` beside
-                    // a sibling's `171 msgs` says which one is a stub the fork
-                    // stalled and which one holds the work — the question the
-                    // user is actually asking when they expand a lineage whose
-                    // members are, by construction, label-identical.
+                    // member's markers take what its id and count leave. All of it
+                    // is [`child_tail`]'s, drawn once without a reason to learn
+                    // what the row keeps and once beside the one that fits.
                     //
-                    // DIM, like the timestamp: the id (or fork name) is left the
-                    // row's one undimmed field so the eye can scan children by
-                    // it, and the count reads as an annotation hanging off it. A
-                    // named Modifier, never an embedded escape or an RGB value
-                    // (TERMINAL-SAFE STYLING).
-                    let used = spans.iter().map(Span::width).sum::<usize>() + reserved;
-                    if let Some(msgs) = fit_child_msgs(session.msg_count, content_width, used) {
+                    // A child's turn count, DIM like the timestamp, says which
+                    // member of a lineage is a stalled stub and which holds the
+                    // work — see [`fit_child_msgs`].
+                    let name = lineage::fork_title(session);
+                    let facts = ChildFacts {
+                        name: name.as_deref(),
+                        id: &session.session_id,
+                        msg_count: session.msg_count,
+                        failed: session.failed_task.is_some(),
+                        unbound: app.lost_agent_bindings.contains(&session.session_id),
+                        hidden: soft_hidden,
+                    };
+                    let used: usize = spans.iter().map(Span::width).sum();
+                    let mut tail = child_tail(&facts, content_width, used, 0);
+                    let reason_cols =
+                        fill_reason_slot(&mut spans, reason_slot, content_width, tail.kept());
+                    if reason_cols > 0 {
+                        tail = child_tail(&facts, content_width, used, reason_cols);
+                    }
+                    if let Some(lead) = tail.lead {
+                        spans.push(Span::raw(lead));
+                    }
+                    if let Some(msgs) = tail.msgs {
                         spans.push(Span::styled(
                             msgs,
                             Style::default().add_modifier(Modifier::DIM),
                         ));
                     }
-                    // An unnamed member's markers yield to its id and count, and its
-                    // `[hidden]` is pushed whatever the width; a named fork's
-                    // markers were reserved above.
-                    let markers = named_markers.unwrap_or_else(|| {
-                        let used: usize = spans.iter().map(Span::width).sum();
-                        ChildMarkers {
-                            hidden: soft_hidden,
-                            ..fit_child_markers(failed, unbound, false, content_width, used)
-                        }
-                    });
-                    push_child_markers(&mut spans, markers);
+                    push_child_markers(&mut spans, tail.markers);
                     return dim_row_if(ListItem::new(Line::from(spans)), soft_hidden);
                 }
 
@@ -1089,11 +1094,25 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
                     } else {
                         0
                     };
+                // The reason fills what the label's floor, `(+N)`, `[task failed]`
+                // and `[unbound]` leave — `[hidden]` too, which is drawn whatever
+                // the width — AFTER every one of them was decided against `used`.
+                let hidden_width = if soft_hidden {
+                    HIDDEN_ROW_MARKER.chars().count()
+                } else {
+                    0
+                };
+                let reason_cols = fill_reason_slot(
+                    &mut spans,
+                    reason_slot,
+                    content_width,
+                    MIN_LABEL_COLS_BESIDE_REASON + reserved + hidden_width,
+                );
                 let label = if reserved > 0 {
                     // The SAME `used` the reservation above was decided against —
-                    // nothing has pushed to `spans` in between, so re-summing it
-                    // could only ever produce that identical width.
-                    fit_label(&session.label, content_width, used, reserved)
+                    // nothing was pushed before the label but the reason, whose
+                    // columns come off the label alone.
+                    fit_label(&session.label, content_width, used + reason_cols, reserved)
                 } else {
                     session.label.clone()
                 };
@@ -6393,10 +6412,18 @@ fn wrap_message(text: &str, width: u16) -> Vec<String> {
     lines
 }
 
+/// The box's height without a reason line: the six lines of copy and the two
+/// border rows.
+const STOP_CONFIRM_HEIGHT: u16 = 8;
+
+/// What the stop confirm says before the `waitingFor` value claude reported
+/// ([`super::app::PendingStop::waiting_for`]): `It's waiting on: permission prompt`.
+const STOP_CONFIRM_WAITING_ON: &str = "It's waiting on: ";
+
 /// The "stop the waiting agent?" confirmation overlay, shown when `Ctrl-R` targets
-/// a `needs input` background agent. Confirming stops the waiting agent (ending its
-/// live job, conversation kept) so the reply can land in place; the two moves are
-/// spelled out because stopping is not free.
+/// a `needs input` background agent that is not registry-only. Confirming stops the
+/// waiting agent (ending its live job, conversation kept) so the reply can land
+/// in place; the two moves are spelled out because stopping is not free.
 ///
 /// Drawn last (on top of the board) with a [`Clear`]. Pure presentation — the
 /// target session and the job id live on [`App::pending_stop`]; styled with named
@@ -6410,15 +6437,23 @@ fn render_stop_confirm(frame: &mut Frame, app: &App) {
         .map(|s| s.label.as_str())
         .filter(|l| !l.is_empty())
         .unwrap_or(pending.session_id.as_str());
-    let area = centered_rect(frame.area(), 64, 8);
+    // One more line (and one more row of box) when the agent said what it waits on.
+    let reason_line = pending
+        .waiting_for
+        .as_deref()
+        .filter(|reason| !reason.is_empty())
+        .map(|reason| Line::from(Span::raw(format!("{STOP_CONFIRM_WAITING_ON}{reason}"))));
+    let height = STOP_CONFIRM_HEIGHT + u16::from(reason_line.is_some());
+    let area = centered_rect(frame.area(), 64, height);
 
-    let lines = vec![
-        Line::from(Span::styled(
-            "This session is a waiting agent.",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )),
+    let mut lines = vec![Line::from(Span::styled(
+        "This session is a waiting agent.",
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    lines.extend(reason_line);
+    lines.extend([
         Line::from(""),
         Line::from(Span::raw(format!(
             "Stop it and reply in place?  —  {label}"
@@ -6432,7 +6467,7 @@ fn render_stop_confirm(frame: &mut Frame, app: &App) {
             "Enter  stop & reply    \u{b7}    Esc  cancel",
             Style::default().add_modifier(Modifier::DIM),
         )),
-    ];
+    ]);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -7150,6 +7185,108 @@ fn fit_child_name(
     (!fitted.is_empty()).then(|| mark + &fitted)
 }
 
+/// What [`child_tail`] needs to know about a lineage CHILD row's session.
+struct ChildFacts<'a> {
+    /// The fork's name when snapback named it, else the id is drawn.
+    name: Option<&'a str>,
+    /// The session id, of which [`short_id`] draws a prefix.
+    id: &'a str,
+    /// The turn count [`fit_child_msgs`] weighs.
+    msg_count: usize,
+    /// A background task this session launched stands failed.
+    failed: bool,
+    /// The #80811 lost-binding badge.
+    unbound: bool,
+    /// The session is soft-hidden.
+    hidden: bool,
+}
+
+/// What a lineage CHILD row draws after the agent badge's gap.
+struct ChildTail {
+    /// The fork's `⑂ name` or the member's id; `None` for a name with no column left.
+    lead: Option<String>,
+    /// The turn count, or `None` when it does not fit whole.
+    msgs: Option<String>,
+    /// The trailing markers kept.
+    markers: ChildMarkers,
+    /// Whether `lead` is a fork's name, which gives way, rather than an id.
+    named: bool,
+}
+
+impl ChildTail {
+    /// The columns the row keeps to the right of a `waitingFor` reason: a fork's
+    /// name down to [`MIN_LABEL_COLS_BESIDE_REASON`] (all of it when the count is
+    /// drawn, which needed the name whole), an id whole, the count and the markers.
+    fn kept(&self) -> usize {
+        let lead = self.lead.as_ref().map_or(0, |lead| lead.chars().count());
+        let lead = if self.named && self.msgs.is_none() {
+            lead.min(MIN_LABEL_COLS_BESIDE_REASON)
+        } else {
+            lead
+        };
+        lead + self.msgs.as_ref().map_or(0, |msgs| msgs.chars().count()) + self.markers.width()
+    }
+}
+
+/// A lineage CHILD row's fields after the badge gap, fitted against the columns
+/// the row has: `used` is what sits before them, and `reason_cols` what a
+/// `waitingFor` reason takes of those that remain.
+///
+/// The markers are decided against `used` alone, the reason's columns NOT counted:
+/// the reason is the first thing to give way, so it never decides a marker. The
+/// name and the count are decided against `used` plus the reason, which is how the
+/// reason's columns come off the name. Pure.
+fn child_tail(
+    facts: &ChildFacts<'_>,
+    content_width: usize,
+    used: usize,
+    reason_cols: usize,
+) -> ChildTail {
+    let named = facts.name.is_some();
+    // A named fork's markers are held back from its name, so they are decided first.
+    let named_markers = facts.name.map(|_| {
+        fit_child_markers(
+            facts.failed,
+            facts.unbound,
+            facts.hidden,
+            content_width,
+            used,
+        )
+    });
+    let reserved = named_markers.map_or(0, ChildMarkers::width);
+    let lead = match facts.name {
+        Some(name) => fit_child_name(name, content_width, used + reason_cols, reserved),
+        None => Some(short_id(facts.id)),
+    };
+    let lead_cols = lead.as_ref().map_or(0, |lead| lead.chars().count());
+    let msgs = fit_child_msgs(
+        facts.msg_count,
+        content_width,
+        used + reason_cols + lead_cols + reserved,
+    );
+    // An unnamed member's markers yield to its id and count, and its `[hidden]` is
+    // pushed whatever the width; a named fork's were reserved above.
+    let markers = named_markers.unwrap_or_else(|| {
+        let msgs_cols = msgs.as_ref().map_or(0, |msgs| msgs.chars().count());
+        ChildMarkers {
+            hidden: facts.hidden,
+            ..fit_child_markers(
+                facts.failed,
+                facts.unbound,
+                false,
+                content_width,
+                used + lead_cols + msgs_cols,
+            )
+        }
+    });
+    ChildTail {
+        lead,
+        msgs,
+        markers,
+        named,
+    }
+}
+
 /// Which trailing markers a lineage CHILD row draws, in drawing order:
 /// [`FAILED_TASK_MARKER`], [`AGENT_UNBOUND_MARKER`], [`HIDDEN_ROW_MARKER`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7297,6 +7434,85 @@ fn modal_list_label(choice: &ModalChoice) -> String {
         }
         _ => choice.label.clone(),
     }
+}
+
+/// The ` · reason` segment a `needs input` row draws after its phrase, or `None`
+/// when the row has no room for one worth reading.
+///
+/// `content_width` is the row's drawable columns, `used` what sits LEFT of the
+/// reason's slot, and `kept` every column the row keeps to its right, apart from
+/// the trailing gap this holds back itself: the label's floor
+/// ([`MIN_LABEL_COLS_BESIDE_REASON`]) and every marker the row draws, or on a child
+/// row what [`ChildTail::kept`] counts. The reason takes only what is left: it is
+/// cut with a [`LABEL_ELLIPSIS`] when it does not fit, and dropped whole when even
+/// [`MIN_REASON_COLS`] of it would not. So it is the reason that gives way first,
+/// never the label or a marker, and a narrow pane draws the row it drew before the
+/// reason existed. Counts CHARS, the crate's one convention for label width. Pure.
+fn fit_waiting_reason(
+    reason: &str,
+    content_width: usize,
+    used: usize,
+    kept: usize,
+) -> Option<String> {
+    let separator = agents::WAITING_FOR_SEPARATOR;
+    let separator_width = separator.chars().count();
+    // The two-space gap `render_list` pushes after the badge belongs to the row's
+    // next field, not to the reason.
+    let budget = content_width
+        .saturating_sub(used)
+        .saturating_sub(BADGE_GAP.chars().count())
+        .saturating_sub(kept);
+    let room = budget.checked_sub(separator_width)?;
+    let width = reason.chars().count();
+    if width <= room {
+        return Some(format!("{separator}{reason}"));
+    }
+    if room < MIN_REASON_COLS {
+        return None;
+    }
+    let kept: String = reason
+        .chars()
+        .take(room - LABEL_ELLIPSIS.chars().count())
+        .collect();
+    Some(format!("{separator}{kept}{LABEL_ELLIPSIS}"))
+}
+
+/// Where a `needs input` row's `waitingFor` reason goes, held until the rest of
+/// the row has decided what it keeps.
+struct ReasonSlot<'a> {
+    /// What claude said the agent waits on.
+    reason: &'a str,
+    /// The index in the row's spans the reason is inserted at: right after the
+    /// phrase, ahead of the badge's trailing gap.
+    at: usize,
+    /// The columns the spans before `at` draw.
+    left: usize,
+}
+
+/// Fill `slot` with the reason [`fit_waiting_reason`] says fits beside the `kept`
+/// columns, and return the columns it took (0 for none).
+///
+/// Split from the row's other fields so that the reason is decided LAST: every
+/// marker, count and label floor has already been fitted against the row WITHOUT
+/// it, which is what makes the reason the first thing to give way.
+fn fill_reason_slot(
+    spans: &mut Vec<Span<'_>>,
+    slot: Option<ReasonSlot<'_>>,
+    content_width: usize,
+    kept: usize,
+) -> usize {
+    let Some(slot) = slot else {
+        return 0;
+    };
+    let Some(segment) = fit_waiting_reason(slot.reason, content_width, slot.left, kept) else {
+        return 0;
+    };
+    let width = segment.chars().count();
+    spans.insert(
+        slot.at,
+        Span::styled(segment, Style::default().add_modifier(Modifier::DIM)),
+    );
+    width
 }
 
 /// Break `text` into consecutive `(slice, is_match)` runs on EXTENDED
@@ -13679,6 +13895,8 @@ going until a third line | alice |\n\
                 id: Some("job-1".to_string()),
                 state: Some("running".to_string()),
                 status: None,
+                waiting_for: None,
+                process_key_unread: false,
                 pid: None,
                 started_at_ms: None,
             },
@@ -14887,6 +15105,8 @@ going until a third line | alice |\n\
                 id: None,
                 state: Some("working".to_string()),
                 status: None,
+                waiting_for: None,
+                process_key_unread: false,
                 pid: None,
                 started_at_ms: None,
             },
@@ -17732,6 +17952,8 @@ going until a third line | alice |\n\
                     id: None,
                     state: Some(state.to_string()),
                     status: None,
+                    waiting_for: None,
+                    process_key_unread: false,
                     pid: None,
                     started_at_ms: None,
                 },
@@ -18029,6 +18251,8 @@ going until a third line | alice |\n\
                 id: None,
                 state: Some("blocked".to_string()),
                 status: None,
+                waiting_for: None,
+                process_key_unread: false,
                 pid: None,
                 started_at_ms: None,
             },
@@ -18054,6 +18278,41 @@ going until a third line | alice |\n\
             "a SELECTED live session must never fall through to the \
              nothing-selected placeholder: {rows:?}"
         );
+    }
+
+    /// A background record in `state` that also carries a `waitingFor`.
+    fn reported_waiting(state: &str, waiting_for: &str) -> ReportedAgent {
+        ReportedAgent::fixture("background", Some(state), None).with_waiting_for(waiting_for)
+    }
+
+    /// Issue #83: what a `needs input` agent waits ON rides after the phrase, as
+    /// claude sent it. Only that bucket draws it: a record whose `state` says
+    /// `working` still reads as working, whatever `waitingFor` it also carries. Read
+    /// on the empty-transcript fallback, the one place the banner leads with words.
+    #[test]
+    fn the_status_banner_names_what_a_needs_input_agent_waits_on() {
+        let (width, height) = BANNER_PANE;
+        for (state, waiting_for, expected) in [
+            (
+                "blocked",
+                "permission prompt",
+                "bg needs input \u{b7} permission prompt",
+            ),
+            ("blocked", "", "bg needs input"),
+            ("working", "dialog open", "bg working"),
+        ] {
+            let mut session = sample_session();
+            session.file = empty_transcript_fixture();
+            let mut app = App::new(vec![session], Scope::All, PathBuf::from("/tmp/launch"));
+            let mut reported = HashMap::new();
+            reported.insert(
+                "sess-normal-1".to_string(),
+                reported_waiting(state, waiting_for),
+            );
+            app.set_reported_agents(reported, None);
+            let rows = inner_rows(&mut app, width, height);
+            assert_eq!(rows[0], expected, "{state:?} / {waiting_for:?}: {rows:?}");
+        }
     }
 
     #[test]
@@ -18196,6 +18455,8 @@ going until a third line | alice |\n\
                 id: None,
                 state: Some("done".to_string()),
                 status: None,
+                waiting_for: None,
+                process_key_unread: false,
                 pid: None,
                 started_at_ms: None,
             },
@@ -20765,6 +21026,8 @@ going until a third line | alice |\n\
                 id: None,
                 state: Some("blocked".to_string()),
                 status: None,
+                waiting_for: None,
+                process_key_unread: false,
                 pid: None,
                 started_at_ms: None,
             },
@@ -20822,6 +21085,8 @@ going until a third line | alice |\n\
                 id: None,
                 state: Some("blocked".to_string()),
                 status: None,
+                waiting_for: None,
+                process_key_unread: false,
                 pid: None,
                 started_at_ms: None,
             },
@@ -21425,6 +21690,8 @@ going until a third line | alice |\n\
             id: None,
             state: state.map(str::to_owned),
             status: status.map(str::to_owned),
+            waiting_for: None,
+            process_key_unread: false,
             pid: None,
             started_at_ms: None,
         }
@@ -21711,6 +21978,8 @@ going until a third line | alice |\n\
                     id: None,
                     state: Some(state.to_string()),
                     status: status.map(str::to_owned),
+                    waiting_for: None,
+                    process_key_unread: false,
                     pid: None,
                     started_at_ms: None,
                 },
@@ -21921,6 +22190,484 @@ going until a third line | alice |\n\
                 "and it must NOT draw at badge weight — only NeedsInput does"
             );
         }
+    }
+
+    /// Issue #83: the list row draws what a `needs input` agent waits on after the
+    /// phrase, DIM so the loud `needs input` stays the thing the eye lands on, and
+    /// draws it for that bucket ALONE — a `working` record that also carries a
+    /// `waitingFor` shows none. Read off the DRAWN cells.
+    #[test]
+    fn render_list_draws_what_a_needs_input_row_waits_on() {
+        let mut sessions = Vec::new();
+        let mut reported = HashMap::new();
+        for (label, state) in [("sess-waiting", "blocked"), ("sess-busy", "working")] {
+            let mut session = sample_session();
+            session.session_id = label.to_string();
+            session.label = label.to_string();
+            reported.insert(
+                label.to_string(),
+                reported_waiting(state, "permission prompt"),
+            );
+            sessions.push(session);
+        }
+        let mut app = App::new(sessions, Scope::All, PathBuf::from("/tmp/launch"));
+        app.set_reported_agents(reported, None);
+
+        let (width, height) = (80, 8);
+        let buffer = drawn_list(&mut app, width, height);
+
+        let waiting = row_of(&buffer, width, height, "sess-waiting");
+        let line = row_text(&buffer, waiting, width);
+        assert!(
+            line.contains("needs input \u{b7} permission prompt"),
+            "the reason follows the phrase: {line:?}"
+        );
+        let reason = " \u{b7} permission prompt";
+        let reason_x = column_of(&buffer, waiting, width, reason);
+        for i in 0..reason.chars().count() {
+            let cell = buffer
+                .cell((
+                    reason_x + u16::try_from(i).expect("a short reason"),
+                    waiting,
+                ))
+                .expect("a drawn reason cell");
+            assert!(
+                cell.modifier.contains(Modifier::DIM),
+                "the reason is DIM: {:?}",
+                cell.modifier
+            );
+        }
+
+        let busy = row_of(&buffer, width, height, "sess-busy");
+        let busy_line = row_text(&buffer, busy, width);
+        assert!(
+            !busy_line.contains("permission prompt"),
+            "a `working` record shows no reason, `state` wins: {busy_line:?}"
+        );
+    }
+
+    /// A head row whose agent waits on `permission prompt`, drawn at `width`, and
+    /// the text of its session row.
+    fn waiting_row_at(width: u16, waiting_for: &str) -> String {
+        let mut session = sample_session();
+        session.label = "Refactor the payment webhook handler".to_string();
+        let mut reported = HashMap::new();
+        reported.insert(
+            session.session_id.clone(),
+            reported_waiting("blocked", waiting_for),
+        );
+        let mut app = App::new(vec![session], Scope::All, PathBuf::from("/tmp/launch"));
+        app.set_reported_agents(reported, None);
+        let height = 5;
+        let buffer = drawn_list(&mut app, width, height);
+        let y = row_of(&buffer, width, height, "needs input");
+        row_text(&buffer, y, width)
+    }
+
+    /// Issue #83: the reason gives way BEFORE the label does. On the 38-column list
+    /// pane an 80-column terminal gives, the row is the one it drew before the
+    /// reason existed (the label starts where it always did); a pane with a little
+    /// more room cuts the reason, and one with plenty draws it whole.
+    #[test]
+    fn the_waiting_reason_gives_way_before_the_label_does() {
+        let narrow = waiting_row_at(38, "permission prompt");
+        assert!(
+            !narrow.contains('\u{b7}'),
+            "no room beside the label, so no reason: {narrow:?}"
+        );
+        assert!(
+            narrow.contains("needs input  Refactor t"),
+            "the label keeps the columns it had without a reason: {narrow:?}"
+        );
+
+        let cut = waiting_row_at(50, "permission prompt");
+        assert!(
+            cut.contains("needs input \u{b7} permissi\u{2026}  Refactor t"),
+            "the reason is cut, and the label keeps its columns: {cut:?}"
+        );
+
+        let whole = waiting_row_at(80, "permission prompt");
+        assert!(
+            whole.contains("needs input \u{b7} permission prompt  Refactor the"),
+            "with room the reason is whole: {whole:?}"
+        );
+    }
+
+    /// The fit as arithmetic: whole when it fits, cut with an ellipsis down to
+    /// [`MIN_REASON_COLS`] characters, dropped below that or when nothing is left
+    /// after the label's columns, and never counting the label's columns as its own.
+    #[test]
+    fn fit_waiting_reason_cuts_then_drops_and_never_takes_the_labels_columns() {
+        let separator = agents::WAITING_FOR_SEPARATOR;
+        let gap = BADGE_GAP.chars().count();
+        let kept = MIN_LABEL_COLS_BESIDE_REASON;
+        let reserved = gap + kept;
+        let reason = "permission prompt";
+        let whole_width = separator.chars().count() + reason.chars().count();
+        // Exactly the width it needs beyond the label's share: whole.
+        assert_eq!(
+            fit_waiting_reason(reason, 20 + whole_width + reserved, 20, kept),
+            Some(format!("{separator}{reason}"))
+        );
+        // One column short: two chars go, one for the column and one for the ellipsis.
+        assert_eq!(
+            fit_waiting_reason(reason, 20 + whole_width + reserved - 1, 20, kept),
+            Some(format!("{separator}permission prom\u{2026}"))
+        );
+        // The smallest cut worth drawing, and one column below it.
+        let floor = separator.chars().count() + MIN_REASON_COLS;
+        assert_eq!(
+            fit_waiting_reason(reason, 20 + floor + reserved, 20, kept)
+                .map(|segment| segment.chars().count()),
+            Some(floor)
+        );
+        assert_eq!(
+            fit_waiting_reason(reason, 20 + floor + reserved - 1, 20, kept),
+            None
+        );
+        // No room at all, and a row already wider than the pane: dropped, no underflow.
+        assert_eq!(fit_waiting_reason(reason, 20 + reserved, 20, kept), None);
+        assert_eq!(fit_waiting_reason(reason, 10, 20, kept), None);
+    }
+
+    /// What the row keeps to the reason's right comes off the reason's room, column
+    /// for column: the label's floor AND a marker, so a marker is never what pays.
+    #[test]
+    fn fit_waiting_reason_leaves_the_kept_columns_to_the_row() {
+        let separator = agents::WAITING_FOR_SEPARATOR;
+        let gap = BADGE_GAP.chars().count();
+        let reason = "permission prompt";
+        let whole_width = separator.chars().count() + reason.chars().count();
+        let kept = MIN_LABEL_COLS_BESIDE_REASON + FAILED_TASK_MARKER.chars().count();
+        assert_eq!(
+            fit_waiting_reason(reason, 20 + gap + kept + whole_width, 20, kept),
+            Some(format!("{separator}{reason}"))
+        );
+        assert_eq!(
+            fit_waiting_reason(reason, 20 + gap + kept + whole_width - 1, 20, kept),
+            Some(format!("{separator}permission prom\u{2026}")),
+            "one column short of whole: cut, the kept columns untouched"
+        );
+        assert_eq!(
+            fit_waiting_reason(
+                reason,
+                20 + gap + kept + separator.chars().count() + MIN_REASON_COLS - 1,
+                20,
+                kept
+            ),
+            None,
+            "below the smallest worthwhile cut: dropped, never paid for by the marker"
+        );
+    }
+
+    /// A child row's markers and count are what they are without a reason, however
+    /// many columns the reason takes of what [`ChildTail::kept`] leaves it, and the
+    /// name keeps its floor.
+    #[test]
+    fn a_child_tail_keeps_its_markers_and_count_beside_the_reason() {
+        for name in [None, Some("Review the payment webhook handler")] {
+            let facts = ChildFacts {
+                name,
+                id: BG_ID,
+                msg_count: 171,
+                failed: true,
+                unbound: true,
+                hidden: true,
+            };
+            for content_width in 20..=140 {
+                let used = 20;
+                let without = child_tail(&facts, content_width, used, 0);
+                let room = content_width
+                    .saturating_sub(used)
+                    .saturating_sub(without.kept());
+                let with = child_tail(&facts, content_width, used, room);
+                assert_eq!(with.markers, without.markers, "{name:?} at {content_width}");
+                // A named fork's markers never count the reason, however much it takes.
+                if name.is_some() {
+                    assert_eq!(
+                        child_tail(&facts, content_width, used, content_width).markers,
+                        without.markers,
+                        "{name:?} at {content_width}: a marker was decided against the reason"
+                    );
+                }
+                assert_eq!(
+                    with.msgs.is_some(),
+                    without.msgs.is_some(),
+                    "{name:?} at {content_width}"
+                );
+                if name.is_none() {
+                    assert_eq!(with.lead, without.lead, "an id is never cut");
+                } else if let (Some(with), Some(without)) = (&with.lead, &without.lead) {
+                    assert!(
+                        with.chars().count()
+                            >= without.chars().count().min(MIN_LABEL_COLS_BESIDE_REASON),
+                        "{name:?} at {content_width}: {with:?} vs {without:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The text of the row a `needs input` agent draws on the board `build` makes at
+    /// `width`, with its `waitingFor` reason `waiting_for` (or none), for the
+    /// session `id`; `None` where the pane is too narrow to draw the badge at all.
+    /// A fresh board per call, so each width starts from the same one.
+    fn needs_input_row(
+        build: &dyn Fn() -> App,
+        id: &str,
+        waiting_for: Option<&str>,
+        width: u16,
+    ) -> Option<String> {
+        let mut app = build();
+        let agent = match waiting_for {
+            Some(reason) => reported_waiting("blocked", reason),
+            None => ReportedAgent::fixture("background", Some("blocked"), None),
+        };
+        app.set_reported_agents(HashMap::from([(id.to_string(), agent)]), None);
+        let height = LINEAGE_BOARD_SIZE.1;
+        let buffer = drawn_list(&mut app, width, height);
+        let y = (0..height).find(|&y| row_text(&buffer, y, width).contains("needs input"))?;
+        Some(row_text(&buffer, y, width))
+    }
+
+    /// What follows `needs input` on a drawn row once the reason (if any) is
+    /// taken out: the label, or a child's id or fork name, then the markers.
+    fn after_the_reason(row: &str) -> &str {
+        let after = row.split_once("needs input").expect("a needs-input row").1;
+        match after.strip_prefix(" \u{b7} ") {
+            Some(reason_and_rest) => reason_and_rest
+                .split_once("  ")
+                .expect("a reason is followed by the badge gap")
+                .1
+                .trim_start(),
+            None => after.trim_start(),
+        }
+    }
+
+    /// Issue #83: the reason is the FIRST thing on a row to give way. At every
+    /// pane width the row with a reason draws the markers and the label (or id, or
+    /// fork name) floor the same row draws WITHOUT one, and at least one width
+    /// makes the reason fit beside them, so the sweep pins something.
+    fn assert_the_reason_gives_way_first(
+        what: &str,
+        build: &dyn Fn() -> App,
+        id: &str,
+        markers: &[&str],
+    ) {
+        let mut reason_drawn_beside_a_marker = false;
+        for width in 40..=140_u16 {
+            let Some(without) = needs_input_row(build, id, None, width) else {
+                continue;
+            };
+            let with = needs_input_row(build, id, Some("permission prompt"), width)
+                .expect("the badge the row drew without a reason is drawn with one");
+            let tail_without = after_the_reason(&without);
+            let tail_with = after_the_reason(&with);
+            for marker in markers {
+                assert_eq!(
+                    tail_with.contains(marker.trim()),
+                    tail_without.contains(marker.trim()),
+                    "{what} at {width}: the reason changed whether {marker:?} is drawn\n\
+                     without: {without:?}\nwith:    {with:?}"
+                );
+            }
+            // The floor is columns, and a cut label spends its last one on the
+            // ellipsis: so every column but that one matches, and it matches or
+            // is the ellipsis.
+            let floor_with: Vec<char> = tail_with
+                .chars()
+                .take(MIN_LABEL_COLS_BESIDE_REASON)
+                .collect();
+            let floor_without: Vec<char> = tail_without
+                .chars()
+                .take(MIN_LABEL_COLS_BESIDE_REASON)
+                .collect();
+            let last = MIN_LABEL_COLS_BESIDE_REASON - 1;
+            assert!(
+                floor_with.len() == floor_without.len()
+                    && floor_with.get(..last) == floor_without.get(..last)
+                    && (floor_with.get(last) == floor_without.get(last)
+                        || floor_with.get(last).map(char::to_string).as_deref()
+                            == Some(LABEL_ELLIPSIS)),
+                "{what} at {width}: the reason cut into the first \
+                 {MIN_LABEL_COLS_BESIDE_REASON} columns\nwithout: {without:?}\nwith:    {with:?}"
+            );
+            if with.contains('\u{b7}') {
+                reason_drawn_beside_a_marker |=
+                    markers.iter().all(|marker| with.contains(marker.trim()));
+            }
+        }
+        assert!(
+            reason_drawn_beside_a_marker,
+            "{what}: no width drew the reason beside every marker, so this pins nothing"
+        );
+    }
+
+    /// A lone (lineage-less) session `LONE_ID` set up by `shape`.
+    fn lone_board(shape: fn(&mut App)) -> App {
+        let mut app = lineage_board();
+        shape(&mut app);
+        app
+    }
+
+    /// A folded lineage head's `(+N)` is kept whole beside a reason, with a real
+    /// 16-column timestamp: the 70-column pane the review measured among them.
+    #[test]
+    fn the_waiting_reason_leaves_a_folded_heads_count_its_columns() {
+        assert_the_reason_gives_way_first(
+            "folded head",
+            &lineage_board,
+            BG_ID,
+            &[&lineage_marker(1)],
+        );
+    }
+
+    /// `[task failed]` survives a reason on a head row, alone and together with
+    /// `(+N)` and `[unbound]` (the pane that has room for one keeps the failed task).
+    #[test]
+    fn the_waiting_reason_leaves_a_heads_failed_task_its_columns() {
+        let failed: fn(&mut App) = |app| {
+            let lone = app
+                .sessions
+                .iter()
+                .position(|s| s.session_id == LONE_ID)
+                .expect("the lone row");
+            app.sessions[lone].failed_task = Some(failed_task(SHORT_FAILURE, None));
+        };
+        assert_the_reason_gives_way_first(
+            "head with a failed task",
+            &|| lone_board(failed),
+            LONE_ID,
+            &[FAILED_TASK_MARKER],
+        );
+        let everything: fn(&mut App) = |app| {
+            let bg = app
+                .sessions
+                .iter()
+                .position(|s| s.session_id == BG_ID)
+                .expect("the lineage head");
+            app.sessions[bg].failed_task = Some(failed_task(SHORT_FAILURE, None));
+            app.lost_agent_bindings.insert(BG_ID.to_string());
+        };
+        assert_the_reason_gives_way_first(
+            "folded head with a failed task and an unbound badge",
+            &|| lone_board(everything),
+            BG_ID,
+            &[&lineage_marker(1), FAILED_TASK_MARKER, AGENT_UNBOUND_MARKER],
+        );
+    }
+
+    /// `[unbound]` survives a reason on a head row.
+    #[test]
+    fn the_waiting_reason_leaves_a_heads_unbound_badge_its_columns() {
+        let unbound: fn(&mut App) = |app| {
+            app.lost_agent_bindings.insert(LONE_ID.to_string());
+        };
+        assert_the_reason_gives_way_first(
+            "head with an unbound badge",
+            &|| lone_board(unbound),
+            LONE_ID,
+            &[AGENT_UNBOUND_MARKER],
+        );
+    }
+
+    /// A lineage CHILD row keeps its id, turn count and markers beside a reason.
+    #[test]
+    fn the_waiting_reason_leaves_a_child_rows_fields_their_columns() {
+        let expanded_with_markers: fn(&mut App) = |app| {
+            app.expand_selected();
+            let child = app
+                .sessions
+                .iter()
+                .position(|s| s.session_id == ANCESTOR_ID)
+                .expect("the folded-away ancestor");
+            app.sessions[child].failed_task = Some(failed_task(SHORT_FAILURE, None));
+            app.lost_agent_bindings.insert(ANCESTOR_ID.to_string());
+        };
+        assert_the_reason_gives_way_first(
+            "unnamed child",
+            &|| lone_board(expanded_with_markers),
+            ANCESTOR_ID,
+            &[
+                &child_msgs(ANCESTOR_MSGS),
+                FAILED_TASK_MARKER,
+                AGENT_UNBOUND_MARKER,
+            ],
+        );
+    }
+
+    /// A named fork's child row keeps its markers and its name's floor beside a
+    /// reason.
+    #[test]
+    fn the_waiting_reason_leaves_a_named_forks_fields_their_columns() {
+        let build = || {
+            let mut app = named_forks_board(&[(MARKED_FORK_ID, "Review PR1", BG_TS)], Vec::new());
+            let fork = app
+                .sessions
+                .iter()
+                .position(|s| s.session_id == MARKED_FORK_ID)
+                .expect("the fork is on the board");
+            app.sessions[fork].failed_task = Some(failed_task(SHORT_FAILURE, None));
+            app.hidden_ids.insert(MARKED_FORK_ID.to_string());
+            app.toggle_show_hidden();
+            app.lost_agent_bindings.insert(MARKED_FORK_ID.to_string());
+            app
+        };
+        assert_the_reason_gives_way_first(
+            "named fork",
+            &build,
+            MARKED_FORK_ID,
+            &[
+                &child_msgs(FORK_MSGS),
+                FAILED_TASK_MARKER,
+                AGENT_UNBOUND_MARKER,
+                HIDDEN_ROW_MARKER,
+            ],
+        );
+    }
+
+    /// Issue #83: the stop confirm names what the agent waits on when claude said,
+    /// on one more line, and draws no such line when it did not.
+    #[test]
+    fn the_stop_confirm_names_what_the_agent_waits_on() {
+        let drawn = |waiting_for: Option<&str>| -> Vec<String> {
+            let mut app = App::new(
+                vec![sample_session()],
+                Scope::All,
+                PathBuf::from("/tmp/launch"),
+            );
+            app.open_stop_confirm(
+                "sess-normal-1".to_string(),
+                "job".to_string(),
+                waiting_for.map(str::to_owned),
+            );
+            let mut terminal =
+                Terminal::new(TestBackend::new(80, 24)).expect("build an in-memory test terminal");
+            terminal
+                .draw(|frame| render_stop_confirm(frame, &app))
+                .expect("render_stop_confirm must not panic");
+            let buffer = terminal.backend().buffer().clone();
+            (0..24).map(|y| row_text(&buffer, y, 80)).collect()
+        };
+
+        let named = drawn(Some("permission prompt"));
+        assert!(
+            named
+                .iter()
+                .any(|row| row.contains("It's waiting on: permission prompt")),
+            "the confirm names the reason: {named:?}"
+        );
+        let unnamed = drawn(None);
+        assert!(
+            !unnamed.iter().any(|row| row.contains("waiting on")),
+            "no reason, no line: {unnamed:?}"
+        );
+        let height = |rows: &[String]| rows.iter().filter(|row| !row.is_empty()).count();
+        assert_eq!(
+            height(&named),
+            height(&unnamed) + 1,
+            "the reason adds exactly one row to the box"
+        );
     }
 
     /// The SHAPE channel: the ONE bucket that wants the user marks its badge with
@@ -24969,6 +25716,8 @@ going until a third line | alice |\n\
                     id: None,
                     state: Some(state.to_string()),
                     status: None,
+                    waiting_for: None,
+                    process_key_unread: false,
                     pid: None,
                     started_at_ms: None,
                 },
@@ -25758,6 +26507,8 @@ going until a third line | alice |\n\
             id: None,
             state: Some("blocked".to_string()),
             status: None,
+            waiting_for: None,
+            process_key_unread: false,
             pid: None,
             started_at_ms: None,
         };
@@ -26550,6 +27301,8 @@ going until a third line | alice |\n\
                     id: None,
                     state: Some("blocked".to_string()),
                     status: None,
+                    waiting_for: None,
+                    process_key_unread: false,
                     pid: None,
                     started_at_ms: None,
                 },

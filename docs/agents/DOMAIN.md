@@ -275,14 +275,17 @@ other or from `kind`. The re-measurement changes the figure, not the decision: a
 present pid is still no evidence of a write, and an absent one no evidence of
 none.
 
-The pid now has THREE consumers. Two never ask the writer question. The
+The pid now has FOUR consumers. Three never ask the writer question. The
 [`Ctrl-K` interrupt gate's signal route](#the-signal-route-no-job-id-a-pid) asks
 "which process do I signal?" for a reported session that has no stoppable job
 id, and it is the reason `ReportedAgent::pid` was parsed. The pinned preview row
 asks only whether one is PRESENT, to decide whether a live agent's status and age
 ride after the turn marker (see [reported agents](#reported-agents-srcagentsrs)).
+The `Ctrl-R` reply gate's `agents::is_registry_only` asks the same PRESENCE question
+(of the key, whatever its JSON type) to route a quick reply's stop (see the
+[reply gate](#quick-reply--non-interactive-send-srcsendrs)).
 
-The third, the parse's [gone-process filter](#records-that-name-a-gone-process),
+The fourth, the parse's [gone-process filter](#records-that-name-a-gone-process),
 answers the writer question for ONE case, and only by removal. It leaves out an
 INTERACTIVE record whose pid the kernel says names no running process, so the
 guard never sees that record and the `None` arm allows. That is the writer
@@ -293,7 +296,7 @@ every background record and the guard keeps judging it by its bucket. It reaches
 the guard in that direction only. It never adds a record, and a pid the kernel
 calls running, or cannot settle, leaves the record exactly as it was, so a
 present pid is still no evidence of a write. `delete::can_delete` itself still
-never reads the field. The field's doc comment names all three and carries the
+never reads the field. The field's doc comment names all four and carries the
 same prohibition as this note, so the pid cannot drift into the writer guard any
 other way without contradicting both.
 
@@ -1115,7 +1118,9 @@ fork, keeps the id. The name is fitted BEFORE the turn count
 (`view::fit_child_name`), and the row's markers (`[task failed]`, `[unbound]`,
 `[hidden]`) are reserved before either (`view::fit_child_markers`, the
 marker-first rule a head row's `fit_label` keeps), so a narrowing pane drops the
-count first, then ellipsizes the name (dropping it only when not one column is
+count first (after a `needs input` row's `waitingFor` reason, which gives way
+before every field here: [reported agents](#reported-agents-srcagentsrs)), then
+ellipsizes the name (dropping it only when not one column is
 left for it), and keeps every marker that fits whole; a marker that cannot is
 dropped whole, never clipped at the edge. An unnamed member's markers still take
 what its id and count leave. A wider pane — `Shift-→` toward the list — shows more
@@ -1570,6 +1575,55 @@ step that branches on it:
   Attach and `claude stop` **when read from the `live_agents` probe**, never from
   the `--all` map, which is a stale snapshot of a job that may have ended.
 - `state`/`status`, the activity qualifier (see below).
+- `waitingFor`, the **tenth key** of a record: what a session that stopped for
+  the user is waiting ON, in claude's own words. Its VALUE is a string, read with
+  `as_str`, so an absent, `null` or mistyped value is `None` and never discards
+  the record; a string is cleaned (`agents::clean_waiting_for`: control
+  characters and escape sequences out, whitespace collapsed, capped at
+  `WAITING_FOR_MAX_CHARS`) because it is claude-supplied text drawn into the
+  terminal. A string that cleans to nothing stays present. Two consumers, neither
+  a writer question: [`agents::waiting_reason`](#activity-buckets-agentactivity)
+  shows the value after the `needs input` phrase — on the list row, in the
+  preview banner's status (`friendly_status`) and in the `Ctrl-R` stop confirm
+  (`It's waiting on: permission prompt`) — on the `NeedsInput` bucket ALONE; and
+  the KEY's presence, whatever its JSON type, is one of the three signs
+  `agents::is_registry_only` reads (see the
+  [reply gate](#quick-reply--non-interactive-send-srcsendrs)). The parse keeps
+  that presence in `ReportedAgent::process_key_unread` for a key the typed fields
+  could not read, so a wrong-typed value still counts as a sign of a process. On
+  the list row the reason is the FIRST thing to give way: it takes only the
+  columns nothing else the row draws needs (`view::fit_waiting_reason`), which is
+  the label's first ten (a fork's name's, on a named child row) and every marker
+  and field after the badge — `(+N)`, `[task failed]`, `[unbound]`, `[hidden]`, a
+  child's id and turn count — each decided against the row WITHOUT the reason
+  (`view::fill_reason_slot` runs last, `view::child_tail` for a child row). It is
+  cut, then dropped, before any of them gives way. The value is shown as claude
+  sent it: claude's own agent view shortens it (the 2.1.326 bundle maps
+  `permission prompt`, `sandbox request`, `worker request` and `goal proposal` to
+  `permission`, `input needed` to `question` and `dialog open` to nothing), and
+  copying that map would mean keeping it in step with claude.
+  `Ctrl-K`'s confirm and `delete::can_delete` never read it.
+
+  *Where it comes from:* read out of the `claude` 2.1.322 bundle (2.1.326 has the
+  same code), not documented. The session process builds it:
+  `function uEe(h){let M=f$o(h);if(M!==void 0)return{status:"waiting",waitingFor:M,working:!1};return{status:h.isLoading||h.delegatedActive?"busy":"idle",waitingFor:void 0,working:h.isQueryActive}}`
+  with
+  `function f$o(h){if(h.queuedElicitation)return"input needed";if(h.topDialogWaitingFor!==void 0)return h.topDialogWaitingFor;if(h.pendingWorkerRequest)return"worker request";if(h.pendingSandboxRequest)return"sandbox request";if(h.isShowingLocalJSXCommand&&!h.isResponseStreaming&&!h.delegatedActive)return"dialog open";return}`,
+  and a dialog's own value defaults as `…?.waitingFor??"permission prompt"`. The
+  registry reads it back as `waitingFor:typeof o.waitingFor==="string"?o.waitingFor:void 0`.
+  So it is `status: "waiting"` plus a reason, written by the session PROCESS: a
+  record that carries one has a process behind it, which is why its presence keeps
+  the stop confirm. Values seen: `"dialog open"` (2026-11-11, interactive,
+  `status: waiting`) and `"permission prompt"` (2026-11-17, background, `blocked`
+  with `status: waiting`); the bundle also names `input needed`, `worker request`,
+  `sandbox request` and `goal proposal` (a session goal Claude proposed, read from
+  the 2.1.326 bundle on 2026-11-17), never seen on the wire. The first and second probes are
+  [Samples G and H](#observed-value-distribution).
+
+  *A caveat, not observed:* `state` wins in `classify`, so a record with
+  `state: working` and `status: waiting` would still be classed as `working`, and
+  the reason would only appear if it were shown on every bucket. It is shown on
+  `NeedsInput` alone.
 - `pid`, the OS process id claude reports: a JSON number, read with `as_u64` and
   narrowed with `u32::try_from`, so an absent, mistyped (a string) or out-of-range
   value is `None` and never discards the record. Its VALUE has two consumers:
@@ -1577,8 +1631,9 @@ step that branches on it:
   asks the kernel about an interactive record's pid before that record is kept,
   and `Ctrl-K`'s
   [signal route](#the-signal-route-no-job-id-a-pid). Its PRESENCE is the pinned
-  preview row's LIVE test (`view::reports_live_process`, next bullet). It is
-  NOT a writer signal; see [the one write into this tree](#on-disk-layout).
+  preview row's LIVE test (`view::reports_live_process`, next bullet) and, as a
+  key of any type, one of the three signs the `Ctrl-R` gate's
+  `agents::is_registry_only` reads. It is NOT a writer signal; see [the one write into this tree](#on-disk-layout).
 - `startedAt`, when claude says the session started: epoch MILLISECONDS as a JSON
   number (13 digits, e.g. `1790152789592`), read with `as_i64`, fail-soft. Its
   one consumer is the preview banner's age phrase (`live busy · 46m`, built by
@@ -1889,7 +1944,7 @@ Every qualifier-shaped output derives from that enum, so they cannot drift apart
 
 | Bucket | Qualifier(s) | Badge color | Badge glyph | Dot pulses | Row reads |
 | --- | --- | --- | --- | --- | --- |
-| `NeedsInput` | `blocked`, `waiting` | `Yellow` (label/phrase) | `!` (`Red`) | no | `needs input` (translated — both tokens) |
+| `NeedsInput` | `blocked`, `waiting` | `Yellow` (label/phrase) | `!` (`Red`) | no | `needs input` (translated — both tokens), then ` · <waitingFor>` when the record carries a non-empty one |
 | `Idle` | `idle` | `Green` | `●` | no | `idle` (verbatim) |
 | `Working` | `working`, `busy` | `Gray` | `●` | **yes** (-> `DarkGray`) | verbatim (`working` / `busy`) |
 | `WorkingButIdle` | `state`=`working`/`busy` **AND** `status`=`idle` | `Gray` | `●` | **no** | `interrupted` (**translated**, no wire token) |
@@ -1970,7 +2025,7 @@ non-display consumers route it with the LIVE states:
   lands here moves an irreversible unlink and not just a steady dot.
 
 *Observed:* a live `claude --bg` probe at 2.1.326 (2026-11-17, bare `claude
-agents --json` about every 250 ms)
+agents --json` about every 250 ms, [Sample H](#observed-value-distribution))
 went `working` with no `status` → `working`+`busy` → `blocked`+`waiting` and
 read no `working`+`idle` poll; no local observation of the pair is claimed.
 
@@ -2143,6 +2198,42 @@ under both flags (9 in F1, 7 in F2), the same 5 background sessions in both
 captures, and those 5 the only background records carrying a `status` beside
 their `state`. The bare `done`×2 are two of those 5, each its own session. The
 nine-key union was unchanged.
+
+Sample G, dated 2026-11-11T17:01:41Z at `claude 2.1.322`: bare
+`claude agents --json` 111 records (101 background, 10 interactive), `--all` 484
+(474 background, 10 interactive). Keys: `cwd`, `id`, `kind`, `name`, `pid`,
+`sessionId`, `startedAt`, `state`, `status`, `waitingFor` — **ten**; every sample
+above recorded nine. `waitingFor` was on 1 record: interactive, `status: waiting`,
+`"dialog open"`. The bare list held background `blocked` with no `pid`, `status`
+or `waitingFor` ×100, background `working`/`busy` ×1 (with a `pid`), and
+interactive `busy` ×7, `idle` ×2, `waiting` ×1. `--all` adds `stopped` ×236,
+`done` ×136 and `failed` ×1, none carrying a `status` or a `pid`.
+
+Sample H, dated 2026-11-17 at `claude 2.1.326`, a live `claude --bg` probe taken
+for [`waitingFor`](#reported-agents-srcagentsrs) and the `WorkingButIdle` pair.
+Launch: cwd a trusted project folder, `claude --bg --model haiku
+--permission-mode manual "<a prompt asking for one Bash command that writes a
+file under /tmp>"` at 06:56:54.947Z, which printed `backgrounded · e54ba092`.
+`--permission-mode manual` was needed because the settings in use default to
+`auto`. The bare `claude agents --json` was polled
+about every 250 ms; each row is one run of identical polls, as (`state`,
+`status`, `pid` present, `waitingFor`, transcript exists):
+
+| Window | `state` | `status` | `pid` | `waitingFor` | Transcript | Polls |
+| --- | --- | --- | --- | --- | --- | --- |
+| +0.38 → +0.64 s | `working` | none | no | none | no | 2 |
+| +0.92 → +4.45 s | `working` | `busy` | yes | none | no | 15 |
+| +4.69 → +6.47 s | `working` | `busy` | yes | none | yes | 8 |
+| +6.72 → +11.53 s | `blocked` | `waiting` | yes | `"permission prompt"` | yes | 20 |
+
+No poll read `working` with `idle`. `claude stop e54ba092` (exit 0) took the
+session out of the bare list; `--all` then showed `{kind: background, id:
+e54ba092, state: "stopped"}` with no `pid`, `status` or `waitingFor`. The ten-key
+union held across every poll. Baseline in the same capture: about 101 bare
+background records, all `blocked` with no `pid`, `status` or `waitingFor` (the
+registry-only shape the `Ctrl-R` gate stops without asking), and one live interactive
+record with `status: waiting` and `waitingFor: "dialog open"`. This is the probe
+the `WorkingButIdle` paragraph above cites.
 
 In Samples C and D, `state` and `status` were **kind-exclusive**: every background
 record carried a `state` and no `status`, and every interactive record the
@@ -4133,7 +4224,8 @@ never the polled `--all` map — classified by the one `agents::classify`), and
 | held, but the record carries no stoppable job id (every `kind: "interactive"` record measured so far), with or without a `pid` | — | refuse (`SEND_LIVE_REFUSED`) — try `Ctrl-K` or Fork (`Ctrl-X f`) |
 | `done` | `Done` | stop the ended job, then reply — straight to compose |
 | `stopped`, `failed` | `Ended` | same: stop, then reply |
-| `blocked`, `waiting` | `NeedsInput` | **confirm** (`App::pending_stop`, a small modal — stopping abandons a waiting agent), then stop + reply |
+| `blocked` on a **background** record with NO `pid`, NO `status` and NO `waitingFor` KEY (a **registry-only** agent, `agents::is_registry_only`) | `NeedsInput` | stop the registry-only job, then reply — straight to compose, no confirm, as `Done` does |
+| any other `blocked`, `waiting` — a `pid`, `status` or `waitingFor` key of any type on the record, a non-background `kind`, or `state` spelled `waiting` | `NeedsInput` | **confirm** (`App::pending_stop`, a small modal — stopping abandons a waiting agent; it names the reason, `It's waiting on: permission prompt`, when the record carries one), then stop + reply |
 | `working`, `busy` | `Working` | refuse (`SEND_LIVE_REFUSED`) — try `Ctrl-K` or Fork (`Ctrl-X f`) |
 | `state`=`working`/`busy` **AND** `status`=`idle` | `WorkingButIdle` (reads `interrupted`) | refuse (the same message) |
 | `idle` | `Idle` | refuse (the same message) |
@@ -4190,6 +4282,27 @@ rule out a live agent that will write again ([what the pair shows](#activity-buc
 Acting on that inference could stop live work on a guess, so the bucket is granted
 no stop here, as [its own rules](#activity-buckets-agentactivity) promise. A badge
 that merely LOOKS at rest is not licence to stop a job.
+
+**What a registry-only agent is, and why it skips the confirm.** `Done`/`Ended`
+are over because claude said so. A registry-only agent is the other shape that
+needs no confirm: claude's job registry holds it as `blocked` and the record
+carries none of the keys a session process writes — no `pid`, no `status`, no
+`waitingFor` (the 2026-11-11 baseline was about a hundred such records, and none
+carried any of the three: Samples G and H). That is a statement about the
+RECORD, not proof that no process exists: Sample H's first polls (+0.38 → +0.64
+s), a `--bg` agent just launched, read `working` with none of the three before a
+`pid` appeared, so the rule asks `blocked` as well and stays one record shape. The name is narrower than the
+"parked" the hard-delete guard admits (`NeedsInput`, `Done`, `Ended`, a bucket
+where this is one record shape inside `NeedsInput`), which is why it has its own
+word. The rule fails toward asking, so it takes ALL of: a `background` `kind`,
+`state` exactly `blocked`, and the three keys absent. Any sign of a live process
+keeps the confirm, and the confirm names the reason when there is one. The three
+count by KEY, whatever its JSON type: a `pid`, `status` or `waitingFor` that is a
+string, a number, `null` or an object is still on the wire, so it keeps the
+confirm even though the typed fields read it as absent
+(`ReportedAgent::process_key_unread` carries that presence out of the parse), and
+a string `waitingFor` that cleans to nothing counts too. `Ctrl-K`'s confirm is
+unchanged: it still asks for a registry-only agent.
 
 The stop step (`build_stop_argv`, the SHORT agent-view job id from the probe's
 `ReportedAgent.id`) runs in `run_send` BEFORE the send, **best-effort**: if the job

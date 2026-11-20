@@ -184,6 +184,22 @@ const NEEDS_INPUT_COPY: &str = "needs input";
 /// ([`AgentActivity::WorkingButIdle`]) so the code never asserts that cause.
 const INTERRUPTED_COPY: &str = "interrupted";
 
+/// What joins a [`AgentActivity::NeedsInput`] phrase to the `waitingFor` value
+/// claude reported ([`ReportedAgent::waiting_for`]): `needs input · permission
+/// prompt`. The list row and the preview banner draw it from this one constant.
+pub const WAITING_FOR_SEPARATOR: &str = " \u{b7} ";
+
+/// The most characters of a `waitingFor` value the board keeps.
+///
+/// The value is claude's own free-form phrase and nothing on the wire bounds it.
+/// The list row fits it to what its other fields leave (`view::fit_waiting_reason`);
+/// this cap bounds what the preview's status and the stop confirm carry. The values
+/// seen are short (`permission prompt`, `dialog open`: DOMAIN.md, "Observed value
+/// distribution"); what a dialog supplies for itself is not shown to be. 40 leaves
+/// the seen ones whole and fits the stop confirm's 62 columns beside its
+/// `It's waiting on: ` lead-in.
+const WAITING_FOR_MAX_CHARS: usize = 40;
+
 /// Milliseconds per second. `startedAt` arrives as epoch MILLISECONDS
 /// ([`ReportedAgent::started_at_ms`]), while [`elapsed_phrase`]'s finest unit is a
 /// whole second.
@@ -237,11 +253,38 @@ pub struct ReportedAgent {
     pub state: Option<String>,
     /// `status` field (e.g. `"idle"`), if present.
     pub status: Option<String>,
+    /// `waitingFor` field: what a session that stopped for the user is waiting
+    /// on, in claude's own words (`"permission prompt"`, `"dialog open"`), if
+    /// present as a string. Cleaned at the parse ([`clean_waiting_for`]): control
+    /// characters out, capped at [`WAITING_FOR_MAX_CHARS`]. A string that cleans
+    /// to nothing stays `Some("")` — the record DID carry the key.
+    ///
+    /// **TWO consumers, and neither is a writer question:**
+    ///
+    /// * the DISPLAY — [`waiting_reason`] gives the non-empty value to the list
+    ///   row, the preview banner ([`friendly_status`]) and the stop-then-reply
+    ///   confirm, on the [`AgentActivity::NeedsInput`] bucket alone;
+    /// * [`is_registry_only`], by PRESENCE alone, so the quick reply stops a registry-only
+    ///   agent without asking only when this is absent.
+    ///
+    /// **Never read by [`crate::delete::can_delete`], and never by `Ctrl-K`'s
+    /// confirm.** The value is a reason to ASK, not evidence about a writer.
+    pub waiting_for: Option<String>,
+    /// Whether the wire carried a `pid`, `status` or `waitingFor` KEY whose value
+    /// the typed fields above could not read — a wrong JSON type (a string `pid`,
+    /// a `null`, an object) or a `pid` out of `u32` range. Those fields read it as
+    /// absent, so this is the one place the key's PRESENCE survives the parse.
+    ///
+    /// **ONE consumer: [`is_registry_only`].** A key claude wrote is a sign a process is
+    /// behind the record whatever its type, so the quick reply must not stop such
+    /// an agent without asking. Every other consumer keeps reading the typed
+    /// field and never this.
+    pub process_key_unread: bool,
     /// `pid` field: the OS process id claude reports for this session, if any.
     /// A JSON NUMBER on the wire, read fail-soft and narrowed (see
     /// [`parse_agents_json`]).
     ///
-    /// **THREE consumers, each named so a fourth one cannot arrive quietly, and only
+    /// **FOUR consumers, each named so a fifth one cannot arrive quietly, and only
     /// the first two read the NUMBER:**
     ///
     /// * the parse's gone-process filter ([`reports_a_gone_process`], inside
@@ -258,6 +301,12 @@ pub struct ReportedAgent {
     ///   claude holds a process for the session — to decide whether the status and
     ///   age ride after the turn marker. A display fact: it never reads the number,
     ///   and it decides nothing.
+    /// * [`is_registry_only`], which `Ctrl-R`'s gate ([`crate::send::reply_gate`]) asks of
+    ///   the record the hand-off probe just returned. PRESENCE alone, as above: a
+    ///   `blocked` background record with no pid is the shape that stops without a
+    ///   confirm, and any pid key at all keeps it, even one that is no readable number
+    ///   ([`ReportedAgent::process_key_unread`]). It routes a quick reply's stop and
+    ///   signals nothing.
     ///
     /// `pid` and [`ReportedAgent::id`] are two SEPARATE conditions and neither
     /// may be inferred from the other, nor from `kind`. Measured at
@@ -283,10 +332,11 @@ pub struct ReportedAgent {
     /// unchanged. The filter above is the one way the pid reaches the guard's
     /// answer, and only by REMOVING an interactive record from the map the guard
     /// is handed, so it can lift a refusal and never cause one (DOMAIN.md's
-    /// "Records that name a gone process" owns why). The other two consumers
+    /// "Records that name a gone process" owns why). The other three consumers
     /// answer different questions — "which process do I signal?", and by its
-    /// presence alone "is this agent live on the pinned row?" — and neither may be
-    /// conflated with the writer question.
+    /// presence alone "is this agent live on the pinned row?" and "is a process
+    /// behind this quick reply's target?" — and none may be conflated with the
+    /// writer question.
     pub pid: Option<u32>,
     /// `startedAt` field: when claude says this session started, as epoch
     /// MILLISECONDS (a 13-digit JSON number on the wire at `claude 2.1.278`,
@@ -351,6 +401,8 @@ impl ReportedAgent {
             id: None,
             state: state.map(str::to_owned),
             status: status.map(str::to_owned),
+            waiting_for: None,
+            process_key_unread: false,
             pid: None,
             started_at_ms: None,
         }
@@ -361,6 +413,12 @@ impl ReportedAgent {
     /// having to grow a parameter every caller then has to pass `None` to.
     pub(crate) fn with_pid(mut self, pid: u32) -> Self {
         self.pid = Some(pid);
+        self
+    }
+
+    /// Put a `waitingFor` on a fixture, at the call site, like [`Self::with_pid`].
+    pub(crate) fn with_waiting_for(mut self, waiting_for: &str) -> Self {
+        self.waiting_for = Some(waiting_for.to_owned());
         self
     }
 }
@@ -552,8 +610,57 @@ pub fn qualifier_copy(agent: &ReportedAgent) -> Option<&str> {
     })
 }
 
+/// What a session in the [`AgentActivity::NeedsInput`] bucket is waiting ON, in
+/// claude's own words (`permission prompt`), for the surfaces that draw it after
+/// the `needs input` phrase: the list row, the preview banner ([`friendly_status`])
+/// and the stop-then-reply confirm.
+///
+/// `None` for every other bucket — a record that says `working` with a
+/// `waitingFor` still reads as working, because `state` wins ([`classify`]) — and
+/// for a value that is absent, mistyped or empty. The value is shown AS CLAUDE
+/// SENT IT: no map shortens it, so nothing here needs keeping in step with claude.
+/// Already cleaned at the parse ([`clean_waiting_for`]). Pure.
+#[must_use]
+pub fn waiting_reason(agent: &ReportedAgent) -> Option<&str> {
+    if classify(agent) != AgentActivity::NeedsInput {
+        return None;
+    }
+    agent
+        .waiting_for
+        .as_deref()
+        .filter(|reason| !reason.is_empty())
+}
+
+/// Whether `agent` is a REGISTRY-ONLY background agent: claude's job registry holds
+/// it as `blocked` and NOTHING on the record says a process is behind it — no `pid`,
+/// no `status`, no `waitingFor`. The quick reply ([`crate::send::reply_gate`]) stops
+/// such an agent and replies without asking, as it does for `done`; any sign of a
+/// live process keeps its confirm. Narrower than the "parked" the hard-delete guard
+/// admits ([`crate::delete::can_delete`]): that is a bucket, this is one record shape.
+///
+/// Fails toward ASKING, so it takes ALL of: `kind` is `background`, `state` is
+/// exactly `blocked` (`waiting` is the interactive spelling and a `status`-only
+/// record has no registry state), and no `pid`, `status` or `waitingFor` KEY on the
+/// wire. A key counts by PRESENCE, whatever its JSON type: the typed fields read a
+/// wrong-typed or out-of-range value as `None`, so [`ReportedAgent::process_key_unread`]
+/// carries those, and a string `waitingFor` that cleaned to nothing is still `Some`.
+///
+/// Pure. It routes a quick reply's stop and nothing else: `Ctrl-K`'s confirm and
+/// the hard-delete guard ([`crate::delete::can_delete`]) never ask it.
+#[must_use]
+pub fn is_registry_only(agent: &ReportedAgent) -> bool {
+    agent.kind == KIND_BACKGROUND
+        && agent.state.as_deref() == Some(QUALIFIER_BLOCKED)
+        && agent.pid.is_none()
+        && agent.status.is_none()
+        && agent.waiting_for.is_none()
+        && !agent.process_key_unread
+}
+
 /// A one-line, human-readable status for a reported agent: the kind label (`bg`
-/// / `live`) plus its qualifier — e.g. `bg needs input`, `live working`.
+/// / `live`) plus its qualifier — e.g. `bg needs input`, `live working` — and,
+/// for a `needs input` agent that reported what it waits on, that after
+/// [`WAITING_FOR_SEPARATOR`]: `bg needs input · permission prompt`.
 ///
 /// Pure, and the phrase comes from [`qualifier_copy`] so the value set is
 /// interpreted in exactly one place (shared with the board list row). An agent
@@ -564,7 +671,26 @@ pub fn friendly_status(agent: &ReportedAgent) -> String {
     let Some(phrase) = qualifier_copy(agent) else {
         return label.to_string(); // Nothing to qualify -> the label stands alone.
     };
-    format!("{label} {phrase}")
+    match waiting_reason(agent) {
+        Some(reason) => format!("{label} {phrase}{WAITING_FOR_SEPARATOR}{reason}"),
+        None => format!("{label} {phrase}"),
+    }
+}
+
+/// A `waitingFor` string made safe to draw on the board: control characters and
+/// escape sequences out, whitespace runs collapsed, capped at
+/// [`WAITING_FOR_MAX_CHARS`]. It is claude-supplied text drawn into the terminal,
+/// so it takes the same cleaning as every other external line the board shows
+/// ([`crate::send::sanitize_status`]); a plain value like `permission prompt`
+/// passes through unchanged. Pure.
+fn clean_waiting_for(raw: &str) -> String {
+    let cleaned = crate::send::sanitize_status(raw);
+    cleaned
+        .chars()
+        .take(WAITING_FOR_MAX_CHARS)
+        .collect::<String>()
+        .trim_end()
+        .to_owned()
 }
 
 /// How long before `now_ms` claude says a session started, in ONE coarse unit —
@@ -703,11 +829,14 @@ fn try_parse_agents_json(
             continue; // No join key -> unusable record, skip (never fatal).
         };
         let str_field = |key: &str| element.get(key).and_then(Value::as_str).map(str::to_owned);
-        let agent = ReportedAgent {
+        let mut agent = ReportedAgent {
             kind: str_field("kind").unwrap_or_default(),
             id: str_field("id"),
             state: str_field("state"),
             status: str_field("status"),
+            // A string only: any other JSON type reads as absent, like the rest.
+            waiting_for: str_field("waitingFor").map(|raw| clean_waiting_for(&raw)),
+            process_key_unread: false,
             // `pid` and `startedAt` are JSON NUMBERS on the wire (measured
             // at claude 2.1.278), so they need their own readers: passing
             // either through `str_field` would silently yield `None` on
@@ -720,6 +849,14 @@ fn try_parse_agents_json(
                 .and_then(|pid| u32::try_from(pid).ok()),
             started_at_ms: element.get("startedAt").and_then(Value::as_i64),
         };
+        // The typed reads above lose a key of the wrong type; presence is kept here.
+        agent.process_key_unread = [
+            ("pid", agent.pid.is_none()),
+            ("status", agent.status.is_none()),
+            ("waitingFor", agent.waiting_for.is_none()),
+        ]
+        .into_iter()
+        .any(|(key, unread)| unread && element.get(key).is_some());
         // Skipped before the insert, never removed after it: the insert is the
         // last-one-wins collapse, and the session's other record must survive.
         if reports_a_gone_process(&agent, &pid_gone) {
@@ -1668,6 +1805,8 @@ mod tests {
                 id: Some("11111111".to_string()),
                 state: Some("blocked".to_string()),
                 status: Some("idle".to_string()),
+                waiting_for: None,
+                process_key_unread: false,
                 pid: None,
                 started_at_ms: None,
             }
@@ -1694,6 +1833,8 @@ mod tests {
                 id: None,
                 state: None,
                 status: Some("busy".to_string()),
+                waiting_for: None,
+                process_key_unread: false,
                 pid: Some(29628),
                 started_at_ms: Some(1_790_152_789_592),
             }
@@ -2007,6 +2148,8 @@ mod tests {
             id: Some("0a1b2c3d".to_string()),
             state: Some("stopped".to_string()),
             status: None,
+            waiting_for: None,
+            process_key_unread: false,
             pid: None,
             started_at_ms: Some(1_792_412_145_367),
         };
@@ -2236,5 +2379,186 @@ mod tests {
         );
 
         child.wait().expect("reap the stand-in child");
+    }
+
+    /// `waitingFor` is read fail-soft, as a string only (issue #83; the values seen
+    /// are `"permission prompt"` and `"dialog open"`, DOMAIN.md "Observed value
+    /// distribution"). A mistyped or null value is absent; a string is cleaned of
+    /// control characters and escape sequences before it can reach the terminal, and
+    /// capped; one that cleans to nothing is KEPT as `Some("")`, because the record
+    /// still carried the key.
+    #[test]
+    fn waiting_for_is_read_as_a_cleaned_string_and_never_discards_the_record() {
+        let long = "x".repeat(WAITING_FOR_MAX_CHARS * 3);
+        let raw = format!(
+            r#"[
+            {{"sessionId":"plain","kind":"background","state":"blocked","waitingFor":"permission prompt"}},
+            {{"sessionId":"absent","kind":"background","state":"blocked"}},
+            {{"sessionId":"null","kind":"background","state":"blocked","waitingFor":null}},
+            {{"sessionId":"number","kind":"background","state":"blocked","waitingFor":7}},
+            {{"sessionId":"object","kind":"background","state":"blocked","waitingFor":{{"a":1}}}},
+            {{"sessionId":"empty","kind":"background","state":"blocked","waitingFor":""}},
+            {{"sessionId":"escapes","kind":"background","state":"blocked","waitingFor":"\u001b[31mdialog\u0007\n  open\u001b[0m"}},
+            {{"sessionId":"controls","kind":"background","state":"blocked","waitingFor":"\u0007\u001b"}},
+            {{"sessionId":"long","kind":"background","state":"blocked","waitingFor":"{long}"}}
+        ]"#
+        );
+        let reported = parse_agents_json(&raw, no_pid_is_gone);
+        assert_eq!(
+            reported.len(),
+            9,
+            "no record is discarded for its waitingFor"
+        );
+        let waiting = |id: &str| reported[id].waiting_for.as_deref();
+        assert_eq!(
+            waiting("plain"),
+            Some("permission prompt"),
+            "kept as claude sent it"
+        );
+        for absent in ["absent", "null", "number", "object"] {
+            assert_eq!(
+                waiting(absent),
+                None,
+                "{absent}: not a string reads as absent"
+            );
+        }
+        assert_eq!(
+            waiting("empty"),
+            Some(""),
+            "an empty string is still the key"
+        );
+        assert_eq!(
+            waiting("escapes"),
+            Some("dialog open"),
+            "no escape reaches the terminal"
+        );
+        assert_eq!(
+            waiting("controls"),
+            Some(""),
+            "cleaned to nothing, still present"
+        );
+        assert_eq!(
+            waiting("long").map(|value| value.chars().count()),
+            Some(WAITING_FOR_MAX_CHARS),
+            "capped, so it cannot push the row's label off"
+        );
+    }
+
+    /// The reason is shown for the `needs input` bucket and no other, after the
+    /// phrase; an empty one shows nothing extra. `state` wins in `classify`, so a
+    /// `working` record carrying a `waitingFor` (never observed) reads as working
+    /// with no reason.
+    #[test]
+    fn waiting_reason_follows_the_needs_input_phrase_and_only_that_bucket() {
+        let blocked =
+            agent("background", Some("blocked"), None).with_waiting_for("permission prompt");
+        assert_eq!(waiting_reason(&blocked), Some("permission prompt"));
+        assert_eq!(
+            friendly_status(&blocked),
+            "bg needs input \u{b7} permission prompt"
+        );
+        assert_eq!(
+            qualifier_copy(&blocked),
+            Some("needs input"),
+            "the phrase stays whole"
+        );
+
+        let interactive =
+            agent("interactive", None, Some("waiting")).with_waiting_for("dialog open");
+        assert_eq!(
+            friendly_status(&interactive),
+            "live needs input \u{b7} dialog open"
+        );
+
+        let empty = agent("background", Some("blocked"), None).with_waiting_for("");
+        assert_eq!(waiting_reason(&empty), None);
+        assert_eq!(friendly_status(&empty), "bg needs input");
+
+        let absent = agent("background", Some("blocked"), None);
+        assert_eq!(friendly_status(&absent), "bg needs input");
+
+        // The bucket is decided by `state` first: `working` + `waiting` is Working.
+        let working = agent("background", Some("working"), Some("waiting"))
+            .with_waiting_for("permission prompt");
+        assert_eq!(classify(&working), AgentActivity::Working);
+        assert_eq!(waiting_reason(&working), None);
+        assert_eq!(friendly_status(&working), "bg working");
+    }
+
+    /// `is_registry_only` needs ALL of: a background record, `state` exactly `blocked`, and
+    /// no `pid`, no `status`, no `waitingFor`. Any one missing fails toward asking.
+    #[test]
+    fn is_registry_only_needs_every_condition_and_fails_toward_asking() {
+        let bare = agent("background", Some("blocked"), None);
+        assert!(is_registry_only(&bare), "the 2026-11-11 baseline shape");
+        assert!(!is_registry_only(&bare.clone().with_pid(4_242)), "a pid");
+        assert!(
+            !is_registry_only(&agent("background", Some("blocked"), Some("waiting"))),
+            "a status"
+        );
+        assert!(
+            !is_registry_only(&bare.clone().with_waiting_for("permission prompt")),
+            "a waitingFor"
+        );
+        assert!(
+            !is_registry_only(&bare.clone().with_waiting_for("")),
+            "a waitingFor that cleaned to nothing is still the key"
+        );
+        assert!(
+            !is_registry_only(&agent("interactive", Some("blocked"), None)),
+            "only a background record"
+        );
+        assert!(
+            !is_registry_only(&agent("background", Some("waiting"), None)),
+            "`waiting` is not the registry's `blocked` spelling"
+        );
+        assert!(
+            !is_registry_only(&agent("background", None, Some("blocked"))),
+            "a blocked STATUS with no state is not the registry-only shape"
+        );
+        assert!(
+            !is_registry_only(&agent("background", Some("working"), None)),
+            "not needs input at all"
+        );
+    }
+
+    /// A `pid`, `status` or `waitingFor` KEY on the wire keeps the confirm whatever
+    /// its JSON type: the typed fields read a wrong-typed value as absent, and
+    /// presence alone must still count as a sign a process is behind the record.
+    /// Run through the real parse, because the presence is decided there.
+    #[test]
+    fn is_registry_only_counts_a_present_key_of_any_json_type() {
+        let record = |extra: &str| {
+            format!(r#"{{"sessionId":"s","kind":"background","state":"blocked"{extra}}}"#)
+        };
+        let registry_only = |extra: &str| {
+            let reported = parse_agents_json(&format!("[{}]", record(extra)), no_pid_is_gone);
+            is_registry_only(&reported["s"])
+        };
+        assert!(
+            registry_only(""),
+            "no key at all is the registry-only shape"
+        );
+        for key in ["pid", "status", "waitingFor"] {
+            for value in [
+                r#""text""#,
+                "7",
+                "null",
+                "true",
+                "{}",
+                "[]",
+                "-1",
+                "99999999999",
+            ] {
+                assert!(
+                    !registry_only(&format!(r#","{key}":{value}"#)),
+                    "{key}: {value} is on the wire, so a process may be behind it"
+                );
+            }
+        }
+        assert!(
+            registry_only(r#","name":"x","cwd":"/tmp","startedAt":1"#),
+            "keys that are no sign of a process leave it registry-only"
+        );
     }
 }

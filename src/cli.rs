@@ -136,10 +136,12 @@ KEYS:
                   · ? open the key-map table (same as F1)
     Ctrl-R        quick reply — send a one-shot message to the selected session
                   without leaving the board. An agent whose run is over (done,
-                  stopped, failed) is stopped first so the reply lands in place;
-                  a waiting one (needs input) confirms first; a working, idle,
-                  interrupted or unrecognized agent, or a session claude reports
-                  with no job to stop, is refused — try Ctrl-K or Fork instead.
+                  stopped, failed) is stopped first so the reply lands in place,
+                  and so is a waiting one (needs input) whose record says
+                  nothing of a process; any other waiting one confirms first,
+                  naming what it waits on; a working, idle, interrupted or unrecognized
+                  agent, or a session claude reports with no job to stop, is
+                  refused — try Ctrl-K or Fork instead.
                   While a session's own reply is still being sent (or, on a
                   fork from the Ctrl-X f box's Enter, the fork itself), or the
                   session is being moved (Ctrl-X w), Ctrl-R on that session is
