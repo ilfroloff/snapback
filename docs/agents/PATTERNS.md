@@ -228,8 +228,10 @@ it. Follow this split when adding behavior:
   `drop_in_order` (the managed drop-in filter and sort, split from the directory
   listing because a real `read_dir` often comes back sorted already and would let a
   missing sort pass); `worktrees`' whole trio, split from its spawn the same way —
-  `git_worktree_argv` (the invocation is a contract with an external CLI, so it
-  is asserted without running one), `set_from_output` (the same
+  `git_worktree_argv` / `git_toplevel_argv` (the invocation is a contract with an
+  external CLI, so it is asserted without running one), `with_toplevel_main`
+  (the submodule main-root correction over its two lookups, a `.git` stat and the
+  `rev-parse` answer, both parameters) with `toplevel_from_output`, `set_from_output` (the same
   non-zero-exit-means-no-signal decision, plus non-UTF-8 output rejected WHOLE
   rather than lossily repaired, since a replacement character inside a path is a
   directory that exists nowhere) and `parse_porcelain` (which takes its
@@ -296,7 +298,10 @@ it. Follow this split when adding behavior:
   [DOMAIN.md](DOMAIN.md#a-content-index-position-never-projects-into-preview-coordinates))
   / `fit_label` (the marker-vs-label width
   reservation, pure so it is tested as arithmetic rather than only through a
-  rendered pane) / `child_msgs` and `fit_child_msgs` (a lineage child's
+  rendered pane) / `fit_label_tail` (its tail-keeping twin, which only a move-picker
+  row takes, through `modal_list_label`: a worktree path's END, the branch, is
+  what tells rows apart, so an over-wide one reads `…/<end>` within
+  `modal_list_label_budget`; a model or agent row keeps its start) / `child_msgs` and `fit_child_msgs` (a lineage child's
   turn-count segment and whether the row can afford it — ALL-OR-NOTHING: the
   segment is drawn whole or dropped entirely and never ellipsized, because a
   clipped `171 msgs` reads back as a plausible `17` and a confidently WRONG
@@ -322,7 +327,8 @@ it. Follow this split when adding behavior:
   than dragging ratatui into the parser layer).
 - Thin, impure: `resume::launch` (chdir + spawn + wait), `defined_agents::discover_agents`
   (the FS walk over `select_agents` / `parse_frontmatter`), `worktrees::resolve`
-  (spawn + capture, delegating every decision to `set_from_output`),
+  (spawn + capture, delegating every decision to `set_from_output`,
+  `with_toplevel_main` and `toplevel_from_output`),
   `model_aliases::installed_model_aliases` (locate on `$PATH`, canonicalize,
   chunk-read — it decides only WHERE to look and delegates what the bytes mean to
   `parse_model_aliases`), `claude_settings::model_defaults` (reads
@@ -1256,10 +1262,12 @@ the not-live refusal points at. Neither the `Ctrl-X f` box nor either of its run
 asks.
 
 The **second** allowed one-shot is `worktrees::resolve` (`git -C <dir> worktree
-list --porcelain`), and it is worth stating separately because its moment is not
+list --porcelain`, plus `git -C <main> rev-parse --show-toplevel` when the main
+root carries no `.git`: a submodule or a bare repo, once, for the main root only),
+and it is worth stating separately because its moment is not
 a hand-off: it runs at **construction and on reload** — `App::new` and
 `App::apply_reload` — which puts it in the same category as the synchronous
-store reload that already happens there, one bounded child per reload rather than
+store reload that already happens there, one bounded child per reload (two for a submodule) rather than
 a cadence. The same two conditions apply and are met: it adds no tick, thread, or
 event source (so background cost is unchanged), and its cost is a single local
 `git` invocation folded into a reload the board is already blocked on, not a

@@ -5,7 +5,10 @@
 //! * The LIVE worktree set — one fail-soft `git worktree list --porcelain`
 //!   shell-out, parsed into the canonicalized worktree roots that make up ONE
 //!   project, plus a display label for it. Authoritative, and the only thing
-//!   that can relate two folders no path rule could.
+//!   that can relate two folders no path rule could. A SUBMODULE's main worktree
+//!   is the one record git reports wrongly (its gitdir, not its checkout), so a
+//!   second, conditional `git rev-parse --show-toplevel` corrects that one root
+//!   ([`with_toplevel_main`]).
 //! * The REPO ROOT of a path ([`project_root`]) — the pure prefix
 //!   [`group::repo_root_of`] derives, canonicalized. Weaker, but it answers for
 //!   a worktree that has been REMOVED, which git by definition cannot: git
@@ -56,6 +59,20 @@ const GIT_DIR_FLAG: &str = "-C";
 /// depend on terminal-independent padding, while `--porcelain` prints one
 /// `<key> <value>` line per attribute in blank-line-separated records.
 const WORKTREE_LIST_ARGV: [&str; 3] = ["worktree", "list", "--porcelain"];
+
+/// The subcommand that names the CHECKOUT a directory belongs to, which the main
+/// record of a submodule's porcelain list does not: git 2.56.1 reports a
+/// submodule's main worktree as its gitdir (`<super>/.git/modules/<name>`), while
+/// `rev-parse --show-toplevel` run there answers the real checkout
+/// (`core.worktree`). Measured on that version; a git that reports the checkout
+/// directly never reaches this call, because its main record has a `.git`.
+const TOPLEVEL_ARGV: [&str; 2] = ["rev-parse", "--show-toplevel"];
+
+/// The entry a checkout carries at its root — a folder in a plain repo, a file
+/// (`gitdir: …`) in a submodule or linked worktree. The main record of the
+/// porcelain list lacks it exactly when git reported a gitdir (a submodule) or a
+/// bare repository, the two cases [`with_toplevel_main`] asks git about.
+const DOT_GIT_ENTRY: &str = ".git";
 
 /// The prefix of the ONE porcelain line this module reads: `worktree <path>`.
 ///
@@ -226,21 +243,33 @@ pub fn project_root_name(launch_dir: &Path) -> String {
         .unwrap_or_else(|| root.to_string_lossy().into_owned())
 }
 
-/// Build the argv of the worktree probe (`git -C <launch_dir> worktree list
-/// --porcelain`); `argv[0]` is the program.
+/// Build the argv of a git probe run in `dir` (`git -C <dir> <args…>`);
+/// `argv[0]` is the program.
 ///
 /// Pure and separate from the spawn, like [`crate::agents`]' argv builders: the
 /// exact invocation is a contract with an external CLI, so it must be assertable
 /// WITHOUT spawning git (which the suite never does).
 #[must_use]
-fn git_worktree_argv(launch_dir: &Path) -> Vec<OsString> {
-    let mut argv = Vec::with_capacity(3 + WORKTREE_LIST_ARGV.len());
+fn git_argv(dir: &Path, args: &[&str]) -> Vec<OsString> {
+    let mut argv = Vec::with_capacity(3 + args.len());
     argv.push(OsString::from(GIT_PROGRAM));
     argv.push(OsString::from(GIT_DIR_FLAG));
-    // As an `OsString`, so a non-UTF-8 launch dir is passed through untouched.
-    argv.push(launch_dir.as_os_str().to_os_string());
-    argv.extend(WORKTREE_LIST_ARGV.iter().map(OsString::from));
+    // As an `OsString`, so a non-UTF-8 dir is passed through untouched.
+    argv.push(dir.as_os_str().to_os_string());
+    argv.extend(args.iter().map(OsString::from));
     argv
+}
+
+/// The worktree probe: `git -C <launch_dir> worktree list --porcelain`.
+#[must_use]
+fn git_worktree_argv(launch_dir: &Path) -> Vec<OsString> {
+    git_argv(launch_dir, &WORKTREE_LIST_ARGV)
+}
+
+/// The toplevel probe: `git -C <dir> rev-parse --show-toplevel`.
+#[must_use]
+fn git_toplevel_argv(dir: &Path) -> Vec<OsString> {
+    git_argv(dir, &TOPLEVEL_ARGV)
 }
 
 /// Decide what a finished worktree probe MEANS: the parsed set when git exited
@@ -269,15 +298,78 @@ fn set_from_output(success: bool, stdout: &[u8]) -> WorktreeSet {
     parse_porcelain(text, resolve_dir)
 }
 
+/// Run `argv` with its stdout and stderr CAPTURED (stdin null) so git can never
+/// write to the terminal the board is drawn on, and never blocks reading from it.
+/// `None` when the program could not be spawned (`git` not on PATH, etc.).
+fn run_git(argv: &[OsString]) -> Option<std::process::Output> {
+    Command::new(&argv[0]).args(&argv[1..]).output().ok()
+}
+
+/// Decide what a finished `rev-parse --show-toplevel` MEANS: the canonicalized
+/// checkout when git exited zero with non-empty UTF-8 output, `None` otherwise.
+///
+/// Pure, for the reason [`set_from_output`] is. Every failure collapses to
+/// `None` — "keep the root as it is" — never an error: a bare repository, which
+/// has no work tree, exits non-zero here.
+#[must_use]
+fn toplevel_from_output(
+    success: bool,
+    stdout: &[u8],
+    canonicalize: impl Fn(&Path) -> PathBuf,
+) -> Option<PathBuf> {
+    if !success {
+        return None;
+    }
+    let text = std::str::from_utf8(stdout).ok()?.trim_end();
+    (!text.is_empty()).then(|| canonicalize(Path::new(text)))
+}
+
+/// Correct the MAIN root of `set` when git reported a gitdir in its place.
+///
+/// A submodule's `worktree list --porcelain` names its main worktree by the
+/// gitdir (`<super>/.git/modules/<name>`), which no session's `cwd` sits under
+/// and which `strip_prefix` cannot relate to the linked worktrees below the real
+/// checkout. A real checkout has a `.git` entry at its root, so:
+///
+/// * the main root HAS one -> the set is returned untouched (a plain repo: one
+///   stat, no git);
+/// * it has none -> `toplevel` is asked for the checkout; an answer REPLACES the
+///   main root (and the label, which names the main worktree), no answer — a bare
+///   repository, any git failure — leaves the set as it is.
+///
+/// Pure over its two lookups, as [`parse_porcelain`] is over `canonicalize`: the
+/// filesystem stat and the git call are parameters, so the decision is testable
+/// with neither. `toplevel`'s answer must be canonicalized already.
+#[must_use]
+fn with_toplevel_main(
+    set: WorktreeSet,
+    has_dot_git: impl Fn(&Path) -> bool,
+    toplevel: impl Fn(&Path) -> Option<PathBuf>,
+) -> WorktreeSet {
+    let Some(main) = set.roots.first() else {
+        return set;
+    };
+    if has_dot_git(main) {
+        return set;
+    }
+    let Some(checkout) = toplevel(main) else {
+        return set;
+    };
+    let label = Some(group::repo_of(&checkout));
+    let rest = set.roots.into_iter().skip(1);
+    WorktreeSet::from_resolved(std::iter::once(checkout).chain(rest), label)
+}
+
 /// Read the live worktree set of the project containing `launch_dir`.
 ///
-/// The ONE impure step: it owns the spawn alone, and what the result means is
-/// [`set_from_output`]'s pure decision. Output is CAPTURED (stdout and stderr
-/// both into pipes, stdin null) so git can never write to the terminal the board
-/// is drawn on, and never blocks reading from it.
+/// The impure step: it owns the spawns alone, and what each result means is
+/// [`set_from_output`]'s and [`with_toplevel_main`]'s pure decision. The second
+/// spawn (`rev-parse --show-toplevel`) happens only for a main root with no
+/// `.git`, i.e. a submodule or a bare repository, and is for the MAIN root alone
+/// — never one per session.
 ///
 /// Never panics: a missing binary or any other spawn failure returns
-/// [`WorktreeSet::empty`], as does every other failure mode.
+/// [`WorktreeSet::empty`] (first call) or leaves the set as parsed (second).
 ///
 /// MUST stay a bounded one-shot (launch and reload), never a render-loop or
 /// per-keystroke call — it blocks on a child process.
@@ -289,12 +381,18 @@ fn set_from_output(success: bool, stdout: &[u8]) -> WorktreeSet {
 #[allow(dead_code)]
 #[must_use]
 pub fn resolve(launch_dir: &Path) -> WorktreeSet {
-    let argv = git_worktree_argv(launch_dir);
-    let output = match Command::new(&argv[0]).args(&argv[1..]).output() {
-        Ok(output) => output,
-        Err(_) => return WorktreeSet::empty(), // `git` not on PATH, spawn failed, etc.
+    let Some(output) = run_git(&git_worktree_argv(launch_dir)) else {
+        return WorktreeSet::empty();
     };
-    set_from_output(output.status.success(), &output.stdout)
+    let set = set_from_output(output.status.success(), &output.stdout);
+    with_toplevel_main(
+        set,
+        |dir| dir.join(DOT_GIT_ENTRY).exists(),
+        |dir| {
+            let output = run_git(&git_toplevel_argv(dir))?;
+            toplevel_from_output(output.status.success(), &output.stdout, resolve_dir)
+        },
+    )
 }
 
 /// Parse `git worktree list --porcelain` output into a [`WorktreeSet`].
@@ -530,6 +628,148 @@ branch refs/heads/feature/quick-send-reply-to-session
         assert_eq!(
             set_from_output(true, b"worktree /Users/me/acme/web\xff\n"),
             WorktreeSet::empty()
+        );
+    }
+
+    /// Real `git worktree list --porcelain` output of a SUBMODULE
+    /// (`marketplace-workspace/backend`, `core.worktree = ../../../backend`),
+    /// captured on git 2.56.1 and cut to its first three records. The main
+    /// worktree comes out as the GITDIR (`.git/modules/backend`), not the
+    /// checkout its linked worktrees live under.
+    const SUBMODULE_SAMPLE: &str = "\
+worktree /Volumes/Development/marketplace/marketplace-workspace/.git/modules/backend
+HEAD 092037ad6a3cfc3eaf179acf59d22011e0226624
+branch refs/heads/DEV
+
+worktree /Volumes/Development/marketplace/marketplace-workspace/backend/.agents/worktrees/MRK-3113-foreign-key-decisions-spec
+HEAD baa65379a27c0e48b8a3e4edd90ebb8d757a385b
+branch refs/heads/MRK-3113-foreign-key-decisions-spec
+
+worktree /Volumes/Development/marketplace/marketplace-workspace/backend/.agents/worktrees/bull-board-queue-ui
+HEAD bd2007eb831a8745e65b25558081ee9241912ba2
+branch refs/heads/feature/MRK-3032-bull-board-queue-ui
+";
+
+    const SUBMODULE_GITDIR: &str =
+        "/Volumes/Development/marketplace/marketplace-workspace/.git/modules/backend";
+    const SUBMODULE_CHECKOUT: &str =
+        "/Volumes/Development/marketplace/marketplace-workspace/backend";
+    const SUBMODULE_WT: &str = "/Volumes/Development/marketplace/marketplace-workspace/backend/.agents/worktrees/bull-board-queue-ui";
+
+    /// The submodule case this exists for: the porcelain's first record is the
+    /// gitdir, `rev-parse --show-toplevel` names the checkout, and the set must
+    /// end up with the CHECKOUT as main (so `strip_prefix(main)` relates the
+    /// linked worktrees to it), the label drawn from it, and the rest untouched.
+    #[test]
+    fn a_submodules_gitdir_main_is_replaced_by_its_toplevel() {
+        let parsed = parse_porcelain(SUBMODULE_SAMPLE, as_is);
+        assert_eq!(
+            parsed.main(),
+            Some(Path::new(SUBMODULE_GITDIR)),
+            "premise: git's first record is the gitdir"
+        );
+        assert!(
+            !parsed.contains(Path::new(SUBMODULE_CHECKOUT)),
+            "premise: the checkout is not in git's list at all"
+        );
+
+        let set = with_toplevel_main(
+            parsed,
+            |_| false,
+            |dir| {
+                assert_eq!(
+                    dir,
+                    Path::new(SUBMODULE_GITDIR),
+                    "asked about the main root"
+                );
+                Some(PathBuf::from(SUBMODULE_CHECKOUT))
+            },
+        );
+
+        assert_eq!(set.main(), Some(Path::new(SUBMODULE_CHECKOUT)));
+        assert!(set.contains(Path::new(SUBMODULE_CHECKOUT)));
+        assert!(
+            !set.contains(Path::new(SUBMODULE_GITDIR)),
+            "the gitdir is REPLACED, not kept beside it"
+        );
+        assert_eq!(set.label(), Some("backend"), "the label names the checkout");
+        let roots: Vec<&Path> = set.roots().collect();
+        assert_eq!(roots.len(), 3, "linked worktrees keep their places");
+        assert_eq!(roots[2], Path::new(SUBMODULE_WT));
+        assert_eq!(
+            roots[2].strip_prefix(roots[0]).ok(),
+            Some(Path::new(".agents/worktrees/bull-board-queue-ui")),
+            "a linked worktree now reads relative to main"
+        );
+    }
+
+    /// A real checkout (it has a `.git`) never asks git again: the one-stat path
+    /// of every plain repo and linked-worktree launch.
+    #[test]
+    fn a_main_root_with_a_dot_git_is_left_alone_without_a_second_git_call() {
+        let parsed = parse_porcelain(SAMPLE, as_is);
+        let set = with_toplevel_main(
+            parsed.clone(),
+            |dir| {
+                assert_eq!(dir, Path::new(MAIN));
+                true
+            },
+            |_| panic!("a plain repo must not run `rev-parse`"),
+        );
+        assert_eq!(set, parsed);
+    }
+
+    /// Every way the second question can fail keeps the first answer: a bare
+    /// repository (non-zero exit), a spawn failure, and an unresolved set.
+    #[test]
+    fn a_failed_toplevel_lookup_or_an_empty_set_changes_nothing() {
+        let parsed = parse_porcelain(SUBMODULE_SAMPLE, as_is);
+        assert_eq!(
+            with_toplevel_main(parsed.clone(), |_| false, |_| None),
+            parsed
+        );
+        assert_eq!(
+            with_toplevel_main(
+                WorktreeSet::empty(),
+                |_| panic!("an empty set has no main to stat"),
+                |_| panic!("an empty set has no main to ask about"),
+            ),
+            WorktreeSet::empty()
+        );
+    }
+
+    /// `toplevel_from_output` reads git's answer only when it is a success with
+    /// a non-empty UTF-8 path; everything else is "no answer".
+    #[test]
+    fn toplevel_output_is_read_only_from_a_clean_success() {
+        assert_eq!(
+            toplevel_from_output(true, b"/r/backend\n", as_is),
+            Some(PathBuf::from("/r/backend")),
+            "the trailing newline is not part of the path"
+        );
+        assert_eq!(toplevel_from_output(false, b"/r/backend\n", as_is), None);
+        assert_eq!(toplevel_from_output(true, b"", as_is), None);
+        assert_eq!(toplevel_from_output(true, b"\n", as_is), None);
+        assert_eq!(toplevel_from_output(true, b"/r/back\xffend\n", as_is), None);
+    }
+
+    /// Like the worktree probe, the toplevel probe is a contract with git: `-C`
+    /// carries the directory as data, so nothing depends on the process CWD.
+    #[test]
+    fn toplevel_argv_is_git_dash_c_dir_rev_parse_show_toplevel() {
+        let expected: Vec<OsString> = [
+            "git",
+            "-C",
+            "/r/.git/modules/backend",
+            "rev-parse",
+            "--show-toplevel",
+        ]
+        .iter()
+        .map(OsString::from)
+        .collect();
+        assert_eq!(
+            git_toplevel_argv(Path::new("/r/.git/modules/backend")),
+            expected
         );
     }
 

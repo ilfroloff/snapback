@@ -663,7 +663,8 @@ the modal `F1` opens.
   back into one. On a row with no copies it does nothing.
 - `Ctrl-X w` **moves** the selected session to another worktree of the launch
   project without leaving the board. A picker lists the project's worktrees — the
-  main folder first, the session's own folder left out — and `Enter` has Claude
+  main folder first (a git submodule's too), the session's own folder left out; a
+  path too long for the box keeps its end, behind a `…` — and `Enter` has Claude
   Code move the transcript into the chosen folder in the background. You stay on
   the board, and usually within a second the status line says `moved to <folder>`,
   or why not. While the move runs the row reads `moving…`, and `Enter`, `Ctrl-X f`,

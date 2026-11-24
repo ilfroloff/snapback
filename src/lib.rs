@@ -7,7 +7,7 @@
 //! (`store`) is unit-tested before any TUI code lands. The `tui` module is the
 //! elm-style shell; `watch` feeds autorefresh events; `search` isolates the
 //! substring matcher (`memchr::memmem`); `worktrees` resolves the launch
-//! project's live worktree set (the one git shell-out, kept out of the pure
+//! project's live worktree set (the git shell-outs, kept out of the pure
 //! `store` core); `resume` spawns `claude` as a child and RETURNS so `snapback`
 //! stays a persistent dashboard (quitting a resumed session drops you back onto
 //! the board).
