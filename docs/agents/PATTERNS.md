@@ -1117,6 +1117,13 @@ either: a compose's `model:` label and the picker's first row are answered by
 `App::compose_default` from what this event stored and from the CACHED preview,
 which is what lets the label be asked in render and the row on a keystroke.
 
+`ide::spawn_detect` and `ide::spawn_open` sit outside that count and are the same ordinary kind:
+the first walks snapback's process ancestry once per process and delivers a single
+`AppEvent::IdeDetected` (a one-shot started per board session, like the alias
+probe); the second is a file-link click's open — an existence check and a launcher
+child — delivering a single `AppEvent::FileOpened`. The click itself decides
+without touching the disk (`update::file_click`), so neither is an exception.
+
 `claude_catalog::spawn_fetch` is the seventh, and the one that runs a `claude`
 child from an event rather than from a confirmed key: claude's `initialize`
 handshake for a compose's folder, delivered as a single `AppEvent::CatalogFetched`.
@@ -1752,7 +1759,7 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    four actions touches what it holds — its text and caret, its target session
    id, or the row selection that id is addressed by. A selection is mouse state
    that any key ends (so typing never fights it), a fold toggle re-renders the
-   same session, and a link opens in the browser. The subagent switch alone would
+   same session, and a link opens (a web link in the browser, a file link in the host IDE). The subagent switch alone would
    change what the pane shows beneath the box, so `update::click_effect` refuses
    that one click itself (below) rather than the gate taking the other three
    away. A new-session draft is still
@@ -2185,7 +2192,7 @@ success.
 
 **A MOUSE click is scoped like a keypress, and which kind it is depends on WHAT it
 resolved to.** `update::note_link_click` is the instance, and it is the ONE place a
-preview-link click's four outcomes are mapped to status treatment — a single site, so
+preview-link click's outcomes are mapped to status treatment — a single site, so
 each is decided once and any of them can be re-decided without hunting. It runs on
 the click's RELEASE (`update::click_effect`), never on the press: a press only
 records where it landed, and a press that became a drag resolves no link at all,
@@ -2196,9 +2203,12 @@ so it says nothing here.
 | `Opening(url)` | TRANSIENT `opening <url>` | A confirmation: what the user aimed at is under way, so it dwells rather than squatting on the keymap row. |
 | `RefusedScheme(url)` | STICKY `not opening <url> - …` | A refusal the reader may act on: a `[label](url)` target is scheme-checked nowhere on the way in, so a label CAN render underlined over a url the opener will not take. |
 | `Unresolvable` | STICKY `cannot tell which link …` | The hit-test ABSTAINED — the clicked line is past `view`'s probe budget (`probe_within_budget`). Not the same claim as "no link": that budget bounds the line's SIZE times its candidate count, so a line with no regions has a product of zero and is always within it, and abstaining IMPLIES a rendered link there. A rendered, underlined affordance that does nothing must say so. |
+| `FileRefused(reason, path)` | STICKY `not opening <path> - <reason>` | A file link snapback will not open (no IDE, no folder to resolve against): the reader can only act on it if the line names the path. The worker's later refusals (no such file, launcher failed) arrive as `FileOpened { success: false }` and are sticky the same way. |
+| `IdeDetecting` | TRANSIENT nudge | The ancestry walk has not answered; nothing is wrong and a moment later it will. |
+| `OpenFile(req)` | nothing | The request is on its way; the worker's `FileOpened` states the outcome (`opened in <IDE>` is transient), so no claim is made before the launcher ran. |
 | `NoLink` | nothing | A NO-OP, which must not wipe a refusal the reader has not read yet (the `WheelTarget::Ignore` arm is the same principle for the wheel). |
 
-The first three are ACTIONABLE inputs — the user aimed at something and it either
+The rows above `NoLink` are ACTIONABLE inputs — the user aimed at something and it either
 happens or is refused — so each may clear whatever the line held, exactly as an
 actionable keypress does. That asymmetry against the fourth is load-bearing beyond
 tidiness: `resume::open_url` nulls all child stdio and swallows every error, so the
@@ -2215,9 +2225,12 @@ opens `http`/`https` only — `store::preview::has_openable_scheme`, which both
 `store::preview::match_autolink` and `resume::opener_argv` read, so the renderer and
 the opener cannot disagree about what a link is. `update::resolve_link_click` asks
 that same predicate rather than a rule of its own, which is why the two variants can
-never describe a url differently from the opener that gets it.
+never describe a url differently from the opener that gets it. A target that
+`store::target::markdown_target` reads as a local file is a third kind, decided
+before either (`view::LinkProbe::File`); the opener's gate is not consulted for it,
+and a url with a scheme is never one.
 
-Across all four rows the governing rule is the same: saying nothing was never an
+Across all these rows the governing rule is the same: saying nothing was never an
 option for a click that landed on something. An affordance that renders, records a
 region and then silently does nothing is the very indistinguishable silence this
 hit-test was built to remove, and leaving it at the far end of the path — whether by
@@ -2276,7 +2289,7 @@ Tests are **inline** `#[cfg(test)] mod tests` at the bottom of each source file
 - **Per-reader fixtures** sit beside the store, one directory per reader, each
   read by that module's own tests and never discovered as a store:
   `tests/fixtures/preview/` (single session files for the answering-model and
-  effort readings), `tests/fixtures/skill_listing/` (`listing.jsonl`: real
+  effort readings, and `sess-file-links-1` for the file-link regions), `tests/fixtures/skill_listing/` (`listing.jsonl`: real
   record shapes with shortened descriptions — the `agent_listing_delta` records
   `store::skills` reads, beside a `skill_listing` record and a non-JSON line it
   must skip), `tests/fixtures/subagent_status/` (five subagent transcripts, one per tail

@@ -21,6 +21,7 @@ pub mod parse;
 pub mod preview;
 pub mod skills;
 pub mod subagents;
+pub mod target;
 pub mod tasks;
 
 use std::collections::{HashMap, HashSet};

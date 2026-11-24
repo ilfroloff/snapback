@@ -1,0 +1,8 @@
+{"type":"user","sessionId":"sess-file-links-relocated-1","cwd":"/ws/first","timestamp":"2026-07-04T10:00:00.000Z","message":{"role":"user","content":"Where is the decision?"}}
+{"type":"assistant","sessionId":"sess-file-links-relocated-1","cwd":"/ws/first","timestamp":"2026-07-04T10:00:05.000Z","message":{"role":"assistant","content":"See [early](docs/early.md)."}}
+{"type":"relocated","sessionId":"sess-file-links-relocated-1","relocatedCwd":"/ws/second","timestamp":"2026-07-04T10:03:00.000Z"}
+{"type":"user","sessionId":"sess-file-links-relocated-1","cwd":"/ws/second","timestamp":"2026-07-04T10:05:00.000Z","message":{"role":"user","content":"And now?"}}
+{"type":"assistant","sessionId":"sess-file-links-relocated-1","cwd":"/ws/second","timestamp":"2026-07-04T10:05:05.000Z","message":{"role":"assistant","content":"See [mid](docs/mid.md) and [site](https://example.com/a.md)."}}
+{"type":"relocated","sessionId":"sess-file-links-relocated-1","relocatedCwd":"/ws/third","timestamp":"2026-07-04T10:06:00.000Z"}
+{"type":"assistant","sessionId":"sess-file-links-relocated-1","cwd":"/ws/third","timestamp":"2026-07-04T10:06:05.000Z","message":{"role":"assistant","content":"See [late](docs/late.md)."}}
+{"type":"relocated","sessionId":"sess-file-links-relocated-1","relocatedCwd":"","timestamp":"2026-07-04T10:07:00.000Z"}

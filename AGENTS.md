@@ -48,9 +48,14 @@ one place.
   Only an `interactive` record whose `pid` the kernel DEFINITELY reports gone
   is dropped; every other record is KEPT
   ([DOMAIN.md](docs/agents/DOMAIN.md#records-that-name-a-gone-process)).
+  Same for the host-IDE ancestry walk and for the target of a file link
+  (`src/store/target.rs`): a process or path that cannot be read, a layout that
+  matches nothing, a target that is not plainly a file all end as "no IDE" /
+  "not a file", never a guessed launcher or a panic
+  ([DOMAIN.md](docs/agents/DOMAIN.md#file-links-open-in-the-host-ide)).
   (`src/store/*`, `src/agents.rs`, `src/claude_catalog.rs`,
   `src/claude_move.rs`, `src/command_kinds.rs`, `src/defined_agents.rs`,
-  `src/claude_settings.rs`, `src/claude_trust.rs`)
+  `src/claude_settings.rs`, `src/claude_trust.rs`, `src/ide.rs`)
 - **AUTHORITATIVE-FROM-FILE.** Read `cwd`/`sessionId` from INSIDE the file,
   never decode the `<encoded-cwd>` folder name (the `/`→`-` encoding is lossy).
   Re-read them at hand-off time. A `relocated` record (written by claude's `/cd`
@@ -325,7 +330,10 @@ one place.
   clipboard copy (`CopyFinished` — `Ctrl-X y`'s id and a preview
   drag-selection alike, ONE path, its tool a THREADED child the driver starts, so
   no keystroke or mouse release waits on it), the `--model` alias probe
-  (`ModelAliases`), the settings-model read (`SettingsModel`), the compose
+  (`ModelAliases`), the settings-model read (`SettingsModel`), the host-IDE
+  ancestry walk (`IdeDetected`, once per process, memoized), a file link's open
+  (`FileOpened` — its existence check and its launcher child run on the worker,
+  never on the click), the compose
   pick list's catalog fetch (`CatalogFetched` — a `claude` child the DRIVER
   starts when the pure `take_catalog_fetch` says so, never a key handler; its
   workspace-trust read and its `command_kinds` folder reads run on that same
@@ -347,7 +355,7 @@ one place.
   landed.
   (`src/watch.rs`, `src/worktrees.rs`, `src/tui/clipboard.rs`,
   `src/claude_catalog.rs`, `src/claude_trust.rs`, `src/command_kinds.rs`,
-  `src/claude_move.rs`, `src/store/subagents.rs`)
+  `src/claude_move.rs`, `src/store/subagents.rs`, `src/ide.rs`)
 - **PURE, GIT-FREE STORE CORE.** `src/store/*` decides everything from the bytes
   it was given: `repo_of`'s worktree collapse is a pure string heuristic, and NO
   module under `src/store/` may shell out (to `git` or anything else) or read

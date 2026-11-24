@@ -2770,6 +2770,99 @@ launched it GOT the result is a different question — the stranded-agent ledger
 once it lands, answers that one — and nothing compares the two. They can
 legitimately differ: a subagent can finish while its hand-back is lost.
 
+### File links open in the host IDE
+
+A click on a link in the preview opens a FILE when the link names one. Two
+shapes are file links, both read by the pure grammar in `store::target` (the one
+rule `store::preview`, `view::link_at` and `update::resolve_link_click` share, so
+the renderer and the click cannot disagree):
+
+- a `[label](target)` markdown link whose target has no scheme and a `/` or a
+  `name.ext` final component (`markdown_target`) — drawn underlined like any link;
+- an inline code span with a `/` and a `name.ext` final component
+  (`backtick_target`) — it KEEPS its dim code style, so nothing on screen says it
+  is clickable (the guide says so). A bare name (`_document.page.tsx:28-34`), a
+  glob, a `~` path, a `//` path and anything with whitespace are NOT file links.
+
+Either may end in `:N`, `:N-M`, `:N:C` or `#LN` / `#LN-LM`; the line is the first
+number. A `:` inside the path is part of a name (`docs/plans/2026-11-06T05:42:19Z-x/A.md`);
+a target OPENING with a scheme (`file:///…`, `vscode://…`, `mailto:`) is never a
+file, and stays `LinkClick::RefusedScheme` — `resume::opener_argv`'s `http`/`https`
+gate is untouched and still the only thing that hands a url to the OS opener.
+
+**Where a relative path resolves.** `LinkRegion::dirs` carries the folders, stamped
+by `store::preview::render_stream`: the session's FIRST in-file `cwd` (not the
+board's `Session::cwd`, which a `relocated` record moves), then the `cwd` recorded
+on the record that wrote the link, then the folder of the session's LAST `relocated`
+record (`parse::relocated_cwd_of`, the one reading of that marker `parse_file` also
+uses), without repeating one. The second travels with the region because a session
+that changed folders writes links relative to where it was then; the third is added
+to EVERY file link once the stream ends (`stamp_relocated`), because the last
+`relocated` record may come after links it still applies to. Pure string work: the
+store tests no folder for existence. `LocalTarget::candidates` joins the path onto each ABSOLUTE folder in that
+order (an absolute path is itself); the open worker takes the first that is a
+regular file.
+
+**Which IDE.** The one that owns snapback's own terminal, never "the frontmost one"
+or "the one with the project open". `ide::detect` runs once per process on its own
+thread (`AppEvent::IdeDetected`) and walks the parent processes, nearest first
+(`proc_pidinfo` + `proc_pidpath` on macOS, `/proc/<pid>/stat` + `/proc/<pid>/exe` on
+Linux); the first ancestor `ide::choose` reads as an IDE wins:
+
+| Family | Recognised by | Command |
+| --- | --- | --- |
+| JetBrains | the bundle's main binary `<X>.app/Contents/MacOS/<product>` (Linux: `<home>/jbr/bin/java`, launcher `<home>/bin/<product>.sh`) | `<that binary> --line N <abs>` |
+| VS Code family | the OUTERMOST `.app` holding `Contents/Resources/app/bin/{code,cursor,windsurf,codium,…}` (Linux: `<dir>/<name>` beside `<dir>/bin/<name>`) | `<launcher> -r -g <abs>:N` (`-r <abs>` for a path holding `:`) |
+| Zed | `Zed.app/Contents/MacOS/zed` with `Contents/MacOS/cli` (Linux: `libexec/zed-editor` beside `bin/zed`) | `<cli> <abs>:N` (`<cli> <abs>` for a path holding `:`) |
+
+A path holding a `:` opens WITHOUT its line in the VS Code family and Zed
+(`Ide::passed_line`): VS Code's `-g` parser (`doResolveFilePath` in VS Code
+Insiders' `mainImpl.js`) splits on every `:`, reads an all-digit segment as the line
+or column and has no fallback to the raw path, so `…/2026-11-06T05:42:19Z-x/A.md:21`
+would open a file that does not exist while the launcher exits 0. Without `-g` the
+path is taken as written. Zed's parser was not measured, so it is treated the same
+way. JetBrains takes the line as its own `--line` argument and keeps it.
+
+The launcher is always an absolute path read off the ancestry, never a name looked
+up on `PATH`: two installs of one JetBrains product share a bundle id, so only the
+ancestor's own path picks the right one. Measured on macOS in November 2026: a
+WebStorm and a RustRover terminal's shell has `…/Contents/MacOS/<product>` as its
+direct parent; `webstorm --line 2 <file>` and VS Code Insiders'
+`<bundle>/Contents/Resources/app/bin/code -r -g <file>:3` both exited 0 against the
+running instance without starting another. Nothing was measured for Zed, Cursor,
+Windsurf, VSCodium or the Linux layouts: they follow each vendor's documented
+layout and are asserted only against stated paths.
+
+The ancestry is the ONLY input: `ide` reads no environment variable to pick an IDE.
+A `tmux` (or `screen`) server keeps the environment it was STARTED in, not that of the
+terminal attached to it, so an environment hint (`VSCODE_GIT_ASKPASS_*`,
+`TERM_PROGRAM`, `TERMINAL_EMULATOR`, `__CFBundleIdentifier`) could name an IDE the
+user is not looking at. Inside a multiplexer, and in any terminal whose parent
+processes include no IDE, a click is therefore refused (`Refusal::NoIde`), the
+same as in a plain terminal. There is no fallback to `$VISUAL` / `$EDITOR`,
+`open` / `xdg-open`, the clipboard, an IDE bridge or an OSC 8 link.
+
+**What a click says.** `update::file_click` decides on the spot, with no disk read;
+the worker (`ide::open`) checks the file and runs the launcher, and every launcher
+argument is an ABSOLUTE, existing, REGULAR file, so a path written into a
+transcript cannot be read as a flag or a JetBrains sub-command. The launcher runs
+with no shell and no stdio, under `ide::LAUNCHER_TIMEOUT`. No project argument is
+passed, so a file outside the open project opens in the focused window.
+
+| Outcome | Status (full path, `Refusal::status`) | Class |
+| --- | --- | --- |
+| IDE not found yet | `still looking for the IDE that owns this terminal - click again in a moment` | transient |
+| no IDE | `not opening <abs> - snapback is not running inside an IDE terminal` | sticky |
+| relative path, no absolute folder | `not opening <path> - no folder to resolve it against` | sticky |
+| no candidate exists | `not opening <abs> - no such file` | sticky |
+| exists, not a regular file | `not opening <abs> - not a regular file` | sticky |
+| launcher not started / exited non-zero / timed out | `not opening <abs> - could not start the IDE launcher: …` / `the IDE launcher exited with …` / `the IDE launcher did not finish within 10 s` | sticky |
+| opened | `opened in <IDE name>`, or `opened in <IDE name> - line N not passed, the path holds ':'` when a line was asked for and withheld (`ide::opened_status`) | transient |
+
+The no-IDE, no-folder and detecting rows are written by `note_link_click`; the rest
+arrive as one `AppEvent::FileOpened`. A path that `../` takes outside the project
+is only displayed to the user who clicked it, which is accepted.
+
 ### Answering model (`store::preview`)
 
 Every `assistant` record carries `message.model` — the model that actually

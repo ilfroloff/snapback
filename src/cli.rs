@@ -230,10 +230,17 @@ KEYS:
                   click folds it back; a subagent launch, its line reading
                   ◆ delegated to @agent, switches the preview to that
                   subagent's own transcript (a launch inside it switches to the
-                  subagent it launched; Esc goes back); otherwise a link opens
-                  (http/https only). Like the drag and double-click below, it
-                  works while a reply or fork box is open, except the switch,
-                  which waits until the box is closed
+                  subagent it launched; Esc goes back); otherwise a link opens.
+                  A web link (http/https only) opens in your browser. A file
+                  link (a markdown link with no scheme, or a backticked path
+                  with a / and name.ext, optionally :21, :21-40 or #L21) opens
+                  at its line in the IDE snapback runs inside (JetBrains, VS
+                  Code family, Zed), found from its parent processes alone: in
+                  tmux or a plain terminal the click refuses. Any other scheme
+                  (file://, vscode://) opens nothing. Each refusal says why on
+                  the status line. Like the drag and
+                  double-click below, it works while a reply or fork box is
+                  open, except the switch, which waits until the box is closed
     drag          in the preview: select transcript text; on release it is
                   copied the way Ctrl-X y copies (your clipboard tool, or OSC 52
                   over SSH). A drag that starts on a node, a subagent launch or
@@ -248,8 +255,8 @@ KEYS:
     double-click  in the preview: select the word under the pointer and copy it
                   on release, the same way a drag copies (two clicks on one
                   cell within half a second). The first click still unfolds a
-                  node, switches to a subagent or opens a link; the second only
-                  selects, so a node double-clicked stays open
+                  node, switches to a subagent or opens a link (web or file);
+                  the second only selects, so a node double-clicked stays open
     Backspace     delete the query character before the cursor
     Alt+Backspace delete the WORD before the cursor — one whole search atom, so
                   a path or a branch name goes in one press. Ctrl-W and Alt+H do
