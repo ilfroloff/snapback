@@ -16,7 +16,9 @@
 //! ([`Outcome::FinishCopy`]) because only the driver holds the writer its OSC 52
 //! fallback needs.
 //! `ModelAliases` and `SettingsModel` store the one answer each of the `--model`
-//! alias probe and the settings read. `SubagentsWritten`, the watcher's batch of
+//! alias probe and the settings read. `IdeDetected` stores the host-IDE answer and
+//! `FileOpened` lands a file-link open's status (transient on success, sticky on a
+//! refusal). `SubagentsWritten`, the watcher's batch of
 //! subagent transcript writes, draws the subagent view again when it shows one of
 //! them and marks the selected session's subagent record to be read again — never
 //! a reload — and `SubagentRuns` lands the background refresh's record while it
@@ -32,6 +34,8 @@
 //! continue, quit, hand off a resume, fire one of the four no-teardown children
 //! (`Send` / `Move` / `Interrupt` / `BgLaunch`), deliver `Ctrl-K`'s child-free SIGTERM
 //! (`Signal`, a `kill(2)` the driver runs inline — see [`Outcome::Signal`]),
+//! open a clicked file link in the host IDE (`OpenFile`, a detached thread like the
+//! four),
 //! or start / finish a clipboard copy — `Ctrl-X y`'s id or a preview
 //! drag-selection — (`Copy` / `FinishCopy`). All of it is
 //! terminal-free and unit tested; the terminal-driving loop that calls it lives in
@@ -70,9 +74,9 @@
 //! | terminal paste | inserted as TEXT — never as keystrokes (see below); at the find bar's caret while it is open. A compose paste is cut at `send::COMPOSE_PROMPT_MAX_BYTES`; a draft over it is refused, box kept, on `Enter` in every box and on `Ctrl-O` in the fork box and the draft (`compose::refuse_too_long`) |
 //! | mouse: click a folded node's header | unfold the node — a subagent's hand-back (`◆ message from`) or context claude injected (`◇`) — where it sits, and a second click folds it back; a click on a header toggles its node and never opens a link. On the RELEASE, like a link, and ahead of one (see [`click_effect`]). Works while a quick reply or fork box is open, like every pointer action over the transcript but the `◆ delegated to …` switch below |
 //! | mouse: click a `◆ delegated to …` line | switch the preview to that subagent's OWN transcript — the SUBAGENT VIEW: the pane's title names the subagent, its pinned row names the subagent's turn, the board query never marks it (the find bar does), and it updates as the subagent writes. A `◆ delegated to …` line inside it switches to that nested subagent. `Esc` or `Ctrl-X ↓` again goes back to the session's own transcript where it was scrolled; `Ctrl-R` and `Ctrl-X f` leave it too, and so does ANY change of the selected session (`App::set_selected`): `Up` / `Down` while the open view is hidden, the mouse wheel over the list, a search edit, `Tab` or `Ctrl-A` that filters the row out, `Ctrl-X x` or `Ctrl-X h` hiding it, `Ctrl-X d` or `Ctrl-X w` taking it off the board, `Ctrl-X z` from a `↳` row, a reload that drops the row, and the cursor following a headless fork onto its new row. Only this click, `Ctrl-X ↓`, `Left` / `Right` and `Up` / `Down` inside the view open it — no search key does (see [`App::open_subagent_view`]). On the RELEASE, like a link. Refused, on a sticky status line, while a quick reply or fork box is open: what the box sends lands in the session, so the pane keeps showing the session's own transcript |
-//! | mouse: click a preview link | open its url in the browser — `http`/`https` only: any other scheme opens nothing and says so on a sticky status line. On the RELEASE, since only then is it known that the press was a click and not the start of a drag (see [`mouse_effect`]). Works while a quick reply or fork box is open |
+//! | mouse: click a preview link | open the link under the pointer, of EITHER kind. A WEB link opens its url in the browser — `http`/`https` only: any other scheme (`file://`, `vscode://`, …) opens nothing and says so on a sticky status line. A FILE link (a scheme-less markdown target or a backticked path, `store::target`) opens in the IDE snapback runs inside, found once by its parent processes alone (see [`file_click`]), at the line the link names: before that walk has answered, a transient nudge; with no IDE in the ancestry (a plain terminal, `tmux`, `screen`) or no folder to resolve a relative path against, a sticky refusal naming the path; then the open worker's own outcome — `opened in <IDE>` transiently, or a sticky refusal (no such file, not a regular file, a launcher that did not start, exited unsuccessfully or timed out). On the RELEASE, since only then is it known that the press was a click and not the start of a drag (see [`mouse_effect`]). Works while a quick reply or fork box is open |
 //! | mouse: drag in the preview | select transcript text in reading order, reverse-videoed — DRAWN text only: each row ends at its last drawn character, never at the pane's edge, and a drag over blank space alone selects nothing, so its release copies nothing. A drag that starts in a grid table cell and stays in its column stays in that cell and copies it as one line. HOLD the drag past the transcript's top or bottom edge and the pane glides that way, a small step every `AUTOSCROLL_FRAME` — faster the further past the edge — so the selection keeps growing into rows that were never on screen until the button comes up (see [`App::autoscroll_preview_selection`]); a plain move while the button is held counts as the release the terminal lost. The release copies the WHOLE selection the way `Ctrl-X y` copies — [`Outcome::Copy`], the clipboard tool first, OSC 52 as the fallback — with a transient status. Never the in-flight reply's tail. A wheel notch, any key or a resize ends it. A drag that starts on a node header, a `◆ delegated to …` line or a link selects, and toggles, switches or opens nothing. Off under any overlay and a new-session draft's card, but ON while a quick reply or fork box is open (each previews the real transcript; the drag neither moves its caret nor touches its text), and never started on the pinned row, the running list or a docked compose zone (see [`press_starts_selection`]) |
-//! | mouse: double-click in the preview | select the WORD under the pointer (Unicode word boundaries, on the drawn row) and copy it on release, exactly as a drag copies. Two presses on the SAME cell within [`DOUBLE_CLICK_INTERVAL`] (see [`is_double_click`]); a blank word selects nothing; a quick third click keeps the word. The FIRST release is a plain click — it toggles a node header, switches to a subagent or opens a link, as above — and the SECOND copies the word and toggles, switches or opens nothing, so a node header double-clicked is opened once and stays open. Any key, wheel notch or reload resets the count (a fold toggle does not: it is the first click's own effect), and a press that turned into a drag is not a first click. Same gate as a drag ([`press_starts_selection`]), so it too works while a quick reply or fork box is open |
+//! | mouse: double-click in the preview | select the WORD under the pointer (Unicode word boundaries, on the drawn row) and copy it on release, exactly as a drag copies. Two presses on the SAME cell within [`DOUBLE_CLICK_INTERVAL`] (see [`is_double_click`]); a blank word selects nothing; a quick third click keeps the word. The FIRST release is a plain click — it toggles a node header, switches to a subagent or opens a link of either kind (web or file), as above — and the SECOND copies the word and toggles, switches or opens nothing, so a node header double-clicked is opened once and stays open. Any key, wheel notch or reload resets the count (a fold toggle does not: it is the first click's own effect), and a press that turned into a drag is not a first click. Same gate as a drag ([`press_starts_selection`]), so it too works while a quick reply or fork box is open |
 //! | `Esc` | unwind one level: close the find bar when it is open; else clear the search query when one is typed; else leave the subagent view for the session's own transcript — an OPEN view, drawn or not, so `Esc` never quits past a view the list-only layout or a card hides; else quit |
 //! | `Ctrl-C` | quit from the board; while a modal, a confirmation, the key map or a pending `Ctrl-X` chord is open it closes or cancels that instead, and in a compose box it never quits (`Esc` cancels the box) |
 //! | `F1`, `Ctrl-X ?`, `Ctrl+Shift+/` (`Ctrl-?`) | open the full key-map MODAL (a table of every binding); `↑`/`↓` (or `k`/`j`)/`PgUp`/`PgDn`/`Home`/`End` and the mouse wheel scroll it; `Esc`, `Ctrl-C`, `F1` or `Ctrl+Shift+/` (in any form it arrives as) closes it — `Ctrl-X ?` only opens it, since inside the modal the `Ctrl-X` leader is inert. It owns the keyboard like every modal. `Ctrl-X ?` (two plain keys) is the way in that works in every terminal and `F1` works in most (GNOME Terminal binds it to its own Help, and a Mac laptop keyboard needs `Fn`+`F1`): a terminal often cannot deliver `Ctrl+Shift+/` at all (`Ctrl-?` is the legacy 0x7F, which arrives as Backspace). Without the kitty keyboard protocol it cannot be told from `Ctrl-/`, so `Ctrl-?`, `Ctrl-/` and the legacy 0x1F (`Ctrl-7`) all count (see [`App::show_key_map`]) |
@@ -141,10 +145,12 @@ use ratatui::layout::{Position, Rect};
 use crate::claude_move::{self, LineageMove, MoveJob, MoveRequest};
 use crate::defined_agents;
 use crate::delete;
+use crate::ide::{self, IdeState, OpenRequest, Refusal};
 use crate::resume::{self, Ready};
 use crate::send::{
     self, BgLaunchRequest, InterruptGate, InterruptRequest, ReplyGate, SendRequest, SignalPlan,
 };
+use crate::store::target::{markdown_target, LocalTarget};
 use crate::store::{preview, SessionStore};
 use crate::watch::{AppEvent, CopyPayload};
 
@@ -348,6 +354,13 @@ pub enum Outcome {
     /// nothing. The interactive escape hatch (`Ctrl-O`) still takes
     /// [`Resume`](Self::Resume), because that one really does hand the terminal over.
     BgLaunch(BgLaunchRequest),
+    /// Open a clicked file link in the host IDE on a detached thread and KEEP
+    /// running — like [`Send`](Self::Send), the board never tears down. Handled
+    /// inline by [`crate::tui::run`] ([`crate::ide::spawn_open`]); the open reports
+    /// back via [`AppEvent::FileOpened`](crate::watch::AppEvent::FileOpened). Carried
+    /// as data so the click DECISION stays pure and unit-testable; the existence
+    /// check and the launcher are the worker's, never the click's.
+    OpenFile(OpenRequest),
     /// Send a re-verified pid a SIGTERM — `Ctrl-K`'s route for a reported session
     /// with no stoppable job id, confirmed and re-probed
     /// ([`send::signal_plan`](crate::send::signal_plan)). The board never tears down.
@@ -665,8 +678,9 @@ pub fn key_to_action(
 ///   reply or fork box is open), and otherwise it is resolved
 ///   against the rendered preview links: a hit on an `http`/`https` url opens it
 ///   in the default browser and reports `opening <url>` transiently, a hit on any
-///   other scheme opens NOTHING and reports a sticky refusal naming the url, a
-///   line too big to hit-test reports a sticky [`LinkClick::Unresolvable`]
+///   other scheme opens NOTHING and reports a sticky refusal naming the url, a hit
+///   on a FILE link opens it in the host IDE or nudges or refuses
+///   ([`file_click`], [`MouseEffect::OpenFile`]), a line too big to hit-test reports a sticky [`LinkClick::Unresolvable`]
 ///   message, and a miss writes nothing (the mapping lives in
 ///   [`note_link_click`]). All are routed independently of the modal key gate, and
 ///   a press cannot start a selection, toggle a node, switch to a subagent or open
@@ -886,6 +900,23 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
             // OWNERSHIP).
             app.set_settings_model(defaults.new_session);
             app.set_restore_overridden(defaults.restore_overridden);
+            Outcome::Continue
+        }
+        AppEvent::IdeDetected(found) => {
+            // Delivered ONCE per board session, off-thread, by the ancestry walk;
+            // just store the answer. Deliberately silent (STATUS-LINE OWNERSHIP): a
+            // file-link click states its own outcome.
+            app.set_ide(found);
+            Outcome::Continue
+        }
+        AppEvent::FileOpened { status, success } => {
+            // A file-link open finished off-thread. Success is a transient
+            // confirmation; every refusal stays sticky and names the full path.
+            if success {
+                app.set_status_transient(status);
+            } else {
+                app.set_status(status);
+            }
             Outcome::Continue
         }
         AppEvent::SendFinished {
@@ -1397,6 +1428,9 @@ enum MouseEffect {
     /// A plain CLICK — press and release with no drag — over a drawn link whose
     /// scheme snapback opens ([`LinkClick::Opening`]): open this url.
     OpenLink(String),
+    /// A plain CLICK over a drawn FILE link ([`LinkClick::OpenFile`]) while the
+    /// host IDE is known: hand the file to it, off-thread.
+    OpenFile(OpenRequest),
     /// A finished DRAG: copy this selected text.
     Copy(String),
 }
@@ -1419,6 +1453,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Outcome {
             resume::open_url(&url);
             Outcome::Continue
         }
+        MouseEffect::OpenFile(req) => Outcome::OpenFile(req),
         MouseEffect::Copy(text) => Outcome::Copy(CopyPayload::Selection(text)),
     }
 }
@@ -1652,8 +1687,10 @@ fn press_starts_selection(app: &App, pos: Position) -> bool {
 ///   to open its url ([`MouseEffect::OpenLink`]) and reports `opening <url>`
 ///   transiently; a hit on any OTHER scheme opens nothing and reports a STICKY
 ///   refusal naming the url (the gate is [`preview::has_openable_scheme`]); a line
-///   too big to hit-test reports a sticky [`LinkClick::Unresolvable`] message; and
-///   a miss writes nothing.
+///   too big to hit-test reports a sticky [`LinkClick::Unresolvable`] message; a
+///   hit on a FILE link ([`LinkClick::OpenFile`] and its two refusals, decided by
+///   [`file_click`]) asks for [`MouseEffect::OpenFile`] while the host IDE is known
+///   and otherwise nudges or refuses; and a miss writes nothing.
 ///
 /// Resolved at the PRESS cell because that is the cell the gate vetted: a press
 /// is admitted only inside the transcript rect ([`press_starts_selection`]), so a
@@ -1698,16 +1735,19 @@ fn click_effect(app: &mut App, press: Position) -> MouseEffect {
     note_link_click(app, &click);
     match click {
         LinkClick::Opening(url) => MouseEffect::OpenLink(url),
-        LinkClick::NoLink | LinkClick::RefusedScheme(_) | LinkClick::Unresolvable => {
-            MouseEffect::None
-        }
+        LinkClick::OpenFile(req) => MouseEffect::OpenFile(req),
+        LinkClick::NoLink
+        | LinkClick::RefusedScheme(_)
+        | LinkClick::Unresolvable
+        | LinkClick::FileRefused(..)
+        | LinkClick::IdeDetecting => MouseEffect::None,
     }
 }
 
 /// What a left-click on the preview pane amounts to — the ONE outcome the whole click
 /// path speaks in, from the hit-test through the status line to the spawn.
 ///
-/// It has four states because the click really has four, and the two that used to
+/// It began with four states, the click really having four, and the two that used to
 /// share an `Option::None` are the reason this type exists. [`NoLink`](Self::NoLink)
 /// says the pointer was over ordinary text; [`Unresolvable`](Self::Unresolvable) says
 /// the pointer was over a line too large to hit-test, so WHICH link it landed on — or
@@ -1739,6 +1779,17 @@ enum LinkClick {
     /// The click's line exceeded the hit-test's probe budget, so which link it hit is
     /// unknown — see the type doc for why that is not [`NoLink`](Self::NoLink).
     Unresolvable,
+    /// The click resolved to a LOCAL FILE (`store::target`) and the host IDE is
+    /// known: this request opens it, and the worker owns the existence check and the
+    /// outcome's status.
+    OpenFile(OpenRequest),
+    /// The click resolved to a local file and snapback will not open it, for a
+    /// reason decided on the spot (no IDE, no folder to resolve against): the
+    /// reason and the path to name.
+    FileRefused(Refusal, PathBuf),
+    /// The click resolved to a local file while the ancestry walk has not answered:
+    /// asked again a moment later it will.
+    IdeDetecting,
 }
 
 /// Decide what a left-click on the preview pane at screen `(col, row)` amounts to,
@@ -1747,7 +1798,7 @@ enum LinkClick {
 /// The DECISION half of a link click ([`click_effect`] asks it on a click's
 /// release; [`handle_mouse`] holds the one spawn), split out for the reason
 /// PATTERNS §3 gives: everything here is terminal-, process- and status-free and can
-/// be asserted directly against all four outcomes, while the caller is left holding
+/// be asserted directly against every outcome, while the caller is left holding
 /// one spawn. That is what lets a test drive a real rendered transcript all the way to
 /// "this is the url that would be opened" without a browser appearing on the machine
 /// running it. It takes `&mut App` only because the width-scoped preview cache is
@@ -1760,10 +1811,11 @@ enum LinkClick {
 /// lines and the link regions) comes from the SAME width-scoped cache the view drew
 /// from — the very map the draw windowed itself by, so the click and the paint
 /// resolve a screen row to a logical line through one shared answer rather than two
-/// models. The hit itself comes from the pure [`view::link_at`], whose three answers
-/// widen into four here by asking [`preview::has_openable_scheme`] of a hit — the same
+/// models. The hit itself comes from the pure [`view::link_at`], whose answers
+/// widen here: a url hit by asking [`preview::has_openable_scheme`] of it — the same
 /// predicate the autolink parser applies and [`resume::opener_argv`] enforces, asked
-/// once, here, so the driver holds no gate of its own.
+/// once, here, so the driver holds no gate of its own — and a file hit through
+/// [`file_click`], which never reaches that gate.
 ///
 /// A pane with no previewed session at all is [`LinkClick::NoLink`]: there is no
 /// transcript to have hit, which is a genuine absence rather than an abstention.
@@ -1772,6 +1824,7 @@ fn resolve_link_click(app: &mut App, col: u16, row: u16) -> LinkClick {
     // Read before the borrow below: the hit context borrows `app` for as long as its
     // lines are in hand, and the offset is a plain `Copy` field.
     let scroll = app.preview_scroll;
+    let ide = app.ide().clone();
     let Some((row_prefix, lines, regions, ..)) = app.preview_hit_context(transcript.width) else {
         return LinkClick::NoLink;
     };
@@ -1782,6 +1835,36 @@ fn resolve_link_click(app: &mut App, col: u16, row: u16) -> LinkClick {
             LinkClick::Opening(url.to_string())
         }
         view::LinkProbe::Hit(url) => LinkClick::RefusedScheme(url.to_string()),
+        view::LinkProbe::File(region) => match markdown_target(&region.url) {
+            Some(target) => file_click(&ide, &target, &region.dirs),
+            // `link_at` answered a file only for a url this rule reads, so this
+            // arm is unreachable; if the two ever drift, the click refuses.
+            None => LinkClick::RefusedScheme(region.url.clone()),
+        },
+    }
+}
+
+/// Decide a click on a LOCAL-FILE link, given what the board knows of the host
+/// IDE: pure, and touching no disk — the existence check is the open worker's.
+///
+/// The order is the order of the reader's questions: no folder to resolve a
+/// relative path against is refused first (the path is as written, there being no
+/// absolute one to name); then the IDE — still being looked for is a nudge, none is
+/// a refusal naming the FIRST absolute candidate — and only a known IDE yields a
+/// request, carrying every candidate so the worker can try them in order.
+fn file_click(ide: &IdeState, target: &LocalTarget, dirs: &[String]) -> LinkClick {
+    let candidates = target.candidates(dirs);
+    let Some(first) = candidates.first() else {
+        return LinkClick::FileRefused(Refusal::NoFolder, PathBuf::from(&target.path));
+    };
+    match ide {
+        IdeState::Detecting => LinkClick::IdeDetecting,
+        IdeState::Absent => LinkClick::FileRefused(Refusal::NoIde, first.clone()),
+        IdeState::Found(ide) => LinkClick::OpenFile(OpenRequest {
+            ide: ide.clone(),
+            candidates,
+            line: target.line,
+        }),
     }
 }
 
@@ -1800,7 +1883,7 @@ const LINK_OPENING_PREFIX: &str = "opening ";
 /// The two halves of the status a link click reports when it hit a link it will NOT
 /// open, wrapped around the url so the reader sees which link and why.
 ///
-/// snapback opens `http`/`https` only ([`preview::has_openable_scheme`] — the rule
+/// snapback opens `http`/`https` URLs only ([`preview::has_openable_scheme`] — the rule
 /// the autolink parser already applies, and the gate [`resume::opener_argv`] enforces).
 /// A `[label](url)` target, though, is authored by the transcript and is scheme-checked
 /// nowhere on the way in, so a label CAN render underlined over a url the opener will
@@ -1808,7 +1891,7 @@ const LINK_OPENING_PREFIX: &str = "opening ";
 /// affordance that quietly does nothing is exactly the indistinguishable silence this
 /// hit-test exists to remove, and re-creating it here would trade one unreadable state
 /// for another.
-const LINK_REFUSED_PREFIX: &str = "not opening ";
+const LINK_REFUSED_PREFIX: &str = ide::REFUSED_PREFIX;
 /// The other half of the refusal (see [`LINK_REFUSED_PREFIX`]): it names the rule, so
 /// the reader learns the link is unreachable from snapback rather than broken.
 const LINK_REFUSED_SUFFIX: &str = " - only http/https links open";
@@ -1837,7 +1920,7 @@ const LINK_UNRESOLVED: &str = "cannot tell which link that is - this line is too
 
 /// Give a resolved [`LinkClick`] its status-line treatment. The ONE place that mapping
 /// lives, so each outcome's stickiness is decided once and is re-readable as a table.
-/// Terminal- and process-free, so it is unit-testable across all four.
+/// Terminal- and process-free, so it is unit-testable across every outcome.
 ///
 /// A click that RESOLVED anything is an ACTIONABLE input, not a notification: the user
 /// aimed at something and either it is about to happen or it is refused, exactly as for
@@ -1876,6 +1959,16 @@ fn note_link_click(app: &mut App, click: &LinkClick) {
             app.set_status(format!("{LINK_REFUSED_PREFIX}{url}{LINK_REFUSED_SUFFIX}"));
         }
         LinkClick::Unresolvable => app.set_status(LINK_UNRESOLVED),
+        // The open worker reports the outcome (`AppEvent::FileOpened`), so a request
+        // on its way says nothing here: a "success" written before the launcher ran
+        // would be a claim nothing has checked.
+        LinkClick::OpenFile(_) => {}
+        // Both are outcomes the reader may have to act on, so STICKY like every
+        // refusal; the IDE refusal names the absolute path snapback WOULD have
+        // opened, so the reader can open it by hand.
+        LinkClick::FileRefused(refusal, path) => app.set_status(refusal.status(path)),
+        // A nudge, not an outcome: transient, and it expires unread without harm.
+        LinkClick::IdeDetecting => app.set_status_transient(ide::DETECTING_NUDGE),
     }
 }
 
@@ -7228,6 +7321,214 @@ mod tests {
             "and it is a refusal, not a confirmation: a message that expired unread \
              would leave exactly the silence it exists to break"
         );
+    }
+
+    // --- file links: the click decision, its statuses, its events ------------
+
+    fn test_ide() -> crate::ide::Ide {
+        crate::ide::Ide {
+            name: "WebStorm 2026.3".to_string(),
+            family: crate::ide::Family::JetBrains,
+            launcher: PathBuf::from("/Apps/WebStorm.app/Contents/MacOS/webstorm"),
+        }
+    }
+
+    fn file_target(raw: &str) -> LocalTarget {
+        markdown_target(raw).expect("a file target")
+    }
+
+    /// The decision is a table over what the board knows of the IDE, and the
+    /// folders the link resolves against.
+    #[test]
+    fn file_click_decides_open_nudge_or_each_refusal() {
+        let target = file_target("docs/a.md:12");
+        let dirs = vec!["/ws/first".to_string(), "/ws/second".to_string()];
+
+        assert_eq!(
+            file_click(&IdeState::Found(test_ide()), &target, &dirs),
+            LinkClick::OpenFile(OpenRequest {
+                ide: test_ide(),
+                candidates: vec![
+                    PathBuf::from("/ws/first/docs/a.md"),
+                    PathBuf::from("/ws/second/docs/a.md"),
+                ],
+                line: Some(12),
+            }),
+            "a known IDE gets every candidate, in precedence order, and the line"
+        );
+        assert_eq!(
+            file_click(&IdeState::Absent, &target, &dirs),
+            LinkClick::FileRefused(Refusal::NoIde, PathBuf::from("/ws/first/docs/a.md")),
+            "no IDE refuses, naming the absolute path of the first candidate"
+        );
+        assert_eq!(
+            file_click(&IdeState::Detecting, &target, &dirs),
+            LinkClick::IdeDetecting
+        );
+        assert_eq!(
+            file_click(&IdeState::Found(test_ide()), &target, &[]),
+            LinkClick::FileRefused(Refusal::NoFolder, PathBuf::from("docs/a.md")),
+            "a relative path with no folder to resolve against cannot be opened"
+        );
+        let absolute = file_target("/etc/hosts");
+        assert_eq!(
+            file_click(&IdeState::Absent, &absolute, &[]),
+            LinkClick::FileRefused(Refusal::NoIde, PathBuf::from("/etc/hosts")),
+            "an absolute path needs no folder"
+        );
+    }
+
+    /// Each outcome has its own stickiness: the no-IDE and no-folder refusals are
+    /// sticky and name the path; the detection nudge dwells; a request on its way
+    /// says nothing, because the worker owns the outcome.
+    #[test]
+    fn file_click_outcomes_have_their_own_status_class() {
+        let mut app = app_with("s", None);
+        note_link_click(
+            &mut app,
+            &LinkClick::FileRefused(Refusal::NoIde, PathBuf::from("/ws/docs/a.md")),
+        );
+        assert_eq!(
+            app.status.as_deref(),
+            Some("not opening /ws/docs/a.md - snapback is not running inside an IDE terminal")
+        );
+        assert_eq!(app.status_ttl, None, "the no-IDE refusal is sticky");
+
+        note_link_click(&mut app, &LinkClick::IdeDetecting);
+        assert_eq!(app.status.as_deref(), Some(ide::DETECTING_NUDGE));
+        assert_eq!(app.status_ttl, Some(STATUS_DWELL_TICKS), "a nudge dwells");
+
+        app.set_status("a refusal not yet read");
+        note_link_click(
+            &mut app,
+            &LinkClick::OpenFile(OpenRequest {
+                ide: test_ide(),
+                candidates: vec![PathBuf::from("/ws/a.md")],
+                line: None,
+            }),
+        );
+        assert_eq!(
+            app.status.as_deref(),
+            Some("a refusal not yet read"),
+            "a request in flight claims no outcome"
+        );
+    }
+
+    #[test]
+    fn the_detection_and_open_events_land_on_the_board() {
+        let mut app = app_with("s", None);
+        let mut store = SessionStore::new(Path::new("/nonexistent-root"));
+        assert_eq!(app.ide(), &IdeState::Detecting);
+
+        dispatch(
+            &mut app,
+            AppEvent::IdeDetected(Some(test_ide())),
+            &mut store,
+        );
+        assert_eq!(app.ide(), &IdeState::Found(test_ide()));
+        dispatch(&mut app, AppEvent::IdeDetected(None), &mut store);
+        assert_eq!(app.ide(), &IdeState::Absent);
+        assert_eq!(app.status, None, "detection is silent");
+
+        dispatch(
+            &mut app,
+            AppEvent::FileOpened {
+                status: "opened in WebStorm 2026.3".to_string(),
+                success: true,
+            },
+            &mut store,
+        );
+        assert_eq!(app.status.as_deref(), Some("opened in WebStorm 2026.3"));
+        assert_eq!(
+            app.status_ttl,
+            Some(STATUS_DWELL_TICKS),
+            "success clears itself"
+        );
+
+        dispatch(
+            &mut app,
+            AppEvent::FileOpened {
+                status: "not opening /w/a.md - no such file".to_string(),
+                success: false,
+            },
+            &mut store,
+        );
+        assert_eq!(
+            app.status.as_deref(),
+            Some("not opening /w/a.md - no such file")
+        );
+        assert_eq!(
+            app.status_ttl, None,
+            "a refusal stays until the next keypress"
+        );
+    }
+
+    /// End to end over a REAL render: a click on a drawn file link resolves, through
+    /// the same hit-test as a url, to the request or refusal its IDE state decides —
+    /// and opens nothing itself.
+    #[test]
+    fn a_click_on_a_drawn_file_link_follows_the_hosts_ide_state() {
+        let dir = unique_temp_dir("link-file");
+        // One app per state: a second click on the same cell is a double-click.
+        let clicked = |ide: Option<Option<crate::ide::Ide>>| {
+            let mut app = link_app_to(&dir, None, "docs/a.md");
+            if let Some(found) = ide {
+                app.set_ide(found);
+            }
+            app.set_status("cleared by the click");
+            let buffer = render_board(&mut app);
+            let (col, row) = drawn_link_cell(&buffer, app.preview_rect);
+            let effect = click(&mut app, col, row);
+            (effect, app.status.clone(), app.status_ttl)
+        };
+
+        // Detection pending: a nudge, nothing opens.
+        let (effect, status, _) = clicked(None);
+        assert_eq!(effect, MouseEffect::None);
+        assert_eq!(status.as_deref(), Some(ide::DETECTING_NUDGE));
+
+        // No IDE: a sticky refusal naming the absolute path against the record's cwd.
+        let (effect, status, ttl) = clicked(Some(None));
+        assert_eq!(effect, MouseEffect::None);
+        assert_eq!(
+            status.as_deref(),
+            Some("not opening /tmp/docs/a.md - snapback is not running inside an IDE terminal")
+        );
+        assert_eq!(ttl, None);
+
+        // A known IDE: the request, with no status written by the click.
+        let (effect, status, _) = clicked(Some(Some(test_ide())));
+        assert_eq!(
+            effect,
+            MouseEffect::OpenFile(OpenRequest {
+                ide: test_ide(),
+                candidates: vec![PathBuf::from("/tmp/docs/a.md")],
+                line: None,
+            })
+        );
+        assert_eq!(status.as_deref(), Some("cleared by the click"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The http(s) path is untouched by file links: the same click still opens a
+    /// url, and a scheme that is not http(s) still refuses with the scheme rule.
+    #[test]
+    fn a_url_link_still_opens_and_a_foreign_scheme_still_refuses_with_an_ide_known() {
+        let dir = unique_temp_dir("link-file-url");
+        for (url, expected) in [
+            (LINK_URL, LinkClick::Opening(LINK_URL.to_string())),
+            (
+                REFUSED_URL,
+                LinkClick::RefusedScheme(REFUSED_URL.to_string()),
+            ),
+        ] {
+            let mut app = link_app_to(&dir, None, url);
+            app.set_ide(Some(test_ide()));
+            let buffer = render_board(&mut app);
+            let (col, row) = drawn_link_cell(&buffer, app.preview_rect);
+            assert_eq!(resolve_link_click(&mut app, col, row), expected);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A drag that STARTS on a link is a selection, not a click: its release copies

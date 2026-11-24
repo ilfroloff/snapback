@@ -29,6 +29,7 @@ use time::OffsetDateTime;
 use crate::agents::ReportedAgent;
 use crate::claude_move;
 use crate::defined_agents::{self, DefinedAgent};
+use crate::ide::{Ide, IdeState};
 use crate::resume::{ModelPick, EFFORT_LEVELS};
 use crate::{config, delete, hidden};
 
@@ -2765,6 +2766,15 @@ pub struct App {
     /// release, ~2.2 s debug) is allowed to be deliberately unoptimized — nothing
     /// is blocked on it.
     model_aliases: Vec<String>,
+    /// The IDE this process runs inside, the one a file link opens in
+    /// ([`crate::ide`]): [`IdeState::Detecting`] until the off-thread ancestry walk
+    /// delivers.
+    ///
+    /// DERIVED, IN-MEMORY state about the process's own surroundings: nothing here
+    /// reaches disk. Written only by [`set_ide`](Self::set_ide), from
+    /// [`AppEvent::IdeDetected`](crate::watch::AppEvent::IdeDetected), and kept across
+    /// board sessions (the app outlives them; the walk is memoized per process).
+    ide: IdeState,
     /// The model a NEW session in the launch dir would run on with no `--model`,
     /// as the user's `claude` settings files and `ANTHROPIC_MODEL` name it — `None`
     /// until the off-thread read delivers, and when they name none.
@@ -3316,6 +3326,9 @@ impl App {
             // probe delivers onto the event channel some frames from now; nothing
             // waits for it here (see the field docs).
             model_aliases: Vec::new(),
+            // The ancestry walk has not answered: a file-link click is a nudge
+            // until it does (see the field docs).
+            ide: IdeState::Detecting,
             // Nothing read yet, so a draft says `model: default` and a reply names
             // its session's model; the off-thread settings read delivers both facts
             // onto the event channel, and nothing waits for it. Nothing on disk can
@@ -5819,6 +5832,19 @@ impl App {
     /// line (AGENTS.md: STATUS-LINE OWNERSHIP). Nothing on disk learns it either.
     pub fn set_model_aliases(&mut self, aliases: Vec<String>) {
         self.model_aliases = aliases;
+    }
+
+    /// The IDE this process runs inside, as far as the board knows it.
+    pub fn ide(&self) -> &IdeState {
+        &self.ide
+    }
+
+    /// Adopt the host-IDE answer ([`AppEvent::IdeDetected`](crate::watch::AppEvent::IdeDetected)):
+    /// a plain swap, the walk having run on its own thread. Sets no status — which
+    /// IDE owns the terminal is a fact true over an INTERVAL, and a click states
+    /// its own outcome (STATUS-LINE OWNERSHIP).
+    pub fn set_ide(&mut self, ide: Option<Ide>) {
+        self.ide = ide.map_or(IdeState::Absent, IdeState::Found);
     }
 
     /// Adopt the model the user's `claude` settings name for a NEW session, read

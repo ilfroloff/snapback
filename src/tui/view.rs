@@ -43,6 +43,7 @@ use crate::search::SearchMode;
 use crate::store::preview::{self, CellRegion, FoldRegion, LinkRegion, SubagentRegion};
 use crate::store::skills::CommandKind;
 use crate::store::subagents::{Subagent, SubagentRecord, SubagentStatus};
+use crate::store::target::markdown_target;
 use crate::store::{lineage, FailedTask};
 
 use super::app::{
@@ -4135,6 +4136,10 @@ fn probe_within_budget(line_bytes: usize, candidates: usize) -> bool {
 pub(crate) enum LinkProbe<'a> {
     /// The click landed on a cell this url's region PAINTED.
     Hit(&'a str),
+    /// The click landed on a cell a LOCAL-FILE region PAINTED
+    /// (`store::target::markdown_target`): the region itself, because the folders it
+    /// resolves against ([`LinkRegion::dirs`]) travel with it.
+    File(&'a LinkRegion),
     /// The click resolved to a real cell carrying no link region.
     NoLink,
     /// The click's line exceeded [`LINK_PROBE_BYTE_BUDGET`], so the probe was never
@@ -4400,7 +4405,13 @@ pub(crate) fn link_at<'a>(
                     rel_col,
                 )
         })
-        .map_or(LinkProbe::NoLink, |r| LinkProbe::Hit(r.url.as_str()))
+        .map_or(LinkProbe::NoLink, |r| {
+            if markdown_target(&r.url).is_some() {
+                LinkProbe::File(r)
+            } else {
+                LinkProbe::Hit(r.url.as_str())
+            }
+        })
 }
 
 /// The fold key of a fold node — a peer message or injected context — whose
@@ -11363,6 +11374,7 @@ going until a third line | alice |\n\
             col_start,
             col_end,
             url: url.to_string(),
+            dirs: Vec::new(),
         }
     }
 
@@ -11382,6 +11394,41 @@ going until a third line | alice |\n\
             ),
             Span::raw(".".repeat(cols.saturating_sub(col_end))),
         ])
+    }
+
+    /// A region whose url is a local file answers the REGION, so the folders it
+    /// resolves against travel to the click; an http url and a foreign scheme still
+    /// answer a url.
+    #[test]
+    fn link_at_answers_a_file_region_whole_and_a_url_as_a_url() {
+        let inner = inner_rect();
+        let lines = vec![
+            link_line(12, 4, 8),
+            link_line(12, 4, 8),
+            link_line(12, 4, 8),
+        ];
+        let prefix = wrapped_row_prefix(&lines, inner.width);
+        let mut file = region(0, 4, 8, "docs/a.md:3");
+        file.dirs = vec!["/ws".to_string()];
+        let regions = [
+            file.clone(),
+            region(1, 4, 8, "https://example.com/x.md"),
+            region(2, 4, 8, "file:///etc/passwd"),
+        ];
+        let at = |row: u16| {
+            link_at(
+                inner.x + 5,
+                inner.y + row,
+                inner,
+                0,
+                &prefix,
+                &lines,
+                &regions,
+            )
+        };
+        assert_eq!(at(0), LinkProbe::File(&file));
+        assert_eq!(at(1), LinkProbe::Hit("https://example.com/x.md"));
+        assert_eq!(at(2), LinkProbe::Hit("file:///etc/passwd"));
     }
 
     #[test]

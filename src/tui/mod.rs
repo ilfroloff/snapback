@@ -550,6 +550,12 @@ fn run_inner(
     // as the default inside the session that just ended reaches the next draft.
     // Untested for the same accepted reason as the line above.
     events.spawn_settings_model_probe(app.launch_dir.clone());
+    // Find the IDE this process runs inside (the one a file link opens in) by
+    // walking its process ancestry OFF the UI thread: another ONE-SHOT, delivering a
+    // single `AppEvent::IdeDetected`. The walk is memoized for the process, so only
+    // the first board session pays it. Untested for the same accepted reason as the
+    // lines above.
+    events.spawn_ide_probe();
     // The app's queue of completions no board session has read. It outlives this
     // session because `lib::run` re-enters the board on the SAME `App`, while the
     // channel above dies with this function.
@@ -621,6 +627,12 @@ fn run_inner(
                 // watcher reload.
                 Outcome::BgLaunch(req) => {
                     crate::send::spawn_bg_launch(req, events.sender());
+                }
+                // A file-link click that reached a launcher: hand the file to the
+                // host IDE on a detached thread and KEEP drawing, exactly like
+                // `Outcome::Send`. It reports back via `AppEvent::FileOpened`.
+                Outcome::OpenFile(req) => {
+                    crate::ide::spawn_open(req, events.sender());
                 }
                 // A confirmed, re-verified SIGTERM: performed RIGHT HERE, inline, and
                 // its result shown on the status line at once — with no detached

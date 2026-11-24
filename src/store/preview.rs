@@ -115,7 +115,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::command::{self, collapse_control_wrappers, Segment};
 use super::label::{self, PeerOrigin};
+use super::parse::relocated_cwd_of;
 use super::subagents::{self, RunProgress, RunVerdict, SubagentIndex, SubagentMeta};
+use super::target::{backtick_target, markdown_target};
 use super::Session;
 
 /// Floor on a GFM table column's rendered width in GRID mode — and, because a
@@ -213,7 +215,7 @@ const ELLIPSIS_WIDTH: usize = 1;
 /// TOGETHER with the `Text` under the same width discipline (see [`App`]).
 ///
 /// [`App`]: crate::tui::app::App
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkRegion {
     /// Line index into the rendered [`Text`] the label sits on.
     pub content_row: usize,
@@ -223,6 +225,17 @@ pub struct LinkRegion {
     pub col_end: usize,
     /// The link target to open.
     pub url: String,
+    /// The folders a LOCAL-FILE target (`store::target`) resolves against, in the
+    /// order they are tried: the session's first in-file `cwd`, then the `cwd`
+    /// recorded on the record the link came from, then the folder of the
+    /// session's last `relocated` record, without repeating one.
+    ///
+    /// Stamped by [`render_stream`] for a region whose `url` is a file target and
+    /// EMPTY for every other. The second folder has to travel with the region
+    /// because a session that changed folders (a worktree hop, `/cd`) writes
+    /// links relative to where it WAS when it wrote them; it is not recoverable
+    /// from the click, which sees the region and nothing of the record.
+    pub dirs: Vec<String>,
 }
 
 /// A clickable fold toggle inside the rendered preview — the header line of a
@@ -748,6 +761,13 @@ fn render_stream(reader: impl BufRead, stream: &StreamContext) -> RenderedPrevie
     // POSITIONAL — never a file-level hoist — so a late record cannot retroactively
     // label the turns that precede it.
     let mut agent = AgentState::default();
+    // The session's first in-file `cwd`: the folder a file link resolves against
+    // first ([`LinkRegion::dirs`]). Read here rather than taken from the board's
+    // session, which a `relocated` record moves to a later folder.
+    let mut first_cwd: Option<String> = None;
+    // The folder of the LAST `relocated` record, which may come after links it
+    // still applies to, so it is stamped once the stream has ended.
+    let mut relocated_cwd: Option<String> = None;
     for line in reader.lines() {
         let line = match line {
             Ok(l) => l,
@@ -771,12 +791,18 @@ fn render_stream(reader: impl BufRead, stream: &StreamContext) -> RenderedPrevie
             }
         }
         run = run.map(|run| run.after(&record));
+        if let Some(cwd) = relocated_cwd_of(&record) {
+            relocated_cwd = Some(cwd);
+        }
         if let Some(block) = render_record(&record, &mut agent, &mut prev_day, stream) {
             // ONE offset, ONE rebase, every kind of region: a node's fold target,
             // a delegation line's, the links inside a body and the rows search must
             // skip must never disagree about a row.
             let offset = lines.len();
-            links.extend(rebased(block.links, offset));
+            first_cwd = first_cwd.or_else(|| record_cwd(&record));
+            let mut block_links = block.links;
+            stamp_dirs(&mut block_links, first_cwd.as_deref(), record_cwd(&record));
+            links.extend(rebased(block_links, offset));
             folds.extend(rebased(block.folds, offset));
             subagent_regions.extend(rebased(block.subagents, offset));
             unindexed.extend(rebased(block.unindexed, offset));
@@ -788,6 +814,7 @@ fn render_stream(reader: impl BufRead, stream: &StreamContext) -> RenderedPrevie
             lines.extend(block.lines);
         }
     }
+    stamp_relocated(&mut links, relocated_cwd.as_deref());
 
     RenderedPreview {
         text: Text::from(lines),
@@ -801,6 +828,52 @@ fn render_stream(reader: impl BufRead, stream: &StreamContext) -> RenderedPrevie
         last_effort,
         run_ended: run.map(RunProgress::ended),
     }
+}
+
+/// The non-blank `cwd` a record carries, if any.
+fn record_cwd(record: &Value) -> Option<String> {
+    record
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|c| !c.trim().is_empty())
+        .map(str::to_string)
+}
+
+/// Give each local-file region of a record's block the folders it resolves
+/// against ([`LinkRegion::dirs`]): the session's first in-file `cwd`, then the
+/// record's own. Every other region keeps none, so a url link costs nothing here.
+/// The `relocated` folder is added after the stream ([`stamp_relocated`]).
+fn stamp_dirs(links: &mut [LinkRegion], first_cwd: Option<&str>, line_cwd: Option<String>) {
+    let mut dirs: Vec<String> = first_cwd.map(str::to_string).into_iter().collect();
+    if let Some(line_cwd) = line_cwd.filter(|c| !dirs.contains(c)) {
+        dirs.push(line_cwd);
+    }
+    if dirs.is_empty() {
+        return;
+    }
+    for link in links.iter_mut().filter(|l| is_file_link(l)) {
+        link.dirs = dirs.clone();
+    }
+}
+
+/// Append the session's `relocated` folder, last, to every local-file region that
+/// does not already list it: a session that moved folders (`/cd`, `Ctrl-X w`)
+/// wrote its earlier links relative to where it WAS, and its later ones to where
+/// it went. A pure string step, no disk — the click's worker checks which exists.
+fn stamp_relocated(links: &mut [LinkRegion], relocated_cwd: Option<&str>) {
+    let Some(relocated) = relocated_cwd else {
+        return;
+    };
+    for link in links.iter_mut().filter(|l| is_file_link(l)) {
+        if !link.dirs.iter().any(|d| d == relocated) {
+            link.dirs.push(relocated.to_string());
+        }
+    }
+}
+
+/// Whether a region's url is a local-file target (`store::target`).
+fn is_file_link(link: &LinkRegion) -> bool {
+    markdown_target(&link.url).is_some()
 }
 
 /// Shift a batch of block-relative regions down by `offset` rows so they address
@@ -2357,6 +2430,7 @@ fn regions_from_inline(
             col_start: prefix_width + l.col_start,
             col_end: prefix_width + l.col_end,
             url: l.url,
+            dirs: Vec::new(),
         })
         .collect()
 }
@@ -3499,6 +3573,7 @@ fn table_data_lines(
                         col_start: edge + l.col_start,
                         col_end: edge + l.col_end,
                         url: l.url.clone(),
+                        dirs: Vec::new(),
                     }));
                 }
                 // This cell is shorter than the row: hold its column open.
@@ -3715,7 +3790,17 @@ fn parse_inline_collect(
             if let Some(close) = after.find('`').filter(|&c| c > 0) {
                 col += flush_plain(&mut plain, &mut spans, base);
                 let content = after[..close].to_string();
-                col += display_width(&content);
+                let width = display_width(&content);
+                // A backticked file path is clickable though it keeps its dim code
+                // look: the region is recorded here, the style is not touched.
+                if backtick_target(&content).is_some() {
+                    links.push(InlineLink {
+                        col_start: col,
+                        col_end: col + width,
+                        url: content.clone(),
+                    });
+                }
+                col += width;
                 spans.push(Span::styled(content, code_style()));
                 i += 1 + close + 1;
                 continue;
@@ -7169,6 +7254,140 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // --- local-file link regions -------------------------------------------
+
+    /// The regions of the synthetic file-link fixture, with the text each paints.
+    fn file_link_regions() -> Vec<(String, LinkRegion)> {
+        let rendered = render_file_expanded(&preview_fixture("sess-file-links-1.jsonl"), WIDE, &[]);
+        rendered
+            .links
+            .iter()
+            .map(|r| {
+                let line = &rendered.text.lines[r.content_row];
+                (cols_of(line, r.col_start, r.col_end), r.clone())
+            })
+            .collect()
+    }
+
+    /// A `relocated` record's folder is the THIRD folder a link is tried against,
+    /// for the links written before it as well as after (the LAST one wins, a blank
+    /// one is ignored), and a link that already lists it does not repeat it.
+    #[test]
+    fn the_relocated_folder_is_a_third_candidate_for_every_file_link() {
+        let rendered = render_file_expanded(
+            &preview_fixture("sess-file-links-relocated-1.jsonl"),
+            WIDE,
+            &[],
+        );
+        let dirs_of = |url: &str| {
+            rendered
+                .links
+                .iter()
+                .find(|r| r.url == url)
+                .unwrap_or_else(|| panic!("no region for {url}"))
+                .dirs
+                .clone()
+        };
+        assert_eq!(
+            dirs_of("docs/early.md"),
+            ["/ws/first", "/ws/third"],
+            "a link written BEFORE the relocated record still gets its folder"
+        );
+        assert_eq!(
+            dirs_of("docs/mid.md"),
+            ["/ws/first", "/ws/second", "/ws/third"],
+            "first folder, the line's folder, then the relocated one, in that order"
+        );
+        assert_eq!(dirs_of("docs/late.md"), ["/ws/first", "/ws/third"]);
+        assert!(dirs_of("https://example.com/a.md").is_empty());
+
+        let same = render_file_expanded(
+            &preview_fixture("sess-file-links-relocated-2.jsonl"),
+            WIDE,
+            &[],
+        );
+        assert_eq!(
+            same.links[0].dirs,
+            ["/ws/first"],
+            "a relocated folder equal to an earlier one is not listed twice"
+        );
+    }
+
+    /// The five shapes a real session wrote — two markdown links, a backticked path
+    /// with colons in its folder name, a backticked path with a line range, and a
+    /// bare name that must NOT be clickable — each becomes (or does not become) a
+    /// region, painted over exactly its own text, carrying the folders to resolve
+    /// against: the session's first `cwd`, then the record's own.
+    #[test]
+    fn file_links_become_regions_and_a_bare_name_does_not() {
+        let regions = file_link_regions();
+        let by_url = |url: &str| {
+            regions
+                .iter()
+                .find(|(_, r)| r.url == url)
+                .unwrap_or_else(|| panic!("no region for {url}: {regions:#?}"))
+        };
+
+        let (label, adr) = by_url("docs/adr/0003-separate-analytics.md");
+        assert_eq!(label, "ADR 0003");
+        assert_eq!(
+            adr.dirs,
+            ["/ws/first"],
+            "a link in the first folder lists it once"
+        );
+        let (label, _) = by_url("docs/runbooks/analytics.md");
+        assert_eq!(label, "runbook");
+
+        let handover = "docs/plans/2026-11-06T05:42:19Z-analytics-handover/HANDOVER.md";
+        let (label, plan) = by_url(handover);
+        assert_eq!(label, handover, "a backticked path is painted whole");
+        assert_eq!(
+            plan.dirs,
+            ["/ws/first", "/ws/second"],
+            "the first in-file folder first, then the folder recorded on the line"
+        );
+        let code = "frontend/apps/mono/src/dataLayer.ts:21-40";
+        let (label, _) = by_url(code);
+        assert_eq!(label, code, "the line range is part of what is clickable");
+
+        assert!(
+            regions
+                .iter()
+                .all(|(label, _)| !label.contains("_document.page.tsx")),
+            "a bare file name is ambiguous and never a region: {regions:#?}"
+        );
+        assert!(
+            regions.iter().all(|(_, r)| !r.url.contains('*')),
+            "a glob is not a file: {regions:#?}"
+        );
+        // The url link stays a plain url link with no folders; the anchor is a
+        // region (it always was) that the click will not read as a file.
+        let (_, site) = by_url("https://example.com/a.md");
+        assert!(site.dirs.is_empty());
+        let (_, anchor) = by_url("#top");
+        assert!(anchor.dirs.is_empty());
+        assert_eq!(regions.len(), 6, "{regions:#?}");
+    }
+
+    /// A backticked path keeps its dim code style: clickable without looking it.
+    #[test]
+    fn a_backticked_file_path_keeps_its_code_style() {
+        let rendered = render_file_expanded(&preview_fixture("sess-file-links-1.jsonl"), WIDE, &[]);
+        let region = rendered
+            .links
+            .iter()
+            .find(|r| r.url.ends_with("HANDOVER.md"))
+            .expect("the backticked path has a region");
+        let line = &rendered.text.lines[region.content_row];
+        let span = line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("HANDOVER.md"))
+            .expect("the path is painted");
+        assert_eq!(span.style, code_style());
+        assert!(!span.style.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
     // --- link regions inside a GFM table (grid mode) ----------------------
 
     /// The text a line PAINTS at display columns `start..end` — the exact question
@@ -7520,12 +7739,14 @@ mod tests {
                 col_start: 1,
                 col_end: 9,
                 url: "clipped".to_string(),
+                dirs: Vec::new(),
             },
             LinkRegion {
                 content_row: 0,
                 col_start: 7,
                 col_end: 9,
                 url: "dropped".to_string(),
+                dirs: Vec::new(),
             },
         ];
         let (clamped, out, _) = clamped_grid(vec![line], links, Vec::new(), 6);
@@ -7551,6 +7772,7 @@ mod tests {
                 col_start: 0,
                 col_end: 3,
                 url: "kept".to_string(),
+                dirs: Vec::new(),
             }],
             Vec::new(),
             6,

@@ -1,0 +1,4 @@
+{"type":"user","sessionId":"sess-file-links-1","cwd":"/ws/first","timestamp":"2026-07-04T10:00:00.000Z","message":{"role":"user","content":"Where is the decision?"}}
+{"type":"assistant","sessionId":"sess-file-links-1","cwd":"/ws/first","timestamp":"2026-07-04T10:00:05.000Z","message":{"role":"assistant","content":"See [ADR 0003](docs/adr/0003-separate-analytics.md) and the [runbook](docs/runbooks/analytics.md)."}}
+{"type":"user","sessionId":"sess-file-links-1","cwd":"/ws/second","timestamp":"2026-07-04T10:05:00.000Z","message":{"role":"user","content":"And the code?"}}
+{"type":"assistant","sessionId":"sess-file-links-1","cwd":"/ws/second","timestamp":"2026-07-04T10:05:05.000Z","message":{"role":"assistant","content":"Handover: `docs/plans/2026-11-06T05:42:19Z-analytics-handover/HANDOVER.md`. Code: `frontend/apps/mono/src/dataLayer.ts:21-40`. Bare: `_document.page.tsx:28-34`. Glob `src/*.rs`, url [site](https://example.com/a.md), anchor [top](#top)."}}

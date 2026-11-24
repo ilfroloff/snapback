@@ -270,6 +270,17 @@ pub struct FailedTaskNotice {
     pub timestamp_raw: Option<String>,
 }
 
+/// The `relocatedCwd` of a `relocated` record, or `None` for any other record or
+/// a blank or non-string value. The ONE reading of that marker: [`parse_file`]
+/// keeps the last one it sees, and the preview's file links read the same rule.
+pub(super) fn relocated_cwd_of(record: &Value) -> Option<String> {
+    (record.get("type").and_then(Value::as_str) == Some("relocated"))
+        .then(|| record.get("relocatedCwd").and_then(Value::as_str))
+        .flatten()
+        .filter(|c| !c.trim().is_empty())
+        .map(str::to_string)
+}
+
 /// Stream one JSONL file fail-soft and say what it is.
 ///
 /// Three-way on purpose (see [`FileVerdict`]): a file that carries no `cwd` is
@@ -347,14 +358,8 @@ pub fn parse_file(path: &Path) -> FileVerdict<ParsedFile> {
             }
         }
         // claude's `/cd` marker: the LAST non-empty `relocatedCwd` wins.
-        if record.get("type").and_then(Value::as_str) == Some("relocated") {
-            if let Some(c) = record
-                .get("relocatedCwd")
-                .and_then(Value::as_str)
-                .filter(|c| !c.trim().is_empty())
-            {
-                relocated_cwd = Some(c.to_string());
-            }
+        if let Some(c) = relocated_cwd_of(&record) {
+            relocated_cwd = Some(c);
         }
         if session_id.is_none() {
             if let Some(s) = record.get("sessionId").and_then(Value::as_str) {

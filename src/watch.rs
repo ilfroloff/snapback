@@ -34,6 +34,7 @@ use notify_debouncer_mini::{new_debouncer, DebounceEventResult, DebouncedEventKi
 
 use crate::agents::{self, ReportedAgent};
 use crate::claude_settings;
+use crate::ide::{self, Ide};
 use crate::model_aliases;
 use crate::store::discover::{
     is_session_path, store_depth, subagent_transcript_at, StoreDepth, SubagentTranscript,
@@ -344,6 +345,31 @@ pub enum AppEvent {
     /// lands — a draft `model: default`, a reply the session's own model — and keep
     /// reading that if it never does.
     SettingsModel(claude_settings::ModelDefaults),
+    /// The IDE snapback runs inside, found OFF the UI thread by walking its own
+    /// process ancestry (see [`crate::ide::detect`]); `None` when it runs inside
+    /// none this module knows.
+    ///
+    /// Like [`ModelAliases`](Self::ModelAliases) it fires EXACTLY ONCE per board
+    /// session, from a thread spawned for that one answer — the walk itself runs
+    /// once per process and is remembered, so a later board session's answer is
+    /// instant. Nothing waits on it: a file-link click before it lands is a nudge
+    /// ([`crate::ide::DETECTING_NUDGE`]), never a block.
+    IdeDetected(Option<Ide>),
+    /// A file-link click's open finished, delivered OFF the UI thread by the
+    /// detached open worker ([`crate::ide::spawn_open`]).
+    ///
+    /// Like [`SendFinished`](Self::SendFinished) it fires EXACTLY ONCE per click
+    /// that reached a launcher, from a thread spawned for that one open. `status`
+    /// is `opened in <IDE>` or the refusal naming the full path (no such file, not
+    /// a regular file, the launcher failed); `success` picks the status's class — a
+    /// transient confirmation, or a sticky refusal.
+    FileOpened {
+        /// The mapped status line.
+        status: String,
+        /// Whether the file opened (`true`, transient) or was refused (`false`,
+        /// sticky).
+        success: bool,
+    },
     /// A folder's slash commands and agents as claude's own `initialize`
     /// handshake lists them, fetched OFF the UI thread for the compose pick list
     /// (see [`crate::claude_catalog::spawn_fetch`]).
@@ -730,6 +756,17 @@ impl EventLoop {
     /// fail and its answer be lost for the rest of the process.
     pub fn spawn_model_alias_probe(&self) {
         spawn_model_alias_thread(self.tx.clone(), model_aliases::installed_model_aliases);
+    }
+
+    /// Start the OFF-THREAD host-IDE detection (real runtime path only): one
+    /// thread that walks snapback's process ancestry ([`ide::detect`], memoized for
+    /// the process) and delivers the answer ONCE as [`AppEvent::IdeDetected`].
+    ///
+    /// Not started by [`new`](Self::new), for the same reason the probes below are
+    /// not: the event-loop unit tests must never read the real process table.
+    /// [`crate::tui::run`] calls it once per BOARD SESSION, like the alias probe.
+    pub fn spawn_ide_probe(&self) {
+        ide::spawn_detect(self.tx.clone());
     }
 
     /// Start the OFF-THREAD settings-model read (real runtime path only).

@@ -27,6 +27,7 @@ mod config;
 mod defined_agents;
 mod delete;
 mod hidden;
+mod ide;
 mod model_aliases;
 mod resume;
 mod search;
@@ -120,8 +121,8 @@ pub fn run() {
             }
             // `run` only breaks its own loop on Quit/Resume; Continue never
             // escapes, and a quick-reply Send, a `Ctrl-X w` Move, an interrupt,
-            // the interrupt's SIGTERM route, a background-agent launch, and a
-            // clipboard copy (its request and its completion) are all handled
+            // the interrupt's SIGTERM route, a background-agent launch, a
+            // file-link open, and a clipboard copy (its request and its completion) are all handled
             // INSIDE `run_inner` (the board stays up, so none of them propagates
             // here) — treat them all as a clean exit for totality.
             Ok(
@@ -131,6 +132,7 @@ pub fn run() {
                 | Outcome::Interrupt(_)
                 | Outcome::Signal { .. }
                 | Outcome::BgLaunch(_)
+                | Outcome::OpenFile(_)
                 | Outcome::Copy(_)
                 | Outcome::FinishCopy { .. },
             ) => break,

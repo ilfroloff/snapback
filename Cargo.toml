@@ -89,12 +89,13 @@ unicode-segmentation = "=1.13.3"
 # columns aligned. Already in the tree transitively via ratatui; pinned exact.
 unicode-width = "=0.2.2"
 
-# Unix-only, like the three calls it exists for: off unix `send::signal_term` is
+# Unix-only, like the calls it exists for: off unix `send::signal_term` is
 # a same-signature fallback that REFUSES instead of signalling, the catalog
 # fetch kills its child alone (`Child::kill`), the gone-process check drops no
-# record, and nothing else in the crate names a `libc` item.
+# record, the host-IDE walk finds no IDE, and nothing else in the crate names a
+# `libc` item.
 [target.'cfg(unix)'.dependencies]
-# THREE calls, each in one `unsafe` block:
+# FOUR calls, each in its own `unsafe` block (`proc_pidinfo` in two):
 # - `kill(2)`, SIGTERM, for `Ctrl-K`'s signal route (`send::signal_term`), the
 #   only handle left on a reported session that carries no stoppable job `id`.
 #   SIGTERM only on that route: no SIGKILL, no escalation ladder.
@@ -106,6 +107,11 @@ unicode-width = "=0.2.2"
 #   `pid` it answers `ESRCH` for names no running process and is left out. It
 #   signals nothing. Linux answers the same question from procfs, with no `libc`
 #   call.
+# - `proc_pidinfo` (the same flavor) and `proc_pidpath`, macOS only, for the
+#   host-IDE walk (`ide::parent_of`, `ide::exe_of`): a process's parent pid and
+#   executable path, read once per run off the UI thread to find the IDE whose
+#   terminal snapback runs in. Both only read. Linux reads `/proc/<pid>/stat` and
+#   `/proc/<pid>/exe`, with no `libc` call.
 # The two signal calls are preferred over shelling out to `/bin/kill`, which
 # would cost a PATH dependency and a child process (and, for `Ctrl-K`, a
 # thread) for calls that return immediately.

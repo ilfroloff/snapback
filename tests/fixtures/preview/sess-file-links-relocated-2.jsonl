@@ -1,0 +1,3 @@
+{"type":"user","sessionId":"sess-file-links-relocated-2","cwd":"/ws/first","timestamp":"2026-07-04T10:00:00.000Z","message":{"role":"user","content":"Go."}}
+{"type":"assistant","sessionId":"sess-file-links-relocated-2","cwd":"/ws/first","timestamp":"2026-07-04T10:00:05.000Z","message":{"role":"assistant","content":"See [a](docs/a.md)."}}
+{"type":"relocated","sessionId":"sess-file-links-relocated-2","relocatedCwd":"/ws/first","timestamp":"2026-07-04T10:03:00.000Z"}
