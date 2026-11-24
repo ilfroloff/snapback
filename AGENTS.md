@@ -352,9 +352,12 @@ one place.
   it was given: `repo_of`'s worktree collapse is a pure string heuristic, and NO
   module under `src/store/` may shell out (to `git` or anything else) or read
   ambient state to answer a per-session question — it does not scale past a
-  handful of sessions and it is not fail-soft. The ONE `git` shell-out lives in
-  `src/worktrees.rs`, outside the store, where it runs ONCE per launch/reload for
-  the launch dir alone; that placement is the whole reason the module exists.
+  handful of sessions and it is not fail-soft. The `git` shell-outs live in
+  `src/worktrees.rs`, outside the store, where they run once per launch/reload
+  for the launch dir alone: `worktree list`, plus a second `rev-parse
+  --show-toplevel` for the MAIN worktree only, and only when git reported a root
+  with no `.git` (a submodule's gitdir, or a bare repo); that placement is the
+  whole reason the module exists.
   Keep the dependency one-way: `tui` -> `worktrees` -> `store::group`.
   (`src/store/*`, `src/worktrees.rs`)
 - **TERMINAL-SAFE STYLING.** Style with ratatui `Style`/`Modifier` + NAMED ANSI

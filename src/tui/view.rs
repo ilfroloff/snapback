@@ -6870,19 +6870,20 @@ fn modal_list_description_column(label: &str) -> u16 {
 fn modal_list_row_lines(choice: &ModalChoice, selected: bool) -> Vec<Line<'static>> {
     let description = choice.description.as_deref();
     let effort = modal_effort_span(&choice.action, selected);
+    let label = modal_list_label(choice);
     let Some(text) = description.filter(|_| choice.wrap_description) else {
-        return vec![modal_list_row(&choice.label, effort, description, selected)];
+        return vec![modal_list_row(&label, effort, description, selected)];
     };
     // A wrapping row's hanging indent is measured from the LABEL alone, so it must
     // never also carry an effort. It cannot today: only the model picker's
     // default row wraps, and that row holds no pick (so no effort).
     debug_assert!(effort.is_none(), "a wrapping row never carries an effort");
-    let column = modal_list_description_column(&choice.label);
+    let column = modal_list_description_column(&label);
     let mut chunks = wrap_message(text, MODAL_INNER_WIDTH.saturating_sub(column)).into_iter();
     // `wrap_message` always yields at least one line; the default is unreachable.
     let first = chunks.next().unwrap_or_default();
     let indent = " ".repeat(usize::from(column));
-    let mut lines = vec![modal_list_row(&choice.label, None, Some(&first), selected)];
+    let mut lines = vec![modal_list_row(&label, None, Some(&first), selected)];
     lines.extend(chunks.map(|chunk| {
         Line::from(vec![
             Span::raw(indent.clone()),
@@ -7253,6 +7254,49 @@ fn fit_label(label: &str, content_width: usize, used: usize, marker: usize) -> S
         .take(budget - LABEL_ELLIPSIS.chars().count())
         .chain(LABEL_ELLIPSIS.chars())
         .collect()
+}
+
+/// `label` cut to at most `budget` chars by dropping its HEAD, keeping the END
+/// behind a leading [`LABEL_ELLIPSIS`] — the tail-keeping twin of [`fit_label`],
+/// for a label whose end is what tells rows apart.
+///
+/// A move-picker row is a worktree path relative to the main checkout, and every
+/// row starts `.agents/worktrees/`: [`fit_label`]'s kept head would be the same
+/// text on all of them and the branch name, the whole difference, would be the
+/// part lost. Counts CHARS, as [`fit_label`] does. A zero budget has no room even
+/// for the ellipsis and yields an empty string.
+fn fit_label_tail(label: &str, budget: usize) -> String {
+    let count = label.chars().count();
+    if count <= budget {
+        return label.to_string();
+    }
+    if budget == 0 {
+        return String::new();
+    }
+    let keep = budget - LABEL_ELLIPSIS.chars().count();
+    LABEL_ELLIPSIS
+        .chars()
+        .chain(label.chars().skip(count - keep))
+        .collect()
+}
+
+/// Columns a `List`-modal row's label has: the box's inside width less the
+/// selected marker, which is as wide as the unselected one.
+fn modal_list_label_budget() -> usize {
+    usize::from(MODAL_INNER_WIDTH).saturating_sub(MODAL_LIST_SELECTED_MARKER.chars().count())
+}
+
+/// The label a `List`-modal choice DRAWS. A move picker's row (`Ctrl-X w`) keeps
+/// the END of an over-wide path ([`fit_label_tail`]); every other row's label is
+/// drawn whole, and clipped at the border when it overruns, so a model or agent
+/// name keeps its start.
+fn modal_list_label(choice: &ModalChoice) -> String {
+    match choice.action {
+        ModalAction::MoveTo(_) | ModalAction::ChooseMoveScope { .. } => {
+            fit_label_tail(&choice.label, modal_list_label_budget())
+        }
+        _ => choice.label.clone(),
+    }
 }
 
 /// Break `text` into consecutive `(slice, is_match)` runs on EXTENDED
@@ -25251,6 +25295,62 @@ going until a third line | alice |\n\
         // And a prefix that OVERRUNS the row saturates rather than panicking —
         // a terminal can always be dragged narrower than the layout wants.
         assert_eq!(fit_label("anything", 4, 99, marker), "");
+    }
+
+    #[test]
+    fn fit_label_tail_keeps_the_end_and_never_overruns_its_budget() {
+        assert_eq!(fit_label_tail("short", 10), "short");
+        assert_eq!(fit_label_tail("exactly-10", 10), "exactly-10");
+
+        let fitted = fit_label_tail("abcdefghijk", 10);
+        assert_eq!(fitted, "…cdefghijk", "one column too many keeps the end");
+        assert_eq!(fitted.chars().count(), 10);
+
+        assert_eq!(fit_label_tail("anything", 1), LABEL_ELLIPSIS);
+        assert_eq!(fit_label_tail("anything", 0), "");
+        // Multi-byte chars are counted and cut as chars, never as bytes.
+        assert_eq!(fit_label_tail("ééééé", 3), "…éé");
+    }
+
+    /// The reported shape: a worktree path wider than the move picker's label
+    /// columns keeps its END (the branch), while a model or agent row of the same
+    /// width keeps its start.
+    #[test]
+    fn only_a_move_row_keeps_the_end_of_an_over_wide_label() {
+        let label = ".agents/worktrees/mrk-3091-shopify-uninstalled-store-shown-integrated-extra";
+        let budget = modal_list_label_budget();
+        assert!(
+            label.chars().count() > budget,
+            "premise: the label is wider"
+        );
+        let drawn = |action| {
+            let choice = ModalChoice {
+                label: label.to_string(),
+                description: None,
+                wrap_description: false,
+                action,
+            };
+            modal_list_row_lines(&choice, true)[0]
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        };
+
+        let moved = drawn(ModalAction::MoveTo(PathBuf::from("/r/x")));
+        assert!(moved.starts_with(&format!("{MODAL_LIST_SELECTED_MARKER}{LABEL_ELLIPSIS}")));
+        assert!(moved.ends_with("shopify-uninstalled-store-shown-integrated-extra"));
+        assert_eq!(
+            moved.chars().count(),
+            usize::from(MODAL_INNER_WIDTH),
+            "marker + label fill the box's inside width exactly"
+        );
+
+        let named = drawn(ModalAction::Cancel);
+        assert!(
+            named.starts_with(&format!("{MODAL_LIST_SELECTED_MARKER}.agents/")),
+            "a non-move row is drawn whole, its start kept: {named:?}"
+        );
     }
 
     /// The [`lineage_board`] fixture with the #80811 shape applied to the pair it
